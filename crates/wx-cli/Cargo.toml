@@ -1,6 +1,6 @@
 [package]
 name = "wx-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,6 +18,13 @@ serde_json = { workspace = true }
 string-interner = { workspace = true }
 wx-compiler = { path = "../wx-compiler" }
 wx-fmt = { path = "../wx-fmt" }
+wx-lsp = { path = "../wx-lsp" }
+# `rt`: the `lsp` subcommand builds a current-thread runtime itself (see
+# `cmd_lsp`), everything else in this binary is synchronous. `io-std`: it
+# passes concrete `tokio::io::stdin()`/`stdout()` handles into
+# `wx_lsp::run_stdio`, which takes them generically instead of constructing
+# them itself (so it type-checks for `wx-lsp-wasm`'s wasm32 target too).
+tokio = { version = "1", default-features = false, features = ["rt", "io-std"] }
 
 
 [[bin]]

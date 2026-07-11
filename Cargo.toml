@@ -20,6 +20,12 @@ package.authors = ["Artem Melnyk <melkam464@gmail.com>"]
 insta.opt-level = 3
 similar.opt-level = 3
 
+# Debug symbols are dead weight in a shipped `wx` binary (npm/GitHub release
+# artifacts, the VS Code extension's PATH lookup) — this alone drops it from
+# ~7.4MB to ~5.0MB, no runtime or compile-time cost.
+[profile.release]
+strip = true
+
 [workspace.dependencies]
 codespan-reporting = "0.13.1"
 string-interner = "0.20.0"

@@ -4,31 +4,13 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    # Runs the build/package steps only, without publishing to the
-    # Marketplace — use this to validate the cross-platform build matrix
-    # before cutting a real release.
+    # Runs the build/package step only, without publishing to the
+    # Marketplace — use this to validate packaging before cutting a release.
 
 jobs:
   build-and-package:
-    name: Build & Package (${{ matrix.vscode-target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            vscode-target: win32-x64
-          - os: ubuntu-latest
-            rust-target: x86_64-unknown-linux-gnu
-            vscode-target: linux-x64
-          - os: macos-latest
-            rust-target: x86_64-apple-darwin
-            vscode-target: darwin-x64
-          - os: macos-latest
-            rust-target: aarch64-apple-darwin
-            vscode-target: darwin-arm64
-
+    name: Build & Package
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -44,24 +26,6 @@ jobs:
           node-version: "24"
           cache: "pnpm"
 
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
-      - name: Build Rust LSP Server
-        run: cargo build --release --manifest-path crates/wx-lsp/Cargo.toml --target ${{ matrix.rust-target }}
-
-      - name: Copy Binary to Extension Folder
-        shell: bash
-        run: |
-          mkdir -p vscode/bin
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/${{ matrix.rust-target }}/release/wx-lsp.exe vscode/bin/wx-lsp.exe
-          else
-            cp target/${{ matrix.rust-target }}/release/wx-lsp vscode/bin/wx-lsp
-          fi
-
       - name: Install Dependencies
         # Scoped to just this package: a full workspace install would also
         # try to install web-next, which depends on locally wasm-pack-built
@@ -70,15 +34,18 @@ jobs:
 
       - name: Package VS Code Extension
         working-directory: ./vscode
+        # No `--target`: the extension no longer bundles a native binary (it
+        # resolves `wx` from the user's PATH, same as `deno.path`), so a
+        # single platform-independent .vsix covers everyone.
         # --no-dependencies: the extension is bundled via tsdown, so vsce's
         # npm-based node_modules dependency check is both unnecessary and
         # broken under pnpm's symlinked node_modules layout.
-        run: npx @vscode/vsce package --no-dependencies --target ${{ matrix.vscode-target }} --out wx-vscode-${{ matrix.vscode-target }}.vsix
+        run: npx @vscode/vsce package --no-dependencies --out wx-vscode.vsix
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: vsix-${{ matrix.vscode-target }}
+          name: vsix
           path: "vscode/*.vsix"
 
   publish:
@@ -87,11 +54,11 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
-      - name: Download all VSIX artifacts
+      - name: Download VSIX artifact
         uses: actions/download-artifact@v8
         with:
+          name: vsix
           path: artifacts
-          merge-multiple: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v6

@@ -48,6 +48,15 @@ jobs:
 
       - name: Build wx CLI
         run: cargo build --release --manifest-path crates/wx-cli/Cargo.toml --target ${{ matrix.rust-target }}
+        env:
+          # Only for the binaries actually shipped via npm/GitHub releases —
+          # not set in the root Cargo.toml (which `strip = true` alone lives
+          # in) so a plain local `cargo build --release` during development
+          # stays on the fast path. ~14% smaller than `strip` alone, at
+          # ~2.2x the build time — a trade only worth making for a build
+          # nobody waits on interactively.
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
 
       - name: Stage Binary
         shell: bash

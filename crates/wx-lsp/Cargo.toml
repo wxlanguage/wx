@@ -1,6 +1,6 @@
 [package]
 name = "wx-lsp"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -40,7 +40,14 @@ web-time = "1.1.0"
 tower-lsp-server = { version = "0.23.0", default-features = false, features = [
     "runtime-tokio",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+# `rt`, not `rt-multi-thread`: this crate no longer builds its own runtime
+# (that moved to whichever binary embeds it, e.g. `wx-cli`'s `lsp`
+# subcommand), so the only runtime-shaped feature it needs for itself is
+# `macros` for `#[tokio::test]` in `tests.rs`. No `io-std` either — that's
+# only needed to construct concrete `tokio::io::Stdin`/`Stdout` handles,
+# which `run_stdio` now takes as generic parameters instead of constructing
+# itself (see its doc comment).
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `wx-lsp-wasm` never calls `Server::serve`, but `tower-lsp-server` still

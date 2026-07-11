@@ -2,7 +2,7 @@
 	"name": "wx-vscode",
 	"displayName": "WX - WebAssembly Expressive Language",
 	"description": "WX language support: syntax highlighting, LSP diagnostics, completions, and formatting",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"engines": {
 		"vscode": "^1.125.0"
 	},
@@ -55,6 +55,11 @@
 			"type": "object",
 			"title": "WX Language Configuration",
 			"properties": {
+				"wx.path": {
+					"type": "string",
+					"default": "",
+					"description": "Path to the wx executable, used to run the language server. If empty, wx is resolved from your PATH."
+				},
 				"wx.formatter.indentSize": {
 					"type": "number",
 					"default": 2,

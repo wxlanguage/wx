@@ -52,6 +52,10 @@ fn main() {
 				.about("Format a WX source file in-place")
 				.arg(clap::Arg::new("path").required(true).index(1)),
 		)
+		.subcommand(
+			clap::Command::new("lsp")
+				.about("Start the WX language server over stdio"),
+		)
 		.get_matches();
 
 	match matches.subcommand() {
@@ -73,8 +77,23 @@ fn main() {
 		Some(("format", sub)) => {
 			cmd_format(sub.get_one::<String>("path").unwrap())
 		}
+		Some(("lsp", _)) => cmd_lsp(),
 		_ => unreachable!(),
 	}
+}
+
+/// The other subcommands are synchronous; only this one needs an async
+/// runtime, so it builds one for itself rather than making `main` async.
+/// Current-thread is enough — `tower_lsp_server::Server` schedules its own
+/// request concurrency independent of the runtime's thread count.
+fn cmd_lsp() {
+	tokio::runtime::Builder::new_current_thread()
+		.build()
+		.unwrap()
+		.block_on(wx_lsp::run_stdio(
+			tokio::io::stdin(),
+			tokio::io::stdout(),
+		));
 }
 
 enum MessageFormat {

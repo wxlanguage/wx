@@ -2222,20 +2222,22 @@ dependencies = [
 
 [[package]]
 name = "wx-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "codespan-reporting",
  "serde",
  "serde_json",
  "string-interner",
+ "tokio",
  "wx-compiler",
  "wx-fmt",
+ "wx-lsp",
 ]
 
 [[package]]
 name = "wx-compiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codespan-reporting",
  "indoc",
@@ -2250,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "wx-compiler-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codespan-reporting",
  "serde",
@@ -2263,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "wx-fmt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "indoc",
  "string-interner",
@@ -2272,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "wx-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codespan-reporting",
  "futures",
