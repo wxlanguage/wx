@@ -40,6 +40,10 @@ deno task build:wasm
 
 Distribution: `wx` (all subcommands, including `lsp`) ships via GitHub Releases and npm (`@wx-lang/cli`, per-platform optional deps) — see `.github/workflows/publish-cli.yml`. The VS Code extension (`vscode/`) doesn't bundle a binary; it resolves `wx` from the user's PATH (or an explicit `wx.path` setting) and spawns `wx lsp`, the same model as `deno.path`. Release binaries are stripped (`[profile.release] strip = true` in the root `Cargo.toml` — cheap enough, no build-time cost, to apply everywhere including a plain local `cargo install`); `lto`/`codegen-units = 1` are enabled only in `publish-cli.yml`'s build step via env vars, not in `Cargo.toml`, since they meaningfully slow down builds and should only cost time on binaries actually being shipped.
 
+## Releasing
+
+The whole project is versioned in lockstep (compiler, CLI, LSP, VS Code extension share one version — see `CHANGELOG.md`'s preamble) rather than per-crate. Before tagging a release, check whether the diff actually warrants `0.MINOR.0` vs `0.x.PATCH`: under the standard pre-1.0 semver convention, `0.MINOR.0` is for breaking changes (removes previously-working behavior, or makes previously-accepted code newly fail) and `0.x.PATCH` is for backward-compatible ones — don't default to a patch bump just because nothing looks dramatic on its face.
+
 ## Compilation pipeline
 
 ```
