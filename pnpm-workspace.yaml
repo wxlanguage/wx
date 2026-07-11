@@ -1,5 +1,4 @@
 packages:
-  - "vscode"
   - "cli"
   - "cli/npm/*"
 
