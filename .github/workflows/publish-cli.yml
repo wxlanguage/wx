@@ -10,11 +10,16 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
     name: Build & Publish (${{ matrix.npm-pkg }})
     runs-on: ${{ matrix.os }}
+    # Only gate real releases behind the environment's approval/OIDC setup —
+    # workflow_dispatch is used to validate the build matrix from any branch
+    # and shouldn't have to wait on environment approval just to compile.
+    environment: ${{ github.event_name == 'release' && 'npm-publish' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +88,10 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Update npm for OIDC support
+        if: github.event_name == 'release'
+        run: npm install -g npm@latest # trusted publishing needs npm 11.5.1+
+
       # Idempotent: if a previous run already published this exact
       # name@version (e.g. a retry after a later step failed), skip instead
       # of failing the whole job on npm's "cannot publish over previously
@@ -99,14 +108,16 @@ jobs:
           else
             npm publish --access public
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No NODE_AUTH_TOKEN — trusted publishing authenticates via this
+        # job's OIDC token (id-token: write) matched against the Trusted
+        # Publisher config on npmjs.com for this package.
 
   publish-main:
     name: Publish @wx-lang/cli
     needs: build
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
+    environment: npm-publish
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -123,6 +134,9 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: "pnpm"
 
+      - name: Update npm for OIDC support
+        run: npm install -g npm@latest # trusted publishing needs npm 11.5.1+
+
       - name: Install dependencies
         # Scoped to just this package: a full workspace install would also
         # try to install web-next, which depends on locally wasm-pack-built
@@ -135,5 +149,6 @@ jobs:
       - name: Publish
         working-directory: cli
         run: pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No NODE_AUTH_TOKEN — relies on OIDC trusted publishing. A token
+        # here would make npm/pnpm skip OIDC entirely and auth with it
+        # instead, so it can't coexist with actually testing/using OIDC.
