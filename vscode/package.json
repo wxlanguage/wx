@@ -17,7 +17,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/MellKam/wx.git"
+		"url": "https://github.com/wxlanguage/wx.git"
 	},
 	"contributes": {
 		"commands": [

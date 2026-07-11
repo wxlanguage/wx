@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository = "https://github.com/MellKam/wx/tree/main/crates/wx-cli"
+repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-cli"
 
 [lints]
 workspace = true
