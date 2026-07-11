@@ -1069,6 +1069,34 @@ pub fn build_service() -> (LspService<Backend>, tower_lsp_server::ClientSocket)
 	.finish()
 }
 
+/// Serves the language server over the given transport until the client
+/// disconnects. Requires a Tokio runtime to already be running (the
+/// caller's responsibility, e.g. `wx-cli`'s `lsp` subcommand).
+///
+/// Generic over the reader/writer rather than hardcoding
+/// `tokio::io::stdin()`/`stdout()`, so the caller owns constructing them —
+/// this crate no longer needs Tokio's `io-std` feature just for itself.
+///
+/// Native-only (`#[cfg]`ed out for `wasm32`, this crate's other embedder via
+/// `wx-lsp-wasm`), not just unused there: `tower_lsp_server::Server`'s
+/// `AsyncRead`/`AsyncWrite` bounds resolve to a *different* trait depending
+/// on which of its features is active — `tokio::io`'s under
+/// `runtime-tokio` (native), `futures::io`'s under `runtime-agnostic`
+/// (wasm32, see `transport.rs` in that crate). A single generic signature
+/// can satisfy one or the other, not both, so this can only compile for the
+/// target whose trait it's actually bounded by.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn run_stdio<I, O>(stdin: I, stdout: O)
+where
+	I: tokio::io::AsyncRead + Unpin,
+	O: tokio::io::AsyncWrite,
+{
+	let (service, socket) = build_service();
+	tower_lsp_server::Server::new(stdin, stdout, socket)
+		.serve(service)
+		.await;
+}
+
 // ── State management
 // ──────────────────────────────────────────────────────────
 

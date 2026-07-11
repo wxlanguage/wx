@@ -11,7 +11,7 @@ WX is a Rust-implemented compiler for a language that targets WebAssembly. Synta
 ```bash
 # Build
 cargo build -p wx-compiler           # core library
-cargo build --release -p wx-cli  # CLI binary → target/release/wx-compiler
+cargo build --release -p wx-cli  # CLI binary → target/release/wx
 
 # Inspect WASM output (WABT is installed)
 wasm2wat output.wasm                 # disassemble to WAT text format
@@ -30,6 +30,15 @@ cargo fmt
 
 # Build the WASM playground package
 deno task build:wasm
+```
+
+## Crates & binaries
+
+`wx` is a single native binary (from `wx-cli`) with `compile`/`check`/`format`/`lsp` subcommands — there is no separate `wx-lsp` binary anymore. `wx-lsp` is a library-only crate (no `main.rs`): it exposes `build_service()` (builds the `tower-lsp-server` `LspService`) and `run_stdio(stdin, stdout)` (serves it over a caller-supplied transport). `wx-cli`'s `lsp` subcommand (`cmd_lsp` in `wx-cli/src/main.rs`) is the only place that spins up a Tokio runtime — a current-thread one, scoped to just that subcommand, since everything else in the CLI is synchronous.
+
+`run_stdio` is `#[cfg(not(target_arch = "wasm32"))]`: `tower_lsp_server::Server`'s `AsyncRead`/`AsyncWrite` bounds resolve to a different trait depending on which of its features is active (`tokio::io`'s under `runtime-tokio`, native; `futures::io`'s under `runtime-agnostic`, wasm32), so it can only compile for the target whose trait it's bounded by. `wx-lsp-wasm` (excluded from the main workspace — wasm32-only, built via `wasm-pack`/`deno task build:wasm` for the browser playground in `web-next/`) only ever calls `build_service()` directly and bridges the transport over `postMessage` instead.
+
+Distribution: `wx` (all subcommands, including `lsp`) ships via GitHub Releases and npm (`@wx-lang/cli`, per-platform optional deps) — see `.github/workflows/publish-cli.yml`. The VS Code extension (`vscode/`) doesn't bundle a binary; it resolves `wx` from the user's PATH (or an explicit `wx.path` setting) and spawns `wx lsp`, the same model as `deno.path`. Release binaries are stripped (`[profile.release] strip = true` in the root `Cargo.toml` — cheap enough, no build-time cost, to apply everywhere including a plain local `cargo install`); `lto`/`codegen-units = 1` are enabled only in `publish-cli.yml`'s build step via env vars, not in `Cargo.toml`, since they meaningfully slow down builds and should only cost time on binaries actually being shipped.
 
 ## Compilation pipeline
 
@@ -38,8 +47,8 @@ source text
     │  ast::Parser::parse()
     ▼
 AST  (src/ast/)
-    │  vfs::load_single_file_compilation() → CompilationGraph
-    │  tir::build(&graph, &mut interner)
+    │  vfs::CompilationGraphBuilder — load_stdlib()/load_binary()/build() → CompilationGraph
+    │  tir::TIR::build(&mut compilation)
     ▼
 TIR  (src/tir/) — type-checked, name-resolved IR
     │  MIR::build(&tir, &interner, graph.id_generator)
@@ -56,32 +65,33 @@ ScheduledFunction
 WASM bytecode (WasmModule::encode() → Vec<u8>)
 ```
 
-`std.wx` is embedded via `include_str!` in `lib.rs` as `STDLIB_SOURCE` and is always the first file in the `CompilationGraph`. It defines the `Memory` trait, `wasm` module intrinsics, `impl char` methods, and stdlib constants.
+`std/lib.wx` is embedded via `include_str!("../../std/lib.wx")` in `vfs/mod.rs` as `STDLIB_SOURCE` and is always the first file in the `CompilationGraph` (loaded via `CompilationGraphBuilder::load_stdlib()`). It defines the `Memory` trait, `wasm` module intrinsics, `impl char` methods, and stdlib constants.
 
 ## Key modules (`crates/wx-compiler/src/`)
 
 - **`ast/`** — lexer + parser → AST nodes
 - **`tir/builder.rs`** — the largest file; prescan + demand-driven type checker and name resolver
 - **`mir/mod.rs`** — desugaring: `+=` → explicit `=`, struct access → `AggregateGet`, `char` → `U32`, inlining, monomorphization, DCE
-- **`opt/`** — sea-of-nodes SSA IR for per-function optimization (CSE via `ensure_node`, liveness, scheduling)
+- **`opt/`** — sea-of-nodes SSA IR for per-function optimization (CSE via `Builder::node`, which delegates to `intern_node`; liveness, scheduling)
 - **`codegen/mod.rs`** — WASM bytecode emitter; `Builder::build` is the entry point
-- **`fmt/`** — pretty-printer for WX source (used by the LSP formatter)
-- **`vfs.rs`** — `CompilationGraph` and file loading; `VirtualFileSource` for in-memory tests
-- **`std.wx`** — standard library source embedded at compile time
+- **`vfs/`** — `CompilationGraph` and file loading; `VirtualFileSource` for in-memory tests
+- **`../std/lib.wx`** — standard library source (sibling to `src/`), embedded at compile time
+
+The pretty-printer used to live at `fmt/` in this crate; it's now its own crate, `wx-fmt` (`crates/wx-fmt/src/lib.rs`), used by both `wx-cli` (the `format` subcommand) and `wx-lsp` (the LSP formatting request).
 
 ## TIR resolution design
 
 `tir/builder.rs` uses a prescan + demand-driven approach across four phases:
 
-1. **Phase 1 — `pre_scan_item()`**: walks every item in every file and registers it into `builder.ast_nodes: HashMap<DefId, AstNodeRef>`. No type-checking; just populates the registry.
-2. **Phase 2 — `ensure_signature(def_id)`**: called for every registered `DefId` in parse order. Demand-driven — `ensure_signature` is re-entrant safe (guarded by `sig_state: HashMap<DefId, ComputeState>`) so resolving one signature can pull in another on demand.
+1. **Phase 1 — `pre_scan_item()`**: walks every item in every file and registers it into `builder.ast_nodes: Vec<AstEntry<'ast>>` (parse order; each entry holds `def_id`/`file_id`/`namespace`/`node`). No type-checking; just populates the registry.
+2. **Phase 2 — `ensure_signature(def_id)`**: called for every registered `DefId` in parse order (via `sig_state`, built from `ast_nodes` right after Phase 1 completes). Demand-driven — `ensure_signature` is re-entrant safe (guarded by `sig_state: HashMap<DefId, SigEntry>`, where `SigEntry` holds the `ast_nodes` index plus a `ComputeState`) so resolving one signature can pull in another on demand.
 3. **Phase 3 — `ensure_body(def_id)`**: evaluates function bodies for every registered `DefId`.
 4. **Phase 3.5 — `check_trait_conformance()`**: verifies every trait impl provides all required items.
 5. **Phase 4 — exports**: processes `export { ... }` blocks after all signatures are resolved.
 
 ## Type system
 
-Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 16 slots are pre-interned in `TypePool::new()` and MUST match the constants in `tir/mod.rs`. Never reorder them; add new pre-interned types at the end only.
+Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 18 slots (`ERROR` through `CHAR` below) are pre-interned via a single hardcoded `vec![Type::Error, Type::Infer, ..., Type::Char]` literal at the top of `tir::builder::build` (`tir/builder.rs`, assigned directly to `tir.types`; the reverse lookup `type_index_lookup` is then built by iterating over it) and MUST match the constants in `tir/mod.rs`. Never reorder them; add new pre-interned types at the end only.
 
 | Constant | Index |
 |---|---|
@@ -117,21 +127,20 @@ Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 16 slots are p
 - Functions, `fn(T) -> U` type expressions (first-class function references)
 - Structs, `impl` blocks, `pub fn` methods, `#[inline]` attribute
 - Traits with default method bodies, associated types (`type Size: PointerSize`), associated consts, `impl Trait for Type`
-- Generics / monomorphization — `fn f<T>(t: T) -> T`; `#[inline]` on generic functions is not currently propagated to mono instances (documented in tests)
+- Generics / monomorphization — `fn f<T>(t: T) -> T`; `#[inline]` on generic functions is propagated to their mono instances (`mir/tests.rs`, `test_inline_attribute_on_generic_propagated_to_mono_instance`)
 - `module` declarations for multi-file compilation; `pub` visibility for cross-module access
 - `memory` declarations — `memory heap: Memory32;` lowers to WASM linear memory
 - `import "module" { fn ... }` — WASM imports; `export { fn, global }` — WASM exports (optionally renamed with `as "name"`)
 - `#[intrinsic]` — marks functions in `module wasm { }` as WASM intrinsics (memory ops)
 - Untyped integer/float literals coerced by context or via `as T` cast
-- `as` casts: integer↔integer; `char`→`u8`/`u16`/`u32`; `u8`/`u16`→`char`; `u32 as char` is blocked
+- `as` casts: validity is checked via `are_scalar_compatible`/`WasmScalar` equivalence (not a numeric-only allowlist) — integer↔integer and `char`↔`u8`/`u16`/`u32` all pass since `char` and `u32` share `WasmScalar::I32`. Unsafe/lossy casts (e.g. `u32 as char`, which is *not* currently blocked) aren't yet checked — TODO at `tir/builder.rs:9579`
 - `loop`, `break <value>`, `continue`, labeled blocks (`outer: { break :outer }`)
 - Block expressions (last expression without `;` is the value)
 
 ## MIR passes (in order)
 
 1. **Monomorphization** — generic functions instantiated per unique type-arg set via `MonoRegistry`
-2. **Inlining** (`run_inlining_pass`) — Kahn topological sort of `#[inline]` call graph; cycle-breaking via anchor selection for mutual recursion
-3. **DCE** — BFS from exported functions; unreachable functions removed from `mir.functions`
+2. **Inlining + DCE** (`run_inlining_pass`, called once from `MIR::build`) — one function doing both: Kahn topological sort of the `#[inline]` call graph (cycle-breaking via anchor selection for mutual recursion), then a reachability walk from `mir.exports` **and** `mir.start_function` that `retain`s only reachable functions in `mir.functions`
 
 Struct layout uses alignment-sorted field ordering (fields sorted descending by alignment) to minimize padding.
 
@@ -139,7 +148,7 @@ String literals lower to a `[]u8` slice aggregate `{ StaticPointer, len }`. Stat
 
 ## Testing patterns
 
-Tests live in `#[cfg(test)]` modules at the bottom of each source file. The `TestCase` helper in `tir/tests.rs` and `mir/tests.rs` constructs a `CompilationGraph` (which automatically includes `std.wx`) and runs the pipeline:
+Tests live in `#[cfg(test)]` modules at the bottom of each source file. The `TestCase` helper in `tir/tests.rs` and `mir/tests.rs` constructs a `CompilationGraph` (which automatically includes `std/lib.wx`) and runs the pipeline:
 
 ```rust
 // TIR test
@@ -156,12 +165,11 @@ insta::assert_yaml_snapshot!(case.mir);
 let case = TestCase::new_multi_file("src/main.wx", "module math;", &[("src/math.wx", "pub fn add() -> i32 { 1 }")]);
 ```
 
-Snapshot files live in `src/tir/snapshots/` and `src/mir/snapshots/`. Never edit `.snap` files by hand. Any change to `std.wx` shifts byte offsets causing all snapshot tests to fail — regenerate with `INSTA_UPDATE=always`.
+Snapshot files live in `src/tir/snapshots/` and `src/mir/snapshots/`. Never edit `.snap` files by hand. Any change to `std/lib.wx` shifts byte offsets causing all snapshot tests to fail — regenerate with `INSTA_UPDATE=always`.
 
 ## Common pitfalls
 
-- **Pre-interned `TypeIndex` ordering:** never insert in the middle of the `intern_type` sequence in `tir::build` — every downstream type check silently gets wrong types.
-- **`ensure_signature` re-entrancy:** guarded by `sig_state`; an `InProgress` state means a cycle. Adding resolution code that calls `ensure_signature` recursively is safe only if cycles are handled.
-- **`is_numeric_cast` is the gatekeeper for `as` casts** — only integer↔integer and `char`↔`u8`/`u16` are allowed (not `u32 as char`).
+- **Pre-interned `TypeIndex` ordering:** never insert in the middle of the pre-interned `vec![...]` literal at the top of `tir::builder::build` — every downstream type check silently gets wrong types.
+- **`ensure_signature` re-entrancy:** guarded by `sig_state: HashMap<DefId, SigEntry>` (each entry carries a `ComputeState`); an in-progress state means a cycle. Adding resolution code that calls `ensure_signature` recursively is safe only if cycles are handled.
+- **Cast checking is looser than it looks:** `are_scalar_compatible`/`WasmScalar` equivalence is the gatekeeper for `as` casts, not a numeric-only allowlist — lossy casts like `u32 as char` currently pass (see `tir/builder.rs:9579` TODO). Don't assume the cast surface is fully validated.
 - **`pub fn` only:** impl methods without `pub` are not visible to user code via `Type::method()` call syntax.
-- **`#[inline]` on generics** is currently not propagated to mono instances (documented bug in `mir/tests.rs`).

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as process from "node:process";
 import {
 	workspace,
 	ExtensionContext,
@@ -15,7 +16,6 @@ import {
 	LanguageClient,
 	LanguageClientOptions,
 	ServerOptions,
-	TransportKind,
 } from "vscode-languageclient/node";
 import {
 	AnsiDecorationProvider,
@@ -25,20 +25,78 @@ import {
 
 let client: LanguageClient | null = null;
 
-const resolveServerBinary = (context: ExtensionContext): string => {
+function fileExists(filePath: string): boolean {
+	try {
+		return fs.statSync(filePath).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function splitPathEnvValue(value: string): string[] {
+	const separator = process.platform === "win32" ? ";" : ":";
+	return value
+		.split(separator)
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
+// On Windows, `wx` on PATH may be `wx.exe`, `wx.cmd` (an npm global-install
+// shim), etc. — `PATHEXT` lists which suffixes actually count as executable.
+function candidateNames(baseName: string): string[] {
+	if (process.platform !== "win32") return [baseName];
+	const pathExt = process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM";
+	return splitPathEnvValue(pathExt).map((ext) => baseName + ext);
+}
+
+// Manually walks `PATH` looking for a `wx` executable — the same resolution
+// `child_process.spawn("wx", ...)` does internally, just done eagerly so we
+// can show a specific, actionable error message ahead of time instead of
+// waiting for `client.start()` to fail with a generic "spawn wx ENOENT".
+// Mirrors `getDefaultDenoCommand` in denoland/vscode_deno's
+// client/src/util.ts.
+function findWxOnPath(): string | undefined {
+	const pathValue = process.env.PATH ?? "";
+	for (const dir of splitPathEnvValue(pathValue)) {
+		for (const name of candidateNames("wx")) {
+			const candidate = path.join(dir, name);
+			if (fileExists(candidate)) return candidate;
+		}
+	}
+	return undefined;
+}
+
+// Resolved fresh on every start/restart (not cached) so that changing
+// `wx.path` and running "WX: Restart Language Server" picks it up without a
+// full window reload. Returns `undefined` if nothing resolvable was found,
+// so `startServer` can show a specific error instead of letting
+// `client.start()` fail with an opaque one.
+const resolveServerCommand = (
+	context: ExtensionContext,
+): string | undefined => {
+	const configured = workspace.getConfiguration("wx").get<string>("path");
+	if (configured) {
+		const resolved = path.isAbsolute(configured)
+			? configured
+			: (workspace.workspaceFolders?.[0] &&
+				path.resolve(workspace.workspaceFolders[0].uri.fsPath, configured));
+		return resolved && fileExists(resolved) ? resolved : undefined;
+	}
+
 	if (context.extensionMode === ExtensionMode.Development) {
-		return path.resolve(
+		const devBinary = path.resolve(
 			context.extensionPath,
 			"..",
 			"target",
 			"debug",
-			process.platform === "win32" ? "wx-lsp.exe" : "wx-lsp",
+			process.platform === "win32" ? "wx.exe" : "wx",
 		);
+		if (fileExists(devBinary)) return devBinary;
 	}
 
-	return context.asAbsolutePath(
-		path.join("bin", process.platform === "win32" ? "wx-lsp.exe" : "wx-lsp"),
-	);
+	// No bundled binary (unlike the old per-platform .vsix builds) — same
+	// model as `deno.path`: resolve `wx` from the user's PATH.
+	return findWxOnPath();
 };
 
 let fileWatcher: FileSystemWatcher | null = null;
@@ -72,17 +130,34 @@ async function decorateVisibleEditors(document: TextDocument) {
 	}
 }
 
-async function startServer(serverModule: string) {
-	if (!fs.existsSync(serverModule)) {
-		window.showErrorMessage(
-			`WX Language Server binary not found at: ${serverModule}`,
-		);
+async function startServer(context: ExtensionContext) {
+	const serverCommand = resolveServerCommand(context);
+	if (!serverCommand) {
+		const configured = workspace.getConfiguration("wx").get<string>("path");
+		const message = configured
+			? `Could not find the 'wx' executable at the configured "wx.path": ${configured}`
+			: "Could not find the 'wx' executable on your PATH. Install it " +
+				"with `npm install -g @wx-lang/cli` (or `cargo install --path " +
+				'crates/wx-cli`), or set the "wx.path" setting to point to it directly.';
+		const action = await window.showErrorMessage(message, "Open Settings");
+		if (action === "Open Settings") {
+			commands.executeCommand(
+				"workbench.action.openSettings",
+				"wx.path",
+			);
+		}
 		return;
 	}
 
+	// No `transport` here: for an `Executable`, vscode-languageclient treats
+	// an explicit `TransportKind.stdio` as a signal to append a `--stdio`
+	// flag to `args` (the convention some LSP servers use to pick their
+	// transport) — `wx lsp` always talks over stdio and doesn't accept that
+	// flag, so it'd reject it (`error: unexpected argument '--stdio' found`).
+	// Omitting `transport` spawns/pipes identically but skips that flag.
 	const serverOptions: ServerOptions = {
-		command: serverModule,
-		transport: TransportKind.stdio,
+		command: serverCommand,
+		args: ["lsp"],
 	};
 
 	fileWatcher?.dispose();
@@ -142,7 +217,6 @@ async function startServer(serverModule: string) {
 }
 
 export function activate(context: ExtensionContext) {
-	const serverModule = resolveServerBinary(context);
 	const restartCommand = commands.registerCommand(
 		"wx-vscode.restartServer",
 		async () => {
@@ -152,7 +226,7 @@ export function activate(context: ExtensionContext) {
 				await client.stop();
 			}
 
-			await startServer(serverModule);
+			await startServer(context);
 		},
 	);
 
@@ -163,7 +237,7 @@ export function activate(context: ExtensionContext) {
 	});
 
 	context.subscriptions.push(restartCommand, configListener);
-	startServer(serverModule);
+	startServer(context);
 
 	// Provide content for wx:// virtual stdlib URIs (e.g. wx://std/lib.wx)
 	context.subscriptions.push(
