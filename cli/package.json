@@ -5,6 +5,11 @@
 	"author": {
 		"name": "Artem Melnyk"
 	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/wxlanguage/wx",
+		"directory": "cli"
+	},
 	"type": "module",
 	"bin": {
 		"wx": "./bin.js"
