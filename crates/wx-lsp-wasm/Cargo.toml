@@ -12,7 +12,7 @@ edition = "2024"
 rust-version = "1.85.1"
 authors = ["Artem Melnyk <melkam464@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/MellKam/wx/tree/main/crates/wx-lsp-wasm"
+repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-lsp-wasm"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
