@@ -1,3 +1,6 @@
 [submodule "editors/vscode"]
 	path = editors/vscode
 	url = https://github.com/wxlanguage/vscode.git
+[submodule "editors/zed"]
+	path = editors/zed
+	url = https://github.com/wxlanguage/zed.git
