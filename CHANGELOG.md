@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning currently applies to the whole project at once (the compiler,
-CLI, and tooling are released in lockstep) rather than per-crate.
+CLI, and LSP are released in lockstep) rather than per-crate. Editor
+integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
+live in their own repos with independent versioning.
 
 ## [0.1.1] - 2026-07-11
 
@@ -26,7 +28,7 @@ CLI, and tooling are released in lockstep) rather than per-crate.
 ### Changed
 
 - The VS Code extension no longer bundles a platform-specific binary —
-  see [vscode/CHANGELOG.md](vscode/CHANGELOG.md) for details.
+  see [wxlanguage/vscode](https://github.com/wxlanguage/vscode/blob/main/CHANGELOG.md) for details.
 - Release binaries are smaller (debug symbols stripped).
 - A malformed `import "..."` alias now reports a normal diagnostic
   instead of aborting the parser outright.
@@ -64,5 +66,5 @@ Still early: expect rough edges and breaking changes before 1.0.
   x64/arm64, Windows).
 - Language Server: diagnostics, completions, and formatting, packaged as
   the "WX - WebAssembly Expressive Language" VS Code extension (see
-  [vscode/CHANGELOG.md](vscode/CHANGELOG.md) for extension-specific
+  [wxlanguage/vscode](https://github.com/wxlanguage/vscode/blob/main/CHANGELOG.md) for extension-specific
   changes).
