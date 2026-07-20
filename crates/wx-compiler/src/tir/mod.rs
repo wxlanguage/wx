@@ -62,6 +62,11 @@ pub enum TypeParamOwner {
 	/// Non-trait generic impl block: `impl<Params> Target { }`.
 	/// Value is the index into `TIR::impl_block_list`.
 	ImplBlock(u32),
+	/// `impl Trait for Target { }` / `impl<Params> Trait for Target { }`.
+	/// Value is the index into `TIR::trait_impls`. `type_params` is empty
+	/// for what used to be called a "concrete" trait impl — the degenerate
+	/// (zero-parameter) case of the same shape as `ImplBlock`.
+	TraitImpl(TraitImplIndex),
 	/// `type Alias<T> = ...;` — the alias's own type parameters.
 	TypeAlias(DefId),
 }
@@ -312,6 +317,7 @@ pub type MemoryIndex = u32;
 pub type EnumVariantIndex = u32;
 pub type EnumIndex = u32;
 pub type TraitIndex = u32;
+pub type InherentImplIndex = u32;
 pub type TraitImplIndex = u32;
 pub type TypesetIndex = u32;
 
@@ -369,7 +375,13 @@ pub struct Trait {
 pub struct TraitImpl {
 	pub id: ast::DefId,
 	pub trait_index: TraitIndex,
-	pub target: TypeIndex,
+	/// Empty for what used to be called a "concrete" trait impl
+	/// (`impl Trait for Target { .. }`) — the degenerate (zero-parameter)
+	/// case of the same shape as a generic one, mirroring `ImplBlock`.
+	pub type_params: Box<[TypeParamInfo]>,
+	/// See `ImplBlock::target` — `span` here is the target type expression
+	/// in `impl Trait for «this» { .. }`.
+	pub target: Spanned<TypeIndex>,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -379,6 +391,9 @@ pub struct TraitImpl {
 	#[cfg_attr(test, serde(skip))]
 	pub span: TextSpan,
 	pub file_id: FileId,
+	/// See `ImplBlock::self_accesses`.
+	#[cfg_attr(test, serde(skip))]
+	pub self_accesses: Vec<SourceSpan>,
 }
 
 /// The intersection of representable value ranges across a set of integer types.
@@ -977,6 +992,7 @@ pub struct Memory {
 	pub kind: TypeIndex,
 	pub min_pages: Option<u32>,
 	pub max_pages: Option<u32>,
+	pub accesses: Vec<SourceSpan>,
 }
 
 /// Back-pointer to whichever declaration created this namespace.
@@ -1061,16 +1077,11 @@ pub enum FileKind {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum ImplEntry {
 	Method(FunctionIndex),
-	AssociatedFn(FunctionIndex),
-	/// The type is always `tir.constants[index].ty.inner` — never stored
-	/// separately. A memory-instantiated associated const (see
-	/// `Builder::seed_memory_trait_impl_with`) gets its own freshly pushed
-	/// `Constant` with the substituted type baked in, rather than sharing
-	/// the trait's template `Constant` with a divergent type here.
-	AssociatedConst(ConstIndex),
+	AssocFunction(FunctionIndex),
+	AssocConstant(ConstIndex),
 	/// `ty` is `TypeParam` in trait declarations (a placeholder) and the
 	/// concrete type in impls.
-	AssociatedType {
+	AssocType {
 		ty: TypeIndex,
 	},
 }
@@ -1079,15 +1090,15 @@ impl ImplEntry {
 	pub fn def_span(self, tir: &TIR) -> SourceSpan {
 		match self {
 			ImplEntry::Method(func_index)
-			| ImplEntry::AssociatedFn(func_index) => {
+			| ImplEntry::AssocFunction(func_index) => {
 				let func = &tir.functions[func_index as usize];
 				SourceSpan::new(func.file_id, func.name.span)
 			}
-			ImplEntry::AssociatedConst(index) => {
+			ImplEntry::AssocConstant(index) => {
 				let constant = &tir.constants[index as usize];
 				SourceSpan::new(constant.file_id, constant.name.span)
 			}
-			ImplEntry::AssociatedType { .. } => {
+			ImplEntry::AssocType { .. } => {
 				todo!(
 					"we need to store the def_id of type alias here so that we can point to the actaul definition place"
 				)
@@ -1104,14 +1115,26 @@ impl ImplEntry {
 /// different thing, just the degenerate (zero-parameter) case of the same
 /// shape, so a concrete and a generic inherent impl can be compared/detected
 /// as conflicting on equal footing instead of living in separate registries.
-pub struct ImplBlock {
+pub struct InherentImpl {
 	/// Synthetic `DefId` used to demand-drive this block's `ensure_signature`.
 	pub id: ast::DefId,
 	pub file_id: FileId,
 	pub type_params: Box<[TypeParamInfo]>,
-	/// `TypeIndex::ERROR` until `ensure_signature` for this block runs.
-	pub target: TypeIndex,
+	/// `inner` is `TypeIndex::ERROR` until `ensure_signature` for this block
+	/// runs. `span` is the target type expression as written in the impl
+	/// header (`impl «this» { .. }`) — kept alongside the resolved type so
+	/// consumers (e.g. `Self`'s go-to-definition) have a source location to
+	/// point at without re-deriving one from the resolved `Type`.
+	pub target: Spanned<TypeIndex>,
 	pub members: HashMap<SymbolU32, ImplEntry>,
+	/// Spans of every `Self` keyword usage resolved against this block —
+	/// kept separate from `target`'s own struct/enum `accesses` so LSP
+	/// consumers (semantic tokens, rename) can tell "literally named the
+	/// type" apart from "used the `Self` keyword", which read the same at
+	/// the type-resolution level but must be treated differently: renaming
+	/// the type must not rewrite `Self` text, and `Self` shouldn't be
+	/// colored like an identifier reference.
+	pub self_accesses: Vec<SourceSpan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1392,6 +1415,9 @@ define_diagnostic_codes! {
 		UnusedEnumVariant => "W1009",
 		MissingImportAlias => "E1058",
 		AmbiguousTraitMember => "E1059",
+		NotAField => "E1060",
+		DuplicateTraitImpl => "E1061",
+		InvalidImplTarget => "E1062",
 	}
 }
 
@@ -1744,7 +1770,7 @@ impl<'a> TypeFormatter<'a> {
 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
 					}
 					TypeParamOwner::ImplBlock(block_idx) => {
-						let symbol = self.tir.impl_block_list
+						let symbol = self.tir.inherent_impls
 							[*block_idx as usize]
 							.type_params[*param_index as usize]
 							.name
@@ -1756,6 +1782,13 @@ impl<'a> TypeFormatter<'a> {
 							.tir
 							.expect_type_alias_index(*def_id)
 							as usize]
+							.type_params[*param_index as usize]
+							.name
+							.inner;
+						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+					}
+					TypeParamOwner::TraitImpl(impl_idx) => {
+						let symbol = self.tir.trait_impls[*impl_idx as usize]
 							.type_params[*param_index as usize]
 							.name
 							.inner;
@@ -1889,30 +1922,36 @@ pub struct TIR {
 	/// `type_params`) and generic (`impl<T> Target { .. }`) alike. See
 	/// `ImplBlock`.
 	#[cfg_attr(test, serde(skip))]
-	pub impl_block_list: Vec<ImplBlock>,
+	pub inherent_impls: Vec<InherentImpl>,
 	/// Dispatch index: `(outer type constructor, member name) → every block
 	/// index that provides that name for that shape`. Coarse on purpose — a
 	/// struct with several separate concrete impls for different type
 	/// arguments (e.g. `impl Box<i32> { .. }` and `impl Box<bool> { .. }`)
 	/// legitimately share one entry here without conflicting; resolution
 	/// checks each candidate against the actual receiver
-	/// (`Builder::match_impl_block`) to find out which ones really apply,
+	/// (`TIR::unify_inherent_impl_target`) to find out which ones really apply,
 	/// and it's *that* per-receiver count — not this bucket's raw length —
 	/// that decides whether there's a genuine conflict.
 	#[cfg_attr(test, serde(skip))]
-	pub impl_block_dispatch: HashMap<(ImplTarget, SymbolU32), Vec<u32>>,
+	pub inherent_impl_dispatch:
+		HashMap<(ImplTarget, SymbolU32), Vec<InherentImplIndex>>,
 	pub traits: Vec<Trait>,
 	pub trait_impls: Vec<TraitImpl>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub trait_impl_lookup: HashMap<(TypeIndex, TraitIndex), TraitImplIndex>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub type_trait_impls: HashMap<TypeIndex, Vec<TraitImplIndex>>,
+	/// Every trait impl (concrete or generic alike — mirrors
+	/// `impl_block_list`/`impl_block_dispatch`'s treatment of inherent
+	/// impls), coarsely bucketed by outer type constructor only — not by
+	/// trait, since a type rarely has more than a handful of trait impls of
+	/// any kind, so a cheap linear scan filtering by trait index (done in
+	/// `TIR::find_trait_impl`) is simpler than a second key component.
+	/// `TIR::unify_trait_impl_target` unifies each candidate's `target` against the
+	/// actual receiver and checks its declared bounds — for a concrete
+	/// (zero-param) impl this degenerates to exact `TypeIndex` equality, so
+	/// `impl Show for Foo<i32>` and `impl Show for Foo<bool>` coexist here
+	/// without conflating: the bucket is only a coarse first-pass filter,
+	/// per-candidate unification is what actually disambiguates.
+	#[cfg_attr(test, serde(skip))]
+	pub trait_impl_dispatch:
+		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 	pub constants: Vec<Constant>,
 	#[cfg_attr(test, serde(skip))]
 	pub tagged_items: HashMap<SymbolU32, DefId>,
@@ -2118,6 +2157,23 @@ impl TIR {
 		}
 	}
 
+	/// The source location where `ty` was declared, if it names a struct or
+	/// enum directly (`None` for primitives, pointers, type params, etc. —
+	/// nothing to point at).
+	pub fn type_declaration_span(&self, ty: TypeIndex) -> Option<SourceSpan> {
+		match self.types.get(ty.as_usize())? {
+			Type::Struct { struct_index, .. } => {
+				let s = self.structs.get(*struct_index as usize)?;
+				Some(SourceSpan::new(s.file_id, s.name.span))
+			}
+			Type::Enum { enum_index } => {
+				let e = self.enums.get(*enum_index as usize)?;
+				Some(SourceSpan::new(e.file_id, e.name.span))
+			}
+			_ => None,
+		}
+	}
+
 	#[inline]
 	pub fn expect_enum_index(&self, id: DefId) -> EnumIndex {
 		match self.item_lookup[&id] {
@@ -2143,7 +2199,7 @@ impl TIR {
 	) -> &TypeParamInfo {
 		match owner {
 			TypeParamOwner::ImplBlock(block_idx) => {
-				&self.impl_block_list[block_idx as usize].type_params[abs_index]
+				&self.inherent_impls[block_idx as usize].type_params[abs_index]
 			}
 			TypeParamOwner::Function(id) => {
 				let func_idx = self.expect_function_index(id) as usize;
@@ -2166,6 +2222,9 @@ impl TIR {
 				let alias_idx = self.expect_type_alias_index(id) as usize;
 				&self.type_aliases[alias_idx].type_params[abs_index]
 			}
+			TypeParamOwner::TraitImpl(impl_idx) => {
+				&self.trait_impls[impl_idx as usize].type_params[abs_index]
+			}
 		}
 	}
 
@@ -2177,7 +2236,7 @@ impl TIR {
 	) -> &mut TypeParamInfo {
 		match owner {
 			TypeParamOwner::ImplBlock(block_idx) => {
-				&mut self.impl_block_list[block_idx as usize].type_params
+				&mut self.inherent_impls[block_idx as usize].type_params
 					[abs_index]
 			}
 			TypeParamOwner::Function(id) => {
@@ -2201,6 +2260,9 @@ impl TIR {
 				let alias_idx = self.expect_type_alias_index(id) as usize;
 				&mut self.type_aliases[alias_idx].type_params[abs_index]
 			}
+			TypeParamOwner::TraitImpl(impl_idx) => {
+				&mut self.trait_impls[impl_idx as usize].type_params[abs_index]
+			}
 		}
 	}
 
@@ -2215,14 +2277,443 @@ impl TIR {
 		let func = &self.functions[func_index as usize];
 		let parent_params: &[TypeParamInfo] = match func.type_param_parent {
 			Some(TypeParamOwner::ImplBlock(block_idx)) => {
-				&self.impl_block_list[block_idx as usize].type_params
+				&self.inherent_impls[block_idx as usize].type_params
 			}
 			Some(TypeParamOwner::Trait(trait_idx)) => std::slice::from_ref(
 				&self.traits[trait_idx as usize].self_type_param,
 			),
+			Some(TypeParamOwner::TraitImpl(impl_idx)) => {
+				&self.trait_impls[impl_idx as usize].type_params
+			}
 			_ => &[],
 		};
 		parent_params.iter().chain(func.type_params.iter())
+	}
+
+	/// Structural unification: for every `TypeParam` slot reachable inside
+	/// `pattern_ty`, bind the corresponding position in `actual_ty` into
+	/// `type_args` (first binding wins — a later occurrence of an
+	/// already-bound slot, or an explicit pre-seeded turbofish value, is
+	/// checked for consistency rather than overwritten). Shared by
+	/// inherent-impl matching (`Self::unify_inherent_impl_target`) and
+	/// trait-impl matching (`Self::unify_trait_impl_target`) — lives on
+	/// `TIR` rather than `tir::builder::Builder` so `mir::Builder` (which
+	/// only ever holds `&TIR`, never the TIR-build-only `Builder`) can
+	/// reuse the trait-impl side too, via `find_trait_impl`.
+	///
+	/// `Err(())` when `pattern_ty` can't possibly describe `actual_ty` — a
+	/// `TypeParam` bound to two different values, or a fixed (non-generic)
+	/// position in `pattern_ty` that doesn't equal the corresponding
+	/// `actual_ty` position. Traversal never stops early on an `Err(())`,
+	/// even though the overall result is already decided: binding keeps
+	/// happening for every other, independent position exactly as it
+	/// always has, so a caller that ignores the return value (most of them
+	/// — the diagnostic-reporting ones report their own mismatch from the
+	/// substituted result afterward, not from this) sees no behavior
+	/// change at all. Only `unify_impl_target` currently reads it, to
+	/// reject a candidate this function would otherwise silently
+	/// over-accept (see its doc). Not a real error in the diagnostic
+	/// sense — nothing here is user-facing, `Result` is just a
+	/// `#[must_use]` `bool` so every other call site has to spell out
+	/// `let _ =` and make ignoring it a visible choice.
+	fn infer_type_args(
+		&self,
+		type_args: &mut [TypeIndex],
+		pattern_ty: TypeIndex,
+		actual_ty: TypeIndex,
+	) -> Result<(), ()> {
+		// Unresolved comptime literals have no concrete type yet; inferring T = INTEGER would give the wrong answer once the literal is coerced.
+		// Skip ERROR and INFER actuals too — they must not fill a still-unresolved slot.
+		if actual_ty == TypeIndex::INTEGER
+			|| actual_ty == TypeIndex::FLOAT
+			|| actual_ty == TypeIndex::ERROR
+			|| actual_ty == TypeIndex::INFER
+		{
+			return Ok(());
+		}
+
+		match (
+			&self.types[pattern_ty.as_usize()],
+			&self.types[actual_ty.as_usize()],
+		) {
+			(Type::TypeParam { param_index, .. }, _) => {
+				match type_args.get_mut(*param_index as usize) {
+					Some(slot) if *slot == TypeIndex::INFER => {
+						*slot = actual_ty;
+						Ok(())
+					}
+					// Already bound (turbofish or an earlier occurrence) —
+					// consistent only if it's the same value.
+					Some(slot) if *slot == actual_ty => Ok(()),
+					Some(_) => Err(()),
+					None => Ok(()),
+				}
+			}
+			(
+				Type::AssocTypeProjection {
+					assoc_name,
+					trait_index,
+					base,
+					..
+				},
+				Type::AssocTypeProjection {
+					assoc_name: actual_assoc,
+					trait_index: actual_trait,
+					base: actual_base,
+					..
+				},
+			) if assoc_name == actual_assoc && trait_index == actual_trait => {
+				self.infer_type_args(type_args, *base, *actual_base)
+			}
+			(
+				Type::Tuple { elements: pattern },
+				Type::Tuple { elements: actual },
+			) if pattern.len() == actual.len() => pattern
+				.iter()
+				.copied()
+				.zip(actual.iter().copied())
+				.try_fold((), |_, (pattern, actual)| {
+					self.infer_type_args(type_args, pattern, actual)
+				}),
+			(
+				Type::Function {
+					signature: pattern_sig,
+				},
+				Type::Function {
+					signature: actual_sig,
+				},
+			) if pattern_sig.params_count == actual_sig.params_count
+				&& pattern_sig.items.len() == actual_sig.items.len() =>
+			{
+				pattern_sig
+					.items
+					.iter()
+					.copied()
+					.zip(actual_sig.items.iter().copied())
+					.try_fold((), |_, (pattern, actual)| {
+						self.infer_type_args(type_args, pattern, actual)
+					})
+			}
+			(
+				Type::Pointer {
+					to: pattern_to,
+					memory: pattern_memory,
+					..
+				},
+				Type::Pointer {
+					to: actual_to,
+					memory: actual_memory,
+					..
+				},
+			) => {
+				let to_result =
+					self.infer_type_args(type_args, *pattern_to, *actual_to);
+				let memory_result = self.infer_type_args(
+					type_args,
+					*pattern_memory,
+					*actual_memory,
+				);
+				to_result.and(memory_result)
+			}
+			(
+				Type::Array {
+					of: pattern_of,
+					size: pattern_size,
+					memory: pattern_memory,
+					..
+				},
+				Type::Array {
+					of: actual_of,
+					size: actual_size,
+					memory: actual_memory,
+					..
+				},
+			) if pattern_size == actual_size => {
+				let of_result =
+					self.infer_type_args(type_args, *pattern_of, *actual_of);
+				let memory_result = self.infer_type_args(
+					type_args,
+					*pattern_memory,
+					*actual_memory,
+				);
+				of_result.and(memory_result)
+			}
+			(
+				Type::Slice {
+					of: pattern_of,
+					memory: pattern_memory,
+					..
+				},
+				Type::Slice {
+					of: actual_of,
+					memory: actual_memory,
+					..
+				},
+			) => {
+				let of_result =
+					self.infer_type_args(type_args, *pattern_of, *actual_of);
+				let memory_result = self.infer_type_args(
+					type_args,
+					*pattern_memory,
+					*actual_memory,
+				);
+				of_result.and(memory_result)
+			}
+			(
+				Type::Struct {
+					struct_index: pattern_struct,
+					args: pattern_args,
+				},
+				Type::Struct {
+					struct_index: actual_struct,
+					args: actual_args,
+				},
+			) if pattern_struct == actual_struct
+				&& pattern_args.len() == actual_args.len() =>
+			{
+				pattern_args
+					.iter()
+					.copied()
+					.zip(actual_args.iter().copied())
+					.try_fold((), |_, (pattern, actual)| {
+						self.infer_type_args(type_args, pattern, actual)
+					})
+			}
+			_ if pattern_ty == actual_ty => Ok(()),
+			_ => Err(()),
+		}
+	}
+
+	/// The typeset bound on a `TypeParam`, if any (`None` for any other kind of type).
+	fn type_param_typeset_bound(&self, ty: TypeIndex) -> Option<TypesetIndex> {
+		let Type::TypeParam {
+			ref owner,
+			param_index,
+		} = self.types[ty.as_usize()]
+		else {
+			return None;
+		};
+		self.type_param_info(*owner, param_index as usize)
+			.bounds
+			.typeset
+	}
+
+	/// `ty`'s own declared bounds, for the two kinds of type that carry
+	/// bounds without being concrete yet — a `TypeParam` (a function's or
+	/// impl's own generic param) or an `AssocTypeProjection` (`Self::M`,
+	/// bounded by whichever trait declares `M`). `None` for anything
+	/// concrete, which has no bounds of its own to consult — whether it
+	/// satisfies a trait/typeset is a lookup (`find_trait_impl`/
+	/// `concrete_type_in_typeset`), not a declaration.
+	fn abstract_type_bounds(&self, ty: TypeIndex) -> Option<&Bounds> {
+		match &self.types[ty.as_usize()] {
+			Type::TypeParam { owner, param_index } => Some(
+				&self.type_param_info(*owner, *param_index as usize).bounds,
+			),
+			Type::AssocTypeProjection {
+				trait_index,
+				assoc_name,
+				..
+			} => self.traits[*trait_index as usize]
+				.assoc_types
+				.get(assoc_name)
+				.map(|at| &at.bounds),
+			_ => None,
+		}
+	}
+
+	/// True when concrete `ty` is a member of the given typeset.
+	fn concrete_type_in_typeset(
+		&self,
+		ty: TypeIndex,
+		typeset_index: TypesetIndex,
+	) -> bool {
+		self.typesets[typeset_index as usize].members.contains(&ty)
+	}
+
+	/// Shared core of `unify_inherent_impl_target`/`unify_trait_impl_target`:
+	/// does a target with `type_params_len` free slots apply to
+	/// `receiver_ty`, and if so what's the substitution? `None` if it
+	/// doesn't apply at all.
+	///
+	/// The no-type-params case is handled separately rather than via
+	/// `infer_type_args`: with an empty `type_args` slice it has nothing to
+	/// bind, so it would silently accept any receiver of the same outer
+	/// shape instead of rejecting a mismatch.
+	///
+	/// Doesn't judge whether a leftover `TypeIndex::INFER` slot is
+	/// acceptable — that differs between the two callers, so it's their
+	/// call, made after this returns.
+	///
+	/// Does reject an inconsistent substitution itself, though (`None`
+	/// when `infer_type_args` returns `Err(())`) — e.g. `impl<T> Pair<T,
+	/// T>` against a receiver `Pair<i32, bool>`: `infer_type_args`'s
+	/// first-binding-wins would otherwise bind `T = i32` from the first
+	/// field and silently drop the conflicting `bool` from the second,
+	/// reporting this block as a match when no consistent `T` makes it one.
+	fn unify_impl_target(
+		&self,
+		type_params_len: usize,
+		target: TypeIndex,
+		receiver_ty: TypeIndex,
+	) -> Option<Box<[TypeIndex]>> {
+		if type_params_len == 0 {
+			// `ImplTarget` is coarser than the full concrete type, so
+			// multiple non-generic impls can share a bucket (e.g. `impl
+			// Box<i32>` and `impl Box<bool>`) — this is what tells them
+			// apart for a given receiver.
+			return (target == receiver_ty).then(|| Box::new([]) as _);
+		}
+		let mut type_args: Vec<TypeIndex> =
+			vec![TypeIndex::INFER; type_params_len];
+		self.infer_type_args(&mut type_args, target, receiver_ty)
+			.ok()
+			.map(|()| type_args.into_boxed_slice())
+	}
+
+	/// Does every `type_params[i].bounds` (trait bounds and typeset) accept
+	/// its matching `type_args[i]`? A still-`TypeIndex::INFER` slot is
+	/// skipped — it has no value at all yet, concrete or otherwise, so
+	/// validating it is deferred to whoever eventually resolves it (e.g.
+	/// `check_typeset_bounds_on_type_args` post-call, for an inherent-impl
+	/// param only pinned down by the call's own arguments).
+	///
+	/// An abstract slot (`arg_ty` is itself a `TypeParam`/
+	/// `AssocTypeProjection` — e.g. `M` unified against `Self::M` inside a
+	/// trait default body) is checked against *its own* declared bounds via
+	/// `abstract_type_bounds`, not looked up in `find_trait_impl`/
+	/// `concrete_type_in_typeset` — those only know about concrete impls,
+	/// and an abstract type isn't concrete yet. This only recognizes an
+	/// exact, directly-declared bound (no supertrait transitivity: `M:
+	/// Sub` does not currently satisfy a required `Super` even if `Sub:
+	/// Super`) — matching the same level of rigor `check_typeset_bounds_on_type_args`
+	/// already applies via `type_param_typeset_bound`.
+	fn type_args_satisfy_bounds(
+		&self,
+		type_params: &[TypeParamInfo],
+		type_args: &[TypeIndex],
+	) -> bool {
+		for (tp, arg_ty) in type_params.iter().zip(type_args.iter().copied()) {
+			if arg_ty == TypeIndex::INFER {
+				continue;
+			}
+			match self.abstract_type_bounds(arg_ty) {
+				Some(declared) => {
+					let traits_ok = tp.bounds.traits.iter().all(|req| {
+						declared
+							.traits
+							.iter()
+							.any(|d| d.trait_index == req.trait_index)
+					});
+					if !traits_ok {
+						return false;
+					}
+					if let Some(req_ts) = tp.bounds.typeset
+						&& declared.typeset != Some(req_ts)
+					{
+						return false;
+					}
+				}
+				None => {
+					for bound in tp.bounds.traits.iter() {
+						if self
+							.find_trait_impl(arg_ty, bound.trait_index)
+							.is_none()
+						{
+							return false;
+						}
+					}
+					if let Some(ts_index) = tp.bounds.typeset
+						&& !self.concrete_type_in_typeset(arg_ty, ts_index)
+					{
+						return false;
+					}
+				}
+			}
+		}
+		true
+	}
+
+	/// Does `inherent_impls[block_idx]`'s target apply to `receiver_ty`, and
+	/// if so what's the substitution? `None` if it doesn't apply at all,
+	/// including when a declared bound on an inferred (non-`INFER`) type arg
+	/// isn't satisfied.
+	///
+	/// Slots `unify_impl_target` couldn't resolve from the receiver stay
+	/// `TypeIndex::INFER` so the call site can still fill them in — not from
+	/// an explicit turbofish (that only ever fills a method's *own* generic
+	/// slots, never impl-inherited ones — see `own_start` in
+	/// `build_namespace_member_expression`), but from the call's own
+	/// arguments: `Holder::make(5)` with no turbofish on `Holder` passes a
+	/// namespace type whose own args are themselves still `INFER` at this
+	/// point, so `T` here stays `INFER` too until `build_generic_call_arguments`
+	/// infers it from the `5` argument afterward.
+	fn unify_inherent_impl_target(
+		&self,
+		block_idx: usize,
+		receiver_ty: TypeIndex,
+	) -> Option<Box<[TypeIndex]>> {
+		let block = &self.inherent_impls[block_idx];
+		let type_args = self.unify_impl_target(
+			block.type_params.len(),
+			block.target.inner,
+			receiver_ty,
+		)?;
+		self.type_args_satisfy_bounds(&block.type_params, &type_args)
+			.then_some(type_args)
+	}
+
+	/// Does `trait_impls[impl_idx]`'s target apply to `receiver_ty`, and if
+	/// so what's the substitution? `None` if it doesn't apply, including
+	/// when a declared bound on an inferred type arg isn't satisfied.
+	///
+	/// Unlike an inherent impl (see `unify_inherent_impl_target`), a trait
+	/// impl's type params are never reached through an unresolved namespace
+	/// type — every caller of `find_trait_impl` already has a fully-resolved
+	/// concrete receiver in hand, so the receiver is the only place a trait
+	/// impl's own type params can ever come from. So, unlike
+	/// `unify_inherent_impl_target`, any slot left `TypeIndex::INFER` after
+	/// `unify_impl_target` means this impl doesn't apply, full stop: letting
+	/// `INFER` through would eventually reach MIR/codegen, which must never
+	/// happen.
+	fn unify_trait_impl_target(
+		&self,
+		impl_idx: TraitImplIndex,
+		receiver_ty: TypeIndex,
+	) -> Option<Box<[TypeIndex]>> {
+		let imp = &self.trait_impls[impl_idx as usize];
+		let type_args = self.unify_impl_target(
+			imp.type_params.len(),
+			imp.target.inner,
+			receiver_ty,
+		)?;
+		if type_args.contains(&TypeIndex::INFER) {
+			return None;
+		}
+		self.type_args_satisfy_bounds(&imp.type_params, &type_args)
+			.then_some(type_args)
+	}
+
+	/// Finds the trait impl (concrete or generic) that makes `ty` implement
+	/// `trait_index`, if any, along with the type-arg substitution inferred
+	/// from `ty` (empty for a concrete impl). The single entry point for
+	/// every "does this specific trait apply here" query — associated-type
+	/// projection resolution, supertrait conformance checks, and `where`
+	/// bound checks all go through this rather than reading
+	/// `trait_impl_dispatch` directly.
+	pub fn find_trait_impl(
+		&self,
+		ty: TypeIndex,
+		trait_index: TraitIndex,
+	) -> Option<(TraitImplIndex, Box<[TypeIndex]>)> {
+		let kind = ImplTarget::from_type(&self.types[ty.as_usize()]).ok()?;
+		let &(_, idx) = self
+			.trait_impl_dispatch
+			.get(&kind)?
+			.iter()
+			.find(|(ti, _)| *ti == trait_index)?;
+		self.unify_trait_impl_target(idx, ty)
+			.map(|args| (idx, args))
 	}
 }
 

@@ -133,8 +133,10 @@ fn mark_node_inputs_live(
 		DataNodeKind::Add { left, right, .. }
 		| DataNodeKind::Sub { left, right, .. }
 		| DataNodeKind::Mul { left, right, .. }
-		| DataNodeKind::Div { left, right, .. }
-		| DataNodeKind::Rem { left, right, .. }
+		| DataNodeKind::DivS { left, right, .. }
+		| DataNodeKind::DivU { left, right, .. }
+		| DataNodeKind::RemS { left, right, .. }
+		| DataNodeKind::RemU { left, right, .. }
 		| DataNodeKind::BitAnd { left, right, .. }
 		| DataNodeKind::BitOr { left, right, .. }
 		| DataNodeKind::BitXor { left, right, .. }

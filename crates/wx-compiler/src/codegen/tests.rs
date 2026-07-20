@@ -17,7 +17,7 @@ struct TestCase {
 	bytecode: Vec<u8>,
 }
 
-impl<'case> TestCase {
+impl TestCase {
 	fn new(source: &str) -> Self {
 		let mut builder = vfs::CompilationGraphBuilder::new();
 		let stdlib_id = builder.load_stdlib();
@@ -2618,4 +2618,207 @@ fn test_address_of_wat() {
     "});
 	assert!(case.tir.diagnostics.is_empty());
 	insta::assert_snapshot!(wasmprinter::print_bytes(&case.bytecode).unwrap());
+}
+
+/// A `Size = u64` memory must be declared as a 64-bit (memory64) linear
+/// memory — limits flags 0x04/0x05 — and pointers into it must be i64
+/// end-to-end: signature valtypes, locals, and load/store address
+/// operands. The module fails wasm validation if any of those disagree
+/// with the memory declaration.
+#[test]
+fn test_memory64_pointer_roundtrip() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u64 } { min_pages: 1 };
+
+        fn store_load(p: heap::*mut u64) -> u64 {
+            p.* = 7;
+            p.*
+        }
+
+        export { store_load }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let store_load = instance
+		.get_typed_func::<u64, u64>(&mut store, "store_load")
+		.expect("Failed to get store_load function");
+	assert_eq!(store_load.call(&mut store, 64).unwrap(), 7);
+}
+
+/// Memory64 corners beyond plain pointers: `memory.size`/`memory.grow`
+/// take and return i64 page counts, static data needs an `i64.const`
+/// segment-offset init expression, string slices are `{i64 ptr, i64 len}`,
+/// and `DATA_END` is an i64 constant.
+#[test]
+fn test_memory64_size_grow_and_static_data() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u64 } { min_pages: 1 };
+
+        fn size_pages() -> u64 { heap.size() }
+        fn grow_one() -> u64 { heap.grow(1) }
+        fn msg() -> heap::[]u8 { \"hello\" }
+        fn data_end() -> heap::*u8 { heap::DATA_END }
+
+        export { size_pages, grow_one, msg, data_end }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let size_pages = instance
+		.get_typed_func::<(), u64>(&mut store, "size_pages")
+		.unwrap();
+	let grow_one = instance
+		.get_typed_func::<(), u64>(&mut store, "grow_one")
+		.unwrap();
+	let msg = instance
+		.get_typed_func::<(), (u64, u64)>(&mut store, "msg")
+		.unwrap();
+	let data_end = instance
+		.get_typed_func::<(), u64>(&mut store, "data_end")
+		.unwrap();
+
+	assert_eq!(size_pages.call(&mut store, ()).unwrap(), 1);
+	assert_eq!(
+		grow_one.call(&mut store, ()).unwrap(),
+		1,
+		"grow returns old size"
+	);
+	assert_eq!(size_pages.call(&mut store, ()).unwrap(), 2);
+	let (ptr, len) = msg.call(&mut store, ()).unwrap();
+	assert_eq!((ptr, len), (0, 5), "static \"hello\" at offset 0");
+	assert_eq!(data_end.call(&mut store, ()).unwrap(), 5);
+}
+
+/// Static data goes to the memory named by the literal's type: one data
+/// segment per memory, per-memory `DATA_END`, and the bytes readable from
+/// the right memory at runtime. Only segments targeting memory index > 0
+/// use the multi-memory flags-2 encoding — the memory-0 segment keeps the
+/// extension-free form.
+#[test]
+fn test_multi_memory_static_data() {
+	let case = TestCase::new(indoc! {"
+        memory first: Memory where { Size = u32 } { min_pages: 1 };
+        memory second: Memory where { Size = u32 } { min_pages: 1 };
+
+        fn greet_first() -> first::[]u8 { \"hello\" }
+        fn greet_second() -> second::[]u8 { \"world!!\" }
+        fn end_first() -> first::*u8 { first::DATA_END }
+        fn end_second() -> second::*u8 { second::DATA_END }
+
+        export {
+            first,
+            second,
+            greet_first,
+            greet_second,
+            end_first,
+            end_second,
+        }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let greet_first = instance
+		.get_typed_func::<(), (u32, u32)>(&mut store, "greet_first")
+		.unwrap();
+	let greet_second = instance
+		.get_typed_func::<(), (u32, u32)>(&mut store, "greet_second")
+		.unwrap();
+	let end_first = instance
+		.get_typed_func::<(), u32>(&mut store, "end_first")
+		.unwrap();
+	let end_second = instance
+		.get_typed_func::<(), u32>(&mut store, "end_second")
+		.unwrap();
+
+	let (ptr, len) = greet_first.call(&mut store, ()).unwrap();
+	let first_mem = instance.get_memory(&mut store, "first").unwrap();
+	assert_eq!(
+		&first_mem.data(&store)[ptr as usize..(ptr + len) as usize],
+		b"hello"
+	);
+
+	let (ptr, len) = greet_second.call(&mut store, ()).unwrap();
+	let second_mem = instance.get_memory(&mut store, "second").unwrap();
+	assert_eq!(
+		&second_mem.data(&store)[ptr as usize..(ptr + len) as usize],
+		b"world!!"
+	);
+
+	assert_eq!(end_first.call(&mut store, ()).unwrap(), 5);
+	assert_eq!(end_second.call(&mut store, ()).unwrap(), 7);
+}
+
+/// `u32` lowers to wasm `i32`, so instruction selection must pick the
+/// unsigned opcode variants (`i32.gt_u`, `i32.div_u`, `i32.rem_u`,
+/// `i32.shr_u`). Every input below produces a different result under the
+/// signed and unsigned interpretation of the same bits.
+#[test]
+fn test_u32_arithmetic_is_unsigned() {
+	let case = TestCase::new(indoc! {"
+        fn gt(a: u32, b: u32) -> bool { a > b }
+        fn div(a: u32, b: u32) -> u32 { a / b }
+        fn rem(a: u32, b: u32) -> u32 { a % b }
+        fn shr(a: u32, b: u32) -> u32 { a >> b }
+
+        export { gt, div, rem, shr }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let gt = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "gt")
+		.unwrap();
+	assert_eq!(
+		gt.call(&mut store, (1, u32::MAX as i32)).unwrap(),
+		0,
+		"gt(1, u32::MAX): 1 > 4294967295 must be false (i32.gt_u)"
+	);
+
+	let div = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "div")
+		.unwrap();
+	assert_eq!(
+		div.call(&mut store, (0x8000_0000u32 as i32, 2)).unwrap() as u32,
+		0x4000_0000,
+		"div(0x80000000, 2) must divide unsigned (i32.div_u)"
+	);
+
+	let rem = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "rem")
+		.unwrap();
+	assert_eq!(
+		rem.call(&mut store, (u32::MAX as i32, 10)).unwrap() as u32,
+		u32::MAX % 10,
+		"rem(u32::MAX, 10) must take the remainder unsigned (i32.rem_u)"
+	);
+
+	let shr = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "shr")
+		.unwrap();
+	assert_eq!(
+		shr.call(&mut store, (0x8000_0000u32 as i32, 1)).unwrap() as u32,
+		0x4000_0000,
+		"shr(0x80000000, 1) must shift in a zero bit (i32.shr_u)"
+	);
 }

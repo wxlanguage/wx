@@ -216,12 +216,17 @@ impl<'mir> Builder<'mir> {
 			ExprKind::StaticPointer { data_index } => {
 				let node = self.node(DataNodeKind::StaticDataRef {
 					data_index: *data_index,
+					ty: ScalarType::try_from(expr.ty)
+						.expect("static pointer must be scalar"),
 				});
 				StackResult::Value(node)
 			}
 			ExprKind::MemoryOffset { memory } => {
-				let node =
-					self.node(DataNodeKind::MemoryOffset { memory: *memory });
+				let node = self.node(DataNodeKind::MemoryOffset {
+					memory: *memory,
+					ty: ScalarType::try_from(expr.ty)
+						.expect("memory offset must be scalar"),
+				});
 				StackResult::Value(node)
 			}
 			ExprKind::MemoryIndex { memory } => {
@@ -230,8 +235,11 @@ impl<'mir> Builder<'mir> {
 				StackResult::Value(node)
 			}
 			ExprKind::MemorySize { memory } => {
-				let result_node = self
-					.node(DataNodeKind::MemorySizeResult { memory: *memory });
+				let result_node = self.node(DataNodeKind::MemorySizeResult {
+					memory: *memory,
+					ty: ScalarType::try_from(expr.ty)
+						.expect("memory.size result must be scalar"),
+				});
 				self.push_stmt(
 					block_idx,
 					ControlNode::MemorySize {
@@ -242,208 +250,30 @@ impl<'mir> Builder<'mir> {
 				StackResult::Value(result_node)
 			}
 
-			// ── Arithmetic ────────────────────────────────────────────────
-			ExprKind::Add { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Add {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::Sub { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Sub {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::Mul { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Mul {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::Div { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Div {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::Rem { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Rem {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-
-			// ── Bitwise ───────────────────────────────────────────────────
-			ExprKind::And { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::BitAnd {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::Or { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::BitOr {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::BitAnd { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::BitAnd {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::BitOr { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::BitOr {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::BitXor { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::BitXor {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::LeftShift { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::Shl {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
-			ExprKind::RightShift { left, right } => self.build_binary(
-				block_idx,
-				bindings,
-				left,
-				right,
-				expr.ty,
-				|l, r, ty| DataNodeKind::ShrS {
-					left: l,
-					right: r,
-					ty,
-				},
-			),
+			// ── Binary operators ──────────────────────────────────────────
+			ExprKind::Add { left, right }
+			| ExprKind::Sub { left, right }
+			| ExprKind::Mul { left, right }
+			| ExprKind::Div { left, right }
+			| ExprKind::Rem { left, right }
+			| ExprKind::And { left, right }
+			| ExprKind::Or { left, right }
+			| ExprKind::BitAnd { left, right }
+			| ExprKind::BitOr { left, right }
+			| ExprKind::BitXor { left, right }
+			| ExprKind::LeftShift { left, right }
+			| ExprKind::RightShift { left, right } => {
+				self.build_binary(block_idx, bindings, expr, left, right)
+			}
 
 			// ── Comparisons ───────────────────────────────────────────────
-			ExprKind::Eq { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::Eq {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
-			}
-			ExprKind::NotEq { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::NotEq {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
-			}
-			ExprKind::Less { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::LtS {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
-			}
-			ExprKind::LessEq { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::LtEqS {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
-			}
-			ExprKind::Greater { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::GtS {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
-			}
-			ExprKind::GreaterEq { left, right } => {
-				self.build_cmp(block_idx, bindings, left, right, |l, r, ty| {
-					DataNodeKind::GtEqS {
-						left: l,
-						right: r,
-						ty,
-					}
-				})
+			ExprKind::Eq { left, right }
+			| ExprKind::NotEq { left, right }
+			| ExprKind::Less { left, right }
+			| ExprKind::LessEq { left, right }
+			| ExprKind::Greater { left, right }
+			| ExprKind::GreaterEq { left, right } => {
+				self.build_cmp(block_idx, bindings, expr, left, right)
 			}
 
 			// ── Unary ─────────────────────────────────────────────────────
@@ -816,6 +646,8 @@ impl<'mir> Builder<'mir> {
 				let result_node = self.node(DataNodeKind::MemoryGrowResult {
 					memory: *memory,
 					delta: delta_node,
+					ty: ScalarType::try_from(expr.ty)
+						.expect("memory.grow result must be scalar"),
 				});
 				self.push_stmt(
 					block_idx,
@@ -883,7 +715,7 @@ impl<'mir> Builder<'mir> {
 	fn build_block_expr(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut [StackResult],
 		scope_index: mir::ScopeIndex,
 		expressions: &[mir::Expression],
 	) -> StackResult {
@@ -975,7 +807,7 @@ impl<'mir> Builder<'mir> {
 	fn build_loop(
 		&mut self,
 		parent_block: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut [StackResult],
 		_scope_index: mir::ScopeIndex,
 		body_expr: &mir::Expression,
 	) -> StackResult {
@@ -1175,7 +1007,7 @@ impl<'mir> Builder<'mir> {
 		i: usize,
 		loop_params: &[StackResult],
 		loop_final: &[StackResult],
-		parent_bindings: &mut Vec<StackResult>,
+		parent_bindings: &mut [StackResult],
 		outputs: &mut Vec<DataNodeIndex>,
 	) {
 		let param = match loop_params[i] {
@@ -1256,7 +1088,7 @@ impl<'mir> Builder<'mir> {
 		then_bindings: &[StackResult],
 		else_bindings: &[StackResult],
 		parent_len: usize,
-		parent_bindings: &mut Vec<StackResult>,
+		parent_bindings: &mut [StackResult],
 		outputs: &mut Vec<DataNodeIndex>,
 	) -> StackResult {
 		for i in 0..parent_len {
@@ -1424,36 +1256,82 @@ impl<'mir> Builder<'mir> {
 		result
 	}
 
+	/// Arithmetic, bitwise, and shift operators. WASM has separate signed
+	/// and unsigned instructions for division, remainder, and right shift;
+	/// `ScalarType` can't tell them apart (`u32` and `i32` are both `I32`
+	/// there), so the node kind is chosen from the MIR type. Unsigned
+	/// integers and pointers take the `_u` variants; floats keep the `S`
+	/// kinds, which the scheduler maps to the sign-free float instructions.
 	fn build_binary(
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<StackResult>,
-		left: &mir::Expression,
-		right: &mir::Expression,
-		result_ty: mir::Type,
-		make: impl FnOnce(DataNodeIndex, DataNodeIndex, ScalarType) -> DataNodeKind,
+		expr: &mir::Expression,
+		lhs: &mir::Expression,
+		rhs: &mir::Expression,
 	) -> StackResult {
+		use DataNodeKind as N;
+		use mir::ExprKind as E;
+
 		let ty =
-			ScalarType::try_from(result_ty).expect("binary op must be scalar");
-		let l = self.build_expr(block_idx, bindings, left).unwrap_value();
-		let r = self.build_expr(block_idx, bindings, right).unwrap_value();
-		StackResult::Value(self.node(make(l, r, ty)))
+			ScalarType::try_from(expr.ty).expect("binary op must be scalar");
+		let unsigned = expr.ty.is_unsigned();
+		let left = self.build_expr(block_idx, bindings, lhs).unwrap_value();
+		let right = self.build_expr(block_idx, bindings, rhs).unwrap_value();
+
+		let kind = match &expr.kind {
+			E::Add { .. } => N::Add { left, right, ty },
+			E::Sub { .. } => N::Sub { left, right, ty },
+			E::Mul { .. } => N::Mul { left, right, ty },
+			E::Div { .. } if unsigned => N::DivU { left, right, ty },
+			E::Div { .. } => N::DivS { left, right, ty },
+			E::Rem { .. } if unsigned => N::RemU { left, right, ty },
+			E::Rem { .. } => N::RemS { left, right, ty },
+			E::And { .. } | E::BitAnd { .. } => N::BitAnd { left, right, ty },
+			E::Or { .. } | E::BitOr { .. } => N::BitOr { left, right, ty },
+			E::BitXor { .. } => N::BitXor { left, right, ty },
+			E::LeftShift { .. } => N::Shl { left, right, ty },
+			E::RightShift { .. } if unsigned => N::ShrU { left, right, ty },
+			E::RightShift { .. } => N::ShrS { left, right, ty },
+			_ => unreachable!("build_binary called on a non-binary ExprKind"),
+		};
+		StackResult::Value(self.node(kind))
 	}
 
+	/// Comparison operators. Like `build_binary`, the signed/unsigned
+	/// choice comes from the MIR type — but from the *operands*, since the
+	/// result is always Bool. The `ScalarType` likewise comes from the
+	/// built operand node.
 	fn build_cmp(
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<StackResult>,
-		left: &mir::Expression,
-		right: &mir::Expression,
-		make: impl FnOnce(DataNodeIndex, DataNodeIndex, ScalarType) -> DataNodeKind,
+		expr: &mir::Expression,
+		lhs: &mir::Expression,
+		rhs: &mir::Expression,
 	) -> StackResult {
-		// Comparison operand type comes from the operands, not the result (which is
-		// always I32).
-		let l = self.build_expr(block_idx, bindings, left).unwrap_value();
-		let r = self.build_expr(block_idx, bindings, right).unwrap_value();
-		let operand_ty = self.func.data_nodes[l as usize].kind.unwrap_scalar();
-		StackResult::Value(self.node(make(l, r, operand_ty)))
+		use DataNodeKind as N;
+		use mir::ExprKind as E;
+
+		let unsigned = lhs.ty.is_unsigned();
+		let left = self.build_expr(block_idx, bindings, lhs).unwrap_value();
+		let right = self.build_expr(block_idx, bindings, rhs).unwrap_value();
+		let ty = self.func.data_nodes[left as usize].kind.unwrap_scalar();
+
+		let kind = match &expr.kind {
+			E::Eq { .. } => N::Eq { left, right, ty },
+			E::NotEq { .. } => N::NotEq { left, right, ty },
+			E::Less { .. } if unsigned => N::LtU { left, right, ty },
+			E::Less { .. } => N::LtS { left, right, ty },
+			E::LessEq { .. } if unsigned => N::LtEqU { left, right, ty },
+			E::LessEq { .. } => N::LtEqS { left, right, ty },
+			E::Greater { .. } if unsigned => N::GtU { left, right, ty },
+			E::Greater { .. } => N::GtS { left, right, ty },
+			E::GreaterEq { .. } if unsigned => N::GtEqU { left, right, ty },
+			E::GreaterEq { .. } => N::GtEqS { left, right, ty },
+			_ => unreachable!("build_cmp called on a non-comparison ExprKind"),
+		};
+		StackResult::Value(self.node(kind))
 	}
 
 	/// Flat index into `data_bindings` for a MIR (scope_index, local_index)
@@ -1687,8 +1565,10 @@ impl<'mir> Builder<'mir> {
 			DataNodeKind::Add { left, right, ty } => (left, right, ty),
 			DataNodeKind::Sub { left, right, ty } => (left, right, ty),
 			DataNodeKind::Mul { left, right, ty } => (left, right, ty),
-			DataNodeKind::Div { left, right, ty } => (left, right, ty),
-			DataNodeKind::Rem { left, right, ty } => (left, right, ty),
+			DataNodeKind::DivS { left, right, ty } => (left, right, ty),
+			DataNodeKind::DivU { left, right, ty } => (left, right, ty),
+			DataNodeKind::RemS { left, right, ty } => (left, right, ty),
+			DataNodeKind::RemU { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitAnd { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitOr { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitXor { left, right, ty } => (left, right, ty),
@@ -1705,10 +1585,34 @@ impl<'mir> Builder<'mir> {
 			DataNodeKind::Add { .. } => l.wrapping_add(r),
 			DataNodeKind::Sub { .. } => l.wrapping_sub(r),
 			DataNodeKind::Mul { .. } => l.wrapping_mul(r),
-			DataNodeKind::Div { .. } if r == 0 => return None,
-			DataNodeKind::Div { .. } => l.wrapping_div(r),
-			DataNodeKind::Rem { .. } if r == 0 => return None,
-			DataNodeKind::Rem { .. } => l.wrapping_rem(r),
+			DataNodeKind::DivS { .. } | DataNodeKind::RemS { .. } if r == 0 => {
+				return None;
+			}
+			DataNodeKind::DivU { .. } | DataNodeKind::RemU { .. } if r == 0 => {
+				return None;
+			}
+			// Signed div can trap (INT_MIN / -1); leave that to runtime.
+			DataNodeKind::DivS { .. } => match ty {
+				ScalarType::I32 => (l as i32).checked_div(r as i32)? as i64,
+				ScalarType::I64 => l.checked_div(r)?,
+				_ => return None,
+			},
+			DataNodeKind::DivU { .. } => match ty {
+				ScalarType::I32 => ((l as u32) / (r as u32)) as i32 as i64,
+				ScalarType::I64 => ((l as u64) / (r as u64)) as i64,
+				_ => return None,
+			},
+			// WASM rem_s(INT_MIN, -1) is defined as 0, matching wrapping_rem.
+			DataNodeKind::RemS { .. } => match ty {
+				ScalarType::I32 => (l as i32).wrapping_rem(r as i32) as i64,
+				ScalarType::I64 => l.wrapping_rem(r),
+				_ => return None,
+			},
+			DataNodeKind::RemU { .. } => match ty {
+				ScalarType::I32 => ((l as u32) % (r as u32)) as i32 as i64,
+				ScalarType::I64 => ((l as u64) % (r as u64)) as i64,
+				_ => return None,
+			},
 			DataNodeKind::BitAnd { .. } => l & r,
 			DataNodeKind::BitOr { .. } => l | r,
 			DataNodeKind::BitXor { .. } => l ^ r,
@@ -1775,7 +1679,8 @@ impl<'mir> Builder<'mir> {
 					return Some(right);
 				}
 			}
-			DataNodeKind::Div { left, right, .. } => {
+			DataNodeKind::DivS { left, right, .. }
+			| DataNodeKind::DivU { left, right, .. } => {
 				if one(right) {
 					return Some(left);
 				}

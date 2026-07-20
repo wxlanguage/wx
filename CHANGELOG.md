@@ -8,6 +8,74 @@ CLI, and LSP are released in lockstep) rather than per-crate. Editor
 integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
 live in their own repos with independent versioning.
 
+## [0.2.0] - 2026-07-20
+
+### Changed
+
+- **Breaking:** a trait may now have at most one implementation per type
+  constructor. `impl Trait for Box<i32>` and `impl Trait for Box<u8>` (or
+  two differently-bounded generic impls of the same trait for the same
+  struct) now conflict at declaration time, reported as `E1061`, even if
+  the conflicting impls are never actually called. This replaces the
+  previous behavior of allowing multiple same-trait impls to coexist and
+  resolving/erroring on ambiguity lazily at the call site.
+
+### Added
+
+- Language: generic trait impls — `impl<T> Trait for Type<T>`, including
+  bounded params (`impl<T: Foo> Bar for Vec<T>`), with full support for
+  monomorphization and associated-type substitution through the impl.
+- Language: `Allocator` trait in the standard library (`type M: Memory`,
+  `reserve`, `alloc<T>`, `alloc_slice<T>`), giving custom allocators
+  (e.g. bump allocators) a standard interface.
+- Language: the unused-variable warning no longer fires for
+  underscore-prefixed names (`_foo`) or an unused `self` receiver,
+  matching Rust's convention.
+- WASM: correct pointer-width handling for `Memory64`-declared memories —
+  pointers, `memory.size`/`memory.grow`, and static data offsets now use
+  64-bit addressing where required instead of always emitting 32-bit
+  code (which produced invalid WASM). Static data placement is also now
+  correctly per-memory in multi-memory modules, instead of always
+  landing in memory 0.
+- Language Server: go-to-implementation (`textDocument/implementation`);
+  proper hover/goto-definition/highlighting for `self` and `Self`;
+  `memory` declarations are now indexed (hover/goto-def previously did
+  nothing for them); completions after `::` for enums, structs, traits,
+  and namespaces.
+
+### Fixed
+
+- A real correctness bug where unsigned (`u32`/`u64`) comparisons,
+  right-shifts, division, and remainder were compiled using signed WASM
+  instructions, producing wrong results for values that differ under
+  signed vs. unsigned interpretation.
+- A parser panic (`unreachable!()`) on malformed label syntax reachable
+  from ordinary mid-edit states (e.g. `std::io:` while typing
+  `std::io::`) — now reports a normal diagnostic (`E0014`) instead of
+  crashing.
+- A type-checker bug where a pointer type referenced before its
+  `memory` declaration's own signature had resolved (e.g. inside an
+  earlier `import` block) could be interned as a distinct, identical-
+  looking type, producing confusing "expected `heap::*mut u32`, found
+  `heap::*mut u32`" diagnostics.
+- A MIR lowering crash ("no impl found for associated type projection")
+  when a trait's default generic method used an associated `Memory`
+  type in its own signature (as the new `Allocator` trait does).
+- A false-positive "unused function" warning for trait methods only
+  ever reached through dynamic dispatch (a trait default calling an
+  abstract method on `Self`).
+- Formatter: attributes (e.g. `#[tag = "..."]`) on `typeset` items were
+  silently dropped when formatting; generic params on a trait impl
+  (`impl<T> Trait for Type<T>`) were also being dropped.
+- Formatter: comments inside an otherwise-empty `{}` body, and
+  leading/gap/trailing comments around import/export entries, were
+  being dropped.
+- Language Server: associated consts without a body (a trait's own
+  abstract `const`, or a memory's synthesized consts) were invisible to
+  hover/goto-def; type-annotation completions incorrectly offered
+  functions and constants; bare enum variants leaked into plain-
+  identifier completion.
+
 ## [0.1.1] - 2026-07-11
 
 ### Added

@@ -55,10 +55,10 @@ fn function_block(ast: &AST, index: usize) -> &[Separated<Spanned<Statement>>] {
 	statements
 }
 
-fn statement_expression<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn statement_expression(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Expression {
+) -> &Expression {
 	let Statement::Expression(expr) = &statements[index].inner.inner else {
 		panic!("expected expression statement")
 	};
@@ -66,10 +66,10 @@ fn statement_expression<'a>(
 	&expr.inner
 }
 
-fn local_definition_value<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn local_definition_value(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Expression {
+) -> &Expression {
 	let Statement::LocalDefinition { value, .. } =
 		&statements[index].inner.inner
 	else {
@@ -79,10 +79,10 @@ fn local_definition_value<'a>(
 	&value.inner
 }
 
-fn local_definition_pattern<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn local_definition_pattern(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Pattern {
+) -> &Pattern {
 	let Statement::LocalDefinition { pattern, .. } =
 		&statements[index].inner.inner
 	else {
@@ -396,6 +396,21 @@ fn test_label_requires_block_like_expression() {
 
 	assert_eq!(diagnostic_codes(&case.ast), vec!["E0006"]);
 	assert!(function_block(&case.ast, 0).is_empty());
+}
+
+#[test]
+fn test_multi_segment_label_reports_diagnostic_instead_of_panicking() {
+	// A partially-typed namespace access (`std::io` followed by a lone `:`
+	// while typing the second `::`) parses as a multi-segment path immediately
+	// followed by a colon, which used to hit `unreachable!()` in
+	// `parse_labelled_expression`.
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            std::io:
+        }
+    "});
+
+	assert_eq!(diagnostic_codes(&case.ast), vec!["E0014"]);
 }
 
 #[test]
@@ -979,7 +994,7 @@ fn test_module_pub_items_and_associated_types() {
 			)
 	));
 
-	let Item::ImplTrait {
+	let Item::TraitImpl {
 		items: impl_items, ..
 	} = item(&case.ast, 3)
 	else {
@@ -1225,7 +1240,7 @@ fn test_impl_trait_multi_segment_trait_name() {
         }
     "});
 	assert!(case.ast.diagnostics.is_empty());
-	let Item::ImplTrait { trait_name, .. } = item(&case.ast, 0) else {
+	let Item::TraitImpl { trait_name, .. } = item(&case.ast, 0) else {
 		panic!("expected ImplTrait")
 	};
 	assert_eq!(

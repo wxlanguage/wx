@@ -300,7 +300,7 @@ pub enum ImportDesc {
 		mutability: Mutability,
 	},
 	Memory {
-		memory_type: MemoryType,
+		memory: Memory,
 	},
 }
 
@@ -340,6 +340,8 @@ pub struct WasmModule {
 struct MemoryEntry {
 	wasm_index: u32,
 	kind: mir::MemoryKind,
+	/// Total size (bytes) of this memory's static data segment.
+	static_size: u32,
 }
 
 pub struct Builder {
@@ -347,8 +349,6 @@ pub struct Builder {
 	/// Byte offset of each live static entry in the assembled data segment.
 	/// Keyed by `MIR.static_entries` index.
 	entry_offsets: HashMap<u32, u32>,
-	/// Total size (bytes) of the assembled static data segment.
-	static_segment_size: u32,
 	/// Maps every function DefId (imported or defined) to its wasm function
 	/// index. Imported functions occupy indices 0..import_func_count;
 	/// defined functions follow.
@@ -377,9 +377,12 @@ impl TryFrom<mir::Type> for ValueType {
 			| mir::Type::U16
 			| mir::Type::I32
 			| mir::Type::U32
-			| mir::Type::Pointer { .. }
 			| mir::Type::Function { .. } => Ok(ValueType::I32),
 			mir::Type::I64 | mir::Type::U64 => Ok(ValueType::I64),
+			mir::Type::Pointer { kind, .. } => match kind {
+				mir::MemoryKind::Memory32 => Ok(ValueType::I32),
+				mir::MemoryKind::Memory64 => Ok(ValueType::I64),
+			},
 			mir::Type::F32 => Ok(ValueType::F32),
 			mir::Type::F64 => Ok(ValueType::F64),
 			_ => unreachable!(),
@@ -445,23 +448,23 @@ impl Builder {
 				.align
 				.cmp(&mir.static_entries[a as usize].align)
 		});
-		let mut segment_bytes: Vec<u8> = Vec::new();
+		// One segment per memory that has static data; an entry's offset is
+		// relative to its own memory's segment.
+		let mut segment_bytes: HashMap<ast::DefId, Vec<u8>> = HashMap::new();
 		let mut entry_offsets: HashMap<u32, u32> = HashMap::new();
 		for idx in sorted_indices {
 			let entry = &mir.static_entries[idx as usize];
-			let current = segment_bytes.len() as u32;
+			let bytes = segment_bytes.entry(entry.memory).or_default();
+			let current = bytes.len() as u32;
 			let aligned = current.next_multiple_of(entry.align);
-			segment_bytes
-				.extend(std::iter::repeat_n(0, (aligned - current) as usize));
-			entry_offsets.insert(idx, segment_bytes.len() as u32);
-			segment_bytes.extend_from_slice(&entry.bytes);
+			bytes.extend(std::iter::repeat_n(0, (aligned - current) as usize));
+			entry_offsets.insert(idx, bytes.len() as u32);
+			bytes.extend_from_slice(&entry.bytes);
 		}
-		let static_segment_size = segment_bytes.len() as u32;
 
 		let mut builder = Builder {
 			table: Vec::new(),
 			entry_offsets,
-			static_segment_size,
 			func_wasm_index: HashMap::new(),
 			global_wasm_index: HashMap::new(),
 			memories: HashMap::new(),
@@ -479,6 +482,9 @@ impl Builder {
 					MemoryEntry {
 						wasm_index: idx as u32,
 						kind: m.kind,
+						static_size: segment_bytes
+							.get(&m.id)
+							.map_or(0, |b| b.len() as u32),
 					},
 				);
 			}
@@ -524,13 +530,16 @@ impl Builder {
 						builder.global_wasm_index.insert(*id, next_global_idx);
 						next_global_idx += 1;
 					}
-					mir::ImportModuleItem::Memory { name, .. } => {
+					mir::ImportModuleItem::Memory { name, id } => {
 						imports.push(Import {
 							module: import_module.name.clone(),
 							name: interner.resolve(*name).unwrap().to_string(),
 							desc: ImportDesc::Memory {
-								memory_type: MemoryType::Unbounded {
-									initial: 0,
+								memory: Memory {
+									limits: MemoryLimits::Unbounded {
+										initial_pages: 0,
+									},
+									kind: builder.memories[id].kind,
 								},
 							},
 						});
@@ -628,31 +637,30 @@ impl Builder {
 			func_index: builder.func_wasm_index[&id],
 		});
 
-		let required_pages = match static_segment_size {
-			0 => 0,
-			len => len.div_ceil(65536),
-		};
-		let imported_memory_count = mir
-			.imports
-			.iter()
-			.flat_map(|m| m.items.iter())
-			.filter(|item| matches!(item, mir::ImportModuleItem::Memory { .. }))
-			.count() as u32;
 		let memories = mir
 			.memories
 			.iter()
-			.enumerate()
-			.map(|(i, info)| {
-				let initial = info.min_pages.unwrap_or(0).max(
-					if i == 0 && imported_memory_count == 0 {
-						required_pages
-					} else {
-						0
+			.map(|info| {
+				// A defined memory must be large enough for its own static
+				// data; an imported memory's size is the host's business.
+				let required_pages = match info.source {
+					mir::MemorySource::External => 0,
+					mir::MemorySource::Internal => {
+						builder.memories[&info.id].static_size.div_ceil(65536)
+					}
+				};
+				let initial = info.min_pages.unwrap_or(0).max(required_pages);
+				Memory {
+					limits: match info.max_pages {
+						Some(max) => MemoryLimits::Bounded {
+							initial_pages: initial,
+							max_pages: max,
+						},
+						None => MemoryLimits::Unbounded {
+							initial_pages: initial,
+						},
 					},
-				);
-				match info.max_pages {
-					Some(max) => MemoryType::Bounded { initial, max },
-					None => MemoryType::Unbounded { initial },
+					kind: info.kind,
 				}
 			})
 			.collect();
@@ -673,14 +681,19 @@ impl Builder {
 				imports: imports.into_boxed_slice(),
 			},
 			data: DataSection {
-				segments: if segment_bytes.is_empty() {
-					Box::new([])
-				} else {
-					Box::new([DataSegment {
-						memory_index: 0,
-						offset: 0,
-						bytes: segment_bytes.into_boxed_slice(),
-					}])
+				segments: {
+					let mut segments: Vec<DataSegment> = segment_bytes
+						.into_iter()
+						.filter(|(_, bytes)| !bytes.is_empty())
+						.map(|(id, bytes)| DataSegment {
+							memory_index: builder.memories[&id].wasm_index,
+							offset: 0,
+							memory_kind: builder.memories[&id].kind,
+							bytes: bytes.into_boxed_slice(),
+						})
+						.collect();
+					segments.sort_by_key(|s| s.memory_index);
+					segments.into_boxed_slice()
 				},
 			},
 			memory: MemorySection { memories },
@@ -796,7 +809,9 @@ impl Builder {
 			SI::I32Sub => sink.push(Instruction::I32Sub as u8),
 			SI::I32Mul => sink.push(Instruction::I32Mul as u8),
 			SI::I32DivS => sink.push(Instruction::I32DivS as u8),
+			SI::I32DivU => sink.push(Instruction::I32DivU as u8),
 			SI::I32RemS => sink.push(Instruction::I32RemS as u8),
+			SI::I32RemU => sink.push(Instruction::I32RemU as u8),
 			SI::I32And => sink.push(Instruction::I32And as u8),
 			SI::I32Or => sink.push(Instruction::I32Or as u8),
 			SI::I32Xor => sink.push(Instruction::I32Xor as u8),
@@ -820,7 +835,9 @@ impl Builder {
 			SI::I64Sub => sink.push(Instruction::I64Sub as u8),
 			SI::I64Mul => sink.push(Instruction::I64Mul as u8),
 			SI::I64DivS => sink.push(Instruction::I64DivS as u8),
+			SI::I64DivU => sink.push(Instruction::I64DivU as u8),
 			SI::I64RemS => sink.push(Instruction::I64RemS as u8),
+			SI::I64RemU => sink.push(Instruction::I64RemU as u8),
 			SI::I64And => sink.push(Instruction::I64And as u8),
 			SI::I64Or => sink.push(Instruction::I64Or as u8),
 			SI::I64Xor => sink.push(Instruction::I64Xor as u8),
@@ -1040,20 +1057,29 @@ impl Builder {
 				sink.push(Instruction::I32Const as u8);
 				table_idx.encode(sink);
 			}
-			SI::StaticDataPointer(data_index) => {
+			SI::StaticDataPointer { data_index, ty } => {
 				let offset = self.entry_offsets[&data_index];
-				sink.push(Instruction::I32Const as u8);
-				(offset as i32).encode(sink);
+				match ty {
+					crate::opt::ScalarType::I64 => {
+						sink.push(Instruction::I64Const as u8);
+						(offset as i64).encode(sink);
+					}
+					_ => {
+						sink.push(Instruction::I32Const as u8);
+						(offset as i32).encode(sink);
+					}
+				}
 			}
 			SI::DataSectionEnd { memory } => {
-				match self.memories[&memory].kind {
+				let entry = &self.memories[&memory];
+				match entry.kind {
 					mir::MemoryKind::Memory32 => {
 						sink.push(Instruction::I32Const as u8);
-						(self.static_segment_size as i32).encode(sink);
+						(entry.static_size as i32).encode(sink);
 					}
 					mir::MemoryKind::Memory64 => {
 						sink.push(Instruction::I64Const as u8);
-						(self.static_segment_size as i64).encode(sink);
+						(entry.static_size as i64).encode(sink);
 					}
 				}
 			}
@@ -1456,9 +1482,9 @@ impl Encode for ImportSection {
 						Mutability::Mutable => section_sink.push(0x01),
 					}
 				}
-				ImportDesc::Memory { memory_type } => {
+				ImportDesc::Memory { memory } => {
 					section_sink.push(0x02); // Memory import kind
-					memory_type.encode(&mut section_sink);
+					memory.encode(&mut section_sink);
 				}
 			}
 		}
@@ -1761,16 +1787,35 @@ impl Encode for DataSection {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct DataSegment {
 	pub memory_index: u32,
-	pub offset: u32, // i32.const offset expr in wasm binary
+	pub offset: u32,
+	/// Width of the target memory: the offset init expression must be an
+	/// `i64.const` for a 64-bit memory, `i32.const` otherwise.
+	pub memory_kind: mir::MemoryKind,
 	pub bytes: Box<[u8]>,
 }
 
 impl Encode for DataSegment {
 	fn encode(&self, sink: &mut Vec<u8>) {
-		self.memory_index.encode(sink);
-		// offset is encoded as i32.const offset followed by end opcode
-		sink.push(Instruction::I32Const as u8);
-		self.offset.encode(sink);
+		// Segment flags: 0 = active in memory 0; 2 = active with an
+		// explicit memory index (multi-memory). Never emit flags 2 for
+		// memory 0 so single-memory modules stay extension-free.
+		if self.memory_index == 0 {
+			0u32.encode(sink);
+		} else {
+			2u32.encode(sink);
+			self.memory_index.encode(sink);
+		}
+		// offset is encoded as a const init expr followed by end opcode
+		match self.memory_kind {
+			mir::MemoryKind::Memory32 => {
+				sink.push(Instruction::I32Const as u8);
+				(self.offset as i32).encode(sink);
+			}
+			mir::MemoryKind::Memory64 => {
+				sink.push(Instruction::I64Const as u8);
+				(self.offset as i64).encode(sink);
+			}
+		}
 		sink.push(Instruction::End as u8);
 		(self.bytes.len() as u32).encode(sink);
 		sink.extend_from_slice(&self.bytes);
@@ -1779,16 +1824,21 @@ impl Encode for DataSegment {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemorySection {
-	pub memories: Box<[MemoryType]>,
+	pub memories: Box<[Memory]>,
 }
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum MemoryType {
-	/// Only initial size specified (can grow up to 2^16 pages)
-	Unbounded { initial: u32 },
-	/// Both min and max specified
-	Bounded { initial: u32, max: u32 },
+pub struct Memory {
+	pub limits: MemoryLimits,
+	pub kind: mir::MemoryKind,
+}
+
+#[derive(Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum MemoryLimits {
+	Unbounded { initial_pages: u32 },
+	Bounded { initial_pages: u32, max_pages: u32 },
 }
 
 impl Encode for MemorySection {
@@ -1806,17 +1856,25 @@ impl Encode for MemorySection {
 	}
 }
 
-impl Encode for MemoryType {
+impl Encode for Memory {
 	fn encode(&self, sink: &mut Vec<u8>) {
-		match self {
-			MemoryType::Unbounded { initial } => {
-				sink.push(0x00);
-				initial.encode(sink);
+		// Limits flags byte: bit 0 = has max, bit 2 = 64-bit address space.
+		let memory64 = match self.kind {
+			mir::MemoryKind::Memory32 => 0x00,
+			mir::MemoryKind::Memory64 => 0x04,
+		};
+		match &self.limits {
+			MemoryLimits::Unbounded { initial_pages } => {
+				sink.push(memory64);
+				initial_pages.encode(sink);
 			}
-			MemoryType::Bounded { initial, max } => {
-				sink.push(0x01);
-				initial.encode(sink);
-				max.encode(sink);
+			MemoryLimits::Bounded {
+				initial_pages,
+				max_pages,
+			} => {
+				sink.push(0x01 | memory64);
+				initial_pages.encode(sink);
+				max_pages.encode(sink);
 			}
 		}
 	}

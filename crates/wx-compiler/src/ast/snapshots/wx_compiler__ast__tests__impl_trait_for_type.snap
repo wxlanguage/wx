@@ -7,8 +7,9 @@ diagnostics: []
 items:
   - inner:
       inner:
-        ImplTrait:
+        TraitImpl:
           id: 1
+          type_params: []
           trait_name:
             - ident:
                 inner: 0
@@ -31,7 +32,7 @@ items:
           items:
             - inner:
                 inner:
-                  Method:
+                  Function:
                     id: 0
                     pub_span: ~
                     attributes: []

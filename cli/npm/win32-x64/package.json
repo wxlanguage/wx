@@ -1,6 +1,6 @@
 {
 	"name": "@wx-lang/cli-win32-x64",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Native wx CLI binary for Windows (x64)",
 	"repository": {
 		"type": "git",

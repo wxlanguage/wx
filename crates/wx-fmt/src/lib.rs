@@ -420,13 +420,13 @@ impl<'a> Builder<'a> {
 				}
 				nodes.push(self.hard_line());
 			}
-			let id = self.build_item(&item.inner.inner);
+			let id = self.build_item(&item.inner.inner, item.inner.span);
 			nodes.push(id);
 		}
 		self.arena.concat(nodes)
 	}
 
-	fn build_item(&mut self, item: &ast::Item) -> NodeId {
+	fn build_item(&mut self, item: &ast::Item, span: ast::TextSpan) -> NodeId {
 		match item {
 			ast::Item::Function {
 				signature,
@@ -477,13 +477,18 @@ impl<'a> Builder<'a> {
 				value,
 			),
 			ast::Item::Export { entries } => {
-				self.build_export_definition(entries)
+				self.build_export_definition(span, entries)
 			}
 			ast::Item::Import {
 				module,
 				alias,
 				entries,
-			} => self.build_import_definition(module, alias.as_ref(), entries),
+			} => self.build_import_definition(
+				span,
+				module,
+				alias.as_ref(),
+				entries,
+			),
 			ast::Item::Memory {
 				name, kind, config, ..
 			} => {
@@ -525,19 +530,27 @@ impl<'a> Builder<'a> {
 				name,
 				variants,
 				..
-			} => self.build_enum_definition(*pub_span, repr, name, variants),
-			ast::Item::Impl {
+			} => self
+				.build_enum_definition(span, *pub_span, repr, name, variants),
+			ast::Item::InherentImpl {
 				type_params,
 				target,
 				items,
 				..
-			} => self.build_impl_definition(type_params, target, items),
-			ast::Item::ImplTrait {
+			} => self.build_impl_definition(span, type_params, target, items),
+			ast::Item::TraitImpl {
+				type_params,
 				trait_name,
 				target,
 				items,
 				..
-			} => self.build_impl_trait_definition(trait_name, target, items),
+			} => self.build_impl_trait_definition(
+				span,
+				type_params,
+				trait_name,
+				target,
+				items,
+			),
 			ast::Item::Const {
 				pub_span,
 				name,
@@ -549,7 +562,7 @@ impl<'a> Builder<'a> {
 				pub_span,
 				name,
 				items,
-			} => self.build_module_definition(*pub_span, name, items),
+			} => self.build_module_definition(span, *pub_span, name, items),
 			ast::Item::ModuleDeclaration { pub_span, name } => {
 				self.build_module_declaration(*pub_span, name)
 			}
@@ -560,6 +573,7 @@ impl<'a> Builder<'a> {
 				items,
 				..
 			} => self.build_trait_definition(
+				span,
 				*pub_span,
 				name,
 				supertraits.as_ref(),
@@ -573,6 +587,7 @@ impl<'a> Builder<'a> {
 				fields,
 				pub_span,
 			} => self.build_struct_declaration(
+				span,
 				attributes,
 				name,
 				type_params,
@@ -581,11 +596,13 @@ impl<'a> Builder<'a> {
 			),
 			ast::Item::TypeSet {
 				pub_span,
+				attributes,
 				name,
 				members,
 				..
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
+				self.build_attributes(&mut items, attributes);
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
@@ -637,6 +654,7 @@ impl<'a> Builder<'a> {
 
 	fn build_import_definition(
 		&mut self,
+		span: ast::TextSpan,
 		module: &ast::Spanned<SymbolU32>,
 		alias: Option<&ast::Spanned<SymbolU32>>,
 		entries: &[ast::Separated<ast::Spanned<ast::ImportEntry>>],
@@ -651,10 +669,34 @@ impl<'a> Builder<'a> {
 
 		items.push(self.text(Text::SpaceLBrace));
 
-		if !entries.is_empty() {
+		if entries.is_empty() {
+			self.build_empty_braced_comments(&mut items, span);
+		} else {
+			let leading_comments = self
+				.comments
+				.between(span.start, entries[0].inner.span.start);
+			let last_end = entries.last().unwrap().inner.span.end;
+			let trailing_comments = self.comments.between(last_end, span.end);
+
 			let mut entry_items: Vec<NodeId> = vec![self.line()];
 
+			for comment in leading_comments {
+				entry_items.push(self.source_text(comment.span));
+				entry_items.push(self.hard_line());
+			}
+
 			for (index, entry) in entries.iter().enumerate() {
+				if index > 0 {
+					let prev_end = entries[index - 1].inner.span.end;
+					let curr_start = entry.inner.span.start;
+					let gap_comments =
+						self.comments.between(prev_end, curr_start);
+					for comment in gap_comments {
+						entry_items.push(self.source_text(comment.span));
+						entry_items.push(self.hard_line());
+					}
+				}
+
 				let mut entry_nodes: Vec<NodeId> = Vec::new();
 
 				if let Some(ext_name) = &entry.inner.inner.external_name {
@@ -706,18 +748,24 @@ impl<'a> Builder<'a> {
 				}
 			}
 
+			for comment in trailing_comments {
+				entry_items.push(self.hard_line());
+				entry_items.push(self.source_text(comment.span));
+			}
+
 			let concat = self.arena.concat(entry_items);
 			let indented = self.arena.indent(concat);
 			items.push(indented);
+			items.push(self.line());
 		}
 
-		items.push(self.line());
 		items.push(self.text(Text::RBrace));
 		self.arena.concat(items)
 	}
 
 	fn build_module_definition(
 		&mut self,
+		span: ast::TextSpan,
 		pub_span: Option<ast::TextSpan>,
 		name: &ast::Spanned<SymbolU32>,
 		items: &[ast::Separated<ast::Spanned<ast::Item>>],
@@ -737,6 +785,8 @@ impl<'a> Builder<'a> {
 			let indented = self.arena.indent(inner);
 			nodes.push(indented);
 			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
 		}
 
 		nodes.push(self.text(Text::RBrace));
@@ -761,6 +811,7 @@ impl<'a> Builder<'a> {
 
 	fn build_impl_definition(
 		&mut self,
+		span: ast::TextSpan,
 		type_params: &[ast::TypeParam],
 		target: &ast::Spanned<ast::TypeExpression>,
 		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
@@ -777,6 +828,8 @@ impl<'a> Builder<'a> {
 			let inner = self.arena.concat2(hl, body);
 			nodes.push(self.arena.indent(inner));
 			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
 		}
 
 		nodes.push(self.text(Text::RBrace));
@@ -786,18 +839,20 @@ impl<'a> Builder<'a> {
 
 	fn build_impl_trait_definition(
 		&mut self,
+		span: ast::TextSpan,
+		type_params: &[ast::TypeParam],
 		trait_name: &[ast::PathSegment],
 		target: &ast::Spanned<ast::TypeExpression>,
 		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
 	) -> NodeId {
-		let impl_kw = self.text(Text::Impl);
-		let sp = self.text(Text::Space);
+		let mut nodes: Vec<NodeId> = vec![self.text(Text::Impl)];
+		self.build_type_params(&mut nodes, type_params);
+		nodes.push(self.text(Text::Space));
 		let trait_id = self.build_path_segments(trait_name);
 		let for_kw = self.text(Text::ForKw);
 		let target_id = self.build_type_expression(&target.inner);
 		let brace = self.text(Text::SpaceLBrace);
-		let mut nodes: Vec<NodeId> =
-			vec![impl_kw, sp, trait_id, for_kw, target_id, brace];
+		nodes.extend([trait_id, for_kw, target_id, brace]);
 
 		if !items.is_empty() {
 			let body = self.build_impl_item_list(items);
@@ -805,6 +860,8 @@ impl<'a> Builder<'a> {
 			let inner = self.arena.concat2(hl, body);
 			nodes.push(self.arena.indent(inner));
 			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
 		}
 
 		nodes.push(self.text(Text::RBrace));
@@ -840,7 +897,7 @@ impl<'a> Builder<'a> {
 
 	fn build_impl_item(&mut self, item: &ast::ImplItem) -> NodeId {
 		match item {
-			ast::ImplItem::Method {
+			ast::ImplItem::Function {
 				pub_span,
 				attributes,
 				signature,
@@ -858,7 +915,7 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(nodes);
 				self.arena.group(concat)
 			}
-			ast::ImplItem::Const {
+			ast::ImplItem::Constant {
 				name, ty, value, ..
 			} => {
 				let mut nodes: Vec<NodeId> =
@@ -885,6 +942,7 @@ impl<'a> Builder<'a> {
 
 	fn build_trait_definition(
 		&mut self,
+		span: ast::TextSpan,
 		pub_span: Option<ast::TextSpan>,
 		name: &ast::Spanned<SymbolU32>,
 		supertraits: Option<&ast::Spanned<ast::BoundExpression>>,
@@ -910,6 +968,8 @@ impl<'a> Builder<'a> {
 			let inner = self.arena.concat2(hl, body);
 			nodes.push(self.arena.indent(inner));
 			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
 		}
 
 		nodes.push(self.text(Text::RBrace));
@@ -1033,6 +1093,7 @@ impl<'a> Builder<'a> {
 
 	fn build_enum_definition(
 		&mut self,
+		span: ast::TextSpan,
 		pub_span: Option<ast::TextSpan>,
 		repr: &Option<Box<ast::Spanned<ast::TypeExpression>>>,
 		name: &ast::Spanned<SymbolU32>,
@@ -1073,6 +1134,8 @@ impl<'a> Builder<'a> {
 			let concat = self.arena.concat(variant_items);
 			nodes.push(self.arena.indent(concat));
 			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
 		}
 
 		nodes.push(self.text(Text::RBrace));
@@ -1081,6 +1144,7 @@ impl<'a> Builder<'a> {
 
 	fn build_struct_declaration(
 		&mut self,
+		span: ast::TextSpan,
 		attributes: &[ast::Attribute],
 		name: &ast::Spanned<SymbolU32>,
 		type_params: &[ast::TypeParam],
@@ -1120,6 +1184,8 @@ impl<'a> Builder<'a> {
 			let concat = self.arena.concat(field_items);
 			items.push(self.arena.indent(concat));
 			items.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut items, span);
 		}
 
 		items.push(self.text(Text::RBrace));
@@ -1128,13 +1194,39 @@ impl<'a> Builder<'a> {
 
 	fn build_export_definition(
 		&mut self,
+		span: ast::TextSpan,
 		entries: &[ast::Separated<ast::Spanned<ast::ExportEntry>>],
 	) -> NodeId {
 		let mut items: Vec<NodeId> = vec![self.text(Text::ExportLBrace)];
 
-		if !entries.is_empty() {
+		if entries.is_empty() {
+			self.build_empty_braced_comments(&mut items, span);
+		} else {
+			let leading_comments = self
+				.comments
+				.between(span.start, entries[0].inner.span.start);
+			let last_end = entries.last().unwrap().inner.span.end;
+			let trailing_comments = self.comments.between(last_end, span.end);
+
 			let mut entry_items: Vec<NodeId> = vec![self.line()];
+
+			for comment in leading_comments {
+				entry_items.push(self.source_text(comment.span));
+				entry_items.push(self.hard_line());
+			}
+
 			for (index, entry) in entries.iter().enumerate() {
+				if index > 0 {
+					let prev_end = entries[index - 1].inner.span.end;
+					let curr_start = entry.inner.span.start;
+					let gap_comments =
+						self.comments.between(prev_end, curr_start);
+					for comment in gap_comments {
+						entry_items.push(self.source_text(comment.span));
+						entry_items.push(self.hard_line());
+					}
+				}
+
 				let mut en: Vec<NodeId> =
 					vec![self.symbol(entry.inner.inner.name.inner)];
 				if let Some(alias) = &entry.inner.inner.alias {
@@ -1150,13 +1242,39 @@ impl<'a> Builder<'a> {
 				}
 			}
 
+			for comment in trailing_comments {
+				entry_items.push(self.hard_line());
+				entry_items.push(self.source_text(comment.span));
+			}
+
 			let concat = self.arena.concat(entry_items);
 			items.push(self.arena.indent(concat));
+			items.push(self.line());
 		}
 
-		items.push(self.line());
 		items.push(self.text(Text::RBrace));
 		self.arena.concat(items)
+	}
+
+	fn build_empty_braced_comments(
+		&mut self,
+		items: &mut Vec<NodeId>,
+		span: ast::TextSpan,
+	) {
+		let comments = self.comments.between(span.start, span.end);
+		if comments.is_empty() {
+			return;
+		}
+		let mut inner: Vec<NodeId> = vec![self.hard_line()];
+		for (index, comment) in comments.iter().enumerate() {
+			inner.push(self.source_text(comment.span));
+			if index + 1 < comments.len() {
+				inner.push(self.hard_line());
+			}
+		}
+		let inner_concat = self.arena.concat(inner);
+		items.push(self.arena.indent(inner_concat));
+		items.push(self.hard_line());
 	}
 
 	fn build_attributes(

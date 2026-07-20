@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 53
+  - id: 58
     signature_index: 0
     scopes:
       - kind: Block
@@ -44,8 +44,8 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 53
-      name: 83
+      id: 58
+      name: 88
 imports: []
 memories: []
 aggregates:

@@ -86,7 +86,9 @@ pub enum Instruction {
 	I32Sub,
 	I32Mul,
 	I32DivS,
+	I32DivU,
 	I32RemS,
+	I32RemU,
 	I32And,
 	I32Or,
 	I32Xor,
@@ -111,7 +113,9 @@ pub enum Instruction {
 	I64Sub,
 	I64Mul,
 	I64DivS,
+	I64DivU,
 	I64RemS,
+	I64RemU,
 	I64And,
 	I64Or,
 	I64Xor,
@@ -223,7 +227,10 @@ pub enum Instruction {
 	},
 	/// A static array; the encoder resolves the index to a byte offset in the
 	/// data segment and emits `i32.const <byte_offset>`.
-	StaticDataPointer(u32),
+	StaticDataPointer {
+		data_index: u32,
+		ty: ScalarType,
+	},
 }
 
 #[cfg_attr(test, derive(Debug, serde::Serialize))]
@@ -575,7 +582,9 @@ impl<'f> Scheduler<'f> {
 
 			ControlNode::MemorySize { memory, result } => {
 				self.body.push(Instruction::MemorySize(*memory));
-				let local = self.alloc_local(ScalarType::I32);
+				let ty =
+					self.func.data_nodes[*result as usize].kind.unwrap_scalar();
+				let local = self.alloc_local(ty);
 				self.node_to_local.insert(*result, local);
 				self.body.push(Instruction::LocalSet(local));
 			}
@@ -588,7 +597,10 @@ impl<'f> Scheduler<'f> {
 				self.emit_value(*delta);
 				self.body.push(Instruction::MemoryGrow(*memory));
 				if self.should_spill(&self.func.data_nodes[*result as usize]) {
-					let local = self.alloc_local(ScalarType::I32);
+					let ty = self.func.data_nodes[*result as usize]
+						.kind
+						.unwrap_scalar();
+					let local = self.alloc_local(ty);
 					self.node_to_local.insert(*result, local);
 					self.body.push(Instruction::LocalSet(local));
 				}
@@ -751,10 +763,11 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::FunctionRef { id } => {
 				self.body.push(Instruction::FunctionPointer(id));
 			}
-			DataNodeKind::StaticDataRef { data_index } => {
-				self.body.push(Instruction::StaticDataPointer(data_index));
+			DataNodeKind::StaticDataRef { data_index, ty } => {
+				self.body
+					.push(Instruction::StaticDataPointer { data_index, ty });
 			}
-			DataNodeKind::MemoryOffset { memory } => {
+			DataNodeKind::MemoryOffset { memory, .. } => {
 				self.body.push(Instruction::DataSectionEnd { memory });
 			}
 			DataNodeKind::MemoryIndex { memory } => {
@@ -797,7 +810,7 @@ impl<'f> Scheduler<'f> {
 					ScalarType::F64 => Instruction::F64Mul,
 				});
 			}
-			DataNodeKind::Div { left, right, ty } => {
+			DataNodeKind::DivS { left, right, ty } => {
 				self.emit_value(left);
 				self.emit_value(right);
 				self.body.push(match ty {
@@ -807,12 +820,30 @@ impl<'f> Scheduler<'f> {
 					ScalarType::F64 => Instruction::F64Div,
 				});
 			}
-			DataNodeKind::Rem { left, right, ty } => {
+			DataNodeKind::DivU { left, right, ty } => {
+				self.emit_value(left);
+				self.emit_value(right);
+				self.body.push(match ty {
+					ScalarType::I32 => Instruction::I32DivU,
+					ScalarType::I64 => Instruction::I64DivU,
+					_ => unreachable!("float division is always DivS"),
+				});
+			}
+			DataNodeKind::RemS { left, right, ty } => {
 				self.emit_value(left);
 				self.emit_value(right);
 				self.body.push(match ty {
 					ScalarType::I32 => Instruction::I32RemS,
 					ScalarType::I64 => Instruction::I64RemS,
+					_ => unimplemented!("float remainder"),
+				});
+			}
+			DataNodeKind::RemU { left, right, ty } => {
+				self.emit_value(left);
+				self.emit_value(right);
+				self.body.push(match ty {
+					ScalarType::I32 => Instruction::I32RemU,
+					ScalarType::I64 => Instruction::I64RemU,
 					_ => unimplemented!("float remainder"),
 				});
 			}
@@ -1296,7 +1327,7 @@ impl<'f> Scheduler<'f> {
 /// Param slots (indices `0..params_count`) are never remapped — WASM passes
 /// arguments via the first N locals and the ABI cannot be changed.
 fn coalesce_locals(
-	body: &mut Vec<Instruction>,
+	body: &mut [Instruction],
 	locals: &mut Vec<Local>,
 	params_count: usize,
 ) {
@@ -1363,8 +1394,8 @@ fn coalesce_locals(
 	let mut active: Vec<(usize, u32, usize)> = Vec::new();
 	let mut next_slot = params_count as u32;
 	let mut mapping = vec![0u32; n];
-	for i in 0..params_count {
-		mapping[i] = i as u32;
+	for (i, slot) in mapping.iter_mut().enumerate().take(params_count) {
+		*slot = i as u32;
 	}
 
 	for old in order {

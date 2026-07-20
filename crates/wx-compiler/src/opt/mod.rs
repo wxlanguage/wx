@@ -61,6 +61,10 @@ impl MemAccess {
 			mir::Type::I64 | mir::Type::U64 => Self::I64,
 			mir::Type::F32 => Self::F32,
 			mir::Type::F64 => Self::F64,
+			mir::Type::Pointer { kind, .. } => match kind {
+				mir::MemoryKind::Memory32 => Self::I32,
+				mir::MemoryKind::Memory64 => Self::I64,
+			},
 			_ => Self::I32,
 		}
 	}
@@ -98,9 +102,12 @@ impl TryFrom<mir::Type> for ScalarType {
 			| mir::Type::I8
 			| mir::Type::U16
 			| mir::Type::I16
-			| mir::Type::Pointer { .. }
 			| mir::Type::Function { .. } => ScalarType::I32,
 			mir::Type::I64 | mir::Type::U64 => ScalarType::I64,
+			mir::Type::Pointer { kind, .. } => match kind {
+				mir::MemoryKind::Memory32 => ScalarType::I32,
+				mir::MemoryKind::Memory64 => ScalarType::I64,
+			},
 			mir::Type::F32 => ScalarType::F32,
 			mir::Type::F64 => ScalarType::F64,
 			_ => return Err(()),
@@ -170,20 +177,26 @@ pub enum DataNodeKind {
 		id: ast::DefId,
 	},
 	/// Pointer into the static data segment for a string or array constant.
+	/// `ty` is the pointer width of the memory holding the static data.
 	StaticDataRef {
 		data_index: u32,
+		ty: ScalarType,
 	},
 	/// Byte offset of the end of the data section (link-time constant).
+	/// `ty` is the memory's pointer width.
 	MemoryOffset {
 		memory: ast::DefId,
+		ty: ScalarType,
 	},
 	/// WASM linear-memory index as an integer constant, resolved at codegen.
 	MemoryIndex {
 		memory: ast::DefId,
 	},
-	/// Result of a `MemorySize` control node. Excluded from CSE; always spilled.
+	/// Result of a `MemorySize` control node. Excluded from CSE; always
+	/// spilled. `ty` is the memory's size type (I64 for Memory64).
 	MemorySizeResult {
 		memory: ast::DefId,
+		ty: ScalarType,
 	},
 
 	// ── Arithmetic ─────────────────────────────────────────────────────────
@@ -202,12 +215,22 @@ pub enum DataNodeKind {
 		right: DataNodeIndex,
 		ty: ScalarType,
 	},
-	Div {
+	DivS {
 		left: DataNodeIndex,
 		right: DataNodeIndex,
 		ty: ScalarType,
 	},
-	Rem {
+	DivU {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	RemS {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	RemU {
 		left: DataNodeIndex,
 		right: DataNodeIndex,
 		ty: ScalarType,
@@ -368,6 +391,7 @@ pub enum DataNodeKind {
 	MemoryGrowResult {
 		memory: ast::DefId,
 		delta: DataNodeIndex,
+		ty: ScalarType,
 	},
 	/// Value produced by a `ControlNode::PointerLoad`. Always spilled.
 	PointerLoadResult {
@@ -384,8 +408,10 @@ impl DataNodeKind {
 			| DataNodeKind::Add { ty, .. }
 			| DataNodeKind::Sub { ty, .. }
 			| DataNodeKind::Mul { ty, .. }
-			| DataNodeKind::Div { ty, .. }
-			| DataNodeKind::Rem { ty, .. }
+			| DataNodeKind::DivS { ty, .. }
+			| DataNodeKind::DivU { ty, .. }
+			| DataNodeKind::RemS { ty, .. }
+			| DataNodeKind::RemU { ty, .. }
 			| DataNodeKind::BitAnd { ty, .. }
 			| DataNodeKind::BitOr { ty, .. }
 			| DataNodeKind::BitXor { ty, .. }
@@ -412,15 +438,15 @@ impl DataNodeKind {
 			| DataNodeKind::GtEqS { .. }
 			| DataNodeKind::GtEqU { .. }
 			| DataNodeKind::FunctionRef { .. }
-			| DataNodeKind::StaticDataRef { .. }
-			| DataNodeKind::MemoryOffset { .. }
 			| DataNodeKind::MemoryIndex { .. }
-			| DataNodeKind::MemorySizeResult { .. }
-			| DataNodeKind::MemoryGrowResult { .. }
 			| DataNodeKind::I32WrapI64 { .. } => NodeType::Scalar(ScalarType::I32),
 			DataNodeKind::I64ExtendI32S { .. }
 			| DataNodeKind::I64ExtendI32U { .. } => NodeType::Scalar(ScalarType::I64),
-			DataNodeKind::GlobalGet { ty, .. } => NodeType::Scalar(*ty),
+			DataNodeKind::GlobalGet { ty, .. }
+			| DataNodeKind::StaticDataRef { ty, .. }
+			| DataNodeKind::MemoryOffset { ty, .. }
+			| DataNodeKind::MemorySizeResult { ty, .. }
+			| DataNodeKind::MemoryGrowResult { ty, .. } => NodeType::Scalar(*ty),
 
 			DataNodeKind::PointerLoadResult { access, .. } => {
 				NodeType::Scalar(access.scalar_type())
@@ -661,8 +687,10 @@ impl Function {
             DataNodeKind::Add { left, right, .. }
             | DataNodeKind::Sub { left, right, .. }
             | DataNodeKind::Mul { left, right, .. }
-            | DataNodeKind::Div { left, right, .. }
-            | DataNodeKind::Rem { left, right, .. }
+            | DataNodeKind::DivS { left, right, .. }
+            | DataNodeKind::DivU { left, right, .. }
+            | DataNodeKind::RemS { left, right, .. }
+            | DataNodeKind::RemU { left, right, .. }
             | DataNodeKind::BitAnd { left, right, .. }
             | DataNodeKind::BitOr  { left, right, .. }
             | DataNodeKind::BitXor { left, right, .. }

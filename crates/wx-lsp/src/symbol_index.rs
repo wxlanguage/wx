@@ -1,18 +1,20 @@
+use std::collections::HashMap;
 use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{DefId, StringInterner, TextSpan};
 use wx_compiler::tir::{
-	EnumVariantIndex, ExportItem, FieldAccessKind, LocalIndex,
+	EnumVariantIndex, ExportItem, FieldAccessKind, ImplTarget, LocalIndex,
 	ModuleDeclarationKind, NamespaceIndex, ScopeIndex, SourceSpan, TIR,
-	TypeParamOwner,
+	TraitImplIndex, TypeParamOwner,
 };
 use wx_compiler::vfs::FileId;
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum SymbolKind {
 	Function(DefId),
 	Global(DefId),
 	Const(DefId),
+	Memory(DefId),
 	Enum(DefId),
 	Struct(DefId),
 	Namespace(NamespaceIndex),
@@ -25,6 +27,12 @@ pub enum SymbolKind {
 		func_id: DefId,
 		param_idx: u32,
 	},
+	/// The `self` receiver parameter — always param index 0, so unlike
+	/// `Param` it doesn't need to carry one. Kept distinct from `Param` for
+	/// the same reason `InherentImplSelf`/`TraitImplSelf` are distinct from
+	/// `Struct`/`Enum`: it's the `self` keyword, not a name the user chose,
+	/// so semantic tokens shouldn't color it like an ordinary parameter.
+	SelfParam(DefId),
 	EnumVariant {
 		enum_id: DefId,
 		variant_idx: EnumVariantIndex,
@@ -47,10 +55,36 @@ pub enum SymbolKind {
 		struct_id: DefId,
 		field_idx: u32,
 	},
+	/// `Self` inside an inherent impl block (`impl Target { .. }`). Kept
+	/// distinct from `Struct`/`Enum` (even though it resolves to the same
+	/// target type) so `Rename` — which matches purely on `SymbolKind`
+	/// equality — doesn't rewrite the `Self` keyword text when renaming the
+	/// target type, and semantic tokens don't color `Self` like a type
+	/// reference. See `wx_compiler::tir::ImplBlock::self_accesses`.
+	InherentImplSelf(u32),
+	/// `Self` inside a trait impl (`impl Trait for Target { .. }`). Same
+	/// reasoning as `InherentImplSelf`. See
+	/// `wx_compiler::tir::TraitImpl::self_accesses`.
+	TraitImplSelf(TraitImplIndex),
+}
+
+/// One entry in `SymbolIndex::impls_by_target` — an impl block or trait
+/// impl, before it's known which. Kept as one merged map (rather than two,
+/// one per collection) because every consumer looks up a target's impls and
+/// immediately wants both kinds together (see `reference_search_kinds`,
+/// `implementation_locations`); a single lookup returning both is simpler
+/// than two lookups whose results always get merged anyway.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImplRef {
+	/// Index into `TIR::impl_block_list`.
+	Inherent(u32),
+	/// Index into `TIR::trait_impls`.
+	Trait(TraitImplIndex),
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct SpanInfo {
 	pub source: SourceSpan,
 	pub kind: SymbolKind,
@@ -71,9 +105,27 @@ pub struct GlobalDefinition {
 pub struct SymbolIndex {
 	pub definitions: Vec<SpanInfo>,
 	pub references: Vec<SpanInfo>,
+	/// Redirect targets for synthetic kinds (currently just
+	/// `InherentImplSelf`/`TraitImplSelf`) that a query can land *on* but
+	/// must never be found *at* — e.g. an impl header's target span is
+	/// where `Self` inside that impl redirects to, but clicking the target
+	/// name itself must resolve as a plain reference to that type (and
+	/// from there, goto-definition to the type's real declaration), not
+	/// back to this same spot. Kept out of `definitions` so
+	/// `find_at_position` never returns them; consulted only by kind, once
+	/// a query has already resolved to one of these kinds some other way.
+	pub transparent_definitions: Vec<SpanInfo>,
 	/// Named module-level definitions sorted by string value for prefix search.
 	/// Excludes scope-sensitive items (locals, params, type params, labels).
 	pub global_definitions: Vec<GlobalDefinition>,
+	/// Every impl block and trait impl, keyed by the struct/enum it targets
+	/// — `ImplTarget` identity only, so every instantiation of a generic
+	/// struct's impls lands under the same key (unlike
+	/// `TIR::type_trait_impls`, which is keyed by exact `TypeIndex` for a
+	/// different consumer — see its doc comment). Lets `References`/
+	/// `textDocument/implementation` find every impl of a struct/enum in
+	/// O(1) instead of scanning `impl_block_list`/`trait_impls` per query.
+	pub impls_by_target: HashMap<ImplTarget, Vec<ImplRef>>,
 }
 
 impl SymbolIndex {
@@ -81,7 +133,9 @@ impl SymbolIndex {
 		Self {
 			definitions: Vec::new(),
 			references: Vec::new(),
+			transparent_definitions: Vec::new(),
 			global_definitions: Vec::new(),
+			impls_by_target: HashMap::new(),
 		}
 	}
 
@@ -114,6 +168,31 @@ impl SymbolIndex {
 			(None, None) => None,
 		}
 	}
+
+	/// The redirect target for `kind`, if it's one of the synthetic kinds
+	/// that has one (see `transparent_definitions`). Falls back to a normal
+	/// kind-matching search of `definitions` for every other kind, so
+	/// callers can use this as their one lookup regardless of which bucket
+	/// a kind's definition happens to live in. The two buckets are a strict
+	/// partition — every kind lives in exactly one — so it's enough to
+	/// decide which one up front from the shape of `kind` itself, rather
+	/// than scanning `transparent_definitions` on every call regardless of
+	/// whether `kind` could even be there. `TypeParam` needs the `owner`
+	/// check because it's the one variant that appears in both: a trait's
+	/// own implicit `Self` (`owner: Trait(_)`) is transparent, but every
+	/// other owner's type params are ordinary `definitions`.
+	pub fn definition_for_kind(&self, kind: SymbolKind) -> Option<&SpanInfo> {
+		let definitions = match kind {
+			SymbolKind::InherentImplSelf(_)
+			| SymbolKind::TraitImplSelf(_)
+			| SymbolKind::TypeParam {
+				owner: TypeParamOwner::Trait(_),
+				..
+			} => &self.transparent_definitions,
+			_ => &self.definitions,
+		};
+		definitions.iter().find(|e| e.kind == kind)
+	}
 }
 
 fn find_narrowest(
@@ -131,6 +210,12 @@ fn find_narrowest(
 
 pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 	let mut index = SymbolIndex::new();
+	// `self` is a soft keyword — TIR carries no receiver flag on
+	// `FunctionParam`, only the convention (checked ad hoc in half a dozen
+	// places in `tir/builder.rs`) that a method's first param is named
+	// `self`. `None` only if no method anywhere interned "self" yet (no
+	// methods at all), in which case no param can match it below anyway.
+	let self_sym = interner.get("self");
 
 	for global in &tir.globals {
 		let info = SpanInfo {
@@ -140,7 +225,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		index.global_definitions.push(GlobalDefinition {
 			name: global.name.inner,
 			namespace: global.namespace,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &global.accesses {
@@ -165,7 +250,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			index.global_definitions.push(GlobalDefinition {
 				name: function.name.inner,
 				namespace: function.namespace,
-				info: info.clone(),
+				info,
 			});
 		}
 		index.definitions.push(info);
@@ -184,24 +269,29 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			index.definitions.push(SpanInfo {
 				source: SourceSpan::new(file_id, tp.name.span),
-				kind: kind.clone(),
+				kind,
 			});
 			for access in &tp.accesses {
 				index.references.push(SpanInfo {
 					source: SourceSpan::new(access.file_id, access.span),
-					kind: kind.clone(),
+					kind,
 				});
 			}
 		}
 
 		let num_params = function.params.len();
 		for (param_idx, param) in function.params.iter().enumerate() {
-			index.definitions.push(SpanInfo {
-				source: SourceSpan::new(file_id, param.name.span),
-				kind: SymbolKind::Param {
+			let kind = if param_idx == 0 && Some(param.name.inner) == self_sym {
+				SymbolKind::SelfParam(func_id)
+			} else {
+				SymbolKind::Param {
 					func_id,
 					param_idx: param_idx as u32,
-				},
+				}
+			};
+			index.definitions.push(SpanInfo {
+				source: SourceSpan::new(file_id, param.name.span),
+				kind,
 			});
 		}
 
@@ -215,18 +305,23 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 					};
 					index.definitions.push(SpanInfo {
 						source: SourceSpan::new(file_id, label.name.span),
-						kind: kind.clone(),
+						kind,
 					});
 					for access_span in label.accesses.iter().copied() {
 						index.references.push(SpanInfo {
 							source: SourceSpan::new(file_id, access_span),
-							kind: kind.clone(),
+							kind,
 						});
 					}
 				}
 				for (local_idx, local) in scope.locals.iter().enumerate() {
 					let is_param = scope_idx == 0 && local_idx < num_params;
-					let kind = if is_param {
+					let kind = if is_param
+						&& local_idx == 0 && Some(local.name.inner)
+						== self_sym
+					{
+						SymbolKind::SelfParam(func_id)
+					} else if is_param {
 						SymbolKind::Param {
 							func_id,
 							param_idx: local_idx as u32,
@@ -241,13 +336,13 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 					if !is_param {
 						index.definitions.push(SpanInfo {
 							source: SourceSpan::new(file_id, local.name.span),
-							kind: kind.clone(),
+							kind,
 						});
 					}
 					for access in local.accesses.iter().copied() {
 						index.references.push(SpanInfo {
 							source: SourceSpan::new(file_id, access.span),
-							kind: kind.clone(),
+							kind,
 						});
 					}
 				}
@@ -263,7 +358,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		index.global_definitions.push(GlobalDefinition {
 			name: struct_.name.inner,
 			namespace: struct_.namespace,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &struct_.accesses {
@@ -279,12 +374,12 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			index.definitions.push(SpanInfo {
 				source: SourceSpan::new(struct_.file_id, tp.name.span),
-				kind: kind.clone(),
+				kind,
 			});
 			for access in &tp.accesses {
 				index.references.push(SpanInfo {
 					source: SourceSpan::new(access.file_id, access.span),
-					kind: kind.clone(),
+					kind,
 				});
 			}
 		}
@@ -296,7 +391,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			index.definitions.push(SpanInfo {
 				source: SourceSpan::new(struct_.file_id, field.name.span),
-				kind: kind.clone(),
+				kind,
 			});
 			for access in &field.accesses {
 				if matches!(
@@ -305,7 +400,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				) {
 					index.references.push(SpanInfo {
 						source: SourceSpan::new(access.file_id, access.span),
-						kind: kind.clone(),
+						kind,
 					});
 				}
 			}
@@ -320,7 +415,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		index.global_definitions.push(GlobalDefinition {
 			name: enum_.name.inner,
 			namespace: enum_.namespace,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &enum_.accesses {
@@ -336,25 +431,37 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			let variant_info = SpanInfo {
 				source: SourceSpan::new(enum_.file_id, variant.name.span),
-				kind: variant_kind.clone(),
+				kind: variant_kind,
 			};
-			index.global_definitions.push(GlobalDefinition {
-				name: variant.name.inner,
-				namespace: enum_.namespace,
-				info: variant_info.clone(),
-			});
+			// Unlike methods/associated consts (guarded by `parent.is_none()`
+			// above), variants have no "maybe bare, maybe qualified" case to
+			// gate on — `Enum::Variant` is the only legal access (see
+			// `ResolvedMember::EnumVariant` in `tir/builder.rs`, the sole
+			// place variants get resolved, always through member lookup) —
+			// so they never belong in `global_definitions` at all.
 			index.definitions.push(variant_info);
 			for access in &variant.accesses {
 				index.references.push(SpanInfo {
 					source: *access,
-					kind: variant_kind.clone(),
+					kind: variant_kind,
 				});
 			}
 		}
 	}
 
 	for constant in &tir.constants {
-		if constant.value.is_some() {
+		// `value.is_some()` alone would wrongly exclude associated consts
+		// that structurally never have one: a trait's own abstract
+		// declaration (`const NAME: T;`, no body) and a memory's
+		// compiler-synthesized instantiation of it (e.g. `heap::DATA_END`,
+		// forked in `seed_memory_trait_impl_with`). Both are always fully
+		// resolved once present in `tir.constants` — `parent.is_some()`
+		// alone is enough to index them. Only a *top-level* const
+		// (`parent: None`) can be the broken placeholder described at its
+		// `AstNodeRef::Const` finalization site — one whose initializer
+		// failed to build stays permanently `value: None` and never claims
+		// its name, so `value.is_some()` still gates that case correctly.
+		if constant.value.is_some() || constant.parent.is_some() {
 			let info = SpanInfo {
 				source: SourceSpan::new(constant.file_id, constant.name.span),
 				kind: SymbolKind::Const(constant.id),
@@ -365,16 +472,29 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				index.global_definitions.push(GlobalDefinition {
 					name: constant.name.inner,
 					namespace: constant.namespace,
-					info: info.clone(),
+					info,
 				});
 			}
 			index.definitions.push(info);
-			for access in &constant.accesses {
+			for access in constant.accesses.iter().copied() {
 				index.references.push(SpanInfo {
-					source: *access,
+					source: access,
 					kind: SymbolKind::Const(constant.id),
 				});
 			}
+		}
+	}
+
+	for memory in tir.memories.iter() {
+		index.definitions.push(SpanInfo {
+			source: SourceSpan::new(memory.file_id, memory.name.span),
+			kind: SymbolKind::Memory(memory.id),
+		});
+		for access in memory.accesses.iter().copied() {
+			index.references.push(SpanInfo {
+				source: access,
+				kind: SymbolKind::Memory(memory.id),
+			});
 		}
 	}
 
@@ -396,7 +516,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 							decl.declaring_file_id,
 							decl.name.span,
 						),
-						kind: kind.clone(),
+						kind,
 					});
 				}
 				(source, decl.name.inner)
@@ -415,38 +535,63 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		};
 		let info = SpanInfo {
 			source: def_source,
-			kind: kind.clone(),
+			kind,
 		};
 		index.global_definitions.push(GlobalDefinition {
 			name: name_sym,
 			namespace: ns.parent,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &ns.accesses {
 			index.references.push(SpanInfo {
 				source: *access,
-				kind: kind.clone(),
+				kind,
 			});
 		}
 	}
 
-	for trait_ in tir.traits.iter() {
+	for (trait_index, trait_) in tir.traits.iter().enumerate() {
 		let kind = SymbolKind::Trait(trait_.id);
 		let info = SpanInfo {
 			source: SourceSpan::new(trait_.file_id, trait_.name.span),
-			kind: kind.clone(),
+			kind,
 		};
 		index.global_definitions.push(GlobalDefinition {
 			name: trait_.name.inner,
 			namespace: trait_.namespace,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &trait_.accesses {
 			index.references.push(SpanInfo {
 				source: *access,
-				kind: kind.clone(),
+				kind,
+			});
+		}
+
+		let self_kind = SymbolKind::TypeParam {
+			owner: TypeParamOwner::Trait(trait_index as u32),
+			param_index: 0,
+		};
+		// Same reasoning as `InherentImplSelf`/`TraitImplSelf`: this
+		// redirect target sits at the exact same span as the trait's own
+		// `Trait(id)` definition just above (`self_type_param.name.span` is
+		// set to `trait_.name.span` at construction), so it must stay out
+		// of `definitions` — otherwise clicking the trait's own declared
+		// name can resolve as this synthetic kind instead, whose redirect
+		// target is that same spot, making go-to-definition a no-op.
+		index.transparent_definitions.push(SpanInfo {
+			source: SourceSpan::new(
+				trait_.file_id,
+				trait_.self_type_param.name.span,
+			),
+			kind: self_kind,
+		});
+		for access in &trait_.self_type_param.accesses {
+			index.references.push(SpanInfo {
+				source: *access,
+				kind: self_kind,
 			});
 		}
 
@@ -457,18 +602,18 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			let at_info = SpanInfo {
 				source: SourceSpan::new(trait_.file_id, at.name_span),
-				kind: at_kind.clone(),
+				kind: at_kind,
 			};
 			index.global_definitions.push(GlobalDefinition {
 				name: *assoc_name,
 				namespace: trait_.namespace,
-				info: at_info.clone(),
+				info: at_info,
 			});
 			index.definitions.push(at_info);
 			for access in &at.accesses {
 				index.references.push(SpanInfo {
 					source: *access,
-					kind: at_kind.clone(),
+					kind: at_kind,
 				});
 			}
 		}
@@ -478,23 +623,33 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		let kind = SymbolKind::TypeSet(typeset.id);
 		let info = SpanInfo {
 			source: SourceSpan::new(typeset.file_id, typeset.name.span),
-			kind: kind.clone(),
+			kind,
 		};
 		index.global_definitions.push(GlobalDefinition {
 			name: typeset.name.inner,
 			namespace: typeset.namespace,
-			info: info.clone(),
+			info,
 		});
 		index.definitions.push(info);
 		for access in &typeset.accesses {
 			index.references.push(SpanInfo {
 				source: *access,
-				kind: kind.clone(),
+				kind,
 			});
 		}
 	}
 
-	for (block_idx, block) in tir.impl_block_list.iter().enumerate() {
+	for (block_idx, block) in tir.inherent_impls.iter().enumerate() {
+		if let Ok(target) =
+			ImplTarget::from_type(&tir.types[block.target.inner.as_usize()])
+		{
+			index
+				.impls_by_target
+				.entry(target)
+				.or_default()
+				.push(ImplRef::Inherent(block_idx as u32));
+		}
+
 		for (param_index, tp) in block.type_params.iter().enumerate() {
 			let kind = SymbolKind::TypeParam {
 				owner: TypeParamOwner::ImplBlock(block_idx as u32),
@@ -502,14 +657,56 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			};
 			index.definitions.push(SpanInfo {
 				source: SourceSpan::new(block.file_id, tp.name.span),
-				kind: kind.clone(),
+				kind,
 			});
 			for access in &tp.accesses {
 				index.references.push(SpanInfo {
 					source: SourceSpan::new(access.file_id, access.span),
-					kind: kind.clone(),
+					kind,
 				});
 			}
+		}
+
+		if !block.self_accesses.is_empty() {
+			let kind = SymbolKind::InherentImplSelf(block_idx as u32);
+			index.transparent_definitions.push(SpanInfo {
+				source: SourceSpan::new(block.file_id, block.target.span),
+				kind,
+			});
+			for access in &block.self_accesses {
+				index.references.push(SpanInfo {
+					source: *access,
+					kind,
+				});
+			}
+		}
+	}
+
+	for (trait_impl_index, trait_impl) in tir.trait_impls.iter().enumerate() {
+		if let Ok(target) = ImplTarget::from_type(
+			&tir.types[trait_impl.target.inner.as_usize()],
+		) {
+			index
+				.impls_by_target
+				.entry(target)
+				.or_default()
+				.push(ImplRef::Trait(trait_impl_index as TraitImplIndex));
+		}
+
+		if trait_impl.self_accesses.is_empty() {
+			continue;
+		}
+		let kind =
+			SymbolKind::TraitImplSelf(trait_impl_index as TraitImplIndex);
+		index.transparent_definitions.push(SpanInfo {
+			source: SourceSpan::new(trait_impl.file_id, trait_impl.target.span),
+			kind,
+		});
+		for access in &trait_impl.self_accesses {
+			index.references.push(SpanInfo {
+				source: *access,
+				kind,
+			});
 		}
 	}
 
@@ -541,7 +738,19 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 					});
 				}
 			}
-			ExportItem::Memory { .. } => {}
+			ExportItem::Memory {
+				internal_name, id, ..
+			} => {
+				if let Some(mi) = tir.memory_index(*id) {
+					index.references.push(SpanInfo {
+						source: SourceSpan::new(
+							tir.memories[mi as usize].file_id,
+							internal_name.span,
+						),
+						kind: SymbolKind::Memory(*id),
+					});
+				}
+			}
 		}
 	}
 
