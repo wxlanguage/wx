@@ -715,7 +715,7 @@ impl<'mir> Builder<'mir> {
 	fn build_block_expr(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut [StackResult],
 		scope_index: mir::ScopeIndex,
 		expressions: &[mir::Expression],
 	) -> StackResult {
@@ -807,7 +807,7 @@ impl<'mir> Builder<'mir> {
 	fn build_loop(
 		&mut self,
 		parent_block: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut [StackResult],
 		_scope_index: mir::ScopeIndex,
 		body_expr: &mir::Expression,
 	) -> StackResult {
@@ -1007,7 +1007,7 @@ impl<'mir> Builder<'mir> {
 		i: usize,
 		loop_params: &[StackResult],
 		loop_final: &[StackResult],
-		parent_bindings: &mut Vec<StackResult>,
+		parent_bindings: &mut [StackResult],
 		outputs: &mut Vec<DataNodeIndex>,
 	) {
 		let param = match loop_params[i] {
@@ -1088,7 +1088,7 @@ impl<'mir> Builder<'mir> {
 		then_bindings: &[StackResult],
 		else_bindings: &[StackResult],
 		parent_len: usize,
-		parent_bindings: &mut Vec<StackResult>,
+		parent_bindings: &mut [StackResult],
 		outputs: &mut Vec<DataNodeIndex>,
 	) -> StackResult {
 		for i in 0..parent_len {

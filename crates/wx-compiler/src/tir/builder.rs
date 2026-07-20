@@ -6118,7 +6118,7 @@ impl<'ast> Builder<'ast, '_> {
 		let mut params: Vec<FunctionParam> =
 			Vec::with_capacity(signature.params.len());
 		for param in signature.params.iter() {
-			let name = param.inner.inner.name.clone();
+			let name = param.inner.inner.name;
 			if let Some(first_span) = seen_params.get(&name.inner).copied() {
 				let name_str = self.interner.resolve(name.inner).unwrap();
 				self.tir.diagnostics.push(report_duplicate_parameter(

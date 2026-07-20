@@ -840,7 +840,7 @@ fn test_loop_two_mutated_bindings() {
 	// body.
 	for lp in &active {
 		assert!(
-			lp.uses.len() >= 1,
+			!lp.uses.is_empty(),
 			"active LoopParam should have ≥1 use; got {:?}",
 			lp.kind
 		);
@@ -1257,7 +1257,7 @@ fn test_sched_if_else_phi_stores() {
 	assert!(
 		matches!(body[end_pos + 1], Instruction::LocalGet(_)),
 		"expected LocalGet after End; got {:#?}",
-		&body[end_pos + 1]
+		body[end_pos + 1]
 	);
 	assert_eq!(
 		body.len(),
@@ -1601,7 +1601,7 @@ export {{ read, heap }}"
 		let body = case.schedule();
 
 		assert!(
-			body.iter().any(|i| is_expected(i)),
+			body.iter().any(is_expected),
 			"expected narrow load opcode for {ptr_ty}; got {:#?}",
 			body
 		);
@@ -1636,7 +1636,7 @@ export {{ write, heap }}"
 		let body = case.schedule();
 
 		assert!(
-			body.iter().any(|i| is_expected(i)),
+			body.iter().any(is_expected),
 			"expected narrow store opcode for {ptr_ty}; got {:#?}",
 			body
 		);

@@ -17,7 +17,7 @@ struct TestCase {
 	bytecode: Vec<u8>,
 }
 
-impl<'case> TestCase {
+impl TestCase {
 	fn new(source: &str) -> Self {
 		let mut builder = vfs::CompilationGraphBuilder::new();
 		let stdlib_id = builder.load_stdlib();

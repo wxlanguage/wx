@@ -11,7 +11,7 @@ struct TestCase {
 	ast: ast::AST,
 }
 
-impl<'case> TestCase {
+impl TestCase {
 	fn new(source: &str) -> Self {
 		let mut interner = ast::StringInterner::new();
 		let mut files = vfs::Files::new();

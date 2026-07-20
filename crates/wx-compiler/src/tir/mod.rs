@@ -2372,8 +2372,8 @@ impl TIR {
 				.iter()
 				.copied()
 				.zip(actual.iter().copied())
-				.fold(Ok(()), |acc, (pattern, actual)| {
-					acc.and(self.infer_type_args(type_args, pattern, actual))
+				.try_fold((), |_, (pattern, actual)| {
+					self.infer_type_args(type_args, pattern, actual)
 				}),
 			(
 				Type::Function {
@@ -2390,10 +2390,8 @@ impl TIR {
 					.iter()
 					.copied()
 					.zip(actual_sig.items.iter().copied())
-					.fold(Ok(()), |acc, (pattern, actual)| {
-						acc.and(
-							self.infer_type_args(type_args, pattern, actual),
-						)
+					.try_fold((), |_, (pattern, actual)| {
+						self.infer_type_args(type_args, pattern, actual)
 					})
 			}
 			(
@@ -2477,10 +2475,8 @@ impl TIR {
 					.iter()
 					.copied()
 					.zip(actual_args.iter().copied())
-					.fold(Ok(()), |acc, (pattern, actual)| {
-						acc.and(
-							self.infer_type_args(type_args, pattern, actual),
-						)
+					.try_fold((), |_, (pattern, actual)| {
+						self.infer_type_args(type_args, pattern, actual)
 					})
 			}
 			_ if pattern_ty == actual_ty => Ok(()),
@@ -2691,7 +2687,7 @@ impl TIR {
 			imp.target.inner,
 			receiver_ty,
 		)?;
-		if type_args.iter().any(|&t| t == TypeIndex::INFER) {
+		if type_args.contains(&TypeIndex::INFER) {
 			return None;
 		}
 		self.type_args_satisfy_bounds(&imp.type_params, &type_args)

@@ -2967,7 +2967,7 @@ fn test_fn_uses_struct_declared_after_is_ok() {
 		.tir
 		.diagnostics
 		.iter()
-		.filter(|d| d.code.as_deref().map_or(false, |c| c.starts_with('E')))
+		.filter(|d| d.code.as_deref().is_some_and(|c| c.starts_with('E')))
 		.collect();
 	assert!(
 		type_errors.is_empty(),

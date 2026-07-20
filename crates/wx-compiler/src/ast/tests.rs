@@ -55,10 +55,10 @@ fn function_block(ast: &AST, index: usize) -> &[Separated<Spanned<Statement>>] {
 	statements
 }
 
-fn statement_expression<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn statement_expression(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Expression {
+) -> &Expression {
 	let Statement::Expression(expr) = &statements[index].inner.inner else {
 		panic!("expected expression statement")
 	};
@@ -66,10 +66,10 @@ fn statement_expression<'a>(
 	&expr.inner
 }
 
-fn local_definition_value<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn local_definition_value(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Expression {
+) -> &Expression {
 	let Statement::LocalDefinition { value, .. } =
 		&statements[index].inner.inner
 	else {
@@ -79,10 +79,10 @@ fn local_definition_value<'a>(
 	&value.inner
 }
 
-fn local_definition_pattern<'a>(
-	statements: &'a [Separated<Spanned<Statement>>],
+fn local_definition_pattern(
+	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &'a Pattern {
+) -> &Pattern {
 	let Statement::LocalDefinition { pattern, .. } =
 		&statements[index].inner.inner
 	else {

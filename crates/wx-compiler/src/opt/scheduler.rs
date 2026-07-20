@@ -1327,7 +1327,7 @@ impl<'f> Scheduler<'f> {
 /// Param slots (indices `0..params_count`) are never remapped — WASM passes
 /// arguments via the first N locals and the ABI cannot be changed.
 fn coalesce_locals(
-	body: &mut Vec<Instruction>,
+	body: &mut [Instruction],
 	locals: &mut Vec<Local>,
 	params_count: usize,
 ) {
@@ -1394,8 +1394,8 @@ fn coalesce_locals(
 	let mut active: Vec<(usize, u32, usize)> = Vec::new();
 	let mut next_slot = params_count as u32;
 	let mut mapping = vec![0u32; n];
-	for i in 0..params_count {
-		mapping[i] = i as u32;
+	for (i, slot) in mapping.iter_mut().enumerate().take(params_count) {
+		*slot = i as u32;
 	}
 
 	for old in order {
