@@ -46,7 +46,7 @@ Distribution: `wx` (all subcommands, including `lsp`) ships via GitHub Releases 
 
 ## Releasing
 
-The compiler, CLI, and LSP are versioned in lockstep (see `CHANGELOG.md`'s preamble) rather than per-crate. Editor integrations under `editors/` version independently in their own repos, each with its own `CHANGELOG.md` and release tags. Before tagging a `wx` release, check whether the diff actually warrants `0.MINOR.0` vs `0.x.PATCH`: under the standard pre-1.0 semver convention, `0.MINOR.0` is for breaking changes (removes previously-working behavior, or makes previously-accepted code newly fail) and `0.x.PATCH` is for backward-compatible ones — don't default to a patch bump just because nothing looks dramatic on its face.
+The compiler, CLI, and LSP are versioned in lockstep (see `CHANGELOG.md`'s preamble) rather than per-crate. For the full release process (version bump rules, changelog conventions, branch protection, tagging, and publish-workflow gotchas), use the `release-wx` skill.
 
 ## Compilation pipeline
 
