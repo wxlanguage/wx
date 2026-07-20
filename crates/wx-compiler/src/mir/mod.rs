@@ -254,9 +254,28 @@ pub enum Type {
 	Unit,
 	Never,
 	Bool,
-	Pointer { memory: ast::DefId },
-	Aggregate { aggregate_index: AggregateIndex },
-	Function { signature_index: SignatureIndex },
+	Pointer {
+		memory: ast::DefId,
+		kind: MemoryKind,
+	},
+	Aggregate {
+		aggregate_index: AggregateIndex,
+	},
+	Function {
+		signature_index: SignatureIndex,
+	},
+}
+
+impl Type {
+	/// Types whose division, remainder, right shift, and ordered comparisons
+	/// must use the unsigned WASM instruction variants. Pointers are
+	/// unsigned addresses.
+	pub fn is_unsigned(self) -> bool {
+		matches!(
+			self,
+			Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Pointer { .. }
+		)
+	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -339,6 +358,8 @@ pub struct MemoryInfo {
 pub struct StaticEntry {
 	pub bytes: Box<[u8]>,
 	pub align: u32,
+	/// The memory whose data segment this entry is placed in.
+	pub memory: ast::DefId,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -772,7 +793,9 @@ struct Builder<'tir> {
 	/// TIR accesses.
 	call_edges: Vec<(ast::DefId, ast::DefId)>,
 	static_entries: Vec<StaticEntry>,
-	symbol_to_entry_index: HashMap<SymbolU32, u32>,
+	/// String-literal dedup: the same literal may still appear once per
+	/// memory, so the memory is part of the key.
+	symbol_to_entry_index: HashMap<(SymbolU32, ast::DefId), u32>,
 }
 
 struct FunctionContext {
@@ -783,11 +806,55 @@ struct FunctionContext {
 }
 
 impl<'tir> Builder<'tir> {
-	/// Resolve a memory `TypeIndex` to its concrete `ast::DefId`.
-	/// If the index is a `TypeParam`, substitutes via `current_substitutions`
-	/// (same step `lower_type_index` performs for type params).
+	/// Given an `AssocTypeProjection`'s already-known `trait_index`/
+	/// `assoc_name` and a fully concrete `base`, finds the applicable impl
+	/// and its stored associated-type value. That value lives in the
+	/// *impl's own* type-param scheme (e.g. `TraitImpl(impl_idx)`'s param 0
+	/// for `impl<T> Trait for Foo<T> { type Assoc = ...; }`), not the
+	/// caller's — so it is only safe to further resolve/lower under
+	/// `impl_type_args`, never under whatever `current_substitutions`
+	/// happens to be active at the call site. Returns `impl_type_args`
+	/// alongside so callers can install it before recursing.
+	fn find_assoc_type_value(
+		&self,
+		base: tir::TypeIndex,
+		trait_index: tir::TraitIndex,
+		assoc_name: SymbolU32,
+	) -> (tir::TraitImplIndex, Box<[tir::TypeIndex]>, tir::TypeIndex) {
+		// `trait_index` is already known (part of the projection itself), so
+		// go straight through `find_trait_impl` rather than
+		// `resolve_impl_member`'s ambiguity-scanning candidate search — no
+		// ambiguity is possible here.
+		let (impl_idx, impl_type_args) =
+			self.tir.find_trait_impl(base, trait_index).expect(
+				"no impl found for associated type projection during MIR lowering",
+			);
+		let assoc_ty = match self.tir.trait_impls[impl_idx as usize]
+			.members
+			.get(&assoc_name)
+		{
+			Some(tir::ImplEntry::AssocType { ty }) => *ty,
+			_ => unreachable!(
+				"trait impl matched via find_trait_impl but has no associated type entry"
+			),
+		};
+		(impl_idx, impl_type_args, assoc_ty)
+	}
+
 	/// Resolve a TIR TypeIndex to a concrete TIR TypeIndex using `current_substitutions`.
 	/// Handles chains of `AssocTypeProjection` by recursing through the base.
+	///
+	/// Only chases direct `TypeParam`/`AssocTypeProjection` leaves — it
+	/// cannot represent a *composite* associated-type value (e.g.
+	/// `type Assoc = Box<T>;`) as a single resolved `TypeIndex` without
+	/// interning a new one, which this `&self` method has no way to do
+	/// (`Builder::tir` is a frozen `&TIR`). Its only callers needing that —
+	/// `resolve_memory_id` and its own recursion on `base` — never hit the
+	/// composite case in practice (a memory type is never wrapped inside
+	/// another type constructor). `lower_type_index`'s `AssocTypeProjection`
+	/// arm handles the general/composite case itself instead of going
+	/// through here, since it can install `impl_type_args` into
+	/// `current_substitutions` before recursing.
 	fn resolve_tir_type(&self, ty: tir::TypeIndex) -> tir::TypeIndex {
 		match &self.tir.types[ty.as_usize()] {
 			tir::Type::TypeParam { param_index, .. } => {
@@ -801,28 +868,22 @@ impl<'tir> Builder<'tir> {
 				let (base, assoc_name, trait_index) =
 					(*base, *assoc_name, *trait_index);
 				let concrete_base = self.resolve_tir_type(base);
-				// `trait_index` is already known (part of the projection
-				// itself), so go straight through `trait_impl_lookup` rather
-				// than `resolve_impl_member`'s ambiguity-scanning candidate
-				// search — no ambiguity is possible here.
-				self.tir
-					.trait_impl_lookup
-					.get(&(concrete_base, trait_index))
-					.and_then(|&idx| {
-						self.tir.trait_impls[idx as usize]
-							.members
-							.get(&assoc_name)
-					})
-					.and_then(|e| {
-						if let tir::ImplEntry::AssociatedType { ty } = e {
-							Some(*ty)
-						} else {
-							None
-						}
-					})
-					.expect(
-						"no impl found for associated type projection during MIR lowering",
-					)
+				let (impl_idx, impl_type_args, assoc_ty) = self
+					.find_assoc_type_value(
+						concrete_base,
+						trait_index,
+						assoc_name,
+					);
+				let resolved = match &self.tir.types[assoc_ty.as_usize()] {
+					tir::Type::TypeParam { param_index, owner }
+						if *owner
+							== tir::TypeParamOwner::TraitImpl(impl_idx) =>
+					{
+						impl_type_args[*param_index as usize]
+					}
+					_ => assoc_ty,
+				};
+				self.resolve_tir_type(resolved)
 			}
 			_ => ty,
 		}
@@ -835,6 +896,17 @@ impl<'tir> Builder<'tir> {
 			_ => unreachable!(
 				"memory TypeIndex does not resolve to Type::Memory"
 			),
+		}
+	}
+
+	/// The MIR pointer type for a memory, with the memory's width baked in
+	/// so later stages can pick value types and access widths from the type
+	/// alone, without a memory-table lookup.
+	fn pointer_type(&self, memory: ast::DefId) -> Type {
+		let tir_idx = self.tir.expect_memory_index(memory) as usize;
+		Type::Pointer {
+			memory,
+			kind: MemoryKind::from_type_index(self.tir.memories[tir_idx].kind),
 		}
 	}
 
@@ -983,12 +1055,8 @@ impl<'tir> Builder<'tir> {
 			Type::U8 | Type::I8 | Type::Bool => Layout { size: 1, align: 1 },
 			Type::U16 | Type::I16 => Layout { size: 2, align: 2 },
 			Type::Unit | Type::Never => Layout { size: 0, align: 1 },
-			Type::Pointer { memory } => {
-				let tir_idx = self.tir.expect_memory_index(memory) as usize;
-				let ptr_size = MemoryKind::from_type_index(
-					self.tir.memories[tir_idx].kind,
-				)
-				.pointer_size();
+			Type::Pointer { kind, .. } => {
+				let ptr_size = kind.pointer_size();
 				Layout {
 					size: ptr_size,
 					align: ptr_size,
@@ -1017,17 +1085,17 @@ impl<'tir> Builder<'tir> {
 		// and promote the error to TIR. For now, this will stack-overflow on
 		// truly recursive generic instantiations.
 
-		// For generic structs, resolve TypeParam entries in args and temporarily
-		// install them as current_substitutions so lower_type_index resolves fields.
+		// For generic structs, resolve TypeParam/AssocTypeProjection entries
+		// in args and temporarily install them as current_substitutions so
+		// lower_type_index resolves fields. Must go through `resolve_tir_type`
+		// (not just a shallow `TypeParam` match) so a struct instantiated with
+		// a projection type arg (e.g. `Layout<Self::M>` inside a trait default
+		// method body) resolves once `Self` is concrete, instead of installing
+		// the unresolved projection itself as the new substitution scope.
 		let saved = if !args.is_empty() {
 			let concrete_args: Box<[tir::TypeIndex]> = args
 				.iter()
-				.map(|&a| match &self.tir.types[a.as_usize()] {
-					tir::Type::TypeParam { param_index, .. } => {
-						self.current_substitutions[*param_index as usize]
-					}
-					_ => a,
-				})
+				.map(|&a| self.resolve_tir_type(a))
 				.collect();
 			Some(std::mem::replace(
 				&mut self.current_substitutions,
@@ -1118,14 +1186,38 @@ impl<'tir> Builder<'tir> {
 					Type::Function { signature_index }
 				}
 			}
-			tir::Type::AssocTypeProjection { .. } => {
-				let concrete = self.resolve_tir_type(type_idx);
-				self.lower_type_index(concrete)
+			tir::Type::AssocTypeProjection {
+				base,
+				assoc_name,
+				trait_index,
+			} => {
+				let concrete_base = self.resolve_tir_type(base);
+				let (_, impl_type_args, assoc_ty) = self.find_assoc_type_value(
+					concrete_base,
+					trait_index,
+					assoc_name,
+				);
+				// Unlike `resolve_tir_type`, this is `&mut self`, so it can
+				// install the impl's own substitutions before recursing —
+				// which is what makes a *composite* associated-type value
+				// (e.g. `type Assoc = Box<T>;`) work: `assoc_ty`'s `T`
+				// belongs to the impl's own param scheme, not whatever
+				// scheme `current_substitutions` holds for the caller right
+				// now, so it must be swapped in before `lower_type_index`
+				// recurses into `assoc_ty`'s structure (e.g. `Box<_>`'s
+				// type arg) and resolves that `TypeParam` leaf.
+				let saved = std::mem::replace(
+					&mut self.current_substitutions,
+					impl_type_args,
+				);
+				let result = self.lower_type_index(assoc_ty);
+				self.current_substitutions = saved;
+				result
 			}
 			tir::Type::Pointer { memory, .. }
 			| tir::Type::Array { memory, .. } => {
 				let memory = self.resolve_memory_id(memory);
-				Type::Pointer { memory }
+				self.pointer_type(memory)
 			}
 			tir::Type::Slice { memory, .. } => {
 				let memory = self.resolve_memory_id(memory);
@@ -1135,7 +1227,7 @@ impl<'tir> Builder<'tir> {
 				// Slice layout is a fixed `{ ptr, len }` ABI contract, not a
 				// sorting outcome — see the pipeline notes on slice lowering.
 				let aggregate_index = self.ensure_aggregate(
-					Box::new([Type::Pointer { memory }, len_ty]),
+					Box::new([self.pointer_type(memory), len_ty]),
 					FieldOrder::Fixed,
 				);
 				Type::Aggregate { aggregate_index }
@@ -1459,25 +1551,28 @@ impl<'tir> Builder<'tir> {
 		func_ctx: &mut FunctionContext,
 		bytes: Vec<u8>,
 		align: u32,
+		memory: ast::DefId,
 	) -> (u32, u32) {
 		let size = bytes.len() as u32;
 		let idx = self.static_entries.len() as u32;
 		self.static_entries.push(StaticEntry {
 			bytes: bytes.into_boxed_slice(),
 			align,
+			memory,
 		});
 		func_ctx.static_data.push(idx);
 		(idx, size)
 	}
 
-	/// Add a string literal entry, deduplicating by symbol; returns `(index,
-	/// byte_size)`.
+	/// Add a string literal entry, deduplicating by (symbol, memory);
+	/// returns `(index, byte_size)`.
 	fn push_string_data(
 		&mut self,
 		func_ctx: &mut FunctionContext,
 		symbol: SymbolU32,
+		memory: ast::DefId,
 	) -> (u32, u32) {
-		if let Some(&idx) = self.symbol_to_entry_index.get(&symbol) {
+		if let Some(&idx) = self.symbol_to_entry_index.get(&(symbol, memory)) {
 			let size = self.static_entries[idx as usize].bytes.len() as u32;
 			func_ctx.static_data.push(idx);
 			return (idx, size);
@@ -1491,8 +1586,9 @@ impl<'tir> Builder<'tir> {
 		self.static_entries.push(StaticEntry {
 			bytes: s.as_bytes().to_vec().into_boxed_slice(),
 			align: 1,
+			memory,
 		});
-		self.symbol_to_entry_index.insert(symbol, idx);
+		self.symbol_to_entry_index.insert((symbol, memory), idx);
 		func_ctx.static_data.push(idx);
 		(idx, size)
 	}
@@ -1513,7 +1609,7 @@ impl<'tir> Builder<'tir> {
 			self.tir.types[object.ty.as_usize()]
 		{
 			let memory_id = self.resolve_memory_id(memory);
-			let ptr_ty = Type::Pointer { memory: memory_id };
+			let ptr_ty = self.pointer_type(memory_id);
 			let (si, li) = match &object.kind {
 				tir::ExprKind::Local {
 					scope_index,
@@ -1710,21 +1806,32 @@ impl<'tir> Builder<'tir> {
 				ty: Type::U32,
 			},
 			tir::ExprKind::String { symbol } => {
+				// The literal's slice type says which memory its bytes are
+				// placed in.
+				let memory_id = match &self.tir.types[expr.ty.as_usize()] {
+					tir::Type::Slice { memory, .. } => {
+						self.resolve_memory_id(*memory)
+					}
+					_ => unreachable!("string literal must have slice type"),
+				};
 				let (data_index, size) =
-					self.push_string_data(func_ctx, *symbol);
+					self.push_string_data(func_ctx, *symbol, memory_id);
 				let ty = self.lower_type_index(expr.ty);
+				let mem_idx = self.tir.expect_memory_index(memory_id) as usize;
 				Expression {
 					kind: ExprKind::Aggregate {
 						values: Box::new([
 							Expression {
 								kind: ExprKind::StaticPointer { data_index },
-								ty: Type::Pointer {
-									memory: self.tir.memories[0].id,
-								},
+								ty: self.pointer_type(memory_id),
 							},
 							Expression {
 								kind: ExprKind::Int { value: size as i64 },
-								ty: Type::U32,
+								// Slice len has the memory's size type
+								// (u64 for a 64-bit memory).
+								ty: self.lower_type_index(
+									self.tir.memories[mem_idx].kind,
+								),
 							},
 						]),
 					},
@@ -1780,22 +1887,22 @@ impl<'tir> Builder<'tir> {
 					);
 				}
 
-				// Substitute any TypeParam entries in type_args through
-				// current_substitutions.  Without this, a generic calling another
-				// generic (e.g. `call_wrap<T>` calling `wrap<T>`) would register
-				// `wrap<TypeParam{0}>` instead of `wrap<i32>`, causing
-				// `lower_type_index` to recurse infinitely when it later tries to
-				// lower `TypeParam{0}` with substitutions = [TypeParam{0}].
+				// Substitute any TypeParam/AssocTypeProjection entries in
+				// type_args through current_substitutions.  Without this, a
+				// generic calling another generic (e.g. `call_wrap<T>` calling
+				// `wrap<T>`) would register `wrap<TypeParam{0}>` instead of
+				// `wrap<i32>`, causing `lower_type_index` to recurse
+				// infinitely when it later tries to lower `TypeParam{0}` with
+				// substitutions = [TypeParam{0}]. Must go through
+				// `resolve_tir_type` (not just a shallow `TypeParam` match) so
+				// a projection like `Self::M` — inferred as a type arg to a
+				// nested generic call inside a trait default method body —
+				// also resolves once `Self` is concrete, instead of being
+				// passed through unresolved and later failing to find a trait
+				// impl for a still-generic base.
 				let concrete_type_args: Box<[tir::TypeIndex]> = type_args
 					.iter()
-					.map(|&ty| match &self.tir.types[ty.as_usize()] {
-						tir::Type::TypeParam { param_index, .. } => self
-							.current_substitutions
-							.get(*param_index as usize)
-							.copied()
-							.unwrap_or(ty),
-						_ => ty,
-					})
+					.map(|&ty| self.resolve_tir_type(ty))
 					.collect();
 				let mono_id = self
 					.mono_registry
@@ -1841,17 +1948,15 @@ impl<'tir> Builder<'tir> {
 				let tir_idx = self.tir.expect_function_index(*id);
 				let tir_func = &self.tir.functions[tir_idx as usize];
 
-				// Resolve any TypeParam entries in type_args through active substitutions.
+				// Resolve any TypeParam/AssocTypeProjection entries in
+				// type_args through active substitutions — see the matching
+				// comment in the `GenericCall` arm above for why a shallow
+				// `TypeParam`-only match isn't enough (e.g. `Self::M` used as
+				// a nested generic call's type arg inside a trait default
+				// method body).
 				let resolved: Box<[tir::TypeIndex]> = type_args
 					.iter()
-					.map(|&ty| match &self.tir.types[ty.as_usize()] {
-						tir::Type::TypeParam { param_index, .. } => self
-							.current_substitutions
-							.get(*param_index as usize)
-							.copied()
-							.unwrap_or(ty),
-						_ => ty,
-					})
+					.map(|&ty| self.resolve_tir_type(ty))
 					.collect();
 
 				// Intern the callee's concrete signature before consuming `resolved`.
@@ -1877,10 +1982,9 @@ impl<'tir> Builder<'tir> {
 							"abstract trait method must be parented by its trait"
 						),
 					};
-					let trait_impl_idx = *self
+					let (trait_impl_idx, impl_type_args) = self
 						.tir
-						.trait_impl_lookup
-						.get(&(concrete_self, trait_index))
+						.find_trait_impl(concrete_self, trait_index)
 						.expect("no impl found for abstract trait method");
 					let impl_func_idx = self.tir.trait_impls
 						[trait_impl_idx as usize]
@@ -1891,7 +1995,23 @@ impl<'tir> Builder<'tir> {
 							_ => unreachable!(),
 						})
 						.expect("no impl found for abstract trait method");
-					self.tir.functions[impl_func_idx as usize].id
+					let impl_func_id =
+						self.tir.functions[impl_func_idx as usize].id;
+					if impl_type_args.is_empty() {
+						// Concrete impl: the method has zero type params of
+						// its own, so it was already eagerly emitted (with
+						// this bare id) by `MIR::build`'s main loop — reuse
+						// it directly rather than registering a redundant
+						// duplicate through `mono_registry`.
+						impl_func_id
+					} else {
+						// Generic impl: this method's `total_type_param_count`
+						// is nonzero (it inherits the impl's own params), so
+						// `MIR::build`'s main loop skipped it — it only ever
+						// gets lowered on demand, here, via the worklist.
+						self.mono_registry
+							.get_or_insert(impl_func_id, impl_type_args)
+					}
 				};
 				self.record_call_edge(target_id);
 
@@ -2447,14 +2567,14 @@ impl<'tir> Builder<'tir> {
 				if bytes.is_empty() {
 					return Expression {
 						kind: ExprKind::Int { value: 0 },
-						ty: Type::Pointer { memory: memory_id },
+						ty: self.pointer_type(memory_id),
 					};
 				}
 				let (data_index, _) =
-					self.push_static_data(func_ctx, bytes, align);
+					self.push_static_data(func_ctx, bytes, align, memory_id);
 				Expression {
 					kind: ExprKind::StaticPointer { data_index },
-					ty: Type::Pointer { memory: memory_id },
+					ty: self.pointer_type(memory_id),
 				}
 			}
 			tir::ExprKind::ArrayRepeat {
@@ -2474,14 +2594,14 @@ impl<'tir> Builder<'tir> {
 				if bytes.is_empty() {
 					return Expression {
 						kind: ExprKind::Int { value: 0 },
-						ty: Type::Pointer { memory: memory_id },
+						ty: self.pointer_type(memory_id),
 					};
 				}
 				let (data_index, _) =
-					self.push_static_data(func_ctx, bytes, align);
+					self.push_static_data(func_ctx, bytes, align, memory_id);
 				Expression {
 					kind: ExprKind::StaticPointer { data_index },
-					ty: Type::Pointer { memory: memory_id },
+					ty: self.pointer_type(memory_id),
 				}
 			}
 			tir::ExprKind::SliceRange { object, start, end } => {
@@ -2498,7 +2618,7 @@ impl<'tir> Builder<'tir> {
 
 				let elem_size = self.compute_layout(elem_tir_ty).size;
 				let memory_id = self.resolve_memory_id(mem_tir_ty);
-				let ptr_ty = Type::Pointer { memory: memory_id };
+				let ptr_ty = self.pointer_type(memory_id);
 				let tir_mem_idx =
 					self.tir.expect_memory_index(memory_id) as usize;
 				let idx_ty =

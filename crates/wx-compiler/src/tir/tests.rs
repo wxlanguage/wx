@@ -470,6 +470,77 @@ fn test_local_with_type_annotation_invalid_rhs_recovers() {
 }
 
 #[test]
+fn test_generic_call_arg_mismatch_preserves_function_body() {
+	// Regression: `build_generic_call_arguments` returned `Err(())` on a plain
+	// argument type mismatch (an already-fully-diagnosed, recoverable error —
+	// unlike an unresolvable type param), and every caller up the chain
+	// (`build_call_expression` -> `build_expression` -> `build_block_result`
+	// -> `build_block_expression` -> `build_function_body`) propagated that
+	// `Err` with `?` all the way out. `ensure_body` then left `function.body`
+	// as `None` entirely — not just the failing call, the *whole* body,
+	// including the unrelated `local ptr = ...` statement. With no body at
+	// all, LSP hover/go-to-definition on `ptr` had nothing to look up.
+	// `build_generic_call_arguments` is now infallible: it still reports the
+	// diagnostic but returns a usable `type_args` (sanitizing any leftover
+	// `INFER` to `ERROR`), so callers keep building a real expression tree.
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 };
+        fn make_ptr() -> heap::*mut u16 { unreachable }
+        fn f(count: heap::Size) -> heap::[]u8 {
+            local ptr = make_ptr();
+            std::slice_from_parts(ptr, count)
+        }
+        export { heap as \"memory\", f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
+		"expected E1001 (type mismatch), got: {:?}",
+		case.tir.diagnostics
+	);
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| {
+			case.graph
+				.interner
+				.resolve(f.name.inner)
+				.map(|n| n == "f")
+				.unwrap_or(false)
+		})
+		.expect("function 'f' not found");
+	let body = func.body.as_ref().expect(
+		"function body should be preserved despite the argument mismatch",
+	);
+	let ExprKind::Block {
+		expressions,
+		result,
+		..
+	} = &body.block.kind
+	else {
+		panic!("expected a block expression");
+	};
+	assert_eq!(expressions.len(), 1, "expected the `local ptr` statement");
+	let ExprKind::GenericCall { arguments, .. } =
+		&result.as_ref().expect("expected a tail expression").kind
+	else {
+		panic!(
+			"expected the tail expression to be the `slice_from_parts` call"
+		);
+	};
+	assert!(
+		matches!(arguments[0].kind, ExprKind::Local { .. }),
+		"expected `ptr`'s reference to survive as a Local node, got: {:?}",
+		arguments[0].kind
+	);
+	assert_ne!(
+		arguments[0].ty,
+		TypeIndex::ERROR,
+		"`ptr`'s real (mismatched) type should be preserved, not poisoned to ERROR"
+	);
+}
+
+#[test]
 fn test_local_with_pointer_type_annotation_dereference_recovers() {
 	// When the RHS errors (e.g. `alloc` is undeclared), the local must still carry
 	// the declared pointer type so that `n.*` doesn't cascade into a "not a pointer" error.
@@ -1449,6 +1520,38 @@ fn test_stdlib_struct_field_access() {
 	);
 }
 
+/// Accessing a method via field syntax (`p.area`, no call parens) must
+/// report a diagnostic (E1060) instead of panicking.
+#[test]
+fn test_method_accessed_as_field_is_error() {
+	let case = TestCase::new(indoc! {"
+        struct Point {
+            pub x: i32,
+        }
+
+        impl Point {
+            pub fn area(self) -> i32 {
+                self.x
+            }
+        }
+
+        fn f(p: Point) -> i32 {
+            p.area
+        }
+
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::NotAField),
+		"expected E1060 (not a field), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
 /// Methods on built-in types defined in stdlib are callable from user code.
 #[test]
 fn test_stdlib_method_callable() {
@@ -1503,9 +1606,9 @@ fn test_impl_members_registered() {
 
 	let members = &case
 		.tir
-		.impl_block_list
+		.inherent_impls
 		.iter()
-		.find(|b| b.target == TypeIndex::I32)
+		.find(|b| b.target.inner == TypeIndex::I32)
 		.expect("impl_block_list should have an entry for i32")
 		.members;
 
@@ -1532,7 +1635,7 @@ fn test_impl_members_registered() {
 		abs_entry
 	);
 	assert!(
-		matches!(from_bool_entry, ImplEntry::AssociatedFn(_)),
+		matches!(from_bool_entry, ImplEntry::AssocFunction(_)),
 		"`from_bool` should be ImplEntry::AssociatedFn, got {:?}",
 		from_bool_entry
 	);
@@ -1541,7 +1644,7 @@ fn test_impl_members_registered() {
 	let &ImplEntry::Method(abs_idx) = abs_entry else {
 		unreachable!()
 	};
-	let &ImplEntry::AssociatedFn(from_bool_idx) = from_bool_entry else {
+	let &ImplEntry::AssocFunction(from_bool_idx) = from_bool_entry else {
 		unreachable!()
 	};
 	assert!(
@@ -1938,30 +2041,38 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 
 	// target type is Point (a struct)
 	assert!(
-		matches!(case.tir.types[ti.target.as_usize()], Type::Struct { .. }),
+		matches!(
+			case.tir.types[ti.target.inner.as_usize()],
+			Type::Struct { .. }
+		),
 		"target should be a struct type"
 	);
 
-	let point_type = ti.target;
+	let point_type = ti.target.inner;
 	let drawable_index = ti.trait_index;
 
-	// trait_impl_lookup is queryable for (Point, Drawable)
+	// find_trait_impl is queryable for (Point, Drawable)
 	assert!(
 		case.tir
-			.trait_impl_lookup
-			.contains_key(&(point_type, drawable_index)),
-		"trait_impl_lookup should contain (Point, Drawable)"
+			.find_trait_impl(point_type, drawable_index)
+			.is_some(),
+		"find_trait_impl should resolve (Point, Drawable)"
 	);
 
-	// type_trait_impls maps Point → a list that includes this impl
-	let ti_index = case.tir.trait_impl_lookup[&(point_type, drawable_index)];
+	// trait_impl_dispatch maps Point's outer shape → a list that includes this impl
+	let (ti_index, _) = case
+		.tir
+		.find_trait_impl(point_type, drawable_index)
+		.unwrap();
+	let kind = ImplTarget::from_type(&case.tir.types[point_type.as_usize()])
+		.expect("Point should be a valid impl target");
 	assert!(
 		case.tir
-			.type_trait_impls
-			.get(&point_type)
-			.map(|v| v.contains(&ti_index))
+			.trait_impl_dispatch
+			.get(&kind)
+			.map(|v| v.iter().any(|&(_, idx)| idx == ti_index))
 			.unwrap_or(false),
-		"type_trait_impls should include the Drawable impl for Point"
+		"trait_impl_dispatch should include the Drawable impl for Point"
 	);
 
 	// draw method is registered in TraitImpl.members
@@ -1972,14 +2083,14 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 
 	// `impl_block_list` is for inherent impls only — trait-provided methods
 	// (like `draw`, from the `Drawable` impl above) are resolved on demand
-	// from `trait_impls`/`type_trait_impls` instead (see
+	// from `trait_impls`/`trait_impl_dispatch` instead (see
 	// `Builder::resolve_impl_member`), so they must never leak into an
 	// inherent impl block's `members` for `Point`.
 	assert!(
 		case.tir
-			.impl_block_list
+			.inherent_impls
 			.iter()
-			.filter(|b| b.target == point_type)
+			.filter(|b| b.target.inner == point_type)
 			.all(|b| !b.members.contains_key(&draw_sym)),
 		"`draw` (a trait method) should not appear in any inherent impl block for Point"
 	);
@@ -2146,6 +2257,134 @@ fn test_ambiguity_between_explicit_override_and_bodied_default() {
 }
 
 #[test]
+fn test_generic_inherent_impl_repeated_type_param_rejects_inconsistent_receiver()
+ {
+	// `impl<T> Pair<T, T>` pins both fields to one shared `T` — a receiver
+	// like `Pair<i32, bool>` has no consistent `T` that makes it apply.
+	// `infer_type_args` alone wouldn't catch this (first-binding-wins would
+	// bind `T = i32` from the first field and silently drop the conflicting
+	// `bool` from the second) — `unify_impl_target` rejects it by checking
+	// `infer_type_args`'s own consistency result, so the block never
+	// becomes a candidate at all, and resolution falls through to the
+	// ordinary "no applicable method" diagnostic — matching what real Rust
+	// reports for the identical case (`E0599: no method named foo found`,
+	// verified against rustc directly).
+	let case = TestCase::new(indoc! {"
+        struct Pair<A, B> { a: A, b: B }
+
+        impl<T> Pair<T, T> {
+            fn foo(self) {}
+        }
+
+        fn use_it(p: Pair<i32, bool>) {
+            p.foo()
+        }
+
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
+		"expected a method-not-found diagnostic (no consistent `T` makes \
+		 `Pair<T, T>` apply to `Pair<i32, bool>`), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_inherent_impl_repeated_type_param_false_match_causes_spurious_ambiguity()
+ {
+	// A sharper variant of the test above: both impl blocks provide `foo`,
+	// so they share the `(Struct(Pair), "foo")` dispatch bucket. `impl<T>
+	// Pair<T, T>` is a bogus candidate for `Pair<i32, bool>` (no consistent
+	// `T`), while `impl<A, B> Pair<A, B>` is the one genuinely-applicable
+	// inherent impl. Before `unify_impl_target` checked `infer_type_args`'s
+	// consistency result, the bogus block would still land in
+	// `inherent_candidates` alongside the real one, producing a spurious
+	// "defined multiple times" conflict between two blocks that don't
+	// actually both apply — this regression-tests that it's rejected
+	// before ever becoming a candidate.
+	let case = TestCase::new(indoc! {"
+        struct Pair<A, B> { a: A, b: B }
+
+        impl<T> Pair<T, T> {
+            fn foo(self) {}
+        }
+
+        impl<A, B> Pair<A, B> {
+            fn foo(self) -> i32 { 1 }
+        }
+
+        fn use_it(p: Pair<i32, bool>) -> i32 {
+            p.foo()
+        }
+
+        export { use_it }
+    "});
+	assert!(
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.severity == Severity::Error),
+		"expected `foo` to resolve cleanly via `impl<A, B> Pair<A, B>` \
+		 (the only impl that actually applies to `Pair<i32, bool>`), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(|d| d.severity == Severity::Error)
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_inherent_impl_bound_violation_rejects_receiver() {
+	// `impl<T: Numeric> Box<T>` requires `T` to implement `Numeric` — a
+	// receiver like `Box<NotNumeric>` doesn't satisfy that bound, so `get`
+	// shouldn't resolve through this impl at all. Unlike the repeated-param
+	// case, nothing downstream re-checks this (only `.bounds.typeset` is
+	// re-validated post-call, not `.bounds.traits`), so today this compiles
+	// with no diagnostic whatsoever.
+	let case = TestCase::new(indoc! {"
+        trait Numeric {}
+
+        struct Box<T> { value: T }
+
+        impl<T: Numeric> Box<T> {
+            fn get(self) -> T { self.value }
+        }
+
+        struct NotNumeric {}
+
+        fn use_it(b: Box<NotNumeric>) -> NotNumeric {
+            b.get()
+        }
+
+        export { use_it }
+    "});
+	// `has_error_code` alone isn't enough here: unrelated stdlib-resolution
+	// noise (`Allocator::alloc`'s `self.reserve(..)`, tracked separately)
+	// also carries `MethodNotFound`, so this checks the message names `get`
+	// specifically rather than matching that noise by accident.
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::MethodNotFound.code())
+			&& d.message.contains("get")),
+		"expected a method-not-found diagnostic naming `get` (resolving it \
+		 on `Box<NotNumeric>`, which doesn't implement `Numeric`), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
 fn test_impl_trait_function_origin_is_trait_impl() {
 	let case = TestCase::new(indoc! {"
         trait Greet {
@@ -2187,10 +2426,114 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 	assert!(
 		matches!(
 			case.tir.functions[func_index as usize].type_param_parent,
-			None
+			Some(TypeParamOwner::TraitImpl(_))
 		),
-		"method inside trait impl block doens't need to inherit self"
+		"method inside trait impl block should point `type_param_parent` at its \
+		 `TraitImpl` — not to inherit type params (trait impls have none yet), \
+		 but so `Self` inside the body can be traced back to its container"
 	);
+}
+
+#[test]
+fn test_self_keyword_recorded_in_impl_block_self_accesses() {
+	let case = TestCase::new(indoc! {"
+        struct Foo {}
+        impl Foo {
+            fn make() -> Self {
+                Self::{}
+            }
+            fn other() -> Self {
+                Self::make()
+            }
+        }
+        export {}
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.all(|d| d.severity != Severity::Error),
+		"unexpected errors: {:?}",
+		case.tir.diagnostics
+	);
+	// `impl_block_list` also holds stdlib's own inherent impls (e.g. `impl
+	// char { .. }`), so find our block by membership rather than assuming
+	// an index.
+	let make_sym = case
+		.graph
+		.interner
+		.get("make")
+		.expect("symbol `make` not interned");
+	let block = case
+		.tir
+		.inherent_impls
+		.iter()
+		.find(|b| b.members.contains_key(&make_sym))
+		.expect("no ImplBlock has a 'make' member");
+	// `Self` appears four times: `-> Self` on both signatures, `Self::{}`
+	// in `make`'s body, and `Self::make()` in `other`'s body.
+	assert_eq!(block.self_accesses.len(), 4);
+}
+
+#[test]
+fn test_self_keyword_recorded_in_trait_impl_self_accesses() {
+	let case = TestCase::new(indoc! {"
+        trait Greet {
+            fn make() -> Self;
+            fn other() -> Self;
+        }
+        struct Foo {}
+        impl Greet for Foo {
+            fn make() -> Self {
+                Self::{}
+            }
+            fn other() -> Self {
+                Self::make()
+            }
+        }
+        export {}
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.all(|d| d.severity != Severity::Error),
+		"unexpected errors: {:?}",
+		case.tir.diagnostics
+	);
+	assert_eq!(case.tir.trait_impls.len(), 1);
+	assert_eq!(case.tir.trait_impls[0].self_accesses.len(), 4);
+}
+
+#[test]
+fn test_self_keyword_recorded_in_trait_impl_assoc_type_self_accesses() {
+	// Regression test: `TraitImplAssocType` built its `GenericScope` with
+	// `owner: TypeParamOwner::Trait(trait_index)` instead of
+	// `TypeParamOwner::TraitImpl(trait_impl_index)` — harmless for type
+	// resolution itself (`Self` resolves off `scope.self_type`, which was
+	// already correct), but `record_self_keyword_access` only recognizes
+	// `ImplBlock`/`TraitImpl` owners, so the access was silently dropped
+	// instead of landing in `self_accesses`.
+	let case = TestCase::new(indoc! {"
+        trait Container {
+            type Elem;
+        }
+        struct Foo {}
+        impl Container for Foo {
+            type Elem = Self;
+        }
+        export {}
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.all(|d| d.severity != Severity::Error),
+		"unexpected errors: {:?}",
+		case.tir.diagnostics
+	);
+	assert_eq!(case.tir.trait_impls.len(), 1);
+	assert_eq!(case.tir.trait_impls[0].self_accesses.len(), 1);
 }
 
 // ── trait duplicate definition ────────────────────────────────────────────────
@@ -2240,6 +2583,37 @@ fn test_trait_default_body_referencing_sibling_method_does_not_panic() {
         }
     "});
 	// Test passes as long as it does not panic.
+}
+
+#[test]
+fn test_method_call_on_self_less_trait_fn_reports_not_a_method() {
+	// Regression: `TraitFunction` registration always inserted `ImplEntry::Method`
+	// into `traits[..].members`, even when the function's first param isn't
+	// `self`. `resolve_impl_member`'s `Type::TypeParam` branch reads that map
+	// directly, so calling such a function with method-call syntax on a
+	// trait-bounded generic reached `build_method_call_expression`'s
+	// `signature.params()[1..]` with an empty params list and panicked.
+	let case = TestCase::new(indoc! {"
+        trait Reserve {
+            fn reserve() -> i32;
+        }
+
+        fn use_it<T: Reserve>(x: T) -> i32 {
+            x.reserve()
+        }
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.severity == Severity::Error),
+		"expected a 'not a method' style error, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
 }
 
 // ── trait conformance check
@@ -2697,6 +3071,29 @@ fn test_generic_struct_in_type_position_resolves() {
 }
 
 #[test]
+fn test_turbofish_first_segment_resolves_enclosing_type_param() {
+	// Regression: `build_path_expression`'s handling of turbofish on a
+	// multi-segment path's first segment (e.g. `Wrapper::<T>::make()`)
+	// resolved that segment's type args with `scope: None`, discarding the
+	// enclosing function's generic scope entirely. Any type param reference
+	// there — not just `Self` — silently failed to resolve; this manifested
+	// as either a bogus "undeclared type" or (with a struct's generic args
+	// resolving to an inconsistent length) a panic in monomorphization.
+	let case = TestCase::new(indoc! {"
+        struct Wrapper<T> { x: T }
+        impl <T> Wrapper<T> {
+            pub fn make() -> i32 { 0 }
+        }
+        fn use_it<T>() -> i32 {
+            Wrapper::<T>::make()
+        }
+        fn concrete() -> i32 { use_it::<i32>() }
+        export { concrete }
+    "});
+	no_errors(&case);
+}
+
+#[test]
 fn test_generic_struct_init_with_type_args() {
 	let case = TestCase::new(indoc! {"
         struct Pair<T> { pub first: T, pub second: T }
@@ -2758,17 +3155,18 @@ fn test_generic_struct_init_wrong_type_arg_count_is_error() {
 
 #[test]
 fn test_generic_struct_fewer_type_args_in_signature_is_error() {
-	// Padding with TypeIndex::INFER is only useful where something can later
-	// fill the gap in (e.g. from a local's initializer). A function signature
-	// has no such follow-up step, so a padded param type must still be
-	// rejected — same rule as bare `_`.
+	// A short type-arg list on a `Path`/`GenericApplication` is always
+	// resolved via `TypeArgArity::RequireExact` (every position `resolve_type`
+	// dispatches into, since there's no expression anywhere to unify a gap
+	// against later) — so this is a `TypeArgCountMismatch`, reported at the
+	// point of the mismatch itself, not a later "`_` isn't allowed here" check.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
         fn f(p: Pair<i32>) -> i32 { p.a }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::InferInSignature),
-		"expected E1051 for partially-applied generic struct in signature, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for partially-applied generic struct in signature, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -2779,16 +3177,52 @@ fn test_generic_struct_fewer_type_args_in_signature_is_error() {
 
 #[test]
 fn test_generic_struct_bare_reference_in_signature_is_error() {
-	// No turbofish at all is the extreme case of "fewer args than declared":
-	// every slot is padded, not just the trailing ones — still rejected in
-	// signature position.
+	// No turbofish at all is the extreme case of "fewer args than declared" —
+	// still an arity mismatch, same as a partial list.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
         fn f(p: Pair) { }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::InferInSignature),
-		"expected E1051 for bare generic struct reference in signature, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for bare generic struct reference in signature, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_impl_block_bare_generic_struct_target_is_error() {
+	// `impl Pair { .. }` for a generic `Pair<T, U>` used to silently pad the
+	// impl target's args with TypeIndex::INFER instead of erroring — there is
+	// no expression anywhere near an impl target that could fill the gap in,
+	// so this must be an immediate arity error, same as a bare reference
+	// anywhere else in type-expression position.
+	let case = TestCase::new(indoc! {"
+        struct Pair<T, U> { a: T, b: U }
+        impl Pair {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for bare generic struct target in impl block, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+	// `resolve_generic_type_application` keeps the struct's shape
+	// (`Pair<{error}, {error}>`) instead of collapsing to a bare
+	// `TypeIndex::ERROR`, so `ImplTarget::from_type` still recognizes it as a
+	// struct target and doesn't raise a second, redundant "cannot define
+	// inherit `impl` for `{unknown}`" diagnostic on top of the arity one.
+	assert_eq!(
+		case.tir.diagnostics.len(),
+		1,
+		"expected only the E1040 diagnostic, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -2799,15 +3233,42 @@ fn test_generic_struct_bare_reference_in_signature_is_error() {
 
 #[test]
 fn test_generic_struct_fewer_type_args_infers_from_local_initializer() {
-	// Outside signature position, a padded INFER slot is filled in later —
-	// here from the local's own initializer, which supplies both args.
+	// `local`'s annotation is still resolved via `TypeArgArity::RequireExact`
+	// (it's a type-expression position — omitting args isn't allowed even
+	// though there's an initializer alongside it), but explicit `_` per slot
+	// satisfies the arity check and still gets filled in from the
+	// initializer afterward, same as it always has.
+	let case = TestCase::new(indoc! {"
+        struct Pair<T, U> { a: T, b: U }
+        fn f() {
+            local p: Pair<_, _> = Pair::<i32, bool>::{ a: 1, b: true }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_generic_struct_fewer_type_args_in_local_annotation_without_underscore_is_error()
+ {
+	// Unlike struct-init/turbofish-on-a-call (`TypeArgArity::AllowInfer`), a
+	// `local` annotation is type-expression position, so omitting args
+	// outright (rather than writing `_` for each) is rejected — same as any
+	// other type-expression position.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
         fn f() {
             local p: Pair<i32> = Pair::<i32, bool>::{ a: 1, b: true }
         }
     "});
-	no_errors(&case);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for partially-applied generic struct in local annotation, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
 }
 
 #[test]
@@ -2948,15 +3409,15 @@ fn test_type_alias_wrong_type_arg_count_is_error() {
 
 #[test]
 fn test_type_alias_fewer_type_args_in_signature_is_error() {
-	// Same rule as generic structs: a padded INFER slot has no follow-up
-	// step in signature position, so it's still rejected there.
+	// Same rule as generic structs: a short type-arg list is always an
+	// immediate arity mismatch in type-expression position.
 	let case = TestCase::new(indoc! {"
         type Pair<T, U> = (T, U);
         fn f(p: Pair<i32>) { }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::InferInSignature),
-		"expected E1051 for partially-applied alias in signature, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for partially-applied alias in signature, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -2967,13 +3428,35 @@ fn test_type_alias_fewer_type_args_in_signature_is_error() {
 
 #[test]
 fn test_type_alias_fewer_type_args_infers_from_local_initializer() {
+	// Explicit `_` per slot satisfies the arity check, then gets filled in
+	// from the initializer, same as for a generic struct.
+	let case = TestCase::new(indoc! {"
+        type Pair<T, U> = (T, U);
+        fn f() {
+            local p: Pair<_, _> = (1, true)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_type_alias_fewer_type_args_in_local_annotation_without_underscore_is_error()
+ {
 	let case = TestCase::new(indoc! {"
         type Pair<T, U> = (T, U);
         fn f() {
             local p: Pair<i32> = (1, true)
         }
     "});
-	no_errors(&case);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 for partially-applied alias in local annotation, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
 }
 
 #[test]
@@ -3255,7 +3738,7 @@ fn test_assoc_type_declared_in_trait() {
 	assert!(
 		matches!(
 			container_trait.members.get(&elem_sym),
-			Some(ImplEntry::AssociatedType { .. })
+			Some(ImplEntry::AssocType { .. })
 		),
 		"expected 'Elem' in Container::members as AssociatedType"
 	);
@@ -3391,9 +3874,71 @@ fn test_assoc_type_impl_registers_in_trait_impl() {
 	assert!(
 		matches!(
 			ti.members.get(&elem_sym),
-			Some(ImplEntry::AssociatedType { ty }) if *ty == TypeIndex::U32
+			Some(ImplEntry::AssocType { ty }) if *ty == TypeIndex::U32
 		),
 		"expected 'Elem' → u32 in TraitImpl::members"
+	);
+}
+
+#[test]
+fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
+	// Regression test: `Self::Elem` inside a plain (non-trait) `impl Heap { .. }`
+	// block resolves `Self` to the concrete `Type::Struct` for `Heap` (not a
+	// `TypeParam`/`AssocTypeProjection`), so the associated-type lookup for
+	// `Elem` fell into `resolve_impl_member`'s inherent/trait-impl fallback —
+	// which never recorded an access on `Container::assoc_types["Elem"]`,
+	// leaving hover/go-to-definition on `Elem` with nothing to find.
+	let source = indoc! {"
+        trait Bound {}
+        impl Bound for u32 {}
+        trait Container {
+            type Elem: Bound;
+        }
+        struct Heap {}
+        impl Container for Heap {
+            type Elem = u32;
+        }
+        impl Heap {
+            fn zero() -> Self::Elem {
+                0
+            }
+        }
+    "};
+	let case = TestCase::new(source);
+	no_errors(&case);
+
+	let container_trait = case
+		.tir
+		.traits
+		.iter()
+		.find(|t| {
+			case.graph.interner.resolve(t.name.inner) == Some("Container")
+		})
+		.expect("trait 'Container' not found");
+
+	let elem_sym = case
+		.graph
+		.interner
+		.get("Elem")
+		.expect("symbol 'Elem' not interned");
+
+	let elem_assoc_type = container_trait
+		.assoc_types
+		.get(&elem_sym)
+		.expect("expected 'Elem' in Container::assoc_types");
+
+	// `TestCase::new` prepends `"use std::*;\n"` ahead of `source`, so shift
+	// the expected offset by that prefix's length.
+	let self_elem_offset = "use std::*;\n".len()
+		+ source.find("Self::Elem").unwrap()
+		+ "Self::".len();
+	assert!(
+		elem_assoc_type
+			.accesses
+			.iter()
+			.any(|access| access.span.start == self_elem_offset as u32),
+		"expected an access recorded at the `Self::Elem` usage (offset {self_elem_offset}), got: {:?}",
+		elem_assoc_type.accesses
 	);
 }
 
@@ -3706,7 +4251,10 @@ fn test_infer_in_function_param_type_is_error() {
 	let case = TestCase::new(indoc! {"
         fn foo(x: _) -> i32 { 0 }
     "});
-	has_error_matching(&case, "`_` is not allowed in item type signatures");
+	has_error_matching(
+		&case,
+		"`_` is not allowed within types on item signatures",
+	);
 }
 
 #[test]
@@ -3714,7 +4262,10 @@ fn test_infer_in_function_return_type_is_error() {
 	let case = TestCase::new(indoc! {"
         fn foo() -> _ { 0 }
     "});
-	has_error_matching(&case, "`_` is not allowed in item type signatures");
+	has_error_matching(
+		&case,
+		"`_` is not allowed within types on item signatures",
+	);
 }
 
 #[test]
@@ -3722,7 +4273,10 @@ fn test_infer_in_struct_field_is_error() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: _ }
     "});
-	has_error_matching(&case, "`_` is not allowed in item type signatures");
+	has_error_matching(
+		&case,
+		"`_` is not allowed within types on item signatures",
+	);
 }
 
 #[test]
@@ -3730,7 +4284,10 @@ fn test_infer_in_global_declaration_is_error() {
 	let case = TestCase::new(indoc! {"
         global x: _ = 0;
     "});
-	has_error_matching(&case, "`_` is not allowed in item type signatures");
+	has_error_matching(
+		&case,
+		"`_` is not allowed within types on item signatures",
+	);
 }
 
 #[test]
@@ -4293,6 +4850,145 @@ fn test_type_application_on_non_generic_is_error() {
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
 		"expected E1040 (TypeArgCountMismatch) for type args on non-generic fn, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_generic_method_self_shape_mismatch_reports_clear_diagnostic() {
+	// Regression: calling a method whose `self` requires a pointer
+	// (`self: *mut Self`) on a plain value receiver used to report a
+	// confusing "cannot infer type for type parameter `Self`" —
+	// `infer_type_args` only unifies matching shapes (Pointer only binds
+	// against Pointer), so a value receiver just silently failed to bind
+	// `Self` rather than reporting *why*. `resolve_method_call` now catches
+	// the pointer-vs-value shape mismatch directly (before any type_args
+	// machinery runs) and reports one clear `TypeMistmatch` instead of
+	// leaving it to surface later as an unhelpful "type annotation required".
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 };
+
+        trait Foo {
+            fn bar<T>(self: *mut Self) -> T { unreachable }
+        }
+
+        struct S {}
+
+        impl Foo for S {}
+
+        fn f() {
+            local s = S::{};
+            local n = s.bar::<u32>();
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
+		"expected E1001 (type mismatch), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TypeAnnotationRequired),
+		"should not also report 'cannot infer type parameter Self', got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_method_call_turbofish_resolves_own_type_param() {
+	// Regression: `build_method_call_expression` destructured `MethodCallExpr`
+	// with `..`, silently discarding the AST's `type_args` field — explicit
+	// turbofish on a method call (`.make::<u32>()`) was parsed but never used,
+	// forcing inference to work it out from context alone (or fail).
+	let case = TestCase::new(indoc! {"
+        struct Wrapper<M> { x: M }
+        impl <M> Wrapper<M> {
+            pub fn make<T>(self) -> T { unreachable }
+        }
+        fn f(w: Wrapper<i32>) -> u32 {
+            w.make::<u32>()
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_method_call_turbofish_pads_past_impl_level_type_args() {
+	// Regression: `resolve_method_call` returned the impl-level substitution
+	// (e.g. `[M = heap]`, length 1) as-is whenever it was non-empty, instead
+	// of padding it out to the method's *total* type param count (impl-level
+	// + the method's own). For a generic inherent-impl method that also
+	// declares its own additional type param (`fn make<T>` on `impl<M> Wrapper<M>`),
+	// this left `type_args` one slot too short. Turbofish merging (which
+	// writes into the trailing "own" slots, offset by the impl-level count)
+	// then corrupted the *impl-level* slot instead — `M` got overwritten with
+	// the turbofish value meant for `T`, breaking the object's own type check.
+	// Fixed by padding the impl-level substitution to `total_type_param_count()`
+	// with `INFER` before returning it.
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 };
+        struct Wrapper<M: Memory> { x: M::Size }
+        impl <M: Memory> Wrapper<M> {
+            pub fn make<T>(self) -> T { unreachable }
+        }
+        fn f(w: Wrapper<heap>) -> u32 {
+            w.make::<u32>()
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_method_call_turbofish_wrong_count_is_error() {
+	let case = TestCase::new(indoc! {"
+        struct Wrapper<M> { x: M }
+        impl <M> Wrapper<M> {
+            pub fn make<T>(self) -> T { unreachable }
+        }
+        fn f(w: Wrapper<i32>) -> u32 {
+            w.make::<u32, i32>()
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 (TypeArgCountMismatch) for too many type args on method call, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_method_call_turbofish_on_non_generic_method_is_error() {
+	let case = TestCase::new(indoc! {"
+        struct Wrapper<M> { x: M }
+        impl <M> Wrapper<M> {
+            pub fn plain(self) -> i32 { 0 }
+        }
+        fn f(w: Wrapper<i32>) -> i32 {
+            w.plain::<i32>()
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
+		"expected E1040 (TypeArgCountMismatch) for type args on non-generic method, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -5907,8 +6603,8 @@ fn test_generic_impl_bare_type_param_is_error() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
-		"expected E1001 (TypeMistmatch/no nominal type) for bare type param impl, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::InvalidImplTarget),
+		"expected InvalidImplTarget (no nominal type) for bare type param impl, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -6432,6 +7128,91 @@ fn test_assoc_type_as_memory_tag_in_trait() {
 }
 
 #[test]
+fn test_assoc_type_resolves_in_trait_default_body() {
+	// Regression: `Self::M` resolved fine in a trait method *signature* (see
+	// `test_assoc_type_as_memory_tag_in_trait` above) but failed with
+	// "undeclared type" inside a default *body*. Two bugs combined to cause
+	// it: (1) `ensure_body`'s `TraitFunction` arm built `Self` as
+	// `TypeParam { owner: Function(fi), .. }` instead of
+	// `TypeParam { owner: Trait(trait_index), .. }` like signature
+	// resolution does, so it didn't carry the implicit `Self: <trait>` bound
+	// needed to look up associated types; (2) even after fixing that,
+	// `build_path_expression`'s turbofish-on-first-segment handling (e.g.
+	// `Layout::<Self::M>`) resolved its type args with `scope: None`,
+	// discarding the enclosing function's generic scope entirely.
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 };
+
+        trait Allocator {
+            type M: Memory;
+
+            fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+
+            #[inline]
+            fn alloc_slice<T>(self: Self::M::*mut Self, count: Self::M::Size) -> Self::M::*mut u8 {
+                local layout = Layout::<Self::M>::array::<T>(count);
+                self.reserve(layout)
+            }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_generic_call_result_type_infers_assoc_type_arg() {
+	// Regression: `self.reserve(Layout::of::<T>())` (no `::<M>` turbofish on
+	// `Layout::of`, since only `T` is explicit) failed with "cannot infer
+	// type for type parameter `M`" even though `M` is fully determined by
+	// context — `reserve`'s param type is `Layout<Self::M>`. Both
+	// `build_call_expression` and `build_method_call_expression`'s
+	// generic-call branches built every argument with a flat
+	// `expected_type: TypeIndex::INFER`, deferring all inference to a
+	// post-hoc check against each argument's *already-built* type. That
+	// works when an argument is self-determining, but `Layout::of::<T>()`
+	// takes no value arguments — the call's own expected result type is the
+	// *only* way to learn `M` — so it was never inferred, and the call fell
+	// back to displaying its uninstantiated `Layout<M>`, producing a
+	// spurious second "type mismatch" against the expected `Layout<Self::M>`.
+	// Fixed by seeding `type_args` from the call's own expected type
+	// *before* building arguments, so nested generic calls can use it.
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 };
+
+        trait Allocator {
+            type M: Memory;
+
+            fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+
+            #[inline]
+            fn alloc<T>(self: Self::M::*mut Self) -> Self::M::*mut T {
+                self.reserve(Layout::of::<T>()) as _
+            }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_generic_function_call_result_type_infers_nested_call_arg() {
+	// Same class of bug as `test_generic_call_result_type_infers_assoc_type_arg`,
+	// isolated to a plain function call (no traits/methods/assoc types) to
+	// show it's a general gap in generic-call argument building, not
+	// something specific to associated-type projections.
+	let case = TestCase::new(indoc! {"
+        struct Wrapper<T> { x: T }
+        impl <T> Wrapper<T> {
+            pub fn make() -> Self { unreachable }
+        }
+        fn take<T>(w: Wrapper<T>) -> T { unreachable }
+        fn use_it() -> i32 {
+            take(Wrapper::make())
+        }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
 fn test_assoc_type_memory_bound_satisfied_by_memory_decl() {
 	// `impl Allocator for BumpAllocator { type M = heap; }` — concrete memory
 	// satisfies the `M: Memory` bound on the associated type.
@@ -6460,6 +7241,48 @@ fn test_assoc_type_memory_bound_satisfied_by_memory_decl() {
         }
     "});
 	no_errors(&case);
+}
+
+#[test]
+fn test_memory_records_access_in_type_position() {
+	// Regression test: `memory` declarations had no `accesses` field at all,
+	// so referencing `heap` as a type (here, `type M = heap;`) never recorded
+	// anything — hover/go-to-definition on `heap` had nothing to find.
+	let source = indoc! {"
+        memory heap: Memory where { Size = u32 };
+
+        trait Allocator {
+            type M: Memory;
+        }
+
+        struct BumpAllocator {}
+
+        impl Allocator for BumpAllocator {
+            type M = heap;
+        }
+    "};
+	let case = TestCase::new(source);
+	no_errors(&case);
+
+	let memory = case
+		.tir
+		.memories
+		.iter()
+		.find(|m| case.graph.interner.resolve(m.name.inner) == Some("heap"))
+		.expect("memory 'heap' not found");
+
+	// `TestCase::new` prepends `"use std::*;\n"` ahead of `source`.
+	let heap_in_type_m_offset = "use std::*;\n".len()
+		+ source.find("type M = heap;").unwrap()
+		+ "type M = ".len();
+	assert!(
+		memory
+			.accesses
+			.iter()
+			.any(|access| access.span.start == heap_in_type_m_offset as u32),
+		"expected an access recorded at `type M = heap;`'s `heap` (offset {heap_in_type_m_offset}), got: {:?}",
+		memory.accesses
+	);
 }
 
 // ── loop type inference ───────────────────────────────────────────────────────
@@ -6688,6 +7511,35 @@ fn test_phantom_type_param_as_infer_is_error() {
 		&case.tir,
 		DiagnosticCode::TypeAnnotationRequired
 	));
+}
+
+#[test]
+fn test_phantom_inherited_type_param_reports_error_not_panic() {
+	// Regression: the phantom-param check indexed
+	// `functions[func_index].type_params[i]` directly, which only holds a
+	// function's own explicit type params — not ones inherited from a parent
+	// impl block. When the phantom slot was an *inherited* param (like `M`
+	// here, inherited from `impl<M> Holder<M>` since `get` declares no type
+	// params of its own), `i` pointed past the end of that empty vec and
+	// panicked ("index out of bounds: the len is 0 but the index is 0")
+	// instead of reporting E1002. Fixed by using
+	// `function_type_params_iter(func_index).nth(i)`, matching the sibling
+	// check just above it that already accounted for inherited params.
+	let case = TestCase::new(indoc! {"
+        struct Holder<M> { x: i32 }
+        impl<M> Holder<M> {
+            pub fn get() -> i32 { 0 }
+        }
+        fn use_it() -> i32 {
+            Holder::get()
+        }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeAnnotationRequired),
+		"expected E1002 (type annotation required) for unresolvable `M`, got: {:?}",
+		case.tir.diagnostics
+	);
 }
 
 #[test]
@@ -7064,7 +7916,10 @@ fn test_impl_module_trait_for_type_resolves() {
 		.find(|ti| ti.members.contains_key(&draw_sym))
 		.expect("no TraitImpl has 'draw' method");
 	assert!(
-		matches!(case.tir.types[ti.target.as_usize()], Type::Struct { .. }),
+		matches!(
+			case.tir.types[ti.target.inner.as_usize()],
+			Type::Struct { .. }
+		),
 		"target should be Point (a struct)"
 	);
 }
@@ -7085,6 +7940,130 @@ fn test_invalid_self_type_rejected() {
 			.any(|d| d.code.as_deref() == Some("E1053")),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_invalid_self_type_rejected_in_trait_declaration() {
+	// Regression: unlike `ImplBlockMethod`, the `TraitFunction` registration
+	// site never called `is_valid_self_type`, so a trait method could declare
+	// `self: i32` (any type, not just `Self`/`*Self`) without a diagnostic —
+	// and since the entry is still `ImplEntry::Method`, callers downstream
+	// that assume `self` typechecks against the receiver would silently
+	// accept a mismatched receiver.
+	let case = TestCase::new(indoc! {"
+        trait Drawable {
+            fn bad(self: i32) -> i32;
+        }
+        export { }
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.code.as_deref() == Some("E1053")),
+		"expected InvalidSelfType diagnostic, got: {:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_invalid_self_type_rejected_in_trait_impl() {
+	// Same gap as above, but for the `impl Trait for Type` registration site.
+	let case = TestCase::new(indoc! {"
+        trait Drawable {
+            fn bad(self) -> i32;
+        }
+        struct Foo { x: i32 }
+        impl Drawable for Foo {
+            fn bad(self: i32) -> i32 { 0 }
+        }
+        export { }
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.code.as_deref() == Some("E1053")),
+		"expected InvalidSelfType diagnostic, got: {:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_duplicate_param_name_in_method_rejected() {
+	// Regression: `build_method_signature` used to duplicate the param loop
+	// from `build_function_signature` without its duplicate-name check, so a
+	// method could redeclare a param name without a diagnostic. Merging both
+	// into one `build_function_signature` closed that gap for methods too.
+	let case = TestCase::new(indoc! {"
+        struct Foo { x: i32 }
+        impl Foo {
+            pub fn bad(self, a: i32, a: i32) -> i32 { a }
+        }
+        export { }
+    "});
+	assert!(
+		case.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.code.as_deref() == Some("E1000")),
+		"expected DuplicateDefinition diagnostic, got: {:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_infer_in_method_param_type_rejected() {
+	// Regression: methods resolved param types via raw `resolve_type`, which
+	// silently accepts `_` (INFER) — unlike free functions, which go through
+	// `resolve_signature_type` and reject it. Merging into one
+	// `build_function_signature` closed that gap for methods too.
+	let case = TestCase::new(indoc! {"
+        struct Foo { x: i32 }
+        impl Foo {
+            pub fn bad(self, a: _) -> i32 { 0 }
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::InferInSignature),
+		"expected E1051 for `_` in method param type, got: {:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_bare_self_param_resolves_to_self_type() {
+	// Regression: merging `build_method_signature` into `build_function_signature`
+	// dropped the `is_self` defaulting in the untyped-param branch, so a bare
+	// `self` (no `: Type`) silently resolved to `TypeIndex::ERROR` instead of
+	// `Self` — no diagnostic fired (`ERROR` is a poison value, not an error
+	// site), so `no_errors`-style assertions couldn't catch it; only checking
+	// the actual resolved type does.
+	let case = TestCase::new(indoc! {"
+        struct Foo { x: i32 }
+        impl Foo {
+            pub fn by_value(self) -> i32 { 0 }
+        }
+        export { }
+    "});
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| {
+			case.graph
+				.interner
+				.resolve(f.name.inner)
+				.map(|n| n == "by_value")
+				.unwrap_or(false)
+		})
+		.expect("by_value not found");
+	assert_ne!(
+		func.params[0].ty.inner,
+		TypeIndex::ERROR,
+		"bare self param resolved to ERROR"
 	);
 }
 
@@ -7671,7 +8650,73 @@ fn test_true_false_are_keywords_not_shadowable() {
 }
 
 #[test]
-fn test_generic_trait_impl_probe() {
+fn test_underscore_prefixed_local_suppresses_unused_warning() {
+	// `_foo` still binds the name (unlike a bare `_` wildcard) but, matching
+	// Rust's convention, should not trigger the unused-variable lint.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local _unused: i32 = 1;
+            2
+        }
+        export { f }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::UnusedVariable),
+		"expected no unused-variable warning for `_unused`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_underscore_prefixed_param_suppresses_unused_warning() {
+	let case = TestCase::new(indoc! {"
+        fn f(_unused: i32) -> i32 {
+            1
+        }
+        export { f }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::UnusedVariable),
+		"expected no unused-variable warning for param `_unused`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_plain_unused_local_still_warns() {
+	// Sanity check that the underscore-prefix exemption didn't accidentally
+	// disable the lint entirely.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local unused: i32 = 1;
+            2
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UnusedVariable),
+		"expected unused-variable warning for `unused`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_trait_impl_resolves() {
+	// `impl<T> Getter for Box<T>` — the impl's own `T` (not the struct's,
+	// though here it happens to line up) must be resolvable at the target
+	// type expression, and dispatch must find it for a concrete receiver.
 	let case = TestCase::new(indoc! {"
         struct Box<T> { v: T }
 
@@ -7689,18 +8734,43 @@ fn test_generic_trait_impl_probe() {
 
         export { use_it }
     "});
-	eprintln!(
-		"DIAGS: {:#?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| (&d.message, d.severity))
-			.collect::<Vec<_>>()
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(
+		errors.is_empty(),
+		"unexpected errors: {:?}",
+		errors.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+	let getter_sym = case
+		.graph
+		.interner
+		.get("Getter")
+		.expect("symbol `Getter` not interned");
+	let trait_impl = case
+		.tir
+		.trait_impls
+		.iter()
+		.find(|ti| {
+			case.tir.traits[ti.trait_index as usize].name.inner == getter_sym
+		})
+		.expect("no TraitImpl for Getter");
+	assert_eq!(
+		trait_impl.type_params.len(),
+		1,
+		"the impl's own type param should be registered on the TraitImpl"
 	);
 }
 
 #[test]
-fn test_generic_inherent_impl_vs_trait_priority_probe() {
+fn test_generic_inherent_impl_vs_trait_priority() {
+	// A generic inherent impl and a concrete trait impl both provide `get`
+	// on `Box<i32>` with different return types (`T` vs `bool`) — inherent
+	// must win outright, so `use_it`'s `-> i32` body type-checks cleanly
+	// only if the inherent (T = i32) method was chosen.
 	let case = TestCase::new(indoc! {"
         struct Box<T> { v: T }
 
@@ -7722,12 +8792,313 @@ fn test_generic_inherent_impl_vs_trait_priority_probe() {
 
         export { use_it }
     "});
-	eprintln!(
-		"DIAGS: {:#?}",
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(
+		errors.is_empty(),
+		"expected the inherent impl to win over the trait impl, got errors: {:?}",
+		errors.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_trait_impl_bound_satisfied() {
+	// `impl<T: Foo> Getter for Box<T>` applies to `Box<Yes>` since `Yes: Foo`.
+	let case = TestCase::new(indoc! {"
+        trait Foo {}
+
+        struct Yes {}
+        impl Foo for Yes {}
+
+        struct Box<T> { v: T }
+
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl<T: Foo> Getter for Box<T> {
+            fn get(self) -> i32 { 1 }
+        }
+
+        fn use_it(b: Box<Yes>) -> i32 {
+            b.get()
+        }
+
+        export { use_it }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
+		"expected the bounded impl to apply since Yes: Foo, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
-			.map(|d| (&d.message, d.severity))
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_trait_impl_bound_violation_reports_error() {
+	// Same shape as `test_generic_trait_impl_bound_satisfied`, but the
+	// receiver's type argument (`No`) does not implement the impl's bound
+	// (`Foo`) — the impl must not apply, so `.get()` resolves to nothing.
+	let case = TestCase::new(indoc! {"
+        trait Foo {}
+
+        struct No {}
+
+        struct Box<T> { v: T }
+
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl<T: Foo> Getter for Box<T> {
+            fn get(self) -> i32 { 1 }
+        }
+
+        fn use_it(b: Box<No>) -> i32 {
+            b.get()
+        }
+
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
+		"expected no method found since No does not implement Foo, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_trait_impl_and_concrete_impl_ambiguous() {
+	// A concrete `impl Getter for Box<i32>` and a generic
+	// `impl<T> Getter for Box<T>` both target the same type constructor
+	// `Box` — WX allows at most one implementation of a given trait per type
+	// constructor, so this is a `DuplicateTraitImpl` error at the second
+	// impl's declaration, not a call-site ambiguity (generic arguments never
+	// participate in impl selection, so it doesn't matter that the two
+	// impls' receivers happen to overlap here).
+	let case = TestCase::new(indoc! {"
+        struct Box<T> { v: T }
+
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl Getter for Box<i32> {
+            fn get(self) -> i32 { 1 }
+        }
+
+        impl<T> Getter for Box<T> {
+            fn get(self) -> i32 { 2 }
+        }
+
+        fn use_it(b: Box<i32>) -> i32 {
+            b.get()
+        }
+
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateTraitImpl),
+		"expected a duplicate-trait-impl error for the second `impl Getter for Box<_>`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_two_concrete_trait_impls_for_same_struct_is_duplicate() {
+	// Two non-overlapping concrete impls (`Box<i32>` and `Box<u8>`) of the
+	// same trait still target the same type constructor `Box` — illegal
+	// regardless of the fact that their receivers never actually collide.
+	let case = TestCase::new(indoc! {"
+        struct Box<T> { v: T }
+
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl Getter for Box<i32> {
+            fn get(self) -> i32 { 1 }
+        }
+
+        impl Getter for Box<u8> {
+            fn get(self) -> i32 { 2 }
+        }
+
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateTraitImpl),
+		"expected a duplicate-trait-impl error for two concrete impls of Getter for Box<_>, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_two_generic_trait_impls_for_same_struct_is_duplicate() {
+	// Two independently-bounded generic impls of the same trait for the
+	// same constructor — illegal even though `Foo`/`Bar` could be disjoint
+	// bounds satisfiable by no common type; WX doesn't reason about bound
+	// overlap here, the constructor match alone is enough to conflict.
+	let case = TestCase::new(indoc! {"
+        trait Foo {}
+        trait Bar {}
+
+        struct Box<T> { v: T }
+
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl<T: Foo> Getter for Box<T> {
+            fn get(self) -> i32 { 1 }
+        }
+
+        impl<T: Bar> Getter for Box<T> {
+            fn get(self) -> i32 { 2 }
+        }
+
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateTraitImpl),
+		"expected a duplicate-trait-impl error for two generic impls of Getter for Box<_>, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_blanket_trait_impl_reports_invalid_impl_target() {
+	// `impl<T> Getter for T` has a bare `Type::TypeParam` as its target.
+	// `ImplTarget::from_type` has no case for that (see its `Err(())` arm
+	// list), so this must be reported right at the impl block via
+	// `DiagnosticCode::InvalidImplTarget` — mirroring the equivalent
+	// mistake on an *inherent* impl (`impl<T> T { .. }`), which reports the
+	// same code ("cannot define an `impl` block for `T`"). Before this was
+	// wired up, `register_trait_impl` silently discarded the impl instead
+	// (see git history), leaving it dead code with no diagnostic at all,
+	// and the only symptom was a disconnected `MethodNotFound` at every
+	// call site instead.
+	let case = TestCase::new(indoc! {"
+        trait Getter {
+            fn get(self) -> i32;
+        }
+
+        impl<T> Getter for T {
+            fn get(self) -> i32 { 1 }
+        }
+
+        export { }
+    "});
+
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::InvalidImplTarget),
+		"expected an `InvalidImplTarget` error at the blanket impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_trait_impl_associated_type_substitutes() {
+	// `impl<T> Container for Box<T> { type Item = T; ... }` — the
+	// associated type's stored value is the impl's own type param, so
+	// resolving `Self::Item` for a concrete `Box<i32>` receiver must
+	// substitute through the type args inferred from that receiver rather
+	// than leaking the impl's bare `TypeParam`.
+	let case = TestCase::new(indoc! {"
+        trait Container {
+            type Item;
+            fn get(self) -> Self::Item;
+        }
+
+        struct Box<T> { v: T }
+
+        impl<T> Container for Box<T> {
+            type Item = T;
+            fn get(self) -> Self::Item { self.v }
+        }
+
+        fn use_it(b: Box<i32>) -> i32 {
+            b.get()
+        }
+
+        export { use_it }
+    "});
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(
+		errors.is_empty(),
+		"expected Self::Item to substitute to i32, got errors: {:?}",
+		errors.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_abstract_dispatch_access_recorded_for_associated_const() {
+	// `T::FOO` inside a bounded-generic function resolves to `HasConst`'s
+	// abstract declaration (no value — only impls provide one), so
+	// `record_abstract_dispatch_access` must mark `Impl1::FOO` as accessed
+	// too, exactly as it already does for methods. Before it handled
+	// `ImplEntry::AssociatedConst`, this fell through as a no-op and
+	// `Impl1::FOO` was flagged as an unused-item false positive even though
+	// it's reachable via abstract dispatch.
+	let case = TestCase::new(indoc! {"
+        trait HasConst {
+            const FOO: i32;
+        }
+
+        struct Impl1 {}
+        impl HasConst for Impl1 {
+            const FOO: i32 = 42;
+        }
+
+        fn use_it<T: HasConst>() -> i32 {
+            T::FOO
+        }
+
+        fn run() -> i32 {
+            use_it::<Impl1>()
+        }
+
+        export { run }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"expected no diagnostics (in particular no false-positive unused-item warning for Impl1::FOO), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
 			.collect::<Vec<_>>()
 	);
 }
@@ -7827,15 +9198,7 @@ fn test_generic_inherent_impl_resolves_via_path_call_syntax() {
 
         export { use_it }
     "});
-	assert!(
-		case.tir.diagnostics.is_empty(),
-		"expected no diagnostics: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
-	);
+	no_errors(&case);
 }
 
 #[test]
@@ -7953,15 +9316,18 @@ fn test_two_generic_impl_blocks_colliding_despite_differing_bounds_is_rejected()
 
 #[test]
 fn test_trait_impl_resolution_uses_global_index_not_local_position() {
-	// `type_trait_impls[ty]` holds GLOBAL indices into `self.tir.trait_impls`
-	// (assigned in registration order across the whole file), not positions
-	// local to `ty`. `Unrelated`'s impl registers first (`trait_impls[0]`);
-	// `S`'s impl (the one we actually care about) registers second
-	// (`trait_impls[1]`), so `type_trait_impls[S] == [1]`. A regression here
-	// (e.g. using the loop position `0..impl_count` to index `trait_impls`
-	// directly instead of dereferencing through `type_trait_impls[S]` first)
-	// would look at `Unrelated`'s impl instead of `S`'s and wrongly report
-	// `S` as not having `foo`.
+	// `trait_impl_dispatch[kind]` holds GLOBAL indices into
+	// `self.tir.trait_impls` (assigned in registration order across the
+	// whole file), not positions local to `kind`. `Unrelated`'s impl
+	// registers first (`trait_impls[0]`); `S`'s impl (the one we actually
+	// care about) registers second (`trait_impls[1]`), so
+	// `trait_impl_dispatch[Struct(S)] == [1]` (a bucket shared by outer
+	// shape, not narrowed to `S` specifically until `unify_trait_impl_target`
+	// checks each candidate). A regression here (e.g. using the loop
+	// position `0..impl_count` to index `trait_impls` directly instead of
+	// dereferencing through the dispatch bucket first) would look at
+	// `Unrelated`'s impl instead of `S`'s and wrongly report `S` as not
+	// having `foo`.
 	let case = TestCase::new(indoc! {"
         trait Other {
             fn bar(self) -> i32;

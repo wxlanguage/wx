@@ -399,6 +399,21 @@ fn test_label_requires_block_like_expression() {
 }
 
 #[test]
+fn test_multi_segment_label_reports_diagnostic_instead_of_panicking() {
+	// A partially-typed namespace access (`std::io` followed by a lone `:`
+	// while typing the second `::`) parses as a multi-segment path immediately
+	// followed by a colon, which used to hit `unreachable!()` in
+	// `parse_labelled_expression`.
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            std::io:
+        }
+    "});
+
+	assert_eq!(diagnostic_codes(&case.ast), vec!["E0014"]);
+}
+
+#[test]
 fn test_struct_init() {
 	// explicit fields, shorthand ({ field } == { field: field }), and empty
 	let case = TestCase::new(indoc! {"
@@ -979,7 +994,7 @@ fn test_module_pub_items_and_associated_types() {
 			)
 	));
 
-	let Item::ImplTrait {
+	let Item::TraitImpl {
 		items: impl_items, ..
 	} = item(&case.ast, 3)
 	else {
@@ -1225,7 +1240,7 @@ fn test_impl_trait_multi_segment_trait_name() {
         }
     "});
 	assert!(case.ast.diagnostics.is_empty());
-	let Item::ImplTrait { trait_name, .. } = item(&case.ast, 0) else {
+	let Item::TraitImpl { trait_name, .. } = item(&case.ast, 0) else {
 		panic!("expected ImplTrait")
 	};
 	assert_eq!(

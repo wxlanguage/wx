@@ -57,7 +57,12 @@ Sample programs live in the [`examples`](examples) directory.
 
 Here are some of the resources I used to learn about compilers and wasm while working on this project:
 
-- [Julian Hartl (natrixcc)](https://github.com/julian-hartl/natrixcc) - I learned a lot by digging into the source code of this project.
-- [tylerlaceby](https://www.youtube.com/@tylerlaceby) - Great youtube channel where I learned a lot about how to write lexers and parsers.
-- [Jon Gjengset](https://www.youtube.com/@jonhoo) - Another great author that has a lot of content about Rust with deep dives into the language internals.
-- Blog posts and conference talks by [Andrew Kelley](https://github.com/andrewrk), the creator of the Zig.
+- [Youtube channel of Julian Hartl](https://www.youtube.com/channel/UCFRB-SI9q_p5Erjsj-EpOGw)
+- [Youtube channel of Jon Gjengset](https://www.youtube.com/@jonhoo)
+- [Youtube channel of Tyler Laceby](https://www.youtube.com/@tylerlaceby)
+- [Simple but Powerful Pratt Parsing by Alex Kladov](https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html)
+- [WASM IO conference talks](https://www.youtube.com/@wasmio)
+- Youtube channels with recordings of rust conferences like [Rust NL](https://www.youtube.com/@rustnederlandrustnl) and [EuroRust](https://www.youtube.com/@eurorust)
+- [Conference talks of Andrew Kelley](https://andrewkelley.me/)
+- [rats159](https://www.youtube.com/@awesome.rats159)
+- [Allocation Strategies by gingerBill](https://www.youtube.com/watch?v=BxLEymP1f6o)

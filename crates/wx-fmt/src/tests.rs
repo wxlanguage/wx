@@ -354,6 +354,31 @@ fn test_format_struct_items() {
 }
 
 #[test]
+fn test_format_typeset_items() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"pointer_size\"]
+        pub typeset PointerSize { u32, u64 }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            #[tag = \"pointer_size\"]
+            pub typeset PointerSize { u32, u64 }
+        "}
+	);
+}
+
+#[test]
 fn test_format_generic_struct_stays_inline() {
 	let case = TestCase::new(indoc! {"
         struct Pair<A, B> { first: A, second: B }
@@ -1036,6 +1061,155 @@ fn test_format_comments_preserved() {
             }
         "},
 	);
+
+	// Comment as the only content of an otherwise empty export block.
+	assert_eq!(
+		fmt(indoc! {"
+            export {
+                // heap
+            }
+        "}),
+		indoc! {"
+            export {
+                // heap
+            }
+        "},
+	);
+
+	// Comment as the only content of an otherwise empty import block.
+	assert_eq!(
+		fmt(indoc! {"
+            import \"env\" {
+                // nothing yet
+            }
+        "}),
+		indoc! {"
+            import \"env\" {
+                // nothing yet
+            }
+        "},
+	);
+
+	// Leading/gap/trailing comments around export entries.
+	assert_eq!(
+		fmt(indoc! {"
+            fn heap() -> i32 { 1 }
+            fn other() -> i32 { 2 }
+            export {
+                // leading comment
+                heap,
+                // middle comment
+                other
+                // trailing comment
+            }
+        "}),
+		indoc! {"
+            fn heap() -> i32 {
+                1
+            }
+
+            fn other() -> i32 {
+                2
+            }
+
+            export {
+                // leading comment
+                heap,
+                // middle comment
+                other
+                // trailing comment
+            }
+        "},
+	);
+
+	// Truly empty export/import blocks collapse to one line, matching
+	// every other empty brace body (struct/module/trait/enum/impl).
+	assert_eq!(fmt("export {}\n"), "export {}\n");
+	assert_eq!(fmt("import \"env\" {}\n"), "import \"env\" {}\n");
+
+	// Comment as the only content of an otherwise empty body, for every
+	// other brace-bodied item kind.
+	assert_eq!(
+		fmt(indoc! {"
+            struct Foo {
+                // fields tbd
+            }
+        "}),
+		indoc! {"
+            struct Foo {
+                // fields tbd
+            }
+        "},
+	);
+	assert_eq!(
+		fmt(indoc! {"
+            module m {
+                // nothing yet
+            }
+        "}),
+		indoc! {"
+            module m {
+                // nothing yet
+            }
+        "},
+	);
+	assert_eq!(
+		fmt(indoc! {"
+            trait T {
+                // methods tbd
+            }
+        "}),
+		indoc! {"
+            trait T {
+                // methods tbd
+            }
+        "},
+	);
+	assert_eq!(
+		fmt(indoc! {"
+            enum E {
+                // variants tbd
+            }
+        "}),
+		indoc! {"
+            enum E {
+                // variants tbd
+            }
+        "},
+	);
+	assert_eq!(
+		fmt(indoc! {"
+            struct Foo {}
+            impl Foo {
+                // methods tbd
+            }
+        "}),
+		indoc! {"
+            struct Foo {}
+
+            impl Foo {
+                // methods tbd
+            }
+        "},
+	);
+	assert_eq!(
+		fmt(indoc! {"
+            trait T {}
+            struct Foo {}
+            impl T for Foo {
+                // methods tbd
+            }
+        "}),
+		indoc! {"
+            trait T {}
+
+            struct Foo {}
+
+            impl T for Foo {
+                // methods tbd
+            }
+        "},
+	);
 }
 
 #[test]
@@ -1119,6 +1293,40 @@ fn test_format_impl_trait_multi_segment() {
 		indoc! {"
             impl module::Drawable for Point {
                 fn draw(self) {}
+            }
+        "}
+	);
+}
+
+#[test]
+fn test_format_impl_trait_generic_type_params() {
+	// Regression test: build_impl_trait_definition previously dropped the
+	// impl's own type_params (e.g. `impl<T> Trait for Type<T>` lost `<T>`),
+	// silently changing the code's meaning.
+	let case = TestCase::new(indoc! {"
+        impl<T> Trait for Wrapper<T> {
+            fn get(self) -> T {
+                self.value
+            }
+        }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            impl<T> Trait for Wrapper<T> {
+                fn get(self) -> T {
+                    self.value
+                }
             }
         "}
 	);

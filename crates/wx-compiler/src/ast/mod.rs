@@ -231,6 +231,7 @@ define_diagnostic_codes! {
 		MissingInitializer => "E0010",
 		InvalidAttribute => "E0012",
 		InvalidNamespace => "E0013",
+		InvalidLabel => "E0014",
 		CrlfLineEndings => "W0001",
 		VisibilityNotPermitted => "W0002",
 	}
@@ -1374,14 +1375,16 @@ pub struct Attribute {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum ImplItem {
-	Method {
+	/// A method or associated function — TIR distinguishes the two after
+	/// parsing, by checking whether the first param is named `self`.
+	Function {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 		block: Box<Spanned<Expression>>,
 	},
-	Const {
+	Constant {
 		id: DefId,
 		name: Spanned<SymbolU32>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
@@ -1398,8 +1401,10 @@ pub enum ImplItem {
 impl ImplItem {
 	pub fn is_block_like(&self) -> bool {
 		match self {
-			ImplItem::Method { .. } => true,
-			ImplItem::Const { .. } | ImplItem::AssociatedType { .. } => false,
+			ImplItem::Function { .. } => true,
+			ImplItem::Constant { .. } | ImplItem::AssociatedType { .. } => {
+				false
+			}
 		}
 	}
 }
@@ -1580,15 +1585,17 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 		variants: Box<[Separated<Spanned<EnumVariant>>]>,
 	},
-	Impl {
+	/// `impl Type { ... }`
+	InherentImpl {
 		id: DefId,
 		type_params: Box<[TypeParam]>,
 		target: Box<Spanned<TypeExpression>>,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
-	/// `impl Trait for Type { ... }`
-	ImplTrait {
+	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
+	TraitImpl {
 		id: DefId,
+		type_params: Box<[TypeParam]>,
 		/// Plain path to the trait, e.g. `module::Trait`.
 		trait_name: Box<[PathSegment]>,
 		target: Box<Spanned<TypeExpression>>,
@@ -1671,8 +1678,8 @@ impl Item {
 			| Item::Export { .. }
 			| Item::Import { .. }
 			| Item::Enum { .. }
-			| Item::Impl { .. }
-			| Item::ImplTrait { .. }
+			| Item::InherentImpl { .. }
+			| Item::TraitImpl { .. }
 			| Item::Struct { .. }
 			| Item::Module { .. }
 			| Item::Trait { .. }
@@ -1702,8 +1709,8 @@ impl Item {
 			| Item::Export { .. }
 			| Item::Import { .. }
 			| Item::Enum { .. }
-			| Item::Impl { .. }
-			| Item::ImplTrait { .. }
+			| Item::InherentImpl { .. }
+			| Item::TraitImpl { .. }
 			| Item::Memory { .. }
 			| Item::Const { .. }
 			| Item::Module { .. }
@@ -3733,7 +3740,20 @@ impl<'ctx> Parser<'ctx> {
 			{
 				segs[0].ident
 			}
-			_ => unreachable!(),
+			_ => {
+				parser.ast.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::InvalidLabel.code())
+						.with_message("invalid label")
+						.with_label(
+							Label::primary(parser.ast.file_id, label_expr.span)
+								.with_message(
+									"a label must be a single identifier, not a path",
+								),
+						),
+				);
+				return Err(());
+			}
 		};
 		let colon_token = parser.next_expect(Token::Colon)?;
 
@@ -4522,7 +4542,7 @@ impl<'ctx> Parser<'ctx> {
 				let value = parser.parse_expression(BindingPower::Default)?;
 				let span = TextSpan::new(const_span.start, value.span.end);
 				Ok(Spanned {
-					inner: ImplItem::Const {
+					inner: ImplItem::Constant {
 						id: parser.id_generator.generate(),
 						name: Spanned {
 							inner: name_symbol,
@@ -4566,7 +4586,7 @@ impl<'ctx> Parser<'ctx> {
 				let block = Parser::parse_block_expression(parser)?;
 				let method_span = TextSpan::new(fn_span.start, block.span.end);
 				Ok(Spanned {
-					inner: ImplItem::Method {
+					inner: ImplItem::Function {
 						id: parser.id_generator.generate(),
 						pub_span,
 						attributes: attrs,
@@ -4638,8 +4658,9 @@ impl<'ctx> Parser<'ctx> {
 
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
-				inner: Item::ImplTrait {
+				inner: Item::TraitImpl {
 					id: parser.id_generator.generate(),
+					type_params,
 					items: items.inner,
 					target,
 					trait_name,
@@ -4661,7 +4682,7 @@ impl<'ctx> Parser<'ctx> {
 
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
-			inner: Item::Impl {
+			inner: Item::InherentImpl {
 				id: parser.id_generator.generate(),
 				type_params,
 				items: items.inner,
@@ -5004,8 +5025,8 @@ impl<'ctx> Parser<'ctx> {
 			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
 			Item::Export { .. }
 			| Item::Import { .. }
-			| Item::Impl { .. }
-			| Item::ImplTrait { .. }
+			| Item::InherentImpl { .. }
+			| Item::TraitImpl { .. }
 			| Item::Memory { .. } => {
 				parser.ast.diagnostics.push(
 					Diagnostic::warning()

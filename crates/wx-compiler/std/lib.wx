@@ -3,34 +3,46 @@ pub const PAGE_SIZE: u32 = 65536;
 
 #[intrinsic]
 fn memory_grow<M: Memory>(mem: M, delta: M::Size) -> M::Size;
+
 #[intrinsic]
 fn memory_size<M: Memory>(mem: M) -> M::Size;
+
 #[intrinsic]
 fn slice_len<M: Memory, T>(slice: M::[]T) -> M::Size;
+
 #[intrinsic]
 fn slice_ptr<M: Memory, T>(slice: M::[]T) -> M::*T;
+
 #[intrinsic]
 fn slice_from_parts<M: Memory, T>(data: M::*T, len: M::Size) -> M::[]T;
+
 #[intrinsic]
 fn size_of<T, M: Memory>() -> M::Size;
+
 #[intrinsic]
 fn align_of<T, M: Memory>() -> M::Size;
+
 #[intrinsic]
 fn memory_fill<M: Memory>(dst: M::*mut u8, val: u8, len: M::Size);
+
 #[intrinsic]
 fn memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*mut u8, src: SrcMem::*u8, len: Size);
+
 #[intrinsic]
 fn i64_extend_i32(value: i32) -> i64;
+
 #[intrinsic]
 fn u64_extend_u32(value: u32) -> u64;
+
 #[intrinsic]
 fn i32_wrap_i64(value: i64) -> i32;
 
 pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }
+
 #[tag = "pointer_size"]
 pub typeset PointerSize { u32, u64 }
 
@@ -38,6 +50,7 @@ pub trait Memory {
     type Size: PointerSize;
 
     const MEMORY_INDEX: u32;
+
     const DATA_END: Self::*u8;
 
     #[inline]
@@ -65,6 +78,27 @@ impl<M: Memory> Layout<M> {
     #[inline]
     pub fn array<T>(count: M::Size) -> Self {
         Self::{ align: align_of::<T>(), size: size_of::<T>() * count }
+    }
+}
+
+pub trait Allocator {
+    type M: Memory;
+
+    fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+
+    #[inline]
+    fn alloc<T>(self: Self::M::*mut Self, value: T) -> Self::M::*mut T {
+        local ptr = self.reserve(Layout::of::<T>()) as Self::M::*mut T;
+        ptr.* = value;
+        ptr
+    }
+
+    #[inline]
+    fn alloc_slice<T>(self: Self::M::*mut Self, count: Self::M::Size) -> Self::M::[]mut T {
+        std::slice_from_parts(
+            self.reserve(Layout::array::<T>(count)) as Self::M::*T,
+            count,
+        ) as _
     }
 }
 

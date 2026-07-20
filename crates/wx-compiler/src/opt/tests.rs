@@ -860,7 +860,7 @@ fn test_no_fold_div_by_zero() {
 	let div_exists = opt
 		.data_nodes
 		.iter()
-		.any(|n| matches!(n.kind, DataNodeKind::Div { .. }));
+		.any(|n| matches!(n.kind, DataNodeKind::DivS { .. }));
 	assert!(
 		div_exists,
 		"Div(1, 0) must not be folded; nodes: {:#?}",
@@ -2014,5 +2014,79 @@ fn test_const_mul_power_of_two_fully_folds() {
 			.iter()
 			.any(|n| matches!(n.kind, DataNodeKind::Int { value: 12, .. })),
 		"expected Int{{12}} after constant fold"
+	);
+}
+
+// ── Signedness of instruction selection ───────────────────────────────────────
+
+/// `u32 > u32` must schedule `i32.gt_u`, not `i32.gt_s`: `gt(1, u32::MAX)`
+/// is false unsigned but true signed. The builder lowers every MIR
+/// comparison to the signed node kind (`GtS` et al.); the `*U` variants
+/// exist but are never constructed.
+#[test]
+fn test_u32_comparison_schedules_unsigned_instruction() {
+	let case = TestCase::new(indoc! {"
+        fn gt(a: u32, b: u32) -> bool { a > b }
+        export { gt }
+    "});
+	let body = case.schedule();
+	assert!(
+		body.iter().any(|i| matches!(i, Instruction::I32GtU)),
+		"u32 > u32 must emit i32.gt_u; got: {body:?}"
+	);
+}
+
+/// `u32 >> n` must schedule the logical shift `i32.shr_u`, not the
+/// arithmetic `i32.shr_s` (the builder hardcodes `ShrS` for `RightShift`).
+#[test]
+fn test_u32_right_shift_schedules_logical_shift() {
+	let case = TestCase::new(indoc! {"
+        fn shr(a: u32, b: u32) -> u32 { a >> b }
+        export { shr }
+    "});
+	let body = case.schedule();
+	assert!(
+		body.iter().any(|i| matches!(i, Instruction::I32ShrU)),
+		"u32 >> must emit i32.shr_u; got: {body:?}"
+	);
+}
+
+/// A pointer into a `Size = u64` memory is a 64-bit scalar: params,
+/// locals, and address operands must lower to I64, not I32.
+/// `mir::Type::Pointer` carries its memory's width for exactly this.
+#[test]
+fn test_memory64_pointer_param_is_i64() {
+	let case = TestCase::new(indoc! {"
+        memory stack: Memory where { Size = u64 };
+        fn id(p: stack::*u8) -> stack::*u8 { p }
+        export { id }
+    "});
+	let func = case.get_first_func();
+	let opt = Builder::build(&case.mir, func);
+	assert!(
+		matches!(
+			opt.data_nodes[0].kind,
+			DataNodeKind::Param {
+				index: 0,
+				ty: ScalarType::I64
+			}
+		),
+		"Memory64 pointer param must be I64; got {:?}",
+		opt.data_nodes[0].kind
+	);
+}
+
+/// `u32 / u32` must schedule `i32.div_u`, not `i32.div_s`:
+/// `0x8000_0000 / 2` differs between the two interpretations.
+#[test]
+fn test_u32_division_schedules_unsigned_div() {
+	let case = TestCase::new(indoc! {"
+        fn div(a: u32, b: u32) -> u32 { a / b }
+        export { div }
+    "});
+	let body = case.schedule();
+	assert!(
+		body.iter().any(|i| matches!(i, Instruction::I32DivU)),
+		"u32 / u32 must emit i32.div_u; got: {body:?}"
 	);
 }

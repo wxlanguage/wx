@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use codespan_reporting::diagnostic::Severity;
 use indoc::indoc;
 
 use super::*;
@@ -514,6 +515,98 @@ fn test_unused_trait_impl_eliminated_by_dce() {
     "});
 	// run, doubled<Num1>, Num1::value — Num2::value must not survive.
 	assert_eq!(case.mir.functions.len(), 3);
+}
+
+/// Same shape as `test_unused_trait_impl_eliminated_by_dce`'s call chain
+/// (`doubled`'s default body calls the abstract `value` on `Self`), but the
+/// impl providing `value` is generic (`impl<T> Scalable for Box<T>`) rather
+/// than concrete. Once `Self` is concretely `Box<i32>` at this call site,
+/// the abstract-dispatch path in `GenericMethodCall` lowering must
+/// monomorphize the generic impl's `value` through `mono_registry` rather
+/// than referencing its (nonexistent, since it was never eagerly emitted)
+/// unspecialized TIR id directly.
+#[test]
+fn test_generic_trait_impl_abstract_dispatch_monomorphizes() {
+	let case = TestCase::new(indoc! {"
+        trait Scalable {
+            fn value(self) -> i32;
+            fn doubled(self) -> i32 { self.value() * 2 }
+        }
+        struct Box<T> { v: T }
+        impl<T> Scalable for Box<T> {
+            fn value(self) -> i32 { 1 }
+        }
+        fn run(b: Box<i32>) -> i32 {
+            b.doubled()
+        }
+        export { run }
+    "});
+	// Errors only, not all diagnostics: `self` genuinely isn't read in
+	// `value`'s body (it can't meaningfully use `self.v` here — `T` is
+	// unbounded, so returning it as `i32` wouldn't type-check for a
+	// generic impl), so a legitimate, correctly-firing `unused variable`
+	// warning is expected and unrelated to what this test is about.
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(errors.is_empty(), "{:?}", errors);
+	// run, doubled<Box<i32>>, value<Box<i32>> — same shape as the concrete
+	// case, just monomorphized through the generic impl instead of reused
+	// directly.
+	assert_eq!(case.mir.functions.len(), 3);
+}
+
+/// `impl<T> Container for Box<T> { type Item = Wrapper<T>; ... }` — the
+/// associated type's value is a *composite* (`Wrapper<T>`, not a bare `T`),
+/// so resolving `C::Item` for a monomorphized `C = Box<i32>` must
+/// substitute the impl's own `T` inside `Wrapper<T>`'s structure (via a
+/// `current_substitutions` swap in `lower_type_index`'s
+/// `AssocTypeProjection` arm), not just a top-level `TypeParam` leaf.
+#[test]
+fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
+	let case = TestCase::new(indoc! {"
+        trait Container {
+            type Item;
+            fn wrap(self) -> Self::Item;
+        }
+        struct Box<T> { v: T }
+        struct Wrapper<T> { inner: T }
+        impl<T> Container for Box<T> {
+            type Item = Wrapper<T>;
+            fn wrap(self) -> Self::Item {
+                Wrapper::{ inner: self.v }
+            }
+        }
+        fn use_container<C: Container>(c: C) -> C::Item {
+            c.wrap()
+        }
+        fn run(b: Box<i32>) -> Wrapper<i32> {
+            use_container(b)
+        }
+        export { run }
+    "});
+	// Errors only, not all diagnostics: `Wrapper::inner` is only ever
+	// written (via the struct literal) and passed around as a whole value,
+	// never individually read back out anywhere in this program — a
+	// legitimate, correctly-firing `field never read` warning unrelated to
+	// what this test is about.
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(errors.is_empty(), "{:?}", errors);
+	let agg = case
+		.mir
+		.aggregates
+		.iter()
+		.find(|a| a.values.len() == 1 && a.values[0] == Type::I32)
+		.expect("Wrapper<i32> aggregate with I32 field not found");
+	assert_eq!(agg.layout.size, 4);
 }
 
 #[test]
@@ -1201,4 +1294,36 @@ fn test_generic_compound_assign_through_ptr_deref() {
 		case.tir.diagnostics
 	);
 	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_string_literal_dedup_is_per_memory() {
+	// The same literal must produce one static entry per *memory* it is
+	// used in — shared within a memory, duplicated across memories.
+	let case = TestCase::new(indoc! {"
+        memory first: Memory where { Size = u32 };
+        memory second: Memory where { Size = u32 };
+
+        fn a() -> first::[]u8 { \"hi\" }
+        fn b() -> second::[]u8 { \"hi\" }
+        fn c() -> first::[]u8 { \"hi\" }
+
+        export { a, b, c }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"unexpected TIR diagnostics: {:?}",
+		case.tir.diagnostics
+	);
+	assert_eq!(
+		case.mir.static_entries.len(),
+		2,
+		"expected one \"hi\" entry per memory"
+	);
+	let memories: Vec<_> =
+		case.mir.static_entries.iter().map(|e| e.memory).collect();
+	assert_ne!(
+		memories[0], memories[1],
+		"the two entries must target different memories"
+	);
 }

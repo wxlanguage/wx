@@ -18,29 +18,30 @@ use tower_lsp_server::ls_types::{
 	DidOpenTextDocumentParams, DidSaveTextDocumentParams,
 	DocumentFormattingParams, GotoDefinitionParams, GotoDefinitionResponse,
 	Hover, HoverContents, HoverParams, HoverProviderCapability,
-	InitializeParams, InitializeResult, InitializedParams, Location,
-	MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-	ParameterInformation, ParameterLabel, Position, Range, ReferenceParams,
-	RenameParams, SemanticToken, SemanticTokenType, SemanticTokensFullOptions,
-	SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-	SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities,
-	SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-	SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-	TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-	WorkspaceEdit,
+	ImplementationProviderCapability, InitializeParams, InitializeResult,
+	InitializedParams, Location, MarkupContent, MarkupKind, MessageType,
+	NumberOrString, OneOf, ParameterInformation, ParameterLabel, Position,
+	Range, ReferenceParams, RenameParams, SemanticToken, SemanticTokenType,
+	SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+	SemanticTokensParams, SemanticTokensResult,
+	SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp,
+	SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
+	TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+	TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::ast;
 use wx_compiler::ast::TextSpan;
 use wx_compiler::tir::{
-	ModuleDeclarationKind, SourceSpan, TIR, TypeParamInfo, TypeParamOwner,
+	ImplTarget, ModuleDeclarationKind, SourceSpan, TIR, TypeParamInfo,
+	TypeParamOwner,
 };
 use wx_compiler::vfs::{self, FileId, FileSource, NativeFileSource};
 
 mod completion;
 mod symbol_index;
 pub mod task;
-use symbol_index::{SymbolIndex, SymbolKind, build_symbol_index};
+use symbol_index::{ImplRef, SymbolIndex, SymbolKind, build_symbol_index};
 
 /// Ordered list of token types declared in the semantic tokens legend.
 #[repr(u32)]
@@ -185,6 +186,14 @@ enum Command {
 	},
 	Hover(HoverParams, oneshot::Sender<Option<Hover>>),
 	GotoDefinition(
+		GotoDefinitionParams,
+		oneshot::Sender<Option<GotoDefinitionResponse>>,
+	),
+	// `GotoImplementationParams`/`GotoImplementationResponse` are just type
+	// aliases for `GotoDefinitionParams`/`GotoDefinitionResponse` in
+	// `lsp_types` (see `lsp_types::request::GotoImplementation`) — reusing
+	// the same types here instead of importing the aliases.
+	GotoImplementation(
 		GotoDefinitionParams,
 		oneshot::Sender<Option<GotoDefinitionResponse>>,
 	),
@@ -386,13 +395,41 @@ async fn handle_command(
 					compiled.symbol_index.find_at_position(file_id, offset)?;
 				let def = compiled
 					.symbol_index
-					.definitions
-					.iter()
-					.find(|e| e.kind == info.kind)
+					.definition_for_kind(info.kind)
 					.map(|e| e.source)?;
 				let uri = file_id_to_uri(compiled, def.file_id)?;
 				let range = span_to_range(&compiled.graph.files, def)?;
 				Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
+			})();
+			let _ = reply.send(result);
+		}
+		Command::GotoImplementation(params, reply) => {
+			let result = (|| {
+				let (compiled, file_id) = resolve_uri(
+					state,
+					&params.text_document_position_params.text_document.uri,
+				)?;
+				let offset = position_to_offset(
+					&compiled.graph.files,
+					file_id,
+					params.text_document_position_params.position,
+				)?;
+				let info =
+					compiled.symbol_index.find_at_position(file_id, offset)?;
+				let locations = implementation_locations(
+					&compiled.tir,
+					&compiled.symbol_index,
+					info.kind,
+				)
+				.into_iter()
+				.filter_map(|source| {
+					let uri = file_id_to_uri(compiled, source.file_id)?;
+					let range = span_to_range(&compiled.graph.files, source)?;
+					Some(Location { uri, range })
+				})
+				.collect::<Vec<_>>();
+				(!locations.is_empty())
+					.then_some(GotoDefinitionResponse::Array(locations))
 			})();
 			let _ = reply.send(result);
 		}
@@ -409,11 +446,16 @@ async fn handle_command(
 				)?;
 				let info =
 					compiled.symbol_index.find_at_position(file_id, offset)?;
+				let search_kinds = reference_search_kinds(
+					&compiled.tir,
+					&compiled.symbol_index,
+					info.kind,
+				);
 				let locations = compiled
 					.symbol_index
 					.references
 					.iter()
-					.filter(|e| e.kind == info.kind)
+					.filter(|e| search_kinds.contains(&e.kind))
 					.chain(
 						params
 							.context
@@ -423,7 +465,7 @@ async fn handle_command(
 									.symbol_index
 									.definitions
 									.iter()
-									.filter(|d| d.kind == info.kind)
+									.filter(|d| search_kinds.contains(&d.kind))
 							})
 							.into_iter()
 							.flatten(),
@@ -662,7 +704,7 @@ async fn handle_command(
 
 				for entry in entries {
 					let Some(token_type) =
-						symbol_kind_to_token_type(&entry.kind)
+						symbol_kind_to_token_type(entry.kind)
 					else {
 						continue;
 					};
@@ -781,6 +823,9 @@ impl LanguageServer for Backend {
 					..Default::default()
 				}),
 				definition_provider: Some(OneOf::Left(true)),
+				implementation_provider: Some(
+					ImplementationProviderCapability::Simple(true),
+				),
 				references_provider: Some(OneOf::Left(true)),
 				rename_provider: Some(OneOf::Left(true)),
 				document_formatting_provider: Some(OneOf::Left(true)),
@@ -873,6 +918,17 @@ impl LanguageServer for Backend {
 		Ok(self
 			.state
 			.query(|reply| Command::GotoDefinition(params, reply))
+			.await
+			.flatten())
+	}
+
+	async fn goto_implementation(
+		&self,
+		params: GotoDefinitionParams,
+	) -> Result<Option<GotoDefinitionResponse>> {
+		Ok(self
+			.state
+			.query(|reply| Command::GotoImplementation(params, reply))
 			.await
 			.flatten())
 	}
@@ -1636,6 +1692,15 @@ fn symbol_hover_text(
 			};
 			Some(format!("{pub_prefix}global {mut_kw}{name}: {type_str}"))
 		}
+		SymbolKind::Memory(def_id) => {
+			let mi = tir.memory_index(*def_id)? as usize;
+			let memory = &tir.memories[mi];
+			let name = interner.resolve(memory.name.inner).unwrap_or("?");
+			let size_str = fmt.display_type(memory.kind).unwrap();
+			Some(format!(
+				"memory {name}: Memory where {{ Size = {size_str} }}"
+			))
+		}
 		SymbolKind::Struct(def_id) => {
 			let struct_ =
 				tir.structs.get(tir.struct_index(*def_id)? as usize)?;
@@ -1655,6 +1720,14 @@ fn symbol_hover_text(
 			let pub_prefix = if enum_.pub_span.is_some() { "pub " } else { "" };
 			let repr = fmt.display_type(enum_.repr_type).unwrap();
 			Some(format!("{pub_prefix}enum {name}: {repr} {{ ... }}"))
+		}
+		SymbolKind::InherentImplSelf(block_idx) => {
+			let target = tir.inherent_impls.get(*block_idx as usize)?.target;
+			Some(format!("Self = {}", fmt.display_type(target.inner).ok()?))
+		}
+		SymbolKind::TraitImplSelf(trait_impl_idx) => {
+			let target = tir.trait_impls.get(*trait_impl_idx as usize)?.target;
+			Some(format!("Self = {}", fmt.display_type(target.inner).ok()?))
 		}
 		SymbolKind::Local {
 			func_id,
@@ -1681,6 +1754,13 @@ fn symbol_hover_text(
 			let type_str = fmt.display_type(param.ty.inner).unwrap();
 			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("{mut_kw}{name}: {type_str}"))
+		}
+		SymbolKind::SelfParam(func_id) => {
+			let fi = tir.function_index(*func_id)? as usize;
+			let param = tir.functions[fi].params.first()?;
+			let type_str = fmt.display_type(param.ty.inner).unwrap();
+			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
+			Some(format!("{mut_kw}self: {type_str}"))
 		}
 		SymbolKind::EnumVariant {
 			enum_id,
@@ -1740,7 +1820,7 @@ fn symbol_hover_text(
 					tir.structs[si].type_params.get(param_index)?
 				}
 				TypeParamOwner::ImplBlock(block_idx) => tir
-					.impl_block_list
+					.inherent_impls
 					.get(*block_idx as usize)?
 					.type_params
 					.get(param_index)?,
@@ -1752,6 +1832,7 @@ fn symbol_hover_text(
 					let ai = tir.type_alias_index(*def_id)? as usize;
 					tir.type_aliases[ai].type_params.get(param_index)?
 				}
+				TypeParamOwner::TraitImpl(_) => return None,
 			};
 			let name = interner.resolve(tp.name.inner).unwrap();
 			let bounds_str = fmt.display_bounds(&tp.bounds).unwrap_or_default();
@@ -1888,26 +1969,156 @@ fn find_active_call(source: &str, offset: usize) -> Option<ActiveCall> {
 	})
 }
 
-fn symbol_kind_to_token_type(kind: &SymbolKind) -> Option<TokenType> {
+fn symbol_kind_to_token_type(kind: SymbolKind) -> Option<TokenType> {
 	let tt = match kind {
 		SymbolKind::Function(_) => TokenType::Function,
 		SymbolKind::Global(_)
 		| SymbolKind::Const(_)
+		| SymbolKind::Memory(_)
 		| SymbolKind::Local { .. }
 		| SymbolKind::StructField { .. } => TokenType::Variable,
 		SymbolKind::Enum(_) => TokenType::Enum,
 		SymbolKind::Struct(_) => TokenType::Struct,
 		SymbolKind::Namespace(_) => TokenType::Namespace,
 		SymbolKind::Param { .. } => TokenType::Parameter,
+		// The `self` receiver — excluded for the same reason as
+		// `InherentImplSelf`/`TraitImplSelf` below: it's the `self` keyword,
+		// not a name the user chose, so it shouldn't be colored like an
+		// ordinary parameter.
+		SymbolKind::SelfParam(_) => return None,
 		SymbolKind::EnumVariant { .. } => TokenType::EnumMember,
 		SymbolKind::Trait(_) => TokenType::Interface,
+		// The trait's implicit `Self` is the only `TypeParam` a `Trait`
+		// owns (see `Trait::self_type_param`) — excluded here for the same
+		// reason as `InherentImplSelf`/`TraitImplSelf` below: it's the
+		// `Self` keyword, not a name the user wrote, so it shouldn't be
+		// colored like a type-parameter reference.
+		SymbolKind::TypeParam {
+			owner: TypeParamOwner::Trait(_),
+			..
+		} => return None,
 		SymbolKind::TypeParam { .. } => TokenType::TypeParameter,
 		SymbolKind::AssocType { .. } | SymbolKind::TypeSet(_) => {
 			TokenType::Type
 		}
 		SymbolKind::Label { .. } => return None,
+		// `Self` inside an impl block or trait impl — excluded so the
+		// editor's grammar-based keyword highlighting applies instead (the
+		// original ask this whole feature exists for), matching how
+		// rust-analyzer treats `self`/`Self`. See
+		// `symbol_index::SymbolKind::InherentImplSelf`.
+		SymbolKind::InherentImplSelf(_) | SymbolKind::TraitImplSelf(_) => {
+			return None;
+		}
 	};
 	Some(tt)
+}
+
+/// Every `SymbolKind` that should count as "a reference to the same thing"
+/// as `kind`, for `textDocument/references`. For most kinds this is just
+/// `[kind]` — unchanged. For a struct/enum (or `Self` inside one of its
+/// impls, normalized to the struct/enum it resolves to first), it's the
+/// struct/enum's own kind plus `InherentImplSelf`/`TraitImplSelf` for every
+/// impl block/trait impl targeting that type — so `Self` usages inside
+/// those impls show up as references too, the way a literal name reference
+/// would (matches rust-analyzer). Looked up via `SymbolIndex`'s
+/// `ImplTarget`-keyed reverse indices (O(1)) rather than scanning
+/// `impl_block_list`/`trait_impls` per query. `Rename` deliberately does
+/// *not* use this — it must stay exact-kind-only, or it would rewrite
+/// `Self` keyword text.
+fn reference_search_kinds(
+	tir: &TIR,
+	index: &SymbolIndex,
+	kind: SymbolKind,
+) -> Vec<SymbolKind> {
+	let target = match kind {
+		SymbolKind::Struct(id) => tir.struct_index(id).map(ImplTarget::Struct),
+		SymbolKind::Enum(id) => tir.enum_index(id).map(ImplTarget::Enum),
+		SymbolKind::InherentImplSelf(block_idx) => {
+			tir.inherent_impls.get(block_idx as usize).and_then(|b| {
+				ImplTarget::from_type(&tir.types[b.target.inner.as_usize()])
+					.ok()
+			})
+		}
+		SymbolKind::TraitImplSelf(trait_impl_idx) => {
+			tir.trait_impls.get(trait_impl_idx as usize).and_then(|ti| {
+				ImplTarget::from_type(&tir.types[ti.target.inner.as_usize()])
+					.ok()
+			})
+		}
+		_ => return vec![kind],
+	};
+	let target_kind = target.and_then(|t| match t {
+		ImplTarget::Struct(idx) => {
+			Some(SymbolKind::Struct(tir.structs.get(idx as usize)?.id))
+		}
+		ImplTarget::Enum(idx) => {
+			Some(SymbolKind::Enum(tir.enums.get(idx as usize)?.id))
+		}
+		_ => None,
+	});
+	let (Some(target), Some(target_kind)) = (target, target_kind) else {
+		return vec![kind];
+	};
+	let mut kinds = vec![target_kind];
+	if let Some(refs) = index.impls_by_target.get(&target) {
+		kinds.extend(refs.iter().map(|r| match r {
+			ImplRef::Inherent(idx) => SymbolKind::InherentImplSelf(*idx),
+			ImplRef::Trait(idx) => SymbolKind::TraitImplSelf(*idx),
+		}));
+	}
+	kinds
+}
+
+/// Every location `textDocument/implementation` should jump to for `kind`:
+/// for a struct/enum, every impl block or trait impl targeting it (any
+/// instantiation, via the same `ImplTarget`-keyed indices
+/// `reference_search_kinds` uses); for a trait, every impl of that trait,
+/// regardless of target type. Each location is the impl header's own
+/// target-type span (`impl Target { }` / `impl Trait for Target { }`),
+/// matching rust-analyzer's landing spot. Empty for every other kind — `Self`
+/// itself isn't a sensible place to ask "go to implementations" from.
+fn implementation_locations(
+	tir: &TIR,
+	index: &SymbolIndex,
+	kind: SymbolKind,
+) -> Vec<SourceSpan> {
+	let target = match kind {
+		SymbolKind::Struct(id) => tir.struct_index(id).map(ImplTarget::Struct),
+		SymbolKind::Enum(id) => tir.enum_index(id).map(ImplTarget::Enum),
+		SymbolKind::Trait(id) => {
+			let Some(trait_index) = tir.trait_index(id) else {
+				return Vec::new();
+			};
+			return tir
+				.trait_impls
+				.iter()
+				.filter(|ti| ti.trait_index == trait_index)
+				.map(|ti| SourceSpan::new(ti.file_id, ti.target.span))
+				.collect();
+		}
+		_ => return Vec::new(),
+	};
+	let Some(target) = target else {
+		return Vec::new();
+	};
+	index
+		.impls_by_target
+		.get(&target)
+		.into_iter()
+		.flatten()
+		.copied()
+		.filter_map(|impl_ref| match impl_ref {
+			ImplRef::Inherent(idx) => tir
+				.inherent_impls
+				.get(idx as usize)
+				.map(|b| SourceSpan::new(b.file_id, b.target.span)),
+			ImplRef::Trait(idx) => tir
+				.trait_impls
+				.get(idx as usize)
+				.map(|ti| SourceSpan::new(ti.file_id, ti.target.span)),
+		})
+		.collect()
 }
 
 // ── Helpers

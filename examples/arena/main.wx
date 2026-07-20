@@ -1,0 +1,17 @@
+use std::*;
+
+struct Arena<M: Memory> {
+    start: M::*u8,
+    end: M::*u8,
+    cursor: M::*u8,
+}
+
+impl<M: Memory> Arena<M> {
+    fn new(buffer: M::[]u8) -> Self {
+        Self::{
+            start: buffer.ptr(),
+            end: ptr::add(buffer.ptr(), buffer.len()),
+            cursor: buffer.ptr(),
+        }
+    }
+}

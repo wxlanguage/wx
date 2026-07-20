@@ -12,9 +12,11 @@ use crate::symbol_index::SymbolKind;
 use crate::{
 	Backend, CompiledRoot, OpenDocument, ServerState, analyze_root,
 	build_service, compute_refresh, diagnostic_publish_paths,
-	discover_crate_root, find_active_call, owning_root,
+	discover_crate_root, find_active_call, implementation_locations,
+	owning_root, reference_search_kinds, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
+use wx_compiler::tir::TypeParamOwner;
 
 /// Exercises `Backend` through its real `LanguageServer` trait methods
 /// (rather than the `ServerState` free functions the other tests in this
@@ -374,6 +376,59 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 }
 
 #[test]
+fn completion_in_type_annotation_position_excludes_functions_and_consts() {
+	// Regression test: `CompletionContext::TypeAnnotation` used to reuse
+	// `global_completion_items` wholesale, which includes every kind
+	// (functions, consts, globals, traits, ...) valid in *value* position —
+	// so typing `local x: ` offered a free function or const as if it were
+	// a type. Fixed by `type_completion_items`, restricted to
+	// `is_type_like` kinds (`Struct`/`Enum`/`TypeSet`/`Namespace`).
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		}
+
+		const MAX: i32 = 10;
+
+		fn helper() -> i32 {
+		    0
+		}
+
+		fn test() {
+		    local p:
+		}
+	"};
+	let cursor = source.find("local p:").unwrap() + "local p:".len();
+
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		cursor,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+	assert!(
+		labels.contains(&"Point"),
+		"expected struct `Point` in type-position completions; got: {labels:?}"
+	);
+	assert!(
+		!labels.contains(&"MAX"),
+		"const `MAX` must not be offered in type position; got: {labels:?}"
+	);
+	assert!(
+		!labels.contains(&"helper"),
+		"function `helper` must not be offered in type position; got: {labels:?}"
+	);
+}
+
+#[test]
 fn completion_excludes_impl_methods_and_associated_functions() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! { "
@@ -427,6 +482,52 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 	assert!(
 		!labels.contains(&"sum"),
 		"method `Point::sum` must not be bare-callable; got: {labels:?}"
+	);
+}
+
+#[test]
+fn completion_excludes_enum_variants_from_bare_identifier_position() {
+	// Regression test: enum variants are only ever resolved as a qualified
+	// member (`Enum::Variant` — see `ResolvedMember::EnumVariant` in
+	// `tir/builder.rs`, the sole place they're resolved), never as a bare
+	// name, but `build_symbol_index` unconditionally pushed them into
+	// `global_definitions` (unlike methods/associated consts, which already
+	// gate on `parent.is_none()`), so they leaked into plain-identifier
+	// completion as if `StdIn` alone were a valid expression.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! { "
+		enum FileDescriptor: u8 {
+		    StdIn,
+		    StdOut,
+		    StdErr,
+		}
+
+		fn test() {
+
+		}
+	" };
+	let cursor = source.find("fn test() {\n").unwrap() + "fn test() {\n".len();
+
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		cursor,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+	assert!(
+		labels.contains(&"FileDescriptor"),
+		"expected enum `FileDescriptor` in completions; got: {labels:?}"
+	);
+	assert!(
+		!labels.contains(&"StdIn"),
+		"variant `FileDescriptor::StdIn` must not be bare-accessible; got: {labels:?}"
 	);
 }
 
@@ -585,6 +686,121 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 	assert!(
 		labels.contains(&"add"),
 		"expected `add` visible after `use math::*;`; got: {labels:?}"
+	);
+}
+
+#[test]
+fn path_completion_after_enum_lists_variants() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		enum FileDescriptor: u8 {
+		    StdIn,
+		    StdOut,
+		    StdErr,
+		}
+
+		fn test() {
+		    FileDescriptor::
+		}
+	"};
+	let cursor =
+		source.find("FileDescriptor::").unwrap() + "FileDescriptor::".len();
+
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		cursor,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+	assert!(
+		labels.contains(&"StdIn")
+			&& labels.contains(&"StdOut")
+			&& labels.contains(&"StdErr"),
+		"expected all three variants after `FileDescriptor::`; got: {labels:?}"
+	);
+}
+
+#[test]
+fn path_completion_after_struct_lists_only_pub_methods() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		}
+
+		impl Point {
+		    pub fn origin() -> Self {
+		        Self::{ x: 0 }
+		    }
+
+		    fn private_helper() -> i32 {
+		        0
+		    }
+		}
+
+		fn test() {
+		    Point::
+		}
+	"};
+	let cursor = source.rfind("Point::").unwrap() + "Point::".len();
+
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		cursor,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+	assert!(
+		labels.contains(&"origin"),
+		"expected `pub fn origin` after `Point::`; got: {labels:?}"
+	);
+	assert!(
+		!labels.contains(&"private_helper"),
+		"non-pub `private_helper` must not be offered via `Point::`; got: {labels:?}"
+	);
+}
+
+#[test]
+fn path_completion_after_namespace_lists_module_members() {
+	let root = PathBuf::from("/test/main.wx");
+	let math = PathBuf::from("/test/math.wx");
+	let source = "module math;\nfn test() {\n    math::\n}";
+	let cursor = source.find("math::\n").unwrap() + "math::".len();
+
+	let (_, compiled) = compile_multi_source(
+		&root,
+		source,
+		&[(&math, "pub fn add() -> i32 { 1 }")],
+	);
+	let file_id = file_id_for(&compiled, &root);
+
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		cursor,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+	assert!(
+		labels.contains(&"add"),
+		"expected `add` after `math::`; got: {labels:?}"
 	);
 }
 
@@ -801,6 +1017,645 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 			..definition.source.span.end as usize],
 		"Status",
 		"go-to-definition should land on the `enum Status` name"
+	);
+}
+
+#[test]
+fn self_type_in_trait_method_resolves_to_trait_definition() {
+	// Regression test: `build_symbol_index` recorded accesses for a trait's
+	// own name and its associated types, but never read the trait's implicit
+	// `self_type_param` — so a `Self` reference inside a trait method (e.g. a
+	// return type) had no reference entry and hover/go-to-definition on it
+	// silently did nothing.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Cloneable {
+		    fn duplicate(self) -> Self;
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let self_offset = source.find("-> Self").unwrap() + "-> ".len();
+
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, self_offset as u32)
+		.unwrap_or_else(|| panic!("expected a symbol at the `Self` position"));
+
+	assert!(
+		matches!(
+			found.kind,
+			SymbolKind::TypeParam {
+				owner: TypeParamOwner::Trait(_),
+				param_index: 0
+			}
+		),
+		"expected the `Self` reference to resolve to the trait's implicit type param; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definition_for_kind(found.kind)
+		.expect("expected a matching Self type param redirect target");
+	assert_eq!(
+		&source[definition.source.span.start as usize
+			..definition.source.span.end as usize],
+		"Cloneable",
+		"go-to-definition for `Self` should land on the enclosing trait's name"
+	);
+}
+
+#[test]
+fn trait_own_name_resolves_to_trait_not_self_type_param() {
+	// Regression test: the trait's own declared name sits at the exact same
+	// span as its implicit `self_type_param`'s redirect target
+	// (`self_type_param.name.span` is set to the trait's own `name.span` at
+	// construction — see `self_type_in_trait_method_resolves_to_trait_definition`).
+	// Before `transparent_definitions` existed, both lived in `definitions`,
+	// and `find_narrowest`'s reversed iteration order happened to prefer the
+	// type-param entry on that tie — so clicking the trait's own declared
+	// name resolved as `TypeParam { owner: Trait(_), .. }` instead of
+	// `Trait`. Go-to-definition itself was unaffected (both kinds' redirect
+	// targets are this same span either way), but everything else keyed off
+	// `SymbolKind` was wrong: hover showed the type-param's text instead of
+	// the trait's, semantic tokens emitted two conflicting overlapping
+	// entries for one span, and — worst — Rename from this position would
+	// have renamed every `Self` occurrence in the trait's default bodies
+	// while leaving the trait's own name untouched.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Cloneable {
+		    fn duplicate(self) -> Self;
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let trait_name_offset =
+		source.find("trait Cloneable").unwrap() + "trait ".len();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, trait_name_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the trait's own declared name")
+		});
+
+	assert!(
+		matches!(found.kind, SymbolKind::Trait(_)),
+		"expected the trait's own name to resolve as SymbolKind::Trait, not the implicit Self type param; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definition_for_kind(found.kind)
+		.expect("expected a matching trait definition entry");
+	assert_eq!(
+		definition.source.span.start, trait_name_offset as u32,
+		"sanity check: a Trait definition's redirect target is its own declaration site"
+	);
+}
+
+#[test]
+fn self_type_in_impl_block_resolves_to_struct_definition() {
+	// Regression test: `Self` inside a plain `impl` block resolves to the
+	// target's concrete `Type::Struct`/`Type::Enum` directly (not a
+	// `Type::TypeParam`). It's tracked as `SymbolKind::InherentImplSelf`
+	// rather than `SymbolKind::Struct` — same underlying target, but a
+	// distinct kind — so `Rename` (which matches purely on `SymbolKind`
+	// equality) renaming the struct doesn't also rewrite the `Self`
+	// keyword text. Hover/go-to-definition still redirect to the impl's
+	// target type, via a synthetic definition entry at the impl header's
+	// own target span.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		    y: i32,
+		}
+
+		impl Point {
+		    pub fn origin() -> Self {
+		        Self::{ x: 0, y: 0 }
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let return_type_offset = source.find("-> Self").unwrap() + "-> ".len();
+
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, return_type_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `Self` return type position")
+		});
+
+	assert!(
+		matches!(found.kind, SymbolKind::InherentImplSelf(_)),
+		"expected the `Self` reference to resolve to the impl block; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definition_for_kind(found.kind)
+		.expect("expected a matching InherentImplSelf redirect target");
+	assert_eq!(
+		&source[definition.source.span.start as usize
+			..definition.source.span.end as usize],
+		"Point",
+		"go-to-definition for `Self` should land on the impl header's target"
+	);
+
+	// `Self::{ .. }` struct-init syntax goes through a different call site
+	// than the return-type position but funnels into the same resolution
+	// function, so it should resolve too.
+	let init_offset = source.find("Self::{").unwrap();
+	let found_init = compiled
+		.symbol_index
+		.find_at_position(file_id, init_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `Self::{{ }}` init position")
+		});
+	assert!(
+		matches!(found_init.kind, SymbolKind::InherentImplSelf(_)),
+		"expected `Self::{{ }}` to resolve to the impl block; got: {found_init:?}"
+	);
+}
+
+#[test]
+fn self_receiver_param_resolves_to_self_param_not_plain_param() {
+	// Regression test: a method's `self` receiver used to be indistinguishable
+	// from any other named parameter (`SymbolKind::Param { func_id,
+	// param_idx: 0 }`), so semantic tokens colored it like an ordinary
+	// parameter instead of leaving it to the editor's keyword highlighting —
+	// same class of bug as `Self`/`self` inside impl bodies. Fixed by giving
+	// it its own `SymbolKind::SelfParam`, detected the same way TIR itself
+	// decides a function is a method: first param named `self`.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		}
+
+		impl Point {
+		    pub fn x_value(self) -> i32 {
+		        self.x
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let param_offset = source.find("(self)").unwrap() + "(".len();
+	let found_param = compiled
+		.symbol_index
+		.find_at_position(file_id, param_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `self` parameter position")
+		});
+	assert!(
+		matches!(found_param.kind, SymbolKind::SelfParam(_)),
+		"expected the `self` receiver to resolve to SymbolKind::SelfParam; got: {found_param:?}"
+	);
+
+	let body_offset = source.find("self.x").unwrap();
+	let found_body = compiled
+		.symbol_index
+		.find_at_position(file_id, body_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `self` body reference")
+		});
+	assert!(
+		matches!(found_body.kind, SymbolKind::SelfParam(_)),
+		"expected `self.x` to resolve to SymbolKind::SelfParam too; got: {found_body:?}"
+	);
+
+	assert!(
+		symbol_kind_to_token_type(found_param.kind).is_none(),
+		"the `self` receiver must not get a semantic token — the editor's \
+		 keyword grammar highlights it instead"
+	);
+}
+
+#[test]
+fn impl_header_target_resolves_to_struct_not_self() {
+	// Regression test: the impl header's own target mention (`impl Point`'s
+	// `Point`) sits at the exact same span as `InherentImplSelf`'s redirect
+	// target (`Self` inside the impl lands there too). Before
+	// `transparent_definitions` existed, both lived in `definitions`, and
+	// `find_at_position` ties toward definitions — so clicking the header's
+	// own `Point` resolved as `InherentImplSelf`, whose redirect target was
+	// that exact same position, making go-to-definition a no-op (which
+	// editors typically show as a references picker instead of navigating).
+	// It must resolve as a plain `Struct` reference instead, landing on the
+	// real `struct Point` declaration.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		}
+
+		impl Point {
+		    pub fn origin() -> Self {
+		        Self::{ x: 0 }
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let header_target_offset =
+		source.find("impl Point").unwrap() + "impl ".len();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, header_target_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the impl header's `Point`")
+		});
+
+	assert!(
+		matches!(found.kind, SymbolKind::Struct(_)),
+		"expected the impl header's own target to resolve as a plain struct reference, not InherentImplSelf; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definition_for_kind(found.kind)
+		.expect("expected a matching struct definition entry");
+	let declaration_offset =
+		source.find("struct Point").unwrap() + "struct ".len();
+	assert_eq!(
+		definition.source.span.start, declaration_offset as u32,
+		"go-to-definition on the impl header's target should land on the real `struct Point` declaration, not the impl header itself"
+	);
+}
+
+#[test]
+fn reference_search_kinds_merges_self_usages_targeting_the_struct() {
+	// Regression test: `textDocument/references` on a struct name used to
+	// match `SymbolKind::Struct` exactly, so it missed every `Self` usage
+	// inside that struct's own impls — tracked separately as
+	// `InherentImplSelf` specifically so `Rename` wouldn't rewrite them
+	// (see `self_type_in_impl_block_resolves_to_struct_definition`), but
+	// References should still surface them, matching rust-analyzer.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point {
+		    x: i32,
+		}
+
+		impl Point {
+		    pub fn origin() -> Self {
+		        Self::{ x: 0 }
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let struct_name_offset =
+		source.find("struct Point").unwrap() + "struct ".len();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, struct_name_offset as u32)
+		.unwrap_or_else(|| panic!("expected a symbol at the `Point` name"));
+	assert!(
+		matches!(found.kind, SymbolKind::Struct(_)),
+		"expected the struct name to resolve to SymbolKind::Struct; got: {found:?}"
+	);
+
+	let search_kinds = reference_search_kinds(
+		&compiled.tir,
+		&compiled.symbol_index,
+		found.kind,
+	);
+	assert!(
+		search_kinds.contains(&found.kind),
+		"expected the literal struct name kind to still be included"
+	);
+	assert!(
+		search_kinds
+			.iter()
+			.any(|k| matches!(k, SymbolKind::InherentImplSelf(_))),
+		"expected `Self` usages in Point's impl to be merged in; got: {search_kinds:?}"
+	);
+	assert_eq!(
+		search_kinds.len(),
+		2,
+		"expected exactly the struct kind plus one InherentImplSelf kind (one impl block); got: {search_kinds:?}"
+	);
+
+	// Rename must NOT use this merge — it stays exact-kind-only, or it
+	// would rewrite `Self` keyword text when renaming the struct.
+	let rename_kinds = compiled
+		.symbol_index
+		.references
+		.iter()
+		.filter(|e| e.kind == found.kind);
+	assert!(
+		rename_kinds.clone().count() > 0,
+		"sanity check: Point should have at least one literal reference"
+	);
+	assert!(
+		rename_kinds
+			.clone()
+			.all(|e| !matches!(e.kind, SymbolKind::InherentImplSelf(_))),
+		"exact-kind filtering (what Rename uses) must never include InherentImplSelf"
+	);
+}
+
+#[test]
+fn implementation_locations_finds_inherent_and_trait_impls_of_a_struct() {
+	// `textDocument/implementation` on `struct Point` should land on both
+	// impl headers' target-type spans — the inherent `impl Point { }` and
+	// the `impl Drawable for Point { }` trait impl — reusing the same
+	// `ImplTarget`-keyed reverse indices `reference_search_kinds` uses.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Drawable {
+		    fn draw(&self) -> i32;
+		}
+
+		struct Point {
+		    x: i32,
+		}
+
+		impl Point {
+		    pub fn origin() -> Self {
+		        Self::{ x: 0 }
+		    }
+		}
+
+		impl Drawable for Point {
+		    fn draw(&self) -> i32 {
+		        self.x
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let struct_name_offset =
+		source.find("struct Point").unwrap() + "struct ".len();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, struct_name_offset as u32)
+		.unwrap_or_else(|| panic!("expected a symbol at the `Point` name"));
+	assert!(matches!(found.kind, SymbolKind::Struct(_)));
+
+	let locations = implementation_locations(
+		&compiled.tir,
+		&compiled.symbol_index,
+		found.kind,
+	);
+	assert_eq!(
+		locations.len(),
+		2,
+		"expected the inherent impl and the trait impl; got: {locations:?}"
+	);
+
+	let inherent_target_offset =
+		source.find("impl Point").unwrap() + "impl ".len();
+	let trait_impl_target_offset =
+		source.find("impl Drawable for Point").unwrap()
+			+ "impl Drawable for ".len();
+	let offsets: Vec<u32> = locations.iter().map(|s| s.span.start).collect();
+	assert!(
+		offsets.contains(&(inherent_target_offset as u32)),
+		"expected a location at the inherent impl's target span; got: {offsets:?}"
+	);
+	assert!(
+		offsets.contains(&(trait_impl_target_offset as u32)),
+		"expected a location at the trait impl's target span; got: {offsets:?}"
+	);
+}
+
+#[test]
+fn implementation_locations_finds_impls_of_a_trait() {
+	// `textDocument/implementation` on `trait Drawable` should land on every
+	// impl of it, regardless of target type.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Drawable {
+		    fn draw(&self) -> i32;
+		}
+
+		struct Point {
+		    x: i32,
+		}
+
+		impl Drawable for Point {
+		    fn draw(&self) -> i32 {
+		        self.x
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let trait_name_offset =
+		source.find("trait Drawable").unwrap() + "trait ".len();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, trait_name_offset as u32)
+		.unwrap_or_else(|| panic!("expected a symbol at the `Drawable` name"));
+	assert!(matches!(found.kind, SymbolKind::Trait(_)));
+
+	let locations = implementation_locations(
+		&compiled.tir,
+		&compiled.symbol_index,
+		found.kind,
+	);
+	let trait_impl_target_offset =
+		source.find("impl Drawable for Point").unwrap()
+			+ "impl Drawable for ".len();
+	assert_eq!(
+		locations.iter().map(|s| s.span.start).collect::<Vec<_>>(),
+		vec![trait_impl_target_offset as u32]
+	);
+}
+
+#[test]
+fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
+	// Regression test: `Self::Elem` inside a plain `impl Heap { .. }` block
+	// (where `Heap` implements `Container` elsewhere) resolves `Self` to the
+	// concrete `Heap` struct, so the `Elem` lookup went through
+	// `resolve_impl_member`'s trait-impl fallback in the TIR builder — which
+	// never recorded an access on `Container`'s associated type. Fixed by
+	// having `resolve_impl_member` report which trait a member came from
+	// (`MemberLookup::Trait { trait_index, .. }`) so the caller can record it.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Bound {}
+		impl Bound for u32 {}
+		trait Container {
+		    type Elem: Bound;
+		}
+		struct Heap {}
+		impl Container for Heap {
+		    type Elem = u32;
+		}
+		impl Heap {
+		    fn zero() -> Self::Elem {
+		        0
+		    }
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let self_elem_offset = source.find("Self::Elem").unwrap() + "Self::".len();
+
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, self_elem_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `Self::Elem` position")
+		});
+
+	assert!(
+		matches!(found.kind, SymbolKind::AssocType { .. }),
+		"expected `Self::Elem` to resolve to the associated type; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definitions
+		.iter()
+		.find(|d| d.kind == found.kind)
+		.expect("expected a matching associated type definition entry");
+	assert_eq!(
+		&source[definition.source.span.start as usize
+			..definition.source.span.end as usize],
+		"Elem",
+		"go-to-definition for `Self::Elem` should land on the trait's `type Elem` declaration"
+	);
+}
+
+#[test]
+fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
+	// Regression test: `memory` declarations never recorded any access at
+	// all (unlike struct/enum/trait/const), and `wx-lsp`'s `SymbolKind` had
+	// no `Memory` variant to begin with — so hover/go-to-definition on a
+	// memory name silently did nothing everywhere: as a type (`heap::[]u8`,
+	// `type M = heap;`), as a value receiver (`heap.size()`), and in an
+	// `export { heap as "..." }` list.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		use std::*;
+
+		memory heap: Memory where { Size = u32 } { min_pages: 1 };
+
+		fn heap_size() -> u32 {
+		    heap.size()
+		}
+
+		export {
+		    heap as \"memory\",
+		    heap_size
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let definition = compiled
+		.symbol_index
+		.definitions
+		.iter()
+		.find(|d| matches!(d.kind, SymbolKind::Memory(_)))
+		.expect("expected a definition entry for `memory heap`");
+
+	// Value position: `heap.size()`.
+	let value_offset = source.find("heap.size()").unwrap();
+	let found_value = compiled
+		.symbol_index
+		.find_at_position(file_id, value_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `heap.size()` receiver position")
+		});
+	assert_eq!(
+		found_value.kind, definition.kind,
+		"expected `heap` in `heap.size()` to resolve to the memory declaration"
+	);
+
+	// Export-list position: `heap as "memory"`.
+	let export_offset = source.find("heap as").unwrap();
+	let found_export = compiled
+		.symbol_index
+		.find_at_position(file_id, export_offset as u32)
+		.unwrap_or_else(|| {
+			panic!(
+				"expected a symbol at the `heap as \"memory\"` export position"
+			)
+		});
+	assert_eq!(
+		found_export.kind, definition.kind,
+		"expected `heap` in the export list to resolve to the memory declaration"
+	);
+}
+
+#[test]
+fn memory_associated_const_namespace_access_resolves() {
+	// Regression test: `heap::DATA_END` resolves fine in the TIR (its access
+	// is correctly recorded on a per-memory `Constant` forked by
+	// `seed_memory_trait_impl_with`), but that forked const never gets a
+	// `value` (its value is compiler-synthesized, not a user-written
+	// initializer) — and `build_symbol_index`'s constant loop gated *both*
+	// definitions and references behind `constant.value.is_some()`, which
+	// wrongly excludes any associated const that structurally never has a
+	// value (this one, and a trait's own abstract `const NAME: T;`
+	// declaration). So `heap::DATA_END` had no definition or reference
+	// entry at all — hover/go-to-definition silently did nothing.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		use std::*;
+
+		memory heap: Memory where { Size = u32 } { min_pages: 1 };
+		global mut bump: *u8 = heap::DATA_END;
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	let data_end_offset = source.find("DATA_END").unwrap();
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, data_end_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the `heap::DATA_END` position")
+		});
+	assert!(
+		matches!(found.kind, SymbolKind::Const(_)),
+		"expected `DATA_END` to resolve to a const; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definitions
+		.iter()
+		.find(|d| d.kind == found.kind)
+		.expect("expected a matching const definition entry");
+
+	// The forked per-memory const has no user-written declaration of its
+	// own — `seed_memory_trait_impl_with` copies the `name`/`file_id` of the
+	// `Memory` trait's abstract `const DATA_END: Self::*u8;` straight from
+	// its template, so go-to-definition correctly lands there (in
+	// `std/lib.wx`) rather than anywhere in this test's own source.
+	let SymbolKind::Const(const_id) = found.kind else {
+		unreachable!("checked above");
+	};
+	let const_index = compiled.tir.const_index(const_id).unwrap();
+	let const_name = compiled.tir.constants[const_index as usize].name.inner;
+	assert_eq!(
+		compiled.graph.interner.resolve(const_name),
+		Some("DATA_END"),
+		"expected the resolved const to be named `DATA_END`"
+	);
+	assert_eq!(
+		definition.source.span,
+		compiled.tir.constants[const_index as usize].name.span,
+		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
 }
 
