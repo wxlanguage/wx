@@ -963,7 +963,7 @@ impl<'mir> Builder<'mir> {
 	fn build_if_chain_arm(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut [StackResult],
 		selector: DataNodeIndex,
 		selector_ty: ScalarType,
 		discriminant: i64,
@@ -1236,9 +1236,8 @@ impl<'mir> Builder<'mir> {
 			merged_per_slot.push(merged);
 		}
 
-		for slot in 0..parent_len {
-			bindings[slot] = merged_per_slot[slot];
-		}
+		bindings[..parent_len]
+			.copy_from_slice(&merged_per_slot[..parent_len]);
 		let result = merged_per_slot[parent_len];
 
 		let mut switch_cases: Vec<SwitchCase> = arms
@@ -1595,11 +1594,17 @@ impl<'mir> Builder<'mir> {
 		target: BlockIndex,
 		bindings: &[StackResult],
 	) -> Box<[(DataNodeIndex, DataNodeIndex)]> {
-		let len = self.func.loop_data(target).loop_params.len();
+		// Cloned out up front rather than indexed per-iteration: `self.func`
+		// would otherwise need re-borrowing on every loop, and
+		// `collect_scalar_loop_param_updates` below already needs `&mut self`.
+		let loop_params = self.func.loop_data(target).loop_params.clone();
 		let mut updates = Vec::new();
-		for i in 0..len {
-			let param = self.func.loop_data(target).loop_params[i];
-			let current = bindings[i];
+		// `bindings` may hold more entries than `loop_params` (deeper scopes
+		// nested inside the loop) — `zip` stops at the shorter one, same as
+		// the original `0..loop_params.len()` bound.
+		for (param, current) in
+			loop_params.iter().copied().zip(bindings.iter().copied())
+		{
 			if let (StackResult::Value(p), StackResult::Value(c)) =
 				(param, current)
 			{
