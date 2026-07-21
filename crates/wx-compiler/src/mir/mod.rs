@@ -127,6 +127,24 @@ pub enum ExprKind {
 		then_block: Box<Expression>,
 		else_block: Option<Box<Expression>>,
 	},
+	/// A `match`, kept as a genuine N-way construct rather than desugared to
+	/// nested `IfElse` — Opt/codegen choose between a WASM `br_table` (dense
+	/// case values) and a `br_if` chain (sparse) based on the case set, and
+	/// both need the full case list rather than a binary tree of ifs.
+	Switch {
+		selector: Box<Expression>,
+		/// `(case discriminant, case body)` pairs in source order. The
+		/// discriminant is always a canonical `i64` by this stage: the raw
+		/// value for ints, 0/1 for bool, the codepoint for char, or the
+		/// enum variant's folded `const_value` (enum variants already fold
+		/// to constants — see the `tir::ExprKind::EnumVariant` lowering
+		/// below).
+		cases: Box<[(i64, Expression)]>,
+		/// The wildcard arm's body. `None` only when TIR proved
+		/// exhaustiveness without an explicit `_` (every enum variant
+		/// covered) — codegen synthesizes `unreachable` for that case.
+		default: Option<Box<Expression>>,
+	},
 	BitAnd {
 		left: Box<Expression>,
 		right: Box<Expression>,
@@ -2284,6 +2302,50 @@ impl<'tir> Builder<'tir> {
 					ty: self.lower_type_index(expr.ty),
 				}
 			}
+			tir::ExprKind::Match { scrutinee, arms } => {
+				let selector =
+					Box::new(self.lower_expression(func_ctx, scrutinee, sink));
+				let mut cases: Vec<(i64, Expression)> =
+					Vec::with_capacity(arms.len());
+				let mut default: Option<Box<Expression>> = None;
+				for arm in arms.iter() {
+					let body = self.lower_expression(func_ctx, &arm.body, sink);
+					match arm.pattern {
+						tir::Pattern::Wildcard => {
+							default = Some(Box::new(body));
+						}
+						tir::Pattern::Int(v) => cases.push((v, body)),
+						tir::Pattern::Bool(v) => cases.push((v as i64, body)),
+						tir::Pattern::Char(v) => cases.push((v as i64, body)),
+						tir::Pattern::EnumVariant {
+							enum_index,
+							variant_index,
+						} => {
+							let variant = &self.tir.enums[enum_index as usize]
+								.variants[variant_index as usize];
+							let discriminant = match variant.const_value {
+								Some(tir::ConstValue::Int(v)) => v,
+								// Error-free TIR guarantees an integer-repr
+								// enum's variants fold to an int constant —
+								// see the `EnumReprNotInteger` check in
+								// `Builder::build_enum`.
+								_ => unreachable!(
+									"enum variant without a folded integer compile-time value"
+								),
+							};
+							cases.push((discriminant, body));
+						}
+					}
+				}
+				Expression {
+					kind: ExprKind::Switch {
+						selector,
+						cases: cases.into_boxed_slice(),
+						default,
+					},
+					ty: self.lower_type_index(expr.ty),
+				}
+			}
 			tir::ExprKind::Break { scope_index, value } => Expression {
 				kind: ExprKind::Break {
 					scope_index: *scope_index,
@@ -3582,6 +3644,19 @@ fn rewrite_body(
 			then_block: rw_box(then_block),
 			else_block: else_block.map(rw_box),
 		},
+		ExprKind::Switch {
+			selector,
+			cases,
+			default,
+		} => ExprKind::Switch {
+			selector: rw_box(selector),
+			cases: cases
+				.into_vec()
+				.into_iter()
+				.map(|(discriminant, body)| (discriminant, rw(body)))
+				.collect(),
+			default: rw_opt(default),
+		},
 		ExprKind::Add { left, right } => ExprKind::Add {
 			left: rw_box(left),
 			right: rw_box(right),
@@ -3874,6 +3949,37 @@ fn inline_expr(
 				current_scope,
 			);
 			if let Some(e) = else_block {
+				inline_expr(
+					e,
+					caller_scopes,
+					inline_id,
+					inline_body,
+					current_scope,
+				);
+			}
+		}
+		ExprKind::Switch {
+			selector,
+			cases,
+			default,
+		} => {
+			inline_expr(
+				selector,
+				caller_scopes,
+				inline_id,
+				inline_body,
+				current_scope,
+			);
+			for (_, body) in cases.iter_mut() {
+				inline_expr(
+					body,
+					caller_scopes,
+					inline_id,
+					inline_body,
+					current_scope,
+				);
+			}
+			if let Some(e) = default {
 				inline_expr(
 					e,
 					caller_scopes,

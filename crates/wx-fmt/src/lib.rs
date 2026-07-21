@@ -49,6 +49,7 @@ define_text! {
 		Local   => "local ",
 		Loop    => "loop ",
 		If      => "if ",
+		Match   => "match ",
 		Enum    => "enum ",
 		// keywords without trailing space
 		Break       => "break",
@@ -1091,6 +1092,46 @@ impl<'a> Builder<'a> {
 		self.arena.concat(nodes)
 	}
 
+	fn build_match_expression(
+		&mut self,
+		span: ast::TextSpan,
+		scrutinee: &ast::Spanned<ast::Expression>,
+		arms: &[ast::Separated<ast::Spanned<ast::MatchArm>>],
+	) -> NodeId {
+		let match_kw = self.text(Text::Match);
+		let scrutinee_id = self.build_expression(scrutinee);
+		let mut nodes: Vec<NodeId> =
+			vec![match_kw, scrutinee_id, self.text(Text::SpaceLBrace)];
+
+		if !arms.is_empty() {
+			let mut arm_items: Vec<NodeId> = vec![self.hard_line()];
+			for (index, arm) in arms.iter().enumerate() {
+				let mut an: Vec<NodeId> =
+					vec![self.build_expression(&arm.inner.inner.pattern)];
+				an.push(self.text(Text::Arrow));
+				an.push(self.build_expression(&arm.inner.inner.body));
+				if index + 1 < arms.len() {
+					an.push(self.text(Text::Comma));
+				} else {
+					an.push(self.if_break_comma());
+				}
+				arm_items.push(self.arena.concat(an));
+				if index + 1 < arms.len() {
+					arm_items.push(self.hard_line());
+				}
+			}
+
+			let concat = self.arena.concat(arm_items);
+			nodes.push(self.arena.indent(concat));
+			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
+		}
+
+		nodes.push(self.text(Text::RBrace));
+		self.arena.concat(nodes)
+	}
+
 	fn build_enum_definition(
 		&mut self,
 		span: ast::TextSpan,
@@ -1608,6 +1649,9 @@ impl<'a> Builder<'a> {
 				let block_id = self.build_expression(block);
 				let concat = self.arena.concat2(loop_kw, block_id);
 				self.arena.group(concat)
+			}
+			ast::Expression::Match { scrutinee, arms } => {
+				self.build_match_expression(expression.span, scrutinee, arms)
 			}
 			ast::Expression::Break { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Break)];

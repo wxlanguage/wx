@@ -9358,3 +9358,188 @@ fn test_trait_impl_resolution_uses_global_index_not_local_position() {
 			.collect::<Vec<_>>()
 	);
 }
+
+// ── match ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_match_int_exhaustive_with_wildcard() {
+	let case = TestCase::new(indoc! {"
+        fn sign(x: i32) -> i32 {
+            match x {
+                0 -> { 0 },
+                1 -> { 1 },
+                _ -> { -1 },
+            }
+        }
+        export { sign }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"{:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+	insta::assert_yaml_snapshot!(case.tir);
+}
+
+#[test]
+fn test_match_enum_all_variants_covered_no_wildcard_ok() {
+	let case = TestCase::new(indoc! {"
+        enum FileDescriptor: u8 {
+            StdIn,
+            StdOut,
+            StdErr,
+        }
+        fn name(fd: FileDescriptor) -> u8 {
+            match fd {
+                FileDescriptor::StdIn -> { 0 },
+                FileDescriptor::StdOut -> { 1 },
+                FileDescriptor::StdErr -> { 2 },
+            }
+        }
+        export { name }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"expected exhaustive enum match without `_` to need no diagnostics, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_match_enum_missing_variant_is_error() {
+	let case = TestCase::new(indoc! {"
+        enum FileDescriptor: u8 {
+            StdIn,
+            StdOut,
+            StdErr,
+        }
+        fn name(fd: FileDescriptor) -> u8 {
+            match fd {
+                FileDescriptor::StdIn -> { 0 },
+                FileDescriptor::StdOut -> { 1 },
+            }
+        }
+        export { name }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::NonExhaustiveMatch),
+		"expected E1063 (NonExhaustiveMatch) for missing StdErr, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_match_int_without_wildcard_is_error() {
+	let case = TestCase::new(indoc! {"
+        fn sign(x: i32) -> i32 {
+            match x {
+                0 -> { 0 },
+                1 -> { 1 },
+            }
+        }
+        export { sign }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::NonExhaustiveMatch),
+		"expected E1063 (NonExhaustiveMatch) for an int match without `_`, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_match_invalid_pattern_shape_is_error() {
+	// `y` is a legal expression (a local reference) but not a legal
+	// pattern: it isn't a literal, `_`, or an `Enum::Variant` path, and it
+	// doesn't fold to a compile-time constant.
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32, y: i32) -> i32 {
+            match x {
+                y -> { 1 },
+                _ -> { 2 },
+            }
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::InvalidPattern),
+		"expected E1065 (InvalidPattern) for a non-constant pattern, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) {
+            local y = match x {
+                0 -> { x > 0 },
+                _ -> { x },
+            };
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
+		"expected E1001 (TypeMistmatch) reused for mismatched arm types, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_match_enum_variant_marks_variant_used() {
+	let case = TestCase::new(indoc! {"
+        enum FileDescriptor: u8 {
+            StdIn,
+            StdOut,
+            StdErr,
+        }
+        fn name(fd: FileDescriptor) -> u8 {
+            match fd {
+                FileDescriptor::StdIn -> { 0 },
+                _ -> { 1 },
+            }
+        }
+        export { name }
+    "});
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.collect();
+	assert!(errors.is_empty(), "{:?}", errors);
+	let enum_ = case
+		.tir
+		.enums
+		.iter()
+		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("FileDescriptor"))
+		.expect("FileDescriptor enum not found");
+	let std_in = enum_
+		.variants
+		.iter()
+		.find(|v| case.graph.interner.resolve(v.name.inner) == Some("StdIn"))
+		.expect("StdIn variant not found");
+	assert!(
+		!std_in.accesses.is_empty(),
+		"expected the match pattern `FileDescriptor::StdIn` to record a variant access"
+	);
+}
+
+#[test]
+fn test_match_duplicate_pattern_warns_unreachable() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            match x {
+                0 -> { 1 },
+                0 -> { 2 },
+                _ -> { 3 },
+            }
+        }
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UnreachableMatchArm),
+		"expected W1010 (UnreachableMatchArm) for a duplicate `0` pattern, got: {:?}",
+		case.tir.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+}

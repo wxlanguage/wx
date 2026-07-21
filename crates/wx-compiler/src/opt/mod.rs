@@ -519,6 +519,21 @@ pub enum ControlNode {
 		outputs: Box<[DataNodeIndex]>,
 		result: StackResult,
 	},
+	/// A `match`, kept as a genuine N-way branch rather than desugared to
+	/// nested `IfElse` — the scheduler picks a WASM `br_table` (dense case
+	/// values) or a `br_if` chain (sparse) based on the case set.
+	Switch {
+		selector: DataNodeIndex,
+		cases: Box<[SwitchCase]>,
+		/// The wildcard arm, if the source had one (absent only when TIR
+		/// proved exhaustiveness by covering every enum variant).
+		default: Option<SwitchCase>,
+		/// Merged (Phi) nodes, one per divergent binding across arms, plus —
+		/// if the arms' own result values differ — one more for the overall
+		/// match result. Same role as `IfElse.outputs`, but folded N-way.
+		outputs: Box<[DataNodeIndex]>,
+		result: StackResult,
+	},
 	Loop {
 		body: BlockIndex,
 		/// LoopParam nodes for bindings that change across the loop.
@@ -529,9 +544,21 @@ pub enum ControlNode {
 	Break {
 		target: BlockIndex,
 		value: StackResult,
+		/// `(loop_param_node, current_value_node)` pairs, decomposed to
+		/// scalars — the target loop's own carried bindings (`Block::loop_params`)
+		/// as of this exact break site. The loop's normal "commit accumulated
+		/// bindings, then branch back" tail code (`ControlNode::Loop`'s own
+		/// scheduling) only runs on ordinary fallthrough; an early exit
+		/// bypasses it entirely, so every `break`/`continue` site must
+		/// independently commit whatever its own current values are —
+		/// mirroring how `break_result_outputs` already does this for the
+		/// loop's trailing *value* specifically.
+		loop_param_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
 	},
 	Continue {
 		target: BlockIndex,
+		/// See `Break::loop_param_updates`.
+		loop_param_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
 	},
 	Unreachable,
 	MemorySize {
@@ -574,17 +601,58 @@ pub enum ControlNode {
 	},
 }
 
+pub type LoopIndex = u32;
+
 pub struct Block {
-	pub is_loop: bool,
 	pub parent: Option<BlockIndex>,
 	pub statements: Vec<ControlNode>,
-	/// Exit value. For loop blocks, overwritten with `body_fallthrough` after
-	/// `build_loop`; the pre-overwrite value is saved into `ControlNode::Loop.result`.
+	/// Exit value. Overwritten as the block is built; the final value is
+	/// what callers (e.g. `IfElse`/`Switch` arm handling) read back. For
+	/// loop blocks, overwritten with `body_fallthrough` after `build_loop`
+	/// finishes building the body — the pre-overwrite value (accumulated
+	/// from every `break <value>` inside) is saved into
+	/// `ControlNode::Loop.result` before this happens.
 	pub result: StackResult,
+	/// `Some` only for loop blocks — indexes into `Function::loops` for the
+	/// two things only loops need (`break_result_outputs`, `loop_params`).
+	/// A separate table rather than always-present-but-usually-empty fields
+	/// on every `Block`, since most blocks aren't loops.
+	pub loop_index: Option<LoopIndex>,
+}
+
+impl Block {
+	pub fn is_loop(&self) -> bool {
+		self.loop_index.is_some()
+	}
+}
+
+pub struct LoopData {
 	/// Phi nodes at the loop-exit join point for `break <value>` paths.
-	/// Scheduler pre-allocates WASM locals for these; each `Break` stores into
-	/// them before the `br`. Empty when all breaks carry the same value.
+	/// Scheduler pre-allocates WASM locals for these; each `Break` stores
+	/// into them before the `br`. Empty when all breaks carry the same
+	/// value.
 	pub break_result_outputs: Vec<DataNodeIndex>,
+	/// This loop's own per-slot `LoopParam` bindings, exactly as returned by
+	/// `Builder::create_loop_params`. Kept around so a nested `break`/
+	/// `continue` — however deep inside the body — can look up which
+	/// `LoopParam` node corresponds to which binding slot; see
+	/// `ControlNode::Break::loop_param_updates`.
+	pub loop_params: Vec<StackResult>,
+}
+
+/// One `match` arm, lowered. `own_values` is required because `DataNodeKind::Phi`
+/// is strictly binary (`left`/`right`, positionally keyed by convention) — an
+/// N-ary join can't recover "this specific arm's contribution" the way
+/// `IfElse`'s `emit_phi_stores_for_branch` reads `left`/`right` structurally,
+/// so each case carries its own per-slot values explicitly.
+pub struct SwitchCase {
+	/// `None` only for the default/wildcard arm.
+	pub discriminant: Option<i64>,
+	pub block: BlockIndex,
+	/// This case's own value for each of `Switch.outputs`, same length/order
+	/// as `outputs`. `StackResult::Never` means this arm's body diverges
+	/// before reaching the join, so the scheduler emits no store for it.
+	pub own_values: Box<[StackResult]>,
 }
 
 pub struct Function {
@@ -593,6 +661,8 @@ pub struct Function {
 	/// One slot per MIR scope (indexed by scope index). `None` until the scope
 	/// is built.
 	pub blocks: Vec<Option<Block>>,
+	/// Per-loop extra data, indexed by `Block::loop_index`.
+	pub loops: Vec<LoopData>,
 	/// CSE map: `DataNodeKind` → existing `DataNodeIndex`. Impure nodes excluded.
 	data_lookup: HashMap<DataNodeKind, DataNodeIndex>,
 }
@@ -603,8 +673,36 @@ impl Function {
 			id,
 			data_nodes: Vec::new(),
 			blocks: (0..scope_count).map(|_| None).collect(),
+			loops: Vec::new(),
 			data_lookup: HashMap::new(),
 		}
+	}
+
+	/// Registers a new loop's `LoopData` and returns its `LoopIndex`.
+	pub fn push_loop_data(&mut self, data: LoopData) -> LoopIndex {
+		let idx = self.loops.len() as LoopIndex;
+		self.loops.push(data);
+		idx
+	}
+
+	/// The `LoopData` for a loop block. Panics if `block_idx` isn't a loop.
+	pub fn loop_data(&self, block_idx: BlockIndex) -> &LoopData {
+		let idx = self.blocks[block_idx as usize]
+			.as_ref()
+			.unwrap()
+			.loop_index
+			.expect("loop_data called on a non-loop block");
+		&self.loops[idx as usize]
+	}
+
+	/// Mutable counterpart of `loop_data`.
+	pub fn loop_data_mut(&mut self, block_idx: BlockIndex) -> &mut LoopData {
+		let idx = self.blocks[block_idx as usize]
+			.as_ref()
+			.unwrap()
+			.loop_index
+			.expect("loop_data_mut called on a non-loop block");
+		&mut self.loops[idx as usize]
 	}
 
 	/// Get or create a data node via CSE only. Does not apply any algebraic

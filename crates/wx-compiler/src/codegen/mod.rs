@@ -899,6 +899,21 @@ impl Builder {
 				sink.push(Instruction::BrIf as u8);
 				depth.encode(sink);
 			}
+			SI::BrTable(depths) => {
+				sink.push(Instruction::BrTable as u8);
+				// WASM's `br_table` encodes as `vec(labelidx) labelidx` — a
+				// table of length `depths.len() - 1` followed by the
+				// default depth as a separate trailing immediate. The
+				// scheduler folds both into one slice (its trailing element
+				// *is* the default) since both stages need the same split.
+				let (default_depth, table) =
+					depths.split_last().expect("BrTable is never empty");
+				(table.len() as u32).encode(sink);
+				for depth in table {
+					depth.encode(sink);
+				}
+				default_depth.encode(sink);
+			}
 			SI::Return => sink.push(Instruction::Return as u8),
 			SI::Unreachable => sink.push(Instruction::Unreachable as u8),
 			SI::Drop => sink.push(Instruction::Drop as u8),

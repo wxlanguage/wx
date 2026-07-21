@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use codespan_reporting::diagnostic::Severity;
 
@@ -565,6 +565,95 @@ fn report_type_annotation_required(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 		.with_message("type annotation required")
 		.with_label(span.primary_label())
+}
+
+fn report_invalid_match_scrutinee_type(
+	fmt: TypeFormatter,
+	ty: TypeIndex,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InvalidMatchScrutineeType.code())
+		.with_message("invalid `match` scrutinee type")
+		.with_label(span.primary_label().with_message(format!(
+			"cannot match on `{}`",
+			fmt.display_type(ty).unwrap_or_default()
+		)))
+		.with_note(
+			"`match` scrutinees must be an enum, integer, `char`, or `bool`",
+		)
+}
+
+fn report_invalid_pattern(span: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InvalidPattern.code())
+		.with_message("invalid pattern")
+		.with_label(span.primary_label())
+		.with_note(
+			"patterns are: an integer/char/bool literal, `EnumName::Variant`, or `_`",
+		)
+}
+
+/// One diagnostic per non-exhaustive `match` on an enum scrutinee, grouping
+/// every uncovered variant into one message — mirrors
+/// `report_unused_enum_variants`'s 1/2/3-5/many phrasing.
+fn report_non_exhaustive_match(
+	interner: &ast::StringInterner,
+	span: SourceSpan,
+	missing_variants: &[Spanned<SymbolU32>],
+) -> Diagnostic<FileId> {
+	let message = match missing_variants.len() {
+		1 => {
+			let name = interner.resolve(missing_variants[0].inner).unwrap();
+			format!("non-exhaustive `match`: variant `{name}` not covered")
+		}
+		2 => {
+			let a = interner.resolve(missing_variants[0].inner).unwrap();
+			let b = interner.resolve(missing_variants[1].inner).unwrap();
+			format!("non-exhaustive `match`: variants `{a}` and `{b}` not covered")
+		}
+		3..=5 => {
+			let (last, rest) = missing_variants.split_last().unwrap();
+			let rest = rest
+				.iter()
+				.map(|name| {
+					format!("`{}`", interner.resolve(name.inner).unwrap())
+				})
+				.collect::<Vec<_>>()
+				.join(", ");
+			let last = interner.resolve(last.inner).unwrap();
+			format!(
+				"non-exhaustive `match`: variants {rest}, and `{last}` not covered"
+			)
+		}
+		_ => "non-exhaustive `match`: multiple variants not covered".to_string(),
+	};
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NonExhaustiveMatch.code())
+		.with_message(message)
+		.with_label(span.primary_label())
+		.with_note("add a wildcard arm `_ -> { ... }` or cover every variant")
+}
+
+fn report_non_exhaustive_match_no_wildcard(
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NonExhaustiveMatch.code())
+		.with_message(
+			"non-exhaustive `match`: this type's values cannot be fully enumerated",
+		)
+		.with_label(span.primary_label())
+		.with_note("add a wildcard arm `_ -> { ... }` to handle any other value")
+}
+
+fn report_unreachable_match_arm(span: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::UnreachableMatchArm.code())
+		.with_message("unreachable match arm")
+		.with_label(span.primary_label().with_message(
+			"this pattern is already covered by an earlier arm",
+		))
 }
 
 fn report_unused_variable(span: SourceSpan) -> Diagnostic<FileId> {
@@ -8252,6 +8341,9 @@ impl<'ast> Builder<'ast, '_> {
 			ast::Expression::IfElse { .. } => {
 				self.build_if_else_expression(func_ctx, access_ctx, expr, None)
 			}
+			ast::Expression::Match { .. } => {
+				self.build_match_expression(func_ctx, access_ctx, expr)
+			}
 			ast::Expression::Loop { .. } => {
 				self.build_loop_expression(func_ctx, access_ctx, expr, None)
 			}
@@ -9598,6 +9690,294 @@ impl<'ast> Builder<'ast, '_> {
 			ty,
 			span: expr.span,
 		})
+	}
+
+	fn build_match_expression(
+		&mut self,
+		ctx: &mut ExprContext,
+		access_ctx: AccessContext,
+		expr: &Spanned<ast::Expression>,
+	) -> Result<Expression, ()> {
+		let (scrutinee_expr, arms) = match &expr.inner {
+			ast::Expression::Match { scrutinee, arms } => (scrutinee, arms),
+			_ => unreachable!(),
+		};
+
+		let scrutinee = self.build_expression(
+			ctx,
+			AccessContext {
+				expected_type: TypeIndex::INFER,
+				access_kind: AccessKind::Read,
+			},
+			scrutinee_expr,
+		)?;
+		let scrutinee_ty = scrutinee.ty;
+
+		let is_valid_scrutinee = matches!(
+			self.tir.types[scrutinee_ty.as_usize()],
+			Type::Enum { .. }
+		) || scrutinee_ty == TypeIndex::BOOL
+			|| scrutinee_ty == TypeIndex::CHAR
+			|| scrutinee_ty.is_integer();
+		if !is_valid_scrutinee {
+			self.tir.diagnostics.push(report_invalid_match_scrutinee_type(
+				TypeFormatter::new(&self.tir, self.interner),
+				scrutinee_ty,
+				SourceSpan::new(
+					ctx.resolve_context.file_id,
+					scrutinee_expr.span,
+				),
+			));
+			return Err(());
+		}
+
+		if arms.is_empty() {
+			self.tir.diagnostics.push(
+				report_non_exhaustive_match_no_wildcard(SourceSpan::new(
+					ctx.resolve_context.file_id,
+					expr.span,
+				)),
+			);
+			return Err(());
+		}
+
+		let mut arm_data: Vec<(Pattern, TextSpan, Expression)> =
+			Vec::with_capacity(arms.len());
+		for arm in arms.iter() {
+			let ast_arm = &arm.inner.inner;
+			let pattern =
+				self.build_pattern(ctx, scrutinee_ty, &ast_arm.pattern)?;
+			let body = match ast_arm.body.inner {
+				ast::Expression::Block { .. } => ctx.enter_block(
+					BlockScope {
+						label: None,
+						kind: BlockKind::Block,
+						parent: Some(ctx.scope_index),
+						span: ast_arm.body.span,
+						locals: Vec::new(),
+						inferred_type: TypeIndex::INFER,
+						expected_type: access_ctx.expected_type,
+					},
+					|ctx| self.build_block_expression(ctx, &ast_arm.body),
+				)?,
+				_ => unreachable!(),
+			};
+			arm_data.push((pattern, ast_arm.pattern.span, body));
+		}
+
+		// Exact-duplicate-pattern / dead-arm-after-wildcard detection — cheap
+		// byproduct of walking the arm list once; a warning, not an error.
+		{
+			let mut seen_wildcard = false;
+			let mut seen_ints: HashSet<i64> = HashSet::new();
+			let mut seen_chars: HashSet<char> = HashSet::new();
+			let mut seen_bools: HashSet<bool> = HashSet::new();
+			let mut seen_variants: HashSet<EnumVariantIndex> = HashSet::new();
+			for (pattern, pattern_span, _) in &arm_data {
+				let unreachable = if seen_wildcard {
+					true
+				} else {
+					match pattern {
+						Pattern::Wildcard => false,
+						Pattern::Int(v) => !seen_ints.insert(*v),
+						Pattern::Char(v) => !seen_chars.insert(*v),
+						Pattern::Bool(v) => !seen_bools.insert(*v),
+						Pattern::EnumVariant { variant_index, .. } => {
+							!seen_variants.insert(*variant_index)
+						}
+					}
+				};
+				if matches!(pattern, Pattern::Wildcard) {
+					seen_wildcard = true;
+				}
+				if unreachable {
+					self.tir.diagnostics.push(report_unreachable_match_arm(
+						SourceSpan::new(
+							ctx.resolve_context.file_id,
+							*pattern_span,
+						),
+					));
+				}
+			}
+		}
+
+		// Cross-arm comptime coercion + unification, folded left-to-right —
+		// same idiom `build_if_else_expression` uses pairwise for two branches.
+		let target_ty = arm_data
+			.iter()
+			.map(|(_, _, body)| body.ty)
+			.find(|ty| !ty.is_comptime_number())
+			.unwrap_or(arm_data[0].2.ty);
+
+		let mut result_ty = target_ty;
+		for (_, _, body) in arm_data.iter_mut() {
+			if body.ty.is_comptime_number() && !target_ty.is_comptime_number() {
+				self.coerce_untyped_expr(ctx, body, target_ty)?;
+			}
+			match self.unify(result_ty, body.ty) {
+				Ok(ty) => result_ty = ty,
+				Err(_) => {
+					self.tir.diagnostics.push(report_type_mistmatch(
+						TypeFormatter::new(&self.tir, self.interner),
+						TypeMistmatchDiagnostic {
+							expected_type: result_ty,
+							actual_type: body.ty,
+							span: SourceSpan::new(
+								ctx.resolve_context.file_id,
+								body.span,
+							),
+						},
+					));
+					return Err(());
+				}
+			}
+		}
+
+		let built_arms: Box<[MatchArm]> = arm_data
+			.into_iter()
+			.map(|(pattern, pattern_span, body)| MatchArm {
+				pattern,
+				pattern_span,
+				body: Box::new(body),
+			})
+			.collect();
+
+		self.check_match_exhaustiveness(
+			ctx.resolve_context.file_id,
+			scrutinee_ty,
+			&built_arms,
+			expr.span,
+		)?;
+
+		Ok(Expression {
+			kind: ExprKind::Match {
+				scrutinee: Box::new(scrutinee),
+				arms: built_arms,
+			},
+			ty: result_ty,
+			span: expr.span,
+		})
+	}
+
+	/// Resolves a `match` arm's pattern by re-running the ordinary expression
+	/// builder on its syntax and interpreting the result — reuses
+	/// `build_path_expression`'s existing `Enum::Variant` resolution (and its
+	/// "used" tracking) rather than a separate pattern-resolution path.
+	fn build_pattern(
+		&mut self,
+		ctx: &mut ExprContext,
+		scrutinee_ty: TypeIndex,
+		pattern_expr: &Spanned<ast::Expression>,
+	) -> Result<Pattern, ()> {
+		if matches!(pattern_expr.inner, ast::Expression::Placeholder) {
+			return Ok(Pattern::Wildcard);
+		}
+
+		let built = self.build_expression(
+			ctx,
+			AccessContext {
+				expected_type: scrutinee_ty,
+				access_kind: AccessKind::Read,
+			},
+			pattern_expr,
+		)?;
+
+		if matches!(self.tir.types[scrutinee_ty.as_usize()], Type::Enum { .. })
+		{
+			if let ExprKind::NamespaceAccess { member, .. } = &built.kind
+				&& let ExprKind::EnumVariant { enum_index, variant_index } =
+					member.kind
+				&& built.ty == scrutinee_ty
+			{
+				return Ok(Pattern::EnumVariant { enum_index, variant_index });
+			}
+			self.tir.diagnostics.push(report_invalid_pattern(
+				SourceSpan::new(ctx.resolve_context.file_id, pattern_expr.span),
+			));
+			return Err(());
+		}
+
+		let mut built = built;
+		if built.ty.is_comptime_number() {
+			self.coerce_untyped_expr(ctx, &mut built, scrutinee_ty)?;
+		}
+
+		match self.eval_const_expr(&built) {
+			Ok(ConstValue::Int(v)) if scrutinee_ty.is_integer() => {
+				Ok(Pattern::Int(v))
+			}
+			Ok(ConstValue::Bool(v)) if scrutinee_ty == TypeIndex::BOOL => {
+				Ok(Pattern::Bool(v))
+			}
+			Ok(ConstValue::Char(v)) if scrutinee_ty == TypeIndex::CHAR => {
+				Ok(Pattern::Char(v))
+			}
+			_ => {
+				self.tir.diagnostics.push(report_invalid_pattern(
+					SourceSpan::new(
+						ctx.resolve_context.file_id,
+						pattern_expr.span,
+					),
+				));
+				Err(())
+			}
+		}
+	}
+
+	/// Full exhaustiveness is required unless a wildcard arm is present: an
+	/// enum scrutinee must cover every variant, and any other scrutinee type
+	/// (whose domain isn't enumerable) always requires `_`.
+	fn check_match_exhaustiveness(
+		&mut self,
+		file_id: FileId,
+		scrutinee_ty: TypeIndex,
+		arms: &[MatchArm],
+		match_span: TextSpan,
+	) -> Result<(), ()> {
+		let has_wildcard =
+			arms.iter().any(|arm| matches!(arm.pattern, Pattern::Wildcard));
+		if has_wildcard {
+			return Ok(());
+		}
+
+		match &self.tir.types[scrutinee_ty.as_usize()] {
+			Type::Enum { enum_index } => {
+				let enum_index = *enum_index as usize;
+				let variant_count = self.tir.enums[enum_index].variants.len();
+				let mut covered = vec![false; variant_count];
+				for arm in arms {
+					if let Pattern::EnumVariant { variant_index, .. } =
+						arm.pattern
+					{
+						covered[variant_index as usize] = true;
+					}
+				}
+				let missing: Vec<Spanned<SymbolU32>> = covered
+					.iter()
+					.enumerate()
+					.filter(|&(_, &covered)| !covered)
+					.map(|(i, _)| self.tir.enums[enum_index].variants[i].name)
+					.collect();
+				if missing.is_empty() {
+					Ok(())
+				} else {
+					self.tir.diagnostics.push(report_non_exhaustive_match(
+						self.interner,
+						SourceSpan::new(file_id, match_span),
+						&missing,
+					));
+					Err(())
+				}
+			}
+			_ => {
+				self.tir.diagnostics.push(
+					report_non_exhaustive_match_no_wildcard(SourceSpan::new(
+						file_id, match_span,
+					)),
+				);
+				Err(())
+			}
+		}
 	}
 
 	fn build_cast_expression(

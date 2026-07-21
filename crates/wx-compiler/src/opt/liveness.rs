@@ -68,15 +68,53 @@ fn mark_block_roots(
 					mark_block_roots(func, *else_block, live, worklist);
 				}
 			}
+			ControlNode::Switch {
+				selector,
+				cases,
+				default,
+				outputs,
+				result,
+			} => {
+				mark_node_live(*selector, live, worklist);
+				for &output in outputs.iter() {
+					mark_node_live(output, live, worklist);
+				}
+				if outputs.is_empty() {
+					mark_stack_result_live(*result, live, worklist);
+				}
+				// `own_values` need no separate marking here: each arm's raw
+				// contribution to a divergent slot is either the slot's sole
+				// `outputs` node directly, or was folded into it through a
+				// chain of intermediate Phi nodes (`Phi::left`/`right`) that
+				// `mark_node_inputs_live` already walks — so marking the
+				// slot's one `outputs` entry live transitively covers every
+				// arm's own value for that slot.
+				for case in cases.iter().chain(default.iter()) {
+					mark_block_roots(func, case.block, live, worklist);
+				}
+			}
 			ControlNode::Loop { body, outputs, .. } => {
 				for &output in outputs.iter() {
 					mark_node_live(output, live, worklist);
 				}
 				mark_block_roots(func, *body, live, worklist);
 			}
-			ControlNode::Break { .. }
-			| ControlNode::Continue { .. }
-			| ControlNode::Unreachable => {}
+			ControlNode::Break {
+				value,
+				loop_param_updates,
+				..
+			} => {
+				mark_stack_result_live(*value, live, worklist);
+				for &(_, current) in loop_param_updates.iter() {
+					mark_node_live(current, live, worklist);
+				}
+			}
+			ControlNode::Continue { loop_param_updates, .. } => {
+				for &(_, current) in loop_param_updates.iter() {
+					mark_node_live(current, live, worklist);
+				}
+			}
+			ControlNode::Unreachable => {}
 			ControlNode::MemoryGrow { delta, .. } => {
 				mark_node_live(*delta, live, worklist);
 			}

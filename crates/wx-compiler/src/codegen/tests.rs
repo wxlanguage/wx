@@ -2822,3 +2822,217 @@ fn test_u32_arithmetic_is_unsigned() {
 		"shr(0x80000000, 1) must shift in a zero bit (i32.shr_u)"
 	);
 }
+
+// ── break/continue must commit the loop's carried bindings ────────────────
+//
+// Regression coverage for a bug found while implementing `match`: a `break`/
+// `continue` bypasses the loop's own "commit accumulated bindings, then
+// branch back" tail code (which only runs on ordinary fallthrough), so any
+// mutation to a loop-carried `mut` local made right before an early exit was
+// silently lost — the next iteration (or code after the loop) would see a
+// stale value. Predates `match` entirely (reproduces with plain `if`/`else`);
+// fixed in `Builder::loop_param_updates` / `Scheduler::emit_loop_param_updates`.
+
+#[test]
+fn test_break_commits_mutation_made_just_before_it() {
+	// Regression: this used to return 4 — the `acc += 1` that made `acc == 5`
+	// true was never committed to the loop's carried local before `break`.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut acc: i32 = 0;
+            loop {
+                acc += 1;
+                if acc == 5 {
+                    break;
+                }
+            }
+            acc
+        }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_continue_commits_mutation_made_just_before_it() {
+	// Regression: this used to hang — `i`'s new value overwrote its own
+	// carried local before `acc`'s new value (which reads the *old* `i`)
+	// was computed, and separately `continue` never committed either value
+	// at all before branching back, so `i` never advanced.
+	let case = TestCase::new(indoc! {"
+        fn sum_until(n: i32) -> i32 {
+            local mut i: i32 = 0;
+            local mut acc: i32 = 0;
+            loop {
+                if i == n {
+                    break;
+                } else {
+                    acc += i;
+                    i += 1;
+                    continue;
+                }
+            }
+            acc
+        }
+        export { sum_until }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let sum_until = instance
+		.get_typed_func::<i32, i32>(&mut store, "sum_until")
+		.unwrap();
+	assert_eq!(sum_until.call(&mut store, 0).unwrap(), 0);
+	assert_eq!(sum_until.call(&mut store, 1).unwrap(), 0);
+	assert_eq!(sum_until.call(&mut store, 5).unwrap(), 0 + 1 + 2 + 3 + 4);
+}
+
+#[test]
+fn test_match_inside_loop_break_and_continue_commit_mutations() {
+	// Same regression as above, but through `match` specifically — the
+	// highest-risk spot for this bug given `match`'s N-way arm structure.
+	// Only one real case (`5`) here, so this goes through
+	// `Builder::build_switch_as_if_chain` (below `should_use_br_table`'s
+	// threshold), which chains each level's `Block::parent` to the previous
+	// one to get correct `break`/`continue` depths — see
+	// `test_match_inside_loop_break_and_continue_dense_br_table` for the
+	// equivalent stress test through the `br_table` path, whose synthetic
+	// wrapper-block chain (`Builder::push_synthetic_block`) is a different
+	// mechanism for the same depth problem. This test covers the
+	// *value*-commit half of the underlying mechanism, shared by both paths.
+	let case = TestCase::new(indoc! {"
+        fn sum_until(n: i32) -> i32 {
+            local mut i: i32 = 0;
+            local mut acc: i32 = 0;
+            loop {
+                match i {
+                    5 -> { break; },
+                    _ -> {
+                        if i == n {
+                            break;
+                        }
+                        acc += i;
+                        i += 1;
+                        continue;
+                    },
+                }
+            }
+            acc
+        }
+        export { sum_until }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let sum_until = instance
+		.get_typed_func::<i32, i32>(&mut store, "sum_until")
+		.unwrap();
+	assert_eq!(sum_until.call(&mut store, 0).unwrap(), 0);
+	assert_eq!(sum_until.call(&mut store, 1).unwrap(), 0);
+	assert_eq!(sum_until.call(&mut store, 3).unwrap(), 0 + 1 + 2);
+	// n=10 never reached before i hits 5 — capped by the `5 -> break` arm.
+	assert_eq!(sum_until.call(&mut store, 10).unwrap(), 0 + 1 + 2 + 3 + 4);
+}
+
+#[test]
+fn test_match_enum_dispatch_runs_correctly() {
+	let case = TestCase::new(indoc! {"
+        enum FileDescriptor: u8 {
+            StdIn,
+            StdOut,
+            StdErr,
+        }
+
+        fn fd_name_len(fd: FileDescriptor) -> u32 {
+            match fd {
+                FileDescriptor::StdIn -> { 5 },
+                FileDescriptor::StdOut -> { 6 },
+                FileDescriptor::StdErr -> { 6 },
+            }
+        }
+        export { fd_name_len }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let fd_name_len = instance
+		.get_typed_func::<u32, u32>(&mut store, "fd_name_len")
+		.unwrap();
+	assert_eq!(fd_name_len.call(&mut store, 0).unwrap(), 5);
+	assert_eq!(fd_name_len.call(&mut store, 1).unwrap(), 6);
+	assert_eq!(fd_name_len.call(&mut store, 2).unwrap(), 6);
+}
+
+#[test]
+fn test_match_inside_loop_break_and_continue_dense_br_table() {
+	// Three real dense cases (`0`, `1`, `2`) push this over
+	// `Builder::should_use_br_table`'s threshold, so it schedules as a real
+	// `br_table` (`Scheduler::emit_switch_br_table`) rather than an
+	// `IfElse` chain — the depth-bookkeeping mechanism is entirely
+	// different (`Builder::push_synthetic_block`'s wrapper-block chain vs.
+	// chaining each arm to the previous one), so this needs its own
+	// break/continue-commits-mutations regression coverage. `continue` is
+	// exercised from the two innermost case positions (0 and 1 — the
+	// deepest synthetic wrapper nesting, where an off-by-one in the depth
+	// chain is most likely to surface either as a WASM validation failure
+	// at `Module::new` below or as a silently wrong `acc`), `break` from
+	// both a real case (2) and the default arm.
+	let case = TestCase::new(indoc! {"
+        fn f(n: i32) -> i32 {
+            local mut i: i32 = 0;
+            local mut acc: i32 = 0;
+            loop {
+                match i {
+                    0 -> {
+                        acc += 100;
+                        i += 1;
+                        continue;
+                    },
+                    1 -> {
+                        acc += 10;
+                        i += 1;
+                        continue;
+                    },
+                    2 -> {
+                        if i == n {
+                            break;
+                        }
+                        acc += 1;
+                        i += 1;
+                        continue;
+                    },
+                    _ -> {
+                        break;
+                    },
+                }
+            }
+            acc
+        }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<i32, i32>(&mut store, "f").unwrap();
+	// i=0 (case0): acc=100, i=1 — i=1 (case1): acc=110, i=2 — i=2 (case2):
+	// i==n, break immediately.
+	assert_eq!(f.call(&mut store, 2).unwrap(), 110);
+	// Same first two steps (acc=110, i=2), but i != n at i=2, so case2 runs
+	// `acc += 1; i += 1; continue` (acc=111, i=3) — i=3 hits the default
+	// arm and breaks.
+	assert_eq!(f.call(&mut store, 100).unwrap(), 111);
+}
