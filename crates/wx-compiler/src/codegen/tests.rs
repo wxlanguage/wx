@@ -3036,3 +3036,121 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
 	// arm and breaks.
 	assert_eq!(f.call(&mut store, 100).unwrap(), 111);
 }
+
+/// A dense (`br_table`-eligible) match whose divergent value is a
+/// struct, not a scalar — each arm returns a different `Point`. Guards
+/// against a regression in `Builder::merge_switch_slot`: an
+/// aggregate-typed join must be decomposed field-by-field (each field
+/// gets its own scalar `Switch` output/local) rather than treated as one
+/// opaque unit, since a WASM local can only ever hold one scalar value.
+#[test]
+fn test_match_dense_struct_valued_arms() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        fn classify(x: i32) -> i32 {
+            local p = match x {
+                0 -> { Point::{ x: 10, y: 1 } },
+                1 -> { Point::{ x: 20, y: 2 } },
+                2 -> { Point::{ x: 30, y: 3 } },
+                _ -> { Point::{ x: 40, y: 4 } },
+            };
+            p.x + p.y
+        }
+
+        export { classify }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let classify = instance
+		.get_typed_func::<i32, i32>(&mut store, "classify")
+		.unwrap();
+	assert_eq!(classify.call(&mut store, 0).unwrap(), 11);
+	assert_eq!(classify.call(&mut store, 1).unwrap(), 22);
+	assert_eq!(classify.call(&mut store, 2).unwrap(), 33);
+	assert_eq!(classify.call(&mut store, 99).unwrap(), 44); // default arm
+}
+
+/// A dense match where one arm diverges (`return`) before touching a
+/// binding that every other arm assigns. The arm's own tail value folds
+/// to `Unit` (mixed with `Never` from the returning arm) and contributes
+/// no `Switch` output, while the `acc` binding genuinely diverges and
+/// does. Guards against a regression where a "no-output" slot ahead of a
+/// real one in slot order could desync `SwitchCase::own_values` from
+/// `Switch::outputs` (see `Builder::merge_switch_slot`); this specific
+/// ordering (result slot always last) couldn't actually trigger the
+/// desync, but it's exactly the shape that looked risky.
+#[test]
+fn test_match_dense_early_return_with_divergent_binding() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local mut acc: i32 = 0;
+            match x {
+                0 -> { return 99; },
+                1 -> { acc = 1; },
+                2 -> { acc = 2; },
+                _ -> { acc = 3; },
+            }
+            acc
+        }
+
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<i32, i32>(&mut store, "f").unwrap();
+	assert_eq!(f.call(&mut store, 0).unwrap(), 99);
+	assert_eq!(f.call(&mut store, 1).unwrap(), 1);
+	assert_eq!(f.call(&mut store, 2).unwrap(), 2);
+	assert_eq!(f.call(&mut store, 99).unwrap(), 3);
+}
+
+/// A wide, sparse match (500 arms, spread far enough apart that density
+/// stays low regardless of count — see `Builder::should_use_br_table`)
+/// stays on the if-chain path no matter how many arms it has. Guards
+/// against a regression to recursive if-chain *construction*:
+/// `build_switch_as_if_chain` used to recurse (via `build_if_chain_arm`/
+/// `build_if_chain_else`) one Rust call stack frame — plus a
+/// `bindings.to_vec()` clone — per arm, with nothing bounding that beyond
+/// how many arms a *sparse* match happens to have in source text. It's now
+/// built iteratively (case-by-case, last to first) instead.
+///
+/// 500 is comfortably within what the current pipeline handles; it is not
+/// a stress test of the whole compiler. Isolated testing during this fix
+/// confirmed `Builder::build_switch_as_if_chain` alone now handles 3000+
+/// arms with no stack growth at all — but a *separate*, pre-existing
+/// recursion in `opt::liveness::mark_block_roots` (which also walks an
+/// `IfElse` chain's `else_block` one level at a time, and predates `match`
+/// entirely — the same recursion runs for a hand-written, deeply nested
+/// `if`/`else if` chain) still caps the realistic ceiling somewhere between
+/// ~800 and ~1200 arms on this machine. That's an independent limitation,
+/// not fixed here.
+#[test]
+fn test_match_wide_sparse_if_chain_builds_iteratively() {
+	const ARMS: i32 = 500;
+	let mut arms = String::new();
+	for i in 0..ARMS {
+		arms.push_str(&format!("{} -> {{ {} }},\n", i * 1000, i));
+	}
+	let source = format!(
+		"fn f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ -> {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
+	);
+	let case = TestCase::new(&source);
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<i32, i32>(&mut store, "f").unwrap();
+	assert_eq!(f.call(&mut store, 0).unwrap(), 0); // first arm
+	assert_eq!(f.call(&mut store, 250 * 1000).unwrap(), 250); // middle arm
+	assert_eq!(f.call(&mut store, (ARMS - 1) * 1000).unwrap(), ARMS - 1); // last arm
+	assert_eq!(f.call(&mut store, 7).unwrap(), -1); // default (no arm matches 7)
+}

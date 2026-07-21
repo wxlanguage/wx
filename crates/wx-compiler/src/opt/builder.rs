@@ -26,6 +26,16 @@ struct SwitchArmBuild {
 	bindings: Vec<StackResult>,
 }
 
+/// One arm's contribution to an aggregate-typed `Switch` join slot, as
+/// decomposed by `Builder::merge_switch_slot` — either the arm's own
+/// per-field values (reusing the `Box<[DataNodeIndex]>` `extract_aggregate_fields`
+/// already returned, no re-wrapping), or a `Never`/`Unit` marker to
+/// propagate to every field without materializing `field_count` copies of it.
+enum PerArmSlot {
+	Fields(Box<[DataNodeIndex]>),
+	NoValue(StackResult),
+}
+
 impl<'mir> Builder<'mir> {
 	/// Lower one MIR function into a sea-of-nodes `Function`.
 	pub fn build(
@@ -909,6 +919,20 @@ impl<'mir> Builder<'mir> {
 	/// have side effects) and its resulting `DataNodeIndex` is compared
 	/// against each case's discriminant directly — no MIR round-trip needed
 	/// since Opt values are referenced by index, not re-evaluated per use.
+	///
+	/// Built iteratively, case-by-case from the *last* case back to the
+	/// first, rather than by recursing through the case list: a naive
+	/// recursive descent would grow the Rust call stack (and clone the
+	/// bindings vector) once per case, with nothing bounding that beyond the
+	/// arm count itself — exactly the shape this sparse path is chosen for
+	/// (a wide-but-sparse match can have many cases). Every case's `then`
+	/// branch is a mutually exclusive alternative from the *same* starting
+	/// point, so every one of them is built from the caller's original,
+	/// still-unmodified `bindings` — only the final (case 0) merge writes
+	/// into it; every earlier merge writes into a throwaway scratch buffer
+	/// that becomes the next case's `else_bindings` going outward, mirroring
+	/// how only the outermost frame's merge touched the real `bindings` in
+	/// the old recursive version.
 	fn build_switch_as_if_chain(
 		&mut self,
 		block_idx: BlockIndex,
@@ -939,119 +963,31 @@ impl<'mir> Builder<'mir> {
 		let selector_ty =
 			self.func.data_nodes[selector as usize].kind.unwrap_scalar();
 
-		let (discriminant, case_body) = &cases[0];
-		self.build_if_chain_arm(
-			block_idx,
-			bindings,
-			selector,
-			selector_ty,
-			*discriminant,
-			case_body,
-			&cases[1..],
-			default_expr,
-		)
-	}
+		// One container block per case: case `i`'s `IfElse` is pushed into
+		// `containers[i]` (`containers[0]` is `block_idx` itself); case
+		// `i`'s "else" side is `containers[i + 1]` (or, for the last case,
+		// the default/unreachable base built below) — a plain forward loop,
+		// no recursion needed just to allocate these.
+		let mut containers: Vec<BlockIndex> = Vec::with_capacity(cases.len());
+		containers.push(block_idx);
+		for _ in 1..cases.len() {
+			let parent = *containers.last().unwrap();
+			containers.push(self.push_synthetic_block(parent));
+		}
+		let last_container = *containers.last().unwrap();
 
-	/// One comparison level of the if-chain: `if selector == discriminant {
-	/// case_body } else { <rest of the chain> }`, pushed directly into
-	/// `block_idx` — same contract as every other `build_*` statement
-	/// method (`build_if_else` included). Reuses `extend_bindings` /
-	/// `merge_branches`, the same primitives `build_if_else` uses for a
-	/// single then/else pair, just recursing through `rest`/`default_expr`
-	/// instead.
-	#[allow(clippy::too_many_arguments)]
-	fn build_if_chain_arm(
-		&mut self,
-		block_idx: BlockIndex,
-		bindings: &mut [StackResult],
-		selector: DataNodeIndex,
-		selector_ty: ScalarType,
-		discriminant: i64,
-		case_body: &mir::Expression,
-		rest: &[(i64, mir::Expression)],
-		default_expr: Option<&mir::Expression>,
-	) -> StackResult {
-		let const_node = self.node(DataNodeKind::Int {
-			value: discriminant,
-			ty: selector_ty,
-		});
-		let condition = self.node(DataNodeKind::Eq {
-			left: selector,
-			right: const_node,
-			ty: selector_ty,
-		});
-
-		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
-		let mut then_bindings = self.extend_bindings(bindings, then_scope);
-		self.func.blocks[then_scope as usize] = Some(Block {
-			parent: Some(block_idx),
-			statements: Vec::new(),
-			result: StackResult::Never,
-			loop_index: None,
-		});
-		let then_result =
-			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize].as_mut().unwrap().result =
-			then_result;
-
-		let (else_block, else_result, else_bindings) = self
-			.build_if_chain_else(
-				block_idx,
-				bindings,
-				selector,
-				selector_ty,
-				rest,
-				default_expr,
-			);
-
-		let parent_len = bindings.len();
-		let mut outputs = Vec::new();
-		let result = self.merge_branches(
-			then_result,
-			else_result,
-			&then_bindings,
-			&else_bindings,
-			parent_len,
-			bindings,
-			&mut outputs,
-		);
-
-		self.push_stmt(
-			block_idx,
-			ControlNode::IfElse {
-				condition,
-				then_block: then_scope,
-				else_block: Some(else_block),
-				outputs: outputs.into_boxed_slice(),
-				result,
-			},
-		);
-		result
-	}
-
-	/// The "else" side of one if-chain level: another nested comparison
-	/// (in a synthetic container — no MIR scope backs an invented "else if"
-	/// position) if `rest` isn't exhausted yet; otherwise the default arm's
-	/// own real scope (genuine source content, no synthetic wrapping
-	/// needed), or a synthetic block holding a single `Unreachable` if
-	/// there's no default (TIR proved exhaustiveness without one).
-	#[allow(clippy::too_many_arguments)]
-	fn build_if_chain_else(
-		&mut self,
-		parent: BlockIndex,
-		bindings: &[StackResult],
-		selector: DataNodeIndex,
-		selector_ty: ScalarType,
-		rest: &[(i64, mir::Expression)],
-		default_expr: Option<&mir::Expression>,
-	) -> (BlockIndex, StackResult, Vec<StackResult>) {
-		let Some((head, tail)) = rest.split_first() else {
-			return match default_expr {
+		// The base of the chain: the default arm's own scope (genuine
+		// source content, no synthetic wrapping needed), or a synthetic
+		// block holding a single `Unreachable` if there's no default (TIR
+		// proved exhaustiveness without one).
+		let (mut else_block, mut else_result, mut else_bindings) =
+			match default_expr {
 				Some(body) => {
 					let (scope, exprs) = Self::unwrap_block(body);
-					let mut scope_bindings = self.extend_bindings(bindings, scope);
+					let mut scope_bindings =
+						self.extend_bindings(bindings, scope);
 					self.func.blocks[scope as usize] = Some(Block {
-						parent: Some(parent),
+						parent: Some(last_container),
 						statements: Vec::new(),
 						result: StackResult::Never,
 						loop_index: None,
@@ -1066,27 +1002,111 @@ impl<'mir> Builder<'mir> {
 					(scope, result, scope_bindings)
 				}
 				None => {
-					let unreachable_block = self.push_synthetic_block(parent);
+					let unreachable_block =
+						self.push_synthetic_block(last_container);
 					self.push_stmt(unreachable_block, ControlNode::Unreachable);
-					(unreachable_block, StackResult::Never, bindings.to_vec())
+					(unreachable_block, StackResult::Never, bindings.clone())
 				}
 			};
-		};
 
-		let (discriminant, case_body) = head;
-		let container = self.push_synthetic_block(parent);
-		let mut container_bindings = bindings.to_vec();
-		let result = self.build_if_chain_arm(
-			container,
-			&mut container_bindings,
-			selector,
-			selector_ty,
-			*discriminant,
-			case_body,
-			tail,
-			default_expr,
-		);
-		(container, result, container_bindings)
+		let parent_len = bindings.len();
+		for i in (0..cases.len()).rev() {
+			let (discriminant, case_body) = &cases[i];
+			let container = containers[i];
+			let (condition, then_scope, then_result, then_bindings) = self
+				.build_if_chain_then_branch(
+					container,
+					bindings,
+					selector,
+					selector_ty,
+					*discriminant,
+					case_body,
+				);
+
+			let mut outputs = Vec::new();
+			let result;
+			if i == 0 {
+				// The outermost level: merge directly into the caller's own
+				// `bindings`, matching the old recursive version's single
+				// depth-0 merge.
+				result = self.merge_branches(
+					then_result,
+					else_result,
+					&then_bindings,
+					&else_bindings,
+					parent_len,
+					bindings,
+					&mut outputs,
+				);
+			} else {
+				let mut scratch = vec![StackResult::Unit; parent_len];
+				result = self.merge_branches(
+					then_result,
+					else_result,
+					&then_bindings,
+					&else_bindings,
+					parent_len,
+					&mut scratch,
+					&mut outputs,
+				);
+				else_bindings = scratch;
+			}
+
+			self.push_stmt(
+				container,
+				ControlNode::IfElse {
+					condition,
+					then_block: then_scope,
+					else_block: Some(else_block),
+					outputs: outputs.into_boxed_slice(),
+					result,
+				},
+			);
+
+			else_block = container;
+			else_result = result;
+		}
+
+		else_result
+	}
+
+	/// Builds one case's `if selector == discriminant { case_body }` — the
+	/// "then" half of one if-chain level, shared by every iteration of
+	/// `build_switch_as_if_chain`'s fold regardless of which buffer that
+	/// iteration merges into.
+	fn build_if_chain_then_branch(
+		&mut self,
+		container: BlockIndex,
+		bindings: &[StackResult],
+		selector: DataNodeIndex,
+		selector_ty: ScalarType,
+		discriminant: i64,
+		case_body: &mir::Expression,
+	) -> (DataNodeIndex, BlockIndex, StackResult, Vec<StackResult>) {
+		let const_node = self.node(DataNodeKind::Int {
+			value: discriminant,
+			ty: selector_ty,
+		});
+		let condition = self.node(DataNodeKind::Eq {
+			left: selector,
+			right: const_node,
+			ty: selector_ty,
+		});
+
+		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
+		let mut then_bindings = self.extend_bindings(bindings, then_scope);
+		self.func.blocks[then_scope as usize] = Some(Block {
+			parent: Some(container),
+			statements: Vec::new(),
+			result: StackResult::Never,
+			loop_index: None,
+		});
+		let then_result =
+			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
+		self.func.blocks[then_scope as usize].as_mut().unwrap().result =
+			then_result;
+
+		(condition, then_scope, then_result, then_bindings)
 	}
 
 	fn build_switch(
@@ -1182,57 +1202,28 @@ impl<'mir> Builder<'mir> {
 			}
 		};
 
-		// Fold each slot pairwise across all arms — the same primitive
-		// `build_if_else`/`merge_branches` uses for two branches, just
-		// looped over N. Intermediate fold-phis are discarded (scratch
-		// vec): a slot contributes at most one real `Switch` output, since
-		// nothing downstream inspects a Phi's `left`/`right` for a Switch —
-		// the scheduler reads each arm's raw contribution from
-		// `SwitchCase::own_values` instead.
+		// Merge each slot across all arms via `merge_switch_slot`. A slot
+		// contributes at most one real `Switch` output per divergent
+		// *scalar leaf*: nothing downstream inspects a Phi's `left`/`right`
+		// for a Switch (the scheduler reads each arm's raw contribution
+		// from `SwitchCase::own_values` instead), so aggregate-typed slots
+		// are decomposed field-by-field rather than merged as one opaque
+		// unit, and a slot with no real value (only `Never`/`Unit` across
+		// arms) contributes no leaf at all — `outputs` and every arm's row
+		// in `own_values` grow together, one entry per leaf, so the two
+		// stay index-aligned regardless of how many leaves a slot expands
+		// into.
 		let mut outputs: Vec<DataNodeIndex> = Vec::new();
-		let mut divergent_slots: Vec<usize> = Vec::new();
 		let mut merged_per_slot: Vec<StackResult> =
 			Vec::with_capacity(total_slots);
+		let mut own_values: Vec<Vec<StackResult>> =
+			vec![Vec::new(); arms.len()];
 
 		for slot in 0..total_slots {
-			let first = slot_value(&arms[0], slot);
-			let unanimous =
-				arms[1..].iter().all(|a| slot_value(a, slot) == first);
-			let merged = if unanimous {
-				first
-			} else {
-				let mut acc = first;
-				for arm in &arms[1..] {
-					let v = slot_value(arm, slot);
-					acc = match (acc, v) {
-						(StackResult::Never, other)
-						| (other, StackResult::Never) => other,
-						(StackResult::Unit, StackResult::Unit) => {
-							StackResult::Unit
-						}
-						(StackResult::Value(l), StackResult::Value(r)) => {
-							if l == r {
-								StackResult::Value(l)
-							} else {
-								let mut scratch = Vec::new();
-								StackResult::Value(self.merge_values(
-									l,
-									r,
-									&mut scratch,
-								))
-							}
-						}
-						_ => panic!(
-							"type mismatch when merging match arm values"
-						),
-					};
-				}
-				if let StackResult::Value(v) = acc {
-					outputs.push(v);
-				}
-				divergent_slots.push(slot);
-				acc
-			};
+			let values: Vec<StackResult> =
+				arms.iter().map(|arm| slot_value(arm, slot)).collect();
+			let merged =
+				self.merge_switch_slot(&values, &mut outputs, &mut own_values);
 			merged_per_slot.push(merged);
 		}
 
@@ -1242,22 +1233,11 @@ impl<'mir> Builder<'mir> {
 
 		let mut switch_cases: Vec<SwitchCase> = arms
 			.into_iter()
-			.map(|arm| {
-				let own_values = divergent_slots
-					.iter()
-					.map(|&slot| {
-						if slot < parent_len {
-							arm.bindings[slot]
-						} else {
-							arm.result
-						}
-					})
-					.collect();
-				SwitchCase {
-					discriminant: arm.discriminant,
-					block: arm.scope,
-					own_values,
-				}
+			.zip(own_values)
+			.map(|(arm, own_values)| SwitchCase {
+				discriminant: arm.discriminant,
+				block: arm.scope,
+				own_values: own_values.into_boxed_slice(),
 			})
 			.collect();
 
@@ -1280,6 +1260,114 @@ impl<'mir> Builder<'mir> {
 			},
 		);
 		result
+	}
+
+	/// Merges one `Switch` join slot (an outer binding, or the arms' own
+	/// result) across every arm's `values` (one `StackResult` per arm, same
+	/// order as `arms`). A `Switch` output only ever needs a validly-typed
+	/// placeholder node per genuinely divergent *scalar* leaf — the
+	/// scheduler reads each arm's real contribution from
+	/// `SwitchCase::own_values`, never a Phi's `left`/`right` — so this
+	/// decomposes an aggregate-typed slot field-by-field (recursively, for
+	/// nested aggregates) instead of merging it as one opaque unit, and
+	/// treats a slot whose arms differ only in `Never` vs `Unit` (no arm
+	/// disagrees on a real value) as contributing no leaf at all. Every
+	/// `outputs.push` here is paired with exactly one push into each arm's
+	/// row of `own_values`, so the two always stay index-aligned no matter
+	/// how many leaves a slot expands into or how many slots contribute
+	/// none.
+	fn merge_switch_slot(
+		&mut self,
+		values: &[StackResult],
+		outputs: &mut Vec<DataNodeIndex>,
+		own_values: &mut [Vec<StackResult>],
+	) -> StackResult {
+		let first = values[0];
+		if values[1..].iter().copied().all(|v| v == first) {
+			return first;
+		}
+
+		let Some(sample) = values.iter().copied().find_map(|v| match v {
+			StackResult::Value(n) => Some(n),
+			_ => None,
+		}) else {
+			// Every arm is `Never` or `Unit` (a mix of the two — a uniform
+			// value would have taken the fast path above): no real value to
+			// carry, so this slot contributes no leaf.
+			return StackResult::Unit;
+		};
+
+		match self.func.data_nodes[sample as usize].kind.node_type() {
+			NodeType::Scalar(ty) => {
+				let leaf = match values.iter().copied().find_map(|v| match v {
+					StackResult::Value(n) if n != sample => Some(n),
+					_ => None,
+				}) {
+					Some(other) => self.node(DataNodeKind::Phi {
+						left: sample,
+						right: other,
+						ty,
+					}),
+					// Every value-bearing arm agrees; only `Never`/`Unit`
+					// arms vary, so there's no genuine value divergence.
+					None => sample,
+				};
+				outputs.push(leaf);
+				for (arm_values, v) in
+					own_values.iter_mut().zip(values.iter().copied())
+				{
+					arm_values.push(v);
+				}
+				StackResult::Value(leaf)
+			}
+			NodeType::Aggregate(aggregate_index) => {
+				let field_count =
+					self.mir.aggregates[aggregate_index as usize].values.len();
+				// Extract each value-bearing arm's fields exactly once (not
+				// once per field below). A `Never`/`Unit` arm propagates
+				// unchanged to every field — its body diverges before
+				// producing this slot at all, so it has nothing to
+				// contribute at any field either — without allocating
+				// `field_count` copies of that marker to represent it.
+				let per_arm: Vec<PerArmSlot> = values
+					.iter()
+					.copied()
+					.map(|v| match v {
+						StackResult::Value(n) => {
+							let (fields, _) = self.extract_aggregate_fields(n);
+							PerArmSlot::Fields(fields)
+						}
+						other => PerArmSlot::NoValue(other),
+					})
+					.collect();
+
+				let merged_fields: Box<[DataNodeIndex]> = (0..field_count)
+					.map(|field| {
+						let field_values: Vec<StackResult> = per_arm
+							.iter()
+							.map(|slot| match slot {
+								PerArmSlot::Fields(fields) => {
+									StackResult::Value(fields[field])
+								}
+								PerArmSlot::NoValue(v) => *v,
+							})
+							.collect();
+						self
+							.merge_switch_slot(
+								&field_values,
+								outputs,
+								own_values,
+							)
+							.unwrap_value()
+					})
+					.collect();
+				let agg = self.node(DataNodeKind::Aggregate {
+					fields: merged_fields,
+					aggregate_index,
+				});
+				StackResult::Value(agg)
+			}
+		}
 	}
 
 	fn build_switch_arm(
