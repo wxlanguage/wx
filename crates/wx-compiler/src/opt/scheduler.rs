@@ -31,7 +31,7 @@ use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
 	BlockIndex, ControlNode, DataNode, DataNodeIndex, DataNodeKind, Function,
-	MemAccess, ScalarType, StackResult,
+	MemAccess, ScalarType, StackResult, SwitchCase,
 };
 
 // ── Output types
@@ -170,6 +170,15 @@ pub enum Instruction {
 	End,
 	Br(u32), // break by depth
 	BrIf(u32),
+	/// Branch depth per shifted-selector index, covering every index in the
+	/// case set's `[min, max]` range (including gaps), followed by the
+	/// default depth as the trailing element — i.e. `depths[i]` for
+	/// `i < depths.len() - 1`, `depths[depths.len() - 1]` for anything else
+	/// (per WASM semantics: an out-of-table index, including one that went
+	/// negative before being reinterpreted as unsigned, always falls to the
+	/// default). One field instead of a separate `default_depth` since the
+	/// encoder needs the exact same split either way.
+	BrTable(Box<[u32]>),
 	Return,
 	Unreachable,
 	Drop,
@@ -466,6 +475,66 @@ impl<'f> Scheduler<'f> {
 				}
 			}
 
+			ControlNode::Switch {
+				selector,
+				cases,
+				default,
+				outputs,
+				result,
+			} => {
+				self.pre_alloc_phi_outputs(outputs);
+
+				// Compared against every case constant below — always spill to
+				// its own local (regardless of the generic multi-use spill
+				// heuristic, which only tracks DataNode-to-DataNode uses, not
+				// ControlNode references) so each comparison rereads the same
+				// computed value instead of re-emitting a (possibly impure)
+				// computation once per case.
+				self.emit_value(*selector);
+				let selector_ty = self.func.data_nodes[*selector as usize]
+					.kind
+					.unwrap_scalar();
+				let selector_local = self.alloc_local(selector_ty);
+				self.body.push(Instruction::LocalSet(selector_local));
+
+				let result_block_ty = if outputs.is_empty() {
+					self.stack_result_block_type(*result)
+				} else {
+					BlockType::Empty
+				};
+
+				self.emit_switch_br_table(
+					selector_local,
+					selector_ty,
+					cases,
+					default.as_ref(),
+					outputs,
+					result_block_ty,
+				);
+
+				// Same "capture the fallthrough value into a local" step
+				// `IfElse` does — lets the parent's `emit_value(result_node)`
+				// read from a local uniformly rather than assuming a value is
+				// still sitting on the WASM stack.
+				if outputs.is_empty() {
+					if let StackResult::Value(result_node) = *result {
+						let local = if let Some(&l) =
+							self.node_to_local.get(&result_node)
+						{
+							l
+						} else {
+							let ty = self.func.data_nodes[result_node as usize]
+								.kind
+								.unwrap_scalar();
+							let l = self.alloc_local(ty);
+							self.node_to_local.insert(result_node, l);
+							l
+						};
+						self.body.push(Instruction::LocalSet(local));
+					}
+				}
+			}
+
 			ControlNode::Loop {
 				body,
 				outputs,
@@ -488,9 +557,9 @@ impl<'f> Scheduler<'f> {
 
 				// Pre-allocate WASM locals for break-result phi nodes so that
 				// Break handlers inside the body can write to them before `br`.
-				for phi in self.func.blocks[*body as usize]
-					.as_ref()
-					.unwrap()
+				for phi in self
+					.func
+					.loop_data(*body)
 					.break_result_outputs
 					.iter()
 					.copied()
@@ -540,20 +609,21 @@ impl<'f> Scheduler<'f> {
 				self.body.push(Instruction::End); // Block
 			}
 
-			ControlNode::Break { target, value } => {
+			ControlNode::Break {
+				target,
+				value,
+				loop_param_updates,
+			} => {
 				if let StackResult::Value(v) = value {
 					// Store break value into phi locals; LocalSet in reverse
 					// because emit_value pushes fields lowest-first.
-					let n_phis = self.func.blocks[*target as usize]
-						.as_ref()
-						.unwrap()
-						.break_result_outputs
-						.len();
+					let n_phis =
+						self.func.loop_data(*target).break_result_outputs.len();
 					if n_phis > 0 {
 						self.emit_value(*v);
-						for phi in self.func.blocks[*target as usize]
-							.as_ref()
-							.unwrap()
+						for phi in self
+							.func
+							.loop_data(*target)
 							.break_result_outputs
 							.iter()
 							.copied()
@@ -567,11 +637,21 @@ impl<'f> Scheduler<'f> {
 						}
 					}
 				}
+				// This break's own current values for the target loop's
+				// carried bindings — committed here because the loop's normal
+				// "commit, then branch back" tail code only runs on ordinary
+				// fallthrough, which this `br` bypasses entirely. See
+				// `Builder::loop_param_updates`.
+				self.emit_loop_param_updates(loop_param_updates);
 				let depth = self.break_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
 
-			ControlNode::Continue { target } => {
+			ControlNode::Continue {
+				target,
+				loop_param_updates,
+			} => {
+				self.emit_loop_param_updates(loop_param_updates);
 				let depth = self.continue_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
@@ -1258,6 +1338,179 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
+	/// Commits a `break`/`continue` site's own current values for its target
+	/// loop's carried bindings, immediately before the `br` that leaves the
+	/// current block. See `Builder::loop_param_updates` for why every such
+	/// site must do this independently rather than relying on the loop's own
+	/// (fallthrough-only) tail code.
+	fn emit_loop_param_updates(
+		&mut self,
+		updates: &[(DataNodeIndex, DataNodeIndex)],
+	) {
+		// Two-phase, matching `ControlNode::Loop`'s own tail code: push every
+		// current value first, *then* pop into locals in reverse. A single
+		// interleaved emit+store pass would be wrong here — a later update's
+		// `current` can itself be an expression that reads an *earlier*
+		// update's `param` local (e.g. `acc += i; i += 1;`: acc's new value
+		// reads `i`'s old value out of the very local `i`'s own update is
+		// about to overwrite), so every read must happen before any write.
+		for &(_, current) in updates {
+			self.emit_value(current);
+		}
+		for &(param, _) in updates.iter().rev() {
+			let local = *self.node_to_local.get(&param).expect(
+				"loop param local must be pre-allocated by the Loop handler",
+			);
+			self.body.push(Instruction::LocalSet(local));
+		}
+	}
+
+	/// Emits `cases` (guaranteed non-empty, `selector_ty == I32` — see
+	/// `Builder::should_use_br_table`) as a WASM `br_table` jump table,
+	/// nested in a fixed stack of `block`s so every case — and the trailing
+	/// `default`, or `unreachable` if TIR proved exhaustiveness without one
+	/// — gets its own branch depth:
+	///
+	/// ```text
+	/// block $after                       (result_block_ty)
+	///   block $default
+	///     block $case[N-1]
+	///       ...
+	///         block $case[0]
+	///           <selector - min>  br_table
+	///         end                        ; case 0 body starts here
+	///         <case 0 body>  br $after
+	///       end                          ; case 1 body starts here
+	///       ...
+	///     end                            ; case N-1 body starts here
+	///     <case N-1 body>  br $after
+	///   end                              ; default body starts here
+	///   <default body>                   ; (or `unreachable`)
+	/// end
+	/// ```
+	///
+	/// `Builder::build_switch` allocates a matching chain of synthetic
+	/// depth-bookkeeping blocks (`Builder::push_synthetic_block`) so a
+	/// `break`/`continue` written inside an arm still resolves through the
+	/// ordinary `break_depth`/`continue_depth` ancestor walk with no
+	/// scheduler-side depth bookkeeping — this function must keep emitting
+	/// exactly that many real `block`s (`case_count + 2`) for the two to
+	/// stay in sync.
+	fn emit_switch_br_table(
+		&mut self,
+		selector_local: u32,
+		selector_ty: ScalarType,
+		cases: &[SwitchCase],
+		default: Option<&SwitchCase>,
+		outputs: &[DataNodeIndex],
+		result_block_ty: BlockType,
+	) {
+		debug_assert_eq!(
+			selector_ty,
+			ScalarType::I32,
+			"should_use_br_table restricts br_table to an I32 selector"
+		);
+		let case_count = cases.len();
+
+		self.body.push(Instruction::Block {
+			ty: result_block_ty,
+		}); // $after
+		self.body.push(Instruction::Block {
+			ty: BlockType::Empty,
+		}); // $default
+		for _ in 0..case_count {
+			self.body.push(Instruction::Block {
+				ty: BlockType::Empty,
+			}); // $case[N-1] .. $case[0], innermost last
+		}
+
+		let min = cases
+			.iter()
+			.filter_map(|c| c.discriminant)
+			.min()
+			.expect("should_use_br_table guarantees at least one case");
+		let max = cases
+			.iter()
+			.filter_map(|c| c.discriminant)
+			.max()
+			.expect("should_use_br_table guarantees at least one case");
+		let range = (max - min) as usize + 1;
+
+		// `depths[i]` for `i < range` is the branch depth for shifted-selector
+		// value `i` — the *array position* of the case whose discriminant is
+		// `min + i` (cases aren't necessarily discriminant-sorted, so this
+		// can't be computed positionally from the value alone). The trailing
+		// entry is the default depth; every slot starts there, covering both
+		// "gap within the range" (density < 1.0 is allowed) and the
+		// out-of-range/default case uniformly.
+		let mut depths = vec![case_count as u32; range + 1];
+		for (i, case) in cases.iter().enumerate() {
+			let d = case.discriminant.expect("non-default switch case");
+			depths[(d - min) as usize] = i as u32;
+		}
+
+		self.body.push(Instruction::LocalGet(selector_local));
+		self.body.push(Instruction::I32Const(min as i32));
+		self.body.push(Instruction::I32Sub);
+		self.body.push(Instruction::BrTable(depths.into_boxed_slice()));
+
+		for (i, case) in cases.iter().enumerate() {
+			self.body.push(Instruction::End); // end $case[i]
+			self.emit_switch_case_body(case, outputs);
+			self.body.push(Instruction::Br((case_count - i) as u32));
+		}
+		self.body.push(Instruction::End); // end $default
+		match default {
+			Some(case) => self.emit_switch_case_body(case, outputs),
+			// TIR proved every case is covered (exhaustive enum match with
+			// no explicit `_`) — nothing left to fall through to.
+			None => self.body.push(Instruction::Unreachable),
+		}
+		self.body.push(Instruction::End); // end $after
+	}
+
+	fn emit_switch_case_body(
+		&mut self,
+		case: &SwitchCase,
+		outputs: &[DataNodeIndex],
+	) {
+		self.emit_block(case.block);
+		if outputs.is_empty() {
+			// Value-type block: like `IfElse`, the arm's own tail value (its
+			// `Block::result`, not one of its `statements`) must be pushed
+			// explicitly so it flows out through the `if`/`else`'s result type.
+			let block_result = self.func.blocks[case.block as usize]
+				.as_ref()
+				.unwrap()
+				.result;
+			if let StackResult::Value(n) = block_result {
+				self.emit_value(n);
+			}
+		} else {
+			// Two-phase, same reasoning as `emit_loop_param_updates`: push
+			// every own-value first, *then* pop into locals in reverse. A
+			// later slot's value can be an expression that reads an earlier
+			// slot's own pre-update local (e.g. `acc += i; i += 1;`), so
+			// every read must happen before any write.
+			for (&value, _) in case.own_values.iter().zip(outputs) {
+				if let StackResult::Value(v) = value {
+					self.emit_value(v);
+				}
+			}
+			for (&value, &phi) in
+				case.own_values.iter().zip(outputs).rev()
+			{
+				// `StackResult::Never`: this arm's body diverges before
+				// reaching the join (e.g. ends in `return`/`unreachable`) —
+				// nothing was pushed above, so nothing to store.
+				if matches!(value, StackResult::Value(_)) {
+					let local = *self.node_to_local.get(&phi).unwrap();
+					self.body.push(Instruction::LocalSet(local));
+				}
+			}
+		}
+	}
+
 	// ── Depth computation ──────────────────────────────────────────────────────
 
 	/// WASM `br` depth for a `break` targeting `target_block` from
@@ -1271,12 +1524,12 @@ impl<'f> Scheduler<'f> {
 		loop {
 			let block = self.func.blocks[idx as usize].as_ref().unwrap();
 			if idx == target {
-				if block.is_loop {
+				if block.is_loop() {
 					depth += 1;
 				}
 				return depth;
 			}
-			depth += if block.is_loop { 2 } else { 1 };
+			depth += if block.is_loop() { 2 } else { 1 };
 			idx = block.parent.unwrap();
 		}
 	}

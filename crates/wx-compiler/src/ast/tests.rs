@@ -370,6 +370,60 @@ fn test_if_else() {
 }
 
 #[test]
+fn test_match_int_literal_patterns() {
+	let case = TestCase::new(indoc! {"
+        fn sign(x: i32) -> i32 {
+            match x {
+                0 -> { 0 },
+                1 -> { 1 },
+                _ -> { -1 },
+            }
+        }
+    "});
+	insta::assert_yaml_snapshot!(case.ast);
+}
+
+#[test]
+fn test_match_enum_variant_patterns() {
+	let case = TestCase::new(indoc! {"
+        enum FileDescriptor: u8 {
+            StdIn,
+            StdOut,
+            StdErr,
+        }
+
+        fn name(fd: FileDescriptor) -> u8 {
+            match fd {
+                FileDescriptor::StdIn -> { 0 },
+                FileDescriptor::StdOut -> { 1 },
+                FileDescriptor::StdErr -> { 2 },
+            }
+        }
+    "});
+	insta::assert_yaml_snapshot!(case.ast);
+}
+
+#[test]
+fn test_match_missing_arrow_recovers_with_diagnostic() {
+	// The missing `->` itself is reported as E0002. `SeparatedGroup`'s
+	// recovery matches the arm list's closing brace by token *kind*, not
+	// nesting depth, so it mistakes `{ 1 }`'s own `}` for the match's
+	// closing brace here — a pre-existing characteristic of recovery
+	// shared by every brace-delimited construct in this parser, not
+	// specific to `match` — which cascades into a second diagnostic
+	// (E0009) while re-syncing at the enclosing item boundary.
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            match x {
+                0 { 1 },
+                _ -> { 0 },
+            }
+        }
+    "});
+	assert_eq!(diagnostic_codes(&case.ast), vec!["E0002", "E0009"]);
+}
+
+#[test]
 fn test_loop_break_label() {
 	// labeled loop, break with label and a value, continue
 	let case = TestCase::new(indoc! {"

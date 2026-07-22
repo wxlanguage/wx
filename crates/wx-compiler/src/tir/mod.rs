@@ -627,6 +627,10 @@ pub enum ExprKind {
 		then_block: Box<Expression>,
 		else_block: Option<Box<Expression>>,
 	},
+	Match {
+		scrutinee: Box<Expression>,
+		arms: Box<[MatchArm]>,
+	},
 	Break {
 		scope_index: ScopeIndex,
 		value: Option<Box<Expression>>,
@@ -893,6 +897,29 @@ pub struct EnumVariant {
 	/// Compile-time value of `value`, if it folds — see `Builder::eval_const_expr`.
 	pub const_value: Option<ConstValue>,
 	pub accesses: Vec<SourceSpan>,
+}
+
+/// A resolved `match` arm pattern. v1 supports only patterns whose legality
+/// can be checked by re-running the ordinary expression builder on the arm's
+/// syntax (see `Builder::build_pattern`) — no bindings, no or-patterns, no
+/// guards.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum Pattern {
+	Int(i64),
+	Bool(bool),
+	Char(char),
+	EnumVariant { enum_index: u32, variant_index: EnumVariantIndex },
+	Wildcard,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct MatchArm {
+	pub pattern: Pattern,
+	pub pattern_span: ast::TextSpan,
+	pub body: Box<Expression>,
 }
 
 #[derive(Clone, Copy)]
@@ -1418,6 +1445,10 @@ define_diagnostic_codes! {
 		NotAField => "E1060",
 		DuplicateTraitImpl => "E1061",
 		InvalidImplTarget => "E1062",
+		NonExhaustiveMatch => "E1063",
+		InvalidMatchScrutineeType => "E1064",
+		InvalidPattern => "E1065",
+		UnreachableMatchArm => "W1010",
 	}
 }
 

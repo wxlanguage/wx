@@ -1327,3 +1327,83 @@ fn test_string_literal_dedup_is_per_memory() {
 		"the two entries must target different memories"
 	);
 }
+
+// ── match ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_match_int_lowers_to_switch() {
+	let case = TestCase::new(indoc! {"
+        fn sign(x: i32) -> i32 {
+            match x {
+                0 -> { 0 },
+                1 -> { 1 },
+                _ -> { -1 },
+            }
+        }
+
+        export { sign }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_match_enum_lowers_discriminants_to_repr_values() {
+	// Enum-variant patterns lower to their folded `const_value` (the repr
+	// scalar), not a symbolic variant index — mirrors how `Color::Green`
+	// itself erases to a scalar (test_enum_variant_lowered_to_repr_scalar).
+	let case = TestCase::new(indoc! {"
+        enum Color: i32 {
+            Red = 1,
+            Green,
+            Blue,
+        }
+
+        fn to_u8(c: Color) -> u8 {
+            match c {
+                Color::Red -> { 0 },
+                Color::Green -> { 1 },
+                Color::Blue -> { 2 },
+            }
+        }
+
+        export { to_u8 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
+	let case = TestCase::new(indoc! {"
+        enum Color: i32 {
+            Red = 1,
+            Green,
+            Blue,
+        }
+
+        fn to_u8(c: Color) -> u8 {
+            match c {
+                Color::Red -> { 0 },
+                Color::Green -> { 1 },
+                Color::Blue -> { 2 },
+            }
+        }
+
+        export { to_u8 }
+    "});
+	let ExprKind::Block { expressions, .. } = &case.mir.functions[0].block.kind
+	else {
+		panic!("function body must be a Block");
+	};
+	let switch = expressions
+		.iter()
+		.find_map(|e| match &e.kind {
+			ExprKind::Switch { cases, default, .. } => Some((cases, default)),
+			_ => None,
+		})
+		.expect("expected a Switch in the lowered function body");
+	assert_eq!(switch.0.len(), 3, "expected one case per enum variant");
+	assert!(
+		switch.1.is_none(),
+		"exhaustive enum match without `_` should lower with no default arm"
+	);
+}

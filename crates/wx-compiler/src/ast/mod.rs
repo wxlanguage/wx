@@ -1110,6 +1110,11 @@ pub enum Expression {
 		then_block: Box<Spanned<Expression>>,
 		else_block: Option<Box<Spanned<Expression>>>,
 	},
+	/// `match {expr} { {pattern} -> { ... }, ... }`
+	Match {
+		scrutinee: Box<Spanned<Expression>>,
+		arms: Box<[Separated<Spanned<MatchArm>>]>,
+	},
 	/// `continue (:{label})?`
 	Continue {
 		label: Option<Spanned<SymbolU32>>,
@@ -1186,6 +1191,19 @@ pub struct StructInitField {
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
+/// One arm of a `match` expression: `{pattern} -> { ... }`.
+///
+/// `pattern` is parsed as an ordinary `Expression` (a literal, `_`, or an
+/// `Enum::Variant` path) — legality is validated in TIR rather than by a
+/// separate pattern grammar, mirroring how `EnumVariant.value` reuses
+/// `Expression` for its discriminant.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct MatchArm {
+	pub pattern: Box<Spanned<Expression>>,
+	pub body: Box<Spanned<Expression>>,
+}
+
 /// One segment of a `::` path, with optional turbofish type args.
 /// `Point` → `PathSegment { ident: "Point", type_args: [] }`
 /// `Point::<i32>` → `PathSegment { ident: "Point", type_args: [i32] }`
@@ -1219,6 +1237,7 @@ impl Expression {
 			| Expression::IfElse { .. }
 			| Expression::Loop { .. }
 			| Expression::Label { .. }
+			| Expression::Match { .. }
 			| Expression::StructInit { .. } => true,
 			_ => false,
 		}
@@ -1818,6 +1837,7 @@ pub enum Keyword {
 	SelfType,
 	Type,
 	Typeset,
+	Match,
 	/// `_` — wildcard in patterns, inference placeholder in types, discard in
 	/// value position.  Kept as a keyword so all three uses share one token.
 	Underscore,
@@ -1859,6 +1879,7 @@ impl TryFrom<&str> for Keyword {
 			"Self" => Ok(Keyword::SelfType),
 			"type" => Ok(Keyword::Type),
 			"typeset" => Ok(Keyword::Typeset),
+			"match" => Ok(Keyword::Match),
 			"_" => Ok(Keyword::Underscore),
 			"use" => Ok(Keyword::Use),
 			"where" => Ok(Keyword::Where),
@@ -3028,6 +3049,10 @@ impl<'ctx> Parser<'ctx> {
 						Parser::parse_loop_expression,
 						BindingPower::Primary,
 					)),
+					Ok(Keyword::Match) => Some((
+						Parser::parse_match_expression,
+						BindingPower::Primary,
+					)),
 					Ok(Keyword::Break) => Some((
 						Parser::parse_break_expression,
 						BindingPower::Primary,
@@ -3897,6 +3922,46 @@ impl<'ctx> Parser<'ctx> {
 				})
 			}
 		}
+	}
+
+	fn parse_match_expression(
+		parser: &mut Parser,
+	) -> Result<Spanned<Expression>, ()> {
+		let match_keyword = parser.lexer.next();
+		let scrutinee = parser.parse_expression(BindingPower::Default)?;
+
+		let arms = SeparatedGroup {
+			open_token: Token::OpenBrace,
+			close_token: Token::CloseBrace,
+			separator_token: Token::Comma,
+			item_handler: |parser: &mut Parser| -> Result<Spanned<MatchArm>, ()> {
+				let pattern = parser.parse_expression(BindingPower::Default)?;
+				parser.next_expect(Token::MinusRightArrow)?;
+				let body = Parser::parse_block_expression(parser)?;
+				let span = TextSpan::new(pattern.span.start, body.span.end);
+				Ok(Spanned {
+					inner: MatchArm {
+						pattern: Box::new(pattern),
+						body: Box::new(body),
+					},
+					span,
+				})
+			},
+			// Arm bodies are always `{ }` blocks, so — like `parse_enum_item`
+			// — a missing trailing comma before the next arm is never
+			// ambiguous with statement continuation; no warning needed.
+			should_warn_missing_separator: None,
+		}
+		.parse(parser)?;
+
+		let span = TextSpan::new(match_keyword.span.start, arms.span.end);
+		Ok(Spanned {
+			inner: Expression::Match {
+				scrutinee: Box::new(scrutinee),
+				arms: arms.inner,
+			},
+			span,
+		})
 	}
 
 	/// Handles `expr::<T, U>` turbofish when `expr` is NOT a bare identifier

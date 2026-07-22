@@ -1,7 +1,7 @@
 use crate::mir::{self, ExprKind};
 use crate::opt::{
 	Block, BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function,
-	MemAccess, NodeType, ScalarType, StackResult,
+	LoopData, MemAccess, NodeType, ScalarType, StackResult, SwitchCase,
 };
 
 pub struct Builder<'mir> {
@@ -14,6 +14,26 @@ pub struct Builder<'mir> {
 	/// locals start. Computed once from the scope parent-chain before
 	/// building begins.
 	locals_offsets: Box<[u32]>,
+}
+
+/// One `match` arm as built so far: its own scope/bindings plus what it
+/// contributed to (parent-binding index, or the arm's own result if
+/// `slot == parent_len` — see `Builder::build_switch`).
+struct SwitchArmBuild {
+	discriminant: Option<i64>,
+	scope: BlockIndex,
+	result: StackResult,
+	bindings: Vec<StackResult>,
+}
+
+/// One arm's contribution to an aggregate-typed `Switch` join slot, as
+/// decomposed by `Builder::merge_switch_slot` — either the arm's own
+/// per-field values (reusing the `Box<[DataNodeIndex]>` `extract_aggregate_fields`
+/// already returned, no re-wrapping), or a `Never`/`Unit` marker to
+/// propagate to every field without materializing `field_count` copies of it.
+enum PerArmSlot {
+	Fields(Box<[DataNodeIndex]>),
+	NoValue(StackResult),
 }
 
 impl<'mir> Builder<'mir> {
@@ -102,11 +122,10 @@ impl<'mir> Builder<'mir> {
 		}
 
 		self.func.blocks[0] = Some(Block {
-			is_loop: false,
 			parent: None,
 			statements: Vec::new(),
 			result: StackResult::Never,
-			break_result_outputs: Vec::new(),
+			loop_index: None,
 		});
 
 		let body_exprs = match &mir_func.block.kind {
@@ -459,6 +478,29 @@ impl<'mir> Builder<'mir> {
 				then_block,
 				else_block.as_deref(),
 			),
+			ExprKind::Switch {
+				selector,
+				cases,
+				default,
+			} => {
+				if Self::should_use_br_table(selector.ty, cases) {
+					self.build_switch(
+						block_idx,
+						bindings,
+						selector,
+						cases,
+						default.as_deref(),
+					)
+				} else {
+					self.build_switch_as_if_chain(
+						block_idx,
+						bindings,
+						selector,
+						cases,
+						default.as_deref(),
+					)
+				}
+			}
 			ExprKind::Loop { scope_index, block } => {
 				self.build_loop(block_idx, bindings, *scope_index, block)
 			}
@@ -468,6 +510,12 @@ impl<'mir> Builder<'mir> {
 					None => StackResult::Unit,
 				};
 				let target = *scope_index as BlockIndex;
+				// Captured *before* the merge below (which only concerns the
+				// loop's own trailing value) — this break's own current
+				// contribution to the loop's carried bindings, independent of
+				// its break value. See `loop_param_updates`.
+				let loop_param_updates =
+					self.loop_param_updates(target, bindings);
 				let existing =
 					self.func.blocks[target as usize].as_ref().unwrap().result;
 				// Merge the break value with any previously-seen break result.
@@ -483,10 +531,8 @@ impl<'mir> Builder<'mir> {
 					(StackResult::Value(l), StackResult::Value(r)) => {
 						let mut outputs = Vec::new();
 						let node = self.merge_values(l, r, &mut outputs);
-						self.func.blocks[target as usize]
-							.as_mut()
-							.unwrap()
-							.break_result_outputs = outputs;
+						self.func.loop_data_mut(target).break_result_outputs =
+							outputs;
 						StackResult::Value(node)
 					}
 					_ => panic!(
@@ -498,15 +544,23 @@ impl<'mir> Builder<'mir> {
 					merged;
 				self.push_stmt(
 					block_idx,
-					ControlNode::Break { target, value: val },
+					ControlNode::Break {
+						target,
+						value: val,
+						loop_param_updates,
+					},
 				);
 				StackResult::Never
 			}
 			ExprKind::Continue { scope_index } => {
+				let target = *scope_index as BlockIndex;
+				let loop_param_updates =
+					self.loop_param_updates(target, bindings);
 				self.push_stmt(
 					block_idx,
 					ControlNode::Continue {
-						target: *scope_index as BlockIndex,
+						target,
+						loop_param_updates,
 					},
 				);
 				StackResult::Never
@@ -748,29 +802,25 @@ impl<'mir> Builder<'mir> {
 		let (then_scope, then_exprs) = Self::unwrap_block(then_expr);
 		let mut then_bindings = self.extend_bindings(bindings, then_scope);
 		self.func.blocks[then_scope as usize] = Some(Block {
-			is_loop: false,
 			parent: Some(block_idx),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			break_result_outputs: Vec::new(),
+			loop_index: None,
 		});
 		let then_result =
 			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize]
-			.as_mut()
-			.unwrap()
-			.result = then_result;
+		self.func.blocks[then_scope as usize].as_mut().unwrap().result =
+			then_result;
 
 		let (else_result, else_bindings, else_scope) = match else_expr {
 			Some(e) => {
 				let (scope, exprs) = Self::unwrap_block(e);
 				let mut eb = self.extend_bindings(bindings, scope);
 				self.func.blocks[scope as usize] = Some(Block {
-					is_loop: false,
 					parent: Some(block_idx),
 					statements: Vec::new(),
 					result: StackResult::Never,
-					break_result_outputs: Vec::new(),
+					loop_index: None,
 				});
 				let r = self.build_block_exprs(scope, &mut eb, exprs);
 				self.func.blocks[scope as usize].as_mut().unwrap().result = r;
@@ -804,6 +854,547 @@ impl<'mir> Builder<'mir> {
 		result
 	}
 
+	/// Whether `cases` is dense enough to justify a WASM `br_table` jump
+	/// table over a right-nested `br_if` comparison chain. `br_table`'s cost
+	/// (both code size and, for a sparse range, wasted table entries that
+	/// all point at the default) is proportional to the index range
+	/// regardless of how many cases are actually populated, so a small case
+	/// count or a wide/sparse range isn't worth it — those are built as a
+	/// plain `IfElse` chain instead (`build_switch_as_if_chain`), which
+	/// reuses `IfElse`'s existing depth/scheduling machinery unmodified.
+	///
+	/// Restricted to an `I32` selector: the dispatch shifts the selector by
+	/// `-min` and truncates to `br_table`'s mandatory i32 index. For an I64
+	/// selector, a genuinely out-of-range runtime value could truncate
+	/// (wrap) into an in-range index and be misrouted to the wrong case
+	/// instead of falling through to the default — I32 selectors can't
+	/// overflow the shift, so this sidesteps the issue rather than adding a
+	/// separate range-check-before-truncate path. This covers the
+	/// overwhelming majority of real matches anyway (enums, `bool`, `char`,
+	/// and ordinary `i32`/`u32` literals); I64 matches still compile
+	/// correctly, just always via the if-chain.
+	fn should_use_br_table(
+		selector_ty: mir::Type,
+		cases: &[(i64, mir::Expression)],
+	) -> bool {
+		if ScalarType::try_from(selector_ty) != Ok(ScalarType::I32) {
+			return false;
+		}
+		if cases.len() < 3 {
+			return false;
+		}
+		let min = cases.iter().map(|(d, _)| *d).min().unwrap();
+		let max = cases.iter().map(|(d, _)| *d).max().unwrap();
+		let range = max as i128 - min as i128 + 1;
+		if range > 512 {
+			return false;
+		}
+		(cases.len() as f64) / (range as f64) >= 0.5
+	}
+
+	/// Allocates a new `Block` beyond those pre-sized for MIR scopes — used
+	/// for synthetic WASM-nesting-only blocks that don't correspond to a
+	/// MIR scope, such as the "else if" containers
+	/// `build_switch_as_if_chain` invents for cases beyond the first, or the
+	/// depth-bookkeeping wrapper blocks `build_switch`'s `br_table` shape
+	/// needs. A `Block` here is purely a scheduling container — it costs
+	/// nothing at the WASM level by itself; only the `ControlNode`s that
+	/// target it as a `then_block`/`else_block`/etc. produce real
+	/// instructions — so allocating extra ones freely is cheap.
+	fn push_synthetic_block(&mut self, parent: BlockIndex) -> BlockIndex {
+		let idx = self.func.blocks.len() as BlockIndex;
+		self.func.blocks.push(Some(Block {
+			parent: Some(parent),
+			statements: Vec::new(),
+			result: StackResult::Never,
+			loop_index: None,
+		}));
+		idx
+	}
+
+	/// Lowers a `match` that didn't qualify for `br_table` (see
+	/// `should_use_br_table`) into a right-nested `IfElse` chain — the exact
+	/// shape a hand-written `if x == 0 { .. } else if x == 1 { .. } else {
+	/// .. }` would produce. The scrutinee is evaluated exactly once (it may
+	/// have side effects) and its resulting `DataNodeIndex` is compared
+	/// against each case's discriminant directly — no MIR round-trip needed
+	/// since Opt values are referenced by index, not re-evaluated per use.
+	///
+	/// Built iteratively, case-by-case from the *last* case back to the
+	/// first, rather than by recursing through the case list: a naive
+	/// recursive descent would grow the Rust call stack (and clone the
+	/// bindings vector) once per case, with nothing bounding that beyond the
+	/// arm count itself — exactly the shape this sparse path is chosen for
+	/// (a wide-but-sparse match can have many cases). Every case's `then`
+	/// branch is a mutually exclusive alternative from the *same* starting
+	/// point, so every one of them is built from the caller's original,
+	/// still-unmodified `bindings` — only the final (case 0) merge writes
+	/// into it; every earlier merge writes into a throwaway scratch buffer
+	/// that becomes the next case's `else_bindings` going outward, mirroring
+	/// how only the outermost frame's merge touched the real `bindings` in
+	/// the old recursive version.
+	fn build_switch_as_if_chain(
+		&mut self,
+		block_idx: BlockIndex,
+		bindings: &mut Vec<StackResult>,
+		selector_expr: &mir::Expression,
+		cases: &[(i64, mir::Expression)],
+		default_expr: Option<&mir::Expression>,
+	) -> StackResult {
+		// A match that's just `_ -> body` lowers to `Switch { cases: [],
+		// default: Some(body) }` in MIR — there's no comparison to make at
+		// all, so just build `body` directly with no branch. The scrutinee
+		// is still evaluated once for its side effects, matching `Switch`'s
+		// semantics elsewhere.
+		if cases.is_empty() {
+			self.build_expr(block_idx, bindings, selector_expr);
+			return match default_expr {
+				Some(body) => self.build_expr(block_idx, bindings, body),
+				None => {
+					self.push_stmt(block_idx, ControlNode::Unreachable);
+					StackResult::Never
+				}
+			};
+		}
+
+		let selector = self
+			.build_expr(block_idx, bindings, selector_expr)
+			.unwrap_value();
+		let selector_ty =
+			self.func.data_nodes[selector as usize].kind.unwrap_scalar();
+
+		// One container block per case: case `i`'s `IfElse` is pushed into
+		// `containers[i]` (`containers[0]` is `block_idx` itself); case
+		// `i`'s "else" side is `containers[i + 1]` (or, for the last case,
+		// the default/unreachable base built below) — a plain forward loop,
+		// no recursion needed just to allocate these.
+		let mut containers: Vec<BlockIndex> = Vec::with_capacity(cases.len());
+		containers.push(block_idx);
+		for _ in 1..cases.len() {
+			let parent = *containers.last().unwrap();
+			containers.push(self.push_synthetic_block(parent));
+		}
+		let last_container = *containers.last().unwrap();
+
+		// The base of the chain: the default arm's own scope (genuine
+		// source content, no synthetic wrapping needed), or a synthetic
+		// block holding a single `Unreachable` if there's no default (TIR
+		// proved exhaustiveness without one).
+		let (mut else_block, mut else_result, mut else_bindings) =
+			match default_expr {
+				Some(body) => {
+					let (scope, exprs) = Self::unwrap_block(body);
+					let mut scope_bindings =
+						self.extend_bindings(bindings, scope);
+					self.func.blocks[scope as usize] = Some(Block {
+						parent: Some(last_container),
+						statements: Vec::new(),
+						result: StackResult::Never,
+						loop_index: None,
+					});
+					let result = self.build_block_exprs(
+						scope,
+						&mut scope_bindings,
+						exprs,
+					);
+					self.func.blocks[scope as usize].as_mut().unwrap().result =
+						result;
+					(scope, result, scope_bindings)
+				}
+				None => {
+					let unreachable_block =
+						self.push_synthetic_block(last_container);
+					self.push_stmt(unreachable_block, ControlNode::Unreachable);
+					(unreachable_block, StackResult::Never, bindings.clone())
+				}
+			};
+
+		let parent_len = bindings.len();
+		for i in (0..cases.len()).rev() {
+			let (discriminant, case_body) = &cases[i];
+			let container = containers[i];
+			let (condition, then_scope, then_result, then_bindings) = self
+				.build_if_chain_then_branch(
+					container,
+					bindings,
+					selector,
+					selector_ty,
+					*discriminant,
+					case_body,
+				);
+
+			let mut outputs = Vec::new();
+			let result;
+			if i == 0 {
+				// The outermost level: merge directly into the caller's own
+				// `bindings`, matching the old recursive version's single
+				// depth-0 merge.
+				result = self.merge_branches(
+					then_result,
+					else_result,
+					&then_bindings,
+					&else_bindings,
+					parent_len,
+					bindings,
+					&mut outputs,
+				);
+			} else {
+				let mut scratch = vec![StackResult::Unit; parent_len];
+				result = self.merge_branches(
+					then_result,
+					else_result,
+					&then_bindings,
+					&else_bindings,
+					parent_len,
+					&mut scratch,
+					&mut outputs,
+				);
+				else_bindings = scratch;
+			}
+
+			self.push_stmt(
+				container,
+				ControlNode::IfElse {
+					condition,
+					then_block: then_scope,
+					else_block: Some(else_block),
+					outputs: outputs.into_boxed_slice(),
+					result,
+				},
+			);
+
+			else_block = container;
+			else_result = result;
+		}
+
+		else_result
+	}
+
+	/// Builds one case's `if selector == discriminant { case_body }` — the
+	/// "then" half of one if-chain level, shared by every iteration of
+	/// `build_switch_as_if_chain`'s fold regardless of which buffer that
+	/// iteration merges into.
+	fn build_if_chain_then_branch(
+		&mut self,
+		container: BlockIndex,
+		bindings: &[StackResult],
+		selector: DataNodeIndex,
+		selector_ty: ScalarType,
+		discriminant: i64,
+		case_body: &mir::Expression,
+	) -> (DataNodeIndex, BlockIndex, StackResult, Vec<StackResult>) {
+		let const_node = self.node(DataNodeKind::Int {
+			value: discriminant,
+			ty: selector_ty,
+		});
+		let condition = self.node(DataNodeKind::Eq {
+			left: selector,
+			right: const_node,
+			ty: selector_ty,
+		});
+
+		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
+		let mut then_bindings = self.extend_bindings(bindings, then_scope);
+		self.func.blocks[then_scope as usize] = Some(Block {
+			parent: Some(container),
+			statements: Vec::new(),
+			result: StackResult::Never,
+			loop_index: None,
+		});
+		let then_result =
+			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
+		self.func.blocks[then_scope as usize].as_mut().unwrap().result =
+			then_result;
+
+		(condition, then_scope, then_result, then_bindings)
+	}
+
+	fn build_switch(
+		&mut self,
+		block_idx: BlockIndex,
+		bindings: &mut Vec<StackResult>,
+		selector_expr: &mir::Expression,
+		mir_cases: &[(i64, mir::Expression)],
+		default_expr: Option<&mir::Expression>,
+	) -> StackResult {
+		let selector = self
+			.build_expr(block_idx, bindings, selector_expr)
+			.unwrap_value();
+
+		// `should_use_br_table` guarantees a real `br_table` shape here, not
+		// a nested if/else emulation — so this builds `Block::parent` chains
+		// that mirror the *actual* WASM nesting `emit_switch_br_table`
+		// produces:
+		//   block $after
+		//     block $default
+		//       block $case[N-1] ... block $case[0]
+		//         <dispatch>
+		//       end          <- case 0 body runs here, still inside $case[1]
+		//       ...
+		//     end            <- case N-1 body runs here, still inside $default
+		//   end              <- default body runs here, still inside $after
+		// Every wrapper closes *before* the content that logically "belongs"
+		// to it runs, so nothing ever sits directly inside its own
+		// same-numbered wrapper: case i's body sits one level further out,
+		// inside `$case[i+1]` (or `$default` for the last case), and the
+		// default arm's body sits inside `$after` directly (`$default`
+		// itself, like every `$case`, only wraps the dispatch/cases below
+		// it — got this backwards once already, see the default-arm branch
+		// below). `push_synthetic_block` costs nothing at the WASM level
+		// itself (see its doc comment) — this chain is purely bookkeeping
+		// for `break_depth`/`continue_depth`'s ancestor walk, not a
+		// reflection of anything actually emitted here. `default_block` is
+		// always allocated (even with no `_` arm) since it's still a real
+		// WASM block wrapping the dispatch + every case.
+		let case_count = mir_cases.len();
+		debug_assert!(
+			case_count >= 3,
+			"should_use_br_table guarantees at least 3 cases"
+		);
+		let after_block = self.push_synthetic_block(block_idx);
+		let default_block = self.push_synthetic_block(after_block);
+		let mut case_wasm_parent = vec![default_block; case_count];
+		case_wasm_parent[case_count - 1] = after_block;
+		// case_wasm_parent[case_count - 2] is already `default_block` — the
+		// vec's fill value — since case `N-2` sits directly inside
+		// `$case[N-1]`, whose own real parent *is* `$default` with no
+		// synthetic hop needed in between.
+		let mut wrapper_parent = default_block;
+		for i in (0..case_count - 2).rev() {
+			let wrapper = self.push_synthetic_block(wrapper_parent);
+			case_wasm_parent[i] = wrapper;
+			wrapper_parent = wrapper;
+		}
+
+		let mut arms: Vec<SwitchArmBuild> =
+			Vec::with_capacity(case_count + default_expr.is_some() as usize);
+		for (i, (discriminant, body)) in mir_cases.iter().enumerate() {
+			arms.push(self.build_switch_arm(
+				case_wasm_parent[i],
+				bindings,
+				Some(*discriminant),
+				body,
+			));
+		}
+		if let Some(body) = default_expr {
+			// Unlike a real case, `emit_switch_br_table` closes `$default`
+			// itself *before* emitting the default body (mirroring how
+			// every `$case[i]` wrapper closes before case i's body runs) —
+			// so the default body lands directly inside `$after`, one hop
+			// further out than `after_block` itself represents. Its parent
+			// is `block_idx` directly, not `after_block`.
+			arms.push(self.build_switch_arm(block_idx, bindings, None, body));
+		}
+		debug_assert!(
+			!arms.is_empty(),
+			"TIR guarantees at least one match arm"
+		);
+
+		let parent_len = bindings.len();
+		// One slot per parent binding, plus one more for each arm's own result.
+		let total_slots = parent_len + 1;
+
+		let slot_value = |arm: &SwitchArmBuild, slot: usize| -> StackResult {
+			if slot < parent_len {
+				arm.bindings[slot]
+			} else {
+				arm.result
+			}
+		};
+
+		// Merge each slot across all arms via `merge_switch_slot`. A slot
+		// contributes at most one real `Switch` output per divergent
+		// *scalar leaf*: nothing downstream inspects a Phi's `left`/`right`
+		// for a Switch (the scheduler reads each arm's raw contribution
+		// from `SwitchCase::own_values` instead), so aggregate-typed slots
+		// are decomposed field-by-field rather than merged as one opaque
+		// unit, and a slot with no real value (only `Never`/`Unit` across
+		// arms) contributes no leaf at all — `outputs` and every arm's row
+		// in `own_values` grow together, one entry per leaf, so the two
+		// stay index-aligned regardless of how many leaves a slot expands
+		// into.
+		let mut outputs: Vec<DataNodeIndex> = Vec::new();
+		let mut merged_per_slot: Vec<StackResult> =
+			Vec::with_capacity(total_slots);
+		let mut own_values: Vec<Vec<StackResult>> =
+			vec![Vec::new(); arms.len()];
+
+		for slot in 0..total_slots {
+			let values: Vec<StackResult> =
+				arms.iter().map(|arm| slot_value(arm, slot)).collect();
+			let merged =
+				self.merge_switch_slot(&values, &mut outputs, &mut own_values);
+			merged_per_slot.push(merged);
+		}
+
+		bindings[..parent_len]
+			.copy_from_slice(&merged_per_slot[..parent_len]);
+		let result = merged_per_slot[parent_len];
+
+		let mut switch_cases: Vec<SwitchCase> = arms
+			.into_iter()
+			.zip(own_values)
+			.map(|(arm, own_values)| SwitchCase {
+				discriminant: arm.discriminant,
+				block: arm.scope,
+				own_values: own_values.into_boxed_slice(),
+			})
+			.collect();
+
+		// The default arm, if present, was pushed last — pop it back off so
+		// `ControlNode::Switch.cases` holds only the real discriminant cases.
+		let default = if default_expr.is_some() {
+			switch_cases.pop()
+		} else {
+			None
+		};
+
+		self.push_stmt(
+			block_idx,
+			ControlNode::Switch {
+				selector,
+				cases: switch_cases.into_boxed_slice(),
+				default,
+				outputs: outputs.into_boxed_slice(),
+				result,
+			},
+		);
+		result
+	}
+
+	/// Merges one `Switch` join slot (an outer binding, or the arms' own
+	/// result) across every arm's `values` (one `StackResult` per arm, same
+	/// order as `arms`). A `Switch` output only ever needs a validly-typed
+	/// placeholder node per genuinely divergent *scalar* leaf — the
+	/// scheduler reads each arm's real contribution from
+	/// `SwitchCase::own_values`, never a Phi's `left`/`right` — so this
+	/// decomposes an aggregate-typed slot field-by-field (recursively, for
+	/// nested aggregates) instead of merging it as one opaque unit, and
+	/// treats a slot whose arms differ only in `Never` vs `Unit` (no arm
+	/// disagrees on a real value) as contributing no leaf at all. Every
+	/// `outputs.push` here is paired with exactly one push into each arm's
+	/// row of `own_values`, so the two always stay index-aligned no matter
+	/// how many leaves a slot expands into or how many slots contribute
+	/// none.
+	fn merge_switch_slot(
+		&mut self,
+		values: &[StackResult],
+		outputs: &mut Vec<DataNodeIndex>,
+		own_values: &mut [Vec<StackResult>],
+	) -> StackResult {
+		let first = values[0];
+		if values[1..].iter().copied().all(|v| v == first) {
+			return first;
+		}
+
+		let Some(sample) = values.iter().copied().find_map(|v| match v {
+			StackResult::Value(n) => Some(n),
+			_ => None,
+		}) else {
+			// Every arm is `Never` or `Unit` (a mix of the two — a uniform
+			// value would have taken the fast path above): no real value to
+			// carry, so this slot contributes no leaf.
+			return StackResult::Unit;
+		};
+
+		match self.func.data_nodes[sample as usize].kind.node_type() {
+			NodeType::Scalar(ty) => {
+				let leaf = match values.iter().copied().find_map(|v| match v {
+					StackResult::Value(n) if n != sample => Some(n),
+					_ => None,
+				}) {
+					Some(other) => self.node(DataNodeKind::Phi {
+						left: sample,
+						right: other,
+						ty,
+					}),
+					// Every value-bearing arm agrees; only `Never`/`Unit`
+					// arms vary, so there's no genuine value divergence.
+					None => sample,
+				};
+				outputs.push(leaf);
+				for (arm_values, v) in
+					own_values.iter_mut().zip(values.iter().copied())
+				{
+					arm_values.push(v);
+				}
+				StackResult::Value(leaf)
+			}
+			NodeType::Aggregate(aggregate_index) => {
+				let field_count =
+					self.mir.aggregates[aggregate_index as usize].values.len();
+				// Extract each value-bearing arm's fields exactly once (not
+				// once per field below). A `Never`/`Unit` arm propagates
+				// unchanged to every field — its body diverges before
+				// producing this slot at all, so it has nothing to
+				// contribute at any field either — without allocating
+				// `field_count` copies of that marker to represent it.
+				let per_arm: Vec<PerArmSlot> = values
+					.iter()
+					.copied()
+					.map(|v| match v {
+						StackResult::Value(n) => {
+							let (fields, _) = self.extract_aggregate_fields(n);
+							PerArmSlot::Fields(fields)
+						}
+						other => PerArmSlot::NoValue(other),
+					})
+					.collect();
+
+				let merged_fields: Box<[DataNodeIndex]> = (0..field_count)
+					.map(|field| {
+						let field_values: Vec<StackResult> = per_arm
+							.iter()
+							.map(|slot| match slot {
+								PerArmSlot::Fields(fields) => {
+									StackResult::Value(fields[field])
+								}
+								PerArmSlot::NoValue(v) => *v,
+							})
+							.collect();
+						self
+							.merge_switch_slot(
+								&field_values,
+								outputs,
+								own_values,
+							)
+							.unwrap_value()
+					})
+					.collect();
+				let agg = self.node(DataNodeKind::Aggregate {
+					fields: merged_fields,
+					aggregate_index,
+				});
+				StackResult::Value(agg)
+			}
+		}
+	}
+
+	fn build_switch_arm(
+		&mut self,
+		parent_block: BlockIndex,
+		parent_bindings: &[StackResult],
+		discriminant: Option<i64>,
+		body: &mir::Expression,
+	) -> SwitchArmBuild {
+		let (scope, exprs) = Self::unwrap_block(body);
+		let mut arm_bindings = self.extend_bindings(parent_bindings, scope);
+		self.func.blocks[scope as usize] = Some(Block {
+			parent: Some(parent_block),
+			statements: Vec::new(),
+			result: StackResult::Never,
+			loop_index: None,
+		});
+		let result = self.build_block_exprs(scope, &mut arm_bindings, exprs);
+		self.func.blocks[scope as usize].as_mut().unwrap().result = result;
+		SwitchArmBuild {
+			discriminant,
+			scope,
+			result,
+			bindings: arm_bindings,
+		}
+	}
+
 	fn build_loop(
 		&mut self,
 		parent_block: BlockIndex,
@@ -820,12 +1411,15 @@ impl<'mir> Builder<'mir> {
 		// Extend for the body scope's own locals.
 		self.extend_bindings_in_place(&mut loop_bindings, body_scope);
 
+		let loop_index = self.func.push_loop_data(LoopData {
+			break_result_outputs: Vec::new(),
+			loop_params: loop_params.clone(),
+		});
 		self.func.blocks[body_block as usize] = Some(Block {
-			is_loop: true,
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			break_result_outputs: Vec::new(),
+			loop_index: Some(loop_index),
 		});
 		let body_fallthrough =
 			self.build_block_exprs(body_block, &mut loop_bindings, body_exprs);
@@ -833,14 +1427,10 @@ impl<'mir> Builder<'mir> {
 		// statements. Save it before overwriting with the body's fallthrough
 		// result (which is always Unit/Never since loops exit via break, not
 		// fallthrough).
-		let break_result = self.func.blocks[body_block as usize]
-			.as_ref()
-			.unwrap()
-			.result;
-		self.func.blocks[body_block as usize]
-			.as_mut()
-			.unwrap()
-			.result = body_fallthrough;
+		let break_result =
+			self.func.blocks[body_block as usize].as_ref().unwrap().result;
+		self.func.blocks[body_block as usize].as_mut().unwrap().result =
+			body_fallthrough;
 
 		// Patch loop params and collect outputs.
 		let mut outputs = Vec::new();
@@ -1074,6 +1664,71 @@ impl<'mir> Builder<'mir> {
 					parent_bindings[i] = StackResult::Value(new_agg);
 				}
 			}
+		}
+	}
+
+	/// `(loop_param_node, current_value_node)` pairs, decomposed to scalars —
+	/// the target loop's own carried bindings (`LoopData::loop_params`) as of
+	/// this exact point, wherever they differ from what the loop param
+	/// itself currently holds. `Break`/`Continue` use this to commit their
+	/// own current values before jumping: the loop's normal "commit
+	/// accumulated bindings, then branch back" tail code
+	/// (`ControlNode::Loop`'s own scheduling) only runs on ordinary
+	/// fallthrough, so an early exit must commit independently or the next
+	/// iteration (for `continue`) — or code after the loop (for `break`) —
+	/// would see stale values.
+	fn loop_param_updates(
+		&mut self,
+		target: BlockIndex,
+		bindings: &[StackResult],
+	) -> Box<[(DataNodeIndex, DataNodeIndex)]> {
+		// Cloned out up front rather than indexed per-iteration: `self.func`
+		// would otherwise need re-borrowing on every loop, and
+		// `collect_scalar_loop_param_updates` below already needs `&mut self`.
+		let loop_params = self.func.loop_data(target).loop_params.clone();
+		let mut updates = Vec::new();
+		// `bindings` may hold more entries than `loop_params` (deeper scopes
+		// nested inside the loop) — `zip` stops at the shorter one, same as
+		// the original `0..loop_params.len()` bound.
+		for (param, current) in
+			loop_params.iter().copied().zip(bindings.iter().copied())
+		{
+			if let (StackResult::Value(p), StackResult::Value(c)) =
+				(param, current)
+			{
+				self.collect_scalar_loop_param_updates(p, c, &mut updates);
+			}
+		}
+		updates.into_boxed_slice()
+	}
+
+	fn collect_scalar_loop_param_updates(
+		&mut self,
+		param: DataNodeIndex,
+		current: DataNodeIndex,
+		updates: &mut Vec<(DataNodeIndex, DataNodeIndex)>,
+	) {
+		if param == current {
+			return;
+		}
+		match (
+			self.func.data_nodes[param as usize].kind.node_type(),
+			self.func.data_nodes[current as usize].kind.node_type(),
+		) {
+			(NodeType::Scalar(_), NodeType::Scalar(_)) => {
+				updates.push((param, current));
+			}
+			(NodeType::Aggregate(_), NodeType::Aggregate(_)) => {
+				let (param_fields, _) = self.extract_aggregate_fields(param);
+				let (current_fields, _) =
+					self.extract_aggregate_fields(current);
+				for (&p, &c) in
+					param_fields.iter().zip(current_fields.iter())
+				{
+					self.collect_scalar_loop_param_updates(p, c, updates);
+				}
+			}
+			_ => {}
 		}
 	}
 

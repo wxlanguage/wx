@@ -1,0 +1,207 @@
+---
+source: crates/wx-compiler/src/ast/tests.rs
+expression: case.ast
+---
+file_id: 0
+diagnostics: []
+items:
+  - inner:
+      inner:
+        Function:
+          id: 0
+          pub_span: ~
+          attributes: []
+          signature:
+            name:
+              inner: 0
+              span:
+                start: 3
+                end: 7
+            type_params: []
+            params:
+              - inner:
+                  inner:
+                    mut_span: ~
+                    name:
+                      inner: 1
+                      span:
+                        start: 8
+                        end: 9
+                    ty:
+                      inner:
+                        Path:
+                          - ident:
+                              inner: 2
+                              span:
+                                start: 11
+                                end: 14
+                            type_args: []
+                      span:
+                        start: 11
+                        end: 14
+                  span:
+                    start: 8
+                    end: 14
+                separator: ~
+            result:
+              inner:
+                Path:
+                  - ident:
+                      inner: 2
+                      span:
+                        start: 19
+                        end: 22
+                    type_args: []
+              span:
+                start: 19
+                end: 22
+          block:
+            inner:
+              Block:
+                statements:
+                  - inner:
+                      inner:
+                        Expression:
+                          inner:
+                            Match:
+                              scrutinee:
+                                inner:
+                                  Path:
+                                    - ident:
+                                        inner: 1
+                                        span:
+                                          start: 35
+                                          end: 36
+                                      type_args: []
+                                span:
+                                  start: 35
+                                  end: 36
+                              arms:
+                                - inner:
+                                    inner:
+                                      pattern:
+                                        inner:
+                                          Int:
+                                            value: 0
+                                        span:
+                                          start: 47
+                                          end: 48
+                                      body:
+                                        inner:
+                                          Block:
+                                            statements:
+                                              - inner:
+                                                  inner:
+                                                    Expression:
+                                                      inner:
+                                                        Int:
+                                                          value: 0
+                                                      span:
+                                                        start: 54
+                                                        end: 55
+                                                  span:
+                                                    start: 54
+                                                    end: 55
+                                                separator: ~
+                                        span:
+                                          start: 52
+                                          end: 57
+                                    span:
+                                      start: 47
+                                      end: 57
+                                  separator:
+                                    start: 57
+                                    end: 58
+                                - inner:
+                                    inner:
+                                      pattern:
+                                        inner:
+                                          Int:
+                                            value: 1
+                                        span:
+                                          start: 67
+                                          end: 68
+                                      body:
+                                        inner:
+                                          Block:
+                                            statements:
+                                              - inner:
+                                                  inner:
+                                                    Expression:
+                                                      inner:
+                                                        Int:
+                                                          value: 1
+                                                      span:
+                                                        start: 74
+                                                        end: 75
+                                                  span:
+                                                    start: 74
+                                                    end: 75
+                                                separator: ~
+                                        span:
+                                          start: 72
+                                          end: 77
+                                    span:
+                                      start: 67
+                                      end: 77
+                                  separator:
+                                    start: 77
+                                    end: 78
+                                - inner:
+                                    inner:
+                                      pattern:
+                                        inner: Placeholder
+                                        span:
+                                          start: 87
+                                          end: 88
+                                      body:
+                                        inner:
+                                          Block:
+                                            statements:
+                                              - inner:
+                                                  inner:
+                                                    Expression:
+                                                      inner:
+                                                        Unary:
+                                                          operator:
+                                                            inner: InvertSign
+                                                            span:
+                                                              start: 94
+                                                              end: 95
+                                                          operand:
+                                                            inner:
+                                                              Int:
+                                                                value: 1
+                                                            span:
+                                                              start: 95
+                                                              end: 96
+                                                      span:
+                                                        start: 94
+                                                        end: 96
+                                                  span:
+                                                    start: 94
+                                                    end: 96
+                                                separator: ~
+                                        span:
+                                          start: 92
+                                          end: 98
+                                    span:
+                                      start: 87
+                                      end: 98
+                                  separator:
+                                    start: 98
+                                    end: 99
+                          span:
+                            start: 29
+                            end: 105
+                      span:
+                        start: 29
+                        end: 105
+                    separator: ~
+            span:
+              start: 23
+              end: 107
+      span:
+        start: 0
+        end: 107
+    separator: ~
