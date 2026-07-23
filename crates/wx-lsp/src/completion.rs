@@ -590,7 +590,7 @@ fn path_completion_items(
 				member_completion_items(
 					tir,
 					interner,
-					&tir.traits[idx as usize].members,
+					&tir.traits[idx as usize].entries,
 					prefix,
 				)
 			})

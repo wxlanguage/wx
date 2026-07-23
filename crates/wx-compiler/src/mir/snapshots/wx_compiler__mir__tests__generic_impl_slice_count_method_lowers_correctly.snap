@@ -24,7 +24,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 63
+                        id: 64
                     ty:
                       Function:
                         signature_index: 0
@@ -39,7 +39,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 63
+  - id: 64
     signature_index: 0
     scopes:
       - kind: Block

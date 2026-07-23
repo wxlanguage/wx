@@ -1,0 +1,23 @@
+trait Soo {}
+
+trait Koo {}
+
+trait X {
+  type Y: Soo + Koo;
+}
+
+struct Foo {
+  b: i32,
+}
+
+fn x<T: X where { Y = Foo }>(t: T) -> T::Y {
+  <Type as X>::
+}
+
+type O = fn()!<trap> -> never;
+
+struct Bar {}
+
+impl X for Bar {
+  type Y = Foo;
+}

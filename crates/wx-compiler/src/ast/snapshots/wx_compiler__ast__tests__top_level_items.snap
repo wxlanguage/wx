@@ -142,7 +142,7 @@ items:
             span:
               start: 52
               end: 55
-          kind:
+          bound:
             inner:
               WithBindings:
                 path:
@@ -213,6 +213,7 @@ items:
             span:
               start: 112
               end: 113
+          attributes: []
       span:
         start: 86
         end: 113
@@ -248,6 +249,7 @@ items:
             span:
               start: 132
               end: 135
+          attributes: []
       span:
         start: 115
         end: 135
@@ -446,6 +448,7 @@ items:
               separator:
                 start: 282
                 end: 283
+          attributes: []
       span:
         start: 237
         end: 285

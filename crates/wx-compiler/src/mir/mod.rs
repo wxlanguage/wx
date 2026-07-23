@@ -663,12 +663,12 @@ impl MIR {
 			memories: tir
 				.memories
 				.iter()
-				.map(|m| MemoryInfo {
-					id: m.id,
+				.map(|mem| MemoryInfo {
+					id: mem.id,
 					source: MemorySource::Internal,
-					kind: MemoryKind::from_type_index(m.kind),
-					min_pages: m.min_pages,
-					max_pages: m.max_pages,
+					kind: MemoryKind::from_type_index(mem.size.inner),
+					min_pages: mem.min_pages,
+					max_pages: mem.max_pages,
 				})
 				.collect(),
 			exports: {
@@ -832,11 +832,12 @@ impl<'tir> Builder<'tir> {
 		let assoc_ty = match self.tir.trait_impls[impl_idx as usize]
 			.members
 			.get(&assoc_name)
+			.unwrap()
 		{
-			Some(tir::ImplEntry::AssocType { ty }) => *ty,
-			_ => unreachable!(
-				"trait impl matched via find_trait_impl but has no associated type entry"
-			),
+			tir::ImplEntry::AssocType(idx) => {
+				self.tir.assoc_type_impls[*idx as usize].ty.unwrap().inner
+			}
+			_ => unreachable!(),
 		};
 		(impl_idx, impl_type_args, assoc_ty)
 	}
@@ -906,7 +907,9 @@ impl<'tir> Builder<'tir> {
 		let tir_idx = self.tir.expect_memory_index(memory) as usize;
 		Type::Pointer {
 			memory,
-			kind: MemoryKind::from_type_index(self.tir.memories[tir_idx].kind),
+			kind: MemoryKind::from_type_index(
+				self.tir.memories[tir_idx].size.inner,
+			),
 		}
 	}
 
@@ -953,7 +956,7 @@ impl<'tir> Builder<'tir> {
 				let id = self.resolve_memory_id(*memory);
 				let tir_idx = self.tir.expect_memory_index(id) as usize;
 				let pointer_size = MemoryKind::from_type_index(
-					self.tir.memories[tir_idx].kind,
+					self.tir.memories[tir_idx].size.inner,
 				)
 				.pointer_size();
 				Layout {
@@ -965,7 +968,7 @@ impl<'tir> Builder<'tir> {
 				let id = self.resolve_memory_id(*memory);
 				let tir_idx = self.tir.expect_memory_index(id) as usize;
 				let pointer_size = MemoryKind::from_type_index(
-					self.tir.memories[tir_idx].kind,
+					self.tir.memories[tir_idx].size.inner,
 				)
 				.pointer_size();
 				Layout {
@@ -1093,10 +1096,8 @@ impl<'tir> Builder<'tir> {
 		// method body) resolves once `Self` is concrete, instead of installing
 		// the unresolved projection itself as the new substitution scope.
 		let saved = if !args.is_empty() {
-			let concrete_args: Box<[tir::TypeIndex]> = args
-				.iter()
-				.map(|&a| self.resolve_tir_type(a))
-				.collect();
+			let concrete_args: Box<[tir::TypeIndex]> =
+				args.iter().map(|&a| self.resolve_tir_type(a)).collect();
 			Some(std::mem::replace(
 				&mut self.current_substitutions,
 				concrete_args,
@@ -1222,8 +1223,8 @@ impl<'tir> Builder<'tir> {
 			tir::Type::Slice { memory, .. } => {
 				let memory = self.resolve_memory_id(memory);
 				let tir_idx = self.tir.expect_memory_index(memory) as usize;
-				let kind_ty = self.tir.memories[tir_idx].kind;
-				let len_ty = self.lower_type_index(kind_ty);
+				let kind_ty = self.tir.memories[tir_idx].size;
+				let len_ty = self.lower_type_index(kind_ty.inner);
 				// Slice layout is a fixed `{ ptr, len }` ABI contract, not a
 				// sorting outcome — see the pipeline notes on slice lowering.
 				let aggregate_index = self.ensure_aggregate(
@@ -1830,7 +1831,7 @@ impl<'tir> Builder<'tir> {
 								// Slice len has the memory's size type
 								// (u64 for a 64-bit memory).
 								ty: self.lower_type_index(
-									self.tir.memories[mem_idx].kind,
+									self.tir.memories[mem_idx].size.inner,
 								),
 							},
 						]),
@@ -2621,8 +2622,9 @@ impl<'tir> Builder<'tir> {
 				let ptr_ty = self.pointer_type(memory_id);
 				let tir_mem_idx =
 					self.tir.expect_memory_index(memory_id) as usize;
-				let idx_ty =
-					self.lower_type_index(self.tir.memories[tir_mem_idx].kind);
+				let idx_ty = self.lower_type_index(
+					self.tir.memories[tir_mem_idx].size.inner,
+				);
 
 				let lowered_obj = self.lower_expression(func_ctx, object, sink);
 
