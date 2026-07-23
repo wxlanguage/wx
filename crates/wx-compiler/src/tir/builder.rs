@@ -210,7 +210,7 @@ enum PendingClaim {
 
 enum BoundKind {
 	Trait(TraitBound),
-	TypeSet(TypesetIndex),
+	TypeSet(TypesetBound),
 }
 
 #[derive(Clone)]
@@ -793,16 +793,6 @@ fn report_undeclared_type(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_code(DiagnosticCode::UndeclaredType.code())
 		.with_message("undeclared type")
 		.with_label(span.primary_label())
-}
-
-fn report_bare_assoc_type(span: SourceSpan, name: &str) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::UndeclaredType.code())
-		.with_message(format!("cannot find type `{name}` in this scope"))
-		.with_label(span.primary_label())
-		.with_note(format!(
-			"you might have meant to use the associated type: `Self::{name}`"
-		))
 }
 
 struct BinaryOperatorCannotBeAppliedDiagnostic {
@@ -1416,6 +1406,7 @@ pub fn build(graph: &mut CompilationGraph) -> TIR {
 		trait_impls: Vec::new(),
 		trait_impl_dispatch: HashMap::new(),
 		constants: Vec::new(),
+		assoc_type_impls: Vec::new(),
 		tagged_items: HashMap::new(),
 		typesets: Vec::new(),
 		type_aliases: Vec::new(),
@@ -1926,7 +1917,10 @@ impl<'ast> Builder<'ast, '_> {
 			self.insert_symbol(
 				resolve_context.namespace,
 				type_key,
-				SymbolKind::Memory { memory_index, kind },
+				SymbolKind::Memory {
+					memory_index,
+					size: kind,
+				},
 			);
 		}
 		let value_key = (SymbolNamespace::Value, name.inner);
@@ -1937,7 +1931,10 @@ impl<'ast> Builder<'ast, '_> {
 			self.insert_symbol(
 				resolve_context.namespace,
 				value_key,
-				SymbolKind::Memory { memory_index, kind },
+				SymbolKind::Memory {
+					memory_index,
+					size: kind,
+				},
 			);
 		}
 	}
@@ -1987,8 +1984,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		namespace: Option<NamespaceIndex>,
 		key: (SymbolNamespace, SymbolU32),
-		file_id: FileId,
-		span: TextSpan,
+		span: SourceSpan,
 	) -> Result<Option<SymbolKind>, ()> {
 		match self.lookup_global_symbol(namespace, key) {
 			Some(SymbolKind::Pending(def_id)) => {
@@ -1999,9 +1995,9 @@ impl<'ast> Builder<'ast, '_> {
 						..
 					})
 				) {
-					self.tir.diagnostics.push(report_cyclic_type_dependency(
-						SourceSpan::new(file_id, span),
-					));
+					self.tir
+						.diagnostics
+						.push(report_cyclic_type_dependency(span));
 					return Err(());
 				}
 				self.ensure_signature(def_id);
@@ -2190,13 +2186,16 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			SymbolKind::Memory { memory_index, kind } => {
+			SymbolKind::Memory {
+				memory_index,
+				size: kind,
+			} => {
 				let memory = &mut self.tir.memories[memory_index as usize];
 				memory
 					.accesses
 					.push(SourceSpan::new(resolve_ctx.file_id, expr_span));
 				let id = memory.id;
-				let ty = self.intern_type(Type::Memory { kind, id });
+				let ty = self.intern_type(Type::Memory { size: kind, id });
 				Ok(Expression {
 					kind: ExprKind::Memory { id },
 					ty,
@@ -2237,9 +2236,12 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn symbol_kind_to_type(&mut self, kind: SymbolKind) -> Option<TypeIndex> {
 		match kind {
-			SymbolKind::Memory { kind, memory_index } => {
+			SymbolKind::Memory {
+				size: kind,
+				memory_index,
+			} => {
 				let id = self.tir.memories[memory_index as usize].id;
-				Some(self.intern_type(Type::Memory { kind, id }))
+				Some(self.intern_type(Type::Memory { size: kind, id }))
 			}
 			SymbolKind::Module { namespace_idx } => {
 				Some(self.intern_type(Type::Namespace { namespace_idx }))
@@ -2330,11 +2332,14 @@ impl<'ast> Builder<'ast, '_> {
 				let owner = scope.owner;
 				let abs_index =
 					(self.inherited_type_param_count(owner) + own_idx) as u32;
-				self.record_type_param_access(
-					owner,
-					abs_index,
-					SourceSpan::new(resolve_context.file_id, identifier.span),
-				);
+
+				self.tir
+					.type_param_info_mut(owner, abs_index as usize)
+					.accesses
+					.push(SourceSpan::new(
+						resolve_context.file_id,
+						identifier.span,
+					));
 				return Ok(self.intern_type(Type::TypeParam {
 					owner,
 					param_index: abs_index,
@@ -2354,14 +2359,16 @@ impl<'ast> Builder<'ast, '_> {
 						{
 							// ImplBlock has no grandparent, so abs_index == i.
 							let abs_index = i as u32;
-							self.record_type_param_access(
-								parent_owner,
-								abs_index,
-								SourceSpan::new(
+							self.tir
+								.type_param_info_mut(
+									parent_owner,
+									abs_index as usize,
+								)
+								.accesses
+								.push(SourceSpan::new(
 									resolve_context.file_id,
 									identifier.span,
-								),
-							);
+								));
 							return Ok(self.intern_type(Type::TypeParam {
 								owner: parent_owner,
 								param_index: abs_index,
@@ -2395,37 +2402,54 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			return Ok(self_ty);
 		}
-		let kind = self.resolve_pending_global_symbol(
+		let symbol = match self.resolve_pending_global_symbol(
 			resolve_context.namespace,
 			(SymbolNamespace::Type, identifier.inner),
-			resolve_context.file_id,
-			identifier.span,
-		)?;
-		match kind {
-			Some(SymbolKind::TraitAssocType { assoc_name, .. }) => {
-				let name = self.interner.resolve(assoc_name).unwrap();
-				self.tir.diagnostics.push(report_bare_assoc_type(
+			SourceSpan::new(resolve_context.file_id, identifier.span),
+		)? {
+			Some(symbol) => symbol,
+			None => {
+				self.tir.diagnostics.push(report_undeclared_type(
 					SourceSpan::new(resolve_context.file_id, identifier.span),
-					name,
 				));
-				Err(())
+				return Err(());
 			}
-			Some(SymbolKind::Trait { .. } | SymbolKind::TypeSet { .. }) => {
+		};
+		match symbol {
+			SymbolKind::TraitAssocType { assoc_name, .. } => {
+				let name = self.interner.resolve(assoc_name).unwrap();
 				self.tir.diagnostics.push(
-                    Diagnostic::error()
-                        .with_code(DiagnosticCode::ExpectedTrait.code())
-                        .with_message("cannot use a trait or typeset as a type; use it as a bound: `<T: TraitName>`")
-                        .with_label(Label::primary(resolve_context.file_id, identifier.span)),
-                );
+					Diagnostic::error()
+						.with_code(DiagnosticCode::UndeclaredType.code())
+						.with_message(format!(
+							"cannot find type `{name}` in this scope",
+						))
+						.with_label(Label::primary(
+							resolve_context.file_id,
+							identifier.span,
+						))
+						.with_note(format!(
+							"you might have meant to use the associated type: `Self::{name}`"
+						)),
+				);
 				Err(())
 			}
-			Some(
-				kind @ (SymbolKind::Struct { .. }
-				| SymbolKind::TypeAlias { .. }),
-			) => {
+			SymbolKind::Trait { .. } | SymbolKind::TypeSet { .. } => {
+				self.tir.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::ExpectedBound.code())
+						.with_message("cannot use a bound as a type")
+						.with_label(Label::primary(
+							resolve_context.file_id,
+							identifier.span,
+						)),
+				);
+				Err(())
+			}
+			SymbolKind::Struct { .. } | SymbolKind::TypeAlias { .. } => {
 				let ty = self.resolve_generic_type_application(
 					resolve_context,
-					kind,
+					symbol,
 					&[],
 					identifier.span,
 					arity,
@@ -2436,21 +2460,15 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(ty)
 				}
 			}
-			Some(kind) => {
+			symbol => {
 				self.record_type_kind_access(
 					resolve_context.file_id,
-					kind,
+					symbol,
 					identifier.span,
 				);
-				if let Some(ty) = self.symbol_kind_to_type(kind) {
+				if let Some(ty) = self.symbol_kind_to_type(symbol) {
 					return Ok(ty);
 				}
-				self.tir.diagnostics.push(report_undeclared_type(
-					SourceSpan::new(resolve_context.file_id, identifier.span),
-				));
-				Err(())
-			}
-			None => {
 				self.tir.diagnostics.push(report_undeclared_type(
 					SourceSpan::new(resolve_context.file_id, identifier.span),
 				));
@@ -2549,6 +2567,8 @@ impl<'ast> Builder<'ast, '_> {
 		type_expr: &Spanned<ast::TypeExpression>,
 	) -> TypeIndex {
 		match &type_expr.inner {
+			// TEMP stub to unblock local builds during parallel QualifiedPath work — not part of this fix, do not keep.
+			ast::TypeExpression::QualifiedPath { .. } => todo!(),
 			ast::TypeExpression::Infer => TypeIndex::INFER,
 			// Every `ast::TypeExpression::Path`, wherever it appears (a fn
 			// param, an impl target, a `local` annotation, nested inside
@@ -2968,18 +2988,6 @@ impl<'ast> Builder<'ast, '_> {
 		.unwrap_or(TypeIndex::ERROR)
 	}
 
-	fn register_tagged_items(
-		&mut self,
-		def_id: ast::DefId,
-		attrs: &[ItemAttribute],
-	) {
-		for attr in attrs {
-			if let ItemAttribute::Tag(key) = attr {
-				self.tir.tagged_items.insert(*key, def_id);
-			}
-		}
-	}
-
 	// TODO: this silently drops unrecognized attribute names/values (the
 	// `_ => None` arm below) and never checks whether a resolved attribute
 	// is actually valid on the item kind it was attached to (e.g.
@@ -2990,9 +2998,10 @@ impl<'ast> Builder<'ast, '_> {
 	// rather than best-effort.
 	fn resolve_attributes(
 		&mut self,
-		attrs: &[ast::Attribute],
+		id: DefId,
+		attributes: &[ast::Attribute],
 	) -> Box<[ItemAttribute]> {
-		attrs
+		attributes
 			.iter()
 			.filter_map(|a| {
 				match (&a.value, self.interner.resolve(a.name.inner)) {
@@ -3010,6 +3019,7 @@ impl<'ast> Builder<'ast, '_> {
 							self.interner.resolve(value.inner).unwrap_or("");
 						let key =
 							self.interner.get_or_intern(unescape_string(raw));
+						self.tir.tagged_items.insert(key, id);
 						Some(ItemAttribute::Tag(key))
 					}
 					_ => None,
@@ -3055,31 +3065,6 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			_ => 0,
 		}
-	}
-
-	fn type_param_bounds(&self, ty: TypeIndex) -> &[TraitBound] {
-		let Type::TypeParam { owner, param_index } =
-			self.tir.types[ty.as_usize()]
-		else {
-			return &[];
-		};
-		self.tir
-			.type_param_info(owner, param_index as usize)
-			.bounds
-			.traits
-			.as_ref()
-	}
-
-	fn record_type_param_access(
-		&mut self,
-		owner: TypeParamOwner,
-		param_index: u32,
-		span: SourceSpan,
-	) {
-		self.tir
-			.type_param_info_mut(owner, param_index as usize)
-			.accesses
-			.push(span);
 	}
 
 	/// Records a `Self` keyword usage against the impl block or trait impl
@@ -3212,6 +3197,7 @@ impl<'ast> Builder<'ast, '_> {
 						let a = &self.tir.type_aliases[idx as usize];
 						SourceSpan::new(a.file_id, a.name.span)
 					}
+					// TODO: chaugh panic when writing impl for trait, need to revisit this
 					ItemIndex::TypeSet(_)
 					| ItemIndex::Trait(_)
 					| ItemIndex::TraitImpl(_) => unreachable!(
@@ -3251,8 +3237,7 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, signature.name.span),
 				);
-				let attributes = self.resolve_attributes(attributes);
-				self.register_tagged_items(*id, &attributes);
+				let attributes = self.resolve_attributes(*id, attributes);
 				let func_index = self.tir.functions.len() as u32;
 				self.tir
 					.item_lookup
@@ -3345,7 +3330,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.item_lookup
 					.insert(*id, ItemIndex::Struct(struct_index));
-				let attributes = self.resolve_attributes(attributes);
+				let attributes = self.resolve_attributes(*id, attributes);
 				self.tir.structs.push(Struct {
 					id: *id,
 					file_id,
@@ -3439,7 +3424,9 @@ impl<'ast> Builder<'ast, '_> {
 					node: AstNodeRef::TypeAlias { item },
 				});
 			}
-			ast::Item::Memory { id, name, .. } => {
+			ast::Item::Memory {
+				id, name, bound, ..
+			} => {
 				self.claim_name_binding(
 					namespace,
 					(SymbolNamespace::Type, name.inner),
@@ -3460,7 +3447,10 @@ impl<'ast> Builder<'ast, '_> {
 					id: *id,
 					file_id,
 					name: *name,
-					kind: TypeIndex::ERROR,
+					size: Spanned {
+						inner: TypeIndex::ERROR,
+						span: bound.span,
+					},
 					min_pages: None,
 					max_pages: None,
 					accesses: Vec::new(),
@@ -3473,20 +3463,26 @@ impl<'ast> Builder<'ast, '_> {
 				});
 			}
 			ast::Item::Const {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				attributes,
+				..
 			} => {
+				let id = *id;
 				self.claim_name_binding(
 					namespace,
 					(SymbolNamespace::Value, name.inner),
-					*id,
+					id,
 					SourceSpan::new(file_id, name.span),
 				);
 				let const_index = self.tir.constants.len() as ConstIndex;
 				self.tir
 					.item_lookup
-					.insert(*id, ItemIndex::Const(const_index));
+					.insert(id, ItemIndex::Const(const_index));
+				let attributes = self.resolve_attributes(id, attributes);
 				self.tir.constants.push(Constant {
-					id: *id,
+					id,
 					file_id,
 					namespace,
 					parent: None,
@@ -3499,9 +3495,10 @@ impl<'ast> Builder<'ast, '_> {
 					value: None,
 					const_value: None,
 					accesses: Vec::new(),
+					attributes,
 				});
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
+					def_id: id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Constant { item },
@@ -3553,8 +3550,6 @@ impl<'ast> Builder<'ast, '_> {
 				}
 
 				let trait_index = self.tir.traits.len() as u32;
-				let mut member_ids: Vec<ast::DefId> =
-					Vec::with_capacity(items.len());
 				for trait_item in items.iter() {
 					match &trait_item.inner.inner {
 						ast::TraitItem::Function { id, .. } => {
@@ -3567,7 +3562,6 @@ impl<'ast> Builder<'ast, '_> {
 									item: &trait_item.inner.inner,
 								},
 							});
-							member_ids.push(*id);
 						}
 						ast::TraitItem::Const { id, .. } => {
 							self.ast_nodes.push(AstEntry {
@@ -3579,7 +3573,6 @@ impl<'ast> Builder<'ast, '_> {
 									item: &trait_item.inner.inner,
 								},
 							});
-							member_ids.push(*id);
 						}
 						ast::TraitItem::AssociatedType { id, name, .. } => {
 							self.insert_symbol(
@@ -3596,7 +3589,6 @@ impl<'ast> Builder<'ast, '_> {
 									item: &trait_item.inner.inner,
 								},
 							});
-							member_ids.push(*id);
 						}
 					}
 				}
@@ -3616,16 +3608,15 @@ impl<'ast> Builder<'ast, '_> {
 							traits: Box::new([TraitBound {
 								trait_index,
 								bindings: Box::new([]),
+								span: name.span,
 							}]),
 							typeset: None,
 						},
 						accesses: Vec::new(),
 					},
-					supertraits: Vec::new(),
-					members: HashMap::new(),
+					entries: HashMap::new(),
 					assoc_types: HashMap::new(),
-					member_ids,
-					supertrait_bindings: HashMap::new(),
+					bounds: Bounds::default(),
 					accesses: Vec::new(),
 				});
 				self.tir
@@ -3709,7 +3700,7 @@ impl<'ast> Builder<'ast, '_> {
 								todo!("support consts in generic impls")
 							}
 						}
-						ast::ImplItem::AssociatedType { name, .. } => {
+						ast::ImplItem::AssocType { name, .. } => {
 							if type_params.is_empty() {
 								self.tir.diagnostics.push(
 									report_associated_type_in_inherent_impl(
@@ -3865,7 +3856,9 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 			}
-			ast::Item::Export { .. } => {} // handled during build pass
+			ast::Item::Export { .. } => {
+				// handled during build pass
+			}
 			ast::Item::TypeSet {
 				id,
 				name,
@@ -3873,8 +3866,7 @@ impl<'ast> Builder<'ast, '_> {
 				attributes,
 				..
 			} => {
-				let resolved_attrs = self.resolve_attributes(attributes);
-				self.register_tagged_items(*id, &resolved_attrs);
+				let attributes = self.resolve_attributes(*id, attributes);
 				let typeset_index = self.tir.typesets.len() as TypesetIndex;
 				self.tir.typesets.push(TypeSet {
 					id: *id,
@@ -3885,6 +3877,7 @@ impl<'ast> Builder<'ast, '_> {
 					members: Box::new([]),
 					intersection_range: IntegerRange::widest(),
 					accesses: Vec::new(),
+					attributes,
 				});
 				self.tir
 					.item_lookup
@@ -3935,9 +3928,7 @@ impl<'ast> Builder<'ast, '_> {
 								},
 							});
 						}
-						ast::ImplItem::AssociatedType {
-							id: type_id, ..
-						} => {
+						ast::ImplItem::AssocType { id: type_id, .. } => {
 							self.ast_nodes.push(AstEntry {
 								def_id: *type_id,
 								file_id,
@@ -4231,9 +4222,10 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					value,
-					..
+					attributes,
 				} = item
 				{
+					let attributes = self.resolve_attributes(*id, attributes);
 					let self_type = self.tir.inherent_impls
 						[block_index as usize]
 						.target
@@ -4286,6 +4278,7 @@ impl<'ast> Builder<'ast, '_> {
 							value: Some(Box::new(value_expr)),
 							const_value,
 							accesses: Vec::new(),
+							attributes,
 						});
 						self.tir
 							.item_lookup
@@ -4335,8 +4328,7 @@ impl<'ast> Builder<'ast, '_> {
 					.type_params
 					.len();
 
-				let attributes = self.resolve_attributes(attributes);
-				self.register_tagged_items(*id, &attributes);
+				let attributes = self.resolve_attributes(*id, attributes);
 				let func_index = self.tir.functions.len() as u32;
 
 				// Register the function with only its own (method-level) type
@@ -4505,68 +4497,77 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir.inherent_impls[block_index as usize].target.inner =
 					target;
 			}
-			AstNodeRef::Trait {
-				trait_index, item, ..
-			} => {
-				let (supertraits, trait_id, attributes) = match item {
+			AstNodeRef::Trait { trait_index, item } => {
+				let (supertraits, trait_id, attributes, items) = match item {
 					ast::Item::Trait {
 						id,
 						supertraits,
 						attributes,
+						items,
 						..
-					} => (supertraits, id, attributes),
+					} => (supertraits, id, attributes, items),
 					_ => unreachable!(),
 				};
-				let resolved_attrs = self.resolve_attributes(attributes);
-				self.register_tagged_items(*trait_id, &resolved_attrs);
-
-				let supertrait_bounds = if let Some(spanned) = supertraits {
+				// `Trait` has no `attributes` field of its own to store the
+				// result in — `#[inline]`/`#[intrinsic]`/`#[fixed_layout]`
+				// don't apply to traits, and `#[tag = "..."]` (the only one
+				// that does) works purely through the global
+				// `self.tir.tagged_items` map, populated as a side effect
+				// here.
+				self.resolve_attributes(*trait_id, attributes);
+				let bounds = if let Some(spanned) = supertraits {
 					self.resolve_bounds(resolve_context, None, spanned)
 				} else {
 					Bounds::default()
 				};
 
-				if let (Some(spanned), true) =
-					(supertraits, supertrait_bounds.typeset.is_some())
-				{
-					self.tir.diagnostics.push(
-						Diagnostic::error()
-							.with_code(DiagnosticCode::ExpectedTrait.code())
-							.with_message(
-								"expected a trait name, not a typeset",
-							)
-							.with_label(Label::primary(
-								resolve_context.file_id,
-								spanned.span,
-							)),
-					);
+				self.tir.traits[trait_index as usize].bounds = bounds.clone();
+
+				// Force every member's own signature to resolve right along
+				// with the trait's — `entries`/`assoc_types` only get
+				// populated when a member's own `ensure_signature` (via its
+				// own `AstNodeRef::Trait{Function,Const,AssocType}` entry)
+				// runs, and callers that demand-pull a trait mid-signature
+				// (e.g. resolving `M::Size` for `M: Memory` before `Memory`
+				// itself is reached in parse order) only call
+				// `ensure_signature` on the trait's own id, expecting that
+				// to be transitive over its members.
+				for trait_item in items.iter() {
+					let member_id = match &trait_item.inner.inner {
+						ast::TraitItem::Function { id, .. }
+						| ast::TraitItem::Const { id, .. }
+						| ast::TraitItem::AssociatedType { id, .. } => *id,
+					};
+					self.ensure_signature(member_id);
 				}
 
-				let resolved: Vec<TraitIndex> = supertrait_bounds
-					.traits
-					.iter()
-					.map(|tb| tb.trait_index)
-					.collect();
-
-				let mut bindings: HashMap<(TraitIndex, SymbolU32), TypeIndex> =
-					HashMap::new();
-				for tb in supertrait_bounds.traits.iter() {
-					for &(assoc_name, val_ty) in tb.bindings.iter() {
-						bindings.insert((tb.trait_index, assoc_name), val_ty);
-						if let Some(spanned) = supertraits {
-							self.check_assoc_type_bounds(
-								resolve_context.file_id,
-								tb.trait_index,
-								assoc_name,
-								val_ty,
-								spanned.span,
-							);
-						}
+				// `Self` here is this trait's own — a supertrait binding like
+				// `trait Foo: Bar where { AssocX = SomeType }` states a
+				// constraint that must hold for whatever type ends up
+				// implementing `Foo` (and therefore `Bar`), which is exactly
+				// `Foo`'s own `Self` placeholder — there's no concrete
+				// receiver yet at trait-declaration time.
+				let self_type = self.intern_type(Type::TypeParam {
+					owner: TypeParamOwner::Trait(trait_index),
+					param_index: 0,
+				});
+				for supertrait in bounds.traits.iter() {
+					for &(assoc_name, val_ty) in supertrait.bindings.iter() {
+						self.check_assoc_type_bounds(
+							resolve_context.file_id,
+							supertrait.trait_index,
+							self_type,
+							Spanned {
+								inner: assoc_name,
+								span: supertrait.span,
+							},
+							Spanned {
+								inner: val_ty,
+								span: supertrait.span,
+							},
+						);
 					}
 				}
-				self.tir.traits[trait_index as usize].supertraits = resolved;
-				self.tir.traits[trait_index as usize].supertrait_bindings =
-					bindings;
 			}
 			AstNodeRef::TypeSet {
 				typeset_index,
@@ -4640,14 +4641,7 @@ impl<'ast> Builder<'ast, '_> {
 				{
 					// `Self` is owned by the trait; the function inherits it via
 					// type_param_parent so type_params holds only explicit params.
-					let self_type_param_idx =
-						self.intern_type(Type::TypeParam {
-							owner: TypeParamOwner::Trait(trait_index),
-							param_index: 0,
-						});
-					let attributes = self.resolve_attributes(attributes);
-					self.register_tagged_items(*id, &attributes);
-
+					let attributes = self.resolve_attributes(*id, attributes);
 					let func_index = self.tir.functions.len() as u32;
 					self.tir.functions.push(Function {
 						id: *id,
@@ -4670,20 +4664,24 @@ impl<'ast> Builder<'ast, '_> {
 						accesses: Vec::new(),
 						params: Box::new([]),
 						result: None,
-						attributes: attributes.clone(),
+						attributes,
 					});
 					self.tir
 						.item_lookup
 						.insert(*id, ItemIndex::Function(func_index));
+					let self_type = self.intern_type(Type::TypeParam {
+						owner: TypeParamOwner::Trait(trait_index),
+						param_index: 0,
+					});
 					self.resolve_type_param_bounds(
 						resolve_context,
 						TypeParamOwner::Function(*id),
-						Some(self_type_param_idx),
+						Some(self_type),
 						&signature.type_params,
 					);
 					let sig_scope = GenericScope {
 						owner: TypeParamOwner::Function(*id),
-						self_type: Some(self_type_param_idx),
+						self_type: Some(self_type),
 					};
 					let (params, result) = self.build_function_signature(
 						resolve_context,
@@ -4706,7 +4704,7 @@ impl<'ast> Builder<'ast, '_> {
 						ImplEntry::AssocFunction(func_index)
 					};
 					self.tir.traits[trait_index as usize]
-						.members
+						.entries
 						.insert(signature.name.inner, entry);
 				}
 			}
@@ -4734,8 +4732,7 @@ impl<'ast> Builder<'ast, '_> {
 						Some(self_scope),
 						ty,
 					);
-					let attributes = self.resolve_attributes(attributes);
-					self.register_tagged_items(*id, &attributes);
+					let attributes = self.resolve_attributes(*id, attributes);
 					let const_index = self.tir.constants.len() as ConstIndex;
 					self.tir.constants.push(Constant {
 						id: *id,
@@ -4751,11 +4748,12 @@ impl<'ast> Builder<'ast, '_> {
 						value: None,
 						const_value: None,
 						accesses: Vec::new(),
+						attributes,
 					});
 					self.tir
 						.item_lookup
 						.insert(*id, ItemIndex::Const(const_index));
-					self.tir.traits[trait_index as usize].members.insert(
+					self.tir.traits[trait_index as usize].entries.insert(
 						name.inner,
 						ImplEntry::AssocConstant(const_index),
 					);
@@ -4809,7 +4807,7 @@ impl<'ast> Builder<'ast, '_> {
 			AstNodeRef::Memory { item } => {
 				if let ast::Item::Memory {
 					name,
-					kind,
+					bound: kind,
 					id,
 					config,
 				} = item
@@ -4839,7 +4837,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					};
 
-					let mut bindings: HashMap<SymbolU32, TypeIndex> =
+					let mut bindings: HashMap<SymbolU32, Spanned<TypeIndex>> =
 						HashMap::new();
 					if let ast::BoundExpression::WithBindings {
 						bindings: where_bindings,
@@ -4852,7 +4850,13 @@ impl<'ast> Builder<'ast, '_> {
 								None,
 								&binding.ty,
 							);
-							bindings.insert(binding.name.inner, val_ty);
+							bindings.insert(
+								binding.name.inner,
+								Spanned {
+									inner: val_ty,
+									span: binding.ty.span,
+								},
+							);
 							if let Some(at) = self.tir.traits
 								[trait_index as usize]
 								.assoc_types
@@ -4863,21 +4867,33 @@ impl<'ast> Builder<'ast, '_> {
 									binding.name.span,
 								));
 							}
+							// No real `Self` exists yet at this point — the
+							// memory's own `Type::Memory` isn't interned
+							// until after this loop (it depends on `Size`,
+							// which is one of these very bindings).
+							// `Memory::Size`'s bound (`PointerSize`) has no
+							// `where { .. = Self }` clause today, so this is
+							// a no-op in practice; `ERROR` only bites if a
+							// future bound here starts requiring one.
 							self.check_assoc_type_bounds(
 								resolve_context.file_id,
 								trait_index,
-								binding.name.inner,
-								val_ty,
-								binding.ty.span,
+								TypeIndex::ERROR,
+								binding.name,
+								Spanned {
+									inner: val_ty,
+									span: binding.ty.span,
+								},
 							);
 						}
 					}
 
 					let size_symbol = self.interner.get_or_intern("Size");
-					let memory_kind = match bindings.get(&size_symbol).copied()
+					let memory_size = match bindings.get(&size_symbol).copied()
 					{
 						Some(ty)
-							if ty == TypeIndex::U32 || ty == TypeIndex::U64 =>
+							if ty.inner == TypeIndex::U32
+								|| ty.inner == TypeIndex::U64 =>
 						{
 							ty
 						}
@@ -4899,17 +4915,11 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					};
 
-					let trait_fn_ids = self.tir.traits[trait_index as usize]
-						.member_ids
-						.clone();
-					for tid in trait_fn_ids {
-						self.ensure_signature(tid);
-					}
 					let memory_index = self.tir.expect_memory_index(*id);
 					self.tir.memories[memory_index as usize] = Memory {
 						id: *id,
 						file_id: resolve_context.file_id,
-						kind: memory_kind,
+						size: memory_size,
 						name: *name,
 						min_pages: config.as_ref().and_then(|c| {
 							c.min_pages.as_ref().map(|s| s.inner)
@@ -4920,13 +4930,13 @@ impl<'ast> Builder<'ast, '_> {
 						accesses: Vec::new(),
 					};
 					let memory_type = self.intern_type(Type::Memory {
-						kind: memory_kind,
+						size: memory_size.inner,
 						id: *id,
 					});
 					let members = self.seed_memory_trait_impl_with(
 						trait_index,
 						memory_type,
-						&bindings,
+						memory_size,
 					);
 
 					// Register the memory type as implementing its declared
@@ -4977,7 +4987,7 @@ impl<'ast> Builder<'ast, '_> {
 							type_key,
 							SymbolKind::Memory {
 								memory_index,
-								kind: memory_kind,
+								size: memory_size.inner,
 							},
 						);
 					}
@@ -4991,7 +5001,7 @@ impl<'ast> Builder<'ast, '_> {
 							value_key,
 							SymbolKind::Memory {
 								memory_index,
-								kind: memory_kind,
+								size: memory_size.inner,
 							},
 						);
 					}
@@ -5194,7 +5204,7 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(BoundKind::TypeSet(_)) => {
 						self.tir.diagnostics.push(
 							Diagnostic::error()
-								.with_code(DiagnosticCode::ExpectedTrait.code())
+								.with_code(DiagnosticCode::ExpectedBound.code())
 								.with_message("expected a trait name")
 								.with_label(Label::primary(
 									resolve_context.file_id,
@@ -5289,15 +5299,8 @@ impl<'ast> Builder<'ast, '_> {
 					..
 				} = item
 				{
-					let func_attrs = self.resolve_attributes(attributes);
-					self.register_tagged_items(*id, &func_attrs);
+					let attributes = self.resolve_attributes(*id, attributes);
 					let func_index = self.tir.functions.len() as u32;
-
-					// Push a placeholder first, same as `ImplBlockFunction`:
-					// `Self` inside the signature (e.g. `fn make() -> Self`)
-					// resolves its container via `function_index(*id)` →
-					// `type_param_parent`, which needs `*id` already
-					// registered, not just about to be.
 					self.tir.functions.push(Function {
 						id: *id,
 						file_id: resolve_context.file_id,
@@ -5315,7 +5318,7 @@ impl<'ast> Builder<'ast, '_> {
 						accesses: Vec::new(),
 						params: Box::new([]),
 						result: None,
-						attributes: func_attrs,
+						attributes,
 					});
 					self.tir
 						.item_lookup
@@ -5369,9 +5372,10 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					value,
-					..
+					attributes,
 				} = item
 				{
+					let attributes = self.resolve_attributes(*id, attributes);
 					let self_scope = GenericScope {
 						owner: TypeParamOwner::TraitImpl(trait_impl_index),
 						self_type: Some(self_type),
@@ -5420,6 +5424,7 @@ impl<'ast> Builder<'ast, '_> {
 							value: Some(Box::new(value_expr)),
 							const_value,
 							accesses: Vec::new(),
+							attributes,
 						});
 						self.tir
 							.item_lookup
@@ -5441,32 +5446,45 @@ impl<'ast> Builder<'ast, '_> {
 					attributes,
 				} = item
 				{
-					let bounds = bounds
-						.as_ref()
-						.map(|bound| {
-							self.resolve_bounds(resolve_context, None, bound)
-						})
-						.unwrap_or_default();
-					let attributes = self.resolve_attributes(attributes);
-					self.register_tagged_items(*id, &attributes);
-
-					let placeholder = self.intern_type(Type::AssociatedType {
-						assoc_name: name.inner,
-						trait_index,
+					let attributes = self.resolve_attributes(*id, attributes);
+					let self_type_param = self.intern_type(Type::TypeParam {
+						owner: TypeParamOwner::Trait(trait_index),
+						param_index: 0,
 					});
+					let self_scope = GenericScope {
+						owner: TypeParamOwner::Trait(trait_index),
+						self_type: Some(self_type_param),
+					};
 
+					// Register the assoc type (name, entries, symbol) before
+					// resolving its own bounds — a `where` clause can reference
+					// this exact assoc type indirectly through a mutually
+					// recursive trait (e.g. `trait A { type X: B where { Y =
+					// Self } }` next to `trait B { type Y: A where { X = Self }
+					// }`), and that reference needs an already-present
+					// `assoc_types` entry to record its access against, even
+					// though this assoc type's own bounds haven't resolved yet.
 					self.tir.traits[trait_index as usize].assoc_types.insert(
 						name.inner,
 						TraitAssocType {
 							id: *id,
 							name_span: name.span,
-							bounds,
+							bounds: Bounds::default(),
 							accesses: Vec::new(),
 						},
 					);
-					self.tir.traits[trait_index as usize].members.insert(
+					let assoc_type_index =
+						self.tir.assoc_type_impls.len() as AssocTypeIndex;
+					self.tir.assoc_type_impls.push(AssocTypeImpl {
+						id: *id,
+						file_id: resolve_context.file_id,
+						name: *name,
+						ty: None,
+						attributes,
+					});
+					self.tir.traits[trait_index as usize].entries.insert(
 						name.inner,
-						ImplEntry::AssocType { ty: placeholder },
+						ImplEntry::AssocType(assoc_type_index),
 					);
 
 					// Replace Pending with TraitAssocType only if it's still our
@@ -5484,6 +5502,22 @@ impl<'ast> Builder<'ast, '_> {
 							},
 						);
 					}
+
+					let bounds = bounds
+						.as_ref()
+						.map(|bound| {
+							self.resolve_bounds(
+								resolve_context,
+								Some(self_scope),
+								bound,
+							)
+						})
+						.unwrap_or_default();
+					self.tir.traits[trait_index as usize]
+						.assoc_types
+						.get_mut(&name.inner)
+						.unwrap()
+						.bounds = bounds;
 				}
 			}
 			AstNodeRef::TraitImplAssocType {
@@ -5501,7 +5535,14 @@ impl<'ast> Builder<'ast, '_> {
 					.target
 					.inner;
 
-				if let ast::ImplItem::AssociatedType { name, ty, .. } = item {
+				if let ast::ImplItem::AssocType {
+					id,
+					name,
+					ty,
+					attributes,
+				} = item
+				{
+					let attributes = self.resolve_attributes(*id, attributes);
 					let self_scope = GenericScope {
 						owner: TypeParamOwner::TraitImpl(trait_impl_index),
 						self_type: Some(self_type),
@@ -5511,27 +5552,22 @@ impl<'ast> Builder<'ast, '_> {
 						Some(self_scope),
 						ty,
 					);
-					let entry = ImplEntry::AssocType { ty: concrete_ty };
+					let assoc_type_index =
+						self.tir.assoc_type_impls.len() as AssocTypeIndex;
+					self.tir.assoc_type_impls.push(AssocTypeImpl {
+						id: *id,
+						file_id: resolve_context.file_id,
+						name: *name,
+						ty: Some(Spanned {
+							inner: concrete_ty,
+							span: ty.span,
+						}),
+						attributes,
+					});
+					let entry = ImplEntry::AssocType(assoc_type_index);
 					self.tir.trait_impls[trait_impl_index as usize]
 						.members
 						.insert(name.inner, entry);
-
-					// Bounds are resolved lazily — ensure the trait's signature is
-					// ready before reading assoc_types.
-					let trait_def_id = self.tir.traits[trait_index as usize]
-                        .member_ids
-                        .iter()
-                        .copied()
-                        .find(|&did| {
-                            matches!(
-                                self.sig_state.get(&did).map(|e| &self.ast_nodes[e.node_idx].node),
-                                Some(AstNodeRef::TraitAssocType { item, .. })
-                                    if matches!(item, ast::TraitItem::AssociatedType { name: n, .. } if n.inner == name.inner)
-                            )
-                        });
-					if let Some(did) = trait_def_id {
-						self.ensure_signature(did);
-					}
 					if let Some(at) = self.tir.traits[trait_index as usize]
 						.assoc_types
 						.get_mut(&name.inner)
@@ -5541,13 +5577,8 @@ impl<'ast> Builder<'ast, '_> {
 							name.span,
 						));
 					}
-					self.check_assoc_type_bounds(
-						resolve_context.file_id,
-						trait_index,
-						name.inner,
-						concrete_ty,
-						name.span,
-					);
+					// Bound conformance is checked later, in
+					// `check_trait_conformance` (Phase 3.5) — not here.
 				}
 			}
 		}
@@ -5787,53 +5818,48 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		resolve_context: ResolveContext,
 		identifier: Spanned<SymbolU32>,
-		span: TextSpan,
+		full_span: TextSpan,
 	) -> Result<BoundKind, ()> {
 		let file_id = resolve_context.file_id;
-		let kind = self.resolve_pending_global_symbol(
+		let symbol = match self.resolve_pending_global_symbol(
 			resolve_context.namespace,
 			(SymbolNamespace::Type, identifier.inner),
-			file_id,
-			identifier.span,
-		)?;
-		match kind {
-			Some(SymbolKind::Trait { trait_index }) => {
+			SourceSpan::new(file_id, identifier.span),
+		)? {
+			Some(symbol) => symbol,
+			None => {
+				self.tir.diagnostics.push(report_undeclared_type(
+					SourceSpan::new(file_id, identifier.span),
+				));
+				return Err(());
+			}
+		};
+		match symbol {
+			SymbolKind::Trait { trait_index } => {
 				self.tir.traits[trait_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
 				Ok(BoundKind::Trait(TraitBound {
 					trait_index,
 					bindings: Box::new([]),
+					span: full_span,
 				}))
 			}
-			Some(SymbolKind::TypeSet { typeset_index }) => {
+			SymbolKind::TypeSet { typeset_index } => {
 				self.tir.typesets[typeset_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
-				Ok(BoundKind::TypeSet(typeset_index))
-			}
-			None => {
-				self.tir.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::UndeclaredType.code())
-						.with_message(format!(
-							"cannot find trait or typeset `{}` in this scope",
-							self.interner
-								.resolve(identifier.inner)
-								.unwrap_or("<unknown>")
-						))
-						.with_label(Label::primary(file_id, span)),
-				);
-				Err(())
+				Ok(BoundKind::TypeSet(TypesetBound {
+					typeset_index,
+					span: full_span,
+				}))
 			}
 			_ => {
 				self.tir.diagnostics.push(
 					Diagnostic::error()
-						.with_code(DiagnosticCode::ExpectedTrait.code())
-						.with_message(
-							"expected a trait or typeset name as a bound",
-						)
-						.with_label(Label::primary(file_id, span)),
+						.with_code(DiagnosticCode::ExpectedBound.code())
+						.with_message("expected bound")
+						.with_label(Label::primary(file_id, full_span)),
 				);
 				Err(())
 			}
@@ -5847,14 +5873,14 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		resolve_context: ResolveContext,
 		segs: &[ast::PathSegment],
-		span: TextSpan,
+		full_span: TextSpan,
 	) -> Result<BoundKind, ()> {
-		let file_id = resolve_context.file_id;
+		debug_assert!(segs.len() > 0);
 		if segs.len() == 1 {
 			return self.resolve_identifier_as_bound(
 				resolve_context,
 				segs[0].ident,
-				span,
+				full_span,
 			);
 		}
 		// Walk all but the last segment as type namespaces (modules).
@@ -5886,8 +5912,10 @@ impl<'ast> Builder<'ast, '_> {
 				Err(()) => return Err(()),
 			}
 		}
+
 		// Final segment: look up the symbol in the final namespace and convert to BoundKind.
 		let last = segs.last().unwrap();
+		let file_id = resolve_context.file_id;
 		let Type::Namespace { namespace_idx } =
 			self.tir.types[namespace_ty.as_usize()].clone()
 		else {
@@ -5900,31 +5928,40 @@ impl<'ast> Builder<'ast, '_> {
 			);
 			return Err(());
 		};
-		let kind = self.resolve_pending_namespace_symbol(
+		let kind = match self.resolve_pending_namespace_symbol(
 			namespace_idx,
 			(SymbolNamespace::Type, last.ident.inner),
 			SourceSpan::new(file_id, last.ident.span),
-		)?;
+		)? {
+			Some(kind) => kind,
+			None => {
+				todo!();
+			}
+		};
 		match kind {
-			Some(SymbolKind::Trait { trait_index }) => {
+			SymbolKind::Trait { trait_index } => {
 				self.tir.traits[trait_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
 				Ok(BoundKind::Trait(TraitBound {
 					trait_index,
 					bindings: Box::new([]),
+					span: full_span,
 				}))
 			}
-			Some(SymbolKind::TypeSet { typeset_index }) => {
+			SymbolKind::TypeSet { typeset_index } => {
 				self.tir.typesets[typeset_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
-				Ok(BoundKind::TypeSet(typeset_index))
+				Ok(BoundKind::TypeSet(TypesetBound {
+					typeset_index,
+					span: full_span,
+				}))
 			}
 			_ => {
 				self.tir.diagnostics.push(
 					Diagnostic::error()
-						.with_code(DiagnosticCode::ExpectedTrait.code())
+						.with_code(DiagnosticCode::ExpectedBound.code())
 						.with_message(
 							"expected a trait or typeset name as a bound",
 						)
@@ -5951,13 +5988,13 @@ impl<'ast> Builder<'ast, '_> {
 					segs,
 					bound.span,
 				) {
-					Ok(BoundKind::Trait(tb)) => Bounds {
-						traits: Box::new([tb]),
+					Ok(BoundKind::Trait(trait_bound)) => Bounds {
+						traits: Box::new([trait_bound]),
 						typeset: None,
 					},
-					Ok(BoundKind::TypeSet(ts)) => Bounds {
+					Ok(BoundKind::TypeSet(typeset_bound)) => Bounds {
 						traits: Box::new([]),
-						typeset: Some(ts),
+						typeset: Some(typeset_bound),
 					},
 					Err(()) => Bounds::default(),
 				}
@@ -5988,9 +6025,10 @@ impl<'ast> Builder<'ast, '_> {
 					bound.span,
 				) {
 					Ok(BoundKind::Trait(tb)) => tb.trait_index,
-					Ok(BoundKind::TypeSet(_)) => {
+					Ok(BoundKind::TypeSet(typeset)) => {
 						self.tir.diagnostics.push(
 							Diagnostic::error()
+								// TODO: add diagnostic code here
 								.with_message(
 									"typesets cannot have associated type bindings",
 								)
@@ -5999,10 +6037,24 @@ impl<'ast> Builder<'ast, '_> {
 									bound.span,
 								)),
 						);
-						return Bounds::default();
+						return Bounds {
+							traits: Box::new([]),
+							typeset: Some(typeset),
+						};
 					}
 					Err(()) => return Bounds::default(),
 				};
+				// Force the bound trait's own signature — and therefore its
+				// members' `assoc_types` entries — to resolve before looking
+				// up bindings below. Without this, a trait that hasn't been
+				// visited by the main signature-resolution pass yet (e.g. two
+				// traits whose assoc-type `where` clauses reference each
+				// other, such as `trait A { type X: B where { Y = Self } }`
+				// next to `trait B { type Y: A where { X = Self } }`) would
+				// have an empty `assoc_types` map here, silently dropping the
+				// access instead of recording it. `ensure_signature` is a
+				// no-op if already done or in progress on the call stack.
+				self.ensure_signature(self.tir.traits[trait_index as usize].id);
 				let mut bindings: Vec<(SymbolU32, TypeIndex)> = Vec::new();
 				for binding in where_bindings.iter() {
 					if let Some(at) = self.tir.traits[trait_index as usize]
@@ -6023,13 +6075,14 @@ impl<'ast> Builder<'ast, '_> {
 					traits: Box::new([TraitBound {
 						trait_index,
 						bindings: bindings.into_boxed_slice(),
+						span: bound.span,
 					}]),
 					typeset: None,
 				}
 			}
 			ast::BoundExpression::BoundList(items) => {
 				let mut traits: Vec<TraitBound> = Vec::new();
-				let mut typeset: Option<TypesetIndex> = None;
+				let mut typeset: Option<TypesetBound> = None;
 				for item in items.iter() {
 					let resolved =
 						self.resolve_bounds(resolve_context, scope, item);
@@ -6359,10 +6412,12 @@ impl<'ast> Builder<'ast, '_> {
 									.members
 									.get(&assoc_name)
 								{
-									Some(ImplEntry::AssocType {
-										ty: concrete,
-									}) => {
-										let concrete = *concrete;
+									Some(ImplEntry::AssocType(idx)) => {
+										let concrete = self
+											.tir
+											.assoc_type_impls[*idx as usize]
+											.ty
+											.unwrap();
 										// The impl's own assoc-type value may
 										// reference its own type params (e.g.
 										// `impl<T> Trait for Foo<T> { type
@@ -6370,14 +6425,34 @@ impl<'ast> Builder<'ast, '_> {
 										// through the args just inferred from
 										// `substituted`.
 										self.substitute_type(
-											concrete,
+											concrete.inner,
 											&impl_type_args,
 										)
 									}
 									_ => ty,
 								}
 							}
-							None => ty,
+							None => {
+								// `substituted` can land here either because
+								// it's a genuinely concrete type that just
+								// doesn't implement `trait_index` (a real,
+								// permanent bound failure — the call site's
+								// own bound check already reports this; don't
+								// hand back the stale pre-substitution
+								// projection as if it were valid), or because
+								// it's still `INFER`/`ERROR` itself (type-arg
+								// inference hasn't finished yet) — that's not
+								// a failure, just "not resolved yet," so defer
+								// the same way the TypeParam/AssocTypeProjection
+								// arm above does.
+								if substituted == TypeIndex::INFER
+									|| substituted == TypeIndex::ERROR
+								{
+									ty
+								} else {
+									TypeIndex::ERROR
+								}
+							}
 						}
 					}
 				}
@@ -6653,19 +6728,13 @@ impl<'ast> Builder<'ast, '_> {
 	fn seed_memory_trait_impl_with(
 		&mut self,
 		trait_index: u32,
-		memory_type: TypeIndex,
-		// Assoc-type overrides from the parent supertrait declaration.
-		// E.g. Memory32's `Memory<Size=u32>` provides {"Size" → u32}.
-		bindings: &HashMap<SymbolU32, TypeIndex>,
+		memory_self: TypeIndex,
+		memory_size: Spanned<TypeIndex>,
 	) -> HashMap<SymbolU32, ImplEntry> {
-		// Ensure all member signatures in this trait are resolved.
-		for did in self.tir.traits[trait_index as usize].member_ids.clone() {
-			self.ensure_signature(did);
-		}
 		let self_symbol = self.interner.get_or_intern("self");
 		let raw_members: Vec<(SymbolU32, ImplEntry)> = self.tir.traits
 			[trait_index as usize]
-			.members
+			.entries
 			.iter()
 			.map(|(&sym, entry)| (sym, *entry))
 			.collect();
@@ -6678,7 +6747,7 @@ impl<'ast> Builder<'ast, '_> {
 					if func
 						.params
 						.first()
-						.map(|p| p.name.inner == self_symbol)
+						.map(|param| param.name.inner == self_symbol)
 						.unwrap_or(false)
 					{
 						ImplEntry::Method(fi)
@@ -6686,9 +6755,20 @@ impl<'ast> Builder<'ast, '_> {
 						ImplEntry::AssocFunction(fi)
 					}
 				}
-				ImplEntry::AssocType { ty } => {
-					let concrete = bindings.get(&sym).copied().unwrap_or(ty);
-					ImplEntry::AssocType { ty: concrete }
+				ImplEntry::AssocType(idx) => {
+					let original = &self.tir.assoc_type_impls[idx as usize];
+					let new_id = self.id_generator.generate();
+					let new_entry = AssocTypeImpl {
+						id: new_id,
+						file_id: original.file_id,
+						name: original.name,
+						ty: Some(memory_size),
+						attributes: Box::new([]),
+					};
+					let new_index =
+						self.tir.assoc_type_impls.len() as AssocTypeIndex;
+					self.tir.assoc_type_impls.push(new_entry);
+					ImplEntry::AssocType(new_index)
 				}
 				ImplEntry::AssocConstant(index) => {
 					// Fork a copy of the template `Constant` with Self
@@ -6700,7 +6780,7 @@ impl<'ast> Builder<'ast, '_> {
 					let original_ty =
 						self.tir.constants[index as usize].ty.inner;
 					let concrete_ty =
-						self.substitute_type(original_ty, &[memory_type]);
+						self.substitute_type(original_ty, &[memory_self]);
 					let c = &self.tir.constants[index as usize];
 					let new_id = self.id_generator.generate();
 					let new_constant = Constant {
@@ -6717,6 +6797,7 @@ impl<'ast> Builder<'ast, '_> {
 						value: None,
 						const_value: None,
 						accesses: Vec::new(),
+						attributes: Box::new([]),
 					};
 					let new_index = self.tir.constants.len() as ConstIndex;
 					self.tir.constants.push(new_constant);
@@ -7529,80 +7610,184 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	/// Emits a diagnostic for each bound on `assoc_name` that `concrete_ty`
-	/// does not satisfy. `error_span` is where the type was written.
+	/// does not satisfy. `self_ty` is what `Self` refers to in this checking
+	/// context — the type that `assoc_name` is *the associated type of*
+	/// (e.g. `u8` when checking `impl UnsignedInt for u8`'s `Signed`
+	/// binding) — needed to check `where { OtherAssoc = Self }` bindings on
+	/// `assoc_name`'s own bounds (e.g. `SignedInt`'s `Unsigned` must equal
+	/// `Self`, not just that `concrete_ty: SignedInt`). `error_span` is where
+	/// the type was written.
 	fn check_assoc_type_bounds(
 		&mut self,
 		file_id: FileId,
 		trait_index: TraitIndex,
-		assoc_name: SymbolU32,
-		concrete_ty: TypeIndex,
-		error_span: TextSpan,
+		self_type: TypeIndex,
+		name: Spanned<SymbolU32>,
+		ty: Spanned<TypeIndex>,
 	) {
-		let Some(at) = self.tir.traits[trait_index as usize]
+		let Some(bounds) = self.tir.traits[trait_index as usize]
 			.assoc_types
-			.get(&assoc_name)
+			.get(&name.inner)
+			.map(|assoc_type| assoc_type.bounds.clone())
 		else {
+			// TODO: handle unknown associated type
 			return;
 		};
 
-		let assoc_name_str =
-			self.interner.resolve(assoc_name).unwrap_or("?").to_string();
-
-		for bound in &at.bounds.traits {
-			if self
-				.tir
-				.find_trait_impl(concrete_ty, bound.trait_index)
-				.is_none()
-			{
-				let bound_name = self
-					.interner
-					.resolve(
-						self.tir.traits[bound.trait_index as usize].name.inner,
-					)
-					.unwrap()
-					.to_string();
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
-					.display_type(concrete_ty)
-					.unwrap();
-				self.tir.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TypeMistmatch.code())
-						.with_message(format!(
-							"associated type `{assoc_name_str}` must implement `{bound_name}`",
-						))
-						.with_label(Label::primary(file_id, error_span))
-						.with_note(format!(
-							"`{type_name}` does not implement `{bound_name}`"
-						)),
-				);
+		for bound in bounds.traits.iter() {
+			match self.tir.find_trait_impl(ty.inner, bound.trait_index) {
+				Some((impl_idx, impl_type_args)) => {
+					// `where { OtherAssoc = Self }`-style bindings: verify the
+					// impl's *actual* value for `OtherAssoc` matches what's
+					// required, not just that the trait itself is implemented.
+					for &(binding_name, expected_ty) in bound.bindings.iter() {
+						let expected =
+							self.substitute_type(expected_ty, &[self_type]);
+						let actual = match self.tir.trait_impls
+							[impl_idx as usize]
+							.members
+							.get(&binding_name)
+						{
+							Some(ImplEntry::AssocType(idx)) => {
+								let raw = self.tir.assoc_type_impls
+									[*idx as usize]
+									.ty
+									.unwrap();
+								self.substitute_type(raw.inner, &impl_type_args)
+							}
+							// Missing item is already reported separately by
+							// `check_trait_conformance`'s `MissingItem` check.
+							_ => continue,
+						};
+						if expected != actual {
+							let assoc_name_str =
+								self.interner.resolve(name.inner).unwrap();
+							let binding_name_str =
+								self.interner.resolve(binding_name).unwrap();
+							let bound_name = self
+								.interner
+								.resolve(
+									self.tir.traits[bound.trait_index as usize]
+										.name
+										.inner,
+								)
+								.unwrap();
+							let fmt =
+								TypeFormatter::new(&self.tir, self.interner);
+							let concrete_name =
+								fmt.display_type(ty.inner).unwrap_or_default();
+							let expected_name =
+								fmt.display_type(expected).unwrap_or_default();
+							let actual_name =
+								fmt.display_type(actual).unwrap_or_default();
+							self.tir.diagnostics.push(
+								Diagnostic::error()
+									.with_code(DiagnosticCode::TypeMistmatch.code())
+									.with_message(format!(
+										"associated type `{assoc_name_str}` = `{concrete_name}` does not satisfy `{bound_name}`'s required binding `{binding_name_str} = {expected_name}`",
+									))
+									.with_label(
+										Label::primary(
+											file_id,
+											name.span,
+										).with_message(format!(
+											"`{concrete_name}::{binding_name_str}` is `{actual_name}`, not `{expected_name}`"
+										))
+									),
+							);
+						}
+					}
+				}
+				None => {
+					let assoc_name = self.interner.resolve(name.inner).unwrap();
+					let type_name =
+						TypeFormatter::new(&self.tir, self.interner)
+							.display_type(ty.inner)
+							.unwrap();
+					let trait_name = self
+						.interner
+						.resolve(
+							self.tir.traits[bound.trait_index as usize]
+								.name
+								.inner,
+						)
+						.unwrap();
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::TraitBoundViolation.code(),
+							)
+							.with_message(format!(
+								"the trait bound `{type_name}: {trait_name}` is not satisfied",
+							))
+							.with_label(
+								Label::primary(file_id, ty.span).with_message(
+									format!(
+										"the trait `{trait_name}` is not implemented for `{type_name}`"
+									),
+								),
+							)
+							.with_label(
+								Label::secondary(
+									self.tir.traits[trait_index as usize]
+										.file_id,
+									bound.span,
+								)
+								.with_message(format!(
+									"required by a bound in `{trait_name}::{assoc_name}`"
+								)),
+							),
+					);
+				}
 			}
 		}
 
-		if let Some(typeset_index) = at.bounds.typeset {
-			if !self
+		if let Some(typeset) = bounds.typeset
+			&& !self
 				.tir
-				.concrete_type_in_typeset(concrete_ty, typeset_index)
-			{
-				let ts_name = self
-					.interner
-					.resolve(
-						self.tir.typesets[typeset_index as usize].name.inner,
-					)
-					.unwrap_or("?")
-					.to_string();
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
-					.display_type(concrete_ty)
-					.unwrap();
-				self.tir.diagnostics.push(
-                    Diagnostic::error()
-                        .with_code(DiagnosticCode::TypesetBoundViolation.code())
-                        .with_message(format!(
-                            "associated type `{assoc_name_str}` must be a member of typeset `{ts_name}`",
-                        ))
-                        .with_label(Label::primary(file_id, error_span))
-                        .with_note(format!("`{type_name}` is not a member of typeset `{ts_name}`")),
-                );
-			}
+				.concrete_type_in_typeset(ty.inner, typeset.typeset_index)
+		{
+			let typeset_name = self
+				.interner
+				.resolve(
+					self.tir.typesets[typeset.typeset_index as usize]
+						.name
+						.inner,
+				)
+				.unwrap();
+			let assoc_name = self.interner.resolve(name.inner).unwrap();
+			let type_name = TypeFormatter::new(&self.tir, self.interner)
+				.display_type(ty.inner)
+				.unwrap();
+			let trait_name = self
+				.interner
+				.resolve(self.tir.traits[trait_index as usize].name.inner)
+				.unwrap();
+			self.tir.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::TypesetBoundViolation.code())
+						.with_message(format!(
+							"associated type `{assoc_name}` must be a member of typeset `{typeset_name}`",
+						))
+						.with_label(
+							Label::primary(
+								file_id,
+								name.span,
+							).with_message(
+								format!("`{type_name}` is not a member of typeset `{typeset_name}`")
+							)
+						)
+						.with_label(
+							Label::secondary(
+								self.tir.traits[trait_index as usize]
+									.file_id,
+								typeset.span,
+							)
+							.with_message(format!(
+								"required by a bound in `{trait_name}::{assoc_name}`"
+							)),
+						),
+				);
 		}
 	}
 
@@ -7632,7 +7817,7 @@ impl<'ast> Builder<'ast, '_> {
 			// (unlike `resolve_impl_member`, which also falls back to bodied
 			// trait defaults). We use `ti.members` intentionally here: a
 			// default method must not satisfy an abstract (no-body) requirement.
-			for (&sym, entry) in &trait_.members {
+			for (&sym, entry) in &trait_.entries {
 				// `body.is_none()` distinguishes abstract from default methods.
 				// Requires Phase 3 to have populated bodies before this runs.
 				let (required, kind) = match entry {
@@ -7640,7 +7825,7 @@ impl<'ast> Builder<'ast, '_> {
 						(self.tir.functions[*fi as usize].body.is_none(), "fn")
 					}
 					ImplEntry::AssocConstant(_) => (true, "const"),
-					ImplEntry::AssocType { .. } => (true, "type"),
+					ImplEntry::AssocType(_) => (true, "type"),
 					_ => continue,
 				};
 				if required && !ti.members.contains_key(&sym) {
@@ -7654,14 +7839,16 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 
-			for &supertrait_index in &trait_.supertraits {
+			for supertrait in &trait_.bounds.traits {
 				if self
 					.tir
-					.find_trait_impl(ti.target.inner, supertrait_index)
+					.find_trait_impl(ti.target.inner, supertrait.trait_index)
 					.is_none()
 				{
-					let supertrait_sym =
-						self.tir.traits[supertrait_index as usize].name.inner;
+					let supertrait_sym = self.tir.traits
+						[supertrait.trait_index as usize]
+						.name
+						.inner;
 					violations.push(Violation::MissingSupertrait {
 						file_id: ti.file_id,
 						span: ti.span,
@@ -7669,6 +7856,42 @@ impl<'ast> Builder<'ast, '_> {
 						supertrait_sym,
 					});
 				}
+			}
+		}
+
+		for trait_impl_index in 0..self.tir.trait_impls.len() {
+			// `.members` is a HashMap keyed by symbol (kept that way for the
+			// O(1) point lookups on the hot path in `resolve_impl_member`),
+			// so unlike a slice there's no cheap per-index re-derive here.
+			// Collecting just the matching `AssocTypeIndex` values — bounded
+			// by how many associated types one impl provides, so a handful
+			// at most — is the smallest way to end the borrow on `members`
+			// before `check_assoc_type_bounds` needs `&mut self` below.
+			let assoc_type_indices: Vec<AssocTypeIndex> = self.tir.trait_impls
+				[trait_impl_index]
+				.members
+				.values()
+				.copied()
+				.filter_map(|entry| match entry {
+					ImplEntry::AssocType(idx) => Some(idx),
+					_ => None,
+				})
+				.collect();
+			for assoc_type_index in assoc_type_indices {
+				let assoc_type_impl = self.tir.assoc_type_impls
+					[assoc_type_index as usize]
+					.clone();
+				let trait_index =
+					self.tir.trait_impls[trait_impl_index].trait_index;
+				let self_type =
+					self.tir.trait_impls[trait_impl_index].target.inner;
+				self.check_assoc_type_bounds(
+					assoc_type_impl.file_id,
+					trait_index,
+					self_type,
+					assoc_type_impl.name,
+					assoc_type_impl.ty.unwrap(),
+				);
 			}
 		}
 
@@ -8111,6 +8334,8 @@ impl<'ast> Builder<'ast, '_> {
 		expr: &Spanned<ast::Expression>,
 	) -> Result<Expression, ()> {
 		match &expr.inner {
+			// TEMP stub to unblock local builds during parallel QualifiedPath work — not part of this fix, do not keep.
+			ast::Expression::QualifiedPath { .. } => todo!(),
 			ast::Expression::Int { value } => Ok(Expression {
 				kind: ExprKind::Int { value: *value },
 				ty: TypeIndex::INTEGER,
@@ -8773,19 +8998,28 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 			}
-			Type::TypeParam { .. } => {
-				let bounds = self.type_param_bounds(namespace.inner).to_owned();
-				for bound in &bounds {
-					let trait_index = bound.trait_index;
-					let def_ids = self.tir.traits[trait_index as usize]
-						.member_ids
-						.clone();
-					for def_id in def_ids {
-						self.ensure_signature(def_id);
-					}
-					if let Some(ImplEntry::AssocType { .. }) = self.tir.traits
+			Type::TypeParam { owner, param_index } => {
+				let owner = *owner;
+				let param_index = *param_index;
+				let trait_count = self
+					.tir
+					.type_param_info(owner, param_index as usize)
+					.bounds
+					.traits
+					.len();
+				for trait_bound_index in 0..trait_count {
+					let trait_index = self
+						.tir
+						.type_param_info(owner, param_index as usize)
+						.bounds
+						.traits[trait_bound_index]
+						.trait_index;
+					self.ensure_signature(
+						self.tir.traits[trait_index as usize].id,
+					);
+					if let Some(ImplEntry::AssocType(_)) = self.tir.traits
 						[trait_index as usize]
-						.members
+						.entries
 						.get(&member.ident.inner)
 					{
 						if let Some(at) = self.tir.traits[trait_index as usize]
@@ -8826,30 +9060,27 @@ impl<'ast> Builder<'ast, '_> {
 					.map(|at| at.bounds.traits.clone())
 					.unwrap_or_default();
 				for bound in bounds.iter() {
-					let bound_trait = bound.trait_index;
-					let def_ids = self.tir.traits[bound_trait as usize]
-						.member_ids
-						.clone();
-					for def_id in def_ids {
-						self.ensure_signature(def_id);
-					}
-					if let Some(ImplEntry::AssocType { .. }) = self.tir.traits
-						[bound_trait as usize]
-						.members
+					self.ensure_signature(
+						self.tir.traits[bound.trait_index as usize].id,
+					);
+					if let Some(ImplEntry::AssocType(_)) = self.tir.traits
+						[bound.trait_index as usize]
+						.entries
 						.get(&member.ident.inner)
 					{
-						if let Some(at) = self.tir.traits[bound_trait as usize]
+						if let Some(assoc_type) = self.tir.traits
+							[bound.trait_index as usize]
 							.assoc_types
 							.get_mut(&member.ident.inner)
 						{
-							at.accesses.push(SourceSpan::new(
+							assoc_type.accesses.push(SourceSpan::new(
 								resolve_context.file_id,
 								member.ident.span,
 							));
 						}
 						return Ok(self.intern_type(
 							Type::AssocTypeProjection {
-								trait_index: bound_trait,
+								trait_index: bound.trait_index,
 								assoc_name: member.ident.inner,
 								base: namespace.inner,
 							},
@@ -8880,25 +9111,32 @@ impl<'ast> Builder<'ast, '_> {
 				SourceSpan::new(resolve_context.file_id, member.ident.span),
 			) {
 				MemberLookup::Trait {
-					entry: ImplEntry::AssocType { ty },
+					entry: ImplEntry::AssocType(idx),
 					trait_index,
 					..
 				} => {
-					if let Some(at) = self.tir.traits[trait_index as usize]
+					if let Some(assoc_type) = self.tir.traits
+						[trait_index as usize]
 						.assoc_types
 						.get_mut(&member.ident.inner)
 					{
-						at.accesses.push(SourceSpan::new(
+						assoc_type.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
 							member.ident.span,
 						));
 					}
-					Ok(ty)
+					Ok(self.tir.assoc_type_impls[idx as usize]
+						.ty
+						.unwrap()
+						.inner)
 				}
 				MemberLookup::Inherent {
-					entry: ImplEntry::AssocType { ty },
+					entry: ImplEntry::AssocType(idx),
 					..
-				} => Ok(ty),
+				} => Ok(self.tir.assoc_type_impls[idx as usize]
+					.ty
+					.unwrap()
+					.inner),
 				MemberLookup::Ambiguous => Err(()),
 				_ => {
 					// TODO: we could improve the diagnostics here
@@ -9034,11 +9272,11 @@ impl<'ast> Builder<'ast, '_> {
 				});
 			}
 			MemberLookup::Inherent {
-				entry: ImplEntry::AssocType { .. },
+				entry: ImplEntry::AssocType(_),
 				..
 			}
 			| MemberLookup::Trait {
-				entry: ImplEntry::AssocType { .. },
+				entry: ImplEntry::AssocType(_),
 				..
 			}
 			| MemberLookup::NotFound => {}
@@ -9720,12 +9958,7 @@ impl<'ast> Builder<'ast, '_> {
 			Type::F64 => Some(WasmScalar::F64),
 			Type::Pointer { memory, .. } => {
 				match &self.tir.types[memory.as_usize()] {
-					Type::Memory { id, .. } => {
-						let kind = self.tir.memories
-							[self.tir.expect_memory_index(*id) as usize]
-							.kind;
-						self.type_scalar(kind)
-					}
+					Type::Memory { size, .. } => self.type_scalar(*size),
 					_ => None,
 				}
 			}
@@ -11445,89 +11678,6 @@ impl<'ast> Builder<'ast, '_> {
 			.is_some_and(|a| a.bounds.typeset.is_some())
 	}
 
-	/// Returns the typeset bound for any type that can carry one:
-	/// `TypeParam` (via its `typeset_bound` field) or `AssocTypeProjection`
-	/// (via the trait's associated-type `typeset_bound`).
-	fn typeset_bound_for(&self, ty: TypeIndex) -> Option<TypesetIndex> {
-		match &self.tir.types[ty.as_usize()] {
-			Type::TypeParam { .. } => self.tir.type_param_typeset_bound(ty),
-			Type::AssocTypeProjection {
-				trait_index,
-				assoc_name,
-				..
-			} => self.tir.traits[*trait_index as usize]
-				.assoc_types
-				.get(assoc_name)
-				.and_then(|at| at.bounds.typeset),
-			_ => None,
-		}
-	}
-
-	/// After type_args are finalized for a generic call, check that each
-	/// type arg satisfies the typeset bounds of its type parameter.
-	/// If the type arg is itself a TypeParam (nested generic context), check
-	/// that it has the required typeset bound rather than requiring membership.
-	fn check_typeset_bounds_on_type_args(
-		&mut self,
-		func_index: FunctionIndex,
-		type_args: &[TypeIndex],
-		file_id: FileId,
-		call_span: TextSpan,
-	) {
-		let type_params: Vec<(SymbolU32, Option<TypesetIndex>)> = self
-			.tir
-			.function_type_params_iter(func_index)
-			.map(|tp| (tp.name.inner, tp.bounds.typeset))
-			.collect();
-		for (i, (param_name, typeset_bound)) in
-			type_params.iter().copied().enumerate()
-		{
-			let Some(ts_index) = typeset_bound else {
-				continue;
-			};
-			let Some(&arg_ty) = type_args.get(i) else {
-				continue;
-			};
-			if arg_ty == TypeIndex::ERROR {
-				continue;
-			}
-			let satisfied = match &self.tir.types[arg_ty.as_usize()] {
-				// Nested generic: the caller's TypeParam forwards here — check its typeset bound.
-				Type::TypeParam { .. } => {
-					self.tir.type_param_typeset_bound(arg_ty) == Some(ts_index)
-				}
-				// Concrete type: must be a member of the typeset.
-				_ => self.tir.concrete_type_in_typeset(arg_ty, ts_index),
-			};
-			if !satisfied {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
-					.display_type(arg_ty)
-					.unwrap_or_default();
-				let set_name = self
-					.interner
-					.resolve(self.tir.typesets[ts_index as usize].name.inner)
-					.unwrap_or("?")
-					.to_owned();
-				let param_name_str =
-					self.interner.resolve(param_name).unwrap_or("?").to_owned();
-				self.tir.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TypesetBoundViolation.code())
-						.with_message(format!(
-							"type `{type_name}` is not a member of typeset `{set_name}`"
-						))
-						.with_label(
-							Label::primary(file_id, call_span).with_message(
-								format!(
-									"`{param_name_str}` requires a type from `{set_name}`"
-								),
-							),
-						),
-				);
-			}
-		}
-	}
-
 	/// Builds/coerces `arguments` against `func_index`'s signature and
 	/// resolves `type_args`. Never fails: a type mismatch or unresolvable
 	/// type param is reported as a diagnostic but the caller still gets back
@@ -11543,17 +11693,17 @@ impl<'ast> Builder<'ast, '_> {
 		expected_result: TypeIndex,
 		call_span: TextSpan,
 	) -> Box<[TypeIndex]> {
+		let result_type = self.tir.functions[func_index as usize]
+			.result
+			.as_ref()
+			.map(|r| r.inner)
+			.unwrap_or(TypeIndex::UNIT);
 		if expected_result != TypeIndex::INFER {
-			let result_type = self.tir.functions[func_index as usize]
-				.result
-				.as_ref()
-				.map(|r| r.inner)
-				.unwrap_or(TypeIndex::UNIT);
 			// Ignored: an inconsistent result-type seed here is a real user
 			// error, but it's caught below by the leftover-`INFER`/
 			// substituted-result check, which reports a clearer diagnostic
 			// than this structural signal could on its own.
-			let _ = self.tir.infer_type_args(
+			_ = self.tir.infer_type_args(
 				&mut type_args,
 				result_type,
 				expected_result,
@@ -11569,8 +11719,7 @@ impl<'ast> Builder<'ast, '_> {
 			// Ignored: a genuine mismatch here surfaces separately when
 			// this argument gets checked against the (by-then substituted)
 			// param type, with the actual expected/found types shown.
-			let _ =
-				self.tir.infer_type_args(&mut type_args, param_type, arg.ty);
+			_ = self.tir.infer_type_args(&mut type_args, param_type, arg.ty);
 		}
 
 		// Detect unresolvable type parameters by substituting the current type_args
@@ -11582,11 +11731,6 @@ impl<'ast> Builder<'ast, '_> {
 		// This means `contains_infer` on the substituted result is false for
 		// params that appear only via `C::Item` style projections, and true for
 		// params that appear directly (e.g. M in `Layout<M>`).
-		let result_type = self.tir.functions[func_index as usize]
-			.result
-			.as_ref()
-			.map(|r| r.inner)
-			.unwrap_or(TypeIndex::UNIT);
 		let substituted_result = self.substitute_type(result_type, &type_args);
 		let mut had_unresolved = false;
 		if self.contains_infer(substituted_result) {
@@ -11641,12 +11785,38 @@ impl<'ast> Builder<'ast, '_> {
 					None => break,
 				};
 
-			let expected_type =
+			let substituted_expected =
 				self.substitute_expected_type(param_type, &type_args);
-			let expected_type = if self.contains_infer(expected_type) {
+			let expected_type = if self.contains_infer(substituted_expected) {
+				// `substituted_expected` still has an open type-param slot
+				// somewhere (e.g. `Box<T>` with `T` unresolved) — but an
+				// open slot doesn't mean this argument is fine to defer on.
+				// If `arg.ty` structurally can't match this shape no matter
+				// what the open slot turns out to be (e.g. `i32` against
+				// `Box<_>` — a scalar can never be a `Box`, regardless of
+				// `T`), that's a real, unconditional mismatch, not a
+				// "provide a type annotation" situation — report it here,
+				// using the partially-substituted type so the message names
+				// the real expected shape (`Box<_>`, not just `_`).
+				if !self.type_satisfies_annotation(arg.ty, substituted_expected)
+				{
+					self.tir.diagnostics.push(report_type_mistmatch(
+						TypeFormatter::new(&self.tir, self.interner),
+						TypeMistmatchDiagnostic {
+							expected_type: substituted_expected,
+							actual_type: arg.ty,
+							span: SourceSpan::new(
+								ctx.resolve_context.file_id,
+								arg.span,
+							),
+						},
+					));
+					had_error = true;
+					continue;
+				}
 				TypeIndex::INFER
 			} else {
-				expected_type
+				substituted_expected
 			};
 
 			if expected_type != TypeIndex::INFER {
@@ -11684,12 +11854,12 @@ impl<'ast> Builder<'ast, '_> {
 		// and can never be constrained.  Skip if coercion already failed to
 		// avoid double-reporting on top of a TypeMistmatch.
 		if !had_error {
-			for (i, &slot) in type_args.iter().enumerate() {
+			for (index, slot) in type_args.iter().copied().enumerate() {
 				if slot == TypeIndex::INFER {
 					let name_symbol = self
 						.tir
 						.function_type_params_iter(func_index)
-						.nth(i)
+						.nth(index)
 						.expect(
 							"type_args length must equal total_type_param_count",
 						)
@@ -11722,6 +11892,138 @@ impl<'ast> Builder<'ast, '_> {
 				*slot = TypeIndex::ERROR;
 			}
 		}
+
+		// Collected here instead of pushed straight to `self.tir.diagnostics`:
+		// `param_info` below borrows `self.tir` for the rest of each
+		// iteration (both the trait loop and the typeset check use it, with
+		// `continue`s in between), so nothing in this loop can also hold
+		// `&mut self.tir.diagnostics` at the same time. Costs nothing on the
+		// common no-violation path — `Vec::new()` doesn't allocate until the
+		// first `push` — unlike cloning `param_info.bounds` would on every
+		// call regardless of outcome.
+		let mut diagnostics: Vec<Diagnostic<FileId>> = Vec::new();
+		// Zipped once, in lockstep, rather than re-deriving `param_info` via
+		// a fresh `.nth(arg_index)` per iteration (which would re-walk the
+		// chained parent/own type-param iterator from the start every time)
+		// — safe now that nothing in this loop needs `&mut self.tir`
+		// (diagnostics are collected above instead), so holding this one
+		// iterator borrowed across the whole loop is fine.
+		for (index, (param_info, arg_ty)) in self
+			.tir
+			.function_type_params_iter(func_index)
+			.zip(type_args.iter().copied())
+			.enumerate()
+		{
+			if arg_ty == TypeIndex::ERROR {
+				continue;
+			}
+			// A declared bound can list several traits (`T: Foo + Bar`) —
+			// report every one `arg_ty` fails, not just the first.
+			for trait_bound in param_info.bounds.traits.iter() {
+				if self
+					.tir
+					.type_implements_trait(arg_ty, trait_bound.trait_index)
+				{
+					continue;
+				}
+				let type_name = TypeFormatter::new(&self.tir, self.interner)
+					.display_type(arg_ty)
+					.unwrap_or_default();
+				let trait_name = self
+					.interner
+					.resolve(
+						self.tir.traits[trait_bound.trait_index as usize]
+							.name
+							.inner,
+					)
+					.unwrap();
+				// Narrow the primary span to whichever argument's declared
+				// type is exactly this type param, if one exists (a
+				// turbofish-only or return-only param has none)
+				let arg_span = self.tir.functions[func_index as usize]
+					.params
+					.iter()
+					.zip(arguments.iter())
+					.find_map(|(param, arg)| {
+						match &self.tir.types[param.ty.inner.as_usize()] {
+							Type::TypeParam { param_index, .. }
+								if *param_index as usize == index =>
+							{
+								Some(arg.span)
+							}
+							_ => None,
+						}
+					})
+					.unwrap_or(call_span);
+				let func_name = self
+					.interner
+					.resolve(self.tir.functions[func_index as usize].name.inner)
+					.unwrap();
+				let func_file_id =
+					self.tir.functions[func_index as usize].file_id;
+				diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::TraitBoundViolation.code())
+						.with_message(format!(
+							"the trait bound `{type_name}: {trait_name}` is not satisfied"
+						))
+						.with_label(
+							Label::primary(
+								ctx.resolve_context.file_id,
+								arg_span,
+							)
+							.with_message(format!(
+								"the trait `{trait_name}` is not implemented for `{type_name}`"
+							)),
+						)
+						.with_label(
+							Label::secondary(func_file_id, trait_bound.span)
+								.with_message(format!(
+									"required by a bound in `{func_name}`"
+								)),
+						),
+				);
+			}
+
+			let Some(param_bound) = param_info.bounds.typeset else {
+				continue;
+			};
+			let satisfied =
+				self.tir.type_in_typeset(arg_ty, param_bound.typeset_index);
+			if !satisfied {
+				let type_name = TypeFormatter::new(&self.tir, self.interner)
+					.display_type(arg_ty)
+					.unwrap_or_default();
+				let set_name = self
+					.interner
+					.resolve(
+						self.tir.typesets[param_bound.typeset_index as usize]
+							.name
+							.inner,
+					)
+					.unwrap();
+				let param_name_str =
+					self.interner.resolve(param_info.name.inner).unwrap();
+				diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::TypesetBoundViolation.code())
+						.with_message(format!(
+							"type `{type_name}` is not a member of typeset `{set_name}`"
+						))
+						.with_label(
+							Label::primary(
+								ctx.resolve_context.file_id,
+								call_span,
+							)
+							.with_message(format!(
+								"`{param_name_str}` requires a type from `{set_name}`"
+							)),
+						),
+				);
+			}
+		}
+		self.tir.diagnostics.extend(diagnostics);
+
 		type_args
 	}
 
@@ -11981,12 +12283,6 @@ impl<'ast> Builder<'ast, '_> {
 					access_ctx.expected_type,
 					expr.span,
 				);
-				self.check_typeset_bounds_on_type_args(
-					func_index,
-					&type_args,
-					ctx.resolve_context.file_id,
-					expr.span,
-				);
 				let return_ty =
 					self.substitute_type(signature.result(), &type_args);
 
@@ -12051,7 +12347,7 @@ impl<'ast> Builder<'ast, '_> {
 					None => false,
 				}
 			}
-			ImplEntry::AssocConstant(_) | ImplEntry::AssocType { .. } => false,
+			ImplEntry::AssocConstant(_) | ImplEntry::AssocType(_) => false,
 		}
 	}
 
@@ -12097,7 +12393,7 @@ impl<'ast> Builder<'ast, '_> {
 				Some(ImplEntry::AssocConstant(ci)) => {
 					constants[ci as usize].accesses.push(span);
 				}
-				Some(ImplEntry::AssocType { .. }) | None => {}
+				Some(ImplEntry::AssocType(_)) | None => {}
 			}
 		}
 	}
@@ -12329,7 +12625,7 @@ impl<'ast> Builder<'ast, '_> {
 					.map(|bound| bound.trait_index)
 				{
 					let entry = match self.tir.traits[trait_index as usize]
-						.members
+						.entries
 						.get(&member_symbol)
 						.cloned()
 					{
@@ -12402,7 +12698,7 @@ impl<'ast> Builder<'ast, '_> {
 						.cloned();
 					let from_trait_default = self.tir.traits
 						[trait_index as usize]
-						.members
+						.entries
 						.get(&member_symbol)
 						.cloned()
 						.filter(|entry| self.entry_has_body(*entry));
@@ -12816,12 +13112,6 @@ impl<'ast> Builder<'ast, '_> {
 			&mut built_arguments,
 			type_args,
 			access_ctx.expected_type,
-			expr.span,
-		);
-		self.check_typeset_bounds_on_type_args(
-			func_index,
-			&inferred_type_args,
-			file_id,
 			expr.span,
 		);
 		let return_ty =
@@ -13243,7 +13533,12 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			expr.ty = target_idx;
 			Ok(())
-		} else if let Some(typeset_index) = self.typeset_bound_for(target_idx) {
+		} else if let Some(typeset_index) = self
+			.tir
+			.type_bounds(target_idx)
+			.and_then(|bounds| bounds.typeset)
+			.map(|typeset_bound| typeset_bound.typeset_index)
+		{
 			let ts = &self.tir.typesets[typeset_index as usize];
 			let range = &ts.intersection_range;
 			let ts_name = self
@@ -13826,8 +14121,10 @@ impl<'ast> Builder<'ast, '_> {
 				// a stale, differently-kinded duplicate.
 				let id = self.tir.memories[0].id;
 				self.ensure_signature(id);
-				let kind = self.tir.memories[0].kind;
-				Ok(self.intern_type(Type::Memory { id, kind }))
+				Ok(self.intern_type(Type::Memory {
+					id,
+					size: self.tir.memories[0].size.inner,
+				}))
 			}
 			_ => {
 				self.tir
@@ -13842,7 +14139,7 @@ impl<'ast> Builder<'ast, '_> {
 		match &self.tir.types[memory.as_usize()].clone() {
 			Type::Memory { id, .. } => {
 				let idx = self.tir.expect_memory_index(*id);
-				self.tir.memories[idx as usize].kind
+				self.tir.memories[idx as usize].size.inner
 			}
 			Type::TypeParam { owner, param_index } => {
 				// Generic `M: Memory` — the index type is `M::Size`.

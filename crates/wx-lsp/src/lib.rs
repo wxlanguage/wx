@@ -1696,7 +1696,7 @@ fn symbol_hover_text(
 			let mi = tir.memory_index(*def_id)? as usize;
 			let memory = &tir.memories[mi];
 			let name = interner.resolve(memory.name.inner).unwrap_or("?");
-			let size_str = fmt.display_type(memory.kind).unwrap();
+			let size_str = fmt.display_type(memory.size.inner).unwrap();
 			Some(format!(
 				"memory {name}: Memory where {{ Size = {size_str} }}"
 			))
@@ -1846,22 +1846,13 @@ fn symbol_hover_text(
 		SymbolKind::Trait(def_id) => {
 			let trait_ = tir.traits.get(tir.trait_index(*def_id)? as usize)?;
 			let name = interner.resolve(trait_.name.inner).unwrap_or("?");
-			let mut s = format!("trait {name}");
-			if !trait_.supertraits.is_empty() {
-				s.push_str(": ");
-				for (i, &st_idx) in trait_.supertraits.iter().enumerate() {
-					if i > 0 {
-						s.push_str(" + ");
-					}
-					let st_name = tir
-						.traits
-						.get(st_idx as usize)
-						.and_then(|t| interner.resolve(t.name.inner))
-						.unwrap_or("?");
-					s.push_str(st_name);
-				}
+			let bounds_str =
+				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
+			if bounds_str.is_empty() {
+				Some(format!("trait {name}"))
+			} else {
+				Some(format!("trait {name}: {bounds_str}"))
 			}
-			Some(s)
 		}
 		SymbolKind::TypeSet(def_id) => {
 			let typeset =

@@ -1002,7 +1002,7 @@ fn test_module_pub_items_and_associated_types() {
 	};
 	assert!(matches!(
 		impl_items[0].inner.inner,
-		ImplItem::AssociatedType { .. }
+		ImplItem::AssocType { .. }
 	));
 }
 

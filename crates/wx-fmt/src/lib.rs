@@ -490,7 +490,10 @@ impl<'a> Builder<'a> {
 				entries,
 			),
 			ast::Item::Memory {
-				name, kind, config, ..
+				name,
+				bound: kind,
+				config,
+				..
 			} => {
 				let name_id = self.symbol(name.inner);
 				let kind_id = self.build_bound_expression(&kind.inner);
@@ -929,7 +932,7 @@ impl<'a> Builder<'a> {
 				nodes.push(self.text(Text::Semi));
 				self.arena.concat(nodes)
 			}
-			ast::ImplItem::AssociatedType { name, ty, .. } => {
+			ast::ImplItem::AssocType { name, ty, .. } => {
 				let type_kw = self.text(Text::TypeKw);
 				let name_sym = self.symbol(name.inner);
 				let eq = self.text(Text::EqSp);
@@ -1540,6 +1543,7 @@ impl<'a> Builder<'a> {
 		expression: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
 		match &expression.inner {
+			ast::Expression::QualifiedPath { .. } => todo!(),
 			ast::Expression::Path(path) => self.build_path_segments(path),
 			ast::Expression::Binary {
 				left,
@@ -2001,6 +2005,7 @@ impl<'a> Builder<'a> {
 		type_expression: &ast::TypeExpression,
 	) -> NodeId {
 		match type_expression {
+			ast::TypeExpression::QualifiedPath { .. } => todo!(),
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
 			ast::TypeExpression::Path(path) => self.build_path_segments(path),
 			ast::TypeExpression::Function { params, result } => {
