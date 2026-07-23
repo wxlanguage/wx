@@ -5875,7 +5875,7 @@ impl<'ast> Builder<'ast, '_> {
 		segs: &[ast::PathSegment],
 		full_span: TextSpan,
 	) -> Result<BoundKind, ()> {
-		debug_assert!(segs.len() > 0);
+		debug_assert!(!segs.is_empty());
 		if segs.len() == 1 {
 			return self.resolve_identifier_as_bound(
 				resolve_context,
