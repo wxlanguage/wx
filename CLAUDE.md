@@ -73,7 +73,7 @@ ScheduledFunction
 WASM bytecode (WasmModule::encode() → Vec<u8>)
 ```
 
-`std/lib.wx` is embedded via `include_str!("../../std/lib.wx")` in `vfs/mod.rs` as `STDLIB_SOURCE` and is always the first file in the `CompilationGraph` (loaded via `CompilationGraphBuilder::load_stdlib()`). It defines the `Memory` trait, `wasm` module intrinsics, `impl char` methods, and stdlib constants.
+`std/main.wx` is embedded via `include_str!("../../std/main.wx")` in `vfs/mod.rs` as `STDLIB_SOURCE` and is always the first file in the `CompilationGraph` (loaded via `CompilationGraphBuilder::load_stdlib()`). It defines the `Memory` trait, `wasm` module intrinsics, `impl char` methods, and stdlib constants.
 
 ## Key modules (`crates/wx-compiler/src/`)
 
@@ -83,7 +83,7 @@ WASM bytecode (WasmModule::encode() → Vec<u8>)
 - **`opt/`** — sea-of-nodes SSA IR for per-function optimization (CSE via `Builder::node`, which delegates to `intern_node`; liveness, scheduling)
 - **`codegen/mod.rs`** — WASM bytecode emitter; `Builder::build` is the entry point
 - **`vfs/`** — `CompilationGraph` and file loading; `VirtualFileSource` for in-memory tests
-- **`../std/lib.wx`** — standard library source (sibling to `src/`), embedded at compile time
+- **`../std/main.wx`** — standard library source (sibling to `src/`), embedded at compile time
 
 The pretty-printer used to live at `fmt/` in this crate; it's now its own crate, `wx-fmt` (`crates/wx-fmt/src/lib.rs`), used by both `wx-cli` (the `format` subcommand) and `wx-lsp` (the LSP formatting request).
 
@@ -136,7 +136,7 @@ Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 18 slots (`ERR
 - Structs, `impl` blocks, `pub fn` methods, `#[inline]` attribute
 - Traits with default method bodies, associated types (`type Size: PointerSize`), associated consts, `impl Trait for Type`
 - Generics / monomorphization — `fn f<T>(t: T) -> T`; `#[inline]` on generic functions is propagated to their mono instances (`mir/tests.rs`, `test_inline_attribute_on_generic_propagated_to_mono_instance`)
-- `module` declarations for multi-file compilation; `pub` visibility for cross-module access
+- `module` declarations for multi-file compilation; Rust-style default visibility — an item without `pub` is visible to its declaring namespace and every descendant namespace, not to ancestors or unrelated modules. Enforced today for name lookup (`use module::*;` wildcard imports) and explicit qualified paths (`module::Item`, both type- and value-position); **not yet enforced** for method calls or struct field access — see Common pitfalls
 - `memory` declarations — `memory heap: Memory32;` lowers to WASM linear memory
 - `import "module" { fn ... }` — WASM imports; `export { fn, global }` — WASM exports (optionally renamed with `as "name"`)
 - `#[intrinsic]` — marks functions in `module wasm { }` as WASM intrinsics (memory ops)
@@ -156,7 +156,7 @@ String literals lower to a `[]u8` slice aggregate `{ StaticPointer, len }`. Stat
 
 ## Testing patterns
 
-Tests live in `#[cfg(test)]` modules at the bottom of each source file. The `TestCase` helper in `tir/tests.rs` and `mir/tests.rs` constructs a `CompilationGraph` (which automatically includes `std/lib.wx`) and runs the pipeline:
+Tests live in `#[cfg(test)]` modules at the bottom of each source file. The `TestCase` helper in `tir/tests.rs` and `mir/tests.rs` constructs a `CompilationGraph` (which automatically includes `std/main.wx`) and runs the pipeline:
 
 ```rust
 // TIR test
@@ -173,11 +173,12 @@ insta::assert_yaml_snapshot!(case.mir);
 let case = TestCase::new_multi_file("src/main.wx", "module math;", &[("src/math.wx", "pub fn add() -> i32 { 1 }")]);
 ```
 
-Snapshot files live in `src/tir/snapshots/` and `src/mir/snapshots/`. Never edit `.snap` files by hand. Any change to `std/lib.wx` shifts byte offsets causing all snapshot tests to fail — regenerate with `INSTA_UPDATE=always`.
+Snapshot files live in `src/tir/snapshots/` and `src/mir/snapshots/`. Never edit `.snap` files by hand. Any change to `std/main.wx` shifts byte offsets causing all snapshot tests to fail — regenerate with `INSTA_UPDATE=always`.
 
 ## Common pitfalls
 
 - **Pre-interned `TypeIndex` ordering:** never insert in the middle of the pre-interned `vec![...]` literal at the top of `tir::builder::build` — every downstream type check silently gets wrong types.
 - **`ensure_signature` re-entrancy:** guarded by `sig_state: HashMap<DefId, SigEntry>` (each entry carries a `ComputeState`); an in-progress state means a cycle. Adding resolution code that calls `ensure_signature` recursively is safe only if cycles are handled.
 - **Cast checking is looser than it looks:** `are_scalar_compatible`/`WasmScalar` equivalence is the gatekeeper for `as` casts, not a numeric-only allowlist — lossy casts like `u32 as char` currently pass (see `tir/builder.rs:9579` TODO). Don't assume the cast surface is fully validated.
-- **`pub fn` only:** impl methods without `pub` are not visible to user code via `Type::method()` call syntax.
+- **Privacy is only enforced at namespace-lookup sites:** `symbol_is_visible`/`is_ancestor_or_self` (`tir/builder.rs`) gate `use module::*;` wildcard imports and explicit `module::Item` qualified paths. Method calls (`obj.method()` and `Type::method()` — both funnel through `resolve_impl_member`) and struct field access are **not** gated yet — don't assume a missing `pub` on an impl method or struct field actually blocks access. This is a missing call, not a missing mechanism: inherent- and trait-impl methods already carry a real `namespace`/`pub_span` on their `Function` entry (same shape `symbol_visibility`'s `SymbolKind::Function` arm already reads), and `StructField` already carries its own `pub_span` and can reuse the parent `Struct`'s `namespace` — wiring these up should be close to a one-line `symbol_is_visible` call at each resolution site, not a data-model change. The one real gap is trait *default-body* methods (no impl override), which live on `tir.traits[..].entries` with no `pub_span` of their own and would need a fallback to the trait's own visibility, mirroring how `SymbolKind::TraitAssocType` already falls back to its trait.
+- **`is_ancestor_or_self`'s `None` hazard:** a namespace's `.parent` is `Option<NamespaceIndex>`, and `None` is overloaded — it means both "the root/binary crate's own top-level scope" (which has no `tir.namespaces` entry) *and* what you get by walking one step past any named crate's own root (whose `parent` is also `None`). Naively walking `.parent` until `None` would let code inside `std` see the binary crate's private root items merely because both chains dead-end at the same `None` value. `is_ancestor_or_self` avoids this by stopping the walk the moment it lands on a namespace that is itself a crate root (`ModuleDeclarationKind::Crate`) without having matched — crossing into a different crate never counts as reaching an ancestor. Any new ancestry-walking code must preserve this.

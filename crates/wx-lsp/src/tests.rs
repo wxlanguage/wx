@@ -861,7 +861,7 @@ fn resolve_uri_finds_virtual_stdlib_module() {
 		.crates
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
-		.find(|m| m.file_path == "lib.wx")
+		.find(|m| m.file_path == "main.wx")
 		.map(|m| m.file_id)
 		.expect("stdlib module should be present in the compiled graph");
 	let uri = crate::file_id_to_uri(&compiled, stdlib_file_id)
@@ -1641,7 +1641,7 @@ fn memory_associated_const_namespace_access_resolves() {
 	// own — `seed_memory_trait_impl_with` copies the `name`/`file_id` of the
 	// `Memory` trait's abstract `const DATA_END: Self::*u8;` straight from
 	// its template, so go-to-definition correctly lands there (in
-	// `std/lib.wx`) rather than anywhere in this test's own source.
+	// `std/main.wx`) rather than anywhere in this test's own source.
 	let SymbolKind::Const(const_id) = found.kind else {
 		unreachable!("checked above");
 	};

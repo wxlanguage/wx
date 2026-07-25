@@ -8,6 +8,57 @@ CLI, and LSP are released in lockstep) rather than per-crate. Editor
 integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
 live in their own repos with independent versioning.
 
+## [0.3.0] - 2026-07-25
+
+### Changed
+
+- **Breaking:** non-`pub` items are now only visible within their
+  declaring namespace and its descendants (Rust-style default-visibility
+  privacy), enforced at wildcard-import and qualified-path resolution in
+  both type and value position, reported as `E1065`. Previously nothing
+  enforced visibility anywhere in the resolver, so code relying on
+  reaching a non-`pub` item through `use module::*` or a qualified path
+  from outside its declaring module — previously silently accepted —
+  now fails to compile.
+
+### Added
+
+- Language: `match` expressions — literal (`int`/`char`/`bool`),
+  `Enum::Variant`, and `_` wildcard patterns, with full exhaustiveness
+  checking (`E1066` for a non-exhaustive match) and a warning for an
+  unreachable arm shadowed by an earlier identical pattern (`W1010`).
+  Codegen picks between a WASM `br_table` (dense patterns) and a
+  right-nested if/else chain (sparse), decided once during optimizer
+  construction. See
+  `devlog/2026-07-21-match-expression-and-br-table.md` for the full
+  pipeline walkthrough.
+- Language: qualified-path syntax — `<Type as Trait>::item` and
+  `<Type>::item`, in both expression and type position, to disambiguate
+  a name across multiple bounds/impls (e.g. two traits in scope
+  declaring the same method or associated type).
+- Language: `where { Assoc: Bound }` clauses — a generic function can
+  now require one of its type parameter's associated types to satisfy a
+  trait or typeset that the type parameter's own bound doesn't declare,
+  enforced both at the function's call sites and at `impl`-declaration
+  time.
+- Std: `size_of`, `memory_grow`, and other `wasm`-module intrinsics are
+  now `pub`, since example code calls them directly and the new privacy
+  enforcement would otherwise reject that.
+
+### Fixed
+
+- A `break`/`continue` exiting a loop could bypass that loop's own
+  "commit loop-carried locals" tail code, silently losing a mutation
+  made immediately before the early exit — found while testing `match`
+  inside a loop, but not itself match-specific.
+- Sea-of-nodes builder: a dense (`br_table`) match's per-slot arm-value
+  merge left dead `Phi` nodes for every divergent slot but the last, and
+  panicked outright if a divergent slot's value was a struct instead of
+  a scalar. A sparse match lowered through the if/else-chain path also
+  recursed one Rust call-stack frame per arm, bounding realistic arm
+  counts far below what dense matches could already handle; that path is
+  now iterative.
+
 ## [0.2.0] - 2026-07-20
 
 ### Changed

@@ -1,5 +1,9 @@
 # Session Index
 
+## 2026-07-21
+
+- [2026-07-21-match-expression-and-br-table.md](2026-07-21-match-expression-and-br-table.md) — `match` expressions added end-to-end (AST reuses `->`, TIR patterns + exhaustiveness, MIR `Switch` kept as a genuine N-way node, Opt decides `br_table` vs. `if`/`else` chain once via `should_use_br_table`, Scheduler `emit_switch_br_table`, Codegen `BrTable` opcode); two `Block::parent` depth-chain off-by-one bugs found and fixed via wasmtime execution testing; unrelated pre-existing `break`/`continue` loop-param commit bug found and fixed along the way
+
 ## 2026-06-24
 
 - [2026-06-24-vscode-extension-setup.md](2026-06-24-vscode-extension-setup.md) — CI publish workflow (cross-platform `.vsix`), `ExtensionMode`-based binary resolution, actionable error messages, config-change restart, FileSystemWatcher leak fix, tmLanguage keyword scope split, pointer/deref highlighting

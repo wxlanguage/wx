@@ -90,10 +90,7 @@ fn cmd_lsp() {
 	tokio::runtime::Builder::new_current_thread()
 		.build()
 		.unwrap()
-		.block_on(wx_lsp::run_stdio(
-			tokio::io::stdin(),
-			tokio::io::stdout(),
-		));
+		.block_on(wx_lsp::run_stdio(tokio::io::stdin(), tokio::io::stdout()));
 }
 
 enum MessageFormat {
