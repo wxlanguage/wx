@@ -950,6 +950,34 @@ fn test_if_without_else_unit_body_is_ok() {
 	no_errors(&case);
 }
 
+#[test]
+fn test_if_bad_condition_still_checks_branches() {
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            if undefined_var { undefined_then(); } else { undefined_else(); }
+        }
+    "});
+	let count = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::UndeclaredIdentifier.code())
+		})
+		.count();
+	assert_eq!(
+		count,
+		3,
+		"expected an UndeclaredIdentifier for the condition and each branch, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
 // ── chained (nested) comptime binary expressions ─────────────────────────
 
 #[test]

@@ -11181,14 +11181,21 @@ impl<'ast> Builder<'ast, '_> {
 		expr_span: TextSpan,
 		label: Option<LabelIndex>,
 	) -> Result<Expression, ()> {
-		let condition = self.build_expression(
+		let condition = match self.build_expression(
 			ctx,
 			AccessContext {
 				expected_type: TypeIndex::BOOL,
 				access_kind: AccessKind::Read,
 			},
 			condition,
-		)?;
+		) {
+			Ok(expr) => expr,
+			Err(_) => Expression {
+				kind: ExprKind::Error,
+				ty: TypeIndex::ERROR,
+				span: condition.span,
+			},
+		};
 
 		let mut then_block = ctx.enter_block(
 			BlockScope {
