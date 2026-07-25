@@ -352,6 +352,7 @@ pub struct Trait {
 	pub id: ast::DefId,
 	pub file_id: FileId,
 	pub namespace: Option<NamespaceIndex>,
+	pub pub_span: Option<TextSpan>,
 	pub name: ast::Spanned<SymbolU32>,
 	/// The implicit `Self` type parameter owned by this trait. All trait
 	/// methods inherit it via `type_param_parent = TypeParamOwner::Trait(idx)`.
@@ -1233,10 +1234,24 @@ pub enum FunctionKind {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitBound {
 	pub trait_index: TraitIndex,
-	/// Resolved RHS types from `where { AssocType = RhsType }` bindings,
-	/// sorted by assoc-type name for deterministic equality.
-	pub bindings: Box<[(SymbolU32, TypeIndex)]>,
+	/// Resolved RHS of each `where { AssocType = RhsType }` / `where {
+	/// AssocType: Bound }` binding, sorted by assoc-type name for
+	/// deterministic equality. At most one entry per name — `resolve_bounds`
+	/// rejects a second binding for the same associated type regardless of
+	/// which kind either one is, so a name can never appear twice here.
+	pub bindings: Box<[(SymbolU32, AssocBindingKind)]>,
 	pub span: TextSpan,
+}
+
+/// The right-hand side of one `TraitBound` binding.
+#[derive(Clone)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum AssocBindingKind {
+	/// `AssocType = RhsType`.
+	Equals(TypeIndex),
+	/// `AssocType: Bound`.
+	Bound(Bounds),
 }
 
 #[derive(Clone, Copy)]
@@ -1434,6 +1449,8 @@ define_diagnostic_codes! {
 		DuplicateTraitImpl => "E1061",
 		InvalidImplTarget => "E1062",
 		TraitBoundViolation => "E1063",
+		DuplicateAssocTypeBinding => "E1064",
+		PrivateItem => "E1065",
 	}
 }
 
@@ -1829,11 +1846,34 @@ impl<'a> TypeFormatter<'a> {
 				Ok(())
 			}
 			Type::AssocTypeProjection {
-				assoc_name, base, ..
+				trait_index,
+				assoc_name,
+				base,
 			} => {
-				let (assoc_name, base) = (*assoc_name, *base);
-				self.write_type(f, base)?;
-				f.write_str("::")?;
+				let (trait_index, assoc_name, base) =
+					(*trait_index, *assoc_name, *base);
+				// `trait_index` already disambiguates the *type* — this is
+				// purely about whether the unqualified *spelling*
+				// `base::assoc_name` would read as ambiguous to someone
+				// looking at `base`'s own bounds (i.e. more than one bound
+				// trait declares an assoc type with this name), in which
+				// case spell out which one via `<base as Trait>::assoc_name`
+				// instead, matching rustc's own qualified-path printing.
+				if self.tir.assoc_type_bound_is_ambiguous(base, assoc_name) {
+					f.write_str("<")?;
+					self.write_type(f, base)?;
+					f.write_str(" as ")?;
+					self.interner
+						.resolve(
+							self.tir.traits[trait_index as usize].name.inner,
+						)
+						.ok_or(std::fmt::Error)
+						.and_then(|trait_name| f.write_str(trait_name))?;
+					f.write_str(">::")?;
+				} else {
+					self.write_type(f, base)?;
+					f.write_str("::")?;
+				}
 				self.interner
 					.resolve(assoc_name)
 					.ok_or(std::fmt::Error)
@@ -1864,7 +1904,7 @@ impl<'a> TypeFormatter<'a> {
 				.and_then(|name| f.write_str(name))?;
 			if !trait_bound.bindings.is_empty() {
 				f.write_str(" where { ")?;
-				for (i, (assoc_name, assoc_type)) in
+				for (i, (assoc_name, kind)) in
 					trait_bound.bindings.iter().enumerate()
 				{
 					if i > 0 {
@@ -1874,8 +1914,16 @@ impl<'a> TypeFormatter<'a> {
 						.resolve(*assoc_name)
 						.ok_or(std::fmt::Error)
 						.and_then(|name| f.write_str(name))?;
-					f.write_str(" = ")?;
-					self.write_type(f, *assoc_type)?;
+					match kind {
+						AssocBindingKind::Equals(ty) => {
+							f.write_str(" = ")?;
+							self.write_type(f, *ty)?;
+						}
+						AssocBindingKind::Bound(bound) => {
+							f.write_str(": ")?;
+							self.write_bounds(f, bound)?;
+						}
+					}
 				}
 				f.write_str(" }")?;
 			}
@@ -2505,26 +2553,6 @@ impl TIR {
 		}
 	}
 
-	/// Returns the typeset bound for any type that can carry one:
-	/// `TypeParam` (via its `typeset_bound` field) or `AssocTypeProjection`
-	/// (via the trait's associated-type `typeset_bound`).
-	fn type_bounds(&self, ty: TypeIndex) -> Option<&Bounds> {
-		match &self.types[ty.as_usize()] {
-			Type::TypeParam { owner, param_index } => Some(
-				&self.type_param_info(*owner, *param_index as usize).bounds,
-			),
-			Type::AssocTypeProjection {
-				trait_index,
-				assoc_name,
-				..
-			} => self.traits[*trait_index as usize]
-				.assoc_types
-				.get(assoc_name)
-				.map(|assoc_type| &assoc_type.bounds),
-			_ => None,
-		}
-	}
-
 	/// `ty`'s own declared bounds, for the two kinds of type that carry
 	/// bounds without being concrete yet — a `TypeParam` (a function's or
 	/// impl's own generic param) or an `AssocTypeProjection` (`Self::M`,
@@ -2540,13 +2568,83 @@ impl TIR {
 			Type::AssocTypeProjection {
 				trait_index,
 				assoc_name,
-				..
-			} => self.traits[*trait_index as usize]
-				.assoc_types
-				.get(assoc_name)
-				.map(|at| &at.bounds),
+				base,
+			} => {
+				// `base`'s own bounds may already carry a fully-resolved
+				// entry for this exact assoc type — e.g. `Mem: Memory where
+				// { Size: UnsignedInt }` stores the *merge* of `Memory::
+				// Size`'s own `PointerSize` bound with `UnsignedInt` on
+				// `Mem`'s `TraitBound.bindings`, computed once when that
+				// `where` clause was resolved (see `resolve_bounds`'s
+				// `AssocTypeBindingKind::Bound` arm). Preferring that over
+				// the bare trait declaration is what lets a projection see
+				// bounds a plain `type Size: PointerSize` alone never could
+				// — and since it's already the complete, merged picture,
+				// there's nothing left to combine here, just a lookup. A
+				// `= Type` (rather than `: Bound`) entry for this name means
+				// the where clause pinned the type down exactly instead of
+				// adding a bound — nothing for this query to report.
+				let from_where_clause = self
+					.abstract_type_bounds(*base)
+					.and_then(|base_bounds| {
+						base_bounds
+							.traits
+							.iter()
+							.find(|b| b.trait_index == *trait_index)
+					})
+					.and_then(|b| {
+						b.bindings.iter().find_map(|(name, kind)| {
+							match (name == assoc_name, kind) {
+								(true, AssocBindingKind::Bound(bounds)) => {
+									Some(bounds)
+								}
+								_ => None,
+							}
+						})
+					});
+				from_where_clause.or_else(|| {
+					self.traits[*trait_index as usize]
+						.assoc_types
+						.get(assoc_name)
+						.map(|at| &at.bounds)
+				})
+			}
 			_ => None,
 		}
+	}
+
+	/// Would `Base::name` be ambiguous if printed unqualified — i.e. do more
+	/// than one of `base`'s own declared bounds (see
+	/// [`TIR::abstract_type_bounds`]) declare an associated type named
+	/// `name`? Used by [`TypeFormatter`] to decide between `Base::name` and
+	/// `<Base as Trait>::name` when displaying a
+	/// [`Type::AssocTypeProjection`] — the projection's own `trait_index`
+	/// already disambiguates the *type*, this only asks whether the
+	/// *unqualified spelling* would read as ambiguous to someone looking at
+	/// `base`'s bounds. Short-circuits after the second match, and — unlike
+	/// a version built on `bound_trait_indices`-style helpers that collect a
+	/// list first — never allocates, since the two paths that would ever
+	/// call this (formatting a type, not resolving one) never need to
+	/// interleave a mutable call partway through.
+	fn assoc_type_bound_is_ambiguous(
+		&self,
+		base: TypeIndex,
+		name: SymbolU32,
+	) -> bool {
+		let Some(bounds) = self.abstract_type_bounds(base) else {
+			return false;
+		};
+		bounds
+			.traits
+			.iter()
+			.filter(|bound| {
+				matches!(
+					self.traits[bound.trait_index as usize].entries.get(&name),
+					Some(ImplEntry::AssocType(_))
+				)
+			})
+			.nth(1)
+			.is_some()
 	}
 
 	/// True when concrete `ty` is a member of the given typeset.

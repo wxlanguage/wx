@@ -1543,7 +1543,19 @@ impl<'a> Builder<'a> {
 		expression: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
 		match &expression.inner {
-			ast::Expression::QualifiedPath { .. } => todo!(),
+			ast::Expression::QualifiedPath { root, segments } => {
+				let self_type_node =
+					self.build_type_expression(&root.self_type.inner);
+				self.build_qualified_path(
+					self_type_node,
+					Some(&root.trait_path),
+					segments,
+				)
+			}
+			ast::Expression::Grouped { inner, segments } => {
+				let inner_node = self.build_type_expression(&inner.inner);
+				self.build_qualified_path(inner_node, None, segments)
+			}
 			ast::Expression::Path(path) => self.build_path_segments(path),
 			ast::Expression::Binary {
 				left,
@@ -1957,6 +1969,28 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
+	/// Formats `<self_type_node [as trait_segments]>::segments` — shared by
+	/// `QualifiedPath` (`<Type as Trait>::Item`, `trait_segments: Some`) and
+	/// `Grouped` (`<Type>::Item`, `trait_segments: None`) in both type
+	/// position and expression position, which differ only in how
+	/// `self_type_node` itself was built.
+	fn build_qualified_path(
+		&mut self,
+		self_type_node: NodeId,
+		trait_segments: Option<&[ast::PathSegment]>,
+		segments: &[ast::PathSegment],
+	) -> NodeId {
+		let mut items: Vec<NodeId> = vec![self.text(Text::Lt), self_type_node];
+		if let Some(trait_segments) = trait_segments {
+			items.push(self.text(Text::As));
+			items.push(self.build_path_segments(trait_segments));
+		}
+		items.push(self.text(Text::Gt));
+		items.push(self.text(Text::ColonColon));
+		items.push(self.build_path_segments(segments));
+		self.arena.concat(items)
+	}
+
 	fn build_bound_expression(
 		&mut self,
 		bound: &ast::BoundExpression,
@@ -1974,9 +2008,20 @@ impl<'a> Builder<'a> {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
 					let key = self.symbol(binding.name.inner);
-					let eq = self.text(Text::EqSp);
-					let ty = self.build_type_expression(&binding.ty.inner);
-					binding_parts.push(self.arena.concat3(key, eq, ty));
+					let rhs = match &binding.kind {
+						ast::AssocTypeBindingKind::Equals(ty) => {
+							let eq = self.text(Text::EqSp);
+							let ty = self.build_type_expression(&ty.inner);
+							self.arena.concat2(eq, ty)
+						}
+						ast::AssocTypeBindingKind::Bound(bound) => {
+							let colon = self.text(Text::ColonSp);
+							let bound =
+								self.build_bound_expression(&bound.inner);
+							self.arena.concat2(colon, bound)
+						}
+					};
+					binding_parts.push(self.arena.concat2(key, rhs));
 				}
 				let bindings_concat = self.arena.concat(binding_parts);
 				self.arena.concat5(
@@ -2005,7 +2050,19 @@ impl<'a> Builder<'a> {
 		type_expression: &ast::TypeExpression,
 	) -> NodeId {
 		match type_expression {
-			ast::TypeExpression::QualifiedPath { .. } => todo!(),
+			ast::TypeExpression::QualifiedPath { root, segments } => {
+				let self_type_node =
+					self.build_type_expression(&root.self_type.inner);
+				self.build_qualified_path(
+					self_type_node,
+					Some(&root.trait_path),
+					segments,
+				)
+			}
+			ast::TypeExpression::Grouped { inner, segments } => {
+				let inner_node = self.build_type_expression(&inner.inner);
+				self.build_qualified_path(inner_node, None, segments)
+			}
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
 			ast::TypeExpression::Path(path) => self.build_path_segments(path),
 			ast::TypeExpression::Function { params, result } => {

@@ -1949,7 +1949,7 @@ fn test_memory_grow_and_size() {
             heap.size()
         }
 
-        fn grow_by(delta: u32) -> u32 {
+        fn grow_by(delta: u32) -> i32 {
             heap.grow(delta)
         }
 
@@ -1967,7 +1967,7 @@ fn test_memory_grow_and_size() {
 		.get_typed_func::<(), u32>(&mut store, "size_pages")
 		.expect("size_pages not found");
 	let grow_by = instance
-		.get_typed_func::<u32, u32>(&mut store, "grow_by")
+		.get_typed_func::<u32, i32>(&mut store, "grow_by")
 		.expect("grow_by not found");
 
 	// Initial size is 1 page (64 KB).
@@ -2661,7 +2661,7 @@ fn test_memory64_size_grow_and_static_data() {
         memory heap: Memory where { Size = u64 } { min_pages: 1 };
 
         fn size_pages() -> u64 { heap.size() }
-        fn grow_one() -> u64 { heap.grow(1) }
+        fn grow_one() -> i64 { heap.grow(1) }
         fn msg() -> heap::[]u8 { \"hello\" }
         fn data_end() -> heap::*u8 { heap::DATA_END }
 
@@ -2679,7 +2679,7 @@ fn test_memory64_size_grow_and_static_data() {
 		.get_typed_func::<(), u64>(&mut store, "size_pages")
 		.unwrap();
 	let grow_one = instance
-		.get_typed_func::<(), u64>(&mut store, "grow_one")
+		.get_typed_func::<(), i64>(&mut store, "grow_one")
 		.unwrap();
 	let msg = instance
 		.get_typed_func::<(), (u64, u64)>(&mut store, "msg")

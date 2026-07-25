@@ -1129,13 +1129,21 @@ pub enum Expression {
 	/// Replaces bare `Identifier`, `NamespaceAccess`, and path-typed
 	/// `TypeApplication` as the canonical representation for named references.
 	Path(Box<[PathSegment]>),
-	/// `<Type as Trait>::item` or `<Type>::item` — a qualified path pinning
-	/// down exactly which trait's item is meant. Composes with the usual
-	/// postfix grammar (`Call`, `ObjectAccess`, `Index`) like any other
-	/// primary expression, e.g. `<Type as Trait>::method(x)`.
+	/// `<Type as Trait>::item` — a qualified path pinning down exactly
+	/// which trait's item is meant. Composes with the usual postfix grammar
+	/// (`Call`, `ObjectAccess`, `Index`) like any other primary expression,
+	/// e.g. `<Type as Trait>::method(x)`.
 	QualifiedPath {
-		self_type: Box<Spanned<TypeExpression>>,
-		trait_path: Option<Box<[PathSegment]>>,
+		root: QualifiedPathRoot,
+		segments: Box<[PathSegment]>,
+	},
+	/// `<Type>::item` — a bare bracketed type used as a path root, with no
+	/// trait qualification. Distinct from `QualifiedPath`: this doesn't
+	/// disambiguate anything (it resolves exactly like the unbracketed
+	/// `Type::item` would), it's purely for self-types that can't be
+	/// written as a plain path segment (e.g. `<[T]>::method()`).
+	Grouped {
+		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
 	/// `Name::{ field: expr }` or `module::Name::<T>::{ field: expr }`
@@ -1201,13 +1209,28 @@ pub struct PathSegment {
 	pub type_args: Box<[Spanned<TypeExpression>]>,
 }
 
+/// The `<Type as Trait>` clause of a qualified path (`<Type as
+/// Trait>::item`) — its own struct so the whole bracketed clause, the site
+/// of a "trait not implemented" error, carries one precise span (exactly
+/// `<self_type as trait_path>`, not including the trailing `::item`) rather
+/// than that span having to be reconstructed from separately-threaded
+/// pieces at every diagnostic call site.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct QualifiedPathRoot {
+	pub self_type: Box<Spanned<TypeExpression>>,
+	pub trait_path: Box<[PathSegment]>,
+	pub span: TextSpan,
+}
+
 /// A trait or typeset bound expression.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum BoundExpression {
 	/// `Trait` or `module::Trait`
 	Path(Box<[PathSegment]>),
-	/// `Memory where { Size = u32 }` — trait bound with associated-type bindings.
+	/// `Memory where { Size = u32, Size: UnsignedInt }` — trait bound with
+	/// associated-type bindings.
 	WithBindings {
 		path: Box<BoundExpression>,
 		bindings: Box<[AssocTypeBinding]>,
@@ -1245,12 +1268,23 @@ pub struct FunctionTypeParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// `Size = u32` inside a `where { }` block — binds an associated type.
+/// `Size = u32` (equality) or `Size: UnsignedInt` (bound) inside a `where {
+/// }` block — constrains an associated type.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct AssocTypeBinding {
 	pub name: Spanned<SymbolU32>,
-	pub ty: Spanned<TypeExpression>,
+	pub kind: AssocTypeBindingKind,
+}
+
+/// The right-hand side of an [`AssocTypeBinding`].
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum AssocTypeBindingKind {
+	/// `Size = u32` — the associated type must equal exactly this type.
+	Equals(Spanned<TypeExpression>),
+	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
+	Bound(Spanned<BoundExpression>),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1297,14 +1331,20 @@ pub enum TypeExpression {
 		name: Spanned<SymbolU32>,
 		args: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
-	/// `<Type as Trait>::Item` or `<Type>::Item` — a qualified path that
-	/// pins down exactly which trait's item is meant, disambiguating a name
-	/// that would otherwise be ambiguous (or first-match) across multiple
-	/// bounds/impls on `self_type`. `trait_path` is `None` for the
-	/// unqualified `<Type>::Item` form.
+	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
+	/// which trait's item is meant, disambiguating a name that would
+	/// otherwise be ambiguous (or first-match) across multiple bounds/impls
+	/// on `self_type`.
 	QualifiedPath {
-		self_type: Box<Spanned<TypeExpression>>,
-		trait_path: Option<Box<[PathSegment]>>,
+		root: QualifiedPathRoot,
+		segments: Box<[PathSegment]>,
+	},
+	/// `<Type>::Item` — a bare bracketed type used as a path root, with no
+	/// trait qualification. See `Expression::Grouped` for why this is kept
+	/// distinct from `QualifiedPath` rather than making its `trait_path`
+	/// optional.
+	Grouped {
+		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
 }
@@ -2557,9 +2597,10 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// Parse `where { Name = Type, ... }` — the bindings block following a type.
-	/// Returns a `Spanned` whose span covers from `{` through `}`.
-	/// The `where` keyword must already be confirmed as the next token by the caller.
+	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
+	/// following a type. Returns a `Spanned` whose span covers from `{`
+	/// through `}`. The `where` keyword must already be confirmed as the next
+	/// token by the caller.
 	fn parse_where_bindings(
 		&mut self,
 	) -> Result<Spanned<Box<[AssocTypeBinding]>>, ()> {
@@ -2589,10 +2630,14 @@ impl<'ctx> Parser<'ctx> {
 				inner: self.intern_identifier(name_span),
 				span: name_span,
 			};
-			self.next_expect(Token::Eq)?;
-			let ty = self.parse_type_expression()?;
+			let kind = if self.lexer.next_if(Token::Colon).is_some() {
+				AssocTypeBindingKind::Bound(self.parse_bounds_expression()?)
+			} else {
+				self.next_expect(Token::Eq)?;
+				AssocTypeBindingKind::Equals(self.parse_type_expression()?)
+			};
 			self.lexer.next_if(Token::Comma);
-			bindings.push(AssocTypeBinding { name, ty });
+			bindings.push(AssocTypeBinding { name, kind });
 		};
 
 		Ok(Spanned {
@@ -2887,32 +2932,46 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
-	/// Parse `<Type as Trait>::Item` or `<Type>::Item` — a qualified path
-	/// that pins down exactly which trait's item is meant. The opening `<`
-	/// is not yet consumed.
+	/// Parse `<Type as Trait>::Item` (a trait-qualified path) or `<Type>::Item`
+	/// (a bare bracketed self-type, no trait) — the opening `<` is not yet
+	/// consumed. Which one this becomes hinges entirely on whether `as`
+	/// follows `self_type`.
 	fn parse_qualified_path_type_expression(
 		&mut self,
 	) -> Result<Spanned<TypeExpression>, ()> {
 		let open_span = self.lexer.next().span; // consume `<`
 		let self_type = self.parse_type_expression()?;
-		let trait_path = if matches!(self.peek_keyword(), Some(Keyword::As)) {
+		if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
-			Some(self.parse_path_segments()?.inner)
+			let trait_path = self.parse_path_segments()?;
+			let close_span = self.expect_close_angle(open_span);
+			self.next_expect(Token::ColonColon)?;
+			let segments = self.parse_path_segments()?;
+			let span = TextSpan::new(open_span.start, segments.span.end);
+			Ok(Spanned {
+				inner: TypeExpression::QualifiedPath {
+					root: QualifiedPathRoot {
+						self_type: Box::new(self_type),
+						trait_path: trait_path.inner,
+						span: TextSpan::new(open_span.start, close_span.end),
+					},
+					segments: segments.inner,
+				},
+				span,
+			})
 		} else {
-			None
-		};
-		self.expect_close_angle(open_span);
-		self.next_expect(Token::ColonColon)?;
-		let segments = self.parse_path_segments()?;
-		let span = TextSpan::new(open_span.start, segments.span.end);
-		Ok(Spanned {
-			inner: TypeExpression::QualifiedPath {
-				self_type: Box::new(self_type),
-				trait_path,
-				segments: segments.inner,
-			},
-			span,
-		})
+			self.expect_close_angle(open_span);
+			self.next_expect(Token::ColonColon)?;
+			let segments = self.parse_path_segments()?;
+			let span = TextSpan::new(open_span.start, segments.span.end);
+			Ok(Spanned {
+				inner: TypeExpression::Grouped {
+					inner: Box::new(self_type),
+					segments: segments.inner,
+				},
+				span,
+			})
+		}
 	}
 
 	fn parse_slice_or_array_type_expression(
@@ -3273,36 +3332,50 @@ impl<'ctx> Parser<'ctx> {
 		Ok(left)
 	}
 
-	/// Parse `<Type as Trait>::item` or `<Type>::item` in expression
+	/// Parse `<Type as Trait>::item` (a trait-qualified path) or
+	/// `<Type>::item` (a bare bracketed self-type, no trait) in expression
 	/// position — the expression-side twin of
-	/// `parse_qualified_path_type_expression`. The opening `<` is not yet
-	/// consumed. Ordinary postfix parsing (`Call`, `ObjectAccess`, `Index`)
-	/// applies on top of the returned expression via the normal Pratt loop,
-	/// so `<Type as Trait>::method(x)` needs no extra handling here.
+	/// `parse_qualified_path_type_expression`; see its doc comment for how
+	/// the two forms are told apart. The opening `<` is not yet consumed.
+	/// Ordinary postfix parsing (`Call`, `ObjectAccess`, `Index`) applies on
+	/// top of the returned expression via the normal Pratt loop, so `<Type
+	/// as Trait>::method(x)` needs no extra handling here.
 	fn parse_qualified_path_expression(
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let open_span = parser.lexer.next().span; // consume `<`
 		let self_type = parser.parse_type_expression()?;
-		let trait_path = if matches!(parser.peek_keyword(), Some(Keyword::As))
-		{
+		if matches!(parser.peek_keyword(), Some(Keyword::As)) {
 			parser.lexer.next(); // consume `as`
-			Some(parser.parse_path_segments()?.inner)
+			let trait_path = parser.parse_path_segments()?;
+			let close_span = parser.expect_close_angle(open_span);
+			parser.next_expect(Token::ColonColon)?;
+			let segments = parser.parse_path_segments()?;
+			let span = TextSpan::new(open_span.start, segments.span.end);
+			Ok(Spanned {
+				inner: Expression::QualifiedPath {
+					root: QualifiedPathRoot {
+						self_type: Box::new(self_type),
+						trait_path: trait_path.inner,
+						span: TextSpan::new(open_span.start, close_span.end),
+					},
+					segments: segments.inner,
+				},
+				span,
+			})
 		} else {
-			None
-		};
-		parser.expect_close_angle(open_span);
-		parser.next_expect(Token::ColonColon)?;
-		let segments = parser.parse_path_segments()?;
-		let span = TextSpan::new(open_span.start, segments.span.end);
-		Ok(Spanned {
-			inner: Expression::QualifiedPath {
-				self_type: Box::new(self_type),
-				trait_path,
-				segments: segments.inner,
-			},
-			span,
-		})
+			parser.expect_close_angle(open_span);
+			parser.next_expect(Token::ColonColon)?;
+			let segments = parser.parse_path_segments()?;
+			let span = TextSpan::new(open_span.start, segments.span.end);
+			Ok(Spanned {
+				inner: Expression::Grouped {
+					inner: Box::new(self_type),
+					segments: segments.inner,
+				},
+				span,
+			})
+		}
 	}
 
 	fn parse_path_expression(

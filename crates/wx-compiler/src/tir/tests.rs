@@ -2217,6 +2217,439 @@ fn test_two_trait_impls_with_colliding_method_name_is_ambiguous() {
 }
 
 #[test]
+fn test_qualified_path_expression_disambiguates_trait_method() {
+	// Same setup as `test_two_trait_impls_with_colliding_method_name_is_ambiguous`
+	// (`S` implements both `A` and `B`, each with a colliding `foo`), but
+	// calling through `<S as A>::foo(s)` / `<S as B>::foo(s)` instead of
+	// `s.foo()` — the qualified path pins down which trait's method is
+	// meant, so neither call should be ambiguous.
+	let case = TestCase::new(indoc! {"
+        trait A {
+            fn foo(self) -> i32;
+        }
+
+        trait B {
+            fn foo(self) -> i32;
+        }
+
+        struct S {}
+
+        impl A for S {
+            fn foo(self) -> i32 { 1 }
+        }
+
+        impl B for S {
+            fn foo(self) -> i32 { 2 }
+        }
+
+        fn use_a(s: S) -> i32 {
+            <S as A>::foo(s)
+        }
+
+        fn use_b(s: S) -> i32 {
+            <S as B>::foo(s)
+        }
+
+        export { use_a, use_b }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_qualified_path_type_position_assoc_type_projection() {
+	// The motivating example: `<Mem::Size as Unsigned>::Signed` in a
+	// generic function's return type, where `Mem::Size` is itself an
+	// `AssocTypeProjection` (via `Mem: Memory`) rather than a plain type
+	// param — exercises `resolve_required_trait_member_type`'s
+	// `AssocTypeProjection` branch, which searches the bounds declared on
+	// the associated type (`type Size: Unsigned`) rather than impls.
+	let case = TestCase::new(indoc! {"
+        trait Unsigned {
+            type Signed;
+        }
+        trait Memory {
+            type Size: Unsigned;
+        }
+        struct Mem32 {}
+        impl Memory for Mem32 {
+            type Size = u32;
+        }
+        impl Unsigned for u32 {
+            type Signed = i32;
+        }
+        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+            unreachable
+        }
+        fn grow_concrete(mem: Mem32, delta: u32) -> i32 {
+            grow(mem, delta)
+        }
+        export { grow_concrete }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_qualified_path_trait_not_implemented_is_error() {
+	// `Empty` never implements `Greeter` at all — `<Empty as
+	// Greeter>::greet` should report the same "trait bound not satisfied"
+	// diagnostic as an ordinary unsatisfied bound, not a generic
+	// undeclared-item error.
+	let case = TestCase::new(indoc! {"
+        trait Greeter {
+            fn greet(self) -> u32;
+        }
+        struct Empty {}
+        fn use_it(e: Empty) -> u32 {
+            <Empty as Greeter>::greet(e)
+        }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_qualified_path_no_such_member_is_error() {
+	// `Thing` does implement `Other`, but `Other` has no `greet` member —
+	// distinct from the "not implemented at all" case above, and should be
+	// reported with the same code the unqualified "no associated item"
+	// fallback already uses.
+	let case = TestCase::new(indoc! {"
+        trait Other {
+            fn shout(self) -> u32;
+        }
+        struct Thing {}
+        impl Other for Thing {
+            fn shout(self) -> u32 { 3 }
+        }
+        fn use_it(t: Thing) -> u32 {
+            <Thing as Other>::greet(t)
+        }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"expected an undeclared-identifier diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_qualified_path_type_param_not_bound_is_error() {
+	// `T` is bound by `A` but not `B` — `<T as B>::foo` should report that
+	// `T` doesn't satisfy `B`, exercising
+	// `resolve_trait_member`/`build_required_trait_member_expression`'s
+	// `Type::TypeParam` branch rather than the concrete-type one.
+	let case = TestCase::new(indoc! {"
+        trait A {
+            fn foo(self) -> i32;
+        }
+        trait B {
+            fn foo(self) -> i32;
+        }
+        fn use_it<T: A>(x: T) -> i32 {
+            <T as B>::foo(x)
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_qualified_path_trait_not_satisfied_span_covers_bracket_only() {
+	// Regression test: the "trait bound not satisfied" diagnostic for
+	// `<Mem::Size as Unsigned>::Signed` used to point at `Signed` (the
+	// unrelated final segment) instead of the `<Mem::Size as Unsigned>`
+	// clause that's actually wrong — `Mem::Size` (i.e. `Memory::Size`)
+	// never declared an `Unsigned` bound. The primary label's span must
+	// cover exactly the bracketed `<...>` clause, not the trailing
+	// `::Signed`.
+	let source = indoc! {"
+        trait Unsigned {
+            type Signed;
+        }
+        trait Memory {
+            type Size;
+        }
+        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+            unreachable
+        }
+        export { }
+    "};
+	let case = TestCase::new(source);
+	let diag = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())
+		})
+		.expect("expected a trait-bound-violation diagnostic");
+
+	let prefix_len = "use std::*;\n".len();
+	let bracket_start =
+		prefix_len + source.find("<Mem::Size as Unsigned>").unwrap();
+	let bracket_end = bracket_start + "<Mem::Size as Unsigned>".len();
+
+	let primary = diag
+		.labels
+		.iter()
+		.find(|l| {
+			l.style == codespan_reporting::diagnostic::LabelStyle::Primary
+		})
+		.expect("missing primary label");
+	assert_eq!(
+		primary.range,
+		bracket_start..bracket_end,
+		"expected the primary label to span exactly `<Mem::Size as Unsigned>`, not include `::Signed`"
+	);
+}
+
+#[test]
+fn test_qualified_path_grouped_form_resolves_like_unqualified_path() {
+	// `<Type>::item` (no `as Trait`) — the bare bracketed-self-type form,
+	// kept as its own `Grouped` AST node distinct from `QualifiedPath`
+	// (which always requires a trait). Exercised in both type position (a
+	// return type) and expression position (a call), and should resolve
+	// exactly like the unbracketed `Type::item` would — no errors, no
+	// disambiguation involved.
+	let case = TestCase::new(indoc! {"
+        trait Container {
+            type Item;
+            fn get(self) -> Self::Item;
+        }
+        struct Boxed {}
+        impl Container for Boxed {
+            type Item = u32;
+            fn get(self) -> u32 { 42 }
+        }
+        fn use_it<T: Container>(x: T) -> <T>::Item {
+            <T>::get(x)
+        }
+        export { }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_qualified_path_assoc_type_projection_recovers_type_despite_unsatisfied_bound()
+ {
+	// Generic regression case: `Mem::Item` never declares `Converter` in its
+	// own bounds (`type Item;`, no `: Converter`), so
+	// `<Mem::Item as Converter>::Output` reports a trait-bound-violation —
+	// but `Converter` *does* declare an `Output` assoc type, so the return
+	// type should still resolve to the `AssocTypeProjection` it would have
+	// been rather than collapsing to `TypeIndex::ERROR`. Matches rustc: an
+	// unsatisfied predicate doesn't erase the type it was checked against,
+	// so hover/further type-checking stays useful instead of cascading into
+	// unrelated `{unknown}` noise.
+	let case = TestCase::new(indoc! {"
+        trait Converter {
+            type Output;
+        }
+        trait Container {
+            type Item;
+        }
+        fn f<Mem: Container>(mem: Mem, delta: Mem::Item) -> <Mem::Item as Converter>::Output {
+            unreachable
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
+		.expect("function 'f' not found");
+	let result_ty = func.result.as_ref().expect("expected a return type").inner;
+
+	let converter_trait =
+		case.tir
+			.traits
+			.iter()
+			.position(|t| {
+				case.graph.interner.resolve(t.name.inner) == Some("Converter")
+			})
+			.expect("trait 'Converter' not found") as TraitIndex;
+	let output_sym = case.graph.interner.get("Output").unwrap();
+
+	match &case.tir.types[result_ty.as_usize()] {
+		Type::AssocTypeProjection {
+			trait_index,
+			assoc_name,
+			..
+		} => {
+			assert_eq!(
+				*trait_index, converter_trait,
+				"recovered type should still be keyed on the named trait `Converter`"
+			);
+			assert_eq!(
+				*assoc_name, output_sym,
+				"recovered type should still name the requested assoc type `Output`"
+			);
+		}
+		other => panic!(
+			"expected the return type to recover to AssocTypeProjection despite the unsatisfied bound, got {other:?}"
+		),
+	}
+}
+
+#[test]
+fn test_qualified_path_assoc_type_on_bound_type_param_resolves() {
+	// Regression test: `<T as A>::Item` where `T` genuinely *is* bound by
+	// `A` (the success path, not the recovery path exercised by the test
+	// below). `resolve_trait_member`'s `TypeParam` branch returns the
+	// trait's own abstract declaration entry for an assoc type — which has
+	// no concrete `ty` to unwrap, unlike a real impl's entry — so this used
+	// to panic (`Option::unwrap()` on `None`) instead of building the
+	// `AssocTypeProjection` the abstract case actually needs.
+	let case = TestCase::new(indoc! {"
+        trait A {
+            type Item;
+        }
+        fn use_it<T: A>(x: T) -> <T as A>::Item {
+            unreachable
+        }
+        export { }
+    "});
+	no_errors(&case);
+
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
+		.expect("function 'use_it' not found");
+	let result_ty = func.result.as_ref().expect("expected a return type").inner;
+	assert!(
+		matches!(
+			case.tir.types[result_ty.as_usize()],
+			Type::AssocTypeProjection { .. }
+		),
+		"expected the return type to resolve to AssocTypeProjection, got {:?}",
+		case.tir.types[result_ty.as_usize()]
+	);
+}
+
+#[test]
+fn test_qualified_path_type_param_not_bound_recovers_type() {
+	// Same recovery, but through the general (non-`AssocTypeProjection`)
+	// branch: `T` is bound by `A` but not `B`, yet `B` does declare an
+	// `Item` assoc type — `<T as B>::Item` should still recover that shape.
+	let case = TestCase::new(indoc! {"
+        trait A {
+            fn foo(self) -> i32;
+        }
+        trait B {
+            type Item;
+        }
+        fn use_it<T: A>(x: T) -> <T as B>::Item {
+            unreachable
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
+		.expect("function 'use_it' not found");
+	let result_ty = func.result.as_ref().expect("expected a return type").inner;
+	assert!(
+		matches!(
+			case.tir.types[result_ty.as_usize()],
+			Type::AssocTypeProjection { .. }
+		),
+		"expected the return type to recover to AssocTypeProjection despite the unsatisfied bound, got {:?}",
+		case.tir.types[result_ty.as_usize()]
+	);
+}
+
+#[test]
+fn test_qualified_path_no_such_member_does_not_recover() {
+	// Contrast with the two tests above: when the named trait genuinely has
+	// no member by that name (not a bound-satisfaction problem, a typo/
+	// nonexistent-name problem), there's nothing sensible to recover — the
+	// return type must stay `TypeIndex::ERROR`, not silently invent a type
+	// for a name that was never declared anywhere.
+	let case = TestCase::new(indoc! {"
+        trait Other {
+            fn shout(self) -> u32;
+        }
+        struct Thing {}
+        impl Other for Thing {
+            fn shout(self) -> u32 { 3 }
+        }
+        fn use_it(t: Thing) -> <Thing as Other>::Nope {
+            unreachable
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredType),
+		"expected an undeclared-type diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
+		.expect("function 'use_it' not found");
+	let result_ty = func.result.as_ref().expect("expected a return type").inner;
+	assert_eq!(
+		result_ty,
+		TypeIndex::ERROR,
+		"a nonexistent member name has nothing to recover — return type should stay ERROR"
+	);
+}
+
+#[test]
 fn test_ambiguity_between_explicit_override_and_bodied_default() {
 	// `A::foo` is a bodied default that `S` doesn't override; `B::foo` is
 	// explicitly provided by `S`. Both are still live candidates for
@@ -2482,6 +2915,7 @@ fn test_self_keyword_recorded_in_trait_impl_self_accesses() {
             fn make() -> Self;
             fn other() -> Self;
         }
+        #[tag = \"target\"]
         struct Foo {}
         impl Greet for Foo {
             fn make() -> Self {
@@ -2501,8 +2935,20 @@ fn test_self_keyword_recorded_in_trait_impl_self_accesses() {
 		"unexpected errors: {:?}",
 		case.tir.diagnostics
 	);
-	assert_eq!(case.tir.trait_impls.len(), 1);
-	assert_eq!(case.tir.trait_impls[0].self_accesses.len(), 4);
+	// `std` registers its own trait impls first, so find the one that
+	// targets this test's own (tagged) `Foo` struct rather than assuming index 0.
+	let target_tag = case.graph.interner.get("target").unwrap();
+	let foo_def_id = *case.tir.tagged_items.get(&target_tag).unwrap();
+	let foo_self_type = case.tir.structs
+		[case.tir.struct_index(foo_def_id).unwrap() as usize]
+		.self_type;
+	let trait_impl = case
+		.tir
+		.trait_impls
+		.iter()
+		.find(|i| i.target.inner == foo_self_type)
+		.expect("no TraitImpl targets 'Foo'");
+	assert_eq!(trait_impl.self_accesses.len(), 4);
 }
 
 #[test]
@@ -2518,6 +2964,7 @@ fn test_self_keyword_recorded_in_trait_impl_assoc_type_self_accesses() {
         trait Container {
             type Elem;
         }
+        #[tag = \"target\"]
         struct Foo {}
         impl Container for Foo {
             type Elem = Self;
@@ -2532,8 +2979,18 @@ fn test_self_keyword_recorded_in_trait_impl_assoc_type_self_accesses() {
 		"unexpected errors: {:?}",
 		case.tir.diagnostics
 	);
-	assert_eq!(case.tir.trait_impls.len(), 1);
-	assert_eq!(case.tir.trait_impls[0].self_accesses.len(), 1);
+	let target_tag = case.graph.interner.get("target").unwrap();
+	let foo_def_id = *case.tir.tagged_items.get(&target_tag).unwrap();
+	let foo_self_type = case.tir.structs
+		[case.tir.struct_index(foo_def_id).unwrap() as usize]
+		.self_type;
+	let trait_impl = case
+		.tir
+		.trait_impls
+		.iter()
+		.find(|i| i.target.inner == foo_self_type)
+		.expect("no TraitImpl targets 'Foo'");
+	assert_eq!(trait_impl.self_accesses.len(), 1);
 }
 
 // ── trait duplicate definition ────────────────────────────────────────────────
@@ -2567,6 +3024,146 @@ fn test_local_trait_silently_shadows_wildcard_import() {
 	assert!(
 		!has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
 		"local trait shadowing wildcard import should not produce a duplicate error"
+	);
+}
+
+// ── privacy / visibility ──────────────────────────────────────────────────────
+
+#[test]
+fn test_private_module_item_not_visible_via_wildcard_import() {
+	// A non-`pub` item stays invisible through `use foo::*;` — wildcard
+	// imports only ever bring in a module's public surface.
+	let case = TestCase::new(indoc! {"
+        module foo {
+            const SECRET: i32 = 1;
+        }
+        use foo::*;
+        fn f() -> i32 {
+            SECRET
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"expected 'SECRET' to be invisible (undeclared) through the wildcard import, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_pub_module_item_visible_via_wildcard_import() {
+	let case = TestCase::new(indoc! {"
+        module foo {
+            pub const PUBLIC: i32 = 1;
+        }
+        use foo::*;
+        fn f() -> i32 {
+            PUBLIC
+        }
+        export { f }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"unexpected diagnostics for a pub item reached via wildcard import: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_private_module_item_not_visible_via_qualified_path() {
+	// Same rule, but named explicitly as `foo::SECRET` — bypasses the
+	// wildcard-import path entirely and exercises the explicit-qualified-path
+	// resolver instead, which reports the dedicated "is private" diagnostic.
+	let case = TestCase::new(indoc! {"
+        module foo {
+            const SECRET: i32 = 1;
+        }
+        fn f() -> i32 {
+            foo::SECRET
+        }
+        export { }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::PrivateItem),
+		"expected a private-item diagnostic for 'foo::SECRET', got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_pub_module_item_visible_via_qualified_path() {
+	let case = TestCase::new(indoc! {"
+        module foo {
+            pub const PUBLIC: i32 = 1;
+        }
+        fn f() -> i32 {
+            foo::PUBLIC
+        }
+        export { f }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"unexpected diagnostics for a pub item reached via qualified path: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_private_item_visible_to_descendant_module_not_to_ancestor() {
+	// Rust-style default visibility: a non-`pub` item is visible to its own
+	// declaring module and every descendant module, but not to an ancestor —
+	// even though the ancestor is exactly where the child module's own name
+	// is declared and reachable from.
+	let case = TestCase::new(indoc! {"
+        module foo {
+            const SECRET: i32 = 1;
+
+            module bar {
+                pub fn uses_secret() -> i32 {
+                    foo::SECRET
+                }
+            }
+        }
+
+        fn ancestor_access() -> i32 {
+            foo::SECRET
+        }
+
+        export { }
+    "});
+	let private_item_errors = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::PrivateItem.code())
+		})
+		.count();
+	assert_eq!(
+		private_item_errors,
+		1,
+		"expected exactly one private-item diagnostic (the root-level access), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
 	);
 }
 
@@ -3784,6 +4381,52 @@ fn test_assoc_type_projection_in_return_type() {
 		"return type should be AssocTypeProjection for C::Elem, got type index {}",
 		result_ty.as_u32()
 	);
+	assert_eq!(
+		case.tir
+			.formatter(&case.graph.interner)
+			.display_type(result_ty)
+			.unwrap(),
+		"C::Elem",
+		"unambiguous — C is only bound by Container, which is the only bound declaring Elem — should stay unqualified"
+	);
+}
+
+#[test]
+fn test_assoc_type_projection_display_is_qualified_when_ambiguous() {
+	// `T: A + B`, and *both* `A` and `B` declare an `Item` associated type —
+	// unlike the unambiguous case above, printing `T::Item` here would be
+	// genuinely ambiguous to a reader (which trait's `Item`?), so the
+	// formatter must spell out `<T as A>::Item` instead, matching rustc's
+	// own qualified-path printing for the same situation.
+	let case = TestCase::new(indoc! {"
+        trait A {
+            type Item;
+        }
+        trait B {
+            type Item;
+        }
+        fn foo<T: A + B>() -> <T as A>::Item {
+            unreachable
+        }
+    "});
+	no_errors(&case);
+
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("foo"))
+		.expect("function 'foo' not found");
+	let result_ty = func.result.as_ref().expect("expected a return type").inner;
+
+	assert_eq!(
+		case.tir
+			.formatter(&case.graph.interner)
+			.display_type(result_ty)
+			.unwrap(),
+		"<T as A>::Item",
+		"T is bound by both A and B, both declaring Item — display must qualify which trait's Item this is"
+	);
 }
 
 #[test]
@@ -3953,22 +4596,27 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	// Regression test: `resolve_bounds`'s `WithBindings` arm looked up
 	// `assoc_types.get_mut(&binding.name)` on the *other* trait before that
 	// trait had necessarily inserted its own entry — for two traits whose
-	// assoc-type `where` clauses reference each other (`UnsignedInt::Signed`
-	// bound by `SignedInt where { Unsigned = Self }`, and vice versa), the
-	// first trait processed (`UnsignedInt`, being earlier in parse order)
-	// would reference `SignedInt::Unsigned` before `SignedInt`'s own
+	// assoc-type `where` clauses reference each other (`A::X` bound by `B
+	// where { Y = Self }`, and vice versa), the first trait processed (`A`,
+	// being earlier in parse order) would reference `B::Y` before `B`'s own
 	// `TraitAssocType` node had run, silently dropping the access (no
 	// diagnostic — the lookup just missed). Fixed by pre-registering the
 	// assoc type in `assoc_types` (with placeholder bounds) before resolving
 	// its own bounds, so a same-name lookup during mutual resolution always
 	// finds an entry to record against.
+	//
+	// Deliberately named `A`/`B`/`X`/`Y` rather than something like
+	// `UnsignedInt`/`SignedInt` — the stdlib now declares its own traits by
+	// those names, and this test needs to stay independent of stdlib
+	// content (searching `case.tir.traits` by name would otherwise find the
+	// stdlib's same-named trait instead of this test's local one).
 	let source = indoc! {"
-        trait UnsignedInt {
-            type Signed: SignedInt where { Unsigned = Self };
+        trait A {
+            type X: B where { Y = Self };
         }
 
-        trait SignedInt {
-            type Unsigned: UnsignedInt where { Signed = Self };
+        trait B {
+            type Y: A where { X = Self };
         }
     "};
 	let case = TestCase::new(source);
@@ -3981,44 +4629,40 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 			.find(|t| case.graph.interner.resolve(t.name.inner) == Some(name))
 			.unwrap_or_else(|| panic!("trait '{name}' not found"))
 	};
-	let unsigned_int = find_trait("UnsignedInt");
-	let signed_int = find_trait("SignedInt");
+	let trait_a = find_trait("A");
+	let trait_b = find_trait("B");
 
-	let signed_sym = case.graph.interner.get("Signed").unwrap();
-	let unsigned_sym = case.graph.interner.get("Unsigned").unwrap();
+	let x_sym = case.graph.interner.get("X").unwrap();
+	let y_sym = case.graph.interner.get("Y").unwrap();
 
 	let prefix_len = "use std::*;\n".len();
-	let unsigned_binding_offset = prefix_len
-		+ source.find("Unsigned = Self").unwrap();
-	let signed_binding_offset =
-		prefix_len + source.find("Signed = Self").unwrap();
+	let y_binding_offset = prefix_len + source.find("Y = Self").unwrap();
+	let x_binding_offset = prefix_len + source.find("X = Self").unwrap();
 
-	let signed_at = unsigned_int
+	let x_at = trait_a
 		.assoc_types
-		.get(&signed_sym)
-		.expect("expected 'Signed' in UnsignedInt::assoc_types");
+		.get(&x_sym)
+		.expect("expected 'X' in A::assoc_types");
 	assert!(
-		signed_at
-			.accesses
+		x_at.accesses
 			.iter()
-			.any(|a| a.span.start == signed_binding_offset as u32),
-		"expected an access on UnsignedInt::Signed at the `Signed = Self` \
-		 binding (offset {signed_binding_offset}), got: {:?}",
-		signed_at.accesses
+			.any(|acc| acc.span.start == x_binding_offset as u32),
+		"expected an access on A::X at the `X = Self` binding (offset \
+		 {x_binding_offset}), got: {:?}",
+		x_at.accesses
 	);
 
-	let unsigned_at = signed_int
+	let y_at = trait_b
 		.assoc_types
-		.get(&unsigned_sym)
-		.expect("expected 'Unsigned' in SignedInt::assoc_types");
+		.get(&y_sym)
+		.expect("expected 'Y' in B::assoc_types");
 	assert!(
-		unsigned_at
-			.accesses
+		y_at.accesses
 			.iter()
-			.any(|a| a.span.start == unsigned_binding_offset as u32),
-		"expected an access on SignedInt::Unsigned at the `Unsigned = Self` \
-		 binding (offset {unsigned_binding_offset}), got: {:?}",
-		unsigned_at.accesses
+			.any(|acc| acc.span.start == y_binding_offset as u32),
+		"expected an access on B::Y at the `Y = Self` binding (offset \
+		 {y_binding_offset}), got: {:?}",
+		y_at.accesses
 	);
 }
 
@@ -9539,6 +10183,335 @@ fn test_trait_impl_resolution_uses_global_index_not_local_position() {
 	assert!(
 		!has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
 		"expected `s.foo()` to resolve via `S`'s own impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_where_clause_bound_on_assoc_type_lets_qualified_path_resolve() {
+	// `type Size: PointerSize` alone doesn't make `Mem::Size: UnsignedInt`
+	// provable — that extra fact only becomes visible once `grow` adds
+	// `where { Size: UnsignedInt }` to its own `Mem: Memory` bound, which
+	// `abstract_type_bounds` must merge with `Memory::Size`'s own declared
+	// bound before `<Mem::Size as UnsignedInt>::Signed` can typecheck.
+	let case = TestCase::new(indoc! {"
+        trait UnsignedInt {
+            type Signed: SignedInt where { Unsigned = Self };
+        }
+
+        trait SignedInt {
+            type Unsigned: UnsignedInt where { Signed = Self };
+        }
+
+        impl UnsignedInt for u32 {
+            type Signed = i32;
+        }
+
+        impl SignedInt for i32 {
+            type Unsigned = u32;
+        }
+
+        fn grow<Mem: Memory where { Size: UnsignedInt }>(_mem: Mem, _delta: Mem::Size) -> <Mem::Size as UnsignedInt>::Signed {
+            unreachable
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected no trait-bound-violation diagnostic, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_trait_conformance_checks_bound_kind_assoc_binding_trait_violation() {
+	// `Container::Elem` requires `HasSize where { Size: Marker }` — an impl
+	// providing an `Elem` whose `Size` doesn't implement `Marker` must be
+	// rejected at the `impl` site itself, with no call ever needed to
+	// trigger it. Regression test for `check_assoc_type_bounds` previously
+	// only verifying `Equals`-kind bindings and silently skipping `Bound`.
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait HasSize {
+            type Size;
+        }
+        trait Container {
+            type Elem: HasSize where { Size: Marker };
+        }
+        struct BadElem {}
+        impl HasSize for BadElem {
+            type Size = u32;
+        }
+        struct Foo {}
+        impl Container for Foo {
+            type Elem = BadElem;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic for BadElem::Size not implementing Marker, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_trait_conformance_checks_bound_kind_assoc_binding_typeset_violation() {
+	// Same shape, but the `Bound` is a typeset rather than a trait.
+	let case = TestCase::new(indoc! {"
+        pub typeset Ints { u32, u64 }
+        trait HasSize {
+            type Size;
+        }
+        trait Container {
+            type Elem: HasSize where { Size: Ints };
+        }
+        struct BadElem {}
+        impl HasSize for BadElem {
+            type Size = bool;
+        }
+        struct Foo {}
+        impl Container for Foo {
+            type Elem = BadElem;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypesetBoundViolation),
+		"expected a typeset-bound-violation diagnostic for BadElem::Size (bool) not in Ints, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_trait_conformance_bound_kind_assoc_binding_satisfied_no_error() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait HasSize {
+            type Size;
+        }
+        trait Container {
+            type Elem: HasSize where { Size: Marker };
+        }
+        struct GoodElem {}
+        impl HasSize for GoodElem {
+            type Size = u32;
+        }
+        impl Marker for u32 {}
+        struct Foo {}
+        impl Container for Foo {
+            type Elem = GoodElem;
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"unexpected trait-bound-violation diagnostic: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_call_site_assoc_bound_satisfied_no_error() {
+	// `needs_marker`'s own `where { Size: Marker }` isn't checked merely by
+	// unifying `Mem: Memory` — the call site's *concrete* `Mem32::Size`
+	// (`u32`) must actually implement `Marker` too. Here it does.
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Memory {
+            type Size;
+        }
+        struct Mem32 {}
+        impl Memory for Mem32 {
+            type Size = u32;
+        }
+        impl Marker for u32 {}
+        fn needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
+        fn use_it(mem: Mem32, delta: u32) {
+            needs_marker(mem, delta);
+        }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_call_site_assoc_bound_violated_reports_error() {
+	// Same shape as `test_call_site_assoc_bound_satisfied_no_error`, but
+	// `u32` never implements `Marker` here — `needs_marker`'s `where { Size:
+	// Marker }` bound must be enforced against `Mem32`'s *actual* `Size`
+	// at the call site, not just checked in the abstract (inside
+	// `needs_marker`'s own body, where `Mem::Size: Marker` is taken on
+	// faith from the signature).
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Memory {
+            type Size;
+        }
+        struct Mem32 {}
+        impl Memory for Mem32 {
+            type Size = u32;
+        }
+        fn needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
+        fn use_it(mem: Mem32, delta: u32) {
+            needs_marker(mem, delta);
+        }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a trait-bound-violation diagnostic for `u32: Marker`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_unqualified_chained_projection_resolves_when_unambiguous() {
+	// `Mem::Size::Signed` (no `<... as Trait>::` qualification) should
+	// resolve on its own once `Size`'s bounds include exactly one trait
+	// declaring `Signed` — here that's only true because of the `where {
+	// Size: Unsigned }` merge; `Memory::Size` alone declares no bound at
+	// all.
+	let case = TestCase::new(indoc! {"
+        trait Unsigned { type Signed; }
+        trait Memory { type Size; }
+        struct Mem32 {}
+        impl Memory for Mem32 { type Size = u32; }
+        impl Unsigned for u32 { type Signed = i32; }
+
+        fn f<Mem: Memory where { Size: Unsigned }>(_m: Mem) -> Mem::Size::Signed { unreachable }
+        fn f_concrete(m: Mem32) -> i32 { f(m) }
+        export { f_concrete }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_unqualified_chained_projection_ambiguous_reports_error() {
+	// `Size`'s bounds end up including *two* traits that both declare
+	// `Foo` — one from `Memory::Size`'s own declaration (`TraitA`), one
+	// from `f`'s `where { Size: TraitB }`. The unqualified `Mem::Size::Foo`
+	// can't tell them apart and must be rejected rather than silently
+	// picking whichever bound happens to be checked first.
+	let case = TestCase::new(indoc! {"
+        trait TraitA { type Foo; }
+        trait TraitB { type Foo; }
+        trait Memory { type Size: TraitA; }
+        struct Mem32 {}
+        impl Memory for Mem32 { type Size = u32; }
+        impl TraitA for u32 { type Foo = i32; }
+        impl TraitB for u32 { type Foo = i64; }
+
+        fn f<Mem: Memory where { Size: TraitB }>(_m: Mem) -> Mem::Size::Foo { unreachable }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::AmbiguousTraitMember),
+		"expected an ambiguous-trait-member diagnostic for `Mem::Size::Foo`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_where_clause_assoc_type_conflicting_typeset_bound_reports_error() {
+	// `Memory::Size` is already pinned to `SetA` by the trait's own
+	// declaration (`type Size: SetA`); `f`'s `where { Size: SetB }` tries to
+	// layer on a second, different typeset bound for the same associated
+	// type. `Bounds` only ever holds one typeset slot, so this must be
+	// rejected at the point the `where` clause is resolved rather than
+	// silently keeping (or silently dropping) one of the two.
+	let case = TestCase::new(indoc! {"
+        typeset SetA { u8, u16 }
+        typeset SetB { u32, u64 }
+        trait Memory { type Size: SetA; }
+        struct Mem8 {}
+        impl Memory for Mem8 { type Size = u8; }
+
+        fn f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MultipleTypesetBounds),
+		"expected a multiple-typeset-bounds diagnostic, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_display_bounds_includes_where_clause_assoc_type_bound() {
+	// Regression test: `TypeFormatter::write_bounds` (shared by diagnostic
+	// messages and LSP hover) used to only look at `TraitBound.bindings`'
+	// `Equals` entries when deciding whether to print a `where { }` clause
+	// at all — a bound with *only* a `where { Size: Unsigned }` entry (no
+	// `=` binding) printed as bare `Memory`, silently dropping the
+	// constraint from what the user sees on hover.
+	let case = TestCase::new(indoc! {"
+        trait Unsigned {}
+        trait Memory { type Size; }
+        fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem, delta: Mem::Size) -> Mem::Size {
+            unreachable
+        }
+    "});
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| {
+			case.graph
+				.interner
+				.resolve(f.name.inner)
+				.map(|n| n == "grow")
+				.unwrap_or(false)
+		})
+		.unwrap();
+	let fmt = case.tir.formatter(&case.graph.interner);
+	let s = fmt.display_bounds(&func.type_params[0].bounds).unwrap();
+	assert_eq!(s, "Memory where { Size: Unsigned }");
+}
+
+#[test]
+fn test_where_clause_duplicate_binding_name_reports_error() {
+	// Whether written as two equality bindings, two bounds, or a mix, the
+	// same associated-type name can only be bound once per `where { }`
+	// block — a second occurrence is diagnosed and dropped rather than
+	// silently overriding or merging with the first.
+	let case = TestCase::new(indoc! {"
+        trait Unsigned {}
+        trait Memory { type Size; }
+        struct Mem32 {}
+        impl Memory for Mem32 { type Size = u32; }
+
+        fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(_m: Mem) {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateAssocTypeBinding),
+		"expected a duplicate-assoc-type-binding diagnostic, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()

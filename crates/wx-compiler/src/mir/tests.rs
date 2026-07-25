@@ -37,7 +37,7 @@ impl TestCase {
 // Minimal inline definitions shared across tests that need them.
 
 /// ASCII helper and char methods, purpose-named to avoid colliding with
-/// `std/lib.wx`'s own `impl char { fn is_ascii_lowercase / to_ascii_uppercase }`
+/// `std/main.wx`'s own `impl char { fn is_ascii_lowercase / to_ascii_uppercase }`
 /// (a real collision would now correctly be flagged as a duplicate impl).
 const CHAR_ASCII_METHODS: &str = indoc! {"
     const ASCII_CASE_MASK: u8 = 0b0010_0000;
@@ -286,7 +286,7 @@ fn test_memory_grow_lowers_to_memory_grow() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(delta: u32) -> u32 {
+        pub fn f(delta: u32) -> i32 {
             heap.grow(delta)
         }
 

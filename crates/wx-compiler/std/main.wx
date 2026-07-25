@@ -1,60 +1,99 @@
-const ASCII_CASE_MASK: u8 = 0b0010_0000;
 pub const PAGE_SIZE: u32 = 65536;
 
 #[intrinsic]
-fn memory_grow<M: Memory>(mem: M, delta: M::Size) -> M::Size;
+pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
 #[intrinsic]
-fn memory_size<M: Memory>(mem: M) -> M::Size;
+pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 #[intrinsic]
-fn slice_len<M: Memory, T>(slice: M::[]T) -> M::Size;
+pub fn slice_len<Mem: Memory, T>(slice: Mem::[]T) -> Mem::Size;
 
 #[intrinsic]
-fn slice_ptr<M: Memory, T>(slice: M::[]T) -> M::*T;
+pub fn slice_ptr<Mem: Memory, T>(slice: Mem::[]T) -> Mem::*T;
 
 #[intrinsic]
-fn slice_from_parts<M: Memory, T>(data: M::*T, len: M::Size) -> M::[]T;
+pub fn slice_from_parts<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::[]T;
 
 #[intrinsic]
-fn size_of<T, M: Memory>() -> M::Size;
+pub fn size_of<T, Mem: Memory>() -> Mem::Size;
 
 #[intrinsic]
-fn align_of<T, M: Memory>() -> M::Size;
+pub fn align_of<T, Mem: Memory>() -> Mem::Size;
 
 #[intrinsic]
-fn memory_fill<M: Memory>(dst: M::*mut u8, val: u8, len: M::Size);
+pub fn memory_fill<Mem: Memory>(dst: Mem::*mut u8, val: u8, len: Mem::Size);
 
 #[intrinsic]
-fn memory_copy<
+pub fn memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*mut u8, src: SrcMem::*u8, len: Size);
 
 #[intrinsic]
-fn i64_extend_i32(value: i32) -> i64;
+pub fn i64_extend_i32(value: i32) -> i64;
 
 #[intrinsic]
-fn u64_extend_u32(value: u32) -> u64;
+pub fn u64_extend_u32(value: u32) -> u64;
 
 #[intrinsic]
-fn i32_wrap_i64(value: i64) -> i32;
+pub fn i32_wrap_i64(value: i64) -> i32;
 
 pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }
+
+trait UnsignedInt {
+    type Signed: SignedInt where { Unsigned = Self };
+}
+
+trait SignedInt {
+    type Unsigned: UnsignedInt where { Signed = Self };
+}
+
+impl UnsignedInt for u8 {
+    type Signed = i8;
+}
+
+impl UnsignedInt for u16 {
+    type Signed = i16;
+}
+
+impl UnsignedInt for u32 {
+    type Signed = i32;
+}
+
+impl UnsignedInt for u64 {
+    type Signed = i64;
+}
+
+impl SignedInt for i8 {
+    type Unsigned = u8;
+}
+
+impl SignedInt for i16 {
+    type Unsigned = u16;
+}
+
+impl SignedInt for i32 {
+    type Unsigned = u32;
+}
+
+impl SignedInt for i64 {
+    type Unsigned = u64;
+}
 
 #[tag = "pointer_size"]
 pub typeset PointerSize { u32, u64 }
 
 pub trait Memory {
-    type Size: PointerSize;
+    type Size: PointerSize + UnsignedInt;
 
     const MEMORY_INDEX: u32;
 
     const DATA_END: Self::*u8;
 
     #[inline]
-    fn grow(self, delta: Self::Size) -> Self::Size {
+    fn grow(self, delta: Self::Size) -> Self::Size::Signed {
         memory_grow(self, delta)
     }
 
@@ -64,97 +103,99 @@ pub trait Memory {
     }
 }
 
-pub struct Layout<M: Memory> {
-    pub size: M::Size,
-    pub align: M::Size,
+pub struct Layout<Mem: Memory> {
+    pub size: Mem::Size,
+    pub align: Mem::Size,
 }
 
-impl<M: Memory> Layout<M> {
+impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub fn of<T>() -> Self {
         Self::{ size: size_of::<T>(), align: align_of::<T>() }
     }
 
     #[inline]
-    pub fn array<T>(count: M::Size) -> Self {
+    pub fn array<T>(count: Mem::Size) -> Self {
         Self::{ align: align_of::<T>(), size: size_of::<T>() * count }
     }
 }
 
 pub trait Allocator {
-    type M: Memory;
+    type Mem: Memory;
 
-    fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+    fn reserve(self: Self::Mem::*mut Self, layout: Layout<Self::Mem>) -> Self::Mem::*mut u8;
 
     #[inline]
-    fn alloc<T>(self: Self::M::*mut Self, value: T) -> Self::M::*mut T {
-        local ptr = self.reserve(Layout::of::<T>()) as Self::M::*mut T;
+    fn alloc<T>(self: Self::Mem::*mut Self, value: T) -> Self::Mem::*mut T {
+        local ptr = self.reserve(Layout::of::<T>()) as Self::Mem::*mut T;
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    fn alloc_slice<T>(self: Self::M::*mut Self, count: Self::M::Size) -> Self::M::[]mut T {
-        std::slice_from_parts(
-            self.reserve(Layout::array::<T>(count)) as Self::M::*T,
-            count,
+    fn alloc_slice<T>(self: Self::Mem::*mut Self, len: Self::Mem::Size) -> Self::Mem::[]mut T {
+        slice_from_parts(
+            self.reserve(Layout::array::<T>(len)) as Self::Mem::*T,
+            len,
         ) as _
     }
 }
 
 pub module ptr {
     #[inline]
-    pub fn null<M: Memory, T>() -> M::*T {
+    pub fn null<Mem: Memory, T>() -> Mem::*T {
         0 as _
     }
 
     #[inline]
-    pub fn null_mut<M: Memory, T>() -> M::*mut T {
+    pub fn null_mut<Mem: Memory, T>() -> Mem::*mut T {
         0 as _
     }
 
     #[inline]
-    pub fn is_null<M: Memory, T>(ptr: M::*T) -> bool {
-        ptr as M::Size == 0
+    pub fn is_null<Mem: Memory, T>(ptr: Mem::*T) -> bool {
+        ptr as Mem::Size == 0
     }
 
     #[inline]
-    pub fn cast_mut<M: Memory, T>(ptr: M::*T) -> M::*mut T {
+    pub fn cast_mut<Mem: Memory, T>(ptr: Mem::*T) -> Mem::*mut T {
         ptr as _
     }
 
     #[inline]
-    pub fn add<M: Memory, T>(ptr: M::*T, count: M::Size) -> M::*T {
-        (ptr as M::Size + count * size_of::<T, M>()) as _
+    pub fn add<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
+        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn sub<M: Memory, T>(ptr: M::*T, count: M::Size) -> M::*T {
-        (ptr as M::Size - count * size_of::<T, M>()) as _
+    pub fn sub<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
+        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn add_mut<M: Memory, T>(ptr: M::*mut T, count: M::Size) -> M::*mut T {
-        (ptr as M::Size + count * size_of::<T, M>()) as _
+    pub fn add_mut<Mem: Memory, T>(ptr: Mem::*mut T, count: Mem::Size) -> Mem::*mut T {
+        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn sub_mut<M: Memory, T>(ptr: M::*mut T, count: M::Size) -> M::*mut T {
-        (ptr as M::Size - count * size_of::<T, M>()) as _
+    pub fn sub_mut<Mem: Memory, T>(ptr: Mem::*mut T, count: Mem::Size) -> Mem::*mut T {
+        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
     }
 }
 
-impl<M: Memory, T> M::[]T {
+impl<Mem: Memory, T> Mem::[]T {
     #[inline]
-    pub fn len(self) -> M::Size {
+    pub fn len(self) -> Mem::Size {
         slice_len(self)
     }
 
     #[inline]
-    pub fn ptr(self) -> M::*T {
+    pub fn ptr(self) -> Mem::*T {
         slice_ptr(self)
     }
 }
+
+const ASCII_CASE_MASK: u8 = 0b0010_0000;
 
 impl char {
     #[inline]

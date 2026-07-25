@@ -23,72 +23,16 @@ global mut bump: *u8 = heap::DATA_END;
 
 struct BumpAllocator {}
 
-trait UnsignedInt {
-  type Signed: SignedInt where { Unsigned = Self };
-}
-
-trait SignedInt {
-  type Unsigned: UnsignedInt where { Signed = Self };
-}
-
-impl UnsignedInt for u8 {
-  type Signed = i8;
-}
-
-impl UnsignedInt for u16 {
-  type Signed = i16;
-}
-
-impl UnsignedInt for u32 {
-  type Signed = i32;
-}
-
-impl UnsignedInt for u64 {
-  type Signed = i64;
-}
-
-impl SignedInt for i8 {
-  type Unsigned = u8;
-}
-
-impl SignedInt for i16 {
-  type Unsigned = u16;
-}
-
-impl SignedInt for i32 {
-  type Unsigned = u32;
-}
-
-impl SignedInt for i64 {
-  type Unsigned = u64;
-}
-
-struct Box<T: UnsignedInt> {
-  value: T,
-}
-
-fn get_signed<T: UnsignedInt>(unsigned: Box<T>) -> T::Signed {
-  unreachable
-}
-
-fn test() {
-  // local x = get_signed::<i32>(1);
-  local x = get_signed(1 as i32);
-}
-
-// fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
-//   unreachable
-// }
 impl Allocator for BumpAllocator {
-  type M = heap;
+  type Mem = heap;
 
-  fn reserve(self: *mut Self, layout: Layout<heap>) -> *mut u8 {
+  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
     local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
     local new_end = ptr + layout.size;
     local cur_end = heap.size() * PAGE_SIZE;
     if new_end > cur_end {
       local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
-      local _grew = heap.grow(needed);
+      if heap.grow(needed) == -1 { unreachable }
     }
     bump = new_end as *u8;
     ptr as *mut u8

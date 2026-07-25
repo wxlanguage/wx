@@ -159,18 +159,19 @@ items:
                       span:
                         start: 72
                         end: 76
-                    ty:
-                      inner:
-                        Path:
-                          - ident:
-                              inner: 7
-                              span:
-                                start: 79
-                                end: 82
-                            type_args: []
-                      span:
-                        start: 79
-                        end: 82
+                    kind:
+                      Equals:
+                        inner:
+                          Path:
+                            - ident:
+                                inner: 7
+                                span:
+                                  start: 79
+                                  end: 82
+                              type_args: []
+                        span:
+                          start: 79
+                          end: 82
             span:
               start: 57
               end: 84

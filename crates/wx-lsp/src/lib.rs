@@ -1019,7 +1019,7 @@ impl Backend {
 				))
 			})?;
 		match filename {
-			"lib.wx" => Ok(wx_compiler::vfs::STDLIB_SOURCE.to_string()),
+			"main.wx" => Ok(wx_compiler::vfs::STDLIB_SOURCE.to_string()),
 			other => Err(JsonRpcError::invalid_params(format!(
 				"unknown stdlib file: {other}"
 			))),
@@ -2240,7 +2240,7 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 }
 
 /// Whether `path` is one of our own absolute paths, as opposed to a virtual
-/// stdlib name like `lib.wx`. Deliberately not `Path::is_absolute()`: it is
+/// stdlib name like `main.wx`. Deliberately not `Path::is_absolute()`: it is
 /// (surprisingly) always `false` on `wasm32-unknown-unknown` even for
 /// `/`-rooted paths (see `file_id_to_uri`), which — before this was
 /// introduced — silently dropped every diagnostic and owned-file entry in

@@ -264,6 +264,76 @@ fn test_format_trait_items() {
 }
 
 #[test]
+fn test_format_where_clause_assoc_type_bound() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+				trailing_comma: true,
+			},
+		)
+	};
+
+	// `Assoc: Bound` alongside the existing `Assoc = Type` equality form.
+	assert_eq!(
+		fmt(
+			"fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}"
+		),
+		"fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}\n",
+	);
+
+	assert_eq!(
+		fmt(
+			"fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}"
+		),
+		"fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
+	);
+}
+
+#[test]
+fn test_format_qualified_path() {
+	// `<Type as Trait>::item` in both type position (a function's return
+	// type) and expression position (a call), with and without the `as
+	// Trait` part.
+	let case = TestCase::new(indoc! {"
+        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+            <Thing as Greeter>::greet(mem)
+        }
+
+        fn plain(x: <T>::Item) -> <T>::Item {
+            <T>::method(x)
+        }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+                <Thing as Greeter>::greet(mem)
+            }
+
+            fn plain(x: <T>::Item) -> <T>::Item {
+                <T>::method(x)
+            }
+        "}
+	);
+}
+
+#[test]
 fn test_format_const_items() {
 	let case = TestCase::new(indoc! {"
         const MAX: i32 = 100;
