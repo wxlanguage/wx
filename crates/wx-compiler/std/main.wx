@@ -202,14 +202,18 @@ impl char {
     pub fn to_ascii_uppercase(self) -> char {
         if self.is_ascii_lowercase() {
             ((self as u8) ^ ASCII_CASE_MASK) as char
-        } else { self }
+        } else {
+            self
+        }
     }
 
     #[inline]
     pub fn to_ascii_lowercase(self) -> char {
         if self.is_ascii_uppercase() {
             ((self as u8) ^ ASCII_CASE_MASK) as char
-        } else { self }
+        } else {
+            self
+        }
     }
 
     #[inline]

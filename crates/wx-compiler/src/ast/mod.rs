@@ -1269,6 +1269,14 @@ impl Expression {
 			_ => false,
 		}
 	}
+
+	#[inline]
+	pub fn as_block_statements(&self) -> &[Separated<Spanned<Statement>>] {
+		match self {
+			Expression::Block { statements } => statements,
+			_ => unreachable!("expected a block expression"),
+		}
+	}
 }
 
 /// A generic type parameter declaration: `T` or `T: Bound1 + Bound2`.

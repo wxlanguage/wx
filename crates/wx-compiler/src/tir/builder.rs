@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use codespan_reporting::diagnostic::Severity;
 
+use crate::ast::Statement;
 use crate::vfs::{CrateId, Files};
 use crate::{ast::MethodCallExpr, tir::*};
 
@@ -8345,7 +8346,9 @@ impl<'ast> Builder<'ast, '_> {
 				self_type: scope.self_type,
 			}),
 		};
-		let result = self.build_block_expression(&mut ctx, block)?;
+		let statements = block.inner.as_block_statements();
+		let result =
+			self.build_block_expression(&mut ctx, statements, block.span)?;
 		self.report_stack_warnings(ctx.resolve_context.file_id, &ctx.stack);
 		Ok(FunctionBody {
 			block: Box::new(result),
@@ -8356,22 +8359,17 @@ impl<'ast> Builder<'ast, '_> {
 	fn build_block_expression(
 		&mut self,
 		ctx: &mut ExprContext,
-		block: &Spanned<ast::Expression>,
+		statements: &[Separated<Spanned<Statement>>],
+		block_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let statements = match &block.inner {
-			ast::Expression::Block { statements } => statements,
-			_ => unreachable!(),
-		};
-
 		let (statements, result) = match statements.split_last() {
-			Some((last, rest)) if last.separator.is_none() => match &last
-				.inner
-				.inner
-			{
-				ast::Statement::Expression(expr) => (rest, Some(expr.as_ref())),
-				_ => (statements.as_ref(), None),
-			},
-			_ => (statements.as_ref(), None),
+			Some((last, rest)) if last.separator.is_none() => {
+				match &last.inner.inner {
+					Statement::Expression(expr) => (rest, Some(expr.as_ref())),
+					_ => (statements, None),
+				}
+			}
+			_ => (statements, None),
 		};
 
 		let expressions = match self.build_block_statements(ctx, statements) {
@@ -8408,7 +8406,7 @@ impl<'ast> Builder<'ast, '_> {
 						result: None,
 					},
 					ty: inferred_type,
-					span: block.span,
+					span: block_span,
 				});
 			}
 			BlockState::Incomplete(expressions) => expressions,
@@ -8438,7 +8436,7 @@ impl<'ast> Builder<'ast, '_> {
 						result: result.map(Box::new),
 					},
 					ty: inferred_type,
-					span: block.span,
+					span: block_span,
 				})
 			}
 			BlockKind::Block => {
@@ -8457,7 +8455,7 @@ impl<'ast> Builder<'ast, '_> {
 							actual_type: inferred_type,
 							span: SourceSpan::new(
 								ctx.resolve_context.file_id,
-								block.span,
+								block_span,
 							),
 						},
 					));
@@ -8473,7 +8471,7 @@ impl<'ast> Builder<'ast, '_> {
 						result: result.map(Box::new),
 					},
 					ty: block_ty,
-					span: block.span,
+					span: block_span,
 				})
 			}
 		}
@@ -9555,28 +9553,44 @@ impl<'ast> Builder<'ast, '_> {
 					inferred_type: TypeIndex::INFER,
 					expected_type: access_ctx.expected_type,
 				},
-				|ctx| self.build_block_expression(ctx, expr),
+				|ctx| {
+					self.build_block_expression(
+						ctx,
+						expr.inner.as_block_statements(),
+						expr.span,
+					)
+				},
 			),
-			ast::Expression::IfElse { .. } => {
-				self.build_if_else_expression(func_ctx, access_ctx, expr, None)
-			}
+			ast::Expression::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => self.build_if_else_expression(
+				func_ctx,
+				access_ctx,
+				condition,
+				then_block,
+				else_block.as_deref(),
+				expr.span,
+				None,
+			),
 			ast::Expression::Match { .. } => {
 				self.build_match_expression(func_ctx, access_ctx, expr)
 			}
-			ast::Expression::Loop { .. } => {
-				self.build_loop_expression(func_ctx, access_ctx, expr, None)
-			}
-			ast::Expression::Cast { .. } => {
-				self.build_cast_expression(func_ctx, access_ctx, expr)
-			}
+			ast::Expression::Loop { block } => self.build_loop_expression(
+				func_ctx, access_ctx, block, expr.span, None,
+			),
+			ast::Expression::Cast { value, ty } => self.build_cast_expression(
+				func_ctx, access_ctx, value, ty, expr.span,
+			),
 			ast::Expression::Break { .. } => {
 				self.build_break_expression(func_ctx, expr)
 			}
 			ast::Expression::Continue { .. } => {
 				self.build_continue_expression(func_ctx, expr)
 			}
-			ast::Expression::Label { .. } => {
-				self.build_label_expression(func_ctx, access_ctx, expr)
+			ast::Expression::Label { block, label } => {
+				self.build_label_expression(func_ctx, access_ctx, block, *label)
 			}
 			ast::Expression::StructInit { path, fields } => self
 				.build_struct_init_expression(
@@ -10975,18 +10989,14 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		expr: &Spanned<ast::Expression>,
+		block: &Spanned<ast::Expression>,
+		label: Spanned<SymbolU32>,
 	) -> Result<Expression, ()> {
-		let (label, block) = match &expr.inner {
-			ast::Expression::Label { label, block } => (*label, block),
-			_ => unreachable!(),
-		};
-		let label = ctx.stack.push_label(label);
-
-		match block.inner {
+		let label_index = ctx.stack.push_label(label);
+		match &block.inner {
 			ast::Expression::Block { .. } => ctx.enter_block(
 				BlockScope {
-					label: Some(label),
+					label: Some(label_index),
 					kind: BlockKind::Block,
 					parent: Some(ctx.scope_index),
 					span: block.span,
@@ -10994,26 +11004,41 @@ impl<'ast> Builder<'ast, '_> {
 					inferred_type: TypeIndex::INFER,
 					expected_type: access_ctx.expected_type,
 				},
-				|ctx| self.build_block_expression(ctx, block),
+				|ctx| {
+					self.build_block_expression(
+						ctx,
+						block.inner.as_block_statements(),
+						block.span,
+					)
+				},
 			),
-			ast::Expression::IfElse { .. } => self.build_if_else_expression(
+			ast::Expression::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => self.build_if_else_expression(
 				ctx,
 				AccessContext {
 					expected_type: access_ctx.expected_type,
 					access_kind: AccessKind::Read,
 				},
-				block,
-				Some(label),
+				condition,
+				then_block,
+				else_block.as_deref(),
+				block.span,
+				Some(label_index),
 			),
-			ast::Expression::Loop { .. } => self.build_loop_expression(
-				ctx,
-				AccessContext {
-					expected_type: access_ctx.expected_type,
-					access_kind: AccessKind::Read,
-				},
-				block,
-				Some(label),
-			),
+			ast::Expression::Loop { block: inner_block } => self
+				.build_loop_expression(
+					ctx,
+					AccessContext {
+						expected_type: access_ctx.expected_type,
+						access_kind: AccessKind::Read,
+					},
+					inner_block,
+					block.span,
+					Some(label_index),
+				),
 			_ => unreachable!(),
 		}
 	}
@@ -11022,27 +11047,27 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		expr: &Spanned<ast::Expression>,
+		block: &Spanned<ast::Expression>,
+		expr_span: TextSpan,
 		label: Option<LabelIndex>,
 	) -> Result<Expression, ()> {
-		let block = match &expr.inner {
-			ast::Expression::Loop { block } => block,
-			_ => unreachable!(),
-		};
-
 		let file_id = func_ctx.resolve_context.file_id;
 		func_ctx.enter_block(
 			BlockScope {
 				label,
 				kind: BlockKind::Loop,
 				parent: Some(func_ctx.scope_index),
-				span: expr.span,
+				span: expr_span,
 				locals: Vec::new(),
 				inferred_type: TypeIndex::INFER,
 				expected_type: access_ctx.expected_type,
 			},
 			|ctx| {
-				let block = self.build_block_expression(ctx, block)?;
+				let block = self.build_block_expression(
+					ctx,
+					block.inner.as_block_statements(),
+					block.span,
+				)?;
 
 				let scope = &ctx.stack.scopes[ctx.scope_index as usize];
 				let (expected_type, inferred_type) =
@@ -11056,7 +11081,7 @@ impl<'ast> Builder<'ast, '_> {
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
-							span: SourceSpan::new(file_id, expr.span),
+							span: SourceSpan::new(file_id, expr_span),
 						},
 					));
 					return Err(());
@@ -11070,7 +11095,7 @@ impl<'ast> Builder<'ast, '_> {
 						block: Box::new(block),
 					},
 					ty,
-					span: expr.span,
+					span: expr_span,
 				})
 			},
 		)
@@ -11145,22 +11170,17 @@ impl<'ast> Builder<'ast, '_> {
 		})
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn build_if_else_expression(
 		&mut self,
 		ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		expr: &Spanned<ast::Expression>,
+		condition: &Spanned<ast::Expression>,
+		then_block: &Spanned<ast::Expression>,
+		else_block: Option<&Spanned<ast::Expression>>,
+		expr_span: TextSpan,
 		label: Option<LabelIndex>,
 	) -> Result<Expression, ()> {
-		let (condition, then_block, maybe_else_block) = match &expr.inner {
-			ast::Expression::IfElse {
-				condition,
-				then_block,
-				else_block,
-			} => (condition, then_block, else_block),
-			_ => unreachable!(),
-		};
-
 		let condition = self.build_expression(
 			ctx,
 			AccessContext {
@@ -11170,41 +11190,47 @@ impl<'ast> Builder<'ast, '_> {
 			condition,
 		)?;
 
-		let mut then_block = match then_block.inner {
-			ast::Expression::Block { .. } => ctx.enter_block(
-				BlockScope {
-					label,
-					kind: BlockKind::Block,
-					parent: Some(ctx.scope_index),
-					span: then_block.span,
-					locals: Vec::new(),
-					inferred_type: TypeIndex::INFER,
-					expected_type: match maybe_else_block {
-						Some(_) => access_ctx.expected_type,
-						None => TypeIndex::INFER,
-					},
+		let mut then_block = ctx.enter_block(
+			BlockScope {
+				label,
+				kind: BlockKind::Block,
+				parent: Some(ctx.scope_index),
+				span: then_block.span,
+				locals: Vec::new(),
+				inferred_type: TypeIndex::INFER,
+				expected_type: match else_block {
+					Some(_) => access_ctx.expected_type,
+					None => TypeIndex::INFER,
 				},
-				|ctx| self.build_block_expression(ctx, then_block),
-			)?,
-			_ => unreachable!(),
-		};
-		let (else_block, ty) = match maybe_else_block {
-			Some(ast_else_block) => {
-				let mut else_block = match ast_else_block.inner {
-					ast::Expression::Block { .. } => ctx.enter_block(
-						BlockScope {
-							label,
-							kind: BlockKind::Block,
-							parent: Some(ctx.scope_index),
-							span: ast_else_block.span,
-							locals: Vec::new(),
-							inferred_type: TypeIndex::INFER,
-							expected_type: access_ctx.expected_type,
-						},
-						|ctx| self.build_block_expression(ctx, ast_else_block),
-					)?,
-					_ => unreachable!(),
-				};
+			},
+			|ctx| {
+				self.build_block_expression(
+					ctx,
+					then_block.inner.as_block_statements(),
+					then_block.span,
+				)
+			},
+		)?;
+		let (else_block, ty) = match else_block {
+			Some(else_block) => {
+				let mut else_block = ctx.enter_block(
+					BlockScope {
+						label,
+						kind: BlockKind::Block,
+						parent: Some(ctx.scope_index),
+						span: else_block.span,
+						locals: Vec::new(),
+						inferred_type: TypeIndex::INFER,
+						expected_type: access_ctx.expected_type,
+					},
+					|ctx| {
+						self.build_block_expression(
+							ctx,
+							else_block.inner.as_block_statements(),
+							else_block.span,
+						)
+					},
+				)?;
 
 				// Cross-branch comptime coercion: coerce the comptime branch to match the
 				// concrete sibling. Break values inside a comptime branch still need a type
@@ -11237,7 +11263,7 @@ impl<'ast> Builder<'ast, '_> {
 								actual_type: else_block.ty,
 								span: SourceSpan::new(
 									ctx.resolve_context.file_id,
-									ast_else_block.span,
+									else_block.span,
 								),
 							},
 						));
@@ -11271,7 +11297,7 @@ impl<'ast> Builder<'ast, '_> {
 				else_block: else_block.map(Box::new),
 			},
 			ty,
-			span: expr.span,
+			span: expr_span,
 		})
 	}
 
@@ -11327,26 +11353,28 @@ impl<'ast> Builder<'ast, '_> {
 
 		let mut arm_data: Vec<(Pattern, TextSpan, Expression)> =
 			Vec::with_capacity(arms.len());
-		for arm in arms.iter() {
-			let ast_arm = &arm.inner.inner;
+		for arm in arms.iter().map(|arm| &arm.inner.inner) {
 			let pattern =
-				self.build_pattern(ctx, scrutinee_ty, &ast_arm.pattern)?;
-			let body = match ast_arm.body.inner {
-				ast::Expression::Block { .. } => ctx.enter_block(
-					BlockScope {
-						label: None,
-						kind: BlockKind::Block,
-						parent: Some(ctx.scope_index),
-						span: ast_arm.body.span,
-						locals: Vec::new(),
-						inferred_type: TypeIndex::INFER,
-						expected_type: access_ctx.expected_type,
-					},
-					|ctx| self.build_block_expression(ctx, &ast_arm.body),
-				)?,
-				_ => unreachable!(),
-			};
-			arm_data.push((pattern, ast_arm.pattern.span, body));
+				self.build_pattern(ctx, scrutinee_ty, &arm.pattern)?;
+			let body = ctx.enter_block(
+				BlockScope {
+					label: None,
+					kind: BlockKind::Block,
+					parent: Some(ctx.scope_index),
+					span: arm.body.span,
+					locals: Vec::new(),
+					inferred_type: TypeIndex::INFER,
+					expected_type: access_ctx.expected_type,
+				},
+				|ctx| {
+					self.build_block_expression(
+						ctx,
+						arm.body.inner.as_block_statements(),
+						arm.body.span,
+					)
+				},
+			)?;
+			arm_data.push((pattern, arm.pattern.span, body));
 		}
 
 		// Exact-duplicate-pattern / dead-arm-after-wildcard detection — cheap
@@ -11577,13 +11605,10 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		expr: &Spanned<ast::Expression>,
+		value: &Spanned<ast::Expression>,
+		cast_type: &Spanned<ast::TypeExpression>,
+		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let (value, cast_type) = match &expr.inner {
-			ast::Expression::Cast { value, ty } => (value, ty),
-			_ => unreachable!(),
-		};
-
 		let cast_type =
 			self.resolve_type(ctx.resolve_context, ctx.scope, cast_type);
 		if cast_type == TypeIndex::ERROR {
@@ -11593,7 +11618,7 @@ impl<'ast> Builder<'ast, '_> {
 			let expected = access_ctx.expected_type;
 			if expected == TypeIndex::INFER {
 				self.tir.diagnostics.push(report_type_annotation_required(
-					SourceSpan::new(ctx.resolve_context.file_id, expr.span),
+					SourceSpan::new(ctx.resolve_context.file_id, expr_span),
 				));
 				return self.build_expression(ctx, access_ctx, value);
 			}
@@ -11619,7 +11644,7 @@ impl<'ast> Builder<'ast, '_> {
 				TypeFormatter::new(&self.tir, self.interner),
 				value.ty,
 				cast_type,
-				SourceSpan::new(ctx.resolve_context.file_id, expr.span),
+				SourceSpan::new(ctx.resolve_context.file_id, expr_span),
 			));
 		}
 

@@ -305,6 +305,18 @@ struct Builder<'a> {
 	arena: Arena,
 }
 
+#[derive(Clone, Copy)]
+struct BlockComments<'a> {
+	leading: &'a [ast::Comment],
+	trailing: &'a [ast::Comment],
+}
+
+impl BlockComments<'_> {
+	fn is_empty(&self) -> bool {
+		self.leading.is_empty() && self.trailing.is_empty()
+	}
+}
+
 impl<'a> Builder<'a> {
 	#[inline]
 	fn text(&mut self, t: Text) -> NodeId {
@@ -1442,12 +1454,8 @@ impl<'a> Builder<'a> {
 		&mut self,
 		block: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
-		match &block.inner {
-			ast::Expression::Block { statements } => {
-				self.build_block(block.span, statements, true)
-			}
-			_ => unreachable!("function body must be a block expression"),
-		}
+		let statements = block.inner.as_block_statements();
+		self.build_block(block.span, statements, true)
 	}
 
 	fn build_block(
@@ -1456,11 +1464,54 @@ impl<'a> Builder<'a> {
 		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
 		force_break: bool,
 	) -> NodeId {
+		let comments = self.block_comments(block_span, statements);
+		let concat =
+			self.build_block_content(statements, comments, force_break);
+		self.arena.group(concat)
+	}
+
+	/// Computes a block's comment shape once, for reuse both when emitting
+	/// the comments and when deciding whether the block forces a break.
+	fn block_comments(
+		&self,
+		block_span: ast::TextSpan,
+		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
+	) -> BlockComments<'a> {
+		match statements.split_first() {
+			None => BlockComments {
+				leading: self
+					.comments
+					.between(block_span.start, block_span.end),
+				trailing: &[],
+			},
+			Some((first, _)) => {
+				let last_end = statements.last().unwrap().inner.span.end;
+				BlockComments {
+					leading: self
+						.comments
+						.between(block_span.start, first.inner.span.start),
+					trailing: self.comments.between(last_end, block_span.end),
+				}
+			}
+		}
+	}
+
+	/// Same as `build_block`, but leaves the result ungrouped so a caller can
+	/// fold it into a larger group — used by `if`/`else` so the two branches
+	/// share one break decision instead of each block deciding on its own.
+	/// Takes an already-computed `shape` rather than a span so a caller that
+	/// also needs the shape for its own decisions (e.g. `if`/`else` deciding
+	/// whether to force both branches to break) doesn't pay for it twice.
+	fn build_block_content(
+		&mut self,
+		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
+		comments: BlockComments<'a>,
+		force_break: bool,
+	) -> NodeId {
 		let mut items: Vec<NodeId> = vec![self.text(Text::LBrace)];
 
 		if statements.is_empty() {
-			let comments =
-				self.comments.between(block_span.start, block_span.end);
+			let comments = comments.leading;
 			if !comments.is_empty() {
 				let mut inner: Vec<NodeId> = vec![self.hard_line()];
 				for (index, comment) in comments.iter().enumerate() {
@@ -1474,16 +1525,8 @@ impl<'a> Builder<'a> {
 				items.push(self.hard_line());
 			}
 		} else {
-			let leading_comments = self
-				.comments
-				.between(block_span.start, statements[0].inner.span.start);
-			let last_end = statements.last().unwrap().inner.span.end;
-			let trailing_comments =
-				self.comments.between(last_end, block_span.end);
-			let has_comments =
-				!leading_comments.is_empty() || !trailing_comments.is_empty();
-
-			let single = !force_break && !has_comments && statements.len() == 1;
+			let single =
+				!force_break && comments.is_empty() && statements.len() == 1;
 			let mut inner: Vec<NodeId> = Vec::new();
 			inner.push(if single {
 				self.soft_line()
@@ -1491,7 +1534,7 @@ impl<'a> Builder<'a> {
 				self.hard_line()
 			});
 
-			for comment in leading_comments {
+			for comment in comments.leading {
 				inner.push(self.source_text(comment.span));
 				inner.push(self.hard_line());
 			}
@@ -1536,7 +1579,7 @@ impl<'a> Builder<'a> {
 				}
 			}
 
-			for comment in trailing_comments {
+			for comment in comments.trailing {
 				inner.push(self.hard_line());
 				inner.push(self.source_text(comment.span));
 			}
@@ -1551,8 +1594,7 @@ impl<'a> Builder<'a> {
 		}
 
 		items.push(self.text(Text::RBrace));
-		let concat = self.arena.concat(items);
-		self.arena.group(concat)
+		self.arena.concat(items)
 	}
 
 	fn build_call_args(
@@ -1651,11 +1693,35 @@ impl<'a> Builder<'a> {
 				let if_kw = self.text(Text::If);
 				let cond = self.build_expression(condition);
 				let sp = self.text(Text::Space);
-				let then_id = self.build_expression(then_block);
+
+				let then_statements = then_block.inner.as_block_statements();
+				let then_comments =
+					self.block_comments(then_block.span, then_statements);
+				let else_data = else_block.as_deref().map(|b| {
+					let statements = b.inner.as_block_statements();
+					let shape = self.block_comments(b.span, statements);
+					(statements, shape)
+				});
+
+				let force_break = then_statements.len() > 1
+					|| !then_comments.is_empty()
+					|| else_data.is_some_and(|(statements, comments)| {
+						statements.len() > 1 || !comments.is_empty()
+					});
+
+				let then_id = self.build_block_content(
+					then_statements,
+					then_comments,
+					force_break,
+				);
 				let mut items: Vec<NodeId> = vec![if_kw, cond, sp, then_id];
-				if let Some(else_block) = else_block {
+				if let Some((statements, comments)) = else_data {
 					items.push(self.text(Text::Else));
-					items.push(self.build_expression(else_block));
+					items.push(self.build_block_content(
+						statements,
+						comments,
+						force_break,
+					));
 				}
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
