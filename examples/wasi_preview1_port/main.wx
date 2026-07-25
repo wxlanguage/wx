@@ -1,0 +1,686 @@
+// A complete port of every type and function declared in
+// `wasi_preview1/typenames.witx` and `wasi_preview1/wasi_snapshot_preview1.witx`
+// (WASI Preview 1) into wx type definitions and `import` declarations, to
+// find out how much of the spec wx can express as-is and where it can't.
+//
+// Two real limitations surfaced along the way — both worked around below,
+// each documented at its use site:
+//
+//   1. `$fd` is a witx `(handle)` — an opaque resource type with no declared
+//      bit pattern. wx has no distinct opaque-handle/newtype construct, so
+//      it's approximated as a `u32`-repr enum naming only the well-known
+//      standard descriptors (`Fd::Stdin`/`Stdout`/`Stderr`); an arbitrary
+//      host-assigned descriptor (e.g. returned by `path_open`) is brought
+//      into the type with `raw_u32 as Fd`, which wx permits for any integer
+//      value, not just a declared variant — the same escape hatch C's own
+//      enums rely on.
+//
+//   2. witx `union` (a tagged sum type, e.g. `$subscription_u`) has no wx
+//      equivalent at all — wx `enum` is strictly a plain integer
+//      discriminant, no variant carries payload data, and there is no
+//      separate union/ADT construct. The workaround models the real C ABI
+//      the union compiles to instead of the union itself: a tag field
+//      followed by a payload field typed as the *largest* variant, with
+//      every other (smaller) variant read/written by reinterpreting that
+//      same field's address as a pointer to the smaller variant's type —
+//      valid because union members always share the union's base address.
+//      See `SubscriptionU` below.
+//
+// A third issue — a struct-of-structs (`Subscription.u: SubscriptionU`,
+// itself containing `SubscriptionClock`) used to either crash the compiler
+// or emit invalid wasm depending on how it was constructed, since the
+// field-projection, pointer-store/load, and parameter-passing code all
+// assumed an aggregate's fields were already scalar and never recursed into
+// a field that was itself an aggregate. That's now fixed (see
+// `opt::builder::Builder::get_aggregate_field`/`emit_aggregate_store`/
+// `build_aggregate_load`/`build_param_value` and
+// `opt::scheduler::Scheduler::ensure_aggregate_locals`), so the nested
+// structs below are built directly with the natural, ordinary syntax
+// (`alloc::<T>(T::{ ... nested literal ... })`), same as any other struct.
+//
+// Every record type uses `#[fixed_layout]` (declaration-order fields with
+// natural C-style alignment padding, rather than wx's default
+// alignment-sorted layout) so that a WASI host writing raw struct bytes
+// through a pointer lines up with the fields wx code reads back.
+use std::*;
+
+memory heap: Memory where { Size = u32 } { min_pages: 1 };
+
+// ── Plain scalar typedefs ───────────────────────────────────────────────────
+type Size = u32;
+type Filesize = u64;
+type Timestamp = u64;
+type Filedelta = i64;
+type Dircookie = u64;
+type Dirnamlen = u32;
+type Inode = u64;
+type Device = u64;
+type Linkcount = u64;
+type Userdata = u64;
+type Exitcode = u32;
+type Siflags = u16;
+
+// ── `$fd` (handle) ───────────────────────────────────────────────────────────
+// See the file-level comment (limitation 1) for why this is an enum rather
+// than a true opaque handle type.
+enum Fd: u32 {
+  Stdin = 0,
+  Stdout = 1,
+  Stderr = 2,
+}
+
+// ── `$errno` ─────────────────────────────────────────────────────────────────
+enum Errno: u16 {
+  Success = 0,
+  TooBig = 1,
+  Acces = 2,
+  Addrinuse = 3,
+  Addrnotavail = 4,
+  Afnosupport = 5,
+  Again = 6,
+  Already = 7,
+  Badf = 8,
+  Badmsg = 9,
+  Busy = 10,
+  Canceled = 11,
+  Child = 12,
+  Connaborted = 13,
+  Connrefused = 14,
+  Connreset = 15,
+  Deadlk = 16,
+  Destaddrreq = 17,
+  Dom = 18,
+  Dquot = 19,
+  Exist = 20,
+  Fault = 21,
+  Fbig = 22,
+  Hostunreach = 23,
+  Idrm = 24,
+  Ilseq = 25,
+  Inprogress = 26,
+  Intr = 27,
+  Inval = 28,
+  Io = 29,
+  Isconn = 30,
+  Isdir = 31,
+  Loop = 32,
+  Mfile = 33,
+  Mlink = 34,
+  Msgsize = 35,
+  Multihop = 36,
+  Nametoolong = 37,
+  Netdown = 38,
+  Netreset = 39,
+  Netunreach = 40,
+  Nfile = 41,
+  Nobufs = 42,
+  Nodev = 43,
+  Noent = 44,
+  Noexec = 45,
+  Nolck = 46,
+  Nolink = 47,
+  Nomem = 48,
+  Nomsg = 49,
+  Noprotoopt = 50,
+  Nospc = 51,
+  Nosys = 52,
+  Notconn = 53,
+  Notdir = 54,
+  Notempty = 55,
+  Notrecoverable = 56,
+  Notsock = 57,
+  Notsup = 58,
+  Notty = 59,
+  Nxio = 60,
+  Overflow = 61,
+  Ownerdead = 62,
+  Perm = 63,
+  Pipe = 64,
+  Proto = 65,
+  Protonosupport = 66,
+  Prototype = 67,
+  Range = 68,
+  Rofs = 69,
+  Spipe = 70,
+  Srch = 71,
+  Stale = 72,
+  Timedout = 73,
+  Txtbsy = 74,
+  Xdev = 75,
+  Notcapable = 76,
+}
+
+// ── `$rights` (flags, u64) ───────────────────────────────────────────────────
+// A genuinely composable bitset (any subset of these bits is a legal
+// request), not a closed set of named states — so this is a namespaced
+// group of flag constants rather than an enum, same reasoning as every
+// other `flags` type below.
+module Rights {
+  pub const FD_DATASYNC: u64 = 0x1;
+  pub const FD_READ: u64 = 0x2;
+  pub const FD_SEEK: u64 = 0x4;
+  pub const FD_FDSTAT_SET_FLAGS: u64 = 0x8;
+  pub const FD_SYNC: u64 = 0x10;
+  pub const FD_TELL: u64 = 0x20;
+  pub const FD_WRITE: u64 = 0x40;
+  pub const FD_ADVISE: u64 = 0x80;
+  pub const FD_ALLOCATE: u64 = 0x100;
+  pub const PATH_CREATE_DIRECTORY: u64 = 0x200;
+  pub const PATH_CREATE_FILE: u64 = 0x400;
+  pub const PATH_LINK_SOURCE: u64 = 0x800;
+  pub const PATH_LINK_TARGET: u64 = 0x1000;
+  pub const PATH_OPEN: u64 = 0x2000;
+  pub const FD_READDIR: u64 = 0x4000;
+  pub const PATH_READLINK: u64 = 0x8000;
+  pub const PATH_RENAME_SOURCE: u64 = 0x10000;
+  pub const PATH_RENAME_TARGET: u64 = 0x20000;
+  pub const PATH_FILESTAT_GET: u64 = 0x40000;
+  pub const PATH_FILESTAT_SET_SIZE: u64 = 0x80000;
+  pub const PATH_FILESTAT_SET_TIMES: u64 = 0x100000;
+  pub const FD_FILESTAT_GET: u64 = 0x200000;
+  pub const FD_FILESTAT_SET_SIZE: u64 = 0x400000;
+  pub const FD_FILESTAT_SET_TIMES: u64 = 0x800000;
+  pub const PATH_SYMLINK: u64 = 0x1000000;
+  pub const PATH_REMOVE_DIRECTORY: u64 = 0x2000000;
+  pub const PATH_UNLINK_FILE: u64 = 0x4000000;
+  pub const POLL_FD_READWRITE: u64 = 0x8000000;
+  pub const SOCK_SHUTDOWN: u64 = 0x10000000;
+  pub const SOCK_ACCEPT: u64 = 0x20000000;
+}
+
+// ── `$iovec` / `$ciovec` / `$iovec_array` / `$ciovec_array` ─────────────────
+// No struct needed at all: wx's native `[]T` slice ABI already lowers to
+// exactly `{ ptr: u32, len: u32 }` in linear memory (see
+// `examples/wasi_hello_world`), which is bit-for-bit `__wasi_ciovec_t`'s
+// layout. `[]u8` *is* `$ciovec` and `[]mut u8` *is* `$iovec`; `[][]u8` /
+// `[][]mut u8` are the `_array` list variants. Used inline below.
+// ── `$whence` ────────────────────────────────────────────────────────────────
+enum Whence: u8 {
+  Set = 0,
+  Cur = 1,
+  End = 2,
+}
+
+// ── `$filetype` ──────────────────────────────────────────────────────────────
+enum Filetype: u8 {
+  Unknown = 0,
+  BlockDevice = 1,
+  CharacterDevice = 2,
+  Directory = 3,
+  RegularFile = 4,
+  SocketDgram = 5,
+  SocketStream = 6,
+  SymbolicLink = 7,
+}
+
+// ── `$dirent` ────────────────────────────────────────────────────────────────
+#[fixed_layout]
+struct Dirent {
+  d_next: Dircookie,
+  d_ino: Inode,
+  d_namlen: Dirnamlen,
+  d_type: Filetype,
+}
+
+// ── `$advice` ────────────────────────────────────────────────────────────────
+enum Advice: u8 {
+  Normal = 0,
+  Sequential = 1,
+  Random = 2,
+  Willneed = 3,
+  Dontneed = 4,
+  Noreuse = 5,
+}
+
+// ── `$fdflags` (flags, u16) ──────────────────────────────────────────────────
+module Fdflags {
+  pub const APPEND: u16 = 0x1;
+  pub const DSYNC: u16 = 0x2;
+  pub const NONBLOCK: u16 = 0x4;
+  pub const RSYNC: u16 = 0x8;
+  pub const SYNC: u16 = 0x10;
+}
+
+// ── `$fdstat` ────────────────────────────────────────────────────────────────
+#[fixed_layout]
+struct Fdstat {
+  fs_filetype: Filetype,
+  fs_flags: u16,
+  fs_rights_base: u64,
+  fs_rights_inheriting: u64,
+}
+
+// ── `$fstflags` (flags, u16) ─────────────────────────────────────────────────
+module Fstflags {
+  pub const ATIM: u16 = 0x1;
+  pub const ATIM_NOW: u16 = 0x2;
+  pub const MTIM: u16 = 0x4;
+  pub const MTIM_NOW: u16 = 0x8;
+}
+
+// ── `$lookupflags` (flags, u32) ──────────────────────────────────────────────
+module Lookupflags {
+  pub const SYMLINK_FOLLOW: u32 = 0x1;
+}
+
+// ── `$oflags` (flags, u16) ───────────────────────────────────────────────────
+module OFlags {
+  pub const CREAT: u16 = 0x1;
+  pub const DIRECTORY: u16 = 0x2;
+  pub const EXCL: u16 = 0x4;
+  pub const TRUNC: u16 = 0x8;
+}
+
+// ── `$filestat` ──────────────────────────────────────────────────────────────
+#[fixed_layout]
+struct Filestat {
+  dev: Device,
+  ino: Inode,
+  filetype: Filetype,
+  nlink: Linkcount,
+  size: Filesize,
+  atim: Timestamp,
+  mtim: Timestamp,
+  ctim: Timestamp,
+}
+
+// ── `$eventtype` ─────────────────────────────────────────────────────────────
+enum Eventtype: u8 {
+  Clock = 0,
+  FdRead = 1,
+  FdWrite = 2,
+}
+
+// ── `$eventrwflags` (flags, u16) ─────────────────────────────────────────────
+module Eventrwflags {
+  pub const FD_READWRITE_HANGUP: u16 = 0x1;
+}
+
+// ── `$event_fd_readwrite` ────────────────────────────────────────────────────
+#[fixed_layout]
+struct EventFdReadwrite {
+  nbytes: Filesize,
+  flags: u16,
+}
+
+// ── `$event` ─────────────────────────────────────────────────────────────────
+// witx's field name `type` collides with the wx keyword used for type
+// aliases (`type Foo = Bar;`); renamed to `event_type`.
+#[fixed_layout]
+struct Event {
+  userdata: Userdata,
+  error: Errno,
+  event_type: Eventtype,
+  fd_readwrite: EventFdReadwrite,
+}
+
+// ── `$subclockflags` (flags, u16) ────────────────────────────────────────────
+module Subclockflags {
+  pub const SUBSCRIPTION_CLOCK_ABSTIME: u16 = 0x1;
+}
+
+// ── `$subscription_clock` ────────────────────────────────────────────────────
+#[fixed_layout]
+struct SubscriptionClock {
+  id: ClockId,
+  timeout: Timestamp,
+  precision: Timestamp,
+  flags: u16,
+}
+
+// ── `$subscription_fd_readwrite` ─────────────────────────────────────────────
+#[fixed_layout]
+struct SubscriptionFdReadwrite {
+  file_descriptor: Fd,
+}
+
+// ── `$subscription_u` (union — see limitation 2 in the file header) ─────────
+// `SubscriptionClock` (24 bytes, align 8) is the larger of the two variants;
+// `SubscriptionFdReadwrite` (4 bytes, align 4) fits inside its first 4 bytes.
+// Construct/read the `fd_readwrite` case via `subscription_u_as_fd_readwrite`
+// below rather than a second field, which would double-allocate space no
+// real union has.
+#[fixed_layout]
+struct SubscriptionU {
+  tag: Eventtype,
+  clock: SubscriptionClock,
+}
+
+fn subscription_u_as_fd_readwrite(u: *mut SubscriptionU) -> *mut SubscriptionFdReadwrite {
+  (u.*.clock.&mut) as _
+}
+
+// ── `$subscription` ──────────────────────────────────────────────────────────
+#[fixed_layout]
+struct Subscription {
+  userdata: Userdata,
+  u: SubscriptionU,
+}
+
+// ── `$signal` ────────────────────────────────────────────────────────────────
+enum Signal: u8 {
+  None = 0,
+  Hup = 1,
+  Int = 2,
+  Quit = 3,
+  Ill = 4,
+  Trap = 5,
+  Abrt = 6,
+  Bus = 7,
+  Fpe = 8,
+  Kill = 9,
+  Usr1 = 10,
+  Segv = 11,
+  Usr2 = 12,
+  Pipe = 13,
+  Alrm = 14,
+  Term = 15,
+  Chld = 16,
+  Cont = 17,
+  Stop = 18,
+  Tstp = 19,
+  Ttin = 20,
+  Ttou = 21,
+  Urg = 22,
+  Xcpu = 23,
+  Xfsz = 24,
+  Vtalrm = 25,
+  Prof = 26,
+  Winch = 27,
+  Poll = 28,
+  Pwr = 29,
+  Sys = 30,
+}
+
+// ── `$riflags` / `$roflags` (flags, u16) ─────────────────────────────────────
+module Riflags {
+  pub const RECV_PEEK: u16 = 0x1;
+  pub const RECV_WAITALL: u16 = 0x2;
+}
+
+module Roflags {
+  pub const RECV_DATA_TRUNCATED: u16 = 0x1;
+}
+
+// ── `$sdflags` (flags, u8) ────────────────────────────────────────────────────
+module Sdflags {
+  pub const RD: u8 = 0x1;
+  pub const WR: u8 = 0x2;
+}
+
+// ── `$preopentype` ───────────────────────────────────────────────────────────
+enum Preopentype: u8 {
+  Dir = 0,
+}
+
+// ── `$prestat_dir` / `$prestat` ──────────────────────────────────────────────
+// `$prestat` is technically also a witx `union`, but it has exactly one
+// variant, so — unlike `$subscription_u` — a plain tag + single payload
+// field already matches the real layout with no reinterpretation needed.
+#[fixed_layout]
+struct PrestatDir {
+  pr_name_len: Size,
+}
+
+#[fixed_layout]
+struct Prestat {
+  tag: Preopentype,
+  dir: PrestatDir,
+}
+
+// `$clockid`, used by `$subscription_clock` above, declared last among the
+// plain enums only because `SubscriptionClock` needed it first — order
+// otherwise follows typenames.witx.
+enum ClockId: u32 {
+  Realtime = 0,
+  Monotonic = 1,
+  ProcessCputimeId = 2,
+  ThreadCputimeId = 3,
+}
+
+// ── wasi_snapshot_preview1 module ────────────────────────────────────────────
+//
+// Every witx `(result $error (expected T (error $errno)))` return shape
+// lowers, at the raw wasm ABI, to: `T` (if present) written through an
+// extra trailing out-pointer parameter, and the function itself returning
+// only `Errno`. A `(tuple A B)` success payload becomes two trailing
+// out-pointers instead of one. This is the same shape already proven in
+// `examples/wasi_args`'s `args_sizes_get`.
+import "wasi_snapshot_preview1" as wasi {
+  fn args_get(argv: *mut u32, argv_buf: *mut u8) -> Errno;
+  fn args_sizes_get(argc: *mut u32, argv_buf_size: *mut u32) -> Errno;
+  fn environ_get(environ: *mut u32, environ_buf: *mut u8) -> Errno;
+  fn environ_sizes_get(environ_count: *mut u32, environ_buf_size: *mut u32) -> Errno;
+  fn clock_res_get(id: ClockId, resolution: *mut u64) -> Errno;
+  fn clock_time_get(id: ClockId, precision: u64, time: *mut u64) -> Errno;
+  fn fd_advise(fd: Fd, offset: u64, len: u64, advice: Advice) -> Errno;
+  fn fd_allocate(fd: Fd, offset: u64, len: u64) -> Errno;
+  fn fd_close(fd: Fd) -> Errno;
+  fn fd_datasync(fd: Fd) -> Errno;
+  fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno;
+  fn fd_fdstat_set_flags(fd: Fd, flags: u16) -> Errno;
+  fn fd_fdstat_set_rights(
+    fd: Fd,
+    fs_rights_base: u64,
+    fs_rights_inheriting: u64,
+  ) -> Errno;
+  fn fd_filestat_get(fd: Fd, stat: *mut Filestat) -> Errno;
+  fn fd_filestat_set_size(fd: Fd, size: u64) -> Errno;
+  fn fd_filestat_set_times(fd: Fd, atim: u64, mtim: u64, fst_flags: u16) -> Errno;
+  fn fd_pread(fd: Fd, iovs: [][]mut u8, offset: u64, nread: *mut u32) -> Errno;
+  fn fd_prestat_get(fd: Fd, prestat: *mut Prestat) -> Errno;
+  fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_len: u32) -> Errno;
+  fn fd_pwrite(fd: Fd, iovs: [][]u8, offset: u64, nwritten: *mut u32) -> Errno;
+  fn fd_read(fd: Fd, iovs: [][]mut u8, nread: *mut u32) -> Errno;
+  fn fd_readdir(
+    fd: Fd,
+    buf: *mut u8,
+    buf_len: u32,
+    cookie: u64,
+    bufused: *mut u32,
+  ) -> Errno;
+  fn fd_renumber(fd: Fd, to: Fd) -> Errno;
+  fn fd_seek(fd: Fd, offset: i64, whence: Whence, newoffset: *mut u64) -> Errno;
+  fn fd_sync(fd: Fd) -> Errno;
+  fn fd_tell(fd: Fd, offset: *mut u64) -> Errno;
+  fn fd_write(fd: Fd, iovs: [][]u8, nwritten: *mut u32) -> Errno;
+  fn path_create_directory(fd: Fd, path: []u8) -> Errno;
+  fn path_filestat_get(fd: Fd, flags: u32, path: []u8, stat: *mut Filestat) -> Errno;
+  fn path_filestat_set_times(
+    fd: Fd,
+    flags: u32,
+    path: []u8,
+    atim: u64,
+    mtim: u64,
+    fst_flags: u16,
+  ) -> Errno;
+  fn path_link(
+    old_fd: Fd,
+    old_flags: u32,
+    old_path: []u8,
+    new_fd: Fd,
+    new_path: []u8,
+  ) -> Errno;
+  fn path_open(
+    fd: Fd,
+    dirflags: u32,
+    path: []u8,
+    oflags: u16,
+    fs_rights_base: u64,
+    fs_rights_inheriting: u64,
+    fdflags: u16,
+    opened_fd: *mut u32,
+  ) -> Errno;
+  fn path_readlink(
+    fd: Fd,
+    path: []u8,
+    buf: *mut u8,
+    buf_len: u32,
+    bufused: *mut u32,
+  ) -> Errno;
+  fn path_remove_directory(fd: Fd, path: []u8) -> Errno;
+  fn path_rename(fd: Fd, old_path: []u8, new_fd: Fd, new_path: []u8) -> Errno;
+  fn path_symlink(old_path: []u8, fd: Fd, new_path: []u8) -> Errno;
+  fn path_unlink_file(fd: Fd, path: []u8) -> Errno;
+  // `$in`/`$out` are raw pointers to caller-managed arrays with the element
+  // count passed separately (`nsubscriptions`), *not* witx `list`s — so
+  // these stay single-element pointers rather than `[]T` slices; the slice
+  // ABI's implicit length would duplicate (and could disagree with)
+  // `nsubscriptions`.
+  fn poll_oneoff(
+    in_: *Subscription,
+    out: *mut Event,
+    nsubscriptions: u32,
+    nevents: *mut u32,
+  ) -> Errno;
+  fn proc_exit(rval: u32);
+  fn proc_raise(sig: Signal) -> Errno;
+  fn sched_yield() -> Errno;
+  fn random_get(buf: []mut u8) -> Errno;
+  fn sock_accept(fd: Fd, flags: u16, new_fd: *mut u32) -> Errno;
+  fn sock_recv(
+    fd: Fd,
+    ri_data: [][]mut u8,
+    ri_flags: u16,
+    ro_datalen: *mut u32,
+    ro_flags: *mut u16,
+  ) -> Errno;
+  fn sock_send(fd: Fd, si_data: [][]u8, si_flags: u16, so_datalen: *mut u32) -> Errno;
+  fn sock_shutdown(fd: Fd, how: u8) -> Errno;
+}
+
+// ── Demo ──────────────────────────────────────────────────────────────────
+// Everything above type-checks and reaches codegen, which proves wx accepts
+// the declarations — but that alone doesn't prove the trickiest new piece
+// (the `subscription_u` tag+payload reinterpretation) actually produces
+// correct bytes at runtime, or that a `#[fixed_layout]` record a *real* WASI
+// host writes lines up with the fields wx code reads back. `main` below
+// exercises both, plus a couple of representative calls from elsewhere in
+// the spec, and prints results instead of just asserting success so a
+// human running it can see real values came back.
+global mut bump: *u8 = heap::DATA_END;
+
+struct BumpAllocator {}
+
+impl Allocator for BumpAllocator {
+  type Mem = heap;
+
+  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
+    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+    local new_end = ptr + layout.size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      if heap.grow(needed) == -1 { unreachable }
+    }
+    bump = new_end as *u8;
+    ptr as *mut u8
+  }
+}
+
+fn write_all(fd: Fd, bytes: []u8) {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+  io_vecs[0] = bytes;
+  local nwritten = alloc.alloc::<u32>(0);
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+}
+
+// Decimal, not hex, so the demo output reads naturally; values here are all
+// small (enum tags, event counts), so a 10-digit buffer is more than enough.
+fn write_decimal(fd: Fd, mut value: u32) {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local buf = alloc.alloc_slice::<u8>(10);
+  local mut i: u32 = 10;
+  if value == 0 {
+    i -= 1;
+    buf[i] = '0' as u8;
+  } else {
+    loop {
+      if value == 0 { break };
+      i -= 1;
+      buf[i] = '0' as u8 + (value % 10) as u8;
+      value /= 10;
+    }
+  }
+  write_all(fd, slice_from_parts(ptr::add(buf.ptr(), i), 10 - i));
+}
+
+fn main() {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  
+  // clock_time_get: a plain scalar (u64) out-param.
+  local time_ptr = alloc.alloc::<u64>(0);
+  if wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success {
+    unreachable
+  };
+  write_all(Fd::Stdout, "clock_time_get: ok\n");
+  
+  // fd_fdstat_get: reads a #[fixed_layout] record back through a pointer a
+  // real host wrote into — proves the struct's byte layout actually lines
+  // up, not just that wx accepted the declaration.
+  local stat_ptr = alloc.alloc(Fdstat::{
+    fs_filetype: Filetype::Unknown,
+    fs_flags: 0,
+    fs_rights_base: 0,
+    fs_rights_inheriting: 0,
+  });
+  if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success { unreachable };
+  write_all(Fd::Stdout, "fd_fdstat_get: fs_filetype=");
+  write_decimal(Fd::Stdout, stat_ptr.*.fs_filetype as u32);
+  write_all(Fd::Stdout, "\n");
+  
+  // poll_oneoff: one clock subscription (relative 5ms timeout), read back
+  // through the raw-pointer-array ABI. Not every host implements this, so
+  // the errno is printed rather than asserted on.
+  //
+  // `Subscription` nests two levels deep (`u.clock`) — plain nested struct
+  // literals, same as any other struct.
+  local sub_ptr = alloc.alloc(Subscription::{
+    userdata: 0,
+    u: SubscriptionU::{
+      tag: Eventtype::Clock,
+      clock: SubscriptionClock::{
+        id: ClockId::Monotonic,
+        timeout: 5000000,
+        precision: 0,
+        flags: 0,
+      },
+    },
+  });
+  local event_ptr = alloc.alloc(Event::{
+    userdata: 0,
+    error: Errno::Success,
+    event_type: Eventtype::Clock,
+    fd_readwrite: EventFdReadwrite::{ nbytes: 0, flags: 0 },
+  });
+  local nevents_ptr = alloc.alloc::<u32>(0);
+  local poll_result = wasi::poll_oneoff(sub_ptr, event_ptr, 1, nevents_ptr);
+  write_all(Fd::Stdout, "poll_oneoff: errno=");
+  write_decimal(Fd::Stdout, poll_result as u32);
+  write_all(Fd::Stdout, " nevents=");
+  write_decimal(Fd::Stdout, nevents_ptr.*);
+  write_all(Fd::Stdout, "\n");
+  
+  // Round-trip the union workaround itself, independent of any real WASI
+  // call: write through the smaller variant (SubscriptionFdReadwrite),
+  // read back through the same bytes via the larger field's address.
+  local scratch = alloc.alloc(SubscriptionU::{
+    tag: Eventtype::FdRead,
+    clock: SubscriptionClock::{
+      id: ClockId::Realtime,
+      timeout: 0,
+      precision: 0,
+      flags: 0,
+    },
+  });
+  local recovered = subscription_u_as_fd_readwrite(scratch).*.file_descriptor;
+  write_all(Fd::Stdout, "union round-trip: file_descriptor=");
+  write_decimal(Fd::Stdout, recovered as u32);
+  write_all(Fd::Stdout, "\n");
+}
+
+export {
+  main as "_start",
+  heap as "memory",
+}

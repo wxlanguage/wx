@@ -3275,6 +3275,7 @@ impl<'ctx> Parser<'ctx> {
 			| Token::PlusEq
 			| Token::MinusEq
 			| Token::StarEq
+			| Token::SlashEq
 			| Token::PercentEq => Some((
 				Parser::parse_binary_expression,
 				BindingPower::Assignment,

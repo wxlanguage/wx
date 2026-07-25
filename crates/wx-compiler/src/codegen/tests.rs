@@ -166,6 +166,38 @@ fn test_arithmetic_operations() {
 	assert_eq!(rem.call(&mut store, (20, 7)).unwrap(), 6);
 }
 
+/// `led_lookup`'s assignment-operator match arm (`ast/mod.rs`) used to list
+/// `Eq | PlusEq | MinusEq | StarEq | PercentEq` and omit `SlashEq`, so `/=`
+/// silently failed to parse as an infix continuation: `value /= 10;` parsed
+/// as the bare expression-statement `value` (tripping "value must be used")
+/// followed by a dangling `/= 10;` fragment, rather than as a division
+/// assignment. `+=`/`-=`/`*=`/`%=` all worked; only `/=` was missing.
+#[test]
+fn test_compound_assignment_operators() {
+	let case = TestCase::new(indoc! {"
+        fn all(mut a: i32, b: i32) -> i32 {
+            a += b;
+            a -= b;
+            a *= b;
+            a /= b;
+            a %= b;
+            a
+        }
+        export { all }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let all = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "all")
+		.unwrap();
+	// a=20,b=3: (20+3)=23, (23-3)=20, (20*3)=60, (60/3)=20, (20%3)=2
+	assert_eq!(all.call(&mut store, (20, 3)).unwrap(), 2);
+}
+
 #[test]
 fn test_comparison_operations() {
 	let case = TestCase::new(indoc! {"
@@ -302,6 +334,79 @@ fn test_loops() {
 		.unwrap();
 	assert_eq!(sum_to_n.call(&mut store, 10).unwrap(), 55);
 	assert_eq!(sum_to_n.call(&mut store, 100).unwrap(), 5050);
+}
+
+/// A loop-invariant pointer held in a local (here, a heap-allocated slice's
+/// base address) must not collapse onto the same WASM local as a temporary
+/// that's freshly written on every iteration. If they do (see
+/// `coalesce_locals` in `opt/scheduler.rs`), the temporary's write on
+/// iteration N clobbers the invariant pointer before iteration N+1 rereads
+/// it, and the copy silently reads through the wrong address from the third
+/// iteration onward. Function *parameters* are exempt from coalescing (their
+/// slots are fixed by the WASM ABI), so this needs the base pointer to come
+/// from a `local` — hence the bump allocator — to actually land the two
+/// values in the pool of spillable locals the coalescer operates on.
+#[test]
+fn test_loop_copy_does_not_alias_locals_across_iterations() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 };
+
+        global mut bump: heap::*u8 = heap::DATA_END;
+
+        struct BumpAllocator {}
+        impl Allocator for BumpAllocator {
+            type Mem = heap;
+            fn reserve(self: heap::*mut Self, layout: Layout<heap>) -> heap::*mut u8 {
+                local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+                local new_end = ptr + layout.size;
+                bump = new_end as heap::*u8;
+                ptr as heap::*mut u8
+            }
+        }
+
+        fn copy4() {
+            local alloc: heap::*mut BumpAllocator = ptr::null_mut();
+            local arr = alloc.alloc_slice::<u32>(4);
+            arr[0] = 10;
+            arr[1] = 20;
+            arr[2] = 30;
+            arr[3] = 40;
+            local out = alloc.alloc_slice::<u32>(4);
+
+            local mut i: u32 = 0;
+            loop {
+                if i == 4 { break };
+                out[i] = arr[i];
+                i += 1;
+            }
+        }
+
+        export { heap, copy4 }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+	let mem = instance.get_memory(&mut store, "heap").unwrap();
+	let copy4 = instance
+		.get_typed_func::<(), ()>(&mut store, "copy4")
+		.unwrap();
+
+	copy4.call(&mut store, ()).unwrap();
+
+	// The bump allocator hands out `arr` at byte 0 and `out` right after it
+	// at byte 16 (both 4×u32 = 16 bytes), in that allocation order.
+	let mut got = [0i32; 4];
+	for (i, slot) in got.iter_mut().enumerate() {
+		let mut bytes = [0u8; 4];
+		mem.read(&mut store, 16 + i * 4, &mut bytes).unwrap();
+		*slot = i32::from_le_bytes(bytes);
+	}
+	assert_eq!(got, [10, 20, 30, 40]);
 }
 
 #[test]
@@ -1577,6 +1682,177 @@ fn test_struct_pointer_load_and_store() {
 	insta::assert_snapshot!(wasmprinter::print_bytes(&case.bytecode).unwrap());
 }
 
+/// A struct-of-structs (a field whose own type is itself a struct) used to
+/// crash the compiler or emit invalid WASM depending on how it was
+/// constructed:
+/// - held *by value* (a plain `local x = Outer::{ inner: Inner::{...} };`,
+///   or passed through a generic function parameter) panicked with
+///   "aggregate field must be scalar" — the field-projection and
+///   locals-spilling code assumed every aggregate field was already scalar
+///   and never recursed into a nested aggregate.
+/// - written through a pointer in one statement avoided the panic but
+///   corrupted the emitted store sequence the moment the *inner* literal
+///   had more than one field, regardless of nesting depth.
+///
+/// This exercises the by-value / local-binding path (nested field read,
+/// then a sibling-field mutation that must leave the untouched nested field
+/// intact) at three levels of nesting.
+#[test]
+fn test_nested_struct_field_access_on_local() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn read_deep_id() -> u64 {
+            local t = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            t.mid.deep.id
+        }
+
+        fn mutate_sibling_field_preserves_nested() -> u64 {
+            local mut t = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            t.flag = 9;
+            t.mid.deep.id
+        }
+
+        export { heap, read_deep_id, mutate_sibling_field_preserves_nested }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	let read_deep_id = instance
+		.get_typed_func::<(), u64>(&mut store, "read_deep_id")
+		.unwrap();
+	assert_eq!(read_deep_id.call(&mut store, ()).unwrap(), 77);
+
+	let mutate = instance
+		.get_typed_func::<(), u64>(
+			&mut store,
+			"mutate_sibling_field_preserves_nested",
+		)
+		.unwrap();
+	assert_eq!(mutate.call(&mut store, ()).unwrap(), 77);
+}
+
+/// The pointer-store/load side of the same bug: a nested literal written
+/// through a pointer in one statement, read back through a pointer, and a
+/// leaf field mutated in place through a pointer-field chain — all at three
+/// levels of nesting, with an inner struct that has more than one field
+/// (the shape that used to corrupt the store sequence).
+#[test]
+fn test_nested_struct_pointer_store_and_load() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+
+        // #[fixed_layout] so the byte offsets asserted below (declaration
+        // order, not alignment-sorted) are pinned rather than incidental.
+        #[fixed_layout]
+        struct Deep { id: u64 }
+        #[fixed_layout]
+        struct Mid { tag: u8, deep: Deep }
+        #[fixed_layout]
+        struct Top { flag: u8, mid: Mid }
+
+        fn store_nested_literal(p: heap::*mut Top) {
+            p.* = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 3 } } };
+        }
+
+        fn read_deep_id(p: heap::*Top) -> u64 {
+            p.*.mid.deep.id
+        }
+
+        fn write_deep_id(p: heap::*mut Top, v: u64) {
+            p.*.mid.deep.id = v;
+        }
+
+        export { heap, store_nested_literal, read_deep_id, write_deep_id }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+	let mem = instance.get_memory(&mut store, "heap").unwrap();
+
+	let store_nested_literal = instance
+		.get_typed_func::<i32, ()>(&mut store, "store_nested_literal")
+		.unwrap();
+	let read_deep_id = instance
+		.get_typed_func::<i32, u64>(&mut store, "read_deep_id")
+		.unwrap();
+	let write_deep_id = instance
+		.get_typed_func::<(i32, u64), ()>(&mut store, "write_deep_id")
+		.unwrap();
+
+	store_nested_literal.call(&mut store, 0).unwrap();
+	assert_eq!(read_deep_id.call(&mut store, 0).unwrap(), 3);
+
+	// `Top` layout: flag@0 (u8), mid@8 (align 8: tag@8, deep.id@16).
+	// Confirm the literal store landed at the right byte offsets, not just
+	// that `read_deep_id` reports the right value through the same (buggy,
+	// pre-fix) code path.
+	let mut byte = [0u8; 1];
+	mem.read(&mut store, 0, &mut byte).unwrap();
+	assert_eq!(byte[0], 1, "flag@0");
+	mem.read(&mut store, 8, &mut byte).unwrap();
+	assert_eq!(byte[0], 2, "mid.tag@8");
+	let mut qword = [0u8; 8];
+	mem.read(&mut store, 16, &mut qword).unwrap();
+	assert_eq!(u64::from_le_bytes(qword), 3, "mid.deep.id@16");
+
+	write_deep_id.call(&mut store, (0, 42)).unwrap();
+	assert_eq!(read_deep_id.call(&mut store, 0).unwrap(), 42);
+	// Sibling fields must survive the nested-field write untouched.
+	mem.read(&mut store, 0, &mut byte).unwrap();
+	assert_eq!(byte[0], 1, "flag@0 survives nested write");
+	mem.read(&mut store, 8, &mut byte).unwrap();
+	assert_eq!(byte[0], 2, "mid.tag@8 survives nested write");
+}
+
+/// A nested-aggregate function *parameter* (not inlined away): the caller's
+/// argument-flattening and the callee's parameter-rebinding both used to
+/// assume every aggregate field was scalar.
+#[test]
+fn test_nested_struct_function_parameter() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn get_deep_id(t: Top) -> u64 {
+            t.mid.deep.id
+        }
+
+        fn call_it() -> u64 {
+            get_deep_id(Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 99 } } })
+        }
+
+        export { heap, call_it }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+	let call_it = instance
+		.get_typed_func::<(), u64>(&mut store, "call_it")
+		.unwrap();
+	assert_eq!(call_it.call(&mut store, ()).unwrap(), 99);
+}
+
 #[test]
 fn test_struct_field_write_through_pointer() {
 	// `ptr.*.field = val` — field write through a mutable pointer.
@@ -2592,6 +2868,47 @@ fn test_address_of_struct_field() {
 	assert_eq!(x_addr.call(&mut store, base).unwrap(), base);
 	// y is the second field: address == base + 4
 	assert_eq!(y_addr.call(&mut store, base).unwrap(), base + 4);
+}
+
+/// A widening `as` cast on a scalar-compatible pair (e.g. `u16 as u32`, both
+/// `ValueType::I32` at the wasm level) is elided in TIR by mutating the
+/// value expression's `.ty` in place rather than wrapping it in a cast node
+/// (`build_cast_expression`, tir/builder.rs) — harmless for a value already
+/// sitting in a register, but this used to also corrupt a pending memory
+/// read: `p.*.field as u32` reused that mutated (widened) type to pick the
+/// load's byte width too, so a `u16` field loaded as `i32.load` instead of
+/// `i32.load16_u`, silently pulling in whatever bytes follow it in the
+/// struct. Fixed by deriving the load's access width from the `Place`'s own
+/// type, which the cast elision never touches.
+#[test]
+fn test_narrow_field_cast_does_not_overread_adjacent_bytes() {
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        struct S { a: u8, b: u64, c: u16 }
+
+        fn read_c(p: heap::*S) -> u32 { p.*.c as u32 }
+
+        export { heap, read_c }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+	let mem = instance.get_memory(&mut store, "heap").unwrap();
+	let read_c = instance
+		.get_typed_func::<i32, u32>(&mut store, "read_c")
+		.unwrap();
+
+	// Sorted layout (descending alignment) places `b: u64` @0, `c: u16` @8,
+	// `a: u8` @10. Poison every byte around `c` so an overread is visible.
+	mem.write(&mut store, 0, &[0xFFu8; 16]).unwrap();
+	mem.write(&mut store, 8, &1234u16.to_le_bytes()).unwrap();
+
+	assert_eq!(read_c.call(&mut store, 0).unwrap(), 1234);
 }
 
 #[test]

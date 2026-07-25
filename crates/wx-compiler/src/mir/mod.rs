@@ -2934,7 +2934,7 @@ impl<'tir> Builder<'tir> {
 						offset,
 						memory,
 					},
-					ty: self.lower_type_index(expr.ty),
+					ty: self.lower_type_index(place.ty),
 				}
 			}
 			tir::ExprKind::AddressOf { place, .. } => {

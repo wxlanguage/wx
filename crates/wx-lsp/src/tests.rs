@@ -10,10 +10,12 @@ use wx_compiler::vfs::FileId;
 use crate::completion::{completion_items, find_enclosing_function};
 use crate::symbol_index::SymbolKind;
 use crate::{
-	Backend, CompiledRoot, OpenDocument, ServerState, analyze_root,
-	build_service, compute_refresh, diagnostic_publish_paths,
-	discover_crate_root, find_active_call, implementation_locations,
-	owning_root, reference_search_kinds, symbol_kind_to_token_type,
+	Backend, CompiledRoot, OpenDocument, ServerState, TokenType, analyze_root,
+	build_service, byte_to_position, compute_refresh,
+	diagnostic_publish_paths, discover_crate_root, find_active_call,
+	implementation_locations, owning_root, position_to_offset,
+	position_to_offset_in_str, reference_search_kinds, symbol_hover_text,
+	symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
 use wx_compiler::tir::TypeParamOwner;
@@ -626,6 +628,72 @@ fn completion_prefix_filters_results() {
 }
 
 #[test]
+fn position_conversion_handles_non_ascii_line_correctly() {
+	// Regression test: `position_to_offset`/`position_to_offset_in_str`
+	// treated `Position::character` (a UTF-16 code unit offset per the LSP
+	// spec) as if it were a raw byte offset. A line with non-ASCII content
+	// before the cursor throws that off — e.g. Cyrillic is 1 UTF-16 unit but
+	// 2 UTF-8 bytes per character — so the computed byte offset landed short
+	// of the intended column, and for some columns *inside* a multi-byte
+	// character. Slicing the source at that offset (as `completion_items`
+	// does) then panicked with "not a char boundary". This is a faithful
+	// reproduction of a real crash reported against `// привет al`-shaped
+	// input: character offset 14 (UTF-16 units before "al") used as a byte
+	// offset lands inside the two-byte encoding of 'в'.
+	let source =
+		"fn alpha() -> i32 { 0 }\nfn beta() -> i32 {\n    // привет al\n}";
+	let al_byte_offset = source.rfind("al").unwrap();
+	let position = Position {
+		line: 2,
+		character: 14,
+	};
+
+	let offset = position_to_offset_in_str(source, position)
+		.expect("position should resolve to a byte offset");
+	assert_eq!(
+		offset, al_byte_offset,
+		"UTF-16 character offset should map to the byte offset right before `al`"
+	);
+	assert!(
+		source.is_char_boundary(offset),
+		"resolved offset must land on a char boundary"
+	);
+
+	let root = PathBuf::from("/test/main.wx");
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	// The compiled-file-index path (used once a file isn't an open/unsaved
+	// buffer) must agree with the direct-source path above.
+	let indexed_offset =
+		position_to_offset(&compiled.graph.files, file_id, position)
+			.expect("position should resolve to a byte offset") as usize;
+	assert_eq!(indexed_offset, al_byte_offset);
+
+	// Round-tripping back must recover the same UTF-16 count, not a byte count.
+	let recovered =
+		byte_to_position(&compiled.graph.files, file_id, al_byte_offset)
+			.expect("byte offset should resolve to a position");
+	assert_eq!(recovered, position);
+
+	// And the offset must actually be usable end-to-end: completion right
+	// after "al" should still see it as a two-character prefix.
+	let items = completion_items(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.symbol_index,
+		file_id,
+		source,
+		offset,
+	);
+	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+	assert!(
+		labels.contains(&"alpha"),
+		"expected `alpha` in completions; got: {labels:?}"
+	);
+}
+
+#[test]
 fn completion_hides_sibling_module_items_without_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
@@ -1018,6 +1086,63 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 		"Status",
 		"go-to-definition should land on the `enum Status` name"
 	);
+}
+
+#[test]
+fn type_alias_used_as_return_type_resolves_to_its_definition() {
+	// Regression test: `build_symbol_index` never visited `tir.type_aliases`
+	// at all, and `SymbolKind` had no `TypeAlias` variant — so a `type Id =
+	// u32;` alias had no definition/reference entries whatsoever. Every
+	// LSP feature keyed off `SymbolKind` (go-to-definition, hover, semantic
+	// tokens) silently did nothing for a name that resolved to a type alias.
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		type Id = u32;
+
+		fn test() -> Id {
+		    0 as Id
+		}
+	"};
+	let (_, compiled) = compile_source(&root, source);
+	let file_id = file_id_for(&compiled, &root);
+
+	// Offset of `Id` in `-> Id`, not the `0 as Id` cast.
+	let return_type_offset = source.find("-> Id").unwrap() + "-> ".len();
+
+	let found = compiled
+		.symbol_index
+		.find_at_position(file_id, return_type_offset as u32)
+		.unwrap_or_else(|| {
+			panic!("expected a symbol at the return type position")
+		});
+
+	assert!(
+		matches!(found.kind, SymbolKind::TypeAlias(_)),
+		"expected the return type reference to resolve to the type alias; got: {found:?}"
+	);
+
+	let definition = compiled
+		.symbol_index
+		.definitions
+		.iter()
+		.find(|d| d.kind == found.kind)
+		.expect("expected a matching type alias definition entry");
+	assert_eq!(
+		&source[definition.source.span.start as usize
+			..definition.source.span.end as usize],
+		"Id",
+		"go-to-definition should land on the `type Id` name"
+	);
+
+	assert!(
+		matches!(symbol_kind_to_token_type(found.kind), Some(TokenType::Type)),
+		"a type alias reference should be colored as a type"
+	);
+
+	let hover =
+		symbol_hover_text(&compiled.tir, &compiled.graph.interner, &found.kind)
+			.expect("expected hover text for the type alias");
+	assert_eq!(hover, "type Id = u32");
 }
 
 #[test]

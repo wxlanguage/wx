@@ -1597,13 +1597,47 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
+	/// An expression that already introduces its own hard-broken multi-line
+	/// layout (a struct literal, or a single-argument call hugging one) —
+	/// safe to print attached to whatever precedes it (`(`, `=`, ...)
+	/// without wrapping it in an extra `line()`/`indent()` pair.
+	///
+	/// This matters because `Renderer::measure_flat` stops measuring at the
+	/// first hard line it finds and returns the (short) width accumulated so
+	/// far, so a `Group` containing a struct literal several calls deep is
+	/// always measured as "fits" and rendered `Flat`. `Indent` nodes bump
+	/// `self.indent` unconditionally, even in `Flat` mode where their own
+	/// `line()`/`soft_line()` renders as nothing — so every such wrapper
+	/// still stacks an extra, visually pointless indent level onto the
+	/// struct literal's own fields. Skipping the wrapper for huggable values
+	/// keeps only the indent the literal adds for itself.
+	fn is_huggable(expr: &ast::Expression) -> bool {
+		if expr.is_block_like() {
+			return true;
+		}
+		match expr {
+			ast::Expression::Call { arguments, .. } => {
+				arguments.len() == 1
+					&& Self::is_huggable(&arguments[0].inner.inner)
+			}
+			ast::Expression::MethodCall(mc) => {
+				mc.arguments.len() == 1
+					&& Self::is_huggable(&mc.arguments[0].inner.inner)
+			}
+			_ => false,
+		}
+	}
+
 	fn build_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
 		arguments: &[ast::Separated<ast::Spanned<ast::Expression>>],
 	) {
 		out.push(self.text(Text::LParen));
-		if !arguments.is_empty() {
+		if arguments.len() == 1 && Self::is_huggable(&arguments[0].inner.inner)
+		{
+			out.push(self.build_expression(&arguments[0].inner));
+		} else if !arguments.is_empty() {
 			let mut arg_nodes: Vec<NodeId> = vec![self.line()];
 			for (index, arg) in arguments.iter().enumerate() {
 				arg_nodes.push(self.build_expression(&arg.inner));
@@ -2043,7 +2077,7 @@ impl<'a> Builder<'a> {
 					items.push(self.build_type_expression(&annotation.inner));
 				}
 				let value_node = self.build_expression(value);
-				if value.inner.is_block_like() {
+				if Self::is_huggable(&value.inner) {
 					items.push(self.text(Text::EqSp));
 					items.push(value_node);
 				} else {

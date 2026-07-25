@@ -1135,11 +1135,36 @@ impl<'f> Scheduler<'f> {
 				field_index,
 				..
 			} => {
-				// Ensure the aggregate's per-field locals are populated, then read
-				// the requested field.
+				// Ensure the aggregate's per-*leaf* locals are populated (see
+				// `ensure_aggregate_locals`), then find the one belonging to
+				// this (always-scalar, per `get_aggregate_field`) top-level
+				// field: `node_to_aggregate_locals` is flattened, so a field
+				// preceded by a nested-aggregate sibling doesn't sit at
+				// `field_index` directly — skip past every leaf contributed
+				// by earlier sibling fields first.
 				self.ensure_aggregate_locals(aggregate);
-				let field_local = self.node_to_aggregate_locals[&aggregate]
-					[field_index as usize];
+				let aggregate_index =
+					match &self.func.data_nodes[aggregate as usize].kind {
+						DataNodeKind::Aggregate {
+							aggregate_index, ..
+						}
+						| DataNodeKind::AggregateCallResult {
+							aggregate_index,
+						} => *aggregate_index,
+						_ => unreachable!(
+							"AggregateGet::aggregate must itself be an aggregate node"
+						),
+					};
+				let leaf_offset: usize = self.mir.aggregates
+					[aggregate_index as usize]
+					.values[..field_index as usize]
+					.iter()
+					.map(|&t| {
+						Self::flatten_mir_type(t, &self.mir.aggregates).len()
+					})
+					.sum();
+				let field_local =
+					self.node_to_aggregate_locals[&aggregate][leaf_offset];
 				self.body.push(Instruction::LocalGet(field_local));
 			}
 
@@ -1237,9 +1262,14 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Ensure per-field WASM locals exist for an `Aggregate` node.
-	/// Emits each field expression and spills it to a fresh local, then records
-	/// the mapping in `node_to_aggregate_locals`.
+	/// Ensure per-*leaf* WASM locals exist for an `Aggregate` node.
+	/// Emits each scalar field expression and spills it to a fresh local; a
+	/// field that is itself an aggregate has no local of its own — it's
+	/// walked into recursively, and its own (already- or newly-computed)
+	/// leaf locals are spliced in directly, so `node_to_aggregate_locals`
+	/// always ends up holding one entry per *leaf* scalar, flattened in the
+	/// same pre-order as `flatten_mir_type`. Records the mapping in
+	/// `node_to_aggregate_locals`.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
 	/// are populated by `emit_control` when the call instruction is emitted.
@@ -1262,20 +1292,26 @@ impl<'f> Scheduler<'f> {
 					"ensure_aggregate_locals called on non-aggregate node"
 				),
 			};
-		let field_types: Vec<ScalarType> = self.mir.aggregates
-			[aggregate_index as usize]
-			.values
-			.iter()
-			.map(|&t| {
-				ScalarType::try_from(t).expect("aggregate field must be scalar")
-			})
-			.collect();
 		let mut locals = Vec::with_capacity(fields.len());
 		for (i, &field_node) in fields.iter().enumerate() {
-			self.emit_value(field_node);
-			let local = self.alloc_local(field_types[i]);
-			self.body.push(Instruction::LocalSet(local));
-			locals.push(local);
+			let field_ty =
+				self.mir.aggregates[aggregate_index as usize].values[i];
+			match field_ty {
+				mir::Type::Aggregate { .. } => {
+					self.ensure_aggregate_locals(field_node);
+					locals.extend_from_slice(
+						&self.node_to_aggregate_locals[&field_node],
+					);
+				}
+				_ => {
+					let scalar_ty = ScalarType::try_from(field_ty)
+						.expect("non-aggregate field must be scalar");
+					self.emit_value(field_node);
+					let local = self.alloc_local(scalar_ty);
+					self.body.push(Instruction::LocalSet(local));
+					locals.push(local);
+				}
+			}
 		}
 		self.node_to_aggregate_locals
 			.insert(node, locals.into_boxed_slice());
@@ -1614,6 +1650,62 @@ fn coalesce_locals(
 				}
 			}
 			_ => {}
+		}
+	}
+
+	// A `[first_write, last_read]` window computed from flat textual positions
+	// is only valid for straight-line code: it implicitly assumes every
+	// instruction executes at most once. `Loop` is the one construct that
+	// breaks that assumption — its body is a single textual span that
+	// actually runs many times, via a back-edge (`Br`) to the `Loop`
+	// instruction itself. A slot written once before the loop and read once
+	// inside it gets `last_read` pinned to that first textual occurrence,
+	// even though the same read recurs on every later iteration. If some
+	// other slot's write/read pair falls entirely after that position but
+	// still inside the loop body, the ranges look non-overlapping and the
+	// allocator happily hands them the same physical local — which then
+	// gets clobbered by the second slot's write before the first slot's
+	// value is read again on the next iteration.
+	//
+	// Fix: widen every slot touched anywhere inside a loop so its range
+	// covers that loop's entire `[Loop, End]` span (and transitively every
+	// loop it's nested in, since the same argument applies at each nesting
+	// level). Two slots both live inside the same loop then always overlap
+	// and can never be coalesced together, which is what correctness under
+	// repeated execution requires.
+	let mut frame_starts: Vec<usize> = Vec::new();
+	let mut loop_spans: Vec<(usize, usize)> = Vec::new();
+	for (i, instr) in body.iter().enumerate() {
+		match instr {
+			Instruction::Block { .. } | Instruction::If { .. } => {
+				frame_starts.push(usize::MAX);
+			}
+			Instruction::Loop { .. } => {
+				frame_starts.push(i);
+			}
+			Instruction::End => {
+				if let Some(start) = frame_starts.pop() {
+					if start != usize::MAX {
+						loop_spans.push((start, i));
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
+	for &(ls, le) in &loop_spans {
+		for instr in &body[ls..=le] {
+			let s = match instr {
+				Instruction::LocalGet(s)
+				| Instruction::LocalSet(s)
+				| Instruction::LocalTee(s) => *s as usize,
+				_ => continue,
+			};
+			if s >= params_count {
+				first_write[s] = first_write[s].min(ls);
+				last_read[s] = last_read[s].max(le);
+			}
 		}
 	}
 

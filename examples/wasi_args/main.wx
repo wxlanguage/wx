@@ -1,0 +1,94 @@
+// WASI Preview 1 command-line arguments — queries the size of the argv
+// buffer, allocates it, fills it in, and prints each argument on its own
+// line. See run.mjs for the actual argv the host hands to the guest.
+use std::*;
+
+memory heap: Memory where { Size = u32 } { min_pages: 1 };
+
+enum FileDescriptor: u32 {
+  Stdout = 1,
+}
+
+// WASI Preview 1 encodes every result as `__wasi_errno_t` (a u16, passed as
+// i32 at the raw wasm ABI boundary): 0 always means success, and every other
+// value names a specific failure. These examples only ever care about the
+// success/failure distinction, so `Success` is the only variant declared —
+// see the WASI Preview 1 spec for the full errno list.
+enum Errno: i32 {
+  Success = 0,
+}
+
+import "wasi_snapshot_preview1" as wasi {
+  fn args_sizes_get(argc: *mut u32, argv_buf_size: *mut u32) -> Errno;
+  fn args_get(argv: *mut u32, argv_buf: *mut u8) -> Errno;
+  fn fd_write(fd: FileDescriptor, io_vecs: [][]u8, bytes_written: *mut u32) -> Errno;
+}
+
+global mut bump: *u8 = heap::DATA_END;
+
+struct BumpAllocator {}
+
+impl Allocator for BumpAllocator {
+  type Mem = heap;
+
+  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
+    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+    local new_end = ptr + layout.size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      if heap.grow(needed) == -1 { unreachable }
+    }
+    bump = new_end as *u8;
+    ptr as *mut u8
+  }
+}
+
+fn write_all(fd: FileDescriptor, bytes: []u8) {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+  io_vecs[0] = bytes;
+  local nwritten = alloc.alloc::<u32>(0);
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+}
+
+// WASI argv/environ strings are NUL-terminated C strings; scan forward to
+// find the length before turning a pointer into a wx slice.
+fn cstr_len(mut p: *u8) -> u32 {
+  local mut len: u32 = 0;
+  loop {
+    if p.* == 0 { break len };
+    p = ptr::add(p, 1);
+    len += 1;
+  }
+}
+
+fn main() {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+
+  local argc_ptr = alloc.alloc::<u32>(0);
+  local argv_buf_size_ptr = alloc.alloc::<u32>(0);
+  if wasi::args_sizes_get(argc_ptr, argv_buf_size_ptr) != Errno::Success { unreachable };
+
+  local argc = argc_ptr.*;
+  local argv = alloc.alloc_slice::<u32>(argc);
+  local argv_buf = alloc.alloc_slice::<u8>(argv_buf_size_ptr.*);
+  if wasi::args_get(argv.ptr() as _, argv_buf.ptr() as _) != Errno::Success { unreachable };
+
+  local mut i: u32 = 0;
+  loop {
+    if i == argc { break };
+
+    local str_ptr = ptr::add(argv.ptr(), i).* as *u8;
+    local len = cstr_len(str_ptr);
+    write_all(FileDescriptor::Stdout, slice_from_parts(str_ptr, len));
+    write_all(FileDescriptor::Stdout, "\n");
+
+    i += 1;
+  }
+}
+
+export {
+  main as "_start",
+  heap as "memory",
+}
