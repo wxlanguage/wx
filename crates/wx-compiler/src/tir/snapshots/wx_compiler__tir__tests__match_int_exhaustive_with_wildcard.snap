@@ -24,9 +24,6 @@ types:
   - Struct:
       struct_index: 0
       args: []
-  - Struct:
-      struct_index: 1
-      args: []
   - TypeParam:
       owner:
         Function: 1
@@ -37,12 +34,12 @@ types:
       param_index: 0
   - Pointer:
       to: 6
-      memory: 21
+      memory: 20
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 21
+      base: 20
   - TypeParam:
       owner:
         Trait: 0
@@ -54,34 +51,34 @@ types:
   - AssocTypeProjection:
       trait_index: 0
       assoc_name: 10
-      base: 23
-  - Function:
-      signature:
-        items:
-          - 21
-          - 23
-          - 26
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 21
-          - 23
-        params_count: 1
-  - AssocTypeProjection:
-      trait_index: 2
-      assoc_name: 9
-      base: 20
-  - AssocTypeProjection:
-      trait_index: 0
-      assoc_name: 10
-      base: 29
+      base: 22
   - Function:
       signature:
         items:
           - 20
+          - 22
+          - 25
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 20
+          - 22
+        params_count: 1
+  - AssocTypeProjection:
+      trait_index: 2
+      assoc_name: 9
+      base: 19
+  - AssocTypeProjection:
+      trait_index: 0
+      assoc_name: 10
+      base: 28
+  - Function:
+      signature:
+        items:
+          - 19
+          - 28
           - 29
-          - 30
         params_count: 2
   - TypeParam:
       owner:
@@ -90,12 +87,12 @@ types:
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 32
+      base: 31
   - Function:
       signature:
         items:
+          - 31
           - 32
-          - 33
         params_count: 1
   - TypeParam:
       owner:
@@ -106,18 +103,18 @@ types:
         Function: 3
       param_index: 1
   - Slice:
-      of: 36
-      memory: 35
+      of: 35
+      memory: 34
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 35
+      base: 34
   - Function:
       signature:
         items:
+          - 36
           - 37
-          - 38
         params_count: 1
   - TypeParam:
       owner:
@@ -128,18 +125,18 @@ types:
         Function: 4
       param_index: 1
   - Slice:
-      of: 41
-      memory: 40
+      of: 40
+      memory: 39
       mutable: false
   - Pointer:
-      to: 41
-      memory: 40
+      to: 40
+      memory: 39
       mutable: false
   - Function:
       signature:
         items:
+          - 41
           - 42
-          - 43
         params_count: 1
   - TypeParam:
       owner:
@@ -150,23 +147,23 @@ types:
         Function: 5
       param_index: 1
   - Pointer:
-      to: 46
-      memory: 45
+      to: 45
+      memory: 44
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 45
+      base: 44
   - Slice:
-      of: 46
-      memory: 45
+      of: 45
+      memory: 44
       mutable: false
   - Function:
       signature:
         items:
+          - 46
           - 47
           - 48
-          - 49
         params_count: 2
   - TypeParam:
       owner:
@@ -175,11 +172,11 @@ types:
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 51
+      base: 50
   - Function:
       signature:
         items:
-          - 52
+          - 51
         params_count: 0
   - TypeParam:
       owner:
@@ -188,11 +185,11 @@ types:
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 54
+      base: 53
   - Function:
       signature:
         items:
-          - 55
+          - 54
         params_count: 0
   - TypeParam:
       owner:
@@ -200,18 +197,18 @@ types:
       param_index: 0
   - Pointer:
       to: 6
-      memory: 57
+      memory: 56
       mutable: true
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 57
+      base: 56
   - Function:
       signature:
         items:
-          - 58
+          - 57
           - 6
-          - 59
+          - 58
           - 2
         params_count: 3
   - TypeParam:
@@ -224,7 +221,7 @@ types:
       param_index: 2
   - Pointer:
       to: 6
-      memory: 62
+      memory: 61
       mutable: true
   - TypeParam:
       owner:
@@ -232,14 +229,14 @@ types:
       param_index: 1
   - Pointer:
       to: 6
-      memory: 64
+      memory: 63
       mutable: false
   - Function:
       signature:
         items:
-          - 63
-          - 65
-          - 61
+          - 62
+          - 64
+          - 60
           - 2
         params_count: 3
   - Function:
@@ -267,7 +264,7 @@ types:
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 70
+      base: 69
   - TypeParam:
       owner:
         ImplBlock: 0
@@ -275,21 +272,21 @@ types:
   - Struct:
       struct_index: 0
       args:
-        - 72
+        - 71
   - Function:
       signature:
         items:
-          - 73
+          - 72
         params_count: 0
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 72
+      base: 71
   - Function:
       signature:
         items:
-          - 75
-          - 73
+          - 74
+          - 72
         params_count: 1
   - TypeParam:
       owner:
@@ -298,59 +295,59 @@ types:
   - AssocTypeProjection:
       trait_index: 3
       assoc_name: 5
-      base: 77
+      base: 76
   - Pointer:
-      to: 77
-      memory: 78
+      to: 76
+      memory: 77
       mutable: true
   - TypeParam:
       owner:
         Function: 47
       param_index: 1
   - Pointer:
-      to: 80
-      memory: 78
+      to: 79
+      memory: 77
       mutable: true
   - Function:
       signature:
         items:
+          - 78
           - 79
           - 80
-          - 81
         params_count: 2
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 78
+      base: 77
   - TypeParam:
       owner:
         Function: 48
       param_index: 1
   - Slice:
-      of: 84
-      memory: 78
+      of: 83
+      memory: 77
       mutable: true
   - Function:
       signature:
         items:
-          - 79
-          - 83
-          - 85
+          - 78
+          - 82
+          - 84
         params_count: 2
   - Struct:
       struct_index: 0
       args:
-        - 78
+        - 77
   - Pointer:
       to: 6
-      memory: 78
+      memory: 77
       mutable: true
   - Function:
       signature:
         items:
-          - 79
+          - 78
+          - 86
           - 87
-          - 88
         params_count: 2
   - TypeParam:
       owner:
@@ -361,13 +358,13 @@ types:
         Function: 50
       param_index: 1
   - Pointer:
-      to: 91
-      memory: 90
+      to: 90
+      memory: 89
       mutable: false
   - Function:
       signature:
         items:
-          - 92
+          - 91
         params_count: 0
   - TypeParam:
       owner:
@@ -378,13 +375,13 @@ types:
         Function: 51
       param_index: 1
   - Pointer:
-      to: 95
-      memory: 94
+      to: 94
+      memory: 93
       mutable: true
   - Function:
       signature:
         items:
-          - 96
+          - 95
         params_count: 0
   - TypeParam:
       owner:
@@ -395,13 +392,13 @@ types:
         Function: 52
       param_index: 1
   - Pointer:
-      to: 99
-      memory: 98
+      to: 98
+      memory: 97
       mutable: false
   - Function:
       signature:
         items:
-          - 100
+          - 99
           - 16
         params_count: 1
   - TypeParam:
@@ -413,18 +410,18 @@ types:
         Function: 53
       param_index: 1
   - Pointer:
-      to: 103
-      memory: 102
+      to: 102
+      memory: 101
       mutable: false
   - Pointer:
-      to: 103
-      memory: 102
+      to: 102
+      memory: 101
       mutable: true
   - Function:
       signature:
         items:
+          - 103
           - 104
-          - 105
         params_count: 1
   - TypeParam:
       owner:
@@ -435,19 +432,19 @@ types:
         Function: 54
       param_index: 1
   - Pointer:
-      to: 108
-      memory: 107
+      to: 107
+      memory: 106
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 107
+      base: 106
   - Function:
       signature:
         items:
+          - 108
           - 109
-          - 110
-          - 109
+          - 108
         params_count: 2
   - TypeParam:
       owner:
@@ -458,19 +455,19 @@ types:
         Function: 55
       param_index: 1
   - Pointer:
-      to: 113
-      memory: 112
+      to: 112
+      memory: 111
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 112
+      base: 111
   - Function:
       signature:
         items:
+          - 113
           - 114
-          - 115
-          - 114
+          - 113
         params_count: 2
   - TypeParam:
       owner:
@@ -481,19 +478,19 @@ types:
         Function: 56
       param_index: 1
   - Pointer:
-      to: 118
-      memory: 117
+      to: 117
+      memory: 116
       mutable: true
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 117
+      base: 116
   - Function:
       signature:
         items:
+          - 118
           - 119
-          - 120
-          - 119
+          - 118
         params_count: 2
   - TypeParam:
       owner:
@@ -504,19 +501,19 @@ types:
         Function: 57
       param_index: 1
   - Pointer:
-      to: 123
-      memory: 122
+      to: 122
+      memory: 121
       mutable: true
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 122
+      base: 121
   - Function:
       signature:
         items:
+          - 123
           - 124
-          - 125
-          - 124
+          - 123
         params_count: 2
   - TypeParam:
       owner:
@@ -527,28 +524,28 @@ types:
         ImplBlock: 1
       param_index: 1
   - Slice:
-      of: 128
-      memory: 127
+      of: 127
+      memory: 126
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 127
+      base: 126
   - Function:
       signature:
         items:
+          - 128
           - 129
-          - 130
         params_count: 1
   - Pointer:
-      to: 128
-      memory: 127
+      to: 127
+      memory: 126
       mutable: false
   - Function:
       signature:
         items:
-          - 129
-          - 132
+          - 128
+          - 131
         params_count: 1
   - Function:
       signature:
@@ -562,18 +559,10 @@ types:
           - 17
           - 16
         params_count: 1
-  - TypeParam:
-      owner:
-        Struct: 76
-      param_index: 0
-  - Struct:
-      struct_index: 1
-      args:
-        - 11
   - Function:
       signature:
         items:
-          - 137
+          - 11
           - 11
         params_count: 1
   - FunctionItem:
@@ -591,12 +580,12 @@ types:
   - FunctionItem:
       id: 6
       type_args:
-        - 141
+        - 138
         - 1
   - FunctionItem:
       id: 7
       type_args:
-        - 141
+        - 138
         - 1
   - TypeParam:
       owner:
@@ -605,12 +594,12 @@ types:
   - FunctionItem:
       id: 7
       type_args:
-        - 144
+        - 141
         - 1
   - FunctionItem:
       id: 6
       type_args:
-        - 144
+        - 141
         - 1
   - Struct:
       struct_index: 0
@@ -620,49 +609,49 @@ types:
       id: 42
       type_args:
         - 1
-        - 80
+        - 79
   - FunctionItem:
       id: 5
       type_args:
         - 1
         - 1
   - Pointer:
-      to: 84
-      memory: 78
+      to: 83
+      memory: 77
       mutable: false
   - FunctionItem:
       id: 43
       type_args:
         - 1
-        - 84
+        - 83
   - Slice:
-      of: 84
-      memory: 78
+      of: 83
+      memory: 77
       mutable: false
   - AssocTypeProjection:
       trait_index: 2
       assoc_name: 9
-      base: 98
+      base: 97
   - FunctionItem:
       id: 6
       type_args:
-        - 108
         - 107
+        - 106
   - FunctionItem:
       id: 6
       type_args:
-        - 113
         - 112
+        - 111
   - FunctionItem:
       id: 6
       type_args:
-        - 118
         - 117
+        - 116
   - FunctionItem:
       id: 6
       type_args:
-        - 123
         - 122
+        - 121
   - FunctionItem:
       id: 3
       type_args:
@@ -670,7 +659,7 @@ types:
         - 1
   - Slice:
       of: 1
-      memory: 127
+      memory: 126
       mutable: false
   - FunctionItem:
       id: 4
@@ -715,7 +704,7 @@ functions:
               end: 114
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 31
+    signature_index: 30
     name:
       inner: 4
       span:
@@ -729,7 +718,7 @@ functions:
             start: 80
             end: 83
         ty:
-          inner: 20
+          inner: 19
           span:
             start: 85
             end: 88
@@ -740,12 +729,12 @@ functions:
             start: 90
             end: 95
         ty:
-          inner: 29
+          inner: 28
           span:
             start: 97
             end: 106
     result:
-      inner: 30
+      inner: 29
       span:
         start: 111
         end: 128
@@ -789,7 +778,7 @@ functions:
               end: 192
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 34
+    signature_index: 33
     name:
       inner: 11
       span:
@@ -803,12 +792,12 @@ functions:
             start: 176
             end: 179
         ty:
-          inner: 32
+          inner: 31
           span:
             start: 181
             end: 184
     result:
-      inner: 33
+      inner: 32
       span:
         start: 189
         end: 198
@@ -865,7 +854,7 @@ functions:
               end: 262
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 39
+    signature_index: 38
     name:
       inner: 12
       span:
@@ -879,12 +868,12 @@ functions:
             start: 247
             end: 252
         ty:
-          inner: 37
+          inner: 36
           span:
             start: 254
             end: 262
     result:
-      inner: 38
+      inner: 37
       span:
         start: 267
         end: 276
@@ -945,7 +934,7 @@ functions:
               end: 352
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 44
+    signature_index: 43
     name:
       inner: 15
       span:
@@ -959,12 +948,12 @@ functions:
             start: 325
             end: 330
         ty:
-          inner: 42
+          inner: 41
           span:
             start: 332
             end: 340
     result:
-      inner: 43
+      inner: 42
       span:
         start: 345
         end: 352
@@ -1029,7 +1018,7 @@ functions:
               end: 450
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 50
+    signature_index: 49
     name:
       inner: 16
       span:
@@ -1043,7 +1032,7 @@ functions:
             start: 408
             end: 412
         ty:
-          inner: 47
+          inner: 46
           span:
             start: 414
             end: 421
@@ -1054,12 +1043,12 @@ functions:
             start: 423
             end: 426
         ty:
-          inner: 48
+          inner: 47
           span:
             start: 428
             end: 437
     result:
-      inner: 49
+      inner: 48
       span:
         start: 442
         end: 450
@@ -1108,7 +1097,7 @@ functions:
               end: 505
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 53
+    signature_index: 52
     name:
       inner: 19
       span:
@@ -1116,7 +1105,7 @@ functions:
         end: 480
     params: []
     result:
-      inner: 52
+      inner: 51
       span:
         start: 502
         end: 511
@@ -1185,7 +1174,7 @@ functions:
               end: 567
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 56
+    signature_index: 55
     name:
       inner: 20
       span:
@@ -1193,7 +1182,7 @@ functions:
         end: 542
     params: []
     result:
-      inner: 55
+      inner: 54
       span:
         start: 564
         end: 573
@@ -1241,7 +1230,7 @@ functions:
               end: 657
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 60
+    signature_index: 59
     name:
       inner: 21
       span:
@@ -1255,7 +1244,7 @@ functions:
             start: 621
             end: 624
         ty:
-          inner: 58
+          inner: 57
           span:
             start: 626
             end: 638
@@ -1277,7 +1266,7 @@ functions:
             start: 649
             end: 652
         ty:
-          inner: 59
+          inner: 58
           span:
             start: 654
             end: 663
@@ -1329,7 +1318,7 @@ functions:
             - trait_index: 2
               bindings:
                 - - 9
-                  - Equals: 61
+                  - Equals: 60
               span:
                 start: 735
                 end: 763
@@ -1349,7 +1338,7 @@ functions:
             - trait_index: 2
               bindings:
                 - - 9
-                  - Equals: 61
+                  - Equals: 60
               span:
                 start: 777
                 end: 805
@@ -1361,7 +1350,7 @@ functions:
               end: 820
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 66
+    signature_index: 65
     name:
       inner: 25
       span:
@@ -1375,7 +1364,7 @@ functions:
             start: 809
             end: 812
         ty:
-          inner: 63
+          inner: 62
           span:
             start: 814
             end: 829
@@ -1386,7 +1375,7 @@ functions:
             start: 831
             end: 834
         ty:
-          inner: 65
+          inner: 64
           span:
             start: 836
             end: 847
@@ -1397,7 +1386,7 @@ functions:
             start: 849
             end: 852
         ty:
-          inner: 61
+          inner: 60
           span:
             start: 854
             end: 858
@@ -1416,7 +1405,7 @@ functions:
     type_params: []
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 67
+    signature_index: 66
     name:
       inner: 30
       span:
@@ -1453,7 +1442,7 @@ functions:
     type_params: []
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 68
+    signature_index: 67
     name:
       inner: 34
       span:
@@ -1490,7 +1479,7 @@ functions:
     type_params: []
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 69
+    signature_index: 68
     name:
       inner: 36
       span:
@@ -1558,7 +1547,7 @@ functions:
               end: 3088
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 93
+    signature_index: 92
     name:
       inner: 64
       span:
@@ -1566,7 +1555,7 @@ functions:
         end: 3059
     params: []
     result:
-      inner: 92
+      inner: 91
       span:
         start: 3081
         end: 3088
@@ -1584,8 +1573,8 @@ functions:
               start: 3089
               end: 3111
             locals: []
-            inferred_type: 92
-            expected_type: 92
+            inferred_type: 91
+            expected_type: 91
       block:
         kind:
           Block:
@@ -1595,11 +1584,11 @@ functions:
               kind:
                 Int:
                   value: 0
-              ty: 92
+              ty: 91
               span:
                 start: 3099
                 end: 3100
-        ty: 92
+        ty: 91
         span:
           start: 3089
           end: 3111
@@ -1644,7 +1633,7 @@ functions:
               end: 3179
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 97
+    signature_index: 96
     name:
       inner: 65
       span:
@@ -1652,7 +1641,7 @@ functions:
         end: 3146
     params: []
     result:
-      inner: 96
+      inner: 95
       span:
         start: 3168
         end: 3179
@@ -1670,8 +1659,8 @@ functions:
               start: 3180
               end: 3202
             locals: []
-            inferred_type: 96
-            expected_type: 96
+            inferred_type: 95
+            expected_type: 95
       block:
         kind:
           Block:
@@ -1681,11 +1670,11 @@ functions:
               kind:
                 Int:
                   value: 0
-              ty: 96
+              ty: 95
               span:
                 start: 3190
                 end: 3191
-        ty: 96
+        ty: 95
         span:
           start: 3180
           end: 3202
@@ -1734,7 +1723,7 @@ functions:
               end: 3265
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 101
+    signature_index: 100
     name:
       inner: 66
       span:
@@ -1748,7 +1737,7 @@ functions:
             start: 3253
             end: 3256
         ty:
-          inner: 100
+          inner: 99
           span:
             start: 3258
             end: 3265
@@ -1776,7 +1765,7 @@ functions:
                   span:
                     start: 3253
                     end: 3256
-                ty: 100
+                ty: 99
                 mut_span: ~
                 accesses:
                   - span:
@@ -1803,7 +1792,7 @@ functions:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 153
+                    ty: 150
                     span:
                       start: 3285
                       end: 3288
@@ -1811,7 +1800,7 @@ functions:
                     kind:
                       Int:
                         value: 0
-                    ty: 153
+                    ty: 150
                     span:
                       start: 3305
                       end: 3306
@@ -1872,7 +1861,7 @@ functions:
               end: 3392
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 106
+    signature_index: 105
     name:
       inner: 68
       span:
@@ -1886,12 +1875,12 @@ functions:
             start: 3364
             end: 3367
         ty:
-          inner: 104
+          inner: 103
           span:
             start: 3369
             end: 3376
     result:
-      inner: 105
+      inner: 104
       span:
         start: 3381
         end: 3392
@@ -1914,15 +1903,15 @@ functions:
                   span:
                     start: 3364
                     end: 3367
-                ty: 104
+                ty: 103
                 mut_span: ~
                 accesses:
                   - span:
                       start: 3403
                       end: 3406
                     kind: Read
-            inferred_type: 105
-            expected_type: 105
+            inferred_type: 104
+            expected_type: 104
       block:
         kind:
           Block:
@@ -1933,11 +1922,11 @@ functions:
                 Local:
                   scope_index: 0
                   local_index: 0
-              ty: 105
+              ty: 104
               span:
                 start: 3403
                 end: 3406
-        ty: 105
+        ty: 104
         span:
           start: 3393
           end: 3417
@@ -2006,7 +1995,7 @@ functions:
               end: 3556
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 111
+    signature_index: 110
     name:
       inner: 69
       span:
@@ -2020,7 +2009,7 @@ functions:
             start: 3464
             end: 3467
         ty:
-          inner: 109
+          inner: 108
           span:
             start: 3469
             end: 3476
@@ -2031,12 +2020,12 @@ functions:
             start: 3478
             end: 3483
         ty:
-          inner: 110
+          inner: 109
           span:
             start: 3485
             end: 3494
     result:
-      inner: 109
+      inner: 108
       span:
         start: 3499
         end: 3506
@@ -2059,7 +2048,7 @@ functions:
                   span:
                     start: 3464
                     end: 3467
-                ty: 109
+                ty: 108
                 mut_span: ~
                 accesses:
                   - span:
@@ -2071,15 +2060,15 @@ functions:
                   span:
                     start: 3478
                     end: 3483
-                ty: 110
+                ty: 109
                 mut_span: ~
                 accesses:
                   - span:
                       start: 3537
                       end: 3542
                     kind: Read
-            inferred_type: 109
-            expected_type: 109
+            inferred_type: 108
+            expected_type: 108
       block:
         kind:
           Block:
@@ -2098,7 +2087,7 @@ functions:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 110
+                    ty: 109
                     span:
                       start: 3518
                       end: 3521
@@ -2115,7 +2104,7 @@ functions:
                             Local:
                               scope_index: 0
                               local_index: 1
-                          ty: 110
+                          ty: 109
                           span:
                             start: 3537
                             end: 3542
@@ -2124,22 +2113,22 @@ functions:
                             GenericCall:
                               id: 6
                               type_args:
-                                - 108
                                 - 107
+                                - 106
                               arguments: []
-                          ty: 110
+                          ty: 109
                           span:
                             start: 3545
                             end: 3564
-                    ty: 110
+                    ty: 109
                     span:
                       start: 3537
                       end: 3564
-              ty: 109
+              ty: 108
               span:
                 start: 3518
                 end: 3564
-        ty: 109
+        ty: 108
         span:
           start: 3507
           end: 3576
@@ -2208,7 +2197,7 @@ functions:
               end: 3715
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 116
+    signature_index: 115
     name:
       inner: 70
       span:
@@ -2222,7 +2211,7 @@ functions:
             start: 3623
             end: 3626
         ty:
-          inner: 114
+          inner: 113
           span:
             start: 3628
             end: 3635
@@ -2233,12 +2222,12 @@ functions:
             start: 3637
             end: 3642
         ty:
-          inner: 115
+          inner: 114
           span:
             start: 3644
             end: 3653
     result:
-      inner: 114
+      inner: 113
       span:
         start: 3658
         end: 3665
@@ -2261,7 +2250,7 @@ functions:
                   span:
                     start: 3623
                     end: 3626
-                ty: 114
+                ty: 113
                 mut_span: ~
                 accesses:
                   - span:
@@ -2273,15 +2262,15 @@ functions:
                   span:
                     start: 3637
                     end: 3642
-                ty: 115
+                ty: 114
                 mut_span: ~
                 accesses:
                   - span:
                       start: 3696
                       end: 3701
                     kind: Read
-            inferred_type: 114
-            expected_type: 114
+            inferred_type: 113
+            expected_type: 113
       block:
         kind:
           Block:
@@ -2300,7 +2289,7 @@ functions:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 115
+                    ty: 114
                     span:
                       start: 3677
                       end: 3680
@@ -2317,7 +2306,7 @@ functions:
                             Local:
                               scope_index: 0
                               local_index: 1
-                          ty: 115
+                          ty: 114
                           span:
                             start: 3696
                             end: 3701
@@ -2326,22 +2315,22 @@ functions:
                             GenericCall:
                               id: 6
                               type_args:
-                                - 113
                                 - 112
+                                - 111
                               arguments: []
-                          ty: 115
+                          ty: 114
                           span:
                             start: 3704
                             end: 3723
-                    ty: 115
+                    ty: 114
                     span:
                       start: 3696
                       end: 3723
-              ty: 114
+              ty: 113
               span:
                 start: 3677
                 end: 3723
-        ty: 114
+        ty: 113
         span:
           start: 3666
           end: 3735
@@ -2410,7 +2399,7 @@ functions:
               end: 3886
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 121
+    signature_index: 120
     name:
       inner: 71
       span:
@@ -2424,7 +2413,7 @@ functions:
             start: 3786
             end: 3789
         ty:
-          inner: 119
+          inner: 118
           span:
             start: 3791
             end: 3802
@@ -2435,12 +2424,12 @@ functions:
             start: 3804
             end: 3809
         ty:
-          inner: 120
+          inner: 119
           span:
             start: 3811
             end: 3820
     result:
-      inner: 119
+      inner: 118
       span:
         start: 3825
         end: 3836
@@ -2463,7 +2452,7 @@ functions:
                   span:
                     start: 3786
                     end: 3789
-                ty: 119
+                ty: 118
                 mut_span: ~
                 accesses:
                   - span:
@@ -2475,15 +2464,15 @@ functions:
                   span:
                     start: 3804
                     end: 3809
-                ty: 120
+                ty: 119
                 mut_span: ~
                 accesses:
                   - span:
                       start: 3867
                       end: 3872
                     kind: Read
-            inferred_type: 119
-            expected_type: 119
+            inferred_type: 118
+            expected_type: 118
       block:
         kind:
           Block:
@@ -2502,7 +2491,7 @@ functions:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 120
+                    ty: 119
                     span:
                       start: 3848
                       end: 3851
@@ -2519,7 +2508,7 @@ functions:
                             Local:
                               scope_index: 0
                               local_index: 1
-                          ty: 120
+                          ty: 119
                           span:
                             start: 3867
                             end: 3872
@@ -2528,22 +2517,22 @@ functions:
                             GenericCall:
                               id: 6
                               type_args:
-                                - 118
                                 - 117
+                                - 116
                               arguments: []
-                          ty: 120
+                          ty: 119
                           span:
                             start: 3875
                             end: 3894
-                    ty: 120
+                    ty: 119
                     span:
                       start: 3867
                       end: 3894
-              ty: 119
+              ty: 118
               span:
                 start: 3848
                 end: 3894
-        ty: 119
+        ty: 118
         span:
           start: 3837
           end: 3906
@@ -2612,7 +2601,7 @@ functions:
               end: 4057
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 126
+    signature_index: 125
     name:
       inner: 72
       span:
@@ -2626,7 +2615,7 @@ functions:
             start: 3957
             end: 3960
         ty:
-          inner: 124
+          inner: 123
           span:
             start: 3962
             end: 3973
@@ -2637,12 +2626,12 @@ functions:
             start: 3975
             end: 3980
         ty:
-          inner: 125
+          inner: 124
           span:
             start: 3982
             end: 3991
     result:
-      inner: 124
+      inner: 123
       span:
         start: 3996
         end: 4007
@@ -2665,7 +2654,7 @@ functions:
                   span:
                     start: 3957
                     end: 3960
-                ty: 124
+                ty: 123
                 mut_span: ~
                 accesses:
                   - span:
@@ -2677,15 +2666,15 @@ functions:
                   span:
                     start: 3975
                     end: 3980
-                ty: 125
+                ty: 124
                 mut_span: ~
                 accesses:
                   - span:
                       start: 4038
                       end: 4043
                     kind: Read
-            inferred_type: 124
-            expected_type: 124
+            inferred_type: 123
+            expected_type: 123
       block:
         kind:
           Block:
@@ -2704,7 +2693,7 @@ functions:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 125
+                    ty: 124
                     span:
                       start: 4019
                       end: 4022
@@ -2721,7 +2710,7 @@ functions:
                             Local:
                               scope_index: 0
                               local_index: 1
-                          ty: 125
+                          ty: 124
                           span:
                             start: 4038
                             end: 4043
@@ -2730,26 +2719,26 @@ functions:
                             GenericCall:
                               id: 6
                               type_args:
-                                - 123
                                 - 122
+                                - 121
                               arguments: []
-                          ty: 125
+                          ty: 124
                           span:
                             start: 4046
                             end: 4065
-                    ty: 125
+                    ty: 124
                     span:
                       start: 4038
                       end: 4065
-              ty: 124
+              ty: 123
               span:
                 start: 4019
                 end: 4065
-        ty: 124
+        ty: 123
         span:
           start: 4008
           end: 4077
-  - id: 77
+  - id: 76
     file_id: 1
     namespace: ~
     parent: ~
@@ -2757,34 +2746,34 @@ functions:
     type_params: []
     type_param_parent: ~
     inherited_type_param_count: 0
-    signature_index: 138
+    signature_index: 135
     name:
-      inner: 89
+      inner: 88
       span:
-        start: 46
-        end: 49
+        start: 15
+        end: 19
     params:
       - mut_span: ~
         name:
-          inner: 90
+          inner: 89
           span:
-            start: 50
-            end: 51
+            start: 20
+            end: 21
         ty:
-          inner: 137
+          inner: 11
           span:
-            start: 53
-            end: 65
+            start: 23
+            end: 26
     result:
       inner: 11
       span:
-        start: 70
-        end: 73
+        start: 31
+        end: 34
     accesses:
       - file_id: 1
         span:
-          start: 95
-          end: 98
+          start: 129
+          end: 133
     attributes: []
     body:
       stack:
@@ -2794,21 +2783,48 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 74
-              end: 85
+              start: 35
+              end: 119
             locals:
               - name:
-                  inner: 90
+                  inner: 89
                   span:
-                    start: 50
-                    end: 51
-                ty: 137
+                    start: 20
+                    end: 21
+                ty: 11
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 76
-                      end: 77
+                      start: 47
+                      end: 48
                     kind: Read
+            inferred_type: 11
+            expected_type: 11
+          - kind: Block
+            label: ~
+            parent: 0
+            span:
+              start: 64
+              end: 69
+            locals: []
+            inferred_type: 11
+            expected_type: 11
+          - kind: Block
+            label: ~
+            parent: 0
+            span:
+              start: 84
+              end: 89
+            locals: []
+            inferred_type: 11
+            expected_type: 11
+          - kind: Block
+            label: ~
+            parent: 0
+            span:
+              start: 104
+              end: 110
+            locals: []
             inferred_type: 11
             expected_type: 11
       block:
@@ -2818,29 +2834,102 @@ functions:
             expressions: []
             result:
               kind:
-                FieldAccess:
-                  object:
+                Match:
+                  scrutinee:
                     kind:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 137
+                    ty: 11
                     span:
-                      start: 76
-                      end: 77
-                  field:
-                    inner: 31
-                    span:
-                      start: 78
-                      end: 83
+                      start: 47
+                      end: 48
+                  arms:
+                    - pattern:
+                        Int: 0
+                      pattern_span:
+                        start: 59
+                        end: 60
+                      body:
+                        kind:
+                          Block:
+                            scope_index: 1
+                            expressions: []
+                            result:
+                              kind:
+                                Int:
+                                  value: 0
+                              ty: 11
+                              span:
+                                start: 66
+                                end: 67
+                        ty: 11
+                        span:
+                          start: 64
+                          end: 69
+                    - pattern:
+                        Int: 1
+                      pattern_span:
+                        start: 79
+                        end: 80
+                      body:
+                        kind:
+                          Block:
+                            scope_index: 2
+                            expressions: []
+                            result:
+                              kind:
+                                Int:
+                                  value: 1
+                              ty: 11
+                              span:
+                                start: 86
+                                end: 87
+                        ty: 11
+                        span:
+                          start: 84
+                          end: 89
+                    - pattern: Wildcard
+                      pattern_span:
+                        start: 99
+                        end: 100
+                      body:
+                        kind:
+                          Block:
+                            scope_index: 3
+                            expressions: []
+                            result:
+                              kind:
+                                Unary:
+                                  operator:
+                                    inner: InvertSign
+                                    span:
+                                      start: 106
+                                      end: 107
+                                  operand:
+                                    kind:
+                                      Int:
+                                        value: 1
+                                    ty: 11
+                                    span:
+                                      start: 107
+                                      end: 108
+                              ty: 11
+                              span:
+                                start: 106
+                                end: 108
+                        ty: 11
+                        span:
+                          start: 104
+                          end: 110
               ty: 11
               span:
-                start: 76
-                end: 83
+                start: 41
+                end: 117
         ty: 11
         span:
-          start: 74
-          end: 85
+          start: 35
+          end: 119
   - id: 38
     file_id: 0
     namespace: 0
@@ -2851,7 +2940,7 @@ functions:
     type_param_parent:
       Trait: 2
     inherited_type_param_count: 1
-    signature_index: 27
+    signature_index: 26
     name:
       inner: 50
       span:
@@ -2865,7 +2954,7 @@ functions:
             start: 1876
             end: 1880
         ty:
-          inner: 21
+          inner: 20
           span:
             start: 1876
             end: 1880
@@ -2876,12 +2965,12 @@ functions:
             start: 1882
             end: 1887
         ty:
-          inner: 23
+          inner: 22
           span:
             start: 1889
             end: 1899
     result:
-      inner: 26
+      inner: 25
       span:
         start: 1904
         end: 1922
@@ -2904,7 +2993,7 @@ functions:
                   span:
                     start: 1876
                     end: 1880
-                ty: 21
+                ty: 20
                 mut_span: ~
                 accesses:
                   - span:
@@ -2916,15 +3005,15 @@ functions:
                   span:
                     start: 1882
                     end: 1887
-                ty: 23
+                ty: 22
                 mut_span: ~
                 accesses:
                   - span:
                       start: 1951
                       end: 1956
                     kind: Read
-            inferred_type: 26
-            expected_type: 26
+            inferred_type: 25
+            expected_type: 25
       block:
         kind:
           Block:
@@ -2935,13 +3024,13 @@ functions:
                 GenericCall:
                   id: 1
                   type_args:
-                    - 21
+                    - 20
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 21
+                      ty: 20
                       span:
                         start: 1945
                         end: 1949
@@ -2949,15 +3038,15 @@ functions:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 23
+                      ty: 22
                       span:
                         start: 1951
                         end: 1956
-              ty: 26
+              ty: 25
               span:
                 start: 1933
                 end: 1957
-        ty: 26
+        ty: 25
         span:
           start: 1923
           end: 1963
@@ -2971,7 +3060,7 @@ functions:
     type_param_parent:
       Trait: 2
     inherited_type_param_count: 1
-    signature_index: 28
+    signature_index: 27
     name:
       inner: 52
       span:
@@ -2985,12 +3074,12 @@ functions:
             start: 1991
             end: 1995
         ty:
-          inner: 21
+          inner: 20
           span:
             start: 1991
             end: 1995
     result:
-      inner: 23
+      inner: 22
       span:
         start: 2000
         end: 2010
@@ -3013,15 +3102,15 @@ functions:
                   span:
                     start: 1991
                     end: 1995
-                ty: 21
+                ty: 20
                 mut_span: ~
                 accesses:
                   - span:
                       start: 2033
                       end: 2037
                     kind: Read
-            inferred_type: 23
-            expected_type: 23
+            inferred_type: 22
+            expected_type: 22
       block:
         kind:
           Block:
@@ -3032,21 +3121,21 @@ functions:
                 GenericCall:
                   id: 2
                   type_args:
-                    - 21
+                    - 20
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 21
+                      ty: 20
                       span:
                         start: 2033
                         end: 2037
-              ty: 23
+              ty: 22
               span:
                 start: 2021
                 end: 2038
-        ty: 23
+        ty: 22
         span:
           start: 2011
           end: 2044
@@ -3079,7 +3168,7 @@ functions:
     type_param_parent:
       ImplBlock: 0
     inherited_type_param_count: 1
-    signature_index: 74
+    signature_index: 73
     name:
       inner: 55
       span:
@@ -3087,7 +3176,7 @@ functions:
         end: 2194
     params: []
     result:
-      inner: 73
+      inner: 72
       span:
         start: 2203
         end: 2207
@@ -3109,8 +3198,8 @@ functions:
               start: 2208
               end: 2278
             locals: []
-            inferred_type: 73
-            expected_type: 73
+            inferred_type: 72
+            expected_type: 72
       block:
         kind:
           Block:
@@ -3125,10 +3214,10 @@ functions:
                         GenericCall:
                           id: 6
                           type_args:
-                            - 141
-                            - 72
+                            - 138
+                            - 71
                           arguments: []
-                      ty: 75
+                      ty: 74
                       span:
                         start: 2232
                         end: 2246
@@ -3136,18 +3225,18 @@ functions:
                         GenericCall:
                           id: 7
                           type_args:
-                            - 141
-                            - 72
+                            - 138
+                            - 71
                           arguments: []
-                      ty: 75
+                      ty: 74
                       span:
                         start: 2255
                         end: 2270
-              ty: 73
+              ty: 72
               span:
                 start: 2218
                 end: 2272
-        ty: 73
+        ty: 72
         span:
           start: 2208
           end: 2278
@@ -3180,7 +3269,7 @@ functions:
     type_param_parent:
       ImplBlock: 0
     inherited_type_param_count: 1
-    signature_index: 76
+    signature_index: 75
     name:
       inner: 56
       span:
@@ -3194,12 +3283,12 @@ functions:
             start: 2314
             end: 2319
         ty:
-          inner: 75
+          inner: 74
           span:
             start: 2321
             end: 2330
     result:
-      inner: 73
+      inner: 72
       span:
         start: 2335
         end: 2339
@@ -3226,15 +3315,15 @@ functions:
                   span:
                     start: 2314
                     end: 2319
-                ty: 75
+                ty: 74
                 mut_span: ~
                 accesses:
                   - span:
                       start: 2405
                       end: 2410
                     kind: Read
-            inferred_type: 73
-            expected_type: 73
+            inferred_type: 72
+            expected_type: 72
       block:
         kind:
           Block:
@@ -3257,10 +3346,10 @@ functions:
                               GenericCall:
                                 id: 6
                                 type_args:
-                                  - 144
-                                  - 72
+                                  - 141
+                                  - 71
                                 arguments: []
-                            ty: 75
+                            ty: 74
                             span:
                               start: 2388
                               end: 2402
@@ -3269,11 +3358,11 @@ functions:
                               Local:
                                 scope_index: 0
                                 local_index: 0
-                            ty: 75
+                            ty: 74
                             span:
                               start: 2405
                               end: 2410
-                      ty: 75
+                      ty: 74
                       span:
                         start: 2388
                         end: 2410
@@ -3281,18 +3370,18 @@ functions:
                         GenericCall:
                           id: 7
                           type_args:
-                            - 144
-                            - 72
+                            - 141
+                            - 71
                           arguments: []
-                      ty: 75
+                      ty: 74
                       span:
                         start: 2365
                         end: 2380
-              ty: 73
+              ty: 72
               span:
                 start: 2350
                 end: 2412
-        ty: 73
+        ty: 72
         span:
           start: 2340
           end: 2418
@@ -3306,7 +3395,7 @@ functions:
     type_param_parent:
       Trait: 3
     inherited_type_param_count: 1
-    signature_index: 89
+    signature_index: 88
     name:
       inner: 59
       span:
@@ -3320,7 +3409,7 @@ functions:
             start: 2482
             end: 2486
         ty:
-          inner: 79
+          inner: 78
           span:
             start: 2488
             end: 2508
@@ -3331,12 +3420,12 @@ functions:
             start: 2510
             end: 2516
         ty:
-          inner: 87
+          inner: 86
           span:
             start: 2518
             end: 2535
     result:
-      inner: 88
+      inner: 87
       span:
         start: 2540
         end: 2558
@@ -3386,7 +3475,7 @@ functions:
     type_param_parent:
       Trait: 3
     inherited_type_param_count: 1
-    signature_index: 82
+    signature_index: 81
     name:
       inner: 61
       span:
@@ -3400,7 +3489,7 @@ functions:
             start: 2591
             end: 2595
         ty:
-          inner: 79
+          inner: 78
           span:
             start: 2597
             end: 2617
@@ -3411,12 +3500,12 @@ functions:
             start: 2619
             end: 2624
         ty:
-          inner: 80
+          inner: 79
           span:
             start: 2626
             end: 2627
     result:
-      inner: 81
+      inner: 80
       span:
         start: 2632
         end: 2649
@@ -3439,7 +3528,7 @@ functions:
                   span:
                     start: 2591
                     end: 2595
-                ty: 79
+                ty: 78
                 mut_span: ~
                 accesses:
                   - span:
@@ -3451,7 +3540,7 @@ functions:
                   span:
                     start: 2619
                     end: 2624
-                ty: 80
+                ty: 79
                 mut_span: ~
                 accesses:
                   - span:
@@ -3463,7 +3552,7 @@ functions:
                   span:
                     start: 2666
                     end: 2669
-                ty: 81
+                ty: 80
                 mut_span: ~
                 accesses:
                   - span:
@@ -3474,8 +3563,8 @@ functions:
                       start: 2757
                       end: 2760
                     kind: Read
-            inferred_type: 81
-            expected_type: 81
+            inferred_type: 80
+            expected_type: 80
       block:
         kind:
           Block:
@@ -3495,13 +3584,13 @@ functions:
                         GenericMethodCall:
                           id: 46
                           type_args:
-                            - 77
+                            - 76
                           arguments:
                             - kind:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 79
+                              ty: 78
                               span:
                                 start: 2672
                                 end: 2676
@@ -3509,14 +3598,14 @@ functions:
                                 GenericCall:
                                   id: 42
                                   type_args:
-                                    - 78
-                                    - 80
+                                    - 77
+                                    - 79
                                   arguments: []
-                              ty: 87
+                              ty: 86
                               span:
                                 start: 2685
                                 end: 2702
-                      ty: 81
+                      ty: 80
                       span:
                         start: 2672
                         end: 2703
@@ -3534,12 +3623,12 @@ functions:
                               Local:
                                 scope_index: 0
                                 local_index: 2
-                            ty: 81
+                            ty: 80
                             span:
                               start: 2734
                               end: 2737
-                      ty: 80
-                      memory: 78
+                      ty: 79
+                      memory: 77
                       mutable: true
                       span:
                         start: 2734
@@ -3549,7 +3638,7 @@ functions:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 80
+                      ty: 79
                       span:
                         start: 2742
                         end: 2747
@@ -3562,11 +3651,11 @@ functions:
                 Local:
                   scope_index: 0
                   local_index: 2
-              ty: 81
+              ty: 80
               span:
                 start: 2757
                 end: 2760
-        ty: 81
+        ty: 80
         span:
           start: 2650
           end: 2766
@@ -3601,7 +3690,7 @@ functions:
     type_param_parent:
       Trait: 3
     inherited_type_param_count: 1
-    signature_index: 86
+    signature_index: 85
     name:
       inner: 63
       span:
@@ -3615,7 +3704,7 @@ functions:
             start: 2804
             end: 2808
         ty:
-          inner: 79
+          inner: 78
           span:
             start: 2810
             end: 2830
@@ -3626,12 +3715,12 @@ functions:
             start: 2832
             end: 2835
         ty:
-          inner: 83
+          inner: 82
           span:
             start: 2837
             end: 2852
     result:
-      inner: 85
+      inner: 84
       span:
         start: 2857
         end: 2875
@@ -3654,7 +3743,7 @@ functions:
                   span:
                     start: 2804
                     end: 2808
-                ty: 79
+                ty: 78
                 mut_span: ~
                 accesses:
                   - span:
@@ -3666,7 +3755,7 @@ functions:
                   span:
                     start: 2832
                     end: 2835
-                ty: 83
+                ty: 82
                 mut_span: ~
                 accesses:
                   - span:
@@ -3677,8 +3766,8 @@ functions:
                       start: 2984
                       end: 2987
                     kind: Read
-            inferred_type: 85
-            expected_type: 85
+            inferred_type: 84
+            expected_type: 84
       block:
         kind:
           Block:
@@ -3689,20 +3778,20 @@ functions:
                 GenericCall:
                   id: 5
                   type_args:
-                    - 78
-                    - 84
+                    - 77
+                    - 83
                   arguments:
                     - kind:
                         GenericMethodCall:
                           id: 46
                           type_args:
-                            - 77
+                            - 76
                           arguments:
                             - kind:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 79
+                              ty: 78
                               span:
                                 start: 2916
                                 end: 2920
@@ -3710,22 +3799,22 @@ functions:
                                 GenericCall:
                                   id: 43
                                   type_args:
-                                    - 78
-                                    - 84
+                                    - 77
+                                    - 83
                                   arguments:
                                     - kind:
                                         Local:
                                           scope_index: 0
                                           local_index: 1
-                                      ty: 83
+                                      ty: 82
                                       span:
                                         start: 2948
                                         end: 2951
-                              ty: 87
+                              ty: 86
                               span:
                                 start: 2929
                                 end: 2952
-                      ty: 150
+                      ty: 147
                       span:
                         start: 2916
                         end: 2953
@@ -3733,15 +3822,15 @@ functions:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 83
+                      ty: 82
                       span:
                         start: 2984
                         end: 2987
-              ty: 85
+              ty: 84
               span:
                 start: 2886
                 end: 2998
-        ty: 85
+        ty: 84
         span:
           start: 2876
           end: 3009
@@ -3757,7 +3846,7 @@ functions:
     type_param_parent:
       ImplBlock: 1
     inherited_type_param_count: 2
-    signature_index: 131
+    signature_index: 130
     name:
       inner: 18
       span:
@@ -3771,12 +3860,12 @@ functions:
             start: 4142
             end: 4146
         ty:
-          inner: 129
+          inner: 128
           span:
             start: 4142
             end: 4146
     result:
-      inner: 130
+      inner: 129
       span:
         start: 4151
         end: 4160
@@ -3799,15 +3888,15 @@ functions:
                   span:
                     start: 4142
                     end: 4146
-                ty: 129
+                ty: 128
                 mut_span: ~
                 accesses:
                   - span:
                       start: 4181
                       end: 4185
                     kind: Read
-            inferred_type: 130
-            expected_type: 130
+            inferred_type: 129
+            expected_type: 129
       block:
         kind:
           Block:
@@ -3818,22 +3907,22 @@ functions:
                 GenericCall:
                   id: 3
                   type_args:
+                    - 126
                     - 127
-                    - 128
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 129
+                      ty: 128
                       span:
                         start: 4181
                         end: 4185
-              ty: 130
+              ty: 129
               span:
                 start: 4171
                 end: 4186
-        ty: 130
+        ty: 129
         span:
           start: 4161
           end: 4192
@@ -3849,7 +3938,7 @@ functions:
     type_param_parent:
       ImplBlock: 1
     inherited_type_param_count: 2
-    signature_index: 133
+    signature_index: 132
     name:
       inner: 62
       span:
@@ -3863,12 +3952,12 @@ functions:
             start: 4223
             end: 4227
         ty:
-          inner: 129
+          inner: 128
           span:
             start: 4223
             end: 4227
     result:
-      inner: 132
+      inner: 131
       span:
         start: 4232
         end: 4239
@@ -3891,15 +3980,15 @@ functions:
                   span:
                     start: 4223
                     end: 4227
-                ty: 129
+                ty: 128
                 mut_span: ~
                 accesses:
                   - span:
                       start: 4260
                       end: 4264
                     kind: Read
-            inferred_type: 132
-            expected_type: 132
+            inferred_type: 131
+            expected_type: 131
       block:
         kind:
           Block:
@@ -3910,22 +3999,22 @@ functions:
                 GenericCall:
                   id: 4
                   type_args:
+                    - 126
                     - 127
-                    - 128
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 129
+                      ty: 128
                       span:
                         start: 4260
                         end: 4264
-              ty: 132
+              ty: 131
               span:
                 start: 4250
                 end: 4265
-        ty: 132
+        ty: 131
         span:
           start: 4240
           end: 4271
@@ -3941,7 +4030,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 134
+    signature_index: 133
     name:
       inner: 75
       span:
@@ -4119,7 +4208,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 134
+    signature_index: 133
     name:
       inner: 77
       span:
@@ -4297,7 +4386,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 79
       span:
@@ -4398,7 +4487,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 78
       span:
@@ -4548,7 +4637,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 76
       span:
@@ -4698,7 +4787,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 80
       span:
@@ -4934,7 +5023,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 81
       span:
@@ -5080,7 +5169,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 82
       span:
@@ -5406,7 +5495,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 83
       span:
@@ -5687,7 +5776,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 84
       span:
@@ -5833,7 +5922,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 85
       span:
@@ -6159,7 +6248,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 86
       span:
@@ -6575,7 +6664,7 @@ functions:
     type_param_parent:
       ImplBlock: 2
     inherited_type_param_count: 0
-    signature_index: 135
+    signature_index: 134
     name:
       inner: 87
       span:
@@ -6887,15 +6976,15 @@ module_decls:
 import_decls: []
 enums: []
 exports:
-  89:
+  88:
     Function:
       internal_name:
-        inner: 89
+        inner: 88
         span:
-          start: 95
-          end: 98
+          start: 129
+          end: 133
       external_name: ~
-      id: 77
+      id: 76
 structs:
   - id: 41
     file_id: 0
@@ -6939,7 +7028,7 @@ structs:
             start: 2089
             end: 2093
         ty:
-          inner: 71
+          inner: 70
           span:
             start: 2095
             end: 2104
@@ -6963,7 +7052,7 @@ structs:
             start: 2114
             end: 2119
         ty:
-          inner: 71
+          inner: 70
           span:
             start: 2121
             end: 2130
@@ -7001,55 +7090,6 @@ structs:
         span:
           start: 2929
           end: 2935
-  - id: 76
-    file_id: 1
-    namespace: ~
-    pub_span: ~
-    name:
-      inner: 88
-      span:
-        start: 19
-        end: 26
-    type_params:
-      - name:
-          inner: 13
-          span:
-            start: 27
-            end: 28
-        bounds:
-          traits: []
-          typeset: ~
-        accesses:
-          - file_id: 1
-            span:
-              start: 39
-              end: 40
-    attributes: []
-    fields:
-      - name:
-          inner: 31
-          span:
-            start: 32
-            end: 37
-        ty:
-          inner: 136
-          span:
-            start: 39
-            end: 40
-        pub_span: ~
-        accesses:
-          - kind: Read
-            file_id: 1
-            span:
-              start: 78
-              end: 83
-    lookup:
-      31: 0
-    accesses:
-      - file_id: 1
-        span:
-          start: 53
-          end: 60
 traits:
   - id: 15
     file_id: 0
@@ -7459,7 +7499,7 @@ constants:
         start: 1828
         end: 1836
     ty:
-      inner: 22
+      inner: 21
       span:
         start: 1838
         end: 1847
@@ -7661,5 +7701,5 @@ typesets:
           start: 710
           end: 721
     attributes:
-      - Tag: 91
+      - Tag: 90
 type_aliases: []

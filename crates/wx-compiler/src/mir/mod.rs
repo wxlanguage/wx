@@ -127,6 +127,24 @@ pub enum ExprKind {
 		then_block: Box<Expression>,
 		else_block: Option<Box<Expression>>,
 	},
+	/// A `match`, kept as a genuine N-way construct rather than desugared to
+	/// nested `IfElse` — Opt/codegen choose between a WASM `br_table` (dense
+	/// case values) and a `br_if` chain (sparse) based on the case set, and
+	/// both need the full case list rather than a binary tree of ifs.
+	Switch {
+		selector: Box<Expression>,
+		/// `(case discriminant, case body)` pairs in source order. The
+		/// discriminant is always a canonical `i64` by this stage: the raw
+		/// value for ints, 0/1 for bool, the codepoint for char, or the
+		/// enum variant's folded `const_value` (enum variants already fold
+		/// to constants — see the `tir::ExprKind::EnumVariant` lowering
+		/// below).
+		cases: Box<[(i64, Expression)]>,
+		/// The wildcard arm's body. `None` only when TIR proved
+		/// exhaustiveness without an explicit `_` (every enum variant
+		/// covered) — codegen synthesizes `unreachable` for that case.
+		default: Option<Box<Expression>>,
+	},
 	BitAnd {
 		left: Box<Expression>,
 		right: Box<Expression>,
@@ -663,12 +681,12 @@ impl MIR {
 			memories: tir
 				.memories
 				.iter()
-				.map(|m| MemoryInfo {
-					id: m.id,
+				.map(|mem| MemoryInfo {
+					id: mem.id,
 					source: MemorySource::Internal,
-					kind: MemoryKind::from_type_index(m.kind),
-					min_pages: m.min_pages,
-					max_pages: m.max_pages,
+					kind: MemoryKind::from_type_index(mem.size.inner),
+					min_pages: mem.min_pages,
+					max_pages: mem.max_pages,
 				})
 				.collect(),
 			exports: {
@@ -832,11 +850,12 @@ impl<'tir> Builder<'tir> {
 		let assoc_ty = match self.tir.trait_impls[impl_idx as usize]
 			.members
 			.get(&assoc_name)
+			.unwrap()
 		{
-			Some(tir::ImplEntry::AssocType { ty }) => *ty,
-			_ => unreachable!(
-				"trait impl matched via find_trait_impl but has no associated type entry"
-			),
+			tir::ImplEntry::AssocType(idx) => {
+				self.tir.assoc_type_impls[*idx as usize].ty.unwrap().inner
+			}
+			_ => unreachable!(),
 		};
 		(impl_idx, impl_type_args, assoc_ty)
 	}
@@ -906,7 +925,9 @@ impl<'tir> Builder<'tir> {
 		let tir_idx = self.tir.expect_memory_index(memory) as usize;
 		Type::Pointer {
 			memory,
-			kind: MemoryKind::from_type_index(self.tir.memories[tir_idx].kind),
+			kind: MemoryKind::from_type_index(
+				self.tir.memories[tir_idx].size.inner,
+			),
 		}
 	}
 
@@ -953,7 +974,7 @@ impl<'tir> Builder<'tir> {
 				let id = self.resolve_memory_id(*memory);
 				let tir_idx = self.tir.expect_memory_index(id) as usize;
 				let pointer_size = MemoryKind::from_type_index(
-					self.tir.memories[tir_idx].kind,
+					self.tir.memories[tir_idx].size.inner,
 				)
 				.pointer_size();
 				Layout {
@@ -965,7 +986,7 @@ impl<'tir> Builder<'tir> {
 				let id = self.resolve_memory_id(*memory);
 				let tir_idx = self.tir.expect_memory_index(id) as usize;
 				let pointer_size = MemoryKind::from_type_index(
-					self.tir.memories[tir_idx].kind,
+					self.tir.memories[tir_idx].size.inner,
 				)
 				.pointer_size();
 				Layout {
@@ -1093,10 +1114,8 @@ impl<'tir> Builder<'tir> {
 		// method body) resolves once `Self` is concrete, instead of installing
 		// the unresolved projection itself as the new substitution scope.
 		let saved = if !args.is_empty() {
-			let concrete_args: Box<[tir::TypeIndex]> = args
-				.iter()
-				.map(|&a| self.resolve_tir_type(a))
-				.collect();
+			let concrete_args: Box<[tir::TypeIndex]> =
+				args.iter().map(|&a| self.resolve_tir_type(a)).collect();
 			Some(std::mem::replace(
 				&mut self.current_substitutions,
 				concrete_args,
@@ -1222,8 +1241,8 @@ impl<'tir> Builder<'tir> {
 			tir::Type::Slice { memory, .. } => {
 				let memory = self.resolve_memory_id(memory);
 				let tir_idx = self.tir.expect_memory_index(memory) as usize;
-				let kind_ty = self.tir.memories[tir_idx].kind;
-				let len_ty = self.lower_type_index(kind_ty);
+				let kind_ty = self.tir.memories[tir_idx].size;
+				let len_ty = self.lower_type_index(kind_ty.inner);
 				// Slice layout is a fixed `{ ptr, len }` ABI contract, not a
 				// sorting outcome — see the pipeline notes on slice lowering.
 				let aggregate_index = self.ensure_aggregate(
@@ -1830,7 +1849,7 @@ impl<'tir> Builder<'tir> {
 								// Slice len has the memory's size type
 								// (u64 for a 64-bit memory).
 								ty: self.lower_type_index(
-									self.tir.memories[mem_idx].kind,
+									self.tir.memories[mem_idx].size.inner,
 								),
 							},
 						]),
@@ -2284,6 +2303,50 @@ impl<'tir> Builder<'tir> {
 					ty: self.lower_type_index(expr.ty),
 				}
 			}
+			tir::ExprKind::Match { scrutinee, arms } => {
+				let selector =
+					Box::new(self.lower_expression(func_ctx, scrutinee, sink));
+				let mut cases: Vec<(i64, Expression)> =
+					Vec::with_capacity(arms.len());
+				let mut default: Option<Box<Expression>> = None;
+				for arm in arms.iter() {
+					let body = self.lower_expression(func_ctx, &arm.body, sink);
+					match arm.pattern {
+						tir::Pattern::Wildcard => {
+							default = Some(Box::new(body));
+						}
+						tir::Pattern::Int(v) => cases.push((v, body)),
+						tir::Pattern::Bool(v) => cases.push((v as i64, body)),
+						tir::Pattern::Char(v) => cases.push((v as i64, body)),
+						tir::Pattern::EnumVariant {
+							enum_index,
+							variant_index,
+						} => {
+							let variant = &self.tir.enums[enum_index as usize]
+								.variants[variant_index as usize];
+							let discriminant = match variant.const_value {
+								Some(tir::ConstValue::Int(v)) => v,
+								// Error-free TIR guarantees an integer-repr
+								// enum's variants fold to an int constant —
+								// see the `EnumReprNotInteger` check in
+								// `Builder::build_enum`.
+								_ => unreachable!(
+									"enum variant without a folded integer compile-time value"
+								),
+							};
+							cases.push((discriminant, body));
+						}
+					}
+				}
+				Expression {
+					kind: ExprKind::Switch {
+						selector,
+						cases: cases.into_boxed_slice(),
+						default,
+					},
+					ty: self.lower_type_index(expr.ty),
+				}
+			}
 			tir::ExprKind::Break { scope_index, value } => Expression {
 				kind: ExprKind::Break {
 					scope_index: *scope_index,
@@ -2621,8 +2684,9 @@ impl<'tir> Builder<'tir> {
 				let ptr_ty = self.pointer_type(memory_id);
 				let tir_mem_idx =
 					self.tir.expect_memory_index(memory_id) as usize;
-				let idx_ty =
-					self.lower_type_index(self.tir.memories[tir_mem_idx].kind);
+				let idx_ty = self.lower_type_index(
+					self.tir.memories[tir_mem_idx].size.inner,
+				);
 
 				let lowered_obj = self.lower_expression(func_ctx, object, sink);
 
@@ -3582,6 +3646,19 @@ fn rewrite_body(
 			then_block: rw_box(then_block),
 			else_block: else_block.map(rw_box),
 		},
+		ExprKind::Switch {
+			selector,
+			cases,
+			default,
+		} => ExprKind::Switch {
+			selector: rw_box(selector),
+			cases: cases
+				.into_vec()
+				.into_iter()
+				.map(|(discriminant, body)| (discriminant, rw(body)))
+				.collect(),
+			default: rw_opt(default),
+		},
 		ExprKind::Add { left, right } => ExprKind::Add {
 			left: rw_box(left),
 			right: rw_box(right),
@@ -3874,6 +3951,37 @@ fn inline_expr(
 				current_scope,
 			);
 			if let Some(e) = else_block {
+				inline_expr(
+					e,
+					caller_scopes,
+					inline_id,
+					inline_body,
+					current_scope,
+				);
+			}
+		}
+		ExprKind::Switch {
+			selector,
+			cases,
+			default,
+		} => {
+			inline_expr(
+				selector,
+				caller_scopes,
+				inline_id,
+				inline_body,
+				current_scope,
+			);
+			for (_, body) in cases.iter_mut() {
+				inline_expr(
+					body,
+					caller_scopes,
+					inline_id,
+					inline_body,
+					current_scope,
+				);
+			}
+			if let Some(e) = default {
 				inline_expr(
 					e,
 					caller_scopes,

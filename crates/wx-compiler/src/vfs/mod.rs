@@ -290,7 +290,7 @@ pub struct CompilationGraphBuilder {
 	pub crates: Vec<CrateGraph>,
 }
 
-pub const STDLIB_SOURCE: &str = include_str!("../../std/lib.wx");
+pub const STDLIB_SOURCE: &str = include_str!("../../std/main.wx");
 
 impl Default for CompilationGraphBuilder {
 	fn default() -> Self {
@@ -314,9 +314,9 @@ impl CompilationGraphBuilder {
 	pub fn load_stdlib(&mut self) -> CrateId {
 		self.load_library(
 			"std",
-			"lib.wx".to_string(),
+			"main.wx".to_string(),
 			&VirtualFileSource::new(HashMap::from([(
-				"lib.wx".to_string(),
+				"main.wx".to_string(),
 				STDLIB_SOURCE.to_string(),
 			)])),
 		)

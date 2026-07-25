@@ -1692,21 +1692,23 @@ fn test_loop_two_breaks_different_values_creates_phi() {
 	);
 
 	// The loop body block must have break_result_outputs populated with that phi.
-	let loop_block = opt
+	let (loop_idx, _) = opt
 		.blocks
 		.iter()
-		.filter_map(|b| b.as_ref())
-		.find(|b| b.is_loop)
+		.enumerate()
+		.filter_map(|(i, b)| b.as_ref().map(|b| (i as u32, b)))
+		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
+	let break_result_outputs = &opt.loop_data(loop_idx).break_result_outputs;
 	assert_eq!(
-		loop_block.break_result_outputs.len(),
+		break_result_outputs.len(),
 		1,
 		"expected one phi index in break_result_outputs; got {:?}",
-		loop_block.break_result_outputs
+		break_result_outputs
 	);
 
 	// The phi's inputs must be the two break values (Int{0}=false, Int{1}=true).
-	let phi_idx = loop_block.break_result_outputs[0];
+	let phi_idx = break_result_outputs[0];
 	assert!(
 		matches!(
 			opt.data_nodes[phi_idx as usize].kind,
@@ -1733,14 +1735,15 @@ fn test_loop_single_break_no_phi() {
 		.count();
 	assert_eq!(phi_count, 0, "single break needs no Phi");
 
-	let loop_block = opt
+	let (loop_idx, _) = opt
 		.blocks
 		.iter()
-		.filter_map(|b| b.as_ref())
-		.find(|b| b.is_loop)
+		.enumerate()
+		.filter_map(|(i, b)| b.as_ref().map(|b| (i as u32, b)))
+		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		loop_block.break_result_outputs.is_empty(),
+		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty for a single-break loop"
 	);
 }
@@ -1767,14 +1770,15 @@ fn test_loop_two_breaks_same_value_phi_folds() {
 		.count();
 	assert_eq!(phi_count, 0, "Phi(7, 7) must fold away");
 
-	let loop_block = opt
+	let (loop_idx, _) = opt
 		.blocks
 		.iter()
-		.filter_map(|b| b.as_ref())
-		.find(|b| b.is_loop)
+		.enumerate()
+		.filter_map(|(i, b)| b.as_ref().map(|b| (i as u32, b)))
+		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		loop_block.break_result_outputs.is_empty(),
+		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty when phi folds"
 	);
 }
@@ -2088,5 +2092,268 @@ fn test_u32_division_schedules_unsigned_div() {
 	assert!(
 		body.iter().any(|i| matches!(i, Instruction::I32DivU)),
 		"u32 / u32 must emit i32.div_u; got: {body:?}"
+	);
+}
+
+// ── match / Switch ───────────────────────────────────────────────────────
+
+/// Every arm just returns the same param unchanged — no phi is needed, so
+/// `ControlNode::Switch.outputs` must be empty (the "unanimous" fast path).
+/// Three dense real cases (`0`, `1`, `2`) so this actually routes through
+/// `build_switch` — see `Builder::should_use_br_table` — rather than the
+/// `IfElse` chain a sub-threshold match now lowers to.
+#[test]
+fn test_match_switch_no_divergent_bindings() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32, y: i32) -> i32 {
+            match x {
+                0 -> { y },
+                1 -> { y },
+                2 -> { y },
+                _ -> { y },
+            }
+        }
+        export { f }
+    "});
+	let opt = Builder::build(&case.mir, case.get_first_func());
+	let root = opt.blocks[0].as_ref().unwrap();
+	let outputs = root
+		.statements
+		.iter()
+		.find_map(|s| match s {
+			ControlNode::Switch { outputs, .. } => Some(outputs),
+			_ => None,
+		})
+		.expect("expected a Switch statement");
+	assert!(
+		outputs.is_empty(),
+		"expected no phi outputs when every arm agrees; got {outputs:?}"
+	);
+}
+
+/// Each arm assigns a different literal to an outer `mut` local (a
+/// statement, not the arm's tail value) — exactly one divergent binding, so
+/// `outputs.len() == 1`, and each case's `own_values[0]` must carry that
+/// arm's own assigned literal. Four dense real cases so this routes through
+/// `build_switch` (see `Builder::should_use_br_table`).
+#[test]
+fn test_match_switch_phi_per_divergent_binding() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local mut acc: i32 = 0;
+            match x {
+                0 -> { acc = 1; },
+                1 -> { acc = 2; },
+                2 -> { acc = 3; },
+                _ -> { acc = 4; },
+            }
+            acc
+        }
+        export { f }
+    "});
+	let opt = Builder::build(&case.mir, case.get_first_func());
+	let root = opt.blocks[0].as_ref().unwrap();
+	let (cases, default, outputs) = root
+		.statements
+		.iter()
+		.find_map(|s| match s {
+			ControlNode::Switch {
+				cases,
+				default,
+				outputs,
+				..
+			} => Some((cases, default, outputs)),
+			_ => None,
+		})
+		.expect("expected a Switch statement");
+	assert_eq!(
+		outputs.len(),
+		1,
+		"expected exactly one divergent binding (`acc`); outputs: {outputs:?}"
+	);
+
+	let int_value = |case: &crate::opt::SwitchCase| match case.own_values[0] {
+		StackResult::Value(n) => match opt.data_nodes[n as usize].kind {
+			DataNodeKind::Int { value, .. } => value,
+			ref other => panic!("expected an Int node, got {other:?}"),
+		},
+		other => panic!("expected a Value own-contribution, got {other:?}"),
+	};
+	let mut values: Vec<i64> = cases.iter().map(int_value).collect();
+	values.push(int_value(default.as_ref().unwrap()));
+	values.sort();
+	assert_eq!(
+		values,
+		vec![1, 2, 3, 4],
+		"each arm's own contribution to the `acc` phi must be its own literal"
+	);
+}
+
+/// Each arm's *tail value* (not a binding) differs — the "own result" slot
+/// is what diverges here, still surfacing as exactly one phi output. Three
+/// dense real cases so this routes through `build_switch` (see
+/// `Builder::should_use_br_table`).
+#[test]
+fn test_match_switch_result_value_join() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            match x {
+                0 -> { 10 },
+                1 -> { 20 },
+                2 -> { 25 },
+                _ -> { 30 },
+            }
+        }
+        export { f }
+    "});
+	let opt = Builder::build(&case.mir, case.get_first_func());
+	let root = opt.blocks[0].as_ref().unwrap();
+	let (cases, outputs, result) = root
+		.statements
+		.iter()
+		.find_map(|s| match s {
+			ControlNode::Switch {
+				cases,
+				outputs,
+				result,
+				..
+			} => Some((cases, outputs, result)),
+			_ => None,
+		})
+		.expect("expected a Switch statement");
+	assert_eq!(cases.len(), 3, "0, 1, 2 are real cases; _ is the default");
+	assert_eq!(
+		outputs.len(),
+		1,
+		"the differing tail values must merge into exactly one phi"
+	);
+	assert!(
+		matches!(result, StackResult::Value(v) if outputs.contains(v)),
+		"the Switch's own result must be the merged phi; result: {result:?}, outputs: {outputs:?}"
+	);
+}
+
+/// An exhaustive enum match with no explicit `_` must lower with no default
+/// case — mirrors `mir::tests::test_match_exhaustive_enum_no_wildcard_has_no_default`,
+/// checked again here to confirm it survives Opt construction unchanged.
+#[test]
+fn test_match_switch_exhaustive_enum_has_no_default() {
+	let case = TestCase::new(indoc! {"
+        enum Color: u8 {
+            Red,
+            Green,
+            Blue,
+        }
+        fn to_u8(c: Color) -> u8 {
+            match c {
+                Color::Red -> { 0 },
+                Color::Green -> { 1 },
+                Color::Blue -> { 2 },
+            }
+        }
+        export { to_u8 }
+    "});
+	let opt = Builder::build(&case.mir, case.get_first_func());
+	let root = opt.blocks[0].as_ref().unwrap();
+	let (cases, default) = root
+		.statements
+		.iter()
+		.find_map(|s| match s {
+			ControlNode::Switch { cases, default, .. } => {
+				Some((cases, default))
+			}
+			_ => None,
+		})
+		.expect("expected a Switch statement");
+	assert_eq!(cases.len(), 3, "one case per enum variant");
+	assert!(
+		default.is_none(),
+		"exhaustive enum match without `_` should have no default arm"
+	);
+}
+
+/// End-to-end scheduling sanity check: a 3-arm match with only 2 *real*
+/// cases (`0`, `1`, plus the `_` default) stays below
+/// `Builder::should_use_br_table`'s `>= 3` threshold, so it's built by
+/// `Builder::build_switch_as_if_chain` and schedules as a plain right-nested
+/// `if`/`else` chain — no `ControlNode::Switch`/`br_table` involved at all.
+#[test]
+fn test_match_schedules_nested_if_else_chain() {
+	let case = TestCase::new(indoc! {"
+        fn sign(x: i32) -> i32 {
+            match x {
+                0 -> { 0 },
+                1 -> { 1 },
+                _ -> { -1 },
+            }
+        }
+        export { sign }
+    "});
+	let body = case.schedule();
+	let if_count = body
+		.iter()
+		.filter(|i| matches!(i, Instruction::If { .. }))
+		.count();
+	let else_count = body
+		.iter()
+		.filter(|i| matches!(i, Instruction::Else))
+		.count();
+	let eq_count = body
+		.iter()
+		.filter(|i| matches!(i, Instruction::I32Eq))
+		.count();
+	assert_eq!(if_count, 2, "one `if` per real case; got: {body:?}");
+	assert_eq!(else_count, 2, "one `else` per real case; got: {body:?}");
+	assert_eq!(eq_count, 2, "one comparison per real case; got: {body:?}");
+	assert!(
+		!body.iter().any(|i| matches!(i, Instruction::BrTable(_))),
+		"below the br_table threshold, must not emit one; got: {body:?}"
+	);
+}
+
+/// Once a match has >= 3 dense real cases, it crosses
+/// `Builder::should_use_br_table`'s threshold and schedules as a single
+/// `br_table` instead — `depths` is indexed by *shifted selector value*
+/// (`declared discriminant - min`), holding each case's *array position*
+/// (declaration order, not discriminant value — the two happen to coincide
+/// here since cases are declared in ascending order), with the trailing
+/// entry as the default depth (`== case_count`, since default sits one
+/// `block` further out than the outermost real case — see
+/// `Scheduler::emit_switch_br_table`'s doc comment for the full nesting
+/// diagram).
+#[test]
+fn test_match_schedules_br_table_for_dense_cases() {
+	let case = TestCase::new(indoc! {"
+        fn classify(x: i32) -> i32 {
+            match x {
+                0 -> { 10 },
+                1 -> { 20 },
+                2 -> { 30 },
+                _ -> { -1 },
+            }
+        }
+        export { classify }
+    "});
+	let body = case.schedule();
+	let br_tables: Vec<_> = body
+		.iter()
+		.filter_map(|i| match i {
+			Instruction::BrTable(depths) => Some(depths),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(
+		br_tables.len(),
+		1,
+		"expected exactly one br_table; got: {body:?}"
+	);
+	assert_eq!(
+		br_tables[0].as_ref(),
+		[0, 1, 2, 3],
+		"depths must be per-case array position, default (== case_count) trailing"
+	);
+	assert!(
+		!body.iter().any(|i| matches!(i, Instruction::If { .. })),
+		"a dense match must not also emit an if/else chain; got: {body:?}"
 	);
 }

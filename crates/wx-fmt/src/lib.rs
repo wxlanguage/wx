@@ -49,6 +49,7 @@ define_text! {
 		Local   => "local ",
 		Loop    => "loop ",
 		If      => "if ",
+		Match   => "match ",
 		Enum    => "enum ",
 		// keywords without trailing space
 		Break       => "break",
@@ -490,7 +491,10 @@ impl<'a> Builder<'a> {
 				entries,
 			),
 			ast::Item::Memory {
-				name, kind, config, ..
+				name,
+				bound: kind,
+				config,
+				..
 			} => {
 				let name_id = self.symbol(name.inner);
 				let kind_id = self.build_bound_expression(&kind.inner);
@@ -929,7 +933,7 @@ impl<'a> Builder<'a> {
 				nodes.push(self.text(Text::Semi));
 				self.arena.concat(nodes)
 			}
-			ast::ImplItem::AssociatedType { name, ty, .. } => {
+			ast::ImplItem::AssocType { name, ty, .. } => {
 				let type_kw = self.text(Text::TypeKw);
 				let name_sym = self.symbol(name.inner);
 				let eq = self.text(Text::EqSp);
@@ -1088,6 +1092,46 @@ impl<'a> Builder<'a> {
 		nodes.push(self.text(Text::EqSp));
 		nodes.push(self.build_type_expression(&ty.inner));
 		nodes.push(self.text(Text::Semi));
+		self.arena.concat(nodes)
+	}
+
+	fn build_match_expression(
+		&mut self,
+		span: ast::TextSpan,
+		scrutinee: &ast::Spanned<ast::Expression>,
+		arms: &[ast::Separated<ast::Spanned<ast::MatchArm>>],
+	) -> NodeId {
+		let match_kw = self.text(Text::Match);
+		let scrutinee_id = self.build_expression(scrutinee);
+		let mut nodes: Vec<NodeId> =
+			vec![match_kw, scrutinee_id, self.text(Text::SpaceLBrace)];
+
+		if !arms.is_empty() {
+			let mut arm_items: Vec<NodeId> = vec![self.hard_line()];
+			for (index, arm) in arms.iter().enumerate() {
+				let mut an: Vec<NodeId> =
+					vec![self.build_expression(&arm.inner.inner.pattern)];
+				an.push(self.text(Text::Arrow));
+				an.push(self.build_expression(&arm.inner.inner.body));
+				if index + 1 < arms.len() {
+					an.push(self.text(Text::Comma));
+				} else {
+					an.push(self.if_break_comma());
+				}
+				arm_items.push(self.arena.concat(an));
+				if index + 1 < arms.len() {
+					arm_items.push(self.hard_line());
+				}
+			}
+
+			let concat = self.arena.concat(arm_items);
+			nodes.push(self.arena.indent(concat));
+			nodes.push(self.hard_line());
+		} else {
+			self.build_empty_braced_comments(&mut nodes, span);
+		}
+
+		nodes.push(self.text(Text::RBrace));
 		self.arena.concat(nodes)
 	}
 
@@ -1540,6 +1584,19 @@ impl<'a> Builder<'a> {
 		expression: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
 		match &expression.inner {
+			ast::Expression::QualifiedPath { root, segments } => {
+				let self_type_node =
+					self.build_type_expression(&root.self_type.inner);
+				self.build_qualified_path(
+					self_type_node,
+					Some(&root.trait_path),
+					segments,
+				)
+			}
+			ast::Expression::Grouped { inner, segments } => {
+				let inner_node = self.build_type_expression(&inner.inner);
+				self.build_qualified_path(inner_node, None, segments)
+			}
 			ast::Expression::Path(path) => self.build_path_segments(path),
 			ast::Expression::Binary {
 				left,
@@ -1608,6 +1665,9 @@ impl<'a> Builder<'a> {
 				let block_id = self.build_expression(block);
 				let concat = self.arena.concat2(loop_kw, block_id);
 				self.arena.group(concat)
+			}
+			ast::Expression::Match { scrutinee, arms } => {
+				self.build_match_expression(expression.span, scrutinee, arms)
 			}
 			ast::Expression::Break { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Break)];
@@ -1953,6 +2013,28 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
+	/// Formats `<self_type_node [as trait_segments]>::segments` — shared by
+	/// `QualifiedPath` (`<Type as Trait>::Item`, `trait_segments: Some`) and
+	/// `Grouped` (`<Type>::Item`, `trait_segments: None`) in both type
+	/// position and expression position, which differ only in how
+	/// `self_type_node` itself was built.
+	fn build_qualified_path(
+		&mut self,
+		self_type_node: NodeId,
+		trait_segments: Option<&[ast::PathSegment]>,
+		segments: &[ast::PathSegment],
+	) -> NodeId {
+		let mut items: Vec<NodeId> = vec![self.text(Text::Lt), self_type_node];
+		if let Some(trait_segments) = trait_segments {
+			items.push(self.text(Text::As));
+			items.push(self.build_path_segments(trait_segments));
+		}
+		items.push(self.text(Text::Gt));
+		items.push(self.text(Text::ColonColon));
+		items.push(self.build_path_segments(segments));
+		self.arena.concat(items)
+	}
+
 	fn build_bound_expression(
 		&mut self,
 		bound: &ast::BoundExpression,
@@ -1970,9 +2052,20 @@ impl<'a> Builder<'a> {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
 					let key = self.symbol(binding.name.inner);
-					let eq = self.text(Text::EqSp);
-					let ty = self.build_type_expression(&binding.ty.inner);
-					binding_parts.push(self.arena.concat3(key, eq, ty));
+					let rhs = match &binding.kind {
+						ast::AssocTypeBindingKind::Equals(ty) => {
+							let eq = self.text(Text::EqSp);
+							let ty = self.build_type_expression(&ty.inner);
+							self.arena.concat2(eq, ty)
+						}
+						ast::AssocTypeBindingKind::Bound(bound) => {
+							let colon = self.text(Text::ColonSp);
+							let bound =
+								self.build_bound_expression(&bound.inner);
+							self.arena.concat2(colon, bound)
+						}
+					};
+					binding_parts.push(self.arena.concat2(key, rhs));
 				}
 				let bindings_concat = self.arena.concat(binding_parts);
 				self.arena.concat5(
@@ -2001,6 +2094,19 @@ impl<'a> Builder<'a> {
 		type_expression: &ast::TypeExpression,
 	) -> NodeId {
 		match type_expression {
+			ast::TypeExpression::QualifiedPath { root, segments } => {
+				let self_type_node =
+					self.build_type_expression(&root.self_type.inner);
+				self.build_qualified_path(
+					self_type_node,
+					Some(&root.trait_path),
+					segments,
+				)
+			}
+			ast::TypeExpression::Grouped { inner, segments } => {
+				let inner_node = self.build_type_expression(&inner.inner);
+				self.build_qualified_path(inner_node, None, segments)
+			}
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
 			ast::TypeExpression::Path(path) => self.build_path_segments(path),
 			ast::TypeExpression::Function { params, result } => {
