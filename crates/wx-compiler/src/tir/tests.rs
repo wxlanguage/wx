@@ -7164,6 +7164,62 @@ fn test_enum_unused_is_warned() {
 }
 
 #[test]
+fn test_pub_const_in_inherent_impl_not_warned_unused() {
+	// Regression test: `ImplItem::Constant` (unlike `ImplItem::Function`,
+	// which already carries `pub_span`) never recorded whether an inherent
+	// impl's associated const was declared `pub` — the parser parsed the
+	// `pub` keyword via the same shared `parse_impl_member` prefix used for
+	// methods, but silently dropped it for consts, and TIR then hardcoded
+	// `pub_span: None` when building the `Constant` entry. Since the
+	// unused-item check only skips items with `pub_span.is_some()`, every
+	// `pub const` inside an `impl` block was wrongly flagged as unused
+	// regardless of its actual visibility.
+	let case = TestCase::new(indoc! {"
+        struct Foo {}
+        impl Foo {
+            pub const BAR: i32 = 1;
+        }
+        export {}
+    "});
+	assert!(
+		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedItem.code())
+			&& d.message.contains("BAR")),
+		"pub const in an inherent impl block must not be flagged unused, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_private_const_in_inherent_impl_is_warned_unused() {
+	// Companion to the test above: confirms the fix respects `pub_span`
+	// rather than blanket-suppressing the unused check for every impl
+	// const.
+	let case = TestCase::new(indoc! {"
+        struct Foo {}
+        impl Foo {
+            const BAR: i32 = 1;
+        }
+        export {}
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedItem.code())
+			&& d.message.contains("BAR")),
+		"expected W1004 for unused private const `BAR`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
 fn test_pub_enum_no_unused_warn() {
 	let case = TestCase::new(indoc! {"
         pub enum Color: i32 {

@@ -1,0 +1,292 @@
+use std::*;
+
+memory heap: Memory where { Size = u32 } { min_pages: 4 };
+
+import "host" as host {
+    fn key_down(code: i32) -> i32;
+}
+
+// ── constants ────────────────────────────────────────────────────────────────
+const MAP_MAX_W: u32 = 64;
+const MAP_MAX_H: u32 = 64;
+
+const SCREEN_W: i32 = 160;
+const SCREEN_H: i32 = 120;
+const FOV: f64 = 1.2;
+
+const MOVE_SPEED: f64 = 3.0;
+const ROT_SPEED: f64 = 2.5;
+
+// ── trig (range-reduce + polynomial; validated separately against libm) ──────
+fn reduce(x: f64) -> f64 {
+    local two_pi = f64::PI * 2.0;
+    local k = f64_floor((x + f64::PI) / two_pi);
+    x - k * two_pi
+}
+
+fn sin_poly(y: f64) -> f64 {
+    local y2 = y * y;
+    local y3 = y2 * y;
+    local y5 = y3 * y2;
+    local y7 = y5 * y2;
+    local y9 = y7 * y2;
+    local y11 = y9 * y2;
+    y - y3 / 6.0 + y5 / 120.0 - y7 / 5040.0 + y9 / 362880.0 - y11 / 39916800.0
+}
+
+pub fn wx_sin(x: f64) -> f64 {
+    local half_pi = f64::PI / 2.0;
+    local mut q = reduce(x);
+    if q > half_pi { q = f64::PI - q; } else { if q < -half_pi { q = -f64::PI - q; }; };
+    sin_poly(q)
+}
+
+pub fn wx_cos(x: f64) -> f64 {
+    wx_sin(x + f64::PI / 2.0)
+}
+
+// ── map ────────────────────────────────────────────────────────────────────
+// `map_data` is a plain byte buffer (row-major, MAP_MAX_W*MAP_MAX_H capacity,
+// one byte per cell — 0 = empty, nonzero = wall) that the host writes
+// directly, then tells wx the real dimensions via `load_map`. There is no
+// compiled-in default: `load_map` must be called once before the first
+// `frame()` call.
+global mut map_w: u32 = 0;
+global mut map_h: u32 = 0;
+global mut map_data: heap::*mut u8 = ptr::null_mut();
+
+pub fn map_ptr() -> i32 {
+    map_data as i32
+}
+
+pub fn map_at(x: i32, y: i32) -> u8 {
+    if x < 0 || y < 0 || x >= map_w as i32 || y >= map_h as i32 {
+        1
+    } else {
+        ptr::add(map_data, y as u32 * map_w + x as u32).*
+    }
+}
+
+fn is_wall(x: f64, y: f64) -> bool {
+    map_at(i32_trunc_f64(f64_floor(x)), i32_trunc_f64(f64_floor(y))) != 0
+}
+
+// Scans row-major for the first open cell and spawns the player there, so an
+// uploaded map doesn't need to guarantee any particular cell is walkable.
+fn find_spawn() {
+    local mut y: i32 = 0;
+    local mut found = false;
+    loop {
+        if found { break };
+        if y >= map_h as i32 { break };
+        local mut x: i32 = 0;
+        loop {
+            if found { break };
+            if x >= map_w as i32 { break };
+            if map_at(x, y) == 0 {
+                player_x = f64_convert_i32(x) + 0.5;
+                player_y = f64_convert_i32(y) + 0.5;
+                player_angle = 0.0;
+                found = true;
+            };
+            x += 1;
+        };
+        y += 1;
+    };
+}
+
+// Host writes `w * h` bytes (row-major, 0 = empty, nonzero = wall) into the
+// buffer at `map_ptr()` before calling this.
+pub fn load_map(w: i32, h: i32) {
+    map_w = w as u32;
+    map_h = h as u32;
+    find_spawn();
+}
+
+// ── bump allocator (same pattern as examples/snake) ───────────────────────────
+global mut bump: heap::*u8 = heap::DATA_END;
+
+fn alloc_bytes(size: u32, align: u32) -> heap::*mut u8 {
+    local ptr = (bump as u32 + align - 1) / align * align;
+    local new_end = ptr + size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+        local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        _ = heap.grow(needed);
+    };
+    bump = new_end as heap::*u8;
+    ptr as heap::*mut u8
+}
+
+// ── framebuffer ────────────────────────────────────────────────────────────
+global mut fb_ptr: heap::*mut u8 = ptr::null_mut();
+
+pub fn framebuffer_ptr() -> i32 {
+    fb_ptr as i32
+}
+
+fn put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
+    if x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H { return; };
+    local offset = (y as u32 * SCREEN_W as u32 + x as u32) * 4;
+    local p = ptr::add_mut(fb_ptr, offset);
+    p.* = r;
+    ptr::add_mut(p, 1).* = g;
+    ptr::add_mut(p, 2).* = b;
+    ptr::add_mut(p, 3).* = 255;
+}
+
+// ── player state ─────────────────────────────────────────────────────────────
+global mut player_x: f64 = 3.5;
+global mut player_y: f64 = 3.5;
+global mut player_angle: f64 = 0.0;
+
+// ── raycasting ───────────────────────────────────────────────────────────────
+struct RayHit {
+    dist: f64,
+    side: i32,
+}
+
+fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
+    local dir_x = wx_cos(angle);
+    local dir_y = wx_sin(angle);
+    
+    local mut map_x = i32_trunc_f64(f64_floor(ox));
+    local mut map_y = i32_trunc_f64(f64_floor(oy));
+
+    local mut delta_dist_x: f64 = 1000000000000.0;
+    local mut delta_dist_y: f64 = 1000000000000.0;
+    if dir_x != 0.0 { delta_dist_x = f64_abs(1.0 / dir_x) }
+    if dir_y != 0.0 { delta_dist_y = f64_abs(1.0 / dir_y) }
+
+    local mut step_x: i32 = 0;
+    local mut step_y: i32 = 0;
+    local mut side_dist_x: f64 = 0.0;
+    local mut side_dist_y: f64 = 0.0;
+    
+    if dir_x < 0.0 {
+        step_x = -1;
+        side_dist_x = (ox - f64_convert_i32(map_x)) * delta_dist_x;
+    } else {
+        step_x = 1;
+        side_dist_x = (f64_convert_i32(map_x) + 1.0 - ox) * delta_dist_x;
+    }
+    if dir_y < 0.0 {
+        step_y = -1;
+        side_dist_y = (oy - f64_convert_i32(map_y)) * delta_dist_y;
+    } else {
+        step_y = 1;
+        side_dist_y = (f64_convert_i32(map_y) + 1.0 - oy) * delta_dist_y;
+    }
+    
+    local mut side: i32 = 0;
+    local mut hit = false;
+    loop {
+        if hit { break };
+        if side_dist_x < side_dist_y {
+            side_dist_x += delta_dist_x;
+            map_x += step_x;
+            side = 0;
+        } else {
+            side_dist_y += delta_dist_y;
+            map_y += step_y;
+            side = 1;
+        }
+        if map_at(map_x, map_y) != 0 { hit = true }
+    }
+    
+    local dist = if side == 0 {
+        (f64_convert_i32(map_x) - ox + (1.0 - f64_convert_i32(step_x)) / 2.0)
+            / dir_x
+    } else {
+        (f64_convert_i32(map_y) - oy + (1.0 - f64_convert_i32(step_y)) / 2.0)
+            / dir_y
+    };
+    
+    RayHit::{ dist, side }
+}
+
+// ── render ───────────────────────────────────────────────────────────────────
+pub fn render() {
+    local mut x: i32 = 0;
+    loop {
+        if x >= SCREEN_W { break };
+
+        local t = f64_convert_i32(x) / f64_convert_i32(SCREEN_W);
+        local ray_angle = player_angle - FOV / 2.0 + FOV * t;
+        local hit = cast_ray(player_x, player_y, ray_angle);
+        local corrected = hit.dist * wx_cos(ray_angle - player_angle);
+
+        local mut line_height = SCREEN_H;
+        if corrected > 0.0001 {
+            line_height = i32_trunc_f64(f64_convert_i32(SCREEN_H) / corrected);
+        };
+
+        local mut draw_start = SCREEN_H / 2 - line_height / 2;
+        local mut draw_end = SCREEN_H / 2 + line_height / 2;
+        if draw_start < 0 { draw_start = 0; };
+        if draw_end >= SCREEN_H { draw_end = SCREEN_H - 1; };
+
+        local mut shade: u8 = 200;
+        if hit.side == 1 { shade = 140; };
+
+        local mut y: i32 = 0;
+        loop {
+            if y >= SCREEN_H { break };
+            if y < draw_start {
+                put_pixel(x, y, 40, 40, 60);
+            } else {
+                if y > draw_end {
+                    put_pixel(x, y, 70, 70, 70);
+                } else {
+                    put_pixel(x, y, shade, 0, 0);
+                };
+            };
+            y += 1;
+        };
+        x += 1;
+    };
+}
+
+// ── input + movement ───────────────────────────────────────────────────────
+pub fn update(dt_ms: i64) {
+    local dt = f64_convert_i64(dt_ms) / 1000.0;
+    local mut forward: f64 = 0.0;
+    local mut strafe: f64 = 0.0;
+
+    if host::key_down(87) != 0 { forward += 1.0; };
+    if host::key_down(83) != 0 { forward -= 1.0; };
+    if host::key_down(68) != 0 { strafe += 1.0; };
+    if host::key_down(65) != 0 { strafe -= 1.0; };
+    if host::key_down(39) != 0 { player_angle += ROT_SPEED * dt; };
+    if host::key_down(37) != 0 { player_angle -= ROT_SPEED * dt; };
+
+    local dir_x = wx_cos(player_angle);
+    local dir_y = wx_sin(player_angle);
+    local perp_x = -dir_y;
+    local perp_y = dir_x;
+
+    local nx = player_x + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
+    local ny = player_y + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
+
+    if !is_wall(nx, player_y) { player_x = nx; };
+    if !is_wall(player_x, ny) { player_y = ny; };
+}
+
+pub fn frame(dt_ms: i64) {
+    update(dt_ms);
+    render();
+}
+
+pub fn init() {
+    fb_ptr = alloc_bytes(SCREEN_W as u32 * SCREEN_H as u32 * 4, 4);
+    map_data = alloc_bytes(MAP_MAX_W * MAP_MAX_H, 1);
+}
+
+export {
+    heap as "memory",
+    init,
+    frame,
+    framebuffer_ptr,
+    map_ptr,
+    load_map,
+}

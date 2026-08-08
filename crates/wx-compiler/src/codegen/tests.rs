@@ -3469,3 +3469,160 @@ fn test_match_wide_sparse_if_chain_builds_iteratively() {
 	assert_eq!(f.call(&mut store, (ARMS - 1) * 1000).unwrap(), ARMS - 1); // last arm
 	assert_eq!(f.call(&mut store, 7).unwrap(), -1); // default (no arm matches 7)
 }
+
+#[test]
+fn test_if_without_else_preserves_local_initializer() {
+	// Regression test: `local mut x: T = INIT; if cond { x = OTHER; };` must
+	// still read as INIT when `cond` is false. `emit_phi_stores_for_branch`
+	// stores a phi's "else" (unchanged) input inside the WASM `else` block —
+	// but a source `if` with no `else` has none, so without a fix that store
+	// never runs, leaving the phi's freshly allocated (zero-valued) local
+	// instead of INIT.
+	let case = TestCase::new(indoc! {"
+        fn f(cond: bool) -> f64 {
+            local mut x: f64 = 1000000000000.0;
+            if cond {
+                x = 5.0;
+            };
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, f64>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(
+		f.call(&mut store, 0).unwrap(),
+		1000000000000.0,
+		"initializer must survive when the if-without-else doesn't run"
+	);
+	assert_eq!(f.call(&mut store, 1).unwrap(), 5.0);
+}
+
+#[test]
+fn test_unrelated_if_else_phis_are_not_cse_aliased() {
+	// Regression test: two independent `if`/`else` statements that happen to
+	// merge the same pair of constants (here `-1`/`1`, once for `a` gated on
+	// `cond_a`, once for `b` gated on `cond_b`) must not collapse into one
+	// Phi node. `DataNodeKind::Phi` is structurally `(left, right, ty)` with
+	// no identity tying it to the branch that produced it, so without
+	// excluding it from CSE (`is_pure`), two unrelated joins with matching
+	// operands alias and one variable silently reads the other's value.
+	let case = TestCase::new(indoc! {"
+        fn f(cond_a: bool, cond_b: bool) -> i32 {
+            local mut a: i32 = 0;
+            local mut b: i32 = 0;
+            if cond_a { a = -1; } else { a = 1; };
+            if cond_b { b = -1; } else { b = 1; };
+            a * 10 + b
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, (1, 0)).unwrap(), -9); // a=-1, b=1
+	assert_eq!(f.call(&mut store, (0, 1)).unwrap(), 9); // a=1, b=-1
+	assert_eq!(f.call(&mut store, (1, 1)).unwrap(), -11); // a=-1, b=-1
+	assert_eq!(f.call(&mut store, (0, 0)).unwrap(), 11); // a=1, b=1
+}
+
+#[test]
+fn test_pure_value_shared_across_if_else_branches_is_materialized_before_branch()
+ {
+	// Regression test: a pure expression referenced identically from *both*
+	// branches of an if/else (here `f64_convert_i32(y)`, used once in each
+	// branch's arithmetic) must be computed once, before the branch, not
+	// lazily the first time the scheduler's single-pass walk reaches it.
+	// `should_spill` correctly decides this value needs a local (it has more
+	// than one use), but naive lazy materialization stores it only inside
+	// whichever branch is scheduled first — the other branch's `local.get`
+	// then reads a local nothing on that path ever wrote, silently reading
+	// WASM's zero-initialized default instead of the real value.
+	let case = TestCase::new(indoc! {"
+        fn f(oy: f64, dir_negative: bool) -> f64 {
+            local mut y: i32 = 1;
+            local delta: f64 = 100.0;
+            local yf = f64_convert_i32(y);
+            if dir_negative {
+                (oy - yf) * delta
+            } else {
+                (yf + 1.0 - oy) * delta
+            }
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<(f64, i32), f64>(&mut store, "f")
+		.unwrap();
+
+	// else branch (dir_negative = false): (1 + 1 - 1.5) * 100 = 50
+	assert_eq!(f.call(&mut store, (1.5, 0)).unwrap(), 50.0);
+	// then branch (dir_negative = true): (1.5 - 1) * 100 = 50
+	assert_eq!(f.call(&mut store, (1.5, 1)).unwrap(), 50.0);
+}
+
+#[test]
+fn test_pure_value_shared_via_reassignment_across_if_else_branches() {
+	// Regression test for a narrower case than
+	// `test_pure_value_shared_across_if_else_branches_is_materialized_before_branch`:
+	// there, the shared value flows out as each branch's own *tail
+	// expression* (`Block::result`). Here it instead flows through a
+	// reassignment of a pre-existing `local mut` inside each branch — which
+	// at the sea-of-nodes level means the shared value only appears as one
+	// side of the branch-merging `Phi` in `IfElse.outputs`, not directly in
+	// either branch's own `Block::result`. A first version of the
+	// cross-branch placement fix accounted for the tail-expression case but
+	// not this one, since it never looked at `IfElse.outputs`' `Phi.left`/
+	// `Phi.right` as belonging to their respective branch blocks.
+	let case = TestCase::new(indoc! {"
+        fn f(dir_negative: bool, mag: i32) -> i32 {
+            local mut step: i32 = 0;
+            local mut side_dist: i32 = 0;
+            local m = mag * 2;
+            if dir_negative {
+                step = -1;
+                side_dist = m - 1;
+            } else {
+                step = 1;
+                side_dist = m + 1;
+            }
+            side_dist * 100 + step
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "f")
+		.unwrap();
+
+	// then: m=10, side_dist=9, step=-1 -> 899
+	assert_eq!(f.call(&mut store, (1, 5)).unwrap(), 899);
+	// else: m=10, side_dist=11, step=1 -> 1101
+	assert_eq!(f.call(&mut store, (0, 5)).unwrap(), 1101);
+}

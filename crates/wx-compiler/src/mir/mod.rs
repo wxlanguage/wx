@@ -191,6 +191,18 @@ pub enum ExprKind {
 	Neg {
 		value: Box<Expression>,
 	},
+	Sqrt {
+		value: Box<Expression>,
+	},
+	Abs {
+		value: Box<Expression>,
+	},
+	Floor {
+		value: Box<Expression>,
+	},
+	Ceil {
+		value: Box<Expression>,
+	},
 	I64ExtendI32S {
 		value: Box<Expression>,
 	},
@@ -198,6 +210,60 @@ pub enum ExprKind {
 		value: Box<Expression>,
 	},
 	I32WrapI64 {
+		value: Box<Expression>,
+	},
+	F32ConvertI32 {
+		value: Box<Expression>,
+	},
+	F32ConvertU32 {
+		value: Box<Expression>,
+	},
+	F32ConvertI64 {
+		value: Box<Expression>,
+	},
+	F32ConvertU64 {
+		value: Box<Expression>,
+	},
+	F64ConvertI32 {
+		value: Box<Expression>,
+	},
+	F64ConvertU32 {
+		value: Box<Expression>,
+	},
+	F64ConvertI64 {
+		value: Box<Expression>,
+	},
+	F64ConvertU64 {
+		value: Box<Expression>,
+	},
+	I32TruncF32 {
+		value: Box<Expression>,
+	},
+	U32TruncF32 {
+		value: Box<Expression>,
+	},
+	I32TruncF64 {
+		value: Box<Expression>,
+	},
+	U32TruncF64 {
+		value: Box<Expression>,
+	},
+	I64TruncF32 {
+		value: Box<Expression>,
+	},
+	U64TruncF32 {
+		value: Box<Expression>,
+	},
+	I64TruncF64 {
+		value: Box<Expression>,
+	},
+	U64TruncF64 {
+		value: Box<Expression>,
+	},
+	F64PromoteF32 {
+		value: Box<Expression>,
+	},
+	F32DemoteF64 {
 		value: Box<Expression>,
 	},
 	/// `i32.const <data_section_end>` — byte offset of the first writable
@@ -3167,6 +3233,46 @@ impl<'tir> Builder<'tir> {
 					ty: self.lower_type_index(expr_ty),
 				}
 			}
+			"f32_sqrt" | "f64_sqrt" => Expression {
+				kind: ExprKind::Sqrt {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_abs" | "f64_abs" => Expression {
+				kind: ExprKind::Abs {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_floor" | "f64_floor" => Expression {
+				kind: ExprKind::Floor {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_ceil" | "f64_ceil" => Expression {
+				kind: ExprKind::Ceil {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
 			"i64_extend_i32" => Expression {
 				kind: ExprKind::I64ExtendI32S {
 					value: Box::new(self.lower_expression(
@@ -3189,6 +3295,186 @@ impl<'tir> Builder<'tir> {
 			},
 			"i32_wrap_i64" => Expression {
 				kind: ExprKind::I32WrapI64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_convert_i32" => Expression {
+				kind: ExprKind::F32ConvertI32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_convert_u32" => Expression {
+				kind: ExprKind::F32ConvertU32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_convert_i64" => Expression {
+				kind: ExprKind::F32ConvertI64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_convert_u64" => Expression {
+				kind: ExprKind::F32ConvertU64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_convert_i32" => Expression {
+				kind: ExprKind::F64ConvertI32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_convert_u32" => Expression {
+				kind: ExprKind::F64ConvertU32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_convert_i64" => Expression {
+				kind: ExprKind::F64ConvertI64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_convert_u64" => Expression {
+				kind: ExprKind::F64ConvertU64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_trunc_f32" => Expression {
+				kind: ExprKind::I32TruncF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"u32_trunc_f32" => Expression {
+				kind: ExprKind::U32TruncF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_trunc_f64" => Expression {
+				kind: ExprKind::I32TruncF64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"u32_trunc_f64" => Expression {
+				kind: ExprKind::U32TruncF64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i64_trunc_f32" => Expression {
+				kind: ExprKind::I64TruncF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"u64_trunc_f32" => Expression {
+				kind: ExprKind::U64TruncF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i64_trunc_f64" => Expression {
+				kind: ExprKind::I64TruncF64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"u64_trunc_f64" => Expression {
+				kind: ExprKind::U64TruncF64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_promote_f32" => Expression {
+				kind: ExprKind::F64PromoteF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_demote_f64" => Expression {
+				kind: ExprKind::F32DemoteF64 {
 					value: Box::new(self.lower_expression(
 						func_ctx,
 						&arguments[0],
@@ -3611,6 +3897,18 @@ fn rewrite_body(
 		ExprKind::Neg { value } => ExprKind::Neg {
 			value: rw_box(value),
 		},
+		ExprKind::Sqrt { value } => ExprKind::Sqrt {
+			value: rw_box(value),
+		},
+		ExprKind::Abs { value } => ExprKind::Abs {
+			value: rw_box(value),
+		},
+		ExprKind::Floor { value } => ExprKind::Floor {
+			value: rw_box(value),
+		},
+		ExprKind::Ceil { value } => ExprKind::Ceil {
+			value: rw_box(value),
+		},
 		ExprKind::BitNot { value } => ExprKind::BitNot {
 			value: rw_box(value),
 		},
@@ -3624,6 +3922,60 @@ fn rewrite_body(
 			value: rw_box(value),
 		},
 		ExprKind::I32WrapI64 { value } => ExprKind::I32WrapI64 {
+			value: rw_box(value),
+		},
+		ExprKind::F32ConvertI32 { value } => ExprKind::F32ConvertI32 {
+			value: rw_box(value),
+		},
+		ExprKind::F32ConvertU32 { value } => ExprKind::F32ConvertU32 {
+			value: rw_box(value),
+		},
+		ExprKind::F32ConvertI64 { value } => ExprKind::F32ConvertI64 {
+			value: rw_box(value),
+		},
+		ExprKind::F32ConvertU64 { value } => ExprKind::F32ConvertU64 {
+			value: rw_box(value),
+		},
+		ExprKind::F64ConvertI32 { value } => ExprKind::F64ConvertI32 {
+			value: rw_box(value),
+		},
+		ExprKind::F64ConvertU32 { value } => ExprKind::F64ConvertU32 {
+			value: rw_box(value),
+		},
+		ExprKind::F64ConvertI64 { value } => ExprKind::F64ConvertI64 {
+			value: rw_box(value),
+		},
+		ExprKind::F64ConvertU64 { value } => ExprKind::F64ConvertU64 {
+			value: rw_box(value),
+		},
+		ExprKind::I32TruncF32 { value } => ExprKind::I32TruncF32 {
+			value: rw_box(value),
+		},
+		ExprKind::U32TruncF32 { value } => ExprKind::U32TruncF32 {
+			value: rw_box(value),
+		},
+		ExprKind::I32TruncF64 { value } => ExprKind::I32TruncF64 {
+			value: rw_box(value),
+		},
+		ExprKind::U32TruncF64 { value } => ExprKind::U32TruncF64 {
+			value: rw_box(value),
+		},
+		ExprKind::I64TruncF32 { value } => ExprKind::I64TruncF32 {
+			value: rw_box(value),
+		},
+		ExprKind::U64TruncF32 { value } => ExprKind::U64TruncF32 {
+			value: rw_box(value),
+		},
+		ExprKind::I64TruncF64 { value } => ExprKind::I64TruncF64 {
+			value: rw_box(value),
+		},
+		ExprKind::U64TruncF64 { value } => ExprKind::U64TruncF64 {
+			value: rw_box(value),
+		},
+		ExprKind::F64PromoteF32 { value } => ExprKind::F64PromoteF32 {
+			value: rw_box(value),
+		},
+		ExprKind::F32DemoteF64 { value } => ExprKind::F32DemoteF64 {
 			value: rw_box(value),
 		},
 		ExprKind::GlobalSet { id, value } => ExprKind::GlobalSet {
@@ -3873,11 +4225,33 @@ fn inline_expr(
 		| ExprKind::Drop { value }
 		| ExprKind::AggregateSet { value, .. }
 		| ExprKind::Neg { value }
+		| ExprKind::Sqrt { value }
+		| ExprKind::Abs { value }
+		| ExprKind::Floor { value }
+		| ExprKind::Ceil { value }
 		| ExprKind::BitNot { value }
 		| ExprKind::Eqz { value }
 		| ExprKind::I64ExtendI32S { value }
 		| ExprKind::I64ExtendI32U { value }
-		| ExprKind::I32WrapI64 { value } => inline_expr(
+		| ExprKind::I32WrapI64 { value }
+		| ExprKind::F32ConvertI32 { value }
+		| ExprKind::F32ConvertU32 { value }
+		| ExprKind::F32ConvertI64 { value }
+		| ExprKind::F32ConvertU64 { value }
+		| ExprKind::F64ConvertI32 { value }
+		| ExprKind::F64ConvertU32 { value }
+		| ExprKind::F64ConvertI64 { value }
+		| ExprKind::F64ConvertU64 { value }
+		| ExprKind::I32TruncF32 { value }
+		| ExprKind::U32TruncF32 { value }
+		| ExprKind::I32TruncF64 { value }
+		| ExprKind::U32TruncF64 { value }
+		| ExprKind::I64TruncF32 { value }
+		| ExprKind::U64TruncF32 { value }
+		| ExprKind::I64TruncF64 { value }
+		| ExprKind::U64TruncF64 { value }
+		| ExprKind::F64PromoteF32 { value }
+		| ExprKind::F32DemoteF64 { value } => inline_expr(
 			value,
 			caller_scopes,
 			inline_id,

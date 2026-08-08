@@ -4941,6 +4941,7 @@ impl<'ast> Builder<'ast, '_> {
 
 				if let ast::ImplItem::Constant {
 					id,
+					pub_span,
 					name,
 					ty,
 					value,
@@ -4991,7 +4992,7 @@ impl<'ast> Builder<'ast, '_> {
 							file_id: resolve_context.file_id,
 							namespace: resolve_context.namespace,
 							parent: Some(ItemParent::Impl(self_type)),
-							pub_span: None,
+							pub_span: *pub_span,
 							name: *name,
 							ty: ast::Spanned {
 								inner: resolved_ty,
@@ -6133,6 +6134,7 @@ impl<'ast> Builder<'ast, '_> {
 
 				if let ast::ImplItem::Constant {
 					id,
+					pub_span: _,
 					name,
 					ty,
 					value,

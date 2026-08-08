@@ -1467,6 +1467,7 @@ pub enum ImplItem {
 	},
 	Constant {
 		id: DefId,
+		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
 		value: Box<Spanned<Expression>>,
@@ -4803,6 +4804,7 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Spanned {
 					inner: ImplItem::Constant {
 						id: parser.id_generator.generate(),
+						pub_span,
 						name: Spanned {
 							inner: name_symbol,
 							span: name_span,

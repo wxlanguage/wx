@@ -319,6 +319,40 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(self.node(DataNodeKind::Neg { operand, ty }))
 			}
+			ExprKind::Sqrt { value } => {
+				let ty =
+					ScalarType::try_from(expr.ty).expect("Sqrt must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Sqrt { operand, ty }),
+				)
+			}
+			ExprKind::Abs { value } => {
+				let ty =
+					ScalarType::try_from(expr.ty).expect("Abs must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(self.node(DataNodeKind::Abs { operand, ty }))
+			}
+			ExprKind::Floor { value } => {
+				let ty = ScalarType::try_from(expr.ty)
+					.expect("Floor must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Floor { operand, ty }),
+				)
+			}
+			ExprKind::Ceil { value } => {
+				let ty =
+					ScalarType::try_from(expr.ty).expect("Ceil must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Ceil { operand, ty }),
+				)
+			}
 			ExprKind::BitNot { value } => {
 				let ty = ScalarType::try_from(expr.ty)
 					.expect("BitNot must be scalar");
@@ -352,6 +386,132 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(
 					self.node(DataNodeKind::I32WrapI64 { operand }),
+				)
+			}
+			ExprKind::F32ConvertI32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ConvertI32 { operand }),
+				)
+			}
+			ExprKind::F32ConvertU32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ConvertU32 { operand }),
+				)
+			}
+			ExprKind::F32ConvertI64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ConvertI64 { operand }),
+				)
+			}
+			ExprKind::F32ConvertU64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ConvertU64 { operand }),
+				)
+			}
+			ExprKind::F64ConvertI32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ConvertI32 { operand }),
+				)
+			}
+			ExprKind::F64ConvertU32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ConvertU32 { operand }),
+				)
+			}
+			ExprKind::F64ConvertI64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ConvertI64 { operand }),
+				)
+			}
+			ExprKind::F64ConvertU64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ConvertU64 { operand }),
+				)
+			}
+			ExprKind::I32TruncF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I32TruncF32 { operand }),
+				)
+			}
+			ExprKind::U32TruncF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::U32TruncF32 { operand }),
+				)
+			}
+			ExprKind::I32TruncF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I32TruncF64 { operand }),
+				)
+			}
+			ExprKind::U32TruncF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::U32TruncF64 { operand }),
+				)
+			}
+			ExprKind::I64TruncF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I64TruncF32 { operand }),
+				)
+			}
+			ExprKind::U64TruncF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::U64TruncF32 { operand }),
+				)
+			}
+			ExprKind::I64TruncF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I64TruncF64 { operand }),
+				)
+			}
+			ExprKind::U64TruncF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::U64TruncF64 { operand }),
+				)
+			}
+			ExprKind::F64PromoteF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64PromoteF32 { operand }),
+				)
+			}
+			ExprKind::F32DemoteF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32DemoteF64 { operand }),
 				)
 			}
 
