@@ -38,7 +38,11 @@ fn sin_poly(y: f64) -> f64 {
 pub fn wx_sin(x: f64) -> f64 {
     local half_pi = f64::PI / 2.0;
     local mut q = reduce(x);
-    if q > half_pi { q = f64::PI - q; } else { if q < -half_pi { q = -f64::PI - q; }; };
+    if q > half_pi {
+        q = f64::PI - q;
+    } else {
+        if q < -half_pi { q = -f64::PI - q; };
+    };
     sin_poly(q)
 }
 
@@ -153,12 +157,12 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     
     local mut map_x = i32_trunc_f64(f64_floor(ox));
     local mut map_y = i32_trunc_f64(f64_floor(oy));
-
+    
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
     if dir_x != 0.0 { delta_dist_x = f64_abs(1.0 / dir_x) }
     if dir_y != 0.0 { delta_dist_y = f64_abs(1.0 / dir_y) }
-
+    
     local mut step_x: i32 = 0;
     local mut step_y: i32 = 0;
     local mut side_dist_x: f64 = 0.0;
@@ -211,25 +215,25 @@ pub fn render() {
     local mut x: i32 = 0;
     loop {
         if x >= SCREEN_W { break };
-
+        
         local t = f64_convert_i32(x) / f64_convert_i32(SCREEN_W);
         local ray_angle = player_angle - FOV / 2.0 + FOV * t;
         local hit = cast_ray(player_x, player_y, ray_angle);
         local corrected = hit.dist * wx_cos(ray_angle - player_angle);
-
+        
         local mut line_height = SCREEN_H;
         if corrected > 0.0001 {
             line_height = i32_trunc_f64(f64_convert_i32(SCREEN_H) / corrected);
         };
-
+        
         local mut draw_start = SCREEN_H / 2 - line_height / 2;
         local mut draw_end = SCREEN_H / 2 + line_height / 2;
         if draw_start < 0 { draw_start = 0; };
         if draw_end >= SCREEN_H { draw_end = SCREEN_H - 1; };
-
+        
         local mut shade: u8 = 200;
         if hit.side == 1 { shade = 140; };
-
+        
         local mut y: i32 = 0;
         loop {
             if y >= SCREEN_H { break };
@@ -253,22 +257,22 @@ pub fn update(dt_ms: i64) {
     local dt = f64_convert_i64(dt_ms) / 1000.0;
     local mut forward: f64 = 0.0;
     local mut strafe: f64 = 0.0;
-
+    
     if host::key_down(87) != 0 { forward += 1.0; };
     if host::key_down(83) != 0 { forward -= 1.0; };
     if host::key_down(68) != 0 { strafe += 1.0; };
     if host::key_down(65) != 0 { strafe -= 1.0; };
     if host::key_down(39) != 0 { player_angle += ROT_SPEED * dt; };
     if host::key_down(37) != 0 { player_angle -= ROT_SPEED * dt; };
-
+    
     local dir_x = wx_cos(player_angle);
     local dir_y = wx_sin(player_angle);
     local perp_x = -dir_y;
     local perp_y = dir_x;
-
+    
     local nx = player_x + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
     local ny = player_y + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
-
+    
     if !is_wall(nx, player_y) { player_x = nx; };
     if !is_wall(player_x, ny) { player_y = ny; };
 }

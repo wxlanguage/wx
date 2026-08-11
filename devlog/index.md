@@ -3,6 +3,7 @@
 ## 2026-08-11
 
 - [2026-08-11-ownership-borrowing-allocator-design.md](2026-08-11-ownership-borrowing-allocator-design.md) — Design-only discussion: owned/borrowed (no `&mut`) ownership model reusing existing `*T`/`*mut T`/`[]T`/`[N]T` syntax, scope-based lifetime inference deferred `'a` syntax, manual-vs-automatic cleanup unified via a minimal opt-in `Drop` trait, and an open allocator-identity problem (memory tag ≠ allocator; bump/arena allocators need arena-scoped escape checks instead of per-object `Drop`)
+- [2026-08-11-ownership-implementation-strategy.md](2026-08-11-ownership-implementation-strategy.md) — Follow-up: checking belongs at TIR (not MIR) since control flow, `Place`/`PlaceKind`, per-binding use-lists, and scope-parent chains already exist there pre-monomorphization; move-vs-Copy resolved as a transitive-affine rule (`*T` itself, or transitively via inline fields, or explicit `impl Drop`) with `&T` as Copy but still scope-checked per copy
 
 ## 2026-07-21
 
