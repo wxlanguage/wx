@@ -832,6 +832,29 @@ fn test_format_local_definition_wraps() {
             }
         "},
 	);
+
+	// A single-argument call whose argument is a (possibly nested) struct
+	// literal hugs: no break after `=`, no extra indent from the call's own
+	// parens — only the struct literal's own fields get one indent level.
+	// Regression test for a bug where each level (the `local =` wrapper, the
+	// call's argument-list wrapper, and every nested struct literal's own
+	// wrapper) stacked its own indent on top of the others, since
+	// `measure_flat` reports groups containing a hard line as short/"fits"
+	// and `Indent` bumps the indent level regardless of whether the group
+	// it's in is actually rendered Flat or Break.
+	assert_eq!(
+		fmt(
+			"fn f() { local p = alloc(Outer::{ tag: 1, inner: Inner::{ id: 2, timeout: 3 } }); }"
+		),
+		indoc! {"
+            fn f() {
+                local p = alloc(Outer::{
+                    tag: 1,
+                    inner: Inner::{ id: 2, timeout: 3 },
+                });
+            }
+        "},
+	);
 }
 
 #[test]
@@ -930,22 +953,26 @@ fn test_format_memory_config() {
 
 	// min_pages only
 	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 } { min_pages: 4 };"),
-		"memory heap: Memory where { Size = u32 } { min_pages: 4 };\n",
+		fmt(
+			"#[memory_limits(min_pages = 4)] memory heap: Memory where { Size = u32 };"
+		),
+		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 } { max_pages: 10 };"),
-		"memory heap: Memory where { Size = u32 } { max_pages: 10 };\n",
+		fmt(
+			"#[memory_limits(max_pages = 10)] memory heap: Memory where { Size = u32 };"
+		),
+		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 } { min_pages: 1, max_pages: 10 };"
+			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory where { Size = u32 };"
 		),
-		"memory heap: Memory where { Size = u32 } { min_pages: 1, max_pages: 10 };\n",
+		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 }
 

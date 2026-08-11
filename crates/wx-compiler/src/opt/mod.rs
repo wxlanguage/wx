@@ -273,6 +273,22 @@ pub enum DataNodeKind {
 		operand: DataNodeIndex,
 		ty: ScalarType,
 	},
+	Sqrt {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Abs {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Floor {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Ceil {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
 	BitNot {
 		operand: DataNodeIndex,
 		ty: ScalarType,
@@ -291,6 +307,60 @@ pub enum DataNodeKind {
 	},
 	/// `i32.wrap_i64` — truncates I64 to I32.
 	I32WrapI64 {
+		operand: DataNodeIndex,
+	},
+	F32ConvertI32 {
+		operand: DataNodeIndex,
+	},
+	F32ConvertU32 {
+		operand: DataNodeIndex,
+	},
+	F32ConvertI64 {
+		operand: DataNodeIndex,
+	},
+	F32ConvertU64 {
+		operand: DataNodeIndex,
+	},
+	F64ConvertI32 {
+		operand: DataNodeIndex,
+	},
+	F64ConvertU32 {
+		operand: DataNodeIndex,
+	},
+	F64ConvertI64 {
+		operand: DataNodeIndex,
+	},
+	F64ConvertU64 {
+		operand: DataNodeIndex,
+	},
+	I32TruncF32 {
+		operand: DataNodeIndex,
+	},
+	U32TruncF32 {
+		operand: DataNodeIndex,
+	},
+	I32TruncF64 {
+		operand: DataNodeIndex,
+	},
+	U32TruncF64 {
+		operand: DataNodeIndex,
+	},
+	I64TruncF32 {
+		operand: DataNodeIndex,
+	},
+	U64TruncF32 {
+		operand: DataNodeIndex,
+	},
+	I64TruncF64 {
+		operand: DataNodeIndex,
+	},
+	U64TruncF64 {
+		operand: DataNodeIndex,
+	},
+	F64PromoteF32 {
+		operand: DataNodeIndex,
+	},
+	F32DemoteF64 {
 		operand: DataNodeIndex,
 	},
 
@@ -419,6 +489,10 @@ impl DataNodeKind {
 			| DataNodeKind::ShrS { ty, .. }
 			| DataNodeKind::ShrU { ty, .. }
 			| DataNodeKind::Neg { ty, .. }
+			| DataNodeKind::Sqrt { ty, .. }
+			| DataNodeKind::Abs { ty, .. }
+			| DataNodeKind::Floor { ty, .. }
+			| DataNodeKind::Ceil { ty, .. }
 			| DataNodeKind::BitNot { ty, .. }
 			| DataNodeKind::AggregateGet { ty, .. }
 			| DataNodeKind::Phi { ty, .. }
@@ -439,9 +513,27 @@ impl DataNodeKind {
 			| DataNodeKind::GtEqU { .. }
 			| DataNodeKind::FunctionRef { .. }
 			| DataNodeKind::MemoryIndex { .. }
-			| DataNodeKind::I32WrapI64 { .. } => NodeType::Scalar(ScalarType::I32),
+			| DataNodeKind::I32WrapI64 { .. }
+			| DataNodeKind::I32TruncF32 { .. }
+			| DataNodeKind::U32TruncF32 { .. }
+			| DataNodeKind::I32TruncF64 { .. }
+			| DataNodeKind::U32TruncF64 { .. } => NodeType::Scalar(ScalarType::I32),
 			DataNodeKind::I64ExtendI32S { .. }
-			| DataNodeKind::I64ExtendI32U { .. } => NodeType::Scalar(ScalarType::I64),
+			| DataNodeKind::I64ExtendI32U { .. }
+			| DataNodeKind::I64TruncF32 { .. }
+			| DataNodeKind::U64TruncF32 { .. }
+			| DataNodeKind::I64TruncF64 { .. }
+			| DataNodeKind::U64TruncF64 { .. } => NodeType::Scalar(ScalarType::I64),
+			DataNodeKind::F32ConvertI32 { .. }
+			| DataNodeKind::F32ConvertU32 { .. }
+			| DataNodeKind::F32ConvertI64 { .. }
+			| DataNodeKind::F32ConvertU64 { .. }
+			| DataNodeKind::F32DemoteF64 { .. } => NodeType::Scalar(ScalarType::F32),
+			DataNodeKind::F64ConvertI32 { .. }
+			| DataNodeKind::F64ConvertU32 { .. }
+			| DataNodeKind::F64ConvertI64 { .. }
+			| DataNodeKind::F64ConvertU64 { .. }
+			| DataNodeKind::F64PromoteF32 { .. } => NodeType::Scalar(ScalarType::F64),
 			DataNodeKind::GlobalGet { ty, .. }
 			| DataNodeKind::StaticDataRef { ty, .. }
 			| DataNodeKind::MemoryOffset { ty, .. }
@@ -473,7 +565,15 @@ impl DataNodeKind {
 	/// Returns true when two nodes with the same inputs are guaranteed to
 	/// produce the same value and can be deduplicated. Impure nodes (reads of
 	/// mutable state, call results, memory ops) and LoopParams (mutated after
-	/// creation) are not pure and each represent a distinct value.
+	/// creation) are not pure and each represent a distinct value. Phi is not
+	/// pure either: its value is control-dependent on the specific join point
+	/// that produced it (which predecessor branch is live), so two Phis with
+	/// identical `(left, right, ty)` from *unrelated* branches are not
+	/// interchangeable even though they look structurally equal — CSE-ing
+	/// them would silently make one join's value leak into the other's. A
+	/// `Phi{left, right}` with `left == right` is still simplified away, but
+	/// that happens in `Builder::node` before nodes ever reach `intern_node`,
+	/// so excluding `Phi` here only removes the unsound cross-join dedup.
 	fn is_pure(&self) -> bool {
 		match self {
 			DataNodeKind::GlobalGet { .. }
@@ -482,7 +582,8 @@ impl DataNodeKind {
 			| DataNodeKind::AggregateCallResult { .. }
 			| DataNodeKind::MemoryGrowResult { .. }
 			| DataNodeKind::PointerLoadResult { .. }
-			| DataNodeKind::LoopParam { .. } => false,
+			| DataNodeKind::LoopParam { .. }
+			| DataNodeKind::Phi { .. } => false,
 			_ => true,
 		}
 	}
@@ -811,11 +912,33 @@ impl Function {
             }
 
             DataNodeKind::Neg    { operand, .. }
+            | DataNodeKind::Sqrt { operand, .. }
+            | DataNodeKind::Abs { operand, .. }
+            | DataNodeKind::Floor { operand, .. }
+            | DataNodeKind::Ceil { operand, .. }
             | DataNodeKind::BitNot { operand, .. }
             | DataNodeKind::Eqz    { operand }
             | DataNodeKind::I64ExtendI32S { operand }
             | DataNodeKind::I64ExtendI32U { operand }
             | DataNodeKind::I32WrapI64 { operand }
+            | DataNodeKind::F32ConvertI32 { operand }
+            | DataNodeKind::F32ConvertU32 { operand }
+            | DataNodeKind::F32ConvertI64 { operand }
+            | DataNodeKind::F32ConvertU64 { operand }
+            | DataNodeKind::F64ConvertI32 { operand }
+            | DataNodeKind::F64ConvertU32 { operand }
+            | DataNodeKind::F64ConvertI64 { operand }
+            | DataNodeKind::F64ConvertU64 { operand }
+            | DataNodeKind::I32TruncF32 { operand }
+            | DataNodeKind::U32TruncF32 { operand }
+            | DataNodeKind::I32TruncF64 { operand }
+            | DataNodeKind::U32TruncF64 { operand }
+            | DataNodeKind::I64TruncF32 { operand }
+            | DataNodeKind::U64TruncF32 { operand }
+            | DataNodeKind::I64TruncF64 { operand }
+            | DataNodeKind::U64TruncF64 { operand }
+            | DataNodeKind::F64PromoteF32 { operand }
+            | DataNodeKind::F32DemoteF64 { operand }
             | DataNodeKind::AggregateGet { aggregate: operand, .. } => {
                 self.data_nodes[*operand as usize].uses.push(user_id);
             }

@@ -8,6 +8,78 @@ CLI, and LSP are released in lockstep) rather than per-crate. Editor
 integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
 live in their own repos with independent versioning.
 
+## [0.4.0] - 2026-08-11
+
+### Changed
+
+- **Breaking:** `memory` declarations no longer take a trailing config
+  block — page limits are now set via a `#[memory_limits(...)]` attribute:
+  ```
+  // before
+  memory heap: Memory where { Size = u32 } { min_pages: 1, max_pages: 10 };
+  // after
+  #[memory_limits(min_pages = 1, max_pages = 10)]
+  memory heap: Memory where { Size = u32 };
+  ```
+  Old syntax is now a parse error.
+- **Breaking:** `#[fixed_layout]` renamed to `#[fixed_order]`. Note this is
+  currently a *silent* breakage: unrecognized attribute names are dropped
+  without a diagnostic, so code still using `#[fixed_layout]` will not fail
+  to compile — it will silently fall back to alignment-sorted field order
+  instead of preserving declaration order. Search your code for
+  `#[fixed_layout]` and rename it manually.
+
+### Added
+
+- Std: float math/conversion intrinsics — `sqrt`/`abs`/`floor`/`ceil` for
+  `f32`/`f64`, all `i32`/`u32`/`i64`/`u64` ↔ `f32`/`f64` convert/trunc ops,
+  `f64_promote_f32`/`f32_demote_f64`, and `f32::PI`/`f64::PI`.
+- wx-lsp: go-to-definition, hover, semantic highlighting, and completion
+  now work for type aliases (`type Id = u32;`) — previously silently
+  unindexed.
+- MIR: dead-code elimination now also prunes unreachable imported
+  functions, dropping an import module entirely once none of its items
+  are reachable.
+- Examples: new WASI Preview 1 examples (`wasi_args`, `wasi_random`,
+  `wasi_file_io`) and a near-complete port of the
+  `wasi_snapshot_preview1` witx spec (`wasi_preview1_port`) exercising
+  real host imports; a `raycaster` example dogfooding the new float
+  intrinsics.
+
+### Fixed
+
+- Sea-of-nodes scheduler: a pure value read from more than one block
+  (e.g. shared across `if`/`else` branches) could be computed in only one
+  branch and read as WASM's zero-initialized default from any other
+  reader. `compute_value_placement` now hoists such values to their
+  lowest common ancestor block. Also fixes a related if-without-else phi
+  bug and excludes `Phi` nodes from CSE so unrelated if/else joins that
+  happen to merge the same constants no longer alias.
+- Codegen: `coalesce_locals` computed local live ranges from flat textual
+  position, so a local written before a `loop`'s back-edge and read after
+  it could be coalesced with an unrelated local, silently aliasing values
+  across iterations.
+- MIR: a narrow-field read through a pointer (`p.*.field as u32`) could
+  over-read adjacent bytes.
+- MIR/optimizer: nested aggregates (a struct field that is itself a
+  struct) could crash the compiler or emit invalid WASM.
+- Parser: `/=` compound assignment failed to parse.
+- Codegen: an explicit `#[memory_limits(max_pages = ...)]` below the
+  memory's actual required initial page count could produce an invalid
+  WASM module (`initial > max`); `max_pages` is now bumped up to match
+  when needed.
+- wx-lsp: `Position::character` was treated as a raw byte offset instead
+  of a UTF-16 code unit count per the LSP spec, so any line with
+  non-ASCII content before the cursor could panic (e.g. completion after
+  a Cyrillic comment).
+- A bad `if` condition previously suppressed every diagnostic inside both
+  branches instead of still checking them.
+- `pub const` inside an `impl` block was wrongly flagged as unused.
+- wx-fmt: `if`/`else` branches decided flat/break formatting
+  independently even when nested under the same outer group, and excess
+  indentation was added to calls whose single argument is a (possibly
+  deeply nested) struct literal.
+
 ## [0.3.0] - 2026-07-25
 
 ### Changed

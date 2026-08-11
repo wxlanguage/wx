@@ -198,11 +198,33 @@ fn mark_node_inputs_live(
 			mark_node_live(*right, live, worklist);
 		}
 		DataNodeKind::Neg { operand, .. }
+		| DataNodeKind::Sqrt { operand, .. }
+		| DataNodeKind::Abs { operand, .. }
+		| DataNodeKind::Floor { operand, .. }
+		| DataNodeKind::Ceil { operand, .. }
 		| DataNodeKind::BitNot { operand, .. }
 		| DataNodeKind::Eqz { operand }
 		| DataNodeKind::I64ExtendI32S { operand }
 		| DataNodeKind::I64ExtendI32U { operand }
 		| DataNodeKind::I32WrapI64 { operand }
+		| DataNodeKind::F32ConvertI32 { operand }
+		| DataNodeKind::F32ConvertU32 { operand }
+		| DataNodeKind::F32ConvertI64 { operand }
+		| DataNodeKind::F32ConvertU64 { operand }
+		| DataNodeKind::F64ConvertI32 { operand }
+		| DataNodeKind::F64ConvertU32 { operand }
+		| DataNodeKind::F64ConvertI64 { operand }
+		| DataNodeKind::F64ConvertU64 { operand }
+		| DataNodeKind::I32TruncF32 { operand }
+		| DataNodeKind::U32TruncF32 { operand }
+		| DataNodeKind::I32TruncF64 { operand }
+		| DataNodeKind::U32TruncF64 { operand }
+		| DataNodeKind::I64TruncF32 { operand }
+		| DataNodeKind::U64TruncF32 { operand }
+		| DataNodeKind::I64TruncF64 { operand }
+		| DataNodeKind::U64TruncF64 { operand }
+		| DataNodeKind::F64PromoteF32 { operand }
+		| DataNodeKind::F32DemoteF64 { operand }
 		| DataNodeKind::AggregateGet {
 			aggregate: operand, ..
 		} => {

@@ -1244,9 +1244,9 @@ pub enum ItemAttribute {
 	Inline,
 	Intrinsic,
 	Tag(SymbolU32),
-	/// `#[fixed_layout]` — struct fields keep declaration order in memory
+	/// `#[fixed_order]` — struct fields keep declaration order in memory
 	/// instead of being sorted by alignment descending.
-	FixedLayout,
+	FixedOrder,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1484,6 +1484,7 @@ define_diagnostic_codes! {
 		NonExhaustiveMatch => "E1066",
 		InvalidMatchScrutineeType => "E1067",
 		InvalidPattern => "E1068",
+		InvalidMemoryLimitsAttribute => "E1069",
 		UnreachableMatchArm => "W1010",
 	}
 }

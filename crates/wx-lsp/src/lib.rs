@@ -1860,6 +1860,18 @@ fn symbol_hover_text(
 			let name = interner.resolve(typeset.name.inner).unwrap_or("?");
 			Some(format!("typeset {name} {{ ... }}"))
 		}
+		SymbolKind::TypeAlias(def_id) => {
+			let ai = tir.type_alias_index(*def_id)? as usize;
+			let alias = &tir.type_aliases[ai];
+			let fmt = fmt.with_type_params(&alias.type_params);
+			let name = interner.resolve(alias.name.inner).unwrap_or("?");
+			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
+			let mut s = format!("{pub_prefix}type {name}");
+			push_type_params(&mut s, tir, interner, &alias.type_params);
+			s.push_str(" = ");
+			s.push_str(&fmt.display_type(alias.template).ok()?);
+			Some(s)
+		}
 		SymbolKind::Const(def_id) => {
 			let ci = tir.const_index(*def_id)? as usize;
 			let constant = &tir.constants[ci];
@@ -1989,9 +2001,9 @@ fn symbol_kind_to_token_type(kind: SymbolKind) -> Option<TokenType> {
 			..
 		} => return None,
 		SymbolKind::TypeParam { .. } => TokenType::TypeParameter,
-		SymbolKind::AssocType { .. } | SymbolKind::TypeSet(_) => {
-			TokenType::Type
-		}
+		SymbolKind::AssocType { .. }
+		| SymbolKind::TypeSet(_)
+		| SymbolKind::TypeAlias(_) => TokenType::Type,
 		SymbolKind::Label { .. } => return None,
 		// `Self` inside an impl block or trait impl — excluded so the
 		// editor's grammar-based keyword highlighting applies instead (the
@@ -2142,13 +2154,57 @@ fn resolve_source_and_offset<'a>(
 	}
 }
 
+/// Converts a UTF-16 code unit offset within `line` — the unit LSP's
+/// `Position::character` is defined in (see the `PositionEncodingKind` spec;
+/// this server never negotiates `utf-8`/`utf-32`, so every `Position` it
+/// receives or sends is UTF-16) — to the corresponding UTF-8 byte offset.
+/// Every character outside the Basic Multilingual Plane (emoji, some CJK)
+/// counts as 2 UTF-16 units despite being a single `char`, and most non-ASCII
+/// BMP characters (e.g. Cyrillic) take 1 UTF-16 unit but 2+ UTF-8 bytes — so
+/// neither a byte count nor a `char` count can stand in for it. Treating
+/// `character` as a byte offset directly (the previous behavior) sliced the
+/// source at whatever byte the UTF-16 count landed on, which for non-ASCII
+/// text can fall inside a multi-byte character and panic.
+///
+/// Fast-paths pure-ASCII lines (the overwhelming majority of source code):
+/// there, byte offset and UTF-16 offset are the same number by construction,
+/// so `str::is_ascii()` — a chunked, word-at-a-time check, not a per-char
+/// loop — lets those lines skip the `char_indices` walk entirely.
+fn utf16_offset_to_byte_offset(line: &str, utf16_offset: usize) -> usize {
+	if line.is_ascii() {
+		return utf16_offset.min(line.len());
+	}
+	let mut utf16_units = 0usize;
+	for (byte_offset, ch) in line.char_indices() {
+		if utf16_units >= utf16_offset {
+			return byte_offset;
+		}
+		utf16_units += ch.len_utf16();
+	}
+	line.len()
+}
+
+/// The reverse of `utf16_offset_to_byte_offset`: counts how many UTF-16 code
+/// units `prefix` encodes as, for building a `Position` to send back to the
+/// client. Same ASCII fast path, for the same reason.
+fn byte_offset_to_utf16_offset(prefix: &str) -> usize {
+	if prefix.is_ascii() {
+		return prefix.len();
+	}
+	prefix.chars().map(char::len_utf16).sum()
+}
+
 fn position_to_offset(
 	files: &vfs::Files,
 	file_id: FileId,
 	position: Position,
 ) -> Option<u32> {
 	let line_range = files.line_range(file_id, position.line as usize).ok()?;
-	Some((line_range.start + position.character as usize) as u32)
+	let source = files.source(file_id).ok()?;
+	let line_text = &source[line_range.clone()];
+	let byte_in_line =
+		utf16_offset_to_byte_offset(line_text, position.character as usize);
+	Some((line_range.start + byte_in_line) as u32)
 }
 
 /// Converts an LSP `Position` to a byte offset directly in a source string,
@@ -2171,7 +2227,15 @@ fn position_to_offset_in_str(
 	if line < position.line {
 		return None;
 	}
-	Some((byte_offset + position.character as usize).min(source.len()))
+	let rest = &source[byte_offset..];
+	let line_text = rest.split('\n').next().unwrap_or(rest);
+	Some(
+		byte_offset
+			+ utf16_offset_to_byte_offset(
+				line_text,
+				position.character as usize,
+			),
+	)
 }
 
 fn span_to_range(files: &vfs::Files, source: SourceSpan) -> Option<Range> {
@@ -2189,10 +2253,11 @@ fn byte_to_position(
 ) -> Option<Position> {
 	let line = files.line_index(file_id, byte_index).ok()?;
 	let line_range = files.line_range(file_id, line).ok()?;
-	let character = byte_index.saturating_sub(line_range.start);
+	let source = files.source(file_id).ok()?;
+	let prefix = &source[line_range.start..byte_index.min(line_range.end)];
 	Some(Position {
 		line: line as u32,
-		character: character as u32,
+		character: byte_offset_to_utf16_offset(prefix) as u32,
 	})
 }
 

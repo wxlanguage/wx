@@ -1269,6 +1269,14 @@ impl Expression {
 			_ => false,
 		}
 	}
+
+	#[inline]
+	pub fn as_block_statements(&self) -> &[Separated<Spanned<Statement>>] {
+		match self {
+			Expression::Block { statements } => statements,
+			_ => unreachable!("expected a block expression"),
+		}
+	}
 }
 
 /// A generic type parameter declaration: `T` or `T: Bound1 + Bound2`.
@@ -1435,14 +1443,37 @@ pub enum AttributeValue {
 	Word,
 	/// `#[tag = "memory"]` — name plus a string literal (stored raw, including quotes).
 	NameValue(Spanned<SymbolU32>),
+	/// `#[memory_limits(min_pages = 1, max_pages = 10)]` — name plus a
+	/// parenthesized, comma-separated list of `name = value` arguments.
+	Args(Box<[Separated<Spanned<AttributeArg>>]>),
 }
 
-/// A single attribute on an item, e.g. `#[inline]` or `#[tag = "memory"]`.
+/// A single attribute on an item, e.g. `#[inline]`, `#[tag = "memory"]`, or
+/// `#[memory_limits(min_pages = 1)]`.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Attribute {
 	pub name: Spanned<SymbolU32>,
 	pub value: AttributeValue,
+}
+
+/// One `name = value` argument inside a parenthesized attribute, e.g.
+/// `min_pages = 1` in `#[memory_limits(min_pages = 1)]`.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct AttributeArg {
+	pub name: Spanned<SymbolU32>,
+	pub value: AttributeArgValue,
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum AttributeArgValue {
+	/// Range/sign validity for a given attribute is a semantic question,
+	/// checked where the attribute is resolved (TIR), not here.
+	Int(Spanned<i64>),
+	/// Stored raw, including quotes — consistent with `AttributeValue::NameValue`.
+	String(Spanned<SymbolU32>),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1459,6 +1490,7 @@ pub enum ImplItem {
 	},
 	Constant {
 		id: DefId,
+		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
 		value: Box<Spanned<Expression>>,
@@ -1557,20 +1589,6 @@ pub enum ImportDeclaration {
 		name: Spanned<SymbolU32>,
 		kind: Spanned<BoundExpression>,
 	},
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct MemoryConfig {
-	pub min_pages: Option<Spanned<u32>>,
-	pub max_pages: Option<Spanned<u32>>,
-}
-
-/// Intermediate type used only during parsing of a `MemoryConfig` block.
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct MemoryConfigField {
-	pub name: Spanned<SymbolU32>,
-	pub value: Spanned<u32>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1685,9 +1703,9 @@ pub enum Item {
 	},
 	Memory {
 		id: DefId,
+		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		bound: Spanned<BoundExpression>,
-		config: Option<MemoryConfig>,
 	},
 	Const {
 		id: DefId,
@@ -1782,6 +1800,7 @@ impl Item {
 			| Item::Global { attributes, .. }
 			| Item::Enum { attributes, .. }
 			| Item::TypeAlias { attributes, .. }
+			| Item::Memory { attributes, .. }
 			| Item::Struct { attributes, .. } => {
 				*attributes = attrs;
 			}
@@ -1789,7 +1808,6 @@ impl Item {
 			| Item::Import { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. }
-			| Item::Memory { .. }
 			| Item::Module { .. }
 			| Item::ModuleDeclaration { .. }
 			| Item::Use { .. } => {}
@@ -2321,6 +2339,16 @@ impl<'ctx> Parser<'ctx> {
 					inner: sym,
 					span: str_token.span,
 				})
+			} else if parser.lexer.peek().inner == Token::OpenParen {
+				let args = SeparatedGroup {
+					open_token: Token::OpenParen,
+					close_token: Token::CloseParen,
+					separator_token: Token::Comma,
+					should_warn_missing_separator: None,
+					item_handler: Parser::parse_attribute_arg,
+				}
+				.parse(parser)?;
+				AttributeValue::Args(args.inner)
 			} else {
 				AttributeValue::Word
 			};
@@ -2347,6 +2375,56 @@ impl<'ctx> Parser<'ctx> {
 			});
 		}
 		Ok(attrs.into_boxed_slice())
+	}
+
+	fn parse_attribute_arg(
+		parser: &mut Parser,
+	) -> Result<Spanned<AttributeArg>, ()> {
+		let name_span = parser.next_expect(Token::Identifier)?.span;
+		let name = Spanned {
+			inner: parser.intern_identifier(name_span),
+			span: name_span,
+		};
+		parser.next_expect(Token::Eq)?;
+		let value_token = parser.lexer.next();
+		let value = match value_token.inner {
+			Token::Int => {
+				let raw = value_token
+					.span
+					.extract_str(parser.source)
+					.parse::<i64>()
+					.unwrap_or(0);
+				AttributeArgValue::Int(Spanned {
+					inner: raw,
+					span: value_token.span,
+				})
+			}
+			Token::String => {
+				let raw = value_token.span.extract_str(parser.source);
+				let sym = parser.interner.get_or_intern(raw);
+				AttributeArgValue::String(Spanned {
+					inner: sym,
+					span: value_token.span,
+				})
+			}
+			_ => {
+				parser.ast.diagnostics.push(report_unexpected_token(
+					parser.ast.file_id,
+					value_token,
+					Token::Int,
+				));
+				return Err(());
+			}
+		};
+		let value_span = match &value {
+			AttributeArgValue::Int(v) => v.span,
+			AttributeArgValue::String(v) => v.span,
+		};
+		let span = TextSpan::new(name_span.start, value_span.end);
+		Ok(Spanned {
+			inner: AttributeArg { name, value },
+			span,
+		})
 	}
 
 	fn parse_function_param_item(
@@ -3267,6 +3345,7 @@ impl<'ctx> Parser<'ctx> {
 			| Token::PlusEq
 			| Token::MinusEq
 			| Token::StarEq
+			| Token::SlashEq
 			| Token::PercentEq => Some((
 				Parser::parse_binary_expression,
 				BindingPower::Assignment,
@@ -4794,6 +4873,7 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Spanned {
 					inner: ImplItem::Constant {
 						id: parser.id_generator.generate(),
+						pub_span,
 						name: Spanned {
 							inner: name_symbol,
 							span: name_span,
@@ -5299,74 +5379,6 @@ impl<'ctx> Parser<'ctx> {
 		Ok(item)
 	}
 
-	fn parse_memory_config_field(
-		parser: &mut Parser,
-	) -> Result<Spanned<MemoryConfigField>, ()> {
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
-		parser.next_expect(Token::Colon)?;
-		let value_token = parser.lexer.next();
-		let value = match value_token.inner {
-			Token::Int => {
-				let raw = value_token
-					.span
-					.extract_str(parser.source)
-					.parse::<i64>()
-					.unwrap_or(0);
-				if raw < 0 {
-					parser.ast.diagnostics.push(
-						codespan_reporting::diagnostic::Diagnostic::error()
-							.with_message(
-								"memory page count must be a non-negative integer",
-							)
-							.with_label(
-								codespan_reporting::diagnostic::Label::primary(
-									parser.ast.file_id,
-									value_token.span,
-								),
-							),
-					);
-					return Err(());
-				}
-				if raw > u32::MAX as i64 {
-					parser.ast.diagnostics.push(
-						codespan_reporting::diagnostic::Diagnostic::error()
-							.with_message(
-								"memory page count exceeds maximum (4294967295)",
-							)
-							.with_label(
-								codespan_reporting::diagnostic::Label::primary(
-									parser.ast.file_id,
-									value_token.span,
-								),
-							),
-					);
-					return Err(());
-				}
-				Spanned {
-					inner: raw as u32,
-					span: value_token.span,
-				}
-			}
-			_ => {
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
-					value_token,
-					Token::Int,
-				));
-				return Err(());
-			}
-		};
-		let span = TextSpan::new(name_span.start, value.span.end);
-		Ok(Spanned {
-			inner: MemoryConfigField { name, value },
-			span,
-		})
-	}
-
 	fn parse_memory_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let memory_span = parser.lexer.next().span;
 
@@ -5379,90 +5391,12 @@ impl<'ctx> Parser<'ctx> {
 		parser.next_expect(Token::Colon)?;
 		let kind = parser.parse_bound()?;
 
-		let config = if parser.lexer.peek().inner == Token::OpenBrace {
-			let fields = SeparatedGroup {
-				open_token: Token::OpenBrace,
-				close_token: Token::CloseBrace,
-				separator_token: Token::Comma,
-				should_warn_missing_separator: None,
-				item_handler: Parser::parse_memory_config_field,
-			}
-			.parse(parser)?;
-
-			let mut min_pages: Option<Spanned<u32>> = None;
-			let mut max_pages: Option<Spanned<u32>> = None;
-
-			for field in fields.inner.iter() {
-				let field_name = parser
-					.interner
-					.resolve(field.inner.inner.name.inner)
-					.unwrap_or("");
-				match field_name {
-					"min_pages" => {
-						if min_pages.is_some() {
-							parser.ast.diagnostics.push(
-                                codespan_reporting::diagnostic::Diagnostic::error()
-                                    .with_message("duplicate memory property `min_pages`")
-                                    .with_label(codespan_reporting::diagnostic::Label::primary(
-                                        parser.ast.file_id,
-                                        field.inner.inner.name.span,
-                                    )),
-                            );
-						} else {
-							let v = &field.inner.inner.value;
-							min_pages = Some(Spanned {
-								inner: v.inner,
-								span: TextSpan::new(v.span.start, v.span.end),
-							});
-						}
-					}
-					"max_pages" => {
-						if max_pages.is_some() {
-							parser.ast.diagnostics.push(
-                                codespan_reporting::diagnostic::Diagnostic::error()
-                                    .with_message("duplicate memory property `max_pages`")
-                                    .with_label(codespan_reporting::diagnostic::Label::primary(
-                                        parser.ast.file_id,
-                                        field.inner.inner.name.span,
-                                    )),
-                            );
-						} else {
-							let v = &field.inner.inner.value;
-							max_pages = Some(Spanned {
-								inner: v.inner,
-								span: TextSpan::new(v.span.start, v.span.end),
-							});
-						}
-					}
-					_ => {
-						parser.ast.diagnostics.push(
-                            codespan_reporting::diagnostic::Diagnostic::error()
-                                .with_message(format!(
-                                    "unknown memory property `{field_name}`, expected `min_pages` or `max_pages`"
-                                ))
-                                .with_label(codespan_reporting::diagnostic::Label::primary(
-                                    parser.ast.file_id,
-                                    field.inner.inner.name.span,
-                                )),
-                        );
-					}
-				}
-			}
-
-			Some(MemoryConfig {
-				min_pages,
-				max_pages,
-			})
-		} else {
-			None
-		};
-
 		let span = TextSpan::new(memory_span.start, kind.span.end);
 		Ok(Spanned {
 			inner: Item::Memory {
+				attributes: Box::new([]),
 				name,
 				bound: kind,
-				config,
 				id: parser.id_generator.generate(),
 			},
 			span,

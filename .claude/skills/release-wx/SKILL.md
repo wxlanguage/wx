@@ -79,6 +79,12 @@ If protected: commit on a branch (e.g. `release/x.y.z`), push, open a PR,
 wait for the required status check, merge — then `git checkout main && git
 pull` locally before tagging (your local `main` is stale otherwise).
 
+**main `wx`'s ruleset also requires signed commits** (`required_signatures`
+in its `rules[]`) — check `git config --get commit.gpgsign` /
+`user.signingkey` up front; if unset, set up commit signing (SSH signing is
+the quick option) before committing anything for the release, or the PR will
+sit `BLOCKED` with a generic "base branch policy prohibits the merge" error.
+
 **Gotcha already hit once:** the required status check is matched by the CI
 job's `name:` string, not the workflow name. If you rename the job in
 `ci.yml`, the ruleset's `required_status_checks[].context` must be updated to

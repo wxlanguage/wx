@@ -48,11 +48,7 @@ fn function_block(ast: &AST, index: usize) -> &[Separated<Spanned<Statement>>] {
 		panic!("expected function item")
 	};
 
-	let Expression::Block { statements } = &block.inner else {
-		panic!("expected function body block")
-	};
-
-	statements
+	block.inner.as_block_statements()
 }
 
 fn statement_expression(

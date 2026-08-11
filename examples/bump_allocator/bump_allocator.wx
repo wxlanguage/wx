@@ -11,9 +11,9 @@
 //   └──────────────┴──────────┴──────────┴──────────┴────── ·· ─┘
 //   0          DATA_END                            bump      heap end
 
-memory heap: Memory where { Size = u32 } {
-    min_pages: 1,   // start with one 64 KiB page
-};
+// start with one 64 KiB page
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
 
 // ── allocator state ───────────────────────────────────────────────────────────
 

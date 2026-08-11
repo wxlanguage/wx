@@ -266,11 +266,13 @@ fn global_definition_completion_item(
 			kind: Some(CompletionItemKind::TYPE_PARAMETER),
 			..Default::default()
 		},
-		SymbolKind::AssocType { .. } => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::TYPE_PARAMETER),
-			..Default::default()
-		},
+		SymbolKind::AssocType { .. } | SymbolKind::TypeAlias(_) => {
+			CompletionItem {
+				label: name,
+				kind: Some(CompletionItemKind::TYPE_PARAMETER),
+				..Default::default()
+			}
+		}
 		_ => return None,
 	})
 }
@@ -324,6 +326,7 @@ fn is_type_like(kind: &SymbolKind) -> bool {
 		SymbolKind::Struct(_)
 			| SymbolKind::Enum(_)
 			| SymbolKind::TypeSet(_)
+			| SymbolKind::TypeAlias(_)
 			| SymbolKind::Namespace(_)
 	)
 }

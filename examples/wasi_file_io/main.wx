@@ -1,0 +1,133 @@
+// WASI Preview 1 file I/O — creates a file inside a preopened directory,
+// writes a message into it, closes it, reopens it read-only, and echoes
+// what was actually read back on disk to stdout.
+//
+// Guest fd 3 is the first preopened directory descriptor; run.mjs maps it
+// to a real host directory (./sandbox) via node:wasi's `preopens` option.
+// Paths passed to `path_open` are resolved relative to that directory.
+use std::*;
+
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
+enum FileDescriptor: u32 {
+  Stdout = 1,
+  PreopenedDir = 3,
+}
+
+// WASI Preview 1 encodes every result as `__wasi_errno_t` (a u16, passed as
+// i32 at the raw wasm ABI boundary): 0 always means success, and every other
+// value names a specific failure. These examples only ever care about the
+// success/failure distinction, so `Success` is the only variant declared —
+// see the WASI Preview 1 spec for the full errno list.
+enum Errno: i32 {
+  Success = 0,
+}
+
+// __wasi_oflags_t bits, combined with `|` — there's no single closed set of
+// named "open modes" here (any subset of these bits is a legal request), so
+// this stays a namespaced group of flag constants rather than an enum.
+module OFlags {
+  pub const CREAT: u32 = 0x1;
+  pub const TRUNC: u32 = 0x8;
+}
+
+// __wasi_rights_t bits this example needs (of many more defined by the
+// spec) — same reasoning as OFlags: a composable bitset, not an enum.
+module Rights {
+  pub const FD_READ: u64 = 0x2;
+  pub const FD_WRITE: u64 = 0x40;
+}
+
+import "wasi_snapshot_preview1" as wasi {
+  fn path_open(
+    dir_fd: FileDescriptor,
+    dir_flags: u32,
+    path: []u8,
+    o_flags: u32,
+    fs_rights_base: u64,
+    fs_rights_inheriting: u64,
+    fd_flags: u32,
+    opened_fd: *mut u32,
+  ) -> Errno;
+
+  fn fd_write(fd: FileDescriptor, io_vecs: [][]u8, bytes_written: *mut u32) -> Errno;
+  fn fd_read(fd: FileDescriptor, io_vecs: [][]mut u8, bytes_read: *mut u32) -> Errno;
+  fn fd_close(fd: FileDescriptor) -> Errno;
+}
+
+global mut bump: *u8 = heap::DATA_END;
+
+struct BumpAllocator {}
+
+impl Allocator for BumpAllocator {
+  type Mem = heap;
+
+  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
+    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+    local new_end = ptr + layout.size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      if heap.grow(needed) == -1 { unreachable }
+    }
+    bump = new_end as *u8;
+    ptr as *mut u8
+  }
+}
+
+fn write_all(fd: FileDescriptor, bytes: []u8) {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+  io_vecs[0] = bytes;
+  local nwritten = alloc.alloc::<u32>(0);
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+}
+
+fn main() {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+
+  local created_fd_ptr = alloc.alloc::<u32>(0);
+  local create_result = wasi::path_open(
+    FileDescriptor::PreopenedDir,
+    0,
+    "message.txt",
+    OFlags::CREAT | OFlags::TRUNC,
+    Rights::FD_WRITE,
+    0,
+    0,
+    created_fd_ptr,
+  );
+  if create_result != Errno::Success { unreachable };
+
+  local created_fd = created_fd_ptr.* as FileDescriptor;
+  write_all(created_fd, "Hello from wx, written straight to disk!\n");
+  if wasi::fd_close(created_fd) != Errno::Success { unreachable };
+
+  local read_fd_ptr = alloc.alloc::<u32>(0);
+  local open_result = wasi::path_open(
+    FileDescriptor::PreopenedDir,
+    0,
+    "message.txt",
+    0,
+    Rights::FD_READ,
+    0,
+    0,
+    read_fd_ptr,
+  );
+  if open_result != Errno::Success { unreachable };
+
+  local read_fd = read_fd_ptr.* as FileDescriptor;
+  local buf = alloc.alloc_slice::<u8>(256);
+  local io_vecs = alloc.alloc_slice::<[]mut u8>(1);
+  io_vecs[0] = buf;
+  local nread = alloc.alloc::<u32>(0);
+  if wasi::fd_read(read_fd, io_vecs, nread) != Errno::Success { unreachable };
+  if wasi::fd_close(read_fd) != Errno::Success { unreachable };
+
+  write_all(FileDescriptor::Stdout, slice_from_parts(buf.ptr(), nread.*));
+}
+
+export {
+  main as "_start",
+  heap as "memory",
+}

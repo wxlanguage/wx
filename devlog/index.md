@@ -1,5 +1,9 @@
 # Session Index
 
+## 2026-08-11
+
+- [2026-08-11-ownership-borrowing-allocator-design.md](2026-08-11-ownership-borrowing-allocator-design.md) — Design-only discussion: owned/borrowed (no `&mut`) ownership model reusing existing `*T`/`*mut T`/`[]T`/`[N]T` syntax, scope-based lifetime inference deferred `'a` syntax, manual-vs-automatic cleanup unified via a minimal opt-in `Drop` trait, and an open allocator-identity problem (memory tag ≠ allocator; bump/arena allocators need arena-scoped escape checks instead of per-object `Drop`)
+
 ## 2026-07-21
 
 - [2026-07-21-match-expression-and-br-table.md](2026-07-21-match-expression-and-br-table.md) — `match` expressions added end-to-end (AST reuses `->`, TIR patterns + exhaustiveness, MIR `Switch` kept as a genuine N-way node, Opt decides `br_table` vs. `if`/`else` chain once via `should_use_br_table`, Scheduler `emit_switch_br_table`, Codegen `BrTable` opcode); two `Block::parent` depth-chain off-by-one bugs found and fixed via wasmtime execution testing; unrelated pre-existing `break`/`continue` loop-param commit bug found and fixed along the way

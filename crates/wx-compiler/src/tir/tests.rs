@@ -484,7 +484,8 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	// diagnostic but returns a usable `type_args` (sanitizing any leftover
 	// `INFER` to `ERROR`), so callers keep building a real expression tree.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         fn make_ptr() -> heap::*mut u16 { unreachable }
         fn f(count: heap::Size) -> heap::[]u8 {
             local ptr = make_ptr();
@@ -545,7 +546,8 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
 	// When the RHS errors (e.g. `alloc` is undeclared), the local must still carry
 	// the declared pointer type so that `n.*` doesn't cascade into a "not a pointer" error.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         fn write(x: i32) {
             local p: heap::*mut Node = alloc_node()
@@ -584,7 +586,8 @@ fn test_compare_mutable_pointer_with_null() {
 	// (`heap::*Node`), even though null()'s return type is an immutable pointer.
 	// Previously `infer_type_args` required matching mutability, causing E1002.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         fn is_null(p: heap::*Node) -> bool {
             p == ptr::null()
@@ -948,6 +951,34 @@ fn test_if_without_else_unit_body_is_ok() {
         }
     "});
 	no_errors(&case);
+}
+
+#[test]
+fn test_if_bad_condition_still_checks_branches() {
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            if undefined_var { undefined_then(); } else { undefined_else(); }
+        }
+    "});
+	let count = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::UndeclaredIdentifier.code())
+		})
+		.count();
+	assert_eq!(
+		count,
+		3,
+		"expected an UndeclaredIdentifier for the condition and each branch, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
 }
 
 // ── chained (nested) comptime binary expressions ─────────────────────────
@@ -7136,6 +7167,62 @@ fn test_enum_unused_is_warned() {
 }
 
 #[test]
+fn test_pub_const_in_inherent_impl_not_warned_unused() {
+	// Regression test: `ImplItem::Constant` (unlike `ImplItem::Function`,
+	// which already carries `pub_span`) never recorded whether an inherent
+	// impl's associated const was declared `pub` — the parser parsed the
+	// `pub` keyword via the same shared `parse_impl_member` prefix used for
+	// methods, but silently dropped it for consts, and TIR then hardcoded
+	// `pub_span: None` when building the `Constant` entry. Since the
+	// unused-item check only skips items with `pub_span.is_some()`, every
+	// `pub const` inside an `impl` block was wrongly flagged as unused
+	// regardless of its actual visibility.
+	let case = TestCase::new(indoc! {"
+        struct Foo {}
+        impl Foo {
+            pub const BAR: i32 = 1;
+        }
+        export {}
+    "});
+	assert!(
+		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedItem.code())
+			&& d.message.contains("BAR")),
+		"pub const in an inherent impl block must not be flagged unused, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_private_const_in_inherent_impl_is_warned_unused() {
+	// Companion to the test above: confirms the fix respects `pub_span`
+	// rather than blanket-suppressing the unused check for every impl
+	// const.
+	let case = TestCase::new(indoc! {"
+        struct Foo {}
+        impl Foo {
+            const BAR: i32 = 1;
+        }
+        export {}
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedItem.code())
+			&& d.message.contains("BAR")),
+		"expected W1004 for unused private const `BAR`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
 fn test_pub_enum_no_unused_warn() {
 	let case = TestCase::new(indoc! {"
         pub enum Color: i32 {
@@ -7562,9 +7649,8 @@ fn test_global_init_if_expression_resolves() {
 #[test]
 fn test_global_initialized_to_data_end_tir() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         global mut bump: heap::*u8 = heap::DATA_END;
         export { heap }
     "});

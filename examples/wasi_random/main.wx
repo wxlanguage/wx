@@ -1,0 +1,83 @@
+// WASI Preview 1 randomness — fills a buffer via random_get and prints it
+// to stdout as a hex string.
+use std::*;
+
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
+enum FileDescriptor: u32 {
+  Stdout = 1,
+}
+
+// WASI Preview 1 encodes every result as `__wasi_errno_t` (a u16, passed as
+// i32 at the raw wasm ABI boundary): 0 always means success, and every other
+// value names a specific failure. These examples only ever care about the
+// success/failure distinction, so `Success` is the only variant declared —
+// see the WASI Preview 1 spec for the full errno list.
+enum Errno: i32 {
+  Success = 0,
+}
+
+import "wasi_snapshot_preview1" as wasi {
+  fn random_get(buf: []mut u8) -> Errno;
+  fn fd_write(fd: FileDescriptor, io_vecs: [][]u8, bytes_written: *mut u32) -> Errno;
+}
+
+global mut bump: *u8 = heap::DATA_END;
+
+struct BumpAllocator {}
+
+impl Allocator for BumpAllocator {
+  type Mem = heap;
+
+  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
+    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+    local new_end = ptr + layout.size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      if heap.grow(needed) == -1 { unreachable }
+    }
+    bump = new_end as *u8;
+    ptr as *mut u8
+  }
+}
+
+const RANDOM_BYTES: u32 = 16;
+
+fn write_all(fd: FileDescriptor, bytes: []u8) {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+  io_vecs[0] = bytes;
+  local nwritten = alloc.alloc::<u32>(0);
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+}
+
+fn hex_digit(nibble: u8) -> u8 {
+  if nibble < 10 { '0' as u8 + nibble } else { 'a' as u8 + (nibble - 10) }
+}
+
+fn main() {
+  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+
+  local random_bytes = alloc.alloc_slice::<u8>(RANDOM_BYTES);
+  if wasi::random_get(random_bytes) != Errno::Success { unreachable };
+
+  // Two hex digits per random byte, plus a trailing newline.
+  local text = alloc.alloc_slice::<u8>(RANDOM_BYTES * 2 + 1);
+  local mut i: u32 = 0;
+  loop {
+    if i == RANDOM_BYTES { break };
+    local byte = random_bytes[i];
+    text[i * 2] = hex_digit(byte / 16);
+    text[i * 2 + 1] = hex_digit(byte % 16);
+    i += 1;
+  }
+  text[RANDOM_BYTES * 2] = '\n' as u8;
+
+  write_all(FileDescriptor::Stdout, text as _);
+}
+
+export {
+  main as "_start",
+  heap as "memory",
+}

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>wx raycaster</title>
+<style>
+  html, body {
+    background: #111;
+    color: #ddd;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 24px;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 1px solid #444;
+    width: 640px;
+    height: 480px;
+  }
+  #panel {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  button {
+    background: #333;
+    color: #ddd;
+    border: 1px solid #555;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { background: #444; }
+  #status { font-size: 13px; color: #999; }
+  #help { font-size: 13px; color: #777; max-width: 640px; text-align: center; }
+</style>
+</head>
+<body>
+  <h2>wx raycaster</h2>
+  <canvas id="screen" width="160" height="120"></canvas>
+  <div id="panel">
+    <input type="file" id="mapfile" accept=".txt" />
+    <span id="status">loading…</span>
+  </div>
+  <div id="help">
+    WASD to move, arrow keys to turn. Upload a .txt map: each line is a row,
+    <code>#</code> = wall, <code>.</code> = empty. Rows are padded to equal
+    width with walls.
+  </div>
+  <script type="module" src="raycaster.js"></script>
+</body>
+</html>

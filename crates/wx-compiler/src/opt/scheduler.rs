@@ -139,11 +139,19 @@ pub enum Instruction {
 	F32Mul,
 	F32Div,
 	F32Neg,
+	F32Sqrt,
+	F32Abs,
+	F32Floor,
+	F32Ceil,
 	F64Add,
 	F64Sub,
 	F64Mul,
 	F64Div,
 	F64Neg,
+	F64Sqrt,
+	F64Abs,
+	F64Floor,
+	F64Ceil,
 	F32Eq,
 	F32Ne,
 	F32Lt,
@@ -222,6 +230,24 @@ pub enum Instruction {
 	I64ExtendI32S,
 	I64ExtendI32U,
 	I32WrapI64,
+	F32ConvertI32S,
+	F32ConvertI32U,
+	F32ConvertI64S,
+	F32ConvertI64U,
+	F64ConvertI32S,
+	F64ConvertI32U,
+	F64ConvertI64S,
+	F64ConvertI64U,
+	I32TruncF32S,
+	I32TruncF32U,
+	I32TruncF64S,
+	I32TruncF64U,
+	I64TruncF32S,
+	I64TruncF32U,
+	I64TruncF64S,
+	I64TruncF64U,
+	F64PromoteF32,
+	F32DemoteF64,
 	// Nop (used as a placeholder)
 	Nop,
 	// Symbolic references — resolved to concrete i32.const values by the
@@ -267,6 +293,13 @@ pub struct Scheduler<'f> {
 	node_to_aggregate_locals: HashMap<DataNodeIndex, Box<[u32]>>,
 	/// Output instruction stream.
 	body: Vec<Instruction>,
+	/// Placement decisions for pure values read from more than one block —
+	/// computed once by `compute_value_placement` before emission starts,
+	/// consulted (and drained, one block at a time) by `emit_block`. Indexed
+	/// directly by `BlockIndex` rather than a `HashMap` — both index types
+	/// here are dense `u32`s, the same convention `DataLiveness` uses for
+	/// `DataNodeIndex`. See `compute_value_placement`'s doc comment.
+	placement_by_block: Vec<Vec<DataNodeIndex>>,
 }
 
 impl<'f> Scheduler<'f> {
@@ -301,12 +334,11 @@ impl<'f> Scheduler<'f> {
 			node_to_local: HashMap::new(),
 			node_to_aggregate_locals: HashMap::new(),
 			body: Vec::new(),
+			placement_by_block: Vec::new(),
 		};
+		sched.placement_by_block = sched.compute_value_placement();
 
-		let root = func.blocks[0].as_ref().expect("root block must exist");
-		for stmt in &root.statements {
-			sched.emit_control(0, stmt);
-		}
+		sched.emit_block(0);
 
 		if matches!(sched.body.last(), Some(Instruction::Return)) {
 			sched.body.pop();
@@ -409,6 +441,28 @@ impl<'f> Scheduler<'f> {
 			} => {
 				// Pre-allocate WASM locals for phi outputs.
 				self.pre_alloc_phi_outputs(outputs);
+
+				// A phi's "else" (unchanged) input is normally stored by the
+				// `emit_phi_stores_for_branch(.., false)` call below, but that
+				// runs inside the WASM `else` block — which doesn't exist
+				// here. Without it, a false condition would skip straight to
+				// `end`, leaving each phi's freshly allocated (zero-valued)
+				// local instead of the source's implied "stays unchanged"
+				// value. So that store is emitted once, unconditionally,
+				// right here before the `if`. This never conflicts with the
+				// `then`-branch store below: when the condition is true, the
+				// `then` block's own store (inside the `if`) runs afterward
+				// and overwrites the same local — WASM's `if` semantics
+				// guarantee the `then` block's code, store included, simply
+				// doesn't execute at all when the condition is false, so
+				// exactly one store's result is ever actually observed.
+				if else_block.is_none() {
+					self.emit_phi_stores_for_branch(
+						*then_block,
+						outputs,
+						false,
+					);
+				}
 
 				self.emit_value(*condition);
 
@@ -780,6 +834,15 @@ impl<'f> Scheduler<'f> {
 	}
 
 	fn emit_block(&mut self, block_idx: BlockIndex) {
+		// Materialize any pure values placed here by `compute_value_placement`
+		// before this block's own statements — they may be read by more than
+		// one of this block's (mutually exclusive) descendant branches, so
+		// they must exist in a local before any of those branches run, not
+		// lazily on whichever one the scheduler happens to reach first.
+		let nodes = self.placement_by_block[block_idx as usize].clone();
+		for node in nodes {
+			self.ensure_local(node);
+		}
 		for stmt in &self.func.blocks[block_idx as usize]
 			.as_ref()
 			.expect("block scope should be built")
@@ -787,6 +850,491 @@ impl<'f> Scheduler<'f> {
 		{
 			self.emit_control(block_idx, stmt);
 		}
+	}
+
+	// ── Cross-branch value placement ────────────────────────────────────────
+
+	/// Decides, for every pure `DataNode` read from more than one block, the
+	/// single block where it must be materialized: the lowest block that is
+	/// an ancestor of (i.e. always runs before) every block that reads it.
+	///
+	/// `should_spill`/`ensure_local` alone are only sound when a spilled
+	/// node's uses all live in the same block — they materialize a value
+	/// lazily, the first time `emit_value` reaches it. That's unsound
+	/// whenever the reading blocks are siblings under an `if`/`else` or
+	/// `match` (only one of them actually runs at a time, so whichever
+	/// branch the scheduler's single-pass walk happens to visit first
+	/// "claims" the store, and any other branch reading the same node just
+	/// gets a local that branch never actually populated) — or even when one
+	/// reader is inside a branch and another is in the block that contains
+	/// it, since the containing block isn't guaranteed the branch that
+	/// computed the value actually ran.
+	///
+	/// `Block::parent` already gives this IR a tree over blocks (nesting via
+	/// `if`/`switch`/`loop`, not a general CFG), so "the block guaranteed to
+	/// run before a set of others" is just their lowest common ancestor in
+	/// that tree — no dominator-tree algorithm needed.
+	///
+	/// Both `DataNodeIndex` and `BlockIndex` are dense `u32`s (see
+	/// `DataLiveness` for the same convention), so every set below is a
+	/// plain `Vec` indexed directly by one of them rather than a hashmap.
+	/// Finding which blocks read which nodes is a single forward pass
+	/// (`record_block_own_nodes`, direct operands only, no recursion)
+	/// followed by a single backward pass propagating each node's readers
+	/// down to its own operands (`for_each_operand`). That backward pass is
+	/// valid in one sweep because a node's operands always have a lower
+	/// `DataNodeIndex` than the node itself — a node can only reference an
+	/// operand that was already interned (`Builder::intern_node` assigns
+	/// indices in creation order) — so by the time the sweep reaches a
+	/// node, every one of its own readers (all at higher indices) has
+	/// already propagated its blocks into it. This replaces re-deriving each
+	/// node's full transitive closure from scratch at every site that reads
+	/// it, which repeats work across shared sub-expressions.
+	fn compute_value_placement(&self) -> Vec<Vec<DataNodeIndex>> {
+		let mut consuming_blocks: Vec<Vec<BlockIndex>> =
+			vec![Vec::new(); self.func.data_nodes.len()];
+		for block_idx in 0..self.func.blocks.len() as BlockIndex {
+			if self.func.blocks[block_idx as usize].is_none() {
+				continue;
+			}
+			self.record_block_own_nodes(block_idx, &mut consuming_blocks);
+		}
+
+		// Propagate downward: a pure node's readers are also, transitively,
+		// readers of its own operands. Impure nodes (CallResult, GlobalGet,
+		// LoopParam, Phi, ...) never propagate past themselves — their own
+		// operands (a call's args, a phi's per-branch inputs, ...) are
+		// always consumed at the single fixed control-node site that
+		// produces the impure value (e.g. a call's args are pushed and
+		// consumed exactly once, right where the call executes), which
+		// `record_block_own_nodes` already recorded directly. Re-deriving
+		// that from wherever the impure *result* is later read would be
+		// redundant at best and wrong at worst, since the result's readers
+		// don't run where the impure computation itself ran.
+		for node in (0..self.func.data_nodes.len() as DataNodeIndex).rev() {
+			if consuming_blocks[node as usize].is_empty() {
+				continue;
+			}
+			if !self.func.data_nodes[node as usize].kind.is_pure() {
+				continue;
+			}
+			let blocks = consuming_blocks[node as usize].clone();
+			self.for_each_operand(node, |operand| {
+				for &b in &blocks {
+					push_unique_block(
+						&mut consuming_blocks[operand as usize],
+						b,
+					);
+				}
+			});
+		}
+
+		let block_depths = self.compute_block_depths();
+		let mut placement_by_block: Vec<Vec<DataNodeIndex>> =
+			vec![Vec::new(); self.func.blocks.len()];
+		for node in 0..self.func.data_nodes.len() as DataNodeIndex {
+			let blocks = &consuming_blocks[node as usize];
+			if blocks.len() < 2 {
+				continue;
+			}
+			if !self.func.data_nodes[node as usize].kind.is_pure() {
+				continue;
+			}
+			if !self.should_spill(&self.func.data_nodes[node as usize]) {
+				continue;
+			}
+			let mut blocks_iter = blocks.iter().copied();
+			let first = blocks_iter.next().unwrap();
+			let lca = blocks_iter
+				.fold(first, |acc, b| self.lca_block(&block_depths, acc, b));
+			// If the LCA is itself one of the consuming blocks, this node is
+			// already naturally computed there in program order — e.g.
+			// `local cur_end = heap.size() * PAGE_SIZE; if new_end > cur_end
+			// { ... cur_end ... }`: `cur_end` is read both by the condition
+			// (in the block that declares it) and from inside the nested
+			// `then` branch, so its LCA is that same declaring block. That
+			// block's own existing lazy-on-first-use `ensure_local` call
+			// (triggered while emitting the condition, strictly before the
+			// nested branch is even entered) is already correct and
+			// sufficient — forcing materialization at the very *start* of
+			// that block instead would run it before whatever it itself
+			// depends on (here, the `heap.size()` call) has executed.
+			// Hoisting only the cases where the LCA is a strict ancestor —
+			// never a member of `blocks` itself — is exactly what keeps this
+			// pass from ever reordering a value ahead of its own inputs.
+			if !blocks.contains(&lca) {
+				placement_by_block[lca as usize].push(node);
+			}
+		}
+		placement_by_block
+	}
+
+	/// Records every `DataNode` that `block_idx`'s own statements read.
+	///
+	/// A phi's `left`/`right` (`IfElse.outputs`) or a switch arm's own
+	/// contribution (`SwitchCase.own_values`) is recorded against the
+	/// specific branch block that actually produced it — `then_block`/
+	/// `else_block`/`case.block` — never against `block_idx` itself.
+	/// `block_idx` (the block containing the `if`/`switch`) only ever reads
+	/// the phi's *merged* result, a value in its own right that's already
+	/// correctly materialized by the existing `pre_alloc_phi_outputs`/
+	/// `emit_phi_stores_for_branch` machinery — not the branch-local values
+	/// feeding into it. Recording those against `block_idx` instead of their
+	/// true origin block is exactly the bug this function exists to avoid:
+	/// it would misidentify a value that's only ever computed inside one
+	/// specific branch as something already available beforehand.
+	///
+	/// Only records the *direct* operand named by each control node —
+	/// transitive propagation to that operand's own operands happens once,
+	/// globally, in `compute_value_placement`'s backward sweep. Every case
+	/// below reduces to the same one-line insertion into `consuming_blocks`
+	/// (`push_unique_block`, shared with that backward sweep) — the size of
+	/// this function is `ControlNode`'s own variant count, not new logic.
+	fn record_block_own_nodes(
+		&self,
+		block_idx: BlockIndex,
+		consuming_blocks: &mut [Vec<BlockIndex>],
+	) {
+		let block = self.func.blocks[block_idx as usize]
+			.as_ref()
+			.expect("block scope should be built");
+		// `Block::result` is the block's own exit value (e.g. an if-branch's
+		// tail expression) — separate from `statements`, and where a value
+		// like `map_y_f` in the doc example gets read when a branch's whole
+		// body is just `(oy - map_y_f) * delta_dist_y` with no other
+		// statement.
+		if let StackResult::Value(n) = block.result {
+			push_unique_block(&mut consuming_blocks[n as usize], block_idx);
+		}
+		for stmt in &block.statements {
+			match stmt {
+				ControlNode::Return { value } => {
+					if let StackResult::Value(n) = value {
+						push_unique_block(
+							&mut consuming_blocks[*n as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::GlobalSet { value, .. } => {
+					push_unique_block(
+						&mut consuming_blocks[*value as usize],
+						block_idx,
+					);
+				}
+				ControlNode::Call { callee, args, .. } => {
+					push_unique_block(
+						&mut consuming_blocks[*callee as usize],
+						block_idx,
+					);
+					for &a in args.iter() {
+						push_unique_block(
+							&mut consuming_blocks[a as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::IfElse {
+					condition,
+					then_block,
+					else_block,
+					outputs,
+					..
+				} => {
+					push_unique_block(
+						&mut consuming_blocks[*condition as usize],
+						block_idx,
+					);
+					for &phi in outputs.iter() {
+						// The phi's own merged value is read by block_idx.
+						push_unique_block(
+							&mut consuming_blocks[phi as usize],
+							block_idx,
+						);
+						let DataNodeKind::Phi { left, right, .. } =
+							&self.func.data_nodes[phi as usize].kind
+						else {
+							continue;
+						};
+						let (l, r) = (*left, *right);
+						push_unique_block(
+							&mut consuming_blocks[l as usize],
+							*then_block,
+						);
+						// No `else`: per `Builder::merge_branches`, `right`
+						// is just whatever `bindings[i]` already held going
+						// into the `if` — i.e. the parent's own pre-existing
+						// value, not anything computed inside a branch — so
+						// it belongs to block_idx.
+						let r_block = else_block.unwrap_or(block_idx);
+						push_unique_block(
+							&mut consuming_blocks[r as usize],
+							r_block,
+						);
+					}
+				}
+				ControlNode::Switch {
+					selector,
+					cases,
+					default,
+					outputs,
+					..
+				} => {
+					push_unique_block(
+						&mut consuming_blocks[*selector as usize],
+						block_idx,
+					);
+					for &phi in outputs.iter() {
+						push_unique_block(
+							&mut consuming_blocks[phi as usize],
+							block_idx,
+						);
+					}
+					for case in cases.iter().chain(default.iter()) {
+						for &own in case.own_values.iter() {
+							if let StackResult::Value(n) = own {
+								push_unique_block(
+									&mut consuming_blocks[n as usize],
+									case.block,
+								);
+							}
+						}
+					}
+				}
+				ControlNode::Loop { outputs, .. } => {
+					// LoopParam nodes themselves are impure (excluded from
+					// placement entirely); nothing pure to record here.
+					for &o in outputs.iter() {
+						push_unique_block(
+							&mut consuming_blocks[o as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::Break {
+					value,
+					loop_param_updates,
+					..
+				} => {
+					if let StackResult::Value(n) = value {
+						push_unique_block(
+							&mut consuming_blocks[*n as usize],
+							block_idx,
+						);
+					}
+					for &(_, current) in loop_param_updates.iter() {
+						push_unique_block(
+							&mut consuming_blocks[current as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::Continue {
+					loop_param_updates, ..
+				} => {
+					for &(_, current) in loop_param_updates.iter() {
+						push_unique_block(
+							&mut consuming_blocks[current as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::Unreachable => {}
+				// `result`/`delta` etc. that *produce* a value (rather than
+				// read one) are deliberately not recorded here — see the
+				// impure-node skip in `compute_value_placement`.
+				ControlNode::MemorySize { .. } => {}
+				ControlNode::MemoryGrow { delta, .. } => {
+					push_unique_block(
+						&mut consuming_blocks[*delta as usize],
+						block_idx,
+					);
+				}
+				ControlNode::MemoryFill { dst, val, len, .. } => {
+					for &n in [dst, val, len] {
+						push_unique_block(
+							&mut consuming_blocks[n as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::MemoryCopy { dst, src, len, .. } => {
+					for &n in [dst, src, len] {
+						push_unique_block(
+							&mut consuming_blocks[n as usize],
+							block_idx,
+						);
+					}
+				}
+				ControlNode::PointerLoad { address, .. } => {
+					push_unique_block(
+						&mut consuming_blocks[*address as usize],
+						block_idx,
+					);
+				}
+				ControlNode::PointerStore { address, value, .. } => {
+					for &n in [address, value] {
+						push_unique_block(
+							&mut consuming_blocks[n as usize],
+							block_idx,
+						);
+					}
+				}
+			}
+		}
+	}
+
+	/// Invokes `f` once for each `DataNode` operand `node` directly reads —
+	/// one hop, not transitive. `compute_value_placement`'s backward sweep
+	/// supplies the transitivity by visiting every node in the function
+	/// exactly once, in decreasing index order.
+	///
+	/// `node` is always pure here (the sweep skips impure nodes before
+	/// calling this), so the impure arms below — `CallResult`,
+	/// `MemoryGrowResult`, `PointerLoadResult`, `Phi`, `LoopParam` — are
+	/// unreachable in practice. They're listed anyway (as no-ops) so the
+	/// match stays exhaustive against `DataNodeKind` and reads uniformly:
+	/// an impure node's own operands are consumed at the single
+	/// control-node site that produces it, already recorded directly by
+	/// `record_block_own_nodes`, not wherever the impure result is later
+	/// read.
+	fn for_each_operand(
+		&self,
+		node: DataNodeIndex,
+		mut f: impl FnMut(DataNodeIndex),
+	) {
+		match &self.func.data_nodes[node as usize].kind {
+			DataNodeKind::Add { left, right, .. }
+			| DataNodeKind::Sub { left, right, .. }
+			| DataNodeKind::Mul { left, right, .. }
+			| DataNodeKind::DivS { left, right, .. }
+			| DataNodeKind::DivU { left, right, .. }
+			| DataNodeKind::RemS { left, right, .. }
+			| DataNodeKind::RemU { left, right, .. }
+			| DataNodeKind::BitAnd { left, right, .. }
+			| DataNodeKind::BitOr { left, right, .. }
+			| DataNodeKind::BitXor { left, right, .. }
+			| DataNodeKind::Shl { left, right, .. }
+			| DataNodeKind::ShrS { left, right, .. }
+			| DataNodeKind::ShrU { left, right, .. }
+			| DataNodeKind::Eq { left, right, .. }
+			| DataNodeKind::NotEq { left, right, .. }
+			| DataNodeKind::LtS { left, right, .. }
+			| DataNodeKind::LtU { left, right, .. }
+			| DataNodeKind::LtEqS { left, right, .. }
+			| DataNodeKind::LtEqU { left, right, .. }
+			| DataNodeKind::GtS { left, right, .. }
+			| DataNodeKind::GtU { left, right, .. }
+			| DataNodeKind::GtEqS { left, right, .. }
+			| DataNodeKind::GtEqU { left, right, .. } => {
+				f(*left);
+				f(*right);
+			}
+			DataNodeKind::Neg { operand, .. }
+			| DataNodeKind::Sqrt { operand, .. }
+			| DataNodeKind::Abs { operand, .. }
+			| DataNodeKind::Floor { operand, .. }
+			| DataNodeKind::Ceil { operand, .. }
+			| DataNodeKind::BitNot { operand, .. }
+			| DataNodeKind::Eqz { operand }
+			| DataNodeKind::I64ExtendI32S { operand }
+			| DataNodeKind::I64ExtendI32U { operand }
+			| DataNodeKind::I32WrapI64 { operand }
+			| DataNodeKind::F32ConvertI32 { operand }
+			| DataNodeKind::F32ConvertU32 { operand }
+			| DataNodeKind::F32ConvertI64 { operand }
+			| DataNodeKind::F32ConvertU64 { operand }
+			| DataNodeKind::F64ConvertI32 { operand }
+			| DataNodeKind::F64ConvertU32 { operand }
+			| DataNodeKind::F64ConvertI64 { operand }
+			| DataNodeKind::F64ConvertU64 { operand }
+			| DataNodeKind::I32TruncF32 { operand }
+			| DataNodeKind::U32TruncF32 { operand }
+			| DataNodeKind::I32TruncF64 { operand }
+			| DataNodeKind::U32TruncF64 { operand }
+			| DataNodeKind::I64TruncF32 { operand }
+			| DataNodeKind::U64TruncF32 { operand }
+			| DataNodeKind::I64TruncF64 { operand }
+			| DataNodeKind::U64TruncF64 { operand }
+			| DataNodeKind::F64PromoteF32 { operand }
+			| DataNodeKind::F32DemoteF64 { operand }
+			| DataNodeKind::AggregateGet {
+				aggregate: operand, ..
+			} => {
+				f(*operand);
+			}
+			DataNodeKind::Aggregate { fields, .. } => {
+				for &field in fields.iter() {
+					f(field);
+				}
+			}
+			// Impure — unreachable here; see this function's doc comment.
+			DataNodeKind::Phi { .. }
+			| DataNodeKind::CallResult { .. }
+			| DataNodeKind::MemoryGrowResult { .. }
+			| DataNodeKind::PointerLoadResult { .. } => {}
+			// Leaf nodes, plus impure result kinds with no operand of
+			// interest here.
+			DataNodeKind::Int { .. }
+			| DataNodeKind::Float { .. }
+			| DataNodeKind::Param { .. }
+			| DataNodeKind::GlobalGet { .. }
+			| DataNodeKind::FunctionRef { .. }
+			| DataNodeKind::StaticDataRef { .. }
+			| DataNodeKind::MemoryOffset { .. }
+			| DataNodeKind::MemoryIndex { .. }
+			| DataNodeKind::MemorySizeResult { .. }
+			| DataNodeKind::AggregateCallResult { .. }
+			| DataNodeKind::LoopParam { .. } => {}
+		}
+	}
+
+	/// Depth of each block in the `Block::parent` tree (root = 0), computed
+	/// in one forward pass over `self.func.blocks`. Valid in one pass for
+	/// the same reason `for_each_operand`'s backward sweep is: a block's
+	/// parent always has a lower `BlockIndex` than the block itself (a
+	/// nested scope's index is only minted once its enclosing scope
+	/// already exists), so a block's parent's depth is always already
+	/// final by the time the block itself is visited.
+	fn compute_block_depths(&self) -> Vec<u32> {
+		let mut depths = vec![0u32; self.func.blocks.len()];
+		for (i, block) in self.func.blocks.iter().enumerate() {
+			if let Some(parent) = block.as_ref().and_then(|b| b.parent) {
+				depths[i] = depths[parent as usize] + 1;
+			}
+		}
+		depths
+	}
+
+	/// Lowest common ancestor of two blocks in the `Block::parent` tree —
+	/// the block guaranteed to run before both, as late as possible.
+	/// `depths` (from `compute_block_depths`, computed once per function)
+	/// lets this walk both parent chains in lockstep instead of building an
+	/// ancestor set for one side.
+	fn lca_block(
+		&self,
+		depths: &[u32],
+		mut a: BlockIndex,
+		mut b: BlockIndex,
+	) -> BlockIndex {
+		let parent_of = |b: BlockIndex| {
+			self.func.blocks[b as usize]
+				.as_ref()
+				.unwrap()
+				.parent
+				.unwrap()
+		};
+		while depths[a as usize] > depths[b as usize] {
+			a = parent_of(a);
+		}
+		while depths[b as usize] > depths[a as usize] {
+			b = parent_of(b);
+		}
+		while a != b {
+			a = parent_of(a);
+			b = parent_of(b);
+		}
+		a
 	}
 
 	// ── Value emission ────────────────────────────────────────────────────────
@@ -1002,6 +1550,38 @@ impl<'f> Scheduler<'f> {
 					self.body.push(Instruction::I64Sub);
 				}
 			},
+			DataNodeKind::Sqrt { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Sqrt,
+					ScalarType::F64 => Instruction::F64Sqrt,
+					_ => unimplemented!(),
+				});
+			}
+			DataNodeKind::Abs { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Abs,
+					ScalarType::F64 => Instruction::F64Abs,
+					_ => unimplemented!(),
+				});
+			}
+			DataNodeKind::Floor { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Floor,
+					ScalarType::F64 => Instruction::F64Floor,
+					_ => unimplemented!(),
+				});
+			}
+			DataNodeKind::Ceil { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Ceil,
+					ScalarType::F64 => Instruction::F64Ceil,
+					_ => unimplemented!(),
+				});
+			}
 			DataNodeKind::BitNot { operand, ty } => {
 				// WASM has no bitwise-not; emit `x ^ -1`.
 				self.emit_value(operand);
@@ -1031,6 +1611,78 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::I32WrapI64 { operand } => {
 				self.emit_value(operand);
 				self.body.push(Instruction::I32WrapI64);
+			}
+			DataNodeKind::F32ConvertI32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32ConvertI32S);
+			}
+			DataNodeKind::F32ConvertU32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32ConvertI32U);
+			}
+			DataNodeKind::F32ConvertI64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32ConvertI64S);
+			}
+			DataNodeKind::F32ConvertU64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32ConvertI64U);
+			}
+			DataNodeKind::F64ConvertI32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64ConvertI32S);
+			}
+			DataNodeKind::F64ConvertU32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64ConvertI32U);
+			}
+			DataNodeKind::F64ConvertI64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64ConvertI64S);
+			}
+			DataNodeKind::F64ConvertU64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64ConvertI64U);
+			}
+			DataNodeKind::I32TruncF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I32TruncF32S);
+			}
+			DataNodeKind::U32TruncF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I32TruncF32U);
+			}
+			DataNodeKind::I32TruncF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I32TruncF64S);
+			}
+			DataNodeKind::U32TruncF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I32TruncF64U);
+			}
+			DataNodeKind::I64TruncF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I64TruncF32S);
+			}
+			DataNodeKind::U64TruncF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I64TruncF32U);
+			}
+			DataNodeKind::I64TruncF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I64TruncF64S);
+			}
+			DataNodeKind::U64TruncF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I64TruncF64U);
+			}
+			DataNodeKind::F64PromoteF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64PromoteF32);
+			}
+			DataNodeKind::F32DemoteF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32DemoteF64);
 			}
 
 			DataNodeKind::Eq { left, right, ty } => {
@@ -1135,11 +1787,36 @@ impl<'f> Scheduler<'f> {
 				field_index,
 				..
 			} => {
-				// Ensure the aggregate's per-field locals are populated, then read
-				// the requested field.
+				// Ensure the aggregate's per-*leaf* locals are populated (see
+				// `ensure_aggregate_locals`), then find the one belonging to
+				// this (always-scalar, per `get_aggregate_field`) top-level
+				// field: `node_to_aggregate_locals` is flattened, so a field
+				// preceded by a nested-aggregate sibling doesn't sit at
+				// `field_index` directly — skip past every leaf contributed
+				// by earlier sibling fields first.
 				self.ensure_aggregate_locals(aggregate);
-				let field_local = self.node_to_aggregate_locals[&aggregate]
-					[field_index as usize];
+				let aggregate_index =
+					match &self.func.data_nodes[aggregate as usize].kind {
+						DataNodeKind::Aggregate {
+							aggregate_index, ..
+						}
+						| DataNodeKind::AggregateCallResult {
+							aggregate_index,
+						} => *aggregate_index,
+						_ => unreachable!(
+							"AggregateGet::aggregate must itself be an aggregate node"
+						),
+					};
+				let leaf_offset: usize = self.mir.aggregates
+					[aggregate_index as usize]
+					.values[..field_index as usize]
+					.iter()
+					.map(|&t| {
+						Self::flatten_mir_type(t, &self.mir.aggregates).len()
+					})
+					.sum();
+				let field_local =
+					self.node_to_aggregate_locals[&aggregate][leaf_offset];
 				self.body.push(Instruction::LocalGet(field_local));
 			}
 
@@ -1237,9 +1914,14 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Ensure per-field WASM locals exist for an `Aggregate` node.
-	/// Emits each field expression and spills it to a fresh local, then records
-	/// the mapping in `node_to_aggregate_locals`.
+	/// Ensure per-*leaf* WASM locals exist for an `Aggregate` node.
+	/// Emits each scalar field expression and spills it to a fresh local; a
+	/// field that is itself an aggregate has no local of its own — it's
+	/// walked into recursively, and its own (already- or newly-computed)
+	/// leaf locals are spliced in directly, so `node_to_aggregate_locals`
+	/// always ends up holding one entry per *leaf* scalar, flattened in the
+	/// same pre-order as `flatten_mir_type`. Records the mapping in
+	/// `node_to_aggregate_locals`.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
 	/// are populated by `emit_control` when the call instruction is emitted.
@@ -1262,20 +1944,26 @@ impl<'f> Scheduler<'f> {
 					"ensure_aggregate_locals called on non-aggregate node"
 				),
 			};
-		let field_types: Vec<ScalarType> = self.mir.aggregates
-			[aggregate_index as usize]
-			.values
-			.iter()
-			.map(|&t| {
-				ScalarType::try_from(t).expect("aggregate field must be scalar")
-			})
-			.collect();
 		let mut locals = Vec::with_capacity(fields.len());
 		for (i, &field_node) in fields.iter().enumerate() {
-			self.emit_value(field_node);
-			let local = self.alloc_local(field_types[i]);
-			self.body.push(Instruction::LocalSet(local));
-			locals.push(local);
+			let field_ty =
+				self.mir.aggregates[aggregate_index as usize].values[i];
+			match field_ty {
+				mir::Type::Aggregate { .. } => {
+					self.ensure_aggregate_locals(field_node);
+					locals.extend_from_slice(
+						&self.node_to_aggregate_locals[&field_node],
+					);
+				}
+				_ => {
+					let scalar_ty = ScalarType::try_from(field_ty)
+						.expect("non-aggregate field must be scalar");
+					self.emit_value(field_node);
+					let local = self.alloc_local(scalar_ty);
+					self.body.push(Instruction::LocalSet(local));
+					locals.push(local);
+				}
+			}
 		}
 		self.node_to_aggregate_locals
 			.insert(node, locals.into_boxed_slice());
@@ -1568,6 +2256,16 @@ impl<'f> Scheduler<'f> {
 	}
 }
 
+/// Appends `block` to `blocks` unless it's already present. Each node is
+/// read from only a handful of blocks at most, so a linear scan beats a
+/// `HashSet` here — no hashing, and no allocation at all until a node is
+/// actually read from a second block.
+fn push_unique_block(blocks: &mut Vec<BlockIndex>, block: BlockIndex) {
+	if !blocks.contains(&block) {
+		blocks.push(block);
+	}
+}
+
 // ── Local coalescing ──────────────────────────────────────────────────────────
 
 /// Reuse WASM local slots for spilled values whose live ranges do not overlap.
@@ -1614,6 +2312,62 @@ fn coalesce_locals(
 				}
 			}
 			_ => {}
+		}
+	}
+
+	// A `[first_write, last_read]` window computed from flat textual positions
+	// is only valid for straight-line code: it implicitly assumes every
+	// instruction executes at most once. `Loop` is the one construct that
+	// breaks that assumption — its body is a single textual span that
+	// actually runs many times, via a back-edge (`Br`) to the `Loop`
+	// instruction itself. A slot written once before the loop and read once
+	// inside it gets `last_read` pinned to that first textual occurrence,
+	// even though the same read recurs on every later iteration. If some
+	// other slot's write/read pair falls entirely after that position but
+	// still inside the loop body, the ranges look non-overlapping and the
+	// allocator happily hands them the same physical local — which then
+	// gets clobbered by the second slot's write before the first slot's
+	// value is read again on the next iteration.
+	//
+	// Fix: widen every slot touched anywhere inside a loop so its range
+	// covers that loop's entire `[Loop, End]` span (and transitively every
+	// loop it's nested in, since the same argument applies at each nesting
+	// level). Two slots both live inside the same loop then always overlap
+	// and can never be coalesced together, which is what correctness under
+	// repeated execution requires.
+	let mut frame_starts: Vec<usize> = Vec::new();
+	let mut loop_spans: Vec<(usize, usize)> = Vec::new();
+	for (i, instr) in body.iter().enumerate() {
+		match instr {
+			Instruction::Block { .. } | Instruction::If { .. } => {
+				frame_starts.push(usize::MAX);
+			}
+			Instruction::Loop { .. } => {
+				frame_starts.push(i);
+			}
+			Instruction::End => {
+				if let Some(start) = frame_starts.pop() {
+					if start != usize::MAX {
+						loop_spans.push((start, i));
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
+	for &(ls, le) in &loop_spans {
+		for instr in &body[ls..=le] {
+			let s = match instr {
+				Instruction::LocalGet(s)
+				| Instruction::LocalSet(s)
+				| Instruction::LocalTee(s) => *s as usize,
+				_ => continue,
+			};
+			if s >= params_count {
+				first_write[s] = first_write[s].min(ls);
+				last_read[s] = last_read[s].max(le);
+			}
 		}
 	}
 

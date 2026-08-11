@@ -17,6 +17,7 @@ pub enum SymbolKind {
 	Memory(DefId),
 	Enum(DefId),
 	Struct(DefId),
+	TypeAlias(DefId),
 	Namespace(NamespaceIndex),
 	Local {
 		func_id: DefId,
@@ -636,6 +637,42 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				source: *access,
 				kind,
 			});
+		}
+	}
+
+	for type_alias in tir.type_aliases.iter() {
+		let kind = SymbolKind::TypeAlias(type_alias.id);
+		let info = SpanInfo {
+			source: SourceSpan::new(type_alias.file_id, type_alias.name.span),
+			kind,
+		};
+		index.global_definitions.push(GlobalDefinition {
+			name: type_alias.name.inner,
+			namespace: type_alias.namespace,
+			info,
+		});
+		index.definitions.push(info);
+		for access in &type_alias.accesses {
+			index.references.push(SpanInfo {
+				source: *access,
+				kind,
+			});
+		}
+		for (param_index, tp) in type_alias.type_params.iter().enumerate() {
+			let kind = SymbolKind::TypeParam {
+				owner: TypeParamOwner::TypeAlias(type_alias.id),
+				param_index: param_index as u32,
+			};
+			index.definitions.push(SpanInfo {
+				source: SourceSpan::new(type_alias.file_id, tp.name.span),
+				kind,
+			});
+			for access in &tp.accesses {
+				index.references.push(SpanInfo {
+					source: SourceSpan::new(access.file_id, access.span),
+					kind,
+				});
+			}
 		}
 	}
 
