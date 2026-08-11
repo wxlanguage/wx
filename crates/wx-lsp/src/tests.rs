@@ -11,11 +11,10 @@ use crate::completion::{completion_items, find_enclosing_function};
 use crate::symbol_index::SymbolKind;
 use crate::{
 	Backend, CompiledRoot, OpenDocument, ServerState, TokenType, analyze_root,
-	build_service, byte_to_position, compute_refresh,
-	diagnostic_publish_paths, discover_crate_root, find_active_call,
-	implementation_locations, owning_root, position_to_offset,
-	position_to_offset_in_str, reference_search_kinds, symbol_hover_text,
-	symbol_kind_to_token_type,
+	build_service, byte_to_position, compute_refresh, diagnostic_publish_paths,
+	discover_crate_root, find_active_call, implementation_locations,
+	owning_root, position_to_offset, position_to_offset_in_str,
+	reference_search_kinds, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
 use wx_compiler::tir::TypeParamOwner;
@@ -1671,8 +1670,8 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 	let source = indoc::indoc! {"
 		use std::*;
 
-		memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+		#[memory_limits(min_pages = 1)]
+		memory heap: Memory where { Size = u32 };
 		fn heap_size() -> u32 {
 		    heap.size()
 		}
@@ -1737,7 +1736,8 @@ fn memory_associated_const_namespace_access_resolves() {
 	let source = indoc::indoc! {"
 		use std::*;
 
-		memory heap: Memory where { Size = u32 } { min_pages: 1 };
+		#[memory_limits(min_pages = 1)]
+		memory heap: Memory where { Size = u32 };
 		global mut bump: *u8 = heap::DATA_END;
 	"};
 	let (_, compiled) = compile_source(&root, source);

@@ -349,8 +349,8 @@ fn test_loops() {
 #[test]
 fn test_loop_copy_does_not_alias_locals_across_iterations() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         global mut bump: heap::*u8 = heap::DATA_END;
 
         struct BumpAllocator {}
@@ -938,7 +938,8 @@ fn test_global_init_generic_null_pointer_executes() {
 	// null() is a generic function: null<M: Memory, T>() -> M::*T
 	// Type params must be inferred from the global's declared type.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         global mut head: heap::*Node = ptr::null()
         fn get_head() -> u32 { head as u32 }
@@ -1503,9 +1504,8 @@ fn test_struct_call_result_wat() {
 #[test]
 fn test_pointer_deref_load_and_store() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn read(ptr: heap::*i32) -> i32 {
             ptr.*
@@ -1550,9 +1550,8 @@ fn test_pointer_deref_load_and_store() {
 #[test]
 fn test_pointer_deref_increment() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1
-        }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
 
         fn increment(ptr: heap::*mut i32) {
             ptr.* += 1
@@ -1601,9 +1600,8 @@ fn test_struct_pointer_load_and_store() {
 	// and that individual field loads return the correct values.
 	// The WAT snapshot pins the emitted instruction shape.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1
-        }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
 
         struct Point {
             x: i32,
@@ -1700,8 +1698,8 @@ fn test_struct_pointer_load_and_store() {
 #[test]
 fn test_nested_struct_field_access_on_local() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Deep { id: u64 }
         struct Mid { tag: u8, deep: Deep }
         struct Top { flag: u8, mid: Mid }
@@ -1749,15 +1747,15 @@ fn test_nested_struct_field_access_on_local() {
 #[test]
 fn test_nested_struct_pointer_store_and_load() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
-
-        // #[fixed_layout] so the byte offsets asserted below (declaration
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        // #[fixed_order] so the byte offsets asserted below (declaration
         // order, not alignment-sorted) are pinned rather than incidental.
-        #[fixed_layout]
+        #[fixed_order]
         struct Deep { id: u64 }
-        #[fixed_layout]
+        #[fixed_order]
         struct Mid { tag: u8, deep: Deep }
-        #[fixed_layout]
+        #[fixed_order]
         struct Top { flag: u8, mid: Mid }
 
         fn store_nested_literal(p: heap::*mut Top) {
@@ -1824,8 +1822,8 @@ fn test_nested_struct_pointer_store_and_load() {
 #[test]
 fn test_nested_struct_function_parameter() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Deep { id: u64 }
         struct Mid { tag: u8, deep: Deep }
         struct Top { flag: u8, mid: Mid }
@@ -1858,7 +1856,8 @@ fn test_struct_field_write_through_pointer() {
 	// `ptr.*.field = val` — field write through a mutable pointer.
 	// Uses the byte-offset PointerStore path, not whole-struct assignment.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
         fn set_x(ptr: heap::*mut Point, v: i32) { ptr.*.x = v }
         fn set_y(ptr: heap::*mut Point, v: i32) { ptr.*.y = v }
@@ -2145,9 +2144,8 @@ fn test_generic_struct_pointer_load_store() {
 	// Codegen must emit the correct field offsets for the monomorphized aggregate
 	// (x@0, y@4), going through the same path as the non-generic pointer tests.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1
-        }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
 
         struct Point<T> {
             x: T,
@@ -2217,9 +2215,8 @@ fn test_memory_grow_and_size() {
 	// old page count and extends by n pages. Both route through @memory_size /
 	// @memory_grow intrinsics via the Memory trait default methods.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn size_pages() -> u32 {
             heap.size()
@@ -2263,9 +2260,8 @@ fn test_memory_size_before_grow_ordering() {
 	// If MemorySize is treated as a floating data node, the scheduler may emit
 	// memory.size after memory.grow, returning 2 instead of 1.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn capture_size_before_grow() -> u32 {
             local before = heap.size();
@@ -2303,9 +2299,8 @@ fn test_array_literal_read_by_index() {
 	// address 0; indexing it must return the right element via i32.load at
 	// base + i * elem_size.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn get(i: u32) -> i32 {
             local arr: heap::[4]i32 = [10, 20, 30, 40];
@@ -2335,9 +2330,8 @@ fn test_array_write_and_read_back() {
 	// initialises a 4-element block at address 0, then the wx functions do
 	// a round-trip write+read to verify PointerStore/PointerLoad addressing.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn write(arr: [4]mut i32, i: u32, v: i32) { arr[i] = v; }
         fn read(arr: [4]i32, i: u32) -> i32 { arr[i] }
@@ -2384,9 +2378,8 @@ fn test_dead_array_excluded_from_data_section() {
 	// DCE removes functions that are not reachable from exports.  The static
 	// array owned by a dead function must not appear in the WASM data segment.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn live() -> i32 { 42 }
 
@@ -2411,9 +2404,8 @@ fn test_array_index_wat() {
 	// WAT snapshot: pins the data segment placement and the load/store
 	// instruction shape (i32.add + i32.mul offset arithmetic).
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn get(i: u32) -> i32 {
             local arr: [4]i32 = [10, 20, 30, 40];
@@ -2447,9 +2439,8 @@ fn test_slice_range_wat() {
 	//   • bounds checking (out-of-range access is UB at runtime)
 	//   • from > to produces a nonsensical negative length
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn full_copy(s: heap::[]i32) -> heap::[]i32 {
             s[..]
@@ -2481,9 +2472,8 @@ fn test_slice_range_array_wat() {
 	// arr[..]    — ptr = array base, len = const 4 (array size)
 	// arr[i..n]  — ptr = base + i*4, len = n − i
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn full_array(arr: heap::[4]i32) -> heap::[]i32 {
             arr[..]
@@ -2506,9 +2496,8 @@ fn test_narrow_pointer_deref_sign_extension_and_byte_isolation() {
 	// 2. Sign-extension: reading 0xFF through *i8 must yield -1.
 	// 3. Byte isolation: writing through *u8 must not touch adjacent bytes.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         fn read_u8(ptr: heap::*u8) -> u8 { ptr.* }
         fn read_i8(ptr: heap::*i8) -> i8 { ptr.* }
@@ -2562,9 +2551,8 @@ fn test_global_read_before_write_returns_old_value() {
 	// re-emits `global.get` after the `global.set`, yielding new_end instead
 	// of the original ptr.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         global mut bump: heap::*u8 = heap::DATA_END;
 
@@ -2602,9 +2590,8 @@ fn test_global_initialized_to_data_end() {
 	// compile-time static-segment-end offset as its WASM init expression,
 	// and reading it back at runtime must return that same value.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         global mut bump: heap::*u8 = heap::DATA_END;
 
@@ -2646,9 +2633,8 @@ fn test_null_pointer_comparison() {
 	//  1. null() compares equal to another null() (the `node.next == ptr::null()` pattern)
 	//  2. a non-zero pointer does NOT compare equal to null()
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
 
         struct Node { value: i32, next: *Node }
 
@@ -2756,8 +2742,8 @@ fn test_check_wad_magic_wat() {
 	// Constant slice indices 0-3 must all fold into `i32.load8_u offset=N`
 	// with no runtime Add/Mul — the four loads become offset=0,1,2,3.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         pub fn check_wad_magic(data: heap::[]u8) -> bool {
             data[0] == 0x49
                 && data[1] == 0x57
@@ -2775,8 +2761,8 @@ fn test_constant_index_offset_folding_wat() {
 	// Constant array and slice indices must be folded directly into the WASM
 	// memarg immediate (e.g. `i32.load offset=8`) with no runtime Add/Mul.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         fn get_arr() -> i32 {
             local arr: [4]i32 = [10, 20, 30, 40];
             arr[2]
@@ -2800,8 +2786,8 @@ fn test_address_of_array_element() {
 	// The byte address must equal base + i * elem_size; writing through the
 	// returned pointer must update the correct memory slot.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         fn elem_ptr(arr: heap::[4]mut i32, i: u32) -> heap::*mut i32 {
             arr[i].&mut
         }
@@ -2840,7 +2826,8 @@ fn test_address_of_struct_field() {
 	// `x` is at offset 0; `y` is at offset 4 (both are i32 fields with alignment 4,
 	// sorted in declaration order since alignment is equal).
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
         fn x_addr(ptr: heap::*Point) -> heap::*i32 { ptr.*.x.& }
@@ -2883,7 +2870,8 @@ fn test_address_of_struct_field() {
 #[test]
 fn test_narrow_field_cast_does_not_overread_adjacent_bytes() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct S { a: u8, b: u64, c: u16 }
 
         fn read_c(p: heap::*S) -> u32 { p.*.c as u32 }
@@ -2924,7 +2912,8 @@ fn test_address_of_wat() {
 	// x_addr   — field at static offset 0: the address IS the pointer.
 	//   Expected: local.get 0  (no arithmetic needed)
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
         fn elem_ptr(arr: heap::[4]i32, i: u32) -> heap::*i32 { arr[i].& }
@@ -2945,8 +2934,8 @@ fn test_address_of_wat() {
 #[test]
 fn test_memory64_pointer_roundtrip() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u64 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u64 };
         fn store_load(p: heap::*mut u64) -> u64 {
             p.* = 7;
             p.*
@@ -2975,8 +2964,8 @@ fn test_memory64_pointer_roundtrip() {
 #[test]
 fn test_memory64_size_grow_and_static_data() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u64 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u64 };
         fn size_pages() -> u64 { heap.size() }
         fn grow_one() -> i64 { heap.grow(1) }
         fn msg() -> heap::[]u8 { \"hello\" }
@@ -3025,9 +3014,10 @@ fn test_memory64_size_grow_and_static_data() {
 #[test]
 fn test_multi_memory_static_data() {
 	let case = TestCase::new(indoc! {"
-        memory first: Memory where { Size = u32 } { min_pages: 1 };
-        memory second: Memory where { Size = u32 } { min_pages: 1 };
-
+        #[memory_limits(min_pages = 1)]
+        memory first: Memory where { Size = u32 };
+        #[memory_limits(min_pages = 1)]
+        memory second: Memory where { Size = u32 };
         fn greet_first() -> first::[]u8 { \"hello\" }
         fn greet_second() -> second::[]u8 { \"world!!\" }
         fn end_first() -> first::*u8 { first::DATA_END }

@@ -484,7 +484,8 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	// diagnostic but returns a usable `type_args` (sanitizing any leftover
 	// `INFER` to `ERROR`), so callers keep building a real expression tree.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         fn make_ptr() -> heap::*mut u16 { unreachable }
         fn f(count: heap::Size) -> heap::[]u8 {
             local ptr = make_ptr();
@@ -545,7 +546,8 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
 	// When the RHS errors (e.g. `alloc` is undeclared), the local must still carry
 	// the declared pointer type so that `n.*` doesn't cascade into a "not a pointer" error.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         fn write(x: i32) {
             local p: heap::*mut Node = alloc_node()
@@ -584,7 +586,8 @@ fn test_compare_mutable_pointer_with_null() {
 	// (`heap::*Node`), even though null()'s return type is an immutable pointer.
 	// Previously `infer_type_args` required matching mutability, causing E1002.
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } { min_pages: 1 }
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         fn is_null(p: heap::*Node) -> bool {
             p == ptr::null()
@@ -7646,9 +7649,8 @@ fn test_global_init_if_expression_resolves() {
 #[test]
 fn test_global_initialized_to_data_end_tir() {
 	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 } {
-            min_pages: 1,
-        };
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 };
         global mut bump: heap::*u8 = heap::DATA_END;
         export { heap }
     "});

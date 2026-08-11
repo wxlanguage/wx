@@ -137,6 +137,7 @@ items:
       inner:
         Memory:
           id: 1
+          attributes: []
           name:
             inner: 4
             span:
@@ -175,7 +176,6 @@ items:
             span:
               start: 57
               end: 84
-          config: ~
       span:
         start: 45
         end: 84

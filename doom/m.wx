@@ -2,8 +2,8 @@ use std::*;
 
 module boo;
 
-memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
 struct Layout<M: Memory> {
     size: M::Size,
     align: M::Size,

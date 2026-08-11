@@ -101,8 +101,6 @@ define_text! {
 		// compound tokens
 		ExportLBrace => "export {",
 		FnParen      => "fn(",
-		MinPages     => "min_pages: ",
-		MaxPages     => "max_pages: ",
 		// binary operators
 		Add       => "+",
 		Sub       => "-",
@@ -505,38 +503,15 @@ impl<'a> Builder<'a> {
 			ast::Item::Memory {
 				name,
 				bound: kind,
-				config,
+				attributes,
 				..
 			} => {
-				let name_id = self.symbol(name.inner);
-				let kind_id = self.build_bound_expression(&kind.inner);
-				let mut parts: Vec<NodeId> = vec![
-					self.text(Text::Memory),
-					name_id,
-					self.text(Text::ColonSp),
-					kind_id,
-				];
-				if let Some(cfg) = config {
-					let mut fields: Vec<NodeId> = Vec::new();
-					if let Some(min) = &cfg.min_pages {
-						let span = min.span;
-						fields.push(self.text(Text::MinPages));
-						fields.push(self.source_text(span));
-					}
-					if let Some(max) = &cfg.max_pages {
-						let span = max.span;
-						if !fields.is_empty() {
-							fields.push(self.text(Text::CommaSp));
-						}
-						fields.push(self.text(Text::MaxPages));
-						fields.push(self.source_text(span));
-					}
-					if !fields.is_empty() {
-						parts.push(self.text(Text::SpaceLBraceSpace));
-						parts.extend(fields);
-						parts.push(self.text(Text::SpaceRBrace));
-					}
-				}
+				let mut parts: Vec<NodeId> = Vec::new();
+				self.build_attributes(&mut parts, attributes);
+				parts.push(self.text(Text::Memory));
+				parts.push(self.symbol(name.inner));
+				parts.push(self.text(Text::ColonSp));
+				parts.push(self.build_bound_expression(&kind.inner));
 				parts.push(self.text(Text::Semi));
 				self.arena.concat(parts)
 			}
@@ -1341,9 +1316,32 @@ impl<'a> Builder<'a> {
 		for attr in attributes {
 			out.push(self.text(Text::HashLBracket));
 			out.push(self.symbol(attr.name.inner));
-			if let ast::AttributeValue::NameValue(value) = &attr.value {
-				out.push(self.text(Text::EqSp));
-				out.push(self.symbol(value.inner));
+			match &attr.value {
+				ast::AttributeValue::Word => {}
+				ast::AttributeValue::NameValue(value) => {
+					out.push(self.text(Text::EqSp));
+					out.push(self.symbol(value.inner));
+				}
+				ast::AttributeValue::Args(args) => {
+					out.push(self.text(Text::LParen));
+					for (index, arg) in args.iter().enumerate() {
+						let arg = &arg.inner.inner;
+						out.push(self.symbol(arg.name.inner));
+						out.push(self.text(Text::EqSp));
+						match &arg.value {
+							ast::AttributeArgValue::Int(value) => {
+								out.push(self.source_text(value.span));
+							}
+							ast::AttributeArgValue::String(value) => {
+								out.push(self.symbol(value.inner));
+							}
+						}
+						if index + 1 < args.len() {
+							out.push(self.text(Text::CommaSp));
+						}
+					}
+					out.push(self.text(Text::RParen));
+				}
 			}
 			out.push(self.text(Text::RBracket));
 			out.push(self.hard_line());

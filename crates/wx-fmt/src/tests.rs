@@ -953,22 +953,26 @@ fn test_format_memory_config() {
 
 	// min_pages only
 	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 } { min_pages: 4 };"),
-		"memory heap: Memory where { Size = u32 } { min_pages: 4 };\n",
+		fmt(
+			"#[memory_limits(min_pages = 4)] memory heap: Memory where { Size = u32 };"
+		),
+		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 } { max_pages: 10 };"),
-		"memory heap: Memory where { Size = u32 } { max_pages: 10 };\n",
+		fmt(
+			"#[memory_limits(max_pages = 10)] memory heap: Memory where { Size = u32 };"
+		),
+		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 } { min_pages: 1, max_pages: 10 };"
+			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory where { Size = u32 };"
 		),
-		"memory heap: Memory where { Size = u32 } { min_pages: 1, max_pages: 10 };\n",
+		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
 	);
 }
 

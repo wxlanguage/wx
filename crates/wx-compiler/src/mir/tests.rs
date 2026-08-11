@@ -698,9 +698,9 @@ fn test_struct_layout_is_alignment_sorted() {
 }
 
 #[test]
-fn test_fixed_layout_struct_keeps_declaration_order() {
+fn test_fixed_order_struct_keeps_declaration_order() {
 	let case = TestCase::new(indoc! {"
-        #[fixed_layout]
+        #[fixed_order]
         struct Mixed {
             a: bool,
             b: i64,
@@ -728,6 +728,59 @@ fn test_fixed_layout_struct_keeps_declaration_order() {
 	assert_eq!(&*agg.offsets, &[0, 8, 16, 24]);
 	assert_eq!(&*agg.values, &[Type::Bool, Type::I64, Type::U32, Type::F64]);
 	assert_eq!(&*agg.decl_to_phys, &[0, 1, 2, 3]);
+}
+
+#[test]
+fn test_unreachable_imported_function_is_dropped_from_mir_imports() {
+	let case = TestCase::new(indoc! {"
+        import \"env\" as env {
+            fn used() -> i32;
+            fn unused() -> i32;
+        }
+
+        fn main() -> i32 {
+            env::used()
+        }
+
+        export { main }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	assert_eq!(case.mir.imports.len(), 1);
+	let names: Vec<&str> = case.mir.imports[0]
+		.items
+		.iter()
+		.map(|item| match item {
+			ImportModuleItem::Function { name, .. } => {
+				case.graph.interner.resolve(*name).unwrap()
+			}
+			_ => panic!("expected only Function items in this test"),
+		})
+		.collect();
+	assert_eq!(names, ["used"]);
+}
+
+#[test]
+fn test_import_module_with_no_reachable_functions_is_dropped_entirely() {
+	let case = TestCase::new(indoc! {"
+        import \"dead\" as dead {
+            fn unused() -> i32;
+        }
+
+        import \"alive\" as alive {
+            fn used() -> i32;
+        }
+
+        fn main() -> i32 {
+            alive::used()
+        }
+
+        export { main }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	assert_eq!(case.mir.imports.len(), 1);
+	assert_eq!(case.mir.imports[0].name, "alive");
 }
 
 // ── Generics / monomorphization

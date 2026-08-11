@@ -650,11 +650,16 @@ impl Builder {
 					}
 				};
 				let initial = info.min_pages.unwrap_or(0).max(required_pages);
+				// `min_pages`/`max_pages` are hints, not obligations: just
+				// like `initial` gets bumped above a too-small `min_pages`,
+				// `max_pages` gets bumped above `initial` when it would
+				// otherwise be violated, rather than emitting an
+				// `initial > max` module (invalid per spec).
 				Memory {
 					limits: match info.max_pages {
 						Some(max) => MemoryLimits::Bounded {
 							initial_pages: initial,
-							max_pages: max,
+							max_pages: max.max(initial),
 						},
 						None => MemoryLimits::Unbounded {
 							initial_pages: initial,

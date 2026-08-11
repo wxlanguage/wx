@@ -3,8 +3,8 @@
 // line. See run.mjs for the actual argv the host hands to the guest.
 use std::*;
 
-memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
 enum FileDescriptor: u32 {
   Stdout = 1,
 }

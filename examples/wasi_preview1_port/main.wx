@@ -38,14 +38,14 @@
 // structs below are built directly with the natural, ordinary syntax
 // (`alloc::<T>(T::{ ... nested literal ... })`), same as any other struct.
 //
-// Every record type uses `#[fixed_layout]` (declaration-order fields with
+// Every record type uses `#[fixed_order]` (declaration-order fields with
 // natural C-style alignment padding, rather than wx's default
 // alignment-sorted layout) so that a WASI host writing raw struct bytes
 // through a pointer lines up with the fields wx code reads back.
 use std::*;
 
-memory heap: Memory where { Size = u32 } { min_pages: 1 };
-
+#[memory_limits(min_pages = 1)]
+memory heap: Memory where { Size = u32 };
 // ── Plain scalar typedefs ───────────────────────────────────────────────────
 type Size = u32;
 type Filesize = u64;
@@ -214,7 +214,7 @@ enum Filetype: u8 {
 }
 
 // ── `$dirent` ────────────────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct Dirent {
   d_next: Dircookie,
   d_ino: Inode,
@@ -242,7 +242,7 @@ module Fdflags {
 }
 
 // ── `$fdstat` ────────────────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct Fdstat {
   fs_filetype: Filetype,
   fs_flags: u16,
@@ -272,7 +272,7 @@ module OFlags {
 }
 
 // ── `$filestat` ──────────────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct Filestat {
   dev: Device,
   ino: Inode,
@@ -297,7 +297,7 @@ module Eventrwflags {
 }
 
 // ── `$event_fd_readwrite` ────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct EventFdReadwrite {
   nbytes: Filesize,
   flags: u16,
@@ -306,7 +306,7 @@ struct EventFdReadwrite {
 // ── `$event` ─────────────────────────────────────────────────────────────────
 // witx's field name `type` collides with the wx keyword used for type
 // aliases (`type Foo = Bar;`); renamed to `event_type`.
-#[fixed_layout]
+#[fixed_order]
 struct Event {
   userdata: Userdata,
   error: Errno,
@@ -320,7 +320,7 @@ module Subclockflags {
 }
 
 // ── `$subscription_clock` ────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct SubscriptionClock {
   id: ClockId,
   timeout: Timestamp,
@@ -329,7 +329,7 @@ struct SubscriptionClock {
 }
 
 // ── `$subscription_fd_readwrite` ─────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct SubscriptionFdReadwrite {
   file_descriptor: Fd,
 }
@@ -340,7 +340,7 @@ struct SubscriptionFdReadwrite {
 // Construct/read the `fd_readwrite` case via `subscription_u_as_fd_readwrite`
 // below rather than a second field, which would double-allocate space no
 // real union has.
-#[fixed_layout]
+#[fixed_order]
 struct SubscriptionU {
   tag: Eventtype,
   clock: SubscriptionClock,
@@ -351,7 +351,7 @@ fn subscription_u_as_fd_readwrite(u: *mut SubscriptionU) -> *mut SubscriptionFdR
 }
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
-#[fixed_layout]
+#[fixed_order]
 struct Subscription {
   userdata: Userdata,
   u: SubscriptionU,
@@ -417,12 +417,12 @@ enum Preopentype: u8 {
 // `$prestat` is technically also a witx `union`, but it has exactly one
 // variant, so — unlike `$subscription_u` — a plain tag + single payload
 // field already matches the real layout with no reinterpretation needed.
-#[fixed_layout]
+#[fixed_order]
 struct PrestatDir {
   pr_name_len: Size,
 }
 
-#[fixed_layout]
+#[fixed_order]
 struct Prestat {
   tag: Preopentype,
   dir: PrestatDir,
@@ -553,7 +553,7 @@ import "wasi_snapshot_preview1" as wasi {
 // Everything above type-checks and reaches codegen, which proves wx accepts
 // the declarations — but that alone doesn't prove the trickiest new piece
 // (the `subscription_u` tag+payload reinterpretation) actually produces
-// correct bytes at runtime, or that a `#[fixed_layout]` record a *real* WASI
+// correct bytes at runtime, or that a `#[fixed_order]` record a *real* WASI
 // host writes lines up with the fields wx code reads back. `main` below
 // exercises both, plus a couple of representative calls from elsewhere in
 // the spec, and prints results instead of just asserting success so a
@@ -616,7 +616,7 @@ fn main() {
   };
   write_all(Fd::Stdout, "clock_time_get: ok\n");
   
-  // fd_fdstat_get: reads a #[fixed_layout] record back through a pointer a
+  // fd_fdstat_get: reads a #[fixed_order] record back through a pointer a
   // real host wrote into — proves the struct's byte layout actually lines
   // up, not just that wx accepted the declaration.
   local stat_ptr = alloc.alloc(Fdstat::{

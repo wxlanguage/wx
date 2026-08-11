@@ -3709,7 +3709,7 @@ impl<'ast> Builder<'ast, '_> {
 	// TODO: this silently drops unrecognized attribute names/values (the
 	// `_ => None` arm below) and never checks whether a resolved attribute
 	// is actually valid on the item kind it was attached to (e.g.
-	// `#[fixed_layout]` on a function, or `#[intrinsic]` on a struct) or
+	// `#[fixed_order]` on a function, or `#[intrinsic]` on a struct) or
 	// whether the same attribute appears more than once on one item.
 	// Add validation + diagnostics for unknown attributes, attributes used
 	// on the wrong item kind, and duplicates once this needs to be correct
@@ -3729,8 +3729,8 @@ impl<'ast> Builder<'ast, '_> {
 					(ast::AttributeValue::Word, Some("intrinsic")) => {
 						Some(ItemAttribute::Intrinsic)
 					}
-					(ast::AttributeValue::Word, Some("fixed_layout")) => {
-						Some(ItemAttribute::FixedLayout)
+					(ast::AttributeValue::Word, Some("fixed_order")) => {
+						Some(ItemAttribute::FixedOrder)
 					}
 					(ast::AttributeValue::NameValue(value), Some("tag")) => {
 						let raw =
@@ -3744,6 +3744,177 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			})
 			.collect()
+	}
+
+	/// Reads and validates a `#[memory_limits(min_pages = .., max_pages = ..)]`
+	/// attribute off a memory declaration. These are hints, not obligations —
+	/// codegen may still bump the emitted initial page count above
+	/// `min_pages` when static data requires it — so this only validates the
+	/// attribute's own shape, not anything about actual memory usage.
+	fn resolve_memory_limits_attribute(
+		&mut self,
+		file_id: FileId,
+		attributes: &[ast::Attribute],
+	) -> (Option<u32>, Option<u32>) {
+		let mut min_pages: Option<Spanned<u32>> = None;
+		let mut max_pages: Option<Spanned<u32>> = None;
+		let mut seen = false;
+
+		for attr in attributes {
+			if self.interner.resolve(attr.name.inner) != Some("memory_limits") {
+				continue;
+			}
+			if seen {
+				self.tir.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidMemoryLimitsAttribute.code(),
+						)
+						.with_message(
+							"duplicate `#[memory_limits(...)]` attribute",
+						)
+						.with_label(
+							SourceSpan::new(file_id, attr.name.span)
+								.primary_label(),
+						),
+				);
+				continue;
+			}
+			seen = true;
+
+			let args = match &attr.value {
+				ast::AttributeValue::Args(args) => args,
+				_ => {
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimitsAttribute
+									.code(),
+							)
+							.with_message(
+								"`#[memory_limits(...)]` requires parenthesized arguments",
+							)
+							.with_note(
+								"example: #[memory_limits(min_pages = 1, max_pages = 10)]",
+							)
+							.with_label(
+								SourceSpan::new(file_id, attr.name.span)
+									.primary_label(),
+							),
+					);
+					continue;
+				}
+			};
+
+			for entry in args.iter() {
+				let arg = &entry.inner.inner;
+				let arg_name =
+					self.interner.resolve(arg.name.inner).unwrap_or("");
+				let slot = match arg_name {
+					"min_pages" => &mut min_pages,
+					"max_pages" => &mut max_pages,
+					_ => {
+						self.tir.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::InvalidMemoryLimitsAttribute
+										.code(),
+								)
+								.with_message(format!(
+									"unknown `memory_limits` argument `{arg_name}`, expected `min_pages` or `max_pages`"
+								))
+								.with_label(
+									SourceSpan::new(file_id, arg.name.span)
+										.primary_label(),
+								),
+						);
+						continue;
+					}
+				};
+
+				let raw = match &arg.value {
+					ast::AttributeArgValue::Int(v) => v,
+					ast::AttributeArgValue::String(v) => {
+						self.tir.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::InvalidMemoryLimitsAttribute
+										.code(),
+								)
+								.with_message(format!(
+									"`{arg_name}` must be an integer"
+								))
+								.with_label(
+									SourceSpan::new(file_id, v.span)
+										.primary_label(),
+								),
+						);
+						continue;
+					}
+				};
+
+				if !(0..=u32::MAX as i64).contains(&raw.inner) {
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimitsAttribute
+									.code(),
+							)
+							.with_message(format!(
+								"`{arg_name}` must fit in a 32-bit unsigned integer"
+							))
+							.with_label(
+								SourceSpan::new(file_id, raw.span)
+									.primary_label(),
+							),
+					);
+					continue;
+				}
+
+				if slot.is_some() {
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimitsAttribute
+									.code(),
+							)
+							.with_message(format!(
+								"duplicate `{arg_name}` argument"
+							))
+							.with_label(
+								SourceSpan::new(file_id, arg.name.span)
+									.primary_label(),
+							),
+					);
+					continue;
+				}
+
+				*slot = Some(Spanned {
+					inner: raw.inner as u32,
+					span: raw.span,
+				});
+			}
+		}
+
+		if let (Some(min), Some(max)) = (&min_pages, &max_pages) {
+			if min.inner > max.inner {
+				self.tir.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidMemoryLimitsAttribute.code(),
+						)
+						.with_message(format!(
+							"`min_pages` ({}) cannot exceed `max_pages` ({})",
+							min.inner, max.inner
+						))
+						.with_label(
+							SourceSpan::new(file_id, min.span).primary_label(),
+						),
+				);
+			}
+		}
+
+		(min_pages.map(|s| s.inner), max_pages.map(|s| s.inner))
 	}
 
 	/// Returns the type params owned directly by `owner` (not including any
@@ -5232,7 +5403,7 @@ impl<'ast> Builder<'ast, '_> {
 					_ => unreachable!(),
 				};
 				// `Trait` has no `attributes` field of its own to store the
-				// result in — `#[inline]`/`#[intrinsic]`/`#[fixed_layout]`
+				// result in — `#[inline]`/`#[intrinsic]`/`#[fixed_order]`
 				// don't apply to traits, and `#[tag = "..."]` (the only one
 				// that does) works purely through the global
 				// `self.tir.tagged_items` map, populated as a side effect
@@ -5542,7 +5713,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					bound: kind,
 					id,
-					config,
+					attributes,
 				} = item
 				{
 					let kind_bounds =
@@ -5680,18 +5851,20 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					};
 
+					let (min_pages, max_pages) = self
+						.resolve_memory_limits_attribute(
+							resolve_context.file_id,
+							attributes,
+						);
+
 					let memory_index = self.tir.expect_memory_index(*id);
 					self.tir.memories[memory_index as usize] = Memory {
 						id: *id,
 						file_id: resolve_context.file_id,
 						size: memory_size,
 						name: *name,
-						min_pages: config.as_ref().and_then(|c| {
-							c.min_pages.as_ref().map(|s| s.inner)
-						}),
-						max_pages: config.as_ref().and_then(|c| {
-							c.max_pages.as_ref().map(|s| s.inner)
-						}),
+						min_pages,
+						max_pages,
 						accesses: Vec::new(),
 					};
 					let memory_type = self.intern_type(Type::Memory {
