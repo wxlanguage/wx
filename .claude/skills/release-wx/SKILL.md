@@ -116,8 +116,12 @@ anything is safe to trigger** — the two repos differ:
   with nothing to approve. Confirm gate presence/absence before creating the
   release, don't assume symmetry between repos.
 
-Watch the run: `gh run list --workflow=<file>.yml --limit 3` /
-`gh run view <id> --json status,conclusion`.
+The publish workflow triggers itself off the `release: published` event —
+`gh release create` above is enough to kick it off, don't also run
+`gh workflow run <file>.yml` by hand, that would start a second, redundant
+run. Just watch the one that already started: `gh run list
+--workflow=<file>.yml --limit 3` / `gh run view <id> --json
+status,conclusion`.
 
 If a release's workflow fails on a real bug (not the code being released,
 but the workflow/tooling itself): fix it on `main`, then **delete and
