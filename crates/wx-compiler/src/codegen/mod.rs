@@ -2,36 +2,11 @@ use std::collections::HashMap;
 
 use leb128fmt;
 
-use crate::{ast, mir};
-
-#[derive(Clone, Copy, PartialEq, Hash, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ValueType {
-	I32,
-	I64,
-	F32,
-	F64,
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum BlockResult {
-	Empty,
-	SingleValue(ValueType),
-	MultiValue(SignatureIndex),
-}
+use crate::wasm::{self, ScalarType};
+use crate::{ast, mir, vfs};
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct LocalIndex(pub u32);
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Local {
-	ty: ValueType,
-}
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct FuncIndex(pub u32);
@@ -44,146 +19,17 @@ pub struct GlobalIndex(pub u32);
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FunctionSignature {
 	pub param_count: usize,
-	pub param_results: Box<[ValueType]>,
+	pub param_results: Box<[ScalarType]>,
 }
 
 impl FunctionSignature {
-	pub fn params(&self) -> &[ValueType] {
+	pub fn params(&self) -> &[ScalarType] {
 		self.param_results.get(..self.param_count).unwrap_or(&[])
 	}
 
-	pub fn results(&self) -> &[ValueType] {
+	pub fn results(&self) -> &[ScalarType] {
 		self.param_results.get(self.param_count..).unwrap_or(&[])
 	}
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum Expression {
-	Nop,
-	I32Const {
-		value: i32,
-	},
-	I64Const {
-		value: i64,
-	},
-	F32Const {
-		value: f32,
-	},
-	F64Const {
-		value: f64,
-	},
-	LocalGet {
-		local_index: LocalIndex,
-	},
-	LocalSet {
-		local_index: LocalIndex,
-	},
-	GlobalGet {
-		global_index: GlobalIndex,
-	},
-	GlobalSet {
-		global: GlobalIndex,
-	},
-	Return,
-	Block {
-		expressions: Box<[Expression]>,
-		result: BlockResult,
-	},
-	Break {
-		depth: u32,
-	},
-	Unreachable,
-	Loop {
-		expressions: Box<[Expression]>,
-		result: BlockResult,
-	},
-	IfElse {
-		result: BlockResult,
-		then_branch: Box<Expression>,
-		else_branch: Option<Box<Expression>>,
-	},
-	Drop,
-	Call {
-		function: FuncIndex,
-	},
-	CallIndirect {
-		table_index: TableIndex,
-		type_index: SignatureIndex,
-	},
-	I32Add,
-	I32Sub,
-	I32Mul,
-	I32DivS,
-	I32DivU,
-	I32RemS,
-	I32RemU,
-	I32Eq,
-	I32Ne,
-	I32And,
-	I32Or,
-	I32Xor,
-	I32Eqz,
-	I32Shl,
-	I32ShrS,
-	I32ShrU,
-	I32LtS,
-	I32LtU,
-	I32GtS,
-	I32GtU,
-	I32LeS,
-	I32LeU,
-	I32GeS,
-	I32GeU,
-	I64Add,
-	I64Sub,
-	I64Mul,
-	I64DivS,
-	I64DivU,
-	I64RemS,
-	I64RemU,
-	I64Eq,
-	I64Eqz,
-	I64Ne,
-	I64And,
-	I64Or,
-	I64Xor,
-	I64Shl,
-	I64ShrS,
-	I64ShrU,
-	I64LtS,
-	I64LtU,
-	I64GtS,
-	I64GtU,
-	I64LeS,
-	I64LeU,
-	I64GeS,
-	I64GeU,
-	F32Add,
-	F32Sub,
-	F32Mul,
-	F64Add,
-	F64Sub,
-	F64Mul,
-	F32Eq,
-	F64Eq,
-	F32Ne,
-	F64Ne,
-	F32Lt,
-	F64Lt,
-	F32Gt,
-	F64Gt,
-	F32Le,
-	F64Le,
-	F32Ge,
-	F64Ge,
-	F32Div,
-	F64Div,
-	F32Neg,
-	F64Neg,
-	F32Trunc,
-	F64Trunc,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -224,10 +70,51 @@ pub struct ExportSection {
 	items: Box<[ExportItem]>,
 }
 
+/// One instruction's source position. `offset` starts out relative to the
+/// start of its own function's `expressions` bytes (set by
+/// `Builder::encode_scheduled`, the only place that still has both the
+/// instruction and its span together) and is corrected in place — `offset
+/// += <where my buffer landed in my caller's>` — as it passes up through
+/// `FunctionBody::encode_with_debug_spans` and
+/// `CodeSection::encode_with_debug_spans`, ending up absolute within the
+/// fully encoded module.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy)]
+pub struct DebugSpan {
+	pub offset: u32,
+	pub file_id: vfs::FileId,
+	pub span: ast::TextSpan,
+}
+
+/// One function's absolute byte range within the encoded module, plus its
+/// declared locals resolved to wasm-local indices — everything about a
+/// function that's only knowable during encoding (`start`/`end`, corrected
+/// to absolute module offsets the same way `DebugSpan.offset` is) or only
+/// available transiently during scheduling (`locals`, from
+/// `wasm::Function`, which is otherwise dropped once `encode_scheduled`
+/// consumes it). Deliberately doesn't carry the function's name, and uses
+/// plain byte-offset terms rather than DWARF's `low_pc`/`high_pc`
+/// vocabulary: the caller already has `&mir::MIR` (whose
+/// `mir.functions[i].name` lines up index-for-index with this) and knows
+/// what it's going to do with these facts — codegen doesn't need to know
+/// anything about that (e.g. DWARF).
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone)]
+pub struct FunctionDebugInfo {
+	pub start: u32,
+	pub end: u32,
+	pub locals: Vec<wasm::LocalDebugInfo>,
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionBody {
-	locals: Box<[Local]>,
+	locals: Box<[wasm::Local]>,
 	expressions: Box<[u8]>,
+	/// One entry per instruction in `expressions`. Empty outside `--debug`
+	/// builds; see `wasm::Function::spans`.
+	debug_spans: Vec<DebugSpan>,
+	/// Empty outside `--debug` builds; see `wasm::Function::locals_debug`.
+	locals_debug: Vec<wasm::LocalDebugInfo>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -284,9 +171,11 @@ pub enum Mutability {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 struct Global {
-	ty: ValueType,
+	ty: ScalarType,
 	mutability: Mutability,
-	value: Expression,
+	/// Only the four `*Const` variants are valid WASM global init
+	/// expressions; anything else is a construction bug upstream.
+	value: crate::wasm::Instruction,
 }
 
 #[derive(Clone)]
@@ -296,7 +185,7 @@ pub enum ImportDesc {
 		signature_index: SignatureIndex,
 	},
 	Global {
-		ty: ValueType,
+		ty: ScalarType,
 		mutability: Mutability,
 	},
 	Memory {
@@ -344,7 +233,10 @@ struct MemoryEntry {
 	static_size: u32,
 }
 
-pub struct Builder {
+pub struct Builder<'a> {
+	/// The MIR being encoded — fixed for the whole module, so it lives here
+	/// once instead of being re-passed to every encoding call.
+	mir: &'a mir::MIR,
 	table: Vec<FuncIndex>,
 	/// Byte offset of each live static entry in the assembled data segment.
 	/// Keyed by `MIR.static_entries` index.
@@ -365,50 +257,7 @@ pub struct Builder {
 	signatures: HashMap<FunctionSignature, SignatureIndex>,
 }
 
-impl TryFrom<mir::Type> for ValueType {
-	type Error = ();
-
-	fn try_from(value: mir::Type) -> Result<Self, Self::Error> {
-		match value {
-			mir::Type::Bool
-			| mir::Type::I8
-			| mir::Type::U8
-			| mir::Type::I16
-			| mir::Type::U16
-			| mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Function { .. } => Ok(ValueType::I32),
-			mir::Type::I64 | mir::Type::U64 => Ok(ValueType::I64),
-			mir::Type::Pointer { kind, .. } => match kind {
-				mir::MemoryKind::Memory32 => Ok(ValueType::I32),
-				mir::MemoryKind::Memory64 => Ok(ValueType::I64),
-			},
-			mir::Type::F32 => Ok(ValueType::F32),
-			mir::Type::F64 => Ok(ValueType::F64),
-			_ => unreachable!(),
-		}
-	}
-}
-
-impl Builder {
-	/// Recursively expand a MIR type into its flat wasm `ValueType`s.
-	/// Unit/Never produce zero slots; Aggregate recurses into its fields.
-	fn flatten_type(
-		ty: mir::Type,
-		aggregates: &[mir::Aggregate],
-	) -> Vec<ValueType> {
-		match ty {
-			mir::Type::Unit | mir::Type::Never => vec![],
-			mir::Type::Aggregate { aggregate_index } => aggregates
-				[aggregate_index as usize]
-				.values
-				.iter()
-				.flat_map(|&f| Self::flatten_type(f, aggregates))
-				.collect(),
-			t => vec![ValueType::try_from(t).unwrap()],
-		}
-	}
-
+impl<'a> Builder<'a> {
 	/// Intern a function signature built from a MIR signature + the aggregate
 	/// pool, correctly flattening any aggregate params/results into
 	/// individual wasm types.
@@ -419,10 +268,15 @@ impl Builder {
 	) -> SignatureIndex {
 		let mut param_results = Vec::new();
 		for &param in sig.params() {
-			param_results.extend(Self::flatten_type(param, aggregates));
+			param_results.extend(crate::wasm::flatten_type_to_scalars(
+				param, aggregates,
+			));
 		}
 		let param_count = param_results.len();
-		param_results.extend(Self::flatten_type(sig.result(), aggregates));
+		param_results.extend(crate::wasm::flatten_type_to_scalars(
+			sig.result(),
+			aggregates,
+		));
 		let signature = FunctionSignature {
 			param_count,
 			param_results: param_results.into_boxed_slice(),
@@ -432,8 +286,9 @@ impl Builder {
 	}
 
 	pub fn build(
-		mir: &mir::MIR,
+		mir: &'a mir::MIR,
 		interner: &ast::StringInterner,
+		mode: crate::CompilationMode,
 	) -> Result<WasmModule, ()> {
 		// Layout static data segment: collect live entries from all functions,
 		// sort largest-align-first for minimal padding, then lay out bytes.
@@ -463,6 +318,7 @@ impl Builder {
 		}
 
 		let mut builder = Builder {
+			mir,
 			table: Vec::new(),
 			entry_offsets,
 			func_wasm_index: HashMap::new(),
@@ -523,7 +379,7 @@ impl Builder {
 							module: import_module.name.clone(),
 							name: interner.resolve(*name).unwrap().to_string(),
 							desc: ImportDesc::Global {
-								ty: ValueType::I32,
+								ty: ScalarType::I32,
 								mutability: Mutability::Immutable,
 							},
 						});
@@ -590,10 +446,17 @@ impl Builder {
 			);
 			function_signatures.push(signature_index);
 
-			let opt_func = crate::opt::builder::Builder::build(mir, func);
-			let scheduled =
-				crate::opt::scheduler::Scheduler::schedule(&opt_func, mir);
-			let body = builder.encode_scheduled(&scheduled, mir);
+			let scheduled = match mode {
+				crate::CompilationMode::Release => {
+					let opt_func =
+						crate::opt::builder::Builder::build(mir, func);
+					crate::opt::scheduler::Scheduler::schedule(&opt_func, mir)
+				}
+				crate::CompilationMode::Debug => {
+					crate::mir::scheduler::schedule(func, mir)
+				}
+			};
+			let body = builder.encode_scheduled(scheduled, func.file_id);
 
 			functions.push(body);
 		}
@@ -605,24 +468,24 @@ impl Builder {
 				.map(|global| {
 					let init_value = match (
 						global.const_init,
-						ValueType::try_from(global.ty).unwrap(),
+						ScalarType::try_from(global.ty).unwrap(),
 					) {
-						(mir::ConstInit::Int(v), ValueType::I32) => {
-							Expression::I32Const { value: v as i32 }
+						(mir::ConstInit::Int(v), ScalarType::I32) => {
+							crate::wasm::Instruction::I32Const(v as i32)
 						}
-						(mir::ConstInit::Int(v), ValueType::I64) => {
-							Expression::I64Const { value: v }
+						(mir::ConstInit::Int(v), ScalarType::I64) => {
+							crate::wasm::Instruction::I64Const(v)
 						}
-						(mir::ConstInit::Float(v), ValueType::F32) => {
-							Expression::F32Const { value: v as f32 }
+						(mir::ConstInit::Float(v), ScalarType::F32) => {
+							crate::wasm::Instruction::F32Const(v as f32)
 						}
-						(mir::ConstInit::Float(v), ValueType::F64) => {
-							Expression::F64Const { value: v }
+						(mir::ConstInit::Float(v), ScalarType::F64) => {
+							crate::wasm::Instruction::F64Const(v)
 						}
 						_ => unreachable!(),
 					};
 					Global {
-						ty: ValueType::try_from(global.ty).unwrap(),
+						ty: ScalarType::try_from(global.ty).unwrap(),
 						mutability: match global.mutability {
 							mir::Mutability::Mutable => Mutability::Mutable,
 							mir::Mutability::Immutable => Mutability::Immutable,
@@ -742,35 +605,45 @@ impl Builder {
 	/// pools already built on `self`.
 	fn encode_scheduled(
 		&mut self,
-		scheduled: &crate::opt::scheduler::ScheduledFunction,
-		mir: &mir::MIR,
+		func: wasm::Function,
+		file_id: vfs::FileId,
 	) -> FunctionBody {
-		let locals: Box<[Local]> = scheduled
-			.locals
-			.iter()
-			.map(|l| Local {
-				ty: ValueType::from(l.ty),
-			})
-			.collect();
-
+		// `spans` is either empty (opt::scheduler's Release output) or
+		// exactly `body`-length (mir::scheduler's --debug output) — never
+		// partially populated, so indexing by position is safe here.
+		let has_spans = !func.spans.is_empty();
 		let mut sink = Vec::new();
-		for instr in scheduled.body.iter().cloned() {
-			self.encode_scheduled_instr(instr, mir, &mut sink);
+		let mut debug_spans = Vec::new();
+		for (i, instr) in func.body.iter().cloned().enumerate() {
+			if has_spans {
+				debug_spans.push(DebugSpan {
+					offset: sink.len() as u32,
+					file_id,
+					span: func.spans[i],
+				});
+			}
+			self.encode_scheduled_instr(
+				instr,
+				&func.br_table_depths,
+				&mut sink,
+			);
 		}
 
 		FunctionBody {
-			locals,
+			locals: func.locals.into_boxed_slice(),
 			expressions: sink.into_boxed_slice(),
+			debug_spans,
+			locals_debug: func.locals_debug,
 		}
 	}
 
 	fn encode_scheduled_instr(
 		&mut self,
-		instr: crate::opt::scheduler::Instruction,
-		mir: &mir::MIR,
+		instr: crate::wasm::Instruction,
+		br_table_depths: &[u32],
 		sink: &mut Vec<u8>,
 	) {
-		use crate::opt::scheduler::Instruction as SI;
+		use crate::wasm::Instruction as SI;
 		match instr {
 			SI::I32Const(v) => {
 				sink.push(Instruction::I32Const as u8);
@@ -892,15 +765,15 @@ impl Builder {
 			SI::F64Ge => sink.push(Instruction::F64Ge as u8),
 			SI::Block { ty } => {
 				sink.push(Instruction::Block as u8);
-				Self::encode_block_type(ty, sink);
+				self.encode_block_type(ty, sink);
 			}
 			SI::Loop { ty } => {
 				sink.push(Instruction::Loop as u8);
-				Self::encode_block_type(ty, sink);
+				self.encode_block_type(ty, sink);
 			}
 			SI::If { ty } => {
 				sink.push(Instruction::If as u8);
-				Self::encode_block_type(ty, sink);
+				self.encode_block_type(ty, sink);
 			}
 			SI::Else => sink.push(Instruction::Else as u8),
 			SI::End => sink.push(Instruction::End as u8),
@@ -912,13 +785,14 @@ impl Builder {
 				sink.push(Instruction::BrIf as u8);
 				depth.encode(sink);
 			}
-			SI::BrTable(depths) => {
+			SI::BrTable { start, len } => {
 				sink.push(Instruction::BrTable as u8);
 				// WASM's `br_table` encodes as `vec(labelidx) labelidx` — a
-				// table of length `depths.len() - 1` followed by the
-				// default depth as a separate trailing immediate. The
-				// scheduler folds both into one slice (its trailing element
-				// *is* the default) since both stages need the same split.
+				// table followed by the default depth as a separate trailing
+				// immediate. The scheduler's range's last element *is* the
+				// default, since both stages need the same split.
+				let depths =
+					&br_table_depths[start as usize..(start + len) as usize];
 				let (default_depth, table) =
 					depths.split_last().expect("BrTable is never empty");
 				(table.len() as u32).encode(sink);
@@ -935,10 +809,10 @@ impl Builder {
 				sink.push(Instruction::Call as u8);
 				wasm_idx.encode(sink);
 			}
-			SI::CallIndirectSym { mir_sig_index } => {
+			SI::CallIndirectSym { signature_index } => {
 				let type_index = self.register_signature(
-					&mir.signatures[mir_sig_index as usize],
-					&mir.aggregates,
+					&self.mir.signatures[signature_index as usize],
+					&self.mir.aggregates,
 				);
 				sink.push(Instruction::CallIndirect as u8);
 				type_index.0.encode(sink);
@@ -1106,7 +980,7 @@ impl Builder {
 			SI::StaticDataPointer { data_index, ty } => {
 				let offset = self.entry_offsets[&data_index];
 				match ty {
-					crate::opt::ScalarType::I64 => {
+					crate::wasm::ScalarType::I64 => {
 						sink.push(Instruction::I64Const as u8);
 						(offset as i64).encode(sink);
 					}
@@ -1133,13 +1007,21 @@ impl Builder {
 	}
 
 	fn encode_block_type(
-		ty: crate::opt::scheduler::BlockType,
+		&mut self,
+		ty: crate::wasm::BlockType,
 		sink: &mut Vec<u8>,
 	) {
-		use crate::opt::scheduler::BlockType;
+		use crate::wasm::BlockType;
 		match ty {
 			BlockType::Empty => sink.push(0x40),
 			BlockType::Value(vt) => vt.encode(sink),
+			BlockType::MultiValue(signature_index) => {
+				let type_index = self.register_signature(
+					&self.mir.signatures[signature_index as usize],
+					&self.mir.aggregates,
+				);
+				type_index.0.encode(sink);
+			}
 		}
 	}
 }
@@ -1441,28 +1323,16 @@ impl Encode for u32 {
 	}
 }
 
-impl Encode for ValueType {
+impl Encode for ScalarType {
 	fn encode(&self, sink: &mut Vec<u8>) {
 		let opcode = match self {
-			ValueType::I32 => 0x7F,
-			ValueType::I64 => 0x7E,
-			ValueType::F32 => 0x7D,
-			ValueType::F64 => 0x7C,
+			ScalarType::I32 => 0x7F,
+			ScalarType::I64 => 0x7E,
+			ScalarType::F32 => 0x7D,
+			ScalarType::F64 => 0x7C,
 		};
 
 		sink.push(opcode);
-	}
-}
-
-impl Encode for BlockResult {
-	fn encode(&self, sink: &mut Vec<u8>) {
-		match self {
-			BlockResult::Empty => sink.push(0x40),
-			BlockResult::SingleValue(ty) => ty.encode(sink),
-			// Multi-value block types are encoded as a type-section index (s33).
-			// Type indices are always small positive integers, so s33 == u32 LEB128.
-			BlockResult::MultiValue(idx) => idx.0.encode(sink),
-		}
 	}
 }
 
@@ -1616,19 +1486,19 @@ impl Encode for Global {
 		});
 
 		match self.value {
-			Expression::I32Const { value } => {
+			crate::wasm::Instruction::I32Const(value) => {
 				sink.push(Instruction::I32Const as u8);
 				value.encode(sink);
 			}
-			Expression::F32Const { value } => {
+			crate::wasm::Instruction::F32Const(value) => {
 				sink.push(Instruction::F32Const as u8);
 				value.encode(sink);
 			}
-			Expression::I64Const { value } => {
+			crate::wasm::Instruction::I64Const(value) => {
 				sink.push(Instruction::I64Const as u8);
 				value.encode(sink);
 			}
-			Expression::F64Const { value } => {
+			crate::wasm::Instruction::F64Const(value) => {
 				sink.push(Instruction::F64Const as u8);
 				value.encode(sink);
 			}
@@ -1667,19 +1537,11 @@ impl Encode for StartSection {
 }
 
 impl FunctionBody {
-	fn encode(
-		&self,
-		sink: &mut Vec<u8>,
-		module: &WasmModule,
-		func_index: FuncIndex,
-	) {
-		let mut body_content: Vec<u8> = Vec::new();
+	fn encode_locals(&self, param_count: usize) -> Vec<u8> {
+		let mut sink = Vec::new();
 
-		let type_index = module.functions.types[func_index.0 as usize];
-		let func_type = module.types.signatures[type_index.0 as usize].clone();
-
-		let mut grouped_locals = Vec::<(ValueType, u32)>::new();
-		for local in self.locals.iter().skip(func_type.param_count) {
+		let mut grouped_locals = Vec::<(ScalarType, u32)>::new();
+		for local in self.locals.iter().skip(param_count) {
 			match grouped_locals.last_mut() {
 				Some((last_ty, count)) if *last_ty == local.ty => {
 					*count += 1;
@@ -1690,12 +1552,66 @@ impl FunctionBody {
 			}
 		}
 
-		(grouped_locals.len() as u32).encode(&mut body_content);
+		(grouped_locals.len() as u32).encode(&mut sink);
 		for (group_type, count) in grouped_locals {
-			count.encode(&mut body_content);
-			group_type.encode(&mut body_content);
+			count.encode(&mut sink);
+			group_type.encode(&mut sink);
 		}
 
+		sink
+	}
+
+	/// Plain encode — returns nothing, never touches `debug_spans`.
+	fn encode(
+		&self,
+		sink: &mut Vec<u8>,
+		module: &WasmModule,
+		func_index: FuncIndex,
+	) {
+		self.encode_body(sink, module, func_index);
+	}
+
+	/// Same as `encode`, but also returns `self.debug_spans` and a
+	/// `FunctionDebugInfo` for this function, both corrected to offsets
+	/// relative to `sink` (the caller still needs to add where `sink`
+	/// itself lands in its own caller, exactly as
+	/// `CodeSection::encode_with_debug_spans` does).
+	fn encode_with_debug_spans(
+		&self,
+		sink: &mut Vec<u8>,
+		module: &WasmModule,
+		func_index: FuncIndex,
+	) -> (Vec<DebugSpan>, FunctionDebugInfo) {
+		let expr_start = self.encode_body(sink, module, func_index);
+		let mut spans = self.debug_spans.clone();
+		for span in &mut spans {
+			span.offset += expr_start;
+		}
+		let info = FunctionDebugInfo {
+			start: expr_start,
+			end: expr_start + self.expressions.len() as u32,
+			locals: self.locals_debug.clone(),
+		};
+		(spans, info)
+	}
+
+	/// Writes the actual body bytes, returning where `expressions`' first
+	/// byte lands in `sink` — the one piece of position information
+	/// `debug_spans`' offsets (relative to `expressions`) still need to
+	/// become absolute. Computed from values already needed for the real
+	/// encoding (`body_content`'s length up to that point, and `sink`'s
+	/// length right before it's extended), not re-derived separately.
+	fn encode_body(
+		&self,
+		sink: &mut Vec<u8>,
+		module: &WasmModule,
+		func_index: FuncIndex,
+	) -> u32 {
+		let type_index = module.functions.types[func_index.0 as usize];
+		let func_type = module.types.signatures[type_index.0 as usize].clone();
+
+		let mut body_content = self.encode_locals(func_type.param_count);
+		let locals_offset = body_content.len() as u32;
 		body_content.extend_from_slice(
 			&module.code.functions[func_index.0 as usize].expressions,
 		);
@@ -1703,15 +1619,16 @@ impl FunctionBody {
 
 		let body_size = body_content.len() as u32;
 		body_size.encode(sink);
+		let body_start = sink.len() as u32;
 		sink.extend_from_slice(&body_content);
+
+		body_start + locals_offset
 	}
 }
 
-trait ContextEncode {
-	fn encode(&self, sink: &mut Vec<u8>, module: &WasmModule);
-}
-
-impl ContextEncode for CodeSection {
+impl CodeSection {
+	/// Plain encode — never touches `debug_spans`, so a `--debug` module
+	/// encoded this way pays nothing for spans it wasn't asked to resolve.
 	fn encode(&self, sink: &mut Vec<u8>, module: &WasmModule) {
 		sink.push(SectionId::Code as u8);
 
@@ -1725,6 +1642,48 @@ impl ContextEncode for CodeSection {
 		let section_size = section_sink.len() as u32;
 		section_size.encode(sink);
 		sink.extend_from_slice(&section_sink);
+	}
+
+	/// Same as `encode`, but also returns every function's `debug_spans` and
+	/// `FunctionDebugInfo`, corrected to offsets relative to `sink` (the
+	/// caller still needs to add where `sink` itself lands in its own
+	/// caller, exactly as `WasmModule::encode_with_debug_spans` does).
+	fn encode_with_debug_spans(
+		&self,
+		sink: &mut Vec<u8>,
+		module: &WasmModule,
+	) -> (Vec<DebugSpan>, Vec<FunctionDebugInfo>) {
+		sink.push(SectionId::Code as u8);
+
+		let mut section_sink: Vec<u8> = Vec::new();
+		let function_count = self.functions.len() as u32;
+		function_count.encode(&mut section_sink);
+
+		let mut spans = Vec::new();
+		let mut infos = Vec::with_capacity(self.functions.len());
+		for (index, func) in self.functions.iter().enumerate() {
+			let (func_spans, info) = func.encode_with_debug_spans(
+				&mut section_sink,
+				module,
+				FuncIndex(index as u32),
+			);
+			spans.extend(func_spans);
+			infos.push(info);
+		}
+
+		let section_size = section_sink.len() as u32;
+		section_size.encode(sink);
+		let content_start = sink.len() as u32;
+		sink.extend_from_slice(&section_sink);
+
+		for s in &mut spans {
+			s.offset += content_start;
+		}
+		for info in &mut infos {
+			info.start += content_start;
+			info.end += content_start;
+		}
+		(spans, infos)
 	}
 }
 
@@ -1927,52 +1886,81 @@ impl Encode for Memory {
 }
 
 impl WasmModule {
-	pub fn encode(&self) -> Vec<u8> {
-		let mut sink = [
+	/// Every section that precedes Code, appended to `sink` — shared by
+	/// `encode` and `encode_with_debug_spans`, since neither needs anything
+	/// module-specific about how this part is written.
+	fn write_preamble(&self, sink: &mut Vec<u8>) {
+		sink.extend_from_slice(&[
 			0x00, 0x61, 0x73, 0x6D, // Magic
 			0x01, 0x00, 0x00, 0x00, // Version
-		]
-		.to_vec();
+		]);
 
-		self.types.encode(&mut sink);
+		self.types.encode(sink);
 		match self.imports.imports.len() {
 			0 => {}
-			_ => self.imports.encode(&mut sink),
+			_ => self.imports.encode(sink),
 		}
 		match self.functions.types.len() {
 			0 => {}
-			_ => self.functions.encode(&mut sink),
+			_ => self.functions.encode(sink),
 		}
 		match self.tables.tables.len() {
 			0 => {}
-			_ => self.tables.encode(&mut sink),
+			_ => self.tables.encode(sink),
 		}
 		match self.memory.memories.len() {
 			0 => {}
-			_ => self.memory.encode(&mut sink),
+			_ => self.memory.encode(sink),
 		}
 		match self.globals.globals.len() {
 			0 => {}
-			_ => self.globals.encode(&mut sink),
+			_ => self.globals.encode(sink),
 		}
 		match self.exports.items.len() {
 			0 => {}
-			_ => self.exports.encode(&mut sink),
+			_ => self.exports.encode(sink),
 		}
 		if let Some(ref start) = self.start {
-			start.encode(&mut sink);
+			start.encode(sink);
 		}
 		match self.elements.segments.len() {
 			0 => {}
-			_ => self.elements.encode(&mut sink),
+			_ => self.elements.encode(sink),
 		}
-		self.code.encode(&mut sink, self);
+	}
+
+	fn write_data_section(&self, sink: &mut Vec<u8>) {
 		match self.data.segments.len() {
 			0 => {}
-			_ => self.data.encode(&mut sink),
+			_ => self.data.encode(sink),
 		}
+	}
 
+	/// Plain encode — routes through `CodeSection::encode`, which never
+	/// touches `debug_spans`, so this pays nothing for spans it wasn't asked
+	/// to resolve even when the module is a `--debug` build.
+	pub fn encode(&self) -> Vec<u8> {
+		let mut sink = Vec::new();
+		self.write_preamble(&mut sink);
+		self.code.encode(&mut sink, self);
+		self.write_data_section(&mut sink);
 		sink
+	}
+
+	/// Same as `encode`, but also returns every `--debug` instruction's span
+	/// and every function's `FunctionDebugInfo`, resolved to absolute
+	/// offsets into the returned bytes — both empty for a
+	/// `CompilationMode::Release` module, since only `mir::scheduler`
+	/// populates `FunctionBody::debug_spans`/`locals_debug`.
+	pub fn encode_with_debug_spans(
+		&self,
+	) -> (Vec<u8>, Vec<DebugSpan>, Vec<FunctionDebugInfo>) {
+		let mut sink = Vec::new();
+		self.write_preamble(&mut sink);
+		let (debug_spans, function_debug_info) =
+			self.code.encode_with_debug_spans(&mut sink, self);
+		self.write_data_section(&mut sink);
+		(sink, debug_spans, function_debug_info)
 	}
 }
 

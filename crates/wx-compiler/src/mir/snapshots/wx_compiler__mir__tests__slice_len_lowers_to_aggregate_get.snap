@@ -13,6 +13,7 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -25,8 +26,16 @@ functions:
                   local_index: 0
                   value_index: 1
               ty: U32
+              span:
+                start: 92
+                end: 104
       ty: U32
+      span:
+        start: 86
+        end: 106
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Aggregate:

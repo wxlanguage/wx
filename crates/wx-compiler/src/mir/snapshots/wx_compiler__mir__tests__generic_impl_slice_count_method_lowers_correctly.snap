@@ -13,6 +13,7 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -28,6 +29,9 @@ functions:
                     ty:
                       Function:
                         signature_index: 0
+                    span:
+                      start: 195
+                      end: 204
                   arguments:
                     - kind:
                         LocalGet:
@@ -36,9 +40,20 @@ functions:
                       ty:
                         Aggregate:
                           aggregate_index: 0
+                      span:
+                        start: 195
+                        end: 196
               ty: U32
+              span:
+                start: 195
+                end: 204
       ty: U32
+      span:
+        start: 189
+        end: 206
     static_data: []
+    file_id: 1
+    name: ~
   - id: 114
     signature_index: 0
     scopes:
@@ -49,6 +64,7 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -61,8 +77,16 @@ functions:
                   local_index: 0
                   value_index: 1
               ty: U32
+              span:
+                start: 127
+                end: 142
       ty: U32
+      span:
+        start: 117
+        end: 148
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Aggregate:

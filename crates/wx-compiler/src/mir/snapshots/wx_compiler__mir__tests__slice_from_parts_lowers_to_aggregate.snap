@@ -16,6 +16,7 @@ functions:
             mutability: Immutable
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result:
           Aggregate:
             aggregate_index: 0
@@ -35,18 +36,32 @@ functions:
                         Pointer:
                           memory: 106
                           kind: Memory32
+                      span:
+                        start: 127
+                        end: 130
                     - kind:
                         LocalGet:
                           scope_index: 0
                           local_index: 1
                       ty: U32
+                      span:
+                        start: 132
+                        end: 135
               ty:
                 Aggregate:
                   aggregate_index: 0
+              span:
+                start: 110
+                end: 136
       ty:
         Aggregate:
           aggregate_index: 0
+      span:
+        start: 104
+        end: 138
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Pointer:

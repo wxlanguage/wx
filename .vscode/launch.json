@@ -1,0 +1,43 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "wasmtime: debug dwarf-playground/program.wasm",
+			"type": "lldb",
+			"request": "launch",
+			"program": "/opt/homebrew/bin/wasmtime",
+			"args": [
+				"run",
+				"-D",
+				"debug-info=y",
+				"--invoke",
+				"compute",
+				"program.wasm",
+				"5"
+			],
+			// Deliberately no `-O opt-level=0`: at that opt level, any local
+			// with a multi-field (DW_OP_piece-composite) location — i.e. any
+			// struct local, and program.wx has one — crashes wasmtime's own
+			// DWARF transform (see wasmtime-dwarf-transform-bug.md, "Bug 3").
+			// Default opt level avoids that path; the tradeoff is some
+			// scalar locals show "optimized out" right at a function's
+			// entry (normal — becomes available a few instructions in).
+			"cwd": "${workspaceFolder}/dwarf-playground",
+			"stopOnEntry": false,
+			"initCommands": [
+				// Required on macOS for lldb to pick up the GDB/LLDB JIT
+				// interface that wasmtime uses to register debug info for
+				// the JIT-compiled module at runtime.
+				"settings set plugin.jit-loader.gdb.enable on",
+				// Our DWARF's compile-unit directory is a bare "." (see
+				// dwarf/mod.rs's LineProgramBuilder — there's no real
+				// directory/filename split to model for a single-file
+				// build). lldb resolves that "." against its *own* cwd,
+				// not the debuggee's `cwd` above, so without this it can't
+				// find program.wx on disk and falls back to disassembly
+				// view even though the line-table resolution is correct.
+				"settings set target.source-map . ${workspaceFolder}/dwarf-playground"
+			]
+		}
+	]
+}

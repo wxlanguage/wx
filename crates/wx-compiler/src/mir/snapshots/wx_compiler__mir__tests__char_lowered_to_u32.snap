@@ -11,6 +11,7 @@ functions:
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -22,8 +23,16 @@ functions:
                   scope_index: 0
                   local_index: 0
               ty: U32
+              span:
+                start: 47
+                end: 48
       ty: U32
+      span:
+        start: 41
+        end: 50
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - U32

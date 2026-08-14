@@ -11,18 +11,22 @@ functions:
         locals:
           - ty: I32
             mutability: Immutable
+        locals_debug: []
         result: I32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: I32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: I32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: I32
     block:
       kind:
@@ -37,6 +41,9 @@ functions:
                         scope_index: 0
                         local_index: 0
                     ty: I32
+                    span:
+                      start: 47
+                      end: 48
                   cases:
                     - - 0
                       - kind:
@@ -47,7 +54,13 @@ functions:
                                   Int:
                                     value: 0
                                 ty: I32
+                                span:
+                                  start: 66
+                                  end: 67
                         ty: I32
+                        span:
+                          start: 64
+                          end: 69
                     - - 1
                       - kind:
                           Block:
@@ -57,7 +70,13 @@ functions:
                                   Int:
                                     value: 1
                                 ty: I32
+                                span:
+                                  start: 86
+                                  end: 87
                         ty: I32
+                        span:
+                          start: 84
+                          end: 89
                   default:
                     kind:
                       Block:
@@ -70,11 +89,28 @@ functions:
                                     Int:
                                       value: 1
                                   ty: I32
+                                  span:
+                                    start: 107
+                                    end: 108
                             ty: I32
+                            span:
+                              start: 106
+                              end: 108
                     ty: I32
+                    span:
+                      start: 104
+                      end: 110
               ty: I32
+              span:
+                start: 41
+                end: 117
       ty: I32
+      span:
+        start: 35
+        end: 119
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - I32

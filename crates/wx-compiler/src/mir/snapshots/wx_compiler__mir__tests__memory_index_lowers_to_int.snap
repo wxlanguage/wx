@@ -9,6 +9,7 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -19,8 +20,16 @@ functions:
                 MemoryIndex:
                   memory: 106
               ty: U32
+              span:
+                start: 79
+                end: 97
       ty: U32
+      span:
+        start: 73
+        end: 99
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - U32

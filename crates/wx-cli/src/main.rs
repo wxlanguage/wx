@@ -39,6 +39,12 @@ fn main() {
 							 for stdout (default: <input>.wasm)",
 						),
 				)
+				.arg(
+					clap::Arg::new("debug")
+						.long("debug")
+						.action(clap::ArgAction::SetTrue)
+						.help("Skip optimizations"),
+				)
 				.arg(message_format.clone()),
 		)
 		.subcommand(
@@ -65,7 +71,12 @@ fn main() {
 			let format = parse_message_format(
 				sub.get_one::<String>("message-format").unwrap(),
 			);
-			cmd_compile(path, output, format);
+			let mode = if sub.get_flag("debug") {
+				CompilationMode::Debug
+			} else {
+				CompilationMode::Release
+			};
+			cmd_compile(path, output, format, mode);
 		}
 		Some(("check", sub)) => {
 			let path = sub.get_one::<String>("path").unwrap();
@@ -242,7 +253,12 @@ fn abort_if_errors(count: usize) {
 	std::process::exit(1);
 }
 
-fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
+fn cmd_compile(
+	file_path: &str,
+	output: Option<&str>,
+	format: MessageFormat,
+	mode: CompilationMode,
+) {
 	let mut compilation = load_compilation(file_path);
 
 	for crate_graph in &compilation.crates {
@@ -266,12 +282,26 @@ fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
 			.count(),
 	);
 
-	let mir =
-		mir::MIR::build(&tir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner).unwrap();
-	let bytecode = module.encode();
+	let mut mir = mir::MIR::build(
+		&tir,
+		&compilation.interner,
+		compilation.id_generator,
+		mode,
+	);
+	let mut graph = mir::CallGraph::build(&mir.functions, &mir.call_edges);
+	if mode == CompilationMode::Release {
+		mir.inline_calls(&mut graph);
+	}
+	mir.dead_code_eliminate(&graph);
+	let module =
+		codegen::Builder::build(&mir, &compilation.interner, mode).unwrap();
 
 	if output == Some("-") {
+		// No debug info for stdout output, regardless of mode — same
+		// reasoning as `--debug` always being self-contained for file
+		// output: nothing here would have anywhere to attribute embedded
+		// DWARF, since there's no file path to reason about.
+		let bytecode = module.encode();
 		std::io::stdout().write_all(&bytecode).unwrap();
 		return;
 	}
@@ -280,6 +310,34 @@ fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
 		Some(path) => path.to_string(),
 		None => format!("{}.wasm", output_stem(file_path)),
 	};
+
+	let bytecode = match mode {
+		CompilationMode::Release => module.encode(),
+		CompilationMode::Debug => {
+			let (mut bytecode, debug_spans, function_debug_info) =
+				module.encode_with_debug_spans();
+			let sections = dwarf::build(
+				&debug_spans,
+				&function_debug_info,
+				&mir,
+				&compilation.interner,
+				&compilation.files,
+			);
+			for (name, payload) in [
+				(".debug_abbrev", &sections.debug_abbrev),
+				(".debug_info", &sections.debug_info),
+				(".debug_line", &sections.debug_line),
+				(".debug_str", &sections.debug_str),
+				(".debug_line_str", &sections.debug_line_str),
+				(".debug_aranges", &sections.debug_aranges),
+			] {
+				bytecode
+					.extend_from_slice(&dwarf::custom_section(name, payload));
+			}
+			bytecode
+		}
+	};
+
 	let mut file = fs::File::create(&out_path).unwrap();
 	file.write_all(&bytecode).unwrap();
 	eprintln!("Wrote {} bytes to {out_path}", bytecode.len());

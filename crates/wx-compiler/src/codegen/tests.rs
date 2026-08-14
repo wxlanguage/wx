@@ -66,8 +66,22 @@ impl TestCase {
 			}
 			std::process::exit(1);
 		}
-		let mir = mir::MIR::build(&tir, &graph.interner, graph.id_generator);
-		let wasm = Builder::build(&mir, &graph.interner).unwrap();
+		let mut mir = mir::MIR::build(
+			&tir,
+			&graph.interner,
+			graph.id_generator,
+			crate::CompilationMode::Release,
+		);
+		let mut call_graph =
+			mir::CallGraph::build(&mir.functions, &mir.call_edges);
+		mir.inline_calls(&mut call_graph);
+		mir.dead_code_eliminate(&call_graph);
+		let wasm = Builder::build(
+			&mir,
+			&graph.interner,
+			crate::CompilationMode::Release,
+		)
+		.unwrap();
 		let bytecode = wasm.encode();
 
 		TestCase {
@@ -3615,4 +3629,161 @@ fn test_pure_value_shared_via_reassignment_across_if_else_branches() {
 	assert_eq!(f.call(&mut store, (1, 5)).unwrap(), 899);
 	// else: m=10, side_dist=11, step=1 -> 1101
 	assert_eq!(f.call(&mut store, (0, 5)).unwrap(), 1101);
+}
+
+/// `encode_with_debug_spans`'s offsets are verified against
+/// `wasm-objdump -d`'s independently-computed ground truth (not just
+/// re-checked against our own encoder): for this function, `wasm-objdump`
+/// reports `local.get 0` at file offset `0x28` (40), `i32.const 1` at
+/// `0x2a` (42), `i32.add` at `0x2c` (44), `local.set 1` at `0x2d` (45),
+/// `local.get 1` at `0x2f` (47), `i32.const 2` at `0x31` (49), `i32.mul` at
+/// `0x33` (51) — matching every offset asserted below exactly.
+#[test]
+fn encode_with_debug_spans_locates_correct_module_offsets() {
+	let source = indoc! {"
+        fn compute(x: i32) -> i32 {
+            local y = x + 1;
+            y * 2
+        }
+        export { compute }
+    "};
+	let mut builder = vfs::CompilationGraphBuilder::new();
+	let stdlib_id = builder.load_stdlib();
+	let prefixed = format!("use std::*;\n{source}");
+	let root_id = builder
+		.load_binary(
+			"main.wx".to_string(),
+			&vfs::VirtualFileSource::new(HashMap::from([(
+				"main.wx".to_string(),
+				prefixed.clone(),
+			)])),
+		)
+		.unwrap();
+	let mut graph = builder.build(root_id, stdlib_id);
+	let tir = tir::TIR::build(&mut graph);
+	let mut mir = mir::MIR::build(
+		&tir,
+		&graph.interner,
+		graph.id_generator,
+		crate::CompilationMode::Debug,
+	);
+	let call_graph = mir::CallGraph::build(&mir.functions, &mir.call_edges);
+	mir.dead_code_eliminate(&call_graph);
+	let wasm =
+		Builder::build(&mir, &graph.interner, crate::CompilationMode::Debug)
+			.unwrap();
+	let (bytecode, debug_spans, function_debug_info) =
+		wasm.encode_with_debug_spans();
+
+	// Sanity-check the offsets actually land where `wasm-objdump` says the
+	// corresponding instruction starts, not just that they're plausible.
+	assert_eq!(bytecode[40], 0x20); // local.get
+	assert_eq!(bytecode[42], 0x41); // i32.const
+	assert_eq!(bytecode[44], 0x6a); // i32.add
+	assert_eq!(bytecode[45], 0x21); // local.set
+	assert_eq!(bytecode[47], 0x20); // local.get
+	assert_eq!(bytecode[49], 0x41); // i32.const
+	assert_eq!(bytecode[51], 0x6c); // i32.mul
+
+	// `compute` is the only function: its range covers offset 40 (the first
+	// instruction, `local.get`) through 52 (one past the final 1-byte
+	// `i32.mul` at 51), and its two locals (param `x`, declared local `y`)
+	// each resolve to their own single wasm local slot.
+	assert_eq!(function_debug_info.len(), 1);
+	let info = &function_debug_info[0];
+	assert_eq!((info.start, info.end), (40, 52));
+	let names: Vec<(&str, u32, u32)> = info
+		.locals
+		.iter()
+		.map(|l| {
+			(
+				graph.interner.resolve(l.name).unwrap(),
+				l.wasm_local_start,
+				l.wasm_local_count,
+			)
+		})
+		.collect();
+	assert_eq!(names, vec![("x", 0, 1), ("y", 1, 1)]);
+
+	let text_at =
+		|span: ast::TextSpan| &prefixed[span.start as usize..span.end as usize];
+	let actual: Vec<(u32, &str)> = debug_spans
+		.iter()
+		.map(|d| (d.offset, text_at(d.span)))
+		.collect();
+	assert_eq!(
+		actual,
+		vec![
+			(40, "x"),
+			(42, "1"),
+			(44, "x + 1"),
+			(45, "local y = x + 1"),
+			(47, "y"),
+			(49, "2"),
+			(51, "y * 2"),
+		]
+	);
+}
+
+/// Regression test: `mir::scheduler`'s `ExprKind::LocalGet` used to always
+/// emit exactly one `local.get`, even when the local's type was an
+/// aggregate occupying several consecutive wasm locals (e.g. reading a
+/// whole struct-typed local to pass it as a by-value call argument) — only
+/// the first flattened field ever reached the stack, producing an
+/// under-full wasm `call` that fails to validate. Caught by hand while
+/// building a `--debug` demo, not by any prior test: nothing previously
+/// exercised reading (as opposed to writing) a whole aggregate-typed local
+/// under `CompilationMode::Debug`.
+#[test]
+fn debug_mode_reading_whole_struct_local_pushes_every_field() {
+	let source = indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+        fn magnitude_sq(v: Vec2) -> i32 {
+            v.x * v.x + v.y * v.y
+        }
+        fn compute(x: i32, y: i32) -> i32 {
+            local v: Vec2 = Vec2::{ x: x, y: y };
+            magnitude_sq(v)
+        }
+        export { compute }
+    "};
+	let mut builder = vfs::CompilationGraphBuilder::new();
+	let stdlib_id = builder.load_stdlib();
+	let prefixed = format!("use std::*;\n{source}");
+	let root_id = builder
+		.load_binary(
+			"main.wx".to_string(),
+			&vfs::VirtualFileSource::new(HashMap::from([(
+				"main.wx".to_string(),
+				prefixed,
+			)])),
+		)
+		.unwrap();
+	let mut graph = builder.build(root_id, stdlib_id);
+	let tir = tir::TIR::build(&mut graph);
+	let mut mir = mir::MIR::build(
+		&tir,
+		&graph.interner,
+		graph.id_generator,
+		crate::CompilationMode::Debug,
+	);
+	let call_graph = mir::CallGraph::build(&mir.functions, &mir.call_edges);
+	mir.dead_code_eliminate(&call_graph);
+	let wasm =
+		Builder::build(&mir, &graph.interner, crate::CompilationMode::Debug)
+			.unwrap();
+	let bytecode = wasm.encode();
+
+	// Validating with wasmtime is the point: the bug produced a wasm
+	// `call` with too few arguments on the stack, which fails to validate
+	// at module-compile time, before execution even starts.
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let compute = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "compute")
+		.unwrap();
+
+	assert_eq!(compute.call(&mut store, (3, 4)).unwrap(), 25);
 }

@@ -129,7 +129,7 @@ impl File {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct FileId(u32);
 
 #[cfg_attr(test, derive(serde::Serialize))]

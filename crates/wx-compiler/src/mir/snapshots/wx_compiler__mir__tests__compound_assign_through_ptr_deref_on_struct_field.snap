@@ -14,6 +14,7 @@ functions:
                 memory: 106
                 kind: Memory32
             mutability: Immutable
+        locals_debug: []
         result: Unit
     block:
       kind:
@@ -31,6 +32,9 @@ functions:
                       Pointer:
                         memory: 106
                         kind: Memory32
+                    span:
+                      start: 155
+                      end: 156
                   value:
                     kind:
                       Add:
@@ -46,20 +50,40 @@ functions:
                                   Pointer:
                                     memory: 106
                                     kind: Memory32
+                                span:
+                                  start: 155
+                                  end: 156
                               offset: 4
                               memory: 106
                           ty: U32
+                          span:
+                            start: 155
+                            end: 162
                         right:
                           kind:
                             Int:
                               value: 1
                           ty: U32
+                          span:
+                            start: 166
+                            end: 167
                     ty: U32
+                    span:
+                      start: 155
+                      end: 167
                   offset: 4
                   memory: 106
               ty: Unit
+              span:
+                start: 155
+                end: 167
       ty: Unit
+      span:
+        start: 149
+        end: 170
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Pointer:

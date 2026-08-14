@@ -11,18 +11,22 @@ functions:
         locals:
           - ty: I32
             mutability: Immutable
+        locals_debug: []
         result: U8
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: U8
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: U8
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: U8
     block:
       kind:
@@ -37,6 +41,9 @@ functions:
                         scope_index: 0
                         local_index: 0
                     ty: I32
+                    span:
+                      start: 104
+                      end: 105
                   cases:
                     - - 1
                       - kind:
@@ -47,7 +54,13 @@ functions:
                                   Int:
                                     value: 0
                                 ty: U8
+                                span:
+                                  start: 132
+                                  end: 133
                         ty: U8
+                        span:
+                          start: 130
+                          end: 135
                     - - 2
                       - kind:
                           Block:
@@ -57,7 +70,13 @@ functions:
                                   Int:
                                     value: 1
                                 ty: U8
+                                span:
+                                  start: 163
+                                  end: 164
                         ty: U8
+                        span:
+                          start: 161
+                          end: 166
                     - - 3
                       - kind:
                           Block:
@@ -67,11 +86,25 @@ functions:
                                   Int:
                                     value: 2
                                 ty: U8
+                                span:
+                                  start: 193
+                                  end: 194
                         ty: U8
+                        span:
+                          start: 191
+                          end: 196
                   default: ~
               ty: U8
+              span:
+                start: 98
+                end: 203
       ty: U8
+      span:
+        start: 92
+        end: 205
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - I32

@@ -11,10 +11,12 @@ functions:
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: I32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: I32
       - kind: Block
         parent: 1
@@ -23,6 +25,7 @@ functions:
             mutability: Immutable
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: I32
     block:
       kind:
@@ -40,7 +43,13 @@ functions:
                           value:
                             kind: Noop
                             ty: Unit
+                            span:
+                              start: 89
+                              end: 93
                       ty: Unit
+                      span:
+                        start: 89
+                        end: 93
                     - kind:
                         LocalSet:
                           scope_index: 2
@@ -51,7 +60,13 @@ functions:
                                 scope_index: 0
                                 local_index: 0
                             ty: U32
+                            span:
+                              start: 99
+                              end: 104
                       ty: Unit
+                      span:
+                        start: 99
+                        end: 104
                     - kind:
                         Block:
                           scope_index: 2
@@ -65,11 +80,28 @@ functions:
                                         scope_index: 2
                                         local_index: 1
                                     ty: U32
+                                    span:
+                                      start: 3484
+                                      end: 3489
                               ty: I32
+                              span:
+                                start: 3466
+                                end: 3490
                       ty: I32
+                      span:
+                        start: 3456
+                        end: 3496
               ty: I32
+              span:
+                start: 89
+                end: 105
       ty: I32
+      span:
+        start: 83
+        end: 107
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Unit

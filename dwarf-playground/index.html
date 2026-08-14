@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>wx DWARF debugging playground</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+  code, pre { font-family: ui-monospace, monospace; background: #f2f2f2; padding: 2px 6px; border-radius: 4px; }
+  pre { padding: 12px; overflow-x: auto; }
+  h1 { font-size: 1.3em; }
+  h2 { font-size: 1.05em; margin-top: 2em; }
+  .panel { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 16px 0; }
+  button { font-size: 1em; padding: 6px 14px; cursor: pointer; }
+  input { font-size: 1em; padding: 4px 8px; width: 4em; }
+  #result { font-weight: 600; }
+  ol { padding-left: 1.3em; }
+  li { margin-bottom: 0.6em; }
+</style>
+</head>
+<body>
+<h1>wx &mdash; DWARF debugging playground</h1>
+<p>
+  <code>program.wasm</code> was compiled from <code>program.wx</code> via
+  <code>wx compile --debug</code>. It has real DWARF5 debug info embedded
+  directly in it (<code>.debug_info</code>, <code>.debug_line</code>, ...) &mdash;
+  no separate source map, nothing else to load.
+</p>
+
+<div class="panel">
+  <strong>compute(n)</strong> &mdash; sums <code>magnitude_sq(Vec2{x:i,y:2i}) + i</code>
+  for i in 0..n, via helper functions <code>add</code>/<code>magnitude_sq</code>.
+  <div style="margin-top: 10px;">
+    n = <input id="n" type="number" value="5" />
+    <button id="run">call compute(n)</button>
+    &nbsp; result: <span id="result">&mdash;</span>
+  </div>
+</div>
+
+<h2>How to debug it in Chrome DevTools</h2>
+<ol>
+  <li>Install the
+    <a href="https://chromewebstore.google.com/detail/cc%C2%B3-devtools-support-dwa/pdcpmagijalfljmkmjngeonclgbbannb">C/C++ DevTools Support (DWARF)</a>
+    extension (once, if you don't already have it).
+  </li>
+  <li>Serve this folder over HTTP &mdash; <code>fetch()</code> won't load
+    <code>program.wasm</code> from a <code>file://</code> page. From this
+    directory:
+    <pre>python3 -m http.server 8000</pre>
+    then open <code>http://localhost:8000/</code>.
+  </li>
+  <li>Open DevTools (Cmd+Opt+I) &rarr; <strong>Sources</strong> tab. Once the
+    page loads and instantiates the module, a <code>program.wasm</code> entry
+    with a <em>file tree</em> icon should appear in the sources list &mdash;
+    that's the DWARF extension recognizing the embedded debug info and
+    exposing <code>program.wx</code> as an actual source file, not
+    disassembly.
+  </li>
+  <li>Open <code>program.wx</code> under that entry, click a line number
+    inside <code>compute</code>, <code>add</code>, or <code>magnitude_sq</code>
+    to set a breakpoint (e.g. the <code>total = add(...)</code> line, or
+    inside <code>magnitude_sq</code>).
+  </li>
+  <li>Click <strong>call compute(n)</strong> above. Execution should pause at
+    your breakpoint, in wx source, with a real call stack across the three
+    functions and the locals/params (<code>i</code>, <code>total</code>,
+    <code>v</code>, <code>v.x</code>/<code>v.y</code>, ...) inspectable in
+    the Scope pane.
+  </li>
+</ol>
+
+<p>
+  If the DWARF extension doesn't pick it up as expected, or the Scope pane
+  doesn't show real names/values, that's useful signal too &mdash; it means
+  either the extension's expectations differ from what this module provides
+  (e.g. it may expect an <code>external_debug_info</code> section or a
+  specific loading path rather than picking up embedded DWARF directly from
+  <code>WebAssembly.instantiateStreaming</code>), which is exactly the kind
+  of gap worth knowing about.
+</p>
+
+<h2>Recompiling after editing program.wx</h2>
+<p>From the repo root:</p>
+<pre>cargo run -p wx-cli --bin wx -- compile dwarf-playground/program.wx --debug -o dwarf-playground/program.wasm</pre>
+
+<script>
+let compute;
+
+async function init() {
+  // instantiateStreaming (not fetch+arrayBuffer+instantiate) matters here:
+  // Chrome's DWARF extension hooks the streaming compilation path, where it
+  // can observe the network response as compilation happens.
+  const { instance } = await WebAssembly.instantiateStreaming(
+    fetch("program.wasm"),
+    {},
+  );
+  compute = instance.exports.compute;
+}
+
+document.getElementById("run").addEventListener("click", () => {
+  const n = parseInt(document.getElementById("n").value, 10) || 0;
+  const result = compute(n);
+  document.getElementById("result").textContent = result;
+});
+
+init().catch((err) => {
+  document.getElementById("result").textContent = "load error: " + err;
+});
+</script>
+</body>
+</html>

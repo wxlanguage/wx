@@ -214,6 +214,7 @@ fn inline_call(
 	arguments: Box<[Expression]>,
 	caller_scopes: &mut Vec<BlockScope>,
 	call_site_scope: ScopeIndex,
+	call_span: ast::TextSpan,
 ) -> Expression {
 	let result_ty = callee.block.ty;
 
@@ -223,6 +224,7 @@ fn inline_call(
 		kind: tir::BlockKind::Block,
 		parent: Some(call_site_scope),
 		locals: vec![],
+		locals_debug: vec![],
 		result: result_ty,
 	});
 
@@ -244,13 +246,17 @@ fn inline_call(
 		.into_vec()
 		.into_iter()
 		.enumerate()
-		.map(|(i, arg)| Expression {
-			ty: Type::Unit,
-			kind: ExprKind::LocalSet {
-				scope_index: body_scope_offset,
-				local_index: i as LocalIndex,
-				value: Box::new(arg),
-			},
+		.map(|(i, arg)| {
+			let arg_span = arg.span;
+			Expression {
+				ty: Type::Unit,
+				kind: ExprKind::LocalSet {
+					scope_index: body_scope_offset,
+					local_index: i as LocalIndex,
+					value: Box::new(arg),
+				},
+				span: arg_span,
+			}
 		})
 		.collect();
 
@@ -264,6 +270,7 @@ fn inline_call(
 			scope_index: wrapper_scope,
 			expressions: exprs.into_boxed_slice(),
 		},
+		span: call_span,
 	}
 }
 
@@ -583,11 +590,17 @@ fn inline_expr(
 		ExprKind::Call { arguments, .. } => arguments,
 		_ => unreachable!(),
 	};
-	*expr = inline_call(inline_body, arguments, caller_scopes, current_scope);
+	*expr = inline_call(
+		inline_body,
+		arguments,
+		caller_scopes,
+		current_scope,
+		expr.span,
+	);
 }
 
 /// Directed call graph over MIR function `DefId`s.
-struct CallGraph {
+pub struct CallGraph {
 	/// `callees[A]` = functions that A calls.
 	callees: HashMap<ast::DefId, HashSet<ast::DefId>>,
 	/// `callers[A]` = functions that call A.
@@ -595,7 +608,7 @@ struct CallGraph {
 }
 
 impl CallGraph {
-	fn build(
+	pub fn build(
 		functions: &[Function],
 		call_edges: &[(ast::DefId, ast::DefId)],
 	) -> Self {
@@ -621,87 +634,117 @@ impl CallGraph {
 	}
 }
 
-/// Inlines all `#[inline]` functions in topological order, then removes
-/// unreachable functions — and unreachable imported functions — via dead
-/// code elimination from export roots.
-pub fn run_inlining_pass(mir: &mut MIR) {
-	let mut graph = CallGraph::build(&mir.functions, &mir.call_edges);
+impl MIR {
+	/// Inlines all `#[inline]` functions in topological order, patching
+	/// `graph` in place to reflect inlined edges as it goes (see the "Update
+	/// graph" step below) — `self.call_edges` itself is never touched, so a
+	/// caller that needs an accurate post-inlining graph (e.g. for
+	/// `dead_code_eliminate`) must reuse this same `graph` rather than
+	/// rebuilding one from `self.call_edges`. Named `inline_calls` rather
+	/// than `inline_functions` to avoid colliding with `MIR::inline_functions`,
+	/// the set of DefIds this pass reads to decide what's eligible.
+	pub fn inline_calls(&mut self, graph: &mut CallGraph) {
+		// DefId → index in self.functions for O(1) mutation during inlining.
+		let func_idx: HashMap<ast::DefId, usize> = self
+			.functions
+			.iter()
+			.enumerate()
+			.map(|(i, f)| (f.id, i))
+			.collect();
 
-	// DefId → index in mir.functions for O(1) mutation during inlining.
-	let func_idx: HashMap<ast::DefId, usize> = mir
-		.functions
-		.iter()
-		.enumerate()
-		.map(|(i, f)| (f.id, i))
-		.collect();
+		// Kahn's algorithm on the inline subgraph:
+		// in-degree = number of inline callees not yet processed.
+		let mut inline_callee_count: HashMap<ast::DefId, usize> = self
+			.inline_functions
+			.iter()
+			.map(|&id| {
+				let count = graph.callees[&id]
+					.iter()
+					.filter(|c| self.inline_functions.contains(c))
+					.count();
+				(id, count)
+			})
+			.collect();
 
-	// Kahn's algorithm on the inline subgraph:
-	// in-degree = number of inline callees not yet processed.
-	let mut inline_callee_count: HashMap<ast::DefId, usize> = mir
-		.inline_functions
-		.iter()
-		.map(|&id| {
-			let count = graph.callees[&id]
-				.iter()
-				.filter(|c| mir.inline_functions.contains(c))
-				.count();
-			(id, count)
-		})
-		.collect();
+		let mut queue: VecDeque<ast::DefId> = inline_callee_count
+			.iter()
+			.filter(|(_, n)| **n == 0)
+			.map(|(&id, _)| id)
+			.collect();
 
-	let mut queue: VecDeque<ast::DefId> = inline_callee_count
-		.iter()
-		.filter(|(_, n)| **n == 0)
-		.map(|(&id, _)| id)
-		.collect();
+		// Outer loop: run Kahn's, then break one mutual-recursion cycle at a
+		// time. When all inline callees have been processed the inner while
+		// loop drains to empty and there are no stalled nodes left, so we
+		// break out.
+		loop {
+			while let Some(f_id) = queue.pop_front() {
+				// f's body is clean: all of its inline callees were processed first.
+				// Clone once here; inline_call will clone scopes+block again per call site.
+				let f_body = self.functions[func_idx[&f_id]].clone();
 
-	// Outer loop: run Kahn's, then break one mutual-recursion cycle at a time.
-	// When all inline callees have been processed the inner while loop drains
-	// to empty and there are no stalled nodes left, so we break out.
-	loop {
-		while let Some(f_id) = queue.pop_front() {
-			// f's body is clean: all of its inline callees were processed first.
-			// Clone once here; inline_call will clone scopes+block again per call site.
-			let f_body = mir.functions[func_idx[&f_id]].clone();
+				let caller_ids: Vec<ast::DefId> =
+					graph.callers[&f_id].iter().copied().collect();
+				// f's own callee set doesn't change while its callers are being
+				// processed below (only caller/f edges are touched), so collect
+				// it once here instead of re-cloning it on every caller.
+				let f_callees: Vec<ast::DefId> =
+					graph.callees[&f_id].iter().copied().collect();
+				for caller_id in caller_ids {
+					let ci = func_idx[&caller_id];
+					let caller_func = &mut self.functions[ci];
+					inline_expr(
+						&mut caller_func.block,
+						&mut caller_func.scopes,
+						f_id,
+						&f_body,
+						0,
+					);
+					caller_func
+						.static_data
+						.extend_from_slice(&f_body.static_data);
 
-			let caller_ids: Vec<ast::DefId> =
-				graph.callers[&f_id].iter().copied().collect();
-			// f's own callee set doesn't change while its callers are being
-			// processed below (only caller/f edges are touched), so collect
-			// it once here instead of re-cloning it on every caller.
-			let f_callees: Vec<ast::DefId> =
-				graph.callees[&f_id].iter().copied().collect();
-			for caller_id in caller_ids {
-				let ci = func_idx[&caller_id];
-				let caller_func = &mut mir.functions[ci];
-				inline_expr(
-					&mut caller_func.block,
-					&mut caller_func.scopes,
-					f_id,
-					&f_body,
-					0,
-				);
-				caller_func
-					.static_data
-					.extend_from_slice(&f_body.static_data);
+					// Update graph: remove caller → f, propagate f's callees to caller.
+					graph.callees.get_mut(&caller_id).unwrap().remove(&f_id);
+					graph.callers.get_mut(&f_id).unwrap().remove(&caller_id);
+					for callee_id in f_callees.iter().copied() {
+						graph
+							.callees
+							.get_mut(&caller_id)
+							.unwrap()
+							.insert(callee_id);
+						graph
+							.callers
+							.get_mut(&callee_id)
+							.unwrap()
+							.insert(caller_id);
+					}
 
-				// Update graph: remove caller → f, propagate f's callees to caller.
-				graph.callees.get_mut(&caller_id).unwrap().remove(&f_id);
-				graph.callers.get_mut(&f_id).unwrap().remove(&caller_id);
-				for callee_id in f_callees.iter().copied() {
-					graph
-						.callees
-						.get_mut(&caller_id)
-						.unwrap()
-						.insert(callee_id);
-					graph
-						.callers
-						.get_mut(&callee_id)
-						.unwrap()
-						.insert(caller_id);
+					// If caller is also inline, one of its pending inline callees is done.
+					if let Some(count) = inline_callee_count.get_mut(&caller_id)
+					{
+						*count -= 1;
+						if *count == 0 {
+							queue.push_back(caller_id);
+						}
+					}
 				}
+				// graph.callers[f_id] is now empty — f is dead.
+			}
 
-				// If caller is also inline, one of its pending inline callees is done.
+			// Cycle-breaker: any inline function still with count > 0 is part of a
+			// mutual-recursion cycle.  Inlining it fully would require infinite
+			// expansion, so we evict one "anchor" per iteration — it stays as an
+			// ordinary call target — then decrement its inline callers so they may
+			// become unblocked and get inlined on the next inner-loop pass.
+			let anchor = inline_callee_count
+				.iter()
+				.find(|(_, n)| **n > 0)
+				.map(|(&id, _)| id);
+			let Some(anchor) = anchor else { break };
+			inline_callee_count.remove(&anchor);
+			for caller_id in
+				graph.callers[&anchor].iter().copied().collect::<Vec<_>>()
+			{
 				if let Some(count) = inline_callee_count.get_mut(&caller_id) {
 					*count -= 1;
 					if *count == 0 {
@@ -709,65 +752,50 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 					}
 				}
 			}
-			// graph.callers[f_id] is now empty — f is dead.
 		}
+	}
 
-		// Cycle-breaker: any inline function still with count > 0 is part of a
-		// mutual-recursion cycle.  Inlining it fully would require infinite
-		// expansion, so we evict one "anchor" per iteration — it stays as an
-		// ordinary call target — then decrement its inline callers so they may
-		// become unblocked and get inlined on the next inner-loop pass.
-		let anchor = inline_callee_count
+	/// Removes functions — and unreachable imported functions — that aren't
+	/// reachable from export roots or the start function, via BFS over
+	/// `graph`. Pass the same `graph` `inline_calls` patched if inlining ran
+	/// first, or a fresh `CallGraph::build(&self.functions, &self.call_edges)`
+	/// if not.
+	pub fn dead_code_eliminate(&mut self, graph: &CallGraph) {
+		// Dead code elimination: BFS from exported functions and the start function.
+		let mut live: HashSet<ast::DefId> = self
+			.exports
 			.iter()
-			.find(|(_, n)| **n > 0)
-			.map(|(&id, _)| id);
-		let Some(anchor) = anchor else { break };
-		inline_callee_count.remove(&anchor);
-		for caller_id in
-			graph.callers[&anchor].iter().copied().collect::<Vec<_>>()
-		{
-			if let Some(count) = inline_callee_count.get_mut(&caller_id) {
-				*count -= 1;
-				if *count == 0 {
-					queue.push_back(caller_id);
+			.filter_map(|e| match e {
+				ExportItem::Function { id, .. } => Some(*id),
+				_ => None,
+			})
+			.collect();
+		if let Some(start_id) = self.start_function {
+			live.insert(start_id);
+		}
+		let mut dce_queue: VecDeque<ast::DefId> =
+			live.iter().copied().collect();
+		while let Some(id) = dce_queue.pop_front() {
+			for &callee_id in graph.callees.get(&id).into_iter().flatten() {
+				if live.insert(callee_id) {
+					dce_queue.push_back(callee_id);
 				}
 			}
 		}
-	}
+		self.functions.retain(|f| live.contains(&f.id));
 
-	// Dead code elimination: BFS from exported functions and the start function.
-	let mut live: HashSet<ast::DefId> = mir
-		.exports
-		.iter()
-		.filter_map(|e| match e {
-			ExportItem::Function { id, .. } => Some(*id),
-			_ => None,
-		})
-		.collect();
-	if let Some(start_id) = mir.start_function {
-		live.insert(start_id);
-	}
-	let mut dce_queue: VecDeque<ast::DefId> = live.iter().copied().collect();
-	while let Some(id) = dce_queue.pop_front() {
-		for &callee_id in graph.callees.get(&id).into_iter().flatten() {
-			if live.insert(callee_id) {
-				dce_queue.push_back(callee_id);
-			}
+		// Imported functions share the same DefId space and flow through the
+		// same call_edges as regular calls (see `record_call_edge`), so `live`
+		// already tells us which imported functions are actually reachable.
+		// Imported globals/memories aren't tracked here yet — they're not part
+		// of `call_edges` — so leave those import kinds untouched for now.
+		for module in &mut self.imports {
+			module.items.retain(|item| match item {
+				ImportModuleItem::Function { id, .. } => live.contains(id),
+				ImportModuleItem::Global { .. }
+				| ImportModuleItem::Memory { .. } => true,
+			});
 		}
+		self.imports.retain(|module| !module.items.is_empty());
 	}
-	mir.functions.retain(|f| live.contains(&f.id));
-
-	// Imported functions share the same DefId space and flow through the
-	// same call_edges as regular calls (see `record_call_edge`), so `live`
-	// already tells us which imported functions are actually reachable.
-	// Imported globals/memories aren't tracked here yet — they're not part
-	// of `call_edges` — so leave those import kinds untouched for now.
-	for module in &mut mir.imports {
-		module.items.retain(|item| match item {
-			ImportModuleItem::Function { id, .. } => live.contains(id),
-			ImportModuleItem::Global { .. }
-			| ImportModuleItem::Memory { .. } => true,
-		});
-	}
-	mir.imports.retain(|module| !module.items.is_empty());
 }

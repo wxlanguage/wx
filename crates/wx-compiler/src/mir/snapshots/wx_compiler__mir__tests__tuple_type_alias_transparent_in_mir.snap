@@ -9,6 +9,7 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result:
           Aggregate:
             aggregate_index: 0
@@ -24,17 +25,31 @@ functions:
                         Int:
                           value: 1
                       ty: U32
+                      span:
+                        start: 66
+                        end: 67
                     - kind:
                         Int:
                           value: 2
                       ty: U32
+                      span:
+                        start: 69
+                        end: 70
               ty:
                 Aggregate:
                   aggregate_index: 0
+              span:
+                start: 65
+                end: 71
       ty:
         Aggregate:
           aggregate_index: 0
+      span:
+        start: 59
+        end: 73
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Aggregate:

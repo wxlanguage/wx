@@ -9,6 +9,7 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -24,16 +25,28 @@ functions:
                     ty:
                       Function:
                         signature_index: 0
+                    span:
+                      start: 141
+                      end: 165
                   arguments: []
               ty: U32
+              span:
+                start: 141
+                end: 165
       ty: U32
+      span:
+        start: 139
+        end: 167
     static_data: []
+    file_id: 1
+    name: ~
   - id: 109
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -49,16 +62,28 @@ functions:
                     ty:
                       Function:
                         signature_index: 0
+                    span:
+                      start: 191
+                      end: 216
                   arguments: []
               ty: U32
+              span:
+                start: 191
+                end: 216
       ty: U32
+      span:
+        start: 189
+        end: 218
     static_data: []
+    file_id: 1
+    name: ~
   - id: 114
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -69,14 +94,23 @@ functions:
                 Int:
                   value: 1
               ty: U32
+              span:
+                start: 98
+                end: 115
       ty: U32
+      span:
+        start: 96
+        end: 117
     static_data: []
+    file_id: 1
+    name: ~
   - id: 115
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -87,8 +121,16 @@ functions:
                 Int:
                   value: 4
               ty: U32
+              span:
+                start: 98
+                end: 115
       ty: U32
+      span:
+        start: 96
+        end: 117
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - U32

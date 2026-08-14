@@ -11,34 +11,41 @@ functions:
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 1
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 2
         locals: []
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 2
         locals: []
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 2
         locals: []
+        locals_debug: []
         result: Bool
       - kind: Block
         parent: 5
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: Bool
     block:
       kind:
@@ -59,7 +66,13 @@ functions:
                                 scope_index: 0
                                 local_index: 0
                             ty: U32
+                            span:
+                              start: 405
+                              end: 406
                       ty: Unit
+                      span:
+                        start: 405
+                        end: 406
                     - kind:
                         Block:
                           scope_index: 2
@@ -81,7 +94,13 @@ functions:
                                                       scope_index: 2
                                                       local_index: 0
                                                   ty: U32
+                                                  span:
+                                                    start: 237
+                                                    end: 241
                                             ty: Unit
+                                            span:
+                                              start: 237
+                                              end: 241
                                           - kind:
                                               Block:
                                                 scope_index: 6
@@ -97,12 +116,21 @@ functions:
                                                                     scope_index: 6
                                                                     local_index: 0
                                                                 ty: U32
+                                                                span:
+                                                                  start: 133
+                                                                  end: 137
                                                               right:
                                                                 kind:
                                                                   Int:
                                                                     value: 97
                                                                 ty: U32
+                                                                span:
+                                                                  start: 141
+                                                                  end: 144
                                                           ty: Bool
+                                                          span:
+                                                            start: 133
+                                                            end: 144
                                                         right:
                                                           kind:
                                                             LessEq:
@@ -112,15 +140,33 @@ functions:
                                                                     scope_index: 6
                                                                     local_index: 0
                                                                 ty: U32
+                                                                span:
+                                                                  start: 148
+                                                                  end: 152
                                                               right:
                                                                 kind:
                                                                   Int:
                                                                     value: 122
                                                                 ty: U32
+                                                                span:
+                                                                  start: 156
+                                                                  end: 159
                                                           ty: Bool
+                                                          span:
+                                                            start: 148
+                                                            end: 159
                                                     ty: Bool
+                                                    span:
+                                                      start: 133
+                                                      end: 159
                                             ty: Bool
+                                            span:
+                                              start: 123
+                                              end: 165
                                     ty: Bool
+                                    span:
+                                      start: 237
+                                      end: 261
                                   then_block:
                                     kind:
                                       Block:
@@ -134,13 +180,25 @@ functions:
                                                       scope_index: 2
                                                       local_index: 0
                                                   ty: U8
+                                                  span:
+                                                    start: 278
+                                                    end: 282
                                                 right:
                                                   kind:
                                                     Int:
                                                       value: 32
                                                   ty: U8
+                                                  span:
+                                                    start: 292
+                                                    end: 307
                                             ty: U32
+                                            span:
+                                              start: 277
+                                              end: 307
                                     ty: U32
+                                    span:
+                                      start: 262
+                                      end: 326
                                   else_block:
                                     kind:
                                       Block:
@@ -151,12 +209,32 @@ functions:
                                                 scope_index: 2
                                                 local_index: 0
                                             ty: U32
+                                            span:
+                                              start: 346
+                                              end: 350
                                     ty: U32
+                                    span:
+                                      start: 332
+                                      end: 360
                               ty: U32
+                              span:
+                                start: 234
+                                end: 360
                       ty: U32
+                      span:
+                        start: 224
+                        end: 366
               ty: U32
+              span:
+                start: 405
+                end: 426
       ty: U32
+      span:
+        start: 399
+        end: 428
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - U32

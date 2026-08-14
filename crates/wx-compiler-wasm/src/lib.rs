@@ -100,10 +100,21 @@ pub fn compile(
 		.into_js());
 	}
 
-	let mir =
-		mir::MIR::build(&hir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner)
-		.map_err(|_| "codegen failed".to_string())?;
+	let mut mir = mir::MIR::build(
+		&hir,
+		&compilation.interner,
+		compilation.id_generator,
+		CompilationMode::Release,
+	);
+	let mut graph = mir::CallGraph::build(&mir.functions, &mir.call_edges);
+	mir.inline_calls(&mut graph);
+	mir.dead_code_eliminate(&graph);
+	let module = codegen::Builder::build(
+		&mir,
+		&compilation.interner,
+		CompilationMode::Release,
+	)
+	.map_err(|_| "codegen failed".to_string())?;
 	let bytecode = module.encode();
 
 	Ok(CompilationResult {
