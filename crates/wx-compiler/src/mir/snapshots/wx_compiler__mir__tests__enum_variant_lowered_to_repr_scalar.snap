@@ -9,6 +9,7 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: I32
     block:
       kind:
@@ -19,8 +20,16 @@ functions:
                 Int:
                   value: 2
               ty: I32
+              span:
+                start: 104
+                end: 109
       ty: I32
+      span:
+        start: 91
+        end: 111
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - I32

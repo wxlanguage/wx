@@ -21,19 +21,11 @@ pub mod scheduler;
 #[cfg(test)]
 mod tests;
 
+use crate::wasm::ScalarType;
 use crate::{ast, mir};
 
 pub type DataNodeIndex = u32;
 pub type BlockIndex = u32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ScalarType {
-	I32,
-	I64,
-	F32,
-	F64,
-}
 
 /// Sign only matters for narrow loads: `i32.load8_s` vs `i32.load8_u`.
 /// Full-width loads and stores are always unsigned.
@@ -87,41 +79,6 @@ impl MemAccess {
 			Self::I16S | Self::I16U => 1,
 			Self::I32 | Self::F32 => 2,
 			Self::I64 | Self::F64 => 3,
-		}
-	}
-}
-
-impl TryFrom<mir::Type> for ScalarType {
-	type Error = ();
-	fn try_from(ty: mir::Type) -> Result<Self, ()> {
-		Ok(match ty {
-			mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Bool
-			| mir::Type::U8
-			| mir::Type::I8
-			| mir::Type::U16
-			| mir::Type::I16
-			| mir::Type::Function { .. } => ScalarType::I32,
-			mir::Type::I64 | mir::Type::U64 => ScalarType::I64,
-			mir::Type::Pointer { kind, .. } => match kind {
-				mir::MemoryKind::Memory32 => ScalarType::I32,
-				mir::MemoryKind::Memory64 => ScalarType::I64,
-			},
-			mir::Type::F32 => ScalarType::F32,
-			mir::Type::F64 => ScalarType::F64,
-			_ => return Err(()),
-		})
-	}
-}
-
-impl From<ScalarType> for crate::codegen::ValueType {
-	fn from(ty: ScalarType) -> Self {
-		match ty {
-			ScalarType::I32 => crate::codegen::ValueType::I32,
-			ScalarType::I64 => crate::codegen::ValueType::I64,
-			ScalarType::F32 => crate::codegen::ValueType::F32,
-			ScalarType::F64 => crate::codegen::ValueType::F64,
 		}
 	}
 }

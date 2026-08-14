@@ -1,8 +1,9 @@
 use crate::mir::{self, ExprKind};
 use crate::opt::{
 	Block, BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function,
-	LoopData, MemAccess, NodeType, ScalarType, StackResult, SwitchCase,
+	LoopData, MemAccess, NodeType, StackResult, SwitchCase,
 };
+use crate::wasm::ScalarType;
 
 pub struct Builder<'mir> {
 	mir: &'mir mir::MIR,

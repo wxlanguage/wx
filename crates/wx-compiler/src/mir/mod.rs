@@ -7,9 +7,13 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefIdGenerator};
 use crate::tir::{self, ItemAttribute};
+use crate::vfs;
 
 mod inlining;
-use inlining::{rebase_scope, run_inlining_pass};
+pub use inlining::CallGraph;
+use inlining::rebase_scope;
+
+pub mod scheduler;
 
 #[cfg(test)]
 mod tests;
@@ -373,6 +377,7 @@ impl Type {
 pub struct Expression {
 	pub kind: ExprKind,
 	pub ty: Type,
+	pub span: ast::TextSpan,
 }
 
 #[derive(Clone)]
@@ -384,6 +389,25 @@ pub struct Aggregate {
 	pub layout: Layout,
 	/// `decl_to_phys[decl_index]` = physical slot index.
 	decl_to_phys: Box<[u32]>,
+}
+
+/// Recursively flatten a MIR type into its constituent scalar leaf types —
+/// `Unit`/`Never` produce no slots, `Aggregate` recurses field by field
+/// (in physical/layout order, matching `Aggregate::values`), everything else
+/// is already a leaf. Shared by `opt::scheduler` (which converts leaves to
+/// `ScalarType`) and `mir::scheduler` (which does the same for its own
+/// direct-lowering locals) — kept MIR-only so it has no dependency on `opt`.
+pub fn flatten_type(ty: Type, aggregates: &[Aggregate]) -> Vec<Type> {
+	match ty {
+		Type::Unit | Type::Never => vec![],
+		Type::Aggregate { aggregate_index } => aggregates
+			[aggregate_index as usize]
+			.values
+			.iter()
+			.flat_map(|&f| flatten_type(f, aggregates))
+			.collect(),
+		scalar => vec![scalar],
+	}
 }
 
 /// Whether a memory is locally defined or provided by the WASM host.
@@ -465,7 +489,7 @@ pub struct MIR {
 	pub aggregates: Box<[Aggregate]>,
 	pub static_entries: Vec<StaticEntry>,
 	/// Direct call edges collected during lowering: (caller_mir_id,
-	/// callee_mir_id). Consumed by `run_inlining_pass` to build the call
+	/// callee_mir_id). Consumed by `CallGraph::build` to build the call
 	/// graph.
 	#[cfg_attr(test, serde(skip))]
 	pub call_edges: Vec<(ast::DefId, ast::DefId)>,
@@ -518,12 +542,57 @@ pub struct Local {
 	pub mutability: Mutability,
 }
 
+/// Debug-only metadata for one declared local: its source name and, for a
+/// directly struct-typed local, its struct's own name and field names.
+/// Lives in `BlockScope::locals_debug`, a side table parallel to `locals`
+/// rather than fields on `Local` itself — `Local` is shared by every build
+/// (including Release, which never reads this), so keeping it out entirely
+/// means Release pays nothing: `locals_debug` stays an empty, unallocated
+/// `Vec` unless `MIR::build` is asked for debug info (see `CompilationMode`).
+///
+/// Only covers a scope's originally-declared locals (params + `local`
+/// statements, known from TIR before lowering starts) — compiler-
+/// synthesized temporaries appended later during expression lowering (see
+/// the `frame[0].locals.push` call sites below) never get an entry, so
+/// `locals_debug.get(local_index)` returning `None` doubles as "this local
+/// has no debug info" for exactly those temporaries, with no separate
+/// tracking needed.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone)]
+pub struct LocalDebugInfo {
+	pub name: SymbolU32,
+	pub struct_debug: Option<StructDebugInfo>,
+}
+
+/// Present on a [`LocalDebugInfo`] when its local's type is directly a named
+/// struct (not a tuple, pointer-to-struct, or a struct nested inside
+/// another aggregate) — that struct's own name and its fields' names in
+/// physical/layout order (matching `Aggregate::values`/`::offsets`' order).
+/// Resolved fresh from TIR per `Local` rather than stored on `Aggregate`
+/// itself: `Aggregate` is deduplicated purely by structural shape, so two
+/// differently-named, identically-shaped structs (or a struct and a
+/// same-shaped tuple) can share one `Aggregate` entry — storing names there
+/// would mean one of them shows the other's names. `None` (missing this
+/// struct — not represented) for anything not a struct one level deep;
+/// `--debug` info for those falls back to positional field labels.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone)]
+pub struct StructDebugInfo {
+	pub name: SymbolU32,
+	/// Field names in physical (layout) order — same order as
+	/// `Aggregate::values`/`::offsets` for this local's aggregate.
+	pub field_names: Box<[SymbolU32]>,
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone)]
 pub struct BlockScope {
 	pub kind: tir::BlockKind,
 	pub parent: Option<ScopeIndex>,
 	pub locals: Vec<Local>,
+	/// Empty unless `MIR::build` was asked to collect `--debug` info — see
+	/// [`LocalDebugInfo`].
+	pub locals_debug: Vec<LocalDebugInfo>,
 	pub result: Type,
 }
 
@@ -555,6 +624,16 @@ pub struct Function {
 	/// Codegen unions these across all live functions to determine which
 	/// entries to include in the WASM data segment.
 	pub static_data: Vec<u32>,
+	/// The file this function was declared in — every span on `block` is
+	/// relative to this file's text. Safe to treat as a single file per
+	/// function only because `--debug` (the only mode that reads spans)
+	/// never inlines, so a function's body never mixes expressions lowered
+	/// from a different source file.
+	pub file_id: vfs::FileId,
+	/// The function's declared name — `None` unless `MIR::build` was asked
+	/// for `--debug` info (see `CompilationMode`), and always `None` for the
+	/// synthetic `__wx_start` function, which has no single source name.
+	pub name: Option<SymbolU32>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -607,10 +686,12 @@ impl MIR {
 		tir: &tir::TIR,
 		interner: &ast::StringInterner,
 		id_generator: ast::DefIdGenerator,
+		mode: crate::CompilationMode,
 	) -> MIR {
 		let mut builder = Builder {
 			tir,
 			interner,
+			mode,
 			aggregate_index_lookup: HashMap::new(),
 			aggregates: Vec::new(),
 			signature_pool: Vec::new(),
@@ -742,7 +823,7 @@ impl MIR {
 			functions.push(f.clone());
 		}
 
-		let mut mir = MIR {
+		let mir = MIR {
 			functions,
 			inline_functions,
 			globals,
@@ -809,7 +890,6 @@ impl MIR {
 			static_entries: builder.static_entries,
 		};
 
-		run_inlining_pass(&mut mir);
 		mir
 	}
 }
@@ -862,6 +942,10 @@ enum IndexAddress {
 struct Builder<'tir> {
 	tir: &'tir tir::TIR,
 	interner: &'tir ast::StringInterner,
+	/// Set once from `MIR::build`'s own `mode` argument. `lower_function`/
+	/// `build_start_function` read it to decide whether to populate
+	/// `BlockScope::locals_debug` — see [`LocalDebugInfo`].
+	mode: crate::CompilationMode,
 	aggregate_index_lookup: HashMap<(FieldOrder, Box<[Type]>), AggregateIndex>,
 	aggregates: Vec<Aggregate>,
 	/// Concrete function signatures, interned on demand. The index into this
@@ -1217,6 +1301,49 @@ impl<'tir> Builder<'tir> {
 		aggregate_index
 	}
 
+	/// See [`StructDebugInfo`]. `mir_ty` is `tir_ty` already lowered (via
+	/// `lower_type_index`, immediately before this is called) — reused here
+	/// rather than re-derived, just to confirm it's actually an aggregate
+	/// and to find that aggregate's `decl_to_phys` mapping. Must run before
+	/// `current_substitutions` changes again (e.g. before recursing into a
+	/// different generic context), since `resolve_tir_type` reads it.
+	fn struct_debug_info(
+		&self,
+		tir_ty: tir::TypeIndex,
+		mir_ty: Type,
+	) -> Option<StructDebugInfo> {
+		let Type::Aggregate { aggregate_index } = mir_ty else {
+			return None;
+		};
+		let resolved = self.resolve_tir_type(tir_ty);
+		let tir::Type::Struct { struct_index, .. } =
+			&self.tir.types[resolved.as_usize()]
+		else {
+			return None;
+		};
+		let tir_struct = &self.tir.structs[*struct_index as usize];
+		let aggregate = &self.aggregates[aggregate_index as usize];
+
+		// `decl_to_phys` already maps each field straight to its physical
+		// slot — scatter names directly there in one pass instead of
+		// collecting-then-sorting.
+		let mut field_names: Vec<Option<SymbolU32>> =
+			vec![None; tir_struct.fields.len()];
+		for (decl, field) in tir_struct.fields.iter().enumerate() {
+			field_names[aggregate.decl_to_phys[decl] as usize] =
+				Some(field.name.inner);
+		}
+		Some(StructDebugInfo {
+			name: tir_struct.name.inner,
+			field_names: field_names
+				.into_iter()
+				.map(|n| {
+					n.expect("decl_to_phys is a bijection over declared fields")
+				})
+				.collect(),
+		})
+	}
+
 	fn lower_type_index(&mut self, type_idx: tir::TypeIndex) -> Type {
 		match type_idx {
 			idx if idx == tir::TypeIndex::ERROR => unreachable!(),
@@ -1397,22 +1524,31 @@ impl<'tir> Builder<'tir> {
 			.map(|scope| {
 				let result_type_idx =
 					scope.inferred_type.infer_or(tir::TypeIndex::UNIT);
-				let locals = scope
-					.locals
-					.iter()
-					.map(|tir_local| Local {
-						ty: self.lower_type_index(tir_local.ty),
+				let mut locals = Vec::with_capacity(scope.locals.len());
+				let mut locals_debug = Vec::new();
+				for tir_local in &scope.locals {
+					let ty = self.lower_type_index(tir_local.ty);
+					if self.mode == crate::CompilationMode::Debug {
+						locals_debug.push(LocalDebugInfo {
+							name: tir_local.name.inner,
+							struct_debug: self
+								.struct_debug_info(tir_local.ty, ty),
+						});
+					}
+					locals.push(Local {
+						ty,
 						mutability: if tir_local.mut_span.is_some() {
 							Mutability::Mutable
 						} else {
 							Mutability::Immutable
 						},
-					})
-					.collect();
+					});
+				}
 				BlockScope {
 					kind: scope.kind,
 					parent: scope.parent,
 					locals,
+					locals_debug,
 					result: self.lower_type_index(result_type_idx),
 				}
 			})
@@ -1434,6 +1570,9 @@ impl<'tir> Builder<'tir> {
 			scopes: ctx.frame,
 			block,
 			static_data: ctx.static_data,
+			file_id: func.file_id,
+			name: (self.mode == crate::CompilationMode::Debug)
+				.then_some(func.name.inner),
 		}
 	}
 
@@ -1490,6 +1629,11 @@ impl<'tir> Builder<'tir> {
 		if globals_with_init.is_empty() {
 			return None;
 		}
+		// Synthetic function stitching together every global's initializer,
+		// which could in principle span multiple files — arbitrarily
+		// attributed to the first one, since this body already has no real
+		// single source span either (see the `Block`'s span below).
+		let file_id = globals_with_init[0].file_id;
 
 		self.current_function_id = Some(start_id);
 
@@ -1498,6 +1642,7 @@ impl<'tir> Builder<'tir> {
 			kind: tir::BlockKind::Block,
 			parent: None,
 			locals: vec![],
+			locals_debug: vec![],
 			result: Type::Unit,
 		};
 		let mut combined_frame: Vec<BlockScope> = vec![root_scope];
@@ -1514,22 +1659,31 @@ impl<'tir> Builder<'tir> {
 				.map(|scope| {
 					let result_ty =
 						scope.inferred_type.infer_or(tir::TypeIndex::UNIT);
-					let locals = scope
-						.locals
-						.iter()
-						.map(|tir_local| Local {
-							ty: self.lower_type_index(tir_local.ty),
+					let mut locals = Vec::with_capacity(scope.locals.len());
+					let mut locals_debug = Vec::new();
+					for tir_local in &scope.locals {
+						let ty = self.lower_type_index(tir_local.ty);
+						if self.mode == crate::CompilationMode::Debug {
+							locals_debug.push(LocalDebugInfo {
+								name: tir_local.name.inner,
+								struct_debug: self
+									.struct_debug_info(tir_local.ty, ty),
+							});
+						}
+						locals.push(Local {
+							ty,
 							mutability: if tir_local.mut_span.is_some() {
 								Mutability::Mutable
 							} else {
 								Mutability::Immutable
 							},
-						})
-						.collect();
+						});
+					}
 					BlockScope {
 						kind: scope.kind,
 						parent: scope.parent,
 						locals,
+						locals_debug,
 						result: self.lower_type_index(result_ty),
 					}
 				})
@@ -1570,6 +1724,7 @@ impl<'tir> Builder<'tir> {
 					value: Box::new(lowered),
 				},
 				ty: Type::Unit,
+				span: body.block.span,
 			});
 			combined_static_data.extend(ctx.static_data);
 		}
@@ -1590,8 +1745,13 @@ impl<'tir> Builder<'tir> {
 					expressions: combined_body.into_boxed_slice(),
 				},
 				ty: Type::Unit,
+				// Synthetic: this block stitches together every global's
+				// initializer, so it has no single originating source span.
+				span: ast::TextSpan { start: 0, end: 0 },
 			},
 			static_data: combined_static_data,
+			file_id,
+			name: None,
 		})
 	}
 
@@ -1720,6 +1880,7 @@ impl<'tir> Builder<'tir> {
 							value: Box::new(lowered),
 						},
 						ty: Type::Unit,
+						span: object.span,
 					});
 					(0, temp)
 				}
@@ -1731,6 +1892,7 @@ impl<'tir> Builder<'tir> {
 					value_index: 0,
 				},
 				ty: ptr_ty,
+				span: object.span,
 			};
 			(ptr, ptr_ty)
 		} else {
@@ -1749,6 +1911,9 @@ impl<'tir> Builder<'tir> {
 
 		let idx_ty = self.lower_type_index(index.ty);
 		let idx = self.lower_expression(func_ctx, index, sink);
+		// Spans the whole indexing expression (`object[index]`), since none
+		// of these arithmetic nodes has a source counterpart of its own.
+		let span = ast::TextSpan::new(object.span.start, index.span.end);
 		IndexAddress::Dynamic(Expression {
 			kind: ExprKind::Add {
 				left: Box::new(base),
@@ -1760,12 +1925,15 @@ impl<'tir> Builder<'tir> {
 								value: elem_size as i64,
 							},
 							ty: idx_ty,
+							span,
 						}),
 					},
 					ty: idx_ty,
+					span,
 				}),
 			},
 			ty: ptr_ty,
+			span,
 		})
 	}
 
@@ -1773,25 +1941,33 @@ impl<'tir> Builder<'tir> {
 	/// scalar — shared by every place that reads a `ConstValue` cached on TIR
 	/// (`Constant`, `EnumVariant`) so codegen never has to re-walk the original
 	/// expression tree just to rediscover a value TIR already computed.
-	fn lower_const_value(const_value: tir::ConstValue, ty: Type) -> Expression {
+	fn lower_const_value(
+		const_value: tir::ConstValue,
+		ty: Type,
+		span: ast::TextSpan,
+	) -> Expression {
 		match const_value {
 			tir::ConstValue::Int(value) => Expression {
 				kind: ExprKind::Int { value },
 				ty,
+				span,
 			},
 			tir::ConstValue::Float(value) => Expression {
 				kind: ExprKind::Float { value },
 				ty,
+				span,
 			},
 			tir::ConstValue::Bool(value) => Expression {
 				kind: ExprKind::Bool { value },
 				ty,
+				span,
 			},
 			tir::ConstValue::Char(value) => Expression {
 				kind: ExprKind::Int {
 					value: value as i64,
 				},
 				ty,
+				span,
 			},
 		}
 	}
@@ -1810,26 +1986,32 @@ impl<'tir> Builder<'tir> {
 			| tir::ExprKind::Memory { .. } => Expression {
 				kind: ExprKind::Noop,
 				ty: Type::Unit,
+				span: expr.span,
 			},
 			tir::ExprKind::Unreachable => Expression {
 				kind: ExprKind::Unreachable,
 				ty: Type::Never,
+				span: expr.span,
 			},
 			tir::ExprKind::Int { value } => Expression {
 				kind: ExprKind::Int { value: *value },
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Float { value } => Expression {
 				kind: ExprKind::Float { value: *value },
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Bool { value } => Expression {
 				kind: ExprKind::Bool { value: *value },
 				ty: Type::Bool,
+				span: expr.span,
 			},
 			tir::ExprKind::Global { id } => Expression {
 				kind: ExprKind::Global { id: *id },
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Local {
 				scope_index,
@@ -1840,6 +2022,7 @@ impl<'tir> Builder<'tir> {
 					local_index: *local_index,
 				},
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Function { id } => {
 				// If the FunctionItem carries non-empty type_args the reference is a
@@ -1878,6 +2061,7 @@ impl<'tir> Builder<'tir> {
 						Expression {
 							kind: ExprKind::Function { id: mono_id },
 							ty: Type::Function { signature_index },
+							span: expr.span,
 						}
 					}
 					_ => {
@@ -1885,6 +2069,7 @@ impl<'tir> Builder<'tir> {
 						Expression {
 							kind: ExprKind::Function { id: *id },
 							ty: self.lower_type_index(expr.ty),
+							span: expr.span,
 						}
 					}
 				}
@@ -1894,6 +2079,7 @@ impl<'tir> Builder<'tir> {
 					value: *value as i64,
 				},
 				ty: Type::U32,
+				span: expr.span,
 			},
 			tir::ExprKind::String { symbol } => {
 				// The literal's slice type says which memory its bytes are
@@ -1914,6 +2100,7 @@ impl<'tir> Builder<'tir> {
 							Expression {
 								kind: ExprKind::StaticPointer { data_index },
 								ty: self.pointer_type(memory_id),
+								span: expr.span,
 							},
 							Expression {
 								kind: ExprKind::Int { value: size as i64 },
@@ -1922,10 +2109,12 @@ impl<'tir> Builder<'tir> {
 								ty: self.lower_type_index(
 									self.tir.memories[mem_idx].size.inner,
 								),
+								span: expr.span,
 							},
 						]),
 					},
 					ty,
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Return { value } => Expression {
@@ -1935,6 +2124,7 @@ impl<'tir> Builder<'tir> {
 					}),
 				},
 				ty: Type::Never,
+				span: expr.span,
 			},
 			tir::ExprKind::EnumVariant {
 				enum_index,
@@ -1946,6 +2136,7 @@ impl<'tir> Builder<'tir> {
 					Some(const_value) => Self::lower_const_value(
 						const_value,
 						self.lower_type_index(expr.ty),
+						expr.span,
 					),
 					// Error-free TIR guarantees every variant folds to a
 					// constant — see the `NotConstEvaluatable`/range checks
@@ -1971,6 +2162,7 @@ impl<'tir> Builder<'tir> {
 						func_ctx,
 						func.name.inner,
 						expr.ty,
+						expr.span,
 						type_args,
 						arguments,
 						sink,
@@ -2024,10 +2216,12 @@ impl<'tir> Builder<'tir> {
 							ty: Type::Function {
 								signature_index: callee_sig_idx,
 							},
+							span: expr.span,
 						}),
 						arguments: lowered_args,
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::GenericMethodCall {
@@ -2116,10 +2310,12 @@ impl<'tir> Builder<'tir> {
 							ty: Type::Function {
 								signature_index: callee_sig_idx,
 							},
+							span: expr.span,
 						}),
 						arguments: lowered_args,
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Call { callee, arguments } => {
@@ -2136,6 +2332,7 @@ impl<'tir> Builder<'tir> {
 							func_ctx,
 							func.name.inner,
 							expr.ty,
+							expr.span,
 							&[],
 							arguments,
 							sink,
@@ -2149,6 +2346,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::Call { callee, arguments },
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::MethodCall { arguments, id } => {
@@ -2162,6 +2360,7 @@ impl<'tir> Builder<'tir> {
 					ty: Type::Function {
 						signature_index: callee_sig_idx,
 					},
+					span: expr.span,
 				});
 				let arguments: Box<_> = arguments
 					.iter()
@@ -2170,6 +2369,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::Call { callee, arguments },
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::NamespaceAccess { namespace, member } => {
@@ -2192,6 +2392,7 @@ impl<'tir> Builder<'tir> {
 											memory: *id,
 										},
 										ty: result_ty,
+										span: expr.span,
 									};
 								}
 								"MEMORY_INDEX" => {
@@ -2200,6 +2401,7 @@ impl<'tir> Builder<'tir> {
 											memory: *id,
 										},
 										ty: result_ty,
+										span: expr.span,
 									};
 								}
 								_ => unreachable!(),
@@ -2207,9 +2409,11 @@ impl<'tir> Builder<'tir> {
 						};
 
 						match self.tir.constants[const_idx].const_value {
-							Some(const_value) => {
-								Self::lower_const_value(const_value, result_ty)
-							}
+							Some(const_value) => Self::lower_const_value(
+								const_value,
+								result_ty,
+								expr.span,
+							),
 							None => unreachable!(),
 						}
 					}
@@ -2222,7 +2426,7 @@ impl<'tir> Builder<'tir> {
 				if let Some(const_value) =
 					self.tir.constants[const_idx].const_value
 				{
-					Self::lower_const_value(const_value, result_ty)
+					Self::lower_const_value(const_value, result_ty, expr.span)
 				} else if self.tir.constants[const_idx].value.is_some() {
 					todo!("complex const expression in MIR lowering")
 				} else {
@@ -2261,6 +2465,7 @@ impl<'tir> Builder<'tir> {
 							value_index: phys_index,
 						},
 						ty: field_ty,
+						span: expr.span,
 					},
 					_ => {
 						let object_ty = self.lower_type_index(object.ty);
@@ -2280,6 +2485,7 @@ impl<'tir> Builder<'tir> {
 								value: Box::new(object_lowered),
 							},
 							ty: Type::Unit,
+							span: expr.span,
 						});
 
 						Expression {
@@ -2289,6 +2495,7 @@ impl<'tir> Builder<'tir> {
 								value_index: phys_index,
 							},
 							ty: field_ty,
+							span: expr.span,
 						}
 					}
 				}
@@ -2319,6 +2526,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::Aggregate { values },
 					ty: Type::Aggregate { aggregate_index },
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::TupleInit { elements } => {
@@ -2351,6 +2559,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::Aggregate { values },
 					ty: Type::Aggregate { aggregate_index },
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::IfElse {
@@ -2372,6 +2581,7 @@ impl<'tir> Builder<'tir> {
 						else_block,
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Match { scrutinee, arms } => {
@@ -2416,6 +2626,7 @@ impl<'tir> Builder<'tir> {
 						default,
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Break { scope_index, value } => Expression {
@@ -2426,12 +2637,14 @@ impl<'tir> Builder<'tir> {
 					}),
 				},
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Continue { scope_index } => Expression {
 				kind: ExprKind::Continue {
 					scope_index: *scope_index,
 				},
 				ty: Type::Never,
+				span: expr.span,
 			},
 			tir::ExprKind::Loop { scope_index, block } => Expression {
 				kind: ExprKind::Loop {
@@ -2441,6 +2654,7 @@ impl<'tir> Builder<'tir> {
 					),
 				},
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Block {
 				scope_index,
@@ -2470,6 +2684,7 @@ impl<'tir> Builder<'tir> {
 						expressions: inner_sink.into_boxed_slice(),
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::LocalDeclaration {
@@ -2486,6 +2701,7 @@ impl<'tir> Builder<'tir> {
 					),
 				},
 				ty: self.lower_type_index(expr.ty),
+				span: expr.span,
 			},
 			tir::ExprKind::Unary { operator, operand } => {
 				let operand =
@@ -2497,6 +2713,7 @@ impl<'tir> Builder<'tir> {
 						UnaryOp::BitNot => ExprKind::BitNot { value: operand },
 					},
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Binary {
@@ -2685,6 +2902,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind,
 					ty: self.lower_type_index(expr.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::ArrayLiteral { elements, memory } => {
@@ -2702,6 +2920,7 @@ impl<'tir> Builder<'tir> {
 					return Expression {
 						kind: ExprKind::Int { value: 0 },
 						ty: self.pointer_type(memory_id),
+						span: expr.span,
 					};
 				}
 				let (data_index, _) =
@@ -2709,6 +2928,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::StaticPointer { data_index },
 					ty: self.pointer_type(memory_id),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::ArrayRepeat {
@@ -2729,6 +2949,7 @@ impl<'tir> Builder<'tir> {
 					return Expression {
 						kind: ExprKind::Int { value: 0 },
 						ty: self.pointer_type(memory_id),
+						span: expr.span,
 					};
 				}
 				let (data_index, _) =
@@ -2736,6 +2957,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::StaticPointer { data_index },
 					ty: self.pointer_type(memory_id),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::SliceRange { object, start, end } => {
@@ -2786,6 +3008,7 @@ impl<'tir> Builder<'tir> {
 										value: Box::new(lowered_obj),
 									},
 									ty: Type::Unit,
+									span: expr.span,
 								});
 								(0, temp)
 							}
@@ -2797,6 +3020,7 @@ impl<'tir> Builder<'tir> {
 								value_index: 0,
 							},
 							ty: ptr_ty,
+							span: expr.span,
 						};
 						let len = Expression {
 							kind: ExprKind::AggregateGet {
@@ -2805,6 +3029,7 @@ impl<'tir> Builder<'tir> {
 								value_index: 1,
 							},
 							ty: idx_ty,
+							span: expr.span,
 						};
 						(ptr, Some(len))
 					}
@@ -2830,6 +3055,7 @@ impl<'tir> Builder<'tir> {
 							value: Box::new(s_lowered),
 						},
 						ty: Type::Unit,
+						span: expr.span,
 					});
 					Some(temp)
 				} else {
@@ -2846,6 +3072,7 @@ impl<'tir> Builder<'tir> {
 								local_index: li,
 							},
 							ty: idx_ty,
+							span: expr.span,
 						};
 						let byte_offset = if elem_size == 1 {
 							start_val
@@ -2858,9 +3085,11 @@ impl<'tir> Builder<'tir> {
 											value: elem_size as i64,
 										},
 										ty: idx_ty,
+										span: expr.span,
 									}),
 								},
 								ty: idx_ty,
+								span: expr.span,
 							}
 						};
 						Expression {
@@ -2869,6 +3098,7 @@ impl<'tir> Builder<'tir> {
 								right: Box::new(byte_offset),
 							},
 							ty: ptr_ty,
+							span: expr.span,
 						}
 					}
 				};
@@ -2898,6 +3128,7 @@ impl<'tir> Builder<'tir> {
 									value: Box::new(e_lowered),
 								},
 								ty: Type::Unit,
+								span: expr.span,
 							});
 
 							// Allocate a synthetic block scope for the trap branch.
@@ -2908,6 +3139,7 @@ impl<'tir> Builder<'tir> {
 									func_ctx.current_scope_index as u32,
 								),
 								locals: vec![],
+								locals_debug: vec![],
 								result: Type::Never,
 							});
 
@@ -2922,6 +3154,7 @@ impl<'tir> Builder<'tir> {
 													local_index: s_li,
 												},
 												ty: idx_ty,
+												span: expr.span,
 											}),
 											right: Box::new(Expression {
 												kind: ExprKind::LocalGet {
@@ -2929,9 +3162,11 @@ impl<'tir> Builder<'tir> {
 													local_index: e_temp,
 												},
 												ty: idx_ty,
+												span: expr.span,
 											}),
 										},
 										ty: Type::Bool,
+										span: expr.span,
 									}),
 									then_block: Box::new(Expression {
 										kind: ExprKind::Block {
@@ -2940,14 +3175,17 @@ impl<'tir> Builder<'tir> {
 												Expression {
 													kind: ExprKind::Unreachable,
 													ty: Type::Never,
+													span: expr.span,
 												},
 											]),
 										},
 										ty: Type::Never,
+										span: expr.span,
 									}),
 									else_block: None,
 								},
 								ty: Type::Unit,
+								span: expr.span,
 							});
 
 							Expression {
@@ -2956,6 +3194,7 @@ impl<'tir> Builder<'tir> {
 									local_index: e_temp,
 								},
 								ty: idx_ty,
+								span: expr.span,
 							}
 						} else {
 							e_lowered
@@ -2965,6 +3204,7 @@ impl<'tir> Builder<'tir> {
 						Some(sz) => Expression {
 							kind: ExprKind::Int { value: sz as i64 },
 							ty: idx_ty,
+							span: expr.span,
 						},
 						None => opt_slice_len.unwrap(),
 					},
@@ -2982,9 +3222,11 @@ impl<'tir> Builder<'tir> {
 									local_index: li,
 								},
 								ty: idx_ty,
+								span: expr.span,
 							}),
 						},
 						ty: idx_ty,
+						span: expr.span,
 					},
 				};
 
@@ -2994,6 +3236,7 @@ impl<'tir> Builder<'tir> {
 						values: Box::new([offset_ptr, new_len]),
 					},
 					ty: result_ty,
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::Load { place } => {
@@ -3006,6 +3249,7 @@ impl<'tir> Builder<'tir> {
 						memory,
 					},
 					ty: self.lower_type_index(place.ty),
+					span: expr.span,
 				}
 			}
 			tir::ExprKind::AddressOf { place, .. } => {
@@ -3023,9 +3267,11 @@ impl<'tir> Builder<'tir> {
 									value: offset as i64,
 								},
 								ty: ptr_ty,
+								span: expr.span,
 							}),
 						},
 						ty: ptr_ty,
+						span: expr.span,
 					}
 				}
 			}
@@ -3042,6 +3288,7 @@ impl<'tir> Builder<'tir> {
 						memory,
 					},
 					ty: Type::Unit,
+					span: expr.span,
 				}
 			}
 		}
@@ -3052,6 +3299,7 @@ impl<'tir> Builder<'tir> {
 		func_ctx: &mut FunctionContext,
 		name: SymbolU32,
 		expr_ty: tir::TypeIndex,
+		span: ast::TextSpan,
 		type_args: &[tir::TypeIndex],
 		arguments: &[tir::Expression],
 		sink: &mut Vec<Expression>,
@@ -3082,6 +3330,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::MemoryGrow { memory, delta },
 					ty: self.lower_type_index(expr_ty),
+					span,
 				}
 			}
 			"memory_size" => {
@@ -3103,6 +3352,7 @@ impl<'tir> Builder<'tir> {
 				Expression {
 					kind: ExprKind::MemorySize { memory },
 					ty: self.lower_type_index(expr_ty),
+					span,
 				}
 			}
 			"slice_len" => {
@@ -3119,6 +3369,7 @@ impl<'tir> Builder<'tir> {
 							value_index: 1,
 						},
 						ty: result_ty,
+						span,
 					},
 					_ => {
 						let slice_ty = self.lower_type_index(slice_arg.ty);
@@ -3136,6 +3387,7 @@ impl<'tir> Builder<'tir> {
 								value: Box::new(lowered),
 							},
 							ty: Type::Unit,
+							span,
 						});
 						Expression {
 							kind: ExprKind::AggregateGet {
@@ -3144,6 +3396,7 @@ impl<'tir> Builder<'tir> {
 								value_index: 1,
 							},
 							ty: result_ty,
+							span,
 						}
 					}
 				}
@@ -3162,6 +3415,7 @@ impl<'tir> Builder<'tir> {
 							value_index: 0,
 						},
 						ty: result_ty,
+						span,
 					},
 					_ => {
 						let slice_ty = self.lower_type_index(slice_arg.ty);
@@ -3179,6 +3433,7 @@ impl<'tir> Builder<'tir> {
 								value: Box::new(lowered),
 							},
 							ty: Type::Unit,
+							span,
 						});
 						Expression {
 							kind: ExprKind::AggregateGet {
@@ -3187,6 +3442,7 @@ impl<'tir> Builder<'tir> {
 								value_index: 0,
 							},
 							ty: result_ty,
+							span,
 						}
 					}
 				}
@@ -3200,6 +3456,7 @@ impl<'tir> Builder<'tir> {
 						values: Box::new([data, len]),
 					},
 					ty: result_ty,
+					span,
 				}
 			}
 			"size_of" => {
@@ -3218,6 +3475,7 @@ impl<'tir> Builder<'tir> {
 						value: layout.size as i64,
 					},
 					ty: self.lower_type_index(expr_ty),
+					span,
 				}
 			}
 			"align_of" => {
@@ -3236,6 +3494,7 @@ impl<'tir> Builder<'tir> {
 						value: layout.align as i64,
 					},
 					ty: self.lower_type_index(expr_ty),
+					span,
 				}
 			}
 			"f32_sqrt" | "f64_sqrt" => Expression {
@@ -3247,6 +3506,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_abs" | "f64_abs" => Expression {
 				kind: ExprKind::Abs {
@@ -3257,6 +3517,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_floor" | "f64_floor" => Expression {
 				kind: ExprKind::Floor {
@@ -3267,6 +3528,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_ceil" | "f64_ceil" => Expression {
 				kind: ExprKind::Ceil {
@@ -3277,6 +3539,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i64_extend_i32" => Expression {
 				kind: ExprKind::I64ExtendI32S {
@@ -3287,6 +3550,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"u64_extend_u32" => Expression {
 				kind: ExprKind::I64ExtendI32U {
@@ -3297,6 +3561,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i32_wrap_i64" => Expression {
 				kind: ExprKind::I32WrapI64 {
@@ -3307,6 +3572,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_convert_i32" => Expression {
 				kind: ExprKind::F32ConvertI32 {
@@ -3317,6 +3583,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_convert_u32" => Expression {
 				kind: ExprKind::F32ConvertU32 {
@@ -3327,6 +3594,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_convert_i64" => Expression {
 				kind: ExprKind::F32ConvertI64 {
@@ -3337,6 +3605,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_convert_u64" => Expression {
 				kind: ExprKind::F32ConvertU64 {
@@ -3347,6 +3616,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f64_convert_i32" => Expression {
 				kind: ExprKind::F64ConvertI32 {
@@ -3357,6 +3627,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f64_convert_u32" => Expression {
 				kind: ExprKind::F64ConvertU32 {
@@ -3367,6 +3638,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f64_convert_i64" => Expression {
 				kind: ExprKind::F64ConvertI64 {
@@ -3377,6 +3649,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f64_convert_u64" => Expression {
 				kind: ExprKind::F64ConvertU64 {
@@ -3387,6 +3660,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i32_trunc_f32" => Expression {
 				kind: ExprKind::I32TruncF32 {
@@ -3397,6 +3671,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"u32_trunc_f32" => Expression {
 				kind: ExprKind::U32TruncF32 {
@@ -3407,6 +3682,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i32_trunc_f64" => Expression {
 				kind: ExprKind::I32TruncF64 {
@@ -3417,6 +3693,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"u32_trunc_f64" => Expression {
 				kind: ExprKind::U32TruncF64 {
@@ -3427,6 +3704,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i64_trunc_f32" => Expression {
 				kind: ExprKind::I64TruncF32 {
@@ -3437,6 +3715,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"u64_trunc_f32" => Expression {
 				kind: ExprKind::U64TruncF32 {
@@ -3447,6 +3726,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"i64_trunc_f64" => Expression {
 				kind: ExprKind::I64TruncF64 {
@@ -3457,6 +3737,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"u64_trunc_f64" => Expression {
 				kind: ExprKind::U64TruncF64 {
@@ -3467,6 +3748,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f64_promote_f32" => Expression {
 				kind: ExprKind::F64PromoteF32 {
@@ -3477,6 +3759,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"f32_demote_f64" => Expression {
 				kind: ExprKind::F32DemoteF64 {
@@ -3487,6 +3770,7 @@ impl<'tir> Builder<'tir> {
 					)),
 				},
 				ty: self.lower_type_index(expr_ty),
+				span,
 			},
 			"memory_fill" => {
 				let raw_ty = type_args[0];
@@ -3527,6 +3811,7 @@ impl<'tir> Builder<'tir> {
 						len,
 					},
 					ty: Type::Unit,
+					span,
 				}
 			}
 			"memory_copy" => {
@@ -3572,6 +3857,7 @@ impl<'tir> Builder<'tir> {
 						len,
 					},
 					ty: Type::Unit,
+					span,
 				}
 			}
 			name => unreachable!("cannot lower unknown intrinsic `{name}`"),
@@ -3750,6 +4036,7 @@ impl<'tir> Builder<'tir> {
 		let binary_expr = Expression {
 			kind: binary_expr_kind,
 			ty: self.lower_type_index(left.ty),
+			span: ast::TextSpan::new(left.span.start, right.span.end),
 		};
 
 		// Now assign the result back to left: x = (x + y)

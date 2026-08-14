@@ -1,0 +1,28 @@
+struct Vec2 {
+    x: i32,
+    y: i32,
+}
+
+fn add(a: i32, b: i32) -> i32 {
+    local sum = a + b;
+    sum
+}
+
+fn magnitude_sq(v: Vec2) -> i32 {
+    v.x * v.x + v.y * v.y
+}
+
+fn compute(n: i32) -> i32 {
+    local mut total: i32 = 0;
+    local mut i: i32 = 0;
+    loop {
+        if i >= n { break };
+        local v: Vec2 = Vec2::{ x: i, y: i * 2 };
+        local step = add(magnitude_sq(v), i);
+        total = add(total, step);
+        i += 1;
+    }
+    total
+}
+
+export { compute }

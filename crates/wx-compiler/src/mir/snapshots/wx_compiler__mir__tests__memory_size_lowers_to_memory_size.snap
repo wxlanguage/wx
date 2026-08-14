@@ -9,16 +9,19 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 0
         locals: []
+        locals_debug: []
         result: U32
       - kind: Block
         parent: 1
         locals:
           - ty: Unit
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -36,7 +39,13 @@ functions:
                           value:
                             kind: Noop
                             ty: Unit
+                            span:
+                              start: 79
+                              end: 83
                       ty: Unit
+                      span:
+                        start: 79
+                        end: 83
                     - kind:
                         Block:
                           scope_index: 2
@@ -45,10 +54,24 @@ functions:
                                 MemorySize:
                                   memory: 106
                               ty: U32
+                              span:
+                                start: 3554
+                                end: 3571
                       ty: U32
+                      span:
+                        start: 3544
+                        end: 3577
               ty: U32
+              span:
+                start: 79
+                end: 90
       ty: U32
+      span:
+        start: 73
+        end: 92
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Unit

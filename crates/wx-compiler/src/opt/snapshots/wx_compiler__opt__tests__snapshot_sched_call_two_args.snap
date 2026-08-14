@@ -11,3 +11,6 @@ body:
   - LocalGet: 1
   - Call: 107
   - LocalTee: 2
+br_table_depths: []
+spans: []
+locals_debug: []

@@ -13,8 +13,9 @@ use indoc::indoc;
 
 use crate::mir::{self, MIR};
 use crate::opt::builder::Builder;
-use crate::opt::scheduler::{Instruction, Scheduler};
-use crate::opt::{ControlNode, DataNodeKind, ScalarType, StackResult};
+use crate::opt::scheduler::Scheduler;
+use crate::opt::{ControlNode, DataNodeKind, StackResult};
+use crate::wasm::{Instruction, ScalarType};
 use crate::{tir, vfs};
 
 /// Minimal stdlib definitions required for memory / pointer tests.
@@ -42,7 +43,7 @@ impl TestCase {
 		Scheduler::schedule(&opt, &self.mir).body
 	}
 
-	fn schedule_full(&self) -> crate::opt::scheduler::ScheduledFunction {
+	fn schedule_full(&self) -> crate::wasm::Function {
 		let func_mir = self.get_first_func();
 		let opt = Builder::build(&self.mir, func_mir);
 		Scheduler::schedule(&opt, &self.mir)
@@ -65,7 +66,16 @@ impl TestCase {
 			.unwrap();
 		let mut graph = builder.build(root_id, stdlib_id);
 		let tir = tir::TIR::build(&mut graph);
-		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
+		let mut mir = MIR::build(
+			&tir,
+			&graph.interner,
+			graph.id_generator,
+			crate::CompilationMode::Release,
+		);
+		let mut call_graph =
+			mir::CallGraph::build(&mir.functions, &mir.call_edges);
+		mir.inline_calls(&mut call_graph);
+		mir.dead_code_eliminate(&call_graph);
 		TestCase { mir }
 	}
 
@@ -566,7 +576,7 @@ fn test_sched_if_else() {
 		matches!(
 			body[ip],
 			Instruction::If {
-				ty: crate::opt::scheduler::BlockType::Empty
+				ty: crate::wasm::BlockType::Empty
 			}
 		),
 		"If block type should be Empty when phi outputs exist; got {:?}",
@@ -1234,7 +1244,7 @@ fn test_sched_if_else_phi_stores() {
 		matches!(
 			body[if_pos],
 			Instruction::If {
-				ty: crate::opt::scheduler::BlockType::Empty
+				ty: crate::wasm::BlockType::Empty
 			}
 		),
 		"If block type should be Empty when phi stores are used; got {:?}",
@@ -2306,7 +2316,9 @@ fn test_match_schedules_nested_if_else_chain() {
 	assert_eq!(else_count, 2, "one `else` per real case; got: {body:?}");
 	assert_eq!(eq_count, 2, "one comparison per real case; got: {body:?}");
 	assert!(
-		!body.iter().any(|i| matches!(i, Instruction::BrTable(_))),
+		!body
+			.iter()
+			.any(|i| matches!(i, Instruction::BrTable { .. })),
 		"below the br_table threshold, must not emit one; got: {body:?}"
 	);
 }
@@ -2334,11 +2346,15 @@ fn test_match_schedules_br_table_for_dense_cases() {
         }
         export { classify }
     "});
-	let body = case.schedule();
-	let br_tables: Vec<_> = body
+	let sched = case.schedule_full();
+	let body = &sched.body;
+	let br_tables: Vec<&[u32]> = body
 		.iter()
 		.filter_map(|i| match i {
-			Instruction::BrTable(depths) => Some(depths),
+			Instruction::BrTable { start, len } => Some(
+				&sched.br_table_depths
+					[*start as usize..(*start + *len) as usize],
+			),
 			_ => None,
 		})
 		.collect();
@@ -2348,7 +2364,7 @@ fn test_match_schedules_br_table_for_dense_cases() {
 		"expected exactly one br_table; got: {body:?}"
 	);
 	assert_eq!(
-		br_tables[0].as_ref(),
+		br_tables[0],
 		[0, 1, 2, 3],
 		"depths must be per-case array position, default (== case_count) trailing"
 	);

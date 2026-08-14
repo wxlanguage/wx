@@ -9,6 +9,7 @@ functions:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -19,14 +20,23 @@ functions:
                 Int:
                   value: 1
               ty: U32
+              span:
+                start: 77
+                end: 98
       ty: U32
+      span:
+        start: 75
+        end: 100
     static_data: []
+    file_id: 1
+    name: ~
   - id: 108
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -37,14 +47,23 @@ functions:
                 Int:
                   value: 4
               ty: U32
+              span:
+                start: 124
+                end: 146
       ty: U32
+      span:
+        start: 122
+        end: 148
     static_data: []
+    file_id: 1
+    name: ~
   - id: 109
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -55,14 +74,23 @@ functions:
                 Int:
                   value: 8
               ty: U32
+              span:
+                start: 172
+                end: 194
       ty: U32
+      span:
+        start: 170
+        end: 196
     static_data: []
+    file_id: 1
+    name: ~
   - id: 110
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals: []
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -73,8 +101,16 @@ functions:
                 Int:
                   value: 2
               ty: U32
+              span:
+                start: 220
+                end: 242
       ty: U32
+      span:
+        start: 218
+        end: 244
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - U32

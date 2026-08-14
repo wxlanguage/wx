@@ -29,7 +29,15 @@ impl TestCase {
 			.unwrap();
 		let mut graph = builder.build(root_id, stdlib_id);
 		let tir = tir::TIR::build(&mut graph);
-		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
+		let mut mir = MIR::build(
+			&tir,
+			&graph.interner,
+			graph.id_generator,
+			crate::CompilationMode::Release,
+		);
+		let mut call_graph = CallGraph::build(&mir.functions, &mir.call_edges);
+		mir.inline_calls(&mut call_graph);
+		mir.dead_code_eliminate(&call_graph);
 		TestCase { graph, tir, mir }
 	}
 }

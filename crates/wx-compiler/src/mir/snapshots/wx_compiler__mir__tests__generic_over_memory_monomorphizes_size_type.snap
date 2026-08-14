@@ -11,6 +11,7 @@ functions:
         locals:
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -26,17 +27,34 @@ functions:
                     ty:
                       Function:
                         signature_index: 0
+                    span:
+                      start: 196
+                      end: 209
                   arguments:
                     - kind: Noop
                       ty: Unit
+                      span:
+                        start: 201
+                        end: 205
                     - kind:
                         LocalGet:
                           scope_index: 0
                           local_index: 0
                       ty: U32
+                      span:
+                        start: 207
+                        end: 208
               ty: U32
+              span:
+                start: 196
+                end: 209
       ty: U32
+      span:
+        start: 190
+        end: 211
     static_data: []
+    file_id: 1
+    name: ~
   - id: 110
     signature_index: 3
     scopes:
@@ -45,6 +63,7 @@ functions:
         locals:
           - ty: U64
             mutability: Immutable
+        locals_debug: []
         result: U64
     block:
       kind:
@@ -60,17 +79,34 @@ functions:
                     ty:
                       Function:
                         signature_index: 2
+                    span:
+                      start: 251
+                      end: 265
                   arguments:
                     - kind: Noop
                       ty: Unit
+                      span:
+                        start: 256
+                        end: 261
                     - kind:
                         LocalGet:
                           scope_index: 0
                           local_index: 0
                       ty: U64
+                      span:
+                        start: 263
+                        end: 264
               ty: U64
+              span:
+                start: 251
+                end: 265
       ty: U64
+      span:
+        start: 245
+        end: 267
     static_data: []
+    file_id: 1
+    name: ~
   - id: 119
     signature_index: 0
     scopes:
@@ -81,6 +117,7 @@ functions:
             mutability: Immutable
           - ty: U32
             mutability: Immutable
+        locals_debug: []
         result: U32
     block:
       kind:
@@ -92,8 +129,16 @@ functions:
                   scope_index: 0
                   local_index: 1
               ty: U32
+              span:
+                start: 154
+                end: 155
       ty: U32
+      span:
+        start: 148
+        end: 157
     static_data: []
+    file_id: 1
+    name: ~
   - id: 120
     signature_index: 2
     scopes:
@@ -104,6 +149,7 @@ functions:
             mutability: Immutable
           - ty: U64
             mutability: Immutable
+        locals_debug: []
         result: U64
     block:
       kind:
@@ -115,8 +161,16 @@ functions:
                   scope_index: 0
                   local_index: 1
               ty: U64
+              span:
+                start: 154
+                end: 155
       ty: U64
+      span:
+        start: 148
+        end: 157
     static_data: []
+    file_id: 1
+    name: ~
 signatures:
   - items:
       - Unit
