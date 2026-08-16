@@ -1,17 +1,25 @@
 use std::*;
 
-struct Arena<M: Memory> {
-    start: M::*u8,
-    end: M::*u8,
-    cursor: M::*u8,
+struct Arena<Mem: Memory> {
+    start: Mem::*u8,
+    end: Mem::*u8,
+    cursor: Mem::*u8,
 }
 
-impl<M: Memory> Arena<M> {
-    fn new(buffer: M::[]u8) -> Self {
+impl<Mem: Memory> Arena<Mem> {
+    fn new(buffer: Mem::[]u8) -> Self {
         Self::{
             start: buffer.ptr(),
             end: ptr::add(buffer.ptr(), buffer.len()),
             cursor: buffer.ptr(),
         }
     }
+}
+
+impl f32 {
+    const PI: f32 = 3.14;
+}
+
+fn test() {
+    local x = f32::PI;
 }

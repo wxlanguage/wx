@@ -615,13 +615,15 @@ impl<'a> Builder<'a> {
 				pub_span,
 				name,
 				type_params,
-				ty,
+				body,
+				attributes,
 				..
 			} => self.build_type_alias_definition(
 				*pub_span,
 				name,
 				type_params,
-				ty,
+				body.as_deref(),
+				attributes,
 			),
 			ast::Item::Use { path, pub_span } => {
 				let mut items: Vec<NodeId> = Vec::new();
@@ -907,10 +909,20 @@ impl<'a> Builder<'a> {
 				self.arena.group(concat)
 			}
 			ast::ImplItem::Constant {
-				name, ty, value, ..
+				pub_span,
+				attributes,
+				name,
+				ty,
+				value,
+				..
 			} => {
-				let mut nodes: Vec<NodeId> =
-					vec![self.text(Text::Const), self.symbol(name.inner)];
+				let mut nodes: Vec<NodeId> = Vec::new();
+				self.build_attributes(&mut nodes, attributes);
+				if pub_span.is_some() {
+					nodes.push(self.text(Text::Pub));
+				}
+				nodes.push(self.text(Text::Const));
+				nodes.push(self.symbol(name.inner));
 				if let Some(ty) = ty {
 					nodes.push(self.text(Text::ColonSp));
 					nodes.push(self.build_type_expression(&ty.inner));
@@ -1067,17 +1079,21 @@ impl<'a> Builder<'a> {
 		pub_span: Option<ast::TextSpan>,
 		name: &ast::Spanned<SymbolU32>,
 		type_params: &[ast::TypeParam],
-		ty: &ast::Spanned<ast::TypeExpression>,
+		body: Option<&ast::Spanned<ast::TypeExpression>>,
+		attributes: &[ast::Attribute],
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
+		self.build_attributes(&mut nodes, attributes);
 		if pub_span.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::TypeKw));
 		nodes.push(self.symbol(name.inner));
 		self.build_type_params(&mut nodes, type_params);
-		nodes.push(self.text(Text::EqSp));
-		nodes.push(self.build_type_expression(&ty.inner));
+		if let Some(body) = body {
+			nodes.push(self.text(Text::EqSp));
+			nodes.push(self.build_type_expression(&body.inner));
+		}
 		nodes.push(self.text(Text::Semi));
 		self.arena.concat(nodes)
 	}

@@ -1,3 +1,42 @@
+#[intrinsic]
+pub type i8;
+
+#[intrinsic]
+pub type u8;
+
+#[intrinsic]
+pub type i16;
+
+#[intrinsic]
+pub type u16;
+
+#[intrinsic]
+pub type i32;
+
+#[intrinsic]
+pub type u32;
+
+#[intrinsic]
+pub type i64;
+
+#[intrinsic]
+pub type u64;
+
+#[intrinsic]
+pub type f32;
+
+#[intrinsic]
+pub type f64;
+
+#[intrinsic]
+pub type bool;
+
+#[intrinsic]
+pub type char;
+
+#[intrinsic]
+pub type never;
+
 pub const PAGE_SIZE: u32 = 65536;
 
 #[intrinsic]
@@ -119,11 +158,11 @@ pub fn f64_promote_f32(value: f32) -> f64;
 pub fn f32_demote_f64(value: f64) -> f32;
 
 impl f32 {
-    pub const PI: f32 = 3.14159265358979323846;
+    pub const PI: f32 = 3.14159265358979323846264338327950288;
 }
 
 impl f64 {
-    pub const PI: f64 = 3.14159265358979323846;
+    pub const PI: f64 = 3.14159265358979323846264338327950288;
 }
 
 pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }

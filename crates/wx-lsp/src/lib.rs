@@ -33,8 +33,8 @@ use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::ast;
 use wx_compiler::ast::TextSpan;
 use wx_compiler::tir::{
-	ImplTarget, ModuleDeclarationKind, SourceSpan, TIR, TypeParamInfo,
-	TypeParamOwner,
+	ImplTarget, ItemAttribute, ModuleDeclarationKind, SourceSpan, TIR,
+	TypeParamInfo, TypeParamOwner,
 };
 use wx_compiler::vfs::{self, FileId, FileSource, NativeFileSource};
 
@@ -1868,8 +1868,13 @@ fn symbol_hover_text(
 			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}type {name}");
 			push_type_params(&mut s, tir, interner, &alias.type_params);
-			s.push_str(" = ");
-			s.push_str(&fmt.display_type(alias.template).ok()?);
+			// Bodiless `#[intrinsic] type u8;` — `alias.body` holds the
+			// resolved primitive, not a source-written `= Type` (see the
+			// doc comment on `TypeAlias::body`).
+			if !alias.attributes.contains(&ItemAttribute::Intrinsic) {
+				s.push_str(" = ");
+				s.push_str(&fmt.display_type(alias.body).ok()?);
+			}
 			Some(s)
 		}
 		SymbolKind::Const(def_id) => {

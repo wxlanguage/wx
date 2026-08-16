@@ -53,7 +53,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				language_id: "wx".into(),
 				version: 1,
 				text:
-					"fn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
 						.into(),
 			},
 		})
@@ -69,7 +69,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				range: None,
 				range_length: None,
 				text:
-					"fn add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
+					"use std::*;\nfn add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
 						.into(),
 			}],
 		})
@@ -81,7 +81,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 			text_document_position_params: TextDocumentPositionParams {
 				text_document: TextDocumentIdentifier { uri: uri.clone() },
 				position: Position {
-					line: 0,
+					line: 1,
 					character: 4,
 				},
 			},
@@ -950,7 +950,7 @@ fn full_diagnostic_renders_and_handles_bad_index() {
 	let root = PathBuf::from("/test/main.wx");
 	let (_, compiled) = compile_source(
 		&root,
-		"fn main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
+		"use std::*;\nfn main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
 	);
 
 	assert!(
@@ -1096,6 +1096,8 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 	// tokens) silently did nothing for a name that resolved to a type alias.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
+		use std::*;
+
 		type Id = u32;
 
 		fn test() -> Id {

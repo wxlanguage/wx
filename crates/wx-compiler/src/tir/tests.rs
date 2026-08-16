@@ -3932,7 +3932,7 @@ fn test_type_alias_simple() {
 		.iter()
 		.find(|a| case.graph.interner.resolve(a.name.inner) == Some("Foo"))
 		.expect("Foo alias not found");
-	assert_eq!(alias.template, TypeIndex::I32);
+	assert_eq!(alias.body, TypeIndex::I32);
 }
 
 #[test]
@@ -3964,7 +3964,7 @@ fn test_type_alias_generic_rhs() {
 			case.graph.interner.resolve(a.name.inner) == Some("WrapperI32")
 		})
 		.expect("WrapperI32 alias not found");
-	match &case.tir.types[alias.template.as_usize()] {
+	match &case.tir.types[alias.body.as_usize()] {
 		Type::Struct { args, .. } => {
 			assert_eq!(args.len(), 1);
 			assert_eq!(case.tir.types[args[0].as_usize()], Type::I32);

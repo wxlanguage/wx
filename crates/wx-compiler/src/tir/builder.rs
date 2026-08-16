@@ -434,6 +434,17 @@ fn report_missing_function_body(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_note("provide a definition for the function: `{ <body> }`")
 }
 
+fn report_missing_type_alias_body(span: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingTypeAliasBody.code())
+		.with_message("free type alias without body")
+		.with_label(span.primary_label())
+		.with_label(
+			Label::secondary(span.file_id, span.span)
+				.with_message("provide a definition for the type: `= <type>;`"),
+		)
+}
+
 fn report_invalid_memory_kind(span: SourceSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InvalidMemoryKind.code())
@@ -2584,7 +2595,7 @@ impl<'ast> Builder<'ast, '_> {
 			| SymbolKind::TraitAssocType { .. }
 			| SymbolKind::Pending(_) => None,
 			SymbolKind::TypeAlias { type_alias_index } => {
-				Some(self.tir.type_aliases[type_alias_index as usize].template)
+				Some(self.tir.type_aliases[type_alias_index as usize].body)
 			}
 		}
 	}
@@ -2599,11 +2610,6 @@ impl<'ast> Builder<'ast, '_> {
 		identifier: Spanned<SymbolU32>,
 		arity: TypeArgArity,
 	) -> Result<TypeIndex, ()> {
-		if let Ok(ty) =
-			Type::try_from(self.interner.resolve(identifier.inner).unwrap())
-		{
-			return Ok(self.intern_type(ty));
-		}
 		if let Some(scope) = scope {
 			// Search the owner's own type params first (innermost scope wins).
 			let own_params: &[TypeParamInfo] = match scope.owner {
@@ -4281,6 +4287,7 @@ impl<'ast> Builder<'ast, '_> {
 				pub_span,
 				name,
 				type_params,
+				attributes,
 				..
 			} => {
 				self.claim_name_binding(
@@ -4293,17 +4300,19 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.item_lookup
 					.insert(*id, ItemIndex::TypeAlias(type_alias_index));
+				let attributes = self.resolve_attributes(*id, attributes);
 				self.tir.type_aliases.push(TypeAlias {
 					id: *id,
 					file_id,
 					namespace,
 					pub_span: *pub_span,
 					name: *name,
+					attributes,
 					type_params: type_params
 						.iter()
 						.map(|tp| TypeParamInfo::new(tp.name))
 						.collect(),
-					template: TypeIndex::ERROR,
+					body: TypeIndex::ERROR,
 					accesses: Vec::new(),
 				});
 				self.ast_nodes.push(AstEntry {
@@ -4971,14 +4980,14 @@ impl<'ast> Builder<'ast, '_> {
 				);
 			}
 			AstNodeRef::TypeAlias { item } => {
-				let (id, name, ast_type_params, ty_expr) = match item {
+				let (id, name, ast_type_params, body_expr) = match item {
 					ast::Item::TypeAlias {
 						id,
 						name,
 						type_params,
-						ty,
+						body,
 						..
-					} => (id, name, type_params, ty),
+					} => (id, name, type_params, body),
 					_ => unreachable!(),
 				};
 				let type_alias_index = self.tir.expect_type_alias_index(*id);
@@ -5003,12 +5012,40 @@ impl<'ast> Builder<'ast, '_> {
 						self_type: None,
 					})
 				};
-				let template = self.resolve_signature_type(
-					resolve_context,
-					scope,
-					ty_expr,
-				);
-				self.tir.type_aliases[type_alias_index as usize].template =
+				let template = match body_expr {
+					Some(ty_expr) => self.resolve_signature_type(
+						resolve_context,
+						scope,
+						ty_expr,
+					),
+					// `#[intrinsic] type i8;` etc — bodiless, only legal for
+					// the primitives declared in `std/main.wx`. Same trust
+					// model as `#[intrinsic]` on functions (see
+					// `resolve_attributes`'s doc comment): not validated
+					// against the item kind or checked against user modules
+					// yet, since only the stdlib we control uses it today.
+					None if self.tir.type_aliases
+						[type_alias_index as usize]
+						.attributes
+						.contains(&ItemAttribute::Intrinsic) =>
+					{
+						Type::try_from(
+							self.interner.resolve(name.inner).unwrap(),
+						)
+						.map(|ty| self.intern_type(ty))
+						.unwrap_or(TypeIndex::ERROR)
+					}
+					None => {
+						self.tir.diagnostics.push(
+							report_missing_type_alias_body(SourceSpan::new(
+								resolve_context.file_id,
+								name.span,
+							)),
+						);
+						TypeIndex::ERROR
+					}
+				};
+				self.tir.type_aliases[type_alias_index as usize].body =
 					template;
 
 				// Bind the name only if this occurrence still holds its own
@@ -7440,7 +7477,7 @@ impl<'ast> Builder<'ast, '_> {
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
 				let template =
-					self.tir.type_aliases[type_alias_index as usize].template;
+					self.tir.type_aliases[type_alias_index as usize].body;
 				self.substitute_type(template, &args)
 			}
 			_ => unreachable!("filtered above"),

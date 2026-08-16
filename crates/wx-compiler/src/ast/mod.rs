@@ -1746,13 +1746,15 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		path: Box<[Spanned<SymbolU32>]>,
 	},
-	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent alias.
+	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
+	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
+	/// declaration (primitives).
 	TypeAlias {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		type_params: Box<[TypeParam]>,
-		ty: Box<Spanned<TypeExpression>>,
+		body: Option<Box<Spanned<TypeExpression>>>,
 		attributes: Box<[Attribute]>,
 	},
 }
@@ -5307,10 +5309,25 @@ impl<'ctx> Parser<'ctx> {
 			Box::new([])
 		};
 
-		parser.next_expect(Token::Eq)?;
-		let ty = parser.parse_type_expression()?;
+		// No `= TypeExpr` body — a bodiless `type Name;` declaration, only
+		// legal when tagged `#[intrinsic]` (checked in TIR). Used for
+		// primitives, which have no expressible type-expression right-hand
+		// side of their own and are never generic, so falling back to
+		// `name_span` (rather than tracking `type_params`' own end, which
+		// nothing else in this parser needs either) is exact for every real
+		// use of this branch.
+		let body = if parser.lexer.peek().inner == Token::Eq {
+			parser.lexer.next();
+			Some(Box::new(parser.parse_type_expression()?))
+		} else {
+			None
+		};
 
-		let span = TextSpan::new(type_span.start, ty.span.end);
+		let end = match &body {
+			Some(body) => body.span.end,
+			None => name_span.end,
+		};
+		let span = TextSpan::new(type_span.start, end);
 		Ok(Spanned {
 			inner: Item::TypeAlias {
 				id: parser.id_generator.generate(),
@@ -5320,7 +5337,7 @@ impl<'ctx> Parser<'ctx> {
 					span: name_span,
 				},
 				type_params,
-				ty: Box::new(ty),
+				body,
 				attributes: Box::new([]),
 			},
 			span,

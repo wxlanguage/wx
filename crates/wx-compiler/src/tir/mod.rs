@@ -1486,6 +1486,7 @@ define_diagnostic_codes! {
 		InvalidPattern => "E1068",
 		InvalidMemoryLimitsAttribute => "E1069",
 		UnreachableMatchArm => "W1010",
+		MissingTypeAliasBody => "E1070",
 	}
 }
 
@@ -1557,6 +1558,7 @@ pub struct TypeAlias {
 	pub namespace: Option<NamespaceIndex>,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
+	pub attributes: Box<[ItemAttribute]>,
 	/// Empty for non-generic aliases.
 	pub type_params: Box<[TypeParamInfo]>,
 	/// The alias's target type, fully resolved. For a generic alias this may
@@ -1564,7 +1566,12 @@ pub struct TypeAlias {
 	/// placeholders, substituted via `substitute_type` at each reference site
 	/// that supplies concrete type arguments — the alias is transparent and
 	/// never appears past TIR.
-	pub template: TypeIndex,
+	///
+	/// Not `Option<TypeIndex>`: always resolved by the time anyone reads it
+	/// (falls back to `TypeIndex::ERROR`, never absent), even for bodiless
+	/// `#[intrinsic] type u8;` declarations. To check whether source actually
+	/// wrote `= Type`, look at `attributes` for `ItemAttribute::Intrinsic`.
+	pub body: TypeIndex,
 	pub accesses: Vec<SourceSpan>,
 }
 
