@@ -42,16 +42,16 @@ import "wasi_snapshot_preview1" as wasi {
   fn path_open(
     dir_fd: FileDescriptor,
     dir_flags: u32,
-    path: []u8,
+    path: &[u8],
     o_flags: u32,
     fs_rights_base: u64,
     fs_rights_inheriting: u64,
     fd_flags: u32,
-    opened_fd: *mut u32,
+    opened_fd: *u32,
   ) -> Errno;
 
-  fn fd_write(fd: FileDescriptor, io_vecs: [][]u8, bytes_written: *mut u32) -> Errno;
-  fn fd_read(fd: FileDescriptor, io_vecs: [][]mut u8, bytes_read: *mut u32) -> Errno;
+  fn fd_write(fd: FileDescriptor, io_vecs: &[&[u8]], bytes_written: *u32) -> Errno;
+  fn fd_read(fd: FileDescriptor, io_vecs: &[*[u8]], bytes_read: *u32) -> Errno;
   fn fd_close(fd: FileDescriptor) -> Errno;
 }
 
@@ -62,8 +62,8 @@ struct BumpAllocator {}
 impl Allocator for BumpAllocator {
   type Mem = heap;
 
-  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
-    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+  fn reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
+    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align);
     local new_end = ptr + layout.size;
     local cur_end = heap.size() * PAGE_SIZE;
     if new_end > cur_end {
@@ -71,20 +71,20 @@ impl Allocator for BumpAllocator {
       if heap.grow(needed) == -1 { unreachable }
     }
     bump = new_end as *u8;
-    ptr as *mut u8
+    ptr as *u8
   }
 }
 
-fn write_all(fd: FileDescriptor, bytes: []u8) {
-  local alloc: *mut BumpAllocator = std::ptr::null_mut();
-  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+fn write_all(fd: FileDescriptor, bytes: &[u8]) {
+  local alloc: *BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<&[u8]>(1);
   io_vecs[0] = bytes;
   local nwritten = alloc.alloc::<u32>(0);
   if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
 }
 
 fn main() {
-  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local alloc: *BumpAllocator = std::ptr::null_mut();
 
   local created_fd_ptr = alloc.alloc::<u32>(0);
   local create_result = wasi::path_open(
@@ -118,7 +118,7 @@ fn main() {
 
   local read_fd = read_fd_ptr.* as FileDescriptor;
   local buf = alloc.alloc_slice::<u8>(256);
-  local io_vecs = alloc.alloc_slice::<[]mut u8>(1);
+  local io_vecs = alloc.alloc_slice::<*[u8]>(1);
   io_vecs[0] = buf;
   local nread = alloc.alloc::<u32>(0);
   if wasi::fd_read(read_fd, io_vecs, nread) != Errno::Success { unreachable };

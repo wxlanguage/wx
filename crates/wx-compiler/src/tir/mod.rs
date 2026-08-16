@@ -148,18 +148,18 @@ pub enum Type {
 	Pointer {
 		to: TypeIndex,
 		memory: TypeIndex,
-		mutable: bool,
+		ownership: ast::Ownership,
 	},
 	Array {
 		of: TypeIndex,
 		size: u32,
 		memory: TypeIndex,
-		mutable: bool,
+		ownership: ast::Ownership,
 	},
 	Slice {
 		of: TypeIndex,
 		memory: TypeIndex,
-		mutable: bool,
+		ownership: ast::Ownership,
 	},
 	Namespace {
 		namespace_idx: u32,
@@ -690,10 +690,10 @@ pub enum ExprKind {
 	Load {
 		place: Box<Place>,
 	},
-	/// Take the address of a memory place (`.&` / `.&mut` postfix operators).
+	/// Take the address of a memory place (`.&` postfix operator). Always
+	/// produces a shared reference.
 	AddressOf {
 		place: Box<Place>,
-		mutable: bool,
 	},
 	/// Store a value to a memory place (assignment through a place).
 	Store {
@@ -1575,6 +1575,13 @@ pub struct TypeAlias {
 	pub accesses: Vec<SourceSpan>,
 }
 
+fn ownership_sigil(ownership: ast::Ownership) -> char {
+	match ownership {
+		ast::Ownership::Exclusive => '*',
+		ast::Ownership::Shared => '&',
+	}
+}
+
 pub struct TypeFormatter<'a> {
 	tir: &'a TIR,
 	pub interner: &'a ast::StringInterner,
@@ -1677,43 +1684,39 @@ impl<'a> TypeFormatter<'a> {
 			Type::Pointer {
 				to,
 				memory,
-				mutable,
+				ownership,
 			} => {
 				self.write_type(f, *memory)?;
-				f.write_str("::*")?;
-				if *mutable {
-					f.write_str("mut ")?;
-				}
+				f.write_str("::")?;
+				f.write_char(ownership_sigil(*ownership))?;
 				self.write_type(f, *to)?;
 				Ok(())
 			}
 			Type::Slice {
 				of,
 				memory,
-				mutable,
+				ownership,
 			} => {
 				self.write_type(f, *memory)?;
-				f.write_str("::[]")?;
-				if *mutable {
-					f.write_str("mut ")?;
-				}
+				f.write_str("::")?;
+				f.write_char(ownership_sigil(*ownership))?;
+				f.write_char('[')?;
 				self.write_type(f, *of)?;
+				f.write_char(']')?;
 				Ok(())
 			}
 			Type::Array {
 				of,
 				size,
 				memory,
-				mutable,
+				ownership,
 			} => {
 				self.write_type(f, *memory)?;
-				write!(
-					f,
-					"::[{}]{}",
-					size,
-					if *mutable { "mut " } else { "" }
-				)?;
+				f.write_str("::")?;
+				f.write_char(ownership_sigil(*ownership))?;
+				f.write_char('[')?;
 				self.write_type(f, *of)?;
+				write!(f, "; {}]", size)?;
 				Ok(())
 			}
 			Type::Tuple { elements } => {

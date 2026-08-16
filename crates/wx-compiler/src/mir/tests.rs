@@ -316,7 +316,7 @@ fn test_memory_data_end_lowers_to_memory_offset() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f() -> heap::*u8 {
+        pub fn f() -> heap::&u8 {
             heap::DATA_END
         }
 
@@ -347,7 +347,7 @@ fn test_slice_len_lowers_to_aggregate_get() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(s: heap::[]u8) -> u32 {
+        pub fn f(s: heap::&[u8]) -> u32 {
             slice_len(s)
         }
 
@@ -364,7 +364,7 @@ fn test_slice_from_parts_lowers_to_aggregate() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(ptr: heap::*u8, len: u32) -> heap::[]u8 {
+        pub fn f(ptr: heap::&u8, len: u32) -> heap::&[u8] {
             slice_from_parts(ptr, len)
         }
 
@@ -1120,7 +1120,7 @@ fn test_multiple_calls_to_generic_produce_single_mono_instance() {
 // ─────────────────────────────────────────────────────────────
 
 // String literal tests removed: `string` is no longer a named struct type;
-// string literals produce `[]u8` slices. Static-data coverage is provided
+// string literals produce `&[u8]` slices. Static-data coverage is provided
 // by the array literal tests below.
 
 // ── arrays
@@ -1128,11 +1128,11 @@ fn test_multiple_calls_to_generic_produce_single_mono_instance() {
 
 #[test]
 fn test_array_literal_bytes_are_little_endian() {
-	// [1, 2, 3] as heap::[3]i32 → 12 bytes encoding each value as 32-bit LE.
+	// [1, 2, 3] as heap::&[i32; 3] → 12 bytes encoding each value as 32-bit LE.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::[3]i32 {
-            local arr: heap::[3]i32 = [1, 2, 3];
+        fn get() -> heap::&[i32; 3] {
+            local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
         export { get }
@@ -1151,11 +1151,11 @@ fn test_array_literal_bytes_are_little_endian() {
 
 #[test]
 fn test_array_repeat_bytes_repeated() {
-	// [7; 4] as heap::[4]u8 → four bytes each equal to 7.
+	// [7; 4] as heap::&[u8; 4] → four bytes each equal to 7.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::[4]u8 {
-            local arr: heap::[4]u8 = [7; 4];
+        fn get() -> heap::&[u8; 4] {
+            local arr: heap::&[u8; 4] = [7; 4];
             arr
         }
         export { get }
@@ -1172,8 +1172,8 @@ fn test_array_dce_removes_static_data_ownership() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         fn live() -> i32 { 42 }
-        fn dead() -> heap::[3]i32 {
-            local arr: heap::[3]i32 = [1, 2, 3];
+        fn dead() -> heap::&[i32; 3] {
+            local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
         export { live }
@@ -1196,16 +1196,16 @@ fn test_static_entry_alignment_matches_element_type() {
 	// i32 elements → align 4; f64 elements → align 8; u8 elements → align 1.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ints() -> heap::[2]i32 {
-            local a: heap::[2]i32 = [10, 20];
+        fn ints() -> heap::&[i32; 2] {
+            local a: heap::&[i32; 2] = [10, 20];
             a
         }
-        fn doubles() -> heap::[2]f64 {
-            local b: heap::[2]f64 = [1.0; 2];
+        fn doubles() -> heap::&[f64; 2] {
+            local b: heap::&[f64; 2] = [1.0; 2];
             b
         }
-        fn bytes() -> heap::[2]u8 {
-            local c: heap::[2]u8 = [1; 2];
+        fn bytes() -> heap::&[u8; 2] {
+            local c: heap::&[u8; 2] = [1; 2];
             c
         }
         export { ints, doubles, bytes }
@@ -1272,17 +1272,17 @@ fn test_size_of_generic_monomorphizes() {
 #[test]
 fn test_generic_impl_slice_count_method_lowers_correctly() {
 	// Uses `count`, not `len`, to avoid colliding with the stdlib's own
-	// `impl<M: Memory, T> M::[]T { fn len(...) }`.
+	// `impl<M: Memory, T> M::&[T] { fn len(...) }`.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        impl<M: Memory, T> M::[]T {
+        impl<M: Memory, T> M::&[T] {
             pub fn count(self) -> M::Size {
                 slice_len(self)
             }
         }
 
-        pub fn get_len(s: heap::[]u8) -> u32 {
+        pub fn get_len(s: heap::&[u8]) -> u32 {
             s.count()
         }
 
@@ -1303,7 +1303,7 @@ fn test_compound_assign_through_ptr_deref_on_struct_field() {
             cap: u32,
         }
 
-        fn increment_len(p: heap::*mut Vec) {
+        fn increment_len(p: heap::*Vec) {
             p.*.len += 1;
         }
 
@@ -1330,12 +1330,12 @@ fn test_generic_compound_assign_through_ptr_deref() {
         }
 
         impl<T> Vec<T> {
-            pub fn increment_len(self: heap::*mut Self) {
+            pub fn increment_len(self: heap::*Self) {
                 self.*.len += 1;
             }
         }
 
-        fn call_it(p: heap::*mut Vec<u32>) {
+        fn call_it(p: heap::*Vec<u32>) {
             p.increment_len();
         }
 
@@ -1357,9 +1357,9 @@ fn test_string_literal_dedup_is_per_memory() {
         memory first: Memory where { Size = u32 };
         memory second: Memory where { Size = u32 };
 
-        fn a() -> first::[]u8 { \"hi\" }
-        fn b() -> second::[]u8 { \"hi\" }
-        fn c() -> first::[]u8 { \"hi\" }
+        fn a() -> first::&[u8] { \"hi\" }
+        fn b() -> second::&[u8] { \"hi\" }
+        fn c() -> first::&[u8] { \"hi\" }
 
         export { a, b, c }
     "});

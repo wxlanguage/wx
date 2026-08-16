@@ -190,8 +190,8 @@ fn test_type_expression_forms() {
 	let case = TestCase::new(indoc! {"
         struct TypeForms {
             ptr: *u8,
-            slice: []u8,
-            array: [4]u8,
+            slice: &[u8],
+            array: &[u8; 4],
             tuple: (i32, u32),
             namespaced: math::Number,
         }
@@ -636,20 +636,19 @@ fn test_chained_member_access() {
 }
 
 #[test]
-fn test_address_of_immutable() {
-	// ptr.*.& — immutable address-of; value is Deref, mut_span is None
+fn test_address_of() {
+	// ptr.*.& — address-of; value is Deref. Always produces a shared reference.
 	let case = TestCase::new(indoc! {"
-        fn f(ptr: *i32) {
+        fn f(ptr: &i32) {
             local a = ptr.*.&;
         }
     "});
 	assert!(case.ast.diagnostics.is_empty());
 	let stmts = function_block(&case.ast, 0);
 	let expr = local_definition_value(stmts, 0);
-	let Expression::AddressOf { value, mut_span } = expr else {
+	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
 	};
-	assert!(mut_span.is_none(), "expected no mut_span");
 	assert!(
 		matches!(value.inner, Expression::Deref { .. }),
 		"expected Deref as AddressOf operand"
@@ -657,37 +656,19 @@ fn test_address_of_immutable() {
 }
 
 #[test]
-fn test_address_of_mutable() {
-	// ptr.*.&mut — mutable address-of; mut_span is Some
-	let case = TestCase::new(indoc! {"
-        fn f(ptr: *mut i32) {
-            local a = ptr.*.&mut;
-        }
-    "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
-	let expr = local_definition_value(stmts, 0);
-	let Expression::AddressOf { mut_span, .. } = expr else {
-		panic!("expected AddressOf, got {expr:?}");
-	};
-	assert!(mut_span.is_some(), "expected mut_span for .&mut");
-}
-
-#[test]
 fn test_address_of_through_field() {
 	// ptr.*.field.& — address-of a field: AddressOf > ObjectAccess > Deref
 	let case = TestCase::new(indoc! {"
-        fn f(ptr: *Point) {
+        fn f(ptr: &Point) {
             local a = ptr.*.x.&;
         }
     "});
 	assert!(case.ast.diagnostics.is_empty());
 	let stmts = function_block(&case.ast, 0);
 	let expr = local_definition_value(stmts, 0);
-	let Expression::AddressOf { value, mut_span } = expr else {
+	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
 	};
-	assert!(mut_span.is_none());
 	let Expression::ObjectAccess { object, .. } = &value.inner else {
 		panic!("expected ObjectAccess inside AddressOf");
 	};

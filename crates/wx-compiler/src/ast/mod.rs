@@ -1076,10 +1076,9 @@ pub enum Expression {
 	Deref {
 		pointer: Box<Spanned<Expression>>,
 	},
-	/// `{expr}.&` or `{expr}.&mut`
+	/// `{expr}.&` — always produces a shared reference.
 	AddressOf {
 		value: Box<Spanned<Expression>>,
-		mut_span: Option<TextSpan>,
 	},
 	/// `return {expr}`
 	Return {
@@ -1314,6 +1313,17 @@ pub enum AssocTypeBindingKind {
 	Bound(Spanned<BoundExpression>),
 }
 
+/// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
+/// No enforcement of "only one exclusive value at a time" — this is a naming
+/// convention carried through the type system, not a move-checker.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum Ownership {
+	Exclusive,
+	Shared,
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum TypeExpression {
@@ -1326,21 +1336,21 @@ pub enum TypeExpression {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
 	},
-	/// `*u8` or `*mut u8`
+	/// `*u8` or `&u8`
 	Pointer {
-		mutability: Option<TextSpan>,
+		ownership: Ownership,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `[]u8` or `[]mut u8`
+	/// `*[u8]` or `&[u8]`
 	Slice {
-		mutability: Option<TextSpan>,
+		ownership: Ownership,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `[5]u8` or `[5]mut u8`
+	/// `*[u8; 5]` or `&[u8; 5]`
 	Array {
-		size: Spanned<usize>,
-		mutability: Option<TextSpan>,
+		ownership: Ownership,
 		inner: Box<Spanned<TypeExpression>>,
+		size: Spanned<usize>,
 	},
 	/// `(T, U, V)` or `()`
 	Tuple {
@@ -2783,21 +2793,6 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_mut_span(&mut self) -> Option<TextSpan> {
-		let token = self.lexer.peek();
-		match token.inner {
-			Token::Identifier
-				if matches!(
-					Keyword::try_from(token.span.extract_str(self.source)),
-					Ok(Keyword::Mut)
-				) =>
-			{
-				Some(self.lexer.next().span)
-			}
-			_ => None,
-		}
-	}
-
 	/// Parse a `::` separated path with optional turbofish type args per segment.
 	/// Returns `Spanned<Box<[PathSegment]>>`.
 	fn parse_path_segments(
@@ -2902,20 +2897,15 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_type_expression(&mut self) -> Result<Spanned<TypeExpression>, ()> {
 		let token = self.lexer.peek();
 		match token.inner {
-			Token::Star => {
-				let star_span = self.lexer.next().span;
-				let mutability = self.parse_mut_span();
-				let inner = self.parse_type_expression()?;
-				let span = TextSpan::new(star_span.start, inner.span.end);
-				Ok(Spanned {
-					inner: TypeExpression::Pointer {
-						mutability,
-						inner: Box::new(inner),
-					},
-					span,
-				})
+			Token::Star | Token::Amper => {
+				let sigil = self.lexer.next();
+				let ownership = if sigil.inner == Token::Star {
+					Ownership::Exclusive
+				} else {
+					Ownership::Shared
+				};
+				self.parse_pointer_type_expression(ownership, sigil.span)
 			}
-			Token::OpenBracket => self.parse_slice_or_array_type_expression(),
 			Token::Identifier => {
 				let (first_tok, first_sym) = match Keyword::try_from(
 					token.span.extract_str(self.source),
@@ -3075,26 +3065,41 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
-	fn parse_slice_or_array_type_expression(
+	/// Parses everything after a leading `*`/`&` sigil: a bare type (`*T`,
+	/// `&T` → `Pointer`), or a bracketed one (`*[T]`/`&[T]` → `Slice`,
+	/// `*[T; N]`/`&[T; N]` → `Array`).
+	fn parse_pointer_type_expression(
 		&mut self,
+		ownership: Ownership,
+		sigil_span: TextSpan,
 	) -> Result<Spanned<TypeExpression>, ()> {
-		let open_span = self.lexer.next().span;
-		let next = self.lexer.peek();
+		if self.lexer.peek().inner != Token::OpenBracket {
+			let inner = self.parse_type_expression()?;
+			let span = TextSpan::new(sigil_span.start, inner.span.end);
+			return Ok(Spanned {
+				inner: TypeExpression::Pointer {
+					ownership,
+					inner: Box::new(inner),
+				},
+				span,
+			});
+		}
+
+		self.lexer.next(); // consume `[`
+		let inner = self.parse_type_expression()?;
+		let next = self.lexer.next();
 		match next.inner {
 			Token::CloseBracket => {
-				let _close = self.lexer.next();
-				let mutability = self.parse_mut_span();
-				let inner = self.parse_type_expression()?;
-				let span = TextSpan::new(open_span.start, inner.span.end);
+				let span = TextSpan::new(sigil_span.start, next.span.end);
 				Ok(Spanned {
 					inner: TypeExpression::Slice {
-						mutability,
+						ownership,
 						inner: Box::new(inner),
 					},
 					span,
 				})
 			}
-			Token::Int => {
+			Token::SemiColon => {
 				let size_token = self.lexer.next();
 				let size_value = size_token
 					.span
@@ -3112,15 +3117,13 @@ impl<'ctx> Parser<'ctx> {
 					inner: size_value,
 					span: size_token.span,
 				};
-				self.next_expect(Token::CloseBracket)?;
-				let mutability = self.parse_mut_span();
-				let inner = self.parse_type_expression()?;
-				let span = TextSpan::new(open_span.start, inner.span.end);
+				let close_span = self.next_expect(Token::CloseBracket)?.span;
+				let span = TextSpan::new(sigil_span.start, close_span.end);
 				Ok(Spanned {
 					inner: TypeExpression::Array {
-						size,
-						mutability,
+						ownership,
 						inner: Box::new(inner),
+						size,
 					},
 					span,
 				})
@@ -3637,20 +3640,12 @@ impl<'ctx> Parser<'ctx> {
 				},
 				span,
 			}),
-			Token::Amper => {
-				let mut_span = parser.parse_mut_span();
-				let span = TextSpan::new(
-					object.span.start,
-					mut_span.map_or(token.span.end, |s| s.end),
-				);
-				Ok(Spanned {
-					inner: Expression::AddressOf {
-						value: Box::new(object),
-						mut_span,
-					},
-					span,
-				})
-			}
+			Token::Amper => Ok(Spanned {
+				inner: Expression::AddressOf {
+					value: Box::new(object),
+				},
+				span,
+			}),
 			Token::Identifier => {
 				let member_symbol = parser.intern_identifier(token.span);
 				Ok(Spanned {

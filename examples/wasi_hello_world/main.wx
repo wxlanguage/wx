@@ -12,8 +12,8 @@ enum FileDescriptor: u8 {
 import "wasi_snapshot_preview1" as wasi {
   fn fd_write(
     file_descriptor: FileDescriptor,
-    io_vecs: [][]u8,
-    bytes_written: *mut u32,
+    io_vecs: &[&[u8]],
+    bytes_written: *u32,
   ) -> i32;
 }
 
@@ -26,8 +26,8 @@ struct BumpAllocator {}
 impl Allocator for BumpAllocator {
   type Mem = heap;
 
-  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
-    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+  fn reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
+    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align);
     local new_end = ptr + layout.size;
     local cur_end = heap.size() * PAGE_SIZE;
     if new_end > cur_end {
@@ -35,13 +35,13 @@ impl Allocator for BumpAllocator {
       if heap.grow(needed) == -1 { unreachable }
     }
     bump = new_end as *u8;
-    ptr as *mut u8
+    ptr as *u8
   }
 }
 
 fn main() {
-  local bump: *mut BumpAllocator = std::ptr::null_mut();
-  local io_vecs = bump.alloc_slice::<[]u8>(1);
+  local bump: *BumpAllocator = std::ptr::null_mut();
+  local io_vecs = bump.alloc_slice::<&[u8]>(1);
   io_vecs[0] = "Hello, world!\n";
   local nwritten_ptr = bump.alloc::<u32>(0);
   _ = wasi::fd_write(FileDescriptor::StdOut, io_vecs, nwritten_ptr);

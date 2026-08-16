@@ -22,9 +22,9 @@ impl<M: Memory> Layout<M> {
 trait Allocator {
     type M: Memory;
 
-    fn alloc(mut self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+    fn alloc(mut self, layout: Layout<Self::M>) -> Self::M::*u8;
 
-    fn dealloc(mut self, ptr: Self::M::*mut u8, layout: Layout<Self::M>);
+    fn dealloc(mut self, ptr: Self::M::*u8, layout: Layout<Self::M>);
 }
 
 struct BumpAllocator {}
@@ -32,19 +32,18 @@ struct BumpAllocator {}
 impl Allocator for BumpAllocator {
     type M = heap;
 
-    fn alloc(x, layout: Layout<heap>) -> heap::*mut u8 {
-        local align = layout.align;
-        local ptr = (bump as u32 + align - 1) / align * align;
+    fn alloc(x, layout: Layout<heap>) -> heap::*u8 {
+        local ptr = ptr::align_up::<heap>(bump as u32, layout.align);
         local new_end = ptr + layout.size;
         local cur_end = heap.size() * PAGE_SIZE;
         if new_end > cur_end {
             local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
         }
         bump = new_end as heap::*u8;
-        ptr as heap::*mut u8
+        ptr as heap::*u8
     }
 
-    fn dealloc(x, _ptr: heap::*mut u8, _layout: Layout<heap>) {}
+    fn dealloc(x, _ptr: heap::*u8, _layout: Layout<heap>) {}
 }
 
 struct Vec<T, A: Allocator> {
@@ -57,7 +56,7 @@ struct Vec<T, A: Allocator> {
 impl<T, A: Allocator> Vec<T, A> {
     #[inline]
     pub fn new(alloc: A) -> Vec<T, A> {
-        Vec::{ buf: ptr::null(), len: 0, cap: 0, alloc }
+        Vec::{ buf: ptr::null_mut(), len: 0, cap: 0, alloc }
     }
 
     pub fn push(mut self: A::M::*Self, value: T) {
@@ -85,12 +84,12 @@ impl<T, A: Allocator> Vec<T, A> {
         self.*.len = self.*.len + 1;
     }
 
-    pub fn get(self: A::M::*Self, index: A::M::Size) -> T {
+    pub fn get(self: A::M::&Self, index: A::M::Size) -> T {
         self.*.buf.add(index).*
     }
 
     #[inline]
-    pub fn len(self: A::M::*Self) -> A::M::Size {
+    pub fn len(self: A::M::&Self) -> A::M::Size {
         self.*.len
     }
 }

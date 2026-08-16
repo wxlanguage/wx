@@ -64,7 +64,6 @@ define_text! {
 		Dot              => ".",
 		DotStar          => ".*",
 		DotAmp           => ".&",
-		DotAmpMut        => ".&mut",
 		DotDot           => "..",
 		LBrace           => "{",
 		LBraceSpace      => "{ ",
@@ -77,7 +76,6 @@ define_text! {
 		Gt               => ">",
 		Star             => "*",
 		Underscore       => "_",
-		SliceBrackets    => "[]",
 		HashLBracket     => "#[",
 		ColonColon       => "::",
 		ColonColonLt     => "::<",
@@ -1878,13 +1876,9 @@ impl<'a> Builder<'a> {
 				let dot_star = self.text(Text::DotStar);
 				self.arena.concat2(ptr_id, dot_star)
 			}
-			ast::Expression::AddressOf { value, mut_span } => {
+			ast::Expression::AddressOf { value } => {
 				let val_id = self.build_expression(value);
-				let suffix = if mut_span.is_some() {
-					self.text(Text::DotAmpMut)
-				} else {
-					self.text(Text::DotAmp)
-				};
+				let suffix = self.text(Text::DotAmp);
 				self.arena.concat2(val_id, suffix)
 			}
 			ast::Expression::StructInit { path, fields } => {
@@ -2256,37 +2250,36 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
-			ast::TypeExpression::Pointer { mutability, inner } => {
-				let mut items: Vec<NodeId> = vec![self.text(Text::Star)];
-				if mutability.is_some() {
-					items.push(self.text(Text::Mut));
-				}
-				items.push(self.build_type_expression(&inner.inner));
+			ast::TypeExpression::Pointer { ownership, inner } => {
+				let items: Vec<NodeId> = vec![
+					self.text(ownership_sigil(*ownership)),
+					self.build_type_expression(&inner.inner),
+				];
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Slice { mutability, inner } => {
-				let mut items: Vec<NodeId> =
-					vec![self.text(Text::SliceBrackets)];
-				if mutability.is_some() {
-					items.push(self.text(Text::Mut));
-				}
-				items.push(self.build_type_expression(&inner.inner));
+			ast::TypeExpression::Slice { ownership, inner } => {
+				let items: Vec<NodeId> = vec![
+					self.text(ownership_sigil(*ownership)),
+					self.text(Text::LBracket),
+					self.build_type_expression(&inner.inner),
+					self.text(Text::RBracket),
+				];
 				self.arena.concat(items)
 			}
 			ast::TypeExpression::Array {
-				size,
-				mutability,
+				ownership,
 				inner,
+				size,
 			} => {
-				let mut items: Vec<NodeId> = vec![
+				let items: Vec<NodeId> = vec![
+					self.text(ownership_sigil(*ownership)),
 					self.text(Text::LBracket),
+					self.build_type_expression(&inner.inner),
+					self.text(Text::Semi),
+					self.text(Text::Space),
 					self.source_text(size.span),
 					self.text(Text::RBracket),
 				];
-				if mutability.is_some() {
-					items.push(self.text(Text::Mut));
-				}
-				items.push(self.build_type_expression(&inner.inner));
 				self.arena.concat(items)
 			}
 			ast::TypeExpression::Tuple { elements } => {
@@ -2496,6 +2489,13 @@ impl<'a> Renderer<'a> {
 			}
 		}
 		width
+	}
+}
+
+fn ownership_sigil(ownership: ast::Ownership) -> Text {
+	match ownership {
+		ast::Ownership::Exclusive => Text::Star,
+		ast::Ownership::Shared => Text::Amp,
 	}
 }
 

@@ -486,8 +486,8 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
-        fn make_ptr() -> heap::*mut u16 { unreachable }
-        fn f(count: heap::Size) -> heap::[]u8 {
+        fn make_ptr() -> heap::&u16 { unreachable }
+        fn f(count: heap::Size) -> heap::&[u8] {
             local ptr = make_ptr();
             std::slice_from_parts(ptr, count)
         }
@@ -550,7 +550,7 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         fn write(x: i32) {
-            local p: heap::*mut Node = alloc_node()
+            local p: heap::*Node = alloc_node()
             p.*.x = x
         }
         export { write }
@@ -589,7 +589,7 @@ fn test_compare_mutable_pointer_with_null() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        fn is_null(p: heap::*Node) -> bool {
+        fn is_null(p: heap::&Node) -> bool {
             p == ptr::null()
         }
         export { is_null }
@@ -4832,7 +4832,7 @@ fn test_assoc_type_projection_in_tuple_wrapper() {
 #[test]
 fn test_assoc_type_projection_in_pointer_wrapper() {
 	// Recursive substitution must also preserve projections nested under
-	// pointer types. Untagged `*C::Item` resolves memory from the single
+	// pointer types. Untagged `&C::Item` resolves memory from the single
 	// ambient memory declaration.
 	let case = TestCase::new_multi_file(
 		"main.wx",
@@ -4841,10 +4841,10 @@ fn test_assoc_type_projection_in_pointer_wrapper() {
             trait Container {
                 type Item;
             }
-            fn process<C: Container>(ptr: *C::Item) {
+            fn process<C: Container>(ptr: &C::Item) {
                 unreachable
             }
-            fn wrap<C: Container>(ptr: *C::Item) {
+            fn wrap<C: Container>(ptr: &C::Item) {
                 process(ptr)
             }
         "},
@@ -5131,12 +5131,12 @@ fn test_module_namespace_type_access() {
 
 #[test]
 fn test_memory_tagged_pointer() {
-	// `heap::*i32` resolves to Type::Pointer { memory: Some(heap_id) }
+	// `heap::&i32` resolves to Type::Pointer { memory: Some(heap_id) }
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(p: heap::*i32) {
+            fn f(p: heap::&i32) {
                 unreachable
             }
         "},
@@ -5161,19 +5161,19 @@ fn test_memory_tagged_pointer() {
 	};
 	assert!(
 		is_heap_ptr,
-		"expected heap::*i32 (pointer tagged with heap), got index {}",
+		"expected heap::&i32 (pointer tagged with heap), got index {}",
 		param_ty.as_u32()
 	);
 }
 
 #[test]
 fn test_memory_tagged_slice() {
-	// `heap::[]u8` resolves to Type::Slice { memory: Some(heap_id) }
+	// `heap::&[u8]` resolves to Type::Slice { memory: Some(heap_id) }
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(s: heap::[]u8) {
+            fn f(s: heap::&[u8]) {
                 unreachable
             }
         "},
@@ -5198,19 +5198,19 @@ fn test_memory_tagged_slice() {
 	};
 	assert!(
 		is_heap_slice,
-		"expected heap::[]u8 (slice tagged with heap), got index {}",
+		"expected heap::&[u8] (slice tagged with heap), got index {}",
 		param_ty.as_u32()
 	);
 }
 
 #[test]
 fn test_memory_tagged_array() {
-	// `heap::[4]u8` resolves to Type::Array { size: 4, memory: Some(heap_id) }
+	// `heap::&[u8; 4]` resolves to Type::Array { size: 4, memory: Some(heap_id) }
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]u8) {
+            fn f(a: heap::&[u8; 4]) {
                 unreachable
             }
         "},
@@ -5237,19 +5237,19 @@ fn test_memory_tagged_array() {
 	};
 	assert!(
 		is_heap_array,
-		"expected heap::[4]u8 (array tagged with heap), got index {}",
+		"expected heap::&[u8; 4] (array tagged with heap), got index {}",
 		param_ty.as_u32()
 	);
 }
 
 #[test]
 fn test_memory_tagged_nested_array() {
-	// `heap::[4]heap::[4]u8` — outer array in heap, elements are heap-tagged arrays
+	// `heap::&[heap::&[u8; 4]; 4]` — outer array in heap, elements are heap-tagged arrays
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]heap::[4]u8) {
+            fn f(a: heap::&[heap::&[u8; 4]; 4]) {
                 unreachable
             }
         "},
@@ -5310,12 +5310,12 @@ fn test_memory_tagged_non_pointer_is_error() {
 
 #[test]
 fn test_untagged_and_tagged_pointer_resolve_to_same_type() {
-	// With one memory in scope, `*i32` and `heap::*i32` resolve to the same type.
+	// With one memory in scope, `&i32` and `heap::&i32` resolve to the same type.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: *i32, b: heap::*i32) {
+            fn f(a: &i32, b: heap::&i32) {
                 unreachable
             }
         "},
@@ -5334,7 +5334,7 @@ fn test_untagged_and_tagged_pointer_resolve_to_same_type() {
 	let tagged = f.params[1].ty.inner;
 	assert_eq!(
 		untagged, tagged,
-		"with one memory, *i32 and heap::*i32 should intern to the same TypeIndex"
+		"with one memory, &i32 and heap::&i32 should intern to the same TypeIndex"
 	);
 }
 
@@ -5621,7 +5621,7 @@ fn test_type_application_on_non_generic_is_error() {
 #[test]
 fn test_generic_method_self_shape_mismatch_reports_clear_diagnostic() {
 	// Regression: calling a method whose `self` requires a pointer
-	// (`self: *mut Self`) on a plain value receiver used to report a
+	// (`self: &Self`) on a plain value receiver used to report a
 	// confusing "cannot infer type for type parameter `Self`" —
 	// `infer_type_args` only unifies matching shapes (Pointer only binds
 	// against Pointer), so a value receiver just silently failed to bind
@@ -5633,7 +5633,7 @@ fn test_generic_method_self_shape_mismatch_reports_clear_diagnostic() {
         memory heap: Memory where { Size = u32 };
 
         trait Foo {
-            fn bar<T>(self: *mut Self) -> T { unreachable }
+            fn bar<T>(self: &Self) -> T { unreachable }
         }
 
         struct S {}
@@ -5779,7 +5779,7 @@ fn test_deref_load_through_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn read(ptr: heap::*i32) -> i32 { ptr.* }
+        fn read(ptr: heap::&i32) -> i32 { ptr.* }
     "},
 		&[],
 	);
@@ -5792,7 +5792,7 @@ fn test_deref_store_through_mutable_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn write(ptr: heap::*mut i32) { ptr.* = 42 }
+        fn write(ptr: heap::*i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -5805,7 +5805,7 @@ fn test_deref_arithmetic_assignment_through_mutable_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn increment(ptr: heap::*mut i32) { ptr.* += 1 }
+        fn increment(ptr: heap::*i32) { ptr.* += 1 }
     "},
 		&[],
 	);
@@ -5840,7 +5840,7 @@ fn test_deref_store_through_immutable_pointer_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::*i32) { ptr.* = 42 }
+        fn bad(ptr: heap::&i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -5861,7 +5861,7 @@ fn test_deref_arithmetic_assignment_through_immutable_pointer_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::*i32) { ptr.* += 1 }
+        fn bad(ptr: heap::&i32) { ptr.* += 1 }
     "},
 		&[],
 	);
@@ -5882,7 +5882,7 @@ fn test_deref_type_mismatch_on_store_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::*mut i32) { ptr.* = true }
+        fn bad(ptr: heap::*i32) { ptr.* = true }
     "},
 		&[],
 	);
@@ -6051,8 +6051,8 @@ fn test_array_literal_basic() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[3]i32 {
-                local x: heap::[3]i32 = [1, 2, 3];
+            fn f() -> heap::&[i32; 3] {
+                local x: heap::&[i32; 3] = [1, 2, 3];
                 x
             }
         "},
@@ -6067,8 +6067,8 @@ fn test_array_literal_mutable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[3]i32 {
-                local x: heap::[3]i32 = [1, 2, 3];
+            fn f() -> heap::*[i32; 3] {
+                local x: heap::*[i32; 3] = [1, 2, 3];
                 x
             }
         "},
@@ -6083,8 +6083,8 @@ fn test_array_literal_float_elements() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[2]f32 {
-                local x: heap::[2]f32 = [1.0, 2.0];
+            fn f() -> heap::&[f32; 2] {
+                local x: heap::&[f32; 2] = [1.0, 2.0];
                 x
             }
         "},
@@ -6099,8 +6099,8 @@ fn test_array_literal_empty_with_annotation() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[0]i32 {
-                local x: heap::[0]i32 = [];
+            fn f() -> heap::&[i32; 0] {
+                local x: heap::&[i32; 0] = [];
                 x
             }
         "},
@@ -6116,7 +6116,7 @@ fn test_array_literal_size_mismatch_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f() {
-                local x: heap::[3]i32 = [1, 2];
+                local x: heap::&[i32; 3] = [1, 2];
             }
         "},
 		&[],
@@ -6152,7 +6152,7 @@ fn test_array_literal_no_memory_is_error() {
 	// No memory declaration — array cannot be placed in linear memory.
 	let case = TestCase::new(indoc! {"
         fn f() {
-            local x: [3]i32 = [1, 2, 3];
+            local x: &[i32; 3] = [1, 2, 3];
         }
     "});
 	assert!(
@@ -6168,7 +6168,7 @@ fn test_array_literal_non_numeric_element_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f() {
-                local x: heap::[2]i32 = [true, false];
+                local x: heap::&[i32; 2] = [true, false];
             }
         "},
 		&[],
@@ -6184,7 +6184,7 @@ fn test_array_literal_mixed_element_types_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f(b: bool) {
-                local x: heap::[2]bool = [b, b];
+                local x: heap::&[bool; 2] = [b, b];
             }
         "},
 		&[],
@@ -6201,8 +6201,8 @@ fn test_array_repeat_basic() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[4]i32 {
-                local x: heap::[4]i32 = [0; 4];
+            fn f() -> heap::&[i32; 4] {
+                local x: heap::&[i32; 4] = [0; 4];
                 x
             }
         "},
@@ -6217,8 +6217,8 @@ fn test_array_repeat_float() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::[8]f64 {
-                local x: heap::[8]f64 = [0.0; 8];
+            fn f() -> heap::&[f64; 8] {
+                local x: heap::&[f64; 8] = [0.0; 8];
                 x
             }
         "},
@@ -6234,7 +6234,7 @@ fn test_array_repeat_count_not_const_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f(n: u32) {
-                local x: heap::[4]i32 = [0; n];
+                local x: heap::&[i32; 4] = [0; n];
             }
         "},
 		&[],
@@ -6252,7 +6252,7 @@ fn test_array_repeat_size_mismatch_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f() {
-                local x: heap::[4]i32 = [0; 3];
+                local x: heap::&[i32; 4] = [0; 3];
             }
         "},
 		&[],
@@ -6288,7 +6288,7 @@ fn test_array_repeat_non_numeric_value_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f(b: bool) {
-                local x: heap::[4]i32 = [b; 4];
+                local x: heap::&[i32; 4] = [b; 4];
             }
         "},
 		&[],
@@ -6305,7 +6305,7 @@ fn test_index_read_from_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32) -> i32 { a[0] }
+            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -6318,7 +6318,7 @@ fn test_index_read_from_slice() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[]i32) -> i32 { a[0] }
+            fn f(a: heap::&[i32]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -6343,7 +6343,7 @@ fn test_index_wrong_index_type_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32, i: i64) -> i32 { a[i] }
+            fn f(a: heap::&[i32; 4], i: i64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -6364,7 +6364,7 @@ fn test_index_store_through_mutable_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]mut i32) { a[0] = 42 }
+            fn f(a: heap::*[i32; 4]) { a[0] = 42 }
         "},
 		&[],
 	);
@@ -6377,7 +6377,7 @@ fn test_index_store_through_immutable_array_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32) { a[0] = 42 }
+            fn f(a: heap::&[i32; 4]) { a[0] = 42 }
         "},
 		&[],
 	);
@@ -6398,7 +6398,7 @@ fn test_index_arithmetic_assignment_through_mutable_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]mut i32) { a[0] += 1 }
+            fn f(a: heap::*[i32; 4]) { a[0] += 1 }
         "},
 		&[],
 	);
@@ -6411,7 +6411,7 @@ fn test_index_arithmetic_assignment_through_immutable_array_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32) { a[0] += 1 }
+            fn f(a: heap::&[i32; 4]) { a[0] += 1 }
         "},
 		&[],
 	);
@@ -6432,7 +6432,7 @@ fn test_index_store_type_mismatch_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]mut i32) { a[0] = true }
+            fn f(a: heap::*[i32; 4]) { a[0] = true }
         "},
 		&[],
 	);
@@ -6445,7 +6445,7 @@ fn test_index_memory64_requires_u64_index() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u64 };
-            fn f(a: heap::[4]i32) -> i32 { a[0] }
+            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -6461,7 +6461,7 @@ fn test_index_ambiguous_memory_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             memory stack: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32) -> i32 { a[0] }
+            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -6477,7 +6477,7 @@ fn test_array_literal_runtime_element_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f(x: i32) {
-                local arr: heap::[2]i32 = [x, 1];
+                local arr: heap::&[i32; 2] = [x, 1];
             }
         "},
 		&[],
@@ -6495,7 +6495,7 @@ fn test_array_repeat_runtime_value_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             fn f(x: i32) {
-                local arr: heap::[4]i32 = [x; 4];
+                local arr: heap::&[i32; 4] = [x; 4];
             }
         "},
 		&[],
@@ -6515,7 +6515,7 @@ fn test_index_concrete_memory32_typed_variable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32, i: u32) -> i32 { a[i] }
+            fn f(a: heap::&[i32; 4], i: u32) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -6529,7 +6529,7 @@ fn test_index_concrete_memory64_typed_variable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u64 };
-            fn f(a: heap::[4]i32, i: u64) -> i32 { a[i] }
+            fn f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -6543,7 +6543,7 @@ fn test_index_memory32_with_u64_variable_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::[4]i32, i: u64) -> i32 { a[i] }
+            fn f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -6560,13 +6560,13 @@ fn test_index_memory32_with_u64_variable_is_error() {
 
 #[test]
 fn test_index_generic_array_with_assoc_size_type() {
-	// Generic fn over M: Memory indexing M::[4]i32 with M::Size — the index
+	// Generic fn over M: Memory indexing M::&[i32; 4] with M::Size — the index
 	// type must accept M::Size rather than requiring a concrete integer type.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(arr: M::[4]i32, i: M::Size) -> i32 {
+            fn read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
                 arr[i]
             }
         "},
@@ -6582,7 +6582,7 @@ fn test_index_generic_slice_with_assoc_size_type() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(s: M::[]i32, i: M::Size) -> i32 {
+            fn read<M: Memory>(s: M::&[i32], i: M::Size) -> i32 {
                 s[i]
             }
         "},
@@ -6599,10 +6599,10 @@ fn test_index_generic_array_call_with_concrete_memory() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(arr: M::[4]i32, i: M::Size) -> i32 {
+            fn read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
                 arr[i]
             }
-            fn caller(arr: heap::[4]i32, i: u32) -> i32 {
+            fn caller(arr: heap::&[i32; 4], i: u32) -> i32 {
                 read(arr, i)
             }
         "},
@@ -7462,7 +7462,7 @@ fn test_generic_impl_block_registers_and_dispatches() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn get_len(s: heap::[]u8) -> u32 {
+        fn get_len(s: heap::&[u8]) -> u32 {
             s.len()
         }
 
@@ -7497,7 +7497,7 @@ fn test_generic_impl_bare_type_param_is_error() {
 fn test_slice_range_full_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(s: heap::[]u8) -> heap::[]u8 {
+        fn f(s: heap::&[u8]) -> heap::&[u8] {
             s[..]
         }
         export { f }
@@ -7513,7 +7513,7 @@ fn test_slice_range_full_is_ok() {
 fn test_slice_range_with_bounds_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(s: heap::[]u8, i: u32, n: u32) -> heap::[]u8 {
+        fn f(s: heap::&[u8], i: u32, n: u32) -> heap::&[u8] {
             s[i..n]
         }
         export { f }
@@ -7529,7 +7529,7 @@ fn test_slice_range_with_bounds_is_ok() {
 fn test_slice_range_on_array_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(arr: heap::[4]u8) -> heap::[]u8 {
+        fn f(arr: heap::&[u8; 4]) -> heap::&[u8] {
             arr[1..3]
         }
         export { f }
@@ -7545,7 +7545,7 @@ fn test_slice_range_on_array_is_ok() {
 fn test_slice_range_on_non_indexable_is_error() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(x: i32) -> heap::[]i32 {
+        fn f(x: i32) -> heap::&[i32] {
             x[..]
         }
         export { f }
@@ -7793,11 +7793,11 @@ fn test_typeset_intersection_range_out_of_bounds_reports_error() {
 
 #[test]
 fn test_generic_slice_first_with_pointer_size_index() {
-	// `self[0]` inside `impl<M: Memory, T> M::[]T` — the literal `0` must be
+	// `self[0]` inside `impl<M: Memory, T> M::&[T]` — the literal `0` must be
 	// coerced to `M::Size`, whose typeset bound is `PointerSize { u32, u64 }`.
 	// The intersection range for PointerSize is [0, u32::MAX], so `0` is valid.
 	let case = TestCase::new(indoc! {"
-        impl<M: Memory, T> M::[]T {
+        impl<M: Memory, T> M::&[T] {
             pub fn first(self) -> T { self[0] }
         }
         export { }
@@ -8025,10 +8025,10 @@ fn test_assoc_type_resolves_in_trait_default_body() {
         trait Allocator {
             type M: Memory;
 
-            fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+            fn reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
 
             #[inline]
-            fn alloc_slice<T>(self: Self::M::*mut Self, count: Self::M::Size) -> Self::M::*mut u8 {
+            fn alloc_slice<T>(self: Self::M::*Self, count: Self::M::Size) -> Self::M::*u8 {
                 local layout = Layout::<Self::M>::array::<T>(count);
                 self.reserve(layout)
             }
@@ -8060,10 +8060,10 @@ fn test_generic_call_result_type_infers_assoc_type_arg() {
         trait Allocator {
             type M: Memory;
 
-            fn reserve(self: Self::M::*mut Self, layout: Layout<Self::M>) -> Self::M::*mut u8;
+            fn reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
 
             #[inline]
-            fn alloc<T>(self: Self::M::*mut Self) -> Self::M::*mut T {
+            fn alloc<T>(self: Self::M::*Self) -> Self::M::*T {
                 self.reserve(Layout::of::<T>()) as _
             }
         }
@@ -9045,30 +9045,30 @@ fn test_duplicate_method_name_in_generic_impl_rejected() {
 
 #[test]
 fn test_tree_mut_binding_mut_does_not_grant_write_through() {
-	// `mut` on binding does NOT grant write-through — pointer type must be `*mut T`.
+	// `mut` on binding does NOT grant write-through — pointer type must be `*T`.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(mut ptr: heap::*i32) { ptr.* = 42 }
+        fn bad(mut ptr: heap::&i32) { ptr.* = 42 }
     "},
 		&[],
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::CannotMutateImmutable),
-		"mut binding + *i32 should NOT allow write-through; got: {:?}",
+		"mut binding + &i32 should NOT allow write-through; got: {:?}",
 		case.tir.diagnostics
 	);
 }
 
 #[test]
 fn test_tree_mut_immutable_binding_mutable_pointer_write_ok() {
-	// Immutable binding + `*mut T` IS sufficient for write-through.
+	// Immutable binding + `*T` IS sufficient for write-through.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ok(ptr: heap::*mut i32) { ptr.* = 42 }
+        fn ok(ptr: heap::*i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -9077,30 +9077,30 @@ fn test_tree_mut_immutable_binding_mutable_pointer_write_ok() {
 
 #[test]
 fn test_tree_mut_nested_inner_immutable_blocks_deep_write() {
-	// `p: *mut *i32` — outer `*mut` allows storing a pointer, but inner `*i32` blocks write-through.
+	// `p: *&i32` — outer `*` (exclusive) allows storing a pointer, but inner `&i32` (shared) blocks write-through.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(p: heap::*mut heap::*i32) { p.*.* = 99 }
+        fn bad(p: heap::*heap::&i32) { p.*.* = 99 }
     "},
 		&[],
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::CannotMutateImmutable),
-		"p.*.* write should error: inner *i32 is immutable; got: {:?}",
+		"p.*.* write should error: inner &i32 is shared; got: {:?}",
 		case.tir.diagnostics
 	);
 }
 
 #[test]
 fn test_tree_mut_nested_both_mutable_write_ok() {
-	// `p: *mut *mut i32` — both levels mutable, p.*.* = val should work.
+	// `p: **i32` — both levels mutable, p.*.* = val should work.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ok(p: heap::*mut heap::*mut i32) { p.*.* = 99 }
+        fn ok(p: heap::*heap::*i32) { p.*.* = 99 }
     "},
 		&[],
 	);
@@ -9109,32 +9109,32 @@ fn test_tree_mut_nested_both_mutable_write_ok() {
 
 #[test]
 fn test_tree_mut_struct_field_through_immutable_ptr_is_error() {
-	// `ptr: *Node` — cannot write any field through it.
+	// `ptr: &Node` — cannot write any field through it.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { x: i32 }
-        fn bad(ptr: heap::*Node) { ptr.*.x = 1 }
+        fn bad(ptr: heap::&Node) { ptr.*.x = 1 }
     "},
 		&[],
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::CannotMutateImmutable),
-		"field write through *Node should error; got: {:?}",
+		"field write through &Node should error; got: {:?}",
 		case.tir.diagnostics
 	);
 }
 
 #[test]
 fn test_tree_mut_struct_field_through_mutable_ptr_ok() {
-	// `ptr: *mut Node` — can write fields.
+	// `ptr: *Node` — can write fields.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { x: i32 }
-        fn ok(ptr: heap::*mut Node) { ptr.*.x = 1 }
+        fn ok(ptr: heap::*Node) { ptr.*.x = 1 }
     "},
 		&[],
 	);
@@ -9143,13 +9143,13 @@ fn test_tree_mut_struct_field_through_mutable_ptr_ok() {
 
 #[test]
 fn test_tree_mut_mutable_ptr_coerces_to_immutable_param() {
-	// Passing `*mut T` where `*T` is expected is allowed (safe downgrade).
+	// Passing `*T` (exclusive) where `&T` (shared) is expected is allowed (safe downgrade).
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn read(ptr: heap::*i32) -> i32 { ptr.* }
-        fn call(p: heap::*mut i32) -> i32 { read(p) }
+        fn read(ptr: heap::&i32) -> i32 { ptr.* }
+        fn call(p: heap::*i32) -> i32 { read(p) }
     "},
 		&[],
 	);
@@ -9158,41 +9158,41 @@ fn test_tree_mut_mutable_ptr_coerces_to_immutable_param() {
 
 #[test]
 fn test_tree_mut_immutable_ptr_cannot_satisfy_mutable_param() {
-	// Passing `*T` where `*mut T` is expected is NOT allowed.
+	// Passing `&T` (shared) where `*T` (exclusive) is expected is NOT allowed.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn write(ptr: heap::*mut i32) { ptr.* = 1 }
-        fn call(p: heap::*i32) { write(p) }
+        fn write(ptr: heap::*i32) { ptr.* = 1 }
+        fn call(p: heap::&i32) { write(p) }
     "},
 		&[],
 	);
 	assert!(
 		!case.tir.diagnostics.is_empty(),
-		"passing *i32 to *mut i32 param must error; got no diagnostics"
+		"passing &i32 to *i32 param must error; got no diagnostics"
 	);
 }
 
 #[test]
 fn test_tree_mut_binding_mut_allows_reassign_but_not_write_through() {
-	// `local mut p: *i32` — can reassign p, but cannot write through p.*.
+	// `local mut p: &i32` — can reassign p, but cannot write through p.*.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(a: heap::*i32, b: heap::*i32) {
-            local mut p: heap::*i32 = a;
+        fn bad(a: heap::&i32, b: heap::&i32) {
+            local mut p: heap::&i32 = a;
             p = b;
             p.* = 99
         }
     "},
 		&[],
 	);
-	// Reassign `p = b` is ok (mut binding). Write `p.* = 99` must error (pointer type immutable).
+	// Reassign `p = b` is ok (mut binding). Write `p.* = 99` must error (pointer type shared).
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::CannotMutateImmutable),
-		"write through *i32 must error even with mut binding; got: {:?}",
+		"write through &i32 must error even with mut binding; got: {:?}",
 		case.tir.diagnostics
 	);
 	let errors: Vec<_> = case
@@ -9218,9 +9218,9 @@ fn test_ptr_autoderef_calls_method_on_inner_type() {
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn value(self: heap::*Node) -> i32 { self.*.value }
+            pub fn value(self: heap::&Node) -> i32 { self.*.value }
         }
-        fn get(n: heap::*Node) -> i32 { n.value() }
+        fn get(n: heap::&Node) -> i32 { n.value() }
         export { get }
     "});
 	assert!(
@@ -9232,14 +9232,14 @@ fn test_ptr_autoderef_calls_method_on_inner_type() {
 
 #[test]
 fn test_ptr_autoderef_mutable_ptr_calls_mut_self_method() {
-	// `ptr.set()` on `*mut Node` should resolve to a method taking `self: heap::*mut Self`.
+	// `ptr.set()` on `*Node` should resolve to a method taking `self: heap::*Self`.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn set(self: heap::*mut Node, v: i32) { self.*.value = v }
+            pub fn set(self: heap::*Node, v: i32) { self.*.value = v }
         }
-        fn update(n: heap::*mut Node) { n.set(42) }
+        fn update(n: heap::*Node) { n.set(42) }
         export { update }
     "});
 	assert!(
@@ -9251,14 +9251,14 @@ fn test_ptr_autoderef_mutable_ptr_calls_mut_self_method() {
 
 #[test]
 fn test_ptr_autoderef_mutable_ptr_coerces_to_immutable_self() {
-	// `*mut T` calling a method with `self: *T` should succeed via `*mut T → *T` coercion.
+	// `*T` calling a method with `self: &T` should succeed via `*T → &T` coercion.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::*Node) -> i32 { self.*.val }
+            pub fn read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn get(n: heap::*mut Node) -> i32 { n.read() }
+        fn get(n: heap::*Node) -> i32 { n.read() }
         export { get }
     "});
 	assert!(
@@ -9270,14 +9270,14 @@ fn test_ptr_autoderef_mutable_ptr_coerces_to_immutable_self() {
 
 #[test]
 fn test_ptr_autoderef_immutable_ptr_rejects_mut_self_method() {
-	// `ptr.set()` on `*Node` (immutable) with `self: *mut Node` should be a type mismatch.
+	// `ptr.set()` on `&Node` (shared) with `self: *Node` should be a type mismatch.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn set(self: heap::*mut Node, v: i32) { self.*.value = v }
+            pub fn set(self: heap::*Node, v: i32) { self.*.value = v }
         }
-        fn bad(n: heap::*Node) { n.set(42) }
+        fn bad(n: heap::&Node) { n.set(42) }
         export { bad }
     "});
 	assert!(
@@ -9312,9 +9312,9 @@ fn test_ptr_autoderef_generic_impl_method() {
         memory heap: Memory where { Size = u32 };
         struct Wrapper<T> { inner: T }
         impl <T> Wrapper<T> {
-            pub fn get(self: heap::*Wrapper<T>) -> T { self.*.inner }
+            pub fn get(self: heap::&Wrapper<T>) -> T { self.*.inner }
         }
-        fn unwrap(w: heap::*Wrapper<i32>) -> i32 { w.get() }
+        fn unwrap(w: heap::&Wrapper<i32>) -> i32 { w.get() }
         export { unwrap }
     "});
 	assert!(
@@ -9326,16 +9326,16 @@ fn test_ptr_autoderef_generic_impl_method() {
 
 #[test]
 fn test_ptr_autoderef_memory_qualifier_mismatch_errors() {
-	// `other::*Node` calling a method with `self: heap::*Node` — the inner type `Node`
+	// `other::&Node` calling a method with `self: heap::&Node` — the inner type `Node`
 	// is found, but the self-param check fails because the memory qualifiers differ.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         memory other: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::*Node) -> i32 { self.*.val }
+            pub fn read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn bad(n: other::*Node) -> i32 { n.read() }
+        fn bad(n: other::&Node) -> i32 { n.read() }
         export { bad }
     "});
 	assert!(
@@ -9346,15 +9346,15 @@ fn test_ptr_autoderef_memory_qualifier_mismatch_errors() {
 
 #[test]
 fn test_ptr_autoderef_double_pointer_not_found() {
-	// `**Node` — auto-deref is one level only. The inner type is `*Node`, which has no
+	// `&&Node` — auto-deref is one level only. The inner type is `&Node`, which has no
 	// impl block, so the method is not found.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::*Node) -> i32 { self.*.val }
+            pub fn read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn bad(n: heap::*heap::*Node) -> i32 { n.read() }
+        fn bad(n: heap::&heap::&Node) -> i32 { n.read() }
         export { bad }
     "});
 	assert!(
@@ -9370,7 +9370,7 @@ fn test_ptr_field_access_does_not_auto_deref() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
-        fn bad(n: heap::*Node) -> i32 { n.val }
+        fn bad(n: heap::&Node) -> i32 { n.val }
         export { bad }
     "});
 	assert!(
@@ -9381,16 +9381,16 @@ fn test_ptr_field_access_does_not_auto_deref() {
 
 #[test]
 fn test_ptr_autoderef_chained_calls() {
-	// `ptr.next().get_val()` — `next()` returns `*Node`, then `get_val()` auto-derefs
+	// `ptr.next().get_val()` — `next()` returns `&Node`, then `get_val()` auto-derefs
 	// the returned pointer. Each call goes through resolve_method_call independently.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn next(self: heap::*Node) -> heap::*Node { self }
-            pub fn get_val(self: heap::*Node) -> i32 { self.*.val }
+            pub fn next(self: heap::&Node) -> heap::&Node { self }
+            pub fn get_val(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn chain(n: heap::*Node) -> i32 { n.next().get_val() }
+        fn chain(n: heap::&Node) -> i32 { n.next().get_val() }
         export { chain }
     "});
 	assert!(
@@ -9400,7 +9400,7 @@ fn test_ptr_autoderef_chained_calls() {
 	);
 }
 
-// ── AddressOf (.& / .&mut) ─────────────────────────────────────────────────
+// ── AddressOf (.&) ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_address_of_non_place_rejected() {
@@ -9417,29 +9417,14 @@ fn test_address_of_non_place_rejected() {
 }
 
 #[test]
-fn test_address_of_mut_through_immutable_pointer_rejected() {
-	// `.&mut` through an immutable pointer must emit a diagnostic.
-	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::*i32) -> heap::*mut i32 { ptr.*.&mut }
-        export { bad }
-    "});
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::CannotMutateImmutable),
-		"expected CannotMutateImmutable for .&mut through *i32; got: {:?}",
-		case.tir.diagnostics
-	);
-}
-
-#[test]
 fn test_address_of_place_has_correct_pointer_type() {
-	// `arr[i].&` on a heap array must resolve to a `heap::*i32` pointer type,
-	// and `ptr.*.field.&` on a struct field must resolve to the field's pointer type.
+	// `arr[i].&` on a heap array must resolve to a `heap::&i32` reference type,
+	// and `ptr.*.field.&` on a struct field must resolve to the field's reference type.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn arr_elem_ptr(arr: heap::[4]i32, i: u32) -> heap::*i32 { arr[i].& }
-        fn field_ptr(ptr: heap::*Point) -> heap::*i32 { ptr.*.x.& }
+        fn arr_elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
+        fn field_ptr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
         export { arr_elem_ptr, field_ptr }
     "});
 	assert!(
@@ -10056,9 +10041,9 @@ fn test_generic_inherent_impl_on_slice_beats_trait_no_ambiguity() {
 	// Same inherent-always-wins rule as the struct case, but on
 	// `ImplTarget::Slice` — confirms the fix generalizes past `Struct`. If
 	// this incorrectly picked `Counter::count` (-> bool) instead of the
-	// inherent `M::[]T::count` (-> u32), `use_it`'s return type would
+	// inherent `M::&[T]::count` (-> u32), `use_it`'s return type would
 	// fail to check. Uses `count`, not `len`, to avoid colliding with the
-	// stdlib's own `impl<M: Memory, T> M::[]T { fn len(...) }`.
+	// stdlib's own `impl<M: Memory, T> M::&[T] { fn len(...) }`.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
@@ -10066,15 +10051,15 @@ fn test_generic_inherent_impl_on_slice_beats_trait_no_ambiguity() {
             fn count(self) -> bool;
         }
 
-        impl<M: Memory, T> M::[]T {
+        impl<M: Memory, T> M::&[T] {
             pub fn count(self) -> u32 { 0 }
         }
 
-        impl Counter for heap::[]i32 {
+        impl Counter for heap::&[i32] {
             fn count(self) -> bool { true }
         }
 
-        fn use_it(s: heap::[]i32) -> u32 {
+        fn use_it(s: heap::&[i32]) -> u32 {
             s.count()
         }
 

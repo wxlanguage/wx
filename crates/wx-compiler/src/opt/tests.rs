@@ -978,7 +978,7 @@ fn test_struct_pointer_load_expands_to_per_field_loads() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn load_point(ptr: heap::*Point) -> Point { ptr.* }
+        fn load_point(ptr: heap::&Point) -> Point { ptr.* }
         export { load_point, heap }
     "}
 	);
@@ -1032,7 +1032,7 @@ fn test_struct_pointer_load_field_access_folds() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn get_x(ptr: heap::*Point) -> i32 {
+        fn get_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
@@ -1084,7 +1084,7 @@ fn test_struct_pointer_store_expands_to_per_field_stores() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn store_point(ptr: heap::*mut Point, x: i32, y: i32) {
+        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
         export { store_point, heap }
@@ -1277,7 +1277,7 @@ fn test_sched_struct_pointer_store() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn store_point(ptr: heap::*mut Point, x: i32, y: i32) {
+        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
         export { store_point, heap }
@@ -1319,7 +1319,7 @@ fn test_sched_struct_pointer_load_field_access() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn get_x(ptr: heap::*Point) -> i32 {
+        fn get_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
@@ -1360,7 +1360,7 @@ fn test_sched_struct_pointer_load_full_aggregate_keeps_all_loads() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn load_point(ptr: heap::*Point) -> Point { ptr.* }
+        fn load_point(ptr: heap::&Point) -> Point { ptr.* }
         export { load_point, heap }
     "}
 	);
@@ -1584,10 +1584,10 @@ fn test_sched_call_result_spilled() {
 #[test]
 fn test_sched_narrow_loads_emit_correct_opcodes() {
 	let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
-		("*u8", "u8", |i| matches!(i, Instruction::I32Load8U(_))),
-		("*i8", "i8", |i| matches!(i, Instruction::I32Load8S(_))),
-		("*u16", "u16", |i| matches!(i, Instruction::I32Load16U(_))),
-		("*i16", "i16", |i| matches!(i, Instruction::I32Load16S(_))),
+		("&u8", "u8", |i| matches!(i, Instruction::I32Load8U(_))),
+		("&i8", "i8", |i| matches!(i, Instruction::I32Load8S(_))),
+		("&u16", "u16", |i| matches!(i, Instruction::I32Load16U(_))),
+		("&i16", "i16", |i| matches!(i, Instruction::I32Load16S(_))),
 	];
 
 	for (ptr_ty, ret_ty, is_expected) in cases {
@@ -1619,10 +1619,8 @@ export {{ read, heap }}"
 #[test]
 fn test_sched_narrow_stores_emit_correct_opcodes() {
 	let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
-		("*mut u8", "u8", |i| matches!(i, Instruction::I32Store8(_))),
-		("*mut u16", "u16", |i| {
-			matches!(i, Instruction::I32Store16(_))
-		}),
+		("*u8", "u8", |i| matches!(i, Instruction::I32Store8(_))),
+		("*u16", "u16", |i| matches!(i, Instruction::I32Store16(_))),
 	];
 
 	for (ptr_ty, val_ty, is_expected) in cases {
@@ -2062,7 +2060,7 @@ fn test_u32_right_shift_schedules_logical_shift() {
 fn test_memory64_pointer_param_is_i64() {
 	let case = TestCase::new(indoc! {"
         memory stack: Memory where { Size = u64 };
-        fn id(p: stack::*u8) -> stack::*u8 { p }
+        fn id(p: stack::&u8) -> stack::&u8 { p }
         export { id }
     "});
 	let func = case.get_first_func();

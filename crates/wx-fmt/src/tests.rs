@@ -805,14 +805,14 @@ fn test_format_local_definition_wraps() {
 	// Using FB_WIDTH (a named constant) makes the expression exceed 80 cols.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn set_pixel(x: u32, y: u32) { local base: heap::*mut u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3) as heap::*mut u8; }"
+			"memory heap: Memory where { Size = u32 }; fn set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
 		),
 		indoc! {"
             memory heap: Memory where { Size = u32 };
 
             fn set_pixel(x: u32, y: u32) {
-                local base: heap::*mut u8 =
-                    (fb_ptr() + (y * FB_WIDTH + x) * 3) as heap::*mut u8;
+                local base: heap::*u8 =
+                    (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8;
             }
         "},
 	);
@@ -876,12 +876,12 @@ fn test_format_inline_blocks() {
 	// Single-statement if guard: fits → inline.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn check(data: heap::[]u8) -> bool { if data.len() < 4 { return false }; true }"
+			"memory heap: Memory where { Size = u32 }; fn check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
 		),
 		indoc! {"
             memory heap: Memory where { Size = u32 };
 
-            fn check(data: heap::[]u8) -> bool {
+            fn check(data: heap::&[u8]) -> bool {
                 if data.len() < 4 { return false };
                 true
             }
@@ -1005,12 +1005,12 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 	// Long chain: exceeds 80 columns, each operand on its own line.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn read(data: heap::[]u8, off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
+			"memory heap: Memory where { Size = u32 }; fn read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
 		),
 		indoc! {"
             memory heap: Memory where { Size = u32 };
 
-            fn read(data: heap::[]u8, off: u32) -> i32 {
+            fn read(data: heap::&[u8], off: u32) -> i32 {
                 (data[off] as i32)
                     | ((data[off + 1] as i32) << 8)
                     | ((data[off + 2] as i32) << 16)
@@ -1312,7 +1312,7 @@ fn test_format_comments_preserved() {
 #[test]
 fn test_format_long_type_params_wrap() {
 	let case = TestCase::new(indoc! {"
-        pub fn memory_copy<Size: PointerSize, SrcMem: Memory where { Size = Size }, DstMem: Memory where { Size = Size }>(dst: DstMem::*mut u8, src: SrcMem::*u8, len: Size) {}
+        pub fn memory_copy<Size: PointerSize, SrcMem: Memory where { Size = Size }, DstMem: Memory where { Size = Size }>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
     "});
 	let output = format(
 		&case.ast,
@@ -1331,7 +1331,7 @@ fn test_format_long_type_params_wrap() {
                 Size: PointerSize,
                 SrcMem: Memory where { Size = Size },
                 DstMem: Memory where { Size = Size },
-            >(dst: DstMem::*mut u8, src: SrcMem::*u8, len: Size) {}
+            >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
         "},
 	);
 }
@@ -1339,9 +1339,8 @@ fn test_format_long_type_params_wrap() {
 #[test]
 fn test_format_address_of() {
 	let case = TestCase::new(indoc! {r#"
-        fn f(ptr: *i32, mptr: *mut i32) {
+        fn f(ptr: &i32) {
             local a = ptr.*.&;
-            local b = mptr.*.&mut;
         }
     "#});
 	let output = format(
@@ -1357,9 +1356,8 @@ fn test_format_address_of() {
 	assert_eq!(
 		output,
 		indoc! {r#"
-            fn f(ptr: *i32, mptr: *mut i32) {
+            fn f(ptr: &i32) {
                 local a = ptr.*.&;
-                local b = mptr.*.&mut;
             }
         "#}
 	);

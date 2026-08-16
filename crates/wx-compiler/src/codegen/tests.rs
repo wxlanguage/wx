@@ -356,16 +356,16 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         struct BumpAllocator {}
         impl Allocator for BumpAllocator {
             type Mem = heap;
-            fn reserve(self: heap::*mut Self, layout: Layout<heap>) -> heap::*mut u8 {
+            fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
                 local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
                 local new_end = ptr + layout.size;
                 bump = new_end as heap::*u8;
-                ptr as heap::*mut u8
+                ptr as heap::*u8
             }
         }
 
         fn copy4() {
-            local alloc: heap::*mut BumpAllocator = ptr::null_mut();
+            local alloc: heap::*BumpAllocator = ptr::null_mut();
             local arr = alloc.alloc_slice::<u32>(4);
             arr[0] = 10;
             arr[1] = 20;
@@ -681,7 +681,7 @@ fn test_imports() {
         memory heap: Memory where { Size = u32 };
 
         import \"console\" as console {
-            fn log(value: []u8) -> ();
+            fn log(value: &[u8]) -> ();
         }
 
         fn main() {
@@ -738,7 +738,7 @@ fn test_dead_function_strings_excluded_from_data_section() {
         memory heap: Memory where { Size = u32 };
 
         import \"env\" as env {
-            fn log(message: []u8);
+            fn log(message: &[u8]);
         }
 
         fn live_fn() {
@@ -934,14 +934,14 @@ fn test_global_init_if_expression_executes() {
 
 #[test]
 fn test_global_init_generic_null_pointer_executes() {
-	// global mut head: heap::*Node = ptr::null()
-	// null() is a generic function: null<M: Memory, T>() -> M::*T
+	// global mut head: heap::&Node = ptr::null()
+	// null() is a generic function: null<M: Memory, T>() -> M::&T
 	// Type params must be inferred from the global's declared type.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        global mut head: heap::*Node = ptr::null()
+        global mut head: heap::&Node = ptr::null()
         fn get_head() -> u32 { head as u32 }
         export { get_head }
     "});
@@ -1507,11 +1507,11 @@ fn test_pointer_deref_load_and_store() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn read(ptr: heap::*i32) -> i32 {
+        fn read(ptr: heap::&i32) -> i32 {
             ptr.*
         }
 
-        fn write(ptr: heap::*mut i32, val: i32) {
+        fn write(ptr: heap::*i32, val: i32) {
             ptr.* = val
         }
 
@@ -1553,7 +1553,7 @@ fn test_pointer_deref_increment() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
 
-        fn increment(ptr: heap::*mut i32) {
+        fn increment(ptr: heap::*i32) {
             ptr.* += 1
         }
 
@@ -1608,16 +1608,16 @@ fn test_struct_pointer_load_and_store() {
             y: i32,
         }
 
-        fn store_point(ptr: heap::*mut Point, x: i32, y: i32) {
+        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
 
-        fn load_x(ptr: heap::*Point) -> i32 {
+        fn load_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
 
-        fn load_y(ptr: heap::*Point) -> i32 {
+        fn load_y(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.y
         }
@@ -1758,15 +1758,15 @@ fn test_nested_struct_pointer_store_and_load() {
         #[fixed_order]
         struct Top { flag: u8, mid: Mid }
 
-        fn store_nested_literal(p: heap::*mut Top) {
+        fn store_nested_literal(p: heap::*Top) {
             p.* = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 3 } } };
         }
 
-        fn read_deep_id(p: heap::*Top) -> u64 {
+        fn read_deep_id(p: heap::&Top) -> u64 {
             p.*.mid.deep.id
         }
 
-        fn write_deep_id(p: heap::*mut Top, v: u64) {
+        fn write_deep_id(p: heap::*Top, v: u64) {
             p.*.mid.deep.id = v;
         }
 
@@ -1859,10 +1859,10 @@ fn test_struct_field_write_through_pointer() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
-        fn set_x(ptr: heap::*mut Point, v: i32) { ptr.*.x = v }
-        fn set_y(ptr: heap::*mut Point, v: i32) { ptr.*.y = v }
-        fn get_x(ptr: heap::*Point) -> i32 { ptr.*.x }
-        fn get_y(ptr: heap::*Point) -> i32 { ptr.*.y }
+        fn set_x(ptr: heap::*Point, v: i32) { ptr.*.x = v }
+        fn set_y(ptr: heap::*Point, v: i32) { ptr.*.y = v }
+        fn get_x(ptr: heap::&Point) -> i32 { ptr.*.x }
+        fn get_y(ptr: heap::&Point) -> i32 { ptr.*.y }
         export { heap, set_x, set_y, get_x, get_y }
     "});
 	let engine = wasmtime::Engine::default();
@@ -2140,7 +2140,7 @@ fn test_generic_struct_chained_calls() {
 
 #[test]
 fn test_generic_struct_pointer_load_store() {
-	// Memory load/store via a pointer to a generic struct `heap::*Point<i32>`.
+	// Memory load/store via a pointer to a generic struct `heap::&Point<i32>`.
 	// Codegen must emit the correct field offsets for the monomorphized aggregate
 	// (x@0, y@4), going through the same path as the non-generic pointer tests.
 	let case = TestCase::new(indoc! {"
@@ -2152,16 +2152,16 @@ fn test_generic_struct_pointer_load_store() {
             y: T,
         }
 
-        fn store_pt(ptr: heap::*mut Point<i32>, x: i32, y: i32) {
+        fn store_pt(ptr: heap::*Point<i32>, x: i32, y: i32) {
             ptr.* = Point::{ x, y }
         }
 
-        fn load_x(ptr: heap::*Point<i32>) -> i32 {
+        fn load_x(ptr: heap::&Point<i32>) -> i32 {
             local p = ptr.*;
             p.x
         }
 
-        fn load_y(ptr: heap::*Point<i32>) -> i32 {
+        fn load_y(ptr: heap::&Point<i32>) -> i32 {
             local p = ptr.*;
             p.y
         }
@@ -2303,7 +2303,7 @@ fn test_array_literal_read_by_index() {
         memory heap: Memory where { Size = u32 };
 
         fn get(i: u32) -> i32 {
-            local arr: heap::[4]i32 = [10, 20, 30, 40];
+            local arr: heap::&[i32; 4] = [10, 20, 30, 40];
             arr[i]
         }
 
@@ -2333,8 +2333,8 @@ fn test_array_write_and_read_back() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn write(arr: [4]mut i32, i: u32, v: i32) { arr[i] = v; }
-        fn read(arr: [4]i32, i: u32) -> i32 { arr[i] }
+        fn write(arr: *[i32; 4], i: u32, v: i32) { arr[i] = v; }
+        fn read(arr: &[i32; 4], i: u32) -> i32 { arr[i] }
 
         export { heap, write, read }
     "});
@@ -2384,7 +2384,7 @@ fn test_dead_array_excluded_from_data_section() {
         fn live() -> i32 { 42 }
 
         fn dead() -> i32 {
-            local arr: [3]i32 = [0xDE, 0xAD, 0xBE];
+            local arr: &[i32; 3] = [0xDE, 0xAD, 0xBE];
             arr[0]
         }
 
@@ -2408,7 +2408,7 @@ fn test_array_index_wat() {
         memory heap: Memory where { Size = u32 };
 
         fn get(i: u32) -> i32 {
-            local arr: [4]i32 = [10, 20, 30, 40];
+            local arr: &[i32; 4] = [10, 20, 30, 40];
             arr[i]
         }
 
@@ -2442,19 +2442,19 @@ fn test_slice_range_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn full_copy(s: heap::[]i32) -> heap::[]i32 {
+        fn full_copy(s: heap::&[i32]) -> heap::&[i32] {
             s[..]
         }
 
-        fn to_limit(s: heap::[]i32, to: u32) -> heap::[]i32 {
+        fn to_limit(s: heap::&[i32], to: u32) -> heap::&[i32] {
             s[..to]
         }
 
-        fn from_start(s: heap::[]i32, from: u32) -> heap::[]i32 {
+        fn from_start(s: heap::&[i32], from: u32) -> heap::&[i32] {
             s[from..]
         }
 
-        fn bounded(s: heap::[]i32, from: u32, to: u32) -> heap::[]i32 {
+        fn bounded(s: heap::&[i32], from: u32, to: u32) -> heap::&[i32] {
             s[from..to]
         }
 
@@ -2475,11 +2475,11 @@ fn test_slice_range_array_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn full_array(arr: heap::[4]i32) -> heap::[]i32 {
+        fn full_array(arr: heap::&[i32; 4]) -> heap::&[i32] {
             arr[..]
         }
 
-        fn partial_array(arr: heap::[4]i32, i: u32, n: u32) -> heap::[]i32 {
+        fn partial_array(arr: heap::&[i32; 4], i: u32, n: u32) -> heap::&[i32] {
             arr[i..n]
         }
 
@@ -2499,9 +2499,9 @@ fn test_narrow_pointer_deref_sign_extension_and_byte_isolation() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn read_u8(ptr: heap::*u8) -> u8 { ptr.* }
-        fn read_i8(ptr: heap::*i8) -> i8 { ptr.* }
-        fn write_u8(ptr: heap::*mut u8, val: u8) { ptr.* = val }
+        fn read_u8(ptr: heap::&u8) -> u8 { ptr.* }
+        fn read_i8(ptr: heap::&i8) -> i8 { ptr.* }
+        fn write_u8(ptr: heap::*u8, val: u8) { ptr.* = val }
 
         export { heap, read_u8, read_i8, write_u8 }
     "});
@@ -2636,10 +2636,10 @@ fn test_null_pointer_comparison() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        struct Node { value: i32, next: *Node }
+        struct Node { value: i32, next: &Node }
 
-        fn make_null() -> *Node { ptr::null() }
-        fn is_null_ptr(p: *Node) -> bool { p == ptr::null() }
+        fn make_null() -> &Node { ptr::null() }
+        fn is_null_ptr(p: &Node) -> bool { p == ptr::null() }
         fn ptr_from_addr() -> *Node { 4 as heap::*Node }
 
         export { heap, make_null, is_null_ptr, ptr_from_addr }
@@ -2744,7 +2744,7 @@ fn test_check_wad_magic_wat() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
-        pub fn check_wad_magic(data: heap::[]u8) -> bool {
+        pub fn check_wad_magic(data: heap::&[u8]) -> bool {
             data[0] == 0x49
                 && data[1] == 0x57
                 && data[2] == 0x41
@@ -2764,11 +2764,11 @@ fn test_constant_index_offset_folding_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
         fn get_arr() -> i32 {
-            local arr: [4]i32 = [10, 20, 30, 40];
+            local arr: &[i32; 4] = [10, 20, 30, 40];
             arr[2]
         }
 
-        fn get_slice(s: heap::[]i32) -> i32 {
+        fn get_slice(s: heap::&[i32]) -> i32 {
             s[3]
         }
 
@@ -2777,19 +2777,18 @@ fn test_constant_index_offset_folding_wat() {
 	insta::assert_snapshot!(wasmprinter::print_bytes(&case.bytecode).unwrap());
 }
 
-// ── AddressOf (.& / .&mut)
+// ── AddressOf (.&)
 // ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_address_of_array_element() {
-	// `arr[i].&mut` on a mutable heap array returns a *mut pointer to element i.
-	// The byte address must equal base + i * elem_size; writing through the
-	// returned pointer must update the correct memory slot.
+	// `arr[i].&` on a heap array returns a shared reference to element i.
+	// The byte address must equal base + i * elem_size.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
-        fn elem_ptr(arr: heap::[4]mut i32, i: u32) -> heap::*mut i32 {
-            arr[i].&mut
+        fn elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 {
+            arr[i].&
         }
 
         export { heap, elem_ptr }
@@ -2830,8 +2829,8 @@ fn test_address_of_struct_field() {
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
-        fn x_addr(ptr: heap::*Point) -> heap::*i32 { ptr.*.x.& }
-        fn y_addr(ptr: heap::*Point) -> heap::*i32 { ptr.*.y.& }
+        fn x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
+        fn y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
 
         export { heap, x_addr, y_addr }
     "});
@@ -2874,7 +2873,7 @@ fn test_narrow_field_cast_does_not_overread_adjacent_bytes() {
         memory heap: Memory where { Size = u32 }
         struct S { a: u8, b: u64, c: u16 }
 
-        fn read_c(p: heap::*S) -> u32 { p.*.c as u32 }
+        fn read_c(p: heap::&S) -> u32 { p.*.c as u32 }
 
         export { heap, read_c }
     "});
@@ -2916,9 +2915,9 @@ fn test_address_of_wat() {
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
-        fn elem_ptr(arr: heap::[4]i32, i: u32) -> heap::*i32 { arr[i].& }
-        fn x_addr(ptr: heap::*Point) -> heap::*i32 { ptr.*.x.& }
-        fn y_addr(ptr: heap::*Point) -> heap::*i32 { ptr.*.y.& }
+        fn elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
+        fn x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
+        fn y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
 
         export { heap, elem_ptr, x_addr, y_addr }
     "});
@@ -2936,7 +2935,7 @@ fn test_memory64_pointer_roundtrip() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u64 };
-        fn store_load(p: heap::*mut u64) -> u64 {
+        fn store_load(p: heap::*u64) -> u64 {
             p.* = 7;
             p.*
         }
@@ -2968,8 +2967,8 @@ fn test_memory64_size_grow_and_static_data() {
         memory heap: Memory where { Size = u64 };
         fn size_pages() -> u64 { heap.size() }
         fn grow_one() -> i64 { heap.grow(1) }
-        fn msg() -> heap::[]u8 { \"hello\" }
-        fn data_end() -> heap::*u8 { heap::DATA_END }
+        fn msg() -> heap::&[u8] { \"hello\" }
+        fn data_end() -> heap::&u8 { heap::DATA_END }
 
         export { size_pages, grow_one, msg, data_end }
     "});
@@ -3018,10 +3017,10 @@ fn test_multi_memory_static_data() {
         memory first: Memory where { Size = u32 };
         #[memory_limits(min_pages = 1)]
         memory second: Memory where { Size = u32 };
-        fn greet_first() -> first::[]u8 { \"hello\" }
-        fn greet_second() -> second::[]u8 { \"world!!\" }
-        fn end_first() -> first::*u8 { first::DATA_END }
-        fn end_second() -> second::*u8 { second::DATA_END }
+        fn greet_first() -> first::&[u8] { \"hello\" }
+        fn greet_second() -> second::&[u8] { \"world!!\" }
+        fn end_first() -> first::&u8 { first::DATA_END }
+        fn end_second() -> second::&u8 { second::DATA_END }
 
         export {
             first,

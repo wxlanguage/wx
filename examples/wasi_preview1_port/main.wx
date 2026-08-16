@@ -21,10 +21,12 @@
 //      separate union/ADT construct. The workaround models the real C ABI
 //      the union compiles to instead of the union itself: a tag field
 //      followed by a payload field typed as the *largest* variant, with
-//      every other (smaller) variant read/written by reinterpreting that
-//      same field's address as a pointer to the smaller variant's type —
-//      valid because union members always share the union's base address.
-//      See `SubscriptionU` below.
+//      every other (smaller) variant addressed by computing its byte
+//      offset within the payload (via a null-pointer `offsetof`, since
+//      `.&` only ever yields a shared reference, never a reinterpretable
+//      pointer) and reinterpreting the base pointer's address plus that
+//      offset as the smaller variant's type — valid because union members
+//      always share the union's base address. See `SubscriptionU` below.
 //
 // A third issue — a struct-of-structs (`Subscription.u: SubscriptionU`,
 // itself containing `SubscriptionClock`) used to either crash the compiler
@@ -189,11 +191,11 @@ module Rights {
 }
 
 // ── `$iovec` / `$ciovec` / `$iovec_array` / `$ciovec_array` ─────────────────
-// No struct needed at all: wx's native `[]T` slice ABI already lowers to
+// No struct needed at all: wx's native slice ABI already lowers to
 // exactly `{ ptr: u32, len: u32 }` in linear memory (see
 // `examples/wasi_hello_world`), which is bit-for-bit `__wasi_ciovec_t`'s
-// layout. `[]u8` *is* `$ciovec` and `[]mut u8` *is* `$iovec`; `[][]u8` /
-// `[][]mut u8` are the `_array` list variants. Used inline below.
+// layout. `&[u8]` *is* `$ciovec` and `*[u8]` *is* `$iovec`; `&[&[u8]]` /
+// `&[*[u8]]` are the `_array` list variants. Used inline below.
 // ── `$whence` ────────────────────────────────────────────────────────────────
 enum Whence: u8 {
   Set = 0,
@@ -346,8 +348,10 @@ struct SubscriptionU {
   clock: SubscriptionClock,
 }
 
-fn subscription_u_as_fd_readwrite(u: *mut SubscriptionU) -> *mut SubscriptionFdReadwrite {
-  (u.*.clock.&mut) as _
+fn subscription_u_as_fd_readwrite(u: *SubscriptionU) -> *SubscriptionFdReadwrite {
+  local base: *SubscriptionU = ptr::null_mut();
+  local offset = (base.*.clock.& as heap::Size) - (base as heap::Size);
+  (u as heap::Size + offset) as *SubscriptionFdReadwrite
 }
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
@@ -447,49 +451,49 @@ enum ClockId: u32 {
 // out-pointers instead of one. This is the same shape already proven in
 // `examples/wasi_args`'s `args_sizes_get`.
 import "wasi_snapshot_preview1" as wasi {
-  fn args_get(argv: *mut u32, argv_buf: *mut u8) -> Errno;
-  fn args_sizes_get(argc: *mut u32, argv_buf_size: *mut u32) -> Errno;
-  fn environ_get(environ: *mut u32, environ_buf: *mut u8) -> Errno;
-  fn environ_sizes_get(environ_count: *mut u32, environ_buf_size: *mut u32) -> Errno;
-  fn clock_res_get(id: ClockId, resolution: *mut u64) -> Errno;
-  fn clock_time_get(id: ClockId, precision: u64, time: *mut u64) -> Errno;
+  fn args_get(argv: *u32, argv_buf: *u8) -> Errno;
+  fn args_sizes_get(argc: *u32, argv_buf_size: *u32) -> Errno;
+  fn environ_get(environ: *u32, environ_buf: *u8) -> Errno;
+  fn environ_sizes_get(environ_count: *u32, environ_buf_size: *u32) -> Errno;
+  fn clock_res_get(id: ClockId, resolution: *u64) -> Errno;
+  fn clock_time_get(id: ClockId, precision: u64, time: *u64) -> Errno;
   fn fd_advise(fd: Fd, offset: u64, len: u64, advice: Advice) -> Errno;
   fn fd_allocate(fd: Fd, offset: u64, len: u64) -> Errno;
   fn fd_close(fd: Fd) -> Errno;
   fn fd_datasync(fd: Fd) -> Errno;
-  fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno;
+  fn fd_fdstat_get(fd: Fd, stat: *Fdstat) -> Errno;
   fn fd_fdstat_set_flags(fd: Fd, flags: u16) -> Errno;
   fn fd_fdstat_set_rights(
     fd: Fd,
     fs_rights_base: u64,
     fs_rights_inheriting: u64,
   ) -> Errno;
-  fn fd_filestat_get(fd: Fd, stat: *mut Filestat) -> Errno;
+  fn fd_filestat_get(fd: Fd, stat: *Filestat) -> Errno;
   fn fd_filestat_set_size(fd: Fd, size: u64) -> Errno;
   fn fd_filestat_set_times(fd: Fd, atim: u64, mtim: u64, fst_flags: u16) -> Errno;
-  fn fd_pread(fd: Fd, iovs: [][]mut u8, offset: u64, nread: *mut u32) -> Errno;
-  fn fd_prestat_get(fd: Fd, prestat: *mut Prestat) -> Errno;
-  fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_len: u32) -> Errno;
-  fn fd_pwrite(fd: Fd, iovs: [][]u8, offset: u64, nwritten: *mut u32) -> Errno;
-  fn fd_read(fd: Fd, iovs: [][]mut u8, nread: *mut u32) -> Errno;
+  fn fd_pread(fd: Fd, iovs: &[*[u8]], offset: u64, nread: *u32) -> Errno;
+  fn fd_prestat_get(fd: Fd, prestat: *Prestat) -> Errno;
+  fn fd_prestat_dir_name(fd: Fd, path: *u8, path_len: u32) -> Errno;
+  fn fd_pwrite(fd: Fd, iovs: &[&[u8]], offset: u64, nwritten: *u32) -> Errno;
+  fn fd_read(fd: Fd, iovs: &[*[u8]], nread: *u32) -> Errno;
   fn fd_readdir(
     fd: Fd,
-    buf: *mut u8,
+    buf: *u8,
     buf_len: u32,
     cookie: u64,
-    bufused: *mut u32,
+    bufused: *u32,
   ) -> Errno;
   fn fd_renumber(fd: Fd, to: Fd) -> Errno;
-  fn fd_seek(fd: Fd, offset: i64, whence: Whence, newoffset: *mut u64) -> Errno;
+  fn fd_seek(fd: Fd, offset: i64, whence: Whence, newoffset: *u64) -> Errno;
   fn fd_sync(fd: Fd) -> Errno;
-  fn fd_tell(fd: Fd, offset: *mut u64) -> Errno;
-  fn fd_write(fd: Fd, iovs: [][]u8, nwritten: *mut u32) -> Errno;
-  fn path_create_directory(fd: Fd, path: []u8) -> Errno;
-  fn path_filestat_get(fd: Fd, flags: u32, path: []u8, stat: *mut Filestat) -> Errno;
+  fn fd_tell(fd: Fd, offset: *u64) -> Errno;
+  fn fd_write(fd: Fd, iovs: &[&[u8]], nwritten: *u32) -> Errno;
+  fn path_create_directory(fd: Fd, path: &[u8]) -> Errno;
+  fn path_filestat_get(fd: Fd, flags: u32, path: &[u8], stat: *Filestat) -> Errno;
   fn path_filestat_set_times(
     fd: Fd,
     flags: u32,
-    path: []u8,
+    path: &[u8],
     atim: u64,
     mtim: u64,
     fst_flags: u16,
@@ -497,55 +501,55 @@ import "wasi_snapshot_preview1" as wasi {
   fn path_link(
     old_fd: Fd,
     old_flags: u32,
-    old_path: []u8,
+    old_path: &[u8],
     new_fd: Fd,
-    new_path: []u8,
+    new_path: &[u8],
   ) -> Errno;
   fn path_open(
     fd: Fd,
     dirflags: u32,
-    path: []u8,
+    path: &[u8],
     oflags: u16,
     fs_rights_base: u64,
     fs_rights_inheriting: u64,
     fdflags: u16,
-    opened_fd: *mut u32,
+    opened_fd: *u32,
   ) -> Errno;
   fn path_readlink(
     fd: Fd,
-    path: []u8,
-    buf: *mut u8,
+    path: &[u8],
+    buf: *u8,
     buf_len: u32,
-    bufused: *mut u32,
+    bufused: *u32,
   ) -> Errno;
-  fn path_remove_directory(fd: Fd, path: []u8) -> Errno;
-  fn path_rename(fd: Fd, old_path: []u8, new_fd: Fd, new_path: []u8) -> Errno;
-  fn path_symlink(old_path: []u8, fd: Fd, new_path: []u8) -> Errno;
-  fn path_unlink_file(fd: Fd, path: []u8) -> Errno;
+  fn path_remove_directory(fd: Fd, path: &[u8]) -> Errno;
+  fn path_rename(fd: Fd, old_path: &[u8], new_fd: Fd, new_path: &[u8]) -> Errno;
+  fn path_symlink(old_path: &[u8], fd: Fd, new_path: &[u8]) -> Errno;
+  fn path_unlink_file(fd: Fd, path: &[u8]) -> Errno;
   // `$in`/`$out` are raw pointers to caller-managed arrays with the element
   // count passed separately (`nsubscriptions`), *not* witx `list`s — so
-  // these stay single-element pointers rather than `[]T` slices; the slice
+  // these stay single-element pointers rather than slices; the slice
   // ABI's implicit length would duplicate (and could disagree with)
   // `nsubscriptions`.
   fn poll_oneoff(
-    in_: *Subscription,
-    out: *mut Event,
+    in_: &Subscription,
+    out: *Event,
     nsubscriptions: u32,
-    nevents: *mut u32,
+    nevents: *u32,
   ) -> Errno;
   fn proc_exit(rval: u32);
   fn proc_raise(sig: Signal) -> Errno;
   fn sched_yield() -> Errno;
-  fn random_get(buf: []mut u8) -> Errno;
-  fn sock_accept(fd: Fd, flags: u16, new_fd: *mut u32) -> Errno;
+  fn random_get(buf: *[u8]) -> Errno;
+  fn sock_accept(fd: Fd, flags: u16, new_fd: *u32) -> Errno;
   fn sock_recv(
     fd: Fd,
-    ri_data: [][]mut u8,
+    ri_data: &[*[u8]],
     ri_flags: u16,
-    ro_datalen: *mut u32,
-    ro_flags: *mut u16,
+    ro_datalen: *u32,
+    ro_flags: *u16,
   ) -> Errno;
-  fn sock_send(fd: Fd, si_data: [][]u8, si_flags: u16, so_datalen: *mut u32) -> Errno;
+  fn sock_send(fd: Fd, si_data: &[&[u8]], si_flags: u16, so_datalen: *u32) -> Errno;
   fn sock_shutdown(fd: Fd, how: u8) -> Errno;
 }
 
@@ -565,8 +569,8 @@ struct BumpAllocator {}
 impl Allocator for BumpAllocator {
   type Mem = heap;
 
-  fn reserve(self: *mut Self, layout: Layout<Self::Mem>) -> *mut u8 {
-    local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
+  fn reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
+    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align);
     local new_end = ptr + layout.size;
     local cur_end = heap.size() * PAGE_SIZE;
     if new_end > cur_end {
@@ -574,13 +578,13 @@ impl Allocator for BumpAllocator {
       if heap.grow(needed) == -1 { unreachable }
     }
     bump = new_end as *u8;
-    ptr as *mut u8
+    ptr as *u8
   }
 }
 
-fn write_all(fd: Fd, bytes: []u8) {
-  local alloc: *mut BumpAllocator = std::ptr::null_mut();
-  local io_vecs = alloc.alloc_slice::<[]u8>(1);
+fn write_all(fd: Fd, bytes: &[u8]) {
+  local alloc: *BumpAllocator = std::ptr::null_mut();
+  local io_vecs = alloc.alloc_slice::<&[u8]>(1);
   io_vecs[0] = bytes;
   local nwritten = alloc.alloc::<u32>(0);
   if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
@@ -589,7 +593,7 @@ fn write_all(fd: Fd, bytes: []u8) {
 // Decimal, not hex, so the demo output reads naturally; values here are all
 // small (enum tags, event counts), so a 10-digit buffer is more than enough.
 fn write_decimal(fd: Fd, mut value: u32) {
-  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local alloc: *BumpAllocator = std::ptr::null_mut();
   local buf = alloc.alloc_slice::<u8>(10);
   local mut i: u32 = 10;
   if value == 0 {
@@ -607,7 +611,7 @@ fn write_decimal(fd: Fd, mut value: u32) {
 }
 
 fn main() {
-  local alloc: *mut BumpAllocator = std::ptr::null_mut();
+  local alloc: *BumpAllocator = std::ptr::null_mut();
   
   // clock_time_get: a plain scalar (u64) out-param.
   local time_ptr = alloc.alloc::<u64>(0);

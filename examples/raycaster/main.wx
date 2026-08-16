@@ -58,7 +58,7 @@ pub fn wx_cos(x: f64) -> f64 {
 // `frame()` call.
 global mut map_w: u32 = 0;
 global mut map_h: u32 = 0;
-global mut map_data: heap::*mut u8 = ptr::null_mut();
+global mut map_data: heap::&u8 = ptr::null_mut();
 
 pub fn map_ptr() -> i32 {
     map_data as i32
@@ -111,8 +111,8 @@ pub fn load_map(w: i32, h: i32) {
 // ── bump allocator (same pattern as examples/snake) ───────────────────────────
 global mut bump: heap::*u8 = heap::DATA_END;
 
-fn alloc_bytes(size: u32, align: u32) -> heap::*mut u8 {
-    local ptr = (bump as u32 + align - 1) / align * align;
+fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
+    local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size;
     local cur_end = heap.size() * PAGE_SIZE;
     if new_end > cur_end {
@@ -120,11 +120,11 @@ fn alloc_bytes(size: u32, align: u32) -> heap::*mut u8 {
         _ = heap.grow(needed);
     };
     bump = new_end as heap::*u8;
-    ptr as heap::*mut u8
+    ptr as heap::*u8
 }
 
 // ── framebuffer ────────────────────────────────────────────────────────────
-global mut fb_ptr: heap::*mut u8 = ptr::null_mut();
+global mut fb_ptr: heap::*u8 = ptr::null_mut();
 
 pub fn framebuffer_ptr() -> i32 {
     fb_ptr as i32

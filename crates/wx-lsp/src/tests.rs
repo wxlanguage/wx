@@ -1665,7 +1665,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 	// Regression test: `memory` declarations never recorded any access at
 	// all (unlike struct/enum/trait/const), and `wx-lsp`'s `SymbolKind` had
 	// no `Memory` variant to begin with — so hover/go-to-definition on a
-	// memory name silently did nothing everywhere: as a type (`heap::[]u8`,
+	// memory name silently did nothing everywhere: as a type (`heap::&[u8]`,
 	// `type M = heap;`), as a value receiver (`heap.size()`), and in an
 	// `export { heap as "..." }` list.
 	let root = PathBuf::from("/test/main.wx");

@@ -46,13 +46,13 @@ pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed
 pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 #[intrinsic]
-pub fn slice_len<Mem: Memory, T>(slice: Mem::[]T) -> Mem::Size;
+pub fn slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
 #[intrinsic]
-pub fn slice_ptr<Mem: Memory, T>(slice: Mem::[]T) -> Mem::*T;
+pub fn slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
 #[intrinsic]
-pub fn slice_from_parts<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::[]T;
+pub fn slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
 
 #[intrinsic]
 pub fn size_of<T, Mem: Memory>() -> Mem::Size;
@@ -61,14 +61,14 @@ pub fn size_of<T, Mem: Memory>() -> Mem::Size;
 pub fn align_of<T, Mem: Memory>() -> Mem::Size;
 
 #[intrinsic]
-pub fn memory_fill<Mem: Memory>(dst: Mem::*mut u8, val: u8, len: Mem::Size);
+pub fn memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
 #[intrinsic]
 pub fn memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
->(dst: DstMem::*mut u8, src: SrcMem::*u8, len: Size);
+>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
 #[intrinsic]
 pub fn i64_extend_i32(value: i32) -> i64;
@@ -248,19 +248,19 @@ impl<Mem: Memory> Layout<Mem> {
 pub trait Allocator {
     type Mem: Memory;
 
-    fn reserve(self: Self::Mem::*mut Self, layout: Layout<Self::Mem>) -> Self::Mem::*mut u8;
+    fn reserve(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    fn alloc<T>(self: Self::Mem::*mut Self, value: T) -> Self::Mem::*mut T {
-        local ptr = self.reserve(Layout::of::<T>()) as Self::Mem::*mut T;
+    fn alloc<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+        local ptr = self.reserve(Layout::of::<T>()) as Self::Mem::*T;
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    fn alloc_slice<T>(self: Self::Mem::*mut Self, len: Self::Mem::Size) -> Self::Mem::[]mut T {
+    fn alloc_slice<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.reserve(Layout::array::<T>(len)) as Self::Mem::*T,
+            self.reserve(Layout::array::<T>(len)) as Self::Mem::&T,
             len,
         ) as _
     }
@@ -268,54 +268,62 @@ pub trait Allocator {
 
 pub module ptr {
     #[inline]
-    pub fn null<Mem: Memory, T>() -> Mem::*T {
+    pub fn null<Mem: Memory, T>() -> Mem::&T {
         0 as _
     }
 
     #[inline]
-    pub fn null_mut<Mem: Memory, T>() -> Mem::*mut T {
+    pub fn null_mut<Mem: Memory, T>() -> Mem::*T {
         0 as _
     }
 
     #[inline]
-    pub fn is_null<Mem: Memory, T>(ptr: Mem::*T) -> bool {
+    pub fn is_null<Mem: Memory, T>(ptr: Mem::&T) -> bool {
         ptr as Mem::Size == 0
     }
 
     #[inline]
-    pub fn cast_mut<Mem: Memory, T>(ptr: Mem::*T) -> Mem::*mut T {
+    pub fn cast_mut<Mem: Memory, T>(ptr: Mem::&T) -> Mem::*T {
         ptr as _
     }
 
     #[inline]
-    pub fn add<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
+    pub fn add<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
         (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn sub<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
+    pub fn sub<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
         (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn add_mut<Mem: Memory, T>(ptr: Mem::*mut T, count: Mem::Size) -> Mem::*mut T {
+    pub fn add_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
         (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
     }
 
     #[inline]
-    pub fn sub_mut<Mem: Memory, T>(ptr: Mem::*mut T, count: Mem::Size) -> Mem::*mut T {
+    pub fn sub_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
         (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
+    }
+
+    #[inline]
+    pub fn align_up<Mem: Memory>(addr: Mem::Size, align: Mem::Size) -> Mem::Size {
+        local mask = align - 1;
+        local result = (addr + mask) & ^mask;
+        if result < addr { unreachable }
+        result
     }
 }
 
-impl<Mem: Memory, T> Mem::[]T {
+impl<Mem: Memory, T> Mem::&[T] {
     #[inline]
     pub fn len(self) -> Mem::Size {
         slice_len(self)
     }
 
     #[inline]
-    pub fn ptr(self) -> Mem::*T {
+    pub fn ptr(self) -> Mem::&T {
         slice_ptr(self)
     }
 }

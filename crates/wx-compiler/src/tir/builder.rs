@@ -1123,9 +1123,9 @@ fn report_cannot_store_through_immutable_pointer(
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::CannotMutateImmutable.code())
-		.with_message("cannot write through an immutable pointer")
+		.with_message("cannot write through a shared reference")
 		.with_label(span.primary_label())
-		.with_note("consider changing the pointer type to `*mut T`")
+		.with_note("consider changing the reference type to `*T`")
 }
 
 fn report_cannot_deref_non_pointer(
@@ -1153,18 +1153,6 @@ fn report_cannot_take_address_of_value(span: SourceSpan) -> Diagnostic<FileId> {
         )
         .with_note(
             "`.&` is only valid on places reachable through a pointer, e.g. `ptr.*` or `ptr.*.field`",
-        )
-}
-
-fn report_cannot_take_mutable_address_of_immutable(
-	span: SourceSpan,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-        .with_code(DiagnosticCode::CannotMutateImmutable.code())
-        .with_message("cannot take a mutable address of an immutable place")
-        .with_label(span.primary_label())
-        .with_note(
-            "the pointer chain leading here is immutable; use `*mut T` to allow mutable access",
         )
 }
 
@@ -1717,45 +1705,45 @@ impl<'ast> Builder<'ast, '_> {
 			return true;
 		}
 		match (&self.tir.types[a.as_usize()], &self.tir.types[b.as_usize()]) {
-			// *mut T coerces to *T (dropping write permission is always safe).
+			// *T coerces to &T (dropping write permission is always safe).
 			(
 				Type::Pointer {
 					to: a_to,
 					memory: a_mem,
-					mutable: true,
+					ownership: ast::Ownership::Exclusive,
 				},
 				Type::Pointer {
 					to: b_to,
 					memory: b_mem,
-					mutable: false,
+					ownership: ast::Ownership::Shared,
 				},
 			) => a_to == b_to && a_mem == b_mem,
-			// []mut T coerces to []T (dropping write permission is always safe).
+			// *[T] coerces to &[T] (dropping write permission is always safe).
 			(
 				Type::Slice {
 					of: a_of,
 					memory: a_mem,
-					mutable: true,
+					ownership: ast::Ownership::Exclusive,
 				},
 				Type::Slice {
 					of: b_of,
 					memory: b_mem,
-					mutable: false,
+					ownership: ast::Ownership::Shared,
 				},
 			) => a_of == b_of && a_mem == b_mem,
-			// [N]mut T coerces to [N]T (dropping write permission is always safe).
+			// *[T; N] coerces to &[T; N] (dropping write permission is always safe).
 			(
 				Type::Array {
 					of: a_of,
 					size: a_size,
 					memory: a_mem,
-					mutable: true,
+					ownership: ast::Ownership::Exclusive,
 				},
 				Type::Array {
 					of: b_of,
 					size: b_size,
 					memory: b_mem,
-					mutable: false,
+					ownership: ast::Ownership::Shared,
 				},
 			) => a_of == b_of && a_size == b_size && a_mem == b_mem,
 			// FunctionItem coerces implicitly to its matching Function type.
@@ -2947,7 +2935,7 @@ impl<'ast> Builder<'ast, '_> {
 					},
 				})
 			}
-			ast::TypeExpression::Pointer { mutability, inner } => {
+			ast::TypeExpression::Pointer { ownership, inner } => {
 				let to = self.resolve_type(resolve_context, scope, inner);
 				let span =
 					SourceSpan::new(resolve_context.file_id, type_expr.span);
@@ -2957,10 +2945,10 @@ impl<'ast> Builder<'ast, '_> {
 				self.intern_type(Type::Pointer {
 					to,
 					memory,
-					mutable: mutability.is_some(),
+					ownership: *ownership,
 				})
 			}
-			ast::TypeExpression::Slice { mutability, inner } => {
+			ast::TypeExpression::Slice { ownership, inner } => {
 				let of = self.resolve_type(resolve_context, scope, inner);
 				let span =
 					SourceSpan::new(resolve_context.file_id, type_expr.span);
@@ -2970,13 +2958,13 @@ impl<'ast> Builder<'ast, '_> {
 				self.intern_type(Type::Slice {
 					of,
 					memory,
-					mutable: mutability.is_some(),
+					ownership: *ownership,
 				})
 			}
 			ast::TypeExpression::Array {
-				size,
-				mutability,
+				ownership,
 				inner,
+				size,
 			} => {
 				let of = self.resolve_type(resolve_context, scope, inner);
 				let span =
@@ -2988,7 +2976,7 @@ impl<'ast> Builder<'ast, '_> {
 					of,
 					size: size.inner as u32,
 					memory,
-					mutable: mutability.is_some(),
+					ownership: *ownership,
 				})
 			}
 			ast::TypeExpression::Tuple { elements } => {
@@ -3067,7 +3055,7 @@ impl<'ast> Builder<'ast, '_> {
 				// for untagged pointer/array/slice annotations.
 				match &inner.inner {
 					ast::TypeExpression::Pointer {
-						mutability,
+						ownership,
 						inner: ptr_inner,
 					} => {
 						let to = self.resolve_type(
@@ -3078,13 +3066,13 @@ impl<'ast> Builder<'ast, '_> {
 						self.intern_type(Type::Pointer {
 							to,
 							memory: memory_ty,
-							mutable: mutability.is_some(),
+							ownership: *ownership,
 						})
 					}
 					ast::TypeExpression::Array {
-						size,
-						mutability,
+						ownership,
 						inner: arr_inner,
+						size,
 					} => {
 						let of = self.resolve_type(
 							resolve_context,
@@ -3095,11 +3083,11 @@ impl<'ast> Builder<'ast, '_> {
 							of,
 							size: size.inner as u32,
 							memory: memory_ty,
-							mutable: mutability.is_some(),
+							ownership: *ownership,
 						})
 					}
 					ast::TypeExpression::Slice {
-						mutability,
+						ownership,
 						inner: sl_inner,
 					} => {
 						let of =
@@ -3107,7 +3095,7 @@ impl<'ast> Builder<'ast, '_> {
 						self.intern_type(Type::Slice {
 							of,
 							memory: memory_ty,
-							mutable: mutability.is_some(),
+							ownership: *ownership,
 						})
 					}
 					_ => {
@@ -7600,9 +7588,9 @@ impl<'ast> Builder<'ast, '_> {
 			Type::Pointer {
 				to,
 				memory,
-				mutable,
+				ownership,
 			} => {
-				let (to, memory, mutable) = (*to, *memory, *mutable);
+				let (to, memory, ownership) = (*to, *memory, *ownership);
 				let next_to = self.substitute_type(to, type_args);
 				let next_memory = self.substitute_type(memory, type_args);
 				if next_to == to && next_memory == memory {
@@ -7611,7 +7599,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.intern_type(Type::Pointer {
 						to: next_to,
 						memory: next_memory,
-						mutable,
+						ownership,
 					})
 				}
 			}
@@ -7619,10 +7607,10 @@ impl<'ast> Builder<'ast, '_> {
 				of,
 				size,
 				memory,
-				mutable,
+				ownership,
 			} => {
-				let (of, size, memory, mutable) =
-					(*of, *size, *memory, *mutable);
+				let (of, size, memory, ownership) =
+					(*of, *size, *memory, *ownership);
 				let next_of = self.substitute_type(of, type_args);
 				let next_memory = self.substitute_type(memory, type_args);
 				if next_of == of && next_memory == memory {
@@ -7632,16 +7620,16 @@ impl<'ast> Builder<'ast, '_> {
 						of: next_of,
 						size,
 						memory: next_memory,
-						mutable,
+						ownership,
 					})
 				}
 			}
 			Type::Slice {
 				of,
 				memory,
-				mutable,
+				ownership,
 			} => {
-				let (of, memory, mutable) = (*of, *memory, *mutable);
+				let (of, memory, ownership) = (*of, *memory, *ownership);
 				let next_of = self.substitute_type(of, type_args);
 				let next_memory = self.substitute_type(memory, type_args);
 				if next_of == of && next_memory == memory {
@@ -7650,7 +7638,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.intern_type(Type::Slice {
 						of: next_of,
 						memory: next_memory,
-						mutable,
+						ownership,
 					})
 				}
 			}
@@ -7810,16 +7798,17 @@ impl<'ast> Builder<'ast, '_> {
 				Type::Pointer {
 					to: at,
 					memory: amem,
-					mutable: amut,
+					ownership: aown,
 				},
 				Type::Pointer {
 					to: bt,
 					memory: bmem,
-					mutable: bmut,
+					ownership: bown,
 				},
 			) => {
-				// *mut T satisfies *T (dropping mut is safe); the reverse is not.
-				(*amut || !*bmut)
+				// *T satisfies &T (dropping write permission is safe); the reverse is not.
+				!(*aown == ast::Ownership::Shared
+					&& *bown == ast::Ownership::Exclusive)
 					&& self.type_satisfies_annotation(*at, *bt)
 					&& self.type_satisfies_annotation(*amem, *bmem)
 			}
@@ -9690,7 +9679,7 @@ impl<'ast> Builder<'ast, '_> {
 					ty: self.intern_type(Type::Slice {
 						of: TypeIndex::U8,
 						memory: memory_ty,
-						mutable: false,
+						ownership: ast::Ownership::Shared,
 					}),
 					span: expr.span,
 				})
@@ -9831,8 +9820,7 @@ impl<'ast> Builder<'ast, '_> {
 				.build_slice_range_expression(
 					func_ctx, expr.span, object, start, end,
 				),
-			ast::Expression::AddressOf { value, mut_span } => {
-				let mutable = mut_span.is_some();
+			ast::Expression::AddressOf { value } => {
 				let operand = self.build_expression(
 					func_ctx,
 					AccessContext {
@@ -9843,23 +9831,13 @@ impl<'ast> Builder<'ast, '_> {
 				)?;
 				match operand.kind {
 					ExprKind::Load { place } => {
-						if mutable && !place.mutable {
-							self.tir.diagnostics.push(
-								report_cannot_take_mutable_address_of_immutable(
-									SourceSpan::new(
-										func_ctx.resolve_context.file_id,
-										expr.span,
-									),
-								),
-							);
-						}
 						let pointer_ty = self.intern_type(Type::Pointer {
 							to: place.ty,
 							memory: place.memory,
-							mutable,
+							ownership: ast::Ownership::Shared,
 						});
 						Ok(Expression {
-							kind: ExprKind::AddressOf { place, mutable },
+							kind: ExprKind::AddressOf { place },
 							ty: pointer_ty,
 							span: expr.span,
 						})
@@ -11875,6 +11853,12 @@ impl<'ast> Builder<'ast, '_> {
 			return true;
 		}
 		match (&self.tir.types[a.as_usize()], &self.tir.types[b.as_usize()]) {
+			// KNOWN GAP: casts only check `memory` equality, not ownership —
+			// `&T as *T` currently passes, silently defeating "a `&T` is
+			// always read-only". Fixing this properly needs a real rework of
+			// `as`-cast checking (and probably lands alongside whatever
+			// borrow-checker-alternative wx eventually gets), so it's left
+			// as-is for now rather than patched in isolation here.
 			(
 				Type::Pointer { memory: a_mem, .. },
 				Type::Pointer { memory: b_mem, .. },
@@ -12206,7 +12190,9 @@ impl<'ast> Builder<'ast, '_> {
 
 		match operator.inner {
 			ast::UnaryOp::InvertSign | ast::UnaryOp::BitNot => {
-				if operand.ty.is_primitive() || operand.ty.is_comptime_number()
+				if operand.ty.is_primitive()
+					|| self.is_typeset_bounded_assoc_type(operand.ty)
+					|| operand.ty.is_comptime_number()
 				{
 					let ty = operand.ty;
 					Ok(Expression {
@@ -12218,7 +12204,35 @@ impl<'ast> Builder<'ast, '_> {
 						span: expr.span,
 					})
 				} else {
-					panic!("can't apply unary operator to this type")
+					let formatter =
+						TypeFormatter::new(&self.tir, self.interner);
+					let diagnostic = Diagnostic::error()
+						.with_code(
+							DiagnosticCode::UnaryOperatorCannotBeApplied.code(),
+						)
+						.with_message(format!(
+							"operator `{}` cannot be applied to type `{}`",
+							operator.inner,
+							formatter.display_type(operand.ty).unwrap()
+						))
+						.with_label(Label::primary(
+							ctx.resolve_context.file_id,
+							operand.span,
+						))
+						.with_label(Label::secondary(
+							ctx.resolve_context.file_id,
+							operator.span,
+						));
+
+					self.tir.diagnostics.push(diagnostic);
+					Ok(Expression {
+						kind: ExprKind::Unary {
+							operator,
+							operand: Box::new(operand),
+						},
+						ty: TypeIndex::ERROR,
+						span: expr.span,
+					})
 				}
 			}
 			ast::UnaryOp::Not => {
@@ -12505,7 +12519,8 @@ impl<'ast> Builder<'ast, '_> {
 			(left_type, right_type)
 				if left_type == right_type
 					&& (left_type.is_integer()
-						|| left_type == TypeIndex::BOOL) =>
+						|| left_type == TypeIndex::BOOL
+						|| self.is_typeset_bounded_assoc_type(left_type)) =>
 			{
 				Ok(Expression {
 					kind: ExprKind::Binary {
@@ -12654,7 +12669,8 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(left_type, right_type)
 				if left_type == right_type
-					&& self.is_arithmetic_type(left_type) =>
+					&& (left_type.is_primitive()
+						|| self.is_typeset_bounded_assoc_type(left_type)) =>
 			{
 				Ok(Expression {
 					kind: ExprKind::Binary {
@@ -13585,7 +13601,8 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(left_type, right_type)
 				if left_type == right_type
-					&& self.is_arithmetic_type(left_type) =>
+					&& (left_type.is_primitive()
+						|| self.is_typeset_bounded_assoc_type(left_type)) =>
 			{
 				Ok(Expression {
 					kind: ExprKind::Binary {
@@ -13633,16 +13650,13 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// True when `ty` can be used as an operand in arithmetic or comparison
-	/// expressions.  Extends `is_primitive()` to cover `AssocTypeProjection`
-	/// types bounded by a typeset (e.g. `M::Size` where `type Size: PointerSize`).
-	/// Currently all typesets consist entirely of integer primitives, so any
-	/// typeset-bounded projection is unconditionally accepted here.
+	/// `true` when `ty` is an `AssocTypeProjection` (e.g. `M::Size` where
+	/// `type Size: PointerSize`) whose owning trait declares that
+	/// associated type with a typeset bound. Currently all typesets consist
+	/// entirely of integer primitives, so any typeset-bounded projection is
+	/// unconditionally accepted here.
 	/// TODO: re-check each typeset member when non-numeric typesets are added.
-	fn is_arithmetic_type(&self, ty: TypeIndex) -> bool {
-		if ty.is_primitive() {
-			return true;
-		}
+	fn is_typeset_bounded_assoc_type(&self, ty: TypeIndex) -> bool {
 		let Type::AssocTypeProjection {
 			trait_index,
 			assoc_name,
@@ -16234,8 +16248,8 @@ impl<'ast> Builder<'ast, '_> {
 				Type::Pointer {
 					to,
 					memory,
-					mutable,
-				} => (*to, *memory, *mutable),
+					ownership,
+				} => (*to, *memory, *ownership == ast::Ownership::Exclusive),
 				_ => {
 					self.tir.diagnostics.push(report_cannot_deref_non_pointer(
 						SourceSpan::new(
@@ -16367,15 +16381,15 @@ impl<'ast> Builder<'ast, '_> {
 		let source_span =
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
-		let (expected_of, expected_memory, expected_size, expected_mutable) =
+		let (expected_of, expected_memory, expected_size, expected_ownership) =
 			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
 				Type::Array {
 					of,
 					memory,
 					size,
-					mutable,
-				} => (of, Some(memory), Some(size), mutable),
-				_ => (TypeIndex::INFER, None, None, false),
+					ownership,
+				} => (of, Some(memory), Some(size), ownership),
+				_ => (TypeIndex::INFER, None, None, ast::Ownership::Shared),
 			};
 
 		if let Some(expected_size) = expected_size {
@@ -16476,7 +16490,7 @@ impl<'ast> Builder<'ast, '_> {
 			of: elem_type,
 			size: elements.len() as u32,
 			memory,
-			mutable: expected_mutable,
+			ownership: expected_ownership,
 		});
 
 		Ok(Expression {
@@ -16500,15 +16514,15 @@ impl<'ast> Builder<'ast, '_> {
 		let source_span =
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
-		let (expected_of, expected_memory, expected_mutable) =
+		let (expected_of, expected_memory, expected_ownership) =
 			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
 				Type::Array {
 					of,
 					memory,
-					mutable,
+					ownership,
 					..
-				} => (of, Some(memory), mutable),
-				_ => (TypeIndex::INFER, None, false),
+				} => (of, Some(memory), ownership),
+				_ => (TypeIndex::INFER, None, ast::Ownership::Shared),
 			};
 
 		let count_built = self.build_expression(
@@ -16594,7 +16608,7 @@ impl<'ast> Builder<'ast, '_> {
 			of: value.ty,
 			size: count,
 			memory,
-			mutable: expected_mutable,
+			ownership: expected_ownership,
 		});
 
 		Ok(Expression {
@@ -16627,19 +16641,19 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, mutable) =
+		let (elem_type, memory, ownership) =
 			match self.tir.types[object.ty.as_usize()].clone() {
 				Type::Array {
 					of,
 					memory,
-					mutable,
+					ownership,
 					..
-				} => (of, memory, mutable),
+				} => (of, memory, ownership),
 				Type::Slice {
 					of,
 					memory,
-					mutable,
-				} => (of, memory, mutable),
+					ownership,
+				} => (of, memory, ownership),
 				Type::Error => return Err(()),
 				_ => {
 					self.tir.diagnostics.push(report_index_on_non_indexable(
@@ -16654,6 +16668,7 @@ impl<'ast> Builder<'ast, '_> {
 					return Err(());
 				}
 			};
+		let mutable = ownership == ast::Ownership::Exclusive;
 
 		if matches!(
 			access_ctx.access_kind,
@@ -16729,19 +16744,19 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, mutable) =
+		let (elem_type, memory, ownership) =
 			match self.tir.types[object.ty.as_usize()].clone() {
 				Type::Array {
 					of,
 					memory,
-					mutable,
+					ownership,
 					..
-				} => (of, memory, mutable),
+				} => (of, memory, ownership),
 				Type::Slice {
 					of,
 					memory,
-					mutable,
-				} => (of, memory, mutable),
+					ownership,
+				} => (of, memory, ownership),
 				Type::Error => return Err(()),
 				_ => {
 					self.tir.diagnostics.push(report_index_on_non_indexable(
@@ -16802,7 +16817,7 @@ impl<'ast> Builder<'ast, '_> {
 		let result_ty = self.intern_type(Type::Slice {
 			of: elem_type,
 			memory,
-			mutable,
+			ownership,
 		});
 		Ok(Expression {
 			kind: ExprKind::SliceRange {
