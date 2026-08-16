@@ -1,5 +1,9 @@
 # Session Index
 
+## 2026-08-16
+
+- [2026-08-16-primitives-as-items-and-use-scoping.md](2026-08-16-primitives-as-items-and-use-scoping.md) — Primitives turned into real `#[intrinsic] pub type X;` items (DefId, LSP go-to-def/hover) instead of a hardcoded string match; unrelated `wx-fmt` bug found (`impl` block `pub const` silently lost `pub`, broke ~100 tests); investigating "std auto-imported everywhere" surfaced that a root-level `use X::*;` is currently crate-wide in wx, not per-file like Rust — `lookup_global_symbol`'s ancestor-walk conflates privacy-ancestry with import-lookup, confirmed empirically via a multi-file probe; also found duplicate inherent-impl members (e.g. two `impl f32 { const PI }`) are only ever caught at first use, or not at all if unused — both noted as their own future tasks, not fixed today
+
 ## 2026-08-11
 
 - [2026-08-11-ownership-borrowing-allocator-design.md](2026-08-11-ownership-borrowing-allocator-design.md) — Design-only discussion: owned/borrowed (no `&mut`) ownership model reusing existing `*T`/`*mut T`/`[]T`/`[N]T` syntax, scope-based lifetime inference deferred `'a` syntax, manual-vs-automatic cleanup unified via a minimal opt-in `Drop` trait, and an open allocator-identity problem (memory tag ≠ allocator; bump/arena allocators need arena-scoped escape checks instead of per-object `Drop`)
