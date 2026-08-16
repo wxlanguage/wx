@@ -1,0 +1,18 @@
+fn trap() does(trap) -> ();
+
+fn read<Mem: Memory>() does(read<Mem>) -> ();
+fn write<Mem: Memory>() does(write<Mem>) -> ();
+fn grow<Mem: Memory>() does(read<Mem>, grow<Mem>) -> ();
+
+fn transacts<Mem: std::Memory>() does(read<Mem>, write<Mem>, grow<Mem>) -> ();
+
+fn add(a: i32, b: i32)<_> -> i32;
+fn sub(a: i32, b: i32)<_> -> i32;
+fn mul(a: i32, b: i32)<_> -> i32;
+fn div(a: i32, b: i32)<trap> -> i32;
+fn alloc(size: u32)<*> -> u32;
+
+fn add(a: i32, b: i32) does() -> i32;
+fn sub(a: i32, b: i32) does() -> i32;
+fn mul(a: i32, b: i32) does() -> i32;
+fn div(a: i32, b: i32) does(trap) -> i32;
