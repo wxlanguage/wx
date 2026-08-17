@@ -1,5 +1,16 @@
 # 2026-08-17 — Chained-inlining flat-offset collision: root cause, two fix candidates, both deferred
 
+**Resolved same day — see
+[2026-08-17-chained-inlining-offset-collision-fix.md](2026-08-17-chained-inlining-offset-collision-fix.md).**
+Neither candidate below shipped as designed: 2b (`scope_offset`/`scope_end`
+comparison) was implemented and verified first, then replaced with a
+simpler fix after further discussion — inlining's `LocalSet`-populated
+argument locals turned out not to need a new scope of their own at all, so
+there was nothing left to protect against colliding with anything else's
+new scope. Kept below as the historical record of the investigation that
+found the root cause; the "for whoever picks this back up" section's
+recommendation is superseded.
+
 Follow-on to the "chained-inlining flat-offset collision" bug noted in
 [2026-08-17-compound-assignment-implementation-and-deferred-bugs.md](2026-08-17-compound-assignment-implementation-and-deferred-bugs.md).
 Went deep on root cause and two different fix designs; ultimately reverted

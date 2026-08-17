@@ -1,5 +1,13 @@
 # 2026-08-17 — Compound assignment implementation, dead-code-lint fix, and two deferred bugs
 
+**Both items below are resolved as of later the same day.** The chained-inlining
+bug's fix is in
+[2026-08-17-chained-inlining-offset-collision-fix.md](2026-08-17-chained-inlining-offset-collision-fix.md)
+(via the investigation in
+[2026-08-17-chained-inlining-offset-collision-investigation.md](2026-08-17-chained-inlining-offset-collision-investigation.md));
+the `char` item was already resolved in place below when this entry was
+first written.
+
 ## Compound assignment (task #8) implemented
 
 Followed the design in
@@ -77,9 +85,10 @@ construction outside the inlining case — confirmed via
 `debug_assert_eq!(idx, child.len())` on the fallthrough branch, never
 tripped across the full suite.
 
-## Two bugs found, deferred (user: "keep them noted, we will tackle them later")
+## Two bugs found, initially deferred (user: "keep them noted, we will tackle them later") — both since resolved
 
-**Chained-inlining flat-offset collision (value-correctness bug).** While
+**Chained-inlining flat-offset collision (value-correctness bug) — fixed,
+see the dedicated fix entry linked above.** While
 stress-testing the fix above, the same review fork constructed
 `fn calc(a,b,c,d: i32) -> i32 { (a + b) + (c + d) }` and ran it through
 wasmtime: `calc(-5,5,-5,5)` returns `-5`, not `0`. Confirmed pre-existing
@@ -121,4 +130,4 @@ require a real impl. Renamed to `test_char_arithmetic_requires_explicit_cast`
 and rewritten to use the cast-based form; added a sibling
 `test_char_arithmetic_without_cast_is_error` to lock in the rejection as
 intentional, not incidental. 717 passed / 1 failed (only `test_lerp`, the
-still-deferred chained-inlining bug, remains).
+chained-inlining bug, remained — fixed later the same day, see above).
