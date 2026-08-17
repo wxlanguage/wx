@@ -11,18 +11,14 @@ functions:
         locals:
           - ty: U32
             mutability: Immutable
-        result: I32
-      - kind: Block
-        parent: 0
-        locals: []
-        result: I32
-      - kind: Block
-        parent: 1
-        locals:
           - ty: Unit
             mutability: Immutable
           - ty: U32
             mutability: Immutable
+        result: I32
+      - kind: Block
+        parent: 0
+        locals: []
         result: I32
     block:
       kind:
@@ -35,16 +31,16 @@ functions:
                   expressions:
                     - kind:
                         LocalSet:
-                          scope_index: 2
-                          local_index: 0
+                          scope_index: 0
+                          local_index: 1
                           value:
                             kind: Noop
                             ty: Unit
                       ty: Unit
                     - kind:
                         LocalSet:
-                          scope_index: 2
-                          local_index: 1
+                          scope_index: 0
+                          local_index: 2
                           value:
                             kind:
                               LocalGet:
@@ -54,7 +50,7 @@ functions:
                       ty: Unit
                     - kind:
                         Block:
-                          scope_index: 2
+                          scope_index: 0
                           expressions:
                             - kind:
                                 MemoryGrow:
@@ -62,8 +58,8 @@ functions:
                                   delta:
                                     kind:
                                       LocalGet:
-                                        scope_index: 2
-                                        local_index: 1
+                                        scope_index: 0
+                                        local_index: 2
                                     ty: U32
                               ty: I32
                       ty: I32

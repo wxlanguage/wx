@@ -846,6 +846,45 @@ fn test_global_init_block_with_locals_executes() {
 }
 
 #[test]
+fn test_global_init_multiple_globals_with_own_locals_executes() {
+	// Two globals, each declaring its own locals in its initializer block —
+	// each becomes a self-contained `Block` value of its own `GlobalSet`,
+	// processed via the same clone-then-discard mechanism that makes
+	// if/else branches safe, so their scopes sharing a flat offset (both are
+	// children of the start function's shared root) is harmless: nothing
+	// here mutates a shared, uncloned bindings vector across globals the
+	// way `mir::inlining::inline_call`'s old design used to across inlined
+	// calls.
+	let case = TestCase::new(indoc! {"
+        global mut x: i32 = {
+            local a = 3 as i32;
+            local b = 4 as i32;
+            a * b
+        }
+        global mut y: i32 = {
+            local c = 10 as i32;
+            local d = 20 as i32;
+            c + d
+        }
+        fn get_x() -> i32 { x }
+        fn get_y() -> i32 { y }
+        export { get_x, get_y }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let get_x = instance
+		.get_typed_func::<(), i32>(&mut store, "get_x")
+		.unwrap();
+	let get_y = instance
+		.get_typed_func::<(), i32>(&mut store, "get_y")
+		.unwrap();
+	assert_eq!(get_x.call(&mut store, ()).unwrap(), 12);
+	assert_eq!(get_y.call(&mut store, ()).unwrap(), 30);
+}
+
+#[test]
 fn test_global_init_multiple_sequential_executes() {
 	// g2 is declared after g1: when g2's initializer runs, g1 already holds 10.
 	let case = TestCase::new(indoc! {"

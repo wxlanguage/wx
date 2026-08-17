@@ -8,17 +8,13 @@ functions:
     scopes:
       - kind: Block
         parent: ~
-        locals: []
+        locals:
+          - ty: Unit
+            mutability: Immutable
         result: U32
       - kind: Block
         parent: 0
         locals: []
-        result: U32
-      - kind: Block
-        parent: 1
-        locals:
-          - ty: Unit
-            mutability: Immutable
         result: U32
     block:
       kind:
@@ -31,7 +27,7 @@ functions:
                   expressions:
                     - kind:
                         LocalSet:
-                          scope_index: 2
+                          scope_index: 0
                           local_index: 0
                           value:
                             kind: Noop
@@ -39,7 +35,7 @@ functions:
                       ty: Unit
                     - kind:
                         Block:
-                          scope_index: 2
+                          scope_index: 0
                           expressions:
                             - kind:
                                 MemorySize:

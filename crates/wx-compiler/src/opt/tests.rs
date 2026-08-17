@@ -112,10 +112,13 @@ impl TestCase {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// `fn add(a: i32, b: i32) -> i32 { a + b }` should produce exactly:
+/// `fn add(a: i32, b: i32) -> i32 { a + b }` should produce:
 ///   - 2 Param nodes (indices 0 and 1)
 ///   - 1 Add node referencing them
 ///   - root block has 1 statement (Return)
+///
+/// Plus one dead `Int(0)` node — see the in-test comment on the node-count
+/// assertion for why that one's expected and harmless.
 #[test]
 fn test_simple_add() {
 	let case = TestCase::new(indoc! {"
@@ -126,11 +129,20 @@ fn test_simple_add() {
 	let func = case.get_tagged_func("target");
 	let opt = Builder::build(&case.mir, func);
 
-	// Exactly 3 data nodes: Param(0), Param(1), Add.
+	// 4 data nodes: Param(0), Param(1), a dead Int(0), Add. The dead Int(0)
+	// is `i32::add`'s inlined `self`/`rhs` locals living in `add`'s own root
+	// scope (see `mir::inlining::inline_call`) — `build_function` seeds
+	// every root-scope local past the function's own declared parameters
+	// with a default value before the function body's own `LocalSet`s (here,
+	// forwarding `a`/`b` into those locals) get a chance to run, so one
+	// throwaway default node is unavoidable per inlined call whose site is
+	// the function root. Harmless: nothing uses it, and the same node gets
+	// reused (via `Builder::node`'s CSE) for any other `0`-valued i32 this
+	// function happens to need elsewhere.
 	assert_eq!(
 		opt.data_nodes.len(),
-		3,
-		"expected Param(0), Param(1), Add — got {:#?}",
+		4,
+		"expected Param(0), Param(1), a dead Int(0), Add — got {:#?}",
 		opt.data_nodes.iter().map(|n| &n.kind).collect::<Vec<_>>()
 	);
 
@@ -149,7 +161,7 @@ fn test_simple_add() {
 		}
 	));
 	assert!(matches!(
-		opt.data_nodes[2].kind,
+		opt.data_nodes[3].kind,
 		DataNodeKind::Add {
 			left: 0,
 			right: 1,
@@ -161,12 +173,12 @@ fn test_simple_add() {
 	// a use-edge). Params are used by the Add.
 	assert_eq!(
 		opt.data_nodes[0].uses,
-		vec![2],
+		vec![3],
 		"Param(0) should be used by Add"
 	);
 	assert_eq!(
 		opt.data_nodes[1].uses,
-		vec![2],
+		vec![3],
 		"Param(1) should be used by Add"
 	);
 
@@ -176,7 +188,7 @@ fn test_simple_add() {
 	assert!(matches!(
 		root.statements[0],
 		crate::opt::ControlNode::Return {
-			value: StackResult::Value(2)
+			value: StackResult::Value(3)
 		}
 	));
 }
