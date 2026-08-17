@@ -37,6 +37,36 @@ pub type char;
 #[intrinsic]
 pub type never;
 
+#[tag = "add"]
+pub trait Add {
+    fn add(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "sub"]
+pub trait Sub {
+    fn sub(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "mul"]
+pub trait Mul {
+    fn mul(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "div"]
+pub trait Div {
+    fn div(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "rem"]
+pub trait Rem {
+    fn rem(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "neg"]
+pub trait Neg {
+    fn neg(self: Self) -> Self;
+}
+
 pub const PAGE_SIZE: u32 = 65536;
 
 #[intrinsic]
@@ -104,6 +134,90 @@ pub fn f32_ceil(value: f32) -> f32;
 pub fn f64_ceil(value: f64) -> f64;
 
 #[intrinsic]
+pub fn f32_trunc(value: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_trunc(value: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_neg(value: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_neg(value: i64) -> i64;
+
+#[intrinsic]
+pub fn f32_neg(value: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_neg(value: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_add(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_add(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn f32_add(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_add(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_sub(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_sub(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn f32_sub(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_sub(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_mul(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_mul(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn f32_mul(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_mul(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_div(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn u32_div(a: u32, b: u32) -> u32;
+
+#[intrinsic]
+pub fn i64_div(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn u64_div(a: u64, b: u64) -> u64;
+
+#[intrinsic]
+pub fn f32_div(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_div(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn i32_rem(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn u32_rem(a: u32, b: u32) -> u32;
+
+#[intrinsic]
+pub fn i64_rem(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn u64_rem(a: u64, b: u64) -> u64;
+
+#[intrinsic]
 pub fn f32_convert_i32(value: i32) -> f32;
 
 #[intrinsic]
@@ -159,10 +273,356 @@ pub fn f32_demote_f64(value: f64) -> f32;
 
 impl f32 {
     pub const PI: f32 = 3.14159265358979323846264338327950288;
+
+    #[inline]
+    pub fn trunc(self: Self) -> Self { f32_trunc(self) }
 }
 
 impl f64 {
     pub const PI: f64 = 3.14159265358979323846264338327950288;
+
+    #[inline]
+    pub fn trunc(self: Self) -> Self { f64_trunc(self) }
+}
+
+impl Add for i32 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self { i32_add(self, rhs) }
+}
+
+impl Sub for i32 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self { i32_sub(self, rhs) }
+}
+
+impl Mul for i32 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self { i32_mul(self, rhs) }
+}
+
+impl Div for i32 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { i32_div(self, rhs) }
+}
+
+impl Rem for i32 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self { i32_rem(self, rhs) }
+}
+
+impl Neg for i32 {
+    #[inline]
+    fn neg(self: Self) -> Self { i32_neg(self) }
+}
+
+impl Add for u32 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self as i32, rhs as i32) as u32
+    }
+}
+
+impl Sub for u32 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self as i32, rhs as i32) as u32
+    }
+}
+
+impl Mul for u32 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self as i32, rhs as i32) as u32
+    }
+}
+
+impl Div for u32 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { u32_div(self, rhs) }
+}
+
+impl Rem for u32 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self { u32_rem(self, rhs) }
+}
+
+impl Add for i64 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self { i64_add(self, rhs) }
+}
+
+impl Sub for i64 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self { i64_sub(self, rhs) }
+}
+
+impl Mul for i64 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self { i64_mul(self, rhs) }
+}
+
+impl Div for i64 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { i64_div(self, rhs) }
+}
+
+impl Rem for i64 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self { i64_rem(self, rhs) }
+}
+
+impl Neg for i64 {
+    #[inline]
+    fn neg(self: Self) -> Self { i64_neg(self) }
+}
+
+impl Add for u64 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i64_add(self as i64, rhs as i64) as u64
+    }
+}
+
+impl Sub for u64 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i64_sub(self as i64, rhs as i64) as u64
+    }
+}
+
+impl Mul for u64 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i64_mul(self as i64, rhs as i64) as u64
+    }
+}
+
+impl Div for u64 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { u64_div(self, rhs) }
+}
+
+impl Rem for u64 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self { u64_rem(self, rhs) }
+}
+
+impl Add for f32 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self { f32_add(self, rhs) }
+}
+
+impl Sub for f32 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self { f32_sub(self, rhs) }
+}
+
+impl Mul for f32 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self { f32_mul(self, rhs) }
+}
+
+impl Div for f32 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { f32_div(self, rhs) }
+}
+
+impl Neg for f32 {
+    #[inline]
+    fn neg(self: Self) -> Self { f32_neg(self) }
+}
+
+impl Rem for f32 {
+    // Matches Rust/C `fmod`: truncating division, result has the sign of
+    // the dividend.
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        self - rhs * (self / rhs).trunc()
+    }
+}
+
+impl Add for f64 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self { f64_add(self, rhs) }
+}
+
+impl Sub for f64 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self { f64_sub(self, rhs) }
+}
+
+impl Mul for f64 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self { f64_mul(self, rhs) }
+}
+
+impl Div for f64 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self { f64_div(self, rhs) }
+}
+
+impl Neg for f64 {
+    #[inline]
+    fn neg(self: Self) -> Self { f64_neg(self) }
+}
+
+impl Rem for f64 {
+    // Matches Rust/C `fmod`: truncating division, result has the sign of
+    // the dividend.
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        self - rhs * (self / rhs).trunc()
+    }
+}
+
+impl Add for i8 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Sub for i8 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Mul for i8 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Div for i8 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self {
+        i32_div(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Rem for i8 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        i32_rem(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Neg for i8 {
+    #[inline]
+    fn neg(self: Self) -> Self { i32_neg(self as i32) as i8 }
+}
+
+impl Add for u8 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self as i32, rhs as i32) as u8
+    }
+}
+
+impl Sub for u8 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self as i32, rhs as i32) as u8
+    }
+}
+
+impl Mul for u8 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self as i32, rhs as i32) as u8
+    }
+}
+
+impl Div for u8 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self {
+        u32_div(self as u32, rhs as u32) as u8
+    }
+}
+
+impl Rem for u8 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        u32_rem(self as u32, rhs as u32) as u8
+    }
+}
+
+impl Add for i16 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Sub for i16 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Mul for i16 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Div for i16 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self {
+        i32_div(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Rem for i16 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        i32_rem(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Neg for i16 {
+    #[inline]
+    fn neg(self: Self) -> Self { i32_neg(self as i32) as i16 }
+}
+
+impl Add for u16 {
+    #[inline]
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self as i32, rhs as i32) as u16
+    }
+}
+
+impl Sub for u16 {
+    #[inline]
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self as i32, rhs as i32) as u16
+    }
+}
+
+impl Mul for u16 {
+    #[inline]
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self as i32, rhs as i32) as u16
+    }
+}
+
+impl Div for u16 {
+    #[inline]
+    fn div(self: Self, rhs: Self) -> Self {
+        u32_div(self as u32, rhs as u32) as u16
+    }
+}
+
+impl Rem for u16 {
+    #[inline]
+    fn rem(self: Self, rhs: Self) -> Self {
+        u32_rem(self as u32, rhs as u32) as u16
+    }
 }
 
 pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }

@@ -688,6 +688,7 @@ async fn handle_command(
 				let (compiled, file_id) =
 					resolve_uri(state, &params.text_document.uri)?;
 				let files = &compiled.graph.files;
+				let source = files.source(file_id).ok()?;
 
 				let mut data: Vec<SemanticToken> = Vec::new();
 				let mut prev_line = 0u32;
@@ -708,6 +709,30 @@ async fn handle_command(
 					else {
 						continue;
 					};
+					// Operator dispatch (`+`, `-`, `+=`, ...) pushes a
+					// go-to-definition access at the *operator's own span*
+					// onto the resolved trait method (`resolve_trait_method`
+					// et al. in tir/builder.rs) — correct for go-to-def, but
+					// it means these spans land in `references` too, tagged
+					// with the callee's own `SymbolKind::Function`, which
+					// would otherwise paint `+`/`-` the same color as a real
+					// function call. An operator's span is never a valid
+					// identifier (starts with a symbol character, never a
+					// letter/underscore), so filtering on that excludes them
+					// from semantic highlighting without touching how
+					// go-to-definition/find-references (which read the same
+					// `references` list) behave.
+					let span_text = source.get(
+						entry.source.span.start as usize
+							..entry.source.span.end as usize,
+					);
+					if !span_text.is_some_and(|t| {
+						t.starts_with(|c: char| {
+							c.is_alphabetic() || c == '_'
+						})
+					}) {
+						continue;
+					}
 					let Some(pos) = byte_to_position(
 						files,
 						file_id,

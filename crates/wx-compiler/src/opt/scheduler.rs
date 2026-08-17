@@ -143,6 +143,7 @@ pub enum Instruction {
 	F32Abs,
 	F32Floor,
 	F32Ceil,
+	F32Trunc,
 	F64Add,
 	F64Sub,
 	F64Mul,
@@ -152,6 +153,7 @@ pub enum Instruction {
 	F64Abs,
 	F64Floor,
 	F64Ceil,
+	F64Trunc,
 	F32Eq,
 	F32Ne,
 	F32Lt,
@@ -1235,6 +1237,7 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::Abs { operand, .. }
 			| DataNodeKind::Floor { operand, .. }
 			| DataNodeKind::Ceil { operand, .. }
+			| DataNodeKind::Trunc { operand, .. }
 			| DataNodeKind::BitNot { operand, .. }
 			| DataNodeKind::Eqz { operand }
 			| DataNodeKind::I64ExtendI32S { operand }
@@ -1579,6 +1582,14 @@ impl<'f> Scheduler<'f> {
 				self.body.push(match ty {
 					ScalarType::F32 => Instruction::F32Ceil,
 					ScalarType::F64 => Instruction::F64Ceil,
+					_ => unimplemented!(),
+				});
+			}
+			DataNodeKind::Trunc { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Trunc,
+					ScalarType::F64 => Instruction::F64Trunc,
 					_ => unimplemented!(),
 				});
 			}

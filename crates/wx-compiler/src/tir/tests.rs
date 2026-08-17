@@ -1530,9 +1530,37 @@ fn test_stdlib_types_available() {
 	);
 }
 
-/// char is a primitive type — arithmetic on chars should resolve correctly.
+/// `char` deliberately has no `impl Add`/`impl Sub` of its own — matching
+/// Rust, arithmetic on a `char` requires an explicit cast to an integer
+/// type first (`std/main.wx`'s own `to_ascii_uppercase`/`to_ascii_lowercase`
+/// use the same `(self as u8) ... as char` idiom).
 #[test]
-fn test_stdlib_struct_field_access() {
+fn test_char_arithmetic_requires_explicit_cast() {
+	let case = TestCase::new(indoc! {"
+        fn shift(c: char) -> char {
+            ((c as u8) - 32) as char
+        }
+
+        export { shift }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"unexpected diagnostics: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// The direct-arithmetic counterpart of the above: `char - int` without a
+/// cast must be rejected, not silently allowed — locks in the design
+/// decision (char arithmetic is opt-in via cast, not implicit) as an
+/// explicit regression test rather than an accident of `char` simply
+/// lacking an impl.
+#[test]
+fn test_char_arithmetic_without_cast_is_error() {
 	let case = TestCase::new(indoc! {"
         fn shift(c: char) -> char {
             c - 32
@@ -1541,8 +1569,11 @@ fn test_stdlib_struct_field_access() {
         export { shift }
     "});
 	assert!(
-		case.tir.diagnostics.is_empty(),
-		"unexpected diagnostics: {:?}",
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `char - int` without a cast, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -10804,4 +10835,230 @@ fn test_match_duplicate_pattern_warns_unreachable() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
 	);
+}
+
+// ── generic type param bounded by an operator trait ─────────────────────────
+
+#[test]
+fn test_generic_type_param_bounded_by_add_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn add_generic<T: Add>(a: T, b: T) -> T {
+            a + b
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_generic_type_param_unbounded_operator_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        pub fn add_generic<T>(a: T, b: T) -> T {
+            a + b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for unbounded T + T, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_type_param_bounded_compound_assign_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn add_assign_generic<T: Add>(a: T, b: T) -> T {
+            local mut x: T = a;
+            x += b;
+            x
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_generic_type_param_unbounded_compound_assign_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        pub fn add_assign_generic<T>(a: T, b: T) -> T {
+            local mut x: T = a;
+            x += b;
+            x
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for unbounded T += T, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+// ── struct operator-trait impls ─────────────────────────────────────────────
+//
+// Every `impl Add for X` exercised above (and in `std/main.wx` itself) is for
+// a primitive. `ImplTarget::from_type` (`tir/mod.rs`) treats `Type::Struct`
+// as an equally valid dispatch target via the same `find_trait_impl` lookup,
+// but nothing previously exercised that path — these are the first tests to
+// implement an operator trait for a user-defined struct rather than a
+// primitive.
+
+#[test]
+fn test_struct_impl_add_dispatches() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_operator_dispatch_records_goto_definition_access() {
+	// Mirrors `test_export_const_reports_cannot_export_and_records_access`'s
+	// use of `accesses` to verify LSP hover/go-to-definition — except here
+	// dispatch succeeds, so the check is that the `+` operator's own span
+	// was recorded against the resolved `Vec2::add` method, exactly as the
+	// prior conversation's hover/go-to-def-on-operators behavior requires.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            #[tag = \"vec2_add\"]
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+    "});
+	no_errors(&case);
+
+	let add_tag = case.graph.interner.get("vec2_add").unwrap();
+	let add_def_id = *case.tir.tagged_items.get(&add_tag).unwrap();
+	let add_index = case.tir.function_index(add_def_id).unwrap();
+
+	assert_eq!(
+		case.tir.functions[add_index as usize].accesses.len(),
+		1,
+		"the `+` in `a + b` must be recorded as a go-to-definition access on \
+		 Vec2's `add` method, the same way an ordinary `.add()` method call \
+		 would be"
+	);
+}
+
+#[test]
+fn test_struct_without_operator_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Vec2 + Vec2` \
+		 with no `Add` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_struct_operator_impl_does_not_grant_other_operators() {
+	// Implementing `Add` for a struct must not make `Mul` (or any other
+	// operator trait) resolve too — each operator dispatches through its own
+	// trait independently (`OperatorTraits::for_op`); there is no
+	// "implements one, gets all" fallback.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        pub fn mul_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a * b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Vec2 * Vec2` \
+		 when only `Add` (not `Mul`) is implemented, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_struct_impl_neg_dispatches() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Neg for Vec2 {
+            fn neg(self: Self) -> Self {
+                Vec2::{ x: -self.x, y: -self.y }
+            }
+        }
+
+        pub fn neg_vec2(a: Vec2) -> Vec2 {
+            -a
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_compound_assignment_dispatches_to_add_method() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        pub fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
+            a += b;
+            a
+        }
+    "});
+	no_errors(&case);
 }

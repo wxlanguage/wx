@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use indoc::indoc;
 
+use crate::ast;
 use crate::mir::{self, MIR};
 use crate::opt::builder::Builder;
 use crate::opt::scheduler::{Instruction, Scheduler};
@@ -32,6 +33,8 @@ const STD: &str = indoc! {"
 // ──────────────────────────────────────────────────────────────
 
 struct TestCase {
+	tir: tir::TIR,
+	interner: ast::StringInterner,
 	mir: MIR,
 }
 
@@ -66,14 +69,44 @@ impl TestCase {
 		let mut graph = builder.build(root_id, stdlib_id);
 		let tir = tir::TIR::build(&mut graph);
 		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
-		TestCase { mir }
+		TestCase {
+			tir,
+			interner: graph.interner,
+			mir,
+		}
 	}
 
-	/// Return the first function in the MIR output.
-	/// Each test compiles a single function (no stdlib), so this is always the
-	/// right one.
+	/// Return the first function in the MIR output. Only reliable when the
+	/// test's own snippet is the sole function reachable from `export` —
+	/// the stdlib (always loaded, see `TestCase::new`) contributes plenty of
+	/// its own functions to `mir.functions` ahead of it once any of them
+	/// survive DCE (e.g. arithmetic operator dispatch). Prefer
+	/// `get_tagged_func` (`#[tag = "..."]` on the function under test) for
+	/// anything that isn't purely memory/control-flow.
 	fn get_first_func(&self) -> &mir::Function {
 		self.mir.functions.first().expect("no functions in MIR")
+	}
+
+	/// Return the function tagged `#[tag = "..."]` in the test's own
+	/// snippet — robust against however many stdlib functions land in
+	/// `mir.functions` alongside it, unlike `get_first_func`.
+	fn get_tagged_func(&self, tag: &str) -> &mir::Function {
+		let symbol = self
+			.interner
+			.get(tag)
+			.unwrap_or_else(|| panic!("no `{tag}` symbol interned"));
+		let id = *self
+			.tir
+			.tagged_items
+			.get(&symbol)
+			.unwrap_or_else(|| panic!("no #[tag = \"{tag}\"] item found"));
+		self.mir
+			.functions
+			.iter()
+			.find(|f| f.id == id)
+			.unwrap_or_else(|| {
+				panic!("#[tag = \"{tag}\"] function not present in MIR output")
+			})
 	}
 }
 
@@ -86,10 +119,11 @@ impl TestCase {
 #[test]
 fn test_simple_add() {
 	let case = TestCase::new(indoc! {"
+        #[tag = \"target\"]
         fn add(a: i32, b: i32) -> i32 { a + b }
         export { add }
     "});
-	let func = case.get_first_func();
+	let func = case.get_tagged_func("target");
 	let opt = Builder::build(&case.mir, func);
 
 	// Exactly 3 data nodes: Param(0), Param(1), Add.

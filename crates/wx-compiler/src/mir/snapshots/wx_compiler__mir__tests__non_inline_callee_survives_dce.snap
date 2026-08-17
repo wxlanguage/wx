@@ -3,12 +3,24 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 120
-    signature_index: 0
+  - id: 274
+    signature_index: 1
     scopes:
       - kind: Block
         parent: ~
         locals:
+          - ty: U32
+            mutability: Immutable
+        result: U32
+      - kind: Block
+        parent: 0
+        locals: []
+        result: U32
+      - kind: Block
+        parent: 1
+        locals:
+          - ty: U32
+            mutability: Immutable
           - ty: U32
             mutability: Immutable
         result: U32
@@ -18,23 +30,55 @@ functions:
           scope_index: 0
           expressions:
             - kind:
-                Add:
-                  left:
-                    kind:
-                      LocalGet:
-                        scope_index: 0
-                        local_index: 0
-                    ty: U32
-                  right:
-                    kind:
-                      Int:
-                        value: 1
-                    ty: U32
+                Block:
+                  scope_index: 1
+                  expressions:
+                    - kind:
+                        LocalSet:
+                          scope_index: 2
+                          local_index: 0
+                          value:
+                            kind:
+                              LocalGet:
+                                scope_index: 0
+                                local_index: 0
+                            ty: U32
+                      ty: Unit
+                    - kind:
+                        LocalSet:
+                          scope_index: 2
+                          local_index: 1
+                          value:
+                            kind:
+                              Int:
+                                value: 1
+                            ty: U32
+                      ty: Unit
+                    - kind:
+                        Block:
+                          scope_index: 2
+                          expressions:
+                            - kind:
+                                Add:
+                                  left:
+                                    kind:
+                                      LocalGet:
+                                        scope_index: 2
+                                        local_index: 0
+                                    ty: I32
+                                  right:
+                                    kind:
+                                      LocalGet:
+                                        scope_index: 2
+                                        local_index: 1
+                                    ty: I32
+                              ty: U32
+                      ty: U32
               ty: U32
       ty: U32
     static_data: []
-  - id: 121
-    signature_index: 0
+  - id: 275
+    signature_index: 1
     scopes:
       - kind: Block
         parent: ~
@@ -52,10 +96,10 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 120
+                        id: 274
                     ty:
                       Function:
-                        signature_index: 0
+                        signature_index: 1
                   arguments:
                     - kind:
                         LocalGet:
@@ -69,7 +113,81 @@ signatures:
   - items:
       - U32
       - U32
+      - U32
+    params_count: 2
+  - items:
+      - U32
+      - U32
     params_count: 1
+  - items:
+      - F32
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
+      - I32
+      - I32
+      - I32
+    params_count: 2
+  - items:
+      - I32
+      - I32
+    params_count: 1
+  - items:
+      - I64
+      - I64
+      - I64
+    params_count: 2
+  - items:
+      - I64
+      - I64
+    params_count: 1
+  - items:
+      - U64
+      - U64
+      - U64
+    params_count: 2
+  - items:
+      - F32
+      - F32
+      - F32
+    params_count: 2
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
+  - items:
+      - I8
+      - I8
+      - I8
+    params_count: 2
+  - items:
+      - I8
+      - I8
+    params_count: 1
+  - items:
+      - U8
+      - U8
+      - U8
+    params_count: 2
+  - items:
+      - I16
+      - I16
+      - I16
+    params_count: 2
+  - items:
+      - I16
+      - I16
+    params_count: 1
+  - items:
+      - U16
+      - U16
+      - U16
+    params_count: 2
   - items:
       - U32
       - Bool
@@ -77,8 +195,8 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 121
-      name: 124
+      id: 275
+      name: 172
 imports: []
 memories: []
 aggregates: []

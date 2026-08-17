@@ -289,6 +289,10 @@ pub enum DataNodeKind {
 		operand: DataNodeIndex,
 		ty: ScalarType,
 	},
+	Trunc {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
 	BitNot {
 		operand: DataNodeIndex,
 		ty: ScalarType,
@@ -493,6 +497,7 @@ impl DataNodeKind {
 			| DataNodeKind::Abs { ty, .. }
 			| DataNodeKind::Floor { ty, .. }
 			| DataNodeKind::Ceil { ty, .. }
+			| DataNodeKind::Trunc { ty, .. }
 			| DataNodeKind::BitNot { ty, .. }
 			| DataNodeKind::AggregateGet { ty, .. }
 			| DataNodeKind::Phi { ty, .. }
@@ -916,6 +921,7 @@ impl Function {
             | DataNodeKind::Abs { operand, .. }
             | DataNodeKind::Floor { operand, .. }
             | DataNodeKind::Ceil { operand, .. }
+            | DataNodeKind::Trunc { operand, .. }
             | DataNodeKind::BitNot { operand, .. }
             | DataNodeKind::Eqz    { operand }
             | DataNodeKind::I64ExtendI32S { operand }

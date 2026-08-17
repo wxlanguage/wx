@@ -353,6 +353,15 @@ impl<'mir> Builder<'mir> {
 					self.node(DataNodeKind::Ceil { operand, ty }),
 				)
 			}
+			ExprKind::Trunc { value } => {
+				let ty = ScalarType::try_from(expr.ty)
+					.expect("Trunc must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Trunc { operand, ty }),
+				)
+			}
 			ExprKind::BitNot { value } => {
 				let ty = ScalarType::try_from(expr.ty)
 					.expect("BitNot must be scalar");
@@ -1643,26 +1652,53 @@ impl<'mir> Builder<'mir> {
 
 	// ── Binding helpers ───────────────────────────────────────────────────────
 
-	/// Extend `parent` bindings with the locals of `scope_index`.
+	/// Extend `parent` bindings with the locals of `scope_index`, seeding
+	/// each with a default value — unless it's already been written, which
+	/// happens when an inlined call's `LocalSet`s bind this scope's locals
+	/// (via their global `flat_index`) *before* the scope's own `Block` node
+	/// is reached (`mir::inlining::inline_call` emits the argument
+	/// `LocalSet`s as siblings preceding the callee's body block, not as
+	/// its first statements). Blindly appending a default in that case
+	/// would push it past the slot the `LocalSet` already populated,
+	/// producing a node nothing ever references.
 	fn extend_bindings(
 		&mut self,
 		parent: &[StackResult],
 		scope_index: mir::ScopeIndex,
 	) -> Vec<StackResult> {
 		let mut child = parent.to_vec();
-		for local in &self.mir_func.scopes[scope_index as usize].locals {
+		for (i, local) in self.mir_func.scopes[scope_index as usize]
+			.locals
+			.iter()
+			.enumerate()
+		{
+			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			if idx < child.len() {
+				continue;
+			}
+			debug_assert_eq!(idx, child.len());
 			child.push(self.default_value(local.ty));
 		}
 		child
 	}
 
-	/// Extend `bindings` in-place with the locals of `scope_index`.
+	/// In-place counterpart of `extend_bindings` — see its doc comment for
+	/// why already-written slots must be skipped rather than defaulted.
 	fn extend_bindings_in_place(
 		&mut self,
 		bindings: &mut Vec<StackResult>,
 		scope_index: mir::ScopeIndex,
 	) {
-		for local in &self.mir_func.scopes[scope_index as usize].locals {
+		for (i, local) in self.mir_func.scopes[scope_index as usize]
+			.locals
+			.iter()
+			.enumerate()
+		{
+			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			if idx < bindings.len() {
+				continue;
+			}
+			debug_assert_eq!(idx, bindings.len());
 			bindings.push(self.default_value(local.ty));
 		}
 	}

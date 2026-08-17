@@ -106,6 +106,84 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 	);
 }
 
+/// Operator dispatch (`a + b`) resolves to a real trait method (`Add::add`)
+/// and pushes a go-to-definition access at the *operator's own span* onto
+/// it, the same mechanism an ordinary function reference uses — so without
+/// filtering, `+` would show up in semantic tokens tagged with the callee's
+/// `SymbolKind::Function`, painting it the same color as a real function
+/// call. Asserts the operator gets no semantic token at all, while a real
+/// function-name reference on the same line still does.
+#[tokio::test]
+async fn semantic_tokens_do_not_highlight_operators_as_functions() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe2/main.wx").unwrap();
+	// Line 1: "fn add(a: i32, b: i32) -> i32 { a + b }" — `+` is at column 34.
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text:
+					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+						.into(),
+			},
+		})
+		.await;
+
+	let result = backend
+		.semantic_tokens_full(SemanticTokensParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		})
+		.await
+		.expect("semantic_tokens_full should not error")
+		.expect("expected a semantic tokens result");
+
+	let SemanticTokensResult::Tokens(tokens) = result else {
+		panic!("expected a full tokens result, not a delta");
+	};
+
+	// Decode the delta-encoded tokens back to absolute (line, character)
+	// positions.
+	let mut line = 0u32;
+	let mut character = 0u32;
+	let mut positions = Vec::new();
+	for tok in &tokens.data {
+		if tok.delta_line == 0 {
+			character += tok.delta_start;
+		} else {
+			line += tok.delta_line;
+			character = tok.delta_start;
+		}
+		positions.push((line, character, tok.token_type));
+	}
+
+	assert!(
+		!positions.iter().any(|&(l, c, _)| l == 1 && c == 34),
+		"operator `+` must not get its own semantic token: {:?}",
+		positions
+	);
+	assert!(
+		positions
+			.iter()
+			.any(|&(l, _, tt)| l == 1 && tt == TokenType::Function as u32),
+		"expected `add`'s own declaration on line 1 to still be highlighted \
+		 as a function: {:?}",
+		positions
+	);
+}
+
 /// Resolves the `FileId` for a given file path from a compiled root.
 fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
 	compiled

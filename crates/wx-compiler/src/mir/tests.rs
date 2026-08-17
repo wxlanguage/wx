@@ -1460,3 +1460,74 @@ fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
 		"exhaustive enum match without `_` should lower with no default arm"
 	);
 }
+
+// ── struct operator-trait impls
+// ──────────────────────────────────────────
+
+#[test]
+fn test_struct_operator_overload_lowers_to_call() {
+	// Not `#[inline]`, so `a + b` must lower to a genuine `Call` targeting
+	// the resolved `Vec2::add` — the struct-target counterpart of every
+	// other operator-dispatch test, which only ever exercises primitives.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+
+        export { add_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_operator_overload_inline_method_is_substituted() {
+	// Same as above but `#[inline]`, matching the convention every primitive
+	// impl in `std/main.wx` already uses — the snapshot should show the
+	// struct-field arithmetic substituted directly, no Call node left.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            #[inline]
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+
+        export { add_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_compound_assignment_lowers_to_add_call() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
+            a += b;
+            a
+        }
+
+        export { add_assign_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}

@@ -209,6 +209,9 @@ pub enum ExprKind {
 	Ceil {
 		value: Box<Expression>,
 	},
+	Trunc {
+		value: Box<Expression>,
+	},
 	I64ExtendI32S {
 		value: Box<Expression>,
 	},
@@ -1385,6 +1388,20 @@ impl<'tir> Builder<'tir> {
 		}
 	}
 
+	/// Whether `id` refers to an `#[intrinsic]` function. Intrinsic calls are
+	/// eliminated entirely during lowering (substituted for a dedicated
+	/// `ExprKind` variant) and never become a real `mir::Function`, so they
+	/// must never be recorded as a call-graph edge — an intrinsic id showing
+	/// up as someone's callee would leave `CallGraph`'s `callers` map without
+	/// an entry for it (populated only from `mir.functions`), which the
+	/// inlining pass's Kahn-queue loop assumes always exists.
+	fn is_intrinsic(&self, id: ast::DefId) -> bool {
+		let func_index = self.tir.expect_function_index(id);
+		self.tir.functions[func_index as usize]
+			.attributes
+			.contains(&tir::ItemAttribute::Intrinsic)
+	}
+
 	fn lower_function(&mut self, func: &tir::Function) -> Function {
 		let body = func
 			.body
@@ -1802,7 +1819,7 @@ impl<'tir> Builder<'tir> {
 		expr: &tir::Expression,
 		sink: &mut Vec<Expression>,
 	) -> Expression {
-		use crate::ast::{BinaryOp, UnaryOp};
+		use crate::ast::UnaryOp;
 
 		match &expr.kind {
 			tir::ExprKind::Error
@@ -1865,7 +1882,9 @@ impl<'tir> Builder<'tir> {
 						let mono_id = self
 							.mono_registry
 							.get_or_insert(fn_id, concrete_args.clone());
-						self.record_call_edge(mono_id);
+						if !self.is_intrinsic(fn_id) {
+							self.record_call_edge(mono_id);
+						}
 						let fi = self.tir.expect_function_index(fn_id) as usize;
 						let sig_idx = self.tir.functions[fi].signature_index;
 						let saved = std::mem::replace(
@@ -1881,7 +1900,9 @@ impl<'tir> Builder<'tir> {
 						}
 					}
 					_ => {
-						self.record_call_edge(*id);
+						if !self.is_intrinsic(*id) {
+							self.record_call_edge(*id);
+						}
 						Expression {
 							kind: ExprKind::Function { id: *id },
 							ty: self.lower_type_index(expr.ty),
@@ -2141,6 +2162,7 @@ impl<'tir> Builder<'tir> {
 							sink,
 						);
 					}
+					self.record_call_edge(id);
 				};
 				let arguments = arguments
 					.iter()
@@ -2504,20 +2526,9 @@ impl<'tir> Builder<'tir> {
 				left,
 				right,
 			} => {
-				use BinaryOp::*;
+				use tir::BinaryOp::*;
 
 				let kind = match operator.inner {
-					Assign => {
-						self.lower_assignment(func_ctx, left, right, sink)
-					}
-					AddAssign | SubAssign | MulAssign | DivAssign
-					| RemAssign => self.lower_compound_assignment(
-						func_ctx,
-						operator.inner,
-						left,
-						right,
-						sink,
-					),
 					Add => {
 						let left = Box::new(
 							self.lower_expression(func_ctx, left, sink),
@@ -3044,6 +3055,50 @@ impl<'tir> Builder<'tir> {
 					ty: Type::Unit,
 				}
 			}
+			tir::ExprKind::Assign { left, right } => Expression {
+				kind: self.lower_assignment(func_ctx, left, right, sink),
+				ty: Type::Unit,
+			},
+			tir::ExprKind::CompoundAssign {
+				target,
+				rhs,
+				method_id,
+			} => self
+				.lower_compound_assign(func_ctx, target, rhs, *method_id, sink),
+			tir::ExprKind::GenericCompoundAssign {
+				target,
+				rhs,
+				abstract_method_id,
+				self_type,
+			} => {
+				let method_id = self.resolve_generic_compound_method(
+					*abstract_method_id,
+					*self_type,
+				);
+				self.lower_compound_assign(
+					func_ctx, target, rhs, method_id, sink,
+				)
+			}
+			tir::ExprKind::CompoundStore {
+				target,
+				rhs,
+				method_id,
+			} => self
+				.lower_compound_store(func_ctx, target, rhs, *method_id, sink),
+			tir::ExprKind::GenericCompoundStore {
+				target,
+				rhs,
+				abstract_method_id,
+				self_type,
+			} => {
+				let method_id = self.resolve_generic_compound_method(
+					*abstract_method_id,
+					*self_type,
+				);
+				self.lower_compound_store(
+					func_ctx, target, rhs, method_id, sink,
+				)
+			}
 		}
 	}
 
@@ -3273,6 +3328,102 @@ impl<'tir> Builder<'tir> {
 					value: Box::new(self.lower_expression(
 						func_ctx,
 						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_trunc" | "f64_trunc" => Expression {
+				kind: ExprKind::Trunc {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_neg" | "i64_neg" | "f32_neg" | "f64_neg" => Expression {
+				kind: ExprKind::Neg {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_add" | "i64_add" | "f32_add" | "f64_add" => Expression {
+				kind: ExprKind::Add {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_sub" | "i64_sub" | "f32_sub" | "f64_sub" => Expression {
+				kind: ExprKind::Sub {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_mul" | "i64_mul" | "f32_mul" | "f64_mul" => Expression {
+				kind: ExprKind::Mul {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_div" | "u32_div" | "i64_div" | "u64_div" | "f32_div"
+			| "f64_div" => Expression {
+				kind: ExprKind::Div {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_rem" | "u32_rem" | "i64_rem" | "u64_rem" => Expression {
+				kind: ExprKind::Rem {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
 						sink,
 					)),
 				},
@@ -3642,18 +3793,40 @@ impl<'tir> Builder<'tir> {
 		right: &tir::Expression,
 		sink: &mut Vec<Expression>,
 	) -> ExprKind {
-		match &left.kind {
+		if let tir::ExprKind::Placeholder = &left.kind {
+			// `_ = expr`: evaluate rhs for side effects, discard the value.
+			return ExprKind::Drop {
+				value: Box::new(self.lower_expression(func_ctx, right, sink)),
+			};
+		}
+		let value = self.lower_expression(func_ctx, right, sink);
+		self.lower_assign_target(left, value)
+	}
+
+	/// Builds the `LocalSet`/`GlobalSet`/`AggregateSet` that writes `value`
+	/// to `target` (a `Local`/`Global`/`FieldAccess`). Shared by plain
+	/// assignment (`lower_assignment`, `value` = the lowered rhs) and
+	/// compound assignment (`lower_compound_assign`, `value` = the resolved
+	/// operator method's `Call`) — `target`'s own indices/field-offset are
+	/// pure metadata lookups, never requiring further lowering, so both
+	/// callers can share this exactly.
+	fn lower_assign_target(
+		&mut self,
+		target: &tir::Expression,
+		value: Expression,
+	) -> ExprKind {
+		match &target.kind {
 			tir::ExprKind::Local {
 				scope_index,
 				local_index,
 			} => ExprKind::LocalSet {
 				scope_index: *scope_index,
 				local_index: *local_index,
-				value: Box::new(self.lower_expression(func_ctx, right, sink)),
+				value: Box::new(value),
 			},
 			tir::ExprKind::Global { id } => ExprKind::GlobalSet {
 				id: *id,
-				value: Box::new(self.lower_expression(func_ctx, right, sink)),
+				value: Box::new(value),
 			},
 			tir::ExprKind::FieldAccess {
 				object,
@@ -3685,131 +3858,184 @@ impl<'tir> Builder<'tir> {
 					scope_index: *scope_index,
 					local_index: *local_index,
 					value_index: phys_index as u32,
-					value: Box::new(
-						self.lower_expression(func_ctx, right, sink),
-					),
+					value: Box::new(value),
 				}
 			}
-			tir::ExprKind::Placeholder => {
-				// `_ = expr`: evaluate rhs for side effects, discard the value.
-				ExprKind::Drop {
-					value: Box::new(
-						self.lower_expression(func_ctx, right, sink),
-					),
-				}
-			}
-			_ => unreachable!(),
+			_ => unreachable!(
+				"assignment target must be Local/Global/FieldAccess"
+			),
 		}
 	}
 
-	fn lower_compound_assignment(
+	/// Builds the `Call` to `method_id` a compound-assignment operator
+	/// resolves to — `current_value`/`rhs` are its two arguments (mirrors
+	/// `MethodCall`'s lowering), and the call's own MIR type is
+	/// `current_value`'s type, since every operator trait method returns
+	/// `Self`. Records the call-graph edge so the inlining pass considers
+	/// this call a candidate exactly like an ordinary `MethodCall` would —
+	/// primitive impls (`impl Add for i32`, `#[inline]`) only collapse back
+	/// to a native op if this edge exists.
+	fn build_compound_operator_call(
+		&mut self,
+		method_id: ast::DefId,
+		current_value: Expression,
+		rhs: Expression,
+	) -> Expression {
+		self.record_call_edge(method_id);
+		let ty = current_value.ty;
+		let tir_idx = self.tir.expect_function_index(method_id);
+		let callee_sig_idx = self.intern_tir_function_type(
+			self.tir.functions[tir_idx as usize].signature_index,
+		);
+		Expression {
+			kind: ExprKind::Call {
+				callee: Box::new(Expression {
+					kind: ExprKind::Function { id: method_id },
+					ty: Type::Function {
+						signature_index: callee_sig_idx,
+					},
+				}),
+				arguments: Box::new([current_value, rhs]),
+			},
+			ty,
+		}
+	}
+
+	/// Resolves `GenericCompoundAssign`/`GenericCompoundStore`'s abstract
+	/// trait method to a concrete one now that `self_type` is guaranteed
+	/// concrete (the surrounding function has already been monomorphized
+	/// for this instantiation) — exactly `GenericMethodCall`'s
+	/// abstract-method branch, just factored out since compound assignment
+	/// has two `Place`/non-`Place` shapes that both need it.
+	fn resolve_generic_compound_method(
+		&mut self,
+		abstract_method_id: ast::DefId,
+		self_type: tir::TypeIndex,
+	) -> ast::DefId {
+		let concrete_self = self.resolve_tir_type(self_type);
+		let tir_idx = self.tir.expect_function_index(abstract_method_id);
+		let tir_func = &self.tir.functions[tir_idx as usize];
+		let method_name = tir_func.name.inner;
+		let trait_index = match tir_func.parent {
+			Some(tir::ItemParent::Trait(idx)) => idx,
+			_ => unreachable!(
+				"abstract trait method must be parented by its trait"
+			),
+		};
+		let (trait_impl_idx, impl_type_args) = self
+			.tir
+			.find_trait_impl(concrete_self, trait_index)
+			.expect("no impl found for abstract trait method");
+		let impl_func_idx = self.tir.trait_impls[trait_impl_idx as usize]
+			.members
+			.get(&method_name)
+			.map(|entry| match entry {
+				tir::ImplEntry::Method(idx) => *idx,
+				_ => unreachable!(),
+			})
+			.expect("no impl found for abstract trait method");
+		let impl_func_id = self.tir.functions[impl_func_idx as usize].id;
+		if impl_type_args.is_empty() {
+			impl_func_id
+		} else {
+			self.mono_registry
+				.get_or_insert(impl_func_id, impl_type_args)
+		}
+	}
+
+	/// `CompoundAssign`/`GenericCompoundAssign` (target is `Local`/`Global`/
+	/// `FieldAccess`): read the current value, call the resolved operator
+	/// method, write the result back — `target`'s indices are safe to
+	/// reference twice (`Copy` metadata, not a computation), so no
+	/// once-only-lowering concern here, unlike `lower_compound_store`.
+	fn lower_compound_assign(
 		&mut self,
 		func_ctx: &mut FunctionContext,
-		op: crate::ast::BinaryOp,
-		left: &tir::Expression,
-		right: &tir::Expression,
+		target: &tir::Expression,
+		rhs: &tir::Expression,
+		method_id: ast::DefId,
 		sink: &mut Vec<Expression>,
-	) -> ExprKind {
-		use crate::ast::BinaryOp::*;
+	) -> Expression {
+		let current_value = self.lower_expression(func_ctx, target, sink);
+		let lowered_rhs = self.lower_expression(func_ctx, rhs, sink);
+		let call = self.build_compound_operator_call(
+			method_id,
+			current_value,
+			lowered_rhs,
+		);
+		Expression {
+			kind: self.lower_assign_target(target, call),
+			ty: Type::Unit,
+		}
+	}
 
-		// Desugar x += y to x = x + y
-		let binary_op = match op {
-			AddAssign => Add,
-			SubAssign => Sub,
-			MulAssign => Mul,
-			DivAssign => Div,
-			RemAssign => Rem,
-			_ => unreachable!(),
+	/// `CompoundStore`/`GenericCompoundStore` (target is a `Place`): the
+	/// careful one. Computes `target`'s address exactly once and sinks it
+	/// into a temp local, reused via `LocalGet` for both the old-value read
+	/// and the final store — fixes the pre-existing double-evaluation bug
+	/// where e.g. `arr[i()] += 1` called `i()` twice (once per
+	/// `lower_place_address` call). Mirrors the temp-local idiom already
+	/// used elsewhere in this file (e.g. `lower_intrinsic`'s `slice_len`/
+	/// `slice_ptr` arms).
+	fn lower_compound_store(
+		&mut self,
+		func_ctx: &mut FunctionContext,
+		target: &tir::Place,
+		rhs: &tir::Expression,
+		method_id: ast::DefId,
+		sink: &mut Vec<Expression>,
+	) -> Expression {
+		let (ptr, offset, memory) =
+			self.lower_place_address(func_ctx, target, sink);
+		let ptr_ty = ptr.ty;
+		let temp_idx = func_ctx.frame[0].locals.len() as u32;
+		func_ctx.frame[0].locals.push(Local {
+			ty: ptr_ty,
+			mutability: Mutability::Immutable,
+		});
+		sink.push(Expression {
+			kind: ExprKind::LocalSet {
+				scope_index: 0,
+				local_index: temp_idx,
+				value: Box::new(ptr),
+			},
+			ty: Type::Unit,
+		});
+
+		let current_value = Expression {
+			kind: ExprKind::PointerLoad {
+				pointer: Box::new(Expression {
+					kind: ExprKind::LocalGet {
+						scope_index: 0,
+						local_index: temp_idx,
+					},
+					ty: ptr_ty,
+				}),
+				offset,
+				memory,
+			},
+			ty: self.lower_type_index(target.ty),
 		};
-
-		// Create the binary operation: x + y
-		let binary_expr_kind = match binary_op {
-			Add => ExprKind::Add {
-				left: Box::new(self.lower_expression(func_ctx, left, sink)),
-				right: Box::new(self.lower_expression(func_ctx, right, sink)),
+		let lowered_rhs = self.lower_expression(func_ctx, rhs, sink);
+		let call = self.build_compound_operator_call(
+			method_id,
+			current_value,
+			lowered_rhs,
+		);
+		Expression {
+			kind: ExprKind::PointerStore {
+				pointer: Box::new(Expression {
+					kind: ExprKind::LocalGet {
+						scope_index: 0,
+						local_index: temp_idx,
+					},
+					ty: ptr_ty,
+				}),
+				value: Box::new(call),
+				offset,
+				memory,
 			},
-			Sub => ExprKind::Sub {
-				left: Box::new(self.lower_expression(func_ctx, left, sink)),
-				right: Box::new(self.lower_expression(func_ctx, right, sink)),
-			},
-			Mul => ExprKind::Mul {
-				left: Box::new(self.lower_expression(func_ctx, left, sink)),
-				right: Box::new(self.lower_expression(func_ctx, right, sink)),
-			},
-			Div => ExprKind::Div {
-				left: Box::new(self.lower_expression(func_ctx, left, sink)),
-				right: Box::new(self.lower_expression(func_ctx, right, sink)),
-			},
-			Rem => ExprKind::Rem {
-				left: Box::new(self.lower_expression(func_ctx, left, sink)),
-				right: Box::new(self.lower_expression(func_ctx, right, sink)),
-			},
-			_ => unreachable!(),
-		};
-
-		let binary_expr = Expression {
-			kind: binary_expr_kind,
-			ty: self.lower_type_index(left.ty),
-		};
-
-		// Now assign the result back to left: x = (x + y)
-		match &left.kind {
-			tir::ExprKind::Local {
-				scope_index,
-				local_index,
-			} => ExprKind::LocalSet {
-				scope_index: *scope_index,
-				local_index: *local_index,
-				value: Box::new(binary_expr),
-			},
-			tir::ExprKind::Global { id } => ExprKind::GlobalSet {
-				id: *id,
-				value: Box::new(binary_expr),
-			},
-			tir::ExprKind::Load { place } => {
-				let (ptr, offset, memory) =
-					self.lower_place_address(func_ctx, place, sink);
-				ExprKind::PointerStore {
-					pointer: Box::new(ptr),
-					value: Box::new(binary_expr),
-					offset,
-					memory,
-				}
-			}
-			tir::ExprKind::FieldAccess {
-				object,
-				field: member,
-			} => {
-				let (struct_index, args) =
-					match &self.tir.types[object.ty.as_usize()] {
-						tir::Type::Struct { struct_index, args } => {
-							(*struct_index, args.clone())
-						}
-						_ => unreachable!("ObjectAccess on non-struct type"),
-					};
-				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, &args);
-				let decl_index = self.tir.structs[struct_index as usize].lookup
-					[&member.inner];
-				let phys_index = self.aggregates[aggregate_index as usize]
-					.decl_to_phys[decl_index] as usize;
-				let tir::ExprKind::Local {
-					scope_index,
-					local_index,
-				} = &object.kind
-				else {
-					unreachable!(
-						"ObjectAccess compound assignment: object must be Local after place/value split"
-					)
-				};
-				ExprKind::AggregateSet {
-					scope_index: *scope_index,
-					local_index: *local_index,
-					value_index: phys_index as u32,
-					value: Box::new(binary_expr),
-				}
-			}
-			_ => unreachable!(),
+			ty: Type::Unit,
 		}
 	}
 }

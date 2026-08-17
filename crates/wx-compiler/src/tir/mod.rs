@@ -545,6 +545,96 @@ pub enum PlaceKind {
 	},
 }
 
+/// `ast::BinaryOp` minus its six assignment variants (`Assign` and the five
+/// `*Assign` compound forms). By the time an expression reaches
+/// `ExprKind::Binary`, assignment has already been routed to its own nodes
+/// (`Assign`, `Store`, `CompoundAssign`, `GenericCompoundAssign`,
+/// `CompoundStore`, `GenericCompoundStore`) — giving `Binary` its own operator
+/// type makes that split enforced by the compiler (an exhaustive match can
+/// never again accidentally construct `Binary` with an assignment operator)
+/// rather than merely a convention.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum BinaryOp {
+	Add,
+	Sub,
+	Mul,
+	Div,
+	Rem,
+	Eq,
+	NotEq,
+	Less,
+	LessEq,
+	Greater,
+	GreaterEq,
+	And,
+	Or,
+	BitAnd,
+	BitOr,
+	BitXor,
+	LeftShift,
+	RightShift,
+}
+
+impl From<ast::BinaryOp> for BinaryOp {
+	fn from(op: ast::BinaryOp) -> Self {
+		match op {
+			ast::BinaryOp::Add => BinaryOp::Add,
+			ast::BinaryOp::Sub => BinaryOp::Sub,
+			ast::BinaryOp::Mul => BinaryOp::Mul,
+			ast::BinaryOp::Div => BinaryOp::Div,
+			ast::BinaryOp::Rem => BinaryOp::Rem,
+			ast::BinaryOp::Eq => BinaryOp::Eq,
+			ast::BinaryOp::NotEq => BinaryOp::NotEq,
+			ast::BinaryOp::Less => BinaryOp::Less,
+			ast::BinaryOp::LessEq => BinaryOp::LessEq,
+			ast::BinaryOp::Greater => BinaryOp::Greater,
+			ast::BinaryOp::GreaterEq => BinaryOp::GreaterEq,
+			ast::BinaryOp::And => BinaryOp::And,
+			ast::BinaryOp::Or => BinaryOp::Or,
+			ast::BinaryOp::BitAnd => BinaryOp::BitAnd,
+			ast::BinaryOp::BitOr => BinaryOp::BitOr,
+			ast::BinaryOp::BitXor => BinaryOp::BitXor,
+			ast::BinaryOp::LeftShift => BinaryOp::LeftShift,
+			ast::BinaryOp::RightShift => BinaryOp::RightShift,
+			ast::BinaryOp::Assign
+			| ast::BinaryOp::AddAssign
+			| ast::BinaryOp::SubAssign
+			| ast::BinaryOp::MulAssign
+			| ast::BinaryOp::DivAssign
+			| ast::BinaryOp::RemAssign => unreachable!(
+				"assignment operators never reach tir::ExprKind::Binary — \
+				 they are represented by dedicated Assign/CompoundAssign-family nodes"
+			),
+		}
+	}
+}
+
+impl BinaryOp {
+	pub fn is_arithmetic(&self) -> bool {
+		matches!(
+			self,
+			BinaryOp::Add
+				| BinaryOp::Sub
+				| BinaryOp::Mul
+				| BinaryOp::Div
+				| BinaryOp::Rem
+		)
+	}
+
+	pub fn is_bitwise(&self) -> bool {
+		matches!(
+			self,
+			BinaryOp::BitAnd
+				| BinaryOp::BitOr
+				| BinaryOp::BitXor
+				| BinaryOp::LeftShift
+				| BinaryOp::RightShift
+		)
+	}
+}
+
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum ExprKind {
@@ -591,7 +681,7 @@ pub enum ExprKind {
 		operand: Box<Expression>,
 	},
 	Binary {
-		operator: ast::Spanned<ast::BinaryOp>,
+		operator: ast::Spanned<BinaryOp>,
 		left: Box<Expression>,
 		right: Box<Expression>,
 	},
@@ -699,6 +789,67 @@ pub enum ExprKind {
 	Store {
 		target: Box<Place>,
 		value: Box<Expression>,
+	},
+	/// `x = y` for a `Local`/`Global`/`FieldAccess`/`Placeholder` target —
+	/// the non-`Place` counterpart of `Store`. Kept as its own node (rather
+	/// than reusing `Binary`) so `Binary`'s operator can be the assignment-
+	/// free `tir::BinaryOp` — see that type's doc comment.
+	Assign {
+		left: Box<Expression>,
+		right: Box<Expression>,
+	},
+	/// `x += y` and friends where `x`'s type is already concrete and a real
+	/// `Add`-style impl was found — sugar over `x = x.add(y)`, but its own
+	/// node (rather than desugared into a `MethodCall` at TIR-build time,
+	/// the way plain `+` is) because `target` would otherwise have to be
+	/// built twice — once to read the current value, once as the
+	/// assignment target — which isn't safe in general since `Expression`
+	/// isn't `Clone` and a `target` may itself embed side-effecting
+	/// sub-expressions. `target` is `Local`/`Global`/`FieldAccess` only —
+	/// `Load{place}` targets use `CompoundStore` instead, since a `Place`
+	/// needs its own once-only-lowering treatment distinct from an
+	/// `Expression`'s. `method_id` is the resolved `Add`-style impl method.
+	CompoundAssign {
+		target: Box<Expression>,
+		rhs: Box<Expression>,
+		method_id: ast::DefId,
+	},
+	/// The `CompoundAssign` counterpart for when `target`'s type isn't
+	/// concrete yet at TIR-build time (a bare `TypeParam` or a
+	/// typeset-bounded `AssocTypeProjection`) — `abstract_method_id` is the
+	/// trait's own abstract method declaration (no body) and `self_type` is
+	/// `target`'s (still abstract) type, mirroring `GenericMethodCall`'s
+	/// `type_args[0] = Self` convention (stored bare rather than as a
+	/// single-element `type_args` slice since none of the operator traits'
+	/// methods carry any generics of their own beyond the implicit `Self`).
+	/// Resolved for real once monomorphization substitutes a concrete
+	/// `Self`, via the exact same `find_trait_impl` fallback
+	/// `GenericMethodCall` already uses for abstract trait methods at
+	/// MIR-lowering time — no new resolution machinery.
+	GenericCompoundAssign {
+		target: Box<Expression>,
+		rhs: Box<Expression>,
+		abstract_method_id: ast::DefId,
+		self_type: TypeIndex,
+	},
+	/// The `Load{place}`-targeted analogue of `CompoundAssign`, named to
+	/// mirror `Store`. Needed as a distinct node (rather than reusing
+	/// `CompoundAssign` with `target: Load{place}`) because a `Place`'s
+	/// address must be computed exactly once and reused for both the old-
+	/// value read and the store — MIR lowers `target` directly as a
+	/// `Place`, not as an `Expression` wrapping one.
+	CompoundStore {
+		target: Box<Place>,
+		rhs: Box<Expression>,
+		method_id: ast::DefId,
+	},
+	/// The `Load{place}`-targeted analogue of `GenericCompoundAssign` — see
+	/// both `CompoundStore` and `GenericCompoundAssign`'s doc comments.
+	GenericCompoundStore {
+		target: Box<Place>,
+		rhs: Box<Expression>,
+		abstract_method_id: ast::DefId,
+		self_type: TypeIndex,
 	},
 }
 

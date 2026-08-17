@@ -202,6 +202,7 @@ fn mark_node_inputs_live(
 		| DataNodeKind::Abs { operand, .. }
 		| DataNodeKind::Floor { operand, .. }
 		| DataNodeKind::Ceil { operand, .. }
+		| DataNodeKind::Trunc { operand, .. }
 		| DataNodeKind::BitNot { operand, .. }
 		| DataNodeKind::Eqz { operand }
 		| DataNodeKind::I64ExtendI32S { operand }

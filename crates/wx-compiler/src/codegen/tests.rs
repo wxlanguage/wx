@@ -3615,3 +3615,189 @@ fn test_pure_value_shared_via_reassignment_across_if_else_branches() {
 	// else: m=10, side_dist=11, step=1 -> 1101
 	assert_eq!(f.call(&mut store, (0, 5)).unwrap(), 1101);
 }
+
+// ── struct operator-trait impls
+// ──────────────────────────────────────────
+//
+// Every operator-overload execution test above (`test_arithmetic_operations`,
+// `test_compound_assignment_operators`, ...) exercises a primitive, whose
+// `impl Add`/etc. in `std/main.wx` is what every one of them silently relies
+// on. None of them actually implement an operator trait for a *user*
+// struct — the entire motivating use case (`Vec2 + Vec2`) had never been
+// run end to end through TIR, MIR, codegen, and a real wasmtime execution
+// before this section. Struct fields stay `i32` so the multi-value ABI
+// (`test_struct_returned_from_call`'s "flatten to params/results" pattern)
+// is exercised the same way it already is for non-operator struct tests.
+
+#[test]
+fn test_struct_operator_overload_add_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+            local a = Vec2::{ x: ax, y: ay };
+            local b = Vec2::{ x: bx, y: by };
+            local c = a + b;
+            c.x + c.y
+        }
+
+        export { run }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let run = instance
+		.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run")
+		.unwrap();
+
+	// (3+10) + (4+20) = 37
+	assert_eq!(run.call(&mut store, (3, 4, 10, 20)).unwrap(), 37);
+	// (-5+2) + (7+-9) = -5
+	assert_eq!(run.call(&mut store, (-5, 7, 2, -9)).unwrap(), -5);
+}
+
+#[test]
+fn test_struct_operator_overload_arithmetic_ops_wasmtime() {
+	// `#[inline]`, matching every primitive impl's own convention — verifies
+	// operator-overload methods on a struct participate correctly in the
+	// inlining pass too, not just the un-inlined `Call` path above.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            #[inline]
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        impl Sub for Vec2 {
+            #[inline]
+            fn sub(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x - rhs.x, y: self.y - rhs.y }
+            }
+        }
+
+        impl Mul for Vec2 {
+            #[inline]
+            fn mul(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x * rhs.x, y: self.y * rhs.y }
+            }
+        }
+
+        fn run_add(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+            local c = Vec2::{ x: ax, y: ay } + Vec2::{ x: bx, y: by };
+            c.x + c.y
+        }
+
+        fn run_sub(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+            local c = Vec2::{ x: ax, y: ay } - Vec2::{ x: bx, y: by };
+            c.x + c.y
+        }
+
+        fn run_mul(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+            local c = Vec2::{ x: ax, y: ay } * Vec2::{ x: bx, y: by };
+            c.x + c.y
+        }
+
+        export { run_add, run_sub, run_mul }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let run_add = instance
+		.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_add")
+		.unwrap();
+	// (3+10) + (4+20) = 37
+	assert_eq!(run_add.call(&mut store, (3, 4, 10, 20)).unwrap(), 37);
+
+	let run_sub = instance
+		.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_sub")
+		.unwrap();
+	// (10-3) + (20-4) = 23
+	assert_eq!(run_sub.call(&mut store, (10, 20, 3, 4)).unwrap(), 23);
+
+	let run_mul = instance
+		.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_mul")
+		.unwrap();
+	// (3*2) + (4*5) = 26
+	assert_eq!(run_mul.call(&mut store, (3, 4, 2, 5)).unwrap(), 26);
+}
+
+#[test]
+fn test_struct_operator_overload_neg_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Neg for Vec2 {
+            fn neg(self: Self) -> Self {
+                Vec2::{ x: -self.x, y: -self.y }
+            }
+        }
+
+        fn run(ax: i32, ay: i32) -> i32 {
+            local a = Vec2::{ x: ax, y: ay };
+            local b = -a;
+            b.x + b.y
+        }
+
+        export { run }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let run = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+		.unwrap();
+
+	assert_eq!(run.call(&mut store, (3, -4)).unwrap(), 1); // -3 + 4
+	assert_eq!(run.call(&mut store, (0, 5)).unwrap(), -5); // 0 + -5
+}
+
+#[test]
+fn test_struct_operator_overload_compound_assignment_wasmtime() {
+	// `+=` on a struct, going through the newly rebuilt `CompoundAssign`
+	// lowering (see the compound-assignment devlogs) rather than the plain
+	// `Add` dispatch the other tests above exercise.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+            local mut a = Vec2::{ x: ax, y: ay };
+            a += Vec2::{ x: bx, y: by };
+            a.x + a.y
+        }
+
+        export { run }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let run = instance
+		.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run")
+		.unwrap();
+
+	// (3+10) + (4+20) = 37
+	assert_eq!(run.call(&mut store, (3, 4, 10, 20)).unwrap(), 37);
+}

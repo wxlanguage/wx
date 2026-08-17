@@ -79,6 +79,7 @@ impl Rebaser {
 			| ExprKind::Abs { value }
 			| ExprKind::Floor { value }
 			| ExprKind::Ceil { value }
+			| ExprKind::Trunc { value }
 			| ExprKind::BitNot { value }
 			| ExprKind::Eqz { value }
 			| ExprKind::I64ExtendI32S { value }
@@ -287,6 +288,7 @@ fn inline_expr(
 		| ExprKind::Abs { value }
 		| ExprKind::Floor { value }
 		| ExprKind::Ceil { value }
+		| ExprKind::Trunc { value }
 		| ExprKind::BitNot { value }
 		| ExprKind::Eqz { value }
 		| ExprKind::I64ExtendI32S { value }
