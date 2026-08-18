@@ -90,9 +90,11 @@ pub enum Token {
 	LeftArrow,
 	LeftArrowEq,
 	DoubleLeftArrow,
+	DoubleLeftArrowEq,
 	RightArrow,
 	RightArrowEq,
 	DoubleRightArrow,
+	DoubleRightArrowEq,
 	Plus,
 	PlusEq,
 	Minus,
@@ -105,9 +107,12 @@ pub enum Token {
 	PercentEq,
 	Amper,
 	DoubleAmper,
+	AmperEq,
 	Vbar,
 	DoubleVbar,
+	VbarEq,
 	Caret,
+	CaretEq,
 	Hash,
 	MinusRightArrow,
 	// Special
@@ -146,9 +151,11 @@ impl std::fmt::Display for Token {
 			LeftArrow => "<",
 			LeftArrowEq => "<=",
 			DoubleLeftArrow => "<<",
+			DoubleLeftArrowEq => "<<=",
 			RightArrow => ">",
 			RightArrowEq => ">=",
 			DoubleRightArrow => ">>",
+			DoubleRightArrowEq => ">>=",
 			Plus => "+",
 			PlusEq => "+=",
 			Minus => "-",
@@ -161,9 +168,12 @@ impl std::fmt::Display for Token {
 			PercentEq => "%=",
 			Amper => "&",
 			DoubleAmper => "&&",
+			AmperEq => "&=",
 			Vbar => "|",
 			DoubleVbar => "||",
+			VbarEq => "|=",
 			Caret => "^",
+			CaretEq => "^=",
 			Hash => "#",
 			MinusRightArrow => "->",
 			Comment => "comment",
@@ -547,10 +557,8 @@ impl<'a> Lexer<'a> {
 			'<' => self.consume_open_angle(),
 			'>' => self.consume_close_angle(),
 			'!' => self.consume_and_check('=', Token::BangEq, Token::Bang),
-			'&' => {
-				self.consume_and_check('&', Token::DoubleAmper, Token::Amper)
-			}
-			'|' => self.consume_and_check('|', Token::DoubleVbar, Token::Vbar),
+			'&' => self.consume_amper(),
+			'|' => self.consume_vbar(),
 			'"' => self.consume_string(),
 
 			// Less Frequent
@@ -558,7 +566,7 @@ impl<'a> Lexer<'a> {
 			'%' => {
 				self.consume_and_check('=', Token::PercentEq, Token::Percent)
 			}
-			'^' => Token::Caret,
+			'^' => self.consume_and_check('=', Token::CaretEq, Token::Caret),
 			'\r' => {
 				self.has_crlf = true;
 				self.consume_whitespace()
@@ -591,6 +599,38 @@ impl<'a> Lexer<'a> {
 	}
 
 	#[inline]
+	fn consume_amper(&mut self) -> Token {
+		let mut lookahead = self.chars.clone();
+		match lookahead.next().unwrap_or(EOF) {
+			'&' => {
+				_ = self.chars.next();
+				Token::DoubleAmper
+			}
+			'=' => {
+				_ = self.chars.next();
+				Token::AmperEq
+			}
+			_ => Token::Amper,
+		}
+	}
+
+	#[inline]
+	fn consume_vbar(&mut self) -> Token {
+		let mut lookahead = self.chars.clone();
+		match lookahead.next().unwrap_or(EOF) {
+			'|' => {
+				_ = self.chars.next();
+				Token::DoubleVbar
+			}
+			'=' => {
+				_ = self.chars.next();
+				Token::VbarEq
+			}
+			_ => Token::Vbar,
+		}
+	}
+
+	#[inline]
 	fn consume_dash(&mut self) -> Token {
 		let mut lookahead = self.chars.clone();
 		match lookahead.next().unwrap_or(EOF) {
@@ -616,7 +656,13 @@ impl<'a> Lexer<'a> {
 			}
 			'<' => {
 				_ = self.chars.next();
-				Token::DoubleLeftArrow
+				match lookahead.next().unwrap_or(EOF) {
+					'=' => {
+						_ = self.chars.next();
+						Token::DoubleLeftArrowEq
+					}
+					_ => Token::DoubleLeftArrow,
+				}
 			}
 			_ => Token::LeftArrow,
 		}
@@ -632,7 +678,13 @@ impl<'a> Lexer<'a> {
 			}
 			'>' => {
 				_ = self.chars.next();
-				Token::DoubleRightArrow
+				match lookahead.next().unwrap_or(EOF) {
+					'=' => {
+						_ = self.chars.next();
+						Token::DoubleRightArrowEq
+					}
+					_ => Token::DoubleRightArrow,
+				}
 			}
 			_ => Token::RightArrow,
 		}
@@ -824,6 +876,11 @@ pub enum BinaryOp {
 	MulAssign,
 	DivAssign,
 	RemAssign,
+	BitAndAssign,
+	BitOrAssign,
+	BitXorAssign,
+	LeftShiftAssign,
+	RightShiftAssign,
 	// Bitwise
 	BitAnd,
 	BitOr,
@@ -854,6 +911,11 @@ impl BinaryOp {
 			BinaryOp::MulAssign => "*=",
 			BinaryOp::DivAssign => "/=",
 			BinaryOp::RemAssign => "%=",
+			BinaryOp::BitAndAssign => "&=",
+			BinaryOp::BitOrAssign => "|=",
+			BinaryOp::BitXorAssign => "^=",
+			BinaryOp::LeftShiftAssign => "<<=",
+			BinaryOp::RightShiftAssign => ">>=",
 			BinaryOp::BitAnd => "&",
 			BinaryOp::BitOr => "|",
 			BinaryOp::BitXor => "^",
@@ -897,6 +959,11 @@ impl TryFrom<Token> for BinaryOp {
 			Token::StarEq => Ok(BinaryOp::MulAssign),
 			Token::SlashEq => Ok(BinaryOp::DivAssign),
 			Token::PercentEq => Ok(BinaryOp::RemAssign),
+			Token::AmperEq => Ok(BinaryOp::BitAndAssign),
+			Token::VbarEq => Ok(BinaryOp::BitOrAssign),
+			Token::CaretEq => Ok(BinaryOp::BitXorAssign),
+			Token::DoubleLeftArrowEq => Ok(BinaryOp::LeftShiftAssign),
+			Token::DoubleRightArrowEq => Ok(BinaryOp::RightShiftAssign),
 			// Bitwise
 			Token::Amper => Ok(BinaryOp::BitAnd),
 			Token::Vbar => Ok(BinaryOp::BitOr),
@@ -1817,6 +1884,11 @@ impl From<BinaryOp> for BindingPower {
 			BinaryOp::MulAssign => BindingPower::Assignment,
 			BinaryOp::DivAssign => BindingPower::Assignment,
 			BinaryOp::RemAssign => BindingPower::Assignment,
+			BinaryOp::BitAndAssign => BindingPower::Assignment,
+			BinaryOp::BitOrAssign => BindingPower::Assignment,
+			BinaryOp::BitXorAssign => BindingPower::Assignment,
+			BinaryOp::LeftShiftAssign => BindingPower::Assignment,
+			BinaryOp::RightShiftAssign => BindingPower::Assignment,
 
 			BinaryOp::Or => BindingPower::LogicalOr,
 			BinaryOp::And => BindingPower::LogicalAnd,
@@ -3303,7 +3375,12 @@ impl<'ctx> Parser<'ctx> {
 			| Token::MinusEq
 			| Token::StarEq
 			| Token::SlashEq
-			| Token::PercentEq => Some((
+			| Token::PercentEq
+			| Token::AmperEq
+			| Token::VbarEq
+			| Token::CaretEq
+			| Token::DoubleLeftArrowEq
+			| Token::DoubleRightArrowEq => Some((
 				Parser::parse_binary_expression,
 				BindingPower::Assignment,
 			)),

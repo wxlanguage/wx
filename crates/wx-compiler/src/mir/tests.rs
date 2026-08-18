@@ -1661,3 +1661,24 @@ fn test_struct_compound_assignment_lowers_to_add_call() {
     "});
 	insta::assert_yaml_snapshot!(case.mir);
 }
+
+#[test]
+fn test_struct_compound_assignment_lowers_to_bitand_call() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+            a &= b;
+            a
+        }
+
+        export { and_assign_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}

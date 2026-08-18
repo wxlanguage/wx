@@ -603,7 +603,12 @@ impl From<ast::BinaryOp> for BinaryOp {
 			| ast::BinaryOp::SubAssign
 			| ast::BinaryOp::MulAssign
 			| ast::BinaryOp::DivAssign
-			| ast::BinaryOp::RemAssign => unreachable!(
+			| ast::BinaryOp::RemAssign
+			| ast::BinaryOp::BitAndAssign
+			| ast::BinaryOp::BitOrAssign
+			| ast::BinaryOp::BitXorAssign
+			| ast::BinaryOp::LeftShiftAssign
+			| ast::BinaryOp::RightShiftAssign => unreachable!(
 				"assignment operators never reach tir::ExprKind::Binary — \
 				 they are represented by dedicated Assign/CompoundAssign-family nodes"
 			),

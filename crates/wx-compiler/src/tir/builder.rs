@@ -12961,8 +12961,13 @@ impl<'ast> Builder<'ast, '_> {
 			| ast::BinaryOp::SubAssign
 			| ast::BinaryOp::MulAssign
 			| ast::BinaryOp::DivAssign
-			| ast::BinaryOp::RemAssign => {
-				self.build_arithmetic_assignment_expr(func_ctx, expr)
+			| ast::BinaryOp::RemAssign
+			| ast::BinaryOp::BitAndAssign
+			| ast::BinaryOp::BitOrAssign
+			| ast::BinaryOp::BitXorAssign
+			| ast::BinaryOp::LeftShiftAssign
+			| ast::BinaryOp::RightShiftAssign => {
+				self.build_compound_assignment_expr(func_ctx, expr)
 			}
 			ast::BinaryOp::Eq
 			| ast::BinaryOp::NotEq
@@ -13862,7 +13867,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	fn build_arithmetic_assignment_expr(
+	fn build_compound_assignment_expr(
 		&mut self,
 		ctx: &mut ExprContext,
 		expr: &Spanned<ast::Expression>,
@@ -13888,6 +13893,11 @@ impl<'ast> Builder<'ast, '_> {
 				ast::BinaryOp::MulAssign => ast::BinaryOp::Mul,
 				ast::BinaryOp::DivAssign => ast::BinaryOp::Div,
 				ast::BinaryOp::RemAssign => ast::BinaryOp::Rem,
+				ast::BinaryOp::BitAndAssign => ast::BinaryOp::BitAnd,
+				ast::BinaryOp::BitOrAssign => ast::BinaryOp::BitOr,
+				ast::BinaryOp::BitXorAssign => ast::BinaryOp::BitXor,
+				ast::BinaryOp::LeftShiftAssign => ast::BinaryOp::LeftShift,
+				ast::BinaryOp::RightShiftAssign => ast::BinaryOp::RightShift,
 				_ => unreachable!(),
 			},
 			span: operator.span,

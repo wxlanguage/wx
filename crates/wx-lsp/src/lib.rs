@@ -727,9 +727,7 @@ async fn handle_command(
 							..entry.source.span.end as usize,
 					);
 					if !span_text.is_some_and(|t| {
-						t.starts_with(|c: char| {
-							c.is_alphabetic() || c == '_'
-						})
+						t.starts_with(|c: char| c.is_alphabetic() || c == '_')
 					}) {
 						continue;
 					}

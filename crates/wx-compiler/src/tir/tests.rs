@@ -926,6 +926,31 @@ fn test_coerce_binary_bitwise_i32() {
 	);
 }
 
+#[test]
+fn test_primitive_bitwise_compound_assign_operators() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut x: i32 = 10;
+            x &= 12;
+            x |= 3;
+            x ^= 5;
+            x <<= 1;
+            x >>= 2;
+            x
+        }
+        export { f }
+    "});
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"{:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
 // ── direct coercion to small integer types ───────────────────────────────
 
 #[test]
@@ -11187,6 +11212,18 @@ fn test_generic_type_param_bounded_compound_assign_dispatches() {
 }
 
 #[test]
+fn test_generic_type_param_bitand_bounded_compound_assign_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn and_assign_generic<T: BitAnd>(a: T, b: T) -> T {
+            local mut x: T = a;
+            x &= b;
+            x
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
 fn test_generic_type_param_unbounded_compound_assign_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
         pub fn add_assign_generic<T>(a: T, b: T) -> T {
@@ -11361,6 +11398,25 @@ fn test_struct_compound_assignment_dispatches_to_add_method() {
 
         pub fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
             a += b;
+            a
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_compound_assignment_dispatches_to_bitand_method() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        pub fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+            a &= b;
             a
         }
     "});
