@@ -32,8 +32,7 @@ impl Hasher for DefaultHasher {
     local mut i: Mem::Size = 0;
     loop {
       if i == bytes.len() { break };
-      self.*.value
-        = (self.*.value ^ u64_extend_u32(bytes[i] as u32)) * FNV_PRIME;
+      self.*.value ^= u64_extend_u32(bytes[i] as u32) * FNV_PRIME;
       i += 1;
     };
   }

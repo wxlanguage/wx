@@ -8151,6 +8151,49 @@ fn test_typeset_intersection_range_out_of_bounds_reports_error() {
 	);
 }
 
+// ── operators on typeset-bounded type params ─────────────────────────────
+//
+// A bare `T: Size`-style typeset bound and a typeset-bounded associated
+// type (`Mem::Size`, bounded by `PointerSize`) are both "this will concretize
+// to one of a fixed set of integer primitives" — `resolve_bounded_operator_method`
+// trusts a typeset bound for any operator trait the same way `AssocTypeProjection`
+// already is, so both spellings should support arithmetic/bitwise operators and
+// their compound-assignment forms identically.
+
+#[test]
+fn test_typeset_bounded_type_param_supports_arithmetic_operator() {
+	let case = TestCase::new(indoc! {"
+        fn add<N: Integer>(a: N, b: N) -> N { a + b }
+        fn use_it() -> i32 { add(1 as i32, 2 as i32) }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_typeset_bounded_type_param_supports_bitwise_operator() {
+	let case = TestCase::new(indoc! {"
+        fn and<N: Integer>(a: N, b: N) -> N { a & b }
+        fn use_it() -> i32 { and(6 as i32, 3 as i32) }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_typeset_bounded_type_param_supports_compound_assignment() {
+	let case = TestCase::new(indoc! {"
+        fn add_assign<N: Integer>(a: N, b: N) -> N {
+            local mut x: N = a;
+            x += b;
+            x
+        }
+        fn use_it() -> i32 { add_assign(1 as i32, 2 as i32) }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
 #[test]
 fn test_generic_slice_first_with_pointer_size_index() {
 	// `self[0]` inside `impl<M: Memory, T> M::&[T]` — the literal `0` must be

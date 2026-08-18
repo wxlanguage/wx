@@ -1887,17 +1887,50 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// The operator trait's own declared method for `method_symbol` — every
+	/// operator trait declares exactly one, so this never legitimately
+	/// misses. Shared by every "trust it, don't check the concrete type"
+	/// path: a typeset-bounded type param or associated type (`T: Size`,
+	/// `Mem::Size`) both resolve to this the same way, since neither is a
+	/// concrete `ImplTarget` `resolve_trait_method` could look up.
+	fn operator_trait_method(
+		&self,
+		trait_index: TraitIndex,
+		method_symbol: SymbolU32,
+	) -> FunctionIndex {
+		match self.tir.traits[trait_index as usize]
+			.entries
+			.get(&method_symbol)
+		{
+			Some(ImplEntry::Method(idx)) => *idx,
+			_ => unreachable!("operator trait must declare its own method"),
+		}
+	}
+
 	/// The `Type::TypeParam` counterpart of `resolve_trait_method` — which
 	/// only ever resolves a concrete `ImplTarget`, so it fails outright for
 	/// a type param (`ImplTarget::from_type` doesn't handle `TypeParam`).
 	/// Checks the type param's own declared bounds instead: `None` means
-	/// the operator's trait isn't among them — a genuinely unbounded `T` —
-	/// and the caller should fall through to the ordinary concrete-resolution
-	/// path, which reports the same "operator cannot be applied" diagnostic
-	/// either way. `Some` returns the trait's *abstract* method (no body —
-	/// resolved for real once monomorphization substitutes a concrete
-	/// `Self`, exactly like `GenericMethodCall`'s existing abstract-method
-	/// fallback).
+	/// neither bound applies — a genuinely unbounded `T` — and the caller
+	/// should fall through to the ordinary concrete-resolution path, which
+	/// reports the same "operator cannot be applied" diagnostic either way.
+	///
+	/// Two independent ways a type param can be "bounded enough" for this:
+	/// - A real trait bound matching this operator's own trait (`T: Add`
+	///   for `+`) — could concretize to any type implementing that trait,
+	///   not just a primitive, so resolution stays deferred.
+	/// - A typeset bound (`T: Size`) — every typeset today consists
+	///   entirely of integer primitives (enforced at typeset-declaration
+	///   time, `DiagnosticCode::TypesetMemberNotInteger`), which all carry
+	///   `#[inline]` impls of every operator trait, so it's trusted
+	///   unconditionally for *any* operator trait here, exactly like
+	///   `Type::AssocTypeProjection`'s equivalent trust (see
+	///   `is_typeset_bounded_assoc_type`) — no need to check which trait
+	///   `T` was bounded by.
+	///
+	/// `Some` returns the trait's *abstract* method (no body — resolved for
+	/// real once monomorphization substitutes a concrete `Self`, exactly
+	/// like `GenericMethodCall`'s existing abstract-method fallback).
 	fn resolve_bounded_operator_method(
 		&self,
 		owner: TypeParamOwner,
@@ -1905,23 +1938,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 	) -> Option<FunctionIndex> {
-		let bounded = self
-			.tir
-			.type_param_info(owner, param_index as usize)
-			.bounds
-			.traits
-			.iter()
-			.any(|tb| tb.trait_index == trait_index);
+		let bounds =
+			&self.tir.type_param_info(owner, param_index as usize).bounds;
+		let bounded = bounds.typeset.is_some()
+			|| bounds.traits.iter().any(|tb| tb.trait_index == trait_index);
 		if !bounded {
 			return None;
 		}
-		match self.tir.traits[trait_index as usize]
-			.entries
-			.get(&method_symbol)
-		{
-			Some(ImplEntry::Method(idx)) => Some(*idx),
-			_ => unreachable!("operator trait must declare its own method"),
-		}
+		Some(self.operator_trait_method(trait_index, method_symbol))
 	}
 
 	/// Resolves `operator` for `ty` in `ctx`'s evaluation mode and builds the
@@ -1929,17 +1953,17 @@ impl<'ast> Builder<'ast, '_> {
 	/// - `Comptime` never attempts dispatch at all (see `EvalMode`'s doc
 	///   comment) — builds a plain `Binary` node, exactly as before operator
 	///   overloading existed, still directly foldable by `eval_const_expr`.
-	/// - `Runtime`, dispatch succeeds — records `operator`'s own span as a
-	///   go-to-definition access against the resolved method (the same
-	///   `accesses`-list mechanism ordinary method calls use) and builds a
-	///   `MethodCall`.
+	/// - `Runtime`, `ty` isn't concrete yet (`Type::TypeParam` or
+	///   `Type::AssocTypeProjection`) but is trusted anyway — a real trait
+	///   bound, or a typeset bound on either shape (see
+	///   `resolve_bounded_operator_method`/`is_typeset_bounded_assoc_type`)
+	///   — builds a `GenericMethodCall`, deferred to real resolution once
+	///   monomorphization substitutes a concrete `Self`.
+	/// - `Runtime`, dispatch succeeds against a concrete type — records
+	///   `operator`'s own span as a go-to-definition access against the
+	///   resolved method (the same `accesses`-list mechanism ordinary
+	///   method calls use) and builds a `MethodCall`.
 	/// - `Runtime`, dispatch fails — reports "operator cannot be applied".
-	///   Only call this once the caller has already ruled out the one
-	///   legitimate non-error failure case, a typeset-bounded associated
-	///   type (see `resolve_trait_method`'s doc comment) — every current
-	///   caller either gates `ty` to primitives beforehand (arms 2/3 of
-	///   `build_arithmetic_expr`) or checks
-	///   `is_typeset_bounded_assoc_type` itself first (the equal-types arm).
 	fn build_operator_dispatch(
 		&mut self,
 		ctx: &ExprContext,
@@ -1965,42 +1989,40 @@ impl<'ast> Builder<'ast, '_> {
 			};
 		};
 
-		// A bare `Type::TypeParam` isn't concrete, so `resolve_trait_method`
-		// below can never resolve it (`find_trait_impl` fails outright for one
-		// — see `ImplTarget::from_type`). Unlike a typeset-bounded
-		// `AssocTypeProjection`, whose members are always primitives (the
-		// native op works directly, used as-is via `build_arithmetic_result`'s
-		// plain-`Binary` path), a `T: Add`-bounded type param could concretize
-		// to any type implementing `Add`, not just a primitive — so this needs
-		// real deferred dispatch, exactly like `left.add(right)` would produce
-		// for a written generic method call, resolved at MIR-lowering time
-		// once monomorphization substitutes a concrete `Self`. An unbounded
-		// `T` falls through to the same failure path below as a concrete type
-		// with no matching impl, since `resolve_bounded_operator_method`
-		// deliberately returns `None` for both.
-		if let Type::TypeParam { owner, param_index } =
-			self.tir.types[ty.as_usize()]
-			&& let Some((trait_index, method_symbol)) =
-				traits.for_op(binary_op.inner)
-			&& let Some(func_idx) = self.resolve_bounded_operator_method(
-				owner,
-				param_index,
-				trait_index,
-				method_symbol,
-			) {
-			self.tir.functions[func_idx as usize].accesses.push(
-				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
-			);
-			let abstract_method_id = self.tir.functions[func_idx as usize].id;
-			return Expression {
-				kind: ExprKind::GenericMethodCall {
-					id: abstract_method_id,
-					type_args: Box::new([ty]),
-					arguments: Box::new([left, right]),
-				},
-				ty,
-				span,
+		if let Some((trait_index, method_symbol)) =
+			traits.for_op(binary_op.inner)
+		{
+			let deferred = match self.tir.types[ty.as_usize()] {
+				Type::TypeParam { owner, param_index } => self
+					.resolve_bounded_operator_method(
+						owner,
+						param_index,
+						trait_index,
+						method_symbol,
+					),
+				Type::AssocTypeProjection { .. }
+					if self.is_typeset_bounded_assoc_type(ty) =>
+				{
+					Some(self.operator_trait_method(trait_index, method_symbol))
+				}
+				_ => None,
 			};
+			if let Some(func_idx) = deferred {
+				self.tir.functions[func_idx as usize].accesses.push(
+					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+				);
+				let abstract_method_id =
+					self.tir.functions[func_idx as usize].id;
+				return Expression {
+					kind: ExprKind::GenericMethodCall {
+						id: abstract_method_id,
+						type_args: Box::new([ty]),
+						arguments: Box::new([left, right]),
+					},
+					ty,
+					span,
+				};
+			}
 		}
 
 		let method = traits.for_op(binary_op.inner).and_then(
@@ -2047,52 +2069,17 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Shared by every arm of `build_arithmetic_expr` once `ty` is a fully
-	/// concrete type both operands agree on (coerced or already equal).
-	/// Typeset-bounded associated types (`M::Size`) are the one type shape
-	/// `find_trait_impl` can never resolve — a structural non-error, not a
-	/// missing impl — so they stay on the plain `Binary` path; every other
-	/// type goes through real dispatch via `build_operator_dispatch`, which
-	/// already reports "operator cannot be applied" on its own if nothing
-	/// implements it.
-	fn build_arithmetic_result(
-		&mut self,
-		ctx: &ExprContext,
-		operator: Spanned<ast::BinaryOp>,
-		left: Expression,
-		right: Expression,
-		ty: TypeIndex,
-		span: ast::TextSpan,
-	) -> Expression {
-		if self.is_typeset_bounded_assoc_type(ty) {
-			Expression {
-				kind: ExprKind::Binary {
-					operator: Spanned {
-						inner: BinaryOp::from(operator.inner),
-						span: operator.span,
-					},
-					left: Box::new(left),
-					right: Box::new(right),
-				},
-				ty,
-				span,
-			}
-		} else {
-			self.build_operator_dispatch(ctx, operator, left, right, ty, span)
-		}
-	}
-
 	/// Shared by `build_bitwise_binary_expr`'s same-type arm once `ty` is a
-	/// fully concrete type both operands agree on. Unlike
-	/// `build_arithmetic_result`, integers/`bool`/typeset-bounded associated
-	/// types stay on the plain `Binary` path unconditionally — that's the
+	/// fully concrete type both operands agree on. Concrete integers/`bool`
+	/// stay on the plain `Binary` path unconditionally — that's the
 	/// pre-existing native codegen for bitwise ops on primitives, and it's
 	/// deliberately left untouched (no snapshot churn, no new intrinsics
-	/// needed for the concrete-primitive case). Only a type outside that set
-	/// (a struct, or a bare `Type::TypeParam` bounded by one of the bitwise
-	/// traits) goes through real dispatch via `build_operator_dispatch`,
-	/// which already reports "operator cannot be applied" on its own if
-	/// nothing implements it.
+	/// needed for the concrete-primitive case). Everything else (a struct,
+	/// a typeset-bounded `Type::TypeParam`/`Type::AssocTypeProjection`, or a
+	/// bare `Type::TypeParam` bounded by one of the bitwise traits) goes
+	/// through real dispatch via `build_operator_dispatch`, which already
+	/// reports "operator cannot be applied" on its own if nothing
+	/// implements it.
 	fn build_bitwise_result(
 		&mut self,
 		ctx: &ExprContext,
@@ -2102,10 +2089,7 @@ impl<'ast> Builder<'ast, '_> {
 		ty: TypeIndex,
 		span: ast::TextSpan,
 	) -> Expression {
-		if ty.is_integer()
-			|| ty == TypeIndex::BOOL
-			|| self.is_typeset_bounded_assoc_type(ty)
-		{
+		if ty.is_integer() || ty == TypeIndex::BOOL {
 			Expression {
 				kind: ExprKind::Binary {
 					operator: Spanned {
@@ -2176,15 +2160,7 @@ impl<'ast> Builder<'ast, '_> {
 		// concrete, non-implementing type.
 		let abstract_func_idx = match self.tir.types[ty.as_usize()] {
 			Type::AssocTypeProjection { .. } => {
-				match self.tir.traits[trait_index as usize]
-					.entries
-					.get(&method_symbol)
-				{
-					Some(ImplEntry::Method(func_idx)) => Some(*func_idx),
-					_ => unreachable!(
-						"operator trait must declare its own method"
-					),
-				}
+				Some(self.operator_trait_method(trait_index, method_symbol))
 			}
 			Type::TypeParam { owner, param_index } => self
 				.resolve_bounded_operator_method(
@@ -2244,8 +2220,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// pass an `operator` `for_unary_op` recognizes (`InvertSign`/
 	/// `BitNot`) — `!x` (`Not`) is bool-only and never reaches here.
 	///
-	/// TODO: revisit whether this and `build_operator_dispatch` (plus
-	/// `build_arithmetic_result`/`build_unary_arithmetic_result`) can share
+	/// TODO: revisit whether this and `build_operator_dispatch` can share
 	/// more than `resolve_trait_method` — the binary/unary duplication here
 	/// is mostly `Box::new([left, right])` vs. `Box::new([operand])` and
 	/// `ExprKind::Binary` vs. `ExprKind::Unary`, which might collapse with a
@@ -2279,23 +2254,28 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		// Same reasoning as `build_operator_dispatch`'s equivalent branch: a
-		// bare `Type::TypeParam` isn't concrete, so `resolve_trait_method`
-		// below can never resolve it — a `T: Neg`-bounded type param could
-		// concretize to any type implementing `Neg`, not just a primitive,
-		// so this needs real deferred dispatch, resolved at MIR-lowering
-		// time once monomorphization substitutes a concrete `Self`. An
-		// unbounded `T` falls through to the same failure path below as a
-		// concrete type with no matching impl, since
-		// `resolve_bounded_operator_method` deliberately returns `None` for
-		// both.
-		if let Type::TypeParam { owner, param_index } =
-			self.tir.types[ty.as_usize()]
-			&& let Some(func_idx) = self.resolve_bounded_operator_method(
-				owner,
-				param_index,
-				trait_index,
-				method_symbol,
-			) {
+		// bare `Type::TypeParam` or `Type::AssocTypeProjection` isn't
+		// concrete, so `resolve_trait_method` below can never resolve it —
+		// deferred dispatch, resolved at MIR-lowering time once
+		// monomorphization substitutes a concrete `Self`. An unbounded `T`
+		// falls through to the same failure path below as a concrete type
+		// with no matching impl.
+		let deferred = match self.tir.types[ty.as_usize()] {
+			Type::TypeParam { owner, param_index } => self
+				.resolve_bounded_operator_method(
+					owner,
+					param_index,
+					trait_index,
+					method_symbol,
+				),
+			Type::AssocTypeProjection { .. }
+				if self.is_typeset_bounded_assoc_type(ty) =>
+			{
+				Some(self.operator_trait_method(trait_index, method_symbol))
+			}
+			_ => None,
+		};
+		if let Some(func_idx) = deferred {
 			self.tir.functions[func_idx as usize].accesses.push(
 				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 			);
@@ -2346,31 +2326,6 @@ impl<'ast> Builder<'ast, '_> {
 					span,
 				}
 			}
-		}
-	}
-
-	/// Unary counterpart of `build_arithmetic_result` — excludes
-	/// typeset-bounded associated types before delegating to
-	/// `build_unary_operator_dispatch`, same reasoning as the binary case.
-	fn build_unary_arithmetic_result(
-		&mut self,
-		ctx: &ExprContext,
-		operator: Spanned<ast::UnaryOp>,
-		operand: Expression,
-		ty: TypeIndex,
-		span: ast::TextSpan,
-	) -> Expression {
-		if self.is_typeset_bounded_assoc_type(ty) {
-			Expression {
-				kind: ExprKind::Unary {
-					operator,
-					operand: Box::new(operand),
-				},
-				ty,
-				span,
-			}
-		} else {
-			self.build_unary_operator_dispatch(ctx, operator, operand, ty, span)
 		}
 	}
 
@@ -13030,20 +12985,18 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			ast::UnaryOp::InvertSign => {
 				let ty = operand.ty;
-				Ok(self.build_unary_arithmetic_result(
+				Ok(self.build_unary_operator_dispatch(
 					ctx, operator, operand, ty, expr.span,
 				))
 			}
 			ast::UnaryOp::BitNot => {
-				if operand.ty.is_primitive()
-					|| self.is_typeset_bounded_assoc_type(operand.ty)
-					|| operand.ty.is_comptime_number()
+				if operand.ty.is_primitive() || operand.ty.is_comptime_number()
 				{
 					// Native fast path — unchanged from before `BitNot`
-					// had an overload trait at all: primitives, typeset-
-					// bounded associated types, and deferred comptime
-					// numbers stay a plain `Unary` node (no snapshot
-					// churn, no new intrinsics needed for this case).
+					// had an overload trait at all: primitives and
+					// deferred comptime numbers stay a plain `Unary`
+					// node (no snapshot churn, no new intrinsics needed
+					// for this case).
 					let ty = operand.ty;
 					Ok(Expression {
 						kind: ExprKind::Unary {
@@ -13054,13 +13007,14 @@ impl<'ast> Builder<'ast, '_> {
 						span: expr.span,
 					})
 				} else {
-					// Anything else (a struct) goes through real `BitNot`
-					// dispatch, which reports "operator cannot be
-					// applied" on its own if nothing implements it —
-					// same shape as `InvertSign`'s always-dispatch arm
-					// above, just gated to the non-primitive case to
-					// match the binary bitwise operators' native-path
-					// split (`build_bitwise_result`).
+					// Anything else (a struct, or a typeset-bounded
+					// `Type::TypeParam`/`Type::AssocTypeProjection`) goes
+					// through real `BitNot` dispatch, which reports
+					// "operator cannot be applied" on its own if nothing
+					// implements it — same shape as `InvertSign`'s
+					// always-dispatch arm above, just gated to the
+					// non-primitive case to match the binary bitwise
+					// operators' native-path split (`build_bitwise_result`).
 					let ty = operand.ty;
 					Ok(self.build_unary_operator_dispatch(
 						ctx, operator, operand, ty, expr.span,
@@ -14377,13 +14331,13 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(l, ty) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, ty)?;
-				Ok(self.build_arithmetic_result(
+				Ok(self.build_operator_dispatch(
 					ctx, operator, left, right, ty, expr.span,
 				))
 			}
 			(ty, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, ty)?;
-				Ok(self.build_arithmetic_result(
+				Ok(self.build_operator_dispatch(
 					ctx, operator, left, right, ty, expr.span,
 				))
 			}
@@ -14402,7 +14356,7 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(right)
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
-				.build_arithmetic_result(
+				.build_operator_dispatch(
 					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
