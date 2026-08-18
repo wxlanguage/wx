@@ -11,3 +11,4 @@ body:
   - LocalGet: 1
   - Call: 275
   - LocalTee: 2
+br_table_depths: []

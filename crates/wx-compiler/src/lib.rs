@@ -6,3 +6,4 @@ pub mod opt;
 pub mod testing;
 pub mod tir;
 pub mod vfs;
+pub mod wasm;

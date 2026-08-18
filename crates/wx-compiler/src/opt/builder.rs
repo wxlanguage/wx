@@ -128,10 +128,10 @@ impl<'mir> Builder<'mir> {
 	/// (`*wasm_idx` tracks the next free slot across the whole call). A
 	/// scalar parameter is just one `Param` node; an aggregate parameter —
 	/// possibly nested — is passed as a flattened run of scalar WASM params
-	/// (mirroring how `flatten_mir_type`/signature flattening lays out a
-	/// call site's arguments), so this recurses to rebuild the matching
-	/// (possibly nested) `Aggregate` literal from them, in the same
-	/// pre-order `flatten_mir_type` itself would visit.
+	/// (mirroring how `wasm::flatten_type_to_scalars`/signature flattening
+	/// lays out a call site's arguments), so this recurses to rebuild the
+	/// matching (possibly nested) `Aggregate` literal from them, in the same
+	/// pre-order `wasm::flatten_type_to_scalars` itself would visit.
 	fn build_param_value(
 		&mut self,
 		ty: mir::Type,
