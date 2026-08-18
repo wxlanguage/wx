@@ -99,6 +99,8 @@ pub trait BitNot {
 
 pub const PAGE_SIZE: u32 = 65536;
 
+/// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure.
+/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
 #[intrinsic]
 pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
