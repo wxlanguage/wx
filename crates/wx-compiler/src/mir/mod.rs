@@ -1634,7 +1634,7 @@ impl<'tir> Builder<'tir> {
 					buf.extend_from_slice(&(v as u32).to_le_bytes());
 				} else if ty == tir::TypeIndex::I64 || ty == tir::TypeIndex::U64
 				{
-					buf.extend_from_slice(&(v as u64).to_le_bytes());
+					buf.extend_from_slice(&v.to_le_bytes());
 				} else {
 					unreachable!("unexpected int element type");
 				}
