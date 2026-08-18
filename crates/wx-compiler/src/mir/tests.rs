@@ -1512,6 +1512,136 @@ fn test_struct_operator_overload_inline_method_is_substituted() {
 }
 
 #[test]
+fn test_struct_bitand_overload_lowers_to_call() {
+	// Bitwise operators reuse the same dispatch path as arithmetic
+	// (`build_operator_dispatch`) once a struct is involved — same shape
+	// as `test_struct_operator_overload_lowers_to_call`, just for `&`.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+
+        export { and_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitand_overload_inline_method_is_substituted() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            #[inline]
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+
+        export { and_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitnot_overload_lowers_to_call() {
+	// Unary `^x` reuses the same dispatch path as `-x` (`Neg`) once a
+	// struct is involved (`build_unary_operator_dispatch`) — same shape
+	// as the binary struct-overload tests, for the one unary bitwise op.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+
+        export { not_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitnot_overload_inline_method_is_substituted() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            #[inline]
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+
+        export { not_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_generic_bitand_bound_resolves_to_primitive_impl() {
+	// A bare type param bounded by `BitAnd` must dispatch through
+	// `resolve_bounded_operator_method` and monomorphize to `i32`'s own
+	// (native-fast-path-backed) impl — the generic-bound counterpart of
+	// the struct tests above, exercising primitives instead.
+	let case = TestCase::new(indoc! {"
+        fn and_it<T: BitAnd>(a: T, b: T) -> T {
+            a & b
+        }
+
+        fn use_and(a: i32, b: i32) -> i32 {
+            and_it(a, b)
+        }
+
+        export { use_and }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
+	// Unary counterpart of `test_generic_bitand_bound_resolves_to_primitive_impl`
+	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
+	// branch, so a bare type param bounded by `BitNot` failed to dispatch
+	// at all. Now it goes through `resolve_bounded_operator_method` and
+	// monomorphizes to `i32`'s own (native-fast-path-backed) impl, same as
+	// the binary case.
+	let case = TestCase::new(indoc! {"
+        fn not_it<T: BitNot>(a: T) -> T {
+            ^a
+        }
+
+        fn use_not(a: i32) -> i32 {
+            not_it(a)
+        }
+
+        export { use_not }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
 fn test_struct_compound_assignment_lowers_to_add_call() {
 	let case = TestCase::new(indoc! {"
         struct Vec2 { x: i32, y: i32 }

@@ -1,0 +1,90 @@
+use std::*;
+
+trait Hasher {
+  fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
+
+  fn finish(self) -> u64;
+
+  #[inline]
+  fn hash<Mem: Memory, T: Hash>(self: Mem::*Self, value: Mem::&T) {
+    value.hash(self);
+  }
+}
+
+type Ptr<T> = T::&u8;
+
+// FNV-1a: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+struct DefaultHasher {
+  value: u64,
+}
+
+impl DefaultHasher {
+  pub fn new() -> Self {
+    Self::{ value: FNV_OFFSET_BASIS }
+  }
+}
+
+impl Hasher for DefaultHasher {
+  fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]) {
+    local mut i: Mem::Size = 0;
+    loop {
+      if i == bytes.len() { break };
+      self.*.value
+        = (self.*.value ^ u64_extend_u32(bytes[i] as u32)) * FNV_PRIME;
+      i += 1;
+    };
+  }
+
+  fn finish(self) -> u64 {
+    self.value
+  }
+}
+
+trait Hash {
+  fn hash<Mem: Memory, H: Hasher>(self: Mem::&Self, state: Mem::*H);
+}
+
+impl Hash for i32 {
+  fn hash<Mem: Memory, H: Hasher>(self: Mem::&Self, state: Mem::*H) {
+    local bytes =
+      slice_from_parts::<Mem, u8>(self as Mem::&u8, size_of::<i32, Mem>());
+    state.write(bytes);
+  }
+}
+
+memory heap: Memory where { Size = u32 };
+global mut bump: heap::*u8 = heap::DATA_END;
+
+struct BumpAllocator {}
+
+impl Allocator for BumpAllocator {
+  type Mem = heap;
+
+  fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+    local ptr = ptr::align_up::<heap>(bump as u32, layout.align);
+    local new_end = ptr + layout.size;
+    local cur_end = heap.size() * PAGE_SIZE;
+    if new_end > cur_end {
+      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      if heap.grow(needed) == -1 { unreachable }
+    }
+    bump = new_end as heap::*u8;
+    ptr as heap::*u8
+  }
+}
+
+fn hash_i32(value: i32) -> u64 {
+  local bump: heap::*BumpAllocator = ptr::null_mut();
+  local value = bump.alloc(value);
+  local hasher = bump.alloc(DefaultHasher::new());
+  hasher.hash(value);
+  hasher.*.finish()
+}
+
+export {
+  heap as "memory",
+  hash_i32,
+}

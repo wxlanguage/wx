@@ -1464,7 +1464,9 @@ impl<'tir> Builder<'tir> {
 			.value
 			.as_ref()
 			.and_then(|body| match body.block.kind {
-				tir::ExprKind::Int { value } => Some(ConstInit::Int(value)),
+				tir::ExprKind::Int { value } => {
+					Some(ConstInit::Int(value as i64))
+				}
 				tir::ExprKind::Float { value } => Some(ConstInit::Float(value)),
 				_ => None,
 			})
@@ -1833,7 +1835,9 @@ impl<'tir> Builder<'tir> {
 				ty: Type::Never,
 			},
 			tir::ExprKind::Int { value } => Expression {
-				kind: ExprKind::Int { value: *value },
+				kind: ExprKind::Int {
+					value: *value as i64,
+				},
 				ty: self.lower_type_index(expr.ty),
 			},
 			tir::ExprKind::Float { value } => Expression {
@@ -2108,20 +2112,42 @@ impl<'tir> Builder<'tir> {
 						.expect("no impl found for abstract trait method");
 					let impl_func_id =
 						self.tir.functions[impl_func_idx as usize].id;
-					if impl_type_args.is_empty() {
-						// Concrete impl: the method has zero type params of
-						// its own, so it was already eagerly emitted (with
-						// this bare id) by `MIR::build`'s main loop — reuse
+					// `impl_type_args` alone only covers the impl block's own
+					// params (e.g. `impl<T> Trait for Box<T>`'s `T`) — the
+					// impl's copy of the method can *also* declare its own
+					// extra params (e.g. `fn write<Mem: Memory>(...)` on an
+					// otherwise-concrete `impl Hasher for DefaultHasher`),
+					// which `impl_type_args` says nothing about. Reusing the
+					// bare `impl_func_id` whenever `impl_type_args` alone is
+					// empty is therefore wrong whenever the method has any
+					// such params of its own: that instance was never
+					// eagerly emitted by `MIR::build`'s main loop (which only
+					// emits functions with zero *total* type params), so the
+					// bare id has no MIR function/wasm index behind it.
+					let impl_own_type_params =
+						&self.tir.functions[impl_func_idx as usize].type_params;
+					if impl_type_args.is_empty()
+						&& impl_own_type_params.is_empty()
+					{
+						// Fully concrete: zero total type params, so it was
+						// already eagerly emitted (with this bare id) — reuse
 						// it directly rather than registering a redundant
 						// duplicate through `mono_registry`.
 						impl_func_id
 					} else {
-						// Generic impl: this method's `total_type_param_count`
-						// is nonzero (it inherits the impl's own params), so
-						// `MIR::build`'s main loop skipped it — it only ever
-						// gets lowered on demand, here, via the worklist.
+						// Needs monomorphizing on demand via the worklist.
+						// Full arg list: the impl block's own args (its
+						// inherited-param prefix) followed by the method's
+						// own args — `resolved`'s tail after the leading
+						// `Self` slot (index 0, already consumed above to
+						// find the impl).
+						let full_args: Box<[tir::TypeIndex]> = impl_type_args
+							.iter()
+							.copied()
+							.chain(resolved[1..].iter().copied())
+							.collect();
 						self.mono_registry
-							.get_or_insert(impl_func_id, impl_type_args)
+							.get_or_insert(impl_func_id, full_args)
 					}
 				};
 				self.record_call_edge(target_id);
@@ -3353,6 +3379,16 @@ impl<'tir> Builder<'tir> {
 				},
 				ty: self.lower_type_index(expr_ty),
 			},
+			"i32_bitnot" | "i64_bitnot" => Expression {
+				kind: ExprKind::BitNot {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
 			"i32_add" | "i64_add" | "f32_add" | "f64_add" => Expression {
 				kind: ExprKind::Add {
 					left: Box::new(self.lower_expression(
@@ -3416,6 +3452,81 @@ impl<'tir> Builder<'tir> {
 			},
 			"i32_rem" | "u32_rem" | "i64_rem" | "u64_rem" => Expression {
 				kind: ExprKind::Rem {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_bitand" | "i64_bitand" => Expression {
+				kind: ExprKind::BitAnd {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_bitor" | "i64_bitor" => Expression {
+				kind: ExprKind::BitOr {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_bitxor" | "i64_bitxor" => Expression {
+				kind: ExprKind::BitXor {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_shl" | "i64_shl" => Expression {
+				kind: ExprKind::LeftShift {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_shr" | "u32_shr" | "i64_shr" | "u64_shr" => Expression {
+				kind: ExprKind::RightShift {
 					left: Box::new(self.lower_expression(
 						func_ctx,
 						&arguments[0],

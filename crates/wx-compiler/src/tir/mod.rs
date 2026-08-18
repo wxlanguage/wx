@@ -622,17 +622,6 @@ impl BinaryOp {
 				| BinaryOp::Rem
 		)
 	}
-
-	pub fn is_bitwise(&self) -> bool {
-		matches!(
-			self,
-			BinaryOp::BitAnd
-				| BinaryOp::BitOr
-				| BinaryOp::BitXor
-				| BinaryOp::LeftShift
-				| BinaryOp::RightShift
-		)
-	}
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -641,8 +630,10 @@ pub enum ExprKind {
 	Error,
 	Placeholder,
 	Unreachable,
+	/// Mirrors `ast::Expression::Int`: the raw, non-negative magnitude as
+	/// written, never itself negative — see that type's doc comment.
 	Int {
-		value: i64,
+		value: u64,
 	},
 	Float {
 		value: f64,
@@ -1638,6 +1629,7 @@ define_diagnostic_codes! {
 		InvalidMemoryLimitsAttribute => "E1069",
 		UnreachableMatchArm => "W1010",
 		MissingTypeAliasBody => "E1070",
+		EnumVariantRequiresExplicitValue => "E1071",
 	}
 }
 

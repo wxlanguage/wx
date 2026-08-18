@@ -220,6 +220,12 @@ struct Builder<'ast, 'graph> {
 /// the hot path. Lives on `Builder`, not `TIR`: nothing outside `TIR::build`
 /// needs this mapping — every operator is already resolved to a concrete
 /// `ExprKind::MethodCall` by the time `TIR::build` returns.
+///
+/// Covers arithmetic (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`) and bitwise
+/// (`BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`/`BitNot`) operators alike — every
+/// binary family dispatches through `for_op`/`build_operator_dispatch`, and
+/// both unary members (`Neg`, `BitNot`) through `for_unary_op`/
+/// `build_unary_operator_dispatch`.
 #[derive(Clone)]
 struct OperatorTraits {
 	add: (TraitIndex, SymbolU32),
@@ -228,12 +234,19 @@ struct OperatorTraits {
 	div: (TraitIndex, SymbolU32),
 	rem: (TraitIndex, SymbolU32),
 	neg: (TraitIndex, SymbolU32),
+	bitand: (TraitIndex, SymbolU32),
+	bitor: (TraitIndex, SymbolU32),
+	bitxor: (TraitIndex, SymbolU32),
+	shl: (TraitIndex, SymbolU32),
+	shr: (TraitIndex, SymbolU32),
+	bitnot: (TraitIndex, SymbolU32),
 }
 
 impl OperatorTraits {
-	/// Maps an arithmetic `BinaryOp` to its `(TraitIndex, SymbolU32)` entry
-	/// — the lookup every arithmetic-operator dispatch path needs, factored
-	/// out so it's defined once. `None` for a non-arithmetic operator.
+	/// Maps an arithmetic or bitwise `BinaryOp` to its `(TraitIndex,
+	/// SymbolU32)` entry — the lookup every such operator-dispatch path
+	/// needs, factored out so it's defined once. `None` for an operator with
+	/// no overload trait (comparisons, logical, assignment).
 	fn for_op(&self, op: BinaryOp) -> Option<(TraitIndex, SymbolU32)> {
 		Some(match op {
 			BinaryOp::Add => self.add,
@@ -241,7 +254,25 @@ impl OperatorTraits {
 			BinaryOp::Mul => self.mul,
 			BinaryOp::Div => self.div,
 			BinaryOp::Rem => self.rem,
+			BinaryOp::BitAnd => self.bitand,
+			BinaryOp::BitOr => self.bitor,
+			BinaryOp::BitXor => self.bitxor,
+			BinaryOp::LeftShift => self.shl,
+			BinaryOp::RightShift => self.shr,
 			_ => return None,
+		})
+	}
+
+	/// Unary counterpart of `for_op`, for `-x` (`Neg`) and `^x` (`BitNot`).
+	/// `None` for an operator with no overload trait (`!x`, bool-only).
+	fn for_unary_op(
+		&self,
+		op: ast::UnaryOp,
+	) -> Option<(TraitIndex, SymbolU32)> {
+		Some(match op {
+			ast::UnaryOp::InvertSign => self.neg,
+			ast::UnaryOp::BitNot => self.bitnot,
+			ast::UnaryOp::Not => return None,
 		})
 	}
 }
@@ -422,6 +453,18 @@ fn report_enum_repr_not_integer(
 			"`{}` is not an integer type",
 			fmt.display_type(ty).unwrap_or_default()
 		)))
+}
+
+fn report_enum_variant_requires_explicit_value(
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::EnumVariantRequiresExplicitValue.code())
+		.with_message("enum variant requires an explicit value")
+		.with_label(span.primary_label().with_message("add `= <value>` here"))
+		.with_note(
+			"or add a value to an earlier variant to anchor auto-increment",
+		)
 }
 
 /// One diagnostic per colliding value, not pairwise: primary label on the enum's own
@@ -1808,6 +1851,12 @@ impl<'ast> Builder<'ast, '_> {
 			div: self.resolve_operator_trait("div"),
 			rem: self.resolve_operator_trait("rem"),
 			neg: self.resolve_operator_trait("neg"),
+			bitand: self.resolve_operator_trait("bitand"),
+			bitor: self.resolve_operator_trait("bitor"),
+			bitxor: self.resolve_operator_trait("bitxor"),
+			shl: self.resolve_operator_trait("shl"),
+			shr: self.resolve_operator_trait("shr"),
+			bitnot: self.resolve_operator_trait("bitnot"),
 		}
 	}
 
@@ -2033,6 +2082,47 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// Shared by `build_bitwise_binary_expr`'s same-type arm once `ty` is a
+	/// fully concrete type both operands agree on. Unlike
+	/// `build_arithmetic_result`, integers/`bool`/typeset-bounded associated
+	/// types stay on the plain `Binary` path unconditionally — that's the
+	/// pre-existing native codegen for bitwise ops on primitives, and it's
+	/// deliberately left untouched (no snapshot churn, no new intrinsics
+	/// needed for the concrete-primitive case). Only a type outside that set
+	/// (a struct, or a bare `Type::TypeParam` bounded by one of the bitwise
+	/// traits) goes through real dispatch via `build_operator_dispatch`,
+	/// which already reports "operator cannot be applied" on its own if
+	/// nothing implements it.
+	fn build_bitwise_result(
+		&mut self,
+		ctx: &ExprContext,
+		operator: Spanned<ast::BinaryOp>,
+		left: Expression,
+		right: Expression,
+		ty: TypeIndex,
+		span: ast::TextSpan,
+	) -> Expression {
+		if ty.is_integer()
+			|| ty == TypeIndex::BOOL
+			|| self.is_typeset_bounded_assoc_type(ty)
+		{
+			Expression {
+				kind: ExprKind::Binary {
+					operator: Spanned {
+						inner: BinaryOp::from(operator.inner),
+						span: operator.span,
+					},
+					left: Box::new(left),
+					right: Box::new(right),
+				},
+				ty,
+				span,
+			}
+		} else {
+			self.build_operator_dispatch(ctx, operator, left, right, ty, span)
+		}
+	}
+
 	/// Resolves what a compound-assignment operator (`+=` and friends)
 	/// dispatches to for `ty`, for building `CompoundAssign`/`CompoundStore`
 	/// (`Concrete`) or `GenericCompoundAssign`/`GenericCompoundStore`
@@ -2147,10 +2237,12 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Unary counterpart of `build_operator_dispatch`, for `-x` (`Neg`
-	/// dispatch) only — `EvalMode` gating, go-to-definition access
+	/// Unary counterpart of `build_operator_dispatch`, for `-x` (`Neg`) and
+	/// `^x` (`BitNot`) — `EvalMode` gating, go-to-definition access
 	/// recording, and diagnostic-on-failure all mirror the binary case
-	/// exactly, just with one operand instead of two.
+	/// exactly, just with one operand instead of two. Callers only ever
+	/// pass an `operator` `for_unary_op` recognizes (`InvertSign`/
+	/// `BitNot`) — `!x` (`Not`) is bool-only and never reaches here.
 	///
 	/// TODO: revisit whether this and `build_operator_dispatch` (plus
 	/// `build_arithmetic_result`/`build_unary_arithmetic_result`) can share
@@ -2177,7 +2269,48 @@ impl<'ast> Builder<'ast, '_> {
 				span,
 			};
 		};
-		let (trait_index, method_symbol) = traits.neg;
+		let Some((trait_index, method_symbol)) =
+			traits.for_unary_op(operator.inner)
+		else {
+			unreachable!(
+				"build_unary_operator_dispatch called with an operator \
+				 that has no overload trait"
+			)
+		};
+
+		// Same reasoning as `build_operator_dispatch`'s equivalent branch: a
+		// bare `Type::TypeParam` isn't concrete, so `resolve_trait_method`
+		// below can never resolve it — a `T: Neg`-bounded type param could
+		// concretize to any type implementing `Neg`, not just a primitive,
+		// so this needs real deferred dispatch, resolved at MIR-lowering
+		// time once monomorphization substitutes a concrete `Self`. An
+		// unbounded `T` falls through to the same failure path below as a
+		// concrete type with no matching impl, since
+		// `resolve_bounded_operator_method` deliberately returns `None` for
+		// both.
+		if let Type::TypeParam { owner, param_index } =
+			self.tir.types[ty.as_usize()]
+			&& let Some(func_idx) = self.resolve_bounded_operator_method(
+				owner,
+				param_index,
+				trait_index,
+				method_symbol,
+			) {
+			self.tir.functions[func_idx as usize].accesses.push(
+				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+			);
+			let abstract_method_id = self.tir.functions[func_idx as usize].id;
+			return Expression {
+				kind: ExprKind::GenericMethodCall {
+					id: abstract_method_id,
+					type_args: Box::new([ty]),
+					arguments: Box::new([operand]),
+				},
+				ty,
+				span,
+			};
+		}
+
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
 			Some(func_idx) => {
 				self.tir.functions[func_idx as usize].accesses.push(
@@ -6826,7 +6959,14 @@ impl<'ast> Builder<'ast, '_> {
 						namespace: resolve_context.namespace,
 						parent: Some(ItemParent::Impl(self_type)),
 						body: None,
-						type_params: Box::new([]),
+						// Own (method-level) type params only — impl-level
+						// params are inherited via type_param_parent, same
+						// convention as InherentImplFunction.
+						type_params: signature
+							.type_params
+							.iter()
+							.map(|tp| TypeParamInfo::new(tp.name))
+							.collect(),
 						type_param_parent: Some(TypeParamOwner::TraitImpl(
 							trait_impl_index,
 						)),
@@ -6842,6 +6982,18 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir
 						.item_lookup
 						.insert(*id, ItemIndex::Function(func_index));
+
+					// Resolve the method's own param bounds (e.g. `Mem:
+					// Memory` in `fn write<Mem: Memory>(...)`)  — without
+					// this, resolve_type_identifier can still find the type
+					// param by name (it's registered above), but any trait
+					// bound on it is silently dropped.
+					self.resolve_type_param_bounds(
+						resolve_context,
+						TypeParamOwner::Function(*id),
+						None,
+						&signature.type_params,
+					);
 
 					let self_scope = GenericScope {
 						owner: TypeParamOwner::Function(*id),
@@ -8737,7 +8889,13 @@ impl<'ast> Builder<'ast, '_> {
 			Vec::with_capacity(ast_variants.len());
 		let mut variant_lookup: HashMap<SymbolU32, EnumVariantIndex> =
 			HashMap::with_capacity(variants.len());
-		let mut next_auto_value: i64 = 0;
+		// `None` until some variant provides a known value to continue
+		// from — either an explicit `= <value>` that actually evaluated,
+		// or a prior implicit variant that itself continued from one. An
+		// implicit variant reached while this is still `None` has nothing
+		// to anchor to, which is an error (see the `None` arm below)
+		// rather than a silent `0`-based default.
+		let mut next_auto_value: Option<i64> = None;
 
 		for ast_variant in ast_variants.iter().map(|v| &v.inner.inner) {
 			if let Some(first_index) =
@@ -8797,9 +8955,11 @@ impl<'ast> Builder<'ast, '_> {
 						Err(_) => (None, None),
 					}
 				}
-				None => {
-					if let Some(ref range) = ty_range {
-						if !range.contains(next_auto_value) {
+				None => match next_auto_value {
+					Some(v) => {
+						if let Some(ref range) = ty_range
+							&& !range.contains(v)
+						{
 							self.tir.diagnostics.push(
 								report_integer_literal_out_of_range(
 									TypeFormatter::new(
@@ -8808,7 +8968,7 @@ impl<'ast> Builder<'ast, '_> {
 									),
 									IntegerLiteralOutOfRangeDiagnostic {
 										ty: repr_type,
-										value: next_auto_value,
+										value: v,
 										span: SourceSpan::new(
 											resolve_context.file_id,
 											ast_variant.name.span,
@@ -8817,14 +8977,28 @@ impl<'ast> Builder<'ast, '_> {
 								),
 							);
 						}
+						(None, Some(v))
 					}
-					(None, Some(next_auto_value))
-				}
+					// Nothing above this variant established a value to
+					// continue from — same "already reported once on the
+					// enum itself" cascade guard as the `Some(_) if
+					// repr_type == TypeIndex::ERROR` arm above.
+					None => {
+						if repr_type != TypeIndex::ERROR {
+							self.tir.diagnostics.push(
+								report_enum_variant_requires_explicit_value(
+									SourceSpan::new(
+										resolve_context.file_id,
+										ast_variant.name.span,
+									),
+								),
+							);
+						}
+						(None, None)
+					}
+				},
 			};
-			next_auto_value = match const_value {
-				Some(value) => value.wrapping_add(1),
-				None => next_auto_value.wrapping_add(1),
-			};
+			next_auto_value = const_value.map(|v| v.wrapping_add(1));
 
 			let variant_index = variants.len() as EnumVariantIndex;
 			variant_lookup.insert(ast_variant.name.inner, variant_index);
@@ -8925,17 +9099,38 @@ impl<'ast> Builder<'ast, '_> {
 	/// chain of const-on-const arithmetic stays linear instead of blowing up.
 	fn eval_const_expr(&self, expr: &Expression) -> Result<ConstValue, ()> {
 		match &expr.kind {
-			ExprKind::Int { value } => Ok(ConstValue::Int(*value)),
+			// `value` is a raw, non-negative literal magnitude (see
+			// `ExprKind::Int`'s doc comment) — bit-reinterpret into the
+			// unified `ConstValue::Int(i64)` representation, same
+			// convention `IntegerRange` already uses (e.g. `u64::MAX as
+			// i64 == -1`, correct for an already-`u64`-typed constant).
+			ExprKind::Int { value } => Ok(ConstValue::Int(*value as i64)),
 			ExprKind::Float { value } => Ok(ConstValue::Float(*value)),
 			ExprKind::Bool { value } => Ok(ConstValue::Bool(*value)),
 			ExprKind::Char { value } => Ok(ConstValue::Char(*value)),
 			ExprKind::Unary { operator, operand } => {
+				// A literal being negated directly (`-128`) must be
+				// negated from its raw `u64` magnitude, not from the
+				// bit-cast `i64` recursing through `eval_const_expr`
+				// would otherwise produce for it — negating *that* value
+				// would panic on `-9223372036854775808` (`i64::MIN`'s
+				// magnitude bit-casts to `i64::MIN` itself, and only
+				// `wrapping_neg` on the raw magnitude wraps that back to
+				// the correct answer).
+				if let ast::UnaryOp::InvertSign = operator.inner
+					&& let ExprKind::Int { value } = operand.kind
+				{
+					return Ok(ConstValue::Int((value as i64).wrapping_neg()));
+				}
+
 				let ConstValue::Int(value) = self.eval_const_expr(operand)?
 				else {
 					return Err(());
 				};
 				match operator.inner {
-					ast::UnaryOp::InvertSign => Ok(ConstValue::Int(-value)),
+					ast::UnaryOp::InvertSign => {
+						Ok(ConstValue::Int(value.wrapping_neg()))
+					}
 					ast::UnaryOp::BitNot => Ok(ConstValue::Int(!value)),
 					ast::UnaryOp::Not => Err(()),
 				}
@@ -8952,6 +9147,22 @@ impl<'ast> Builder<'ast, '_> {
 				else {
 					return Err(());
 				};
+				// `Add`/`Sub`/`Mul` are representation-agnostic in two's
+				// complement — the wrapped bit pattern is identical
+				// whether `left`/`right` are interpreted as signed or
+				// unsigned, so folding them via plain `i64` wrapping ops
+				// is correct regardless of `expr.ty`'s real signedness.
+				// `Div`/`Rem` are not: dividing the same bit pattern as
+				// signed vs. unsigned gives different answers whenever a
+				// `u64` constant's magnitude exceeds `i64::MAX` (e.g.
+				// `u64::MAX / 2`, which as signed `i64` is `-1 / 2 == 0`,
+				// but is `9223372036854775807` as unsigned) — those two
+				// need to consult `expr.ty` and pick the matching
+				// operation.
+				let unsigned = expr.ty == TypeIndex::U8
+					|| expr.ty == TypeIndex::U16
+					|| expr.ty == TypeIndex::U32
+					|| expr.ty == TypeIndex::U64;
 				match operator.inner {
 					BinaryOp::Add => {
 						Ok(ConstValue::Int(left.wrapping_add(right)))
@@ -8962,11 +9173,31 @@ impl<'ast> Builder<'ast, '_> {
 					BinaryOp::Mul => {
 						Ok(ConstValue::Int(left.wrapping_mul(right)))
 					}
+					BinaryOp::Div if unsigned => {
+						if right == 0 {
+							Err(())
+						} else {
+							Ok(ConstValue::Int(
+								((left as u64).wrapping_div(right as u64))
+									as i64,
+							))
+						}
+					}
 					BinaryOp::Div => {
 						if right == 0 {
 							Err(())
 						} else {
 							Ok(ConstValue::Int(left.wrapping_div(right)))
+						}
+					}
+					BinaryOp::Rem if unsigned => {
+						if right == 0 {
+							Err(())
+						} else {
+							Ok(ConstValue::Int(
+								((left as u64).wrapping_rem(right as u64))
+									as i64,
+							))
 						}
 					}
 					BinaryOp::Rem => {
@@ -12803,6 +13034,11 @@ impl<'ast> Builder<'ast, '_> {
 					|| self.is_typeset_bounded_assoc_type(operand.ty)
 					|| operand.ty.is_comptime_number()
 				{
+					// Native fast path — unchanged from before `BitNot`
+					// had an overload trait at all: primitives, typeset-
+					// bounded associated types, and deferred comptime
+					// numbers stay a plain `Unary` node (no snapshot
+					// churn, no new intrinsics needed for this case).
 					let ty = operand.ty;
 					Ok(Expression {
 						kind: ExprKind::Unary {
@@ -12813,27 +13049,17 @@ impl<'ast> Builder<'ast, '_> {
 						span: expr.span,
 					})
 				} else {
-					self.tir.diagnostics.push(
-						report_unary_operator_cannot_be_applied(
-							TypeFormatter::new(&self.tir, self.interner),
-							UnaryOperatorCannotBeAppliedDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								operator,
-								operand: Spanned {
-									inner: operand.ty,
-									span: operand.span,
-								},
-							},
-						),
-					);
-					Ok(Expression {
-						kind: ExprKind::Unary {
-							operator,
-							operand: Box::new(operand),
-						},
-						ty: TypeIndex::ERROR,
-						span: expr.span,
-					})
+					// Anything else (a struct) goes through real `BitNot`
+					// dispatch, which reports "operator cannot be
+					// applied" on its own if nothing implements it —
+					// same shape as `InvertSign`'s always-dispatch arm
+					// above, just gated to the non-primitive case to
+					// match the binary bitwise operators' native-path
+					// split (`build_bitwise_result`).
+					let ty = operand.ty;
+					Ok(self.build_unary_operator_dispatch(
+						ctx, operator, operand, ty, expr.span,
+					))
 				}
 			}
 			ast::UnaryOp::Not => {
@@ -13124,22 +13350,10 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr.span,
 				})
 			}
-			(left_type, right_type)
-				if left_type == right_type
-					&& (left_type.is_integer()
-						|| left_type == TypeIndex::BOOL
-						|| self.is_typeset_bounded_assoc_type(left_type)) =>
-			{
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: left_type,
-					span: expr.span,
-				})
-			}
+			(left_type, right_type) if left_type == right_type => Ok(self
+				.build_bitwise_result(
+					ctx, operator, left, right, left_type, expr.span,
+				)),
 			(left_type, right_type) => {
 				self.tir
 					.diagnostics
@@ -16093,133 +16307,38 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let formatter = TypeFormatter::new(&self.tir, self.interner);
 
-		if target_idx == TypeIndex::I32 {
-			if value > i32::MAX as i64 || value < i32::MIN as i64 {
+		// `value` is always the raw, non-negative magnitude as written (see
+		// `ExprKind::Int`'s doc comment) — negation is a separate `Unary`
+		// node handled by `coerce_untyped_unary_expr`, never reaching here.
+		// So every primitive-integer target below only ever needs an
+		// upper-bound check against its own `MAX` (as `u64`); a lower bound
+		// can never fire and isn't checked.
+		let primitive_int_max: Option<u64> = match target_idx {
+			TypeIndex::I32 => Some(i32::MAX as u64),
+			TypeIndex::I64 => Some(i64::MAX as u64),
+			TypeIndex::U32 => Some(u32::MAX as u64),
+			TypeIndex::U64 => Some(u64::MAX),
+			TypeIndex::U8 => Some(u8::MAX as u64),
+			TypeIndex::I8 => Some(i8::MAX as u64),
+			TypeIndex::U16 => Some(u16::MAX as u64),
+			TypeIndex::I16 => Some(i16::MAX as u64),
+			TypeIndex::CHAR => Some(u32::MAX as u64),
+			_ => None,
+		};
+		if let Some(max) = primitive_int_max {
+			if value > max {
 				self.tir
 					.diagnostics
 					.push(report_integer_literal_out_of_range(
 						formatter,
 						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::I32,
-							value,
+							ty: target_idx,
+							value: value as i64,
 							span: SourceSpan::new(file_id, expr.span),
 						},
 					));
 			}
-			expr.ty = TypeIndex::I32;
-			Ok(())
-		} else if target_idx == TypeIndex::I64 {
-			// `value` is already an `i64`, so it can never fall outside
-			// `i64::MIN..=i64::MAX` — literals too large to parse as `i64`
-			// are rejected earlier, in `parse_integer_literal`.
-			expr.ty = TypeIndex::I64;
-			Ok(())
-		} else if target_idx == TypeIndex::U32 {
-			if value > u32::MAX as i64 || value < 0 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::U32,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::U32;
-			Ok(())
-		} else if target_idx == TypeIndex::U64 {
-			// i64 is at most i64::MAX which always fits in u64; only negative values are
-			// invalid
-			if value < 0 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::U64,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::U64;
-			Ok(())
-		} else if target_idx == TypeIndex::U8 {
-			if value < 0 || value > u8::MAX as i64 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::U8,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::U8;
-			Ok(())
-		} else if target_idx == TypeIndex::I8 {
-			if value < i8::MIN as i64 || value > i8::MAX as i64 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::I8,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::I8;
-			Ok(())
-		} else if target_idx == TypeIndex::U16 {
-			if value < 0 || value > u16::MAX as i64 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::U16,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::U16;
-			Ok(())
-		} else if target_idx == TypeIndex::I16 {
-			if value < i16::MIN as i64 || value > i16::MAX as i64 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::I16,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::I16;
-			Ok(())
-		} else if target_idx == TypeIndex::CHAR {
-			if value < 0 || value > u32::MAX as i64 {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: TypeIndex::CHAR,
-							value,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
-			}
-			expr.ty = TypeIndex::CHAR;
+			expr.ty = target_idx;
 			Ok(())
 		} else if target_idx == TypeIndex::F32 || target_idx == TypeIndex::F64 {
 			self.tir
@@ -16234,33 +16353,22 @@ impl<'ast> Builder<'ast, '_> {
 		) {
 			match self.type_scalar(target_idx) {
 				Some(WasmScalar::I32) => {
-					if value < 0 || value > u32::MAX as i64 {
+					if value > u32::MAX as u64 {
 						self.tir.diagnostics.push(
 							report_integer_literal_out_of_range(
 								formatter,
 								IntegerLiteralOutOfRangeDiagnostic {
 									ty: TypeIndex::U32,
-									value,
+									value: value as i64,
 									span: SourceSpan::new(file_id, expr.span),
 								},
 							),
 						);
 					}
 				}
-				Some(WasmScalar::I64) => {
-					if value < 0 {
-						self.tir.diagnostics.push(
-							report_integer_literal_out_of_range(
-								formatter,
-								IntegerLiteralOutOfRangeDiagnostic {
-									ty: TypeIndex::U64,
-									value,
-									span: SourceSpan::new(file_id, expr.span),
-								},
-							),
-						);
-					}
-				}
+				// `value` is a `u64`, so it can never exceed `u64::MAX` —
+				// nothing to check.
+				Some(WasmScalar::I64) => {}
 				_ => {
 					// Generic pointer (TypeParam memory) — validate against the
 					// `#[tag = "pointer_size"]` typeset (`PointerSize` in std.wx).
@@ -16273,7 +16381,7 @@ impl<'ast> Builder<'ast, '_> {
 						})
 						.map(|idx| &self.tir.typesets[idx as usize])
 					{
-						if !ts.intersection_range.contains(value) {
+						if !ts.intersection_range.contains(value as i64) {
 							let ts_name = self
 								.interner
 								.resolve(ts.name.inner)
@@ -16281,7 +16389,7 @@ impl<'ast> Builder<'ast, '_> {
 								.to_string();
 							self.tir.diagnostics.push(
 								report_integer_literal_out_of_typeset_range(
-									value,
+									value as i64,
 									&ts_name,
 									&ts.intersection_range,
 									SourceSpan::new(file_id, expr.span),
@@ -16307,10 +16415,10 @@ impl<'ast> Builder<'ast, '_> {
 				.resolve(ts.name.inner)
 				.unwrap_or("?")
 				.to_string();
-			if !range.contains(value) {
+			if !range.contains(value as i64) {
 				self.tir.diagnostics.push(
 					report_integer_literal_out_of_typeset_range(
-						value,
+						value as i64,
 						&ts_name,
 						range,
 						SourceSpan::new(file_id, expr.span),
@@ -16367,9 +16475,18 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		match operator.inner {
-			ast::UnaryOp::BitNot | ast::UnaryOp::InvertSign => {
-				let is_valid = target_idx == TypeIndex::I32
-					|| target_idx == TypeIndex::I64;
+			// `-x`: valid for any signed numeric target — all four signed
+			// integer widths plus both floats. Unsigned targets are
+			// deliberately excluded (`local x: u32 = -1;` must fail to
+			// coerce, same as negating an already-typed `u32` operand does
+			// elsewhere).
+			ast::UnaryOp::InvertSign => {
+				let is_valid = target_idx == TypeIndex::I8
+					|| target_idx == TypeIndex::I16
+					|| target_idx == TypeIndex::I32
+					|| target_idx == TypeIndex::I64
+					|| target_idx == TypeIndex::F32
+					|| target_idx == TypeIndex::F64;
 				if !is_valid {
 					self.tir.diagnostics.push(report_unable_to_coerce(
 						TypeFormatter::new(&self.tir, self.interner),
@@ -16378,11 +16495,60 @@ impl<'ast> Builder<'ast, '_> {
 					));
 					return Err(());
 				}
+
+				// Two's-complement's negative range holds one more
+				// magnitude than its positive range (e.g. `i8::MIN` is
+				// `-128` but `i8::MAX` is only `127`). `operand` here is
+				// always the un-negated positive literal, so delegating
+				// straight to `coerce_untyped_expr` would range-check
+				// that magnitude against the ordinary (narrower)
+				// positive-max bound and wrongly reject exactly the
+				// most-negative value of each width (`-128i8`,
+				// `-32768i16`, `-2147483648i32`,
+				// `-9223372036854775808i64`) — check the true
+				// negation-aware bound here instead, and skip the
+				// generic recursive coercion for this shape entirely.
+				if let ExprKind::Int { value } = operand.kind {
+					let max_magnitude: u64 = match target_idx {
+						TypeIndex::I8 => i8::MIN.unsigned_abs() as u64,
+						TypeIndex::I16 => i16::MIN.unsigned_abs() as u64,
+						TypeIndex::I32 => i32::MIN.unsigned_abs() as u64,
+						TypeIndex::I64 => i64::MIN.unsigned_abs(),
+						// F32/F64: no integer range to check.
+						_ => u64::MAX,
+					};
+					if value > max_magnitude {
+						self.tir.diagnostics.push(
+							report_integer_literal_out_of_range(
+								TypeFormatter::new(&self.tir, self.interner),
+								IntegerLiteralOutOfRangeDiagnostic {
+									ty: target_idx,
+									value: (value as i64).wrapping_neg(),
+									span: SourceSpan::new(file_id, expr.span),
+								},
+							),
+						);
+					}
+					operand.ty = target_idx;
+				} else {
+					self.coerce_untyped_expr(ctx, operand, target_idx)?;
+				}
+			}
+			// `^x`: valid for any integer width, signed or unsigned — sign
+			// doesn't matter for bitwise complement.
+			ast::UnaryOp::BitNot => {
+				if !target_idx.is_integer() {
+					self.tir.diagnostics.push(report_unable_to_coerce(
+						TypeFormatter::new(&self.tir, self.interner),
+						target_idx,
+						SourceSpan::new(file_id, expr.span),
+					));
+					return Err(());
+				}
+				self.coerce_untyped_expr(ctx, operand, target_idx)?;
 			}
 			_ => unreachable!(),
 		}
-
-		self.coerce_untyped_expr(ctx, operand, target_idx)?;
 
 		// Same reasoning as `coerce_untyped_binary_expression`'s equivalent
 		// go-to-definition fix: the node stays `Unary` either way (`Neg`'s
@@ -16421,33 +16587,22 @@ impl<'ast> Builder<'ast, '_> {
 			_ => unreachable!(),
 		};
 
-		match operator.inner {
-			op if op.is_arithmetic() => {
-				if !target_idx.is_primitive() {
-					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
-						target_idx,
-						SourceSpan::new(file_id, expr.span),
-					));
-					return Err(());
-				}
-			}
-			op if op.is_bitwise() => {
-				let is_integer = target_idx == TypeIndex::I32
-					|| target_idx == TypeIndex::I64
-					|| target_idx == TypeIndex::U32
-					|| target_idx == TypeIndex::U64;
-				if !is_integer {
-					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
-						target_idx,
-						SourceSpan::new(file_id, expr.span),
-					));
-					return Err(());
-				}
-			}
-			_ => unreachable!(),
-		};
+		// Arithmetic only: unlike `build_arithmetic_expr`, which leaves a
+		// comptime-comptime `Binary` node's `ty` as the untyped pseudo-type
+		// for coercion to be deferred to here, `build_bitwise_binary_expr`
+		// always resolves its own type inline (against `access_ctx`'s
+		// expected type, or by reporting "type annotation required" itself
+		// when that's unknown) — so a bitwise `Binary` node is never left
+		// untyped for this function to reach.
+		debug_assert!(operator.inner.is_arithmetic());
+		if !target_idx.is_primitive() {
+			self.tir.diagnostics.push(report_unable_to_coerce(
+				TypeFormatter::new(&self.tir, self.interner),
+				target_idx,
+				SourceSpan::new(file_id, expr.span),
+			));
+			return Err(());
+		}
 
 		let left_result = self.coerce_untyped_expr(ctx, left, target_idx);
 		let right_result = self.coerce_untyped_expr(ctx, right, target_idx);
@@ -17145,7 +17300,9 @@ impl<'ast> Builder<'ast, '_> {
 		)?;
 		let count =
 			match count_built.kind {
-				ExprKind::Int { value } if value >= 0 => value as u32,
+				// `value` is always non-negative (see `ExprKind::Int`'s
+				// doc comment) — no guard needed.
+				ExprKind::Int { value } => value as u32,
 				_ => {
 					self.tir.diagnostics.push(
 						report_array_repeat_count_not_const(SourceSpan::new(

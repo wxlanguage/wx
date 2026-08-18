@@ -2285,7 +2285,7 @@ fn test_match_switch_result_value_join() {
 fn test_match_switch_exhaustive_enum_has_no_default() {
 	let case = TestCase::new(indoc! {"
         enum Color: u8 {
-            Red,
+            Red = 0,
             Green,
             Blue,
         }

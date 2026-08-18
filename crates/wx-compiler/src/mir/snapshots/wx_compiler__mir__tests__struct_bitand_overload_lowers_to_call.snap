@@ -13,7 +13,13 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
-        result: U32
+          - ty:
+              Aggregate:
+                aggregate_index: 0
+            mutability: Immutable
+        result:
+          Aggregate:
+            aggregate_index: 0
     block:
       kind:
         Block:
@@ -24,7 +30,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 410
+                        id: 403
                     ty:
                       Function:
                         signature_index: 0
@@ -36,10 +42,21 @@ functions:
                       ty:
                         Aggregate:
                           aggregate_index: 0
-              ty: U32
-      ty: U32
+                    - kind:
+                        LocalGet:
+                          scope_index: 0
+                          local_index: 1
+                      ty:
+                        Aggregate:
+                          aggregate_index: 0
+              ty:
+                Aggregate:
+                  aggregate_index: 0
+      ty:
+        Aggregate:
+          aggregate_index: 0
     static_data: []
-  - id: 410
+  - id: 403
     signature_index: 0
     scopes:
       - kind: Block
@@ -49,26 +66,54 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
-        result: U32
+          - ty:
+              Aggregate:
+                aggregate_index: 0
+            mutability: Immutable
+        result:
+          Aggregate:
+            aggregate_index: 0
     block:
       kind:
         Block:
           scope_index: 0
           expressions:
             - kind:
-                AggregateGet:
-                  scope_index: 0
-                  local_index: 0
-                  value_index: 1
-              ty: U32
-      ty: U32
+                Aggregate:
+                  values:
+                    - kind:
+                        BitAnd:
+                          left:
+                            kind:
+                              AggregateGet:
+                                scope_index: 0
+                                local_index: 0
+                                value_index: 0
+                            ty: I32
+                          right:
+                            kind:
+                              AggregateGet:
+                                scope_index: 0
+                                local_index: 1
+                                value_index: 0
+                            ty: I32
+                      ty: I32
+              ty:
+                Aggregate:
+                  aggregate_index: 0
+      ty:
+        Aggregate:
+          aggregate_index: 0
     static_data: []
 signatures:
   - items:
       - Aggregate:
           aggregate_index: 0
-      - U32
-    params_count: 1
+      - Aggregate:
+          aggregate_index: 0
+      - Aggregate:
+          aggregate_index: 0
+    params_count: 2
   - items:
       - F32
       - F32
@@ -174,26 +219,16 @@ exports:
       id: 405
       name: 204
 imports: []
-memories:
-  - id: 402
-    source: Internal
-    kind: Memory32
-    min_pages: ~
-    max_pages: ~
+memories: []
 aggregates:
   - values:
-      - Pointer:
-          memory: 402
-          kind: Memory32
-      - U32
+      - I32
     offsets:
       - 0
-      - 4
     layout:
-      size: 8
+      size: 4
       align: 4
     decl_to_phys:
       - 0
-      - 1
 static_entries: []
 start_function: ~

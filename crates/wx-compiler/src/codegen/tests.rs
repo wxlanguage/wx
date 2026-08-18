@@ -1329,6 +1329,62 @@ fn test_trait_default_method() {
 }
 
 #[test]
+fn test_trait_method_with_own_type_param_called_through_generic_bound() {
+	// Regression test: `Consumer::consume<Mem, W: Writer>`'s body calls
+	// `w.write(1)`, where `write<Mem: Memory>` is an *abstract* trait
+	// method that itself declares its own type param (`Mem`), dispatched
+	// on a value (`w: Mem::*W`) whose type is `consume`'s own generic
+	// bound `W`, not `Self`. Once `Consumer::consume` is monomorphized
+	// (`Mem = heap`, `W = Counter`), MIR's abstract-dispatch lowering
+	// previously conflated "the impl block has no type params of its own"
+	// (true here — `impl Writer for Counter` isn't generic) with "the
+	// impl's copy of the method has no type params of its own" (false —
+	// `write` still has `Mem`), reusing `write`'s bare, never-lowered TIR id
+	// instead of monomorphizing it. That produced a `Call` referencing a
+	// function with no wasm index, panicking in codegen
+	// (`self.func_wasm_index[&id]`) rather than compiling cleanly — this
+	// test only needs to build without panicking, not actually run.
+	let _case = TestCase::new(indoc! {"
+        trait Writer {
+            fn write<Mem: Memory>(self: Mem::*Self, byte: u8);
+        }
+
+        struct Counter {
+            value: u8,
+        }
+
+        impl Writer for Counter {
+            fn write<Mem: Memory>(self: Mem::*Self, byte: u8) {
+                self.*.value = byte;
+            }
+        }
+
+        trait Consumer {
+            fn consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W);
+        }
+
+        impl Consumer for i32 {
+            fn consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W) {
+                w.write(1);
+            }
+        }
+
+        memory heap: Memory where { Size = u32 };
+
+        fn run() {
+            local value_ptr: heap::&i32 = ptr::null();
+            local counter_ptr: heap::*Counter = ptr::null_mut();
+            value_ptr.consume::<heap, Counter>(counter_ptr);
+        }
+
+        export {
+            heap as \"memory\",
+            run,
+        }
+    "});
+}
+
+#[test]
 fn test_tuple_roundtrip() {
 	// Execution test: swap(3, 7) must return (7, 3).
 	let case = TestCase::new(indoc! {"
@@ -3290,7 +3346,7 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
 fn test_match_enum_dispatch_runs_correctly() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor: u8 {
-            StdIn,
+            StdIn = 0,
             StdOut,
             StdErr,
         }

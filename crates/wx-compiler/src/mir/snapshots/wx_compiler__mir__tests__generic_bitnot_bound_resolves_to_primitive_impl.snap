@@ -8,59 +8,90 @@ functions:
     scopes:
       - kind: Block
         parent: ~
-        locals: []
-        result: U32
+        locals:
+          - ty: I32
+            mutability: Immutable
+        result: I32
     block:
       kind:
         Block:
           scope_index: 0
           expressions:
             - kind:
-                Int:
-                  value: 1
-              ty: U32
-      ty: U32
+                Call:
+                  callee:
+                    kind:
+                      Function:
+                        id: 404
+                    ty:
+                      Function:
+                        signature_index: 0
+                  arguments:
+                    - kind:
+                        LocalGet:
+                          scope_index: 0
+                          local_index: 0
+                      ty: I32
+              ty: I32
+      ty: I32
     static_data: []
   - id: 404
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
-        locals: []
-        result: U32
-    block:
-      kind:
-        Block:
-          scope_index: 0
-          expressions:
-            - kind:
-                Int:
-                  value: 4
-              ty: U32
-      ty: U32
-    static_data: []
-  - id: 405
-    signature_index: 0
-    scopes:
+        locals:
+          - ty: I32
+            mutability: Immutable
+          - ty: I32
+            mutability: Immutable
+        result: I32
       - kind: Block
-        parent: ~
+        parent: 0
         locals: []
-        result: U32
+        result: I32
     block:
       kind:
         Block:
           scope_index: 0
           expressions:
             - kind:
-                Int:
-                  value: 8
-              ty: U32
-      ty: U32
+                Block:
+                  scope_index: 1
+                  expressions:
+                    - kind:
+                        LocalSet:
+                          scope_index: 0
+                          local_index: 1
+                          value:
+                            kind:
+                              LocalGet:
+                                scope_index: 0
+                                local_index: 0
+                            ty: I32
+                      ty: Unit
+                    - kind:
+                        Block:
+                          scope_index: 0
+                          expressions:
+                            - kind:
+                                BitNot:
+                                  value:
+                                    kind:
+                                      LocalGet:
+                                        scope_index: 0
+                                        local_index: 1
+                                    ty: I32
+                              ty: I32
+                      ty: I32
+              ty: I32
+      ty: I32
     static_data: []
 signatures:
   - items:
-      - U32
-    params_count: 0
+      - I32
+      - I32
+    params_count: 1
   - items:
       - F32
       - F32
@@ -74,10 +105,6 @@ signatures:
       - I32
       - I32
     params_count: 2
-  - items:
-      - I32
-      - I32
-    params_count: 1
   - items:
       - U32
       - U32
@@ -165,19 +192,8 @@ exports:
   - Function:
       id: 403
       name: 203
-  - Function:
-      id: 404
-      name: 204
-  - Function:
-      id: 405
-      name: 205
 imports: []
-memories:
-  - id: 402
-    source: Internal
-    kind: Memory32
-    min_pages: ~
-    max_pages: ~
+memories: []
 aggregates: []
 static_entries: []
 start_function: ~

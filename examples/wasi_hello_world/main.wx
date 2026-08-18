@@ -4,7 +4,7 @@
 use std::*;
 
 enum FileDescriptor: u8 {
-  StdIn,
+  StdIn = 0,
   StdOut,
   StdErr,
 }

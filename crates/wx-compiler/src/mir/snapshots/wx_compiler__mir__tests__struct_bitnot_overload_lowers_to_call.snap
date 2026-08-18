@@ -3,64 +3,93 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 403
-    signature_index: 0
-    scopes:
-      - kind: Block
-        parent: ~
-        locals: []
-        result: U32
-    block:
-      kind:
-        Block:
-          scope_index: 0
-          expressions:
-            - kind:
-                Int:
-                  value: 1
-              ty: U32
-      ty: U32
-    static_data: []
-  - id: 404
-    signature_index: 0
-    scopes:
-      - kind: Block
-        parent: ~
-        locals: []
-        result: U32
-    block:
-      kind:
-        Block:
-          scope_index: 0
-          expressions:
-            - kind:
-                Int:
-                  value: 4
-              ty: U32
-      ty: U32
-    static_data: []
   - id: 405
     signature_index: 0
     scopes:
       - kind: Block
         parent: ~
-        locals: []
-        result: U32
+        locals:
+          - ty:
+              Aggregate:
+                aggregate_index: 0
+            mutability: Immutable
+        result:
+          Aggregate:
+            aggregate_index: 0
     block:
       kind:
         Block:
           scope_index: 0
           expressions:
             - kind:
-                Int:
-                  value: 8
-              ty: U32
-      ty: U32
+                Call:
+                  callee:
+                    kind:
+                      Function:
+                        id: 403
+                    ty:
+                      Function:
+                        signature_index: 0
+                  arguments:
+                    - kind:
+                        LocalGet:
+                          scope_index: 0
+                          local_index: 0
+                      ty:
+                        Aggregate:
+                          aggregate_index: 0
+              ty:
+                Aggregate:
+                  aggregate_index: 0
+      ty:
+        Aggregate:
+          aggregate_index: 0
+    static_data: []
+  - id: 403
+    signature_index: 0
+    scopes:
+      - kind: Block
+        parent: ~
+        locals:
+          - ty:
+              Aggregate:
+                aggregate_index: 0
+            mutability: Immutable
+        result:
+          Aggregate:
+            aggregate_index: 0
+    block:
+      kind:
+        Block:
+          scope_index: 0
+          expressions:
+            - kind:
+                Aggregate:
+                  values:
+                    - kind:
+                        BitNot:
+                          value:
+                            kind:
+                              AggregateGet:
+                                scope_index: 0
+                                local_index: 0
+                                value_index: 0
+                            ty: I32
+                      ty: I32
+              ty:
+                Aggregate:
+                  aggregate_index: 0
+      ty:
+        Aggregate:
+          aggregate_index: 0
     static_data: []
 signatures:
   - items:
-      - U32
-    params_count: 0
+      - Aggregate:
+          aggregate_index: 0
+      - Aggregate:
+          aggregate_index: 0
+    params_count: 1
   - items:
       - F32
       - F32
@@ -163,21 +192,19 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 403
-      name: 203
-  - Function:
-      id: 404
-      name: 204
-  - Function:
       id: 405
-      name: 205
+      name: 204
 imports: []
-memories:
-  - id: 402
-    source: Internal
-    kind: Memory32
-    min_pages: ~
-    max_pages: ~
-aggregates: []
+memories: []
+aggregates:
+  - values:
+      - I32
+    offsets:
+      - 0
+    layout:
+      size: 4
+      align: 4
+    decl_to_phys:
+      - 0
 static_entries: []
 start_function: ~

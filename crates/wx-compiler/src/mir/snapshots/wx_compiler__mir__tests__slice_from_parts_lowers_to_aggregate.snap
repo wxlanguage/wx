@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 275
+  - id: 403
     signature_index: 0
     scopes:
       - kind: Block
@@ -11,7 +11,7 @@ functions:
         locals:
           - ty:
               Pointer:
-                memory: 274
+                memory: 402
                 kind: Memory32
             mutability: Immutable
           - ty: U32
@@ -33,7 +33,7 @@ functions:
                           local_index: 0
                       ty:
                         Pointer:
-                          memory: 274
+                          memory: 402
                           kind: Memory32
                     - kind:
                         LocalGet:
@@ -50,7 +50,7 @@ functions:
 signatures:
   - items:
       - Pointer:
-          memory: 274
+          memory: 402
           kind: Memory32
       - U32
       - Aggregate:
@@ -79,6 +79,10 @@ signatures:
       - U32
     params_count: 2
   - items:
+      - U32
+      - U32
+    params_count: 1
+  - items:
       - I64
       - I64
       - I64
@@ -92,6 +96,10 @@ signatures:
       - U64
       - U64
     params_count: 2
+  - items:
+      - U64
+      - U64
+    params_count: 1
   - items:
       - F32
       - F32
@@ -117,6 +125,10 @@ signatures:
       - U8
     params_count: 2
   - items:
+      - U8
+      - U8
+    params_count: 1
+  - items:
       - I16
       - I16
       - I16
@@ -129,23 +141,28 @@ signatures:
       - U16
       - U16
       - U16
+    params_count: 2
+  - items:
+      - U16
+      - U16
+    params_count: 1
+  - items:
+      - Bool
+      - Bool
+      - Bool
     params_count: 2
   - items:
       - U32
       - Bool
     params_count: 1
-  - items:
-      - U32
-      - U32
-    params_count: 1
 globals: []
 exports:
   - Function:
-      id: 275
-      name: 171
+      id: 403
+      name: 203
 imports: []
 memories:
-  - id: 274
+  - id: 402
     source: Internal
     kind: Memory32
     min_pages: ~
@@ -153,7 +170,7 @@ memories:
 aggregates:
   - values:
       - Pointer:
-          memory: 274
+          memory: 402
           kind: Memory32
       - U32
     offsets:

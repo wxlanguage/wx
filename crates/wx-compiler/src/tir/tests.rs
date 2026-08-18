@@ -679,8 +679,10 @@ fn test_coerce_int_overflow_i32() {
 #[test]
 fn test_coerce_int_negative_for_u32() {
 	let case = TestCase::new("fn f() -> u32 { -1 } export { f }");
-	// `-1` is `Unary { InvertSign, Int(1) }` — coerce_untyped_unary_expr only
-	// allows InvertSign for i32/i64, so u32 produces E1005 (UnableToCoerce).
+	// `-1` is `Unary { InvertSign, Int(1) }` — coerce_untyped_unary_expr
+	// allows InvertSign for any signed numeric target (i8/i16/i32/i64/
+	// f32/f64) but deliberately excludes unsigned targets, so u32
+	// produces E1005 (UnableToCoerce).
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UnableToCoerce),
 		"expected E1005 (UnableToCoerce) for negated literal coerced to u32, got: {:?}",
@@ -689,6 +691,134 @@ fn test_coerce_int_negative_for_u32() {
 			.iter()
 			.map(|d| &d.message)
 			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_coerce_negated_literal_to_every_signed_width_and_float() {
+	// Regression test: `coerce_untyped_unary_expr`'s target-type allowlist
+	// used to only accept i32/i64 for `InvertSign`, rejecting `-1`/`-1.5`
+	// coerced to any other signed numeric type.
+	let case = TestCase::new(indoc! {"
+        fn a() -> i8 { -1 }
+        fn b() -> i16 { -1 }
+        fn c() -> i32 { -1 }
+        fn d() -> i64 { -1 }
+        fn e() -> f32 { -1.5 }
+        fn f() -> f64 { -1.5 }
+        export { a, b, c, d, e, f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_coerce_min_value_literal_for_every_signed_width() {
+	// Regression test: two's-complement's negative range holds one more
+	// magnitude than its positive range (`i8::MIN` is `-128` but `i8::MAX`
+	// is only `127`) — `coerce_untyped_unary_expr` used to range-check the
+	// un-negated magnitude against the ordinary positive-max bound,
+	// wrongly rejecting exactly the most-negative value of each width.
+	let case = TestCase::new(indoc! {"
+        fn a() -> i8 { -128 }
+        fn b() -> i16 { -32768 }
+        fn c() -> i32 { -2147483648 }
+        fn d() -> i64 { -9223372036854775808 }
+        export { a, b, c, d }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_coerce_one_past_min_value_literal_still_out_of_range() {
+	let case = TestCase::new("fn f() -> i8 { -129 } export { f }");
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::IntegerLiteralOutOfRange),
+		"expected E1004 (out of range) for `-129i8` (one past `i8::MIN`), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_coerce_u64_max_literal_succeeds() {
+	// Regression test: `parse_integer_literal` used to parse straight into
+	// `i64`, so any literal magnitude beyond `i64::MAX` (including
+	// `u64::MAX` itself, a purely positive literal with no negation
+	// involved) failed to parse at all.
+	let case =
+		TestCase::new("fn f() -> u64 { 18446744073709551615 } export { f }");
+	no_errors(&case);
+}
+
+#[test]
+fn test_eval_const_expr_double_negated_i64_min_does_not_panic() {
+	// `-(-9223372036854775808)` — the inner negation must fold via
+	// `wrapping_neg` (not a bare `-`, which would panic on `i64::MIN`).
+	let case = TestCase::new(
+		"const X: i64 = -(-9223372036854775808); fn f() -> i64 { X } export { f }",
+	);
+	no_errors(&case);
+}
+
+#[test]
+fn test_eval_const_expr_u64_div_uses_unsigned_semantics() {
+	// Regression test: `eval_const_expr`'s `Div`/`Rem` folding used to
+	// operate on the bit-reinterpreted `i64` unconditionally — correct
+	// for `Add`/`Sub`/`Mul` (representation-agnostic in two's complement)
+	// but wrong for division, where signed vs. unsigned interpretation of
+	// the same bits genuinely differ once a `u64` magnitude exceeds
+	// `i64::MAX`. `u64::MAX` bit-casts to `-1i64`, and `-1i64 / 2 == 0`
+	// under signed division — but the correct unsigned answer is
+	// `9223372036854775807`.
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: u64 = 18446744073709551615 / 2;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.constants[const_index as usize].const_value,
+		Some(ConstValue::Int(9223372036854775807))
+	);
+}
+
+#[test]
+fn test_eval_const_expr_u64_rem_uses_unsigned_semantics() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: u64 = 18446744073709551615 % 100;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.constants[const_index as usize].const_value,
+		Some(ConstValue::Int(15))
+	);
+}
+
+#[test]
+fn test_eval_const_expr_signed_div_unaffected_by_unsigned_fix() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: i64 = -10 / 3;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.constants[const_index as usize].const_value,
+		Some(ConstValue::Int(-3))
 	);
 }
 
@@ -2927,6 +3057,42 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 		 `TraitImpl` — not to inherit type params (trait impls have none yet), \
 		 but so `Self` inside the body can be traced back to its container"
 	);
+}
+
+/// Regression test: a method declared with its own generic type param
+/// (`fn write<Mem: Memory>(...)`, distinct from any impl-level type param)
+/// previously failed to resolve that param when the method lived inside a
+/// `impl Trait for Type { .. }` block — `AstNodeRef::TraitImplFunction`
+/// hardcoded the new `Function`'s own `type_params` to empty and skipped
+/// `resolve_type_param_bounds` entirely, unlike the exactly analogous
+/// `InherentImplFunction`/`TraitFunction` arms, which both do this
+/// correctly. The same signature written directly on the trait (`Hasher`'s
+/// own `write`) never had this bug — only the impl providing it did.
+#[test]
+fn test_trait_impl_method_with_own_generic_type_param_resolves() {
+	let case = TestCase::new(indoc! {"
+        trait Hasher {
+            fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
+        }
+
+        struct DefaultHasher {
+            value: u64,
+        }
+
+        impl Hasher for DefaultHasher {
+            fn write<Mem: Memory>(self: Mem::&Self, bytes: Mem::&[u8]) {
+                unreachable
+            }
+        }
+    "});
+	let errors: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.map(|d| &d.message)
+		.collect();
+	assert!(errors.is_empty(), "{:?}", errors);
 }
 
 #[test]
@@ -6776,10 +6942,13 @@ fn test_enum_variants_are_populated() {
 }
 
 #[test]
-fn test_enum_all_implicit_variants() {
+fn test_enum_variants_after_anchor_auto_increment() {
+	// Only the first variant needs an explicit value — every variant
+	// after it (`East`/`South`/`West`) may still omit one, auto-
+	// incrementing from `North`'s explicit `0`.
 	let case = TestCase::new(indoc! {"
         enum Direction: u32 {
-            North,
+            North = 0,
             East,
             South,
             West,
@@ -6919,7 +7088,7 @@ fn test_enum_missing_repr_with_explicit_values_reports_once() {
 fn test_enum_duplicate_variant_is_error() {
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
-            Red,
+            Red = 0,
             Red,
         }
     "});
@@ -7009,7 +7178,15 @@ fn test_enum_negation_folds_for_signed_repr() {
 }
 
 #[test]
-fn test_enum_duplicate_value_is_error() {
+fn test_enum_implicit_first_variant_no_longer_collides_silently() {
+	// This used to be `test_enum_duplicate_value_is_error`: `A` (implicit)
+	// silently got the auto-incremented `0`, colliding with `B = 0` —
+	// exactly the motivating bug for requiring an explicit anchor
+	// (`examples/compare/main.wx`'s real `Ordering` enum hit this exact
+	// shape). Under the new rule `A` is rejected outright before any
+	// collision has a chance to happen; `EnumDuplicateValue` itself still
+	// has coverage via `test_enum_duplicate_value_groups_all_colliding_variants`
+	// (fully-explicit variants can still collide with each other).
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
             A,
@@ -7018,8 +7195,135 @@ fn test_enum_duplicate_value_is_error() {
         export {}
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::EnumDuplicateValue),
-		"expected E1056 (EnumDuplicateValue) for auto-value colliding with explicit value, got: {:?}",
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::EnumVariantRequiresExplicitValue
+		),
+		"expected E1071 (EnumVariantRequiresExplicitValue) for implicit `A` with nothing to anchor to, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_enum_first_variant_requires_explicit_value() {
+	let case = TestCase::new(indoc! {"
+        enum E: i32 {
+            A,
+            B,
+        }
+        export {}
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::EnumVariantRequiresExplicitValue
+		),
+		"expected E1071 (EnumVariantRequiresExplicitValue) for `A`, the \
+		 first variant, with no explicit value, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_enum_anchored_by_non_adjacent_earlier_variant_is_ok() {
+	// `C` is implicit and isn't immediately preceded by an explicit value
+	// (`B` is also implicit) — it's anchored transitively by `A`, above
+	// both. Auto-increment still counts from `B` (`5`), not from `A`
+	// (`0`) — only the *requirement* that an anchor exists looks
+	// backward arbitrarily far; the numeric continuation is still always
+	// "previous variant's value + 1".
+	let case = TestCase::new(indoc! {"
+        enum E: i32 {
+            A = 0,
+            B = 5,
+            C,
+        }
+        export {}
+    "});
+	no_errors(&case);
+	let enum_ = case
+		.tir
+		.enums
+		.iter()
+		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("E"))
+		.expect("E enum not found");
+	assert_eq!(enum_.variants[2].const_value, Some(ConstValue::Int(6)));
+}
+
+#[test]
+fn test_enum_variant_with_broken_value_does_not_anchor_later_variants() {
+	// A variant with a syntactically-present but unresolvable `=` value
+	// does not establish a numeric baseline (there is none to give) —
+	// `B` correctly still reports "requires an explicit value" on top of
+	// whatever error `A`'s own broken expression produced. This is a
+	// straightforward consequence of representing the auto-increment
+	// cursor as a single `Option<i64>` (`build_enum`'s `next_auto_value`)
+	// rather than tracking "has an anchor" and "next numeric value"
+	// separately.
+	let case = TestCase::new(indoc! {"
+        enum E: i32 {
+            A = some_undefined_const,
+            B,
+        }
+        export {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"expected E1007 (UndeclaredIdentifier) for `A`'s broken value, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::EnumVariantRequiresExplicitValue
+		),
+		"expected E1071 (EnumVariantRequiresExplicitValue) for `B` too, \
+		 since `A`'s value never resolved to a usable baseline, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_enum_missing_value_does_not_cascade_when_repr_missing() {
+	let case = TestCase::new(indoc! {"
+        enum E {
+            A,
+            B,
+        }
+        export {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MissingEnumRepr),
+		"expected E1036 (MissingEnumRepr), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+	assert!(
+		!has_error_code(
+			&case.tir,
+			DiagnosticCode::EnumVariantRequiresExplicitValue
+		),
+		"E1071 (EnumVariantRequiresExplicitValue) must not cascade on top \
+		 of an already-broken repr type, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -7179,7 +7483,7 @@ fn test_const_not_const_evaluatable_value_is_error() {
 fn test_enum_unused_is_warned() {
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
-            Red,
+            Red = 0,
             Green,
         }
         export {}
@@ -7257,7 +7561,7 @@ fn test_private_const_in_inherent_impl_is_warned_unused() {
 fn test_pub_enum_no_unused_warn() {
 	let case = TestCase::new(indoc! {"
         pub enum Color: i32 {
-            Red,
+            Red = 0,
             Green,
         }
         export {}
@@ -7276,7 +7580,7 @@ fn test_enum_variant_unused_is_warned() {
 	// but `Green` is never referenced through `Color::Green`.
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
-            Red,
+            Red = 0,
             Green,
         }
         fn get_red() -> Color {
@@ -7307,7 +7611,7 @@ fn test_enum_variant_unused_is_warned() {
 fn test_enum_all_variants_used_no_warn() {
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
-            Red,
+            Red = 0,
             Green,
         }
         fn both(c: Color) -> bool {
@@ -7331,7 +7635,7 @@ fn test_enum_all_variants_used_no_warn() {
 fn test_enum_two_unused_variants_grouped_without_oxford_comma() {
 	let case = TestCase::new(indoc! {"
         enum Direction: i32 {
-            Right,
+            Right = 0,
             Down,
             Left,
         }
@@ -7357,7 +7661,7 @@ fn test_enum_two_unused_variants_grouped_without_oxford_comma() {
 fn test_enum_five_unused_variants_grouped_with_oxford_comma() {
 	let case = TestCase::new(indoc! {"
         enum Direction: i32 {
-            Right,
+            Right = 0,
             Down,
             Left,
             Up,
@@ -7387,7 +7691,7 @@ fn test_enum_five_unused_variants_grouped_with_oxford_comma() {
 fn test_enum_six_unused_variants_collapses_to_generic_message() {
 	let case = TestCase::new(indoc! {"
         enum Direction: i32 {
-            Right,
+            Right = 0,
             Down,
             Left,
             Up,
@@ -9523,8 +9827,8 @@ fn test_duplicate_enum_definition_is_error() {
 	// branch reporting a diagnostic at all — two same-named enums were
 	// silently accepted with the second one just dropped.
 	let case = TestCase::new(indoc! {"
-        enum Foo: i32 { A }
-        enum Foo: i32 { B }
+        enum Foo: i32 { A = 0 }
+        enum Foo: i32 { B = 0 }
         export { }
     "});
 	assert!(
@@ -10652,7 +10956,7 @@ fn test_match_int_exhaustive_with_wildcard() {
 fn test_match_enum_all_variants_covered_no_wildcard_ok() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor: u8 {
-            StdIn,
+            StdIn = 0,
             StdOut,
             StdErr,
         }
@@ -10680,7 +10984,7 @@ fn test_match_enum_all_variants_covered_no_wildcard_ok() {
 fn test_match_enum_missing_variant_is_error() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor: u8 {
-            StdIn,
+            StdIn = 0,
             StdOut,
             StdErr,
         }
@@ -10776,7 +11080,7 @@ fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
 fn test_match_enum_variant_marks_variant_used() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor: u8 {
-            StdIn,
+            StdIn = 0,
             StdOut,
             StdErr,
         }
@@ -11061,4 +11365,215 @@ fn test_struct_compound_assignment_dispatches_to_add_method() {
         }
     "});
 	no_errors(&case);
+}
+
+// ── struct bitwise operator-trait impls
+// ──────────────────────────────────────
+//
+// `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr` dispatch through the same
+// `OperatorTraits`/`build_operator_dispatch` machinery as arithmetic once a
+// struct is involved (`build_bitwise_result`, `tir/builder.rs`) — primitives
+// keep the pre-existing native fast path (see `is_integer()`/`== BOOL`
+// checks there), so these tests only need to cover the struct side; the
+// primitive side is unchanged and already covered by every existing
+// bitwise-on-primitive test.
+
+#[test]
+fn test_struct_impl_bitand_dispatches() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        pub fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_bitand_impl_reports_diagnostic() {
+	// Same type on both sides but no `BitAnd` impl — before
+	// `build_bitwise_result` existed this fell through to the generic
+	// "type mismatch" catch-all (misleading, since the types *do* match);
+	// it must now report the accurate "operator cannot be applied" code,
+	// exactly like the arithmetic path already does.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        pub fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Flags & Flags` \
+		 with no `BitAnd` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_struct_bitand_impl_does_not_grant_other_bitwise_operators() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        pub fn or_flags(a: Flags, b: Flags) -> Flags {
+            a | b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Flags | Flags` \
+		 when only `BitAnd` (not `BitOr`) is implemented, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_bitand_bound_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn and_it<T: BitAnd>(a: T, b: T) -> T {
+            a & b
+        }
+
+        pub fn use_and(a: i32, b: i32) -> i32 {
+            and_it(a, b)
+        }
+    "});
+	no_errors(&case);
+}
+
+// ── struct `BitNot` overload (unary `^`) ────────────────────────────────────
+//
+// `^x` reuses the same dispatch machinery as `-x` (`Neg`) —
+// `build_unary_operator_dispatch`, generalized via `OperatorTraits::
+// for_unary_op` — gated the same way the binary bitwise operators are:
+// primitives/typeset-bounded types keep the pre-existing native fast path
+// (`build_unary_expression`'s `is_primitive()` check, unchanged), only a
+// struct falls through to real dispatch.
+
+#[test]
+fn test_struct_impl_bitnot_dispatches() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        pub fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_bitnot_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        pub fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UnaryOperatorCannotBeApplied),
+		"expected E1010 (UnaryOperatorCannotBeApplied) for `^Flags` with \
+		 no `BitNot` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_struct_bitnot_impl_does_not_grant_neg() {
+	// Implementing `BitNot` for a struct must not make `Neg` resolve too
+	// — each unary operator dispatches through its own trait
+	// independently (`OperatorTraits::for_unary_op`), no "implements one,
+	// gets all" fallback, mirroring the binary operators' equivalent test.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        pub fn neg_flags(a: Flags) -> Flags {
+            -a
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UnaryOperatorCannotBeApplied),
+		"expected E1010 (UnaryOperatorCannotBeApplied) for `-Flags` when \
+		 only `BitNot` (not `Neg`) is implemented, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_bitnot_bound_dispatches() {
+	// `build_unary_operator_dispatch` now has a `Type::TypeParam` branch
+	// mirroring the binary `build_operator_dispatch` — a bare type param
+	// bounded by `BitNot` dispatches through `resolve_bounded_operator_method`
+	// instead of failing with "operator cannot be applied".
+	let case = TestCase::new(indoc! {"
+        pub fn not_it<T: BitNot>(a: T) -> T {
+            ^a
+        }
+
+        pub fn use_not(a: i32) -> i32 {
+            not_it(a)
+        }
+    "});
+	assert!(
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.severity == Severity::Error),
+		"{:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
 }

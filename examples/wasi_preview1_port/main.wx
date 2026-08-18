@@ -476,13 +476,7 @@ import "wasi_snapshot_preview1" as wasi {
   fn fd_prestat_dir_name(fd: Fd, path: *u8, path_len: u32) -> Errno;
   fn fd_pwrite(fd: Fd, iovs: &[&[u8]], offset: u64, nwritten: *u32) -> Errno;
   fn fd_read(fd: Fd, iovs: &[*[u8]], nread: *u32) -> Errno;
-  fn fd_readdir(
-    fd: Fd,
-    buf: *u8,
-    buf_len: u32,
-    cookie: u64,
-    bufused: *u32,
-  ) -> Errno;
+  fn fd_readdir(fd: Fd, buf: *u8, buf_len: u32, cookie: u64, bufused: *u32) -> Errno;
   fn fd_renumber(fd: Fd, to: Fd) -> Errno;
   fn fd_seek(fd: Fd, offset: i64, whence: Whence, newoffset: *u64) -> Errno;
   fn fd_sync(fd: Fd) -> Errno;
@@ -515,13 +509,7 @@ import "wasi_snapshot_preview1" as wasi {
     fdflags: u16,
     opened_fd: *u32,
   ) -> Errno;
-  fn path_readlink(
-    fd: Fd,
-    path: &[u8],
-    buf: *u8,
-    buf_len: u32,
-    bufused: *u32,
-  ) -> Errno;
+  fn path_readlink(fd: Fd, path: &[u8], buf: *u8, buf_len: u32, bufused: *u32) -> Errno;
   fn path_remove_directory(fd: Fd, path: &[u8]) -> Errno;
   fn path_rename(fd: Fd, old_path: &[u8], new_fd: Fd, new_path: &[u8]) -> Errno;
   fn path_symlink(old_path: &[u8], fd: Fd, new_path: &[u8]) -> Errno;

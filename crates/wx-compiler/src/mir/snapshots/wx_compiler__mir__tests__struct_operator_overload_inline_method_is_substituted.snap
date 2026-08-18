@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 277
+  - id: 405
     signature_index: 0
     scopes:
       - kind: Block
@@ -235,6 +235,10 @@ signatures:
       - U32
     params_count: 2
   - items:
+      - U32
+      - U32
+    params_count: 1
+  - items:
       - I64
       - I64
       - I64
@@ -248,6 +252,10 @@ signatures:
       - U64
       - U64
     params_count: 2
+  - items:
+      - U64
+      - U64
+    params_count: 1
   - items:
       - F32
       - F32
@@ -273,6 +281,10 @@ signatures:
       - U8
     params_count: 2
   - items:
+      - U8
+      - U8
+    params_count: 1
+  - items:
       - I16
       - I16
       - I16
@@ -285,20 +297,25 @@ signatures:
       - U16
       - U16
       - U16
+    params_count: 2
+  - items:
+      - U16
+      - U16
+    params_count: 1
+  - items:
+      - Bool
+      - Bool
+      - Bool
     params_count: 2
   - items:
       - U32
       - Bool
     params_count: 1
-  - items:
-      - U32
-      - U32
-    params_count: 1
 globals: []
 exports:
   - Function:
-      id: 277
-      name: 173
+      id: 405
+      name: 205
 imports: []
 memories: []
 aggregates:

@@ -67,6 +67,36 @@ pub trait Neg {
     fn neg(self: Self) -> Self;
 }
 
+#[tag = "bitand"]
+pub trait BitAnd {
+    fn bitand(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "bitor"]
+pub trait BitOr {
+    fn bitor(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "bitxor"]
+pub trait BitXor {
+    fn bitxor(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "shl"]
+pub trait Shl {
+    fn shl(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "shr"]
+pub trait Shr {
+    fn shr(self: Self, rhs: Self) -> Self;
+}
+
+#[tag = "bitnot"]
+pub trait BitNot {
+    fn bitnot(self: Self) -> Self;
+}
+
 pub const PAGE_SIZE: u32 = 65536;
 
 #[intrinsic]
@@ -218,6 +248,48 @@ pub fn i64_rem(a: i64, b: i64) -> i64;
 pub fn u64_rem(a: u64, b: u64) -> u64;
 
 #[intrinsic]
+pub fn i32_bitand(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_bitand(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn i32_bitor(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_bitor(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn i32_bitxor(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_bitxor(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn i32_shl(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_shl(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn i32_shr(a: i32, b: i32) -> i32;
+
+#[intrinsic]
+pub fn u32_shr(a: u32, b: u32) -> u32;
+
+#[intrinsic]
+pub fn i64_shr(a: i64, b: i64) -> i64;
+
+#[intrinsic]
+pub fn u64_shr(a: u64, b: u64) -> u64;
+
+#[intrinsic]
+pub fn i32_bitnot(value: i32) -> i32;
+
+#[intrinsic]
+pub fn i64_bitnot(value: i64) -> i64;
+
+#[intrinsic]
 pub fn f32_convert_i32(value: i32) -> f32;
 
 #[intrinsic]
@@ -315,6 +387,36 @@ impl Neg for i32 {
     fn neg(self: Self) -> Self { i32_neg(self) }
 }
 
+impl BitAnd for i32 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self { i32_bitand(self, rhs) }
+}
+
+impl BitOr for i32 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self { i32_bitor(self, rhs) }
+}
+
+impl BitXor for i32 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self { i32_bitxor(self, rhs) }
+}
+
+impl Shl for i32 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self { i32_shl(self, rhs) }
+}
+
+impl Shr for i32 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self { i32_shr(self, rhs) }
+}
+
+impl BitNot for i32 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i32_bitnot(self) }
+}
+
 impl Add for u32 {
     #[inline]
     fn add(self: Self, rhs: Self) -> Self {
@@ -344,6 +446,46 @@ impl Div for u32 {
 impl Rem for u32 {
     #[inline]
     fn rem(self: Self, rhs: Self) -> Self { u32_rem(self, rhs) }
+}
+
+impl BitAnd for u32 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as u32
+    }
+}
+
+impl BitOr for u32 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as u32
+    }
+}
+
+impl BitXor for u32 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as u32
+    }
+}
+
+impl Shl for u32 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self as i32, rhs as i32) as u32
+    }
+}
+
+impl Shr for u32 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self { u32_shr(self, rhs) }
+}
+
+impl BitNot for u32 {
+    #[inline]
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self as i32) as u32
+    }
 }
 
 impl Add for i64 {
@@ -376,6 +518,36 @@ impl Neg for i64 {
     fn neg(self: Self) -> Self { i64_neg(self) }
 }
 
+impl BitAnd for i64 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self { i64_bitand(self, rhs) }
+}
+
+impl BitOr for i64 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self { i64_bitor(self, rhs) }
+}
+
+impl BitXor for i64 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self { i64_bitxor(self, rhs) }
+}
+
+impl Shl for i64 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self { i64_shl(self, rhs) }
+}
+
+impl Shr for i64 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self { i64_shr(self, rhs) }
+}
+
+impl BitNot for i64 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i64_bitnot(self) }
+}
+
 impl Add for u64 {
     #[inline]
     fn add(self: Self, rhs: Self) -> Self {
@@ -405,6 +577,46 @@ impl Div for u64 {
 impl Rem for u64 {
     #[inline]
     fn rem(self: Self, rhs: Self) -> Self { u64_rem(self, rhs) }
+}
+
+impl BitAnd for u64 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i64_bitand(self as i64, rhs as i64) as u64
+    }
+}
+
+impl BitOr for u64 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i64_bitor(self as i64, rhs as i64) as u64
+    }
+}
+
+impl BitXor for u64 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i64_bitxor(self as i64, rhs as i64) as u64
+    }
+}
+
+impl Shl for u64 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i64_shl(self as i64, rhs as i64) as u64
+    }
+}
+
+impl Shr for u64 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self { u64_shr(self, rhs) }
+}
+
+impl BitNot for u64 {
+    #[inline]
+    fn bitnot(self: Self) -> Self {
+        i64_bitnot(self as i64) as u64
+    }
 }
 
 impl Add for f32 {
@@ -515,6 +727,46 @@ impl Neg for i8 {
     fn neg(self: Self) -> Self { i32_neg(self as i32) as i8 }
 }
 
+impl BitAnd for i8 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as i8
+    }
+}
+
+impl BitOr for i8 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as i8
+    }
+}
+
+impl BitXor for i8 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Shl for i8 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self as i32, rhs as i32) as i8
+    }
+}
+
+impl Shr for i8 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self {
+        i32_shr(self as i32, rhs as i32) as i8
+    }
+}
+
+impl BitNot for i8 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as i8 }
+}
+
 impl Add for u8 {
     #[inline]
     fn add(self: Self, rhs: Self) -> Self {
@@ -548,6 +800,46 @@ impl Rem for u8 {
     fn rem(self: Self, rhs: Self) -> Self {
         u32_rem(self as u32, rhs as u32) as u8
     }
+}
+
+impl BitAnd for u8 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as u8
+    }
+}
+
+impl BitOr for u8 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as u8
+    }
+}
+
+impl BitXor for u8 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as u8
+    }
+}
+
+impl Shl for u8 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self as i32, rhs as i32) as u8
+    }
+}
+
+impl Shr for u8 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self {
+        u32_shr(self as u32, rhs as u32) as u8
+    }
+}
+
+impl BitNot for u8 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as u8 }
 }
 
 impl Add for i16 {
@@ -590,6 +882,46 @@ impl Neg for i16 {
     fn neg(self: Self) -> Self { i32_neg(self as i32) as i16 }
 }
 
+impl BitAnd for i16 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as i16
+    }
+}
+
+impl BitOr for i16 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as i16
+    }
+}
+
+impl BitXor for i16 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Shl for i16 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self as i32, rhs as i32) as i16
+    }
+}
+
+impl Shr for i16 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self {
+        i32_shr(self as i32, rhs as i32) as i16
+    }
+}
+
+impl BitNot for i16 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as i16 }
+}
+
 impl Add for u16 {
     #[inline]
     fn add(self: Self, rhs: Self) -> Self {
@@ -622,6 +954,67 @@ impl Rem for u16 {
     #[inline]
     fn rem(self: Self, rhs: Self) -> Self {
         u32_rem(self as u32, rhs as u32) as u16
+    }
+}
+
+impl BitAnd for u16 {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as u16
+    }
+}
+
+impl BitOr for u16 {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as u16
+    }
+}
+
+impl BitXor for u16 {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as u16
+    }
+}
+
+impl Shl for u16 {
+    #[inline]
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self as i32, rhs as i32) as u16
+    }
+}
+
+impl Shr for u16 {
+    #[inline]
+    fn shr(self: Self, rhs: Self) -> Self {
+        u32_shr(self as u32, rhs as u32) as u16
+    }
+}
+
+impl BitNot for u16 {
+    #[inline]
+    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as u16 }
+}
+
+impl BitAnd for bool {
+    #[inline]
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self as i32, rhs as i32) as bool
+    }
+}
+
+impl BitOr for bool {
+    #[inline]
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self as i32, rhs as i32) as bool
+    }
+}
+
+impl BitXor for bool {
+    #[inline]
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self as i32, rhs as i32) as bool
     }
 }
 

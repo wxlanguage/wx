@@ -861,59 +861,6 @@ impl BinaryOp {
 			BinaryOp::RightShift => ">>",
 		}
 	}
-
-	pub fn is_assignment(&self) -> bool {
-		match self {
-			BinaryOp::Assign
-			| BinaryOp::AddAssign
-			| BinaryOp::SubAssign
-			| BinaryOp::MulAssign
-			| BinaryOp::DivAssign
-			| BinaryOp::RemAssign => true,
-			_ => false,
-		}
-	}
-
-	pub fn is_comparison(&self) -> bool {
-		match self {
-			BinaryOp::Eq
-			| BinaryOp::NotEq
-			| BinaryOp::Less
-			| BinaryOp::LessEq
-			| BinaryOp::Greater
-			| BinaryOp::GreaterEq => true,
-			_ => false,
-		}
-	}
-
-	pub fn is_logical(&self) -> bool {
-		match self {
-			BinaryOp::And | BinaryOp::Or => true,
-			_ => false,
-		}
-	}
-
-	pub fn is_arithmetic(&self) -> bool {
-		match self {
-			BinaryOp::Add
-			| BinaryOp::Sub
-			| BinaryOp::Mul
-			| BinaryOp::Div
-			| BinaryOp::Rem => true,
-			_ => false,
-		}
-	}
-
-	pub fn is_bitwise(&self) -> bool {
-		match self {
-			BinaryOp::BitAnd
-			| BinaryOp::BitOr
-			| BinaryOp::BitXor
-			| BinaryOp::LeftShift
-			| BinaryOp::RightShift => true,
-			_ => false,
-		}
-	}
 }
 
 impl std::fmt::Display for BinaryOp {
@@ -1026,9 +973,14 @@ pub struct Separated<T> {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum Expression {
 	Error,
-	/// `1`
+	/// `1`. Always the raw, non-negative magnitude as written — `-1` is a
+	/// separate `Unary { InvertSign, .. }` node wrapping this, never folded
+	/// in here. Stored as `u64` (not `i64`) so the full range a literal can
+	/// validly denote — up to `u64::MAX` directly, or up to `i64::MIN`'s
+	/// magnitude when negated — is representable before a concrete target
+	/// type decides the final signed/unsigned interpretation.
 	Int {
-		value: i64,
+		value: u64,
 	},
 	/// `1.0`
 	Float {
@@ -3764,18 +3716,18 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_int_expression(
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
-		fn parse_integer_literal(s: &str) -> Option<i64> {
+		fn parse_integer_literal(s: &str) -> Option<u64> {
 			let s = s.replace('_', "");
 			if let Some(rest) =
 				s.strip_prefix("0b").or_else(|| s.strip_prefix("0B"))
 			{
-				i64::from_str_radix(rest, 2).ok()
+				u64::from_str_radix(rest, 2).ok()
 			} else if let Some(rest) =
 				s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
 			{
-				i64::from_str_radix(rest, 16).ok()
+				u64::from_str_radix(rest, 16).ok()
 			} else {
-				s.parse::<i64>().ok()
+				s.parse::<u64>().ok()
 			}
 		}
 		let token = parser.lexer.next();
