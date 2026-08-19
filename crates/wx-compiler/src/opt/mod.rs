@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 pub mod builder;
 mod liveness;
+#[cfg(debug_assertions)]
+mod local_dominance;
 pub mod scheduler;
 
 #[cfg(test)]
