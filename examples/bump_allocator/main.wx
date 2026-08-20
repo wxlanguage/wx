@@ -28,9 +28,9 @@ pub fn alloc<T>() -> heap::*T {
     local align = align_of::<T, heap>();
     local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size_of::<T, heap>();
-    local cur_end = heap.size() * PAGE_SIZE;
+    local cur_end = heap.size_bytes();
     if new_end > cur_end {
-        local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         local _grew = heap.grow(needed);
     }
     bump = new_end as heap::*u8;

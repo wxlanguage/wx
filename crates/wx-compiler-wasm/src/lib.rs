@@ -71,12 +71,12 @@ pub fn compile(
 		serde_wasm_bindgen::from_value(files.into())
 			.map_err(|err| err.to_string())?;
 
-	let mut builder = vfs::CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
+	let mut builder = vfs::CompilationUnitBuilder::new();
+	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(entry_path, &vfs::VirtualFileSource::new(files))
 		.map_err(|_| "entry file not found among `files`".to_string())?;
-	let mut compilation = builder.build(root_id, stdlib_id);
+	let mut compilation = builder.build(root_id);
 
 	let ast_diagnostics: Vec<_> = compilation
 		.crates

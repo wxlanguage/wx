@@ -177,6 +177,9 @@ fn mark_node_inputs_live(
 		| DataNodeKind::DivU { left, right, .. }
 		| DataNodeKind::RemS { left, right, .. }
 		| DataNodeKind::RemU { left, right, .. }
+		| DataNodeKind::Min { left, right, .. }
+		| DataNodeKind::Max { left, right, .. }
+		| DataNodeKind::Copysign { left, right, .. }
 		| DataNodeKind::BitAnd { left, right, .. }
 		| DataNodeKind::BitOr { left, right, .. }
 		| DataNodeKind::BitXor { left, right, .. }
@@ -203,6 +206,7 @@ fn mark_node_inputs_live(
 		| DataNodeKind::Floor { operand, .. }
 		| DataNodeKind::Ceil { operand, .. }
 		| DataNodeKind::Trunc { operand, .. }
+		| DataNodeKind::Nearest { operand, .. }
 		| DataNodeKind::BitNot { operand, .. }
 		| DataNodeKind::Eqz { operand }
 		| DataNodeKind::I64ExtendI32S { operand }
@@ -226,6 +230,10 @@ fn mark_node_inputs_live(
 		| DataNodeKind::U64TruncF64 { operand }
 		| DataNodeKind::F64PromoteF32 { operand }
 		| DataNodeKind::F32DemoteF64 { operand }
+		| DataNodeKind::I32ReinterpretF32 { operand }
+		| DataNodeKind::F32ReinterpretI32 { operand }
+		| DataNodeKind::I64ReinterpretF64 { operand }
+		| DataNodeKind::F64ReinterpretI64 { operand }
 		| DataNodeKind::AggregateGet {
 			aggregate: operand, ..
 		} => {

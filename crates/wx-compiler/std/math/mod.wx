@@ -1,0 +1,462 @@
+impl f64 {
+  /// Archimedes' constant (π)
+  pub const PI: f64 = 3.14159265358979323846264338327950288;
+
+  /// π/2
+  pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
+}
+
+impl f32 {
+  /// Archimedes' constant (π)
+  pub const PI: f32 = 3.14159265358979323846264338327950288;
+
+  /// π/2
+  pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
+}
+
+module sinf;
+
+// Float algorithms — grouped separately from the const/inherent-wrapper
+// blocks above since these are real multi-step algorithms (built on
+// to_bits/from_bits), not one-line intrinsic wrappers.
+impl f32 {
+  // `scale_pow2` implements the C99/POSIX `scalbn`/`scalbnf` function
+  // (`x * 2^n`, computed by adjusting `x`'s binary exponent directly
+  // rather than via `2^n` as an intermediate value, which could itself
+  // overflow/underflow even when the final scaled result is
+  // representable). This specific bounded-prescale technique traces to
+  // Sun's fdlibm (`s_scalbn.c`, 1993), via musl's `scalbn.c`/
+  // `scalbnf.c` — see also rust-lang/libm's further-generalized,
+  // float-width-generic reimplementation at
+  // `libm/src/math/generic/scalbn.rs`. Out-of-range `n` is handled by
+  // pre-scaling in bounded chunks (each an exact power-of-two multiply)
+  // before the final direct-bit-construction multiply, so extreme `n`
+  // still correctly saturates to `inf`/`0` instead of miscomputing.
+  pub fn scale_pow2(self: Self, exp: i32) -> Self {
+    local mut y: f32 = self;
+    local mut n: i32 = exp;
+    // Exact powers of two, precomputed as literals instead of
+    // f32::from_bits(0x7f000000/0x00800000/0x4b800000) — wx has no
+    // const-eval for function calls, and no fold rule for
+    // reinterpret-of-a-constant either, so from_bits here would cost
+    // a real runtime instruction; a literal compiles straight to
+    // f32.const.
+    if n > 127 {
+      y = y * 1.7014118346046923e38;
+      n = n - 127;
+      if n > 127 {
+        y = y * 1.7014118346046923e38;
+        n = n - 127;
+        if n > 127 { n = 127; }
+      }
+    } else {
+      if n < -126 {
+        y = y * 1.1754943508222875e-38 * 16777216.0;
+        n = n + 126 - 24;
+        if n < -126 {
+          y = y * 1.1754943508222875e-38 * 16777216.0;
+          n = n + 126 - 24;
+          if n < -126 { n = -126; }
+        }
+      }
+    }
+    y * f32::from_bits(((127 + n) as u32) << 23)
+  }
+}
+
+impl f64 {
+  // See f32::scale_pow2 — same algorithm, ported from musl's scalbn.
+  pub fn scale_pow2(self: Self, exp: i32) -> Self {
+    local mut y: f64 = self;
+    local mut n: i32 = exp;
+    // Exact powers of two, precomputed as literals instead of
+    // f64::from_bits(0x7fe0000000000000/0x0010000000000000/
+    // 0x4340000000000000) — wx has no const-eval for function calls,
+    // and no fold rule for reinterpret-of-a-constant either, so
+    // from_bits here would cost a real runtime instruction; a literal
+    // compiles straight to f64.const.
+    if n > 1023 {
+      y = y * 8.98846567431158e307;
+      n = n - 1023;
+      if n > 1023 {
+        y = y * 8.98846567431158e307;
+        n = n - 1023;
+        if n > 1023 { n = 1023 };
+      }
+    } else {
+      if n < -1022 {
+        y = y * 2.2250738585072014e-308 * 9007199254740992.0;
+        n = n + 1022 - 53;
+        if n < -1022 {
+          y = y * 2.2250738585072014e-308 * 9007199254740992.0;
+          n = n + 1022 - 53;
+          if n < -1022 { n = -1022 };
+        }
+      }
+    }
+    y * f64::from_bits(i64_extend_i32(1023 + n) as u64 << 52)
+  }
+}
+
+// sin/cos for f64 — ported from musl's s_sin.c/s_cos.c/k_sin.c/k_cos.c
+// (themselves derived from Sun's fdlibm). Range reduction currently only
+// covers the "medium" path (`|x|` up to `2^20*(pi/2)`, ~1.65e6) — every
+// practical input — via `rem_pio2_medium`; true Payne-Hanek reduction for
+// arbitrarily large `x` is deferred (it needs real integer arrays, which
+// in wx means a caller-supplied `Memory`, a bigger API-shape question
+// than a simple `.sin()` method should force on every caller).
+// k_sin: sin(x+y) for |x+y| <= pi/4. Degree-13 minimax polynomial in
+// x^2, with a first-derivative correction term for the `y` (tail) part.
+const K_SIN_S1: f64 = -1.66666666666666324348e-01;
+const K_SIN_S2: f64 = 8.33333333332248946124e-03;
+const K_SIN_S3: f64 = -1.98412698298579493134e-04;
+const K_SIN_S4: f64 = 2.75573137070700676789e-06;
+const K_SIN_S5: f64 = -2.50507602534068634195e-08;
+const K_SIN_S6: f64 = 1.58969099521155010221e-10;
+
+fn k_sin(x: f64, y: f64, iy: i32) -> f64 {
+  local z: f64 = x * x;
+  local w: f64 = z * z;
+  local r: f64 =
+    K_SIN_S2 + z * (K_SIN_S3 + z * K_SIN_S4) + z * w * (K_SIN_S5 + z * K_SIN_S6);
+  local v: f64 = z * x;
+  if iy == 0 {
+    x + v * (K_SIN_S1 + z * r)
+  } else {
+    x - ((z * (0.5 * y - v * r) - y) - v * K_SIN_S1)
+  }
+}
+
+// k_cos: cos(x+y) for |x+y| <= pi/4. Degree-14 minimax polynomial,
+// structured to preserve accuracy of `1 - x*x/2` in infinite precision.
+const K_COS_C1: f64 = 4.16666666666666019037e-02;
+const K_COS_C2: f64 = -1.38888888888741095749e-03;
+const K_COS_C3: f64 = 2.48015872894767294178e-05;
+const K_COS_C4: f64 = -2.75573143513906633035e-07;
+const K_COS_C5: f64 = 2.08757232129817482790e-09;
+const K_COS_C6: f64 = -1.13596475577881948265e-11;
+
+fn k_cos(x: f64, y: f64) -> f64 {
+  local z: f64 = x * x;
+  local w: f64 = z * z;
+  local r: f64 =
+    z * (K_COS_C1 + z * (K_COS_C2 + z * K_COS_C3))
+      + w * w * (K_COS_C4 + z * (K_COS_C5 + z * K_COS_C6));
+  local hz: f64 = 0.5 * z;
+  local one_minus_hz: f64 = 1.0 - hz;
+  one_minus_hz + (((1.0 - one_minus_hz) - hz) + (z * r - x * y))
+}
+
+// rem_pio2_medium: reduces `x` to `y0 + y1 = x - n*(pi/2)` with
+// `|y0 + y1| <= pi/4`, returning `n`. `pi/2` is split into three
+// decreasing-magnitude parts (PIO2_1/2/3 + their tails) so the
+// subtraction can be refined to extra precision only when needed.
+//
+// Returns a struct rather than a tuple: tuple values can be constructed
+// and passed as function arguments, but neither `local` destructuring
+// nor `.0`/`.1` field access on an already-constructed tuple is
+// implemented yet, so a tuple return has no way to get its fields back
+// out on the caller side.
+struct Reduction {
+  n: i32,
+  y0: f64,
+  y1: f64,
+}
+
+const REM_PIO2_TO_INT: f64 = 1.5 / f64::EPSILON;
+const REM_PIO2_INV_PIO2: f64 = 6.36619772367581382433e-01;
+const REM_PIO2_PIO2_1: f64 = 1.57079632673412561417e+00;
+const REM_PIO2_PIO2_1T: f64 = 6.07710050650619224932e-11;
+const REM_PIO2_PIO2_2: f64 = 6.07710050630396597660e-11;
+
+const REM_PIO2_PIO2_2T: f64 = 2.02226624879595063154e-21;
+const REM_PIO2_PIO2_3: f64 = 2.02226624871116645580e-21;
+const REM_PIO2_PIO2_3T: f64 = 8.47842766036889956997e-32;
+
+fn rem_pio2_medium(x: f64) -> Reduction {
+  local tmp: f64 = x * REM_PIO2_INV_PIO2 + REM_PIO2_TO_INT;
+  local f_n: f64 = tmp - REM_PIO2_TO_INT;
+  local n: i32 = i32_trunc_f64(f_n);
+  local mut r: f64 = x - f_n * REM_PIO2_PIO2_1;
+  local mut w: f64 = f_n * REM_PIO2_PIO2_1T;
+  local mut y0: f64 = r - w;
+  // Precision-refinement heuristic (see rem_pio2.rs's `medium`): the
+  // original compares raw exponent bits (`ex - ey`) to detect
+  // cancellation in `r - w`; approximated here with a magnitude-ratio
+  // comparison biased to trigger more often than the exact bit check,
+  // so this never skips a needed correction round — only ever does
+  // extra, harmless work instead.
+  if y0.abs() < x.abs() * 0.000030517578125 {
+    local t: f64 = r;
+    w = f_n * REM_PIO2_PIO2_2;
+    r = t - w;
+    w = f_n * REM_PIO2_PIO2_2T - ((t - r) - w);
+    y0 = r - w;
+    if y0.abs() < x.abs() * 0.000000000000003552713678800501 {
+      local t2: f64 = r;
+      w = f_n * REM_PIO2_PIO2_3;
+      r = t2 - w;
+      w = f_n * REM_PIO2_PIO2_3T - ((t2 - r) - w);
+      y0 = r - w;
+    }
+  }
+  local y1: f64 = (r - y0) - w;
+  Reduction::{ n: n, y0: y0, y1: y1 }
+}
+
+impl f64 {
+  pub fn sin(self: Self) -> Self {
+    local x: f64 = self;
+    local ax: f64 = x.abs();
+    if ax <= 0.7853981633974483 {
+      if ax < 0.000000014901161193847656 { x } else { k_sin(x, 0.0, 0) }
+    } else {
+      if !(ax < f64::INFINITY) {
+        x - x
+      } else {
+        local red = rem_pio2_medium(x);
+        match red.n & 3 {
+          0 -> { k_sin(red.y0, red.y1, 1) },
+          1 -> { k_cos(red.y0, red.y1) },
+          2 -> { -k_sin(red.y0, red.y1, 1) },
+          _ -> { -k_cos(red.y0, red.y1) }
+        }
+      }
+    }
+  }
+
+  pub fn cos(self: Self) -> Self {
+    local x: f64 = self;
+    local ax: f64 = x.abs();
+    if ax <= 0.7853981633974483 {
+      if ax < 0.000000010536712127723509 { 1.0 } else { k_cos(x, 0.0) }
+    } else {
+      if !(ax < f64::INFINITY) {
+        x - x
+      } else {
+        local red = rem_pio2_medium(x);
+        match red.n & 3 {
+          0 -> { k_cos(red.y0, red.y1) },
+          1 -> { -k_sin(red.y0, red.y1, 1) },
+          2 -> { -k_cos(red.y0, red.y1) },
+          _ -> { k_sin(red.y0, red.y1, 1) }
+        }
+      }
+    }
+  }
+}
+
+// Single-precision sin/cos kernels — musl's `__sindf`/`__cosdf`
+// (`src/math/__sindf.c`, `__cosdf.c`), via rust-lang/compiler-builtins'
+// `libm/src/math/k_sinf.rs`/`k_cosf.rs` (the `libm` crate was merged into
+// that repo in April 2025; `rust-lang/libm` is archived). These are *not* `k_sin`/`k_cos` above with retuned
+// coefficients: the single-precision polynomials are shorter (4 terms
+// against 6, and no `y` tail argument) because they only have to be good to
+// `f32` precision, which is the entire reason a separate path exists.
+//
+// Both still take and evaluate in `f64` and only round on the way out —
+// that higher intermediate precision is what lets the short form stay
+// inside 1 ulp, and is exactly what musl does (`float __sindf(double x)`).
+// Promoting all the way to `f64::sin` instead would also work, and would
+// even be a hair more accurate, but it gives up the fast paths below: every
+// argument in |x| <= 9*pi/4 — which is where trigonometry in practice
+// mostly lives — is handled here without any argument reduction at all.
+//
+// |sin(x)/x - k_sinf(x)| < 2**-37.5
+const K_SINF_S1: f64 = -0.166666666416265235595;
+const K_SINF_S2: f64 = 0.0083333293858894631756;
+const K_SINF_S3: f64 = -0.000198393348360966317347;
+const K_SINF_S4: f64 = 0.0000027183114939898219064;
+
+fn k_sinf(x: f64) -> f32 {
+  local z: f64 = x * x;
+  local w: f64 = z * z;
+  local r: f64 = K_SINF_S3 + z * K_SINF_S4;
+  local s: f64 = z * x;
+  f32_demote_f64((x + s * (K_SINF_S1 + z * K_SINF_S2)) + s * w * r)
+}
+
+// |cos(x) - k_cosf(x)| < 2**-34.1
+const K_COSF_C0: f64 = -0.499999997251031003120;
+const K_COSF_C1: f64 = 0.0416666233237390631894;
+const K_COSF_C2: f64 = -0.00138867637746099294692;
+const K_COSF_C3: f64 = 0.0000243904487962774090654;
+
+fn k_cosf(x: f64) -> f32 {
+  local z: f64 = x * x;
+  local w: f64 = z * z;
+  local r: f64 = K_COSF_C2 + z * K_COSF_C3;
+  f32_demote_f64(((1.0 + z * K_COSF_C0) + w * K_COSF_C1) + (w * z) * r)
+}
+
+// The `f32` counterpart of `Reduction` — see that struct's comment for why
+// this is a struct and not a tuple. Only one output term is needed here,
+// not `y0`/`y1`: 25+53 bits of pi/2 covers every argument this reduction
+// accepts, so there is no tail to carry.
+struct ReductionF32 {
+  n: i32,
+  y: f64,
+}
+
+// 25-bit head of pi/2, and the rest of pi/2 beyond it. The `f64` path needs
+// a three-way split (`REM_PIO2_PIO2_1`/`_2`/`_3` plus tails) and a
+// cancellation-refinement loop; at `f32` input width a single head+tail
+// pair is already exact enough, which is most of why this function is so
+// much shorter than `rem_pio2_medium`. From `libm/src/math/rem_pio2f.rs`.
+const REM_PIO2F_PIO2_1: f64 = 1.57079631090164184570e+00;
+const REM_PIO2F_PIO2_1T: f64 = 1.58932547735281966916e-08;
+
+// 2**28 * (pi/2) — the largest argument the head+tail split above stays
+// accurate for, and the point where musl hands off to `__rem_pio2_large`
+// (Payne-Hanek; `libm/src/math/rem_pio2_large.rs`, the one piece both
+// precisions share). That is not ported yet, so `f32::sin`/`f32::cos` return
+// NaN past this instead of quietly returning garbage. Note the `f64` path
+// has the same gap and handles it *worse* — `rem_pio2_medium` runs
+// unguarded and traps once the quadrant stops fitting `i32`, somewhere
+// around |x| = 3.4e9.
+// TODO: port `__rem_pio2_large` and drop this cutoff from both paths.
+const REM_PIO2F_MEDIUM_MAX: f32 = 421657440.0;
+
+fn rem_pio2f(x: f32) -> ReductionF32 {
+  local xd: f64 = f64_promote_f32(x);
+  // Specialised rint: adding then subtracting 1.5/EPSILON forces rounding
+  // to an integer without a round-trip through an integer type. musl
+  // follows this with two correction branches that only matter under
+  // directed rounding; wasm has round-to-nearest-ties-to-even and no way
+  // to select anything else, so those branches are unreachable here and
+  // are left out.
+  local tmp: f64 = xd * REM_PIO2_INV_PIO2 + REM_PIO2_TO_INT;
+  local f_n: f64 = tmp - REM_PIO2_TO_INT;
+  ReductionF32::{
+    n: i32_trunc_f64(f_n),
+    y: xd - f_n * REM_PIO2F_PIO2_1 - f_n * REM_PIO2F_PIO2_1T,
+  }
+}
+
+// Small multiples of pi/2, rounded to `f64`.
+const F32_1PIO2: f64 = 1.5707963267948966;
+const F32_2PIO2: f64 = 3.141592653589793;
+const F32_3PIO2: f64 = 4.71238898038469;
+const F32_4PIO2: f64 = 6.283185307179586;
+
+// Branch thresholds, each the `f32` just below the named multiple of pi/4 —
+// the float-comparison form of the raw exponent-word compares musl uses
+// (`ix <= 0x3f490fda` and friends), matching how `f64::sin` above already
+// tests magnitudes rather than bits.
+const F32_TRIG_PIO4: f32 = 0.7853981256484985;
+const F32_TRIG_3PIO4: f32 = 2.356194257736206;
+const F32_TRIG_5PIO4: f32 = 3.9269907474517822;
+const F32_TRIG_7PIO4: f32 = 5.497786998748779;
+const F32_TRIG_9PIO4: f32 = 7.068583011627197;
+// 2**-12: below this, sin(x) == x and cos(x) == 1 in `f32`.
+const F32_TRIG_TINY: f32 = 0.000244140625;
+
+impl f32 {
+  // musl's `sinf` (`src/math/sinf.c`), via `libm/src/math/sinf.rs`.
+  pub fn sin(self: Self) -> Self {
+    local x: f32 = self;
+    local ax: f32 = x.abs();
+    local xd: f64 = f64_promote_f32(x);
+    if ax <= F32_TRIG_PIO4 {
+      if ax < F32_TRIG_TINY { x } else { k_sinf(xd) }
+    } else {
+      if ax <= F32_TRIG_5PIO4 {
+        if ax <= F32_TRIG_3PIO4 {
+          if x < 0.0 { -k_cosf(xd + F32_1PIO2) } else { k_cosf(xd - F32_1PIO2) }
+        } else {
+          if x < 0.0 {
+            k_sinf(-(xd + F32_2PIO2))
+          } else {
+            k_sinf(-(xd - F32_2PIO2))
+          }
+        }
+      } else {
+        if ax <= F32_TRIG_9PIO4 {
+          if ax <= F32_TRIG_7PIO4 {
+            if x < 0.0 {
+              k_cosf(xd + F32_3PIO2)
+            } else {
+              -k_cosf(xd - F32_3PIO2)
+            }
+          } else {
+            if x < 0.0 {
+              k_sinf(xd + F32_4PIO2)
+            } else {
+              k_sinf(xd - F32_4PIO2)
+            }
+          }
+        } else {
+          if !(ax < f32::INFINITY) {
+            x - x
+          } else {
+            if ax > REM_PIO2F_MEDIUM_MAX {
+              f32::NAN
+            } else {
+              local red = rem_pio2f(x);
+              match red.n & 3 {
+                0 -> { k_sinf(red.y) },
+                1 -> { k_cosf(red.y) },
+                2 -> { k_sinf(-red.y) },
+                _ -> { -k_cosf(red.y) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // musl's `cosf` (`src/math/cosf.c`), via `libm/src/math/cosf.rs`.
+  pub fn cos(self: Self) -> Self {
+    local x: f32 = self;
+    local ax: f32 = x.abs();
+    local xd: f64 = f64_promote_f32(x);
+    if ax <= F32_TRIG_PIO4 {
+      if ax < F32_TRIG_TINY { 1.0 } else { k_cosf(xd) }
+    } else {
+      if ax <= F32_TRIG_5PIO4 {
+        if ax > F32_TRIG_3PIO4 {
+          if x < 0.0 {
+            -k_cosf(xd + F32_2PIO2)
+          } else {
+            -k_cosf(xd - F32_2PIO2)
+          }
+        } else {
+          if x < 0.0 { k_sinf(xd + F32_1PIO2) } else { k_sinf(F32_1PIO2 - xd) }
+        }
+      } else {
+        if ax <= F32_TRIG_9PIO4 {
+          if ax > F32_TRIG_7PIO4 {
+            if x < 0.0 {
+              k_cosf(xd + F32_4PIO2)
+            } else {
+              k_cosf(xd - F32_4PIO2)
+            }
+          } else {
+            if x < 0.0 {
+              k_sinf(-xd - F32_3PIO2)
+            } else {
+              k_sinf(xd - F32_3PIO2)
+            }
+          }
+        } else {
+          if !(ax < f32::INFINITY) {
+            x - x
+          } else {
+            if ax > REM_PIO2F_MEDIUM_MAX {
+              f32::NAN
+            } else {
+              local red = rem_pio2f(x);
+              match red.n & 3 {
+                0 -> { k_cosf(red.y) },
+                1 -> { k_sinf(-red.y) },
+                2 -> { -k_cosf(red.y) },
+                _ -> { k_sinf(red.y) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

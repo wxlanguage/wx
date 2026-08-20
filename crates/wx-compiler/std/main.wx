@@ -97,16 +97,6 @@ pub trait BitNot {
     fn bitnot(self: Self) -> Self;
 }
 
-pub const PAGE_SIZE: u32 = 65536;
-
-/// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure.
-/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
-#[intrinsic]
-pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
-
-#[intrinsic]
-pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
-
 #[intrinsic]
 pub fn slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
@@ -115,22 +105,6 @@ pub fn slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
 #[intrinsic]
 pub fn slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
-
-#[intrinsic]
-pub fn size_of<T, Mem: Memory>() -> Mem::Size;
-
-#[intrinsic]
-pub fn align_of<T, Mem: Memory>() -> Mem::Size;
-
-#[intrinsic]
-pub fn memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
-
-#[intrinsic]
-pub fn memory_copy<
-    Size: PointerSize,
-    SrcMem: Memory where { Size = Size },
-    DstMem: Memory where { Size = Size },
->(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
 #[intrinsic]
 pub fn i64_extend_i32(value: i32) -> i64;
@@ -170,6 +144,30 @@ pub fn f32_trunc(value: f32) -> f32;
 
 #[intrinsic]
 pub fn f64_trunc(value: f64) -> f64;
+
+#[intrinsic]
+pub fn f32_nearest(value: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_nearest(value: f64) -> f64;
+
+#[intrinsic]
+pub fn f32_min(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_min(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn f32_max(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_max(a: f64, b: f64) -> f64;
+
+#[intrinsic]
+pub fn f32_copysign(a: f32, b: f32) -> f32;
+
+#[intrinsic]
+pub fn f64_copysign(a: f64, b: f64) -> f64;
 
 #[intrinsic]
 pub fn i32_neg(value: i32) -> i32;
@@ -345,78 +343,232 @@ pub fn f64_promote_f32(value: f32) -> f64;
 #[intrinsic]
 pub fn f32_demote_f64(value: f64) -> f32;
 
+#[intrinsic]
+pub fn i32_reinterpret_f32(value: f32) -> i32;
+
+#[intrinsic]
+pub fn f32_reinterpret_i32(value: i32) -> f32;
+
+#[intrinsic]
+pub fn i64_reinterpret_f64(value: f64) -> i64;
+
+#[intrinsic]
+pub fn f64_reinterpret_i64(value: i64) -> f64;
+
 impl f32 {
-    pub const PI: f32 = 3.14159265358979323846264338327950288;
+    pub const NAN: f32 = 0.0 / 0.0;
+
+    pub const INFINITY: f32 = 1.0 / 0.0;
+
+    pub const NEG_INFINITY: f32 = -1.0 / 0.0;
+
+    pub const EPSILON: f32 = 1.19209290e-7;
+
+    pub const MIN: f32 = -3.40282347e+38;
+
+    pub const MIN_POSITIVE: f32 = 1.17549435e-38;
+
+    pub const MAX: f32 = 3.40282347e+38;
 
     #[inline]
-    pub fn trunc(self: Self) -> Self { f32_trunc(self) }
+    pub fn trunc(self: Self) -> Self {
+        f32_trunc(self)
+    }
+
+    #[inline]
+    pub fn abs(self: Self) -> Self {
+        f32_abs(self)
+    }
+
+    #[inline]
+    pub fn floor(self: Self) -> Self {
+        f32_floor(self)
+    }
+
+    #[inline]
+    pub fn ceil(self: Self) -> Self {
+        f32_ceil(self)
+    }
+
+    #[inline]
+    pub fn nearest(self: Self) -> Self {
+        f32_nearest(self)
+    }
+
+    #[inline]
+    pub fn min(self: Self, other: Self) -> Self {
+        f32_min(self, other)
+    }
+
+    #[inline]
+    pub fn max(self: Self, other: Self) -> Self {
+        f32_max(self, other)
+    }
+
+    #[inline]
+    pub fn copysign(self: Self, sign: Self) -> Self {
+        f32_copysign(self, sign)
+    }
+
+    #[inline]
+    pub fn to_bits(self: Self) -> u32 {
+        i32_reinterpret_f32(self) as u32
+    }
+
+    #[inline]
+    pub fn from_bits(bits: u32) -> Self {
+        f32_reinterpret_i32(bits as i32)
+    }
 }
 
 impl f64 {
-    pub const PI: f64 = 3.14159265358979323846264338327950288;
+    pub const NAN: f64 = 0.0 / 0.0;
+
+    pub const INFINITY: f64 = 1.0 / 0.0;
+
+    pub const NEG_INFINITY: f64 = -1.0 / 0.0;
+
+    pub const EPSILON: f64 = 2.2204460492503131e-16;
+
+    pub const MIN: f64 = -1.7976931348623157e+308;
+
+    pub const MIN_POSITIVE: f64 = 2.2250738585072014e-308;
+
+    pub const MAX: f64 = 1.7976931348623157e+308;
 
     #[inline]
-    pub fn trunc(self: Self) -> Self { f64_trunc(self) }
+    pub fn trunc(self: Self) -> Self {
+        f64_trunc(self)
+    }
+
+    #[inline]
+    pub fn abs(self: Self) -> Self {
+        f64_abs(self)
+    }
+
+    #[inline]
+    pub fn floor(self: Self) -> Self {
+        f64_floor(self)
+    }
+
+    #[inline]
+    pub fn ceil(self: Self) -> Self {
+        f64_ceil(self)
+    }
+
+    #[inline]
+    pub fn nearest(self: Self) -> Self {
+        f64_nearest(self)
+    }
+
+    #[inline]
+    pub fn min(self: Self, other: Self) -> Self {
+        f64_min(self, other)
+    }
+
+    #[inline]
+    pub fn max(self: Self, other: Self) -> Self {
+        f64_max(self, other)
+    }
+
+    #[inline]
+    pub fn copysign(self: Self, sign: Self) -> Self {
+        f64_copysign(self, sign)
+    }
+
+    #[inline]
+    pub fn to_bits(self: Self) -> u64 {
+        i64_reinterpret_f64(self) as u64
+    }
+
+    #[inline]
+    pub fn from_bits(bits: u64) -> Self {
+        f64_reinterpret_i64(bits as i64)
+    }
 }
 
 impl Add for i32 {
     #[inline]
-    fn add(self: Self, rhs: Self) -> Self { i32_add(self, rhs) }
+    fn add(self: Self, rhs: Self) -> Self {
+        i32_add(self, rhs)
+    }
 }
 
 impl Sub for i32 {
     #[inline]
-    fn sub(self: Self, rhs: Self) -> Self { i32_sub(self, rhs) }
+    fn sub(self: Self, rhs: Self) -> Self {
+        i32_sub(self, rhs)
+    }
 }
 
 impl Mul for i32 {
     #[inline]
-    fn mul(self: Self, rhs: Self) -> Self { i32_mul(self, rhs) }
+    fn mul(self: Self, rhs: Self) -> Self {
+        i32_mul(self, rhs)
+    }
 }
 
 impl Div for i32 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { i32_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        i32_div(self, rhs)
+    }
 }
 
 impl Rem for i32 {
     #[inline]
-    fn rem(self: Self, rhs: Self) -> Self { i32_rem(self, rhs) }
+    fn rem(self: Self, rhs: Self) -> Self {
+        i32_rem(self, rhs)
+    }
 }
 
 impl Neg for i32 {
     #[inline]
-    fn neg(self: Self) -> Self { i32_neg(self) }
+    fn neg(self: Self) -> Self {
+        i32_neg(self)
+    }
 }
 
 impl BitAnd for i32 {
     #[inline]
-    fn bitand(self: Self, rhs: Self) -> Self { i32_bitand(self, rhs) }
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i32_bitand(self, rhs)
+    }
 }
 
 impl BitOr for i32 {
     #[inline]
-    fn bitor(self: Self, rhs: Self) -> Self { i32_bitor(self, rhs) }
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i32_bitor(self, rhs)
+    }
 }
 
 impl BitXor for i32 {
     #[inline]
-    fn bitxor(self: Self, rhs: Self) -> Self { i32_bitxor(self, rhs) }
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i32_bitxor(self, rhs)
+    }
 }
 
 impl Shl for i32 {
     #[inline]
-    fn shl(self: Self, rhs: Self) -> Self { i32_shl(self, rhs) }
+    fn shl(self: Self, rhs: Self) -> Self {
+        i32_shl(self, rhs)
+    }
 }
 
 impl Shr for i32 {
     #[inline]
-    fn shr(self: Self, rhs: Self) -> Self { i32_shr(self, rhs) }
+    fn shr(self: Self, rhs: Self) -> Self {
+        i32_shr(self, rhs)
+    }
 }
 
 impl BitNot for i32 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i32_bitnot(self) }
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self)
+    }
 }
 
 impl Add for u32 {
@@ -442,12 +594,16 @@ impl Mul for u32 {
 
 impl Div for u32 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { u32_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        u32_div(self, rhs)
+    }
 }
 
 impl Rem for u32 {
     #[inline]
-    fn rem(self: Self, rhs: Self) -> Self { u32_rem(self, rhs) }
+    fn rem(self: Self, rhs: Self) -> Self {
+        u32_rem(self, rhs)
+    }
 }
 
 impl BitAnd for u32 {
@@ -480,7 +636,9 @@ impl Shl for u32 {
 
 impl Shr for u32 {
     #[inline]
-    fn shr(self: Self, rhs: Self) -> Self { u32_shr(self, rhs) }
+    fn shr(self: Self, rhs: Self) -> Self {
+        u32_shr(self, rhs)
+    }
 }
 
 impl BitNot for u32 {
@@ -492,62 +650,86 @@ impl BitNot for u32 {
 
 impl Add for i64 {
     #[inline]
-    fn add(self: Self, rhs: Self) -> Self { i64_add(self, rhs) }
+    fn add(self: Self, rhs: Self) -> Self {
+        i64_add(self, rhs)
+    }
 }
 
 impl Sub for i64 {
     #[inline]
-    fn sub(self: Self, rhs: Self) -> Self { i64_sub(self, rhs) }
+    fn sub(self: Self, rhs: Self) -> Self {
+        i64_sub(self, rhs)
+    }
 }
 
 impl Mul for i64 {
     #[inline]
-    fn mul(self: Self, rhs: Self) -> Self { i64_mul(self, rhs) }
+    fn mul(self: Self, rhs: Self) -> Self {
+        i64_mul(self, rhs)
+    }
 }
 
 impl Div for i64 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { i64_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        i64_div(self, rhs)
+    }
 }
 
 impl Rem for i64 {
     #[inline]
-    fn rem(self: Self, rhs: Self) -> Self { i64_rem(self, rhs) }
+    fn rem(self: Self, rhs: Self) -> Self {
+        i64_rem(self, rhs)
+    }
 }
 
 impl Neg for i64 {
     #[inline]
-    fn neg(self: Self) -> Self { i64_neg(self) }
+    fn neg(self: Self) -> Self {
+        i64_neg(self)
+    }
 }
 
 impl BitAnd for i64 {
     #[inline]
-    fn bitand(self: Self, rhs: Self) -> Self { i64_bitand(self, rhs) }
+    fn bitand(self: Self, rhs: Self) -> Self {
+        i64_bitand(self, rhs)
+    }
 }
 
 impl BitOr for i64 {
     #[inline]
-    fn bitor(self: Self, rhs: Self) -> Self { i64_bitor(self, rhs) }
+    fn bitor(self: Self, rhs: Self) -> Self {
+        i64_bitor(self, rhs)
+    }
 }
 
 impl BitXor for i64 {
     #[inline]
-    fn bitxor(self: Self, rhs: Self) -> Self { i64_bitxor(self, rhs) }
+    fn bitxor(self: Self, rhs: Self) -> Self {
+        i64_bitxor(self, rhs)
+    }
 }
 
 impl Shl for i64 {
     #[inline]
-    fn shl(self: Self, rhs: Self) -> Self { i64_shl(self, rhs) }
+    fn shl(self: Self, rhs: Self) -> Self {
+        i64_shl(self, rhs)
+    }
 }
 
 impl Shr for i64 {
     #[inline]
-    fn shr(self: Self, rhs: Self) -> Self { i64_shr(self, rhs) }
+    fn shr(self: Self, rhs: Self) -> Self {
+        i64_shr(self, rhs)
+    }
 }
 
 impl BitNot for i64 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i64_bitnot(self) }
+    fn bitnot(self: Self) -> Self {
+        i64_bitnot(self)
+    }
 }
 
 impl Add for u64 {
@@ -573,12 +755,16 @@ impl Mul for u64 {
 
 impl Div for u64 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { u64_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        u64_div(self, rhs)
+    }
 }
 
 impl Rem for u64 {
     #[inline]
-    fn rem(self: Self, rhs: Self) -> Self { u64_rem(self, rhs) }
+    fn rem(self: Self, rhs: Self) -> Self {
+        u64_rem(self, rhs)
+    }
 }
 
 impl BitAnd for u64 {
@@ -611,7 +797,9 @@ impl Shl for u64 {
 
 impl Shr for u64 {
     #[inline]
-    fn shr(self: Self, rhs: Self) -> Self { u64_shr(self, rhs) }
+    fn shr(self: Self, rhs: Self) -> Self {
+        u64_shr(self, rhs)
+    }
 }
 
 impl BitNot for u64 {
@@ -623,32 +811,40 @@ impl BitNot for u64 {
 
 impl Add for f32 {
     #[inline]
-    fn add(self: Self, rhs: Self) -> Self { f32_add(self, rhs) }
+    fn add(self: Self, rhs: Self) -> Self {
+        f32_add(self, rhs)
+    }
 }
 
 impl Sub for f32 {
     #[inline]
-    fn sub(self: Self, rhs: Self) -> Self { f32_sub(self, rhs) }
+    fn sub(self: Self, rhs: Self) -> Self {
+        f32_sub(self, rhs)
+    }
 }
 
 impl Mul for f32 {
     #[inline]
-    fn mul(self: Self, rhs: Self) -> Self { f32_mul(self, rhs) }
+    fn mul(self: Self, rhs: Self) -> Self {
+        f32_mul(self, rhs)
+    }
 }
 
 impl Div for f32 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { f32_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        f32_div(self, rhs)
+    }
 }
 
 impl Neg for f32 {
     #[inline]
-    fn neg(self: Self) -> Self { f32_neg(self) }
+    fn neg(self: Self) -> Self {
+        f32_neg(self)
+    }
 }
 
 impl Rem for f32 {
-    // Matches Rust/C `fmod`: truncating division, result has the sign of
-    // the dividend.
     #[inline]
     fn rem(self: Self, rhs: Self) -> Self {
         self - rhs * (self / rhs).trunc()
@@ -657,32 +853,40 @@ impl Rem for f32 {
 
 impl Add for f64 {
     #[inline]
-    fn add(self: Self, rhs: Self) -> Self { f64_add(self, rhs) }
+    fn add(self: Self, rhs: Self) -> Self {
+        f64_add(self, rhs)
+    }
 }
 
 impl Sub for f64 {
     #[inline]
-    fn sub(self: Self, rhs: Self) -> Self { f64_sub(self, rhs) }
+    fn sub(self: Self, rhs: Self) -> Self {
+        f64_sub(self, rhs)
+    }
 }
 
 impl Mul for f64 {
     #[inline]
-    fn mul(self: Self, rhs: Self) -> Self { f64_mul(self, rhs) }
+    fn mul(self: Self, rhs: Self) -> Self {
+        f64_mul(self, rhs)
+    }
 }
 
 impl Div for f64 {
     #[inline]
-    fn div(self: Self, rhs: Self) -> Self { f64_div(self, rhs) }
+    fn div(self: Self, rhs: Self) -> Self {
+        f64_div(self, rhs)
+    }
 }
 
 impl Neg for f64 {
     #[inline]
-    fn neg(self: Self) -> Self { f64_neg(self) }
+    fn neg(self: Self) -> Self {
+        f64_neg(self)
+    }
 }
 
 impl Rem for f64 {
-    // Matches Rust/C `fmod`: truncating division, result has the sign of
-    // the dividend.
     #[inline]
     fn rem(self: Self, rhs: Self) -> Self {
         self - rhs * (self / rhs).trunc()
@@ -726,7 +930,9 @@ impl Rem for i8 {
 
 impl Neg for i8 {
     #[inline]
-    fn neg(self: Self) -> Self { i32_neg(self as i32) as i8 }
+    fn neg(self: Self) -> Self {
+        i32_neg(self as i32) as i8
+    }
 }
 
 impl BitAnd for i8 {
@@ -766,7 +972,9 @@ impl Shr for i8 {
 
 impl BitNot for i8 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as i8 }
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self as i32) as i8
+    }
 }
 
 impl Add for u8 {
@@ -841,7 +1049,9 @@ impl Shr for u8 {
 
 impl BitNot for u8 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as u8 }
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self as i32) as u8
+    }
 }
 
 impl Add for i16 {
@@ -881,7 +1091,9 @@ impl Rem for i16 {
 
 impl Neg for i16 {
     #[inline]
-    fn neg(self: Self) -> Self { i32_neg(self as i32) as i16 }
+    fn neg(self: Self) -> Self {
+        i32_neg(self as i32) as i16
+    }
 }
 
 impl BitAnd for i16 {
@@ -921,7 +1133,9 @@ impl Shr for i16 {
 
 impl BitNot for i16 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as i16 }
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self as i32) as i16
+    }
 }
 
 impl Add for u16 {
@@ -996,7 +1210,9 @@ impl Shr for u16 {
 
 impl BitNot for u16 {
     #[inline]
-    fn bitnot(self: Self) -> Self { i32_bitnot(self as i32) as u16 }
+    fn bitnot(self: Self) -> Self {
+        i32_bitnot(self as i32) as u16
+    }
 }
 
 impl BitAnd for bool {
@@ -1022,11 +1238,11 @@ impl BitXor for bool {
 
 pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }
 
-trait UnsignedInt {
+pub trait UnsignedInt {
     type Signed: SignedInt where { Unsigned = Self };
 }
 
-trait SignedInt {
+pub trait SignedInt {
     type Unsigned: UnsignedInt where { Signed = Self };
 }
 
@@ -1062,30 +1278,76 @@ impl SignedInt for i64 {
     type Unsigned = u64;
 }
 
+/// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure. \
+/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
+#[intrinsic]
+pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
+
+/// Returns the current size of `mem` in pages. \
+/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/size
+#[intrinsic]
+pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
+
+/// This is analogous to `memset` in C. \
+/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
+#[intrinsic]
+pub fn memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
+
+/// Can copy across two different memories as long as they have the same pointer size. 
+/// This is analogous to `memmove` in C. \
+/// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
+#[intrinsic]
+pub fn memory_copy<
+    Size: PointerSize,
+    SrcMem: Memory where { Size = Size },
+    DstMem: Memory where { Size = Size },
+>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
+
 #[tag = "pointer_size"]
 pub typeset PointerSize { u32, u64 }
 
 pub trait Memory {
     type Size: PointerSize + UnsignedInt;
 
-    const MEMORY_INDEX: u32;
+    /// This constant exposes internal information about which index this memory will use in the generated wasm module.
+    const INDEX: u32;
 
+    /// The address right after the compiler's statically-placed data (string and array literals) in this memory. 
+    /// This can be used as a safe starting point for making dynamic allocations.
     const DATA_END: Self::*u8;
 
+    /// The size of one memory page in bytes (64 KiB) — a constant defined by the WebAssembly specification. \
+    /// https://webassembly.github.io/spec/core/exec/runtime.html#page-size
+    const PAGE_SIZE: Self::Size = 65536;
+
+    /// Grows this memory by `delta` pages; returns the previous size in pages, or `-1` on failure.
     #[inline]
     fn grow(self, delta: Self::Size) -> Self::Size::Signed {
         memory_grow(self, delta)
     }
 
+    /// Returns the current size of this memory, in pages.
     #[inline]
-    fn size(self) -> Self::Size {
+    fn size_pages(self) -> Self::Size {
         memory_size(self)
+    }
+
+    /// Returns the current size of this memory, in bytes.
+    #[inline]
+    fn size_bytes(self) -> Self::Size {
+        self.size_pages() * Self::PAGE_SIZE
     }
 }
 
+#[intrinsic]
+pub fn size_of<T, Mem: Memory>() -> Mem::Size;
+
+#[intrinsic]
+pub fn align_of<T, Mem: Memory>() -> Mem::Size;
+
 pub struct Layout<Mem: Memory> {
-    pub size: Mem::Size,
-    pub align: Mem::Size,
+    size: Mem::Size,
+    align: Mem::Size,
 }
 
 impl<Mem: Memory> Layout<Mem> {
@@ -1097,6 +1359,16 @@ impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub fn array<T>(count: Mem::Size) -> Self {
         Self::{ align: align_of::<T>(), size: size_of::<T>() * count }
+    }
+
+    #[inline]
+    pub fn size(self) -> Mem::Size {
+        self.size
+    }
+
+    #[inline]
+    pub fn align(self) -> Mem::Size {
+        self.align
     }
 }
 
@@ -1162,12 +1434,11 @@ pub module ptr {
         (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
     }
 
+    /// Rounds `addr` up to the next multiple of `align`. 
+    /// **`align` must be a power of two.**
     #[inline]
     pub fn align_up<Mem: Memory>(addr: Mem::Size, align: Mem::Size) -> Mem::Size {
-        local mask = align - 1;
-        local result = (addr + mask) & ^mask;
-        if result < addr { unreachable }
-        result
+        (addr + align - 1) & ^(align - 1)
     }
 }
 

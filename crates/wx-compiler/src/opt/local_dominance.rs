@@ -130,7 +130,12 @@ fn intersect(a: &[bool], b: &[bool]) -> Vec<bool> {
 /// `depth` resolves past every open frame (a branch to the function's own
 /// implicit outermost block, which exits the function like `Return` and is
 /// not a merge input for any tracked frame).
-fn record_exit(frames: &mut [Frame], depth: u32, set: &[bool], reachable: bool) {
+fn record_exit(
+	frames: &mut [Frame],
+	depth: u32,
+	set: &[bool],
+	reachable: bool,
+) {
 	if !reachable {
 		return;
 	}
@@ -282,8 +287,7 @@ pub fn verify_local_dominance(
 								frame.entry_set.clone(),
 								frame.entry_reachable,
 							));
-						let mut merged =
-							then_reachable.then_some(then_set);
+						let mut merged = then_reachable.then_some(then_set);
 						if reachable {
 							merged = Some(match merged {
 								None => set.clone(),
@@ -385,10 +389,8 @@ mod tests {
 	use super::*;
 
 	fn test_func(uses: Vec<Vec<DataNodeIndex>>) -> Function {
-		let mut func = Function::new(
-			crate::ast::DefIdGenerator::new().generate(),
-			0,
-		);
+		let mut func =
+			Function::new(crate::ast::DefIdGenerator::new().generate(), 0);
 		func.data_nodes = uses
 			.into_iter()
 			.map(|uses| crate::opt::DataNode {
@@ -431,10 +433,8 @@ mod tests {
 	/// before the consumer-purity filter was added).
 	#[test]
 	fn loop_param_after_edge_does_not_panic() {
-		let mut func = Function::new(
-			crate::ast::DefIdGenerator::new().generate(),
-			0,
-		);
+		let mut func =
+			Function::new(crate::ast::DefIdGenerator::new().generate(), 0);
 		// node 0: LoopParam, before=constant (unused here), after=node 1.
 		// node 1: some pure expression computed inside the loop body,
 		// created *after* node 0's placeholder — records "node 0 is used
@@ -465,7 +465,11 @@ mod tests {
 		verify_local_dominance(body, n_locals, params_count, &[]);
 	}
 
-	fn panics(body: &[Instruction], n_locals: usize, params_count: usize) -> bool {
+	fn panics(
+		body: &[Instruction],
+		n_locals: usize,
+		params_count: usize,
+	) -> bool {
 		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 			run(body, n_locals, params_count)
 		}))

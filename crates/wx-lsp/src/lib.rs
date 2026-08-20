@@ -125,7 +125,7 @@ struct AnalysisResult {
 }
 
 struct CompiledRoot {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: TIR,
 	symbol_index: SymbolIndex,
 	/// LSP version of each file in the crate at the time TIR was last built.
@@ -370,10 +370,24 @@ async fn handle_command(
 					&info.kind,
 				)?;
 				let range = span_to_range(&compiled.graph.files, info.source)?;
+				let doc = doc_comment_anchor(&compiled.tir, &info.kind)
+					.and_then(|anchor| {
+						let source = &compiled
+							.graph
+							.files
+							.get(anchor.file_id)
+							.ok()?
+							.source;
+						leading_doc_comment(source, anchor.span.start)
+					});
+				let value = match doc {
+					Some(doc) => format!("```wx\n{text}\n```\n\n---\n\n{doc}"),
+					None => format!("```wx\n{text}\n```"),
+				};
 				Some(Hover {
 					contents: HoverContents::Markup(MarkupContent {
 						kind: MarkupKind::Markdown,
-						value: format!("```wx\n{text}\n```"),
+						value,
 					}),
 					range: Some(range),
 				})
@@ -1041,10 +1055,12 @@ impl Backend {
 					params.uri
 				))
 			})?;
-		match filename {
-			"main.wx" => Ok(wx_compiler::vfs::STDLIB_SOURCE.to_string()),
-			other => Err(JsonRpcError::invalid_params(format!(
-				"unknown stdlib file: {other}"
+		// Keyed exactly as the stdlib crate's own module paths, so any file
+		// the stdlib grows is servable here without touching this match.
+		match wx_compiler::vfs::stdlib_file(filename) {
+			Some(source) => Ok(source.to_string()),
+			None => Err(JsonRpcError::invalid_params(format!(
+				"unknown stdlib file: {filename}"
 			))),
 		}
 	}
@@ -1348,7 +1364,7 @@ fn collect_clear_operations(
 
 fn compile_root(
 	state: &ServerState,
-	mut graph: vfs::CompilationGraph,
+	mut graph: vfs::CompilationUnit,
 	logs: &mut Vec<String>,
 ) -> CompiledRoot {
 	let compiled_versions = graph
@@ -1390,14 +1406,14 @@ fn parse_root(
 	state: &ServerState,
 	root: &Path,
 	logs: &mut Vec<String>,
-) -> std::result::Result<vfs::CompilationGraph, ()> {
+) -> std::result::Result<vfs::CompilationUnit, ()> {
 	let overlay = OverlayFileSource::new(&state.open_documents);
-	let mut builder = vfs::CompilationGraphBuilder::new();
+	let mut builder = vfs::CompilationUnitBuilder::new();
 	let parse_start = web_time::Instant::now();
-	let stdlib_id = builder.load_stdlib();
+	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(root.to_str().unwrap_or_default().to_string(), &overlay)?;
-	let graph = builder.build(root_id, stdlib_id);
+	let graph = builder.build(root_id);
 	logs.push(format!("parsing took {:?}", parse_start.elapsed()));
 	Ok(graph)
 }
@@ -1661,6 +1677,94 @@ fn push_type_params(
 		}
 	}
 	s.push('>');
+}
+
+/// The point to search backward from for `kind`'s own leading doc comment —
+/// `pub_span`'s start when the item is `pub` (it sits to the left of
+/// `fn`/`struct`/etc., closer to any attributes/doc comments above), else
+/// the item's name span. `None` for symbol kinds that aren't a standalone
+/// declaration with its own doc comment (locals, params, `self`, type
+/// params, labels, enum variants, struct fields, associated types, and the
+/// synthetic `Self`/namespace kinds).
+fn doc_comment_anchor(tir: &TIR, kind: &SymbolKind) -> Option<SourceSpan> {
+	fn anchor(
+		file_id: FileId,
+		pub_span: Option<TextSpan>,
+		name_span: TextSpan,
+	) -> SourceSpan {
+		SourceSpan::new(file_id, pub_span.unwrap_or(name_span))
+	}
+	match kind {
+		SymbolKind::Function(id) => {
+			let f = &tir.functions[tir.function_index(*id)? as usize];
+			Some(anchor(f.file_id, f.pub_span, f.name.span))
+		}
+		SymbolKind::Global(id) => {
+			let g = &tir.globals[tir.global_index(*id)? as usize];
+			Some(anchor(g.file_id, g.pub_span, g.name.span))
+		}
+		SymbolKind::Const(id) => {
+			let c = &tir.constants[tir.const_index(*id)? as usize];
+			Some(anchor(c.file_id, c.pub_span, c.name.span))
+		}
+		SymbolKind::Struct(id) => {
+			let s = tir.structs.get(tir.struct_index(*id)? as usize)?;
+			Some(anchor(s.file_id, s.pub_span, s.name.span))
+		}
+		SymbolKind::Enum(id) => {
+			let e = tir.enums.get(tir.enum_index(*id)? as usize)?;
+			Some(anchor(e.file_id, e.pub_span, e.name.span))
+		}
+		SymbolKind::Trait(id) => {
+			let t = tir.traits.get(tir.trait_index(*id)? as usize)?;
+			Some(anchor(t.file_id, t.pub_span, t.name.span))
+		}
+		SymbolKind::TypeSet(id) => {
+			let ts = tir.typesets.get(tir.typeset_index(*id)? as usize)?;
+			Some(anchor(ts.file_id, ts.pub_span, ts.name.span))
+		}
+		SymbolKind::TypeAlias(id) => {
+			let a = &tir.type_aliases[tir.type_alias_index(*id)? as usize];
+			Some(anchor(a.file_id, a.pub_span, a.name.span))
+		}
+		SymbolKind::Memory(id) => {
+			let m = &tir.memories[tir.memory_index(*id)? as usize];
+			Some(SourceSpan::new(m.file_id, m.name.span))
+		}
+		_ => None,
+	}
+}
+
+/// The markdown text of the doc-comment block (if any) immediately above
+/// `anchor_offset` in `source` — walks backward one whole line at a time: a
+/// `///` line is collected, a `#[...]` line is skipped (attributes sit
+/// between a doc comment and the item they document, e.g. `std/main.wx`'s
+/// `memory_grow`), and anything else (including a blank line) stops the
+/// walk. Linear in the size of the doc-comment block being read — each
+/// `rfind('\n')` scans backward only as far as the nearest newline, not the
+/// whole `source[..k]` slice it's called on, so cost never depends on how
+/// deep into the file `anchor_offset` is.
+fn leading_doc_comment(source: &str, anchor_offset: u32) -> Option<String> {
+	let mut doc_lines = Vec::new();
+	let mut line_start = source[..anchor_offset as usize]
+		.rfind('\n')
+		.map_or(0, |i| i + 1);
+	while line_start > 0 {
+		let prev_line_start =
+			source[..line_start - 1].rfind('\n').map_or(0, |i| i + 1);
+		let line = source[prev_line_start..line_start - 1].trim();
+		if let Some(text) = line.strip_prefix("///") {
+			doc_lines.push(text.strip_prefix(' ').unwrap_or(text));
+		} else if !line.starts_with("#[") {
+			break;
+		}
+		line_start = prev_line_start;
+	}
+	if doc_lines.is_empty() {
+		return None;
+	}
+	doc_lines.reverse();
+	Some(doc_lines.join("\n"))
 }
 
 fn symbol_hover_text(

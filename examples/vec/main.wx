@@ -35,9 +35,9 @@ impl Allocator for BumpAllocator {
     fn alloc(x, layout: Layout<heap>) -> heap::*u8 {
         local ptr = ptr::align_up::<heap>(bump as u32, layout.align);
         local new_end = ptr + layout.size;
-        local cur_end = heap.size() * PAGE_SIZE;
+        local cur_end = heap.size_bytes();
         if new_end > cur_end {
-            local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+            local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         }
         bump = new_end as heap::*u8;
         ptr as heap::*u8

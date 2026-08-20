@@ -212,6 +212,21 @@ pub enum ExprKind {
 	Trunc {
 		value: Box<Expression>,
 	},
+	Nearest {
+		value: Box<Expression>,
+	},
+	Min {
+		left: Box<Expression>,
+		right: Box<Expression>,
+	},
+	Max {
+		left: Box<Expression>,
+		right: Box<Expression>,
+	},
+	Copysign {
+		left: Box<Expression>,
+		right: Box<Expression>,
+	},
 	I64ExtendI32S {
 		value: Box<Expression>,
 	},
@@ -273,6 +288,18 @@ pub enum ExprKind {
 		value: Box<Expression>,
 	},
 	F32DemoteF64 {
+		value: Box<Expression>,
+	},
+	I32ReinterpretF32 {
+		value: Box<Expression>,
+	},
+	F32ReinterpretI32 {
+		value: Box<Expression>,
+	},
+	I64ReinterpretF64 {
+		value: Box<Expression>,
+	},
+	F64ReinterpretI64 {
 		value: Box<Expression>,
 	},
 	/// `i32.const <data_section_end>` — byte offset of the first writable
@@ -1242,8 +1269,9 @@ impl<'tir> Builder<'tir> {
 			_ => {}
 		};
 
-		match self.tir.types[type_idx.as_usize()].clone() {
+		match &self.tir.types[type_idx.as_usize()] {
 			tir::Type::TypeParam { param_index, .. } => {
+				let param_index = *param_index;
 				let concrete = self.current_substitutions[param_index as usize];
 				self.lower_type_index(concrete)
 			}
@@ -1251,7 +1279,7 @@ impl<'tir> Builder<'tir> {
 				signature_index: self.intern_tir_function_type(type_idx),
 			},
 			tir::Type::FunctionItem { id, type_args } => {
-				let fi = self.tir.expect_function_index(id) as usize;
+				let fi = self.tir.expect_function_index(*id) as usize;
 				let sig_idx = self.tir.functions[fi].signature_index;
 				if type_args.is_empty() {
 					Type::Function {
@@ -1285,11 +1313,11 @@ impl<'tir> Builder<'tir> {
 				assoc_name,
 				trait_index,
 			} => {
-				let concrete_base = self.resolve_tir_type(base);
+				let concrete_base = self.resolve_tir_type(*base);
 				let (_, impl_type_args, assoc_ty) = self.find_assoc_type_value(
 					concrete_base,
-					trait_index,
-					assoc_name,
+					*trait_index,
+					*assoc_name,
 				);
 				// Unlike `resolve_tir_type`, this is `&mut self`, so it can
 				// install the impl's own substitutions before recursing —
@@ -1310,11 +1338,11 @@ impl<'tir> Builder<'tir> {
 			}
 			tir::Type::Pointer { memory, .. }
 			| tir::Type::Array { memory, .. } => {
-				let memory = self.resolve_memory_id(memory);
+				let memory = self.resolve_memory_id(*memory);
 				self.pointer_type(memory)
 			}
 			tir::Type::Slice { memory, .. } => {
-				let memory = self.resolve_memory_id(memory);
+				let memory = self.resolve_memory_id(*memory);
 				let tir_idx = self.tir.expect_memory_index(memory) as usize;
 				let kind_ty = self.tir.memories[tir_idx].size;
 				let len_ty = self.lower_type_index(kind_ty.inner);
@@ -1329,7 +1357,7 @@ impl<'tir> Builder<'tir> {
 			tir::Type::Memory { .. } => Type::Unit,
 			tir::Type::Struct { struct_index, args } => {
 				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, &args);
+					self.ensure_aggregate_for_struct(*struct_index, args);
 				Type::Aggregate { aggregate_index }
 			}
 			tir::Type::Tuple { elements } => {
@@ -1342,7 +1370,7 @@ impl<'tir> Builder<'tir> {
 				Type::Aggregate { aggregate_index }
 			}
 			tir::Type::Enum { enum_index } => {
-				let repr_ty = self.tir.enums[enum_index as usize].repr_type;
+				let repr_ty = self.tir.enums[*enum_index as usize].repr_type;
 				self.lower_type_index(repr_ty)
 			}
 			_ => unreachable!(),
@@ -1865,10 +1893,10 @@ impl<'tir> Builder<'tir> {
 			tir::ExprKind::Function { id } => {
 				// If the FunctionItem carries non-empty type_args the reference is a
 				// monomorphized generic function; register the mono instance.
-				match self.tir.types[expr.ty.as_usize()].clone() {
-					tir::Type::FunctionItem {
+				match &self.tir.types[expr.ty.as_usize()] {
+					&tir::Type::FunctionItem {
 						id: fn_id,
-						type_args,
+						ref type_args,
 					} if !type_args.is_empty() => {
 						let concrete_args: Box<[tir::TypeIndex]> = type_args
 							.iter()
@@ -2226,6 +2254,11 @@ impl<'tir> Builder<'tir> {
 						let const_idx =
 							self.tir.expect_const_index(*id) as usize;
 						let result_ty = self.lower_type_index(expr.ty);
+						// Only `DATA_END`/`INDEX` are compiler-synthesized —
+						// every other `Memory`-trait const (e.g. `PAGE_SIZE`)
+						// is an ordinary default value, already folded to a
+						// `const_value` in TIR, and falls through to the
+						// generic path below like any other const.
 						if let tir::Type::Memory { id, .. } =
 							&self.tir.types[namespace.inner.as_usize()]
 						{
@@ -2242,7 +2275,7 @@ impl<'tir> Builder<'tir> {
 										ty: result_ty,
 									};
 								}
-								"MEMORY_INDEX" => {
+								"INDEX" => {
 									return Expression {
 										kind: ExprKind::MemoryIndex {
 											memory: *id,
@@ -2250,7 +2283,7 @@ impl<'tir> Builder<'tir> {
 										ty: result_ty,
 									};
 								}
-								_ => unreachable!(),
+								_ => {}
 							}
 						};
 
@@ -2776,16 +2809,16 @@ impl<'tir> Builder<'tir> {
 				}
 			}
 			tir::ExprKind::SliceRange { object, start, end } => {
-				let (elem_tir_ty, mem_tir_ty, static_size) =
-					match self.tir.types[object.ty.as_usize()].clone() {
-						tir::Type::Array {
-							of, memory, size, ..
-						} => (of, memory, Some(size)),
-						tir::Type::Slice { of, memory, .. } => {
-							(of, memory, None)
-						}
-						_ => unreachable!(),
-					};
+				let (elem_tir_ty, mem_tir_ty, static_size) = match &self
+					.tir
+					.types[object.ty.as_usize()]
+				{
+					tir::Type::Array {
+						of, memory, size, ..
+					} => (*of, *memory, Some(*size)),
+					tir::Type::Slice { of, memory, .. } => (*of, *memory, None),
+					_ => unreachable!(),
+				};
 
 				let elem_size = self.compute_layout(elem_tir_ty).size;
 				let memory_id = self.resolve_memory_id(mem_tir_ty);
@@ -3369,6 +3402,61 @@ impl<'tir> Builder<'tir> {
 				},
 				ty: self.lower_type_index(expr_ty),
 			},
+			"f32_nearest" | "f64_nearest" => Expression {
+				kind: ExprKind::Nearest {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_min" | "f64_min" => Expression {
+				kind: ExprKind::Min {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_max" | "f64_max" => Expression {
+				kind: ExprKind::Max {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_copysign" | "f64_copysign" => Expression {
+				kind: ExprKind::Copysign {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
 			"i32_neg" | "i64_neg" | "f32_neg" | "f64_neg" => Expression {
 				kind: ExprKind::Neg {
 					value: Box::new(self.lower_expression(
@@ -3750,6 +3838,46 @@ impl<'tir> Builder<'tir> {
 				},
 				ty: self.lower_type_index(expr_ty),
 			},
+			"i32_reinterpret_f32" => Expression {
+				kind: ExprKind::I32ReinterpretF32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f32_reinterpret_i32" => Expression {
+				kind: ExprKind::F32ReinterpretI32 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i64_reinterpret_f64" => Expression {
+				kind: ExprKind::I64ReinterpretF64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"f64_reinterpret_i64" => Expression {
+				kind: ExprKind::F64ReinterpretI64 {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
 			"memory_fill" => {
 				let raw_ty = type_args[0];
 				let mem_ty = match &self.tir.types[raw_ty.as_usize()] {
@@ -3865,9 +3993,9 @@ impl<'tir> Builder<'tir> {
 				let (base_ptr, base_offset, memory_id) =
 					self.lower_place_address(func_ctx, object, sink);
 				let (struct_index, args) =
-					match self.tir.types[object.ty.as_usize()].clone() {
+					match &self.tir.types[object.ty.as_usize()] {
 						tir::Type::Struct { struct_index, args } => {
-							(struct_index, args)
+							(*struct_index, &args[..])
 						}
 						_ => unreachable!(
 							"PlaceKind::Field: parent place must be a struct"

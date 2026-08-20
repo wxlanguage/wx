@@ -704,6 +704,43 @@ fn test_numeric_literal_forms() {
 	));
 }
 
+#[test]
+fn test_scientific_notation_float_literals() {
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            local plain  = 1e10;
+            local dot    = 3.4e2;
+            local plus   = 1e+5;
+            local minus  = 1.5e-3;
+            local upper  = 2E3;
+        }
+    "});
+
+	assert!(case.ast.diagnostics.is_empty());
+	let statements = function_block(&case.ast, 0);
+	assert_eq!(statements.len(), 5);
+	assert!(matches!(
+		local_definition_value(statements, 0),
+		Expression::Float { value } if *value == 1e10
+	));
+	assert!(matches!(
+		local_definition_value(statements, 1),
+		Expression::Float { value } if *value == 3.4e2
+	));
+	assert!(matches!(
+		local_definition_value(statements, 2),
+		Expression::Float { value } if *value == 1e+5
+	));
+	assert!(matches!(
+		local_definition_value(statements, 3),
+		Expression::Float { value } if *value == 1.5e-3
+	));
+	assert!(matches!(
+		local_definition_value(statements, 4),
+		Expression::Float { value } if *value == 2E3
+	));
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -880,6 +917,24 @@ fn test_invalid_integer_literal() {
 	assert!(matches!(
 		statement_expression(function_block(&case.ast, 0), 0),
 		Expression::Int { value: 0 }
+	));
+}
+
+#[test]
+fn test_invalid_float_literal_empty_exponent() {
+	// `1e` and `1e+` still lex as a single (malformed) Float token rather
+	// than backtracking to split off `e`/`e+` as a separate identifier —
+	// see the comment on `Lexer::consume_number`'s exponent handling.
+	let case = TestCase::new(indoc! {"
+        fn f() -> f32 {
+            1e
+        }
+    "});
+
+	assert_eq!(diagnostic_codes(&case.ast), vec!["E0005"]);
+	assert!(matches!(
+		statement_expression(function_block(&case.ast, 0), 0),
+		Expression::Float { value } if *value == 0.0
 	));
 }
 

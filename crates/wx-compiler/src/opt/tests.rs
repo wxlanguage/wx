@@ -24,7 +24,7 @@ const STD: &str = indoc! {"
     typeset PointerSize { u32, u64 }
     trait Memory {
         type Size: PointerSize;
-        const MEMORY_INDEX: u32;
+        const INDEX: u32;
         fn grow(self, delta: Self::Size) -> Self::Size;
         fn size(self) -> Self::Size;
     }
@@ -55,8 +55,8 @@ impl TestCase {
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
@@ -67,7 +67,7 @@ impl TestCase {
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
+		let mut graph = builder.build(root_id);
 		let tir = tir::TIR::build(&mut graph);
 		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
 		TestCase {

@@ -3,20 +3,20 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 404
-    signature_index: 1
+  - id: 510
+    signature_index: 9
     scopes:
       - kind: Block
         parent: ~
         locals:
           - ty:
               Pointer:
-                memory: 402
+                memory: 508
                 kind: Memory32
             mutability: Immutable
           - ty:
               Pointer:
-                memory: 402
+                memory: 508
                 kind: Memory32
             mutability: Immutable
           - ty: U32
@@ -44,7 +44,7 @@ functions:
                         local_index: 0
                     ty:
                       Pointer:
-                        memory: 402
+                        memory: 508
                         kind: Memory32
               ty: Unit
             - kind:
@@ -56,7 +56,7 @@ functions:
                         local_index: 1
                     ty:
                       Pointer:
-                        memory: 402
+                        memory: 508
                         kind: Memory32
                   value:
                     kind:
@@ -77,10 +77,10 @@ functions:
                                             local_index: 1
                                         ty:
                                           Pointer:
-                                            memory: 402
+                                            memory: 508
                                             kind: Memory32
                                       offset: 4
-                                      memory: 402
+                                      memory: 508
                                   ty: U32
                             ty: Unit
                           - kind:
@@ -115,11 +115,48 @@ functions:
                             ty: U32
                     ty: U32
                   offset: 4
-                  memory: 402
+                  memory: 508
               ty: Unit
       ty: Unit
     static_data: []
 signatures:
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
+  - items:
+      - F64
+      - F64
+      - I32
+      - F64
+    params_count: 3
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - Aggregate:
+          aggregate_index: 0
+    params_count: 1
+  - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - Aggregate:
+          aggregate_index: 1
+    params_count: 1
   - items:
       - U32
       - U32
@@ -127,7 +164,7 @@ signatures:
     params_count: 2
   - items:
       - Pointer:
-          memory: 402
+          memory: 508
           kind: Memory32
       - Unit
     params_count: 1
@@ -136,13 +173,60 @@ signatures:
       - F32
     params_count: 1
   - items:
+      - F32
+      - F32
+      - F32
+    params_count: 2
+  - items:
+      - F32
+      - I32
+    params_count: 1
+  - items:
+      - F32
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F32
+    params_count: 1
+  - items:
+      - U32
+      - F32
+    params_count: 1
+  - items:
       - F64
+      - I64
+    params_count: 1
+  - items:
+      - F64
+      - U64
+    params_count: 1
+  - items:
+      - I64
+      - F64
+    params_count: 1
+  - items:
+      - U64
       - F64
     params_count: 1
   - items:
       - I32
       - I32
       - I32
+    params_count: 2
+  - items:
+      - F32
+      - I32
+      - F32
+    params_count: 2
+  - items:
+      - I32
+      - I64
+    params_count: 1
+  - items:
+      - F64
+      - I32
+      - F64
     params_count: 2
   - items:
       - I32
@@ -170,16 +254,6 @@ signatures:
       - U64
       - U64
     params_count: 1
-  - items:
-      - F32
-      - F32
-      - F32
-    params_count: 2
-  - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
   - items:
       - I8
       - I8
@@ -228,16 +302,43 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 404
-      name: 206
+      id: 510
+      name: 310
 imports: []
 memories:
-  - id: 402
+  - id: 508
     source: Internal
     kind: Memory32
     min_pages: ~
     max_pages: ~
 aggregates:
+  - values:
+      - F64
+      - F64
+      - I32
+    offsets:
+      - 0
+      - 8
+      - 16
+    layout:
+      size: 24
+      align: 8
+    decl_to_phys:
+      - 2
+      - 0
+      - 1
+  - values:
+      - F64
+      - I32
+    offsets:
+      - 0
+      - 8
+    layout:
+      size: 16
+      align: 8
+    decl_to_phys:
+      - 1
+      - 0
   - values:
       - U32
       - U32

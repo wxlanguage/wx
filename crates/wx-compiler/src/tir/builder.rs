@@ -1658,7 +1658,7 @@ fn report_invalid_cast(
 		.with_label(span.primary_label())
 }
 
-pub fn build(graph: &mut CompilationGraph) -> TIR {
+pub fn build(graph: &mut CompilationUnit) -> TIR {
 	let source_modules: Vec<_> = graph
 		.crates
 		.iter()
@@ -6298,6 +6298,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					attributes,
+					value,
 				} = item
 				{
 					let ty_idx = self.resolve_type(
@@ -6306,6 +6307,51 @@ impl<'ast> Builder<'ast, '_> {
 						ty,
 					);
 					let attributes = self.resolve_attributes(*id, attributes);
+					// A default value's `Self`-relative type (`Self::Size`)
+					// is already resolved above into `ty_idx`, an abstract
+					// `Type::TypeParam` — building/coercing the value
+					// expression against it needs no further generic-scope
+					// threading, the same way an ordinary comptime literal
+					// already coerces against a typeset-bounded type param
+					// (see `test_typeset_intersection_range_literal_in_local`).
+					let (value_expr, const_value) = match value {
+						Some(value_ast) => match self
+							.build_const_context_expression(
+								resolve_context,
+								value_ast,
+								ty_idx,
+							) {
+							Ok(value_expr) => {
+								let const_value =
+									match self.eval_const_expr(&value_expr) {
+										Ok(v) => Some(v),
+										Err(_) => {
+											self.tir.diagnostics.push(
+												report_not_const_evaluatable(
+													SourceSpan::new(
+														resolve_context.file_id,
+														value_ast.span,
+													),
+												),
+											);
+											None
+										}
+									};
+								(Some(Box::new(value_expr)), const_value)
+							}
+							Err(_) => (None, None),
+						},
+						None => (None, None),
+					};
+					// Captured only now, right before the push — building the
+					// value expression above can itself demand-drive other
+					// items' signatures, which may push their own entries
+					// onto `self.tir.constants` first. Snapshotting the
+					// index any earlier (as the surrounding TIR structs
+					// mostly do, safely, since they never resolve a value
+					// expression in between) would go stale the moment that
+					// happens, pointing this entry at whatever unrelated
+					// constant ended up in the slot instead.
 					let const_index = self.tir.constants.len() as ConstIndex;
 					self.tir.constants.push(Constant {
 						id: *id,
@@ -6318,8 +6364,8 @@ impl<'ast> Builder<'ast, '_> {
 							inner: ty_idx,
 							span: ty.span,
 						},
-						value: None,
-						const_value: None,
+						value: value_expr,
+						const_value,
 						accesses: Vec::new(),
 						attributes,
 					});
@@ -6646,10 +6692,9 @@ impl<'ast> Builder<'ast, '_> {
 							inner: ty_idx,
 							span: ty_span,
 						};
-					// A const whose value fails to build never claims its
-					// name, matching current behavior — the stub still
-					// exists (for `item_lookup`/duplicate-span purposes)
-					// with `value: None`, but stays permanently `Pending`.
+					// A const whose value fails to build keeps `value: None`
+					// and `const_value: None` on its stub — but it still
+					// binds its name below, so it stays referenceable.
 					if let Ok(value_expr) = self.build_const_context_expression(
 						resolve_context,
 						value,
@@ -6674,18 +6719,31 @@ impl<'ast> Builder<'ast, '_> {
 							Some(Box::new(value_expr));
 						self.tir.constants[const_index as usize].const_value =
 							const_value;
+					}
 
-						let key = (SymbolNamespace::Value, name.inner);
-						if matches!(
-							self.direct_scope_lookup(resolve_context.namespace, key),
-							Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-						) {
-							self.insert_symbol(
-								resolve_context.namespace,
-								key,
-								SymbolKind::Const { const_index },
-							);
-						}
+					// Bind the name whether or not the value resolved. Every
+					// other item kind binds unconditionally once it holds its
+					// own `Pending` slot; a const used to bind only on
+					// success, which left the name permanently `Pending` and
+					// made the next use of it in value position hit the
+					// "signature resolved but symbol still pending"
+					// unreachable in `global_symbol_to_expression` — the same
+					// hole `register_placeholder_memory` exists to close for
+					// `memory` declarations, and with the same trust model:
+					// `build_const_context_expression` has already reported
+					// why the value failed, and `wx-cli` aborts before
+					// `MIR::build` whenever TIR carries any error, so the
+					// value-less stub never reaches lowering.
+					let key = (SymbolNamespace::Value, name.inner);
+					if matches!(
+						self.direct_scope_lookup(resolve_context.namespace, key),
+						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
+					) {
+						self.insert_symbol(
+							resolve_context.namespace,
+							key,
+							SymbolKind::Const { const_index },
+						);
 					}
 				}
 			}
@@ -7552,8 +7610,8 @@ impl<'ast> Builder<'ast, '_> {
 		// Final segment: look up the symbol in the final namespace and convert to BoundKind.
 		let last = segs.last().unwrap();
 		let file_id = resolve_context.file_id;
-		let Type::Namespace { namespace_idx } =
-			self.tir.types[namespace_ty.as_usize()].clone()
+		let &Type::Namespace { namespace_idx } =
+			&self.tir.types[namespace_ty.as_usize()]
 		else {
 			self.tir.diagnostics.push(
 				Diagnostic::error()
@@ -8199,6 +8257,24 @@ impl<'ast> Builder<'ast, '_> {
 							})
 						}
 					}
+					// `Type::Memory` is compiler-synthesized (a `memory`
+					// declaration, never a hand-written `impl Memory for
+					// ..`), so it never gets a real `TraitImpl` entry the
+					// `find_trait_impl` branch below could find — its
+					// `Size` is already known directly as a struct field
+					// (same fact `pointer_type_for_memory` relies on).
+					// Also sidesteps an ordering hazard: this substitution
+					// runs from `seed_memory_trait_impl_with`, called
+					// *before* the caller registers this memory's real
+					// `TraitImpl` — so even a `Type::Memory` impl entry
+					// existing wouldn't yet be visible to `find_trait_impl`
+					// at this point.
+					Type::Memory { size, .. }
+						if assoc_name
+							== self.interner.get_or_intern("Size") =>
+					{
+						*size
+					}
 					// `trait_index` is already known here (it's part of the
 					// projection type itself), so go straight to that one
 					// impl instead of the ambiguity-scanning
@@ -8584,6 +8660,17 @@ impl<'ast> Builder<'ast, '_> {
 						self.substitute_type(original_ty, &[memory_self]);
 					let c = &self.tir.constants[index as usize];
 					let new_id = self.id_generator.generate();
+					// `value` itself can't be forked (not `Clone` — see
+					// above), but `const_value` can: it's what MIR lowering
+					// actually reads for a `Memory`-trait const access (see
+					// the `NamespaceAccess` handling in `mir::build`), so a
+					// default value's already-folded result (e.g.
+					// `PAGE_SIZE`'s `Int(65536)`) needs to carry over here
+					// or every memory's clone silently loses it, unlike
+					// `INDEX`/`DATA_END` (always `None` on the template
+					// too, since their values are synthesized by name in
+					// MIR instead).
+					let const_value = c.const_value;
 					let new_constant = Constant {
 						id: new_id,
 						file_id: c.file_id,
@@ -8596,7 +8683,7 @@ impl<'ast> Builder<'ast, '_> {
 							span: c.ty.span,
 						},
 						value: None,
-						const_value: None,
+						const_value,
 						accesses: Vec::new(),
 						attributes: Box::new([]),
 					};
@@ -9078,16 +9165,18 @@ impl<'ast> Builder<'ast, '_> {
 					return Ok(ConstValue::Int((value as i64).wrapping_neg()));
 				}
 
-				let ConstValue::Int(value) = self.eval_const_expr(operand)?
-				else {
-					return Err(());
-				};
-				match operator.inner {
-					ast::UnaryOp::InvertSign => {
+				let value = self.eval_const_expr(operand)?;
+				match (operator.inner, value) {
+					(ast::UnaryOp::InvertSign, ConstValue::Float(value)) => {
+						Ok(ConstValue::Float(-value))
+					}
+					(ast::UnaryOp::InvertSign, ConstValue::Int(value)) => {
 						Ok(ConstValue::Int(value.wrapping_neg()))
 					}
-					ast::UnaryOp::BitNot => Ok(ConstValue::Int(!value)),
-					ast::UnaryOp::Not => Err(()),
+					(ast::UnaryOp::BitNot, ConstValue::Int(value)) => {
+						Ok(ConstValue::Int(!value))
+					}
+					_ => Err(()),
 				}
 			}
 			ExprKind::Binary {
@@ -9095,11 +9184,29 @@ impl<'ast> Builder<'ast, '_> {
 				left,
 				right,
 			} => {
-				let ConstValue::Int(left) = self.eval_const_expr(left)? else {
+				let left = self.eval_const_expr(left)?;
+				let right = self.eval_const_expr(right)?;
+				// Float operands are representation-agnostic the same way
+				// int Add/Sub/Mul are: plain `f64` arithmetic already
+				// follows IEEE-754 (division by zero yields ±∞/NaN rather
+				// than panicking), so no divide-by-zero guard is needed
+				// here the way the integer Div/Rem arms below need one.
+				if let (ConstValue::Float(left), ConstValue::Float(right)) =
+					(left, right)
+				{
+					return match operator.inner {
+						BinaryOp::Add => Ok(ConstValue::Float(left + right)),
+						BinaryOp::Sub => Ok(ConstValue::Float(left - right)),
+						BinaryOp::Mul => Ok(ConstValue::Float(left * right)),
+						BinaryOp::Div => Ok(ConstValue::Float(left / right)),
+						BinaryOp::Rem => Ok(ConstValue::Float(left % right)),
+						_ => Err(()),
+					};
+				}
+				let ConstValue::Int(left) = left else {
 					return Err(());
 				};
-				let ConstValue::Int(right) = self.eval_const_expr(right)?
-				else {
+				let ConstValue::Int(right) = right else {
 					return Err(());
 				};
 				// `Add`/`Sub`/`Mul` are representation-agnostic in two's
@@ -9161,6 +9268,32 @@ impl<'ast> Builder<'ast, '_> {
 						} else {
 							Ok(ConstValue::Int(left.wrapping_rem(right)))
 						}
+					}
+					BinaryOp::BitAnd => Ok(ConstValue::Int(left & right)),
+					BinaryOp::BitOr => Ok(ConstValue::Int(left | right)),
+					BinaryOp::BitXor => Ok(ConstValue::Int(left ^ right)),
+					// Masking (rather than a plain `<<`/`>>`) keeps an
+					// out-of-range shift amount (e.g. a typo'd `1 << 99`)
+					// from panicking the compiler itself — it folds to
+					// *some* wrapped value, which the caller's own
+					// range/repr check then rejects like any other
+					// out-of-range constant.
+					BinaryOp::LeftShift => {
+						Ok(ConstValue::Int(left.wrapping_shl(right as u32)))
+					}
+					// Right shift mirrors the same signed/arithmetic vs.
+					// unsigned/logical split codegen uses for the runtime
+					// `ShrS`/`ShrU` instructions (`opt/builder.rs`): `unsigned`
+					// picks a logical shift on the bit pattern, otherwise an
+					// arithmetic (sign-extending) shift on the `i64` value —
+					// correct here because that value is already the sign-
+					// extended bit-reinterpretation `ExprKind::Int`/`Unary`
+					// produced for it.
+					BinaryOp::RightShift if unsigned => Ok(ConstValue::Int(
+						(left as u64).wrapping_shr(right as u32) as i64,
+					)),
+					BinaryOp::RightShift => {
+						Ok(ConstValue::Int(left.wrapping_shr(right as u32)))
 					}
 					_ => Err(()),
 				}
@@ -9861,7 +9994,10 @@ impl<'ast> Builder<'ast, '_> {
 					ImplEntry::Method(fi) => {
 						(self.tir.functions[*fi as usize].body.is_none(), "fn")
 					}
-					ImplEntry::AssocConstant(_) => (true, "const"),
+					ImplEntry::AssocConstant(ci) => (
+						self.tir.constants[*ci as usize].value.is_none(),
+						"const",
+					),
 					ImplEntry::AssocType(_) => (true, "type"),
 					_ => continue,
 				};
@@ -10088,9 +10224,19 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		for constant in self.tir.constants.iter() {
+			// A trait const's default value (`parent: Some(ItemParent::Trait(_))`)
+			// is exempt for the same reason a default trait method is (see
+			// above): the trait declaration is itself the "use" — the
+			// default exists for whatever impl/generic code inherits it,
+			// which the compiler can't statically trace back here. Trait
+			// consts always carry `pub_span: None` (visibility comes from
+			// the trait, not the item), so without this they'd all read as
+			// "private and unused" the moment they got a default value —
+			// previously unreachable, since every trait const was bodiless.
 			if constant.pub_span.is_none()
 				&& constant.accesses.is_empty()
 				&& constant.value.is_some()
+				&& !matches!(constant.parent, Some(ItemParent::Trait(_)))
 			{
 				let name = self.interner.resolve(constant.name.inner).unwrap();
 				self.tir.diagnostics.push(
@@ -11527,13 +11673,17 @@ impl<'ast> Builder<'ast, '_> {
 		match lookup {
 			MemberLookup::Inherent {
 				entry: ImplEntry::AssocConstant(index),
-				..
+				type_args,
 			}
 			| MemberLookup::Trait {
 				entry: ImplEntry::AssocConstant(index),
+				type_args,
 				..
 			} => {
-				return Ok(ResolvedMember::Const { const_index: index });
+				return Ok(ResolvedMember::Const {
+					const_index: index,
+					type_args,
+				});
 			}
 			MemberLookup::Inherent {
 				entry:
@@ -11624,7 +11774,10 @@ impl<'ast> Builder<'ast, '_> {
 						Ok(ResolvedMember::Global { global_index })
 					}
 					Some(SymbolKind::Const { const_index }) => {
-						Ok(ResolvedMember::Const { const_index })
+						Ok(ResolvedMember::Const {
+							const_index,
+							type_args: Box::new([]),
+						})
 					}
 					_ => {
 						self.tir.diagnostics.push(
@@ -11781,12 +11934,28 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			ResolvedMember::Const { const_index } => {
+			ResolvedMember::Const {
+				const_index,
+				type_args,
+			} => {
 				self.tir.constants[const_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, member_span));
 				let id = self.tir.constants[const_index as usize].id;
-				let ty = self.tir.constants[const_index as usize].ty.inner;
+				let raw_ty = self.tir.constants[const_index as usize].ty.inner;
+				// Substitutes the owning trait's `Self` for the receiver's
+				// own type — a no-op (`type_args` empty) for a plain
+				// module-level const, and for a trait const whose type
+				// never mentions `Self` in the first place (`substitute_type`
+				// returns any type unchanged when it contains nothing to
+				// substitute). For a generic receiver (`Mem: Memory`),
+				// `type_args` is `[Mem's own TypeIndex]`, so this leaves the
+				// projection deferred (still `Mem::Size`, not yet
+				// concrete) rather than forcing it — exactly like a
+				// `GenericMethodCall`'s abstract-method type stays
+				// deferred until monomorphization substitutes a concrete
+				// `Self`.
+				let ty = self.substitute_type(raw_ty, &type_args);
 				Ok(Expression {
 					kind: ExprKind::NamespaceAccess {
 						namespace,
@@ -11892,8 +12061,11 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let resolved = match lookup {
-			Ok((ImplEntry::AssocConstant(const_index), _)) => {
-				ResolvedMember::Const { const_index }
+			Ok((ImplEntry::AssocConstant(const_index), type_args)) => {
+				ResolvedMember::Const {
+					const_index,
+					type_args,
+				}
 			}
 			Ok((
 				ImplEntry::Method(func_index)
@@ -15215,7 +15387,18 @@ impl<'ast> Builder<'ast, '_> {
 					None => false,
 				}
 			}
-			ImplEntry::AssocConstant(_) | ImplEntry::AssocType(_) => false,
+			// Unlike a method's body (resolved lazily in the separate,
+			// later `ensure_body` phase — so `tir.functions[..].body` can
+			// still be `None` for a default method whose body just hasn't
+			// been demanded yet), a const's `value` is resolved eagerly,
+			// atomically, within `ensure_signature` itself, strictly before
+			// its `ImplEntry::AssocConstant` entry is inserted into
+			// `trait.entries` — so by the time this entry is even
+			// reachable to look up, `value` is guaranteed already set.
+			ImplEntry::AssocConstant(const_index) => {
+				self.tir.constants[const_index as usize].value.is_some()
+			}
+			ImplEntry::AssocType(_) => false,
 		}
 	}
 
@@ -17059,44 +17242,39 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	fn pointer_type_for_memory(&mut self, memory: TypeIndex) -> TypeIndex {
-		match &self.tir.types[memory.as_usize()].clone() {
-			Type::Memory { id, .. } => {
-				let idx = self.tir.expect_memory_index(*id);
-				self.tir.memories[idx as usize].size.inner
+		let (owner, param_index) = match &self.tir.types[memory.as_usize()] {
+			&Type::Memory { id, .. } => {
+				let idx = self.tir.expect_memory_index(id);
+				return self.tir.memories[idx as usize].size.inner;
 			}
-			Type::TypeParam { owner, param_index } => {
-				// Generic `M: Memory` — the index type is `M::Size`.
-				// Find the first bound trait that declares `Size` as an assoc type.
-				let size_sym = self.interner.get_or_intern("Size");
-				let param_index = *param_index;
-				let bounds = self
-					.tir
-					.type_param_info(*owner, param_index as usize)
-					.bounds
-					.traits
-					.to_owned();
-				let trait_index = bounds
-					.iter()
-					.find(|b| {
-						self.tir.traits[b.trait_index as usize]
-							.assoc_types
-							.contains_key(&size_sym)
-					})
-					.map(|b| b.trait_index);
-				match trait_index {
-					Some(trait_index) => {
-						self.intern_type(Type::AssocTypeProjection {
-							trait_index,
-							assoc_name: size_sym,
-							base: memory,
-						})
-					}
-					// No bound with Size — fall back to untyped; will be caught
-					// by type checking if the user provides a typed index.
-					None => TypeIndex::INTEGER,
-				}
-			}
-			_ => TypeIndex::INTEGER,
+			&Type::TypeParam { owner, param_index } => (owner, param_index),
+			_ => return TypeIndex::INTEGER,
+		};
+
+		// Generic `M: Memory` — the index type is `M::Size`.
+		// Find the first bound trait that declares `Size` as an assoc type.
+		let size_sym = self.interner.get_or_intern("Size");
+		let trait_index = self
+			.tir
+			.type_param_info(owner, param_index as usize)
+			.bounds
+			.traits
+			.iter()
+			.find(|b| {
+				self.tir.traits[b.trait_index as usize]
+					.assoc_types
+					.contains_key(&size_sym)
+			})
+			.map(|b| b.trait_index);
+		match trait_index {
+			Some(trait_index) => self.intern_type(Type::AssocTypeProjection {
+				trait_index,
+				assoc_name: size_sym,
+				base: memory,
+			}),
+			// No bound with Size — fall back to untyped; will be caught
+			// by type checking if the user provides a typed index.
+			None => TypeIndex::INTEGER,
 		}
 	}
 
@@ -17111,8 +17289,8 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_size, expected_ownership) =
-			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
-				Type::Array {
+			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+				&Type::Array {
 					of,
 					memory,
 					size,
@@ -17244,8 +17422,8 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_ownership) =
-			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
-				Type::Array {
+			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+				&Type::Array {
 					of,
 					memory,
 					ownership,
@@ -17278,8 +17456,8 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 
-		if let Type::Array { size, .. } =
-			self.tir.types[access_ctx.expected_type.as_usize()].clone()
+		if let &Type::Array { size, .. } =
+			&self.tir.types[access_ctx.expected_type.as_usize()]
 		{
 			if count != size {
 				self.tir.diagnostics.push(report_array_size_mismatch(
@@ -17372,33 +17550,30 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, ownership) =
-			match self.tir.types[object.ty.as_usize()].clone() {
-				Type::Array {
-					of,
-					memory,
-					ownership,
-					..
-				} => (of, memory, ownership),
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				} => (of, memory, ownership),
-				Type::Error => return Err(()),
-				_ => {
-					self.tir.diagnostics.push(report_index_on_non_indexable(
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							object.span,
-						),
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(object.ty)
-							.unwrap(),
-					));
-					return Err(());
-				}
-			};
+		let indexable = match &self.tir.types[object.ty.as_usize()] {
+			&Type::Array {
+				of,
+				memory,
+				ownership,
+				..
+			}
+			| &Type::Slice {
+				of,
+				memory,
+				ownership,
+			} => Some((of, memory, ownership)),
+			Type::Error => return Err(()),
+			_ => None,
+		};
+		let Some((elem_type, memory, ownership)) = indexable else {
+			self.tir.diagnostics.push(report_index_on_non_indexable(
+				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
+				TypeFormatter::new(&self.tir, self.interner)
+					.display_type(object.ty)
+					.unwrap(),
+			));
+			return Err(());
+		};
 		let mutable = ownership == ast::Ownership::Exclusive;
 
 		if matches!(
@@ -17475,33 +17650,30 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, ownership) =
-			match self.tir.types[object.ty.as_usize()].clone() {
-				Type::Array {
-					of,
-					memory,
-					ownership,
-					..
-				} => (of, memory, ownership),
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				} => (of, memory, ownership),
-				Type::Error => return Err(()),
-				_ => {
-					self.tir.diagnostics.push(report_index_on_non_indexable(
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							object.span,
-						),
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(object.ty)
-							.unwrap(),
-					));
-					return Err(());
-				}
-			};
+		let indexable = match &self.tir.types[object.ty.as_usize()] {
+			&Type::Array {
+				of,
+				memory,
+				ownership,
+				..
+			}
+			| &Type::Slice {
+				of,
+				memory,
+				ownership,
+			} => Some((of, memory, ownership)),
+			Type::Error => return Err(()),
+			_ => None,
+		};
+		let Some((elem_type, memory, ownership)) = indexable else {
+			self.tir.diagnostics.push(report_index_on_non_indexable(
+				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
+				TypeFormatter::new(&self.tir, self.interner)
+					.display_type(object.ty)
+					.unwrap(),
+			));
+			return Err(());
+		};
 
 		let index_type = self.pointer_type_for_memory(memory);
 

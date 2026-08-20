@@ -1,0 +1,33 @@
+// Small multiples of pi/2 rounded to double precision.
+const S1_PIO2: f64 = 1. * f64::FRAC_PI_2;
+const S2_PIO2: f64 = 2. * f64::FRAC_PI_2;
+const S3_PIO2: f64 = 3. * f64::FRAC_PI_2;
+const S4_PIO2: f64 = 4. * f64::FRAC_PI_2;
+
+pub fn sinf(x: f32) -> f32 {
+  local x64 = f64_promote_f32(x);
+  
+  // 0x1p120f === 2 ^ 120
+  local x1p120 = f32::from_bits(0x7b800000);
+  
+  local mut ix = x.to_bits();
+  local sign = (ix >> 31) != 0;
+  ix &= 0x7fffffff;
+
+  if ix <= 0x3f490fda {
+    /* |x| ~<= pi/4 */
+    if ix < 0x39800000 {
+        /* |x| < 2**-12 */
+        /* raise inexact if x!=0 and underflow if subnormal */
+        force_eval!(if ix < 0x00800000 {
+            x / x1p120
+        } else {
+            x + x1p120
+        });
+        return x;
+    }
+    // return k_sinf(x64);
+  }
+  
+  // unreachable
+}

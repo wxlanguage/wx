@@ -152,6 +152,7 @@ impl Rebaser {
 			| ExprKind::Floor { value }
 			| ExprKind::Ceil { value }
 			| ExprKind::Trunc { value }
+			| ExprKind::Nearest { value }
 			| ExprKind::BitNot { value }
 			| ExprKind::Eqz { value }
 			| ExprKind::I64ExtendI32S { value }
@@ -175,6 +176,10 @@ impl Rebaser {
 			| ExprKind::U64TruncF64 { value }
 			| ExprKind::F64PromoteF32 { value }
 			| ExprKind::F32DemoteF64 { value }
+			| ExprKind::I32ReinterpretF32 { value }
+			| ExprKind::F32ReinterpretI32 { value }
+			| ExprKind::I64ReinterpretF64 { value }
+			| ExprKind::F64ReinterpretI64 { value }
 			| ExprKind::PointerLoad { pointer: value, .. }
 			| ExprKind::MemoryGrow { delta: value, .. } => self.rebase(value),
 			ExprKind::Add { left, right }
@@ -195,6 +200,9 @@ impl Rebaser {
 			| ExprKind::BitXor { left, right }
 			| ExprKind::LeftShift { left, right }
 			| ExprKind::RightShift { left, right }
+			| ExprKind::Min { left, right }
+			| ExprKind::Max { left, right }
+			| ExprKind::Copysign { left, right }
 			| ExprKind::PointerStore {
 				pointer: left,
 				value: right,
@@ -358,12 +366,26 @@ fn inline_call(
 }
 
 /// Walks `expr` in-place (post-order) and replaces every direct call to
-/// `inline_id` with `inline_body` inlined at the call site.
+/// any function in `targets` with that function's body inlined at the call
+/// site.
+///
+/// `targets` holds every `#[inline]` function that's simultaneously ready
+/// to be inlined in this round of `run_inlining_pass` (a whole topological
+/// "level" — everything with no remaining unresolved inline dependency),
+/// not just one. Inlining a whole level together in a single walk, rather
+/// than one call at a time in separate passes, means a call to one target
+/// found nested inside another target's already-substituted wrapper block
+/// (e.g. `v * (2.0 + z * r)`, mixing `Mul::mul` and `Add::add`) gets
+/// resolved in the *same* walk that created that wrapper — so `current_scope`
+/// is never re-derived from scratch against an already-substituted tree,
+/// which is what let a later, separate pass mistake a wrapper block (meant
+/// to always stay empty — see `inline_call`'s doc comment) for a real
+/// caller scope and silently alias two calls' locals via
+/// `compute_locals_offsets` in `opt/builder.rs`.
 fn inline_expr(
 	expr: &mut Expression,
 	caller_scopes: &mut Vec<BlockScope>,
-	inline_id: ast::DefId,
-	inline_body: &Function,
+	targets: &HashMap<ast::DefId, Function>,
 	current_scope: ScopeIndex,
 ) {
 	// Recurse into all children first.
@@ -378,6 +400,7 @@ fn inline_expr(
 		| ExprKind::Floor { value }
 		| ExprKind::Ceil { value }
 		| ExprKind::Trunc { value }
+		| ExprKind::Nearest { value }
 		| ExprKind::BitNot { value }
 		| ExprKind::Eqz { value }
 		| ExprKind::I64ExtendI32S { value }
@@ -400,23 +423,17 @@ fn inline_expr(
 		| ExprKind::I64TruncF64 { value }
 		| ExprKind::U64TruncF64 { value }
 		| ExprKind::F64PromoteF32 { value }
-		| ExprKind::F32DemoteF64 { value } => inline_expr(
-			value,
-			caller_scopes,
-			inline_id,
-			inline_body,
-			current_scope,
-		),
+		| ExprKind::F32DemoteF64 { value }
+		| ExprKind::I32ReinterpretF32 { value }
+		| ExprKind::F32ReinterpretI32 { value }
+		| ExprKind::I64ReinterpretF64 { value }
+		| ExprKind::F64ReinterpretI64 { value } => {
+			inline_expr(value, caller_scopes, targets, current_scope)
+		}
 
 		ExprKind::Aggregate { values: fields } => {
 			for e in fields.iter_mut() {
-				inline_expr(
-					e,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(e, caller_scopes, targets, current_scope);
 			}
 		}
 		ExprKind::Block {
@@ -426,32 +443,16 @@ fn inline_expr(
 		} => {
 			let block_scope = *scope_index;
 			for e in expressions.iter_mut() {
-				inline_expr(
-					e,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					block_scope,
-				);
+				inline_expr(e, caller_scopes, targets, block_scope);
 			}
 		}
-		ExprKind::Loop { block, .. } => inline_expr(
-			block,
-			caller_scopes,
-			inline_id,
-			inline_body,
-			current_scope,
-		),
+		ExprKind::Loop { block, .. } => {
+			inline_expr(block, caller_scopes, targets, current_scope)
+		}
 
 		ExprKind::Break { value, .. } | ExprKind::Return { value } => {
 			if let Some(v) = value {
-				inline_expr(
-					v,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(v, caller_scopes, targets, current_scope);
 			}
 		}
 		ExprKind::IfElse {
@@ -459,28 +460,10 @@ fn inline_expr(
 			then_block,
 			else_block,
 		} => {
-			inline_expr(
-				condition,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				then_block,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(condition, caller_scopes, targets, current_scope);
+			inline_expr(then_block, caller_scopes, targets, current_scope);
 			if let Some(e) = else_block {
-				inline_expr(
-					e,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(e, caller_scopes, targets, current_scope);
 			}
 		}
 		ExprKind::Switch {
@@ -488,48 +471,18 @@ fn inline_expr(
 			cases,
 			default,
 		} => {
-			inline_expr(
-				selector,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(selector, caller_scopes, targets, current_scope);
 			for (_, body) in cases.iter_mut() {
-				inline_expr(
-					body,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(body, caller_scopes, targets, current_scope);
 			}
 			if let Some(e) = default {
-				inline_expr(
-					e,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(e, caller_scopes, targets, current_scope);
 			}
 		}
 		ExprKind::Call { callee, arguments } => {
-			inline_expr(
-				callee,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(callee, caller_scopes, targets, current_scope);
 			for a in arguments.iter_mut() {
-				inline_expr(
-					a,
-					caller_scopes,
-					inline_id,
-					inline_body,
-					current_scope,
-				);
+				inline_expr(a, caller_scopes, targets, current_scope);
 			}
 		}
 		ExprKind::Add { left, right }
@@ -549,97 +502,32 @@ fn inline_expr(
 		| ExprKind::BitOr { left, right }
 		| ExprKind::BitXor { left, right }
 		| ExprKind::LeftShift { left, right }
-		| ExprKind::RightShift { left, right } => {
-			inline_expr(
-				left,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				right,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+		| ExprKind::RightShift { left, right }
+		| ExprKind::Min { left, right }
+		| ExprKind::Max { left, right }
+		| ExprKind::Copysign { left, right } => {
+			inline_expr(left, caller_scopes, targets, current_scope);
+			inline_expr(right, caller_scopes, targets, current_scope);
 		}
-		ExprKind::MemoryGrow { delta, .. } => inline_expr(
-			delta,
-			caller_scopes,
-			inline_id,
-			inline_body,
-			current_scope,
-		),
+		ExprKind::MemoryGrow { delta, .. } => {
+			inline_expr(delta, caller_scopes, targets, current_scope)
+		}
 		ExprKind::MemoryFill { dst, val, len, .. } => {
-			inline_expr(
-				dst,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				val,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				len,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(dst, caller_scopes, targets, current_scope);
+			inline_expr(val, caller_scopes, targets, current_scope);
+			inline_expr(len, caller_scopes, targets, current_scope);
 		}
 		ExprKind::MemoryCopy { dst, src, len, .. } => {
-			inline_expr(
-				dst,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				src,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				len,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(dst, caller_scopes, targets, current_scope);
+			inline_expr(src, caller_scopes, targets, current_scope);
+			inline_expr(len, caller_scopes, targets, current_scope);
 		}
-		ExprKind::PointerLoad { pointer, .. } => inline_expr(
-			pointer,
-			caller_scopes,
-			inline_id,
-			inline_body,
-			current_scope,
-		),
+		ExprKind::PointerLoad { pointer, .. } => {
+			inline_expr(pointer, caller_scopes, targets, current_scope)
+		}
 		ExprKind::PointerStore { pointer, value, .. } => {
-			inline_expr(
-				pointer,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
-			inline_expr(
-				value,
-				caller_scopes,
-				inline_id,
-				inline_body,
-				current_scope,
-			);
+			inline_expr(pointer, caller_scopes, targets, current_scope);
+			inline_expr(value, caller_scopes, targets, current_scope);
 		}
 		// Leaf variants — nothing to recurse into.
 		ExprKind::Noop
@@ -658,7 +546,8 @@ fn inline_expr(
 		| ExprKind::StaticPointer { .. } => {}
 	}
 
-	// After children are processed, check if this node is a call to inline_id.
+	// After children are processed, check if this node is a call to one of
+	// this round's targets.
 	let id = match &expr.kind {
 		ExprKind::Call { callee, .. } => match &callee.kind {
 			ExprKind::Function { id } => *id,
@@ -666,15 +555,15 @@ fn inline_expr(
 		},
 		_ => return,
 	};
-	if id != inline_id {
+	let Some(body) = targets.get(&id) else {
 		return;
-	}
+	};
 
 	let arguments = match std::mem::replace(&mut expr.kind, ExprKind::Noop) {
 		ExprKind::Call { arguments, .. } => arguments,
 		_ => unreachable!(),
 	};
-	*expr = inline_call(inline_body, arguments, caller_scopes, current_scope);
+	*expr = inline_call(body, arguments, caller_scopes, current_scope);
 }
 
 /// Directed call graph over MIR function `DefId`s.
@@ -746,40 +635,107 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 		.map(|(&id, _)| id)
 		.collect();
 
-	// Outer loop: run Kahn's, then break one mutual-recursion cycle at a time.
-	// When all inline callees have been processed the inner while loop drains
-	// to empty and there are no stalled nodes left, so we break out.
+	// Outer loop: run Kahn's one whole ready-level at a time, then break one
+	// mutual-recursion cycle at a time when a level empties out with stalled
+	// nodes still left. When every inline callee has been processed, `queue`
+	// stays empty and there are no stalled nodes left either, so we break out.
 	loop {
-		while let Some(f_id) = queue.pop_front() {
-			// f's body is clean: all of its inline callees were processed first.
-			// Clone once here; inline_call will clone scopes+block again per call site.
-			let f_body = mir.functions[func_idx[&f_id]].clone();
+		if queue.is_empty() {
+			// Cycle-breaker: any inline function still with count > 0 is part
+			// of a mutual-recursion cycle. Inlining it fully would require
+			// infinite expansion, so we evict one "anchor" per iteration — it
+			// stays as an ordinary call target — then decrement its inline
+			// callers so they may become unblocked and form the next level.
+			let anchor = inline_callee_count
+				.iter()
+				.find(|(_, n)| **n > 0)
+				.map(|(&id, _)| id);
+			let Some(anchor) = anchor else { break };
+			inline_callee_count.remove(&anchor);
+			for &caller_id in &graph.callers[&anchor] {
+				if let Some(count) = inline_callee_count.get_mut(&caller_id) {
+					*count -= 1;
+					if *count == 0 {
+						queue.push_back(caller_id);
+					}
+				}
+			}
+			continue;
+		}
 
-			let caller_ids: Vec<ast::DefId> =
-				graph.callers[&f_id].iter().copied().collect();
-			// f's own callee set doesn't change while its callers are being
-			// processed below (only caller/f edges are touched), so collect
-			// it once here instead of re-cloning it on every caller.
-			let f_callees: Vec<ast::DefId> =
-				graph.callees[&f_id].iter().copied().collect();
-			for caller_id in caller_ids {
-				let ci = func_idx[&caller_id];
-				let caller_func = &mut mir.functions[ci];
-				inline_expr(
-					&mut caller_func.block,
-					&mut caller_func.scopes,
-					f_id,
-					&f_body,
-					0,
-				);
+		// Drain every currently-ready function as one combined round: none
+		// of them depend on each other (Kahn's algorithm guarantees a
+		// function only reaches in-degree 0 once every inline callee of its
+		// own is already resolved), so inlining the whole level together in
+		// a single walk per caller — rather than one target at a time across
+		// separate passes — is both valid and, per `inline_expr`'s doc
+		// comment, required for correctness. Newly-ready callers discovered
+		// while processing this level go to `queue` for the *next* level,
+		// not this one, keeping `targets` fixed for the whole round.
+		let level: Vec<ast::DefId> = queue.drain(..).collect();
+
+		// Every caller of *any* level member gets exactly one combined
+		// inline_expr walk, regardless of how many level members it calls.
+		let mut caller_ids: HashSet<ast::DefId> = HashSet::new();
+		for &f_id in &level {
+			caller_ids.extend(graph.callers[&f_id].iter().copied());
+		}
+
+		// A level member with no caller left is never substituted anywhere
+		// this round, so nothing below ever reads its body — narrow the
+		// level to the members that are actually about to be inlined before
+		// paying for any of the per-member work. Most of a level is
+		// typically uncalled `#[inline]` stdlib functions still awaiting the
+		// DCE sweep at the end of this pass.
+		let inlined: Vec<ast::DefId> = level
+			.iter()
+			.copied()
+			.filter(|id| !graph.callers[id].is_empty())
+			.collect();
+
+		// Clone once here; inline_call will clone scopes+block again per
+		// call site.
+		let targets: HashMap<ast::DefId, Function> = inlined
+			.iter()
+			.map(|&id| (id, mir.functions[func_idx[&id]].clone()))
+			.collect();
+
+		// Each level member's own callee set doesn't change while callers
+		// are processed below (only caller/member edges are touched), so
+		// snapshot it once here instead of re-deriving it per caller.
+		let level_callees: HashMap<ast::DefId, Vec<ast::DefId>> = inlined
+			.iter()
+			.map(|&id| (id, graph.callees[&id].iter().copied().collect()))
+			.collect();
+
+		for caller_id in caller_ids {
+			let ci = func_idx[&caller_id];
+			let caller_func = &mut mir.functions[ci];
+			inline_expr(
+				&mut caller_func.block,
+				&mut caller_func.scopes,
+				&targets,
+				0,
+			);
+
+			for &f_id in &inlined {
+				if !graph.callees[&caller_id].contains(&f_id) {
+					continue;
+				}
+				// Only the bodies actually spliced in here bring their static
+				// entries along. Unioning the whole level's entries into every
+				// caller would keep data alive for functions this caller never
+				// calls — dead bytes in the emitted data segment (codegen
+				// unions `static_data` over the live functions), on top of
+				// growing every caller's list by the whole level each round.
 				caller_func
 					.static_data
-					.extend_from_slice(&f_body.static_data);
-
-				// Update graph: remove caller → f, propagate f's callees to caller.
+					.extend_from_slice(&targets[&f_id].static_data);
+				// Update graph: remove caller → f_id, propagate f_id's
+				// callees to caller.
 				graph.callees.get_mut(&caller_id).unwrap().remove(&f_id);
 				graph.callers.get_mut(&f_id).unwrap().remove(&caller_id);
-				for callee_id in f_callees.iter().copied() {
+				for &callee_id in &level_callees[&f_id] {
 					graph
 						.callees
 						.get_mut(&caller_id)
@@ -792,7 +748,8 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 						.insert(caller_id);
 				}
 
-				// If caller is also inline, one of its pending inline callees is done.
+				// If caller is also inline, one of its pending inline
+				// callees is done.
 				if let Some(count) = inline_callee_count.get_mut(&caller_id) {
 					*count -= 1;
 					if *count == 0 {
@@ -800,30 +757,8 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 					}
 				}
 			}
-			// graph.callers[f_id] is now empty — f is dead.
 		}
-
-		// Cycle-breaker: any inline function still with count > 0 is part of a
-		// mutual-recursion cycle.  Inlining it fully would require infinite
-		// expansion, so we evict one "anchor" per iteration — it stays as an
-		// ordinary call target — then decrement its inline callers so they may
-		// become unblocked and get inlined on the next inner-loop pass.
-		let anchor = inline_callee_count
-			.iter()
-			.find(|(_, n)| **n > 0)
-			.map(|(&id, _)| id);
-		let Some(anchor) = anchor else { break };
-		inline_callee_count.remove(&anchor);
-		for caller_id in
-			graph.callers[&anchor].iter().copied().collect::<Vec<_>>()
-		{
-			if let Some(count) = inline_callee_count.get_mut(&caller_id) {
-				*count -= 1;
-				if *count == 0 {
-					queue.push_back(caller_id);
-				}
-			}
-		}
+		// graph.callers[f_id] is now empty for every f_id in level — dead.
 	}
 
 	// Dead code elimination: BFS from exported functions and the start function.

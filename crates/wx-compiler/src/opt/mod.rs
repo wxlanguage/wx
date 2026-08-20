@@ -194,6 +194,21 @@ pub enum DataNodeKind {
 		right: DataNodeIndex,
 		ty: ScalarType,
 	},
+	Min {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Max {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Copysign {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
 
 	// ── Bitwise ────────────────────────────────────────────────────────────
 	BitAnd {
@@ -249,6 +264,10 @@ pub enum DataNodeKind {
 		ty: ScalarType,
 	},
 	Trunc {
+		operand: DataNodeIndex,
+		ty: ScalarType,
+	},
+	Nearest {
 		operand: DataNodeIndex,
 		ty: ScalarType,
 	},
@@ -324,6 +343,18 @@ pub enum DataNodeKind {
 		operand: DataNodeIndex,
 	},
 	F32DemoteF64 {
+		operand: DataNodeIndex,
+	},
+	I32ReinterpretF32 {
+		operand: DataNodeIndex,
+	},
+	F32ReinterpretI32 {
+		operand: DataNodeIndex,
+	},
+	I64ReinterpretF64 {
+		operand: DataNodeIndex,
+	},
+	F64ReinterpretI64 {
 		operand: DataNodeIndex,
 	},
 
@@ -445,6 +476,9 @@ impl DataNodeKind {
 			| DataNodeKind::DivU { ty, .. }
 			| DataNodeKind::RemS { ty, .. }
 			| DataNodeKind::RemU { ty, .. }
+			| DataNodeKind::Min { ty, .. }
+			| DataNodeKind::Max { ty, .. }
+			| DataNodeKind::Copysign { ty, .. }
 			| DataNodeKind::BitAnd { ty, .. }
 			| DataNodeKind::BitOr { ty, .. }
 			| DataNodeKind::BitXor { ty, .. }
@@ -457,6 +491,7 @@ impl DataNodeKind {
 			| DataNodeKind::Floor { ty, .. }
 			| DataNodeKind::Ceil { ty, .. }
 			| DataNodeKind::Trunc { ty, .. }
+			| DataNodeKind::Nearest { ty, .. }
 			| DataNodeKind::BitNot { ty, .. }
 			| DataNodeKind::AggregateGet { ty, .. }
 			| DataNodeKind::Phi { ty, .. }
@@ -481,23 +516,35 @@ impl DataNodeKind {
 			| DataNodeKind::I32TruncF32 { .. }
 			| DataNodeKind::U32TruncF32 { .. }
 			| DataNodeKind::I32TruncF64 { .. }
-			| DataNodeKind::U32TruncF64 { .. } => NodeType::Scalar(ScalarType::I32),
+			| DataNodeKind::U32TruncF64 { .. }
+			| DataNodeKind::I32ReinterpretF32 { .. } => {
+				NodeType::Scalar(ScalarType::I32)
+			}
 			DataNodeKind::I64ExtendI32S { .. }
 			| DataNodeKind::I64ExtendI32U { .. }
 			| DataNodeKind::I64TruncF32 { .. }
 			| DataNodeKind::U64TruncF32 { .. }
 			| DataNodeKind::I64TruncF64 { .. }
-			| DataNodeKind::U64TruncF64 { .. } => NodeType::Scalar(ScalarType::I64),
+			| DataNodeKind::U64TruncF64 { .. }
+			| DataNodeKind::I64ReinterpretF64 { .. } => {
+				NodeType::Scalar(ScalarType::I64)
+			}
 			DataNodeKind::F32ConvertI32 { .. }
 			| DataNodeKind::F32ConvertU32 { .. }
 			| DataNodeKind::F32ConvertI64 { .. }
 			| DataNodeKind::F32ConvertU64 { .. }
-			| DataNodeKind::F32DemoteF64 { .. } => NodeType::Scalar(ScalarType::F32),
+			| DataNodeKind::F32DemoteF64 { .. }
+			| DataNodeKind::F32ReinterpretI32 { .. } => {
+				NodeType::Scalar(ScalarType::F32)
+			}
 			DataNodeKind::F64ConvertI32 { .. }
 			| DataNodeKind::F64ConvertU32 { .. }
 			| DataNodeKind::F64ConvertI64 { .. }
 			| DataNodeKind::F64ConvertU64 { .. }
-			| DataNodeKind::F64PromoteF32 { .. } => NodeType::Scalar(ScalarType::F64),
+			| DataNodeKind::F64PromoteF32 { .. }
+			| DataNodeKind::F64ReinterpretI64 { .. } => {
+				NodeType::Scalar(ScalarType::F64)
+			}
 			DataNodeKind::GlobalGet { ty, .. }
 			| DataNodeKind::StaticDataRef { ty, .. }
 			| DataNodeKind::MemoryOffset { ty, .. }
@@ -854,6 +901,9 @@ impl Function {
             | DataNodeKind::DivU { left, right, .. }
             | DataNodeKind::RemS { left, right, .. }
             | DataNodeKind::RemU { left, right, .. }
+            | DataNodeKind::Min { left, right, .. }
+            | DataNodeKind::Max { left, right, .. }
+            | DataNodeKind::Copysign { left, right, .. }
             | DataNodeKind::BitAnd { left, right, .. }
             | DataNodeKind::BitOr  { left, right, .. }
             | DataNodeKind::BitXor { left, right, .. }
@@ -881,6 +931,7 @@ impl Function {
             | DataNodeKind::Floor { operand, .. }
             | DataNodeKind::Ceil { operand, .. }
             | DataNodeKind::Trunc { operand, .. }
+            | DataNodeKind::Nearest { operand, .. }
             | DataNodeKind::BitNot { operand, .. }
             | DataNodeKind::Eqz    { operand }
             | DataNodeKind::I64ExtendI32S { operand }
@@ -904,6 +955,10 @@ impl Function {
             | DataNodeKind::U64TruncF64 { operand }
             | DataNodeKind::F64PromoteF32 { operand }
             | DataNodeKind::F32DemoteF64 { operand }
+            | DataNodeKind::I32ReinterpretF32 { operand }
+            | DataNodeKind::F32ReinterpretI32 { operand }
+            | DataNodeKind::I64ReinterpretF64 { operand }
+            | DataNodeKind::F64ReinterpretI64 { operand }
             | DataNodeKind::AggregateGet { aggregate: operand, .. } => {
                 self.data_nodes[*operand as usize].uses.push(user_id);
             }

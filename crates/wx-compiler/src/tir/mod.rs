@@ -5,7 +5,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefId, Separated, Spanned, TextSpan};
-use crate::vfs::{CompilationGraph, CrateId, FileId};
+use crate::vfs::{CompilationUnit, CrateId, FileId};
 
 mod builder;
 #[cfg(test)]
@@ -1140,6 +1140,12 @@ pub enum ResolvedMember {
 	},
 	Const {
 		const_index: ConstIndex,
+		/// Substitutes the owning trait's `Self` (and any of its own type
+		/// params) when the constant's declared type references them, e.g.
+		/// `Mem::PAGE_SIZE` where the trait declares `const PAGE_SIZE:
+		/// Self::Size` — empty for a plain (non-`Self`-relative) const type,
+		/// same convention as `Function`'s `type_args`.
+		type_args: Box<[TypeIndex]>,
 	},
 	Global {
 		global_index: u32,
@@ -3077,7 +3083,7 @@ impl TIR {
 	}
 
 	#[inline]
-	pub fn build(compilation: &mut CompilationGraph) -> TIR {
+	pub fn build(compilation: &mut CompilationUnit) -> TIR {
 		builder::build(compilation)
 	}
 }

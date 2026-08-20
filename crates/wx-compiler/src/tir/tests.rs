@@ -11,14 +11,14 @@ use crate::vfs;
 
 #[allow(unused)]
 struct TestCase {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: TIR,
 }
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
@@ -29,7 +29,7 @@ impl TestCase {
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
+		let mut graph = builder.build(root_id);
 		let tir = TIR::build(&mut graph);
 		TestCase { graph, tir }
 	}
@@ -46,15 +46,15 @@ impl TestCase {
 			workspace_files.insert((*path).to_string(), (*source).to_string());
 		}
 
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
 				entry_path.to_string(),
 				&vfs::VirtualFileSource::new(workspace_files),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
+		let mut graph = builder.build(root_id);
 		let tir = TIR::build(&mut graph);
 		TestCase { graph, tir }
 	}
@@ -820,6 +820,90 @@ fn test_eval_const_expr_signed_div_unaffected_by_unsigned_fix() {
 		case.tir.constants[const_index as usize].const_value,
 		Some(ConstValue::Int(-3))
 	);
+}
+
+#[test]
+fn test_eval_const_expr_float_div_by_zero_folds_to_infinity() {
+	// Regression test: `eval_const_expr`'s `Binary` arm used to only
+	// destructure `ConstValue::Int` operands, so any float arithmetic
+	// (including this) was rejected as not-const-evaluatable rather than
+	// following plain IEEE-754 semantics the way runtime float division
+	// already does.
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: f32 = 1.0 / 0.0;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.constants[const_index as usize].const_value,
+		Some(ConstValue::Float(f64::INFINITY))
+	);
+}
+
+#[test]
+fn test_eval_const_expr_float_neg_div_by_zero_folds_to_neg_infinity() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: f32 = -1.0 / 0.0;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.constants[const_index as usize].const_value,
+		Some(ConstValue::Float(f64::NEG_INFINITY))
+	);
+}
+
+#[test]
+fn test_eval_const_expr_zero_div_zero_folds_to_nan() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: f32 = 0.0 / 0.0;
+        export {}
+    "});
+	no_errors(&case);
+	let tag = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.expect_const_index(def_id);
+	let Some(ConstValue::Float(value)) =
+		case.tir.constants[const_index as usize].const_value
+	else {
+		panic!("expected a folded float const");
+	};
+	assert!(value.is_nan());
+}
+
+#[test]
+fn test_f32_nan_infinity_neg_infinity_consts_resolve() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> bool {
+            f32::NAN != f32::NAN
+                && f32::INFINITY > 0.0
+                && f32::NEG_INFINITY < 0.0
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_f64_nan_infinity_neg_infinity_consts_resolve() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> bool {
+            f64::NAN != f64::NAN
+                && f64::INFINITY > 0.0
+                && f64::NEG_INFINITY < 0.0
+        }
+        export { f }
+    "});
+	no_errors(&case);
 }
 
 #[test]
@@ -2064,8 +2148,8 @@ fn test_memory_missing_std_import_does_not_panic() {
 	// unresolved trait bound, so the memory's kind can't be determined.
 	// This must not leave `MEM` stuck as `SymbolKind::Pending`, which
 	// used to panic (`unreachable!`) as soon as anything referenced it.
-	let mut builder = vfs::CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
+	let mut builder = vfs::CompilationUnitBuilder::new();
+	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(
 			"main.wx".to_string(),
@@ -2073,13 +2157,13 @@ fn test_memory_missing_std_import_does_not_panic() {
 				"main.wx".to_string(),
 				indoc! {"
                     memory MEM: Memory where { Size = u32 };
-                    pub fn f() -> u32 { MEM::MEMORY_INDEX }
+                    pub fn f() -> u32 { MEM::INDEX }
                 "}
 				.to_string(),
 			)])),
 		)
 		.unwrap();
-	let mut graph = builder.build(root_id, stdlib_id);
+	let mut graph = builder.build(root_id);
 	let tir = TIR::build(&mut graph);
 	assert!(
 		tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -2103,12 +2187,12 @@ fn test_fn_declaration_without_body_is_error() {
 
 #[test]
 fn test_memory_index_const_resolves() {
-	// `MEM::MEMORY_INDEX` — namespace access to a memory constant resolves cleanly.
+	// `MEM::INDEX` — namespace access to a memory constant resolves cleanly.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        pub fn f() -> u32 { MEM::MEMORY_INDEX }
+        pub fn f() -> u32 { MEM::INDEX }
     "},
 		&[],
 	);
@@ -2125,13 +2209,13 @@ fn test_memory_index_const_resolves() {
 
 #[test]
 fn test_memory_size_call_resolves() {
-	// `.size()` is a method from the Memory trait; calling it should produce no
-	// errors.
+	// `.size_pages()` is a method from the Memory trait; calling it should
+	// produce no errors.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        pub fn f() { _ = MEM.size(); }
+        pub fn f() { _ = MEM.size_pages(); }
     "},
 		&[],
 	);
@@ -7496,6 +7580,42 @@ fn test_const_not_const_evaluatable_value_is_error() {
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::NotConstEvaluatable),
 		"expected E1057 (NotConstEvaluatable), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_const_whose_value_failed_to_build_is_still_referenceable() {
+	// A const whose *value* fails to build still has to claim its name in
+	// Phase 2. It used to bind only on success, so the name stayed
+	// `SymbolKind::Pending` forever and the first use of it in value position
+	// panicked on the "signature resolved but symbol still pending"
+	// unreachable rather than reporting the original error. Checking
+	// `std/main.wx` as a binary crate reached this through a long cascade;
+	// this is the direct form.
+	//
+	// The unresolved associated item is deliberate — it mirrors the stdlib
+	// cascade (`f64::EPSILON`) and is one of the few forms that actually
+	// makes `build_const_context_expression` return `Err`. A bare undeclared
+	// identifier (`const A: f64 = NOPE;`) still builds *Ok*, as an error
+	// expression, and only fails to fold, so it never reaches that branch.
+	let case = TestCase::new(indoc! {"
+        const A: f64 = f64::NOPE;
+
+        fn f() -> f64 {
+            local x = A;
+            x
+        }
+
+        export { f }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"expected E1007 (UndeclaredIdentifier) for the const's own value, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()

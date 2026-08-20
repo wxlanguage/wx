@@ -25,7 +25,7 @@ fn load_crate_parses_entry_file() {
 	fs::write(&path, "module math;").unwrap();
 	fs::write(&child_path, "fn add() {} ").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	let crate_id = builder
 		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
 		.unwrap();
@@ -54,7 +54,7 @@ fn load_crate_reports_missing_entry_file() {
 	let path = dir.join("missing.wx");
 	let path_str = path.to_str().unwrap().to_string();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	assert_eq!(
 		builder.load_binary(path_str, &NativeFileSource),
 		Err(()),
@@ -76,7 +76,7 @@ fn load_crate_diagnoses_missing_child_module_without_aborting() {
 	let path = dir.join("main.wx");
 	fs::write(&path, "module boo;\nfn works() -> i32 { 1 }").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	let crate_id = builder
 		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
 		.expect(
@@ -123,7 +123,7 @@ fn load_crate_resolves_module_directory_file() {
 	fs::write(&path, "module math;").unwrap();
 	fs::write(&child_path, "fn add() {}").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	let crate_id = builder
 		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
 		.unwrap();
@@ -154,7 +154,7 @@ fn load_crate_rejects_ambiguous_module_paths() {
 	fs::write(&sibling_path, "fn from_file() {}").unwrap();
 	fs::write(&directory_path, "fn from_dir() {}").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	let crate_id = builder
 		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
 		.expect(
@@ -189,8 +189,8 @@ fn load_crate_rejects_ambiguous_module_paths() {
 
 #[test]
 fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
-	let mut builder = CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
+	let mut builder = CompilationUnitBuilder::new();
+	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(
 			"src/main.wx".to_string(),
@@ -200,7 +200,7 @@ fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 			])),
 		)
 		.expect("failed to load crate");
-	let graph = builder.build(root_id, stdlib_id);
+	let graph = builder.build(root_id);
 
 	let entry_crate = &graph.crates[1];
 	assert_eq!(entry_crate.modules.len(), 2);

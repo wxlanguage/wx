@@ -106,6 +106,130 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 	);
 }
 
+/// `leading_doc_comment` (invoked via `doc_comment_anchor`) appends a
+/// function's `///` doc comment below the usual fenced signature block, for
+/// both the definition site and a call site.
+#[tokio::test]
+async fn hover_includes_leading_doc_comment() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe3/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"/// Doubles `x`.\n",
+					"/// Second line.\n",
+					"fn double(x: i32) -> i32 { x + x }\n",
+					"fn use_it() -> i32 { double(1) }\n",
+					"export { use_it }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Call site: `double(1)` on line 4, column 22 (inside "double").
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 4,
+					character: 22,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `double`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert_eq!(
+		markup.value,
+		"```wx\nfn double(x: i32) -> i32\n```\n\n---\n\nDoubles `x`.\nSecond line.",
+		"call-site hover should include the doc comment below the signature"
+	);
+}
+
+/// The `memory_grow` shape from `std/main.wx`: an `#[attribute]` sits
+/// between the doc comment and the item it documents. That gap must still
+/// be tolerated (attributes are skipped, not treated as breaking the
+/// association), while a genuine blank line still breaks it.
+#[tokio::test]
+async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe4/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"/// Not attached — blank line below breaks it.\n",
+					"\n",
+					"/// Attached despite the attribute below it.\n",
+					"#[inline]\n",
+					"fn triple(x: i32) -> i32 { x + x + x }\n",
+					"export { triple }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Definition site: `fn triple` on line 5, column 3 (inside "triple").
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 5,
+					character: 3,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `triple`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert_eq!(
+		markup.value,
+		"```wx\nfn triple(x: i32) -> i32\n```\n\n---\n\nAttached despite the attribute below it.",
+		"doc comment across an #[attribute] line should attach, and the \
+		 blank-line-separated comment above it should not: got {}",
+		markup.value
+	);
+}
+
 /// Operator dispatch (`a + b`) resolves to a real trait method (`Add::add`)
 /// and pushes a go-to-definition access at the *operator's own span* onto
 /// it, the same mechanism an ordinary function reference uses — so without
@@ -1744,7 +1868,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 	// all (unlike struct/enum/trait/const), and `wx-lsp`'s `SymbolKind` had
 	// no `Memory` variant to begin with — so hover/go-to-definition on a
 	// memory name silently did nothing everywhere: as a type (`heap::&[u8]`,
-	// `type M = heap;`), as a value receiver (`heap.size()`), and in an
+	// `type M = heap;`), as a value receiver (`heap.size_pages()`), and in an
 	// `export { heap as "..." }` list.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
@@ -1753,7 +1877,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 		#[memory_limits(min_pages = 1)]
 		memory heap: Memory where { Size = u32 };
 		fn heap_size() -> u32 {
-		    heap.size()
+		    heap.size_pages()
 		}
 
 		export {
@@ -1771,17 +1895,19 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 		.find(|d| matches!(d.kind, SymbolKind::Memory(_)))
 		.expect("expected a definition entry for `memory heap`");
 
-	// Value position: `heap.size()`.
-	let value_offset = source.find("heap.size()").unwrap();
+	// Value position: `heap.size_pages()`.
+	let value_offset = source.find("heap.size_pages()").unwrap();
 	let found_value = compiled
 		.symbol_index
 		.find_at_position(file_id, value_offset as u32)
 		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `heap.size()` receiver position")
+			panic!(
+				"expected a symbol at the `heap.size_pages()` receiver position"
+			)
 		});
 	assert_eq!(
 		found_value.kind, definition.kind,
-		"expected `heap` in `heap.size()` to resolve to the memory declaration"
+		"expected `heap` in `heap.size_pages()` to resolve to the memory declaration"
 	);
 
 	// Export-list position: `heap as "memory"`.

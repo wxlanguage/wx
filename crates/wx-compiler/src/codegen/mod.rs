@@ -675,6 +675,10 @@ impl Builder {
 			SI::F32Floor => sink.push(Instruction::F32Floor as u8),
 			SI::F32Ceil => sink.push(Instruction::F32Ceil as u8),
 			SI::F32Trunc => sink.push(Instruction::F32Trunc as u8),
+			SI::F32Nearest => sink.push(Instruction::F32Nearest as u8),
+			SI::F32Min => sink.push(Instruction::F32Min as u8),
+			SI::F32Max => sink.push(Instruction::F32Max as u8),
+			SI::F32Copysign => sink.push(Instruction::F32Copysign as u8),
 			SI::F64Add => sink.push(Instruction::F64Add as u8),
 			SI::F64Sub => sink.push(Instruction::F64Sub as u8),
 			SI::F64Mul => sink.push(Instruction::F64Mul as u8),
@@ -685,6 +689,10 @@ impl Builder {
 			SI::F64Floor => sink.push(Instruction::F64Floor as u8),
 			SI::F64Ceil => sink.push(Instruction::F64Ceil as u8),
 			SI::F64Trunc => sink.push(Instruction::F64Trunc as u8),
+			SI::F64Nearest => sink.push(Instruction::F64Nearest as u8),
+			SI::F64Min => sink.push(Instruction::F64Min as u8),
+			SI::F64Max => sink.push(Instruction::F64Max as u8),
+			SI::F64Copysign => sink.push(Instruction::F64Copysign as u8),
 			SI::F32Eq => sink.push(Instruction::F32Eq as u8),
 			SI::F32Ne => sink.push(Instruction::F32Ne as u8),
 			SI::F32Lt => sink.push(Instruction::F32Lt as u8),
@@ -905,6 +913,18 @@ impl Builder {
 			SI::I64TruncF64U => sink.push(Instruction::I64TruncF64U as u8),
 			SI::F64PromoteF32 => sink.push(Instruction::F64PromoteF32 as u8),
 			SI::F32DemoteF64 => sink.push(Instruction::F32DemoteF64 as u8),
+			SI::I32ReinterpretF32 => {
+				sink.push(Instruction::I32ReinterpretF32 as u8)
+			}
+			SI::F32ReinterpretI32 => {
+				sink.push(Instruction::F32ReinterpretI32 as u8)
+			}
+			SI::I64ReinterpretF64 => {
+				sink.push(Instruction::I64ReinterpretF64 as u8)
+			}
+			SI::F64ReinterpretI64 => {
+				sink.push(Instruction::F64ReinterpretI64 as u8)
+			}
 			SI::Nop => sink.push(Instruction::Nop as u8),
 			SI::FunctionPointer(id) => {
 				let wasm_idx = self.func_wasm_index[&id];

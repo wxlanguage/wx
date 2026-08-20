@@ -182,11 +182,11 @@ fn diagnostic_to_json(
 	}
 }
 
-fn load_compilation(file_path: &str) -> vfs::CompilationGraph {
-	let mut builder = vfs::CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
+fn load_compilation(file_path: &str) -> vfs::CompilationUnit {
+	let mut builder = vfs::CompilationUnitBuilder::new();
+	builder.load_stdlib();
 	match builder.load_binary(file_path.to_string(), &vfs::NativeFileSource) {
-		Ok(root_id) => builder.build(root_id, stdlib_id),
+		Ok(root_id) => builder.build(root_id),
 		Err(()) => {
 			eprintln!("error: cannot read file '{file_path}'");
 			std::process::exit(1);
@@ -198,7 +198,7 @@ fn load_compilation(file_path: &str) -> vfs::CompilationGraph {
 /// Does not inspect severity — call `abort_if_errors` separately, after all
 /// diagnostics across every stage have been emitted.
 fn emit_diagnostics(
-	compilation: &vfs::CompilationGraph,
+	compilation: &vfs::CompilationUnit,
 	diagnostics: &[Diagnostic<vfs::FileId>],
 	format: &MessageFormat,
 ) {

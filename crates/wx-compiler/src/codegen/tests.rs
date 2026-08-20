@@ -10,7 +10,7 @@ use crate::{mir, tir, vfs};
 
 #[allow(unused)]
 struct TestCase {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: tir::TIR,
 	mir: mir::MIR,
 	wasm: WasmModule,
@@ -19,8 +19,8 @@ struct TestCase {
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
@@ -31,8 +31,8 @@ impl TestCase {
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
-		let root_crate = &graph.crates[root_id.as_usize()];
+		let mut graph = builder.build(root_id);
+		let root_crate = &graph.crates[graph.root_crate.as_usize()];
 		if root_crate.diagnostics.iter().any(|d| {
 			d.severity == codespan_reporting::diagnostic::Severity::Error
 		}) {
@@ -357,8 +357,8 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         impl Allocator for BumpAllocator {
             type Mem = heap;
             fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
-                local ptr = (bump as u32 + layout.align - 1) / layout.align * layout.align;
-                local new_end = ptr + layout.size;
+                local ptr = (bump as u32 + layout.align() - 1) / layout.align() * layout.align();
+                local new_end = ptr + layout.size();
                 bump = new_end as heap::*u8;
                 ptr as heap::*u8
             }
@@ -2306,15 +2306,16 @@ fn test_generic_struct_pointer_load_store() {
 
 #[test]
 fn test_memory_grow_and_size() {
-	// memory.size() returns the current page count; memory.grow(n) returns the
-	// old page count and extends by n pages. Both route through @memory_size /
-	// @memory_grow intrinsics via the Memory trait default methods.
+	// memory.size_pages() returns the current page count; memory.grow(n) returns
+	// the old page count and extends by n pages. Both route through
+	// @memory_size / @memory_grow intrinsics via the Memory trait default
+	// methods.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
         fn size_pages() -> u32 {
-            heap.size()
+            heap.size_pages()
         }
 
         fn grow_by(delta: u32) -> i32 {
@@ -2351,15 +2352,16 @@ fn test_memory_grow_and_size() {
 
 #[test]
 fn test_memory_size_before_grow_ordering() {
-	// Captures memory.size() BEFORE memory.grow(), then returns the captured value.
-	// If MemorySize is treated as a floating data node, the scheduler may emit
-	// memory.size after memory.grow, returning 2 instead of 1.
+	// Captures memory.size_pages() BEFORE memory.grow(), then returns the
+	// captured value. If MemorySize is treated as a floating data node, the
+	// scheduler may emit memory.size after memory.grow, returning 2 instead
+	// of 1.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
         fn capture_size_before_grow() -> u32 {
-            local before = heap.size();
+            local before = heap.size_pages();
             _ = heap.grow(1);
             before
         }
@@ -3060,7 +3062,7 @@ fn test_memory64_size_grow_and_static_data() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u64 };
-        fn size_pages() -> u64 { heap.size() }
+        fn size_pages() -> u64 { heap.size_pages() }
         fn grow_one() -> i64 { heap.grow(1) }
         fn msg() -> heap::&[u8] { \"hello\" }
         fn data_end() -> heap::&u8 { heap::DATA_END }
@@ -3895,4 +3897,429 @@ fn test_struct_operator_overload_compound_assignment_wasmtime() {
 
 	// (3+10) + (4+20) = 37
 	assert_eq!(run.call(&mut store, (3, 4, 10, 20)).unwrap(), 37);
+}
+
+#[test]
+fn test_float_to_from_bits_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        fn f32_to_bits(x: f32) -> u32 { x.to_bits() }
+        fn f32_from_bits(bits: u32) -> f32 { f32::from_bits(bits) }
+        fn f64_to_bits(x: f64) -> u64 { x.to_bits() }
+        fn f64_from_bits(bits: u64) -> f64 { f64::from_bits(bits) }
+
+        export { f32_to_bits, f32_from_bits, f64_to_bits, f64_from_bits }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let f32_to_bits = instance
+		.get_typed_func::<f32, u32>(&mut store, "f32_to_bits")
+		.unwrap();
+	assert_eq!(f32_to_bits.call(&mut store, 1.0).unwrap(), 1.0f32.to_bits());
+	assert_eq!(
+		f32_to_bits.call(&mut store, -1.0).unwrap(),
+		(-1.0f32).to_bits()
+	);
+	assert_eq!(
+		f32_to_bits.call(&mut store, f32::NAN).unwrap(),
+		f32::NAN.to_bits()
+	);
+
+	let f32_from_bits = instance
+		.get_typed_func::<u32, f32>(&mut store, "f32_from_bits")
+		.unwrap();
+	assert_eq!(
+		f32_from_bits.call(&mut store, 0x3f800000).unwrap(),
+		f32::from_bits(0x3f800000)
+	);
+
+	let f64_to_bits = instance
+		.get_typed_func::<f64, u64>(&mut store, "f64_to_bits")
+		.unwrap();
+	assert_eq!(f64_to_bits.call(&mut store, 1.0).unwrap(), 1.0f64.to_bits());
+	assert_eq!(
+		f64_to_bits.call(&mut store, f64::INFINITY).unwrap(),
+		f64::INFINITY.to_bits()
+	);
+
+	let f64_from_bits = instance
+		.get_typed_func::<u64, f64>(&mut store, "f64_from_bits")
+		.unwrap();
+	assert_eq!(
+		f64_from_bits.call(&mut store, 0x3ff0000000000000).unwrap(),
+		f64::from_bits(0x3ff0000000000000)
+	);
+}
+
+#[test]
+fn test_f32_scale_pow2_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        fn scale(x: f32, n: i32) -> f32 { x.scale_pow2(n) }
+        export { scale }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let scale = instance
+		.get_typed_func::<(f32, i32), f32>(&mut store, "scale")
+		.unwrap();
+
+	// Ordinary range.
+	assert_eq!(scale.call(&mut store, (1.0, 3)).unwrap(), 8.0);
+	assert_eq!(scale.call(&mut store, (1.0, -3)).unwrap(), 0.125);
+	assert_eq!(scale.call(&mut store, (1.5, 10)).unwrap(), 1536.0);
+	assert_eq!(scale.call(&mut store, (-2.5, 5)).unwrap(), -80.0);
+	assert_eq!(scale.call(&mut store, (3.5, 0)).unwrap(), 3.5);
+	// Exact boundary of the representable range.
+	assert_eq!(scale.call(&mut store, (1.0, 127)).unwrap(), 1.7014118e38);
+	assert_eq!(scale.call(&mut store, (1.0, -126)).unwrap(), 1.1754944e-38);
+	// Beyond one direct exponent step — exercises the pre-scaling loop.
+	assert_eq!(scale.call(&mut store, (1.0, 128)).unwrap(), f32::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, 254)).unwrap(), f32::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, -149)).unwrap(), 1e-45); // smallest subnormal
+	assert_eq!(scale.call(&mut store, (1.0, -150)).unwrap(), 0.0);
+	// Extreme n, clamped.
+	assert_eq!(scale.call(&mut store, (1.0, 1000)).unwrap(), f32::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, -1000)).unwrap(), 0.0);
+}
+
+#[test]
+fn test_f64_scale_pow2_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        fn scale(x: f64, n: i32) -> f64 { x.scale_pow2(n) }
+        export { scale }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let scale = instance
+		.get_typed_func::<(f64, i32), f64>(&mut store, "scale")
+		.unwrap();
+
+	assert_eq!(scale.call(&mut store, (1.0, 3)).unwrap(), 8.0);
+	assert_eq!(scale.call(&mut store, (1.0, -3)).unwrap(), 0.125);
+	assert_eq!(scale.call(&mut store, (1.5, 10)).unwrap(), 1536.0);
+	assert_eq!(scale.call(&mut store, (-2.5, 5)).unwrap(), -80.0);
+	assert_eq!(
+		scale.call(&mut store, (1.0, 1023)).unwrap(),
+		8.98846567431158e307
+	);
+	assert_eq!(
+		scale.call(&mut store, (1.0, -1022)).unwrap(),
+		f64::MIN_POSITIVE
+	);
+	// Beyond one direct exponent step — exercises the pre-scaling loop.
+	assert_eq!(scale.call(&mut store, (1.0, 1024)).unwrap(), f64::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, 2046)).unwrap(), f64::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, -1074)).unwrap(), 5e-324); // smallest subnormal
+	assert_eq!(scale.call(&mut store, (1.0, -1075)).unwrap(), 0.0);
+	// Extreme n, clamped.
+	assert_eq!(scale.call(&mut store, (1.0, 10000)).unwrap(), f64::INFINITY);
+	assert_eq!(scale.call(&mut store, (1.0, -10000)).unwrap(), 0.0);
+}
+
+#[test]
+fn test_float_boundary_consts_match_ieee754_exactly_wasmtime() {
+	// Unlike NAN/INFINITY, these are exact IEEE-754 boundary magnitudes —
+	// worth an execution-level check since a narrowing bug (f64 literal ->
+	// f32 constant) would silently round to a nearby-but-wrong bit
+	// pattern rather than fail to compile.
+	let case = TestCase::new(indoc! {"
+        fn f32_max() -> f32 { f32::MAX }
+        fn f32_min() -> f32 { f32::MIN }
+        fn f32_min_positive() -> f32 { f32::MIN_POSITIVE }
+        fn f32_epsilon() -> f32 { f32::EPSILON }
+
+        fn f64_max() -> f64 { f64::MAX }
+        fn f64_min() -> f64 { f64::MIN }
+        fn f64_min_positive() -> f64 { f64::MIN_POSITIVE }
+        fn f64_epsilon() -> f64 { f64::EPSILON }
+
+        export {
+            f32_max, f32_min, f32_min_positive, f32_epsilon,
+            f64_max, f64_min, f64_min_positive, f64_epsilon
+        }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	macro_rules! assert_const {
+		($name:literal, $ty:ty, $expected:expr) => {
+			let f = instance
+				.get_typed_func::<(), $ty>(&mut store, $name)
+				.unwrap();
+			assert_eq!(f.call(&mut store, ()).unwrap(), $expected);
+		};
+	}
+
+	assert_const!("f32_max", f32, f32::MAX);
+	assert_const!("f32_min", f32, f32::MIN);
+	assert_const!("f32_min_positive", f32, f32::MIN_POSITIVE);
+	assert_const!("f32_epsilon", f32, f32::EPSILON);
+
+	assert_const!("f64_max", f64, f64::MAX);
+	assert_const!("f64_min", f64, f64::MIN);
+	assert_const!("f64_min_positive", f64, f64::MIN_POSITIVE);
+	assert_const!("f64_epsilon", f64, f64::EPSILON);
+}
+
+#[test]
+fn test_f32_abs_floor_min_max_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        fn f_abs(x: f32) -> f32 { x.abs() }
+        fn f_floor(x: f32) -> f32 { x.floor() }
+        fn f_ceil(x: f32) -> f32 { x.ceil() }
+        fn f_nearest(x: f32) -> f32 { x.nearest() }
+        fn f_min(a: f32, b: f32) -> f32 { a.min(b) }
+        fn f_max(a: f32, b: f32) -> f32 { a.max(b) }
+        fn f_copysign(a: f32, b: f32) -> f32 { a.copysign(b) }
+
+        export { f_abs, f_floor, f_ceil, f_nearest, f_min, f_max, f_copysign }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let f_abs = instance
+		.get_typed_func::<f32, f32>(&mut store, "f_abs")
+		.unwrap();
+	assert_eq!(f_abs.call(&mut store, -3.5).unwrap(), 3.5);
+	assert_eq!(f_abs.call(&mut store, 3.5).unwrap(), 3.5);
+
+	let f_floor = instance
+		.get_typed_func::<f32, f32>(&mut store, "f_floor")
+		.unwrap();
+	assert_eq!(f_floor.call(&mut store, 3.7).unwrap(), 3.0);
+	assert_eq!(f_floor.call(&mut store, -3.2).unwrap(), -4.0);
+
+	let f_ceil = instance
+		.get_typed_func::<f32, f32>(&mut store, "f_ceil")
+		.unwrap();
+	assert_eq!(f_ceil.call(&mut store, 3.2).unwrap(), 4.0);
+	assert_eq!(f_ceil.call(&mut store, -3.7).unwrap(), -3.0);
+
+	let f_nearest = instance
+		.get_typed_func::<f32, f32>(&mut store, "f_nearest")
+		.unwrap();
+	// Ties-to-even, not away-from-zero: 2.5 -> 2, 3.5 -> 4.
+	assert_eq!(f_nearest.call(&mut store, 2.5).unwrap(), 2.0);
+	assert_eq!(f_nearest.call(&mut store, 3.5).unwrap(), 4.0);
+	assert_eq!(f_nearest.call(&mut store, -2.5).unwrap(), -2.0);
+	assert_eq!(f_nearest.call(&mut store, 3.2).unwrap(), 3.0);
+
+	let f_min = instance
+		.get_typed_func::<(f32, f32), f32>(&mut store, "f_min")
+		.unwrap();
+	assert_eq!(f_min.call(&mut store, (2.0, 5.0)).unwrap(), 2.0);
+	assert_eq!(f_min.call(&mut store, (5.0, 2.0)).unwrap(), 2.0);
+
+	let f_max = instance
+		.get_typed_func::<(f32, f32), f32>(&mut store, "f_max")
+		.unwrap();
+	assert_eq!(f_max.call(&mut store, (2.0, 5.0)).unwrap(), 5.0);
+	assert_eq!(f_max.call(&mut store, (5.0, 2.0)).unwrap(), 5.0);
+
+	let f_copysign = instance
+		.get_typed_func::<(f32, f32), f32>(&mut store, "f_copysign")
+		.unwrap();
+	assert_eq!(f_copysign.call(&mut store, (3.0, -1.0)).unwrap(), -3.0);
+	assert_eq!(f_copysign.call(&mut store, (-3.0, 1.0)).unwrap(), 3.0);
+	assert_eq!(f_copysign.call(&mut store, (3.0, 1.0)).unwrap(), 3.0);
+}
+
+#[test]
+fn test_f64_abs_floor_min_max_wasmtime() {
+	let case = TestCase::new(indoc! {"
+        fn f_abs(x: f64) -> f64 { x.abs() }
+        fn f_floor(x: f64) -> f64 { x.floor() }
+        fn f_ceil(x: f64) -> f64 { x.ceil() }
+        fn f_nearest(x: f64) -> f64 { x.nearest() }
+        fn f_min(a: f64, b: f64) -> f64 { a.min(b) }
+        fn f_max(a: f64, b: f64) -> f64 { a.max(b) }
+        fn f_copysign(a: f64, b: f64) -> f64 { a.copysign(b) }
+
+        export { f_abs, f_floor, f_ceil, f_nearest, f_min, f_max, f_copysign }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let f_abs = instance
+		.get_typed_func::<f64, f64>(&mut store, "f_abs")
+		.unwrap();
+	assert_eq!(f_abs.call(&mut store, -3.5).unwrap(), 3.5);
+	assert_eq!(f_abs.call(&mut store, 3.5).unwrap(), 3.5);
+
+	let f_floor = instance
+		.get_typed_func::<f64, f64>(&mut store, "f_floor")
+		.unwrap();
+	assert_eq!(f_floor.call(&mut store, 3.7).unwrap(), 3.0);
+	assert_eq!(f_floor.call(&mut store, -3.2).unwrap(), -4.0);
+
+	let f_ceil = instance
+		.get_typed_func::<f64, f64>(&mut store, "f_ceil")
+		.unwrap();
+	assert_eq!(f_ceil.call(&mut store, 3.2).unwrap(), 4.0);
+	assert_eq!(f_ceil.call(&mut store, -3.7).unwrap(), -3.0);
+
+	let f_nearest = instance
+		.get_typed_func::<f64, f64>(&mut store, "f_nearest")
+		.unwrap();
+	// Ties-to-even, not away-from-zero: 2.5 -> 2, 3.5 -> 4.
+	assert_eq!(f_nearest.call(&mut store, 2.5).unwrap(), 2.0);
+	assert_eq!(f_nearest.call(&mut store, 3.5).unwrap(), 4.0);
+	assert_eq!(f_nearest.call(&mut store, -2.5).unwrap(), -2.0);
+	assert_eq!(f_nearest.call(&mut store, 3.2).unwrap(), 3.0);
+
+	let f_min = instance
+		.get_typed_func::<(f64, f64), f64>(&mut store, "f_min")
+		.unwrap();
+	assert_eq!(f_min.call(&mut store, (2.0, 5.0)).unwrap(), 2.0);
+	assert_eq!(f_min.call(&mut store, (5.0, 2.0)).unwrap(), 2.0);
+
+	let f_max = instance
+		.get_typed_func::<(f64, f64), f64>(&mut store, "f_max")
+		.unwrap();
+	assert_eq!(f_max.call(&mut store, (2.0, 5.0)).unwrap(), 5.0);
+	assert_eq!(f_max.call(&mut store, (5.0, 2.0)).unwrap(), 5.0);
+
+	let f_copysign = instance
+		.get_typed_func::<(f64, f64), f64>(&mut store, "f_copysign")
+		.unwrap();
+	assert_eq!(f_copysign.call(&mut store, (3.0, -1.0)).unwrap(), -3.0);
+	assert_eq!(f_copysign.call(&mut store, (-3.0, 1.0)).unwrap(), 3.0);
+	assert_eq!(f_copysign.call(&mut store, (3.0, 1.0)).unwrap(), 3.0);
+}
+
+/// Distance between two `f32`s in representable steps. `0` means bit-identical.
+fn ulps_apart(a: f32, b: f32) -> u64 {
+	// Map the sign-magnitude bit pattern onto a monotonic integer line so that
+	// adjacent floats are adjacent integers across zero.
+	fn monotonic(x: f32) -> i64 {
+		let bits = x.to_bits() as i32;
+		if bits < 0 {
+			(i32::MIN as i64) - (bits as i64)
+		} else {
+			bits as i64
+		}
+	}
+	monotonic(a).abs_diff(monotonic(b))
+}
+
+#[test]
+fn test_f32_sin_cos_agree_with_reference() {
+	// `f32::sin`/`f32::cos` are musl's `sinf`/`cosf` — four-term kernels plus
+	// the single-step `rem_pio2f` reduction, all evaluated one precision up.
+	// A wrong coefficient digit stays invisible on the |x| <= 9*pi/4 fast
+	// paths (they never reach the reduction) and only shows up once argument
+	// reduction kicks in, so the sweep below has to straddle both.
+	let case = TestCase::new(indoc! {"
+        fn s(x: f32) -> f32 { x.sin() }
+        fn c(x: f32) -> f32 { x.cos() }
+
+        export { s, c }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let sin = instance
+		.get_typed_func::<f32, f32>(&mut store, "s")
+		.unwrap();
+	let cos = instance
+		.get_typed_func::<f32, f32>(&mut store, "c")
+		.unwrap();
+
+	// Reference: compute in `f64` and round once. That is correctly rounded
+	// for every `f32` input, and unlike the host's own `f32::sin` it doesn't
+	// vary with whatever libm the platform happens to ship.
+	let ref_sin = |x: f32| (x as f64).sin() as f32;
+	let ref_cos = |x: f32| (x as f64).cos() as f32;
+
+	// One representative per branch, then a sweep that crosses all of them.
+	let mut probes: Vec<f32> = vec![
+		0.0, 1e-8, 0.0001, // |x| < 2^-12, returned as-is
+		0.5,    // |x| <= pi/4, direct kernel
+		1.0,    // pi/4 .. 3pi/4
+		2.0,    // 3pi/4 .. 5pi/4
+		3.0, 4.0, // 5pi/4 .. 7pi/4
+		6.0, // 7pi/4 .. 9pi/4
+		7.0, 8.0, // past 9pi/4: argument reduction
+		100.0, 12345.678, 1.0e6, 1.0e8,
+		4.0e8, // just inside the reduction's valid range
+	];
+	// Cross every branch boundary, both signs.
+	let mut x = 0.03125f32;
+	while x < 5.0e8 {
+		probes.push(x);
+		x *= 1.37;
+	}
+	let signed: Vec<f32> = probes.iter().flat_map(|&p| [p, -p]).collect();
+
+	let mut worst = 0u64;
+	let mut worst_at = 0.0f32;
+	for &x in &signed {
+		for (got, want, name) in [
+			(sin.call(&mut store, x).unwrap(), ref_sin(x), "sin"),
+			(cos.call(&mut store, x).unwrap(), ref_cos(x), "cos"),
+		] {
+			let d = ulps_apart(got, want);
+			assert!(
+				d <= 1,
+				"{name}({x:e}) = {got:e}, reference {want:e} ({d} ulps apart)"
+			);
+			if d > worst {
+				worst = d;
+				worst_at = x;
+			}
+		}
+	}
+	// Guard against the assertion silently passing on a degenerate probe set.
+	assert!(
+		signed.len() > 100,
+		"probe set collapsed to {} points",
+		signed.len()
+	);
+	let _ = worst_at;
+
+	// Exact results the polynomial paths must not perturb.
+	assert_eq!(
+		sin.call(&mut store, 0.0).unwrap().to_bits(),
+		0.0f32.to_bits()
+	);
+	assert_eq!(
+		sin.call(&mut store, -0.0).unwrap().to_bits(),
+		(-0.0f32).to_bits(),
+		"sin(-0) must keep its sign"
+	);
+	assert_eq!(cos.call(&mut store, 0.0).unwrap(), 1.0);
+
+	// sin/cos of a non-finite argument is NaN.
+	assert!(sin.call(&mut store, f32::INFINITY).unwrap().is_nan());
+	assert!(cos.call(&mut store, f32::NEG_INFINITY).unwrap().is_nan());
+	assert!(sin.call(&mut store, f32::NAN).unwrap().is_nan());
+
+	// Documented gap: `rem_pio2_large` (Payne-Hanek) isn't ported, so
+	// arguments past 2^28*(pi/2) report NaN rather than quietly returning a
+	// wrong answer. Change this assertion when that reduction lands.
+	assert!(
+		sin.call(&mut store, 5.0e8).unwrap().is_nan(),
+		"arguments past the medium-reduction cutoff should be NaN, not garbage"
+	);
+	assert!(cos.call(&mut store, 1.0e30).unwrap().is_nan());
 }

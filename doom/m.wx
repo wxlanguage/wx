@@ -42,17 +42,16 @@ impl Allocator for BumpAllocator<heap> {
 
     fn alloc(self: Self::M::*Self, layout: Layout<Self::M>) -> *u8 {
         local start = ptr::align_up::<Self::M>(self.*.bump, layout.align);
-        
+
         // 2. Calculate the end address of this allocation
         local end = start + layout.size;
         
         // 3. Check if we have exceeded the current WebAssembly memory size.
-        // `heap.size()` returns pages, so we multiply by your PAGE_SIZE constant (65536).
-        local current_bytes = heap.size() * PAGE_SIZE;
+        local current_bytes = heap.size_bytes();
         
         if end > current_bytes {
             local bytes_needed = end - current_bytes;
-            local pages_needed = (bytes_needed + PAGE_SIZE - 1) / PAGE_SIZE;
+            local pages_needed = (bytes_needed + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
             
             // Grow the WebAssembly memory
             // (Note: In a production language, you should check if `grow` 
@@ -79,9 +78,9 @@ global mut bump: heap::*u8 = heap::DATA_END;
 fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
     local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size;
-    local cur_end = heap.size() * PAGE_SIZE;
+    local cur_end = heap.size_bytes();
     if new_end > cur_end {
-        local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
     bump = new_end as heap::*u8;

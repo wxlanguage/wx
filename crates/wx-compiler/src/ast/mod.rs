@@ -787,6 +787,31 @@ impl<'a> Lexer<'a> {
 			}
 		}
 
+		// Scientific notation: `e`/`E` right after a numeric literal is
+		// always an exponent — there's no valid grammar where an
+		// identifier can immediately follow a number with no operator
+		// between them — so commit unconditionally rather than
+		// backtracking. An empty/sign-only exponent (`1e`, `1e+`) still
+		// lexes as a single malformed Float token, which falls straight
+		// into the same `report_invalid_float_literal` diagnostic
+		// `parse_float_expression` already raises for any span
+		// `str::parse::<f64>` rejects — no separate error handling needed
+		// here.
+		if let Some('e' | 'E') = self.chars.clone().next() {
+			_ = self.chars.next();
+			if let Some('+' | '-') = self.chars.clone().next() {
+				_ = self.chars.next();
+			}
+			let mut lookahead = self.chars.clone();
+			while let Some(ch) = lookahead.next() {
+				match ch {
+					'0'..='9' | '_' => _ = self.chars.next(),
+					_ => break,
+				}
+			}
+			return Token::Float;
+		}
+
 		match seen_dot {
 			true => Token::Float,
 			false => Token::Int,
@@ -1554,13 +1579,15 @@ pub enum TraitItem {
 		/// implementation.
 		body: Option<Box<Spanned<Expression>>>,
 	},
-	/// An associated constant declaration (type only, no value — value comes
-	/// from impl).
+	/// An associated constant declaration, with an optional default value.
+	/// `None` = abstract (must be provided by every impl); `Some` = a
+	/// default value impls may omit and inherit as-is.
 	Const {
 		id: DefId,
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		ty: Box<Spanned<TypeExpression>>,
+		value: Option<Box<Spanned<Expression>>>,
 	},
 	/// An associated type declaration: `type Name;` or `type Name: Bound1 +
 	/// Bound2;` The concrete type is provided by each impl; bounds
@@ -5141,8 +5168,21 @@ impl<'ctx> Parser<'ctx> {
 								parser.intern_identifier(name_span);
 							parser.next_expect(Token::Colon)?;
 							let ty = parser.parse_type_expression()?;
-							let span =
-								TextSpan::new(const_span.start, ty.span.end);
+							let value =
+								if parser.lexer.next_if(Token::Eq).is_some() {
+									Some(Box::new(parser.parse_expression(
+										BindingPower::Default,
+									)?))
+								} else {
+									None
+								};
+							let span = TextSpan::new(
+								const_span.start,
+								match &value {
+									Some(value) => value.span.end,
+									None => ty.span.end,
+								},
+							);
 							Ok(Spanned {
 								inner: TraitItem::Const {
 									id: parser.id_generator.generate(),
@@ -5151,6 +5191,7 @@ impl<'ctx> Parser<'ctx> {
 										span: name_span,
 									},
 									ty: Box::new(ty),
+									value,
 									attributes,
 								},
 								span,
