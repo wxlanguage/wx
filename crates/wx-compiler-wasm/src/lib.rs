@@ -70,22 +70,38 @@ pub fn compile(
 	let files: HashMap<String, String> =
 		serde_wasm_bindgen::from_value(files.into())
 			.map_err(|err| err.to_string())?;
+	// Callers are responsible for providing absolute (`/`-rooted) paths,
+	// same as every other `FileSource` consumer.
+	let files: HashMap<vfs::AbsolutePath, String> = files
+		.into_iter()
+		.map(|(path, source)| (vfs::AbsolutePath::new(path), source))
+		.collect();
 
 	let mut builder = vfs::CompilationUnitBuilder::new();
 	builder.load_stdlib();
 	let root_id = builder
-		.load_binary(entry_path, &vfs::VirtualFileSource::new(files))
+		.load_binary(
+			vfs::AbsolutePath::new(entry_path),
+			&vfs::VirtualFileSource::new(files),
+		)
 		.map_err(|_| "entry file not found among `files`".to_string())?;
 	let mut compilation = builder.build(root_id);
 
-	let ast_diagnostics: Vec<_> = compilation
-		.crates
+	let pre_tir_diagnostics: Vec<_> = compilation
+		.packages
 		.iter()
-		.flat_map(|crate_graph| crate_graph.diagnostics.iter().cloned())
+		.flat_map(|package_graph| {
+			package_graph.linker_diagnostics.iter().cloned().chain(
+				package_graph
+					.modules
+					.iter()
+					.flat_map(|module| module.ast.diagnostics.iter().cloned()),
+			)
+		})
 		.collect();
-	if !ast_diagnostics.is_empty() {
+	if !pre_tir_diagnostics.is_empty() {
 		return Ok(CompilationResult {
-			diagnostics: ast_diagnostics,
+			diagnostics: pre_tir_diagnostics,
 			bytecode: None,
 		}
 		.into_js());

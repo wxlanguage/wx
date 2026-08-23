@@ -12,7 +12,7 @@ use crate::symbol_index::SymbolKind;
 use crate::{
 	Backend, CompiledRoot, OpenDocument, ServerState, TokenType, analyze_root,
 	build_service, byte_to_position, compute_refresh, diagnostic_publish_paths,
-	discover_crate_root, find_active_call, implementation_locations,
+	discover_package_root, find_active_call, implementation_locations,
 	owning_root, position_to_offset, position_to_offset_in_str,
 	reference_search_kinds, symbol_hover_text, symbol_kind_to_token_type,
 };
@@ -312,10 +312,10 @@ async fn semantic_tokens_do_not_highlight_operators_as_functions() {
 fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
 	compiled
 		.graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
-		.find(|m| Path::new(&m.file_path) == path)
+		.find(|m| Path::new(m.file_path.as_str()) == path)
 		.unwrap_or_else(|| {
 			panic!("file not found in compiled graph: {}", path.display())
 		})
@@ -332,18 +332,18 @@ fn open_document(text: &str) -> OpenDocument {
 }
 
 #[test]
-fn discover_crate_root_walks_up_to_main_wx() {
+fn discover_package_root_walks_up_to_main_wx() {
 	let workspace_root = PathBuf::from("/workspace");
-	let crate_root = workspace_root.join("app").join("main.wx");
+	let package_root = workspace_root.join("app").join("main.wx");
 	let child_file = workspace_root.join("app").join("math").join("add.wx");
 
 	let mut open_documents = HashMap::new();
-	open_documents.insert(crate_root.clone(), open_document("module math;"));
+	open_documents.insert(package_root.clone(), open_document("module math;"));
 
 	let discovered =
-		discover_crate_root(&open_documents, &[workspace_root], &child_file);
+		discover_package_root(&open_documents, &[workspace_root], &child_file);
 
-	assert_eq!(discovered, Some(crate_root));
+	assert_eq!(discovered, Some(package_root));
 }
 
 #[test]
@@ -1127,13 +1127,13 @@ fn resolve_uri_finds_virtual_stdlib_module() {
 	let (_, compiled) = compile_source(&root, "fn main() {}");
 	let stdlib_file_id = compiled
 		.graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
-		.find(|m| m.file_path == "main.wx")
+		.find(|m| m.file_path.as_str() == "/main.wx")
 		.map(|m| m.file_id)
 		.expect("stdlib module should be present in the compiled graph");
-	let uri = crate::file_id_to_uri(&compiled, stdlib_file_id)
+	let uri = crate::file_id_to_uri(&compiled.graph.files, stdlib_file_id)
 		.expect("should construct a wx://std/ URI for the stdlib module");
 
 	let mut state = ServerState::default();

@@ -3,8 +3,8 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 509
-    signature_index: 9
+  - id: 448
+    signature_index: 1
     scopes:
       - kind: Block
         parent: ~
@@ -39,50 +39,13 @@ functions:
                           expressions:
                             - kind:
                                 MemorySize:
-                                  memory: 508
+                                  memory: 447
                               ty: U32
                       ty: U32
               ty: U32
       ty: U32
     static_data: []
 signatures:
-  - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
-  - items:
-      - F64
-      - F64
-      - I32
-      - F64
-    params_count: 3
-  - items:
-      - F64
-      - I32
-    params_count: 1
-  - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - F64
-      - Aggregate:
-          aggregate_index: 0
-    params_count: 1
-  - items:
-      - F64
-      - F32
-    params_count: 1
-  - items:
-      - F32
-      - F64
-    params_count: 1
-  - items:
-      - F32
-      - Aggregate:
-          aggregate_index: 1
-    params_count: 1
   - items:
       - Unit
       - U32
@@ -117,6 +80,15 @@ signatures:
     params_count: 1
   - items:
       - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
+  - items:
+      - F64
       - I64
     params_count: 1
   - items:
@@ -135,20 +107,6 @@ signatures:
       - I32
       - I32
       - I32
-    params_count: 2
-  - items:
-      - F32
-      - I32
-      - F32
-    params_count: 2
-  - items:
-      - I32
-      - I64
-    params_count: 1
-  - items:
-      - F64
-      - I32
-      - F64
     params_count: 2
   - items:
       - I32
@@ -229,42 +187,15 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 509
-      name: 307
+      id: 448
+      name: 233
 imports: []
 memories:
-  - id: 508
+  - id: 447
     source: Internal
     kind: Memory32
     min_pages: ~
     max_pages: ~
-aggregates:
-  - values:
-      - F64
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-      - 16
-    layout:
-      size: 24
-      align: 8
-    decl_to_phys:
-      - 2
-      - 0
-      - 1
-  - values:
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-    layout:
-      size: 16
-      align: 8
-    decl_to_phys:
-      - 1
-      - 0
+aggregates: []
 static_entries: []
 start_function: ~

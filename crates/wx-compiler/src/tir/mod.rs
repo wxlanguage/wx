@@ -5,7 +5,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefId, Separated, Spanned, TextSpan};
-use crate::vfs::{CompilationUnit, CrateId, FileId};
+use crate::vfs::{CompilationUnit, FileId, PackageId};
 
 mod builder;
 #[cfg(test)]
@@ -1183,9 +1183,9 @@ pub enum ModuleDeclarationKind {
 	Module(u32),
 	/// Index into `TIR::import_decls`.
 	Import(u32),
-	/// Top-level namespace created implicitly for a named library crate.
+	/// Top-level namespace created implicitly for a named library package.
 	/// Carries the root module's `FileId` for diagnostic spans.
-	Crate(CrateId, FileId),
+	Package(PackageId, FileId),
 }
 
 /// The symbol table for a module namespace — shared concept for both local
@@ -3076,7 +3076,7 @@ impl TIR {
 			Some(idx) => match self.namespaces[idx as usize].declaration {
 				ModuleDeclarationKind::Import(_) => true,
 				ModuleDeclarationKind::Module(_)
-				| ModuleDeclarationKind::Crate(..) => false,
+				| ModuleDeclarationKind::Package(..) => false,
 			},
 			None => false,
 		}

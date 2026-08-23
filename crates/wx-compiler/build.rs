@@ -30,7 +30,7 @@ fn main() {
 	entries.sort();
 
 	assert!(
-		entries.iter().any(|(relative, _)| relative == "main.wx"),
+		entries.iter().any(|(relative, _)| relative == "/main.wx"),
 		"std/main.wx is the stdlib crate root and must exist"
 	);
 
@@ -48,12 +48,13 @@ fn main() {
 		.expect("OUT_DIR should be writable during a build");
 }
 
-/// Collects `(path relative to `std/`, absolute path)` for every `.wx` file
-/// under `dir`, recursively.
+/// Collects `("/"-prefixed path relative to `std/`, absolute path)` for
+/// every `.wx` file under `dir`, recursively.
 ///
-/// Relative paths always use `/`, on every platform, because that is what
-/// `vfs::Loader::load_module` normalises separators to before looking a path
-/// up in the `FileSource`.
+/// The first element is `/`-prefixed and always uses `/` as a separator, on
+/// every platform, matching `vfs::AbsolutePath`'s own convention directly —
+/// `load_stdlib` can then wrap each entry as-is, with no runtime
+/// string-patching step to make it absolute.
 fn collect_wx_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 	let read = fs::read_dir(dir)
 		.unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
@@ -69,7 +70,10 @@ fn collect_wx_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 				.expect("walked path is always under root")
 				.to_string_lossy()
 				.replace('\\', "/");
-			out.push((relative, path.to_string_lossy().into_owned()));
+			out.push((
+				format!("/{relative}"),
+				path.to_string_lossy().into_owned(),
+			));
 		}
 	}
 }

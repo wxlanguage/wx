@@ -3,15 +3,15 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 509
-    signature_index: 8
+  - id: 448
+    signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals:
           - ty:
               Aggregate:
-                aggregate_index: 2
+                aggregate_index: 0
             mutability: Immutable
         result: U32
     block:
@@ -29,45 +29,8 @@ functions:
     static_data: []
 signatures:
   - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
-  - items:
-      - F64
-      - F64
-      - I32
-      - F64
-    params_count: 3
-  - items:
-      - F64
-      - I32
-    params_count: 1
-  - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - F64
       - Aggregate:
           aggregate_index: 0
-    params_count: 1
-  - items:
-      - F64
-      - F32
-    params_count: 1
-  - items:
-      - F32
-      - F64
-    params_count: 1
-  - items:
-      - F32
-      - Aggregate:
-          aggregate_index: 1
-    params_count: 1
-  - items:
-      - Aggregate:
-          aggregate_index: 2
       - U32
     params_count: 1
   - items:
@@ -95,6 +58,15 @@ signatures:
       - U32
       - F32
     params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
   - items:
       - F64
       - I64
@@ -115,20 +87,6 @@ signatures:
       - I32
       - I32
       - I32
-    params_count: 2
-  - items:
-      - F32
-      - I32
-      - F32
-    params_count: 2
-  - items:
-      - I32
-      - I64
-    params_count: 1
-  - items:
-      - F64
-      - I32
-      - F64
     params_count: 2
   - items:
       - I32
@@ -209,38 +167,11 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 509
-      name: 307
+      id: 448
+      name: 235
 imports: []
 memories: []
 aggregates:
-  - values:
-      - F64
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-      - 16
-    layout:
-      size: 24
-      align: 8
-    decl_to_phys:
-      - 2
-      - 0
-      - 1
-  - values:
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-    layout:
-      size: 16
-      align: 8
-    decl_to_phys:
-      - 1
-      - 0
   - values:
       - U32
       - U32

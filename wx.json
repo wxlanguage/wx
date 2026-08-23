@@ -1,0 +1,20 @@
+{
+    "type": "lib",
+    "meta": {
+        "name": "bar",
+        "description": "Bar Package",
+        "version": "0.1.0",
+        "repository": "https://example.com"
+    },
+    "dependencies": {
+        "foo": {
+            "type": "local",
+            "path": "../foo"
+        }
+    },
+    "format": {
+        "max_line_width": 80,
+        "indent_width": 4,
+        "trailing_comma": true
+    }
+}

@@ -182,10 +182,31 @@ fn diagnostic_to_json(
 	}
 }
 
+/// Resolves a CLI-provided file path to an absolute one, joining it
+/// against the process's current directory if the user typed a relative
+/// path — every `FileSource` consumer works with `AbsolutePath` only, so
+/// this is the one place that has to make that true for whatever the user
+/// actually typed.
+///
+/// Known gap: only checks for a leading `/`, so a Windows drive-letter
+/// absolute path (`C:\...`) would incorrectly be treated as relative and
+/// joined onto the cwd instead of used as-is.
+fn resolve_cli_path(file_path: &str) -> vfs::AbsolutePath {
+	if file_path.starts_with('/') {
+		return vfs::AbsolutePath::new(file_path);
+	}
+	let cwd = std::env::current_dir()
+		.expect("current directory should be accessible");
+	vfs::AbsolutePath::new(cwd.to_string_lossy().into_owned())
+		.join(&vfs::RelativePath::new(file_path))
+}
+
 fn load_compilation(file_path: &str) -> vfs::CompilationUnit {
 	let mut builder = vfs::CompilationUnitBuilder::new();
 	builder.load_stdlib();
-	match builder.load_binary(file_path.to_string(), &vfs::NativeFileSource) {
+	match builder
+		.load_binary(resolve_cli_path(file_path), &vfs::NativeFileSource)
+	{
 		Ok(root_id) => builder.build(root_id),
 		Err(()) => {
 			eprintln!("error: cannot read file '{file_path}'");
@@ -245,14 +266,28 @@ fn abort_if_errors(count: usize) {
 fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
 	let mut compilation = load_compilation(file_path);
 
-	for crate_graph in &compilation.crates {
-		emit_diagnostics(&compilation, &crate_graph.diagnostics, &format);
+	for package_graph in &compilation.packages {
+		emit_diagnostics(
+			&compilation,
+			&package_graph.linker_diagnostics,
+			&format,
+		);
+		for module in &package_graph.modules {
+			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
+		}
 	}
 	abort_if_errors(
 		compilation
-			.crates
+			.packages
 			.iter()
-			.flat_map(|crate_graph| crate_graph.diagnostics.iter())
+			.flat_map(|package_graph| {
+				package_graph.linker_diagnostics.iter().chain(
+					package_graph
+						.modules
+						.iter()
+						.flat_map(|module| module.ast.diagnostics.iter()),
+				)
+			})
 			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
 			.count(),
 	);
@@ -288,14 +323,28 @@ fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
 fn cmd_check(file_path: &str, format: MessageFormat) {
 	let mut compilation = load_compilation(file_path);
 
-	for crate_graph in &compilation.crates {
-		emit_diagnostics(&compilation, &crate_graph.diagnostics, &format);
+	for package_graph in &compilation.packages {
+		emit_diagnostics(
+			&compilation,
+			&package_graph.linker_diagnostics,
+			&format,
+		);
+		for module in &package_graph.modules {
+			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
+		}
 	}
 	abort_if_errors(
 		compilation
-			.crates
+			.packages
 			.iter()
-			.flat_map(|crate_graph| crate_graph.diagnostics.iter())
+			.flat_map(|package_graph| {
+				package_graph.linker_diagnostics.iter().chain(
+					package_graph
+						.modules
+						.iter()
+						.flat_map(|module| module.ast.diagnostics.iter()),
+				)
+			})
 			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
 			.count(),
 	);
@@ -322,7 +371,9 @@ fn cmd_format(file_path: &str) {
 	};
 
 	let mut files = vfs::Files::new();
-	let file_id = files.add(file_path.to_string(), source).unwrap();
+	let file_id = files
+		.add(file_path.to_string(), source, vfs::FileOrigin::Local)
+		.unwrap();
 	let mut interner = ast::StringInterner::new();
 	let mut id_gen = ast::DefIdGenerator::new();
 

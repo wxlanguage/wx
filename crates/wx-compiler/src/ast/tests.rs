@@ -1,7 +1,7 @@
 use indoc::indoc;
 
 use super::*;
-use crate::vfs::Files;
+use crate::vfs::{FileOrigin, Files};
 
 #[allow(unused)]
 struct TestCase {
@@ -16,7 +16,7 @@ impl TestCase {
 		let mut id_generator = DefIdGenerator::new();
 		let mut files = Files::new();
 		let file_id = files
-			.add("main.wx".to_string(), source.to_string())
+			.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
 			.unwrap();
 		let ast =
 			Parser::parse(file_id, &files, &mut interner, &mut id_generator);

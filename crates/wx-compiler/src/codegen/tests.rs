@@ -24,21 +24,29 @@ impl TestCase {
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
-				"main.wx".to_string(),
-				&vfs::VirtualFileSource::new(HashMap::from([(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					prefixed,
 				)])),
 			)
 			.unwrap();
 		let mut graph = builder.build(root_id);
-		let root_crate = &graph.crates[graph.root_crate.as_usize()];
-		if root_crate.diagnostics.iter().any(|d| {
+		let root_package = &graph.packages[graph.root_package.as_usize()];
+		let package_diagnostics = || {
+			root_package.linker_diagnostics.iter().chain(
+				root_package
+					.modules
+					.iter()
+					.flat_map(|m| m.ast.diagnostics.iter()),
+			)
+		};
+		if package_diagnostics().any(|d| {
 			d.severity == codespan_reporting::diagnostic::Severity::Error
 		}) {
 			let writer = StandardStream::stderr(ColorChoice::Always);
 			let config = codespan_reporting::term::Config::default();
-			for diagnostic in root_crate.diagnostics.iter() {
+			for diagnostic in package_diagnostics() {
 				term::emit_to_io_write(
 					&mut writer.lock(),
 					&config,

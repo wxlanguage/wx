@@ -36,7 +36,9 @@ use wx_compiler::tir::{
 	ImplTarget, ItemAttribute, ModuleDeclarationKind, SourceSpan, TIR,
 	TypeParamInfo, TypeParamOwner,
 };
-use wx_compiler::vfs::{self, FileId, FileSource, NativeFileSource};
+use wx_compiler::vfs::{
+	self, AbsolutePath, FileId, FileSource, NativeFileSource,
+};
 
 mod completion;
 mod symbol_index;
@@ -105,7 +107,7 @@ struct OpenDocument {
 struct ServerState {
 	open_documents: HashMap<PathBuf, OpenDocument>,
 	workspace_folders: Vec<PathBuf>,
-	/// Compiled artifacts per crate root — the one source of truth. Which
+	/// Compiled artifacts per package root — the one source of truth. Which
 	/// `CompiledRoot`/`FileId` a given URI belongs to is computed on demand
 	/// by `resolve_uri` rather than tracked in a second index, since keeping
 	/// a hand-maintained reverse map in sync with this one is exactly the
@@ -128,7 +130,7 @@ struct CompiledRoot {
 	graph: vfs::CompilationUnit,
 	tir: TIR,
 	symbol_index: SymbolIndex,
-	/// LSP version of each file in the crate at the time TIR was last built.
+	/// LSP version of each file in the package at the time TIR was last built.
 	/// `None` means the file was on disk (not open via LSP) at compile time.
 	compiled_versions: HashMap<PathBuf, Option<std::num::NonZeroI32>>,
 }
@@ -148,16 +150,23 @@ impl<'a> OverlayFileSource<'a> {
 }
 
 impl FileSource for OverlayFileSource<'_> {
-	fn read_to_string(&self, path: &str) -> std::result::Result<String, ()> {
-		if let Some(doc) = self.open_documents.get(Path::new(path)) {
+	fn read_to_string(
+		&self,
+		path: &AbsolutePath,
+	) -> std::result::Result<String, ()> {
+		if let Some(doc) = self.open_documents.get(Path::new(path.as_str())) {
 			return Ok(doc.text.clone());
 		}
 		self.native.read_to_string(path)
 	}
 
-	fn exists(&self, path: &str) -> bool {
-		self.open_documents.contains_key(Path::new(path))
+	fn exists(&self, path: &AbsolutePath) -> bool {
+		self.open_documents.contains_key(Path::new(path.as_str()))
 			|| self.native.exists(path)
+	}
+
+	fn origin(&self) -> vfs::FileOrigin {
+		vfs::FileOrigin::Local
 	}
 }
 
@@ -411,7 +420,7 @@ async fn handle_command(
 					.symbol_index
 					.definition_for_kind(info.kind)
 					.map(|e| e.source)?;
-				let uri = file_id_to_uri(compiled, def.file_id)?;
+				let uri = file_id_to_uri(&compiled.graph.files, def.file_id)?;
 				let range = span_to_range(&compiled.graph.files, def)?;
 				Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
 			})();
@@ -437,7 +446,7 @@ async fn handle_command(
 				)
 				.into_iter()
 				.filter_map(|source| {
-					let uri = file_id_to_uri(compiled, source.file_id)?;
+					let uri = file_id_to_uri(&compiled.graph.files, source.file_id)?;
 					let range = span_to_range(&compiled.graph.files, source)?;
 					Some(Location { uri, range })
 				})
@@ -486,7 +495,7 @@ async fn handle_command(
 					)
 					.filter_map(|entry| {
 						let uri =
-							file_id_to_uri(compiled, entry.source.file_id)?;
+							file_id_to_uri(&compiled.graph.files, entry.source.file_id)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some(Location { uri, range })
@@ -521,7 +530,7 @@ async fn handle_command(
 					.filter(|e| e.kind == info.kind)
 					.filter_map(|entry| {
 						let uri =
-							file_id_to_uri(compiled, entry.source.file_id)?;
+							file_id_to_uri(&compiled.graph.files, entry.source.file_id)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some((uri, range))
@@ -545,7 +554,7 @@ async fn handle_command(
 		Command::Formatting(params, reply) => {
 			let result = async {
 				let path = uri_to_path(&params.text_document.uri)?;
-				let root = discover_crate_root(
+				let root = discover_package_root(
 					&state.open_documents,
 					&state.workspace_folders,
 					&path,
@@ -561,10 +570,12 @@ async fn handle_command(
 				flush_logs(client, logs).await;
 				let graph = parse_result.ok()?;
 				let module = graph
-					.crates
+					.packages
 					.iter()
 					.flat_map(|cg| cg.modules.iter())
-					.find(|m| Path::new(&m.file_path) == path.as_path())?;
+					.find(|m| {
+						Path::new(m.file_path.as_str()) == path.as_path()
+					})?;
 				let has_errors = module.ast.diagnostics.iter().any(|d| {
 					matches!(
 						d.severity,
@@ -1049,15 +1060,15 @@ impl Backend {
 			)
 			.await;
 		let filename =
-			params.uri.strip_prefix("wx://std/").ok_or_else(|| {
+			params.uri.strip_prefix("wx://std").ok_or_else(|| {
 				JsonRpcError::invalid_params(format!(
 					"not a wxstd URI: {}",
 					params.uri
 				))
 			})?;
-		// Keyed exactly as the stdlib crate's own module paths, so any file
+		// Keyed exactly as the stdlib package's own module paths, so any file
 		// the stdlib grows is servable here without touching this match.
-		match wx_compiler::vfs::stdlib_file(filename) {
+		match wx_compiler::vfs::stdlib_file(&AbsolutePath::new(filename)) {
 			Some(source) => Ok(source.to_string()),
 			None => Err(JsonRpcError::invalid_params(format!(
 				"unknown stdlib file: {filename}"
@@ -1110,16 +1121,21 @@ fn render_full_diagnostic(
 		return "Unable to find original wx diagnostic.".to_string();
 	};
 	// Same order `analysis_from_compiled_root`/`add_compiler_diagnostic`
-	// iterate and expand in — crate diagnostics per crate, then TIR
-	// diagnostics, one slot per `diagnostic_locations` entry matching this
-	// path (a diagnostic with no primary label, like unused-enum-variant
-	// warnings, contributes one slot per variant) — so `index` lines up
-	// exactly with what the client saw when this was published.
+	// iterate and expand in — per package, linker diagnostics then every
+	// module's own AST diagnostics, then TIR diagnostics, one slot per
+	// `diagnostic_locations` entry matching this path (a diagnostic with no
+	// primary label, like unused-enum-variant warnings, contributes one slot
+	// per variant) — so `index` lines up exactly with what the client saw
+	// when this was published.
 	let diagnostic = compiled
 		.graph
-		.crates
+		.packages
 		.iter()
-		.flat_map(|cg| cg.diagnostics.iter())
+		.flat_map(|cg| {
+			cg.linker_diagnostics.iter().chain(
+				cg.modules.iter().flat_map(|m| m.ast.diagnostics.iter()),
+			)
+		})
 		.chain(compiled.tir.diagnostics.iter())
 		.flat_map(|d| {
 			let target_path = &target_path;
@@ -1220,11 +1236,11 @@ fn resolve_uri<'a>(
 	state.cached.values().find_map(|compiled| {
 		compiled
 			.graph
-			.crates
+			.packages
 			.iter()
 			.flat_map(|cg| cg.modules.iter())
 			.find_map(|m| {
-				let matches = file_id_to_uri(compiled, m.file_id)
+				let matches = file_id_to_uri(&compiled.graph.files, m.file_id)
 					.is_some_and(|u| u.as_str() == uri.as_str());
 				matches.then_some((compiled, m.file_id))
 			})
@@ -1263,7 +1279,7 @@ pub(crate) fn compute_refresh(
 	logs: &mut Vec<String>,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
 	let previous_root = owning_root(state, file_path).map(Path::to_path_buf);
-	let current_root = discover_crate_root(
+	let current_root = discover_package_root(
 		&state.open_documents,
 		&state.workspace_folders,
 		file_path,
@@ -1368,11 +1384,11 @@ fn compile_root(
 	logs: &mut Vec<String>,
 ) -> CompiledRoot {
 	let compiled_versions = graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
 		.map(|m| {
-			let path = PathBuf::from(&m.file_path);
+			let path = PathBuf::from(m.file_path.as_str());
 			let ver = state
 				.open_documents
 				.get(&path)
@@ -1400,7 +1416,7 @@ fn compile_root(
 /// (`analyze_root`).
 /// Fails only if the entry file itself (`root`) can't be read — everything
 /// past that point (missing/ambiguous `module` declarations elsewhere in the
-/// crate) is a diagnostic on the resulting graph instead, since `discover_crate_root`
+/// package) is a diagnostic on the resulting graph instead, since `discover_package_root`
 /// already verified `root` exists before calling this.
 fn parse_root(
 	state: &ServerState,
@@ -1411,8 +1427,10 @@ fn parse_root(
 	let mut builder = vfs::CompilationUnitBuilder::new();
 	let parse_start = web_time::Instant::now();
 	builder.load_stdlib();
-	let root_id = builder
-		.load_binary(root.to_str().unwrap_or_default().to_string(), &overlay)?;
+	let root_id = builder.load_binary(
+		vfs::AbsolutePath::new(root.to_str().unwrap_or_default()),
+		&overlay,
+	)?;
 	let graph = builder.build(root_id);
 	logs.push(format!("parsing took {:?}", parse_start.elapsed()));
 	Ok(graph)
@@ -1422,19 +1440,30 @@ fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 	let mut diagnostics_by_file = HashMap::new();
 	let mut owned_files = HashSet::new();
 
-	for crate_graph in &compiled.graph.crates {
-		for path in crate_graph.path_to_module.keys() {
-			let path_buf = PathBuf::from(path);
-			if is_absolute_path(&path_buf) {
-				owned_files.insert(path_buf);
+	for package_graph in &compiled.graph.packages {
+		for module in &package_graph.modules {
+			let Ok(file) = compiled.graph.files.get(module.file_id) else {
+				continue;
+			};
+			if file.origin == vfs::FileOrigin::Local {
+				owned_files.insert(PathBuf::from(module.file_path.as_str()));
 			}
 		}
-		for diagnostic in &crate_graph.diagnostics {
+		for diagnostic in &package_graph.linker_diagnostics {
 			add_compiler_diagnostic(
 				&mut diagnostics_by_file,
 				&compiled.graph.files,
 				diagnostic,
 			);
+		}
+		for module in &package_graph.modules {
+			for diagnostic in &module.ast.diagnostics {
+				add_compiler_diagnostic(
+					&mut diagnostics_by_file,
+					&compiled.graph.files,
+					diagnostic,
+				);
+			}
 		}
 	}
 
@@ -1453,7 +1482,7 @@ fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 }
 
 /// The only way `parse_root` can still fail: the entry file itself couldn't
-/// be read (e.g. deleted between `discover_crate_root`'s existence check and
+/// be read (e.g. deleted between `discover_package_root`'s existence check and
 /// this call). Everything else — missing/ambiguous child modules — is now a
 /// diagnostic on the graph rather than a hard failure, so this is a rare,
 /// narrow case rather than the general error path it used to be.
@@ -1495,17 +1524,18 @@ pub(crate) fn diagnostic_publish_paths(
 }
 
 /// Resolves one label to the absolute path + LSP range it points at, or
-/// `None` if the label's file has no name, the name isn't an absolute path
-/// (true for stdlib's virtual `wx://std/...` "files"), or the span doesn't
-/// map to a valid range.
+/// `None` if the label's file is `Virtual` (true for the stdlib's `wx://std/...`
+/// "files", which have no real location on disk to file a diagnostic under),
+/// or the span doesn't map to a valid range.
 fn label_location(
 	files: &vfs::Files,
 	label: &Label<FileId>,
 ) -> Option<(PathBuf, Range)> {
-	let path = PathBuf::from(files.name(label.file_id).ok()?);
-	if !is_absolute_path(&path) {
+	let file = files.get(label.file_id).ok()?;
+	if file.origin != vfs::FileOrigin::Local {
 		return None;
 	}
+	let path = PathBuf::from(&file.name);
 	let range = span_to_range(
 		files,
 		SourceSpan::new(
@@ -1623,8 +1653,7 @@ fn diagnostic_related_information(
 		if label.message.is_empty() {
 			return None;
 		}
-		let path = PathBuf::from(files.name(label.file_id).ok()?);
-		let uri = path_to_file_uri(&path)?;
+		let uri = file_id_to_uri(files, label.file_id)?;
 		let range = span_to_range(
 			files,
 			SourceSpan::new(
@@ -1926,9 +1955,9 @@ fn symbol_hover_text(
 						None => Some(format!("import \"{external}\"")),
 					}
 				}
-				ModuleDeclarationKind::Crate(_, _) => {
+				ModuleDeclarationKind::Package(_, _) => {
 					let name = interner.resolve(ns.name).unwrap_or("?");
-					Some(format!("crate {name}"))
+					Some(format!("package {name}"))
 				}
 			}
 		}
@@ -2402,7 +2431,7 @@ fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
 	}
 }
 
-pub(crate) fn discover_crate_root(
+pub(crate) fn discover_package_root(
 	open_documents: &HashMap<PathBuf, OpenDocument>,
 	workspace_folders: &[PathBuf],
 	file_path: &Path,
@@ -2436,42 +2465,33 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 	uri.to_file_path().map(|cow| cow.into_owned())
 }
 
-/// Whether `path` is one of our own absolute paths, as opposed to a virtual
-/// stdlib name like `main.wx`. Deliberately not `Path::is_absolute()`: it is
-/// (surprisingly) always `false` on `wasm32-unknown-unknown` even for
-/// `/`-rooted paths (see `file_id_to_uri`), which — before this was
-/// introduced — silently dropped every diagnostic and owned-file entry in
-/// `analysis_from_compiled_root`/`label_location` on wasm, since both
-/// gated on `Path::is_absolute()` directly.
-fn is_absolute_path(path: &Path) -> bool {
-	path.to_str().is_some_and(|s| s.starts_with('/'))
-}
-
 /// Builds a `file://` URI directly from an absolute path, bypassing
 /// `Uri::from_file_path`'s `Path::is_absolute()` gate — see `file_id_to_uri`
 /// for why that gate is unusable on `wasm32-unknown-unknown`. Every call
-/// site that turns one of our own paths into a URI must go through this (or
-/// `file_id_to_uri`) instead of `Uri::from_file_path` directly.
+/// site that turns one of our own `Local` paths into a URI must go through
+/// this (or `file_id_to_uri`) instead of `Uri::from_file_path` directly.
 fn path_to_file_uri(path: &Path) -> Option<Uri> {
 	let stripped = path.to_str()?.strip_prefix('/')?;
 	Uri::from_str(&format!("file:///{stripped}")).ok()
 }
 
-/// Converts a `FileId` to a URI. Real files get a `file://` URI; virtual
-/// files (non-absolute names, i.e. stdlib) get a `wx://std/<name>` URI.
+/// Converts a `FileId` to a URI: a `Local` file gets a `file://` URI, a
+/// `Virtual` file (i.e. the stdlib) gets a `wx://std/<name>` URI.
 ///
 /// Deliberately not `Uri::from_file_path`: it gates on `Path::is_absolute()`
 /// to decide whether it can skip `canonicalize()` — and `is_absolute()` is
 /// (surprisingly) always `false` on `wasm32-unknown-unknown` even for
 /// `/`-rooted paths, so it always falls through to `canonicalize()`, which
 /// needs a real filesystem and always fails in the browser. `name` is our
-/// own virtual path, not a real OS path, so we don't need any of that —
-/// just check for the leading `/` ourselves and build the URI directly.
-fn file_id_to_uri(compiled: &CompiledRoot, file_id: FileId) -> Option<Uri> {
-	let name = compiled.graph.files.name(file_id).ok()?;
-	match path_to_file_uri(Path::new(name)) {
-		Some(uri) => Some(uri),
-		None => Uri::from_str(&format!("wx://std/{name}")).ok(),
+/// own virtual path, not necessarily a real OS path, so we don't need any of
+/// that — dispatch on `FileOrigin` and build the URI directly.
+fn file_id_to_uri(files: &vfs::Files, file_id: FileId) -> Option<Uri> {
+	let file = files.get(file_id).ok()?;
+	match file.origin {
+		vfs::FileOrigin::Local => path_to_file_uri(Path::new(&file.name)),
+		vfs::FileOrigin::Virtual => {
+			Uri::from_str(&format!("wx://std/{}", file.name)).ok()
+		}
 	}
 }
 

@@ -3,15 +3,15 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 511
-    signature_index: 8
+  - id: 450
+    signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals:
           - ty:
               Aggregate:
-                aggregate_index: 2
+                aggregate_index: 0
             mutability: Immutable
         result: U32
     block:
@@ -24,10 +24,10 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 517
+                        id: 456
                     ty:
                       Function:
-                        signature_index: 8
+                        signature_index: 0
                   arguments:
                     - kind:
                         LocalGet:
@@ -35,19 +35,19 @@ functions:
                           local_index: 0
                       ty:
                         Aggregate:
-                          aggregate_index: 2
+                          aggregate_index: 0
               ty: U32
       ty: U32
     static_data: []
-  - id: 517
-    signature_index: 8
+  - id: 456
+    signature_index: 0
     scopes:
       - kind: Block
         parent: ~
         locals:
           - ty:
               Aggregate:
-                aggregate_index: 2
+                aggregate_index: 0
             mutability: Immutable
         result: U32
     block:
@@ -65,45 +65,8 @@ functions:
     static_data: []
 signatures:
   - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
-  - items:
-      - F64
-      - F64
-      - I32
-      - F64
-    params_count: 3
-  - items:
-      - F64
-      - I32
-    params_count: 1
-  - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - F64
       - Aggregate:
           aggregate_index: 0
-    params_count: 1
-  - items:
-      - F64
-      - F32
-    params_count: 1
-  - items:
-      - F32
-      - F64
-    params_count: 1
-  - items:
-      - F32
-      - Aggregate:
-          aggregate_index: 1
-    params_count: 1
-  - items:
-      - Aggregate:
-          aggregate_index: 2
       - U32
     params_count: 1
   - items:
@@ -131,6 +94,15 @@ signatures:
       - U32
       - F32
     params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
   - items:
       - F64
       - I64
@@ -151,20 +123,6 @@ signatures:
       - I32
       - I32
       - I32
-    params_count: 2
-  - items:
-      - F32
-      - I32
-      - F32
-    params_count: 2
-  - items:
-      - I32
-      - I64
-    params_count: 1
-  - items:
-      - F64
-      - I32
-      - F64
     params_count: 2
   - items:
       - I32
@@ -245,46 +203,19 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 511
-      name: 308
+      id: 450
+      name: 234
 imports: []
 memories:
-  - id: 508
+  - id: 447
     source: Internal
     kind: Memory32
     min_pages: ~
     max_pages: ~
 aggregates:
   - values:
-      - F64
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-      - 16
-    layout:
-      size: 24
-      align: 8
-    decl_to_phys:
-      - 2
-      - 0
-      - 1
-  - values:
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-    layout:
-      size: 16
-      align: 8
-    decl_to_phys:
-      - 1
-      - 0
-  - values:
       - Pointer:
-          memory: 508
+          memory: 447
           kind: Memory32
       - U32
     offsets:

@@ -22,8 +22,8 @@ impl TestCase {
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
-				"main.wx".to_string(),
-				&vfs::VirtualFileSource::new(HashMap::from([(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					prefixed,
 				)])),
@@ -50,8 +50,8 @@ impl TestCase {
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
-				entry_path.to_string(),
-				&vfs::VirtualFileSource::new(workspace_files),
+				vfs::AbsolutePath::new(format!("/{entry_path}")),
+				&vfs::VirtualFileSource::from_relative(workspace_files),
 			)
 			.unwrap();
 		let mut graph = builder.build(root_id);
@@ -114,7 +114,7 @@ fn test_parse_char_literal() {
 }
 
 #[test]
-fn test_build_with_crate_graph_lowers_child_module_items() {
+fn test_build_with_package_graph_lowers_child_module_items() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		"module math;",
@@ -131,7 +131,7 @@ fn test_build_with_crate_graph_lowers_child_module_items() {
 }
 
 #[test]
-fn test_build_with_crate_graph_resolves_cross_file_module_function_call() {
+fn test_build_with_package_graph_resolves_cross_file_module_function_call() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
@@ -150,7 +150,7 @@ fn test_build_with_crate_graph_resolves_cross_file_module_function_call() {
 }
 
 #[test]
-fn test_build_with_crate_graph_resolves_cross_file_module_type_access() {
+fn test_build_with_package_graph_resolves_cross_file_module_type_access() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
@@ -2152,8 +2152,8 @@ fn test_memory_missing_std_import_does_not_panic() {
 	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(
-			"main.wx".to_string(),
-			&vfs::VirtualFileSource::new(HashMap::from([(
+			vfs::AbsolutePath::new("/main.wx"),
+			&vfs::VirtualFileSource::from_relative(HashMap::from([(
 				"main.wx".to_string(),
 				indoc! {"
                     memory MEM: Memory where { Size = u32 };
@@ -4583,8 +4583,14 @@ fn no_errors(case: &TestCase) {
 		display_style: DisplayStyle::Rich,
 		..term::Config::default()
 	};
-	for crate_ in &case.graph.crates {
-		for diagnostic in crate_.diagnostics.iter().filter(|diagnostic| {
+	for package_ in &case.graph.packages {
+		let package_diagnostics = package_.linker_diagnostics.iter().chain(
+			package_
+				.modules
+				.iter()
+				.flat_map(|m| m.ast.diagnostics.iter()),
+		);
+		for diagnostic in package_diagnostics.filter(|diagnostic| {
 			match diagnostic.severity {
 				Severity::Error | Severity::Bug => true,
 				_ => false,
@@ -7595,7 +7601,7 @@ fn test_const_whose_value_failed_to_build_is_still_referenceable() {
 	// `SymbolKind::Pending` forever and the first use of it in value position
 	// panicked on the "signature resolved but symbol still pending"
 	// unreachable rather than reporting the original error. Checking
-	// `std/main.wx` as a binary crate reached this through a long cascade;
+	// `std/main.wx` as a binary package reached this through a long cascade;
 	// this is the direct form.
 	//
 	// The unresolved associated item is deliberate — it mirrors the stdlib
@@ -7715,7 +7721,7 @@ fn test_pub_enum_no_unused_warn() {
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::UnusedItem.code())
 			&& d.message.contains("Color")),
-		"pub enum should not warn as unused even with no in-crate references"
+		"pub enum should not warn as unused even with no in-package references"
 	);
 }
 

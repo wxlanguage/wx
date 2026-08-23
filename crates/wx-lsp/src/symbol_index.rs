@@ -530,7 +530,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				};
 				(SourceSpan::new(decl.file_id, span), name_sym)
 			}
-			ModuleDeclarationKind::Crate(_, file_id) => {
+			ModuleDeclarationKind::Package(_, file_id) => {
 				(SourceSpan::new(file_id, TextSpan::new(0, 0)), ns.name)
 			}
 		};

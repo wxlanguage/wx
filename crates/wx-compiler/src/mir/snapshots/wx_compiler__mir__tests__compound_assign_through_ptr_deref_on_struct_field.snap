@@ -3,20 +3,20 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 510
-    signature_index: 9
+  - id: 449
+    signature_index: 1
     scopes:
       - kind: Block
         parent: ~
         locals:
           - ty:
               Pointer:
-                memory: 508
+                memory: 447
                 kind: Memory32
             mutability: Immutable
           - ty:
               Pointer:
-                memory: 508
+                memory: 447
                 kind: Memory32
             mutability: Immutable
           - ty: U32
@@ -44,7 +44,7 @@ functions:
                         local_index: 0
                     ty:
                       Pointer:
-                        memory: 508
+                        memory: 447
                         kind: Memory32
               ty: Unit
             - kind:
@@ -56,7 +56,7 @@ functions:
                         local_index: 1
                     ty:
                       Pointer:
-                        memory: 508
+                        memory: 447
                         kind: Memory32
                   value:
                     kind:
@@ -77,10 +77,10 @@ functions:
                                             local_index: 1
                                         ty:
                                           Pointer:
-                                            memory: 508
+                                            memory: 447
                                             kind: Memory32
                                       offset: 4
-                                      memory: 508
+                                      memory: 447
                                   ty: U32
                             ty: Unit
                           - kind:
@@ -115,48 +115,11 @@ functions:
                             ty: U32
                     ty: U32
                   offset: 4
-                  memory: 508
+                  memory: 447
               ty: Unit
       ty: Unit
     static_data: []
 signatures:
-  - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
-  - items:
-      - F64
-      - F64
-      - I32
-      - F64
-    params_count: 3
-  - items:
-      - F64
-      - I32
-    params_count: 1
-  - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - F64
-      - Aggregate:
-          aggregate_index: 0
-    params_count: 1
-  - items:
-      - F64
-      - F32
-    params_count: 1
-  - items:
-      - F32
-      - F64
-    params_count: 1
-  - items:
-      - F32
-      - Aggregate:
-          aggregate_index: 1
-    params_count: 1
   - items:
       - U32
       - U32
@@ -164,7 +127,7 @@ signatures:
     params_count: 2
   - items:
       - Pointer:
-          memory: 508
+          memory: 447
           kind: Memory32
       - Unit
     params_count: 1
@@ -195,6 +158,15 @@ signatures:
     params_count: 1
   - items:
       - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
+  - items:
+      - F64
       - I64
     params_count: 1
   - items:
@@ -213,20 +185,6 @@ signatures:
       - I32
       - I32
       - I32
-    params_count: 2
-  - items:
-      - F32
-      - I32
-      - F32
-    params_count: 2
-  - items:
-      - I32
-      - I64
-    params_count: 1
-  - items:
-      - F64
-      - I32
-      - F64
     params_count: 2
   - items:
       - I32
@@ -302,43 +260,16 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 510
-      name: 310
+      id: 449
+      name: 236
 imports: []
 memories:
-  - id: 508
+  - id: 447
     source: Internal
     kind: Memory32
     min_pages: ~
     max_pages: ~
 aggregates:
-  - values:
-      - F64
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-      - 16
-    layout:
-      size: 24
-      align: 8
-    decl_to_phys:
-      - 2
-      - 0
-      - 1
-  - values:
-      - F64
-      - I32
-    offsets:
-      - 0
-      - 8
-    layout:
-      size: 16
-      align: 8
-    decl_to_phys:
-      - 1
-      - 0
   - values:
       - U32
       - U32

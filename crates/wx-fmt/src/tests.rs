@@ -16,7 +16,11 @@ impl TestCase {
 		let mut interner = ast::StringInterner::new();
 		let mut files = vfs::Files::new();
 		let file_id = files
-			.add("main.wx".to_string(), source.to_string())
+			.add(
+				"main.wx".to_string(),
+				source.to_string(),
+				vfs::FileOrigin::Local,
+			)
 			.unwrap();
 		let mut id_generator = ast::DefIdGenerator::new();
 		let ast = ast::Parser::parse(

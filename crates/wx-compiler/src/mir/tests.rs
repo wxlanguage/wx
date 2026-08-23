@@ -20,8 +20,8 @@ impl TestCase {
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
-				"main.wx".to_string(),
-				&vfs::VirtualFileSource::new(HashMap::from([(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					prefixed,
 				)])),

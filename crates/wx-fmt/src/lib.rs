@@ -2378,6 +2378,7 @@ impl<'a> Builder<'a> {
 	}
 }
 
+#[derive(Clone, Copy)]
 pub struct RendererConfig {
 	pub max_line_width: u32,
 	pub indent_width: u8,

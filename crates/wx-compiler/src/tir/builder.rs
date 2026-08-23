@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
-use crate::vfs::{CrateId, Files};
+use crate::vfs::{Files, PackageId, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
 struct ExprContext {
@@ -201,7 +201,7 @@ struct Builder<'ast, 'graph> {
 	type_index_lookup: HashMap<Type, TypeIndex>,
 	tir: TIR,
 	/// Namespaces brought into the root scope via `use path::*;` at the binary
-	/// crate root (where `namespace = None`).  Parallel to `ModuleNamespace::wildcard_imports`.
+	/// package root (where `namespace = None`).  Parallel to `ModuleNamespace::wildcard_imports`.
 	root_wildcard_imports: Vec<NamespaceIndex>,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
 	ast_nodes: Vec<AstEntry<'ast>>,
@@ -1660,13 +1660,13 @@ fn report_invalid_cast(
 
 pub fn build(graph: &mut CompilationUnit) -> TIR {
 	let source_modules: Vec<_> = graph
-		.crates
+		.packages
 		.iter()
-		.flat_map(|crate_graph| {
-			crate_graph
+		.flat_map(|package_graph| {
+			package_graph
 				.modules
 				.iter()
-				.map(move |module| (crate_graph, module))
+				.map(move |module| (package_graph, module))
 		})
 		.collect();
 	assert!(
@@ -1740,38 +1740,41 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		operator_traits: None,
 	};
 
-	// Create a top-level namespace for each named (library) crate before prescanning.
+	// Create a top-level namespace for each named (library) package before prescanning.
 	// This lets modules inside stdlib live under `std::` rather than the root namespace.
-	let mut crate_namespaces: HashMap<CrateId, NamespaceIndex> = HashMap::new();
-	for crate_graph in &graph.crates {
-		if let Some(crate_name) = crate_graph.name {
+	let mut package_namespaces: HashMap<PackageId, NamespaceIndex> =
+		HashMap::new();
+	for package_graph in &graph.packages {
+		if let PackageKind::Library { name: package_name } = package_graph.kind
+		{
 			let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
 			builder.tir.namespaces.push(ModuleNamespace {
-				name: crate_name,
+				name: package_name,
 				parent: None,
-				declaration: ModuleDeclarationKind::Crate(
-					crate_graph.id,
-					crate_graph.modules[crate_graph.root.as_usize()].file_id,
+				declaration: ModuleDeclarationKind::Package(
+					package_graph.id,
+					package_graph.modules[package_graph.root.as_usize()]
+						.file_id,
 				),
 				symbols: HashMap::new(),
 				wildcard_imports: Vec::new(),
 				accesses: Vec::new(),
 			});
 			builder.symbol_lookup.insert(
-				(SymbolNamespace::Type, crate_name),
+				(SymbolNamespace::Type, package_name),
 				SymbolKind::Module { namespace_idx },
 			);
-			crate_namespaces.insert(crate_graph.id, namespace_idx);
+			package_namespaces.insert(package_graph.id, namespace_idx);
 		}
 	}
 
 	// Phase 1: register all top-level items into ast_nodes / pending
-	for (crate_graph, source_module) in source_modules.iter().copied() {
-		let crate_base = crate_namespaces.get(&crate_graph.id).copied();
-		let module_path = crate_graph.module_symbol_path(source_module.id);
+	for (package_graph, source_module) in source_modules.iter().copied() {
+		let package_base = package_namespaces.get(&package_graph.id).copied();
+		let module_path = package_graph.module_symbol_path(source_module.id);
 		let namespace = builder.ensure_module_path(
 			source_module.file_id,
-			crate_base,
+			package_base,
 			&module_path,
 		);
 		for item in source_module.ast.items.iter() {
@@ -2757,16 +2760,16 @@ impl<'ast> Builder<'ast, '_> {
 	/// private item is visible to its declaring module and every descendant
 	/// module).
 	///
-	/// `None` is overloaded: it's both "the root/binary crate's own
+	/// `None` is overloaded: it's both "the root/binary package's own
 	/// top-level scope" (which has no `tir.namespaces` entry) *and* what you
-	/// get by walking one step past any named crate's own root (whose
+	/// get by walking one step past any named package's own root (whose
 	/// `parent` is also `None`, since it has no further ancestor). Naively
 	/// walking `.parent` until `None` would conflate the two and let code
-	/// inside `std` see the binary crate's private root items merely
+	/// inside `std` see the binary package's private root items merely
 	/// because both chains dead-end at the same `None` value. To avoid that,
 	/// the walk stops the moment it lands on a namespace that is itself a
-	/// crate root (`ModuleDeclarationKind::Crate`) without having matched —
-	/// crossing into a different crate never counts as reaching an ancestor.
+	/// package root (`ModuleDeclarationKind::Package`) without having matched —
+	/// crossing into a different package never counts as reaching an ancestor.
 	fn is_ancestor_or_self(
 		&self,
 		accessor: Option<NamespaceIndex>,
@@ -2781,8 +2784,10 @@ impl<'ast> Builder<'ast, '_> {
 				return false;
 			};
 			let namespace = &self.tir.namespaces[idx as usize];
-			if matches!(namespace.declaration, ModuleDeclarationKind::Crate(..))
-			{
+			if matches!(
+				namespace.declaration,
+				ModuleDeclarationKind::Package(..)
+			) {
 				return false;
 			}
 			current = namespace.parent;
@@ -4664,7 +4669,7 @@ impl<'ast> Builder<'ast, '_> {
 						let decl = &self.tir.import_decls[import_idx as usize];
 						SourceSpan::new(decl.file_id, decl.external_name.span)
 					}
-					ModuleDeclarationKind::Crate(_, file_id) => {
+					ModuleDeclarationKind::Package(_, file_id) => {
 						SourceSpan::new(file_id, ast::TextSpan::new(0, 0))
 					}
 				}
