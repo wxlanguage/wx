@@ -99,7 +99,7 @@ pub struct SpanInfo {
 pub struct GlobalDefinition {
 	pub name: SymbolU32,
 	/// `None` means the implicit root namespace.
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub info: SpanInfo,
 }
 
@@ -530,19 +530,31 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				};
 				(SourceSpan::new(decl.file_id, span), name_sym)
 			}
-			ModuleDeclarationKind::Package(_, file_id) => {
-				(SourceSpan::new(file_id, TextSpan::new(0, 0)), ns.name)
+			// A package has no name of its own — each dependent names it by
+			// its own `dependencies` key. Its definition span is still worth
+			// indexing, but there's no single name to file it under.
+			//
+			// TODO: emit one entry per incoming edge instead, so a package is
+			// completable under the name each dependent actually uses.
+			ModuleDeclarationKind::Package(file_id) => {
+				index.definitions.push(SpanInfo {
+					source: SourceSpan::new(file_id, TextSpan::new(0, 0)),
+					kind,
+				});
+				continue;
 			}
 		};
 		let info = SpanInfo {
 			source: def_source,
 			kind,
 		};
-		index.global_definitions.push(GlobalDefinition {
-			name: name_sym,
-			namespace: ns.parent,
-			info,
-		});
+		if let Some(parent) = ns.parent {
+			index.global_definitions.push(GlobalDefinition {
+				name: name_sym,
+				namespace: parent,
+				info,
+			});
+		}
 		index.definitions.push(info);
 		for access in &ns.accesses {
 			index.references.push(SpanInfo {

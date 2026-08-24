@@ -5,7 +5,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefId, Separated, Spanned, TextSpan};
-use crate::vfs::{CompilationUnit, FileId, PackageId};
+use crate::vfs::{CompilationUnit, FileId, PackageGraph, PackageId};
 
 mod builder;
 #[cfg(test)]
@@ -326,7 +326,7 @@ pub type AssocTypeIndex = u32;
 pub struct Constant {
 	pub id: DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	/// `Some` for associated consts (`impl Target { const FOO }` / trait
 	/// consts) — `None` for free top-level consts. See `ItemParent`.
 	pub parent: Option<ItemParent>,
@@ -351,7 +351,7 @@ pub struct TraitAssocType {
 pub struct Trait {
 	pub id: ast::DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub pub_span: Option<TextSpan>,
 	pub name: ast::Spanned<SymbolU32>,
 	/// The implicit `Self` type parameter owned by this trait. All trait
@@ -498,7 +498,7 @@ impl IntegerRange {
 pub struct TypeSet {
 	pub id: ast::DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub name: ast::Spanned<SymbolU32>,
 	pub pub_span: Option<ast::TextSpan>,
 	pub members: Box<[TypeIndex]>,
@@ -1021,7 +1021,7 @@ pub enum ExportItem {
 pub struct Enum {
 	pub id: ast::DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub pub_span: Option<ast::TextSpan>,
 	pub name: ast::Spanned<SymbolU32>,
 	pub repr_type: TypeIndex,
@@ -1183,18 +1183,24 @@ pub enum ModuleDeclarationKind {
 	Module(u32),
 	/// Index into `TIR::import_decls`.
 	Import(u32),
-	/// Top-level namespace created implicitly for a named library package.
-	/// Carries the root module's `FileId` for diagnostic spans.
-	Package(PackageId, FileId),
+	/// A package's own root namespace. Carries the entry module's `FileId`
+	/// for diagnostic spans; which package it is lives on
+	/// [`ModuleNamespace::package`], the same as for every other namespace.
+	Package(FileId),
 }
 
 /// The symbol table for a module namespace — shared concept for both local
 /// modules (`module foo;` / `module foo { }`) and import blocks (`import "env" { }`).
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModuleNamespace {
-	pub name: SymbolU32,
-	/// `None` when the parent is the root namespace (not stored in `TIR::namespaces`).
+	/// `None` for a package's own root namespace, which has no ancestor.
+	///
+	/// No name: that belongs to the declaration that introduced this
+	/// namespace, and a package has no single one.
 	pub parent: Option<NamespaceIndex>,
+	/// The package this namespace belongs to — every namespace is inside
+	/// exactly one, so it's stored rather than recovered by walking parents.
+	pub package: PackageId,
 	pub declaration: ModuleDeclarationKind,
 	#[cfg_attr(
 		test,
@@ -1272,6 +1278,10 @@ pub enum ImplEntry {
 pub struct AssocTypeImpl {
 	pub id: DefId,
 	pub file_id: FileId,
+	/// The scope it was declared in. Kept alongside `file_id` so trait
+	/// conformance checking, which walks impls rather than source, can
+	/// report against the right scope without reconstructing one.
+	pub namespace: NamespaceIndex,
 	pub name: Spanned<SymbolU32>,
 	pub ty: Option<Spanned<TypeIndex>>,
 	pub attributes: Box<[ItemAttribute]>,
@@ -1485,7 +1495,7 @@ impl Function {
 pub struct Function {
 	pub id: DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	/// `Some` for methods/associated functions (impl or trait members) —
 	/// `None` for free top-level and imported functions. See `ItemParent`.
 	pub parent: Option<ItemParent>,
@@ -1648,7 +1658,7 @@ define_diagnostic_codes! {
 pub struct Global {
 	pub id: DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub accesses: Vec<SourceSpan>,
 	pub name: Spanned<SymbolU32>,
 	pub ty: Spanned<TypeIndex>,
@@ -1686,7 +1696,7 @@ pub struct StructField {
 pub struct Struct {
 	pub id: DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
 	/// Empty for non-generic structs.
@@ -1709,7 +1719,7 @@ pub struct Struct {
 pub struct TypeAlias {
 	pub id: DefId,
 	pub file_id: FileId,
-	pub namespace: Option<NamespaceIndex>,
+	pub namespace: NamespaceIndex,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
 	pub attributes: Box<[ItemAttribute]>,
@@ -1739,24 +1749,26 @@ fn ownership_sigil(ownership: ast::Ownership) -> char {
 pub struct TypeFormatter<'a> {
 	tir: &'a TIR,
 	pub interner: &'a ast::StringInterner,
-	type_params: &'a [TypeParamInfo],
+	/// Needed to name a package, which has no name of its own — see
+	/// [`TIR::namespace_name`].
+	packages: &'a [PackageGraph],
+	/// The package whose point of view names are rendered from.
+	from: PackageId,
 }
 
 impl<'a> TypeFormatter<'a> {
-	pub fn new(tir: &'a TIR, interner: &'a ast::StringInterner) -> Self {
+	pub fn new(
+		tir: &'a TIR,
+		interner: &'a ast::StringInterner,
+		packages: &'a [PackageGraph],
+		from: PackageId,
+	) -> Self {
 		Self {
 			tir,
 			interner,
-			type_params: &[],
+			packages,
+			from,
 		}
-	}
-
-	pub fn with_type_params(
-		mut self,
-		type_params: &'a [TypeParamInfo],
-	) -> Self {
-		self.type_params = type_params;
-		self
 	}
 
 	pub fn display_kind(&self, idx: TypeIndex) -> &'static str {
@@ -1919,7 +1931,11 @@ impl<'a> TypeFormatter<'a> {
 			}
 			Type::Namespace { namespace_idx } => self
 				.interner
-				.resolve(self.tir.namespaces[*namespace_idx as usize].name)
+				.resolve(self.tir.namespace_name(
+					*namespace_idx,
+					self.packages,
+					self.from,
+				))
 				.ok_or(std::fmt::Error)
 				.and_then(|name| f.write_str(name)),
 			Type::Function { signature } => {
@@ -2167,15 +2183,25 @@ pub struct TIR {
 	pub globals: Vec<Global>,
 	pub memories: Vec<Memory>,
 	pub namespaces: Vec<ModuleNamespace>,
-	/// Symbol table for the implicit root namespace (`namespace = None`) —
-	/// the counterpart of `ModuleNamespace::symbols` for items that aren't
-	/// nested inside any `module { }` block.
+	/// Each package's own root namespace. Every package has one, so a
+	/// top-level item always lives in a real namespace rather than in a
+	/// separate global table — which is what lets `parent: None` mean
+	/// "nothing above this" and nothing else, and so what stops a lookup in
+	/// one package from reaching another's items.
+	///
+	/// Also where a package's dependency names live: each `(key, target)`
+	/// edge is an ordinary `Module` symbol in the declaring package's
+	/// namespace here, since a dependency behaves exactly like a `module`
+	/// declared at the top of its entry file.
 	#[cfg_attr(test, serde(skip))]
-	pub root_symbols: HashMap<(SymbolNamespace, SymbolU32), SymbolKind>,
-	/// Namespaces brought into the root scope via `use path::*;`. Parallel to
-	/// `ModuleNamespace::wildcard_imports`.
+	pub package_namespaces: HashMap<PackageId, NamespaceIndex>,
+	/// The scope each file's top-level items live in, indexed by `FileId` —
+	/// its module's namespace, or its package's root namespace for an entry
+	/// file, which has no `module` declaration of its own.
+	///
+	/// Recorded in Phase 1, where `ensure_module_path` already computes it.
 	#[cfg_attr(test, serde(skip))]
-	pub root_wildcard_imports: Vec<NamespaceIndex>,
+	pub file_namespaces: Vec<NamespaceIndex>,
 	pub module_decls: Vec<ModuleDecl>,
 	pub import_decls: Vec<ImportDecl>,
 	pub enums: Vec<Enum>,
@@ -3064,21 +3090,47 @@ impl TIR {
 	pub fn formatter<'a>(
 		&'a self,
 		interner: &'a ast::StringInterner,
+		packages: &'a [PackageGraph],
+		from: PackageId,
 	) -> TypeFormatter<'a> {
-		TypeFormatter::new(self, interner)
+		TypeFormatter::new(self, interner, packages, from)
 	}
 
-	pub fn is_import_namespace(
+	/// The name `namespace` goes by, as seen from package `from`.
+	///
+	/// Contextual because a package has no name of its own: it's known by the
+	/// `dependencies` key of whoever declared it, so the same package can be
+	/// `foo` in one package and `bar` in another. Modules and imports are
+	/// named by their own declaration and ignore `from`.
+	///
+	/// Total: a package is only nameable from one that declared it, and
+	/// `add_dependency` keeps that name unique.
+	pub fn namespace_name(
 		&self,
-		namespace: Option<NamespaceIndex>,
-	) -> bool {
-		match namespace {
-			Some(idx) => match self.namespaces[idx as usize].declaration {
-				ModuleDeclarationKind::Import(_) => true,
-				ModuleDeclarationKind::Module(_)
-				| ModuleDeclarationKind::Package(..) => false,
-			},
-			None => false,
+		namespace: NamespaceIndex,
+		packages: &[PackageGraph],
+		from: PackageId,
+	) -> SymbolU32 {
+		match self.namespaces[namespace as usize].declaration {
+			ModuleDeclarationKind::Module(decl_idx) => {
+				self.module_decls[decl_idx as usize].name.inner
+			}
+			ModuleDeclarationKind::Import(decl_idx) => {
+				let decl = &self.import_decls[decl_idx as usize];
+				decl.internal_name.unwrap_or(decl.external_name).inner
+			}
+			ModuleDeclarationKind::Package(_) => {
+				let target = self.namespaces[namespace as usize].package;
+				packages[from.as_usize()].dependency_names[&target]
+			}
+		}
+	}
+
+	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
+		match self.namespaces[namespace as usize].declaration {
+			ModuleDeclarationKind::Import(_) => true,
+			ModuleDeclarationKind::Module(_)
+			| ModuleDeclarationKind::Package(..) => false,
 		}
 	}
 

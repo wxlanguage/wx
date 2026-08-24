@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
-use crate::vfs::{Files, PackageId, PackageKind};
+use crate::vfs::{Files, PackageGraph};
 use crate::{ast::MethodCallExpr, tir::*};
 
 struct ExprContext {
@@ -194,15 +194,22 @@ pub fn parse_char_literal(s: &str) -> Result<char, CharLiteralError> {
 }
 
 struct Builder<'ast, 'graph> {
+	// These cannot collapse into a single `&'graph mut CompilationUnit`, even
+	// though all four are its fields. `ast_nodes` holds `&'ast ast::Item`
+	// pointing into `packages[..].modules[..].ast` — into the same unit. That
+	// only works because `packages` (shared) and `interner`/`id_generator`
+	// (mutable) are *disjoint fields* borrowed separately. Behind one `&mut`
+	// the AST refs must be reborrowed out of it, which poisons the builder for
+	// every later `&mut self` phase (E0502) — and phases 2, 3, 3.5 and 4 all
+	// run while `ast_nodes` is live.
 	interner: &'graph mut ast::StringInterner,
 	id_generator: &'graph mut ast::DefIdGenerator,
 	files: &'graph Files,
-	symbol_lookup: HashMap<(SymbolNamespace, SymbolU32), SymbolKind>,
+	/// Read only to resolve what a package calls its dependencies, which is
+	/// where a package's canonical name lives (see `PackageGraph::dependency_names`).
+	packages: &'graph [PackageGraph],
 	type_index_lookup: HashMap<Type, TypeIndex>,
 	tir: TIR,
-	/// Namespaces brought into the root scope via `use path::*;` at the binary
-	/// package root (where `namespace = None`).  Parallel to `ModuleNamespace::wildcard_imports`.
-	root_wildcard_imports: Vec<NamespaceIndex>,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
 	ast_nodes: Vec<AstEntry<'ast>>,
 	/// Maps DefId → SigEntry; populated after Phase 1 with exact capacity.
@@ -322,7 +329,7 @@ enum BoundKind {
 struct AstEntry<'ast> {
 	def_id: ast::DefId,
 	file_id: FileId,
-	namespace: Option<NamespaceIndex>,
+	namespace: NamespaceIndex,
 	node: AstNodeRef<'ast>,
 }
 
@@ -341,11 +348,11 @@ struct GenericScope {
 #[derive(Clone, Copy)]
 struct ResolveContext {
 	file_id: FileId,
-	namespace: Option<NamespaceIndex>,
+	namespace: NamespaceIndex,
 }
 
 impl ResolveContext {
-	fn new(file_id: FileId, namespace: Option<NamespaceIndex>) -> Self {
+	fn new(file_id: FileId, namespace: NamespaceIndex) -> Self {
 		Self { file_id, namespace }
 	}
 }
@@ -1701,8 +1708,8 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		globals: Vec::new(),
 		exports: HashMap::new(),
 		namespaces: Vec::new(),
-		root_symbols: HashMap::new(),
-		root_wildcard_imports: Vec::new(),
+		package_namespaces: HashMap::new(),
+		file_namespaces: vec![0; graph.files.len()],
 		module_decls: Vec::new(),
 		import_decls: Vec::new(),
 		enums: Vec::new(),
@@ -1726,57 +1733,80 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 			.enumerate()
 			.map(|(idx, ty)| (ty.clone(), TypeIndex(idx as u32))),
 	);
-	let symbol_lookup = HashMap::new();
 	let mut builder = Builder {
-		symbol_lookup,
 		interner: &mut graph.interner,
 		id_generator: &mut graph.id_generator,
 		files: &graph.files,
+		packages: &graph.packages,
 		tir,
 		type_index_lookup,
 		sig_state: HashMap::new(),
-		root_wildcard_imports: Vec::new(),
 		ast_nodes: Vec::new(),
 		operator_traits: None,
 	};
 
-	// Create a top-level namespace for each named (library) package before prescanning.
-	// This lets modules inside stdlib live under `std::` rather than the root namespace.
-	let mut package_namespaces: HashMap<PackageId, NamespaceIndex> =
-		HashMap::new();
+	// Every package gets a root namespace of its own, the root package
+	// included. That is what makes `parent: None` mean "nothing above this"
+	// and nothing else — previously it also meant "the root package's own
+	// scope", which is why a lookup walking past any package boundary fell
+	// through into the root's items, and why `is_ancestor_or_self` needed a
+	// hand-written stop at package roots.
+	//
+	// Created by walking `graph.packages` in order, so `NamespaceIndex`
+	// values never depend on `HashMap` iteration order: they end up in
+	// snapshots.
 	for package_graph in &graph.packages {
-		if let PackageKind::Library { name: package_name } = package_graph.kind
-		{
-			let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
-			builder.tir.namespaces.push(ModuleNamespace {
-				name: package_name,
-				parent: None,
-				declaration: ModuleDeclarationKind::Package(
-					package_graph.id,
-					package_graph.modules[package_graph.root.as_usize()]
-						.file_id,
-				),
-				symbols: HashMap::new(),
-				wildcard_imports: Vec::new(),
-				accesses: Vec::new(),
-			});
-			builder.symbol_lookup.insert(
-				(SymbolNamespace::Type, package_name),
-				SymbolKind::Module { namespace_idx },
+		let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
+		builder.tir.namespaces.push(ModuleNamespace {
+			parent: None,
+			package: package_graph.id,
+			declaration: ModuleDeclarationKind::Package(
+				package_graph.modules[package_graph.root.as_usize()].file_id,
+			),
+			symbols: HashMap::new(),
+			wildcard_imports: Vec::new(),
+			accesses: Vec::new(),
+		});
+		builder
+			.tir
+			.package_namespaces
+			.insert(package_graph.id, namespace_idx);
+	}
+
+	// A dependency is an implicit `module <key>;` at the top of the declaring
+	// package's entry file, so its name is an ordinary `Module` symbol in
+	// that package's own namespace. Nothing global is involved, which is what
+	// keeps a package's dependencies invisible to everyone else — including
+	// to its own dependents, who never declared them.
+	for package_graph in &graph.packages {
+		let owner = builder.tir.package_namespaces[&package_graph.id];
+		for (&name, target) in &package_graph.dependencies {
+			let target_namespace = builder.tir.package_namespaces[target];
+			builder.tir.namespaces[owner as usize].symbols.insert(
+				(SymbolNamespace::Type, name),
+				SymbolKind::Module {
+					namespace_idx: target_namespace,
+				},
 			);
-			package_namespaces.insert(package_graph.id, namespace_idx);
 		}
 	}
 
 	// Phase 1: register all top-level items into ast_nodes / pending
 	for (package_graph, source_module) in source_modules.iter().copied() {
-		let package_base = package_namespaces.get(&package_graph.id).copied();
+		let package_base = builder.tir.package_namespaces[&package_graph.id];
 		let module_path = package_graph.module_symbol_path(source_module.id);
 		let namespace = builder.ensure_module_path(
 			source_module.file_id,
 			package_base,
 			&module_path,
 		);
+
+		// Recorded where it's decided: an entry file has an empty module
+		// path, so this is its package's namespace; any other file gets its
+		// own module's.
+		builder.tir.file_namespaces[source_module.file_id.as_usize()] =
+			namespace;
+
 		for item in source_module.ast.items.iter() {
 			builder.pre_scan_item(
 				source_module.file_id,
@@ -1814,18 +1844,24 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	builder.check_trait_conformance();
 
 	// Phase 4: process exports (must run after all signatures are resolved)
-	for (_, source_module) in source_modules.iter().copied() {
+	for (package_graph, source_module) in source_modules.iter().copied() {
+		let package_namespace =
+			builder.tir.package_namespaces[&package_graph.id];
 		for item in source_module.ast.items.iter() {
 			if let ast::Item::Export { entries } = &item.inner.inner {
-				builder.build_exports(source_module.file_id, entries);
+				builder.build_exports(
+					source_module.file_id,
+					package_namespace,
+					entries,
+				);
 			}
 		}
 	}
 
 	builder.report_unused_items();
 
-	builder.tir.root_symbols = builder.symbol_lookup;
-	builder.tir.root_wildcard_imports = builder.root_wildcard_imports;
+	// Nothing to hand over: top-level items and root wildcard imports now
+	// live on each package's own namespace, already inside `builder.tir`.
 
 	builder.tir
 }
@@ -2051,7 +2087,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2200,7 +2236,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2312,7 +2348,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_unary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						UnaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2471,7 +2507,7 @@ impl<'ast> Builder<'ast, '_> {
 	fn ensure_module(
 		&mut self,
 		file_id: FileId,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		name: ast::Spanned<SymbolU32>,
 		pub_span: Option<ast::TextSpan>,
 	) -> NamespaceIndex {
@@ -2493,8 +2529,9 @@ impl<'ast> Builder<'ast, '_> {
 		let namespace_idx = self.tir.namespaces.len() as u32;
 		let decl_idx = self.tir.module_decls.len() as u32;
 		self.tir.namespaces.push(ModuleNamespace {
-			name: symbol,
-			parent: namespace,
+			parent: Some(namespace),
+			// A nested module belongs to whatever package encloses it.
+			package: self.tir.namespaces[namespace as usize].package,
 			declaration: ModuleDeclarationKind::Module(decl_idx),
 			symbols: HashMap::new(),
 			wildcard_imports: Vec::new(),
@@ -2515,12 +2552,14 @@ impl<'ast> Builder<'ast, '_> {
 		namespace_idx
 	}
 
+	/// Returns the namespace `path` names, relative to `base` — which is
+	/// `base` itself for an empty path, i.e. a package's entry file.
 	fn ensure_module_path(
 		&mut self,
 		file_id: FileId,
-		base: Option<NamespaceIndex>,
+		base: NamespaceIndex,
 		path: &[SymbolU32],
-	) -> Option<NamespaceIndex> {
+	) -> NamespaceIndex {
 		let mut namespace = base;
 
 		for (i, segment) in path.iter().copied().enumerate() {
@@ -2542,7 +2581,7 @@ impl<'ast> Builder<'ast, '_> {
 						Some(file_id);
 				}
 			}
-			namespace = Some(namespace_idx);
+			namespace = namespace_idx;
 		}
 
 		namespace
@@ -2639,17 +2678,27 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// A type formatter that renders package names as `namespace`'s own
+	/// package sees them — a package has no name of its own, so what it's
+	/// called depends on who's looking.
+	fn formatter(&self, namespace: NamespaceIndex) -> TypeFormatter<'_> {
+		TypeFormatter::new(
+			&self.tir,
+			self.interner,
+			self.packages,
+			self.tir.namespaces[namespace as usize].package,
+		)
+	}
+
 	fn insert_symbol(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		kind: SymbolKind,
 	) {
-		if let Some(idx) = namespace {
-			self.tir.namespaces[idx as usize].symbols.insert(key, kind);
-		} else {
-			self.symbol_lookup.insert(key, kind);
-		}
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.insert(key, kind);
 	}
 
 	/// Looks up `key` in `namespace`'s own symbol map only — no parent-scope
@@ -2660,14 +2709,13 @@ impl<'ast> Builder<'ast, '_> {
 	/// its name binding.
 	fn direct_scope_lookup(
 		&self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 	) -> Option<SymbolKind> {
-		if let Some(idx) = namespace {
-			self.tir.namespaces[idx as usize].symbols.get(&key).copied()
-		} else {
-			self.symbol_lookup.get(&key).copied()
-		}
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.get(&key)
+			.copied()
 	}
 
 	/// Phase-1 registration for a name that may collide with an earlier
@@ -2682,7 +2730,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// is exclusive; every syntactic occurrence still gets fully resolved.
 	fn claim_name_binding(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		id: ast::DefId,
 		definition_span: SourceSpan,
@@ -2760,38 +2808,25 @@ impl<'ast> Builder<'ast, '_> {
 	/// private item is visible to its declaring module and every descendant
 	/// module).
 	///
-	/// `None` is overloaded: it's both "the root/binary package's own
-	/// top-level scope" (which has no `tir.namespaces` entry) *and* what you
-	/// get by walking one step past any named package's own root (whose
-	/// `parent` is also `None`, since it has no further ancestor). Naively
-	/// walking `.parent` until `None` would conflate the two and let code
-	/// inside `std` see the binary package's private root items merely
-	/// because both chains dead-end at the same `None` value. To avoid that,
-	/// the walk stops the moment it lands on a namespace that is itself a
-	/// package root (`ModuleDeclarationKind::Package`) without having matched —
-	/// crossing into a different package never counts as reaching an ancestor.
+	/// A plain walk up `.parent` is enough now that every package has its own
+	/// root namespace: a chain terminates inside the package it started in,
+	/// so crossing into another package is impossible by construction. This
+	/// used to need an explicit stop at `ModuleDeclarationKind::Package`,
+	/// because `None` meant both "no ancestor" and "the root package's own
+	/// scope", and the two chains dead-ended at the same value.
 	fn is_ancestor_or_self(
 		&self,
-		accessor: Option<NamespaceIndex>,
-		declaring: Option<NamespaceIndex>,
+		accessor: NamespaceIndex,
+		declaring: NamespaceIndex,
 	) -> bool {
-		let mut current = accessor;
-		loop {
-			if current == declaring {
+		let mut current = Some(accessor);
+		while let Some(idx) = current {
+			if idx == declaring {
 				return true;
 			}
-			let Some(idx) = current else {
-				return false;
-			};
-			let namespace = &self.tir.namespaces[idx as usize];
-			if matches!(
-				namespace.declaration,
-				ModuleDeclarationKind::Package(..)
-			) {
-				return false;
-			}
-			current = namespace.parent;
+			current = self.tir.namespaces[idx as usize].parent;
 		}
+		false
 	}
 
 	/// Returns the visibility span and declaring namespace for `kind`, or
@@ -2803,7 +2838,7 @@ impl<'ast> Builder<'ast, '_> {
 	fn symbol_visibility(
 		&self,
 		kind: SymbolKind,
-	) -> Option<(Option<TextSpan>, Option<NamespaceIndex>)> {
+	) -> Option<(Option<TextSpan>, NamespaceIndex)> {
 		let (pub_span, declaring) = match kind {
 			SymbolKind::Enum { enum_index } => {
 				let item = &self.tir.enums[enum_index as usize];
@@ -2852,11 +2887,10 @@ impl<'ast> Builder<'ast, '_> {
 		// their functions/globals never carry a real `pub_span`. Without
 		// this, every import would read as private-by-default and become
 		// uncallable from outside the `import` block itself.
-		if let Some(idx) = declaring
-			&& matches!(
-				self.tir.namespaces[idx as usize].declaration,
-				ModuleDeclarationKind::Import(..)
-			) {
+		if matches!(
+			self.tir.namespaces[declaring as usize].declaration,
+			ModuleDeclarationKind::Import(..)
+		) {
 			return None;
 		}
 		Some((pub_span, declaring))
@@ -2867,7 +2901,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// namespace or a descendant of it.
 	fn symbol_is_visible(
 		&self,
-		accessor: Option<NamespaceIndex>,
+		accessor: NamespaceIndex,
 		kind: SymbolKind,
 	) -> bool {
 		match self.symbol_visibility(kind) {
@@ -2881,10 +2915,10 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn lookup_global_symbol(
 		&self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 	) -> Option<SymbolKind> {
-		let mut current = namespace;
+		let mut current = Some(namespace);
 		while let Some(idx) = current {
 			let namespace_ref = &self.tir.namespaces[idx as usize];
 			if let Some(kind) = namespace_ref.symbols.get(&key).copied() {
@@ -2902,18 +2936,10 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			current = namespace_ref.parent;
 		}
-		if let Some(kind) = self.symbol_lookup.get(&key).copied() {
-			return Some(kind);
-		};
-		for namespace_idx in self.root_wildcard_imports.iter().copied() {
-			if let Some(kind) = self.tir.namespaces[namespace_idx as usize]
-				.symbols
-				.get(&key)
-				.copied() && self.symbol_is_visible(namespace, kind)
-			{
-				return Some(kind);
-			}
-		}
+		// `parent: None` is only ever a package root now, so running out of
+		// parents *is* the package boundary. There's no outer store left to
+		// fall into, which is what keeps one package's items — and its
+		// dependency names — invisible to every other package.
 		None
 	}
 
@@ -2923,7 +2949,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// pending item is still being computed on the current call stack.
 	fn resolve_pending_global_symbol(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
 	) -> Result<Option<SymbolKind>, ()> {
@@ -2965,7 +2991,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// separately, the same way a wildcard import is.
 	fn resolve_pending_namespace_symbol(
 		&mut self,
-		accessor_namespace: Option<NamespaceIndex>,
+		accessor_namespace: NamespaceIndex,
 		target_namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
@@ -3684,12 +3710,9 @@ impl<'ast> Builder<'ast, '_> {
 							Diagnostic::error()
 								.with_message(format!(
 									"`{}` is not a memory declaration",
-									TypeFormatter::new(
-										&self.tir,
-										self.interner
-									)
-									.display_type(memory_ty)
-									.unwrap()
+									self.formatter(resolve_context.namespace)
+										.display_type(memory_ty)
+										.unwrap()
 								))
 								.with_label(Label::primary(
 									resolve_context.file_id,
@@ -4192,7 +4215,8 @@ impl<'ast> Builder<'ast, '_> {
 						.any(|b| b.trait_index == required_trait)
 				});
 			if !bound_satisfied {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -4281,7 +4305,8 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			Err(TraitMemberError::NotImplemented) => {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -4669,7 +4694,7 @@ impl<'ast> Builder<'ast, '_> {
 						let decl = &self.tir.import_decls[import_idx as usize];
 						SourceSpan::new(decl.file_id, decl.external_name.span)
 					}
-					ModuleDeclarationKind::Package(_, file_id) => {
+					ModuleDeclarationKind::Package(file_id) => {
 						SourceSpan::new(file_id, ast::TextSpan::new(0, 0))
 					}
 				}
@@ -4745,7 +4770,7 @@ impl<'ast> Builder<'ast, '_> {
 	fn pre_scan_item(
 		&mut self,
 		file_id: FileId,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		item: &'ast ast::Item,
 	) {
 		match item {
@@ -5049,7 +5074,7 @@ impl<'ast> Builder<'ast, '_> {
 				for child in items.iter() {
 					self.pre_scan_item(
 						file_id,
-						Some(namespace_index),
+						namespace_index,
 						&child.inner.inner,
 					);
 				}
@@ -5065,14 +5090,10 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			} => {
 				let trait_key = (SymbolNamespace::Type, name.inner);
-				let existing_direct = if let Some(idx) = namespace {
-					self.tir.namespaces[idx as usize].symbols.get(&trait_key)
-				} else {
-					self.symbol_lookup.get(&trait_key)
-				};
+				let existing_direct =
+					self.direct_scope_lookup(namespace, trait_key);
 				if let Some(existing) = existing_direct
 					.filter(|k| !matches!(k, SymbolKind::Pending(_)))
-					.cloned()
 				{
 					let name_str = self.interner.resolve(name.inner).unwrap();
 					let first_definition = self.get_symbol_location(existing);
@@ -5285,8 +5306,8 @@ impl<'ast> Builder<'ast, '_> {
 				let namespace_idx = self.tir.namespaces.len() as u32;
 				let decl_idx = self.tir.import_decls.len() as u32;
 				self.tir.namespaces.push(ModuleNamespace {
-					name: module_sym,
-					parent: namespace,
+					parent: Some(namespace),
+					package: self.tir.namespaces[namespace as usize].package,
 					declaration: ModuleDeclarationKind::Import(decl_idx),
 					symbols: HashMap::new(),
 					wildcard_imports: Vec::new(),
@@ -5363,13 +5384,18 @@ impl<'ast> Builder<'ast, '_> {
 				let mut resolved = true;
 				for segment in path.iter() {
 					let key = (SymbolNamespace::Type, segment.inner);
-					let kind = if let Some(idx) = current_ns {
-						self.tir.namespaces[idx as usize]
+					let kind = match current_ns {
+						// Later segments resolve only inside what we've
+						// already walked into.
+						Some(idx) => self.tir.namespaces[idx as usize]
 							.symbols
 							.get(&key)
-							.copied()
-					} else {
-						self.symbol_lookup.get(&key).copied()
+							.copied(),
+						// The first segment is an ordinary scope-chain lookup
+						// from wherever the `use` was written, so it reaches a
+						// sibling module, or a dependency name held further up
+						// on the package's own root namespace.
+						None => self.lookup_global_symbol(namespace, key),
 					};
 					match kind {
 						Some(SymbolKind::Module { namespace_idx }) => {
@@ -5384,16 +5410,10 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 				}
-				if resolved {
-					if let Some(source_ns) = current_ns {
-						if let Some(ns_idx) = namespace {
-							self.tir.namespaces[ns_idx as usize]
-								.wildcard_imports
-								.push(source_ns);
-						} else {
-							self.root_wildcard_imports.push(source_ns);
-						}
-					}
+				if resolved && let Some(source_ns) = current_ns {
+					self.tir.namespaces[namespace as usize]
+						.wildcard_imports
+						.push(source_ns);
 				}
 			}
 			ast::Item::Export { .. } => {
@@ -6049,8 +6069,7 @@ impl<'ast> Builder<'ast, '_> {
 								)
 								.with_message(format!(
 									"cannot define an `impl` block for `{}`",
-									self.tir
-										.formatter(self.interner)
+									self.formatter(resolve_context.namespace)
 										.display_type(self_type)
 										.unwrap()
 								))
@@ -6132,7 +6151,7 @@ impl<'ast> Builder<'ast, '_> {
 							continue;
 						};
 						self.check_assoc_type_bounds(
-							resolve_context.file_id,
+							resolve_context,
 							supertrait.trait_index,
 							self_type,
 							Spanned {
@@ -6179,9 +6198,8 @@ impl<'ast> Builder<'ast, '_> {
 										)
 										.with_message(format!(
 											"`{}` is not an integer type",
-											TypeFormatter::new(
-												&self.tir,
-												self.interner
+											self.formatter(
+												resolve_context.namespace
 											)
 											.display_type(ty)
 											.unwrap_or_default()
@@ -6532,7 +6550,7 @@ impl<'ast> Builder<'ast, '_> {
 							// a no-op in practice; `ERROR` only bites if a
 							// future bound here starts requiring one.
 							self.check_assoc_type_bounds(
-								resolve_context.file_id,
+								resolve_context,
 								trait_index,
 								TypeIndex::ERROR,
 								binding.name,
@@ -6772,7 +6790,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.functions.push(Function {
 						id: *id,
 						file_id: resolve_context.file_id,
-						namespace: Some(import_ns_idx),
+						namespace: import_ns_idx,
 						parent: None,
 						signature_index,
 						body: None,
@@ -6823,7 +6841,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.globals.push(Global {
 						id: *id,
 						file_id: resolve_context.file_id,
-						namespace: Some(import_ns_idx),
+						namespace: import_ns_idx,
 						value: None,
 						name: *name,
 						ty: ast::Spanned {
@@ -7168,6 +7186,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.assoc_type_impls.push(AssocTypeImpl {
 						id: *id,
 						file_id: resolve_context.file_id,
+						namespace: resolve_context.namespace,
 						name: *name,
 						ty: None,
 						attributes,
@@ -7247,6 +7266,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.assoc_type_impls.push(AssocTypeImpl {
 						id: *id,
 						file_id: resolve_context.file_id,
+						namespace: resolve_context.namespace,
 						name: *name,
 						ty: Some(Spanned {
 							inner: concrete_ty,
@@ -7449,7 +7469,7 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				} else if !self.coercible_to(value_expr.ty, global_ty) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(func_ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: global_ty,
 							actual_type: value_expr.ty,
@@ -8065,10 +8085,7 @@ impl<'ast> Builder<'ast, '_> {
 										resolve_context.file_id,
 										ty.span,
 									),
-									TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									),
+									self.formatter(resolve_context.namespace),
 									resolved,
 								),
 							);
@@ -8643,6 +8660,7 @@ impl<'ast> Builder<'ast, '_> {
 					let new_entry = AssocTypeImpl {
 						id: new_id,
 						file_id: original.file_id,
+						namespace: original.namespace,
 						name: original.name,
 						ty: Some(memory_size),
 						attributes: Box::new([]),
@@ -8706,16 +8724,21 @@ impl<'ast> Builder<'ast, '_> {
 		members
 	}
 
+	/// `package_namespace` is the exporting package's own root namespace —
+	/// `export { .. }` is a top-level item, so the names it lists are
+	/// resolved against exactly that scope and no wider one.
 	fn build_exports(
 		&mut self,
 		file_id: FileId,
+		package_namespace: NamespaceIndex,
 		entries: &[Separated<Spanned<ast::ExportEntry>>],
 	) {
 		for entry in entries.iter() {
 			let internal_name = &entry.inner.inner.name;
 
-			let global_value = match self
-				.symbol_lookup
+			let exported_scope =
+				&self.tir.namespaces[package_namespace as usize].symbols;
+			let global_value = match exported_scope
 				.get(&(SymbolNamespace::Value, internal_name.inner))
 			{
 				Some(value) => *value,
@@ -8725,8 +8748,9 @@ impl<'ast> Builder<'ast, '_> {
 					// report the more precise diagnostic instead of treating
 					// it as an unresolved name. Still record the access so
 					// the LSP can resolve hover/go-to-definition on it.
-					if let Some(type_value) = self
-						.symbol_lookup
+					if let Some(type_value) = self.tir.namespaces
+						[package_namespace as usize]
+						.symbols
 						.get(&(SymbolNamespace::Type, internal_name.inner))
 						.copied()
 					{
@@ -8911,7 +8935,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.resolve_type(resolve_context, None, repr_type);
 				if resolved != TypeIndex::ERROR && !resolved.is_integer() {
 					self.tir.diagnostics.push(report_enum_repr_not_integer(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(resolve_context.namespace),
 						resolved,
 						SourceSpan::new(
 							resolve_context.file_id,
@@ -9009,10 +9033,7 @@ impl<'ast> Builder<'ast, '_> {
 						{
 							self.tir.diagnostics.push(
 								report_integer_literal_out_of_range(
-									TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									),
+									self.formatter(resolve_context.namespace),
 									IntegerLiteralOutOfRangeDiagnostic {
 										ty: repr_type,
 										value: v,
@@ -9374,7 +9395,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		if ty != TypeIndex::ERROR && !self.coercible_to(value_expr.ty, ty) {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: ty,
 					actual_type: value_expr.ty,
@@ -9549,7 +9570,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -9671,12 +9692,13 @@ impl<'ast> Builder<'ast, '_> {
 	/// the type was written.
 	fn check_assoc_type_bounds(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		trait_index: TraitIndex,
 		self_type: TypeIndex,
 		name: Spanned<SymbolU32>,
 		ty: Spanned<TypeIndex>,
 	) {
+		let file_id = resolve_context.file_id;
 		let Some(bounds) = self.tir.traits[trait_index as usize]
 			.assoc_types
 			.get(&name.inner)
@@ -9742,10 +9764,8 @@ impl<'ast> Builder<'ast, '_> {
 												.inner,
 										)
 										.unwrap();
-									let fmt = TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									);
+									let fmt = self
+										.formatter(resolve_context.namespace);
 									let concrete_name = fmt
 										.display_type(ty.inner)
 										.unwrap_or_default();
@@ -9791,10 +9811,8 @@ impl<'ast> Builder<'ast, '_> {
 											.inner,
 									)
 									.unwrap();
-								let fmt = TypeFormatter::new(
-									&self.tir,
-									self.interner,
-								);
+								let fmt =
+									self.formatter(resolve_context.namespace);
 								let concrete_name = fmt
 									.display_type(ty.inner)
 									.unwrap_or_default();
@@ -9875,10 +9893,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 				None => {
 					let assoc_name = self.interner.resolve(name.inner).unwrap();
-					let type_name =
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(ty.inner)
-							.unwrap();
+					let type_name = self
+						.formatter(resolve_context.namespace)
+						.display_type(ty.inner)
+						.unwrap();
 					let trait_name = self
 						.interner
 						.resolve(
@@ -9931,7 +9949,8 @@ impl<'ast> Builder<'ast, '_> {
 				)
 				.unwrap();
 			let assoc_name = self.interner.resolve(name.inner).unwrap();
-			let type_name = TypeFormatter::new(&self.tir, self.interner)
+			let type_name = self
+				.formatter(resolve_context.namespace)
 				.display_type(ty.inner)
 				.unwrap();
 			let trait_name = self
@@ -10064,7 +10083,10 @@ impl<'ast> Builder<'ast, '_> {
 				let self_type =
 					self.tir.trait_impls[trait_impl_index].target.inner;
 				self.check_assoc_type_bounds(
-					assoc_type_impl.file_id,
+					ResolveContext::new(
+						assoc_type_impl.file_id,
+						assoc_type_impl.namespace,
+					),
 					trait_index,
 					self_type,
 					assoc_type_impl.name,
@@ -10129,15 +10151,10 @@ impl<'ast> Builder<'ast, '_> {
 		for function in self.tir.functions.iter() {
 			let is_intrinsic =
 				function.attributes.contains(&ItemAttribute::Intrinsic);
-			let is_imported = function
-				.namespace
-				.map(|ns| {
-					matches!(
-						self.tir.namespaces[ns as usize].declaration,
-						ModuleDeclarationKind::Import(_)
-					)
-				})
-				.unwrap_or(false);
+			let is_imported = matches!(
+				self.tir.namespaces[function.namespace as usize].declaration,
+				ModuleDeclarationKind::Import(_)
+			);
 			if is_intrinsic || is_imported {
 				continue;
 			}
@@ -10202,15 +10219,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		for global in self.tir.globals.iter() {
-			let is_imported = global
-				.namespace
-				.map(|ns| {
-					matches!(
-						self.tir.namespaces[ns as usize].declaration,
-						ModuleDeclarationKind::Import(_)
-					)
-				})
-				.unwrap_or(false);
+			let is_imported = matches!(
+				self.tir.namespaces[global.namespace as usize].declaration,
+				ModuleDeclarationKind::Import(_)
+			);
 			if !is_imported && global.accesses.is_empty() {
 				let name = self.interner.resolve(global.name.inner).unwrap();
 				self.tir.diagnostics.push(
@@ -10365,11 +10377,8 @@ impl<'ast> Builder<'ast, '_> {
 				)?;
 
 				let scope = &mut ctx.stack.scopes[ctx.scope_index as usize];
-				let inferred_type = self.infer_block_type(
-					ctx.resolve_context.file_id,
-					scope,
-					&result,
-				)?;
+				let inferred_type =
+					self.infer_block_type(ctx.resolve_context, scope, &result)?;
 				scope.inferred_type = inferred_type;
 				if result.ty.is_comptime_number()
 					&& !inferred_type.is_comptime_number()
@@ -10434,10 +10443,11 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn infer_block_type(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		scope: &BlockScope,
 		value: &Expression,
 	) -> Result<TypeIndex, ()> {
+		let file_id = resolve_context.file_id;
 		if value.ty.is_comptime_number() {
 			let coerce_to = scope.inferred_type.infer_or(scope.expected_type);
 			if coerce_to != TypeIndex::INFER {
@@ -10453,7 +10463,7 @@ impl<'ast> Builder<'ast, '_> {
 			let inferred_type = scope.inferred_type;
 			if !self.coercible_to(result_type, inferred_type) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: inferred_type,
 						actual_type: result_type,
@@ -10466,7 +10476,7 @@ impl<'ast> Builder<'ast, '_> {
 			let expected_type = scope.expected_type;
 			if !self.coercible_to(result_type, expected_type) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type,
 						actual_type: result_type,
@@ -10847,15 +10857,17 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let entry = self.resolve_impl_member(
+			func_ctx.resolve_context,
 			object.ty,
 			member.inner,
-			SourceSpan::new(func_ctx.resolve_context.file_id, member.span),
+			member.span,
 		);
 		match entry {
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
 				let member_name =
 					self.interner.resolve(member.inner).unwrap_or("?");
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
 					.unwrap();
 				self.tir.diagnostics.push(
@@ -11332,7 +11344,8 @@ impl<'ast> Builder<'ast, '_> {
 		if !candidates.is_empty() {
 			let member_name_str =
 				self.interner.resolve(member_name).unwrap_or("?");
-			let type_name = TypeFormatter::new(&self.tir, self.interner)
+			let type_name = self
+				.formatter(resolve_context.namespace)
 				.display_type(base)
 				.unwrap_or_default();
 			let mut diagnostic = Diagnostic {
@@ -11521,7 +11534,8 @@ impl<'ast> Builder<'ast, '_> {
 				}
 				let member_name =
 					self.interner.resolve(member.ident.inner).unwrap();
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(namespace.inner)
 					.unwrap_or_default();
 				self.tir.diagnostics.push(
@@ -11538,9 +11552,10 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			_ => match self.resolve_impl_member(
+				resolve_context,
 				namespace.inner,
 				member.ident.inner,
-				SourceSpan::new(resolve_context.file_id, member.ident.span),
+				member.ident.span,
 			) {
 				MemberLookup::Trait {
 					entry: ImplEntry::AssocType(idx),
@@ -11575,10 +11590,10 @@ impl<'ast> Builder<'ast, '_> {
 					// one case for MemberLookup::NotFound and another for Found with not correct kind
 					let member_name =
 						self.interner.resolve(member.ident.inner).unwrap();
-					let type_name =
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(namespace.inner)
-							.unwrap();
+					let type_name = self
+						.formatter(resolve_context.namespace)
+						.display_type(namespace.inner)
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::UndeclaredType.code())
@@ -11654,9 +11669,10 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Result<ResolvedMember, ()> {
 		let file_id = resolve_context.file_id;
 		let lookup = self.resolve_impl_member(
+			resolve_context,
 			namespace.inner,
 			member.inner,
-			SourceSpan::new(file_id, member.span),
+			member.span,
 		);
 		// See the identical check in `resolve_method_call`: a `TypeParam`
 		// namespace (e.g. `T::SOME_CONST` inside `fn f<T: SomeTrait>()`)
@@ -11798,7 +11814,8 @@ impl<'ast> Builder<'ast, '_> {
 			_ => {
 				let member_name =
 					self.interner.resolve(member.inner).unwrap_or("?");
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(namespace.inner)
 					.unwrap();
 				self.tir.diagnostics.push(
@@ -12100,7 +12117,8 @@ impl<'ast> Builder<'ast, '_> {
 				return Err(());
 			}
 			Err(TraitMemberError::NotImplemented) => {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(func_ctx.resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -12217,7 +12235,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -12404,7 +12422,7 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(ty) => (Some(else_block), ty),
 					Err(_) => {
 						self.tir.diagnostics.push(report_type_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							TypeMistmatchDiagnostic {
 								expected_type: then_block.ty,
 								actual_type: else_block.ty,
@@ -12425,7 +12443,7 @@ impl<'ast> Builder<'ast, '_> {
 					(None, TypeIndex::UNIT)
 				} else {
 					self.tir.diagnostics.push(report_missing_else_block(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						then_block.ty,
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
@@ -12479,7 +12497,7 @@ impl<'ast> Builder<'ast, '_> {
 			self.tir
 				.diagnostics
 				.push(report_invalid_match_scrutinee_type(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(ctx.resolve_context.namespace),
 					scrutinee_ty,
 					SourceSpan::new(
 						ctx.resolve_context.file_id,
@@ -12577,7 +12595,7 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(ty) => result_ty = ty,
 				Err(_) => {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: result_ty,
 							actual_type: body.ty,
@@ -12788,7 +12806,7 @@ impl<'ast> Builder<'ast, '_> {
 			value.ty = cast_type;
 		} else {
 			self.tir.diagnostics.push(report_invalid_cast(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				value.ty,
 				cast_type,
 				SourceSpan::new(ctx.resolve_context.file_id, expr_span),
@@ -12978,7 +12996,7 @@ impl<'ast> Builder<'ast, '_> {
 					let scope =
 						ctx.stack.scopes.get_mut(scope_index as usize).unwrap();
 					let inferred_type = self.infer_block_type(
-						ctx.resolve_context.file_id,
+						ctx.resolve_context,
 						scope,
 						&built,
 					)?;
@@ -13015,7 +13033,7 @@ impl<'ast> Builder<'ast, '_> {
 					let inferred = scope.inferred_type;
 					if !self.coercible_to(TypeIndex::UNIT, inferred) {
 						let formatter =
-							TypeFormatter::new(&self.tir, self.interner);
+							self.formatter(ctx.resolve_context.namespace);
 						self.tir.diagnostics.push(report_type_mistmatch(
 							formatter,
 							TypeMistmatchDiagnostic {
@@ -13224,7 +13242,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 				} else {
 					let formatter =
-						TypeFormatter::new(&self.tir, self.interner);
+						self.formatter(ctx.resolve_context.namespace);
 					let diagnostic = Diagnostic::error()
 						.with_code(
 							DiagnosticCode::UnaryOperatorCannotBeApplied.code(),
@@ -13288,7 +13306,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 		} else if left.ty != TypeIndex::BOOL {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
 					actual_type: left.ty,
@@ -13315,7 +13333,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 		} else if right.ty != TypeIndex::BOOL {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
 					actual_type: right.ty,
@@ -13401,7 +13419,7 @@ impl<'ast> Builder<'ast, '_> {
 					{
 						self.tir.diagnostics.push(
 							report_binary_operator_cannot_be_applied(
-								TypeFormatter::new(&self.tir, self.interner),
+								self.formatter(ctx.resolve_context.namespace),
 								BinaryOperatorCannotBeAppliedDiagnostic {
 									file_id: ctx.resolve_context.file_id,
 									operator,
@@ -13434,7 +13452,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !right_type.is_integer() && right_type != TypeIndex::BOOL {
 					self.tir.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								operator,
@@ -13462,7 +13480,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !left_type.is_integer() && left_type != TypeIndex::BOOL {
 					self.tir.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								operator,
@@ -13494,7 +13512,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -13690,7 +13708,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -13760,7 +13778,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, local_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13803,7 +13821,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, global_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13878,7 +13896,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13935,7 +13953,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14062,7 +14080,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, local_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14122,7 +14140,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, global_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14183,7 +14201,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14256,7 +14274,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14346,7 +14364,7 @@ impl<'ast> Builder<'ast, '_> {
 				let inferred_type = {
 					let scope = ctx.stack.scopes.get_mut(0).unwrap();
 					let inferred_type = self.infer_block_type(
-						ctx.resolve_context.file_id,
+						ctx.resolve_context,
 						scope,
 						&built,
 					)?;
@@ -14373,7 +14391,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -14407,7 +14425,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -14476,7 +14494,7 @@ impl<'ast> Builder<'ast, '_> {
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
 				if l != r {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: l,
 							actual_type: r,
@@ -14540,7 +14558,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -14716,7 +14734,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !self.type_satisfies_annotation(arg.ty, substituted_expected)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: substituted_expected,
 							actual_type: arg.ty,
@@ -14744,7 +14762,7 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				} else if !self.coercible_to(arg.ty, expected_type) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: arg.ty,
@@ -14858,7 +14876,8 @@ impl<'ast> Builder<'ast, '_> {
 					}
 					continue;
 				}
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(ctx.resolve_context.namespace)
 					.display_type(arg_ty)
 					.unwrap_or_default();
 				let trait_name = self
@@ -14923,7 +14942,8 @@ impl<'ast> Builder<'ast, '_> {
 			let satisfied =
 				self.tir.type_in_typeset(arg_ty, param_bound.typeset_index);
 			if !satisfied {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(ctx.resolve_context.namespace)
 					.display_type(arg_ty)
 					.unwrap_or_default();
 				let set_name = self
@@ -14977,10 +14997,10 @@ impl<'ast> Builder<'ast, '_> {
 				};
 				let assoc_name_str =
 					self.interner.resolve(*assoc_name).unwrap_or("?");
-				let concrete_name =
-					TypeFormatter::new(&self.tir, self.interner)
-						.display_type(concrete)
-						.unwrap_or_default();
+				let concrete_name = self
+					.formatter(ctx.resolve_context.namespace)
+					.display_type(concrete)
+					.unwrap_or_default();
 				let func_name = self
 					.interner
 					.resolve(self.tir.functions[func_index as usize].name.inner)
@@ -15117,7 +15137,7 @@ impl<'ast> Builder<'ast, '_> {
 					);
 				} else if !self.coercible_to(argument.ty, expected_type) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: argument.ty,
@@ -15195,7 +15215,7 @@ impl<'ast> Builder<'ast, '_> {
 
 				if callee.ty != TypeIndex::ERROR {
 					let formatter =
-						TypeFormatter::new(&self.tir, self.interner);
+						self.formatter(ctx.resolve_context.namespace);
 					let mut diagnostic = Diagnostic::error()
 						.with_code(DiagnosticCode::CannotCallExpression.code())
 						.with_message("call expression requires function")
@@ -15230,7 +15250,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		if arguments.len() != signature.params().len() {
 			self.tir.diagnostics.push(report_argument_count_mismatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
 					params: signature.params(),
@@ -15480,8 +15500,7 @@ impl<'ast> Builder<'ast, '_> {
 			let imp = &self.tir.trait_impls[trait_impl_index as usize];
 			let span = SourceSpan::new(imp.file_id, imp.span);
 			let type_str = self
-				.tir
-				.formatter(self.interner)
+				.formatter(self.tir.file_namespaces[imp.file_id.as_usize()])
 				.display_type(target_type)
 				.unwrap();
 			self.tir.diagnostics.push(Diagnostic {
@@ -15658,9 +15677,10 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn resolve_impl_member(
 		&mut self,
+		resolve_context: ResolveContext,
 		target_type: TypeIndex,
 		member_symbol: SymbolU32,
-		member_span: SourceSpan,
+		member_span: TextSpan,
 	) -> MemberLookup {
 		struct MemberCandidate {
 			trait_index: TraitIndex,
@@ -15720,7 +15740,7 @@ impl<'ast> Builder<'ast, '_> {
 					target,
 					target_type,
 					member_symbol,
-					member_span,
+					SourceSpan::new(resolve_context.file_id, member_span),
 				) {
 					return result;
 				}
@@ -15787,7 +15807,7 @@ impl<'ast> Builder<'ast, '_> {
 		if candidates.is_empty() {
 			MemberLookup::NotFound
 		} else {
-			let formatter = TypeFormatter::new(&self.tir, self.interner);
+			let formatter = self.formatter(resolve_context.namespace);
 			let mut diagnostic = Diagnostic {
 				severity: Severity::Error,
 				code: Some(
@@ -15797,12 +15817,14 @@ impl<'ast> Builder<'ast, '_> {
 				labels: Vec::with_capacity(candidates.len() + 1),
 				notes: Vec::new(),
 			};
-			diagnostic
-				.labels
-				.push(member_span.primary_label().with_message(format!(
-					"multiple `{}` found",
-					formatter.interner.resolve(member_symbol).unwrap()
-				)));
+			diagnostic.labels.push(
+				SourceSpan::new(resolve_context.file_id, member_span)
+					.primary_label()
+					.with_message(format!(
+						"multiple `{}` found",
+						formatter.interner.resolve(member_symbol).unwrap()
+					)),
+			);
 			let type_name = formatter.display_type(target_type).unwrap();
 			for (idx, candidate) in candidates.iter().enumerate() {
 				let trait_name =
@@ -15945,10 +15967,11 @@ impl<'ast> Builder<'ast, '_> {
 	/// callable as a method.
 	fn resolve_method_call(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		receiver: Spanned<TypeIndex>,
 		method: Spanned<SymbolU32>,
 	) -> Result<(FunctionIndex, Box<[TypeIndex]>), ()> {
+		let file_id = resolve_context.file_id;
 		// Pointer types cannot have impl blocks, so look up methods on the inner type directly.
 		let lookup_ty = match &self.tir.types[receiver.inner.as_usize()] {
 			Type::Pointer { to, .. } => *to,
@@ -15960,9 +15983,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let lookup = self.resolve_impl_member(
+			resolve_context,
 			lookup_ty,
 			method.inner,
-			SourceSpan::new(file_id, method.span),
+			method.span,
 		);
 		// `resolve_impl_member`'s `TypeParam` branch is the only path that
 		// can produce `MemberLookup::Trait` for a `TypeParam` receiver
@@ -16004,7 +16028,7 @@ impl<'ast> Builder<'ast, '_> {
 					Type::Pointer { .. }
 				) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
 							actual_type: receiver.inner,
@@ -16036,7 +16060,7 @@ impl<'ast> Builder<'ast, '_> {
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
 				self.tir.diagnostics.push(report_not_a_method(
 					SourceSpan::new(file_id, method.span),
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					method.inner,
 					lookup_ty,
 				));
@@ -16045,7 +16069,7 @@ impl<'ast> Builder<'ast, '_> {
 			MemberLookup::NotFound => {
 				self.tir.diagnostics.push(report_method_not_found(
 					SourceSpan::new(file_id, method.span),
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					method.inner,
 					receiver.inner,
 				));
@@ -16082,7 +16106,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		let file_id = ctx.resolve_context.file_id;
 		let (func_index, mut type_args) = self.resolve_method_call(
-			file_id,
+			ctx.resolve_context,
 			Spanned {
 				inner: object.ty,
 				span: object.span,
@@ -16103,7 +16127,7 @@ impl<'ast> Builder<'ast, '_> {
 		let non_self_params = &signature.params()[1..];
 		if arguments.len() != non_self_params.len() {
 			self.tir.diagnostics.push(report_argument_count_mismatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
 					params: non_self_params,
@@ -16140,7 +16164,7 @@ impl<'ast> Builder<'ast, '_> {
 			if let Some(&self_param_ty) = signature.params().first() {
 				if !self.coercible_to(object.ty, self_param_ty) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
 							actual_type: object.ty,
@@ -16377,7 +16401,7 @@ impl<'ast> Builder<'ast, '_> {
 				return Ok(value.ty);
 			}
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type,
 					actual_type: value.ty,
@@ -16392,7 +16416,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		self.tir.diagnostics.push(report_type_mistmatch(
-			TypeFormatter::new(&self.tir, self.interner),
+			self.formatter(ctx.resolve_context.namespace),
 			TypeMistmatchDiagnostic {
 				expected_type,
 				actual_type: value.ty,
@@ -16408,7 +16432,6 @@ impl<'ast> Builder<'ast, '_> {
 		expr: &mut Expression,
 		target_type: TypeIndex,
 	) -> Result<(), ()> {
-		let file_id = ctx.resolve_context.file_id;
 		// if target_type == TypeIndex::INFER {
 		//     self.tir
 		//         .diagnostics
@@ -16418,12 +16441,16 @@ impl<'ast> Builder<'ast, '_> {
 		//     return Err(());
 		// }
 		match expr.kind {
-			ExprKind::Int { .. } => {
-				self.coerce_untyped_int_expr(file_id, expr, target_type)
-			}
-			ExprKind::Float { .. } => {
-				self.coerce_untyped_float_expr(file_id, expr, target_type)
-			}
+			ExprKind::Int { .. } => self.coerce_untyped_int_expr(
+				ctx.resolve_context,
+				expr,
+				target_type,
+			),
+			ExprKind::Float { .. } => self.coerce_untyped_float_expr(
+				ctx.resolve_context,
+				expr,
+				target_type,
+			),
 			ExprKind::Unary { .. } => {
 				self.coerce_untyped_unary_expr(ctx, expr, target_type)
 			}
@@ -16449,15 +16476,16 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn coerce_untyped_int_expr(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		expr: &mut Expression,
 		target_idx: TypeIndex,
 	) -> Result<(), ()> {
+		let file_id = resolve_context.file_id;
 		let value = match expr.kind {
 			ExprKind::Int { value } => value,
 			_ => unreachable!(),
 		};
-		let formatter = TypeFormatter::new(&self.tir, self.interner);
+		let formatter = self.formatter(resolve_context.namespace);
 
 		// `value` is always the raw, non-negative magnitude as written (see
 		// `ExprKind::Int`'s doc comment) — negation is a separate `Unary`
@@ -16592,10 +16620,11 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn coerce_untyped_float_expr(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		expr: &mut Expression,
 		target_idx: TypeIndex,
 	) -> Result<(), ()> {
+		let file_id = resolve_context.file_id;
 		if target_idx == TypeIndex::F32 {
 			// TODO: add a diagnostic if the literal is out of range
 			expr.ty = TypeIndex::F32;
@@ -16606,7 +16635,7 @@ impl<'ast> Builder<'ast, '_> {
 			Ok(())
 		} else {
 			self.tir.diagnostics.push(report_unable_to_coerce(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
 			));
@@ -16641,7 +16670,7 @@ impl<'ast> Builder<'ast, '_> {
 					|| target_idx == TypeIndex::F64;
 				if !is_valid {
 					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
 					));
@@ -16672,7 +16701,7 @@ impl<'ast> Builder<'ast, '_> {
 					if value > max_magnitude {
 						self.tir.diagnostics.push(
 							report_integer_literal_out_of_range(
-								TypeFormatter::new(&self.tir, self.interner),
+								self.formatter(ctx.resolve_context.namespace),
 								IntegerLiteralOutOfRangeDiagnostic {
 									ty: target_idx,
 									value: (value as i64).wrapping_neg(),
@@ -16691,7 +16720,7 @@ impl<'ast> Builder<'ast, '_> {
 			ast::UnaryOp::BitNot => {
 				if !target_idx.is_integer() {
 					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
 					));
@@ -16749,7 +16778,7 @@ impl<'ast> Builder<'ast, '_> {
 		debug_assert!(operator.inner.is_arithmetic());
 		if !target_idx.is_primitive() {
 			self.tir.diagnostics.push(report_unable_to_coerce(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
 			));
@@ -16987,7 +17016,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			} else if !self.coercible_to(field_expr.ty, expected_ty) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: expected_ty,
 						actual_type: field_expr.ty,
@@ -17173,7 +17202,7 @@ impl<'ast> Builder<'ast, '_> {
 							func_ctx.resolve_context.file_id,
 							pointer.span,
 						),
-						TypeFormatter::new(&self.tir, self.interner)
+						self.formatter(func_ctx.resolve_context.namespace)
 							.display_type(pointer.ty)
 							.unwrap(),
 					));
@@ -17371,7 +17400,7 @@ impl<'ast> Builder<'ast, '_> {
 			for elem in &built[1..] {
 				if elem.ty != ty {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(func_ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: ty,
 							actual_type: elem.ty,
@@ -17573,7 +17602,7 @@ impl<'ast> Builder<'ast, '_> {
 		let Some((elem_type, memory, ownership)) = indexable else {
 			self.tir.diagnostics.push(report_index_on_non_indexable(
 				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
-				TypeFormatter::new(&self.tir, self.interner)
+				self.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
 					.unwrap(),
 			));
@@ -17608,7 +17637,7 @@ impl<'ast> Builder<'ast, '_> {
 			self.coerce_untyped_expr(func_ctx, &mut index, index_type)?;
 		} else if index.ty != index_type {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(func_ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: index_type,
 					actual_type: index.ty,
@@ -17673,7 +17702,7 @@ impl<'ast> Builder<'ast, '_> {
 		let Some((elem_type, memory, ownership)) = indexable else {
 			self.tir.diagnostics.push(report_index_on_non_indexable(
 				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
-				TypeFormatter::new(&self.tir, self.interner)
+				self.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
 					.unwrap(),
 			));
@@ -17698,7 +17727,7 @@ impl<'ast> Builder<'ast, '_> {
 					.coerce_untyped_expr(func_ctx, &mut bound, index_type)?;
 			} else if bound.ty != index_type {
 				builder.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&builder.tir, builder.interner),
+					builder.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: index_type,
 						actual_type: bound.ty,

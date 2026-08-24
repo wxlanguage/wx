@@ -1,21 +1,57 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
-
 use super::{AbsolutePath, RelativePath};
 use crate::ast;
 
-/// A parsed `wx.json`. Not yet consulted by any loader — `open_package`
-/// (a later step) is what will actually resolve one of these into a
-/// `PackageGraph`.
+/// A parsed `wx.json`. Resolved into `PackageGraph`s by
+/// [`super::resolve::open_package`].
 ///
 /// A struct wrapping a tagged enum, not the enum alone, so `dependencies` is
-/// declared once and shared by both kinds instead of duplicated per variant.
+/// declared once and shared by every kind instead of duplicated per variant.
+///
+/// Unknown keys are ignored rather than rejected: `wx.json` is expected to
+/// grow further sections (`meta`, `format`), and a manifest written for a
+/// newer wx should still load on an older one rather than failing outright.
 #[derive(serde::Deserialize)]
 pub struct PackageManifest {
 	pub package: PackageManifestKind,
 	#[serde(default)]
-	pub dependencies: HashMap<String, DependencySource>,
+	pub dependencies: HashMap<PackageName, DependencySource>,
+}
+
+/// A `dependencies` key: the name a package is known by inside the package
+/// that declared it, and — since a package no longer declares a name of its
+/// own — the only source of package names there is.
+///
+/// A newtype rather than a bare `String` so validity is a type invariant
+/// established at parse time, not a check some resolution step has to
+/// remember to run. It also means an invalid key is a real `serde` error
+/// carrying a message, instead of the bare `Err(())` the resolver used to
+/// return, which aborted the whole compilation with nothing printed.
+#[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
+pub struct PackageName(String);
+
+impl PackageName {
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl<'de> serde::Deserialize<'de> for PackageName {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let name = String::deserialize(deserializer)?;
+		if is_valid_package_name(&name) {
+			Ok(PackageName(name))
+		} else {
+			Err(serde::de::Error::custom(format!(
+				"invalid package name `{name}`: must be a snake_case \
+				 identifier and not a reserved keyword"
+			)))
+		}
+	}
 }
 
 impl PackageManifest {
@@ -27,22 +63,33 @@ impl PackageManifest {
 
 /// What `wx.json`'s `"package"` object deserializes to. Distinct from
 /// [`super::PackageKind`] (the resolved runtime kind on `PackageGraph`) —
-/// this one is purely what the manifest's `"type"` field says, and
-/// additionally carries `name` for `Lib` (a binary's name, if it ever gets
-/// one, wouldn't belong here — it's not part of what `"type"` means).
+/// this one is purely what the manifest's `"type"` field says.
+///
+/// No variant carries a name. What a package is called is decided by
+/// whoever depends on it (its `dependencies` key), so a self-declared name
+/// would be either ignored or a second, conflicting source of truth. A
+/// globally-unique registry identity is a separate future concern
+/// (`meta.name`), not this.
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PackageManifestKind {
-	Lib {
-		#[serde(deserialize_with = "deserialize_package_name")]
-		name: String,
-	},
+	Lib,
 	Bin,
+	/// This package *is* the stdlib: it defines the `#[tag = "..."]` items
+	/// the language itself needs (the twelve operator traits), so the
+	/// embedded stdlib must not also be loaded alongside it.
+	///
+	/// Not "no stdlib" — wx has no freestanding mode, since those tagged
+	/// items are mandatory for every compilation. It means "I provide it
+	/// myself". Resolves to an ordinary [`super::PackageKind::Library`];
+	/// the std-ness is recorded once, as
+	/// [`super::CompilationUnit::stdlib_package`].
+	Std,
 }
 
-/// A single `dependencies` entry. Only one variant today, but tagged from
-/// the start so a future remote/registry source is an additive new variant,
-/// not a breaking reshape of every existing `wx.json`'s `dependencies`.
+/// A single `dependencies` entry. Tagged from the start so a future
+/// remote/registry source is an additive new variant, not a breaking reshape
+/// of every existing `wx.json`'s `dependencies`.
 ///
 /// `path: RelativePath`, not a general path type: this design's
 /// dependency-resolution rule requires a declared dependency path to
@@ -88,11 +135,11 @@ impl DependencySource {
 /// would otherwise load without error and then be permanently
 /// unreferenceable from any `.wx` file (`loop::Item` can't parse as a path).
 ///
-/// `pub(super)`: also used by `vfs::resolve` to validate a `dependencies`
-/// key before using it as a package's name (see `PackageKind::Library`'s
-/// name being sourced from the dependency key, not the target's own
-/// manifest).
-pub(super) fn is_valid_package_name(name: &str) -> bool {
+/// Private: [`PackageName`] is now the only way a name enters the system, so
+/// this has exactly one caller (that type's `Deserialize`) plus its own
+/// tests. Validating anywhere else would mean a name had already been built
+/// unchecked.
+fn is_valid_package_name(name: &str) -> bool {
 	let mut chars = name.chars();
 	let first_ok =
 		matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_lowercase());
@@ -102,37 +149,40 @@ pub(super) fn is_valid_package_name(name: &str) -> bool {
 		&& ast::Keyword::try_from(name).is_err()
 }
 
-fn deserialize_package_name<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
-	let name = String::deserialize(deserializer)?;
-	if is_valid_package_name(&name) {
-		Ok(name)
-	} else {
-		Err(serde::de::Error::custom(format!(
-			"invalid package name `{name}`: must be a snake_case \
-			 identifier and not a reserved keyword"
-		)))
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
+	/// Dependency keys are the only names a manifest declares, so they're
+	/// what the name-validation tests below exercise.
+	fn dependency<'m>(
+		manifest: &'m PackageManifest,
+		key: &str,
+	) -> Option<&'m DependencySource> {
+		manifest
+			.dependencies
+			.iter()
+			.find(|(name, _)| name.as_str() == key)
+			.map(|(_, source)| source)
+	}
+
 	#[test]
 	fn manifest_parses_valid_lib_package() {
-		let manifest = PackageManifest::parse(
-			r#"{ "package": { "type": "lib", "name": "std" } }"#,
-		)
-		.expect("valid lib manifest should parse");
+		let manifest =
+			PackageManifest::parse(r#"{ "package": { "type": "lib" } }"#)
+				.expect("valid lib manifest should parse");
 
-		match manifest.package {
-			PackageManifestKind::Lib { name } => assert_eq!(name, "std"),
-			PackageManifestKind::Bin => panic!("expected Lib"),
-		}
+		assert!(matches!(manifest.package, PackageManifestKind::Lib));
 		assert!(manifest.dependencies.is_empty());
+	}
+
+	#[test]
+	fn manifest_parses_std_package() {
+		let manifest =
+			PackageManifest::parse(r#"{ "package": { "type": "std" } }"#)
+				.expect("valid std manifest should parse");
+
+		assert!(matches!(manifest.package, PackageManifestKind::Std));
 	}
 
 	#[test]
@@ -148,7 +198,7 @@ mod tests {
 		.expect("valid bin manifest should parse");
 
 		assert!(matches!(manifest.package, PackageManifestKind::Bin));
-		match manifest.dependencies.get("somelib") {
+		match dependency(&manifest, "somelib") {
 			Some(DependencySource::Local { path }) => {
 				assert_eq!(path.as_str(), "../somelib")
 			}
@@ -156,46 +206,65 @@ mod tests {
 		}
 	}
 
+	/// A package no longer declares a name, and unknown keys are ignored
+	/// rather than rejected (so a manifest written for a newer wx still
+	/// loads on an older one) — so a stale `"name"` parses and is dropped.
 	#[test]
-	fn manifest_rejects_lib_without_name() {
-		let result =
-			PackageManifest::parse(r#"{ "package": { "type": "lib" } }"#);
-		assert!(result.is_err(), "a lib manifest without `name` should fail");
+	fn manifest_ignores_stale_package_name() {
+		let manifest = PackageManifest::parse(
+			r#"{ "package": { "type": "lib", "name": "std" } }"#,
+		)
+		.expect("an unknown key should be ignored, not rejected");
+
+		assert!(matches!(manifest.package, PackageManifestKind::Lib));
 	}
 
 	#[test]
 	fn manifest_rejects_invalid_package_type() {
-		let result = PackageManifest::parse(
-			r#"{ "package": { "type": "wat", "name": "std" } }"#,
-		);
+		let result =
+			PackageManifest::parse(r#"{ "package": { "type": "wat" } }"#);
 		assert!(result.is_err(), "an unrecognized `type` should fail");
 	}
 
-	#[test]
-	fn manifest_rejects_uppercase_package_name() {
-		let result = PackageManifest::parse(
-			r#"{ "package": { "type": "lib", "name": "Std" } }"#,
-		);
-		assert!(result.is_err(), "an uppercase package name should fail");
+	fn parse_with_dependency_key(key: &str) -> Result<PackageManifest, ()> {
+		PackageManifest::parse(&format!(
+			r#"{{
+				"package": {{ "type": "bin" }},
+				"dependencies": {{
+					"{key}": {{ "type": "local", "path": "../somelib" }}
+				}}
+			}}"#
+		))
+		.map_err(|_| ())
 	}
 
 	#[test]
-	fn manifest_rejects_hyphenated_package_name() {
-		let result = PackageManifest::parse(
-			r#"{ "package": { "type": "lib", "name": "my-lib" } }"#,
-		);
-		assert!(result.is_err(), "a hyphenated package name should fail");
-	}
-
-	#[test]
-	fn manifest_rejects_reserved_keyword_package_name() {
-		let result = PackageManifest::parse(
-			r#"{ "package": { "type": "lib", "name": "loop" } }"#,
-		);
+	fn manifest_rejects_uppercase_dependency_key() {
 		assert!(
-			result.is_err(),
+			parse_with_dependency_key("SomeLib").is_err(),
+			"an uppercase package name should fail"
+		);
+	}
+
+	#[test]
+	fn manifest_rejects_hyphenated_dependency_key() {
+		assert!(
+			parse_with_dependency_key("my-lib").is_err(),
+			"a hyphenated package name should fail"
+		);
+	}
+
+	#[test]
+	fn manifest_rejects_reserved_keyword_dependency_key() {
+		assert!(
+			parse_with_dependency_key("loop").is_err(),
 			"a reserved-keyword package name should fail"
 		);
+	}
+
+	#[test]
+	fn manifest_accepts_snake_case_dependency_key() {
+		assert!(parse_with_dependency_key("my_lib").is_ok());
 	}
 
 	#[test]

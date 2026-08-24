@@ -9,7 +9,9 @@ use string_interner::symbol::SymbolU32;
 use crate::ast;
 
 mod manifest;
-pub use manifest::{DependencySource, PackageManifest, PackageManifestKind};
+pub use manifest::{
+	DependencySource, PackageManifest, PackageManifestKind, PackageName,
+};
 
 mod resolve;
 pub use resolve::{open_package, package_kind};
@@ -68,6 +70,8 @@ define_diagnostic_codes! {
 		AmbiguousModuleFile => "E2001",
 		DuplicatePackageName => "E2002",
 		CircularDependency => "E2003",
+		StdPackageAsDependency => "E2004",
+		PackageDeclaredTwice => "E2005",
 	}
 }
 
@@ -202,6 +206,14 @@ impl File {
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FileId(u32);
 
+impl FileId {
+	/// File ids are dense within a compilation, so anything keyed by file can
+	/// be a `Vec` rather than a map.
+	pub fn as_usize(self) -> usize {
+		self.0 as usize
+	}
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Files {
 	files: Vec<File>,
@@ -235,6 +247,10 @@ impl Files {
 		});
 
 		Some(file_id)
+	}
+
+	pub fn len(&self) -> usize {
+		self.files.len()
 	}
 
 	pub fn get(&self, file_id: FileId) -> Result<&File, files::Error> {
@@ -338,20 +354,44 @@ pub struct SourceModule {
 	pub ast: ast::AST,
 }
 
+/// What a package *is*, as declared by its manifest — deliberately carries
+/// no name. A package's name is a property of the edge that reached it (see
+/// [`PackageGraph::dependencies`]), not of the package itself. The stdlib is
+/// not a kind either: it's an ordinary `Library` that additionally happens
+/// to be [`CompilationUnit::stdlib_package`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PackageKind {
-	/// Produces a WASM module and cannot be imported; has no name.
+	/// Produces a WASM module and cannot be imported.
 	Binary,
-	/// Importable under `name` (`std` in `std::Memory`) — a library always
-	/// has a name, so this is carried on the variant rather than as a
-	/// separate `Option` that every reader would have to re-check.
-	Library { name: SymbolU32 },
+	/// Importable, and subject to the library restrictions (no `export`,
+	/// no `memory`, ...).
+	Library,
 }
 
 pub struct PackageGraph {
 	pub id: PackageId,
 	pub root: ModuleId,
 	pub kind: PackageKind,
+	/// The other packages *this* package may refer to, keyed by the name it
+	/// refers to them by — its own `dependencies` keys, plus the implicit
+	/// `std`.
+	///
+	/// A name lives here, on the edge, rather than on the target: the same
+	/// package can legitimately be `foo` here and `bar` in another package's
+	/// map, and no package has a name of its own at all. Nothing outside
+	/// this map can name a package, which is what keeps a transitive
+	/// dependency invisible to anyone who didn't declare it.
+	///
+	/// Read these as an implicit `module <key>;` at the top of the package's
+	/// entry file — that's exactly the meaning TIR gives them, and why a
+	/// local `module foo;` colliding with a key here is an ordinary
+	/// duplicate definition rather than an ambiguity to arbitrate.
+	pub dependencies: HashMap<SymbolU32, PackageId>,
+	/// Inverse of [`Self::dependencies`]. Well-defined only because
+	/// [`CompilationUnitBuilder::add_dependency`] keeps the mapping
+	/// injective: a package is declared under exactly one name here, which
+	/// is what makes that name its canonical one — it has none of its own.
+	pub dependency_names: HashMap<PackageId, SymbolU32>,
 	pub entry_path: AbsolutePath,
 	pub modules: Vec<SourceModule>,
 	pub linker_diagnostics: Vec<Diagnostic<FileId>>,
@@ -361,13 +401,13 @@ pub struct PackageGraph {
 pub struct CompilationUnit {
 	pub files: Files,
 	pub packages: Vec<PackageGraph>,
-	/// Every package that successfully claimed a name, keyed by that name.
-	/// Maintained by [`CompilationUnitBuilder::load_package`] itself (the
-	/// one place a package's name is decided), so it's always complete and
-	/// correct regardless of which frontend built this compilation —
-	/// there's no separate resolution-time bookkeeping to keep in sync.
-	pub package_by_name: HashMap<SymbolU32, PackageId>,
 	pub root_package: PackageId,
+	/// The package providing the language's `#[tag = "..."]` items (the
+	/// twelve operator traits `resolve_operator_traits` looks up). Always
+	/// present — see [`CompilationUnitBuilder::build`] for why this is not an
+	/// `Option`. Equal to `root_package` when the root package *is* the
+	/// stdlib.
+	pub stdlib_package: PackageId,
 	pub id_generator: ast::DefIdGenerator,
 	pub interner: ast::StringInterner,
 }
@@ -377,7 +417,11 @@ pub struct CompilationUnitBuilder {
 	pub id_generator: ast::DefIdGenerator,
 	pub interner: ast::StringInterner,
 	pub packages: Vec<PackageGraph>,
-	pub package_by_name: HashMap<SymbolU32, PackageId>,
+	/// Set once the stdlib exists, and seeded into every package loaded
+	/// afterwards as its implicit `std` dependency. `None` only while the
+	/// stdlib itself is being loaded — which is exactly what keeps it from
+	/// depending on itself, with no check needed.
+	stdlib: Option<PackageId>,
 }
 
 /// Every `.wx` file under `std/`, embedded at build time as
@@ -421,11 +465,13 @@ impl CompilationUnitBuilder {
 			id_generator: ast::DefIdGenerator::new(),
 			interner: ast::StringInterner::new(),
 			packages: Vec::new(),
-			package_by_name: HashMap::new(),
+			stdlib: None,
 		}
 	}
 
-	/// Loads the stdlib as a named `std` package from its embedded sources.
+	/// Loads the embedded stdlib and marks it as this compilation's, so
+	/// every package loaded afterwards gets `std` seeded into its
+	/// dependencies.
 	///
 	/// Every file in [`STDLIB_FILES`] is handed to the loader up front, so the
 	/// stdlib is an ordinary multi-file package from here on: `module foo;` in
@@ -441,27 +487,28 @@ impl CompilationUnitBuilder {
 				(AbsolutePath::new(*path), source.to_string())
 			})
 			.collect();
-		self.load_library(
-			"std",
-			AbsolutePath::new("/main.wx"),
-			&VirtualFileSource::new(files),
-		)
-		.expect("embedded stdlib source should always be readable")
+		let id = self
+			.load_package(
+				PackageKind::Library,
+				AbsolutePath::new("/main.wx"),
+				&VirtualFileSource::new(files),
+			)
+			.expect("embedded stdlib source should always be readable");
+		self.set_stdlib(id);
+		id
 	}
 
-	#[inline]
-	pub fn load_library(
-		&mut self,
-		name: &str,
-		entry_path: AbsolutePath,
-		file_source: &impl FileSource,
-	) -> Result<PackageId, ()> {
-		let name = self.interner.get_or_intern(name);
-		self.load_package(
-			PackageKind::Library { name },
-			entry_path,
-			file_source,
-		)
+	/// Marks an already-loaded package as this compilation's stdlib — used
+	/// by `open_package` when the root declares `"type": "std"` and so
+	/// provides the tagged items itself, which can't go through
+	/// [`Self::load_stdlib`] because its sources come from a manifest rather
+	/// than from [`STDLIB_FILES`].
+	///
+	/// Must run before any package that should be able to name `std`: the
+	/// seed in [`Self::load_package`] only applies to packages loaded after
+	/// this point.
+	pub fn set_stdlib(&mut self, package: PackageId) {
+		self.stdlib = Some(package);
 	}
 
 	#[inline]
@@ -471,6 +518,49 @@ impl CompilationUnitBuilder {
 		file_source: &impl FileSource,
 	) -> Result<PackageId, ()> {
 		self.load_package(PackageKind::Binary, entry_path, file_source)
+	}
+
+	/// Records that `owner` refers to `dependency` by `name`, diagnosing a
+	/// collision itself rather than handing one back.
+	///
+	/// A `dependencies` entry is a *declaration*, not an alias — it's what
+	/// introduces a package into the compilation, the way `module foo;`
+	/// introduces a module. So the mapping is kept one-to-one in both
+	/// directions: declaring one package under two names is a duplicate
+	/// declaration, and a second name is spelled with an alias instead.
+	///
+	/// An existing binding always wins, which is what makes the seeded `std`
+	/// survive a manifest that tries to bind that name — the stdlib is
+	/// unreplaceable with no reserved-key check anywhere.
+	pub fn add_dependency(
+		&mut self,
+		owner: PackageId,
+		name: SymbolU32,
+		dependency: PackageId,
+	) {
+		let package = &mut self.packages[owner.as_usize()];
+		if let Some(existing) =
+			package.dependency_names.get(&dependency).copied()
+		{
+			package
+				.linker_diagnostics
+				.push(report_package_declared_twice(
+					self.interner.resolve(name).unwrap(),
+					self.interner.resolve(existing).unwrap(),
+				));
+			return;
+		}
+		if package.dependencies.contains_key(&name) {
+			package
+				.linker_diagnostics
+				.push(report_duplicate_dependency_name(
+					self.interner.resolve(name).unwrap(),
+				));
+			return;
+		}
+
+		package.dependencies.insert(name, dependency);
+		package.dependency_names.insert(dependency, name);
 	}
 
 	/// Loads a package starting from `entry_path`. Fails only if the entry
@@ -485,11 +575,36 @@ impl CompilationUnitBuilder {
 		file_source: &impl FileSource,
 	) -> Result<PackageId, ()> {
 		let package_id = PackageId(self.packages.len() as u32);
+
+		// Every package can reach the stdlib under the name `std` without
+		// declaring it — seeded here rather than left to each caller so it
+		// cannot be forgotten, and seeded *before* any manifest key is
+		// inserted so that declaring `"std"` yourself collides with it
+		// instead of replacing it. `self.stdlib` is still `None` while the
+		// stdlib itself is being loaded, so it never depends on itself.
+		//
+		// Computed before the loader takes its `&mut self`.
+		let (dependencies, dependency_names) = match self.stdlib {
+			Some(stdlib) => {
+				let std = self.interner.get_or_intern("std");
+				(
+					HashMap::from([(std, stdlib)]),
+					HashMap::from([(stdlib, std)]),
+				)
+			}
+			None => (HashMap::new(), HashMap::new()),
+		};
+
 		let mut loader = Loader::new(self, package_id, file_source);
 		let root = loader.load_module(entry_path.clone(), None, None)?;
-		let mut package_graph = PackageGraph {
+
+		// Built into a local first: moving the loader's fields out here is
+		// what ends its borrow of `self`, which the push then needs.
+		let package_graph = PackageGraph {
 			id: package_id,
 			kind,
+			dependencies,
+			dependency_names,
 			root,
 			entry_path,
 			modules: loader.modules,
@@ -497,43 +612,28 @@ impl CompilationUnitBuilder {
 			path_to_module: loader.path_to_module,
 		};
 
-		// This is the one place a package's name is decided, so it's the
-		// one place that can both detect and diagnose two packages
-		// claiming the same name — first claim wins (this is what makes
-		// the implicit-`std` rule's override work: an explicit `"std"`
-		// dependency just needs to load before the fallback ever runs),
-		// and the loser gets a diagnostic naming the package that already
-		// holds it.
-		if let PackageKind::Library { name } = kind {
-			match self.package_by_name.get(&name) {
-				Some(&existing_id) => {
-					let name_str = self.interner.resolve(name).unwrap();
-					let existing_entry_path =
-						&self.packages[existing_id.as_usize()].entry_path;
-					package_graph.linker_diagnostics.push(
-						report_duplicate_package_name(
-							name_str,
-							package_graph.entry_path.as_str(),
-							existing_entry_path.as_str(),
-						),
-					);
-				}
-				None => {
-					self.package_by_name.insert(name, package_id);
-				}
-			}
-		}
-
 		self.packages.push(package_graph);
 		Ok(package_id)
 	}
 
+	/// Panics if no stdlib was ever established. Every compilation has
+	/// exactly one provider of the language's `#[tag = "..."]` items — the
+	/// embedded stdlib, or the root package itself when it declares
+	/// `"type": "std"` — so a `CompilationUnit` without one isn't a state
+	/// worth representing. The stdlib is taken from the builder rather than
+	/// passed in, so the value that gets recorded is necessarily the same
+	/// one that was seeded into every package's dependencies; passing it
+	/// separately would let the two disagree.
 	pub fn build(self, root_package: PackageId) -> CompilationUnit {
+		let stdlib_package = self.stdlib.expect(
+			"a stdlib must be established (`load_stdlib` or `set_stdlib`) \
+			 before building a compilation",
+		);
 		CompilationUnit {
 			files: self.files,
 			packages: self.packages,
-			package_by_name: self.package_by_name,
 			root_package,
+			stdlib_package,
 			id_generator: self.id_generator,
 			interner: self.interner,
 		}
@@ -589,21 +689,27 @@ fn report_ambiguous_module(
 		)))
 }
 
-/// No label: `serde_json` doesn't track a byte position for individual
-/// manifest fields, so there's no real span inside either `wx.json` to
-/// underline. Both packages' entry files are named in the message text
-/// instead — enough to go find and fix the conflicting manifest, just
-/// without a code frame.
-fn report_duplicate_package_name(
-	name: &str,
-	this_entry_path: &str,
-	first_entry_path: &str,
-) -> Diagnostic<FileId> {
+/// No label: `serde_json` tracks no byte position for individual manifest
+/// fields, so there's no span inside the `wx.json` to underline. Same for
+/// [`report_package_declared_twice`].
+fn report_duplicate_dependency_name(name: &str) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::DuplicatePackageName.code())
 		.with_message(format!(
-			"duplicate package name `{name}`: claimed by both the package \
-			 rooted at `{first_entry_path}` and the one at `{this_entry_path}`"
+			"the name `{name}` is already used by another package this one \
+			 depends on"
+		))
+}
+
+fn report_package_declared_twice(
+	name: &str,
+	existing: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::PackageDeclaredTwice.code())
+		.with_message(format!(
+			"this package is already declared as `{existing}`, so it cannot \
+			 also be declared as `{name}`"
 		))
 }
 

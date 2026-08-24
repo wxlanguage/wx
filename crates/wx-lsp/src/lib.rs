@@ -376,6 +376,8 @@ async fn handle_command(
 				let text = symbol_hover_text(
 					&compiled.tir,
 					&compiled.graph.interner,
+					&compiled.graph.packages,
+					compiled.graph.root_package,
 					&info.kind,
 				)?;
 				let range = span_to_range(&compiled.graph.files, info.source)?;
@@ -446,7 +448,8 @@ async fn handle_command(
 				)
 				.into_iter()
 				.filter_map(|source| {
-					let uri = file_id_to_uri(&compiled.graph.files, source.file_id)?;
+					let uri =
+						file_id_to_uri(&compiled.graph.files, source.file_id)?;
 					let range = span_to_range(&compiled.graph.files, source)?;
 					Some(Location { uri, range })
 				})
@@ -494,8 +497,10 @@ async fn handle_command(
 							.flatten(),
 					)
 					.filter_map(|entry| {
-						let uri =
-							file_id_to_uri(&compiled.graph.files, entry.source.file_id)?;
+						let uri = file_id_to_uri(
+							&compiled.graph.files,
+							entry.source.file_id,
+						)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some(Location { uri, range })
@@ -529,8 +534,10 @@ async fn handle_command(
 					.chain(compiled.symbol_index.definitions.iter())
 					.filter(|e| e.kind == info.kind)
 					.filter_map(|entry| {
-						let uri =
-							file_id_to_uri(&compiled.graph.files, entry.source.file_id)?;
+						let uri = file_id_to_uri(
+							&compiled.graph.files,
+							entry.source.file_id,
+						)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some((uri, range))
@@ -645,7 +652,11 @@ async fn handle_command(
 				};
 				let fi = compiled.tir.function_index(*def_id)? as usize;
 				let func = &compiled.tir.functions[fi];
-				let fmt = compiled.tir.formatter(&compiled.graph.interner);
+				let fmt = compiled.tir.formatter(
+					&compiled.graph.interner,
+					&compiled.graph.packages,
+					compiled.graph.root_package,
+				);
 				let interner = &compiled.graph.interner;
 
 				let name = interner.resolve(func.name.inner).unwrap_or("?");
@@ -804,6 +815,7 @@ async fn handle_command(
 				let items = completion::completion_items(
 					&compiled.tir,
 					&compiled.graph.interner,
+					&compiled.graph.packages,
 					&compiled.symbol_index,
 					file_id,
 					source,
@@ -1132,9 +1144,9 @@ fn render_full_diagnostic(
 		.packages
 		.iter()
 		.flat_map(|cg| {
-			cg.linker_diagnostics.iter().chain(
-				cg.modules.iter().flat_map(|m| m.ast.diagnostics.iter()),
-			)
+			cg.linker_diagnostics
+				.iter()
+				.chain(cg.modules.iter().flat_map(|m| m.ast.diagnostics.iter()))
 		})
 		.chain(compiled.tir.diagnostics.iter())
 		.flat_map(|d| {
@@ -1686,6 +1698,8 @@ fn push_type_params(
 	s: &mut String,
 	tir: &TIR,
 	interner: &ast::StringInterner,
+	packages: &[vfs::PackageGraph],
+	from: vfs::PackageId,
 	type_params: &[TypeParamInfo],
 ) {
 	if type_params.is_empty() {
@@ -1701,7 +1715,7 @@ fn push_type_params(
 			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
 		if has_bounds {
 			s.push_str(": ");
-			let fmt = tir.formatter(interner);
+			let fmt = tir.formatter(interner, packages, from);
 			s.push_str(&fmt.display_bounds(&tp.bounds).unwrap_or_default());
 		}
 	}
@@ -1799,18 +1813,26 @@ fn leading_doc_comment(source: &str, anchor_offset: u32) -> Option<String> {
 fn symbol_hover_text(
 	tir: &TIR,
 	interner: &ast::StringInterner,
+	packages: &[vfs::PackageGraph],
+	from: vfs::PackageId,
 	kind: &SymbolKind,
 ) -> Option<String> {
-	let fmt = tir.formatter(interner);
+	let fmt = tir.formatter(interner, packages, from);
 	match kind {
 		SymbolKind::Function(def_id) => {
 			let fi = tir.function_index(*def_id)? as usize;
 			let func = &tir.functions[fi];
-			let fmt = fmt.with_type_params(&func.type_params);
 			let name = interner.resolve(func.name.inner).unwrap_or("?");
 			let pub_prefix = if func.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}fn {name}");
-			push_type_params(&mut s, tir, interner, &func.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&func.type_params,
+			);
 			s.push('(');
 			for (i, param) in func.params.iter().enumerate() {
 				if i > 0 {
@@ -1867,7 +1889,14 @@ fn symbol_hover_text(
 				""
 			};
 			let mut s = format!("{pub_prefix}struct {name}");
-			push_type_params(&mut s, tir, interner, &struct_.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&struct_.type_params,
+			);
 			Some(s)
 		}
 		SymbolKind::Enum(def_id) => {
@@ -1955,8 +1984,12 @@ fn symbol_hover_text(
 						None => Some(format!("import \"{external}\"")),
 					}
 				}
-				ModuleDeclarationKind::Package(_, _) => {
-					let name = interner.resolve(ns.name).unwrap_or("?");
+				// A package has no name of its own — show it as the package
+				// this hover is rendered from calls it.
+				ModuleDeclarationKind::Package(_) => {
+					let name = interner
+						.resolve(tir.namespace_name(*ns_idx, packages, from))
+						.unwrap_or("?");
 					Some(format!("package {name}"))
 				}
 			}
@@ -2019,11 +2052,17 @@ fn symbol_hover_text(
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = tir.type_alias_index(*def_id)? as usize;
 			let alias = &tir.type_aliases[ai];
-			let fmt = fmt.with_type_params(&alias.type_params);
 			let name = interner.resolve(alias.name.inner).unwrap_or("?");
 			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}type {name}");
-			push_type_params(&mut s, tir, interner, &alias.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&alias.type_params,
+			);
 			// Bodiless `#[intrinsic] type u8;` — `alias.body` holds the
 			// resolved primitive, not a source-written `= Type` (see the
 			// doc comment on `TypeAlias::body`).
@@ -2052,7 +2091,6 @@ fn symbol_hover_text(
 			let struct_ =
 				tir.structs.get(tir.struct_index(*struct_id)? as usize)?;
 			let field = struct_.fields.get(*field_idx as usize)?;
-			let fmt = fmt.with_type_params(&struct_.type_params);
 			let name = interner.resolve(field.name.inner).unwrap_or("?");
 			let type_str = fmt.display_type(field.ty.inner).unwrap();
 			let pub_prefix = if field.pub_span.is_some() { "pub " } else { "" };

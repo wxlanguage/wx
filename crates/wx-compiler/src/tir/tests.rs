@@ -60,6 +60,63 @@ impl TestCase {
 	}
 }
 
+/// The stdlib has to typecheck as a package in its own right, not only as
+/// everyone else's dependency. Loading it as the **root** package is what
+/// makes that checkable: nothing else calls `load_stdlib()`, so there is no
+/// second copy of `std` for it to collide with.
+///
+/// This checks the *embedded* `STDLIB_FILES` — the artifact actually shipped
+/// inside the binary — rather than a copy read back off disk, so it can't
+/// drift from what users get.
+///
+/// Errors and bugs only, deliberately: `report_unused_items` fires on
+/// essentially all of `std` here, since nothing imports it. Same known gap
+/// `test_imported_global` works around.
+#[test]
+fn test_stdlib_typechecks_as_root_package() {
+	let mut builder = vfs::CompilationUnitBuilder::new();
+	let std_id = builder.load_stdlib();
+	// Root *and* stdlib provider are the same package here — that's the whole
+	// point of loading it this way.
+	let mut graph = builder.build(std_id);
+
+	// Linker and parse diagnostics live on the package graph and on each
+	// module's own AST respectively — neither is folded into `tir.diagnostics`,
+	// so both have to be checked explicitly (same chain the CLI walks).
+	let load_errors: Vec<String> = graph
+		.packages
+		.iter()
+		.flat_map(|package_graph| {
+			package_graph.linker_diagnostics.iter().chain(
+				package_graph
+					.modules
+					.iter()
+					.flat_map(|module| module.ast.diagnostics.iter()),
+			)
+		})
+		.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
+		.map(|d| format!("{}: {}", d.code.as_deref().unwrap_or("?"), d.message))
+		.collect();
+	assert!(
+		load_errors.is_empty(),
+		"stdlib failed to load cleanly:\n{}",
+		load_errors.join("\n")
+	);
+
+	let tir = TIR::build(&mut graph);
+	let type_errors: Vec<String> = tir
+		.diagnostics
+		.iter()
+		.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
+		.map(|d| format!("{}: {}", d.code.as_deref().unwrap_or("?"), d.message))
+		.collect();
+	assert!(
+		type_errors.is_empty(),
+		"stdlib failed to typecheck standalone:\n{}",
+		type_errors.join("\n")
+	);
+}
+
 #[test]
 fn test_unescape_string() {
 	assert_eq!(unescape_string(r#""hello""#), "hello");
@@ -4590,12 +4647,11 @@ fn no_errors(case: &TestCase) {
 				.iter()
 				.flat_map(|m| m.ast.diagnostics.iter()),
 		);
-		for diagnostic in package_diagnostics.filter(|diagnostic| {
-			match diagnostic.severity {
+		for diagnostic in
+			package_diagnostics.filter(|diagnostic| match diagnostic.severity {
 				Severity::Error | Severity::Bug => true,
 				_ => false,
-			}
-		}) {
+			}) {
 			term::emit_to_write_style(
 				&mut writer.lock(),
 				&config,
@@ -4726,7 +4782,11 @@ fn test_assoc_type_projection_in_return_type() {
 	);
 	assert_eq!(
 		case.tir
-			.formatter(&case.graph.interner)
+			.formatter(
+				&case.graph.interner,
+				&case.graph.packages,
+				case.graph.root_package,
+			)
 			.display_type(result_ty)
 			.unwrap(),
 		"C::Elem",
@@ -4764,7 +4824,11 @@ fn test_assoc_type_projection_display_is_qualified_when_ambiguous() {
 
 	assert_eq!(
 		case.tir
-			.formatter(&case.graph.interner)
+			.formatter(
+				&case.graph.interner,
+				&case.graph.packages,
+				case.graph.root_package,
+			)
 			.display_type(result_ty)
 			.unwrap(),
 		"<T as A>::Item",
@@ -11090,7 +11154,11 @@ fn test_display_bounds_includes_where_clause_assoc_type_bound() {
 				.unwrap_or(false)
 		})
 		.unwrap();
-	let fmt = case.tir.formatter(&case.graph.interner);
+	let fmt = case.tir.formatter(
+		&case.graph.interner,
+		&case.graph.packages,
+		case.graph.root_package,
+	);
 	let s = fmt.display_bounds(&func.type_params[0].bounds).unwrap();
 	assert_eq!(s, "Memory where { Size: Unsigned }");
 }

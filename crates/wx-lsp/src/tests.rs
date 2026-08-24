@@ -530,6 +530,7 @@ fn completion_inside_function_includes_params() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -561,6 +562,7 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -610,6 +612,7 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -663,6 +666,7 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -717,6 +721,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -747,6 +752,7 @@ fn completion_inside_function_shows_globals_too() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -775,6 +781,7 @@ fn completion_sorts_locals_before_globals() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -811,6 +818,7 @@ fn completion_prefix_filters_results() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -882,6 +890,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -911,6 +920,7 @@ fn completion_hides_sibling_module_items_without_use() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -945,6 +955,7 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -981,6 +992,7 @@ fn path_completion_after_enum_lists_variants() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -1026,6 +1038,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -1060,6 +1073,7 @@ fn path_completion_after_namespace_lists_module_members() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -1342,9 +1356,14 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 		"a type alias reference should be colored as a type"
 	);
 
-	let hover =
-		symbol_hover_text(&compiled.tir, &compiled.graph.interner, &found.kind)
-			.expect("expected hover text for the type alias");
+	let hover = symbol_hover_text(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.graph.packages,
+		compiled.graph.root_package,
+		&found.kind,
+	)
+	.expect("expected hover text for the type alias");
 	assert_eq!(hover, "type Id = u32");
 }
 

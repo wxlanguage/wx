@@ -168,8 +168,15 @@ explicit instruction ("don't commit, I'll review and commit myself").
 
 ## Open questions
 
-1. **`wx format`'s final CLI shape — not decided.** Three concrete options were on the table
-   when the session paused:
+1. **`wx format`'s final CLI shape — RESOLVED** later the same day, see
+   [2026-08-23-format-cli-and-stdlib-provider-design.md](2026-08-23-format-cli-and-stdlib-provider-design.md).
+   None of A/B/C below was chosen: the problem was re-decomposed into two orthogonal axes
+   (file selection, config resolution) first, which dissolved the tension that made all three
+   feel unsatisfying. The load-bearing observation was that `load_package` already walks the
+   module tree from an entry file with no manifest involved, so "format a package" and "format
+   a module tree without a manifest" are the same call. That devlog also reverses this one's
+   rejection of directory-vs-file argument sniffing — see its "Smaller decisions" for why the
+   original objection is satisfied rather than overridden. The three options as they stood:
    - **(A)** rustfmt-style: `wx format` only ever takes explicit `.wx` file arguments, full
      stop; no built-in "whole project" mode at all (mirrors that `rustfmt` itself never takes a
      directory — `cargo fmt` is a separate wrapper that expands a crate to a file list first).
@@ -182,18 +189,25 @@ explicit instruction ("don't commit, I'll review and commit myself").
    - **(C)** an explicit `--all` flag, orthogonal to `--manifest`, so "whole package" is never
      inferred from "you didn't pass files": `--manifest wx.json --all` = whole package;
      `--manifest wx.json a.wx` = just `a.wx`, using that manifest's config.
-   User's last words on this: "let's plan it tomorrow" — needs a fresh decision next session,
-   not an assumption.
 2. **`wx.json`'s eventual `format`/`meta` sections** — the stray root `wx.json` (see Key
    findings) already sketches a shape for these (`meta.{description,version,repository}`,
    `format.{max_line_width,indent_width,trailing_comma}`), but `notes/implementation-plan.md`
    explicitly scoped both out of the current plan. Worth explicitly deciding whether that stray
    file is the intended next-step schema or just a scratch example, and whether/how it should
-   reconcile with the current nested-under-`"package"` shape.
+   reconcile with the current nested-under-`"package"` shape. **Still open**, but narrowed by
+   [2026-08-23-format-cli-and-stdlib-provider-design.md](2026-08-23-format-cli-and-stdlib-provider-design.md):
+   `meta.name` is now understood as registry identity, a *separate concept* from the
+   dependency-key name (which is what a package is actually called within a compilation) — and
+   the `name` field is being removed from `lib` manifests entirely, so the two can't be
+   conflated. The `format` section is a hard prerequisite for that devlog's Part 1 config axis.
 3. **Step 4 (wiring `cmd_compile`/`cmd_check` to `open_package`, the plan's original motivating
    bug) was explicitly deferred** by the user this session ("No, keep this focused on
    cmd_format") — still open, not forgotten. `load_compilation` in `wx-cli/src/main.rs` still
    hardcodes `load_stdlib()+load_binary()`.
 4. **Per-file, walk-up-based format-config discovery** (the rustfmt/Prettier model discussed
    under Decisions) is not implemented — there's no `format` section in `PackageManifest` yet
-   to discover in the first place. Worth revisiting once (2) is resolved.
+   to discover in the first place. Worth revisiting once (2) is resolved. **Deliberately not
+   adopted for now**: the follow-up devlog settles on `--manifest` → the directory target's own
+   `wx.json` → `./wx.json` → defaults, with no ancestor walk, while keeping
+   `resolve_config(file) -> RendererConfig` shaped so the walk-up model stays a
+   surface-compatible internal upgrade.
