@@ -14,89 +14,10 @@ impl f32 {
   pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
 }
 
-mod sinf;
-
-// Float algorithms — grouped separately from the const/inherent-wrapper
-// blocks above since these are real multi-step algorithms (built on
-// to_bits/from_bits), not one-line intrinsic wrappers.
-impl f32 {
-  // `scale_pow2` implements the C99/POSIX `scalbn`/`scalbnf` function
-  // (`x * 2^n`, computed by adjusting `x`'s binary exponent directly
-  // rather than via `2^n` as an intermediate value, which could itself
-  // overflow/underflow even when the final scaled result is
-  // representable). This specific bounded-prescale technique traces to
-  // Sun's fdlibm (`s_scalbn.c`, 1993), via musl's `scalbn.c`/
-  // `scalbnf.c` — see also rust-lang/libm's further-generalized,
-  // float-width-generic reimplementation at
-  // `libm/src/math/generic/scalbn.rs`. Out-of-range `n` is handled by
-  // pre-scaling in bounded chunks (each an exact power-of-two multiply)
-  // before the final direct-bit-construction multiply, so extreme `n`
-  // still correctly saturates to `inf`/`0` instead of miscomputing.
-  pub fn scale_pow2(self: Self, exp: i32) -> Self {
-    local mut y: f32 = self;
-    local mut n: i32 = exp;
-    // Exact powers of two, precomputed as literals instead of
-    // f32::from_bits(0x7f000000/0x00800000/0x4b800000) — wx has no
-    // const-eval for function calls, and no fold rule for
-    // reinterpret-of-a-constant either, so from_bits here would cost
-    // a real runtime instruction; a literal compiles straight to
-    // f32.const.
-    if n > 127 {
-      y = y * 1.7014118346046923e38;
-      n = n - 127;
-      if n > 127 {
-        y = y * 1.7014118346046923e38;
-        n = n - 127;
-        if n > 127 { n = 127; }
-      }
-    } else {
-      if n < -126 {
-        y = y * 1.1754943508222875e-38 * 16777216.0;
-        n = n + 126 - 24;
-        if n < -126 {
-          y = y * 1.1754943508222875e-38 * 16777216.0;
-          n = n + 126 - 24;
-          if n < -126 { n = -126; }
-        }
-      }
-    }
-    y * f32::from_bits(((127 + n) as u32) << 23)
-  }
-}
-
-impl f64 {
-  // See f32::scale_pow2 — same algorithm, ported from musl's scalbn.
-  pub fn scale_pow2(self: Self, exp: i32) -> Self {
-    local mut y: f64 = self;
-    local mut n: i32 = exp;
-    // Exact powers of two, precomputed as literals instead of
-    // f64::from_bits(0x7fe0000000000000/0x0010000000000000/
-    // 0x4340000000000000) — wx has no const-eval for function calls,
-    // and no fold rule for reinterpret-of-a-constant either, so
-    // from_bits here would cost a real runtime instruction; a literal
-    // compiles straight to f64.const.
-    if n > 1023 {
-      y = y * 8.98846567431158e307;
-      n = n - 1023;
-      if n > 1023 {
-        y = y * 8.98846567431158e307;
-        n = n - 1023;
-        if n > 1023 { n = 1023 };
-      }
-    } else {
-      if n < -1022 {
-        y = y * 2.2250738585072014e-308 * 9007199254740992.0;
-        n = n + 1022 - 53;
-        if n < -1022 {
-          y = y * 2.2250738585072014e-308 * 9007199254740992.0;
-          n = n + 1022 - 53;
-          if n < -1022 { n = -1022 };
-        }
-      }
-    }
-    y * f64::from_bits(i64_extend_i32(1023 + n) as u64 << 52)
-  }
-}
+mod k_cosf;
+mod k_sinf;
+mod scalbn;
+mod rem_pio2f;
 
 // sin/cos for f64 — ported from musl's s_sin.c/s_cos.c/k_sin.c/k_cos.c
 // (themselves derived from Sun's fdlibm). Range reduction currently only

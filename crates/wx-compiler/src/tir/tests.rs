@@ -1937,17 +1937,18 @@ fn test_stdlib_method_callable() {
 fn test_impl_members_registered() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
-            pub fn abs(self) -> i32 {
+            pub fn impl_members_registered_test_method(self) -> i32 {
                 if self < 0 { -self } else { self }
             }
 
-            pub fn from_bool(b: bool) -> i32 {
+            pub fn impl_members_registered_test_assoc_fn(b: bool) -> i32 {
                 if b { 1 } else { 0 }
             }
         }
 
         fn use_them(x: i32, b: bool) -> i32 {
-            x.abs() + i32::from_bool(b)
+            x.impl_members_registered_test_method()
+                + i32::impl_members_registered_test_assoc_fn(b)
         }
 
         export { use_them }
@@ -1962,56 +1963,63 @@ fn test_impl_members_registered() {
 			.collect::<Vec<_>>()
 	);
 
+	let method_sym = case
+		.graph
+		.interner
+		.get("impl_members_registered_test_method")
+		.expect("symbol not interned");
+	let assoc_fn_sym = case
+		.graph
+		.interner
+		.get("impl_members_registered_test_assoc_fn")
+		.expect("symbol not interned");
+
+	// `impl_block_list` also holds stdlib's own inherent impls for `i32`, so
+	// find our block by membership rather than assuming it's the only one.
 	let members = &case
 		.tir
 		.inherent_impls
 		.iter()
-		.find(|b| b.target.inner == TypeIndex::I32)
-		.expect("impl_block_list should have an entry for i32")
+		.find(|b| {
+			b.target.inner == TypeIndex::I32
+				&& b.members.contains_key(&method_sym)
+		})
+		.expect("impl_block_list should have our i32 impl block")
 		.members;
 
-	let abs_sym = case
-		.graph
-		.interner
-		.get("abs")
-		.expect("symbol `abs` not interned");
-	let from_bool_sym = case
-		.graph
-		.interner
-		.get("from_bool")
-		.expect("symbol `from_bool` not interned");
-
-	// `abs` takes `self` → Method; `from_bool` has no receiver → AssociatedFn
-	let abs_entry = members.get(&abs_sym).expect("`abs` missing from members");
-	let from_bool_entry = members
-		.get(&from_bool_sym)
-		.expect("`from_bool` missing from members");
+	// method takes `self` → Method; assoc fn has no receiver → AssociatedFn
+	let method_entry = members
+		.get(&method_sym)
+		.expect("method missing from members");
+	let assoc_fn_entry = members
+		.get(&assoc_fn_sym)
+		.expect("assoc fn missing from members");
 
 	assert!(
-		matches!(abs_entry, ImplEntry::Method(_)),
-		"`abs` should be ImplEntry::Method, got {:?}",
-		abs_entry
+		matches!(method_entry, ImplEntry::Method(_)),
+		"method should be ImplEntry::Method, got {:?}",
+		method_entry
 	);
 	assert!(
-		matches!(from_bool_entry, ImplEntry::AssocFunction(_)),
-		"`from_bool` should be ImplEntry::AssociatedFn, got {:?}",
-		from_bool_entry
+		matches!(assoc_fn_entry, ImplEntry::AssocFunction(_)),
+		"assoc fn should be ImplEntry::AssociatedFn, got {:?}",
+		assoc_fn_entry
 	);
 
 	// Both entries must point to valid function indices
-	let &ImplEntry::Method(abs_idx) = abs_entry else {
+	let &ImplEntry::Method(method_idx) = method_entry else {
 		unreachable!()
 	};
-	let &ImplEntry::AssocFunction(from_bool_idx) = from_bool_entry else {
+	let &ImplEntry::AssocFunction(assoc_fn_idx) = assoc_fn_entry else {
 		unreachable!()
 	};
 	assert!(
-		(abs_idx as usize) < case.tir.functions.len(),
-		"abs func_index out of bounds"
+		(method_idx as usize) < case.tir.functions.len(),
+		"method func_index out of bounds"
 	);
 	assert!(
-		(from_bool_idx as usize) < case.tir.functions.len(),
-		"from_bool func_index out of bounds"
+		(assoc_fn_idx as usize) < case.tir.functions.len(),
+		"assoc fn func_index out of bounds"
 	);
 }
 

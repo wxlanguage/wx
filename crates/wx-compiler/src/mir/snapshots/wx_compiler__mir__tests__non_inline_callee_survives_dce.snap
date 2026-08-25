@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 447
+  - id: 469
     signature_index: 1
     scopes:
       - kind: Block
@@ -73,7 +73,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 448
+  - id: 470
     signature_index: 1
     scopes:
       - kind: Block
@@ -92,7 +92,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 447
+                        id: 469
                     ty:
                       Function:
                         signature_index: 1
@@ -141,6 +141,18 @@ signatures:
       - F32
     params_count: 1
   - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - I64
+    params_count: 1
+  - items:
+      - F32
+      - U64
+    params_count: 1
+  - items:
       - F64
       - F64
     params_count: 1
@@ -166,6 +178,22 @@ signatures:
       - F64
     params_count: 1
   - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F64
+    params_count: 1
+  - items:
       - I32
       - I32
       - I32
@@ -175,6 +203,14 @@ signatures:
       - I32
     params_count: 1
   - items:
+      - U32
+      - F64
+    params_count: 1
+  - items:
+      - I64
+      - F32
+    params_count: 1
+  - items:
       - I64
       - I64
       - I64
@@ -182,6 +218,10 @@ signatures:
   - items:
       - I64
       - I64
+    params_count: 1
+  - items:
+      - U64
+      - F32
     params_count: 1
   - items:
       - U64
@@ -240,8 +280,8 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 448
-      name: 234
+      id: 470
+      name: 242
 imports: []
 memories: []
 aggregates: []

@@ -1,0 +1,52 @@
+// Reduces `x` to `x - n*(pi/2)`, returning `(n, x - n*(pi/2))` — used by `sin`/`cos`/`tan` to
+// bring their argument into a small range before applying a polynomial approximation. Double
+// precision throughout except `x` itself. Ported from musl's `e_rem_pio2f.c`.
+//
+// The original also handles arbitrarily large `x` via `__rem_pio2_large` (Payne-Hanek
+// reduction against a hardcoded table of 2/pi's bits) — not ported here, same decision
+// already made for `mod.wx`'s own inline `rem_pio2f` (see its `REM_PIO2F_MEDIUM_MAX` comment):
+// it's a large, separate algorithm, and no current caller needs arguments that big. Unlike
+// that inline version, this one is self-contained rather than trusting its caller to check the
+// cutoff first — past `|x| < 2^28 * (pi/2)`, or for `inf`/`NaN`, it returns `(0, NaN)` instead
+// of requiring the caller to guard it.
+
+const TOINT: f64 = 1.5 / f64::EPSILON;
+
+// 53 bits of 2/pi
+const INV_PIO2: f64 = 6.36619772367581382433e-01;
+// first 25 bits of pi/2
+const PIO2_1: f64 = 1.57079631090164184570e+00;
+// pi/2 - PIO2_1
+const PIO2_1T: f64 = 1.58932547735281966916e-08;
+
+// Same shape as `mod.wx`'s own `ReductionF32` — not reused directly since this file is a
+// standalone, not-yet-wired staging module (see `k_sinf.wx`/`k_cosf.wx`/`scalbn.wx`), but
+// named to match for whenever it replaces the inline version there.
+struct ReductionF32 {
+    n: i32,
+    y: f64,
+}
+
+pub fn rem_pio2f(x: f32) -> ReductionF32 {
+    local x64: f64 = x.promote();
+    local ix: u32 = x.to_bits() & 0x7fffffff;
+
+    // |x| ~< 2^28*(pi/2), medium size — 25+53 bit pi is good enough here.
+    if ix < 0x4dc90fdb {
+        // Specialised rint(): adding then subtracting 1.5/EPSILON forces rounding to an
+        // integer without a round-trip through an integer type. Assumes round-to-nearest,
+        // which is the only mode wasm has (musl's two correction branches for directed
+        // rounding modes are dead code here).
+        local tmp: f64 = x64 * INV_PIO2 + TOINT;
+        local f_n: f64 = tmp - TOINT;
+        return ReductionF32::{
+            n: f_n.to_i32(),
+            y: x64 - f_n * PIO2_1 - f_n * PIO2_1T,
+        };
+    }
+
+    // Large finite `x`, or `x` is inf/NaN — the former would need `__rem_pio2_large`, the
+    // latter is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the
+    // original); both collapse to the same answer here.
+    ReductionF32::{ n: 0, y: f64::NAN }
+}

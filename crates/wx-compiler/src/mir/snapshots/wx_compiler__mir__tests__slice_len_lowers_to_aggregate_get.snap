@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 448
+  - id: 470
     signature_index: 0
     scopes:
       - kind: Block
@@ -59,6 +59,18 @@ signatures:
       - F32
     params_count: 1
   - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - I64
+    params_count: 1
+  - items:
+      - F32
+      - U64
+    params_count: 1
+  - items:
       - F64
       - F64
     params_count: 1
@@ -84,6 +96,22 @@ signatures:
       - F64
     params_count: 1
   - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F64
+    params_count: 1
+  - items:
       - I32
       - I32
       - I32
@@ -91,6 +119,10 @@ signatures:
   - items:
       - I32
       - I32
+    params_count: 1
+  - items:
+      - U32
+      - F64
     params_count: 1
   - items:
       - U32
@@ -103,12 +135,20 @@ signatures:
     params_count: 1
   - items:
       - I64
+      - F32
+    params_count: 1
+  - items:
+      - I64
       - I64
       - I64
     params_count: 2
   - items:
       - I64
       - I64
+    params_count: 1
+  - items:
+      - U64
+      - F32
     params_count: 1
   - items:
       - U64
@@ -167,11 +207,11 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 448
-      name: 233
+      id: 470
+      name: 241
 imports: []
 memories:
-  - id: 447
+  - id: 469
     source: Internal
     kind: Memory32
     min_pages: ~
@@ -179,7 +219,7 @@ memories:
 aggregates:
   - values:
       - Pointer:
-          memory: 447
+          memory: 469
           kind: Memory32
       - U32
     offsets:
