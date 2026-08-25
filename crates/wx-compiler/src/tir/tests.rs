@@ -174,7 +174,7 @@ fn test_parse_char_literal() {
 fn test_build_with_package_graph_lowers_child_module_items() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
-		"module math;",
+		"mod math;",
 		&[("src/math.wx", "fn add() -> i32 { 1 }")],
 	);
 
@@ -192,7 +192,7 @@ fn test_build_with_package_graph_resolves_cross_file_module_function_call() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module math;
+            mod math;
 
             fn main() -> i32 {
                 math::add()
@@ -211,7 +211,7 @@ fn test_build_with_package_graph_resolves_cross_file_module_type_access() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module shapes;
+            mod shapes;
 
             fn use_circle(circle: shapes::Circle) {
                 unreachable
@@ -2103,12 +2103,12 @@ fn test_non_pub_fn_unused_warning() {
 	);
 }
 
-/// Functions declared inside a `module` block are intrinsics/imports and must
+/// Functions declared inside a `mod` block are intrinsics/imports and must
 /// not trigger an unused-function warning even if they are never called.
 #[test]
 fn test_module_fn_no_unused_warning() {
 	let case = TestCase::new(indoc! {"
-        module math {
+        mod math {
             #[intrinsic]
             fn add(a: i32, b: i32) -> i32;
         }
@@ -3428,7 +3428,7 @@ fn test_private_module_item_not_visible_via_wildcard_import() {
 	// A non-`pub` item stays invisible through `use foo::*;` — wildcard
 	// imports only ever bring in a module's public surface.
 	let case = TestCase::new(indoc! {"
-        module foo {
+        mod foo {
             const SECRET: i32 = 1;
         }
         use foo::*;
@@ -3451,7 +3451,7 @@ fn test_private_module_item_not_visible_via_wildcard_import() {
 #[test]
 fn test_pub_module_item_visible_via_wildcard_import() {
 	let case = TestCase::new(indoc! {"
-        module foo {
+        mod foo {
             pub const PUBLIC: i32 = 1;
         }
         use foo::*;
@@ -3477,7 +3477,7 @@ fn test_private_module_item_not_visible_via_qualified_path() {
 	// wildcard-import path entirely and exercises the explicit-qualified-path
 	// resolver instead, which reports the dedicated "is private" diagnostic.
 	let case = TestCase::new(indoc! {"
-        module foo {
+        mod foo {
             const SECRET: i32 = 1;
         }
         fn f() -> i32 {
@@ -3499,7 +3499,7 @@ fn test_private_module_item_not_visible_via_qualified_path() {
 #[test]
 fn test_pub_module_item_visible_via_qualified_path() {
 	let case = TestCase::new(indoc! {"
-        module foo {
+        mod foo {
             pub const PUBLIC: i32 = 1;
         }
         fn f() -> i32 {
@@ -3525,10 +3525,10 @@ fn test_private_item_visible_to_descendant_module_not_to_ancestor() {
 	// even though the ancestor is exactly where the child module's own name
 	// is declared and reachable from.
 	let case = TestCase::new(indoc! {"
-        module foo {
+        mod foo {
             const SECRET: i32 = 1;
 
-            module bar {
+            mod bar {
                 pub fn uses_secret() -> i32 {
                     foo::SECRET
                 }
@@ -5493,7 +5493,7 @@ fn test_module_namespace_type_access() {
 	// `module::Type` — a type accessed through a module namespace resolves
 	// to the module's declared type without errors.
 	let case = TestCase::new(indoc! {"
-        module shapes {
+        mod shapes {
             pub struct Circle {}
         }
         fn use_circle(c: shapes::Circle) {
@@ -6319,7 +6319,7 @@ fn test_path_inline_module_type_associated_fn() {
 	// `math::Point::zero()` — 3-segment path through an inline module to an
 	// associated function: module → type → fn.
 	let case = TestCase::new(indoc! {"
-        module math {
+        mod math {
             pub struct Point {}
             impl Point {
                 pub fn zero() -> i32 { 0 }
@@ -6339,7 +6339,7 @@ fn test_path_cross_module_struct_init() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module shapes;
+            mod shapes;
 
             fn make() -> shapes::Point {
                 shapes::Point::{ x: 1, y: 2 }
@@ -6359,7 +6359,7 @@ fn test_path_cross_module_generic_struct_init() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module containers;
+            mod containers;
 
             fn make() -> containers::Wrapper::<i32> {
                 containers::Wrapper::<i32>::{ value: 42 }
@@ -8409,7 +8409,7 @@ fn test_type_position_inline_module_registers_module_access() {
 	// Accessing a type via an inline module path should register an LSP access
 	// on the module declaration.
 	let case = TestCase::new(indoc! {"
-        module math {
+        mod math {
             pub struct Vec2 { pub x: i32, pub y: i32 }
         }
 
@@ -8434,8 +8434,8 @@ fn test_type_position_three_segment_inline_module_path() {
 	// `outer::inner::Point` — three-segment type path through two nested inline
 	// modules. Exercises the intermediate loop in resolve_type.
 	let case = TestCase::new(indoc! {"
-        module outer {
-            pub module inner {
+        mod outer {
+            pub mod inner {
                 pub struct Point { pub x: i32, pub y: i32 }
             }
         }
@@ -8452,11 +8452,11 @@ fn test_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
 {
 	// Every package implicitly depends on `std`, materialized as a `Module`
 	// symbol in the root package's own namespace before any file is
-	// scanned. A user `module std { }` declaration must not silently merge
+	// scanned. A user `mod std { }` declaration must not silently merge
 	// its contents into the real stdlib's namespace — it should be reported
 	// as a same-scope duplicate definition, same as any other name clash.
 	let case = TestCase::new(indoc! {"
-        module std {
+        mod std {
             pub fn my_helper() -> i32 { 42 }
         }
 
@@ -8466,7 +8466,7 @@ fn test_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
-		"expected E1000 (DuplicateDefinition) for `module std` colliding \
+		"expected E1000 (DuplicateDefinition) for `mod std` colliding \
 		 with the implicit std dependency, got: {:?}",
 		case.tir
 			.diagnostics
@@ -8480,7 +8480,7 @@ fn test_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
 fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
  {
 	// Same collision as above, but through the file-pointing form
-	// (`module std;`, resolved by Phase 1a directly from vfs's
+	// (`mod std;`, resolved by Phase 1a directly from vfs's
 	// `SourceModule` tree) rather than an inline block. Regression test:
 	// this form used to silently steal the `std` binding with zero
 	// diagnostic, since Phase 1a's `create_module_namespace` had no
@@ -8491,7 +8491,7 @@ fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module std;
+            mod std;
             fn main() -> i32 { 1 }
             export { main }
         "},
@@ -8499,7 +8499,7 @@ fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
-		"expected E1000 (DuplicateDefinition) for file-declared `module \
+		"expected E1000 (DuplicateDefinition) for file-declared `mod \
 		 std;` colliding with the implicit std dependency, got: {:?}",
 		case.tir
 			.diagnostics
@@ -8513,7 +8513,7 @@ fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate
 fn test_import_alias_colliding_with_implicit_std_dependency_is_duplicate_definition()
  {
 	// The third name-owning mechanism alongside dependencies and
-	// `module`: an `import "..." as std { }` block must not silently
+	// `mod`: an `import "..." as std { }` block must not silently
 	// steal the `std` binding either.
 	let case = TestCase::new(indoc! {"
         import \"env\" as std {
@@ -8543,7 +8543,7 @@ fn test_type_position_undeclared_in_module_path_is_error() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module shapes;
+            mod shapes;
 
             fn f(x: shapes::NonExistent) { }
 
@@ -8564,7 +8564,7 @@ fn test_type_position_undeclared_in_module_path_is_error() {
 
 #[test]
 fn test_sibling_modules_get_independent_same_named_children() {
-	// `a` and `b` are siblings, both declaring `module shared;`. Each
+	// `a` and `b` are siblings, both declaring `mod shared;`. Each
 	// module's own children live under a directory named after *that
 	// module* (`src/a/`, `src/b/`) regardless of whether the module itself
 	// was found via the sibling-file or `mod.wx` form — so these resolve
@@ -8574,20 +8574,20 @@ fn test_sibling_modules_get_independent_same_named_children() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module a;
-            module b;
+            mod a;
+            mod b;
             fn main() -> i32 { a::use_a() + b::use_b() }
             export { main }
         "},
 		&[
 			(
 				"src/a.wx",
-				"module shared;\npub fn use_a() -> i32 { shared::x() }",
+				"mod shared;\npub fn use_a() -> i32 { shared::x() }",
 			),
 			("src/a/shared.wx", "pub fn x() -> i32 { 1 }"),
 			(
 				"src/b.wx",
-				"module shared;\npub fn use_b() -> i32 { shared::x() }",
+				"mod shared;\npub fn use_b() -> i32 { shared::x() }",
 			),
 			("src/b/shared.wx", "pub fn x() -> i32 { 2 }"),
 		],
@@ -8621,8 +8621,8 @@ fn test_struct_init_three_segment_inline_module_path() {
 	// inline module path. Exercises the namespace_span tracking loop added to
 	// build_struct_init_expression.
 	let case = TestCase::new(indoc! {"
-        module outer {
-            pub module inner {
+        mod outer {
+            pub mod inner {
                 pub struct Point { pub x: i32, pub y: i32 }
             }
         }
@@ -8642,7 +8642,7 @@ fn test_struct_init_undeclared_type_in_module_path_is_error() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		indoc! {"
-            module shapes;
+            mod shapes;
 
             fn f() -> shapes::Ghost {
                 shapes::Ghost::{ }
@@ -9519,7 +9519,7 @@ fn test_impl_module_trait_for_type_resolves() {
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
-            module shapes;
+            mod shapes;
             use shapes::*;
             struct Point { x: i32 }
             impl shapes::Drawable for Point {
@@ -11319,7 +11319,7 @@ fn test_where_clause_duplicate_binding_name_reports_error() {
 #[test]
 fn test_qualified_bound_with_undeclared_member_reports_diagnostic_not_panic() {
 	let case = TestCase::new(indoc! {"
-        module ns {
+        mod ns {
             pub trait Marker {}
         }
 
@@ -11346,7 +11346,7 @@ fn test_qualified_bound_with_undeclared_member_reports_diagnostic_not_panic() {
 #[test]
 fn test_qualified_bound_namespace_segment_records_access() {
 	let case = TestCase::new(indoc! {"
-        module ns {
+        mod ns {
             pub trait Marker {}
         }
 

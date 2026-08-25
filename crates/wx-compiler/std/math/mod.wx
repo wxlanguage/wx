@@ -14,7 +14,7 @@ impl f32 {
   pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
 }
 
-module sinf;
+mod sinf;
 
 // Float algorithms — grouped separately from the const/inherent-wrapper
 // blocks above since these are real multi-step algorithms (built on

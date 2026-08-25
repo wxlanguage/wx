@@ -168,7 +168,7 @@ pub fn local_completion_items(
 
 /// Namespace of the module containing `file_id`, for completion requests
 /// that fall outside any function body (no enclosing-function namespace to
-/// fall back on). Only inline `module foo { }` blocks are missed here —
+/// fall back on). Only inline `mod foo { }` blocks are missed here —
 /// those share the file of their enclosing function, which already carries
 /// the right namespace.
 /// TODO: both halves are linear scans. The right fix is `File::package`
@@ -177,7 +177,7 @@ pub fn local_completion_items(
 /// `cmd_format`, the one caller that still builds a bare `Files` with no
 /// package.
 fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
-	// A package's entry file has no `module` declaration of its own — its
+	// A package's entry file has no `mod` declaration of its own — its
 	// scope is the package's root namespace, which records that file id.
 	// Checked first because a compilation holds only a handful of packages,
 	// while `module_decls` grows with every file in it.

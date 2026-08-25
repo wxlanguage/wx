@@ -1534,7 +1534,7 @@ fn compile_root(
 /// (`formatting`) or immediately feeds it into a TIR rebuild anyway
 /// (`analyze_root`).
 /// Fails only if the entry file itself (`root`) can't be read — everything
-/// past that point (missing/ambiguous `module` declarations elsewhere in the
+/// past that point (missing/ambiguous `mod` declarations elsewhere in the
 /// package) is a diagnostic on the resulting graph instead, since `discover_package_root`
 /// already verified `root` exists before calling this.
 fn parse_root(
@@ -2107,7 +2107,7 @@ fn symbol_hover_text(
 					let name = interner.resolve(decl.name.inner).unwrap_or("?");
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
-					Some(format!("{pub_prefix}module {name}"))
+					Some(format!("{pub_prefix}mod {name}"))
 				}
 				ModuleDeclarationKind::Import(import_idx) => {
 					let decl = tir.import_decls.get(import_idx as usize)?;

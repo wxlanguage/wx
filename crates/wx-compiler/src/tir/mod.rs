@@ -1190,7 +1190,7 @@ pub enum ModuleDeclarationKind {
 }
 
 /// The symbol table for a module namespace — shared concept for both local
-/// modules (`module foo;` / `module foo { }`) and import blocks (`import "env" { }`).
+/// modules (`mod foo;` / `mod foo { }`) and import blocks (`import "env" { }`).
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModuleNamespace {
 	/// `None` for a package's own root namespace, which has no ancestor.
@@ -1215,12 +1215,12 @@ pub struct ModuleNamespace {
 	pub accesses: Vec<SourceSpan>,
 }
 
-/// Declaration-site metadata for a locally-defined module (`module foo;` / `module foo { }`).
+/// Declaration-site metadata for a locally-defined module (`mod foo;` / `mod foo { }`).
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModuleDecl {
 	/// Index into `TIR::namespaces` for this module's symbol table.
 	pub namespace_idx: NamespaceIndex,
-	/// File containing the `module foo;` or `module foo { }` declaration.
+	/// File containing the `mod foo;` or `mod foo { }` declaration.
 	pub declaring_file_id: FileId,
 	/// File that IS this module (`foo.wx`). `None` for inline modules.
 	pub own_file_id: Option<FileId>,
@@ -2191,13 +2191,13 @@ pub struct TIR {
 	///
 	/// Also where a package's dependency names live: each `(key, target)`
 	/// edge is an ordinary `Module` symbol in the declaring package's
-	/// namespace here, since a dependency behaves exactly like a `module`
+	/// namespace here, since a dependency behaves exactly like a `mod`
 	/// declared at the top of its entry file.
 	#[cfg_attr(test, serde(skip))]
 	pub package_namespaces: HashMap<PackageId, NamespaceIndex>,
 	/// The scope each file's top-level items live in, indexed by `FileId` —
 	/// its module's namespace, or its package's root namespace for an entry
-	/// file, which has no `module` declaration of its own.
+	/// file, which has no `mod` declaration of its own.
 	///
 	/// Recorded in Phase 1, where `ensure_module_path` already computes it.
 	#[cfg_attr(test, serde(skip))]

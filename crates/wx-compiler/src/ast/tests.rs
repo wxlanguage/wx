@@ -1016,7 +1016,7 @@ fn test_missing_comma_between_struct_fields_warns_but_parses() {
 #[test]
 fn test_module_pub_items_and_associated_types() {
 	let case = TestCase::new(indoc! {"
-        pub module math {
+        pub mod math {
             pub fn zero() -> i32 {
                 0
             }
@@ -1094,7 +1094,7 @@ fn test_module_pub_items_and_associated_types() {
 
 #[test]
 fn test_external_module_item() {
-	let case = TestCase::new("module math;");
+	let case = TestCase::new("mod math;");
 
 	assert!(case.ast.diagnostics.is_empty());
 

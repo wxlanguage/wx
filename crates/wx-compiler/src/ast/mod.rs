@@ -1969,7 +1969,7 @@ pub enum Keyword {
 	Pub,
 	Memory,
 	Const,
-	Module,
+	Mod,
 	Trait,
 	For,
 	SelfType,
@@ -2011,7 +2011,7 @@ impl TryFrom<&str> for Keyword {
 			"pub" => Ok(Keyword::Pub),
 			"memory" => Ok(Keyword::Memory),
 			"const" => Ok(Keyword::Const),
-			"module" => Ok(Keyword::Module),
+			"mod" => Ok(Keyword::Mod),
 			"trait" => Ok(Keyword::Trait),
 			"for" => Ok(Keyword::For),
 			"Self" => Ok(Keyword::SelfType),
@@ -2305,7 +2305,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Struct) => Ok(Parser::parse_struct_item),
 			Some(Keyword::Memory) => Ok(Parser::parse_memory_item),
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
-			Some(Keyword::Module) => Ok(Parser::parse_module_item),
+			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
@@ -5613,7 +5613,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	fn parse_module_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
-		let module_span = parser.lexer.next().span; // consume `module`
+		let module_span = parser.lexer.next().span; // consume `mod`
 
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let name_symbol = parser.intern_identifier(name_span);

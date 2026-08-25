@@ -1393,7 +1393,7 @@ pub trait Allocator {
     }
 }
 
-pub module ptr {
+pub mod ptr {
     #[inline]
     pub fn null<Mem: Memory, T>() -> Mem::&T {
         0 as _

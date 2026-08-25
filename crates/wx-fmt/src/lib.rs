@@ -37,7 +37,7 @@ define_text! {
 		Struct  => "struct ",
 		Impl    => "impl",
 		Trait   => "trait ",
-		Module  => "module ",
+		Module  => "mod ",
 		Use     => "use ",
 		Memory  => "memory ",
 		Import  => "import ",

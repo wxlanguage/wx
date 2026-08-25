@@ -1,6 +1,6 @@
 use std::*;
 
-module x;
+mod x;
 
 fn abc() -> i32 {
   _ = pow::pow(1, 2);

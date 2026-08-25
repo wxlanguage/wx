@@ -510,7 +510,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 						SourceSpan::new(decl.declaring_file_id, decl.name.span)
 					}
 				};
-				// The `module foo;` name in the declaring file is itself a reference.
+				// The `mod foo;` name in the declaring file is itself a reference.
 				if decl.own_file_id.is_some() {
 					index.references.push(SpanInfo {
 						source: SourceSpan::new(

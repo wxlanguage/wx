@@ -506,7 +506,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"module math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
@@ -561,7 +561,7 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"module math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
@@ -641,7 +641,7 @@ fn compile_source(root: &PathBuf, source: &str) -> (ServerState, CompiledRoot) {
 }
 
 /// Compiles `root_source` alongside additional `(path, source)` files (e.g.
-/// files pulled in via `module foo;` declarations).
+/// files pulled in via `mod foo;` declarations).
 fn compile_multi_source(
 	root: &PathBuf,
 	root_source: &str,
@@ -1053,7 +1053,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 fn completion_hides_sibling_module_items_without_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nfn main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
@@ -1088,7 +1088,7 @@ fn completion_hides_sibling_module_items_without_use() {
 fn completion_shows_sibling_module_items_via_wildcard_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nuse math::*;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nuse math::*;\nfn main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
@@ -1206,7 +1206,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 fn path_completion_after_namespace_lists_module_members() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nfn test() {\n    math::\n}";
+	let source = "mod math;\nfn test() {\n    math::\n}";
 	let cursor = source.find("math::\n").unwrap() + "math::".len();
 
 	let (_, compiled) = compile_multi_source(
@@ -1238,7 +1238,7 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	// Regression test: signature_help used to compute `offset` from
 	// `compiled.graph.files` (the source as of the last save) and then slice
 	// into that same stale, shorter string. Typing new lines above the
-	// cursor without saving (e.g. wrapping existing code in a new `module`
+	// cursor without saving (e.g. wrapping existing code in a new `mod`
 	// block) pushed the live cursor position past the stale source's length
 	// and panicked on `source[..offset]`. `resolve_source_and_offset` is the
 	// shared fix both `completion` and `signature_help` now go through —
@@ -1248,7 +1248,7 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	let (mut state, compiled) = compile_source(&root, stale_source);
 	state.cached.insert(root.clone(), compiled);
 
-	let live_source = "module test {\n    fn foo()\n}\n\nfn test() {\n\n}";
+	let live_source = "mod test {\n    fn foo()\n}\n\nfn test() {\n\n}";
 	state
 		.open_documents
 		.insert(root.clone(), open_document(live_source));
@@ -1315,7 +1315,7 @@ fn cross_package_namespace_token_gets_a_reference() {
 	// literal `std` in `use std::*;`) never made it into `references` —
 	// hover/goto-definition/semantic-highlighting had nothing to find at
 	// that token, even though the item it resolves to (`helper`) worked
-	// fine. A locally-declared `module foo;` never hit this arm at all
+	// fine. A locally-declared `mod foo;` never hit this arm at all
 	// (it's `ModuleDeclarationKind::Module`), which is why same-package
 	// modules never showed the bug.
 	use wx_compiler::vfs::{self, VirtualFileSource};

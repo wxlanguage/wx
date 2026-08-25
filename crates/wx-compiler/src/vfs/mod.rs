@@ -20,7 +20,7 @@ pub use resolve::{open_manifest, package_kind};
 mod path;
 pub use path::{AbsolutePath, RelativePath};
 
-// Diagnostic codes for this stage (resolving `module foo;` declarations to
+// Diagnostic codes for this stage (resolving `mod foo;` declarations to
 // files and wiring up the package graph — closer to a linker than a parser or
 // type checker). Follows the same per-stage numbering convention as
 // `ast::DiagnosticCode` (E0xxx) and `tir::DiagnosticCode` (E1xxx).
@@ -395,9 +395,9 @@ pub struct PackageGraph {
 	/// this map can name a package, which is what keeps a transitive
 	/// dependency invisible to anyone who didn't declare it.
 	///
-	/// Read these as an implicit `module <key>;` at the top of the package's
+	/// Read these as an implicit `mod <key>;` at the top of the package's
 	/// entry file — that's exactly the meaning TIR gives them, and why a
-	/// local `module foo;` colliding with a key here is an ordinary
+	/// local `mod foo;` colliding with a key here is an ordinary
 	/// duplicate definition rather than an ambiguity to arbitrate.
 	pub dependencies: HashMap<SymbolU32, PackageId>,
 	/// Inverse of [`Self::dependencies`]. Well-defined only because
@@ -446,7 +446,7 @@ pub struct CompilationUnitBuilder {
 ///
 /// The un-prefixed remainder is exactly the key the module resolver looks
 /// up, so `std/math/mod.wx` appears here as `/math/mod.wx`, which is what a
-/// `module math;` declaration in `main.wx` resolves to.
+/// `mod math;` declaration in `main.wx` resolves to.
 pub const STDLIB_FILES: &[(&str, &str)] =
 	include!(concat!(env!("OUT_DIR"), "/stdlib_files.rs"));
 
@@ -487,7 +487,7 @@ impl CompilationUnitBuilder {
 	/// dependencies.
 	///
 	/// Every file in [`STDLIB_FILES`] is handed to the loader up front, so the
-	/// stdlib is an ordinary multi-file package from here on: `module foo;` in
+	/// stdlib is an ordinary multi-file package from here on: `mod foo;` in
 	/// `main.wx` resolves against this map exactly as it would against the
 	/// filesystem for a user package. Adding a stdlib file needs no change here.
 	///
@@ -537,7 +537,7 @@ impl CompilationUnitBuilder {
 	/// collision itself rather than handing one back.
 	///
 	/// A `dependencies` entry is a *declaration*, not an alias — it's what
-	/// introduces a package into the compilation, the way `module foo;`
+	/// introduces a package into the compilation, the way `mod foo;`
 	/// introduces a module. So the mapping is kept one-to-one in both
 	/// directions: declaring one package under two names is a duplicate
 	/// declaration, and a second name is spelled with an alias instead.
@@ -584,7 +584,7 @@ impl CompilationUnitBuilder {
 
 	/// Loads a package starting from `entry_path`. Fails only if the entry
 	/// point itself can't be read — there's no partial package to build
-	/// without it. Everything past that point (missing/ambiguous `module`
+	/// without it. Everything past that point (missing/ambiguous `mod`
 	/// declarations) is recorded as a diagnostic instead of aborting, so one
 	/// broken submodule doesn't take down the whole package.
 	pub fn load_package(
@@ -689,7 +689,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 
 	/// Loads a single module and, recursively, every child it can resolve.
 	/// Fails only when *this* file itself can't be read — a missing or
-	/// ambiguous child `module foo;` is instead recorded as a diagnostic on
+	/// ambiguous child `mod foo;` is instead recorded as a diagnostic on
 	/// the declaration (see below) and simply omitted from `children`, so
 	/// one broken submodule doesn't take down its siblings or its parent.
 	fn load_module(
@@ -798,7 +798,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		Ok(module_id)
 	}
 
-	/// `module { }` is the only item kind that can hide a `module foo;`
+	/// `mod { }` is the only item kind that can hide a `mod foo;`
 	/// file declaration inside it — not legal there, since where a
 	/// declared file lives should be readable from that one line, not
 	/// require walking up through however many inline wrappers enclose it
@@ -817,8 +817,8 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 							DiagnosticCode::NestedModuleDeclaration.code(),
 						)
 						.with_message(
-							"a `module foo;` file declaration cannot appear inside an \
-			 inline `module { }` block",
+							"a `mod foo;` file declaration cannot appear inside an \
+			 inline `mod { }` block",
 						)
 						.with_label(
 							Label::primary(file_id, name.span).with_message(
@@ -835,7 +835,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		}
 	}
 
-	/// Resolves `module <child_module_name>;`, declared inside the module
+	/// Resolves `mod <child_module_name>;`, declared inside the module
 	/// that owns `owned_dir`, to a candidate file path. `owned_dir` is
 	/// *that module's* directory — accumulated from its own name, not
 	/// wherever its own file happens to physically sit — so this doesn't

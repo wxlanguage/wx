@@ -1768,7 +1768,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 			.insert(package_graph.id, namespace_idx);
 	}
 
-	// A dependency is an implicit `module <key>;` at the top of the declaring
+	// A dependency is an implicit `mod <key>;` at the top of the declaring
 	// package's entry file, so its name is an ordinary `Module` symbol in
 	// that package's own namespace. Nothing global is involved, which is what
 	// keeps a package's dependencies invisible to everyone else — including
@@ -2529,7 +2529,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// `namespace`, with no lookup — every field is set exactly once, here,
 	/// by whichever of the two callers actually has the real data:
 	/// Phase 1a (file-based modules, `own_file_id: Some(..)`) or
-	/// `ensure_module`'s not-found path (inline `module foo { }` blocks,
+	/// `ensure_module`'s not-found path (inline `mod foo { }` blocks,
 	/// `own_file_id: None`).
 	fn create_module_namespace(
 		&mut self,
@@ -2568,7 +2568,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// Checks `namespace`'s direct scope for an existing Type-namespace
 	/// binding under `name` that's some `SymbolKind::Module` — a
 	/// dependency (`wx.json`), an `import "..." { }` block, or another
-	/// `module`. Every legitimate case of two sites converging on one
+	/// `mod`. Every legitimate case of two sites converging on one
 	/// module namespace (a declaring file and its content file) is handled
 	/// entirely by Phase 1a, before any of this module's three callers
 	/// ever run — so by the time any of them see a hit here, it's always a
@@ -2607,8 +2607,8 @@ impl<'ast> Builder<'ast, '_> {
 		Some(namespace_idx)
 	}
 
-	/// Resolves an *inline* `module foo { }` block — the one case vfs never
-	/// sees (it only discovers file-based `module foo;` declarations, which
+	/// Resolves an *inline* `mod foo { }` block — the one case vfs never
+	/// sees (it only discovers file-based `mod foo;` declarations, which
 	/// Phase 1a already handles before any file's items are scanned).
 	fn ensure_module(
 		&mut self,

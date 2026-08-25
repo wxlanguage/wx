@@ -150,7 +150,7 @@ fn test_format_single_import_function_stays_inline() {
 #[test]
 fn test_format_module_items() {
 	let case = TestCase::new(indoc! {"
-        pub module wasm {
+        pub mod wasm {
             pub fn answer() -> i32{
                 42
             }
@@ -158,7 +158,7 @@ fn test_format_module_items() {
             fn helper(  ) {}
         }
 
-        module math;
+        mod math;
     "});
 	let output = format(
 		&case.ast,
@@ -173,7 +173,7 @@ fn test_format_module_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            pub module wasm {
+            pub mod wasm {
                 pub fn answer() -> i32 {
                     42
                 }
@@ -181,7 +181,7 @@ fn test_format_module_items() {
                 fn helper() {}
             }
 
-            module math;
+            mod math;
         "}
 	);
 }
@@ -1302,12 +1302,12 @@ fn test_format_comments_preserved() {
 	);
 	assert_eq!(
 		fmt(indoc! {"
-            module m {
+            mod m {
                 // nothing yet
             }
         "}),
 		indoc! {"
-            module m {
+            mod m {
                 // nothing yet
             }
         "},

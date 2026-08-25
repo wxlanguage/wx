@@ -26,14 +26,14 @@ enum Errno: i32 {
 // __wasi_oflags_t bits, combined with `|` — there's no single closed set of
 // named "open modes" here (any subset of these bits is a legal request), so
 // this stays a namespaced group of flag constants rather than an enum.
-module OFlags {
+mod OFlags {
   pub const CREAT: u32 = 0x1;
   pub const TRUNC: u32 = 0x8;
 }
 
 // __wasi_rights_t bits this example needs (of many more defined by the
 // spec) — same reasoning as OFlags: a composable bitset, not an enum.
-module Rights {
+mod Rights {
   pub const FD_READ: u64 = 0x2;
   pub const FD_WRITE: u64 = 0x40;
 }

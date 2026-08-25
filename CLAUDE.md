@@ -136,10 +136,10 @@ Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 18 slots (`ERR
 - Structs, `impl` blocks, `pub fn` methods, `#[inline]` attribute
 - Traits with default method bodies, associated types (`type Size: PointerSize`), associated consts, `impl Trait for Type`
 - Generics / monomorphization — `fn f<T>(t: T) -> T`; `#[inline]` on generic functions is propagated to their mono instances (`mir/tests.rs`, `test_inline_attribute_on_generic_propagated_to_mono_instance`)
-- `module` declarations for multi-file compilation; Rust-style default visibility — an item without `pub` is visible to its declaring namespace and every descendant namespace, not to ancestors or unrelated modules. Enforced today for name lookup (`use module::*;` wildcard imports) and explicit qualified paths (`module::Item`, both type- and value-position); **not yet enforced** for method calls or struct field access — see Common pitfalls
+- `mod` declarations for multi-file compilation; Rust-style default visibility — an item without `pub` is visible to its declaring namespace and every descendant namespace, not to ancestors or unrelated modules. Enforced today for name lookup (`use module::*;` wildcard imports) and explicit qualified paths (`module::Item`, both type- and value-position); **not yet enforced** for method calls or struct field access — see Common pitfalls
 - `memory` declarations — `memory heap: Memory32;` lowers to WASM linear memory
 - `import "module" { fn ... }` — WASM imports; `export { fn, global }` — WASM exports (optionally renamed with `as "name"`)
-- `#[intrinsic]` — marks functions in `module wasm { }` as WASM intrinsics (memory ops)
+- `#[intrinsic]` — marks functions in `mod wasm { }` as WASM intrinsics (memory ops)
 - Untyped integer/float literals coerced by context or via `as T` cast
 - `as` casts: validity is checked via `are_scalar_compatible`/`WasmScalar` equivalence (not a numeric-only allowlist) — integer↔integer and `char`↔`u8`/`u16`/`u32` all pass since `char` and `u32` share `WasmScalar::I32`. Unsafe/lossy casts (e.g. `u32 as char`, which is *not* currently blocked) aren't yet checked — TODO at `tir/builder.rs:9579`
 - `loop`, `break <value>`, `continue`, labeled blocks (`outer: { break :outer }`)
@@ -170,7 +170,7 @@ assert_eq!(case.mir.functions.len(), 2);
 insta::assert_yaml_snapshot!(case.mir);
 
 // Multi-file TIR test
-let case = TestCase::new_multi_file("src/main.wx", "module math;", &[("src/math.wx", "pub fn add() -> i32 { 1 }")]);
+let case = TestCase::new_multi_file("src/main.wx", "mod math;", &[("src/math.wx", "pub fn add() -> i32 { 1 }")]);
 ```
 
 Snapshot files live in `src/tir/snapshots/` and `src/mir/snapshots/`. Never edit `.snap` files by hand. Any change to `std/main.wx` shifts byte offsets causing all snapshot tests to fail — regenerate with `INSTA_UPDATE=always`.

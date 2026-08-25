@@ -25,7 +25,7 @@ pub struct FormatSelection {
 ///
 /// `files`, if given, names an explicit list of paths relative to `dir` —
 /// format exactly those files, with no module-tree walk. Each is loaded
-/// independently via its own `load_binary` call; if it declares `module`s
+/// independently via its own `load_binary` call; if it declares `mod`s
 /// of its own, those get parsed too (parsing has to follow them to parse
 /// the file at all) but are not selected — only the named file is, same
 /// as a single shallow file always worked. With no `files`, every module

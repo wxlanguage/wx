@@ -13,7 +13,7 @@ struct BumpAllocator<M: Memory> {
     bump: M::Size,
 }
 
-module xor {
+mod xor {
     pub fn test() {}
 }
 
