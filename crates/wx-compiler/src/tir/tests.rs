@@ -8563,6 +8563,39 @@ fn test_type_position_undeclared_in_module_path_is_error() {
 }
 
 #[test]
+fn test_sibling_modules_get_independent_same_named_children() {
+	// `a` and `b` are siblings, both declaring `module shared;`. Each
+	// module's own children live under a directory named after *that
+	// module* (`src/a/`, `src/b/`) regardless of whether the module itself
+	// was found via the sibling-file or `mod.wx` form — so these resolve
+	// to two entirely independent files, not a collision (vfs/mod.rs's
+	// `owned_dir` accumulation). Confirmed by giving each `shared` a
+	// different return value and checking both come through unmodified.
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            module a;
+            module b;
+            fn main() -> i32 { a::use_a() + b::use_b() }
+            export { main }
+        "},
+		&[
+			(
+				"src/a.wx",
+				"module shared;\npub fn use_a() -> i32 { shared::x() }",
+			),
+			("src/a/shared.wx", "pub fn x() -> i32 { 1 }"),
+			(
+				"src/b.wx",
+				"module shared;\npub fn use_b() -> i32 { shared::x() }",
+			),
+			("src/b/shared.wx", "pub fn x() -> i32 { 2 }"),
+		],
+	);
+	no_errors(&case);
+}
+
+#[test]
 fn test_type_position_non_namespace_as_intermediate_is_error() {
 	// `i32::Foo` — `i32` is a primitive, not a module; looking up an associated
 	// type that doesn't exist should produce E1021 (UndeclaredType).

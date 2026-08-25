@@ -229,6 +229,54 @@ fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 }
 
 #[test]
+fn load_virtual_compilation_child_of_a_sibling_file_module_resolves_under_its_own_name()
+ {
+	// A module's own children always resolve under a directory named after
+	// *that module* — `a.wx` declaring `module shared;` looks for
+	// `/src/a/shared.wx`, not `/src/shared.wx`, regardless of `a.wx` being
+	// the plain-sibling form rather than `a/mod.wx`. Placing `shared.wx` at
+	// `/src/shared.wx` (the pre-fix resolution target, and formerly also
+	// reachable from a second sibling `b.wx` — a silent, asymmetric
+	// collision between the two) is now simply the wrong location, and
+	// reported as an honest, ordinary `ModuleFileNotFound`.
+	let mut builder = CompilationUnitBuilder::new();
+	builder.load_stdlib();
+	let root_id = builder
+		.load_binary(
+			AbsolutePath::new("/src/main.wx"),
+			&VirtualFileSource::new(HashMap::from([
+				(AbsolutePath::new("/src/main.wx"), "module a;".to_string()),
+				(AbsolutePath::new("/src/a.wx"), "module shared;".to_string()),
+				(
+					AbsolutePath::new("/src/shared.wx"),
+					"pub fn x() -> i32 { 1 }".to_string(),
+				),
+			])),
+		)
+		.expect("a.wx itself is still readable");
+	let graph = &builder.packages[root_id.as_u32() as usize];
+
+	let root = &graph.modules[graph.root.as_u32() as usize];
+	let a = &graph.modules[root.children[0].as_u32() as usize];
+	assert_eq!(
+		a.children.len(),
+		0,
+		"the unresolved `shared` module should be omitted, not present as \
+		 a stub"
+	);
+	assert!(
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::ModuleFileNotFound.code())),
+		"expected E2000 (ModuleFileNotFound), got: {:?}",
+		graph
+			.linker_diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
 fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
 	// `module extra;` inside an inline `module utils { }` block is not a
 	// legal declaration site — unlike Rust, wx doesn't resolve it by

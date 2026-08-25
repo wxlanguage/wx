@@ -614,7 +614,9 @@ impl CompilationUnitBuilder {
 		};
 
 		let mut loader = Loader::new(self, package_id, file_source);
-		let root = loader.load_module(entry_path.clone(), None)?;
+		let root_owned_dir = entry_path.parent();
+		let root =
+			loader.load_module(entry_path.clone(), None, root_owned_dir)?;
 
 		// Built into a local first: moving the loader's fields out here is
 		// what ends its borrow of `self`, which the push then needs.
@@ -693,6 +695,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		&mut self,
 		file_path: AbsolutePath,
 		declaration: Option<ModuleDeclaration>,
+		owned_dir: AbsolutePath,
 	) -> Result<ModuleId, ()> {
 		if let Some(&module_id) = self.path_to_module.get(&file_path) {
 			return Ok(module_id);
@@ -746,10 +749,21 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		let mut children = Vec::with_capacity(child_decls.len());
 		for (child_name, child_pub_span) in child_decls {
 			let Some(child_path) =
-				self.resolve_child_module_path(module_id, child_name, file_id)
+				self.resolve_child_module_path(&owned_dir, child_name, file_id)
 			else {
 				continue; // already diagnosed as ambiguous
 			};
+			// A module's own children always live under a directory named
+			// after *that module*, not wherever its own file physically
+			// sits — so `math.wx` and `math/mod.wx` grant `math` the exact
+			// same `owned_dir` for its children (both `src/math/`), same as
+			// Rust's `foo.rs`/`foo/mod.rs` being interchangeable.
+			let child_name_str =
+				self.ctx.interner.resolve(child_name.inner).expect(
+					"module symbol should resolve while loading package",
+				);
+			let child_owned_dir =
+				owned_dir.join(&RelativePath::new(child_name_str.to_string()));
 			match self.load_module(
 				child_path.clone(),
 				Some(ModuleDeclaration {
@@ -757,6 +771,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 					name: child_name,
 					pub_span: child_pub_span,
 				}),
+				child_owned_dir,
 			) {
 				Ok(child_id) => children.push(child_id),
 				Err(()) => {
@@ -819,15 +834,18 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		}
 	}
 
-	/// Resolves `module <child_module_name>;` declared at `child_span` in
-	/// `parent_module_id`'s file to a candidate file path. Doesn't check the
-	/// path actually exists (that's `load_module`'s job) except to detect
-	/// the ambiguous case, which it diagnoses directly since — unlike a
-	/// simple not-found — there's no single "the file" to report from
-	/// `load_module`.
+	/// Resolves `module <child_module_name>;`, declared inside the module
+	/// that owns `owned_dir`, to a candidate file path. `owned_dir` is
+	/// *that module's* directory — accumulated from its own name, not
+	/// wherever its own file happens to physically sit — so this doesn't
+	/// need to look anything up about the declaring module itself. Doesn't
+	/// check the path actually exists (that's `load_module`'s job) except
+	/// to detect the ambiguous case, which it diagnoses directly since —
+	/// unlike a simple not-found — there's no single "the file" to report
+	/// from `load_module`.
 	fn resolve_child_module_path(
 		&mut self,
-		parent_module_id: ModuleId,
+		owned_dir: &AbsolutePath,
 		child_module_name: ast::Spanned<SymbolU32>,
 		parent_file_id: FileId,
 	) -> Option<AbsolutePath> {
@@ -836,12 +854,10 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			.interner
 			.resolve(child_module_name.inner)
 			.expect("module symbol should resolve while loading package");
-		let parent_dir =
-			self.modules[parent_module_id.0 as usize].file_path.parent();
 		let sibling_file =
-			parent_dir.join(&RelativePath::new(format!("{module_name}.wx")));
-		let directory_file = parent_dir
-			.join(&RelativePath::new(format!("{module_name}/mod.wx")));
+			owned_dir.join(&RelativePath::new(format!("{module_name}.wx")));
+		let directory_file =
+			owned_dir.join(&RelativePath::new(format!("{module_name}/mod.wx")));
 
 		if self.file_source.exists(&sibling_file)
 			&& self.file_source.exists(&directory_file)

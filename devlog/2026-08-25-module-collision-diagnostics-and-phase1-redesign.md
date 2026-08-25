@@ -20,7 +20,7 @@ later if some other caller got there first." Also fixed: vfs's
 `ModuleDeclaration` scan was flat, so a `module foo;` nested inside an inline
 `module { }` block was invisible to it rather than diagnosed (`E2006`, new).
 
-826 `wx-compiler` + 53 `wx-lsp` passing (up from 822 + 53 at the start of this
+828 `wx-compiler` + 53 `wx-lsp` passing (up from 822 + 53 at the start of this
 session — new regression tests, no regressions). The three
 `sin`/`cos`/`scale_pow2` failures from the previous session are unrelated and
 still failing (`std/math` submodule in progress).
@@ -166,6 +166,45 @@ separate from the existing flat `child_decls` scan rather than merged into one
 dual-purpose function with a depth counter, so the common path stays exactly
 as simple as it was.
 
+## A module's children now resolve under its own name, not its file's directory
+
+Found while trying to write a regression test for a "diamond" case (two
+sibling files, `a.wx`/`b.wx`, both declaring `module shared;`) — the repro
+itself turned out to be ill-formed, and fixing *that* is a better fix than
+patching the dedup race it seemed to expose.
+
+`resolve_child_module_path` used to search relative to
+`self.modules[parent_module_id].file_path.parent()` — the declaring file's own
+*physical* directory. For a plain-sibling file like `a.wx` (living directly in
+`src/`, not `src/a/mod.wx`), that directory is `src/` — the same directory
+`main.wx` itself lives in. So `a.wx` declaring `module shared;` never actually
+nested `shared` under `a` at all; it resolved to `src/shared.wx`, a plain
+sibling of `main.wx`, `a.wx`, and `b.wx` alike, with no more claim to that name
+than any of them. Rust's actual rule (confirmed against its own diagnostic,
+`E0583`, which suggests creating `.../a/shared.rs`) always grants a module its
+own directory per path segment — `a.rs` included — regardless of whether `a`
+itself is file-backed via a plain sibling or `a/mod.rs`.
+
+Fixed by threading an accumulated `owned_dir: AbsolutePath` through
+`Loader::load_module` and `resolve_child_module_path`, replacing the
+file-path-derived lookup entirely. The root's `owned_dir` is its entry file's
+own directory (unchanged); every child's `owned_dir` is
+`<parent's owned_dir>/<child's own name>`, computed the same way regardless of
+which form resolved the child's own file. This makes `math.wx` and
+`math/mod.wx` fully interchangeable for what directory `math`'s own children
+live in (`src/math/` either way) — matching Rust's `foo.rs`/`foo/mod.rs`
+equivalence — and makes the "diamond" impossible by construction rather than
+by restriction: `a`'s and `b`'s `shared` now resolve under `src/a/` and
+`src/b/` respectively, genuinely different files, no collision to race. No new
+diagnostic code needed — a `module shared;` that doesn't have a real file at
+its now-correctly-scoped location is just an ordinary `ModuleFileNotFound`
+(`E2000`).
+
+`resolve_child_module_path` also lost its `parent_module_id` parameter (no
+`self.modules[..]` lookup needed) and now just takes `owned_dir` directly. No
+existing test exercised a non-root file declaring its own children, so nothing
+depended on the old, non-accumulating behavior.
+
 ## Key findings
 
 - `Spanned<T>` has a manual `impl<T: Copy> Copy for Spanned<T> {}`
@@ -188,14 +227,6 @@ as simple as it was.
 
 ## Follow-ups
 
-- **Diamond dependency declarations.** If two different files both write
-  `module shared;` resolving to the same target, vfs's `path_to_module` dedup
-  means the target's `SourceModule.declaration.parent` only ever records the
-  *first* discoverer. The second declaring file's own `ModuleDeclaration` item
-  still gets processed by `pre_scan_item`'s (now-empty) arm and does nothing —
-  meaning the second parent's own reference to the name never gets a binding
-  at all. Not introduced by this session (the asymmetry existed before, just
-  manifesting differently); not covered by a test either direction.
 - Everything else from the previous devlog's follow-up list is still open:
   tests for the per-package-namespace semantics, `display_type`/`display_bounds`
   infallibility, `pub interner` removal, the two disagreeing `TypeFormatter`
