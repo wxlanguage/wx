@@ -1669,12 +1669,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	let source_modules: Vec<_> = graph
 		.packages
 		.iter()
-		.flat_map(|package_graph| {
-			package_graph
-				.modules
-				.iter()
-				.map(move |module| (package_graph, module))
-		})
+		.flat_map(|package_graph| package_graph.modules.iter())
 		.collect();
 	assert!(
 		!source_modules.is_empty(),
@@ -1778,9 +1773,9 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	// that package's own namespace. Nothing global is involved, which is what
 	// keeps a package's dependencies invisible to everyone else — including
 	// to its own dependents, who never declared them.
-	for package_graph in &graph.packages {
-		let owner = builder.tir.package_namespaces[&package_graph.id];
-		for (&name, target) in &package_graph.dependencies {
+	for package in &graph.packages {
+		let owner = builder.tir.package_namespaces[&package.id];
+		for (&name, target) in &package.dependencies {
 			let target_namespace = builder.tir.package_namespaces[target];
 			builder.tir.namespaces[owner as usize].symbols.insert(
 				(SymbolNamespace::Type, name),
@@ -1791,22 +1786,48 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		}
 	}
 
-	// Phase 1: register all top-level items into ast_nodes / pending
-	for (package_graph, source_module) in source_modules.iter().copied() {
-		let package_base = builder.tir.package_namespaces[&package_graph.id];
-		let module_path = package_graph.module_symbol_path(source_module.id);
-		let namespace = builder.ensure_module_path(
-			source_module.file_id,
-			package_base,
-			&module_path,
-		);
-
-		// Recorded where it's decided: an entry file has an empty module
-		// path, so this is its package's namespace; any other file gets its
-		// own module's.
+	// Phase 1a: one namespace per file, created directly from the
+	// `SourceModule` tree vfs already built. `ModuleId`s are assigned in
+	// push order and vfs always pushes a parent before loading any child,
+	// so a child's `ModuleId` — and therefore its position in
+	// `source_modules` — always comes after its parent's; a child's parent
+	// namespace is therefore always already in `file_namespaces` by the
+	// time the child is processed. Every field of every `ModuleDecl` is set
+	// exactly once, here, straight from vfs's data — nothing downstream
+	// ever writes to one afterward.
+	for source_module in source_modules.iter().copied() {
+		let package = &builder.packages[source_module.package_id.as_usize()];
+		let namespace = match &source_module.declaration {
+			None => builder.tir.package_namespaces[&package.id],
+			Some(declaration) => {
+				let parent_module =
+					&package.modules[declaration.parent.as_usize()];
+				let parent_namespace = builder.tir.file_namespaces
+					[parent_module.file_id.as_usize()];
+				match builder.check_module_collision(
+					parent_module.file_id,
+					parent_namespace,
+					declaration.name,
+				) {
+					Some(existing) => existing,
+					None => builder.create_module_namespace(
+						parent_module.file_id,
+						parent_namespace,
+						declaration.name,
+						declaration.pub_span,
+						Some(source_module.file_id),
+					),
+				}
+			}
+		};
 		builder.tir.file_namespaces[source_module.file_id.as_usize()] =
 			namespace;
+	}
 
+	// Phase 1b: register all top-level items into ast_nodes / pending.
+	for source_module in source_modules.iter().copied() {
+		let namespace =
+			builder.tir.file_namespaces[source_module.file_id.as_usize()];
 		for item in source_module.ast.items.iter() {
 			builder.pre_scan_item(
 				source_module.file_id,
@@ -1844,9 +1865,9 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	builder.check_trait_conformance();
 
 	// Phase 4: process exports (must run after all signatures are resolved)
-	for (package_graph, source_module) in source_modules.iter().copied() {
+	for source_module in source_modules.iter().copied() {
 		let package_namespace =
-			builder.tir.package_namespaces[&package_graph.id];
+			builder.tir.package_namespaces[&source_module.package_id];
 		for item in source_module.ast.items.iter() {
 			if let ast::Item::Export { entries } = &item.inner.inner {
 				builder.build_exports(
@@ -2504,28 +2525,20 @@ impl<'ast> Builder<'ast, '_> {
 		})
 	}
 
-	fn ensure_module(
+	/// Unconditionally creates a new module namespace as a child of
+	/// `namespace`, with no lookup — every field is set exactly once, here,
+	/// by whichever of the two callers actually has the real data:
+	/// Phase 1a (file-based modules, `own_file_id: Some(..)`) or
+	/// `ensure_module`'s not-found path (inline `module foo { }` blocks,
+	/// `own_file_id: None`).
+	fn create_module_namespace(
 		&mut self,
-		file_id: FileId,
+		declaring_file_id: FileId,
 		namespace: NamespaceIndex,
 		name: ast::Spanned<SymbolU32>,
 		pub_span: Option<ast::TextSpan>,
+		own_file_id: Option<FileId>,
 	) -> NamespaceIndex {
-		let symbol = name.inner;
-		if let Some(SymbolKind::Module { namespace_idx }) = self
-			.lookup_global_symbol(namespace, (SymbolNamespace::Type, symbol))
-		{
-			if let ModuleDeclarationKind::Module(decl_idx) =
-				self.tir.namespaces[namespace_idx as usize].declaration
-			{
-				let decl = &mut self.tir.module_decls[decl_idx as usize];
-				if decl.pub_span.is_none() {
-					decl.pub_span = pub_span;
-				}
-			}
-			return namespace_idx;
-		}
-
 		let namespace_idx = self.tir.namespaces.len() as u32;
 		let decl_idx = self.tir.module_decls.len() as u32;
 		self.tir.namespaces.push(ModuleNamespace {
@@ -2539,52 +2552,77 @@ impl<'ast> Builder<'ast, '_> {
 		});
 		self.tir.module_decls.push(ModuleDecl {
 			namespace_idx,
-			declaring_file_id: file_id,
-			own_file_id: None,
+			declaring_file_id,
+			own_file_id,
 			name,
 			pub_span,
 		});
 		self.insert_symbol(
 			namespace,
-			(SymbolNamespace::Type, symbol),
+			(SymbolNamespace::Type, name.inner),
 			SymbolKind::Module { namespace_idx },
 		);
 		namespace_idx
 	}
 
-	/// Returns the namespace `path` names, relative to `base` — which is
-	/// `base` itself for an empty path, i.e. a package's entry file.
-	fn ensure_module_path(
+	/// Checks `namespace`'s direct scope for an existing Type-namespace
+	/// binding under `name` that's some `SymbolKind::Module` — a
+	/// dependency (`wx.json`), an `import "..." { }` block, or another
+	/// `module`. Every legitimate case of two sites converging on one
+	/// module namespace (a declaring file and its content file) is handled
+	/// entirely by Phase 1a, before any of this module's three callers
+	/// ever run — so by the time any of them see a hit here, it's always a
+	/// genuine duplicate, never something safe to reuse. Diagnoses the
+	/// collision and returns the existing namespace to recover into (the
+	/// same tradeoff as any other diagnosed TIR: the compilation already
+	/// has an error and `wx-cli` aborts before `MIR::build`, so what the
+	/// colliding declaration's own contents end up merged into doesn't
+	/// matter). `None` when the name is free to claim, or already claimed
+	/// by some other, unrelated kind of symbol — not this helper's
+	/// concern.
+	fn check_module_collision(
 		&mut self,
 		file_id: FileId,
-		base: NamespaceIndex,
-		path: &[SymbolU32],
-	) -> NamespaceIndex {
-		let mut namespace = base;
-
-		for (i, segment) in path.iter().copied().enumerate() {
-			let namespace_idx = self.ensure_module(
-				file_id,
+		namespace: NamespaceIndex,
+		name: ast::Spanned<SymbolU32>,
+	) -> Option<NamespaceIndex> {
+		let existing @ SymbolKind::Module { namespace_idx } = self
+			.direct_scope_lookup(
 				namespace,
-				ast::Spanned {
-					inner: segment,
-					span: ast::TextSpan::new(0, 0),
-				},
-				None,
-			);
-			// Set own_file_id on the last segment — that's the source module's actual file.
-			if i == path.len() - 1 {
-				if let ModuleDeclarationKind::Module(decl_idx) =
-					self.tir.namespaces[namespace_idx as usize].declaration
-				{
-					self.tir.module_decls[decl_idx as usize].own_file_id =
-						Some(file_id);
-				}
-			}
-			namespace = namespace_idx;
-		}
+				(SymbolNamespace::Type, name.inner),
+			)?
+		else {
+			return None;
+		};
+		let first_definition = self.get_symbol_location(existing);
+		let name_str = self.interner.resolve(name.inner).unwrap();
+		self.tir.diagnostics.push(report_duplicate_definition(
+			DuplicateDefinitionDiagnostic {
+				name: name_str,
+				namespace: SymbolNamespace::Type,
+				first_definition,
+				second_definition: SourceSpan::new(file_id, name.span),
+			},
+		));
+		Some(namespace_idx)
+	}
 
-		namespace
+	/// Resolves an *inline* `module foo { }` block — the one case vfs never
+	/// sees (it only discovers file-based `module foo;` declarations, which
+	/// Phase 1a already handles before any file's items are scanned).
+	fn ensure_module(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		name: ast::Spanned<SymbolU32>,
+		pub_span: Option<ast::TextSpan>,
+	) -> NamespaceIndex {
+		if let Some(existing) =
+			self.check_module_collision(file_id, namespace, name)
+		{
+			return existing;
+		}
+		self.create_module_namespace(file_id, namespace, name, pub_span, None)
 	}
 
 	/// Walk `ty` without crossing pointer/slice boundaries and return the span
@@ -5079,9 +5117,10 @@ impl<'ast> Builder<'ast, '_> {
 					);
 				}
 			}
-			ast::Item::ModuleDeclaration { name, pub_span } => {
-				self.ensure_module(file_id, namespace, *name, *pub_span);
-			}
+			// Nothing to do: Phase 1a already created this module's
+			// namespace (and set its `pub_span`) directly from vfs's
+			// `SourceModule` tree, before any file's items were scanned.
+			ast::Item::ModuleDeclaration { .. } => {}
 			ast::Item::Trait {
 				id,
 				name,
@@ -5294,15 +5333,6 @@ impl<'ast> Builder<'ast, '_> {
 						span: import_module_name.span,
 					}
 				};
-				if alias.is_none() {
-					self.tir.diagnostics.push(report_missing_import_alias(
-						SourceSpan::new(file_id, import_module_name.span),
-					));
-				}
-				let module_sym = match alias {
-					Some(a) => a.inner,
-					None => external_name.inner,
-				};
 				let namespace_idx = self.tir.namespaces.len() as u32;
 				let decl_idx = self.tir.import_decls.len() as u32;
 				self.tir.namespaces.push(ModuleNamespace {
@@ -5313,11 +5343,33 @@ impl<'ast> Builder<'ast, '_> {
 					wildcard_imports: Vec::new(),
 					accesses: Vec::new(),
 				});
-				self.insert_symbol(
-					namespace,
-					(SymbolNamespace::Type, module_sym),
-					SymbolKind::Module { namespace_idx },
-				);
+				// Only a real, user-written alias is ever checked for a
+				// collision or bound as a `Type`-namespace name —
+				// `external_name` (the unescaped import-path string) was
+				// never something the user wrote as an identifier, so
+				// there's nothing legitimate to check or bind it under.
+				// Either failure still lets the import's own namespace,
+				// decl, and entries register normally below — it just
+				// isn't reachable by name.
+				match *alias {
+					Some(alias) => {
+						if self
+							.check_module_collision(file_id, namespace, alias)
+							.is_none()
+						{
+							self.insert_symbol(
+								namespace,
+								(SymbolNamespace::Type, alias.inner),
+								SymbolKind::Module { namespace_idx },
+							);
+						}
+					}
+					None => {
+						self.tir.diagnostics.push(report_missing_import_alias(
+							SourceSpan::new(file_id, import_module_name.span),
+						));
+					}
+				}
 				for entry in entries.iter() {
 					match &entry.inner.inner.declaration {
 						ast::ImportDeclaration::Function { id, .. } => {

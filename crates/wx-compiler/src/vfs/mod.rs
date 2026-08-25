@@ -72,6 +72,7 @@ define_diagnostic_codes! {
 		CircularDependency => "E2003",
 		StdPackageAsDependency => "E2004",
 		PackageDeclaredTwice => "E2005",
+		NestedModuleDeclaration => "E2006",
 	}
 }
 
@@ -341,14 +342,25 @@ impl PackageId {
 	}
 }
 
+/// Where a non-root module was declared: the parent that named it, and that
+/// declaration's own name/span/visibility. `parent` and `name` always exist
+/// or don't exist together — bundled here, rather than as two independent
+/// `Option`s on `SourceModule`, so that invariant is enforced by the type
+/// itself instead of a comment.
+#[derive(Clone)]
+pub struct ModuleDeclaration {
+	pub parent: ModuleId,
+	pub name: ast::Spanned<SymbolU32>,
+	/// Whether the declaration was `pub`. Independently optional — a
+	/// declaration that exists but isn't `pub` is a normal, valid state.
+	pub pub_span: Option<ast::TextSpan>,
+}
+
 pub struct SourceModule {
 	pub package_id: PackageId,
-	pub id: ModuleId,
-	pub parent: Option<ModuleId>,
 	pub children: Vec<ModuleId>,
-	/// Intra-package path segment declared by `module foo;`. `None` for the package
-	/// root — root items need no qualifier (`add`, not `root::add`).
-	pub name: Option<SymbolU32>,
+	/// `None` only for the package root, which has no declaring site.
+	pub declaration: Option<ModuleDeclaration>,
 	pub file_id: FileId,
 	pub file_path: AbsolutePath,
 	pub ast: ast::AST,
@@ -542,20 +554,26 @@ impl CompilationUnitBuilder {
 		if let Some(existing) =
 			package.dependency_names.get(&dependency).copied()
 		{
-			package
-				.linker_diagnostics
-				.push(report_package_declared_twice(
-					self.interner.resolve(name).unwrap(),
+			let diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::PackageDeclaredTwice.code())
+				.with_message(format!(
+					"this package is already declared as `{}`, so it cannot \
+			 also be declared as `{}`",
 					self.interner.resolve(existing).unwrap(),
+					self.interner.resolve(name).unwrap(),
 				));
+			package.linker_diagnostics.push(diagnostic);
 			return;
 		}
 		if package.dependencies.contains_key(&name) {
-			package
-				.linker_diagnostics
-				.push(report_duplicate_dependency_name(
-					self.interner.resolve(name).unwrap(),
+			let diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::DuplicatePackageName.code())
+				.with_message(format!(
+					"the name `{}` is already used by another package this one \
+			 depends on",
+					self.interner.resolve(name).unwrap()
 				));
+			package.linker_diagnostics.push(diagnostic);
 			return;
 		}
 
@@ -596,7 +614,7 @@ impl CompilationUnitBuilder {
 		};
 
 		let mut loader = Loader::new(self, package_id, file_source);
-		let root = loader.load_module(entry_path.clone(), None, None)?;
+		let root = loader.load_module(entry_path.clone(), None)?;
 
 		// Built into a local first: moving the loader's fields out here is
 		// what ends its borrow of `self`, which the push then needs.
@@ -640,79 +658,6 @@ impl CompilationUnitBuilder {
 	}
 }
 
-impl PackageGraph {
-	pub fn module_symbol_path(&self, module_id: ModuleId) -> Box<[SymbolU32]> {
-		let mut path = Vec::new();
-		let mut current = Some(module_id);
-
-		while let Some(id) = current {
-			let module = &self.modules[id.as_u32() as usize];
-			if let Some(name) = module.name {
-				path.push(name);
-			}
-			current = module.parent;
-		}
-
-		path.reverse();
-		path.into_boxed_slice()
-	}
-}
-
-/// Converts a `module foo;` resolution failure into a diagnostic attached to
-/// that declaration's span, rather than to the (possibly nonexistent) file
-/// it failed to resolve to.
-fn report_module_not_found(
-	file_id: FileId,
-	span: ast::TextSpan,
-	path: &str,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::ModuleFileNotFound.code())
-		.with_message(format!("module file not found: `{path}`"))
-		.with_label(
-			Label::primary(file_id, span)
-				.with_message(format!("no such file: `{path}`")),
-		)
-}
-
-fn report_ambiguous_module(
-	file_id: FileId,
-	span: ast::TextSpan,
-	file: &str,
-	directory_file: &str,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::AmbiguousModuleFile.code())
-		.with_message("ambiguous module")
-		.with_label(Label::primary(file_id, span).with_message(format!(
-			"both `{file}` and `{directory_file}` exist"
-		)))
-}
-
-/// No label: `serde_json` tracks no byte position for individual manifest
-/// fields, so there's no span inside the `wx.json` to underline. Same for
-/// [`report_package_declared_twice`].
-fn report_duplicate_dependency_name(name: &str) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::DuplicatePackageName.code())
-		.with_message(format!(
-			"the name `{name}` is already used by another package this one \
-			 depends on"
-		))
-}
-
-fn report_package_declared_twice(
-	name: &str,
-	existing: &str,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::PackageDeclaredTwice.code())
-		.with_message(format!(
-			"this package is already declared as `{existing}`, so it cannot \
-			 also be declared as `{name}`"
-		))
-}
-
 struct Loader<'ctx, 'src, S: FileSource> {
 	package_id: PackageId,
 	file_source: &'src S,
@@ -747,8 +692,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	fn load_module(
 		&mut self,
 		file_path: AbsolutePath,
-		name: Option<SymbolU32>,
-		parent: Option<ModuleId>,
+		declaration: Option<ModuleDeclaration>,
 	) -> Result<ModuleId, ()> {
 		if let Some(&module_id) = self.path_to_module.get(&file_path) {
 			return Ok(module_id);
@@ -772,32 +716,35 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			&mut self.ctx.interner,
 			&mut self.ctx.id_generator,
 		);
-		let child_decls: Box<[ast::Spanned<SymbolU32>]> = ast
-			.items
+		let child_decls: Box<
+			[(ast::Spanned<SymbolU32>, Option<ast::TextSpan>)],
+		> = ast.items
 			.iter()
 			.filter_map(|item| match &item.inner.inner {
-				ast::Item::ModuleDeclaration { name, .. } => Some(*name),
+				ast::Item::ModuleDeclaration { name, pub_span } => {
+					Some((*name, *pub_span))
+				}
+				ast::Item::Module { items, .. } => {
+					self.diagnose_nested_module_declarations(file_id, items);
+					None
+				}
 				_ => None,
 			})
 			.collect();
 
-		let module_id = ModuleId(u32::try_from(self.modules.len()).expect(
-			"module count should never realistically approach u32::MAX",
-		));
+		let module_id = ModuleId(self.modules.len() as u32);
 		self.path_to_module.insert(file_path.clone(), module_id);
 		self.modules.push(SourceModule {
 			package_id: self.package_id,
-			id: module_id,
-			parent,
 			children: Vec::new(),
-			name,
+			declaration,
 			file_id,
 			file_path,
 			ast,
 		});
 
 		let mut children = Vec::with_capacity(child_decls.len());
-		for child_name in child_decls {
+		for (child_name, child_pub_span) in child_decls {
 			let Some(child_path) =
 				self.resolve_child_module_path(module_id, child_name, file_id)
 			else {
@@ -805,20 +752,71 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			};
 			match self.load_module(
 				child_path.clone(),
-				Some(child_name.inner),
-				Some(module_id),
+				Some(ModuleDeclaration {
+					parent: module_id,
+					name: child_name,
+					pub_span: child_pub_span,
+				}),
 			) {
 				Ok(child_id) => children.push(child_id),
-				Err(()) => self.diagnostics.push(report_module_not_found(
-					file_id,
-					child_name.span,
-					child_path.as_str(),
-				)),
+				Err(()) => {
+					let diagnostic = Diagnostic::error()
+						.with_code(DiagnosticCode::ModuleFileNotFound.code())
+						.with_message(format!(
+							"module file not found: `{}`",
+							child_path.as_str()
+						))
+						.with_label(
+							Label::primary(file_id, child_name.span)
+								.with_message(format!(
+									"no such file: `{}`",
+									child_path.as_str()
+								)),
+						);
+					self.diagnostics.push(diagnostic);
+				}
 			}
 		}
 		self.modules[module_id.0 as usize].children = children;
 
 		Ok(module_id)
+	}
+
+	/// `module { }` is the only item kind that can hide a `module foo;`
+	/// file declaration inside it — not legal there, since where a
+	/// declared file lives should be readable from that one line, not
+	/// require walking up through however many inline wrappers enclose it
+	/// (unlike Rust, which resolves it by accumulating a directory segment
+	/// per inline level).
+	fn diagnose_nested_module_declarations(
+		&mut self,
+		file_id: FileId,
+		items: &[ast::Separated<ast::Spanned<ast::Item>>],
+	) {
+		for item in items {
+			match &item.inner.inner {
+				ast::Item::ModuleDeclaration { name, .. } => {
+					let diagnostic = Diagnostic::error()
+						.with_code(
+							DiagnosticCode::NestedModuleDeclaration.code(),
+						)
+						.with_message(
+							"a `module foo;` file declaration cannot appear inside an \
+			 inline `module { }` block",
+						)
+						.with_label(
+							Label::primary(file_id, name.span).with_message(
+								"move this declaration to the file's top level",
+							),
+						);
+					self.diagnostics.push(diagnostic);
+				}
+				ast::Item::Module { items, .. } => {
+					self.diagnose_nested_module_declarations(file_id, items);
+				}
+				_ => {}
+			}
+		}
 	}
 
 	/// Resolves `module <child_module_name>;` declared at `child_span` in
@@ -848,12 +846,18 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		if self.file_source.exists(&sibling_file)
 			&& self.file_source.exists(&directory_file)
 		{
-			self.diagnostics.push(report_ambiguous_module(
-				parent_file_id,
-				child_module_name.span,
-				sibling_file.as_str(),
-				directory_file.as_str(),
-			));
+			let diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::AmbiguousModuleFile.code())
+				.with_message("ambiguous module")
+				.with_label(
+					Label::primary(parent_file_id, child_module_name.span)
+						.with_message(format!(
+							"both `{}` and `{}` exist",
+							sibling_file.as_str(),
+							directory_file.as_str()
+						)),
+				);
+			self.diagnostics.push(diagnostic);
 			return None;
 		}
 

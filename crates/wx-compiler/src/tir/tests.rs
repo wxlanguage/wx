@@ -8448,6 +8448,95 @@ fn test_type_position_three_segment_inline_module_path() {
 }
 
 #[test]
+fn test_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
+{
+	// Every package implicitly depends on `std`, materialized as a `Module`
+	// symbol in the root package's own namespace before any file is
+	// scanned. A user `module std { }` declaration must not silently merge
+	// its contents into the real stdlib's namespace — it should be reported
+	// as a same-scope duplicate definition, same as any other name clash.
+	let case = TestCase::new(indoc! {"
+        module std {
+            pub fn my_helper() -> i32 { 42 }
+        }
+
+        fn main() -> i32 { std::my_helper() }
+
+        export { main }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"expected E1000 (DuplicateDefinition) for `module std` colliding \
+		 with the implicit std dependency, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
+ {
+	// Same collision as above, but through the file-pointing form
+	// (`module std;`, resolved by Phase 1a directly from vfs's
+	// `SourceModule` tree) rather than an inline block. Regression test:
+	// this form used to silently steal the `std` binding with zero
+	// diagnostic, since Phase 1a's `create_module_namespace` had no
+	// collision check at all — `use std::*;` (and every other `std::x`
+	// reference) would then resolve against the user's own file instead
+	// of the real stdlib, producing a cascade of unrelated "undeclared
+	// type"/"cannot coerce" errors instead of one clear diagnostic.
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            module std;
+            fn main() -> i32 { 1 }
+            export { main }
+        "},
+		&[("src/std.wx", "pub fn my_helper() -> i32 { 42 }")],
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"expected E1000 (DuplicateDefinition) for file-declared `module \
+		 std;` colliding with the implicit std dependency, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_import_alias_colliding_with_implicit_std_dependency_is_duplicate_definition()
+ {
+	// The third name-owning mechanism alongside dependencies and
+	// `module`: an `import "..." as std { }` block must not silently
+	// steal the `std` binding either.
+	let case = TestCase::new(indoc! {"
+        import \"env\" as std {
+            fn foo();
+        }
+
+        fn main() -> i32 { 1 }
+
+        export { main }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"expected E1000 (DuplicateDefinition) for `import ... as std` \
+		 colliding with the implicit std dependency, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
 fn test_type_position_undeclared_in_module_path_is_error() {
 	// `shapes::NonExistent` — the module exists but the type does not.
 	// Should produce exactly one error (not a cascade) and not panic.

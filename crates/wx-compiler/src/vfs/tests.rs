@@ -40,9 +40,10 @@ fn load_package_parses_entry_file() {
 	assert_eq!(root.children.len(), 1);
 
 	let child = &graph.modules[root.children[0].as_u32() as usize];
-	assert_eq!(child.parent, Some(graph.root));
+	let declaration = child.declaration.as_ref().unwrap();
+	assert_eq!(declaration.parent, graph.root);
 	assert_eq!(
-		child.name.and_then(|name| builder.interner.resolve(name)),
+		builder.interner.resolve(declaration.name.inner),
 		Some("math")
 	);
 
@@ -225,4 +226,41 @@ fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 
 	let child = &entry_package.modules[root.children[0].as_u32() as usize];
 	assert_eq!(child.file_path.as_str(), "/src/math.wx");
+}
+
+#[test]
+fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
+	// `module extra;` inside an inline `module utils { }` block is not a
+	// legal declaration site — unlike Rust, wx doesn't resolve it by
+	// accumulating a directory segment per inline level. It should be
+	// diagnosed, not silently ignored, and the surrounding file should
+	// still load its own top-level items normally.
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new("/main.wx"),
+			&VirtualFileSource::new(HashMap::from([(
+				AbsolutePath::new("/main.wx"),
+				"module utils { module extra; }\nfn works() -> i32 { 1 }"
+					.to_string(),
+			)])),
+		)
+		.expect("the entry file itself is still readable");
+	let graph = &builder.packages[package_id.as_u32() as usize];
+
+	assert_eq!(
+		graph.modules.len(),
+		1,
+		"the nested `extra` declaration should not cause a file to load"
+	);
+	assert!(
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::NestedModuleDeclaration.code())),
+		"expected E2006 (NestedModuleDeclaration), got: {:?}",
+		graph
+			.linker_diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
 }
