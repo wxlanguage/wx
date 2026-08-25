@@ -10,11 +10,12 @@ use crate::ast;
 
 mod manifest;
 pub use manifest::{
-	DependencySource, PackageManifest, PackageManifestKind, PackageName,
+	DependencySource, FormatManifest, PackageManifest, PackageManifestKind,
+	PackageName,
 };
 
 mod resolve;
-pub use resolve::{open_package, package_kind};
+pub use resolve::{open_manifest, package_kind};
 
 mod path;
 pub use path::{AbsolutePath, RelativePath};
@@ -511,7 +512,7 @@ impl CompilationUnitBuilder {
 	}
 
 	/// Marks an already-loaded package as this compilation's stdlib — used
-	/// by `open_package` when the root declares `"type": "std"` and so
+	/// by `open_manifest` when the root declares `"type": "std"` and so
 	/// provides the tagged items itself, which can't go through
 	/// [`Self::load_stdlib`] because its sources come from a manifest rather
 	/// than from [`STDLIB_FILES`].

@@ -97,6 +97,78 @@ async fn flush_logs(client: &Client, logs: Vec<String>) {
 	}
 }
 
+/// Accumulates named, timed steps for one logical operation — e.g. parsing
+/// a package as part of typechecking it, or parsing a package as part of
+/// formatting one of its files — so the whole dependency chain renders as
+/// one readable block instead of one independent log line per step with no
+/// visible relationship between them.
+struct Trace {
+	/// The file that caused this trace (the one edited/opened/formatted).
+	/// Its package root is whatever `wx.json`-bearing ancestor it shares a
+	/// path prefix with — no need to store that separately.
+	path: PathBuf,
+	steps: Vec<(&'static str, web_time::Duration)>,
+}
+
+impl Trace {
+	fn new(path: PathBuf) -> Self {
+		Self {
+			path,
+			steps: Vec::new(),
+		}
+	}
+
+	/// Times `f`, records its duration under `label`, and returns its
+	/// result unchanged — so callers thread this through exactly like the
+	/// bare `Instant::now()` calls it replaces, `?` included.
+	fn step<T>(&mut self, label: &'static str, f: impl FnOnce() -> T) -> T {
+		let start = web_time::Instant::now();
+		let result = f();
+		self.steps.push((label, start.elapsed()));
+		result
+	}
+
+	/// Renders the causing file and every recorded step as an indented
+	/// tree under `operation`, with the steps' total on the heading line
+	/// itself (it's a summary of the block, not a sibling step that ran).
+	/// Every line past the heading is indented two spaces so it reads as
+	/// part of this one log entry rather than the surrounding log list —
+	/// VS Code's Output panel only timestamp-prefixes a message's first
+	/// line, so the rest need their own visual cue to stay grouped:
+	/// ```text
+	/// typecheck — 1.664473ms
+	///   file: "/examples/pow/main.wx"
+	///   ├─ parse:      772.593µs
+	///   └─ typecheck:  891.88µs
+	/// ```
+	fn finish(&self, operation: &str) -> String {
+		let mut out = if self.steps.is_empty() {
+			operation.to_string()
+		} else {
+			let total: web_time::Duration =
+				self.steps.iter().map(|(_, d)| *d).sum();
+			format!("{operation} — {total:?}")
+		};
+		out.push_str(&format!("\n  file: {:?}", self.path));
+		let width = self
+			.steps
+			.iter()
+			.map(|(label, _)| label.len())
+			.max()
+			.unwrap_or(0)
+			+ 1;
+		let last = self.steps.len().saturating_sub(1);
+		for (i, (label, duration)) in self.steps.iter().enumerate() {
+			let branch = if i == last { "└─" } else { "├─" };
+			let label_colon = format!("{label}:");
+			out.push_str(&format!(
+				"\n  {branch} {label_colon:<width$}  {duration:?}"
+			));
+		}
+		out
+	}
+}
+
 #[derive(Clone)]
 struct OpenDocument {
 	text: String,
@@ -115,10 +187,19 @@ struct ServerState {
 	cached: HashMap<PathBuf, CompiledRoot>,
 	/// root -> files we last published diagnostics for. Needed to know which
 	/// files to clear when a root is dropped or a file leaves its owning
-	/// root; also doubles as the reverse (file -> owning root) index via
-	/// `owning_root`, so there's no separate `file_to_root` map to drift out
-	/// of sync with it.
+	/// root. Deliberately many-to-many, not a partition: a dependency file
+	/// legitimately appears here under every root whose compiled graph
+	/// reaches it, not just its own project's root.
 	published_by_root: HashMap<PathBuf, HashSet<PathBuf>>,
+	/// file -> the root `discover_package_root` returned for it, as of the
+	/// last `compute_refresh` call made for exactly that file. Kept
+	/// separate from `published_by_root` — that map answers "which files
+	/// does root R currently reach" (many-to-many, since a dependency file
+	/// is reachable from every root that depends on it) — this one answers
+	/// "what is file F's own project" (one answer per file, never derived
+	/// from the other map, only ever written here for the one file it was
+	/// just asked about).
+	own_root: HashMap<PathBuf, PathBuf>,
 }
 
 struct AnalysisResult {
@@ -567,67 +648,70 @@ async fn handle_command(
 					&path,
 				)?;
 
-				// Always reparse fresh from the live buffer rather than
-				// going through `cached`: format-on-save fires before
-				// `didSave`, so `cached` would still reflect the previous
-				// save. Parsing is cheap enough (~1ms on typical files) that
-				// there's no need to cache it across calls.
-				let mut logs = Vec::new();
-				let parse_result = parse_root(state, &root, &mut logs);
-				flush_logs(client, logs).await;
-				let graph = parse_result.ok()?;
-				let module = graph
-					.packages
-					.iter()
-					.flat_map(|cg| cg.modules.iter())
-					.find(|m| {
-						Path::new(m.file_path.as_str()) == path.as_path()
-					})?;
-				let has_errors = module.ast.diagnostics.iter().any(|d| {
-					matches!(
-						d.severity,
-						codespan_reporting::diagnostic::Severity::Error
-							| codespan_reporting::diagnostic::Severity::Bug
-					)
-				});
-				if has_errors {
-					return None;
-				}
-				let file = graph.files.get(module.file_id).ok()?;
-				let source = file.source.as_str();
-				let config = wx_fmt::RendererConfig {
-					indent_width: params.options.tab_size as u8,
-					..Default::default()
-				};
-				let fmt_start = web_time::Instant::now();
-				let formatted =
-					panic::catch_unwind(panic::AssertUnwindSafe(|| {
-						wx_fmt::format(
-							&module.ast,
-							&graph.interner,
-							source,
-							config,
+				// Computed synchronously so `?` can short-circuit freely on
+				// any failure without skipping the trace flush below —
+				// there's exactly one `.await` point for this whole
+				// command (the flush itself), not one per step.
+				let mut trace = Trace::new(path.clone());
+				let outcome = (|| {
+					// Always reparse fresh from the live buffer rather than
+					// going through `cached`: format-on-save fires before
+					// `didSave`, so `cached` would still reflect the
+					// previous save. Parsing is cheap enough (~1ms on
+					// typical files) that there's no need to cache it
+					// across calls.
+					let graph = parse_root(state, &root, &mut trace).ok()?;
+					let module = graph
+						.packages
+						.iter()
+						.flat_map(|cg| cg.modules.iter())
+						.find(|m| {
+							Path::new(m.file_path.as_str()) == path.as_path()
+						})?;
+					let has_errors = module.ast.diagnostics.iter().any(|d| {
+						matches!(
+							d.severity,
+							codespan_reporting::diagnostic::Severity::Error
+								| codespan_reporting::diagnostic::Severity::Bug
 						)
-					}))
-					.ok()?;
-				client
-					.log_message(
-						MessageType::LOG,
-						format!("formatting took {:?}", fmt_start.elapsed()),
-					)
-					.await;
-				let end = byte_to_position(
-					&graph.files,
-					module.file_id,
-					source.len(),
-				)?;
-				Some(vec![TextEdit {
-					range: Range {
-						start: Position::default(),
-						end,
-					},
-					new_text: formatted,
-				}])
+					});
+					if has_errors {
+						return None;
+					}
+					let file = graph.files.get(module.file_id).ok()?;
+					let source = file.source.as_str();
+					let config = wx_fmt::RendererConfig {
+						indent_width: params.options.tab_size as u8,
+						..Default::default()
+					};
+					let formatted = trace.step("render", || {
+						panic::catch_unwind(panic::AssertUnwindSafe(|| {
+							wx_fmt::format(
+								&module.ast,
+								&graph.interner,
+								source,
+								config,
+							)
+						}))
+						.ok()
+					})?;
+					let end = byte_to_position(
+						&graph.files,
+						module.file_id,
+						source.len(),
+					)?;
+					Some(vec![TextEdit {
+						range: Range {
+							start: Position::default(),
+							end,
+						},
+						new_text: formatted,
+					}])
+				})();
+
+				flush_logs(client, vec![trace.finish("format")]).await;
+
+				outcome
 			}
 			.await;
 			let _ = reply.send(result);
@@ -1068,7 +1152,8 @@ impl Backend {
 		self.client
 			.log_message(
 				MessageType::LOG,
-				format!("virtual_file_content uri={}", params.uri),
+				Trace::new(PathBuf::from(&params.uri))
+					.finish("virtual_file_content"),
 			)
 			.await;
 		let filename =
@@ -1259,16 +1344,6 @@ fn resolve_uri<'a>(
 	})
 }
 
-/// Finds which root `file`'s diagnostics were last published under, by
-/// scanning `published_by_root` — the reverse of `ServerState::cached`'s
-/// forward (root -> files) direction, computed on demand instead of kept in
-/// a second `file -> root` map.
-fn owning_root<'a>(state: &'a ServerState, file: &Path) -> Option<&'a Path> {
-	state.published_by_root.iter().find_map(|(root, files)| {
-		files.contains(file).then_some(root.as_path())
-	})
-}
-
 /// Whether any file in `tracked` (a root's `compiled_versions`) has moved on
 /// from the version it was last built/parsed against.
 fn versions_stale(
@@ -1290,27 +1365,54 @@ pub(crate) fn compute_refresh(
 	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
-	let previous_root = owning_root(state, file_path).map(Path::to_path_buf);
+	let previous_root = state.own_root.get(file_path).cloned();
 	let current_root = discover_package_root(
 		&state.open_documents,
 		&state.workspace_folders,
 		file_path,
 	);
+	match &current_root {
+		Some(root) => {
+			state.own_root.insert(file_path.to_path_buf(), root.clone());
+		}
+		None => {
+			state.own_root.remove(file_path);
+		}
+	}
 	let mut publications = Vec::new();
 
-	if let Some(root) = current_root.as_ref() {
-		let analysis = analyze_root(state, root, logs);
-		publications.extend(collect_publish_operations(state, root, analysis));
+	// Clearing the old root first, then publishing the current state
+	// second, matters once both can mention `file_path`: LSP publish
+	// replaces a URI's whole diagnostic list, so whichever of these two
+	// runs last is what the client ends up showing. Current state should
+	// always win over a stale clear.
+	if let Some(old_root) = &previous_root {
+		if current_root.as_ref() != Some(old_root) {
+			publications.extend(collect_clear_operations(state, old_root));
+		}
 	}
 
-	if previous_root != current_root {
-		if let Some(old_root) = previous_root {
-			if current_root.as_ref() != Some(&old_root) {
-				publications.extend(collect_clear_operations(state, &old_root));
-			}
-		} else if current_root.is_none() {
-			publications.push((file_path.to_path_buf(), Vec::new()));
+	match current_root.as_ref() {
+		Some(root) => {
+			let analysis = analyze_root(state, root, file_path, logs);
+			publications
+				.extend(collect_publish_operations(state, root, analysis));
 		}
+		// Not part of any project. An open buffer gets a visible hint
+		// instead of silence; anything else (e.g. this call is running
+		// because the file just closed) just clears whatever hint may
+		// have been showing — there's no document left to point one at.
+		None => match state.open_documents.get(file_path) {
+			Some(_) => {
+				publications.push((
+					file_path.to_path_buf(),
+					vec![orphan_file_diagnostic()],
+				));
+			}
+			None => {
+				publications.push((file_path.to_path_buf(), Vec::new()));
+			}
+		},
 	}
 
 	publications
@@ -1319,25 +1421,32 @@ pub(crate) fn compute_refresh(
 pub(crate) fn analyze_root(
 	state: &mut ServerState,
 	root: &Path,
+	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> AnalysisResult {
 	// Skip TIR rebuild if no open file's version has advanced since last compile.
 	if let Some(compiled) = state.cached.get(root) {
 		if !versions_stale(&compiled.compiled_versions, &state.open_documents) {
-			logs.push(format!("TIR cache hit for {:?}", root));
+			logs.push(
+				Trace::new(file_path.to_path_buf())
+					.finish("typecheck — cache hit"),
+			);
 			return analysis_from_compiled_root(compiled);
 		}
 	}
 
-	let graph = match parse_root(state, root, logs) {
+	let mut trace = Trace::new(file_path.to_path_buf());
+	let graph = match parse_root(state, root, &mut trace) {
 		Ok(graph) => graph,
 		Err(()) => {
 			state.cached.remove(root);
+			logs.push(trace.finish("typecheck"));
 			return analysis_from_missing_entry_file(root);
 		}
 	};
 
-	let compiled = compile_root(state, graph, logs);
+	let compiled = compile_root(state, graph, &mut trace);
+	logs.push(trace.finish("typecheck"));
 	let result = analysis_from_compiled_root(&compiled);
 	state.cached.insert(root.to_path_buf(), compiled);
 	result
@@ -1393,7 +1502,7 @@ fn collect_clear_operations(
 fn compile_root(
 	state: &ServerState,
 	mut graph: vfs::CompilationUnit,
-	logs: &mut Vec<String>,
+	trace: &mut Trace,
 ) -> CompiledRoot {
 	let compiled_versions = graph
 		.packages
@@ -1408,9 +1517,7 @@ fn compile_root(
 			(path, ver)
 		})
 		.collect();
-	let tir_start = web_time::Instant::now();
-	let tir = TIR::build(&mut graph);
-	logs.push(format!("typechecking took {:?}", tir_start.elapsed()));
+	let tir = trace.step("typecheck", || TIR::build(&mut graph));
 	let symbol_index = build_symbol_index(&tir, &graph.interner);
 	CompiledRoot {
 		graph,
@@ -1433,19 +1540,11 @@ fn compile_root(
 fn parse_root(
 	state: &ServerState,
 	root: &Path,
-	logs: &mut Vec<String>,
+	trace: &mut Trace,
 ) -> std::result::Result<vfs::CompilationUnit, ()> {
 	let overlay = OverlayFileSource::new(&state.open_documents);
-	let mut builder = vfs::CompilationUnitBuilder::new();
-	let parse_start = web_time::Instant::now();
-	builder.load_stdlib();
-	let root_id = builder.load_binary(
-		vfs::AbsolutePath::new(root.to_str().unwrap_or_default()),
-		&overlay,
-	)?;
-	let graph = builder.build(root_id);
-	logs.push(format!("parsing took {:?}", parse_start.elapsed()));
-	Ok(graph)
+	let dir = vfs::AbsolutePath::new(root.to_str().unwrap_or_default());
+	trace.step("parse", || vfs::open_manifest(dir, &overlay))
 }
 
 fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
@@ -1493,11 +1592,13 @@ fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 	}
 }
 
-/// The only way `parse_root` can still fail: the entry file itself couldn't
-/// be read (e.g. deleted between `discover_package_root`'s existence check and
-/// this call). Everything else — missing/ambiguous child modules — is now a
-/// diagnostic on the graph rather than a hard failure, so this is a rare,
-/// narrow case rather than the general error path it used to be.
+/// The only way `parse_root` can still fail now that `discover_package_root`
+/// has already confirmed a `wx.json` exists: that manifest fails to parse,
+/// or its `entry` can't be read (e.g. either was deleted between
+/// `discover_package_root`'s existence check and this call). Everything
+/// else — missing/ambiguous child modules, dependency resolution problems —
+/// is a diagnostic on the graph rather than a hard failure, so this is a
+/// rare, narrow case rather than the general error path it used to be.
 fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 	let mut diagnostics_by_file = HashMap::new();
 	let mut owned_files = HashSet::new();
@@ -1511,7 +1612,11 @@ fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 			code: None,
 			code_description: None,
 			source: Some("wx-lsp".to_string()),
-			message: format!("failed to read file `{}`", root.display()),
+			message: format!(
+				"failed to load the wx project at `{}` (its `wx.json` may \
+				 not parse, or its `entry` may not be readable)",
+				root.display()
+			),
 			related_information: None,
 			tags: None,
 			data: None,
@@ -1521,6 +1626,42 @@ fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 	AnalysisResult {
 		diagnostics_by_file,
 		owned_files,
+	}
+}
+
+/// A file with no `wx.json` ancestor isn't part of any project the LSP can
+/// resolve. Surfaced as a visible, whole-file hint rather than silence —
+/// mirrors rust-analyzer's own "unlinked file" diagnostic, including its
+/// trick for spanning the whole document without measuring it: an
+/// intentionally out-of-range end position, which compliant clients clamp
+/// to the real end of the document, needing no scan of `text` at all.
+/// Tagged `UNNECESSARY` so editors render the file faded, making "wx-lsp
+/// doesn't see this file" a visual property of the file itself, not just
+/// an absence of red squiggles.
+fn orphan_file_diagnostic() -> Diagnostic {
+	Diagnostic {
+		range: Range {
+			start: Position {
+				line: 0,
+				character: 0,
+			},
+			end: Position {
+				line: u32::MAX,
+				character: u32::MAX,
+			},
+		},
+		severity: Some(DiagnosticSeverity::INFORMATION),
+		code: None,
+		code_description: None,
+		source: Some("wx-lsp".to_string()),
+		message: "This file is not part of a wx project, so wx-lsp \
+		          can't offer IDE services for it.\n\nAdd a `wx.json` in \
+		          this directory (or an ancestor) with an `entry` that \
+		          reaches this file."
+			.to_string(),
+		related_information: None,
+		tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+		data: None,
 	}
 }
 
@@ -2469,17 +2610,21 @@ fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
 	}
 }
 
+/// Finds the project directory governing `file_path` — the nearest
+/// ancestor (bounded by `workspace_folders`, when given) with a `wx.json`
+/// — or `None` if there is no such ancestor. Returns the *directory*, not
+/// an entry file: which file compilation actually starts from is
+/// `wx.json`'s own `entry` field, resolved later by `vfs::open_manifest`,
+/// not a filename convention this function would have to know about.
+///
+/// No special case for a file itself being named `main.wx` — that
+/// convention doesn't exist anymore. Every file, `main.wx` or not,
+/// belongs to a project only by virtue of a `wx.json` somewhere above it.
 pub(crate) fn discover_package_root(
 	open_documents: &HashMap<PathBuf, OpenDocument>,
 	workspace_folders: &[PathBuf],
 	file_path: &Path,
 ) -> Option<PathBuf> {
-	if file_path.file_name().is_some_and(|name| name == "main.wx")
-		&& (open_documents.contains_key(file_path) || file_path.exists())
-	{
-		return Some(file_path.to_path_buf());
-	}
-
 	let mut current = file_path.parent();
 	while let Some(dir) = current {
 		if !workspace_folders.is_empty()
@@ -2489,9 +2634,9 @@ pub(crate) fn discover_package_root(
 			continue;
 		}
 
-		let candidate = dir.join("main.wx");
+		let candidate = dir.join("wx.json");
 		if open_documents.contains_key(&candidate) || candidate.exists() {
-			return Some(candidate);
+			return Some(dir.to_path_buf());
 		}
 		current = dir.parent();
 	}
@@ -2527,8 +2672,14 @@ fn file_id_to_uri(files: &vfs::Files, file_id: FileId) -> Option<Uri> {
 	let file = files.get(file_id).ok()?;
 	match file.origin {
 		vfs::FileOrigin::Local => path_to_file_uri(Path::new(&file.name)),
+		// `file.name` is already `/`-prefixed (the embedded stdlib's own
+		// `AbsolutePath` convention, e.g. `/main.wx`), so no separator goes
+		// between `wx://std` and it — `wx://std/main.wx`, not
+		// `wx://std//main.wx`. `virtual_file_content`'s `strip_prefix("wx://std")`
+		// expects exactly this: a leading-slash remainder it can feed
+		// straight into `stdlib_file`/`AbsolutePath::new`.
 		vfs::FileOrigin::Virtual => {
-			Uri::from_str(&format!("wx://std/{}", file.name)).ok()
+			Uri::from_str(&format!("wx://std{}", file.name)).ok()
 		}
 	}
 }

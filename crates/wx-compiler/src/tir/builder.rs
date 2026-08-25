@@ -7707,7 +7707,10 @@ impl<'ast> Builder<'ast, '_> {
 		)? {
 			Some(kind) => kind,
 			None => {
-				todo!();
+				self.tir.diagnostics.push(report_undeclared_type(
+					SourceSpan::new(file_id, last.ident.span),
+				));
+				return Err(());
 			}
 		};
 		match kind {
@@ -11481,17 +11484,13 @@ impl<'ast> Builder<'ast, '_> {
 			return Err(());
 		}
 		match &self.tir.types[namespace.inner.as_usize()] {
+			// No access recorded for `namespace` itself here: a
+			// `Type::Namespace` value only ever comes from
+			// `symbol_kind_to_type`, whose only two call sites both call
+			// `record_type_kind_access` immediately beforehand, at the
+			// exact segment span that produced it — recording it again
+			// here would duplicate that entry.
 			Type::Namespace { namespace_idx } => {
-				if let Type::Namespace { namespace_idx } =
-					&self.tir.types[namespace.inner.as_usize()]
-				{
-					self.tir.namespaces[*namespace_idx as usize].accesses.push(
-						SourceSpan::new(
-							resolve_context.file_id,
-							namespace.span,
-						),
-					)
-				};
 				let namespace_idx = *namespace_idx;
 				let kind = self.resolve_pending_namespace_symbol(
 					resolve_context.namespace,
@@ -11705,6 +11704,21 @@ impl<'ast> Builder<'ast, '_> {
 					.accesses
 					.push(SourceSpan::new(file_id, span));
 			}
+			// The canonical place a namespace reference gets recorded —
+			// every `Type::Namespace` value is produced by
+			// `symbol_kind_to_type`, and both of its call sites reach it
+			// through this same function, right here, at the exact segment
+			// span that resolved it. Callers that go on to use the result
+			// as a namespace to dispatch a further member through
+			// (`resolve_namespace_type_member`, `build_namespace_member_expression`)
+			// must not *also* record it there — that would duplicate this
+			// entry, which is exactly the bug this arm's addition caused
+			// before those two calls were removed.
+			SymbolKind::Module { namespace_idx } => {
+				self.tir.namespaces[namespace_idx as usize]
+					.accesses
+					.push(SourceSpan::new(file_id, span));
+			}
 			_ => {}
 		}
 	}
@@ -11888,6 +11902,12 @@ impl<'ast> Builder<'ast, '_> {
 
 	/// Core namespace-member dispatch: look up `member` inside a type whose
 	/// `TypeIndex` has already been resolved.
+	///
+	/// No access recorded for `namespace` itself here: a `Type::Namespace`
+	/// value only ever comes from `symbol_kind_to_type`, whose only two
+	/// call sites both call `record_type_kind_access` immediately
+	/// beforehand, at the exact segment span that produced it — recording
+	/// it again here would duplicate that entry.
 	fn build_namespace_member_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
@@ -11895,16 +11915,6 @@ impl<'ast> Builder<'ast, '_> {
 		segment: &ast::PathSegment,
 		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let file_id = func_ctx.resolve_context.file_id;
-
-		if let Type::Namespace { namespace_idx } =
-			&self.tir.types[namespace.inner.as_usize()]
-		{
-			self.tir.namespaces[*namespace_idx as usize]
-				.accesses
-				.push(SourceSpan::new(file_id, namespace.span))
-		};
-
 		let resolved = self.resolve_namespace_member(
 			func_ctx.resolve_context,
 			namespace,

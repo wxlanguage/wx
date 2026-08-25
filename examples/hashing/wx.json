@@ -1,0 +1,10 @@
+{
+    "type": "bin",
+    "entry": "main.wx",
+    "dependencies": {
+        "pow": {
+            "type": "local",
+            "path": "../pow"
+        }
+    }
+}

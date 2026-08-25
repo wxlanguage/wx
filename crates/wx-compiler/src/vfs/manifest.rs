@@ -4,19 +4,52 @@ use super::{AbsolutePath, RelativePath};
 use crate::ast;
 
 /// A parsed `wx.json`. Resolved into `PackageGraph`s by
-/// [`super::resolve::open_package`].
+/// [`super::resolve::open_manifest`].
 ///
-/// A struct wrapping a tagged enum, not the enum alone, so `dependencies` is
-/// declared once and shared by every kind instead of duplicated per variant.
+/// Flat rather than nesting `type`/`entry` under a `"package"` object:
+/// there's no longer a second, package-scoped namespace of keys to justify
+/// the nesting now that a package has no name of its own to put in there
+/// either — every key here just is a property of this manifest.
 ///
 /// Unknown keys are ignored rather than rejected: `wx.json` is expected to
-/// grow further sections (`meta`, `format`), and a manifest written for a
-/// newer wx should still load on an older one rather than failing outright.
+/// grow further top-level keys (`meta`), and a manifest written for a newer
+/// wx should still load on an older one rather than failing outright.
 #[derive(serde::Deserialize)]
 pub struct PackageManifest {
-	pub package: PackageManifestKind,
+	#[serde(rename = "type")]
+	pub kind: PackageManifestKind,
+	/// Where compilation starts, relative to this manifest's own directory
+	/// — required, not defaulted to a conventional filename like `main.wx`,
+	/// so a directory argument never has to guess which file is the root.
+	/// The same field regardless of `kind`: entry-point resolution doesn't
+	/// vary with what kind of package this is.
+	pub entry: RelativePath,
 	#[serde(default)]
 	pub dependencies: HashMap<PackageName, DependencySource>,
+	#[serde(default)]
+	pub format: FormatManifest,
+}
+
+/// The optional `"format"` section: `wx.json`'s copy of `wx-fmt`'s
+/// `RendererConfig`, one field looser. Lives here rather than as
+/// `wx_fmt::RendererConfig` itself — `wx-fmt` depends on `wx-compiler`, not
+/// the reverse, so this crate has no way to name that type. `wx-fmt` reads
+/// this struct directly and overlays whatever's `Some` onto
+/// `RendererConfig::default()`; there's deliberately no second, duplicate
+/// set of these three fields anywhere.
+///
+/// Every field optional and defaulted, at both the struct level (a manifest
+/// with no `"format"` key at all) and per-field (one that sets only e.g.
+/// `max_line_width`) — a manifest should be able to override a single
+/// setting without restating the other two.
+#[derive(serde::Deserialize, Default, Clone, Copy)]
+pub struct FormatManifest {
+	#[serde(default)]
+	pub max_line_width: Option<u32>,
+	#[serde(default)]
+	pub indent_width: Option<u8>,
+	#[serde(default)]
+	pub trailing_comma: Option<bool>,
 }
 
 /// A `dependencies` key: the name a package is known by inside the package
@@ -61,17 +94,23 @@ impl PackageManifest {
 	}
 }
 
-/// What `wx.json`'s `"package"` object deserializes to. Distinct from
-/// [`super::PackageKind`] (the resolved runtime kind on `PackageGraph`) —
-/// this one is purely what the manifest's `"type"` field says.
+/// What `wx.json`'s top-level `"type"` field deserializes to. Distinct
+/// from [`super::PackageKind`] (the resolved runtime kind on
+/// `PackageGraph`) — this one is purely what the manifest says.
 ///
 /// No variant carries a name. What a package is called is decided by
 /// whoever depends on it (its `dependencies` key), so a self-declared name
 /// would be either ignored or a second, conflicting source of truth. A
 /// globally-unique registry identity is a separate future concern
 /// (`meta.name`), not this.
+///
+/// A plain fieldless enum, not internally tagged — there's no longer a
+/// nested `"package"` object for `#[serde(tag = "type")]` to discriminate
+/// into; `PackageManifest` itself carries the `"type"` key as an ordinary
+/// field (renamed via `#[serde(rename = "type")]`), and every unit variant
+/// here deserializes directly from that field's plain string value.
 #[derive(serde::Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum PackageManifestKind {
 	Lib,
 	Bin,
@@ -169,27 +208,78 @@ mod tests {
 	#[test]
 	fn manifest_parses_valid_lib_package() {
 		let manifest =
-			PackageManifest::parse(r#"{ "package": { "type": "lib" } }"#)
+			PackageManifest::parse(r#"{ "type": "lib", "entry": "main.wx" }"#)
 				.expect("valid lib manifest should parse");
 
-		assert!(matches!(manifest.package, PackageManifestKind::Lib));
+		assert!(matches!(manifest.kind, PackageManifestKind::Lib));
+		assert_eq!(manifest.entry.as_str(), "main.wx");
 		assert!(manifest.dependencies.is_empty());
+	}
+
+	#[test]
+	fn manifest_defaults_format_section_when_absent() {
+		let manifest =
+			PackageManifest::parse(r#"{ "type": "lib", "entry": "main.wx" }"#)
+				.expect("valid lib manifest should parse");
+
+		assert_eq!(manifest.format.max_line_width, None);
+		assert_eq!(manifest.format.indent_width, None);
+		assert_eq!(manifest.format.trailing_comma, None);
+	}
+
+	#[test]
+	fn manifest_parses_full_format_section() {
+		let manifest = PackageManifest::parse(
+			r#"{
+				"type": "lib",
+				"entry": "main.wx",
+				"format": {
+					"max_line_width": 100,
+					"indent_width": 2,
+					"trailing_comma": false
+				}
+			}"#,
+		)
+		.expect("valid format section should parse");
+
+		assert_eq!(manifest.format.max_line_width, Some(100));
+		assert_eq!(manifest.format.indent_width, Some(2));
+		assert_eq!(manifest.format.trailing_comma, Some(false));
+	}
+
+	/// A manifest should be able to override a single setting without
+	/// restating the other two.
+	#[test]
+	fn manifest_format_section_fields_are_individually_optional() {
+		let manifest = PackageManifest::parse(
+			r#"{
+				"type": "lib",
+				"entry": "main.wx",
+				"format": { "max_line_width": 100 }
+			}"#,
+		)
+		.expect("a partial format section should parse");
+
+		assert_eq!(manifest.format.max_line_width, Some(100));
+		assert_eq!(manifest.format.indent_width, None);
+		assert_eq!(manifest.format.trailing_comma, None);
 	}
 
 	#[test]
 	fn manifest_parses_std_package() {
 		let manifest =
-			PackageManifest::parse(r#"{ "package": { "type": "std" } }"#)
+			PackageManifest::parse(r#"{ "type": "std", "entry": "main.wx" }"#)
 				.expect("valid std manifest should parse");
 
-		assert!(matches!(manifest.package, PackageManifestKind::Std));
+		assert!(matches!(manifest.kind, PackageManifestKind::Std));
 	}
 
 	#[test]
 	fn manifest_parses_valid_bin_package_with_dependencies() {
 		let manifest = PackageManifest::parse(
 			r#"{
-				"package": { "type": "bin" },
+				"type": "bin",
+				"entry": "main.wx",
 				"dependencies": {
 					"somelib": { "type": "local", "path": "../somelib" }
 				}
@@ -197,7 +287,7 @@ mod tests {
 		)
 		.expect("valid bin manifest should parse");
 
-		assert!(matches!(manifest.package, PackageManifestKind::Bin));
+		assert!(matches!(manifest.kind, PackageManifestKind::Bin));
 		match dependency(&manifest, "somelib") {
 			Some(DependencySource::Local { path }) => {
 				assert_eq!(path.as_str(), "../somelib")
@@ -212,24 +302,31 @@ mod tests {
 	#[test]
 	fn manifest_ignores_stale_package_name() {
 		let manifest = PackageManifest::parse(
-			r#"{ "package": { "type": "lib", "name": "std" } }"#,
+			r#"{ "type": "lib", "entry": "main.wx", "name": "std" }"#,
 		)
 		.expect("an unknown key should be ignored, not rejected");
 
-		assert!(matches!(manifest.package, PackageManifestKind::Lib));
+		assert!(matches!(manifest.kind, PackageManifestKind::Lib));
 	}
 
 	#[test]
 	fn manifest_rejects_invalid_package_type() {
 		let result =
-			PackageManifest::parse(r#"{ "package": { "type": "wat" } }"#);
+			PackageManifest::parse(r#"{ "type": "wat", "entry": "main.wx" }"#);
 		assert!(result.is_err(), "an unrecognized `type` should fail");
+	}
+
+	#[test]
+	fn manifest_rejects_missing_entry() {
+		let result = PackageManifest::parse(r#"{ "type": "lib" }"#);
+		assert!(result.is_err(), "a missing `entry` should fail");
 	}
 
 	fn parse_with_dependency_key(key: &str) -> Result<PackageManifest, ()> {
 		PackageManifest::parse(&format!(
 			r#"{{
-				"package": {{ "type": "bin" }},
+				"type": "bin",
+				"entry": "main.wx",
 				"dependencies": {{
 					"{key}": {{ "type": "local", "path": "../somelib" }}
 				}}
@@ -271,7 +368,8 @@ mod tests {
 	fn manifest_rejects_unrecognized_dependency_type() {
 		let result = PackageManifest::parse(
 			r#"{
-				"package": { "type": "bin" },
+				"type": "bin",
+				"entry": "main.wx",
 				"dependencies": {
 					"somelib": { "type": "remote", "url": "https://example.com" }
 				}

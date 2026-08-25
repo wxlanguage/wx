@@ -11310,6 +11310,71 @@ fn test_where_clause_duplicate_binding_name_reports_error() {
 	);
 }
 
+/// Regression test: `resolve_path_segments_as_bound`'s final-segment lookup
+/// (`module::Missing`) used to hit a bare `todo!()` when the name wasn't
+/// found in the namespace, panicking the whole compilation (and, in the
+/// LSP, the single actor task that owns all its state — killing every
+/// language feature until the client noticed and respawned the server).
+/// It must report an ordinary diagnostic instead.
+#[test]
+fn test_qualified_bound_with_undeclared_member_reports_diagnostic_not_panic() {
+	let case = TestCase::new(indoc! {"
+        module ns {
+            pub trait Marker {}
+        }
+
+        fn f<T: ns::Missing>() {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredType),
+		"expected an undeclared-type diagnostic, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// Regression test: a bare identifier that resolves to a module (the first
+/// segment of a qualified bound like `ns::Marker`) went through
+/// `record_type_kind_access`, whose `match` had no arm for
+/// `SymbolKind::Module` — so the namespace's own `accesses` list never
+/// gained an entry for that token, even though the trait it named
+/// (`Marker`) was recorded correctly. Hover/go-to-definition/semantic
+/// highlighting had nothing to find at the `ns` token as a result.
+#[test]
+fn test_qualified_bound_namespace_segment_records_access() {
+	let case = TestCase::new(indoc! {"
+        module ns {
+            pub trait Marker {}
+        }
+
+        fn f<T: ns::Marker>(_x: T) {}
+    "});
+	assert!(
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| matches!(d.severity, Severity::Error | Severity::Bug)),
+		"expected no error diagnostics; got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+
+	let has_namespace_access =
+		case.tir.namespaces.iter().any(|ns| !ns.accesses.is_empty());
+	assert!(
+		has_namespace_access,
+		"expected some namespace to have a recorded access for the `ns` \
+		 token in `T: ns::Marker`"
+	);
+}
+
 // ── match ────────────────────────────────────────────────────────────────
 
 #[test]

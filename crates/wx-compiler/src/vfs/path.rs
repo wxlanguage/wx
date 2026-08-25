@@ -114,7 +114,7 @@ impl<'de> serde::Deserialize<'de> for RelativePath {
 /// treats `/` as *its own* root purely by convention, stripping it back
 /// off before consulting its in-memory map — see its own doc comment).
 /// Every frontend is responsible for producing one of these before
-/// calling into [`super::open_package`]/[`super::CompilationUnitBuilder`]
+/// calling into [`super::open_manifest`]/[`super::CompilationUnitBuilder`]
 /// — nothing past that boundary ever has to wonder whether a path is
 /// absolute or relative, because it always is.
 ///

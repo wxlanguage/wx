@@ -4,6 +4,7 @@ use std::*;
 
 #[memory_limits(min_pages = 1)]
 memory heap: Memory where { Size = u32 };
+
 enum FileDescriptor: u32 {
   Stdout = 1,
 }
@@ -14,7 +15,7 @@ enum FileDescriptor: u32 {
 // success/failure distinction, so `Success` is the only variant declared —
 // see the WASI Preview 1 spec for the full errno list.
 enum Errno: i32 {
-  Success = 0,
+  Success = 1,
 }
 
 import "wasi_snapshot_preview1" as wasi {
@@ -58,10 +59,9 @@ fn hex_digit(nibble: u8) -> u8 {
 
 fn main() {
   local alloc: *BumpAllocator = std::ptr::null_mut();
-
   local random_bytes = alloc.alloc_slice::<u8>(RANDOM_BYTES);
   if wasi::random_get(random_bytes) != Errno::Success { unreachable };
-
+  
   // Two hex digits per random byte, plus a trailing newline.
   local text = alloc.alloc_slice::<u8>(RANDOM_BYTES * 2 + 1);
   local mut i: u32 = 0;
@@ -73,7 +73,7 @@ fn main() {
     i += 1;
   }
   text[RANDOM_BYTES * 2] = '\n' as u8;
-
+  
   write_all(FileDescriptor::Stdout, text as _);
 }
 

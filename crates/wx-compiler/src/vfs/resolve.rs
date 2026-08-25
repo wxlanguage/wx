@@ -9,8 +9,8 @@ use super::{
 	PackageManifest, PackageManifestKind, PackageName, RelativePath,
 };
 
-/// Maps a manifest's declared `"package"` kind to the resolved
-/// `PackageKind` used at runtime. No name is involved: what a package is
+/// Maps a manifest's declared `"type"` to the resolved `PackageKind` used
+/// at runtime. No name is involved: what a package is
 /// called is decided by whoever depends on it, and is threaded separately
 /// (see `open_manifest_package`).
 ///
@@ -28,31 +28,26 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 	}
 }
 
-/// Loads whatever `entry` points at, resolving a `wx.json` manifest if one
-/// governs it — the single entry point every frontend (CLI, LSP, wasm,
-/// tests) should use instead of hand-rolling the `load_stdlib()` +
-/// `load_binary()` dance.
+/// Loads the package whose manifest lives at `{dir}/wx.json` as the root of
+/// a compilation, resolving every dependency it declares. Requires a
+/// manifest to exist — there's no anonymous, manifest-less fallback; every
+/// compilation belongs to a project, the same rule `wx format` follows.
 ///
-/// `entry` is always absolute — every frontend is responsible for making
-/// it so before calling this (joining a CLI argument against
+/// `dir` is always absolute — every frontend is responsible for making it
+/// so before calling this (joining a CLI argument against
 /// `std::env::current_dir()`, or following the synthetic `/`-rooted
-/// convention `VirtualFileSource`-backed compilations use). Nothing past
-/// this point ever has to wonder whether a path is absolute or relative.
+/// convention `VirtualFileSource`-backed compilations use).
 ///
-/// - No `wx.json` in `entry`'s containing directory: today's exact
-///   anonymous behavior — `load_stdlib()` then `load_binary(entry, ..)`,
-///   in that order.
-/// - `wx.json` found: `entry` itself is ignored from here on — the entry
-///   file is always `main.wx` next to the manifest, regardless of
-///   `"type"` (see the design doc for why the filename never varies with
-///   kind) — and every `dependencies` entry is resolved recursively,
-///   relative to *its declaring* manifest's own directory. The embedded
-///   stdlib is loaded first, before the root and before any dependency,
-///   unless the root declares `"type": "std"` and so provides it itself.
-///   That is the whole of the implicit-`std` rule: the stdlib is not
-///   replaceable, so there is no override path and no reserved-key check —
-///   a dependency bound to the key `std` simply loses the first-claim-wins
-///   race and gets `DuplicatePackageName`.
+/// The manifest's `entry` field (relative to `dir`) says where compilation
+/// starts, regardless of `type` — see the design doc for why entry-point
+/// resolution never varies with kind. Every `dependencies` entry is then
+/// resolved recursively, relative to *its declaring* manifest's own
+/// directory. The embedded stdlib is loaded first, before the root and
+/// before any dependency, unless the root declares `"type": "std"` and so
+/// provides it itself. That is the whole of the implicit-`std` rule: the
+/// stdlib is not replaceable, so there is no override path and no
+/// reserved-key check — a dependency bound to the key `std` simply loses
+/// the first-claim-wins race and gets `DuplicatePackageName`.
 ///
 /// `source` is shared, unchanged, across every package this resolves —
 /// correct today only because `Local` is the only `DependencySource`
@@ -63,35 +58,27 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 /// can't be threaded through `&impl FileSource` here without widening it
 /// to `&dyn FileSource` first — deliberately not done now, since that
 /// variant is explicitly out of scope for this plan.
-pub fn open_package(
-	entry: AbsolutePath,
+pub fn open_manifest(
+	dir: AbsolutePath,
 	source: &impl FileSource,
 ) -> Result<CompilationUnit, ()> {
 	let mut builder = CompilationUnitBuilder::new();
-	let dir = entry.parent();
-	let manifest_path = dir.join(&RelativePath::new("wx.json"));
 
-	if !source.exists(&manifest_path) {
-		builder.load_stdlib();
-		let root_id = builder.load_binary(entry, source)?;
-		return Ok(builder.build(root_id));
-	}
-
-	// The root is loaded here rather than through `open_manifest_package`
-	// because two things are true of it and of nothing else: it has no name
+	// Loaded here rather than through `open_manifest_package` because two
+	// things are true of the root and of nothing else: it has no name
 	// (nothing in this compilation depends on it), and its `"type"` is the
 	// only one that can decide whether a stdlib is loaded at all. Both are
 	// properties of *being* the root, so threading them through the
 	// recursion would mean every dependency carrying parameters only the
 	// outermost call could ever use.
 	let manifest = read_manifest(&dir, source)?;
-	let entry_path = dir.join(&RelativePath::new("main.wx"));
-	let kind = package_kind(&manifest.package);
+	let entry_path = dir.join(&manifest.entry);
+	let kind = package_kind(&manifest.kind);
 
 	// The two kinds differ in *when* the stdlib is established relative to
 	// the root, which is the whole of the implicit-`std` rule — so the
 	// ordering lives in the arms rather than in flags read further down.
-	let root_id = match manifest.package {
+	let root_id = match manifest.kind {
 		// The root provides the tagged items itself, so no embedded stdlib
 		// is loaded. Marked after loading, so it isn't listed as its own
 		// dependency; everything resolved below still sees it.
@@ -122,7 +109,7 @@ pub fn open_package(
 }
 
 /// Reads and parses the `wx.json` governing `dir`. Shared by the root (in
-/// `open_package`) and every dependency (in `open_manifest_package`), which
+/// `open_manifest`) and every dependency (in `open_manifest_package`), which
 /// is the only reason a manifest's location is expressed once rather than at
 /// each call site.
 fn read_manifest(
@@ -146,9 +133,9 @@ fn read_manifest(
 /// it far enough to name it in a diagnostic.
 ///
 /// Only ever called for dependencies — the root is loaded directly by
-/// `open_package`. Being in this function is therefore itself the proof that
-/// a package is *not* the root, which is what makes the `"type": "std"`
-/// check below need no flag to tell the two cases apart.
+/// `open_manifest`. Being in this function is therefore itself the proof
+/// that a package is *not* the root, which is what makes the `"type":
+/// "std"` check below need no flag to tell the two cases apart.
 ///
 /// Registers itself in `in_progress` under `identity` as soon as it has an
 /// id and *before* recursing, so a dependency edge that points back here
@@ -164,10 +151,11 @@ fn open_manifest_package(
 	in_progress: &mut HashMap<ResolvedDependency, PackageId>,
 ) -> Result<PackageId, ()> {
 	let manifest = read_manifest(dir, source)?;
+	let entry_path = dir.join(&manifest.entry);
 
 	let id = builder.load_package(
-		package_kind(&manifest.package),
-		dir.join(&RelativePath::new("main.wx")),
+		package_kind(&manifest.kind),
+		entry_path,
 		source,
 	)?;
 	in_progress.insert(identity.clone(), id);
@@ -179,7 +167,7 @@ fn open_manifest_package(
 	// package would load as an ordinary library while its `#[tag = "..."]`
 	// items still landed in the one compilation-wide `tagged_items` map,
 	// silently competing for `add`/`sub`/... against the real stdlib's.
-	if matches!(manifest.package, PackageManifestKind::Std) {
+	if matches!(manifest.kind, PackageManifestKind::Std) {
 		builder.packages[id.as_usize()]
 			.linker_diagnostics
 			.push(report_std_package_as_dependency(name.as_str()));
@@ -326,29 +314,13 @@ mod tests {
 	}
 
 	#[test]
-	fn plain_binary_with_no_manifest_gets_std() {
-		let source = virtual_source(&[("/main.wx", "fn add() {}")]);
-		let compilation =
-			open_package(AbsolutePath::new("/main.wx"), &source).unwrap();
-
-		assert_eq!(compilation.packages.len(), 2, "root + std");
-		assert_eq!(
-			dependency_of(&compilation, compilation.root_package, "std"),
-			Some(compilation.stdlib_package),
-			"every package can reach the stdlib without declaring it"
-		);
-		let root = &compilation.packages[compilation.root_package.as_usize()];
-		assert!(matches!(root.kind, PackageKind::Binary));
-	}
-
-	#[test]
 	fn manifested_binary_with_no_dependencies_gets_std() {
 		let source = virtual_source(&[
-			("/app/wx.json", r#"{ "package": { "type": "bin" } }"#),
+			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
 			("/app/main.wx", "fn add() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(compilation.packages.len(), 2, "root + std");
 		assert_eq!(
@@ -361,14 +333,43 @@ mod tests {
 		assert_eq!(root.entry_path.as_str(), "/app/main.wx");
 	}
 
+	/// The `entry` field, not a hardcoded `main.wx` convention — proves the
+	/// entry file can be named anything, and is resolved relative to the
+	/// manifest's own directory.
+	#[test]
+	fn manifested_binary_resolves_a_non_conventional_entry_name() {
+		let source = virtual_source(&[
+			(
+				"/app/wx.json",
+				r#"{ "type": "bin", "entry": "src/start.wx" }"#,
+			),
+			("/app/src/start.wx", "fn add() {}"),
+		]);
+		let compilation =
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+
+		let root = &compilation.packages[compilation.root_package.as_usize()];
+		assert_eq!(root.entry_path.as_str(), "/app/src/start.wx");
+	}
+
+	#[test]
+	fn manifest_directory_without_a_wx_json_fails() {
+		let source = virtual_source(&[("/app/main.wx", "fn add() {}")]);
+		assert!(
+			open_manifest(AbsolutePath::new("/app"), &source).is_err(),
+			"a directory argument commits to the manifest-driven path — no \
+			 fallback to guessing an entry file"
+		);
+	}
+
 	#[test]
 	fn std_root_package_does_not_get_a_second_std_loaded() {
 		let source = virtual_source(&[
-			("/app/wx.json", r#"{ "package": { "type": "std" } }"#),
+			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
 			("/app/main.wx", "fn add() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -393,18 +394,22 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"package": { "type": "bin" },
+					"type": "bin",
+					"entry": "main.wx",
 					"dependencies": {
 						"std": { "type": "local", "path": "../alt_std" }
 					}
 				}"#,
 			),
 			("/app/main.wx", "fn add() {}"),
-			("/alt_std/wx.json", r#"{ "package": { "type": "lib" } }"#),
+			(
+				"/alt_std/wx.json",
+				r#"{ "type": "lib", "entry": "main.wx" }"#,
+			),
 			("/alt_std/main.wx", "fn replacement() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
@@ -438,18 +443,19 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"package": { "type": "bin" },
+					"type": "bin",
+					"entry": "main.wx",
 					"dependencies": {
 						"mystd": { "type": "local", "path": "../mystd" }
 					}
 				}"#,
 			),
 			("/app/main.wx", "fn add() {}"),
-			("/mystd/wx.json", r#"{ "package": { "type": "std" } }"#),
+			("/mystd/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
 			("/mystd/main.wx", "fn replacement() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -490,7 +496,8 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"package": { "type": "bin" },
+					"type": "bin",
+					"entry": "main.wx",
 					"dependencies": {
 						"libx": { "type": "local", "path": "../x" },
 						"liby": { "type": "local", "path": "../y" }
@@ -498,23 +505,24 @@ mod tests {
 				}"#,
 			),
 			("/app/main.wx", "fn add() {}"),
-			("/x/wx.json", r#"{ "package": { "type": "lib" } }"#),
+			("/x/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
 			("/x/main.wx", "fn from_x() {}"),
 			(
 				"/y/wx.json",
 				r#"{
-					"package": { "type": "bin" },
+					"type": "bin",
+					"entry": "main.wx",
 					"dependencies": {
 						"libx": { "type": "local", "path": "../z" }
 					}
 				}"#,
 			),
 			("/y/main.wx", "fn from_y() {}"),
-			("/z/wx.json", r#"{ "package": { "type": "lib" } }"#),
+			("/z/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
 			("/z/main.wx", "fn from_z() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		let all_diagnostics: Vec<_> = compilation
 			.packages
@@ -547,7 +555,8 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"package": { "type": "bin" },
+					"type": "bin",
+					"entry": "main.wx",
 					"dependencies": {
 						"a": { "type": "local", "path": "../a" },
 						"b": { "type": "local", "path": "../b" }
@@ -558,7 +567,8 @@ mod tests {
 			(
 				"/a/wx.json",
 				r#"{
-					"package": { "type": "lib" },
+					"type": "lib",
+					"entry": "main.wx",
 					"dependencies": {
 						"shared": { "type": "local", "path": "../shared" }
 					}
@@ -568,18 +578,22 @@ mod tests {
 			(
 				"/b/wx.json",
 				r#"{
-					"package": { "type": "lib" },
+					"type": "lib",
+					"entry": "main.wx",
 					"dependencies": {
 						"shared": { "type": "local", "path": "../shared" }
 					}
 				}"#,
 			),
 			("/b/main.wx", "fn from_b() {}"),
-			("/shared/wx.json", r#"{ "package": { "type": "lib" } }"#),
+			(
+				"/shared/wx.json",
+				r#"{ "type": "lib", "entry": "main.wx" }"#,
+			),
 			("/shared/main.wx", "fn from_shared() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/app/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -607,7 +621,8 @@ mod tests {
 			(
 				"/a/wx.json",
 				r#"{
-					"package": { "type": "lib" },
+					"type": "lib",
+					"entry": "main.wx",
 					"dependencies": {
 						"b": { "type": "local", "path": "../b" }
 					}
@@ -617,7 +632,8 @@ mod tests {
 			(
 				"/b/wx.json",
 				r#"{
-					"package": { "type": "lib" },
+					"type": "lib",
+					"entry": "main.wx",
 					"dependencies": {
 						"a": { "type": "local", "path": "../a" }
 					}
@@ -626,7 +642,7 @@ mod tests {
 			("/b/main.wx", "fn from_b() {}"),
 		]);
 		let compilation =
-			open_package(AbsolutePath::new("/a/main.wx"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/a"), &source).unwrap();
 
 		let all_diagnostics: Vec<_> = compilation
 			.packages

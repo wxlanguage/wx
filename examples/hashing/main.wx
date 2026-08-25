@@ -1,7 +1,14 @@
 use std::*;
 
+module x;
+
+fn abc() -> i32 {
+  _ = pow::pow(1, 2);
+  5
+}
+
 trait Hasher {
-  fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
+  fn write<Mem: std::Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
 
   fn finish(self) -> u64;
 
@@ -11,7 +18,7 @@ trait Hasher {
   }
 }
 
-type Ptr<T> = T::&u8;
+type Ptr<T: std::Memory> = T::&u8;
 
 // FNV-1a: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 const FNV_OFFSET_BASIS: u64 = 14695981039346656037;

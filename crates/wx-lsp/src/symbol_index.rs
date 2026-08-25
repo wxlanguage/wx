@@ -532,15 +532,32 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			}
 			// A package has no name of its own — each dependent names it by
 			// its own `dependencies` key. Its definition span is still worth
-			// indexing, but there's no single name to file it under.
+			// indexing, but there's no single name to file it under, so this
+			// skips the shared `global_definitions` push below (which needs
+			// exactly one name) by `continue`ing past it — but every actual
+			// usage site (`pow::pow(...)`, the literal `std` in
+			// `use std::*;`) still needs recording into `references` the
+			// same as any other namespace kind, or hover/goto-def/semantic
+			// highlighting can never find that token. Recording it here,
+			// before the `continue`, rather than also falling through to
+			// the shared code below (which would additionally re-push this
+			// same definition and attempt the name-keyed
+			// `global_definitions` entry this arm exists to skip).
 			//
-			// TODO: emit one entry per incoming edge instead, so a package is
-			// completable under the name each dependent actually uses.
+			// TODO: emit one `global_definitions` entry per incoming edge
+			// instead, so a package is completable under the name each
+			// dependent actually uses.
 			ModuleDeclarationKind::Package(file_id) => {
 				index.definitions.push(SpanInfo {
 					source: SourceSpan::new(file_id, TextSpan::new(0, 0)),
 					kind,
 				});
+				for access in &ns.accesses {
+					index.references.push(SpanInfo {
+						source: *access,
+						kind,
+					});
+				}
 				continue;
 			}
 		};
