@@ -1620,6 +1620,43 @@ pub struct FunctionSignature {
 	pub result: Option<Box<Spanned<TypeExpression>>>,
 }
 
+/// One node of a `use` tree. `use a::b::*` is
+/// `Path{a, Path{b, Glob}}`; `use a::{b, c::*}` is `Path{a, Group[Name{b},
+/// Path{c, Glob}]}`.
+///
+/// The two leaf kinds resolve at different times, which is why they stay
+/// distinct all the way into TIR rather than collapsing into one "import"
+/// node: a `Glob` has to be registered during prescan (`lookup_global_symbol`
+/// consults `wildcard_imports` throughout Phase 2, so one registered later
+/// would be invisible to earlier lookups), while a `Name` *cannot* be
+/// resolved that early — files are prescanned in order, so `use math::add;`
+/// in `main.wx` runs before `math.wx`'s items exist.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum UseTree {
+	/// `*` — every visible name in the namespace walked to so far.
+	Glob,
+	/// A single imported name, optionally renamed: `add`, `add as plus`.
+	/// Carries its own `DefId` — this leaf is what binds a local name, so
+	/// it is what `claim_name_binding` and `item_lookup` key on.
+	Name {
+		id: DefId,
+		name: Spanned<SymbolU32>,
+		alias: Option<Spanned<SymbolU32>>,
+	},
+	/// One `::`-separated segment and whatever follows it.
+	Path {
+		segment: Spanned<SymbolU32>,
+		rest: Box<Spanned<UseTree>>,
+	},
+	/// `{ .. }` — several subtrees sharing the prefix walked to so far.
+	/// `Separated<Spanned<_>>` is what `SeparatedGroup::parse` returns, and
+	/// matches `ExportEntry`'s shape. Nothing reads the separator spans: a
+	/// `use` group is formatted on one line, so it never emits a trailing
+	/// comma the way a broken `export` block does.
+	Group(Box<[Separated<Spanned<UseTree>>]>),
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct ExportEntry {
@@ -1718,6 +1755,13 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 	},
 	Export {
+		id: DefId,
+		/// Span of the `export` keyword alone. The block's invariants —
+		/// only one, at the package root, not in a library — are properties
+		/// of the block itself rather than of any name it lists, so they
+		/// need a span that doesn't belong to an entry. It's also the only
+		/// span an empty `export { }` has.
+		keyword_span: TextSpan,
 		entries: Box<[Separated<Spanned<ExportEntry>>]>,
 	},
 	Import {
@@ -1797,10 +1841,17 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 		members: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
-	/// `use path::*;` — wildcard import; brings all public items from the namespace into scope.
+	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
+	/// brings names from another namespace into this one.
+	///
+	/// The `DefId` lives on each `UseTree::Name` leaf rather than here: one
+	/// `use` item can bind several names, and `ensure_signature` keys its
+	/// compute state — and `item_lookup` its declaration span — per `DefId`.
+	/// A leaf is the thing that binds a name, so a leaf is the thing that
+	/// gets an id.
 	Use {
 		pub_span: Option<TextSpan>,
-		path: Box<[Spanned<SymbolU32>]>,
+		tree: Spanned<UseTree>,
 	},
 	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
@@ -4805,6 +4856,8 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Export {
+				id: parser.id_generator.generate(),
+				keyword_span: export_keyword.span,
 				entries: entries.inner,
 			},
 			span,
@@ -5659,40 +5712,95 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_use_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let use_span = parser.lexer.next().span; // consume `use`
 
-		let mut path: Vec<Spanned<SymbolU32>> = Vec::new();
+		// The trailing `;` is deliberately left for the caller: top-level
+		// items are separated by `SemiColon` at the group level (see
+		// `parse_module_item`).
+		let tree = Self::parse_use_tree(parser)?;
 
-		loop {
-			let token = parser.next_expect(Token::Identifier)?;
-			let symbol = parser.intern_identifier(token.span);
-			path.push(Spanned {
-				inner: symbol,
-				span: token.span,
+		Ok(Spanned {
+			span: TextSpan::new(use_span.start, tree.span.end),
+			inner: Item::Use {
+				pub_span: None,
+				tree,
+			},
+		})
+	}
+
+	/// One node of a `use` tree, recursing on `::` and `{ .. }`.
+	///
+	/// `a::b` is left-nested as `Path{a, Path{b, ..}}` rather than collected
+	/// into a flat prefix + leaf, because a `Group` can appear at any depth
+	/// (`a::{b::{c, d}, e}`) — there is no single prefix to collect.
+	fn parse_use_tree(parser: &mut Parser) -> Result<Spanned<UseTree>, ()> {
+		let token = parser.lexer.peek();
+
+		if token.inner == Token::Star {
+			let span = parser.lexer.next().span;
+			return Ok(Spanned {
+				inner: UseTree::Glob,
+				span,
 			});
-
-			if parser.lexer.peek().inner != Token::ColonColon {
-				break;
-			}
-			parser.lexer.next(); // consume `::`
-
-			if parser.lexer.peek().inner == Token::Star {
-				let end = parser.lexer.next().span.end; // consume `*`
-				return Ok(Spanned {
-					inner: Item::Use {
-						pub_span: None,
-						path: path.into_boxed_slice(),
-					},
-					span: TextSpan::new(use_span.start, end),
-				});
-			}
 		}
 
-		// Reached end without `*` — invalid, only `use path::*` is supported.
-		parser.ast.diagnostics.push(report_unexpected_token(
-			parser.ast.file_id,
-			parser.lexer.peek(),
-			Token::Star,
-		));
-		Err(())
+		if token.inner == Token::OpenBrace {
+			let group = SeparatedGroup {
+				open_token: Token::OpenBrace,
+				close_token: Token::CloseBrace,
+				separator_token: Token::Comma,
+				item_handler: Self::parse_use_tree,
+				should_warn_missing_separator: None,
+			}
+			.parse(parser)?;
+			return Ok(Spanned {
+				inner: UseTree::Group(group.inner),
+				span: group.span,
+			});
+		}
+
+		let name_token = parser.next_expect(Token::Identifier)?;
+		let name = Spanned {
+			inner: parser.intern_identifier(name_token.span),
+			span: name_token.span,
+		};
+
+		// `::` — this identifier is a segment, not the leaf.
+		if parser.lexer.peek().inner == Token::ColonColon {
+			parser.lexer.next(); // consume `::`
+			let rest = Self::parse_use_tree(parser)?;
+			return Ok(Spanned {
+				span: TextSpan::new(name.span.start, rest.span.end),
+				inner: UseTree::Path {
+					segment: name,
+					rest: Box::new(rest),
+				},
+			});
+		}
+
+		// Leaf: a name, optionally renamed. Unlike an export alias — which
+		// renames into the wasm ABI and so takes a string — this renames
+		// into wx's own scope, so it takes an identifier.
+		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
+			parser.lexer.next(); // consume `as`
+			let alias_token = parser.next_expect(Token::Identifier)?;
+			Some(Spanned {
+				inner: parser.intern_identifier(alias_token.span),
+				span: alias_token.span,
+			})
+		} else {
+			None
+		};
+
+		Ok(Spanned {
+			span: TextSpan::new(
+				name.span.start,
+				alias.map_or(name.span.end, |a| a.span.end),
+			),
+			inner: UseTree::Name {
+				id: parser.id_generator.generate(),
+				name,
+				alias,
+			},
+		})
 	}
 
 	fn parse_import_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {

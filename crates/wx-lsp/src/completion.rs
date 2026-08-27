@@ -216,7 +216,7 @@ pub fn visible_namespaces(
 			break;
 		}
 		let ns = &tir.namespaces[idx as usize];
-		visible.extend(ns.wildcard_imports.iter().copied());
+		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
 		current = ns.parent;
 	}
 	visible

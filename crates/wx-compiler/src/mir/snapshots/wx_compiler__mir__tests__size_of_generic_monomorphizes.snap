@@ -20,7 +20,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 478
+                        id: 479
                     ty:
                       Function:
                         signature_index: 0
@@ -45,7 +45,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 479
+                        id: 480
                     ty:
                       Function:
                         signature_index: 0
@@ -53,7 +53,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 478
+  - id: 479
     signature_index: 0
     scopes:
       - kind: Block
@@ -71,7 +71,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 479
+  - id: 480
     signature_index: 0
     scopes:
       - kind: Block

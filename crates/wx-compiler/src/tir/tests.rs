@@ -34,6 +34,29 @@ impl TestCase {
 		TestCase { graph, tir }
 	}
 
+	/// Same as [`Self::new`], but the root package is a **library** rather
+	/// than a binary. `load_binary` is the only constructor the other
+	/// helpers use, so without this there is no way to reach any rule that
+	/// depends on the root package's kind.
+	fn new_library(source: &str) -> Self {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
+		let prefixed = format!("use std::*;\n{source}");
+		let root_id = builder
+			.load_package(
+				vfs::PackageKind::Library,
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
+					"main.wx".to_string(),
+					prefixed,
+				)])),
+			)
+			.unwrap();
+		let mut graph = builder.build(root_id);
+		let tir = TIR::build(&mut graph);
+		TestCase { graph, tir }
+	}
+
 	fn new_multi_file(
 		entry_path: &str,
 		source: &str,
@@ -221,6 +244,753 @@ fn test_build_with_package_graph_resolves_cross_file_module_type_access() {
 	);
 
 	no_errors(&case);
+}
+
+/// An `export { .. }` block rides the Phase 2 sweep as an ordinary
+/// `ast_nodes` entry, so it resolves the names it lists by forcing them
+/// through `ensure_signature` — exactly like any other reference site.
+/// That makes a forward reference work: the block can precede everything it
+/// names, including a `memory` whose `Size` binding has to check trait
+/// bounds (`u32: PointerSize + UnsignedInt`) against the stdlib.
+#[test]
+fn test_export_block_preceding_the_items_it_names() {
+	let case = TestCase::new(indoc! {"
+        export { heap, elem }
+
+        memory heap: Memory where { Size = u32 }
+
+        fn elem(arr: heap::&[i32; 4], i: u32) -> i32 { arr[i] }
+    "});
+
+	no_errors(&case);
+	assert_eq!(case.tir.export_block.as_ref().unwrap().items.len(), 2);
+}
+
+// ── `use` trees ──────────────────────────────────────────────────────────
+
+/// Convenience for the `use` tests: a two-file package whose `src/math.wx`
+/// is `math`, with `use std::*;` already prefixed onto the entry file.
+fn use_case(entry: &str, math: &str) -> TestCase {
+	TestCase::new_multi_file(
+		"src/main.wx",
+		&format!("mod math;\n{entry}"),
+		&[("src/math.wx", math)],
+	)
+}
+
+#[test]
+fn test_use_named_import_binds_the_name() {
+	let case = use_case(
+		indoc! {"
+            use math::add;
+            fn main() -> i32 { add() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+}
+
+#[test]
+fn test_use_alias_binds_the_local_name() {
+	let case = use_case(
+		indoc! {"
+            use math::add as plus;
+            fn main() -> i32 { plus() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+}
+
+#[test]
+fn test_use_group_imports_every_leaf() {
+	let case = use_case(
+		indoc! {"
+            use math::{add, sub};
+            fn main() -> i32 { add() + sub() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+	);
+	no_errors(&case);
+	assert_eq!(case.tir.use_items.len(), 2, "one `UseItem` per named leaf");
+}
+
+/// Nested groups and both leaf kinds in one item — the shape that proves
+/// the tree is really recursive rather than a prefix plus a leaf.
+#[test]
+fn test_use_nested_group_with_both_leaf_kinds() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod math;
+            use math::{trig::{sin, cos}, ops::*};
+            fn main() -> i32 { sin() + cos() + double(1) }
+            export { main }
+        "},
+		&[
+			("src/math.wx", "pub mod trig;\npub mod ops;"),
+			(
+				"src/math/trig.wx",
+				"pub fn sin() -> i32 { 1 }\npub fn cos() -> i32 { 2 }",
+			),
+			("src/math/ops.wx", "pub fn double(x: i32) -> i32 { x * 2 }"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// A group's prefix is one mention of `math` in the source, so it is walked
+/// once and recorded once however many names hang off it. Per-leaf walking
+/// recorded it per leaf, and since the LSP turns every access into a
+/// reference, that gave find-references repeats and made rename emit two
+/// overlapping edits at a single range.
+#[test]
+fn test_group_prefix_is_walked_once() {
+	let case = use_case(
+		indoc! {"
+            use math::{add, sub};
+            fn main() -> i32 { add() + sub() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+	);
+	no_errors(&case);
+
+	assert_eq!(
+		case.tir.use_prefixes.len(),
+		1,
+		"both leaves name the same `math`, so it is stored once"
+	);
+	let math = case.tir.use_items[0].prefix;
+	let PrefixTarget::Resolved(math_ns) =
+		case.tir.use_prefixes[math as usize].target
+	else {
+		panic!("`math` should have resolved")
+	};
+	assert_eq!(
+		case.tir.namespaces[math_ns as usize].accesses.len(),
+		1,
+		"one source mention of `math` is one access"
+	);
+}
+
+/// Two statements naming the same module are two separate mentions, so they
+/// get an entry — and an access — each.
+#[test]
+fn test_separate_use_statements_do_not_share_a_prefix() {
+	let case = use_case(
+		indoc! {"
+            use math::add;
+            use math::sub;
+            fn main() -> i32 { add() + sub() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+	);
+	no_errors(&case);
+	assert_eq!(case.tir.use_prefixes.len(), 2);
+}
+
+/// A glob binds no name, so it needs no prefix entry of its own.
+#[test]
+fn test_glob_allocates_no_prefix() {
+	let case = use_case(
+		"use math::*;\nfn main() -> i32 { add() }\nexport { main }",
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+	assert!(case.tir.use_prefixes.is_empty());
+}
+
+#[test]
+fn test_use_imports_a_type() {
+	let case = use_case(
+		indoc! {"
+            use math::Point;
+            fn main() -> i32 { local p: Point = Point::{ x: 1 }; p.x }
+            export { main }
+        "},
+		"pub struct Point { pub x: i32 }",
+	);
+	no_errors(&case);
+}
+
+#[test]
+fn test_use_private_item_reports_at_the_use_site() {
+	let case = use_case(
+		"use math::hidden;\nfn main() -> i32 { 1 }\nexport { main }",
+		"fn hidden() -> i32 { 1 }",
+	);
+	assert!(has_error_code(&case.tir, DiagnosticCode::PrivateItem));
+}
+
+/// The glob path stays silent on an unresolvable prefix — it has to, since
+/// it runs before other files are scanned — but a named leaf resolves late
+/// enough that silence would just lose the error.
+#[test]
+fn test_use_unresolved_name_reports() {
+	let case = use_case(
+		"use math::nope;\nfn main() -> i32 { 1 }\nexport { main }",
+		"pub fn add() -> i32 { 1 }",
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::UndeclaredIdentifier
+	));
+}
+
+#[test]
+fn test_use_unresolved_prefix_reports() {
+	let case = use_case(
+		"use nothere::thing;\nfn main() -> i32 { 1 }\nexport { main }",
+		"pub fn add() -> i32 { 1 }",
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::UndeclaredIdentifier
+	));
+}
+
+/// `use add;` names no module to import from. It used to be accepted in
+/// silence: the prefix walker returned a bare `Option`, so "resolved",
+/// "failed, already reported" and "there were no segments at all" were the
+/// same value, and the last one fell through the reporting path entirely.
+#[test]
+fn test_use_without_a_module_reports() {
+	let case = use_case(
+		"use add;\nfn main() -> i32 { 1 }\nexport { main }",
+		"pub fn add() -> i32 { 1 }",
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"a bare `use add;` imports nothing and must say so: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_use_prefix_that_is_not_a_module_reports() {
+	let case = use_case(
+		"use S::thing;\nstruct S {}\nfn main() -> i32 { 1 }\nexport { main }",
+		"pub fn add() -> i32 { 1 }",
+	);
+	assert!(has_error_code(&case.tir, DiagnosticCode::NotANamespace));
+}
+
+/// An import claims both symbol namespaces at prescan, before its target is
+/// known. When the target turns out to occupy only one of them, the other
+/// claim must vanish without a trace — a function import next to a struct
+/// of the same name is legal.
+#[test]
+fn test_value_import_does_not_collide_with_a_type_declaration() {
+	let case = use_case(
+		indoc! {"
+            use math::add;
+            struct add { x: i32 }
+            fn main() -> i32 { add() }
+            export { main }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"`add` the function and `add` the struct occupy different symbol \
+		 namespaces: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_type_import_does_not_collide_with_a_value_declaration() {
+	let case = use_case(
+		indoc! {"
+            use math::Point;
+            fn Point() -> i32 { 2 }
+            fn main() -> i32 { Point() }
+            export { main }
+        "},
+		"pub struct Point { x: i32 }",
+	);
+	assert!(!has_error_code(
+		&case.tir,
+		DiagnosticCode::DuplicateDefinition
+	));
+}
+
+/// The collision that *is* real still has to be reported — and exactly
+/// once, in either source order, since prescan defers the judgement and
+/// Phase 2 must not double it.
+#[test]
+fn test_import_colliding_in_the_same_namespace_reports_once() {
+	for source in [
+		"use math::add;\nfn add() -> i32 { 2 }\nfn main() -> i32 { add() }",
+		"fn add() -> i32 { 2 }\nuse math::add;\nfn main() -> i32 { add() }",
+	] {
+		let case = use_case(
+			&format!("{source}\nexport {{ main }}"),
+			"pub fn add() -> i32 { 1 }",
+		);
+		let duplicates = case
+			.tir
+			.diagnostics
+			.iter()
+			.filter(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::DuplicateDefinition.code())
+			})
+			.count();
+		assert_eq!(duplicates, 1, "for source:\n{source}");
+	}
+}
+
+/// Value position had no `Pending` forcing at all, so a reference resolved
+/// before its target's signature hit an `unreachable!`. Both ways of
+/// getting there are legal source.
+#[test]
+fn test_value_reference_forces_a_pending_signature() {
+	// A `use` written *below* the reference to what it imports.
+	let case = use_case(
+		indoc! {"
+            const DOUBLE: i32 = BASE;
+            use math::BASE;
+            fn main() -> i32 { DOUBLE }
+            export { main }
+        "},
+		"pub const BASE: i32 = 21;",
+	);
+	no_errors(&case);
+
+	// A const naming a const declared later — no `use` involved at all,
+	// which is why this one crashed long before `use` trees existed.
+	let case = TestCase::new(indoc! {"
+        const A: i32 = B;
+        const B: i32 = 1;
+        fn main() -> i32 { A }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_self_referential_const_reports_a_cycle() {
+	let case = TestCase::new(indoc! {"
+        const A: i32 = A;
+        fn main() -> i32 { A }
+        export { main }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::CyclicTypeDependency
+	));
+}
+
+/// The span a wildcard ambiguity will point at (Part 4): the path and the
+/// star, not the `use` keyword, and — for a glob nested in a group — only
+/// the part that is a contiguous range of source.
+#[test]
+fn test_glob_import_records_its_path_span() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		"mod math;\nuse math::{trig::*};\nfn main() -> i32 { 1 }\nexport { main }",
+		&[
+			("src/math.wx", "pub mod trig;"),
+			("src/math/trig.wx", "pub fn sin() -> i32 { 1 }"),
+		],
+	);
+	no_errors(&case);
+
+	let root = case.tir.file_namespaces[1];
+	let spelled: Vec<&str> = case.tir.namespaces[root as usize]
+		.wildcard_imports
+		.iter()
+		.map(|import| {
+			let source = &case
+				.graph
+				.files
+				.get(import.span.file_id)
+				.expect("the entry file is in the compilation unit")
+				.source;
+			&source
+				[import.span.span.start as usize..import.span.span.end as usize]
+		})
+		.collect();
+
+	// `std::*` is the prelude line `TestCase` prepends; `trig::*` is the
+	// nested glob. A span reaching back to `math` would cross the `{` and
+	// not be a contiguous range of source.
+	assert_eq!(spelled, vec!["std::*", "trig::*"]);
+}
+
+// ── wildcard ambiguity ───────────────────────────────────────────────────
+
+/// Two modules, `x` and `y`, both glob-imported into the entry file.
+fn ambiguity_case(entry: &str, x: &str, y: &str) -> TestCase {
+	TestCase::new_multi_file(
+		"src/main.wx",
+		&format!("mod x;\nmod y;\nuse x::*;\nuse y::*;\n{entry}"),
+		&[("src/x.wx", x), ("src/y.wx", y)],
+	)
+}
+
+/// The labels belong on the `use` statements, not the definitions: each
+/// definition is fine on its own, and it's importing both into one scope
+/// that isn't.
+#[test]
+fn test_two_globs_supplying_one_name_is_ambiguous() {
+	let case = ambiguity_case(
+		"fn main() -> i32 { FOO }\nexport { main }",
+		"pub const FOO: i32 = 6;",
+		"pub const FOO: i32 = 5;",
+	);
+
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousWildcardImport.code())
+		})
+		.expect("expected E1075");
+
+	let secondary: Vec<&str> = diagnostic
+		.labels
+		.iter()
+		.filter(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Secondary
+		})
+		.map(|label| {
+			let source = &case.graph.files.get(label.file_id).unwrap().source;
+			&source[label.range.clone()]
+		})
+		.collect();
+	assert_eq!(
+		secondary,
+		vec!["x::*", "y::*"],
+		"one label per glob, spanning the path and star — not the `use` \
+		 keyword, and not the definition it resolved to"
+	);
+}
+
+/// Value position goes through `resolve_symbol`, which is `&self` and can't
+/// report; wiring the check only into the `&mut self` forcing wrappers
+/// would have covered types and missed this — rustc's own example.
+#[test]
+fn test_ambiguity_is_reported_in_value_position() {
+	let case = ambiguity_case(
+		"fn main() -> i32 { pick() }\nexport { main }",
+		"pub fn pick() -> i32 { 6 }",
+		"pub fn pick() -> i32 { 5 }",
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::AmbiguousWildcardImport
+	));
+}
+
+#[test]
+fn test_ambiguity_is_reported_in_type_position() {
+	let case = ambiguity_case(
+		"fn main(p: Point) -> i32 { 1 }\nexport { main }",
+		"pub struct Point { pub x: i32 }",
+		"pub struct Point { pub y: i32 }",
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::AmbiguousWildcardImport
+	));
+}
+
+/// Reachable from the export block now that Part 3 resolves entries through
+/// the scope chain — without this, `export { pick }` would silently bake
+/// one of two `pick`s into the module ABI.
+#[test]
+fn test_ambiguity_is_reported_from_the_export_block() {
+	let case = ambiguity_case(
+		"export { pick }",
+		"pub fn pick() -> i32 { 6 }",
+		"pub fn pick() -> i32 { 5 }",
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::AmbiguousWildcardImport
+	));
+}
+
+/// One item reachable two ways is not a conflict — there's nothing to
+/// arbitrate, since both globs name the same thing.
+#[test]
+fn test_one_item_through_two_globs_is_not_ambiguous() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod base;
+            mod x;
+            mod y;
+            use x::*;
+            use y::*;
+
+            fn main() -> i32 { shared() }
+            export { main }
+        "},
+		&[
+			("src/base.wx", "pub fn shared() -> i32 { 1 }"),
+			("src/x.wx", "pub use base::shared;"),
+			("src/y.wx", "pub use base::shared;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// The fix the diagnostic recommends has to actually work: a namespace's
+/// own symbols are consulted before its globs, so an explicit import wins
+/// outright.
+#[test]
+fn test_explicit_import_disambiguates_two_globs() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod x;
+            mod y;
+            use x::*;
+            use y::*;
+            use x::pick;
+
+            fn main() -> i32 { pick() }
+            export { main }
+        "},
+		&[
+			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
+			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// A glob here and a glob on an enclosing scope is ordinary shadowing, not
+/// ambiguity — which is why the walk stops at the first level that
+/// resolves rather than gathering candidates across levels.
+#[test]
+fn test_glob_in_an_inner_scope_shadows_an_outer_one() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod x;
+            mod y;
+            use x::*;
+
+            mod inner {
+                use y::*;
+                pub fn get() -> i32 { pick() }
+            }
+
+            fn main() -> i32 { inner::get() }
+            export { main }
+        "},
+		&[
+			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
+			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+		],
+	);
+	no_errors(&case);
+}
+
+// ── export reach ─────────────────────────────────────────────────────────
+
+/// A submodule item used to be unexportable by any spelling: the block did a
+/// direct lookup in the package root's own symbol map, so a name that a
+/// `use` had put in scope resolved everywhere in the file *except* here.
+#[test]
+fn test_export_reaches_a_named_import() {
+	let case = use_case(
+		indoc! {"
+            use math::add;
+            export { add }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+	assert_eq!(case.tir.export_block.as_ref().unwrap().items.len(), 1);
+}
+
+#[test]
+fn test_export_reaches_a_glob_import() {
+	let case = use_case(
+		indoc! {"
+            use math::*;
+            export { add }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+	assert_eq!(case.tir.export_block.as_ref().unwrap().items.len(), 1);
+}
+
+/// The alias renames into wx's scope, so that — not the original — is the
+/// name the export block sees, and the wasm export takes the alias too
+/// unless the entry renames it again.
+#[test]
+fn test_export_reaches_an_aliased_import() {
+	let case = use_case(
+		indoc! {"
+            use math::add as plus;
+            export { plus }
+        "},
+		"pub fn add() -> i32 { 1 }",
+	);
+	no_errors(&case);
+	let block = case.tir.export_block.as_ref().unwrap();
+	assert_eq!(block.items.len(), 1);
+}
+
+/// Reaching through the scope chain must not reach *past* what's visible:
+/// a non-`pub` submodule item stays unexportable, and says why.
+#[test]
+fn test_export_cannot_reach_a_private_item_through_a_glob() {
+	let case = use_case(
+		indoc! {"
+            use math::*;
+            export { hidden }
+        "},
+		"fn hidden() -> i32 { 1 }",
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"a private item is not in scope here, so it is not exportable: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+	assert!(case.tir.export_block.as_ref().unwrap().items.is_empty());
+}
+
+#[test]
+fn test_second_export_block_reports_duplicate() {
+	let case = TestCase::new(indoc! {"
+        fn foo() -> i32 { 42 }
+        fn bar() -> i32 { 43 }
+
+        export { foo }
+        export { bar }
+    "});
+
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::DuplicateExportBlock
+	));
+	// The first block still owns the slot, so its exports are unaffected —
+	// the second block is rejected, not merged in.
+	let block = case.tir.export_block.as_ref().unwrap();
+	assert_eq!(block.items.len(), 1);
+}
+
+#[test]
+fn test_export_block_in_submodule_reports_not_at_root() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod math;
+
+            fn main() -> i32 { math::add() }
+
+            export { main }
+        "},
+		&[("src/math.wx", "pub fn add() -> i32 { 1 }\nexport { add }")],
+	);
+
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::ExportBlockNotAtRoot
+	));
+}
+
+#[test]
+fn test_export_block_in_inline_module_reports_not_at_root() {
+	// An inline `mod` in the entry file has a namespace of its own, so the
+	// single "is this the package root's namespace?" comparison catches it
+	// for the same reason it catches a separate module file.
+	let case = TestCase::new(indoc! {"
+        mod inner {
+            pub fn f() -> i32 { 1 }
+            export { f }
+        }
+    "});
+
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::ExportBlockNotAtRoot
+	));
+}
+
+/// A block rejected for sitting in the wrong place must not claim the
+/// package's one export slot on its way out — otherwise the entry file's
+/// legitimate block gets reported as a duplicate of a block that was
+/// itself rejected, and the real ABI silently loses its exports.
+#[test]
+fn test_misplaced_export_block_does_not_claim_the_export_slot() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod math;
+
+            fn main() -> i32 { math::add() }
+
+            export { main }
+        "},
+		&[("src/math.wx", "pub fn add() -> i32 { 1 }\nexport { add }")],
+	);
+
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::ExportBlockNotAtRoot
+	));
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::DuplicateExportBlock),
+		"the entry file's block is the only one that claimed the slot, so \
+		 nothing should be reported as a duplicate: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+	let block = case
+		.tir
+		.export_block
+		.as_ref()
+		.expect("the entry file's block still owns the slot");
+	assert_eq!(block.items.len(), 1);
+}
+
+#[test]
+fn test_library_package_cannot_export() {
+	let case = TestCase::new_library(indoc! {"
+        pub fn add() -> i32 { 1 }
+
+        export { add }
+    "});
+
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::LibraryCannotExport
+	));
+	assert!(
+		case.tir.export_block.is_none(),
+		"a library has no ABI, so nothing should have been exported"
+	);
 }
 
 #[test]

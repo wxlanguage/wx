@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
-use crate::vfs::{Files, PackageGraph};
+use crate::vfs::{Files, PackageGraph, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
 struct ExprContext {
@@ -208,6 +208,11 @@ struct Builder<'ast, 'graph> {
 	/// Read only to resolve what a package calls its dependencies, which is
 	/// where a package's canonical name lives (see `PackageGraph::dependency_names`).
 	packages: &'graph [PackageGraph],
+	/// The package being compiled. Only `export { .. }` needs this: exports
+	/// are a property of the artifact as a whole, so the sole legal home for
+	/// a block is this package's entry file — a dependency that declares one
+	/// would otherwise merge its names into an ABI it doesn't own.
+	root_package: PackageId,
 	type_index_lookup: HashMap<Type, TypeIndex>,
 	tir: TIR,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
@@ -351,6 +356,51 @@ struct ResolveContext {
 	namespace: NamespaceIndex,
 }
 
+/// The outcome of walking a `use` prefix — see
+/// [`Builder::walk_use_prefix`], which reports none of these itself because
+/// only its caller knows which deserve a diagnostic.
+enum PrefixWalk {
+	Resolved(NamespaceIndex),
+	/// No segments at all: `use add;`. Distinct from `Unresolved` because
+	/// there is no segment to point a label at, and distinct from
+	/// `Resolved` because there is no namespace to look the leaf up in —
+	/// conflating the three into an `Option` is what let this spelling
+	/// through silently.
+	Empty,
+	/// A segment naming something that isn't a module.
+	NotAModule(ast::Spanned<SymbolU32>, SourceSpan),
+	/// A segment naming nothing at all.
+	Unresolved(SourceSpan),
+}
+
+/// The outcome of a scope-chain lookup — see
+/// [`Builder::lookup_scope_chain`].
+enum ScopeLookup {
+	NotFound,
+	Found(SymbolKind),
+	/// Two or more globs at one scope level supply *distinct* items for this
+	/// name, so which one wins is nothing but `use`-statement order.
+	///
+	/// Carries every candidate paired with the glob that supplied it,
+	/// because the thing worth pointing a label at is the `use` statements —
+	/// each definition is fine on its own; it's importing both that isn't.
+	/// Always holds at least two entries.
+	Ambiguous(Box<[(SymbolKind, SourceSpan)]>),
+}
+
+impl ScopeLookup {
+	/// What this name resolves to with ambiguity set aside: the first
+	/// candidate in `use` order, which is exactly what resolution silently
+	/// picked back when ambiguity wasn't detected at all.
+	fn symbol(&self) -> Option<SymbolKind> {
+		match self {
+			ScopeLookup::NotFound => None,
+			ScopeLookup::Found(kind) => Some(*kind),
+			ScopeLookup::Ambiguous(candidates) => Some(candidates[0].0),
+		}
+	}
+}
+
 impl ResolveContext {
 	fn new(file_id: FileId, namespace: NamespaceIndex) -> Self {
 		Self { file_id, namespace }
@@ -438,6 +488,20 @@ enum AstNodeRef<'ast> {
 	ImportedGlobal {
 		import_module_index: u32,
 		decl: &'ast ast::ImportDeclaration,
+	},
+	/// One named leaf of a `use` tree. Everything it needs is already in
+	/// `tir.use_items[use_index]` — the syntactic prefix, the name, the
+	/// alias — so unlike every other variant here it holds no `&'ast`
+	/// reference.
+	Use {
+		use_index: u32,
+	},
+	/// An `export { .. }` block. Carries no type of its own — its
+	/// "signature" is the act of resolving each listed name to an
+	/// `ExportItem`, which is why it rides the Phase 2 sweep like any
+	/// other item instead of needing a pass of its own.
+	Export {
+		item: &'ast ast::Item,
 	},
 }
 
@@ -1014,6 +1078,66 @@ fn report_undeclared_identifier(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_label(span.primary_label())
 }
 
+/// What to call a `SymbolKind` in prose. `Pending` stays vague on purpose:
+/// its signature hasn't been computed, so the specific kind isn't known yet
+/// and guessing would be worse than the generic word.
+fn symbol_kind_noun(kind: SymbolKind) -> &'static str {
+	match kind {
+		SymbolKind::Enum { .. } => "enum",
+		SymbolKind::Struct { .. } => "struct",
+		SymbolKind::Module { .. } => "module",
+		SymbolKind::Memory { .. } => "memory",
+		SymbolKind::Trait { .. } => "trait",
+		SymbolKind::TypeSet { .. } => "type set",
+		SymbolKind::Global { .. } => "global",
+		SymbolKind::Function { .. } => "function",
+		SymbolKind::Const { .. } => "constant",
+		SymbolKind::TraitAssocType { .. } => "associated type",
+		SymbolKind::TypeAlias { .. } => "type alias",
+		SymbolKind::Pending(_) => "item",
+	}
+}
+
+fn report_not_a_namespace(name: &str, span: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NotANamespace.code())
+		.with_message(format!("`{name}` is not a module"))
+		.with_label(
+			span.primary_label()
+				.with_message("only a module can be used as a path prefix"),
+		)
+}
+
+fn report_import_without_module(
+	name: &str,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UndeclaredIdentifier.code())
+		.with_message(format!("unresolved import `{name}`"))
+		.with_label(
+			span.primary_label()
+				.with_message("no module to import this from"),
+		)
+		.with_note(format!(
+			"a `use` names where the item comes from, as in `use math::{name};`"
+		))
+}
+
+fn report_unresolved_import(
+	name: &str,
+	module: &str,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UndeclaredIdentifier.code())
+		.with_message(format!("no `{name}` in `{module}`"))
+		.with_label(
+			span.primary_label()
+				.with_message("not found in this module"),
+		)
+}
+
 fn report_private_item(name: &str, span: SourceSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::PrivateItem.code())
@@ -1399,6 +1523,51 @@ fn report_duplicate_export(
 		))
 }
 
+fn report_duplicate_export_block(
+	first_block: SourceSpan,
+	second_block: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateExportBlock.code())
+		.with_message("a package can only have one `export` block")
+		.with_label(second_block.primary_label())
+		.with_label(
+			first_block
+				.secondary_label()
+				.with_message("previous `export` block here"),
+		)
+		.with_note(
+			"an `export` block declares the package's entire public ABI, so \
+			 there is nothing for a second one to add — merge the two blocks",
+		)
+}
+
+fn report_export_block_not_at_root(block: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::ExportBlockNotAtRoot.code())
+		.with_message(
+			"an `export` block must be at the top level of the package's \
+			 entry file",
+		)
+		.with_label(block.primary_label())
+		.with_note(
+			"exports name the artifact's exit points, which belong to the \
+			 package as a whole rather than to any one module inside it",
+		)
+}
+
+fn report_library_cannot_export(block: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::LibraryCannotExport.code())
+		.with_message("a library package cannot have an `export` block")
+		.with_label(block.primary_label())
+		.with_note(
+			"a library is consumed by another package, not run — mark its \
+			 items `pub` to expose them to dependents, or set `\"type\": \
+			 \"bin\"` in the manifest to build this package as an artifact",
+		)
+}
+
 fn report_comparison_type_annotation_required(
 	left: SourceSpan,
 	right: SourceSpan,
@@ -1701,7 +1870,9 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		],
 		functions: Vec::new(),
 		globals: Vec::new(),
-		exports: HashMap::new(),
+		export_block: None,
+		use_items: Vec::new(),
+		use_prefixes: Vec::new(),
 		namespaces: Vec::new(),
 		package_namespaces: HashMap::new(),
 		file_namespaces: vec![0; graph.files.len()],
@@ -1733,6 +1904,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		id_generator: &mut graph.id_generator,
 		files: &graph.files,
 		packages: &graph.packages,
+		root_package: graph.root_package,
 		tir,
 		type_index_lookup,
 		sig_state: HashMap::new(),
@@ -1863,21 +2035,6 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 
 	// Phase 3.5: verify every trait impl provides all required items
 	builder.check_trait_conformance();
-
-	// Phase 4: process exports (must run after all signatures are resolved)
-	for source_module in source_modules.iter().copied() {
-		let package_namespace =
-			builder.tir.package_namespaces[&source_module.package_id];
-		for item in source_module.ast.items.iter() {
-			if let ast::Item::Export { entries } = &item.inner.inner {
-				builder.build_exports(
-					source_module.file_id,
-					package_namespace,
-					entries,
-				);
-			}
-		}
-	}
 
 	builder.report_unused_items();
 
@@ -2774,6 +2931,19 @@ impl<'ast> Builder<'ast, '_> {
 		definition_span: SourceSpan,
 	) -> PendingClaim {
 		if let Some(existing) = self.direct_scope_lookup(namespace, key) {
+			// A real declaration always outranks an import's provisional
+			// claim, and displaces it without a word — see
+			// [`Self::claim_use_binding`] for why the import can't be judged
+			// yet. The displaced import re-checks this slot in Phase 2 and
+			// reports the collision only if it turns out to want the name.
+			if matches!(existing, SymbolKind::Pending(def_id)
+			if matches!(
+				self.tir.item_lookup.get(&def_id),
+				Some(ItemIndex::Use(_))
+			)) {
+				self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+				return PendingClaim::Claimed;
+			}
 			let first_definition = self.get_symbol_location(existing);
 			let name_str = self.interner.resolve(key.1).unwrap();
 			self.tir.diagnostics.push(report_duplicate_definition(
@@ -2788,6 +2958,43 @@ impl<'ast> Builder<'ast, '_> {
 		} else {
 			self.insert_symbol(namespace, key, SymbolKind::Pending(id));
 			PendingClaim::Claimed
+		}
+	}
+
+	/// Claims a name for a `use` leaf — provisionally, and silently.
+	///
+	/// A leaf claims *both* symbol namespaces at prescan, because which one
+	/// its target occupies isn't knowable until Phase 2, so one of the two
+	/// claims is routinely spurious. That makes prescan the wrong place to
+	/// judge any collision involving an import: `use math::add;` (a
+	/// function, so value-only) alongside a local `struct add` is legal, and
+	/// so is `use a::foo;` alongside `use b::foo;` when the two occupy
+	/// different namespaces. Both would be reported as redefinitions on the
+	/// strength of a claim that is about to be withdrawn.
+	///
+	/// So nothing is reported here. A real declaration keeps the slot; a
+	/// rival import takes it (last one wins, provisionally). Either way the
+	/// leaf that lost re-checks in Phase 2, once it knows which namespaces
+	/// it actually wants, and reports the collision then.
+	fn claim_use_binding(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
+	) {
+		match self.direct_scope_lookup(namespace, key) {
+			None => self.insert_symbol(namespace, key, SymbolKind::Pending(id)),
+			// Another import's provisional claim — take it over.
+			Some(SymbolKind::Pending(def_id))
+				if matches!(
+					self.tir.item_lookup.get(&def_id),
+					Some(ItemIndex::Use(_))
+				) =>
+			{
+				self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+			}
+			// A real declaration outranks an import. Leave it alone.
+			Some(_) => {}
 		}
 	}
 
@@ -2951,26 +3158,76 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// The symbol `key` resolves to, ignoring any ambiguity — see
+	/// [`Self::lookup_scope_chain`], whose result this discards the evidence
+	/// from. For sites that ask "is this still my own `Pending`" rather than
+	/// "what does this name mean", which is a question ambiguity can't
+	/// affect.
 	fn lookup_global_symbol(
 		&self,
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 	) -> Option<SymbolKind> {
+		self.lookup_scope_chain(namespace, key).symbol()
+	}
+
+	/// Walks the scope chain for `key`: the namespace's own symbols, then
+	/// its globs, then its parent, out to the package boundary.
+	///
+	/// Ambiguity is detected here, in the one walk every identifier already
+	/// pays for, and the result carries the candidates that caused it — the
+	/// evidence comes from the pass that found the problem rather than from
+	/// a second traversal repeating the same visibility rules. Building the
+	/// candidate list starts only once a second distinct item shows up, so
+	/// the ordinary path allocates nothing.
+	///
+	/// Ambiguity is **per scope level**: two globs on one namespace
+	/// supplying `foo` conflict, but a glob here and a glob on the parent is
+	/// ordinary shadowing, which is why the walk stops at the first level
+	/// that resolves.
+	fn lookup_scope_chain(
+		&self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+	) -> ScopeLookup {
 		let mut current = Some(namespace);
 		while let Some(idx) = current {
 			let namespace_ref = &self.tir.namespaces[idx as usize];
+			// A name declared or explicitly imported here always wins, and
+			// wins unambiguously — which is what makes `use x::foo;` the
+			// documented way out of a glob ambiguity.
 			if let Some(kind) = namespace_ref.symbols.get(&key).copied() {
-				return Some(kind);
+				return ScopeLookup::Found(kind);
 			}
-			for namespace_idx in namespace_ref.wildcard_imports.iter().copied()
-			{
-				if let Some(kind) = self.tir.namespaces[namespace_idx as usize]
+
+			let mut first: Option<(SymbolKind, SourceSpan)> = None;
+			let mut candidates: Vec<(SymbolKind, SourceSpan)> = Vec::new();
+			for import in namespace_ref.wildcard_imports.iter() {
+				let Some(kind) = self.tir.namespaces[import.namespace as usize]
 					.symbols
 					.get(&key)
-					.copied() && self.symbol_is_visible(namespace, kind)
-				{
-					return Some(kind);
+					.copied()
+					.filter(|kind| self.symbol_is_visible(namespace, *kind))
+				else {
+					continue;
+				};
+				match first {
+					// The same item reached two ways is not a conflict.
+					Some((seen, _)) if seen == kind => {}
+					Some(seen) => {
+						if candidates.is_empty() {
+							candidates.push(seen);
+						}
+						candidates.push((kind, import.span));
+					}
+					None => first = Some((kind, import.span)),
 				}
+			}
+			if !candidates.is_empty() {
+				return ScopeLookup::Ambiguous(candidates.into_boxed_slice());
+			}
+			if let Some((kind, _)) = first {
+				return ScopeLookup::Found(kind);
 			}
 			current = namespace_ref.parent;
 		}
@@ -2978,7 +3235,72 @@ impl<'ast> Builder<'ast, '_> {
 		// parents *is* the package boundary. There's no outer store left to
 		// fall into, which is what keeps one package's items — and its
 		// dependency names — invisible to every other package.
-		None
+		ScopeLookup::NotFound
+	}
+
+	/// [`Self::lookup_scope_chain`], reporting an ambiguity before handing
+	/// back the arbitrary winner so resolution carries on with something.
+	///
+	/// This — not [`Self::lookup_global_symbol`] — is what a *reference*
+	/// site wants. The raw one is for sites asking "is this still my own
+	/// `Pending`", a question no amount of glob ambiguity changes.
+	fn lookup_global_symbol_reporting(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		span: SourceSpan,
+	) -> Option<SymbolKind> {
+		match self.lookup_scope_chain(namespace, key) {
+			ScopeLookup::Ambiguous(candidates) => {
+				self.report_wildcard_ambiguity(key.1, span, &candidates);
+				Some(candidates[0].0)
+			}
+			other => other.symbol(),
+		}
+	}
+
+	/// Reports a name that two or more globs supply. Modelled on rustc's
+	/// E0659 but flattened: codespan-reporting has no nested
+	/// sub-diagnostics, so rustc's per-candidate `note:` blocks become
+	/// secondary labels on one diagnostic — the shape `AmbiguousTraitMember`
+	/// already uses.
+	///
+	/// The labels point at the `use` statements, not the definitions: each
+	/// definition is perfectly fine on its own, and it's importing both of
+	/// them into one scope that isn't.
+	fn report_wildcard_ambiguity(
+		&mut self,
+		name: SymbolU32,
+		reference: SourceSpan,
+		candidates: &[(SymbolKind, SourceSpan)],
+	) {
+		let name = self.interner.resolve(name).unwrap();
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::AmbiguousWildcardImport.code())
+			.with_message(format!("`{name}` is ambiguous"))
+			.with_label(
+				reference.primary_label().with_message("ambiguous name"),
+			);
+		for (index, (kind, span)) in candidates.iter().enumerate() {
+			diagnostic = diagnostic.with_label(
+				span.secondary_label().with_message(format!(
+					"`{name}` could {}refer to the {} imported here",
+					if index == 0 { "" } else { "also " },
+					symbol_kind_noun(*kind),
+				)),
+			);
+		}
+		self.tir.diagnostics.push(
+			diagnostic
+				.with_note(
+					"ambiguous because of multiple glob imports of a name in \
+					 the same module",
+				)
+				.with_note(format!(
+					"consider adding an explicit import of `{name}` to \
+					 disambiguate"
+				)),
+		);
 	}
 
 	/// Looks up `key` via [`Self::lookup_global_symbol`], forcing a `Pending`
@@ -2991,7 +3313,10 @@ impl<'ast> Builder<'ast, '_> {
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
 	) -> Result<Option<SymbolKind>, ()> {
-		match self.lookup_global_symbol(namespace, key) {
+		// Reported on the way in, not after forcing: forcing re-runs the
+		// same lookup, and the ambiguity is a property of the imports rather
+		// than of anything a signature could change.
+		match self.lookup_global_symbol_reporting(namespace, key, span) {
 			Some(SymbolKind::Pending(def_id)) => {
 				if matches!(
 					self.sig_state.get(&def_id),
@@ -3070,26 +3395,51 @@ impl<'ast> Builder<'ast, '_> {
 		Ok(resolved)
 	}
 
-	/// Resolves a single symbol name, checking local variables first, then
-	/// the global symbol table. Use `lookup_global_symbol` directly in
-	/// contexts without a function scope (const/global initializers).
-	fn resolve_symbol(
-		&self,
+	/// Resolves a single name in value position: local variables first,
+	/// then the global scope chain, forcing a `Pending` signature through
+	/// `ensure_signature` — the value-position twin of
+	/// what [`Self::resolve_pending_global_symbol`] does for types.
+	///
+	/// Type position has always forced; value position never did, so any
+	/// value reference resolved before its target's signature landed on the
+	/// `Pending` arm of `resolve_symbol_kind_to_expression`, which is
+	/// `unreachable!`. Two ways to get there: a const initializer naming a
+	/// const declared later, and a name imported by a `use` written below
+	/// the reference — both perfectly legal source.
+	///
+	/// `Err(())` means a cycle, already reported; the caller must not also
+	/// report the name as undeclared.
+	fn resolve_symbol_forcing(
+		&mut self,
 		func_ctx: &ExprContext,
-		symbol: SymbolU32,
-	) -> Option<ResolvedSymbol> {
-		if let Some((scope_index, local_index)) = func_ctx.resolve_local(symbol)
+		symbol: ast::Spanned<SymbolU32>,
+	) -> Result<Option<ResolvedSymbol>, ()> {
+		// A local always shadows a global, so returning here means the scope
+		// chain is never consulted for a local — no ambiguity report, no
+		// signature forced, and none of it wasted.
+		if let Some((scope_index, local_index)) =
+			func_ctx.resolve_local(symbol.inner)
 		{
-			return Some(ResolvedSymbol::Local {
+			return Ok(Some(ResolvedSymbol::Local {
 				scope_index,
 				local_index,
-			});
+			}));
 		}
-		self.lookup_global_symbol(
-			func_ctx.resolve_context.namespace,
-			(SymbolNamespace::Value, symbol),
-		)
-		.map(ResolvedSymbol::Global)
+
+		// Past the local check this *is* the global case, so it delegates
+		// rather than reimplementing: `resolve_pending_global_symbol` already
+		// reports ambiguity, guards the cycle, forces, and re-looks-up. Doing
+		// it here instead meant a second copy of the cycle guard — two places
+		// to keep in step for one rule — and three scope-chain walks per
+		// identifier where one does.
+		let resolve_context = func_ctx.resolve_context;
+		Ok(self
+			.resolve_pending_global_symbol(
+				resolve_context.namespace,
+				(SymbolNamespace::Value, symbol.inner),
+				SourceSpan::new(resolve_context.file_id, symbol.span),
+			)?
+			.map(ResolvedSymbol::Global))
 	}
 
 	/// Converts a `ResolvedSymbol` into an `Expression`, registering any
@@ -3825,9 +4175,10 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			ast::TypeExpression::GenericApplication { name, args } => {
 				if let Some(SymbolKind::Pending(def_id)) = self
-					.lookup_global_symbol(
+					.lookup_global_symbol_reporting(
 						resolve_context.namespace,
 						(SymbolNamespace::Type, name.inner),
+						SourceSpan::new(resolve_context.file_id, name.span),
 					) {
 					self.ensure_signature(def_id);
 				}
@@ -3931,9 +4282,10 @@ impl<'ast> Builder<'ast, '_> {
 				return TypeIndex::ERROR;
 			}
 			if let Some(SymbolKind::Pending(def_id)) = self
-				.lookup_global_symbol(
+				.lookup_global_symbol_reporting(
 					resolve_context.namespace,
 					(SymbolNamespace::Type, last.ident.inner),
+					SourceSpan::new(resolve_context.file_id, last.ident.span),
 				) {
 				self.ensure_signature(def_id);
 			}
@@ -4768,6 +5120,13 @@ impl<'ast> Builder<'ast, '_> {
 						let f = &self.tir.functions[idx as usize];
 						SourceSpan::new(f.file_id, f.name.span)
 					}
+					// An import's "declaration" is the local name it binds,
+					// which is the alias when it has one — that's the name
+					// that actually collided.
+					ItemIndex::Use(idx) => {
+						let u = &self.tir.use_items[idx as usize];
+						SourceSpan::new(u.file_id, u.local_name().span)
+					}
 					ItemIndex::Global(idx) => {
 						let g = &self.tir.globals[idx as usize];
 						SourceSpan::new(g.file_id, g.name.span)
@@ -4805,6 +5164,437 @@ impl<'ast> Builder<'ast, '_> {
 
 	/// Phase 1: registers every named item into `ast_nodes` without resolving
 	/// types.
+	/// Walks a `use` tree at prescan, handling its two leaf kinds
+	/// differently because they have opposite timing requirements.
+	///
+	/// A **glob** must be registered *now*: `lookup_global_symbol` consults
+	/// `wildcard_imports` throughout Phase 2, so an edge added later would
+	/// be invisible to every lookup that ran before it. Its prefix is
+	/// resolved with plain non-forcing lookups, which is sound only because
+	/// the only thing a prefix can name is a module, and module symbols are
+	/// installed by Phase 1a — before any item is scanned.
+	///
+	/// A **named leaf** cannot be resolved now: files are prescanned in
+	/// order, so `use math::add;` in `main.wx` runs before `math.wx`'s items
+	/// are registered. It binds its local name to `Pending`, which is
+	/// precisely the marker that makes any later reference force it through
+	/// `ensure_signature` — so the deferral costs nothing.
+	///
+	/// `contiguous_start` tracks where the current path spelling began, for
+	/// the glob's `x::*` span. It resets on entering a group element,
+	/// because a span reaching back across a `{` wouldn't be a contiguous
+	/// range of source.
+	fn pre_scan_use_tree(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		tree: &'ast ast::Spanned<ast::UseTree>,
+		prefix: &mut Vec<ast::Spanned<SymbolU32>>,
+		contiguous_start: u32,
+		prefix_index: Option<u32>,
+	) -> Option<u32> {
+		match &tree.inner {
+			ast::UseTree::Path { segment, rest } => {
+				prefix.push(*segment);
+				// A further segment is a *different* prefix, so leaves below
+				// it share with each other and not with anything alongside —
+				// hence `None` going down, and the caller's own index coming
+				// back out untouched for whatever follows this subtree.
+				self.pre_scan_use_tree(
+					file_id,
+					namespace,
+					rest,
+					prefix,
+					contiguous_start,
+					None,
+				);
+				prefix.pop();
+				prefix_index
+			}
+			ast::UseTree::Group(elements) => {
+				// Threaded across siblings: the first leaf that needs these
+				// tokens allocates them, and every later sibling is handed
+				// the same index. This is the whole reason `{ .. }` needs
+				// its own arm rather than folding into `Path`.
+				let mut shared = prefix_index;
+				for element in elements.iter() {
+					shared = self.pre_scan_use_tree(
+						file_id,
+						namespace,
+						&element.inner,
+						prefix,
+						element.inner.span.start,
+						shared,
+					);
+				}
+				shared
+			}
+			ast::UseTree::Glob => {
+				// Silent on every failure: this runs before other files have
+				// been scanned, so "not found" here means "not yet", and a
+				// bare `use *;` names nothing to import.
+				let PrefixWalk::Resolved(source_ns) =
+					self.walk_use_prefix(file_id, namespace, prefix)
+				else {
+					return prefix_index;
+				};
+				self.tir.namespaces[namespace as usize]
+					.wildcard_imports
+					.push(WildcardImport {
+						namespace: source_ns,
+						span: SourceSpan::new(
+							file_id,
+							ast::TextSpan::new(contiguous_start, tree.span.end),
+						),
+					});
+				// A glob binds no name, so it allocates no prefix of its
+				// own — `use a::b::*;` stores nothing.
+				prefix_index
+			}
+			ast::UseTree::Name { id, name, alias } => {
+				let local = alias.unwrap_or(*name);
+				let use_index = self.tir.use_items.len() as u32;
+
+				// Both namespaces, because which one this import lands in
+				// isn't knowable until its target resolves in Phase 2. The
+				// one that turns out to be wrong is withdrawn there.
+				for symbol_namespace in
+					[SymbolNamespace::Type, SymbolNamespace::Value]
+				{
+					self.claim_use_binding(
+						namespace,
+						(symbol_namespace, local.inner),
+						*id,
+					);
+				}
+
+				// Unconditional, like every other item arm: the stub and the
+				// `ast_nodes` entry exist whether or not the name was won,
+				// so a losing duplicate still resolves fully and still has a
+				// declaration span to point at.
+				// First leaf under this prefix allocates it; siblings handed
+				// the same index reuse it, so the segments are stored once
+				// however many names the group imports.
+				let prefix_index = prefix_index.unwrap_or_else(|| {
+					let index = self.tir.use_prefixes.len() as u32;
+					self.tir.use_prefixes.push(UsePrefix {
+						path: prefix.clone().into_boxed_slice(),
+						target: PrefixTarget::Unwalked,
+					});
+					index
+				});
+
+				// Unconditional, like every other item arm: the stub and the
+				// `ast_nodes` entry exist whether or not the name was won,
+				// so a losing duplicate still resolves fully and still has a
+				// declaration span to point at.
+				self.tir.item_lookup.insert(*id, ItemIndex::Use(use_index));
+				self.tir.use_items.push(UseItem {
+					id: *id,
+					file_id,
+					namespace,
+					prefix: prefix_index,
+					name: *name,
+					alias: *alias,
+				});
+				self.ast_nodes.push(AstEntry {
+					def_id: *id,
+					file_id,
+					namespace,
+					node: AstNodeRef::Use { use_index },
+				});
+				Some(prefix_index)
+			}
+		}
+	}
+
+	/// Resolves one named `use` leaf, in Phase 2: walks its prefix, looks
+	/// the name up in the namespace that lands on, and binds whichever of
+	/// the two symbol namespaces the target actually occupies.
+	///
+	/// Every path out of here has to leave the local name in a settled
+	/// state — bound to a real symbol, or gone. A `Pending` left behind
+	/// would outlive its own signature pass and hit the "signature resolved
+	/// but symbol still pending" unreachable at the next reference to it.
+	fn resolve_use_item(&mut self, use_index: u32) {
+		let item = &self.tir.use_items[use_index as usize];
+		let (id, file_id, namespace, name, local, prefix) = (
+			item.id,
+			item.file_id,
+			item.namespace,
+			item.name,
+			item.local_name(),
+			item.prefix,
+		);
+		let name_span = SourceSpan::new(file_id, name.span);
+
+		let target = match self.tir.use_prefixes[prefix as usize].target {
+			// A sibling leaf already walked these very tokens — reuse its
+			// answer rather than re-walking and re-reporting.
+			walked @ (PrefixTarget::Resolved(_) | PrefixTarget::Failed) => {
+				walked
+			}
+			PrefixTarget::Unwalked => {
+				let path = self.tir.use_prefixes[prefix as usize].path.clone();
+				// Unlike the glob path at prescan — which stays silent, since
+				// it can legitimately run before its target file has been
+				// scanned — a named leaf resolves late enough that everything
+				// it could name already exists, so every failure is real.
+				let walked = match self
+					.walk_use_prefix(file_id, namespace, &path)
+				{
+					PrefixWalk::Resolved(target_ns) => {
+						PrefixTarget::Resolved(target_ns)
+					}
+					// `use add;` — a bare name with nothing to import
+					// it *from*.
+					PrefixWalk::Empty => {
+						let name = self.interner.resolve(name.inner).unwrap();
+						self.tir.diagnostics.push(
+							report_import_without_module(name, name_span),
+						);
+						PrefixTarget::Failed
+					}
+					PrefixWalk::NotAModule(segment, span) => {
+						let name =
+							self.interner.resolve(segment.inner).unwrap();
+						self.tir
+							.diagnostics
+							.push(report_not_a_namespace(name, span));
+						PrefixTarget::Failed
+					}
+					PrefixWalk::Unresolved(span) => {
+						self.tir
+							.diagnostics
+							.push(report_undeclared_identifier(span));
+						PrefixTarget::Failed
+					}
+				};
+				self.tir.use_prefixes[prefix as usize].target = walked;
+				walked
+			}
+		};
+
+		let PrefixTarget::Resolved(target_ns) = target else {
+			self.withdraw_use_claims(namespace, local.inner, id);
+			return;
+		};
+
+		let mut bound_any = false;
+		for symbol_namespace in [SymbolNamespace::Type, SymbolNamespace::Value]
+		{
+			let resolved = self.resolve_pending_namespace_symbol(
+				namespace,
+				target_ns,
+				(symbol_namespace, name.inner),
+				name_span,
+			);
+			match resolved {
+				Ok(Some(kind)) => {
+					let key = (symbol_namespace, local.inner);
+
+					// A rival import may be sitting on this slot. Resolve it
+					// first so the slot settles into either a real binding or
+					// nothing — that's what distinguishes a genuine
+					// collision from a claim that was about to be withdrawn
+					// anyway. It cannot recurse back into this leaf: a rival
+					// only ever displaced us, so we hold nothing it wants.
+					if let Some(SymbolKind::Pending(rival)) =
+						self.direct_scope_lookup(namespace, key)
+						&& rival != id && matches!(
+						self.tir.item_lookup.get(&rival),
+						Some(ItemIndex::Use(_))
+					) {
+						self.ensure_signature(rival);
+					}
+
+					match self.direct_scope_lookup(namespace, key) {
+						// Ours, or vacated by a rival that didn't want it.
+						Some(SymbolKind::Pending(pending_id))
+							if pending_id == id =>
+						{
+							self.insert_symbol(namespace, key, kind);
+						}
+						None => self.insert_symbol(namespace, key, kind),
+						// Someone else really holds this name. Now that the
+						// import is known to want it, the collision is real —
+						// report it here, where prescan couldn't.
+						Some(occupant) => {
+							self.report_import_collision(
+								occupant,
+								symbol_namespace,
+								local,
+								SourceSpan::new(file_id, local.span),
+							);
+						}
+					}
+					// Only for the first namespace that binds. An item
+					// occupying both — a `memory` does — would otherwise
+					// record the identical span twice, and the LSP turns
+					// every access into a reference, so a rename would
+					// emit two overlapping edits at one range.
+					if !bound_any {
+						self.record_type_kind_access(file_id, kind, name.span);
+					}
+					bound_any = true;
+				}
+				Ok(None) => {
+					self.withdraw_use_claim(
+						namespace,
+						local.inner,
+						id,
+						symbol_namespace,
+					);
+				}
+				// Private or cyclic — already reported, and it disqualifies
+				// the name in every symbol namespace at once. Returning
+				// rather than breaking also skips the not-found report
+				// below, which would otherwise pile a second diagnostic on
+				// the same name.
+				Err(()) => {
+					self.withdraw_use_claims(namespace, local.inner, id);
+					return;
+				}
+			}
+		}
+
+		if !bound_any {
+			let name_str = self.interner.resolve(name.inner).unwrap();
+			// A package has no name of its own — it's known by the key the
+			// asking package declared it under, so this needs the *asking*
+			// namespace's package, not the target's.
+			let module = self.tir.namespace_name(
+				target_ns,
+				self.packages,
+				self.tir.namespaces[namespace as usize].package,
+			);
+			let module_str = self.interner.resolve(module).unwrap();
+			self.tir.diagnostics.push(report_unresolved_import(
+				name_str, module_str, name_span,
+			));
+		}
+	}
+
+	/// Reports an import colliding with whatever already holds its local
+	/// name. Ordered by source position rather than by which side is the
+	/// import, so the labels read the same way as any other duplicate
+	/// definition.
+	fn report_import_collision(
+		&mut self,
+		occupant: SymbolKind,
+		symbol_namespace: SymbolNamespace,
+		local: ast::Spanned<SymbolU32>,
+		import: SourceSpan,
+	) {
+		let occupant = self.get_symbol_location(occupant);
+		let name = self.interner.resolve(local.inner).unwrap();
+		let swap = occupant.file_id == import.file_id
+			&& occupant.span.start > import.span.start;
+		let (first, second) = if swap {
+			(import, occupant)
+		} else {
+			(occupant, import)
+		};
+		self.tir.diagnostics.push(report_duplicate_definition(
+			DuplicateDefinitionDiagnostic {
+				name,
+				namespace: symbol_namespace,
+				first_definition: first,
+				second_definition: second,
+			},
+		));
+	}
+
+	/// Removes this leaf's provisional `Pending` claim from one symbol
+	/// namespace — but only where the claim is still this leaf's own, since
+	/// a real declaration may have displaced it.
+	fn withdraw_use_claim(
+		&mut self,
+		namespace: NamespaceIndex,
+		local: SymbolU32,
+		id: ast::DefId,
+		symbol_namespace: SymbolNamespace,
+	) {
+		let key = (symbol_namespace, local);
+		if matches!(
+			self.direct_scope_lookup(namespace, key),
+			Some(SymbolKind::Pending(pending_id)) if pending_id == id
+		) {
+			self.tir.namespaces[namespace as usize].symbols.remove(&key);
+		}
+	}
+
+	/// [`Self::withdraw_use_claim`] for both symbol namespaces — what a leaf
+	/// that resolved to nothing at all needs.
+	fn withdraw_use_claims(
+		&mut self,
+		namespace: NamespaceIndex,
+		local: SymbolU32,
+		id: ast::DefId,
+	) {
+		for symbol_namespace in [SymbolNamespace::Type, SymbolNamespace::Value]
+		{
+			self.withdraw_use_claim(namespace, local, id, symbol_namespace);
+		}
+	}
+
+	/// Walks a `use` prefix to the namespace it names, recording an access
+	/// per resolved segment for IDE navigation.
+	///
+	/// Non-forcing on purpose: the only thing a prefix segment can legally
+	/// name is a module, and module symbols are installed in Phase 1a —
+	/// before any item is scanned — so a prefix is never `Pending`.
+	///
+	/// Reports nothing except an ambiguous first segment (which the lookup
+	/// itself reports). Whether a failure deserves a diagnostic depends
+	/// entirely on who is asking: prescan walks glob prefixes before other
+	/// files exist and must stay silent, while a named leaf in Phase 2 is
+	/// late enough that silence would just lose the error. Returning the
+	/// outcome instead of reporting it is what lets one walker serve both
+	/// without a "should I report" flag.
+	fn walk_use_prefix(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		prefix: &[ast::Spanned<SymbolU32>],
+	) -> PrefixWalk {
+		let mut current_ns: Option<NamespaceIndex> = None;
+		for segment in prefix.iter() {
+			let key = (SymbolNamespace::Type, segment.inner);
+			let span = SourceSpan::new(file_id, segment.span);
+			let kind = match current_ns {
+				// Later segments resolve only inside what we've already
+				// walked into.
+				Some(idx) => {
+					self.tir.namespaces[idx as usize].symbols.get(&key).copied()
+				}
+				// The first segment is an ordinary scope-chain lookup from
+				// wherever the `use` was written, so it reaches a sibling
+				// module, or a dependency name held further up on the
+				// package's own root namespace. It is also the only segment
+				// that can be glob-ambiguous — the rest read one namespace's
+				// own map directly.
+				None => {
+					self.lookup_global_symbol_reporting(namespace, key, span)
+				}
+			};
+			match kind {
+				Some(SymbolKind::Module { namespace_idx }) => {
+					self.tir.namespaces[namespace_idx as usize]
+						.accesses
+						.push(span);
+					current_ns = Some(namespace_idx);
+				}
+				Some(_) => return PrefixWalk::NotAModule(*segment, span),
+				None => return PrefixWalk::Unresolved(span),
+			}
+		}
+		match current_ns {
+			Some(namespace_idx) => PrefixWalk::Resolved(namespace_idx),
+			None => PrefixWalk::Empty,
+		}
+	}
+
 	fn pre_scan_item(
 		&mut self,
 		file_id: FileId,
@@ -5427,49 +6217,29 @@ impl<'ast> Builder<'ast, '_> {
 					lookup: HashMap::new(),
 				});
 			}
-			ast::Item::Use { path, pub_span: _ } => {
-				// Resolve the path to a namespace index and register it as a
-				// wildcard import on the current namespace.  Symbols are looked
-				// up lazily via `lookup_global_symbol` — no copying needed.
-				// Each resolved segment gets an access recorded for IDE navigation.
-				let mut current_ns: Option<NamespaceIndex> = None;
-				let mut resolved = true;
-				for segment in path.iter() {
-					let key = (SymbolNamespace::Type, segment.inner);
-					let kind = match current_ns {
-						// Later segments resolve only inside what we've
-						// already walked into.
-						Some(idx) => self.tir.namespaces[idx as usize]
-							.symbols
-							.get(&key)
-							.copied(),
-						// The first segment is an ordinary scope-chain lookup
-						// from wherever the `use` was written, so it reaches a
-						// sibling module, or a dependency name held further up
-						// on the package's own root namespace.
-						None => self.lookup_global_symbol(namespace, key),
-					};
-					match kind {
-						Some(SymbolKind::Module { namespace_idx }) => {
-							self.tir.namespaces[namespace_idx as usize]
-								.accesses
-								.push(SourceSpan::new(file_id, segment.span));
-							current_ns = Some(namespace_idx);
-						}
-						_ => {
-							resolved = false;
-							break;
-						}
-					}
-				}
-				if resolved && let Some(source_ns) = current_ns {
-					self.tir.namespaces[namespace as usize]
-						.wildcard_imports
-						.push(source_ns);
-				}
+			ast::Item::Use { tree, pub_span: _ } => {
+				let mut prefix: Vec<ast::Spanned<SymbolU32>> = Vec::new();
+				self.pre_scan_use_tree(
+					file_id,
+					namespace,
+					tree,
+					&mut prefix,
+					tree.span.start,
+					None,
+				);
 			}
-			ast::Item::Export { .. } => {
-				// handled during build pass
+			ast::Item::Export { id, .. } => {
+				// No name binding of its own — an export block declares
+				// nothing, it only names items declared elsewhere. It still
+				// gets an `ast_nodes` entry so the Phase 2 sweep reaches it
+				// in parse order, at which point it can force each listed
+				// name through `ensure_signature` like any other reference.
+				self.ast_nodes.push(AstEntry {
+					def_id: *id,
+					file_id,
+					namespace,
+					node: AstNodeRef::Export { item },
+				});
 			}
 			ast::Item::TypeSet {
 				id,
@@ -6918,6 +7688,73 @@ impl<'ast> Builder<'ast, '_> {
 						SymbolKind::Global { global_index },
 					);
 				}
+			}
+			AstNodeRef::Use { use_index } => {
+				self.resolve_use_item(use_index);
+			}
+			AstNodeRef::Export { item } => {
+				// The block's own `DefId` is only ever the `ast_nodes` /
+				// `sig_state` key that got us here; nothing downstream of
+				// resolution refers to a block by id.
+				let ast::Item::Export {
+					keyword_span,
+					entries,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let keyword = SourceSpan::new(file_id, *keyword_span);
+				let block_package =
+					self.tir.namespaces[namespace as usize].package;
+
+				// A library has no ABI of its own — it is consumed through
+				// `pub`, not through exports. This also catches every block
+				// in a dependency, since a dependency is only ever loaded as
+				// a library, and "you can't export from here" is the useful
+				// thing to say about one: moving the block wouldn't help.
+				if matches!(
+					self.packages[block_package.as_usize()].kind,
+					PackageKind::Library
+				) {
+					self.tir
+						.diagnostics
+						.push(report_library_cannot_export(keyword));
+					return;
+				}
+
+				// The entry file's top level is the only namespace equal to
+				// its package's root, so this one comparison rejects both a
+				// submodule file and an inline `mod { .. }` block.
+				let root_namespace =
+					self.tir.package_namespaces[&self.root_package];
+				if namespace != root_namespace {
+					self.tir
+						.diagnostics
+						.push(report_export_block_not_at_root(keyword));
+					return;
+				}
+
+				// The single `Option` that stores a block's exports is also
+				// what proves no earlier block exists, so the two can't
+				// disagree. Note that every rejection above returns *before*
+				// this point: a misplaced block must not claim the slot, or
+				// the package's real block would be reported as the
+				// duplicate of one that was itself rejected.
+				if let Some(existing) = &self.tir.export_block {
+					self.tir.diagnostics.push(report_duplicate_export_block(
+						existing.keyword,
+						keyword,
+					));
+					return;
+				}
+
+				// `export { .. }` is a top-level item, so the names it lists
+				// resolve against the package's own root namespace and no
+				// wider one.
+				let items =
+					self.build_exports(file_id, root_namespace, entries);
+				self.tir.export_block = Some(ExportBlock { keyword, items });
 			}
 			AstNodeRef::TraitImplBlock { item } => {
 				let (block_id, type_params, trait_name, target) = match item {
@@ -8787,28 +9624,45 @@ impl<'ast> Builder<'ast, '_> {
 		file_id: FileId,
 		package_namespace: NamespaceIndex,
 		entries: &[Separated<Spanned<ast::ExportEntry>>],
-	) {
+	) -> HashMap<SymbolU32, ExportItem> {
+		let mut items: HashMap<SymbolU32, ExportItem> = HashMap::new();
 		for entry in entries.iter() {
 			let internal_name = &entry.inner.inner.name;
 
-			let exported_scope =
-				&self.tir.namespaces[package_namespace as usize].symbols;
-			let global_value = match exported_scope
-				.get(&(SymbolNamespace::Value, internal_name.inner))
-			{
-				Some(value) => *value,
+			let span = SourceSpan::new(file_id, internal_name.span);
+			// Force the listed name through `ensure_signature` rather than
+			// reading whatever happens to be resolved already: an export
+			// block is just another reference site, so it pulls in what it
+			// names the same way any other reference does.
+			//
+			// And it resolves through the *scope chain*, not the package
+			// root's own symbol map, so an entry names whatever that name
+			// means at the root — including something a `use` put there.
+			// A direct map lookup made every submodule item unexportable by
+			// any spelling at all: `use math::add; export { add }` would
+			// resolve `add` for every other reference site in the file and
+			// then fail here alone.
+			let Ok(value_symbol) = self.resolve_pending_global_symbol(
+				package_namespace,
+				(SymbolNamespace::Value, internal_name.inner),
+				span,
+			) else {
+				continue;
+			};
+			let global_value = match value_symbol {
+				Some(value) => value,
 				None => {
 					// Not a value, but it might still name a real item that
 					// simply isn't exportable (an enum, struct, trait, ...) —
 					// report the more precise diagnostic instead of treating
 					// it as an unresolved name. Still record the access so
 					// the LSP can resolve hover/go-to-definition on it.
-					if let Some(type_value) = self.tir.namespaces
-						[package_namespace as usize]
-						.symbols
-						.get(&(SymbolNamespace::Type, internal_name.inner))
-						.copied()
-					{
+					if let Ok(Some(type_value)) = self
+						.resolve_pending_global_symbol(
+							package_namespace,
+							(SymbolNamespace::Type, internal_name.inner),
+							span,
+						) {
 						self.record_type_kind_access(
 							file_id,
 							type_value,
@@ -8932,7 +9786,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 
-			match self.tir.exports.get(&export_symbol) {
+			match items.get(&export_symbol) {
 				Some(existing_export) => {
 					let name = self.interner.resolve(export_symbol).unwrap();
 					let first_export_span = match existing_export {
@@ -8966,10 +9820,11 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				}
 				None => {
-					self.tir.exports.insert(export_symbol, export_item);
+					items.insert(export_symbol, export_item);
 				}
 			}
 		}
+		items
 	}
 
 	/// Resolves an enum's repr type, folds every variant's value (explicit or
@@ -10976,8 +11831,20 @@ impl<'ast> Builder<'ast, '_> {
 
 		// ── single-segment, no type args: plain identifier / local / global ───
 		if path.len() == 1 && last.type_args.is_empty() {
-			let symbol = last.ident.inner;
-			return match self.resolve_symbol(func_ctx, symbol) {
+			let resolved = match self
+				.resolve_symbol_forcing(func_ctx, last.ident)
+			{
+				Ok(resolved) => resolved,
+				// Cyclic — already reported.
+				Err(()) => {
+					return Ok(Expression {
+						kind: ExprKind::Error,
+						ty: access_ctx.expected_type.infer_or(TypeIndex::ERROR),
+						span: expr_span,
+					});
+				}
+			};
+			return match resolved {
 				Some(resolved) => self.resolved_symbol_to_expression(
 					func_ctx, access_ctx, resolved, expr_span,
 				),
@@ -11001,9 +11868,13 @@ impl<'ast> Builder<'ast, '_> {
 		if path.len() == 1 {
 			let seg = &path[0];
 			let func_index = match self
-				.lookup_global_symbol(
+				.lookup_global_symbol_reporting(
 					func_ctx.resolve_context.namespace,
 					(SymbolNamespace::Value, seg.ident.inner),
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						seg.ident.span,
+					),
 				)
 				.filter(|k| !matches!(k, SymbolKind::Pending(_)))
 			{

@@ -73,6 +73,33 @@ fn test_format_simple_function() {
 	);
 }
 
+/// `use` trees round-trip through the formatter unchanged, groups included.
+/// They stay on one line even at a narrow `max_line_width`: a `use` names
+/// things living elsewhere, so its length tracks the path being imported
+/// rather than anything in this file.
+#[test]
+fn test_format_use_trees() {
+	let source = indoc! {"
+        use math::*;
+        use math::add;
+        use math::add as plus;
+        use math::{add, sub};
+        use math::{trig::{sin, cos}, ops::*};
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 40,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(output, source);
+}
+
 #[test]
 fn test_format_import_block() {
 	let case = TestCase::new(indoc! {"

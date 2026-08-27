@@ -136,6 +136,10 @@ items:
   - inner:
       inner:
         Export:
+          id: 1
+          keyword_span:
+            start: 40
+            end: 46
           entries:
             - inner:
                 inner:

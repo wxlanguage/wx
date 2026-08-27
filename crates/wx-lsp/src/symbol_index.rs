@@ -776,7 +776,11 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		}
 	}
 
-	for export in tir.exports.values() {
+	for export in tir
+		.export_block
+		.iter()
+		.flat_map(|block| block.items.values())
+	{
 		match export {
 			ExportItem::Function {
 				internal_name, id, ..

@@ -327,6 +327,23 @@ fn test_pub_use_reexports_without_diagnostic() {
 	assert!(pub_span.is_some());
 }
 
+/// Every `use` form the grammar accepts, in one snapshot — the tree shape
+/// is the part worth pinning, since resolution reads it structurally.
+#[test]
+fn test_use_tree_forms() {
+	let case = TestCase::new(indoc! {"
+        use math::*;
+        use math::add;
+        use math::add as plus;
+        use math::{add, sub};
+        use math::{trig::{sin, cos}, ops::*};
+        use a::b::c::d;
+    "});
+
+	assert!(case.ast.diagnostics.is_empty());
+	insta::assert_yaml_snapshot!(case.ast);
+}
+
 #[test]
 fn test_export_alias() {
 	let case = TestCase::new(indoc! {"

@@ -996,6 +996,101 @@ pub struct FunctionParam {
 	pub ty: ast::Spanned<TypeIndex>,
 }
 
+/// One named leaf of a `use` tree — `sin` in `use math::trig::{sin, cos};`.
+/// One per leaf, so it is 1:1 with a `DefId`. Globs have no entry here:
+/// they register a [`WildcardImport`] at prescan and bind no name.
+///
+/// This exists so that a `use` leaf is an *item* like any other.
+/// `SymbolKind::Pending(def_id)` universally means "a stub for `def_id` is
+/// already materialized, reachable through `item_lookup`" — that invariant
+/// is what lets `get_symbol_location` produce a declaration span for a name
+/// whose signature hasn't been computed yet. A leaf that bound a name
+/// without a stub would be a `Pending` with nothing behind it, and the
+/// duplicate-definition diagnostic for `use a::foo;` alongside `fn foo`
+/// would panic on the missing key rather than report.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct UseItem {
+	pub id: DefId,
+	pub file_id: FileId,
+	/// The namespace the `use` was written in — where `local_name` binds.
+	pub namespace: NamespaceIndex,
+	/// Index into `TIR::use_prefixes` — the `math` of `use math::sin;`,
+	/// shared with every sibling leaf that named the same tokens.
+	pub prefix: u32,
+	pub name: ast::Spanned<SymbolU32>,
+	pub alias: Option<ast::Spanned<SymbolU32>>,
+}
+
+/// One occurrence of a `use` prefix — `math` in `use math::{sin, cos};`,
+/// named once in the source and therefore stored once here, however many
+/// leaves sit under it.
+///
+/// Walking it per leaf would resolve the same path repeatedly and record
+/// the same access repeatedly; since the LSP turns every access into a
+/// reference, the duplicates would give find-references repeats and make a
+/// rename emit two overlapping edits at one range. Whichever leaf needs it
+/// first walks it and stores the outcome; the rest read that.
+///
+/// Two separate statements — `use math::add; use math::sub;` — get two
+/// entries, correctly: they are two distinct mentions of `math`.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct UsePrefix {
+	/// The segments as written. Purely syntactic — prescan cannot resolve
+	/// them, which is exactly why named leaves defer to Phase 2. Recorded
+	/// here rather than recovered from the AST later because the prescan
+	/// walk builds this anyway to resolve sibling globs.
+	pub path: Box<[ast::Spanned<SymbolU32>]>,
+	pub target: PrefixTarget,
+}
+
+/// Where a [`UsePrefix`] leads. Three states rather than an
+/// `Option<NamespaceIndex>`, because "nobody has walked this yet" and
+/// "walked, and it goes nowhere" need different answers: the first means
+/// walk it, the second means stay quiet, since the diagnostic was already
+/// reported by whoever walked it.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum PrefixTarget {
+	Unwalked,
+	Resolved(NamespaceIndex),
+	Failed,
+}
+
+impl UseItem {
+	/// The name this import binds locally — the alias when renamed, else
+	/// the imported name itself.
+	#[inline]
+	pub fn local_name(&self) -> ast::Spanned<SymbolU32> {
+		self.alias.unwrap_or(self.name)
+	}
+}
+
+/// A package's `export { .. }` block — its single exit point, and so
+/// either present exactly once or absent entirely.
+///
+/// The resolved items live *inside* the block rather than in a `TIR`-level
+/// map beside a separate "have we already seen a block?" flag, so that one
+/// `Option` answers both questions and the two can never disagree: the
+/// check that rejects a second block is a read of the very value that
+/// holds the first block's exports.
+#[cfg_attr(test, derive(Debug, serde::Serialize))]
+pub struct ExportBlock {
+	/// The `export` keyword itself — what a "previous export block here"
+	/// label points at, and the only span an empty block has.
+	pub keyword: SourceSpan,
+	/// Keyed by *external* name (`alias ?? internal_name`): what has to be
+	/// unique is the name the WASM ABI exposes, not the item's internal
+	/// spelling.
+	#[cfg_attr(
+		test,
+		serde(serialize_with = "crate::testing::serialize_sorted_map")
+	)]
+	pub items: HashMap<SymbolU32, ExportItem>,
+}
+
 #[cfg_attr(test, derive(Debug, serde::Serialize))]
 #[derive(Clone)]
 pub enum ExportItem {
@@ -1071,7 +1166,12 @@ pub struct MatchArm {
 	pub body: Box<Expression>,
 }
 
-#[derive(Clone, Copy)]
+/// `PartialEq` is item identity: every variant is a plain index into a
+/// `TIR` collection, so two equal `SymbolKind`s name the same item. That is
+/// what lets a name reachable through two different globs be recognised as
+/// one item rather than an ambiguity — two modules that each `pub use
+/// c::foo;` both store the identical `Function { func_index }`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum SymbolKind {
@@ -1209,7 +1309,7 @@ pub struct ModuleNamespace {
 	pub symbols: HashMap<(SymbolNamespace, SymbolU32), SymbolKind>,
 	/// Namespaces brought into scope via `use path::*;`.  Checked during lookup
 	/// after direct symbols but before walking to the parent.
-	pub wildcard_imports: Vec<NamespaceIndex>,
+	pub wildcard_imports: Vec<WildcardImport>,
 	/// Source spans where this namespace is referenced (e.g. path segments in
 	/// `use` statements).  Used by the IDE for go-to-definition.
 	pub accesses: Vec<SourceSpan>,
@@ -1226,6 +1326,22 @@ pub struct ModuleDecl {
 	pub own_file_id: Option<FileId>,
 	pub name: ast::Spanned<SymbolU32>,
 	pub pub_span: Option<ast::TextSpan>,
+}
+
+/// One `use path::*;` edge — the namespace it opens, plus where it was
+/// written.
+///
+/// The span is what makes a wildcard ambiguity reportable: when two globs
+/// supply the same name, the thing to point at is the `use` statements, not
+/// the definitions (which are each perfectly fine on their own). Covers the
+/// path and the star, `x::*`, not the `use` keyword — and for a glob nested
+/// in a group (`use a::{b::*, c}`) only `b::*`, since a span reaching back
+/// to `a` wouldn't be a contiguous range of source.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct WildcardImport {
+	pub namespace: NamespaceIndex,
+	pub span: SourceSpan,
 }
 
 /// Declaration-site metadata for an import block (`import "env" { }`).
@@ -1651,6 +1767,10 @@ define_diagnostic_codes! {
 		UnreachableMatchArm => "W1010",
 		MissingTypeAliasBody => "E1070",
 		EnumVariantRequiresExplicitValue => "E1071",
+		DuplicateExportBlock => "E1072",
+		ExportBlockNotAtRoot => "E1073",
+		LibraryCannotExport => "E1074",
+		AmbiguousWildcardImport => "E1075",
 	}
 }
 
@@ -1768,40 +1888,6 @@ impl<'a> TypeFormatter<'a> {
 			interner,
 			packages,
 			from,
-		}
-	}
-
-	pub fn display_kind(&self, idx: TypeIndex) -> &'static str {
-		match &self.tir.types[idx.as_usize()] {
-			Type::Struct { .. } => "struct",
-			Type::Function { .. } | Type::FunctionItem { .. } => "function",
-			Type::Enum { .. } => "enum",
-			Type::F32 | Type::F64 | Type::Float => "float",
-			Type::I8
-			| Type::I16
-			| Type::I32
-			| Type::I64
-			| Type::U8
-			| Type::U16
-			| Type::U32
-			| Type::U64
-			| Type::Integer => "integer",
-			Type::Bool => "bool",
-			Type::Char => "char",
-			Type::Namespace { .. } => "module",
-			Type::Memory { .. } => "memory",
-			Type::Unit => "unit",
-			Type::Array { .. } => "array",
-			Type::Slice { .. } => "slice",
-			Type::Pointer { .. } => "pointer",
-			Type::Tuple { .. } => "tuple",
-			Type::Error => "{unknown}",
-			Type::Infer => "_",
-			Type::Never => "never",
-			Type::AssocTypeProjection { .. } | Type::AssociatedType { .. } => {
-				"type"
-			}
-			Type::TypeParam { .. } => "generic",
 		}
 	}
 
@@ -2164,6 +2250,8 @@ impl<'a> TypeFormatter<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ItemIndex {
 	Function(FunctionIndex),
+	/// Index into `TIR::use_items` — one named `use` leaf.
+	Use(u32),
 	Global(GlobalIndex),
 	Memory(MemoryIndex),
 	Struct(u32),
@@ -2205,11 +2293,11 @@ pub struct TIR {
 	pub module_decls: Vec<ModuleDecl>,
 	pub import_decls: Vec<ImportDecl>,
 	pub enums: Vec<Enum>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub exports: HashMap<SymbolU32, ExportItem>,
+	pub export_block: Option<ExportBlock>,
+	/// Every named `use` leaf, in prescan order. See [`UseItem`].
+	pub use_items: Vec<UseItem>,
+	/// Every distinct `use` prefix occurrence. See [`UsePrefix`].
+	pub use_prefixes: Vec<UsePrefix>,
 	pub structs: Vec<Struct>,
 	/// Every inherent impl block — concrete (`impl Target { .. }`, empty
 	/// `type_params`) and generic (`impl<T> Target { .. }`) alike. See

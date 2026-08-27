@@ -19,16 +19,27 @@ struct TestCase {
 
 impl TestCase {
 	fn new(source: &str) -> Self {
+		Self::new_multi_file("main.wx", source, &[])
+	}
+
+	fn new_multi_file(
+		entry_path: &str,
+		source: &str,
+		extra_files: &[(&str, &str)],
+	) -> Self {
+		let prefixed = format!("use std::*;\n{source}");
+		let mut workspace_files =
+			HashMap::from([(entry_path.to_string(), prefixed)]);
+		for (path, source) in extra_files {
+			workspace_files.insert((*path).to_string(), (*source).to_string());
+		}
+
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		builder.load_stdlib();
-		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
-				vfs::AbsolutePath::new("/main.wx"),
-				&vfs::VirtualFileSource::from_relative(HashMap::from([(
-					"main.wx".to_string(),
-					prefixed,
-				)])),
+				vfs::AbsolutePath::new(format!("/{entry_path}")),
+				&vfs::VirtualFileSource::from_relative(workspace_files),
 			)
 			.unwrap();
 		let mut graph = builder.build(root_id);
@@ -86,6 +97,44 @@ impl TestCase {
 			bytecode,
 		}
 	}
+}
+
+/// Resolving an export is not the same as emitting one. This runs the whole
+/// pipeline on a function that reaches the export block only through a
+/// `use` — a glob, which is the spelling that genuinely needed the reach
+/// fix — and calls it through wasmtime under its external name, so a name
+/// that resolved in TIR but never made it into the wasm export section
+/// would fail here rather than silently produce an empty ABI.
+#[test]
+fn test_export_of_a_glob_imported_function_is_callable() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod math;
+            use math::*;
+
+            export { add as \"sum\" }
+        "},
+		&[("src/math.wx", "pub fn add(a: i32, b: i32) -> i32 { a + b }")],
+	);
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	// Under the alias, not the internal name — the entry renamed it.
+	let sum = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "sum")
+		.expect("`add` should be exported as `sum`");
+	assert_eq!(sum.call(&mut store, (5, 3)).unwrap(), 8);
+
+	assert!(
+		instance.get_func(&mut store, "add").is_none(),
+		"the internal name must not leak into the ABI"
+	);
 }
 
 #[test]

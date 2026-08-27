@@ -792,9 +792,12 @@ impl MIR {
 				})
 				.collect(),
 			exports: {
+				// No block at all and a block that exports nothing are the
+				// same artifact — an empty ABI.
 				let mut exports: Vec<ExportItem> = tir
-					.exports
-					.values()
+					.export_block
+					.iter()
+					.flat_map(|block| block.items.values())
 					.map(|export| match export {
 						tir::ExportItem::Function {
 							id,

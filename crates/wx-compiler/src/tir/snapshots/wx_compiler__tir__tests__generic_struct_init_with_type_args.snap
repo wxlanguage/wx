@@ -29829,7 +29829,12 @@ namespaces:
       : Function:
           func_index: 101
     wildcard_imports:
-      - 0
+      - namespace: 0
+        span:
+          file_id: 1
+          span:
+            start: 4
+            end: 10
     accesses: []
   - parent: 0
     package: 0
@@ -29888,16 +29893,24 @@ module_decls:
       end: 26932
 import_decls: []
 enums: []
-exports:
-  243:
-    Function:
-      internal_name:
-        inner: 243
-        span:
-          start: 136
-          end: 140
-      external_name: ~
-      id: 470
+export_block:
+  keyword:
+    file_id: 1
+    span:
+      start: 127
+      end: 133
+  items:
+    243:
+      Function:
+        internal_name:
+          inner: 243
+          span:
+            start: 136
+            end: 140
+        external_name: ~
+        id: 470
+use_items: []
+use_prefixes: []
 structs:
   - id: 431
     file_id: 0

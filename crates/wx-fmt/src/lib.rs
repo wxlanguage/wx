@@ -489,7 +489,7 @@ impl<'a> Builder<'a> {
 				type_annotation,
 				value,
 			),
-			ast::Item::Export { entries } => {
+			ast::Item::Export { entries, .. } => {
 				self.build_export_definition(span, entries)
 			}
 			ast::Item::Import {
@@ -633,21 +633,51 @@ impl<'a> Builder<'a> {
 				body.as_deref(),
 				attributes,
 			),
-			ast::Item::Use { path, pub_span } => {
+			ast::Item::Use { tree, pub_span } => {
 				let mut items: Vec<NodeId> = Vec::new();
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Use));
-				for (i, segment) in path.iter().enumerate() {
-					if i > 0 {
-						items.push(self.text(Text::ColonColon));
-					}
-					items.push(self.symbol(segment.inner));
-				}
-				items.push(self.text(Text::ColonColon));
-				items.push(self.text(Text::Star));
+				let tree = self.build_use_tree(&tree.inner);
+				items.push(tree);
 				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+		}
+	}
+
+	/// A `use` tree, rendered on one line. Groups stay inline rather than
+	/// breaking like an `export` block does: a `use` names things that live
+	/// elsewhere, so its length tracks the path being imported rather than
+	/// the size of anything in this file, and it stays short in practice.
+	fn build_use_tree(&mut self, tree: &ast::UseTree) -> NodeId {
+		match tree {
+			ast::UseTree::Glob => self.text(Text::Star),
+			ast::UseTree::Name { name, alias, .. } => {
+				let mut items: Vec<NodeId> = vec![self.symbol(name.inner)];
+				if let Some(alias) = alias {
+					items.push(self.text(Text::As));
+					items.push(self.symbol(alias.inner));
+				}
+				self.arena.concat(items)
+			}
+			ast::UseTree::Path { segment, rest } => {
+				let segment = self.symbol(segment.inner);
+				let colons = self.text(Text::ColonColon);
+				let rest = self.build_use_tree(&rest.inner);
+				self.arena.concat(vec![segment, colons, rest])
+			}
+			ast::UseTree::Group(elements) => {
+				let mut items: Vec<NodeId> = vec![self.text(Text::LBrace)];
+				for (index, element) in elements.iter().enumerate() {
+					if index > 0 {
+						items.push(self.text(Text::CommaSp));
+					}
+					let element = self.build_use_tree(&element.inner.inner);
+					items.push(element);
+				}
+				items.push(self.text(Text::RBrace));
 				self.arena.concat(items)
 			}
 		}
