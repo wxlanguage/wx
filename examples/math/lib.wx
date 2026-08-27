@@ -1,3 +1,5 @@
+use std::*;
+
 impl f64 {
   /// Archimedes' constant (π)
   pub const PI: f64 = 3.14159265358979323846264338327950288;

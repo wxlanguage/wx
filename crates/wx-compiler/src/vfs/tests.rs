@@ -208,10 +208,7 @@ fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 		.load_binary(
 			AbsolutePath::new("/src/main.wx"),
 			&VirtualFileSource::new(HashMap::from([
-				(
-					AbsolutePath::new("/src/main.wx"),
-					"mod math;".to_string(),
-				),
+				(AbsolutePath::new("/src/main.wx"), "mod math;".to_string()),
 				(AbsolutePath::new("/src/math.wx"), "fn add() {}".to_string()),
 			])),
 		)
@@ -289,8 +286,7 @@ fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
 			AbsolutePath::new("/main.wx"),
 			&VirtualFileSource::new(HashMap::from([(
 				AbsolutePath::new("/main.wx"),
-				"mod utils { mod extra; }\nfn works() -> i32 { 1 }"
-					.to_string(),
+				"mod utils { mod extra; }\nfn works() -> i32 { 1 }".to_string(),
 			)])),
 		)
 		.expect("the entry file itself is still readable");

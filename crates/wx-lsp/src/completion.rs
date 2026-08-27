@@ -307,14 +307,14 @@ pub fn global_completion_items(
 	prefix: &str,
 	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter_map(|def| {
@@ -365,13 +365,13 @@ pub fn type_completion_items(
 	prefix: &str,
 	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter(|def| is_type_like(&def.info.kind))
@@ -507,10 +507,10 @@ fn resolve_bare_name(
 ) -> Option<SymbolKind> {
 	let lower = symbol_index
 		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap_or("") < name);
+		.partition_point(|def| interner.resolve(def.name).unwrap() < name);
 	symbol_index.global_definitions[lower..]
 		.iter()
-		.take_while(|def| interner.resolve(def.name).unwrap_or("") == name)
+		.take_while(|def| interner.resolve(def.name).unwrap() == name)
 		.find(|def| visible.contains(&def.namespace))
 		.map(|def| def.info.kind)
 }

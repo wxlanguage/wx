@@ -12835,3 +12835,161 @@ fn test_generic_bitnot_bound_dispatches() {
 			.collect::<Vec<_>>()
 	);
 }
+
+#[test]
+fn test_deref_of_error_type_does_not_repeat_diagnostic() {
+	// The `{unknown}` type means an error was already reported for this
+	// binding; dereferencing it must absorb that rather than piling an
+	// E1037 on top.
+	let case = TestCase::new(indoc! {"
+        fn bad() { local p = nonexistent(); p.* = 1; }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"expected the original E1007 (undeclared identifier)"
+	);
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::CannotDerefNonPointer),
+		"E1037 should be absorbed when the operand is already `{{unknown}}`"
+	);
+}
+
+#[test]
+fn test_deref_of_error_type_still_checks_the_assigned_value() {
+	// A deref whose operand is already `{unknown}` absorbs its own
+	// diagnostic, but must not swallow the rest of the statement with it —
+	// the right-hand side still gets built, so its own errors surface.
+	for src in [
+		"fn bad() { local p = nonexistent(); p.* = also_missing(); }",
+		"fn bad() { local p = nonexistent(); p.* += also_missing(); }",
+		"fn bad() { local p = nonexistent(); p.*.field = also_missing(); }",
+	] {
+		let case = TestCase::new(src);
+		let undeclared = case
+			.tir
+			.diagnostics
+			.iter()
+			.filter(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::UndeclaredIdentifier.code())
+			})
+			.count();
+		assert_eq!(
+			undeclared, 2,
+			"expected E1007 for both `nonexistent` and `also_missing` in `{src}`"
+		);
+		assert!(
+			!has_error_code(&case.tir, DiagnosticCode::CannotDerefNonPointer),
+			"E1037 should be absorbed in `{src}`"
+		);
+		assert!(
+			!has_error_code(&case.tir, DiagnosticCode::InvalidAssignmentTarget),
+			"E1013 should not cascade off an already-errored target in `{src}`"
+		);
+	}
+}
+
+#[test]
+fn test_unresolved_callee_still_checks_its_arguments() {
+	// A callee that doesn't resolve leaves no signature to check arguments
+	// against, but must not swallow the argument list with it — errors
+	// *inside* the arguments still have to surface.
+	for (src, args) in [
+		// method not found
+		(
+			"struct S {} fn f(s: S) { s.nope(missing_a(), missing_b()); }",
+			2,
+		),
+		// resolves, but to a field rather than a method
+		("struct S { x: i32 } fn f(s: S) { s.x(missing_a()); }", 1),
+		// associated function that doesn't exist
+		("struct S {} fn f() { S::nope(missing_a()); }", 1),
+	] {
+		let case = TestCase::new(src);
+		let undeclared = case
+			.tir
+			.diagnostics
+			.iter()
+			.filter(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::UndeclaredIdentifier.code())
+					&& d.message == "undeclared identifier"
+			})
+			.count();
+		assert_eq!(
+			undeclared, args,
+			"expected E1007 for each unresolved argument in `{src}`"
+		);
+	}
+}
+
+#[test]
+fn test_unresolved_callee_does_not_demand_a_type_annotation() {
+	// The missing callee is what removed the inference context, so asking
+	// the user to annotate their way out of it misdirects. Both the method
+	// and the plain-call path must stay quiet.
+	for src in [
+		"struct S {} fn f<T>(s: S) { local p = s.nope(Layout::of::<T>()); }",
+		"struct S {} fn f<T>() { local p = nope(Layout::of::<T>()); }",
+	] {
+		let case = TestCase::new(src);
+		assert!(
+			!has_error_code(&case.tir, DiagnosticCode::TypeAnnotationRequired),
+			"E1002 should be absorbed in a poisoned context: `{src}`"
+		);
+	}
+}
+
+#[test]
+fn test_poisoned_context_still_reports_mismatch_between_sibling_arguments() {
+	// Guards the ordering in `build_generic_call_arguments`: the slots are
+	// poisoned *after* argument inference, so `T` is still bound to `i32`
+	// by `a` and `b: bool` is still a real mismatch. Poisoning any earlier
+	// checks both arguments against `ERROR` and loses this silently.
+	let case = TestCase::new(indoc! {"
+        struct S {}
+        fn same<T>(a: T, b: T) -> T { a }
+        fn f(s: S) { local p = s.missing(same(1 as i32, true)); }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
+		"expected E1049 for the unresolved method"
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
+		"expected E1001 for `true` against `T = i32` inferred from `a`"
+	);
+}
+
+#[test]
+fn test_poisoned_deref_store_records_rhs_access_for_hover() {
+	// The editor-visible half of the deref fix. `SymbolIndex` is built from
+	// `local.accesses`, which are pushed while an identifier expression is
+	// built — so a right-hand side that never gets built has no access, and
+	// hovering it shows nothing at all. Before the fix this was 0.
+	//
+	// Distinct from `test_deref_of_error_type_still_checks_the_assigned_value`:
+	// that asserts the RHS produces diagnostics, this asserts it leaves the
+	// index entry behind. Nothing else in the suite covers the latter.
+	let case = TestCase::new(
+		"fn bad(value: i32) { local p = nonexistent(); p.* = value; }",
+	);
+	let function = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("bad"))
+		.expect("`bad` should be registered");
+	let body = function.body.as_ref().expect("`bad` should have a body");
+	let value = body.stack.scopes[0]
+		.locals
+		.iter()
+		.find(|l| case.graph.interner.resolve(l.name.inner) == Some("value"))
+		.expect("`value` param should be a scope-0 local");
+	assert_eq!(
+		value.accesses.len(),
+		1,
+		"the `value` on the right-hand side must record an access, or hover \
+		 over it returns nothing"
+	);
+}

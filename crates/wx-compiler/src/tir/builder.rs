@@ -979,7 +979,7 @@ fn report_method_not_found(
 	method: SymbolU32,
 	ty: TypeIndex,
 ) -> Diagnostic<FileId> {
-	let method_name = formatter.interner.resolve(method).unwrap_or("?");
+	let method_name = formatter.interner.resolve(method).unwrap();
 	let type_name = formatter.display_type(ty).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::MethodNotFound.code())
@@ -995,7 +995,7 @@ fn report_not_a_method(
 	method: SymbolU32,
 	ty: TypeIndex,
 ) -> Diagnostic<FileId> {
-	let member_name = formatter.interner.resolve(method).unwrap_or("?");
+	let member_name = formatter.interner.resolve(method).unwrap();
 	let type_name = formatter.display_type(ty).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::NotAMethod.code())
@@ -4791,8 +4791,7 @@ impl<'ast> Builder<'ast, '_> {
 						Some(ItemAttribute::FixedOrder)
 					}
 					(ast::AttributeValue::NameValue(value), Some("tag")) => {
-						let raw =
-							self.interner.resolve(value.inner).unwrap_or("");
+						let raw = self.interner.resolve(value.inner).unwrap();
 						let key =
 							self.interner.get_or_intern(unescape_string(raw));
 						self.tir.tagged_items.insert(key, id);
@@ -4866,8 +4865,7 @@ impl<'ast> Builder<'ast, '_> {
 
 			for entry in args.iter() {
 				let arg = &entry.inner.inner;
-				let arg_name =
-					self.interner.resolve(arg.name.inner).unwrap_or("");
+				let arg_name = self.interner.resolve(arg.name.inner).unwrap();
 				let slot = match arg_name {
 					"min_pages" => &mut min_pages,
 					"max_pages" => &mut max_pages,
@@ -8683,10 +8681,8 @@ impl<'ast> Builder<'ast, '_> {
 						.iter()
 						.find(|(name, _)| *name == binding.name.inner)
 					{
-						let assoc_name_str = self
-							.interner
-							.resolve(binding.name.inner)
-							.unwrap_or("?");
+						let assoc_name_str =
+							self.interner.resolve(binding.name.inner).unwrap();
 						self.tir.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
@@ -8752,7 +8748,7 @@ impl<'ast> Builder<'ast, '_> {
 									let assoc_name_str = self
 										.interner
 										.resolve(binding.name.inner)
-										.unwrap_or("?");
+										.unwrap();
 									let trait_name_str = self
 										.interner
 										.resolve(
@@ -8761,7 +8757,7 @@ impl<'ast> Builder<'ast, '_> {
 												.name
 												.inner,
 										)
-										.unwrap_or("?");
+										.unwrap();
 									self.tir.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
@@ -9495,7 +9491,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		match &self.tir.types[ty.as_usize()] {
 			Type::Struct { args, .. } => {
-				args.iter().any(|&a| self.contains_infer(a))
+				args.iter().copied().any(|a| self.contains_infer(a))
 			}
 			Type::Pointer { to, memory, .. } => {
 				self.contains_infer(*to) || self.contains_infer(*memory)
@@ -9507,11 +9503,13 @@ impl<'ast> Builder<'ast, '_> {
 				self.contains_infer(*of) || self.contains_infer(*memory)
 			}
 			Type::Tuple { elements } => {
-				elements.iter().any(|&e| self.contains_infer(e))
+				elements.iter().copied().any(|e| self.contains_infer(e))
 			}
-			Type::Function { signature } => {
-				signature.items.iter().any(|&t| self.contains_infer(t))
-			}
+			Type::Function { signature } => signature
+				.items
+				.iter()
+				.copied()
+				.any(|t| self.contains_infer(t)),
 			_ => false,
 		}
 	}
@@ -10778,7 +10776,7 @@ impl<'ast> Builder<'ast, '_> {
 												.name
 												.inner,
 										)
-										.unwrap_or("?");
+										.unwrap();
 									self.tir.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
@@ -11034,10 +11032,9 @@ impl<'ast> Builder<'ast, '_> {
 					trait_sym,
 					supertrait_sym,
 				} => {
-					let trait_name =
-						self.interner.resolve(trait_sym).unwrap_or("?");
+					let trait_name = self.interner.resolve(trait_sym).unwrap();
 					let supertrait_name =
-						self.interner.resolve(supertrait_sym).unwrap_or("?");
+						self.interner.resolve(supertrait_sym).unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
@@ -11774,8 +11771,7 @@ impl<'ast> Builder<'ast, '_> {
 		);
 		match entry {
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
-				let member_name =
-					self.interner.resolve(member.inner).unwrap_or("?");
+				let member_name = self.interner.resolve(member.inner).unwrap();
 				let type_name = self
 					.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
@@ -12268,8 +12264,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if !candidates.is_empty() {
-			let member_name_str =
-				self.interner.resolve(member_name).unwrap_or("?");
+			let member_name_str = self.interner.resolve(member_name).unwrap();
 			let type_name = self
 				.formatter(resolve_context.namespace)
 				.display_type(base)
@@ -12293,7 +12288,7 @@ impl<'ast> Builder<'ast, '_> {
 			for trait_index in &candidates {
 				let trait_ = &self.tir.traits[*trait_index as usize];
 				let trait_name =
-					self.interner.resolve(trait_.name.inner).unwrap_or("?");
+					self.interner.resolve(trait_.name.inner).unwrap();
 				let name_span = trait_
 					.assoc_types
 					.get(&member_name)
@@ -12749,8 +12744,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			_ => {
-				let member_name =
-					self.interner.resolve(member.inner).unwrap_or("?");
+				let member_name = self.interner.resolve(member.inner).unwrap();
 				let type_name = self
 					.formatter(resolve_context.namespace)
 					.display_type(namespace.inner)
@@ -15248,6 +15242,29 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr.span,
 				})
 			}
+			// The target is already in error, so there is no operator impl to
+			// resolve and no `method_id` to build a `CompoundStore` around.
+			// Check the right-hand side anyway so its own mistakes still get
+			// reported, then absorb — the right-hand side of
+			// `build_assignment_expr`'s `ExprKind::Error` arm gets the same
+			// treatment.
+			ExprKind::Error => {
+				self.build_expression(
+					ctx,
+					AccessContext {
+						expected_type: TypeIndex::ERROR,
+						access_kind: AccessKind::Read,
+					},
+					right,
+				)
+				.ok();
+
+				Ok(Expression {
+					kind: ExprKind::Error,
+					ty: TypeIndex::UNIT,
+					span: expr.span,
+				})
+			}
 			_ => {
 				self.tir.diagnostics.push(report_invalid_assignment_target(
 					SourceSpan::new(ctx.resolve_context.file_id, left.span),
@@ -15598,42 +15615,57 @@ impl<'ast> Builder<'ast, '_> {
 		// params that appear only via `C::Item` style projections, and true for
 		// params that appear directly (e.g. M in `Layout<M>`).
 		let substituted_result = self.substitute_type(result_type, &type_args);
-		let mut had_unresolved = false;
 		if self.contains_infer(substituted_result) {
-			for (i, &slot) in type_args.iter().enumerate() {
-				if slot == TypeIndex::INFER {
-					let name_symbol = self
-						.tir
-						.function_type_params_iter(func_index)
-						.nth(i)
-						.expect(
-							"type_args length must equal total_type_param_count",
-						)
-						.name
-						.inner;
-					let param_name =
-						self.interner.resolve(name_symbol).unwrap();
-					self.tir.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::TypeAnnotationRequired.code(),
+			// Nothing at this call site could pin these slots down. Whether
+			// that's the user's problem depends on why there was nothing:
+			// in a poisoned context (`expected_result == ERROR`) the
+			// enclosing callee is already an error and took the inference
+			// context down with it, so demanding an annotation would blame
+			// the user for a gap the error itself opened. Elsewhere the
+			// annotation genuinely is missing.
+			//
+			// Reaching here at all means the argument loop above already
+			// had its chance to bind these slots, so an argument that does
+			// constrain a param has bound it — which is why a mismatch
+			// between two arguments sharing one param (`same(1, true)`)
+			// still gets reported rather than absorbed.
+			if expected_result != TypeIndex::ERROR {
+				for (i, &slot) in type_args.iter().enumerate() {
+					if slot == TypeIndex::INFER {
+						let name_symbol = self
+							.tir
+							.function_type_params_iter(func_index)
+							.nth(i)
+							.expect(
+								"type_args length must equal total_type_param_count",
 							)
-							.with_message(format!(
-								"cannot infer type for type parameter `{param_name}`"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
+							.name
+							.inner;
+						let param_name =
+							self.interner.resolve(name_symbol).unwrap();
+						self.tir.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::TypeAnnotationRequired
+										.code(),
 								)
-								.with_message("type annotation required"),
-							),
-					);
-					had_unresolved = true;
+								.with_message(format!(
+									"cannot infer type for type parameter `{param_name}`"
+								))
+								.with_label(
+									Label::primary(
+										ctx.resolve_context.file_id,
+										call_span,
+									)
+									.with_message("type annotation required"),
+								),
+						);
+					}
 				}
 			}
-		}
-		if had_unresolved {
+			// Unresolved either way: poison the open slots and skip the
+			// argument checks below, which can only produce noise once the
+			// result type is unknown.
 			for slot in type_args.iter_mut() {
 				if *slot == TypeIndex::INFER {
 					*slot = TypeIndex::ERROR;
@@ -15929,7 +15961,7 @@ impl<'ast> Builder<'ast, '_> {
 					continue;
 				};
 				let assoc_name_str =
-					self.interner.resolve(*assoc_name).unwrap_or("?");
+					self.interner.resolve(*assoc_name).unwrap();
 				let concrete_name = self
 					.formatter(ctx.resolve_context.namespace)
 					.display_type(concrete)
@@ -15937,7 +15969,7 @@ impl<'ast> Builder<'ast, '_> {
 				let func_name = self
 					.interner
 					.resolve(self.tir.functions[func_index as usize].name.inner)
-					.unwrap_or("?");
+					.unwrap();
 				let func_file_id =
 					self.tir.functions[func_index as usize].file_id;
 
@@ -15955,7 +15987,7 @@ impl<'ast> Builder<'ast, '_> {
 								.name
 								.inner,
 						)
-						.unwrap_or("?");
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -15993,7 +16025,7 @@ impl<'ast> Builder<'ast, '_> {
 								.name
 								.inner,
 						)
-						.unwrap_or("?");
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
@@ -16104,14 +16136,25 @@ impl<'ast> Builder<'ast, '_> {
 			_ => unreachable!(),
 		};
 
-		let callee = self.build_expression(
-			ctx,
-			AccessContext {
-				expected_type: TypeIndex::INFER,
-				access_kind: AccessKind::Read,
-			},
-			ast_callee,
-		)?;
+		// A callee that failed outright becomes an error-typed expression
+		// rather than propagating `Err`, so it lands in the non-function `_`
+		// arm below — which already builds the arguments (so mistakes inside
+		// the argument list still get reported) and already stays silent
+		// about the callee itself once its type is `ERROR`.
+		let callee = self
+			.build_expression(
+				ctx,
+				AccessContext {
+					expected_type: TypeIndex::INFER,
+					access_kind: AccessKind::Read,
+				},
+				ast_callee,
+			)
+			.unwrap_or(Expression {
+				kind: ExprKind::Error,
+				ty: TypeIndex::ERROR,
+				span: ast_callee.span,
+			});
 		let signature = match &self.tir.types[callee.ty.as_usize()] {
 			Type::Function { signature } => signature.clone(),
 			Type::FunctionItem { id, .. } => {
@@ -16124,14 +16167,20 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			_ => {
-				// still trying to check arguments, even though we don't have information about the parameters
+				// Still trying to check arguments, even though we don't have
+				// information about the parameters. `ERROR` rather than
+				// `INFER` as the expected type: both mean "no parameter type
+				// to check against", but `INFER` also means "so tell me what
+				// it is", which makes `build_generic_call_arguments` demand
+				// an annotation for a type parameter this missing callee is
+				// the reason it couldn't pin down.
 				let arguments: Box<_> = arguments
 					.iter()
 					.map(|arg| {
 						match self.build_expression(
 							ctx,
 							AccessContext {
-								expected_type: TypeIndex::INFER,
+								expected_type: TypeIndex::ERROR,
 								access_kind: AccessKind::Read,
 							},
 							&arg.inner,
@@ -16428,8 +16477,7 @@ impl<'ast> Builder<'ast, '_> {
 		else {
 			let trait_name_sym =
 				self.tir.traits[trait_index as usize].name.inner;
-			let trait_name =
-				self.interner.resolve(trait_name_sym).unwrap_or("?");
+			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
 			let imp = &self.tir.trait_impls[trait_impl_index as usize];
 			let span = SourceSpan::new(imp.file_id, imp.span);
 			let type_str = self
@@ -16455,8 +16503,7 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			let trait_name_sym =
 				self.tir.traits[trait_index as usize].name.inner;
-			let trait_name =
-				self.interner.resolve(trait_name_sym).unwrap_or("?");
+			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
 			let new_impl = &self.tir.trait_impls[trait_impl_index as usize];
 			let new_span = SourceSpan::new(new_impl.file_id, new_impl.span);
 			let existing_impl = &self.tir.trait_impls[existing_index as usize];
@@ -16565,11 +16612,8 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if !candidates.is_empty() {
-			let member_name = self
-				.interner
-				.resolve(member_symbol)
-				.unwrap_or("?")
-				.to_string();
+			let member_name =
+				self.interner.resolve(member_symbol).unwrap().to_string();
 			let mut diagnostic = Diagnostic {
 				severity: Severity::Error,
 				code: Some(
@@ -17038,14 +17082,36 @@ impl<'ast> Builder<'ast, '_> {
 		)?;
 
 		let file_id = ctx.resolve_context.file_id;
-		let (func_index, mut type_args) = self.resolve_method_call(
+		let (func_index, mut type_args) = match self.resolve_method_call(
 			ctx.resolve_context,
 			Spanned {
 				inner: object.ty,
 				span: object.span,
 			},
 			*method,
-		)?;
+		) {
+			Ok(resolved) => resolved,
+			// The method didn't resolve, so there are no parameters to check
+			// against — but still build the arguments so a mistake *inside*
+			// the argument list gets reported rather than hidden behind the
+			// unresolved method. `ERROR` as the expected type for the same
+			// reason as the non-function arm of `build_call_expression`: it
+			// marks the context as already broken, so nothing downstream
+			// asks the user to annotate their way out of it.
+			Err(()) => {
+				for argument in arguments {
+					_ = self.build_expression(
+						ctx,
+						AccessContext {
+							expected_type: TypeIndex::ERROR,
+							access_kind: AccessKind::Read,
+						},
+						&argument.inner,
+					);
+				}
+				return Err(());
+			}
+		};
 
 		self.tir.functions[func_index as usize]
 			.accesses
@@ -17523,11 +17589,8 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			let ts = &self.tir.typesets[typeset_index as usize];
 			let range = &ts.intersection_range;
-			let ts_name = self
-				.interner
-				.resolve(ts.name.inner)
-				.unwrap_or("?")
-				.to_string();
+			let ts_name =
+				self.interner.resolve(ts.name.inner).unwrap().to_string();
 			if !range.contains(value as i64) {
 				self.tir.diagnostics.push(
 					report_integer_literal_out_of_typeset_range(
@@ -18129,6 +18192,19 @@ impl<'ast> Builder<'ast, '_> {
 					memory,
 					ownership,
 				} => (*to, *memory, *ownership == ast::Ownership::Exclusive),
+				// Error already reported — absorb it instead of reporting a
+				// bogus "`{unknown}` is not a pointer" on top of it. An
+				// `ExprKind::Error` rather than `Err(())` so callers keep
+				// going and still check what surrounds the deref: an
+				// assignment, for instance, goes on to type-check its
+				// right-hand side against `{unknown}`.
+				Type::Error => {
+					return Ok(Expression {
+						kind: ExprKind::Error,
+						ty: TypeIndex::ERROR,
+						span,
+					});
+				}
 				_ => {
 					self.tir.diagnostics.push(report_cannot_deref_non_pointer(
 						SourceSpan::new(

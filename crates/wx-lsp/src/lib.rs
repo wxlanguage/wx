@@ -743,7 +743,7 @@ async fn handle_command(
 				);
 				let interner = &compiled.graph.interner;
 
-				let name = interner.resolve(func.name.inner).unwrap_or("?");
+				let name = interner.resolve(func.name.inner).unwrap();
 				let mut label = format!("fn {name}(");
 				let mut param_infos: Vec<ParameterInformation> = Vec::new();
 				// If the first parameter is named `self`, treat this as a
@@ -766,8 +766,7 @@ async fn handle_command(
 						label.push_str(", ");
 					}
 					let param_start = label.len() as u32;
-					let pname =
-						interner.resolve(param.name.inner).unwrap_or("_");
+					let pname = interner.resolve(param.name.inner).unwrap();
 					label.push_str(pname);
 					label.push_str(": ");
 					label.push_str(&fmt.display_type(param.ty.inner).unwrap());
@@ -1851,7 +1850,7 @@ fn push_type_params(
 		if i > 0 {
 			s.push_str(", ");
 		}
-		s.push_str(interner.resolve(tp.name.inner).unwrap_or("?"));
+		s.push_str(interner.resolve(tp.name.inner).unwrap());
 		let has_bounds =
 			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
 		if has_bounds {
@@ -1963,7 +1962,7 @@ fn symbol_hover_text(
 		SymbolKind::Function(def_id) => {
 			let fi = tir.function_index(*def_id)? as usize;
 			let func = &tir.functions[fi];
-			let name = interner.resolve(func.name.inner).unwrap_or("?");
+			let name = interner.resolve(func.name.inner).unwrap();
 			let pub_prefix = if func.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}fn {name}");
 			push_type_params(
@@ -1979,7 +1978,7 @@ fn symbol_hover_text(
 				if i > 0 {
 					s.push_str(", ");
 				}
-				let pname = interner.resolve(param.name.inner).unwrap_or("_");
+				let pname = interner.resolve(param.name.inner).unwrap();
 				s.push_str(pname);
 				s.push_str(": ");
 				s.push_str(&fmt.display_type(param.ty.inner).unwrap());
@@ -1997,7 +1996,7 @@ fn symbol_hover_text(
 		SymbolKind::Global(def_id) => {
 			let gi = tir.global_index(*def_id)? as usize;
 			let global = &tir.globals[gi];
-			let name = interner.resolve(global.name.inner).unwrap_or("?");
+			let name = interner.resolve(global.name.inner).unwrap();
 			let type_str = fmt.display_type(global.ty.inner).unwrap();
 			let pub_prefix = if global.pub_span.is_some() {
 				"pub "
@@ -2014,7 +2013,7 @@ fn symbol_hover_text(
 		SymbolKind::Memory(def_id) => {
 			let mi = tir.memory_index(*def_id)? as usize;
 			let memory = &tir.memories[mi];
-			let name = interner.resolve(memory.name.inner).unwrap_or("?");
+			let name = interner.resolve(memory.name.inner).unwrap();
 			let size_str = fmt.display_type(memory.size.inner).unwrap();
 			Some(format!(
 				"memory {name}: Memory where {{ Size = {size_str} }}"
@@ -2023,7 +2022,7 @@ fn symbol_hover_text(
 		SymbolKind::Struct(def_id) => {
 			let struct_ =
 				tir.structs.get(tir.struct_index(*def_id)? as usize)?;
-			let name = interner.resolve(struct_.name.inner).unwrap_or("?");
+			let name = interner.resolve(struct_.name.inner).unwrap();
 			let pub_prefix = if struct_.pub_span.is_some() {
 				"pub "
 			} else {
@@ -2042,7 +2041,7 @@ fn symbol_hover_text(
 		}
 		SymbolKind::Enum(def_id) => {
 			let enum_ = tir.enums.get(tir.enum_index(*def_id)? as usize)?;
-			let name = interner.resolve(enum_.name.inner).unwrap_or("?");
+			let name = interner.resolve(enum_.name.inner).unwrap();
 			let pub_prefix = if enum_.pub_span.is_some() { "pub " } else { "" };
 			let repr = fmt.display_type(enum_.repr_type).unwrap();
 			Some(format!("{pub_prefix}enum {name}: {repr} {{ ... }}"))
@@ -2068,7 +2067,7 @@ fn symbol_hover_text(
 				.get(*scope_idx as usize)?
 				.locals
 				.get(*local_idx as usize)?;
-			let name = interner.resolve(local.name.inner).unwrap_or("_");
+			let name = interner.resolve(local.name.inner).unwrap();
 			let type_str = fmt.display_type(local.ty).unwrap();
 			let mut_kw = if local.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("local {mut_kw}{name}: {type_str}"))
@@ -2076,7 +2075,7 @@ fn symbol_hover_text(
 		SymbolKind::Param { func_id, param_idx } => {
 			let fi = tir.function_index(*func_id)? as usize;
 			let param = tir.functions[fi].params.get(*param_idx as usize)?;
-			let name = interner.resolve(param.name.inner).unwrap_or("_");
+			let name = interner.resolve(param.name.inner).unwrap();
 			let type_str = fmt.display_type(param.ty.inner).unwrap();
 			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("{mut_kw}{name}: {type_str}"))
@@ -2094,9 +2093,8 @@ fn symbol_hover_text(
 		} => {
 			let enum_ = tir.enums.get(tir.enum_index(*enum_id)? as usize)?;
 			let variant = enum_.variants.get(*variant_idx as usize)?;
-			let enum_name = interner.resolve(enum_.name.inner).unwrap_or("?");
-			let variant_name =
-				interner.resolve(variant.name.inner).unwrap_or("?");
+			let enum_name = interner.resolve(enum_.name.inner).unwrap();
+			let variant_name = interner.resolve(variant.name.inner).unwrap();
 			Some(format!("{enum_name}::{variant_name}"))
 		}
 		SymbolKind::Namespace(ns_idx) => {
@@ -2104,20 +2102,19 @@ fn symbol_hover_text(
 			match ns.declaration {
 				ModuleDeclarationKind::Module(decl_idx) => {
 					let decl = tir.module_decls.get(decl_idx as usize)?;
-					let name = interner.resolve(decl.name.inner).unwrap_or("?");
+					let name = interner.resolve(decl.name.inner).unwrap();
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
 					Some(format!("{pub_prefix}mod {name}"))
 				}
 				ModuleDeclarationKind::Import(import_idx) => {
 					let decl = tir.import_decls.get(import_idx as usize)?;
-					let external = interner
-						.resolve(decl.external_name.inner)
-						.unwrap_or("?");
+					let external =
+						interner.resolve(decl.external_name.inner).unwrap();
 					match &decl.internal_name {
 						Some(alias) => {
 							let alias_name =
-								interner.resolve(alias.inner).unwrap_or("?");
+								interner.resolve(alias.inner).unwrap();
 							Some(format!(
 								"import \"{external}\" as {alias_name}"
 							))
@@ -2130,7 +2127,7 @@ fn symbol_hover_text(
 				ModuleDeclarationKind::Package(_) => {
 					let name = interner
 						.resolve(tir.namespace_name(*ns_idx, packages, from))
-						.unwrap_or("?");
+						.unwrap();
 					Some(format!("package {name}"))
 				}
 			}
@@ -2175,7 +2172,7 @@ fn symbol_hover_text(
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
 			let trait_ = tir.traits.get(tir.trait_index(*def_id)? as usize)?;
-			let name = interner.resolve(trait_.name.inner).unwrap_or("?");
+			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
 				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {
@@ -2187,13 +2184,13 @@ fn symbol_hover_text(
 		SymbolKind::TypeSet(def_id) => {
 			let typeset =
 				tir.typesets.get(tir.typeset_index(*def_id)? as usize)?;
-			let name = interner.resolve(typeset.name.inner).unwrap_or("?");
+			let name = interner.resolve(typeset.name.inner).unwrap();
 			Some(format!("typeset {name} {{ ... }}"))
 		}
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = tir.type_alias_index(*def_id)? as usize;
 			let alias = &tir.type_aliases[ai];
-			let name = interner.resolve(alias.name.inner).unwrap_or("?");
+			let name = interner.resolve(alias.name.inner).unwrap();
 			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}type {name}");
 			push_type_params(
@@ -2216,7 +2213,7 @@ fn symbol_hover_text(
 		SymbolKind::Const(def_id) => {
 			let ci = tir.const_index(*def_id)? as usize;
 			let constant = &tir.constants[ci];
-			let name = interner.resolve(constant.name.inner).unwrap_or("?");
+			let name = interner.resolve(constant.name.inner).unwrap();
 			let type_str = fmt.display_type(constant.ty.inner).unwrap();
 			let pub_prefix = if constant.pub_span.is_some() {
 				"pub "
@@ -2232,7 +2229,7 @@ fn symbol_hover_text(
 			let struct_ =
 				tir.structs.get(tir.struct_index(*struct_id)? as usize)?;
 			let field = struct_.fields.get(*field_idx as usize)?;
-			let name = interner.resolve(field.name.inner).unwrap_or("?");
+			let name = interner.resolve(field.name.inner).unwrap();
 			let type_str = fmt.display_type(field.ty.inner).unwrap();
 			let pub_prefix = if field.pub_span.is_some() { "pub " } else { "" };
 			Some(format!("{pub_prefix}{name}: {type_str}"))
@@ -2243,7 +2240,7 @@ fn symbol_hover_text(
 		} => {
 			let trait_ = tir.traits.get(tir.trait_index(*trait_id)? as usize)?;
 			let at = trait_.assoc_types.get(assoc_name)?;
-			let name = interner.resolve(*assoc_name).unwrap_or("?");
+			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {
 				Some(format!("type {name}"))

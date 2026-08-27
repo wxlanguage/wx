@@ -146,8 +146,8 @@ impl SymbolIndex {
 		self.global_definitions.sort_by(|a, b| {
 			interner
 				.resolve(a.name)
-				.unwrap_or("")
-				.cmp(interner.resolve(b.name).unwrap_or(""))
+				.unwrap()
+				.cmp(interner.resolve(b.name).unwrap())
 		});
 	}
 
