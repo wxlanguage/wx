@@ -36,7 +36,9 @@ use wx_compiler::tir::{
 	ImplTarget, ItemAttribute, ModuleDeclarationKind, SourceSpan, TIR,
 	TypeParamInfo, TypeParamOwner,
 };
-use wx_compiler::vfs::{self, FileId, FileSource, NativeFileSource};
+use wx_compiler::vfs::{
+	self, AbsolutePath, FileId, FileSource, NativeFileSource,
+};
 
 mod completion;
 mod symbol_index;
@@ -95,6 +97,78 @@ async fn flush_logs(client: &Client, logs: Vec<String>) {
 	}
 }
 
+/// Accumulates named, timed steps for one logical operation — e.g. parsing
+/// a package as part of typechecking it, or parsing a package as part of
+/// formatting one of its files — so the whole dependency chain renders as
+/// one readable block instead of one independent log line per step with no
+/// visible relationship between them.
+struct Trace {
+	/// The file that caused this trace (the one edited/opened/formatted).
+	/// Its package root is whatever `wx.json`-bearing ancestor it shares a
+	/// path prefix with — no need to store that separately.
+	path: PathBuf,
+	steps: Vec<(&'static str, web_time::Duration)>,
+}
+
+impl Trace {
+	fn new(path: PathBuf) -> Self {
+		Self {
+			path,
+			steps: Vec::new(),
+		}
+	}
+
+	/// Times `f`, records its duration under `label`, and returns its
+	/// result unchanged — so callers thread this through exactly like the
+	/// bare `Instant::now()` calls it replaces, `?` included.
+	fn step<T>(&mut self, label: &'static str, f: impl FnOnce() -> T) -> T {
+		let start = web_time::Instant::now();
+		let result = f();
+		self.steps.push((label, start.elapsed()));
+		result
+	}
+
+	/// Renders the causing file and every recorded step as an indented
+	/// tree under `operation`, with the steps' total on the heading line
+	/// itself (it's a summary of the block, not a sibling step that ran).
+	/// Every line past the heading is indented two spaces so it reads as
+	/// part of this one log entry rather than the surrounding log list —
+	/// VS Code's Output panel only timestamp-prefixes a message's first
+	/// line, so the rest need their own visual cue to stay grouped:
+	/// ```text
+	/// typecheck — 1.664473ms
+	///   file: "/examples/pow/main.wx"
+	///   ├─ parse:      772.593µs
+	///   └─ typecheck:  891.88µs
+	/// ```
+	fn finish(&self, operation: &str) -> String {
+		let mut out = if self.steps.is_empty() {
+			operation.to_string()
+		} else {
+			let total: web_time::Duration =
+				self.steps.iter().map(|(_, d)| *d).sum();
+			format!("{operation} — {total:?}")
+		};
+		out.push_str(&format!("\n  file: {:?}", self.path));
+		let width = self
+			.steps
+			.iter()
+			.map(|(label, _)| label.len())
+			.max()
+			.unwrap_or(0)
+			+ 1;
+		let last = self.steps.len().saturating_sub(1);
+		for (i, (label, duration)) in self.steps.iter().enumerate() {
+			let branch = if i == last { "└─" } else { "├─" };
+			let label_colon = format!("{label}:");
+			out.push_str(&format!(
+				"\n  {branch} {label_colon:<width$}  {duration:?}"
+			));
+		}
+		out
+	}
+}
+
 #[derive(Clone)]
 struct OpenDocument {
 	text: String,
@@ -105,7 +179,7 @@ struct OpenDocument {
 struct ServerState {
 	open_documents: HashMap<PathBuf, OpenDocument>,
 	workspace_folders: Vec<PathBuf>,
-	/// Compiled artifacts per crate root — the one source of truth. Which
+	/// Compiled artifacts per package root — the one source of truth. Which
 	/// `CompiledRoot`/`FileId` a given URI belongs to is computed on demand
 	/// by `resolve_uri` rather than tracked in a second index, since keeping
 	/// a hand-maintained reverse map in sync with this one is exactly the
@@ -113,10 +187,19 @@ struct ServerState {
 	cached: HashMap<PathBuf, CompiledRoot>,
 	/// root -> files we last published diagnostics for. Needed to know which
 	/// files to clear when a root is dropped or a file leaves its owning
-	/// root; also doubles as the reverse (file -> owning root) index via
-	/// `owning_root`, so there's no separate `file_to_root` map to drift out
-	/// of sync with it.
+	/// root. Deliberately many-to-many, not a partition: a dependency file
+	/// legitimately appears here under every root whose compiled graph
+	/// reaches it, not just its own project's root.
 	published_by_root: HashMap<PathBuf, HashSet<PathBuf>>,
+	/// file -> the root `discover_package_root` returned for it, as of the
+	/// last `compute_refresh` call made for exactly that file. Kept
+	/// separate from `published_by_root` — that map answers "which files
+	/// does root R currently reach" (many-to-many, since a dependency file
+	/// is reachable from every root that depends on it) — this one answers
+	/// "what is file F's own project" (one answer per file, never derived
+	/// from the other map, only ever written here for the one file it was
+	/// just asked about).
+	own_root: HashMap<PathBuf, PathBuf>,
 }
 
 struct AnalysisResult {
@@ -125,10 +208,10 @@ struct AnalysisResult {
 }
 
 struct CompiledRoot {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: TIR,
 	symbol_index: SymbolIndex,
-	/// LSP version of each file in the crate at the time TIR was last built.
+	/// LSP version of each file in the package at the time TIR was last built.
 	/// `None` means the file was on disk (not open via LSP) at compile time.
 	compiled_versions: HashMap<PathBuf, Option<std::num::NonZeroI32>>,
 }
@@ -148,16 +231,23 @@ impl<'a> OverlayFileSource<'a> {
 }
 
 impl FileSource for OverlayFileSource<'_> {
-	fn read_to_string(&self, path: &str) -> std::result::Result<String, ()> {
-		if let Some(doc) = self.open_documents.get(Path::new(path)) {
+	fn read_to_string(
+		&self,
+		path: &AbsolutePath,
+	) -> std::result::Result<String, ()> {
+		if let Some(doc) = self.open_documents.get(Path::new(path.as_str())) {
 			return Ok(doc.text.clone());
 		}
 		self.native.read_to_string(path)
 	}
 
-	fn exists(&self, path: &str) -> bool {
-		self.open_documents.contains_key(Path::new(path))
+	fn exists(&self, path: &AbsolutePath) -> bool {
+		self.open_documents.contains_key(Path::new(path.as_str()))
 			|| self.native.exists(path)
+	}
+
+	fn origin(&self) -> vfs::FileOrigin {
+		vfs::FileOrigin::Local
 	}
 }
 
@@ -364,16 +454,42 @@ async fn handle_command(
 				)?;
 				let info =
 					compiled.symbol_index.find_at_position(file_id, offset)?;
+				// The package the *hovered file* belongs to, not the
+				// compilation's overall root — those only coincide when
+				// hovering inside the binary's own files. A `crate`/`super`
+				// reference (or any package-qualified name) hovered inside a
+				// dependency like `std` needs `std`'s own package here, or
+				// `namespace_name` names things from the wrong package's
+				// perspective.
+				let from = compiled.tir.namespaces
+					[compiled.tir.file_namespaces[file_id.as_usize()] as usize]
+					.package;
 				let text = symbol_hover_text(
 					&compiled.tir,
 					&compiled.graph.interner,
+					&compiled.graph.packages,
+					from,
 					&info.kind,
 				)?;
 				let range = span_to_range(&compiled.graph.files, info.source)?;
+				let doc = doc_comment_anchor(&compiled.tir, &info.kind)
+					.and_then(|anchor| {
+						let source = &compiled
+							.graph
+							.files
+							.get(anchor.file_id)
+							.ok()?
+							.source;
+						leading_doc_comment(source, anchor.span.start)
+					});
+				let value = match doc {
+					Some(doc) => format!("```wx\n{text}\n```\n\n---\n\n{doc}"),
+					None => format!("```wx\n{text}\n```"),
+				};
 				Some(Hover {
 					contents: HoverContents::Markup(MarkupContent {
 						kind: MarkupKind::Markdown,
-						value: format!("```wx\n{text}\n```"),
+						value,
 					}),
 					range: Some(range),
 				})
@@ -397,7 +513,7 @@ async fn handle_command(
 					.symbol_index
 					.definition_for_kind(info.kind)
 					.map(|e| e.source)?;
-				let uri = file_id_to_uri(compiled, def.file_id)?;
+				let uri = file_id_to_uri(&compiled.graph.files, def.file_id)?;
 				let range = span_to_range(&compiled.graph.files, def)?;
 				Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
 			})();
@@ -423,7 +539,8 @@ async fn handle_command(
 				)
 				.into_iter()
 				.filter_map(|source| {
-					let uri = file_id_to_uri(compiled, source.file_id)?;
+					let uri =
+						file_id_to_uri(&compiled.graph.files, source.file_id)?;
 					let range = span_to_range(&compiled.graph.files, source)?;
 					Some(Location { uri, range })
 				})
@@ -471,8 +588,10 @@ async fn handle_command(
 							.flatten(),
 					)
 					.filter_map(|entry| {
-						let uri =
-							file_id_to_uri(compiled, entry.source.file_id)?;
+						let uri = file_id_to_uri(
+							&compiled.graph.files,
+							entry.source.file_id,
+						)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some(Location { uri, range })
@@ -506,8 +625,10 @@ async fn handle_command(
 					.chain(compiled.symbol_index.definitions.iter())
 					.filter(|e| e.kind == info.kind)
 					.filter_map(|entry| {
-						let uri =
-							file_id_to_uri(compiled, entry.source.file_id)?;
+						let uri = file_id_to_uri(
+							&compiled.graph.files,
+							entry.source.file_id,
+						)?;
 						let range =
 							span_to_range(&compiled.graph.files, entry.source)?;
 						Some((uri, range))
@@ -531,71 +652,76 @@ async fn handle_command(
 		Command::Formatting(params, reply) => {
 			let result = async {
 				let path = uri_to_path(&params.text_document.uri)?;
-				let root = discover_crate_root(
+				let root = discover_package_root(
 					&state.open_documents,
 					&state.workspace_folders,
 					&path,
 				)?;
 
-				// Always reparse fresh from the live buffer rather than
-				// going through `cached`: format-on-save fires before
-				// `didSave`, so `cached` would still reflect the previous
-				// save. Parsing is cheap enough (~1ms on typical files) that
-				// there's no need to cache it across calls.
-				let mut logs = Vec::new();
-				let parse_result = parse_root(state, &root, &mut logs);
-				flush_logs(client, logs).await;
-				let graph = parse_result.ok()?;
-				let module = graph
-					.crates
-					.iter()
-					.flat_map(|cg| cg.modules.iter())
-					.find(|m| Path::new(&m.file_path) == path.as_path())?;
-				let has_errors = module.ast.diagnostics.iter().any(|d| {
-					matches!(
-						d.severity,
-						codespan_reporting::diagnostic::Severity::Error
-							| codespan_reporting::diagnostic::Severity::Bug
-					)
-				});
-				if has_errors {
-					return None;
-				}
-				let file = graph.files.get(module.file_id).ok()?;
-				let source = file.source.as_str();
-				let config = wx_fmt::RendererConfig {
-					indent_width: params.options.tab_size as u8,
-					..Default::default()
-				};
-				let fmt_start = web_time::Instant::now();
-				let formatted =
-					panic::catch_unwind(panic::AssertUnwindSafe(|| {
-						wx_fmt::format(
-							&module.ast,
-							&graph.interner,
-							source,
-							config,
+				// Computed synchronously so `?` can short-circuit freely on
+				// any failure without skipping the trace flush below —
+				// there's exactly one `.await` point for this whole
+				// command (the flush itself), not one per step.
+				let mut trace = Trace::new(path.clone());
+				let outcome = (|| {
+					// Always reparse fresh from the live buffer rather than
+					// going through `cached`: format-on-save fires before
+					// `didSave`, so `cached` would still reflect the
+					// previous save. Parsing is cheap enough (~1ms on
+					// typical files) that there's no need to cache it
+					// across calls.
+					let graph = parse_root(state, &root, &mut trace).ok()?;
+					let module = graph
+						.packages
+						.iter()
+						.flat_map(|cg| cg.modules.iter())
+						.find(|m| {
+							Path::new(m.file_path.as_str()) == path.as_path()
+						})?;
+					let has_errors = module.ast.diagnostics.iter().any(|d| {
+						matches!(
+							d.severity,
+							codespan_reporting::diagnostic::Severity::Error
+								| codespan_reporting::diagnostic::Severity::Bug
 						)
-					}))
-					.ok()?;
-				client
-					.log_message(
-						MessageType::LOG,
-						format!("formatting took {:?}", fmt_start.elapsed()),
-					)
-					.await;
-				let end = byte_to_position(
-					&graph.files,
-					module.file_id,
-					source.len(),
-				)?;
-				Some(vec![TextEdit {
-					range: Range {
-						start: Position::default(),
-						end,
-					},
-					new_text: formatted,
-				}])
+					});
+					if has_errors {
+						return None;
+					}
+					let file = graph.files.get(module.file_id).ok()?;
+					let source = file.source.as_str();
+					let config = wx_fmt::RendererConfig {
+						indent_width: params.options.tab_size as u8,
+						..Default::default()
+					};
+					let formatted = trace.step("render", || {
+						panic::catch_unwind(panic::AssertUnwindSafe(|| {
+							wx_fmt::format(
+								&module.ast,
+								&graph.interner,
+								source,
+								config,
+							)
+						}))
+						.ok()
+					})?;
+					let end = byte_to_position(
+						&graph.files,
+						module.file_id,
+						source.len(),
+					)?;
+					Some(vec![TextEdit {
+						range: Range {
+							start: Position::default(),
+							end,
+						},
+						new_text: formatted,
+					}])
+				})();
+
+				flush_logs(client, vec![trace.finish("format")]).await;
+
+				outcome
 			}
 			.await;
 			let _ = reply.send(result);
@@ -620,10 +746,18 @@ async fn handle_command(
 				};
 				let fi = compiled.tir.function_index(*def_id)? as usize;
 				let func = &compiled.tir.functions[fi];
-				let fmt = compiled.tir.formatter(&compiled.graph.interner);
+				// The function's own package, not the compilation's overall
+				// root — see the matching fix in the `Hover` handler above.
+				let from =
+					compiled.tir.namespaces[func.namespace as usize].package;
+				let fmt = compiled.tir.formatter(
+					&compiled.graph.interner,
+					&compiled.graph.packages,
+					from,
+				);
 				let interner = &compiled.graph.interner;
 
-				let name = interner.resolve(func.name.inner).unwrap_or("?");
+				let name = interner.resolve(func.name.inner).unwrap();
 				let mut label = format!("fn {name}(");
 				let mut param_infos: Vec<ParameterInformation> = Vec::new();
 				// If the first parameter is named `self`, treat this as a
@@ -646,8 +780,7 @@ async fn handle_command(
 						label.push_str(", ");
 					}
 					let param_start = label.len() as u32;
-					let pname =
-						interner.resolve(param.name.inner).unwrap_or("_");
+					let pname = interner.resolve(param.name.inner).unwrap();
 					label.push_str(pname);
 					label.push_str(": ");
 					label.push_str(&fmt.display_type(param.ty.inner).unwrap());
@@ -727,10 +860,20 @@ async fn handle_command(
 							..entry.source.span.end as usize,
 					);
 					if !span_text.is_some_and(|t| {
-						t.starts_with(|c: char| {
-							c.is_alphabetic() || c == '_'
-						})
+						t.starts_with(|c: char| c.is_alphabetic() || c == '_')
 					}) {
+						continue;
+					}
+					// `crate`/`super` resolve to an ordinary
+					// `SymbolKind::Namespace` — the same variant a real
+					// module name like `math` gets, so there's no dedicated
+					// kind `symbol_kind_to_token_type` can exclude below the
+					// way it already does for `self`/`Self`. Hardcoded text
+					// check for now, reusing `span_text` already computed
+					// above for the operator filter — TODO: revisit with a
+					// cheaper, kind-based exclusion if this ever shows up on
+					// a profile.
+					if matches!(span_text, Some("crate" | "super")) {
 						continue;
 					}
 					let Some(pos) = byte_to_position(
@@ -781,6 +924,7 @@ async fn handle_command(
 				let items = completion::completion_items(
 					&compiled.tir,
 					&compiled.graph.interner,
+					&compiled.graph.packages,
 					&compiled.symbol_index,
 					file_id,
 					source,
@@ -1033,20 +1177,23 @@ impl Backend {
 		self.client
 			.log_message(
 				MessageType::LOG,
-				format!("virtual_file_content uri={}", params.uri),
+				Trace::new(PathBuf::from(&params.uri))
+					.finish("virtual_file_content"),
 			)
 			.await;
 		let filename =
-			params.uri.strip_prefix("wx://std/").ok_or_else(|| {
+			params.uri.strip_prefix("wx://std").ok_or_else(|| {
 				JsonRpcError::invalid_params(format!(
 					"not a wxstd URI: {}",
 					params.uri
 				))
 			})?;
-		match filename {
-			"main.wx" => Ok(wx_compiler::vfs::STDLIB_SOURCE.to_string()),
-			other => Err(JsonRpcError::invalid_params(format!(
-				"unknown stdlib file: {other}"
+		// Keyed exactly as the stdlib package's own module paths, so any file
+		// the stdlib grows is servable here without touching this match.
+		match wx_compiler::vfs::stdlib_file(&AbsolutePath::new(filename)) {
+			Some(source) => Ok(source.to_string()),
+			None => Err(JsonRpcError::invalid_params(format!(
+				"unknown stdlib file: {filename}"
 			))),
 		}
 	}
@@ -1096,16 +1243,21 @@ fn render_full_diagnostic(
 		return "Unable to find original wx diagnostic.".to_string();
 	};
 	// Same order `analysis_from_compiled_root`/`add_compiler_diagnostic`
-	// iterate and expand in — crate diagnostics per crate, then TIR
-	// diagnostics, one slot per `diagnostic_locations` entry matching this
-	// path (a diagnostic with no primary label, like unused-enum-variant
-	// warnings, contributes one slot per variant) — so `index` lines up
-	// exactly with what the client saw when this was published.
+	// iterate and expand in — per package, linker diagnostics then every
+	// module's own AST diagnostics, then TIR diagnostics, one slot per
+	// `diagnostic_locations` entry matching this path (a diagnostic with no
+	// primary label, like unused-enum-variant warnings, contributes one slot
+	// per variant) — so `index` lines up exactly with what the client saw
+	// when this was published.
 	let diagnostic = compiled
 		.graph
-		.crates
+		.packages
 		.iter()
-		.flat_map(|cg| cg.diagnostics.iter())
+		.flat_map(|cg| {
+			cg.linker_diagnostics
+				.iter()
+				.chain(cg.modules.iter().flat_map(|m| m.ast.diagnostics.iter()))
+		})
 		.chain(compiled.tir.diagnostics.iter())
 		.flat_map(|d| {
 			let target_path = &target_path;
@@ -1206,24 +1358,14 @@ fn resolve_uri<'a>(
 	state.cached.values().find_map(|compiled| {
 		compiled
 			.graph
-			.crates
+			.packages
 			.iter()
 			.flat_map(|cg| cg.modules.iter())
 			.find_map(|m| {
-				let matches = file_id_to_uri(compiled, m.file_id)
+				let matches = file_id_to_uri(&compiled.graph.files, m.file_id)
 					.is_some_and(|u| u.as_str() == uri.as_str());
 				matches.then_some((compiled, m.file_id))
 			})
-	})
-}
-
-/// Finds which root `file`'s diagnostics were last published under, by
-/// scanning `published_by_root` — the reverse of `ServerState::cached`'s
-/// forward (root -> files) direction, computed on demand instead of kept in
-/// a second `file -> root` map.
-fn owning_root<'a>(state: &'a ServerState, file: &Path) -> Option<&'a Path> {
-	state.published_by_root.iter().find_map(|(root, files)| {
-		files.contains(file).then_some(root.as_path())
 	})
 }
 
@@ -1248,27 +1390,54 @@ pub(crate) fn compute_refresh(
 	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
-	let previous_root = owning_root(state, file_path).map(Path::to_path_buf);
-	let current_root = discover_crate_root(
+	let previous_root = state.own_root.get(file_path).cloned();
+	let current_root = discover_package_root(
 		&state.open_documents,
 		&state.workspace_folders,
 		file_path,
 	);
+	match &current_root {
+		Some(root) => {
+			state.own_root.insert(file_path.to_path_buf(), root.clone());
+		}
+		None => {
+			state.own_root.remove(file_path);
+		}
+	}
 	let mut publications = Vec::new();
 
-	if let Some(root) = current_root.as_ref() {
-		let analysis = analyze_root(state, root, logs);
-		publications.extend(collect_publish_operations(state, root, analysis));
+	// Clearing the old root first, then publishing the current state
+	// second, matters once both can mention `file_path`: LSP publish
+	// replaces a URI's whole diagnostic list, so whichever of these two
+	// runs last is what the client ends up showing. Current state should
+	// always win over a stale clear.
+	if let Some(old_root) = &previous_root {
+		if current_root.as_ref() != Some(old_root) {
+			publications.extend(collect_clear_operations(state, old_root));
+		}
 	}
 
-	if previous_root != current_root {
-		if let Some(old_root) = previous_root {
-			if current_root.as_ref() != Some(&old_root) {
-				publications.extend(collect_clear_operations(state, &old_root));
-			}
-		} else if current_root.is_none() {
-			publications.push((file_path.to_path_buf(), Vec::new()));
+	match current_root.as_ref() {
+		Some(root) => {
+			let analysis = analyze_root(state, root, file_path, logs);
+			publications
+				.extend(collect_publish_operations(state, root, analysis));
 		}
+		// Not part of any project. An open buffer gets a visible hint
+		// instead of silence; anything else (e.g. this call is running
+		// because the file just closed) just clears whatever hint may
+		// have been showing — there's no document left to point one at.
+		None => match state.open_documents.get(file_path) {
+			Some(_) => {
+				publications.push((
+					file_path.to_path_buf(),
+					vec![orphan_file_diagnostic()],
+				));
+			}
+			None => {
+				publications.push((file_path.to_path_buf(), Vec::new()));
+			}
+		},
 	}
 
 	publications
@@ -1277,25 +1446,32 @@ pub(crate) fn compute_refresh(
 pub(crate) fn analyze_root(
 	state: &mut ServerState,
 	root: &Path,
+	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> AnalysisResult {
 	// Skip TIR rebuild if no open file's version has advanced since last compile.
 	if let Some(compiled) = state.cached.get(root) {
 		if !versions_stale(&compiled.compiled_versions, &state.open_documents) {
-			logs.push(format!("TIR cache hit for {:?}", root));
+			logs.push(
+				Trace::new(file_path.to_path_buf())
+					.finish("typecheck — cache hit"),
+			);
 			return analysis_from_compiled_root(compiled);
 		}
 	}
 
-	let graph = match parse_root(state, root, logs) {
+	let mut trace = Trace::new(file_path.to_path_buf());
+	let graph = match parse_root(state, root, &mut trace) {
 		Ok(graph) => graph,
 		Err(()) => {
 			state.cached.remove(root);
+			logs.push(trace.finish("typecheck"));
 			return analysis_from_missing_entry_file(root);
 		}
 	};
 
-	let compiled = compile_root(state, graph, logs);
+	let compiled = compile_root(state, graph, &mut trace);
+	logs.push(trace.finish("typecheck"));
 	let result = analysis_from_compiled_root(&compiled);
 	state.cached.insert(root.to_path_buf(), compiled);
 	result
@@ -1350,15 +1526,15 @@ fn collect_clear_operations(
 
 fn compile_root(
 	state: &ServerState,
-	mut graph: vfs::CompilationGraph,
-	logs: &mut Vec<String>,
+	mut graph: vfs::CompilationUnit,
+	trace: &mut Trace,
 ) -> CompiledRoot {
 	let compiled_versions = graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
 		.map(|m| {
-			let path = PathBuf::from(&m.file_path);
+			let path = PathBuf::from(m.file_path.as_str());
 			let ver = state
 				.open_documents
 				.get(&path)
@@ -1366,9 +1542,7 @@ fn compile_root(
 			(path, ver)
 		})
 		.collect();
-	let tir_start = web_time::Instant::now();
-	let tir = TIR::build(&mut graph);
-	logs.push(format!("typechecking took {:?}", tir_start.elapsed()));
+	let tir = trace.step("typecheck", || TIR::build(&mut graph));
 	let symbol_index = build_symbol_index(&tir, &graph.interner);
 	CompiledRoot {
 		graph,
@@ -1385,42 +1559,47 @@ fn compile_root(
 /// (`formatting`) or immediately feeds it into a TIR rebuild anyway
 /// (`analyze_root`).
 /// Fails only if the entry file itself (`root`) can't be read — everything
-/// past that point (missing/ambiguous `module` declarations elsewhere in the
-/// crate) is a diagnostic on the resulting graph instead, since `discover_crate_root`
+/// past that point (missing/ambiguous `mod` declarations elsewhere in the
+/// package) is a diagnostic on the resulting graph instead, since `discover_package_root`
 /// already verified `root` exists before calling this.
 fn parse_root(
 	state: &ServerState,
 	root: &Path,
-	logs: &mut Vec<String>,
-) -> std::result::Result<vfs::CompilationGraph, ()> {
+	trace: &mut Trace,
+) -> std::result::Result<vfs::CompilationUnit, ()> {
 	let overlay = OverlayFileSource::new(&state.open_documents);
-	let mut builder = vfs::CompilationGraphBuilder::new();
-	let parse_start = web_time::Instant::now();
-	let stdlib_id = builder.load_stdlib();
-	let root_id = builder
-		.load_binary(root.to_str().unwrap_or_default().to_string(), &overlay)?;
-	let graph = builder.build(root_id, stdlib_id);
-	logs.push(format!("parsing took {:?}", parse_start.elapsed()));
-	Ok(graph)
+	let dir = vfs::AbsolutePath::new(root.to_str().unwrap_or_default());
+	trace.step("parse", || vfs::open_manifest(dir, &overlay))
 }
 
 fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 	let mut diagnostics_by_file = HashMap::new();
 	let mut owned_files = HashSet::new();
 
-	for crate_graph in &compiled.graph.crates {
-		for path in crate_graph.path_to_module.keys() {
-			let path_buf = PathBuf::from(path);
-			if is_absolute_path(&path_buf) {
-				owned_files.insert(path_buf);
+	for package_graph in &compiled.graph.packages {
+		for module in &package_graph.modules {
+			let Ok(file) = compiled.graph.files.get(module.file_id) else {
+				continue;
+			};
+			if file.origin == vfs::FileOrigin::Local {
+				owned_files.insert(PathBuf::from(module.file_path.as_str()));
 			}
 		}
-		for diagnostic in &crate_graph.diagnostics {
+		for diagnostic in &package_graph.linker_diagnostics {
 			add_compiler_diagnostic(
 				&mut diagnostics_by_file,
 				&compiled.graph.files,
 				diagnostic,
 			);
+		}
+		for module in &package_graph.modules {
+			for diagnostic in &module.ast.diagnostics {
+				add_compiler_diagnostic(
+					&mut diagnostics_by_file,
+					&compiled.graph.files,
+					diagnostic,
+				);
+			}
 		}
 	}
 
@@ -1438,11 +1617,13 @@ fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 	}
 }
 
-/// The only way `parse_root` can still fail: the entry file itself couldn't
-/// be read (e.g. deleted between `discover_crate_root`'s existence check and
-/// this call). Everything else — missing/ambiguous child modules — is now a
-/// diagnostic on the graph rather than a hard failure, so this is a rare,
-/// narrow case rather than the general error path it used to be.
+/// The only way `parse_root` can still fail now that `discover_package_root`
+/// has already confirmed a `wx.json` exists: that manifest fails to parse,
+/// or its `entry` can't be read (e.g. either was deleted between
+/// `discover_package_root`'s existence check and this call). Everything
+/// else — missing/ambiguous child modules, dependency resolution problems —
+/// is a diagnostic on the graph rather than a hard failure, so this is a
+/// rare, narrow case rather than the general error path it used to be.
 fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 	let mut diagnostics_by_file = HashMap::new();
 	let mut owned_files = HashSet::new();
@@ -1456,7 +1637,11 @@ fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 			code: None,
 			code_description: None,
 			source: Some("wx-lsp".to_string()),
-			message: format!("failed to read file `{}`", root.display()),
+			message: format!(
+				"failed to load the wx project at `{}` (its `wx.json` may \
+				 not parse, or its `entry` may not be readable)",
+				root.display()
+			),
 			related_information: None,
 			tags: None,
 			data: None,
@@ -1466,6 +1651,42 @@ fn analysis_from_missing_entry_file(root: &Path) -> AnalysisResult {
 	AnalysisResult {
 		diagnostics_by_file,
 		owned_files,
+	}
+}
+
+/// A file with no `wx.json` ancestor isn't part of any project the LSP can
+/// resolve. Surfaced as a visible, whole-file hint rather than silence —
+/// mirrors rust-analyzer's own "unlinked file" diagnostic, including its
+/// trick for spanning the whole document without measuring it: an
+/// intentionally out-of-range end position, which compliant clients clamp
+/// to the real end of the document, needing no scan of `text` at all.
+/// Tagged `UNNECESSARY` so editors render the file faded, making "wx-lsp
+/// doesn't see this file" a visual property of the file itself, not just
+/// an absence of red squiggles.
+fn orphan_file_diagnostic() -> Diagnostic {
+	Diagnostic {
+		range: Range {
+			start: Position {
+				line: 0,
+				character: 0,
+			},
+			end: Position {
+				line: u32::MAX,
+				character: u32::MAX,
+			},
+		},
+		severity: Some(DiagnosticSeverity::INFORMATION),
+		code: None,
+		code_description: None,
+		source: Some("wx-lsp".to_string()),
+		message: "This file is not part of a wx project, so wx-lsp \
+		          can't offer IDE services for it.\n\nAdd a `wx.json` in \
+		          this directory (or an ancestor) with an `entry` that \
+		          reaches this file."
+			.to_string(),
+		related_information: None,
+		tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+		data: None,
 	}
 }
 
@@ -1481,17 +1702,18 @@ pub(crate) fn diagnostic_publish_paths(
 }
 
 /// Resolves one label to the absolute path + LSP range it points at, or
-/// `None` if the label's file has no name, the name isn't an absolute path
-/// (true for stdlib's virtual `wx://std/...` "files"), or the span doesn't
-/// map to a valid range.
+/// `None` if the label's file is `Virtual` (true for the stdlib's `wx://std/...`
+/// "files", which have no real location on disk to file a diagnostic under),
+/// or the span doesn't map to a valid range.
 fn label_location(
 	files: &vfs::Files,
 	label: &Label<FileId>,
 ) -> Option<(PathBuf, Range)> {
-	let path = PathBuf::from(files.name(label.file_id).ok()?);
-	if !is_absolute_path(&path) {
+	let file = files.get(label.file_id).ok()?;
+	if file.origin != vfs::FileOrigin::Local {
 		return None;
 	}
+	let path = PathBuf::from(&file.name);
 	let range = span_to_range(
 		files,
 		SourceSpan::new(
@@ -1609,8 +1831,7 @@ fn diagnostic_related_information(
 		if label.message.is_empty() {
 			return None;
 		}
-		let path = PathBuf::from(files.name(label.file_id).ok()?);
-		let uri = path_to_file_uri(&path)?;
+		let uri = file_id_to_uri(files, label.file_id)?;
 		let range = span_to_range(
 			files,
 			SourceSpan::new(
@@ -1643,6 +1864,8 @@ fn push_type_params(
 	s: &mut String,
 	tir: &TIR,
 	interner: &ast::StringInterner,
+	packages: &[vfs::PackageGraph],
+	from: vfs::PackageId,
 	type_params: &[TypeParamInfo],
 ) {
 	if type_params.is_empty() {
@@ -1653,39 +1876,135 @@ fn push_type_params(
 		if i > 0 {
 			s.push_str(", ");
 		}
-		s.push_str(interner.resolve(tp.name.inner).unwrap_or("?"));
+		s.push_str(interner.resolve(tp.name.inner).unwrap());
 		let has_bounds =
 			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
 		if has_bounds {
 			s.push_str(": ");
-			let fmt = tir.formatter(interner);
+			let fmt = tir.formatter(interner, packages, from);
 			s.push_str(&fmt.display_bounds(&tp.bounds).unwrap_or_default());
 		}
 	}
 	s.push('>');
 }
 
+/// The point to search backward from for `kind`'s own leading doc comment —
+/// `pub_span`'s start when the item is `pub` (it sits to the left of
+/// `fn`/`struct`/etc., closer to any attributes/doc comments above), else
+/// the item's name span. `None` for symbol kinds that aren't a standalone
+/// declaration with its own doc comment (locals, params, `self`, type
+/// params, labels, enum variants, struct fields, associated types, and the
+/// synthetic `Self`/namespace kinds).
+fn doc_comment_anchor(tir: &TIR, kind: &SymbolKind) -> Option<SourceSpan> {
+	fn anchor(
+		file_id: FileId,
+		pub_span: Option<TextSpan>,
+		name_span: TextSpan,
+	) -> SourceSpan {
+		SourceSpan::new(file_id, pub_span.unwrap_or(name_span))
+	}
+	match kind {
+		SymbolKind::Function(id) => {
+			let f = &tir.functions[tir.function_index(*id)? as usize];
+			Some(anchor(f.file_id, f.pub_span, f.name.span))
+		}
+		SymbolKind::Global(id) => {
+			let g = &tir.globals[tir.global_index(*id)? as usize];
+			Some(anchor(g.file_id, g.pub_span, g.name.span))
+		}
+		SymbolKind::Const(id) => {
+			let c = &tir.constants[tir.const_index(*id)? as usize];
+			Some(anchor(c.file_id, c.pub_span, c.name.span))
+		}
+		SymbolKind::Struct(id) => {
+			let s = tir.structs.get(tir.struct_index(*id)? as usize)?;
+			Some(anchor(s.file_id, s.pub_span, s.name.span))
+		}
+		SymbolKind::Enum(id) => {
+			let e = tir.enums.get(tir.enum_index(*id)? as usize)?;
+			Some(anchor(e.file_id, e.pub_span, e.name.span))
+		}
+		SymbolKind::Trait(id) => {
+			let t = tir.traits.get(tir.trait_index(*id)? as usize)?;
+			Some(anchor(t.file_id, t.pub_span, t.name.span))
+		}
+		SymbolKind::TypeSet(id) => {
+			let ts = tir.typesets.get(tir.typeset_index(*id)? as usize)?;
+			Some(anchor(ts.file_id, ts.pub_span, ts.name.span))
+		}
+		SymbolKind::TypeAlias(id) => {
+			let a = &tir.type_aliases[tir.type_alias_index(*id)? as usize];
+			Some(anchor(a.file_id, a.pub_span, a.name.span))
+		}
+		SymbolKind::Memory(id) => {
+			let m = &tir.memories[tir.memory_index(*id)? as usize];
+			Some(SourceSpan::new(m.file_id, m.name.span))
+		}
+		_ => None,
+	}
+}
+
+/// The markdown text of the doc-comment block (if any) immediately above
+/// `anchor_offset` in `source` — walks backward one whole line at a time: a
+/// `///` line is collected, a `#[...]` line is skipped (attributes sit
+/// between a doc comment and the item they document, e.g. `std/main.wx`'s
+/// `memory_grow`), and anything else (including a blank line) stops the
+/// walk. Linear in the size of the doc-comment block being read — each
+/// `rfind('\n')` scans backward only as far as the nearest newline, not the
+/// whole `source[..k]` slice it's called on, so cost never depends on how
+/// deep into the file `anchor_offset` is.
+fn leading_doc_comment(source: &str, anchor_offset: u32) -> Option<String> {
+	let mut doc_lines = Vec::new();
+	let mut line_start = source[..anchor_offset as usize]
+		.rfind('\n')
+		.map_or(0, |i| i + 1);
+	while line_start > 0 {
+		let prev_line_start =
+			source[..line_start - 1].rfind('\n').map_or(0, |i| i + 1);
+		let line = source[prev_line_start..line_start - 1].trim();
+		if let Some(text) = line.strip_prefix("///") {
+			doc_lines.push(text.strip_prefix(' ').unwrap_or(text));
+		} else if !line.starts_with("#[") {
+			break;
+		}
+		line_start = prev_line_start;
+	}
+	if doc_lines.is_empty() {
+		return None;
+	}
+	doc_lines.reverse();
+	Some(doc_lines.join("\n"))
+}
+
 fn symbol_hover_text(
 	tir: &TIR,
 	interner: &ast::StringInterner,
+	packages: &[vfs::PackageGraph],
+	from: vfs::PackageId,
 	kind: &SymbolKind,
 ) -> Option<String> {
-	let fmt = tir.formatter(interner);
+	let fmt = tir.formatter(interner, packages, from);
 	match kind {
 		SymbolKind::Function(def_id) => {
 			let fi = tir.function_index(*def_id)? as usize;
 			let func = &tir.functions[fi];
-			let fmt = fmt.with_type_params(&func.type_params);
-			let name = interner.resolve(func.name.inner).unwrap_or("?");
+			let name = interner.resolve(func.name.inner).unwrap();
 			let pub_prefix = if func.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}fn {name}");
-			push_type_params(&mut s, tir, interner, &func.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&func.type_params,
+			);
 			s.push('(');
 			for (i, param) in func.params.iter().enumerate() {
 				if i > 0 {
 					s.push_str(", ");
 				}
-				let pname = interner.resolve(param.name.inner).unwrap_or("_");
+				let pname = interner.resolve(param.name.inner).unwrap();
 				s.push_str(pname);
 				s.push_str(": ");
 				s.push_str(&fmt.display_type(param.ty.inner).unwrap());
@@ -1703,7 +2022,7 @@ fn symbol_hover_text(
 		SymbolKind::Global(def_id) => {
 			let gi = tir.global_index(*def_id)? as usize;
 			let global = &tir.globals[gi];
-			let name = interner.resolve(global.name.inner).unwrap_or("?");
+			let name = interner.resolve(global.name.inner).unwrap();
 			let type_str = fmt.display_type(global.ty.inner).unwrap();
 			let pub_prefix = if global.pub_span.is_some() {
 				"pub "
@@ -1720,7 +2039,7 @@ fn symbol_hover_text(
 		SymbolKind::Memory(def_id) => {
 			let mi = tir.memory_index(*def_id)? as usize;
 			let memory = &tir.memories[mi];
-			let name = interner.resolve(memory.name.inner).unwrap_or("?");
+			let name = interner.resolve(memory.name.inner).unwrap();
 			let size_str = fmt.display_type(memory.size.inner).unwrap();
 			Some(format!(
 				"memory {name}: Memory where {{ Size = {size_str} }}"
@@ -1729,19 +2048,26 @@ fn symbol_hover_text(
 		SymbolKind::Struct(def_id) => {
 			let struct_ =
 				tir.structs.get(tir.struct_index(*def_id)? as usize)?;
-			let name = interner.resolve(struct_.name.inner).unwrap_or("?");
+			let name = interner.resolve(struct_.name.inner).unwrap();
 			let pub_prefix = if struct_.pub_span.is_some() {
 				"pub "
 			} else {
 				""
 			};
 			let mut s = format!("{pub_prefix}struct {name}");
-			push_type_params(&mut s, tir, interner, &struct_.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&struct_.type_params,
+			);
 			Some(s)
 		}
 		SymbolKind::Enum(def_id) => {
 			let enum_ = tir.enums.get(tir.enum_index(*def_id)? as usize)?;
-			let name = interner.resolve(enum_.name.inner).unwrap_or("?");
+			let name = interner.resolve(enum_.name.inner).unwrap();
 			let pub_prefix = if enum_.pub_span.is_some() { "pub " } else { "" };
 			let repr = fmt.display_type(enum_.repr_type).unwrap();
 			Some(format!("{pub_prefix}enum {name}: {repr} {{ ... }}"))
@@ -1767,7 +2093,7 @@ fn symbol_hover_text(
 				.get(*scope_idx as usize)?
 				.locals
 				.get(*local_idx as usize)?;
-			let name = interner.resolve(local.name.inner).unwrap_or("_");
+			let name = interner.resolve(local.name.inner).unwrap();
 			let type_str = fmt.display_type(local.ty).unwrap();
 			let mut_kw = if local.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("local {mut_kw}{name}: {type_str}"))
@@ -1775,7 +2101,7 @@ fn symbol_hover_text(
 		SymbolKind::Param { func_id, param_idx } => {
 			let fi = tir.function_index(*func_id)? as usize;
 			let param = tir.functions[fi].params.get(*param_idx as usize)?;
-			let name = interner.resolve(param.name.inner).unwrap_or("_");
+			let name = interner.resolve(param.name.inner).unwrap();
 			let type_str = fmt.display_type(param.ty.inner).unwrap();
 			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("{mut_kw}{name}: {type_str}"))
@@ -1793,9 +2119,8 @@ fn symbol_hover_text(
 		} => {
 			let enum_ = tir.enums.get(tir.enum_index(*enum_id)? as usize)?;
 			let variant = enum_.variants.get(*variant_idx as usize)?;
-			let enum_name = interner.resolve(enum_.name.inner).unwrap_or("?");
-			let variant_name =
-				interner.resolve(variant.name.inner).unwrap_or("?");
+			let enum_name = interner.resolve(enum_.name.inner).unwrap();
+			let variant_name = interner.resolve(variant.name.inner).unwrap();
 			Some(format!("{enum_name}::{variant_name}"))
 		}
 		SymbolKind::Namespace(ns_idx) => {
@@ -1803,20 +2128,19 @@ fn symbol_hover_text(
 			match ns.declaration {
 				ModuleDeclarationKind::Module(decl_idx) => {
 					let decl = tir.module_decls.get(decl_idx as usize)?;
-					let name = interner.resolve(decl.name.inner).unwrap_or("?");
+					let name = interner.resolve(decl.name.inner).unwrap();
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
-					Some(format!("{pub_prefix}module {name}"))
+					Some(format!("{pub_prefix}mod {name}"))
 				}
 				ModuleDeclarationKind::Import(import_idx) => {
 					let decl = tir.import_decls.get(import_idx as usize)?;
-					let external = interner
-						.resolve(decl.external_name.inner)
-						.unwrap_or("?");
+					let external =
+						interner.resolve(decl.external_name.inner).unwrap();
 					match &decl.internal_name {
 						Some(alias) => {
 							let alias_name =
-								interner.resolve(alias.inner).unwrap_or("?");
+								interner.resolve(alias.inner).unwrap();
 							Some(format!(
 								"import \"{external}\" as {alias_name}"
 							))
@@ -1824,9 +2148,13 @@ fn symbol_hover_text(
 						None => Some(format!("import \"{external}\"")),
 					}
 				}
-				ModuleDeclarationKind::Crate(_, _) => {
-					let name = interner.resolve(ns.name).unwrap_or("?");
-					Some(format!("crate {name}"))
+				// A package has no name of its own — show it as the package
+				// this hover is rendered from calls it (or, for `crate`/
+				// `super` naming `from`'s own root, as the literal keyword).
+				ModuleDeclarationKind::Package(_) => {
+					let name =
+						tir.namespace_name(*ns_idx, packages, from, interner);
+					Some(format!("package {name}"))
 				}
 			}
 		}
@@ -1870,7 +2198,7 @@ fn symbol_hover_text(
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
 			let trait_ = tir.traits.get(tir.trait_index(*def_id)? as usize)?;
-			let name = interner.resolve(trait_.name.inner).unwrap_or("?");
+			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
 				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {
@@ -1882,17 +2210,23 @@ fn symbol_hover_text(
 		SymbolKind::TypeSet(def_id) => {
 			let typeset =
 				tir.typesets.get(tir.typeset_index(*def_id)? as usize)?;
-			let name = interner.resolve(typeset.name.inner).unwrap_or("?");
+			let name = interner.resolve(typeset.name.inner).unwrap();
 			Some(format!("typeset {name} {{ ... }}"))
 		}
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = tir.type_alias_index(*def_id)? as usize;
 			let alias = &tir.type_aliases[ai];
-			let fmt = fmt.with_type_params(&alias.type_params);
-			let name = interner.resolve(alias.name.inner).unwrap_or("?");
+			let name = interner.resolve(alias.name.inner).unwrap();
 			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}type {name}");
-			push_type_params(&mut s, tir, interner, &alias.type_params);
+			push_type_params(
+				&mut s,
+				tir,
+				interner,
+				packages,
+				from,
+				&alias.type_params,
+			);
 			// Bodiless `#[intrinsic] type u8;` — `alias.body` holds the
 			// resolved primitive, not a source-written `= Type` (see the
 			// doc comment on `TypeAlias::body`).
@@ -1905,7 +2239,7 @@ fn symbol_hover_text(
 		SymbolKind::Const(def_id) => {
 			let ci = tir.const_index(*def_id)? as usize;
 			let constant = &tir.constants[ci];
-			let name = interner.resolve(constant.name.inner).unwrap_or("?");
+			let name = interner.resolve(constant.name.inner).unwrap();
 			let type_str = fmt.display_type(constant.ty.inner).unwrap();
 			let pub_prefix = if constant.pub_span.is_some() {
 				"pub "
@@ -1921,8 +2255,7 @@ fn symbol_hover_text(
 			let struct_ =
 				tir.structs.get(tir.struct_index(*struct_id)? as usize)?;
 			let field = struct_.fields.get(*field_idx as usize)?;
-			let fmt = fmt.with_type_params(&struct_.type_params);
-			let name = interner.resolve(field.name.inner).unwrap_or("?");
+			let name = interner.resolve(field.name.inner).unwrap();
 			let type_str = fmt.display_type(field.ty.inner).unwrap();
 			let pub_prefix = if field.pub_span.is_some() { "pub " } else { "" };
 			Some(format!("{pub_prefix}{name}: {type_str}"))
@@ -1933,7 +2266,7 @@ fn symbol_hover_text(
 		} => {
 			let trait_ = tir.traits.get(tir.trait_index(*trait_id)? as usize)?;
 			let at = trait_.assoc_types.get(assoc_name)?;
-			let name = interner.resolve(*assoc_name).unwrap_or("?");
+			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {
 				Some(format!("type {name}"))
@@ -2300,17 +2633,21 @@ fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
 	}
 }
 
-pub(crate) fn discover_crate_root(
+/// Finds the project directory governing `file_path` — the nearest
+/// ancestor (bounded by `workspace_folders`, when given) with a `wx.json`
+/// — or `None` if there is no such ancestor. Returns the *directory*, not
+/// an entry file: which file compilation actually starts from is
+/// `wx.json`'s own `entry` field, resolved later by `vfs::open_manifest`,
+/// not a filename convention this function would have to know about.
+///
+/// No special case for a file itself being named `main.wx` — that
+/// convention doesn't exist anymore. Every file, `main.wx` or not,
+/// belongs to a project only by virtue of a `wx.json` somewhere above it.
+pub(crate) fn discover_package_root(
 	open_documents: &HashMap<PathBuf, OpenDocument>,
 	workspace_folders: &[PathBuf],
 	file_path: &Path,
 ) -> Option<PathBuf> {
-	if file_path.file_name().is_some_and(|name| name == "main.wx")
-		&& (open_documents.contains_key(file_path) || file_path.exists())
-	{
-		return Some(file_path.to_path_buf());
-	}
-
 	let mut current = file_path.parent();
 	while let Some(dir) = current {
 		if !workspace_folders.is_empty()
@@ -2320,9 +2657,9 @@ pub(crate) fn discover_crate_root(
 			continue;
 		}
 
-		let candidate = dir.join("main.wx");
+		let candidate = dir.join("wx.json");
 		if open_documents.contains_key(&candidate) || candidate.exists() {
-			return Some(candidate);
+			return Some(dir.to_path_buf());
 		}
 		current = dir.parent();
 	}
@@ -2334,42 +2671,39 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 	uri.to_file_path().map(|cow| cow.into_owned())
 }
 
-/// Whether `path` is one of our own absolute paths, as opposed to a virtual
-/// stdlib name like `main.wx`. Deliberately not `Path::is_absolute()`: it is
-/// (surprisingly) always `false` on `wasm32-unknown-unknown` even for
-/// `/`-rooted paths (see `file_id_to_uri`), which — before this was
-/// introduced — silently dropped every diagnostic and owned-file entry in
-/// `analysis_from_compiled_root`/`label_location` on wasm, since both
-/// gated on `Path::is_absolute()` directly.
-fn is_absolute_path(path: &Path) -> bool {
-	path.to_str().is_some_and(|s| s.starts_with('/'))
-}
-
 /// Builds a `file://` URI directly from an absolute path, bypassing
 /// `Uri::from_file_path`'s `Path::is_absolute()` gate — see `file_id_to_uri`
 /// for why that gate is unusable on `wasm32-unknown-unknown`. Every call
-/// site that turns one of our own paths into a URI must go through this (or
-/// `file_id_to_uri`) instead of `Uri::from_file_path` directly.
+/// site that turns one of our own `Local` paths into a URI must go through
+/// this (or `file_id_to_uri`) instead of `Uri::from_file_path` directly.
 fn path_to_file_uri(path: &Path) -> Option<Uri> {
 	let stripped = path.to_str()?.strip_prefix('/')?;
 	Uri::from_str(&format!("file:///{stripped}")).ok()
 }
 
-/// Converts a `FileId` to a URI. Real files get a `file://` URI; virtual
-/// files (non-absolute names, i.e. stdlib) get a `wx://std/<name>` URI.
+/// Converts a `FileId` to a URI: a `Local` file gets a `file://` URI, a
+/// `Virtual` file (i.e. the stdlib) gets a `wx://std/<name>` URI.
 ///
 /// Deliberately not `Uri::from_file_path`: it gates on `Path::is_absolute()`
 /// to decide whether it can skip `canonicalize()` — and `is_absolute()` is
 /// (surprisingly) always `false` on `wasm32-unknown-unknown` even for
 /// `/`-rooted paths, so it always falls through to `canonicalize()`, which
 /// needs a real filesystem and always fails in the browser. `name` is our
-/// own virtual path, not a real OS path, so we don't need any of that —
-/// just check for the leading `/` ourselves and build the URI directly.
-fn file_id_to_uri(compiled: &CompiledRoot, file_id: FileId) -> Option<Uri> {
-	let name = compiled.graph.files.name(file_id).ok()?;
-	match path_to_file_uri(Path::new(name)) {
-		Some(uri) => Some(uri),
-		None => Uri::from_str(&format!("wx://std/{name}")).ok(),
+/// own virtual path, not necessarily a real OS path, so we don't need any of
+/// that — dispatch on `FileOrigin` and build the URI directly.
+fn file_id_to_uri(files: &vfs::Files, file_id: FileId) -> Option<Uri> {
+	let file = files.get(file_id).ok()?;
+	match file.origin {
+		vfs::FileOrigin::Local => path_to_file_uri(Path::new(&file.name)),
+		// `file.name` is already `/`-prefixed (the embedded stdlib's own
+		// `AbsolutePath` convention, e.g. `/main.wx`), so no separator goes
+		// between `wx://std` and it — `wx://std/main.wx`, not
+		// `wx://std//main.wx`. `virtual_file_content`'s `strip_prefix("wx://std")`
+		// expects exactly this: a leading-slash remainder it can feed
+		// straight into `stdlib_file`/`AbsolutePath::new`.
+		vfs::FileOrigin::Virtual => {
+			Uri::from_str(&format!("wx://std{}", file.name)).ok()
+		}
 	}
 }
 

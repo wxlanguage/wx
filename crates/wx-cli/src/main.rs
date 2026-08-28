@@ -8,6 +8,8 @@ use codespan_reporting::term::DisplayStyle;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use wx_compiler::*;
 
+mod format;
+
 fn main() {
 	let message_format = clap::Arg::new("message-format")
 		.long("message-format")
@@ -26,9 +28,13 @@ fn main() {
 		.subcommand_required(true)
 		.arg_required_else_help(true)
 		.subcommand(
-			clap::Command::new("compile")
-				.about("Compile a WX source file to WebAssembly")
-				.arg(clap::Arg::new("path").required(true).index(1))
+			clap::Command::new("build")
+				.about("Build a WX project to WebAssembly")
+				.arg(
+					clap::Arg::new("path")
+						.help("The project directory to build (default: .)")
+						.default_value("."),
+				)
 				.arg(
 					clap::Arg::new("output")
 						.short('o')
@@ -36,21 +42,49 @@ fn main() {
 						.value_name("PATH")
 						.help(
 							"Output path for the compiled .wasm; use `-` \
-							 for stdout (default: <input>.wasm)",
+							 for stdout (default: <project-dir-name>.wasm)",
 						),
 				)
 				.arg(message_format.clone()),
 		)
 		.subcommand(
 			clap::Command::new("check")
-				.about("Type-check a WX source file without emitting output")
-				.arg(clap::Arg::new("path").required(true).index(1))
+				.about("Type-check a WX project without emitting output")
+				.arg(
+					clap::Arg::new("path")
+						.help("The project directory to check (default: .)")
+						.default_value("."),
+				)
 				.arg(message_format),
 		)
 		.subcommand(
 			clap::Command::new("format")
-				.about("Format a WX source file in-place")
-				.arg(clap::Arg::new("path").required(true).index(1)),
+				.visible_alias("fmt")
+				.about("Format a WX project's source files in-place")
+				.arg(
+					clap::Arg::new("path")
+						.help("The project directory to format (default: .)")
+						.default_value("."),
+				)
+				.arg(
+					clap::Arg::new("files")
+						.long("files")
+						.value_name("FILE,FILE,...")
+						.value_delimiter(',')
+						.help(
+							"Format only these files, relative to the \
+							 project root, instead of the whole project",
+						),
+				)
+				.arg(
+					clap::Arg::new("check")
+						.long("check")
+						.action(clap::ArgAction::SetTrue)
+						.help(
+							"Check formatting without writing; exit \
+							 nonzero if any file would change",
+						),
+				),
 		)
 		.subcommand(
 			clap::Command::new("lsp")
@@ -59,13 +93,13 @@ fn main() {
 		.get_matches();
 
 	match matches.subcommand() {
-		Some(("compile", sub)) => {
+		Some(("build", sub)) => {
 			let path = sub.get_one::<String>("path").unwrap();
 			let output = sub.get_one::<String>("output").map(String::as_str);
 			let format = parse_message_format(
 				sub.get_one::<String>("message-format").unwrap(),
 			);
-			cmd_compile(path, output, format);
+			cmd_build(path, output, format);
 		}
 		Some(("check", sub)) => {
 			let path = sub.get_one::<String>("path").unwrap();
@@ -75,7 +109,12 @@ fn main() {
 			cmd_check(path, format);
 		}
 		Some(("format", sub)) => {
-			cmd_format(sub.get_one::<String>("path").unwrap())
+			let path = sub.get_one::<String>("path").unwrap();
+			let files: Option<Vec<String>> = sub
+				.get_many::<String>("files")
+				.map(|values| values.cloned().collect());
+			let check = sub.get_flag("check");
+			cmd_format(path, files.as_deref(), check);
 		}
 		Some(("lsp", _)) => cmd_lsp(),
 		_ => unreachable!(),
@@ -182,13 +221,38 @@ fn diagnostic_to_json(
 	}
 }
 
-fn load_compilation(file_path: &str) -> vfs::CompilationGraph {
-	let mut builder = vfs::CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
-	match builder.load_binary(file_path.to_string(), &vfs::NativeFileSource) {
-		Ok(root_id) => builder.build(root_id, stdlib_id),
+/// Resolves a CLI-provided file path to an absolute one, joining it
+/// against the process's current directory if the user typed a relative
+/// path — every `FileSource` consumer works with `AbsolutePath` only, so
+/// this is the one place that has to make that true for whatever the user
+/// actually typed.
+///
+/// Known gap: only checks for a leading `/`, so a Windows drive-letter
+/// absolute path (`C:\...`) would incorrectly be treated as relative and
+/// joined onto the cwd instead of used as-is.
+fn resolve_cli_path(file_path: &str) -> vfs::AbsolutePath {
+	if file_path.starts_with('/') {
+		return vfs::AbsolutePath::new(file_path);
+	}
+	let cwd = std::env::current_dir()
+		.expect("current directory should be accessible");
+	vfs::AbsolutePath::new(cwd.to_string_lossy().into_owned())
+		.join(&vfs::RelativePath::new(file_path))
+}
+
+/// Loads the project rooted at `path` — always a directory with a readable
+/// `wx.json`/`entry`. There's no anonymous, manifest-less mode any more
+/// than `wx format` has one; every file `build`/`check` touches belongs to
+/// a project.
+fn load_compilation(path: &str) -> vfs::CompilationUnit {
+	let absolute = resolve_cli_path(path);
+	match vfs::open_manifest(absolute, &vfs::NativeFileSource) {
+		Ok(compilation) => compilation,
 		Err(()) => {
-			eprintln!("error: cannot read file '{file_path}'");
+			eprintln!(
+				"error: '{path}' is not a wx project (no readable \
+				 `wx.json`/`entry`)"
+			);
 			std::process::exit(1);
 		}
 	}
@@ -198,7 +262,7 @@ fn load_compilation(file_path: &str) -> vfs::CompilationGraph {
 /// Does not inspect severity — call `abort_if_errors` separately, after all
 /// diagnostics across every stage have been emitted.
 fn emit_diagnostics(
-	compilation: &vfs::CompilationGraph,
+	compilation: &vfs::CompilationUnit,
 	diagnostics: &[Diagnostic<vfs::FileId>],
 	format: &MessageFormat,
 ) {
@@ -242,17 +306,41 @@ fn abort_if_errors(count: usize) {
 	std::process::exit(1);
 }
 
-fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
-	let mut compilation = load_compilation(file_path);
+fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
+	let mut compilation = load_compilation(project_path);
 
-	for crate_graph in &compilation.crates {
-		emit_diagnostics(&compilation, &crate_graph.diagnostics, &format);
+	if compilation.packages[compilation.root_package.as_usize()].kind
+		== vfs::PackageKind::Library
+	{
+		eprintln!(
+			"error: '{project_path}' is a library package and has no WASM \
+			 output to emit; use `wx check` instead"
+		);
+		std::process::exit(1);
+	}
+
+	for package_graph in &compilation.packages {
+		emit_diagnostics(
+			&compilation,
+			&package_graph.linker_diagnostics,
+			&format,
+		);
+		for module in &package_graph.modules {
+			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
+		}
 	}
 	abort_if_errors(
 		compilation
-			.crates
+			.packages
 			.iter()
-			.flat_map(|crate_graph| crate_graph.diagnostics.iter())
+			.flat_map(|package_graph| {
+				package_graph.linker_diagnostics.iter().chain(
+					package_graph
+						.modules
+						.iter()
+						.flat_map(|module| module.ast.diagnostics.iter()),
+				)
+			})
 			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
 			.count(),
 	);
@@ -278,24 +366,38 @@ fn cmd_compile(file_path: &str, output: Option<&str>, format: MessageFormat) {
 
 	let out_path = match output {
 		Some(path) => path.to_string(),
-		None => format!("{}.wasm", output_stem(file_path)),
+		None => format!("{}.wasm", output_stem(project_path)),
 	};
 	let mut file = fs::File::create(&out_path).unwrap();
 	file.write_all(&bytecode).unwrap();
 	eprintln!("Wrote {} bytes to {out_path}", bytecode.len());
 }
 
-fn cmd_check(file_path: &str, format: MessageFormat) {
-	let mut compilation = load_compilation(file_path);
+fn cmd_check(project_path: &str, format: MessageFormat) {
+	let mut compilation = load_compilation(project_path);
 
-	for crate_graph in &compilation.crates {
-		emit_diagnostics(&compilation, &crate_graph.diagnostics, &format);
+	for package_graph in &compilation.packages {
+		emit_diagnostics(
+			&compilation,
+			&package_graph.linker_diagnostics,
+			&format,
+		);
+		for module in &package_graph.modules {
+			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
+		}
 	}
 	abort_if_errors(
 		compilation
-			.crates
+			.packages
 			.iter()
-			.flat_map(|crate_graph| crate_graph.diagnostics.iter())
+			.flat_map(|package_graph| {
+				package_graph.linker_diagnostics.iter().chain(
+					package_graph
+						.modules
+						.iter()
+						.flat_map(|module| module.ast.diagnostics.iter()),
+				)
+			})
 			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
 			.count(),
 	);
@@ -312,36 +414,89 @@ fn cmd_check(file_path: &str, format: MessageFormat) {
 	println!("No errors found.");
 }
 
-fn cmd_format(file_path: &str) {
-	let source = match fs::read_to_string(file_path) {
-		Ok(s) => s,
-		Err(e) => {
-			eprintln!("error: cannot read '{file_path}': {e}");
+/// Resolves an explicit `--manifest <path>` into a `RendererConfig` once,
+/// up front, for the whole invocation. Unlike a directory argument's own
+/// `wx.json` (opportunistic — falls through to the next config rule on any
+/// failure), this is an explicit ask: a bad or missing `--manifest` is a
+/// hard error, not a silent fallback.
+fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
+	let project_dir = resolve_cli_path(project_path);
+	let selection = match format::expand_project(
+		&project_dir,
+		files,
+		&vfs::NativeFileSource,
+	) {
+		Ok(selection) => selection,
+		Err(()) => {
+			eprintln!(
+				"error: '{project_path}' is not a wx project (no \
+					 readable `wx.json`/`entry`, or a file named by \
+					 `--files` could not be read)"
+			);
 			std::process::exit(1);
 		}
 	};
 
-	let mut files = vfs::Files::new();
-	let file_id = files.add(file_path.to_string(), source).unwrap();
-	let mut interner = ast::StringInterner::new();
-	let mut id_gen = ast::DefIdGenerator::new();
+	let mut any_error = false;
+	let mut any_would_change = false;
 
-	let parsed =
-		ast::Parser::parse(file_id, &files, &mut interner, &mut id_gen);
-	let source = &files.get(file_id).unwrap().source;
-	let formatted = wx_fmt::format(
-		&parsed,
-		&interner,
-		source,
-		wx_fmt::RendererConfig::default(),
-	);
+	for module in &selection.modules {
+		// `Parser::parse` is error-recovering — it always returns *an*
+		// AST, never a hard failure, so a syntax error alone wouldn't stop
+		// this loop otherwise. That's the right call for `compile`/
+		// `check`, which only report and abort; `format` overwrites the
+		// file in place, so rendering and writing a recovered, error-laden
+		// AST back over the original would silently corrupt it instead.
+		if module
+			.ast
+			.diagnostics
+			.iter()
+			.any(|d| matches!(d.severity, Severity::Error | Severity::Bug))
+		{
+			eprintln!(
+				"error: '{}' has syntax errors, skipping (run `wx check \
+				 {}` for details)",
+				module.file_path, module.file_path
+			);
+			any_error = true;
+			continue;
+		}
 
-	fs::write(file_path, &formatted).unwrap();
-	println!("Formatted {file_path}");
+		let file = selection.files.get(module.file_id).unwrap();
+		let formatted = wx_fmt::format(
+			&module.ast,
+			&selection.interner,
+			&file.source,
+			selection.config,
+		);
+
+		if formatted == file.source {
+			continue;
+		}
+		if check {
+			println!("Would reformat {}", module.file_path);
+			any_would_change = true;
+		} else {
+			fs::write(module.file_path.as_str(), &formatted).unwrap();
+			println!("Formatted {}", module.file_path);
+		}
+	}
+
+	if any_error || (check && any_would_change) {
+		std::process::exit(1);
+	}
 }
 
-fn output_stem(file_path: &str) -> String {
-	let filename = file_path.split('/').next_back().unwrap();
-	let parts: Vec<&str> = filename.split('.').collect();
-	parts[..parts.len() - 1].join(".")
+/// Derives a default output filename from the project's own directory
+/// name — `path` is always a directory now, so there's no file extension
+/// to strip the way there used to be. Resolved to an absolute path first
+/// so `.`/`./` name the real directory rather than becoming a literal `.`.
+fn output_stem(path: &str) -> String {
+	let absolute = resolve_cli_path(path);
+	absolute
+		.as_str()
+		.rsplit('/')
+		.find(|segment| !segment.is_empty())
+		.unwrap_or("out")
+		.to_string()
 }

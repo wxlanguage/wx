@@ -33,14 +33,14 @@ Try it instantly in the browser playground: [wx-lang.deno.dev](https://wx-lang.d
 ```bash
 npm install -g @wx-lang/cli
 
-wx compile ./main.wx
+wx build .   # run inside a project directory containing wx.json + your entry file
 ```
 
 **Or build the native CLI from source**
 
 ```bash
 cargo build --release -p wx-cli
-./target/release/wx compile ./main.wx
+./target/release/wx build .
 ```
 
 **Editor support**

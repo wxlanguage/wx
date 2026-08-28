@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
-use crate::vfs::{CrateId, Files};
+use crate::vfs::{Files, PackageGraph, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
 struct ExprContext {
@@ -194,15 +194,27 @@ pub fn parse_char_literal(s: &str) -> Result<char, CharLiteralError> {
 }
 
 struct Builder<'ast, 'graph> {
+	// These cannot collapse into a single `&'graph mut CompilationUnit`, even
+	// though all four are its fields. `ast_nodes` holds `&'ast ast::Item`
+	// pointing into `packages[..].modules[..].ast` — into the same unit. That
+	// only works because `packages` (shared) and `interner`/`id_generator`
+	// (mutable) are *disjoint fields* borrowed separately. Behind one `&mut`
+	// the AST refs must be reborrowed out of it, which poisons the builder for
+	// every later `&mut self` phase (E0502) — and phases 2, 3, 3.5 and 4 all
+	// run while `ast_nodes` is live.
 	interner: &'graph mut ast::StringInterner,
 	id_generator: &'graph mut ast::DefIdGenerator,
 	files: &'graph Files,
-	symbol_lookup: HashMap<(SymbolNamespace, SymbolU32), SymbolKind>,
+	/// Read only to resolve what a package calls its dependencies, which is
+	/// where a package's canonical name lives (see `PackageGraph::dependency_names`).
+	packages: &'graph [PackageGraph],
+	/// The package being compiled. Only `export { .. }` needs this: exports
+	/// are a property of the artifact as a whole, so the sole legal home for
+	/// a block is this package's entry file — a dependency that declares one
+	/// would otherwise merge its names into an ABI it doesn't own.
+	root_package: PackageId,
 	type_index_lookup: HashMap<Type, TypeIndex>,
 	tir: TIR,
-	/// Namespaces brought into the root scope via `use path::*;` at the binary
-	/// crate root (where `namespace = None`).  Parallel to `ModuleNamespace::wildcard_imports`.
-	root_wildcard_imports: Vec<NamespaceIndex>,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
 	ast_nodes: Vec<AstEntry<'ast>>,
 	/// Maps DefId → SigEntry; populated after Phase 1 with exact capacity.
@@ -322,7 +334,7 @@ enum BoundKind {
 struct AstEntry<'ast> {
 	def_id: ast::DefId,
 	file_id: FileId,
-	namespace: Option<NamespaceIndex>,
+	namespace: NamespaceIndex,
 	node: AstNodeRef<'ast>,
 }
 
@@ -341,11 +353,56 @@ struct GenericScope {
 #[derive(Clone, Copy)]
 struct ResolveContext {
 	file_id: FileId,
-	namespace: Option<NamespaceIndex>,
+	namespace: NamespaceIndex,
+}
+
+/// The outcome of walking a `use` prefix — see
+/// [`Builder::walk_use_prefix`], which reports none of these itself because
+/// only its caller knows which deserve a diagnostic.
+enum PrefixWalk {
+	Resolved(NamespaceIndex),
+	/// No segments at all: `use add;`. Distinct from `Unresolved` because
+	/// there is no segment to point a label at, and distinct from
+	/// `Resolved` because there is no namespace to look the leaf up in —
+	/// conflating the three into an `Option` is what let this spelling
+	/// through silently.
+	Empty,
+	/// A segment naming something that isn't a module.
+	NotAModule(ast::Spanned<SymbolU32>, SourceSpan),
+	/// A segment naming nothing at all.
+	Unresolved(SourceSpan),
+}
+
+/// The outcome of a scope-chain lookup — see
+/// [`Builder::lookup_scope_chain`].
+enum ScopeLookup {
+	NotFound,
+	Found(SymbolEntry),
+	/// Two or more globs at one scope level supply *distinct* items for this
+	/// name, so which one wins is nothing but `use`-statement order.
+	///
+	/// Carries every candidate paired with the glob that supplied it,
+	/// because the thing worth pointing a label at is the `use` statements —
+	/// each definition is fine on its own; it's importing both that isn't.
+	/// Always holds at least two entries.
+	Ambiguous(Box<[(SymbolEntry, SourceSpan)]>),
+}
+
+impl ScopeLookup {
+	/// What this name resolves to with ambiguity set aside: the first
+	/// candidate in `use` order, which is exactly what resolution silently
+	/// picked back when ambiguity wasn't detected at all.
+	fn symbol(&self) -> Option<SymbolEntry> {
+		match self {
+			ScopeLookup::NotFound => None,
+			ScopeLookup::Found(entry) => Some(*entry),
+			ScopeLookup::Ambiguous(candidates) => Some(candidates[0].0),
+		}
+	}
 }
 
 impl ResolveContext {
-	fn new(file_id: FileId, namespace: Option<NamespaceIndex>) -> Self {
+	fn new(file_id: FileId, namespace: NamespaceIndex) -> Self {
 		Self { file_id, namespace }
 	}
 }
@@ -431,6 +488,20 @@ enum AstNodeRef<'ast> {
 	ImportedGlobal {
 		import_module_index: u32,
 		decl: &'ast ast::ImportDeclaration,
+	},
+	/// One named leaf of a `use` tree. Everything it needs is already in
+	/// `tir.use_items[use_index]` — the syntactic prefix, the name, the
+	/// alias — so unlike every other variant here it holds no `&'ast`
+	/// reference.
+	Use {
+		use_index: u32,
+	},
+	/// An `export { .. }` block. Carries no type of its own — its
+	/// "signature" is the act of resolving each listed name to an
+	/// `ExportItem`, which is why it rides the Phase 2 sweep like any
+	/// other item instead of needing a pass of its own.
+	Export {
+		item: &'ast ast::Item,
 	},
 }
 
@@ -908,7 +979,7 @@ fn report_method_not_found(
 	method: SymbolU32,
 	ty: TypeIndex,
 ) -> Diagnostic<FileId> {
-	let method_name = formatter.interner.resolve(method).unwrap_or("?");
+	let method_name = formatter.interner.resolve(method).unwrap();
 	let type_name = formatter.display_type(ty).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::MethodNotFound.code())
@@ -924,7 +995,7 @@ fn report_not_a_method(
 	method: SymbolU32,
 	ty: TypeIndex,
 ) -> Diagnostic<FileId> {
-	let member_name = formatter.interner.resolve(method).unwrap_or("?");
+	let member_name = formatter.interner.resolve(method).unwrap();
 	let type_name = formatter.display_type(ty).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::NotAMethod.code())
@@ -1005,6 +1076,73 @@ fn report_undeclared_identifier(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_code(DiagnosticCode::UndeclaredIdentifier.code())
 		.with_message("undeclared identifier")
 		.with_label(span.primary_label())
+}
+
+/// What to call a `SymbolKind` in prose.
+fn symbol_kind_noun(kind: SymbolKind) -> &'static str {
+	match kind {
+		SymbolKind::Enum { .. } => "enum",
+		SymbolKind::Struct { .. } => "struct",
+		SymbolKind::Module { .. } => "module",
+		SymbolKind::Memory { .. } => "memory",
+		SymbolKind::Trait { .. } => "trait",
+		SymbolKind::TypeSet { .. } => "type set",
+		SymbolKind::Global { .. } => "global",
+		SymbolKind::Function { .. } => "function",
+		SymbolKind::Const { .. } => "constant",
+		SymbolKind::TraitAssocType { .. } => "associated type",
+		SymbolKind::TypeAlias { .. } => "type alias",
+	}
+}
+
+/// [`symbol_kind_noun`], but for a raw `SymbolEntry` — `Pending` stays vague
+/// on purpose: its signature hasn't been computed, so the specific kind
+/// isn't known yet and guessing would be worse than the generic word.
+fn symbol_entry_noun(entry: SymbolEntry) -> &'static str {
+	match entry {
+		SymbolEntry::Pending(_) => "item",
+		SymbolEntry::Resolved { kind, .. } => symbol_kind_noun(kind),
+	}
+}
+
+fn report_not_a_namespace(name: &str, span: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NotANamespace.code())
+		.with_message(format!("`{name}` is not a module"))
+		.with_label(
+			span.primary_label()
+				.with_message("only a module can be used as a path prefix"),
+		)
+}
+
+fn report_import_without_module(
+	name: &str,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UndeclaredIdentifier.code())
+		.with_message(format!("unresolved import `{name}`"))
+		.with_label(
+			span.primary_label()
+				.with_message("no module to import this from"),
+		)
+		.with_note(format!(
+			"a `use` names where the item comes from, as in `use math::{name};`"
+		))
+}
+
+fn report_unresolved_import(
+	name: &str,
+	module: &str,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UndeclaredIdentifier.code())
+		.with_message(format!("no `{name}` in `{module}`"))
+		.with_label(
+			span.primary_label()
+				.with_message("not found in this module"),
+		)
 }
 
 fn report_private_item(name: &str, span: SourceSpan) -> Diagnostic<FileId> {
@@ -1392,6 +1530,51 @@ fn report_duplicate_export(
 		))
 }
 
+fn report_duplicate_export_block(
+	first_block: SourceSpan,
+	second_block: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateExportBlock.code())
+		.with_message("a package can only have one `export` block")
+		.with_label(second_block.primary_label())
+		.with_label(
+			first_block
+				.secondary_label()
+				.with_message("previous `export` block here"),
+		)
+		.with_note(
+			"an `export` block declares the package's entire public ABI, so \
+			 there is nothing for a second one to add — merge the two blocks",
+		)
+}
+
+fn report_export_block_not_at_root(block: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::ExportBlockNotAtRoot.code())
+		.with_message(
+			"an `export` block must be at the top level of the package's \
+			 entry file",
+		)
+		.with_label(block.primary_label())
+		.with_note(
+			"exports name the artifact's exit points, which belong to the \
+			 package as a whole rather than to any one module inside it",
+		)
+}
+
+fn report_library_cannot_export(block: SourceSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::LibraryCannotExport.code())
+		.with_message("a library package cannot have an `export` block")
+		.with_label(block.primary_label())
+		.with_note(
+			"a library is consumed by another package, not run — mark its \
+			 items `pub` to expose them to dependents, or set `\"type\": \
+			 \"bin\"` in the manifest to build this package as an artifact",
+		)
+}
+
 fn report_comparison_type_annotation_required(
 	left: SourceSpan,
 	right: SourceSpan,
@@ -1658,16 +1841,11 @@ fn report_invalid_cast(
 		.with_label(span.primary_label())
 }
 
-pub fn build(graph: &mut CompilationGraph) -> TIR {
+pub fn build(graph: &mut CompilationUnit) -> TIR {
 	let source_modules: Vec<_> = graph
-		.crates
+		.packages
 		.iter()
-		.flat_map(|crate_graph| {
-			crate_graph
-				.modules
-				.iter()
-				.map(move |module| (crate_graph, module))
-		})
+		.flat_map(|package_graph| package_graph.modules.iter())
 		.collect();
 	assert!(
 		!source_modules.is_empty(),
@@ -1699,10 +1877,12 @@ pub fn build(graph: &mut CompilationGraph) -> TIR {
 		],
 		functions: Vec::new(),
 		globals: Vec::new(),
-		exports: HashMap::new(),
+		export_block: None,
+		use_items: Vec::new(),
+		use_prefixes: Vec::new(),
 		namespaces: Vec::new(),
-		root_symbols: HashMap::new(),
-		root_wildcard_imports: Vec::new(),
+		package_namespaces: HashMap::new(),
+		file_namespaces: vec![0; graph.files.len()],
 		module_decls: Vec::new(),
 		import_decls: Vec::new(),
 		enums: Vec::new(),
@@ -1726,54 +1906,123 @@ pub fn build(graph: &mut CompilationGraph) -> TIR {
 			.enumerate()
 			.map(|(idx, ty)| (ty.clone(), TypeIndex(idx as u32))),
 	);
-	let symbol_lookup = HashMap::new();
 	let mut builder = Builder {
-		symbol_lookup,
 		interner: &mut graph.interner,
 		id_generator: &mut graph.id_generator,
 		files: &graph.files,
+		packages: &graph.packages,
+		root_package: graph.root_package,
 		tir,
 		type_index_lookup,
 		sig_state: HashMap::new(),
-		root_wildcard_imports: Vec::new(),
 		ast_nodes: Vec::new(),
 		operator_traits: None,
 	};
 
-	// Create a top-level namespace for each named (library) crate before prescanning.
-	// This lets modules inside stdlib live under `std::` rather than the root namespace.
-	let mut crate_namespaces: HashMap<CrateId, NamespaceIndex> = HashMap::new();
-	for crate_graph in &graph.crates {
-		if let Some(crate_name) = crate_graph.name {
-			let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
-			builder.tir.namespaces.push(ModuleNamespace {
-				name: crate_name,
-				parent: None,
-				declaration: ModuleDeclarationKind::Crate(
-					crate_graph.id,
-					crate_graph.modules[crate_graph.root.as_usize()].file_id,
-				),
-				symbols: HashMap::new(),
-				wildcard_imports: Vec::new(),
-				accesses: Vec::new(),
-			});
-			builder.symbol_lookup.insert(
-				(SymbolNamespace::Type, crate_name),
-				SymbolKind::Module { namespace_idx },
+	// Every package gets a root namespace of its own, the root package
+	// included. That is what makes `parent: None` mean "nothing above this"
+	// and nothing else — previously it also meant "the root package's own
+	// scope", which is why a lookup walking past any package boundary fell
+	// through into the root's items, and why `is_ancestor_or_self` needed a
+	// hand-written stop at package roots.
+	//
+	// Created by walking `graph.packages` in order, so `NamespaceIndex`
+	// values never depend on `HashMap` iteration order: they end up in
+	// snapshots.
+	for package_graph in &graph.packages {
+		let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
+		builder.tir.namespaces.push(ModuleNamespace {
+			parent: None,
+			package: package_graph.id,
+			declaration: ModuleDeclarationKind::Package(
+				package_graph.modules[package_graph.root.as_usize()].file_id,
+			),
+			symbols: HashMap::new(),
+			wildcard_imports: Vec::new(),
+			accesses: Vec::new(),
+		});
+		builder
+			.tir
+			.package_namespaces
+			.insert(package_graph.id, namespace_idx);
+		// `crate` at a package root points at itself — there's no `super`
+		// here, since `parent: None` is exactly what marks a package
+		// boundary everywhere else in the resolver.
+		let crate_sym = builder.interner.get_or_intern("crate");
+		builder.tir.namespaces[namespace_idx as usize]
+			.symbols
+			.insert(
+				(SymbolNamespace::Type, crate_sym),
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module { namespace_idx },
+					visibility: Visibility::Public,
+				},
 			);
-			crate_namespaces.insert(crate_graph.id, namespace_idx);
+	}
+
+	// A dependency is an implicit `mod <key>;` at the top of the declaring
+	// package's entry file, so its name is an ordinary `Module` symbol in
+	// that package's own namespace. Nothing global is involved, which is what
+	// keeps a package's dependencies invisible to everyone else — including
+	// to its own dependents, who never declared them.
+	for package in &graph.packages {
+		let owner = builder.tir.package_namespaces[&package.id];
+		for (&name, target) in &package.dependencies {
+			let target_namespace = builder.tir.package_namespaces[target];
+			builder.tir.namespaces[owner as usize].symbols.insert(
+				(SymbolNamespace::Type, name),
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module {
+						namespace_idx: target_namespace,
+					},
+					visibility: Visibility::Public,
+				},
+			);
 		}
 	}
 
-	// Phase 1: register all top-level items into ast_nodes / pending
-	for (crate_graph, source_module) in source_modules.iter().copied() {
-		let crate_base = crate_namespaces.get(&crate_graph.id).copied();
-		let module_path = crate_graph.module_symbol_path(source_module.id);
-		let namespace = builder.ensure_module_path(
-			source_module.file_id,
-			crate_base,
-			&module_path,
-		);
+	// Phase 1a: one namespace per file, created directly from the
+	// `SourceModule` tree vfs already built. `ModuleId`s are assigned in
+	// push order and vfs always pushes a parent before loading any child,
+	// so a child's `ModuleId` — and therefore its position in
+	// `source_modules` — always comes after its parent's; a child's parent
+	// namespace is therefore always already in `file_namespaces` by the
+	// time the child is processed. Every field of every `ModuleDecl` is set
+	// exactly once, here, straight from vfs's data — nothing downstream
+	// ever writes to one afterward.
+	for source_module in source_modules.iter().copied() {
+		let package = &builder.packages[source_module.package_id.as_usize()];
+		let namespace = match &source_module.declaration {
+			None => builder.tir.package_namespaces[&package.id],
+			Some(declaration) => {
+				let parent_module =
+					&package.modules[declaration.parent.as_usize()];
+				let parent_namespace = builder.tir.file_namespaces
+					[parent_module.file_id.as_usize()];
+				match builder.check_module_collision(
+					parent_module.file_id,
+					parent_namespace,
+					declaration.name,
+				) {
+					Some(existing) => existing,
+					None => builder.create_module_namespace(
+						parent_module.file_id,
+						parent_namespace,
+						declaration.name,
+						declaration.pub_span,
+						Some(source_module.file_id),
+					),
+				}
+			}
+		};
+		builder.tir.file_namespaces[source_module.file_id.as_usize()] =
+			namespace;
+	}
+
+	// Phase 1b: register all top-level items into ast_nodes / pending.
+	for source_module in source_modules.iter().copied() {
+		let namespace =
+			builder.tir.file_namespaces[source_module.file_id.as_usize()];
 		for item in source_module.ast.items.iter() {
 			builder.pre_scan_item(
 				source_module.file_id,
@@ -1810,19 +2059,10 @@ pub fn build(graph: &mut CompilationGraph) -> TIR {
 	// Phase 3.5: verify every trait impl provides all required items
 	builder.check_trait_conformance();
 
-	// Phase 4: process exports (must run after all signatures are resolved)
-	for (_, source_module) in source_modules.iter().copied() {
-		for item in source_module.ast.items.iter() {
-			if let ast::Item::Export { entries } = &item.inner.inner {
-				builder.build_exports(source_module.file_id, entries);
-			}
-		}
-	}
-
 	builder.report_unused_items();
 
-	builder.tir.root_symbols = builder.symbol_lookup;
-	builder.tir.root_wildcard_imports = builder.root_wildcard_imports;
+	// Nothing to hand over: top-level items and root wildcard imports now
+	// live on each package's own namespace, already inside `builder.tir`.
 
 	builder.tir
 }
@@ -1887,17 +2127,50 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// The operator trait's own declared method for `method_symbol` — every
+	/// operator trait declares exactly one, so this never legitimately
+	/// misses. Shared by every "trust it, don't check the concrete type"
+	/// path: a typeset-bounded type param or associated type (`T: Size`,
+	/// `Mem::Size`) both resolve to this the same way, since neither is a
+	/// concrete `ImplTarget` `resolve_trait_method` could look up.
+	fn operator_trait_method(
+		&self,
+		trait_index: TraitIndex,
+		method_symbol: SymbolU32,
+	) -> FunctionIndex {
+		match self.tir.traits[trait_index as usize]
+			.entries
+			.get(&method_symbol)
+		{
+			Some(ImplEntry::Method(idx)) => *idx,
+			_ => unreachable!("operator trait must declare its own method"),
+		}
+	}
+
 	/// The `Type::TypeParam` counterpart of `resolve_trait_method` — which
 	/// only ever resolves a concrete `ImplTarget`, so it fails outright for
 	/// a type param (`ImplTarget::from_type` doesn't handle `TypeParam`).
 	/// Checks the type param's own declared bounds instead: `None` means
-	/// the operator's trait isn't among them — a genuinely unbounded `T` —
-	/// and the caller should fall through to the ordinary concrete-resolution
-	/// path, which reports the same "operator cannot be applied" diagnostic
-	/// either way. `Some` returns the trait's *abstract* method (no body —
-	/// resolved for real once monomorphization substitutes a concrete
-	/// `Self`, exactly like `GenericMethodCall`'s existing abstract-method
-	/// fallback).
+	/// neither bound applies — a genuinely unbounded `T` — and the caller
+	/// should fall through to the ordinary concrete-resolution path, which
+	/// reports the same "operator cannot be applied" diagnostic either way.
+	///
+	/// Two independent ways a type param can be "bounded enough" for this:
+	/// - A real trait bound matching this operator's own trait (`T: Add`
+	///   for `+`) — could concretize to any type implementing that trait,
+	///   not just a primitive, so resolution stays deferred.
+	/// - A typeset bound (`T: Size`) — every typeset today consists
+	///   entirely of integer primitives (enforced at typeset-declaration
+	///   time, `DiagnosticCode::TypesetMemberNotInteger`), which all carry
+	///   `#[inline]` impls of every operator trait, so it's trusted
+	///   unconditionally for *any* operator trait here, exactly like
+	///   `Type::AssocTypeProjection`'s equivalent trust (see
+	///   `is_typeset_bounded_assoc_type`) — no need to check which trait
+	///   `T` was bounded by.
+	///
+	/// `Some` returns the trait's *abstract* method (no body — resolved for
+	/// real once monomorphization substitutes a concrete `Self`, exactly
+	/// like `GenericMethodCall`'s existing abstract-method fallback).
 	fn resolve_bounded_operator_method(
 		&self,
 		owner: TypeParamOwner,
@@ -1905,23 +2178,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 	) -> Option<FunctionIndex> {
-		let bounded = self
-			.tir
-			.type_param_info(owner, param_index as usize)
-			.bounds
-			.traits
-			.iter()
-			.any(|tb| tb.trait_index == trait_index);
+		let bounds =
+			&self.tir.type_param_info(owner, param_index as usize).bounds;
+		let bounded = bounds.typeset.is_some()
+			|| bounds.traits.iter().any(|tb| tb.trait_index == trait_index);
 		if !bounded {
 			return None;
 		}
-		match self.tir.traits[trait_index as usize]
-			.entries
-			.get(&method_symbol)
-		{
-			Some(ImplEntry::Method(idx)) => Some(*idx),
-			_ => unreachable!("operator trait must declare its own method"),
-		}
+		Some(self.operator_trait_method(trait_index, method_symbol))
 	}
 
 	/// Resolves `operator` for `ty` in `ctx`'s evaluation mode and builds the
@@ -1929,17 +2193,17 @@ impl<'ast> Builder<'ast, '_> {
 	/// - `Comptime` never attempts dispatch at all (see `EvalMode`'s doc
 	///   comment) — builds a plain `Binary` node, exactly as before operator
 	///   overloading existed, still directly foldable by `eval_const_expr`.
-	/// - `Runtime`, dispatch succeeds — records `operator`'s own span as a
-	///   go-to-definition access against the resolved method (the same
-	///   `accesses`-list mechanism ordinary method calls use) and builds a
-	///   `MethodCall`.
+	/// - `Runtime`, `ty` isn't concrete yet (`Type::TypeParam` or
+	///   `Type::AssocTypeProjection`) but is trusted anyway — a real trait
+	///   bound, or a typeset bound on either shape (see
+	///   `resolve_bounded_operator_method`/`is_typeset_bounded_assoc_type`)
+	///   — builds a `GenericMethodCall`, deferred to real resolution once
+	///   monomorphization substitutes a concrete `Self`.
+	/// - `Runtime`, dispatch succeeds against a concrete type — records
+	///   `operator`'s own span as a go-to-definition access against the
+	///   resolved method (the same `accesses`-list mechanism ordinary
+	///   method calls use) and builds a `MethodCall`.
 	/// - `Runtime`, dispatch fails — reports "operator cannot be applied".
-	///   Only call this once the caller has already ruled out the one
-	///   legitimate non-error failure case, a typeset-bounded associated
-	///   type (see `resolve_trait_method`'s doc comment) — every current
-	///   caller either gates `ty` to primitives beforehand (arms 2/3 of
-	///   `build_arithmetic_expr`) or checks
-	///   `is_typeset_bounded_assoc_type` itself first (the equal-types arm).
 	fn build_operator_dispatch(
 		&mut self,
 		ctx: &ExprContext,
@@ -1965,42 +2229,40 @@ impl<'ast> Builder<'ast, '_> {
 			};
 		};
 
-		// A bare `Type::TypeParam` isn't concrete, so `resolve_trait_method`
-		// below can never resolve it (`find_trait_impl` fails outright for one
-		// — see `ImplTarget::from_type`). Unlike a typeset-bounded
-		// `AssocTypeProjection`, whose members are always primitives (the
-		// native op works directly, used as-is via `build_arithmetic_result`'s
-		// plain-`Binary` path), a `T: Add`-bounded type param could concretize
-		// to any type implementing `Add`, not just a primitive — so this needs
-		// real deferred dispatch, exactly like `left.add(right)` would produce
-		// for a written generic method call, resolved at MIR-lowering time
-		// once monomorphization substitutes a concrete `Self`. An unbounded
-		// `T` falls through to the same failure path below as a concrete type
-		// with no matching impl, since `resolve_bounded_operator_method`
-		// deliberately returns `None` for both.
-		if let Type::TypeParam { owner, param_index } =
-			self.tir.types[ty.as_usize()]
-			&& let Some((trait_index, method_symbol)) =
-				traits.for_op(binary_op.inner)
-			&& let Some(func_idx) = self.resolve_bounded_operator_method(
-				owner,
-				param_index,
-				trait_index,
-				method_symbol,
-			) {
-			self.tir.functions[func_idx as usize].accesses.push(
-				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
-			);
-			let abstract_method_id = self.tir.functions[func_idx as usize].id;
-			return Expression {
-				kind: ExprKind::GenericMethodCall {
-					id: abstract_method_id,
-					type_args: Box::new([ty]),
-					arguments: Box::new([left, right]),
-				},
-				ty,
-				span,
+		if let Some((trait_index, method_symbol)) =
+			traits.for_op(binary_op.inner)
+		{
+			let deferred = match self.tir.types[ty.as_usize()] {
+				Type::TypeParam { owner, param_index } => self
+					.resolve_bounded_operator_method(
+						owner,
+						param_index,
+						trait_index,
+						method_symbol,
+					),
+				Type::AssocTypeProjection { .. }
+					if self.is_typeset_bounded_assoc_type(ty) =>
+				{
+					Some(self.operator_trait_method(trait_index, method_symbol))
+				}
+				_ => None,
 			};
+			if let Some(func_idx) = deferred {
+				self.tir.functions[func_idx as usize].accesses.push(
+					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+				);
+				let abstract_method_id =
+					self.tir.functions[func_idx as usize].id;
+				return Expression {
+					kind: ExprKind::GenericMethodCall {
+						id: abstract_method_id,
+						type_args: Box::new([ty]),
+						arguments: Box::new([left, right]),
+					},
+					ty,
+					span,
+				};
+			}
 		}
 
 		let method = traits.for_op(binary_op.inner).and_then(
@@ -2026,7 +2288,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2047,52 +2309,17 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Shared by every arm of `build_arithmetic_expr` once `ty` is a fully
-	/// concrete type both operands agree on (coerced or already equal).
-	/// Typeset-bounded associated types (`M::Size`) are the one type shape
-	/// `find_trait_impl` can never resolve — a structural non-error, not a
-	/// missing impl — so they stay on the plain `Binary` path; every other
-	/// type goes through real dispatch via `build_operator_dispatch`, which
-	/// already reports "operator cannot be applied" on its own if nothing
-	/// implements it.
-	fn build_arithmetic_result(
-		&mut self,
-		ctx: &ExprContext,
-		operator: Spanned<ast::BinaryOp>,
-		left: Expression,
-		right: Expression,
-		ty: TypeIndex,
-		span: ast::TextSpan,
-	) -> Expression {
-		if self.is_typeset_bounded_assoc_type(ty) {
-			Expression {
-				kind: ExprKind::Binary {
-					operator: Spanned {
-						inner: BinaryOp::from(operator.inner),
-						span: operator.span,
-					},
-					left: Box::new(left),
-					right: Box::new(right),
-				},
-				ty,
-				span,
-			}
-		} else {
-			self.build_operator_dispatch(ctx, operator, left, right, ty, span)
-		}
-	}
-
 	/// Shared by `build_bitwise_binary_expr`'s same-type arm once `ty` is a
-	/// fully concrete type both operands agree on. Unlike
-	/// `build_arithmetic_result`, integers/`bool`/typeset-bounded associated
-	/// types stay on the plain `Binary` path unconditionally — that's the
+	/// fully concrete type both operands agree on. Concrete integers/`bool`
+	/// stay on the plain `Binary` path unconditionally — that's the
 	/// pre-existing native codegen for bitwise ops on primitives, and it's
 	/// deliberately left untouched (no snapshot churn, no new intrinsics
-	/// needed for the concrete-primitive case). Only a type outside that set
-	/// (a struct, or a bare `Type::TypeParam` bounded by one of the bitwise
-	/// traits) goes through real dispatch via `build_operator_dispatch`,
-	/// which already reports "operator cannot be applied" on its own if
-	/// nothing implements it.
+	/// needed for the concrete-primitive case). Everything else (a struct,
+	/// a typeset-bounded `Type::TypeParam`/`Type::AssocTypeProjection`, or a
+	/// bare `Type::TypeParam` bounded by one of the bitwise traits) goes
+	/// through real dispatch via `build_operator_dispatch`, which already
+	/// reports "operator cannot be applied" on its own if nothing
+	/// implements it.
 	fn build_bitwise_result(
 		&mut self,
 		ctx: &ExprContext,
@@ -2102,10 +2329,7 @@ impl<'ast> Builder<'ast, '_> {
 		ty: TypeIndex,
 		span: ast::TextSpan,
 	) -> Expression {
-		if ty.is_integer()
-			|| ty == TypeIndex::BOOL
-			|| self.is_typeset_bounded_assoc_type(ty)
-		{
+		if ty.is_integer() || ty == TypeIndex::BOOL {
 			Expression {
 				kind: ExprKind::Binary {
 					operator: Spanned {
@@ -2176,15 +2400,7 @@ impl<'ast> Builder<'ast, '_> {
 		// concrete, non-implementing type.
 		let abstract_func_idx = match self.tir.types[ty.as_usize()] {
 			Type::AssocTypeProjection { .. } => {
-				match self.tir.traits[trait_index as usize]
-					.entries
-					.get(&method_symbol)
-				{
-					Some(ImplEntry::Method(func_idx)) => Some(*func_idx),
-					_ => unreachable!(
-						"operator trait must declare its own method"
-					),
-				}
+				Some(self.operator_trait_method(trait_index, method_symbol))
 			}
 			Type::TypeParam { owner, param_index } => self
 				.resolve_bounded_operator_method(
@@ -2221,7 +2437,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2244,8 +2460,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// pass an `operator` `for_unary_op` recognizes (`InvertSign`/
 	/// `BitNot`) — `!x` (`Not`) is bool-only and never reaches here.
 	///
-	/// TODO: revisit whether this and `build_operator_dispatch` (plus
-	/// `build_arithmetic_result`/`build_unary_arithmetic_result`) can share
+	/// TODO: revisit whether this and `build_operator_dispatch` can share
 	/// more than `resolve_trait_method` — the binary/unary duplication here
 	/// is mostly `Box::new([left, right])` vs. `Box::new([operand])` and
 	/// `ExprKind::Binary` vs. `ExprKind::Unary`, which might collapse with a
@@ -2279,23 +2494,28 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		// Same reasoning as `build_operator_dispatch`'s equivalent branch: a
-		// bare `Type::TypeParam` isn't concrete, so `resolve_trait_method`
-		// below can never resolve it — a `T: Neg`-bounded type param could
-		// concretize to any type implementing `Neg`, not just a primitive,
-		// so this needs real deferred dispatch, resolved at MIR-lowering
-		// time once monomorphization substitutes a concrete `Self`. An
-		// unbounded `T` falls through to the same failure path below as a
-		// concrete type with no matching impl, since
-		// `resolve_bounded_operator_method` deliberately returns `None` for
-		// both.
-		if let Type::TypeParam { owner, param_index } =
-			self.tir.types[ty.as_usize()]
-			&& let Some(func_idx) = self.resolve_bounded_operator_method(
-				owner,
-				param_index,
-				trait_index,
-				method_symbol,
-			) {
+		// bare `Type::TypeParam` or `Type::AssocTypeProjection` isn't
+		// concrete, so `resolve_trait_method` below can never resolve it —
+		// deferred dispatch, resolved at MIR-lowering time once
+		// monomorphization substitutes a concrete `Self`. An unbounded `T`
+		// falls through to the same failure path below as a concrete type
+		// with no matching impl.
+		let deferred = match self.tir.types[ty.as_usize()] {
+			Type::TypeParam { owner, param_index } => self
+				.resolve_bounded_operator_method(
+					owner,
+					param_index,
+					trait_index,
+					method_symbol,
+				),
+			Type::AssocTypeProjection { .. }
+				if self.is_typeset_bounded_assoc_type(ty) =>
+			{
+				Some(self.operator_trait_method(trait_index, method_symbol))
+			}
+			_ => None,
+		};
+		if let Some(func_idx) = deferred {
 			self.tir.functions[func_idx as usize].accesses.push(
 				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 			);
@@ -2329,7 +2549,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => {
 				self.tir.diagnostics.push(
 					report_unary_operator_cannot_be_applied(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						UnaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
@@ -2346,31 +2566,6 @@ impl<'ast> Builder<'ast, '_> {
 					span,
 				}
 			}
-		}
-	}
-
-	/// Unary counterpart of `build_arithmetic_result` — excludes
-	/// typeset-bounded associated types before delegating to
-	/// `build_unary_operator_dispatch`, same reasoning as the binary case.
-	fn build_unary_arithmetic_result(
-		&mut self,
-		ctx: &ExprContext,
-		operator: Spanned<ast::UnaryOp>,
-		operand: Expression,
-		ty: TypeIndex,
-		span: ast::TextSpan,
-	) -> Expression {
-		if self.is_typeset_bounded_assoc_type(ty) {
-			Expression {
-				kind: ExprKind::Unary {
-					operator,
-					operand: Box::new(operand),
-				},
-				ty,
-				span,
-			}
-		} else {
-			self.build_unary_operator_dispatch(ctx, operator, operand, ty, span)
 		}
 	}
 
@@ -2510,84 +2705,157 @@ impl<'ast> Builder<'ast, '_> {
 		})
 	}
 
-	fn ensure_module(
+	/// Pre-populates `namespace_idx`'s own symbol table with the two
+	/// path-root keywords: `crate` (always, resolving to `package`'s own
+	/// root namespace) and `super` (only when `parent` is `Some`, resolving
+	/// there). Both are inserted as ordinary `SymbolKind::Module` entries —
+	/// indistinguishable from a real module once inserted — so every
+	/// existing path-walking function (`lookup_scope_chain`'s own-symbols
+	/// check, and every multi-segment walker's direct-lookup-in-a-known-
+	/// namespace step) already resolves them correctly with no changes of
+	/// its own, including chained `super::super::x` (each namespace on the
+	/// walk carries its own `super` entry).
+	///
+	/// Called once per namespace, right after it's pushed into
+	/// `tir.namespaces`. For a package's own root namespace, call this
+	/// *after* `tir.package_namespaces` already has that package's entry —
+	/// that's what makes the root's own `crate` naturally resolve to
+	/// itself, with `parent: None` (no `super` inserted there, matching
+	/// every other place `parent: None` already means "package boundary").
+	fn seed_path_root_symbols(
 		&mut self,
-		file_id: FileId,
-		namespace: Option<NamespaceIndex>,
+		namespace_idx: NamespaceIndex,
+		package: PackageId,
+		parent: Option<NamespaceIndex>,
+	) {
+		let crate_sym = self.interner.get_or_intern("crate");
+		let crate_root = self.tir.package_namespaces[&package];
+		self.tir.namespaces[namespace_idx as usize].symbols.insert(
+			(SymbolNamespace::Type, crate_sym),
+			SymbolEntry::Resolved {
+				kind: SymbolKind::Module {
+					namespace_idx: crate_root,
+				},
+				visibility: Visibility::Public,
+			},
+		);
+		let Some(parent) = parent else { return };
+		let super_sym = self.interner.get_or_intern("super");
+		self.tir.namespaces[namespace_idx as usize].symbols.insert(
+			(SymbolNamespace::Type, super_sym),
+			SymbolEntry::Resolved {
+				kind: SymbolKind::Module {
+					namespace_idx: parent,
+				},
+				visibility: Visibility::Public,
+			},
+		);
+	}
+
+	/// Unconditionally creates a new module namespace as a child of
+	/// `namespace`, with no lookup — every field is set exactly once, here,
+	/// by whichever of the two callers actually has the real data:
+	/// Phase 1a (file-based modules, `own_file_id: Some(..)`) or
+	/// `ensure_module`'s not-found path (inline `mod foo { }` blocks,
+	/// `own_file_id: None`).
+	fn create_module_namespace(
+		&mut self,
+		declaring_file_id: FileId,
+		namespace: NamespaceIndex,
 		name: ast::Spanned<SymbolU32>,
 		pub_span: Option<ast::TextSpan>,
+		own_file_id: Option<FileId>,
 	) -> NamespaceIndex {
-		let symbol = name.inner;
-		if let Some(SymbolKind::Module { namespace_idx }) = self
-			.lookup_global_symbol(namespace, (SymbolNamespace::Type, symbol))
-		{
-			if let ModuleDeclarationKind::Module(decl_idx) =
-				self.tir.namespaces[namespace_idx as usize].declaration
-			{
-				let decl = &mut self.tir.module_decls[decl_idx as usize];
-				if decl.pub_span.is_none() {
-					decl.pub_span = pub_span;
-				}
-			}
-			return namespace_idx;
-		}
-
 		let namespace_idx = self.tir.namespaces.len() as u32;
 		let decl_idx = self.tir.module_decls.len() as u32;
+		// A nested module belongs to whatever package encloses it.
+		let package = self.tir.namespaces[namespace as usize].package;
 		self.tir.namespaces.push(ModuleNamespace {
-			name: symbol,
-			parent: namespace,
+			parent: Some(namespace),
+			package,
 			declaration: ModuleDeclarationKind::Module(decl_idx),
 			symbols: HashMap::new(),
 			wildcard_imports: Vec::new(),
 			accesses: Vec::new(),
 		});
+		self.seed_path_root_symbols(namespace_idx, package, Some(namespace));
 		self.tir.module_decls.push(ModuleDecl {
 			namespace_idx,
-			declaring_file_id: file_id,
-			own_file_id: None,
+			declaring_file_id,
+			own_file_id,
 			name,
 			pub_span,
 		});
 		self.insert_symbol(
 			namespace,
-			(SymbolNamespace::Type, symbol),
+			(SymbolNamespace::Type, name.inner),
 			SymbolKind::Module { namespace_idx },
+			pub_span,
 		);
 		namespace_idx
 	}
 
-	fn ensure_module_path(
+	/// Checks `namespace`'s direct scope for an existing Type-namespace
+	/// binding under `name` that's some `SymbolKind::Module` — a
+	/// dependency (`wx.json`), an `import "..." { }` block, or another
+	/// `mod`. Every legitimate case of two sites converging on one
+	/// module namespace (a declaring file and its content file) is handled
+	/// entirely by Phase 1a, before any of this module's three callers
+	/// ever run — so by the time any of them see a hit here, it's always a
+	/// genuine duplicate, never something safe to reuse. Diagnoses the
+	/// collision and returns the existing namespace to recover into (the
+	/// same tradeoff as any other diagnosed TIR: the compilation already
+	/// has an error and `wx-cli` aborts before `MIR::build`, so what the
+	/// colliding declaration's own contents end up merged into doesn't
+	/// matter). `None` when the name is free to claim, or already claimed
+	/// by some other, unrelated kind of symbol — not this helper's
+	/// concern.
+	fn check_module_collision(
 		&mut self,
 		file_id: FileId,
-		base: Option<NamespaceIndex>,
-		path: &[SymbolU32],
+		namespace: NamespaceIndex,
+		name: ast::Spanned<SymbolU32>,
 	) -> Option<NamespaceIndex> {
-		let mut namespace = base;
+		let existing = self.direct_scope_lookup(
+			namespace,
+			(SymbolNamespace::Type, name.inner),
+		)?;
+		let SymbolEntry::Resolved {
+			kind: SymbolKind::Module { namespace_idx },
+			..
+		} = existing
+		else {
+			return None;
+		};
+		let first_definition = self.get_symbol_location(existing);
+		let name_str = self.interner.resolve(name.inner).unwrap();
+		self.tir.diagnostics.push(report_duplicate_definition(
+			DuplicateDefinitionDiagnostic {
+				name: name_str,
+				namespace: SymbolNamespace::Type,
+				first_definition,
+				second_definition: SourceSpan::new(file_id, name.span),
+			},
+		));
+		Some(namespace_idx)
+	}
 
-		for (i, segment) in path.iter().copied().enumerate() {
-			let namespace_idx = self.ensure_module(
-				file_id,
-				namespace,
-				ast::Spanned {
-					inner: segment,
-					span: ast::TextSpan::new(0, 0),
-				},
-				None,
-			);
-			// Set own_file_id on the last segment — that's the source module's actual file.
-			if i == path.len() - 1 {
-				if let ModuleDeclarationKind::Module(decl_idx) =
-					self.tir.namespaces[namespace_idx as usize].declaration
-				{
-					self.tir.module_decls[decl_idx as usize].own_file_id =
-						Some(file_id);
-				}
-			}
-			namespace = Some(namespace_idx);
+	/// Resolves an *inline* `mod foo { }` block — the one case vfs never
+	/// sees (it only discovers file-based `mod foo;` declarations, which
+	/// Phase 1a already handles before any file's items are scanned).
+	fn ensure_module(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		name: ast::Spanned<SymbolU32>,
+		pub_span: Option<ast::TextSpan>,
+	) -> NamespaceIndex {
+		if let Some(existing) =
+			self.check_module_collision(file_id, namespace, name)
+		{
+			return existing;
 		}
-
-		namespace
+		self.create_module_namespace(file_id, namespace, name, pub_span, None)
 	}
 
 	/// Walk `ty` without crossing pointer/slice boundaries and return the span
@@ -2681,17 +2949,55 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// A type formatter that renders package names as `namespace`'s own
+	/// package sees them — a package has no name of its own, so what it's
+	/// called depends on who's looking.
+	fn formatter(&self, namespace: NamespaceIndex) -> TypeFormatter<'_> {
+		TypeFormatter::new(
+			&self.tir,
+			self.interner,
+			self.packages,
+			self.tir.namespaces[namespace as usize].package,
+		)
+	}
+
+	/// Binds `kind` into `namespace`'s own symbol table under `key`, with
+	/// `pub_span` as *this binding's own* visibility qualifier — the item's
+	/// own `pub_span` for a direct declaration, or a `use` leaf's own for a
+	/// re-export (independent of the re-exported item's — that's already
+	/// been checked once, when the leaf's own prefix resolved). Ignored for
+	/// a `kind` that `symbol_kind_is_gated` says isn't subject to privacy
+	/// at all. Not for a still-unresolved claim — see `insert_pending`.
 	fn insert_symbol(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		kind: SymbolKind,
+		pub_span: Option<TextSpan>,
 	) {
-		if let Some(idx) = namespace {
-			self.tir.namespaces[idx as usize].symbols.insert(key, kind);
-		} else {
-			self.symbol_lookup.insert(key, kind);
-		}
+		let visibility =
+			if self.symbol_kind_is_gated(kind) && pub_span.is_none() {
+				Visibility::Private
+			} else {
+				Visibility::Public
+			};
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.insert(key, SymbolEntry::Resolved { kind, visibility });
+	}
+
+	/// Registers a provisional, unresolved claim on `key` for `id` — what
+	/// every item starts as during pre-scan, before its signature (and so
+	/// its real `SymbolKind`/visibility) is known.
+	fn insert_pending(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
+	) {
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.insert(key, SymbolEntry::Pending(id));
 	}
 
 	/// Looks up `key` in `namespace`'s own symbol map only — no parent-scope
@@ -2702,14 +3008,29 @@ impl<'ast> Builder<'ast, '_> {
 	/// its name binding.
 	fn direct_scope_lookup(
 		&self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
-	) -> Option<SymbolKind> {
-		if let Some(idx) = namespace {
-			self.tir.namespaces[idx as usize].symbols.get(&key).copied()
-		} else {
-			self.symbol_lookup.get(&key).copied()
-		}
+	) -> Option<SymbolEntry> {
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.get(&key)
+			.copied()
+	}
+
+	/// `true` if `namespace`'s own symbol table still has `id`'s
+	/// provisional claim sitting on `key`, untouched — the ubiquitous
+	/// "do I still hold my own slot" check every item kind's Phase-2
+	/// registration makes before binding its real `SymbolKind`.
+	fn still_pending(
+		&self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
+	) -> bool {
+		matches!(
+			self.direct_scope_lookup(namespace, key),
+			Some(SymbolEntry::Pending(pending_id)) if pending_id == id
+		)
 	}
 
 	/// Phase-1 registration for a name that may collide with an earlier
@@ -2724,12 +3045,25 @@ impl<'ast> Builder<'ast, '_> {
 	/// is exclusive; every syntactic occurrence still gets fully resolved.
 	fn claim_name_binding(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		id: ast::DefId,
 		definition_span: SourceSpan,
 	) -> PendingClaim {
 		if let Some(existing) = self.direct_scope_lookup(namespace, key) {
+			// A real declaration always outranks an import's provisional
+			// claim, and displaces it without a word — see
+			// [`Self::claim_use_binding`] for why the import can't be judged
+			// yet. The displaced import re-checks this slot in Phase 2 and
+			// reports the collision only if it turns out to want the name.
+			if matches!(existing, SymbolEntry::Pending(def_id)
+			if matches!(
+				self.tir.item_lookup.get(&def_id),
+				Some(ItemIndex::Use(_))
+			)) {
+				self.insert_pending(namespace, key, id);
+				return PendingClaim::Claimed;
+			}
 			let first_definition = self.get_symbol_location(existing);
 			let name_str = self.interner.resolve(key.1).unwrap();
 			self.tir.diagnostics.push(report_duplicate_definition(
@@ -2742,8 +3076,45 @@ impl<'ast> Builder<'ast, '_> {
 			));
 			PendingClaim::Duplicate
 		} else {
-			self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+			self.insert_pending(namespace, key, id);
 			PendingClaim::Claimed
+		}
+	}
+
+	/// Claims a name for a `use` leaf — provisionally, and silently.
+	///
+	/// A leaf claims *both* symbol namespaces at prescan, because which one
+	/// its target occupies isn't knowable until Phase 2, so one of the two
+	/// claims is routinely spurious. That makes prescan the wrong place to
+	/// judge any collision involving an import: `use math::add;` (a
+	/// function, so value-only) alongside a local `struct add` is legal, and
+	/// so is `use a::foo;` alongside `use b::foo;` when the two occupy
+	/// different namespaces. Both would be reported as redefinitions on the
+	/// strength of a claim that is about to be withdrawn.
+	///
+	/// So nothing is reported here. A real declaration keeps the slot; a
+	/// rival import takes it (last one wins, provisionally). Either way the
+	/// leaf that lost re-checks in Phase 2, once it knows which namespaces
+	/// it actually wants, and reports the collision then.
+	fn claim_use_binding(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
+	) {
+		match self.direct_scope_lookup(namespace, key) {
+			None => self.insert_pending(namespace, key, id),
+			// Another import's provisional claim — take it over.
+			Some(SymbolEntry::Pending(def_id))
+				if matches!(
+					self.tir.item_lookup.get(&def_id),
+					Some(ItemIndex::Use(_))
+				) =>
+			{
+				self.insert_pending(namespace, key, id);
+			}
+			// A real declaration outranks an import. Leave it alone.
+			Some(_) => {}
 		}
 	}
 
@@ -2767,10 +3138,7 @@ impl<'ast> Builder<'ast, '_> {
 		let memory_index = self.tir.expect_memory_index(id);
 		let kind = TypeIndex::ERROR;
 		let type_key = (SymbolNamespace::Type, name.inner);
-		if matches!(
-			self.direct_scope_lookup(resolve_context.namespace, type_key),
-			Some(SymbolKind::Pending(pending_id)) if pending_id == id
-		) {
+		if self.still_pending(resolve_context.namespace, type_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				type_key,
@@ -2778,13 +3146,11 @@ impl<'ast> Builder<'ast, '_> {
 					memory_index,
 					size: kind,
 				},
+				None,
 			);
 		}
 		let value_key = (SymbolNamespace::Value, name.inner);
-		if matches!(
-			self.direct_scope_lookup(resolve_context.namespace, value_key),
-			Some(SymbolKind::Pending(pending_id)) if pending_id == id
-		) {
+		if self.still_pending(resolve_context.namespace, value_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				value_key,
@@ -2792,6 +3158,7 @@ impl<'ast> Builder<'ast, '_> {
 					memory_index,
 					size: kind,
 				},
+				None,
 			);
 		}
 	}
@@ -2802,89 +3169,79 @@ impl<'ast> Builder<'ast, '_> {
 	/// private item is visible to its declaring module and every descendant
 	/// module).
 	///
-	/// `None` is overloaded: it's both "the root/binary crate's own
-	/// top-level scope" (which has no `tir.namespaces` entry) *and* what you
-	/// get by walking one step past any named crate's own root (whose
-	/// `parent` is also `None`, since it has no further ancestor). Naively
-	/// walking `.parent` until `None` would conflate the two and let code
-	/// inside `std` see the binary crate's private root items merely
-	/// because both chains dead-end at the same `None` value. To avoid that,
-	/// the walk stops the moment it lands on a namespace that is itself a
-	/// crate root (`ModuleDeclarationKind::Crate`) without having matched —
-	/// crossing into a different crate never counts as reaching an ancestor.
+	/// A plain walk up `.parent` is enough now that every package has its own
+	/// root namespace: a chain terminates inside the package it started in,
+	/// so crossing into another package is impossible by construction. This
+	/// used to need an explicit stop at `ModuleDeclarationKind::Package`,
+	/// because `None` meant both "no ancestor" and "the root package's own
+	/// scope", and the two chains dead-ended at the same value.
 	fn is_ancestor_or_self(
 		&self,
-		accessor: Option<NamespaceIndex>,
-		declaring: Option<NamespaceIndex>,
+		accessor: NamespaceIndex,
+		declaring: NamespaceIndex,
 	) -> bool {
-		let mut current = accessor;
-		loop {
-			if current == declaring {
+		let mut current = Some(accessor);
+		while let Some(idx) = current {
+			if idx == declaring {
 				return true;
 			}
-			let Some(idx) = current else {
-				return false;
-			};
-			let namespace = &self.tir.namespaces[idx as usize];
-			if matches!(namespace.declaration, ModuleDeclarationKind::Crate(..))
-			{
-				return false;
-			}
-			current = namespace.parent;
+			current = self.tir.namespaces[idx as usize].parent;
 		}
+		false
 	}
 
-	/// Returns the visibility span and declaring namespace for `kind`, or
-	/// `None` if this kind carries no per-item visibility of its own and
-	/// should always be treated as visible. Trait members (`TraitAssocType`)
-	/// share their trait's own visibility — `trait` bodies reject a `pub`
-	/// qualifier on their items (see `VisibilityNotPermitted` in the
-	/// parser), so there's no separate span to read for them.
-	fn symbol_visibility(
-		&self,
-		kind: SymbolKind,
-	) -> Option<(Option<TextSpan>, Option<NamespaceIndex>)> {
-		let (pub_span, declaring) = match kind {
+	/// `true` if a binding of `kind` is subject to ordinary `pub`/private
+	/// visibility at all — `false` for the kinds that stay unconditionally
+	/// visible regardless of any `pub`: memories and import-block members
+	/// (parser-rejects `pub` on both — `VisibilityNotPermitted`), and a
+	/// `Module` reached via `crate`/a dependency name or an import block's
+	/// own alias (never user-writable visibility; only a real `mod foo;`/
+	/// `mod foo { }` is gated, using its own `ModuleDecl.pub_span`). Trait
+	/// members (`TraitAssocType`) share their trait's own gating — `trait`
+	/// bodies reject a `pub` qualifier on their items (see
+	/// `VisibilityNotPermitted` in the parser), so there's no separate span
+	/// to read for them.
+	///
+	/// `insert_symbol` calls this to decide whether the `pub_span` it was
+	/// given actually matters — used both for a direct declaration's own
+	/// visibility and, unchanged, for a `use` re-export's (the leaf's own
+	/// `pub_span` in place of the original item's): an exempt kind must
+	/// stay exempt either way, not become newly gated just for having gone
+	/// through a `use`.
+	fn symbol_kind_is_gated(&self, kind: SymbolKind) -> bool {
+		let declaring = match kind {
 			SymbolKind::Enum { enum_index } => {
-				let item = &self.tir.enums[enum_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.enums[enum_index as usize].namespace
 			}
 			SymbolKind::Struct { struct_index } => {
-				let item = &self.tir.structs[struct_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.structs[struct_index as usize].namespace
 			}
 			SymbolKind::Trait { trait_index }
 			| SymbolKind::TraitAssocType { trait_index, .. } => {
-				let item = &self.tir.traits[trait_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.traits[trait_index as usize].namespace
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				let item = &self.tir.typesets[typeset_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.typesets[typeset_index as usize].namespace
 			}
 			SymbolKind::Global { global_index } => {
-				let item = &self.tir.globals[global_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.globals[global_index as usize].namespace
 			}
 			SymbolKind::Function { func_index } => {
-				let item = &self.tir.functions[func_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.functions[func_index as usize].namespace
 			}
 			SymbolKind::Const { const_index } => {
-				let item = &self.tir.constants[const_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.constants[const_index as usize].namespace
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				let item = &self.tir.type_aliases[type_alias_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.type_aliases[type_alias_index as usize].namespace
 			}
-			// Modules and memories aren't gated yet; `Pending` items haven't
-			// allocated their arena slot yet, so there's nothing to read —
-			// callers that care about privacy for a `Pending` result force
-			// it through `ensure_signature` and check again afterwards.
-			SymbolKind::Module { .. }
-			| SymbolKind::Memory { .. }
-			| SymbolKind::Pending(_) => return None,
+			SymbolKind::Module { namespace_idx } => {
+				return matches!(
+					self.tir.namespaces[namespace_idx as usize].declaration,
+					ModuleDeclarationKind::Module(_)
+				);
+			}
+			SymbolKind::Memory { .. } => return false,
 		};
 		// `import "env" { fn log(...); }` declarations share the same
 		// `ModuleNamespace` machinery as real modules, but there's no
@@ -2892,69 +3249,213 @@ impl<'ast> Builder<'ast, '_> {
 		// their functions/globals never carry a real `pub_span`. Without
 		// this, every import would read as private-by-default and become
 		// uncallable from outside the `import` block itself.
-		if let Some(idx) = declaring
-			&& matches!(
-				self.tir.namespaces[idx as usize].declaration,
-				ModuleDeclarationKind::Import(..)
-			) {
-			return None;
-		}
-		Some((pub_span, declaring))
+		!matches!(
+			self.tir.namespaces[declaring as usize].declaration,
+			ModuleDeclarationKind::Import(..)
+		)
 	}
 
-	/// `true` if `kind`, found while resolving from `accessor`, is
-	/// accessible: either it's `pub`, or `accessor` is the declaring
-	/// namespace or a descendant of it.
-	fn symbol_is_visible(
+	/// `true` if `visibility`, found in `declaring_namespace` while
+	/// resolving from `accessor`, is accessible: either it's `Public`, or
+	/// `accessor` is `declaring_namespace` or a descendant of it.
+	/// `declaring_namespace` is whichever namespace's own `symbols` map the
+	/// entry was found in — for a direct declaration that's the same
+	/// namespace `symbol_kind_is_gated` read `pub_span` from; for a `use`
+	/// re-export it's the namespace that wrote the `use`, not the original
+	/// item's.
+	fn visible_from(
 		&self,
-		accessor: Option<NamespaceIndex>,
-		kind: SymbolKind,
+		accessor: NamespaceIndex,
+		declaring_namespace: NamespaceIndex,
+		visibility: Visibility,
 	) -> bool {
-		match self.symbol_visibility(kind) {
-			Some((pub_span, declaring)) => {
-				pub_span.is_some()
-					|| self.is_ancestor_or_self(accessor, declaring)
+		match visibility {
+			Visibility::Public => true,
+			Visibility::Private => {
+				self.is_ancestor_or_self(accessor, declaring_namespace)
 			}
-			None => true,
 		}
 	}
 
+	/// [`Self::visible_from`], for a raw `SymbolEntry` straight out of a
+	/// `symbols` map — used by the one caller that reads visibility off an
+	/// entry that might still be `Pending` (`lookup_scope_chain`'s wildcard
+	/// loop).
+	///
+	/// TODO: a still-`Pending` entry is always treated as visible here,
+	/// without forcing its signature — there's no `Visibility` to read yet
+	/// (see `SymbolEntry`). Safe only because the one caller that needs a
+	/// *real* answer for a name that might be `Pending`
+	/// (`resolve_pending_global_symbol`/`resolve_pending_namespace_symbol`)
+	/// forces resolution via `ensure_signature` and re-fetches the
+	/// now-resolved entry before trusting it — so this is never the value
+	/// an actual gating decision runs on. But nothing enforces that in the
+	/// type system: don't reuse this for a new caller without confirming it
+	/// can't observe a still-`Pending` entry as final.
+	fn entry_visible_from(
+		&self,
+		accessor: NamespaceIndex,
+		declaring_namespace: NamespaceIndex,
+		entry: SymbolEntry,
+	) -> bool {
+		match entry {
+			SymbolEntry::Pending(_) => true,
+			SymbolEntry::Resolved { visibility, .. } => {
+				self.visible_from(accessor, declaring_namespace, visibility)
+			}
+		}
+	}
+
+	/// The symbol `key` resolves to, ignoring any ambiguity — see
+	/// [`Self::lookup_scope_chain`], whose result this discards the evidence
+	/// from. For sites that ask "is this still my own `Pending`" rather than
+	/// "what does this name mean", which is a question ambiguity can't
+	/// affect.
 	fn lookup_global_symbol(
 		&self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
-	) -> Option<SymbolKind> {
-		let mut current = namespace;
+	) -> Option<SymbolEntry> {
+		self.lookup_scope_chain(namespace, key).symbol()
+	}
+
+	/// Walks the scope chain for `key`: the namespace's own symbols, then
+	/// its globs, then its parent, out to the package boundary.
+	///
+	/// Ambiguity is detected here, in the one walk every identifier already
+	/// pays for, and the result carries the candidates that caused it — the
+	/// evidence comes from the pass that found the problem rather than from
+	/// a second traversal repeating the same visibility rules. Building the
+	/// candidate list starts only once a second distinct item shows up, so
+	/// the ordinary path allocates nothing.
+	///
+	/// Ambiguity is **per scope level**: two globs on one namespace
+	/// supplying `foo` conflict, but a glob here and a glob on the parent is
+	/// ordinary shadowing, which is why the walk stops at the first level
+	/// that resolves.
+	fn lookup_scope_chain(
+		&self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+	) -> ScopeLookup {
+		let mut current = Some(namespace);
 		while let Some(idx) = current {
 			let namespace_ref = &self.tir.namespaces[idx as usize];
-			if let Some(kind) = namespace_ref.symbols.get(&key).copied() {
-				return Some(kind);
+			// A name declared or explicitly imported here always wins, and
+			// wins unambiguously — which is what makes `use x::foo;` the
+			// documented way out of a glob ambiguity.
+			if let Some(entry) = namespace_ref.symbols.get(&key).copied() {
+				return ScopeLookup::Found(entry);
 			}
-			for namespace_idx in namespace_ref.wildcard_imports.iter().copied()
-			{
-				if let Some(kind) = self.tir.namespaces[namespace_idx as usize]
+
+			let mut first: Option<(SymbolEntry, SourceSpan)> = None;
+			let mut candidates: Vec<(SymbolEntry, SourceSpan)> = Vec::new();
+			for import in namespace_ref.wildcard_imports.iter() {
+				let Some(entry) = self.tir.namespaces
+					[import.namespace as usize]
 					.symbols
 					.get(&key)
-					.copied() && self.symbol_is_visible(namespace, kind)
-				{
-					return Some(kind);
+					.copied()
+					.filter(|entry| {
+						self.entry_visible_from(
+							namespace,
+							import.namespace,
+							*entry,
+						)
+					})
+				else {
+					continue;
+				};
+				match first {
+					// The same item reached two ways is not a conflict.
+					Some((seen, _)) if seen == entry => {}
+					Some(seen) => {
+						if candidates.is_empty() {
+							candidates.push(seen);
+						}
+						candidates.push((entry, import.span));
+					}
+					None => first = Some((entry, import.span)),
 				}
+			}
+			if !candidates.is_empty() {
+				return ScopeLookup::Ambiguous(candidates.into_boxed_slice());
+			}
+			if let Some((entry, _)) = first {
+				return ScopeLookup::Found(entry);
 			}
 			current = namespace_ref.parent;
 		}
-		if let Some(kind) = self.symbol_lookup.get(&key).copied() {
-			return Some(kind);
-		};
-		for namespace_idx in self.root_wildcard_imports.iter().copied() {
-			if let Some(kind) = self.tir.namespaces[namespace_idx as usize]
-				.symbols
-				.get(&key)
-				.copied() && self.symbol_is_visible(namespace, kind)
-			{
-				return Some(kind);
+		// `parent: None` is only ever a package root now, so running out of
+		// parents *is* the package boundary. There's no outer store left to
+		// fall into, which is what keeps one package's items — and its
+		// dependency names — invisible to every other package.
+		ScopeLookup::NotFound
+	}
+
+	/// [`Self::lookup_scope_chain`], reporting an ambiguity before handing
+	/// back the arbitrary winner so resolution carries on with something.
+	///
+	/// This — not [`Self::lookup_global_symbol`] — is what a *reference*
+	/// site wants. The raw one is for sites asking "is this still my own
+	/// `Pending`", a question no amount of glob ambiguity changes.
+	fn lookup_global_symbol_reporting(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		span: SourceSpan,
+	) -> Option<SymbolEntry> {
+		match self.lookup_scope_chain(namespace, key) {
+			ScopeLookup::Ambiguous(candidates) => {
+				self.report_wildcard_ambiguity(key.1, span, &candidates);
+				Some(candidates[0].0)
 			}
+			other => other.symbol(),
 		}
-		None
+	}
+
+	/// Reports a name that two or more globs supply. Modelled on rustc's
+	/// E0659 but flattened: codespan-reporting has no nested
+	/// sub-diagnostics, so rustc's per-candidate `note:` blocks become
+	/// secondary labels on one diagnostic — the shape `AmbiguousTraitMember`
+	/// already uses.
+	///
+	/// The labels point at the `use` statements, not the definitions: each
+	/// definition is perfectly fine on its own, and it's importing both of
+	/// them into one scope that isn't.
+	fn report_wildcard_ambiguity(
+		&mut self,
+		name: SymbolU32,
+		reference: SourceSpan,
+		candidates: &[(SymbolEntry, SourceSpan)],
+	) {
+		let name = self.interner.resolve(name).unwrap();
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::AmbiguousWildcardImport.code())
+			.with_message(format!("`{name}` is ambiguous"))
+			.with_label(
+				reference.primary_label().with_message("ambiguous name"),
+			);
+		for (index, (entry, span)) in candidates.iter().enumerate() {
+			diagnostic = diagnostic.with_label(
+				span.secondary_label().with_message(format!(
+					"`{name}` could {}refer to the {} imported here",
+					if index == 0 { "" } else { "also " },
+					symbol_entry_noun(*entry),
+				)),
+			);
+		}
+		self.tir.diagnostics.push(
+			diagnostic
+				.with_note(
+					"ambiguous because of multiple glob imports of a name in \
+					 the same module",
+				)
+				.with_note(format!(
+					"consider adding an explicit import of `{name}` to \
+					 disambiguate"
+				)),
+		);
 	}
 
 	/// Looks up `key` via [`Self::lookup_global_symbol`], forcing a `Pending`
@@ -2963,12 +3464,15 @@ impl<'ast> Builder<'ast, '_> {
 	/// pending item is still being computed on the current call stack.
 	fn resolve_pending_global_symbol(
 		&mut self,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
 	) -> Result<Option<SymbolKind>, ()> {
-		match self.lookup_global_symbol(namespace, key) {
-			Some(SymbolKind::Pending(def_id)) => {
+		// Reported on the way in, not after forcing: forcing re-runs the
+		// same lookup, and the ambiguity is a property of the imports rather
+		// than of anything a signature could change.
+		match self.lookup_global_symbol_reporting(namespace, key, span) {
+			Some(SymbolEntry::Pending(def_id)) => {
 				if matches!(
 					self.sig_state.get(&def_id),
 					Some(SigEntry {
@@ -2982,9 +3486,15 @@ impl<'ast> Builder<'ast, '_> {
 					return Err(());
 				}
 				self.ensure_signature(def_id);
-				Ok(self.lookup_global_symbol(namespace, key))
+				// Still pending after one force is not expected in
+				// practice (see `SymbolEntry`'s docs), but rather than
+				// propagate a phantom result, this folds it to `None` —
+				// the same as a name that was never found.
+				Ok(self
+					.lookup_global_symbol(namespace, key)
+					.and_then(SymbolEntry::resolved_kind))
 			}
-			other => Ok(other),
+			other => Ok(other.and_then(SymbolEntry::resolved_kind)),
 		}
 	}
 
@@ -3005,7 +3515,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// separately, the same way a wildcard import is.
 	fn resolve_pending_namespace_symbol(
 		&mut self,
-		accessor_namespace: Option<NamespaceIndex>,
+		accessor_namespace: NamespaceIndex,
 		target_namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
@@ -3015,7 +3525,7 @@ impl<'ast> Builder<'ast, '_> {
 			.get(&key)
 			.copied()
 		{
-			Some(SymbolKind::Pending(def_id)) => {
+			Some(SymbolEntry::Pending(def_id)) => {
 				if matches!(
 					self.sig_state.get(&def_id),
 					Some(SigEntry {
@@ -3036,36 +3546,86 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			other => other,
 		};
-		if let Some(kind) = resolved
-			&& !self.symbol_is_visible(accessor_namespace, kind)
-		{
-			let name = self.interner.resolve(key.1).unwrap();
-			self.tir.diagnostics.push(report_private_item(name, span));
-			return Err(());
+		match resolved {
+			Some(SymbolEntry::Resolved { kind, visibility }) => {
+				if !self.visible_from(
+					accessor_namespace,
+					target_namespace,
+					visibility,
+				) {
+					// Name resolution still succeeded — it's only the
+					// accessibility check that failed — so this is a real
+					// reference, same as Rust treats a private-item access
+					// (E0603): resolved, then separately rejected. Recording
+					// it here, before rejecting, is what lets hover/
+					// go-to-definition work on it and keeps `report_unused_items`
+					// from *also* calling it dead code on top of `PrivateItem`.
+					// Every caller's own `record_symbol_access` call sits
+					// on the success path only, so this doesn't double up.
+					self.tir.record_symbol_access(
+						span.file_id,
+						kind,
+						span.span,
+					);
+					let name = self.interner.resolve(key.1).unwrap();
+					self.tir.diagnostics.push(report_private_item(name, span));
+					return Err(());
+				}
+				Ok(Some(kind))
+			}
+			// Still pending after one force — not expected in practice
+			// (see `SymbolEntry`'s docs) — folds to `None`, same as a name
+			// that was never found, rather than fabricating a visibility
+			// answer for it.
+			Some(SymbolEntry::Pending(_)) | None => Ok(None),
 		}
-		Ok(resolved)
 	}
 
-	/// Resolves a single symbol name, checking local variables first, then
-	/// the global symbol table. Use `lookup_global_symbol` directly in
-	/// contexts without a function scope (const/global initializers).
-	fn resolve_symbol(
-		&self,
+	/// Resolves a single name in value position: local variables first,
+	/// then the global scope chain, forcing a `Pending` signature through
+	/// `ensure_signature` — the value-position twin of
+	/// what [`Self::resolve_pending_global_symbol`] does for types.
+	///
+	/// Type position has always forced; value position never did, so any
+	/// value reference resolved before its target's signature landed on the
+	/// `Pending` arm of `resolve_symbol_kind_to_expression`, which is
+	/// `unreachable!`. Two ways to get there: a const initializer naming a
+	/// const declared later, and a name imported by a `use` written below
+	/// the reference — both perfectly legal source.
+	///
+	/// `Err(())` means a cycle, already reported; the caller must not also
+	/// report the name as undeclared.
+	fn resolve_symbol_forcing(
+		&mut self,
 		func_ctx: &ExprContext,
-		symbol: SymbolU32,
-	) -> Option<ResolvedSymbol> {
-		if let Some((scope_index, local_index)) = func_ctx.resolve_local(symbol)
+		symbol: ast::Spanned<SymbolU32>,
+	) -> Result<Option<ResolvedSymbol>, ()> {
+		// A local always shadows a global, so returning here means the scope
+		// chain is never consulted for a local — no ambiguity report, no
+		// signature forced, and none of it wasted.
+		if let Some((scope_index, local_index)) =
+			func_ctx.resolve_local(symbol.inner)
 		{
-			return Some(ResolvedSymbol::Local {
+			return Ok(Some(ResolvedSymbol::Local {
 				scope_index,
 				local_index,
-			});
+			}));
 		}
-		self.lookup_global_symbol(
-			func_ctx.resolve_context.namespace,
-			(SymbolNamespace::Value, symbol),
-		)
-		.map(ResolvedSymbol::Global)
+
+		// Past the local check this *is* the global case, so it delegates
+		// rather than reimplementing: `resolve_pending_global_symbol` already
+		// reports ambiguity, guards the cycle, forces, and re-looks-up. Doing
+		// it here instead meant a second copy of the cycle guard — two places
+		// to keep in step for one rule — and three scope-chain walks per
+		// identifier where one does.
+		let resolve_context = func_ctx.resolve_context;
+		Ok(self
+			.resolve_pending_global_symbol(
+				resolve_context.namespace,
+				(SymbolNamespace::Value, symbol.inner),
+				SourceSpan::new(resolve_context.file_id, symbol.span),
+			)?
+			.map(ResolvedSymbol::Global))
 	}
 
 	/// Converts a `ResolvedSymbol` into an `Expression`, registering any
@@ -3218,17 +3778,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			#[cfg(debug_assertions)]
-			symbol @ (SymbolKind::TraitAssocType { .. }
-			| SymbolKind::Pending(_)) => match symbol {
-				SymbolKind::Pending(def_id) => {
-					let item = self
-						.ast_nodes
-						.iter()
-						.find(|item| item.def_id == def_id);
-					unreachable!("{:#?}", item);
-				}
-				_ => unreachable!(),
-			},
+			SymbolKind::TraitAssocType { .. } => unreachable!(),
 			#[cfg(not(debug_assertions))]
 			_ => unreachable!(),
 		}
@@ -3269,8 +3819,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			SymbolKind::Trait { .. }
 			| SymbolKind::TypeSet { .. }
-			| SymbolKind::TraitAssocType { .. }
-			| SymbolKind::Pending(_) => None,
+			| SymbolKind::TraitAssocType { .. } => None,
 			SymbolKind::TypeAlias { type_alias_index } => {
 				Some(self.tir.type_aliases[type_alias_index as usize].body)
 			}
@@ -3456,7 +4005,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			symbol => {
-				self.record_type_kind_access(
+				self.tir.record_symbol_access(
 					resolve_context.file_id,
 					symbol,
 					identifier.span,
@@ -3724,12 +4273,9 @@ impl<'ast> Builder<'ast, '_> {
 							Diagnostic::error()
 								.with_message(format!(
 									"`{}` is not a memory declaration",
-									TypeFormatter::new(
-										&self.tir,
-										self.interner
-									)
-									.display_type(memory_ty)
-									.unwrap()
+									self.formatter(resolve_context.namespace)
+										.display_type(memory_ty)
+										.unwrap()
 								))
 								.with_label(Label::primary(
 									resolve_context.file_id,
@@ -3803,17 +4349,21 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			ast::TypeExpression::GenericApplication { name, args } => {
-				if let Some(SymbolKind::Pending(def_id)) = self
-					.lookup_global_symbol(
+				if let Some(SymbolEntry::Pending(def_id)) = self
+					.lookup_global_symbol_reporting(
 						resolve_context.namespace,
 						(SymbolNamespace::Type, name.inner),
+						SourceSpan::new(resolve_context.file_id, name.span),
 					) {
 					self.ensure_signature(def_id);
 				}
-				match self.lookup_global_symbol(
-					resolve_context.namespace,
-					(SymbolNamespace::Type, name.inner),
-				) {
+				match self
+					.lookup_global_symbol(
+						resolve_context.namespace,
+						(SymbolNamespace::Type, name.inner),
+					)
+					.and_then(SymbolEntry::resolved_kind)
+				{
 					Some(
 						kind @ (SymbolKind::Struct { .. }
 						| SymbolKind::TypeAlias { .. }),
@@ -3909,17 +4459,21 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				return TypeIndex::ERROR;
 			}
-			if let Some(SymbolKind::Pending(def_id)) = self
-				.lookup_global_symbol(
+			if let Some(SymbolEntry::Pending(def_id)) = self
+				.lookup_global_symbol_reporting(
 					resolve_context.namespace,
 					(SymbolNamespace::Type, last.ident.inner),
+					SourceSpan::new(resolve_context.file_id, last.ident.span),
 				) {
 				self.ensure_signature(def_id);
 			}
-			let Some(symbol_kind) = self.lookup_global_symbol(
-				resolve_context.namespace,
-				(SymbolNamespace::Type, last.ident.inner),
-			) else {
+			let Some(symbol_kind) = self
+				.lookup_global_symbol(
+					resolve_context.namespace,
+					(SymbolNamespace::Type, last.ident.inner),
+				)
+				.and_then(SymbolEntry::resolved_kind)
+			else {
 				self.tir.diagnostics.push(
 					Diagnostic::error()
 						.with_message("type arguments are not supported here")
@@ -4232,7 +4786,8 @@ impl<'ast> Builder<'ast, '_> {
 						.any(|b| b.trait_index == required_trait)
 				});
 			if !bound_satisfied {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -4321,7 +4876,8 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			Err(TraitMemberError::NotImplemented) => {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -4416,8 +4972,7 @@ impl<'ast> Builder<'ast, '_> {
 						Some(ItemAttribute::FixedOrder)
 					}
 					(ast::AttributeValue::NameValue(value), Some("tag")) => {
-						let raw =
-							self.interner.resolve(value.inner).unwrap_or("");
+						let raw = self.interner.resolve(value.inner).unwrap();
 						let key =
 							self.interner.get_or_intern(unescape_string(raw));
 						self.tir.tagged_items.insert(key, id);
@@ -4491,8 +5046,7 @@ impl<'ast> Builder<'ast, '_> {
 
 			for entry in args.iter() {
 				let arg = &entry.inner.inner;
-				let arg_name =
-					self.interner.resolve(arg.name.inner).unwrap_or("");
+				let arg_name = self.interner.resolve(arg.name.inner).unwrap();
 				let slot = match arg_name {
 					"min_pages" => &mut min_pages,
 					"max_pages" => &mut max_pages,
@@ -4677,73 +5231,26 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	fn get_symbol_location(&self, symbol: SymbolKind) -> SourceSpan {
-		match symbol {
-			SymbolKind::Function { func_index } => {
-				let func = &self.tir.functions[func_index as usize];
-				SourceSpan::new(func.file_id, func.name.span)
-			}
-			SymbolKind::Global { global_index } => {
-				let global = &self.tir.globals[global_index as usize];
-				SourceSpan::new(global.file_id, global.name.span)
-			}
-			SymbolKind::Const { const_index } => {
-				let const_ = &self.tir.constants[const_index as usize];
-				SourceSpan::new(const_.file_id, const_.name.span)
-			}
-			SymbolKind::Enum { enum_index } => {
-				let enum_ = &self.tir.enums[enum_index as usize];
-				SourceSpan::new(enum_.file_id, enum_.name.span)
-			}
-			SymbolKind::Struct { struct_index } => {
-				let s = &self.tir.structs[struct_index as usize];
-				SourceSpan::new(s.file_id, s.name.span)
-			}
-			SymbolKind::Module { namespace_idx } => {
-				match self.tir.namespaces[namespace_idx as usize].declaration {
-					ModuleDeclarationKind::Module(decl_idx) => {
-						let decl = &self.tir.module_decls[decl_idx as usize];
-						SourceSpan::new(decl.declaring_file_id, decl.name.span)
-					}
-					ModuleDeclarationKind::Import(import_idx) => {
-						let decl = &self.tir.import_decls[import_idx as usize];
-						SourceSpan::new(decl.file_id, decl.external_name.span)
-					}
-					ModuleDeclarationKind::Crate(_, file_id) => {
-						SourceSpan::new(file_id, ast::TextSpan::new(0, 0))
-					}
-				}
-			}
-			SymbolKind::Trait { trait_index } => {
-				let trait_ = &self.tir.traits[trait_index as usize];
-				SourceSpan::new(trait_.file_id, trait_.name.span)
-			}
-			SymbolKind::TypeSet { typeset_index } => {
-				let ts = &self.tir.typesets[typeset_index as usize];
-				SourceSpan::new(ts.file_id, ts.name.span)
-			}
-			SymbolKind::Memory { memory_index, .. } => {
-				let memory = &self.tir.memories[memory_index as usize];
-				SourceSpan::new(memory.file_id, memory.name.span)
-			}
-			SymbolKind::TraitAssocType { trait_index, .. } => {
-				let trait_ = &self.tir.traits[trait_index as usize];
-				SourceSpan::new(trait_.file_id, trait_.name.span)
-			}
-			SymbolKind::TypeAlias { type_alias_index } => {
-				let alias = &self.tir.type_aliases[type_alias_index as usize];
-				SourceSpan::new(alias.file_id, alias.name.span)
-			}
+	fn get_symbol_location(&self, entry: SymbolEntry) -> SourceSpan {
+		let symbol = match entry {
+			SymbolEntry::Resolved { kind, .. } => kind,
 			// A `Pending` entry always has a stub already pushed by
 			// `pre_scan_item` (every syntactic occurrence is unconditionally
 			// registered there, duplicate or not), so its declaration span
 			// is available via `item_lookup` even though its fields/value
 			// haven't been resolved yet.
-			SymbolKind::Pending(def_id) => {
-				match self.tir.item_lookup[&def_id] {
+			SymbolEntry::Pending(def_id) => {
+				return match self.tir.item_lookup[&def_id] {
 					ItemIndex::Function(idx) => {
 						let f = &self.tir.functions[idx as usize];
 						SourceSpan::new(f.file_id, f.name.span)
+					}
+					// An import's "declaration" is the local name it binds,
+					// which is the alias when it has one — that's the name
+					// that actually collided.
+					ItemIndex::Use(idx) => {
+						let u = &self.tir.use_items[idx as usize];
+						SourceSpan::new(u.file_id, u.local_name().span)
 					}
 					ItemIndex::Global(idx) => {
 						let g = &self.tir.globals[idx as usize];
@@ -4775,17 +5282,511 @@ impl<'ast> Builder<'ast, '_> {
 					| ItemIndex::TraitImpl(_) => unreachable!(
 						"these kinds never install a Pending symbol"
 					),
+				};
+			}
+		};
+		match symbol {
+			SymbolKind::Function { func_index } => {
+				let func = &self.tir.functions[func_index as usize];
+				SourceSpan::new(func.file_id, func.name.span)
+			}
+			SymbolKind::Global { global_index } => {
+				let global = &self.tir.globals[global_index as usize];
+				SourceSpan::new(global.file_id, global.name.span)
+			}
+			SymbolKind::Const { const_index } => {
+				let const_ = &self.tir.constants[const_index as usize];
+				SourceSpan::new(const_.file_id, const_.name.span)
+			}
+			SymbolKind::Enum { enum_index } => {
+				let enum_ = &self.tir.enums[enum_index as usize];
+				SourceSpan::new(enum_.file_id, enum_.name.span)
+			}
+			SymbolKind::Struct { struct_index } => {
+				let s = &self.tir.structs[struct_index as usize];
+				SourceSpan::new(s.file_id, s.name.span)
+			}
+			SymbolKind::Module { namespace_idx } => {
+				match self.tir.namespaces[namespace_idx as usize].declaration {
+					ModuleDeclarationKind::Module(decl_idx) => {
+						let decl = &self.tir.module_decls[decl_idx as usize];
+						SourceSpan::new(decl.declaring_file_id, decl.name.span)
+					}
+					ModuleDeclarationKind::Import(import_idx) => {
+						let decl = &self.tir.import_decls[import_idx as usize];
+						SourceSpan::new(decl.file_id, decl.external_name.span)
+					}
+					ModuleDeclarationKind::Package(file_id) => {
+						SourceSpan::new(file_id, ast::TextSpan::new(0, 0))
+					}
 				}
+			}
+			SymbolKind::Trait { trait_index } => {
+				let trait_ = &self.tir.traits[trait_index as usize];
+				SourceSpan::new(trait_.file_id, trait_.name.span)
+			}
+			SymbolKind::TypeSet { typeset_index } => {
+				let ts = &self.tir.typesets[typeset_index as usize];
+				SourceSpan::new(ts.file_id, ts.name.span)
+			}
+			SymbolKind::Memory { memory_index, .. } => {
+				let memory = &self.tir.memories[memory_index as usize];
+				SourceSpan::new(memory.file_id, memory.name.span)
+			}
+			SymbolKind::TraitAssocType { trait_index, .. } => {
+				let trait_ = &self.tir.traits[trait_index as usize];
+				SourceSpan::new(trait_.file_id, trait_.name.span)
+			}
+			SymbolKind::TypeAlias { type_alias_index } => {
+				let alias = &self.tir.type_aliases[type_alias_index as usize];
+				SourceSpan::new(alias.file_id, alias.name.span)
 			}
 		}
 	}
 
 	/// Phase 1: registers every named item into `ast_nodes` without resolving
 	/// types.
+	/// Walks a `use` tree at prescan, handling its two leaf kinds
+	/// differently because they have opposite timing requirements.
+	///
+	/// A **glob** must be registered *now*: `lookup_global_symbol` consults
+	/// `wildcard_imports` throughout Phase 2, so an edge added later would
+	/// be invisible to every lookup that ran before it. Its prefix is
+	/// resolved with plain non-forcing lookups, which is sound only because
+	/// the only thing a prefix can name is a module, and module symbols are
+	/// installed by Phase 1a — before any item is scanned.
+	///
+	/// A **named leaf** cannot be resolved now: files are prescanned in
+	/// order, so `use math::add;` in `main.wx` runs before `math.wx`'s items
+	/// are registered. It binds its local name to `Pending`, which is
+	/// precisely the marker that makes any later reference force it through
+	/// `ensure_signature` — so the deferral costs nothing.
+	///
+	/// `contiguous_start` tracks where the current path spelling began, for
+	/// the glob's `x::*` span. It resets on entering a group element,
+	/// because a span reaching back across a `{` wouldn't be a contiguous
+	/// range of source.
+	fn pre_scan_use_tree(
+		&mut self,
+		resolve_context: ResolveContext,
+		pub_span: Option<ast::TextSpan>,
+		tree: &'ast ast::Spanned<ast::UseTree>,
+		prefix: &mut Vec<ast::Spanned<SymbolU32>>,
+		contiguous_start: u32,
+		prefix_index: Option<u32>,
+	) -> Option<u32> {
+		match &tree.inner {
+			ast::UseTree::Path { segment, rest } => {
+				prefix.push(*segment);
+				// A further segment is a *different* prefix, so leaves below
+				// it share with each other and not with anything alongside —
+				// hence `None` going down, and the caller's own index coming
+				// back out untouched for whatever follows this subtree.
+				self.pre_scan_use_tree(
+					resolve_context,
+					pub_span,
+					rest,
+					prefix,
+					contiguous_start,
+					None,
+				);
+				prefix.pop();
+				prefix_index
+			}
+			ast::UseTree::Group(elements) => {
+				// Threaded across siblings: the first leaf that needs these
+				// tokens allocates them, and every later sibling is handed
+				// the same index. This is the whole reason `{ .. }` needs
+				// its own arm rather than folding into `Path`.
+				let mut shared = prefix_index;
+				for element in elements.iter() {
+					shared = self.pre_scan_use_tree(
+						resolve_context,
+						pub_span,
+						&element.inner,
+						prefix,
+						element.inner.span.start,
+						shared,
+					);
+				}
+				shared
+			}
+			ast::UseTree::Glob => {
+				// Silent on every failure: this runs before other files have
+				// been scanned, so "not found" here means "not yet", and a
+				// bare `use *;` names nothing to import.
+				let PrefixWalk::Resolved(source_ns) = self.walk_use_prefix(
+					resolve_context.file_id,
+					resolve_context.namespace,
+					prefix,
+				) else {
+					return prefix_index;
+				};
+				self.tir.namespaces[resolve_context.namespace as usize]
+					.wildcard_imports
+					.push(WildcardImport {
+						namespace: source_ns,
+						span: SourceSpan::new(
+							resolve_context.file_id,
+							ast::TextSpan::new(contiguous_start, tree.span.end),
+						),
+					});
+				// A glob binds no name, so it allocates no prefix of its
+				// own — `use a::b::*;` stores nothing.
+				prefix_index
+			}
+			ast::UseTree::Name { id, name, alias } => {
+				let local = alias.unwrap_or(*name);
+				let use_index = self.tir.use_items.len() as u32;
+
+				// Both namespaces, because which one this import lands in
+				// isn't knowable until its target resolves in Phase 2. The
+				// one that turns out to be wrong is withdrawn there.
+				for symbol_namespace in
+					[SymbolNamespace::Type, SymbolNamespace::Value]
+				{
+					self.claim_use_binding(
+						resolve_context.namespace,
+						(symbol_namespace, local.inner),
+						*id,
+					);
+				}
+
+				// Unconditional, like every other item arm: the stub and the
+				// `ast_nodes` entry exist whether or not the name was won,
+				// so a losing duplicate still resolves fully and still has a
+				// declaration span to point at.
+				// First leaf under this prefix allocates it; siblings handed
+				// the same index reuse it, so the segments are stored once
+				// however many names the group imports.
+				let prefix_index = prefix_index.unwrap_or_else(|| {
+					let index = self.tir.use_prefixes.len() as u32;
+					self.tir.use_prefixes.push(UsePrefix {
+						path: prefix.clone().into_boxed_slice(),
+						target: PrefixTarget::Unwalked,
+					});
+					index
+				});
+
+				// Unconditional, like every other item arm: the stub and the
+				// `ast_nodes` entry exist whether or not the name was won,
+				// so a losing duplicate still resolves fully and still has a
+				// declaration span to point at.
+				self.tir.item_lookup.insert(*id, ItemIndex::Use(use_index));
+				self.tir.use_items.push(UseItem {
+					id: *id,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
+					prefix: prefix_index,
+					name: *name,
+					alias: *alias,
+					pub_span,
+				});
+				self.ast_nodes.push(AstEntry {
+					def_id: *id,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
+					node: AstNodeRef::Use { use_index },
+				});
+				Some(prefix_index)
+			}
+		}
+	}
+
+	/// Resolves one named `use` leaf, in Phase 2: walks its prefix, looks
+	/// the name up in the namespace that lands on, and binds whichever of
+	/// the two symbol namespaces the target actually occupies.
+	///
+	/// Every path out of here has to leave the local name in a settled
+	/// state — bound to a real symbol, or gone. A `Pending` left behind
+	/// would outlive its own signature pass and hit the "signature resolved
+	/// but symbol still pending" unreachable at the next reference to it.
+	fn resolve_use_item(&mut self, use_index: u32) {
+		let item = &self.tir.use_items[use_index as usize];
+		let (id, file_id, namespace, name, local, prefix, pub_span) = (
+			item.id,
+			item.file_id,
+			item.namespace,
+			item.name,
+			item.local_name(),
+			item.prefix,
+			item.pub_span,
+		);
+		let name_span = SourceSpan::new(file_id, name.span);
+
+		let target = match self.tir.use_prefixes[prefix as usize].target {
+			// A sibling leaf already walked these very tokens — reuse its
+			// answer rather than re-walking and re-reporting.
+			walked @ (PrefixTarget::Resolved(_) | PrefixTarget::Failed) => {
+				walked
+			}
+			PrefixTarget::Unwalked => {
+				let path = self.tir.use_prefixes[prefix as usize].path.clone();
+				// Unlike the glob path at prescan — which stays silent, since
+				// it can legitimately run before its target file has been
+				// scanned — a named leaf resolves late enough that everything
+				// it could name already exists, so every failure is real.
+				let walked = match self
+					.walk_use_prefix(file_id, namespace, &path)
+				{
+					PrefixWalk::Resolved(target_ns) => {
+						PrefixTarget::Resolved(target_ns)
+					}
+					// `use add;` — a bare name with nothing to import
+					// it *from*.
+					PrefixWalk::Empty => {
+						let name = self.interner.resolve(name.inner).unwrap();
+						self.tir.diagnostics.push(
+							report_import_without_module(name, name_span),
+						);
+						PrefixTarget::Failed
+					}
+					PrefixWalk::NotAModule(segment, span) => {
+						let name =
+							self.interner.resolve(segment.inner).unwrap();
+						self.tir
+							.diagnostics
+							.push(report_not_a_namespace(name, span));
+						PrefixTarget::Failed
+					}
+					PrefixWalk::Unresolved(span) => {
+						self.tir
+							.diagnostics
+							.push(report_undeclared_identifier(span));
+						PrefixTarget::Failed
+					}
+				};
+				self.tir.use_prefixes[prefix as usize].target = walked;
+				walked
+			}
+		};
+
+		let PrefixTarget::Resolved(target_ns) = target else {
+			self.withdraw_use_claims(namespace, local.inner, id);
+			return;
+		};
+
+		let mut bound_any = false;
+		for symbol_namespace in [SymbolNamespace::Type, SymbolNamespace::Value]
+		{
+			let resolved = self.resolve_pending_namespace_symbol(
+				namespace,
+				target_ns,
+				(symbol_namespace, name.inner),
+				name_span,
+			);
+			match resolved {
+				Ok(Some(kind)) => {
+					let key = (symbol_namespace, local.inner);
+
+					// A rival import may be sitting on this slot. Resolve it
+					// first so the slot settles into either a real binding or
+					// nothing — that's what distinguishes a genuine
+					// collision from a claim that was about to be withdrawn
+					// anyway. It cannot recurse back into this leaf: a rival
+					// only ever displaced us, so we hold nothing it wants.
+					if let Some(SymbolEntry::Pending(rival)) =
+						self.direct_scope_lookup(namespace, key)
+						&& rival != id && matches!(
+						self.tir.item_lookup.get(&rival),
+						Some(ItemIndex::Use(_))
+					) {
+						self.ensure_signature(rival);
+					}
+
+					match self.direct_scope_lookup(namespace, key) {
+						// Ours, or vacated by a rival that didn't want it.
+						Some(SymbolEntry::Pending(pending_id))
+							if pending_id == id =>
+						{
+							self.insert_symbol(namespace, key, kind, pub_span);
+						}
+						None => {
+							self.insert_symbol(namespace, key, kind, pub_span)
+						}
+						// Someone else really holds this name. Now that the
+						// import is known to want it, the collision is real —
+						// report it here, where prescan couldn't.
+						Some(occupant) => {
+							self.report_import_collision(
+								occupant,
+								symbol_namespace,
+								local,
+								SourceSpan::new(file_id, local.span),
+							);
+						}
+					}
+					// Only for the first namespace that binds. An item
+					// occupying both — a `memory` does — would otherwise
+					// record the identical span twice, and the LSP turns
+					// every access into a reference, so a rename would
+					// emit two overlapping edits at one range.
+					if !bound_any {
+						self.tir.record_symbol_access(file_id, kind, name.span);
+					}
+					bound_any = true;
+				}
+				Ok(None) => {
+					self.withdraw_use_claim(
+						namespace,
+						local.inner,
+						id,
+						symbol_namespace,
+					);
+				}
+				// Private or cyclic — already reported, and it disqualifies
+				// the name in every symbol namespace at once. Returning
+				// rather than breaking also skips the not-found report
+				// below, which would otherwise pile a second diagnostic on
+				// the same name.
+				Err(()) => {
+					self.withdraw_use_claims(namespace, local.inner, id);
+					return;
+				}
+			}
+		}
+
+		if !bound_any {
+			let name_str = self.interner.resolve(name.inner).unwrap();
+			// A package has no name of its own — it's known by the key the
+			// asking package declared it under, so this needs the *asking*
+			// namespace's package, not the target's.
+			let module_str = self.tir.namespace_name(
+				target_ns,
+				self.packages,
+				self.tir.namespaces[namespace as usize].package,
+				self.interner,
+			);
+			self.tir.diagnostics.push(report_unresolved_import(
+				name_str, module_str, name_span,
+			));
+		}
+	}
+
+	/// Reports an import colliding with whatever already holds its local
+	/// name. Ordered by source position rather than by which side is the
+	/// import, so the labels read the same way as any other duplicate
+	/// definition.
+	fn report_import_collision(
+		&mut self,
+		occupant: SymbolEntry,
+		symbol_namespace: SymbolNamespace,
+		local: ast::Spanned<SymbolU32>,
+		import: SourceSpan,
+	) {
+		let occupant = self.get_symbol_location(occupant);
+		let name = self.interner.resolve(local.inner).unwrap();
+		let swap = occupant.file_id == import.file_id
+			&& occupant.span.start > import.span.start;
+		let (first, second) = if swap {
+			(import, occupant)
+		} else {
+			(occupant, import)
+		};
+		self.tir.diagnostics.push(report_duplicate_definition(
+			DuplicateDefinitionDiagnostic {
+				name,
+				namespace: symbol_namespace,
+				first_definition: first,
+				second_definition: second,
+			},
+		));
+	}
+
+	/// Removes this leaf's provisional `Pending` claim from one symbol
+	/// namespace — but only where the claim is still this leaf's own, since
+	/// a real declaration may have displaced it.
+	fn withdraw_use_claim(
+		&mut self,
+		namespace: NamespaceIndex,
+		local: SymbolU32,
+		id: ast::DefId,
+		symbol_namespace: SymbolNamespace,
+	) {
+		let key = (symbol_namespace, local);
+		if self.still_pending(namespace, key, id) {
+			self.tir.namespaces[namespace as usize].symbols.remove(&key);
+		}
+	}
+
+	/// [`Self::withdraw_use_claim`] for both symbol namespaces — what a leaf
+	/// that resolved to nothing at all needs.
+	fn withdraw_use_claims(
+		&mut self,
+		namespace: NamespaceIndex,
+		local: SymbolU32,
+		id: ast::DefId,
+	) {
+		for symbol_namespace in [SymbolNamespace::Type, SymbolNamespace::Value]
+		{
+			self.withdraw_use_claim(namespace, local, id, symbol_namespace);
+		}
+	}
+
+	/// Walks a `use` prefix to the namespace it names, recording an access
+	/// per resolved segment for IDE navigation.
+	///
+	/// Non-forcing on purpose: the only thing a prefix segment can legally
+	/// name is a module, and module symbols are installed in Phase 1a —
+	/// before any item is scanned — so a prefix is never `Pending`.
+	///
+	/// Reports nothing except an ambiguous first segment (which the lookup
+	/// itself reports). Whether a failure deserves a diagnostic depends
+	/// entirely on who is asking: prescan walks glob prefixes before other
+	/// files exist and must stay silent, while a named leaf in Phase 2 is
+	/// late enough that silence would just lose the error. Returning the
+	/// outcome instead of reporting it is what lets one walker serve both
+	/// without a "should I report" flag.
+	fn walk_use_prefix(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		prefix: &[ast::Spanned<SymbolU32>],
+	) -> PrefixWalk {
+		let mut current_ns: Option<NamespaceIndex> = None;
+		for segment in prefix.iter() {
+			let key = (SymbolNamespace::Type, segment.inner);
+			let span = SourceSpan::new(file_id, segment.span);
+			let kind = match current_ns {
+				// Later segments resolve only inside what we've already
+				// walked into.
+				Some(idx) => {
+					self.tir.namespaces[idx as usize].symbols.get(&key).copied()
+				}
+				// The first segment is an ordinary scope-chain lookup from
+				// wherever the `use` was written, so it reaches a sibling
+				// module, or a dependency name held further up on the
+				// package's own root namespace. It is also the only segment
+				// that can be glob-ambiguous — the rest read one namespace's
+				// own map directly.
+				None => {
+					self.lookup_global_symbol_reporting(namespace, key, span)
+				}
+			};
+			match kind {
+				Some(SymbolEntry::Resolved {
+					kind: SymbolKind::Module { namespace_idx },
+					..
+				}) => {
+					self.tir.namespaces[namespace_idx as usize]
+						.accesses
+						.push(span);
+					current_ns = Some(namespace_idx);
+				}
+				Some(_) => return PrefixWalk::NotAModule(*segment, span),
+				None => return PrefixWalk::Unresolved(span),
+			}
+		}
+		match current_ns {
+			Some(namespace_idx) => PrefixWalk::Resolved(namespace_idx),
+			None => PrefixWalk::Empty,
+		}
+	}
+
 	fn pre_scan_item(
 		&mut self,
 		file_id: FileId,
-		namespace: Option<NamespaceIndex>,
+		namespace: NamespaceIndex,
 		item: &'ast ast::Item,
 	) {
 		match item {
@@ -5089,14 +6090,15 @@ impl<'ast> Builder<'ast, '_> {
 				for child in items.iter() {
 					self.pre_scan_item(
 						file_id,
-						Some(namespace_index),
+						namespace_index,
 						&child.inner.inner,
 					);
 				}
 			}
-			ast::Item::ModuleDeclaration { name, pub_span } => {
-				self.ensure_module(file_id, namespace, *name, *pub_span);
-			}
+			// Nothing to do: Phase 1a already created this module's
+			// namespace (and set its `pub_span`) directly from vfs's
+			// `SourceModule` tree, before any file's items were scanned.
+			ast::Item::ModuleDeclaration { .. } => {}
 			ast::Item::Trait {
 				id,
 				name,
@@ -5105,14 +6107,10 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			} => {
 				let trait_key = (SymbolNamespace::Type, name.inner);
-				let existing_direct = if let Some(idx) = namespace {
-					self.tir.namespaces[idx as usize].symbols.get(&trait_key)
-				} else {
-					self.symbol_lookup.get(&trait_key)
-				};
+				let existing_direct =
+					self.direct_scope_lookup(namespace, trait_key);
 				if let Some(existing) = existing_direct
-					.filter(|k| !matches!(k, SymbolKind::Pending(_)))
-					.cloned()
+					.filter(|k| !matches!(k, SymbolEntry::Pending(_)))
 				{
 					let name_str = self.interner.resolve(name.inner).unwrap();
 					let first_definition = self.get_symbol_location(existing);
@@ -5154,10 +6152,10 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::TraitItem::AssociatedType { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Type, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -5206,6 +6204,7 @@ impl<'ast> Builder<'ast, '_> {
 					namespace,
 					(SymbolNamespace::Type, name.inner),
 					SymbolKind::Trait { trait_index },
+					*pub_span,
 				);
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
@@ -5313,30 +6312,50 @@ impl<'ast> Builder<'ast, '_> {
 						span: import_module_name.span,
 					}
 				};
-				if alias.is_none() {
-					self.tir.diagnostics.push(report_missing_import_alias(
-						SourceSpan::new(file_id, import_module_name.span),
-					));
-				}
-				let module_sym = match alias {
-					Some(a) => a.inner,
-					None => external_name.inner,
-				};
 				let namespace_idx = self.tir.namespaces.len() as u32;
 				let decl_idx = self.tir.import_decls.len() as u32;
+				let package = self.tir.namespaces[namespace as usize].package;
 				self.tir.namespaces.push(ModuleNamespace {
-					name: module_sym,
-					parent: namespace,
+					parent: Some(namespace),
+					package,
 					declaration: ModuleDeclarationKind::Import(decl_idx),
 					symbols: HashMap::new(),
 					wildcard_imports: Vec::new(),
 					accesses: Vec::new(),
 				});
-				self.insert_symbol(
-					namespace,
-					(SymbolNamespace::Type, module_sym),
-					SymbolKind::Module { namespace_idx },
+				self.seed_path_root_symbols(
+					namespace_idx,
+					package,
+					Some(namespace),
 				);
+				// Only a real, user-written alias is ever checked for a
+				// collision or bound as a `Type`-namespace name —
+				// `external_name` (the unescaped import-path string) was
+				// never something the user wrote as an identifier, so
+				// there's nothing legitimate to check or bind it under.
+				// Either failure still lets the import's own namespace,
+				// decl, and entries register normally below — it just
+				// isn't reachable by name.
+				match *alias {
+					Some(alias) => {
+						if self
+							.check_module_collision(file_id, namespace, alias)
+							.is_none()
+						{
+							self.insert_symbol(
+								namespace,
+								(SymbolNamespace::Type, alias.inner),
+								SymbolKind::Module { namespace_idx },
+								None,
+							);
+						}
+					}
+					None => {
+						self.tir.diagnostics.push(report_missing_import_alias(
+							SourceSpan::new(file_id, import_module_name.span),
+						));
+					}
+				}
 				for entry in entries.iter() {
 					match &entry.inner.inner.declaration {
 						ast::ImportDeclaration::Function { id, .. } => {
@@ -5351,10 +6370,10 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::ImportDeclaration::Global { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Value, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -5367,15 +6386,15 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::ImportDeclaration::Memory { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Type, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Value, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -5394,50 +6413,29 @@ impl<'ast> Builder<'ast, '_> {
 					lookup: HashMap::new(),
 				});
 			}
-			ast::Item::Use { path, pub_span: _ } => {
-				// Resolve the path to a namespace index and register it as a
-				// wildcard import on the current namespace.  Symbols are looked
-				// up lazily via `lookup_global_symbol` — no copying needed.
-				// Each resolved segment gets an access recorded for IDE navigation.
-				let mut current_ns: Option<NamespaceIndex> = None;
-				let mut resolved = true;
-				for segment in path.iter() {
-					let key = (SymbolNamespace::Type, segment.inner);
-					let kind = if let Some(idx) = current_ns {
-						self.tir.namespaces[idx as usize]
-							.symbols
-							.get(&key)
-							.copied()
-					} else {
-						self.symbol_lookup.get(&key).copied()
-					};
-					match kind {
-						Some(SymbolKind::Module { namespace_idx }) => {
-							self.tir.namespaces[namespace_idx as usize]
-								.accesses
-								.push(SourceSpan::new(file_id, segment.span));
-							current_ns = Some(namespace_idx);
-						}
-						_ => {
-							resolved = false;
-							break;
-						}
-					}
-				}
-				if resolved {
-					if let Some(source_ns) = current_ns {
-						if let Some(ns_idx) = namespace {
-							self.tir.namespaces[ns_idx as usize]
-								.wildcard_imports
-								.push(source_ns);
-						} else {
-							self.root_wildcard_imports.push(source_ns);
-						}
-					}
-				}
+			ast::Item::Use { tree, pub_span } => {
+				let mut prefix: Vec<ast::Spanned<SymbolU32>> = Vec::new();
+				self.pre_scan_use_tree(
+					ResolveContext::new(file_id, namespace),
+					*pub_span,
+					tree,
+					&mut prefix,
+					tree.span.start,
+					None,
+				);
 			}
-			ast::Item::Export { .. } => {
-				// handled during build pass
+			ast::Item::Export { id, .. } => {
+				// No name binding of its own — an export block declares
+				// nothing, it only names items declared elsewhere. It still
+				// gets an `ast_nodes` entry so the Phase 2 sweep reaches it
+				// in parse order, at which point it can force each listed
+				// name through `ensure_signature` like any other reference.
+				self.ast_nodes.push(AstEntry {
+					def_id: *id,
+					file_id,
+					namespace,
+					node: AstNodeRef::Export { item },
+				});
 			}
 			ast::Item::TypeSet {
 				id,
@@ -5466,6 +6464,7 @@ impl<'ast> Builder<'ast, '_> {
 					namespace,
 					(SymbolNamespace::Type, name.inner),
 					SymbolKind::TypeSet { typeset_index },
+					*pub_span,
 				);
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
@@ -5547,14 +6546,15 @@ impl<'ast> Builder<'ast, '_> {
 
 		match node {
 			AstNodeRef::Struct { item } => {
-				let (id, name, ast_type_params, fields) = match item {
+				let (id, name, ast_type_params, fields, pub_span) = match item {
 					ast::Item::Struct {
 						id,
 						name,
 						type_params,
 						fields,
+						pub_span,
 						..
-					} => (id, name, type_params, fields),
+					} => (id, name, type_params, fields, pub_span),
 					_ => unreachable!(),
 				};
 				let struct_index = self.tir.expect_struct_index(*id);
@@ -5568,14 +6568,12 @@ impl<'ast> Builder<'ast, '_> {
 				// with), skip the bind: this struct still gets its fields
 				// fully resolved below, it just never becomes referenceable.
 				let key = (SymbolNamespace::Type, name.inner);
-				if matches!(
-					self.direct_scope_lookup(resolve_context.namespace, key),
-					Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-				) {
+				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
 						SymbolKind::Struct { struct_index },
+						*pub_span,
 					);
 				}
 				// Resolve bounds now that the struct is registered and names are in TIR.
@@ -5657,16 +6655,18 @@ impl<'ast> Builder<'ast, '_> {
 				);
 			}
 			AstNodeRef::TypeAlias { item } => {
-				let (id, name, ast_type_params, body_expr) = match item {
-					ast::Item::TypeAlias {
-						id,
-						name,
-						type_params,
-						body,
-						..
-					} => (id, name, type_params, body),
-					_ => unreachable!(),
-				};
+				let (id, name, ast_type_params, body_expr, pub_span) =
+					match item {
+						ast::Item::TypeAlias {
+							id,
+							name,
+							type_params,
+							body,
+							pub_span,
+							..
+						} => (id, name, type_params, body, pub_span),
+						_ => unreachable!(),
+					};
 				let type_alias_index = self.tir.expect_type_alias_index(*id);
 
 				// Deliberately NOT calling insert_symbol yet: the symbol table
@@ -5729,14 +6729,12 @@ impl<'ast> Builder<'ast, '_> {
 				// `Pending` slot — see the identical comment on the Struct
 				// branch.
 				let key = (SymbolNamespace::Type, name.inner);
-				if matches!(
-					self.direct_scope_lookup(resolve_context.namespace, key),
-					Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-				) {
+				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
 						SymbolKind::TypeAlias { type_alias_index },
+						*pub_span,
 					);
 				}
 			}
@@ -5746,6 +6744,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					repr,
 					variants,
+					pub_span,
 					..
 				} = item
 				{
@@ -5762,21 +6761,29 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Type, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Enum { enum_index },
+							*pub_span,
 						);
 					}
 				}
 			}
 			AstNodeRef::Function { item } => match item {
-				ast::Item::Function { id, signature, .. }
-				| ast::Item::FunctionDeclaration { id, signature, .. } => {
+				ast::Item::Function {
+					id,
+					signature,
+					pub_span,
+					..
+				}
+				| ast::Item::FunctionDeclaration {
+					id,
+					signature,
+					pub_span,
+					..
+				} => {
 					let func_index = self.tir.expect_function_index(*id);
 					self.resolve_type_param_bounds(
 						resolve_context,
@@ -5803,14 +6810,12 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Value, signature.name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Function { func_index },
+							*pub_span,
 						);
 					}
 				}
@@ -6089,8 +7094,7 @@ impl<'ast> Builder<'ast, '_> {
 								)
 								.with_message(format!(
 									"cannot define an `impl` block for `{}`",
-									self.tir
-										.formatter(self.interner)
+									self.formatter(resolve_context.namespace)
 										.display_type(self_type)
 										.unwrap()
 								))
@@ -6172,7 +7176,7 @@ impl<'ast> Builder<'ast, '_> {
 							continue;
 						};
 						self.check_assoc_type_bounds(
-							resolve_context.file_id,
+							resolve_context,
 							supertrait.trait_index,
 							self_type,
 							Spanned {
@@ -6219,9 +7223,8 @@ impl<'ast> Builder<'ast, '_> {
 										)
 										.with_message(format!(
 											"`{}` is not an integer type",
-											TypeFormatter::new(
-												&self.tir,
-												self.interner
+											self.formatter(
+												resolve_context.namespace
 											)
 											.display_type(ty)
 											.unwrap_or_default()
@@ -6343,6 +7346,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					attributes,
+					value,
 				} = item
 				{
 					let ty_idx = self.resolve_type(
@@ -6351,6 +7355,51 @@ impl<'ast> Builder<'ast, '_> {
 						ty,
 					);
 					let attributes = self.resolve_attributes(*id, attributes);
+					// A default value's `Self`-relative type (`Self::Size`)
+					// is already resolved above into `ty_idx`, an abstract
+					// `Type::TypeParam` — building/coercing the value
+					// expression against it needs no further generic-scope
+					// threading, the same way an ordinary comptime literal
+					// already coerces against a typeset-bounded type param
+					// (see `test_typeset_intersection_range_literal_in_local`).
+					let (value_expr, const_value) = match value {
+						Some(value_ast) => match self
+							.build_const_context_expression(
+								resolve_context,
+								value_ast,
+								ty_idx,
+							) {
+							Ok(value_expr) => {
+								let const_value =
+									match self.eval_const_expr(&value_expr) {
+										Ok(v) => Some(v),
+										Err(_) => {
+											self.tir.diagnostics.push(
+												report_not_const_evaluatable(
+													SourceSpan::new(
+														resolve_context.file_id,
+														value_ast.span,
+													),
+												),
+											);
+											None
+										}
+									};
+								(Some(Box::new(value_expr)), const_value)
+							}
+							Err(_) => (None, None),
+						},
+						None => (None, None),
+					};
+					// Captured only now, right before the push — building the
+					// value expression above can itself demand-drive other
+					// items' signatures, which may push their own entries
+					// onto `self.tir.constants` first. Snapshotting the
+					// index any earlier (as the surrounding TIR structs
+					// mostly do, safely, since they never resolve a value
+					// expression in between) would go stale the moment that
+					// happens, pointing this entry at whatever unrelated
+					// constant ended up in the slot instead.
 					let const_index = self.tir.constants.len() as ConstIndex;
 					self.tir.constants.push(Constant {
 						id: *id,
@@ -6363,8 +7412,8 @@ impl<'ast> Builder<'ast, '_> {
 							inner: ty_idx,
 							span: ty.span,
 						},
-						value: None,
-						const_value: None,
+						value: value_expr,
+						const_value,
 						accesses: Vec::new(),
 						attributes,
 					});
@@ -6378,7 +7427,14 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			AstNodeRef::Global { item } => {
-				if let ast::Item::Global { name, ty, id, .. } = item {
+				if let ast::Item::Global {
+					name,
+					ty,
+					id,
+					pub_span,
+					..
+				} = item
+				{
 					let global_index = self.tir.expect_global_index(*id);
 					let (ty_idx, ty_span) = match ty {
 						Some(ty) => (
@@ -6410,14 +7466,12 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Value, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Global { global_index },
+							*pub_span,
 						);
 					}
 				}
@@ -6526,7 +7580,7 @@ impl<'ast> Builder<'ast, '_> {
 							// a no-op in practice; `ERROR` only bites if a
 							// future bound here starts requiring one.
 							self.check_assoc_type_bounds(
-								resolve_context.file_id,
+								resolve_context,
 								trait_index,
 								TypeIndex::ERROR,
 								binding.name,
@@ -6630,9 +7684,10 @@ impl<'ast> Builder<'ast, '_> {
 					// independent claims (mirroring the two separate
 					// `claim_name_binding` calls in `pre_scan_item`).
 					let type_key = (SymbolNamespace::Type, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, type_key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
+					if self.still_pending(
+						resolve_context.namespace,
+						type_key,
+						*id,
 					) {
 						self.insert_symbol(
 							resolve_context.namespace,
@@ -6641,12 +7696,14 @@ impl<'ast> Builder<'ast, '_> {
 								memory_index,
 								size: memory_size.inner,
 							},
+							None,
 						);
 					}
 					let value_key = (SymbolNamespace::Value, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, value_key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
+					if self.still_pending(
+						resolve_context.namespace,
+						value_key,
+						*id,
 					) {
 						self.insert_symbol(
 							resolve_context.namespace,
@@ -6655,6 +7712,7 @@ impl<'ast> Builder<'ast, '_> {
 								memory_index,
 								size: memory_size.inner,
 							},
+							None,
 						);
 					}
 				}
@@ -6665,6 +7723,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					value,
+					pub_span,
 					..
 				} = item
 				{
@@ -6691,10 +7750,9 @@ impl<'ast> Builder<'ast, '_> {
 							inner: ty_idx,
 							span: ty_span,
 						};
-					// A const whose value fails to build never claims its
-					// name, matching current behavior — the stub still
-					// exists (for `item_lookup`/duplicate-span purposes)
-					// with `value: None`, but stays permanently `Pending`.
+					// A const whose value fails to build keeps `value: None`
+					// and `const_value: None` on its stub — but it still
+					// binds its name below, so it stays referenceable.
 					if let Ok(value_expr) = self.build_const_context_expression(
 						resolve_context,
 						value,
@@ -6719,18 +7777,29 @@ impl<'ast> Builder<'ast, '_> {
 							Some(Box::new(value_expr));
 						self.tir.constants[const_index as usize].const_value =
 							const_value;
+					}
 
-						let key = (SymbolNamespace::Value, name.inner);
-						if matches!(
-							self.direct_scope_lookup(resolve_context.namespace, key),
-							Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-						) {
-							self.insert_symbol(
-								resolve_context.namespace,
-								key,
-								SymbolKind::Const { const_index },
-							);
-						}
+					// Bind the name whether or not the value resolved. Every
+					// other item kind binds unconditionally once it holds its
+					// own `Pending` slot; a const used to bind only on
+					// success, which left the name permanently `Pending` and
+					// made the next use of it in value position hit the
+					// "signature resolved but symbol still pending"
+					// unreachable in `global_symbol_to_expression` — the same
+					// hole `register_placeholder_memory` exists to close for
+					// `memory` declarations, and with the same trust model:
+					// `build_const_context_expression` has already reported
+					// why the value failed, and `wx-cli` aborts before
+					// `MIR::build` whenever TIR carries any error, so the
+					// value-less stub never reaches lowering.
+					let key = (SymbolNamespace::Value, name.inner);
+					if self.still_pending(resolve_context.namespace, key, *id) {
+						self.insert_symbol(
+							resolve_context.namespace,
+							key,
+							SymbolKind::Const { const_index },
+							*pub_span,
+						);
 					}
 				}
 			}
@@ -6754,7 +7823,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.functions.push(Function {
 						id: *id,
 						file_id: resolve_context.file_id,
-						namespace: Some(import_ns_idx),
+						namespace: import_ns_idx,
 						parent: None,
 						signature_index,
 						body: None,
@@ -6780,7 +7849,10 @@ impl<'ast> Builder<'ast, '_> {
 					let namespace_idx = import_decl.namespace_idx;
 					self.tir.namespaces[namespace_idx as usize].symbols.insert(
 						(SymbolNamespace::Value, signature.name.inner),
-						SymbolKind::Function { func_index },
+						SymbolEntry::Resolved {
+							kind: SymbolKind::Function { func_index },
+							visibility: Visibility::Public,
+						},
 					);
 				}
 			}
@@ -6805,7 +7877,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.globals.push(Global {
 						id: *id,
 						file_id: resolve_context.file_id,
-						namespace: Some(import_ns_idx),
+						namespace: import_ns_idx,
 						value: None,
 						name: *name,
 						ty: ast::Spanned {
@@ -6827,9 +7899,79 @@ impl<'ast> Builder<'ast, '_> {
 					let namespace_idx = import_decl.namespace_idx;
 					self.tir.namespaces[namespace_idx as usize].symbols.insert(
 						(SymbolNamespace::Value, name.inner),
-						SymbolKind::Global { global_index },
+						SymbolEntry::Resolved {
+							kind: SymbolKind::Global { global_index },
+							visibility: Visibility::Public,
+						},
 					);
 				}
+			}
+			AstNodeRef::Use { use_index } => {
+				self.resolve_use_item(use_index);
+			}
+			AstNodeRef::Export { item } => {
+				// The block's own `DefId` is only ever the `ast_nodes` /
+				// `sig_state` key that got us here; nothing downstream of
+				// resolution refers to a block by id.
+				let ast::Item::Export {
+					keyword_span,
+					entries,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let keyword = SourceSpan::new(file_id, *keyword_span);
+				let block_package =
+					self.tir.namespaces[namespace as usize].package;
+
+				// A library has no ABI of its own — it is consumed through
+				// `pub`, not through exports. This also catches every block
+				// in a dependency, since a dependency is only ever loaded as
+				// a library, and "you can't export from here" is the useful
+				// thing to say about one: moving the block wouldn't help.
+				if matches!(
+					self.packages[block_package.as_usize()].kind,
+					PackageKind::Library
+				) {
+					self.tir
+						.diagnostics
+						.push(report_library_cannot_export(keyword));
+					return;
+				}
+
+				// The entry file's top level is the only namespace equal to
+				// its package's root, so this one comparison rejects both a
+				// submodule file and an inline `mod { .. }` block.
+				let root_namespace =
+					self.tir.package_namespaces[&self.root_package];
+				if namespace != root_namespace {
+					self.tir
+						.diagnostics
+						.push(report_export_block_not_at_root(keyword));
+					return;
+				}
+
+				// The single `Option` that stores a block's exports is also
+				// what proves no earlier block exists, so the two can't
+				// disagree. Note that every rejection above returns *before*
+				// this point: a misplaced block must not claim the slot, or
+				// the package's real block would be reported as the
+				// duplicate of one that was itself rejected.
+				if let Some(existing) = &self.tir.export_block {
+					self.tir.diagnostics.push(report_duplicate_export_block(
+						existing.keyword,
+						keyword,
+					));
+					return;
+				}
+
+				// `export { .. }` is a top-level item, so the names it lists
+				// resolve against the package's own root namespace and no
+				// wider one.
+				let items =
+					self.build_exports(file_id, root_namespace, entries);
+				self.tir.export_block = Some(ExportBlock { keyword, items });
 			}
 			AstNodeRef::TraitImplBlock { item } => {
 				let (block_id, type_params, trait_name, target) = match item {
@@ -7150,6 +8292,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.assoc_type_impls.push(AssocTypeImpl {
 						id: *id,
 						file_id: resolve_context.file_id,
+						namespace: resolve_context.namespace,
 						name: *name,
 						ty: None,
 						attributes,
@@ -7163,8 +8306,14 @@ impl<'ast> Builder<'ast, '_> {
 					// own Pending — never clobber a same-named resolved symbol.
 					if matches!(
 						self.lookup_global_symbol(resolve_context.namespace, (SymbolNamespace::Type, name.inner)),
-						Some(SymbolKind::Pending(d)) if d == *id
+						Some(SymbolEntry::Pending(d)) if d == *id
 					) {
+						// Shares the trait's own visibility — trait bodies
+						// reject a `pub` qualifier on their own members (see
+						// `symbol_kind_is_gated`'s doc comment), so there's
+						// no separate span of this assoc type's own to read.
+						let trait_pub_span =
+							self.tir.traits[trait_index as usize].pub_span;
 						self.insert_symbol(
 							resolve_context.namespace,
 							(SymbolNamespace::Type, name.inner),
@@ -7172,6 +8321,7 @@ impl<'ast> Builder<'ast, '_> {
 								trait_index,
 								assoc_name: name.inner,
 							},
+							trait_pub_span,
 						);
 					}
 
@@ -7229,6 +8379,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.tir.assoc_type_impls.push(AssocTypeImpl {
 						id: *id,
 						file_id: resolve_context.file_id,
+						namespace: resolve_context.namespace,
 						name: *name,
 						ty: Some(Spanned {
 							inner: concrete_ty,
@@ -7431,7 +8582,7 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				} else if !self.coercible_to(value_expr.ty, global_ty) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(func_ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: global_ty,
 							actual_type: value_expr.ty,
@@ -7597,8 +8748,8 @@ impl<'ast> Builder<'ast, '_> {
 		// Final segment: look up the symbol in the final namespace and convert to BoundKind.
 		let last = segs.last().unwrap();
 		let file_id = resolve_context.file_id;
-		let Type::Namespace { namespace_idx } =
-			self.tir.types[namespace_ty.as_usize()].clone()
+		let &Type::Namespace { namespace_idx } =
+			&self.tir.types[namespace_ty.as_usize()]
 		else {
 			self.tir.diagnostics.push(
 				Diagnostic::error()
@@ -7617,7 +8768,10 @@ impl<'ast> Builder<'ast, '_> {
 		)? {
 			Some(kind) => kind,
 			None => {
-				todo!();
+				self.tir.diagnostics.push(report_undeclared_type(
+					SourceSpan::new(file_id, last.ident.span),
+				));
+				return Err(());
 			}
 		};
 		match kind {
@@ -7753,10 +8907,8 @@ impl<'ast> Builder<'ast, '_> {
 						.iter()
 						.find(|(name, _)| *name == binding.name.inner)
 					{
-						let assoc_name_str = self
-							.interner
-							.resolve(binding.name.inner)
-							.unwrap_or("?");
+						let assoc_name_str =
+							self.interner.resolve(binding.name.inner).unwrap();
 						self.tir.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
@@ -7822,7 +8974,7 @@ impl<'ast> Builder<'ast, '_> {
 									let assoc_name_str = self
 										.interner
 										.resolve(binding.name.inner)
-										.unwrap_or("?");
+										.unwrap();
 									let trait_name_str = self
 										.interner
 										.resolve(
@@ -7831,7 +8983,7 @@ impl<'ast> Builder<'ast, '_> {
 												.name
 												.inner,
 										)
-										.unwrap_or("?");
+										.unwrap();
 									self.tir.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
@@ -8047,10 +9199,7 @@ impl<'ast> Builder<'ast, '_> {
 										resolve_context.file_id,
 										ty.span,
 									),
-									TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									),
+									self.formatter(resolve_context.namespace),
 									resolved,
 								),
 							);
@@ -8243,6 +9392,24 @@ impl<'ast> Builder<'ast, '_> {
 								base: substituted,
 							})
 						}
+					}
+					// `Type::Memory` is compiler-synthesized (a `memory`
+					// declaration, never a hand-written `impl Memory for
+					// ..`), so it never gets a real `TraitImpl` entry the
+					// `find_trait_impl` branch below could find — its
+					// `Size` is already known directly as a struct field
+					// (same fact `pointer_type_for_memory` relies on).
+					// Also sidesteps an ordering hazard: this substitution
+					// runs from `seed_memory_trait_impl_with`, called
+					// *before* the caller registers this memory's real
+					// `TraitImpl` — so even a `Type::Memory` impl entry
+					// existing wouldn't yet be visible to `find_trait_impl`
+					// at this point.
+					Type::Memory { size, .. }
+						if assoc_name
+							== self.interner.get_or_intern("Size") =>
+					{
+						*size
 					}
 					// `trait_index` is already known here (it's part of the
 					// projection type itself), so go straight to that one
@@ -8550,7 +9717,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		match &self.tir.types[ty.as_usize()] {
 			Type::Struct { args, .. } => {
-				args.iter().any(|&a| self.contains_infer(a))
+				args.iter().copied().any(|a| self.contains_infer(a))
 			}
 			Type::Pointer { to, memory, .. } => {
 				self.contains_infer(*to) || self.contains_infer(*memory)
@@ -8562,11 +9729,13 @@ impl<'ast> Builder<'ast, '_> {
 				self.contains_infer(*of) || self.contains_infer(*memory)
 			}
 			Type::Tuple { elements } => {
-				elements.iter().any(|&e| self.contains_infer(e))
+				elements.iter().copied().any(|e| self.contains_infer(e))
 			}
-			Type::Function { signature } => {
-				signature.items.iter().any(|&t| self.contains_infer(t))
-			}
+			Type::Function { signature } => signature
+				.items
+				.iter()
+				.copied()
+				.any(|t| self.contains_infer(t)),
 			_ => false,
 		}
 	}
@@ -8607,6 +9776,7 @@ impl<'ast> Builder<'ast, '_> {
 					let new_entry = AssocTypeImpl {
 						id: new_id,
 						file_id: original.file_id,
+						namespace: original.namespace,
 						name: original.name,
 						ty: Some(memory_size),
 						attributes: Box::new([]),
@@ -8629,6 +9799,17 @@ impl<'ast> Builder<'ast, '_> {
 						self.substitute_type(original_ty, &[memory_self]);
 					let c = &self.tir.constants[index as usize];
 					let new_id = self.id_generator.generate();
+					// `value` itself can't be forked (not `Clone` — see
+					// above), but `const_value` can: it's what MIR lowering
+					// actually reads for a `Memory`-trait const access (see
+					// the `NamespaceAccess` handling in `mir::build`), so a
+					// default value's already-folded result (e.g.
+					// `PAGE_SIZE`'s `Int(65536)`) needs to carry over here
+					// or every memory's clone silently loses it, unlike
+					// `INDEX`/`DATA_END` (always `None` on the template
+					// too, since their values are synthesized by name in
+					// MIR instead).
+					let const_value = c.const_value;
 					let new_constant = Constant {
 						id: new_id,
 						file_id: c.file_id,
@@ -8641,7 +9822,7 @@ impl<'ast> Builder<'ast, '_> {
 							span: c.ty.span,
 						},
 						value: None,
-						const_value: None,
+						const_value,
 						accesses: Vec::new(),
 						attributes: Box::new([]),
 					};
@@ -8659,31 +9840,54 @@ impl<'ast> Builder<'ast, '_> {
 		members
 	}
 
+	/// `package_namespace` is the exporting package's own root namespace —
+	/// `export { .. }` is a top-level item, so the names it lists are
+	/// resolved against exactly that scope and no wider one.
 	fn build_exports(
 		&mut self,
 		file_id: FileId,
+		package_namespace: NamespaceIndex,
 		entries: &[Separated<Spanned<ast::ExportEntry>>],
-	) {
+	) -> HashMap<SymbolU32, ExportItem> {
+		let mut items: HashMap<SymbolU32, ExportItem> = HashMap::new();
 		for entry in entries.iter() {
 			let internal_name = &entry.inner.inner.name;
 
-			let global_value = match self
-				.symbol_lookup
-				.get(&(SymbolNamespace::Value, internal_name.inner))
-			{
-				Some(value) => *value,
+			let span = SourceSpan::new(file_id, internal_name.span);
+			// Force the listed name through `ensure_signature` rather than
+			// reading whatever happens to be resolved already: an export
+			// block is just another reference site, so it pulls in what it
+			// names the same way any other reference does.
+			//
+			// And it resolves through the *scope chain*, not the package
+			// root's own symbol map, so an entry names whatever that name
+			// means at the root — including something a `use` put there.
+			// A direct map lookup made every submodule item unexportable by
+			// any spelling at all: `use math::add; export { add }` would
+			// resolve `add` for every other reference site in the file and
+			// then fail here alone.
+			let Ok(value_symbol) = self.resolve_pending_global_symbol(
+				package_namespace,
+				(SymbolNamespace::Value, internal_name.inner),
+				span,
+			) else {
+				continue;
+			};
+			let global_value = match value_symbol {
+				Some(value) => value,
 				None => {
 					// Not a value, but it might still name a real item that
 					// simply isn't exportable (an enum, struct, trait, ...) —
 					// report the more precise diagnostic instead of treating
 					// it as an unresolved name. Still record the access so
 					// the LSP can resolve hover/go-to-definition on it.
-					if let Some(type_value) = self
-						.symbol_lookup
-						.get(&(SymbolNamespace::Type, internal_name.inner))
-						.copied()
-					{
-						self.record_type_kind_access(
+					if let Ok(Some(type_value)) = self
+						.resolve_pending_global_symbol(
+							package_namespace,
+							(SymbolNamespace::Type, internal_name.inner),
+							span,
+						) {
+						self.tir.record_symbol_access(
 							file_id,
 							type_value,
 							internal_name.span,
@@ -8769,7 +9973,7 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 				_ => {
-					self.record_type_kind_access(
+					self.tir.record_symbol_access(
 						file_id,
 						global_value,
 						internal_name.span,
@@ -8806,7 +10010,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 
-			match self.tir.exports.get(&export_symbol) {
+			match items.get(&export_symbol) {
 				Some(existing_export) => {
 					let name = self.interner.resolve(export_symbol).unwrap();
 					let first_export_span = match existing_export {
@@ -8840,10 +10044,11 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				}
 				None => {
-					self.tir.exports.insert(export_symbol, export_item);
+					items.insert(export_symbol, export_item);
 				}
 			}
 		}
+		items
 	}
 
 	/// Resolves an enum's repr type, folds every variant's value (explicit or
@@ -8864,7 +10069,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.resolve_type(resolve_context, None, repr_type);
 				if resolved != TypeIndex::ERROR && !resolved.is_integer() {
 					self.tir.diagnostics.push(report_enum_repr_not_integer(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(resolve_context.namespace),
 						resolved,
 						SourceSpan::new(
 							resolve_context.file_id,
@@ -8962,10 +10167,7 @@ impl<'ast> Builder<'ast, '_> {
 						{
 							self.tir.diagnostics.push(
 								report_integer_literal_out_of_range(
-									TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									),
+									self.formatter(resolve_context.namespace),
 									IntegerLiteralOutOfRangeDiagnostic {
 										ty: repr_type,
 										value: v,
@@ -9123,16 +10325,18 @@ impl<'ast> Builder<'ast, '_> {
 					return Ok(ConstValue::Int((value as i64).wrapping_neg()));
 				}
 
-				let ConstValue::Int(value) = self.eval_const_expr(operand)?
-				else {
-					return Err(());
-				};
-				match operator.inner {
-					ast::UnaryOp::InvertSign => {
+				let value = self.eval_const_expr(operand)?;
+				match (operator.inner, value) {
+					(ast::UnaryOp::InvertSign, ConstValue::Float(value)) => {
+						Ok(ConstValue::Float(-value))
+					}
+					(ast::UnaryOp::InvertSign, ConstValue::Int(value)) => {
 						Ok(ConstValue::Int(value.wrapping_neg()))
 					}
-					ast::UnaryOp::BitNot => Ok(ConstValue::Int(!value)),
-					ast::UnaryOp::Not => Err(()),
+					(ast::UnaryOp::BitNot, ConstValue::Int(value)) => {
+						Ok(ConstValue::Int(!value))
+					}
+					_ => Err(()),
 				}
 			}
 			ExprKind::Binary {
@@ -9140,11 +10344,29 @@ impl<'ast> Builder<'ast, '_> {
 				left,
 				right,
 			} => {
-				let ConstValue::Int(left) = self.eval_const_expr(left)? else {
+				let left = self.eval_const_expr(left)?;
+				let right = self.eval_const_expr(right)?;
+				// Float operands are representation-agnostic the same way
+				// int Add/Sub/Mul are: plain `f64` arithmetic already
+				// follows IEEE-754 (division by zero yields ±∞/NaN rather
+				// than panicking), so no divide-by-zero guard is needed
+				// here the way the integer Div/Rem arms below need one.
+				if let (ConstValue::Float(left), ConstValue::Float(right)) =
+					(left, right)
+				{
+					return match operator.inner {
+						BinaryOp::Add => Ok(ConstValue::Float(left + right)),
+						BinaryOp::Sub => Ok(ConstValue::Float(left - right)),
+						BinaryOp::Mul => Ok(ConstValue::Float(left * right)),
+						BinaryOp::Div => Ok(ConstValue::Float(left / right)),
+						BinaryOp::Rem => Ok(ConstValue::Float(left % right)),
+						_ => Err(()),
+					};
+				}
+				let ConstValue::Int(left) = left else {
 					return Err(());
 				};
-				let ConstValue::Int(right) = self.eval_const_expr(right)?
-				else {
+				let ConstValue::Int(right) = right else {
 					return Err(());
 				};
 				// `Add`/`Sub`/`Mul` are representation-agnostic in two's
@@ -9206,6 +10428,32 @@ impl<'ast> Builder<'ast, '_> {
 						} else {
 							Ok(ConstValue::Int(left.wrapping_rem(right)))
 						}
+					}
+					BinaryOp::BitAnd => Ok(ConstValue::Int(left & right)),
+					BinaryOp::BitOr => Ok(ConstValue::Int(left | right)),
+					BinaryOp::BitXor => Ok(ConstValue::Int(left ^ right)),
+					// Masking (rather than a plain `<<`/`>>`) keeps an
+					// out-of-range shift amount (e.g. a typo'd `1 << 99`)
+					// from panicking the compiler itself — it folds to
+					// *some* wrapped value, which the caller's own
+					// range/repr check then rejects like any other
+					// out-of-range constant.
+					BinaryOp::LeftShift => {
+						Ok(ConstValue::Int(left.wrapping_shl(right as u32)))
+					}
+					// Right shift mirrors the same signed/arithmetic vs.
+					// unsigned/logical split codegen uses for the runtime
+					// `ShrS`/`ShrU` instructions (`opt/builder.rs`): `unsigned`
+					// picks a logical shift on the bit pattern, otherwise an
+					// arithmetic (sign-extending) shift on the `i64` value —
+					// correct here because that value is already the sign-
+					// extended bit-reinterpretation `ExprKind::Int`/`Unary`
+					// produced for it.
+					BinaryOp::RightShift if unsigned => Ok(ConstValue::Int(
+						(left as u64).wrapping_shr(right as u32) as i64,
+					)),
+					BinaryOp::RightShift => {
+						Ok(ConstValue::Int(left.wrapping_shr(right as u32)))
 					}
 					_ => Err(()),
 				}
@@ -9281,7 +10529,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		if ty != TypeIndex::ERROR && !self.coercible_to(value_expr.ty, ty) {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: ty,
 					actual_type: value_expr.ty,
@@ -9456,7 +10704,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -9578,12 +10826,13 @@ impl<'ast> Builder<'ast, '_> {
 	/// the type was written.
 	fn check_assoc_type_bounds(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		trait_index: TraitIndex,
 		self_type: TypeIndex,
 		name: Spanned<SymbolU32>,
 		ty: Spanned<TypeIndex>,
 	) {
+		let file_id = resolve_context.file_id;
 		let Some(bounds) = self.tir.traits[trait_index as usize]
 			.assoc_types
 			.get(&name.inner)
@@ -9649,10 +10898,8 @@ impl<'ast> Builder<'ast, '_> {
 												.inner,
 										)
 										.unwrap();
-									let fmt = TypeFormatter::new(
-										&self.tir,
-										self.interner,
-									);
+									let fmt = self
+										.formatter(resolve_context.namespace);
 									let concrete_name = fmt
 										.display_type(ty.inner)
 										.unwrap_or_default();
@@ -9698,10 +10945,8 @@ impl<'ast> Builder<'ast, '_> {
 											.inner,
 									)
 									.unwrap();
-								let fmt = TypeFormatter::new(
-									&self.tir,
-									self.interner,
-								);
+								let fmt =
+									self.formatter(resolve_context.namespace);
 								let concrete_name = fmt
 									.display_type(ty.inner)
 									.unwrap_or_default();
@@ -9757,7 +11002,7 @@ impl<'ast> Builder<'ast, '_> {
 												.name
 												.inner,
 										)
-										.unwrap_or("?");
+										.unwrap();
 									self.tir.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
@@ -9782,10 +11027,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 				None => {
 					let assoc_name = self.interner.resolve(name.inner).unwrap();
-					let type_name =
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(ty.inner)
-							.unwrap();
+					let type_name = self
+						.formatter(resolve_context.namespace)
+						.display_type(ty.inner)
+						.unwrap();
 					let trait_name = self
 						.interner
 						.resolve(
@@ -9838,7 +11083,8 @@ impl<'ast> Builder<'ast, '_> {
 				)
 				.unwrap();
 			let assoc_name = self.interner.resolve(name.inner).unwrap();
-			let type_name = TypeFormatter::new(&self.tir, self.interner)
+			let type_name = self
+				.formatter(resolve_context.namespace)
 				.display_type(ty.inner)
 				.unwrap();
 			let trait_name = self
@@ -9906,7 +11152,10 @@ impl<'ast> Builder<'ast, '_> {
 					ImplEntry::Method(fi) => {
 						(self.tir.functions[*fi as usize].body.is_none(), "fn")
 					}
-					ImplEntry::AssocConstant(_) => (true, "const"),
+					ImplEntry::AssocConstant(ci) => (
+						self.tir.constants[*ci as usize].value.is_none(),
+						"const",
+					),
 					ImplEntry::AssocType(_) => (true, "type"),
 					_ => continue,
 				};
@@ -9968,7 +11217,10 @@ impl<'ast> Builder<'ast, '_> {
 				let self_type =
 					self.tir.trait_impls[trait_impl_index].target.inner;
 				self.check_assoc_type_bounds(
-					assoc_type_impl.file_id,
+					ResolveContext::new(
+						assoc_type_impl.file_id,
+						assoc_type_impl.namespace,
+					),
 					trait_index,
 					self_type,
 					assoc_type_impl.name,
@@ -10006,10 +11258,9 @@ impl<'ast> Builder<'ast, '_> {
 					trait_sym,
 					supertrait_sym,
 				} => {
-					let trait_name =
-						self.interner.resolve(trait_sym).unwrap_or("?");
+					let trait_name = self.interner.resolve(trait_sym).unwrap();
 					let supertrait_name =
-						self.interner.resolve(supertrait_sym).unwrap_or("?");
+						self.interner.resolve(supertrait_sym).unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
@@ -10033,15 +11284,10 @@ impl<'ast> Builder<'ast, '_> {
 		for function in self.tir.functions.iter() {
 			let is_intrinsic =
 				function.attributes.contains(&ItemAttribute::Intrinsic);
-			let is_imported = function
-				.namespace
-				.map(|ns| {
-					matches!(
-						self.tir.namespaces[ns as usize].declaration,
-						ModuleDeclarationKind::Import(_)
-					)
-				})
-				.unwrap_or(false);
+			let is_imported = matches!(
+				self.tir.namespaces[function.namespace as usize].declaration,
+				ModuleDeclarationKind::Import(_)
+			);
 			if is_intrinsic || is_imported {
 				continue;
 			}
@@ -10106,15 +11352,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		for global in self.tir.globals.iter() {
-			let is_imported = global
-				.namespace
-				.map(|ns| {
-					matches!(
-						self.tir.namespaces[ns as usize].declaration,
-						ModuleDeclarationKind::Import(_)
-					)
-				})
-				.unwrap_or(false);
+			let is_imported = matches!(
+				self.tir.namespaces[global.namespace as usize].declaration,
+				ModuleDeclarationKind::Import(_)
+			);
 			if !is_imported && global.accesses.is_empty() {
 				let name = self.interner.resolve(global.name.inner).unwrap();
 				self.tir.diagnostics.push(
@@ -10133,9 +11374,19 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		for constant in self.tir.constants.iter() {
+			// A trait const's default value (`parent: Some(ItemParent::Trait(_))`)
+			// is exempt for the same reason a default trait method is (see
+			// above): the trait declaration is itself the "use" — the
+			// default exists for whatever impl/generic code inherits it,
+			// which the compiler can't statically trace back here. Trait
+			// consts always carry `pub_span: None` (visibility comes from
+			// the trait, not the item), so without this they'd all read as
+			// "private and unused" the moment they got a default value —
+			// previously unreachable, since every trait const was bodiless.
 			if constant.pub_span.is_none()
 				&& constant.accesses.is_empty()
 				&& constant.value.is_some()
+				&& !matches!(constant.parent, Some(ItemParent::Trait(_)))
 			{
 				let name = self.interner.resolve(constant.name.inner).unwrap();
 				self.tir.diagnostics.push(
@@ -10259,11 +11510,8 @@ impl<'ast> Builder<'ast, '_> {
 				)?;
 
 				let scope = &mut ctx.stack.scopes[ctx.scope_index as usize];
-				let inferred_type = self.infer_block_type(
-					ctx.resolve_context.file_id,
-					scope,
-					&result,
-				)?;
+				let inferred_type =
+					self.infer_block_type(ctx.resolve_context, scope, &result)?;
 				scope.inferred_type = inferred_type;
 				if result.ty.is_comptime_number()
 					&& !inferred_type.is_comptime_number()
@@ -10328,10 +11576,11 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn infer_block_type(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		scope: &BlockScope,
 		value: &Expression,
 	) -> Result<TypeIndex, ()> {
+		let file_id = resolve_context.file_id;
 		if value.ty.is_comptime_number() {
 			let coerce_to = scope.inferred_type.infer_or(scope.expected_type);
 			if coerce_to != TypeIndex::INFER {
@@ -10347,7 +11596,7 @@ impl<'ast> Builder<'ast, '_> {
 			let inferred_type = scope.inferred_type;
 			if !self.coercible_to(result_type, inferred_type) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: inferred_type,
 						actual_type: result_type,
@@ -10360,7 +11609,7 @@ impl<'ast> Builder<'ast, '_> {
 			let expected_type = scope.expected_type;
 			if !self.coercible_to(result_type, expected_type) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type,
 						actual_type: result_type,
@@ -10741,15 +11990,16 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let entry = self.resolve_impl_member(
+			func_ctx.resolve_context,
 			object.ty,
 			member.inner,
-			SourceSpan::new(func_ctx.resolve_context.file_id, member.span),
+			member.span,
 		);
 		match entry {
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
-				let member_name =
-					self.interner.resolve(member.inner).unwrap_or("?");
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let member_name = self.interner.resolve(member.inner).unwrap();
+				let type_name = self
+					.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
 					.unwrap();
 				self.tir.diagnostics.push(
@@ -10803,8 +12053,20 @@ impl<'ast> Builder<'ast, '_> {
 
 		// ── single-segment, no type args: plain identifier / local / global ───
 		if path.len() == 1 && last.type_args.is_empty() {
-			let symbol = last.ident.inner;
-			return match self.resolve_symbol(func_ctx, symbol) {
+			let resolved = match self
+				.resolve_symbol_forcing(func_ctx, last.ident)
+			{
+				Ok(resolved) => resolved,
+				// Cyclic — already reported.
+				Err(()) => {
+					return Ok(Expression {
+						kind: ExprKind::Error,
+						ty: access_ctx.expected_type.infer_or(TypeIndex::ERROR),
+						span: expr_span,
+					});
+				}
+			};
+			return match resolved {
 				Some(resolved) => self.resolved_symbol_to_expression(
 					func_ctx, access_ctx, resolved, expr_span,
 				),
@@ -10828,11 +12090,15 @@ impl<'ast> Builder<'ast, '_> {
 		if path.len() == 1 {
 			let seg = &path[0];
 			let func_index = match self
-				.lookup_global_symbol(
+				.lookup_global_symbol_reporting(
 					func_ctx.resolve_context.namespace,
 					(SymbolNamespace::Value, seg.ident.inner),
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						seg.ident.span,
+					),
 				)
-				.filter(|k| !matches!(k, SymbolKind::Pending(_)))
+				.and_then(SymbolEntry::resolved_kind)
 			{
 				Some(SymbolKind::Function { func_index }) => func_index,
 				_ => {
@@ -11224,9 +12490,9 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if !candidates.is_empty() {
-			let member_name_str =
-				self.interner.resolve(member_name).unwrap_or("?");
-			let type_name = TypeFormatter::new(&self.tir, self.interner)
+			let member_name_str = self.interner.resolve(member_name).unwrap();
+			let type_name = self
+				.formatter(resolve_context.namespace)
 				.display_type(base)
 				.unwrap_or_default();
 			let mut diagnostic = Diagnostic {
@@ -11248,7 +12514,7 @@ impl<'ast> Builder<'ast, '_> {
 			for trait_index in &candidates {
 				let trait_ = &self.tir.traits[*trait_index as usize];
 				let trait_name =
-					self.interner.resolve(trait_.name.inner).unwrap_or("?");
+					self.interner.resolve(trait_.name.inner).unwrap();
 				let name_span = trait_
 					.assoc_types
 					.get(&member_name)
@@ -11310,17 +12576,13 @@ impl<'ast> Builder<'ast, '_> {
 			return Err(());
 		}
 		match &self.tir.types[namespace.inner.as_usize()] {
+			// No access recorded for `namespace` itself here: a
+			// `Type::Namespace` value only ever comes from
+			// `symbol_kind_to_type`, whose only two call sites both call
+			// `record_symbol_access` immediately beforehand, at the
+			// exact segment span that produced it — recording it again
+			// here would duplicate that entry.
 			Type::Namespace { namespace_idx } => {
-				if let Type::Namespace { namespace_idx } =
-					&self.tir.types[namespace.inner.as_usize()]
-				{
-					self.tir.namespaces[*namespace_idx as usize].accesses.push(
-						SourceSpan::new(
-							resolve_context.file_id,
-							namespace.span,
-						),
-					)
-				};
 				let namespace_idx = *namespace_idx;
 				let kind = self.resolve_pending_namespace_symbol(
 					resolve_context.namespace,
@@ -11354,7 +12616,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 					Some(kind) => {
-						self.record_type_kind_access(
+						self.tir.record_symbol_access(
 							resolve_context.file_id,
 							kind,
 							member.ident.span,
@@ -11415,7 +12677,8 @@ impl<'ast> Builder<'ast, '_> {
 				}
 				let member_name =
 					self.interner.resolve(member.ident.inner).unwrap();
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(namespace.inner)
 					.unwrap_or_default();
 				self.tir.diagnostics.push(
@@ -11432,9 +12695,10 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			_ => match self.resolve_impl_member(
+				resolve_context,
 				namespace.inner,
 				member.ident.inner,
-				SourceSpan::new(resolve_context.file_id, member.ident.span),
+				member.ident.span,
 			) {
 				MemberLookup::Trait {
 					entry: ImplEntry::AssocType(idx),
@@ -11469,10 +12733,10 @@ impl<'ast> Builder<'ast, '_> {
 					// one case for MemberLookup::NotFound and another for Found with not correct kind
 					let member_name =
 						self.interner.resolve(member.ident.inner).unwrap();
-					let type_name =
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(namespace.inner)
-							.unwrap();
+					let type_name = self
+						.formatter(resolve_context.namespace)
+						.display_type(namespace.inner)
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::UndeclaredType.code())
@@ -11490,52 +12754,6 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	fn record_type_kind_access(
-		&mut self,
-		file_id: FileId,
-		kind: SymbolKind,
-		span: TextSpan,
-	) {
-		match kind {
-			SymbolKind::Struct { struct_index } => {
-				self.tir.structs[struct_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Enum { enum_index } => {
-				self.tir.enums[enum_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Trait { trait_index } => {
-				self.tir.traits[trait_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::TypeSet { typeset_index } => {
-				self.tir.typesets[typeset_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::TypeAlias { type_alias_index } => {
-				self.tir.type_aliases[type_alias_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Const { const_index } => {
-				self.tir.constants[const_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Memory { memory_index, .. } => {
-				self.tir.memories[memory_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			_ => {}
-		}
-	}
-
 	/// Resolve `member_sym` within `namespace_ty`, emitting a diagnostic and
 	/// returning `Err(())` when resolution fails. On success returns
 	/// `Ok(ResolvedMember)` — the caller decides whether the specific kind is
@@ -11548,9 +12766,10 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Result<ResolvedMember, ()> {
 		let file_id = resolve_context.file_id;
 		let lookup = self.resolve_impl_member(
+			resolve_context,
 			namespace.inner,
 			member.inner,
-			SourceSpan::new(file_id, member.span),
+			member.span,
 		);
 		// See the identical check in `resolve_method_call`: a `TypeParam`
 		// namespace (e.g. `T::SOME_CONST` inside `fn f<T: SomeTrait>()`)
@@ -11572,13 +12791,17 @@ impl<'ast> Builder<'ast, '_> {
 		match lookup {
 			MemberLookup::Inherent {
 				entry: ImplEntry::AssocConstant(index),
-				..
+				type_args,
 			}
 			| MemberLookup::Trait {
 				entry: ImplEntry::AssocConstant(index),
+				type_args,
 				..
 			} => {
-				return Ok(ResolvedMember::Const { const_index: index });
+				return Ok(ResolvedMember::Const {
+					const_index: index,
+					type_args,
+				});
 			}
 			MemberLookup::Inherent {
 				entry:
@@ -11669,7 +12892,10 @@ impl<'ast> Builder<'ast, '_> {
 						Ok(ResolvedMember::Global { global_index })
 					}
 					Some(SymbolKind::Const { const_index }) => {
-						Ok(ResolvedMember::Const { const_index })
+						Ok(ResolvedMember::Const {
+							const_index,
+							type_args: Box::new([]),
+						})
 					}
 					_ => {
 						self.tir.diagnostics.push(
@@ -11683,9 +12909,9 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			_ => {
-				let member_name =
-					self.interner.resolve(member.inner).unwrap_or("?");
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let member_name = self.interner.resolve(member.inner).unwrap();
+				let type_name = self
+					.formatter(resolve_context.namespace)
 					.display_type(namespace.inner)
 					.unwrap();
 				self.tir.diagnostics.push(
@@ -11706,6 +12932,12 @@ impl<'ast> Builder<'ast, '_> {
 
 	/// Core namespace-member dispatch: look up `member` inside a type whose
 	/// `TypeIndex` has already been resolved.
+	///
+	/// No access recorded for `namespace` itself here: a `Type::Namespace`
+	/// value only ever comes from `symbol_kind_to_type`, whose only two
+	/// call sites both call `record_symbol_access` immediately
+	/// beforehand, at the exact segment span that produced it — recording
+	/// it again here would duplicate that entry.
 	fn build_namespace_member_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
@@ -11713,16 +12945,6 @@ impl<'ast> Builder<'ast, '_> {
 		segment: &ast::PathSegment,
 		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let file_id = func_ctx.resolve_context.file_id;
-
-		if let Type::Namespace { namespace_idx } =
-			&self.tir.types[namespace.inner.as_usize()]
-		{
-			self.tir.namespaces[*namespace_idx as usize]
-				.accesses
-				.push(SourceSpan::new(file_id, namespace.span))
-		};
-
 		let resolved = self.resolve_namespace_member(
 			func_ctx.resolve_context,
 			namespace,
@@ -11826,12 +13048,28 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			ResolvedMember::Const { const_index } => {
+			ResolvedMember::Const {
+				const_index,
+				type_args,
+			} => {
 				self.tir.constants[const_index as usize]
 					.accesses
 					.push(SourceSpan::new(file_id, member_span));
 				let id = self.tir.constants[const_index as usize].id;
-				let ty = self.tir.constants[const_index as usize].ty.inner;
+				let raw_ty = self.tir.constants[const_index as usize].ty.inner;
+				// Substitutes the owning trait's `Self` for the receiver's
+				// own type — a no-op (`type_args` empty) for a plain
+				// module-level const, and for a trait const whose type
+				// never mentions `Self` in the first place (`substitute_type`
+				// returns any type unchanged when it contains nothing to
+				// substitute). For a generic receiver (`Mem: Memory`),
+				// `type_args` is `[Mem's own TypeIndex]`, so this leaves the
+				// projection deferred (still `Mem::Size`, not yet
+				// concrete) rather than forcing it — exactly like a
+				// `GenericMethodCall`'s abstract-method type stays
+				// deferred until monomorphization substitutes a concrete
+				// `Self`.
+				let ty = self.substitute_type(raw_ty, &type_args);
 				Ok(Expression {
 					kind: ExprKind::NamespaceAccess {
 						namespace,
@@ -11937,8 +13175,11 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let resolved = match lookup {
-			Ok((ImplEntry::AssocConstant(const_index), _)) => {
-				ResolvedMember::Const { const_index }
+			Ok((ImplEntry::AssocConstant(const_index), type_args)) => {
+				ResolvedMember::Const {
+					const_index,
+					type_args,
+				}
 			}
 			Ok((
 				ImplEntry::Method(func_index)
@@ -11968,7 +13209,8 @@ impl<'ast> Builder<'ast, '_> {
 				return Err(());
 			}
 			Err(TraitMemberError::NotImplemented) => {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(func_ctx.resolve_context.namespace)
 					.display_type(base_ty.inner)
 					.unwrap_or_default();
 				let trait_name = self
@@ -12085,7 +13327,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -12272,7 +13514,7 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(ty) => (Some(else_block), ty),
 					Err(_) => {
 						self.tir.diagnostics.push(report_type_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							TypeMistmatchDiagnostic {
 								expected_type: then_block.ty,
 								actual_type: else_block.ty,
@@ -12293,7 +13535,7 @@ impl<'ast> Builder<'ast, '_> {
 					(None, TypeIndex::UNIT)
 				} else {
 					self.tir.diagnostics.push(report_missing_else_block(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						then_block.ty,
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
@@ -12347,7 +13589,7 @@ impl<'ast> Builder<'ast, '_> {
 			self.tir
 				.diagnostics
 				.push(report_invalid_match_scrutinee_type(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(ctx.resolve_context.namespace),
 					scrutinee_ty,
 					SourceSpan::new(
 						ctx.resolve_context.file_id,
@@ -12445,7 +13687,7 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(ty) => result_ty = ty,
 				Err(_) => {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: result_ty,
 							actual_type: body.ty,
@@ -12656,7 +13898,7 @@ impl<'ast> Builder<'ast, '_> {
 			value.ty = cast_type;
 		} else {
 			self.tir.diagnostics.push(report_invalid_cast(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				value.ty,
 				cast_type,
 				SourceSpan::new(ctx.resolve_context.file_id, expr_span),
@@ -12846,7 +14088,7 @@ impl<'ast> Builder<'ast, '_> {
 					let scope =
 						ctx.stack.scopes.get_mut(scope_index as usize).unwrap();
 					let inferred_type = self.infer_block_type(
-						ctx.resolve_context.file_id,
+						ctx.resolve_context,
 						scope,
 						&built,
 					)?;
@@ -12883,7 +14125,7 @@ impl<'ast> Builder<'ast, '_> {
 					let inferred = scope.inferred_type;
 					if !self.coercible_to(TypeIndex::UNIT, inferred) {
 						let formatter =
-							TypeFormatter::new(&self.tir, self.interner);
+							self.formatter(ctx.resolve_context.namespace);
 						self.tir.diagnostics.push(report_type_mistmatch(
 							formatter,
 							TypeMistmatchDiagnostic {
@@ -12961,8 +14203,13 @@ impl<'ast> Builder<'ast, '_> {
 			| ast::BinaryOp::SubAssign
 			| ast::BinaryOp::MulAssign
 			| ast::BinaryOp::DivAssign
-			| ast::BinaryOp::RemAssign => {
-				self.build_arithmetic_assignment_expr(func_ctx, expr)
+			| ast::BinaryOp::RemAssign
+			| ast::BinaryOp::BitAndAssign
+			| ast::BinaryOp::BitOrAssign
+			| ast::BinaryOp::BitXorAssign
+			| ast::BinaryOp::LeftShiftAssign
+			| ast::BinaryOp::RightShiftAssign => {
+				self.build_compound_assignment_expr(func_ctx, expr)
 			}
 			ast::BinaryOp::Eq
 			| ast::BinaryOp::NotEq
@@ -13025,20 +14272,18 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			ast::UnaryOp::InvertSign => {
 				let ty = operand.ty;
-				Ok(self.build_unary_arithmetic_result(
+				Ok(self.build_unary_operator_dispatch(
 					ctx, operator, operand, ty, expr.span,
 				))
 			}
 			ast::UnaryOp::BitNot => {
-				if operand.ty.is_primitive()
-					|| self.is_typeset_bounded_assoc_type(operand.ty)
-					|| operand.ty.is_comptime_number()
+				if operand.ty.is_primitive() || operand.ty.is_comptime_number()
 				{
 					// Native fast path — unchanged from before `BitNot`
-					// had an overload trait at all: primitives, typeset-
-					// bounded associated types, and deferred comptime
-					// numbers stay a plain `Unary` node (no snapshot
-					// churn, no new intrinsics needed for this case).
+					// had an overload trait at all: primitives and
+					// deferred comptime numbers stay a plain `Unary`
+					// node (no snapshot churn, no new intrinsics needed
+					// for this case).
 					let ty = operand.ty;
 					Ok(Expression {
 						kind: ExprKind::Unary {
@@ -13049,13 +14294,14 @@ impl<'ast> Builder<'ast, '_> {
 						span: expr.span,
 					})
 				} else {
-					// Anything else (a struct) goes through real `BitNot`
-					// dispatch, which reports "operator cannot be
-					// applied" on its own if nothing implements it —
-					// same shape as `InvertSign`'s always-dispatch arm
-					// above, just gated to the non-primitive case to
-					// match the binary bitwise operators' native-path
-					// split (`build_bitwise_result`).
+					// Anything else (a struct, or a typeset-bounded
+					// `Type::TypeParam`/`Type::AssocTypeProjection`) goes
+					// through real `BitNot` dispatch, which reports
+					// "operator cannot be applied" on its own if nothing
+					// implements it — same shape as `InvertSign`'s
+					// always-dispatch arm above, just gated to the
+					// non-primitive case to match the binary bitwise
+					// operators' native-path split (`build_bitwise_result`).
 					let ty = operand.ty;
 					Ok(self.build_unary_operator_dispatch(
 						ctx, operator, operand, ty, expr.span,
@@ -13088,7 +14334,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 				} else {
 					let formatter =
-						TypeFormatter::new(&self.tir, self.interner);
+						self.formatter(ctx.resolve_context.namespace);
 					let diagnostic = Diagnostic::error()
 						.with_code(
 							DiagnosticCode::UnaryOperatorCannotBeApplied.code(),
@@ -13152,7 +14398,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 		} else if left.ty != TypeIndex::BOOL {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
 					actual_type: left.ty,
@@ -13179,7 +14425,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 		} else if right.ty != TypeIndex::BOOL {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
 					actual_type: right.ty,
@@ -13265,7 +14511,7 @@ impl<'ast> Builder<'ast, '_> {
 					{
 						self.tir.diagnostics.push(
 							report_binary_operator_cannot_be_applied(
-								TypeFormatter::new(&self.tir, self.interner),
+								self.formatter(ctx.resolve_context.namespace),
 								BinaryOperatorCannotBeAppliedDiagnostic {
 									file_id: ctx.resolve_context.file_id,
 									operator,
@@ -13298,7 +14544,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !right_type.is_integer() && right_type != TypeIndex::BOOL {
 					self.tir.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								operator,
@@ -13326,7 +14572,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !left_type.is_integer() && left_type != TypeIndex::BOOL {
 					self.tir.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								operator,
@@ -13358,7 +14604,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -13554,7 +14800,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -13624,7 +14870,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, local_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13667,7 +14913,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, global_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13742,7 +14988,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13799,7 +15045,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13862,7 +15108,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	fn build_arithmetic_assignment_expr(
+	fn build_compound_assignment_expr(
 		&mut self,
 		ctx: &mut ExprContext,
 		expr: &Spanned<ast::Expression>,
@@ -13888,6 +15134,11 @@ impl<'ast> Builder<'ast, '_> {
 				ast::BinaryOp::MulAssign => ast::BinaryOp::Mul,
 				ast::BinaryOp::DivAssign => ast::BinaryOp::Div,
 				ast::BinaryOp::RemAssign => ast::BinaryOp::Rem,
+				ast::BinaryOp::BitAndAssign => ast::BinaryOp::BitAnd,
+				ast::BinaryOp::BitOrAssign => ast::BinaryOp::BitOr,
+				ast::BinaryOp::BitXorAssign => ast::BinaryOp::BitXor,
+				ast::BinaryOp::LeftShiftAssign => ast::BinaryOp::LeftShift,
+				ast::BinaryOp::RightShiftAssign => ast::BinaryOp::RightShift,
 				_ => unreachable!(),
 			},
 			span: operator.span,
@@ -13921,7 +15172,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, local_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -13981,7 +15232,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right.ty, global_type) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14042,7 +15293,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14115,7 +15366,7 @@ impl<'ast> Builder<'ast, '_> {
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
 					self.tir.diagnostics.push(
 						report_binary_expression_mistmatch(
-							TypeFormatter::new(&self.tir, self.interner),
+							self.formatter(ctx.resolve_context.namespace),
 							BinaryExpressionMistmatchDiagnostic {
 								file_id: ctx.resolve_context.file_id,
 								left_type: Spanned {
@@ -14152,6 +15403,29 @@ impl<'ast> Builder<'ast, '_> {
 							self_type: field_ty,
 						},
 					},
+					ty: TypeIndex::UNIT,
+					span: expr.span,
+				})
+			}
+			// The target is already in error, so there is no operator impl to
+			// resolve and no `method_id` to build a `CompoundStore` around.
+			// Check the right-hand side anyway so its own mistakes still get
+			// reported, then absorb — the right-hand side of
+			// `build_assignment_expr`'s `ExprKind::Error` arm gets the same
+			// treatment.
+			ExprKind::Error => {
+				self.build_expression(
+					ctx,
+					AccessContext {
+						expected_type: TypeIndex::ERROR,
+						access_kind: AccessKind::Read,
+					},
+					right,
+				)
+				.ok();
+
+				Ok(Expression {
+					kind: ExprKind::Error,
 					ty: TypeIndex::UNIT,
 					span: expr.span,
 				})
@@ -14205,7 +15479,7 @@ impl<'ast> Builder<'ast, '_> {
 				let inferred_type = {
 					let scope = ctx.stack.scopes.get_mut(0).unwrap();
 					let inferred_type = self.infer_block_type(
-						ctx.resolve_context.file_id,
+						ctx.resolve_context,
 						scope,
 						&built,
 					)?;
@@ -14232,7 +15506,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -14266,7 +15540,7 @@ impl<'ast> Builder<'ast, '_> {
 					&& self.coercible_to(inferred_type, expected_type)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: inferred_type,
@@ -14335,7 +15609,7 @@ impl<'ast> Builder<'ast, '_> {
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
 				if l != r {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: l,
 							actual_type: r,
@@ -14367,13 +15641,13 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(l, ty) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, ty)?;
-				Ok(self.build_arithmetic_result(
+				Ok(self.build_operator_dispatch(
 					ctx, operator, left, right, ty, expr.span,
 				))
 			}
 			(ty, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, ty)?;
-				Ok(self.build_arithmetic_result(
+				Ok(self.build_operator_dispatch(
 					ctx, operator, left, right, ty, expr.span,
 				))
 			}
@@ -14392,14 +15666,14 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(right)
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
-				.build_arithmetic_result(
+				.build_operator_dispatch(
 					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
 				self.tir
 					.diagnostics
 					.push(report_binary_expression_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						BinaryExpressionMistmatchDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							left_type: Spanned {
@@ -14506,42 +15780,57 @@ impl<'ast> Builder<'ast, '_> {
 		// params that appear only via `C::Item` style projections, and true for
 		// params that appear directly (e.g. M in `Layout<M>`).
 		let substituted_result = self.substitute_type(result_type, &type_args);
-		let mut had_unresolved = false;
 		if self.contains_infer(substituted_result) {
-			for (i, &slot) in type_args.iter().enumerate() {
-				if slot == TypeIndex::INFER {
-					let name_symbol = self
-						.tir
-						.function_type_params_iter(func_index)
-						.nth(i)
-						.expect(
-							"type_args length must equal total_type_param_count",
-						)
-						.name
-						.inner;
-					let param_name =
-						self.interner.resolve(name_symbol).unwrap();
-					self.tir.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::TypeAnnotationRequired.code(),
+			// Nothing at this call site could pin these slots down. Whether
+			// that's the user's problem depends on why there was nothing:
+			// in a poisoned context (`expected_result == ERROR`) the
+			// enclosing callee is already an error and took the inference
+			// context down with it, so demanding an annotation would blame
+			// the user for a gap the error itself opened. Elsewhere the
+			// annotation genuinely is missing.
+			//
+			// Reaching here at all means the argument loop above already
+			// had its chance to bind these slots, so an argument that does
+			// constrain a param has bound it — which is why a mismatch
+			// between two arguments sharing one param (`same(1, true)`)
+			// still gets reported rather than absorbed.
+			if expected_result != TypeIndex::ERROR {
+				for (i, &slot) in type_args.iter().enumerate() {
+					if slot == TypeIndex::INFER {
+						let name_symbol = self
+							.tir
+							.function_type_params_iter(func_index)
+							.nth(i)
+							.expect(
+								"type_args length must equal total_type_param_count",
 							)
-							.with_message(format!(
-								"cannot infer type for type parameter `{param_name}`"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
+							.name
+							.inner;
+						let param_name =
+							self.interner.resolve(name_symbol).unwrap();
+						self.tir.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::TypeAnnotationRequired
+										.code(),
 								)
-								.with_message("type annotation required"),
-							),
-					);
-					had_unresolved = true;
+								.with_message(format!(
+									"cannot infer type for type parameter `{param_name}`"
+								))
+								.with_label(
+									Label::primary(
+										ctx.resolve_context.file_id,
+										call_span,
+									)
+									.with_message("type annotation required"),
+								),
+						);
+					}
 				}
 			}
-		}
-		if had_unresolved {
+			// Unresolved either way: poison the open slots and skip the
+			// argument checks below, which can only produce noise once the
+			// result type is unknown.
 			for slot in type_args.iter_mut() {
 				if *slot == TypeIndex::INFER {
 					*slot = TypeIndex::ERROR;
@@ -14575,7 +15864,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !self.type_satisfies_annotation(arg.ty, substituted_expected)
 				{
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: substituted_expected,
 							actual_type: arg.ty,
@@ -14603,7 +15892,7 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				} else if !self.coercible_to(arg.ty, expected_type) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: arg.ty,
@@ -14717,7 +16006,8 @@ impl<'ast> Builder<'ast, '_> {
 					}
 					continue;
 				}
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(ctx.resolve_context.namespace)
 					.display_type(arg_ty)
 					.unwrap_or_default();
 				let trait_name = self
@@ -14782,7 +16072,8 @@ impl<'ast> Builder<'ast, '_> {
 			let satisfied =
 				self.tir.type_in_typeset(arg_ty, param_bound.typeset_index);
 			if !satisfied {
-				let type_name = TypeFormatter::new(&self.tir, self.interner)
+				let type_name = self
+					.formatter(ctx.resolve_context.namespace)
 					.display_type(arg_ty)
 					.unwrap_or_default();
 				let set_name = self
@@ -14835,15 +16126,15 @@ impl<'ast> Builder<'ast, '_> {
 					continue;
 				};
 				let assoc_name_str =
-					self.interner.resolve(*assoc_name).unwrap_or("?");
-				let concrete_name =
-					TypeFormatter::new(&self.tir, self.interner)
-						.display_type(concrete)
-						.unwrap_or_default();
+					self.interner.resolve(*assoc_name).unwrap();
+				let concrete_name = self
+					.formatter(ctx.resolve_context.namespace)
+					.display_type(concrete)
+					.unwrap_or_default();
 				let func_name = self
 					.interner
 					.resolve(self.tir.functions[func_index as usize].name.inner)
-					.unwrap_or("?");
+					.unwrap();
 				let func_file_id =
 					self.tir.functions[func_index as usize].file_id;
 
@@ -14861,7 +16152,7 @@ impl<'ast> Builder<'ast, '_> {
 								.name
 								.inner,
 						)
-						.unwrap_or("?");
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -14899,7 +16190,7 @@ impl<'ast> Builder<'ast, '_> {
 								.name
 								.inner,
 						)
-						.unwrap_or("?");
+						.unwrap();
 					self.tir.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
@@ -14976,7 +16267,7 @@ impl<'ast> Builder<'ast, '_> {
 					);
 				} else if !self.coercible_to(argument.ty, expected_type) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
 							actual_type: argument.ty,
@@ -15010,14 +16301,25 @@ impl<'ast> Builder<'ast, '_> {
 			_ => unreachable!(),
 		};
 
-		let callee = self.build_expression(
-			ctx,
-			AccessContext {
-				expected_type: TypeIndex::INFER,
-				access_kind: AccessKind::Read,
-			},
-			ast_callee,
-		)?;
+		// A callee that failed outright becomes an error-typed expression
+		// rather than propagating `Err`, so it lands in the non-function `_`
+		// arm below — which already builds the arguments (so mistakes inside
+		// the argument list still get reported) and already stays silent
+		// about the callee itself once its type is `ERROR`.
+		let callee = self
+			.build_expression(
+				ctx,
+				AccessContext {
+					expected_type: TypeIndex::INFER,
+					access_kind: AccessKind::Read,
+				},
+				ast_callee,
+			)
+			.unwrap_or(Expression {
+				kind: ExprKind::Error,
+				ty: TypeIndex::ERROR,
+				span: ast_callee.span,
+			});
 		let signature = match &self.tir.types[callee.ty.as_usize()] {
 			Type::Function { signature } => signature.clone(),
 			Type::FunctionItem { id, .. } => {
@@ -15030,14 +16332,20 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			_ => {
-				// still trying to check arguments, even though we don't have information about the parameters
+				// Still trying to check arguments, even though we don't have
+				// information about the parameters. `ERROR` rather than
+				// `INFER` as the expected type: both mean "no parameter type
+				// to check against", but `INFER` also means "so tell me what
+				// it is", which makes `build_generic_call_arguments` demand
+				// an annotation for a type parameter this missing callee is
+				// the reason it couldn't pin down.
 				let arguments: Box<_> = arguments
 					.iter()
 					.map(|arg| {
 						match self.build_expression(
 							ctx,
 							AccessContext {
-								expected_type: TypeIndex::INFER,
+								expected_type: TypeIndex::ERROR,
 								access_kind: AccessKind::Read,
 							},
 							&arg.inner,
@@ -15054,7 +16362,7 @@ impl<'ast> Builder<'ast, '_> {
 
 				if callee.ty != TypeIndex::ERROR {
 					let formatter =
-						TypeFormatter::new(&self.tir, self.interner);
+						self.formatter(ctx.resolve_context.namespace);
 					let mut diagnostic = Diagnostic::error()
 						.with_code(DiagnosticCode::CannotCallExpression.code())
 						.with_message("call expression requires function")
@@ -15089,7 +16397,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		if arguments.len() != signature.params().len() {
 			self.tir.diagnostics.push(report_argument_count_mismatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
 					params: signature.params(),
@@ -15251,7 +16559,18 @@ impl<'ast> Builder<'ast, '_> {
 					None => false,
 				}
 			}
-			ImplEntry::AssocConstant(_) | ImplEntry::AssocType(_) => false,
+			// Unlike a method's body (resolved lazily in the separate,
+			// later `ensure_body` phase — so `tir.functions[..].body` can
+			// still be `None` for a default method whose body just hasn't
+			// been demanded yet), a const's `value` is resolved eagerly,
+			// atomically, within `ensure_signature` itself, strictly before
+			// its `ImplEntry::AssocConstant` entry is inserted into
+			// `trait.entries` — so by the time this entry is even
+			// reachable to look up, `value` is guaranteed already set.
+			ImplEntry::AssocConstant(const_index) => {
+				self.tir.constants[const_index as usize].value.is_some()
+			}
+			ImplEntry::AssocType(_) => false,
 		}
 	}
 
@@ -15323,13 +16642,11 @@ impl<'ast> Builder<'ast, '_> {
 		else {
 			let trait_name_sym =
 				self.tir.traits[trait_index as usize].name.inner;
-			let trait_name =
-				self.interner.resolve(trait_name_sym).unwrap_or("?");
+			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
 			let imp = &self.tir.trait_impls[trait_impl_index as usize];
 			let span = SourceSpan::new(imp.file_id, imp.span);
 			let type_str = self
-				.tir
-				.formatter(self.interner)
+				.formatter(self.tir.file_namespaces[imp.file_id.as_usize()])
 				.display_type(target_type)
 				.unwrap();
 			self.tir.diagnostics.push(Diagnostic {
@@ -15351,8 +16668,7 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			let trait_name_sym =
 				self.tir.traits[trait_index as usize].name.inner;
-			let trait_name =
-				self.interner.resolve(trait_name_sym).unwrap_or("?");
+			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
 			let new_impl = &self.tir.trait_impls[trait_impl_index as usize];
 			let new_span = SourceSpan::new(new_impl.file_id, new_impl.span);
 			let existing_impl = &self.tir.trait_impls[existing_index as usize];
@@ -15461,11 +16777,8 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if !candidates.is_empty() {
-			let member_name = self
-				.interner
-				.resolve(member_symbol)
-				.unwrap_or("?")
-				.to_string();
+			let member_name =
+				self.interner.resolve(member_symbol).unwrap().to_string();
 			let mut diagnostic = Diagnostic {
 				severity: Severity::Error,
 				code: Some(
@@ -15506,9 +16819,10 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn resolve_impl_member(
 		&mut self,
+		resolve_context: ResolveContext,
 		target_type: TypeIndex,
 		member_symbol: SymbolU32,
-		member_span: SourceSpan,
+		member_span: TextSpan,
 	) -> MemberLookup {
 		struct MemberCandidate {
 			trait_index: TraitIndex,
@@ -15568,7 +16882,7 @@ impl<'ast> Builder<'ast, '_> {
 					target,
 					target_type,
 					member_symbol,
-					member_span,
+					SourceSpan::new(resolve_context.file_id, member_span),
 				) {
 					return result;
 				}
@@ -15635,7 +16949,7 @@ impl<'ast> Builder<'ast, '_> {
 		if candidates.is_empty() {
 			MemberLookup::NotFound
 		} else {
-			let formatter = TypeFormatter::new(&self.tir, self.interner);
+			let formatter = self.formatter(resolve_context.namespace);
 			let mut diagnostic = Diagnostic {
 				severity: Severity::Error,
 				code: Some(
@@ -15645,12 +16959,14 @@ impl<'ast> Builder<'ast, '_> {
 				labels: Vec::with_capacity(candidates.len() + 1),
 				notes: Vec::new(),
 			};
-			diagnostic
-				.labels
-				.push(member_span.primary_label().with_message(format!(
-					"multiple `{}` found",
-					formatter.interner.resolve(member_symbol).unwrap()
-				)));
+			diagnostic.labels.push(
+				SourceSpan::new(resolve_context.file_id, member_span)
+					.primary_label()
+					.with_message(format!(
+						"multiple `{}` found",
+						formatter.interner.resolve(member_symbol).unwrap()
+					)),
+			);
 			let type_name = formatter.display_type(target_type).unwrap();
 			for (idx, candidate) in candidates.iter().enumerate() {
 				let trait_name =
@@ -15793,10 +17109,11 @@ impl<'ast> Builder<'ast, '_> {
 	/// callable as a method.
 	fn resolve_method_call(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		receiver: Spanned<TypeIndex>,
 		method: Spanned<SymbolU32>,
 	) -> Result<(FunctionIndex, Box<[TypeIndex]>), ()> {
+		let file_id = resolve_context.file_id;
 		// Pointer types cannot have impl blocks, so look up methods on the inner type directly.
 		let lookup_ty = match &self.tir.types[receiver.inner.as_usize()] {
 			Type::Pointer { to, .. } => *to,
@@ -15808,9 +17125,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let lookup = self.resolve_impl_member(
+			resolve_context,
 			lookup_ty,
 			method.inner,
-			SourceSpan::new(file_id, method.span),
+			method.span,
 		);
 		// `resolve_impl_member`'s `TypeParam` branch is the only path that
 		// can produce `MemberLookup::Trait` for a `TypeParam` receiver
@@ -15852,7 +17170,7 @@ impl<'ast> Builder<'ast, '_> {
 					Type::Pointer { .. }
 				) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
 							actual_type: receiver.inner,
@@ -15884,7 +17202,7 @@ impl<'ast> Builder<'ast, '_> {
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
 				self.tir.diagnostics.push(report_not_a_method(
 					SourceSpan::new(file_id, method.span),
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					method.inner,
 					lookup_ty,
 				));
@@ -15893,7 +17211,7 @@ impl<'ast> Builder<'ast, '_> {
 			MemberLookup::NotFound => {
 				self.tir.diagnostics.push(report_method_not_found(
 					SourceSpan::new(file_id, method.span),
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(resolve_context.namespace),
 					method.inner,
 					receiver.inner,
 				));
@@ -15929,14 +17247,36 @@ impl<'ast> Builder<'ast, '_> {
 		)?;
 
 		let file_id = ctx.resolve_context.file_id;
-		let (func_index, mut type_args) = self.resolve_method_call(
-			file_id,
+		let (func_index, mut type_args) = match self.resolve_method_call(
+			ctx.resolve_context,
 			Spanned {
 				inner: object.ty,
 				span: object.span,
 			},
 			*method,
-		)?;
+		) {
+			Ok(resolved) => resolved,
+			// The method didn't resolve, so there are no parameters to check
+			// against — but still build the arguments so a mistake *inside*
+			// the argument list gets reported rather than hidden behind the
+			// unresolved method. `ERROR` as the expected type for the same
+			// reason as the non-function arm of `build_call_expression`: it
+			// marks the context as already broken, so nothing downstream
+			// asks the user to annotate their way out of it.
+			Err(()) => {
+				for argument in arguments {
+					_ = self.build_expression(
+						ctx,
+						AccessContext {
+							expected_type: TypeIndex::ERROR,
+							access_kind: AccessKind::Read,
+						},
+						&argument.inner,
+					);
+				}
+				return Err(());
+			}
+		};
 
 		self.tir.functions[func_index as usize]
 			.accesses
@@ -15951,7 +17291,7 @@ impl<'ast> Builder<'ast, '_> {
 		let non_self_params = &signature.params()[1..];
 		if arguments.len() != non_self_params.len() {
 			self.tir.diagnostics.push(report_argument_count_mismatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
 					params: non_self_params,
@@ -15988,7 +17328,7 @@ impl<'ast> Builder<'ast, '_> {
 			if let Some(&self_param_ty) = signature.params().first() {
 				if !self.coercible_to(object.ty, self_param_ty) {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
 							actual_type: object.ty,
@@ -16225,7 +17565,7 @@ impl<'ast> Builder<'ast, '_> {
 				return Ok(value.ty);
 			}
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type,
 					actual_type: value.ty,
@@ -16240,7 +17580,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		self.tir.diagnostics.push(report_type_mistmatch(
-			TypeFormatter::new(&self.tir, self.interner),
+			self.formatter(ctx.resolve_context.namespace),
 			TypeMistmatchDiagnostic {
 				expected_type,
 				actual_type: value.ty,
@@ -16256,7 +17596,6 @@ impl<'ast> Builder<'ast, '_> {
 		expr: &mut Expression,
 		target_type: TypeIndex,
 	) -> Result<(), ()> {
-		let file_id = ctx.resolve_context.file_id;
 		// if target_type == TypeIndex::INFER {
 		//     self.tir
 		//         .diagnostics
@@ -16266,12 +17605,16 @@ impl<'ast> Builder<'ast, '_> {
 		//     return Err(());
 		// }
 		match expr.kind {
-			ExprKind::Int { .. } => {
-				self.coerce_untyped_int_expr(file_id, expr, target_type)
-			}
-			ExprKind::Float { .. } => {
-				self.coerce_untyped_float_expr(file_id, expr, target_type)
-			}
+			ExprKind::Int { .. } => self.coerce_untyped_int_expr(
+				ctx.resolve_context,
+				expr,
+				target_type,
+			),
+			ExprKind::Float { .. } => self.coerce_untyped_float_expr(
+				ctx.resolve_context,
+				expr,
+				target_type,
+			),
 			ExprKind::Unary { .. } => {
 				self.coerce_untyped_unary_expr(ctx, expr, target_type)
 			}
@@ -16297,15 +17640,16 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn coerce_untyped_int_expr(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		expr: &mut Expression,
 		target_idx: TypeIndex,
 	) -> Result<(), ()> {
+		let file_id = resolve_context.file_id;
 		let value = match expr.kind {
 			ExprKind::Int { value } => value,
 			_ => unreachable!(),
 		};
-		let formatter = TypeFormatter::new(&self.tir, self.interner);
+		let formatter = self.formatter(resolve_context.namespace);
 
 		// `value` is always the raw, non-negative magnitude as written (see
 		// `ExprKind::Int`'s doc comment) — negation is a separate `Unary`
@@ -16410,11 +17754,8 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			let ts = &self.tir.typesets[typeset_index as usize];
 			let range = &ts.intersection_range;
-			let ts_name = self
-				.interner
-				.resolve(ts.name.inner)
-				.unwrap_or("?")
-				.to_string();
+			let ts_name =
+				self.interner.resolve(ts.name.inner).unwrap().to_string();
 			if !range.contains(value as i64) {
 				self.tir.diagnostics.push(
 					report_integer_literal_out_of_typeset_range(
@@ -16440,10 +17781,11 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn coerce_untyped_float_expr(
 		&mut self,
-		file_id: FileId,
+		resolve_context: ResolveContext,
 		expr: &mut Expression,
 		target_idx: TypeIndex,
 	) -> Result<(), ()> {
+		let file_id = resolve_context.file_id;
 		if target_idx == TypeIndex::F32 {
 			// TODO: add a diagnostic if the literal is out of range
 			expr.ty = TypeIndex::F32;
@@ -16454,7 +17796,7 @@ impl<'ast> Builder<'ast, '_> {
 			Ok(())
 		} else {
 			self.tir.diagnostics.push(report_unable_to_coerce(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
 			));
@@ -16489,7 +17831,7 @@ impl<'ast> Builder<'ast, '_> {
 					|| target_idx == TypeIndex::F64;
 				if !is_valid {
 					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
 					));
@@ -16520,7 +17862,7 @@ impl<'ast> Builder<'ast, '_> {
 					if value > max_magnitude {
 						self.tir.diagnostics.push(
 							report_integer_literal_out_of_range(
-								TypeFormatter::new(&self.tir, self.interner),
+								self.formatter(ctx.resolve_context.namespace),
 								IntegerLiteralOutOfRangeDiagnostic {
 									ty: target_idx,
 									value: (value as i64).wrapping_neg(),
@@ -16539,7 +17881,7 @@ impl<'ast> Builder<'ast, '_> {
 			ast::UnaryOp::BitNot => {
 				if !target_idx.is_integer() {
 					self.tir.diagnostics.push(report_unable_to_coerce(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
 					));
@@ -16597,7 +17939,7 @@ impl<'ast> Builder<'ast, '_> {
 		debug_assert!(operator.inner.is_arithmetic());
 		if !target_idx.is_primitive() {
 			self.tir.diagnostics.push(report_unable_to_coerce(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(ctx.resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
 			));
@@ -16835,7 +18177,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			} else if !self.coercible_to(field_expr.ty, expected_ty) {
 				self.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&self.tir, self.interner),
+					self.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: expected_ty,
 						actual_type: field_expr.ty,
@@ -17015,13 +18357,26 @@ impl<'ast> Builder<'ast, '_> {
 					memory,
 					ownership,
 				} => (*to, *memory, *ownership == ast::Ownership::Exclusive),
+				// Error already reported — absorb it instead of reporting a
+				// bogus "`{unknown}` is not a pointer" on top of it. An
+				// `ExprKind::Error` rather than `Err(())` so callers keep
+				// going and still check what surrounds the deref: an
+				// assignment, for instance, goes on to type-check its
+				// right-hand side against `{unknown}`.
+				Type::Error => {
+					return Ok(Expression {
+						kind: ExprKind::Error,
+						ty: TypeIndex::ERROR,
+						span,
+					});
+				}
 				_ => {
 					self.tir.diagnostics.push(report_cannot_deref_non_pointer(
 						SourceSpan::new(
 							func_ctx.resolve_context.file_id,
 							pointer.span,
 						),
-						TypeFormatter::new(&self.tir, self.interner)
+						self.formatter(func_ctx.resolve_context.namespace)
 							.display_type(pointer.ty)
 							.unwrap(),
 					));
@@ -17095,44 +18450,39 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	fn pointer_type_for_memory(&mut self, memory: TypeIndex) -> TypeIndex {
-		match &self.tir.types[memory.as_usize()].clone() {
+		let (owner, param_index) = match self.tir.types[memory.as_usize()] {
 			Type::Memory { id, .. } => {
-				let idx = self.tir.expect_memory_index(*id);
-				self.tir.memories[idx as usize].size.inner
+				let idx = self.tir.expect_memory_index(id);
+				return self.tir.memories[idx as usize].size.inner;
 			}
-			Type::TypeParam { owner, param_index } => {
-				// Generic `M: Memory` — the index type is `M::Size`.
-				// Find the first bound trait that declares `Size` as an assoc type.
-				let size_sym = self.interner.get_or_intern("Size");
-				let param_index = *param_index;
-				let bounds = self
-					.tir
-					.type_param_info(*owner, param_index as usize)
-					.bounds
-					.traits
-					.to_owned();
-				let trait_index = bounds
-					.iter()
-					.find(|b| {
-						self.tir.traits[b.trait_index as usize]
-							.assoc_types
-							.contains_key(&size_sym)
-					})
-					.map(|b| b.trait_index);
-				match trait_index {
-					Some(trait_index) => {
-						self.intern_type(Type::AssocTypeProjection {
-							trait_index,
-							assoc_name: size_sym,
-							base: memory,
-						})
-					}
-					// No bound with Size — fall back to untyped; will be caught
-					// by type checking if the user provides a typed index.
-					None => TypeIndex::INTEGER,
-				}
-			}
-			_ => TypeIndex::INTEGER,
+			Type::TypeParam { owner, param_index } => (owner, param_index),
+			_ => return TypeIndex::INTEGER,
+		};
+
+		// Generic `M: Memory` — the index type is `M::Size`.
+		// Find the first bound trait that declares `Size` as an assoc type.
+		let size_sym = self.interner.get_or_intern("Size");
+		let trait_index = self
+			.tir
+			.type_param_info(owner, param_index as usize)
+			.bounds
+			.traits
+			.iter()
+			.find(|b| {
+				self.tir.traits[b.trait_index as usize]
+					.assoc_types
+					.contains_key(&size_sym)
+			})
+			.map(|b| b.trait_index);
+		match trait_index {
+			Some(trait_index) => self.intern_type(Type::AssocTypeProjection {
+				trait_index,
+				assoc_name: size_sym,
+				base: memory,
+			}),
+			// No bound with Size — fall back to untyped; will be caught
+			// by type checking if the user provides a typed index.
+			None => TypeIndex::INTEGER,
 		}
 	}
 
@@ -17147,8 +18497,8 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_size, expected_ownership) =
-			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
-				Type::Array {
+			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+				&Type::Array {
 					of,
 					memory,
 					size,
@@ -17224,7 +18574,7 @@ impl<'ast> Builder<'ast, '_> {
 			for elem in &built[1..] {
 				if elem.ty != ty {
 					self.tir.diagnostics.push(report_type_mistmatch(
-						TypeFormatter::new(&self.tir, self.interner),
+						self.formatter(func_ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: ty,
 							actual_type: elem.ty,
@@ -17280,8 +18630,8 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_ownership) =
-			match self.tir.types[access_ctx.expected_type.as_usize()].clone() {
-				Type::Array {
+			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+				&Type::Array {
 					of,
 					memory,
 					ownership,
@@ -17314,8 +18664,8 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 
-		if let Type::Array { size, .. } =
-			self.tir.types[access_ctx.expected_type.as_usize()].clone()
+		if let &Type::Array { size, .. } =
+			&self.tir.types[access_ctx.expected_type.as_usize()]
 		{
 			if count != size {
 				self.tir.diagnostics.push(report_array_size_mismatch(
@@ -17408,33 +18758,30 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, ownership) =
-			match self.tir.types[object.ty.as_usize()].clone() {
-				Type::Array {
-					of,
-					memory,
-					ownership,
-					..
-				} => (of, memory, ownership),
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				} => (of, memory, ownership),
-				Type::Error => return Err(()),
-				_ => {
-					self.tir.diagnostics.push(report_index_on_non_indexable(
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							object.span,
-						),
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(object.ty)
-							.unwrap(),
-					));
-					return Err(());
-				}
-			};
+		let indexable = match &self.tir.types[object.ty.as_usize()] {
+			&Type::Array {
+				of,
+				memory,
+				ownership,
+				..
+			}
+			| &Type::Slice {
+				of,
+				memory,
+				ownership,
+			} => Some((of, memory, ownership)),
+			Type::Error => return Err(()),
+			_ => None,
+		};
+		let Some((elem_type, memory, ownership)) = indexable else {
+			self.tir.diagnostics.push(report_index_on_non_indexable(
+				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
+				self.formatter(func_ctx.resolve_context.namespace)
+					.display_type(object.ty)
+					.unwrap(),
+			));
+			return Err(());
+		};
 		let mutable = ownership == ast::Ownership::Exclusive;
 
 		if matches!(
@@ -17464,7 +18811,7 @@ impl<'ast> Builder<'ast, '_> {
 			self.coerce_untyped_expr(func_ctx, &mut index, index_type)?;
 		} else if index.ty != index_type {
 			self.tir.diagnostics.push(report_type_mistmatch(
-				TypeFormatter::new(&self.tir, self.interner),
+				self.formatter(func_ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: index_type,
 					actual_type: index.ty,
@@ -17511,33 +18858,30 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let (elem_type, memory, ownership) =
-			match self.tir.types[object.ty.as_usize()].clone() {
-				Type::Array {
-					of,
-					memory,
-					ownership,
-					..
-				} => (of, memory, ownership),
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				} => (of, memory, ownership),
-				Type::Error => return Err(()),
-				_ => {
-					self.tir.diagnostics.push(report_index_on_non_indexable(
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							object.span,
-						),
-						TypeFormatter::new(&self.tir, self.interner)
-							.display_type(object.ty)
-							.unwrap(),
-					));
-					return Err(());
-				}
-			};
+		let indexable = match &self.tir.types[object.ty.as_usize()] {
+			&Type::Array {
+				of,
+				memory,
+				ownership,
+				..
+			}
+			| &Type::Slice {
+				of,
+				memory,
+				ownership,
+			} => Some((of, memory, ownership)),
+			Type::Error => return Err(()),
+			_ => None,
+		};
+		let Some((elem_type, memory, ownership)) = indexable else {
+			self.tir.diagnostics.push(report_index_on_non_indexable(
+				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
+				self.formatter(func_ctx.resolve_context.namespace)
+					.display_type(object.ty)
+					.unwrap(),
+			));
+			return Err(());
+		};
 
 		let index_type = self.pointer_type_for_memory(memory);
 
@@ -17557,7 +18901,7 @@ impl<'ast> Builder<'ast, '_> {
 					.coerce_untyped_expr(func_ctx, &mut bound, index_type)?;
 			} else if bound.ty != index_type {
 				builder.tir.diagnostics.push(report_type_mistmatch(
-					TypeFormatter::new(&builder.tir, builder.interner),
+					builder.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: index_type,
 						actual_type: bound.ty,

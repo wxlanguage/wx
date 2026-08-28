@@ -16,7 +16,11 @@ impl TestCase {
 		let mut interner = ast::StringInterner::new();
 		let mut files = vfs::Files::new();
 		let file_id = files
-			.add("main.wx".to_string(), source.to_string())
+			.add(
+				"main.wx".to_string(),
+				source.to_string(),
+				vfs::FileOrigin::Local,
+			)
 			.unwrap();
 		let mut id_generator = ast::DefIdGenerator::new();
 		let ast = ast::Parser::parse(
@@ -67,6 +71,33 @@ fn test_format_simple_function() {
             }
         "}
 	);
+}
+
+/// `use` trees round-trip through the formatter unchanged, groups included.
+/// They stay on one line even at a narrow `max_line_width`: a `use` names
+/// things living elsewhere, so its length tracks the path being imported
+/// rather than anything in this file.
+#[test]
+fn test_format_use_trees() {
+	let source = indoc! {"
+        use math::*;
+        use math::add;
+        use math::add as plus;
+        use math::{add, sub};
+        use math::{trig::{sin, cos}, ops::*};
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 40,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(output, source);
 }
 
 #[test]
@@ -146,7 +177,7 @@ fn test_format_single_import_function_stays_inline() {
 #[test]
 fn test_format_module_items() {
 	let case = TestCase::new(indoc! {"
-        pub module wasm {
+        pub mod wasm {
             pub fn answer() -> i32{
                 42
             }
@@ -154,7 +185,7 @@ fn test_format_module_items() {
             fn helper(  ) {}
         }
 
-        module math;
+        mod math;
     "});
 	let output = format(
 		&case.ast,
@@ -169,7 +200,7 @@ fn test_format_module_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            pub module wasm {
+            pub mod wasm {
                 pub fn answer() -> i32 {
                     42
                 }
@@ -177,7 +208,7 @@ fn test_format_module_items() {
                 fn helper() {}
             }
 
-            module math;
+            mod math;
         "}
 	);
 }
@@ -445,6 +476,64 @@ fn test_format_typeset_items() {
             #[tag = \"pointer_size\"]
             pub typeset PointerSize { u32, u64 }
         "}
+	);
+}
+
+/// Regression test for a formatter bug where `Item::Trait`/`Item::Enum`/
+/// `Item::Const`/`Item::Global`'s dispatch arms in `build_item` destructured
+/// `attributes` away via `..` and never passed it to their respective
+/// `build_*_definition` functions — silently dropping any `#[...]` on those
+/// four item kinds (unlike `fn`/`struct`/`typeset`/`type`, which were never
+/// affected). Caught by round-tripping `std/main.wx`'s `#[tag = "add"]`-style
+/// operator traits through `wx format`.
+#[test]
+fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
+	let case = TestCase::new(indoc! {r#"
+        #[tag = "add"]
+        pub trait Add {
+            fn add(self: Self, rhs: Self) -> Self;
+        }
+
+        #[tag = "example"]
+        enum Color { Red, Green, Blue }
+
+        #[tag = "example"]
+        pub const LIMIT: i32 = 10;
+
+        #[tag = "example"]
+        global mut counter: i32 = 0;
+    "#});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {r#"
+            #[tag = "add"]
+            pub trait Add {
+                fn add(self: Self, rhs: Self) -> Self;
+            }
+
+            #[tag = "example"]
+            enum Color {
+                Red,
+                Green,
+                Blue,
+            }
+
+            #[tag = "example"]
+            pub const LIMIT: i32 = 10;
+
+            #[tag = "example"]
+            global mut counter: i32 = 0;
+        "#}
 	);
 }
 
@@ -1240,12 +1329,12 @@ fn test_format_comments_preserved() {
 	);
 	assert_eq!(
 		fmt(indoc! {"
-            module m {
+            mod m {
                 // nothing yet
             }
         "}),
 		indoc! {"
-            module m {
+            mod m {
                 // nothing yet
             }
         "},
@@ -1304,6 +1393,49 @@ fn test_format_comments_preserved() {
 
             impl T for Foo {
                 // methods tbd
+            }
+        "},
+	);
+
+	// Leading comment before the first (non-empty) item in an impl body —
+	// regression test: `build_impl_item_list`'s gap-comment handling used
+	// to only look between consecutive items (`index > 0`), so a comment
+	// before the very first item had no gap to be found in and was
+	// silently dropped.
+	assert_eq!(
+		fmt(indoc! {"
+            struct Foo {}
+            impl Foo {
+                // first method
+                fn bar(self: Self) -> Self {
+                    self
+                }
+            }
+        "}),
+		indoc! {"
+            struct Foo {}
+
+            impl Foo {
+                // first method
+                fn bar(self: Self) -> Self {
+                    self
+                }
+            }
+        "},
+	);
+
+	// Same regression, for the first item in a trait body.
+	assert_eq!(
+		fmt(indoc! {"
+            trait T {
+                // first method
+                fn bar(self: Self) -> Self;
+            }
+        "}),
+		indoc! {"
+            trait T {
+                // first method
+                fn bar(self: Self) -> Self;
             }
         "},
 	);

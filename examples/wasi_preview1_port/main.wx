@@ -157,7 +157,7 @@ enum Errno: u16 {
 // request), not a closed set of named states — so this is a namespaced
 // group of flag constants rather than an enum, same reasoning as every
 // other `flags` type below.
-module Rights {
+mod Rights {
   pub const FD_DATASYNC: u64 = 0x1;
   pub const FD_READ: u64 = 0x2;
   pub const FD_SEEK: u64 = 0x4;
@@ -235,7 +235,7 @@ enum Advice: u8 {
 }
 
 // ── `$fdflags` (flags, u16) ──────────────────────────────────────────────────
-module Fdflags {
+mod Fdflags {
   pub const APPEND: u16 = 0x1;
   pub const DSYNC: u16 = 0x2;
   pub const NONBLOCK: u16 = 0x4;
@@ -253,7 +253,7 @@ struct Fdstat {
 }
 
 // ── `$fstflags` (flags, u16) ─────────────────────────────────────────────────
-module Fstflags {
+mod Fstflags {
   pub const ATIM: u16 = 0x1;
   pub const ATIM_NOW: u16 = 0x2;
   pub const MTIM: u16 = 0x4;
@@ -261,12 +261,12 @@ module Fstflags {
 }
 
 // ── `$lookupflags` (flags, u32) ──────────────────────────────────────────────
-module Lookupflags {
+mod Lookupflags {
   pub const SYMLINK_FOLLOW: u32 = 0x1;
 }
 
 // ── `$oflags` (flags, u16) ───────────────────────────────────────────────────
-module OFlags {
+mod OFlags {
   pub const CREAT: u16 = 0x1;
   pub const DIRECTORY: u16 = 0x2;
   pub const EXCL: u16 = 0x4;
@@ -294,7 +294,7 @@ enum Eventtype: u8 {
 }
 
 // ── `$eventrwflags` (flags, u16) ─────────────────────────────────────────────
-module Eventrwflags {
+mod Eventrwflags {
   pub const FD_READWRITE_HANGUP: u16 = 0x1;
 }
 
@@ -317,7 +317,7 @@ struct Event {
 }
 
 // ── `$subclockflags` (flags, u16) ────────────────────────────────────────────
-module Subclockflags {
+mod Subclockflags {
   pub const SUBSCRIPTION_CLOCK_ABSTIME: u16 = 0x1;
 }
 
@@ -397,17 +397,17 @@ enum Signal: u8 {
 }
 
 // ── `$riflags` / `$roflags` (flags, u16) ─────────────────────────────────────
-module Riflags {
+mod Riflags {
   pub const RECV_PEEK: u16 = 0x1;
   pub const RECV_WAITALL: u16 = 0x2;
 }
 
-module Roflags {
+mod Roflags {
   pub const RECV_DATA_TRUNCATED: u16 = 0x1;
 }
 
 // ── `$sdflags` (flags, u8) ────────────────────────────────────────────────────
-module Sdflags {
+mod Sdflags {
   pub const RD: u8 = 0x1;
   pub const WR: u8 = 0x2;
 }
@@ -558,11 +558,11 @@ impl Allocator for BumpAllocator {
   type Mem = heap;
 
   fn reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align);
-    local new_end = ptr + layout.size;
-    local cur_end = heap.size() * PAGE_SIZE;
+    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align());
+    local new_end = ptr + layout.size();
+    local cur_end = heap.size_bytes();
     if new_end > cur_end {
-      local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+      local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
       if heap.grow(needed) == -1 { unreachable }
     }
     bump = new_end as *u8;

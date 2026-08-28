@@ -90,9 +90,11 @@ pub enum Token {
 	LeftArrow,
 	LeftArrowEq,
 	DoubleLeftArrow,
+	DoubleLeftArrowEq,
 	RightArrow,
 	RightArrowEq,
 	DoubleRightArrow,
+	DoubleRightArrowEq,
 	Plus,
 	PlusEq,
 	Minus,
@@ -105,15 +107,17 @@ pub enum Token {
 	PercentEq,
 	Amper,
 	DoubleAmper,
+	AmperEq,
 	Vbar,
 	DoubleVbar,
+	VbarEq,
 	Caret,
+	CaretEq,
 	Hash,
 	MinusRightArrow,
 	// Special
 	Comment,
 	DocComment,
-	Whitespace,
 	Unknown,
 	Eof,
 }
@@ -146,9 +150,11 @@ impl std::fmt::Display for Token {
 			LeftArrow => "<",
 			LeftArrowEq => "<=",
 			DoubleLeftArrow => "<<",
+			DoubleLeftArrowEq => "<<=",
 			RightArrow => ">",
 			RightArrowEq => ">=",
 			DoubleRightArrow => ">>",
+			DoubleRightArrowEq => ">>=",
 			Plus => "+",
 			PlusEq => "+=",
 			Minus => "-",
@@ -161,14 +167,16 @@ impl std::fmt::Display for Token {
 			PercentEq => "%=",
 			Amper => "&",
 			DoubleAmper => "&&",
+			AmperEq => "&=",
 			Vbar => "|",
 			DoubleVbar => "||",
+			VbarEq => "|=",
 			Caret => "^",
+			CaretEq => "^=",
 			Hash => "#",
 			MinusRightArrow => "->",
 			Comment => "comment",
 			DocComment => "doc comment",
-			Whitespace => "whitespace",
 			Unknown => "unknown token",
 			Eof => "end of file",
 		};
@@ -420,9 +428,24 @@ fn report_invalid_attribute(
 		)
 }
 
-struct Lexer<'a> {
-	chars: std::str::Chars<'a>,
-	offset: usize,
+/// Benchmark hook (see `benches/lexer.rs`): lex `src` to EOF and return the
+/// token count. Gated behind the `bench` feature — not part of the public API.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub fn bench_lex_to_eof(src: &str) -> usize {
+	let mut lexer = Lexer::new(src);
+	let mut count = 0usize;
+	loop {
+		count += 1;
+		if lexer.next().inner == Token::Eof {
+			return count;
+		}
+	}
+}
+
+struct Lexer<'src> {
+	chars: std::str::Chars<'src>,
+	src_len: usize,
 	peeked: Option<Spanned<Token>>,
 	comments: Vec<Comment>,
 	has_crlf: bool,
@@ -430,15 +453,20 @@ struct Lexer<'a> {
 
 const EOF: char = '\0';
 
-impl<'a> Lexer<'a> {
-	fn new(input: &'a str) -> Lexer<'a> {
+impl<'src> Lexer<'src> {
+	fn new(input: &'src str) -> Lexer<'src> {
 		Lexer {
 			chars: input.chars(),
-			offset: 0,
+			src_len: input.len(),
 			peeked: None,
 			comments: Vec::new(),
 			has_crlf: false,
 		}
+	}
+
+	/// Current byte offset into the source.
+	fn offset(&self) -> usize {
+		self.src_len - self.chars.as_str().len()
 	}
 
 	fn peek(&mut self) -> Spanned<Token> {
@@ -478,7 +506,6 @@ impl<'a> Lexer<'a> {
 		loop {
 			let token = self.advance();
 			match token.inner {
-				Token::Whitespace => continue,
 				Token::Comment => {
 					self.comments.push(Comment {
 						span: token.span,
@@ -517,11 +544,29 @@ impl<'a> Lexer<'a> {
 	}
 
 	fn advance(&mut self) -> Spanned<Token> {
-		let start = self.chars.as_str().len();
+		// Whitespace never becomes a token — skip it here instead of
+		// round-tripping it through the dispatch below only for `next` to
+		// discard the result and loop. Scan on a local cursor (see
+		// `eat_while`) so the skip costs one `self.chars` store, not one
+		// per whitespace char.
+		let mut cursor = self.chars.clone();
+		loop {
+			let mut probe = cursor.clone();
+			match probe.next() {
+				Some(' ' | '\t' | '\n') => cursor = probe,
+				Some('\r') => {
+					self.has_crlf = true;
+					cursor = probe;
+				}
+				_ => break,
+			}
+		}
+		self.chars = cursor;
+
+		let start = self.offset() as u32;
 		let token = match self.chars.next().unwrap_or(EOF) {
 			// Patterns are ordered by frequency of occurrence in typical source code
 			// Most Frequent
-			' ' | '\t' | '\n' => self.consume_whitespace(),
 			'A'..='Z' | 'a'..='z' | '_' => self.consume_identifier(),
 			'0'..='9' => self.consume_number(),
 
@@ -547,10 +592,8 @@ impl<'a> Lexer<'a> {
 			'<' => self.consume_open_angle(),
 			'>' => self.consume_close_angle(),
 			'!' => self.consume_and_check('=', Token::BangEq, Token::Bang),
-			'&' => {
-				self.consume_and_check('&', Token::DoubleAmper, Token::Amper)
-			}
-			'|' => self.consume_and_check('|', Token::DoubleVbar, Token::Vbar),
+			'&' => self.consume_amper(),
+			'|' => self.consume_vbar(),
 			'"' => self.consume_string(),
 
 			// Less Frequent
@@ -558,18 +601,11 @@ impl<'a> Lexer<'a> {
 			'%' => {
 				self.consume_and_check('=', Token::PercentEq, Token::Percent)
 			}
-			'^' => Token::Caret,
-			'\r' => {
-				self.has_crlf = true;
-				self.consume_whitespace()
-			}
+			'^' => self.consume_and_check('=', Token::CaretEq, Token::Caret),
 			'\0' => Token::Eof,
 			_ => Token::Unknown,
 		};
-		let length = start - self.chars.as_str().len();
-		let span =
-			TextSpan::new(self.offset as u32, (self.offset + length) as u32);
-		self.offset += length;
+		let span = TextSpan::new(start, self.offset() as u32);
 
 		Spanned { inner: token, span }
 	}
@@ -591,9 +627,38 @@ impl<'a> Lexer<'a> {
 	}
 
 	#[inline]
+	fn consume_amper(&mut self) -> Token {
+		match self.chars.clone().next().unwrap_or(EOF) {
+			'&' => {
+				_ = self.chars.next();
+				Token::DoubleAmper
+			}
+			'=' => {
+				_ = self.chars.next();
+				Token::AmperEq
+			}
+			_ => Token::Amper,
+		}
+	}
+
+	#[inline]
+	fn consume_vbar(&mut self) -> Token {
+		match self.chars.clone().next().unwrap_or(EOF) {
+			'|' => {
+				_ = self.chars.next();
+				Token::DoubleVbar
+			}
+			'=' => {
+				_ = self.chars.next();
+				Token::VbarEq
+			}
+			_ => Token::Vbar,
+		}
+	}
+
+	#[inline]
 	fn consume_dash(&mut self) -> Token {
-		let mut lookahead = self.chars.clone();
-		match lookahead.next().unwrap_or(EOF) {
+		match self.chars.clone().next().unwrap_or(EOF) {
 			'=' => {
 				_ = self.chars.next();
 				Token::MinusEq
@@ -608,15 +673,20 @@ impl<'a> Lexer<'a> {
 
 	#[inline]
 	fn consume_open_angle(&mut self) -> Token {
-		let mut lookahead = self.chars.clone();
-		match lookahead.next().unwrap_or(EOF) {
+		match self.chars.clone().next().unwrap_or(EOF) {
 			'=' => {
 				_ = self.chars.next();
 				Token::LeftArrowEq
 			}
 			'<' => {
 				_ = self.chars.next();
-				Token::DoubleLeftArrow
+				match self.chars.clone().next().unwrap_or(EOF) {
+					'=' => {
+						_ = self.chars.next();
+						Token::DoubleLeftArrowEq
+					}
+					_ => Token::DoubleLeftArrow,
+				}
 			}
 			_ => Token::LeftArrow,
 		}
@@ -624,15 +694,20 @@ impl<'a> Lexer<'a> {
 
 	#[inline]
 	fn consume_close_angle(&mut self) -> Token {
-		let mut lookahead = self.chars.clone();
-		match lookahead.next().unwrap_or(EOF) {
+		match self.chars.clone().next().unwrap_or(EOF) {
 			'=' => {
 				_ = self.chars.next();
 				Token::RightArrowEq
 			}
 			'>' => {
 				_ = self.chars.next();
-				Token::DoubleRightArrow
+				match self.chars.clone().next().unwrap_or(EOF) {
+					'=' => {
+						_ = self.chars.next();
+						Token::DoubleRightArrowEq
+					}
+					_ => Token::DoubleRightArrow,
+				}
 			}
 			_ => Token::RightArrow,
 		}
@@ -652,87 +727,85 @@ impl<'a> Lexer<'a> {
 		first
 	}
 
-	fn consume_identifier(&mut self) -> Token {
-		let lookahead = self.chars.clone();
-		for ch in lookahead {
-			match ch {
-				'A'..='Z' | 'a'..='z' | '0'..='9' | '_' => {
-					_ = self.chars.next();
-				}
+	/// Advance past each following char for which `pred` holds, leaving
+	/// `self.chars` on the first char that doesn't (or at end of input).
+	#[inline]
+	fn eat_while(&mut self, pred: impl Fn(char) -> bool) {
+		// Scan on a local cursor and write `self.chars` back once, rather
+		// than restoring it through `&mut self` after every char — the
+		// latter forces a store to the `Lexer` struct per iteration.
+		let mut cursor = self.chars.clone();
+		loop {
+			let mut probe = cursor.clone();
+			match probe.next() {
+				Some(ch) if pred(ch) => cursor = probe,
 				_ => break,
 			}
 		}
+		self.chars = cursor;
+	}
 
+	#[inline]
+	fn consume_identifier(&mut self) -> Token {
+		self.eat_while(
+			|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'),
+		);
 		Token::Identifier
 	}
 
-	fn consume_whitespace(&mut self) -> Token {
-		let lookahead = self.chars.clone();
-		for ch in lookahead {
-			match ch {
-				' ' | '\t' | '\n' => {
-					_ = self.chars.next();
-				}
-				'\r' => {
-					self.has_crlf = true;
-					_ = self.chars.next();
-				}
-				_ => break,
-			}
-		}
-		Token::Whitespace
-	}
-
 	fn consume_number(&mut self) -> Token {
-		let radix_marker = self.chars.clone().next();
-		match radix_marker {
+		match self.chars.clone().next() {
 			Some('b' | 'B') => {
 				_ = self.chars.next();
-				let lookahead = self.chars.clone();
-				for ch in lookahead {
-					match ch {
-						'0' | '1' | '_' => {
-							_ = self.chars.next();
-						}
-						_ => break,
-					}
-				}
+				self.eat_while(|ch| matches!(ch, '0' | '1' | '_'));
 				return Token::Int;
 			}
 			Some('x' | 'X') => {
 				_ = self.chars.next();
-				let lookahead = self.chars.clone();
-				for ch in lookahead {
-					match ch {
-						'0'..='9' | 'a'..='f' | 'A'..='F' | '_' => {
-							_ = self.chars.next();
-						}
-						_ => break,
-					}
-				}
+				self.eat_while(|ch| ch.is_ascii_hexdigit() || ch == '_');
 				return Token::Int;
 			}
 			_ => {}
 		}
 
+		// See `eat_while`: scan locally, store `self.chars` back once.
 		let mut seen_dot = false;
-		let mut lookahead = self.chars.clone();
-		while let Some(ch) = lookahead.next() {
-			match ch {
-				'0'..='9' | '_' => {
-					_ = self.chars.next();
-				}
-				'.' if !seen_dot => {
-					// Don't consume if this is `..` (range operator).
-					let mut after = lookahead.clone();
-					if after.next() == Some('.') {
+		let mut cursor = self.chars.clone();
+		loop {
+			let mut probe = cursor.clone();
+			match probe.next() {
+				Some('0'..='9' | '_') => cursor = probe,
+				Some('.') if !seen_dot => {
+					// `probe` is now past the `.`; don't consume it if the
+					// next char is also `.` (the `..` range operator).
+					if probe.clone().next() == Some('.') {
 						break;
 					}
 					seen_dot = true;
-					_ = self.chars.next();
+					cursor = probe;
 				}
 				_ => break,
 			}
+		}
+		self.chars = cursor;
+
+		// Scientific notation: `e`/`E` right after a numeric literal is
+		// always an exponent — there's no valid grammar where an
+		// identifier can immediately follow a number with no operator
+		// between them — so commit unconditionally rather than
+		// backtracking. An empty/sign-only exponent (`1e`, `1e+`) still
+		// lexes as a single malformed Float token, which falls straight
+		// into the same `report_invalid_float_literal` diagnostic
+		// `parse_float_expression` already raises for any span
+		// `str::parse::<f64>` rejects — no separate error handling needed
+		// here.
+		if let Some('e' | 'E') = self.chars.clone().next() {
+			_ = self.chars.next();
+			if let Some('+' | '-') = self.chars.clone().next() {
+				_ = self.chars.next();
+			}
+			self.eat_while(|ch| ch.is_ascii_digit() || ch == '_');
+			return Token::Float;
 		}
 
 		match seen_dot {
@@ -766,22 +839,11 @@ impl<'a> Lexer<'a> {
 	}
 
 	fn consume_slash(&mut self) -> Token {
-		let mut lookahead = self.chars.clone();
-		match lookahead.next().unwrap_or(EOF) {
+		match self.chars.clone().next().unwrap_or(EOF) {
 			'/' => {
 				_ = self.chars.next(); // consume second /
-				// Peek at third char without advancing lookahead — advancing
-				// it here would put lookahead one step ahead of self.chars,
-				// causing the while loop below to drop the last comment char.
-				let is_doc = lookahead.clone().next().unwrap_or(EOF) == '/';
-				for ch in lookahead {
-					match ch {
-						'\n' | EOF => break,
-						_ => {
-							_ = self.chars.next();
-						}
-					}
-				}
+				let is_doc = self.chars.clone().next().unwrap_or(EOF) == '/';
+				self.eat_while(|ch| !matches!(ch, '\n' | EOF));
 				if is_doc {
 					Token::DocComment
 				} else {
@@ -824,6 +886,11 @@ pub enum BinaryOp {
 	MulAssign,
 	DivAssign,
 	RemAssign,
+	BitAndAssign,
+	BitOrAssign,
+	BitXorAssign,
+	LeftShiftAssign,
+	RightShiftAssign,
 	// Bitwise
 	BitAnd,
 	BitOr,
@@ -854,6 +921,11 @@ impl BinaryOp {
 			BinaryOp::MulAssign => "*=",
 			BinaryOp::DivAssign => "/=",
 			BinaryOp::RemAssign => "%=",
+			BinaryOp::BitAndAssign => "&=",
+			BinaryOp::BitOrAssign => "|=",
+			BinaryOp::BitXorAssign => "^=",
+			BinaryOp::LeftShiftAssign => "<<=",
+			BinaryOp::RightShiftAssign => ">>=",
 			BinaryOp::BitAnd => "&",
 			BinaryOp::BitOr => "|",
 			BinaryOp::BitXor => "^",
@@ -897,6 +969,11 @@ impl TryFrom<Token> for BinaryOp {
 			Token::StarEq => Ok(BinaryOp::MulAssign),
 			Token::SlashEq => Ok(BinaryOp::DivAssign),
 			Token::PercentEq => Ok(BinaryOp::RemAssign),
+			Token::AmperEq => Ok(BinaryOp::BitAndAssign),
+			Token::VbarEq => Ok(BinaryOp::BitOrAssign),
+			Token::CaretEq => Ok(BinaryOp::BitXorAssign),
+			Token::DoubleLeftArrowEq => Ok(BinaryOp::LeftShiftAssign),
+			Token::DoubleRightArrowEq => Ok(BinaryOp::RightShiftAssign),
 			// Bitwise
 			Token::Amper => Ok(BinaryOp::BitAnd),
 			Token::Vbar => Ok(BinaryOp::BitOr),
@@ -1487,13 +1564,15 @@ pub enum TraitItem {
 		/// implementation.
 		body: Option<Box<Spanned<Expression>>>,
 	},
-	/// An associated constant declaration (type only, no value — value comes
-	/// from impl).
+	/// An associated constant declaration, with an optional default value.
+	/// `None` = abstract (must be provided by every impl); `Some` = a
+	/// default value impls may omit and inherit as-is.
 	Const {
 		id: DefId,
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		ty: Box<Spanned<TypeExpression>>,
+		value: Option<Box<Spanned<Expression>>>,
 	},
 	/// An associated type declaration: `type Name;` or `type Name: Bound1 +
 	/// Bound2;` The concrete type is provided by each impl; bounds
@@ -1524,6 +1603,43 @@ pub struct FunctionSignature {
 	pub type_params: Box<[TypeParam]>,
 	pub params: Box<[Separated<Spanned<FunctionParam>>]>,
 	pub result: Option<Box<Spanned<TypeExpression>>>,
+}
+
+/// One node of a `use` tree. `use a::b::*` is
+/// `Path{a, Path{b, Glob}}`; `use a::{b, c::*}` is `Path{a, Group[Name{b},
+/// Path{c, Glob}]}`.
+///
+/// The two leaf kinds resolve at different times, which is why they stay
+/// distinct all the way into TIR rather than collapsing into one "import"
+/// node: a `Glob` has to be registered during prescan (`lookup_global_symbol`
+/// consults `wildcard_imports` throughout Phase 2, so one registered later
+/// would be invisible to earlier lookups), while a `Name` *cannot* be
+/// resolved that early — files are prescanned in order, so `use math::add;`
+/// in `main.wx` runs before `math.wx`'s items exist.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum UseTree {
+	/// `*` — every visible name in the namespace walked to so far.
+	Glob,
+	/// A single imported name, optionally renamed: `add`, `add as plus`.
+	/// Carries its own `DefId` — this leaf is what binds a local name, so
+	/// it is what `claim_name_binding` and `item_lookup` key on.
+	Name {
+		id: DefId,
+		name: Spanned<SymbolU32>,
+		alias: Option<Spanned<SymbolU32>>,
+	},
+	/// One `::`-separated segment and whatever follows it.
+	Path {
+		segment: Spanned<SymbolU32>,
+		rest: Box<Spanned<UseTree>>,
+	},
+	/// `{ .. }` — several subtrees sharing the prefix walked to so far.
+	/// `Separated<Spanned<_>>` is what `SeparatedGroup::parse` returns, and
+	/// matches `ExportEntry`'s shape. Nothing reads the separator spans: a
+	/// `use` group is formatted on one line, so it never emits a trailing
+	/// comma the way a broken `export` block does.
+	Group(Box<[Separated<Spanned<UseTree>>]>),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1624,6 +1740,13 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 	},
 	Export {
+		id: DefId,
+		/// Span of the `export` keyword alone. The block's invariants —
+		/// only one, at the package root, not in a library — are properties
+		/// of the block itself rather than of any name it lists, so they
+		/// need a span that doesn't belong to an entry. It's also the only
+		/// span an empty `export { }` has.
+		keyword_span: TextSpan,
 		entries: Box<[Separated<Spanned<ExportEntry>>]>,
 	},
 	Import {
@@ -1703,10 +1826,17 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 		members: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
-	/// `use path::*;` — wildcard import; brings all public items from the namespace into scope.
+	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
+	/// brings names from another namespace into this one.
+	///
+	/// The `DefId` lives on each `UseTree::Name` leaf rather than here: one
+	/// `use` item can bind several names, and `ensure_signature` keys its
+	/// compute state — and `item_lookup` its declaration span — per `DefId`.
+	/// A leaf is the thing that binds a name, so a leaf is the thing that
+	/// gets an id.
 	Use {
 		pub_span: Option<TextSpan>,
-		path: Box<[Spanned<SymbolU32>]>,
+		tree: Spanned<UseTree>,
 	},
 	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
@@ -1817,6 +1947,11 @@ impl From<BinaryOp> for BindingPower {
 			BinaryOp::MulAssign => BindingPower::Assignment,
 			BinaryOp::DivAssign => BindingPower::Assignment,
 			BinaryOp::RemAssign => BindingPower::Assignment,
+			BinaryOp::BitAndAssign => BindingPower::Assignment,
+			BinaryOp::BitOrAssign => BindingPower::Assignment,
+			BinaryOp::BitXorAssign => BindingPower::Assignment,
+			BinaryOp::LeftShiftAssign => BindingPower::Assignment,
+			BinaryOp::RightShiftAssign => BindingPower::Assignment,
 
 			BinaryOp::Or => BindingPower::LogicalOr,
 			BinaryOp::And => BindingPower::LogicalAnd,
@@ -1870,7 +2005,7 @@ pub enum Keyword {
 	Pub,
 	Memory,
 	Const,
-	Module,
+	Mod,
 	Trait,
 	For,
 	SelfType,
@@ -1882,6 +2017,14 @@ pub enum Keyword {
 	Underscore,
 	Use,
 	Where,
+	/// `crate` — a path root, resolved to a real `SymbolKind::Module` entry
+	/// every namespace is pre-populated with at creation (see
+	/// `tir::builder::create_module_namespace` and the package-root setup
+	/// in `tir::builder::build`), not special-cased in the parser beyond
+	/// being accepted as ordinary path-segment text.
+	Crate,
+	/// `super` — same story as `Crate`, one parent-hop per namespace.
+	Super,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -1912,7 +2055,7 @@ impl TryFrom<&str> for Keyword {
 			"pub" => Ok(Keyword::Pub),
 			"memory" => Ok(Keyword::Memory),
 			"const" => Ok(Keyword::Const),
-			"module" => Ok(Keyword::Module),
+			"mod" => Ok(Keyword::Mod),
 			"trait" => Ok(Keyword::Trait),
 			"for" => Ok(Keyword::For),
 			"Self" => Ok(Keyword::SelfType),
@@ -1922,6 +2065,8 @@ impl TryFrom<&str> for Keyword {
 			"_" => Ok(Keyword::Underscore),
 			"use" => Ok(Keyword::Use),
 			"where" => Ok(Keyword::Where),
+			"crate" => Ok(Keyword::Crate),
+			"super" => Ok(Keyword::Super),
 			_ => Err(()),
 		}
 	}
@@ -2206,7 +2351,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Struct) => Ok(Parser::parse_struct_item),
 			Some(Keyword::Memory) => Ok(Parser::parse_memory_item),
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
-			Some(Keyword::Module) => Ok(Parser::parse_module_item),
+			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
@@ -2266,6 +2411,27 @@ impl<'ctx> Parser<'ctx> {
 	fn intern_identifier(&mut self, span: TextSpan) -> SymbolU32 {
 		let text = span.extract_str(self.source);
 		if Keyword::try_from(text).is_ok() {
+			self.ast
+				.diagnostics
+				.push(report_reserved_identifier(self.ast.file_id, span));
+		}
+
+		self.interner.get_or_intern(text)
+	}
+
+	/// Same as [`Self::intern_identifier`], for a `::`-path segment
+	/// specifically: `crate`/`super` are reserved everywhere else, but
+	/// legal here at any position — the resolver pre-populates every
+	/// namespace's own symbol table with `crate`/`super` entries
+	/// (`tir::builder::create_module_namespace` and the package-root setup
+	/// in `tir::builder::build`), so a path segment spelled `crate`/`super`
+	/// just needs to intern to the same text an ordinary reference would.
+	fn intern_path_segment(&mut self, span: TextSpan) -> SymbolU32 {
+		let text = span.extract_str(self.source);
+		if !matches!(
+			Keyword::try_from(text),
+			Ok(Keyword::Crate) | Ok(Keyword::Super) | Err(())
+		) {
 			self.ast
 				.diagnostics
 				.push(report_reserved_identifier(self.ast.file_id, span));
@@ -2751,7 +2917,7 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 	) -> Result<Spanned<Box<[PathSegment]>>, ()> {
 		let first_span = self.next_expect(Token::Identifier)?.span;
-		let first_sym = self.intern_identifier(first_span);
+		let first_sym = self.intern_path_segment(first_span);
 		let mut segments: Vec<PathSegment> = vec![PathSegment {
 			ident: Spanned {
 				inner: first_sym,
@@ -2771,7 +2937,7 @@ impl<'ctx> Parser<'ctx> {
 				}
 				Token::Identifier => {
 					let seg_span = self.next_expect(Token::Identifier)?.span;
-					let seg_sym = self.intern_identifier(seg_span);
+					let seg_sym = self.intern_path_segment(seg_span);
 					segments.push(PathSegment {
 						ident: Spanned {
 							inner: seg_sym,
@@ -2872,10 +3038,18 @@ impl<'ctx> Parser<'ctx> {
 					Ok(Keyword::Fn) => {
 						return Parser::parse_function_type_expression(self);
 					}
-					Ok(Keyword::SelfType) => {
-						// `Self` is valid in type paths for `Self::AssocType`, etc.
+					// `Self` is valid in type paths for `Self::AssocType`, etc.;
+					// `crate`/`super` are path roots the resolver
+					// pre-populates every namespace with (see
+					// `intern_path_segment`) — none of the three are ever
+					// reserved here, so they intern like ordinary text.
+					Ok(Keyword::SelfType)
+					| Ok(Keyword::Crate)
+					| Ok(Keyword::Super) => {
 						let tok = self.lexer.next();
-						let sym = self.interner.get_or_intern("Self");
+						let sym = self
+							.interner
+							.get_or_intern(tok.span.extract_str(self.source));
 						(tok, sym)
 					}
 					_ => {
@@ -2929,7 +3103,8 @@ impl<'ctx> Parser<'ctx> {
 						}
 						Token::Identifier => {
 							let seg_tok = self.lexer.next();
-							let seg_sym = self.intern_identifier(seg_tok.span);
+							let seg_sym =
+								self.intern_path_segment(seg_tok.span);
 							path_end = seg_tok.span.end;
 							segments.push(PathSegment {
 								ident: Spanned {
@@ -3303,7 +3478,12 @@ impl<'ctx> Parser<'ctx> {
 			| Token::MinusEq
 			| Token::StarEq
 			| Token::SlashEq
-			| Token::PercentEq => Some((
+			| Token::PercentEq
+			| Token::AmperEq
+			| Token::VbarEq
+			| Token::CaretEq
+			| Token::DoubleLeftArrowEq
+			| Token::DoubleRightArrowEq => Some((
 				Parser::parse_binary_expression,
 				BindingPower::Assignment,
 			)),
@@ -3449,6 +3629,8 @@ impl<'ctx> Parser<'ctx> {
 			Ok(Keyword::SelfKw)
 			| Ok(Keyword::SelfType)
 			| Ok(Keyword::Underscore)
+			| Ok(Keyword::Crate)
+			| Ok(Keyword::Super)
 			| Err(_) => {}
 			Ok(_) => {
 				parser.ast.diagnostics.push(report_reserved_identifier(
@@ -4701,6 +4883,8 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Export {
+				id: parser.id_generator.generate(),
+				keyword_span: export_keyword.span,
 				entries: entries.inner,
 			},
 			span,
@@ -5064,8 +5248,21 @@ impl<'ctx> Parser<'ctx> {
 								parser.intern_identifier(name_span);
 							parser.next_expect(Token::Colon)?;
 							let ty = parser.parse_type_expression()?;
-							let span =
-								TextSpan::new(const_span.start, ty.span.end);
+							let value =
+								if parser.lexer.next_if(Token::Eq).is_some() {
+									Some(Box::new(parser.parse_expression(
+										BindingPower::Default,
+									)?))
+								} else {
+									None
+								};
+							let span = TextSpan::new(
+								const_span.start,
+								match &value {
+									Some(value) => value.span.end,
+									None => ty.span.end,
+								},
+							);
 							Ok(Spanned {
 								inner: TraitItem::Const {
 									id: parser.id_generator.generate(),
@@ -5074,6 +5271,7 @@ impl<'ctx> Parser<'ctx> {
 										span: name_span,
 									},
 									ty: Box::new(ty),
+									value,
 									attributes,
 								},
 								span,
@@ -5495,7 +5693,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	fn parse_module_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
-		let module_span = parser.lexer.next().span; // consume `module`
+		let module_span = parser.lexer.next().span; // consume `mod`
 
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let name_symbol = parser.intern_identifier(name_span);
@@ -5541,40 +5739,95 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_use_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let use_span = parser.lexer.next().span; // consume `use`
 
-		let mut path: Vec<Spanned<SymbolU32>> = Vec::new();
+		// The trailing `;` is deliberately left for the caller: top-level
+		// items are separated by `SemiColon` at the group level (see
+		// `parse_module_item`).
+		let tree = Self::parse_use_tree(parser)?;
 
-		loop {
-			let token = parser.next_expect(Token::Identifier)?;
-			let symbol = parser.intern_identifier(token.span);
-			path.push(Spanned {
-				inner: symbol,
-				span: token.span,
+		Ok(Spanned {
+			span: TextSpan::new(use_span.start, tree.span.end),
+			inner: Item::Use {
+				pub_span: None,
+				tree,
+			},
+		})
+	}
+
+	/// One node of a `use` tree, recursing on `::` and `{ .. }`.
+	///
+	/// `a::b` is left-nested as `Path{a, Path{b, ..}}` rather than collected
+	/// into a flat prefix + leaf, because a `Group` can appear at any depth
+	/// (`a::{b::{c, d}, e}`) — there is no single prefix to collect.
+	fn parse_use_tree(parser: &mut Parser) -> Result<Spanned<UseTree>, ()> {
+		let token = parser.lexer.peek();
+
+		if token.inner == Token::Star {
+			let span = parser.lexer.next().span;
+			return Ok(Spanned {
+				inner: UseTree::Glob,
+				span,
 			});
-
-			if parser.lexer.peek().inner != Token::ColonColon {
-				break;
-			}
-			parser.lexer.next(); // consume `::`
-
-			if parser.lexer.peek().inner == Token::Star {
-				let end = parser.lexer.next().span.end; // consume `*`
-				return Ok(Spanned {
-					inner: Item::Use {
-						pub_span: None,
-						path: path.into_boxed_slice(),
-					},
-					span: TextSpan::new(use_span.start, end),
-				});
-			}
 		}
 
-		// Reached end without `*` — invalid, only `use path::*` is supported.
-		parser.ast.diagnostics.push(report_unexpected_token(
-			parser.ast.file_id,
-			parser.lexer.peek(),
-			Token::Star,
-		));
-		Err(())
+		if token.inner == Token::OpenBrace {
+			let group = SeparatedGroup {
+				open_token: Token::OpenBrace,
+				close_token: Token::CloseBrace,
+				separator_token: Token::Comma,
+				item_handler: Self::parse_use_tree,
+				should_warn_missing_separator: None,
+			}
+			.parse(parser)?;
+			return Ok(Spanned {
+				inner: UseTree::Group(group.inner),
+				span: group.span,
+			});
+		}
+
+		let name_token = parser.next_expect(Token::Identifier)?;
+		let name = Spanned {
+			inner: parser.intern_path_segment(name_token.span),
+			span: name_token.span,
+		};
+
+		// `::` — this identifier is a segment, not the leaf.
+		if parser.lexer.peek().inner == Token::ColonColon {
+			parser.lexer.next(); // consume `::`
+			let rest = Self::parse_use_tree(parser)?;
+			return Ok(Spanned {
+				span: TextSpan::new(name.span.start, rest.span.end),
+				inner: UseTree::Path {
+					segment: name,
+					rest: Box::new(rest),
+				},
+			});
+		}
+
+		// Leaf: a name, optionally renamed. Unlike an export alias — which
+		// renames into the wasm ABI and so takes a string — this renames
+		// into wx's own scope, so it takes an identifier.
+		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
+			parser.lexer.next(); // consume `as`
+			let alias_token = parser.next_expect(Token::Identifier)?;
+			Some(Spanned {
+				inner: parser.intern_identifier(alias_token.span),
+				span: alias_token.span,
+			})
+		} else {
+			None
+		};
+
+		Ok(Spanned {
+			span: TextSpan::new(
+				name.span.start,
+				alias.map_or(name.span.end, |a| a.span.end),
+			),
+			inner: UseTree::Name {
+				id: parser.id_generator.generate(),
+				name,
+				alias,
+			},
+		})
 	}
 
 	fn parse_import_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {

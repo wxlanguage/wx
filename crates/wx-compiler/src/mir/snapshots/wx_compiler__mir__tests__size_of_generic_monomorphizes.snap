@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 404
+  - id: 471
     signature_index: 0
     scopes:
       - kind: Block
@@ -20,7 +20,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 410
+                        id: 479
                     ty:
                       Function:
                         signature_index: 0
@@ -28,7 +28,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 405
+  - id: 472
     signature_index: 0
     scopes:
       - kind: Block
@@ -45,7 +45,7 @@ functions:
                   callee:
                     kind:
                       Function:
-                        id: 411
+                        id: 480
                     ty:
                       Function:
                         signature_index: 0
@@ -53,7 +53,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 410
+  - id: 479
     signature_index: 0
     scopes:
       - kind: Block
@@ -71,7 +71,7 @@ functions:
               ty: U32
       ty: U32
     static_data: []
-  - id: 411
+  - id: 480
     signature_index: 0
     scopes:
       - kind: Block
@@ -98,55 +98,127 @@ signatures:
       - F32
     params_count: 1
   - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - I32
-      - I32
-      - I32
-    params_count: 2
-  - items:
-      - I32
-      - I32
-    params_count: 1
-  - items:
-      - U32
-      - U32
-      - U32
-    params_count: 2
-  - items:
-      - U32
-      - U32
-    params_count: 1
-  - items:
-      - I64
-      - I64
-      - I64
-    params_count: 2
-  - items:
-      - I64
-      - I64
-    params_count: 1
-  - items:
-      - U64
-      - U64
-      - U64
-    params_count: 2
-  - items:
-      - U64
-      - U64
-    params_count: 1
-  - items:
       - F32
       - F32
       - F32
     params_count: 2
   - items:
+      - F32
+      - I32
+    params_count: 1
+  - items:
+      - F32
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F32
+    params_count: 1
+  - items:
+      - U32
+      - F32
+    params_count: 1
+  - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - I64
+    params_count: 1
+  - items:
+      - F32
+      - U64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
       - F64
       - F64
       - F64
     params_count: 2
+  - items:
+      - F64
+      - I64
+    params_count: 1
+  - items:
+      - F64
+      - U64
+    params_count: 1
+  - items:
+      - I64
+      - F64
+    params_count: 1
+  - items:
+      - U64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F64
+    params_count: 1
+  - items:
+      - I32
+      - I32
+      - I32
+    params_count: 2
+  - items:
+      - I32
+      - I32
+    params_count: 1
+  - items:
+      - U32
+      - F64
+    params_count: 1
+  - items:
+      - U32
+      - U32
+      - U32
+    params_count: 2
+  - items:
+      - U32
+      - U32
+    params_count: 1
+  - items:
+      - I64
+      - F32
+    params_count: 1
+  - items:
+      - I64
+      - I64
+      - I64
+    params_count: 2
+  - items:
+      - I64
+      - I64
+    params_count: 1
+  - items:
+      - U64
+      - F32
+    params_count: 1
+  - items:
+      - U64
+      - U64
+      - U64
+    params_count: 2
+  - items:
+      - U64
+      - U64
+    params_count: 1
   - items:
       - I8
       - I8
@@ -195,14 +267,14 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 404
-      name: 205
+      id: 471
+      name: 243
   - Function:
-      id: 405
-      name: 206
+      id: 472
+      name: 244
 imports: []
 memories:
-  - id: 402
+  - id: 469
     source: Internal
     kind: Memory32
     min_pages: ~

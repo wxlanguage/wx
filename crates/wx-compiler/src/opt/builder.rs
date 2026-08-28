@@ -85,9 +85,14 @@ impl<'mir> Builder<'mir> {
 		// one slot each.
 		let mut wasm_idx = 0u32;
 		for (i, local) in root_scope.locals[..params_count].iter().enumerate() {
-			data_bindings[i] = StackResult::Value(
-				self.build_param_value(local.ty, &mut wasm_idx),
-			);
+			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
+			// WASM param slot — see the matching case in `build_call`.
+			data_bindings[i] = match local.ty {
+				mir::Type::Unit | mir::Type::Never => StackResult::Unit,
+				ty => StackResult::Value(
+					self.build_param_value(ty, &mut wasm_idx),
+				),
+			};
 		}
 		for (i, local) in root_scope.locals[params_count..].iter().enumerate() {
 			data_bindings[params_count + i] = self.default_value(local.ty);
@@ -297,7 +302,10 @@ impl<'mir> Builder<'mir> {
 			| ExprKind::BitOr { left, right }
 			| ExprKind::BitXor { left, right }
 			| ExprKind::LeftShift { left, right }
-			| ExprKind::RightShift { left, right } => {
+			| ExprKind::RightShift { left, right }
+			| ExprKind::Min { left, right }
+			| ExprKind::Max { left, right }
+			| ExprKind::Copysign { left, right } => {
 				self.build_binary(block_idx, bindings, expr, left, right)
 			}
 
@@ -360,6 +368,15 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(
 					self.node(DataNodeKind::Trunc { operand, ty }),
+				)
+			}
+			ExprKind::Nearest { value } => {
+				let ty = ScalarType::try_from(expr.ty)
+					.expect("Nearest must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Nearest { operand, ty }),
 				)
 			}
 			ExprKind::BitNot { value } => {
@@ -521,6 +538,34 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(
 					self.node(DataNodeKind::F32DemoteF64 { operand }),
+				)
+			}
+			ExprKind::I32ReinterpretF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I32ReinterpretF32 { operand }),
+				)
+			}
+			ExprKind::F32ReinterpretI32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ReinterpretI32 { operand }),
+				)
+			}
+			ExprKind::I64ReinterpretF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I64ReinterpretF64 { operand }),
+				)
+			}
+			ExprKind::F64ReinterpretI64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ReinterpretI64 { operand }),
 				)
 			}
 
@@ -1615,9 +1660,17 @@ impl<'mir> Builder<'mir> {
 		let callee = self
 			.build_expr(block_idx, bindings, callee_expr)
 			.unwrap_value();
+		// Zero-sized arguments (e.g. a `Memory`-typed handle) carry no
+		// runtime bits and occupy no WASM param slot (see
+		// `wasm::flatten_type_to_scalars`'s `Unit`/`Never` case) — drop them
+		// here to match, rather than materializing a nonexistent `Value`.
 		let args: Box<[_]> = arguments
 			.iter()
-			.map(|a| self.build_expr(block_idx, bindings, a).unwrap_value())
+			.filter_map(|a| match self.build_expr(block_idx, bindings, a) {
+				StackResult::Value(idx) => Some(idx),
+				StackResult::Unit => None,
+				StackResult::Never => panic!("expected Value, got Never"),
+			})
 			.collect();
 
 		let result = match result_ty {
@@ -2260,6 +2313,9 @@ impl<'mir> Builder<'mir> {
 			E::LeftShift { .. } => N::Shl { left, right, ty },
 			E::RightShift { .. } if unsigned => N::ShrU { left, right, ty },
 			E::RightShift { .. } => N::ShrS { left, right, ty },
+			E::Min { .. } => N::Min { left, right, ty },
+			E::Max { .. } => N::Max { left, right, ty },
+			E::Copysign { .. } => N::Copysign { left, right, ty },
 			_ => unreachable!("build_binary called on a non-binary ExprKind"),
 		};
 		StackResult::Value(self.node(kind))

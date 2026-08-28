@@ -6,9 +6,10 @@ use tower_lsp_server::ls_types::{
 };
 use wx_compiler::ast::StringInterner;
 use wx_compiler::tir::{
-	ImplEntry, ImplTarget, NamespaceIndex, TIR, TypeFormatter,
+	ImplEntry, ImplTarget, ModuleDeclarationKind, NamespaceIndex, TIR,
+	TypeFormatter,
 };
-use wx_compiler::vfs::FileId;
+use wx_compiler::vfs::{FileId, PackageGraph};
 
 use crate::symbol_index::{ImplRef, SymbolIndex, SymbolKind};
 
@@ -87,11 +88,18 @@ pub fn local_completion_items(
 	tir: &TIR,
 	func_index: usize,
 	interner: &StringInterner,
+	packages: &[PackageGraph],
 	cursor_offset: u32,
 	prefix: &str,
 ) -> Vec<CompletionItem> {
-	let formatter = TypeFormatter::new(tir, interner);
 	let function = &tir.functions[func_index];
+	// Names render as the function's own package sees them.
+	let formatter = TypeFormatter::new(
+		tir,
+		interner,
+		packages,
+		tir.namespaces[function.namespace as usize].package,
+	);
 	let body = match &function.body {
 		Some(b) => b,
 		None => return vec![],
@@ -160,10 +168,29 @@ pub fn local_completion_items(
 
 /// Namespace of the module containing `file_id`, for completion requests
 /// that fall outside any function body (no enclosing-function namespace to
-/// fall back on). Only inline `module foo { }` blocks are missed here —
+/// fall back on). Only inline `mod foo { }` blocks are missed here —
 /// those share the file of their enclosing function, which already carries
 /// the right namespace.
+/// TODO: both halves are linear scans. The right fix is `File::package`
+/// (`vfs::Files` gaining a `PackageId` per file), which turns this into a
+/// `package_namespaces` lookup plus one comparison — blocked only on
+/// `cmd_format`, the one caller that still builds a bare `Files` with no
+/// package.
 fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
+	// A package's entry file has no `mod` declaration of its own — its
+	// scope is the package's root namespace, which records that file id.
+	// Checked first because a compilation holds only a handful of packages,
+	// while `module_decls` grows with every file in it.
+	for &namespace_idx in tir.package_namespaces.values() {
+		if matches!(
+			tir.namespaces[namespace_idx as usize].declaration,
+			ModuleDeclarationKind::Package(package_file)
+				if package_file == file_id
+		) {
+			return Some(namespace_idx);
+		}
+	}
+
 	tir.module_decls
 		.iter()
 		.find(|decl| decl.own_file_id == Some(file_id))
@@ -177,26 +204,20 @@ fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
 /// every reachable namespace instead of stopping at the first name match.
 pub fn visible_namespaces(
 	tir: &TIR,
-	start: Option<NamespaceIndex>,
-) -> HashSet<Option<NamespaceIndex>> {
+	start: NamespaceIndex,
+) -> HashSet<NamespaceIndex> {
 	let mut visible = HashSet::new();
-	let mut current = start;
-	loop {
-		if !visible.insert(current) {
+	let mut current = Some(start);
+	// Running out of parents means we've walked off the top of the package.
+	// Its own root namespace was visited on the way, so its wildcard imports
+	// are already in `visible` — there's no separate root scope to splice in.
+	while let Some(idx) = current {
+		if !visible.insert(idx) {
 			break;
 		}
-		match current {
-			Some(idx) => {
-				let ns = &tir.namespaces[idx as usize];
-				visible.extend(ns.wildcard_imports.iter().map(|&i| Some(i)));
-				current = ns.parent;
-			}
-			None => {
-				visible
-					.extend(tir.root_wildcard_imports.iter().map(|&i| Some(i)));
-				break;
-			}
-		}
+		let ns = &tir.namespaces[idx as usize];
+		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
+		current = ns.parent;
 	}
 	visible
 }
@@ -284,16 +305,16 @@ pub fn global_completion_items(
 	interner: &StringInterner,
 	symbol_index: &SymbolIndex,
 	prefix: &str,
-	visible_from: &HashSet<Option<NamespaceIndex>>,
+	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter_map(|def| {
@@ -342,15 +363,15 @@ pub fn type_completion_items(
 	interner: &StringInterner,
 	symbol_index: &SymbolIndex,
 	prefix: &str,
-	visible_from: &HashSet<Option<NamespaceIndex>>,
+	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter(|def| is_type_like(&def.info.kind))
@@ -482,14 +503,14 @@ fn resolve_bare_name(
 	symbol_index: &SymbolIndex,
 	interner: &StringInterner,
 	name: &str,
-	visible: &HashSet<Option<NamespaceIndex>>,
+	visible: &HashSet<NamespaceIndex>,
 ) -> Option<SymbolKind> {
 	let lower = symbol_index
 		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap_or("") < name);
+		.partition_point(|def| interner.resolve(def.name).unwrap() < name);
 	symbol_index.global_definitions[lower..]
 		.iter()
-		.take_while(|def| interner.resolve(def.name).unwrap_or("") == name)
+		.take_while(|def| interner.resolve(def.name).unwrap() == name)
 		.find(|def| visible.contains(&def.namespace))
 		.map(|def| def.info.kind)
 }
@@ -506,7 +527,7 @@ fn path_completion_items(
 	source: &str,
 	lhs_end: usize,
 	prefix: &str,
-	visible: &HashSet<Option<NamespaceIndex>>,
+	visible: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
 	let lhs_text = &source[..lhs_end];
 	let trimmed_end = lhs_text
@@ -537,7 +558,7 @@ fn path_completion_items(
 		SymbolKind::Namespace(ns_idx) => symbol_index
 			.global_definitions
 			.iter()
-			.filter(|def| def.namespace == Some(ns_idx))
+			.filter(|def| def.namespace == ns_idx)
 			.filter_map(|def| {
 				let name = interner.resolve(def.name)?;
 				if !name.starts_with(prefix) {
@@ -605,6 +626,7 @@ fn path_completion_items(
 pub fn completion_items(
 	tir: &TIR,
 	interner: &StringInterner,
+	packages: &[PackageGraph],
 	symbol_index: &SymbolIndex,
 	file_id: FileId,
 	source: &str,
@@ -618,8 +640,13 @@ pub fn completion_items(
 	let cursor_offset = offset as u32;
 	let func_index = find_enclosing_function(tir, file_id, cursor_offset);
 	let current_namespace = match func_index {
-		Some(fi) => tir.functions[fi].namespace,
+		Some(fi) => Some(tir.functions[fi].namespace),
 		None => file_namespace(tir, file_id),
+	};
+	// No namespace means the file isn't part of the compilation, so nothing
+	// is in scope to complete.
+	let Some(current_namespace) = current_namespace else {
+		return vec![];
 	};
 	let visible = visible_namespaces(tir, current_namespace);
 
@@ -630,6 +657,7 @@ pub fn completion_items(
 					tir,
 					func_index,
 					interner,
+					packages,
 					cursor_offset,
 					prefix,
 				),

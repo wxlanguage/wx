@@ -1,7 +1,7 @@
 use indoc::indoc;
 
 use super::*;
-use crate::vfs::Files;
+use crate::vfs::{FileOrigin, Files};
 
 #[allow(unused)]
 struct TestCase {
@@ -16,7 +16,7 @@ impl TestCase {
 		let mut id_generator = DefIdGenerator::new();
 		let mut files = Files::new();
 		let file_id = files
-			.add("main.wx".to_string(), source.to_string())
+			.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
 			.unwrap();
 		let ast =
 			Parser::parse(file_id, &files, &mut interner, &mut id_generator);
@@ -325,6 +325,23 @@ fn test_pub_use_reexports_without_diagnostic() {
 		panic!("expected use item")
 	};
 	assert!(pub_span.is_some());
+}
+
+/// Every `use` form the grammar accepts, in one snapshot — the tree shape
+/// is the part worth pinning, since resolution reads it structurally.
+#[test]
+fn test_use_tree_forms() {
+	let case = TestCase::new(indoc! {"
+        use math::*;
+        use math::add;
+        use math::add as plus;
+        use math::{add, sub};
+        use math::{trig::{sin, cos}, ops::*};
+        use a::b::c::d;
+    "});
+
+	assert!(case.ast.diagnostics.is_empty());
+	insta::assert_yaml_snapshot!(case.ast);
 }
 
 #[test]
@@ -704,6 +721,56 @@ fn test_numeric_literal_forms() {
 	));
 }
 
+#[test]
+fn test_scientific_notation_float_literals() {
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            local plain  = 1e10;
+            local dot    = 3.4e2;
+            local plus   = 1e+5;
+            local minus  = 1.5e-3;
+            local upper  = 2E3;
+        }
+    "});
+
+	assert!(case.ast.diagnostics.is_empty());
+	let statements = function_block(&case.ast, 0);
+	assert_eq!(statements.len(), 5);
+	assert!(matches!(
+		local_definition_value(statements, 0),
+		Expression::Float { value } if *value == 1e10
+	));
+	assert!(matches!(
+		local_definition_value(statements, 1),
+		Expression::Float { value } if *value == 3.4e2
+	));
+	assert!(matches!(
+		local_definition_value(statements, 2),
+		Expression::Float { value } if *value == 1e+5
+	));
+	assert!(matches!(
+		local_definition_value(statements, 3),
+		Expression::Float { value } if *value == 1.5e-3
+	));
+	assert!(matches!(
+		local_definition_value(statements, 4),
+		Expression::Float { value } if *value == 2E3
+	));
+}
+
+#[test]
+fn test_scientific_notation_literal_at_end_of_input_is_float() {
+	// Regression: the exponent scanner must commit to Float even when the
+	// digits run straight into EOF with no following token to stop the
+	// scan — a dot-less mantissa like `1e5` would otherwise fall through
+	// to the `seen_dot` check and lex as a (bogus) Int.
+	for src in ["1e5", "2E3", "1e+5", "1e", "1E-"] {
+		let tok = Lexer::new(src).advance();
+		assert!(tok.inner == Token::Float, "`{src}` should lex as Float");
+		assert_eq!(tok.span.end - tok.span.start, src.len() as u32);
+	}
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -884,6 +951,24 @@ fn test_invalid_integer_literal() {
 }
 
 #[test]
+fn test_invalid_float_literal_empty_exponent() {
+	// `1e` and `1e+` still lex as a single (malformed) Float token rather
+	// than backtracking to split off `e`/`e+` as a separate identifier —
+	// see the comment on `Lexer::consume_number`'s exponent handling.
+	let case = TestCase::new(indoc! {"
+        fn f() -> f32 {
+            1e
+        }
+    "});
+
+	assert_eq!(diagnostic_codes(&case.ast), vec!["E0005"]);
+	assert!(matches!(
+		statement_expression(function_block(&case.ast, 0), 0),
+		Expression::Float { value } if *value == 0.0
+	));
+}
+
+#[test]
 fn test_incomplete_expression() {
 	let case = TestCase::new(indoc! {"
         fn binary() -> i32 { 1 + }
@@ -961,7 +1046,7 @@ fn test_missing_comma_between_struct_fields_warns_but_parses() {
 #[test]
 fn test_module_pub_items_and_associated_types() {
 	let case = TestCase::new(indoc! {"
-        pub module math {
+        pub mod math {
             pub fn zero() -> i32 {
                 0
             }
@@ -1039,7 +1124,7 @@ fn test_module_pub_items_and_associated_types() {
 
 #[test]
 fn test_external_module_item() {
-	let case = TestCase::new("module math;");
+	let case = TestCase::new("mod math;");
 
 	assert!(case.ast.diagnostics.is_empty());
 

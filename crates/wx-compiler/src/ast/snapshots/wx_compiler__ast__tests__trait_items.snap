@@ -67,6 +67,7 @@ items:
                       span:
                         start: 49
                         end: 52
+                    value: ~
                 span:
                   start: 37
                   end: 52

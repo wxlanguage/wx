@@ -9,6 +9,6 @@ locals:
 body:
   - LocalGet: 0
   - LocalGet: 1
-  - Call: 403
+  - Call: 470
   - LocalTee: 2
 br_table_depths: []

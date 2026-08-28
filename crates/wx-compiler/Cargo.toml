@@ -11,16 +11,24 @@ repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-compiler"
 workspace = true
 
 [lib]
+bench = false
+
+[features]
+bench = []
+
+[[bench]]
+name = "lexer"
+harness = false
 
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }
 leb128fmt = "0.1.0"
 string-interner = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 indoc = "2"
-serde_json = { workspace = true }
 insta = { version = "1.43", features = ["yaml"] }
 wasmtime = "46.0.1"
 wasmprinter = "0.252.0"

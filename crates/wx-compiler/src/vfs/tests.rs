@@ -18,18 +18,21 @@ fn temp_test_dir(test_name: &str) -> PathBuf {
 }
 
 #[test]
-fn load_crate_parses_entry_file() {
+fn load_package_parses_entry_file() {
 	let dir = temp_test_dir("root");
 	let path = dir.join("main.wx");
 	let child_path = dir.join("math.wx");
-	fs::write(&path, "module math;").unwrap();
+	fs::write(&path, "mod math;").unwrap();
 	fs::write(&child_path, "fn add() {} ").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
-	let crate_id = builder
-		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new(path.to_str().unwrap()),
+			&NativeFileSource,
+		)
 		.unwrap();
-	let graph = &builder.crates[crate_id.as_u32() as usize];
+	let graph = &builder.packages[package_id.as_u32() as usize];
 
 	assert_eq!(graph.modules.len(), 2);
 
@@ -37,9 +40,10 @@ fn load_crate_parses_entry_file() {
 	assert_eq!(root.children.len(), 1);
 
 	let child = &graph.modules[root.children[0].as_u32() as usize];
-	assert_eq!(child.parent, Some(graph.root));
+	let declaration = child.declaration.as_ref().unwrap();
+	assert_eq!(declaration.parent, graph.root);
 	assert_eq!(
-		child.name.and_then(|name| builder.interner.resolve(name)),
+		builder.interner.resolve(declaration.name.inner),
 		Some("math")
 	);
 
@@ -49,41 +53,44 @@ fn load_crate_parses_entry_file() {
 }
 
 #[test]
-fn load_crate_reports_missing_entry_file() {
+fn load_package_reports_missing_entry_file() {
 	let dir = temp_test_dir("missing");
 	let path = dir.join("missing.wx");
 	let path_str = path.to_str().unwrap().to_string();
 
-	let mut builder = CompilationGraphBuilder::new();
+	let mut builder = CompilationUnitBuilder::new();
 	assert_eq!(
-		builder.load_binary(path_str, &NativeFileSource),
+		builder.load_binary(AbsolutePath::new(path_str), &NativeFileSource),
 		Err(()),
 		"expected missing entry file to be a fatal error, not a diagnostic \
-		 — there's no crate to build without it"
+		 — there's no package to build without it"
 	);
 
 	fs::remove_dir(&dir).unwrap();
 }
 
 #[test]
-fn load_crate_diagnoses_missing_child_module_without_aborting() {
-	// Regression test: `module boo;` referencing a file that doesn't exist
-	// yet used to abort loading the entire crate. It should instead produce
-	// a diagnostic attached to the `module boo;` declaration and let the
-	// rest of the crate — including other, unrelated top-level items in the
+fn load_package_diagnoses_missing_child_module_without_aborting() {
+	// Regression test: `mod boo;` referencing a file that doesn't exist
+	// yet used to abort loading the entire package. It should instead produce
+	// a diagnostic attached to the `mod boo;` declaration and let the
+	// rest of the package — including other, unrelated top-level items in the
 	// same file — still load normally.
 	let dir = temp_test_dir("missing-child-module");
 	let path = dir.join("main.wx");
-	fs::write(&path, "module boo;\nfn works() -> i32 { 1 }").unwrap();
+	fs::write(&path, "mod boo;\nfn works() -> i32 { 1 }").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
-	let crate_id = builder
-		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new(path.to_str().unwrap()),
+			&NativeFileSource,
+		)
 		.expect(
 			"a missing child module should be a diagnostic, not a fatal \
 			 error — the entry file itself is still readable",
 		);
-	let graph = &builder.crates[crate_id.as_u32() as usize];
+	let graph = &builder.packages[package_id.as_u32() as usize];
 
 	let root = &graph.modules[graph.root.as_u32() as usize];
 	assert_eq!(
@@ -99,11 +106,11 @@ fn load_crate_diagnoses_missing_child_module_without_aborting() {
 		"the rest of main.wx should still parse normally"
 	);
 	assert!(
-		graph.diagnostics.iter().any(|d| d.code.as_deref()
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::ModuleFileNotFound.code())),
 		"expected a module-not-found diagnostic; got: {:?}",
 		graph
-			.diagnostics
+			.linker_diagnostics
 			.iter()
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
@@ -114,25 +121,28 @@ fn load_crate_diagnoses_missing_child_module_without_aborting() {
 }
 
 #[test]
-fn load_crate_resolves_module_directory_file() {
+fn load_package_resolves_module_directory_file() {
 	let dir = temp_test_dir("dir-module-root");
 	let path = dir.join("main.wx");
 	let child_dir = dir.join("math");
 	let child_path = child_dir.join("mod.wx");
 	fs::create_dir(&child_dir).unwrap();
-	fs::write(&path, "module math;").unwrap();
+	fs::write(&path, "mod math;").unwrap();
 	fs::write(&child_path, "fn add() {}").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
-	let crate_id = builder
-		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new(path.to_str().unwrap()),
+			&NativeFileSource,
+		)
 		.unwrap();
-	let graph = &builder.crates[crate_id.as_u32() as usize];
+	let graph = &builder.packages[package_id.as_u32() as usize];
 
 	let root = &graph.modules[graph.root.as_u32() as usize];
 	let child = &graph.modules[root.children[0].as_u32() as usize];
 	assert_eq!(
-		child.file_path,
+		child.file_path.as_str(),
 		child_path.to_str().unwrap().replace('\\', "/")
 	);
 
@@ -143,25 +153,28 @@ fn load_crate_resolves_module_directory_file() {
 }
 
 #[test]
-fn load_crate_rejects_ambiguous_module_paths() {
+fn load_package_rejects_ambiguous_module_paths() {
 	let dir = temp_test_dir("ambiguous-module-root");
 	let path = dir.join("main.wx");
 	let sibling_path = dir.join("math.wx");
 	let child_dir = dir.join("math");
 	let directory_path = child_dir.join("mod.wx");
 	fs::create_dir(&child_dir).unwrap();
-	fs::write(&path, "module math;").unwrap();
+	fs::write(&path, "mod math;").unwrap();
 	fs::write(&sibling_path, "fn from_file() {}").unwrap();
 	fs::write(&directory_path, "fn from_dir() {}").unwrap();
 
-	let mut builder = CompilationGraphBuilder::new();
-	let crate_id = builder
-		.load_binary(path.to_str().unwrap().to_string(), &NativeFileSource)
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new(path.to_str().unwrap()),
+			&NativeFileSource,
+		)
 		.expect(
 			"an ambiguous child module should be a diagnostic, not a fatal \
-			 error — the crate itself still loads",
+			 error — the package itself still loads",
 		);
-	let graph = &builder.crates[crate_id.as_u32() as usize];
+	let graph = &builder.packages[package_id.as_u32() as usize];
 
 	let root = &graph.modules[graph.root.as_u32() as usize];
 	assert_eq!(
@@ -170,11 +183,11 @@ fn load_crate_rejects_ambiguous_module_paths() {
 		"the ambiguous module should be omitted rather than arbitrarily picked"
 	);
 	assert!(
-		graph.diagnostics.iter().any(|d| d.code.as_deref()
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::AmbiguousModuleFile.code())),
 		"expected an ambiguous-module diagnostic; got: {:?}",
 		graph
-			.diagnostics
+			.linker_diagnostics
 			.iter()
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
@@ -189,25 +202,109 @@ fn load_crate_rejects_ambiguous_module_paths() {
 
 #[test]
 fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
-	let mut builder = CompilationGraphBuilder::new();
-	let stdlib_id = builder.load_stdlib();
+	let mut builder = CompilationUnitBuilder::new();
+	builder.load_stdlib();
 	let root_id = builder
 		.load_binary(
-			"src/main.wx".to_string(),
+			AbsolutePath::new("/src/main.wx"),
 			&VirtualFileSource::new(HashMap::from([
-				("src/main.wx".to_string(), "module math;".to_string()),
-				("src/math.wx".to_string(), "fn add() {}".to_string()),
+				(AbsolutePath::new("/src/main.wx"), "mod math;".to_string()),
+				(AbsolutePath::new("/src/math.wx"), "fn add() {}".to_string()),
 			])),
 		)
-		.expect("failed to load crate");
-	let graph = builder.build(root_id, stdlib_id);
+		.expect("failed to load package");
+	let graph = builder.build(root_id);
 
-	let entry_crate = &graph.crates[1];
-	assert_eq!(entry_crate.modules.len(), 2);
-	let root = &entry_crate.modules[entry_crate.root.as_u32() as usize];
-	assert_eq!(root.file_path, "src/main.wx");
+	let entry_package = &graph.packages[1];
+	assert_eq!(entry_package.modules.len(), 2);
+	let root = &entry_package.modules[entry_package.root.as_u32() as usize];
+	assert_eq!(root.file_path.as_str(), "/src/main.wx");
 	assert_eq!(root.children.len(), 1);
 
-	let child = &entry_crate.modules[root.children[0].as_u32() as usize];
-	assert_eq!(child.file_path, "src/math.wx");
+	let child = &entry_package.modules[root.children[0].as_u32() as usize];
+	assert_eq!(child.file_path.as_str(), "/src/math.wx");
+}
+
+#[test]
+fn load_virtual_compilation_child_of_a_sibling_file_module_resolves_under_its_own_name()
+ {
+	// A module's own children always resolve under a directory named after
+	// *that module* — `a.wx` declaring `mod shared;` looks for
+	// `/src/a/shared.wx`, not `/src/shared.wx`, regardless of `a.wx` being
+	// the plain-sibling form rather than `a/mod.wx`. Placing `shared.wx` at
+	// `/src/shared.wx` (the pre-fix resolution target, and formerly also
+	// reachable from a second sibling `b.wx` — a silent, asymmetric
+	// collision between the two) is now simply the wrong location, and
+	// reported as an honest, ordinary `ModuleFileNotFound`.
+	let mut builder = CompilationUnitBuilder::new();
+	builder.load_stdlib();
+	let root_id = builder
+		.load_binary(
+			AbsolutePath::new("/src/main.wx"),
+			&VirtualFileSource::new(HashMap::from([
+				(AbsolutePath::new("/src/main.wx"), "mod a;".to_string()),
+				(AbsolutePath::new("/src/a.wx"), "mod shared;".to_string()),
+				(
+					AbsolutePath::new("/src/shared.wx"),
+					"pub fn x() -> i32 { 1 }".to_string(),
+				),
+			])),
+		)
+		.expect("a.wx itself is still readable");
+	let graph = &builder.packages[root_id.as_u32() as usize];
+
+	let root = &graph.modules[graph.root.as_u32() as usize];
+	let a = &graph.modules[root.children[0].as_u32() as usize];
+	assert_eq!(
+		a.children.len(),
+		0,
+		"the unresolved `shared` module should be omitted, not present as \
+		 a stub"
+	);
+	assert!(
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::ModuleFileNotFound.code())),
+		"expected E2000 (ModuleFileNotFound), got: {:?}",
+		graph
+			.linker_diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
+	// `mod extra;` inside an inline `mod utils { }` block is not a
+	// legal declaration site — unlike Rust, wx doesn't resolve it by
+	// accumulating a directory segment per inline level. It should be
+	// diagnosed, not silently ignored, and the surrounding file should
+	// still load its own top-level items normally.
+	let mut builder = CompilationUnitBuilder::new();
+	let package_id = builder
+		.load_binary(
+			AbsolutePath::new("/main.wx"),
+			&VirtualFileSource::new(HashMap::from([(
+				AbsolutePath::new("/main.wx"),
+				"mod utils { mod extra; }\nfn works() -> i32 { 1 }".to_string(),
+			)])),
+		)
+		.expect("the entry file itself is still readable");
+	let graph = &builder.packages[package_id.as_u32() as usize];
+
+	assert_eq!(
+		graph.modules.len(),
+		1,
+		"the nested `extra` declaration should not cause a file to load"
+	);
+	assert!(
+		graph.linker_diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::NestedModuleDeclaration.code())),
+		"expected E2006 (NestedModuleDeclaration), got: {:?}",
+		graph
+			.linker_diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
 }

@@ -8,26 +8,26 @@ use crate::{tir, vfs};
 
 #[allow(unused)]
 struct TestCase {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: tir::TIR,
 	mir: MIR,
 }
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
-				"main.wx".to_string(),
-				&vfs::VirtualFileSource::new(HashMap::from([(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					prefixed,
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
+		let mut graph = builder.build(root_id);
 		let tir = tir::TIR::build(&mut graph);
 		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
 		TestCase { graph, tir, mir }
@@ -297,12 +297,12 @@ fn test_memory_grow_lowers_to_memory_grow() {
 
 #[test]
 fn test_memory_size_lowers_to_memory_size() {
-	// heap.size() → MemorySize { memory_index: 0 }
+	// heap.size_pages() → MemorySize { memory_index: 0 }
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         pub fn f() -> u32 {
-            heap.size()
+            heap.size_pages()
         }
 
         export { f }
@@ -327,12 +327,12 @@ fn test_memory_data_end_lowers_to_memory_offset() {
 
 #[test]
 fn test_memory_index_lowers_to_int() {
-	// heap::MEMORY_INDEX → Int { value: 0 } (the wasm linear memory index)
+	// heap::INDEX → Int { value: 0 } (the wasm linear memory index)
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         pub fn f() -> u32 {
-            heap::MEMORY_INDEX
+            heap::INDEX
         }
 
         export { f }
@@ -1658,6 +1658,27 @@ fn test_struct_compound_assignment_lowers_to_add_call() {
         }
 
         export { add_assign_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_compound_assignment_lowers_to_bitand_call() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+            a &= b;
+            a
+        }
+
+        export { and_assign_flags }
     "});
 	insta::assert_yaml_snapshot!(case.mir);
 }

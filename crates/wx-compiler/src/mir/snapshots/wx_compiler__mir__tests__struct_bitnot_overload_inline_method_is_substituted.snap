@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 405
+  - id: 472
     signature_index: 0
     scopes:
       - kind: Block
@@ -90,55 +90,127 @@ signatures:
       - F32
     params_count: 1
   - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - I32
-      - I32
-      - I32
-    params_count: 2
-  - items:
-      - I32
-      - I32
-    params_count: 1
-  - items:
-      - U32
-      - U32
-      - U32
-    params_count: 2
-  - items:
-      - U32
-      - U32
-    params_count: 1
-  - items:
-      - I64
-      - I64
-      - I64
-    params_count: 2
-  - items:
-      - I64
-      - I64
-    params_count: 1
-  - items:
-      - U64
-      - U64
-      - U64
-    params_count: 2
-  - items:
-      - U64
-      - U64
-    params_count: 1
-  - items:
       - F32
       - F32
       - F32
     params_count: 2
   - items:
+      - F32
+      - I32
+    params_count: 1
+  - items:
+      - F32
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F32
+    params_count: 1
+  - items:
+      - U32
+      - F32
+    params_count: 1
+  - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - I64
+    params_count: 1
+  - items:
+      - F32
+      - U64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
       - F64
       - F64
       - F64
     params_count: 2
+  - items:
+      - F64
+      - I64
+    params_count: 1
+  - items:
+      - F64
+      - U64
+    params_count: 1
+  - items:
+      - I64
+      - F64
+    params_count: 1
+  - items:
+      - U64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F64
+    params_count: 1
+  - items:
+      - I32
+      - I32
+      - I32
+    params_count: 2
+  - items:
+      - I32
+      - I32
+    params_count: 1
+  - items:
+      - U32
+      - F64
+    params_count: 1
+  - items:
+      - U32
+      - U32
+      - U32
+    params_count: 2
+  - items:
+      - U32
+      - U32
+    params_count: 1
+  - items:
+      - I64
+      - F32
+    params_count: 1
+  - items:
+      - I64
+      - I64
+      - I64
+    params_count: 2
+  - items:
+      - I64
+      - I64
+    params_count: 1
+  - items:
+      - U64
+      - F32
+    params_count: 1
+  - items:
+      - U64
+      - U64
+      - U64
+    params_count: 2
+  - items:
+      - U64
+      - U64
+    params_count: 1
   - items:
       - I8
       - I8
@@ -187,8 +259,8 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 405
-      name: 204
+      id: 472
+      name: 241
 imports: []
 memories: []
 aggregates:

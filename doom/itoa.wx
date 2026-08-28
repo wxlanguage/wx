@@ -14,9 +14,9 @@ global mut bump: heap::*u8 = heap::DATA_END;
 fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
     local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size;
-    local cur_end = heap.size() * PAGE_SIZE;
+    local cur_end = heap.size_bytes();
     if new_end > cur_end {
-        local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
     bump = new_end as heap::*u8;
