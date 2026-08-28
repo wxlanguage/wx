@@ -2560,17 +2560,74 @@ impl<'tir> Builder<'tir> {
 				scope_index,
 				local_index,
 				value,
+				bindings,
 				..
-			} => Expression {
-				kind: ExprKind::LocalSet {
-					scope_index: *scope_index,
-					local_index: *local_index,
-					value: Box::new(
-						self.lower_expression(func_ctx, value, sink),
-					),
-				},
-				ty: self.lower_type_index(expr.ty),
-			},
+			} => {
+				// `local x = e` where `e` diverges makes the whole
+				// declaration `!`; a destructuring pattern never does (a
+				// diverging initializer is not a tuple), so only the
+				// no-bindings path needs to carry that through.
+				let node_ty = self.lower_type_index(expr.ty);
+				let root_set = Expression {
+					kind: ExprKind::LocalSet {
+						scope_index: *scope_index,
+						local_index: *local_index,
+						value: Box::new(
+							self.lower_expression(func_ctx, value, sink),
+						),
+					},
+					ty: node_ty,
+				};
+				if bindings.is_empty() {
+					return root_set;
+				}
+
+				// Destructuring: fill the synthetic root, then project each
+				// sub-binding out of it. `bindings` is already ordered so a
+				// synthetic `source` is set before it is read.
+				let mut sets = Vec::with_capacity(bindings.len() + 1);
+				sets.push(root_set);
+				for binding in bindings.iter() {
+					let source_ty = func_ctx.frame[*scope_index as usize]
+						.locals[binding.source as usize]
+						.ty;
+					let aggregate_index = match source_ty {
+						Type::Aggregate { aggregate_index } => aggregate_index,
+						_ => unreachable!(
+							"destructure source must lower to an aggregate"
+						),
+					};
+					let aggregate = &self.aggregates[aggregate_index as usize];
+					let value_index = match binding.elem {
+						tir::ProjectionElem::TupleElem(decl) => {
+							aggregate.decl_to_phys[decl as usize]
+						}
+					};
+					let field_ty = aggregate.values[value_index as usize];
+					sets.push(Expression {
+						kind: ExprKind::LocalSet {
+							scope_index: *scope_index,
+							local_index: binding.target,
+							value: Box::new(Expression {
+								kind: ExprKind::AggregateGet {
+									scope_index: *scope_index,
+									local_index: binding.source,
+									value_index,
+								},
+								ty: field_ty,
+							}),
+						},
+						ty: Type::Unit,
+					});
+				}
+				// Emit all but the last as statements; the last stands as the
+				// expression this arm evaluates to (the caller pushes it).
+				let last = sets.pop().unwrap();
+				for set in sets {
+					sink.push(set);
+				}
+				last
+			}
 			tir::ExprKind::Unary { operator, operand } => {
 				let operand =
 					Box::new(self.lower_expression(func_ctx, operand, sink));

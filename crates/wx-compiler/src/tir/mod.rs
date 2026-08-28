@@ -658,8 +658,15 @@ pub enum ExprKind {
 	LocalDeclaration {
 		name: ast::Spanned<SymbolU32>,
 		scope_index: ScopeIndex,
+		/// The scrutinee slot: the real binding for `local x = e`, or a
+		/// synthetic root holding the whole value for a destructuring pattern.
 		local_index: LocalIndex,
 		value: Box<Expression>,
+		/// Non-empty only for pattern destructuring (`local (a, b) = e`).
+		/// Topologically ordered — each entry's `source` is `local_index` or a
+		/// `target` filled by an earlier entry, so lowering is a flat sequence
+		/// of assignments with no recursion.
+		bindings: Box<[LocalBinding]>,
 	},
 	Local {
 		scope_index: ScopeIndex,
@@ -906,7 +913,36 @@ pub struct Local {
 	pub name: Spanned<SymbolU32>,
 	pub ty: TypeIndex,
 	pub mut_span: Option<TextSpan>,
+	/// Compiler-introduced, not written by the user — the intermediate slot
+	/// that holds a destructured value while its sub-patterns are projected
+	/// out. Exempt from unused-variable / unnecessary-`mut` lints and hidden
+	/// from editor symbol listings.
+	pub synthetic: bool,
 	pub accesses: Vec<LocalAccess>,
+}
+
+/// One step of a destructuring projection: `source.<elem>` fills `target`.
+/// Never produced by the parser — destructuring is the only way to reach a
+/// tuple element, so this is a closed, compiler-internal vocabulary. Adding a
+/// new kind of destructurable place (arrays, enum payloads) means adding a
+/// variant here plus one arm in MIR lowering.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum ProjectionElem {
+	/// Tuple element in declaration (source) order. MIR maps it through the
+	/// aggregate's `decl_to_phys`, since tuples are alignment-sorted in memory.
+	TupleElem(u32),
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct LocalBinding {
+	/// The local being filled — a user binding, or a synthetic sub-scrutinee
+	/// whose own sub-patterns are projected by later entries.
+	pub target: LocalIndex,
+	/// The local holding the aggregate to project from, in the same scope.
+	pub source: LocalIndex,
+	pub elem: ProjectionElem,
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1858,6 +1894,7 @@ define_diagnostic_codes! {
 		ExportBlockNotAtRoot => "E1073",
 		LibraryCannotExport => "E1074",
 		AmbiguousWildcardImport => "E1075",
+		TuplePatternArityMismatch => "E1076",
 	}
 }
 

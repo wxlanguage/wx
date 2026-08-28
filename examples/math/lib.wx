@@ -20,6 +20,8 @@ mod k_cosf;
 mod k_sinf;
 mod scalbn;
 mod rem_pio2f;
-mod sin;
+mod sinf;
 
 use k_cosf::k_cosf;
+use k_sinf::k_sinf;
+use rem_pio2f::rem_pio2f;

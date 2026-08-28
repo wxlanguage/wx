@@ -18,15 +18,7 @@ const PIO2_1: f64 = 1.57079631090164184570e+00;
 // pi/2 - PIO2_1
 const PIO2_1T: f64 = 1.58932547735281966916e-08;
 
-// Same shape as `mod.wx`'s own `ReductionF32` — not reused directly since this file is a
-// standalone, not-yet-wired staging module (see `k_sinf.wx`/`k_cosf.wx`/`scalbn.wx`), but
-// named to match for whenever it replaces the inline version there.
-struct ReductionF32 {
-    n: i32,
-    y: f64,
-}
-
-pub fn rem_pio2f(x: f32) -> ReductionF32 {
+pub fn rem_pio2f(x: f32) -> (i32, f64) {
     local x64: f64 = x.promote();
     local ix: u32 = x.to_bits() & 0x7fffffff;
     
@@ -38,14 +30,11 @@ pub fn rem_pio2f(x: f32) -> ReductionF32 {
         // rounding modes are dead code here).
         local tmp = x64 * INV_PIO2 + TOINT;
         local f_n = tmp - TOINT;
-        return ReductionF32::{
-            n: f_n.to_i32(),
-            y: x64 - f_n * PIO2_1 - f_n * PIO2_1T,
-        };
-    }
+        return (f_n.to_i32(), x64 - f_n * PIO2_1 - f_n * PIO2_1T);
+    };
     
     // Large finite `x`, or `x` is inf/NaN — the former would need `__rem_pio2_large`, the
     // latter is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the
     // original); both collapse to the same answer here.
-    ReductionF32::{ n: 0, y: f64::NAN }
+    (0, f64::NAN)
 }

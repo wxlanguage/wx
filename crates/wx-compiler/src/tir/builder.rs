@@ -792,6 +792,62 @@ fn report_invalid_pattern(span: SourceSpan) -> Diagnostic<FileId> {
 		)
 }
 
+fn report_non_tuple_destructure(
+	fmt: TypeFormatter,
+	ty: TypeIndex,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InvalidPattern.code())
+		.with_message(format!(
+			"cannot destructure `{}` with a tuple pattern",
+			fmt.display_type(ty).unwrap_or_default()
+		))
+		.with_label(span.primary_label())
+		.with_note(
+			"only a tuple-typed value can be bound with an `(a, b)` pattern",
+		)
+}
+
+fn report_tuple_pattern_arity_mismatch(
+	span: SourceSpan,
+	expected: usize,
+	found: usize,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TuplePatternArityMismatch.code())
+		.with_message(format!(
+			"this tuple has {expected} element{}, but the pattern binds {found}",
+			if expected == 1 { "" } else { "s" }
+		))
+		.with_label(span.primary_label())
+}
+
+fn report_unsupported_local_pattern(
+	span: SourceSpan,
+	what: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InvalidPattern.code())
+		.with_message(format!(
+			"{what} in a `local` binding are not supported yet"
+		))
+		.with_label(span.primary_label())
+		.with_note("bind the value to a name, or use a tuple pattern")
+}
+
+fn report_duplicate_pattern_binding(
+	span: SourceSpan,
+	name: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateDefinition.code())
+		.with_message(format!(
+			"identifier `{name}` is bound more than once in the same pattern"
+		))
+		.with_label(span.primary_label())
+}
+
 /// One diagnostic per non-exhaustive `match` on an enum scrutinee, grouping
 /// every uncovered variant into one message — mirrors
 /// `report_unused_enum_variants`'s 1/2/3-5/many phrasing.
@@ -10574,6 +10630,7 @@ impl<'ast> Builder<'ast, '_> {
 					accesses: Vec::new(),
 					mut_span: param.mut_span,
 					ty: param.ty.inner,
+					synthetic: false,
 				})
 				.collect(),
 			inferred_type: TypeIndex::INFER,
@@ -10763,7 +10820,7 @@ impl<'ast> Builder<'ast, '_> {
 				if local.accesses.is_empty()
 					&& local.ty != TypeIndex::ERROR
 					&& !is_underscore_prefixed
-					&& !is_self
+					&& !is_self && !local.synthetic
 				{
 					self.tir.diagnostics.push(report_unused_variable(
 						SourceSpan::new(file_id, local.name.span),
@@ -17447,31 +17504,14 @@ impl<'ast> Builder<'ast, '_> {
 		ctx: &mut ExprContext,
 		stmt: &Separated<Spanned<ast::Statement>>,
 	) -> Result<Expression, ()> {
-		let (mut_span, name, ty, value) = match &stmt.inner.inner {
+		let (pattern, annotation, value) = match &stmt.inner.inner {
 			ast::Statement::LocalDefinition { pattern, ty, value } => {
-				match &pattern.inner {
-					ast::Pattern::Binding { mut_span, name } => {
-						(*mut_span, *name, ty, value)
-					}
-					_ => {
-						self.tir.diagnostics.push(
-							codespan_reporting::diagnostic::Diagnostic::error()
-								.with_message(
-									"pattern destructuring in locals is not yet supported",
-								)
-								.with_label(Label::primary(
-									ctx.resolve_context.file_id,
-									pattern.span,
-								)),
-						);
-						return Err(());
-					}
-				}
+				(pattern, ty, value)
 			}
 			_ => unreachable!(),
 		};
 
-		let expected_type = match ty {
+		let expected_type = match annotation {
 			Some(ty) => self.resolve_type(ctx.resolve_context, ctx.scope, ty),
 			None => TypeIndex::INFER,
 		};
@@ -17486,8 +17526,8 @@ impl<'ast> Builder<'ast, '_> {
 
 		let (ty, value) = match value_result {
 			Err(()) => {
-				// Expression failed; register the local with the declared type so
-				// subsequent references don't produce cascading errors.
+				// Expression failed; register the local(s) with the declared
+				// type so subsequent references don't produce cascading errors.
 				let ty = expected_type.infer_or(TypeIndex::ERROR);
 				let error_expr = Expression {
 					kind: ExprKind::Error,
@@ -17499,7 +17539,7 @@ impl<'ast> Builder<'ast, '_> {
 			Ok(mut value) => {
 				let ty = self.resolve_local_type(
 					ctx,
-					name.span,
+					pattern.span,
 					&mut value,
 					expected_type,
 				)?;
@@ -17507,27 +17547,294 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 
-		let local_index = ctx.push_local(Local {
-			name,
-			ty,
-			mut_span,
-			accesses: Vec::new(),
-		});
+		let node_ty = if ty == TypeIndex::NEVER {
+			TypeIndex::NEVER
+		} else {
+			TypeIndex::UNIT
+		};
+
+		// The scrutinee slot plus, for a destructuring pattern, the ordered
+		// list of projections that fill each sub-binding out of it.
+		let (root_name, root_index, bindings) = match &pattern.inner {
+			// `local [mut] name = e` — the common case: bind `e` directly, no
+			// projection, no synthetic slot.
+			ast::Pattern::Binding { mut_span, name } => {
+				let idx = ctx.push_local(Local {
+					name: *name,
+					ty,
+					mut_span: *mut_span,
+					synthetic: false,
+					accesses: Vec::new(),
+				});
+				(*name, idx, Vec::new())
+			}
+			// `local _ = e` — evaluate and discard.
+			ast::Pattern::Wildcard => {
+				let discard = ast::Spanned {
+					inner: self.interner.get_or_intern("{discard}"),
+					span: pattern.span,
+				};
+				let idx = ctx.push_local(Local {
+					name: discard,
+					ty,
+					mut_span: None,
+					synthetic: true,
+					accesses: Vec::new(),
+				});
+				(discard, idx, Vec::new())
+			}
+			// A composite pattern: evaluate the initializer once into a
+			// synthetic root, then project each sub-binding out of it.
+			_ => {
+				let root = ast::Spanned {
+					inner: self.interner.get_or_intern("{pattern}"),
+					span: pattern.span,
+				};
+				let idx = ctx.push_local(Local {
+					name: root,
+					ty,
+					mut_span: None,
+					synthetic: true,
+					accesses: Vec::new(),
+				});
+				let mut bindings = Vec::new();
+				let mut seen_names = Vec::new();
+				// Errors are absorbed: the diagnostic is emitted and every
+				// name the pattern would bind is still registered (as ERROR
+				// where needed) so the rest of the block doesn't cascade.
+				let _ = self.expand_pattern(
+					ctx,
+					pattern,
+					ty,
+					idx,
+					&mut bindings,
+					&mut seen_names,
+				);
+				(root, idx, bindings)
+			}
+		};
 
 		Ok(Expression {
 			kind: ExprKind::LocalDeclaration {
-				name,
+				name: root_name,
 				scope_index: ctx.scope_index,
-				local_index,
+				local_index: root_index,
 				value: Box::new(value),
+				bindings: bindings.into_boxed_slice(),
 			},
-			ty: if ty == TypeIndex::NEVER {
-				TypeIndex::NEVER
-			} else {
-				TypeIndex::UNIT
-			},
+			ty: node_ty,
 			span: stmt.inner.span,
 		})
+	}
+
+	/// Expand a composite irrefutable pattern whose value lives in local
+	/// `source`, appending one [`LocalBinding`] per sub-slot (in projection
+	/// order) and recursing for nested composites. On a shape error the
+	/// diagnostic is emitted and `register_pattern_error` still registers the
+	/// names, so callers can absorb the `Err`.
+	fn expand_pattern(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &Spanned<ast::Pattern>,
+		sub_ty: TypeIndex,
+		source: LocalIndex,
+		out: &mut Vec<LocalBinding>,
+		seen_names: &mut Vec<SymbolU32>,
+	) -> Result<(), ()> {
+		let file_id = ctx.resolve_context.file_id;
+		match &pattern.inner {
+			ast::Pattern::Tuple { elements } => {
+				let elem_tys: Box<[TypeIndex]> = match &self.tir.types
+					[sub_ty.as_usize()]
+				{
+					Type::Tuple { elements } => elements.clone(),
+					Type::Error => {
+						self.register_pattern_error(ctx, pattern, seen_names);
+						return Err(());
+					}
+					_ => {
+						self.tir.diagnostics.push(
+							report_non_tuple_destructure(
+								self.formatter(ctx.resolve_context.namespace),
+								sub_ty,
+								SourceSpan::new(file_id, pattern.span),
+							),
+						);
+						self.register_pattern_error(ctx, pattern, seen_names);
+						return Err(());
+					}
+				};
+				if elem_tys.len() != elements.len() {
+					self.tir.diagnostics.push(
+						report_tuple_pattern_arity_mismatch(
+							SourceSpan::new(file_id, pattern.span),
+							elem_tys.len(),
+							elements.len(),
+						),
+					);
+					self.register_pattern_error(ctx, pattern, seen_names);
+					return Err(());
+				}
+				let mut had_err = false;
+				for (i, elem) in elements.iter().enumerate() {
+					if self
+						.bind_child(
+							ctx,
+							&elem.inner,
+							elem_tys[i],
+							source,
+							ProjectionElem::TupleElem(i as u32),
+							out,
+							seen_names,
+						)
+						.is_err()
+					{
+						had_err = true;
+					}
+				}
+				if had_err { Err(()) } else { Ok(()) }
+			}
+			ast::Pattern::Struct { .. } => {
+				self.tir.diagnostics.push(report_unsupported_local_pattern(
+					SourceSpan::new(file_id, pattern.span),
+					"struct patterns",
+				));
+				self.register_pattern_error(ctx, pattern, seen_names);
+				Err(())
+			}
+			ast::Pattern::Binding { .. } | ast::Pattern::Wildcard => {
+				unreachable!("expand_pattern on a non-composite pattern")
+			}
+		}
+	}
+
+	/// Bind one sub-pattern reachable as `parent.<elem>`. Leaf bindings and
+	/// wildcards are handled inline; a nested composite gets a synthetic slot
+	/// and recurses through [`expand_pattern`].
+	fn bind_child(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &Spanned<ast::Pattern>,
+		sub_ty: TypeIndex,
+		parent: LocalIndex,
+		elem: ProjectionElem,
+		out: &mut Vec<LocalBinding>,
+		seen_names: &mut Vec<SymbolU32>,
+	) -> Result<(), ()> {
+		let file_id = ctx.resolve_context.file_id;
+		match &pattern.inner {
+			// The element is simply never read — no binding, no projection.
+			ast::Pattern::Wildcard => Ok(()),
+			ast::Pattern::Binding { mut_span, name } => {
+				if seen_names.contains(&name.inner) {
+					self.tir.diagnostics.push(
+						report_duplicate_pattern_binding(
+							SourceSpan::new(file_id, name.span),
+							self.interner.resolve(name.inner).unwrap_or("?"),
+						),
+					);
+					return Err(());
+				}
+				seen_names.push(name.inner);
+
+				let concrete = !(sub_ty.is_comptime_number()
+					|| self.contains_infer(sub_ty));
+				if !concrete {
+					self.tir.diagnostics.push(report_type_annotation_required(
+						SourceSpan::new(file_id, name.span),
+					));
+				}
+				let target = ctx.push_local(Local {
+					name: *name,
+					ty: if concrete { sub_ty } else { TypeIndex::ERROR },
+					mut_span: *mut_span,
+					synthetic: false,
+					accesses: Vec::new(),
+				});
+				out.push(LocalBinding {
+					target,
+					source: parent,
+					elem,
+				});
+				if concrete { Ok(()) } else { Err(()) }
+			}
+			ast::Pattern::Tuple { .. } | ast::Pattern::Struct { .. } => {
+				let synth = ast::Spanned {
+					inner: self.interner.get_or_intern("{pattern}"),
+					span: pattern.span,
+				};
+				let target = ctx.push_local(Local {
+					name: synth,
+					ty: sub_ty,
+					mut_span: None,
+					synthetic: true,
+					accesses: Vec::new(),
+				});
+				out.push(LocalBinding {
+					target,
+					source: parent,
+					elem,
+				});
+				self.expand_pattern(
+					ctx, pattern, sub_ty, target, out, seen_names,
+				)
+			}
+		}
+	}
+
+	/// After a pattern-shape error, register every name the pattern's
+	/// `Binding`s would introduce (typed `ERROR`) so later references in the
+	/// block resolve instead of producing a wave of "undeclared identifier".
+	fn register_pattern_error(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &Spanned<ast::Pattern>,
+		seen_names: &mut Vec<SymbolU32>,
+	) {
+		match &pattern.inner {
+			ast::Pattern::Wildcard => {}
+			ast::Pattern::Binding { mut_span, name } => {
+				if seen_names.contains(&name.inner) {
+					return;
+				}
+				seen_names.push(name.inner);
+				ctx.push_local(Local {
+					name: *name,
+					ty: TypeIndex::ERROR,
+					mut_span: *mut_span,
+					synthetic: false,
+					accesses: Vec::new(),
+				});
+			}
+			ast::Pattern::Tuple { elements } => {
+				for elem in elements.iter() {
+					self.register_pattern_error(ctx, &elem.inner, seen_names);
+				}
+			}
+			ast::Pattern::Struct { fields, .. } => {
+				for field in fields.iter() {
+					match &field.inner.inner.pattern {
+						Some(p) => {
+							self.register_pattern_error(ctx, p, seen_names)
+						}
+						None => {
+							let name = field.inner.inner.name;
+							if seen_names.contains(&name.inner) {
+								continue;
+							}
+							seen_names.push(name.inner);
+							ctx.push_local(Local {
+								name,
+								ty: TypeIndex::ERROR,
+								mut_span: None,
+								synthetic: false,
+								accesses: Vec::new(),
+							});
+						}
+					}
+				}
+			}
+		}
 	}
 
 	fn resolve_local_type(

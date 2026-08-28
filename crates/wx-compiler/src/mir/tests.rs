@@ -219,6 +219,52 @@ fn test_generic_type_alias_transparent_in_mir() {
 }
 
 #[test]
+fn test_local_tuple_destructure_lowers_to_aggregate_gets() {
+	// `local (n, y) = pair()` → one LocalSet filling the synthetic root from
+	// the call, then one LocalSet per binding whose value is an AggregateGet
+	// off that root. Element order is declaration order; MIR maps it through
+	// `decl_to_phys`, so `y` (f64, wider) sits in physical slot 0.
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, f64) { (1, 2.0) }
+        fn f() -> f64 {
+            local (n, y) = pair();
+            y + n.to_f64()
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let ExportItem::Function { id, .. } = case.mir.exports[0] else {
+		panic!("expected exported function");
+	};
+	let f = case
+		.mir
+		.functions
+		.iter()
+		.find(|fun| fun.id == id)
+		.expect("function `f` present in MIR");
+
+	let ExprKind::Block { expressions, .. } = &f.block.kind else {
+		panic!("function body must be a Block");
+	};
+	let aggregate_gets = expressions
+		.iter()
+		.filter(|e| match &e.kind {
+			ExprKind::LocalSet { value, .. } => {
+				matches!(value.kind, ExprKind::AggregateGet { .. })
+			}
+			_ => false,
+		})
+		.count();
+	assert_eq!(
+		aggregate_gets, 2,
+		"one AggregateGet-backed LocalSet per destructured binding"
+	);
+
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
 fn test_tuple_type_alias_transparent_in_mir() {
 	// A parametric alias to a tuple type, instantiated at a use site, should
 	// lower to ordinary tuple/aggregate MIR.

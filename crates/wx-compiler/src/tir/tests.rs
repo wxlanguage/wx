@@ -2006,6 +2006,143 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
 	));
 }
 
+// ── local tuple destructuring ──────────────────────────────────────────────
+
+#[test]
+fn test_local_tuple_destructure_binds_both() {
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, f64) { (1, 2.0) }
+        fn f() -> f64 {
+            local (n, y) = pair();
+            y + n.to_f64()
+        }
+        export { f }
+    "});
+	no_errors(&case);
+	insta::assert_yaml_snapshot!(case.tir);
+}
+
+#[test]
+fn test_local_tuple_destructure_wildcard_element() {
+	// `_` elements bind nothing and are not projected; the other element still
+	// resolves, and there is no unused-variable warning for the hole.
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, i32) { (1, 2) }
+        fn f() -> i32 {
+            local (a, _) = pair();
+            a
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_local_tuple_destructure_nested() {
+	let case = TestCase::new(indoc! {"
+        fn nested() -> (i32, (i32, i32)) { (1, (2, 3)) }
+        fn f() -> i32 {
+            local (a, (b, c)) = nested();
+            a + b + c
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_local_wildcard_pattern_evaluates_and_discards() {
+	let case = TestCase::new(indoc! {"
+        fn side() -> i32 { 7 }
+        fn f() {
+            local _ = side();
+        }
+        export { f }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_local_tuple_destructure_arity_mismatch() {
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, i32) { (1, 2) }
+        fn f() {
+            local (a, b, c) = pair();
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::TuplePatternArityMismatch
+	));
+}
+
+#[test]
+fn test_local_tuple_pattern_on_non_tuple() {
+	let case = TestCase::new(indoc! {"
+        fn scalar() -> i32 { 5 }
+        fn f() {
+            local (a, b) = scalar();
+        }
+        export { f }
+    "});
+	assert!(has_error_code(&case.tir, DiagnosticCode::InvalidPattern));
+}
+
+#[test]
+fn test_local_tuple_destructure_duplicate_binding() {
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, i32) { (1, 2) }
+        fn f() {
+            local (a, a) = pair();
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::DuplicateDefinition
+	));
+}
+
+#[test]
+fn test_local_tuple_destructure_needs_concrete_element_types() {
+	// No annotation and a comptime-int tuple literal: each element type is
+	// still `INTEGER`, so binding a name to it requires an annotation.
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            local (a, b) = (1, 2);
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::TypeAnnotationRequired
+	));
+}
+
+#[test]
+fn test_local_tuple_destructure_unused_binding_warns_once() {
+	// Exactly one unused-variable warning — for the real binding `b`. The
+	// synthetic root that holds the whole tuple must not also warn.
+	let case = TestCase::new(indoc! {"
+        fn pair() -> (i32, i32) { (1, 2) }
+        fn f() -> i32 {
+            local (a, b) = pair();
+            a
+        }
+        export { f }
+    "});
+	let unused = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::UnusedVariable.code())
+		})
+		.count();
+	assert_eq!(unused, 1, "one W1001, on `b` only");
+}
+
 #[test]
 fn test_assign_to_undeclared_identifier_no_e1013() {
 	// Assignment to an undeclared variable should produce only E1007 (undeclared
