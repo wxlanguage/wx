@@ -255,6 +255,10 @@ impl Files {
 		self.files.len()
 	}
 
+	pub fn is_empty(&self) -> bool {
+		self.files.is_empty()
+	}
+
 	pub fn get(&self, file_id: FileId) -> Result<&File, files::Error> {
 		self.files
 			.get(file_id.0 as usize)
