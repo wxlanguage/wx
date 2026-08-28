@@ -268,6 +268,85 @@ async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
 	);
 }
 
+/// Regression: hovering `crate` used to panic the whole LSP process.
+/// `crate`/`super` resolve to a real `SymbolKind::Module` pointing at a
+/// namespace whose own package is the *same* package doing the asking —
+/// `TIR::namespace_name`'s `Package(_)` arm assumed that never happens
+/// (only a genuine dependency edge used to reach a package-root namespace),
+/// so it indexed straight into `dependency_names` with a key that was never
+/// there for a self-reference.
+#[tokio::test]
+async fn hover_over_crate_keyword_does_not_panic() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let manifest_uri: Uri =
+		Uri::from_str("file:///tmp/probe_crate_kw/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe_crate_kw/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"pub fn helper() -> i32 { 1 }\n",
+					"mod a {\n",
+					"    pub fn use_it() -> i32 { crate::helper() }\n",
+					"}\n",
+					"fn main() -> i32 { a::use_it() }\n",
+					"export { main }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Line 3, inside the word "crate" in `crate::helper()`.
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 3,
+					character: 31,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `crate`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert!(
+		markup.value.contains("crate"),
+		"expected the hover text to name the package as `crate` for a \
+		 self-reference, got: {}",
+		markup.value
+	);
+}
+
 /// Operator dispatch (`a + b`) resolves to a real trait method (`Add::add`)
 /// and pushes a go-to-definition access at the *operator's own span* onto
 /// it, the same mechanism an ordinary function reference uses — so without

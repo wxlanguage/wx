@@ -11,6 +11,14 @@ repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-compiler"
 workspace = true
 
 [lib]
+bench = false
+
+[features]
+bench = []
+
+[[bench]]
+name = "lexer"
+harness = false
 
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }

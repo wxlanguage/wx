@@ -4005,7 +4005,7 @@ impl<'tir> Builder<'tir> {
 						),
 					};
 				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, &args);
+					self.ensure_aggregate_for_struct(struct_index, args);
 				let decl_index = self.tir.structs[struct_index as usize].lookup
 					[&member.inner];
 				let phys_index = self.aggregates[aggregate_index as usize]

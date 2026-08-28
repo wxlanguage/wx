@@ -68,19 +68,6 @@ impl RelativePath {
 		RelativePath(path)
 	}
 
-	/// Skips the leading-`/` check `new` performs. Not `unsafe` in the
-	/// memory-safety sense — nothing here can cause undefined behavior —
-	/// but every other consumer of a `RelativePath` assumes the invariant
-	/// holds, so getting it wrong produces confusing behavior far from
-	/// wherever the mistake was made, mirroring `std`'s own `_unchecked`
-	/// convention (`NonZeroU32::new_unchecked`,
-	/// `str::from_utf8_unchecked`). Currently unused anywhere in this
-	/// crate — kept for API completeness, not because a call site needs
-	/// it yet.
-	pub unsafe fn new_unchecked(path: String) -> Self {
-		RelativePath(path)
-	}
-
 	pub fn as_str(&self) -> &str {
 		&self.0
 	}
@@ -140,14 +127,6 @@ impl AbsolutePath {
 			path.starts_with('/'),
 			"AbsolutePath must start with `/`: `{path}`"
 		);
-		AbsolutePath(path)
-	}
-
-	/// Skips the leading-`/` check `new` performs — see
-	/// [`RelativePath::new_unchecked`] for why this isn't `unsafe` in the
-	/// memory-safety sense, just a sharp edge. Currently unused anywhere
-	/// in this crate.
-	pub unsafe fn new_unchecked(path: String) -> Self {
 		AbsolutePath(path)
 	}
 

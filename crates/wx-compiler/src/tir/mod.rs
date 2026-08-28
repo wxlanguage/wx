@@ -1020,6 +1020,13 @@ pub struct UseItem {
 	pub prefix: u32,
 	pub name: ast::Spanned<SymbolU32>,
 	pub alias: Option<ast::Spanned<SymbolU32>>,
+	/// The `use` statement's own visibility qualifier — `Some` for `pub use`.
+	/// Distinct from the visibility of whatever item this leaf re-exports:
+	/// that was already checked once, when this leaf's own prefix resolved
+	/// (`resolve_pending_namespace_symbol` from the writing namespace).
+	/// This is what governs whether *this* binding is reachable from
+	/// outside the writing namespace — see [`SymbolEntry::visibility`].
+	pub pub_span: Option<ast::TextSpan>,
 }
 
 /// One occurrence of a `use` prefix — `math` in `use math::{sin, cos};`,
@@ -1204,9 +1211,10 @@ pub enum SymbolKind {
 	Const {
 		const_index: ConstIndex,
 	},
-	/// Resolved form of a trait associated type (`type Size`). Replaces
-	/// `Pending` in the symbol lookup after `ensure_signature` processes the
-	/// declaration, so bare uses of `Size` as a type identifier don't stall.
+	/// Resolved form of a trait associated type (`type Size`). Replaces a
+	/// `SymbolEntry::Pending` in the symbol table after `ensure_signature`
+	/// processes the declaration, so bare uses of `Size` as a type
+	/// identifier don't stall.
 	TraitAssocType {
 		trait_index: TraitIndex,
 		assoc_name: SymbolU32,
@@ -1214,10 +1222,89 @@ pub enum SymbolKind {
 	TypeAlias {
 		type_alias_index: u32,
 	},
-	/// Registered during pre-scan but not yet resolved; replaced by the real
-	/// kind when `ensure_signature` runs for this `DefId`.
-	Pending(ast::DefId),
 }
+
+/// Whether a resolved [`SymbolEntry`] is reachable from outside its own
+/// namespace. Kinds that aren't subject to `pub`/private at all — memories,
+/// import-block members, and a `Module` reached via `crate`/a dependency
+/// name — are represented as `Public` too: not a claim that they were
+/// written `pub`, just the honest, unconditionally-visible behavior for
+/// something privacy doesn't apply to (see `symbol_kind_is_gated`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum Visibility {
+	Public,
+	/// Visible only to this entry's own namespace and its descendants.
+	Private,
+}
+
+/// One entry in a [`ModuleNamespace`]'s symbol table — either a claim
+/// registered at pre-scan with nothing resolved yet, or a settled binding.
+///
+/// Split out of `SymbolKind` itself (which used to carry a `Pending(DefId)`
+/// variant of its own) so a still-unresolved claim simply has no
+/// `visibility` to read: the underlying item's own `pub_span` (or a `use`
+/// leaf's) isn't known until `ensure_signature` runs, so instead of
+/// inventing a placeholder value, that state isn't representable here at
+/// all. Every lookup that only wants "what does this name mean" and
+/// doesn't care about visibility can still get a plain `SymbolKind` back
+/// via [`Self::resolved_kind`] — `None` while still pending.
+///
+/// `visibility` on `Resolved` is the visibility of *this binding* — not
+/// necessarily the same as whatever the underlying item declared. A direct
+/// declaration's entry and the item's own visibility always agree
+/// (`insert_symbol` derives one from the other). A `use` re-export's entry
+/// does not: it carries the `use` leaf's own `pub_span`, since re-export
+/// privacy is independent of the original item's — that's already checked
+/// once, when the leaf's own prefix resolved. This is what lets
+/// `SymbolKind` stay a pure item identity (needed so the same item reached
+/// through two globs compares equal) while still tracking per-binding
+/// privacy.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum SymbolEntry {
+	/// Registered during pre-scan but not yet resolved; replaced by
+	/// `Resolved` when `ensure_signature` runs for this `DefId`.
+	Pending(ast::DefId),
+	Resolved {
+		kind: SymbolKind,
+		visibility: Visibility,
+	},
+}
+
+impl SymbolEntry {
+	/// The `SymbolKind` this entry names, or `None` while still pending —
+	/// for a lookup that only cares "what does this name mean" and doesn't
+	/// need to force resolution or read visibility.
+	pub fn resolved_kind(self) -> Option<SymbolKind> {
+		match self {
+			SymbolEntry::Pending(_) => None,
+			SymbolEntry::Resolved { kind, .. } => Some(kind),
+		}
+	}
+}
+
+/// Item identity only — mirrors `SymbolKind`'s own `PartialEq` (a plain
+/// index comparison), ignoring `visibility` on `Resolved`. This is what
+/// lets a name reachable through two different globs, one via a `pub use`
+/// and one direct, still collapse into "the same item" rather than a false
+/// ambiguity even though the two entries' visibility can legitimately
+/// differ.
+impl PartialEq for SymbolEntry {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(SymbolEntry::Pending(a), SymbolEntry::Pending(b)) => a == b,
+			(
+				SymbolEntry::Resolved { kind: a, .. },
+				SymbolEntry::Resolved { kind: b, .. },
+			) => a == b,
+			_ => false,
+		}
+	}
+}
+impl Eq for SymbolEntry {}
 
 /// Result of resolving a single-segment name. Separates the two categories
 /// of symbols: global items (registered in the symbol table) and local
@@ -1306,7 +1393,7 @@ pub struct ModuleNamespace {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub symbols: HashMap<(SymbolNamespace, SymbolU32), SymbolKind>,
+	pub symbols: HashMap<(SymbolNamespace, SymbolU32), SymbolEntry>,
 	/// Namespaces brought into scope via `use path::*;`.  Checked during lookup
 	/// after direct symbols but before walking to the parent.
 	pub wildcard_imports: Vec<WildcardImport>,
@@ -2015,15 +2102,14 @@ impl<'a> TypeFormatter<'a> {
 					.ok_or(std::fmt::Error)
 					.and_then(|name| f.write_str(name))
 			}
-			Type::Namespace { namespace_idx } => self
-				.interner
-				.resolve(self.tir.namespace_name(
+			Type::Namespace { namespace_idx } => {
+				f.write_str(self.tir.namespace_name(
 					*namespace_idx,
 					self.packages,
 					self.from,
+					self.interner,
 				))
-				.ok_or(std::fmt::Error)
-				.and_then(|name| f.write_str(name)),
+			}
 			Type::Function { signature } => {
 				f.write_str("fn(")?;
 				for (i, param) in signature.params().iter().copied().enumerate()
@@ -3191,25 +3277,39 @@ impl TIR {
 	/// `foo` in one package and `bar` in another. Modules and imports are
 	/// named by their own declaration and ignore `from`.
 	///
-	/// Total: a package is only nameable from one that declared it, and
-	/// `add_dependency` keeps that name unique.
-	pub fn namespace_name(
+	/// Returns the resolved `&str` directly rather than a `SymbolU32` —
+	/// every call site immediately resolves it anyway, and it lets the one
+	/// case with no real name of its own (`crate`/`super` naming `from`'s
+	/// own package root, where nothing depends on itself so there's no
+	/// `dependencies` key to read) answer with the literal keyword text
+	/// instead of needing a symbol interned for it.
+	pub fn namespace_name<'a>(
 		&self,
 		namespace: NamespaceIndex,
 		packages: &[PackageGraph],
 		from: PackageId,
-	) -> SymbolU32 {
+		interner: &'a ast::StringInterner,
+	) -> &'a str {
 		match self.namespaces[namespace as usize].declaration {
 			ModuleDeclarationKind::Module(decl_idx) => {
-				self.module_decls[decl_idx as usize].name.inner
+				let sym = self.module_decls[decl_idx as usize].name.inner;
+				interner.resolve(sym).unwrap()
 			}
 			ModuleDeclarationKind::Import(decl_idx) => {
 				let decl = &self.import_decls[decl_idx as usize];
-				decl.internal_name.unwrap_or(decl.external_name).inner
+				let sym =
+					decl.internal_name.unwrap_or(decl.external_name).inner;
+				interner.resolve(sym).unwrap()
 			}
 			ModuleDeclarationKind::Package(_) => {
 				let target = self.namespaces[namespace as usize].package;
-				packages[from.as_usize()].dependency_names[&target]
+				if target == from {
+					"crate"
+				} else {
+					let sym =
+						packages[from.as_usize()].dependency_names[&target];
+					interner.resolve(sym).unwrap()
+				}
 			}
 		}
 	}
@@ -3219,6 +3319,60 @@ impl TIR {
 			ModuleDeclarationKind::Import(_) => true,
 			ModuleDeclarationKind::Module(_)
 			| ModuleDeclarationKind::Package(..) => false,
+		}
+	}
+
+	fn record_symbol_access(
+		&mut self,
+		file_id: FileId,
+		kind: SymbolKind,
+		span: TextSpan,
+	) {
+		let span = SourceSpan::new(file_id, span);
+		match kind {
+			SymbolKind::Struct { struct_index } => {
+				self.structs[struct_index as usize].accesses.push(span);
+			}
+			SymbolKind::Enum { enum_index } => {
+				self.enums[enum_index as usize].accesses.push(span);
+			}
+			SymbolKind::Trait { trait_index } => {
+				self.traits[trait_index as usize].accesses.push(span);
+			}
+			SymbolKind::TypeSet { typeset_index } => {
+				self.typesets[typeset_index as usize].accesses.push(span);
+			}
+			SymbolKind::TypeAlias { type_alias_index } => {
+				self.type_aliases[type_alias_index as usize]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Const { const_index } => {
+				self.constants[const_index as usize].accesses.push(span);
+			}
+			SymbolKind::Memory { memory_index, .. } => {
+				self.memories[memory_index as usize].accesses.push(span);
+			}
+			SymbolKind::Function { func_index } => {
+				self.functions[func_index as usize].accesses.push(span);
+			}
+			SymbolKind::Global { global_index } => {
+				self.globals[global_index as usize].accesses.push(span);
+			}
+			SymbolKind::TraitAssocType {
+				trait_index,
+				assoc_name,
+			} => {
+				self.traits[trait_index as usize]
+					.assoc_types
+					.get_mut(&assoc_name)
+					.unwrap()
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Module { namespace_idx } => {
+				self.namespaces[namespace_idx as usize].accesses.push(span);
+			}
 		}
 	}
 

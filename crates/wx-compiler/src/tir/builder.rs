@@ -377,7 +377,7 @@ enum PrefixWalk {
 /// [`Builder::lookup_scope_chain`].
 enum ScopeLookup {
 	NotFound,
-	Found(SymbolKind),
+	Found(SymbolEntry),
 	/// Two or more globs at one scope level supply *distinct* items for this
 	/// name, so which one wins is nothing but `use`-statement order.
 	///
@@ -385,17 +385,17 @@ enum ScopeLookup {
 	/// because the thing worth pointing a label at is the `use` statements —
 	/// each definition is fine on its own; it's importing both that isn't.
 	/// Always holds at least two entries.
-	Ambiguous(Box<[(SymbolKind, SourceSpan)]>),
+	Ambiguous(Box<[(SymbolEntry, SourceSpan)]>),
 }
 
 impl ScopeLookup {
 	/// What this name resolves to with ambiguity set aside: the first
 	/// candidate in `use` order, which is exactly what resolution silently
 	/// picked back when ambiguity wasn't detected at all.
-	fn symbol(&self) -> Option<SymbolKind> {
+	fn symbol(&self) -> Option<SymbolEntry> {
 		match self {
 			ScopeLookup::NotFound => None,
-			ScopeLookup::Found(kind) => Some(*kind),
+			ScopeLookup::Found(entry) => Some(*entry),
 			ScopeLookup::Ambiguous(candidates) => Some(candidates[0].0),
 		}
 	}
@@ -1078,9 +1078,7 @@ fn report_undeclared_identifier(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_label(span.primary_label())
 }
 
-/// What to call a `SymbolKind` in prose. `Pending` stays vague on purpose:
-/// its signature hasn't been computed, so the specific kind isn't known yet
-/// and guessing would be worse than the generic word.
+/// What to call a `SymbolKind` in prose.
 fn symbol_kind_noun(kind: SymbolKind) -> &'static str {
 	match kind {
 		SymbolKind::Enum { .. } => "enum",
@@ -1094,7 +1092,16 @@ fn symbol_kind_noun(kind: SymbolKind) -> &'static str {
 		SymbolKind::Const { .. } => "constant",
 		SymbolKind::TraitAssocType { .. } => "associated type",
 		SymbolKind::TypeAlias { .. } => "type alias",
-		SymbolKind::Pending(_) => "item",
+	}
+}
+
+/// [`symbol_kind_noun`], but for a raw `SymbolEntry` — `Pending` stays vague
+/// on purpose: its signature hasn't been computed, so the specific kind
+/// isn't known yet and guessing would be worse than the generic word.
+fn symbol_entry_noun(entry: SymbolEntry) -> &'static str {
+	match entry {
+		SymbolEntry::Pending(_) => "item",
+		SymbolEntry::Resolved { kind, .. } => symbol_kind_noun(kind),
 	}
 }
 
@@ -1938,6 +1945,19 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 			.tir
 			.package_namespaces
 			.insert(package_graph.id, namespace_idx);
+		// `crate` at a package root points at itself — there's no `super`
+		// here, since `parent: None` is exactly what marks a package
+		// boundary everywhere else in the resolver.
+		let crate_sym = builder.interner.get_or_intern("crate");
+		builder.tir.namespaces[namespace_idx as usize]
+			.symbols
+			.insert(
+				(SymbolNamespace::Type, crate_sym),
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module { namespace_idx },
+					visibility: Visibility::Public,
+				},
+			);
 	}
 
 	// A dependency is an implicit `mod <key>;` at the top of the declaring
@@ -1951,8 +1971,11 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 			let target_namespace = builder.tir.package_namespaces[target];
 			builder.tir.namespaces[owner as usize].symbols.insert(
 				(SymbolNamespace::Type, name),
-				SymbolKind::Module {
-					namespace_idx: target_namespace,
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module {
+						namespace_idx: target_namespace,
+					},
+					visibility: Visibility::Public,
 				},
 			);
 		}
@@ -2682,6 +2705,53 @@ impl<'ast> Builder<'ast, '_> {
 		})
 	}
 
+	/// Pre-populates `namespace_idx`'s own symbol table with the two
+	/// path-root keywords: `crate` (always, resolving to `package`'s own
+	/// root namespace) and `super` (only when `parent` is `Some`, resolving
+	/// there). Both are inserted as ordinary `SymbolKind::Module` entries —
+	/// indistinguishable from a real module once inserted — so every
+	/// existing path-walking function (`lookup_scope_chain`'s own-symbols
+	/// check, and every multi-segment walker's direct-lookup-in-a-known-
+	/// namespace step) already resolves them correctly with no changes of
+	/// its own, including chained `super::super::x` (each namespace on the
+	/// walk carries its own `super` entry).
+	///
+	/// Called once per namespace, right after it's pushed into
+	/// `tir.namespaces`. For a package's own root namespace, call this
+	/// *after* `tir.package_namespaces` already has that package's entry —
+	/// that's what makes the root's own `crate` naturally resolve to
+	/// itself, with `parent: None` (no `super` inserted there, matching
+	/// every other place `parent: None` already means "package boundary").
+	fn seed_path_root_symbols(
+		&mut self,
+		namespace_idx: NamespaceIndex,
+		package: PackageId,
+		parent: Option<NamespaceIndex>,
+	) {
+		let crate_sym = self.interner.get_or_intern("crate");
+		let crate_root = self.tir.package_namespaces[&package];
+		self.tir.namespaces[namespace_idx as usize].symbols.insert(
+			(SymbolNamespace::Type, crate_sym),
+			SymbolEntry::Resolved {
+				kind: SymbolKind::Module {
+					namespace_idx: crate_root,
+				},
+				visibility: Visibility::Public,
+			},
+		);
+		let Some(parent) = parent else { return };
+		let super_sym = self.interner.get_or_intern("super");
+		self.tir.namespaces[namespace_idx as usize].symbols.insert(
+			(SymbolNamespace::Type, super_sym),
+			SymbolEntry::Resolved {
+				kind: SymbolKind::Module {
+					namespace_idx: parent,
+				},
+				visibility: Visibility::Public,
+			},
+		);
+	}
+
 	/// Unconditionally creates a new module namespace as a child of
 	/// `namespace`, with no lookup — every field is set exactly once, here,
 	/// by whichever of the two callers actually has the real data:
@@ -2698,15 +2768,17 @@ impl<'ast> Builder<'ast, '_> {
 	) -> NamespaceIndex {
 		let namespace_idx = self.tir.namespaces.len() as u32;
 		let decl_idx = self.tir.module_decls.len() as u32;
+		// A nested module belongs to whatever package encloses it.
+		let package = self.tir.namespaces[namespace as usize].package;
 		self.tir.namespaces.push(ModuleNamespace {
 			parent: Some(namespace),
-			// A nested module belongs to whatever package encloses it.
-			package: self.tir.namespaces[namespace as usize].package,
+			package,
 			declaration: ModuleDeclarationKind::Module(decl_idx),
 			symbols: HashMap::new(),
 			wildcard_imports: Vec::new(),
 			accesses: Vec::new(),
 		});
+		self.seed_path_root_symbols(namespace_idx, package, Some(namespace));
 		self.tir.module_decls.push(ModuleDecl {
 			namespace_idx,
 			declaring_file_id,
@@ -2718,6 +2790,7 @@ impl<'ast> Builder<'ast, '_> {
 			namespace,
 			(SymbolNamespace::Type, name.inner),
 			SymbolKind::Module { namespace_idx },
+			pub_span,
 		);
 		namespace_idx
 	}
@@ -2743,11 +2816,14 @@ impl<'ast> Builder<'ast, '_> {
 		namespace: NamespaceIndex,
 		name: ast::Spanned<SymbolU32>,
 	) -> Option<NamespaceIndex> {
-		let existing @ SymbolKind::Module { namespace_idx } = self
-			.direct_scope_lookup(
-				namespace,
-				(SymbolNamespace::Type, name.inner),
-			)?
+		let existing = self.direct_scope_lookup(
+			namespace,
+			(SymbolNamespace::Type, name.inner),
+		)?;
+		let SymbolEntry::Resolved {
+			kind: SymbolKind::Module { namespace_idx },
+			..
+		} = existing
 		else {
 			return None;
 		};
@@ -2885,15 +2961,43 @@ impl<'ast> Builder<'ast, '_> {
 		)
 	}
 
+	/// Binds `kind` into `namespace`'s own symbol table under `key`, with
+	/// `pub_span` as *this binding's own* visibility qualifier — the item's
+	/// own `pub_span` for a direct declaration, or a `use` leaf's own for a
+	/// re-export (independent of the re-exported item's — that's already
+	/// been checked once, when the leaf's own prefix resolved). Ignored for
+	/// a `kind` that `symbol_kind_is_gated` says isn't subject to privacy
+	/// at all. Not for a still-unresolved claim — see `insert_pending`.
 	fn insert_symbol(
 		&mut self,
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		kind: SymbolKind,
+		pub_span: Option<TextSpan>,
+	) {
+		let visibility =
+			if self.symbol_kind_is_gated(kind) && pub_span.is_none() {
+				Visibility::Private
+			} else {
+				Visibility::Public
+			};
+		self.tir.namespaces[namespace as usize]
+			.symbols
+			.insert(key, SymbolEntry::Resolved { kind, visibility });
+	}
+
+	/// Registers a provisional, unresolved claim on `key` for `id` — what
+	/// every item starts as during pre-scan, before its signature (and so
+	/// its real `SymbolKind`/visibility) is known.
+	fn insert_pending(
+		&mut self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
 	) {
 		self.tir.namespaces[namespace as usize]
 			.symbols
-			.insert(key, kind);
+			.insert(key, SymbolEntry::Pending(id));
 	}
 
 	/// Looks up `key` in `namespace`'s own symbol map only — no parent-scope
@@ -2906,11 +3010,27 @@ impl<'ast> Builder<'ast, '_> {
 		&self,
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
-	) -> Option<SymbolKind> {
+	) -> Option<SymbolEntry> {
 		self.tir.namespaces[namespace as usize]
 			.symbols
 			.get(&key)
 			.copied()
+	}
+
+	/// `true` if `namespace`'s own symbol table still has `id`'s
+	/// provisional claim sitting on `key`, untouched — the ubiquitous
+	/// "do I still hold my own slot" check every item kind's Phase-2
+	/// registration makes before binding its real `SymbolKind`.
+	fn still_pending(
+		&self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+		id: ast::DefId,
+	) -> bool {
+		matches!(
+			self.direct_scope_lookup(namespace, key),
+			Some(SymbolEntry::Pending(pending_id)) if pending_id == id
+		)
 	}
 
 	/// Phase-1 registration for a name that may collide with an earlier
@@ -2936,12 +3056,12 @@ impl<'ast> Builder<'ast, '_> {
 			// [`Self::claim_use_binding`] for why the import can't be judged
 			// yet. The displaced import re-checks this slot in Phase 2 and
 			// reports the collision only if it turns out to want the name.
-			if matches!(existing, SymbolKind::Pending(def_id)
+			if matches!(existing, SymbolEntry::Pending(def_id)
 			if matches!(
 				self.tir.item_lookup.get(&def_id),
 				Some(ItemIndex::Use(_))
 			)) {
-				self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+				self.insert_pending(namespace, key, id);
 				return PendingClaim::Claimed;
 			}
 			let first_definition = self.get_symbol_location(existing);
@@ -2956,7 +3076,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 			PendingClaim::Duplicate
 		} else {
-			self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+			self.insert_pending(namespace, key, id);
 			PendingClaim::Claimed
 		}
 	}
@@ -2983,15 +3103,15 @@ impl<'ast> Builder<'ast, '_> {
 		id: ast::DefId,
 	) {
 		match self.direct_scope_lookup(namespace, key) {
-			None => self.insert_symbol(namespace, key, SymbolKind::Pending(id)),
+			None => self.insert_pending(namespace, key, id),
 			// Another import's provisional claim — take it over.
-			Some(SymbolKind::Pending(def_id))
+			Some(SymbolEntry::Pending(def_id))
 				if matches!(
 					self.tir.item_lookup.get(&def_id),
 					Some(ItemIndex::Use(_))
 				) =>
 			{
-				self.insert_symbol(namespace, key, SymbolKind::Pending(id));
+				self.insert_pending(namespace, key, id);
 			}
 			// A real declaration outranks an import. Leave it alone.
 			Some(_) => {}
@@ -3018,10 +3138,7 @@ impl<'ast> Builder<'ast, '_> {
 		let memory_index = self.tir.expect_memory_index(id);
 		let kind = TypeIndex::ERROR;
 		let type_key = (SymbolNamespace::Type, name.inner);
-		if matches!(
-			self.direct_scope_lookup(resolve_context.namespace, type_key),
-			Some(SymbolKind::Pending(pending_id)) if pending_id == id
-		) {
+		if self.still_pending(resolve_context.namespace, type_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				type_key,
@@ -3029,13 +3146,11 @@ impl<'ast> Builder<'ast, '_> {
 					memory_index,
 					size: kind,
 				},
+				None,
 			);
 		}
 		let value_key = (SymbolNamespace::Value, name.inner);
-		if matches!(
-			self.direct_scope_lookup(resolve_context.namespace, value_key),
-			Some(SymbolKind::Pending(pending_id)) if pending_id == id
-		) {
+		if self.still_pending(resolve_context.namespace, value_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				value_key,
@@ -3043,6 +3158,7 @@ impl<'ast> Builder<'ast, '_> {
 					memory_index,
 					size: kind,
 				},
+				None,
 			);
 		}
 	}
@@ -3074,57 +3190,58 @@ impl<'ast> Builder<'ast, '_> {
 		false
 	}
 
-	/// Returns the visibility span and declaring namespace for `kind`, or
-	/// `None` if this kind carries no per-item visibility of its own and
-	/// should always be treated as visible. Trait members (`TraitAssocType`)
-	/// share their trait's own visibility — `trait` bodies reject a `pub`
-	/// qualifier on their items (see `VisibilityNotPermitted` in the
-	/// parser), so there's no separate span to read for them.
-	fn symbol_visibility(
-		&self,
-		kind: SymbolKind,
-	) -> Option<(Option<TextSpan>, NamespaceIndex)> {
-		let (pub_span, declaring) = match kind {
+	/// `true` if a binding of `kind` is subject to ordinary `pub`/private
+	/// visibility at all — `false` for the kinds that stay unconditionally
+	/// visible regardless of any `pub`: memories and import-block members
+	/// (parser-rejects `pub` on both — `VisibilityNotPermitted`), and a
+	/// `Module` reached via `crate`/a dependency name or an import block's
+	/// own alias (never user-writable visibility; only a real `mod foo;`/
+	/// `mod foo { }` is gated, using its own `ModuleDecl.pub_span`). Trait
+	/// members (`TraitAssocType`) share their trait's own gating — `trait`
+	/// bodies reject a `pub` qualifier on their items (see
+	/// `VisibilityNotPermitted` in the parser), so there's no separate span
+	/// to read for them.
+	///
+	/// `insert_symbol` calls this to decide whether the `pub_span` it was
+	/// given actually matters — used both for a direct declaration's own
+	/// visibility and, unchanged, for a `use` re-export's (the leaf's own
+	/// `pub_span` in place of the original item's): an exempt kind must
+	/// stay exempt either way, not become newly gated just for having gone
+	/// through a `use`.
+	fn symbol_kind_is_gated(&self, kind: SymbolKind) -> bool {
+		let declaring = match kind {
 			SymbolKind::Enum { enum_index } => {
-				let item = &self.tir.enums[enum_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.enums[enum_index as usize].namespace
 			}
 			SymbolKind::Struct { struct_index } => {
-				let item = &self.tir.structs[struct_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.structs[struct_index as usize].namespace
 			}
 			SymbolKind::Trait { trait_index }
 			| SymbolKind::TraitAssocType { trait_index, .. } => {
-				let item = &self.tir.traits[trait_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.traits[trait_index as usize].namespace
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				let item = &self.tir.typesets[typeset_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.typesets[typeset_index as usize].namespace
 			}
 			SymbolKind::Global { global_index } => {
-				let item = &self.tir.globals[global_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.globals[global_index as usize].namespace
 			}
 			SymbolKind::Function { func_index } => {
-				let item = &self.tir.functions[func_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.functions[func_index as usize].namespace
 			}
 			SymbolKind::Const { const_index } => {
-				let item = &self.tir.constants[const_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.constants[const_index as usize].namespace
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				let item = &self.tir.type_aliases[type_alias_index as usize];
-				(item.pub_span, item.namespace)
+				self.tir.type_aliases[type_alias_index as usize].namespace
 			}
-			// Modules and memories aren't gated yet; `Pending` items haven't
-			// allocated their arena slot yet, so there's nothing to read —
-			// callers that care about privacy for a `Pending` result force
-			// it through `ensure_signature` and check again afterwards.
-			SymbolKind::Module { .. }
-			| SymbolKind::Memory { .. }
-			| SymbolKind::Pending(_) => return None,
+			SymbolKind::Module { namespace_idx } => {
+				return matches!(
+					self.tir.namespaces[namespace_idx as usize].declaration,
+					ModuleDeclarationKind::Module(_)
+				);
+			}
+			SymbolKind::Memory { .. } => return false,
 		};
 		// `import "env" { fn log(...); }` declarations share the same
 		// `ModuleNamespace` machinery as real modules, but there's no
@@ -3132,29 +3249,60 @@ impl<'ast> Builder<'ast, '_> {
 		// their functions/globals never carry a real `pub_span`. Without
 		// this, every import would read as private-by-default and become
 		// uncallable from outside the `import` block itself.
-		if matches!(
+		!matches!(
 			self.tir.namespaces[declaring as usize].declaration,
 			ModuleDeclarationKind::Import(..)
-		) {
-			return None;
-		}
-		Some((pub_span, declaring))
+		)
 	}
 
-	/// `true` if `kind`, found while resolving from `accessor`, is
-	/// accessible: either it's `pub`, or `accessor` is the declaring
-	/// namespace or a descendant of it.
-	fn symbol_is_visible(
+	/// `true` if `visibility`, found in `declaring_namespace` while
+	/// resolving from `accessor`, is accessible: either it's `Public`, or
+	/// `accessor` is `declaring_namespace` or a descendant of it.
+	/// `declaring_namespace` is whichever namespace's own `symbols` map the
+	/// entry was found in — for a direct declaration that's the same
+	/// namespace `symbol_kind_is_gated` read `pub_span` from; for a `use`
+	/// re-export it's the namespace that wrote the `use`, not the original
+	/// item's.
+	fn visible_from(
 		&self,
 		accessor: NamespaceIndex,
-		kind: SymbolKind,
+		declaring_namespace: NamespaceIndex,
+		visibility: Visibility,
 	) -> bool {
-		match self.symbol_visibility(kind) {
-			Some((pub_span, declaring)) => {
-				pub_span.is_some()
-					|| self.is_ancestor_or_self(accessor, declaring)
+		match visibility {
+			Visibility::Public => true,
+			Visibility::Private => {
+				self.is_ancestor_or_self(accessor, declaring_namespace)
 			}
-			None => true,
+		}
+	}
+
+	/// [`Self::visible_from`], for a raw `SymbolEntry` straight out of a
+	/// `symbols` map — used by the one caller that reads visibility off an
+	/// entry that might still be `Pending` (`lookup_scope_chain`'s wildcard
+	/// loop).
+	///
+	/// TODO: a still-`Pending` entry is always treated as visible here,
+	/// without forcing its signature — there's no `Visibility` to read yet
+	/// (see `SymbolEntry`). Safe only because the one caller that needs a
+	/// *real* answer for a name that might be `Pending`
+	/// (`resolve_pending_global_symbol`/`resolve_pending_namespace_symbol`)
+	/// forces resolution via `ensure_signature` and re-fetches the
+	/// now-resolved entry before trusting it — so this is never the value
+	/// an actual gating decision runs on. But nothing enforces that in the
+	/// type system: don't reuse this for a new caller without confirming it
+	/// can't observe a still-`Pending` entry as final.
+	fn entry_visible_from(
+		&self,
+		accessor: NamespaceIndex,
+		declaring_namespace: NamespaceIndex,
+		entry: SymbolEntry,
+	) -> bool {
+		match entry {
+			SymbolEntry::Pending(_) => true,
+			SymbolEntry::Resolved { visibility, .. } => {
+				self.visible_from(accessor, declaring_namespace, visibility)
+			}
 		}
 	}
 
@@ -3167,7 +3315,7 @@ impl<'ast> Builder<'ast, '_> {
 		&self,
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
-	) -> Option<SymbolKind> {
+	) -> Option<SymbolEntry> {
 		self.lookup_scope_chain(namespace, key).symbol()
 	}
 
@@ -3196,38 +3344,45 @@ impl<'ast> Builder<'ast, '_> {
 			// A name declared or explicitly imported here always wins, and
 			// wins unambiguously — which is what makes `use x::foo;` the
 			// documented way out of a glob ambiguity.
-			if let Some(kind) = namespace_ref.symbols.get(&key).copied() {
-				return ScopeLookup::Found(kind);
+			if let Some(entry) = namespace_ref.symbols.get(&key).copied() {
+				return ScopeLookup::Found(entry);
 			}
 
-			let mut first: Option<(SymbolKind, SourceSpan)> = None;
-			let mut candidates: Vec<(SymbolKind, SourceSpan)> = Vec::new();
+			let mut first: Option<(SymbolEntry, SourceSpan)> = None;
+			let mut candidates: Vec<(SymbolEntry, SourceSpan)> = Vec::new();
 			for import in namespace_ref.wildcard_imports.iter() {
-				let Some(kind) = self.tir.namespaces[import.namespace as usize]
+				let Some(entry) = self.tir.namespaces
+					[import.namespace as usize]
 					.symbols
 					.get(&key)
 					.copied()
-					.filter(|kind| self.symbol_is_visible(namespace, *kind))
+					.filter(|entry| {
+						self.entry_visible_from(
+							namespace,
+							import.namespace,
+							*entry,
+						)
+					})
 				else {
 					continue;
 				};
 				match first {
 					// The same item reached two ways is not a conflict.
-					Some((seen, _)) if seen == kind => {}
+					Some((seen, _)) if seen == entry => {}
 					Some(seen) => {
 						if candidates.is_empty() {
 							candidates.push(seen);
 						}
-						candidates.push((kind, import.span));
+						candidates.push((entry, import.span));
 					}
-					None => first = Some((kind, import.span)),
+					None => first = Some((entry, import.span)),
 				}
 			}
 			if !candidates.is_empty() {
 				return ScopeLookup::Ambiguous(candidates.into_boxed_slice());
 			}
-			if let Some((kind, _)) = first {
-				return ScopeLookup::Found(kind);
+			if let Some((entry, _)) = first {
+				return ScopeLookup::Found(entry);
 			}
 			current = namespace_ref.parent;
 		}
@@ -3249,7 +3404,7 @@ impl<'ast> Builder<'ast, '_> {
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
-	) -> Option<SymbolKind> {
+	) -> Option<SymbolEntry> {
 		match self.lookup_scope_chain(namespace, key) {
 			ScopeLookup::Ambiguous(candidates) => {
 				self.report_wildcard_ambiguity(key.1, span, &candidates);
@@ -3272,7 +3427,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		name: SymbolU32,
 		reference: SourceSpan,
-		candidates: &[(SymbolKind, SourceSpan)],
+		candidates: &[(SymbolEntry, SourceSpan)],
 	) {
 		let name = self.interner.resolve(name).unwrap();
 		let mut diagnostic = Diagnostic::error()
@@ -3281,12 +3436,12 @@ impl<'ast> Builder<'ast, '_> {
 			.with_label(
 				reference.primary_label().with_message("ambiguous name"),
 			);
-		for (index, (kind, span)) in candidates.iter().enumerate() {
+		for (index, (entry, span)) in candidates.iter().enumerate() {
 			diagnostic = diagnostic.with_label(
 				span.secondary_label().with_message(format!(
 					"`{name}` could {}refer to the {} imported here",
 					if index == 0 { "" } else { "also " },
-					symbol_kind_noun(*kind),
+					symbol_entry_noun(*entry),
 				)),
 			);
 		}
@@ -3317,7 +3472,7 @@ impl<'ast> Builder<'ast, '_> {
 		// same lookup, and the ambiguity is a property of the imports rather
 		// than of anything a signature could change.
 		match self.lookup_global_symbol_reporting(namespace, key, span) {
-			Some(SymbolKind::Pending(def_id)) => {
+			Some(SymbolEntry::Pending(def_id)) => {
 				if matches!(
 					self.sig_state.get(&def_id),
 					Some(SigEntry {
@@ -3331,9 +3486,15 @@ impl<'ast> Builder<'ast, '_> {
 					return Err(());
 				}
 				self.ensure_signature(def_id);
-				Ok(self.lookup_global_symbol(namespace, key))
+				// Still pending after one force is not expected in
+				// practice (see `SymbolEntry`'s docs), but rather than
+				// propagate a phantom result, this folds it to `None` —
+				// the same as a name that was never found.
+				Ok(self
+					.lookup_global_symbol(namespace, key)
+					.and_then(SymbolEntry::resolved_kind))
 			}
-			other => Ok(other),
+			other => Ok(other.and_then(SymbolEntry::resolved_kind)),
 		}
 	}
 
@@ -3364,7 +3525,7 @@ impl<'ast> Builder<'ast, '_> {
 			.get(&key)
 			.copied()
 		{
-			Some(SymbolKind::Pending(def_id)) => {
+			Some(SymbolEntry::Pending(def_id)) => {
 				if matches!(
 					self.sig_state.get(&def_id),
 					Some(SigEntry {
@@ -3385,14 +3546,39 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			other => other,
 		};
-		if let Some(kind) = resolved
-			&& !self.symbol_is_visible(accessor_namespace, kind)
-		{
-			let name = self.interner.resolve(key.1).unwrap();
-			self.tir.diagnostics.push(report_private_item(name, span));
-			return Err(());
+		match resolved {
+			Some(SymbolEntry::Resolved { kind, visibility }) => {
+				if !self.visible_from(
+					accessor_namespace,
+					target_namespace,
+					visibility,
+				) {
+					// Name resolution still succeeded — it's only the
+					// accessibility check that failed — so this is a real
+					// reference, same as Rust treats a private-item access
+					// (E0603): resolved, then separately rejected. Recording
+					// it here, before rejecting, is what lets hover/
+					// go-to-definition work on it and keeps `report_unused_items`
+					// from *also* calling it dead code on top of `PrivateItem`.
+					// Every caller's own `record_symbol_access` call sits
+					// on the success path only, so this doesn't double up.
+					self.tir.record_symbol_access(
+						span.file_id,
+						kind,
+						span.span,
+					);
+					let name = self.interner.resolve(key.1).unwrap();
+					self.tir.diagnostics.push(report_private_item(name, span));
+					return Err(());
+				}
+				Ok(Some(kind))
+			}
+			// Still pending after one force — not expected in practice
+			// (see `SymbolEntry`'s docs) — folds to `None`, same as a name
+			// that was never found, rather than fabricating a visibility
+			// answer for it.
+			Some(SymbolEntry::Pending(_)) | None => Ok(None),
 		}
-		Ok(resolved)
 	}
 
 	/// Resolves a single name in value position: local variables first,
@@ -3592,17 +3778,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			#[cfg(debug_assertions)]
-			symbol @ (SymbolKind::TraitAssocType { .. }
-			| SymbolKind::Pending(_)) => match symbol {
-				SymbolKind::Pending(def_id) => {
-					let item = self
-						.ast_nodes
-						.iter()
-						.find(|item| item.def_id == def_id);
-					unreachable!("{:#?}", item);
-				}
-				_ => unreachable!(),
-			},
+			SymbolKind::TraitAssocType { .. } => unreachable!(),
 			#[cfg(not(debug_assertions))]
 			_ => unreachable!(),
 		}
@@ -3643,8 +3819,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			SymbolKind::Trait { .. }
 			| SymbolKind::TypeSet { .. }
-			| SymbolKind::TraitAssocType { .. }
-			| SymbolKind::Pending(_) => None,
+			| SymbolKind::TraitAssocType { .. } => None,
 			SymbolKind::TypeAlias { type_alias_index } => {
 				Some(self.tir.type_aliases[type_alias_index as usize].body)
 			}
@@ -3830,7 +4005,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			symbol => {
-				self.record_type_kind_access(
+				self.tir.record_symbol_access(
 					resolve_context.file_id,
 					symbol,
 					identifier.span,
@@ -4174,7 +4349,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			ast::TypeExpression::GenericApplication { name, args } => {
-				if let Some(SymbolKind::Pending(def_id)) = self
+				if let Some(SymbolEntry::Pending(def_id)) = self
 					.lookup_global_symbol_reporting(
 						resolve_context.namespace,
 						(SymbolNamespace::Type, name.inner),
@@ -4182,10 +4357,13 @@ impl<'ast> Builder<'ast, '_> {
 					) {
 					self.ensure_signature(def_id);
 				}
-				match self.lookup_global_symbol(
-					resolve_context.namespace,
-					(SymbolNamespace::Type, name.inner),
-				) {
+				match self
+					.lookup_global_symbol(
+						resolve_context.namespace,
+						(SymbolNamespace::Type, name.inner),
+					)
+					.and_then(SymbolEntry::resolved_kind)
+				{
 					Some(
 						kind @ (SymbolKind::Struct { .. }
 						| SymbolKind::TypeAlias { .. }),
@@ -4281,7 +4459,7 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				return TypeIndex::ERROR;
 			}
-			if let Some(SymbolKind::Pending(def_id)) = self
+			if let Some(SymbolEntry::Pending(def_id)) = self
 				.lookup_global_symbol_reporting(
 					resolve_context.namespace,
 					(SymbolNamespace::Type, last.ident.inner),
@@ -4289,10 +4467,13 @@ impl<'ast> Builder<'ast, '_> {
 				) {
 				self.ensure_signature(def_id);
 			}
-			let Some(symbol_kind) = self.lookup_global_symbol(
-				resolve_context.namespace,
-				(SymbolNamespace::Type, last.ident.inner),
-			) else {
+			let Some(symbol_kind) = self
+				.lookup_global_symbol(
+					resolve_context.namespace,
+					(SymbolNamespace::Type, last.ident.inner),
+				)
+				.and_then(SymbolEntry::resolved_kind)
+			else {
 				self.tir.diagnostics.push(
 					Diagnostic::error()
 						.with_message("type arguments are not supported here")
@@ -5050,7 +5231,60 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	fn get_symbol_location(&self, symbol: SymbolKind) -> SourceSpan {
+	fn get_symbol_location(&self, entry: SymbolEntry) -> SourceSpan {
+		let symbol = match entry {
+			SymbolEntry::Resolved { kind, .. } => kind,
+			// A `Pending` entry always has a stub already pushed by
+			// `pre_scan_item` (every syntactic occurrence is unconditionally
+			// registered there, duplicate or not), so its declaration span
+			// is available via `item_lookup` even though its fields/value
+			// haven't been resolved yet.
+			SymbolEntry::Pending(def_id) => {
+				return match self.tir.item_lookup[&def_id] {
+					ItemIndex::Function(idx) => {
+						let f = &self.tir.functions[idx as usize];
+						SourceSpan::new(f.file_id, f.name.span)
+					}
+					// An import's "declaration" is the local name it binds,
+					// which is the alias when it has one — that's the name
+					// that actually collided.
+					ItemIndex::Use(idx) => {
+						let u = &self.tir.use_items[idx as usize];
+						SourceSpan::new(u.file_id, u.local_name().span)
+					}
+					ItemIndex::Global(idx) => {
+						let g = &self.tir.globals[idx as usize];
+						SourceSpan::new(g.file_id, g.name.span)
+					}
+					ItemIndex::Memory(idx) => {
+						let m = &self.tir.memories[idx as usize];
+						SourceSpan::new(m.file_id, m.name.span)
+					}
+					ItemIndex::Struct(idx) => {
+						let s = &self.tir.structs[idx as usize];
+						SourceSpan::new(s.file_id, s.name.span)
+					}
+					ItemIndex::Const(idx) => {
+						let c = &self.tir.constants[idx as usize];
+						SourceSpan::new(c.file_id, c.name.span)
+					}
+					ItemIndex::Enum(idx) => {
+						let e = &self.tir.enums[idx as usize];
+						SourceSpan::new(e.file_id, e.name.span)
+					}
+					ItemIndex::TypeAlias(idx) => {
+						let a = &self.tir.type_aliases[idx as usize];
+						SourceSpan::new(a.file_id, a.name.span)
+					}
+					// TODO: chaugh panic when writing impl for trait, need to revisit this
+					ItemIndex::TypeSet(_)
+					| ItemIndex::Trait(_)
+					| ItemIndex::TraitImpl(_) => unreachable!(
+						"these kinds never install a Pending symbol"
+					),
+				};
+			}
+		};
 		match symbol {
 			SymbolKind::Function { func_index } => {
 				let func = &self.tir.functions[func_index as usize];
@@ -5107,56 +5341,6 @@ impl<'ast> Builder<'ast, '_> {
 				let alias = &self.tir.type_aliases[type_alias_index as usize];
 				SourceSpan::new(alias.file_id, alias.name.span)
 			}
-			// A `Pending` entry always has a stub already pushed by
-			// `pre_scan_item` (every syntactic occurrence is unconditionally
-			// registered there, duplicate or not), so its declaration span
-			// is available via `item_lookup` even though its fields/value
-			// haven't been resolved yet.
-			SymbolKind::Pending(def_id) => {
-				match self.tir.item_lookup[&def_id] {
-					ItemIndex::Function(idx) => {
-						let f = &self.tir.functions[idx as usize];
-						SourceSpan::new(f.file_id, f.name.span)
-					}
-					// An import's "declaration" is the local name it binds,
-					// which is the alias when it has one — that's the name
-					// that actually collided.
-					ItemIndex::Use(idx) => {
-						let u = &self.tir.use_items[idx as usize];
-						SourceSpan::new(u.file_id, u.local_name().span)
-					}
-					ItemIndex::Global(idx) => {
-						let g = &self.tir.globals[idx as usize];
-						SourceSpan::new(g.file_id, g.name.span)
-					}
-					ItemIndex::Memory(idx) => {
-						let m = &self.tir.memories[idx as usize];
-						SourceSpan::new(m.file_id, m.name.span)
-					}
-					ItemIndex::Struct(idx) => {
-						let s = &self.tir.structs[idx as usize];
-						SourceSpan::new(s.file_id, s.name.span)
-					}
-					ItemIndex::Const(idx) => {
-						let c = &self.tir.constants[idx as usize];
-						SourceSpan::new(c.file_id, c.name.span)
-					}
-					ItemIndex::Enum(idx) => {
-						let e = &self.tir.enums[idx as usize];
-						SourceSpan::new(e.file_id, e.name.span)
-					}
-					ItemIndex::TypeAlias(idx) => {
-						let a = &self.tir.type_aliases[idx as usize];
-						SourceSpan::new(a.file_id, a.name.span)
-					}
-					// TODO: chaugh panic when writing impl for trait, need to revisit this
-					ItemIndex::TypeSet(_)
-					| ItemIndex::Trait(_)
-					| ItemIndex::TraitImpl(_) => unreachable!(
-						"these kinds never install a Pending symbol"
-					),
-				}
-			}
 		}
 	}
 
@@ -5184,8 +5368,8 @@ impl<'ast> Builder<'ast, '_> {
 	/// range of source.
 	fn pre_scan_use_tree(
 		&mut self,
-		file_id: FileId,
-		namespace: NamespaceIndex,
+		resolve_context: ResolveContext,
+		pub_span: Option<ast::TextSpan>,
 		tree: &'ast ast::Spanned<ast::UseTree>,
 		prefix: &mut Vec<ast::Spanned<SymbolU32>>,
 		contiguous_start: u32,
@@ -5199,8 +5383,8 @@ impl<'ast> Builder<'ast, '_> {
 				// hence `None` going down, and the caller's own index coming
 				// back out untouched for whatever follows this subtree.
 				self.pre_scan_use_tree(
-					file_id,
-					namespace,
+					resolve_context,
+					pub_span,
 					rest,
 					prefix,
 					contiguous_start,
@@ -5217,8 +5401,8 @@ impl<'ast> Builder<'ast, '_> {
 				let mut shared = prefix_index;
 				for element in elements.iter() {
 					shared = self.pre_scan_use_tree(
-						file_id,
-						namespace,
+						resolve_context,
+						pub_span,
 						&element.inner,
 						prefix,
 						element.inner.span.start,
@@ -5231,17 +5415,19 @@ impl<'ast> Builder<'ast, '_> {
 				// Silent on every failure: this runs before other files have
 				// been scanned, so "not found" here means "not yet", and a
 				// bare `use *;` names nothing to import.
-				let PrefixWalk::Resolved(source_ns) =
-					self.walk_use_prefix(file_id, namespace, prefix)
-				else {
+				let PrefixWalk::Resolved(source_ns) = self.walk_use_prefix(
+					resolve_context.file_id,
+					resolve_context.namespace,
+					prefix,
+				) else {
 					return prefix_index;
 				};
-				self.tir.namespaces[namespace as usize]
+				self.tir.namespaces[resolve_context.namespace as usize]
 					.wildcard_imports
 					.push(WildcardImport {
 						namespace: source_ns,
 						span: SourceSpan::new(
-							file_id,
+							resolve_context.file_id,
 							ast::TextSpan::new(contiguous_start, tree.span.end),
 						),
 					});
@@ -5260,7 +5446,7 @@ impl<'ast> Builder<'ast, '_> {
 					[SymbolNamespace::Type, SymbolNamespace::Value]
 				{
 					self.claim_use_binding(
-						namespace,
+						resolve_context.namespace,
 						(symbol_namespace, local.inner),
 						*id,
 					);
@@ -5289,16 +5475,17 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir.item_lookup.insert(*id, ItemIndex::Use(use_index));
 				self.tir.use_items.push(UseItem {
 					id: *id,
-					file_id,
-					namespace,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
 					prefix: prefix_index,
 					name: *name,
 					alias: *alias,
+					pub_span,
 				});
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
-					file_id,
-					namespace,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
 					node: AstNodeRef::Use { use_index },
 				});
 				Some(prefix_index)
@@ -5316,13 +5503,14 @@ impl<'ast> Builder<'ast, '_> {
 	/// but symbol still pending" unreachable at the next reference to it.
 	fn resolve_use_item(&mut self, use_index: u32) {
 		let item = &self.tir.use_items[use_index as usize];
-		let (id, file_id, namespace, name, local, prefix) = (
+		let (id, file_id, namespace, name, local, prefix, pub_span) = (
 			item.id,
 			item.file_id,
 			item.namespace,
 			item.name,
 			item.local_name(),
 			item.prefix,
+			item.pub_span,
 		);
 		let name_span = SourceSpan::new(file_id, name.span);
 
@@ -5397,7 +5585,7 @@ impl<'ast> Builder<'ast, '_> {
 					// collision from a claim that was about to be withdrawn
 					// anyway. It cannot recurse back into this leaf: a rival
 					// only ever displaced us, so we hold nothing it wants.
-					if let Some(SymbolKind::Pending(rival)) =
+					if let Some(SymbolEntry::Pending(rival)) =
 						self.direct_scope_lookup(namespace, key)
 						&& rival != id && matches!(
 						self.tir.item_lookup.get(&rival),
@@ -5408,12 +5596,14 @@ impl<'ast> Builder<'ast, '_> {
 
 					match self.direct_scope_lookup(namespace, key) {
 						// Ours, or vacated by a rival that didn't want it.
-						Some(SymbolKind::Pending(pending_id))
+						Some(SymbolEntry::Pending(pending_id))
 							if pending_id == id =>
 						{
-							self.insert_symbol(namespace, key, kind);
+							self.insert_symbol(namespace, key, kind, pub_span);
 						}
-						None => self.insert_symbol(namespace, key, kind),
+						None => {
+							self.insert_symbol(namespace, key, kind, pub_span)
+						}
 						// Someone else really holds this name. Now that the
 						// import is known to want it, the collision is real —
 						// report it here, where prescan couldn't.
@@ -5432,7 +5622,7 @@ impl<'ast> Builder<'ast, '_> {
 					// every access into a reference, so a rename would
 					// emit two overlapping edits at one range.
 					if !bound_any {
-						self.record_type_kind_access(file_id, kind, name.span);
+						self.tir.record_symbol_access(file_id, kind, name.span);
 					}
 					bound_any = true;
 				}
@@ -5461,12 +5651,12 @@ impl<'ast> Builder<'ast, '_> {
 			// A package has no name of its own — it's known by the key the
 			// asking package declared it under, so this needs the *asking*
 			// namespace's package, not the target's.
-			let module = self.tir.namespace_name(
+			let module_str = self.tir.namespace_name(
 				target_ns,
 				self.packages,
 				self.tir.namespaces[namespace as usize].package,
+				self.interner,
 			);
-			let module_str = self.interner.resolve(module).unwrap();
 			self.tir.diagnostics.push(report_unresolved_import(
 				name_str, module_str, name_span,
 			));
@@ -5479,7 +5669,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// definition.
 	fn report_import_collision(
 		&mut self,
-		occupant: SymbolKind,
+		occupant: SymbolEntry,
 		symbol_namespace: SymbolNamespace,
 		local: ast::Spanned<SymbolU32>,
 		import: SourceSpan,
@@ -5514,10 +5704,7 @@ impl<'ast> Builder<'ast, '_> {
 		symbol_namespace: SymbolNamespace,
 	) {
 		let key = (symbol_namespace, local);
-		if matches!(
-			self.direct_scope_lookup(namespace, key),
-			Some(SymbolKind::Pending(pending_id)) if pending_id == id
-		) {
+		if self.still_pending(namespace, key, id) {
 			self.tir.namespaces[namespace as usize].symbols.remove(&key);
 		}
 	}
@@ -5577,7 +5764,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 			match kind {
-				Some(SymbolKind::Module { namespace_idx }) => {
+				Some(SymbolEntry::Resolved {
+					kind: SymbolKind::Module { namespace_idx },
+					..
+				}) => {
 					self.tir.namespaces[namespace_idx as usize]
 						.accesses
 						.push(span);
@@ -5920,7 +6110,7 @@ impl<'ast> Builder<'ast, '_> {
 				let existing_direct =
 					self.direct_scope_lookup(namespace, trait_key);
 				if let Some(existing) = existing_direct
-					.filter(|k| !matches!(k, SymbolKind::Pending(_)))
+					.filter(|k| !matches!(k, SymbolEntry::Pending(_)))
 				{
 					let name_str = self.interner.resolve(name.inner).unwrap();
 					let first_definition = self.get_symbol_location(existing);
@@ -5962,10 +6152,10 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::TraitItem::AssociatedType { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Type, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -6014,6 +6204,7 @@ impl<'ast> Builder<'ast, '_> {
 					namespace,
 					(SymbolNamespace::Type, name.inner),
 					SymbolKind::Trait { trait_index },
+					*pub_span,
 				);
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
@@ -6123,14 +6314,20 @@ impl<'ast> Builder<'ast, '_> {
 				};
 				let namespace_idx = self.tir.namespaces.len() as u32;
 				let decl_idx = self.tir.import_decls.len() as u32;
+				let package = self.tir.namespaces[namespace as usize].package;
 				self.tir.namespaces.push(ModuleNamespace {
 					parent: Some(namespace),
-					package: self.tir.namespaces[namespace as usize].package,
+					package,
 					declaration: ModuleDeclarationKind::Import(decl_idx),
 					symbols: HashMap::new(),
 					wildcard_imports: Vec::new(),
 					accesses: Vec::new(),
 				});
+				self.seed_path_root_symbols(
+					namespace_idx,
+					package,
+					Some(namespace),
+				);
 				// Only a real, user-written alias is ever checked for a
 				// collision or bound as a `Type`-namespace name —
 				// `external_name` (the unescaped import-path string) was
@@ -6149,6 +6346,7 @@ impl<'ast> Builder<'ast, '_> {
 								namespace,
 								(SymbolNamespace::Type, alias.inner),
 								SymbolKind::Module { namespace_idx },
+								None,
 							);
 						}
 					}
@@ -6172,10 +6370,10 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::ImportDeclaration::Global { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Value, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -6188,15 +6386,15 @@ impl<'ast> Builder<'ast, '_> {
 							});
 						}
 						ast::ImportDeclaration::Memory { id, name, .. } => {
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Type, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
-							self.insert_symbol(
+							self.insert_pending(
 								namespace,
 								(SymbolNamespace::Value, name.inner),
-								SymbolKind::Pending(*id),
+								*id,
 							);
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
@@ -6215,11 +6413,11 @@ impl<'ast> Builder<'ast, '_> {
 					lookup: HashMap::new(),
 				});
 			}
-			ast::Item::Use { tree, pub_span: _ } => {
+			ast::Item::Use { tree, pub_span } => {
 				let mut prefix: Vec<ast::Spanned<SymbolU32>> = Vec::new();
 				self.pre_scan_use_tree(
-					file_id,
-					namespace,
+					ResolveContext::new(file_id, namespace),
+					*pub_span,
 					tree,
 					&mut prefix,
 					tree.span.start,
@@ -6266,6 +6464,7 @@ impl<'ast> Builder<'ast, '_> {
 					namespace,
 					(SymbolNamespace::Type, name.inner),
 					SymbolKind::TypeSet { typeset_index },
+					*pub_span,
 				);
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
@@ -6347,14 +6546,15 @@ impl<'ast> Builder<'ast, '_> {
 
 		match node {
 			AstNodeRef::Struct { item } => {
-				let (id, name, ast_type_params, fields) = match item {
+				let (id, name, ast_type_params, fields, pub_span) = match item {
 					ast::Item::Struct {
 						id,
 						name,
 						type_params,
 						fields,
+						pub_span,
 						..
-					} => (id, name, type_params, fields),
+					} => (id, name, type_params, fields, pub_span),
 					_ => unreachable!(),
 				};
 				let struct_index = self.tir.expect_struct_index(*id);
@@ -6368,14 +6568,12 @@ impl<'ast> Builder<'ast, '_> {
 				// with), skip the bind: this struct still gets its fields
 				// fully resolved below, it just never becomes referenceable.
 				let key = (SymbolNamespace::Type, name.inner);
-				if matches!(
-					self.direct_scope_lookup(resolve_context.namespace, key),
-					Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-				) {
+				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
 						SymbolKind::Struct { struct_index },
+						*pub_span,
 					);
 				}
 				// Resolve bounds now that the struct is registered and names are in TIR.
@@ -6457,16 +6655,18 @@ impl<'ast> Builder<'ast, '_> {
 				);
 			}
 			AstNodeRef::TypeAlias { item } => {
-				let (id, name, ast_type_params, body_expr) = match item {
-					ast::Item::TypeAlias {
-						id,
-						name,
-						type_params,
-						body,
-						..
-					} => (id, name, type_params, body),
-					_ => unreachable!(),
-				};
+				let (id, name, ast_type_params, body_expr, pub_span) =
+					match item {
+						ast::Item::TypeAlias {
+							id,
+							name,
+							type_params,
+							body,
+							pub_span,
+							..
+						} => (id, name, type_params, body, pub_span),
+						_ => unreachable!(),
+					};
 				let type_alias_index = self.tir.expect_type_alias_index(*id);
 
 				// Deliberately NOT calling insert_symbol yet: the symbol table
@@ -6529,14 +6729,12 @@ impl<'ast> Builder<'ast, '_> {
 				// `Pending` slot — see the identical comment on the Struct
 				// branch.
 				let key = (SymbolNamespace::Type, name.inner);
-				if matches!(
-					self.direct_scope_lookup(resolve_context.namespace, key),
-					Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-				) {
+				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
 						SymbolKind::TypeAlias { type_alias_index },
+						*pub_span,
 					);
 				}
 			}
@@ -6546,6 +6744,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					repr,
 					variants,
+					pub_span,
 					..
 				} = item
 				{
@@ -6562,21 +6761,29 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Type, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Enum { enum_index },
+							*pub_span,
 						);
 					}
 				}
 			}
 			AstNodeRef::Function { item } => match item {
-				ast::Item::Function { id, signature, .. }
-				| ast::Item::FunctionDeclaration { id, signature, .. } => {
+				ast::Item::Function {
+					id,
+					signature,
+					pub_span,
+					..
+				}
+				| ast::Item::FunctionDeclaration {
+					id,
+					signature,
+					pub_span,
+					..
+				} => {
 					let func_index = self.tir.expect_function_index(*id);
 					self.resolve_type_param_bounds(
 						resolve_context,
@@ -6603,14 +6810,12 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Value, signature.name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Function { func_index },
+							*pub_span,
 						);
 					}
 				}
@@ -7222,7 +7427,14 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			AstNodeRef::Global { item } => {
-				if let ast::Item::Global { name, ty, id, .. } = item {
+				if let ast::Item::Global {
+					name,
+					ty,
+					id,
+					pub_span,
+					..
+				} = item
+				{
 					let global_index = self.tir.expect_global_index(*id);
 					let (ty_idx, ty_span) = match ty {
 						Some(ty) => (
@@ -7254,14 +7466,12 @@ impl<'ast> Builder<'ast, '_> {
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
 					let key = (SymbolNamespace::Value, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Global { global_index },
+							*pub_span,
 						);
 					}
 				}
@@ -7474,9 +7684,10 @@ impl<'ast> Builder<'ast, '_> {
 					// independent claims (mirroring the two separate
 					// `claim_name_binding` calls in `pre_scan_item`).
 					let type_key = (SymbolNamespace::Type, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, type_key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
+					if self.still_pending(
+						resolve_context.namespace,
+						type_key,
+						*id,
 					) {
 						self.insert_symbol(
 							resolve_context.namespace,
@@ -7485,12 +7696,14 @@ impl<'ast> Builder<'ast, '_> {
 								memory_index,
 								size: memory_size.inner,
 							},
+							None,
 						);
 					}
 					let value_key = (SymbolNamespace::Value, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, value_key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
+					if self.still_pending(
+						resolve_context.namespace,
+						value_key,
+						*id,
 					) {
 						self.insert_symbol(
 							resolve_context.namespace,
@@ -7499,6 +7712,7 @@ impl<'ast> Builder<'ast, '_> {
 								memory_index,
 								size: memory_size.inner,
 							},
+							None,
 						);
 					}
 				}
@@ -7509,6 +7723,7 @@ impl<'ast> Builder<'ast, '_> {
 					name,
 					ty,
 					value,
+					pub_span,
 					..
 				} = item
 				{
@@ -7578,14 +7793,12 @@ impl<'ast> Builder<'ast, '_> {
 					// `MIR::build` whenever TIR carries any error, so the
 					// value-less stub never reaches lowering.
 					let key = (SymbolNamespace::Value, name.inner);
-					if matches!(
-						self.direct_scope_lookup(resolve_context.namespace, key),
-						Some(SymbolKind::Pending(pending_id)) if pending_id == *id
-					) {
+					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
 							SymbolKind::Const { const_index },
+							*pub_span,
 						);
 					}
 				}
@@ -7636,7 +7849,10 @@ impl<'ast> Builder<'ast, '_> {
 					let namespace_idx = import_decl.namespace_idx;
 					self.tir.namespaces[namespace_idx as usize].symbols.insert(
 						(SymbolNamespace::Value, signature.name.inner),
-						SymbolKind::Function { func_index },
+						SymbolEntry::Resolved {
+							kind: SymbolKind::Function { func_index },
+							visibility: Visibility::Public,
+						},
 					);
 				}
 			}
@@ -7683,7 +7899,10 @@ impl<'ast> Builder<'ast, '_> {
 					let namespace_idx = import_decl.namespace_idx;
 					self.tir.namespaces[namespace_idx as usize].symbols.insert(
 						(SymbolNamespace::Value, name.inner),
-						SymbolKind::Global { global_index },
+						SymbolEntry::Resolved {
+							kind: SymbolKind::Global { global_index },
+							visibility: Visibility::Public,
+						},
 					);
 				}
 			}
@@ -8087,8 +8306,14 @@ impl<'ast> Builder<'ast, '_> {
 					// own Pending — never clobber a same-named resolved symbol.
 					if matches!(
 						self.lookup_global_symbol(resolve_context.namespace, (SymbolNamespace::Type, name.inner)),
-						Some(SymbolKind::Pending(d)) if d == *id
+						Some(SymbolEntry::Pending(d)) if d == *id
 					) {
+						// Shares the trait's own visibility — trait bodies
+						// reject a `pub` qualifier on their own members (see
+						// `symbol_kind_is_gated`'s doc comment), so there's
+						// no separate span of this assoc type's own to read.
+						let trait_pub_span =
+							self.tir.traits[trait_index as usize].pub_span;
 						self.insert_symbol(
 							resolve_context.namespace,
 							(SymbolNamespace::Type, name.inner),
@@ -8096,6 +8321,7 @@ impl<'ast> Builder<'ast, '_> {
 								trait_index,
 								assoc_name: name.inner,
 							},
+							trait_pub_span,
 						);
 					}
 
@@ -9661,7 +9887,7 @@ impl<'ast> Builder<'ast, '_> {
 							(SymbolNamespace::Type, internal_name.inner),
 							span,
 						) {
-						self.record_type_kind_access(
+						self.tir.record_symbol_access(
 							file_id,
 							type_value,
 							internal_name.span,
@@ -9747,7 +9973,7 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 				_ => {
-					self.record_type_kind_access(
+					self.tir.record_symbol_access(
 						file_id,
 						global_value,
 						internal_name.span,
@@ -11872,7 +12098,7 @@ impl<'ast> Builder<'ast, '_> {
 						seg.ident.span,
 					),
 				)
-				.filter(|k| !matches!(k, SymbolKind::Pending(_)))
+				.and_then(SymbolEntry::resolved_kind)
 			{
 				Some(SymbolKind::Function { func_index }) => func_index,
 				_ => {
@@ -12353,7 +12579,7 @@ impl<'ast> Builder<'ast, '_> {
 			// No access recorded for `namespace` itself here: a
 			// `Type::Namespace` value only ever comes from
 			// `symbol_kind_to_type`, whose only two call sites both call
-			// `record_type_kind_access` immediately beforehand, at the
+			// `record_symbol_access` immediately beforehand, at the
 			// exact segment span that produced it — recording it again
 			// here would duplicate that entry.
 			Type::Namespace { namespace_idx } => {
@@ -12390,7 +12616,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 					Some(kind) => {
-						self.record_type_kind_access(
+						self.tir.record_symbol_access(
 							resolve_context.file_id,
 							kind,
 							member.ident.span,
@@ -12525,67 +12751,6 @@ impl<'ast> Builder<'ast, '_> {
 					Err(())
 				}
 			},
-		}
-	}
-
-	fn record_type_kind_access(
-		&mut self,
-		file_id: FileId,
-		kind: SymbolKind,
-		span: TextSpan,
-	) {
-		match kind {
-			SymbolKind::Struct { struct_index } => {
-				self.tir.structs[struct_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Enum { enum_index } => {
-				self.tir.enums[enum_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Trait { trait_index } => {
-				self.tir.traits[trait_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::TypeSet { typeset_index } => {
-				self.tir.typesets[typeset_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::TypeAlias { type_alias_index } => {
-				self.tir.type_aliases[type_alias_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Const { const_index } => {
-				self.tir.constants[const_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			SymbolKind::Memory { memory_index, .. } => {
-				self.tir.memories[memory_index as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			// The canonical place a namespace reference gets recorded —
-			// every `Type::Namespace` value is produced by
-			// `symbol_kind_to_type`, and both of its call sites reach it
-			// through this same function, right here, at the exact segment
-			// span that resolved it. Callers that go on to use the result
-			// as a namespace to dispatch a further member through
-			// (`resolve_namespace_type_member`, `build_namespace_member_expression`)
-			// must not *also* record it there — that would duplicate this
-			// entry, which is exactly the bug this arm's addition caused
-			// before those two calls were removed.
-			SymbolKind::Module { namespace_idx } => {
-				self.tir.namespaces[namespace_idx as usize]
-					.accesses
-					.push(SourceSpan::new(file_id, span));
-			}
-			_ => {}
 		}
 	}
 
@@ -12770,7 +12935,7 @@ impl<'ast> Builder<'ast, '_> {
 	///
 	/// No access recorded for `namespace` itself here: a `Type::Namespace`
 	/// value only ever comes from `symbol_kind_to_type`, whose only two
-	/// call sites both call `record_type_kind_access` immediately
+	/// call sites both call `record_symbol_access` immediately
 	/// beforehand, at the exact segment span that produced it — recording
 	/// it again here would duplicate that entry.
 	fn build_namespace_member_expression(
@@ -18285,12 +18450,12 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	fn pointer_type_for_memory(&mut self, memory: TypeIndex) -> TypeIndex {
-		let (owner, param_index) = match &self.tir.types[memory.as_usize()] {
-			&Type::Memory { id, .. } => {
+		let (owner, param_index) = match self.tir.types[memory.as_usize()] {
+			Type::Memory { id, .. } => {
 				let idx = self.tir.expect_memory_index(id);
 				return self.tir.memories[idx as usize].size.inner;
 			}
-			&Type::TypeParam { owner, param_index } => (owner, param_index),
+			Type::TypeParam { owner, param_index } => (owner, param_index),
 			_ => return TypeIndex::INTEGER,
 		};
 

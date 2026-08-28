@@ -454,11 +454,21 @@ async fn handle_command(
 				)?;
 				let info =
 					compiled.symbol_index.find_at_position(file_id, offset)?;
+				// The package the *hovered file* belongs to, not the
+				// compilation's overall root — those only coincide when
+				// hovering inside the binary's own files. A `crate`/`super`
+				// reference (or any package-qualified name) hovered inside a
+				// dependency like `std` needs `std`'s own package here, or
+				// `namespace_name` names things from the wrong package's
+				// perspective.
+				let from = compiled.tir.namespaces
+					[compiled.tir.file_namespaces[file_id.as_usize()] as usize]
+					.package;
 				let text = symbol_hover_text(
 					&compiled.tir,
 					&compiled.graph.interner,
 					&compiled.graph.packages,
-					compiled.graph.root_package,
+					from,
 					&info.kind,
 				)?;
 				let range = span_to_range(&compiled.graph.files, info.source)?;
@@ -736,10 +746,14 @@ async fn handle_command(
 				};
 				let fi = compiled.tir.function_index(*def_id)? as usize;
 				let func = &compiled.tir.functions[fi];
+				// The function's own package, not the compilation's overall
+				// root — see the matching fix in the `Hover` handler above.
+				let from =
+					compiled.tir.namespaces[func.namespace as usize].package;
 				let fmt = compiled.tir.formatter(
 					&compiled.graph.interner,
 					&compiled.graph.packages,
-					compiled.graph.root_package,
+					from,
 				);
 				let interner = &compiled.graph.interner;
 
@@ -848,6 +862,18 @@ async fn handle_command(
 					if !span_text.is_some_and(|t| {
 						t.starts_with(|c: char| c.is_alphabetic() || c == '_')
 					}) {
+						continue;
+					}
+					// `crate`/`super` resolve to an ordinary
+					// `SymbolKind::Namespace` — the same variant a real
+					// module name like `math` gets, so there's no dedicated
+					// kind `symbol_kind_to_token_type` can exclude below the
+					// way it already does for `self`/`Self`. Hardcoded text
+					// check for now, reusing `span_text` already computed
+					// above for the operator filter — TODO: revisit with a
+					// cheaper, kind-based exclusion if this ever shows up on
+					// a profile.
+					if matches!(span_text, Some("crate" | "super")) {
 						continue;
 					}
 					let Some(pos) = byte_to_position(
@@ -2123,11 +2149,11 @@ fn symbol_hover_text(
 					}
 				}
 				// A package has no name of its own — show it as the package
-				// this hover is rendered from calls it.
+				// this hover is rendered from calls it (or, for `crate`/
+				// `super` naming `from`'s own root, as the literal keyword).
 				ModuleDeclarationKind::Package(_) => {
-					let name = interner
-						.resolve(tir.namespace_name(*ns_idx, packages, from))
-						.unwrap();
+					let name =
+						tir.namespace_name(*ns_idx, packages, from, interner);
 					Some(format!("package {name}"))
 				}
 			}

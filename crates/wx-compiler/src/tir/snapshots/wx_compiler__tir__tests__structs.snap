@@ -29289,528 +29289,925 @@ namespaces:
     symbols:
       ? - Type
         - 1
-      : TypeAlias:
-          type_alias_index: 0
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 0
+          visibility: Public
       ? - Type
         - 2
-      : TypeAlias:
-          type_alias_index: 1
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 1
+          visibility: Public
       ? - Type
         - 3
-      : TypeAlias:
-          type_alias_index: 2
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 2
+          visibility: Public
       ? - Type
         - 4
-      : TypeAlias:
-          type_alias_index: 3
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 3
+          visibility: Public
       ? - Type
         - 5
-      : TypeAlias:
-          type_alias_index: 4
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 4
+          visibility: Public
       ? - Type
         - 6
-      : TypeAlias:
-          type_alias_index: 5
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 5
+          visibility: Public
       ? - Type
         - 7
-      : TypeAlias:
-          type_alias_index: 6
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 6
+          visibility: Public
       ? - Type
         - 8
-      : TypeAlias:
-          type_alias_index: 7
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 7
+          visibility: Public
       ? - Type
         - 9
-      : TypeAlias:
-          type_alias_index: 8
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 8
+          visibility: Public
       ? - Type
         - 10
-      : TypeAlias:
-          type_alias_index: 9
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 9
+          visibility: Public
       ? - Type
         - 11
-      : TypeAlias:
-          type_alias_index: 10
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 10
+          visibility: Public
       ? - Type
         - 12
-      : TypeAlias:
-          type_alias_index: 11
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 11
+          visibility: Public
       ? - Type
         - 13
-      : TypeAlias:
-          type_alias_index: 12
+      : Resolved:
+          kind:
+            TypeAlias:
+              type_alias_index: 12
+          visibility: Public
       ? - Type
         - 16
-      : Trait:
-          trait_index: 0
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 0
+          visibility: Public
       ? - Type
         - 22
-      : Trait:
-          trait_index: 1
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 1
+          visibility: Public
       ? - Type
         - 25
-      : Trait:
-          trait_index: 2
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 2
+          visibility: Public
       ? - Type
         - 28
-      : Trait:
-          trait_index: 3
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 3
+          visibility: Public
       ? - Type
         - 31
-      : Trait:
-          trait_index: 4
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 4
+          visibility: Public
       ? - Type
         - 34
-      : Trait:
-          trait_index: 5
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 5
+          visibility: Public
       ? - Type
         - 37
-      : Trait:
-          trait_index: 6
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 6
+          visibility: Public
       ? - Type
         - 40
-      : Trait:
-          trait_index: 7
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 7
+          visibility: Public
       ? - Type
         - 43
-      : Trait:
-          trait_index: 8
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 8
+          visibility: Public
       ? - Type
         - 46
-      : Trait:
-          trait_index: 9
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 9
+          visibility: Public
       ? - Type
         - 49
-      : Trait:
-          trait_index: 10
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 10
+          visibility: Public
       ? - Type
         - 52
-      : Trait:
-          trait_index: 11
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 11
+          visibility: Public
       ? - Type
         - 55
-      : TraitAssocType:
-          trait_index: 15
-          assoc_name: 55
+      : Resolved:
+          kind:
+            TraitAssocType:
+              trait_index: 15
+              assoc_name: 55
+          visibility: Public
       ? - Type
         - 56
-      : Trait:
-          trait_index: 14
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 14
+          visibility: Public
       ? - Type
         - 59
-      : TraitAssocType:
-          trait_index: 14
-          assoc_name: 59
+      : Resolved:
+          kind:
+            TraitAssocType:
+              trait_index: 14
+              assoc_name: 59
+          visibility: Public
       ? - Type
         - 179
-      : TypeSet:
-          typeset_index: 0
+      : Resolved:
+          kind:
+            TypeSet:
+              typeset_index: 0
+          visibility: Public
       ? - Type
         - 180
-      : Trait:
-          trait_index: 12
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 12
+          visibility: Public
       ? - Type
         - 181
-      : TraitAssocType:
-          trait_index: 12
-          assoc_name: 181
+      : Resolved:
+          kind:
+            TraitAssocType:
+              trait_index: 12
+              assoc_name: 181
+          visibility: Public
       ? - Type
         - 182
-      : Trait:
-          trait_index: 13
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 13
+          visibility: Public
       ? - Type
         - 183
-      : TraitAssocType:
-          trait_index: 13
-          assoc_name: 183
+      : Resolved:
+          kind:
+            TraitAssocType:
+              trait_index: 13
+              assoc_name: 183
+          visibility: Public
       ? - Type
         - 192
-      : TypeSet:
-          typeset_index: 1
+      : Resolved:
+          kind:
+            TypeSet:
+              typeset_index: 1
+          visibility: Public
       ? - Type
         - 205
-      : Struct:
-          struct_index: 0
+      : Resolved:
+          kind:
+            Struct:
+              struct_index: 0
+          visibility: Public
       ? - Type
         - 211
-      : Trait:
-          trait_index: 15
+      : Resolved:
+          kind:
+            Trait:
+              trait_index: 15
+          visibility: Public
       ? - Type
         - 215
-      : Module:
-          namespace_idx: 2
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 2
+          visibility: Public
+      ? - Type
+        - 242
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 0
+          visibility: Public
       ? - Value
         - 54
-      : Function:
-          func_index: 0
+      : Resolved:
+          kind:
+            Function:
+              func_index: 0
+          visibility: Public
       ? - Value
         - 60
-      : Function:
-          func_index: 1
+      : Resolved:
+          kind:
+            Function:
+              func_index: 1
+          visibility: Public
       ? - Value
         - 61
-      : Function:
-          func_index: 2
+      : Resolved:
+          kind:
+            Function:
+              func_index: 2
+          visibility: Public
       ? - Value
         - 64
-      : Function:
-          func_index: 3
+      : Resolved:
+          kind:
+            Function:
+              func_index: 3
+          visibility: Public
       ? - Value
         - 66
-      : Function:
-          func_index: 4
+      : Resolved:
+          kind:
+            Function:
+              func_index: 4
+          visibility: Public
       ? - Value
         - 67
-      : Function:
-          func_index: 5
+      : Resolved:
+          kind:
+            Function:
+              func_index: 5
+          visibility: Public
       ? - Value
         - 68
-      : Function:
-          func_index: 6
+      : Resolved:
+          kind:
+            Function:
+              func_index: 6
+          visibility: Public
       ? - Value
         - 69
-      : Function:
-          func_index: 7
+      : Resolved:
+          kind:
+            Function:
+              func_index: 7
+          visibility: Public
       ? - Value
         - 70
-      : Function:
-          func_index: 8
+      : Resolved:
+          kind:
+            Function:
+              func_index: 8
+          visibility: Public
       ? - Value
         - 71
-      : Function:
-          func_index: 9
+      : Resolved:
+          kind:
+            Function:
+              func_index: 9
+          visibility: Public
       ? - Value
         - 72
-      : Function:
-          func_index: 10
+      : Resolved:
+          kind:
+            Function:
+              func_index: 10
+          visibility: Public
       ? - Value
         - 73
-      : Function:
-          func_index: 11
+      : Resolved:
+          kind:
+            Function:
+              func_index: 11
+          visibility: Public
       ? - Value
         - 74
-      : Function:
-          func_index: 12
+      : Resolved:
+          kind:
+            Function:
+              func_index: 12
+          visibility: Public
       ? - Value
         - 75
-      : Function:
-          func_index: 13
+      : Resolved:
+          kind:
+            Function:
+              func_index: 13
+          visibility: Public
       ? - Value
         - 76
-      : Function:
-          func_index: 14
+      : Resolved:
+          kind:
+            Function:
+              func_index: 14
+          visibility: Public
       ? - Value
         - 77
-      : Function:
-          func_index: 15
+      : Resolved:
+          kind:
+            Function:
+              func_index: 15
+          visibility: Public
       ? - Value
         - 78
-      : Function:
-          func_index: 16
+      : Resolved:
+          kind:
+            Function:
+              func_index: 16
+          visibility: Public
       ? - Value
         - 79
-      : Function:
-          func_index: 17
+      : Resolved:
+          kind:
+            Function:
+              func_index: 17
+          visibility: Public
       ? - Value
         - 80
-      : Function:
-          func_index: 18
+      : Resolved:
+          kind:
+            Function:
+              func_index: 18
+          visibility: Public
       ? - Value
         - 83
-      : Function:
-          func_index: 19
+      : Resolved:
+          kind:
+            Function:
+              func_index: 19
+          visibility: Public
       ? - Value
         - 84
-      : Function:
-          func_index: 20
+      : Resolved:
+          kind:
+            Function:
+              func_index: 20
+          visibility: Public
       ? - Value
         - 85
-      : Function:
-          func_index: 21
+      : Resolved:
+          kind:
+            Function:
+              func_index: 21
+          visibility: Public
       ? - Value
         - 86
-      : Function:
-          func_index: 22
+      : Resolved:
+          kind:
+            Function:
+              func_index: 22
+          visibility: Public
       ? - Value
         - 87
-      : Function:
-          func_index: 23
+      : Resolved:
+          kind:
+            Function:
+              func_index: 23
+          visibility: Public
       ? - Value
         - 88
-      : Function:
-          func_index: 24
+      : Resolved:
+          kind:
+            Function:
+              func_index: 24
+          visibility: Public
       ? - Value
         - 89
-      : Function:
-          func_index: 25
+      : Resolved:
+          kind:
+            Function:
+              func_index: 25
+          visibility: Public
       ? - Value
         - 90
-      : Function:
-          func_index: 26
+      : Resolved:
+          kind:
+            Function:
+              func_index: 26
+          visibility: Public
       ? - Value
         - 91
-      : Function:
-          func_index: 27
+      : Resolved:
+          kind:
+            Function:
+              func_index: 27
+          visibility: Public
       ? - Value
         - 92
-      : Function:
-          func_index: 28
+      : Resolved:
+          kind:
+            Function:
+              func_index: 28
+          visibility: Public
       ? - Value
         - 93
-      : Function:
-          func_index: 29
+      : Resolved:
+          kind:
+            Function:
+              func_index: 29
+          visibility: Public
       ? - Value
         - 94
-      : Function:
-          func_index: 30
+      : Resolved:
+          kind:
+            Function:
+              func_index: 30
+          visibility: Public
       ? - Value
         - 95
-      : Function:
-          func_index: 31
+      : Resolved:
+          kind:
+            Function:
+              func_index: 31
+          visibility: Public
       ? - Value
         - 96
-      : Function:
-          func_index: 32
+      : Resolved:
+          kind:
+            Function:
+              func_index: 32
+          visibility: Public
       ? - Value
         - 97
-      : Function:
-          func_index: 33
+      : Resolved:
+          kind:
+            Function:
+              func_index: 33
+          visibility: Public
       ? - Value
         - 98
-      : Function:
-          func_index: 34
+      : Resolved:
+          kind:
+            Function:
+              func_index: 34
+          visibility: Public
       ? - Value
         - 99
-      : Function:
-          func_index: 35
+      : Resolved:
+          kind:
+            Function:
+              func_index: 35
+          visibility: Public
       ? - Value
         - 100
-      : Function:
-          func_index: 36
+      : Resolved:
+          kind:
+            Function:
+              func_index: 36
+          visibility: Public
       ? - Value
         - 101
-      : Function:
-          func_index: 37
+      : Resolved:
+          kind:
+            Function:
+              func_index: 37
+          visibility: Public
       ? - Value
         - 102
-      : Function:
-          func_index: 38
+      : Resolved:
+          kind:
+            Function:
+              func_index: 38
+          visibility: Public
       ? - Value
         - 103
-      : Function:
-          func_index: 39
+      : Resolved:
+          kind:
+            Function:
+              func_index: 39
+          visibility: Public
       ? - Value
         - 104
-      : Function:
-          func_index: 40
+      : Resolved:
+          kind:
+            Function:
+              func_index: 40
+          visibility: Public
       ? - Value
         - 105
-      : Function:
-          func_index: 41
+      : Resolved:
+          kind:
+            Function:
+              func_index: 41
+          visibility: Public
       ? - Value
         - 106
-      : Function:
-          func_index: 42
+      : Resolved:
+          kind:
+            Function:
+              func_index: 42
+          visibility: Public
       ? - Value
         - 107
-      : Function:
-          func_index: 43
+      : Resolved:
+          kind:
+            Function:
+              func_index: 43
+          visibility: Public
       ? - Value
         - 108
-      : Function:
-          func_index: 44
+      : Resolved:
+          kind:
+            Function:
+              func_index: 44
+          visibility: Public
       ? - Value
         - 109
-      : Function:
-          func_index: 45
+      : Resolved:
+          kind:
+            Function:
+              func_index: 45
+          visibility: Public
       ? - Value
         - 110
-      : Function:
-          func_index: 46
+      : Resolved:
+          kind:
+            Function:
+              func_index: 46
+          visibility: Public
       ? - Value
         - 111
-      : Function:
-          func_index: 47
+      : Resolved:
+          kind:
+            Function:
+              func_index: 47
+          visibility: Public
       ? - Value
         - 112
-      : Function:
-          func_index: 48
+      : Resolved:
+          kind:
+            Function:
+              func_index: 48
+          visibility: Public
       ? - Value
         - 113
-      : Function:
-          func_index: 49
+      : Resolved:
+          kind:
+            Function:
+              func_index: 49
+          visibility: Public
       ? - Value
         - 114
-      : Function:
-          func_index: 50
+      : Resolved:
+          kind:
+            Function:
+              func_index: 50
+          visibility: Public
       ? - Value
         - 115
-      : Function:
-          func_index: 51
+      : Resolved:
+          kind:
+            Function:
+              func_index: 51
+          visibility: Public
       ? - Value
         - 116
-      : Function:
-          func_index: 52
+      : Resolved:
+          kind:
+            Function:
+              func_index: 52
+          visibility: Public
       ? - Value
         - 117
-      : Function:
-          func_index: 53
+      : Resolved:
+          kind:
+            Function:
+              func_index: 53
+          visibility: Public
       ? - Value
         - 118
-      : Function:
-          func_index: 54
+      : Resolved:
+          kind:
+            Function:
+              func_index: 54
+          visibility: Public
       ? - Value
         - 119
-      : Function:
-          func_index: 55
+      : Resolved:
+          kind:
+            Function:
+              func_index: 55
+          visibility: Public
       ? - Value
         - 120
-      : Function:
-          func_index: 56
+      : Resolved:
+          kind:
+            Function:
+              func_index: 56
+          visibility: Public
       ? - Value
         - 121
-      : Function:
-          func_index: 57
+      : Resolved:
+          kind:
+            Function:
+              func_index: 57
+          visibility: Public
       ? - Value
         - 122
-      : Function:
-          func_index: 58
+      : Resolved:
+          kind:
+            Function:
+              func_index: 58
+          visibility: Public
       ? - Value
         - 123
-      : Function:
-          func_index: 59
+      : Resolved:
+          kind:
+            Function:
+              func_index: 59
+          visibility: Public
       ? - Value
         - 124
-      : Function:
-          func_index: 60
+      : Resolved:
+          kind:
+            Function:
+              func_index: 60
+          visibility: Public
       ? - Value
         - 125
-      : Function:
-          func_index: 61
+      : Resolved:
+          kind:
+            Function:
+              func_index: 61
+          visibility: Public
       ? - Value
         - 126
-      : Function:
-          func_index: 62
+      : Resolved:
+          kind:
+            Function:
+              func_index: 62
+          visibility: Public
       ? - Value
         - 127
-      : Function:
-          func_index: 63
+      : Resolved:
+          kind:
+            Function:
+              func_index: 63
+          visibility: Public
       ? - Value
         - 128
-      : Function:
-          func_index: 64
+      : Resolved:
+          kind:
+            Function:
+              func_index: 64
+          visibility: Public
       ? - Value
         - 129
-      : Function:
-          func_index: 65
+      : Resolved:
+          kind:
+            Function:
+              func_index: 65
+          visibility: Public
       ? - Value
         - 130
-      : Function:
-          func_index: 66
+      : Resolved:
+          kind:
+            Function:
+              func_index: 66
+          visibility: Public
       ? - Value
         - 131
-      : Function:
-          func_index: 67
+      : Resolved:
+          kind:
+            Function:
+              func_index: 67
+          visibility: Public
       ? - Value
         - 132
-      : Function:
-          func_index: 68
+      : Resolved:
+          kind:
+            Function:
+              func_index: 68
+          visibility: Public
       ? - Value
         - 133
-      : Function:
-          func_index: 69
+      : Resolved:
+          kind:
+            Function:
+              func_index: 69
+          visibility: Public
       ? - Value
         - 134
-      : Function:
-          func_index: 70
+      : Resolved:
+          kind:
+            Function:
+              func_index: 70
+          visibility: Public
       ? - Value
         - 135
-      : Function:
-          func_index: 71
+      : Resolved:
+          kind:
+            Function:
+              func_index: 71
+          visibility: Public
       ? - Value
         - 136
-      : Function:
-          func_index: 72
+      : Resolved:
+          kind:
+            Function:
+              func_index: 72
+          visibility: Public
       ? - Value
         - 137
-      : Function:
-          func_index: 73
+      : Resolved:
+          kind:
+            Function:
+              func_index: 73
+          visibility: Public
       ? - Value
         - 138
-      : Function:
-          func_index: 74
+      : Resolved:
+          kind:
+            Function:
+              func_index: 74
+          visibility: Public
       ? - Value
         - 139
-      : Function:
-          func_index: 75
+      : Resolved:
+          kind:
+            Function:
+              func_index: 75
+          visibility: Public
       ? - Value
         - 140
-      : Function:
-          func_index: 76
+      : Resolved:
+          kind:
+            Function:
+              func_index: 76
+          visibility: Public
       ? - Value
         - 141
-      : Function:
-          func_index: 77
+      : Resolved:
+          kind:
+            Function:
+              func_index: 77
+          visibility: Public
       ? - Value
         - 142
-      : Function:
-          func_index: 78
+      : Resolved:
+          kind:
+            Function:
+              func_index: 78
+          visibility: Public
       ? - Value
         - 143
-      : Function:
-          func_index: 79
+      : Resolved:
+          kind:
+            Function:
+              func_index: 79
+          visibility: Public
       ? - Value
         - 144
-      : Function:
-          func_index: 80
+      : Resolved:
+          kind:
+            Function:
+              func_index: 80
+          visibility: Public
       ? - Value
         - 145
-      : Function:
-          func_index: 81
+      : Resolved:
+          kind:
+            Function:
+              func_index: 81
+          visibility: Public
       ? - Value
         - 146
-      : Function:
-          func_index: 82
+      : Resolved:
+          kind:
+            Function:
+              func_index: 82
+          visibility: Public
       ? - Value
         - 147
-      : Function:
-          func_index: 83
+      : Resolved:
+          kind:
+            Function:
+              func_index: 83
+          visibility: Public
       ? - Value
         - 148
-      : Function:
-          func_index: 84
+      : Resolved:
+          kind:
+            Function:
+              func_index: 84
+          visibility: Public
       ? - Value
         - 149
-      : Function:
-          func_index: 85
+      : Resolved:
+          kind:
+            Function:
+              func_index: 85
+          visibility: Public
       ? - Value
         - 184
-      : Function:
-          func_index: 86
+      : Resolved:
+          kind:
+            Function:
+              func_index: 86
+          visibility: Public
       ? - Value
         - 187
-      : Function:
-          func_index: 87
+      : Resolved:
+          kind:
+            Function:
+              func_index: 87
+          visibility: Public
       ? - Value
         - 188
-      : Function:
-          func_index: 88
+      : Resolved:
+          kind:
+            Function:
+              func_index: 88
+          visibility: Public
       ? - Value
         - 191
-      : Function:
-          func_index: 89
+      : Resolved:
+          kind:
+            Function:
+              func_index: 89
+          visibility: Public
       ? - Value
         - 203
-      : Function:
-          func_index: 90
+      : Resolved:
+          kind:
+            Function:
+              func_index: 90
+          visibility: Public
       ? - Value
         - 204
-      : Function:
-          func_index: 91
+      : Resolved:
+          kind:
+            Function:
+              func_index: 91
+          visibility: Public
       ? - Value
         - 225
-      : Const:
-          const_index: 0
+      : Resolved:
+          kind:
+            Const:
+              const_index: 0
+          visibility: Private
     wildcard_imports: []
     accesses:
       - file_id: 1
@@ -29824,16 +30221,32 @@ namespaces:
     symbols:
       ? - Type
         - 239
-      : Module:
-          namespace_idx: 0
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 0
+          visibility: Public
       ? - Type
         - 240
-      : Struct:
-          struct_index: 1
+      : Resolved:
+          kind:
+            Struct:
+              struct_index: 1
+          visibility: Private
+      ? - Type
+        - 242
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 1
+          visibility: Public
       ? - Value
         - 241
-      : Function:
-          func_index: 101
+      : Resolved:
+          kind:
+            Function:
+              func_index: 101
+          visibility: Private
     wildcard_imports:
       - namespace: 0
         span:
@@ -29847,42 +30260,83 @@ namespaces:
     declaration:
       Module: 0
     symbols:
+      ? - Type
+        - 242
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 0
+          visibility: Public
+      ? - Type
+        - 244
+      : Resolved:
+          kind:
+            Module:
+              namespace_idx: 0
+          visibility: Public
       ? - Value
         - 17
-      : Function:
-          func_index: 96
+      : Resolved:
+          kind:
+            Function:
+              func_index: 96
+          visibility: Public
       ? - Value
         - 23
-      : Function:
-          func_index: 97
+      : Resolved:
+          kind:
+            Function:
+              func_index: 97
+          visibility: Public
       ? - Value
         - 217
-      : Function:
-          func_index: 92
+      : Resolved:
+          kind:
+            Function:
+              func_index: 92
+          visibility: Public
       ? - Value
         - 218
-      : Function:
-          func_index: 93
+      : Resolved:
+          kind:
+            Function:
+              func_index: 93
+          visibility: Public
       ? - Value
         - 219
-      : Function:
-          func_index: 94
+      : Resolved:
+          kind:
+            Function:
+              func_index: 94
+          visibility: Public
       ? - Value
         - 220
-      : Function:
-          func_index: 95
+      : Resolved:
+          kind:
+            Function:
+              func_index: 95
+          visibility: Public
       ? - Value
         - 221
-      : Function:
-          func_index: 98
+      : Resolved:
+          kind:
+            Function:
+              func_index: 98
+          visibility: Public
       ? - Value
         - 222
-      : Function:
-          func_index: 99
+      : Resolved:
+          kind:
+            Function:
+              func_index: 99
+          visibility: Public
       ? - Value
         - 223
-      : Function:
-          func_index: 100
+      : Resolved:
+          kind:
+            Function:
+              func_index: 100
+          visibility: Public
     wildcard_imports: []
     accesses: []
 module_decls:
@@ -33075,7 +33529,7 @@ typesets:
           start: 24320
           end: 24331
     attributes:
-      - Tag: 242
+      - Tag: 243
 type_aliases:
   - id: 0
     file_id: 0

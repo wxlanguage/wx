@@ -595,6 +595,200 @@ fn test_self_referential_const_reports_a_cycle() {
 	));
 }
 
+/// `A`'s own initializer is the self-reference that trips the cycle once,
+/// while `ensure_signature(A)` is `InProgress`. Once that call unwinds,
+/// `sig_state[A]` lands on `Done` — never stuck `InProgress` forever, never
+/// reset back to `Pending` — so `main` and `other`, which each reference `A`
+/// afterward from ordinary (non-cyclic) contexts, should see a plain
+/// resolved `Const` and neither re-derive the cycle nor get a diagnostic of
+/// their own.
+#[test]
+fn test_cyclic_const_referenced_afterward_reports_once_not_per_reference() {
+	let case = TestCase::new(indoc! {"
+        const A: i32 = A;
+        fn main() -> i32 { A }
+        fn other() -> i32 { A + 1 }
+        export { main, other }
+    "});
+
+	let by_code = |code: DiagnosticCode| {
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(move |d| d.code.as_deref() == Some(code.code()))
+			.count()
+	};
+	// A's own initializer legitimately produces two diagnostics on its own
+	// declaration: the cycle itself, and — since the resolved value is an
+	// error placeholder, not a real constant — "not const-evaluable" for
+	// the initializer expression as a whole. Neither should multiply with
+	// the number of *later* references to A: `main` and `other` both read
+	// the already-`Done` A as a plain `i32` const and shouldn't re-trigger
+	// either diagnostic.
+	assert_eq!(
+		by_code(DiagnosticCode::CyclicTypeDependency),
+		1,
+		"expected exactly one cyclic-dependency diagnostic (from A's own \
+		 initializer), not one per later reference to A; got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(
+		by_code(DiagnosticCode::NotConstEvaluatable),
+		1,
+		"expected exactly one not-const-evaluable diagnostic (from A's own \
+		 initializer failing to fold), not one per later reference to A; \
+		 got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(
+		case.tir.diagnostics.len(),
+		2,
+		"main/other referencing the already-Done A should type-check \
+		 cleanly against its declared type, not cascade into further \
+		 errors of their own; got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// Same question as above, but for a mutual cycle (`A` depends on `B`
+/// depends on `A`) instead of direct self-reference, and with each side
+/// referenced afterward from its own function. Only the inner hop that
+/// actually closes the cycle (`B`'s reference back to the still-`InProgress`
+/// `A`) should report — `A`'s own reference to `B` resolves normally, since
+/// by the time that lookup runs `ensure_signature(B)` has already finished
+/// and `B` is bound to a plain `Const`, not left `Pending`.
+#[test]
+fn test_mutual_const_cycle_referenced_afterward_reports_once() {
+	let case = TestCase::new(indoc! {"
+        const A: i32 = B;
+        const B: i32 = A;
+        fn main() -> i32 { A }
+        fn other() -> i32 { B }
+        export { main, other }
+    "});
+
+	let cyclic_count = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.count();
+	assert_eq!(
+		cyclic_count,
+		1,
+		"expected exactly one cyclic-dependency diagnostic for the A/B \
+		 mutual cycle, not one per hop or per later reference; got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+// ── named-import cycle edge cases ───────────────────────────────────────
+
+/// Two modules alias each other's still-unresolved name — `a::Foo` is never
+/// anything but `b::Bar` and vice versa, so neither side ever bottoms out at
+/// a real item. Deliberately doesn't reference `Foo`/`Bar` from anywhere:
+/// Phase 2 calls `ensure_signature` on every registered `DefId` in parse
+/// order regardless of whether anything downstream ever looks it up, so the
+/// cycle should surface on its own.
+#[test]
+fn test_named_import_alias_cycle_across_modules_reports_a_cycle() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            fn main() -> i32 { 1 }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub use b::bar as foo;"),
+			("src/b.wx", "pub use a::foo as bar;"),
+		],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::CyclicTypeDependency
+	));
+}
+
+/// Looks superficially symmetric to the cycle above — each module imports a
+/// name from the other — but both sides bottom out at a real, independent
+/// item, so this is not cyclic. The false-positive case the notes flagged
+/// for a whole-namespace or naive symmetric check.
+#[test]
+fn test_two_modules_importing_concrete_items_from_each_other_is_not_cyclic() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            fn main() -> i32 { a::use_b() + b::use_a() }
+            export { main }
+        "},
+		&[
+			(
+				"src/a.wx",
+				"use b::real_b;\npub fn use_b() -> i32 { real_b() }\npub fn real_a() -> i32 { 1 }",
+			),
+			(
+				"src/b.wx",
+				"use a::real_a;\npub fn use_a() -> i32 { real_a() }\npub fn real_b() -> i32 { 2 }",
+			),
+		],
+	);
+	no_errors(&case);
+}
+
+/// Two named imports of the same local name from two distinct sources
+/// collide eagerly, at prescan — unlike a glob collision (which defers to
+/// the first actual reference and produces `AmbiguousWildcardImport`), this
+/// is an ordinary same-scope duplicate binding.
+#[test]
+fn test_duplicate_named_import_is_duplicate_definition_not_ambiguity() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod x;
+            mod y;
+            use x::pick;
+            use y::pick;
+            fn main() -> i32 { pick() }
+            export { main }
+        "},
+		&[
+			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
+			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+		],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::DuplicateDefinition
+	));
+	assert!(!has_error_code(
+		&case.tir,
+		DiagnosticCode::AmbiguousWildcardImport
+	));
+}
+
 /// The span a wildcard ambiguity will point at (Part 4): the path and the
 /// star, not the `use` keyword, and — for a glob nested in a group — only
 /// the part that is a contiguous range of source.
@@ -804,6 +998,428 @@ fn test_glob_in_an_inner_scope_shadows_an_outer_one() {
 		],
 	);
 	no_errors(&case);
+}
+
+// ── crate/super paths ────────────────────────────────────────────────────
+//
+// `crate`/`super` are ordinary `SymbolKind::Module` entries every namespace
+// is pre-populated with at creation (`Builder::seed_path_root_symbols`) —
+// no dedicated resolver logic, so these tests exercise the existing
+// use/type/value path machinery, not anything new.
+
+/// `crate::x` from a submodule reaches the package root's items.
+#[test]
+fn test_crate_path_reaches_package_root_from_submodule() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            pub fn helper() -> i32 { 1 }
+            fn main() -> i32 { a::call_it() }
+            export { main }
+        "},
+		&[("src/a.wx", "pub fn call_it() -> i32 { crate::helper() }")],
+	);
+	no_errors(&case);
+}
+
+/// `use crate::x;` — the same path root, in `use`-tree position.
+#[test]
+fn test_use_crate_path_binds_a_package_root_item() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            pub fn helper() -> i32 { 1 }
+            fn main() -> i32 { a::call_it() }
+            export { main }
+        "},
+		&[(
+			"src/a.wx",
+			"use crate::helper;\npub fn call_it() -> i32 { helper() }",
+		)],
+	);
+	no_errors(&case);
+}
+
+/// `use crate::*;` — `crate` as a glob root. Falls out of the same
+/// `walk_use_prefix` resolution every other glob prefix already uses.
+#[test]
+fn test_use_crate_glob_imports_the_package_root() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            pub fn helper() -> i32 { 1 }
+            fn main() -> i32 { a::call_it() }
+            export { main }
+        "},
+		&[(
+			"src/a.wx",
+			"use crate::*;\npub fn call_it() -> i32 { helper() }",
+		)],
+	);
+	no_errors(&case);
+}
+
+/// `crate::x` in type position.
+#[test]
+fn test_crate_path_in_type_position_resolves() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            pub struct Point { pub x: i32 }
+            fn main() -> i32 { a::make().x }
+            export { main }
+        "},
+		&[(
+			"src/a.wx",
+			"pub fn make() -> crate::Point { crate::Point::{ x: 1 } }",
+		)],
+	);
+	no_errors(&case);
+}
+
+/// `super::x` from a nested inline module reaches its immediate parent.
+#[test]
+fn test_super_path_reaches_parent_from_nested_module() {
+	let case = TestCase::new(indoc! {"
+        pub fn outer_helper() -> i32 { 1 }
+        mod inner {
+            pub fn call_super() -> i32 { super::outer_helper() }
+        }
+        fn main() -> i32 { inner::call_super() }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// `super::super::x` chains two hops up — each namespace on the walk
+/// carries its own `super` entry, so this needs no chaining-specific logic.
+#[test]
+fn test_super_super_path_chains_to_grandparent() {
+	let case = TestCase::new(indoc! {"
+        pub fn root_helper() -> i32 { 1 }
+        mod outer {
+            pub mod inner {
+                pub fn call_grandparent() -> i32 { super::super::root_helper() }
+            }
+        }
+        fn main() -> i32 { outer::inner::call_grandparent() }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// `foo::super::bar` — a non-leading `super`. Accepted by design, not an
+/// oversight: `super` inside `a`'s own namespace always means `a`'s parent,
+/// consistently, wherever it's written, so restricting it to leading
+/// position would cost real resolver complexity for no ambiguity payoff.
+#[test]
+fn test_non_leading_super_segment_resolves() {
+	let case = TestCase::new(indoc! {"
+        pub fn root_helper() -> i32 { 1 }
+        mod a {
+            pub fn unused() -> i32 { 0 }
+        }
+        fn main() -> i32 { a::super::root_helper() }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// `super` walked past the package root reports the same "not found" a
+/// reference to any other undeclared name would — no dedicated diagnostic
+/// exists, or is needed, since a package root simply has no `super` entry.
+#[test]
+fn test_super_beyond_package_root_is_undeclared() {
+	let case = TestCase::new(indoc! {"
+        fn main() -> i32 { super::main() }
+        export { main }
+    "});
+	assert!(
+		!case.tir.diagnostics.is_empty(),
+		"expected `super` above the package root to be reported as a \
+		 plain unresolved reference"
+	);
+}
+
+// ── wildcard transitivity & cycles (not yet implemented) ────────────────
+//
+// `lookup_scope_chain`'s wildcard branch currently checks only a glob
+// source's *direct* `.symbols` map, never that source's own
+// `wildcard_imports` — so there is neither transitive glob-of-glob
+// resolution nor a cycle risk today, because there is no recursion into a
+// glob source's own globs at all. These are `#[ignore]`d until that
+// recursion (guarded by an on-stack "currently visiting" set of
+// `NamespaceIndex`, the same idiom `ComputeState::InProgress` already uses
+// for named-import cycles) lands — see notes/module_resolution_design_notes.md.
+
+/// `c` globs `b`, `b` re-exports `a` wholesale (`pub use crate::a::*;`) —
+/// `c` should see `a`'s items without naming `a` itself.
+#[test]
+#[ignore = "wildcard glob resolution is single-hop only today; \
+            transitive re-export via `pub use x::*;` chains isn't \
+            implemented yet"]
+fn test_transitive_glob_import_two_hops() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            use b::*;
+            fn main() -> i32 { foo() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/b.wx", "pub use crate::a::*;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// Same as the two-hop case, one hop deeper — transitivity shouldn't have
+/// an arbitrary depth cap, only the cycle check should bound it.
+#[test]
+#[ignore = "wildcard glob resolution is single-hop only today; \
+            transitive re-export via `pub use x::*;` chains isn't \
+            implemented yet"]
+fn test_transitive_glob_import_three_hops() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            mod c;
+            use c::*;
+            fn main() -> i32 { foo() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/b.wx", "pub use crate::a::*;"),
+			("src/c.wx", "pub use crate::b::*;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// `a` globs `b`, `b` globs `a` — a namespace transitively importing itself
+/// via globs, the case constraint #3 in the design notes wants to be a hard
+/// error with the full cycle chain, not Rust's iterative-fixed-point
+/// behavior (which would just never stabilize).
+///
+/// Diagnostic code is a placeholder: reusing `CyclicTypeDependency` (like
+/// struct/type-alias cycles already do) is the simplest option, but a
+/// dedicated "circular wildcard import" code is also on the table — pick
+/// one when implementing and update this assertion.
+#[test]
+#[ignore = "no cycle check exists yet for the wildcard-import graph"]
+fn test_two_module_glob_cycle_is_a_cyclic_error() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            fn main() -> i32 { 1 }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub use crate::b::*;"),
+			("src/b.wx", "pub use crate::a::*;"),
+		],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::CyclicTypeDependency
+	));
+}
+
+/// Degenerate one-node case of the same cycle: a module glob-importing
+/// itself. Should fall out of the same detector as the two-module case
+/// above with no special-casing — worth its own test so nobody adds one.
+#[test]
+#[ignore = "no cycle check exists yet for the wildcard-import graph"]
+fn test_module_glob_importing_itself_is_a_cyclic_error() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            fn main() -> i32 { 1 }
+            export { main }
+        "},
+		&[("src/a.wx", "pub use crate::a::*;")],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::CyclicTypeDependency
+	));
+}
+
+// ── `use` re-export privacy ────────────────────────────────────────────────
+//
+// A `use` leaf's own `pub_span` (`UseItem::pub_span`) governs whether *that
+// binding* is visible outside its own namespace — independent of whatever
+// visibility the re-exported item itself declared, which is only checked
+// once, when the leaf's own prefix resolved. `SymbolEntry::Resolved`'s
+// `visibility` field carries this per-binding answer regardless of how a
+// name was reached (direct qualified path, or via someone else's glob).
+//
+// Still a real gap: `WildcardImport` itself carries no visibility of its
+// own, so a glob-of-glob re-export (`pub use a::*;` inside `b`, reached via
+// `use b::*;` elsewhere) isn't gated — see the wildcard-transitivity tests
+// below, which are `#[ignore]`d for a separate reason (transitivity itself
+// isn't implemented, so there's nothing yet to gate).
+
+/// A private `use` should only make the name visible inside its own
+/// namespace and descendants — not to an external qualified-path reference,
+/// same as a plain private item would be (hence the same diagnostic,
+/// `PrivateItem`, that a direct private declaration would get here).
+#[test]
+fn test_private_use_is_not_visible_via_qualified_path_from_outside() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod baz;
+            fn main() -> i32 { baz::bar() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/baz.wx", "use a::bar;"),
+		],
+	);
+	assert!(has_error_code(&case.tir, DiagnosticCode::PrivateItem));
+}
+
+/// The `pub use` counterpart of the case above — already correct today, and
+/// should stay correct once privacy tracking lands.
+#[test]
+fn test_pub_use_is_visible_via_qualified_path_from_outside() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod baz;
+            fn main() -> i32 { baz::bar() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/baz.wx", "pub use a::bar;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// A private `use` inside `baz` must not be pulled in by someone else's
+/// `use baz::*;` — private imports don't propagate through an external
+/// glob.
+#[test]
+fn test_private_use_is_not_reachable_through_an_external_glob() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod baz;
+            use baz::*;
+            fn main() -> i32 { bar() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/baz.wx", "use a::bar;"),
+		],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::UndeclaredIdentifier
+	));
+}
+
+/// The `pub use` counterpart — already correct today (see also
+/// `test_one_item_through_two_globs_is_not_ambiguous`, which exercises the
+/// same shape), and should stay correct once privacy tracking lands.
+#[test]
+fn test_pub_use_is_reachable_through_an_external_glob() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod baz;
+            use baz::*;
+            fn main() -> i32 { bar() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/baz.wx", "pub use a::bar;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// A chain of *named* `pub use` re-exports (not globs) — already works
+/// mechanically today via the same demand-driven `ensure_signature` path
+/// that resolves any other named import; worth locking in so privacy work
+/// on named imports doesn't regress the chain itself.
+#[test]
+fn test_chained_pub_use_re_export_resolves() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            mod b;
+            mod c;
+            fn main() -> i32 { c::foo() }
+            export { main }
+        "},
+		&[
+			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/b.wx", "pub use a::foo;"),
+			("src/c.wx", "pub use b::foo;"),
+		],
+	);
+	no_errors(&case);
+}
+
+/// A rejected private-item reference should still record an access, the
+/// same way `export { .. }` naming an unexportable item does (see
+/// `test_export_reports_cannot_export_and_records_access`): name resolution
+/// found the item — only the accessibility check failed — so it's a real
+/// reference, not an absence. Recording it is what lets hover/go-to-definition
+/// still work on it, and it must also keep the item from *additionally*
+/// being flagged `UnusedItem` on top of `PrivateItem` — a bare, unreferenced
+/// item and a referenced-but-inaccessible one are different situations.
+#[test]
+fn test_private_item_reference_records_access_and_is_not_flagged_unused() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            fn main() -> i32 { a::foo() }
+            export { main }
+        "},
+		&[("src/a.wx", "fn foo() -> i32 { 1 }")],
+	);
+	assert!(has_error_code(&case.tir, DiagnosticCode::PrivateItem));
+	assert!(!has_error_code(&case.tir, DiagnosticCode::UnusedItem));
+	let func = case
+		.tir
+		.functions
+		.iter()
+		.find(|f| {
+			case.graph
+				.interner
+				.resolve(f.name.inner)
+				.map(|n| n == "foo")
+				.unwrap_or(false)
+		})
+		.expect("function 'foo' not found in TIR");
+	assert_eq!(func.accesses.len(), 1);
 }
 
 // ── export reach ─────────────────────────────────────────────────────────
@@ -12116,7 +12732,7 @@ fn test_qualified_bound_with_undeclared_member_reports_diagnostic_not_panic() {
 
 /// Regression test: a bare identifier that resolves to a module (the first
 /// segment of a qualified bound like `ns::Marker`) went through
-/// `record_type_kind_access`, whose `match` had no arm for
+/// `record_symbol_access`, whose `match` had no arm for
 /// `SymbolKind::Module` — so the namespace's own `accesses` list never
 /// gained an entry for that token, even though the trait it named
 /// (`Marker`) was recorded correctly. Hover/go-to-definition/semantic

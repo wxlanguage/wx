@@ -758,6 +758,19 @@ fn test_scientific_notation_float_literals() {
 	));
 }
 
+#[test]
+fn test_scientific_notation_literal_at_end_of_input_is_float() {
+	// Regression: the exponent scanner must commit to Float even when the
+	// digits run straight into EOF with no following token to stop the
+	// scan — a dot-less mantissa like `1e5` would otherwise fall through
+	// to the `seen_dot` check and lex as a (bogus) Int.
+	for src in ["1e5", "2E3", "1e+5", "1e", "1E-"] {
+		let tok = Lexer::new(src).advance();
+		assert!(tok.inner == Token::Float, "`{src}` should lex as Float");
+		assert_eq!(tok.span.end - tok.span.start, src.len() as u32);
+	}
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]

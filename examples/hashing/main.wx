@@ -1,12 +1,5 @@
 use std::*;
 
-mod x;
-
-fn abc() -> i32 {
-  _ = pow::pow(1, 2);
-  5
-}
-
 trait Hasher {
   fn write<Mem: std::Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
 
