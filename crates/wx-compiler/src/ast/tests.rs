@@ -579,7 +579,7 @@ fn test_literals() {
 	// float, char, and string literals (int is covered everywhere else)
 	let case = TestCase::new(indoc! {"
         fn f() {
-            local a = 3.14;
+            local a = 2.75;
             local b = 'z';
             local c = \"hello\";
         }
@@ -591,7 +591,7 @@ fn test_literals() {
 	else {
 		panic!("expected a float literal")
 	};
-	assert_eq!(*value, 3.14);
+	assert_eq!(*value, 2.75);
 	// `Char` and `String` carry no payload — the text is recovered from the
 	// span, so all the AST records is which kind of literal it was.
 	assert!(matches!(
