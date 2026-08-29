@@ -381,6 +381,11 @@ impl f32 {
     }
 
     #[inline]
+    pub fn sqrt(self) -> Self {
+        f32_sqrt(self)
+    }
+
+    #[inline]
     pub fn floor(self) -> Self {
         f32_floor(self)
     }
@@ -469,6 +474,11 @@ impl f64 {
     #[inline]
     pub fn abs(self) -> Self {
         f64_abs(self)
+    }
+
+    #[inline]
+    pub fn sqrt(self) -> Self {
+        f64_sqrt(self)
     }
 
     #[inline]
@@ -1391,7 +1401,7 @@ pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 #[intrinsic]
 pub fn memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
-/// Can copy across two different memories as long as they have the same pointer size. 
+/// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
 #[intrinsic]
@@ -1410,7 +1420,7 @@ pub trait Memory {
     /// This constant exposes internal information about which index this memory will use in the generated wasm module.
     const INDEX: u32;
 
-    /// The address right after the compiler's statically-placed data (string and array literals) in this memory. 
+    /// The address right after the compiler's statically-placed data (string and array literals) in this memory.
     /// This can be used as a safe starting point for making dynamic allocations.
     const DATA_END: Self::*u8;
 
@@ -1532,7 +1542,7 @@ pub mod ptr {
         (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
     }
 
-    /// Rounds `addr` up to the next multiple of `align`. 
+    /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
     #[inline]
     pub fn align_up<Mem: Memory>(addr: Mem::Size, align: Mem::Size) -> Mem::Size {

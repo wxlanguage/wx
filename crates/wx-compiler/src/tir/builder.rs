@@ -9740,6 +9740,30 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// Returns `true` if a comptime number — the type a literal carries before
+	/// anything has pinned it down — appears anywhere in `ty`.
+	///
+	/// Only tuples are walked, because only a tuple can be *built* out of
+	/// literals and still come out with a type. There is no surface syntax
+	/// for the comptime types, so any type the user wrote is already
+	/// concrete, and every other way to construct an aggregate from literals
+	/// is rejected before it produces one: `[1, 2]` demands an annotation of
+	/// its own, and inferring a struct's type argument from a bare literal
+	/// fails to coerce. A tuple is the one construction that silently keeps
+	/// its elements comptime, and it can nest inside itself.
+	fn contains_comptime_number(&self, ty: TypeIndex) -> bool {
+		if ty.is_comptime_number() {
+			return true;
+		}
+		match &self.tir.types[ty.as_usize()] {
+			Type::Tuple { elements } => elements
+				.iter()
+				.copied()
+				.any(|e| self.contains_comptime_number(e)),
+			_ => false,
+		}
+	}
+
 	fn seed_memory_trait_impl_with(
 		&mut self,
 		trait_index: u32,
@@ -17447,28 +17471,10 @@ impl<'ast> Builder<'ast, '_> {
 		ctx: &mut ExprContext,
 		stmt: &Separated<Spanned<ast::Statement>>,
 	) -> Result<Expression, ()> {
-		let (mut_span, name, ty, value) = match &stmt.inner.inner {
-			ast::Statement::LocalDefinition { pattern, ty, value } => {
-				match &pattern.inner {
-					ast::Pattern::Binding { mut_span, name } => {
-						(*mut_span, *name, ty, value)
-					}
-					_ => {
-						self.tir.diagnostics.push(
-							codespan_reporting::diagnostic::Diagnostic::error()
-								.with_message(
-									"pattern destructuring in locals is not yet supported",
-								)
-								.with_label(Label::primary(
-									ctx.resolve_context.file_id,
-									pattern.span,
-								)),
-						);
-						return Err(());
-					}
-				}
-			}
-			_ => unreachable!(),
+		let ast::Statement::LocalDefinition { pattern, ty, value } =
+			&stmt.inner.inner
+		else {
+			unreachable!()
 		};
 
 		let expected_type = match ty {
@@ -17499,7 +17505,7 @@ impl<'ast> Builder<'ast, '_> {
 			Ok(mut value) => {
 				let ty = self.resolve_local_type(
 					ctx,
-					name.span,
+					pattern.span,
 					&mut value,
 					expected_type,
 				)?;
@@ -17507,27 +17513,435 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 
-		let local_index = ctx.push_local(Local {
-			name,
-			ty,
-			mut_span,
-			accesses: Vec::new(),
-		});
+		let statement_ty = if ty == TypeIndex::NEVER {
+			TypeIndex::NEVER
+		} else {
+			TypeIndex::UNIT
+		};
+
+		let kind = match &pattern.inner {
+			ast::Pattern::Binding { mut_span, name } => {
+				let local_index = ctx.push_local(Local {
+					name: *name,
+					ty,
+					mut_span: *mut_span,
+					accesses: Vec::new(),
+				});
+				ExprKind::LocalDeclaration {
+					name: *name,
+					scope_index: ctx.scope_index,
+					local_index,
+					value: Box::new(value),
+				}
+			}
+			// `local _ = f();` binds nothing. It exists only to run `f()` for
+			// its effects and throw the result away — which is exactly what
+			// `_ = f();` already means, so it lowers to the same node and
+			// reaches MIR's existing `Drop`.
+			ast::Pattern::Wildcard => ExprKind::Assign {
+				left: Box::new(Expression {
+					kind: ExprKind::Placeholder,
+					ty,
+					span: pattern.span,
+				}),
+				right: Box::new(value),
+			},
+			ast::Pattern::Tuple { .. } | ast::Pattern::Struct { .. } => {
+				let mut bindings = Vec::new();
+				let mut path = Vec::new();
+				self.collect_pattern_bindings(
+					ctx,
+					pattern,
+					ty,
+					&mut path,
+					&mut bindings,
+				);
+				ExprKind::DestructureDeclaration {
+					value: Box::new(value),
+					bindings: bindings.into_boxed_slice(),
+				}
+			}
+		};
 
 		Ok(Expression {
-			kind: ExprKind::LocalDeclaration {
-				name,
-				scope_index: ctx.scope_index,
-				local_index,
-				value: Box::new(value),
-			},
-			ty: if ty == TypeIndex::NEVER {
-				TypeIndex::NEVER
-			} else {
-				TypeIndex::UNIT
-			},
+			kind,
+			ty: statement_ty,
 			span: stmt.inner.span,
 		})
+	}
+
+	/// Walks `pattern` against the scrutinee type `ty`, registering one local
+	/// per bound name and recording the projection that reaches its value.
+	///
+	/// `path` is the projection accumulated so far, pushed to on the way down
+	/// and popped on the way back up, so each binding captures the full route
+	/// from the scrutinee to itself. Nested patterns are flattened this way
+	/// rather than kept nested.
+	///
+	/// A `ty` of `ERROR` means the initializer already failed. The walk still
+	/// happens — every name in the pattern is bound, as `ERROR` — so later
+	/// references resolve instead of piling on cascading errors, and no
+	/// shape diagnostics are reported against a type that was never real.
+	fn collect_pattern_bindings(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &Spanned<ast::Pattern>,
+		ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
+		let file_id = ctx.resolve_context.file_id;
+		match &pattern.inner {
+			// Binds nothing: the value it would name is simply never read.
+			// Projections are pure reads of the scrutinee, so unlike the
+			// top-level `_` there is nothing to evaluate for effect either.
+			ast::Pattern::Wildcard => {}
+			ast::Pattern::Binding { mut_span, name } => {
+				let local_index = ctx.push_local(Local {
+					name: *name,
+					ty,
+					mut_span: *mut_span,
+					accesses: Vec::new(),
+				});
+				out.push(PatternBinding {
+					scope_index: ctx.scope_index,
+					local_index,
+					path: path.as_slice().into(),
+				});
+			}
+			ast::Pattern::Tuple { elements } => {
+				// `()` is `UNIT`, not a zero-element `Type::Tuple`, so an
+				// empty tuple pattern has nothing to check or bind.
+				if ty == TypeIndex::UNIT && elements.is_empty() {
+					return;
+				}
+
+				let element_types = match &self.tir.types[ty.as_usize()] {
+					Type::Tuple { elements } => Some(elements.clone()),
+					_ => None,
+				};
+
+				let element_types = match element_types {
+					Some(types) if types.len() == elements.len() => types,
+					other => {
+						if ty != TypeIndex::ERROR {
+							let found = self
+								.formatter(ctx.resolve_context.namespace)
+								.display_type(ty)
+								.unwrap();
+							let message = match &other {
+								Some(types) => format!(
+									"expected a {}-element tuple, found `{}` with {} elements",
+									elements.len(),
+									found,
+									types.len()
+								),
+								None => format!(
+									"expected a tuple, found `{}`",
+									found
+								),
+							};
+							self.tir.diagnostics.push(
+								Diagnostic::error()
+									.with_code(
+										DiagnosticCode::TypeMistmatch.code(),
+									)
+									.with_message(
+										"tuple pattern does not match the value",
+									)
+									.with_label(
+										Label::primary(file_id, pattern.span)
+											.with_message(message),
+									),
+							);
+						}
+						// Bind every name anyway, so nothing cascades.
+						for element in elements.iter() {
+							self.collect_pattern_bindings(
+								ctx,
+								&element.inner,
+								TypeIndex::ERROR,
+								path,
+								out,
+							);
+						}
+						return;
+					}
+				};
+
+				for (index, element) in elements.iter().enumerate() {
+					path.push(PathStep {
+						aggregate_ty: ty,
+						index: index as u32,
+					});
+					self.collect_pattern_bindings(
+						ctx,
+						&element.inner,
+						element_types[index],
+						path,
+						out,
+					);
+					path.pop();
+				}
+			}
+			ast::Pattern::Struct { .. } => self
+				.collect_struct_pattern_bindings(ctx, pattern, ty, path, out),
+		}
+	}
+
+	/// The `Path::{ ... }` arm of `collect_pattern_bindings`, split out only
+	/// because resolving the path, matching it against the scrutinee, and
+	/// checking the field list is a lot to nest inside one match arm.
+	fn collect_struct_pattern_bindings(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &Spanned<ast::Pattern>,
+		ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
+		let ast::Pattern::Struct {
+			path: struct_path,
+			fields,
+			rest,
+		} = &pattern.inner
+		else {
+			unreachable!()
+		};
+		let file_id = ctx.resolve_context.file_id;
+
+		// The scrutinee decides which struct this is and how it is
+		// instantiated; the written path only has to agree with it.
+		let scrutinee = match &self.tir.types[ty.as_usize()] {
+			Type::Struct { struct_index, args } => {
+				Some((*struct_index, args.clone()))
+			}
+			_ => None,
+		};
+
+		// Resolve the written path regardless, so a bad name is reported even
+		// when the scrutinee is already broken.
+		let named_ty = self.resolve_path_type(
+			ctx.resolve_context,
+			ctx.scope,
+			struct_path,
+			pattern.span,
+			TypeArgArity::AllowInfer,
+		);
+		let named_index = match &self.tir.types[named_ty.as_usize()] {
+			Type::Struct { struct_index, .. } => Some(*struct_index),
+			_ => None,
+		};
+		if named_index.is_none() && named_ty != TypeIndex::ERROR {
+			let last = struct_path.last().expect("path is non-empty");
+			let name =
+				self.interner.resolve(last.ident.inner).unwrap().to_string();
+			self.tir.diagnostics.push(report_not_a_struct_type(
+				file_id,
+				name,
+				last.ident.span,
+			));
+		}
+
+		let (struct_index, args) = match scrutinee {
+			Some((struct_index, args))
+				if named_index.is_none_or(|named| named == struct_index) =>
+			{
+				(struct_index, args)
+			}
+			other => {
+				if ty != TypeIndex::ERROR {
+					let fmt = self.formatter(ctx.resolve_context.namespace);
+					let message = match other {
+						Some(_) => format!(
+							"value is `{}`",
+							fmt.display_type(ty).unwrap()
+						),
+						None => format!(
+							"expected a struct, found `{}`",
+							fmt.display_type(ty).unwrap()
+						),
+					};
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::TypeMistmatch.code())
+							.with_message(
+								"struct pattern does not match the value",
+							)
+							.with_label(
+								Label::primary(file_id, pattern.span)
+									.with_message(message),
+							),
+					);
+				}
+				for field in fields.iter() {
+					self.bind_struct_pattern_field(
+						ctx,
+						&field.inner,
+						TypeIndex::ERROR,
+						path,
+						out,
+					);
+				}
+				return;
+			}
+		};
+
+		let field_count = self.tir.structs[struct_index as usize].fields.len();
+		let mut first_mention: Vec<Option<TextSpan>> = vec![None; field_count];
+
+		for field in fields.iter() {
+			let name = field.inner.inner.name;
+			let Some(field_index) = self.tir.structs[struct_index as usize]
+				.lookup
+				.get(&name.inner)
+				.copied()
+			else {
+				let struct_name = self
+					.interner
+					.resolve(self.tir.structs[struct_index as usize].name.inner)
+					.unwrap()
+					.to_string();
+				let field_name =
+					self.interner.resolve(name.inner).unwrap().to_string();
+				self.tir.diagnostics.push(report_unknown_struct_field(
+					UnknownStructFieldDiagnostic {
+						file_id,
+						struct_name: &struct_name,
+						field_name: &field_name,
+						field_span: name.span,
+					},
+				));
+				self.bind_struct_pattern_field(
+					ctx,
+					&field.inner,
+					TypeIndex::ERROR,
+					path,
+					out,
+				);
+				continue;
+			};
+
+			if let Some(first_span) = first_mention[field_index] {
+				let field_name =
+					self.interner.resolve(name.inner).unwrap().to_string();
+				self.tir
+					.diagnostics
+					.push(report_duplicate_struct_field_init(
+						&field_name,
+						SourceSpan::new(file_id, first_span),
+						SourceSpan::new(file_id, name.span),
+					));
+			} else {
+				first_mention[field_index] = Some(name.span);
+			}
+
+			let raw_field_ty = self.tir.structs[struct_index as usize].fields
+				[field_index]
+				.ty
+				.inner;
+			let field_ty = if args.is_empty() {
+				raw_field_ty
+			} else {
+				self.substitute_type(raw_field_ty, &args)
+			};
+			self.tir.structs[struct_index as usize].fields[field_index]
+				.accesses
+				.push(FieldAccess {
+					kind: FieldAccessKind::Read,
+					file_id,
+					span: name.span,
+				});
+
+			path.push(PathStep {
+				aggregate_ty: ty,
+				index: field_index as u32,
+			});
+			self.bind_struct_pattern_field(
+				ctx,
+				&field.inner,
+				field_ty,
+				path,
+				out,
+			);
+			path.pop();
+		}
+
+		if rest.is_none() {
+			let missing: Box<[&str]> = first_mention
+				.iter()
+				.enumerate()
+				.filter(|(_, mention)| mention.is_none())
+				.map(|(index, _)| {
+					self.interner
+						.resolve(
+							self.tir.structs[struct_index as usize].fields
+								[index]
+								.name
+								.inner,
+						)
+						.unwrap()
+				})
+				.collect();
+			if !missing.is_empty() {
+				let fields_str = missing
+					.iter()
+					.map(|field| format!("`{}`", field))
+					.collect::<Vec<_>>()
+					.join(", ");
+				let struct_name = self
+					.interner
+					.resolve(self.tir.structs[struct_index as usize].name.inner)
+					.unwrap();
+				self.tir.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MissingStructFields.code())
+						.with_message(format!(
+							"missing fields {} in pattern for `{}`",
+							fields_str, struct_name
+						))
+						.with_note(
+							"add the remaining fields, or end the pattern with `..` to ignore them",
+						)
+						.with_label(Label::primary(file_id, pattern.span)),
+				);
+			}
+		}
+	}
+
+	/// Binds one entry of a struct pattern. `{ x }` is shorthand for
+	/// `{ x: x }`, so a field with no sub-pattern binds a local named after
+	/// the field itself.
+	fn bind_struct_pattern_field(
+		&mut self,
+		ctx: &mut ExprContext,
+		field: &Spanned<ast::PatternField>,
+		field_ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
+		match &field.inner.pattern {
+			Some(sub_pattern) => self.collect_pattern_bindings(
+				ctx,
+				sub_pattern,
+				field_ty,
+				path,
+				out,
+			),
+			None => {
+				let local_index = ctx.push_local(Local {
+					name: field.inner.name,
+					ty: field_ty,
+					mut_span: None,
+					accesses: Vec::new(),
+				});
+				out.push(PatternBinding {
+					scope_index: ctx.scope_index,
+					local_index,
+					path: path.as_slice().into(),
+				});
+			}
+		}
 	}
 
 	fn resolve_local_type(
@@ -17540,7 +17954,9 @@ impl<'ast> Builder<'ast, '_> {
 		let file_id = ctx.resolve_context.file_id;
 		if expected_type == TypeIndex::INFER {
 			// TODO: impove diagnostic for case where value.ty contains infer
-			if value.ty.is_comptime_number() || self.contains_infer(value.ty) {
+			if self.contains_comptime_number(value.ty)
+				|| self.contains_infer(value.ty)
+			{
 				self.tir.diagnostics.push(report_type_annotation_required(
 					SourceSpan::new(file_id, name_span),
 				));

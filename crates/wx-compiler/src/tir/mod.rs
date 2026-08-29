@@ -661,6 +661,24 @@ pub enum ExprKind {
 		local_index: LocalIndex,
 		value: Box<Expression>,
 	},
+	/// `local (a, b) = expr;` — binds several locals from a *single*
+	/// evaluation of `value`.
+	///
+	/// Deliberately not desugared into one `LocalDeclaration` per binding:
+	/// TIR is a tree, so code is emitted once per occurrence of a node, and
+	/// handing the same `value` to several declarations would re-evaluate it
+	/// per binding. Holding the bindings together lets MIR spill `value` into
+	/// one temp — the idiom it already uses in `lower_compound_store` and
+	/// friends — and read every binding out of that. It also keeps the temp
+	/// on the MIR side, where `Local` has no name, rather than forcing a
+	/// nameless local into TIR where every local is a user-written binding.
+	///
+	/// `bindings` may be empty (`local Point::{ .. } = p;`), in which case
+	/// this is just "evaluate `value`, discard it".
+	DestructureDeclaration {
+		value: Box<Expression>,
+		bindings: Box<[PatternBinding]>,
+	},
 	Local {
 		scope_index: ScopeIndex,
 		local_index: LocalIndex,
@@ -907,6 +925,36 @@ pub struct Local {
 	pub ty: TypeIndex,
 	pub mut_span: Option<TextSpan>,
 	pub accesses: Vec<LocalAccess>,
+}
+
+/// One step of a destructuring projection: "take field `index` of an
+/// aggregate of type `aggregate_ty`".
+///
+/// `aggregate_ty` is carried explicitly so MIR never has to re-derive the
+/// type it is indexing into — `lower_type_index(aggregate_ty)` hands back the
+/// interned `Aggregate` directly, generic substitution already applied, and
+/// its `decl_to_phys` maps `index` onto the alignment-sorted slot.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy)]
+pub struct PathStep {
+	pub aggregate_ty: TypeIndex,
+	/// Declaration-order index — the field's position as written in the
+	/// `struct`, or the element's position in the tuple. Not the physical
+	/// slot; MIR maps it through `decl_to_phys`.
+	pub index: u32,
+}
+
+/// One name bound by a `DestructureDeclaration`, plus the projection path
+/// reaching its value from the scrutinee. Nested patterns are flattened, so
+/// `local (x, (y, z)) = t;` yields paths `[0]`, `[1, 0]`, `[1, 1]` rather
+/// than a nested structure.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct PatternBinding {
+	pub scope_index: ScopeIndex,
+	pub local_index: LocalIndex,
+	pub path: Box<[PathStep]>,
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]

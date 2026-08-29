@@ -3,7 +3,7 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 471
+  - id: 473
     signature_index: 1
     scopes:
       - kind: Block
@@ -11,12 +11,12 @@ functions:
         locals:
           - ty:
               Pointer:
-                memory: 469
+                memory: 471
                 kind: Memory32
             mutability: Immutable
           - ty:
               Pointer:
-                memory: 469
+                memory: 471
                 kind: Memory32
             mutability: Immutable
           - ty: U32
@@ -44,7 +44,7 @@ functions:
                         local_index: 0
                     ty:
                       Pointer:
-                        memory: 469
+                        memory: 471
                         kind: Memory32
               ty: Unit
             - kind:
@@ -56,7 +56,7 @@ functions:
                         local_index: 1
                     ty:
                       Pointer:
-                        memory: 469
+                        memory: 471
                         kind: Memory32
                   value:
                     kind:
@@ -77,10 +77,10 @@ functions:
                                             local_index: 1
                                         ty:
                                           Pointer:
-                                            memory: 469
+                                            memory: 471
                                             kind: Memory32
                                       offset: 4
-                                      memory: 469
+                                      memory: 471
                                   ty: U32
                             ty: Unit
                           - kind:
@@ -115,7 +115,7 @@ functions:
                             ty: U32
                     ty: U32
                   offset: 4
-                  memory: 469
+                  memory: 471
               ty: Unit
       ty: Unit
     static_data: []
@@ -127,7 +127,7 @@ signatures:
     params_count: 2
   - items:
       - Pointer:
-          memory: 469
+          memory: 471
           kind: Memory32
       - Unit
     params_count: 1
@@ -300,11 +300,11 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 471
-      name: 244
+      id: 473
+      name: 245
 imports: []
 memories:
-  - id: 469
+  - id: 471
     source: Internal
     kind: Memory32
     min_pages: ~

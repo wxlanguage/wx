@@ -1682,3 +1682,206 @@ fn test_struct_compound_assignment_lowers_to_bitand_call() {
     "});
 	insta::assert_yaml_snapshot!(case.mir);
 }
+
+// ── local pattern destructuring ──────────────────────────────────────────
+
+/// Warnings are expected in these tests — a binding introduced only to check
+/// where it reads from is genuinely unused — so only errors matter.
+fn assert_no_errors(case: &TestCase) {
+	let errors: Vec<&str> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.map(|d| d.message.as_str())
+		.collect();
+	assert!(errors.is_empty(), "unexpected errors: {:#?}", errors);
+}
+
+fn mir_function<'a>(case: &'a TestCase, name: &str) -> &'a Function {
+	case.mir
+		.functions
+		.iter()
+		.find(|f| {
+			let tir_index = case.tir.expect_function_index(f.id) as usize;
+			case.graph
+				.interner
+				.resolve(case.tir.functions[tir_index].name.inner)
+				== Some(name)
+		})
+		.unwrap_or_else(|| panic!("`{name}` should be in MIR"))
+}
+
+/// The statement list of `name`'s body block.
+fn function_body_statements<'a>(
+	case: &'a TestCase,
+	name: &str,
+) -> &'a [Expression] {
+	match &mir_function(case, name).block.kind {
+		ExprKind::Block { expressions, .. } => expressions,
+		_ => panic!("a function body is a block"),
+	}
+}
+
+/// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
+fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
+	let ExprKind::LocalSet {
+		local_index, value, ..
+	} = &expr.kind
+	else {
+		panic!("expected a `LocalSet`")
+	};
+	let ExprKind::AggregateGet {
+		scope_index: from_scope,
+		local_index: from_local,
+		value_index,
+	} = &value.kind
+	else {
+		panic!("a destructured binding reads its value with `AggregateGet`")
+	};
+	let _ = local_index;
+	(*from_scope, *from_local, *value_index)
+}
+
+/// The whole point of `DestructureDeclaration`: the initializer runs once,
+/// into one temp, and every binding reads back out of that temp.
+#[test]
+fn test_tuple_destructuring_evaluates_initializer_once() {
+	let case = TestCase::new(indoc! {"
+        fn make() -> (i32, i32) { (1, 2) }
+        fn f() -> i32 {
+            local (a, b) = make();
+            a + b
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// [0] spills `make()` into a temp; [1] and [2] read fields out of it.
+	let ExprKind::LocalSet {
+		scope_index: temp_scope,
+		local_index: temp_local,
+		value,
+	} = &statements[0].kind
+	else {
+		panic!("the initializer is spilled into a local first")
+	};
+	assert_eq!(*temp_scope, 0, "temps live in the function root scope");
+	assert!(
+		matches!(value.kind, ExprKind::Call { .. }),
+		"the spilled value is the call itself, evaluated exactly once"
+	);
+
+	let (a_scope, a_local, _) = destructured_store(&statements[1]);
+	let (b_scope, b_local, _) = destructured_store(&statements[2]);
+	assert_eq!((a_scope, a_local), (0, *temp_local));
+	assert_eq!((b_scope, b_local), (0, *temp_local));
+
+	// And the call appears exactly once in the whole body.
+	let calls = statements
+		.iter()
+		.filter(|e| matches!(&e.kind, ExprKind::LocalSet { value, .. } if matches!(value.kind, ExprKind::Call { .. })))
+		.count();
+	assert_eq!(calls, 1, "`make()` must not be re-evaluated per binding");
+}
+
+/// A scrutinee that is already a local is read in place — no copy.
+#[test]
+fn test_destructuring_a_local_scrutinee_skips_the_spill() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b) = pair;
+            a + b
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// `pair` is parameter 0 of scope 0, so both bindings read straight from
+	// it and there is no spilling `LocalSet` ahead of them.
+	let (a_scope, a_local, _) = destructured_store(&statements[0]);
+	let (b_scope, b_local, _) = destructured_store(&statements[1]);
+	assert_eq!((a_scope, a_local), (0, 0));
+	assert_eq!((b_scope, b_local), (0, 0));
+}
+
+/// Tuple elements are alignment-sorted exactly like struct fields, so a
+/// binding has to read the *physical* slot. Reading the declaration index
+/// would hand back the wrong element here.
+#[test]
+fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
+	let case = TestCase::new(indoc! {"
+        fn f(t: (bool, i64, u32)) -> i64 {
+            local (a, b, c) = t;
+            b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+
+	let sig_index = mir_function(&case, "f").signature_index as usize;
+	let param_ty = case.mir.signatures[sig_index].params()[0];
+	let Type::Aggregate { aggregate_index } = param_ty else {
+		panic!("a tuple parameter lowers to an aggregate")
+	};
+	let agg = &case.mir.aggregates[aggregate_index as usize];
+	// Sorted by alignment descending: i64, u32, bool.
+	assert_eq!(&*agg.values, &[Type::I64, Type::U32, Type::Bool]);
+	assert_eq!(&*agg.decl_to_phys, &[2, 0, 1]);
+
+	let statements = function_body_statements(&case, "f");
+	let slots: Vec<u32> = statements[..3]
+		.iter()
+		.map(|e| destructured_store(e).2)
+		.collect();
+	assert_eq!(
+		slots,
+		vec![2, 0, 1],
+		"bindings must read physical slots, not declaration indices"
+	);
+}
+
+#[test]
+fn test_struct_destructuring_reads_declared_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Mixed { a: bool, b: i64 }
+        fn f(m: Mixed) -> i64 {
+            local Mixed::{ a, b } = m;
+            b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+	let statements = function_body_statements(&case, "f");
+	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
+	assert_eq!(destructured_store(&statements[0]).2, 1);
+	assert_eq!(destructured_store(&statements[1]).2, 0);
+}
+
+/// Nested patterns are flattened into projection paths, so an inner binding
+/// hops through an intermediate temp rather than nesting `AggregateGet`s.
+#[test]
+fn test_nested_tuple_destructuring_projects_through_a_temp() {
+	let case = TestCase::new(indoc! {"
+        fn f(t: (i32, (i32, i32))) -> i32 {
+            local (x, (y, z)) = t;
+            x + y + z
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// `t` is already a local, so nothing spills for `x`. Each deeper binding
+	// spills the intermediate `t.1` just before its own store, giving
+	// [x, spill, y, spill, z].
+	let (x_scope, x_local, _) = destructured_store(&statements[0]);
+	assert_eq!((x_scope, x_local), (0, 0), "`x` reads `t` directly");
+
+	let (_, y_from, _) = destructured_store(&statements[2]);
+	let (_, z_from, _) = destructured_store(&statements[4]);
+	assert_ne!(y_from, 0, "`y` reads the spilled inner tuple, not `t`");
+	assert_ne!(z_from, 0, "`z` reads the spilled inner tuple, not `t`");
+}

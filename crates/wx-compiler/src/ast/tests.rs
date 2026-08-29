@@ -846,18 +846,22 @@ fn test_pattern_tuple_destructuring() {
 fn test_pattern_struct_destructuring() {
 	let case = TestCase::new(indoc! {"
         fn f(p: Point) {
-            local Point { x, y } = p;
-            local Point { x: a, y: b } = p;
+            local Point::{ x, y } = p;
+            local Point::{ x: a, y: b } = p;
+            local geom::Point::{ x, .. } = p;
         }
     "});
 	assert!(case.ast.diagnostics.is_empty());
 	let stmts = function_block(&case.ast, 0);
 
-	let Pattern::Struct { name, fields } = local_definition_pattern(stmts, 0)
+	let Pattern::Struct { path, fields, rest } =
+		local_definition_pattern(stmts, 0)
 	else {
 		panic!("expected struct pattern")
 	};
-	assert_eq!(case.interner.resolve(name.inner), Some("Point"));
+	assert_eq!(path.len(), 1);
+	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("Point"));
+	assert!(rest.is_none());
 	assert_eq!(fields.len(), 2);
 	assert!(
 		fields[0].inner.inner.pattern.is_none(),
@@ -880,6 +884,19 @@ fn test_pattern_struct_destructuring() {
 		fields[1].inner.inner.pattern.is_some(),
 		"renamed field should have sub-pattern"
 	);
+
+	// A multi-segment path names a struct in another module, and `..` stands
+	// in for the fields the pattern does not bind.
+	let Pattern::Struct { path, fields, rest } =
+		local_definition_pattern(stmts, 2)
+	else {
+		panic!("expected struct pattern")
+	};
+	assert_eq!(path.len(), 2);
+	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("geom"));
+	assert_eq!(case.interner.resolve(path[1].ident.inner), Some("Point"));
+	assert_eq!(fields.len(), 1);
+	assert!(rest.is_some());
 }
 
 #[test]

@@ -678,7 +678,9 @@ fn test_format_local_patterns() {
             local _ = 3;
             local (a,b) = pair;
             local (mut c,_) = pair;
-            local Point{x,y:renamed} = p;
+            local Point::{x,y:renamed} = p;
+            local geom::Point::{x,..} = p;
+            local Point::{..} = p;
             local (a,b): (i32,i32) = pair;
         }
     "});
@@ -701,7 +703,9 @@ fn test_format_local_patterns() {
                 local _ = 3;
                 local (a, b) = pair;
                 local (mut c, _) = pair;
-                local Point { x, y: renamed } = p;
+                local Point::{ x, y: renamed } = p;
+                local geom::Point::{ x, .. } = p;
+                local Point::{ .. } = p;
                 local (a, b): (i32, i32) = pair;
             }
         "}
@@ -1589,4 +1593,523 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 		},
 	);
 	assert!(!output.is_empty());
+}
+
+/// A comment keeps the line the author put it on. Whether it trails the code
+/// before it or owns its line is decided purely by whether a newline separates
+/// them in the source — never by how wide the result is, the same rule rustfmt
+/// and Prettier use. Moving a comment across a line boundary would silently
+/// change which item it appears to document.
+#[test]
+fn test_format_trailing_comments_keep_their_line() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	// Every construct with a list of entries: items, struct fields, enum
+	// variants, impl members, match arms, export entries, block statements.
+	// Each keeps a comment trailing the entry, a comment owning its own line,
+	// and a comment after the last entry.
+	let source = indoc! {"
+        // File header.
+
+        const A: u32 = 1; // trailing on item
+        const B: u32 = 2;
+
+        struct S {
+            // leading on first field
+            x: u32, // trailing on field
+            y: u32,
+            // own-line before closing brace
+        }
+
+        enum E: u32 {
+            A = 0, // trailing on variant
+            B = 1,
+        }
+
+        impl S {
+            // leading on first member
+            fn a(self) -> u32 {
+                self.x
+            } // trailing on member
+
+            fn b(self) -> u32 {
+                self.y
+            }
+        }
+
+        fn g(v: u32) -> u32 {
+            local a = 1; // trailing on statement
+
+            // own-line, documents b
+            local b = 2;
+            match v {
+                0 -> { a }, // trailing on arm
+                // own-line before arm
+                _ -> { b }
+            }
+            // own-line before closing brace
+        }
+
+        export {
+            // leading on first entry
+            g, // trailing on entry
+        }
+
+        const LAST: u32 = 4; // trailing after the last item
+        // own-line at end of file
+    "};
+
+	// Nothing is dropped, nothing changes line — the source is already in
+	// normal form, so formatting is the identity.
+	assert_eq!(fmt(source), source);
+	// ...and stays that way on a second pass.
+	assert_eq!(fmt(&fmt(source)), source);
+}
+
+/// A doc comment documents whatever follows it, so it never gets pulled up
+/// onto the previous line even when nothing but spaces separates the two.
+#[test]
+fn test_format_doc_comment_never_trails() {
+	let case = TestCase::new(
+		"const A: u32 = 1; /// Documents B.\nconst B: u32 = 2;\n",
+	);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig::default(),
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            const A: u32 = 1;
+            /// Documents B.
+            const B: u32 = 2;
+        "},
+	);
+}
+
+/// An item's attributes sit *outside* its span, so the region a gap measures
+/// for blank lines runs from the end of the previous entry all the way past
+/// the `#[...]` lines to the item's own `span.start`. Only the whitespace in
+/// that region counts as a blank line — the newline ending an attribute's line
+/// must not, or a blank line appears between a doc comment and its item.
+///
+/// Blank lines the author actually wrote are still preserved, wherever they
+/// fall relative to the attribute, matching rustfmt (verified against it: it
+/// keeps all of these and only collapses runs of two or more to one).
+#[test]
+fn test_format_blank_lines_around_attributes() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	// No blank anywhere the author didn't write one — the regression: the
+	// attribute's own newline used to read as a blank line after the doc.
+	let glued = indoc! {"
+        /// Doc line one.
+        /// Doc line two.
+        #[inline]
+        pub fn f() -> u32 {
+            1
+        }
+    "};
+	assert_eq!(fmt(glued), glued);
+
+	// A blank the author did write, on either side of the attribute, survives.
+	let spaced = indoc! {"
+        /// Doc, then a blank, then the attribute.
+
+        #[inline]
+        pub fn f() -> u32 {
+            1
+        }
+    "};
+	assert_eq!(fmt(spaced), spaced);
+
+	// And a blank between two plain items is still kept — the region there
+	// opens with the previous item's `;`, which is not whitespace either.
+	let items = indoc! {"
+        const A: u32 = 1;
+
+        #[inline]
+        pub fn f() -> u32 {
+            1
+        }
+    "};
+	assert_eq!(fmt(items), items);
+}
+
+/// No line ends in whitespace — in particular a blank line between two
+/// indented statements is bare, not the previous line's indent.
+#[test]
+fn test_format_no_trailing_whitespace() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local a = 1;
+
+            a
+        }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig::default(),
+	);
+	assert!(
+		!output.lines().any(|line| line.ends_with(' ')),
+		"line ends in whitespace:\n{output:?}",
+	);
+}
+
+/// Nothing trails the token that *opens* a list. A comment written after `{`
+/// documents the body, not the opener, so it wraps onto its own line — for
+/// every construct alike, which is what rustfmt does (verified against it:
+/// `mod`, `struct`, `enum`, `impl`, a block and `match` all wrap).
+///
+/// This is the one place the same-line rule does not apply, because the code
+/// on that line is the opener rather than an entry of the list.
+#[test]
+fn test_format_comment_after_a_list_opener_wraps() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	let source = indoc! {"
+        mod inner { // opens a `mod`
+            pub const A: u32 = 1;
+        }
+
+        struct S { // opens a `struct`
+            x: u32,
+        }
+
+        enum E: u32 { // opens an `enum`
+            A = 0,
+        }
+
+        impl S { // opens an `impl`
+            fn a(self) -> u32 {
+                self.x
+            }
+        }
+
+        import \"env\" { // opens an `import`
+            fn h() -> u32;
+        }
+
+        fn g(v: u32) -> u32 { // opens a block
+            match v { // opens a `match`
+                _ -> { v }
+            }
+        }
+
+        trait T { // opens a `trait`
+            fn t(self) -> u32;
+        }
+
+        export { // opens an `export`
+            g,
+        }
+    "};
+
+	let expected = indoc! {"
+        mod inner {
+            // opens a `mod`
+            pub const A: u32 = 1;
+        }
+
+        struct S {
+            // opens a `struct`
+            x: u32,
+        }
+
+        enum E: u32 {
+            // opens an `enum`
+            A = 0,
+        }
+
+        impl S {
+            // opens an `impl`
+            fn a(self) -> u32 {
+                self.x
+            }
+        }
+
+        import \"env\" {
+            // opens an `import`
+            fn h() -> u32;
+        }
+
+        fn g(v: u32) -> u32 {
+            // opens a block
+            match v {
+                // opens a `match`
+                _ -> { v }
+            }
+        }
+
+        trait T {
+            // opens a `trait`
+            fn t(self) -> u32;
+        }
+
+        export {
+            // opens an `export`
+            g,
+        }
+    "};
+
+	assert_eq!(fmt(source), expected);
+	// Wrapping happens once: the result is already in normal form.
+	assert_eq!(fmt(expected), expected);
+}
+
+/// The comment that motivated the same-line rule in the first place: one
+/// sitting after an ordinary, non-block entry. Wrapping opener comments must
+/// not pull these down with them.
+#[test]
+fn test_format_trailing_comment_after_a_non_block_item_is_kept() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	let source = indoc! {"
+        const X: i32 = 5; // documents X, not Y
+        const Y: i32 = 6;
+
+        struct S {
+            x: u32, // documents x
+            y: u32,
+        }
+
+        fn g() -> i32 {
+            local a = 1; // documents a
+            a
+        }
+    "};
+
+	assert_eq!(fmt(source), source);
+	assert_eq!(fmt(&fmt(source)), source);
+}
+
+/// `trait` bodies were the one list with no comment handling of their own at
+/// all: a comment trailing a member was reattached to the next one, and a
+/// comment after the last member was dropped on the floor.
+#[test]
+fn test_format_trait_body_comments_are_kept_in_place() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	let source = indoc! {"
+        trait T {
+            // opens the trait
+            fn a(self) -> u32; // trails a member
+
+            // own-line before b
+            fn b(self) -> u32;
+            // after the last member
+        }
+    "};
+
+	assert_eq!(fmt(source), source);
+	assert_eq!(fmt(&fmt(source)), source);
+}
+
+/// A file holding nothing but comments keeps them. Formatting never deletes a
+/// comment, and "there are no items" is not an exception to that.
+#[test]
+fn test_format_comment_only_file_is_preserved() {
+	let source = "// A header-only file.\n// Second line.\n";
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig::default(),
+	);
+	assert_eq!(output, source);
+}
+
+/// The author's vertical whitespace is theirs wherever it falls — including
+/// between two comments that lead the first entry of a list, not just between
+/// comments further down it. rustfmt preserves these too.
+#[test]
+fn test_format_blank_line_between_leading_comments() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	let source = indoc! {"
+        struct S {
+            // one
+
+            // two
+            x: u32,
+        }
+
+        impl S {
+            // one
+
+            // two
+            fn a(self) -> u32 {
+                self.x
+            }
+        }
+
+        fn g() -> u32 {
+            // one
+
+            // two
+            1
+        }
+    "};
+
+	assert_eq!(fmt(source), source);
+	assert_eq!(fmt(&fmt(source)), source);
+}
+
+/// A body with no entries is still a list, and its comments go through the
+/// same gap as any other — an opener on one side, the closing brace on the
+/// other. So an empty body spaces its comments exactly like a body with one
+/// entry in it, rather than collapsing the blank as it used to.
+#[test]
+fn test_format_empty_body_comments_match_a_non_empty_one() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	// The only difference between the two is the field. It must not be what
+	// decides whether the blank line between the comments survives.
+	let source = indoc! {"
+        struct Empty {
+            // one
+
+            // two
+        }
+
+        struct HasAField {
+            // one
+
+            // two
+            x: u32,
+        }
+
+        impl Empty {
+            // one
+
+            // two
+        }
+
+        fn f() {
+            // one
+
+            // two
+        }
+    "};
+
+	assert_eq!(fmt(source), source);
+	assert_eq!(fmt(&fmt(source)), source);
+}
+
+/// A blank line right after an opener is dropped — there is nothing above it
+/// for it to separate the body from. Matches rustfmt, which removes it while
+/// keeping blank lines everywhere else.
+#[test]
+fn test_format_no_blank_line_after_a_list_opener() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig::default(),
+		)
+	};
+
+	let source = indoc! {"
+        struct S {
+
+            // separated from the brace
+            x: u32,
+        }
+
+        impl S {
+
+            fn a(self) -> u32 {
+                self.x
+            }
+        }
+
+        fn g() -> u32 {
+
+            1
+        }
+    "};
+
+	let expected = indoc! {"
+        struct S {
+            // separated from the brace
+            x: u32,
+        }
+
+        impl S {
+            fn a(self) -> u32 {
+                self.x
+            }
+        }
+
+        fn g() -> u32 {
+            1
+        }
+    "};
+
+	assert_eq!(fmt(source), expected);
+	assert_eq!(fmt(expected), expected);
 }
