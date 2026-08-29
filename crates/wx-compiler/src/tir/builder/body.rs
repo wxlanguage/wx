@@ -670,7 +670,7 @@ impl<'ast> Builder<'ast, '_> {
 				let unescaped = unescape_string(raw);
 				let symbol = self.interner.get_or_intern(&unescaped);
 				// An expected slice type pins the literal's memory (`local
-				// s: other::[]u8 = "…"`); ambient resolution is the
+				// s: other::&[u8] = "…"`); ambient resolution is the
 				// fallback and is ambiguous with more than one memory.
 				let memory_ty = match &self.tir.types
 					[access_ctx.expected_type.as_usize()]

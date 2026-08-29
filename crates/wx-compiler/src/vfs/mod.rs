@@ -24,46 +24,7 @@ pub use path::{AbsolutePath, RelativePath};
 // files and wiring up the package graph — closer to a linker than a parser or
 // type checker). Follows the same per-stage numbering convention as
 // `ast::DiagnosticCode` (E0xxx) and `tir::DiagnosticCode` (E1xxx).
-macro_rules! define_diagnostic_codes {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $variant:ident => $code:literal,
-            )*
-        }
-    ) => {
-        $(#[$meta])*
-        $vis enum $name {
-            $($variant,)*
-        }
-
-        impl $name {
-            pub const fn code(&self) -> &'static str {
-                match self {
-                    $(Self::$variant => $code,)*
-                }
-            }
-        }
-
-        impl std::str::FromStr for $name {
-            type Err = ();
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s {
-                    $($code => Ok(Self::$variant),)*
-                    _ => Err(()),
-                }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.code())
-            }
-        }
-    };
-}
+use crate::diagnostics::define_diagnostic_codes;
 
 define_diagnostic_codes! {
 	pub enum DiagnosticCode {

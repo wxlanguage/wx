@@ -184,46 +184,7 @@ impl std::fmt::Display for Token {
 	}
 }
 
-macro_rules! define_diagnostic_codes {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $variant:ident => $code:literal,
-            )*
-        }
-    ) => {
-        $(#[$meta])*
-        $vis enum $name {
-            $($variant,)*
-        }
-
-        impl $name {
-            pub const fn code(&self) -> &'static str {
-                match self {
-                    $(Self::$variant => $code,)*
-                }
-            }
-        }
-
-        impl std::str::FromStr for $name {
-            type Err = ();
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s {
-                    $($code => Ok(Self::$variant),)*
-                    _ => Err(()),
-                }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.code())
-            }
-        }
-    };
-}
+use crate::diagnostics::define_diagnostic_codes;
 
 define_diagnostic_codes! {
 	pub enum DiagnosticCode {
@@ -387,6 +348,16 @@ fn report_invalid_namespace(
 		)
 }
 
+fn report_unknown_token(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UnknownToken.code())
+		.with_message("unknown token")
+		.with_label(
+			Label::primary(file_id, span)
+				.with_message("not valid in wx source"),
+		)
+}
+
 fn report_invalid_item(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InvalidItem.code())
@@ -450,6 +421,7 @@ struct Lexer<'src> {
 	peeked: Option<Spanned<Token>>,
 	comments: Vec<Comment>,
 	has_crlf: bool,
+	unknown_spans: Vec<TextSpan>,
 }
 
 const EOF: char = '\0';
@@ -462,6 +434,7 @@ impl<'src> Lexer<'src> {
 			peeked: None,
 			comments: Vec::new(),
 			has_crlf: false,
+			unknown_spans: Vec::new(),
 		}
 	}
 
@@ -530,16 +503,21 @@ impl<'src> Lexer<'src> {
 					};
 					continue;
 				}
-				_ => match unknown_span {
-					Some(span) => {
-						self.peeked = Some(token);
-						return Spanned {
-							inner: Token::Unknown,
-							span,
-						};
+				_ => {
+					// A run of unknown characters is recorded and skipped,
+					// exactly like a comment. The parser has no handler for
+					// `Token::Unknown`, so surfacing one only ever added a
+					// second, misleading diagnostic on top of this one —
+					// pointing at whatever token happened to follow.
+					//
+					// Recorded here, where the run ends, so it is counted once
+					// however often the surrounding tokens are peeked: `next`
+					// returns a peeked token before reaching this point.
+					if let Some(span) = unknown_span {
+						self.unknown_spans.push(span);
 					}
-					None => return token,
-				},
+					return token;
+				}
 			}
 		}
 	}
@@ -1386,9 +1364,10 @@ pub enum TypeExpression {
 	Tuple {
 		elements: Box<[Spanned<TypeExpression>]>,
 	},
-	/// `heap::*mut u8`, `heap::[]i32` — memory-tagged pointer/slice/array.
+	/// `heap::*u8`, `heap::&[i32]` — memory-tagged pointer/slice/array.
 	/// The memory is always a single-segment path naming the memory
-	/// declaration; the inner is a Pointer, Slice, or Array type.
+	/// declaration; the inner is a Pointer, Slice, or Array type, and so
+	/// always carries its own `*`/`&` ownership sigil.
 	MemoryTagged {
 		memory: Box<[PathSegment]>,
 		inner: Box<Spanned<TypeExpression>>,
@@ -2311,6 +2290,18 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let Parser { mut ast, lexer, .. } = parser;
+		// Appended, in whatever position they land: nothing downstream reads
+		// diagnostics positionally, each one carries its own span, and the
+		// CRLF warning above is already out of source order. `extend` over an
+		// exact-size iterator reserves once and moves each `Diagnostic` — not
+		// a cheap thing to shuffle, holding an owned message and two `Vec`s —
+		// exactly once.
+		ast.diagnostics.extend(
+			lexer
+				.unknown_spans
+				.iter()
+				.map(|span| report_unknown_token(file_id, *span)),
+		);
 		ast.comments = CommentMap(lexer.comments.into_boxed_slice());
 		ast
 	}

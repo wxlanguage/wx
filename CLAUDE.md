@@ -129,7 +129,8 @@ Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 18 slots (`ERR
 ## Language features (current state from tests)
 
 - Primitives: `i32`, `i64`, `u32`, `u64`, `f32`, `f64`, `bool`, `char`, `u8`, `i8`, `u16`, `i16`
-- String literals have type `[]u8` (byte slice); there is no separate `string` type
+- Pointers, slices and arrays always carry an ownership sigil — `*T`/`&T`, `*[T]`/`&[T]`, `*[T; N]`/`&[T; N]` (`*` exclusive, `&` shared); there is no bare `[]T`. Each also belongs to a memory, resolved from the ambient one unless tagged explicitly (`heap::&[u8]`), and the type formatter always prints that memory prefix — so a slice surfaces in diagnostics as `heap::&[u8]`, never `&[u8]`
+- String literals have type `&[u8]` (a shared byte slice); there is no separate `string` type
 - `local` / `local mut` declarations; `global` / `global mut` for module-level state
 - `const` — compile-time evaluated, inlined at every reference site, never emitted as a WASM global
 - Functions, `fn(T) -> U` type expressions (first-class function references)
@@ -152,7 +153,7 @@ Every type is a `TypeIndex` (u32) into `tir.type_pool`. The first 18 slots (`ERR
 
 Struct layout uses alignment-sorted field ordering (fields sorted descending by alignment) to minimize padding.
 
-String literals lower to a `[]u8` slice aggregate `{ StaticPointer, len }`. Static data (string literals, array constants) is currently always placed in `memories[0]` (the first declared memory).
+String literals lower to a `&[u8]` slice aggregate `{ StaticPointer, len }`. Static data (string literals, array constants) is currently always placed in `memories[0]` (the first declared memory).
 
 ## Testing patterns
 

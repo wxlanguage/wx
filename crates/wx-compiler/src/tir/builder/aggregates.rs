@@ -881,7 +881,7 @@ fn report_index_on_non_indexable(
 		))
 		.with_label(span.primary_label())
 		.with_note(
-			"indexing is only supported on array `[N]T` and slice `[]T` types",
+			"indexing is only supported on array `&[T; N]` and slice `&[T]` types",
 		)
 }
 

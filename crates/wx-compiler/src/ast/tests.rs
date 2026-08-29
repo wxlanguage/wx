@@ -1,9 +1,15 @@
 use indoc::indoc;
 
 use super::*;
+use crate::testing::DiagnosticView;
 use crate::vfs::{FileOrigin, Files};
 
-#[allow(unused)]
+/// A single parsed file, kept together with the [`Files`] its spans point
+/// into so diagnostics can be rendered with source context.
+///
+/// Parser tests deliberately skip the package machinery — no stdlib, no
+/// `CompilationUnit` — because nothing here needs it, and every extra stage
+/// would be another way for a test to fail for reasons it is not about.
 struct TestCase {
 	interner: StringInterner,
 	files: Files,
@@ -26,29 +32,146 @@ impl TestCase {
 			ast,
 		}
 	}
+
+	/// Everything the parser reported. See [`DiagnosticView`] for the
+	/// assertions; prefer them over poking at `ast.diagnostics` directly, since
+	/// they render the offending source when they fail.
+	fn diagnostics(&self) -> DiagnosticView<'_> {
+		DiagnosticView::new("parse", &self.ast.diagnostics, &self.files)
+	}
+
+	/// Resolves an interned symbol, so assertions can name things rather than
+	/// compare opaque `SymbolU32` integers (which is all a snapshot shows).
+	fn name(&self, symbol: SymbolU32) -> &str {
+		self.interner
+			.resolve(symbol)
+			.expect("symbol was interned by this parse")
+	}
+
+	/// The signature of the function item at `index`.
+	fn function_signature(&self, index: usize) -> &FunctionSignature {
+		let Item::Function { signature, .. } = self.item(index) else {
+			panic!(
+				"item {index} is {}, not a function",
+				item_kind(self.item(index))
+			)
+		};
+
+		signature
+	}
+
+	/// Renders an expression as a compact S-expression: `a + b * c` becomes
+	/// `(+ a (* b c))`.
+	///
+	/// Precedence and associativity are claims about *tree shape*, and a
+	/// nest of `matches!` states that shape far less clearly than the shape
+	/// itself does. Only the node kinds those tests need are rendered;
+	/// anything else falls back to its variant name, which is enough to make
+	/// a mismatch obvious.
+	fn shape(&self, expr: &Expression) -> String {
+		match expr {
+			Expression::Binary {
+				operator,
+				left,
+				right,
+			} => format!(
+				"({} {} {})",
+				operator.inner,
+				self.shape(&left.inner),
+				self.shape(&right.inner)
+			),
+			// `u` prefix keeps unary `-` distinguishable from binary `-`
+			Expression::Unary { operator, operand } => {
+				format!("(u{} {})", operator.inner, self.shape(&operand.inner))
+			}
+			Expression::Path(segments) => segments
+				.iter()
+				.map(|segment| self.name(segment.ident.inner))
+				.collect::<Vec<_>>()
+				.join("::"),
+			Expression::Int { value } => value.to_string(),
+			other => format!("<{}>", expression_kind(other)),
+		}
+	}
+
+	fn item(&self, index: usize) -> &Item {
+		&self.ast.items[index].inner.inner
+	}
+
+	fn function_block(&self, index: usize) -> &[Separated<Spanned<Statement>>] {
+		let Item::Function { block, .. } = self.item(index) else {
+			panic!(
+				"item {index} is {}, not a function",
+				item_kind(self.item(index))
+			)
+		};
+
+		block.inner.as_block_statements()
+	}
+
+	fn struct_fields(
+		&self,
+		index: usize,
+	) -> &[Separated<Spanned<StructField>>] {
+		let Item::Struct { fields, .. } = self.item(index) else {
+			panic!(
+				"item {index} is {}, not a struct",
+				item_kind(self.item(index))
+			)
+		};
+
+		fields
+	}
 }
 
-fn diagnostic_codes(ast: &AST) -> Vec<&str> {
-	ast.diagnostics
-		.iter()
-		.filter_map(|diagnostic| diagnostic.code.as_deref())
-		.collect()
+/// Parses `expression` as the whole body of a function and renders its shape.
+/// See [`TestCase::shape`].
+fn shape_of(expression: &str) -> String {
+	let case = TestCase::new(&format!("fn f() {{ {expression} }}"));
+	case.diagnostics().assert_none();
+	case.shape(statement_expression(case.function_block(0), 0))
 }
 
-fn item(ast: &AST, index: usize) -> &Item {
-	&ast.items[index].inner.inner
+/// Fallback naming for [`TestCase::shape`] — just enough to identify an
+/// unexpected node without depending on `Debug`.
+fn expression_kind(expression: &Expression) -> &'static str {
+	match expression {
+		Expression::Call { .. } => "call",
+		Expression::MethodCall(_) => "method-call",
+		Expression::ObjectAccess { .. } => "field",
+		Expression::Grouping { .. } => "grouping",
+		Expression::Cast { .. } => "cast",
+		Expression::Float { .. } => "float",
+		Expression::Char => "char",
+		Expression::String => "string",
+		Expression::Placeholder => "placeholder",
+		Expression::Error => "error",
+		_ => "other",
+	}
 }
 
-fn function_item(ast: &AST, index: usize) -> &Item {
-	item(ast, index)
-}
-
-fn function_block(ast: &AST, index: usize) -> &[Separated<Spanned<Statement>>] {
-	let Item::Function { block, .. } = function_item(ast, index) else {
-		panic!("expected function item")
-	};
-
-	block.inner.as_block_statements()
+/// Names an item variant, so a failed destructure says what was actually
+/// parsed instead of only what was wanted.
+fn item_kind(item: &Item) -> &'static str {
+	match item {
+		Item::Function { .. } => "a function",
+		Item::FunctionDeclaration { .. } => "a function declaration",
+		Item::Global { .. } => "a global",
+		Item::Export { .. } => "an export block",
+		Item::Import { .. } => "an import block",
+		Item::Enum { .. } => "an enum",
+		Item::InherentImpl { .. } => "an inherent impl",
+		Item::TraitImpl { .. } => "a trait impl",
+		Item::Struct { .. } => "a struct",
+		Item::Memory { .. } => "a memory",
+		Item::Const { .. } => "a const",
+		Item::Module { .. } => "an inline module",
+		Item::ModuleDeclaration { .. } => "a module declaration",
+		Item::Trait { .. } => "a trait",
+		Item::TypeSet { .. } => "a typeset",
+		Item::Use { .. } => "a use",
+		Item::TypeAlias { .. } => "a type alias",
+	}
 }
 
 fn statement_expression(
@@ -86,17 +209,6 @@ fn local_definition_pattern(
 	};
 
 	&pattern.inner
-}
-
-fn struct_fields(
-	ast: &AST,
-	index: usize,
-) -> &[Separated<Spanned<StructField>>] {
-	let Item::Struct { fields, .. } = item(ast, index) else {
-		panic!("expected struct item")
-	};
-
-	fields
 }
 
 // ── Top-level items ──────────────────────────────────────────────────────────
@@ -139,14 +251,14 @@ fn test_enum_repr_after_name() {
         }
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 
 	let Item::Enum {
 		repr,
 		name,
 		variants,
 		..
-	} = item(&case.ast, 0)
+	} = case.item(0)
 	else {
 		panic!("expected enum item")
 	};
@@ -171,7 +283,24 @@ fn test_function_mut_param() {
             acc
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let param = &case.function_signature(0).params[0].inner.inner;
+	assert_eq!(case.name(param.name.inner), "n");
+	assert!(param.mut_span.is_some(), "`mut n` should record a mut span");
+
+	// `mut` on a local lives on its binding pattern, not on the statement
+	let statements = case.function_block(0);
+	let Pattern::Binding { mut_span, name } =
+		local_definition_pattern(statements, 0)
+	else {
+		panic!("expected a binding pattern")
+	};
+	assert_eq!(case.name(name.inner), "acc");
+	assert!(
+		mut_span.is_some(),
+		"`local mut acc` should record a mut span"
+	);
 }
 
 #[test]
@@ -182,7 +311,15 @@ fn test_fn_pointer_param() {
             f(x)
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let param = &case.function_signature(0).params[0].inner.inner;
+	let ty = &param.ty.as_ref().expect("`f` is annotated").inner;
+	let TypeExpression::Function { params, result } = ty else {
+		panic!("expected a function type, got {ty:?}")
+	};
+	assert_eq!(params.len(), 1);
+	assert!(result.is_some(), "`-> i32` should be recorded");
 }
 
 #[test]
@@ -197,12 +334,8 @@ fn test_type_expression_forms() {
         }
     "});
 
-	assert!(
-		case.ast.diagnostics.is_empty(),
-		"unexpected diagnostics: {:?}",
-		diagnostic_codes(&case.ast)
-	);
-	let Item::Struct { fields, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::Struct { fields, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 
@@ -242,7 +375,25 @@ fn test_impl() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let Item::InherentImpl { items, .. } = case.item(0) else {
+		panic!("item 0 is {}, not an impl", item_kind(case.item(0)))
+	};
+	assert_eq!(items.len(), 1);
+	let ImplItem::Function {
+		pub_span,
+		attributes,
+		signature,
+		..
+	} = &items[0].inner.inner
+	else {
+		panic!("expected a method")
+	};
+	assert_eq!(case.name(signature.name.inner), "double");
+	assert!(pub_span.is_some(), "`pub fn` should record a pub span");
+	assert_eq!(attributes.len(), 1);
+	assert_eq!(case.name(attributes[0].name.inner), "inline");
 }
 
 #[test]
@@ -255,7 +406,24 @@ fn test_impl_trait_for_type() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let Item::TraitImpl {
+		trait_name,
+		target,
+		items,
+		..
+	} = case.item(0)
+	else {
+		panic!("item 0 is {}, not a trait impl", item_kind(case.item(0)))
+	};
+	assert_eq!(trait_name.len(), 1);
+	assert_eq!(case.name(trait_name[0].ident.inner), "Drawable");
+	let TypeExpression::Path(segments) = &target.inner else {
+		panic!("expected a path target")
+	};
+	assert_eq!(case.name(segments[0].ident.inner), "Point");
+	assert_eq!(items.len(), 1);
 }
 
 #[test]
@@ -272,7 +440,51 @@ fn test_trait_items() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let Item::Trait {
+		name,
+		supertraits,
+		items,
+		..
+	} = case.item(0)
+	else {
+		panic!("item 0 is {}, not a trait", item_kind(case.item(0)))
+	};
+	assert_eq!(case.name(name.inner), "Widget");
+	assert!(
+		supertraits.is_some(),
+		"`: Drawable + Sized` should be recorded"
+	);
+	assert_eq!(items.len(), 3);
+
+	let TraitItem::Const { name, .. } = &items[0].inner.inner else {
+		panic!("expected an associated const")
+	};
+	assert_eq!(case.name(name.inner), "SIZE");
+
+	// `render` is abstract, `grow` carries a default body
+	let TraitItem::Function {
+		signature, body, ..
+	} = &items[1].inner.inner
+	else {
+		panic!("expected a trait method")
+	};
+	assert_eq!(case.name(signature.name.inner), "render");
+	assert!(body.is_none(), "`fn render(self);` has no default body");
+
+	let TraitItem::Function {
+		signature,
+		body,
+		attributes,
+		..
+	} = &items[2].inner.inner
+	else {
+		panic!("expected a trait method")
+	};
+	assert_eq!(case.name(signature.name.inner), "grow");
+	assert!(body.is_some(), "`grow` has a default body");
+	assert_eq!(attributes.len(), 1);
 }
 
 #[test]
@@ -285,15 +497,12 @@ fn test_pub_not_permitted_in_trait_items() {
         }
     "});
 
-	assert_eq!(
-		diagnostic_codes(&case.ast),
-		vec![
-			DiagnosticCode::VisibilityNotPermitted.code(),
-			DiagnosticCode::VisibilityNotPermitted.code(),
-			DiagnosticCode::VisibilityNotPermitted.code()
-		]
-	);
-	let Item::Trait { items, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::VisibilityNotPermitted,
+		DiagnosticCode::VisibilityNotPermitted,
+		DiagnosticCode::VisibilityNotPermitted,
+	]);
+	let Item::Trait { items, .. } = case.item(0) else {
 		panic!("expected trait item")
 	};
 	assert_eq!(items.len(), 3);
@@ -306,12 +515,10 @@ fn test_pub_not_applicable_to_memory_item_recovers() {
         fn add(a: i32, b: i32) -> i32 { a + b }
     "});
 
-	assert_eq!(
-		diagnostic_codes(&case.ast),
-		vec![DiagnosticCode::VisibilityNotPermitted.code()]
-	);
-	assert!(matches!(item(&case.ast, 0), Item::Memory { .. }));
-	assert!(matches!(item(&case.ast, 1), Item::Function { .. }));
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::VisibilityNotPermitted]);
+	assert!(matches!(case.item(0), Item::Memory { .. }));
+	assert!(matches!(case.item(1), Item::Function { .. }));
 }
 
 #[test]
@@ -320,8 +527,8 @@ fn test_pub_use_reexports_without_diagnostic() {
         pub use foo::*;
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::Use { pub_span, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::Use { pub_span, .. } = case.item(0) else {
 		panic!("expected use item")
 	};
 	assert!(pub_span.is_some());
@@ -340,7 +547,7 @@ fn test_use_tree_forms() {
         use a::b::c::d;
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 	insta::assert_yaml_snapshot!(case.ast);
 }
 
@@ -350,7 +557,19 @@ fn test_export_alias() {
         fn add(a: i32, b: i32) -> i32 { a + b }
         export { add as \"wasm_add\" }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let Item::Export { entries, .. } = case.item(1) else {
+		panic!("item 1 is {}, not an export block", item_kind(case.item(1)))
+	};
+	assert_eq!(entries.len(), 1);
+	let entry = &entries[0].inner.inner;
+	assert_eq!(case.name(entry.name.inner), "add");
+	let alias = entry
+		.alias
+		.expect("`as \"wasm_add\"` should record an alias");
+	// the alias keeps its quotes: it is the raw WASM export name
+	assert_eq!(case.name(alias.inner), "\"wasm_add\"");
 }
 
 // ── Expressions ──────────────────────────────────────────────────────────────
@@ -365,7 +584,24 @@ fn test_literals() {
             local c = \"hello\";
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let Expression::Float { value } = local_definition_value(statements, 0)
+	else {
+		panic!("expected a float literal")
+	};
+	assert_eq!(*value, 3.14);
+	// `Char` and `String` carry no payload — the text is recovered from the
+	// span, so all the AST records is which kind of literal it was.
+	assert!(matches!(
+		local_definition_value(statements, 1),
+		Expression::Char
+	));
+	assert!(matches!(
+		local_definition_value(statements, 2),
+		Expression::String
+	));
 }
 
 #[test]
@@ -379,7 +615,21 @@ fn test_if_else() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	let Expression::IfElse {
+		condition,
+		then_block,
+		else_block,
+	} = statement_expression(statements, 0)
+	else {
+		panic!("expected an if/else")
+	};
+	assert!(matches!(condition.inner, Expression::Binary { .. }));
+	assert!(matches!(then_block.inner, Expression::Block { .. }));
+	let else_block = else_block.as_ref().expect("`else` should be recorded");
+	assert!(matches!(else_block.inner, Expression::Block { .. }));
 }
 
 #[test]
@@ -393,7 +643,30 @@ fn test_match_int_literal_patterns() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	let Expression::Match { scrutinee, arms } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected a match")
+	};
+	assert!(matches!(scrutinee.inner, Expression::Path(_)));
+	assert_eq!(arms.len(), 3);
+
+	// arm patterns are ordinary expressions at parse time; TIR is what
+	// later decides which of them are valid patterns
+	let patterns: Vec<&Expression> = arms
+		.iter()
+		.map(|arm| &arm.inner.inner.pattern.inner)
+		.collect();
+	assert!(matches!(patterns[0], Expression::Int { value: 0 }));
+	assert!(matches!(patterns[1], Expression::Int { value: 1 }));
+	assert!(
+		matches!(patterns[2], Expression::Placeholder),
+		"`_` should parse as a placeholder, got {:?}",
+		patterns[2]
+	);
 }
 
 #[test]
@@ -413,7 +686,29 @@ fn test_match_enum_variant_patterns() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(1);
+	let Expression::Match { arms, .. } = statement_expression(statements, 0)
+	else {
+		panic!("expected a match")
+	};
+	assert_eq!(arms.len(), 3);
+
+	// each arm pattern is a two-segment path `Enum::Variant`
+	let variants: Vec<&str> = arms
+		.iter()
+		.map(|arm| {
+			let Expression::Path(segments) = &arm.inner.inner.pattern.inner
+			else {
+				panic!("expected a path pattern")
+			};
+			assert_eq!(segments.len(), 2);
+			assert_eq!(case.name(segments[0].ident.inner), "FileDescriptor");
+			case.name(segments[1].ident.inner)
+		})
+		.collect();
+	assert_eq!(variants, ["StdIn", "StdOut", "StdErr"]);
 }
 
 #[test]
@@ -433,7 +728,10 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
             }
         }
     "});
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0002", "E0009"]);
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::InvalidItem,
+	]);
 }
 
 #[test]
@@ -450,7 +748,46 @@ fn test_loop_break_label() {
             }
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	// the label wraps the loop, rather than the loop carrying a label field
+	let statements = case.function_block(0);
+	let Expression::Label { label, block } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected a labelled expression")
+	};
+	assert_eq!(case.name(label.inner), "result");
+	let Expression::Loop { block } = &block.inner else {
+		panic!("expected a loop inside the label")
+	};
+	let Expression::Block { statements } = &block.inner else {
+		panic!("expected a block as the loop body")
+	};
+
+	// `break :result n` carries both a label and a value
+	let Expression::IfElse { then_block, .. } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected an if")
+	};
+	let Expression::Block { statements: body } = &then_block.inner else {
+		panic!("expected a block")
+	};
+	let Expression::Break { label, value } = statement_expression(body, 0)
+	else {
+		panic!("expected a break")
+	};
+	assert_eq!(
+		case.name(label.expect("`break :result` should record a label").inner),
+		"result"
+	);
+	assert!(value.is_some(), "`break :result n` should record a value");
+
+	assert!(matches!(
+		statement_expression(statements, 2),
+		Expression::Continue { .. }
+	));
 }
 
 #[test]
@@ -461,8 +798,9 @@ fn test_label_requires_block_like_expression() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0006"]);
-	assert!(function_block(&case.ast, 0).is_empty());
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::IncompleteExpression]);
+	assert!(case.function_block(0).is_empty());
 }
 
 #[test]
@@ -477,7 +815,8 @@ fn test_multi_segment_label_reports_diagnostic_instead_of_panicking() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0014"]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidLabel]);
 }
 
 #[test]
@@ -490,7 +829,38 @@ fn test_struct_init() {
             local empty = Unit::{};
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let init = |index: usize| {
+		let Expression::StructInit { path, fields } =
+			local_definition_value(statements, index)
+		else {
+			panic!("expected a struct initialiser")
+		};
+		(path, fields)
+	};
+
+	// explicit `x: x` records a value; shorthand `x` leaves it `None`
+	let (path, explicit) = init(0);
+	assert_eq!(case.name(path[0].ident.inner), "Point");
+	assert!(explicit.iter().all(|f| f.inner.inner.value.is_some()));
+
+	let (_, shorthand) = init(1);
+	assert_eq!(shorthand.len(), 2);
+	assert!(
+		shorthand.iter().all(|f| f.inner.inner.value.is_none()),
+		"`Point::{{ x, y }}` is shorthand, so no explicit values"
+	);
+	let names: Vec<&str> = shorthand
+		.iter()
+		.map(|f| case.name(f.inner.inner.name.inner))
+		.collect();
+	assert_eq!(names, ["x", "y"]);
+
+	let (path, empty) = init(2);
+	assert_eq!(case.name(path[0].ident.inner), "Unit");
+	assert!(empty.is_empty());
 }
 
 #[test]
@@ -500,8 +870,8 @@ fn test_generic_struct_init() {
             local p = Point::<f32>::{ x: x, y: y };
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 	let init = local_definition_value(stmts, 0);
 	let Expression::StructInit { path, fields } = init else {
 		panic!("expected StructInit");
@@ -522,8 +892,8 @@ fn test_grouping_and_tuple_expressions() {
         }
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
-	let statements = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
 	assert!(matches!(
 		local_definition_value(statements, 0),
 		Expression::Grouping { .. }
@@ -550,7 +920,43 @@ fn test_call_field_namespace() {
             add(field, neg)
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let unary = |index: usize| {
+		let Expression::Unary { operator, .. } =
+			local_definition_value(statements, index)
+		else {
+			panic!("expected a unary expression")
+		};
+		operator.inner
+	};
+	assert_eq!(unary(0), UnaryOp::InvertSign);
+	assert_eq!(unary(1), UnaryOp::BitNot);
+
+	// `p.x` is field access; `console::log` is a two-segment path — the
+	// distinction between `.` and `::` is settled here, not in TIR
+	let Expression::ObjectAccess { member, .. } =
+		local_definition_value(statements, 2)
+	else {
+		panic!("expected field access")
+	};
+	assert_eq!(case.name(member.inner), "x");
+
+	let Expression::Path(segments) = local_definition_value(statements, 3)
+	else {
+		panic!("expected a path")
+	};
+	let path: Vec<&str> =
+		segments.iter().map(|s| case.name(s.ident.inner)).collect();
+	assert_eq!(path, ["console", "log"]);
+
+	let Expression::Call { arguments, .. } =
+		statement_expression(statements, 4)
+	else {
+		panic!("expected a call")
+	};
+	assert_eq!(arguments.len(), 2);
 }
 
 #[test]
@@ -561,7 +967,7 @@ fn test_operator_precedence() {
         }
     "});
 
-	let statements = function_block(&case.ast, 0);
+	let statements = case.function_block(0);
 	let Expression::Binary { right, .. } = statement_expression(statements, 0)
 	else {
 		panic!("expected outer binary expression")
@@ -589,7 +995,7 @@ fn test_left_associativity() {
         }
     "});
 
-	let statements = function_block(&case.ast, 0);
+	let statements = case.function_block(0);
 	let Expression::Binary { left, operator, .. } =
 		statement_expression(statements, 0)
 	else {
@@ -618,7 +1024,7 @@ fn test_cast_precedence() {
         fn unary(x: i32) -> i32 { -x as i32 }
     "});
 
-	let arithmetic = function_block(&case.ast, 0);
+	let arithmetic = case.function_block(0);
 	let Expression::Binary { right, .. } = statement_expression(arithmetic, 0)
 	else {
 		panic!("expected arithmetic binary expression")
@@ -628,7 +1034,7 @@ fn test_cast_precedence() {
 		"expected cast to bind tighter than addition"
 	);
 
-	let unary = function_block(&case.ast, 1);
+	let unary = case.function_block(1);
 	let Expression::Unary { operand, .. } = statement_expression(unary, 0)
 	else {
 		panic!("expected unary expression")
@@ -649,7 +1055,30 @@ fn test_chained_member_access() {
             local b = p.foo().z;
         }
     "});
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let Expression::ObjectAccess { object, member } =
+		local_definition_value(statements, 0)
+	else {
+		panic!("expected object access")
+	};
+	assert_eq!(case.name(member.inner), "y");
+	let Expression::ObjectAccess { member: inner, .. } = &object.inner else {
+		panic!("`p.x.y` should nest as `(p.x).y`")
+	};
+	assert_eq!(case.name(inner.inner), "x");
+
+	let Expression::ObjectAccess { object, member } =
+		local_definition_value(statements, 1)
+	else {
+		panic!("expected object access")
+	};
+	assert_eq!(case.name(member.inner), "z");
+	assert!(
+		matches!(object.inner, Expression::MethodCall(_)),
+		"`p.foo().z` should access the call's result"
+	);
 }
 
 #[test]
@@ -660,8 +1089,8 @@ fn test_address_of() {
             local a = ptr.*.&;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 	let expr = local_definition_value(stmts, 0);
 	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
@@ -680,8 +1109,8 @@ fn test_address_of_through_field() {
             local a = ptr.*.x.&;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 	let expr = local_definition_value(stmts, 0);
 	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
@@ -705,7 +1134,7 @@ fn test_numeric_literal_forms() {
         }
     "});
 
-	let statements = function_block(&case.ast, 0);
+	let statements = case.function_block(0);
 	assert_eq!(statements.len(), 3);
 	assert!(matches!(
 		local_definition_value(statements, 0),
@@ -733,8 +1162,8 @@ fn test_scientific_notation_float_literals() {
         }
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
-	let statements = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
 	assert_eq!(statements.len(), 5);
 	assert!(matches!(
 		local_definition_value(statements, 0),
@@ -782,8 +1211,8 @@ fn test_pattern_simple_binding() {
             local _ = v;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 
 	assert!(matches!(
 		local_definition_pattern(stmts, 0),
@@ -808,8 +1237,8 @@ fn test_pattern_tuple_destructuring() {
             local (x, (y, z)) = pair;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 
 	let Pattern::Tuple { elements } = local_definition_pattern(stmts, 0) else {
 		panic!("expected tuple pattern")
@@ -851,8 +1280,8 @@ fn test_pattern_struct_destructuring() {
             local geom::Point::{ x, .. } = p;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 
 	let Pattern::Struct { path, fields, rest } =
 		local_definition_pattern(stmts, 0)
@@ -906,8 +1335,8 @@ fn test_pattern_with_type_annotation() {
             local (a, b): (i32, i32) = pair;
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let stmts = function_block(&case.ast, 0);
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
 
 	let Statement::LocalDefinition { pattern, ty, .. } = &stmts[0].inner.inner
 	else {
@@ -928,8 +1357,9 @@ fn test_missing_semicolon_warns_but_parses() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0003"]);
-	assert_eq!(function_block(&case.ast, 0).len(), 2);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+	assert_eq!(case.function_block(0).len(), 2);
 }
 
 #[test]
@@ -939,8 +1369,9 @@ fn test_unclosed_delimiter() {
             local x: i32 = 1;
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0004"]);
-	assert_eq!(function_block(&case.ast, 0).len(), 1);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnclosedDelimiter]);
+	assert_eq!(case.function_block(0).len(), 1);
 }
 
 #[test]
@@ -949,7 +1380,8 @@ fn test_invalid_function_param_type_reports_parse_error() {
         fn f(x: =) {}
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0002"]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 }
 
 #[test]
@@ -960,9 +1392,10 @@ fn test_invalid_integer_literal() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0005"]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidLiteral]);
 	assert!(matches!(
-		statement_expression(function_block(&case.ast, 0), 0),
+		statement_expression(case.function_block(0), 0),
 		Expression::Int { value: 0 }
 	));
 }
@@ -978,9 +1411,10 @@ fn test_invalid_float_literal_empty_exponent() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0005"]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidLiteral]);
 	assert!(matches!(
-		statement_expression(function_block(&case.ast, 0), 0),
+		statement_expression(case.function_block(0), 0),
 		Expression::Float { value } if *value == 0.0
 	));
 }
@@ -992,9 +1426,12 @@ fn test_incomplete_expression() {
         fn unary()  -> i32 { -   }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0006", "E0006"]);
-	assert!(function_block(&case.ast, 0).is_empty());
-	assert!(function_block(&case.ast, 1).is_empty());
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::IncompleteExpression,
+		DiagnosticCode::IncompleteExpression,
+	]);
+	assert!(case.function_block(0).is_empty());
+	assert!(case.function_block(1).is_empty());
 }
 
 #[test]
@@ -1005,8 +1442,9 @@ fn test_reserved_identifier() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0008"]);
-	assert_eq!(function_block(&case.ast, 0).len(), 1);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
+	assert_eq!(case.function_block(0).len(), 1);
 }
 
 #[test]
@@ -1020,9 +1458,13 @@ fn test_invalid_attribute_and_namespace_diagnostics() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0012", "E0009", "E0013"]);
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::InvalidAttribute,
+		DiagnosticCode::InvalidItem,
+		DiagnosticCode::InvalidNamespace,
+	]);
 	assert_eq!(case.ast.items.len(), 2);
-	assert!(matches!(item(&case.ast, 0), Item::Function { .. }));
+	assert!(matches!(case.item(0), Item::Function { .. }));
 }
 
 #[test]
@@ -1044,7 +1486,7 @@ fn test_missing_initializer() {
 		"expected one E0010 for local and one for global"
 	);
 	assert_eq!(case.ast.items.len(), 1);
-	assert!(function_block(&case.ast, 0).is_empty());
+	assert!(case.function_block(0).is_empty());
 }
 
 #[test]
@@ -1056,8 +1498,9 @@ fn test_missing_comma_between_struct_fields_warns_but_parses() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0003"]);
-	assert_eq!(struct_fields(&case.ast, 0).len(), 2);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+	assert_eq!(case.struct_fields(0).len(), 2);
 }
 
 #[test]
@@ -1087,11 +1530,11 @@ fn test_module_pub_items_and_associated_types() {
         }
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 
 	let Item::Module {
 		pub_span, items, ..
-	} = item(&case.ast, 0)
+	} = case.item(0)
 	else {
 		panic!("expected public module")
 	};
@@ -1104,7 +1547,7 @@ fn test_module_pub_items_and_associated_types() {
 		}
 	));
 
-	let Item::Struct { pub_span, .. } = item(&case.ast, 1) else {
+	let Item::Struct { pub_span, .. } = case.item(1) else {
 		panic!("expected public struct")
 	};
 	assert!(pub_span.is_some());
@@ -1113,7 +1556,7 @@ fn test_module_pub_items_and_associated_types() {
 		pub_span,
 		items: trait_items,
 		..
-	} = item(&case.ast, 2)
+	} = case.item(2)
 	else {
 		panic!("expected public trait")
 	};
@@ -1129,7 +1572,7 @@ fn test_module_pub_items_and_associated_types() {
 
 	let Item::TraitImpl {
 		items: impl_items, ..
-	} = item(&case.ast, 3)
+	} = case.item(3)
 	else {
 		panic!("expected trait impl")
 	};
@@ -1143,9 +1586,9 @@ fn test_module_pub_items_and_associated_types() {
 fn test_external_module_item() {
 	let case = TestCase::new("mod math;");
 
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 
-	let Item::ModuleDeclaration { pub_span, name } = item(&case.ast, 0) else {
+	let Item::ModuleDeclaration { pub_span, name } = case.item(0) else {
 		panic!("expected external module")
 	};
 
@@ -1161,9 +1604,10 @@ fn test_chained_comparison_error() {
         }
     "});
 
-	assert_eq!(diagnostic_codes(&case.ast), vec!["E0007"]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ChainedComparison]);
 	let Expression::Binary { left, operator, .. } =
-		statement_expression(function_block(&case.ast, 0), 0)
+		statement_expression(case.function_block(0), 0)
 	else {
 		panic!("expected outer comparison")
 	};
@@ -1189,8 +1633,24 @@ fn test_generic_signatures() {
             middle
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let signature = case.function_signature(0);
+	let params: Vec<&str> = signature
+		.type_params
+		.iter()
+		.map(|param| case.name(param.name.inner))
+		.collect();
+	assert_eq!(params, ["T", "U", "V"]);
+	// only the bounded ones carry a bound expression
+	let bounded: Vec<bool> = signature
+		.type_params
+		.iter()
+		.map(|param| param.bounds.is_some())
+		.collect();
+	assert_eq!(bounded, [false, true, true]);
+	assert_eq!(signature.params.len(), 3);
+	assert!(signature.result.is_some());
 }
 
 #[test]
@@ -1201,13 +1661,13 @@ fn test_generic_struct() {
             second: U,
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 	let Item::Struct {
 		name,
 		type_params,
 		fields,
 		..
-	} = item(&case.ast, 0)
+	} = case.item(0)
 	else {
 		panic!("expected struct item")
 	};
@@ -1227,8 +1687,8 @@ fn test_generic_struct_with_bounds() {
             value: T,
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::Struct { type_params, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::Struct { type_params, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 	assert_eq!(type_params.len(), 1);
@@ -1248,8 +1708,8 @@ fn test_import_alias_and_entry_kinds() {
         }
     "});
 
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::Import { alias, entries, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::Import { alias, entries, .. } = case.item(0) else {
 		panic!("expected import block")
 	};
 	assert_eq!(
@@ -1280,8 +1740,22 @@ fn test_turbofish_call() {
             identity::<i32>(42)
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	let Expression::Call { callee, arguments } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected a call")
+	};
+	assert_eq!(arguments.len(), 1);
+	let Expression::Path(segments) = &callee.inner else {
+		panic!("expected a path callee")
+	};
+	// the turbofish binds to the final segment, not to the call
+	assert_eq!(segments.len(), 1);
+	assert_eq!(case.name(segments[0].ident.inner), "identity");
+	assert_eq!(segments[0].type_args.len(), 1);
 }
 
 #[test]
@@ -1291,8 +1765,17 @@ fn test_turbofish_method_call() {
             obj.transform::<i32>()
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	insta::assert_yaml_snapshot!(case.ast);
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	// a method turbofish is a `MethodCall`, never a `TypeApplication`
+	let Expression::MethodCall(call) = statement_expression(statements, 0)
+	else {
+		panic!("expected a method call")
+	};
+	assert_eq!(case.name(call.method.inner), "transform");
+	assert_eq!(call.type_args.len(), 1);
+	assert!(call.arguments.is_empty());
 }
 
 #[test]
@@ -1304,8 +1787,8 @@ fn test_generic_application_type_args() {
         }
         fn make(x: Pair<i32, f64>) {}
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::Function { signature, .. } = item(&case.ast, 1) else {
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
 	let param_ty = &signature.params[0].inner.inner.ty.as_ref().unwrap().inner;
@@ -1341,7 +1824,7 @@ fn test_double_right_arrow_split() {
         fn bound_turbofish<T: Wrapper::<Inner<u32>>>(t: T) {}
         fn method_turbofish(obj: Foo) { obj.transform::<Vec<u32>>() }
     "});
-	assert!(case.ast.diagnostics.is_empty());
+	case.diagnostics().assert_none();
 }
 
 #[test]
@@ -1349,8 +1832,8 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	let case = TestCase::new(indoc! {"
         fn f<T: Memory where { Size = u32 }>(t: T) {}
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::Function { signature, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
 	let bounds = signature.type_params[0]
@@ -1372,8 +1855,8 @@ fn test_impl_trait_multi_segment_trait_name() {
             fn draw(self) {}
         }
     "});
-	assert!(case.ast.diagnostics.is_empty());
-	let Item::TraitImpl { trait_name, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::TraitImpl { trait_name, .. } = case.item(0) else {
 		panic!("expected ImplTrait")
 	};
 	assert_eq!(
@@ -1389,13 +1872,519 @@ fn test_typeset_attributes_parsed() {
         #[tag = \"my_typeset\"]
         typeset Foo { u32, u64 }
     "});
-	assert!(
-		case.ast.diagnostics.is_empty(),
-		"{:?}",
-		case.ast.diagnostics
-	);
-	let Item::TypeSet { attributes, .. } = item(&case.ast, 0) else {
+	case.diagnostics().assert_none();
+	let Item::TypeSet { attributes, .. } = case.item(0) else {
 		panic!("expected TypeSet")
 	};
 	assert_eq!(attributes.len(), 1, "expected one attribute on the typeset");
+}
+
+// ── binary operators ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_every_binary_operator_parses_to_its_own_operator() {
+	// One row per `BinaryOp` variant. The rendered operator comes from
+	// `BinaryOp::as_str`, so this is really a round-trip through
+	// lex -> `TryFrom<Token> for BinaryOp` -> `as_str`: a mis-wired arm (say
+	// `%=` reaching `MulAssign`) renders the wrong symbol and fails here.
+	let operators = [
+		// arithmetic
+		"+", "-", "*", "/", "%", // comparison
+		"==", "!=", "<", "<=", ">", ">=", // logical
+		"&&", "||", // bitwise
+		"&", "|", "^", "<<", ">>", // assignment
+		"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+	];
+	assert_eq!(
+		operators.len(),
+		29,
+		"every `BinaryOp` variant should have a row here"
+	);
+
+	for operator in operators {
+		assert_eq!(
+			shape_of(&format!("a {operator} b")),
+			format!("({operator} a b)"),
+			"parsing `a {operator} b`"
+		);
+	}
+}
+
+#[test]
+fn test_binary_operator_precedence_ladder() {
+	// Each row pairs two adjacent rungs of `BindingPower`, loosest first, so
+	// together they pin the whole ordering: assignment < || < && < | < ^ < &
+	// < comparison < shift < additive < multiplicative. The looser operator
+	// must end up at the root, with the tighter one nested on the right.
+	for (source, expected) in [
+		("a = b || c", "(= a (|| b c))"),
+		("a || b && c", "(|| a (&& b c))"),
+		("a && b | c", "(&& a (| b c))"),
+		("a | b ^ c", "(| a (^ b c))"),
+		("a ^ b & c", "(^ a (& b c))"),
+		// `&` looser than `==` — the C precedence trap, deliberate here
+		("a & b == c", "(& a (== b c))"),
+		("a == b << c", "(== a (<< b c))"),
+		("a << b + c", "(<< a (+ b c))"),
+		("a + b * c", "(+ a (* b c))"),
+	] {
+		assert_eq!(shape_of(source), expected, "parsing `{source}`");
+	}
+}
+
+#[test]
+fn test_binary_operators_associate_to_the_left() {
+	// `parse_binary_expression` recurses with the *same* binding power, which
+	// makes every operator left-associative.
+	for (source, expected) in [
+		("a - b - c", "(- (- a b) c)"),
+		("a / b / c", "(/ (/ a b) c)"),
+		("a << b << c", "(<< (<< a b) c)"),
+		// Assignment is left-associative too, unlike most languages. That is
+		// intended and unobservable: an assignment evaluates to `()`, so
+		// `a = b = c` is rejected either way — as an invalid assignment
+		// target when grouped `(a = b) = c`, or as a type mismatch were it
+		// grouped `a = (b = c)`. Only if assignment ever yields its assigned
+		// value would the grouping become meaningful.
+		("a = b = c", "(= (= a b) c)"),
+		("a += b += c", "(+= (+= a b) c)"),
+	] {
+		assert_eq!(shape_of(source), expected, "parsing `{source}`");
+	}
+}
+
+#[test]
+fn test_unary_binds_tighter_than_any_binary_operator() {
+	for (source, expected) in [
+		("-a * b", "(* (u- a) b)"),
+		("^a & b", "(& (u^ a) b)"),
+		("!a && b", "(&& (u! a) b)"),
+		// and a unary operand is not swallowed by the binary operator
+		("a * -b", "(* a (u- b))"),
+	] {
+		assert_eq!(shape_of(source), expected, "parsing `{source}`");
+	}
+}
+
+// ── indexing, slicing and array literals ─────────────────────────────────────
+
+#[test]
+fn test_index_and_array_literal_expressions() {
+	let case = TestCase::new(indoc! {"
+        fn f(a: &[i32]) {
+            local list   = [1, 2, 3];
+            local repeat = [0; 8];
+            local single = a[0];
+        }
+    "});
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let Expression::ArrayList { elements } =
+		local_definition_value(statements, 0)
+	else {
+		panic!("expected an array literal")
+	};
+	assert_eq!(elements.len(), 3);
+
+	// `[value; count]` keeps the two apart rather than expanding the value
+	let Expression::ArrayRepeat { value, count } =
+		local_definition_value(statements, 1)
+	else {
+		panic!("expected an array repeat")
+	};
+	assert_eq!(case.shape(&value.inner), "0");
+	assert_eq!(case.shape(&count.inner), "8");
+
+	// a single subscript is an `Index`, never a one-bound `SliceRange`
+	assert!(matches!(
+		local_definition_value(statements, 2),
+		Expression::Index { .. }
+	));
+}
+
+#[test]
+fn test_slice_range_bounds_are_independently_optional() {
+	let case = TestCase::new(indoc! {"
+        fn f(a: &[i32]) {
+            local both = a[1..3];
+            local from = a[1..];
+            local to   = a[..3];
+            local all  = a[..];
+        }
+    "});
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	let bounds = |index: usize| {
+		let Expression::SliceRange { start, end, .. } =
+			local_definition_value(statements, index)
+		else {
+			panic!("expected a slice range")
+		};
+		(start.is_some(), end.is_some())
+	};
+	assert_eq!(bounds(0), (true, true), "a[1..3]");
+	assert_eq!(bounds(1), (true, false), "a[1..]");
+	assert_eq!(bounds(2), (false, true), "a[..3]");
+	assert_eq!(bounds(3), (false, false), "a[..]");
+}
+
+// ── qualified and grouped paths ──────────────────────────────────────────────
+
+#[test]
+fn test_qualified_path_records_its_trait_and_grouped_does_not() {
+	// The two forms differ only in whether a trait disambiguates the item, so
+	// that is the thing worth pinning.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            <Point as Show>::render()
+        }
+
+        fn g() -> i32 {
+            <Point>::origin()
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let Expression::Call { callee, .. } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a call")
+	};
+	let Expression::QualifiedPath { root, segments } = &callee.inner else {
+		panic!("expected a qualified path")
+	};
+	assert_eq!(case.name(root.trait_path[0].ident.inner), "Show");
+	assert_eq!(case.name(segments[0].ident.inner), "render");
+
+	let Expression::Call { callee, .. } =
+		statement_expression(case.function_block(1), 0)
+	else {
+		panic!("expected a call")
+	};
+	let Expression::Grouped { segments, .. } = &callee.inner else {
+		panic!("expected a grouped path — `<T>::x` names no trait")
+	};
+	assert_eq!(case.name(segments[0].ident.inner), "origin");
+}
+
+#[test]
+fn test_qualified_and_grouped_paths_in_type_position() {
+	let case = TestCase::new(indoc! {"
+        fn f(a: <Point as Show>::Out, b: <Point>::Out) {}
+    "});
+	case.diagnostics().assert_none();
+
+	let params = &case.function_signature(0).params;
+	let ty = |index: usize| {
+		&params[index]
+			.inner
+			.inner
+			.ty
+			.as_ref()
+			.expect("annotated")
+			.inner
+	};
+	let TypeExpression::QualifiedPath { root, segments } = ty(0) else {
+		panic!("expected a qualified path type")
+	};
+	assert_eq!(case.name(root.trait_path[0].ident.inner), "Show");
+	assert_eq!(case.name(segments[0].ident.inner), "Out");
+
+	assert!(
+		matches!(ty(1), TypeExpression::Grouped { .. }),
+		"`<Point>::Out` names no trait, so it is a grouped path"
+	);
+}
+
+// ── keyword expressions ──────────────────────────────────────────────────────
+
+#[test]
+fn test_keyword_expressions() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> bool {
+            local t = true;
+            local u = false;
+            local v = unreachable;
+            return t;
+        }
+    "});
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+
+	assert!(matches!(
+		local_definition_value(statements, 0),
+		Expression::True
+	));
+	assert!(matches!(
+		local_definition_value(statements, 1),
+		Expression::False
+	));
+	assert!(matches!(
+		local_definition_value(statements, 2),
+		Expression::Unreachable
+	));
+
+	// `return` carries an optional value
+	let Expression::Return { value } = statement_expression(statements, 3)
+	else {
+		panic!("expected a return")
+	};
+	assert!(value.is_some(), "`return t` should record its value");
+}
+
+#[test]
+fn test_bare_return_has_no_value() {
+	let case = TestCase::new("fn f() { return; }");
+	case.diagnostics().assert_none();
+	let Expression::Return { value } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a return")
+	};
+	assert!(value.is_none());
+}
+
+#[test]
+fn test_turbofish_on_a_non_path_expression_is_a_type_application() {
+	// A turbofish on a plain path attaches to the segment (see
+	// `test_turbofish_call`); on anything else it becomes its own node.
+	let case = TestCase::new(indoc! {"
+        fn f() {
+            local a = (g)::<i32>;
+        }
+    "});
+	case.diagnostics().assert_none();
+	let Expression::TypeApplication { args, .. } =
+		local_definition_value(case.function_block(0), 0)
+	else {
+		panic!("expected a type application")
+	};
+	assert_eq!(args.len(), 1);
+}
+
+// ── remaining type expressions ───────────────────────────────────────────────
+
+#[test]
+fn test_infer_and_memory_tagged_types() {
+	let case = TestCase::new(indoc! {"
+        fn f(p: heap::*u8, s: heap::&[i32]) {
+            local a: _ = 1;
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	// a memory-tagged type names the memory its pointer or slice belongs to
+	let params = &case.function_signature(0).params;
+	for index in [0, 1] {
+		let ty = &params[index]
+			.inner
+			.inner
+			.ty
+			.as_ref()
+			.expect("annotated")
+			.inner;
+		let TypeExpression::MemoryTagged { memory, .. } = ty else {
+			panic!("expected a memory-tagged type")
+		};
+		assert_eq!(case.name(memory[0].ident.inner), "heap");
+	}
+
+	let Statement::LocalDefinition { ty, .. } =
+		&case.function_block(0)[0].inner.inner
+	else {
+		panic!("expected a local definition")
+	};
+	assert!(matches!(
+		ty.as_ref().expect("annotated `_`").inner,
+		TypeExpression::Infer
+	));
+}
+
+// ── remaining items ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_type_alias_item() {
+	let case = TestCase::new(indoc! {"
+        type Id = i32;
+        type Pair<T> = (T, T);
+    "});
+	case.diagnostics().assert_none();
+
+	let Item::TypeAlias { name, .. } = case.item(0) else {
+		panic!("item 0 is {}, not a type alias", item_kind(case.item(0)))
+	};
+	assert_eq!(case.name(name.inner), "Id");
+
+	let Item::TypeAlias {
+		name, type_params, ..
+	} = case.item(1)
+	else {
+		panic!("item 1 is {}, not a type alias", item_kind(case.item(1)))
+	};
+	assert_eq!(case.name(name.inner), "Pair");
+	assert_eq!(type_params.len(), 1);
+}
+
+#[test]
+fn test_imported_function_is_a_declaration_without_a_body() {
+	let case = TestCase::new(indoc! {"
+        import \"env\" {
+            fn log(x: i32)
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let Item::Import { entries, .. } = case.item(0) else {
+		panic!("item 0 is {}, not an import", item_kind(case.item(0)))
+	};
+	assert_eq!(entries.len(), 1);
+	let ImportDeclaration::Function { signature, .. } =
+		&entries[0].inner.inner.declaration
+	else {
+		panic!("expected an imported function")
+	};
+	assert_eq!(case.name(signature.name.inner), "log");
+}
+
+#[test]
+fn test_bodyless_function_is_a_declaration() {
+	// A `fn` with no block is an `Item::FunctionDeclaration` rather than an
+	// `Item::Function` with an empty body — that split is what lets
+	// `#[intrinsic]` and imported functions carry a signature and nothing else.
+	let case = TestCase::new(indoc! {"
+        #[intrinsic]
+        fn raw_load(address: u32) -> i32;
+
+        fn real() -> i32 { 1 }
+    "});
+	case.diagnostics().assert_none();
+
+	let Item::FunctionDeclaration {
+		signature,
+		attributes,
+		..
+	} = case.item(0)
+	else {
+		panic!(
+			"item 0 is {}, not a function declaration",
+			item_kind(case.item(0))
+		)
+	};
+	assert_eq!(case.name(signature.name.inner), "raw_load");
+	assert_eq!(case.name(attributes[0].name.inner), "intrinsic");
+
+	// the one with a body still parses as a plain function
+	assert!(matches!(case.item(1), Item::Function { .. }));
+}
+
+#[test]
+fn test_impl_associated_const() {
+	let case = TestCase::new(indoc! {"
+        impl i32 {
+            const ZERO: i32 = 0;
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let Item::InherentImpl { items, .. } = case.item(0) else {
+		panic!("item 0 is {}, not an impl", item_kind(case.item(0)))
+	};
+	let ImplItem::Constant { name, ty, .. } = &items[0].inner.inner else {
+		panic!("expected an associated const")
+	};
+	assert_eq!(case.name(name.inner), "ZERO");
+	assert!(ty.is_some(), "`const ZERO: i32` is annotated");
+}
+
+#[test]
+fn test_attribute_with_arguments() {
+	// `#[word]` and `#[name = value]` are covered elsewhere; this is the
+	// third shape, `#[name(arg = value, ...)]`.
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1, max_pages = 4)]
+        memory m: Memory where { Size = u32 };
+    "});
+	case.diagnostics().assert_none();
+
+	let Item::Memory { attributes, .. } = case.item(0) else {
+		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
+	};
+	assert_eq!(case.name(attributes[0].name.inner), "memory_limits");
+	let AttributeValue::Args(args) = &attributes[0].value else {
+		panic!("expected parenthesised attribute arguments")
+	};
+	let names: Vec<&str> = args
+		.iter()
+		.map(|arg| case.name(arg.inner.inner.name.inner))
+		.collect();
+	assert_eq!(names, ["min_pages", "max_pages"]);
+}
+
+// ── remaining parser diagnostics ─────────────────────────────────────────────
+
+#[test]
+fn test_local_without_initializer_reports() {
+	let case = TestCase::new("fn f() { local x: i32; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingInitializer]);
+}
+
+#[test]
+fn test_path_in_pattern_position_reports() {
+	// A path is only a pattern as a struct pattern, `Path::{ .. }`.
+	let case = TestCase::new("fn f() { local Foo::Bar = 1; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidPattern]);
+}
+
+#[test]
+fn test_unknown_token_reports() {
+	// `@` lexes to nothing, and is reported for itself. Skipping it leaves
+	// `1 2`, which is still two statements with no separator between them —
+	// so this is the one case where an unknown token legitimately keeps a
+	// follow-on diagnostic.
+	//
+	// Listed parse-error-first only because unknown tokens are appended once
+	// lexing is done; nothing reads diagnostics positionally, so the order
+	// here records what happens rather than anything that must hold.
+	let case = TestCase::new("fn f() -> i32 { 1 @ 2 }");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::UnknownToken,
+	]);
+}
+
+#[test]
+fn test_a_run_of_unknown_characters_reports_once() {
+	// Adjacent unknown characters coalesce into one run, so `@@@` is one
+	// diagnostic rather than three...
+	let case = TestCase::new("fn f() { @@@ }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnknownToken]);
+
+	// ...while separate runs stay separate.
+	let case = TestCase::new("fn f() { @ } fn g() { $ }");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnknownToken,
+		DiagnosticCode::UnknownToken,
+	]);
+}
+
+#[test]
+fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
+	// Because the run is skipped like a comment, what surrounds it still
+	// parses: none of these produce a second, misleading diagnostic pointing
+	// at whatever token happened to follow the unknown one.
+	for source in [
+		"@",
+		"fn f() {} @",
+		"fn f() -> i32 { 1 + @ 2 }",
+		"fn f() -> i32 { g(@) }",
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnknownToken]);
+	}
 }

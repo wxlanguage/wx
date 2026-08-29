@@ -9339,6 +9339,52 @@ fn test_enum_six_unused_variants_collapses_to_generic_message() {
 }
 
 #[test]
+fn test_tagged_items_registered_for_every_taggable_item_kind() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"tagged_fn\"]
+        fn f() -> i32 { 1 }
+        #[tag = \"tagged_struct\"]
+        struct S { x: i32 }
+        #[tag = \"tagged_const\"]
+        const C: i32 = 1;
+        #[tag = \"tagged_alias\"]
+        type A = i32;
+        #[tag = \"tagged_global\"]
+        global mut G: i32 = 0;
+        #[tag = \"tagged_enum\"]
+        enum E: i32 { A = 1 }
+        #[tag = \"tagged_memory\"]
+        memory M: Memory where { Size = u32 };
+        #[tag = \"tagged_trait\"]
+        trait T { fn m(self) -> i32; }
+        export { f }
+    "});
+	// Warnings are expected here (nothing reads these items); errors are not.
+	let errors = error_messages(&case.tir);
+	assert!(errors.is_empty(), "unexpected errors: {errors:#?}");
+	for tag in [
+		"tagged_fn",
+		"tagged_struct",
+		"tagged_const",
+		"tagged_alias",
+		"tagged_global",
+		"tagged_enum",
+		"tagged_memory",
+		"tagged_trait",
+	] {
+		let symbol = case
+			.graph
+			.interner
+			.get(tag)
+			.unwrap_or_else(|| panic!("`{tag}` was never interned"));
+		assert!(
+			case.tir.tagged_items.contains_key(&symbol),
+			"`#[tag = \"{tag}\"]` was not registered in `tagged_items`"
+		);
+	}
+}
+
+#[test]
 fn test_tagged_items_registered() {
 	let case = TestCase::new(indoc! {"
         #[tag = \"my_trait\"]

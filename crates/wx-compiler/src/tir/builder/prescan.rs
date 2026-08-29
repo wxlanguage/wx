@@ -70,6 +70,7 @@ impl<'ast> Builder<'ast, '_> {
 				pub_span,
 				mut_span,
 				name,
+				attributes,
 				..
 			} => {
 				self.claim_name_binding(
@@ -78,6 +79,9 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, name.span),
 				);
+				// `Global` has no `attributes` field of its own, so this runs
+				// purely for the `#[tag = ".."]` registration, as on `Trait`.
+				self.resolve_attributes(*id, attributes);
 				let global_index = self.tir.globals.len() as u32;
 				self.tir
 					.item_lookup
@@ -150,7 +154,11 @@ impl<'ast> Builder<'ast, '_> {
 				});
 			}
 			ast::Item::Enum {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				attributes,
+				..
 			} => {
 				self.claim_name_binding(
 					namespace,
@@ -158,6 +166,8 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, name.span),
 				);
+				// See the `Global` arm: registers `#[tag = ".."]` only.
+				self.resolve_attributes(*id, attributes);
 				let enum_index = self.tir.enums.len() as u32;
 				let self_type = self.intern_type(Type::Enum { enum_index });
 				self.tir
@@ -223,8 +233,16 @@ impl<'ast> Builder<'ast, '_> {
 				});
 			}
 			ast::Item::Memory {
-				id, name, bound, ..
+				id,
+				name,
+				bound,
+				attributes,
+				..
 			} => {
+				// See the `Global` arm: registers `#[tag = ".."]` only. The
+				// `#[memory_limits(..)]` attribute is read separately, in
+				// `signature_memory`.
+				self.resolve_attributes(*id, attributes);
 				self.claim_name_binding(
 					namespace,
 					(SymbolNamespace::Type, name.inner),
