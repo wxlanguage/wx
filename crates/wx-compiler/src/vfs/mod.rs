@@ -24,46 +24,7 @@ pub use path::{AbsolutePath, RelativePath};
 // files and wiring up the package graph — closer to a linker than a parser or
 // type checker). Follows the same per-stage numbering convention as
 // `ast::DiagnosticCode` (E0xxx) and `tir::DiagnosticCode` (E1xxx).
-macro_rules! define_diagnostic_codes {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $variant:ident => $code:literal,
-            )*
-        }
-    ) => {
-        $(#[$meta])*
-        $vis enum $name {
-            $($variant,)*
-        }
-
-        impl $name {
-            pub const fn code(&self) -> &'static str {
-                match self {
-                    $(Self::$variant => $code,)*
-                }
-            }
-        }
-
-        impl std::str::FromStr for $name {
-            type Err = ();
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s {
-                    $($code => Ok(Self::$variant),)*
-                    _ => Err(()),
-                }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.code())
-            }
-        }
-    };
-}
+use crate::diagnostics::define_diagnostic_codes;
 
 define_diagnostic_codes! {
 	pub enum DiagnosticCode {
@@ -411,7 +372,7 @@ pub struct PackageGraph {
 	pub dependency_names: HashMap<PackageId, SymbolU32>,
 	pub entry_path: AbsolutePath,
 	pub modules: Vec<SourceModule>,
-	pub linker_diagnostics: Vec<Diagnostic<FileId>>,
+	pub diagnostics: Vec<Diagnostic<FileId>>,
 	pub path_to_module: HashMap<AbsolutePath, ModuleId>,
 }
 
@@ -427,6 +388,38 @@ pub struct CompilationUnit {
 	pub stdlib_package: PackageId,
 	pub id_generator: ast::DefIdGenerator,
 	pub interner: ast::StringInterner,
+}
+
+impl CompilationUnit {
+	pub fn collect_parser_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
+		self.packages
+			.iter()
+			.flat_map(|package| package.modules.iter())
+			.flat_map(|module| module.ast.diagnostics.iter().cloned())
+			.collect()
+	}
+
+	pub fn collect_linker_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
+		self.packages
+			.iter()
+			.flat_map(|package| package.diagnostics.iter().cloned())
+			.collect()
+	}
+
+	pub fn collect_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
+		self.packages
+			.iter()
+			.flat_map(|package| {
+				package.diagnostics.iter().chain(
+					package
+						.modules
+						.iter()
+						.flat_map(|module| module.ast.diagnostics.iter()),
+				)
+			})
+			.cloned()
+			.collect()
+	}
 }
 
 pub struct CompilationUnitBuilder {
@@ -567,7 +560,7 @@ impl CompilationUnitBuilder {
 					self.interner.resolve(existing).unwrap(),
 					self.interner.resolve(name).unwrap(),
 				));
-			package.linker_diagnostics.push(diagnostic);
+			package.diagnostics.push(diagnostic);
 			return;
 		}
 		if package.dependencies.contains_key(&name) {
@@ -578,7 +571,7 @@ impl CompilationUnitBuilder {
 			 depends on",
 					self.interner.resolve(name).unwrap()
 				));
-			package.linker_diagnostics.push(diagnostic);
+			package.diagnostics.push(diagnostic);
 			return;
 		}
 
@@ -633,7 +626,7 @@ impl CompilationUnitBuilder {
 			root,
 			entry_path,
 			modules: loader.modules,
-			linker_diagnostics: loader.diagnostics,
+			diagnostics: loader.diagnostics,
 			path_to_module: loader.path_to_module,
 		};
 

@@ -1,5 +1,0 @@
-use super::{k_cosf, k_sinf, rem_pio2f};
-
-fn test() {
-    local x = k_cosf(5.0);
-}

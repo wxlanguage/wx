@@ -1846,6 +1846,36 @@ impl<'tir> Builder<'tir> {
 		}
 	}
 
+	/// Stores `value` into a fresh local and returns its index in scope 0, so
+	/// it can be read back more than once without re-evaluating it.
+	///
+	/// The temp-local idiom used throughout this file: `AggregateGet` and
+	/// friends address a local, never an arbitrary expression, so anything
+	/// they need to read has to be parked in one first. Scope 0 (the function
+	/// root) is where all such temps go — its locals outlive every nested
+	/// scope, and `compute_locals_offsets` lays scopes out after it.
+	fn spill_to_temp(
+		&mut self,
+		func_ctx: &mut FunctionContext,
+		value: Expression,
+		sink: &mut Vec<Expression>,
+	) -> LocalIndex {
+		let local_index = func_ctx.frame[0].locals.len() as LocalIndex;
+		func_ctx.frame[0].locals.push(Local {
+			ty: value.ty,
+			mutability: Mutability::Immutable,
+		});
+		sink.push(Expression {
+			kind: ExprKind::LocalSet {
+				scope_index: 0,
+				local_index,
+				value: Box::new(value),
+			},
+			ty: Type::Unit,
+		});
+		local_index
+	}
+
 	fn lower_expression(
 		&mut self,
 		func_ctx: &mut FunctionContext,
@@ -2571,6 +2601,95 @@ impl<'tir> Builder<'tir> {
 				},
 				ty: self.lower_type_index(expr.ty),
 			},
+			tir::ExprKind::DestructureDeclaration { value, bindings } => {
+				if bindings.is_empty() {
+					// Nothing is bound — `local Point::{ .. } = p;` or a
+					// pattern of nothing but `_`. All that remains is to run
+					// the initializer for its effects.
+					let value = self.lower_expression(func_ctx, value, sink);
+					return Expression {
+						kind: ExprKind::Drop {
+							value: Box::new(value),
+						},
+						ty: Type::Unit,
+					};
+				}
+
+				// Every binding reads out of one local, so the initializer is
+				// evaluated exactly once. A value that already *is* a local
+				// needs no copy.
+				let scrutinee = match &value.kind {
+					tir::ExprKind::Local {
+						scope_index,
+						local_index,
+					} => (*scope_index, *local_index),
+					_ => {
+						let value =
+							self.lower_expression(func_ctx, value, sink);
+						(0, self.spill_to_temp(func_ctx, value, sink))
+					}
+				};
+
+				// Each store goes straight into `sink` as it is built, so the
+				// intermediate spills a nested path needs stay next to the
+				// binding that asked for them.
+				let first_store = sink.len();
+				for binding in bindings.iter() {
+					let (mut scope_index, mut local_index) = scrutinee;
+					let mut projected: Option<Expression> = None;
+
+					for step in binding.path.iter() {
+						// `AggregateGet` reads a local, never an arbitrary
+						// expression, so each intermediate hop of a nested
+						// pattern has to land in one first.
+						if let Some(value) = projected.take() {
+							local_index =
+								self.spill_to_temp(func_ctx, value, sink);
+							scope_index = 0;
+						}
+
+						let Type::Aggregate { aggregate_index } =
+							self.lower_type_index(step.aggregate_ty)
+						else {
+							unreachable!(
+								"destructuring path step must name an aggregate"
+							)
+						};
+						let aggregate =
+							&self.aggregates[aggregate_index as usize];
+						// Tuples are alignment-sorted just like structs, so
+						// the declaration index has to be mapped through.
+						let value_index =
+							aggregate.decl_to_phys[step.index as usize];
+						let ty = aggregate.values[value_index as usize];
+
+						projected = Some(Expression {
+							kind: ExprKind::AggregateGet {
+								scope_index,
+								local_index,
+								value_index,
+							},
+							ty,
+						});
+					}
+
+					let value = projected
+						.expect("a destructured binding has at least one step");
+					sink.push(Expression {
+						kind: ExprKind::LocalSet {
+							scope_index: binding.scope_index,
+							local_index: binding.local_index,
+							value: Box::new(value),
+						},
+						ty: Type::Unit,
+					});
+				}
+
+				// The statement's own value is the last store; everything
+				// before it already sits in `sink` in order.
+				debug_assert!(sink.len() > first_store);
+				sink.pop().expect("bindings is non-empty")
+			}
 			tir::ExprKind::Unary { operator, operand } => {
 				let operand =
 					Box::new(self.lower_expression(func_ctx, operand, sink));

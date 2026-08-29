@@ -1,3 +1,14 @@
+//! Test-only support code.
+//!
+//! Split in two: the `serialize_sorted_*` helpers below are referenced by
+//! `serde` attributes on IR types and exist to make snapshot output
+//! deterministic, while [`diagnostics`] carries the assertion vocabulary the
+//! test suites share.
+
+mod diagnostics;
+
+pub use diagnostics::DiagnosticView;
+
 use std::collections::HashMap;
 
 /// Serializes a HashMap with keys sorted for deterministic snapshot output.

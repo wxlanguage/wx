@@ -45,7 +45,7 @@ impl TestCase {
 		let mut graph = builder.build(root_id);
 		let root_package = &graph.packages[graph.root_package.as_usize()];
 		let package_diagnostics = || {
-			root_package.linker_diagnostics.iter().chain(
+			root_package.diagnostics.iter().chain(
 				root_package
 					.modules
 					.iter()

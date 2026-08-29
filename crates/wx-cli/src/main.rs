@@ -6,6 +6,7 @@ use codespan_reporting::files::Files as _;
 use codespan_reporting::term;
 use codespan_reporting::term::DisplayStyle;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+use wx_compiler::diagnostics::Diagnostics as _;
 use wx_compiler::*;
 
 mod format;
@@ -132,6 +133,7 @@ fn cmd_lsp() {
 		.block_on(wx_lsp::run_stdio(tokio::io::stdin(), tokio::io::stdout()));
 }
 
+#[derive(Clone)]
 enum MessageFormat {
 	Text(DisplayStyle),
 	Json,
@@ -264,7 +266,7 @@ fn load_compilation(path: &str) -> vfs::CompilationUnit {
 fn emit_diagnostics(
 	compilation: &vfs::CompilationUnit,
 	diagnostics: &[Diagnostic<vfs::FileId>],
-	format: &MessageFormat,
+	format: MessageFormat,
 ) {
 	match format {
 		MessageFormat::Json => {
@@ -319,40 +321,13 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 		std::process::exit(1);
 	}
 
-	for package_graph in &compilation.packages {
-		emit_diagnostics(
-			&compilation,
-			&package_graph.linker_diagnostics,
-			&format,
-		);
-		for module in &package_graph.modules {
-			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
-		}
-	}
-	abort_if_errors(
-		compilation
-			.packages
-			.iter()
-			.flat_map(|package_graph| {
-				package_graph.linker_diagnostics.iter().chain(
-					package_graph
-						.modules
-						.iter()
-						.flat_map(|module| module.ast.diagnostics.iter()),
-				)
-			})
-			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
-			.count(),
-	);
+	let diagnostics = compilation.collect_diagnostics();
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
 
 	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, &format);
-	abort_if_errors(
-		tir.diagnostics
-			.iter()
-			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
-			.count(),
-	);
+	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
+	abort_if_errors(tir.diagnostics.error_count());
 
 	let mir =
 		mir::MIR::build(&tir, &compilation.interner, compilation.id_generator);
@@ -376,40 +351,15 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 fn cmd_check(project_path: &str, format: MessageFormat) {
 	let mut compilation = load_compilation(project_path);
 
-	for package_graph in &compilation.packages {
-		emit_diagnostics(
-			&compilation,
-			&package_graph.linker_diagnostics,
-			&format,
-		);
-		for module in &package_graph.modules {
-			emit_diagnostics(&compilation, &module.ast.diagnostics, &format);
-		}
-	}
-	abort_if_errors(
-		compilation
-			.packages
-			.iter()
-			.flat_map(|package_graph| {
-				package_graph.linker_diagnostics.iter().chain(
-					package_graph
-						.modules
-						.iter()
-						.flat_map(|module| module.ast.diagnostics.iter()),
-				)
-			})
-			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
-			.count(),
-	);
+	// Gathered once, then both printed and counted — rather than walking the
+	// package graph a second time to recount what was just printed.
+	let diagnostics = compilation.collect_diagnostics();
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
 
 	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, &format);
-	abort_if_errors(
-		tir.diagnostics
-			.iter()
-			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
-			.count(),
-	);
+	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
+	abort_if_errors(tir.diagnostics.error_count());
 
 	println!("No errors found.");
 }
@@ -447,12 +397,7 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 		// `check`, which only report and abort; `format` overwrites the
 		// file in place, so rendering and writing a recovered, error-laden
 		// AST back over the original would silently corrupt it instead.
-		if module
-			.ast
-			.diagnostics
-			.iter()
-			.any(|d| matches!(d.severity, Severity::Error | Severity::Bug))
-		{
+		if module.ast.diagnostics.has_errors() {
 			eprintln!(
 				"error: '{}' has syntax errors, skipping (run `wx check \
 				 {}` for details)",

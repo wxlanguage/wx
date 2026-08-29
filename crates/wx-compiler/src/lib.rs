@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod codegen;
+pub mod diagnostics;
 pub mod mir;
 pub mod opt;
 #[cfg(test)]

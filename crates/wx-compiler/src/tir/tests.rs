@@ -110,7 +110,7 @@ fn test_stdlib_typechecks_as_root_package() {
 		.packages
 		.iter()
 		.flat_map(|package_graph| {
-			package_graph.linker_diagnostics.iter().chain(
+			package_graph.diagnostics.iter().chain(
 				package_graph
 					.modules
 					.iter()
@@ -6035,7 +6035,7 @@ fn no_errors(case: &TestCase) {
 		..term::Config::default()
 	};
 	for package_ in &case.graph.packages {
-		let package_diagnostics = package_.linker_diagnostics.iter().chain(
+		let package_diagnostics = package_.diagnostics.iter().chain(
 			package_
 				.modules
 				.iter()
@@ -9336,6 +9336,52 @@ fn test_enum_six_unused_variants_collapses_to_generic_message() {
 		6,
 		"expected one label per unused variant"
 	);
+}
+
+#[test]
+fn test_tagged_items_registered_for_every_taggable_item_kind() {
+	let case = TestCase::new(indoc! {"
+        #[tag = \"tagged_fn\"]
+        fn f() -> i32 { 1 }
+        #[tag = \"tagged_struct\"]
+        struct S { x: i32 }
+        #[tag = \"tagged_const\"]
+        const C: i32 = 1;
+        #[tag = \"tagged_alias\"]
+        type A = i32;
+        #[tag = \"tagged_global\"]
+        global mut G: i32 = 0;
+        #[tag = \"tagged_enum\"]
+        enum E: i32 { A = 1 }
+        #[tag = \"tagged_memory\"]
+        memory M: Memory where { Size = u32 };
+        #[tag = \"tagged_trait\"]
+        trait T { fn m(self) -> i32; }
+        export { f }
+    "});
+	// Warnings are expected here (nothing reads these items); errors are not.
+	let errors = error_messages(&case.tir);
+	assert!(errors.is_empty(), "unexpected errors: {errors:#?}");
+	for tag in [
+		"tagged_fn",
+		"tagged_struct",
+		"tagged_const",
+		"tagged_alias",
+		"tagged_global",
+		"tagged_enum",
+		"tagged_memory",
+		"tagged_trait",
+	] {
+		let symbol = case
+			.graph
+			.interner
+			.get(tag)
+			.unwrap_or_else(|| panic!("`{tag}` was never interned"));
+		assert!(
+			case.tir.tagged_items.contains_key(&symbol),
+			"`#[tag = \"{tag}\"]` was not registered in `tagged_items`"
+		);
+	}
 }
 
 #[test]
@@ -13608,4 +13654,325 @@ fn test_poisoned_deref_store_records_rhs_access_for_hover() {
 		"the `value` on the right-hand side must record an access, or hover \
 		 over it returns nothing"
 	);
+}
+
+// ── local pattern destructuring ──────────────────────────────────────────
+
+/// Every error-severity diagnostic, rendered for assertion messages.
+fn error_messages(tir: &TIR) -> Vec<String> {
+	tir.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.map(|d| format!("{:?}: {}", d.code, d.message))
+		.collect()
+}
+
+fn assert_no_errors(case: &TestCase) {
+	let errors = error_messages(&case.tir);
+	assert!(errors.is_empty(), "unexpected errors: {:#?}", errors);
+}
+
+#[test]
+fn test_tuple_destructuring_binds_each_element() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b) = pair;
+            a + b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_tuple_destructuring_nested() {
+	let case = TestCase::new(indoc! {"
+        fn f(nested: (i32, (i32, i32))) -> i32 {
+            local (x, (y, z)) = nested;
+            x + y + z
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_tuple_destructuring_arity_mismatch_errors() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b, c) = pair;
+            a + b + c
+        }
+        export { f }
+    "});
+	assert!(has_error_code(&case.tir, DiagnosticCode::TypeMistmatch));
+}
+
+#[test]
+fn test_tuple_pattern_on_non_tuple_errors() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local (a, b) = x;
+            a + b
+        }
+        export { f }
+    "});
+	assert!(has_error_code(&case.tir, DiagnosticCode::TypeMistmatch));
+}
+
+/// A shape mismatch must still bind every name in the pattern, or each later
+/// use of them reports a second, spurious "undeclared identifier".
+#[test]
+fn test_failed_tuple_pattern_still_binds_names() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local (a, b) = x;
+            a + b
+        }
+        export { f }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
+		"names bound by a failed pattern must still resolve: {:#?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_tuple_destructuring_untyped_literal_requires_annotation() {
+	// Same rule as `local x = 1;` — an untyped literal never picks a type on
+	// its own, and a tuple of them must not sneak past it.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local (a, b) = (1, 2);
+            a + b
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::TypeAnnotationRequired
+	));
+}
+
+#[test]
+fn test_tuple_destructuring_with_annotation_coerces_literals() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local (a, b): (i32, i32) = (1, 2);
+            a + b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_destructured_binding_mutability_is_per_binding() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (mut a, b) = pair;
+            a = a + b;
+            a
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_destructured_immutable_binding_cannot_be_assigned() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b) = pair;
+            a = b;
+            a
+        }
+        export { f }
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::CannotMutateImmutable.code())),
+		"assigning to a non-`mut` destructured binding must be rejected"
+	);
+}
+
+/// `_` inside a pattern binds nothing, so it must not trip the unused-local
+/// lint the way a real unused name does.
+#[test]
+fn test_wildcard_in_tuple_pattern_is_not_an_unused_local() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, _) = pair;
+            a
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+	assert!(
+		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedVariable.code())),
+		"`_` binds nothing, so there is no local to be unused"
+	);
+}
+
+#[test]
+fn test_unused_destructured_binding_still_warns() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b) = pair;
+            a
+        }
+        export { f }
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedVariable.code())),
+		"`b` is a real binding that is never read"
+	);
+}
+
+#[test]
+fn test_top_level_wildcard_local_is_accepted() {
+	let case = TestCase::new(indoc! {"
+        fn g() -> i32 { 1 }
+        fn f() -> i32 {
+            local _ = g();
+            2
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_struct_destructuring_shorthand_and_renamed() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        fn f(p: Point) -> i32 {
+            local Point::{ x, y } = p;
+            local Point::{ x: a, y: b } = p;
+            x + y + a + b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_struct_destructuring_missing_field_errors() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        fn f(p: Point) -> i32 {
+            local Point::{ x } = p;
+            x
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::MissingStructFields
+	));
+}
+
+#[test]
+fn test_struct_destructuring_rest_allows_omitted_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32, z: i32 }
+        fn f(p: Point) -> i32 {
+            local Point::{ x, .. } = p;
+            x
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_struct_destructuring_unknown_field_errors() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        fn f(p: Point) -> i32 {
+            local Point::{ x, y, w } = p;
+            x
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::UnknownStructField
+	));
+}
+
+#[test]
+fn test_struct_destructuring_duplicate_field_errors() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        fn f(p: Point) -> i32 {
+            local Point::{ x, x: other, y } = p;
+            x + other
+        }
+        export { f }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::DuplicateStructFieldInit
+	));
+}
+
+#[test]
+fn test_struct_pattern_naming_the_wrong_struct_errors() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        struct Size { x: i32, y: i32 }
+        fn f(p: Point) -> i32 {
+            local Size::{ x, y } = p;
+            x + y
+        }
+        export { f }
+    "});
+	assert!(has_error_code(&case.tir, DiagnosticCode::TypeMistmatch));
+}
+
+#[test]
+fn test_struct_destructuring_nested_in_tuple() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+        fn f(pair: (Point, i32)) -> i32 {
+            local (Point::{ x, y }, n) = pair;
+            x + y + n
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_struct_destructuring_generic_substitutes_field_types() {
+	let case = TestCase::new(indoc! {"
+        struct Pair<T> { first: T, second: T }
+        fn f(p: Pair<i64>) -> i64 {
+            local Pair::{ first, second } = p;
+            first + second
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_struct_destructuring_across_modules() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn f(p: geom::Point) -> i32 {
+                local geom::Point::{ x, y } = p;
+                x + y
+            }
+            export { f }
+        "},
+		&[("src/geom.wx", "pub struct Point { pub x: i32, pub y: i32 }")],
+	);
+	assert_no_errors(&case);
 }

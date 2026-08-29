@@ -19,6 +19,10 @@ bench = []
 [[bench]]
 name = "lexer"
 harness = false
+# The bench body calls `ast::bench_lex_to_eof`, which only exists under the
+# `bench` feature. Without this, `--all-targets` builds the target unfeatured
+# and fails on the missing import.
+required-features = ["bench"]
 
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }

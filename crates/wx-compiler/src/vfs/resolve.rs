@@ -169,7 +169,7 @@ fn open_manifest_package(
 	// silently competing for `add`/`sub`/... against the real stdlib's.
 	if matches!(manifest.kind, PackageManifestKind::Std) {
 		builder.packages[id.as_usize()]
-			.linker_diagnostics
+			.diagnostics
 			.push(report_std_package_as_dependency(name.as_str()));
 	}
 
@@ -231,7 +231,7 @@ fn resolve_dependencies(
 				// and paths through it keep resolving.
 				(None, Some(&pending)) => {
 					builder.packages[owner.as_usize()]
-						.linker_diagnostics
+						.diagnostics
 						.push(report_circular_dependency(key.as_str()));
 					pending
 				}
@@ -285,18 +285,8 @@ fn report_circular_dependency(key: &str) -> Diagnostic<FileId> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::vfs::VirtualFileSource;
-
-	fn virtual_source(files: &[(&str, &str)]) -> VirtualFileSource {
-		VirtualFileSource::new(
-			files
-				.iter()
-				.map(|(path, source)| {
-					(AbsolutePath::new(*path), source.to_string())
-				})
-				.collect(),
-		)
-	}
+	use crate::testing::DiagnosticView;
+	use crate::vfs::tests::workspace;
 
 	/// What `owner` calls the package it reaches under `name`. Replaces the
 	/// old global `package_by_name`: a name is a property of the edge, so
@@ -315,7 +305,7 @@ mod tests {
 
 	#[test]
 	fn manifested_binary_with_no_dependencies_gets_std() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
 			("/app/main.wx", "fn add() {}"),
 		]);
@@ -338,7 +328,7 @@ mod tests {
 	/// manifest's own directory.
 	#[test]
 	fn manifested_binary_resolves_a_non_conventional_entry_name() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{ "type": "bin", "entry": "src/start.wx" }"#,
@@ -354,7 +344,7 @@ mod tests {
 
 	#[test]
 	fn manifest_directory_without_a_wx_json_fails() {
-		let source = virtual_source(&[("/app/main.wx", "fn add() {}")]);
+		let source = workspace(&[("/app/main.wx", "fn add() {}")]);
 		assert!(
 			open_manifest(AbsolutePath::new("/app"), &source).is_err(),
 			"a directory argument commits to the manifest-driven path — no \
@@ -364,7 +354,7 @@ mod tests {
 
 	#[test]
 	fn std_root_package_does_not_get_a_second_std_loaded() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
 			("/app/main.wx", "fn add() {}"),
 		]);
@@ -390,7 +380,7 @@ mod tests {
 	/// first-claim-wins race rather than needing a reserved-key check.
 	#[test]
 	fn dependency_bound_to_std_collides_with_the_stdlib() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
@@ -417,20 +407,9 @@ mod tests {
 			"the seeded stdlib holds the name; the declared one can't take it"
 		);
 
-		let all_diagnostics: Vec<_> = compilation
-			.packages
-			.iter()
-			.flat_map(|p| p.linker_diagnostics.iter())
-			.collect();
-		assert!(
-			all_diagnostics.iter().any(|d| d.code.as_deref()
-				== Some(DiagnosticCode::DuplicatePackageName.code())),
-			"expected a duplicate-name diagnostic; got: {:?}",
-			all_diagnostics
-				.iter()
-				.map(|d| &d.message)
-				.collect::<Vec<_>>()
-		);
+		let diagnostics = compilation.collect_linker_diagnostics();
+		DiagnosticView::new("link", &diagnostics, &compilation.files)
+			.assert_error(DiagnosticCode::DuplicatePackageName);
 	}
 
 	/// `"type": "std"` says "suppress the embedded stdlib for this
@@ -439,7 +418,7 @@ mod tests {
 	/// with the real stdlib's, so it's rejected rather than ignored.
 	#[test]
 	fn std_package_as_a_dependency_is_diagnosed() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
@@ -468,20 +447,9 @@ mod tests {
 			"a `std`-kind dependency does not become the stdlib provider"
 		);
 
-		let all_diagnostics: Vec<_> = compilation
-			.packages
-			.iter()
-			.flat_map(|p| p.linker_diagnostics.iter())
-			.collect();
-		assert!(
-			all_diagnostics.iter().any(|d| d.code.as_deref()
-				== Some(DiagnosticCode::StdPackageAsDependency.code())),
-			"expected a std-as-dependency diagnostic; got: {:?}",
-			all_diagnostics
-				.iter()
-				.map(|d| &d.message)
-				.collect::<Vec<_>>()
-		);
+		let diagnostics = compilation.collect_linker_diagnostics();
+		DiagnosticView::new("link", &diagnostics, &compilation.files)
+			.assert_error(DiagnosticCode::StdPackageAsDependency);
 	}
 
 	/// Inverted deliberately. Under the old model a name was a property of
@@ -491,8 +459,51 @@ mod tests {
 	/// two different maps — the whole point of edge-scoped names, and not
 	/// something to diagnose.
 	#[test]
+	fn one_package_declared_under_two_names_is_diagnosed() {
+		// The inverse of `two_packages_may_use_the_same_key_for_different_
+		// targets`: there, two owners each bind `libx` to a target of their
+		// own, which is fine. Here one owner reaches the *same* package twice
+		// under different keys, which is not — a `dependencies` entry is a
+		// declaration, so the mapping is kept one-to-one in both directions
+		// and a second name has to be spelled with an alias instead.
+		let source = workspace(&[
+			(
+				"/app/wx.json",
+				r#"{
+					"type": "bin",
+					"entry": "main.wx",
+					"dependencies": {
+						"one": { "type": "local", "path": "../shared" },
+						"two": { "type": "local", "path": "../shared" }
+					}
+				}"#,
+			),
+			("/app/main.wx", "fn add() {}"),
+			(
+				"/shared/wx.json",
+				r#"{ "type": "lib", "entry": "main.wx" }"#,
+			),
+			("/shared/main.wx", "fn shared() {}"),
+		]);
+		let compilation =
+			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+
+		let diagnostics = compilation.collect_linker_diagnostics();
+		DiagnosticView::new("link", &diagnostics, &compilation.files)
+			.assert_error(DiagnosticCode::PackageDeclaredTwice);
+
+		// The first key still binds — the package loaded, it just cannot be
+		// reached under both names.
+		assert!(
+			dependency_of(&compilation, compilation.root_package, "one")
+				.is_some(),
+			"the first declaration should still bind its name"
+		);
+	}
+
+	#[test]
 	fn two_packages_may_use_the_same_key_for_different_targets() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
@@ -524,20 +535,10 @@ mod tests {
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
-		let all_diagnostics: Vec<_> = compilation
-			.packages
-			.iter()
-			.flat_map(|p| p.linker_diagnostics.iter())
-			.collect();
-		assert!(
-			all_diagnostics.is_empty(),
-			"the same key in two different packages is not a collision; \
-			 got: {:?}",
-			all_diagnostics
-				.iter()
-				.map(|d| &d.message)
-				.collect::<Vec<_>>()
-		);
+		// The same key in two different packages is not a collision.
+		let diagnostics = compilation.collect_linker_diagnostics();
+		DiagnosticView::new("link", &diagnostics, &compilation.files)
+			.assert_none();
 
 		// Each `libx` resolves within its own package, to a different target.
 		let app = compilation.root_package;
@@ -551,7 +552,7 @@ mod tests {
 
 	#[test]
 	fn diamond_dependency_is_loaded_only_once() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
@@ -600,24 +601,15 @@ mod tests {
 			5,
 			"app, std, a, b, shared — shared loaded exactly once despite two paths to it"
 		);
-		let all_diagnostics: Vec<_> = compilation
-			.packages
-			.iter()
-			.flat_map(|p| p.linker_diagnostics.iter())
-			.collect();
-		assert!(
-			all_diagnostics.is_empty(),
-			"a diamond dependency isn't a collision; got: {:?}",
-			all_diagnostics
-				.iter()
-				.map(|d| &d.message)
-				.collect::<Vec<_>>()
-		);
+		// A diamond dependency isn't a collision.
+		let diagnostics = compilation.collect_linker_diagnostics();
+		DiagnosticView::new("link", &diagnostics, &compilation.files)
+			.assert_none();
 	}
 
 	#[test]
 	fn circular_dependency_is_diagnosed_without_infinite_recursion() {
-		let source = virtual_source(&[
+		let source = workspace(&[
 			(
 				"/a/wx.json",
 				r#"{
@@ -647,7 +639,7 @@ mod tests {
 		let all_diagnostics: Vec<_> = compilation
 			.packages
 			.iter()
-			.flat_map(|p| p.linker_diagnostics.iter())
+			.flat_map(|p| p.diagnostics.iter())
 			.collect();
 		assert!(
 			all_diagnostics.iter().any(|d| d.code.as_deref()

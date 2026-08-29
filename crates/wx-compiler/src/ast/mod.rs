@@ -32,7 +32,7 @@ impl From<TextSpan> for core::ops::Range<usize> {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CommentKind {
 	Line,
 	Doc,
@@ -184,46 +184,7 @@ impl std::fmt::Display for Token {
 	}
 }
 
-macro_rules! define_diagnostic_codes {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $variant:ident => $code:literal,
-            )*
-        }
-    ) => {
-        $(#[$meta])*
-        $vis enum $name {
-            $($variant,)*
-        }
-
-        impl $name {
-            pub const fn code(&self) -> &'static str {
-                match self {
-                    $(Self::$variant => $code,)*
-                }
-            }
-        }
-
-        impl std::str::FromStr for $name {
-            type Err = ();
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s {
-                    $($code => Ok(Self::$variant),)*
-                    _ => Err(()),
-                }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.code())
-            }
-        }
-    };
-}
+use crate::diagnostics::define_diagnostic_codes;
 
 define_diagnostic_codes! {
 	pub enum DiagnosticCode {
@@ -240,6 +201,7 @@ define_diagnostic_codes! {
 		InvalidAttribute => "E0012",
 		InvalidNamespace => "E0013",
 		InvalidLabel => "E0014",
+		InvalidPattern => "E0015",
 		CrlfLineEndings => "W0001",
 		VisibilityNotPermitted => "W0002",
 	}
@@ -386,6 +348,16 @@ fn report_invalid_namespace(
 		)
 }
 
+fn report_unknown_token(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UnknownToken.code())
+		.with_message("unknown token")
+		.with_label(
+			Label::primary(file_id, span)
+				.with_message("not valid in wx source"),
+		)
+}
+
 fn report_invalid_item(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InvalidItem.code())
@@ -449,6 +421,7 @@ struct Lexer<'src> {
 	peeked: Option<Spanned<Token>>,
 	comments: Vec<Comment>,
 	has_crlf: bool,
+	unknown_spans: Vec<TextSpan>,
 }
 
 const EOF: char = '\0';
@@ -461,6 +434,7 @@ impl<'src> Lexer<'src> {
 			peeked: None,
 			comments: Vec::new(),
 			has_crlf: false,
+			unknown_spans: Vec::new(),
 		}
 	}
 
@@ -529,16 +503,21 @@ impl<'src> Lexer<'src> {
 					};
 					continue;
 				}
-				_ => match unknown_span {
-					Some(span) => {
-						self.peeked = Some(token);
-						return Spanned {
-							inner: Token::Unknown,
-							span,
-						};
+				_ => {
+					// A run of unknown characters is recorded and skipped,
+					// exactly like a comment. The parser has no handler for
+					// `Token::Unknown`, so surfacing one only ever added a
+					// second, misleading diagnostic on top of this one —
+					// pointing at whatever token happened to follow.
+					//
+					// Recorded here, where the run ends, so it is counted once
+					// however often the surrounding tokens are peeked: `next`
+					// returns a peeked token before reaching this point.
+					if let Some(span) = unknown_span {
+						self.unknown_spans.push(span);
 					}
-					None => return token,
-				},
+					return token;
+				}
 			}
 		}
 	}
@@ -1385,9 +1364,10 @@ pub enum TypeExpression {
 	Tuple {
 		elements: Box<[Spanned<TypeExpression>]>,
 	},
-	/// `heap::*mut u8`, `heap::[]i32` — memory-tagged pointer/slice/array.
+	/// `heap::*u8`, `heap::&[i32]` — memory-tagged pointer/slice/array.
 	/// The memory is always a single-segment path naming the memory
-	/// declaration; the inner is a Pointer, Slice, or Array type.
+	/// declaration; the inner is a Pointer, Slice, or Array type, and so
+	/// always carries its own `*`/`&` ownership sigil.
 	MemoryTagged {
 		memory: Box<[PathSegment]>,
 		inner: Box<Spanned<TypeExpression>>,
@@ -1423,6 +1403,16 @@ pub struct PatternField {
 	pub pattern: Option<Spanned<Pattern>>,
 }
 
+/// One entry inside a `Path::{ ... }` pattern body. `SeparatedGroup`'s
+/// `item_handler` is a plain `fn` pointer that yields exactly one item, so the
+/// `..` rest marker has to come back through the same channel as a field and
+/// get partitioned out afterwards — that way `..` still benefits from the
+/// group's separator handling and error recovery.
+enum StructPatternItem {
+	Field(PatternField),
+	Rest,
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum Pattern {
@@ -1437,10 +1427,16 @@ pub enum Pattern {
 	Tuple {
 		elements: Box<[Separated<Spanned<Pattern>>]>,
 	},
-	/// `Name { field, other: pat, ... }`
+	/// `Name::{ field, other: pat, ... }` or `module::Name::{ field, .. }` —
+	/// the `::{` mirrors `Expression::StructInit`'s syntax rather than Rust's
+	/// bare `Name { .. }`, so a pattern and a literal for the same struct read
+	/// the same way.
 	Struct {
-		name: Spanned<SymbolU32>,
+		path: Box<[PathSegment]>,
 		fields: Box<[Separated<Spanned<PatternField>>]>,
+		/// Span of a trailing `..`. `None` means the pattern must bind every
+		/// field of the struct.
+		rest: Option<TextSpan>,
 	},
 }
 
@@ -2294,6 +2290,18 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let Parser { mut ast, lexer, .. } = parser;
+		// Appended, in whatever position they land: nothing downstream reads
+		// diagnostics positionally, each one carries its own span, and the
+		// CRLF warning above is already out of source order. `extend` over an
+		// exact-size iterator reserves once and moves each `Diagnostic` — not
+		// a cheap thing to shuffle, holding an owned message and two `Vec`s —
+		// exactly once.
+		ast.diagnostics.extend(
+			lexer
+				.unknown_spans
+				.iter()
+				.map(|span| report_unknown_token(file_id, *span)),
+		);
 		ast.comments = CommentMap(lexer.comments.into_boxed_slice());
 		ast
 	}
@@ -4563,6 +4571,68 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
+	fn parse_struct_pattern_item(
+		parser: &mut Parser,
+	) -> Result<Spanned<StructPatternItem>, ()> {
+		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
+			return Ok(Spanned {
+				inner: StructPatternItem::Rest,
+				span: dot_dot.span,
+			});
+		}
+		let field = Parser::parse_pattern_field(parser)?;
+		Ok(Spanned {
+			inner: StructPatternItem::Field(field.inner),
+			span: field.span,
+		})
+	}
+
+	/// Parses the `::{ ... }` body of a struct pattern, with `path` already
+	/// consumed. Splits the parsed items into real fields plus the span of a
+	/// `..`, if one was written; where `..` sits among the fields carries no
+	/// meaning, so nothing here inspects its position.
+	fn parse_struct_pattern(
+		parser: &mut Parser,
+		path: Box<[PathSegment]>,
+	) -> Result<Spanned<Pattern>, ()> {
+		let path_start = path.first().unwrap().ident.span.start;
+		let items = SeparatedGroup {
+			open_token: Token::OpenBrace,
+			close_token: Token::CloseBrace,
+			separator_token: Token::Comma,
+			should_warn_missing_separator: None,
+			item_handler: Parser::parse_struct_pattern_item,
+		}
+		.parse(parser)?;
+
+		let mut fields: Vec<Separated<Spanned<PatternField>>> =
+			Vec::with_capacity(items.inner.len());
+		let mut rest: Option<TextSpan> = None;
+
+		for Separated { inner, separator } in items.inner.into_vec() {
+			match inner.inner {
+				StructPatternItem::Field(field) => fields.push(Separated {
+					inner: Spanned {
+						inner: field,
+						span: inner.span,
+					},
+					separator,
+				}),
+				StructPatternItem::Rest => rest = Some(inner.span),
+			}
+		}
+
+		let span = TextSpan::new(path_start, items.span.end);
+		Ok(Spanned {
+			inner: Pattern::Struct {
+				path,
+				fields: fields.into_boxed_slice(),
+				rest,
+			},
+			span,
+		})
+	}
+
 	fn parse_pattern(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
 		let token = parser.lexer.peek();
 		match token.inner {
@@ -4608,38 +4678,89 @@ impl<'ctx> Parser<'ctx> {
 						span,
 					});
 				}
+				// A bare identifier is a binding, but it may also open a path
+				// leading to `::{ ... }` — the same shape
+				// `parse_path_expression` walks to reach `StructInit`.
 				let name_token = parser.lexer.next();
 				let name = Spanned {
 					inner: parser.intern_identifier(name_token.span),
 					span: name_token.span,
 				};
-				if parser.lexer.peek().inner == Token::OpenBrace {
-					let fields = SeparatedGroup {
-						open_token: Token::OpenBrace,
-						close_token: Token::CloseBrace,
-						separator_token: Token::Comma,
-						should_warn_missing_separator: None,
-						item_handler: Parser::parse_pattern_field,
+				let mut segments = vec![PathSegment {
+					ident: name,
+					type_args: Box::new([]),
+				}];
+
+				while parser.lexer.peek().inner == Token::ColonColon {
+					parser.lexer.next(); // consume `::`
+					match parser.lexer.peek().inner {
+						// `::<T, U>` — turbofish for the last segment
+						Token::LeftArrow => {
+							let (type_args, _close) =
+								parser.parse_type_args()?;
+							segments.last_mut().unwrap().type_args = type_args;
+						}
+						// `::{ ... }` — struct pattern body
+						Token::OpenBrace => {
+							return Parser::parse_struct_pattern(
+								parser,
+								segments.into(),
+							);
+						}
+						// `::ident` — another path segment
+						Token::Identifier => {
+							let seg_span =
+								parser.next_expect(Token::Identifier)?.span;
+							segments.push(PathSegment {
+								ident: Spanned {
+									inner: parser.intern_identifier(seg_span),
+									span: seg_span,
+								},
+								type_args: Box::new([]),
+							});
+						}
+						_ => {
+							let bad = parser.lexer.peek();
+							parser.ast.diagnostics.push(
+								report_invalid_namespace(
+									parser.ast.file_id,
+									bad.span,
+								),
+							);
+							return Err(());
+						}
 					}
-					.parse(parser)?;
-					let span =
-						TextSpan::new(name_token.span.start, fields.span.end);
-					Ok(Spanned {
-						inner: Pattern::Struct {
-							name,
-							fields: fields.inner,
-						},
-						span,
-					})
-				} else {
-					Ok(Spanned {
-						inner: Pattern::Binding {
-							mut_span: None,
-							name,
-						},
-						span: name_token.span,
-					})
 				}
+
+				// The path never reached `::{`, so it can only be a binding —
+				// and a binding is a single plain name.
+				if segments.len() > 1 || !segments[0].type_args.is_empty() {
+					let span = TextSpan::new(
+						name_token.span.start,
+						segments.last().unwrap().ident.span.end,
+					);
+					parser.ast.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::InvalidPattern.code())
+							.with_message("invalid pattern")
+							.with_note(
+								"a path may only appear in a pattern as a struct pattern, `Path::{ ... }`",
+							)
+							.with_label(
+								Label::primary(parser.ast.file_id, span)
+									.with_message("expected a plain name"),
+							),
+					);
+					return Err(());
+				}
+
+				Ok(Spanned {
+					inner: Pattern::Binding {
+						mut_span: None,
+						name,
+					},
+					span: name_token.span,
+				})
 			}
 			_ => {
 				let token = parser.lexer.next();

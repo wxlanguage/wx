@@ -91,7 +91,7 @@ pub fn compile(
 		.packages
 		.iter()
 		.flat_map(|package_graph| {
-			package_graph.linker_diagnostics.iter().cloned().chain(
+			package_graph.diagnostics.iter().cloned().chain(
 				package_graph
 					.modules
 					.iter()

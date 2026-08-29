@@ -1254,7 +1254,7 @@ fn render_full_diagnostic(
 		.packages
 		.iter()
 		.flat_map(|cg| {
-			cg.linker_diagnostics
+			cg.diagnostics
 				.iter()
 				.chain(cg.modules.iter().flat_map(|m| m.ast.diagnostics.iter()))
 		})
@@ -1585,7 +1585,7 @@ fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
 				owned_files.insert(PathBuf::from(module.file_path.as_str()));
 			}
 		}
-		for diagnostic in &package_graph.linker_diagnostics {
+		for diagnostic in &package_graph.diagnostics {
 			add_compiler_diagnostic(
 				&mut diagnostics_by_file,
 				&compiled.graph.files,

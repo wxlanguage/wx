@@ -1,0 +1,68 @@
+// The sine of an `f32`, ported from Rust's `compiler-builtins` `libm/src/math/sinf.rs`,
+// itself a port of FreeBSD's `s_sinf.c` (Sun Microsystems' fdlibm, converted to float by
+// Ian Lance Taylor and optimised by Bruce D. Evans).
+//
+// Small |x| goes straight to the `k_sinf` kernel; up to |x| ~<= 9*pi/4 the argument is
+// reduced by subtracting a small multiple of pi/2 and dispatching to `k_sinf`/`k_cosf`
+// with the appropriate sign; beyond that `rem_pio2f` does the general reduction.
+use crate::{k_cosf::k_cosf, k_sinf::k_sinf, rem_pio2f::rem_pio2f};
+
+// Small multiples of pi/2 rounded to double precision.
+const S1_PIO2: f64 = 1. * f64::FRAC_PI_2; // 0x3FF921FB, 0x54442D18
+const S2_PIO2: f64 = 2. * f64::FRAC_PI_2; // 0x400921FB, 0x54442D18
+const S3_PIO2: f64 = 3. * f64::FRAC_PI_2; // 0x4012D97C, 0x7F3321D2
+const S4_PIO2: f64 = 4. * f64::FRAC_PI_2; // 0x401921FB, 0x54442D18
+
+/// The sine of `x`, with `x` in radians.
+pub fn sinf(x: f32) -> f32 {
+    local x64 = x.promote();
+
+    local mut ix = x.to_bits();
+    local sign = (ix >> 31) != 0;
+    ix &= 0x7fffffff;
+
+    if ix <= 0x3f490fda {
+        // |x| ~<= pi/4
+        if ix < 0x39800000 {
+            // |x| < 2**-12
+            return x;
+        };
+        return k_sinf(x64);
+    };
+    if ix <= 0x407b53d1 {
+        // |x| ~<= 5*pi/4
+        if ix <= 0x4016cbe3 {
+            // |x| ~<= 3pi/4
+            if sign {
+                return -k_cosf(x64 + S1_PIO2);
+            } else {
+                return k_cosf(x64 - S1_PIO2);
+            };
+        };
+        return k_sinf(if sign { -(x64 + S2_PIO2) } else { -(x64 - S2_PIO2) });
+    };
+    if ix <= 0x40e231d5 {
+        // |x| ~<= 9*pi/4
+        if ix <= 0x40afeddf {
+            // |x| ~<= 7*pi/4
+            if sign {
+                return k_cosf(x64 + S3_PIO2);
+            } else {
+                return -k_cosf(x64 - S3_PIO2);
+            };
+        };
+        return k_sinf(if sign { x64 + S4_PIO2 } else { x64 - S4_PIO2 });
+    };
+
+    // sin(Inf or NaN) is NaN
+    if ix >= 0x7f800000 { return x - x };
+
+    // general argument reduction needed
+    local (n, y) = rem_pio2f(x);
+    match n & 3 {
+        0 -> { k_sinf(y) },
+        1 -> { k_cosf(y) },
+        2 -> { k_sinf(-y) },
+        _ -> { -k_cosf(y) }
+    }
+}
