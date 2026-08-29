@@ -150,6 +150,9 @@ struct Builder<'ast, 'graph> {
 	/// a block is this package's entry file — a dependency that declares one
 	/// would otherwise merge its names into an ABI it doesn't own.
 	root_package: PackageId,
+	/// The package providing the standard library, whose root namespace is the
+	/// prelude every lookup falls back to. See [`Builder::lookup_scope_chain`].
+	stdlib_package: PackageId,
 	type_index_lookup: HashMap<Type, TypeIndex>,
 	tir: TIR,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
@@ -417,6 +420,15 @@ enum TypeArgArity {
 	RequireExact,
 }
 
+/// A struct field resolved by name — see [`Builder::resolve_struct_field`].
+#[derive(Clone, Copy)]
+struct ResolvedField {
+	index: FieldIndex,
+	/// Already substituted with the struct's type arguments, so no caller has
+	/// to remember to do it.
+	ty: TypeIndex,
+}
+
 enum MemberLookup {
 	Inherent {
 		entry: ImplEntry,
@@ -529,6 +541,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		files: &graph.files,
 		packages: &graph.packages,
 		root_package: graph.root_package,
+		stdlib_package: graph.stdlib_package,
 		tir,
 		type_index_lookup,
 		sig_state: HashMap::new(),
@@ -873,10 +886,12 @@ impl<'ast> Builder<'ast, '_> {
 					if field.pub_span.is_some() {
 						continue;
 					}
-					let has_read = field
-						.accesses
-						.iter()
-						.any(|a| matches!(a.kind, FieldAccessKind::Read));
+					let has_read = field.accesses.iter().any(|a| {
+						matches!(
+							a.kind,
+							FieldAccessKind::Read | FieldAccessKind::ReadWrite
+						)
+					});
 					let has_init = field
 						.accesses
 						.iter()

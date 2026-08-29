@@ -7548,45 +7548,45 @@ functions:
     name:
       inner: 17
       span:
-        start: 15
-        end: 18
+        start: 3
+        end: 6
     params:
       - mut_span: ~
         name:
           inner: 81
           span:
-            start: 19
-            end: 20
+            start: 7
+            end: 8
         ty:
           inner: 11
           span:
-            start: 22
-            end: 25
+            start: 10
+            end: 13
       - mut_span: ~
         name:
           inner: 82
           span:
-            start: 27
-            end: 28
+            start: 15
+            end: 16
         ty:
           inner: 11
           span:
-            start: 30
-            end: 33
+            start: 18
+            end: 21
     result:
       inner: 11
       span:
-        start: 38
-        end: 41
+        start: 26
+        end: 29
     accesses:
       - file_id: 1
         span:
-          start: 62
-          end: 65
+          start: 50
+          end: 53
       - file_id: 1
         span:
-          start: 67
-          end: 70
+          start: 55
+          end: 58
     attributes: []
     body:
       stack:
@@ -7596,32 +7596,32 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 42
-              end: 51
+              start: 30
+              end: 39
             locals:
               - name:
                   inner: 81
                   span:
-                    start: 19
-                    end: 20
+                    start: 7
+                    end: 8
                 ty: 11
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 44
-                      end: 45
+                      start: 32
+                      end: 33
                     kind: Read
               - name:
                   inner: 82
                   span:
-                    start: 27
-                    end: 28
+                    start: 15
+                    end: 16
                 ty: 11
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 48
-                      end: 49
+                      start: 36
+                      end: 37
                     kind: Read
             inferred_type: 11
             expected_type: 11
@@ -7640,25 +7640,25 @@ functions:
                           local_index: 0
                       ty: 11
                       span:
-                        start: 44
-                        end: 45
+                        start: 32
+                        end: 33
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 1
                       ty: 11
                       span:
-                        start: 48
-                        end: 49
+                        start: 36
+                        end: 37
                   id: 174
               ty: 11
               span:
-                start: 44
-                end: 49
+                start: 32
+                end: 37
         ty: 11
         span:
-          start: 42
-          end: 51
+          start: 30
+          end: 39
   - id: 13
     file_id: 0
     namespace: 0
@@ -12097,8 +12097,8 @@ functions:
     accesses:
       - file_id: 1
         span:
-          start: 46
-          end: 47
+          start: 34
+          end: 35
     attributes:
       - Inline
     body:
@@ -30449,11 +30449,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30480,13 +30476,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Private
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0
@@ -30590,16 +30580,16 @@ export_block:
   keyword:
     file_id: 1
     span:
-      start: 53
-      end: 59
+      start: 41
+      end: 47
   items:
     17:
       Function:
         internal_name:
           inner: 17
           span:
-            start: 62
-            end: 65
+            start: 50
+            end: 53
         external_name: ~
         id: 471
     245:
@@ -30607,13 +30597,13 @@ export_block:
         internal_name:
           inner: 17
           span:
-            start: 67
-            end: 70
+            start: 55
+            end: 58
         external_name:
           inner: 245
           span:
-            start: 74
-            end: 80
+            start: 62
+            end: 68
         id: 471
 use_items: []
 use_prefixes: []
@@ -34494,16 +34484,16 @@ type_aliases:
           end: 23461
       - file_id: 1
         span:
-          start: 22
-          end: 25
+          start: 10
+          end: 13
       - file_id: 1
         span:
-          start: 30
-          end: 33
+          start: 18
+          end: 21
       - file_id: 1
         span:
-          start: 38
-          end: 41
+          start: 26
+          end: 29
       - file_id: 0
         span:
           start: 7217

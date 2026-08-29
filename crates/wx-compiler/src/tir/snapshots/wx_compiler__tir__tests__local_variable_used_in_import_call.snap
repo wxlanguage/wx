@@ -1321,8 +1321,8 @@ diagnostics:
       - style: Primary
         file_id: 1
         range:
-          start: 108
-          end: 114
+          start: 96
+          end: 102
         message: ""
     notes:
       - "declare a memory in this module: `memory <name>: Memory where { Size = u32 };`"
@@ -7577,15 +7577,15 @@ functions:
     name:
       inner: 244
       span:
-        start: 80
-        end: 84
+        start: 68
+        end: 72
     params: []
     result: ~
     accesses:
       - file_id: 1
         span:
-          start: 163
-          end: 167
+          start: 151
+          end: 155
     attributes: []
     body:
       stack:
@@ -7595,20 +7595,20 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 87
-              end: 152
+              start: 75
+              end: 140
             locals:
               - name:
                   inner: 245
                   span:
-                    start: 99
-                    end: 105
+                    start: 87
+                    end: 93
                 ty: 0
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 142
-                      end: 148
+                      start: 130
+                      end: 136
                     kind: Read
             inferred_type: 2
             expected_type: 2
@@ -7622,20 +7622,20 @@ functions:
                     name:
                       inner: 245
                       span:
-                        start: 99
-                        end: 105
+                        start: 87
+                        end: 93
                     scope_index: 0
                     local_index: 0
                     value:
                       kind: Error
                       ty: 0
                       span:
-                        start: 108
-                        end: 120
+                        start: 96
+                        end: 108
                 ty: 2
                 span:
-                  start: 93
-                  end: 120
+                  start: 81
+                  end: 108
               - kind:
                   Call:
                     callee:
@@ -7644,45 +7644,45 @@ functions:
                           namespace:
                             inner: 306
                             span:
-                              start: 126
-                              end: 133
+                              start: 114
+                              end: 121
                           member:
                             kind:
                               Function:
                                 id: 471
                             ty: 307
                             span:
-                              start: 135
-                              end: 138
+                              start: 123
+                              end: 126
                       ty: 307
                       span:
-                        start: 126
-                        end: 138
+                        start: 114
+                        end: 126
                     arguments:
                       - kind:
                           Int:
                             value: 0
                         ty: 10
                         span:
-                          start: 139
-                          end: 140
+                          start: 127
+                          end: 128
                       - kind:
                           Local:
                             scope_index: 0
                             local_index: 0
                         ty: 0
                         span:
-                          start: 142
-                          end: 148
+                          start: 130
+                          end: 136
                 ty: 2
                 span:
-                  start: 126
-                  end: 149
+                  start: 114
+                  end: 137
             result: ~
         ty: 2
         span:
-          start: 87
-          end: 152
+          start: 75
+          end: 140
   - id: 13
     file_id: 0
     namespace: 0
@@ -29551,37 +29551,37 @@ functions:
     name:
       inner: 243
       span:
-        start: 49
-        end: 52
+        start: 37
+        end: 40
     params:
       - mut_span: ~
         name:
           inner: 216
           span:
-            start: 53
-            end: 56
+            start: 41
+            end: 44
         ty:
           inner: 10
           span:
-            start: 58
-            end: 61
+            start: 46
+            end: 49
       - mut_span: ~
         name:
           inner: 63
           span:
-            start: 63
-            end: 66
+            start: 51
+            end: 54
         ty:
           inner: 10
           span:
-            start: 68
-            end: 71
+            start: 56
+            end: 59
     result: ~
     accesses:
       - file_id: 1
         span:
-          start: 135
-          end: 138
+          start: 123
+          end: 126
     attributes: []
     body: ~
 globals: []
@@ -30514,11 +30514,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30552,13 +30548,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Private
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0
@@ -30674,8 +30664,8 @@ namespaces:
     accesses:
       - file_id: 1
         span:
-          start: 126
-          end: 133
+          start: 114
+          end: 121
 module_decls:
   - namespace_idx: 2
     declaring_file_id: 0
@@ -30694,13 +30684,13 @@ import_decls:
     external_name:
       inner: 242
       span:
-        start: 19
-        end: 28
+        start: 7
+        end: 16
     internal_name:
       inner: 242
       span:
-        start: 32
-        end: 39
+        start: 20
+        end: 27
     lookup:
       243:
         Function:
@@ -30710,16 +30700,16 @@ export_block:
   keyword:
     file_id: 1
     span:
-      start: 154
-      end: 160
+      start: 142
+      end: 148
   items:
     244:
       Function:
         internal_name:
           inner: 244
           span:
-            start: 163
-            end: 167
+            start: 151
+            end: 155
         external_name: ~
         id: 472
 use_items: []
@@ -35141,12 +35131,12 @@ type_aliases:
           end: 24672
       - file_id: 1
         span:
-          start: 58
-          end: 61
+          start: 46
+          end: 49
       - file_id: 1
         span:
-          start: 68
-          end: 71
+          start: 56
+          end: 59
       - file_id: 0
         span:
           start: 7114

@@ -7548,30 +7548,30 @@ functions:
     name:
       inner: 168
       span:
-        start: 15
-        end: 19
+        start: 3
+        end: 7
     params:
       - mut_span: ~
         name:
           inner: 241
           span:
-            start: 20
-            end: 21
+            start: 8
+            end: 9
         ty:
           inner: 11
           span:
-            start: 23
-            end: 26
+            start: 11
+            end: 14
     result:
       inner: 11
       span:
-        start: 31
-        end: 34
+        start: 19
+        end: 22
     accesses:
       - file_id: 1
         span:
-          start: 129
-          end: 133
+          start: 117
+          end: 121
     attributes: []
     body:
       stack:
@@ -7581,20 +7581,20 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 35
-              end: 119
+              start: 23
+              end: 107
             locals:
               - name:
                   inner: 241
                   span:
-                    start: 20
-                    end: 21
+                    start: 8
+                    end: 9
                 ty: 11
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 47
-                      end: 48
+                      start: 35
+                      end: 36
                     kind: Read
             inferred_type: 11
             expected_type: 11
@@ -7602,8 +7602,8 @@ functions:
             label: ~
             parent: 0
             span:
-              start: 64
-              end: 69
+              start: 52
+              end: 57
             locals: []
             inferred_type: 11
             expected_type: 11
@@ -7611,8 +7611,8 @@ functions:
             label: ~
             parent: 0
             span:
-              start: 84
-              end: 89
+              start: 72
+              end: 77
             locals: []
             inferred_type: 11
             expected_type: 11
@@ -7620,8 +7620,8 @@ functions:
             label: ~
             parent: 0
             span:
-              start: 104
-              end: 110
+              start: 92
+              end: 98
             locals: []
             inferred_type: 11
             expected_type: 11
@@ -7640,14 +7640,14 @@ functions:
                         local_index: 0
                     ty: 11
                     span:
-                      start: 47
-                      end: 48
+                      start: 35
+                      end: 36
                   arms:
                     - pattern:
                         Int: 0
                       pattern_span:
-                        start: 59
-                        end: 60
+                        start: 47
+                        end: 48
                       body:
                         kind:
                           Block:
@@ -7659,17 +7659,17 @@ functions:
                                   value: 0
                               ty: 11
                               span:
-                                start: 66
-                                end: 67
+                                start: 54
+                                end: 55
                         ty: 11
                         span:
-                          start: 64
-                          end: 69
+                          start: 52
+                          end: 57
                     - pattern:
                         Int: 1
                       pattern_span:
-                        start: 79
-                        end: 80
+                        start: 67
+                        end: 68
                       body:
                         kind:
                           Block:
@@ -7681,16 +7681,16 @@ functions:
                                   value: 1
                               ty: 11
                               span:
-                                start: 86
-                                end: 87
+                                start: 74
+                                end: 75
                         ty: 11
                         span:
-                          start: 84
-                          end: 89
+                          start: 72
+                          end: 77
                     - pattern: Wildcard
                       pattern_span:
-                        start: 99
-                        end: 100
+                        start: 87
+                        end: 88
                       body:
                         kind:
                           Block:
@@ -7702,32 +7702,32 @@ functions:
                                   operator:
                                     inner: InvertSign
                                     span:
-                                      start: 106
-                                      end: 107
+                                      start: 94
+                                      end: 95
                                   operand:
                                     kind:
                                       Int:
                                         value: 1
                                     ty: 11
                                     span:
-                                      start: 107
-                                      end: 108
+                                      start: 95
+                                      end: 96
                               ty: 11
                               span:
-                                start: 106
-                                end: 108
+                                start: 94
+                                end: 96
                         ty: 11
                         span:
-                          start: 104
-                          end: 110
+                          start: 92
+                          end: 98
               ty: 11
               span:
-                start: 41
-                end: 117
+                start: 29
+                end: 105
         ty: 11
         span:
-          start: 35
-          end: 119
+          start: 23
+          end: 107
   - id: 13
     file_id: 0
     namespace: 0
@@ -12780,8 +12780,8 @@ functions:
     accesses:
       - file_id: 1
         span:
-          start: 106
-          end: 107
+          start: 94
+          end: 95
     attributes:
       - Inline
     body:
@@ -30518,11 +30518,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30549,13 +30545,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Private
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0
@@ -30659,16 +30649,16 @@ export_block:
   keyword:
     file_id: 1
     span:
-      start: 120
-      end: 126
+      start: 108
+      end: 114
   items:
     168:
       Function:
         internal_name:
           inner: 168
           span:
-            start: 129
-            end: 133
+            start: 117
+            end: 121
         external_name: ~
         id: 471
 use_items: []
@@ -34550,12 +34540,12 @@ type_aliases:
           end: 23461
       - file_id: 1
         span:
-          start: 23
-          end: 26
+          start: 11
+          end: 14
       - file_id: 1
         span:
-          start: 31
-          end: 34
+          start: 19
+          end: 22
       - file_id: 0
         span:
           start: 7217

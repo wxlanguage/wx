@@ -898,12 +898,12 @@ pub enum AccessKind {
 	ReadWrite,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 struct AccessContext {
 	/// Hint for type inference at this expression site.
-	/// `TypeIndex::INFER` means "no constraint" (replaces `Option::None`).
+	/// `TypeIndex::INFER` means "no constraint".
 	/// A type containing `TypeIndex::INFER` (e.g. `Layout<_>`) is a partial
 	/// constraint — positions marked INFER act as wildcards.
 	expected_type: TypeIndex,
@@ -1867,6 +1867,7 @@ define_diagnostic_codes! {
 		ExportBlockNotAtRoot => "E1073",
 		LibraryCannotExport => "E1074",
 		AmbiguousWildcardImport => "E1075",
+		PrivateStructField => "E1076",
 	}
 }
 
@@ -1887,7 +1888,29 @@ pub struct Global {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum FieldAccessKind {
 	Read,
+	Write,
+	/// A compound assignment (`s.a += 1`): reads the field *and* stores back
+	/// to it. Kept distinct rather than folded into `Read` so that neither
+	/// question — "was this field ever read?" (`Read | ReadWrite`) nor "was
+	/// it ever written?" (`Write | ReadWrite`) — has to be answered wrongly.
+	/// Collapsing it would force a choice of which consumer gets the truth.
+	ReadWrite,
+	/// A field given its value in a struct literal. The one kind with no
+	/// [`AccessKind`] counterpart, since it is not an expression-position
+	/// mention of the field at all.
 	Init,
+}
+
+impl FieldAccessKind {
+	/// How to record a field mention in expression position, given what the
+	/// surrounding expression does to it.
+	pub fn for_access(kind: AccessKind) -> FieldAccessKind {
+		match kind {
+			AccessKind::Read => FieldAccessKind::Read,
+			AccessKind::Write => FieldAccessKind::Write,
+			AccessKind::ReadWrite => FieldAccessKind::ReadWrite,
+		}
+	}
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1896,6 +1919,30 @@ pub struct FieldAccess {
 	pub kind: FieldAccessKind,
 	pub file_id: FileId,
 	pub span: TextSpan,
+}
+
+/// A field's position in its struct's *declared* order — the index into
+/// [`Struct::fields`], and the key `Struct::lookup` maps a name to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct FieldIndex(u32);
+
+impl FieldIndex {
+	#[inline]
+	pub fn new(index: u32) -> FieldIndex {
+		FieldIndex(index)
+	}
+
+	#[inline]
+	pub fn as_u32(self) -> u32 {
+		self.0
+	}
+
+	#[inline]
+	pub fn as_usize(self) -> usize {
+		self.0 as usize
+	}
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1926,7 +1973,7 @@ pub struct Struct {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub lookup: HashMap<SymbolU32, usize>,
+	pub lookup: HashMap<SymbolU32, FieldIndex>,
 	pub accesses: Vec<SourceSpan>,
 }
 

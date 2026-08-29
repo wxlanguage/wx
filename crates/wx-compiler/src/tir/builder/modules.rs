@@ -315,11 +315,16 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// `true` if `declaring` is `accessor` itself or one of its ancestors —
-	/// i.e. an item declared in `declaring` is visible, without needing
-	/// `pub`, from code in `accessor` (Rust-style default visibility: a
-	/// private item is visible to its declaring module and every descendant
-	/// module).
+	/// `true` if `outer` encloses `inner` — `inner` is `outer` itself or one
+	/// of its descendants. Implemented by walking *up* from `inner`, which is
+	/// the cheap direction: a namespace has one parent but any number of
+	/// children.
+	///
+	/// This is the containment half of Rust-style default visibility: an item
+	/// declared in `outer` is visible without `pub` to `outer` and every
+	/// module nested inside it. Callers phrase it as
+	/// `namespace_contains(declaring, accessor)` — "does the declaring module
+	/// contain the code doing the access".
 	///
 	/// A plain walk up `.parent` is enough now that every package has its own
 	/// root namespace: a chain terminates inside the package it started in,
@@ -327,14 +332,14 @@ impl<'ast> Builder<'ast, '_> {
 	/// used to need an explicit stop at `ModuleDeclarationKind::Package`,
 	/// because `None` meant both "no ancestor" and "the root package's own
 	/// scope", and the two chains dead-ended at the same value.
-	fn is_ancestor_or_self(
+	fn namespace_contains(
 		&self,
-		accessor: NamespaceIndex,
-		declaring: NamespaceIndex,
+		outer: NamespaceIndex,
+		inner: NamespaceIndex,
 	) -> bool {
-		let mut current = Some(accessor);
+		let mut current = Some(inner);
 		while let Some(idx) = current {
-			if idx == declaring {
+			if idx == outer {
 				return true;
 			}
 			current = self.tir.namespaces[idx as usize].parent;
@@ -407,15 +412,21 @@ impl<'ast> Builder<'ast, '_> {
 		)
 	}
 
-	/// `true` if `visibility`, found in `declaring_namespace` while
-	/// resolving from `accessor`, is accessible: either it's `Public`, or
-	/// `accessor` is `declaring_namespace` or a descendant of it.
+	/// The one place the access rule lives: an item declared `visibility` in
+	/// `declaring_namespace` is reachable from `accessor` if **either** it is
+	/// `Public` **or** `declaring_namespace` contains `accessor`.
+	///
+	/// The `or` is what makes `pub` mean anything across a module boundary —
+	/// a `pub` item is reachable from everywhere, containment or not — so
+	/// this is deliberately not a conjunction of the two conditions.
+	///
 	/// `declaring_namespace` is whichever namespace's own `symbols` map the
 	/// entry was found in — for a direct declaration that's the same
 	/// namespace `symbol_kind_is_gated` read `pub_span` from; for a `use`
 	/// re-export it's the namespace that wrote the `use`, not the original
-	/// item's.
-	fn visible_from(
+	/// item's. A struct field has no `symbols` entry of its own, so its
+	/// caller passes the struct's namespace (see [`Self::field_visibility`]).
+	pub(super) fn is_accessible_from(
 		&self,
 		accessor: NamespaceIndex,
 		declaring_namespace: NamespaceIndex,
@@ -424,12 +435,76 @@ impl<'ast> Builder<'ast, '_> {
 		match visibility {
 			Visibility::Public => true,
 			Visibility::Private => {
-				self.is_ancestor_or_self(accessor, declaring_namespace)
+				self.namespace_contains(declaring_namespace, accessor)
 			}
 		}
 	}
 
-	/// [`Self::visible_from`], for a raw `SymbolEntry` straight out of a
+	/// The declared visibility of one struct field.
+	///
+	/// A field never gets a `SymbolEntry` — it is only ever reached by name
+	/// on its owner — so there is no stored [`Visibility`] to read and the
+	/// `pub` qualifier is interpreted here instead, by the same rule
+	/// [`Self::insert_symbol`] applies to everything else.
+	///
+	/// Pair it with [`Self::is_accessible_from`] against the *struct's* namespace:
+	/// a field has no scope of its own, so it is private to the module that
+	/// declares the struct. That deliberately makes an inherent impl written
+	/// in another module an outside accessor — `impl geom::Point { fn f(self)
+	/// -> i32 { self.y } }` has no more claim on a private `y` than any other
+	/// foreign code does.
+	pub(super) fn field_visibility(
+		&self,
+		struct_index: u32,
+		field_index: FieldIndex,
+	) -> Visibility {
+		if self.tir.structs[struct_index as usize].fields
+			[field_index.as_usize()]
+		.pub_span
+		.is_some()
+		{
+			Visibility::Public
+		} else {
+			Visibility::Private
+		}
+	}
+
+	/// Reports a struct field named from outside the module declaring it.
+	///
+	/// Its own code rather than [`report_private_item`]'s `PrivateItem`: that
+	/// one names an item the caller could have brought into scope, and its
+	/// "this item is not `pub`" wording points at a fix the caller can make.
+	/// A field is reachable only through its owner, so the `pub` that has to
+	/// be added is the one on the field declaration — a different fix, made
+	/// by a different person, worth a code a reader can look up separately.
+	pub(super) fn report_private_field(
+		&mut self,
+		struct_index: u32,
+		field_index: FieldIndex,
+		access: SourceSpan,
+	) {
+		let declaration = &self.tir.structs[struct_index as usize];
+		let field = &declaration.fields[field_index.as_usize()];
+		let declared_at = SourceSpan::new(declaration.file_id, field.name.span);
+		let field_name = self.interner.resolve(field.name.inner).unwrap();
+		let struct_name =
+			self.interner.resolve(declaration.name.inner).unwrap();
+
+		let diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::PrivateStructField.code())
+			.with_message(format!(
+				"field `{field_name}` of struct `{struct_name}` is private"
+			))
+			.with_label(access.primary_label().with_message("private field"))
+			.with_label(
+				declared_at
+					.secondary_label()
+					.with_message("declared without `pub` here"),
+			);
+		self.tir.diagnostics.push(diagnostic);
+	}
+
+	/// [`Self::is_accessible_from`], for a raw `SymbolEntry` straight out of a
 	/// `symbols` map — used by the one caller that reads visibility off an
 	/// entry that might still be `Pending` (`lookup_scope_chain`'s wildcard
 	/// loop).
@@ -444,7 +519,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// an actual gating decision runs on. But nothing enforces that in the
 	/// type system: don't reuse this for a new caller without confirming it
 	/// can't observe a still-`Pending` entry as final.
-	fn entry_visible_from(
+	fn is_entry_accessible_from(
 		&self,
 		accessor: NamespaceIndex,
 		declaring_namespace: NamespaceIndex,
@@ -452,9 +527,8 @@ impl<'ast> Builder<'ast, '_> {
 	) -> bool {
 		match entry {
 			SymbolEntry::Pending(_) => true,
-			SymbolEntry::Resolved { visibility, .. } => {
-				self.visible_from(accessor, declaring_namespace, visibility)
-			}
+			SymbolEntry::Resolved { visibility, .. } => self
+				.is_accessible_from(accessor, declaring_namespace, visibility),
 		}
 	}
 
@@ -472,7 +546,8 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	/// Walks the scope chain for `key`: the namespace's own symbols, then
-	/// its globs, then its parent, out to the package boundary.
+	/// its globs, then its parent, out to the package boundary — and finally
+	/// the prelude.
 	///
 	/// Ambiguity is detected here, in the one walk every identifier already
 	/// pays for, and the result carries the candidates that caused it — the
@@ -509,7 +584,7 @@ impl<'ast> Builder<'ast, '_> {
 					.get(&key)
 					.copied()
 					.filter(|entry| {
-						self.entry_visible_from(
+						self.is_entry_accessible_from(
 							namespace,
 							import.namespace,
 							*entry,
@@ -542,7 +617,52 @@ impl<'ast> Builder<'ast, '_> {
 		// parents *is* the package boundary. There's no outer store left to
 		// fall into, which is what keeps one package's items — and its
 		// dependency names — invisible to every other package.
-		ScopeLookup::NotFound
+		//
+		// The prelude is the one exception, and deliberately the last tier: a
+		// name std happens to define never shadows anything the user wrote or
+		// imported, so adding an item to the standard library can't break a
+		// program that already compiled. That ordering is the whole reason
+		// it's a tier of its own rather than a synthetic `use std::*;` seeded
+		// into every namespace — a real glob sits at the same level as the
+		// user's own globs, where colliding with one is an ambiguity error
+		// instead of quiet shadowing, and it would need a `use` statement's
+		// span to blame when it collided.
+		//
+		// Std's own namespaces are not excluded. At std's root the fallback
+		// re-reads the same symbol map tier 1 just missed, which costs one
+		// failed lookup and can't change an answer; one level down, in std's
+		// own `mod ptr`, it's what lets that module see `Memory` and
+		// `size_of` — the same service every other module gets.
+		self.prelude_lookup(namespace, key)
+	}
+
+	/// The prelude tier of [`Self::lookup_scope_chain`]: `key` as found in the
+	/// standard library's root namespace.
+	///
+	/// Visibility is checked against the looking-up namespace exactly as a
+	/// glob's is, so a non-`pub` item at std's root stays internal to std —
+	/// while staying visible to std's own descendants, which is what makes
+	/// serving the prelude to std itself harmless.
+	fn prelude_lookup(
+		&self,
+		namespace: NamespaceIndex,
+		key: (SymbolNamespace, SymbolU32),
+	) -> ScopeLookup {
+		let Some(&prelude) =
+			self.tir.package_namespaces.get(&self.stdlib_package)
+		else {
+			return ScopeLookup::NotFound;
+		};
+		match self.tir.namespaces[prelude as usize]
+			.symbols
+			.get(&key)
+			.copied()
+			.filter(|entry| {
+				self.is_entry_accessible_from(namespace, prelude, *entry)
+			}) {
+			Some(entry) => ScopeLookup::Found(entry),
+			None => ScopeLookup::NotFound,
+		}
 	}
 
 	/// [`Self::lookup_scope_chain`], reporting an ambiguity before handing
@@ -700,7 +820,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		match resolved {
 			Some(SymbolEntry::Resolved { kind, visibility }) => {
-				if !self.visible_from(
+				if !self.is_accessible_from(
 					accessor_namespace,
 					target_namespace,
 					visibility,
@@ -1456,7 +1576,10 @@ fn report_unresolved_import(
 		)
 }
 
-fn report_private_item(name: &str, span: SourceSpan) -> Diagnostic<FileId> {
+pub(super) fn report_private_item(
+	name: &str,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::PrivateItem.code())
 		.with_message(format!("`{name}` is private"))

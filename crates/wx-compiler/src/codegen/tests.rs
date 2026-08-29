@@ -27,9 +27,8 @@ impl TestCase {
 		source: &str,
 		extra_files: &[(&str, &str)],
 	) -> Self {
-		let prefixed = format!("use std::*;\n{source}");
 		let mut workspace_files =
-			HashMap::from([(entry_path.to_string(), prefixed)]);
+			HashMap::from([(entry_path.to_string(), source.to_string())]);
 		for (path, source) in extra_files {
 			workspace_files.insert((*path).to_string(), (*source).to_string());
 		}

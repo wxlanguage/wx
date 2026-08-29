@@ -2360,7 +2360,8 @@ impl<'tir> Builder<'tir> {
 					self.ensure_aggregate_for_struct(struct_index, args);
 				let aggregate = &self.aggregates[aggregate_index as usize];
 				let decl_index = self.tir.structs[struct_index as usize].lookup
-					[&member.inner];
+					[&member.inner]
+					.as_usize();
 				let phys_index = aggregate.decl_to_phys[decl_index];
 				let field_ty = aggregate.values[phys_index as usize];
 
@@ -4126,7 +4127,8 @@ impl<'tir> Builder<'tir> {
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, args);
 				let decl_index = self.tir.structs[struct_index as usize].lookup
-					[&member.inner];
+					[&member.inner]
+					.as_usize();
 				let phys_index = self.aggregates[aggregate_index as usize]
 					.decl_to_phys[decl_index] as usize;
 				let field_offset = self.aggregates[aggregate_index as usize]
@@ -4203,7 +4205,8 @@ impl<'tir> Builder<'tir> {
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, &args);
 				let decl_index = self.tir.structs[struct_index as usize].lookup
-					[&member.inner];
+					[&member.inner]
+					.as_usize();
 				let phys_index = self.aggregates[aggregate_index as usize]
 					.decl_to_phys[decl_index] as usize;
 				let tir::ExprKind::Local {

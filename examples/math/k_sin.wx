@@ -1,0 +1,41 @@
+// The sine kernel on ~[-pi/4, pi/4], ported from Rust's `compiler-builtins` `libm/src/math/
+// k_sin.rs`, itself a port of FreeBSD's `k_sin.c` (Sun Microsystems' fdlibm).
+//
+// `x` is assumed to be bounded by ~pi/4 in magnitude, `y` is the tail of `x` (the low-order
+// part the argument reduction couldn't fit into `x`), and `iy` says whether `y` is zero — pass
+// `0` when calling with `y == 0.0` to take the cheaper branch. Callers must handle `sin(-0)`
+// themselves: the odd polynomial here isn't evaluated in a way that preserves `-0`.
+//
+// sin(x) is approximated by a degree-13 polynomial on [0, pi/4]:
+//
+//     sin(x) ~ x + S1*x^3 + ... + S6*x^13
+//
+// with |sin(x)/x - (1 + S1*x^2 + ... + S6*x^12)| <= 2^-58. The `y` correction uses
+// sin(x+y) = sin(x) + sin'(x)*y ~ sin(x) + (1 - x*x/2)*y, rearranged for accuracy around
+// r = x^3 * (S2 + x^2*(S3 + x^2*(S4 + x^2*(S5 + x^2*S6)))).
+
+// 0xBFC55555, 0x55555549
+const S1: f64 = -1.66666666666666324348e-01;
+// 0x3F811111, 0x1110F8A6
+const S2: f64 = 8.33333333332248946124e-03;
+// 0xBF2A01A0, 0x19C161D5
+const S3: f64 = -1.98412698298579493134e-04;
+// 0x3EC71DE3, 0x57B1FE7D
+const S4: f64 = 2.75573137070700676789e-06;
+// 0xBE5AE5E6, 0x8A2B9CEB
+const S5: f64 = -2.50507602534068634195e-08;
+// 0x3DE5D93A, 0x5ACFD57C
+const S6: f64 = 1.58969099521155010221e-10;
+
+pub fn k_sin(x: f64, y: f64, iy: i32) -> f64 {
+    local z = x * x;
+    local w = z * z;
+    local r = S2 + z * (S3 + z * S4) + z * w * (S5 + z * S6);
+    local v = z * x;
+
+    if iy == 0 {
+        x + v * (S1 + z * r)
+    } else {
+        x - ((z * (0.5 * y - v * r) - y) - v * S1)
+    }
+}

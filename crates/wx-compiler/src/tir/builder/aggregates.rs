@@ -4,6 +4,63 @@
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
+	/// Resolves `name` as a field of `struct_index` instantiated with `args`,
+	/// recording the access and enforcing the field's visibility.
+	///
+	/// `None` means the struct has no such field, deliberately without a
+	/// diagnostic: the callers disagree about what a miss means. `a.b` falls
+	/// through to method lookup, while a struct literal and a struct pattern
+	/// each report their own `UnknownStructField` and recover differently.
+	///
+	/// A *private* field is reported but still returned. Its type is known,
+	/// so the caller keeps building and every later check still runs against
+	/// the real type instead of collapsing into the privacy error.
+	pub(super) fn resolve_struct_field(
+		&mut self,
+		resolve_context: ResolveContext,
+		struct_index: u32,
+		args: &[TypeIndex],
+		name: Spanned<SymbolU32>,
+		kind: FieldAccessKind,
+	) -> Option<ResolvedField> {
+		let declaration = &self.tir.structs[struct_index as usize];
+		let index = declaration.lookup.get(&name.inner).copied()?;
+		let raw_ty = declaration.fields[index.as_usize()].ty.inner;
+		let declaring_namespace = declaration.namespace;
+
+		self.tir.structs[struct_index as usize].fields[index.as_usize()]
+			.accesses
+			.push(FieldAccess {
+				kind,
+				file_id: resolve_context.file_id,
+				span: name.span,
+			});
+
+		let visibility = self.field_visibility(struct_index, index);
+		if !self.is_accessible_from(
+			resolve_context.namespace,
+			declaring_namespace,
+			visibility,
+		) {
+			self.report_private_field(
+				struct_index,
+				index,
+				SourceSpan::new(resolve_context.file_id, name.span),
+			);
+		}
+
+		// The overwhelmingly common case is a non-generic struct, which has
+		// nothing to substitute — checked here rather than inside
+		// `substitute_type` so it costs a branch instead of a call.
+		let ty = if args.is_empty() {
+			raw_ty
+		} else {
+			self.substitute_type(raw_ty, args)
+		};
+
+		Some(ResolvedField { index, ty })
+	}
+
 	pub(super) fn build_struct_init_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
@@ -104,28 +161,31 @@ impl<'ast> Builder<'ast, '_> {
 
 		for field in fields.iter() {
 			let field = &field.inner.inner;
-			let field_name = self.interner.resolve(field.name.inner).unwrap();
 
-			let field_index = match self.tir.structs[struct_index as usize]
-				.lookup
-				.get(&field.name.inner)
-				.copied()
-			{
-				Some(idx) => idx,
-				None => {
-					self.tir.diagnostics.push(report_unknown_struct_field(
-						UnknownStructFieldDiagnostic {
-							file_id: func_ctx.resolve_context.file_id,
-							struct_name: &struct_name,
-							field_name,
-							field_span: field.name.span,
-						},
-					));
-					continue;
-				}
+			let Some(resolved) = self.resolve_struct_field(
+				func_ctx.resolve_context,
+				struct_index,
+				&resolved_args,
+				field.name,
+				FieldAccessKind::Init,
+			) else {
+				let field_name =
+					self.interner.resolve(field.name.inner).unwrap();
+				self.tir.diagnostics.push(report_unknown_struct_field(
+					UnknownStructFieldDiagnostic {
+						file_id: func_ctx.resolve_context.file_id,
+						struct_name: &struct_name,
+						field_name,
+						field_span: field.name.span,
+					},
+				));
+				continue;
 			};
+			let field_index = resolved.index.as_usize();
 
 			if let Some(first_span) = first_mention[field_index] {
+				let field_name =
+					self.interner.resolve(field.name.inner).unwrap();
 				self.tir
 					.diagnostics
 					.push(report_duplicate_struct_field_init(
@@ -144,23 +204,8 @@ impl<'ast> Builder<'ast, '_> {
 			// Mark this field as mentioned (by its name span) before building the value,
 			// so that build errors don't cause it to appear in the "missing fields" list.
 			first_mention[field_index] = Some(field.name.span);
-			self.tir.structs[struct_index as usize].fields[field_index]
-				.accesses
-				.push(FieldAccess {
-					kind: FieldAccessKind::Init,
-					file_id: func_ctx.resolve_context.file_id,
-					span: field.name.span,
-				});
 
-			let raw_expected_ty = self.tir.structs[struct_index as usize]
-				.fields[field_index]
-				.ty
-				.inner;
-			let expected_ty = if resolved_args.is_empty() {
-				raw_expected_ty
-			} else {
-				self.substitute_type(raw_expected_ty, &resolved_args)
-			};
+			let expected_ty = resolved.ty;
 			let field_value = match &field.value {
 				Some(expr) => expr.as_ref(),
 				None => {

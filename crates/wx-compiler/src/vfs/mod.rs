@@ -447,19 +447,50 @@ pub struct CompilationUnitBuilder {
 pub const STDLIB_FILES: &[(&str, &str)] =
 	include!(concat!(env!("OUT_DIR"), "/stdlib_files.rs"));
 
-/// The source of one embedded stdlib file, keyed as in [`STDLIB_FILES`] —
-/// `path` must already be `/`-prefixed (e.g. `AbsolutePath::new("/math/mod.wx")`),
-/// same as every other consumer of this convention; the caller (serving
-/// `wx://std/...` documents to the editor) is responsible for constructing
-/// one, same as any other frontend.
+/// Serves the embedded stdlib to the loader, reading straight out of
+/// [`STDLIB_FILES`].
 ///
-/// Used so go-to-definition can land inside the stdlib without it existing
-/// on disk.
-pub fn stdlib_file(path: &AbsolutePath) -> Option<&'static str> {
-	STDLIB_FILES
-		.iter()
-		.find(|(name, _)| *name == path.as_str())
-		.map(|(_, source)| *source)
+/// The alternative — copying the table into a [`VirtualFileSource`]'s map —
+/// builds an owned duplicate of sources already sitting in the binary, one
+/// that exists only to be read once and dropped. Reading the table directly
+/// keeps it the single place the stdlib's contents live.
+///
+/// Files are tagged [`FileOrigin::Virtual`]: the stdlib has no on-disk home,
+/// and consumers key off `Local` to pick out the user's own files.
+pub struct StdlibFileSource;
+
+impl StdlibFileSource {
+	/// The source of one embedded stdlib file, keyed as in [`STDLIB_FILES`] —
+	/// `path` must already be `/`-prefixed (e.g.
+	/// `AbsolutePath::new("/math/mod.wx")`), same as every other consumer of
+	/// this convention; the caller (serving `wx://std/...` documents to the
+	/// editor) is responsible for constructing one, same as any other
+	/// frontend.
+	///
+	/// Public because go-to-definition needs to land inside the stdlib
+	/// without it existing on disk, and because both trait methods below
+	/// want the same lookup — `exists` in particular, which would otherwise
+	/// have to allocate a whole `String` just to answer a yes/no.
+	pub fn source(path: &AbsolutePath) -> Option<&'static str> {
+		STDLIB_FILES
+			.iter()
+			.find(|(name, _)| *name == path.as_str())
+			.map(|(_, source)| *source)
+	}
+}
+
+impl FileSource for StdlibFileSource {
+	fn read_to_string(&self, path: &AbsolutePath) -> Result<String, ()> {
+		Self::source(path).map(String::from).ok_or(())
+	}
+
+	fn exists(&self, path: &AbsolutePath) -> bool {
+		Self::source(path).is_some()
+	}
+
+	fn origin(&self) -> FileOrigin {
+		FileOrigin::Virtual
+	}
 }
 
 impl Default for CompilationUnitBuilder {
@@ -483,25 +514,20 @@ impl CompilationUnitBuilder {
 	/// every package loaded afterwards gets `std` seeded into its
 	/// dependencies.
 	///
-	/// Every file in [`STDLIB_FILES`] is handed to the loader up front, so the
-	/// stdlib is an ordinary multi-file package from here on: `mod foo;` in
-	/// `main.wx` resolves against this map exactly as it would against the
-	/// filesystem for a user package. Adding a stdlib file needs no change here.
+	/// [`StdlibFileSource`] resolves reads against [`STDLIB_FILES`] on demand,
+	/// so the stdlib is an ordinary multi-file package from here on: `mod
+	/// foo;` in `main.wx` resolves against the embedded table exactly as it
+	/// would against the filesystem for a user package. Adding a stdlib file
+	/// needs no change here.
 	///
 	/// The entry point is embedded, so this can never actually hit the "entry
 	/// point unreadable" case `load_package` guards against.
 	pub fn load_stdlib(&mut self) -> PackageId {
-		let files: HashMap<AbsolutePath, String> = STDLIB_FILES
-			.iter()
-			.map(|(path, source)| {
-				(AbsolutePath::new(*path), source.to_string())
-			})
-			.collect();
 		let id = self
 			.load_package(
 				PackageKind::Library,
 				AbsolutePath::new("/main.wx"),
-				&VirtualFileSource::new(files),
+				&StdlibFileSource,
 			)
 			.expect("embedded stdlib source should always be readable");
 		self.set_stdlib(id);

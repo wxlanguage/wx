@@ -19,13 +19,12 @@ impl TestCase {
 	fn new(source: &str) -> Self {
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		builder.load_stdlib();
-		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
-					prefixed,
+					source.to_string(),
 				)])),
 			)
 			.unwrap();
@@ -41,14 +40,13 @@ impl TestCase {
 	fn new_library(source: &str) -> Self {
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		builder.load_stdlib();
-		let prefixed = format!("use std::*;\n{source}");
 		let root_id = builder
 			.load_package(
 				vfs::PackageKind::Library,
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
-					prefixed,
+					source.to_string(),
 				)])),
 			)
 			.unwrap();
@@ -62,9 +60,8 @@ impl TestCase {
 		source: &str,
 		extra_files: &[(&str, &str)],
 	) -> Self {
-		let prefixed_entry = format!("use std::*;\n{source}");
 		let mut workspace_files =
-			HashMap::from([(entry_path.to_string(), prefixed_entry)]);
+			HashMap::from([(entry_path.to_string(), source.to_string())]);
 		for (path, source) in extra_files {
 			workspace_files.insert((*path).to_string(), (*source).to_string());
 		}
@@ -269,7 +266,7 @@ fn test_export_block_preceding_the_items_it_names() {
 // ── `use` trees ──────────────────────────────────────────────────────────
 
 /// Convenience for the `use` tests: a two-file package whose `src/math.wx`
-/// is `math`, with `use std::*;` already prefixed onto the entry file.
+/// is `math`.
 fn use_case(entry: &str, math: &str) -> TestCase {
 	TestCase::new_multi_file(
 		"src/main.wx",
@@ -820,10 +817,9 @@ fn test_glob_import_records_its_path_span() {
 		})
 		.collect();
 
-	// `std::*` is the prelude line `TestCase` prepends; `trig::*` is the
-	// nested glob. A span reaching back to `math` would cross the `{` and
-	// not be a contiguous range of source.
-	assert_eq!(spelled, vec!["std::*", "trig::*"]);
+	// A span reaching back to `math` would cross the `{` and not be a
+	// contiguous range of source.
+	assert_eq!(spelled, vec!["trig::*"]);
 }
 
 // ── wildcard ambiguity ───────────────────────────────────────────────────
@@ -996,6 +992,71 @@ fn test_glob_in_an_inner_scope_shadows_an_outer_one() {
 			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
 			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
 		],
+	);
+	no_errors(&case);
+}
+
+// ── the prelude ──────────────────────────────────────────────────────────
+//
+// The standard library's root namespace is the last tier `lookup_scope_chain`
+// consults, below every glob. These tests pin that ordering, since it's what
+// lets std grow new items without breaking programs that already compile.
+
+/// A file that never mentions `std` still resolves std's items.
+#[test]
+fn test_prelude_resolves_without_any_import() {
+	let case = TestCase::new(indoc! {"
+        fn main(x: f32) -> f32 { f32_sqrt(x) }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// The prelude reaches submodules, not just the package root — it is a
+/// property of every namespace rather than something inherited from an
+/// ancestor.
+#[test]
+fn test_prelude_reaches_a_submodule() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            fn main(x: f32) -> f32 { a::call_it(x) }
+            export { main }
+        "},
+		&[("src/a.wx", "pub fn call_it(x: f32) -> f32 { f32_sqrt(x) }")],
+	);
+	no_errors(&case);
+}
+
+/// A local declaration outranks the prelude, silently — no ambiguity, and
+/// the local one is what the call resolves to (the `bool` return is what
+/// makes the choice observable: std's `f32_sqrt` returns `f32`).
+#[test]
+fn test_local_declaration_shadows_the_prelude() {
+	let case = TestCase::new(indoc! {"
+        fn f32_sqrt(x: f32) -> bool { true }
+        fn main(x: f32) -> bool { f32_sqrt(x) }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// A glob import outranks the prelude too, and just as silently — unlike a
+/// collision between two globs, which is an ambiguity error. This is the
+/// case that would regress if the prelude were ever implemented as a
+/// synthetic `use std::*;` seeded into each namespace.
+#[test]
+fn test_glob_import_shadows_the_prelude() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod a;
+            use a::*;
+            fn main(x: f32) -> bool { f32_sqrt(x) }
+            export { main }
+        "},
+		&[("src/a.wx", "pub fn f32_sqrt(x: f32) -> bool { true }")],
 	);
 	no_errors(&case);
 }
@@ -1420,6 +1481,129 @@ fn test_private_item_reference_records_access_and_is_not_flagged_unused() {
 		})
 		.expect("function 'foo' not found in TIR");
 	assert_eq!(func.accesses.len(), 1);
+}
+
+// ── struct field privacy ─────────────────────────────────────────────────
+
+/// The three ways a field name is resolved — a read/write through `.`, a
+/// struct literal, and a `local` destructuring pattern — each gate on the
+/// field's own `pub`, against the namespace of the struct that declares it.
+/// A field has no scope of its own, so that struct's module is what it is
+/// private to.
+#[test]
+fn test_private_field_read_rejected_across_modules() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn main(p: geom::Point) -> i32 { p.y }
+            export { main }
+        "},
+		&[("src/geom.wx", "pub struct Point { pub x: i32, y: i32 }")],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::PrivateStructField
+	));
+}
+
+#[test]
+fn test_private_field_init_rejected_across_modules() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn main() -> geom::Point { geom::Point::{ x: 1, y: 2 } }
+            export { main }
+        "},
+		&[("src/geom.wx", "pub struct Point { pub x: i32, y: i32 }")],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::PrivateStructField
+	));
+}
+
+#[test]
+fn test_private_field_destructuring_rejected_across_modules() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn main(p: geom::Point) -> i32 {
+                local geom::Point::{ x, y } = p;
+                x + y
+            }
+            export { main }
+        "},
+		&[("src/geom.wx", "pub struct Point { pub x: i32, y: i32 }")],
+	);
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::PrivateStructField
+	));
+}
+
+/// A private field stays readable from the module that declares the struct,
+/// and — Rust-style default visibility — from every module nested inside it.
+#[test]
+fn test_private_field_visible_to_declaring_module_and_descendants() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn main() -> i32 { geom::read() }
+            export { main }
+        "},
+		&[
+			(
+				"src/geom.wx",
+				indoc! {"
+                    mod inner;
+                    pub struct Point { y: i32 }
+                    pub fn read() -> i32 {
+                        local p = Point::{ y: 1 };
+                        p.y + inner::read(p)
+                    }
+                "},
+			),
+			(
+				"src/geom/inner.wx",
+				"pub fn read(p: super::Point) -> i32 { p.y }",
+			),
+		],
+	);
+	no_errors(&case);
+}
+
+/// Reporting is recoverable: the field exists and its type is known, so the
+/// expression is still built and nothing downstream re-reports. Exactly one
+/// diagnostic, and no cascade of the `undeclared identifier` kind that a
+/// poisoned binding would produce.
+#[test]
+fn test_private_field_access_reports_once_and_recovers() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+            fn main(p: geom::Point) -> i32 { p.y + p.y }
+            export { main }
+        "},
+		&[("src/geom.wx", "pub struct Point { y: i32 }")],
+	);
+	let private = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::PrivateStructField.code())
+		})
+		.count();
+	assert_eq!(private, 2, "one diagnostic per access, and no more");
+	assert!(!has_error_code(
+		&case.tir,
+		DiagnosticCode::UndeclaredIdentifier
+	));
 }
 
 // ── export reach ─────────────────────────────────────────────────────────
@@ -3594,30 +3778,17 @@ fn test_memory_invalid_kind_is_error() {
 }
 
 #[test]
-fn test_memory_missing_std_import_does_not_panic() {
-	// Regression test: without `use std::*;` in scope, `Memory` is an
-	// unresolved trait bound, so the memory's kind can't be determined.
-	// This must not leave `MEM` stuck as `SymbolKind::Pending`, which
-	// used to panic (`unreachable!`) as soon as anything referenced it.
-	let mut builder = vfs::CompilationUnitBuilder::new();
-	builder.load_stdlib();
-	let root_id = builder
-		.load_binary(
-			vfs::AbsolutePath::new("/main.wx"),
-			&vfs::VirtualFileSource::from_relative(HashMap::from([(
-				"main.wx".to_string(),
-				indoc! {"
-                    memory MEM: Memory where { Size = u32 };
-                    pub fn f() -> u32 { MEM::INDEX }
-                "}
-				.to_string(),
-			)])),
-		)
-		.unwrap();
-	let mut graph = builder.build(root_id);
-	let tir = TIR::build(&mut graph);
+fn test_memory_unresolved_kind_does_not_panic() {
+	// Regression test: an unresolvable trait bound means the memory's kind
+	// can't be determined. This must not leave `MEM` stuck as
+	// `SymbolKind::Pending`, which used to panic (`unreachable!`) as soon as
+	// anything referenced it.
+	let case = TestCase::new(indoc! {"
+        memory MEM: NoSuchTrait where { Size = u32 };
+        pub fn f() -> u32 { MEM::INDEX }
+    "});
 	assert!(
-		tir.diagnostics.iter().any(|d| d.code.as_deref()
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::InvalidMemoryKind.code())),
 		"expected invalid memory kind diagnostic"
 	);
@@ -4158,9 +4329,7 @@ fn test_qualified_path_trait_not_satisfied_span_covers_bracket_only() {
 		})
 		.expect("expected a trait-bound-violation diagnostic");
 
-	let prefix_len = "use std::*;\n".len();
-	let bracket_start =
-		prefix_len + source.find("<Mem::Size as Unsigned>").unwrap();
+	let bracket_start = source.find("<Mem::Size as Unsigned>").unwrap();
 	let bracket_end = bracket_start + "<Mem::Size as Unsigned>".len();
 
 	let primary = diag
@@ -6377,11 +6546,7 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 		.get(&elem_sym)
 		.expect("expected 'Elem' in Container::assoc_types");
 
-	// `TestCase::new` prepends `"use std::*;\n"` ahead of `source`, so shift
-	// the expected offset by that prefix's length.
-	let self_elem_offset = "use std::*;\n".len()
-		+ source.find("Self::Elem").unwrap()
-		+ "Self::".len();
+	let self_elem_offset = source.find("Self::Elem").unwrap() + "Self::".len();
 	assert!(
 		elem_assoc_type
 			.accesses
@@ -6436,9 +6601,8 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	let x_sym = case.graph.interner.get("X").unwrap();
 	let y_sym = case.graph.interner.get("Y").unwrap();
 
-	let prefix_len = "use std::*;\n".len();
-	let y_binding_offset = prefix_len + source.find("Y = Self").unwrap();
-	let x_binding_offset = prefix_len + source.find("X = Self").unwrap();
+	let y_binding_offset = source.find("Y = Self").unwrap();
+	let x_binding_offset = source.find("X = Self").unwrap();
 
 	let x_at = trait_a
 		.assoc_types
@@ -7741,7 +7905,10 @@ fn test_path_cross_module_struct_init() {
 
             export { make }
         "},
-		&[("src/shapes.wx", "pub struct Point { x: i32, y: i32 }")],
+		&[(
+			"src/shapes.wx",
+			"pub struct Point { pub x: i32, pub y: i32 }",
+		)],
 	);
 	no_errors(&case);
 }
@@ -7761,7 +7928,10 @@ fn test_path_cross_module_generic_struct_init() {
 
             export { make }
         "},
-		&[("src/containers.wx", "pub struct Wrapper<T> { value: T }")],
+		&[(
+			"src/containers.wx",
+			"pub struct Wrapper<T> { pub value: T }",
+		)],
 	);
 	no_errors(&case);
 }
@@ -10305,10 +10475,8 @@ fn test_memory_records_access_in_type_position() {
 		.find(|m| case.graph.interner.resolve(m.name.inner) == Some("heap"))
 		.expect("memory 'heap' not found");
 
-	// `TestCase::new` prepends `"use std::*;\n"` ahead of `source`.
-	let heap_in_type_m_offset = "use std::*;\n".len()
-		+ source.find("type M = heap;").unwrap()
-		+ "type M = ".len();
+	let heap_in_type_m_offset =
+		source.find("type M = heap;").unwrap() + "type M = ".len();
 	assert!(
 		memory
 			.accesses
@@ -10738,6 +10906,62 @@ fn test_unused_field_read_suppresses_warn() {
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::UnusedStructField.code())),
 		"fields that are read should not warn"
+	);
+}
+
+/// A plain `s.a = 1` used to record a *read*, because assignment targets and
+/// ordinary reads are built by the same function and it hardcoded
+/// `FieldAccessKind::Read` — so writing to a field silently suppressed the
+/// "never read" warning it should have left standing.
+#[test]
+fn test_unused_field_write_does_not_suppress_warn() {
+	let case = TestCase::new(indoc! {"
+        pub struct Pair { x: i32, y: i32 }
+        pub fn make(x: i32) -> Pair {
+            local mut p = Pair::{ x: x, y: 0 };
+            p.y = 1;
+            p
+        }
+        pub fn get_x(p: Pair) -> i32 { p.x }
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedStructField.code())
+			&& d.message.contains('y')),
+		"a field that is only ever written is still never read, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// The counterpart to the above: a compound assignment *does* read the field
+/// before storing back to it, so it must keep suppressing the warning. This
+/// is the distinction `FieldAccessKind::ReadWrite` exists to preserve —
+/// folding it into either `Read` or `Write` gets one of these two tests
+/// wrong.
+#[test]
+fn test_unused_field_compound_assignment_counts_as_read() {
+	let case = TestCase::new(indoc! {"
+        pub struct Pair { x: i32, y: i32 }
+        pub fn make(x: i32) -> Pair {
+            local mut p = Pair::{ x: x, y: 0 };
+            p.y += 1;
+            p
+        }
+        pub fn get_x(p: Pair) -> i32 { p.x }
+    "});
+	assert!(
+		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedStructField.code())),
+		"`p.y += 1` reads `y`, so it must not warn, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
 	);
 }
 

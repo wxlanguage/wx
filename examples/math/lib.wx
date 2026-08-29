@@ -1,5 +1,3 @@
-use std::*;
-
 impl f64 {
   /// Archimedes' constant (π)
   pub const PI: f64 = 3.14159265358979323846264338327950288;
@@ -23,8 +21,16 @@ mod rem_pio2f;
 mod sinf;
 mod cosf;
 
+mod k_cos;
+mod k_sin;
+mod rem_pio2;
+mod sin;
+mod cos;
+
 pub use sinf::sinf;
 pub use cosf::cosf;
+pub use sin::sin;
+pub use cos::cos;
 
 trait Float {
   fn cos(self) -> Self;
@@ -39,5 +45,15 @@ impl Float for f32 {
 
   fn cos(self) -> Self {
     cosf(self)
+  }
+}
+
+impl Float for f64 {
+  fn sin(self) -> Self {
+    sin(self)
+  }
+
+  fn cos(self) -> Self {
+    cos(self)
   }
 }

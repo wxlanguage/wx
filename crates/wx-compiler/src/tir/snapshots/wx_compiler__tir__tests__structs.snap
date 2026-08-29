@@ -1312,14 +1312,14 @@ diagnostics:
       - style: Primary
         file_id: 1
         range:
-          start: 102
-          end: 105
+          start: 90
+          end: 93
         message: ""
       - style: Secondary
         file_id: 1
         range:
-          start: 94
-          end: 97
+          start: 82
+          end: 85
         message: first use of this field
     notes: []
   - severity: Error
@@ -1329,8 +1329,8 @@ diagnostics:
       - style: Primary
         file_id: 1
         range:
-          start: 87
-          end: 111
+          start: 75
+          end: 99
         message: ""
     notes: []
 functions:
@@ -7584,19 +7584,19 @@ functions:
     name:
       inner: 242
       span:
-        start: 67
-        end: 71
+        start: 55
+        end: 59
     params: []
     result:
       inner: 19
       span:
-        start: 77
-        end: 80
+        start: 65
+        end: 68
     accesses:
       - file_id: 1
         span:
-          start: 124
-          end: 128
+          start: 112
+          end: 116
     attributes: []
     body:
       stack:
@@ -7606,8 +7606,8 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 81
-              end: 113
+              start: 69
+              end: 101
             locals: []
             inferred_type: 19
             expected_type: 19
@@ -7623,12 +7623,12 @@ functions:
                   fields: []
               ty: 19
               span:
-                start: 87
-                end: 111
+                start: 75
+                end: 99
         ty: 19
         span:
-          start: 81
-          end: 113
+          start: 69
+          end: 101
   - id: 13
     file_id: 0
     namespace: 0
@@ -30415,11 +30415,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30453,13 +30449,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Private
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0
@@ -30563,16 +30553,16 @@ export_block:
   keyword:
     file_id: 1
     span:
-      start: 115
-      end: 121
+      start: 103
+      end: 109
   items:
     242:
       Function:
         internal_name:
           inner: 242
           span:
-            start: 124
-            end: 128
+            start: 112
+            end: 116
         external_name: ~
         id: 472
 use_items: []
@@ -30695,43 +30685,48 @@ structs:
     name:
       inner: 241
       span:
-        start: 19
-        end: 22
+        start: 7
+        end: 10
     type_params: []
     attributes: []
     fields:
       - name:
           inner: 216
           span:
-            start: 33
-            end: 36
+            start: 21
+            end: 24
         ty:
           inner: 10
           span:
-            start: 38
-            end: 41
+            start: 26
+            end: 29
         pub_span:
-          start: 29
-          end: 32
+          start: 17
+          end: 20
         accesses:
           - kind: Init
             file_id: 1
             span:
-              start: 94
-              end: 97
+              start: 82
+              end: 85
+          - kind: Init
+            file_id: 1
+            span:
+              start: 90
+              end: 93
       - name:
           inner: 63
           span:
-            start: 51
-            end: 54
+            start: 39
+            end: 42
         ty:
           inner: 10
           span:
-            start: 56
-            end: 59
+            start: 44
+            end: 47
         pub_span:
-          start: 47
-          end: 50
+          start: 35
+          end: 38
         accesses: []
     lookup:
       63: 1
@@ -30739,12 +30734,12 @@ structs:
     accesses:
       - file_id: 1
         span:
-          start: 77
-          end: 80
+          start: 65
+          end: 68
       - file_id: 1
         span:
-          start: 87
-          end: 90
+          start: 75
+          end: 78
 traits:
   - id: 14
     file_id: 0
@@ -35051,12 +35046,12 @@ type_aliases:
           end: 24672
       - file_id: 1
         span:
-          start: 38
-          end: 41
+          start: 26
+          end: 29
       - file_id: 1
         span:
-          start: 56
-          end: 59
+          start: 44
+          end: 47
       - file_id: 0
         span:
           start: 7114

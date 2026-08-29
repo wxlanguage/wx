@@ -1,0 +1,48 @@
+// The sine of an `f64`, ported from Rust's `compiler-builtins` `libm/src/math/sin.rs`, itself a
+// port of FreeBSD's `s_sin.c` (Sun Microsystems' fdlibm).
+//
+// Small |x| goes straight to the `k_sin` kernel; everything else is reduced by `rem_pio2` to
+// `y0 + y1 = x - n*(pi/2)` in [-pi/4, pi/4] and dispatched on `n mod 4`:
+//
+//     n        sin(x)      cos(x)       tan(x)
+//     ------------------------------------------
+//     0          S           C            T
+//     1          C          -S           -1/T
+//     2         -S          -C            T
+//     3         -C           S           -1/T
+//
+// where S, C and T are sin, cos and tan on [-pi/4, +pi/4].
+//
+// Unlike `sinf`, there are no dedicated branches for the first few multiples of pi/2 here —
+// `rem_pio2` already special-cases those internally.
+use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
+
+/// The sine of `x`, with `x` in radians.
+///
+/// `sin(inf)`, `sin(-inf)` and `sin(NaN)` are all NaN.
+pub fn sin(x: f64) -> f64 {
+    // High 32 bits of `x` with the sign cleared — see `rem_pio2` on why this stays a `u64`.
+    local ix = (x.to_bits() >> 32) & 0x7fffffff;
+
+    if ix <= 0x3fe921fb {
+        // |x| ~<= pi/4
+        if ix < 0x3e500000 {
+            // |x| < 2**-26, where sin(x) rounds to x. The original raises the inexact and
+            // underflow flags here; wasm has no floating-point exception flags to raise.
+            return x;
+        };
+        return k_sin(x, 0.0, 0);
+    };
+
+    // sin(Inf or NaN) is NaN
+    if ix >= 0x7ff00000 { return x - x };
+
+    // argument reduction needed
+    local (n, y0, y1) = rem_pio2(x);
+    match n & 3 {
+        0 -> { k_sin(y0, y1, 1) },
+        1 -> { k_cos(y0, y1) },
+        2 -> { -k_sin(y0, y1, 1) },
+        _ -> { -k_cos(y0, y1) }
+    }
+}

@@ -901,7 +901,7 @@ impl<'ast> Builder<'ast, '_> {
 			span: operator.span,
 		};
 
-		let mut left = self.build_expression(ctx, access_ctx.clone(), left)?;
+		let mut left = self.build_expression(ctx, access_ctx, left)?;
 		let mut right = self.build_expression(
 			ctx,
 			AccessContext {

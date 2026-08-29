@@ -173,56 +173,47 @@ impl<'ast> Builder<'ast, '_> {
 
 		if let Type::Struct { struct_index, args } =
 			&self.tir.types[object.ty.as_usize()]
-			&& let Some(field_index) = self.tir.structs[*struct_index as usize]
-				.lookup
-				.get(&member.inner)
-				.copied()
 		{
-			let struct_index = *struct_index as usize;
-			let raw_field_ty =
-				self.tir.structs[struct_index].fields[field_index].ty.inner;
-			let field_ty = if args.is_empty() {
-				raw_field_ty
-			} else {
-				self.substitute_type(raw_field_ty, &args.clone())
-			};
-			self.tir.structs[struct_index].fields[field_index]
-				.accesses
-				.push(FieldAccess {
-					kind: FieldAccessKind::Read,
-					file_id: func_ctx.resolve_context.file_id,
-					span: member.span,
-				});
-			return match object.kind {
-				ExprKind::Load { place } => {
-					let memory = place.memory;
-					let mutable = place.mutable;
-					Ok(Expression {
-						kind: ExprKind::Load {
-							place: Box::new(Place {
-								kind: PlaceKind::Field {
-									object: place,
-									member,
-								},
-								ty: field_ty,
-								memory,
-								mutable,
-								span: expr_span,
-							}),
+			let (struct_index, args) = (*struct_index, args.clone());
+			if let Some(resolved) = self.resolve_struct_field(
+				func_ctx.resolve_context,
+				struct_index,
+				&args,
+				member,
+				FieldAccessKind::for_access(access_ctx.access_kind),
+			) {
+				let field_ty = resolved.ty;
+				return match object.kind {
+					ExprKind::Load { place } => {
+						let memory = place.memory;
+						let mutable = place.mutable;
+						Ok(Expression {
+							kind: ExprKind::Load {
+								place: Box::new(Place {
+									kind: PlaceKind::Field {
+										object: place,
+										member,
+									},
+									ty: field_ty,
+									memory,
+									mutable,
+									span: expr_span,
+								}),
+							},
+							ty: field_ty,
+							span: expr_span,
+						})
+					}
+					_ => Ok(Expression {
+						kind: ExprKind::FieldAccess {
+							object: Box::new(object),
+							field: member,
 						},
 						ty: field_ty,
 						span: expr_span,
-					})
-				}
-				_ => Ok(Expression {
-					kind: ExprKind::FieldAccess {
-						object: Box::new(object),
-						field: member,
-					},
-					ty: field_ty,
-					span: expr_span,
-				}),
-			};
+					}),
+				};
+			}
 		}
 
 		let entry = self.resolve_impl_member(

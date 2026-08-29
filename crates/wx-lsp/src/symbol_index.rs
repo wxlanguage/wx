@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{DefId, StringInterner, TextSpan};
 use wx_compiler::tir::{
-	EnumVariantIndex, ExportItem, FieldAccessKind, ImplTarget, LocalIndex,
+	EnumVariantIndex, ExportItem, ImplTarget, LocalIndex,
 	ModuleDeclarationKind, NamespaceIndex, ScopeIndex, SourceSpan, TIR,
 	TraitImplIndex, TypeParamOwner,
 };
@@ -394,16 +394,16 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				source: SourceSpan::new(struct_.file_id, field.name.span),
 				kind,
 			});
+			// Every kind is a reference to the field — reads, writes,
+			// compound assignments and struct-literal initialisers alike.
+			// This used to filter on `Read | Init`, which matched every
+			// variant that existed at the time; spelling the filter out
+			// again would only be a way to silently drop a future kind.
 			for access in &field.accesses {
-				if matches!(
-					access.kind,
-					FieldAccessKind::Read | FieldAccessKind::Init
-				) {
-					index.references.push(SpanInfo {
-						source: SourceSpan::new(access.file_id, access.span),
-						kind,
-					});
-				}
+				index.references.push(SpanInfo {
+					source: SourceSpan::new(access.file_id, access.span),
+					kind,
+				});
 			}
 		}
 	}

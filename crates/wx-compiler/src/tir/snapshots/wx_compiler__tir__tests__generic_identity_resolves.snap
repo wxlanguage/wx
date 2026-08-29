@@ -7551,51 +7551,51 @@ functions:
     namespace: 1
     parent: ~
     pub_span:
-      start: 12
-      end: 15
+      start: 0
+      end: 3
     type_params:
       - name:
           inner: 57
           span:
-            start: 28
-            end: 29
+            start: 16
+            end: 17
         bounds:
           traits: []
           typeset: ~
         accesses:
           - file_id: 1
             span:
-              start: 34
-              end: 35
+              start: 22
+              end: 23
           - file_id: 1
             span:
-              start: 40
-              end: 41
+              start: 28
+              end: 29
     type_param_parent: ~
     inherited_type_param_count: 0
     signature_index: 203
     name:
       inner: 241
       span:
-        start: 19
-        end: 27
+        start: 7
+        end: 15
     params:
       - mut_span: ~
         name:
           inner: 242
           span:
-            start: 31
-            end: 32
+            start: 19
+            end: 20
         ty:
           inner: 202
           span:
-            start: 34
-            end: 35
+            start: 22
+            end: 23
     result:
       inner: 202
       span:
-        start: 40
-        end: 41
+        start: 28
+        end: 29
     accesses: []
     attributes: []
     body:
@@ -7606,20 +7606,20 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 42
-              end: 51
+              start: 30
+              end: 39
             locals:
               - name:
                   inner: 242
                   span:
-                    start: 31
-                    end: 32
+                    start: 19
+                    end: 20
                 ty: 202
                 mut_span: ~
                 accesses:
                   - span:
-                      start: 48
-                      end: 49
+                      start: 36
+                      end: 37
                     kind: Read
             inferred_type: 202
             expected_type: 202
@@ -7635,12 +7635,12 @@ functions:
                   local_index: 0
               ty: 202
               span:
-                start: 48
-                end: 49
+                start: 36
+                end: 37
         ty: 202
         span:
-          start: 42
-          end: 51
+          start: 30
+          end: 39
   - id: 13
     file_id: 0
     namespace: 0
@@ -30427,11 +30427,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30458,13 +30454,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Public
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0

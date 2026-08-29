@@ -1190,7 +1190,9 @@ impl Backend {
 			})?;
 		// Keyed exactly as the stdlib package's own module paths, so any file
 		// the stdlib grows is servable here without touching this match.
-		match wx_compiler::vfs::stdlib_file(&AbsolutePath::new(filename)) {
+		match wx_compiler::vfs::StdlibFileSource::source(&AbsolutePath::new(
+			filename,
+		)) {
 			Some(source) => Ok(source.to_string()),
 			None => Err(JsonRpcError::invalid_params(format!(
 				"unknown stdlib file: {filename}"

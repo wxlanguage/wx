@@ -1,4 +1,4 @@
-global mut x: f32 = 0;
+global mut x: f32 = 0.0;
 
 fn get() -> f32 {
   x
@@ -6,7 +6,7 @@ fn get() -> f32 {
 
 fn set(value: f32) -> f32 {
   x = value;
-  
+
   x
 }
 

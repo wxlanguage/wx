@@ -1,0 +1,38 @@
+// The cosine of an `f64`, ported from Rust's `compiler-builtins` `libm/src/math/cos.rs`, itself
+// a port of FreeBSD's `s_cos.c` (Sun Microsystems' fdlibm).
+//
+// Small |x| goes straight to the `k_cos` kernel; everything else is reduced by `rem_pio2` to
+// `y0 + y1 = x - n*(pi/2)` in [-pi/4, pi/4] and dispatched on `n mod 4` — see `sin.wx` for the
+// table.
+use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
+
+/// The cosine of `x`, with `x` in radians.
+///
+/// `cos(inf)`, `cos(-inf)` and `cos(NaN)` are all NaN.
+pub fn cos(x: f64) -> f64 {
+    // High 32 bits of `x` with the sign cleared — see `rem_pio2` on why this stays a `u64`.
+    local ix = (x.to_bits() >> 32) & 0x7fffffff;
+
+    if ix <= 0x3fe921fb {
+        // |x| ~<= pi/4
+        if ix < 0x3e46a09e {
+            // |x| < 2**-27 * sqrt(2), where cos(x) rounds to 1. The original guards this with
+            // `if x as i32 == 0` purely to raise the inexact flag for non-zero `x`; the
+            // truncation is zero for every `x` this small, and wasm has no flag to raise.
+            return 1.0;
+        };
+        return k_cos(x, 0.0);
+    };
+
+    // cos(Inf or NaN) is NaN
+    if ix >= 0x7ff00000 { return x - x };
+
+    // argument reduction needed
+    local (n, y0, y1) = rem_pio2(x);
+    match n & 3 {
+        0 -> { k_cos(y0, y1) },
+        1 -> { -k_sin(y0, y1, 1) },
+        2 -> { -k_cos(y0, y1) },
+        _ -> { k_sin(y0, y1, 1) }
+    }
+}

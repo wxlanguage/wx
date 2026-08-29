@@ -1,0 +1,38 @@
+// The cosine kernel on [-pi/4, pi/4], ported from Rust's `compiler-builtins` `libm/src/math/
+// k_cos.rs`, itself a port of FreeBSD's `k_cos.c` (Sun Microsystems' fdlibm).
+//
+// `x` is assumed to be bounded by ~pi/4 in magnitude, and `y` is the tail of `x` (the low-order
+// part the argument reduction couldn't fit into `x`).
+//
+// cos(x) is approximated by a degree-14 polynomial on [0, pi/4]:
+//
+//     cos(x) ~ 1 - x*x/2 + C1*x^4 + ... + C6*x^14
+//
+// with a remez error <= 2^-58. Writing r = C1*x^4 + ... + C6*x^14 and w = 1 - x*x/2, and using
+// cos(x+y) ~ cos(x) - sin(x)*y ~ cos(x) - x*y, the result is formed as
+// w + (tmp + (r - x*y)), where `tmp = (1 - w) - x*x/2` is the tiny part of `1 - x*x/2` that
+// `w` itself couldn't represent — exactly zero in infinite precision, but not in f64.
+// Unlike C, wx has no excess-precision problem here: every intermediate is a real f64.
+
+// 0x3FA55555, 0x5555554C
+const C1: f64 = 4.16666666666666019037e-02;
+// 0xBF56C16C, 0x16C15177
+const C2: f64 = -1.38888888888741095749e-03;
+// 0x3EFA01A0, 0x19CB1590
+const C3: f64 = 2.48015872894767294178e-05;
+// 0xBE927E4F, 0x809C52AD
+const C4: f64 = -2.75573143513906633035e-07;
+// 0x3E21EE9E, 0xBDB4B1C4
+const C5: f64 = 2.08757232129817482790e-09;
+// 0xBDA8FAE9, 0xBE8838D4
+const C6: f64 = -1.13596475577881948265e-11;
+
+pub fn k_cos(x: f64, y: f64) -> f64 {
+    local z = x * x;
+    local w = z * z;
+    local r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6));
+    local hz = 0.5 * z;
+    local w = 1.0 - hz;
+
+    w + (((1.0 - w) - hz) + (z * r - x * y))
+}

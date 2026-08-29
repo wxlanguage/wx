@@ -81,7 +81,7 @@ impl<'ast> Builder<'ast, '_> {
 					HashMap::with_capacity(field_count);
 				let mut tir_fields: Vec<StructField> =
 					Vec::with_capacity(field_count);
-				let mut field_lookup: HashMap<SymbolU32, usize> =
+				let mut field_lookup: HashMap<SymbolU32, FieldIndex> =
 					HashMap::with_capacity(field_count);
 
 				for f in fields.iter() {
@@ -110,7 +110,7 @@ impl<'ast> Builder<'ast, '_> {
 						&field.ty,
 					);
 					seen_fields.insert(sym, field.name.span);
-					let idx = tir_fields.len();
+					let idx = FieldIndex::new(tir_fields.len() as u32);
 					field_lookup.insert(sym, idx);
 					tir_fields.push(StructField {
 						name: field.name,

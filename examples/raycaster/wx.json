@@ -1,4 +1,10 @@
 {
-    "type": "bin",
-    "entry": "main.wx"
+  "type": "bin",
+  "entry": "main.wx",
+  "dependencies": {
+    "math": {
+      "type": "local",
+      "path": "../math"
+    }
+  }
 }

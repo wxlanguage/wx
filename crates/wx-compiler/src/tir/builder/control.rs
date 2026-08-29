@@ -1118,11 +1118,13 @@ impl<'ast> Builder<'ast, '_> {
 
 		for field in fields.iter() {
 			let name = field.inner.inner.name;
-			let Some(field_index) = self.tir.structs[struct_index as usize]
-				.lookup
-				.get(&name.inner)
-				.copied()
-			else {
+			let Some(resolved) = self.resolve_struct_field(
+				ctx.resolve_context,
+				struct_index,
+				&args,
+				name,
+				FieldAccessKind::Read,
+			) else {
 				let struct_name = self
 					.interner
 					.resolve(self.tir.structs[struct_index as usize].name.inner)
@@ -1148,6 +1150,7 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			};
 
+			let field_index = resolved.index.as_usize();
 			if let Some(first_span) = first_mention[field_index] {
 				let field_name =
 					self.interner.resolve(name.inner).unwrap().to_string();
@@ -1162,31 +1165,14 @@ impl<'ast> Builder<'ast, '_> {
 				first_mention[field_index] = Some(name.span);
 			}
 
-			let raw_field_ty = self.tir.structs[struct_index as usize].fields
-				[field_index]
-				.ty
-				.inner;
-			let field_ty = if args.is_empty() {
-				raw_field_ty
-			} else {
-				self.substitute_type(raw_field_ty, &args)
-			};
-			self.tir.structs[struct_index as usize].fields[field_index]
-				.accesses
-				.push(FieldAccess {
-					kind: FieldAccessKind::Read,
-					file_id,
-					span: name.span,
-				});
-
 			path.push(PathStep {
 				aggregate_ty: ty,
-				index: field_index as u32,
+				index: resolved.index.as_u32(),
 			});
 			self.bind_struct_pattern_field(
 				ctx,
 				&field.inner,
-				field_ty,
+				resolved.ty,
 				path,
 				out,
 			);

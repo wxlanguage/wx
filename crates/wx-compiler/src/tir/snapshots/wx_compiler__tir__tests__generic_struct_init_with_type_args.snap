@@ -7564,19 +7564,19 @@ functions:
     name:
       inner: 244
       span:
-        start: 62
-        end: 66
+        start: 50
+        end: 54
     params: []
     result:
       inner: 204
       span:
-        start: 72
-        end: 81
+        start: 60
+        end: 69
     accesses:
       - file_id: 1
         span:
-          start: 136
-          end: 140
+          start: 124
+          end: 128
     attributes: []
     body:
       stack:
@@ -7586,8 +7586,8 @@ functions:
             label: ~
             parent: ~
             span:
-              start: 82
-              end: 126
+              start: 70
+              end: 114
             locals: []
             inferred_type: 204
             expected_type: 204
@@ -7606,23 +7606,23 @@ functions:
                           value: 1
                       ty: 11
                       span:
-                        start: 110
-                        end: 111
+                        start: 98
+                        end: 99
                     - kind:
                         Int:
                           value: 2
                       ty: 11
                       span:
-                        start: 121
-                        end: 122
+                        start: 109
+                        end: 110
               ty: 204
               span:
-                start: 88
-                end: 124
+                start: 76
+                end: 112
         ty: 204
         span:
-          start: 82
-          end: 126
+          start: 70
+          end: 114
   - id: 13
     file_id: 0
     namespace: 0
@@ -30409,11 +30409,7 @@ namespaces:
               const_index: 0
           visibility: Private
     wildcard_imports: []
-    accesses:
-      - file_id: 1
-        span:
-          start: 4
-          end: 7
+    accesses: []
   - parent: ~
     package: 1
     declaration:
@@ -30447,13 +30443,7 @@ namespaces:
             Function:
               func_index: 101
           visibility: Private
-    wildcard_imports:
-      - namespace: 0
-        span:
-          file_id: 1
-          span:
-            start: 4
-            end: 10
+    wildcard_imports: []
     accesses: []
   - parent: 0
     package: 0
@@ -30557,16 +30547,16 @@ export_block:
   keyword:
     file_id: 1
     span:
-      start: 127
-      end: 133
+      start: 115
+      end: 121
   items:
     244:
       Function:
         internal_name:
           inner: 244
           span:
-            start: 136
-            end: 140
+            start: 124
+            end: 128
         external_name: ~
         id: 472
 use_items: []
@@ -30689,78 +30679,78 @@ structs:
     name:
       inner: 241
       span:
-        start: 19
-        end: 23
+        start: 7
+        end: 11
     type_params:
       - name:
           inner: 57
           span:
-            start: 24
-            end: 25
+            start: 12
+            end: 13
         bounds:
           traits: []
           typeset: ~
         accesses:
           - file_id: 1
             span:
-              start: 40
-              end: 41
+              start: 28
+              end: 29
           - file_id: 1
             span:
-              start: 55
-              end: 56
+              start: 43
+              end: 44
     attributes: []
     fields:
       - name:
           inner: 242
           span:
-            start: 33
-            end: 38
+            start: 21
+            end: 26
         ty:
           inner: 203
           span:
-            start: 40
-            end: 41
+            start: 28
+            end: 29
         pub_span:
-          start: 29
-          end: 32
+          start: 17
+          end: 20
         accesses:
           - kind: Init
             file_id: 1
             span:
-              start: 103
-              end: 108
+              start: 91
+              end: 96
       - name:
           inner: 243
           span:
-            start: 47
-            end: 53
+            start: 35
+            end: 41
         ty:
           inner: 203
           span:
-            start: 55
-            end: 56
+            start: 43
+            end: 44
         pub_span:
-          start: 43
-          end: 46
+          start: 31
+          end: 34
         accesses:
           - kind: Init
             file_id: 1
             span:
-              start: 113
-              end: 119
+              start: 101
+              end: 107
     lookup:
       242: 0
       243: 1
     accesses:
       - file_id: 1
         span:
-          start: 72
-          end: 76
+          start: 60
+          end: 64
       - file_id: 1
         span:
-          start: 88
-          end: 92
+          start: 76
+          end: 80
 traits:
   - id: 14
     file_id: 0
@@ -34527,8 +34517,8 @@ type_aliases:
           end: 23461
       - file_id: 1
         span:
-          start: 77
-          end: 80
+          start: 65
+          end: 68
       - file_id: 0
         span:
           start: 7217
@@ -34915,8 +34905,8 @@ type_aliases:
           end: 22882
       - file_id: 1
         span:
-          start: 95
-          end: 98
+          start: 83
+          end: 86
   - id: 5
     file_id: 0
     namespace: 0
