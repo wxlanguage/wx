@@ -16,15 +16,20 @@
 use codespan_reporting::diagnostic::{Diagnostic, Severity};
 use codespan_reporting::term;
 
-use crate::diagnostics::Code;
+use crate::diagnostics::{Code, Diagnostics};
 use crate::vfs::{FileId, Files};
 
-/// A borrowed view over one stage's diagnostics, paired with the [`Files`]
-/// they point into so failures can be rendered with source context.
+/// A view over one stage's diagnostics, paired with the [`Files`] they point
+/// into so failures can be rendered with source context.
 ///
 /// `stage` names the stage in panic messages ("parse", "link", "check"). With
 /// three stages reporting into the same `FileId` space, "expected E1015" is a
 /// good deal less useful than "expected E1015 during check".
+///
+/// Borrows throughout — a stage whose diagnostics are not already in one
+/// place (linker diagnostics live per package, parse diagnostics per module)
+/// gathers them into a `Vec` first and views that. Where the allocation
+/// happens is the caller's business, not this type's.
 pub struct DiagnosticView<'a> {
 	stage: &'static str,
 	items: &'a [Diagnostic<FileId>],
@@ -49,13 +54,12 @@ impl<'a> DiagnosticView<'a> {
 		self.items
 	}
 
-	/// `Bug` counts as an error: it is strictly worse than one, so letting it
-	/// slip past an "expected no errors" assertion would be actively
-	/// misleading.
+	/// Delegates to [`Diagnostics::errors`], so "counts as an error" means
+	/// the same here as it does to `wx check` — `Bug` included, since it is
+	/// strictly worse than an error and slipping one past an "expected no
+	/// errors" assertion would be actively misleading.
 	pub fn errors(&self) -> impl Iterator<Item = &'a Diagnostic<FileId>> {
-		self.items
-			.iter()
-			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
+		self.items.errors()
 	}
 
 	pub fn warnings(&self) -> impl Iterator<Item = &'a Diagnostic<FileId>> {

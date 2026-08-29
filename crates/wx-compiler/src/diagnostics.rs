@@ -10,6 +10,10 @@
 //! `crate::testing`, for one) would otherwise have to take a bare `&str` and
 //! give up the compiler's help in spelling a code correctly.
 
+use codespan_reporting::diagnostic::{Diagnostic, Severity};
+
+use crate::vfs::FileId;
+
 /// A stage's diagnostic code.
 ///
 /// Implemented for every enum produced by [`define_diagnostic_codes`], which
@@ -18,6 +22,37 @@
 /// when both are in scope.
 pub trait Code {
 	fn as_code(&self) -> &'static str;
+}
+
+/// Severity queries over a run of diagnostics.
+///
+/// An extension trait because both `Vec` and `Diagnostic` are foreign types,
+/// so there is nowhere to hang an inherent `impl`. Implemented on the slice,
+/// which covers `Vec<Diagnostic<FileId>>` through deref.
+///
+/// Its whole job is to define "counts as an error" once. That predicate —
+/// `Severity::Error | Severity::Bug` — was written out at five separate
+/// points in `wx-cli` alone, and a sixth in the test assertions; `Bug` being
+/// dropped from any one of them is a silent hole, since a bug diagnostic is
+/// strictly worse than an error and would sail through a check that only
+/// looked for `Error`.
+pub trait Diagnostics {
+	fn errors(&self) -> impl Iterator<Item = &Diagnostic<FileId>>;
+
+	fn error_count(&self) -> usize {
+		self.errors().count()
+	}
+
+	fn has_errors(&self) -> bool {
+		self.errors().next().is_some()
+	}
+}
+
+impl Diagnostics for [Diagnostic<FileId>] {
+	fn errors(&self) -> impl Iterator<Item = &Diagnostic<FileId>> {
+		self.iter()
+			.filter(|d| matches!(d.severity, Severity::Error | Severity::Bug))
+	}
 }
 
 macro_rules! define_diagnostic_codes {

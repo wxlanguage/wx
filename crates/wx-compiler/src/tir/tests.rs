@@ -110,7 +110,7 @@ fn test_stdlib_typechecks_as_root_package() {
 		.packages
 		.iter()
 		.flat_map(|package_graph| {
-			package_graph.linker_diagnostics.iter().chain(
+			package_graph.diagnostics.iter().chain(
 				package_graph
 					.modules
 					.iter()
@@ -6035,7 +6035,7 @@ fn no_errors(case: &TestCase) {
 		..term::Config::default()
 	};
 	for package_ in &case.graph.packages {
-		let package_diagnostics = package_.linker_diagnostics.iter().chain(
+		let package_diagnostics = package_.diagnostics.iter().chain(
 			package_
 				.modules
 				.iter()
