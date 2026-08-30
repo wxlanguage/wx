@@ -249,9 +249,12 @@ impl<'ast> Builder<'ast, '_> {
 				// other, such as `trait A { type X: B where { Y = Self } }`
 				// next to `trait B { type Y: A where { X = Self } }`) would
 				// have an empty `assoc_types` map here, silently dropping the
-				// access instead of recording it. `ensure_signature` is a
-				// no-op if already done or in progress on the call stack.
-				self.ensure_signature(self.tir.traits[trait_index as usize].id);
+				// access instead of recording it. Best-effort, hence the
+				// discarded status: in progress means the trait is already
+				// resolving further up the stack, and the access is recorded
+				// against whatever it has populated by now.
+				let _ = self
+					.ensure_signature(self.tir.traits[trait_index as usize].id);
 				// At most one entry per name — a name is only ever
 				// meaningful once per `where { }` block, whether it's
 				// written twice the same way (`Size = u32, Size = u64`) or

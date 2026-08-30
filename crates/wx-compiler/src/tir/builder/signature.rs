@@ -6,17 +6,27 @@
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
-	/// Resolves the signature of `def_id`. Idempotent; detects cycles via
-	/// `sig_state`.
-	pub(super) fn ensure_signature(&mut self, def_id: ast::DefId) {
+	/// Resolves the signature of `def_id`, and reports whether the result is
+	/// usable. Idempotent; detects cycles via `sig_state`.
+	///
+	/// Must have no early `return` of its own: every path out has to reach
+	/// the unwind at the bottom, or `def_id` is left `InProgress` forever and
+	/// its `sig_stack` frame is never popped — which would make every later
+	/// cycle report name items that finished resolving long ago.
+	pub(super) fn ensure_signature(
+		&mut self,
+		def_id: ast::DefId,
+	) -> SignatureStatus {
 		let node_idx = {
 			let entry = self.sig_state.get_mut(&def_id).unwrap();
 			match entry.state {
-				ComputeState::Done | ComputeState::InProgress => return,
+				ComputeState::Done => return SignatureStatus::Resolved,
+				ComputeState::InProgress => return SignatureStatus::Cycle,
 				ComputeState::Pending => entry.state = ComputeState::InProgress,
 			}
 			entry.node_idx
 		};
+		self.sig_stack.push(def_id);
 		let AstEntry {
 			file_id,
 			namespace,
@@ -643,68 +653,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.resolve_use_item(use_index);
 			}
 			AstNodeRef::Export { item } => {
-				// The block's own `DefId` is only ever the `ast_nodes` /
-				// `sig_state` key that got us here; nothing downstream of
-				// resolution refers to a block by id.
-				let ast::Item::Export {
-					keyword_span,
-					entries,
-					..
-				} = item
-				else {
-					unreachable!()
-				};
-				let keyword = SourceSpan::new(file_id, *keyword_span);
-				let block_package =
-					self.tir.namespaces[namespace as usize].package;
-
-				// A library has no ABI of its own — it is consumed through
-				// `pub`, not through exports. This also catches every block
-				// in a dependency, since a dependency is only ever loaded as
-				// a library, and "you can't export from here" is the useful
-				// thing to say about one: moving the block wouldn't help.
-				if matches!(
-					self.packages[block_package.as_usize()].kind,
-					PackageKind::Library
-				) {
-					self.tir
-						.diagnostics
-						.push(report_library_cannot_export(keyword));
-					return;
-				}
-
-				// The entry file's top level is the only namespace equal to
-				// its package's root, so this one comparison rejects both a
-				// submodule file and an inline `mod { .. }` block.
-				let root_namespace =
-					self.tir.package_namespaces[&self.root_package];
-				if namespace != root_namespace {
-					self.tir
-						.diagnostics
-						.push(report_export_block_not_at_root(keyword));
-					return;
-				}
-
-				// The single `Option` that stores a block's exports is also
-				// what proves no earlier block exists, so the two can't
-				// disagree. Note that every rejection above returns *before*
-				// this point: a misplaced block must not claim the slot, or
-				// the package's real block would be reported as the
-				// duplicate of one that was itself rejected.
-				if let Some(existing) = &self.tir.export_block {
-					self.tir.diagnostics.push(report_duplicate_export_block(
-						existing.keyword,
-						keyword,
-					));
-					return;
-				}
-
-				// `export { .. }` is a top-level item, so the names it lists
-				// resolve against the package's own root namespace and no
-				// wider one.
-				let items =
-					self.build_exports(file_id, root_namespace, entries);
-				self.tir.export_block = Some(ExportBlock { keyword, items });
+				self.signature_export_block(file_id, namespace, item)
 			}
 			AstNodeRef::TraitImplBlock { item } => {
 				self.signature_trait_impl_block(resolve_context, item)
@@ -731,7 +680,76 @@ impl<'ast> Builder<'ast, '_> {
 				),
 		}
 
+		self.sig_stack.pop();
 		self.sig_state.get_mut(&def_id).unwrap().state = ComputeState::Done;
+		SignatureStatus::Resolved
+	}
+
+	/// The `export { .. }` arm of [`Self::ensure_signature`], extracted so its
+	/// three rejections can stay early `return`s without escaping that
+	/// function's unwind.
+	fn signature_export_block(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		item: &'ast ast::Item,
+	) {
+		// The block's own `DefId` is only ever the `ast_nodes` / `sig_state`
+		// key that got us here; nothing downstream of resolution refers to a
+		// block by id.
+		let ast::Item::Export {
+			keyword_span,
+			entries,
+			..
+		} = item
+		else {
+			unreachable!()
+		};
+		let keyword = SourceSpan::new(file_id, *keyword_span);
+		let block_package = self.tir.namespaces[namespace as usize].package;
+
+		// A library has no ABI of its own — it is consumed through `pub`, not
+		// through exports. This also catches every block in a dependency,
+		// since a dependency is only ever loaded as a library, and "you can't
+		// export from here" is the useful thing to say about one: moving the
+		// block wouldn't help.
+		if matches!(
+			self.packages[block_package.as_usize()].kind,
+			PackageKind::Library
+		) {
+			self.tir
+				.diagnostics
+				.push(report_library_cannot_export(keyword));
+			return;
+		}
+
+		// The entry file's top level is the only namespace equal to its
+		// package's root, so this one comparison rejects both a submodule file
+		// and an inline `mod { .. }` block.
+		let root_namespace = self.tir.package_namespaces[&self.root_package];
+		if namespace != root_namespace {
+			self.tir
+				.diagnostics
+				.push(report_export_block_not_at_root(keyword));
+			return;
+		}
+
+		// The single `Option` that stores a block's exports is also what
+		// proves no earlier block exists, so the two can't disagree. Note that
+		// every rejection above returns *before* this point: a misplaced block
+		// must not claim the slot, or the package's real block would be
+		// reported as the duplicate of one that was itself rejected.
+		if let Some(existing) = &self.tir.export_block {
+			self.tir
+				.diagnostics
+				.push(report_duplicate_export_block(existing.keyword, keyword));
+			return;
+		}
+
+		// `export { .. }` is a top-level item, so the names it lists resolve
+		// against the package's own root namespace and no wider one.
+		let items = self.build_exports(file_id, root_namespace, entries);
+		self.tir.export_block = Some(ExportBlock { keyword, items });
 	}
 
 	/// Resolves a signature's params and result. When `scope.self_type` is

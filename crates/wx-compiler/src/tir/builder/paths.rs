@@ -690,7 +690,12 @@ impl<'ast> Builder<'ast, '_> {
 		let mut found: Option<TraitIndex> = None;
 		let mut candidates: Vec<TraitIndex> = Vec::new();
 		for trait_index in bound_trait_indices {
-			self.ensure_signature(self.tir.traits[trait_index as usize].id);
+			// In progress means this trait is what put the bound on the stack
+			// in the first place; `entries` is filled in member by member, so
+			// the scan below runs against whatever is there and a member that
+			// hasn't been reached yet simply isn't a candidate.
+			let _ =
+				self.ensure_signature(self.tir.traits[trait_index as usize].id);
 			if !matches!(
 				self.tir.traits[trait_index as usize]
 					.entries

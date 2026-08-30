@@ -7,9 +7,11 @@ use super::*;
 impl<'ast> Builder<'ast, '_> {
 	/// Resolves the body of `def_id`. Not idempotent — calling twice
 	/// double-counts accesses.
+	///
+	/// Phase 3's driver loop is the only caller, and it runs after Phase 2 has
+	/// forced every `ast_nodes` entry, so the signature is always resolved by
+	/// the time we get here — nothing to demand-pull.
 	pub(super) fn ensure_body(&mut self, def_id: ast::DefId) {
-		self.ensure_signature(def_id);
-
 		let node_idx = self.sig_state.get(&def_id).unwrap().node_idx;
 		let AstEntry {
 			file_id,

@@ -713,8 +713,13 @@ impl<'ast> Builder<'ast, '_> {
 						resolve_context.namespace,
 						(SymbolNamespace::Type, name.inner),
 						SourceSpan::new(resolve_context.file_id, name.span),
-					) {
-					self.ensure_signature(def_id);
+					) && self.ensure_signature(def_id) == SignatureStatus::Cycle
+				{
+					self.report_cyclic_type_dependency(
+						def_id,
+						SourceSpan::new(resolve_context.file_id, name.span),
+					);
+					return TypeIndex::ERROR;
 				}
 				match self
 					.lookup_global_symbol(
@@ -823,8 +828,13 @@ impl<'ast> Builder<'ast, '_> {
 					resolve_context.namespace,
 					(SymbolNamespace::Type, last.ident.inner),
 					SourceSpan::new(resolve_context.file_id, last.ident.span),
-				) {
-				self.ensure_signature(def_id);
+				) && self.ensure_signature(def_id) == SignatureStatus::Cycle
+			{
+				self.report_cyclic_type_dependency(
+					def_id,
+					SourceSpan::new(resolve_context.file_id, last.ident.span),
+				);
+				return TypeIndex::ERROR;
 			}
 			let Some(symbol_kind) = self
 				.lookup_global_symbol(
@@ -1087,8 +1097,11 @@ impl<'ast> Builder<'ast, '_> {
 			// below actually holds — whether `required_trait` declares this
 			// assoc type is a static fact about the trait itself, not about
 			// whether `base_ty` satisfies it, and knowing it lets us recover
-			// the intended type even when the bound check fails.
-			self.ensure_signature(self.tir.traits[required_trait as usize].id);
+			// the intended type even when the bound check fails. Best-effort:
+			// in progress means this trait is the one asking, and `entries`
+			// holds whatever it has declared so far.
+			let _ = self
+				.ensure_signature(self.tir.traits[required_trait as usize].id);
 			let has_member = matches!(
 				self.tir.traits[required_trait as usize]
 					.entries
@@ -1259,7 +1272,8 @@ impl<'ast> Builder<'ast, '_> {
 				// shape instead of collapsing to `TypeIndex::ERROR`, even
 				// though the bound isn't proven. A trait that doesn't
 				// define the member at all has nothing to recover.
-				self.ensure_signature(
+				// Best-effort, same as the `AssocTypeProjection` branch.
+				let _ = self.ensure_signature(
 					self.tir.traits[required_trait as usize].id,
 				);
 				match self.tir.traits[required_trait as usize]

@@ -159,15 +159,39 @@ struct Builder<'ast, 'graph> {
 	ast_nodes: Vec<AstEntry<'ast>>,
 	/// Maps DefId → SigEntry; populated after Phase 1 with exact capacity.
 	sig_state: HashMap<ast::DefId, SigEntry>,
+	/// The items whose signatures are currently being resolved, outermost
+	/// first — exactly the `ComputeState::InProgress` entries of `sig_state`,
+	/// but in call order, which a `HashMap` can't give. Only read to render
+	/// the chain in a cyclic-dependency diagnostic: `sig_state` alone can say
+	/// *that* a cycle exists, never which items form it.
+	sig_stack: Vec<ast::DefId>,
 	/// `None` until Phase 2 finishes; see `Builder::operator_traits`.
 	operator_traits: Option<OperatorTraits>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 enum ComputeState {
 	Pending,
 	InProgress,
 	Done,
+}
+
+/// What [`Builder::ensure_signature`] found. `Cycle` means the item was
+/// already being resolved further up the current call stack, so whatever is
+/// in TIR for it is half-built — forcing it again cannot complete it, and
+/// reading it anyway is how a cycle turns into wrong types rather than a
+/// diagnostic.
+///
+/// Whether that is fatal is the caller's call: an item forcing something it
+/// is about to *read* has to stop, while one forcing a child of its own (a
+/// trait forcing its members, say) can't cycle in any way that matters and
+/// discards this. `#[must_use]` is the point of the enum — it makes every
+/// call site say which of the two it is instead of defaulting to silence.
+#[derive(Clone, Copy, PartialEq)]
+#[must_use]
+enum SignatureStatus {
+	Resolved,
+	Cycle,
 }
 
 enum BoundKind {
@@ -545,6 +569,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		tir,
 		type_index_lookup,
 		sig_state: HashMap::new(),
+		sig_stack: Vec::new(),
 		ast_nodes: Vec::new(),
 		operator_traits: None,
 	};
@@ -675,8 +700,10 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	}
 
 	// Phase 2: demand-resolve signatures in parse order (vec is already ordered).
+	// Nothing is in progress at this level, so the status is always `Resolved`
+	// — a cycle is only ever entered, and reported, further down.
 	for i in 0..builder.ast_nodes.len() {
-		builder.ensure_signature(builder.ast_nodes[i].def_id);
+		let _ = builder.ensure_signature(builder.ast_nodes[i].def_id);
 	}
 
 	builder.operator_traits = Some(builder.resolve_operator_traits());

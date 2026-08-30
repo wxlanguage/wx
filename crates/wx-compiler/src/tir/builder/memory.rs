@@ -631,8 +631,11 @@ impl<'ast> Builder<'ast, '_> {
 				// it now so we intern the same `Type::Memory{ id, kind }` that
 				// every other reference to this memory resolves to, instead of
 				// a stale, differently-kinded duplicate.
+				// A `memory` declaration's own signature resolves from its
+				// size expression alone, which cannot mention a memory, so
+				// this can never re-enter and the status is always `Resolved`.
 				let id = self.tir.memories[0].id;
-				self.ensure_signature(id);
+				let _ = self.ensure_signature(id);
 				Ok(self.intern_type(Type::Memory {
 					id,
 					size: self.tir.memories[0].size.inner,

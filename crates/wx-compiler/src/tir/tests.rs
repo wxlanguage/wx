@@ -5803,6 +5803,106 @@ fn test_struct_three_way_cycle_is_error() {
 }
 
 #[test]
+fn test_cyclic_type_dependency_names_every_item_in_the_chain() {
+	// Which reference closes a cycle is an accident of parse order, so the
+	// span alone doesn't identify the loop. `sig_stack` supplies the rest:
+	// every participant gets a label, and the note spells out the order.
+	let case = TestCase::new(indoc! {"
+        type A = B;
+        type B = C;
+        type C = A;
+        fn f(x: A) -> i32 { 1 }
+    "});
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.expect("expected E1032 for a three-way type alias cycle");
+	assert!(
+		diagnostic
+			.notes
+			.iter()
+			.any(|note| note == "the cycle is `A` -> `B` -> `C` -> `A`"),
+		"expected the full chain in a note, got: {:?}",
+		diagnostic.notes
+	);
+	// One primary label for the reference that closed the loop, plus one
+	// secondary per participant.
+	assert_eq!(
+		diagnostic.labels.len(),
+		4,
+		"expected the closing reference plus one label per item in the cycle"
+	);
+}
+
+#[test]
+fn test_self_referential_alias_cycle_omits_the_chain_note() {
+	// A one-item cycle is already spelled out by its single label — repeating
+	// it as "the cycle is `A` -> `A`" would be noise.
+	let case = TestCase::new(indoc! {"
+        type A = A;
+        fn f(x: A) -> i32 { 1 }
+    "});
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.expect("expected E1032 for a self-referential type alias");
+	assert!(
+		!diagnostic
+			.notes
+			.iter()
+			.any(|note| note.starts_with("the cycle is")),
+		"a single-item cycle should not get a chain note, got: {:?}",
+		diagnostic.notes
+	);
+}
+
+#[test]
+fn test_generic_alias_cycle_is_reported_exactly_once() {
+	// `GenericApplication` forces a pending signature on its own rather than
+	// through `resolve_pending_global_symbol`, so it has to recognise a cycle
+	// itself. Before it did, the error surfaced only because the fallback path
+	// re-resolved the name as a bare path and reported it there instead.
+	let case = TestCase::new(indoc! {"
+        type A<T> = B<T>;
+        type B<T> = A<T>;
+        fn f(x: A<i32>) -> i32 { 1 }
+    "});
+	let cyclic: Vec<_> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.collect();
+	assert_eq!(
+		cyclic.len(),
+		1,
+		"expected exactly one E1032 for the generic alias cycle, got: {:?}",
+		cyclic.iter().map(|d| &d.message).collect::<Vec<_>>()
+	);
+	assert!(
+		cyclic[0]
+			.notes
+			.iter()
+			.any(|note| note == "the cycle is `A` -> `B` -> `A`"),
+		"expected the chain note, got: {:?}",
+		cyclic[0].notes
+	);
+}
+
+#[test]
 fn test_struct_forward_reference_resolves() {
 	// B used as a field type before B is declared — no cycle, no diagnostic.
 	let case = TestCase::new(indoc! {"

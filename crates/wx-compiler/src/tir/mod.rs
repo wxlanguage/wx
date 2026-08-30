@@ -2531,6 +2531,60 @@ impl TIR {
 		}
 	}
 
+	/// Name and defining span of a named item. `None` for a `DefId` that is
+	/// not a registered item, and for a trait impl — the one kind with no
+	/// name of its own, `impl Trait for Type` being known by the two names it
+	/// joins rather than by one of its own.
+	///
+	/// Exhaustive over [`ItemIndex`] deliberately: a new item kind must fail
+	/// to compile here rather than silently go unnamed at every call site.
+	pub fn item_name(&self, id: DefId) -> Option<(SymbolU32, SourceSpan)> {
+		let (name, file_id) = match *self.item_lookup.get(&id)? {
+			ItemIndex::Function(i) => {
+				let item = &self.functions[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Use(i) => {
+				let item = &self.use_items[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Global(i) => {
+				let item = &self.globals[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Memory(i) => {
+				let item = &self.memories[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Struct(i) => {
+				let item = &self.structs[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Const(i) => {
+				let item = &self.constants[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::TypeSet(i) => {
+				let item = &self.typesets[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Trait(i) => {
+				let item = &self.traits[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::Enum(i) => {
+				let item = &self.enums[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::TypeAlias(i) => {
+				let item = &self.type_aliases[i as usize];
+				(item.name, item.file_id)
+			}
+			ItemIndex::TraitImpl(_) => return None,
+		};
+		Some((name.inner, SourceSpan::new(file_id, name.span)))
+	}
+
 	#[inline]
 	pub fn expect_function_index(&self, id: DefId) -> FunctionIndex {
 		match self.item_lookup[&id] {

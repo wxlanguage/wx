@@ -322,8 +322,10 @@ impl<'ast> Builder<'ast, '_> {
 		item: &'ast ast::ImplItem,
 		block_index: u32,
 	) {
-		// Ensure the impl block's target is resolved first.
-		self.ensure_signature(block_id);
+		// Ensure the impl block's target is resolved first. In progress means
+		// the block is what forced this member, and it resolves its target
+		// before doing so — see `signature_inherent_impl_block`.
+		let _ = self.ensure_signature(block_id);
 
 		if let ast::ImplItem::Constant {
 			id,
@@ -402,8 +404,9 @@ impl<'ast> Builder<'ast, '_> {
 		item: &'ast ast::ImplItem,
 		block_index: u32,
 	) {
-		// Ensure the impl block's bounds and target are resolved first.
-		self.ensure_signature(block_id);
+		// Ensure the impl block's bounds and target are resolved first. Same
+		// parent-before-member ordering as `signature_inherent_impl_const`.
+		let _ = self.ensure_signature(block_id);
 
 		let ast::ImplItem::Function {
 			id,
@@ -816,7 +819,9 @@ impl<'ast> Builder<'ast, '_> {
 				| ast::TraitItem::Const { id, .. }
 				| ast::TraitItem::AssociatedType { id, .. } => *id,
 			};
-			self.ensure_signature(member_id);
+			// A member cannot be resolving this trait: `bounds` is already
+			// written above, which is all a member ever needs from us.
+			let _ = self.ensure_signature(member_id);
 		}
 
 		// `Self` here is this trait's own — a supertrait binding like
@@ -1178,7 +1183,10 @@ impl<'ast> Builder<'ast, '_> {
 		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
 	) {
-		self.ensure_signature(parent_id);
+		// Parent before member, as in `signature_inherent_impl_const`: in
+		// progress means the block forced us, having already resolved
+		// everything below reads from it.
+		let _ = self.ensure_signature(parent_id);
 		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,
@@ -1283,7 +1291,10 @@ impl<'ast> Builder<'ast, '_> {
 		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
 	) {
-		self.ensure_signature(parent_id);
+		// Parent before member, as in `signature_inherent_impl_const`: in
+		// progress means the block forced us, having already resolved
+		// everything below reads from it.
+		let _ = self.ensure_signature(parent_id);
 		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,
@@ -1460,7 +1471,10 @@ impl<'ast> Builder<'ast, '_> {
 		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
 	) {
-		self.ensure_signature(parent_id);
+		// Parent before member, as in `signature_inherent_impl_const`: in
+		// progress means the block forced us, having already resolved
+		// everything below reads from it.
+		let _ = self.ensure_signature(parent_id);
 		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,

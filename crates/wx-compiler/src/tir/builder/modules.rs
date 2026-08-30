@@ -730,6 +730,60 @@ impl<'ast> Builder<'ast, '_> {
 		);
 	}
 
+	/// Reports `def_id` being referenced at `span` while its own signature is
+	/// still resolving. `sig_stack` supplies the chain that led here, so the
+	/// report can name every item in the loop rather than only the reference
+	/// that happened to close it — which one that is depends on parse order,
+	/// and says little on its own once the cycle spans more than two items.
+	pub(super) fn report_cyclic_type_dependency(
+		&mut self,
+		def_id: ast::DefId,
+		span: SourceSpan,
+	) {
+		// The loop is the tail of the stack from `def_id`'s own frame on;
+		// frames before it led to the cycle without being part of it.
+		let chain: Vec<ast::DefId> = self
+			.sig_stack
+			.iter()
+			.position(|&id| id == def_id)
+			.map(|start| self.sig_stack[start..].to_vec())
+			.unwrap_or_default();
+
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicTypeDependency.code())
+			.with_message("cyclic type dependency")
+			.with_label(span.primary_label());
+
+		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
+		for frame in chain {
+			let Some((name, name_span)) = self.tir.item_name(frame) else {
+				continue;
+			};
+			let name = self.interner.resolve(name).unwrap();
+			names.push(name);
+			diagnostic = diagnostic.with_label(
+				name_span
+					.secondary_label()
+					.with_message(format!("`{name}` is defined here")),
+			);
+		}
+		// A cycle closes back onto its first item, so that name repeats at the
+		// end. Only worth spelling out once two items are involved — a
+		// self-referential one is already clear from its single label.
+		if names.len() > 1 {
+			let note = format!(
+				"the cycle is `{}` -> `{}`",
+				names.join("` -> `"),
+				names[0]
+			);
+			diagnostic = diagnostic.with_note(note);
+		}
+
+		self.tir.diagnostics.push(diagnostic.with_note(
+			"types cannot have infinite size; consider using a pointer to break the cycle",
+		));
+	}
+
 	/// Looks up `key` via [`Self::lookup_global_symbol`], forcing a `Pending`
 	/// result through `ensure_signature` and re-looking it up. Returns
 	/// `Err(())` (with a cyclic-dependency diagnostic already pushed) if the
@@ -745,19 +799,10 @@ impl<'ast> Builder<'ast, '_> {
 		// than of anything a signature could change.
 		match self.lookup_global_symbol_reporting(namespace, key, span) {
 			Some(SymbolEntry::Pending(def_id)) => {
-				if matches!(
-					self.sig_state.get(&def_id),
-					Some(SigEntry {
-						state: ComputeState::InProgress,
-						..
-					})
-				) {
-					self.tir
-						.diagnostics
-						.push(report_cyclic_type_dependency(span));
+				if self.ensure_signature(def_id) == SignatureStatus::Cycle {
+					self.report_cyclic_type_dependency(def_id, span);
 					return Err(());
 				}
-				self.ensure_signature(def_id);
 				// Still pending after one force is not expected in
 				// practice (see `SymbolEntry`'s docs), but rather than
 				// propagate a phantom result, this folds it to `None` —
@@ -798,19 +843,10 @@ impl<'ast> Builder<'ast, '_> {
 			.copied()
 		{
 			Some(SymbolEntry::Pending(def_id)) => {
-				if matches!(
-					self.sig_state.get(&def_id),
-					Some(SigEntry {
-						state: ComputeState::InProgress,
-						..
-					})
-				) {
-					self.tir
-						.diagnostics
-						.push(report_cyclic_type_dependency(span));
+				if self.ensure_signature(def_id) == SignatureStatus::Cycle {
+					self.report_cyclic_type_dependency(def_id, span);
 					return Err(());
 				}
-				self.ensure_signature(def_id);
 				self.tir.namespaces[target_namespace as usize]
 					.symbols
 					.get(&key)
@@ -1260,7 +1296,10 @@ impl<'ast> Builder<'ast, '_> {
 						self.tir.item_lookup.get(&rival),
 						Some(ItemIndex::Use(_))
 					) {
-						self.ensure_signature(rival);
+						// Status discarded on the strength of the comment
+						// above: a rival holds nothing we want, so it can
+						// never be in progress waiting on us.
+						let _ = self.ensure_signature(rival);
 					}
 
 					match self.direct_scope_lookup(namespace, key) {
@@ -1596,14 +1635,6 @@ pub(super) fn report_missing_import_alias(
 			span.primary_label()
 				.with_message("expected `as <name>` here"),
 		)
-}
-
-fn report_cyclic_type_dependency(span: SourceSpan) -> Diagnostic<FileId> {
-	Diagnostic::error()
-        .with_code(DiagnosticCode::CyclicTypeDependency.code())
-        .with_message("cyclic type dependency")
-        .with_label(span.primary_label())
-        .with_note("types cannot have infinite size; consider using a pointer to break the cycle")
 }
 
 pub(super) struct DuplicateDefinitionDiagnostic<'a> {
