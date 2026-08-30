@@ -1200,13 +1200,19 @@ impl<'a> Builder<'a> {
 				nodes.push(self.text(Text::Semi));
 				self.arena.concat(nodes)
 			}
-			ast::ImplItem::AssocType { name, ty, .. } => {
-				let type_kw = self.text(Text::TypeKw);
-				let name_sym = self.symbol(name.inner);
-				let eq = self.text(Text::EqSp);
-				let ty_id = self.build_type_expression(&ty.inner);
-				let semi = self.text(Text::Semi);
-				self.arena.concat5(type_kw, name_sym, eq, ty_id, semi)
+			ast::ImplItem::AssocType {
+				pub_span, name, ty, ..
+			} => {
+				let mut nodes: Vec<NodeId> = Vec::new();
+				if pub_span.is_some() {
+					nodes.push(self.text(Text::Pub));
+				}
+				nodes.push(self.text(Text::TypeKw));
+				nodes.push(self.symbol(name.inner));
+				nodes.push(self.text(Text::EqSp));
+				nodes.push(self.build_type_expression(&ty.inner));
+				nodes.push(self.text(Text::Semi));
+				self.arena.concat(nodes)
 			}
 		}
 	}

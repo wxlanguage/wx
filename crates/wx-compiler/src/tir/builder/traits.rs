@@ -97,6 +97,17 @@ impl<'ast> Builder<'ast, '_> {
 				trait_sym: SymbolU32,
 				supertrait_sym: SymbolU32,
 			},
+			/// An item the impl provides that its trait does not declare —
+			/// either under no name the trait knows, or under one it declares
+			/// as a different kind of item. `declared` is the trait's own
+			/// entry in the latter case.
+			UnexpectedItem {
+				span: SourceSpan,
+				item_sym: SymbolU32,
+				trait_sym: SymbolU32,
+				provided: ImplEntry,
+				declared: Option<ImplEntry>,
+			},
 		}
 
 		let mut violations: Vec<Violation> = Vec::new();
@@ -122,7 +133,15 @@ impl<'ast> Builder<'ast, '_> {
 					ImplEntry::AssocType(_) => (true, "type"),
 					_ => continue,
 				};
-				if required && !ti.members.contains_key(&sym) {
+				// Kind-aware, not just `contains_key`: an item of the wrong
+				// kind under the required name satisfies nothing, and would
+				// otherwise mask the requirement being unimplemented. It is
+				// reported on its own account below.
+				let provided = ti
+					.members
+					.get(&sym)
+					.is_some_and(|provided| provided.is_same_kind(*entry));
+				if required && !provided {
 					violations.push(Violation::MissingItem {
 						file_id: ti.file_id,
 						span: ti.span,
@@ -131,6 +150,25 @@ impl<'ast> Builder<'ast, '_> {
 						kind,
 					});
 				}
+			}
+
+			// The mirror of the loop above: everything the impl provides has
+			// to be something the trait declares, under the same kind. An
+			// extra item is unreachable rather than harmless — a trait impl's
+			// members are only ever looked up through the trait
+			// (`resolve_impl_member`), so nothing could name it.
+			for (&sym, provided) in &ti.members {
+				let declared = trait_.entries.get(&sym).copied();
+				if declared.is_some_and(|entry| entry.is_same_kind(*provided)) {
+					continue;
+				}
+				violations.push(Violation::UnexpectedItem {
+					span: provided.def_span(&self.tir),
+					item_sym: sym,
+					trait_sym: trait_.name.inner,
+					provided: *provided,
+					declared,
+				});
 			}
 
 			for supertrait in &trait_.bounds.traits {
@@ -213,6 +251,43 @@ impl<'ast> Builder<'ast, '_> {
 								kind, item_name, trait_name
 							))
 							.with_label(Label::primary(file_id, span)),
+					);
+				}
+				Violation::UnexpectedItem {
+					span,
+					item_sym,
+					trait_sym,
+					provided,
+					declared,
+				} => {
+					let item_name = self.interner.resolve(item_sym).unwrap();
+					let trait_name = self.interner.resolve(trait_sym).unwrap();
+					let label = span.primary_label();
+					let diagnostic = match declared {
+						Some(declared) => Diagnostic::error()
+							.with_message(format!(
+								"`{item_name}` is a {} in this impl, but \
+								 trait `{trait_name}` declares it as a {}",
+								provided.noun(),
+								declared.noun(),
+							))
+							.with_label(label.with_message(format!(
+								"expected a {}",
+								declared.noun()
+							))),
+						None => Diagnostic::error()
+							.with_message(format!(
+								"{} `{item_name}` is not a member of trait \
+								 `{trait_name}`",
+								provided.noun(),
+							))
+							.with_label(label.with_message(format!(
+								"not a member of trait `{trait_name}`"
+							))),
+					};
+					self.tir.diagnostics.push(
+						diagnostic
+							.with_code(DiagnosticCode::NotATraitMember.code()),
 					);
 				}
 				Violation::MissingSupertrait {
@@ -309,18 +384,13 @@ impl<'ast> Builder<'ast, '_> {
 				self.tir
 					.item_lookup
 					.insert(*id, ItemIndex::Const(const_index));
-				self.tir.inherent_impls[block_index as usize]
-					.members
-					.insert(name.inner, ImplEntry::AssocConstant(const_index));
-				if let Ok(kind) =
-					ImplTarget::from_type(&self.tir.types[self_type.as_usize()])
-				{
-					self.tir
-						.inherent_impl_dispatch
-						.entry((kind, name.inner))
-						.or_default()
-						.push(block_index);
-				}
+				self.register_inherent_impl_member(
+					resolve_context,
+					block_index,
+					self_type,
+					*name,
+					ImplEntry::AssocConstant(const_index),
+				);
 			}
 		}
 	}
@@ -423,48 +493,137 @@ impl<'ast> Builder<'ast, '_> {
 			ImplEntry::AssocFunction(func_index)
 		};
 
-		// Within-block duplicate check: two methods of the same name
-		// in the SAME block. Collisions against a DIFFERENT block
-		// (e.g. two separate `impl Box<i32> { .. }` blocks, or a
-		// concrete impl colliding with a generic one) are no longer
-		// checked eagerly here — the dispatch bucket below can
-		// legitimately hold several non-conflicting blocks (e.g.
-		// `impl Box<i32>` and `impl Box<bool>` both provide `get`
-		// without conflicting), so only `resolve_impl_member`, which
-		// knows the actual receiver type, can tell whether two
-		// candidates in the same bucket truly conflict.
+		self.register_inherent_impl_member(
+			resolve_context,
+			block_index,
+			self_type,
+			signature.name,
+			entry,
+		);
+	}
+
+	/// Registers `entry` under `name`, unless the block already has a member
+	/// of that name — the first declaration wins and every later one is
+	/// reported, matching [`Self::register_trait_impl_member`].
+	///
+	/// The duplicate is dropped from the dispatch bucket too, not just from
+	/// `members`: a second entry there would make the block a candidate twice
+	/// over for a name it only answers to once.
+	///
+	/// A collision with a *different* block counts too, when the two can ever
+	/// apply to the same receiver — see [`Self::conflicting_inherent_block`].
+	/// `resolve_impl_member` arbitrates between candidates as well, but only
+	/// per call site and only where there is one, so a conflict nobody
+	/// happens to call would otherwise ship unreported.
+	fn register_inherent_impl_member(
+		&mut self,
+		resolve_context: ResolveContext,
+		block_index: u32,
+		self_type: TypeIndex,
+		name: ast::Spanned<SymbolU32>,
+		entry: ImplEntry,
+	) {
+		let target =
+			ImplTarget::from_type(&self.tir.types[self_type.as_usize()]).ok();
+		// The block's own members answer first, and separately from the
+		// bucket below: a block whose target failed to resolve has no
+		// `ImplTarget`, so it never reaches a bucket at all, but its own
+		// members can still collide with each other.
 		let existing = self.tir.inherent_impls[block_index as usize]
 			.members
-			.get(&signature.name.inner)
-			.cloned();
-		if let Some(ImplEntry::Method(prev) | ImplEntry::AssocFunction(prev)) =
-			existing
-		{
-			let prev_func = &self.tir.functions[prev as usize];
-			let first = SourceSpan::new(prev_func.file_id, prev_func.name.span);
-			let second =
-				SourceSpan::new(resolve_context.file_id, signature.name.span);
+			.get(&name.inner)
+			.copied();
+		let existing = existing.or_else(|| {
+			let other = self.conflicting_inherent_block(
+				target?,
+				block_index,
+				self_type,
+				name.inner,
+			)?;
+			self.tir.inherent_impls[other as usize]
+				.members
+				.get(&name.inner)
+				.copied()
+		});
+		if let Some(existing) = existing {
+			let namespace = match existing {
+				ImplEntry::AssocType(_) => SymbolNamespace::Type,
+				_ => SymbolNamespace::Value,
+			};
 			self.tir.diagnostics.push(report_duplicate_definition(
 				DuplicateDefinitionDiagnostic {
-					name: self.interner.resolve(signature.name.inner).unwrap(),
-					namespace: SymbolNamespace::Value,
-					first_definition: first,
-					second_definition: second,
+					name: self.interner.resolve(name.inner).unwrap(),
+					namespace,
+					first_definition: existing.def_span(&self.tir),
+					second_definition: SourceSpan::new(
+						resolve_context.file_id,
+						name.span,
+					),
 				},
 			));
+			return;
 		}
+
 		self.tir.inherent_impls[block_index as usize]
 			.members
-			.insert(signature.name.inner, entry);
-		if let Ok(kind) =
-			ImplTarget::from_type(&self.tir.types[self_type.as_usize()])
-		{
+			.insert(name.inner, entry);
+		if let Some(target) = target {
 			self.tir
 				.inherent_impl_dispatch
-				.entry((kind, signature.name.inner))
+				.entry((target, name.inner))
 				.or_default()
 				.push(block_index);
 		}
+	}
+
+	/// An already-registered block that provides `name` for a receiver
+	/// `block_index` would also claim, if there is one.
+	///
+	/// The dispatch bucket is the candidate set, and a precise one: keyed by
+	/// `(ImplTarget, name)`, it holds every block providing this name for
+	/// this type constructor and nothing else. rustc reaches for the same
+	/// index — grouping impls by shared item identifier — only past
+	/// `ALLOCATING_ALGO_THRESHOLD`, because building it is a cost there;
+	/// here dispatch needs it anyway, so the narrow candidate set is free.
+	///
+	/// `ImplTarget` is coarse, though — `impl Box<i32>` and `impl Box<bool>`
+	/// share a bucket while overlapping on no receiver at all — so the
+	/// targets themselves decide. Overlap is asked as unification in both
+	/// directions: one-sided unification treats only the *left* target's
+	/// params as holes, and `Box<i32>` is concrete as far as `Box<T>` is
+	/// concerned, so trying each as the pattern in turn covers a generic
+	/// block against a concrete one either way round.
+	fn conflicting_inherent_block(
+		&self,
+		target: ImplTarget,
+		block_index: u32,
+		self_type: TypeIndex,
+		name: SymbolU32,
+	) -> Option<u32> {
+		let own_params = self.tir.inherent_impls[block_index as usize]
+			.type_params
+			.len();
+		let bucket = self.tir.inherent_impl_dispatch.get(&(target, name))?;
+		bucket.iter().copied().find(|&other| {
+			if other == block_index {
+				return false;
+			}
+			let other_block = &self.tir.inherent_impls[other as usize];
+			self.tir
+				.unify_impl_target(
+					own_params,
+					self_type,
+					other_block.target.inner,
+				)
+				.is_some() || self
+				.tir
+				.unify_impl_target(
+					other_block.type_params.len(),
+					other_block.target.inner,
+					self_type,
+				)
+				.is_some()
+		})
 	}
 
 	pub(super) fn signature_inherent_impl_block(
@@ -492,7 +651,14 @@ impl<'ast> Builder<'ast, '_> {
 		let target = match ImplTarget::from_type(
 			&self.tir.types[self_type.as_usize()],
 		) {
-			Ok(_) => self_type,
+			Ok(kind) => {
+				self.check_inherent_impl_locality(
+					resolve_context,
+					kind,
+					impl_target.span,
+				);
+				self_type
+			}
 			Err(_) => {
 				self.tir.diagnostics.push(
 					Diagnostic::error()
@@ -512,6 +678,96 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 		self.tir.inherent_impls[block_index as usize].target.inner = target;
+	}
+
+	/// The package that defines the type an inherent `impl` targets.
+	///
+	/// Only a struct or enum has a declaration to read this off; the rest are
+	/// answered by rule.
+	///
+	/// - A memory may only be declared in the root module of a binary
+	///   package. Not enforced everywhere yet, but a memory belonging to
+	///   anything but the root package is not a state the language allows.
+	/// - The primitives are the stdlib's because that is where they are
+	///   declared (`#[intrinsic] pub type i32;` and friends in
+	///   `std/main.wx`). Their alias is transparent, so the target arrives
+	///   here as a bare [`Type::I32`] with no declaration left to consult.
+	/// - Nothing declares a slice or an array — the type system builds them
+	///   from an element type — leaving the owner of every other built-in as
+	///   the only sensible answer.
+	fn impl_target_package(&self, target: ImplTarget) -> PackageId {
+		let namespace = match target {
+			ImplTarget::Struct(struct_index) => {
+				self.tir.structs[struct_index as usize].namespace
+			}
+			ImplTarget::Enum(enum_index) => {
+				self.tir.enums[enum_index as usize].namespace
+			}
+			ImplTarget::Memory(_) => return self.root_package,
+			ImplTarget::Slice
+			| ImplTarget::Array
+			| ImplTarget::U8
+			| ImplTarget::I8
+			| ImplTarget::U16
+			| ImplTarget::I16
+			| ImplTarget::U32
+			| ImplTarget::I32
+			| ImplTarget::U64
+			| ImplTarget::I64
+			| ImplTarget::F32
+			| ImplTarget::F64
+			| ImplTarget::Bool
+			| ImplTarget::Char => return self.stdlib_package,
+		};
+		self.tir.namespaces[namespace as usize].package
+	}
+
+	/// An inherent `impl` may only be written in the package that defines its
+	/// target type.
+	///
+	/// Otherwise two packages could each hang a method of the same name off a
+	/// third package's type, and every call site seeing both would have to
+	/// arbitrate — a conflict neither author can detect, since neither one's
+	/// package holds both halves. Confining inherent members to the defining
+	/// package is what lets [`Self::register_impl_member`] treat a name
+	/// collision as a plain duplicate definition.
+	///
+	/// Trait impls are deliberately untouched: implementing a trait for a
+	/// foreign type is the supported way to extend one, and its coherence
+	/// question is already answered by [`Self::register_trait_impl`].
+	fn check_inherent_impl_locality(
+		&mut self,
+		resolve_context: ResolveContext,
+		target: ImplTarget,
+		span: ast::TextSpan,
+	) {
+		let target_package = self.impl_target_package(target);
+		let declaring_package =
+			self.tir.namespaces[resolve_context.namespace as usize].package;
+		if target_package == declaring_package {
+			return;
+		}
+		self.tir.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::ForeignImplTarget.code())
+				.with_message(
+					"cannot define inherent `impl` for a type outside of the \
+					 package where the type is defined",
+				)
+				.with_label(
+					SourceSpan::new(resolve_context.file_id, span)
+						.primary_label()
+						.with_message(
+							"impl for type defined outside of package",
+						),
+				)
+				.with_note(
+					"consider defining a trait and implementing it for the \
+					 type, or wrapping it in a struct of your own and \
+					 implementing that instead"
+						.to_string(),
+				),
+		);
 	}
 
 	pub(super) fn signature_trait(
@@ -876,6 +1132,46 @@ impl<'ast> Builder<'ast, '_> {
 		// inherent impls only.
 	}
 
+	/// Registers `entry` under `name`, unless the impl already has a member of
+	/// that name — the first declaration wins and every later one is reported,
+	/// rather than the last quietly taking the name over. Which one survives
+	/// is deliberately not decided by what the trait declares: an item of the
+	/// wrong kind no longer masks anything, since `check_trait_conformance`
+	/// compares kinds rather than just names.
+	fn register_trait_impl_member(
+		&mut self,
+		resolve_context: ResolveContext,
+		trait_impl_index: TraitImplIndex,
+		name: ast::Spanned<SymbolU32>,
+		entry: ImplEntry,
+	) {
+		let existing = self.tir.trait_impls[trait_impl_index as usize]
+			.members
+			.get(&name.inner)
+			.copied();
+		if let Some(existing) = existing {
+			let namespace = match existing {
+				ImplEntry::AssocType(_) => SymbolNamespace::Type,
+				_ => SymbolNamespace::Value,
+			};
+			self.tir.diagnostics.push(report_duplicate_definition(
+				DuplicateDefinitionDiagnostic {
+					name: self.interner.resolve(name.inner).unwrap(),
+					namespace,
+					first_definition: existing.def_span(&self.tir),
+					second_definition: SourceSpan::new(
+						resolve_context.file_id,
+						name.span,
+					),
+				},
+			));
+			return;
+		}
+		self.tir.trait_impls[trait_impl_index as usize]
+			.members
+			.insert(name.inner, entry);
+	}
+
 	pub(super) fn signature_trait_impl_function(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -909,7 +1205,7 @@ impl<'ast> Builder<'ast, '_> {
 				id: *id,
 				file_id: resolve_context.file_id,
 				namespace: resolve_context.namespace,
-				parent: Some(ItemParent::Impl(self_type)),
+				parent: Some(ItemParent::TraitImpl(trait_impl_index)),
 				body: None,
 				// Own (method-level) type params only — impl-level
 				// params are inherited via type_param_parent, same
@@ -972,9 +1268,12 @@ impl<'ast> Builder<'ast, '_> {
 			} else {
 				ImplEntry::AssocFunction(func_index)
 			};
-			self.tir.trait_impls[trait_impl_index as usize]
-				.members
-				.insert(signature.name.inner, entry);
+			self.register_trait_impl_member(
+				resolve_context,
+				trait_impl_index,
+				signature.name,
+				entry,
+			);
 		}
 	}
 
@@ -1034,7 +1333,7 @@ impl<'ast> Builder<'ast, '_> {
 					id: *id,
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
-					parent: Some(ItemParent::Impl(self_type)),
+					parent: Some(ItemParent::TraitImpl(trait_impl_index)),
 					pub_span: None,
 					name: *name,
 					ty: ast::Spanned {
@@ -1050,9 +1349,12 @@ impl<'ast> Builder<'ast, '_> {
 					.item_lookup
 					.insert(*id, ItemIndex::Const(const_index));
 				let entry = ImplEntry::AssocConstant(const_index);
-				self.tir.trait_impls[trait_impl_index as usize]
-					.members
-					.insert(name.inner, entry);
+				self.register_trait_impl_member(
+					resolve_context,
+					trait_impl_index,
+					*name,
+					entry,
+				);
 			}
 		}
 	}
@@ -1173,6 +1475,7 @@ impl<'ast> Builder<'ast, '_> {
 			name,
 			ty,
 			attributes,
+			..
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
@@ -1196,9 +1499,12 @@ impl<'ast> Builder<'ast, '_> {
 				attributes,
 			});
 			let entry = ImplEntry::AssocType(assoc_type_index);
-			self.tir.trait_impls[trait_impl_index as usize]
-				.members
-				.insert(name.inner, entry);
+			self.register_trait_impl_member(
+				resolve_context,
+				trait_impl_index,
+				*name,
+				entry,
+			);
 			if let Some(at) = self.tir.traits[trait_index as usize]
 				.assoc_types
 				.get_mut(&name.inner)

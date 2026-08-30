@@ -1,26 +1,9 @@
-impl f64 {
-  /// Archimedes' constant (π)
-  pub const PI: f64 = 3.14159265358979323846264338327950288;
-
-  /// π/2
-  pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
-}
-
-impl f32 {
-  /// Archimedes' constant (π)
-  pub const PI: f32 = 3.14159265358979323846264338327950288;
-
-  /// π/2
-  pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
-}
-
 mod k_cosf;
 mod k_sinf;
 mod scalbn;
 mod rem_pio2f;
 mod sinf;
 mod cosf;
-
 mod k_cos;
 mod k_sin;
 mod rem_pio2;
@@ -46,6 +29,12 @@ impl Float for f32 {
   fn cos(self) -> Self {
     cosf(self)
   }
+
+  /// Archimedes' constant (π)
+  pub const PI: f32 = 3.14159265358979323846264338327950288;
+
+  /// π/2
+  pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
 }
 
 impl Float for f64 {
@@ -56,4 +45,10 @@ impl Float for f64 {
   fn cos(self) -> Self {
     cos(self)
   }
+
+  /// Archimedes' constant (π)
+  pub const PI: f64 = 3.14159265358979323846264338327950288;
+
+  /// π/2
+  pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
 }

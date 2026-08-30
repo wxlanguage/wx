@@ -90,7 +90,6 @@ fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
     ptr as heap::*u8
 }
 
-// ── framebuffer ────────────────────────────────────────────────────────────
 global mut fb_ptr: heap::*u8 = ptr::null_mut();
 
 pub fn framebuffer_ptr() -> i32 {
@@ -107,12 +106,10 @@ fn put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
     ptr::add_mut(p, 3).* = 255;
 }
 
-// ── player state ─────────────────────────────────────────────────────────────
 global mut player_x: f64 = 3.5;
 global mut player_y: f64 = 3.5;
 global mut player_angle: f64 = 0.0;
 
-// ── raycasting ───────────────────────────────────────────────────────────────
 struct RayHit {
     dist: f64,
     side: i32,
@@ -123,12 +120,12 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     local dir_y = angle.sin();
 
     local mut map_x = i32_trunc_f64(f64_floor(ox));
-    local mut map_y = i32_trunc_f64(f64_floor(oy));
+    local mut map_y = i32_trunc_f64(oy.floor());
 
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
-    if dir_x != 0.0 { delta_dist_x = f64_abs(1.0 / dir_x) }
-    if dir_y != 0.0 { delta_dist_y = f64_abs(1.0 / dir_y) }
+    if dir_x != 0.0 { delta_dist_x = (1.0 / dir_x).abs() }
+    if dir_y != 0.0 { delta_dist_y = (1.0 / dir_y).abs() }
 
     local mut step_x: i32 = 0;
     local mut step_y: i32 = 0;
@@ -190,7 +187,7 @@ pub fn render() {
 
         local mut line_height = SCREEN_H;
         if corrected > 0.0001 {
-            line_height = i32_trunc_f64(f64_convert_i32(SCREEN_H) / corrected);
+            line_height = (f64_convert_i32(SCREEN_H) / corrected).to_i32();
         };
 
         local mut draw_start = SCREEN_H / 2 - line_height / 2;

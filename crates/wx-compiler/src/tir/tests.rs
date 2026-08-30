@@ -55,6 +55,38 @@ impl TestCase {
 		TestCase { graph, tir }
 	}
 
+	/// A binary root package that depends on one library, which it names
+	/// `dep`. The only way to reach a rule that spans a package boundary.
+	fn new_with_dependency(source: &str, dependency: &str) -> Self {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
+		let dependency_path = vfs::AbsolutePath::new("/dep/lib.wx");
+		let dependency_id = builder
+			.load_package(
+				vfs::PackageKind::Library,
+				dependency_path.clone(),
+				&vfs::VirtualFileSource::new(HashMap::from([(
+					dependency_path,
+					dependency.to_string(),
+				)])),
+			)
+			.unwrap();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
+					"main.wx".to_string(),
+					source.to_string(),
+				)])),
+			)
+			.unwrap();
+		let name = builder.interner.get_or_intern("dep");
+		builder.add_dependency(root_id, name, dependency_id);
+		let mut graph = builder.build(root_id);
+		let tir = TIR::build(&mut graph);
+		TestCase { graph, tir }
+	}
+
 	fn new_multi_file(
 		entry_path: &str,
 		source: &str,
@@ -3506,19 +3538,20 @@ fn test_stdlib_method_callable() {
 #[test]
 fn test_impl_members_registered() {
 	let case = TestCase::new(indoc! {"
-        impl i32 {
-            pub fn impl_members_registered_test_method(self) -> i32 {
-                if self < 0 { -self } else { self }
+        struct Signed { value: i32 }
+
+        impl Signed {
+            pub fn magnitude(self) -> i32 {
+                if self.value < 0 { -self.value } else { self.value }
             }
 
-            pub fn impl_members_registered_test_assoc_fn(b: bool) -> i32 {
+            pub fn from_flag(b: bool) -> i32 {
                 if b { 1 } else { 0 }
             }
         }
 
         fn use_them(x: i32, b: bool) -> i32 {
-            x.impl_members_registered_test_method()
-                + i32::impl_members_registered_test_assoc_fn(b)
+            Signed::{ value: x }.magnitude() + Signed::from_flag(b)
         }
 
         export { use_them }
@@ -3536,25 +3569,22 @@ fn test_impl_members_registered() {
 	let method_sym = case
 		.graph
 		.interner
-		.get("impl_members_registered_test_method")
+		.get("magnitude")
 		.expect("symbol not interned");
 	let assoc_fn_sym = case
 		.graph
 		.interner
-		.get("impl_members_registered_test_assoc_fn")
+		.get("from_flag")
 		.expect("symbol not interned");
 
-	// `impl_block_list` also holds stdlib's own inherent impls for `i32`, so
-	// find our block by membership rather than assuming it's the only one.
+	// `inherent_impls` holds every one of the stdlib's blocks too, so find
+	// this one by membership rather than assuming it's the only one.
 	let members = &case
 		.tir
 		.inherent_impls
 		.iter()
-		.find(|b| {
-			b.target.inner == TypeIndex::I32
-				&& b.members.contains_key(&method_sym)
-		})
-		.expect("impl_block_list should have our i32 impl block")
+		.find(|b| b.members.contains_key(&method_sym))
+		.expect("inherent_impls should have the `Signed` block")
 		.members;
 
 	// method takes `self` → Method; assoc fn has no receiver → AssociatedFn
@@ -4649,18 +4679,21 @@ fn test_generic_inherent_impl_repeated_type_param_rejects_inconsistent_receiver(
 }
 
 #[test]
-fn test_generic_inherent_impl_repeated_type_param_false_match_causes_spurious_ambiguity()
- {
-	// A sharper variant of the test above: both impl blocks provide `foo`,
-	// so they share the `(Struct(Pair), "foo")` dispatch bucket. `impl<T>
-	// Pair<T, T>` is a bogus candidate for `Pair<i32, bool>` (no consistent
-	// `T`), while `impl<A, B> Pair<A, B>` is the one genuinely-applicable
-	// inherent impl. Before `unify_impl_target` checked `infer_type_args`'s
-	// consistency result, the bogus block would still land in
-	// `inherent_candidates` alongside the real one, producing a spurious
-	// "defined multiple times" conflict between two blocks that don't
-	// actually both apply — this regression-tests that it's rejected
-	// before ever becoming a candidate.
+fn test_overlapping_generic_inherent_impls_cannot_share_a_member_name() {
+	// `impl<T> Pair<T, T>` is a strict subset of `impl<A, B> Pair<A, B>` —
+	// `Pair<i32, i32>` is claimed by both — so a `foo` in each is a conflict
+	// between the *declarations*, whatever any particular call site does with
+	// it. Matches rustc, which rejects this exact pair with `E0592:
+	// duplicate definitions with name `foo`` (verified against rustc
+	// directly).
+	//
+	// This used to be accepted because the conflict was only ever arbitrated
+	// per call site, and here the receiver (`Pair<i32, bool>`) has no
+	// consistent `T`, so only one block applied. What that really tested —
+	// `unify_impl_target` rejecting `Pair<T, T>` for `Pair<i32, bool>`
+	// instead of letting it become a bogus candidate — is covered on its own
+	// by `test_generic_inherent_impl_repeated_type_param_rejects_inconsistent_receiver`
+	// above, which needs no second block to say it.
 	let case = TestCase::new(indoc! {"
         struct Pair<A, B> { a: A, b: B }
 
@@ -4679,19 +4712,90 @@ fn test_generic_inherent_impl_repeated_type_param_false_match_causes_spurious_am
         export { use_it }
     "});
 	assert!(
-		!case
-			.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.severity == Severity::Error),
-		"expected `foo` to resolve cleanly via `impl<A, B> Pair<A, B>` \
-		 (the only impl that actually applies to `Pair<i32, bool>`), got: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.filter(|d| d.severity == Severity::Error)
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"expected the two overlapping blocks to conflict on `foo`, got: {:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_disjoint_generic_inherent_impls_may_share_a_member_name() {
+	// The counterpart: `Box<i32>` and `Box<bool>` share the `(Struct(Box),
+	// "get")` dispatch bucket but overlap on no receiver at all, so both may
+	// provide `get`. This is why the check unifies the targets rather than
+	// rejecting on the shared bucket alone.
+	let case = TestCase::new(indoc! {"
+        struct Box<T> { v: T }
+
+        impl Box<i32> {
+            pub fn get(self) -> i32 { self.v }
+        }
+
+        impl Box<bool> {
+            pub fn get(self) -> bool { self.v }
+        }
+
+        fn use_it(a: Box<i32>, b: Box<bool>) -> i32 {
+            if b.get() { a.get() } else { 0 }
+        }
+
+        export { use_it }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_inherent_impls_in_separate_blocks_conflict_without_a_call_site() {
+	// The conflict is in the declarations, so it is reported whether or not
+	// anything calls `turns`. Nothing here does — previously that meant
+	// nothing checked, since only `resolve_impl_member` ever compared
+	// candidates and it runs per call site.
+	let case = TestCase::new(indoc! {"
+        struct Deg { value: i32 }
+
+        impl Deg {
+            pub fn turns(self) -> i32 { self.value }
+        }
+
+        impl Deg {
+            pub fn turns(self) -> bool { true }
+        }
+
+        fn use_it(d: Deg) -> i32 { d.value }
+
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_generic_inherent_impl_blanket_conflicts_with_a_concrete_block() {
+	// `impl<T> Box<T>` claims `Box<i32>` too. Unification is tried in both
+	// directions precisely for this: only the generic side has holes, so
+	// whichever block registers second has to be able to act as the pattern.
+	let case = TestCase::new(indoc! {"
+        struct Box<T> { v: T }
+
+        impl<T> Box<T> {
+            pub fn get(self) -> T { self.v }
+        }
+
+        impl Box<i32> {
+            pub fn get(self) -> i32 { self.v }
+        }
+
+        fn use_it(a: Box<i32>) -> i32 { a.v }
+
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"{:?}",
+		error_messages(&case.tir)
 	);
 }
 
@@ -5192,6 +5296,228 @@ fn test_trait_conformance_missing_fn() {
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
 			== Some(DiagnosticCode::MissingTraitImplItem.code())),
 		"expected E1033 for missing trait item, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| (d.code.as_deref(), &d.message))
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_trait_impl_item_not_declared_by_trait() {
+	// The mirror of the missing-item check: an impl may only provide what its
+	// trait declares. Neither extra item is reachable — a trait impl's members
+	// are looked up through the trait — so both are errors, not silent
+	// additions to the type.
+	let case = TestCase::new(indoc! {"
+        trait Drawable {
+            fn draw(self);
+        }
+
+        struct Point { x: i32 }
+
+        impl Drawable for Point {
+            fn draw(self) {}
+
+            fn hide(self) {}
+
+            const SCALE: i32 = 2;
+        }
+    "});
+	assert_eq!(
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(|d| d.code.as_deref()
+				== Some(DiagnosticCode::NotATraitMember.code()))
+			.count(),
+		2,
+		"expected `hide` and `SCALE` to be rejected: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| (d.code.as_deref(), &d.message))
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_trait_impl_duplicate_member_keeps_the_first() {
+	// The second `turns` is reported rather than silently taking the name
+	// over. `use_it` type-checks against the first one's `i32`, which is what
+	// proves the survivor: had the later `bool` won, the call would not.
+	let case = TestCase::new(indoc! {"
+        trait Angle {
+            fn turns(self) -> i32;
+        }
+
+        struct Deg { value: i32 }
+
+        impl Angle for Deg {
+            fn turns(self) -> i32 { self.value }
+
+            fn turns(self) -> bool { true }
+        }
+
+        fn use_it(d: Deg) -> i32 { d.turns() }
+
+        export { use_it }
+    "});
+	let errors = error_messages(&case.tir);
+	assert_eq!(
+		errors.len(),
+		1,
+		"the duplicate alone should be reported: {errors:#?}"
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
+		"{errors:#?}"
+	);
+}
+
+#[test]
+fn test_inherent_impl_duplicate_member_keeps_the_first() {
+	// Same first-wins rule as the trait impl case. `use_it` type-checks
+	// against the first `turns`'s `i32`, which is what proves the survivor.
+	// The duplicate const was previously not checked at all — only methods
+	// were — so it stands alongside as its own case.
+	let case = TestCase::new(indoc! {"
+        struct Deg { value: i32 }
+
+        impl Deg {
+            pub fn turns(self) -> i32 { self.value }
+
+            pub fn turns(self) -> bool { true }
+
+            pub const SCALE: i32 = 1;
+
+            pub const SCALE: bool = true;
+        }
+
+        fn use_it(d: Deg) -> i32 { d.turns() }
+
+        export { use_it }
+    "});
+	let errors = error_messages(&case.tir);
+	assert_eq!(
+		errors.len(),
+		2,
+		"one per duplicated name, and nothing at the call site: {errors:#?}"
+	);
+	assert!(
+		errors
+			.iter()
+			.all(|message| message.contains("defined multiple times")),
+		"{errors:#?}"
+	);
+}
+
+/// A wrong-kind item must not stand in for the requirement it shadows the
+/// name of — the missing-item check compares kinds, not just names, so both
+/// halves of the mistake are reported.
+#[test]
+fn test_trait_impl_item_of_the_wrong_kind_does_not_satisfy_the_requirement() {
+	let case = TestCase::new(indoc! {"
+        trait Angle {
+            fn turns(self) -> i32;
+        }
+
+        struct Deg { value: i32 }
+
+        impl Angle for Deg {
+            const turns: i32 = 0;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::MissingTraitImplItem),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_trait_impl_item_of_the_wrong_kind() {
+	// The name is declared, but as a function — providing a const under it
+	// satisfies nothing.
+	let case = TestCase::new(indoc! {"
+        trait Drawable {
+            fn draw(self);
+        }
+
+        struct Point { x: i32 }
+
+        impl Drawable for Point {
+            const draw: i32 = 1;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
+		"{:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| (d.code.as_deref(), &d.message))
+			.collect::<Vec<_>>()
+	);
+}
+
+/// A method or an associated function differ only in whether a receiver is
+/// declared, which is a question about a signature — not about whether the
+/// impl is providing the member the trait asked for.
+#[test]
+fn test_trait_impl_may_drop_the_receiver_without_a_membership_error() {
+	let case = TestCase::new(indoc! {"
+        trait Drawable {
+            fn draw(self);
+        }
+
+        struct Point { x: i32 }
+
+        impl Drawable for Point {
+            fn draw() {}
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
+		"{:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| (d.code.as_deref(), &d.message))
+			.collect::<Vec<_>>()
+	);
+}
+
+/// Satisfying a trait requirement is itself the "use" — the same exemption a
+/// trait impl's methods already had, which a const could not read off its
+/// `ItemParent` while that named the target type rather than the impl.
+#[test]
+fn test_trait_impl_const_is_not_reported_unused() {
+	let case = TestCase::new(indoc! {"
+        trait Scaled {
+            const SCALE: i32;
+        }
+
+        struct Point { x: i32 }
+
+        impl Scaled for Point {
+            const SCALE: i32 = 2;
+        }
+    "});
+	assert!(
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::UnusedItem.code())),
+		"{:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -7828,16 +8154,18 @@ fn test_deref_type_mismatch_on_store_is_error() {
 
 #[test]
 fn test_path_type_associated_fn_ufcs() {
-	// `i32::abs(x)` — 2-segment path where the first segment is a type and the
-	// second is an associated function; all params (including self) are explicit.
+	// `Signed::abs(s)` — 2-segment path where the first segment is a type and
+	// the second is an associated function; all params (including self) are
+	// explicit.
 	let case = TestCase::new(indoc! {"
-        impl i32 {
+        struct Signed { value: i32 }
+        impl Signed {
             pub fn abs(self) -> i32 {
-                if self < 0 { -self } else { self }
+                if self.value < 0 { -self.value } else { self.value }
             }
         }
         fn f(x: i32) -> i32 {
-            i32::abs(x)
+            Signed::abs(Signed::{ value: x })
         }
         export { f }
     "});
@@ -9995,18 +10323,47 @@ fn test_typeset_bounded_type_param_supports_compound_assignment() {
 }
 
 #[test]
-fn test_generic_slice_first_with_pointer_size_index() {
-	// `self[0]` inside `impl<M: Memory, T> M::&[T]` — the literal `0` must be
-	// coerced to `M::Size`, whose typeset bound is `PointerSize { u32, u64 }`.
-	// The intersection range for PointerSize is [0, u32::MAX], so `0` is valid.
+fn test_generic_slice_index_coerces_to_pointer_size() {
+	// Indexing `M::&[T]` needs an `M::Size`, whose typeset bound is
+	// `PointerSize { u32, u64 }`. An untyped literal must coerce to it, and
+	// the range it's checked against is the *intersection* of the typeset's
+	// members — [0, u32::MAX] — not `u64`'s. So both ends of that range are
+	// valid, and so is an index already of type `M::Size`.
 	let case = TestCase::new(indoc! {"
-        impl<M: Memory, T> M::&[T] {
-            pub fn first(self) -> T { self[0] }
-        }
-        export { }
+        fn _low<M: Memory, T>(s: M::&[T]) -> T { s[0] }
+        fn _high<M: Memory, T>(s: M::&[T]) -> T { s[4294967295] }
+        fn _exact<M: Memory, T>(s: M::&[T], i: M::Size) -> T { s[i] }
     "});
 	assert!(
 		case.tir.diagnostics.is_empty(),
+		"{:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_generic_slice_index_rejects_out_of_range_literal() {
+	// One past the intersection range's top. Fits `u64`, so it is only
+	// rejectable by checking the typeset as a whole.
+	let case = TestCase::new(indoc! {"
+        fn _f<M: Memory, T>(s: M::&[T]) -> T { s[4294967296] }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TypesetBoundViolation),
+		"{:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_generic_slice_index_rejects_negative_literal() {
+	// Every `PointerSize` member is unsigned, so there is no member for a
+	// negative literal to coerce to at all.
+	let case = TestCase::new(indoc! {"
+        fn _f<M: Memory, T>(s: M::&[T]) -> T { s[-1] }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::UnableToCoerce),
 		"{:?}",
 		case.tir.diagnostics
 	);
@@ -12416,48 +12773,30 @@ fn test_type_param_ambiguous_bound_methods_reports_error() {
 }
 
 #[test]
-fn test_generic_inherent_impl_on_slice_beats_trait_no_ambiguity() {
+fn test_stdlib_inherent_slice_method_beats_trait_no_ambiguity() {
 	// Same inherent-always-wins rule as the struct case, but on
-	// `ImplTarget::Slice` — confirms the fix generalizes past `Struct`. If
-	// this incorrectly picked `Counter::count` (-> bool) instead of the
-	// inherent `M::&[T]::count` (-> u32), `use_it`'s return type would
-	// fail to check. Uses `count`, not `len`, to avoid colliding with the
-	// stdlib's own `impl<M: Memory, T> M::&[T] { fn len(...) }`.
+	// `ImplTarget::Slice`. The inherent side is the stdlib's own
+	// `impl<Mem: Memory, T> Mem::&[T] { fn len(self) -> Mem::Size }`, which
+	// is now the only inherent impl a slice can have. `Counter::len` returns
+	// `bool`, so picking it would make `use_it`'s return type fail to check.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         trait Counter {
-            fn count(self) -> bool;
-        }
-
-        impl<M: Memory, T> M::&[T] {
-            pub fn count(self) -> u32 { 0 }
+            fn len(self) -> bool;
         }
 
         impl Counter for heap::&[i32] {
-            fn count(self) -> bool { true }
+            fn len(self) -> bool { true }
         }
 
         fn use_it(s: heap::&[i32]) -> u32 {
-            s.count()
+            s.len()
         }
 
         export { use_it }
     "});
-	assert!(
-		!case
-			.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.severity == Severity::Error),
-		"unexpected errors: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.filter(|d| d.severity == Severity::Error)
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
-	);
+	assert_no_errors(&case);
 }
 
 #[test]
@@ -14199,4 +14538,110 @@ fn test_struct_destructuring_across_modules() {
 		&[("src/geom.wx", "pub struct Point { pub x: i32, pub y: i32 }")],
 	);
 	assert_no_errors(&case);
+}
+
+// ── inherent impl locality ─────────────────────────────────────────────────
+
+#[test]
+fn test_inherent_impl_on_type_from_another_package_rejected() {
+	let case = TestCase::new_with_dependency(
+		indoc! {"
+            impl dep::Point {
+                pub fn sum(self) -> i32 { self.x + self.y }
+            }
+        "},
+		"pub struct Point { pub x: i32, pub y: i32 }",
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::ForeignImplTarget),
+		"{:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_trait_impl_on_type_from_another_package_allowed() {
+	// The escape hatch the diagnostic points at: a trait impl may target a
+	// foreign type, and stays governed by its own one-impl-per-type rule.
+	let case = TestCase::new_with_dependency(
+		indoc! {"
+            trait Sum {
+                fn sum(self) -> i32;
+            }
+
+            impl Sum for dep::Point {
+                fn sum(self) -> i32 { self.x + self.y }
+            }
+        "},
+		"pub struct Point { pub x: i32, pub y: i32 }",
+	);
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_inherent_impl_from_another_module_of_the_same_package_allowed() {
+	// The boundary is the package, not the module: `Point` is declared in a
+	// submodule and implemented from the root, both inside the root package.
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod geom;
+
+            impl geom::Point {
+                pub fn sum(self) -> i32 { self.x + self.y }
+            }
+        "},
+		&[("src/geom.wx", "pub struct Point { pub x: i32, pub y: i32 }")],
+	);
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_inherent_impl_on_primitive_rejected_outside_stdlib() {
+	// `i32` is declared by `std/main.wx` (`#[intrinsic] pub type i32;`), so
+	// its inherent impls are the stdlib's alone.
+	let case = TestCase::new(indoc! {"
+        impl i32 {
+            pub fn double(self) -> i32 { self * 2 }
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::ForeignImplTarget),
+		"{:?}",
+		case.tir.diagnostics
+	);
+}
+
+#[test]
+fn test_inherent_impl_on_slice_rejected_outside_stdlib() {
+	// Nothing declares a slice type, so no package can claim to define one —
+	// which leaves the stdlib, where every other built-in lives, as the only
+	// place an inherent impl for one may be written. The trait impl beside it
+	// is legal, so exactly one diagnostic is expected.
+	let case = TestCase::new(indoc! {"
+        memory heap: Memory where { Size = u32 };
+
+        trait Counter {
+            fn count(self) -> u32;
+        }
+
+        impl<M: Memory, T> M::&[T] {
+            pub fn count(self) -> u32 { 0 }
+        }
+
+        impl Counter for heap::&[i32] {
+            fn count(self) -> u32 { 0 }
+        }
+    "});
+	assert_eq!(
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(|d| d.code.as_deref()
+				== Some(DiagnosticCode::ForeignImplTarget.code()))
+			.count(),
+		1,
+		"only the inherent impl should be rejected: {:?}",
+		case.tir.diagnostics
+	);
 }

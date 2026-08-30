@@ -84,13 +84,18 @@ pub enum TypeParamOwner {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemParent {
-	/// Non-generic `impl Target { }` / `impl Trait for Target { }`. `Target`
-	/// is already fully resolved, so this points straight at its `TypeIndex`
-	/// — used for both inherent-impl and trait-impl members alike.
+	/// Non-generic inherent `impl Target { }`. `Target` is already fully
+	/// resolved, so this points straight at its `TypeIndex`.
 	Impl(TypeIndex),
-	/// Generic `impl<Params> Target { }` / `impl<Params> Trait for Target { }`.
-	/// Index into `TIR::impl_block_list`.
+	/// Generic inherent `impl<Params> Target { }`. Index into
+	/// `TIR::inherent_impls`.
 	GenericImpl(u32),
+	/// `impl Trait for Target { }` member, generic or not. Named apart from
+	/// the inherent cases because the two differ in more than their target:
+	/// a trait impl's member exists to satisfy a declaration elsewhere, which
+	/// is what exempts it from dead-code reporting. The target is still
+	/// reachable, via `TIR::trait_impls[..].target`.
+	TraitImpl(TraitImplIndex),
 	/// Trait item — a method/const declaration or default body, scoped to
 	/// the trait's implicit `Self`.
 	Trait(TraitIndex),
@@ -1539,6 +1544,34 @@ pub struct AssocTypeImpl {
 }
 
 impl ImplEntry {
+	/// What kind of item this is, for diagnostics.
+	pub fn noun(self) -> &'static str {
+		match self {
+			ImplEntry::Method(_) | ImplEntry::AssocFunction(_) => "function",
+			ImplEntry::AssocConstant(_) => "const",
+			ImplEntry::AssocType(_) => "type",
+		}
+	}
+
+	/// Whether two entries are the same kind of item — what a trait's
+	/// declaration and an impl's item must agree on for the impl to be
+	/// providing the member the trait asked for.
+	///
+	/// `Method` and `AssocFunction` count as the same kind: whether a
+	/// receiver is declared is a question about a signature, not about which
+	/// item a name refers to.
+	pub fn is_same_kind(self, other: ImplEntry) -> bool {
+		match (self, other) {
+			(
+				ImplEntry::Method(_) | ImplEntry::AssocFunction(_),
+				ImplEntry::Method(_) | ImplEntry::AssocFunction(_),
+			) => true,
+			(ImplEntry::AssocConstant(_), ImplEntry::AssocConstant(_)) => true,
+			(ImplEntry::AssocType(_), ImplEntry::AssocType(_)) => true,
+			_ => false,
+		}
+	}
+
 	pub fn def_span(self, tir: &TIR) -> SourceSpan {
 		match self {
 			ImplEntry::Method(func_index)
@@ -1868,6 +1901,8 @@ define_diagnostic_codes! {
 		LibraryCannotExport => "E1074",
 		AmbiguousWildcardImport => "E1075",
 		PrivateStructField => "E1076",
+		ForeignImplTarget => "E1077",
+		NotATraitMember => "E1078",
 	}
 }
 

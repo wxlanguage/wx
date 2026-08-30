@@ -509,6 +509,53 @@ fn test_pub_not_permitted_in_trait_items() {
 }
 
 #[test]
+fn test_pub_not_permitted_in_trait_impl_items() {
+	// The inherent-impl counterpart below keeps its `pub`: the same member
+	// parser produces both, so the qualifier is judged by the impl, not by
+	// the member.
+	let case = TestCase::new(indoc! {"
+        impl Widget for Button {
+            pub const SIZE: u32 = 1;
+            pub type Assoc = u32;
+            pub fn render(self) {}
+        }
+
+        impl Button {
+            pub fn area(self) -> u32 { 1 }
+        }
+    "});
+
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::VisibilityNotPermitted,
+		DiagnosticCode::VisibilityNotPermitted,
+		DiagnosticCode::VisibilityNotPermitted,
+	]);
+	let Item::TraitImpl { items, .. } = case.item(0) else {
+		panic!("expected trait impl item")
+	};
+	assert_eq!(items.len(), 3);
+}
+
+/// The `pub` has to survive parsing even where it is an error, or the
+/// formatter — which rebuilds source from the AST alone — deletes it.
+#[test]
+fn test_pub_on_impl_assoc_type_is_recorded() {
+	let case = TestCase::new(indoc! {"
+        impl Widget for Button {
+            pub type Assoc = u32;
+        }
+    "});
+
+	let Item::TraitImpl { items, .. } = case.item(0) else {
+		panic!("expected trait impl item")
+	};
+	let ImplItem::AssocType { pub_span, .. } = &items[0].inner.inner else {
+		panic!("expected an associated type")
+	};
+	assert!(pub_span.is_some());
+}
+
+#[test]
 fn test_pub_not_applicable_to_memory_item_recovers() {
 	let case = TestCase::new(indoc! {"
         pub memory MEM: Memory where { Size = u32 };

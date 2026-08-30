@@ -760,15 +760,19 @@ impl<'ast> Builder<'ast, '_> {
 			// `TraitImpl(_)` is only ever set by `AstNodeRef::TraitImplFunction`,
 			// never by the inherent-impl path (`ImplBlock(_)`). Inherent
 			// methods get no such exemption.
+			//
+			// A leading `_` marks the function as deliberately unused, the
+			// same convention the unused-local check honours.
+			let name = self.interner.resolve(function.name.inner).unwrap();
 			if function.accesses.is_empty()
 				&& function.pub_span.is_none()
+				&& !name.starts_with('_')
 				&& !matches!(
 					function.type_param_parent,
 					Some(
 						TypeParamOwner::Trait(_) | TypeParamOwner::TraitImpl(_)
 					)
 				) {
-				let name = self.interner.resolve(function.name.inner).unwrap();
 				self.tir.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
@@ -833,20 +837,21 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		for constant in self.tir.constants.iter() {
-			// A trait const's default value (`parent: Some(ItemParent::Trait(_))`)
-			// is exempt for the same reason a default trait method is (see
-			// above): the trait declaration is itself the "use" — the
-			// default exists for whatever impl/generic code inherits it,
-			// which the compiler can't statically trace back here. Trait
-			// consts always carry `pub_span: None` (visibility comes from
-			// the trait, not the item), so without this they'd all read as
-			// "private and unused" the moment they got a default value —
-			// previously unreachable, since every trait const was bodiless.
+			// A trait const's default value, and an impl's const satisfying
+			// one, are both exempt for the same reason a trait method is (see
+			// above): the declaration is itself the "use" — the value exists
+			// for whatever impl or generic code reaches it, which the
+			// compiler can't statically trace back here. Both carry
+			// `pub_span: None` (visibility comes from the trait, not the
+			// item), so without this they'd read as "private and unused" the
+			// moment they got a value.
 			if constant.pub_span.is_none()
 				&& constant.accesses.is_empty()
 				&& constant.value.is_some()
-				&& !matches!(constant.parent, Some(ItemParent::Trait(_)))
-			{
+				&& !matches!(
+					constant.parent,
+					Some(ItemParent::Trait(_) | ItemParent::TraitImpl(_))
+				) {
 				let name = self.interner.resolve(constant.name.inner).unwrap();
 				self.tir.diagnostics.push(
 					Diagnostic::warning()

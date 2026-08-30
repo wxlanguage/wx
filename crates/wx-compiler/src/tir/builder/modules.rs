@@ -1630,7 +1630,7 @@ pub(super) fn report_duplicate_definition(
 		.with_label(diagnostic.first_definition.primary_label().with_message(
 			format!(
 				"previous definition of the {} `{}` here",
-				diagnostic.name, namespace
+				namespace, diagnostic.name
 			),
 		))
 }

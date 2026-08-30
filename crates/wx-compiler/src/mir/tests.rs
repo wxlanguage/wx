@@ -33,31 +33,6 @@ impl TestCase {
 	}
 }
 
-// Minimal inline definitions shared across tests that need them.
-
-/// ASCII helper and char methods, purpose-named to avoid colliding with
-/// `std/main.wx`'s own `impl char { fn is_ascii_lowercase / to_ascii_uppercase }`
-/// (a real collision would now correctly be flagged as a duplicate impl).
-const CHAR_ASCII_METHODS: &str = indoc! {"
-    const ASCII_CASE_MASK: u8 = 0b0010_0000;
-
-    impl char {
-        #[inline]
-        pub fn is_test_lowercase(self) -> bool {
-            self >= 'a' && self <= 'z'
-        }
-
-        #[inline]
-        pub fn to_test_uppercase(self) -> char {
-            if self.is_test_lowercase() {
-                ((self as u8) ^ ASCII_CASE_MASK) as char
-            } else {
-                self
-            }
-        }
-    }
-"};
-
 // ── primitives
 // ────────────────────────────────────────────────────────────────
 
@@ -244,36 +219,64 @@ fn test_tuple_type_alias_transparent_in_mir() {
 
 #[test]
 fn test_struct_method_call() {
-	// Both #[inline] methods get substituted into `to_upper`; the snapshot
-	// shows only the arithmetic body with no Call nodes remaining.
-	let case = TestCase::new(&format!(
-		"{CHAR_ASCII_METHODS}\n{}",
-		indoc! {"
-        fn to_upper(c: char) -> char {
-            c.to_test_uppercase()
+	// A method without `#[inline]` stays a real call: `to_uppercase` survives
+	// as its own MIR function, and `to_upper` reaches it through a `Call`.
+	let case = TestCase::new(indoc! {"
+        struct Letter { code: u8 }
+
+        impl Letter {
+            pub fn to_uppercase(self) -> u8 {
+                self.code ^ 0b0010_0000
+            }
+        }
+
+        fn to_upper(c: u8) -> u8 {
+            Letter::{ code: c }.to_uppercase()
         }
 
         export { to_upper }
-    "}
-	));
-	insta::assert_yaml_snapshot!(case.mir);
+    "});
+	assert_eq!(case.mir.functions.len(), 2, "to_upper + to_uppercase");
+	let mut result = &mir_function(&case, "to_upper").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(matches!(result.kind, ExprKind::Call { .. }));
 }
 
 #[test]
 fn test_inline_method_is_substituted() {
-	// A call to an #[inline] method must be replaced by its body in MIR —
-	// the snapshot shows the inlined if/xor logic with no Call node.
-	let case = TestCase::new(&format!(
-		"{CHAR_ASCII_METHODS}\n{}",
-		indoc! {"
-        fn to_upper(c: char) -> char {
-            c.to_test_uppercase()
+	// A call to an `#[inline]` method is replaced by its body, transitively:
+	// `to_upper` inlines `to_uppercase`, which inlines `is_lowercase`. With no
+	// call left to either, DCE drops both and one function remains.
+	let case = TestCase::new(indoc! {"
+        const ASCII_CASE_MASK: u8 = 0b0010_0000;
+
+        struct Letter { code: u8 }
+
+        impl Letter {
+            #[inline]
+            pub fn is_lowercase(self) -> bool {
+                self.code >= 97 && self.code <= 122
+            }
+
+            #[inline]
+            pub fn to_uppercase(self) -> u8 {
+                if self.is_lowercase() {
+                    self.code ^ ASCII_CASE_MASK
+                } else {
+                    self.code
+                }
+            }
+        }
+
+        fn to_upper(c: u8) -> u8 {
+            Letter::{ code: c }.to_uppercase()
         }
 
         export { to_upper }
-    "}
-	));
-	insta::assert_yaml_snapshot!(case.mir);
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "only `to_upper` should remain");
 }
 
 // ── memory instructions
@@ -1269,26 +1272,36 @@ fn test_size_of_generic_monomorphizes() {
 }
 
 #[test]
-fn test_generic_impl_slice_count_method_lowers_correctly() {
-	// Uses `count`, not `len`, to avoid colliding with the stdlib's own
-	// `impl<M: Memory, T> M::&[T] { fn len(...) }`.
+fn test_generic_slice_impl_method_lowers_correctly() {
+	// The stdlib's `impl<Mem: Memory, T> Mem::&[T] { #[inline] fn len(self) ->
+	// Mem::Size }` at `Mem = heap, T = u8` — the only kind of inherent slice
+	// impl there can be, since nobody defines slices. Two things have to
+	// happen for `s.len()` to lower correctly: `Mem::Size` resolves to
+	// `heap`'s concrete index type, and the `slice_len` intrinsic in the body
+	// becomes a direct read of the slice aggregate's length slot.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        impl<M: Memory, T> M::&[T] {
-            pub fn count(self) -> M::Size {
-                slice_len(self)
-            }
-        }
-
         pub fn get_len(s: heap::&[u8]) -> u32 {
-            s.count()
+            s.len()
         }
 
         export { get_len }
     "});
 	assert!(case.tir.diagnostics.is_empty());
-	insta::assert_yaml_snapshot!(case.mir);
+
+	let mut result = &mir_function(&case, "get_len").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(
+		matches!(result.kind, ExprKind::AggregateGet { value_index: 1, .. }),
+		"`slice_len` should read the slice aggregate's length slot directly"
+	);
+	assert!(
+		matches!(result.ty, Type::U32),
+		"`Mem::Size` should have resolved to `heap`'s index type"
+	);
 }
 
 #[test]

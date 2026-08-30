@@ -1533,6 +1533,11 @@ pub enum ImplItem {
 	},
 	AssocType {
 		id: DefId,
+		/// Always an error to have set — an associated type is only legal in
+		/// a trait impl, where visibility comes from the trait. Recorded
+		/// anyway so the qualifier can be reported and round-tripped:
+		/// dropping it here made the formatter delete `pub` from the source.
+		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Box<Spanned<TypeExpression>>,
 		attributes: Box<[Attribute]>,
@@ -5097,6 +5102,7 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
 						id: parser.id_generator.generate(),
+						pub_span,
 						name: Spanned {
 							inner: name_symbol,
 							span: name_span,
@@ -5240,6 +5246,38 @@ impl<'ctx> Parser<'ctx> {
 				}),
 			}
 			.parse(parser)?;
+
+			// A trait impl's members are reachable exactly where the trait
+			// is, so `pub` on one decides nothing. `parse_impl_member` still
+			// accepts it — it is shared with inherent impls, whose members do
+			// carry visibility, and it has no way to tell which it is parsing
+			// — so the qualifier is judged here, where that is known, rather
+			// than by the member parser itself.
+			for item in items.inner.iter() {
+				let (ImplItem::Function { pub_span, .. }
+				| ImplItem::Constant { pub_span, .. }
+				| ImplItem::AssocType { pub_span, .. }) = &item.inner.inner;
+				let Some(pub_span) = *pub_span else {
+					continue;
+				};
+				parser.ast.diagnostics.push(
+					Diagnostic::warning()
+						.with_code(
+							DiagnosticCode::VisibilityNotPermitted.code(),
+						)
+						.with_message(
+							"visibility qualifiers are not permitted here",
+						)
+						.with_label(
+							Label::primary(parser.ast.file_id, pub_span)
+								.with_message("remove the qualifier"),
+						)
+						.with_note(
+							"trait impl items always share the visibility of \
+							 the trait they implement",
+						),
+				);
+			}
 
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
