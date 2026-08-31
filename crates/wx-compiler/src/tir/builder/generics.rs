@@ -1017,7 +1017,7 @@ impl<'ast> Builder<'ast, '_> {
 		name: Spanned<SymbolU32>,
 		ty: Spanned<TypeIndex>,
 	) {
-		let file_id = resolve_context.file_id;
+		let ResolveContext { file_id, namespace } = resolve_context;
 		let Some(bounds) = self.tir.traits[trait_index as usize]
 			.assoc_types
 			.get(&name.inner)
@@ -1083,21 +1083,17 @@ impl<'ast> Builder<'ast, '_> {
 												.inner,
 										)
 										.unwrap();
-									let fmt = self
-										.formatter(resolve_context.namespace);
-									let concrete_name = fmt
-										.display_type(ty.inner)
-										.unwrap_or_default();
-									let expected_name = fmt
-										.display_type(expected)
-										.unwrap_or_default();
-									let actual_name = fmt
-										.display_type(actual)
-										.unwrap_or_default();
+									let fmt = self.formatter(namespace);
+									let concrete_name =
+										fmt.display_type(ty.inner).unwrap();
+									let expected_name =
+										fmt.display_type(expected).unwrap();
+									let actual_name =
+										fmt.display_type(actual).unwrap();
 									self.tir.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
-												DiagnosticCode::TypeMistmatch
+												DiagnosticCode::TraitBoundViolation
 													.code(),
 											)
 											.with_message(format!(
@@ -1130,8 +1126,7 @@ impl<'ast> Builder<'ast, '_> {
 											.inner,
 									)
 									.unwrap();
-								let fmt =
-									self.formatter(resolve_context.namespace);
+								let fmt = self.formatter(namespace);
 								let concrete_name = fmt
 									.display_type(ty.inner)
 									.unwrap_or_default();
@@ -1213,7 +1208,7 @@ impl<'ast> Builder<'ast, '_> {
 				None => {
 					let assoc_name = self.interner.resolve(name.inner).unwrap();
 					let type_name = self
-						.formatter(resolve_context.namespace)
+						.formatter(namespace)
 						.display_type(ty.inner)
 						.unwrap();
 					let trait_name = self
@@ -1268,10 +1263,8 @@ impl<'ast> Builder<'ast, '_> {
 				)
 				.unwrap();
 			let assoc_name = self.interner.resolve(name.inner).unwrap();
-			let type_name = self
-				.formatter(resolve_context.namespace)
-				.display_type(ty.inner)
-				.unwrap();
+			let type_name =
+				self.formatter(namespace).display_type(ty.inner).unwrap();
 			let trait_name = self
 				.interner
 				.resolve(self.tir.traits[trait_index as usize].name.inner)

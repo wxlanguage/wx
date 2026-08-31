@@ -83,234 +83,260 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	pub(super) fn check_trait_conformance(&mut self) {
-		enum Violation {
-			MissingItem {
-				file_id: FileId,
-				span: TextSpan,
-				item_sym: SymbolU32,
-				trait_sym: SymbolU32,
-				kind: &'static str,
-			},
-			MissingSupertrait {
-				file_id: FileId,
-				span: TextSpan,
-				trait_sym: SymbolU32,
-				supertrait_sym: SymbolU32,
-			},
-			/// An item the impl provides that its trait does not declare —
-			/// either under no name the trait knows, or under one it declares
-			/// as a different kind of item. `declared` is the trait's own
-			/// entry in the latter case.
-			UnexpectedItem {
-				span: SourceSpan,
-				item_sym: SymbolU32,
-				trait_sym: SymbolU32,
-				provided: ImplEntry,
-				declared: Option<ImplEntry>,
-			},
-		}
+		for trait_impl in self.tir.trait_impls.iter() {
+			let trait_def = &self.tir.traits[trait_impl.trait_index as usize];
+			let mut missing_items: Vec<(SymbolU32, TextSpan)> = Vec::new();
 
-		let mut violations: Vec<Violation> = Vec::new();
+			for (&name, &def_entry) in trait_def.entries.iter() {
+				match trait_impl.members.get(&name).copied() {
+					Some(provided_impl) => match (provided_impl, def_entry) {
+						// TODO: verify that impl signatures are compatible trait declarations and report specific issues
+						// error[E0053]: method `foo` has an incompatible type for trait
+						// 	--> crates/wx-compiler/src/lib.rs:23:32
+						// 	|
+						// 23 |     fn foo(b: i32, d: i32, o: i32) {}
+						// 	|                                   ^ expected `i32`, found `()`
+						// 	|
+						// note: type in trait
+						// 	--> crates/wx-compiler/src/lib.rs:13:36
+						// 	|
+						// 13 |     fn foo(b: i32, d: i32, b: i32) -> i32;
+						// 	|                                       ^^^
+						// 	= note: expected signature `fn(_, _, _) -> i32`
+						// 							found signature `fn(_, _, _) -> ()`
+						// help: change the output type to match the trait
+						// 	|
+						// 23 |     fn foo(b: i32, d: i32, o: i32) -> i32 {}
+						// 	|                                    ++++++
+						(
+							ImplEntry::Method(_impl_index),
+							ImplEntry::Method(_def_index),
+						) => {}
+						(
+							ImplEntry::AssocFunction(_impl_index),
+							ImplEntry::AssocFunction(_def_index),
+						) => {}
+						(
+							ImplEntry::AssocConstant(_impl_index),
+							ImplEntry::AssocConstant(_def_index),
+						) => {}
+						(
+							ImplEntry::AssocType(_impl_index),
+							ImplEntry::AssocType(_def_index),
+						) => {}
+						_ => {
+							missing_items.push((
+								name,
+								def_entry.def_span(&self.tir).span,
+							));
+							self.tir.diagnostics.push(
+									Diagnostic::new(Severity::Error)
+										.with_code(
+											DiagnosticCode::TraitImplItemKindMismatch,
+										)
+										.with_message(format!(
+											"item `{}` is a {}, which doesn't match its trait `{}`",
+											self.interner.resolve(name).unwrap(),
+											provided_impl.noun(),
+											self.interner
+												.resolve(trait_def.name.inner)
+												.unwrap(),
+										))
+										.with_label(
+											provided_impl
+												.def_span(&self.tir)
+												.primary_label()
+												.with_message("does not match trait"),
+										)
+										.with_label(
+											def_entry
+												.def_span(&self.tir)
+												.secondary_label()
+												.with_message("item in trait"),
+										),
+								);
+						}
+					},
+					None => {
+						let default_impl_exists = match def_entry {
+							ImplEntry::AssocFunction(func_index)
+							| ImplEntry::Method(func_index) => self.tir.functions
+								[func_index as usize]
+								.body
+								.is_some(),
+							ImplEntry::AssocConstant(const_index) => {
+								self.tir.constants[const_index as usize]
+									.value
+									.is_some()
+							}
+							// TODO: We may add default associated types in traits later
+							// https://github.com/rust-lang/rust/issues/29661
+							// In rust there's much more edge cases with dispatch, impl specialization and triat objects
+							// but for us it should be failrly simple
+							// The only thing is that we shouldn't assume that defautl type bounds the associated type to anythinig automatically
+							// It should act just like a fallback
+							ImplEntry::AssocType(_) => false,
+						};
 
-		for ti in &self.tir.trait_impls {
-			let trait_ = &self.tir.traits[ti.trait_index as usize];
-
-			// `ti.members` = only what the impl block explicitly provided
-			// (unlike `resolve_impl_member`, which also falls back to bodied
-			// trait defaults). We use `ti.members` intentionally here: a
-			// default method must not satisfy an abstract (no-body) requirement.
-			for (&sym, entry) in &trait_.entries {
-				// `body.is_none()` distinguishes abstract from default methods.
-				// Requires Phase 3 to have populated bodies before this runs.
-				let (required, kind) = match entry {
-					ImplEntry::Method(fi) => {
-						(self.tir.functions[*fi as usize].body.is_none(), "fn")
+						if !default_impl_exists {
+							missing_items.push((
+								name,
+								def_entry.def_span(&self.tir).span,
+							));
+						}
 					}
-					ImplEntry::AssocConstant(ci) => (
-						self.tir.constants[*ci as usize].value.is_none(),
-						"const",
-					),
-					ImplEntry::AssocType(_) => (true, "type"),
-					_ => continue,
 				};
-				// Kind-aware, not just `contains_key`: an item of the wrong
-				// kind under the required name satisfies nothing, and would
-				// otherwise mask the requirement being unimplemented. It is
-				// reported on its own account below.
-				let provided = ti
-					.members
-					.get(&sym)
-					.is_some_and(|provided| provided.is_same_kind(*entry));
-				if required && !provided {
-					violations.push(Violation::MissingItem {
-						file_id: ti.file_id,
-						span: ti.span,
-						item_sym: sym,
-						trait_sym: trait_.name.inner,
-						kind,
-					});
+			}
+
+			if !missing_items.is_empty() {
+				missing_items.sort_unstable_by_key(|(_, span)| span.start);
+				// TODO: join without allocating intermediate Box<[_]>
+				let names = missing_items
+					.iter()
+					.map(|(symbol, _)| self.interner.resolve(*symbol).unwrap())
+					.collect::<Box<[_]>>()
+					.join(", ");
+
+				let mut diagnostic = Diagnostic::error()
+					.with_code(DiagnosticCode::IncompleteTraitImpl)
+					.with_message("not all trait items implemented")
+					.with_label(
+						SourceSpan::new(trait_impl.file_id, trait_impl.span)
+							.primary_label()
+							.with_message(format!(
+								"missing {} in implementation",
+								names
+							)),
+					);
+				for (symbol, item_span) in missing_items {
+					diagnostic.labels.push(
+						SourceSpan::new(trait_def.file_id, item_span)
+							.secondary_label()
+							.with_message(format!(
+								"`{}` from trait",
+								self.interner.resolve(symbol).unwrap()
+							)),
+					);
+				}
+				self.tir.diagnostics.push(diagnostic);
+			}
+
+			for (&name, &impl_entry) in trait_impl.members.iter() {
+				if !trait_def.entries.contains_key(&name) {
+					let trait_name =
+						self.interner.resolve(trait_def.name.inner).unwrap();
+					let item_name = self.interner.resolve(name).unwrap();
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::NotATraitMember)
+							.with_message(format!(
+								"{} `{item_name}` is not a member of trait `{trait_name}`",
+								impl_entry.noun(),
+							))
+							.with_label(
+								impl_entry
+									.def_span(&self.tir)
+									.primary_label()
+									.with_message(format!(
+										"not a member of trait `{trait_name}`"
+									)),
+							),
+					);
 				}
 			}
 
-			// The mirror of the loop above: everything the impl provides has
-			// to be something the trait declares, under the same kind. An
-			// extra item is unreachable rather than harmless — a trait impl's
-			// members are only ever looked up through the trait
-			// (`resolve_impl_member`), so nothing could name it.
-			for (&sym, provided) in &ti.members {
-				let declared = trait_.entries.get(&sym).copied();
-				if declared.is_some_and(|entry| entry.is_same_kind(*provided)) {
-					continue;
-				}
-				violations.push(Violation::UnexpectedItem {
-					span: provided.def_span(&self.tir),
-					item_sym: sym,
-					trait_sym: trait_.name.inner,
-					provided: *provided,
-					declared,
-				});
-			}
-
-			for supertrait in &trait_.bounds.traits {
+			for supertrait in trait_def.bounds.traits.iter() {
 				if self
 					.tir
-					.find_trait_impl(ti.target.inner, supertrait.trait_index)
+					.find_trait_impl(
+						trait_impl.target.inner,
+						supertrait.trait_index,
+					)
 					.is_none()
 				{
-					let supertrait_sym = self.tir.traits
-						[supertrait.trait_index as usize]
-						.name
-						.inner;
-					violations.push(Violation::MissingSupertrait {
-						file_id: ti.file_id,
-						span: ti.span,
-						trait_sym: trait_.name.inner,
-						supertrait_sym,
-					});
+					let supertrait_name = self
+						.interner
+						.resolve(
+							self.tir.traits[supertrait.trait_index as usize]
+								.name
+								.inner,
+						)
+						.unwrap();
+					let trait_name =
+						self.interner.resolve(trait_def.name.inner).unwrap();
+					let target_name = self
+						.formatter(trait_impl.namespace)
+						.display_type(trait_impl.target.inner)
+						.unwrap();
+					self.tir.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::UnsatisfiedTraitBound.code(),
+							)
+							.with_message(format!(
+								"the trait bound `{}: {}` is not satisfied",
+								target_name, supertrait_name,
+							))
+							.with_label(
+								SourceSpan::new(
+									trait_impl.file_id,
+									trait_impl.target.span,
+								)
+								.primary_label()
+								.with_message("unsatisfied trait bound"),
+							)
+							.with_label(
+								SourceSpan::new(
+									trait_def.file_id,
+									trait_def.name.span,
+								)
+								.secondary_label()
+								.with_message(format!(
+									"required by a bound in `{}`",
+									trait_name
+								)),
+							),
+					);
 				}
 			}
 		}
 
+		// iterating without borrowing so that there's no issues when trying to borrow again with mutable reference in check_assoc_type_bounds
 		for trait_impl_index in 0..self.tir.trait_impls.len() {
-			// `.members` is a HashMap keyed by symbol (kept that way for the
-			// O(1) point lookups on the hot path in `resolve_impl_member`),
-			// so unlike a slice there's no cheap per-index re-derive here.
-			// Collecting just the matching `AssocTypeIndex` values — bounded
-			// by how many associated types one impl provides, so a handful
-			// at most — is the smallest way to end the borrow on `members`
-			// before `check_assoc_type_bounds` needs `&mut self` below.
-			let assoc_type_indices: Vec<AssocTypeIndex> = self.tir.trait_impls
+			let trait_impl = &self.tir.trait_impls[trait_impl_index];
+			let trait_index = trait_impl.trait_index;
+			let target_type = trait_impl.target.inner;
+			let resolve_context = ResolveContext {
+				file_id: trait_impl.file_id,
+				namespace: trait_impl.namespace,
+			};
+
+			let mut assoc_types: Box<[_]> = self.tir.trait_impls
 				[trait_impl_index]
 				.members
 				.values()
 				.copied()
 				.filter_map(|entry| match entry {
-					ImplEntry::AssocType(idx) => Some(idx),
+					ImplEntry::AssocType(idx) => {
+						let assoc_type =
+							&self.tir.assoc_type_impls[idx as usize];
+						Some((assoc_type.name, assoc_type.ty.unwrap()))
+					}
 					_ => None,
 				})
 				.collect();
-			for assoc_type_index in assoc_type_indices {
-				let assoc_type_impl = self.tir.assoc_type_impls
-					[assoc_type_index as usize]
-					.clone();
-				let trait_index =
-					self.tir.trait_impls[trait_impl_index].trait_index;
-				let self_type =
-					self.tir.trait_impls[trait_impl_index].target.inner;
+			if assoc_types.is_empty() {
+				continue;
+			};
+			assoc_types.sort_unstable_by_key(|(name, _)| name.span.start);
+			for (name, ty) in assoc_types.into_iter() {
 				self.check_assoc_type_bounds(
-					ResolveContext::new(
-						assoc_type_impl.file_id,
-						assoc_type_impl.namespace,
-					),
+					resolve_context,
 					trait_index,
-					self_type,
-					assoc_type_impl.name,
-					assoc_type_impl.ty.unwrap(),
+					target_type,
+					name,
+					ty,
 				);
-			}
-		}
-
-		for v in violations {
-			match v {
-				Violation::MissingItem {
-					file_id,
-					span,
-					item_sym,
-					trait_sym,
-					kind,
-				} => {
-					let item_name = self.interner.resolve(item_sym).unwrap();
-					let trait_name = self.interner.resolve(trait_sym).unwrap();
-					self.tir.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::MissingTraitImplItem.code(),
-							)
-							.with_message(format!(
-								"missing {} `{}` required by `{}`",
-								kind, item_name, trait_name
-							))
-							.with_label(Label::primary(file_id, span)),
-					);
-				}
-				Violation::UnexpectedItem {
-					span,
-					item_sym,
-					trait_sym,
-					provided,
-					declared,
-				} => {
-					let item_name = self.interner.resolve(item_sym).unwrap();
-					let trait_name = self.interner.resolve(trait_sym).unwrap();
-					let label = span.primary_label();
-					let diagnostic = match declared {
-						Some(declared) => Diagnostic::error()
-							.with_message(format!(
-								"`{item_name}` is a {} in this impl, but \
-								 trait `{trait_name}` declares it as a {}",
-								provided.noun(),
-								declared.noun(),
-							))
-							.with_label(label.with_message(format!(
-								"expected a {}",
-								declared.noun()
-							))),
-						None => Diagnostic::error()
-							.with_message(format!(
-								"{} `{item_name}` is not a member of trait \
-								 `{trait_name}`",
-								provided.noun(),
-							))
-							.with_label(label.with_message(format!(
-								"not a member of trait `{trait_name}`"
-							))),
-					};
-					self.tir.diagnostics.push(
-						diagnostic
-							.with_code(DiagnosticCode::NotATraitMember.code()),
-					);
-				}
-				Violation::MissingSupertrait {
-					file_id,
-					span,
-					trait_sym,
-					supertrait_sym,
-				} => {
-					let trait_name = self.interner.resolve(trait_sym).unwrap();
-					let supertrait_name =
-						self.interner.resolve(supertrait_sym).unwrap();
-					self.tir.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::MissingSupertraitImpl.code(),
-							)
-							.with_message(format!(
-								"cannot implement `{}` without implementing supertrait `{}`",
-								trait_name, supertrait_name
-							))
-							.with_label(Label::primary(file_id, span)),
-					);
-				}
 			}
 		}
 	}
@@ -1101,6 +1127,7 @@ impl<'ast> Builder<'ast, '_> {
 				inner: TypeIndex::ERROR,
 				span: target.span,
 			},
+			namespace: resolve_context.namespace,
 			members: HashMap::new(),
 			span: trait_name_span,
 			file_id: resolve_context.file_id,

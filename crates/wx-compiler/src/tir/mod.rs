@@ -394,6 +394,7 @@ pub struct TraitImpl {
 	#[cfg_attr(test, serde(skip))]
 	pub span: TextSpan,
 	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
 	/// See `ImplBlock::self_accesses`.
 	#[cfg_attr(test, serde(skip))]
 	pub self_accesses: Vec<SourceSpan>,
@@ -1547,28 +1548,10 @@ impl ImplEntry {
 	/// What kind of item this is, for diagnostics.
 	pub fn noun(self) -> &'static str {
 		match self {
-			ImplEntry::Method(_) | ImplEntry::AssocFunction(_) => "function",
-			ImplEntry::AssocConstant(_) => "const",
+			ImplEntry::AssocFunction(_) => "function",
+			ImplEntry::Method(_) => "method",
+			ImplEntry::AssocConstant(_) => "constant",
 			ImplEntry::AssocType(_) => "type",
-		}
-	}
-
-	/// Whether two entries are the same kind of item — what a trait's
-	/// declaration and an impl's item must agree on for the impl to be
-	/// providing the member the trait asked for.
-	///
-	/// `Method` and `AssocFunction` count as the same kind: whether a
-	/// receiver is declared is a question about a signature, not about which
-	/// item a name refers to.
-	pub fn is_same_kind(self, other: ImplEntry) -> bool {
-		match (self, other) {
-			(
-				ImplEntry::Method(_) | ImplEntry::AssocFunction(_),
-				ImplEntry::Method(_) | ImplEntry::AssocFunction(_),
-			) => true,
-			(ImplEntry::AssocConstant(_), ImplEntry::AssocConstant(_)) => true,
-			(ImplEntry::AssocType(_), ImplEntry::AssocType(_)) => true,
-			_ => false,
 		}
 	}
 
@@ -1855,8 +1838,8 @@ define_diagnostic_codes! {
 		NamespaceUsedAsValue => "E1030",
 		ExpectedBound => "E1031",
 		CyclicTypeDependency => "E1032",
-		MissingTraitImplItem => "E1033",
-		MissingSupertraitImpl => "E1034",
+		IncompleteTraitImpl => "E1033",
+		UnsatisfiedTraitBound => "E1034",
 		AssociatedTypeInInherentImpl => "E1035",
 		MissingEnumRepr => "E1036",
 		CannotDerefNonPointer => "E1037",
@@ -1903,6 +1886,7 @@ define_diagnostic_codes! {
 		PrivateStructField => "E1076",
 		ForeignImplTarget => "E1077",
 		NotATraitMember => "E1078",
+		TraitImplItemKindMismatch => "E1079",
 	}
 }
 

@@ -178,6 +178,7 @@ impl<'ast> Builder<'ast, '_> {
 				span: name.span,
 			},
 			members,
+			namespace: resolve_context.namespace,
 			span: name.span,
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),

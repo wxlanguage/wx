@@ -5294,7 +5294,7 @@ fn test_trait_conformance_missing_fn() {
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-			== Some(DiagnosticCode::MissingTraitImplItem.code())),
+			== Some(DiagnosticCode::IncompleteTraitImpl.code())),
 		"expected E1033 for missing trait item, got: {:?}",
 		case.tir
 			.diagnostics
@@ -5430,40 +5430,14 @@ fn test_trait_impl_item_of_the_wrong_kind_does_not_satisfy_the_requirement() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::MissingTraitImplItem),
+		has_error_code(&case.tir, DiagnosticCode::IncompleteTraitImpl),
 		"{:?}",
 		error_messages(&case.tir)
 	);
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
+		has_error_code(&case.tir, DiagnosticCode::TraitImplItemKindMismatch),
 		"{:?}",
 		error_messages(&case.tir)
-	);
-}
-
-#[test]
-fn test_trait_impl_item_of_the_wrong_kind() {
-	// The name is declared, but as a function — providing a const under it
-	// satisfies nothing.
-	let case = TestCase::new(indoc! {"
-        trait Drawable {
-            fn draw(self);
-        }
-
-        struct Point { x: i32 }
-
-        impl Drawable for Point {
-            const draw: i32 = 1;
-        }
-    "});
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
-		"{:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| (d.code.as_deref(), &d.message))
-			.collect::<Vec<_>>()
 	);
 }
 
@@ -5484,13 +5458,14 @@ fn test_trait_impl_may_drop_the_receiver_without_a_membership_error() {
         }
     "});
 	assert!(
-		!has_error_code(&case.tir, DiagnosticCode::NotATraitMember),
+		has_error_code(&case.tir, DiagnosticCode::TraitImplItemKindMismatch),
 		"{:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| (d.code.as_deref(), &d.message))
-			.collect::<Vec<_>>()
+		error_messages(&case.tir),
+	);
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::IncompleteTraitImpl),
+		"{:?}",
+		error_messages(&case.tir)
 	);
 }
 
@@ -5540,7 +5515,7 @@ fn test_trait_conformance_missing_const() {
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-			== Some(DiagnosticCode::MissingTraitImplItem.code())),
+			== Some(DiagnosticCode::IncompleteTraitImpl.code())),
 		"expected E1033 for missing const, got: {:?}",
 		case.tir
 			.diagnostics
@@ -5664,7 +5639,7 @@ fn test_supertrait_missing_impl_errors() {
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-			== Some(DiagnosticCode::MissingSupertraitImpl.code())),
+			== Some(DiagnosticCode::UnsatisfiedTraitBound.code())),
 		"expected E1034 for missing supertrait impl, got: {:?}",
 		case.tir
 			.diagnostics
@@ -11566,7 +11541,7 @@ fn test_multiple_supertraits_missing_one_impl_is_error() {
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-			== Some(DiagnosticCode::MissingSupertraitImpl.code())),
+			== Some(DiagnosticCode::UnsatisfiedTraitBound.code())),
 		"expected E1034 for missing Sized impl"
 	);
 }

@@ -19,6 +19,10 @@ trait Float {
   fn cos(self) -> Self;
 
   fn sin(self) -> Self;
+
+  const PI: Self;
+
+  const FRAC_PI_2: Self;
 }
 
 impl Float for f32 {
@@ -26,15 +30,15 @@ impl Float for f32 {
     sinf(self)
   }
 
-  fn cos(self) -> Self {
-    cosf(self)
+  fn cos(b: f32) -> Self {
+    cosf(b)
   }
 
   /// Archimedes' constant (π)
-  pub const PI: f32 = 3.14159265358979323846264338327950288;
+  const PI: f32 = 3.14159265358979323846264338327950288;
 
   /// π/2
-  pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144;
+  const FRAC_PI_2: u32 = 1;
 }
 
 impl Float for f64 {
@@ -47,8 +51,8 @@ impl Float for f64 {
   }
 
   /// Archimedes' constant (π)
-  pub const PI: f64 = 3.14159265358979323846264338327950288;
+  const PI: f64 = 3.14159265358979323846264338327950288;
 
   /// π/2
-  pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
+  const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
 }
