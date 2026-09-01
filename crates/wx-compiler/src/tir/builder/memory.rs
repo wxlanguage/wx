@@ -41,7 +41,7 @@ impl<'ast> Builder<'ast, '_> {
 			match (kind_bounds.traits.as_ref(), kind_bounds.typeset) {
 				([tb], None) => tb.trait_index,
 				_ => {
-					self.tir.diagnostics.push(report_invalid_memory_kind(
+					self.diagnostics.push(report_invalid_memory_kind(
 						SourceSpan::new(resolve_context.file_id, kind.span),
 					));
 					self.register_placeholder_memory(
@@ -69,7 +69,7 @@ impl<'ast> Builder<'ast, '_> {
 				let ty_expr = match &binding.kind {
 					ast::AssocTypeBindingKind::Equals(ty_expr) => ty_expr,
 					ast::AssocTypeBindingKind::Bound(bound) => {
-						self.tir.diagnostics.push(report_invalid_memory_kind(
+						self.diagnostics.push(report_invalid_memory_kind(
 							SourceSpan::new(
 								resolve_context.file_id,
 								bound.span,
@@ -91,7 +91,7 @@ impl<'ast> Builder<'ast, '_> {
 						span: ty_expr.span,
 					},
 				);
-				if let Some(at) = self.tir.traits[trait_index as usize]
+				if let Some(at) = self.items.traits[usize::from(trait_index)]
 					.assoc_types
 					.get_mut(&binding.name.inner)
 				{
@@ -128,7 +128,7 @@ impl<'ast> Builder<'ast, '_> {
 				ty
 			}
 			_ => {
-				self.tir.diagnostics.push(report_invalid_memory_kind(
+				self.diagnostics.push(report_invalid_memory_kind(
 					SourceSpan::new(resolve_context.file_id, kind.span),
 				));
 				self.register_placeholder_memory(resolve_context, *id, name);
@@ -141,8 +141,8 @@ impl<'ast> Builder<'ast, '_> {
 			attributes,
 		);
 
-		let memory_index = self.tir.expect_memory_index(*id);
-		self.tir.memories[memory_index as usize] = Memory {
+		let memory_index = self.items.expect_memory_index(*id);
+		self.items.memories[usize::from(memory_index)] = Memory {
 			id: *id,
 			file_id: resolve_context.file_id,
 			size: memory_size,
@@ -167,9 +167,8 @@ impl<'ast> Builder<'ast, '_> {
 		// is an ordinary `TraitImpl` like any hand-written one — its members go
 		// through the same ambiguity-checked trait tier as everything else, no
 		// special-casing.
-		let trait_impl_index = self.tir.trait_impls.len() as TraitImplIndex;
 		let synthetic_def_id = self.id_generator.generate();
-		self.tir.trait_impls.push(TraitImpl {
+		let trait_impl_index = self.items.push_trait_impl(TraitImpl {
 			id: synthetic_def_id,
 			trait_index,
 			type_params: Box::new([]),
@@ -184,9 +183,6 @@ impl<'ast> Builder<'ast, '_> {
 			self_accesses: Vec::new(),
 		});
 		self.register_trait_impl(memory_type, trait_index, trait_impl_index);
-		self.tir
-			.item_lookup
-			.insert(synthetic_def_id, ItemIndex::TraitImpl(trait_impl_index));
 
 		// Bind each namespace only if this occurrence still holds its own
 		// `Pending` slot there — see the identical comment on the Struct
@@ -233,7 +229,7 @@ impl<'ast> Builder<'ast, '_> {
 		id: ast::DefId,
 		name: &ast::Spanned<SymbolU32>,
 	) {
-		let memory_index = self.tir.expect_memory_index(id);
+		let memory_index = self.items.expect_memory_index(id);
 		let kind = TypeIndex::ERROR;
 		let type_key = (SymbolNamespace::Type, name.inner);
 		if self.still_pending(resolve_context.namespace, type_key, id) {
@@ -280,7 +276,7 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			}
 			if seen {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidMemoryLimitsAttribute.code(),
@@ -300,7 +296,7 @@ impl<'ast> Builder<'ast, '_> {
 			let args = match &attr.value {
 				ast::AttributeValue::Args(args) => args,
 				_ => {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::InvalidMemoryLimitsAttribute
@@ -328,7 +324,7 @@ impl<'ast> Builder<'ast, '_> {
 					"min_pages" => &mut min_pages,
 					"max_pages" => &mut max_pages,
 					_ => {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::InvalidMemoryLimitsAttribute
@@ -349,7 +345,7 @@ impl<'ast> Builder<'ast, '_> {
 				let raw = match &arg.value {
 					ast::AttributeArgValue::Int(v) => v,
 					ast::AttributeArgValue::String(v) => {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::InvalidMemoryLimitsAttribute
@@ -368,7 +364,7 @@ impl<'ast> Builder<'ast, '_> {
 				};
 
 				if !(0..=u32::MAX as i64).contains(&raw.inner) {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::InvalidMemoryLimitsAttribute
@@ -386,7 +382,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 
 				if slot.is_some() {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::InvalidMemoryLimitsAttribute
@@ -412,7 +408,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		if let (Some(min), Some(max)) = (&min_pages, &max_pages) {
 			if min.inner > max.inner {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidMemoryLimitsAttribute.code(),
@@ -433,23 +429,23 @@ impl<'ast> Builder<'ast, '_> {
 
 	fn seed_memory_trait_impl_with(
 		&mut self,
-		trait_index: u32,
+		trait_index: TraitIndex,
 		memory_self: TypeIndex,
 		memory_size: Spanned<TypeIndex>,
 	) -> HashMap<SymbolU32, ImplEntry> {
 		let self_symbol = self.interner.get_or_intern("self");
-		let raw_members: Vec<(SymbolU32, ImplEntry)> = self.tir.traits
-			[trait_index as usize]
-			.entries
-			.iter()
-			.map(|(&sym, entry)| (sym, *entry))
-			.collect();
+		let raw_members: Vec<(SymbolU32, ImplEntry)> = self.items.traits
+			[usize::from(trait_index)]
+		.entries
+		.iter()
+		.map(|(&sym, entry)| (sym, *entry))
+		.collect();
 		let mut members: HashMap<SymbolU32, ImplEntry> =
 			HashMap::with_capacity(raw_members.len());
 		for (sym, entry) in raw_members {
 			let processed = match entry {
 				ImplEntry::Method(fi) => {
-					let func = &self.tir.functions[fi as usize];
+					let func = &self.items.functions[usize::from(fi)];
 					if func
 						.params
 						.first()
@@ -462,7 +458,8 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 				ImplEntry::AssocType(idx) => {
-					let original = &self.tir.assoc_type_impls[idx as usize];
+					let original =
+						&self.items.assoc_type_impls[usize::from(idx)];
 					let new_id = self.id_generator.generate();
 					let new_entry = AssocTypeImpl {
 						id: new_id,
@@ -472,9 +469,7 @@ impl<'ast> Builder<'ast, '_> {
 						ty: Some(memory_size),
 						attributes: Box::new([]),
 					};
-					let new_index =
-						self.tir.assoc_type_impls.len() as AssocTypeIndex;
-					self.tir.assoc_type_impls.push(new_entry);
+					let new_index = self.items.push_assoc_type_impl(new_entry);
 					ImplEntry::AssocType(new_index)
 				}
 				ImplEntry::AssocConstant(index) => {
@@ -485,10 +480,10 @@ impl<'ast> Builder<'ast, '_> {
 					// un-Clone-able `Expression`), but nothing else
 					// actually changes here.
 					let original_ty =
-						self.tir.constants[index as usize].ty.inner;
+						self.items.constants[usize::from(index)].ty.inner;
 					let concrete_ty =
 						self.substitute_type(original_ty, &[memory_self]);
-					let c = &self.tir.constants[index as usize];
+					let c = &self.items.constants[usize::from(index)];
 					let new_id = self.id_generator.generate();
 					// `value` itself can't be forked (not `Clone` — see
 					// above), but `const_value` can: it's what MIR lowering
@@ -517,11 +512,7 @@ impl<'ast> Builder<'ast, '_> {
 						accesses: Vec::new(),
 						attributes: Box::new([]),
 					};
-					let new_index = self.tir.constants.len() as ConstIndex;
-					self.tir.constants.push(new_constant);
-					self.tir
-						.item_lookup
-						.insert(new_id, ItemIndex::Const(new_index));
+					let new_index = self.items.push_constant(new_constant);
 					ImplEntry::AssocConstant(new_index)
 				}
 				other => other,
@@ -549,46 +540,45 @@ impl<'ast> Builder<'ast, '_> {
 			pointer,
 		)?;
 
-		let (inner_ty, memory, mutable) =
-			match &self.tir.types[pointer.ty.as_usize()] {
-				Type::Pointer {
-					to,
-					memory,
-					ownership,
-				} => (*to, *memory, *ownership == ast::Ownership::Exclusive),
-				// Error already reported — absorb it instead of reporting a
-				// bogus "`{unknown}` is not a pointer" on top of it. An
-				// `ExprKind::Error` rather than `Err(())` so callers keep
-				// going and still check what surrounds the deref: an
-				// assignment, for instance, goes on to type-check its
-				// right-hand side against `{unknown}`.
-				Type::Error => {
-					return Ok(Expression {
-						kind: ExprKind::Error,
-						ty: TypeIndex::ERROR,
-						span,
-					});
-				}
-				_ => {
-					self.tir.diagnostics.push(report_cannot_deref_non_pointer(
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							pointer.span,
-						),
-						self.formatter(func_ctx.resolve_context.namespace)
-							.display_type(pointer.ty)
-							.unwrap(),
-					));
-					return Err(());
-				}
-			};
+		let (inner_ty, memory, mutable) = match self.types.resolve(pointer.ty) {
+			Type::Pointer {
+				to,
+				memory,
+				ownership,
+			} => (*to, *memory, *ownership == ast::Ownership::Exclusive),
+			// Error already reported — absorb it instead of reporting a
+			// bogus "`{unknown}` is not a pointer" on top of it. An
+			// `ExprKind::Error` rather than `Err(())` so callers keep
+			// going and still check what surrounds the deref: an
+			// assignment, for instance, goes on to type-check its
+			// right-hand side against `{unknown}`.
+			Type::Error => {
+				return Ok(Expression {
+					kind: ExprKind::Error,
+					ty: TypeIndex::ERROR,
+					span,
+				});
+			}
+			_ => {
+				self.diagnostics.push(report_cannot_deref_non_pointer(
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						pointer.span,
+					),
+					self.formatter(func_ctx.resolve_context.namespace)
+						.display_type(pointer.ty)
+						.unwrap(),
+				));
+				return Err(());
+			}
+		};
 
 		if matches!(
 			access_ctx.access_kind,
 			AccessKind::Write | AccessKind::ReadWrite
 		) && !mutable
 		{
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				report_cannot_store_through_immutable_pointer(SourceSpan::new(
 					func_ctx.resolve_context.file_id,
 					span,
@@ -617,11 +607,9 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		span: SourceSpan,
 	) -> Result<TypeIndex, ()> {
-		match self.tir.memories.len() {
+		match self.items.memories.len() {
 			0 => {
-				self.tir
-					.diagnostics
-					.push(report_no_memory_for_pointer(span));
+				self.diagnostics.push(report_no_memory_for_pointer(span));
 				Err(())
 			}
 			1 => {
@@ -635,17 +623,15 @@ impl<'ast> Builder<'ast, '_> {
 				// A `memory` declaration's own signature resolves from its
 				// size expression alone, which cannot mention a memory, so
 				// this can never re-enter and the status is always `Resolved`.
-				let id = self.tir.memories[0].id;
+				let id = self.items.memories[0].id;
 				let _ = self.ensure_signature(id);
 				Ok(self.intern_type(Type::Memory {
 					id,
-					size: self.tir.memories[0].size.inner,
+					size: self.items.memories[0].size.inner,
 				}))
 			}
 			_ => {
-				self.tir
-					.diagnostics
-					.push(report_ambiguous_pointer_memory(span));
+				self.diagnostics.push(report_ambiguous_pointer_memory(span));
 				Err(())
 			}
 		}
@@ -655,10 +641,10 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		memory: TypeIndex,
 	) -> TypeIndex {
-		let (owner, param_index) = match self.tir.types[memory.as_usize()] {
+		let (owner, param_index) = match self.types.resolve(memory) {
 			Type::Memory { id, .. } => {
-				let idx = self.tir.expect_memory_index(id);
-				return self.tir.memories[idx as usize].size.inner;
+				let idx = self.items.expect_memory_index(*id);
+				return self.items.memories[usize::from(idx)].size.inner;
 			}
 			Type::TypeParam { owner, param_index } => (owner, param_index),
 			_ => return TypeIndex::INTEGER,
@@ -668,13 +654,13 @@ impl<'ast> Builder<'ast, '_> {
 		// Find the first bound trait that declares `Size` as an assoc type.
 		let size_sym = self.interner.get_or_intern("Size");
 		let trait_index = self
-			.tir
-			.type_param_info(owner, param_index as usize)
+			.items
+			.type_param_info(*owner, *param_index as usize)
 			.bounds
 			.traits
 			.iter()
 			.find(|b| {
-				self.tir.traits[b.trait_index as usize]
+				self.items.traits[usize::from(b.trait_index)]
 					.assoc_types
 					.contains_key(&size_sym)
 			})

@@ -17,7 +17,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// walk carries its own `super` entry).
 	///
 	/// Called once per namespace, right after it's pushed into
-	/// `tir.namespaces`. For a package's own root namespace, call this
+	/// `modules.namespaces`. For a package's own root namespace, call this
 	/// *after* `tir.package_namespaces` already has that package's entry —
 	/// that's what makes the root's own `crate` naturally resolve to
 	/// itself, with `parent: None` (no `super` inserted there, matching
@@ -29,27 +29,31 @@ impl<'ast> Builder<'ast, '_> {
 		parent: Option<NamespaceIndex>,
 	) {
 		let crate_sym = self.interner.get_or_intern("crate");
-		let crate_root = self.tir.package_namespaces[&package];
-		self.tir.namespaces[namespace_idx as usize].symbols.insert(
-			(SymbolNamespace::Type, crate_sym),
-			SymbolEntry::Resolved {
-				kind: SymbolKind::Module {
-					namespace_idx: crate_root,
+		let crate_root = self.modules.package_namespaces[&package];
+		self.modules.namespaces[usize::from(namespace_idx)]
+			.symbols
+			.insert(
+				(SymbolNamespace::Type, crate_sym),
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module {
+						namespace_idx: crate_root,
+					},
+					visibility: Visibility::Public,
 				},
-				visibility: Visibility::Public,
-			},
-		);
+			);
 		let Some(parent) = parent else { return };
 		let super_sym = self.interner.get_or_intern("super");
-		self.tir.namespaces[namespace_idx as usize].symbols.insert(
-			(SymbolNamespace::Type, super_sym),
-			SymbolEntry::Resolved {
-				kind: SymbolKind::Module {
-					namespace_idx: parent,
+		self.modules.namespaces[usize::from(namespace_idx)]
+			.symbols
+			.insert(
+				(SymbolNamespace::Type, super_sym),
+				SymbolEntry::Resolved {
+					kind: SymbolKind::Module {
+						namespace_idx: parent,
+					},
+					visibility: Visibility::Public,
 				},
-				visibility: Visibility::Public,
-			},
-		);
+			);
 	}
 
 	/// Unconditionally creates a new module namespace as a child of
@@ -66,26 +70,17 @@ impl<'ast> Builder<'ast, '_> {
 		pub_span: Option<ast::TextSpan>,
 		own_file_id: Option<FileId>,
 	) -> NamespaceIndex {
-		let namespace_idx = self.tir.namespaces.len() as u32;
-		let decl_idx = self.tir.module_decls.len() as u32;
 		// A nested module belongs to whatever package encloses it.
-		let package = self.tir.namespaces[namespace as usize].package;
-		self.tir.namespaces.push(ModuleNamespace {
-			parent: Some(namespace),
+		let package = self.modules.namespaces[usize::from(namespace)].package;
+		let namespace_idx = self.modules.push_module(
+			namespace,
 			package,
-			declaration: ModuleDeclarationKind::Module(decl_idx),
-			symbols: HashMap::new(),
-			wildcard_imports: Vec::new(),
-			accesses: Vec::new(),
-		});
-		self.seed_path_root_symbols(namespace_idx, package, Some(namespace));
-		self.tir.module_decls.push(ModuleDecl {
-			namespace_idx,
 			declaring_file_id,
 			own_file_id,
 			name,
 			pub_span,
-		});
+		);
+		self.seed_path_root_symbols(namespace_idx, package, Some(namespace));
 		self.insert_symbol(
 			namespace,
 			(SymbolNamespace::Type, name.inner),
@@ -129,7 +124,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let first_definition = self.get_symbol_location(existing);
 		let name_str = self.interner.resolve(name.inner).unwrap();
-		self.tir.diagnostics.push(report_duplicate_definition(
+		self.diagnostics.push(report_duplicate_definition(
 			DuplicateDefinitionDiagnostic {
 				name: name_str,
 				namespace: SymbolNamespace::Type,
@@ -178,7 +173,7 @@ impl<'ast> Builder<'ast, '_> {
 			} else {
 				Visibility::Public
 			};
-		self.tir.namespaces[namespace as usize]
+		self.modules.namespaces[usize::from(namespace)]
 			.symbols
 			.insert(key, SymbolEntry::Resolved { kind, visibility });
 	}
@@ -192,7 +187,7 @@ impl<'ast> Builder<'ast, '_> {
 		key: (SymbolNamespace, SymbolU32),
 		id: ast::DefId,
 	) {
-		self.tir.namespaces[namespace as usize]
+		self.modules.namespaces[usize::from(namespace)]
 			.symbols
 			.insert(key, SymbolEntry::Pending(id));
 	}
@@ -208,7 +203,7 @@ impl<'ast> Builder<'ast, '_> {
 		namespace: NamespaceIndex,
 		key: (SymbolNamespace, SymbolU32),
 	) -> Option<SymbolEntry> {
-		self.tir.namespaces[namespace as usize]
+		self.modules.namespaces[usize::from(namespace)]
 			.symbols
 			.get(&key)
 			.copied()
@@ -255,7 +250,7 @@ impl<'ast> Builder<'ast, '_> {
 			// reports the collision only if it turns out to want the name.
 			if matches!(existing, SymbolEntry::Pending(def_id)
 			if matches!(
-				self.tir.item_lookup.get(&def_id),
+				self.items.item_lookup.get(&def_id),
 				Some(ItemIndex::Use(_))
 			)) {
 				self.insert_pending(namespace, key, id);
@@ -263,7 +258,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			let first_definition = self.get_symbol_location(existing);
 			let name_str = self.interner.resolve(key.1).unwrap();
-			self.tir.diagnostics.push(report_duplicate_definition(
+			self.diagnostics.push(report_duplicate_definition(
 				DuplicateDefinitionDiagnostic {
 					name: name_str,
 					namespace: key.0,
@@ -304,7 +299,7 @@ impl<'ast> Builder<'ast, '_> {
 			// Another import's provisional claim — take it over.
 			Some(SymbolEntry::Pending(def_id))
 				if matches!(
-					self.tir.item_lookup.get(&def_id),
+					self.items.item_lookup.get(&def_id),
 					Some(ItemIndex::Use(_))
 				) =>
 			{
@@ -342,7 +337,7 @@ impl<'ast> Builder<'ast, '_> {
 			if idx == outer {
 				return true;
 			}
-			current = self.tir.namespaces[idx as usize].parent;
+			current = self.modules.namespaces[usize::from(idx)].parent;
 		}
 		false
 	}
@@ -368,33 +363,34 @@ impl<'ast> Builder<'ast, '_> {
 	fn symbol_kind_is_gated(&self, kind: SymbolKind) -> bool {
 		let declaring = match kind {
 			SymbolKind::Enum { enum_index } => {
-				self.tir.enums[enum_index as usize].namespace
+				self.items.enums[usize::from(enum_index)].namespace
 			}
 			SymbolKind::Struct { struct_index } => {
-				self.tir.structs[struct_index as usize].namespace
+				self.items.structs[usize::from(struct_index)].namespace
 			}
 			SymbolKind::Trait { trait_index }
 			| SymbolKind::TraitAssocType { trait_index, .. } => {
-				self.tir.traits[trait_index as usize].namespace
+				self.items.traits[usize::from(trait_index)].namespace
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				self.tir.typesets[typeset_index as usize].namespace
+				self.items.typesets[usize::from(typeset_index)].namespace
 			}
 			SymbolKind::Global { global_index } => {
-				self.tir.globals[global_index as usize].namespace
+				self.items.globals[usize::from(global_index)].namespace
 			}
 			SymbolKind::Function { func_index } => {
-				self.tir.functions[func_index as usize].namespace
+				self.items.functions[usize::from(func_index)].namespace
 			}
 			SymbolKind::Const { const_index } => {
-				self.tir.constants[const_index as usize].namespace
+				self.items.constants[usize::from(const_index)].namespace
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				self.tir.type_aliases[type_alias_index as usize].namespace
+				self.items.type_aliases[usize::from(type_alias_index)].namespace
 			}
 			SymbolKind::Module { namespace_idx } => {
 				return matches!(
-					self.tir.namespaces[namespace_idx as usize].declaration,
+					self.modules.namespaces[usize::from(namespace_idx)]
+						.declaration,
 					ModuleDeclarationKind::Module(_)
 				);
 			}
@@ -407,7 +403,7 @@ impl<'ast> Builder<'ast, '_> {
 		// this, every import would read as private-by-default and become
 		// uncallable from outside the `import` block itself.
 		!matches!(
-			self.tir.namespaces[declaring as usize].declaration,
+			self.modules.namespaces[usize::from(declaring)].declaration,
 			ModuleDeclarationKind::Import(..)
 		)
 	}
@@ -455,11 +451,11 @@ impl<'ast> Builder<'ast, '_> {
 	/// foreign code does.
 	pub(super) fn field_visibility(
 		&self,
-		struct_index: u32,
+		struct_index: StructIndex,
 		field_index: FieldIndex,
 	) -> Visibility {
-		if self.tir.structs[struct_index as usize].fields
-			[field_index.as_usize()]
+		if self.items.structs[usize::from(struct_index)].fields
+			[usize::from(field_index)]
 		.pub_span
 		.is_some()
 		{
@@ -479,12 +475,12 @@ impl<'ast> Builder<'ast, '_> {
 	/// by a different person, worth a code a reader can look up separately.
 	pub(super) fn report_private_field(
 		&mut self,
-		struct_index: u32,
+		struct_index: StructIndex,
 		field_index: FieldIndex,
 		access: SourceSpan,
 	) {
-		let declaration = &self.tir.structs[struct_index as usize];
-		let field = &declaration.fields[field_index.as_usize()];
+		let declaration = &self.items.structs[usize::from(struct_index)];
+		let field = &declaration.fields[usize::from(field_index)];
 		let declared_at = SourceSpan::new(declaration.file_id, field.name.span);
 		let field_name = self.interner.resolve(field.name.inner).unwrap();
 		let struct_name =
@@ -501,7 +497,7 @@ impl<'ast> Builder<'ast, '_> {
 					.secondary_label()
 					.with_message("declared without `pub` here"),
 			);
-		self.tir.diagnostics.push(diagnostic);
+		self.diagnostics.push(diagnostic);
 	}
 
 	/// [`Self::is_accessible_from`], for a raw `SymbolEntry` straight out of a
@@ -567,7 +563,7 @@ impl<'ast> Builder<'ast, '_> {
 	) -> ScopeLookup {
 		let mut current = Some(namespace);
 		while let Some(idx) = current {
-			let namespace_ref = &self.tir.namespaces[idx as usize];
+			let namespace_ref = &self.modules.namespaces[usize::from(idx)];
 			// A name declared or explicitly imported here always wins, and
 			// wins unambiguously — which is what makes `use x::foo;` the
 			// documented way out of a glob ambiguity.
@@ -578,19 +574,18 @@ impl<'ast> Builder<'ast, '_> {
 			let mut first: Option<(SymbolEntry, SourceSpan)> = None;
 			let mut candidates: Vec<(SymbolEntry, SourceSpan)> = Vec::new();
 			for import in namespace_ref.wildcard_imports.iter() {
-				let Some(entry) = self.tir.namespaces
-					[import.namespace as usize]
-					.symbols
-					.get(&key)
-					.copied()
-					.filter(|entry| {
-						self.is_entry_accessible_from(
-							namespace,
-							import.namespace,
-							*entry,
-						)
-					})
-				else {
+				let Some(entry) = self.modules.namespaces
+					[usize::from(import.namespace)]
+				.symbols
+				.get(&key)
+				.copied()
+				.filter(|entry| {
+					self.is_entry_accessible_from(
+						namespace,
+						import.namespace,
+						*entry,
+					)
+				}) else {
 					continue;
 				};
 				match first {
@@ -649,11 +644,11 @@ impl<'ast> Builder<'ast, '_> {
 		key: (SymbolNamespace, SymbolU32),
 	) -> ScopeLookup {
 		let Some(&prelude) =
-			self.tir.package_namespaces.get(&self.stdlib_package)
+			self.modules.package_namespaces.get(&self.stdlib_package)
 		else {
 			return ScopeLookup::NotFound;
 		};
-		match self.tir.namespaces[prelude as usize]
+		match self.modules.namespaces[usize::from(prelude)]
 			.symbols
 			.get(&key)
 			.copied()
@@ -717,7 +712,7 @@ impl<'ast> Builder<'ast, '_> {
 				)),
 			);
 		}
-		self.tir.diagnostics.push(
+		self.diagnostics.push(
 			diagnostic
 				.with_note(
 					"ambiguous because of multiple glob imports of a name in \
@@ -756,7 +751,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
 		for frame in chain {
-			let Some((name, name_span)) = self.tir.item_name(frame) else {
+			let Some((name, name_span)) = self.items.item_name(frame) else {
 				continue;
 			};
 			let name = self.interner.resolve(name).unwrap();
@@ -779,7 +774,7 @@ impl<'ast> Builder<'ast, '_> {
 			diagnostic = diagnostic.with_note(note);
 		}
 
-		self.tir.diagnostics.push(diagnostic.with_note(
+		self.diagnostics.push(diagnostic.with_note(
 			"types cannot have infinite size; consider using a pointer to break the cycle",
 		));
 	}
@@ -837,17 +832,18 @@ impl<'ast> Builder<'ast, '_> {
 		key: (SymbolNamespace, SymbolU32),
 		span: SourceSpan,
 	) -> Result<Option<SymbolKind>, ()> {
-		let resolved = match self.tir.namespaces[target_namespace as usize]
-			.symbols
-			.get(&key)
-			.copied()
+		let resolved = match self.modules.namespaces
+			[usize::from(target_namespace)]
+		.symbols
+		.get(&key)
+		.copied()
 		{
 			Some(SymbolEntry::Pending(def_id)) => {
 				if self.ensure_signature(def_id) == SignatureStatus::Cycle {
 					self.report_cyclic_type_dependency(def_id, span);
 					return Err(());
 				}
-				self.tir.namespaces[target_namespace as usize]
+				self.modules.namespaces[usize::from(target_namespace)]
 					.symbols
 					.get(&key)
 					.copied()
@@ -870,13 +866,9 @@ impl<'ast> Builder<'ast, '_> {
 					// from *also* calling it dead code on top of `PrivateItem`.
 					// Every caller's own `record_symbol_access` call sits
 					// on the success path only, so this doesn't double up.
-					self.tir.record_symbol_access(
-						span.file_id,
-						kind,
-						span.span,
-					);
+					self.record_symbol_access(span.file_id, kind, span.span);
 					let name = self.interner.resolve(key.1).unwrap();
-					self.tir.diagnostics.push(report_private_item(name, span));
+					self.diagnostics.push(report_private_item(name, span));
 					return Err(());
 				}
 				Ok(Some(kind))
@@ -945,40 +937,40 @@ impl<'ast> Builder<'ast, '_> {
 			// is available via `item_lookup` even though its fields/value
 			// haven't been resolved yet.
 			SymbolEntry::Pending(def_id) => {
-				return match self.tir.item_lookup[&def_id] {
+				return match self.items.item_lookup[&def_id] {
 					ItemIndex::Function(idx) => {
-						let f = &self.tir.functions[idx as usize];
+						let f = &self.items.functions[usize::from(idx)];
 						SourceSpan::new(f.file_id, f.name.span)
 					}
 					// An import's "declaration" is the local name it binds,
 					// which is the alias when it has one — that's the name
 					// that actually collided.
 					ItemIndex::Use(idx) => {
-						let u = &self.tir.use_items[idx as usize];
+						let u = &self.items.use_items[usize::from(idx)];
 						SourceSpan::new(u.file_id, u.local_name().span)
 					}
 					ItemIndex::Global(idx) => {
-						let g = &self.tir.globals[idx as usize];
+						let g = &self.items.globals[usize::from(idx)];
 						SourceSpan::new(g.file_id, g.name.span)
 					}
 					ItemIndex::Memory(idx) => {
-						let m = &self.tir.memories[idx as usize];
+						let m = &self.items.memories[usize::from(idx)];
 						SourceSpan::new(m.file_id, m.name.span)
 					}
 					ItemIndex::Struct(idx) => {
-						let s = &self.tir.structs[idx as usize];
+						let s = &self.items.structs[usize::from(idx)];
 						SourceSpan::new(s.file_id, s.name.span)
 					}
 					ItemIndex::Const(idx) => {
-						let c = &self.tir.constants[idx as usize];
+						let c = &self.items.constants[usize::from(idx)];
 						SourceSpan::new(c.file_id, c.name.span)
 					}
 					ItemIndex::Enum(idx) => {
-						let e = &self.tir.enums[idx as usize];
+						let e = &self.items.enums[usize::from(idx)];
 						SourceSpan::new(e.file_id, e.name.span)
 					}
 					ItemIndex::TypeAlias(idx) => {
-						let a = &self.tir.type_aliases[idx as usize];
+						let a = &self.items.type_aliases[usize::from(idx)];
 						SourceSpan::new(a.file_id, a.name.span)
 					}
 					// TODO: chaugh panic when writing impl for trait, need to revisit this
@@ -992,33 +984,37 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		match symbol {
 			SymbolKind::Function { func_index } => {
-				let func = &self.tir.functions[func_index as usize];
+				let func = &self.items.functions[usize::from(func_index)];
 				SourceSpan::new(func.file_id, func.name.span)
 			}
 			SymbolKind::Global { global_index } => {
-				let global = &self.tir.globals[global_index as usize];
+				let global = &self.items.globals[usize::from(global_index)];
 				SourceSpan::new(global.file_id, global.name.span)
 			}
 			SymbolKind::Const { const_index } => {
-				let const_ = &self.tir.constants[const_index as usize];
+				let const_ = &self.items.constants[usize::from(const_index)];
 				SourceSpan::new(const_.file_id, const_.name.span)
 			}
 			SymbolKind::Enum { enum_index } => {
-				let enum_ = &self.tir.enums[enum_index as usize];
+				let enum_ = &self.items.enums[usize::from(enum_index)];
 				SourceSpan::new(enum_.file_id, enum_.name.span)
 			}
 			SymbolKind::Struct { struct_index } => {
-				let s = &self.tir.structs[struct_index as usize];
+				let s = &self.items.structs[usize::from(struct_index)];
 				SourceSpan::new(s.file_id, s.name.span)
 			}
 			SymbolKind::Module { namespace_idx } => {
-				match self.tir.namespaces[namespace_idx as usize].declaration {
+				match self.modules.namespaces[usize::from(namespace_idx)]
+					.declaration
+				{
 					ModuleDeclarationKind::Module(decl_idx) => {
-						let decl = &self.tir.module_decls[decl_idx as usize];
+						let decl =
+							&self.modules.module_decls[usize::from(decl_idx)];
 						SourceSpan::new(decl.declaring_file_id, decl.name.span)
 					}
 					ModuleDeclarationKind::Import(import_idx) => {
-						let decl = &self.tir.import_decls[import_idx as usize];
+						let decl =
+							&self.modules.import_decls[usize::from(import_idx)];
 						SourceSpan::new(decl.file_id, decl.external_name.span)
 					}
 					ModuleDeclarationKind::Package(file_id) => {
@@ -1027,23 +1023,24 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			SymbolKind::Trait { trait_index } => {
-				let trait_ = &self.tir.traits[trait_index as usize];
+				let trait_ = &self.items.traits[usize::from(trait_index)];
 				SourceSpan::new(trait_.file_id, trait_.name.span)
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				let ts = &self.tir.typesets[typeset_index as usize];
+				let ts = &self.items.typesets[usize::from(typeset_index)];
 				SourceSpan::new(ts.file_id, ts.name.span)
 			}
 			SymbolKind::Memory { memory_index, .. } => {
-				let memory = &self.tir.memories[memory_index as usize];
+				let memory = &self.items.memories[usize::from(memory_index)];
 				SourceSpan::new(memory.file_id, memory.name.span)
 			}
 			SymbolKind::TraitAssocType { trait_index, .. } => {
-				let trait_ = &self.tir.traits[trait_index as usize];
+				let trait_ = &self.items.traits[usize::from(trait_index)];
 				SourceSpan::new(trait_.file_id, trait_.name.span)
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				let alias = &self.tir.type_aliases[type_alias_index as usize];
+				let alias =
+					&self.items.type_aliases[usize::from(type_alias_index)];
 				SourceSpan::new(alias.file_id, alias.name.span)
 			}
 		}
@@ -1078,8 +1075,8 @@ impl<'ast> Builder<'ast, '_> {
 		tree: &'ast ast::Spanned<ast::UseTree>,
 		prefix: &mut Vec<ast::Spanned<SymbolU32>>,
 		contiguous_start: u32,
-		prefix_index: Option<u32>,
-	) -> Option<u32> {
+		prefix_index: Option<UsePrefixIndex>,
+	) -> Option<UsePrefixIndex> {
 		match &tree.inner {
 			ast::UseTree::Path { segment, rest } => {
 				prefix.push(*segment);
@@ -1127,7 +1124,7 @@ impl<'ast> Builder<'ast, '_> {
 				) else {
 					return prefix_index;
 				};
-				self.tir.namespaces[resolve_context.namespace as usize]
+				self.modules.namespaces[usize::from(resolve_context.namespace)]
 					.wildcard_imports
 					.push(WildcardImport {
 						namespace: source_ns,
@@ -1142,8 +1139,6 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			ast::UseTree::Name { id, name, alias } => {
 				let local = alias.unwrap_or(*name);
-				let use_index = self.tir.use_items.len() as u32;
-
 				// Both namespaces, because which one this import lands in
 				// isn't knowable until its target resolves in Phase 2. The
 				// one that turns out to be wrong is withdrawn there.
@@ -1165,20 +1160,17 @@ impl<'ast> Builder<'ast, '_> {
 				// the same index reuse it, so the segments are stored once
 				// however many names the group imports.
 				let prefix_index = prefix_index.unwrap_or_else(|| {
-					let index = self.tir.use_prefixes.len() as u32;
-					self.tir.use_prefixes.push(UsePrefix {
+					self.items.push_use_prefix(UsePrefix {
 						path: prefix.clone().into_boxed_slice(),
 						target: PrefixTarget::Unwalked,
-					});
-					index
+					})
 				});
 
 				// Unconditional, like every other item arm: the stub and the
 				// `ast_nodes` entry exist whether or not the name was won,
 				// so a losing duplicate still resolves fully and still has a
 				// declaration span to point at.
-				self.tir.item_lookup.insert(*id, ItemIndex::Use(use_index));
-				self.tir.use_items.push(UseItem {
+				let use_index = self.items.push_use_item(UseItem {
 					id: *id,
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
@@ -1206,8 +1198,8 @@ impl<'ast> Builder<'ast, '_> {
 	/// state — bound to a real symbol, or gone. A `Pending` left behind
 	/// would outlive its own signature pass and hit the "signature resolved
 	/// but symbol still pending" unreachable at the next reference to it.
-	pub(super) fn resolve_use_item(&mut self, use_index: u32) {
-		let item = &self.tir.use_items[use_index as usize];
+	pub(super) fn resolve_use_item(&mut self, use_index: UseIndex) {
+		let item = &self.items.use_items[usize::from(use_index)];
 		let (id, file_id, namespace, name, local, prefix, pub_span) = (
 			item.id,
 			item.file_id,
@@ -1219,14 +1211,15 @@ impl<'ast> Builder<'ast, '_> {
 		);
 		let name_span = SourceSpan::new(file_id, name.span);
 
-		let target = match self.tir.use_prefixes[prefix as usize].target {
+		let target = match self.items.use_prefixes[usize::from(prefix)].target {
 			// A sibling leaf already walked these very tokens — reuse its
 			// answer rather than re-walking and re-reporting.
 			walked @ (PrefixTarget::Resolved(_) | PrefixTarget::Failed) => {
 				walked
 			}
 			PrefixTarget::Unwalked => {
-				let path = self.tir.use_prefixes[prefix as usize].path.clone();
+				let path =
+					self.items.use_prefixes[usize::from(prefix)].path.clone();
 				// Unlike the glob path at prescan — which stays silent, since
 				// it can legitimately run before its target file has been
 				// scanned — a named leaf resolves late enough that everything
@@ -1241,27 +1234,25 @@ impl<'ast> Builder<'ast, '_> {
 					// it *from*.
 					PrefixWalk::Empty => {
 						let name = self.interner.resolve(name.inner).unwrap();
-						self.tir.diagnostics.push(
-							report_import_without_module(name, name_span),
-						);
+						self.diagnostics.push(report_import_without_module(
+							name, name_span,
+						));
 						PrefixTarget::Failed
 					}
 					PrefixWalk::NotAModule(segment, span) => {
 						let name =
 							self.interner.resolve(segment.inner).unwrap();
-						self.tir
-							.diagnostics
+						self.diagnostics
 							.push(report_not_a_namespace(name, span));
 						PrefixTarget::Failed
 					}
 					PrefixWalk::Unresolved(span) => {
-						self.tir
-							.diagnostics
+						self.diagnostics
 							.push(report_undeclared_identifier(span));
 						PrefixTarget::Failed
 					}
 				};
-				self.tir.use_prefixes[prefix as usize].target = walked;
+				self.items.use_prefixes[usize::from(prefix)].target = walked;
 				walked
 			}
 		};
@@ -1293,7 +1284,7 @@ impl<'ast> Builder<'ast, '_> {
 					if let Some(SymbolEntry::Pending(rival)) =
 						self.direct_scope_lookup(namespace, key)
 						&& rival != id && matches!(
-						self.tir.item_lookup.get(&rival),
+						self.items.item_lookup.get(&rival),
 						Some(ItemIndex::Use(_))
 					) {
 						// Status discarded on the strength of the comment
@@ -1330,7 +1321,7 @@ impl<'ast> Builder<'ast, '_> {
 					// every access into a reference, so a rename would
 					// emit two overlapping edits at one range.
 					if !bound_any {
-						self.tir.record_symbol_access(file_id, kind, name.span);
+						self.record_symbol_access(file_id, kind, name.span);
 					}
 					bound_any = true;
 				}
@@ -1359,13 +1350,13 @@ impl<'ast> Builder<'ast, '_> {
 			// A package has no name of its own — it's known by the key the
 			// asking package declared it under, so this needs the *asking*
 			// namespace's package, not the target's.
-			let module_str = self.tir.namespace_name(
+			let module_str = self.modules.namespace_name(
 				target_ns,
 				self.packages,
-				self.tir.namespaces[namespace as usize].package,
+				self.modules.namespaces[usize::from(namespace)].package,
 				self.interner,
 			);
-			self.tir.diagnostics.push(report_unresolved_import(
+			self.diagnostics.push(report_unresolved_import(
 				name_str, module_str, name_span,
 			));
 		}
@@ -1391,7 +1382,7 @@ impl<'ast> Builder<'ast, '_> {
 		} else {
 			(occupant, import)
 		};
-		self.tir.diagnostics.push(report_duplicate_definition(
+		self.diagnostics.push(report_duplicate_definition(
 			DuplicateDefinitionDiagnostic {
 				name,
 				namespace: symbol_namespace,
@@ -1413,7 +1404,9 @@ impl<'ast> Builder<'ast, '_> {
 	) {
 		let key = (symbol_namespace, local);
 		if self.still_pending(namespace, key, id) {
-			self.tir.namespaces[namespace as usize].symbols.remove(&key);
+			self.modules.namespaces[usize::from(namespace)]
+				.symbols
+				.remove(&key);
 		}
 	}
 
@@ -1458,9 +1451,10 @@ impl<'ast> Builder<'ast, '_> {
 			let kind = match current_ns {
 				// Later segments resolve only inside what we've already
 				// walked into.
-				Some(idx) => {
-					self.tir.namespaces[idx as usize].symbols.get(&key).copied()
-				}
+				Some(idx) => self.modules.namespaces[usize::from(idx)]
+					.symbols
+					.get(&key)
+					.copied(),
 				// The first segment is an ordinary scope-chain lookup from
 				// wherever the `use` was written, so it reaches a sibling
 				// module, or a dependency name held further up on the
@@ -1476,7 +1470,7 @@ impl<'ast> Builder<'ast, '_> {
 					kind: SymbolKind::Module { namespace_idx },
 					..
 				}) => {
-					self.tir.namespaces[namespace_idx as usize]
+					self.modules.namespaces[usize::from(namespace_idx)]
 						.accesses
 						.push(span);
 					current_ns = Some(namespace_idx);

@@ -179,8 +179,8 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			ExprKind::Const { id } => {
-				let const_index = self.tir.expect_const_index(*id);
-				self.tir.constants[const_index as usize]
+				let const_index = self.items.expect_const_index(*id);
+				self.items.constants[usize::from(const_index)]
 					.const_value
 					.ok_or(())
 			}
@@ -218,7 +218,7 @@ impl<'ast> Builder<'ast, '_> {
 				scopes: vec![root_scope],
 				labels: Vec::new(),
 			},
-			scope_index: 0 as ScopeIndex,
+			scope_index: ScopeIndex::new(0),
 			lookup: HashMap::new(),
 			resolve_context,
 			scope: None,
@@ -242,13 +242,13 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if value_expr.ty.is_comptime_number() {
-			self.tir.diagnostics.push(report_type_annotation_required(
+			self.diagnostics.push(report_type_annotation_required(
 				SourceSpan::new(resolve_context.file_id, expr.span),
 			));
 			return Err(());
 		}
 		if ty != TypeIndex::ERROR && !self.coercible_to(value_expr.ty, ty) {
-			self.tir.diagnostics.push(report_type_mistmatch(
+			self.diagnostics.push(report_type_mistmatch(
 				self.formatter(resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: ty,
@@ -277,7 +277,7 @@ impl<'ast> Builder<'ast, '_> {
 		let cast_type = if cast_type == TypeIndex::INFER {
 			let expected = access_ctx.expected_type;
 			if expected == TypeIndex::INFER {
-				self.tir.diagnostics.push(report_type_annotation_required(
+				self.diagnostics.push(report_type_annotation_required(
 					SourceSpan::new(ctx.resolve_context.file_id, expr_span),
 				));
 				return self.build_expression(ctx, access_ctx, value);
@@ -300,7 +300,7 @@ impl<'ast> Builder<'ast, '_> {
 			// TODO: add checks for unsafe/lossy casts like i32 to u8, or u32 to char
 			value.ty = cast_type;
 		} else {
-			self.tir.diagnostics.push(report_invalid_cast(
+			self.diagnostics.push(report_invalid_cast(
 				self.formatter(ctx.resolve_context.namespace),
 				value.ty,
 				cast_type,
@@ -315,7 +315,7 @@ impl<'ast> Builder<'ast, '_> {
 		if a == b {
 			return true;
 		}
-		match (&self.tir.types[a.as_usize()], &self.tir.types[b.as_usize()]) {
+		match (self.types.resolve(a), self.types.resolve(b)) {
 			// KNOWN GAP: casts only check `memory` equality, not ownership —
 			// `&T as *T` currently passes, silently defeating "a `&T` is
 			// always read-only". Fixing this properly needs a real rework of
@@ -365,7 +365,7 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	fn type_scalar(&self, ty: TypeIndex) -> Option<WasmScalar> {
-		match &self.tir.types[ty.as_usize()] {
+		match self.types.resolve(ty) {
 			Type::Bool
 			| Type::U8
 			| Type::I8
@@ -376,18 +376,17 @@ impl<'ast> Builder<'ast, '_> {
 			| Type::Char
 			| Type::Function { .. } => Some(WasmScalar::I32),
 			Type::Enum { enum_index } => {
-				let repr_type = self.tir.enums[*enum_index as usize].repr_type;
+				let repr_type =
+					self.items.enums[usize::from(*enum_index)].repr_type;
 				self.type_scalar(repr_type)
 			}
 			Type::U64 | Type::I64 => Some(WasmScalar::I64),
 			Type::F32 => Some(WasmScalar::F32),
 			Type::F64 => Some(WasmScalar::F64),
-			Type::Pointer { memory, .. } => {
-				match &self.tir.types[memory.as_usize()] {
-					Type::Memory { size, .. } => self.type_scalar(*size),
-					_ => None,
-				}
-			}
+			Type::Pointer { memory, .. } => match self.types.resolve(*memory) {
+				Type::Memory { size, .. } => self.type_scalar(*size),
+				_ => None,
+			},
 			Type::Tuple { .. }
 			| Type::Array { .. }
 			| Type::AssociatedType { .. }
@@ -414,8 +413,7 @@ impl<'ast> Builder<'ast, '_> {
 		target_type: TypeIndex,
 	) -> Result<(), ()> {
 		// if target_type == TypeIndex::INFER {
-		//     self.tir
-		//         .diagnostics
+		//     self.diagnostics
 		//         .push(report_type_annotation_required(SourceSpan::new(
 		//             file_id, expr.span,
 		//         )));
@@ -445,7 +443,7 @@ impl<'ast> Builder<'ast, '_> {
 			} => {
 				self.coerce_untyped_expr(ctx, result, target_type)?;
 				expr.ty = target_type;
-				ctx.stack.scopes[scope_index as usize].inferred_type =
+				ctx.stack.scopes[usize::from(scope_index)].inferred_type =
 					target_type;
 				Ok(())
 			}
@@ -488,34 +486,28 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		if let Some(max) = primitive_int_max {
 			if value > max {
-				self.tir
-					.diagnostics
-					.push(report_integer_literal_out_of_range(
-						formatter,
-						IntegerLiteralOutOfRangeDiagnostic {
-							ty: target_idx,
-							value: value as i64,
-							span: SourceSpan::new(file_id, expr.span),
-						},
-					));
+				self.diagnostics.push(report_integer_literal_out_of_range(
+					formatter,
+					IntegerLiteralOutOfRangeDiagnostic {
+						ty: target_idx,
+						value: value as i64,
+						span: SourceSpan::new(file_id, expr.span),
+					},
+				));
 			}
 			expr.ty = target_idx;
 			Ok(())
 		} else if target_idx == TypeIndex::F32 || target_idx == TypeIndex::F64 {
-			self.tir
-				.diagnostics
-				.push(report_integer_literal_for_float_type(SourceSpan::new(
-					file_id, expr.span,
-				)));
+			self.diagnostics.push(report_integer_literal_for_float_type(
+				SourceSpan::new(file_id, expr.span),
+			));
 			Err(())
-		} else if matches!(
-			self.tir.types[target_idx.as_usize()],
-			Type::Pointer { .. }
-		) {
+		} else if matches!(self.types.resolve(target_idx), Type::Pointer { .. })
+		{
 			match self.type_scalar(target_idx) {
 				Some(WasmScalar::I32) => {
 					if value > u32::MAX as u64 {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							report_integer_literal_out_of_range(
 								formatter,
 								IntegerLiteralOutOfRangeDiagnostic {
@@ -536,11 +528,11 @@ impl<'ast> Builder<'ast, '_> {
 					if let Some(ts) = self
 						.interner
 						.get("pointer_size")
-						.and_then(|key| self.tir.tagged_items.get(&key))
+						.and_then(|key| self.items.tagged_items.get(&key))
 						.and_then(|tagged_id| {
-							self.tir.typeset_index(*tagged_id)
+							self.items.typeset_index(*tagged_id)
 						})
-						.map(|idx| &self.tir.typesets[idx as usize])
+						.map(|idx| &self.items.typesets[usize::from(idx)])
 					{
 						if !ts.intersection_range.contains(value as i64) {
 							let ts_name = self
@@ -548,7 +540,7 @@ impl<'ast> Builder<'ast, '_> {
 								.resolve(ts.name.inner)
 								.unwrap_or("PointerSize")
 								.to_string();
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								report_integer_literal_out_of_typeset_range(
 									value as i64,
 									&ts_name,
@@ -564,17 +556,17 @@ impl<'ast> Builder<'ast, '_> {
 			expr.ty = target_idx;
 			Ok(())
 		} else if let Some(typeset_index) = self
-			.tir
-			.abstract_type_bounds(target_idx)
+			.items
+			.abstract_type_bounds(&self.types, target_idx)
 			.and_then(|bounds| bounds.typeset)
 			.map(|typeset_bound| typeset_bound.typeset_index)
 		{
-			let ts = &self.tir.typesets[typeset_index as usize];
+			let ts = &self.items.typesets[usize::from(typeset_index)];
 			let range = &ts.intersection_range;
 			let ts_name =
 				self.interner.resolve(ts.name.inner).unwrap().to_string();
 			if !range.contains(value as i64) {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_integer_literal_out_of_typeset_range(
 						value as i64,
 						&ts_name,
@@ -587,7 +579,7 @@ impl<'ast> Builder<'ast, '_> {
 			expr.ty = target_idx;
 			Ok(())
 		} else {
-			self.tir.diagnostics.push(report_unable_to_coerce(
+			self.diagnostics.push(report_unable_to_coerce(
 				formatter,
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
@@ -612,7 +604,7 @@ impl<'ast> Builder<'ast, '_> {
 			expr.ty = TypeIndex::F64;
 			Ok(())
 		} else {
-			self.tir.diagnostics.push(report_unable_to_coerce(
+			self.diagnostics.push(report_unable_to_coerce(
 				self.formatter(resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
@@ -647,7 +639,7 @@ impl<'ast> Builder<'ast, '_> {
 					|| target_idx == TypeIndex::F32
 					|| target_idx == TypeIndex::F64;
 				if !is_valid {
-					self.tir.diagnostics.push(report_unable_to_coerce(
+					self.diagnostics.push(report_unable_to_coerce(
 						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
@@ -677,7 +669,7 @@ impl<'ast> Builder<'ast, '_> {
 						_ => u64::MAX,
 					};
 					if value > max_magnitude {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							report_integer_literal_out_of_range(
 								self.formatter(ctx.resolve_context.namespace),
 								IntegerLiteralOutOfRangeDiagnostic {
@@ -697,7 +689,7 @@ impl<'ast> Builder<'ast, '_> {
 			// doesn't matter for bitwise complement.
 			ast::UnaryOp::BitNot => {
 				if !target_idx.is_integer() {
-					self.tir.diagnostics.push(report_unable_to_coerce(
+					self.diagnostics.push(report_unable_to_coerce(
 						self.formatter(ctx.resolve_context.namespace),
 						target_idx,
 						SourceSpan::new(file_id, expr.span),
@@ -723,7 +715,7 @@ impl<'ast> Builder<'ast, '_> {
 				method_symbol,
 				target_idx,
 			) {
-			self.tir.functions[func_idx as usize]
+			self.items.functions[usize::from(func_idx)]
 				.accesses
 				.push(SourceSpan::new(file_id, operator.span));
 		}
@@ -757,7 +749,7 @@ impl<'ast> Builder<'ast, '_> {
 		// untyped for this function to reach.
 		debug_assert!(operator.inner.is_arithmetic());
 		if !target_idx.is_primitive() {
-			self.tir.diagnostics.push(report_unable_to_coerce(
+			self.diagnostics.push(report_unable_to_coerce(
 				self.formatter(ctx.resolve_context.namespace),
 				target_idx,
 				SourceSpan::new(file_id, expr.span),
@@ -790,7 +782,7 @@ impl<'ast> Builder<'ast, '_> {
 						method_symbol,
 						target_idx,
 					) {
-					self.tir.functions[func_idx as usize]
+					self.items.functions[usize::from(func_idx)]
 						.accesses
 						.push(SourceSpan::new(file_id, operator.span));
 				}

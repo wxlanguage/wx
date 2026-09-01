@@ -6,7 +6,7 @@
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
-	/// Registers `trait_impl_index` (already pushed into `tir.trait_impls`,
+	/// Registers `trait_impl_index` (already pushed into `items.trait_impls`,
 	/// target already resolved to `target_type`) into `trait_impl_dispatch`,
 	/// unless a prior impl of the same trait already claims this type
 	/// constructor — WX allows at most one implementation of a given trait
@@ -22,19 +22,18 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		trait_impl_index: TraitImplIndex,
 	) {
-		let Ok(kind) =
-			ImplTarget::from_type(&self.tir.types[target_type.as_usize()])
+		let Ok(kind) = ImplTarget::from_type(self.types.resolve(target_type))
 		else {
 			let trait_name_sym =
-				self.tir.traits[trait_index as usize].name.inner;
+				self.items.traits[usize::from(trait_index)].name.inner;
 			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
-			let imp = &self.tir.trait_impls[trait_impl_index as usize];
+			let imp = &self.items.trait_impls[usize::from(trait_impl_index)];
 			let span = SourceSpan::new(imp.file_id, imp.span);
 			let type_str = self
-				.formatter(self.tir.file_namespaces[imp.file_id.as_usize()])
+				.formatter(self.modules.file_namespaces[imp.file_id.as_usize()])
 				.display_type(target_type)
 				.unwrap();
-			self.tir.diagnostics.push(Diagnostic {
+			self.diagnostics.push(Diagnostic {
 				severity: Severity::Error,
 				code: Some(
 					DiagnosticCode::InvalidImplTarget.code().to_string(),
@@ -47,19 +46,21 @@ impl<'ast> Builder<'ast, '_> {
 			});
 			return;
 		};
-		let bucket = self.tir.trait_impl_dispatch.entry(kind).or_default();
+		let bucket = self.items.trait_impl_dispatch.entry(kind).or_default();
 		if let Some(&(_, existing_index)) =
 			bucket.iter().find(|(ti, _)| *ti == trait_index)
 		{
 			let trait_name_sym =
-				self.tir.traits[trait_index as usize].name.inner;
+				self.items.traits[usize::from(trait_index)].name.inner;
 			let trait_name = self.interner.resolve(trait_name_sym).unwrap();
-			let new_impl = &self.tir.trait_impls[trait_impl_index as usize];
+			let new_impl =
+				&self.items.trait_impls[usize::from(trait_impl_index)];
 			let new_span = SourceSpan::new(new_impl.file_id, new_impl.span);
-			let existing_impl = &self.tir.trait_impls[existing_index as usize];
+			let existing_impl =
+				&self.items.trait_impls[usize::from(existing_index)];
 			let existing_span =
 				SourceSpan::new(existing_impl.file_id, existing_impl.span);
-			self.tir.diagnostics.push(Diagnostic {
+			self.diagnostics.push(Diagnostic {
 				severity: Severity::Error,
 				code: Some(
 					DiagnosticCode::DuplicateTraitImpl.code().to_string(),
@@ -83,8 +84,9 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	pub(super) fn check_trait_conformance(&mut self) {
-		for trait_impl in self.tir.trait_impls.iter() {
-			let trait_def = &self.tir.traits[trait_impl.trait_index as usize];
+		for trait_impl in self.items.trait_impls.iter() {
+			let trait_def =
+				&self.items.traits[usize::from(trait_impl.trait_index)];
 			let mut missing_items: Vec<(SymbolU32, TextSpan)> = Vec::new();
 
 			for (&name, &def_entry) in trait_def.entries.iter() {
@@ -127,9 +129,9 @@ impl<'ast> Builder<'ast, '_> {
 						_ => {
 							missing_items.push((
 								name,
-								def_entry.def_span(&self.tir).span,
+								def_entry.def_span(&self.items).span,
 							));
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 									Diagnostic::new(Severity::Error)
 										.with_code(
 											DiagnosticCode::TraitImplItemKindMismatch,
@@ -144,13 +146,13 @@ impl<'ast> Builder<'ast, '_> {
 										))
 										.with_label(
 											provided_impl
-												.def_span(&self.tir)
+												.def_span(&self.items)
 												.primary_label()
 												.with_message("does not match trait"),
 										)
 										.with_label(
 											def_entry
-												.def_span(&self.tir)
+												.def_span(&self.items)
 												.secondary_label()
 												.with_message("item in trait"),
 										),
@@ -160,12 +162,12 @@ impl<'ast> Builder<'ast, '_> {
 					None => {
 						let default_impl_exists = match def_entry {
 							ImplEntry::AssocFunction(func_index)
-							| ImplEntry::Method(func_index) => self.tir.functions
-								[func_index as usize]
-								.body
-								.is_some(),
+							| ImplEntry::Method(func_index) => self.items.functions
+								[usize::from(func_index)]
+							.body
+							.is_some(),
 							ImplEntry::AssocConstant(const_index) => {
-								self.tir.constants[const_index as usize]
+								self.items.constants[usize::from(const_index)]
 									.value
 									.is_some()
 							}
@@ -181,7 +183,7 @@ impl<'ast> Builder<'ast, '_> {
 						if !default_impl_exists {
 							missing_items.push((
 								name,
-								def_entry.def_span(&self.tir).span,
+								def_entry.def_span(&self.items).span,
 							));
 						}
 					}
@@ -218,7 +220,7 @@ impl<'ast> Builder<'ast, '_> {
 							)),
 					);
 				}
-				self.tir.diagnostics.push(diagnostic);
+				self.diagnostics.push(diagnostic);
 			}
 
 			for (&name, &impl_entry) in trait_impl.members.iter() {
@@ -226,7 +228,7 @@ impl<'ast> Builder<'ast, '_> {
 					let trait_name =
 						self.interner.resolve(trait_def.name.inner).unwrap();
 					let item_name = self.interner.resolve(name).unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::NotATraitMember)
 							.with_message(format!(
@@ -235,7 +237,7 @@ impl<'ast> Builder<'ast, '_> {
 							))
 							.with_label(
 								impl_entry
-									.def_span(&self.tir)
+									.def_span(&self.items)
 									.primary_label()
 									.with_message(format!(
 										"not a member of trait `{trait_name}`"
@@ -247,8 +249,9 @@ impl<'ast> Builder<'ast, '_> {
 
 			for supertrait in trait_def.bounds.traits.iter() {
 				if self
-					.tir
+					.items
 					.find_trait_impl(
+						&self.types,
 						trait_impl.target.inner,
 						supertrait.trait_index,
 					)
@@ -257,9 +260,10 @@ impl<'ast> Builder<'ast, '_> {
 					let supertrait_name = self
 						.interner
 						.resolve(
-							self.tir.traits[supertrait.trait_index as usize]
-								.name
-								.inner,
+							self.items.traits
+								[usize::from(supertrait.trait_index)]
+							.name
+							.inner,
 						)
 						.unwrap();
 					let trait_name =
@@ -268,7 +272,7 @@ impl<'ast> Builder<'ast, '_> {
 						.formatter(trait_impl.namespace)
 						.display_type(trait_impl.target.inner)
 						.unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::UnsatisfiedTraitBound.code(),
@@ -302,8 +306,8 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		// iterating without borrowing so that there's no issues when trying to borrow again with mutable reference in check_assoc_type_bounds
-		for trait_impl_index in 0..self.tir.trait_impls.len() {
-			let trait_impl = &self.tir.trait_impls[trait_impl_index];
+		for trait_impl_index in 0..self.items.trait_impls.len() {
+			let trait_impl = &self.items.trait_impls[trait_impl_index];
 			let trait_index = trait_impl.trait_index;
 			let target_type = trait_impl.target.inner;
 			let resolve_context = ResolveContext {
@@ -311,7 +315,7 @@ impl<'ast> Builder<'ast, '_> {
 				namespace: trait_impl.namespace,
 			};
 
-			let mut assoc_types: Box<[_]> = self.tir.trait_impls
+			let mut assoc_types: Box<[_]> = self.items.trait_impls
 				[trait_impl_index]
 				.members
 				.values()
@@ -319,7 +323,7 @@ impl<'ast> Builder<'ast, '_> {
 				.filter_map(|entry| match entry {
 					ImplEntry::AssocType(idx) => {
 						let assoc_type =
-							&self.tir.assoc_type_impls[idx as usize];
+							&self.items.assoc_type_impls[usize::from(idx)];
 						Some((assoc_type.name, assoc_type.ty.unwrap()))
 					}
 					_ => None,
@@ -346,7 +350,7 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	) {
 		// Ensure the impl block's target is resolved first. In progress means
 		// the block is what forced this member, and it resolves its target
@@ -363,8 +367,9 @@ impl<'ast> Builder<'ast, '_> {
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
-			let self_type =
-				self.tir.inherent_impls[block_index as usize].target.inner;
+			let self_type = self.items.inherent_impls[usize::from(block_index)]
+				.target
+				.inner;
 			let self_scope = GenericScope {
 				owner: TypeParamOwner::ImplBlock(block_index),
 				self_type: Some(self_type),
@@ -383,17 +388,16 @@ impl<'ast> Builder<'ast, '_> {
 				let const_value = match self.eval_const_expr(&value_expr) {
 					Ok(v) => Some(v),
 					Err(_) => {
-						self.tir.diagnostics.push(
-							report_not_const_evaluatable(SourceSpan::new(
+						self.diagnostics.push(report_not_const_evaluatable(
+							SourceSpan::new(
 								resolve_context.file_id,
 								value.span,
-							)),
-						);
+							),
+						));
 						None
 					}
 				};
-				let const_index = self.tir.constants.len() as ConstIndex;
-				self.tir.constants.push(Constant {
+				let const_index = self.items.push_constant(Constant {
 					id: *id,
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
@@ -409,9 +413,6 @@ impl<'ast> Builder<'ast, '_> {
 					accesses: Vec::new(),
 					attributes,
 				});
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Const(const_index));
 				self.register_inherent_impl_member(
 					resolve_context,
 					block_index,
@@ -428,7 +429,7 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	) {
 		// Ensure the impl block's bounds and target are resolved first. Same
 		// parent-before-member ordering as `signature_inherent_impl_const`.
@@ -446,20 +447,19 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		// The impl block already has its bounds and target resolved.
-		let self_type =
-			self.tir.inherent_impls[block_index as usize].target.inner;
-		let inherited_type_param_count = self.tir.inherent_impls
-			[block_index as usize]
-			.type_params
-			.len();
+		let self_type = self.items.inherent_impls[usize::from(block_index)]
+			.target
+			.inner;
+		let inherited_type_param_count = self.items.inherent_impls
+			[usize::from(block_index)]
+		.type_params
+		.len();
 
 		let attributes = self.resolve_attributes(*id, attributes);
-		let func_index = self.tir.functions.len() as u32;
-
 		// Register the function with only its own (method-level) type
 		// params. Impl-level params (if any) are inherited via
 		// type_param_parent.
-		self.tir.functions.push(Function {
+		let func_index = self.items.push_function(Function {
 			id: *id,
 			file_id: resolve_context.file_id,
 			namespace: resolve_context.namespace,
@@ -480,9 +480,6 @@ impl<'ast> Builder<'ast, '_> {
 			result: None,
 			attributes,
 		});
-		self.tir
-			.item_lookup
-			.insert(*id, ItemIndex::Function(func_index));
 
 		// Resolve the function's own param bounds. resolve_type_identifier
 		// automatically walks up to ImplBlock when a name isn't found in
@@ -511,7 +508,7 @@ impl<'ast> Builder<'ast, '_> {
 			signature,
 		);
 		let signature_index = self.intern_function(&params, result);
-		let func = &mut self.tir.functions[func_index as usize];
+		let func = &mut self.items.functions[usize::from(func_index)];
 		func.params = params;
 		func.result = result;
 		func.signature_index = signature_index;
@@ -547,18 +544,17 @@ impl<'ast> Builder<'ast, '_> {
 	fn register_inherent_impl_member(
 		&mut self,
 		resolve_context: ResolveContext,
-		block_index: u32,
+		block_index: InherentImplIndex,
 		self_type: TypeIndex,
 		name: ast::Spanned<SymbolU32>,
 		entry: ImplEntry,
 	) {
-		let target =
-			ImplTarget::from_type(&self.tir.types[self_type.as_usize()]).ok();
+		let target = ImplTarget::from_type(self.types.resolve(self_type)).ok();
 		// The block's own members answer first, and separately from the
 		// bucket below: a block whose target failed to resolve has no
 		// `ImplTarget`, so it never reaches a bucket at all, but its own
 		// members can still collide with each other.
-		let existing = self.tir.inherent_impls[block_index as usize]
+		let existing = self.items.inherent_impls[usize::from(block_index)]
 			.members
 			.get(&name.inner)
 			.copied();
@@ -569,7 +565,7 @@ impl<'ast> Builder<'ast, '_> {
 				self_type,
 				name.inner,
 			)?;
-			self.tir.inherent_impls[other as usize]
+			self.items.inherent_impls[usize::from(other)]
 				.members
 				.get(&name.inner)
 				.copied()
@@ -579,11 +575,11 @@ impl<'ast> Builder<'ast, '_> {
 				ImplEntry::AssocType(_) => SymbolNamespace::Type,
 				_ => SymbolNamespace::Value,
 			};
-			self.tir.diagnostics.push(report_duplicate_definition(
+			self.diagnostics.push(report_duplicate_definition(
 				DuplicateDefinitionDiagnostic {
 					name: self.interner.resolve(name.inner).unwrap(),
 					namespace,
-					first_definition: existing.def_span(&self.tir),
+					first_definition: existing.def_span(&self.items),
 					second_definition: SourceSpan::new(
 						resolve_context.file_id,
 						name.span,
@@ -593,11 +589,11 @@ impl<'ast> Builder<'ast, '_> {
 			return;
 		}
 
-		self.tir.inherent_impls[block_index as usize]
+		self.items.inherent_impls[usize::from(block_index)]
 			.members
 			.insert(name.inner, entry);
 		if let Some(target) = target {
-			self.tir
+			self.items
 				.inherent_impl_dispatch
 				.entry((target, name.inner))
 				.or_default()
@@ -625,28 +621,30 @@ impl<'ast> Builder<'ast, '_> {
 	fn conflicting_inherent_block(
 		&self,
 		target: ImplTarget,
-		block_index: u32,
+		block_index: InherentImplIndex,
 		self_type: TypeIndex,
 		name: SymbolU32,
-	) -> Option<u32> {
-		let own_params = self.tir.inherent_impls[block_index as usize]
+	) -> Option<InherentImplIndex> {
+		let own_params = self.items.inherent_impls[usize::from(block_index)]
 			.type_params
 			.len();
-		let bucket = self.tir.inherent_impl_dispatch.get(&(target, name))?;
+		let bucket = self.items.inherent_impl_dispatch.get(&(target, name))?;
 		bucket.iter().copied().find(|&other| {
 			if other == block_index {
 				return false;
 			}
-			let other_block = &self.tir.inherent_impls[other as usize];
-			self.tir
+			let other_block = &self.items.inherent_impls[usize::from(other)];
+			self.items
 				.unify_impl_target(
+					&self.types,
 					own_params,
 					self_type,
 					other_block.target.inner,
 				)
 				.is_some() || self
-				.tir
+				.items
 				.unify_impl_target(
+					&self.types,
 					other_block.type_params.len(),
 					other_block.target.inner,
 					self_type,
@@ -660,7 +658,7 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		impl_type_params: &'ast [ast::TypeParam],
 		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	) {
 		self.resolve_type_param_bounds(
 			resolve_context,
@@ -677,9 +675,8 @@ impl<'ast> Builder<'ast, '_> {
 			impl_target,
 		);
 
-		let target = match ImplTarget::from_type(
-			&self.tir.types[self_type.as_usize()],
-		) {
+		let target = match ImplTarget::from_type(self.types.resolve(self_type))
+		{
 			Ok(kind) => {
 				self.check_inherent_impl_locality(
 					resolve_context,
@@ -689,7 +686,7 @@ impl<'ast> Builder<'ast, '_> {
 				self_type
 			}
 			Err(_) => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::InvalidImplTarget.code())
 						.with_message(format!(
@@ -706,7 +703,9 @@ impl<'ast> Builder<'ast, '_> {
 				TypeIndex::ERROR
 			}
 		};
-		self.tir.inherent_impls[block_index as usize].target.inner = target;
+		self.items.inherent_impls[usize::from(block_index)]
+			.target
+			.inner = target;
 	}
 
 	/// The package that defines the type an inherent `impl` targets.
@@ -727,10 +726,10 @@ impl<'ast> Builder<'ast, '_> {
 	fn impl_target_package(&self, target: ImplTarget) -> PackageId {
 		let namespace = match target {
 			ImplTarget::Struct(struct_index) => {
-				self.tir.structs[struct_index as usize].namespace
+				self.items.structs[usize::from(struct_index)].namespace
 			}
 			ImplTarget::Enum(enum_index) => {
-				self.tir.enums[enum_index as usize].namespace
+				self.items.enums[usize::from(enum_index)].namespace
 			}
 			ImplTarget::Memory(_) => return self.root_package,
 			ImplTarget::Slice
@@ -748,7 +747,7 @@ impl<'ast> Builder<'ast, '_> {
 			| ImplTarget::Bool
 			| ImplTarget::Char => return self.stdlib_package,
 		};
-		self.tir.namespaces[namespace as usize].package
+		self.modules.namespaces[usize::from(namespace)].package
 	}
 
 	/// An inherent `impl` may only be written in the package that defines its
@@ -771,12 +770,13 @@ impl<'ast> Builder<'ast, '_> {
 		span: ast::TextSpan,
 	) {
 		let target_package = self.impl_target_package(target);
-		let declaring_package =
-			self.tir.namespaces[resolve_context.namespace as usize].package;
+		let declaring_package = self.modules.namespaces
+			[usize::from(resolve_context.namespace)]
+		.package;
 		if target_package == declaring_package {
 			return;
 		}
-		self.tir.diagnostics.push(
+		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::ForeignImplTarget.code())
 				.with_message(
@@ -819,7 +819,7 @@ impl<'ast> Builder<'ast, '_> {
 		// result in — `#[inline]`/`#[intrinsic]`/`#[fixed_order]`
 		// don't apply to traits, and `#[tag = "..."]` (the only one
 		// that does) works purely through the global
-		// `self.tir.tagged_items` map, populated as a side effect
+		// `self.items.tagged_items` map, populated as a side effect
 		// here.
 		self.resolve_attributes(*trait_id, attributes);
 		let bounds = if let Some(spanned) = supertraits {
@@ -828,7 +828,7 @@ impl<'ast> Builder<'ast, '_> {
 			Bounds::default()
 		};
 
-		self.tir.traits[trait_index as usize].bounds = bounds.clone();
+		self.items.traits[usize::from(trait_index)].bounds = bounds.clone();
 
 		// Force every member's own signature to resolve right along
 		// with the trait's — `entries`/`assoc_types` only get
@@ -908,8 +908,7 @@ impl<'ast> Builder<'ast, '_> {
 			// `Self` is owned by the trait; the function inherits it via
 			// type_param_parent so type_params holds only explicit params.
 			let attributes = self.resolve_attributes(*id, attributes);
-			let func_index = self.tir.functions.len() as u32;
-			self.tir.functions.push(Function {
+			let func_index = self.items.push_function(Function {
 				id: *id,
 				file_id: resolve_context.file_id,
 				namespace: resolve_context.namespace,
@@ -930,9 +929,6 @@ impl<'ast> Builder<'ast, '_> {
 				result: None,
 				attributes,
 			});
-			self.tir
-				.item_lookup
-				.insert(*id, ItemIndex::Function(func_index));
 			let self_type = self.intern_type(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
@@ -953,7 +949,7 @@ impl<'ast> Builder<'ast, '_> {
 				signature,
 			);
 			let sig_idx = self.intern_function(&params, result);
-			let func = &mut self.tir.functions[func_index as usize];
+			let func = &mut self.items.functions[usize::from(func_index)];
 			func.params = params;
 			func.result = result;
 			func.signature_index = sig_idx;
@@ -967,7 +963,7 @@ impl<'ast> Builder<'ast, '_> {
 			} else {
 				ImplEntry::AssocFunction(func_index)
 			};
-			self.tir.traits[trait_index as usize]
+			self.items.traits[usize::from(trait_index)]
 				.entries
 				.insert(signature.name.inner, entry);
 		}
@@ -1017,7 +1013,7 @@ impl<'ast> Builder<'ast, '_> {
 							match self.eval_const_expr(&value_expr) {
 								Ok(v) => Some(v),
 								Err(_) => {
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										report_not_const_evaluatable(
 											SourceSpan::new(
 												resolve_context.file_id,
@@ -1037,14 +1033,13 @@ impl<'ast> Builder<'ast, '_> {
 			// Captured only now, right before the push — building the
 			// value expression above can itself demand-drive other
 			// items' signatures, which may push their own entries
-			// onto `self.tir.constants` first. Snapshotting the
+			// onto `self.items.constants` first. Snapshotting the
 			// index any earlier (as the surrounding TIR structs
 			// mostly do, safely, since they never resolve a value
 			// expression in between) would go stale the moment that
 			// happens, pointing this entry at whatever unrelated
 			// constant ended up in the slot instead.
-			let const_index = self.tir.constants.len() as ConstIndex;
-			self.tir.constants.push(Constant {
+			let const_index = self.items.push_constant(Constant {
 				id: *id,
 				file_id: resolve_context.file_id,
 				namespace: resolve_context.namespace,
@@ -1060,10 +1055,7 @@ impl<'ast> Builder<'ast, '_> {
 				accesses: Vec::new(),
 				attributes,
 			});
-			self.tir
-				.item_lookup
-				.insert(*id, ItemIndex::Const(const_index));
-			self.tir.traits[trait_index as usize]
+			self.items.traits[usize::from(trait_index)]
 				.entries
 				.insert(name.inner, ImplEntry::AssocConstant(const_index));
 		}
@@ -1096,7 +1088,7 @@ impl<'ast> Builder<'ast, '_> {
 		) {
 			Ok(BoundKind::Trait(tb)) => tb.trait_index,
 			Ok(BoundKind::TypeSet(_)) => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
 						.with_message("expected a trait name")
@@ -1115,8 +1107,7 @@ impl<'ast> Builder<'ast, '_> {
 		// type expression below needs `TypeParamOwner::TraitImpl(
 		// trait_impl_index)` to already have somewhere to record
 		// bounds/params against.
-		let trait_impl_index = self.tir.trait_impls.len() as TraitImplIndex;
-		self.tir.trait_impls.push(TraitImpl {
+		let trait_impl_index = self.items.push_trait_impl(TraitImpl {
 			id: *block_id,
 			trait_index,
 			type_params: type_params
@@ -1133,9 +1124,6 @@ impl<'ast> Builder<'ast, '_> {
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),
 		});
-		self.tir
-			.item_lookup
-			.insert(*block_id, ItemIndex::TraitImpl(trait_impl_index));
 
 		self.resolve_type_param_bounds(
 			resolve_context,
@@ -1152,8 +1140,9 @@ impl<'ast> Builder<'ast, '_> {
 			}),
 			target,
 		);
-		self.tir.trait_impls[trait_impl_index as usize].target.inner =
-			target_type;
+		self.items.trait_impls[usize::from(trait_impl_index)]
+			.target
+			.inner = target_type;
 
 		self.register_trait_impl(target_type, trait_index, trait_impl_index);
 
@@ -1177,7 +1166,7 @@ impl<'ast> Builder<'ast, '_> {
 		name: ast::Spanned<SymbolU32>,
 		entry: ImplEntry,
 	) {
-		let existing = self.tir.trait_impls[trait_impl_index as usize]
+		let existing = self.items.trait_impls[usize::from(trait_impl_index)]
 			.members
 			.get(&name.inner)
 			.copied();
@@ -1186,11 +1175,11 @@ impl<'ast> Builder<'ast, '_> {
 				ImplEntry::AssocType(_) => SymbolNamespace::Type,
 				_ => SymbolNamespace::Value,
 			};
-			self.tir.diagnostics.push(report_duplicate_definition(
+			self.diagnostics.push(report_duplicate_definition(
 				DuplicateDefinitionDiagnostic {
 					name: self.interner.resolve(name.inner).unwrap(),
 					namespace,
-					first_definition: existing.def_span(&self.tir),
+					first_definition: existing.def_span(&self.items),
 					second_definition: SourceSpan::new(
 						resolve_context.file_id,
 						name.span,
@@ -1199,7 +1188,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 			return;
 		}
-		self.tir.trait_impls[trait_impl_index as usize]
+		self.items.trait_impls[usize::from(trait_impl_index)]
 			.members
 			.insert(name.inner, entry);
 	}
@@ -1214,16 +1203,17 @@ impl<'ast> Builder<'ast, '_> {
 		// progress means the block forced us, having already resolved
 		// everything below reads from it.
 		let _ = self.ensure_signature(parent_id);
-		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
+		let trait_impl_index = match self.items.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,
 		};
-		let self_type =
-			self.tir.trait_impls[trait_impl_index as usize].target.inner;
-		let inherited_type_param_count = self.tir.trait_impls
-			[trait_impl_index as usize]
-			.type_params
-			.len();
+		let self_type = self.items.trait_impls[usize::from(trait_impl_index)]
+			.target
+			.inner;
+		let inherited_type_param_count = self.items.trait_impls
+			[usize::from(trait_impl_index)]
+		.type_params
+		.len();
 		let self_symbol = self.interner.get_or_intern("self");
 
 		if let ast::ImplItem::Function {
@@ -1235,8 +1225,7 @@ impl<'ast> Builder<'ast, '_> {
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
-			let func_index = self.tir.functions.len() as u32;
-			self.tir.functions.push(Function {
+			let func_index = self.items.push_function(Function {
 				id: *id,
 				file_id: resolve_context.file_id,
 				namespace: resolve_context.namespace,
@@ -1262,9 +1251,6 @@ impl<'ast> Builder<'ast, '_> {
 				result: None,
 				attributes,
 			});
-			self.tir
-				.item_lookup
-				.insert(*id, ItemIndex::Function(func_index));
 
 			// Resolve the method's own param bounds (e.g. `Mem:
 			// Memory` in `fn write<Mem: Memory>(...)`)  — without
@@ -1288,7 +1274,7 @@ impl<'ast> Builder<'ast, '_> {
 				signature,
 			);
 			let signature_index = self.intern_function(&params, result);
-			let func = &mut self.tir.functions[func_index as usize];
+			let func = &mut self.items.functions[usize::from(func_index)];
 			func.params = params;
 			func.result = result;
 			func.signature_index = signature_index;
@@ -1322,12 +1308,13 @@ impl<'ast> Builder<'ast, '_> {
 		// progress means the block forced us, having already resolved
 		// everything below reads from it.
 		let _ = self.ensure_signature(parent_id);
-		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
+		let trait_impl_index = match self.items.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,
 		};
-		let self_type =
-			self.tir.trait_impls[trait_impl_index as usize].target.inner;
+		let self_type = self.items.trait_impls[usize::from(trait_impl_index)]
+			.target
+			.inner;
 
 		if let ast::ImplItem::Constant {
 			id,
@@ -1357,17 +1344,16 @@ impl<'ast> Builder<'ast, '_> {
 				let const_value = match self.eval_const_expr(&value_expr) {
 					Ok(v) => Some(v),
 					Err(_) => {
-						self.tir.diagnostics.push(
-							report_not_const_evaluatable(SourceSpan::new(
+						self.diagnostics.push(report_not_const_evaluatable(
+							SourceSpan::new(
 								resolve_context.file_id,
 								value.span,
-							)),
-						);
+							),
+						));
 						None
 					}
 				};
-				let const_index = self.tir.constants.len() as ConstIndex;
-				self.tir.constants.push(Constant {
+				let const_index = self.items.push_constant(Constant {
 					id: *id,
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
@@ -1383,9 +1369,6 @@ impl<'ast> Builder<'ast, '_> {
 					accesses: Vec::new(),
 					attributes,
 				});
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Const(const_index));
 				let entry = ImplEntry::AssocConstant(const_index);
 				self.register_trait_impl_member(
 					resolve_context,
@@ -1428,26 +1411,27 @@ impl<'ast> Builder<'ast, '_> {
 			// }`), and that reference needs an already-present
 			// `assoc_types` entry to record its access against, even
 			// though this assoc type's own bounds haven't resolved yet.
-			self.tir.traits[trait_index as usize].assoc_types.insert(
-				name.inner,
-				TraitAssocType {
-					id: *id,
-					name_span: name.span,
-					bounds: Bounds::default(),
-					accesses: Vec::new(),
-				},
-			);
+			self.items.traits[usize::from(trait_index)]
+				.assoc_types
+				.insert(
+					name.inner,
+					TraitAssocType {
+						id: *id,
+						name_span: name.span,
+						bounds: Bounds::default(),
+						accesses: Vec::new(),
+					},
+				);
 			let assoc_type_index =
-				self.tir.assoc_type_impls.len() as AssocTypeIndex;
-			self.tir.assoc_type_impls.push(AssocTypeImpl {
-				id: *id,
-				file_id: resolve_context.file_id,
-				namespace: resolve_context.namespace,
-				name: *name,
-				ty: None,
-				attributes,
-			});
-			self.tir.traits[trait_index as usize]
+				self.items.push_assoc_type_impl(AssocTypeImpl {
+					id: *id,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
+					name: *name,
+					ty: None,
+					attributes,
+				});
+			self.items.traits[usize::from(trait_index)]
 				.entries
 				.insert(name.inner, ImplEntry::AssocType(assoc_type_index));
 
@@ -1462,7 +1446,7 @@ impl<'ast> Builder<'ast, '_> {
 				// `symbol_kind_is_gated`'s doc comment), so there's
 				// no separate span of this assoc type's own to read.
 				let trait_pub_span =
-					self.tir.traits[trait_index as usize].pub_span;
+					self.items.traits[usize::from(trait_index)].pub_span;
 				self.insert_symbol(
 					resolve_context.namespace,
 					(SymbolNamespace::Type, name.inner),
@@ -1484,7 +1468,7 @@ impl<'ast> Builder<'ast, '_> {
 					)
 				})
 				.unwrap_or_default();
-			self.tir.traits[trait_index as usize]
+			self.items.traits[usize::from(trait_index)]
 				.assoc_types
 				.get_mut(&name.inner)
 				.unwrap()
@@ -1502,14 +1486,15 @@ impl<'ast> Builder<'ast, '_> {
 		// progress means the block forced us, having already resolved
 		// everything below reads from it.
 		let _ = self.ensure_signature(parent_id);
-		let trait_impl_index = match self.tir.trait_impl_index(parent_id) {
+		let trait_impl_index = match self.items.trait_impl_index(parent_id) {
 			Some(idx) => idx,
 			None => return,
 		};
 		let trait_index =
-			self.tir.trait_impls[trait_impl_index as usize].trait_index;
-		let self_type =
-			self.tir.trait_impls[trait_impl_index as usize].target.inner;
+			self.items.trait_impls[usize::from(trait_impl_index)].trait_index;
+		let self_type = self.items.trait_impls[usize::from(trait_impl_index)]
+			.target
+			.inner;
 
 		if let ast::ImplItem::AssocType {
 			id,
@@ -1527,18 +1512,17 @@ impl<'ast> Builder<'ast, '_> {
 			let concrete_ty =
 				self.resolve_type(resolve_context, Some(self_scope), ty);
 			let assoc_type_index =
-				self.tir.assoc_type_impls.len() as AssocTypeIndex;
-			self.tir.assoc_type_impls.push(AssocTypeImpl {
-				id: *id,
-				file_id: resolve_context.file_id,
-				namespace: resolve_context.namespace,
-				name: *name,
-				ty: Some(Spanned {
-					inner: concrete_ty,
-					span: ty.span,
-				}),
-				attributes,
-			});
+				self.items.push_assoc_type_impl(AssocTypeImpl {
+					id: *id,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
+					name: *name,
+					ty: Some(Spanned {
+						inner: concrete_ty,
+						span: ty.span,
+					}),
+					attributes,
+				});
 			let entry = ImplEntry::AssocType(assoc_type_index);
 			self.register_trait_impl_member(
 				resolve_context,
@@ -1546,7 +1530,7 @@ impl<'ast> Builder<'ast, '_> {
 				*name,
 				entry,
 			);
-			if let Some(at) = self.tir.traits[trait_index as usize]
+			if let Some(at) = self.items.traits[usize::from(trait_index)]
 				.assoc_types
 				.get_mut(&name.inner)
 			{

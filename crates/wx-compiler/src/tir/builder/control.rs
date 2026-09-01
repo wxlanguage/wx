@@ -89,14 +89,14 @@ impl<'ast> Builder<'ast, '_> {
 					block.span,
 				)?;
 
-				let scope = &ctx.stack.scopes[ctx.scope_index as usize];
+				let scope = &ctx.stack.scopes[usize::from(ctx.scope_index)];
 				let (expected_type, inferred_type) =
 					(scope.expected_type, scope.inferred_type);
 				if expected_type != TypeIndex::INFER
 					&& inferred_type != TypeIndex::INFER
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
@@ -134,13 +134,13 @@ impl<'ast> Builder<'ast, '_> {
 		let scope_index = match label {
 			Some(label) => match ctx.resolve_label(label.inner) {
 				Some((scope_index, label_index)) => {
-					ctx.stack.labels[label_index as usize]
+					ctx.stack.labels[usize::from(label_index)]
 						.accesses
 						.push(label.span);
 					scope_index
 				}
 				None => {
-					self.tir.diagnostics.push(report_undeclared_label(
+					self.diagnostics.push(report_undeclared_label(
 						self.interner.resolve(label.inner).unwrap(),
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
@@ -157,7 +157,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => match ctx.get_closest_loop_block() {
 				Some(scope_index) => scope_index,
 				None => {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::ContinueOutsideOfLoop.code(),
@@ -283,7 +283,7 @@ impl<'ast> Builder<'ast, '_> {
 				match self.unify(then_block.ty, else_block.ty) {
 					Ok(ty) => (Some(else_block), ty),
 					Err(_) => {
-						self.tir.diagnostics.push(report_type_mistmatch(
+						self.diagnostics.push(report_type_mistmatch(
 							self.formatter(ctx.resolve_context.namespace),
 							TypeMistmatchDiagnostic {
 								expected_type: then_block.ty,
@@ -304,7 +304,7 @@ impl<'ast> Builder<'ast, '_> {
 				{
 					(None, TypeIndex::UNIT)
 				} else {
-					self.tir.diagnostics.push(report_missing_else_block(
+					self.diagnostics.push(report_missing_else_block(
 						self.formatter(ctx.resolve_context.namespace),
 						then_block.ty,
 						SourceSpan::new(
@@ -349,29 +349,25 @@ impl<'ast> Builder<'ast, '_> {
 		)?;
 		let scrutinee_ty = scrutinee.ty;
 
-		let is_valid_scrutinee = matches!(
-			self.tir.types[scrutinee_ty.as_usize()],
-			Type::Enum { .. }
-		) || scrutinee_ty == TypeIndex::BOOL
-			|| scrutinee_ty == TypeIndex::CHAR
-			|| scrutinee_ty.is_integer();
+		let is_valid_scrutinee =
+			matches!(self.types.resolve(scrutinee_ty), Type::Enum { .. })
+				|| scrutinee_ty == TypeIndex::BOOL
+				|| scrutinee_ty == TypeIndex::CHAR
+				|| scrutinee_ty.is_integer();
 		if !is_valid_scrutinee {
-			self.tir
-				.diagnostics
-				.push(report_invalid_match_scrutinee_type(
-					self.formatter(ctx.resolve_context.namespace),
-					scrutinee_ty,
-					SourceSpan::new(
-						ctx.resolve_context.file_id,
-						scrutinee_expr.span,
-					),
-				));
+			self.diagnostics.push(report_invalid_match_scrutinee_type(
+				self.formatter(ctx.resolve_context.namespace),
+				scrutinee_ty,
+				SourceSpan::new(
+					ctx.resolve_context.file_id,
+					scrutinee_expr.span,
+				),
+			));
 			return Err(());
 		}
 
 		if arms.is_empty() {
-			self.tir
-				.diagnostics
+			self.diagnostics
 				.push(report_non_exhaustive_match_no_wildcard(
 					SourceSpan::new(ctx.resolve_context.file_id, expr.span),
 				));
@@ -430,7 +426,7 @@ impl<'ast> Builder<'ast, '_> {
 					seen_wildcard = true;
 				}
 				if unreachable {
-					self.tir.diagnostics.push(report_unreachable_match_arm(
+					self.diagnostics.push(report_unreachable_match_arm(
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
 							*pattern_span,
@@ -456,7 +452,7 @@ impl<'ast> Builder<'ast, '_> {
 			match self.unify(result_ty, body.ty) {
 				Ok(ty) => result_ty = ty,
 				Err(_) => {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: result_ty,
@@ -521,8 +517,7 @@ impl<'ast> Builder<'ast, '_> {
 			pattern_expr,
 		)?;
 
-		if matches!(self.tir.types[scrutinee_ty.as_usize()], Type::Enum { .. })
-		{
+		if matches!(self.types.resolve(scrutinee_ty), Type::Enum { .. }) {
 			if let ExprKind::NamespaceAccess { member, .. } = &built.kind
 				&& let ExprKind::EnumVariant {
 					enum_index,
@@ -535,8 +530,7 @@ impl<'ast> Builder<'ast, '_> {
 					variant_index,
 				});
 			}
-			self.tir
-				.diagnostics
+			self.diagnostics
 				.push(report_invalid_pattern(SourceSpan::new(
 					ctx.resolve_context.file_id,
 					pattern_expr.span,
@@ -560,12 +554,11 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(Pattern::Char(v))
 			}
 			_ => {
-				self.tir.diagnostics.push(report_invalid_pattern(
-					SourceSpan::new(
+				self.diagnostics
+					.push(report_invalid_pattern(SourceSpan::new(
 						ctx.resolve_context.file_id,
 						pattern_expr.span,
-					),
-				));
+					)));
 				Err(())
 			}
 		}
@@ -588,28 +581,28 @@ impl<'ast> Builder<'ast, '_> {
 			return Ok(());
 		}
 
-		match &self.tir.types[scrutinee_ty.as_usize()] {
+		match self.types.resolve(scrutinee_ty) {
 			Type::Enum { enum_index } => {
-				let enum_index = *enum_index as usize;
-				let variant_count = self.tir.enums[enum_index].variants.len();
+				let enum_index = usize::from(*enum_index);
+				let variant_count = self.items.enums[enum_index].variants.len();
 				let mut covered = vec![false; variant_count];
 				for arm in arms {
 					if let Pattern::EnumVariant { variant_index, .. } =
 						arm.pattern
 					{
-						covered[variant_index as usize] = true;
+						covered[usize::from(variant_index)] = true;
 					}
 				}
 				let missing: Vec<Spanned<SymbolU32>> = covered
 					.iter()
 					.enumerate()
 					.filter(|&(_, &covered)| !covered)
-					.map(|(i, _)| self.tir.enums[enum_index].variants[i].name)
+					.map(|(i, _)| self.items.enums[enum_index].variants[i].name)
 					.collect();
 				if missing.is_empty() {
 					Ok(())
 				} else {
-					self.tir.diagnostics.push(report_non_exhaustive_match(
+					self.diagnostics.push(report_non_exhaustive_match(
 						self.interner,
 						SourceSpan::new(file_id, match_span),
 						&missing,
@@ -618,11 +611,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			_ => {
-				self.tir.diagnostics.push(
-					report_non_exhaustive_match_no_wildcard(SourceSpan::new(
-						file_id, match_span,
-					)),
-				);
+				self.diagnostics
+					.push(report_non_exhaustive_match_no_wildcard(
+						SourceSpan::new(file_id, match_span),
+					));
 				Err(())
 			}
 		}
@@ -641,13 +633,13 @@ impl<'ast> Builder<'ast, '_> {
 		let scope_index = match label {
 			Some(label) => match ctx.resolve_label(label.inner) {
 				Some((scope_index, label_index)) => {
-					ctx.stack.labels[label_index as usize]
+					ctx.stack.labels[usize::from(label_index)]
 						.accesses
 						.push(label.span);
 					scope_index
 				}
 				None => {
-					self.tir.diagnostics.push(report_undeclared_label(
+					self.diagnostics.push(report_undeclared_label(
 						self.interner.resolve(label.inner).unwrap(),
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
@@ -667,7 +659,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => match ctx.get_closest_loop_block() {
 				Some(scope_index) => scope_index,
 				None => {
-					self.tir.diagnostics.push(report_break_outside_of_loop(
+					self.diagnostics.push(report_break_outside_of_loop(
 						SourceSpan::new(ctx.resolve_context.file_id, expr.span),
 					));
 
@@ -687,7 +679,7 @@ impl<'ast> Builder<'ast, '_> {
 				let expected_type = ctx
 					.stack
 					.scopes
-					.get(scope_index as usize)
+					.get(usize::from(scope_index))
 					.unwrap()
 					.expected_type;
 				let mut built = match self.build_expression(
@@ -709,8 +701,11 @@ impl<'ast> Builder<'ast, '_> {
 				};
 
 				let inferred_type = {
-					let scope =
-						ctx.stack.scopes.get_mut(scope_index as usize).unwrap();
+					let scope = ctx
+						.stack
+						.scopes
+						.get_mut(usize::from(scope_index))
+						.unwrap();
 					let inferred_type = self.infer_block_type(
 						ctx.resolve_context,
 						scope,
@@ -722,12 +717,12 @@ impl<'ast> Builder<'ast, '_> {
 
 				if built.ty.is_comptime_number() {
 					if inferred_type.is_comptime_number() {
-						self.tir.diagnostics.push(
-							report_type_annotation_required(SourceSpan::new(
+						self.diagnostics.push(report_type_annotation_required(
+							SourceSpan::new(
 								ctx.resolve_context.file_id,
 								built.span,
-							)),
-						);
+							),
+						));
 						return Err(());
 					}
 					self.coerce_untyped_expr(ctx, &mut built, inferred_type)?;
@@ -744,13 +739,13 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			None => {
 				let scope =
-					ctx.stack.scopes.get_mut(scope_index as usize).unwrap();
+					ctx.stack.scopes.get_mut(usize::from(scope_index)).unwrap();
 				if scope.inferred_type != TypeIndex::INFER {
 					let inferred = scope.inferred_type;
 					if !self.coercible_to(TypeIndex::UNIT, inferred) {
 						let formatter =
 							self.formatter(ctx.resolve_context.namespace);
-						self.tir.diagnostics.push(report_type_mistmatch(
+						self.diagnostics.push(report_type_mistmatch(
 							formatter,
 							TypeMistmatchDiagnostic {
 								expected_type: inferred,
@@ -823,12 +818,12 @@ impl<'ast> Builder<'ast, '_> {
 
 				if built.ty.is_comptime_number() {
 					if inferred_type.is_comptime_number() {
-						self.tir.diagnostics.push(
-							report_type_annotation_required(SourceSpan::new(
+						self.diagnostics.push(report_type_annotation_required(
+							SourceSpan::new(
 								ctx.resolve_context.file_id,
 								built.span,
-							)),
-						);
+							),
+						));
 						return Err(());
 					}
 					self.coerce_untyped_expr(ctx, &mut built, inferred_type)?;
@@ -839,7 +834,7 @@ impl<'ast> Builder<'ast, '_> {
 				if expected_type != TypeIndex::INFER
 					&& !self.coercible_to(inferred_type, expected_type)
 				{
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
@@ -862,8 +857,11 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			None => {
-				let scope =
-					ctx.stack.scopes.get_mut(ctx.scope_index as usize).unwrap();
+				let scope = ctx
+					.stack
+					.scopes
+					.get_mut(usize::from(ctx.scope_index))
+					.unwrap();
 
 				let inferred_type =
 					scope.inferred_type.infer_or(TypeIndex::UNIT);
@@ -873,7 +871,7 @@ impl<'ast> Builder<'ast, '_> {
 				if expected_type != TypeIndex::INFER
 					&& self.coercible_to(inferred_type, expected_type)
 				{
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
@@ -942,7 +940,7 @@ impl<'ast> Builder<'ast, '_> {
 					return;
 				}
 
-				let element_types = match &self.tir.types[ty.as_usize()] {
+				let element_types = match self.types.resolve(ty) {
 					Type::Tuple { elements } => Some(elements.clone()),
 					_ => None,
 				};
@@ -967,7 +965,7 @@ impl<'ast> Builder<'ast, '_> {
 									found
 								),
 							};
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								Diagnostic::error()
 									.with_code(
 										DiagnosticCode::TypeMistmatch.code(),
@@ -1038,7 +1036,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		// The scrutinee decides which struct this is and how it is
 		// instantiated; the written path only has to agree with it.
-		let scrutinee = match &self.tir.types[ty.as_usize()] {
+		let scrutinee = match self.types.resolve(ty) {
 			Type::Struct { struct_index, args } => {
 				Some((*struct_index, args.clone()))
 			}
@@ -1054,7 +1052,7 @@ impl<'ast> Builder<'ast, '_> {
 			pattern.span,
 			TypeArgArity::AllowInfer,
 		);
-		let named_index = match &self.tir.types[named_ty.as_usize()] {
+		let named_index = match self.types.resolve(named_ty) {
 			Type::Struct { struct_index, .. } => Some(*struct_index),
 			_ => None,
 		};
@@ -1062,7 +1060,7 @@ impl<'ast> Builder<'ast, '_> {
 			let last = struct_path.last().expect("path is non-empty");
 			let name =
 				self.interner.resolve(last.ident.inner).unwrap().to_string();
-			self.tir.diagnostics.push(report_not_a_struct_type(
+			self.diagnostics.push(report_not_a_struct_type(
 				file_id,
 				name,
 				last.ident.span,
@@ -1088,7 +1086,7 @@ impl<'ast> Builder<'ast, '_> {
 							fmt.display_type(ty).unwrap()
 						),
 					};
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::TypeMistmatch.code())
 							.with_message(
@@ -1113,7 +1111,8 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 
-		let field_count = self.tir.structs[struct_index as usize].fields.len();
+		let field_count =
+			self.items.structs[usize::from(struct_index)].fields.len();
 		let mut first_mention: Vec<Option<TextSpan>> = vec![None; field_count];
 
 		for field in fields.iter() {
@@ -1127,12 +1126,16 @@ impl<'ast> Builder<'ast, '_> {
 			) else {
 				let struct_name = self
 					.interner
-					.resolve(self.tir.structs[struct_index as usize].name.inner)
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
 					.unwrap()
 					.to_string();
 				let field_name =
 					self.interner.resolve(name.inner).unwrap().to_string();
-				self.tir.diagnostics.push(report_unknown_struct_field(
+				self.diagnostics.push(report_unknown_struct_field(
 					UnknownStructFieldDiagnostic {
 						file_id,
 						struct_name: &struct_name,
@@ -1150,24 +1153,22 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			};
 
-			let field_index = resolved.index.as_usize();
+			let field_index = usize::from(resolved.index);
 			if let Some(first_span) = first_mention[field_index] {
 				let field_name =
 					self.interner.resolve(name.inner).unwrap().to_string();
-				self.tir
-					.diagnostics
-					.push(report_duplicate_struct_field_init(
-						&field_name,
-						SourceSpan::new(file_id, first_span),
-						SourceSpan::new(file_id, name.span),
-					));
+				self.diagnostics.push(report_duplicate_struct_field_init(
+					&field_name,
+					SourceSpan::new(file_id, first_span),
+					SourceSpan::new(file_id, name.span),
+				));
 			} else {
 				first_mention[field_index] = Some(name.span);
 			}
 
 			path.push(PathStep {
 				aggregate_ty: ty,
-				index: resolved.index.as_u32(),
+				index: u32::from(resolved.index),
 			});
 			self.bind_struct_pattern_field(
 				ctx,
@@ -1187,8 +1188,8 @@ impl<'ast> Builder<'ast, '_> {
 				.map(|(index, _)| {
 					self.interner
 						.resolve(
-							self.tir.structs[struct_index as usize].fields
-								[index]
+							self.items.structs[usize::from(struct_index)]
+								.fields[index]
 								.name
 								.inner,
 						)
@@ -1203,9 +1204,13 @@ impl<'ast> Builder<'ast, '_> {
 					.join(", ");
 				let struct_name = self
 					.interner
-					.resolve(self.tir.structs[struct_index as usize].name.inner)
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
 					.unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingStructFields.code())
 						.with_message(format!(

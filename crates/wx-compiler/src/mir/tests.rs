@@ -1715,10 +1715,11 @@ fn mir_function<'a>(case: &'a TestCase, name: &str) -> &'a Function {
 		.functions
 		.iter()
 		.find(|f| {
-			let tir_index = case.tir.expect_function_index(f.id) as usize;
+			let tir_index =
+				usize::from(case.tir.items.expect_function_index(f.id));
 			case.graph
 				.interner
-				.resolve(case.tir.functions[tir_index].name.inner)
+				.resolve(case.tir.items.functions[tir_index].name.inner)
 				== Some(name)
 		})
 		.unwrap_or_else(|| panic!("`{name}` should be in MIR"))

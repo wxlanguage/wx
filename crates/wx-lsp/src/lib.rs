@@ -461,9 +461,10 @@ async fn handle_command(
 				// dependency like `std` needs `std`'s own package here, or
 				// `namespace_name` names things from the wrong package's
 				// perspective.
-				let from = compiled.tir.namespaces
-					[compiled.tir.file_namespaces[file_id.as_usize()] as usize]
-					.package;
+				let from = compiled.tir.modules.namespaces[usize::from(
+					compiled.tir.modules.file_namespaces[file_id.as_usize()],
+				)]
+				.package;
 				let text = symbol_hover_text(
 					&compiled.tir,
 					&compiled.graph.interner,
@@ -744,12 +745,14 @@ async fn handle_command(
 				let SymbolKind::Function(def_id) = &info.kind else {
 					return None;
 				};
-				let fi = compiled.tir.function_index(*def_id)? as usize;
-				let func = &compiled.tir.functions[fi];
+				let fi =
+					usize::from(compiled.tir.items.function_index(*def_id)?);
+				let func = &compiled.tir.items.functions[fi];
 				// The function's own package, not the compilation's overall
 				// root — see the matching fix in the `Hover` handler above.
-				let from =
-					compiled.tir.namespaces[func.namespace as usize].package;
+				let from = compiled.tir.modules.namespaces
+					[usize::from(func.namespace)]
+				.package;
 				let fmt = compiled.tir.formatter(
 					&compiled.graph.interner,
 					&compiled.graph.packages,
@@ -1907,39 +1910,56 @@ fn doc_comment_anchor(tir: &TIR, kind: &SymbolKind) -> Option<SourceSpan> {
 	}
 	match kind {
 		SymbolKind::Function(id) => {
-			let f = &tir.functions[tir.function_index(*id)? as usize];
+			let f = &tir.items.functions
+				[usize::from(tir.items.function_index(*id)?)];
 			Some(anchor(f.file_id, f.pub_span, f.name.span))
 		}
 		SymbolKind::Global(id) => {
-			let g = &tir.globals[tir.global_index(*id)? as usize];
+			let g =
+				&tir.items.globals[usize::from(tir.items.global_index(*id)?)];
 			Some(anchor(g.file_id, g.pub_span, g.name.span))
 		}
 		SymbolKind::Const(id) => {
-			let c = &tir.constants[tir.const_index(*id)? as usize];
+			let c =
+				&tir.items.constants[usize::from(tir.items.const_index(*id)?)];
 			Some(anchor(c.file_id, c.pub_span, c.name.span))
 		}
 		SymbolKind::Struct(id) => {
-			let s = tir.structs.get(tir.struct_index(*id)? as usize)?;
+			let s = tir
+				.items
+				.structs
+				.get(usize::from(tir.items.struct_index(*id)?))?;
 			Some(anchor(s.file_id, s.pub_span, s.name.span))
 		}
 		SymbolKind::Enum(id) => {
-			let e = tir.enums.get(tir.enum_index(*id)? as usize)?;
+			let e = tir
+				.items
+				.enums
+				.get(usize::from(tir.items.enum_index(*id)?))?;
 			Some(anchor(e.file_id, e.pub_span, e.name.span))
 		}
 		SymbolKind::Trait(id) => {
-			let t = tir.traits.get(tir.trait_index(*id)? as usize)?;
+			let t = tir
+				.items
+				.traits
+				.get(usize::from(tir.items.trait_index(*id)?))?;
 			Some(anchor(t.file_id, t.pub_span, t.name.span))
 		}
 		SymbolKind::TypeSet(id) => {
-			let ts = tir.typesets.get(tir.typeset_index(*id)? as usize)?;
+			let ts = tir
+				.items
+				.typesets
+				.get(usize::from(tir.items.typeset_index(*id)?))?;
 			Some(anchor(ts.file_id, ts.pub_span, ts.name.span))
 		}
 		SymbolKind::TypeAlias(id) => {
-			let a = &tir.type_aliases[tir.type_alias_index(*id)? as usize];
+			let a = &tir.items.type_aliases
+				[usize::from(tir.items.type_alias_index(*id)?)];
 			Some(anchor(a.file_id, a.pub_span, a.name.span))
 		}
 		SymbolKind::Memory(id) => {
-			let m = &tir.memories[tir.memory_index(*id)? as usize];
+			let m =
+				&tir.items.memories[usize::from(tir.items.memory_index(*id)?)];
 			Some(SourceSpan::new(m.file_id, m.name.span))
 		}
 		_ => None,
@@ -1988,8 +2008,8 @@ fn symbol_hover_text(
 	let fmt = tir.formatter(interner, packages, from);
 	match kind {
 		SymbolKind::Function(def_id) => {
-			let fi = tir.function_index(*def_id)? as usize;
-			let func = &tir.functions[fi];
+			let fi = usize::from(tir.items.function_index(*def_id)?);
+			let func = &tir.items.functions[fi];
 			let name = interner.resolve(func.name.inner).unwrap();
 			let pub_prefix = if func.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}fn {name}");
@@ -2022,8 +2042,8 @@ fn symbol_hover_text(
 			Some(s)
 		}
 		SymbolKind::Global(def_id) => {
-			let gi = tir.global_index(*def_id)? as usize;
-			let global = &tir.globals[gi];
+			let gi = usize::from(tir.items.global_index(*def_id)?);
+			let global = &tir.items.globals[gi];
 			let name = interner.resolve(global.name.inner).unwrap();
 			let type_str = fmt.display_type(global.ty.inner).unwrap();
 			let pub_prefix = if global.pub_span.is_some() {
@@ -2039,8 +2059,8 @@ fn symbol_hover_text(
 			Some(format!("{pub_prefix}global {mut_kw}{name}: {type_str}"))
 		}
 		SymbolKind::Memory(def_id) => {
-			let mi = tir.memory_index(*def_id)? as usize;
-			let memory = &tir.memories[mi];
+			let mi = usize::from(tir.items.memory_index(*def_id)?);
+			let memory = &tir.items.memories[mi];
 			let name = interner.resolve(memory.name.inner).unwrap();
 			let size_str = fmt.display_type(memory.size.inner).unwrap();
 			Some(format!(
@@ -2048,8 +2068,10 @@ fn symbol_hover_text(
 			))
 		}
 		SymbolKind::Struct(def_id) => {
-			let struct_ =
-				tir.structs.get(tir.struct_index(*def_id)? as usize)?;
+			let struct_ = tir
+				.items
+				.structs
+				.get(usize::from(tir.items.struct_index(*def_id)?))?;
 			let name = interner.resolve(struct_.name.inner).unwrap();
 			let pub_prefix = if struct_.pub_span.is_some() {
 				"pub "
@@ -2068,18 +2090,29 @@ fn symbol_hover_text(
 			Some(s)
 		}
 		SymbolKind::Enum(def_id) => {
-			let enum_ = tir.enums.get(tir.enum_index(*def_id)? as usize)?;
+			let enum_ = tir
+				.items
+				.enums
+				.get(usize::from(tir.items.enum_index(*def_id)?))?;
 			let name = interner.resolve(enum_.name.inner).unwrap();
 			let pub_prefix = if enum_.pub_span.is_some() { "pub " } else { "" };
 			let repr = fmt.display_type(enum_.repr_type).unwrap();
 			Some(format!("{pub_prefix}enum {name}: {repr} {{ ... }}"))
 		}
 		SymbolKind::InherentImplSelf(block_idx) => {
-			let target = tir.inherent_impls.get(*block_idx as usize)?.target;
+			let target = tir
+				.items
+				.inherent_impls
+				.get(usize::from(*block_idx))?
+				.target;
 			Some(format!("Self = {}", fmt.display_type(target.inner).ok()?))
 		}
 		SymbolKind::TraitImplSelf(trait_impl_idx) => {
-			let target = tir.trait_impls.get(*trait_impl_idx as usize)?.target;
+			let target = tir
+				.items
+				.trait_impls
+				.get(usize::from(*trait_impl_idx))?
+				.target;
 			Some(format!("Self = {}", fmt.display_type(target.inner).ok()?))
 		}
 		SymbolKind::Local {
@@ -2087,30 +2120,31 @@ fn symbol_hover_text(
 			scope_idx,
 			local_idx,
 		} => {
-			let fi = tir.function_index(*func_id)? as usize;
-			let body = tir.functions[fi].body.as_ref()?;
+			let fi = usize::from(tir.items.function_index(*func_id)?);
+			let body = tir.items.functions[fi].body.as_ref()?;
 			let local = body
 				.stack
 				.scopes
-				.get(*scope_idx as usize)?
+				.get(usize::from(*scope_idx))?
 				.locals
-				.get(*local_idx as usize)?;
+				.get(usize::from(*local_idx))?;
 			let name = interner.resolve(local.name.inner).unwrap();
 			let type_str = fmt.display_type(local.ty).unwrap();
 			let mut_kw = if local.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("local {mut_kw}{name}: {type_str}"))
 		}
 		SymbolKind::Param { func_id, param_idx } => {
-			let fi = tir.function_index(*func_id)? as usize;
-			let param = tir.functions[fi].params.get(*param_idx as usize)?;
+			let fi = usize::from(tir.items.function_index(*func_id)?);
+			let param =
+				tir.items.functions[fi].params.get(*param_idx as usize)?;
 			let name = interner.resolve(param.name.inner).unwrap();
 			let type_str = fmt.display_type(param.ty.inner).unwrap();
 			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("{mut_kw}{name}: {type_str}"))
 		}
 		SymbolKind::SelfParam(func_id) => {
-			let fi = tir.function_index(*func_id)? as usize;
-			let param = tir.functions[fi].params.first()?;
+			let fi = usize::from(tir.items.function_index(*func_id)?);
+			let param = tir.items.functions[fi].params.first()?;
 			let type_str = fmt.display_type(param.ty.inner).unwrap();
 			let mut_kw = if param.mut_span.is_some() { "mut " } else { "" };
 			Some(format!("{mut_kw}self: {type_str}"))
@@ -2119,24 +2153,31 @@ fn symbol_hover_text(
 			enum_id,
 			variant_idx,
 		} => {
-			let enum_ = tir.enums.get(tir.enum_index(*enum_id)? as usize)?;
-			let variant = enum_.variants.get(*variant_idx as usize)?;
+			let enum_ = tir
+				.items
+				.enums
+				.get(usize::from(tir.items.enum_index(*enum_id)?))?;
+			let variant = enum_.variants.get(usize::from(*variant_idx))?;
 			let enum_name = interner.resolve(enum_.name.inner).unwrap();
 			let variant_name = interner.resolve(variant.name.inner).unwrap();
 			Some(format!("{enum_name}::{variant_name}"))
 		}
 		SymbolKind::Namespace(ns_idx) => {
-			let ns = tir.namespaces.get(*ns_idx as usize)?;
+			let ns = tir.modules.namespaces.get(usize::from(*ns_idx))?;
 			match ns.declaration {
 				ModuleDeclarationKind::Module(decl_idx) => {
-					let decl = tir.module_decls.get(decl_idx as usize)?;
+					let decl =
+						tir.modules.module_decls.get(usize::from(decl_idx))?;
 					let name = interner.resolve(decl.name.inner).unwrap();
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
 					Some(format!("{pub_prefix}mod {name}"))
 				}
 				ModuleDeclarationKind::Import(import_idx) => {
-					let decl = tir.import_decls.get(import_idx as usize)?;
+					let decl = tir
+						.modules
+						.import_decls
+						.get(usize::from(import_idx))?;
 					let external =
 						interner.resolve(decl.external_name.inner).unwrap();
 					match &decl.internal_name {
@@ -2164,28 +2205,29 @@ fn symbol_hover_text(
 			let param_index = *param_index as usize;
 			let tp: &TypeParamInfo = match owner {
 				TypeParamOwner::Function(def_id) => {
-					let fi = tir.function_index(*def_id)? as usize;
-					let func = &tir.functions[fi];
+					let fi = usize::from(tir.items.function_index(*def_id)?);
+					let func = &tir.items.functions[fi];
 					let local = param_index
 						.checked_sub(func.inherited_type_param_count)?;
 					func.type_params.get(local)?
 				}
 				TypeParamOwner::Struct(def_id) => {
-					let si = tir.struct_index(*def_id)? as usize;
-					tir.structs[si].type_params.get(param_index)?
+					let si = usize::from(tir.items.struct_index(*def_id)?);
+					tir.items.structs[si].type_params.get(param_index)?
 				}
 				TypeParamOwner::ImplBlock(block_idx) => tir
+					.items
 					.inherent_impls
-					.get(*block_idx as usize)?
+					.get(usize::from(*block_idx))?
 					.type_params
 					.get(param_index)?,
 				TypeParamOwner::Trait(trait_idx) => {
-					let t = tir.traits.get(*trait_idx as usize)?;
+					let t = tir.items.traits.get(usize::from(*trait_idx))?;
 					&t.self_type_param
 				}
 				TypeParamOwner::TypeAlias(def_id) => {
-					let ai = tir.type_alias_index(*def_id)? as usize;
-					tir.type_aliases[ai].type_params.get(param_index)?
+					let ai = usize::from(tir.items.type_alias_index(*def_id)?);
+					tir.items.type_aliases[ai].type_params.get(param_index)?
 				}
 				TypeParamOwner::TraitImpl(_) => return None,
 			};
@@ -2199,7 +2241,10 @@ fn symbol_hover_text(
 		}
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
-			let trait_ = tir.traits.get(tir.trait_index(*def_id)? as usize)?;
+			let trait_ = tir
+				.items
+				.traits
+				.get(usize::from(tir.items.trait_index(*def_id)?))?;
 			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
 				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
@@ -2210,14 +2255,16 @@ fn symbol_hover_text(
 			}
 		}
 		SymbolKind::TypeSet(def_id) => {
-			let typeset =
-				tir.typesets.get(tir.typeset_index(*def_id)? as usize)?;
+			let typeset = tir
+				.items
+				.typesets
+				.get(usize::from(tir.items.typeset_index(*def_id)?))?;
 			let name = interner.resolve(typeset.name.inner).unwrap();
 			Some(format!("typeset {name} {{ ... }}"))
 		}
 		SymbolKind::TypeAlias(def_id) => {
-			let ai = tir.type_alias_index(*def_id)? as usize;
-			let alias = &tir.type_aliases[ai];
+			let ai = usize::from(tir.items.type_alias_index(*def_id)?);
+			let alias = &tir.items.type_aliases[ai];
 			let name = interner.resolve(alias.name.inner).unwrap();
 			let pub_prefix = if alias.pub_span.is_some() { "pub " } else { "" };
 			let mut s = format!("{pub_prefix}type {name}");
@@ -2239,8 +2286,8 @@ fn symbol_hover_text(
 			Some(s)
 		}
 		SymbolKind::Const(def_id) => {
-			let ci = tir.const_index(*def_id)? as usize;
-			let constant = &tir.constants[ci];
+			let ci = usize::from(tir.items.const_index(*def_id)?);
+			let constant = &tir.items.constants[ci];
 			let name = interner.resolve(constant.name.inner).unwrap();
 			let type_str = fmt.display_type(constant.ty.inner).unwrap();
 			let pub_prefix = if constant.pub_span.is_some() {
@@ -2254,9 +2301,11 @@ fn symbol_hover_text(
 			struct_id,
 			field_idx,
 		} => {
-			let struct_ =
-				tir.structs.get(tir.struct_index(*struct_id)? as usize)?;
-			let field = struct_.fields.get(*field_idx as usize)?;
+			let struct_ = tir
+				.items
+				.structs
+				.get(usize::from(tir.items.struct_index(*struct_id)?))?;
+			let field = struct_.fields.get(usize::from(*field_idx))?;
 			let name = interner.resolve(field.name.inner).unwrap();
 			let type_str = fmt.display_type(field.ty.inner).unwrap();
 			let pub_prefix = if field.pub_span.is_some() { "pub " } else { "" };
@@ -2266,7 +2315,10 @@ fn symbol_hover_text(
 			trait_id,
 			assoc_name,
 		} => {
-			let trait_ = tir.traits.get(tir.trait_index(*trait_id)? as usize)?;
+			let trait_ = tir
+				.items
+				.traits
+				.get(usize::from(tir.items.trait_index(*trait_id)?))?;
 			let at = trait_.assoc_types.get(assoc_name)?;
 			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
@@ -2400,28 +2452,32 @@ fn reference_search_kinds(
 	kind: SymbolKind,
 ) -> Vec<SymbolKind> {
 	let target = match kind {
-		SymbolKind::Struct(id) => tir.struct_index(id).map(ImplTarget::Struct),
-		SymbolKind::Enum(id) => tir.enum_index(id).map(ImplTarget::Enum),
-		SymbolKind::InherentImplSelf(block_idx) => {
-			tir.inherent_impls.get(block_idx as usize).and_then(|b| {
-				ImplTarget::from_type(&tir.types[b.target.inner.as_usize()])
-					.ok()
-			})
+		SymbolKind::Struct(id) => {
+			tir.items.struct_index(id).map(ImplTarget::Struct)
 		}
-		SymbolKind::TraitImplSelf(trait_impl_idx) => {
-			tir.trait_impls.get(trait_impl_idx as usize).and_then(|ti| {
-				ImplTarget::from_type(&tir.types[ti.target.inner.as_usize()])
-					.ok()
-			})
-		}
+		SymbolKind::Enum(id) => tir.items.enum_index(id).map(ImplTarget::Enum),
+		SymbolKind::InherentImplSelf(block_idx) => tir
+			.items
+			.inherent_impls
+			.get(usize::from(block_idx))
+			.and_then(|b| {
+				ImplTarget::from_type(tir.types.resolve(b.target.inner)).ok()
+			}),
+		SymbolKind::TraitImplSelf(trait_impl_idx) => tir
+			.items
+			.trait_impls
+			.get(usize::from(trait_impl_idx))
+			.and_then(|ti| {
+				ImplTarget::from_type(tir.types.resolve(ti.target.inner)).ok()
+			}),
 		_ => return vec![kind],
 	};
 	let target_kind = target.and_then(|t| match t {
-		ImplTarget::Struct(idx) => {
-			Some(SymbolKind::Struct(tir.structs.get(idx as usize)?.id))
-		}
+		ImplTarget::Struct(idx) => Some(SymbolKind::Struct(
+			tir.items.structs.get(usize::from(idx))?.id,
+		)),
 		ImplTarget::Enum(idx) => {
-			Some(SymbolKind::Enum(tir.enums.get(idx as usize)?.id))
+			Some(SymbolKind::Enum(tir.items.enums.get(usize::from(idx))?.id))
 		}
 		_ => None,
 	});
@@ -2452,13 +2508,16 @@ fn implementation_locations(
 	kind: SymbolKind,
 ) -> Vec<SourceSpan> {
 	let target = match kind {
-		SymbolKind::Struct(id) => tir.struct_index(id).map(ImplTarget::Struct),
-		SymbolKind::Enum(id) => tir.enum_index(id).map(ImplTarget::Enum),
+		SymbolKind::Struct(id) => {
+			tir.items.struct_index(id).map(ImplTarget::Struct)
+		}
+		SymbolKind::Enum(id) => tir.items.enum_index(id).map(ImplTarget::Enum),
 		SymbolKind::Trait(id) => {
-			let Some(trait_index) = tir.trait_index(id) else {
+			let Some(trait_index) = tir.items.trait_index(id) else {
 				return Vec::new();
 			};
 			return tir
+				.items
 				.trait_impls
 				.iter()
 				.filter(|ti| ti.trait_index == trait_index)
@@ -2478,12 +2537,14 @@ fn implementation_locations(
 		.copied()
 		.filter_map(|impl_ref| match impl_ref {
 			ImplRef::Inherent(idx) => tir
+				.items
 				.inherent_impls
-				.get(idx as usize)
+				.get(usize::from(idx))
 				.map(|b| SourceSpan::new(b.file_id, b.target.span)),
 			ImplRef::Trait(idx) => tir
+				.items
 				.trait_impls
-				.get(idx as usize)
+				.get(usize::from(idx))
 				.map(|ti| SourceSpan::new(ti.file_id, ti.target.span)),
 		})
 		.collect()

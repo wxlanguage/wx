@@ -33,11 +33,7 @@ impl<'ast> Builder<'ast, '_> {
 					SourceSpan::new(file_id, signature.name.span),
 				);
 				let attributes = self.resolve_attributes(*id, attributes);
-				let func_index = self.tir.functions.len() as u32;
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Function(func_index));
-				self.tir.functions.push(Function {
+				self.items.push_function(Function {
 					id: *id,
 					file_id,
 					namespace,
@@ -82,11 +78,7 @@ impl<'ast> Builder<'ast, '_> {
 				// `Global` has no `attributes` field of its own, so this runs
 				// purely for the `#[tag = ".."]` registration, as on `Trait`.
 				self.resolve_attributes(*id, attributes);
-				let global_index = self.tir.globals.len() as u32;
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Global(global_index));
-				self.tir.globals.push(Global {
+				self.items.push_global(Global {
 					id: *id,
 					file_id,
 					namespace,
@@ -121,16 +113,9 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, name.span),
 				);
-				let struct_index = self.tir.structs.len() as u32;
-				let self_type = self.intern_type(Type::Struct {
-					struct_index,
-					args: Box::new([]),
-				});
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Struct(struct_index));
 				let attributes = self.resolve_attributes(*id, attributes);
-				self.tir.structs.push(Struct {
+				let types = &mut self.types;
+				self.items.push_struct(|struct_index| Struct {
 					id: *id,
 					file_id,
 					namespace,
@@ -140,7 +125,10 @@ impl<'ast> Builder<'ast, '_> {
 						.iter()
 						.map(|tp| TypeParamInfo::new(tp.name))
 						.collect(),
-					self_type,
+					self_type: types.intern(Type::Struct {
+						struct_index,
+						args: Box::new([]),
+					}),
 					attributes,
 					fields: Box::new([]),
 					lookup: HashMap::new(),
@@ -168,19 +156,15 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				// See the `Global` arm: registers `#[tag = ".."]` only.
 				self.resolve_attributes(*id, attributes);
-				let enum_index = self.tir.enums.len() as u32;
-				let self_type = self.intern_type(Type::Enum { enum_index });
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Enum(enum_index));
-				self.tir.enums.push(Enum {
+				let types = &mut self.types;
+				self.items.push_enum(|enum_index| Enum {
 					id: *id,
 					file_id,
 					namespace,
 					pub_span: *pub_span,
 					name: *name,
 					repr_type: TypeIndex::ERROR,
-					self_type,
+					self_type: types.intern(Type::Enum { enum_index }),
 					variants: Box::new([]),
 					variant_lookup: HashMap::new(),
 					accesses: Vec::new(),
@@ -206,12 +190,8 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, name.span),
 				);
-				let type_alias_index = self.tir.type_aliases.len() as u32;
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::TypeAlias(type_alias_index));
 				let attributes = self.resolve_attributes(*id, attributes);
-				self.tir.type_aliases.push(TypeAlias {
+				self.items.push_type_alias(TypeAlias {
 					id: *id,
 					file_id,
 					namespace,
@@ -255,11 +235,7 @@ impl<'ast> Builder<'ast, '_> {
 					*id,
 					SourceSpan::new(file_id, name.span),
 				);
-				let memory_index = self.tir.memories.len() as u32;
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Memory(memory_index));
-				self.tir.memories.push(Memory {
+				self.items.push_memory(Memory {
 					id: *id,
 					file_id,
 					name: *name,
@@ -292,12 +268,8 @@ impl<'ast> Builder<'ast, '_> {
 					id,
 					SourceSpan::new(file_id, name.span),
 				);
-				let const_index = self.tir.constants.len() as ConstIndex;
-				self.tir
-					.item_lookup
-					.insert(id, ItemIndex::Const(const_index));
 				let attributes = self.resolve_attributes(id, attributes);
-				self.tir.constants.push(Constant {
+				self.items.push_constant(Constant {
 					id,
 					file_id,
 					namespace,
@@ -354,7 +326,7 @@ impl<'ast> Builder<'ast, '_> {
 				{
 					let name_str = self.interner.resolve(name.inner).unwrap();
 					let first_definition = self.get_symbol_location(existing);
-					self.tir.diagnostics.push(report_duplicate_definition(
+					self.diagnostics.push(report_duplicate_definition(
 						DuplicateDefinitionDiagnostic {
 							name: name_str,
 							namespace: SymbolNamespace::Type,
@@ -366,7 +338,33 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				}
 
-				let trait_index = self.tir.traits.len() as u32;
+				let self_name_sym = self.interner.get_or_intern("Self");
+				let trait_index = self.items.push_trait(|trait_index| Trait {
+					id: *id,
+					file_id,
+					namespace,
+					pub_span: *pub_span,
+					name: *name,
+					self_type_param: TypeParamInfo {
+						name: Spanned {
+							inner: self_name_sym,
+							span: name.span,
+						},
+						bounds: Bounds {
+							traits: Box::new([TraitBound {
+								trait_index,
+								bindings: Box::new([]),
+								span: name.span,
+							}]),
+							typeset: None,
+						},
+						accesses: Vec::new(),
+					},
+					entries: HashMap::new(),
+					assoc_types: HashMap::new(),
+					bounds: Bounds::default(),
+					accesses: Vec::new(),
+				});
 				for trait_item in items.iter() {
 					match &trait_item.inner.inner {
 						ast::TraitItem::Function { id, .. } => {
@@ -409,37 +407,6 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 				}
-
-				let self_name_sym = self.interner.get_or_intern("Self");
-				self.tir.traits.push(Trait {
-					id: *id,
-					file_id,
-					namespace,
-					pub_span: *pub_span,
-					name: *name,
-					self_type_param: TypeParamInfo {
-						name: Spanned {
-							inner: self_name_sym,
-							span: name.span,
-						},
-						bounds: Bounds {
-							traits: Box::new([TraitBound {
-								trait_index,
-								bindings: Box::new([]),
-								span: name.span,
-							}]),
-							typeset: None,
-						},
-						accesses: Vec::new(),
-					},
-					entries: HashMap::new(),
-					assoc_types: HashMap::new(),
-					bounds: Bounds::default(),
-					accesses: Vec::new(),
-				});
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::Trait(trait_index));
 				self.insert_symbol(
 					namespace,
 					(SymbolNamespace::Type, name.inner),
@@ -464,8 +431,7 @@ impl<'ast> Builder<'ast, '_> {
 				// it, register a dedicated init entry (resolves bounds +
 				// target), then register each item referencing the block's
 				// AST id.
-				let block_index = self.tir.inherent_impls.len() as u32;
-				self.tir.inherent_impls.push(InherentImpl {
+				let block_index = self.items.push_inherent_impl(InherentImpl {
 					id: *impl_id,
 					file_id,
 					type_params: type_params
@@ -521,7 +487,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 						ast::ImplItem::AssocType { name, .. } => {
 							if type_params.is_empty() {
-								self.tir.diagnostics.push(
+								self.diagnostics.push(
 									report_associated_type_in_inherent_impl(
 										SourceSpan::new(file_id, name.span),
 									),
@@ -540,7 +506,6 @@ impl<'ast> Builder<'ast, '_> {
 			} => {
 				// Imports are processed eagerly: their signatures depend only on
 				// primitive types or previously-registered stdlib types.
-				let import_decl_index = self.tir.import_decls.len() as u32;
 				let external_name = {
 					let s = self
 						.interner
@@ -552,17 +517,16 @@ impl<'ast> Builder<'ast, '_> {
 						span: import_module_name.span,
 					}
 				};
-				let namespace_idx = self.tir.namespaces.len() as u32;
-				let decl_idx = self.tir.import_decls.len() as u32;
-				let package = self.tir.namespaces[namespace as usize].package;
-				self.tir.namespaces.push(ModuleNamespace {
-					parent: Some(namespace),
-					package,
-					declaration: ModuleDeclarationKind::Import(decl_idx),
-					symbols: HashMap::new(),
-					wildcard_imports: Vec::new(),
-					accesses: Vec::new(),
-				});
+				let package =
+					self.modules.namespaces[usize::from(namespace)].package;
+				let (namespace_idx, import_decl_index) =
+					self.modules.push_import(
+						namespace,
+						package,
+						file_id,
+						external_name,
+						*alias,
+					);
 				self.seed_path_root_symbols(
 					namespace_idx,
 					package,
@@ -591,7 +555,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 					None => {
-						self.tir.diagnostics.push(report_missing_import_alias(
+						self.diagnostics.push(report_missing_import_alias(
 							SourceSpan::new(file_id, import_module_name.span),
 						));
 					}
@@ -645,13 +609,6 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					}
 				}
-				self.tir.import_decls.push(ImportDecl {
-					namespace_idx,
-					file_id,
-					external_name,
-					internal_name: *alias,
-					lookup: HashMap::new(),
-				});
 			}
 			ast::Item::Use { tree, pub_span } => {
 				let mut prefix: Vec<ast::Spanned<SymbolU32>> = Vec::new();
@@ -685,8 +642,7 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			} => {
 				let attributes = self.resolve_attributes(*id, attributes);
-				let typeset_index = self.tir.typesets.len() as TypesetIndex;
-				self.tir.typesets.push(TypeSet {
+				let typeset_index = self.items.push_typeset(TypeSet {
 					id: *id,
 					file_id,
 					namespace,
@@ -697,9 +653,6 @@ impl<'ast> Builder<'ast, '_> {
 					accesses: Vec::new(),
 					attributes,
 				});
-				self.tir
-					.item_lookup
-					.insert(*id, ItemIndex::TypeSet(typeset_index));
 				self.insert_symbol(
 					namespace,
 					(SymbolNamespace::Type, name.inner),
