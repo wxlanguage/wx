@@ -19,6 +19,7 @@ mod paths;
 mod prescan;
 mod signature;
 mod traits;
+mod type_compare;
 mod types;
 
 use aggregates::{
@@ -45,6 +46,7 @@ use signature::{
 	report_missing_function_body, report_non_constant_global_initializer,
 };
 use traits::report_associated_type_in_inherent_impl;
+use type_compare::{SignatureComparison, TypeComparison};
 use types::report_undeclared_type;
 
 struct ExprContext {

@@ -92,36 +92,49 @@ impl<'ast> Builder<'ast, '_> {
 			for (&name, &def_entry) in trait_def.entries.iter() {
 				match trait_impl.members.get(&name).copied() {
 					Some(provided_impl) => match (provided_impl, def_entry) {
-						// TODO: verify that impl signatures are compatible trait declarations and report specific issues
-						// error[E0053]: method `foo` has an incompatible type for trait
-						// 	--> crates/wx-compiler/src/lib.rs:23:32
-						// 	|
-						// 23 |     fn foo(b: i32, d: i32, o: i32) {}
-						// 	|                                   ^ expected `i32`, found `()`
-						// 	|
-						// note: type in trait
-						// 	--> crates/wx-compiler/src/lib.rs:13:36
-						// 	|
-						// 13 |     fn foo(b: i32, d: i32, b: i32) -> i32;
-						// 	|                                       ^^^
-						// 	= note: expected signature `fn(_, _, _) -> i32`
-						// 							found signature `fn(_, _, _) -> ()`
-						// help: change the output type to match the trait
-						// 	|
-						// 23 |     fn foo(b: i32, d: i32, o: i32) -> i32 {}
-						// 	|                                    ++++++
 						(
-							ImplEntry::Method(_impl_index),
-							ImplEntry::Method(_def_index),
-						) => {}
+							ImplEntry::Method(impl_index),
+							ImplEntry::Method(def_index),
+						)
+						| (
+							ImplEntry::AssocFunction(impl_index),
+							ImplEntry::AssocFunction(def_index),
+						) => {
+							if let SignatureComparison::Incompatible(
+								difference,
+							) = self.compare_method_signature(
+								def_index, impl_index, trait_impl,
+							) {
+								self.diagnostics.push(
+									self.report_incompatible_method_signature(
+										trait_def.name.inner,
+										name,
+										def_index,
+										impl_index,
+										&difference,
+									),
+								);
+							}
+						}
 						(
-							ImplEntry::AssocFunction(_impl_index),
-							ImplEntry::AssocFunction(_def_index),
-						) => {}
-						(
-							ImplEntry::AssocConstant(_impl_index),
-							ImplEntry::AssocConstant(_def_index),
-						) => {}
+							ImplEntry::AssocConstant(impl_index),
+							ImplEntry::AssocConstant(def_index),
+						) => {
+							if let TypeComparison::Different(difference) = self
+								.compare_assoc_const_type(
+									def_index, impl_index, trait_impl,
+								) {
+								self.diagnostics.push(
+									self.report_incompatible_const_type(
+										trait_def.name.inner,
+										name,
+										def_index,
+										impl_index,
+										&difference,
+									),
+								);
+							}
+						}
 						(
 							ImplEntry::AssocType(_impl_index),
 							ImplEntry::AssocType(_def_index),

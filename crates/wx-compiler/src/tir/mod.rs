@@ -2022,6 +2022,8 @@ define_diagnostic_codes! {
 		ForeignImplTarget => "E1077",
 		NotATraitMember => "E1078",
 		TraitImplItemKindMismatch => "E1079",
+		TraitImplSignatureMismatch => "E1080",
+		TraitImplConstTypeMismatch => "E1081",
 	}
 }
 
