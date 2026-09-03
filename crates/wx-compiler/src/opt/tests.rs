@@ -97,6 +97,7 @@ impl TestCase {
 			.unwrap_or_else(|| panic!("no `{tag}` symbol interned"));
 		let id = *self
 			.tir
+			.items
 			.tagged_items
 			.get(&symbol)
 			.unwrap_or_else(|| panic!("no #[tag = \"{tag}\"] item found"));

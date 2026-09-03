@@ -14,22 +14,23 @@ impl<'ast> Builder<'ast, '_> {
 		full_span: TextSpan,
 	) -> Result<BoundKind, ()> {
 		let file_id = resolve_context.file_id;
-		let symbol = match self.resolve_pending_global_symbol(
-			resolve_context.namespace,
-			(SymbolNamespace::Type, identifier.inner),
-			SourceSpan::new(file_id, identifier.span),
-		)? {
-			Some(symbol) => symbol,
-			None => {
-				self.tir.diagnostics.push(report_undeclared_type(
-					SourceSpan::new(file_id, identifier.span),
-				));
-				return Err(());
-			}
-		};
+		let symbol =
+			match self.resolve_pending_global_symbol(
+				resolve_context.namespace,
+				(SymbolNamespace::Type, identifier.inner),
+				SourceSpan::new(file_id, identifier.span),
+			)? {
+				Some(symbol) => symbol,
+				None => {
+					self.diagnostics.push(report_undeclared_type(
+						SourceSpan::new(file_id, identifier.span),
+					));
+					return Err(());
+				}
+			};
 		match symbol {
 			SymbolKind::Trait { trait_index } => {
-				self.tir.traits[trait_index as usize]
+				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
 				Ok(BoundKind::Trait(TraitBound {
@@ -39,7 +40,7 @@ impl<'ast> Builder<'ast, '_> {
 				}))
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				self.tir.typesets[typeset_index as usize]
+				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
 				Ok(BoundKind::TypeSet(TypesetBound {
@@ -48,7 +49,7 @@ impl<'ast> Builder<'ast, '_> {
 				}))
 			}
 			_ => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
 						.with_message("expected bound")
@@ -110,9 +111,9 @@ impl<'ast> Builder<'ast, '_> {
 		let last = segs.last().unwrap();
 		let file_id = resolve_context.file_id;
 		let &Type::Namespace { namespace_idx } =
-			&self.tir.types[namespace_ty.as_usize()]
+			self.types.resolve(namespace_ty)
 		else {
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				Diagnostic::error()
 					.with_message(
 						"expected a module namespace before a bound name",
@@ -121,23 +122,24 @@ impl<'ast> Builder<'ast, '_> {
 			);
 			return Err(());
 		};
-		let kind = match self.resolve_pending_namespace_symbol(
-			resolve_context.namespace,
-			namespace_idx,
-			(SymbolNamespace::Type, last.ident.inner),
-			SourceSpan::new(file_id, last.ident.span),
-		)? {
-			Some(kind) => kind,
-			None => {
-				self.tir.diagnostics.push(report_undeclared_type(
-					SourceSpan::new(file_id, last.ident.span),
-				));
-				return Err(());
-			}
-		};
+		let kind =
+			match self.resolve_pending_namespace_symbol(
+				resolve_context.namespace,
+				namespace_idx,
+				(SymbolNamespace::Type, last.ident.inner),
+				SourceSpan::new(file_id, last.ident.span),
+			)? {
+				Some(kind) => kind,
+				None => {
+					self.diagnostics.push(report_undeclared_type(
+						SourceSpan::new(file_id, last.ident.span),
+					));
+					return Err(());
+				}
+			};
 		match kind {
 			SymbolKind::Trait { trait_index } => {
-				self.tir.traits[trait_index as usize]
+				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
 				Ok(BoundKind::Trait(TraitBound {
@@ -147,7 +149,7 @@ impl<'ast> Builder<'ast, '_> {
 				}))
 			}
 			SymbolKind::TypeSet { typeset_index } => {
-				self.tir.typesets[typeset_index as usize]
+				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
 				Ok(BoundKind::TypeSet(TypesetBound {
@@ -156,7 +158,7 @@ impl<'ast> Builder<'ast, '_> {
 				}))
 			}
 			_ => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
 						.with_message(
@@ -203,7 +205,7 @@ impl<'ast> Builder<'ast, '_> {
 				let segs = match path.as_ref() {
 					ast::BoundExpression::Path(segs) => segs,
 					_ => {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_message(
 									"expected a single trait bound here",
@@ -223,7 +225,7 @@ impl<'ast> Builder<'ast, '_> {
 				) {
 					Ok(BoundKind::Trait(tb)) => tb.trait_index,
 					Ok(BoundKind::TypeSet(typeset)) => {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								// TODO: add diagnostic code here
 								.with_message(
@@ -253,8 +255,9 @@ impl<'ast> Builder<'ast, '_> {
 				// discarded status: in progress means the trait is already
 				// resolving further up the stack, and the access is recorded
 				// against whatever it has populated by now.
-				let _ = self
-					.ensure_signature(self.tir.traits[trait_index as usize].id);
+				let _ = self.ensure_signature(
+					self.items.traits[usize::from(trait_index)].id,
+				);
 				// At most one entry per name — a name is only ever
 				// meaningful once per `where { }` block, whether it's
 				// written twice the same way (`Size = u32, Size = u64`) or
@@ -273,7 +276,7 @@ impl<'ast> Builder<'ast, '_> {
 					{
 						let assoc_name_str =
 							self.interner.resolve(binding.name.inner).unwrap();
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::DuplicateAssocTypeBinding
@@ -292,9 +295,10 @@ impl<'ast> Builder<'ast, '_> {
 						);
 						continue;
 					}
-					if let Some(at) = self.tir.traits[trait_index as usize]
-						.assoc_types
-						.get_mut(&binding.name.inner)
+					if let Some(at) = self.items.traits
+						[usize::from(trait_index)]
+					.assoc_types
+					.get_mut(&binding.name.inner)
 					{
 						at.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
@@ -324,12 +328,12 @@ impl<'ast> Builder<'ast, '_> {
 							// place that needs to know about the trait's own
 							// declared bound (`type Size: PointerSize`) to
 							// fold it in and check for a conflict.
-							let declared = self.tir.traits
-								[trait_index as usize]
-								.assoc_types
-								.get(&binding.name.inner)
-								.map(|at| at.bounds.clone())
-								.unwrap_or_default();
+							let declared = self.items.traits
+								[usize::from(trait_index)]
+							.assoc_types
+							.get(&binding.name.inner)
+							.map(|at| at.bounds.clone())
+							.unwrap_or_default();
 							let merged_typeset = match (
 								declared.typeset,
 								rhs_bounds.typeset,
@@ -342,13 +346,13 @@ impl<'ast> Builder<'ast, '_> {
 									let trait_name_str = self
 										.interner
 										.resolve(
-											self.tir.traits
-												[trait_index as usize]
-												.name
-												.inner,
+											self.items.traits
+												[usize::from(trait_index)]
+											.name
+											.inner,
 										)
 										.unwrap();
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
 												DiagnosticCode::MultipleTypesetBounds
@@ -368,8 +372,8 @@ impl<'ast> Builder<'ast, '_> {
 											)
 											.with_label(
 												Label::secondary(
-													self.tir.traits
-														[trait_index as usize]
+													self.items.traits
+														[usize::from(trait_index)]
 														.file_id,
 													declared_ts.span,
 												)
@@ -451,7 +455,7 @@ impl<'ast> Builder<'ast, '_> {
 					traits.extend_from_slice(&resolved.traits);
 					if let Some(ts) = resolved.typeset {
 						if typeset.is_some() {
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								Diagnostic::error()
 									.with_code(
 										DiagnosticCode::MultipleTypesetBounds
@@ -512,7 +516,7 @@ impl<'ast> Builder<'ast, '_> {
 					)
 				})
 				.unwrap_or_default();
-			self.tir.type_param_info_mut(owner, offset + i).bounds = resolved;
+			self.items.type_param_info_mut(owner, offset + i).bounds = resolved;
 		}
 	}
 
@@ -524,25 +528,25 @@ impl<'ast> Builder<'ast, '_> {
 	) -> &[TypeParamInfo] {
 		match owner {
 			TypeParamOwner::ImplBlock(block_idx) => {
-				&self.tir.inherent_impls[block_idx as usize].type_params
+				&self.items.inherent_impls[usize::from(block_idx)].type_params
 			}
 			TypeParamOwner::Function(id) => {
-				let func_index = self.tir.expect_function_index(id);
-				&self.tir.functions[func_index as usize].type_params
+				let func_index = self.items.expect_function_index(id);
+				&self.items.functions[usize::from(func_index)].type_params
 			}
 			TypeParamOwner::Struct(id) => {
-				let struct_index = self.tir.expect_struct_index(id);
-				&self.tir.structs[struct_index as usize].type_params
+				let struct_index = self.items.expect_struct_index(id);
+				&self.items.structs[usize::from(struct_index)].type_params
 			}
 			TypeParamOwner::Trait(trait_index) => std::slice::from_ref(
-				&self.tir.traits[trait_index as usize].self_type_param,
+				&self.items.traits[usize::from(trait_index)].self_type_param,
 			),
 			TypeParamOwner::TypeAlias(id) => {
-				let alias_index = self.tir.expect_type_alias_index(id);
-				&self.tir.type_aliases[alias_index as usize].type_params
+				let alias_index = self.items.expect_type_alias_index(id);
+				&self.items.type_aliases[usize::from(alias_index)].type_params
 			}
 			TypeParamOwner::TraitImpl(impl_idx) => {
-				&self.tir.trait_impls[impl_idx as usize].type_params
+				&self.items.trait_impls[usize::from(impl_idx)].type_params
 			}
 		}
 	}
@@ -553,8 +557,9 @@ impl<'ast> Builder<'ast, '_> {
 	) -> usize {
 		match owner {
 			TypeParamOwner::Function(id) => {
-				self.tir.function_index(id).map_or(0, |idx| {
-					self.tir.functions[idx as usize].inherited_type_param_count
+				self.items.function_index(id).map_or(0, |idx| {
+					self.items.functions[usize::from(idx)]
+						.inherited_type_param_count
 				})
 			}
 			_ => 0,
@@ -596,15 +601,15 @@ impl<'ast> Builder<'ast, '_> {
 	) -> TypeIndex {
 		let (expected, name_sym) = match symbol_kind {
 			SymbolKind::Struct { struct_index } => {
-				let s = &self.tir.structs[struct_index as usize];
+				let s = &self.items.structs[usize::from(struct_index)];
 				(s.type_params.len(), s.name.inner)
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				let a = &self.tir.type_aliases[type_alias_index as usize];
+				let a = &self.items.type_aliases[usize::from(type_alias_index)];
 				(a.type_params.len(), a.name.inner)
 			}
 			_ => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_message("type arguments are not supported here")
 						.with_label(Label::primary(
@@ -623,7 +628,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let args = if mismatched {
 			let name = self.interner.resolve(name_sym).unwrap();
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeArgCountMismatch.code())
 					.with_message(format!(
@@ -644,7 +649,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		match symbol_kind {
 			SymbolKind::Struct { struct_index } => {
-				self.tir.structs[struct_index as usize]
+				self.items.structs[usize::from(struct_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
 				self.intern_type(Type::Struct {
@@ -653,11 +658,11 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			SymbolKind::TypeAlias { type_alias_index } => {
-				self.tir.type_aliases[type_alias_index as usize]
+				self.items.type_aliases[usize::from(type_alias_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
 				let template =
-					self.tir.type_aliases[type_alias_index as usize].body;
+					self.items.type_aliases[usize::from(type_alias_index)].body;
 				self.substitute_type(template, &args)
 			}
 			_ => unreachable!("filtered above"),
@@ -669,7 +674,7 @@ impl<'ast> Builder<'ast, '_> {
 		ty: TypeIndex,
 		type_args: &[TypeIndex],
 	) -> TypeIndex {
-		match &self.tir.types[ty.as_usize()] {
+		match self.types.resolve(ty) {
 			// Types that can never contain TypeParams — return immediately.
 			Type::Unit
 			| Type::Bool
@@ -706,7 +711,7 @@ impl<'ast> Builder<'ast, '_> {
 				let (base, assoc_name, trait_index) =
 					(*base, *assoc_name, *trait_index);
 				let substituted = self.substitute_type(base, type_args);
-				match &self.tir.types[substituted.as_usize()] {
+				match self.types.resolve(substituted) {
 					Type::TypeParam { .. }
 					| Type::AssocTypeProjection { .. } => {
 						if substituted == base {
@@ -743,19 +748,23 @@ impl<'ast> Builder<'ast, '_> {
 					// `resolve_impl_member` — there's nothing to
 					// disambiguate when the trait is already pinned down.
 					_ => {
-						match self.tir.find_trait_impl(substituted, trait_index)
-						{
+						match self.items.find_trait_impl(
+							&self.types,
+							substituted,
+							trait_index,
+						) {
 							Some((impl_idx, impl_type_args)) => {
-								match self.tir.trait_impls[impl_idx as usize]
-									.members
-									.get(&assoc_name)
+								match self.items.trait_impls
+									[usize::from(impl_idx)]
+								.members
+								.get(&assoc_name)
 								{
 									Some(ImplEntry::AssocType(idx)) => {
 										let concrete = self
-											.tir
-											.assoc_type_impls[*idx as usize]
-											.ty
-											.unwrap();
+											.items
+											.assoc_type_impls[usize::from(*idx)]
+										.ty
+										.unwrap();
 										// The impl's own assoc-type value may
 										// reference its own type params (e.g.
 										// `impl<T> Trait for Foo<T> { type
@@ -965,7 +974,7 @@ impl<'ast> Builder<'ast, '_> {
 		type_args: &[TypeIndex],
 	) -> TypeIndex {
 		let result = self.substitute_type(ty, type_args);
-		match &self.tir.types[result.as_usize()] {
+		match self.types.resolve(result) {
 			Type::TypeParam { .. }
 			| Type::Integer
 			| Type::Float
@@ -987,14 +996,15 @@ impl<'ast> Builder<'ast, '_> {
 		assoc_name: SymbolU32,
 	) -> Option<TypeIndex> {
 		let (impl_idx, impl_type_args) =
-			self.tir.find_trait_impl(ty, trait_index)?;
-		match self.tir.trait_impls[impl_idx as usize]
+			self.items.find_trait_impl(&self.types, ty, trait_index)?;
+		match self.items.trait_impls[usize::from(impl_idx)]
 			.members
 			.get(&assoc_name)
 			.copied()
 		{
 			Some(ImplEntry::AssocType(idx)) => {
-				let raw = self.tir.assoc_type_impls[idx as usize].ty.unwrap();
+				let raw =
+					self.items.assoc_type_impls[usize::from(idx)].ty.unwrap();
 				Some(self.substitute_type(raw.inner, &impl_type_args))
 			}
 			_ => None,
@@ -1018,7 +1028,7 @@ impl<'ast> Builder<'ast, '_> {
 		ty: Spanned<TypeIndex>,
 	) {
 		let ResolveContext { file_id, namespace } = resolve_context;
-		let Some(bounds) = self.tir.traits[trait_index as usize]
+		let Some(bounds) = self.items.traits[usize::from(trait_index)]
 			.assoc_types
 			.get(&name.inner)
 			.map(|assoc_type| assoc_type.bounds.clone())
@@ -1028,7 +1038,11 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		for bound in bounds.traits.iter() {
-			match self.tir.find_trait_impl(ty.inner, bound.trait_index) {
+			match self.items.find_trait_impl(
+				&self.types,
+				ty.inner,
+				bound.trait_index,
+			) {
 				Some((impl_idx, impl_type_args)) => {
 					// Verify the impl's *actual* value for each binding on
 					// `bound` matches what's required — not just that the
@@ -1043,16 +1057,16 @@ impl<'ast> Builder<'ast, '_> {
 					// impl-declaration time instead of call time.
 					for (binding_name, kind) in bound.bindings.iter() {
 						let binding_name = *binding_name;
-						let actual = match self.tir.trait_impls
-							[impl_idx as usize]
-							.members
-							.get(&binding_name)
+						let actual = match self.items.trait_impls
+							[usize::from(impl_idx)]
+						.members
+						.get(&binding_name)
 						{
 							Some(ImplEntry::AssocType(idx)) => {
-								let raw = self.tir.assoc_type_impls
-									[*idx as usize]
-									.ty
-									.unwrap();
+								let raw = self.items.assoc_type_impls
+									[usize::from(*idx)]
+								.ty
+								.unwrap();
 								self.substitute_type(raw.inner, &impl_type_args)
 							}
 							// Missing item is already reported separately by
@@ -1077,10 +1091,11 @@ impl<'ast> Builder<'ast, '_> {
 									let bound_name = self
 										.interner
 										.resolve(
-											self.tir.traits
-												[bound.trait_index as usize]
-												.name
-												.inner,
+											self.items.traits[usize::from(
+												bound.trait_index,
+											)]
+											.name
+											.inner,
 										)
 										.unwrap();
 									let fmt = self.formatter(namespace);
@@ -1090,7 +1105,7 @@ impl<'ast> Builder<'ast, '_> {
 										fmt.display_type(expected).unwrap();
 									let actual_name =
 										fmt.display_type(actual).unwrap();
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
 												DiagnosticCode::TraitBoundViolation
@@ -1120,10 +1135,10 @@ impl<'ast> Builder<'ast, '_> {
 								let bound_name = self
 									.interner
 									.resolve(
-										self.tir.traits
-											[bound.trait_index as usize]
-											.name
-											.inner,
+										self.items.traits
+											[usize::from(bound.trait_index)]
+										.name
+										.inner,
 									)
 									.unwrap();
 								let fmt = self.formatter(namespace);
@@ -1134,7 +1149,8 @@ impl<'ast> Builder<'ast, '_> {
 									.display_type(actual)
 									.unwrap_or_default();
 								for req_trait in required.traits.iter() {
-									if self.tir.type_implements_trait(
+									if self.items.type_implements_trait(
+										&self.types,
 										actual,
 										req_trait.trait_index,
 									) {
@@ -1143,14 +1159,14 @@ impl<'ast> Builder<'ast, '_> {
 									let req_trait_name = self
 										.interner
 										.resolve(
-											self.tir.traits[req_trait
-												.trait_index
-												as usize]
-												.name
-												.inner,
+											self.items.traits[usize::from(
+												req_trait.trait_index,
+											)]
+											.name
+											.inner,
 										)
 										.unwrap();
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
 												DiagnosticCode::TraitBoundViolation.code(),
@@ -1169,21 +1185,22 @@ impl<'ast> Builder<'ast, '_> {
 									);
 								}
 								if let Some(req_typeset) = required.typeset
-									&& !self.tir.type_in_typeset(
+									&& !self.items.type_in_typeset(
+										&self.types,
 										actual,
 										req_typeset.typeset_index,
 									) {
 									let set_name = self
 										.interner
 										.resolve(
-											self.tir.typesets[req_typeset
-												.typeset_index
-												as usize]
-												.name
-												.inner,
+											self.items.typesets[usize::from(
+												req_typeset.typeset_index,
+											)]
+											.name
+											.inner,
 										)
 										.unwrap();
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										Diagnostic::error()
 											.with_code(
 												DiagnosticCode::TypesetBoundViolation.code(),
@@ -1214,12 +1231,12 @@ impl<'ast> Builder<'ast, '_> {
 					let trait_name = self
 						.interner
 						.resolve(
-							self.tir.traits[bound.trait_index as usize]
+							self.items.traits[usize::from(bound.trait_index)]
 								.name
 								.inner,
 						)
 						.unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::TraitBoundViolation.code(),
@@ -1236,7 +1253,7 @@ impl<'ast> Builder<'ast, '_> {
 							)
 							.with_label(
 								Label::secondary(
-									self.tir.traits[trait_index as usize]
+									self.items.traits[usize::from(trait_index)]
 										.file_id,
 									bound.span,
 								)
@@ -1251,13 +1268,13 @@ impl<'ast> Builder<'ast, '_> {
 
 		if let Some(typeset) = bounds.typeset
 			&& !self
-				.tir
+				.items
 				.concrete_type_in_typeset(ty.inner, typeset.typeset_index)
 		{
 			let typeset_name = self
 				.interner
 				.resolve(
-					self.tir.typesets[typeset.typeset_index as usize]
+					self.items.typesets[usize::from(typeset.typeset_index)]
 						.name
 						.inner,
 				)
@@ -1267,9 +1284,9 @@ impl<'ast> Builder<'ast, '_> {
 				self.formatter(namespace).display_type(ty.inner).unwrap();
 			let trait_name = self
 				.interner
-				.resolve(self.tir.traits[trait_index as usize].name.inner)
+				.resolve(self.items.traits[usize::from(trait_index)].name.inner)
 				.unwrap();
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::TypesetBoundViolation.code())
 						.with_message(format!(
@@ -1285,7 +1302,7 @@ impl<'ast> Builder<'ast, '_> {
 						)
 						.with_label(
 							Label::secondary(
-								self.tir.traits[trait_index as usize]
+								self.items.traits[usize::from(trait_index)]
 									.file_id,
 								typeset.span,
 							)
@@ -1308,11 +1325,11 @@ impl<'ast> Builder<'ast, '_> {
 			trait_index,
 			assoc_name,
 			..
-		} = &self.tir.types[ty.as_usize()]
+		} = self.types.resolve(ty)
 		else {
 			return false;
 		};
-		self.tir.traits[*trait_index as usize]
+		self.items.traits[usize::from(*trait_index)]
 			.assoc_types
 			.get(assoc_name)
 			.is_some_and(|a| a.bounds.typeset.is_some())

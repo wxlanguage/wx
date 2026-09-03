@@ -3,6 +3,8 @@
 //! aliases, enums, functions, typesets, globals, consts, `import` declarations
 //! and the `export { .. }` block.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -49,7 +51,7 @@ impl<'ast> Builder<'ast, '_> {
 					} => (id, name, type_params, fields, pub_span),
 					_ => unreachable!(),
 				};
-				let struct_index = self.tir.expect_struct_index(*id);
+				let struct_index = self.items.expect_struct_index(*id);
 				// Bind the name now, before resolving fields, exactly like
 				// the pre-refactor code did: this lets a self-referential
 				// pointer field (e.g. `*Node`) resolve directly instead of
@@ -99,19 +101,17 @@ impl<'ast> Builder<'ast, '_> {
 					let sym = field.name.inner;
 					if let Some(&first_span) = seen_fields.get(&sym) {
 						let fname = self.interner.resolve(sym).unwrap();
-						self.tir.diagnostics.push(
-							report_duplicate_struct_field(
-								fname,
-								SourceSpan::new(
-									resolve_context.file_id,
-									first_span,
-								),
-								SourceSpan::new(
-									resolve_context.file_id,
-									field.name.span,
-								),
+						self.diagnostics.push(report_duplicate_struct_field(
+							fname,
+							SourceSpan::new(
+								resolve_context.file_id,
+								first_span,
 							),
-						);
+							SourceSpan::new(
+								resolve_context.file_id,
+								field.name.span,
+							),
+						));
 						continue;
 					}
 					let field_ty = self.resolve_signature_type(
@@ -134,9 +134,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 
 				// Fill in the placeholder now that all field types are resolved.
-				self.tir.structs[struct_index as usize].fields =
+				self.items.structs[usize::from(struct_index)].fields =
 					tir_fields.into_boxed_slice();
-				self.tir.structs[struct_index as usize].lookup = field_lookup;
+				self.items.structs[usize::from(struct_index)].lookup =
+					field_lookup;
 
 				// Check for direct (non-pointer) self-recursion. Cycles through
 				// generic struct instantiation are not caught here — see TODO in
@@ -159,7 +160,7 @@ impl<'ast> Builder<'ast, '_> {
 						} => (id, name, type_params, body, pub_span),
 						_ => unreachable!(),
 					};
-				let type_alias_index = self.tir.expect_type_alias_index(*id);
+				let type_alias_index = self.items.expect_type_alias_index(*id);
 
 				// Deliberately NOT calling insert_symbol yet: the symbol table
 				// still holds SymbolKind::Pending(*id) while the RHS resolves,
@@ -193,10 +194,10 @@ impl<'ast> Builder<'ast, '_> {
 					// `resolve_attributes`'s doc comment): not validated
 					// against the item kind or checked against user modules
 					// yet, since only the stdlib we control uses it today.
-					None if self.tir.type_aliases
-						[type_alias_index as usize]
-						.attributes
-						.contains(&ItemAttribute::Intrinsic) =>
+					None if self.items.type_aliases
+						[usize::from(type_alias_index)]
+					.attributes
+					.contains(&ItemAttribute::Intrinsic) =>
 					{
 						Type::try_from(
 							self.interner.resolve(name.inner).unwrap(),
@@ -205,16 +206,13 @@ impl<'ast> Builder<'ast, '_> {
 						.unwrap_or(TypeIndex::ERROR)
 					}
 					None => {
-						self.tir.diagnostics.push(
-							report_missing_type_alias_body(SourceSpan::new(
-								resolve_context.file_id,
-								name.span,
-							)),
-						);
+						self.diagnostics.push(report_missing_type_alias_body(
+							SourceSpan::new(resolve_context.file_id, name.span),
+						));
 						TypeIndex::ERROR
 					}
 				};
-				self.tir.type_aliases[type_alias_index as usize].body =
+				self.items.type_aliases[usize::from(type_alias_index)].body =
 					template;
 
 				// Bind the name only if this occurrence still holds its own
@@ -240,7 +238,7 @@ impl<'ast> Builder<'ast, '_> {
 					..
 				} = item
 				{
-					let enum_index = self.tir.expect_enum_index(*id);
+					let enum_index = self.items.expect_enum_index(*id);
 					self.build_enum(
 						resolve_context,
 						name,
@@ -276,7 +274,7 @@ impl<'ast> Builder<'ast, '_> {
 					pub_span,
 					..
 				} => {
-					let func_index = self.tir.expect_function_index(*id);
+					let func_index = self.items.expect_function_index(*id);
 					self.resolve_type_param_bounds(
 						resolve_context,
 						TypeParamOwner::Function(*id),
@@ -293,7 +291,8 @@ impl<'ast> Builder<'ast, '_> {
 						signature,
 					);
 					let signature_index = self.intern_function(&params, result);
-					let func = &mut self.tir.functions[func_index as usize];
+					let func =
+						&mut self.items.functions[usize::from(func_index)];
 					func.params = params;
 					func.result = result;
 					func.signature_index = signature_index;
@@ -362,7 +361,7 @@ impl<'ast> Builder<'ast, '_> {
 						let ty =
 							self.resolve_type(resolve_context, None, &m.inner);
 						if !ty.is_integer() {
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								Diagnostic::error()
 									.with_code(
 										DiagnosticCode::TypesetMemberNotInteger
@@ -397,10 +396,10 @@ impl<'ast> Builder<'ast, '_> {
 					.iter()
 					.filter_map(|&ty| IntegerRange::for_integer_type(ty))
 					.fold(IntegerRange::widest(), IntegerRange::intersect);
-				self.tir.typesets[typeset_index as usize].members =
+				self.items.typesets[usize::from(typeset_index)].members =
 					resolved_members;
-				self.tir.typesets[typeset_index as usize].intersection_range =
-					intersection_range;
+				self.items.typesets[usize::from(typeset_index)]
+					.intersection_range = intersection_range;
 			}
 			AstNodeRef::TraitFunction { trait_index, item } => self
 				.signature_trait_function(resolve_context, trait_index, item),
@@ -416,7 +415,7 @@ impl<'ast> Builder<'ast, '_> {
 					..
 				} = item
 				{
-					let global_index = self.tir.expect_global_index(*id);
+					let global_index = self.items.expect_global_index(*id);
 					let (ty_idx, ty_span) = match ty {
 						Some(ty) => (
 							self.resolve_signature_type(
@@ -427,7 +426,7 @@ impl<'ast> Builder<'ast, '_> {
 							ty.span,
 						),
 						None => {
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								report_type_annotation_required(
 									SourceSpan::new(
 										resolve_context.file_id,
@@ -438,10 +437,11 @@ impl<'ast> Builder<'ast, '_> {
 							(TypeIndex::ERROR, name.span)
 						}
 					};
-					self.tir.globals[global_index as usize].ty = ast::Spanned {
-						inner: ty_idx,
-						span: ty_span,
-					};
+					self.items.globals[usize::from(global_index)].ty =
+						ast::Spanned {
+							inner: ty_idx,
+							span: ty_span,
+						};
 
 					// Bind the name only if this occurrence still holds its
 					// own `Pending` slot — see the identical comment on the
@@ -470,14 +470,14 @@ impl<'ast> Builder<'ast, '_> {
 					..
 				} = item
 				{
-					let const_index = self.tir.expect_const_index(*id);
+					let const_index = self.items.expect_const_index(*id);
 					let (ty_idx, ty_span) = match ty {
 						Some(ty) => (
 							self.resolve_type(resolve_context, None, ty),
 							ty.span,
 						),
 						None => {
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								report_type_annotation_required(
 									SourceSpan::new(
 										resolve_context.file_id,
@@ -488,7 +488,7 @@ impl<'ast> Builder<'ast, '_> {
 							(TypeIndex::ERROR, name.span)
 						}
 					};
-					self.tir.constants[const_index as usize].ty =
+					self.items.constants[usize::from(const_index)].ty =
 						ast::Spanned {
 							inner: ty_idx,
 							span: ty_span,
@@ -505,7 +505,7 @@ impl<'ast> Builder<'ast, '_> {
 							match self.eval_const_expr(&value_expr) {
 								Ok(v) => Some(v),
 								Err(_) => {
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										report_not_const_evaluatable(
 											SourceSpan::new(
 												resolve_context.file_id,
@@ -516,10 +516,10 @@ impl<'ast> Builder<'ast, '_> {
 									None
 								}
 							};
-						self.tir.constants[const_index as usize].value =
+						self.items.constants[usize::from(const_index)].value =
 							Some(Box::new(value_expr));
-						self.tir.constants[const_index as usize].const_value =
-							const_value;
+						self.items.constants[usize::from(const_index)]
+							.const_value = const_value;
 					}
 
 					// Bind the name whether or not the value resolved. Every
@@ -559,11 +559,10 @@ impl<'ast> Builder<'ast, '_> {
 						signature,
 					);
 					let signature_index = self.intern_function(&params, result);
-					let func_index = self.tir.functions.len() as u32;
-					let import_ns_idx = self.tir.import_decls
-						[import_module_index as usize]
-						.namespace_idx;
-					self.tir.functions.push(Function {
+					let import_ns_idx = self.modules.import_decls
+						[usize::from(import_module_index)]
+					.namespace_idx;
+					let func_index = self.items.push_function(Function {
 						id: *id,
 						file_id: resolve_context.file_id,
 						namespace: import_ns_idx,
@@ -580,23 +579,22 @@ impl<'ast> Builder<'ast, '_> {
 						result,
 						attributes: Box::new([]),
 					});
-					self.tir
-						.item_lookup
-						.insert(*id, ItemIndex::Function(func_index));
-					let import_decl = &mut self.tir.import_decls
-						[import_module_index as usize];
+					let import_decl = &mut self.modules.import_decls
+						[usize::from(import_module_index)];
 					import_decl.lookup.insert(
 						signature.name.inner,
 						ImportValue::Function { id: *id },
 					);
 					let namespace_idx = import_decl.namespace_idx;
-					self.tir.namespaces[namespace_idx as usize].symbols.insert(
-						(SymbolNamespace::Value, signature.name.inner),
-						SymbolEntry::Resolved {
-							kind: SymbolKind::Function { func_index },
-							visibility: Visibility::Public,
-						},
-					);
+					self.modules.namespaces[usize::from(namespace_idx)]
+						.symbols
+						.insert(
+							(SymbolNamespace::Value, signature.name.inner),
+							SymbolEntry::Resolved {
+								kind: SymbolKind::Function { func_index },
+								visibility: Visibility::Public,
+							},
+						);
 				}
 			}
 			AstNodeRef::ImportedGlobal {
@@ -613,11 +611,10 @@ impl<'ast> Builder<'ast, '_> {
 				{
 					let resolved_ty =
 						self.resolve_type(resolve_context, None, ty);
-					let global_index = self.tir.globals.len() as u32;
-					let import_ns_idx = self.tir.import_decls
-						[import_module_index as usize]
-						.namespace_idx;
-					self.tir.globals.push(Global {
+					let import_ns_idx = self.modules.import_decls
+						[usize::from(import_module_index)]
+					.namespace_idx;
+					let global_index = self.items.push_global(Global {
 						id: *id,
 						file_id: resolve_context.file_id,
 						namespace: import_ns_idx,
@@ -631,22 +628,21 @@ impl<'ast> Builder<'ast, '_> {
 						mut_span: *mut_span,
 						accesses: Vec::new(),
 					});
-					self.tir
-						.item_lookup
-						.insert(*id, ItemIndex::Global(global_index));
-					let import_decl = &mut self.tir.import_decls
-						[import_module_index as usize];
+					let import_decl = &mut self.modules.import_decls
+						[usize::from(import_module_index)];
 					import_decl
 						.lookup
 						.insert(name.inner, ImportValue::Global { id: *id });
 					let namespace_idx = import_decl.namespace_idx;
-					self.tir.namespaces[namespace_idx as usize].symbols.insert(
-						(SymbolNamespace::Value, name.inner),
-						SymbolEntry::Resolved {
-							kind: SymbolKind::Global { global_index },
-							visibility: Visibility::Public,
-						},
-					);
+					self.modules.namespaces[usize::from(namespace_idx)]
+						.symbols
+						.insert(
+							(SymbolNamespace::Value, name.inner),
+							SymbolEntry::Resolved {
+								kind: SymbolKind::Global { global_index },
+								visibility: Visibility::Public,
+							},
+						);
 				}
 			}
 			AstNodeRef::Use { use_index } => {
@@ -706,7 +702,8 @@ impl<'ast> Builder<'ast, '_> {
 			unreachable!()
 		};
 		let keyword = SourceSpan::new(file_id, *keyword_span);
-		let block_package = self.tir.namespaces[namespace as usize].package;
+		let block_package =
+			self.modules.namespaces[usize::from(namespace)].package;
 
 		// A library has no ABI of its own — it is consumed through `pub`, not
 		// through exports. This also catches every block in a dependency,
@@ -717,19 +714,17 @@ impl<'ast> Builder<'ast, '_> {
 			self.packages[block_package.as_usize()].kind,
 			PackageKind::Library
 		) {
-			self.tir
-				.diagnostics
-				.push(report_library_cannot_export(keyword));
+			self.diagnostics.push(report_library_cannot_export(keyword));
 			return;
 		}
 
 		// The entry file's top level is the only namespace equal to its
 		// package's root, so this one comparison rejects both a submodule file
 		// and an inline `mod { .. }` block.
-		let root_namespace = self.tir.package_namespaces[&self.root_package];
+		let root_namespace =
+			self.modules.package_namespaces[&self.root_package];
 		if namespace != root_namespace {
-			self.tir
-				.diagnostics
+			self.diagnostics
 				.push(report_export_block_not_at_root(keyword));
 			return;
 		}
@@ -739,9 +734,8 @@ impl<'ast> Builder<'ast, '_> {
 		// every rejection above returns *before* this point: a misplaced block
 		// must not claim the slot, or the package's real block would be
 		// reported as the duplicate of one that was itself rejected.
-		if let Some(existing) = &self.tir.export_block {
-			self.tir
-				.diagnostics
+		if let Some(existing) = &self.export_block {
+			self.diagnostics
 				.push(report_duplicate_export_block(existing.keyword, keyword));
 			return;
 		}
@@ -749,7 +743,7 @@ impl<'ast> Builder<'ast, '_> {
 		// `export { .. }` is a top-level item, so the names it lists resolve
 		// against the package's own root namespace and no wider one.
 		let items = self.build_exports(file_id, root_namespace, entries);
-		self.tir.export_block = Some(ExportBlock { keyword, items });
+		self.export_block = Some(ExportBlock { keyword, items });
 	}
 
 	/// Resolves a signature's params and result. When `scope.self_type` is
@@ -772,7 +766,7 @@ impl<'ast> Builder<'ast, '_> {
 			let name = param.inner.inner.name;
 			if let Some(first_span) = seen_params.get(&name.inner).copied() {
 				let name_str = self.interner.resolve(name.inner).unwrap();
-				self.tir.diagnostics.push(report_duplicate_parameter(
+				self.diagnostics.push(report_duplicate_parameter(
 					name_str,
 					SourceSpan::new(resolve_context.file_id, first_span),
 					SourceSpan::new(resolve_context.file_id, name.span),
@@ -789,20 +783,18 @@ impl<'ast> Builder<'ast, '_> {
 					{
 						let valid_self_type = resolved == self_type
 							|| matches!(
-								&self.tir.types[resolved.as_usize()],
+								self.types.resolve(resolved),
 								Type::Pointer { to, .. } if *to == self_type
 							);
 						if !valid_self_type {
-							self.tir.diagnostics.push(
-								report_invalid_self_type(
-									SourceSpan::new(
-										resolve_context.file_id,
-										ty.span,
-									),
-									self.formatter(resolve_context.namespace),
-									resolved,
+							self.diagnostics.push(report_invalid_self_type(
+								SourceSpan::new(
+									resolve_context.file_id,
+									ty.span,
 								),
-							);
+								self.formatter(resolve_context.namespace),
+								resolved,
+							));
 						}
 					}
 					Spanned {
@@ -857,7 +849,7 @@ impl<'ast> Builder<'ast, '_> {
 						let raw = self.interner.resolve(value.inner).unwrap();
 						let key =
 							self.interner.get_or_intern(unescape_string(raw));
-						self.tir.tagged_items.insert(key, id);
+						self.items.tagged_items.insert(key, id);
 						Some(ItemAttribute::Tag(key))
 					}
 					_ => None,
@@ -869,7 +861,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// Resolves an enum's repr type, folds every variant's value (explicit or
 	/// auto-incremented) to a `ConstValue`, range-checks it against the repr, and
 	/// reports one grouped diagnostic per set of variants that collide on the same
-	/// value. Writes `ty`/`variants`/`lookup` directly onto `self.tir.enums[enum_index]`.
+	/// value. Writes `ty`/`variants`/`lookup` directly onto `self.items.enums[enum_index]`.
 	fn build_enum(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -883,7 +875,7 @@ impl<'ast> Builder<'ast, '_> {
 				let resolved =
 					self.resolve_type(resolve_context, None, repr_type);
 				if resolved != TypeIndex::ERROR && !resolved.is_integer() {
-					self.tir.diagnostics.push(report_enum_repr_not_integer(
+					self.diagnostics.push(report_enum_repr_not_integer(
 						self.formatter(resolve_context.namespace),
 						resolved,
 						SourceSpan::new(
@@ -897,7 +889,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			None => {
-				self.tir.diagnostics.push(report_missing_enum_repr(
+				self.diagnostics.push(report_missing_enum_repr(
 					SourceSpan::new(resolve_context.file_id, name.span),
 				));
 				TypeIndex::ERROR
@@ -921,10 +913,10 @@ impl<'ast> Builder<'ast, '_> {
 			if let Some(first_index) =
 				variant_lookup.get(&ast_variant.name.inner).copied()
 			{
-				let first_span = variants[first_index as usize].name.span;
+				let first_span = variants[usize::from(first_index)].name.span;
 				let vname =
 					self.interner.resolve(ast_variant.name.inner).unwrap();
-				self.tir.diagnostics.push(report_duplicate_definition(
+				self.diagnostics.push(report_duplicate_definition(
 					DuplicateDefinitionDiagnostic {
 						name: vname,
 						namespace: SymbolNamespace::Value,
@@ -959,7 +951,7 @@ impl<'ast> Builder<'ast, '_> {
 								Ok(ConstValue::Int(v)) => Some(v),
 								Ok(_) => None,
 								Err(_) => {
-									self.tir.diagnostics.push(
+									self.diagnostics.push(
 										report_not_const_evaluatable(
 											SourceSpan::new(
 												resolve_context.file_id,
@@ -980,7 +972,7 @@ impl<'ast> Builder<'ast, '_> {
 						if let Some(ref range) = ty_range
 							&& !range.contains(v)
 						{
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								report_integer_literal_out_of_range(
 									self.formatter(resolve_context.namespace),
 									IntegerLiteralOutOfRangeDiagnostic {
@@ -1002,7 +994,7 @@ impl<'ast> Builder<'ast, '_> {
 					// repr_type == TypeIndex::ERROR` arm above.
 					None => {
 						if repr_type != TypeIndex::ERROR {
-							self.tir.diagnostics.push(
+							self.diagnostics.push(
 								report_enum_variant_requires_explicit_value(
 									SourceSpan::new(
 										resolve_context.file_id,
@@ -1017,7 +1009,7 @@ impl<'ast> Builder<'ast, '_> {
 			};
 			next_auto_value = const_value.map(|v| v.wrapping_add(1));
 
-			let variant_index = variants.len() as EnumVariantIndex;
+			let variant_index = EnumVariantIndex::new(variants.len() as u32);
 			variant_lookup.insert(ast_variant.name.inner, variant_index);
 			variants.push(EnumVariant {
 				name: ast_variant.name,
@@ -1033,7 +1025,7 @@ impl<'ast> Builder<'ast, '_> {
 			&variants,
 		);
 
-		let enumeration = &mut self.tir.enums[enum_index as usize];
+		let enumeration = &mut self.items.enums[usize::from(enum_index)];
 		enumeration.repr_type = repr_type;
 		enumeration.variants = variants.into_boxed_slice();
 		enumeration.variant_lookup = variant_lookup;
@@ -1096,7 +1088,7 @@ impl<'ast> Builder<'ast, '_> {
 		duplicate_groups
 			.sort_by_key(|(_, spans)| spans.iter().map(|s| s.span.start).min());
 		for (value, spans) in &duplicate_groups {
-			self.tir.diagnostics.push(report_enum_duplicate_value(
+			self.diagnostics.push(report_enum_duplicate_value(
 				SourceSpan::new(resolve_context.file_id, enum_name_span),
 				*value,
 				spans,
@@ -1151,22 +1143,19 @@ impl<'ast> Builder<'ast, '_> {
 							(SymbolNamespace::Type, internal_name.inner),
 							span,
 						) {
-						self.tir.record_symbol_access(
+						self.record_symbol_access(
 							file_id,
 							type_value,
 							internal_name.span,
 						);
-						self.tir.diagnostics.push(report_cannot_export_item(
+						self.diagnostics.push(report_cannot_export_item(
 							self.interner.resolve(internal_name.inner).unwrap(),
 							SourceSpan::new(file_id, internal_name.span),
 						));
 					} else {
-						self.tir.diagnostics.push(
-							report_undeclared_identifier(SourceSpan::new(
-								file_id,
-								internal_name.span,
-							)),
-						);
+						self.diagnostics.push(report_undeclared_identifier(
+							SourceSpan::new(file_id, internal_name.span),
+						));
 					}
 					continue;
 				}
@@ -1186,14 +1175,14 @@ impl<'ast> Builder<'ast, '_> {
 
 			let export_item = match global_value {
 				SymbolKind::Function { func_index } => {
-					if self.tir.functions[func_index as usize]
+					if self.items.functions[usize::from(func_index)]
 						.total_type_param_count()
 						> 0
 					{
-						self.tir.functions[func_index as usize]
+						self.items.functions[usize::from(func_index)]
 							.accesses
 							.push(SourceSpan::new(file_id, internal_name.span));
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							report_cannot_export_generic_function(
 								self.interner
 									.resolve(internal_name.inner)
@@ -1204,45 +1193,45 @@ impl<'ast> Builder<'ast, '_> {
 						continue;
 					}
 
-					self.tir.functions[func_index as usize]
+					self.items.functions[usize::from(func_index)]
 						.accesses
 						.push(SourceSpan::new(file_id, internal_name.span));
 
 					ExportItem::Function {
-						id: self.tir.functions[func_index as usize].id,
+						id: self.items.functions[usize::from(func_index)].id,
 						internal_name: *internal_name,
 						external_name,
 					}
 				}
 				SymbolKind::Global { global_index } => {
-					self.tir.globals[global_index as usize]
+					self.items.globals[usize::from(global_index)]
 						.accesses
 						.push(SourceSpan::new(file_id, internal_name.span));
 
 					ExportItem::Global {
-						id: self.tir.globals[global_index as usize].id,
+						id: self.items.globals[usize::from(global_index)].id,
 						internal_name: *internal_name,
 						external_name,
 					}
 				}
 				SymbolKind::Memory { memory_index, .. } => {
-					self.tir.memories[memory_index as usize]
+					self.items.memories[usize::from(memory_index)]
 						.accesses
 						.push(SourceSpan::new(file_id, internal_name.span));
 
 					ExportItem::Memory {
-						id: self.tir.memories[memory_index as usize].id,
+						id: self.items.memories[usize::from(memory_index)].id,
 						internal_name: *internal_name,
 						external_name,
 					}
 				}
 				_ => {
-					self.tir.record_symbol_access(
+					self.record_symbol_access(
 						file_id,
 						global_value,
 						internal_name.span,
 					);
-					self.tir.diagnostics.push(report_cannot_export_item(
+					self.diagnostics.push(report_cannot_export_item(
 						self.interner.resolve(internal_name.inner).unwrap(),
 						SourceSpan::new(file_id, internal_name.span),
 					));
@@ -1301,7 +1290,7 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					};
 
-					self.tir.diagnostics.push(report_duplicate_export(
+					self.diagnostics.push(report_duplicate_export(
 						name,
 						SourceSpan::new(file_id, first_export_span),
 						SourceSpan::new(file_id, export_span),

@@ -4,6 +4,7 @@ use codespan_reporting::diagnostic::Severity;
 use indoc::indoc;
 
 use super::*;
+use crate::diagnostics::DiagnosticCode;
 use crate::tir::builder::{
 	CharLiteralError, parse_char_literal, unescape_string,
 };
@@ -110,6 +111,46 @@ impl TestCase {
 		let tir = TIR::build(&mut graph);
 		TestCase { graph, tir }
 	}
+}
+
+#[test]
+fn type_interner_seeds_and_deduplicates_types() {
+	let mut types = TypeInterner::new();
+	let builtins = [
+		(TypeIndex::ERROR, Type::Error),
+		(TypeIndex::INFER, Type::Infer),
+		(TypeIndex::UNIT, Type::Unit),
+		(TypeIndex::NEVER, Type::Never),
+		(TypeIndex::INTEGER, Type::Integer),
+		(TypeIndex::FLOAT, Type::Float),
+		(TypeIndex::U8, Type::U8),
+		(TypeIndex::I8, Type::I8),
+		(TypeIndex::U16, Type::U16),
+		(TypeIndex::I16, Type::I16),
+		(TypeIndex::U32, Type::U32),
+		(TypeIndex::I32, Type::I32),
+		(TypeIndex::U64, Type::U64),
+		(TypeIndex::I64, Type::I64),
+		(TypeIndex::F32, Type::F32),
+		(TypeIndex::F64, Type::F64),
+		(TypeIndex::BOOL, Type::Bool),
+		(TypeIndex::CHAR, Type::Char),
+	];
+	let builtin_count = builtins.len();
+
+	for (index, ty) in builtins {
+		assert_eq!(types.resolve(index), &ty);
+		assert_eq!(types.intern(ty), index);
+	}
+
+	let tuple = Type::Tuple {
+		elements: Box::new([TypeIndex::I32, TypeIndex::BOOL]),
+	};
+	let first = types.intern(tuple.clone());
+	let second = types.intern(tuple);
+	assert_eq!(first, second);
+	assert_eq!(usize::from(first), builtin_count);
+	assert_eq!(types.entries.len(), builtin_count + 1);
 }
 
 /// The stdlib has to typecheck as a package in its own right, not only as
@@ -231,7 +272,7 @@ fn test_build_with_package_graph_lowers_child_module_items() {
 	);
 
 	assert!(
-		case.tir.functions.iter().any(|function| case
+		case.tir.items.functions.iter().any(|function| case
 			.graph
 			.interner
 			.resolve(function.name.inner)
@@ -344,7 +385,11 @@ fn test_use_group_imports_every_leaf() {
 		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
 	);
 	no_errors(&case);
-	assert_eq!(case.tir.use_items.len(), 2, "one `UseItem` per named leaf");
+	assert_eq!(
+		case.tir.items.use_items.len(),
+		2,
+		"one `UseItem` per named leaf"
+	);
 }
 
 /// Nested groups and both leaf kinds in one item — the shape that proves
@@ -389,18 +434,20 @@ fn test_group_prefix_is_walked_once() {
 	no_errors(&case);
 
 	assert_eq!(
-		case.tir.use_prefixes.len(),
+		case.tir.items.use_prefixes.len(),
 		1,
 		"both leaves name the same `math`, so it is stored once"
 	);
-	let math = case.tir.use_items[0].prefix;
+	let math = case.tir.items.use_items[0].prefix;
 	let PrefixTarget::Resolved(math_ns) =
-		case.tir.use_prefixes[math as usize].target
+		case.tir.items.use_prefixes[usize::from(math)].target
 	else {
 		panic!("`math` should have resolved")
 	};
 	assert_eq!(
-		case.tir.namespaces[math_ns as usize].accesses.len(),
+		case.tir.modules.namespaces[usize::from(math_ns)]
+			.accesses
+			.len(),
 		1,
 		"one source mention of `math` is one access"
 	);
@@ -420,7 +467,7 @@ fn test_separate_use_statements_do_not_share_a_prefix() {
 		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
 	);
 	no_errors(&case);
-	assert_eq!(case.tir.use_prefixes.len(), 2);
+	assert_eq!(case.tir.items.use_prefixes.len(), 2);
 }
 
 /// A glob binds no name, so it needs no prefix entry of its own.
@@ -431,7 +478,7 @@ fn test_glob_allocates_no_prefix() {
 		"pub fn add() -> i32 { 1 }",
 	);
 	no_errors(&case);
-	assert!(case.tir.use_prefixes.is_empty());
+	assert!(case.tir.items.use_prefixes.is_empty());
 }
 
 #[test]
@@ -833,8 +880,8 @@ fn test_glob_import_records_its_path_span() {
 	);
 	no_errors(&case);
 
-	let root = case.tir.file_namespaces[1];
-	let spelled: Vec<&str> = case.tir.namespaces[root as usize]
+	let root = case.tir.modules.file_namespaces[1];
+	let spelled: Vec<&str> = case.tir.modules.namespaces[usize::from(root)]
 		.wildcard_imports
 		.iter()
 		.map(|import| {
@@ -1502,6 +1549,7 @@ fn test_private_item_reference_records_access_and_is_not_flagged_unused() {
 	assert!(!has_error_code(&case.tir, DiagnosticCode::UnusedItem));
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -1883,7 +1931,7 @@ fn test_export_enum_reports_cannot_export_not_undeclared() {
 			.collect::<Vec<_>>(),
 	);
 	assert_eq!(
-		case.tir.enums[0].accesses.len(),
+		case.tir.items.enums[0].accesses.len(),
 		1,
 		"the `Status` mention in `export {{ Status }}` must still be recorded as an \
 		 access so the LSP can resolve hover/go-to-definition on it despite the error"
@@ -1916,6 +1964,7 @@ fn test_export_generic_function_reports_cannot_export() {
 	);
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -1958,6 +2007,7 @@ fn test_export_const_reports_cannot_export_and_records_access() {
 	);
 	let constant = case
 		.tir
+		.items
 		.constants
 		.iter()
 		.find(|c| {
@@ -2049,18 +2099,19 @@ fn test_imported_global() {
 			.any(|d| d.severity
 				== codespan_reporting::diagnostic::Severity::Error)
 	);
-	// Both imported globals land in tir.globals with no value and namespace
+	// Both imported globals land in tir.items.globals with no value and namespace
 	// pointing to the import block.
-	assert_eq!(case.tir.globals.len(), 2);
-	assert!(case.tir.globals.iter().all(|g| g.value.is_none()));
+	assert_eq!(case.tir.items.globals.len(), 2);
+	assert!(case.tir.items.globals.iter().all(|g| g.value.is_none()));
 	assert!(
 		case.tir
+			.items
 			.globals
 			.iter()
 			.all(|g| case.tir.is_import_namespace(g.namespace))
 	);
 	// They appear in the import_decl lookup.
-	let decl = &case.tir.import_decls[0];
+	let decl = &case.tir.modules.import_decls[0];
 	assert_eq!(decl.lookup.len(), 2);
 }
 
@@ -2159,6 +2210,7 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	);
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -2439,10 +2491,10 @@ fn test_eval_const_expr_u64_div_uses_unsigned_semantics() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	assert_eq!(
-		case.tir.constants[const_index as usize].const_value,
+		case.tir.items.constants[usize::from(const_index)].const_value,
 		Some(ConstValue::Int(9223372036854775807))
 	);
 }
@@ -2456,10 +2508,10 @@ fn test_eval_const_expr_u64_rem_uses_unsigned_semantics() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	assert_eq!(
-		case.tir.constants[const_index as usize].const_value,
+		case.tir.items.constants[usize::from(const_index)].const_value,
 		Some(ConstValue::Int(15))
 	);
 }
@@ -2473,10 +2525,10 @@ fn test_eval_const_expr_signed_div_unaffected_by_unsigned_fix() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	assert_eq!(
-		case.tir.constants[const_index as usize].const_value,
+		case.tir.items.constants[usize::from(const_index)].const_value,
 		Some(ConstValue::Int(-3))
 	);
 }
@@ -2495,10 +2547,10 @@ fn test_eval_const_expr_float_div_by_zero_folds_to_infinity() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	assert_eq!(
-		case.tir.constants[const_index as usize].const_value,
+		case.tir.items.constants[usize::from(const_index)].const_value,
 		Some(ConstValue::Float(f64::INFINITY))
 	);
 }
@@ -2512,10 +2564,10 @@ fn test_eval_const_expr_float_neg_div_by_zero_folds_to_neg_infinity() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	assert_eq!(
-		case.tir.constants[const_index as usize].const_value,
+		case.tir.items.constants[usize::from(const_index)].const_value,
 		Some(ConstValue::Float(f64::NEG_INFINITY))
 	);
 }
@@ -2529,10 +2581,10 @@ fn test_eval_const_expr_zero_div_zero_folds_to_nan() {
     "});
 	no_errors(&case);
 	let tag = case.graph.interner.get("x").unwrap();
-	let def_id = *case.tir.tagged_items.get(&tag).unwrap();
-	let const_index = case.tir.expect_const_index(def_id);
+	let def_id = *case.tir.items.tagged_items.get(&tag).unwrap();
+	let const_index = case.tir.items.expect_const_index(def_id);
 	let Some(ConstValue::Float(value)) =
-		case.tir.constants[const_index as usize].const_value
+		case.tir.items.constants[usize::from(const_index)].const_value
 	else {
 		panic!("expected a folded float const");
 	};
@@ -3581,6 +3633,7 @@ fn test_impl_members_registered() {
 	// this one by membership rather than assuming it's the only one.
 	let members = &case
 		.tir
+		.items
 		.inherent_impls
 		.iter()
 		.find(|b| b.members.contains_key(&method_sym))
@@ -3614,11 +3667,11 @@ fn test_impl_members_registered() {
 		unreachable!()
 	};
 	assert!(
-		(method_idx as usize) < case.tir.functions.len(),
+		(usize::from(method_idx)) < case.tir.items.functions.len(),
 		"method func_index out of bounds"
 	);
 	assert!(
-		(assoc_fn_idx as usize) < case.tir.functions.len(),
+		(usize::from(assoc_fn_idx)) < case.tir.items.functions.len(),
 		"assoc fn func_index out of bounds"
 	);
 }
@@ -3671,11 +3724,13 @@ fn test_struct_fields_kept_in_declaration_order() {
 	let struct_index = case
 		.tir
 		.types
+		.entries
 		.iter()
 		.find_map(|t| {
 			if let Type::Struct { struct_index, .. } = t {
-				if case.tir.structs[*struct_index as usize].name.inner
-					== mixed_sym
+				if case.tir.items.structs[usize::from(*struct_index)]
+					.name
+					.inner == mixed_sym
 				{
 					Some(*struct_index)
 				} else {
@@ -3686,11 +3741,12 @@ fn test_struct_fields_kept_in_declaration_order() {
 			}
 		})
 		.unwrap();
-	let field_names: Vec<&str> = case.tir.structs[struct_index as usize]
-		.fields
-		.iter()
-		.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
-		.collect();
+	let field_names: Vec<&str> = case.tir.items.structs
+		[usize::from(struct_index)]
+	.fields
+	.iter()
+	.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
+	.collect();
 	assert_eq!(field_names, vec!["a", "b", "c", "d"]);
 }
 
@@ -3771,6 +3827,7 @@ fn test_memory_declaration_registers_kind() {
 	assert_eq!(
 		case32
 			.tir
+			.items
 			.memories
 			.iter()
 			.map(|m| m.size.inner)
@@ -3789,6 +3846,7 @@ fn test_memory_declaration_registers_kind() {
 	assert_eq!(
 		case64
 			.tir
+			.items
 			.memories
 			.iter()
 			.map(|m| m.size.inner)
@@ -3987,6 +4045,7 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 	// (stdlib adds its own impls before user ones).
 	let ti = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|ti| ti.members.contains_key(&draw_sym))
@@ -3994,10 +4053,7 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 
 	// target type is Point (a struct)
 	assert!(
-		matches!(
-			case.tir.types[ti.target.inner.as_usize()],
-			Type::Struct { .. }
-		),
+		matches!(case.tir.types.resolve(ti.target.inner), Type::Struct { .. }),
 		"target should be a struct type"
 	);
 
@@ -4007,7 +4063,8 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 	// find_trait_impl is queryable for (Point, Drawable)
 	assert!(
 		case.tir
-			.find_trait_impl(point_type, drawable_index)
+			.items
+			.find_trait_impl(&case.tir.types, point_type, drawable_index)
 			.is_some(),
 		"find_trait_impl should resolve (Point, Drawable)"
 	);
@@ -4015,12 +4072,14 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 	// trait_impl_dispatch maps Point's outer shape → a list that includes this impl
 	let (ti_index, _) = case
 		.tir
-		.find_trait_impl(point_type, drawable_index)
+		.items
+		.find_trait_impl(&case.tir.types, point_type, drawable_index)
 		.unwrap();
-	let kind = ImplTarget::from_type(&case.tir.types[point_type.as_usize()])
+	let kind = ImplTarget::from_type(case.tir.types.resolve(point_type))
 		.expect("Point should be a valid impl target");
 	assert!(
 		case.tir
+			.items
 			.trait_impl_dispatch
 			.get(&kind)
 			.map(|v| v.iter().any(|&(_, idx)| idx == ti_index))
@@ -4041,6 +4100,7 @@ fn test_impl_trait_for_type_registers_trait_impl() {
 	// inherent impl block's `members` for `Point`.
 	assert!(
 		case.tir
+			.items
 			.inherent_impls
 			.iter()
 			.filter(|b| b.target.inner == point_type)
@@ -4438,23 +4498,26 @@ fn test_qualified_path_assoc_type_projection_recovers_type_despite_unsatisfied_b
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
 		.expect("function 'f' not found");
 	let result_ty = func.result.as_ref().expect("expected a return type").inner;
 
-	let converter_trait =
+	let converter_trait = TraitIndex::new(
 		case.tir
+			.items
 			.traits
 			.iter()
 			.position(|t| {
 				case.graph.interner.resolve(t.name.inner) == Some("Converter")
 			})
-			.expect("trait 'Converter' not found") as TraitIndex;
+			.expect("trait 'Converter' not found") as u32,
+	);
 	let output_sym = case.graph.interner.get("Output").unwrap();
 
-	match &case.tir.types[result_ty.as_usize()] {
+	match case.tir.types.resolve(result_ty) {
 		Type::AssocTypeProjection {
 			trait_index,
 			assoc_name,
@@ -4497,6 +4560,7 @@ fn test_qualified_path_assoc_type_on_bound_type_param_resolves() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
@@ -4504,11 +4568,11 @@ fn test_qualified_path_assoc_type_on_bound_type_param_resolves() {
 	let result_ty = func.result.as_ref().expect("expected a return type").inner;
 	assert!(
 		matches!(
-			case.tir.types[result_ty.as_usize()],
+			case.tir.types.resolve(result_ty),
 			Type::AssocTypeProjection { .. }
 		),
 		"expected the return type to resolve to AssocTypeProjection, got {:?}",
-		case.tir.types[result_ty.as_usize()]
+		case.tir.types.resolve(result_ty)
 	);
 }
 
@@ -4541,6 +4605,7 @@ fn test_qualified_path_type_param_not_bound_recovers_type() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
@@ -4548,11 +4613,11 @@ fn test_qualified_path_type_param_not_bound_recovers_type() {
 	let result_ty = func.result.as_ref().expect("expected a return type").inner;
 	assert!(
 		matches!(
-			case.tir.types[result_ty.as_usize()],
+			case.tir.types.resolve(result_ty),
 			Type::AssocTypeProjection { .. }
 		),
 		"expected the return type to recover to AssocTypeProjection despite the unsatisfied bound, got {:?}",
-		case.tir.types[result_ty.as_usize()]
+		case.tir.types.resolve(result_ty)
 	);
 }
 
@@ -4588,6 +4653,7 @@ fn test_qualified_path_no_such_member_does_not_recover() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("use_it"))
@@ -4872,6 +4938,7 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 		.expect("symbol `hello` not interned");
 	let ti = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|ti| ti.members.contains_key(&hello_sym))
@@ -4883,7 +4950,7 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 	};
 	assert!(
 		matches!(
-			case.tir.functions[func_index as usize].type_param_parent,
+			case.tir.items.functions[usize::from(func_index)].type_param_parent,
 			Some(TypeParamOwner::TraitImpl(_))
 		),
 		"method inside trait impl block should point `type_param_parent` at its \
@@ -4913,7 +4980,7 @@ fn test_trait_impl_method_with_own_generic_type_param_resolves() {
         }
 
         impl Hasher for DefaultHasher {
-            fn write<Mem: Memory>(self: Mem::&Self, bytes: Mem::&[u8]) {
+            fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]) {
                 unreachable
             }
         }
@@ -4960,6 +5027,7 @@ fn test_self_keyword_recorded_in_impl_block_self_accesses() {
 		.expect("symbol `make` not interned");
 	let block = case
 		.tir
+		.items
 		.inherent_impls
 		.iter()
 		.find(|b| b.members.contains_key(&make_sym))
@@ -4999,12 +5067,13 @@ fn test_self_keyword_recorded_in_trait_impl_self_accesses() {
 	// `std` registers its own trait impls first, so find the one that
 	// targets this test's own (tagged) `Foo` struct rather than assuming index 0.
 	let target_tag = case.graph.interner.get("target").unwrap();
-	let foo_def_id = *case.tir.tagged_items.get(&target_tag).unwrap();
-	let foo_self_type = case.tir.structs
-		[case.tir.struct_index(foo_def_id).unwrap() as usize]
-		.self_type;
+	let foo_def_id = *case.tir.items.tagged_items.get(&target_tag).unwrap();
+	let foo_self_type = case.tir.items.structs
+		[usize::from(case.tir.items.struct_index(foo_def_id).unwrap())]
+	.self_type;
 	let trait_impl = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|i| i.target.inner == foo_self_type)
@@ -5041,12 +5110,13 @@ fn test_self_keyword_recorded_in_trait_impl_assoc_type_self_accesses() {
 		case.tir.diagnostics
 	);
 	let target_tag = case.graph.interner.get("target").unwrap();
-	let foo_def_id = *case.tir.tagged_items.get(&target_tag).unwrap();
-	let foo_self_type = case.tir.structs
-		[case.tir.struct_index(foo_def_id).unwrap() as usize]
-		.self_type;
+	let foo_def_id = *case.tir.items.tagged_items.get(&target_tag).unwrap();
+	let foo_self_type = case.tir.items.structs
+		[usize::from(case.tir.items.struct_index(foo_def_id).unwrap())]
+	.self_type;
 	let trait_impl = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|i| i.target.inner == foo_self_type)
@@ -5469,6 +5539,361 @@ fn test_trait_impl_may_drop_the_receiver_without_a_membership_error() {
 	);
 }
 
+#[test]
+fn test_trait_impl_method_return_type_mismatch_is_error() {
+	// The exact case from the original TODO this feature replaces (E0053):
+	// trait declares `-> i32`, impl omits a return type entirely (implicit
+	// unit).
+	let case = TestCase::new(indoc! {"
+        trait T {
+            fn foo(b: i32, d: i32, o: i32) -> i32;
+        }
+        struct X {}
+        impl T for X {
+            fn foo(b: i32, d: i32, o: i32) {}
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_trait_impl_method_param_type_mismatch_is_error() {
+	let case = TestCase::new(indoc! {"
+        trait T {
+            fn foo(x: i32);
+        }
+        struct X {}
+        impl T for X {
+            fn foo(x: bool) {}
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_trait_impl_assoc_const_type_mismatch_is_error() {
+	let case = TestCase::new(indoc! {"
+        trait T {
+            const N: i32;
+        }
+        struct X {}
+        impl T for X {
+            const N: bool = true;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitImplConstTypeMismatch),
+		"{:?}",
+		error_messages(&case.tir)
+	);
+}
+
+#[test]
+fn test_trait_impl_method_matching_signature_no_error() {
+	let case = TestCase::new(indoc! {"
+        trait T {
+            fn foo(x: i32, y: bool) -> i32;
+        }
+        struct X {}
+        impl T for X {
+            fn foo(x: i32, y: bool) -> i32 { x }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_trait_impl_method_own_generic_param_alpha_equivalent_no_error() {
+	// The trait method's own `T` and the impl method's own `U` are matched
+	// by relative position, not by name — this must not false-positive as
+	// a `TypeParam` mismatch.
+	let case = TestCase::new(indoc! {"
+        trait Container {
+            fn wrap<T>(self, value: T) -> T;
+        }
+        struct X {}
+        impl Container for X {
+            fn wrap<U>(self, value: U) -> U { value }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_trait_impl_method_self_type_projection_matching_no_error() {
+	// Regression guard: `Self::Elem` on the trait side must resolve through
+	// `find_trait_impl` down to the exact same concrete leaf the impl
+	// writes directly (`u32`), even though the two sides end up under
+	// different `Frame`s by the time they're compared — frame identity
+	// must not gate the fast-path equality check for an already-concrete
+	// leaf (this exact shape broke the stdlib's `Memory::PAGE_SIZE` during
+	// development).
+	let case = TestCase::new(indoc! {"
+        trait Bound {}
+        impl Bound for u32 {}
+        trait Container {
+            type Elem: Bound;
+            fn first(self) -> Self::Elem;
+        }
+        struct X {}
+        impl Container for X {
+            type Elem = u32;
+            fn first(self) -> u32 { 0 }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_nested_assoc_type_projection_mismatch_is_detected() {
+	// `Self::Mid::Out` — the outer projection's base (`Self::Mid`) is itself
+	// a projection, not a bare `TypeParam`. `X`'s `Mid = M` and `M`'s
+	// `Out = i32`, so `Self::Mid::Out` normalizes to `i32`, making the
+	// impl's `bool` return type a genuine signature mismatch. `resolve_head`
+	// has to resolve the nested base recursively before the outer step, so
+	// the comparison must not degrade to a silent `Indeterminate`.
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+
+        trait Outer {
+            type Mid: Inner;
+            fn f(self) -> Self::Mid::Out;
+        }
+
+        struct M {}
+        impl Inner for M { type Out = i32; }
+
+        struct X {}
+        impl Outer for X {
+            type Mid = M;
+            fn f(self) -> bool { true }
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"expected a signature-mismatch diagnostic for `f`'s return type \
+		 (Self::Mid::Out normalizes to i32, impl returns bool), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_nested_assoc_type_projection_match_is_accepted() {
+	// Same shape as the mismatch case above, but the impl's return type
+	// genuinely does normalize to what the trait requires — the companion
+	// case the comparator must *accept*, not just correctly reject.
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+
+        trait Outer {
+            type Mid: Inner;
+            fn f(self) -> Self::Mid::Out;
+        }
+
+        struct M {}
+        impl Inner for M { type Out = i32; }
+
+        struct X {}
+        impl Outer for X {
+            type Mid = M;
+            fn f(self) -> i32 { 0 }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_impl_side_projection_normalizes_against_concrete_trait_return_type() {
+	// The trait returns a concrete `i32`; the impl expresses the same value
+	// through its own method generic's binding (`V::Out` where
+	// `V: Inner where { Out = i32 }`). Both sides run through `resolve_head`
+	// symmetrically, so `found`'s `V::Out` normalizes to `i32` too — no
+	// mismatch.
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+        trait T {
+            fn f<U: Inner where { Out = i32 }>(u: U) -> i32;
+        }
+        struct X {}
+        impl T for X {
+            fn f<V: Inner where { Out = i32 }>(v: V) -> V::Out { unreachable }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_recursive_same_impl_nonidentity_binding_is_detected() {
+	// `Self::Next::Value` normalizes through `impl<T> C for Wrap<T>` twice:
+	// once for `Self::Next` (identity binding, `T` -> `T`), then once more
+	// for the outer `::Value` against `Next`'s hardcoded `Wrap<i32>` (a
+	// *non-identity* binding, `T` -> `i32`). Both land on the same interned
+	// `(T,)`, but the trait side's is under an env where `T` means `i32`
+	// while the impl's own `fn f(self) -> (T,)` is under the root env where
+	// `T` is the impl's free parameter. `compare`'s fast path must reject
+	// them as equal — index match, env mismatch — and let structural
+	// comparison find that `(i32,)` != `(T,)`.
+	let case = TestCase::new(indoc! {"
+        trait C {
+            type Next: C;
+            type Value;
+            fn f(self) -> Self::Next::Value;
+        }
+
+        struct Wrap<T> {}
+
+        impl<T> C for Wrap<T> {
+            type Next = Wrap<i32>;
+            type Value = (T,);
+
+            fn f(self) -> (T,) {
+                unreachable
+            }
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"expected a signature-mismatch diagnostic for `f`'s return type \
+		 (Self::Next::Value normalizes to (i32,) via the impl's own \
+		 hardcoded Next, but the impl declares (T,) for a general T), \
+		 got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_error_in_intermediate_resolution_does_not_cascade() {
+	// `Out`'s declared value (`MissingType`) is undeclared, so it is
+	// `TypeIndex::ERROR` from Phase 2, with an `E1021` already reported.
+	// When `resolve_head` hits that `ERROR` partway through normalizing the
+	// trait's `Self::Out`, the comparison must yield `Indeterminate` — not
+	// fall through to `compare_structural` and stack a spurious `E1080`
+	// signature mismatch on top of the error that already explains it.
+	let case = TestCase::new(indoc! {"
+        trait T {
+            type Out;
+            fn f(self) -> Self::Out;
+        }
+        struct X {}
+        impl T for X {
+            type Out = MissingType;
+            fn f(self) -> i32 { 0 }
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"an undeclared assoc-type value should not cascade into a \
+		 spurious signature-mismatch diagnostic on top of the \
+		 'undeclared type' error that already explains it, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+fn test_expected_typeparam_reduces_against_found_projection() {
+	// The trait returns the bare method generic `A`; the impl returns
+	// `D::Out`, which normalizes to `C` via `D`'s own `where { Out = C }`
+	// binding, and `C` is alpha-equivalent to `A` (same position among each
+	// function's own generics). Both sides go through `resolve_head`
+	// symmetrically, so `found`'s projection is normalized before the
+	// positional check — no mismatch.
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+        trait T {
+            fn f<A, B: Inner where { Out = A }>(b: B) -> A;
+        }
+        struct X {}
+        impl T for X {
+            fn f<C, D: Inner where { Out = C }>(d: D) -> D::Out {
+                unreachable
+            }
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_found_side_nested_projection_normalizes_via_find_trait_impl() {
+	// The impl returns `B::Mid::Out`. `B::Mid` becomes `M` via `B`'s own
+	// `where { Mid = M }` binding, then `M::Out` is `i32` via `impl Inner
+	// for M`. That second step needs `find_trait_impl` on a base that only
+	// became concrete through a binding local to this signature, so the
+	// impl side of the comparison has to run the full `resolve_head` /
+	// `project` path, not just a bound lookup. It normalizes to `i32`,
+	// matching the trait's declared return type.
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+        trait Outer { type Mid: Inner; }
+        struct M {}
+        impl Inner for M { type Out = i32; }
+
+        trait T {
+            fn f<A: Outer where { Mid = M }>(a: A) -> i32;
+        }
+        struct X {}
+        impl T for X {
+            fn f<B: Outer where { Mid = M }>(b: B) -> B::Mid::Out {
+                unreachable
+            }
+        }
+    "});
+	no_errors(&case);
+}
+
+/// A self-referential associated-type value (`type Value = Self::Value`) in a
+/// generic trait impl whose method returns `Self::Value`. The comparator's
+/// `resolve_head` pushes a `TypeEnv::Impl` per `find_trait_impl` step, so a
+/// real projection cycle here would grow the arena without bound.
+///
+/// It can't: `type Value = Self::Value` fails to resolve during Phase 2
+/// (`E1021`), so its stored value is `TypeIndex::ERROR`, and `resolve_head`
+/// bails to `Indeterminate` before it can loop. This locks in "terminates,
+/// and doesn't stack a `TraitImplSignatureMismatch` on top of the `E1021`."
+#[test]
+fn test_self_referential_assoc_type_value_does_not_hang_or_cascade() {
+	let case = TestCase::new(indoc! {"
+        trait C {
+            type Value;
+            fn f(self) -> Self::Value;
+        }
+        struct Wrap<T> {}
+        impl<T> C for Wrap<T> {
+            type Value = Self::Value;
+            fn f(self) -> i32 { unreachable }
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"the unresolvable self-referential assoc-type value should surface \
+		 as its own error, not cascade into a signature mismatch, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
 /// Satisfying a trait requirement is itself the "use" — the same exemption a
 /// trait impl's methods already had, which a const could not read off its
 /// `ItemParent` while that named the target type rather than the impl.
@@ -5585,25 +6010,29 @@ fn test_supertrait_resolved() {
 			.collect::<Vec<_>>()
 	);
 
-	let drawable_idx = case
-		.tir
-		.traits
-		.iter()
-		.position(|t| {
-			case.graph.interner.resolve(t.name.inner) == Some("Drawable")
-		})
-		.expect("Drawable not found") as u32;
-	let sized_idx = case
-		.tir
-		.traits
-		.iter()
-		.position(|t| {
-			case.graph.interner.resolve(t.name.inner) == Some("Sized")
-		})
-		.expect("Sized not found") as u32;
+	let drawable_idx = TraitIndex::new(
+		case.tir
+			.items
+			.traits
+			.iter()
+			.position(|t| {
+				case.graph.interner.resolve(t.name.inner) == Some("Drawable")
+			})
+			.expect("Drawable not found") as u32,
+	);
+	let sized_idx = TraitIndex::new(
+		case.tir
+			.items
+			.traits
+			.iter()
+			.position(|t| {
+				case.graph.interner.resolve(t.name.inner) == Some("Sized")
+			})
+			.expect("Sized not found") as u32,
+	);
 
 	assert_eq!(
-		case.tir.traits[drawable_idx as usize]
+		case.tir.items.traits[usize::from(drawable_idx)]
 			.bounds
 			.traits
 			.iter()
@@ -5977,6 +6406,7 @@ fn test_generic_struct_definition_stores_type_params() {
 	assert!(errors.is_empty(), "{:?}", errors);
 	let s = case
 		.tir
+		.items
 		.structs
 		.iter()
 		.find(|s| case.graph.interner.resolve(s.name.inner) == Some("Point"))
@@ -6000,6 +6430,7 @@ fn test_generic_struct_field_type_is_type_param() {
 	assert!(errors.is_empty(), "{:?}", errors);
 	let s = case
 		.tir
+		.items
 		.structs
 		.iter()
 		.find(|s| case.graph.interner.resolve(s.name.inner) == Some("Wrapper"))
@@ -6007,11 +6438,11 @@ fn test_generic_struct_field_type_is_type_param() {
 	// Field `value` should have type TypeParam { param_index: 0 }.
 	assert!(
 		matches!(
-			case.tir.types[s.fields[0].ty.inner.as_usize()],
+			case.tir.types.resolve(s.fields[0].ty.inner),
 			Type::TypeParam { param_index: 0, .. }
 		),
 		"expected TypeParam, got {:?}",
-		case.tir.types[s.fields[0].ty.inner.as_usize()]
+		case.tir.types.resolve(s.fields[0].ty.inner)
 	);
 }
 
@@ -6255,6 +6686,7 @@ fn test_type_alias_simple() {
 	no_errors(&case);
 	let alias = case
 		.tir
+		.items
 		.type_aliases
 		.iter()
 		.find(|a| case.graph.interner.resolve(a.name.inner) == Some("Foo"))
@@ -6285,16 +6717,17 @@ fn test_type_alias_generic_rhs() {
 	no_errors(&case);
 	let alias = case
 		.tir
+		.items
 		.type_aliases
 		.iter()
 		.find(|a| {
 			case.graph.interner.resolve(a.name.inner) == Some("WrapperI32")
 		})
 		.expect("WrapperI32 alias not found");
-	match &case.tir.types[alias.body.as_usize()] {
+	match case.tir.types.resolve(alias.body) {
 		Type::Struct { args, .. } => {
 			assert_eq!(args.len(), 1);
-			assert_eq!(case.tir.types[args[0].as_usize()], Type::I32);
+			assert_eq!(case.tir.types.resolve(args[0]), &Type::I32);
 		}
 		other => panic!("expected Type::Struct template, got {:?}", other),
 	}
@@ -6314,19 +6747,20 @@ fn test_parametric_type_alias_instantiated_at_use_site() {
 	no_errors(&case);
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("make"))
 		.expect("make function not found");
-	let result_ty = case.tir.types[func.signature_index.as_usize()].clone();
+	let result_ty = case.tir.types.resolve(func.signature_index).clone();
 	let Type::Function { signature } = result_ty else {
 		panic!("expected Type::Function, got {:?}", result_ty);
 	};
-	match &case.tir.types[signature.result().as_usize()] {
+	match case.tir.types.resolve(signature.result()) {
 		Type::Tuple { elements } => {
 			assert_eq!(elements.len(), 2);
-			assert_eq!(case.tir.types[elements[0].as_usize()], Type::I32);
-			assert_eq!(case.tir.types[elements[1].as_usize()], Type::I32);
+			assert_eq!(case.tir.types.resolve(elements[0]), &Type::I32);
+			assert_eq!(case.tir.types.resolve(elements[1]), &Type::I32);
 		}
 		other => panic!("expected Type::Tuple, got {:?}", other),
 	}
@@ -6452,7 +6886,7 @@ fn test_generic_identity_resolves() {
 		"unexpected errors (count: {})",
 		errors.len()
 	);
-	let func = case.tir.functions.iter().find(|f| {
+	let func = case.tir.items.functions.iter().find(|f| {
 		case.graph
 			.interner
 			.resolve(f.name.inner)
@@ -6519,7 +6953,7 @@ fn test_generic_with_bound_resolves() {
 		"unexpected errors (count: {})",
 		errors.len()
 	);
-	let func = case.tir.functions.iter().find(|f| {
+	let func = case.tir.items.functions.iter().find(|f| {
 		case.graph
 			.interner
 			.resolve(f.name.inner)
@@ -6555,6 +6989,7 @@ fn test_type_param_referenced_in_binding_rhs_records_access() {
 	no_errors(&case);
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -6687,6 +7122,7 @@ fn test_assoc_type_declared_in_trait() {
 
 	let container_trait = case
 		.tir
+		.items
 		.traits
 		.iter()
 		.find(|t| {
@@ -6730,6 +7166,7 @@ fn test_assoc_type_projection_in_return_type() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("foo"))
@@ -6738,11 +7175,11 @@ fn test_assoc_type_projection_in_return_type() {
 	let result_ty = func.result.as_ref().expect("expected a return type").inner;
 	assert!(
 		matches!(
-			case.tir.types[result_ty.as_usize()],
+			case.tir.types.resolve(result_ty),
 			Type::AssocTypeProjection { .. }
 		),
 		"return type should be AssocTypeProjection for C::Elem, got type index {}",
-		result_ty.as_u32()
+		u32::from(result_ty)
 	);
 	assert_eq!(
 		case.tir
@@ -6780,6 +7217,7 @@ fn test_assoc_type_projection_display_is_qualified_when_ambiguous() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("foo"))
@@ -6873,12 +7311,14 @@ fn test_assoc_type_impl_registers_in_trait_impl() {
 
 	let ti = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|ti| {
 			case.tir
+				.items
 				.traits
-				.get(ti.trait_index as usize)
+				.get(usize::from(ti.trait_index))
 				.and_then(|t| case.graph.interner.resolve(t.name.inner))
 				== Some("Container")
 		})
@@ -6894,7 +7334,7 @@ fn test_assoc_type_impl_registers_in_trait_impl() {
 		matches!(
 			ti.members.get(&elem_sym),
 			Some(ImplEntry::AssocType(idx))
-				if case.tir.assoc_type_impls[*idx as usize].ty.unwrap().inner == TypeIndex::U32
+				if case.tir.items.assoc_type_impls[usize::from(*idx)].ty.unwrap().inner == TypeIndex::U32
 		),
 		"expected 'Elem' → u32 in TraitImpl::members"
 	);
@@ -6929,6 +7369,7 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 
 	let container_trait = case
 		.tir
+		.items
 		.traits
 		.iter()
 		.find(|t| {
@@ -6975,7 +7416,7 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	// Deliberately named `A`/`B`/`X`/`Y` rather than something like
 	// `UnsignedInt`/`SignedInt` — the stdlib now declares its own traits by
 	// those names, and this test needs to stay independent of stdlib
-	// content (searching `case.tir.traits` by name would otherwise find the
+	// content (searching `case.tir.items.traits` by name would otherwise find the
 	// stdlib's same-named trait instead of this test's local one).
 	let source = indoc! {"
         trait A {
@@ -6991,6 +7432,7 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 
 	let find_trait = |name: &str| {
 		case.tir
+			.items
 			.traits
 			.iter()
 			.find(|t| case.graph.interner.resolve(t.name.inner) == Some(name))
@@ -7050,6 +7492,131 @@ fn test_assoc_type_impl_bound_violation_is_error() {
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
 		"expected E1063 (TraitBoundViolation) for `bool` not implementing `PointerSize`, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>(),
+	);
+}
+
+#[test]
+#[ignore = "false-positive TraitBoundViolation for an abstract projection's own trait-declared bound — see comment above"]
+fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
+	// `impl<T: Container> Container for Wrap<T> { type Elem = T::Elem; }` —
+	// the impl's own `Elem` value is the still-abstract projection `T::Elem`,
+	// not a concrete type, because `T` is a type param at this impl's own
+	// signature-resolution time.
+	//
+	// `check_trait_conformance`'s Phase 3.5 (`check_assoc_type_bounds`,
+	// generics.rs) then verifies this value against `Container::Elem`'s own
+	// declared bound (`type Elem: Bound`) — i.e. it asks "does `T::Elem`
+	// implement `Bound`?" via `find_trait_impl(&self.types, ty.inner,
+	// bound.trait_index)`. `find_trait_impl` only ever resolves a *concrete*
+	// `ImplTarget` (struct/enum/primitive/...), so it returns `None` for an
+	// abstract `AssocTypeProjection` — and `check_assoc_type_bounds` reports
+	// that as a genuine violation, exactly as if `T::Elem` were some
+	// concrete type that simply doesn't implement `Bound`.
+	//
+	// That's a false positive: `T::Elem: Bound` holds unconditionally here,
+	// by construction — `Container::Elem` is declared as `type Elem: Bound`
+	// in the trait itself, so *any* concrete type that ends up standing in
+	// for `T` already had its own `Elem` checked against `Bound` when *its*
+	// impl was conformance-checked. `check_assoc_type_bounds` has no case
+	// for "the projection's base is abstract, but its own trait declaration
+	// already guarantees the bound" — it only ever consults `find_trait_impl`,
+	// which needs a concrete receiver.
+	//
+	// Found while investigating a hypothesized `substitute_type` projection
+	// cycle for the trait-conformance-diff refactor; that specific cycle did
+	// not reproduce as a hang or crash (self- and mutual-reference at
+	// declaration time can't infinitely recurse — `members` is only
+	// populated after a value is computed, and a deferred `TypeParam`-rooted
+	// projection never consults any impl's `members` table until a concrete
+	// substitution shrinks it) — see
+	// `test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependency`
+	// below for what *does* go wrong with that case (a misleading diagnostic,
+	// not a hang). This is a separate, real gap surfaced along the way.
+	let case = TestCase::new(indoc! {"
+        trait Bound {}
+        trait Container {
+            type Elem: Bound;
+        }
+        struct Wrap<T> {}
+        impl<T: Container> Container for Wrap<T> {
+            type Elem = T::Elem;
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+#[ignore = "mutual assoc-type-value reference reports a misleading cascade instead of CyclicTypeDependency — see comment above"]
+fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependency()
+ {
+	// `impl Container for A { type Elem = B::Elem; }` next to
+	// `impl Container for B { type Elem = A::Elem; }` — a genuine cycle:
+	// neither side can be given a value without the other already having
+	// one, in either processing order. This is structurally the same
+	// problem `test_self_referential_const_reports_a_cycle` already handles
+	// correctly for `const A: i32 = A;` via `ensure_signature`'s
+	// `ComputeState::InProgress` guard + `report_cyclic_type_dependency`.
+	//
+	// That machinery isn't wired up for this path, though:
+	// `resolve_namespace_type_member`'s catch-all arm (paths.rs, reached
+	// because `B`/`A` are concrete struct types) reads
+	// `self.items.assoc_type_impls[idx].ty.unwrap()` straight off the
+	// found `AssocTypeImpl`, without first calling `ensure_signature` on
+	// *that specific assoc-type-impl's own* `DefId` the way
+	// `resolve_bounds`'s `WithBindings` arm (generics.rs) and every
+	// "parent before member" call in traits.rs already do before reading
+	// something another item owns. So instead of catching the cycle via
+	// `ComputeState::InProgress`, whichever impl is processed first (parse
+	// order: `A` here) just finds the other's `Elem` isn't in `members` yet
+	// — not because of a cycle, but because `B`'s own `Elem` member hasn't
+	// been registered at all yet — and reports a plain "not found" instead.
+	// That result (`TypeIndex::ERROR`) then flows into `B`'s `Elem`, which
+	// resolves "successfully" against it, and the whole thing cascades into
+	// two more confusing `TraitBoundViolation`s on top, none of which say
+	// anything about a cycle.
+	//
+	// Fix sketch: in `resolve_namespace_type_member`'s
+	// `MemberLookup::Trait`/`MemberLookup::Inherent` arms for
+	// `ImplEntry::AssocType(idx)`, call
+	// `self.ensure_signature(self.items.assoc_type_impls[idx].id)` first,
+	// and report via `report_cyclic_type_dependency` on `SignatureStatus::
+	// Cycle` — mirroring `resolve_pending_global_symbol`/
+	// `resolve_pending_namespace_symbol` (modules.rs). Each `AssocTypeImpl`
+	// already carries its own registered `id`/`ast_nodes` entry
+	// (`AstNodeRef::TraitImplAssocType`, prescan.rs), so `ensure_signature`
+	// dispatches correctly — it's just never called on this path.
+	//
+	// One more thing the fix needs: `push_assoc_type_impl` (tir/mod.rs)
+	// never inserts its `id` into `item_lookup`, unlike every other
+	// `push_*` — so `item_name()`, which `report_cyclic_type_dependency`
+	// uses to label each frame in the "the cycle is `X` -> `Y`" note, has
+	// no case for an associated type and would silently skip that frame.
+	// Needs an `ItemIndex::AssocType` variant added the same way
+	// `push_typeset` registers `ItemIndex::TypeSet` right below it.
+	let case = TestCase::new(indoc! {"
+        trait Bound {}
+        impl Bound for u32 {}
+        trait Container {
+            type Elem: Bound;
+        }
+        struct A {}
+        struct B {}
+        impl Container for A {
+            type Elem = B::Elem;
+        }
+        impl Container for B {
+            type Elem = A::Elem;
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::CyclicTypeDependency),
+		"expected a CyclicTypeDependency diagnostic for the A::Elem <-> \
+		 B::Elem cycle, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -7479,25 +8046,26 @@ fn test_memory_tagged_pointer() {
 	);
 	no_errors(&case);
 
-	let heap_id = case.tir.memories[0].id;
+	let heap_id = case.tir.items.memories[0].id;
 	let f = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
 		.expect("function 'f' not found");
 
 	let param_ty = f.params[0].ty.inner;
-	let is_heap_ptr = match &case.tir.types[param_ty.as_usize()] {
+	let is_heap_ptr = match case.tir.types.resolve(param_ty) {
 		Type::Pointer { memory, .. } => {
-			matches!(&case.tir.types[memory.as_usize()], Type::Memory { id, .. } if *id == heap_id)
+			matches!(case.tir.types.resolve(*memory), Type::Memory { id, .. } if *id == heap_id)
 		}
 		_ => false,
 	};
 	assert!(
 		is_heap_ptr,
 		"expected heap::&i32 (pointer tagged with heap), got index {}",
-		param_ty.as_u32()
+		u32::from(param_ty)
 	);
 }
 
@@ -7516,25 +8084,26 @@ fn test_memory_tagged_slice() {
 	);
 	no_errors(&case);
 
-	let heap_id = case.tir.memories[0].id;
+	let heap_id = case.tir.items.memories[0].id;
 	let f = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
 		.expect("function 'f' not found");
 
 	let param_ty = f.params[0].ty.inner;
-	let is_heap_slice = match &case.tir.types[param_ty.as_usize()] {
+	let is_heap_slice = match case.tir.types.resolve(param_ty) {
 		Type::Slice { memory, .. } => {
-			matches!(&case.tir.types[memory.as_usize()], Type::Memory { id, .. } if *id == heap_id)
+			matches!(case.tir.types.resolve(*memory), Type::Memory { id, .. } if *id == heap_id)
 		}
 		_ => false,
 	};
 	assert!(
 		is_heap_slice,
 		"expected heap::&[u8] (slice tagged with heap), got index {}",
-		param_ty.as_u32()
+		u32::from(param_ty)
 	);
 }
 
@@ -7553,27 +8122,28 @@ fn test_memory_tagged_array() {
 	);
 	no_errors(&case);
 
-	let heap_id = case.tir.memories[0].id;
+	let heap_id = case.tir.items.memories[0].id;
 	let f = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
 		.expect("function 'f' not found");
 
 	let param_ty = f.params[0].ty.inner;
-	let is_heap_array = match &case.tir.types[param_ty.as_usize()] {
+	let is_heap_array = match case.tir.types.resolve(param_ty) {
 		Type::Array {
 			size: 4, memory, ..
 		} => {
-			matches!(&case.tir.types[memory.as_usize()], Type::Memory { id, .. } if *id == heap_id)
+			matches!(case.tir.types.resolve(*memory), Type::Memory { id, .. } if *id == heap_id)
 		}
 		_ => false,
 	};
 	assert!(
 		is_heap_array,
 		"expected heap::&[u8; 4] (array tagged with heap), got index {}",
-		param_ty.as_u32()
+		u32::from(param_ty)
 	);
 }
 
@@ -7592,17 +8162,18 @@ fn test_memory_tagged_nested_array() {
 	);
 	no_errors(&case);
 
-	let heap_id = case.tir.memories[0].id;
+	let heap_id = case.tir.items.memories[0].id;
 	let f = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
 		.expect("function 'f' not found");
 
 	let outer_ty = f.params[0].ty.inner;
-	let is_heap_mem = |memory: &TypeIndex| matches!(&case.tir.types[memory.as_usize()], Type::Memory { id, .. } if *id == heap_id);
-	let (inner_ty, outer_tagged) = match &case.tir.types[outer_ty.as_usize()] {
+	let is_heap_mem = |memory: &TypeIndex| matches!(case.tir.types.resolve(*memory), Type::Memory { id, .. } if *id == heap_id);
+	let (inner_ty, outer_tagged) = match case.tir.types.resolve(outer_ty) {
 		Type::Array {
 			of,
 			size: 4,
@@ -7615,7 +8186,7 @@ fn test_memory_tagged_nested_array() {
 		outer_tagged,
 		"outer array should be tagged with heap memory"
 	);
-	let inner_tagged = match &case.tir.types[inner_ty.as_usize()] {
+	let inner_tagged = match case.tir.types.resolve(inner_ty) {
 		Type::Array {
 			size: 4, memory, ..
 		} => is_heap_mem(memory),
@@ -7660,6 +8231,7 @@ fn test_untagged_and_tagged_pointer_resolve_to_same_type() {
 
 	let f = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("f"))
@@ -7692,13 +8264,14 @@ fn test_function_reference_has_function_item_type() {
 
 	let square_id = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("square"))
 		.expect("function 'square' not found")
 		.id;
 
-	let has_function_item = case.tir.types.iter().any(|t| {
+	let has_function_item = case.tir.types.entries.iter().any(|t| {
 		if let Type::FunctionItem { id, type_args } = t {
 			*id == square_id && type_args.is_empty()
 		} else {
@@ -7727,13 +8300,14 @@ fn test_generic_function_reference_has_function_item_not_fn_pointer() {
 
 	let identity_id = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("identity"))
 		.expect("function 'identity' not found")
 		.id;
 
-	let has_function_item = case.tir.types.iter().any(
+	let has_function_item = case.tir.types.entries.iter().any(
 		|t| matches!(t, Type::FunctionItem { id, .. } if *id == identity_id),
 	);
 	assert!(
@@ -7836,6 +8410,7 @@ fn test_two_functions_have_distinct_function_item_types() {
 
 	let find_id = |name: &str| {
 		case.tir
+			.items
 			.functions
 			.iter()
 			.find(|f| case.graph.interner.resolve(f.name.inner) == Some(name))
@@ -7848,6 +8423,7 @@ fn test_two_functions_have_distinct_function_item_types() {
 	let type_idx = |id: DefId| {
 		case.tir
 			.types
+			.entries
 			.iter()
 			.enumerate()
 			.find_map(|(i, t)| {
@@ -9068,6 +9644,7 @@ fn test_enum_variants_are_populated() {
 
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("Color"))
@@ -9077,7 +9654,7 @@ fn test_enum_variants_are_populated() {
 	assert!(enum_.variant_lookup.len() == 3);
 
 	let red_idx = *enum_.variant_lookup.values().min().unwrap();
-	let red = &enum_.variants[red_idx as usize];
+	let red = &enum_.variants[usize::from(red_idx)];
 	assert_eq!(red.const_value, Some(ConstValue::Int(1)));
 
 	let green = &enum_.variants[1];
@@ -9111,6 +9688,7 @@ fn test_enum_variants_after_anchor_auto_increment() {
 
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| {
@@ -9290,6 +9868,7 @@ fn test_enum_constant_folds_arithmetic_for_auto_increment() {
 
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("Color"))
@@ -9316,6 +9895,7 @@ fn test_enum_negation_folds_for_signed_repr() {
 	assert!(errors.is_empty(), "{:?}", errors);
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("Color"))
@@ -9397,6 +9977,7 @@ fn test_enum_anchored_by_non_adjacent_earlier_variant_is_ok() {
 	no_errors(&case);
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("E"))
@@ -9951,7 +10532,7 @@ fn test_tagged_items_registered_for_every_taggable_item_kind() {
 			.get(tag)
 			.unwrap_or_else(|| panic!("`{tag}` was never interned"));
 		assert!(
-			case.tir.tagged_items.contains_key(&symbol),
+			case.tir.items.tagged_items.contains_key(&symbol),
 			"`#[tag = \"{tag}\"]` was not registered in `tagged_items`"
 		);
 	}
@@ -9979,14 +10560,15 @@ fn test_tagged_items_registered() {
 		.expect("tag key not interned");
 	let fn_def_id = *case
 		.tir
+		.items
 		.tagged_items
 		.get(&fn_key)
 		.expect("fn tagged item not registered");
 	assert!(
-		case.tir.tagged_items.contains_key(&trait_key),
+		case.tir.items.tagged_items.contains_key(&trait_key),
 		"trait tagged item not registered"
 	);
-	assert!(case.tir.function_index(fn_def_id).is_some());
+	assert!(case.tir.items.function_index(fn_def_id).is_some());
 }
 
 #[test]
@@ -10011,11 +10593,11 @@ fn test_tagged_items_registered_for_trait_members() {
 		.get("my_assoc_type")
 		.expect("tag key not interned");
 	assert!(
-		case.tir.tagged_items.contains_key(&const_key),
+		case.tir.items.tagged_items.contains_key(&const_key),
 		"assoc const tagged item not registered"
 	);
 	assert!(
-		case.tir.tagged_items.contains_key(&type_key),
+		case.tir.items.tagged_items.contains_key(&type_key),
 		"assoc type tagged item not registered"
 	);
 }
@@ -10135,7 +10717,7 @@ fn test_global_init_function_call_resolves() {
         export { result }
     "});
 	no_errors(&case);
-	assert!(case.tir.globals[0].value.is_some());
+	assert!(case.tir.items.globals[0].value.is_some());
 }
 
 #[test]
@@ -10149,7 +10731,7 @@ fn test_global_init_block_with_locals_resolves() {
         export { x }
     "});
 	no_errors(&case);
-	assert!(case.tir.globals[0].value.is_some());
+	assert!(case.tir.items.globals[0].value.is_some());
 }
 
 #[test]
@@ -10159,7 +10741,7 @@ fn test_global_init_arithmetic_resolves() {
         export { x }
     "});
 	no_errors(&case);
-	assert!(case.tir.globals[0].value.is_some());
+	assert!(case.tir.items.globals[0].value.is_some());
 }
 
 #[test]
@@ -10181,8 +10763,8 @@ fn test_global_init_cross_global_reference_resolves() {
         export { g1, g2 }
     "});
 	no_errors(&case);
-	assert_eq!(case.tir.globals.len(), 2);
-	assert!(case.tir.globals.iter().all(|g| g.value.is_some()));
+	assert_eq!(case.tir.items.globals.len(), 2);
+	assert!(case.tir.items.globals.iter().all(|g| g.value.is_some()));
 }
 
 #[test]
@@ -10206,7 +10788,7 @@ fn test_global_init_if_expression_resolves() {
         export { x }
     "});
 	no_errors(&case);
-	assert!(case.tir.globals[0].value.is_some());
+	assert!(case.tir.items.globals[0].value.is_some());
 }
 
 #[test]
@@ -10225,7 +10807,7 @@ fn test_global_initialized_to_data_end_tir() {
 			.all(|d| d.severity
 				!= codespan_reporting::diagnostic::Severity::Error)
 	);
-	assert_eq!(case.tir.globals.len(), 1);
+	assert_eq!(case.tir.items.globals.len(), 1);
 }
 
 #[test]
@@ -10242,10 +10824,11 @@ fn test_typeset_definition_registers_in_tir() {
 		case.tir.diagnostics
 	);
 	// At least stdlib Integer + user Numbers typesets are registered
-	assert!(!case.tir.typesets.is_empty());
+	assert!(!case.tir.items.typesets.is_empty());
 	// The user-defined identity function has one type param with one typeset bound
 	let identity = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -10461,9 +11044,14 @@ fn test_type_position_inline_module_registers_module_access() {
     "});
 	no_errors(&case);
 	assert!(
-		case.tir.namespaces.iter().any(|ns| !ns.accesses.is_empty()),
+		case.tir
+			.modules
+			.namespaces
+			.iter()
+			.any(|ns| !ns.accesses.is_empty()),
 		"expected at least one access registered on a namespace, got: {:?}",
 		case.tir
+			.modules
 			.namespaces
 			.iter()
 			.map(|ns| ns.accesses.len())
@@ -10902,6 +11490,7 @@ fn test_memory_records_access_in_type_position() {
 
 	let memory = case
 		.tir
+		.items
 		.memories
 		.iter()
 		.find(|m| case.graph.interner.resolve(m.name.inner) == Some("heap"))
@@ -11439,6 +12028,7 @@ fn test_type_param_multiple_bounds_both_enforced() {
 
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("do_both"))
@@ -11477,7 +12067,7 @@ fn test_type_param_multiple_bounds_missing_impl_is_error() {
 #[test]
 fn test_multiple_supertraits_both_resolved() {
 	// `trait Widget: Drawable + Sized` — both supertraits must appear in
-	// tir.traits[widget_idx].supertraits (exercises BoundList flattening in
+	// tir.items.traits[widget_idx].supertraits (exercises BoundList flattening in
 	// the supertrait resolution handler).
 	let case = TestCase::new(indoc! {"
         trait Drawable { fn draw(self); }
@@ -11488,30 +12078,35 @@ fn test_multiple_supertraits_both_resolved() {
 
 	let widget_idx = case
 		.tir
+		.items
 		.traits
 		.iter()
 		.position(|t| {
 			case.graph.interner.resolve(t.name.inner) == Some("Widget")
 		})
 		.expect("trait 'Widget' not found");
-	let drawable_idx = case
-		.tir
-		.traits
-		.iter()
-		.position(|t| {
-			case.graph.interner.resolve(t.name.inner) == Some("Drawable")
-		})
-		.expect("trait 'Drawable' not found") as u32;
-	let sized_idx = case
-		.tir
-		.traits
-		.iter()
-		.position(|t| {
-			case.graph.interner.resolve(t.name.inner) == Some("Sized")
-		})
-		.expect("trait 'Sized' not found") as u32;
+	let drawable_idx = TraitIndex::new(
+		case.tir
+			.items
+			.traits
+			.iter()
+			.position(|t| {
+				case.graph.interner.resolve(t.name.inner) == Some("Drawable")
+			})
+			.expect("trait 'Drawable' not found") as u32,
+	);
+	let sized_idx = TraitIndex::new(
+		case.tir
+			.items
+			.traits
+			.iter()
+			.position(|t| {
+				case.graph.interner.resolve(t.name.inner) == Some("Sized")
+			})
+			.expect("trait 'Sized' not found") as u32,
+	);
 
-	let supertraits = &case.tir.traits[widget_idx]
+	let supertraits = &case.tir.items.traits[widget_idx]
 		.bounds
 		.traits
 		.iter()
@@ -11561,6 +12156,7 @@ fn test_assoc_type_multiple_bounds_both_stored() {
 
 	let container = case
 		.tir
+		.items
 		.traits
 		.iter()
 		.find(|t| {
@@ -11640,15 +12236,13 @@ fn test_impl_module_trait_for_type_resolves() {
 		.expect("symbol 'draw' not interned");
 	let ti = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|ti| ti.members.contains_key(&draw_sym))
 		.expect("no TraitImpl has 'draw' method");
 	assert!(
-		matches!(
-			case.tir.types[ti.target.inner.as_usize()],
-			Type::Struct { .. }
-		),
+		matches!(case.tir.types.resolve(ti.target.inner), Type::Struct { .. }),
 		"target should be Point (a struct)"
 	);
 }
@@ -11779,6 +12373,7 @@ fn test_bare_self_param_resolves_to_self_type() {
     "});
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -12466,10 +13061,13 @@ fn test_generic_trait_impl_resolves() {
 		.expect("symbol `Getter` not interned");
 	let trait_impl = case
 		.tir
+		.items
 		.trait_impls
 		.iter()
 		.find(|ti| {
-			case.tir.traits[ti.trait_index as usize].name.inner == getter_sym
+			case.tir.items.traits[usize::from(ti.trait_index)]
+				.name
+				.inner == getter_sym
 		})
 		.expect("no TraitImpl for Getter");
 	assert_eq!(
@@ -13013,7 +13611,7 @@ fn test_two_generic_impl_blocks_colliding_despite_differing_bounds_is_rejected()
 #[test]
 fn test_trait_impl_resolution_uses_global_index_not_local_position() {
 	// `trait_impl_dispatch[kind]` holds GLOBAL indices into
-	// `self.tir.trait_impls` (assigned in registration order across the
+	// `self.tir.items.trait_impls` (assigned in registration order across the
 	// whole file), not positions local to `kind`. `Unrelated`'s impl
 	// registers first (`trait_impls[0]`); `S`'s impl (the one we actually
 	// care about) registers second (`trait_impls[1]`), so
@@ -13344,6 +13942,7 @@ fn test_display_bounds_includes_where_clause_assoc_type_bound() {
     "});
 	let func = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| {
@@ -13444,8 +14043,12 @@ fn test_qualified_bound_namespace_segment_records_access() {
 			.collect::<Vec<_>>()
 	);
 
-	let has_namespace_access =
-		case.tir.namespaces.iter().any(|ns| !ns.accesses.is_empty());
+	let has_namespace_access = case
+		.tir
+		.modules
+		.namespaces
+		.iter()
+		.any(|ns| !ns.accesses.is_empty());
 	assert!(
 		has_namespace_access,
 		"expected some namespace to have a recorded access for the `ns` \
@@ -13571,7 +14174,7 @@ fn test_match_invalid_pattern_shape_is_error() {
         export { f }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::InvalidPattern),
+		has_error_code(&case.tir, DiagnosticCode::InvalidMatchPattern),
 		"expected E1068 (InvalidPattern) for a non-constant pattern, got: {:?}",
 		case.tir
 			.diagnostics
@@ -13628,6 +14231,7 @@ fn test_match_enum_variant_marks_variant_used() {
 	assert!(errors.is_empty(), "{:?}", errors);
 	let enum_ = case
 		.tir
+		.items
 		.enums
 		.iter()
 		.find(|e| {
@@ -13799,11 +14403,13 @@ fn test_struct_operator_dispatch_records_goto_definition_access() {
 	no_errors(&case);
 
 	let add_tag = case.graph.interner.get("vec2_add").unwrap();
-	let add_def_id = *case.tir.tagged_items.get(&add_tag).unwrap();
-	let add_index = case.tir.function_index(add_def_id).unwrap();
+	let add_def_id = *case.tir.items.tagged_items.get(&add_tag).unwrap();
+	let add_index = case.tir.items.function_index(add_def_id).unwrap();
 
 	assert_eq!(
-		case.tir.functions[add_index as usize].accesses.len(),
+		case.tir.items.functions[usize::from(add_index)]
+			.accesses
+			.len(),
 		1,
 		"the `+` in `a + b` must be recorded as a go-to-definition access on \
 		 Vec2's `add` method, the same way an ordinary `.add()` method call \
@@ -14276,6 +14882,7 @@ fn test_poisoned_deref_store_records_rhs_access_for_hover() {
 	);
 	let function = case
 		.tir
+		.items
 		.functions
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("bad"))

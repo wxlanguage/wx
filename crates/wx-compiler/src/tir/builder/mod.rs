@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
+use crate::diagnostics::DiagnosticCode;
 use crate::vfs::{Files, PackageGraph, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
@@ -19,6 +20,7 @@ mod paths;
 mod prescan;
 mod signature;
 mod traits;
+mod type_compare;
 mod types;
 
 use aggregates::{
@@ -45,6 +47,7 @@ use signature::{
 	report_missing_function_body, report_non_constant_global_initializer,
 };
 use traits::report_associated_type_in_inherent_impl;
+use type_compare::{SignatureComparison, TypeComparison};
 use types::report_undeclared_type;
 
 struct ExprContext {
@@ -75,7 +78,7 @@ impl ExprContext {
 				return Some((scope_index, value));
 			}
 
-			scope_index = self.stack.scopes[scope_index as usize].parent?;
+			scope_index = self.stack.scopes[usize::from(scope_index)].parent?;
 		}
 	}
 
@@ -85,7 +88,7 @@ impl ExprContext {
 		handler: impl FnOnce(&mut Self) -> T,
 	) -> T {
 		let parent_scope_index = self.scope_index;
-		self.scope_index = self.stack.scopes.len() as u32;
+		self.scope_index = ScopeIndex::new(self.stack.scopes.len() as u32);
 		self.stack.scopes.push(block);
 
 		let result = handler(self);
@@ -101,11 +104,12 @@ impl ExprContext {
 		let mut scope_index = self.scope_index;
 
 		loop {
-			let scope = &self.stack.scopes[scope_index as usize];
+			let scope = &self.stack.scopes[usize::from(scope_index)];
 			match scope.label {
 				Some(label_index)
-					if self.stack.labels[label_index as usize].name.inner
-						== symbol =>
+					if self.stack.labels[usize::from(label_index)]
+						.name
+						.inner == symbol =>
 				{
 					return Some((scope_index, label_index));
 				}
@@ -120,7 +124,7 @@ impl ExprContext {
 		let mut scope_index = self.scope_index;
 
 		loop {
-			let scope = &self.stack.scopes[scope_index as usize];
+			let scope = &self.stack.scopes[usize::from(scope_index)];
 			if scope.kind == BlockKind::Loop {
 				return Some(scope_index);
 			}
@@ -153,8 +157,11 @@ struct Builder<'ast, 'graph> {
 	/// The package providing the standard library, whose root namespace is the
 	/// prelude every lookup falls back to. See [`Builder::lookup_scope_chain`].
 	stdlib_package: PackageId,
-	type_index_lookup: HashMap<Type, TypeIndex>,
-	tir: TIR,
+	items: ItemRegistry,
+	modules: ModuleGraph,
+	types: TypeInterner,
+	diagnostics: Vec<Diagnostic<FileId>>,
+	export_block: Option<ExportBlock>,
 	/// Populated in Phase 1, in parse order. Index matches `sig_state` entries.
 	ast_nodes: Vec<AstEntry<'ast>>,
 	/// Maps DefId → SigEntry; populated after Phase 1 with exact capacity.
@@ -294,24 +301,24 @@ enum AstNodeRef<'ast> {
 	InherentImplBlock {
 		impl_type_params: &'ast [ast::TypeParam],
 		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	},
 	InherentImplFunction {
 		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	},
 	InherentImplConst {
 		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
-		block_index: u32,
+		block_index: InherentImplIndex,
 	},
 	ImportedFunction {
-		import_module_index: u32,
+		import_module_index: ImportDeclIndex,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedGlobal {
-		import_module_index: u32,
+		import_module_index: ImportDeclIndex,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	/// One named leaf of a `use` tree. Everything it needs is already in
@@ -319,7 +326,7 @@ enum AstNodeRef<'ast> {
 	/// alias — so unlike every other variant here it holds no `&'ast`
 	/// reference.
 	Use {
-		use_index: u32,
+		use_index: UseIndex,
 	},
 	/// An `export { .. }` block. Carries no type of its own — its
 	/// "signature" is the act of resolving each listed name to an
@@ -505,60 +512,6 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		"TIR::build requires at least one AST"
 	);
 
-	let tir = TIR {
-		diagnostics: Vec::new(),
-		types: vec![
-			// Order MUST match the IDX constants defined at the top of this file.
-			Type::Error,
-			Type::Infer,
-			Type::Unit,
-			Type::Never,
-			Type::Integer,
-			Type::Float,
-			Type::U8,
-			Type::I8,
-			Type::U16,
-			Type::I16,
-			Type::U32,
-			Type::I32,
-			Type::U64,
-			Type::I64,
-			Type::F32,
-			Type::F64,
-			Type::Bool,
-			Type::Char,
-		],
-		functions: Vec::new(),
-		globals: Vec::new(),
-		export_block: None,
-		use_items: Vec::new(),
-		use_prefixes: Vec::new(),
-		namespaces: Vec::new(),
-		package_namespaces: HashMap::new(),
-		file_namespaces: vec![0; graph.files.len()],
-		module_decls: Vec::new(),
-		import_decls: Vec::new(),
-		enums: Vec::new(),
-		inherent_impls: Vec::new(),
-		inherent_impl_dispatch: HashMap::new(),
-		structs: Vec::new(),
-		memories: Vec::new(),
-		traits: Vec::new(),
-		trait_impls: Vec::new(),
-		trait_impl_dispatch: HashMap::new(),
-		constants: Vec::new(),
-		assoc_type_impls: Vec::new(),
-		tagged_items: HashMap::new(),
-		typesets: Vec::new(),
-		type_aliases: Vec::new(),
-		item_lookup: HashMap::new(),
-	};
-	let type_index_lookup = HashMap::from_iter(
-		tir.types
-			.iter()
-			.enumerate()
-			.map(|(idx, ty)| (ty.clone(), TypeIndex(idx as u32))),
-	);
 	let mut builder = Builder {
 		interner: &mut graph.interner,
 		id_generator: &mut graph.id_generator,
@@ -566,8 +519,11 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		packages: &graph.packages,
 		root_package: graph.root_package,
 		stdlib_package: graph.stdlib_package,
-		tir,
-		type_index_lookup,
+		items: ItemRegistry::new(),
+		modules: ModuleGraph::new(graph.files.len()),
+		types: TypeInterner::new(),
+		diagnostics: Vec::new(),
+		export_block: None,
 		sig_state: HashMap::new(),
 		sig_stack: Vec::new(),
 		ast_nodes: Vec::new(),
@@ -585,8 +541,7 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	// values never depend on `HashMap` iteration order: they end up in
 	// snapshots.
 	for package_graph in &graph.packages {
-		let namespace_idx = builder.tir.namespaces.len() as NamespaceIndex;
-		builder.tir.namespaces.push(ModuleNamespace {
+		let namespace_idx = builder.modules.push_namespace(ModuleNamespace {
 			parent: None,
 			package: package_graph.id,
 			declaration: ModuleDeclarationKind::Package(
@@ -597,14 +552,14 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 			accesses: Vec::new(),
 		});
 		builder
-			.tir
+			.modules
 			.package_namespaces
 			.insert(package_graph.id, namespace_idx);
 		// `crate` at a package root points at itself — there's no `super`
 		// here, since `parent: None` is exactly what marks a package
 		// boundary everywhere else in the resolver.
 		let crate_sym = builder.interner.get_or_intern("crate");
-		builder.tir.namespaces[namespace_idx as usize]
+		builder.modules.namespaces[usize::from(namespace_idx)]
 			.symbols
 			.insert(
 				(SymbolNamespace::Type, crate_sym),
@@ -621,18 +576,20 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	// keeps a package's dependencies invisible to everyone else — including
 	// to its own dependents, who never declared them.
 	for package in &graph.packages {
-		let owner = builder.tir.package_namespaces[&package.id];
+		let owner = builder.modules.package_namespaces[&package.id];
 		for (&name, target) in &package.dependencies {
-			let target_namespace = builder.tir.package_namespaces[target];
-			builder.tir.namespaces[owner as usize].symbols.insert(
-				(SymbolNamespace::Type, name),
-				SymbolEntry::Resolved {
-					kind: SymbolKind::Module {
-						namespace_idx: target_namespace,
+			let target_namespace = builder.modules.package_namespaces[target];
+			builder.modules.namespaces[usize::from(owner)]
+				.symbols
+				.insert(
+					(SymbolNamespace::Type, name),
+					SymbolEntry::Resolved {
+						kind: SymbolKind::Module {
+							namespace_idx: target_namespace,
+						},
+						visibility: Visibility::Public,
 					},
-					visibility: Visibility::Public,
-				},
-			);
+				);
 		}
 	}
 
@@ -648,11 +605,11 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	for source_module in source_modules.iter().copied() {
 		let package = &builder.packages[source_module.package_id.as_usize()];
 		let namespace = match &source_module.declaration {
-			None => builder.tir.package_namespaces[&package.id],
+			None => builder.modules.package_namespaces[&package.id],
 			Some(declaration) => {
 				let parent_module =
 					&package.modules[declaration.parent.as_usize()];
-				let parent_namespace = builder.tir.file_namespaces
+				let parent_namespace = builder.modules.file_namespaces
 					[parent_module.file_id.as_usize()];
 				match builder.check_module_collision(
 					parent_module.file_id,
@@ -670,14 +627,14 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 				}
 			}
 		};
-		builder.tir.file_namespaces[source_module.file_id.as_usize()] =
+		builder.modules.file_namespaces[source_module.file_id.as_usize()] =
 			namespace;
 	}
 
 	// Phase 1b: register all top-level items into ast_nodes / pending.
 	for source_module in source_modules.iter().copied() {
 		let namespace =
-			builder.tir.file_namespaces[source_module.file_id.as_usize()];
+			builder.modules.file_namespaces[source_module.file_id.as_usize()];
 		for item in source_module.ast.items.iter() {
 			builder.pre_scan_item(
 				source_module.file_id,
@@ -718,13 +675,92 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 
 	builder.report_unused_items();
 
-	// Nothing to hand over: top-level items and root wildcard imports now
-	// live on each package's own namespace, already inside `builder.tir`.
-
-	builder.tir
+	builder.finish()
 }
 
 impl<'ast> Builder<'ast, '_> {
+	fn finish(self) -> TIR {
+		TIR {
+			items: self.items,
+			modules: self.modules,
+			types: self.types,
+			diagnostics: self.diagnostics,
+			export_block: self.export_block,
+		}
+	}
+
+	fn record_symbol_access(
+		&mut self,
+		file_id: FileId,
+		kind: SymbolKind,
+		span: TextSpan,
+	) {
+		let span = SourceSpan::new(file_id, span);
+		match kind {
+			SymbolKind::Struct { struct_index } => {
+				self.items.structs[usize::from(struct_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Enum { enum_index } => {
+				self.items.enums[usize::from(enum_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Trait { trait_index } => {
+				self.items.traits[usize::from(trait_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::TypeSet { typeset_index } => {
+				self.items.typesets[usize::from(typeset_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::TypeAlias { type_alias_index } => {
+				self.items.type_aliases[usize::from(type_alias_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Const { const_index } => {
+				self.items.constants[usize::from(const_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Memory { memory_index, .. } => {
+				self.items.memories[usize::from(memory_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Function { func_index } => {
+				self.items.functions[usize::from(func_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Global { global_index } => {
+				self.items.globals[usize::from(global_index)]
+					.accesses
+					.push(span);
+			}
+			SymbolKind::TraitAssocType {
+				trait_index,
+				assoc_name,
+			} => {
+				self.items.traits[usize::from(trait_index)]
+					.assoc_types
+					.get_mut(&assoc_name)
+					.unwrap()
+					.accesses
+					.push(span);
+			}
+			SymbolKind::Module { namespace_idx } => {
+				self.modules.namespaces[usize::from(namespace_idx)]
+					.accesses
+					.push(span);
+			}
+		}
+	}
+
 	/// Records a `Self` keyword usage against the impl block or trait impl
 	/// it resolved through, into `self_accesses` — separate from the target
 	/// type's own `accesses` (still recorded alongside this, in the caller)
@@ -744,20 +780,22 @@ impl<'ast> Builder<'ast, '_> {
 				Some(owner)
 			}
 			TypeParamOwner::Function(id) => {
-				self.tir.function_index(id).and_then(|idx| {
-					self.tir.functions[idx as usize].type_param_parent
+				self.items.function_index(id).and_then(|idx| {
+					self.items.functions[usize::from(idx)].type_param_parent
 				})
 			}
 			_ => None,
 		};
 		match container {
 			Some(TypeParamOwner::ImplBlock(idx)) => {
-				self.tir.inherent_impls[idx as usize]
+				self.items.inherent_impls[usize::from(idx)]
 					.self_accesses
 					.push(span);
 			}
 			Some(TypeParamOwner::TraitImpl(idx)) => {
-				self.tir.trait_impls[idx as usize].self_accesses.push(span);
+				self.items.trait_impls[usize::from(idx)]
+					.self_accesses
+					.push(span);
 			}
 			_ => {}
 		}
@@ -767,11 +805,12 @@ impl<'ast> Builder<'ast, '_> {
 		let code = DiagnosticCode::UnusedItem.code();
 		let type_param_code = DiagnosticCode::UnusedTypeParam.code();
 
-		for function in self.tir.functions.iter() {
+		for function in self.items.functions.iter() {
 			let is_intrinsic =
 				function.attributes.contains(&ItemAttribute::Intrinsic);
 			let is_imported = matches!(
-				self.tir.namespaces[function.namespace as usize].declaration,
+				self.modules.namespaces[usize::from(function.namespace)]
+					.declaration,
 				ModuleDeclarationKind::Import(_)
 			);
 			if is_intrinsic || is_imported {
@@ -800,7 +839,7 @@ impl<'ast> Builder<'ast, '_> {
 						TypeParamOwner::Trait(_) | TypeParamOwner::TraitImpl(_)
 					)
 				) {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
 						.with_message(format!(
@@ -820,7 +859,7 @@ impl<'ast> Builder<'ast, '_> {
 			for param in function.type_params.iter() {
 				if param.accesses.is_empty() {
 					let name = self.interner.resolve(param.name.inner).unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::warning()
 							.with_code(type_param_code)
 							.with_message(format!(
@@ -841,14 +880,15 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		for global in self.tir.globals.iter() {
+		for global in self.items.globals.iter() {
 			let is_imported = matches!(
-				self.tir.namespaces[global.namespace as usize].declaration,
+				self.modules.namespaces[usize::from(global.namespace)]
+					.declaration,
 				ModuleDeclarationKind::Import(_)
 			);
 			if !is_imported && global.accesses.is_empty() {
 				let name = self.interner.resolve(global.name.inner).unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
 						.with_message(format!(
@@ -863,7 +903,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		for constant in self.tir.constants.iter() {
+		for constant in self.items.constants.iter() {
 			// A trait const's default value, and an impl's const satisfying
 			// one, are both exempt for the same reason a trait method is (see
 			// above): the declaration is itself the "use" — the value exists
@@ -880,7 +920,7 @@ impl<'ast> Builder<'ast, '_> {
 					Some(ItemParent::Trait(_) | ItemParent::TraitImpl(_))
 				) {
 				let name = self.interner.resolve(constant.name.inner).unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
 						.with_message(format!("const `{}` is never used", name))
@@ -897,10 +937,10 @@ impl<'ast> Builder<'ast, '_> {
 
 		let field_code = DiagnosticCode::UnusedStructField.code();
 
-		for struct_ in self.tir.structs.iter() {
+		for struct_ in self.items.structs.iter() {
 			if struct_.pub_span.is_none() && struct_.accesses.is_empty() {
 				let name = self.interner.resolve(struct_.name.inner).unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
 						.with_message(format!(
@@ -931,7 +971,7 @@ impl<'ast> Builder<'ast, '_> {
 					if has_init && !has_read {
 						let name =
 							self.interner.resolve(field.name.inner).unwrap();
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::warning()
 								.with_code(field_code)
 								.with_message(format!(
@@ -950,11 +990,12 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		for enum_index in 0..self.tir.enums.len() as EnumIndex {
-			let enum_ = &self.tir.enums[enum_index as usize];
+		for enum_index in 0..self.items.enums.len() {
+			let enum_index = EnumIndex::new(enum_index as u32);
+			let enum_ = &self.items.enums[usize::from(enum_index)];
 			if enum_.pub_span.is_none() && enum_.accesses.is_empty() {
 				let name = self.interner.resolve(enum_.name.inner).unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(code)
 						.with_message(format!("enum `{}` is never used", name))
@@ -980,7 +1021,7 @@ impl<'ast> Builder<'ast, '_> {
 				enum_.file_id,
 				&unused_variants,
 			);
-			self.tir.diagnostics.push(diagnostic);
+			self.diagnostics.push(diagnostic);
 		}
 	}
 }

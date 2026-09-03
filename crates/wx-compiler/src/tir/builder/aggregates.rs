@@ -1,6 +1,8 @@
 //! Aggregate expressions: struct initialisation, tuples, array literals and
 //! repeats, and the indexing and slice-range expressions that read out of them.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -18,23 +20,24 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn resolve_struct_field(
 		&mut self,
 		resolve_context: ResolveContext,
-		struct_index: u32,
+		struct_index: StructIndex,
 		args: &[TypeIndex],
 		name: Spanned<SymbolU32>,
 		kind: FieldAccessKind,
 	) -> Option<ResolvedField> {
-		let declaration = &self.tir.structs[struct_index as usize];
+		let declaration = &self.items.structs[usize::from(struct_index)];
 		let index = declaration.lookup.get(&name.inner).copied()?;
-		let raw_ty = declaration.fields[index.as_usize()].ty.inner;
+		let raw_ty = declaration.fields[usize::from(index)].ty.inner;
 		let declaring_namespace = declaration.namespace;
 
-		self.tir.structs[struct_index as usize].fields[index.as_usize()]
-			.accesses
-			.push(FieldAccess {
-				kind,
-				file_id: resolve_context.file_id,
-				span: name.span,
-			});
+		self.items.structs[usize::from(struct_index)].fields
+			[usize::from(index)]
+		.accesses
+		.push(FieldAccess {
+			kind,
+			file_id: resolve_context.file_id,
+			span: name.span,
+		});
 
 		let visibility = self.field_visibility(struct_index, index);
 		if !self.is_accessible_from(
@@ -87,7 +90,7 @@ impl<'ast> Builder<'ast, '_> {
 			return Err(());
 		}
 
-		let struct_index = match &self.tir.types[struct_ty.as_usize()] {
+		let struct_index = match self.types.resolve(struct_ty) {
 			Type::Struct { struct_index, .. } => *struct_index,
 			_ => {
 				let name = self
@@ -95,7 +98,7 @@ impl<'ast> Builder<'ast, '_> {
 					.resolve(struct_seg.ident.inner)
 					.unwrap()
 					.to_string();
-				self.tir.diagnostics.push(report_not_a_struct_type(
+				self.diagnostics.push(report_not_a_struct_type(
 					file_id,
 					name,
 					struct_seg.ident.span,
@@ -111,27 +114,26 @@ impl<'ast> Builder<'ast, '_> {
 		// or a bare generic reference padded by resolve_path_type would be
 		// mistaken for a real instantiation) > infer from expected type >
 		// empty (inferred per-field below).
-		let type_params_len =
-			self.tir.structs[struct_index as usize].type_params.len();
+		let type_params_len = self.items.structs[usize::from(struct_index)]
+			.type_params
+			.len();
 		let resolved_args: Box<[TypeIndex]> =
 			if !struct_seg.type_args.is_empty() {
-				match &self.tir.types[struct_ty.as_usize()] {
+				match self.types.resolve(struct_ty) {
 					Type::Struct { args, .. } => args.clone(),
 					_ => Box::new([]),
 				}
 			} else if type_params_len == 0 {
 				Box::new([])
 			} else {
-				match &self.tir.types[struct_ty.as_usize()] {
+				match self.types.resolve(struct_ty) {
 					Type::Struct { args, .. }
 						if args.len() == type_params_len
 							&& args.iter().any(|a| *a != TypeIndex::INFER) =>
 					{
 						args.clone()
 					}
-					_ => match &self.tir.types
-						[access_ctx.expected_type.as_usize()]
-					{
+					_ => match self.types.resolve(access_ctx.expected_type) {
 						Type::Struct {
 							struct_index: esi,
 							args,
@@ -147,10 +149,11 @@ impl<'ast> Builder<'ast, '_> {
 
 		let struct_name = self
 			.interner
-			.resolve(self.tir.structs[struct_index as usize].name.inner)
+			.resolve(self.items.structs[usize::from(struct_index)].name.inner)
 			.unwrap()
 			.to_string();
-		let field_count = self.tir.structs[struct_index as usize].fields.len();
+		let field_count =
+			self.items.structs[usize::from(struct_index)].fields.len();
 		// Tracks the field name span of the first mention of each field (regardless of
 		// whether the value built successfully). Used for duplicate detection and to
 		// distinguish genuinely-missing fields from errored ones.
@@ -171,7 +174,7 @@ impl<'ast> Builder<'ast, '_> {
 			) else {
 				let field_name =
 					self.interner.resolve(field.name.inner).unwrap();
-				self.tir.diagnostics.push(report_unknown_struct_field(
+				self.diagnostics.push(report_unknown_struct_field(
 					UnknownStructFieldDiagnostic {
 						file_id: func_ctx.resolve_context.file_id,
 						struct_name: &struct_name,
@@ -181,24 +184,22 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				continue;
 			};
-			let field_index = resolved.index.as_usize();
+			let field_index = usize::from(resolved.index);
 
 			if let Some(first_span) = first_mention[field_index] {
 				let field_name =
 					self.interner.resolve(field.name.inner).unwrap();
-				self.tir
-					.diagnostics
-					.push(report_duplicate_struct_field_init(
-						field_name,
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							first_span,
-						),
-						SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							field.name.span,
-						),
-					));
+				self.diagnostics.push(report_duplicate_struct_field_init(
+					field_name,
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						first_span,
+					),
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						field.name.span,
+					),
+				));
 				continue;
 			}
 			// Mark this field as mentioned (by its name span) before building the value,
@@ -243,7 +244,7 @@ impl<'ast> Builder<'ast, '_> {
 					Err(_) => continue,
 				}
 			} else if !self.coercible_to(field_expr.ty, expected_ty) {
-				self.tir.diagnostics.push(report_type_mistmatch(
+				self.diagnostics.push(report_type_mistmatch(
 					self.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: expected_ty,
@@ -267,7 +268,7 @@ impl<'ast> Builder<'ast, '_> {
 			.map(|(i, _)| {
 				self.interner
 					.resolve(
-						self.tir.structs[struct_index as usize].fields[i]
+						self.items.structs[usize::from(struct_index)].fields[i]
 							.name
 							.inner,
 					)
@@ -275,7 +276,7 @@ impl<'ast> Builder<'ast, '_> {
 			})
 			.collect();
 		if !missing.is_empty() {
-			self.tir.diagnostics.push(report_missing_struct_fields(
+			self.diagnostics.push(report_missing_struct_fields(
 				MissingStructFieldsDiagnostic {
 					file_id: func_ctx.resolve_context.file_id,
 					struct_name: &struct_name,
@@ -337,7 +338,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		// If the expected type is a tuple, use its element types as hints.
 		let expected_elems: Option<Box<[TypeIndex]>> =
-			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+			match self.types.resolve(access_ctx.expected_type) {
 				Type::Tuple { elements }
 					if elements.len() == ast_elements.len() =>
 				{
@@ -410,7 +411,7 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_size, expected_ownership) =
-			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+			match self.types.resolve(access_ctx.expected_type) {
 				&Type::Array {
 					of,
 					memory,
@@ -422,7 +423,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		if let Some(expected_size) = expected_size {
 			if elements.len() as u32 != expected_size {
-				self.tir.diagnostics.push(report_array_size_mismatch(
+				self.diagnostics.push(report_array_size_mismatch(
 					source_span,
 					expected_size,
 					elements.len(),
@@ -445,7 +446,7 @@ impl<'ast> Builder<'ast, '_> {
 				if expected_of != TypeIndex::INFER {
 					self.coerce_untyped_expr(func_ctx, &mut elem, expected_of)?;
 				} else {
-					self.tir.diagnostics.push(report_type_annotation_required(
+					self.diagnostics.push(report_type_annotation_required(
 						SourceSpan::new(
 							func_ctx.resolve_context.file_id,
 							elem.span,
@@ -455,7 +456,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			if !elem.ty.is_numeric() {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_message(
 							"array element type must be a numeric type",
@@ -471,7 +472,7 @@ impl<'ast> Builder<'ast, '_> {
 				elem.kind,
 				ExprKind::Int { .. } | ExprKind::Float { .. }
 			) {
-				self.tir.diagnostics.push(report_array_element_not_const(
+				self.diagnostics.push(report_array_element_not_const(
 					SourceSpan::new(
 						func_ctx.resolve_context.file_id,
 						elem.span,
@@ -486,7 +487,7 @@ impl<'ast> Builder<'ast, '_> {
 			let ty = first.ty;
 			for elem in &built[1..] {
 				if elem.ty != ty {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(func_ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: ty,
@@ -504,8 +505,7 @@ impl<'ast> Builder<'ast, '_> {
 		} else if expected_of != TypeIndex::INFER {
 			expected_of
 		} else {
-			self.tir
-				.diagnostics
+			self.diagnostics
 				.push(report_type_annotation_required(source_span));
 			return Err(());
 		};
@@ -543,7 +543,7 @@ impl<'ast> Builder<'ast, '_> {
 			SourceSpan::new(func_ctx.resolve_context.file_id, span);
 
 		let (expected_of, expected_memory, expected_ownership) =
-			match &self.tir.types[access_ctx.expected_type.as_usize()] {
+			match self.types.resolve(access_ctx.expected_type) {
 				&Type::Array {
 					of,
 					memory,
@@ -561,27 +561,26 @@ impl<'ast> Builder<'ast, '_> {
 			},
 			count_expr,
 		)?;
-		let count =
-			match count_built.kind {
-				// `value` is always non-negative (see `ExprKind::Int`'s
-				// doc comment) — no guard needed.
-				ExprKind::Int { value } => value as u32,
-				_ => {
-					self.tir.diagnostics.push(
-						report_array_repeat_count_not_const(SourceSpan::new(
-							func_ctx.resolve_context.file_id,
-							count_expr.span,
-						)),
-					);
-					return Err(());
-				}
-			};
+		let count = match count_built.kind {
+			// `value` is always non-negative (see `ExprKind::Int`'s
+			// doc comment) — no guard needed.
+			ExprKind::Int { value } => value as u32,
+			_ => {
+				self.diagnostics.push(report_array_repeat_count_not_const(
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						count_expr.span,
+					),
+				));
+				return Err(());
+			}
+		};
 
 		if let &Type::Array { size, .. } =
-			&self.tir.types[access_ctx.expected_type.as_usize()]
+			self.types.resolve(access_ctx.expected_type)
 		{
 			if count != size {
-				self.tir.diagnostics.push(report_array_size_mismatch(
+				self.diagnostics.push(report_array_size_mismatch(
 					source_span,
 					size,
 					count as usize,
@@ -602,7 +601,7 @@ impl<'ast> Builder<'ast, '_> {
 			if expected_of != TypeIndex::INFER {
 				self.coerce_untyped_expr(func_ctx, &mut value, expected_of)?;
 			} else {
-				self.tir.diagnostics.push(report_type_annotation_required(
+				self.diagnostics.push(report_type_annotation_required(
 					SourceSpan::new(
 						func_ctx.resolve_context.file_id,
 						value.span,
@@ -612,7 +611,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 		if !value.ty.is_numeric() {
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				Diagnostic::error()
 					.with_message("array element type must be a numeric type")
 					.with_label(Label::primary(
@@ -624,7 +623,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		if !matches!(value.kind, ExprKind::Int { .. } | ExprKind::Float { .. })
 		{
-			self.tir.diagnostics.push(report_array_element_not_const(
+			self.diagnostics.push(report_array_element_not_const(
 				SourceSpan::new(func_ctx.resolve_context.file_id, value.span),
 			));
 			return Err(());
@@ -671,7 +670,7 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let indexable = match &self.tir.types[object.ty.as_usize()] {
+		let indexable = match self.types.resolve(object.ty) {
 			&Type::Array {
 				of,
 				memory,
@@ -687,7 +686,7 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		let Some((elem_type, memory, ownership)) = indexable else {
-			self.tir.diagnostics.push(report_index_on_non_indexable(
+			self.diagnostics.push(report_index_on_non_indexable(
 				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
 				self.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
@@ -702,7 +701,7 @@ impl<'ast> Builder<'ast, '_> {
 			AccessKind::Write | AccessKind::ReadWrite
 		) && !mutable
 		{
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				report_cannot_store_through_immutable_pointer(SourceSpan::new(
 					func_ctx.resolve_context.file_id,
 					span,
@@ -723,7 +722,7 @@ impl<'ast> Builder<'ast, '_> {
 		if index.ty.is_comptime_number() {
 			self.coerce_untyped_expr(func_ctx, &mut index, index_type)?;
 		} else if index.ty != index_type {
-			self.tir.diagnostics.push(report_type_mistmatch(
+			self.diagnostics.push(report_type_mistmatch(
 				self.formatter(func_ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: index_type,
@@ -771,7 +770,7 @@ impl<'ast> Builder<'ast, '_> {
 			object_expr,
 		)?;
 
-		let indexable = match &self.tir.types[object.ty.as_usize()] {
+		let indexable = match self.types.resolve(object.ty) {
 			&Type::Array {
 				of,
 				memory,
@@ -787,7 +786,7 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		let Some((elem_type, memory, ownership)) = indexable else {
-			self.tir.diagnostics.push(report_index_on_non_indexable(
+			self.diagnostics.push(report_index_on_non_indexable(
 				SourceSpan::new(func_ctx.resolve_context.file_id, object.span),
 				self.formatter(func_ctx.resolve_context.namespace)
 					.display_type(object.ty)
@@ -813,7 +812,7 @@ impl<'ast> Builder<'ast, '_> {
 				builder
 					.coerce_untyped_expr(func_ctx, &mut bound, index_type)?;
 			} else if bound.ty != index_type {
-				builder.tir.diagnostics.push(report_type_mistmatch(
+				builder.diagnostics.push(report_type_mistmatch(
 					builder.formatter(func_ctx.resolve_context.namespace),
 					TypeMistmatchDiagnostic {
 						expected_type: index_type,

@@ -2,18 +2,13 @@
 //! coercion, resolving a written type expression (including paths, qualified
 //! and grouped forms) to a `TypeIndex`, and the direct-recursion check.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
 	pub(super) fn intern_type(&mut self, ty: Type) -> TypeIndex {
-		if let Some(&idx) = self.type_index_lookup.get(&ty) {
-			idx
-		} else {
-			let idx = TypeIndex(self.tir.types.len() as u32);
-			self.tir.types.push(ty.clone());
-			self.type_index_lookup.insert(ty, idx);
-			idx
-		}
+		self.types.intern(ty)
 	}
 
 	pub(super) fn coercible_to(&mut self, a: TypeIndex, b: TypeIndex) -> bool {
@@ -24,7 +19,7 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			return true;
 		}
-		match (&self.tir.types[a.as_usize()], &self.tir.types[b.as_usize()]) {
+		match (self.types.resolve(a), self.types.resolve(b)) {
 			// *T coerces to &T (dropping write permission is always safe).
 			(
 				Type::Pointer {
@@ -68,9 +63,10 @@ impl<'ast> Builder<'ast, '_> {
 			) => a_of == b_of && a_size == b_size && a_mem == b_mem,
 			// FunctionItem coerces implicitly to its matching Function type.
 			(Type::FunctionItem { id, type_args }, Type::Function { .. }) => {
-				let func_index = self.tir.expect_function_index(*id) as usize;
+				let func_index =
+					usize::from(self.items.expect_function_index(*id));
 				let generic_sig =
-					self.tir.functions[func_index].signature_index;
+					self.items.functions[func_index].signature_index;
 				self.substitute_type(generic_sig, &type_args.clone()) == b
 			}
 			_ => false,
@@ -106,16 +102,16 @@ impl<'ast> Builder<'ast, '_> {
 				id: b_id,
 				type_args: ref b_args,
 			},
-		) = (&self.tir.types[a.as_usize()], &self.tir.types[b.as_usize()])
+		) = (self.types.resolve(a), self.types.resolve(b))
 		{
 			let a_args = a_args.clone();
 			let b_args = b_args.clone();
-			let a_sig = self.tir.functions
-				[self.tir.expect_function_index(a_id) as usize]
-				.signature_index;
-			let b_sig = self.tir.functions
-				[self.tir.expect_function_index(b_id) as usize]
-				.signature_index;
+			let a_sig = self.items.functions
+				[usize::from(self.items.expect_function_index(a_id))]
+			.signature_index;
+			let b_sig = self.items.functions
+				[usize::from(self.items.expect_function_index(b_id))]
+			.signature_index;
 			let concrete_a = self.substitute_type(a_sig, &a_args);
 			let concrete_b = self.substitute_type(b_sig, &b_args);
 			if concrete_a == concrete_b {
@@ -133,10 +129,12 @@ impl<'ast> Builder<'ast, '_> {
 		namespace: NamespaceIndex,
 	) -> TypeFormatter<'_> {
 		TypeFormatter::new(
-			&self.tir,
+			&self.types,
+			&self.items,
+			&self.modules,
 			self.interner,
 			self.packages,
-			self.tir.namespaces[namespace as usize].package,
+			self.modules.namespaces[usize::from(namespace)].package,
 		)
 	}
 
@@ -149,7 +147,7 @@ impl<'ast> Builder<'ast, '_> {
 				size: kind,
 				memory_index,
 			} => {
-				let id = self.tir.memories[memory_index as usize].id;
+				let id = self.items.memories[usize::from(memory_index)].id;
 				Some(self.intern_type(Type::Memory { size: kind, id }))
 			}
 			SymbolKind::Module { namespace_idx } => {
@@ -165,23 +163,23 @@ impl<'ast> Builder<'ast, '_> {
 				}))
 			}
 			SymbolKind::Const { const_index } => {
-				let constant = &self.tir.constants[const_index as usize];
+				let constant = &self.items.constants[usize::from(const_index)];
 				Some(constant.ty.inner)
 			}
 			SymbolKind::Global { global_index } => {
-				let global = &self.tir.globals[global_index as usize];
+				let global = &self.items.globals[usize::from(global_index)];
 				Some(global.ty.inner)
 			}
 			SymbolKind::Function { func_index } => {
-				let function = &self.tir.functions[func_index as usize];
+				let function = &self.items.functions[usize::from(func_index)];
 				Some(function.signature_index)
 			}
 			SymbolKind::Trait { .. }
 			| SymbolKind::TypeSet { .. }
 			| SymbolKind::TraitAssocType { .. } => None,
-			SymbolKind::TypeAlias { type_alias_index } => {
-				Some(self.tir.type_aliases[type_alias_index as usize].body)
-			}
+			SymbolKind::TypeAlias { type_alias_index } => Some(
+				self.items.type_aliases[usize::from(type_alias_index)].body,
+			),
 		}
 	}
 
@@ -199,16 +197,17 @@ impl<'ast> Builder<'ast, '_> {
 			// Search the owner's own type params first (innermost scope wins).
 			let own_params: &[TypeParamInfo] = match scope.owner {
 				TypeParamOwner::ImplBlock(block_idx) => {
-					&self.tir.inherent_impls[block_idx as usize].type_params
+					&self.items.inherent_impls[usize::from(block_idx)]
+						.type_params
 				}
 				TypeParamOwner::Function(id) => {
-					self.tir.function_index(id).map_or(&[], |idx| {
-						&self.tir.functions[idx as usize].type_params
+					self.items.function_index(id).map_or(&[], |idx| {
+						&self.items.functions[usize::from(idx)].type_params
 					})
 				}
 				TypeParamOwner::Struct(id) => {
-					self.tir.struct_index(id).map_or(&[], |idx| {
-						&self.tir.structs[idx as usize].type_params
+					self.items.struct_index(id).map_or(&[], |idx| {
+						&self.items.structs[usize::from(idx)].type_params
 					})
 				}
 				// `Self` — literally that name (see `self_type_param`), so
@@ -217,14 +216,15 @@ impl<'ast> Builder<'ast, '_> {
 				// bodies reach the same slice via the parent-chase below
 				// instead (their own scope owner is `Function`).
 				TypeParamOwner::Trait(trait_index) => std::slice::from_ref(
-					&self.tir.traits[trait_index as usize].self_type_param,
+					&self.items.traits[usize::from(trait_index)]
+						.self_type_param,
 				),
 				TypeParamOwner::TraitImpl(impl_idx) => {
-					&self.tir.trait_impls[impl_idx as usize].type_params
+					&self.items.trait_impls[usize::from(impl_idx)].type_params
 				}
 				TypeParamOwner::TypeAlias(id) => {
-					self.tir.type_alias_index(id).map_or(&[], |idx| {
-						&self.tir.type_aliases[idx as usize].type_params
+					self.items.type_alias_index(id).map_or(&[], |idx| {
+						&self.items.type_aliases[usize::from(idx)].type_params
 					})
 				}
 			};
@@ -236,7 +236,7 @@ impl<'ast> Builder<'ast, '_> {
 				let abs_index =
 					(self.inherited_type_param_count(owner) + own_idx) as u32;
 
-				self.tir
+				self.items
 					.type_param_info_mut(owner, abs_index as usize)
 					.accesses
 					.push(SourceSpan::new(
@@ -250,9 +250,10 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			// Not found in own params — check the parent impl block (if any).
 			if let TypeParamOwner::Function(fn_id) = scope.owner {
-				if let Some(fn_idx) = self.tir.function_index(fn_id) {
-					if let Some(parent_owner) =
-						self.tir.functions[fn_idx as usize].type_param_parent
+				if let Some(fn_idx) = self.items.function_index(fn_id) {
+					if let Some(parent_owner) = self.items.functions
+						[usize::from(fn_idx)]
+					.type_param_parent
 					{
 						let parent_params =
 							self.owner_type_params(parent_owner);
@@ -262,7 +263,7 @@ impl<'ast> Builder<'ast, '_> {
 						{
 							// ImplBlock has no grandparent, so abs_index == i.
 							let abs_index = i as u32;
-							self.tir
+							self.items
 								.type_param_info_mut(
 									parent_owner,
 									abs_index as usize,
@@ -312,16 +313,18 @@ impl<'ast> Builder<'ast, '_> {
 		)? {
 			Some(symbol) => symbol,
 			None => {
-				self.tir.diagnostics.push(report_undeclared_type(
-					SourceSpan::new(resolve_context.file_id, identifier.span),
-				));
+				self.diagnostics
+					.push(report_undeclared_type(SourceSpan::new(
+						resolve_context.file_id,
+						identifier.span,
+					)));
 				return Err(());
 			}
 		};
 		match symbol {
 			SymbolKind::TraitAssocType { assoc_name, .. } => {
 				let name = self.interner.resolve(assoc_name).unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::UndeclaredType.code())
 						.with_message(format!(
@@ -338,7 +341,7 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			SymbolKind::Trait { .. } | SymbolKind::TypeSet { .. } => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
 						.with_message("cannot use a bound as a type")
@@ -364,7 +367,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			symbol => {
-				self.tir.record_symbol_access(
+				self.record_symbol_access(
 					resolve_context.file_id,
 					symbol,
 					identifier.span,
@@ -372,9 +375,11 @@ impl<'ast> Builder<'ast, '_> {
 				if let Some(ty) = self.symbol_kind_to_type(symbol) {
 					return Ok(ty);
 				}
-				self.tir.diagnostics.push(report_undeclared_type(
-					SourceSpan::new(resolve_context.file_id, identifier.span),
-				));
+				self.diagnostics
+					.push(report_undeclared_type(SourceSpan::new(
+						resolve_context.file_id,
+						identifier.span,
+					)));
 				Err(())
 			}
 		}
@@ -394,24 +399,25 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Option<u32> {
 		let own_params: &[TypeParamInfo] = match scope.owner {
 			TypeParamOwner::ImplBlock(block_idx) => {
-				&self.tir.inherent_impls[block_idx as usize].type_params
+				&self.items.inherent_impls[usize::from(block_idx)].type_params
 			}
 			TypeParamOwner::Function(id) => {
-				self.tir.function_index(id).map_or(&[], |idx| {
-					&self.tir.functions[idx as usize].type_params
+				self.items.function_index(id).map_or(&[], |idx| {
+					&self.items.functions[usize::from(idx)].type_params
 				})
 			}
-			TypeParamOwner::Struct(id) => self
-				.tir
-				.struct_index(id)
-				.map_or(&[], |idx| &self.tir.structs[idx as usize].type_params),
+			TypeParamOwner::Struct(id) => {
+				self.items.struct_index(id).map_or(&[], |idx| {
+					&self.items.structs[usize::from(idx)].type_params
+				})
+			}
 			TypeParamOwner::Trait(_) => &[],
 			TypeParamOwner::TraitImpl(impl_idx) => {
-				&self.tir.trait_impls[impl_idx as usize].type_params
+				&self.items.trait_impls[usize::from(impl_idx)].type_params
 			}
 			TypeParamOwner::TypeAlias(id) => {
-				self.tir.type_alias_index(id).map_or(&[], |idx| {
-					&self.tir.type_aliases[idx as usize].type_params
+				self.items.type_alias_index(id).map_or(&[], |idx| {
+					&self.items.type_aliases[usize::from(idx)].type_params
 				})
 			}
 		};
@@ -423,9 +429,9 @@ impl<'ast> Builder<'ast, '_> {
 			);
 		}
 		if let TypeParamOwner::Function(fn_id) = scope.owner {
-			if let Some(fn_idx) = self.tir.function_index(fn_id) {
+			if let Some(fn_idx) = self.items.function_index(fn_id) {
 				if let Some(parent_owner) =
-					self.tir.functions[fn_idx as usize].type_param_parent
+					self.items.functions[usize::from(fn_idx)].type_param_parent
 				{
 					// ImplBlock has no grandparent, so abs_index == i.
 					if let Some(i) = self
@@ -456,9 +462,11 @@ impl<'ast> Builder<'ast, '_> {
 	) -> TypeIndex {
 		let ty = self.resolve_type(resolve_context, scope, type_expr);
 		if self.contains_infer(ty) {
-			self.tir.diagnostics.push(report_infer_in_signature(
-				SourceSpan::new(resolve_context.file_id, type_expr.span),
-			));
+			self.diagnostics
+				.push(report_infer_in_signature(SourceSpan::new(
+					resolve_context.file_id,
+					type_expr.span,
+				)));
 		}
 		ty
 	}
@@ -619,7 +627,7 @@ impl<'ast> Builder<'ast, '_> {
 						Err(()) => return TypeIndex::ERROR,
 					}
 				}
-				match &self.tir.types[memory_ty.as_usize()] {
+				match self.types.resolve(memory_ty) {
 					Type::Memory { .. }
 					| Type::TypeParam { .. }
 					| Type::AssocTypeProjection { .. } => {}
@@ -628,7 +636,7 @@ impl<'ast> Builder<'ast, '_> {
 							memory.first().unwrap().ident.span.start,
 							memory.last().unwrap().ident.span.end,
 						);
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_message(format!(
 									"`{}` is not a memory declaration",
@@ -693,7 +701,7 @@ impl<'ast> Builder<'ast, '_> {
 						})
 					}
 					_ => {
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_message(
 									"memory namespace can only prefix pointer, slice, or array types",
@@ -813,7 +821,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.identifier_type_param_index(s, last.ident.inner)
 					.is_some()
 			}) {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_message("type arguments are not supported here")
 						.with_label(Label::primary(
@@ -843,7 +851,7 @@ impl<'ast> Builder<'ast, '_> {
 				)
 				.and_then(SymbolEntry::resolved_kind)
 			else {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_message("type arguments are not supported here")
 						.with_label(Label::primary(
@@ -948,7 +956,7 @@ impl<'ast> Builder<'ast, '_> {
 		) {
 			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
 			Ok(BoundKind::TypeSet(_)) => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_message(
 							"expected a trait after `as`, found a typeset",
@@ -1071,7 +1079,7 @@ impl<'ast> Builder<'ast, '_> {
 		root_span: TextSpan,
 	) -> Result<TypeIndex, ()> {
 		if !member.type_args.is_empty() {
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				Diagnostic::error()
 					.with_message("type arguments are not supported here")
 					.with_label(Label::primary(
@@ -1090,7 +1098,7 @@ impl<'ast> Builder<'ast, '_> {
 		// `AssocTypeProjection` arm but filtered to the one trait already
 		// named instead of searching every declared bound.
 		if matches!(
-			&self.tir.types[base_ty.inner.as_usize()],
+			self.types.resolve(base_ty.inner),
 			Type::AssocTypeProjection { .. }
 		) {
 			// Check trait membership first, independent of whether the bound
@@ -1100,10 +1108,11 @@ impl<'ast> Builder<'ast, '_> {
 			// the intended type even when the bound check fails. Best-effort:
 			// in progress means this trait is the one asking, and `entries`
 			// holds whatever it has declared so far.
-			let _ = self
-				.ensure_signature(self.tir.traits[required_trait as usize].id);
+			let _ = self.ensure_signature(
+				self.items.traits[usize::from(required_trait)].id,
+			);
 			let has_member = matches!(
-				self.tir.traits[required_trait as usize]
+				self.items.traits[usize::from(required_trait)]
 					.entries
 					.get(&member.ident.inner),
 				Some(ImplEntry::AssocType(_))
@@ -1114,24 +1123,22 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[required_trait as usize].name.inner,
+						self.items.traits[usize::from(required_trait)]
+							.name
+							.inner,
 					)
 					.unwrap();
-				self.tir
-					.diagnostics
-					.push(report_qualified_path_no_such_type(
-						SourceSpan::new(
-							resolve_context.file_id,
-							member.ident.span,
-						),
-						member_name,
-						trait_name,
-					));
+				self.diagnostics.push(report_qualified_path_no_such_type(
+					SourceSpan::new(resolve_context.file_id, member.ident.span),
+					member_name,
+					trait_name,
+				));
 				return Err(());
 			}
-			if let Some(assoc_type) = self.tir.traits[required_trait as usize]
-				.assoc_types
-				.get_mut(&member.ident.inner)
+			if let Some(assoc_type) = self.items.traits
+				[usize::from(required_trait)]
+			.assoc_types
+			.get_mut(&member.ident.inner)
 			{
 				assoc_type.accesses.push(SourceSpan::new(
 					resolve_context.file_id,
@@ -1145,12 +1152,12 @@ impl<'ast> Builder<'ast, '_> {
 			});
 
 			// Fetched fresh here (rather than upfront) so this stays a
-			// borrow of `self.tir` alone, not an owned clone kept alive
+			// borrow of `self.items` alone, not an owned clone kept alive
 			// across the `ensure_signature`/`intern_type` calls above —
 			// this is the only place it's used.
 			let bound_satisfied = self
-				.tir
-				.abstract_type_bounds(base_ty.inner)
+				.items
+				.abstract_type_bounds(&self.types, base_ty.inner)
 				.is_some_and(|bounds| {
 					bounds
 						.traits
@@ -1165,10 +1172,12 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[required_trait as usize].name.inner,
+						self.items.traits[usize::from(required_trait)]
+							.name
+							.inner,
 					)
 					.unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_qualified_path_trait_not_satisfied(
 						SourceSpan::new(resolve_context.file_id, root_span),
 						&type_name,
@@ -1194,10 +1203,10 @@ impl<'ast> Builder<'ast, '_> {
 			member.ident.inner,
 		) {
 			Ok((ImplEntry::AssocType(idx), _)) => {
-				if let Some(assoc_type) = self.tir.traits
-					[required_trait as usize]
-					.assoc_types
-					.get_mut(&member.ident.inner)
+				if let Some(assoc_type) = self.items.traits
+					[usize::from(required_trait)]
+				.assoc_types
+				.get_mut(&member.ident.inner)
 				{
 					assoc_type.accesses.push(SourceSpan::new(
 						resolve_context.file_id,
@@ -1212,8 +1221,8 @@ impl<'ast> Builder<'ast, '_> {
 				// the projection type itself instead, exactly like every
 				// other abstract-base case in this file.
 				let ty = if self
-					.tir
-					.abstract_type_bounds(base_ty.inner)
+					.items
+					.abstract_type_bounds(&self.types, base_ty.inner)
 					.is_some()
 				{
 					self.intern_type(Type::AssocTypeProjection {
@@ -1222,7 +1231,10 @@ impl<'ast> Builder<'ast, '_> {
 						base: base_ty.inner,
 					})
 				} else {
-					self.tir.assoc_type_impls[idx as usize].ty.unwrap().inner
+					self.items.assoc_type_impls[usize::from(idx)]
+						.ty
+						.unwrap()
+						.inner
 				};
 				Ok(ty)
 			}
@@ -1235,16 +1247,16 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[required_trait as usize].name.inner,
+						self.items.traits[usize::from(required_trait)]
+							.name
+							.inner,
 					)
 					.unwrap();
-				self.tir
-					.diagnostics
-					.push(report_qualified_path_no_such_type(
-						member_span,
-						member_name,
-						trait_name,
-					));
+				self.diagnostics.push(report_qualified_path_no_such_type(
+					member_span,
+					member_name,
+					trait_name,
+				));
 				Err(())
 			}
 			Err(TraitMemberError::NotImplemented) => {
@@ -1255,10 +1267,12 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[required_trait as usize].name.inner,
+						self.items.traits[usize::from(required_trait)]
+							.name
+							.inner,
 					)
 					.unwrap();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_qualified_path_trait_not_satisfied(
 						SourceSpan::new(resolve_context.file_id, root_span),
 						&type_name,
@@ -1274,17 +1288,17 @@ impl<'ast> Builder<'ast, '_> {
 				// define the member at all has nothing to recover.
 				// Best-effort, same as the `AssocTypeProjection` branch.
 				let _ = self.ensure_signature(
-					self.tir.traits[required_trait as usize].id,
+					self.items.traits[usize::from(required_trait)].id,
 				);
-				match self.tir.traits[required_trait as usize]
+				match self.items.traits[usize::from(required_trait)]
 					.entries
 					.get(&member.ident.inner)
 				{
 					Some(ImplEntry::AssocType(_)) => {
-						if let Some(assoc_type) = self.tir.traits
-							[required_trait as usize]
-							.assoc_types
-							.get_mut(&member.ident.inner)
+						if let Some(assoc_type) = self.items.traits
+							[usize::from(required_trait)]
+						.assoc_types
+						.get_mut(&member.ident.inner)
 						{
 							assoc_type.accesses.push(member_span);
 						}
@@ -1303,16 +1317,16 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[required_trait as usize].name.inner,
+						self.items.traits[usize::from(required_trait)]
+							.name
+							.inner,
 					)
 					.unwrap();
-				self.tir
-					.diagnostics
-					.push(report_qualified_path_no_such_type(
-						member_span,
-						member_name,
-						trait_name,
-					));
+				self.diagnostics.push(report_qualified_path_no_such_type(
+					member_span,
+					member_name,
+					trait_name,
+				));
 				Err(())
 			}
 		}
@@ -1339,10 +1353,7 @@ impl<'ast> Builder<'ast, '_> {
 		if expected == TypeIndex::INFER || actual == expected {
 			return true;
 		}
-		match (
-			&self.tir.types[actual.as_usize()],
-			&self.tir.types[expected.as_usize()],
-		) {
+		match (self.types.resolve(actual), self.types.resolve(expected)) {
 			(
 				Type::Struct {
 					struct_index: ai,
@@ -1394,7 +1405,7 @@ impl<'ast> Builder<'ast, '_> {
 		if ty == TypeIndex::INFER {
 			return true;
 		}
-		match &self.tir.types[ty.as_usize()] {
+		match self.types.resolve(ty) {
 			Type::Struct { args, .. } => {
 				args.iter().copied().any(|a| self.contains_infer(a))
 			}
@@ -1434,7 +1445,7 @@ impl<'ast> Builder<'ast, '_> {
 		if ty.is_comptime_number() {
 			return true;
 		}
-		match &self.tir.types[ty.as_usize()] {
+		match self.types.resolve(ty) {
 			Type::Tuple { elements } => elements
 				.iter()
 				.copied()
@@ -1449,10 +1460,10 @@ impl<'ast> Builder<'ast, '_> {
 	fn find_direct_struct_recursion(
 		&self,
 		ty: TypeIndex,
-		root_struct_index: u32,
-		visited: &mut Vec<u32>,
+		root_struct_index: StructIndex,
+		visited: &mut Vec<StructIndex>,
 	) -> bool {
-		match &self.tir.types[ty.as_usize()] {
+		match self.types.resolve(ty) {
 			Type::Struct { struct_index, .. } => {
 				if *struct_index == root_struct_index {
 					return true;
@@ -1461,7 +1472,7 @@ impl<'ast> Builder<'ast, '_> {
 					return false;
 				}
 				visited.push(*struct_index);
-				let found = self.tir.structs[*struct_index as usize]
+				let found = self.items.structs[usize::from(*struct_index)]
 					.fields
 					.iter()
 					.map(|field| field.ty.inner)
@@ -1498,22 +1509,23 @@ impl<'ast> Builder<'ast, '_> {
 	/// the TODO in `mir::Builder::ensure_aggregate_for_struct`.
 	pub(super) fn check_struct_fields_for_direct_recursion(
 		&mut self,
-		struct_index: u32,
+		struct_index: StructIndex,
 		struct_span: SourceSpan,
 	) {
 		let mut visited = vec![struct_index];
-		for (field_ty, field_span) in self.tir.structs[struct_index as usize]
-			.fields
-			.iter()
-			.map(|field| {
-				(
-					field.ty.inner,
-					SourceSpan::new(
-						self.tir.structs[struct_index as usize].file_id,
-						field.ty.span,
-					),
-				)
-			}) {
+		for (field_ty, field_span) in self.items.structs
+			[usize::from(struct_index)]
+		.fields
+		.iter()
+		.map(|field| {
+			(
+				field.ty.inner,
+				SourceSpan::new(
+					self.items.structs[usize::from(struct_index)].file_id,
+					field.ty.span,
+				),
+			)
+		}) {
 			if self.find_direct_struct_recursion(
 				field_ty,
 				struct_index,
@@ -1521,9 +1533,13 @@ impl<'ast> Builder<'ast, '_> {
 			) {
 				let name = self
 					.interner
-					.resolve(self.tir.structs[struct_index as usize].name.inner)
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
 					.unwrap();
-				self.tir.diagnostics.push(report_recursive_type(
+				self.diagnostics.push(report_recursive_type(
 					name,
 					struct_span,
 					field_span,

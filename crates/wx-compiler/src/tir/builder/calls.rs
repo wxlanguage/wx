@@ -2,6 +2,8 @@
 //! and `Type::method()` resolution against inherent and trait impls, and the
 //! abstract-method path that defers dispatch to monomorphisation.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -35,13 +37,13 @@ impl<'ast> Builder<'ast, '_> {
 				ty: TypeIndex::ERROR,
 				span: ast_callee.span,
 			});
-		let signature = match &self.tir.types[callee.ty.as_usize()] {
+		let signature = match self.types.resolve(callee.ty) {
 			Type::Function { signature } => signature.clone(),
 			Type::FunctionItem { id, .. } => {
-				let signature_index = self.tir.functions
-					[self.tir.expect_function_index(*id) as usize]
-					.signature_index;
-				match &self.tir.types[signature_index.as_usize()] {
+				let signature_index = self.items.functions
+					[usize::from(self.items.expect_function_index(*id))]
+				.signature_index;
+				match self.types.resolve(signature_index) {
 					Type::Function { signature } => signature.clone(),
 					_ => unreachable!(),
 				}
@@ -97,7 +99,7 @@ impl<'ast> Builder<'ast, '_> {
 							"consider using a semicolon here to finish the statement: `;`",
 						);
 					}
-					self.tir.diagnostics.push(diagnostic);
+					self.diagnostics.push(diagnostic);
 				}
 
 				return Ok(Expression {
@@ -111,7 +113,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 		if arguments.len() != signature.params().len() {
-			self.tir.diagnostics.push(report_argument_count_mismatch(
+			self.diagnostics.push(report_argument_count_mismatch(
 				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
@@ -137,15 +139,16 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		if let Some(callee_id) = direct_id {
-			let func_index = self.tir.expect_function_index(callee_id);
-			let type_params_len = self.tir.functions[func_index as usize]
+			let func_index = self.items.expect_function_index(callee_id);
+			let type_params_len = self.items.functions[usize::from(func_index)]
 				.total_type_param_count();
 			if type_params_len > 0 {
 				// FunctionItem.type_args is always padded to type_params_len (with
 				// impl-level args pre-filled and remaining slots as INFER) by the time
 				// we get here — build_namespace_member_expression enforces this invariant.
-				let mut type_args: Box<[TypeIndex]> = match &self.tir.types
-					[callee.ty.as_usize()]
+				let mut type_args: Box<[TypeIndex]> = match self
+					.types
+					.resolve(callee.ty)
 				{
 					Type::FunctionItem { type_args, .. } => type_args.clone(),
 					_ => vec![TypeIndex::INFER; type_params_len]
@@ -158,14 +161,15 @@ impl<'ast> Builder<'ast, '_> {
 				// context instead of only being checked against it after the
 				// fact — see test_generic_call_arg_infers_from_expected_type.
 				if access_ctx.expected_type != TypeIndex::INFER {
-					let result_type = self.tir.functions[func_index as usize]
-						.result
-						.as_ref()
-						.map(|r| r.inner)
-						.unwrap_or(TypeIndex::UNIT);
+					let result_type = self.items.functions
+						[usize::from(func_index)]
+					.result
+					.as_ref()
+					.map(|r| r.inner)
+					.unwrap_or(TypeIndex::UNIT);
 					// Ignored — see the identical seeding step in
 					// `build_generic_call_arguments`.
-					let _ = self.tir.infer_type_args(
+					let _ = self.types.infer_type_args(
 						&mut type_args,
 						result_type,
 						access_ctx.expected_type,
@@ -174,10 +178,11 @@ impl<'ast> Builder<'ast, '_> {
 
 				let mut built_args = Vec::with_capacity(arguments.len());
 				for (index, arg) in arguments.iter().enumerate() {
-					let param_type = self.tir.functions[func_index as usize]
-						.params
-						.get(index)
-						.map(|p| p.ty.inner);
+					let param_type = self.items.functions
+						[usize::from(func_index)]
+					.params
+					.get(index)
+					.map(|p| p.ty.inner);
 					let expected_type = param_type
 						.map(|pt| self.substitute_expected_type(pt, &type_args))
 						.filter(|&t| !self.contains_infer(t))
@@ -193,7 +198,7 @@ impl<'ast> Builder<'ast, '_> {
 					if let Some(param_type) = param_type {
 						// Ignored — see the identical per-argument step in
 						// `build_generic_call_arguments`.
-						let _ = self.tir.infer_type_args(
+						let _ = self.types.infer_type_args(
 							&mut type_args,
 							param_type,
 							built.ty,
@@ -281,7 +286,7 @@ impl<'ast> Builder<'ast, '_> {
 						expected_type,
 					);
 				} else if !self.coercible_to(argument.ty, expected_type) {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
@@ -294,7 +299,7 @@ impl<'ast> Builder<'ast, '_> {
 					));
 				}
 			} else if argument.ty.is_comptime_number() {
-				self.tir.diagnostics.push(report_type_annotation_required(
+				self.diagnostics.push(report_type_annotation_required(
 					SourceSpan::new(ctx.resolve_context.file_id, argument.span),
 				));
 			}
@@ -320,7 +325,7 @@ impl<'ast> Builder<'ast, '_> {
 		expected_result: TypeIndex,
 		call_span: TextSpan,
 	) -> Box<[TypeIndex]> {
-		let result_type = self.tir.functions[func_index as usize]
+		let result_type = self.items.functions[usize::from(func_index)]
 			.result
 			.as_ref()
 			.map(|r| r.inner)
@@ -330,23 +335,26 @@ impl<'ast> Builder<'ast, '_> {
 			// error, but it's caught below by the leftover-`INFER`/
 			// substituted-result check, which reports a clearer diagnostic
 			// than this structural signal could on its own.
-			_ = self.tir.infer_type_args(
+			_ = self.types.infer_type_args(
 				&mut type_args,
 				result_type,
 				expected_result,
 			);
 		}
 		for (index, arg) in arguments.iter().enumerate() {
-			let param_type =
-				match self.tir.functions[func_index as usize].params.get(index)
-				{
-					Some(p) => p.ty.inner,
-					None => break,
-				};
+			let param_type = match self.items.functions[usize::from(func_index)]
+				.params
+				.get(index)
+			{
+				Some(p) => p.ty.inner,
+				None => break,
+			};
 			// Ignored: a genuine mismatch here surfaces separately when
 			// this argument gets checked against the (by-then substituted)
 			// param type, with the actual expected/found types shown.
-			_ = self.tir.infer_type_args(&mut type_args, param_type, arg.ty);
+			_ = self
+				.types
+				.infer_type_args(&mut type_args, param_type, arg.ty);
 		}
 
 		// Detect unresolvable type parameters by substituting the current type_args
@@ -377,7 +385,7 @@ impl<'ast> Builder<'ast, '_> {
 				for (i, &slot) in type_args.iter().enumerate() {
 					if slot == TypeIndex::INFER {
 						let name_symbol = self
-							.tir
+							.items
 							.function_type_params_iter(func_index)
 							.nth(i)
 							.expect(
@@ -387,7 +395,7 @@ impl<'ast> Builder<'ast, '_> {
 							.inner;
 						let param_name =
 							self.interner.resolve(name_symbol).unwrap();
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::TypeAnnotationRequired
@@ -420,12 +428,13 @@ impl<'ast> Builder<'ast, '_> {
 
 		let mut had_error = false;
 		for (index, arg) in arguments.iter_mut().enumerate() {
-			let param_type =
-				match self.tir.functions[func_index as usize].params.get(index)
-				{
-					Some(p) => p.ty.inner,
-					None => break,
-				};
+			let param_type = match self.items.functions[usize::from(func_index)]
+				.params
+				.get(index)
+			{
+				Some(p) => p.ty.inner,
+				None => break,
+			};
 
 			let substituted_expected =
 				self.substitute_expected_type(param_type, &type_args);
@@ -442,7 +451,7 @@ impl<'ast> Builder<'ast, '_> {
 				// the real expected shape (`Box<_>`, not just `_`).
 				if !self.type_satisfies_annotation(arg.ty, substituted_expected)
 				{
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: substituted_expected,
@@ -470,7 +479,7 @@ impl<'ast> Builder<'ast, '_> {
 						had_error = true;
 					}
 				} else if !self.coercible_to(arg.ty, expected_type) {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type,
@@ -484,7 +493,7 @@ impl<'ast> Builder<'ast, '_> {
 					had_error = true;
 				}
 			} else if arg.ty.is_comptime_number() {
-				self.tir.diagnostics.push(report_type_annotation_required(
+				self.diagnostics.push(report_type_annotation_required(
 					SourceSpan::new(ctx.resolve_context.file_id, arg.span),
 				));
 				had_error = true;
@@ -499,7 +508,7 @@ impl<'ast> Builder<'ast, '_> {
 			for (index, slot) in type_args.iter().copied().enumerate() {
 				if slot == TypeIndex::INFER {
 					let name_symbol = self
-						.tir
+						.items
 						.function_type_params_iter(func_index)
 						.nth(index)
 						.expect(
@@ -509,7 +518,7 @@ impl<'ast> Builder<'ast, '_> {
 						.inner;
 					let param_name =
 						self.interner.resolve(name_symbol).unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::TypeAnnotationRequired.code(),
@@ -535,11 +544,11 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		// Collected here instead of pushed straight to `self.tir.diagnostics`:
-		// `param_info` below borrows `self.tir` for the rest of each
+		// Collected here instead of pushed straight to `self.diagnostics`:
+		// `param_info` below borrows `self.items` for the rest of each
 		// iteration (both the trait loop and the typeset check use it, with
 		// `continue`s in between), so nothing in this loop can also hold
-		// `&mut self.tir.diagnostics` at the same time. Costs nothing on the
+		// `&mut self.diagnostics` at the same time. Costs nothing on the
 		// common no-violation path — `Vec::new()` doesn't allocate until the
 		// first `push` — unlike cloning `param_info.bounds` would on every
 		// call regardless of outcome.
@@ -551,7 +560,7 @@ impl<'ast> Builder<'ast, '_> {
 		// above is collected rather than pushed live) has ended, since
 		// resolving a concrete associated-type value needs
 		// `self.substitute_type` (`&mut self`), not just `&mut
-		// self.tir.diagnostics`. Cloning `trait_bound` only happens here, on
+		// self.diagnostics`. Cloning `trait_bound` only happens here, on
 		// the path that already found a `: Bound` entry — the common case
 		// (no `where` clause at all, or only `= Type` entries) never
 		// allocates for this.
@@ -559,11 +568,11 @@ impl<'ast> Builder<'ast, '_> {
 		// Zipped once, in lockstep, rather than re-deriving `param_info` via
 		// a fresh `.nth(arg_index)` per iteration (which would re-walk the
 		// chained parent/own type-param iterator from the start every time)
-		// — safe now that nothing in this loop needs `&mut self.tir`
+		// — safe now that nothing in this loop needs `&mut self.items`
 		// (diagnostics are collected above instead), so holding this one
 		// iterator borrowed across the whole loop is fine.
 		for (index, (param_info, arg_ty)) in self
-			.tir
+			.items
 			.function_type_params_iter(func_index)
 			.zip(type_args.iter().copied())
 			.enumerate()
@@ -574,10 +583,11 @@ impl<'ast> Builder<'ast, '_> {
 			// A declared bound can list several traits (`T: Foo + Bar`) —
 			// report every one `arg_ty` fails, not just the first.
 			for trait_bound in param_info.bounds.traits.iter() {
-				if self
-					.tir
-					.type_implements_trait(arg_ty, trait_bound.trait_index)
-				{
+				if self.items.type_implements_trait(
+					&self.types,
+					arg_ty,
+					trait_bound.trait_index,
+				) {
 					if trait_bound.bindings.iter().any(|(_, kind)| {
 						matches!(kind, AssocBindingKind::Bound(_))
 					}) {
@@ -592,7 +602,7 @@ impl<'ast> Builder<'ast, '_> {
 				let trait_name = self
 					.interner
 					.resolve(
-						self.tir.traits[trait_bound.trait_index as usize]
+						self.items.traits[usize::from(trait_bound.trait_index)]
 							.name
 							.inner,
 					)
@@ -600,12 +610,12 @@ impl<'ast> Builder<'ast, '_> {
 				// Narrow the primary span to whichever argument's declared
 				// type is exactly this type param, if one exists (a
 				// turbofish-only or return-only param has none)
-				let arg_span = self.tir.functions[func_index as usize]
+				let arg_span = self.items.functions[usize::from(func_index)]
 					.params
 					.iter()
 					.zip(arguments.iter())
 					.find_map(|(param, arg)| {
-						match &self.tir.types[param.ty.inner.as_usize()] {
+						match self.types.resolve(param.ty.inner) {
 							Type::TypeParam { param_index, .. }
 								if *param_index as usize == index =>
 							{
@@ -617,10 +627,14 @@ impl<'ast> Builder<'ast, '_> {
 					.unwrap_or(call_span);
 				let func_name = self
 					.interner
-					.resolve(self.tir.functions[func_index as usize].name.inner)
+					.resolve(
+						self.items.functions[usize::from(func_index)]
+							.name
+							.inner,
+					)
 					.unwrap();
 				let func_file_id =
-					self.tir.functions[func_index as usize].file_id;
+					self.items.functions[usize::from(func_index)].file_id;
 				diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -648,8 +662,11 @@ impl<'ast> Builder<'ast, '_> {
 			let Some(param_bound) = param_info.bounds.typeset else {
 				continue;
 			};
-			let satisfied =
-				self.tir.type_in_typeset(arg_ty, param_bound.typeset_index);
+			let satisfied = self.items.type_in_typeset(
+				&self.types,
+				arg_ty,
+				param_bound.typeset_index,
+			);
 			if !satisfied {
 				let type_name = self
 					.formatter(ctx.resolve_context.namespace)
@@ -658,9 +675,10 @@ impl<'ast> Builder<'ast, '_> {
 				let set_name = self
 					.interner
 					.resolve(
-						self.tir.typesets[param_bound.typeset_index as usize]
-							.name
-							.inner,
+						self.items.typesets
+							[usize::from(param_bound.typeset_index)]
+						.name
+						.inner,
 					)
 					.unwrap();
 				let param_name_str =
@@ -683,7 +701,7 @@ impl<'ast> Builder<'ast, '_> {
 				);
 			}
 		}
-		self.tir.diagnostics.extend(diagnostics);
+		self.diagnostics.extend(diagnostics);
 
 		// Second pass: for each `T: Trait where { Assoc: Bound }` the call's
 		// own arguments satisfied `T: Trait` for, also check that `Assoc`'s
@@ -712,27 +730,33 @@ impl<'ast> Builder<'ast, '_> {
 					.unwrap_or_default();
 				let func_name = self
 					.interner
-					.resolve(self.tir.functions[func_index as usize].name.inner)
+					.resolve(
+						self.items.functions[usize::from(func_index)]
+							.name
+							.inner,
+					)
 					.unwrap();
 				let func_file_id =
-					self.tir.functions[func_index as usize].file_id;
+					self.items.functions[usize::from(func_index)].file_id;
 
 				for req_trait in required.traits.iter() {
-					if self
-						.tir
-						.type_implements_trait(concrete, req_trait.trait_index)
-					{
+					if self.items.type_implements_trait(
+						&self.types,
+						concrete,
+						req_trait.trait_index,
+					) {
 						continue;
 					}
 					let req_trait_name = self
 						.interner
 						.resolve(
-							self.tir.traits[req_trait.trait_index as usize]
-								.name
-								.inner,
+							self.items.traits
+								[usize::from(req_trait.trait_index)]
+							.name
+							.inner,
 						)
 						.unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::TraitBoundViolation.code())
 							.with_message(format!(
@@ -757,20 +781,21 @@ impl<'ast> Builder<'ast, '_> {
 				}
 
 				if let Some(req_typeset) = required.typeset
-					&& !self
-						.tir
-						.type_in_typeset(concrete, req_typeset.typeset_index)
-				{
+					&& !self.items.type_in_typeset(
+						&self.types,
+						concrete,
+						req_typeset.typeset_index,
+					) {
 					let set_name = self
 						.interner
 						.resolve(
-							self.tir.typesets
-								[req_typeset.typeset_index as usize]
-								.name
-								.inner,
+							self.items.typesets
+								[usize::from(req_typeset.typeset_index)]
+							.name
+							.inner,
 						)
 						.unwrap();
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::TypesetBoundViolation.code(),
@@ -858,19 +883,19 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 
-		self.tir.functions[func_index as usize]
+		self.items.functions[usize::from(func_index)]
 			.accesses
 			.push(SourceSpan::new(file_id, method.span));
-		let id = self.tir.functions[func_index as usize].id;
+		let id = self.items.functions[usize::from(func_index)].id;
 		let signature_index =
-			self.tir.functions[func_index as usize].signature_index;
-		let signature = match &self.tir.types[signature_index.as_usize()] {
+			self.items.functions[usize::from(func_index)].signature_index;
+		let signature = match self.types.resolve(signature_index) {
 			Type::Function { signature } => signature.clone(),
 			_ => unreachable!(),
 		};
 		let non_self_params = &signature.params()[1..];
 		if arguments.len() != non_self_params.len() {
-			self.tir.diagnostics.push(report_argument_count_mismatch(
+			self.diagnostics.push(report_argument_count_mismatch(
 				self.formatter(ctx.resolve_context.namespace),
 				ArgumentCountMismatchDiagnostic {
 					actual_count: arguments.len(),
@@ -886,7 +911,7 @@ impl<'ast> Builder<'ast, '_> {
 				(ast_type_args.first(), ast_type_args.last())
 			{
 				let count = ast_type_args.len();
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::TypeArgCountMismatch.code())
 						.with_message(format!(
@@ -907,7 +932,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			if let Some(&self_param_ty) = signature.params().first() {
 				if !self.coercible_to(object.ty, self_param_ty) {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
@@ -933,10 +958,11 @@ impl<'ast> Builder<'ast, '_> {
 		// function's own (non-inherited) type_args slots — mirrors how
 		// build_namespace_member_expression merges turbofish for
 		// `Type::method::<T>()`.
-		let fn_params_len =
-			self.tir.functions[func_index as usize].type_params.len();
+		let fn_params_len = self.items.functions[usize::from(func_index)]
+			.type_params
+			.len();
 		if !ast_type_args.is_empty() && ast_type_args.len() != fn_params_len {
-			self.tir.diagnostics.push(
+			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeArgCountMismatch.code())
 					.with_message(format!(
@@ -966,7 +992,7 @@ impl<'ast> Builder<'ast, '_> {
 		if access_ctx.expected_type != TypeIndex::INFER {
 			// Ignored — see the identical seeding step in
 			// `build_generic_call_arguments`.
-			let _ = self.tir.infer_type_args(
+			let _ = self.types.infer_type_args(
 				&mut type_args,
 				signature.result(),
 				access_ctx.expected_type,
@@ -992,7 +1018,7 @@ impl<'ast> Builder<'ast, '_> {
 			if let Some(param_type) = param_type {
 				// Ignored — see the identical per-argument step in
 				// `build_generic_call_arguments`.
-				let _ = self.tir.infer_type_args(
+				let _ = self.types.infer_type_args(
 					&mut type_args,
 					param_type,
 					built.ty,
@@ -1036,7 +1062,7 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Result<(FunctionIndex, Box<[TypeIndex]>), ()> {
 		let file_id = resolve_context.file_id;
 		// Pointer types cannot have impl blocks, so look up methods on the inner type directly.
-		let lookup_ty = match &self.tir.types[receiver.inner.as_usize()] {
+		let lookup_ty = match self.types.resolve(receiver.inner) {
 			Type::Pointer { to, .. } => *to,
 			_ => receiver.inner,
 		};
@@ -1060,10 +1086,8 @@ impl<'ast> Builder<'ast, '_> {
 		// marked accessed, or dead-code detection would flag all of them
 		// as unused even though any could end up being the one called.
 		if let MemberLookup::Trait { trait_index, .. } = &lookup
-			&& matches!(
-				self.tir.types[lookup_ty.as_usize()],
-				Type::TypeParam { .. }
-			) {
+			&& matches!(self.types.resolve(lookup_ty), Type::TypeParam { .. })
+		{
 			self.record_abstract_dispatch_access(
 				*trait_index,
 				method.inner,
@@ -1081,16 +1105,16 @@ impl<'ast> Builder<'ast, '_> {
 				type_args,
 				..
 			} => {
-				let func = &self.tir.functions[func_index as usize];
+				let func = &self.items.functions[usize::from(func_index)];
 				let self_param_ty = func.params[0].ty.inner;
 				if matches!(
-					self.tir.types[self_param_ty.as_usize()],
+					self.types.resolve(self_param_ty),
 					Type::Pointer { .. }
 				) != matches!(
-					self.tir.types[receiver.inner.as_usize()],
+					self.types.resolve(receiver.inner),
 					Type::Pointer { .. }
 				) {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: self_param_ty,
@@ -1121,7 +1145,7 @@ impl<'ast> Builder<'ast, '_> {
 				Ok((func_index, type_args))
 			}
 			MemberLookup::Inherent { .. } | MemberLookup::Trait { .. } => {
-				self.tir.diagnostics.push(report_not_a_method(
+				self.diagnostics.push(report_not_a_method(
 					SourceSpan::new(file_id, method.span),
 					self.formatter(resolve_context.namespace),
 					method.inner,
@@ -1130,7 +1154,7 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 			MemberLookup::NotFound => {
-				self.tir.diagnostics.push(report_method_not_found(
+				self.diagnostics.push(report_method_not_found(
 					SourceSpan::new(file_id, method.span),
 					self.formatter(resolve_context.namespace),
 					method.inner,
@@ -1157,20 +1181,21 @@ impl<'ast> Builder<'ast, '_> {
 		let mut candidates: Vec<MemberCandidate> = Vec::new();
 		let mut candidate: Option<MemberCandidate> = None;
 
-		match &self.tir.types[target_type.as_usize()] {
+		match self.types.resolve(target_type) {
 			Type::TypeParam { owner, param_index } => {
 				for trait_index in self
-					.tir
+					.items
 					.type_param_info(*owner, *param_index as usize)
 					.bounds
 					.traits
 					.iter()
 					.map(|bound| bound.trait_index)
 				{
-					let entry = match self.tir.traits[trait_index as usize]
-						.entries
-						.get(&member_symbol)
-						.cloned()
+					let entry = match self.items.traits
+						[usize::from(trait_index)]
+					.entries
+					.get(&member_symbol)
+					.cloned()
 					{
 						Some(entry) => entry,
 						None => continue,
@@ -1198,7 +1223,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			_ => {
 				let target = match ImplTarget::from_type(
-					&self.tir.types[target_type.as_usize()],
+					self.types.resolve(target_type),
 				) {
 					Ok(target) => target,
 					Err(_) => return MemberLookup::NotFound,
@@ -1218,7 +1243,7 @@ impl<'ast> Builder<'ast, '_> {
 				// what the old exact-key `type_trait_impls` lookup did, plus
 				// generic impls.
 				for (trait_index, impl_index) in self
-					.tir
+					.items
 					.trait_impl_dispatch
 					.get(&target)
 					.map(|v| v.as_slice())
@@ -1294,8 +1319,10 @@ impl<'ast> Builder<'ast, '_> {
 			);
 			let type_name = formatter.display_type(target_type).unwrap();
 			for (idx, candidate) in candidates.iter().enumerate() {
-				let trait_name =
-					self.tir.traits[candidate.trait_index as usize].name.inner;
+				let trait_name = self.items.traits
+					[usize::from(candidate.trait_index)]
+				.name
+				.inner;
 				let trait_name =
 					formatter.interner.resolve(trait_name).unwrap();
 				let message = format!(
@@ -1305,12 +1332,12 @@ impl<'ast> Builder<'ast, '_> {
 				diagnostic.labels.push(
 					candidate
 						.entry
-						.def_span(&self.tir)
+						.def_span(&self.items)
 						.secondary_label()
 						.with_message(message),
 				);
 			}
-			self.tir.diagnostics.push(diagnostic);
+			self.diagnostics.push(diagnostic);
 			MemberLookup::Ambiguous
 		}
 	}
@@ -1339,7 +1366,7 @@ impl<'ast> Builder<'ast, '_> {
 		let mut candidates: Vec<InherentCandidate> = Vec::new();
 
 		for block_idx in self
-			.tir
+			.items
 			.inherent_impl_dispatch
 			.get(&(target, member_symbol))
 			.map(|v| v.as_slice())
@@ -1347,17 +1374,18 @@ impl<'ast> Builder<'ast, '_> {
 			.iter()
 			.copied()
 		{
-			let Some(entry) = self.tir.inherent_impls[block_idx as usize]
+			let Some(entry) = self.items.inherent_impls[usize::from(block_idx)]
 				.members
 				.get(&member_symbol)
 				.copied()
 			else {
 				continue;
 			};
-			let Some(type_args) = self
-				.tir
-				.unify_inherent_impl_target(block_idx as usize, target_type)
-			else {
+			let Some(type_args) = self.items.unify_inherent_impl_target(
+				&self.types,
+				usize::from(block_idx),
+				target_type,
+			) else {
 				continue;
 			};
 			let type_args = self.pad_type_args(entry, type_args);
@@ -1395,7 +1423,7 @@ impl<'ast> Builder<'ast, '_> {
 				diagnostic.labels.push(
 					candidate
 						.entry
-						.def_span(&self.tir)
+						.def_span(&self.items)
 						.secondary_label()
 						.with_message(format!(
 							"candidate #{} defined here",
@@ -1403,7 +1431,7 @@ impl<'ast> Builder<'ast, '_> {
 						)),
 				);
 			}
-			self.tir.diagnostics.push(diagnostic);
+			self.diagnostics.push(diagnostic);
 			return Some(MemberLookup::Ambiguous);
 		}
 
@@ -1433,11 +1461,11 @@ impl<'ast> Builder<'ast, '_> {
 		// implemented for a constructor won't provide the member being
 		// looked up, so this avoids probing every one of them just to find
 		// out it was never a candidate.
-		let from_impl = self.tir.trait_impls[impl_index as usize]
+		let from_impl = self.items.trait_impls[usize::from(impl_index)]
 			.members
 			.get(&member_symbol)
 			.cloned();
-		let from_trait_default = self.tir.traits[trait_index as usize]
+		let from_trait_default = self.items.traits[usize::from(trait_index)]
 			.entries
 			.get(&member_symbol)
 			.cloned()
@@ -1446,8 +1474,11 @@ impl<'ast> Builder<'ast, '_> {
 			return None;
 		}
 
-		let impl_type_args =
-			self.tir.unify_trait_impl_target(impl_index, target_type)?;
+		let impl_type_args = self.items.unify_trait_impl_target(
+			&self.types,
+			impl_index,
+			target_type,
+		)?;
 		// `type_args` must match whichever owner `entry` actually inherits
 		// from: the impl's own params (`impl_type_args`, already in that
 		// scheme) when the impl overrides this member itself, or just
@@ -1481,10 +1512,10 @@ impl<'ast> Builder<'ast, '_> {
 		required_trait: TraitIndex,
 		member_symbol: SymbolU32,
 	) -> Result<(ImplEntry, Box<[TypeIndex]>), TraitMemberError> {
-		match &self.tir.types[target_type.as_usize()] {
+		match self.types.resolve(target_type) {
 			Type::TypeParam { owner, param_index } => {
 				let bound = self
-					.tir
+					.items
 					.type_param_info(*owner, *param_index as usize)
 					.bounds
 					.traits
@@ -1493,7 +1524,7 @@ impl<'ast> Builder<'ast, '_> {
 				if !bound {
 					return Err(TraitMemberError::NotImplemented);
 				}
-				let entry = self.tir.traits[required_trait as usize]
+				let entry = self.items.traits[usize::from(required_trait)]
 					.entries
 					.get(&member_symbol)
 					.cloned()
@@ -1501,12 +1532,11 @@ impl<'ast> Builder<'ast, '_> {
 				Ok((entry, self.pad_type_args(entry, Box::new([target_type]))))
 			}
 			_ => {
-				let target = ImplTarget::from_type(
-					&self.tir.types[target_type.as_usize()],
-				)
-				.map_err(|_| TraitMemberError::NotImplemented)?;
+				let target =
+					ImplTarget::from_type(self.types.resolve(target_type))
+						.map_err(|_| TraitMemberError::NotImplemented)?;
 				let &(_, impl_index) = self
-					.tir
+					.items
 					.trait_impl_dispatch
 					.get(&target)
 					.and_then(|impls| {
@@ -1546,7 +1576,7 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
-				let def_id = self.tir.functions[func_index as usize].id;
+				let def_id = self.items.functions[usize::from(func_index)].id;
 				match self.sig_state.get(&def_id) {
 					Some(e) => matches!(
 						&self.ast_nodes[e.node_idx].node,
@@ -1562,16 +1592,17 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			// Unlike a method's body (resolved lazily in the separate,
-			// later `ensure_body` phase — so `tir.functions[..].body` can
+			// later `ensure_body` phase — so `tir.items.functions[..].body` can
 			// still be `None` for a default method whose body just hasn't
 			// been demanded yet), a const's `value` is resolved eagerly,
 			// atomically, within `ensure_signature` itself, strictly before
 			// its `ImplEntry::AssocConstant` entry is inserted into
 			// `trait.entries` — so by the time this entry is even
 			// reachable to look up, `value` is guaranteed already set.
-			ImplEntry::AssocConstant(const_index) => {
-				self.tir.constants[const_index as usize].value.is_some()
-			}
+			ImplEntry::AssocConstant(const_index) => self.items.constants
+				[usize::from(const_index)]
+			.value
+			.is_some(),
 			ImplEntry::AssocType(_) => false,
 		}
 	}
@@ -1601,22 +1632,22 @@ impl<'ast> Builder<'ast, '_> {
 		// Disjoint-field borrow (rather than collecting matching impl indices
 		// into a `Vec` first) avoids a heap allocation on every call — this
 		// runs once per abstract-dispatch call site, so it's on a hot path.
-		let TIR {
+		let ItemRegistry {
 			trait_impls,
 			functions,
 			constants,
 			..
-		} = &mut self.tir;
+		} = &mut self.items;
 		for trait_impl in trait_impls
 			.iter()
 			.filter(|trait_impl| trait_impl.trait_index == trait_index)
 		{
 			match trait_impl.members.get(&member_symbol).copied() {
 				Some(ImplEntry::Method(fi) | ImplEntry::AssocFunction(fi)) => {
-					functions[fi as usize].accesses.push(span);
+					functions[usize::from(fi)].accesses.push(span);
 				}
 				Some(ImplEntry::AssocConstant(ci)) => {
-					constants[ci as usize].accesses.push(span);
+					constants[usize::from(ci)].accesses.push(span);
 				}
 				Some(ImplEntry::AssocType(_)) | None => {}
 			}
@@ -1631,7 +1662,7 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
-				let total = self.tir.functions[func_index as usize]
+				let total = self.items.functions[usize::from(func_index)]
 					.total_type_param_count();
 				if parent_args.len() == total {
 					return parent_args;

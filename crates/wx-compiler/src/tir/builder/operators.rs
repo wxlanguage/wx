@@ -3,6 +3,8 @@
 //! dispatches through one — binary and unary arithmetic, bitwise, comparison,
 //! logical, assignment and compound assignment.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 /// Whether the expression tree currently being built will actually be
@@ -118,10 +120,11 @@ impl<'ast> Builder<'ast, '_> {
 			.interner
 			.get(tag)
 			.unwrap_or_else(|| panic!("stdlib missing `{tag}` symbol"));
-		let def_id = *self.tir.tagged_items.get(&symbol).unwrap_or_else(|| {
-			panic!("stdlib missing #[tag = \"{tag}\"] item")
-		});
-		(self.tir.expect_trait_index(def_id), symbol)
+		let def_id =
+			*self.items.tagged_items.get(&symbol).unwrap_or_else(|| {
+				panic!("stdlib missing #[tag = \"{tag}\"] item")
+			});
+		(self.items.expect_trait_index(def_id), symbol)
 	}
 
 	pub(super) fn resolve_operator_traits(&self) -> OperatorTraits {
@@ -158,8 +161,8 @@ impl<'ast> Builder<'ast, '_> {
 		ty: TypeIndex,
 	) -> Option<FunctionIndex> {
 		let (impl_idx, _type_args) =
-			self.tir.find_trait_impl(ty, trait_index)?;
-		match self.tir.trait_impls[impl_idx as usize]
+			self.items.find_trait_impl(&self.types, ty, trait_index)?;
+		match self.items.trait_impls[usize::from(impl_idx)]
 			.members
 			.get(&method_symbol)?
 		{
@@ -179,7 +182,7 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 	) -> FunctionIndex {
-		match self.tir.traits[trait_index as usize]
+		match self.items.traits[usize::from(trait_index)]
 			.entries
 			.get(&method_symbol)
 		{
@@ -219,8 +222,10 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 	) -> Option<FunctionIndex> {
-		let bounds =
-			&self.tir.type_param_info(owner, param_index as usize).bounds;
+		let bounds = &self
+			.items
+			.type_param_info(owner, param_index as usize)
+			.bounds;
 		let bounded = bounds.typeset.is_some()
 			|| bounds.traits.iter().any(|tb| tb.trait_index == trait_index);
 		if !bounded {
@@ -273,11 +278,11 @@ impl<'ast> Builder<'ast, '_> {
 		if let Some((trait_index, method_symbol)) =
 			traits.for_op(binary_op.inner)
 		{
-			let deferred = match self.tir.types[ty.as_usize()] {
+			let deferred = match self.types.resolve(ty) {
 				Type::TypeParam { owner, param_index } => self
 					.resolve_bounded_operator_method(
-						owner,
-						param_index,
+						*owner,
+						*param_index,
 						trait_index,
 						method_symbol,
 					),
@@ -289,11 +294,11 @@ impl<'ast> Builder<'ast, '_> {
 				_ => None,
 			};
 			if let Some(func_idx) = deferred {
-				self.tir.functions[func_idx as usize].accesses.push(
+				self.items.functions[usize::from(func_idx)].accesses.push(
 					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 				);
 				let abstract_method_id =
-					self.tir.functions[func_idx as usize].id;
+					self.items.functions[usize::from(func_idx)].id;
 				return Expression {
 					kind: ExprKind::GenericMethodCall {
 						id: abstract_method_id,
@@ -313,10 +318,10 @@ impl<'ast> Builder<'ast, '_> {
 		);
 		match method {
 			Some(func_idx) => {
-				self.tir.functions[func_idx as usize].accesses.push(
+				self.items.functions[usize::from(func_idx)].accesses.push(
 					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 				);
-				let method_id = self.tir.functions[func_idx as usize].id;
+				let method_id = self.items.functions[usize::from(func_idx)].id;
 				Expression {
 					kind: ExprKind::MethodCall {
 						arguments: Box::new([left, right]),
@@ -327,7 +332,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			None => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
 						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
@@ -439,44 +444,44 @@ impl<'ast> Builder<'ast, '_> {
 		// `GenericCompoundAssign`/`GenericCompoundStore` that would only fail
 		// later, as a raw panic once monomorphization substitutes some
 		// concrete, non-implementing type.
-		let abstract_func_idx = match self.tir.types[ty.as_usize()] {
+		let abstract_func_idx = match self.types.resolve(ty) {
 			Type::AssocTypeProjection { .. } => {
 				Some(self.operator_trait_method(trait_index, method_symbol))
 			}
 			Type::TypeParam { owner, param_index } => self
 				.resolve_bounded_operator_method(
-					owner,
-					param_index,
+					*owner,
+					*param_index,
 					trait_index,
 					method_symbol,
 				),
 			_ => None,
 		};
 		if let Some(abstract_func_idx) = abstract_func_idx {
-			self.tir.functions[abstract_func_idx as usize]
+			self.items.functions[usize::from(abstract_func_idx)]
 				.accesses
 				.push(SourceSpan::new(
 					ctx.resolve_context.file_id,
 					operator.span,
 				));
 			return Ok(CompoundOperatorDispatch::Generic {
-				abstract_method_id: self.tir.functions
-					[abstract_func_idx as usize]
-					.id,
+				abstract_method_id: self.items.functions
+					[usize::from(abstract_func_idx)]
+				.id,
 			});
 		}
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
 			Some(func_idx) => {
-				self.tir.functions[func_idx as usize].accesses.push(
+				self.items.functions[usize::from(func_idx)].accesses.push(
 					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 				);
 				Ok(CompoundOperatorDispatch::Concrete(
-					self.tir.functions[func_idx as usize].id,
+					self.items.functions[usize::from(func_idx)].id,
 				))
 			}
 			None => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
 						self.formatter(ctx.resolve_context.namespace),
 						BinaryOperatorCannotBeAppliedDiagnostic {
@@ -541,11 +546,11 @@ impl<'ast> Builder<'ast, '_> {
 		// monomorphization substitutes a concrete `Self`. An unbounded `T`
 		// falls through to the same failure path below as a concrete type
 		// with no matching impl.
-		let deferred = match self.tir.types[ty.as_usize()] {
+		let deferred = match self.types.resolve(ty) {
 			Type::TypeParam { owner, param_index } => self
 				.resolve_bounded_operator_method(
-					owner,
-					param_index,
+					*owner,
+					*param_index,
 					trait_index,
 					method_symbol,
 				),
@@ -557,10 +562,11 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		if let Some(func_idx) = deferred {
-			self.tir.functions[func_idx as usize].accesses.push(
+			self.items.functions[usize::from(func_idx)].accesses.push(
 				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 			);
-			let abstract_method_id = self.tir.functions[func_idx as usize].id;
+			let abstract_method_id =
+				self.items.functions[usize::from(func_idx)].id;
 			return Expression {
 				kind: ExprKind::GenericMethodCall {
 					id: abstract_method_id,
@@ -574,10 +580,10 @@ impl<'ast> Builder<'ast, '_> {
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
 			Some(func_idx) => {
-				self.tir.functions[func_idx as usize].accesses.push(
+				self.items.functions[usize::from(func_idx)].accesses.push(
 					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 				);
-				let method_id = self.tir.functions[func_idx as usize].id;
+				let method_id = self.items.functions[usize::from(func_idx)].id;
 				Expression {
 					kind: ExprKind::MethodCall {
 						arguments: Box::new([operand]),
@@ -588,16 +594,15 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			None => {
-				self.tir.diagnostics.push(
-					report_unary_operator_cannot_be_applied(
+				self.diagnostics
+					.push(report_unary_operator_cannot_be_applied(
 						self.formatter(ctx.resolve_context.namespace),
 						UnaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
 							operand: Spanned { inner: ty, span },
 						},
-					),
-				);
+					));
 				Expression {
 					kind: ExprKind::Unary {
 						operator,
@@ -784,7 +789,7 @@ impl<'ast> Builder<'ast, '_> {
 							operator.span,
 						));
 
-					self.tir.diagnostics.push(diagnostic);
+					self.diagnostics.push(diagnostic);
 					Ok(Expression {
 						kind: ExprKind::Unary {
 							operator,
@@ -824,11 +829,11 @@ impl<'ast> Builder<'ast, '_> {
 		if left.ty == TypeIndex::ERROR {
 			// Error already reported
 		} else if left.ty.is_comptime_number() {
-			self.tir.diagnostics.push(report_type_annotation_required(
+			self.diagnostics.push(report_type_annotation_required(
 				SourceSpan::new(ctx.resolve_context.file_id, left.span),
 			));
 		} else if left.ty != TypeIndex::BOOL {
-			self.tir.diagnostics.push(report_type_mistmatch(
+			self.diagnostics.push(report_type_mistmatch(
 				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
@@ -851,11 +856,11 @@ impl<'ast> Builder<'ast, '_> {
 		if right.ty == TypeIndex::ERROR {
 			// Error already reported
 		} else if right.ty.is_comptime_number() {
-			self.tir.diagnostics.push(report_type_annotation_required(
+			self.diagnostics.push(report_type_annotation_required(
 				SourceSpan::new(ctx.resolve_context.file_id, right.span),
 			));
 		} else if right.ty != TypeIndex::BOOL {
-			self.tir.diagnostics.push(report_type_mistmatch(
+			self.diagnostics.push(report_type_mistmatch(
 				self.formatter(ctx.resolve_context.namespace),
 				TypeMistmatchDiagnostic {
 					expected_type: TypeIndex::BOOL,
@@ -905,7 +910,7 @@ impl<'ast> Builder<'ast, '_> {
 		let mut right = self.build_expression(
 			ctx,
 			AccessContext {
-				expected_type: match &self.tir.types[left.ty.as_usize()] {
+				expected_type: match self.types.resolve(left.ty) {
 					Type::Integer
 					| Type::Float
 					| Type::Error
@@ -940,7 +945,7 @@ impl<'ast> Builder<'ast, '_> {
 					if !expected_type.is_integer()
 						&& expected_type != TypeIndex::BOOL
 					{
-						self.tir.diagnostics.push(
+						self.diagnostics.push(
 							report_binary_operator_cannot_be_applied(
 								self.formatter(ctx.resolve_context.namespace),
 								BinaryOperatorCannotBeAppliedDiagnostic {
@@ -965,7 +970,7 @@ impl<'ast> Builder<'ast, '_> {
 						span: expr.span,
 					})
 				} else {
-					self.tir.diagnostics.push(report_type_annotation_required(
+					self.diagnostics.push(report_type_annotation_required(
 						SourceSpan::new(ctx.resolve_context.file_id, expr.span),
 					));
 					Err(())
@@ -973,7 +978,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(l, right_type) if l.is_comptime_number() => {
 				if !right_type.is_integer() && right_type != TypeIndex::BOOL {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
 							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
@@ -1001,7 +1006,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(left_type, r) if r.is_comptime_number() => {
 				if !left_type.is_integer() && left_type != TypeIndex::BOOL {
-					self.tir.diagnostics.push(
+					self.diagnostics.push(
 						report_binary_operator_cannot_be_applied(
 							self.formatter(ctx.resolve_context.namespace),
 							BinaryOperatorCannotBeAppliedDiagnostic {
@@ -1032,23 +1037,21 @@ impl<'ast> Builder<'ast, '_> {
 					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
-				self.tir
-					.diagnostics
-					.push(report_binary_expression_mistmatch(
-						self.formatter(ctx.resolve_context.namespace),
-						BinaryExpressionMistmatchDiagnostic {
-							file_id: ctx.resolve_context.file_id,
-							left_type: Spanned {
-								inner: left_type,
-								span: left.span,
-							},
-							operator,
-							right_type: Spanned {
-								inner: right_type,
-								span: right.span,
-							},
+				self.diagnostics.push(report_binary_expression_mistmatch(
+					self.formatter(ctx.resolve_context.namespace),
+					BinaryExpressionMistmatchDiagnostic {
+						file_id: ctx.resolve_context.file_id,
+						left_type: Spanned {
+							inner: left_type,
+							span: left.span,
 						},
-					));
+						operator,
+						right_type: Spanned {
+							inner: right_type,
+							span: right.span,
+						},
+					},
+				));
 
 				Ok(Expression {
 					kind: ExprKind::Binary {
@@ -1113,7 +1116,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
-				self.tir.diagnostics.push(
+				self.diagnostics.push(
 					report_comparison_type_annotation_required(
 						SourceSpan::new(ctx.resolve_context.file_id, left.span),
 						SourceSpan::new(
@@ -1188,7 +1191,7 @@ impl<'ast> Builder<'ast, '_> {
 			(left_type, right_type)
 				if left_type == right_type
 					&& matches!(
-						self.tir.types[left_type.as_usize()],
+						self.types.resolve(left_type),
 						Type::Enum { .. }
 					) =>
 			{
@@ -1208,8 +1211,8 @@ impl<'ast> Builder<'ast, '_> {
 					ast::BinaryOp::Eq | ast::BinaryOp::NotEq
 				) && matches!(
 					(
-						&self.tir.types[left_type.as_usize()],
-						&self.tir.types[right_type.as_usize()],
+						self.types.resolve(left_type),
+						self.types.resolve(right_type),
 					),
 					(
 						Type::Pointer { to: lt, memory: lm, .. },
@@ -1228,23 +1231,21 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			(left_type, right_type) => {
-				self.tir
-					.diagnostics
-					.push(report_binary_expression_mistmatch(
-						self.formatter(ctx.resolve_context.namespace),
-						BinaryExpressionMistmatchDiagnostic {
-							file_id: ctx.resolve_context.file_id,
-							left_type: Spanned {
-								inner: left_type,
-								span: left.span,
-							},
-							operator,
-							right_type: Spanned {
-								inner: right_type,
-								span: right.span,
-							},
+				self.diagnostics.push(report_binary_expression_mistmatch(
+					self.formatter(ctx.resolve_context.namespace),
+					BinaryExpressionMistmatchDiagnostic {
+						file_id: ctx.resolve_context.file_id,
+						left_type: Spanned {
+							inner: left_type,
+							span: left.span,
 						},
-					));
+						operator,
+						right_type: Spanned {
+							inner: right_type,
+							span: right.span,
+						},
+					},
+				));
 
 				Ok(Expression {
 					kind: ExprKind::Binary {
@@ -1299,23 +1300,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right, local_type)?;
 				} else if !self.coercible_to(right.ty, local_type) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: local_type,
-									span: left.span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right.ty,
-									span: right.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: local_type,
+								span: left.span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right.ty,
+								span: right.span,
+							},
+						},
+					));
 				}
 
 				Ok(Expression {
@@ -1328,8 +1327,8 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			ExprKind::Global { id } => {
-				let global_index = self.tir.expect_global_index(id);
-				let global = &self.tir.globals[global_index as usize];
+				let global_index = self.items.expect_global_index(id);
+				let global = &self.items.globals[usize::from(global_index)];
 				let global_type = global.ty.inner;
 				let mut right = self.build_expression(
 					ctx,
@@ -1342,23 +1341,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right, global_type)?;
 				} else if !self.coercible_to(right.ty, global_type) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: global_type,
-									span: left.span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right.ty,
-									span: right.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: global_type,
+								span: left.span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right.ty,
+								span: right.span,
+							},
+						},
+					));
 				}
 
 				Ok(Expression {
@@ -1380,7 +1377,7 @@ impl<'ast> Builder<'ast, '_> {
 					right,
 				)?;
 				if right.ty.is_comptime_number() {
-					self.tir.diagnostics.push(report_type_annotation_required(
+					self.diagnostics.push(report_type_annotation_required(
 						SourceSpan::new(
 							ctx.resolve_context.file_id,
 							right.span,
@@ -1417,23 +1414,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right_expr.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right_expr, inner_ty)?;
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: inner_ty,
-									span: left_span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right_expr.ty,
-									span: right_expr.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: inner_ty,
+								span: left_span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right_expr.ty,
+								span: right_expr.span,
+							},
+						},
+					));
 				}
 				Ok(Expression {
 					kind: ExprKind::Store {
@@ -1449,12 +1444,9 @@ impl<'ast> Builder<'ast, '_> {
 					object.kind,
 					ExprKind::Local { .. } | ExprKind::Global { .. }
 				) {
-					self.tir.diagnostics.push(
-						report_invalid_assignment_target(SourceSpan::new(
-							ctx.resolve_context.file_id,
-							left.span,
-						)),
-					);
+					self.diagnostics.push(report_invalid_assignment_target(
+						SourceSpan::new(ctx.resolve_context.file_id, left.span),
+					));
 					return Ok(Expression {
 						kind: ExprKind::Error,
 						ty: TypeIndex::UNIT,
@@ -1474,23 +1466,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right_expr.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right_expr, field_ty)?;
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: field_ty,
-									span: left_span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right_expr.ty,
-									span: right_expr.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: field_ty,
+								span: left_span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right_expr.ty,
+								span: right_expr.span,
+							},
+						},
+					));
 				}
 				Ok(Expression {
 					kind: ExprKind::Assign {
@@ -1526,7 +1516,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			_ => {
-				self.tir.diagnostics.push(report_invalid_assignment_target(
+				self.diagnostics.push(report_invalid_assignment_target(
 					SourceSpan::new(ctx.resolve_context.file_id, left.span),
 				));
 
@@ -1601,23 +1591,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right, local_type)?;
 				} else if !self.coercible_to(right.ty, local_type) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: local_type,
-									span: left.span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right.ty,
-									span: right.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: local_type,
+								span: left.span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right.ty,
+								span: right.span,
+							},
+						},
+					));
 				}
 
 				let dispatch = self.resolve_compound_operator(
@@ -1646,9 +1634,9 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			ExprKind::Global { id } => {
-				let global_index = self.tir.expect_global_index(id);
+				let global_index = self.items.expect_global_index(id);
 				let global =
-					self.tir.globals.get(global_index as usize).unwrap();
+					self.items.globals.get(usize::from(global_index)).unwrap();
 				let global_type = global.ty.inner;
 				let mut right = self.build_expression(
 					ctx,
@@ -1661,23 +1649,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right, global_type)?;
 				} else if !self.coercible_to(right.ty, global_type) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: global_type,
-									span: left.span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right.ty,
-									span: right.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: global_type,
+								span: left.span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right.ty,
+								span: right.span,
+							},
+						},
+					));
 				}
 
 				let dispatch = self.resolve_compound_operator(
@@ -1722,23 +1708,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right_expr.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right_expr, inner_ty)?;
 				} else if !self.coercible_to(right_expr.ty, inner_ty) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: inner_ty,
-									span: left_span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right_expr.ty,
-									span: right_expr.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: inner_ty,
+								span: left_span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right_expr.ty,
+								span: right_expr.span,
+							},
+						},
+					));
 				}
 				let dispatch = self.resolve_compound_operator(
 					ctx, plain_op, inner_ty, left_span,
@@ -1770,12 +1754,9 @@ impl<'ast> Builder<'ast, '_> {
 					object.kind,
 					ExprKind::Local { .. } | ExprKind::Global { .. }
 				) {
-					self.tir.diagnostics.push(
-						report_invalid_assignment_target(SourceSpan::new(
-							ctx.resolve_context.file_id,
-							left.span,
-						)),
-					);
+					self.diagnostics.push(report_invalid_assignment_target(
+						SourceSpan::new(ctx.resolve_context.file_id, left.span),
+					));
 					return Ok(Expression {
 						kind: ExprKind::Error,
 						ty: TypeIndex::UNIT,
@@ -1795,23 +1776,21 @@ impl<'ast> Builder<'ast, '_> {
 				if right_expr.ty.is_comptime_number() {
 					self.coerce_untyped_expr(ctx, &mut right_expr, field_ty)?;
 				} else if !self.coercible_to(right_expr.ty, field_ty) {
-					self.tir.diagnostics.push(
-						report_binary_expression_mistmatch(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryExpressionMistmatchDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								left_type: Spanned {
-									inner: field_ty,
-									span: left_span,
-								},
-								operator,
-								right_type: Spanned {
-									inner: right_expr.ty,
-									span: right_expr.span,
-								},
+					self.diagnostics.push(report_binary_expression_mistmatch(
+						self.formatter(ctx.resolve_context.namespace),
+						BinaryExpressionMistmatchDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							left_type: Spanned {
+								inner: field_ty,
+								span: left_span,
 							},
-						),
-					);
+							operator,
+							right_type: Spanned {
+								inner: right_expr.ty,
+								span: right_expr.span,
+							},
+						},
+					));
 				}
 				let dispatch = self.resolve_compound_operator(
 					ctx, plain_op, field_ty, left_span,
@@ -1862,7 +1841,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			_ => {
-				self.tir.diagnostics.push(report_invalid_assignment_target(
+				self.diagnostics.push(report_invalid_assignment_target(
 					SourceSpan::new(ctx.resolve_context.file_id, left.span),
 				));
 
@@ -1905,7 +1884,7 @@ impl<'ast> Builder<'ast, '_> {
 		let mut right = self.build_expression(
 			ctx,
 			AccessContext {
-				expected_type: match &self.tir.types[left.ty.as_usize()] {
+				expected_type: match self.types.resolve(left.ty) {
 					Type::Integer
 					| Type::Float
 					| Type::Error
@@ -1921,7 +1900,7 @@ impl<'ast> Builder<'ast, '_> {
 		match (left.ty, right.ty) {
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
 				if l != r {
-					self.tir.diagnostics.push(report_type_mistmatch(
+					self.diagnostics.push(report_type_mistmatch(
 						self.formatter(ctx.resolve_context.namespace),
 						TypeMistmatchDiagnostic {
 							expected_type: l,
@@ -1965,14 +1944,14 @@ impl<'ast> Builder<'ast, '_> {
 				))
 			}
 			(l, _) if l == TypeIndex::NEVER => {
-				self.tir.diagnostics.push(report_unreachable_code(
+				self.diagnostics.push(report_unreachable_code(
 					SourceSpan::new(ctx.resolve_context.file_id, right.span),
 				));
 
 				Ok(left)
 			}
 			(_, r) if r == TypeIndex::NEVER => {
-				self.tir.diagnostics.push(report_unreachable_code(
+				self.diagnostics.push(report_unreachable_code(
 					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
 				));
 
@@ -1983,23 +1962,21 @@ impl<'ast> Builder<'ast, '_> {
 					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
-				self.tir
-					.diagnostics
-					.push(report_binary_expression_mistmatch(
-						self.formatter(ctx.resolve_context.namespace),
-						BinaryExpressionMistmatchDiagnostic {
-							file_id: ctx.resolve_context.file_id,
-							left_type: Spanned {
-								inner: left_type,
-								span: left.span,
-							},
-							operator,
-							right_type: Spanned {
-								inner: right_type,
-								span: right.span,
-							},
+				self.diagnostics.push(report_binary_expression_mistmatch(
+					self.formatter(ctx.resolve_context.namespace),
+					BinaryExpressionMistmatchDiagnostic {
+						file_id: ctx.resolve_context.file_id,
+						left_type: Spanned {
+							inner: left_type,
+							span: left.span,
 						},
-					));
+						operator,
+						right_type: Spanned {
+							inner: right_type,
+							span: right.span,
+						},
+					},
+				));
 
 				if access_ctx.expected_type != TypeIndex::INFER {
 					Ok(Expression {

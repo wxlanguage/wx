@@ -73,7 +73,7 @@ pub fn find_enclosing_function(
 	file_id: FileId,
 	cursor_offset: u32,
 ) -> Option<usize> {
-	tir.functions.iter().position(|f| {
+	tir.items.functions.iter().position(|f| {
 		f.file_id == file_id
 			&& f.body.as_ref().is_some_and(|body| {
 				let span = body.stack.scopes[0].span;
@@ -92,13 +92,15 @@ pub fn local_completion_items(
 	cursor_offset: u32,
 	prefix: &str,
 ) -> Vec<CompletionItem> {
-	let function = &tir.functions[func_index];
+	let function = &tir.items.functions[func_index];
 	// Names render as the function's own package sees them.
 	let formatter = TypeFormatter::new(
-		tir,
+		&tir.types,
+		&tir.items,
+		&tir.modules,
 		interner,
 		packages,
-		tir.namespaces[function.namespace as usize].package,
+		tir.modules.namespaces[usize::from(function.namespace)].package,
 	);
 	let body = match &function.body {
 		Some(b) => b,
@@ -108,14 +110,12 @@ pub fn local_completion_items(
 
 	let innermost_idx = body
 		.stack
-		.scopes
-		.iter()
-		.enumerate()
+		.scopes_with_indices()
 		.filter(|(_, s)| {
 			s.span.start <= cursor_offset && s.span.end > cursor_offset
 		})
 		.min_by_key(|(_, s)| s.span.end - s.span.start)
-		.map(|(i, _)| i as u32);
+		.map(|(index, _)| index);
 
 	let innermost_idx = match innermost_idx {
 		Some(i) => i,
@@ -126,9 +126,9 @@ pub fn local_completion_items(
 	let mut current = Some(innermost_idx);
 
 	while let Some(scope_idx) = current {
-		let scope = &body.stack.scopes[scope_idx as usize];
+		let scope = &body.stack.scopes[usize::from(scope_idx)];
 		let is_innermost = scope_idx == innermost_idx;
-		let is_root = scope_idx == 0;
+		let is_root = u32::from(scope_idx) == 0;
 
 		for (local_idx, local) in scope.locals.iter().enumerate() {
 			let is_param = is_root && local_idx < num_params;
@@ -181,9 +181,9 @@ fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
 	// scope is the package's root namespace, which records that file id.
 	// Checked first because a compilation holds only a handful of packages,
 	// while `module_decls` grows with every file in it.
-	for &namespace_idx in tir.package_namespaces.values() {
+	for &namespace_idx in tir.modules.package_namespaces.values() {
 		if matches!(
-			tir.namespaces[namespace_idx as usize].declaration,
+			tir.modules.namespaces[usize::from(namespace_idx)].declaration,
 			ModuleDeclarationKind::Package(package_file)
 				if package_file == file_id
 		) {
@@ -191,7 +191,8 @@ fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
 		}
 	}
 
-	tir.module_decls
+	tir.modules
+		.module_decls
 		.iter()
 		.find(|decl| decl.own_file_id == Some(file_id))
 		.map(|decl| decl.namespace_idx)
@@ -215,7 +216,7 @@ pub fn visible_namespaces(
 		if !visible.insert(idx) {
 			break;
 		}
-		let ns = &tir.namespaces[idx as usize];
+		let ns = &tir.modules.namespaces[usize::from(idx)];
 		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
 		current = ns.parent;
 	}
@@ -234,8 +235,8 @@ fn global_definition_completion_item(
 ) -> Option<CompletionItem> {
 	Some(match kind {
 		SymbolKind::Function(def_id) => {
-			let fi = tir.function_index(*def_id)? as usize;
-			let func = &tir.functions[fi];
+			let fi = usize::from(tir.items.function_index(*def_id)?);
+			let func = &tir.items.functions[fi];
 			let (insert_text, insert_text_format) = if func.params.is_empty() {
 				(format!("{}()", name), InsertTextFormat::PLAIN_TEXT)
 			} else {
@@ -402,7 +403,7 @@ fn member_completion_items(
 			}
 			match entry {
 				ImplEntry::Method(fi) => {
-					let func = tir.functions.get(*fi as usize)?;
+					let func = tir.items.functions.get(usize::from(*fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.len() <= 1 {
 						format!("{name}()")
@@ -422,7 +423,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocFunction(fi) => {
-					let func = tir.functions.get(*fi as usize)?;
+					let func = tir.items.functions.get(usize::from(*fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.is_empty() {
 						format!("{name}()")
@@ -442,7 +443,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocConstant(ci) => {
-					let constant = tir.constants.get(*ci as usize)?;
+					let constant = tir.items.constants.get(usize::from(*ci))?;
 					constant.pub_span?;
 					Some(CompletionItem {
 						label: name.to_string(),
@@ -478,12 +479,16 @@ fn impl_member_completion_items(
 		.flatten()
 		.flat_map(|r| {
 			let members = match r {
-				ImplRef::Inherent(idx) => {
-					tir.inherent_impls.get(*idx as usize).map(|b| &b.members)
-				}
-				ImplRef::Trait(idx) => {
-					tir.trait_impls.get(*idx as usize).map(|ti| &ti.members)
-				}
+				ImplRef::Inherent(idx) => tir
+					.items
+					.inherent_impls
+					.get(usize::from(*idx))
+					.map(|b| &b.members),
+				ImplRef::Trait(idx) => tir
+					.items
+					.trait_impls
+					.get(usize::from(*idx))
+					.map(|ti| &ti.members),
 			};
 			members
 				.into_iter()
@@ -573,8 +578,8 @@ fn path_completion_items(
 			.collect(),
 		SymbolKind::Enum(id) => {
 			let mut items = Vec::new();
-			if let Some(ei) = tir.enum_index(id) {
-				let enum_ = &tir.enums[ei as usize];
+			if let Some(ei) = tir.items.enum_index(id) {
+				let enum_ = &tir.items.enums[usize::from(ei)];
 				items.extend(enum_.variants.iter().filter_map(|v| {
 					let name = interner.resolve(v.name.inner)?;
 					if !name.starts_with(prefix) {
@@ -587,7 +592,7 @@ fn path_completion_items(
 					})
 				}));
 			}
-			if let Some(idx) = tir.enum_index(id) {
+			if let Some(idx) = tir.items.enum_index(id) {
 				items.extend(impl_member_completion_items(
 					tir,
 					interner,
@@ -599,7 +604,7 @@ fn path_completion_items(
 			items
 		}
 		SymbolKind::Struct(id) => {
-			tir.struct_index(id).map_or_else(Vec::new, |idx| {
+			tir.items.struct_index(id).map_or_else(Vec::new, |idx| {
 				impl_member_completion_items(
 					tir,
 					interner,
@@ -610,11 +615,11 @@ fn path_completion_items(
 			})
 		}
 		SymbolKind::Trait(id) => {
-			tir.trait_index(id).map_or_else(Vec::new, |idx| {
+			tir.items.trait_index(id).map_or_else(Vec::new, |idx| {
 				member_completion_items(
 					tir,
 					interner,
-					&tir.traits[idx as usize].entries,
+					&tir.items.traits[usize::from(idx)].entries,
 					prefix,
 				)
 			})
@@ -640,7 +645,7 @@ pub fn completion_items(
 	let cursor_offset = offset as u32;
 	let func_index = find_enclosing_function(tir, file_id, cursor_offset);
 	let current_namespace = match func_index {
-		Some(fi) => Some(tir.functions[fi].namespace),
+		Some(fi) => Some(tir.items.functions[fi].namespace),
 		None => file_namespace(tir, file_id),
 	};
 	// No namespace means the file isn't part of the compilation, so nothing

@@ -1607,7 +1607,7 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 
 #[test]
 fn type_alias_used_as_return_type_resolves_to_its_definition() {
-	// Regression test: `build_symbol_index` never visited `tir.type_aliases`
+	// Regression test: `build_symbol_index` never visited `tir.items.type_aliases`
 	// at all, and `SymbolKind` had no `TypeAlias` variant — so a `type Id =
 	// u32;` alias had no definition/reference entries whatsoever. Every
 	// LSP feature keyed off `SymbolKind` (go-to-definition, hover, semantic
@@ -2297,8 +2297,10 @@ fn memory_associated_const_namespace_access_resolves() {
 	let SymbolKind::Const(const_id) = found.kind else {
 		unreachable!("checked above");
 	};
-	let const_index = compiled.tir.const_index(const_id).unwrap();
-	let const_name = compiled.tir.constants[const_index as usize].name.inner;
+	let const_index = compiled.tir.items.const_index(const_id).unwrap();
+	let const_name = compiled.tir.items.constants[usize::from(const_index)]
+		.name
+		.inner;
 	assert_eq!(
 		compiled.graph.interner.resolve(const_name),
 		Some("DATA_END"),
@@ -2306,7 +2308,9 @@ fn memory_associated_const_namespace_access_resolves() {
 	);
 	assert_eq!(
 		definition.source.span,
-		compiled.tir.constants[const_index as usize].name.span,
+		compiled.tir.items.constants[usize::from(const_index)]
+			.name
+			.span,
 		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
 }
