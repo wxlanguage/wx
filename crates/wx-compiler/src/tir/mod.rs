@@ -2380,11 +2380,10 @@ impl<'a> TypeFormatter<'a> {
 				// trait declares an assoc type with this name), in which
 				// case spell out which one via `<base as Trait>::assoc_name`
 				// instead, matching rustc's own qualified-path printing.
-				if self.items.assoc_type_bound_is_ambiguous(
-					&self.types,
-					base,
-					assoc_name,
-				) {
+				if self
+					.items
+					.assoc_type_bound_is_ambiguous(self.types, base, assoc_name)
+				{
 					f.write_str("<")?;
 					self.write_type(f, base)?;
 					f.write_str(" as ")?;
