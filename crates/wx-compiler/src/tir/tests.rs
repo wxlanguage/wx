@@ -5654,19 +5654,11 @@ fn test_trait_impl_method_self_type_projection_matching_no_error() {
 #[test]
 fn test_nested_assoc_type_projection_mismatch_is_detected() {
 	// `Self::Mid::Out` — the outer projection's base (`Self::Mid`) is itself
-	// an `AssocTypeProjection`, not a bare `TypeParam`. `X`'s `Mid = M`, and
-	// `M`'s own `Out = i32`, so `Self::Mid::Out` normalizes to `i32` —
-	// making the impl's `bool` return type a genuine signature mismatch.
-	//
-	// Previously missed: projection resolution only peeled a bare
-	// `TypeParam` head, so a nested projection base like `Self::Mid` was
-	// left unresolved and `find_trait_impl` rejected it outright,
-	// degrading the whole comparison to `Indeterminate` — silently, no
-	// diagnostic. Fixed by `resolve_and_compare`/`apply_pending`, which
-	// resolve a projection head recursively via a `Pending` chain — each
-	// queued step is built locally and passed straight into a nested
-	// recursive call, never returned, so it never needs to outlive the
-	// call that built it (no closures, no dynamic dispatch needed).
+	// a projection, not a bare `TypeParam`. `X`'s `Mid = M` and `M`'s
+	// `Out = i32`, so `Self::Mid::Out` normalizes to `i32`, making the
+	// impl's `bool` return type a genuine signature mismatch. `resolve_head`
+	// has to resolve the nested base recursively before the outer step, so
+	// the comparison must not degrade to a silent `Indeterminate`.
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
 
@@ -5700,7 +5692,7 @@ fn test_nested_assoc_type_projection_mismatch_is_detected() {
 fn test_nested_assoc_type_projection_match_is_accepted() {
 	// Same shape as the mismatch case above, but the impl's return type
 	// genuinely does normalize to what the trait requires — the companion
-	// case `resolve_and_compare` must accept, not just correctly reject.
+	// case the comparator must *accept*, not just correctly reject.
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
 
@@ -5723,24 +5715,11 @@ fn test_nested_assoc_type_projection_match_is_accepted() {
 
 #[test]
 fn test_impl_side_projection_normalizes_against_concrete_trait_return_type() {
-	// The trait's return type is already concrete (`i32`); the impl
-	// expresses the same value through its own method-generic's declared
-	// equality binding (`V::Out` where `V: Inner where { Out = i32 }`).
-	// These are semantically identical.
-	//
-	// Previously a false positive: `compare_resolved` only ever gave
-	// `expected` a chance to reduce (via `resolve_and_compare`) before
-	// falling to structural comparison — `found` was carried through
-	// unexamined, so an already-concrete `expected` (`i32`) against a
-	// still-abstract `found` (`V::Out`) fell straight to a shape mismatch.
-	// Fixed by `reduce_found`, called as a fallback right where
-	// `compare_resolved` was about to give up: unlike `expected`, `found`
-	// (the impl's own written signature) can only ever reduce through a
-	// declared equality binding on its own generic's bounds — never
-	// `find_trait_impl`, never a new `Frame` — since Phase 2 signature
-	// building already flattens anything `find_trait_impl`-reachable, and
-	// an impl's own generics never get bound to a concrete receiver during
-	// signature comparison at all.
+	// The trait returns a concrete `i32`; the impl expresses the same value
+	// through its own method generic's binding (`V::Out` where
+	// `V: Inner where { Out = i32 }`). Both sides run through `resolve_head`
+	// symmetrically, so `found`'s `V::Out` normalizes to `i32` too — no
+	// mismatch.
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
         trait T {
@@ -5755,37 +5734,16 @@ fn test_impl_side_projection_normalizes_against_concrete_trait_return_type() {
 }
 
 #[test]
-#[ignore = "fast-path unsoundness: same raw TypeIndex can mean different things under different frames when a projection dispatches to the same impl twice with non-identity args — see comment above"]
 fn test_recursive_same_impl_nonidentity_binding_is_detected() {
-	// `Self::Next::Value` dispatches to `impl<T> C for Wrap<T>` *twice*
-	// while resolving: once for `Self::Next` (unifying `Wrap<T_pattern>`
-	// against the original `Wrap<T>` — an *identity* binding, `T` bound to
-	// itself), and once more for the outer `::Value` (unifying
-	// `Wrap<T_pattern>` against `Next`'s hardcoded `Wrap<i32>` — a
-	// *non-identity* binding, `T` bound to `i32`). Both resolutions bottom
-	// out on the exact same raw `TypeIndex` — the tuple `(T,)`, since it's
-	// the literal type written for `Value` in the impl — but under two
-	// different frames: one where `T` means `i32` (from the second,
-	// non-identity dispatch), and one — `found`, the impl's own written
-	// `fn f(self) -> (T,)`, always on `Frame::Root` — where `T` means
-	// whatever the caller instantiates it as.
-	//
-	// `compare_resolved`'s fast path (`expected.index == found.index`)
-	// only compares raw indexes, so it declares these equivalent without
-	// ever consulting either frame. But they aren't: the trait requires
-	// `Self::Next::Value` to be `(i32,)` specifically (`Next` is
-	// hardcoded), while the impl provides `(T,)` for whatever `T` the
-	// caller chose — correct only when `T = i32`, not in general. This
-	// impl does not actually satisfy the trait.
-	//
-	// Confirmed empirically: this exact source currently produces zero
-	// diagnostics.
-	//
-	// The safety argument in `compare_types`'s fast-path comment only
-	// covers `find_trait_impl` unifying an impl's pattern against *its own
-	// original target* (always identity). It doesn't cover a *later*
-	// projection step in the same chain dispatching to the same impl
-	// again against an already-transformed, non-original receiver.
+	// `Self::Next::Value` normalizes through `impl<T> C for Wrap<T>` twice:
+	// once for `Self::Next` (identity binding, `T` -> `T`), then once more
+	// for the outer `::Value` against `Next`'s hardcoded `Wrap<i32>` (a
+	// *non-identity* binding, `T` -> `i32`). Both land on the same interned
+	// `(T,)`, but the trait side's is under an env where `T` means `i32`
+	// while the impl's own `fn f(self) -> (T,)` is under the root env where
+	// `T` is the impl's free parameter. `compare`'s fast path must reject
+	// them as equal — index match, env mismatch — and let structural
+	// comparison find that `(i32,)` != `(T,)`.
 	let case = TestCase::new(indoc! {"
         trait C {
             type Next: C;
@@ -5819,24 +5777,13 @@ fn test_recursive_same_impl_nonidentity_binding_is_detected() {
 }
 
 #[test]
-#[ignore = "an intermediate TypeIndex::ERROR produced mid-resolution (e.g. by an undeclared assoc-type value) isn't re-checked before compare_structural, cascading a spurious signature-mismatch diagnostic on top of the real one — see comment above"]
 fn test_error_in_intermediate_resolution_does_not_cascade() {
-	// `Out`'s declared value (`MissingType`) is undeclared, so resolving
-	// it already produces `TypeIndex::ERROR` and an "undeclared type"
-	// diagnostic during Phase 2. `compare_types`'s `Error`/`Infer` check
-	// only examines the *original* `expected`/`found` operands passed to
-	// it — but `resolve_and_compare`/`apply_pending` recurse into
-	// *themselves* (never back into `compare_types`) after every
-	// resolution step, including the one that produces this `ERROR`, so
-	// it's never re-checked before reaching `compare_structural`, which
-	// reports a second, spurious signature-mismatch diagnostic on top of
-	// the "undeclared type" one that already explains the real problem.
-	//
-	// Confirmed empirically: this exact source currently produces both
-	// `E1021` (undeclared type, correct) *and* `E1080` (signature
-	// mismatch, spurious noise — the compiler shouldn't pile a confusing
-	// second diagnostic about `f`'s signature on top of the actual root
-	// cause).
+	// `Out`'s declared value (`MissingType`) is undeclared, so it is
+	// `TypeIndex::ERROR` from Phase 2, with an `E1021` already reported.
+	// When `resolve_head` hits that `ERROR` partway through normalizing the
+	// trait's `Self::Out`, the comparison must yield `Indeterminate` — not
+	// fall through to `compare_structural` and stack a spurious `E1080`
+	// signature mismatch on top of the error that already explains it.
 	let case = TestCase::new(indoc! {"
         trait T {
             type Out;
@@ -5862,24 +5809,13 @@ fn test_error_in_intermediate_resolution_does_not_cascade() {
 }
 
 #[test]
-#[ignore = "compare_resolved dispatches on expected's shape first — a bare TypeParam goes straight to compare_unresolved_type_param, which never gives found a chance to reduce via reduce_found — see comment above"]
 fn test_expected_typeparam_reduces_against_found_projection() {
-	// The trait's return type is the bare method generic `A`. The impl's
-	// return type is `D::Out`, which reduces to `C` via `D`'s own declared
-	// equality binding — and `C` is alpha-equivalent to `A` (same relative
-	// position among each function's own generics). These should compare
-	// equal.
-	//
-	// `compare_resolved` dispatches on `expected`'s shape before `found`
-	// ever gets a chance to reduce: since `expected` (`A`) is a bare
-	// `TypeParam`, it goes straight to `compare_unresolved_type_param`,
-	// which requires `found` to *already* be a bare `TypeParam` too — but
-	// `found` (`D::Out`) is still a projection at that point, so it's an
-	// automatic mismatch. `reduce_found` is only ever reached from the
-	// *other* branch of that same match, so it never runs here at all.
-	//
-	// Confirmed empirically: this exact source currently reports `E1080`
-	// against `f`.
+	// The trait returns the bare method generic `A`; the impl returns
+	// `D::Out`, which normalizes to `C` via `D`'s own `where { Out = C }`
+	// binding, and `C` is alpha-equivalent to `A` (same position among each
+	// function's own generics). Both sides go through `resolve_head`
+	// symmetrically, so `found`'s projection is normalized before the
+	// positional check — no mismatch.
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
         trait T {
@@ -5896,28 +5832,14 @@ fn test_expected_typeparam_reduces_against_found_projection() {
 }
 
 #[test]
-#[ignore = "reduce_found only tries an equality binding on a projection's raw base — it never resolves a *nested* projection base first, so it can't reach find_trait_impl once an equality binding makes that base concrete — see comment above"]
 fn test_found_side_nested_projection_normalizes_via_find_trait_impl() {
-	// `B::Mid::Out` — `B`'s own declared binding (`where { Mid = M }`)
-	// makes `B::Mid` concrete (`M`), and `M::Out` is `i32` via `impl Inner
-	// for M`. So `B::Mid::Out` should normalize to `i32`, matching the
-	// trait's declared return type exactly.
-	//
-	// `reduce_found`'s doc comment claims an impl's own signature "never
-	// needs `find_trait_impl`, never a new `Frame`" — true when a
-	// projection's base is *directly* a bound generic, but not once a
-	// *nested* base only becomes concrete via that binding: `reduce_found`
-	// only ever calls `resolve_projection_via_bound` on the outer
-	// projection's raw, unreduced base (`B::Mid`, itself still a
-	// projection) — `abstract_type_bounds` on `B::Mid` reports `Mid`'s own
-	// declared trait bound (`Inner`), not an equality value, so the lookup
-	// fails and `reduce_found` gives up without ever trying to reduce
-	// `B::Mid` itself first. Phase 2 couldn't have flattened this either,
-	// since the binding making `B::Mid` concrete is a fact local to this
-	// one method's own signature, not a global one.
-	//
-	// Confirmed empirically: this exact source currently reports `E1080`
-	// against `f`.
+	// The impl returns `B::Mid::Out`. `B::Mid` becomes `M` via `B`'s own
+	// `where { Mid = M }` binding, then `M::Out` is `i32` via `impl Inner
+	// for M`. That second step needs `find_trait_impl` on a base that only
+	// became concrete through a binding local to this signature, so the
+	// impl side of the comparison has to run the full `resolve_head` /
+	// `project` path, not just a bound lookup. It normalizes to `i32`,
+	// matching the trait's declared return type.
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
         trait Outer { type Mid: Inner; }
@@ -5935,6 +5857,40 @@ fn test_found_side_nested_projection_normalizes_via_find_trait_impl() {
         }
     "});
 	no_errors(&case);
+}
+
+/// A self-referential associated-type value (`type Value = Self::Value`) in a
+/// generic trait impl whose method returns `Self::Value`. The comparator's
+/// `resolve_head` pushes a `TypeEnv::Impl` per `find_trait_impl` step, so a
+/// real projection cycle here would grow the arena without bound.
+///
+/// It can't: `type Value = Self::Value` fails to resolve during Phase 2
+/// (`E1021`), so its stored value is `TypeIndex::ERROR`, and `resolve_head`
+/// bails to `Indeterminate` before it can loop. This locks in "terminates,
+/// and doesn't stack a `TraitImplSignatureMismatch` on top of the `E1021`."
+#[test]
+fn test_self_referential_assoc_type_value_does_not_hang_or_cascade() {
+	let case = TestCase::new(indoc! {"
+        trait C {
+            type Value;
+            fn f(self) -> Self::Value;
+        }
+        struct Wrap<T> {}
+        impl<T> C for Wrap<T> {
+            type Value = Self::Value;
+            fn f(self) -> i32 { unreachable }
+        }
+    "});
+	assert!(
+		!has_error_code(&case.tir, DiagnosticCode::TraitImplSignatureMismatch),
+		"the unresolvable self-referential assoc-type value should surface \
+		 as its own error, not cascade into a signature mismatch, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
 }
 
 /// Satisfying a trait requirement is itself the "use" — the same exemption a
