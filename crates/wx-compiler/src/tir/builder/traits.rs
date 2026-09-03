@@ -3,6 +3,8 @@
 //! associated consts and associated types — plus the conformance check that
 //! verifies each impl provides everything its trait requires.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

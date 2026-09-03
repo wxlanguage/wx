@@ -1,6 +1,8 @@
 //! Aggregate expressions: struct initialisation, tuples, array literals and
 //! repeats, and the indexing and slice-range expressions that read out of them.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

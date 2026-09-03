@@ -1413,6 +1413,25 @@ pub enum SymbolKind {
 	},
 }
 
+impl SymbolKind {
+	/// What kind of symbol this is, for diagnostics.
+	pub fn noun(self) -> &'static str {
+		match self {
+			SymbolKind::Enum { .. } => "enum",
+			SymbolKind::Struct { .. } => "struct",
+			SymbolKind::Module { .. } => "module",
+			SymbolKind::Memory { .. } => "memory",
+			SymbolKind::Trait { .. } => "trait",
+			SymbolKind::TypeSet { .. } => "type set",
+			SymbolKind::Global { .. } => "global",
+			SymbolKind::Function { .. } => "function",
+			SymbolKind::Const { .. } => "constant",
+			SymbolKind::TraitAssocType { .. } => "associated type",
+			SymbolKind::TypeAlias { .. } => "type alias",
+		}
+	}
+}
+
 /// Whether a resolved [`SymbolEntry`] is reachable from outside its own
 /// namespace. Kinds that aren't subject to `pub`/private at all — memories,
 /// import-block members, and a `Module` reached via `crate`/a dependency
@@ -1464,6 +1483,15 @@ pub enum SymbolEntry {
 }
 
 impl SymbolEntry {
+	/// What kind of symbol this entry contains, for diagnostics. Pending
+	/// entries stay vague because their signatures have not been computed.
+	pub fn noun(self) -> &'static str {
+		match self {
+			SymbolEntry::Pending(_) => "item",
+			SymbolEntry::Resolved { kind, .. } => kind.noun(),
+		}
+	}
+
 	/// The `SymbolKind` this entry names, or `None` while still pending —
 	/// for a lookup that only cares "what does this name mean" and doesn't
 	/// need to force resolution or read visibility.
@@ -1814,16 +1842,6 @@ pub enum ItemAttribute {
 	FixedOrder,
 }
 
-#[derive(PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum FunctionKind {
-	Free,
-	Impl,
-	Trait,
-	TraitImpl { trait_impl_index: TraitImplIndex },
-}
-
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1927,104 +1945,6 @@ pub struct Function {
 pub struct FunctionBody {
 	pub stack: StackFrame,
 	pub block: Box<Expression>,
-}
-
-use crate::diagnostics::define_diagnostic_codes;
-
-define_diagnostic_codes! {
-	pub enum DiagnosticCode {
-		DuplicateDefinition => "E1000",
-		TypeMistmatch => "E1001",
-		TypeAnnotationRequired => "E1002",
-		UnusedValue => "E1003",
-		IntegerLiteralOutOfRange => "E1004",
-		UnableToCoerce => "E1005",
-		LiteralTypeMismatch => "E1006",
-		UndeclaredIdentifier => "E1007",
-		BinaryOperatorCannotBeApplied => "E1008",
-		CannotCallExpression => "E1009",
-		UnaryOperatorCannotBeApplied => "E1010",
-		UndeclaredLabel => "E1011",
-		BreakOutsideOfLoop => "E1012",
-		InvalidAssignmentTarget => "E1013",
-		ComparisonTypeAnnotationRequired => "E1014",
-		NonConstantGlobalInitializer => "E1015",
-		ArgumentCountMismatch => "E1016",
-		InvalidLiteral => "E1017",
-		DuplicateExport => "E1018",
-		CannotExportItem => "E1019",
-		NotANamespace => "E1020",
-		UndeclaredType => "E1021",
-		DuplicateStructField => "E1022",
-		UnknownStructField => "E1025",
-		DuplicateStructFieldInit => "E1026",
-		MissingStructFields => "E1027",
-		CannotMutateImmutable => "W1000",
-		UnusedVariable => "W1001",
-		UnnecessaryMutability => "W1002",
-		UnreachableCode => "W1003",
-		UnusedItem => "W1004",
-		MissingImportParamName => "W1005",
-		UnusedTypeParam => "W1006",
-		UnusedStructField => "W1007",
-		UnusedLabel => "W1008",
-		MissingFunctionBody => "E1028",
-		InvalidMemoryKind => "E1029",
-		NamespaceUsedAsValue => "E1030",
-		ExpectedBound => "E1031",
-		CyclicTypeDependency => "E1032",
-		IncompleteTraitImpl => "E1033",
-		UnsatisfiedTraitBound => "E1034",
-		AssociatedTypeInInherentImpl => "E1035",
-		MissingEnumRepr => "E1036",
-		CannotDerefNonPointer => "E1037",
-		NoMemoryForPointer => "E1038",
-		AmbiguousPointerMemory => "E1039",
-		TypeArgCountMismatch => "E1040",
-		InvalidCast => "E1041",
-		IndexOnNonIndexable => "E1042",
-		ArraySizeMismatch => "E1043",
-		ArrayRepeatCountNotConst => "E1044",
-		ArrayElementNotConst => "E1045",
-		TypesetMemberNotInteger => "E1046",
-		TypesetBoundViolation => "E1047",
-		MultipleTypesetBounds => "E1048",
-		MethodNotFound => "E1049",
-		NotAMethod => "E1050",
-		InferInSignature => "E1051",
-		MissingElseBlock => "E1052",
-		InvalidSelfType => "E1053",
-		ContinueOutsideOfLoop => "E1054",
-		EnumReprNotInteger => "E1055",
-		EnumDuplicateValue => "E1056",
-		NotConstEvaluatable => "E1057",
-		UnusedEnumVariant => "W1009",
-		MissingImportAlias => "E1058",
-		AmbiguousTraitMember => "E1059",
-		NotAField => "E1060",
-		DuplicateTraitImpl => "E1061",
-		InvalidImplTarget => "E1062",
-		TraitBoundViolation => "E1063",
-		DuplicateAssocTypeBinding => "E1064",
-		PrivateItem => "E1065",
-		NonExhaustiveMatch => "E1066",
-		InvalidMatchScrutineeType => "E1067",
-		InvalidPattern => "E1068",
-		InvalidMemoryLimitsAttribute => "E1069",
-		UnreachableMatchArm => "W1010",
-		MissingTypeAliasBody => "E1070",
-		EnumVariantRequiresExplicitValue => "E1071",
-		DuplicateExportBlock => "E1072",
-		ExportBlockNotAtRoot => "E1073",
-		LibraryCannotExport => "E1074",
-		AmbiguousWildcardImport => "E1075",
-		PrivateStructField => "E1076",
-		ForeignImplTarget => "E1077",
-		NotATraitMember => "E1078",
-		TraitImplItemKindMismatch => "E1079",
-		TraitImplSignatureMismatch => "E1080",
-		TraitImplConstTypeMismatch => "E1081",
-	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]

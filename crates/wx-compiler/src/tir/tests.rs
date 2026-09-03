@@ -4,6 +4,7 @@ use codespan_reporting::diagnostic::Severity;
 use indoc::indoc;
 
 use super::*;
+use crate::diagnostics::DiagnosticCode;
 use crate::tir::builder::{
 	CharLiteralError, parse_char_literal, unescape_string,
 };
@@ -14173,7 +14174,7 @@ fn test_match_invalid_pattern_shape_is_error() {
         export { f }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::InvalidPattern),
+		has_error_code(&case.tir, DiagnosticCode::InvalidMatchPattern),
 		"expected E1068 (InvalidPattern) for a non-constant pattern, got: {:?}",
 		case.tir
 			.diagnostics

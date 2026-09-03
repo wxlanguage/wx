@@ -3,6 +3,8 @@
 //! dispatches through one — binary and unary arithmetic, bitwise, comparison,
 //! logical, assignment and compound assignment.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 /// Whether the expression tree currently being built will actually be

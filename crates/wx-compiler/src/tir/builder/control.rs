@@ -2,6 +2,8 @@
 //! `break`/`continue`/`return`, and `match` together with the pattern
 //! machinery (`local` destructuring included) and its exhaustiveness check.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -1299,7 +1301,7 @@ fn report_invalid_match_scrutinee_type(
 
 fn report_invalid_pattern(span: SourceSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidPattern.code())
+		.with_code(DiagnosticCode::InvalidMatchPattern.code())
 		.with_message("invalid pattern")
 		.with_label(span.primary_label())
 		.with_note(

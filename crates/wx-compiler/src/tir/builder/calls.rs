@@ -2,6 +2,8 @@
 //! and `Type::method()` resolution against inherent and trait impls, and the
 //! abstract-method path that defers dispatch to monomorphisation.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

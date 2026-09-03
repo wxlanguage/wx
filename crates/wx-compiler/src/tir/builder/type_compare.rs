@@ -32,6 +32,8 @@
 //! relative position against the *other* function's own generics (off
 //! `Function::inherited_type_param_count`).
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 /// A type as interpreted "here" — a raw `index`, plus the `TypeEnvId` of the

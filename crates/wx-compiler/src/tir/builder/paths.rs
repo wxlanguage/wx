@@ -2,6 +2,8 @@
 //! (`<T as Trait>::x`) and grouped paths, field/method access on a value, and
 //! turning an already-resolved symbol or namespace member into an expression.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

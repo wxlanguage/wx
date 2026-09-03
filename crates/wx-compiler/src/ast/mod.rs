@@ -1,7 +1,10 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
-use crate::vfs::{self, FileId};
+use crate::{
+	diagnostics::DiagnosticCode,
+	vfs::{self, FileId},
+};
 
 #[cfg(test)]
 mod tests;
@@ -184,29 +187,6 @@ impl std::fmt::Display for Token {
 	}
 }
 
-use crate::diagnostics::define_diagnostic_codes;
-
-define_diagnostic_codes! {
-	pub enum DiagnosticCode {
-		UnknownToken => "E0001",
-		UnexpectedToken => "E0002",
-		MissingSeparator => "E0003",
-		UnclosedDelimiter => "E0004",
-		InvalidLiteral => "E0005",
-		IncompleteExpression => "E0006",
-		ChainedComparison => "E0007",
-		ReservedIdentifier => "E0008",
-		InvalidItem => "E0009",
-		MissingInitializer => "E0010",
-		InvalidAttribute => "E0012",
-		InvalidNamespace => "E0013",
-		InvalidLabel => "E0014",
-		InvalidPattern => "E0015",
-		CrlfLineEndings => "W0001",
-		VisibilityNotPermitted => "W0002",
-	}
-}
-
 fn report_unexpected_token(
 	file_id: FileId,
 	received: Spanned<Token>,
@@ -269,7 +249,7 @@ fn report_invalid_integer_literal(
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidLiteral.code())
+		.with_code(DiagnosticCode::InvalidNumericLiteral.code())
 		.with_message("invalid integer literal")
 		.with_label(Label::primary(file_id, span))
 }
@@ -279,7 +259,7 @@ fn report_invalid_float_literal(
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidLiteral.code())
+		.with_code(DiagnosticCode::InvalidNumericLiteral.code())
 		.with_message("invalid float literal")
 		.with_label(Label::primary(file_id, span))
 }
@@ -4746,7 +4726,7 @@ impl<'ctx> Parser<'ctx> {
 					);
 					parser.ast.diagnostics.push(
 						Diagnostic::error()
-							.with_code(DiagnosticCode::InvalidPattern.code())
+							.with_code(DiagnosticCode::InvalidBindingPattern.code())
 							.with_message("invalid pattern")
 							.with_note(
 								"a path may only appear in a pattern as a struct pattern, `Path::{ ... }`",

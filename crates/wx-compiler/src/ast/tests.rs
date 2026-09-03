@@ -1440,7 +1440,7 @@ fn test_invalid_integer_literal() {
     "});
 
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::InvalidLiteral]);
+		.assert_codes(&[DiagnosticCode::InvalidNumericLiteral]);
 	assert!(matches!(
 		statement_expression(case.function_block(0), 0),
 		Expression::Int { value: 0 }
@@ -1459,7 +1459,7 @@ fn test_invalid_float_literal_empty_exponent() {
     "});
 
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::InvalidLiteral]);
+		.assert_codes(&[DiagnosticCode::InvalidNumericLiteral]);
 	assert!(matches!(
 		statement_expression(case.function_block(0), 0),
 		Expression::Float { value } if *value == 0.0
@@ -2383,7 +2383,7 @@ fn test_path_in_pattern_position_reports() {
 	// A path is only a pattern as a struct pattern, `Path::{ .. }`.
 	let case = TestCase::new("fn f() { local Foo::Bar = 1; }");
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::InvalidPattern]);
+		.assert_codes(&[DiagnosticCode::InvalidBindingPattern]);
 }
 
 #[test]

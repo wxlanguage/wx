@@ -2,6 +2,8 @@
 //! coercion, resolving a written type expression (including paths, qualified
 //! and grouped forms) to a `TypeIndex`, and the direct-recursion check.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

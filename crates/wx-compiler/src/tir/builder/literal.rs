@@ -3,6 +3,8 @@
 //! constant folding that `const` items, enum discriminants and array sizes are
 //! resolved through.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -892,7 +894,7 @@ pub(super) fn report_empty_char_literal(
 	span: SourceSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidLiteral.code())
+		.with_code(DiagnosticCode::InvalidCharacterLiteral.code())
 		.with_message("empty character literal")
 		.with_label(span.primary_label())
 }
@@ -901,7 +903,7 @@ pub(super) fn report_char_literal_too_long(
 	span: SourceSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidLiteral.code())
+		.with_code(DiagnosticCode::InvalidCharacterLiteral.code())
 		.with_message("character literal may only contain one codepoint")
 		.with_label(span.primary_label())
 		.with_note(

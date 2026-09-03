@@ -3,6 +3,8 @@
 //! aliases, enums, functions, typesets, globals, consts, `import` declarations
 //! and the `export { .. }` block.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

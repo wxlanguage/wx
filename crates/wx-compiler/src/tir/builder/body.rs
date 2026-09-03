@@ -2,6 +2,8 @@
 //! statement machinery it is built from, `local` definitions, and the
 //! expression dispatcher that routes each expression kind to its own module.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {

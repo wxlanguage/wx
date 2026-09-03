@@ -7,6 +7,7 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
+use crate::diagnostics::DiagnosticCode;
 
 mod manifest;
 pub use manifest::{
@@ -19,24 +20,6 @@ pub use resolve::{open_manifest, package_kind};
 
 mod path;
 pub use path::{AbsolutePath, RelativePath};
-
-// Diagnostic codes for this stage (resolving `mod foo;` declarations to
-// files and wiring up the package graph — closer to a linker than a parser or
-// type checker). Follows the same per-stage numbering convention as
-// `ast::DiagnosticCode` (E0xxx) and `tir::DiagnosticCode` (E1xxx).
-use crate::diagnostics::define_diagnostic_codes;
-
-define_diagnostic_codes! {
-	pub enum DiagnosticCode {
-		ModuleFileNotFound => "E2000",
-		AmbiguousModuleFile => "E2001",
-		DuplicatePackageName => "E2002",
-		CircularDependency => "E2003",
-		StdPackageAsDependency => "E2004",
-		PackageDeclaredTwice => "E2005",
-		NestedModuleDeclaration => "E2006",
-	}
-}
 
 #[cfg(test)]
 mod tests;

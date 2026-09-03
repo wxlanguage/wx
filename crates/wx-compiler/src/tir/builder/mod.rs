@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
+use crate::diagnostics::DiagnosticCode;
 use crate::vfs::{Files, PackageGraph, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 

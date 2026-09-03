@@ -30,15 +30,15 @@ impl Float for f32 {
     sinf(self)
   }
 
-  fn cos(b: f32) -> Self {
-    cosf(b)
+  fn cos(self) -> Self {
+    cosf(self)
   }
 
   /// Archimedes' constant (π)
   const PI: f32 = 3.14159265358979323846264338327950288;
 
   /// π/2
-  const FRAC_PI_2: u32 = 1;
+  const FRAC_PI_2: Self = 1.0;
 }
 
 impl Float for f64 {

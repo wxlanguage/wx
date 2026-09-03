@@ -1782,7 +1782,7 @@ fn add_compiler_diagnostic(
 
 	let tags = diagnostic.code.as_ref().and_then(|code| {
 		use std::str::FromStr;
-		use wx_compiler::tir::DiagnosticCode;
+		use wx_compiler::diagnostics::DiagnosticCode;
 		DiagnosticCode::from_str(code)
 			.ok()
 			.and_then(|code| match code {

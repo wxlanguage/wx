@@ -2,6 +2,8 @@
 //! names in it, Rust-style default visibility, and `use` trees — prefix walking,
 //! wildcard imports and the ambiguity they can create.
 
+use crate::diagnostics::DiagnosticCode;
+
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
@@ -708,7 +710,7 @@ impl<'ast> Builder<'ast, '_> {
 				span.secondary_label().with_message(format!(
 					"`{name}` could {}refer to the {} imported here",
 					if index == 0 { "" } else { "also " },
-					symbol_entry_noun(*entry),
+					entry.noun(),
 				)),
 			);
 		}
@@ -1540,33 +1542,6 @@ pub(super) enum PendingClaim {
 	/// The scope already had a binding; a duplicate-definition diagnostic
 	/// was pushed against it and nothing was installed for this item.
 	Duplicate,
-}
-
-/// What to call a `SymbolKind` in prose.
-fn symbol_kind_noun(kind: SymbolKind) -> &'static str {
-	match kind {
-		SymbolKind::Enum { .. } => "enum",
-		SymbolKind::Struct { .. } => "struct",
-		SymbolKind::Module { .. } => "module",
-		SymbolKind::Memory { .. } => "memory",
-		SymbolKind::Trait { .. } => "trait",
-		SymbolKind::TypeSet { .. } => "type set",
-		SymbolKind::Global { .. } => "global",
-		SymbolKind::Function { .. } => "function",
-		SymbolKind::Const { .. } => "constant",
-		SymbolKind::TraitAssocType { .. } => "associated type",
-		SymbolKind::TypeAlias { .. } => "type alias",
-	}
-}
-
-/// [`symbol_kind_noun`], but for a raw `SymbolEntry` — `Pending` stays vague
-/// on purpose: its signature hasn't been computed, so the specific kind
-/// isn't known yet and guessing would be worse than the generic word.
-fn symbol_entry_noun(entry: SymbolEntry) -> &'static str {
-	match entry {
-		SymbolEntry::Pending(_) => "item",
-		SymbolEntry::Resolved { kind, .. } => symbol_kind_noun(kind),
-	}
 }
 
 fn report_not_a_namespace(name: &str, span: SourceSpan) -> Diagnostic<FileId> {

@@ -16,7 +16,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Severity};
 use codespan_reporting::term;
 
-use crate::diagnostics::{Code, Diagnostics};
+use crate::diagnostics::{DiagnosticCode, Diagnostics};
 use crate::vfs::{FileId, Files};
 
 /// A view over one stage's diagnostics, paired with the [`Files`] they point
@@ -110,12 +110,8 @@ impl<'a> DiagnosticView<'a> {
 	}
 
 	/// At least one *error* carrying `code`.
-	pub fn assert_error(&self, code: impl Code) {
-		self.assert_reported_inner(
-			code.as_code(),
-			Some(Severity::Error),
-			"error",
-		);
+	pub fn assert_error(&self, code: DiagnosticCode) {
+		self.assert_reported_inner(code.code(), Some(Severity::Error), "error");
 	}
 
 	/// At least one *warning* carrying `code`.
@@ -124,22 +120,22 @@ impl<'a> DiagnosticView<'a> {
 	/// this replaces: that matched on the code alone, so the ~20 warning tests
 	/// using it would have kept passing had the warning been promoted to an
 	/// error.
-	pub fn assert_warning(&self, code: impl Code) {
+	pub fn assert_warning(&self, code: DiagnosticCode) {
 		self.assert_reported_inner(
-			code.as_code(),
+			code.code(),
 			Some(Severity::Warning),
 			"warning",
 		);
 	}
 
 	/// At least one diagnostic carrying `code`, whatever its severity.
-	pub fn assert_reported(&self, code: impl Code) {
-		self.assert_reported_inner(code.as_code(), None, "diagnostic");
+	pub fn assert_reported(&self, code: DiagnosticCode) {
+		self.assert_reported_inner(code.code(), None, "diagnostic");
 	}
 
 	/// Nothing carries `code`, whatever its severity.
-	pub fn assert_absent(&self, code: impl Code) {
-		let wanted = code.as_code();
+	pub fn assert_absent(&self, code: DiagnosticCode) {
+		let wanted = code.code();
 		if self.items.iter().any(|d| d.code.as_deref() == Some(wanted)) {
 			panic!(
 				"expected no `{}` during {}, but it was reported:\n{}",
@@ -172,9 +168,9 @@ impl<'a> DiagnosticView<'a> {
 	/// Stronger than [`Self::assert_error`], which says nothing about whatever
 	/// else the compiler decided to report alongside the expected one. This is
 	/// `ast/tests.rs`'s existing `diagnostic_codes` idiom, generalised.
-	pub fn assert_codes(&self, expected: &[impl Code]) {
+	pub fn assert_codes(&self, expected: &[DiagnosticCode]) {
 		let expected: Vec<&str> =
-			expected.iter().map(|code| code.as_code()).collect();
+			expected.iter().map(DiagnosticCode::code).collect();
 		let actual = self.codes();
 		if actual != expected {
 			panic!(
@@ -247,7 +243,6 @@ mod tests {
 	use codespan_reporting::diagnostic::Diagnostic;
 
 	use super::*;
-	use crate::tir::DiagnosticCode;
 	use crate::vfs::FileOrigin;
 
 	/// One file plus a diagnostic per requested (code, severity), all pointing
