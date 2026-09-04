@@ -60,9 +60,9 @@ Looking only at `fn() -> ()`, we might think there isn't much interesting about 
 
 But removing the call would obviously change the behaviour of the program because it prints something to the outside world.
 
-This information matters to the optimizer. If the result of a computation isn't used, the compiler would like to remove it when possible. But before doing that, it needs to know whether executing that computation can have some observable effect.
+That's useful information for us as developers. A function signature tells us what values a function exchanges with us, so why shouldn't it also tell us what else the function might do?
 
-It would also be useful information for us as developers. A function signature tells us what values a function exchanges with us, so why shouldn't it also tell us what else the function might do?
+It's useful to the compiler too. If the result of a computation isn't used, it would like to remove it, but before doing that it needs to know whether the computation can have some observable effect. The compiler works that out for itself, further down the pipeline where it can see the individual instructions — but as we'll see, there is one boundary where it can't, and has to rely on what we wrote in the signature.
 
 This is where effects come in.
 
@@ -86,9 +86,9 @@ Many languages with effect systems introduce a separate vocabulary for effects. 
 
 But why do we need a separate concept for effects at all? We already have functions describing operations that can happen in our program. What if an effect could simply be a function?
 
-This is essentially what WX does. A function with a body doesn't need to explicitly declare its effects — the compiler can infer them by looking at what happens inside the body. Effects can still be annotated explicitly, in which case the annotation acts as an **upper bound**: every effect inferred from the function body must be contained within the declared set.
+This is essentially what WX does. A function with a body doesn't need to explicitly declare its effects — the compiler can infer them by looking at what happens inside the body. Effects can still be declared explicitly, but we'll come back to the relationship between declared and inferred effects later.
 
-For a function without a body there is nothing to inspect, so the compiler cannot infer a more precise set. In that case, the declared bound is also the function's effective effect summary.
+For a function without a body there is nothing to inspect, so the compiler cannot infer a more precise set. In that case, its declared effects are also its effective effect summary.
 
 A bodyless function can declare no effects at all:
 
@@ -143,6 +143,8 @@ fn do_something() [foo, bar] {
 ```
 
 Effects form a set, so duplicates don't matter. Calling `foo()` once or ten times still only adds `foo` once.
+
+An **effect** here is always one concrete identity, such as `trap` or `throw<ApplicationError>`. A fully resolved **effect set** is a finite set of those identities. Even a parameterized effect becomes concrete once its type arguments are known: `throw<ApplicationError>` and `throw<ConnectionError>` are two separate effects. Generic code may temporarily leave parts of a set unresolved, but we'll come back to that later.
 
 The same process continues transitively through the call graph. If another function calls `do_something`, it inherits both `foo` and `bar` unless something handles those effects before they escape.
 
@@ -291,6 +293,27 @@ And just like before, if `handler` calls another function which can throw `Conne
 [throw<ApplicationError>, throw<ConnectionError>]
 ```
 
+### Exceptions across the JavaScript boundary
+
+WebAssembly exception tags can also be shared with JavaScript. A tag imported from JavaScript or exported by a module has one runtime identity. JavaScript can use that same `WebAssembly.Tag` to construct a `WebAssembly.Exception`, and WebAssembly matches the exception using the tag itself — another tag with the same payload types is not enough. In the other direction, a typed exception which escapes from an exported WebAssembly function appears in JavaScript as a `WebAssembly.Exception` carrying that same tag.
+
+This means that WX can import a tag together with a host function which may throw it:
+
+```rs
+import "host" as host {
+    tag HostError(error: externref) -> never;
+    fn request() [throw<HostError>] -> Response;
+}
+```
+
+The host provides the `HostError` tag when the module is instantiated. If `request` throws an exception constructed with that same tag, WX can catch it as `HostError` and keep the precise `[throw<HostError>]` contract.
+
+If the host function has a known finite set of possible tags, it can list each concrete effect in the same way. This is particularly useful at an import boundary because the compiler cannot inspect the JavaScript implementation. The annotation is the only effect information it has.
+
+An arbitrary JavaScript exception is different. Under the current [WebAssembly JavaScript API](https://webassembly.github.io/spec/js-api/), a value thrown by JavaScript through an imported function is carried into WebAssembly using the separate `WebAssembly.JSTag`. It does not automatically become a WX exception type based on its JavaScript class. WX may eventually expose that as a separate interop effect, but that part of the design is not settled.
+
+So JavaScript interop is not a reason to widen an import to `[throw<_>]`. When a precise tag contract is available, the import should name those concrete effects directly.
+
 ### Handling effects
 
 This is where exceptions become more interesting than our previous examples.
@@ -334,7 +357,7 @@ If the expression can perform other effects, however, those remain:
 
 So handling an effect doesn't make the whole expression pure. It only removes the effects which were actually handled.
 
-Because the compiler knows the exact set of exception effects that can reach a `catch`, WX can also check whether the handler is exhaustive. You can explicitly handle every possible exception:
+When the expression has a concrete effect set, the compiler knows which exception effects can reach a `catch` and can check whether the handler is exhaustive. You can explicitly handle every possible exception:
 
 ```rs
 local result = handler() catch {
@@ -352,9 +375,131 @@ local result = handler() catch {
 };
 ```
 
+The `_` here is only a catch-all pattern for the handler. It removes the concrete exception effects which can reach this `catch`; it does not add a wildcard effect to the set.
+
 In that sense, `catch` is similar to a `match`: instead of exhaustively matching possible values, we're exhaustively handling possible exceptional exits from a computation.
 
+The analogy carries a consequence worth flagging early. What the compiler checks against is the effect contract used for `handler`, so if that contract later grows a new exception, this exhaustive `catch` stops compiling — exactly as adding a variant breaks a `match`. Handling exceptions precisely is what buys that breakage; we'll come back to what it means at a public API boundary.
+
+### Effect scopes
+
+So far we have treated the effects of a function as one flat set. That works until the same effect appears both inside and outside of a `catch`:
+
+```rs
+fn f() {
+    might_throw();
+    might_throw() catch {
+        AppError(status) -> 0,
+    };
+}
+```
+
+Both calls have the `[throw<AppError>]` effect, but the `catch` only handles the exception from the second call. The first one can still escape, so `f` must also have `[throw<AppError>]`.
+
+If the compiler flattened the body first, both calls would collapse into the same set element. Subtracting `throw<AppError>` would then remove the effect from both of them. We need to preserve the structure of the body until the `catch` has been applied.
+
+Instead of a flat set, we can describe the effects using a small expression:
+
+```text
+term = atom(effect)
+     | term ∪ term
+     | term − [effects]
+```
+
+There are only three cases:
+
+- `atom(effect)` represents one effect, such as `log` or `trap`.
+- `a ∪ b` combines the effects of two terms.
+- `a − [effects]` removes a set of handled effects from one term.
+
+Without a `catch`, a function body is just a union of atoms. For example:
+
+```rs
+fn f() {
+    console::log(1);
+    might_trap();
+}
+```
+
+can be represented as:
+
+```text
+atom(log) ∪ atom(trap)
+```
+
+Evaluating the term is just a set union:
+
+```text
+[log] ∪ [trap] = [log, trap]
+```
+
+In the first example, subtraction applies only to the second call:
+
+```text
+atom(throw<AppError>)
+    ∪ (atom(throw<AppError>) − [throw<AppError>])
+```
+
+which evaluates to:
+
+```text
+[throw<AppError>] ∪ ([throw<AppError>] − [throw<AppError>])
+    = [throw<AppError>]
+```
+
+The term on the left side of that subtraction is the **effect scope** of the `catch`. Only effects from that term can be removed. The same effect outside of it continues to propagate normally.
+
+There is one more important part of this rule: the handler itself is outside of the scope it handles.
+
+```rs
+fn f() {
+    fetch() catch {
+        ConnectionError(_) -> retry(),   // retry() can throw it too
+    };
+}
+```
+
+Here `fetch()` throws `ConnectionError`, but `retry()` can throw the same exception again. The effect term looks like this:
+
+```text
+(atom(throw<ConnectionError>) − [throw<ConnectionError>])  // fetch
+    ∪ atom(throw<ConnectionError>)                          // retry
+```
+
+The subtraction removes the exception from `fetch()`. It does not remove the one from `retry()`, because that atom is outside the subtraction. The final effect set is therefore still:
+
+```text
+[throw<ConnectionError>]
+```
+
+This is the same behaviour we would expect from `try`/`catch` in other languages. An exception thrown by a handler does not loop back into the same handler. Catching it requires another `catch`.
+
+So effect composition comes down to three operations. Functions introduce effect atoms, ordinary control flow combines them using unions, and constructs such as `catch` subtract handled effects from a particular scope.
+
 This gives us the other half of effect tracking. Function calls and operations add and compose effects, while constructs that understand a particular effect can handle it and prevent it from propagating further.
+
+### Recursive functions
+
+There is one case where inference needs a little more care: functions can call each other.
+
+```rs
+fn ping() {
+    console::log(1);
+    pong();
+}
+
+fn pong() {
+    if something() {
+        ping();
+    }
+}
+```
+
+Here `ping` depends on the effects of `pong`, while `pong` depends on the effects of `ping`. The compiler cannot finish either function independently. It has to solve the group together until the effect sets stop changing.
+
+With union alone, both functions end up with `[log]`. A `catch` can make the result more precise: two mutually recursive functions do not necessarily have the same effects if one of them handles an effect before it escapes.
+
+Groups like this are known as strongly connected components of the call graph. The exact algorithm used to solve them is an implementation detail, but the language-level rule stays the same: effects propagate through calls unless a surrounding scope handles them.
 
 ## Memory effects
 
@@ -393,8 +538,8 @@ This distinction is going to become important for effect tracking.
 
 ```rs
 fn read<Mem: Memory>(mem: Mem) [read<Mem>];
-fn write<Mem: Memory>(mem: Mem) [read<Mem>, write<Mem>];
-fn grow<Mem: Memory>(mem: Mem) [read<Mem>, grow<Mem>];
+fn write<Mem: Memory>(mem: Mem) [write<Mem>];
+fn grow<Mem: Memory>(mem: Mem) [grow<Mem>];
 ```
 
 Just like `throw<E>` from the previous example, these effects are parameterized by a type. Since every memory has its own unique type, `read<heap>` and `read<secondary>` are two distinct effects.
@@ -425,348 +570,16 @@ This doesn't mean that the compiler has to be equally conservative when optimizi
 
 So these two mechanisms complement each other. Alias analysis gives us fine-grained information while we're looking at code the compiler understands, while memory effects preserve the information we need when we cross a boundary where that analysis stops — most importantly, when calling imported functions.
 
+This is worth stating as a general rule, because it isn't specific to memory. **The effect sets in your signatures aren't what drives optimization.** Not because the compiler doesn't need that information — it very much does — but because it derives it later, at a level where the information fits better.
+
+An effect set is a high-level construct. Its unit is the whole function, so `[trap]` tells us that something in here might trap, without saying which operation or under what conditions. It is also a contract, which means it is deliberately allowed to be broader than the truth. Both of those are exactly what we want from a signature, and neither is what an optimizer wants. Working on the actual instructions instead, the compiler can tell that a particular division cannot trap because the divisor was already checked — which no function signature could ever express.
+
+What the optimizer does need is the effects declared on **imported** functions. That's the one place where there is no body to look at, so the annotation is the only information that exists. Telling the compiler that `process_audio` writes `audio_memory` and nothing else isn't a hint it could have derived on its own — it's the only thing standing between "this call might do anything" and a useful answer.
+
 We could theoretically make the effects themselves more precise by tracking individual memory regions or ranges, but that would be too much of a headache to manage properly. I think the current abstraction is more than enough to produce good, optimizable code.
 
 As a small side note, `grow` is a separate effect because WebAssembly linear memory can grow during execution, but currently cannot shrink. The effect model simply reflects that asymmetry.
 
-## Effect bounds and polymorphism
-
-Earlier we established that an explicit effect annotation is an **upper bound**, not necessarily the exact effects of a function. So far this distinction hasn't mattered much: ordinary functions usually had their effects inferred, while bodyless functions gave the compiler no more precise information to work with. Once effects become part of the type system, however, the distinction becomes important.
-
-Consider:
-
-```rs
-fn calculate() [trap] -> i32 {
-    100 / get_value()
-}
-```
-
-The compiler still infers the effects of the body and checks them against the annotation:
-
-```text
-inferred effects = [trap]
-declared bound   = [trap]
-
-[trap] ⊆ [trap]
-```
-
-The inferred set is allowed to be smaller:
-
-```rs
-fn calculate() [trap] -> i32 {
-    42
-}
-```
-
-Here `[] ⊆ [trap]`, so the function is perfectly valid. The annotation says that `calculate` is allowed to trap, not that it necessarily does.
-
-An effect outside the bound is different:
-
-```rs
-fn calculate() [trap] -> i32 {
-    console::log(42);
-    42
-}
-```
-
-Now `[log] ⊄ [trap]`, so the compiler reports a hard error. The general rule is simply:
-
-```text
-inferred effects ⊆ declared bound
-```
-
-A broader bound is sound but less precise. When the compiler knows both the implementation and its annotation, it can warn if the annotation unnecessarily includes effects that never appear. Narrowing such a bound gives callers a stronger guarantee, but the broader annotation is not incorrect.
-
-This also gives `[]` a useful meaning: because the only subset of the empty set is itself, annotating a function with `[]` requires it to remain pure.
-
-At the other extreme, `[*]` represents an unrestricted bound. `*` is not an effect that can originate from a function; it is simply the top of the effect-set lattice, meaning that any effect is permitted.
-
-### Traits
-
-Trait methods use exactly the same rule:
-
-```rs
-trait Validator {
-    fn validate(value: i32) [throw<ValidationError>] -> bool;
-}
-```
-
-The annotation is an upper bound on every implementation. An implementation may use the whole bound:
-
-```rs
-impl Validator for StrictValidator {
-    fn validate(value: i32) -> bool {
-        if value <= 0 {
-            ValidationError::{}.throw();
-        }
-
-        true
-    }
-}
-```
-
-or a smaller set:
-
-```rs
-impl Validator for PositiveValidator {
-    fn validate(value: i32) -> bool {
-        value > 0
-    }
-}
-```
-
-The second implementation is pure, and `[] ⊆ [throw<ValidationError>]`, so it satisfies the trait just as well. An implementation that introduces `log`, however, would be rejected because `[log]` is not a subset of the declared bound.
-
-There is therefore no special meaning attached to an effect annotation inside a trait. The interesting difference is simply that a bodyless trait method has no implementation from which the compiler could infer a more precise set. At the trait boundary, its declared bound is the best effect summary available.
-
-Omitting the annotation from a trait method means that the trait places no restriction on its effects, which is equivalent to using `[*]`.
-
-### Generic trait calls
-
-Now consider using the trait through a generic parameter:
-
-```rs
-fn validate_with<V: Validator>(validator: V, value: i32) -> bool {
-    validator.validate(value)
-}
-```
-
-It would be safe to immediately treat the call as `[throw<ValidationError>]`, but doing so would throw away information. The actual effects depend on which implementation is eventually selected, so the compiler can preserve the unresolved call itself:
-
-```text
-[<V as Validator>::validate]
-```
-
-When `V` becomes concrete, this can be resolved to the effects of the actual implementation:
-
-```text
-<V as Validator>::validate
-        ↓ V = PositiveValidator
-<PositiveValidator as Validator>::validate
-        ↓
-[]
-```
-
-while `StrictValidator` resolves to `[throw<ValidationError>]`.
-
-The trait bound still guarantees that every possible implementation stays within `[throw<ValidationError>]`; static generic dispatch simply lets the compiler retain a more precise set whenever the implementation becomes known.
-
-### Default implementations
-
-Default implementations follow the same rule:
-
-```rs
-trait Validator {
-    fn validate(value: i32) [throw<ValidationError>] -> bool {
-        true
-    }
-}
-```
-
-The default body is inferred as `[]`, which fits inside the declared bound. Unlike an annotation on an ordinary concrete function, however, there is little reason to warn that `throw<ValidationError>` is unused here: the bound also constrains implementations that may override the default.
-
-Default methods can call other bounded trait methods as well:
-
-```rs
-trait Reporter {
-    fn report(self, message: str) [log];
-
-    fn report_error(self, message: str) [log] {
-        self.report(message)
-    }
-}
-```
-
-The exact implementation of `report` isn't known, but every implementation is guaranteed to stay within `[log]`, so the compiler can prove that the default body also satisfies its bound.
-
-If `report` were unrestricted, its call would have to be conservatively treated as `[*]`, which cannot be proven to fit inside `[log]`.
-
-### Dynamic dispatch
-
-With static generic dispatch, an unresolved call such as `<V as Validator>::validate` may eventually become concrete. With dynamic dispatch, the implementation is selected at runtime, so that opportunity never arrives.
-
-In that case the declared trait bound becomes the best effect summary available. A dynamically dispatched call to a method bounded by `[throw<ValidationError>]` contributes that whole set, even if the implementation selected at runtime happens to be pure. An unrestricted method similarly contributes `[*]`.
-
-## Effect polymorphism
-
-Effects also appear in function types. For example:
-
-```rs
-fn() [trap] -> i32
-```
-
-describes a callable whose effects are bounded by `[trap]`. A pure function can safely be used where this type is expected because `[] ⊆ [trap]`.
-
-More generally, a function with effect bound `A` can be coerced to one with bound `B` whenever:
-
-```text
-A ⊆ B
-```
-
-So these coercions are safe:
-
-```text
-fn() []          -> i32
-        ↓
-fn() [trap]      -> i32
-        ↓
-fn() [trap, log] -> i32
-        ↓
-fn() [*]         -> i32
-```
-
-The reverse direction is not safe: a caller expecting `fn() [] -> i32` relies on the guarantee that invoking it cannot perform any effects.
-
-### Losing precision
-
-Widening an effect bound is safe, but it deliberately loses information:
-
-```rs
-fn get_number() -> i32 {
-    42
-}
-
-local f: fn() [trap] -> i32 = get_number;
-```
-
-The compiler originally knew that `get_number` was pure. Through `f`, however, all we know is the bound encoded in its type, so `f()` must be conservatively treated as `[trap]`.
-
-The same happens in a higher-order function:
-
-```rs
-fn apply(
-    f: fn() [trap] -> i32,
-) [trap] -> i32 {
-    f()
-}
-```
-
-A pure callback is accepted, but calling `apply` still exposes `[trap]`. What we would sometimes like to express instead is that `apply` has exactly whatever effects its callback has.
-
-### Effect-set parameters
-
-WX introduces a separate generic parameter kind for effect sets using `fx`:
-
-```rs
-fn apply<fx E>(
-    f: fn() [E] -> i32,
-) [E] -> i32 {
-    f()
-}
-```
-
-`E` represents an entire effect set rather than one individual effect. Depending on the callback it might become `[]`, `[trap]`, `[log]`, or any other set.
-
-This preserves the relationship instead of widening every callback to one common bound:
-
-```text
-apply(pure)   → E = []     → []
-apply(divide) → E = [trap] → [trap]
-apply(logger) → E = [log]  → [log]
-```
-
-Effect-set parameters compose with concrete effects using the same set union as everything else:
-
-```rs
-fn apply_and_log<fx E>(
-    f: fn() [E] -> i32,
-) [log, E] -> i32 {
-    console::log(123);
-    f()
-}
-```
-
-Here `[log, E]` means `{log} ∪ E`. Multiple parameters work the same way:
-
-```rs
-fn apply_both<fx A, fx B>(
-    a: fn() [A],
-    b: fn() [B],
-) [A, B] {
-    a();
-    b();
-}
-```
-
-where `[A, B]` means `A ∪ B`.
-
-### Effect-set bounds
-
-Effect-set parameters can themselves be bounded:
-
-```rs
-fn apply<fx E: [trap]>(
-    f: fn() [E] -> i32,
-) [E] -> i32 {
-    f()
-}
-```
-
-This uses exactly the same upper-bound relation again:
-
-```text
-E ⊆ [trap]
-```
-
-So `E = []` and `E = [trap]` are valid, while `E = [log]` or `[trap, log]` are not.
-
-This differs subtly from accepting `fn() [trap] -> i32` directly. Both versions restrict the callback to effects within `[trap]`, but the concrete function type widens the callback to that bound. The polymorphic version preserves which particular subset was actually supplied.
-
-## Effects at public boundaries
-
-For private functions, inference is usually enough. If the implementation is available, the compiler can determine its actual effect set directly from the body.
-
-Across a package boundary, however, callers need a stable contract. Public functions therefore require an explicit effect bound:
-
-```rs
-pub fn calculate(value: i32) [trap] -> i32 {
-    ...
-}
-```
-
-The implementation is still inferred and checked using the same rule:
-
-```text
-inferred effects ⊆ [trap]
-```
-
-The implementation may currently be pure and later change to one that can trap without changing the public API. Both implementations satisfy the same bound that callers already had to assume.
-
-Introducing `log`, on the other hand, would violate the contract because `[log] ⊄ [trap]`. The public annotation would have to be explicitly widened before such an implementation could be accepted.
-
-This separates two pieces of information:
-
-```text
-inferred effects    what this particular implementation is known to do
-declared bound      what callers are allowed to assume
-```
-
-Internally, the compiler can preserve the more precise inferred set wherever the implementation is available. Across a package boundary, callers rely on the declared bound instead. This prevents implementation changes from silently changing the effects visible to downstream packages.
-
-Public APIs can also expose polymorphic relationships rather than one concrete set:
-
-```rs
-pub fn apply<fx E>(
-    f: fn() [E] -> i32,
-) [E] -> i32 {
-    f()
-}
-```
-
-or compose them:
-
-```rs
-pub fn apply_and_log<fx E>(
-    f: fn() [E] -> i32,
-) [log, E] -> i32 {
-    console::log(123);
-    f()
-}
-```
-
-These signatures don't commit the API to one concrete effect set. Instead, they describe how the effects exposed by the function depend on the effects of its arguments.
-
-This is where making effects part of the type system becomes useful. Within a concrete body, inference can discover what the implementation does. But once functions are passed around, abstracted over, dynamically dispatched, or exposed across package boundaries, their types need to preserve both what effects are allowed and how those effects depend on other parts of the program.
 
 ## Global variables
 
@@ -845,3 +658,485 @@ This restriction also keeps importing and exporting globals simple. If aggregate
 By keeping globals limited to values that WebAssembly itself can represent directly, imports and exports stay predictable and don't require any hidden transformations.
 
 I also quite like the explicit `get()` and `set()` syntax as a side effect of this design. Global state stands out visually from ordinary local computation, and the corresponding effects are equally explicit to the compiler. The exact API may still change, but I think the underlying model is useful.
+
+## Effect bounds
+
+There are now two effect sets we need to distinguish. The **inferred effects** come from the function body. The **declared effects** are the ones written explicitly in its annotation.
+
+The declared effects act as an upper bound. The compiler still infers the body and checks that everything it finds is allowed by the annotation. If there is no annotation, the inferred effects become the function's effect set directly.
+
+Consider:
+
+```rs
+fn calculate() [trap] -> i32 {
+    100 / get_value()
+}
+```
+
+The compiler still infers the effects of the body and checks them against the annotation:
+
+```text
+inferred effects = [trap]
+declared effects = [trap]
+
+[trap] ⊆ [trap]
+```
+
+The inferred set is allowed to be smaller:
+
+```rs
+fn calculate() [trap] -> i32 {
+    42
+}
+```
+
+Here `[] ⊆ [trap]`, so the function is perfectly valid. The annotation says that `calculate` is allowed to trap, not that it necessarily does.
+
+An effect outside the bound is different:
+
+```rs
+fn calculate() [trap] -> i32 {
+    console::log(42);
+    42
+}
+```
+
+Now `[log] ⊄ [trap]`, so the compiler reports a hard error. The general rule is simply:
+
+```text
+inferred effects ⊆ declared effects
+```
+
+This also gives `[]` a useful meaning: because the only subset of the empty set is itself, annotating a function with `[]` requires it to remain pure.
+
+At the other extreme, `[*]` is the unrestricted top bound. It is not a concrete effect set and `*` is not an effect that can originate from a function. It simply means that there is no useful restriction on which effects are permitted.
+
+
+### What callers see
+
+We've set up a question but haven't answered it. Take:
+
+```rs
+fn calculate() [trap] -> i32 {
+    42
+}
+```
+
+The body has no inferred effects, but the function declares `[trap]`. So when something calls `calculate`, which set does it get?
+
+WX answers: **the declared effects**. If you write the effects yourself, you own them — everyone who calls your function uses the set you wrote, not the one the compiler inferred from your body.
+
+We can see it directly:
+
+```rs
+fn calculate() [trap] -> i32 {
+    42
+}
+
+fn main() {          // inferred: [trap]
+    calculate();
+}
+```
+
+`main` calls a function that cannot trap, and still comes out with `[trap]`. Not because the compiler failed to notice — it can see perfectly well that the body is `42` — but because it uses what `calculate` promised rather than what it happens to do today.
+
+It has to work that way, or the annotation would be worthless. `calculate` is explicitly allowed to trap. If callers were compiled against `[]` instead, then changing the body to something that actually divides would break every one of them, without the signature ever changing.
+
+So an annotation can only ever **widen** what the rest of the program sees. There is no way to write one that makes a function look purer than it really is:
+
+```text
+what callers see  ⊇  what the function can actually do
+```
+
+The practical advice follows from that. Inside your own code, just let the compiler infer. It knows more than you're going to write down, and it keeps up when you edit the body. Write the annotation where you actually need a fixed contract — a public function, or a trait method.
+
+And when you do write one, keeping it tight is now your job. A bound that's wider than necessary isn't wrong and isn't an error, but it does reduce effect-system precision for every caller. Their inferred effects include the wider contract even when the current implementation happens to do less.
+
+That does not necessarily make the implementation itself harder to optimize. If the compiler can inspect the body of `calculate`, it can still see that the body is just `42` and optimize it using the lowered instructions and whatever more precise analysis is available there. The declared effects become important to optimization when that implementation is opaque — for example, across an imported function, an unresolved indirect call, or another boundary where the body is unavailable.
+
+WX doesn't have a linter yet, but this is exactly the sort of thing one could report: an annotation listing an effect the body never performs. I mention it as a future idea rather than a feature, and it would have to stay a lint you can switch off — declaring room to grow is a perfectly reasonable thing to do on purpose, so it can't be a warning the compiler insists on.
+
+## Effect polymorphism
+
+Effects also appear in function types. For example:
+
+```rs
+fn() [trap] -> i32
+```
+
+describes a callable whose effects are bounded by `[trap]`. A pure function can safely be used where this type is expected because `[] ⊆ [trap]`.
+
+More generally, a function with effect bound `A` can be coerced to one with bound `B` whenever:
+
+```text
+A ⊆ B
+```
+
+So these coercions are safe:
+
+```text
+fn() []          -> i32
+        ↓
+fn() [trap]      -> i32
+        ↓
+fn() [trap, log] -> i32
+        ↓
+fn() [*]         -> i32
+```
+
+The reverse direction is not safe: a caller expecting `fn() [] -> i32` relies on the guarantee that invoking it cannot perform any effects.
+
+### Losing precision
+
+Widening an effect bound is safe, but it deliberately loses information:
+
+```rs
+fn get_number() -> i32 {
+    42
+}
+
+local f: fn() [trap] -> i32 = get_number;
+```
+
+The effect analysis originally knew that `get_number` was pure. Through the type of `f`, however, all it knows is the declared bound, so `f()` contributes `[trap]`. A later optimization may recover more precise information if it can prove which function `f` refers to, but the function type itself does not provide that guarantee.
+
+The same happens in a higher-order function:
+
+```rs
+fn apply(
+    f: fn() [trap] -> i32,
+) [trap] -> i32 {
+    f()
+}
+```
+
+A pure callback is accepted, but calling `apply` still exposes `[trap]`. What we would sometimes like to express instead is that `apply` has exactly whatever effects its callback has.
+
+### Effect-set parameters
+
+WX introduces a separate generic parameter kind for effect sets using `fx`:
+
+```rs
+fn apply<fx E>(
+    f: fn() [E] -> i32,
+) [E] -> i32 {
+    f()
+}
+```
+
+`E` represents an entire effect set rather than one individual effect. Depending on the callback it might become `[]`, `[trap]`, `[log]`, or any other set. Until that callback is known, `E` is a symbolic part of the surrounding effect set rather than a new kind of effect.
+
+This preserves the relationship instead of widening every callback to one common bound:
+
+```text
+apply(pure)   → E = []     → []
+apply(divide) → E = [trap] → [trap]
+apply(logger) → E = [log]  → [log]
+```
+
+Effect-set parameters compose with concrete effects using the same set union as everything else:
+
+```rs
+fn apply_and_log<fx E>(
+    f: fn() [E] -> i32,
+) [log, E] -> i32 {
+    console::log(123);
+    f()
+}
+```
+
+Here `[log, E]` means `{log} ∪ E`:
+
+```text
+[E, log]
+    where E = [trap]
+
+        ↓ substitution
+
+[trap, log]
+```
+
+This is still the same set union as before. `E` only postpones the final answer until a substitution is available.
+
+Multiple parameters work the same way:
+
+```rs
+fn apply_both<fx A, fx B>(
+    a: fn() [A],
+    b: fn() [B],
+) [A, B] {
+    a();
+    b();
+}
+```
+
+where `[A, B]` means `A ∪ B`.
+
+### Effect-set bounds
+
+Effect-set parameters can themselves be bounded:
+
+```rs
+fn apply<fx E: [trap]>(
+    f: fn() [E] -> i32,
+) [E] -> i32 {
+    f()
+}
+```
+
+This uses exactly the same upper-bound relation again:
+
+```text
+E ⊆ [trap]
+```
+
+So `E = []` and `E = [trap]` are valid, while `E = [log]` or `[trap, log]` are not.
+
+This differs subtly from accepting `fn() [trap] -> i32` directly. Both versions restrict the callback to effects within `[trap]`, but the concrete function type widens the callback to that bound. The polymorphic version preserves which particular subset was actually supplied.
+
+Sometimes we want to restrict an effect-set parameter to one particular kind of effect. This is where wildcard patterns become useful:
+
+```rs
+fn apply<fx E: [throw<_>]>(
+    f: fn() [E] -> i32,
+) [E] -> i32 {
+    f()
+}
+```
+
+Here `[throw<_>]` is not an ordinary effect set and it is not the effect set of `apply`. It is a pattern constraining which concrete effects `E` may contain:
+
+```text
+every effect in E must match throw<_>
+```
+
+For example:
+
+```text
+E = []                                      valid
+E = [throw<ApplicationError>]               valid
+E = [throw<A>, throw<B>]                    valid
+
+E = [trap]                                  invalid
+E = [throw<ApplicationError>, log]          invalid
+```
+
+The pattern only checks `E`; it does not replace it. If the callback has `[throw<ApplicationError>]`, the result of `apply` is still `[throw<ApplicationError>]`, not `[throw<_>]`.
+
+This keeps the different forms separate:
+
+```text
+resolved effect set     a finite set of concrete effects
+
+symbolic effect set     a set containing unresolved generic information,
+                        such as an fx parameter or generic trait call
+
+effect-bound patterns   constraints on which concrete effects an fx
+                        parameter may contain
+
+unrestricted bound      [*], which permits any effect
+```
+
+Fully resolved effect sets therefore keep their simple set-theoretic structure. They are ordered by subset, and union is their join:
+
+```text
+[] ⊆ [throw<A>] ⊆ [throw<A>, throw<B>]
+```
+
+`[throw<_>]` is not another element in this lattice. It selects which concrete sets are valid substitutions for `E`. In particular, catching never has to produce a set such as `[throw<_>] − [throw<ApplicationError>]`, with the implied meaning of every exception except one. Catching continues to subtract concrete effects from the term it handles.
+
+`[*]` remains different. It is the unrestricted top bound, meaning that any effect is permitted. `[throw<_>]` is narrower and structured: in `<fx E: [throw<_>]>`, every effect in `E` must be an instantiation of `throw`.
+
+A type parameter cannot take its place. Writing `fn f<E: Exception>() [throw<E>]` says that `f` can only throw the single exception type `E`, chosen by whoever calls it — not that it may throw any number of exception types.
+
+### Traits
+
+Trait methods use exactly the same rule:
+
+```rs
+trait Validator {
+    fn validate(value: i32) [throw<ValidationError>] -> bool;
+}
+```
+
+The annotation is an upper bound on every implementation. An implementation may use the whole bound:
+
+```rs
+impl Validator for StrictValidator {
+    fn validate(value: i32) -> bool {
+        if value <= 0 {
+            ValidationError::{}.throw();
+        }
+
+        true
+    }
+}
+```
+
+or a smaller set:
+
+```rs
+impl Validator for PositiveValidator {
+    fn validate(value: i32) -> bool {
+        value > 0
+    }
+}
+```
+
+The second implementation is pure, and `[] ⊆ [throw<ValidationError>]`, so it satisfies the trait just as well. An implementation that introduces `log`, however, would be rejected because `[log]` is not a subset of the declared effects.
+
+There is therefore no special meaning attached to an effect annotation inside a trait. The interesting difference is simply that a bodyless trait method has no implementation from which the compiler could infer a more precise set. At the trait boundary, its declared effects are the best effect summary available.
+
+Omitting the annotation from a trait method means that the trait places no restriction on its effects, which is equivalent to using `[*]`.
+
+### Generic trait calls
+
+Now consider using the trait through a generic parameter:
+
+```rs
+fn validate_with<V: Validator>(validator: V, value: i32) -> bool {
+    validator.validate(value)
+}
+```
+
+It would be safe to immediately treat the call as `[throw<ValidationError>]`, but doing so would throw away information. The actual effects depend on which implementation is eventually selected, so the compiler can preserve the unresolved call itself:
+
+```text
+[<V as Validator>::validate]
+```
+
+This is symbolic effect information, not a new runtime effect. The trait bound already tells us that it is restricted:
+
+```text
+effects(<V as Validator>::validate)
+    ⊆ [throw<ValidationError>]
+```
+
+So the compiler can check the generic function without pretending that the call is completely unrestricted. When `V` becomes concrete, it resolves the symbolic call to the implementation's actual effect set:
+
+```text
+<V as Validator>::validate
+        ↓ V = PositiveValidator
+<PositiveValidator as Validator>::validate
+        ↓
+[]
+```
+
+while `StrictValidator` resolves to:
+
+```text
+<V as Validator>::validate
+        ↓ V = StrictValidator
+<StrictValidator as Validator>::validate
+        ↓
+[throw<ValidationError>]
+```
+
+The trait bound still guarantees that every possible implementation stays within `[throw<ValidationError>]`; static generic dispatch simply lets the compiler retain a more precise set whenever the implementation becomes known.
+
+### Default implementations
+
+Default method bodies are checked against their declared effects in the same way as any other function. They can also call other bounded trait methods:
+
+```rs
+trait Reporter {
+    fn report(self, message: str) [log];
+
+    fn report_error(self, message: str) [log] {
+        self.report(message)
+    }
+}
+```
+
+The exact implementation of `report` isn't known, but every implementation is guaranteed to stay within `[log]`, so the compiler can prove that the default body also satisfies its bound.
+
+If `report` were unrestricted, its call would have to be conservatively treated as `[*]`, which cannot be proven to fit inside `[log]`.
+
+### Dynamic dispatch
+
+With static generic dispatch, an unresolved call such as `<V as Validator>::validate` may eventually become concrete. With dynamic dispatch, the implementation is selected at runtime, so that opportunity never arrives.
+
+At the effect-analysis level, as long as the call remains dynamically dispatched, the trait's declared effects are the best summary available. A call to a method declaring `[throw<ValidationError>]` therefore contributes that whole set, even if the implementation selected at runtime happens to be pure. A later optimization may become more precise if it can devirtualize the call; otherwise it has the same abstraction boundary. An unrestricted method similarly contributes `[*]`.
+
+### When symbolic effects become concrete
+
+We can now connect effect polymorphism back to the effect terms we introduced earlier.
+
+A function body is first described as an effect term made from atoms, unions, and subtractions. For an ordinary function, all of those pieces become concrete once its callees are known, so the term can be evaluated directly:
+
+```text
+function body
+      ↓
+effect term
+      ↓
+[trap, log]
+```
+
+A generic body may not have enough information yet. Its term can contain an effect-set parameter such as `E`, or an unresolved call such as `<V as Validator>::validate`. Instead of replacing those symbols with a wider bound, the compiler keeps them in the term until the generic is instantiated.
+
+For example, a generic body might produce:
+
+```text
+generic body
+      ↓
+[log] ∪ (E − [throw<ApplicationError>])
+      ↓
+E = [log, throw<ApplicationError>]
+      ↓ substitution
+[log] ∪ ([log, throw<ApplicationError>] − [throw<ApplicationError>])
+      ↓
+[log]
+```
+
+The same idea applies to a symbolic trait call. Once `V` is known, `<V as Validator>::validate` is replaced by the effects of the selected implementation, and the surrounding term can be evaluated normally.
+
+These symbols are placeholders for effect sets which will eventually become concrete. That is different from a pattern such as `throw<_>`, which only constrains a substitution and never becomes part of the propagated term.
+
+**The function body is not analyzed again from scratch for every instantiation.** It is analyzed once into a symbolic effect term. Instantiation only supplies the missing pieces and evaluates that reusable term.
+
+So generics postpone effect resolution, not effect analysis. Symbolic effects are what let the compiler retain the relationships found in the body until enough context exists to produce the final concrete set.
+
+## Effects at public boundaries
+
+Public functions require an explicit effect bound:
+
+```rs
+pub fn calculate(value: i32) [trap] -> i32 {
+    ...
+}
+```
+
+Not because a different rule applies across a package boundary — the one from earlier holds everywhere — but because inference would make your published API implicit. Without the annotation your signature would be whatever the body happened to do most recently, so editing an implementation detail would change what downstream code sees, without you touching anything you thought of as public.
+
+Writing the bound is what buys back the freedom to change that implementation. `calculate` may be pure today and grow a division tomorrow; both satisfy `[trap]`, which is what callers were already compiled against.
+
+There is a limit to that freedom, and it's worth being explicit about it. Moving *within* the bound is free; growing the bound itself is not. If `calculate` later declares `[trap, throw<ParseError>]`, every caller that was catching exhaustively suddenly has an exception it doesn't handle, and stops compiling. Widening is a breaking change in exactly the way adding a variant to a public enum is — invisible to anyone who ignored the effects, breaking for anyone who was handling them precisely.
+
+An effect-bound pattern such as `[throw<_>]` does not provide an escape hatch here. It can constrain an `fx` parameter, but it cannot be used as the declared effect set of a concrete public function. If WX needs an equivalent of a non-exhaustive public exception set, that will require a separate design.
+
+What makes a package boundary the place this matters most is the stakes rather than the rule. Downstream code is compiled separately, so a change inside your implementation must not be able to move the effects it was compiled against.
+
+Public APIs can also expose polymorphic relationships rather than one concrete set:
+
+```rs
+pub fn apply<fx E>(
+    f: fn() [E] -> i32,
+) [E] -> i32 {
+    f()
+}
+```
+
+or compose them:
+
+```rs
+pub fn apply_and_log<fx E>(
+    f: fn() [E] -> i32,
+) [log, E] -> i32 {
+    console::log(123);
+    f()
+}
+```
+
+These signatures don't commit the API to one concrete effect set. Instead, they describe how the effects exposed by the function depend on the effects of its arguments.
+
+This is where making effects part of the type system becomes useful. Within a concrete body, inference can discover what the implementation does. But once functions are passed around, abstracted over, dynamically dispatched, or exposed across package boundaries, their types need to preserve both what effects are allowed and how those effects depend on other parts of the program.

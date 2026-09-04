@@ -94,10 +94,12 @@ fn broad() [trap] { }     // annotated, actually pure
 fn caller() { broad(); }  // contract = [trap], not []
 ```
 
-That cost is confined to the *type system*, which is the part that exists for
-the developer's benefit. The optimizer does not pay it — see "two closures"
-in §1. So annotations behave predictably for people, and codegen still gets
-the real facts.
+Every consumer pays that cost, including the optimizer, and that is accepted:
+a broad declaration is a promise the author chose to make, and holding
+codegen to it keeps one summary in the system instead of two (§1, "one
+contract"). The cost is bounded — it is always an over-approximation, so it
+loses optimizations and never correctness — and a sharper propagation, if it
+is ever wanted, belongs on MIR's post-inlining call graph rather than in TIR.
 
 Two consequences that follow directly:
 
@@ -178,11 +180,10 @@ the entire point of the `catch`. So Tarjan may be used to get an *evaluation
 order* (the condensation is still a DAG), but the per-component step has to be
 an iteration to fixpoint rather than a single union. See §4.
 
-**(c) "One stored set is enough."** Two are: what the source wrote
-(`declared`) and what the body closes over (`inferred`). What callers see is
-`declared ?? inferred`, derived rather than stored. A third *closure*
-(`precise`, annotations ignored, for the optimizer) is a real field but only
-once something reads it. See §1's "two closures".
+**(c) "One stored set is enough."** Two are, but only two: what the source
+wrote (`declared`) and what the body closes over (`inferred`). What callers
+see is `declared ?? inferred`, derived rather than stored. There is no third
+closure — see §1's "one contract".
 
 ### What monotonicity we are relying on
 
@@ -341,10 +342,6 @@ closure destroyed the one value the check and the lint need. A stored branch
 result, saving a single `Option` test, at the cost of the information the
 diagnostics run on.
 
-`precise` is a genuinely separate propagation and gets its own array on
-`EffectAnalysis` when it lands — it cannot be derived from these. See "two
-closures" below.
-
 ### Why the term is stored
 
 A fixpoint *iterates*. If a function's equation were "walk the body", every
@@ -377,52 +374,64 @@ what was wrong was assembling it by hooks during Phase 3, and implying the
 MVP needed its subtraction half. It is the term, produced by one walk after
 Phase 3.
 
-### Two closures
+### One contract
 
-The split is the point of §0b's decision, so it is worth stating exactly.
-There are two propagations over the same graph, differing only in what a call
-edge contributes:
+There is exactly one propagation over the call graph, and one summary every
+consumer reads:
 
 ```
 inferred(f) = ⋃ contract(callee) over f's body       stored
 contract(f) = declared(f) ?? inferred(f)             derived
-
-precise(f)  = ⋃ precise(callee)  over f's body       stored, later (§7)
 ```
 
-`inferred` and `precise` are the same walk over the same graph; they differ
-only in which summary a call edge contributes — a callee's contract, or a
-callee's precise set with every annotation ignored. Both are computed for
-every bodied function; `contract` is one `Option` test on top.
-
-The check compares the stored body closure against the declaration, so it
-propagates **contracts**:
+The check compares the stored body closure against the declaration:
 
 ```
 inferred(f)  ⊆  declared(f)
 ```
 
-Checking against contracts rather than against `precise` is what makes the
-check modular. If `f` were validated using what `g` *happens* to do today,
-`g` legally widening within its own declared bound would break `f` — which is
+Propagating **contracts** rather than what callees happen to do today is what
+makes the check modular. If `f` were validated against `g`'s actual body, `g`
+legally widening within its own declared bound would break `f` — which is
 exactly what a contract exists to prevent.
 
-`precise` is not user-visible in any way: no diagnostic, no type, no coercion
-consults it. That is what makes it safe to add later without changing a single
-observable behaviour, and it is why the type system can afford to be
-imprecise in §0b's `broad()` example while codegen is not.
+**Why one set suffices for every consumer.** The `⊆` check means a
+declaration can only ever *widen*, so
+
+```
+contract(f)  ⊇  the effects f can actually perform
+```
+
+is an invariant of the whole system. Every consumer therefore reads an
+over-approximation, and over-approximation is the safe direction for all of
+them: the optimizer keeping a call it could have deleted is a missed
+optimization, never a miscompile; `catch` requiring a handler for an effect
+that cannot fire is precisely what declaring a wider bound is *for* (working
+draft, "the implementation may currently be pure and later change"). No
+consumer needs its own closure, and no rule anywhere selects between
+summaries.
+
+An earlier revision of this plan defined a second closure (`precise`, computed
+with annotations ignored) so the optimizer would not pay for the imprecision
+of §0b's `broad()` example. It is dropped, for two reasons. It defends
+against a hazard the language already makes explicit and opt-in — the only way
+to break the invariant above is the deliberate, greppable subtraction-without-
+handler construct, and defending the optimizer against a guarantee the user
+explicitly took off is the wrong trade. And it would compute the wrong thing
+at the wrong phase: a TIR-side closure runs on the *pre-inlining, pre-DCE*
+call graph, while `opt` runs after MIR has inlined and pruned. If the
+optimizer ever wants sharper facts than the contract, it derives them on its
+own graph, where it is strictly better positioned than TIR — and the lookup is
+exact either way, since `MonoRegistry`'s key `(DefId, Box<[TypeIndex]>)`
+(`mir/mod.rs:857`) is the payload of our effect atom.
 
 Note there is no per-edge boundary logic anywhere. A previous revision
 selected the summary per call site depending on package and body availability;
 §0b's rule removed that, and reducing an atom is now one unconditional lookup.
 
 Neither stored field is redundant. `declared_effects` is what the source said
-and what wx-fmt must round-trip; `inferred` is what the body does
-under its callees' contracts, which is what both diagnostics compare. The
-lint that answers "this declares `[trap]` but never traps" wants
-`precise` once it exists, since `inferred` is inflated by any broad
-annotation below it — which is why that lint is worth having even though it is
-demoted from a default warning.
+and what wx-fmt must round-trip; `inferred` is what the body does under its
+callees' contracts, which is what both diagnostics compare.
 
 The interner itself lives on `TIR` next to `types`, since MIR, the LSP and
 wx-fmt all need to resolve an `EffectSetId` back to names after `TIR::build`
@@ -1294,10 +1303,6 @@ how deep it goes. Its own body closure is still computed — that is what the
 `⊆ declared` check compares — but it is a leaf as far as every caller is
 concerned.
 
-When `precise` lands (§7) it is the same walk with the first case
-deleted: `precise()` always reads solver state where a body exists. Two runs
-of one fixpoint, differing in one branch.
-
 **An origin needs no marking.** `fn trap() [trap]` means
 `contract(trap) = {trap}`, so reducing the atom `trap` yields `{trap}` — a
 fixpoint. The solver never asks whether something is an origin.
@@ -1411,7 +1416,7 @@ The inferred set isn't known until the solver completes. For every function
 with `declared_effects = Some(d)`:
 
 - body closure ⊄ `d` → error, where the body closure propagates callees'
-  **contracts**, not their precise sets (§1). Label the declaration, and use
+  **contracts** (§1). Label the declaration, and use
   the solver-populated provenance map from §3 to point a secondary label at
   the call site that introduced the offending effect.
 - `d ⊄ body closure` → **lint, not a default warning**: "declared effect is
@@ -1419,9 +1424,11 @@ with `declared_effects = Some(d)`:
   deliberate breadth ("The implementation may currently be pure and later
   change to one that can trap without changing the public API"), and under
   §0b's rule that breadth already costs its callers precision, so firing by
-  default would fight the design. Compare against `precise` once it
-  exists (§1), since that is the set that actually answers "never performs".
-  **Exempt bodyless functions**, whose body closure is empty by definition —
+  default would fight the design. It is also inherently approximate: with one
+  closure (§1) the only body-derived set is `inferred`, which is itself
+  inflated by any broad annotation below it, so the lint misses cases where a
+  callee's wide declaration accounts for the effect. Being a lint rather than
+  a warning is what makes that acceptable. **Exempt bodyless functions**, whose body closure is empty by definition —
   without this it fires on every intrinsic and import, `fn trap() [trap] -> never;`
   included, which is the origin the whole system is built on. Also exempt
   trait methods once §7 lands — there the annotation is a bound over all
@@ -1567,19 +1574,14 @@ Each of these is additive against the structure above, not a rewrite:
   or an equivalent symbolic form. Not worth introducing the enum now for a
   single variant, but the honest statement is that `fx` changes the atom
   representation, not that it slots in beside it.
-- **The `precise` closure** — the second propagation defined in §1, computed
-  with annotations ignored. Purely additive by construction: nothing
-  user-visible reads it, so adding it cannot change a diagnostic or a type.
-  It is what keeps §0b's decision from costing codegen anything, and it is the
-  reason the type system can afford to be imprecise where a declaration is
-  broad. Same fixpoint, one branch deleted (§4).
-- **Optimizer payoff** — the point of all of it. `precise == EMPTY` on a call
-  is what lets `opt` CSE it, hoist it out of a loop, or delete it when its
-  result is unused; `write<M>` is what lets a load from a *different* memory
-  survive across an opaque imported call. Note that `opt` should read
-  `precise`, never `contract()` (§1): the type system is
-  deliberately imprecise where a declaration is broad, and the optimizer is
-  the one consumer that should not pay for that.
+- **Optimizer payoff** — the point of all of it. `contract() == EMPTY` on a
+  call is what lets `opt` CSE it, hoist it out of a loop, or delete it when
+  its result is unused; `write<M>` is what lets a load from a *different*
+  memory survive across an opaque imported call. `opt` reads `contract()`
+  like everyone else: it is an over-approximation by construction (§1), so
+  acting on it is always conservative. Where a broad declaration costs a real
+  optimization, the fix is a sharper propagation over MIR's *own* post-
+  inlining call graph, computed in MIR — not a second closure in TIR.
 
 ---
 
