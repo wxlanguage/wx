@@ -2121,7 +2121,8 @@ fn symbol_hover_text(
 			local_idx,
 		} => {
 			let fi = usize::from(tir.items.function_index(*func_id)?);
-			let body = tir.items.functions[fi].body.as_ref()?;
+			let body_idx = tir.items.functions[fi].body?;
+			let body = &tir.items.bodies[usize::from(body_idx)];
 			let local = body
 				.stack
 				.scopes
@@ -2215,7 +2216,7 @@ fn symbol_hover_text(
 					let si = usize::from(tir.items.struct_index(*def_id)?);
 					tir.items.structs[si].type_params.get(param_index)?
 				}
-				TypeParamOwner::ImplBlock(block_idx) => tir
+				TypeParamOwner::InherentImpl(block_idx) => tir
 					.items
 					.inherent_impls
 					.get(usize::from(*block_idx))?

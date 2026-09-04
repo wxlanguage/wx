@@ -1615,8 +1615,8 @@ fn test_struct_bitnot_overload_inline_method_is_substituted() {
 fn test_generic_bitand_bound_resolves_to_primitive_impl() {
 	// A bare type param bounded by `BitAnd` must dispatch through
 	// `resolve_bounded_operator_method` and monomorphize to `i32`'s own
-	// (native-fast-path-backed) impl — the generic-bound counterpart of
-	// the struct tests above, exercising primitives instead.
+	// (intrinsic-backed) impl — the generic-bound counterpart of the struct
+	// tests above, exercising primitives instead.
 	let case = TestCase::new(indoc! {"
         fn and_it<T: BitAnd>(a: T, b: T) -> T {
             a & b
@@ -1637,8 +1637,8 @@ fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
 	// branch, so a bare type param bounded by `BitNot` failed to dispatch
 	// at all. Now it goes through `resolve_bounded_operator_method` and
-	// monomorphizes to `i32`'s own (native-fast-path-backed) impl, same as
-	// the binary case.
+	// monomorphizes to `i32`'s own (intrinsic-backed) impl, same as the
+	// binary case.
 	let case = TestCase::new(indoc! {"
         fn not_it<T: BitNot>(a: T) -> T {
             ^a

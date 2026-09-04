@@ -146,9 +146,7 @@ pub fn rem_pio2(x: f64) -> (i32, f64, f64) {
     };
 
     // |x| ~< 2^20*(pi/2), medium size — 33+33+33 bit pi is good enough here.
-    if ix < 0x413921fb {
-        return medium(x, ix);
-    };
+    if ix < 0x413921fb { return medium(x, ix); };
 
     // Large finite `x`, or `x` is inf/NaN — the former would need `rem_pio2_large`, the latter
     // is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the original); both

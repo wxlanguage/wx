@@ -296,7 +296,8 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			});
 		}
 
-		if let Some(body) = &function.body {
+		if let Some(body_idx) = function.body {
+			let body = &tir.items.bodies[usize::from(body_idx)];
 			for (scope_idx, scope) in body.stack.scopes_with_indices() {
 				let scope_offset = usize::from(scope_idx);
 				if let Some(label_index) = scope.label {
@@ -720,7 +721,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 
 		for (param_index, tp) in block.type_params.iter().enumerate() {
 			let kind = SymbolKind::TypeParam {
-				owner: TypeParamOwner::ImplBlock(block_idx),
+				owner: TypeParamOwner::InherentImpl(block_idx),
 				param_index: param_index as u32,
 			};
 			index.definitions.push(SpanInfo {

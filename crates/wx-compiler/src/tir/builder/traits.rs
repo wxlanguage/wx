@@ -386,7 +386,7 @@ impl<'ast> Builder<'ast, '_> {
 				.target
 				.inner;
 			let self_scope = GenericScope {
-				owner: TypeParamOwner::ImplBlock(block_index),
+				owner: TypeParamOwner::InherentImpl(block_index),
 				self_type: Some(self_type),
 			};
 			let resolved_ty = match ty {
@@ -416,7 +416,7 @@ impl<'ast> Builder<'ast, '_> {
 					id: *id,
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
-					parent: Some(ItemParent::Impl(self_type)),
+					parent: Some(ItemParent::InherentImpl(block_index)),
 					pub_span: *pub_span,
 					name: *name,
 					ty: ast::Spanned {
@@ -478,14 +478,13 @@ impl<'ast> Builder<'ast, '_> {
 			id: *id,
 			file_id: resolve_context.file_id,
 			namespace: resolve_context.namespace,
-			parent: Some(ItemParent::GenericImpl(block_index)),
+			parent: Some(ItemParent::InherentImpl(block_index)),
 			body: None,
 			type_params: signature
 				.type_params
 				.iter()
 				.map(|tp| TypeParamInfo::new(tp.name))
 				.collect(),
-			type_param_parent: Some(TypeParamOwner::ImplBlock(block_index)),
 			inherited_type_param_count,
 			pub_span: *pub_span,
 			signature_index: TypeIndex::ERROR,
@@ -677,14 +676,14 @@ impl<'ast> Builder<'ast, '_> {
 	) {
 		self.resolve_type_param_bounds(
 			resolve_context,
-			TypeParamOwner::ImplBlock(block_index),
+			TypeParamOwner::InherentImpl(block_index),
 			None,
 			impl_type_params,
 		);
 		let self_type = self.resolve_signature_type(
 			resolve_context,
 			Some(GenericScope {
-				owner: TypeParamOwner::ImplBlock(block_index),
+				owner: TypeParamOwner::InherentImpl(block_index),
 				self_type: None,
 			}),
 			impl_target,
@@ -871,7 +870,7 @@ impl<'ast> Builder<'ast, '_> {
 		// implementing `Foo` (and therefore `Bar`), which is exactly
 		// `Foo`'s own `Self` placeholder — there's no concrete
 		// receiver yet at trait-declaration time.
-		let self_type = self.intern_type(Type::TypeParam {
+		let self_type = self.types.intern(Type::TypeParam {
 			owner: TypeParamOwner::Trait(trait_index),
 			param_index: 0,
 		});
@@ -935,7 +934,6 @@ impl<'ast> Builder<'ast, '_> {
 					.iter()
 					.map(|tp| TypeParamInfo::new(tp.name))
 					.collect(),
-				type_param_parent: Some(TypeParamOwner::Trait(trait_index)),
 				inherited_type_param_count: 1,
 				signature_index: TypeIndex::ERROR,
 				name: signature.name,
@@ -944,7 +942,7 @@ impl<'ast> Builder<'ast, '_> {
 				result: None,
 				attributes,
 			});
-			let self_type = self.intern_type(Type::TypeParam {
+			let self_type = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
 			});
@@ -991,7 +989,7 @@ impl<'ast> Builder<'ast, '_> {
 		item: &'ast ast::TraitItem,
 	) {
 		// Self is a TypeParam owned by the trait so `Self::*mut u8` is valid.
-		let self_type_param = self.intern_type(Type::TypeParam {
+		let self_type_param = self.types.intern(Type::TypeParam {
 			owner: TypeParamOwner::Trait(trait_index),
 			param_index: 0,
 		});
@@ -1254,9 +1252,6 @@ impl<'ast> Builder<'ast, '_> {
 					.iter()
 					.map(|tp| TypeParamInfo::new(tp.name))
 					.collect(),
-				type_param_parent: Some(TypeParamOwner::TraitImpl(
-					trait_impl_index,
-				)),
 				inherited_type_param_count,
 				pub_span: *pub_span,
 				signature_index: TypeIndex::ERROR,
@@ -1409,7 +1404,7 @@ impl<'ast> Builder<'ast, '_> {
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
-			let self_type_param = self.intern_type(Type::TypeParam {
+			let self_type_param = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
 			});

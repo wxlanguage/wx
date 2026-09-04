@@ -202,7 +202,7 @@ impl<'ast> Builder<'ast, '_> {
 						Type::try_from(
 							self.interner.resolve(name.inner).unwrap(),
 						)
-						.map(|ty| self.intern_type(ty))
+						.map(|ty| self.types.intern(ty))
 						.unwrap_or(TypeIndex::ERROR)
 					}
 					None => {
@@ -570,7 +570,6 @@ impl<'ast> Builder<'ast, '_> {
 						signature_index,
 						body: None,
 						type_params: Box::new([]),
-						type_param_parent: None,
 						inherited_type_param_count: 0,
 						pub_span: None,
 						name: signature.name,
@@ -1309,7 +1308,7 @@ impl<'ast> Builder<'ast, '_> {
 		params: &[FunctionParam],
 		result: Option<Spanned<TypeIndex>>,
 	) -> TypeIndex {
-		self.intern_type(Type::Function {
+		self.types.intern(Type::Function {
 			signature: FunctionSignature {
 				items: params
 					.iter()

@@ -6,81 +6,57 @@ Before getting into effects, there is one important property of WebAssembly we n
 
 WebAssembly was designed as a platform for sandboxed code execution. A module doesn't automatically have access to things outside of its sandbox. If it wants to communicate with the outside world, that functionality has to be explicitly provided by the host.
 
-For example, WebAssembly itself doesn't have a \`print\` function. If we want our module to print something, the host needs to provide that functionality as an import.
+For example, WebAssembly itself doesn't have a `print` function. If we want our module to print something, the host needs to provide that functionality as an import.
 
 In WX that could look like this:
 
-\`\`\`rust
-
+```rs
 import "console" as console {
-
-    fn log(n: i32) [log];
-
+    fn log(n: i32) [log] -> ();
 }
 
 fn main() {
-
     console::log(123);
-
 }
 
 export {
-
     main,
-
 }
-
-\`\`\`
+```
 
 You can think about a WebAssembly module almost like a function itself. The host provides its imports, while the module exposes exports that the host can call:
 
-\`\`\`text
-
-                 +--------------------------+
-
-                 |                          |
-
-                 |                          |
-
-                 +----.                .----+
-
-                       \              /      \\
-
-  [HOST PLUG] --------> )    WASM    (        ) ---> [HOST SOCKET]
-
- (console::log)        /    MODULE    \      /        (main)
-
-                 +----'                '----+
-
-                 |                          |
-
-                 |                          |
-
-                 +--------------------------+
-
-\`\`\`
+```text
+                 +--------------------------+
+                 |                          |
+                 |                          |
+                 +----.                .----+
+                       \              /      \
+  [HOST PLUG] --------> )    WASM    (        ) ---> [HOST SOCKET]
+ (console::log)        /    MODULE    \      /        (main)
+                 +----'                '----+
+                 |                          |
+                 |                          |
+                 +--------------------------+
+```
 
 The host instantiates the module with the required imports and can then call its exported functions.
 
-This sandbox boundary is going to become important for effects. An imported function such as \`console::log\` can do something observable outside of the WebAssembly module, while its implementation isn't even available for our compiler to inspect.
+This sandbox boundary is going to become important for effects. An imported function such as `console::log` can do something observable outside of the WebAssembly module, while its implementation isn't even available for our compiler to inspect.
 
-Now let's go back to our \`main\` function and ask a simple question: **\*\*what does this function actually do?\*\***
+Now let's go back to our `main` function and ask a simple question: **what does this function actually do?**
 
 A normal function signature describes its inputs and outputs. It tells us which values go in and which value comes back, but it doesn't tell us everything that might happen while the function is executing.
 
 For example, consider:
 
-\`\`\`rust
-
-fn do\_something() -> () {
-
+```rs
+fn do_something() -> () {
     console::log(123);
-
 }
+```
 
-\`\`\`
-
-Looking only at \`fn() -> ()\`, we might think there isn't much interesting about this function. It takes nothing and returns nothing.
+Looking only at `fn() -> ()`, we might think there isn't much interesting about this function. It takes nothing and returns nothing.
 
 But removing the call would obviously change the behaviour of the program because it prints something to the outside world.
 
@@ -92,25 +68,21 @@ This is where effects come in.
 
 In WX, a function signature can contain an effect set after its arguments:
 
-\`\`\`rust
-
+```rs
 import "console" as console {
-
     fn log(n: i32) [log] -> ();
-
 }
+```
 
-\`\`\`
+The square brackets describe the effects that may happen when the function is executed. Here, calling `console::log` has the `log` effect.
 
-The square brackets describe the effects that may happen when the function is executed. Here, calling \`console::log\` has the \`log\` effect.
+But this immediately raises another question: **what exactly is `log`? Where does an effect come from in the first place?**
 
-But this immediately raises another question: **\*\*what exactly is \`log\`? Where does an effect come from in the first place?\*\***
-
-**## Effect origin and tracking**
+## Effect origin and tracking
 
 The one big problem in this model is: how do we even originate an effect? What is an effect from the compiler's perspective?
 
-Many languages with effect systems introduce a separate vocabulary for effects. You might have effects such as \`IO\`, \`Exception\`, \`State\`, or user-defined effect operations. Functions can then declare that performing some operation introduces one of these effects.
+Many languages with effect systems introduce a separate vocabulary for effects. You might have effects such as `IO`, `Exception`, `State`, or user-defined effect operations. Functions can then declare that performing some operation introduces one of these effects.
 
 But why do we need a separate concept for effects at all? We already have functions describing operations that can happen in our program. What if an effect could simply be a function?
 
@@ -120,33 +92,27 @@ For a function without a body there is nothing to inspect, so the compiler canno
 
 A bodyless function can declare no effects at all:
 
-\`\`\`rust
-
-fn some\_intrinsic() [] -> i32;
-
-\`\`\`
+```rs
+fn some_intrinsic() [] -> i32;
+```
 
 It can say that calling it may perform some already existing effect:
 
-\`\`\`rust
-
-fn i32\_div(a: i32, b: i32) [trap] -> i32;
-
-\`\`\`
+```rs
+fn i32_div(a: i32, b: i32) [trap] -> i32;
+```
 
 Or it can reference itself, effectively becoming the origin of a new effect:
 
-\`\`\`rust
-
+```rs
 fn trap() [trap] -> never;
+```
 
-\`\`\`
-
-There is no separate \`effect trap\` declaration here. \`trap\` is just a function, and putting itself into its own effect set tells the compiler that this is where the \`trap\` effect originates.
+There is no separate `effect trap` declaration here. `trap` is just a function, and putting itself into its own effect set tells the compiler that this is where the `trap` effect originates.
 
 In practice there are two main places where such bodyless functions come from in WX: imported functions, whose implementation lives outside the WebAssembly module, and compiler intrinsics representing WebAssembly instructions.
 
-**### How effects compose**
+### How effects compose
 
 Once an effect originates somewhere, it needs to propagate through everything that can reach it.
 
@@ -154,387 +120,284 @@ The rule here is fairly simple: the **inferred effects** of a function are the u
 
 Suppose we have two effectful operations:
 
-\`\`\`rust
-
+```rs
 fn foo() [foo];
-
 fn bar() [bar];
-
-\`\`\`
+```
 
 and call both of them:
 
-\`\`\`rust
-
-fn do\_something() {
-
+```rs
+fn do_something() {
     foo();
-
     bar();
-
 }
-
-\`\`\`
+```
 
 The compiler can infer the resulting effect set:
 
-\`\`\`rust
-
-fn do\_something() [foo, bar] {
-
+```rs
+fn do_something() [foo, bar] {
     // ...
-
 }
+```
 
-\`\`\`
+Effects form a set, so duplicates don't matter. Calling `foo()` once or ten times still only adds `foo` once.
 
-Effects form a set, so duplicates don't matter. Calling \`foo()\` once or ten times still only adds \`foo\` once.
-
-The same process continues transitively through the call graph. If another function calls \`do\_something\`, it inherits both \`foo\` and \`bar\` unless something handles those effects before they escape.
+The same process continues transitively through the call graph. If another function calls `do_something`, it inherits both `foo` and `bar` unless something handles those effects before they escape.
 
 This means that for ordinary functions we don't have to manually propagate effects through every layer of the program. The compiler already knows which operations a function performs and which other functions it calls, so it can infer the resulting set automatically.
 
-**### Tracking traps**
+### Tracking traps
 
 Let's look at a real example.
 
-One of the most basic relevant WebAssembly instructions is \`unreachable\`, which unconditionally traps when executed. For clarity, WX exposes this operation as \`trap\`:
+One of the most basic relevant WebAssembly instructions is `unreachable`, which unconditionally traps when executed. For clarity, WX exposes this operation as `trap`:
 
-\`\`\`rust
-
+```rs
 fn trap() [trap] -> never;
+```
 
-\`\`\`
+The `never` return type tells us that normal control flow cannot continue after this call. Separately, `[trap]` tells us why this computation is effectful: executing it may terminate the current WebAssembly execution with a trap.
 
-The \`never\` return type tells us that normal control flow cannot continue after this call. Separately, \`[trap]\` tells us why this computation is effectful: executing it may terminate the current WebAssembly execution with a trap.
+When we call `trap` inside another function:
 
-When we call \`trap\` inside another function:
-
-\`\`\`rust
-
+```rs
 fn main() {
-
     trap();
-
 }
-
-\`\`\`
+```
 
 the compiler can infer something equivalent to:
 
-\`\`\`rust
-
+```rs
 fn main() [trap] -> never;
+```
 
-\`\`\`
-
-Nothing special happened here specifically because this was a trap. We just applied the composition rule from above: \`main\` calls something with the \`[trap]\` effect, so \`trap\` becomes part of \`main\`'s effect set as well.
+Nothing special happened here specifically because this was a trap. We just applied the composition rule from above: `main` calls something with the `[trap]` effect, so `trap` becomes part of `main`'s effect set as well.
 
 Now consider integer division. WebAssembly integer division traps when the divisor is zero, so WX can describe the intrinsic like this:
 
-\`\`\`rust
+```rs
+fn i32_div(a: i32, b: i32) [trap] -> i32;
+```
 
-fn i32\_div(a: i32, b: i32) [trap] -> i32;
+Notice that this is `[trap]`, not `[i32_div]`.
 
-\`\`\`
-
-Notice that this is \`[trap]\`, not \`[i32\_div]\`.
-
-Division itself isn't an effect we are interested in tracking. It's an ordinary computation which happens to be capable of reaching the already established \`trap\` effect.
+Division itself isn't an effect we are interested in tracking. It's an ordinary computation which happens to be capable of reaching the already established `trap` effect.
 
 This distinction is important: a bodyless function doesn't necessarily introduce a new effect. Its declared effect bound describes what effects executing that operation may ultimately perform. Because there is no body from which to infer anything more precise, that bound is also used as the function's effect summary. Self-reference is simply the mechanism for saying that the operation itself originates a new effect.
 
-For this model to work, the compiler needs to eventually represent every potentially effectful operation through something whose effects it knows. This doesn't mean that everything has to *\*look\** like a function call in source code. Operators and other syntax can still provide the usual abstractions, as long as they eventually lower to functions whose effects the compiler can track.
+For this model to work, the compiler needs to eventually represent every potentially effectful operation through something whose effects it knows. This doesn't mean that everything has to **look** like a function call in source code. Operators and other syntax can still provide the usual abstractions, as long as they eventually lower to functions whose effects the compiler can track.
 
 Operators in WX work through traits, similarly to Rust. For example, integer division eventually resolves to:
 
-\`\`\`rust
-
+```rs
 impl Div for i32 {
-
     fn div(self, other: Self) -> Self {
-
-        i32\_div(self, other)
-
+        i32_div(self, other)
     }
-
 }
-
-\`\`\`
+```
 
 So when you write:
 
-\`\`\`rust
-
+```rs
 a / b
+```
 
-\`\`\`
+the compiler can follow that operation down to `i32_div`, which we already know has the `[trap]` effect. The abstraction doesn't hide the effect from the compiler.
 
-the compiler can follow that operation down to \`i32\_div\`, which we already know has the \`[trap]\` effect. The abstraction doesn't hide the effect from the compiler.
+Assignment variants work the same way. Unlike Rust, WX doesn't have a separate `DivAssign` trait: `a /= b` is syntax sugar derived from `Div`, so it ultimately carries the same effects.
 
-Assignment variants work the same way. Unlike Rust, WX doesn't have a separate \`DivAssign\` trait: \`a /= b\` is syntax sugar derived from \`Div\`, so it ultimately carries the same effects.
+## Exception handling
 
-**## Exception handling**
-
-So far our effect system isn't particularly exciting. We can track that an operation might trap, propagate that information through arbitrary layers of functions, and then... that's about it. A WebAssembly trap cannot be caught by ordinary module code, so once the \`trap\` effect appears there isn't much we can do with it.
+So far our effect system isn't particularly exciting. We can track that an operation might trap, propagate that information through arbitrary layers of functions, and then... that's about it. A WebAssembly trap cannot be caught by ordinary module code, so once the `trap` effect appears there isn't much we can do with it.
 
 Exceptions give us a more interesting example because they can be handled.
 
-The basic idea is similar to \`trap\`: somewhere in the program we perform an operation which interrupts normal control flow. The difference is that an exception can be caught before it escapes, allowing us to recover and continue execution.
+The basic idea is similar to `trap`: somewhere in the program we perform an operation which interrupts normal control flow. The difference is that an exception can be caught before it escapes, allowing us to recover and continue execution.
 
 This also gives us our first example of a parameterized effect.
 
 WebAssembly exceptions are represented using tags. In WX, a tag declaration looks like this:
 
-\`\`\`rust
-
+```rs
 tag ApplicationError(status: ErrorStatus) -> never;
+```
 
-\`\`\`
+Tags automatically implement the `Tag` trait:
 
-Tags automatically implement the \`Tag\` trait:
-
-\`\`\`rust
-
+```rs
 trait Tag {
-
     type Result;
-
 }
+```
 
-\`\`\`
+An exception is a tag whose result is `never`:
 
-An exception is a tag whose result is \`never\`:
-
-\`\`\`rust
-
+```rs
 trait Exception: Tag where { Result = never } {
-
     fn throw(self) -> never {
-
         throw(self)
-
     }
-
 }
+```
 
-\`\`\`
+The underlying `throw` operation can then be represented as another bodyless intrinsic:
 
-The underlying \`throw\` operation can then be represented as another bodyless intrinsic:
+```rs
+fn throw<E: Exception>(exception: E) [throw<E>] -> never;
+```
 
-\`\`\`rust
+This looks very similar to our earlier `trap`:
 
-fn throw\<E: Exception>(exception: E) [throw\<E>] -> never;
-
-\`\`\`
-
-This looks very similar to our earlier \`trap\`:
-
-\`\`\`rust
-
+```rs
 fn trap() [trap] -> never;
+```
 
-\`\`\`
-
-but there is one important difference. \`throw\` is generic, and the instantiated generic argument becomes part of the effect.
+but there is one important difference. `throw` is generic, and the instantiated generic argument becomes part of the effect.
 
 So these are distinct effects:
 
-\`\`\`rust
-
-throw\<ApplicationError>
-
-throw\<ConnectionError>
-
-\`\`\`
+```rs
+throw<ApplicationError>
+throw<ConnectionError>
+```
 
 This means we don't merely know that a function "might throw". We know exactly which exception types it might throw.
 
 For example:
 
-\`\`\`rust
-
+```rs
 fn handler() {
-
     if something() {
-
         ApplicationError(ErrorStatus::Internal).throw();
-
     }
-
 }
-
-\`\`\`
+```
 
 The compiler can infer:
 
-\`\`\`rust
-
-fn handler() [throw\<ApplicationError>] {
-
+```rs
+fn handler() [throw<ApplicationError>] {
     // ...
-
 }
+```
 
-\`\`\`
+And just like before, if `handler` calls another function which can throw `ConnectionError`, the effects compose:
 
-And just like before, if \`handler\` calls another function which can throw \`ConnectionError\`, the effects compose:
+```rs
+[throw<ApplicationError>, throw<ConnectionError>]
+```
 
-\`\`\`rust
-
-[throw\<ApplicationError>, throw\<ConnectionError>]
-
-\`\`\`
-
-**### Handling effects**
+### Handling effects
 
 This is where exceptions become more interesting than our previous examples.
 
-So far effects could only originate and propagate outward. A \`catch\` gives us a way to handle an effect before it escapes:
+So far effects could only originate and propagate outward. A `catch` gives us a way to handle an effect before it escapes:
 
-\`\`\`rust
-
+```rs
 fn main() {
-
     local result = handler() catch {
-
         ApplicationError(status) -> {
-
             fallback()
-
         },
-
     };
-
 }
+```
 
-\`\`\`
+If `handler()` has:
 
-If \`handler()\` has:
+```rs
+[throw<ApplicationError>]
+```
 
-\`\`\`rust
-
-[throw\<ApplicationError>]
-
-\`\`\`
-
-and the \`catch\` handles \`ApplicationError\`, then that effect no longer propagates beyond the \`catch\`.
+and the `catch` handles `ApplicationError`, then that effect no longer propagates beyond the `catch`.
 
 You can think of it as transforming the effect set of the expression:
 
-\`\`\`text
-
+```text
 handler()
-
-    [throw\<ApplicationError>]
-
+    [throw<ApplicationError>]
         catch ApplicationError
-
     []
-
-\`\`\`
+```
 
 If the expression can perform other effects, however, those remain:
 
-\`\`\`text
-
-[log, throw\<ApplicationError>, throw\<ConnectionError>]
-
+```text
+[log, throw<ApplicationError>, throw<ConnectionError>]
         catch ApplicationError
-
-[log, throw\<ConnectionError>]
-
-\`\`\`
+[log, throw<ConnectionError>]
+```
 
 So handling an effect doesn't make the whole expression pure. It only removes the effects which were actually handled.
 
-Because the compiler knows the exact set of exception effects that can reach a \`catch\`, WX can also check whether the handler is exhaustive. You can explicitly handle every possible exception:
+Because the compiler knows the exact set of exception effects that can reach a `catch`, WX can also check whether the handler is exhaustive. You can explicitly handle every possible exception:
 
-\`\`\`rust
-
+```rs
 local result = handler() catch {
-
     ApplicationError(status) -> ...,
-
     ConnectionError(code) -> ...,
-
 };
+```
 
-\`\`\`
+or use a `_` fallback when you intentionally don't care which exception was thrown:
 
-or use a \`\_\` fallback when you intentionally don't care which exception was thrown:
-
-\`\`\`rust
-
+```rs
 local result = handler() catch {
-
     ApplicationError(status) -> ...,
-
-    \_ -> fallback(),
-
+    _ -> fallback(),
 };
+```
 
-\`\`\`
-
-In that sense, \`catch\` is similar to a \`match\`: instead of exhaustively matching possible values, we're exhaustively handling possible exceptional exits from a computation.
+In that sense, `catch` is similar to a `match`: instead of exhaustively matching possible values, we're exhaustively handling possible exceptional exits from a computation.
 
 This gives us the other half of effect tracking. Function calls and operations add and compose effects, while constructs that understand a particular effect can handle it and prevent it from propagating further.
 
-**## Memory effects**
+## Memory effects
 
 Before we continue, I need to briefly explain how memory works in WX, since it's somewhat different from what you might be used to in other languages.
 
 WebAssembly modules aren't required to have linear memory at all. A module can simply export functions that operate on values directly. When you do need memory, however, it has to be explicitly declared. In WX, that looks like this:
 
-\`\`\`wx
-
+```rs
 memory heap: Memory where { Size = u32 };
+```
 
-\`\`\`
-
-\`heap\` is the name of the memory and can be referenced elsewhere in the program. The \`Memory\` trait describes the memory itself, while \`Size\` tells us the size of its addresses. In this case, pointers into \`heap\` use 32-bit addresses.
+`heap` is the name of the memory and can be referenced elsewhere in the program. The `Memory` trait describes the memory itself, while `Size` tells us the size of its addresses. In this case, pointers into `heap` use 32-bit addresses.
 
 More importantly, every memory declaration creates its own unique type. If we declare two memories:
 
-\`\`\`wx
-
+```rs
 memory heap: Memory where { Size = u32 };
-
 memory secondary: Memory where { Size = u64 };
+```
 
-\`\`\`
-
-\`heap\` and \`secondary\` aren't just two values referring to different memories — they also represent distinct types.
+`heap` and `secondary` aren't just two values referring to different memories — they also represent distinct types.
 
 Pointers carry this information as part of their type:
 
-\`\`\`wx
-
+```rs
 // type alias just for demonstration purposes
-
-type Pointer\<Mem: Memory> = Mem::\*u8;
-
+type Pointer<Mem: Memory> = Mem::*u8;
                             ^^^
+```
 
-\`\`\`
+A `heap::*u8` therefore cannot be confused with a `secondary::*u8`. From the pointer type alone, the compiler knows exactly which linear memory the pointer belongs to.
 
-A \`heap::\*u8\` therefore cannot be confused with a \`secondary::\*u8\`. From the pointer type alone, the compiler knows exactly which linear memory the pointer belongs to.
-
-This means that whenever we perform an operation through a pointer, the compiler doesn't merely know that we're accessing *\*some memory\**. It knows exactly which memory is being accessed.
+This means that whenever we perform an operation through a pointer, the compiler doesn't merely know that we're accessing **some memory**. It knows exactly which memory is being accessed.
 
 This distinction is going to become important for effect tracking.
 
-\`\`\`rs
+```rs
+fn read<Mem: Memory>(mem: Mem) [read<Mem>];
+fn write<Mem: Memory>(mem: Mem) [read<Mem>, write<Mem>];
+fn grow<Mem: Memory>(mem: Mem) [read<Mem>, grow<Mem>];
+```
 
-fn read\<Mem: Memory>(mem: Mem) [read\<Mem>];
-
-fn write\<Mem: Memory>(mem: Mem) [read\<Mem>, write\<Mem>];
-
-fn grow\<Mem: Memory>(mem: Mem) [read\<Mem>, grow\<Mem>];
-
-\`\`\`
-
-Just like \`throw\<E>\` from the previous example, these effects are parameterized by a type. Since every memory has its own unique type, \`read\<heap>\` and \`read\<secondary>\` are two distinct effects.
+Just like `throw<E>` from the previous example, these effects are parameterized by a type. Since every memory has its own unique type, `read<heap>` and `read<secondary>` are two distinct effects.
 
 What's slightly unusual here is that these functions don't actually read or write anything themselves. They don't even take a pointer. The memory instance is effectively just a zero-sized value identifying a particular memory, so these calls don't need to produce any runtime code.
 
@@ -542,23 +405,21 @@ But that's the whole idea.
 
 There are many different operations that can access memory. WebAssembly itself has a whole set of load, store and memory instructions, while imported host functions can access a module's memory as well. Giving every one of those operations its own effect would preserve information we don't really care about.
 
-What we usually want to know is much simpler: **\*\*which memory can this computation read or modify?\*\***
+What we usually want to know is much simpler: **which memory can this computation read or modify?**
 
-So all operations that read \`heap\` can share \`read\<heap>\`, while operations that may modify it share \`write\<heap>\`.
+So all operations that read `heap` can share `read<heap>`, while operations that may modify it share `write<heap>`.
 
 This information is also useful for the optimizer. Consider an imported function:
 
-\`\`\`rs
+```rs
+fn process_audio(...) [write<audio_memory>];
+```
 
-fn process\_audio(...) [write\<audio\_memory>];
+The compiler can't inspect its implementation, but it still knows something very important: after calling it, any previously loaded value from `audio_memory` might be stale.
 
-\`\`\`
+At the same time, the effect says nothing about other memories. If we also have a separate `heap`, the compiler knows that `process_audio` cannot modify it, so values loaded from `heap` can still be safely reused.
 
-The compiler can't inspect its implementation, but it still knows something very important: after calling it, any previously loaded value from \`audio\_memory\` might be stale.
-
-At the same time, the effect says nothing about other memories. If we also have a separate \`heap\`, the compiler knows that \`process\_audio\` cannot modify it, so values loaded from \`heap\` can still be safely reused.
-
-There is a limit to how precise this information is. \`write\<audio\_memory>\` doesn't tell us *\*where\** inside that memory the function writes. It might modify one byte or the entire memory, so across an opaque call like this the safe assumption is that any previous read from \`audio\_memory\` may have been invalidated.
+There is a limit to how precise this information is. `write<audio_memory>` doesn't tell us **where** inside that memory the function writes. It might modify one byte or the entire memory, so across an opaque call like this the safe assumption is that any previous read from `audio_memory` may have been invalidated.
 
 This doesn't mean that the compiler has to be equally conservative when optimizing code it can actually see. Inside the module we can still perform normal alias analysis and use the language's borrowing rules to prove that two pointers cannot refer to the same location. In those cases, the optimizer can reason about individual accesses much more precisely.
 
@@ -566,9 +427,9 @@ So these two mechanisms complement each other. Alias analysis gives us fine-grai
 
 We could theoretically make the effects themselves more precise by tracking individual memory regions or ranges, but that would be too much of a headache to manage properly. I think the current abstraction is more than enough to produce good, optimizable code.
 
-As a small side note, \`grow\` is a separate effect because WebAssembly linear memory can grow during execution, but currently cannot shrink. The effect model simply reflects that asymmetry.
+As a small side note, `grow` is a separate effect because WebAssembly linear memory can grow during execution, but currently cannot shrink. The effect model simply reflects that asymmetry.
 
-**## Effect bounds and polymorphism
+## Effect bounds and polymorphism
 
 Earlier we established that an explicit effect annotation is an **upper bound**, not necessarily the exact effects of a function. So far this distinction hasn't mattered much: ordinary functions usually had their effects inferred, while bodyless functions gave the compiler no more precise information to work with. Once effects become part of the type system, however, the distinction becomes important.
 
@@ -907,90 +768,65 @@ These signatures don't commit the API to one concrete effect set. Instead, they 
 
 This is where making effects part of the type system becomes useful. Within a concrete body, inference can discover what the implementation does. But once functions are passed around, abstracted over, dynamically dispatched, or exposed across package boundaries, their types need to preserve both what effects are allowed and how those effects depend on other parts of the program.
 
-
-## Global variables**
+## Global variables
 
 Global variables follow the same general model as the other low-level WebAssembly features we've looked at so far.
 
 At the bottom we have a couple of compiler intrinsics that directly represent WebAssembly's global instructions and act as effect sources:
 
-\`\`\`rs
-
-fn global\_get\<G: Global>(g: G) [global\_get\<G>] -> G::Value;
-
-fn global\_set\<G: GlobalMut>(g: G, value: G::Value) [global\_set\<G>];
-
-\`\`\`
+```rs
+fn global_get<G: Global>(g: G) [global_get<G>] -> G::Value;
+fn global_set<G: GlobalMut>(g: G, value: G::Value) [global_set<G>];
+```
 
 On top of those, the standard library exposes separate traits for immutable and mutable globals:
 
-\`\`\`rs
-
+```rs
 trait Global {
-
     type Value: Copy;
-
     fn get(self) -> Self::Value {
-
-        global\_get(self)
-
+        global_get(self)
     }
-
 }
 
 trait GlobalMut: Global {
-
     fn set(self, value: Self::Value) {
-
-        global\_set(self, value)
-
+        global_set(self, value)
     }
-
 }
-
-\`\`\`
+```
 
 A global can then be declared like any other item:
 
-\`\`\`rs
-
+```rs
 global x: GlobalMut where { Value = i32 } = 0;
+```
 
-\`\`\`
+and accessed explicitly through `get` and `set`:
 
-and accessed explicitly through \`get\` and \`set\`:
-
-\`\`\`rs
-
-fn main() { // [global\_get\<x>, global\_set\<x>]
-
+```rs
+fn main() { // [global_get<x>, global_set<x>]
     x.set(x.get() + 1);
-
 }
+```
 
-\`\`\`
+Just like with memories, every global has its own identity, so `global_get<x>` and `global_get<y>` are different effects. This gives the compiler precise information about which particular global a function may observe or modify.
 
-Just like with memories, every global has its own identity, so \`global\_get\<x>\` and \`global\_get\<y>\` are different effects. This gives the compiler precise information about which particular global a function may observe or modify.
-
-One deliberate difference from local variables is that globals have to be accessed through \`get()\` and \`set()\`. WX doesn't implement ordinary arithmetic or assignment operators directly on global values.
+One deliberate difference from local variables is that globals have to be accessed through `get()` and `set()`. WX doesn't implement ordinary arithmetic or assignment operators directly on global values.
 
 For example, something like this is intentionally not supported:
 
-\`\`\`rs
-
+```rs
 x += 1;
+```
 
-\`\`\`
-
-Allowing that would mean otherwise simple primitive operators such as \`Add\`, or assignment syntax itself, could silently introduce global effects. I want primitive operations to stay as predictable as possible, so global access remains explicit in the source code.
+Allowing that would mean otherwise simple primitive operators such as `Add`, or assignment syntax itself, could silently introduce global effects. I want primitive operations to stay as predictable as possible, so global access remains explicit in the source code.
 
 The slightly more verbose version:
 
-\`\`\`rs
-
+```rs
 x.set(x.get() + 1);
-
-\`\`\`
+```
 
 makes it immediately visible that we're reading and then modifying global state. It also maps very directly to the underlying WebAssembly operations.
 
@@ -998,11 +834,9 @@ There is one more restriction: WebAssembly globals in WX can only contain primit
 
 If you need global aggregate state, you can instead place the value in memory and store a pointer to it:
 
-\`\`\`rs
-
+```rs
 global state: GlobalMut where { Value = heap::&mut State } = ...;
-
-\`\`\`
+```
 
 A pointer is itself a primitive value, so it can be stored in a global normally.
 
@@ -1010,4 +844,4 @@ This restriction also keeps importing and exporting globals simple. If aggregate
 
 By keeping globals limited to values that WebAssembly itself can represent directly, imports and exports stay predictable and don't require any hidden transformations.
 
-I also quite like the explicit \`get()\` and \`set()\` syntax as a side effect of this design. Global state stands out visually from ordinary local computation, and the corresponding effects are equally explicit to the compiler. The exact API may still change, but I think the underlying model is useful.
+I also quite like the explicit `get()` and `set()` syntax as a side effect of this design. Global state stands out visually from ordinary local computation, and the corresponding effects are equally explicit to the compiler. The exact API may still change, but I think the underlying model is useful.

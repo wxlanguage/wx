@@ -286,7 +286,7 @@ impl<'ast> Builder<'ast, '_> {
 			));
 		}
 
-		let ty = self.intern_type(Type::Struct {
+		let ty = self.types.intern(Type::Struct {
 			struct_index,
 			args: resolved_args,
 		});
@@ -377,7 +377,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		let elem_types: Box<[TypeIndex]> = built.iter().map(|e| e.ty).collect();
-		let ty = self.intern_type(Type::Tuple {
+		let ty = self.types.intern(Type::Tuple {
 			elements: elem_types,
 		});
 
@@ -514,7 +514,7 @@ impl<'ast> Builder<'ast, '_> {
 			Some(m) => m,
 			None => self.resolve_ambient_memory(source_span)?,
 		};
-		let array_ty = self.intern_type(Type::Array {
+		let array_ty = self.types.intern(Type::Array {
 			of: elem_type,
 			size: elements.len() as u32,
 			memory,
@@ -633,7 +633,7 @@ impl<'ast> Builder<'ast, '_> {
 			Some(m) => m,
 			None => self.resolve_ambient_memory(source_span)?,
 		};
-		let array_ty = self.intern_type(Type::Array {
+		let array_ty = self.types.intern(Type::Array {
 			of: value.ty,
 			size: count,
 			memory,
@@ -837,7 +837,7 @@ impl<'ast> Builder<'ast, '_> {
 			.map(|e| build_bound(self, e).map(Box::new))
 			.transpose()?;
 
-		let result_ty = self.intern_type(Type::Slice {
+		let result_ty = self.types.intern(Type::Slice {
 			of: elem_type,
 			memory,
 			ownership,

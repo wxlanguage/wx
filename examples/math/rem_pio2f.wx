@@ -21,7 +21,7 @@ const PIO2_1T: f64 = 1.58932547735281966916e-08;
 pub fn rem_pio2f(x: f32) -> (i32, f64) {
     local x64: f64 = x.promote();
     local ix: u32 = x.to_bits() & 0x7fffffff;
-    
+
     // |x| ~< 2^28*(pi/2), medium size — 25+53 bit pi is good enough here.
     if ix < 0x4dc90fdb {
         // Specialised rint(): adding then subtracting 1.5/EPSILON forces rounding to an
@@ -32,7 +32,7 @@ pub fn rem_pio2f(x: f32) -> (i32, f64) {
         local f_n = tmp - TOINT;
         return (f_n.to_i32(), x64 - f_n * PIO2_1 - f_n * PIO2_1T);
     };
-    
+
     // Large finite `x`, or `x` is inf/NaN — the former would need `__rem_pio2_large`, the
     // latter is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the
     // original); both collapse to the same answer here.

@@ -10,49 +10,57 @@ const C4_PIO2: f64 = 4. * f64::FRAC_PI_2; // 0x401921FB, 0x54442D18
 ///
 /// `x` is specified in radians.
 pub fn cosf(x: f32) -> f32 {
-  local x64 = x.promote();
+    local x64 = x.promote();
 
-  local mut ix = x.to_bits();
-  local sign = (ix >> 31) != 0;
-  ix &= 0x7fffffff;
+    local mut ix = x.to_bits();
+    local sign = (ix >> 31) != 0;
+    ix &= 0x7fffffff;
 
-  if ix <= 0x3f490fda {
-    // |x| ~<= pi/4
-    if ix < 0x39800000 {
-      // |x| < 2**-12
-      return 1.;
+    if ix <= 0x3f490fda {
+        // |x| ~<= pi/4
+        if ix < 0x39800000 {
+            // |x| < 2**-12
+            return 1.;
+        }
+        return k_cosf(x64);
     }
-    return k_cosf(x64);
-  }
-  if ix <= 0x407b53d1 {
-    // |x| ~<= 5*pi/4
-    if ix > 0x4016cbe3 {
-      // |x|  ~> 3*pi/4
-      return -k_cosf(if sign { x64 + C2_PIO2 } else { x64 - C2_PIO2 });
-    } else {
-      return if sign { k_sinf(x64 + C1_PIO2) } else { k_sinf(C1_PIO2 - x64) };
+    if ix <= 0x407b53d1 {
+        // |x| ~<= 5*pi/4
+        if ix > 0x4016cbe3 {
+            // |x|  ~> 3*pi/4
+            return -k_cosf(if sign { x64 + C2_PIO2 } else { x64 - C2_PIO2 });
+        } else {
+            return if sign {
+                k_sinf(x64 + C1_PIO2)
+            } else {
+                k_sinf(C1_PIO2 - x64)
+            };
+        }
     }
-  }
 
-  if ix <= 0x40e231d5 {
-    // |x| ~<= 9*pi/4 */
-    if ix > 0x40afeddf {
-      // |x| ~> 7*pi/4 */
-      return k_cosf(if sign { x64 + C4_PIO2 } else { x64 - C4_PIO2 });
-    } else {
-      return if sign { k_sinf(-x64 - C3_PIO2) } else { k_sinf(x64 - C3_PIO2) };
+    if ix <= 0x40e231d5 {
+        // |x| ~<= 9*pi/4 */
+        if ix > 0x40afeddf {
+            // |x| ~> 7*pi/4 */
+            return k_cosf(if sign { x64 + C4_PIO2 } else { x64 - C4_PIO2 });
+        } else {
+            return if sign {
+                k_sinf(-x64 - C3_PIO2)
+            } else {
+                k_sinf(x64 - C3_PIO2)
+            };
+        }
     }
-  }
 
-  // cos(Inf or NaN) is NaN
-  if ix >= 0x7f800000 { return x - x };
+    // cos(Inf or NaN) is NaN
+    if ix >= 0x7f800000 { return x - x };
 
-  // general argument reduction needed
-  local (n, y) = rem_pio2f(x);
-  match n & 3 {
-    0 -> { k_cosf(y) },
-    1 -> { k_sinf(-y) },
-    2 -> { -k_cosf(y) },
-    _ -> { k_sinf(y) }
-  }
+    // general argument reduction needed
+    local (n, y) = rem_pio2f(x);
+    match n & 3 {
+        0 -> { k_cosf(y) },
+        1 -> { k_sinf(-y) },
+        2 -> { -k_cosf(y) },
+        _ -> { k_sinf(y) }
+    }
 }

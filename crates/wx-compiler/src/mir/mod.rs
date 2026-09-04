@@ -1448,10 +1448,10 @@ impl<'tir> Builder<'tir> {
 	}
 
 	fn lower_function(&mut self, func: &tir::Function) -> Function {
-		let body = func
+		let body_idx = func
 			.body
-			.as_ref()
 			.expect("lower_function called on bodyless function");
+		let body = &self.tir.items.bodies[usize::from(body_idx)];
 		let frame = body
 			.stack
 			.scopes
@@ -1505,17 +1505,18 @@ impl<'tir> Builder<'tir> {
 			Type::F32 | Type::F64 => ConstInit::Float(0.0),
 			_ => ConstInit::Int(0),
 		};
-		let const_init = global
-			.value
-			.as_ref()
-			.and_then(|body| match body.block.kind {
-				tir::ExprKind::Int { value } => {
-					Some(ConstInit::Int(value as i64))
+		let const_init = match global.value {
+			Some(body_idx) => {
+				match self.tir.items.bodies[usize::from(body_idx)].block.kind {
+					tir::ExprKind::Int { value } => {
+						ConstInit::Int(value as i64)
+					}
+					tir::ExprKind::Float { value } => ConstInit::Float(value),
+					_ => zero,
 				}
-				tir::ExprKind::Float { value } => Some(ConstInit::Float(value)),
-				_ => None,
-			})
-			.unwrap_or(zero);
+			}
+			None => zero,
+		};
 		Global {
 			id: global.id,
 			ty,
@@ -1542,9 +1543,9 @@ impl<'tir> Builder<'tir> {
 			.iter()
 			.filter(|g| {
 				g.mut_span.is_some()
-					&& g.value.as_ref().is_some_and(|body| {
+					&& g.value.is_some_and(|body_idx| {
 						!matches!(
-							body.block.kind,
+							tir.items.bodies[usize::from(body_idx)].block.kind,
 							tir::ExprKind::Int { .. }
 								| tir::ExprKind::Float { .. }
 						)
@@ -1570,7 +1571,7 @@ impl<'tir> Builder<'tir> {
 		let mut combined_static_data: Vec<u32> = Vec::new();
 
 		for g in globals_with_init {
-			let body = g.value.as_ref().unwrap();
+			let body = &tir.items.bodies[usize::from(g.value.unwrap())];
 
 			let frame: Vec<BlockScope> = body
 				.stack

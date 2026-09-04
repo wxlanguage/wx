@@ -2221,9 +2221,10 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 				.unwrap_or(false)
 		})
 		.expect("function 'f' not found");
-	let body = func.body.as_ref().expect(
+	let body_idx = func.body.expect(
 		"function body should be preserved despite the argument mismatch",
 	);
+	let body = &case.tir.items.bodies[usize::from(body_idx)];
 	let ExprKind::Block {
 		expressions,
 		result,
@@ -2718,6 +2719,56 @@ fn test_coerce_binary_bitwise_i32() {
 			.iter()
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
+	);
+}
+
+/// A bitwise operator on primitives dispatches to a real trait method
+/// (`Shl::shl` etc.) via `build_operator_dispatch`, exactly like arithmetic —
+/// which records a go-to-definition / hover access at the operator's own span
+/// against the resolved method. Without it, LSP hover on `<<` finds nothing
+/// while hover on `+` shows `fn shl(...)`.
+///
+/// Both operand shapes must work: two concrete operands (`a << b`) and — the
+/// far more common one for a shift — a concrete left with a literal right
+/// (`a << 52`), which flows through a different arm of the type checker.
+#[test]
+fn test_primitive_bitwise_operator_records_access_for_hover() {
+	let shl_access_recorded = |src: &str, op: &str| {
+		let case = TestCase::new(src);
+		assert!(
+			case.tir.diagnostics.is_empty(),
+			"unexpected diagnostics for {src:?}: {:?}",
+			case.tir
+				.diagnostics
+				.iter()
+				.map(|d| &d.message)
+				.collect::<Vec<_>>()
+		);
+		let op_start = src.find(op).unwrap() as u32;
+		let shl = case
+			.graph
+			.interner
+			.get("shl")
+			.expect("`shl` symbol should be interned by the stdlib");
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == shl
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		})
+	};
+
+	assert!(
+		shl_access_recorded(
+			"fn f(a: u64, b: u64) -> u64 { a << b } export { f }",
+			"<<",
+		),
+		"two concrete operands: expected a `Shl::shl` access at the `<<` span"
+	);
+	assert!(
+		shl_access_recorded(
+			"fn f(a: u64) -> u64 { a << 52 } export { f }",
+			"<<",
+		),
+		"literal right operand: expected a `Shl::shl` access at the `<<` span"
 	);
 }
 
@@ -4950,7 +5001,8 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 	};
 	assert!(
 		matches!(
-			case.tir.items.functions[usize::from(func_index)].type_param_parent,
+			case.tir.items.functions[usize::from(func_index)]
+				.type_param_parent(),
 			Some(TypeParamOwner::TraitImpl(_))
 		),
 		"method inside trait impl block should point `type_param_parent` at its \
@@ -14535,12 +14587,12 @@ fn test_struct_compound_assignment_dispatches_to_bitand_method() {
 // ──────────────────────────────────────
 //
 // `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr` dispatch through the same
-// `OperatorTraits`/`build_operator_dispatch` machinery as arithmetic once a
-// struct is involved (`build_bitwise_result`, `tir/builder.rs`) — primitives
-// keep the pre-existing native fast path (see `is_integer()`/`== BOOL`
-// checks there), so these tests only need to cover the struct side; the
-// primitive side is unchanged and already covered by every existing
-// bitwise-on-primitive test.
+// `OperatorTraits`/`build_operator_dispatch` machinery as arithmetic, for
+// every operand type — a struct with its own impl, a primitive resolving to
+// the stdlib's `#[inline]` impl, or a typeset-bounded type param. These tests
+// cover the struct side; the primitive side is covered by
+// `test_primitive_bitwise_operator_records_access_for_hover` and the
+// coercion tests above.
 
 #[test]
 fn test_struct_impl_bitand_dispatches() {
@@ -14562,11 +14614,10 @@ fn test_struct_impl_bitand_dispatches() {
 
 #[test]
 fn test_struct_without_bitand_impl_reports_diagnostic() {
-	// Same type on both sides but no `BitAnd` impl — before
-	// `build_bitwise_result` existed this fell through to the generic
-	// "type mismatch" catch-all (misleading, since the types *do* match);
-	// it must now report the accurate "operator cannot be applied" code,
-	// exactly like the arithmetic path already does.
+	// Same type on both sides but no `BitAnd` impl — this must report the
+	// accurate "operator cannot be applied" code via `build_operator_dispatch`,
+	// exactly like the arithmetic path does, not the generic "type mismatch"
+	// catch-all (misleading, since the types *do* match).
 	let case = TestCase::new(indoc! {"
         struct Flags { bits: i32 }
 
@@ -14637,10 +14688,9 @@ fn test_generic_bitand_bound_dispatches() {
 //
 // `^x` reuses the same dispatch machinery as `-x` (`Neg`) —
 // `build_unary_operator_dispatch`, generalized via `OperatorTraits::
-// for_unary_op` — gated the same way the binary bitwise operators are:
-// primitives/typeset-bounded types keep the pre-existing native fast path
-// (`build_unary_expression`'s `is_primitive()` check, unchanged), only a
-// struct falls through to real dispatch.
+// for_unary_op` — for every operand type: a struct with its own impl, a
+// primitive resolving to the stdlib's `#[inline]` impl, or a typeset-bounded
+// type param. Only a comptime-number operand stays a deferred `Unary` node.
 
 #[test]
 fn test_struct_impl_bitnot_dispatches() {
@@ -14887,7 +14937,8 @@ fn test_poisoned_deref_store_records_rhs_access_for_hover() {
 		.iter()
 		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("bad"))
 		.expect("`bad` should be registered");
-	let body = function.body.as_ref().expect("`bad` should have a body");
+	let body_idx = function.body.expect("`bad` should have a body");
+	let body = &case.tir.items.bodies[usize::from(body_idx)];
 	let value = body.stack.scopes[0]
 		.locals
 		.iter()

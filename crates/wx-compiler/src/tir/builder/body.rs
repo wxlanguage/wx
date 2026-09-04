@@ -105,7 +105,7 @@ impl<'ast> Builder<'ast, '_> {
 				let Some(fi) = self.items.function_index(*id) else {
 					return;
 				};
-				let self_type = Some(self.intern_type(Type::TypeParam {
+				let self_type = Some(self.types.intern(Type::TypeParam {
 					owner: TypeParamOwner::Trait(trait_index),
 					param_index: 0,
 				}));
@@ -212,11 +212,12 @@ impl<'ast> Builder<'ast, '_> {
 					&func_ctx.stack,
 				);
 
+				let body_index = self.items.push_body(Body {
+					block: Box::new(value_expr),
+					stack: func_ctx.stack,
+				});
 				self.items.globals[usize::from(global_index)].value =
-					Some(FunctionBody {
-						block: Box::new(value_expr),
-						stack: func_ctx.stack,
-					});
+					Some(body_index);
 
 				return;
 			}
@@ -239,7 +240,9 @@ impl<'ast> Builder<'ast, '_> {
 			body_expr,
 			func_index,
 		) {
-			self.items.functions[usize::from(func_index)].body = Some(body);
+			let body_index = self.items.push_body(body);
+			self.items.functions[usize::from(func_index)].body =
+				Some(body_index);
 		}
 	}
 
@@ -250,7 +253,7 @@ impl<'ast> Builder<'ast, '_> {
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
 		func_index: FunctionIndex,
-	) -> Result<FunctionBody, ()> {
+	) -> Result<Body, ()> {
 		let lookup = signature
 			.params
 			.iter()
@@ -307,7 +310,7 @@ impl<'ast> Builder<'ast, '_> {
 		let result =
 			self.build_block_expression(&mut ctx, statements, block.span)?;
 		self.report_stack_warnings(ctx.resolve_context.file_id, &ctx.stack);
-		Ok(FunctionBody {
+		Ok(Body {
 			block: Box::new(result),
 			stack: ctx.stack,
 		})
@@ -686,7 +689,7 @@ impl<'ast> Builder<'ast, '_> {
 					};
 				Ok(Expression {
 					kind: ExprKind::String { symbol },
-					ty: self.intern_type(Type::Slice {
+					ty: self.types.intern(Type::Slice {
 						of: TypeIndex::U8,
 						memory: memory_ty,
 						ownership: ast::Ownership::Shared,
@@ -841,7 +844,7 @@ impl<'ast> Builder<'ast, '_> {
 				)?;
 				match operand.kind {
 					ExprKind::Load { place } => {
-						let pointer_ty = self.intern_type(Type::Pointer {
+						let pointer_ty = self.types.intern(Type::Pointer {
 							to: place.ty,
 							memory: place.memory,
 							ownership: ast::Ownership::Shared,

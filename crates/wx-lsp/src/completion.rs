@@ -75,7 +75,8 @@ pub fn find_enclosing_function(
 ) -> Option<usize> {
 	tir.items.functions.iter().position(|f| {
 		f.file_id == file_id
-			&& f.body.as_ref().is_some_and(|body| {
+			&& f.body.is_some_and(|body_idx| {
+				let body = &tir.items.bodies[usize::from(body_idx)];
 				let span = body.stack.scopes[0].span;
 				span.start <= cursor_offset && span.end > cursor_offset
 			})
@@ -102,8 +103,8 @@ pub fn local_completion_items(
 		packages,
 		tir.modules.namespaces[usize::from(function.namespace)].package,
 	);
-	let body = match &function.body {
-		Some(b) => b,
+	let body = match function.body {
+		Some(idx) => &tir.items.bodies[usize::from(idx)],
 		None => return vec![],
 	};
 	let num_params = function.params.len();

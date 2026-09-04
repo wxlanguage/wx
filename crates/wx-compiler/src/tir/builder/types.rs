@@ -7,10 +7,6 @@ use crate::diagnostics::DiagnosticCode;
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
-	pub(super) fn intern_type(&mut self, ty: Type) -> TypeIndex {
-		self.types.intern(ty)
-	}
-
 	pub(super) fn coercible_to(&mut self, a: TypeIndex, b: TypeIndex) -> bool {
 		if a == b
 			|| a == TypeIndex::NEVER
@@ -148,16 +144,16 @@ impl<'ast> Builder<'ast, '_> {
 				memory_index,
 			} => {
 				let id = self.items.memories[usize::from(memory_index)].id;
-				Some(self.intern_type(Type::Memory { size: kind, id }))
+				Some(self.types.intern(Type::Memory { size: kind, id }))
 			}
 			SymbolKind::Module { namespace_idx } => {
-				Some(self.intern_type(Type::Namespace { namespace_idx }))
+				Some(self.types.intern(Type::Namespace { namespace_idx }))
 			}
 			SymbolKind::Enum { enum_index } => {
-				Some(self.intern_type(Type::Enum { enum_index }))
+				Some(self.types.intern(Type::Enum { enum_index }))
 			}
 			SymbolKind::Struct { struct_index } => {
-				Some(self.intern_type(Type::Struct {
+				Some(self.types.intern(Type::Struct {
 					struct_index,
 					args: Box::new([]),
 				}))
@@ -174,12 +170,12 @@ impl<'ast> Builder<'ast, '_> {
 				let function = &self.items.functions[usize::from(func_index)];
 				Some(function.signature_index)
 			}
-			SymbolKind::Trait { .. }
-			| SymbolKind::TypeSet { .. }
-			| SymbolKind::TraitAssocType { .. } => None,
 			SymbolKind::TypeAlias { type_alias_index } => Some(
 				self.items.type_aliases[usize::from(type_alias_index)].body,
 			),
+			SymbolKind::Trait { .. }
+			| SymbolKind::TypeSet { .. }
+			| SymbolKind::TraitAssocType { .. } => None,
 		}
 	}
 
@@ -196,7 +192,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let Some(scope) = scope {
 			// Search the owner's own type params first (innermost scope wins).
 			let own_params: &[TypeParamInfo] = match scope.owner {
-				TypeParamOwner::ImplBlock(block_idx) => {
+				TypeParamOwner::InherentImpl(block_idx) => {
 					&self.items.inherent_impls[usize::from(block_idx)]
 						.type_params
 				}
@@ -243,7 +239,7 @@ impl<'ast> Builder<'ast, '_> {
 						resolve_context.file_id,
 						identifier.span,
 					));
-				return Ok(self.intern_type(Type::TypeParam {
+				return Ok(self.types.intern(Type::TypeParam {
 					owner,
 					param_index: abs_index,
 				}));
@@ -253,7 +249,7 @@ impl<'ast> Builder<'ast, '_> {
 				if let Some(fn_idx) = self.items.function_index(fn_id) {
 					if let Some(parent_owner) = self.items.functions
 						[usize::from(fn_idx)]
-					.type_param_parent
+					.type_param_parent()
 					{
 						let parent_params =
 							self.owner_type_params(parent_owner);
@@ -273,7 +269,7 @@ impl<'ast> Builder<'ast, '_> {
 									resolve_context.file_id,
 									identifier.span,
 								));
-							return Ok(self.intern_type(Type::TypeParam {
+							return Ok(self.types.intern(Type::TypeParam {
 								owner: parent_owner,
 								param_index: abs_index,
 							}));
@@ -398,7 +394,7 @@ impl<'ast> Builder<'ast, '_> {
 		name: SymbolU32,
 	) -> Option<u32> {
 		let own_params: &[TypeParamInfo] = match scope.owner {
-			TypeParamOwner::ImplBlock(block_idx) => {
+			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.items.inherent_impls[usize::from(block_idx)].type_params
 			}
 			TypeParamOwner::Function(id) => {
@@ -430,8 +426,9 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		if let TypeParamOwner::Function(fn_id) = scope.owner {
 			if let Some(fn_idx) = self.items.function_index(fn_id) {
-				if let Some(parent_owner) =
-					self.items.functions[usize::from(fn_idx)].type_param_parent
+				if let Some(parent_owner) = self.items.functions
+					[usize::from(fn_idx)]
+				.type_param_parent()
 				{
 					// ImplBlock has no grandparent, so abs_index == i.
 					if let Some(i) = self
@@ -533,7 +530,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 				items.push(result_idx);
 				let items: Box<[TypeIndex]> = items.into();
-				self.intern_type(Type::Function {
+				self.types.intern(Type::Function {
 					signature: FunctionSignature {
 						params_count: params_count as u32,
 						items,
@@ -547,7 +544,7 @@ impl<'ast> Builder<'ast, '_> {
 				let Ok(memory) = self.resolve_ambient_memory(span) else {
 					return TypeIndex::ERROR;
 				};
-				self.intern_type(Type::Pointer {
+				self.types.intern(Type::Pointer {
 					to,
 					memory,
 					ownership: *ownership,
@@ -560,7 +557,7 @@ impl<'ast> Builder<'ast, '_> {
 				let Ok(memory) = self.resolve_ambient_memory(span) else {
 					return TypeIndex::ERROR;
 				};
-				self.intern_type(Type::Slice {
+				self.types.intern(Type::Slice {
 					of,
 					memory,
 					ownership: *ownership,
@@ -577,7 +574,7 @@ impl<'ast> Builder<'ast, '_> {
 				let Ok(memory) = self.resolve_ambient_memory(span) else {
 					return TypeIndex::ERROR;
 				};
-				self.intern_type(Type::Array {
+				self.types.intern(Type::Array {
 					of,
 					size: size.inner as u32,
 					memory,
@@ -593,7 +590,7 @@ impl<'ast> Builder<'ast, '_> {
 				for e in elements.iter() {
 					elems.push(self.resolve_type(resolve_context, scope, e));
 				}
-				self.intern_type(Type::Tuple {
+				self.types.intern(Type::Tuple {
 					elements: elems.into(),
 				})
 			}
@@ -665,7 +662,7 @@ impl<'ast> Builder<'ast, '_> {
 							scope,
 							ptr_inner,
 						);
-						self.intern_type(Type::Pointer {
+						self.types.intern(Type::Pointer {
 							to,
 							memory: memory_ty,
 							ownership: *ownership,
@@ -681,7 +678,7 @@ impl<'ast> Builder<'ast, '_> {
 							scope,
 							arr_inner,
 						);
-						self.intern_type(Type::Array {
+						self.types.intern(Type::Array {
 							of,
 							size: size.inner as u32,
 							memory: memory_ty,
@@ -694,7 +691,7 @@ impl<'ast> Builder<'ast, '_> {
 					} => {
 						let of =
 							self.resolve_type(resolve_context, scope, sl_inner);
-						self.intern_type(Type::Slice {
+						self.types.intern(Type::Slice {
 							of,
 							memory: memory_ty,
 							ownership: *ownership,
@@ -1145,7 +1142,7 @@ impl<'ast> Builder<'ast, '_> {
 					member.ident.span,
 				));
 			}
-			let recovered = self.intern_type(Type::AssocTypeProjection {
+			let recovered = self.types.intern(Type::AssocTypeProjection {
 				trait_index: required_trait,
 				assoc_name: member.ident.inner,
 				base: base_ty.inner,
@@ -1153,7 +1150,7 @@ impl<'ast> Builder<'ast, '_> {
 
 			// Fetched fresh here (rather than upfront) so this stays a
 			// borrow of `self.items` alone, not an owned clone kept alive
-			// across the `ensure_signature`/`intern_type` calls above —
+			// across the `ensure_signature`/`intern` calls above —
 			// this is the only place it's used.
 			let bound_satisfied = self
 				.items
@@ -1225,7 +1222,7 @@ impl<'ast> Builder<'ast, '_> {
 					.abstract_type_bounds(&self.types, base_ty.inner)
 					.is_some()
 				{
-					self.intern_type(Type::AssocTypeProjection {
+					self.types.intern(Type::AssocTypeProjection {
 						trait_index: required_trait,
 						assoc_name: member.ident.inner,
 						base: base_ty.inner,
@@ -1302,7 +1299,7 @@ impl<'ast> Builder<'ast, '_> {
 						{
 							assoc_type.accesses.push(member_span);
 						}
-						Ok(self.intern_type(Type::AssocTypeProjection {
+						Ok(self.types.intern(Type::AssocTypeProjection {
 							trait_index: required_trait,
 							assoc_name: member.ident.inner,
 							base: base_ty.inner,
