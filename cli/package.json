@@ -1,7 +1,7 @@
 {
 	"name": "@wx-lang/cli",
-	"version": "0.4.0",
-	"description": "Native CLI for the WX compiler (compile/check/format WX source to WebAssembly)",
+	"version": "0.5.0",
+	"description": "Native CLI for the WX compiler (build/check/format WX projects to WebAssembly)",
 	"author": {
 		"name": "Artem Melnyk"
 	},
