@@ -62,6 +62,22 @@ pub fn open_manifest(
 	dir: AbsolutePath,
 	source: &impl FileSource,
 ) -> Result<CompilationUnit, ()> {
+	open_manifest_with_manifests(dir, source, &HashMap::new())
+}
+
+/// Uses retained manifest data supplied by a frontend. Entries not supplied
+/// are read through the same FileSource as modules. The data is only an input
+/// to resolution; no manifest is stored on the resulting CompilationUnit.
+pub fn open_manifest_with_manifests(
+	dir: AbsolutePath,
+	source: &impl FileSource,
+	manifests: &HashMap<AbsolutePath, &PackageManifest>,
+) -> Result<CompilationUnit, ()> {
+	let mut resolution = DependencyResolution {
+		manifests,
+		resolved: HashMap::new(),
+		in_progress: HashMap::new(),
+	};
 	let mut builder = CompilationUnitBuilder::new();
 
 	// Loaded here rather than through `open_manifest_package` because two
@@ -71,7 +87,15 @@ pub fn open_manifest(
 	// properties of *being* the root, so threading them through the
 	// recursion would mean every dependency carrying parameters only the
 	// outermost call could ever use.
-	let manifest = read_manifest(&dir, source)?;
+	let loaded;
+	let manifest = if let Some(manifest) = manifests.get(&dir) {
+		*manifest
+	} else {
+		let text =
+			source.read_to_string(&dir.join(&RelativePath::new("wx.json")))?;
+		loaded = PackageManifest::parse(&text).map_err(|_| ())?;
+		&loaded
+	};
 	let entry_path = dir.join(&manifest.entry);
 	let kind = package_kind(&manifest.kind);
 
@@ -99,26 +123,18 @@ pub fn open_manifest(
 		&mut builder,
 		root_id,
 		&dir,
-		manifest.dependencies,
+		&manifest.dependencies,
 		source,
-		&mut HashMap::new(),
-		&mut HashMap::new(),
+		&mut resolution,
 	)?;
 
 	Ok(builder.build(root_id))
 }
 
-/// Reads and parses the `wx.json` governing `dir`. Shared by the root (in
-/// `open_manifest`) and every dependency (in `open_manifest_package`), which
-/// is the only reason a manifest's location is expressed once rather than at
-/// each call site.
-fn read_manifest(
-	dir: &AbsolutePath,
-	source: &impl FileSource,
-) -> Result<PackageManifest, ()> {
-	let manifest_path = dir.join(&RelativePath::new("wx.json"));
-	let manifest_source = source.read_to_string(&manifest_path)?;
-	PackageManifest::parse(&manifest_source).map_err(|_| ())
+struct DependencyResolution<'a> {
+	manifests: &'a HashMap<AbsolutePath, &'a PackageManifest>,
+	resolved: HashMap<ResolvedDependency, PackageId>,
+	in_progress: HashMap<ResolvedDependency, PackageId>,
 }
 
 /// Loads the package whose manifest lives at `{dir}/wx.json`, then
@@ -147,10 +163,17 @@ fn open_manifest_package(
 	name: &PackageName,
 	identity: &ResolvedDependency,
 	source: &impl FileSource,
-	resolved: &mut HashMap<ResolvedDependency, PackageId>,
-	in_progress: &mut HashMap<ResolvedDependency, PackageId>,
+	resolution: &mut DependencyResolution<'_>,
 ) -> Result<PackageId, ()> {
-	let manifest = read_manifest(dir, source)?;
+	let loaded;
+	let manifest = if let Some(manifest) = resolution.manifests.get(dir) {
+		*manifest
+	} else {
+		let text =
+			source.read_to_string(&dir.join(&RelativePath::new("wx.json")))?;
+		loaded = PackageManifest::parse(&text).map_err(|_| ())?;
+		&loaded
+	};
 	let entry_path = dir.join(&manifest.entry);
 
 	let id = builder.load_package(
@@ -158,7 +181,7 @@ fn open_manifest_package(
 		entry_path,
 		source,
 	)?;
-	in_progress.insert(identity.clone(), id);
+	resolution.in_progress.insert(identity.clone(), id);
 
 	// A stdlib can only ever be the root of its own compilation. Declaring
 	// `"type": "std"` has exactly one effect — suppressing the embedded
@@ -177,12 +200,11 @@ fn open_manifest_package(
 		builder,
 		id,
 		dir,
-		manifest.dependencies,
+		&manifest.dependencies,
 		source,
-		resolved,
-		in_progress,
+		resolution,
 	)?;
-	in_progress.remove(identity);
+	resolution.in_progress.remove(identity);
 
 	Ok(id)
 }
@@ -204,15 +226,14 @@ fn resolve_dependencies(
 	builder: &mut CompilationUnitBuilder,
 	owner: PackageId,
 	dir: &AbsolutePath,
-	dependencies: HashMap<PackageName, DependencySource>,
+	dependencies: &HashMap<PackageName, DependencySource>,
 	source: &impl FileSource,
-	resolved: &mut HashMap<ResolvedDependency, PackageId>,
-	in_progress: &mut HashMap<ResolvedDependency, PackageId>,
+	resolution: &mut DependencyResolution<'_>,
 ) -> Result<(), ()> {
 	// Sorted so a name collision among dependencies is diagnosed the same
 	// way on every run, not depending on `HashMap`'s randomized order.
-	let mut dependencies: Vec<_> = dependencies.into_iter().collect();
-	dependencies.sort_by(|(a, _), (b, _)| a.cmp(b));
+	let mut dependencies: Vec<_> = dependencies.iter().collect();
+	dependencies.sort_by_key(|(name, _)| *name);
 
 	for (key, dependency) in dependencies {
 		let identity = dependency.resolve(dir);
@@ -221,35 +242,36 @@ fn resolve_dependencies(
 		// the name is a property of *this* edge: whether the target happens
 		// to have been loaded already (a diamond), or is still being loaded
 		// further up the stack (a cycle), `owner` still calls it `key`.
-		let dependency_id =
-			match (resolved.get(&identity), in_progress.get(&identity)) {
-				// Diamond: reached by another edge already, so its modules are
-				// loaded. Only the binding below is still owed.
-				(Some(&loaded), _) => loaded,
-				// Cycle: recursing again would not terminate, and the diagnostic
-				// stands — but the package does exist, so the name still binds
-				// and paths through it keep resolving.
-				(None, Some(&pending)) => {
-					builder.packages[owner.as_usize()]
-						.diagnostics
-						.push(report_circular_dependency(key.as_str()));
-					pending
-				}
-				(None, None) => {
-					let ResolvedDependency::Local(dependency_dir) = &identity;
-					let id = open_manifest_package(
-						builder,
-						&dependency_dir.clone(),
-						&key,
-						&identity,
-						source,
-						resolved,
-						in_progress,
-					)?;
-					resolved.insert(identity, id);
-					id
-				}
-			};
+		let dependency_id = match (
+			resolution.resolved.get(&identity),
+			resolution.in_progress.get(&identity),
+		) {
+			// Diamond: reached by another edge already, so its modules are
+			// loaded. Only the binding below is still owed.
+			(Some(&loaded), _) => loaded,
+			// Cycle: recursing again would not terminate, and the diagnostic
+			// stands — but the package does exist, so the name still binds
+			// and paths through it keep resolving.
+			(None, Some(&pending)) => {
+				builder.packages[owner.as_usize()]
+					.diagnostics
+					.push(report_circular_dependency(key.as_str()));
+				pending
+			}
+			(None, None) => {
+				let ResolvedDependency::Local(dependency_dir) = &identity;
+				let id = open_manifest_package(
+					builder,
+					dependency_dir,
+					key,
+					&identity,
+					source,
+					resolution,
+				)?;
+				resolution.resolved.insert(identity, id);
+				id
+			}
+		};
 
 		let name = builder.interner.get_or_intern(key.as_str());
 		builder.add_dependency(owner, name, dependency_id);
@@ -301,6 +323,56 @@ mod tests {
 			.dependencies
 			.get(&symbol)
 			.copied()
+	}
+
+	#[test]
+	fn retained_manifests_load_root_and_dependencies_without_json_reads() {
+		struct Source {
+			files: crate::vfs::VirtualFileSource,
+			json_reads: std::cell::Cell<usize>,
+		}
+		impl FileSource for Source {
+			fn read_to_string(
+				&self,
+				path: &AbsolutePath,
+			) -> Result<String, ()> {
+				if path.as_str().ends_with("/wx.json") {
+					self.json_reads.set(self.json_reads.get() + 1);
+					return Err(());
+				}
+				self.files.read_to_string(path)
+			}
+			fn exists(&self, path: &AbsolutePath) -> bool {
+				self.files.exists(path)
+			}
+			fn origin(&self) -> crate::vfs::FileOrigin {
+				crate::vfs::FileOrigin::Local
+			}
+		}
+		let source = Source {
+			files: workspace(&[
+				("/app/main.wx", "fn main() {}"),
+				("/dep/main.wx", "pub fn helper() {}"),
+			]),
+			json_reads: std::cell::Cell::new(0),
+		};
+		let app = PackageManifest::parse(r#"{"type":"bin","entry":"main.wx","dependencies":{"dep":{"type":"local","path":"../dep"}}}"#).unwrap();
+		let dep = PackageManifest::parse(r#"{"type":"lib","entry":"main.wx"}"#)
+			.unwrap();
+		let manifests = HashMap::from([
+			(AbsolutePath::new("/app"), &app),
+			(AbsolutePath::new("/dep"), &dep),
+		]);
+		for _ in 0..2 {
+			let graph = open_manifest_with_manifests(
+				AbsolutePath::new("/app"),
+				&source,
+				&manifests,
+			)
+			.unwrap();
+			assert!(dependency_of(&graph, graph.root_package, "dep").is_some());
+		}
+		assert_eq!(source.json_reads.get(), 0);
 	}
 
 	#[test]

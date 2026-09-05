@@ -2280,6 +2280,7 @@ dependencies = [
  "futures",
  "indoc",
  "serde",
+ "serde_json",
  "string-interner",
  "tokio",
  "tower-lsp-server",

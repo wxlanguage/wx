@@ -14,7 +14,7 @@ use crate::{
 	build_service, byte_to_position, compute_refresh, diagnostic_publish_paths,
 	discover_package_root, find_active_call, implementation_locations,
 	position_to_offset, position_to_offset_in_str, reference_search_kinds,
-	symbol_hover_text, symbol_kind_to_token_type,
+	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
 use wx_compiler::tir::TypeParamOwner;
@@ -451,11 +451,8 @@ fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
 }
 
 fn open_document(text: &str) -> OpenDocument {
-	use std::sync::atomic::{AtomicI32, Ordering};
-	static COUNTER: AtomicI32 = AtomicI32::new(1);
 	OpenDocument {
 		text: text.to_string(),
-		lsp_version: COUNTER.fetch_add(1, Ordering::Relaxed),
 	}
 }
 
@@ -563,10 +560,30 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 		"hashing's root should be cached after its own refresh"
 	);
 
-	// 2. Now refresh pow/main.wx directly, as if the user opened/edited it
-	// in the editor — this must discover pow's own root and must NOT
-	// disturb hashing's already-cached root.
-	compute_refresh(&mut state, &pow_main, &mut Vec::new());
+	// Editing a shared dependency must rebuild its consumer as well as
+	// retaining its own independent package ownership.
+	state.open_documents.insert(
+		pow_main.clone(),
+		open_document(
+			"use std::*; pub fn pow(base: i32, exp: i32) -> bool { true }",
+		),
+	);
+	let mut logs = Vec::new();
+	let publications = crate::compute_active_refresh(
+		&mut state,
+		vec![pow_main.clone(), pow_main],
+		&mut logs,
+	);
+	assert_eq!(
+		logs.len(),
+		2,
+		"each active root must compile once per batch"
+	);
+	let final_diagnostics: HashMap<_, _> = publications.into_iter().collect();
+	assert!(final_diagnostics[&hashing_main].iter().any(|diagnostic| {
+		diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+	}));
+	assert!(!state.cached[&hashing_dir].tir.diagnostics.is_empty());
 
 	assert!(
 		state.cached.contains_key(&hashing_dir),
@@ -708,11 +725,11 @@ fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
 	dir
 }
 
-fn compile_source(root: &PathBuf, source: &str) -> (ServerState, CompiledRoot) {
+fn compile_source(root: &Path, source: &str) -> (ServerState, CompiledRoot) {
 	let mut state = ServerState::default();
 	state
 		.open_documents
-		.insert(root.clone(), open_document(source));
+		.insert(root.to_path_buf(), open_document(source));
 	let dir = open_synthetic_manifest(&mut state, root);
 	analyze_root(&mut state, &dir, root, &mut Vec::new());
 	let compiled = state.cached.remove(&dir).expect("compilation failed");
@@ -722,18 +739,18 @@ fn compile_source(root: &PathBuf, source: &str) -> (ServerState, CompiledRoot) {
 /// Compiles `root_source` alongside additional `(path, source)` files (e.g.
 /// files pulled in via `mod foo;` declarations).
 fn compile_multi_source(
-	root: &PathBuf,
+	root: &Path,
 	root_source: &str,
-	extra_files: &[(&PathBuf, &str)],
+	extra_files: &[(&Path, &str)],
 ) -> (ServerState, CompiledRoot) {
 	let mut state = ServerState::default();
 	state
 		.open_documents
-		.insert(root.clone(), open_document(root_source));
+		.insert(root.to_path_buf(), open_document(root_source));
 	for (path, source) in extra_files {
 		state
 			.open_documents
-			.insert((*path).clone(), open_document(source));
+			.insert(path.to_path_buf(), open_document(source));
 	}
 	let dir = open_synthetic_manifest(&mut state, root);
 	analyze_root(&mut state, &dir, root, &mut Vec::new());
@@ -826,10 +843,12 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 		}
 
 		fn test() {
-		    local p:
+		    local p: i32 = 0;
 		}
 	"};
-	let cursor = source.find("local p:").unwrap() + "local p:".len();
+	// After the space, not against the colon: a cursor touching the colon is
+	// still mid-token and completes nothing (`CompletionContext::Unavailable`).
+	let cursor = source.find("local p: ").unwrap() + "local p: ".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
@@ -1426,9 +1445,7 @@ fn cross_package_namespace_token_gets_a_reference() {
 
 	let graph = vfs::open_manifest(vfs::AbsolutePath::new("/app"), &source)
 		.expect("both packages should load");
-	let state = ServerState::default();
 	let compiled = crate::compile_root(
-		&state,
 		graph,
 		&mut crate::Trace::new(PathBuf::from("/app/main.wx")),
 	);
@@ -2341,5 +2358,323 @@ fn find_enclosing_function_returns_correct_function() {
 	assert_ne!(
 		first_idx, second_idx,
 		"cursor positions in different functions should map to different indices"
+	);
+}
+
+#[test]
+fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
+	let mut state = ServerState::default();
+	let outer = PathBuf::from("/watch-test");
+	let inner = outer.join("nested");
+	let file = inner.join("main.wx");
+	state
+		.open_documents
+		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	state.open_documents.insert(
+		outer.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"nested/main.wx"}"#),
+	);
+	compute_refresh(&mut state, &file, &mut Vec::new());
+	assert_eq!(state.own_root.get(&file), Some(&outer));
+
+	let manifest = inner.join("wx.json");
+	state.open_documents.insert(
+		manifest.clone(),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	crate::compute_active_refresh(
+		&mut state,
+		vec![manifest.clone(), manifest.clone()],
+		&mut Vec::new(),
+	);
+	assert_eq!(state.own_root.get(&file), Some(&inner));
+	assert!(state.cached.contains_key(&outer));
+	assert!(state.cached.contains_key(&inner));
+
+	state.open_documents.remove(&manifest);
+	compute_refresh(&mut state, &manifest, &mut Vec::new());
+	assert_eq!(state.own_root.get(&file), Some(&outer));
+	assert!(state.cached.contains_key(&outer));
+	assert!(!state.cached.contains_key(&inner));
+	assert!(!state.projects.contains_key(&inner));
+}
+
+#[tokio::test]
+async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
+	use crate::{Command, ManifestState, handle_command};
+	use std::collections::VecDeque;
+	use tokio::sync::oneshot;
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let client = &service.inner().client;
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+	let root = PathBuf::from("/manifest-format-test");
+	let manifest_path = root.join("wx.json");
+	let source_path = root.join("main.wx");
+	let dep_path = root.join("dep/wx.json");
+	let manifest = |width| {
+		format!(
+			r#"{{"type":"bin","entry":"main.wx","format":{{"indent_width":{width}}},"dependencies":{{"dep":{{"type":"local","path":"dep"}}}}}}"#
+		)
+	};
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(manifest_path.clone(), open_document(&manifest(2)));
+	state.open_documents.insert(
+		source_path.clone(),
+		open_document("fn main() { local x = true; } export { main }"),
+	);
+	state.open_documents.insert(
+		dep_path.clone(),
+		open_document(r#"{"type":"lib","entry":"main.wx"}"#),
+	);
+	state.open_documents.insert(
+		root.join("dep/main.wx"),
+		open_document("pub fn helper() {}"),
+	);
+
+	async fn format(
+		state: &mut ServerState,
+		client: &tower_lsp_server::Client,
+	) -> Option<Vec<TextEdit>> {
+		let (tx, rx) = oneshot::channel();
+		handle_command(
+			Command::Formatting(
+				DocumentFormattingParams {
+					text_document: TextDocumentIdentifier {
+						uri: Uri::from_str(
+							"file:///manifest-format-test/main.wx",
+						)
+						.unwrap(),
+					},
+					options: FormattingOptions {
+						tab_size: 8,
+						insert_spaces: false,
+						..Default::default()
+					},
+					work_done_progress_params: Default::default(),
+				},
+				tx,
+			),
+			&VecDeque::new(),
+			state,
+			client,
+		)
+		.await;
+		rx.await.unwrap()
+	}
+
+	// First formatting discovers both manifests without requiring a compiled cache.
+	let first = format(&mut state, client).await.unwrap();
+	assert!(state.cached.is_empty());
+	assert_eq!(state.projects.len(), 2);
+	assert!(
+		first[0].new_text.contains("\n  local"),
+		"{}",
+		first[0].new_text
+	);
+
+	// Deliberately alter backing text without an event: both root and dependency
+	// must be reused, not read or parsed again by formatting/package resolution.
+	state.open_documents.get_mut(&manifest_path).unwrap().text = "{".into();
+	state.open_documents.get_mut(&dep_path).unwrap().text = "{".into();
+	assert_eq!(format(&mut state, client).await.unwrap(), first);
+	compute_refresh(&mut state, &source_path, &mut Vec::new());
+	assert_eq!(format(&mut state, client).await.unwrap(), first);
+
+	let pending = VecDeque::from([Command::DidChange {
+		path: manifest_path.clone(),
+		text: manifest(6),
+	}]);
+	handle_command(
+		Command::DidChange {
+			path: manifest_path.clone(),
+			text: manifest(3),
+		},
+		&pending,
+		&mut state,
+		client,
+	)
+	.await;
+	let updated = format(&mut state, client).await.unwrap();
+	assert!(
+		updated[0].new_text.contains("\n   local"),
+		"{}",
+		updated[0].new_text
+	);
+	assert!(!updated[0].new_text.contains("\n      local"));
+
+	// A failed parse replaces the last valid value even if compilation is skipped.
+	handle_command(
+		Command::DidChange {
+			path: manifest_path.clone(),
+			text: "{".into(),
+		},
+		&pending,
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(matches!(
+		state.projects[&root].manifest,
+		ManifestState::Invalid
+	));
+	assert!(format(&mut state, client).await.is_none());
+	state.open_documents.get_mut(&manifest_path).unwrap().text = manifest(4);
+	assert!(
+		format(&mut state, client).await.is_none(),
+		"invalid results are retained until an event"
+	);
+	handle_command(
+		Command::DidChange {
+			path: manifest_path,
+			text: manifest(4),
+		},
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	let edits = format(&mut state, client).await.unwrap();
+	assert!(edits[0].new_text.contains("\n    local"));
+
+	// Feeding that output back in yields no edits at all: an
+	// already-formatted buffer must not be rewritten, or every
+	// format-on-save would dirty the document and force a re-check.
+	state.open_documents.get_mut(&source_path).unwrap().text =
+		edits[0].new_text.clone();
+	assert!(format(&mut state, client).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn watched_file_events_skip_documents_the_editor_already_owns() {
+	use crate::{Command, handle_command};
+	use std::collections::VecDeque;
+
+	let (service, socket) = build_service();
+	let client = &service.inner().client;
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let root = PathBuf::from("/watch-skip-test");
+	let file = root.join("main.wx");
+	let mut state = ServerState::default();
+	state.open_documents.insert(
+		root.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	state
+		.open_documents
+		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	compute_refresh(&mut state, &file, &mut Vec::new());
+	assert!(state.cached.contains_key(&root));
+
+	// Saving an open buffer writes it to disk and the watcher reports it,
+	// but the overlay already held that exact text: no rebuild.
+	state.cached.clear();
+	handle_command(
+		Command::DidChangeWatchedFiles(vec![file, root.join("wx.json")]),
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(state.cached.is_empty());
+
+	// A file the editor does not own still invalidates: that is the only
+	// way `git checkout` and external edits reach the server.
+	handle_command(
+		Command::DidChangeWatchedFiles(vec![root.join("other.wx")]),
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(state.cached.contains_key(&root));
+}
+
+/// A path that can't be converted to `&str` must be declined, not turned
+/// into an empty one: `AbsolutePath::new` asserts on a path that doesn't
+/// start with `/`, and it runs here on the state actor task, so the panic
+/// takes down analysis for the rest of the session rather than skipping one
+/// event.
+#[cfg(unix)]
+#[test]
+fn an_unconvertible_manifest_path_does_not_delete_the_project() {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt;
+
+	let mut state = ServerState::default();
+	let root = PathBuf::from("/project");
+	state.projects.insert(
+		root.clone(),
+		crate::ProjectState {
+			manifest: crate::ManifestState::Invalid,
+			published_files: HashSet::from([root.join("main.wx")]),
+		},
+	);
+
+	// `wx.json` itself is valid UTF-8; the directory holding it is not, so
+	// only the whole-path conversion fails.
+	let mut invalid = PathBuf::from(OsStr::from_bytes(b"/project/\xff"));
+	invalid.push("wx.json");
+
+	let publications = refresh_project_manifest(&mut state, &invalid);
+
+	assert!(
+		publications.is_empty(),
+		"an unreadable path must not publish diagnostic clears"
+	);
+	assert!(
+		state.projects.contains_key(&root),
+		"the unrelated project must survive"
+	);
+}
+
+/// A refresh that changes nothing must publish each file once. Clearing an
+/// active root before re-analysing it drained the `published_files` that
+/// `collect_publish_operations` diffs against, so every still-diagnosed file
+/// got an empty publish immediately followed by an identical real one — a
+/// squiggle blinking off and back on for every file on every keystroke.
+#[test]
+fn a_repeated_refresh_publishes_each_file_once() {
+	let mut state = ServerState::default();
+	let root = PathBuf::from("/republish");
+	let main = root.join("main.wx");
+	state.open_documents.insert(
+		root.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	state.open_documents.insert(
+		main.clone(),
+		open_document("fn main() -> i32 { true }\nexport { main }"),
+	);
+
+	// The first refresh establishes `published_files`; the second is the one
+	// that has something to diff against.
+	compute_refresh(&mut state, &main, &mut Vec::new());
+	let publications = compute_refresh(&mut state, &main, &mut Vec::new());
+
+	let for_main: Vec<_> = publications
+		.iter()
+		.filter(|(path, _)| path == &main)
+		.collect();
+	assert_eq!(
+		for_main.len(),
+		1,
+		"expected one publish for {main:?}, got {for_main:?}"
+	);
+	assert!(
+		!for_main[0].1.is_empty(),
+		"the type error must survive an otherwise-unchanged refresh"
 	);
 }

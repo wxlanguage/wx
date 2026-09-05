@@ -20,6 +20,9 @@ wx-fmt = { path = "../wx-fmt" }
 string-interner = { workspace = true }
 codespan-reporting = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+# Only to build the `registerCapability` options blob, which LSP types
+# model as a bare `serde_json::Value`.
+serde_json = { workspace = true }
 # `std::time::Instant::now()` panics on `wasm32-unknown-unknown`; this is a
 # drop-in replacement backed by `Performance.now()` there.
 web-time = "1.1.0"

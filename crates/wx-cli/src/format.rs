@@ -1,7 +1,7 @@
 use wx_compiler::ast;
 use wx_compiler::vfs::{
-	AbsolutePath, CompilationUnitBuilder, FileSource, Files, FormatManifest,
-	PackageManifest, RelativePath, SourceModule,
+	AbsolutePath, CompilationUnitBuilder, FileSource, Files, PackageManifest,
+	RelativePath, SourceModule,
 };
 use wx_fmt::RendererConfig;
 
@@ -38,7 +38,7 @@ pub fn expand_project(
 	let manifest_path = dir.join(&RelativePath::new("wx.json"));
 	let manifest_source = source.read_to_string(&manifest_path)?;
 	let manifest = PackageManifest::parse(&manifest_source).map_err(|_| ())?;
-	let config = overlay_format_manifest(manifest.format);
+	let config = RendererConfig::from_manifest(manifest.format);
 
 	let mut builder = CompilationUnitBuilder::new();
 	let modules = match files {
@@ -67,15 +67,4 @@ pub fn expand_project(
 		modules,
 		config,
 	})
-}
-
-/// Overlays a manifest's `format` section onto `RendererConfig::default()`
-/// — each field individually, so a manifest can override just one setting.
-fn overlay_format_manifest(format: FormatManifest) -> RendererConfig {
-	let default = RendererConfig::default();
-	RendererConfig {
-		max_line_width: format.max_line_width.unwrap_or(default.max_line_width),
-		indent_width: format.indent_width.unwrap_or(default.indent_width),
-		trailing_comma: format.trailing_comma.unwrap_or(default.trailing_comma),
-	}
 }

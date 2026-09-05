@@ -2685,6 +2685,29 @@ impl Default for RendererConfig {
 	}
 }
 
+impl RendererConfig {
+	/// Overlays a manifest's `format` section onto the defaults, field by
+	/// field, so a `wx.json` can override one setting without restating the
+	/// others.
+	///
+	/// Lives here rather than in either caller because `wx format` and the
+	/// LSP's formatting request must agree byte for byte — formatting a
+	/// file on save and formatting it from the CLI are the same operation,
+	/// and two copies of this overlay would be free to drift apart.
+	pub fn from_manifest(format: wx_compiler::vfs::FormatManifest) -> Self {
+		let default = Self::default();
+		Self {
+			max_line_width: format
+				.max_line_width
+				.unwrap_or(default.max_line_width),
+			indent_width: format.indent_width.unwrap_or(default.indent_width),
+			trailing_comma: format
+				.trailing_comma
+				.unwrap_or(default.trailing_comma),
+		}
+	}
+}
+
 struct Renderer<'a> {
 	config: RendererConfig,
 	interner: &'a ast::StringInterner,

@@ -16,7 +16,7 @@ pub use manifest::{
 };
 
 mod resolve;
-pub use resolve::{open_manifest, package_kind};
+pub use resolve::{open_manifest, open_manifest_with_manifests, package_kind};
 
 mod path;
 pub use path::{AbsolutePath, RelativePath};

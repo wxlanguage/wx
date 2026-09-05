@@ -26,10 +26,28 @@ pub enum CompletionContext {
 	PathAccess { lhs_end: usize },
 	/// Cursor is in a type annotation position (after `:` that is not `::`).
 	TypeAnnotation,
+	/// Cursor sits directly against a colon run that cannot open a path: a
+	/// lone `:`, or three or more. Nothing is offered rather than guessing
+	/// which of the two a half-typed `::` will become.
+	Unavailable,
 }
 
 /// Classifies the completion trigger context at `offset` bytes into `source`.
 pub fn classify_context(source: &str, offset: usize) -> CompletionContext {
+	// Counted on the raw text, before any trimming: `x:` and `x: ` differ
+	// here, and must — only the first has the cursor pressed against the
+	// colon, mid-token. A run of exactly two is the `::` this is all for; a
+	// run of one is either a half-typed `::` or an annotation whose type
+	// hasn't been started, and neither has anything to offer yet.
+	let trailing_colons = source[..offset]
+		.bytes()
+		.rev()
+		.take_while(|&byte| byte == b':')
+		.count();
+	if trailing_colons == 1 || trailing_colons >= 3 {
+		return CompletionContext::Unavailable;
+	}
+
 	// Strip the identifier prefix currently being typed.
 	let prefix_start = source[..offset]
 		.bytes()
@@ -694,6 +712,7 @@ pub fn completion_items(
 		CompletionContext::TypeAnnotation => {
 			type_completion_items(tir, interner, symbol_index, prefix, &visible)
 		}
+		CompletionContext::Unavailable => vec![],
 	}
 }
 
@@ -778,11 +797,41 @@ mod tests {
 		);
 	}
 
+	/// A colon the cursor is pressed against offers nothing — matching
+	/// rust-analyzer, which bails when the token to the immediate left is a
+	/// lone `:` rather than guessing what it will become.
 	#[test]
-	fn single_colon_is_type_annotation() {
+	fn cursor_against_a_lone_colon_is_unavailable() {
 		assert_eq!(
-			classify_context("x:", 2),
+			classify_context("local x:", 8),
+			CompletionContext::Unavailable,
+			"a half-typed annotation has no type to complete yet"
+		);
+		assert_eq!(
+			classify_context("use std:", 8),
+			CompletionContext::Unavailable,
+			"the first colon of a `::` must not offer annotation types"
+		);
+		assert_eq!(
+			classify_context("use std:::", 10),
+			CompletionContext::Unavailable,
+			"three colons cannot open a path"
+		);
+	}
+
+	/// The space is the whole difference: it moves the cursor off the colon,
+	/// so the annotation is now a position to complete rather than a token
+	/// mid-edit.
+	#[test]
+	fn a_space_after_the_colon_restores_type_completions() {
+		assert_eq!(
+			classify_context("local x: ", 9),
 			CompletionContext::TypeAnnotation
+		);
+		assert_eq!(
+			classify_context("local x: i", 10),
+			CompletionContext::TypeAnnotation,
+			"typing the type's first letter must keep completing it"
 		);
 	}
 
@@ -805,15 +854,13 @@ mod tests {
 
 	#[test]
 	fn single_colon_not_confused_with_double_colon() {
-		// Sanity: "::" is PathAccess, single ":" is TypeAnnotation
+		// Sanity: a completed `::` opens a path; one colon is still
+		// mid-token and opens nothing.
 		assert_eq!(
 			classify_context("Foo::", 5),
 			CompletionContext::PathAccess { lhs_end: 3 }
 		);
-		assert_eq!(
-			classify_context("a:", 2),
-			CompletionContext::TypeAnnotation
-		);
+		assert_eq!(classify_context("a:", 2), CompletionContext::Unavailable);
 	}
 
 	#[test]

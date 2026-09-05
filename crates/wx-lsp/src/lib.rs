@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::panic;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use codespan_reporting::diagnostic::{
 	Diagnostic as CodeDiagnostic, Label, LabelStyle, Severity,
@@ -14,20 +14,21 @@ use tower_lsp_server::jsonrpc::{Error as JsonRpcError, Result};
 use tower_lsp_server::ls_types::{
 	CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
 	DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag,
-	DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-	DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-	DocumentFormattingParams, GotoDefinitionParams, GotoDefinitionResponse,
-	Hover, HoverContents, HoverParams, HoverProviderCapability,
+	DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+	DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+	DidOpenTextDocumentParams, DocumentFormattingParams, FileSystemWatcher,
+	GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+	HoverContents, HoverParams, HoverProviderCapability,
 	ImplementationProviderCapability, InitializeParams, InitializeResult,
 	InitializedParams, Location, MarkupContent, MarkupKind, MessageType,
 	NumberOrString, OneOf, ParameterInformation, ParameterLabel, Position,
-	Range, ReferenceParams, RenameParams, SemanticToken, SemanticTokenType,
-	SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-	SemanticTokensParams, SemanticTokensResult,
+	Range, ReferenceParams, Registration, RenameParams, SemanticToken,
+	SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
+	SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
 	SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp,
 	SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
 	TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-	TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
+	TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::ast;
@@ -172,7 +173,6 @@ impl Trace {
 #[derive(Clone)]
 struct OpenDocument {
 	text: String,
-	lsp_version: i32,
 }
 
 #[derive(Default)]
@@ -184,22 +184,41 @@ struct ServerState {
 	/// by `resolve_uri` rather than tracked in a second index, since keeping
 	/// a hand-maintained reverse map in sync with this one is exactly the
 	/// kind of bookkeeping that silently drifts.
+	///
+	/// Written by `analyze_root`, which rebuilds unconditionally rather than
+	/// checking whether the previous entry is still valid. There is no
+	/// staleness check because every mutation already goes through a
+	/// notification that rebuilds — a validity predicate would re-derive, per
+	/// request, what each mutation site already knew. Invalidation belongs on
+	/// the event, not on the read. Manifest changes on disk are pushed by
+	/// the client file watcher.
+	/// Source changes on disk use the same refresh path as buffer edits.
 	cached: HashMap<PathBuf, CompiledRoot>,
-	/// root -> files we last published diagnostics for. Needed to know which
-	/// files to clear when a root is dropped or a file leaves its owning
-	/// root. Deliberately many-to-many, not a partition: a dependency file
-	/// legitimately appears here under every root whose compiled graph
-	/// reaches it, not just its own project's root.
-	published_by_root: HashMap<PathBuf, HashSet<PathBuf>>,
+	/// Persistent manifest and publication state, independent of compiled
+	/// artifacts. Dependency-only entries do not become active analysis roots.
+	projects: HashMap<PathBuf, ProjectState>,
 	/// file -> the root `discover_package_root` returned for it, as of the
-	/// last `compute_refresh` call made for exactly that file. Kept
-	/// separate from `published_by_root` — that map answers "which files
+	/// last refresh batch that re-resolved its ownership. Kept
+	/// separate from project publication tracking — that answers "which files
 	/// does root R currently reach" (many-to-many, since a dependency file
 	/// is reachable from every root that depends on it) — this one answers
 	/// "what is file F's own project" (one answer per file, never derived
-	/// from the other map, only ever written here for the one file it was
-	/// just asked about).
+	/// from the other map). Refresh batches re-resolve tracked files and
+	/// open buffers so manifest creation/deletion updates their ownership.
 	own_root: HashMap<PathBuf, PathBuf>,
+}
+
+/// Source edits retain this state; manifest events replace the parse result.
+/// Invalid manifests remain project boundaries. Removing a manifest from both
+/// disk and the editor removes the project after its publications are cleared.
+struct ProjectState {
+	manifest: ManifestState,
+	published_files: HashSet<PathBuf>,
+}
+
+enum ManifestState {
+	Parsed(vfs::PackageManifest),
+	Invalid,
 }
 
 struct AnalysisResult {
@@ -211,9 +230,6 @@ struct CompiledRoot {
 	graph: vfs::CompilationUnit,
 	tir: TIR,
 	symbol_index: SymbolIndex,
-	/// LSP version of each file in the package at the time TIR was last built.
-	/// `None` means the file was on disk (not open via LSP) at compile time.
-	compiled_versions: HashMap<PathBuf, Option<std::num::NonZeroI32>>,
 }
 
 struct OverlayFileSource<'a> {
@@ -258,18 +274,14 @@ impl FileSource for OverlayFileSource<'_> {
 /// corresponding recompute/publish to happen.
 enum Command {
 	SetWorkspaceFolders(Vec<PathBuf>),
+	DidChangeWatchedFiles(Vec<PathBuf>),
 	DidOpen {
 		path: PathBuf,
 		text: String,
-		version: i32,
 	},
 	DidChange {
 		path: PathBuf,
 		text: String,
-		version: i32,
-	},
-	DidSave {
-		path: PathBuf,
 	},
 	DidClose {
 		path: PathBuf,
@@ -384,34 +396,60 @@ async fn handle_command(
 		Command::SetWorkspaceFolders(folders) => {
 			state.workspace_folders = folders;
 		}
-		Command::DidOpen {
-			path,
-			text,
-			version,
-		} => {
-			state.open_documents.insert(
-				path.clone(),
-				OpenDocument {
-					text,
-					lsp_version: version,
-				},
-			);
+		Command::DidChangeWatchedFiles(paths) => {
+			// A disk event for a file the editor has open carries no
+			// information: `OverlayFileSource` answers both `exists` and
+			// `read_to_string` from `open_documents` whatever the disk
+			// says, so the rebuild it would trigger recomputes a result
+			// `DidChange` already produced. Dropping those is what keeps
+			// a plain save from re-running the whole typecheck.
+			let paths: HashSet<_> = paths
+				.into_iter()
+				.filter(|path| !state.open_documents.contains_key(path))
+				.collect();
+			if paths.is_empty() {
+				return;
+			}
+			let mut logs = Vec::new();
+			let mut publications = Vec::new();
+			for path in &paths {
+				publications.extend(refresh_project_manifest(state, path));
+			}
+			publications.extend(compute_active_refresh(
+				state,
+				paths.into_iter().collect(),
+				&mut logs,
+			));
+			flush_logs(client, logs).await;
+			publish_diagnostics(client, publications).await;
+		}
+		Command::DidOpen { path, text } => {
+			state
+				.open_documents
+				.insert(path.clone(), OpenDocument { text });
 			let mut logs = Vec::new();
 			let publications = compute_refresh(state, &path, &mut logs);
 			flush_logs(client, logs).await;
 			publish_diagnostics(client, publications).await;
 		}
-		Command::DidChange {
-			path,
-			text,
-			version,
-		} => {
-			state.open_documents.insert(
-				path.clone(),
-				OpenDocument {
-					text,
-					lsp_version: version,
-				},
+		Command::DidChange { path, text } => {
+			state
+				.open_documents
+				.insert(path.clone(), OpenDocument { text });
+			// Ahead of the supersession gate below, and returning nothing to
+			// publish by construction: `path` was just inserted into
+			// `open_documents`, so the overlay reports the manifest as
+			// existing and the deletion branch — the only one that produces
+			// diagnostic clears — cannot be taken from here. What this call
+			// is for is the state it writes, keeping `projects` level with
+			// `open_documents` even for an edit whose rebuild is skipped, so
+			// a `Formatting` queued behind one formats to the manifest the
+			// buffer currently says rather than the last compiled one.
+			let mut publications = refresh_project_manifest(state, &path);
+			debug_assert!(
+				publications.is_empty(),
+				"a `didChange` cannot report its own document as deleted; \
+				 if that changes, the `return` below drops these"
 			);
 			// Skip the recompute if a newer edit to this same file is
 			// already waiting right behind this one — it'll trigger its own
@@ -424,13 +462,11 @@ async fn handle_command(
 				return;
 			}
 			let mut logs = Vec::new();
-			let publications = compute_refresh(state, &path, &mut logs);
-			flush_logs(client, logs).await;
-			publish_diagnostics(client, publications).await;
-		}
-		Command::DidSave { path } => {
-			let mut logs = Vec::new();
-			let publications = compute_refresh(state, &path, &mut logs);
+			publications.extend(compute_active_refresh(
+				state,
+				vec![path],
+				&mut logs,
+			));
 			flush_logs(client, logs).await;
 			publish_diagnostics(client, publications).await;
 		}
@@ -665,12 +701,13 @@ async fn handle_command(
 				// command (the flush itself), not one per step.
 				let mut trace = Trace::new(path.clone());
 				let outcome = (|| {
-					// Always reparse fresh from the live buffer rather than
-					// going through `cached`: format-on-save fires before
-					// `didSave`, so `cached` would still reflect the
-					// previous save. Parsing is cheap enough (~1ms on
-					// typical files) that there's no need to cache it
-					// across calls.
+					// Always reparse fresh from the live buffer rather
+					// than going through `cached`, which can lag
+					// `open_documents`: a superseded `DidChange` stores
+					// its text but skips the rebuild, so a format request
+					// queued behind one would format the previous edit.
+					// Parsing is cheap enough (~1ms on typical files) that
+					// there's no need to cache it across calls.
 					let graph = parse_root(state, &root, &mut trace).ok()?;
 					let module = graph
 						.packages
@@ -691,21 +728,32 @@ async fn handle_command(
 					}
 					let file = graph.files.get(module.file_id).ok()?;
 					let source = file.source.as_str();
-					let config = wx_fmt::RendererConfig {
-						indent_width: params.options.tab_size as u8,
-						..Default::default()
+					// The package's `wx.json`, not the editor's tab size:
+					// formatting on save and running `wx format` are the
+					// same operation and must produce the same bytes.
+					let ManifestState::Parsed(manifest) =
+						&state.projects.get(&root)?.manifest
+					else {
+						return None;
 					};
+					let config =
+						wx_fmt::RendererConfig::from_manifest(manifest.format);
 					let formatted = trace.step("render", || {
-						panic::catch_unwind(panic::AssertUnwindSafe(|| {
-							wx_fmt::format(
-								&module.ast,
-								&graph.interner,
-								source,
-								config,
-							)
-						}))
-						.ok()
-					})?;
+						wx_fmt::format(
+							&module.ast,
+							&graph.interner,
+							source,
+							config,
+						)
+					});
+					// An already-formatted file is the common case for
+					// format-on-save. Reporting no edits leaves the buffer
+					// untouched, so the client never fires a `DidChange` and
+					// nothing downstream re-parses or re-checks an identical
+					// document.
+					if formatted == source {
+						return Some(Vec::new());
+					}
 					let end = byte_to_position(
 						&graph.files,
 						module.file_id,
@@ -956,7 +1004,26 @@ async fn handle_command(
 pub struct Backend {
 	client: Client,
 	state: StateHandle,
+	/// Whether the client accepts `client/registerCapability`, recorded from
+	/// `initialize` for `initialized` to act on.
+	///
+	/// An `AtomicBool` rather than a plain field because both handlers take
+	/// `&self` — and a `Mutex` would be overkill for one flag written once,
+	/// before the only read the protocol allows to follow it.
+	supports_dynamic_registration: AtomicBool,
 }
+
+/// The files a change to which can invalidate an analysis: sources, and the
+/// `wx.json` manifests that decide which sources belong to which package and
+/// how they are formatted.
+///
+/// Registered with the client from `initialized` rather than declared by
+/// each editor's own client code. Declaring them here is what makes an
+/// editor with no file-watching API of its own (Zed, whose extensions can
+/// only supply a server command) see manifest and off-buffer source edits
+/// at all — and it keeps every editor watching exactly the same set instead
+/// of each maintaining its own copy of this list.
+const WATCHED_GLOBS: &[&str] = &["**/*.wx", "**/wx.json"];
 
 impl LanguageServer for Backend {
 	async fn initialize(
@@ -974,20 +1041,37 @@ impl LanguageServer for Backend {
 			.collect();
 		self.state
 			.notify(Command::SetWorkspaceFolders(workspace_folders));
+		self.supports_dynamic_registration.store(
+			params
+				.capabilities
+				.workspace
+				.as_ref()
+				.and_then(|workspace| {
+					workspace.did_change_watched_files.as_ref()
+				})
+				.and_then(|watched_files| watched_files.dynamic_registration)
+				.unwrap_or(false),
+			Ordering::Relaxed,
+		);
 		Ok(InitializeResult {
 			capabilities: ServerCapabilities {
 				text_document_sync: Some(TextDocumentSyncCapability::Options(
 					TextDocumentSyncOptions {
 						open_close: Some(true),
 						change: Some(TextDocumentSyncKind::FULL),
-						save: Some(TextDocumentSyncSaveOptions::Supported(
-							true,
-						)),
 						..Default::default()
 					},
 				)),
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
 				completion_provider: Some(CompletionOptions {
+					// Single characters only: LSP has no two-character
+					// trigger, and a client matches the one character it
+					// just inserted, so a `"::"` entry here would never
+					// fire at all. `:` is declared to reach `::`, and
+					// `classify_context` decides what each colon actually
+					// meant — a decision made from the buffer, not from
+					// how the request was triggered, so an explicit invoke
+					// and a typed colon behave alike.
 					trigger_characters: Some(vec![
 						".".to_string(),
 						":".to_string(),
@@ -1030,6 +1114,56 @@ impl LanguageServer for Backend {
 		self.client
 			.log_message(MessageType::LOG, "initialized")
 			.await;
+		if !self.supports_dynamic_registration.load(Ordering::Relaxed) {
+			// Sources still recover on their own — every refresh re-reads
+			// them from disk through `OverlayFileSource` — so the loss
+			// there is promptness, not correctness. Manifests don't:
+			// `parse_root` reads a `wx.json` once, on first encountering
+			// its directory, and only a manifest event ever replaces it.
+			// No client binds this server to JSON documents, so without
+			// watched files that event never arrives and the manifest is
+			// pinned for the rest of the session. Say so, since the
+			// symptom is otherwise a silently stale package layout.
+			self.client
+				.log_message(
+					MessageType::WARNING,
+					"client does not support dynamic capability \
+					 registration: `wx.json` changes will not be picked up, \
+					 and source changes made outside the editor will only \
+					 apply on the next edit",
+				)
+				.await;
+			return;
+		}
+		let options = DidChangeWatchedFilesRegistrationOptions {
+			watchers: WATCHED_GLOBS
+				.iter()
+				.map(|glob| FileSystemWatcher {
+					glob_pattern: GlobPattern::String((*glob).to_string()),
+					// `None` is create | change | delete, all three of
+					// which move a file in or out of a package.
+					kind: None,
+				})
+				.collect(),
+		};
+		let registration = Registration {
+			id: "wx-watched-files".to_string(),
+			method: "workspace/didChangeWatchedFiles".to_string(),
+			register_options: Some(
+				serde_json::to_value(options)
+					.expect("watcher globs are plain strings"),
+			),
+		};
+		if let Err(error) =
+			self.client.register_capability(vec![registration]).await
+		{
+			self.client
+				.log_message(
+					MessageType::WARNING,
+					format!("registering file watchers failed: {error}"),
+				)
+				.await;
+		}
 	}
 
 	async fn shutdown(&self) -> Result<()> {
@@ -1043,7 +1177,6 @@ impl LanguageServer for Backend {
 		self.state.notify(Command::DidOpen {
 			path,
 			text: params.text_document.text,
-			version: params.text_document.version,
 		});
 	}
 
@@ -1057,15 +1190,30 @@ impl LanguageServer for Backend {
 		self.state.notify(Command::DidChange {
 			path,
 			text: change.text,
-			version: params.text_document.version,
 		});
 	}
 
-	async fn did_save(&self, params: DidSaveTextDocumentParams) {
-		let Some(path) = uri_to_path(&params.text_document.uri) else {
-			return;
-		};
-		self.state.notify(Command::DidSave { path });
+	async fn did_change_watched_files(
+		&self,
+		params: DidChangeWatchedFilesParams,
+	) {
+		self.state.notify(Command::DidChangeWatchedFiles(
+			params
+				.changes
+				.into_iter()
+				.filter_map(|event| uri_to_path(&event.uri))
+				// Re-checked rather than trusted from `WATCHED_GLOBS`: a
+				// client is free to deliver events for anything it happens
+				// to watch, including watchers registered by its own
+				// editor-side code, and every path here costs a rebuild.
+				.filter(|path| {
+					path.file_name().is_some_and(|name| name == "wx.json")
+						|| path
+							.extension()
+							.is_some_and(|extension| extension == "wx")
+				})
+				.collect(),
+		));
 	}
 
 	async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1301,6 +1449,7 @@ pub fn build_service() -> (LspService<Backend>, tower_lsp_server::ClientSocket)
 	LspService::build(|client| Backend {
 		state: StateHandle::spawn(client.clone()),
 		client,
+		supports_dynamic_registration: AtomicBool::new(false),
 	})
 	.custom_method("wx/virtualFileContent", Backend::virtual_file_content)
 	.custom_method("wx/fullDiagnostic", Backend::full_diagnostic)
@@ -1374,20 +1523,177 @@ fn resolve_uri<'a>(
 	})
 }
 
-/// Whether any file in `tracked` (a root's `compiled_versions`) has moved on
-/// from the version it was last built/parsed against.
-fn versions_stale(
-	tracked: &HashMap<PathBuf, Option<std::num::NonZeroI32>>,
-	open_documents: &HashMap<PathBuf, OpenDocument>,
-) -> bool {
-	tracked.iter().any(|(path, tracked_ver)| {
-		match (open_documents.get(path), tracked_ver) {
-			(Some(doc), Some(v)) => doc.lsp_version > v.get(),
-			(Some(_), None) => true, // was on disk, now open
-			(None, Some(_)) => true, // was open, now closed
-			(None, None) => false,   // still on disk
+/// Apply a manifest event independently of compilation, including edits whose
+/// rebuild will be skipped as superseded. Never replace editor text with disk.
+fn refresh_project_manifest(
+	state: &mut ServerState,
+	path: &Path,
+) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+	if path.file_name().is_none_or(|name| name != "wx.json") {
+		return Vec::new();
+	}
+	let Some(root) = path.parent() else {
+		return Vec::new();
+	};
+	// Declining, not substituting. `AbsolutePath::new` asserts its argument
+	// starts with `/` — unconditionally, release included — so feeding it a
+	// stand-in empty path panics, and this runs on the state actor task,
+	// whose death leaves `notify` dropping every later command and `query`
+	// answering `None`: a server still connected but permanently silent.
+	// `parse_root` and `uri_to_path` already give up on the same conversion
+	// rather than invent a path.
+	let Some(manifest_path) = path.to_str().map(AbsolutePath::new) else {
+		return Vec::new();
+	};
+	let overlay = OverlayFileSource::new(&state.open_documents);
+	if !overlay.exists(&manifest_path) {
+		let publications = collect_clear_operations(state, root);
+		state.projects.remove(root);
+		return publications;
+	}
+	let parsed = overlay
+		.read_to_string(&manifest_path)
+		.and_then(|text| vfs::PackageManifest::parse(&text).map_err(|_| ()));
+	let manifest = match parsed {
+		Ok(manifest) => ManifestState::Parsed(manifest),
+		Err(()) => ManifestState::Invalid,
+	};
+	if let Some(project) = state.projects.get_mut(root) {
+		project.manifest = manifest;
+	} else {
+		state.projects.insert(
+			root.to_path_buf(),
+			ProjectState {
+				manifest,
+				published_files: HashSet::new(),
+			},
+		);
+	}
+	Vec::new()
+}
+
+/// Refreshes active roots after either buffer or filesystem mutations. Disk
+/// events never modify `open_documents`: the editor owns those contents until
+/// didClose, and OverlayFileSource keeps unsaved text authoritative.
+///
+/// Rebuilds *every* active root once per batch, not just the one owning the
+/// changed file — a known cost, deliberately deferred. `paths` is merged into
+/// the set of all tracked files below, so by the time roots are chosen there
+/// is nothing left distinguishing what actually changed. A full `wx check` of
+/// the largest example here is ~10ms with process start, stdlib, and codegen
+/// included, so one root is single-digit ms; this hurts on a workspace with
+/// many packages, not on this repo.
+///
+/// Narrowing it needs more than inverting `analysis_from_compiled_root`'s file
+/// list. A compiled graph records what was *found*, so a root whose `mod foo;`
+/// failed to resolve holds no recorded dependency on `foo.wx`, and creating
+/// that file later would leave the stale "unresolved module" error up forever.
+/// The dependency set has to come from probes rather than results:
+/// `OverlayFileSource` is the one chokepoint every `exists`/`read_to_string`
+/// passes through, so logging each path it is asked about — hit or miss —
+/// yields an exact set per root, which inverts into `path -> dependent roots`
+/// and turns the loop below into a dirty set. Manifest creation/deletion stays
+/// on the blanket path regardless: `discover_package_root` walks *up* the tree
+/// outside the overlay, so re-parenting is not expressible as a per-root
+/// dependency.
+///
+/// Keep invalidation event-driven rather than polling on queries.
+fn compute_active_refresh(
+	state: &mut ServerState,
+	paths: Vec<PathBuf>,
+	logs: &mut Vec<String>,
+) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+	if paths.is_empty() {
+		return Vec::new();
+	}
+	let old_roots: HashSet<_> = state
+		.cached
+		.keys()
+		.chain(
+			state
+				.projects
+				.iter()
+				.filter(|(_, project)| !project.published_files.is_empty())
+				.map(|(root, _)| root),
+		)
+		.chain(state.own_root.values())
+		.cloned()
+		.collect();
+	let mut files: HashSet<_> = state
+		.own_root
+		.keys()
+		.chain(state.open_documents.keys())
+		.cloned()
+		.collect();
+	files.extend(paths);
+	let mut roots = HashSet::new();
+	// A removed manifest can expose an enclosing package instead. Discover
+	// from the old manifest path before dropping the previous compiled state.
+	for root in &old_roots {
+		if let Some(root) = discover_package_root(
+			&state.open_documents,
+			&state.workspace_folders,
+			&root.join("wx.json"),
+		) {
+			roots.insert(root);
 		}
-	})
+	}
+	state.own_root.clear();
+	let mut current: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
+	for file in files {
+		match discover_package_root(
+			&state.open_documents,
+			&state.workspace_folders,
+			&file,
+		) {
+			Some(root) => {
+				roots.insert(root.clone());
+				state.own_root.insert(file, root);
+			}
+			None => {
+				let diagnostics = if state.open_documents.contains_key(&file) {
+					vec![orphan_file_diagnostic()]
+				} else {
+					Vec::new()
+				};
+				current.insert(file, diagnostics);
+			}
+		}
+	}
+	// Only roots that are *not* about to be re-analysed get cleared
+	// wholesale. `collect_clear_operations` drains `published_files`, which
+	// is exactly what `collect_publish_operations` diffs the new analysis
+	// against — clearing an active root first would leave that diff nothing
+	// to work with, so every file it still reports would be published empty
+	// and then immediately republished with the identical diagnostics.
+	// `analyze_root` replaces the cache entry for the roots skipped here.
+	let mut publications = Vec::new();
+	for root in &old_roots {
+		if !roots.contains(root) {
+			publications.extend(collect_clear_operations(state, root));
+		}
+	}
+	let mut roots: Vec<_> = roots.into_iter().collect();
+	roots.sort();
+	for root in roots {
+		let analysis = analyze_root(state, &root, &root.join("wx.json"), logs);
+		for (file, diagnostics) in
+			collect_publish_operations(state, &root, analysis)
+		{
+			// Shared files appear under multiple roots. Publish their union once,
+			// so an empty result from one root cannot erase another root's errors.
+			let merged = current.entry(file).or_default();
+			for diagnostic in diagnostics {
+				if !merged.contains(&diagnostic) {
+					merged.push(diagnostic);
+				}
+			}
+		}
+	}
+	let mut current: Vec<_> = current.into_iter().collect();
+	current.sort_by(|a, b| a.0.cmp(&b.0));
+	publications.extend(current);
+	publications
 }
 
 pub(crate) fn compute_refresh(
@@ -1395,56 +1701,12 @@ pub(crate) fn compute_refresh(
 	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
-	let previous_root = state.own_root.get(file_path).cloned();
-	let current_root = discover_package_root(
-		&state.open_documents,
-		&state.workspace_folders,
-		file_path,
-	);
-	match &current_root {
-		Some(root) => {
-			state.own_root.insert(file_path.to_path_buf(), root.clone());
-		}
-		None => {
-			state.own_root.remove(file_path);
-		}
-	}
-	let mut publications = Vec::new();
-
-	// Clearing the old root first, then publishing the current state
-	// second, matters once both can mention `file_path`: LSP publish
-	// replaces a URI's whole diagnostic list, so whichever of these two
-	// runs last is what the client ends up showing. Current state should
-	// always win over a stale clear.
-	if let Some(old_root) = &previous_root {
-		if current_root.as_ref() != Some(old_root) {
-			publications.extend(collect_clear_operations(state, old_root));
-		}
-	}
-
-	match current_root.as_ref() {
-		Some(root) => {
-			let analysis = analyze_root(state, root, file_path, logs);
-			publications
-				.extend(collect_publish_operations(state, root, analysis));
-		}
-		// Not part of any project. An open buffer gets a visible hint
-		// instead of silence; anything else (e.g. this call is running
-		// because the file just closed) just clears whatever hint may
-		// have been showing — there's no document left to point one at.
-		None => match state.open_documents.get(file_path) {
-			Some(_) => {
-				publications.push((
-					file_path.to_path_buf(),
-					vec![orphan_file_diagnostic()],
-				));
-			}
-			None => {
-				publications.push((file_path.to_path_buf(), Vec::new()));
-			}
-		},
-	}
-
+	let mut publications = refresh_project_manifest(state, file_path);
+	publications.extend(compute_active_refresh(
+		state,
+		vec![file_path.to_path_buf()],
+		logs,
+	));
 	publications
 }
 
@@ -1454,17 +1716,6 @@ pub(crate) fn analyze_root(
 	file_path: &Path,
 	logs: &mut Vec<String>,
 ) -> AnalysisResult {
-	// Skip TIR rebuild if no open file's version has advanced since last compile.
-	if let Some(compiled) = state.cached.get(root) {
-		if !versions_stale(&compiled.compiled_versions, &state.open_documents) {
-			logs.push(
-				Trace::new(file_path.to_path_buf())
-					.finish("typecheck — cache hit"),
-			);
-			return analysis_from_compiled_root(compiled);
-		}
-	}
-
 	let mut trace = Trace::new(file_path.to_path_buf());
 	let graph = match parse_root(state, root, &mut trace) {
 		Ok(graph) => graph,
@@ -1475,7 +1726,7 @@ pub(crate) fn analyze_root(
 		}
 	};
 
-	let compiled = compile_root(state, graph, &mut trace);
+	let compiled = compile_root(graph, &mut trace);
 	logs.push(trace.finish("typecheck"));
 	let result = analysis_from_compiled_root(&compiled);
 	state.cached.insert(root.to_path_buf(), compiled);
@@ -1489,20 +1740,21 @@ fn collect_publish_operations(
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
 	let AnalysisResult {
 		diagnostics_by_file,
-		owned_files,
+		mut owned_files,
 	} = analysis;
+	owned_files.extend(diagnostics_by_file.keys().cloned());
 
 	let previous = state
-		.published_by_root
+		.projects
 		.get(root)
-		.cloned()
+		.map(|project| project.published_files.clone())
 		.unwrap_or_default();
 	let publish_paths =
 		diagnostic_publish_paths(&previous, &owned_files, &diagnostics_by_file);
 
-	state
-		.published_by_root
-		.insert(root.to_path_buf(), owned_files);
+	if let Some(project) = state.projects.get_mut(root) {
+		project.published_files = owned_files;
+	}
 
 	publish_paths
 		.into_iter()
@@ -1519,8 +1771,8 @@ fn collect_clear_operations(
 	root: &Path,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
 	state.cached.remove(root);
-	if let Some(previous) = state.published_by_root.remove(root) {
-		previous
+	if let Some(project) = state.projects.get_mut(root) {
+		std::mem::take(&mut project.published_files)
 			.into_iter()
 			.map(|path| (path, Vec::new()))
 			.collect()
@@ -1530,51 +1782,85 @@ fn collect_clear_operations(
 }
 
 fn compile_root(
-	state: &ServerState,
 	mut graph: vfs::CompilationUnit,
 	trace: &mut Trace,
 ) -> CompiledRoot {
-	let compiled_versions = graph
-		.packages
-		.iter()
-		.flat_map(|cg| cg.modules.iter())
-		.map(|m| {
-			let path = PathBuf::from(m.file_path.as_str());
-			let ver = state
-				.open_documents
-				.get(&path)
-				.and_then(|doc| std::num::NonZeroI32::new(doc.lsp_version));
-			(path, ver)
-		})
-		.collect();
 	let tir = trace.step("typecheck", || TIR::build(&mut graph));
 	let symbol_index = build_symbol_index(&tir, &graph.interner);
 	CompiledRoot {
 		graph,
 		tir,
 		symbol_index,
-		compiled_versions,
 	}
 }
 
-/// Parses `root` fresh from the live overlay (open buffers over disk
-/// contents). Not cached — parsing is cheap (~1ms on typical files), and a
-/// persistent parse-only cache duplicating `cached`'s staleness tracking
-/// wasn't buying anything since every caller either needs it once
-/// (`formatting`) or immediately feeds it into a TIR rebuild anyway
-/// (`analyze_root`).
-/// Fails only if the entry file itself (`root`) can't be read — everything
-/// past that point (missing/ambiguous `mod` declarations elsewhere in the
-/// package) is a diagnostic on the resulting graph instead, since `discover_package_root`
-/// already verified `root` exists before calling this.
+/// Parses source modules fresh from the live overlay while reusing retained
+/// project manifests. First discovery loads metadata eagerly; subsequent
+/// source edits and format requests do not read or parse those manifests.
+/// Missing/unreadable manifests or entry files fail loading; other compiler
+/// diagnostics remain on the returned graph.
 fn parse_root(
-	state: &ServerState,
+	state: &mut ServerState,
 	root: &Path,
 	trace: &mut Trace,
 ) -> std::result::Result<vfs::CompilationUnit, ()> {
 	let overlay = OverlayFileSource::new(&state.open_documents);
-	let dir = vfs::AbsolutePath::new(root.to_str().unwrap_or_default());
-	trace.step("parse", || vfs::open_manifest(dir, &overlay))
+	let projects = &mut state.projects;
+	let root = AbsolutePath::new(root.to_str().ok_or(())?);
+	trace.step("parse", || {
+		// Eagerly load each newly encountered manifest, including dependencies.
+		// Keep invalid results too; only manifest events retry those reads.
+		let mut pending = vec![root.clone()];
+		let mut visited = HashSet::new();
+		while let Some(dir) = pending.pop() {
+			if !visited.insert(dir.clone()) {
+				continue;
+			}
+			let path = PathBuf::from(dir.as_str());
+			if !projects.contains_key(&path) {
+				let manifest_path =
+					dir.join(&vfs::RelativePath::new("wx.json"));
+				if !overlay.exists(&manifest_path) {
+					return Err(());
+				}
+				let parsed =
+					overlay.read_to_string(&manifest_path).and_then(|text| {
+						vfs::PackageManifest::parse(&text).map_err(|_| ())
+					});
+				let manifest = match parsed {
+					Ok(manifest) => ManifestState::Parsed(manifest),
+					Err(()) => ManifestState::Invalid,
+				};
+				projects.insert(
+					path.clone(),
+					ProjectState {
+						manifest,
+						published_files: HashSet::new(),
+					},
+				);
+			}
+			let ManifestState::Parsed(manifest) = &projects[&path].manifest
+			else {
+				return Err(());
+			};
+			for dependency in manifest.dependencies.values() {
+				let vfs::DependencySource::Local { path } = dependency;
+				pending.push(dir.join(path));
+			}
+		}
+		let manifests: HashMap<_, _> = visited
+			.into_iter()
+			.map(|dir| {
+				let ManifestState::Parsed(manifest) =
+					&projects[Path::new(dir.as_str())].manifest
+				else {
+					unreachable!()
+				};
+				(dir, manifest)
+			})
+			.collect();
+		vfs::open_manifest_with_manifests(root, &overlay, &manifests)
+	})
 }
 
 fn analysis_from_compiled_root(compiled: &CompiledRoot) -> AnalysisResult {
