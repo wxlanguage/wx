@@ -12,9 +12,9 @@ use crate::symbol_index::SymbolKind;
 use crate::{
 	Backend, CompiledRoot, OpenDocument, ServerState, TokenType, analyze_root,
 	build_service, byte_to_position, compute_refresh, diagnostic_publish_paths,
-	discover_crate_root, find_active_call, implementation_locations,
-	owning_root, position_to_offset, position_to_offset_in_str,
-	reference_search_kinds, symbol_hover_text, symbol_kind_to_token_type,
+	discover_package_root, find_active_call, implementation_locations,
+	position_to_offset, position_to_offset_in_str, reference_search_kinds,
+	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
 use wx_compiler::tir::TypeParamOwner;
@@ -45,6 +45,18 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 		while requests.next().await.is_some() {}
 	});
 
+	let manifest_uri: Uri = Uri::from_str("file:///tmp/probe/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
 	let uri: Uri = Uri::from_str("file:///tmp/probe/main.wx").unwrap();
 	backend
 		.did_open(DidOpenTextDocumentParams {
@@ -53,7 +65,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				language_id: "wx".into(),
 				version: 1,
 				text:
-					"fn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
 						.into(),
 			},
 		})
@@ -69,7 +81,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				range: None,
 				range_length: None,
 				text:
-					"fn add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
+					"use std::*;\nfn add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
 						.into(),
 			}],
 		})
@@ -81,7 +93,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 			text_document_position_params: TextDocumentPositionParams {
 				text_document: TextDocumentIdentifier { uri: uri.clone() },
 				position: Position {
-					line: 0,
+					line: 1,
 					character: 4,
 				},
 			},
@@ -106,14 +118,332 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 	);
 }
 
+/// `leading_doc_comment` (invoked via `doc_comment_anchor`) appends a
+/// function's `///` doc comment below the usual fenced signature block, for
+/// both the definition site and a call site.
+#[tokio::test]
+async fn hover_includes_leading_doc_comment() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let manifest_uri: Uri =
+		Uri::from_str("file:///tmp/probe3/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe3/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"/// Doubles `x`.\n",
+					"/// Second line.\n",
+					"fn double(x: i32) -> i32 { x + x }\n",
+					"fn use_it() -> i32 { double(1) }\n",
+					"export { use_it }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Call site: `double(1)` on line 4, column 22 (inside "double").
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 4,
+					character: 22,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `double`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert_eq!(
+		markup.value,
+		"```wx\nfn double(x: i32) -> i32\n```\n\n---\n\nDoubles `x`.\nSecond line.",
+		"call-site hover should include the doc comment below the signature"
+	);
+}
+
+/// The `memory_grow` shape from `std/main.wx`: an `#[attribute]` sits
+/// between the doc comment and the item it documents. That gap must still
+/// be tolerated (attributes are skipped, not treated as breaking the
+/// association), while a genuine blank line still breaks it.
+#[tokio::test]
+async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let manifest_uri: Uri =
+		Uri::from_str("file:///tmp/probe4/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe4/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"/// Not attached — blank line below breaks it.\n",
+					"\n",
+					"/// Attached despite the attribute below it.\n",
+					"#[inline]\n",
+					"fn triple(x: i32) -> i32 { x + x + x }\n",
+					"export { triple }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Definition site: `fn triple` on line 5, column 3 (inside "triple").
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 5,
+					character: 3,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `triple`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert_eq!(
+		markup.value,
+		"```wx\nfn triple(x: i32) -> i32\n```\n\n---\n\nAttached despite the attribute below it.",
+		"doc comment across an #[attribute] line should attach, and the \
+		 blank-line-separated comment above it should not: got {}",
+		markup.value
+	);
+}
+
+/// Regression: hovering `crate` used to panic the whole LSP process.
+/// `crate`/`super` resolve to a real `SymbolKind::Module` pointing at a
+/// namespace whose own package is the *same* package doing the asking —
+/// `TIR::namespace_name`'s `Package(_)` arm assumed that never happens
+/// (only a genuine dependency edge used to reach a package-root namespace),
+/// so it indexed straight into `dependency_names` with a key that was never
+/// there for a self-reference.
+#[tokio::test]
+async fn hover_over_crate_keyword_does_not_panic() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let manifest_uri: Uri =
+		Uri::from_str("file:///tmp/probe_crate_kw/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe_crate_kw/main.wx").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: concat!(
+					"use std::*;\n",
+					"pub fn helper() -> i32 { 1 }\n",
+					"mod a {\n",
+					"    pub fn use_it() -> i32 { crate::helper() }\n",
+					"}\n",
+					"fn main() -> i32 { a::use_it() }\n",
+					"export { main }\n",
+				)
+				.into(),
+			},
+		})
+		.await;
+
+	// Line 3, inside the word "crate" in `crate::helper()`.
+	let result = backend
+		.hover(HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position {
+					line: 3,
+					character: 31,
+				},
+			},
+			work_done_progress_params: Default::default(),
+		})
+		.await
+		.expect("hover should not error")
+		.expect("hover should resolve `crate`");
+	let HoverContents::Markup(markup) = result.contents else {
+		panic!("expected markup hover contents");
+	};
+	assert!(
+		markup.value.contains("crate"),
+		"expected the hover text to name the package as `crate` for a \
+		 self-reference, got: {}",
+		markup.value
+	);
+}
+
+/// Operator dispatch (`a + b`) resolves to a real trait method (`Add::add`)
+/// and pushes a go-to-definition access at the *operator's own span* onto
+/// it, the same mechanism an ordinary function reference uses — so without
+/// filtering, `+` would show up in semantic tokens tagged with the callee's
+/// `SymbolKind::Function`, painting it the same color as a real function
+/// call. Asserts the operator gets no semantic token at all, while a real
+/// function-name reference on the same line still does.
+#[tokio::test]
+async fn semantic_tokens_do_not_highlight_operators_as_functions() {
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let backend: &Backend = service.inner();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: Uri::from_str("file:///tmp/probe2/wx.json").unwrap(),
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
+		})
+		.await;
+
+	let uri: Uri = Uri::from_str("file:///tmp/probe2/main.wx").unwrap();
+	// Line 1: "fn add(a: i32, b: i32) -> i32 { a + b }" — `+` is at column 34.
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text:
+					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+						.into(),
+			},
+		})
+		.await;
+
+	let result = backend
+		.semantic_tokens_full(SemanticTokensParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		})
+		.await
+		.expect("semantic_tokens_full should not error")
+		.expect("expected a semantic tokens result");
+
+	let SemanticTokensResult::Tokens(tokens) = result else {
+		panic!("expected a full tokens result, not a delta");
+	};
+
+	// Decode the delta-encoded tokens back to absolute (line, character)
+	// positions.
+	let mut line = 0u32;
+	let mut character = 0u32;
+	let mut positions = Vec::new();
+	for tok in &tokens.data {
+		if tok.delta_line == 0 {
+			character += tok.delta_start;
+		} else {
+			line += tok.delta_line;
+			character = tok.delta_start;
+		}
+		positions.push((line, character, tok.token_type));
+	}
+
+	assert!(
+		!positions.iter().any(|&(l, c, _)| l == 1 && c == 34),
+		"operator `+` must not get its own semantic token: {:?}",
+		positions
+	);
+	assert!(
+		positions
+			.iter()
+			.any(|&(l, _, tt)| l == 1 && tt == TokenType::Function as u32),
+		"expected `add`'s own declaration on line 1 to still be highlighted \
+		 as a function: {:?}",
+		positions
+	);
+}
+
 /// Resolves the `FileId` for a given file path from a compiled root.
 fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
 	compiled
 		.graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
-		.find(|m| Path::new(&m.file_path) == path)
+		.find(|m| Path::new(m.file_path.as_str()) == path)
 		.unwrap_or_else(|| {
 			panic!("file not found in compiled graph: {}", path.display())
 		})
@@ -121,27 +451,27 @@ fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
 }
 
 fn open_document(text: &str) -> OpenDocument {
-	use std::sync::atomic::{AtomicI32, Ordering};
-	static COUNTER: AtomicI32 = AtomicI32::new(1);
 	OpenDocument {
 		text: text.to_string(),
-		lsp_version: COUNTER.fetch_add(1, Ordering::Relaxed),
 	}
 }
 
 #[test]
-fn discover_crate_root_walks_up_to_main_wx() {
+fn discover_package_root_walks_up_to_wx_json() {
 	let workspace_root = PathBuf::from("/workspace");
-	let crate_root = workspace_root.join("app").join("main.wx");
-	let child_file = workspace_root.join("app").join("math").join("add.wx");
+	let package_dir = workspace_root.join("app");
+	let child_file = package_dir.join("math").join("add.wx");
 
 	let mut open_documents = HashMap::new();
-	open_documents.insert(crate_root.clone(), open_document("module math;"));
+	open_documents.insert(
+		package_dir.join("wx.json"),
+		open_document(r#"{ "type": "bin", "entry": "main.wx" }"#),
+	);
 
 	let discovered =
-		discover_crate_root(&open_documents, &[workspace_root], &child_file);
+		discover_package_root(&open_documents, &[workspace_root], &child_file);
 
-	assert_eq!(discovered, Some(crate_root));
+	assert_eq!(discovered, Some(package_dir));
 }
 
 #[test]
@@ -175,6 +505,94 @@ fn diagnostic_publish_paths_keeps_previous_files_for_clearing() {
 }
 
 #[test]
+fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
+	// Regression test: a dependency file (`pow/main.wx`, reached only as
+	// part of `hashing`'s compiled graph) is *also*, independently, the
+	// entry file of its own project. `owning_root` used to scan
+	// `published_by_root` for ANY root whose `owned_files` contained the
+	// query file — and `hashing`'s own `owned_files` legitimately includes
+	// `pow/main.wx` too, since it's part of hashing's compiled dependency
+	// graph. If hashing published first, `owning_root("pow/main.wx")`
+	// would incorrectly return hashing's root as pow's "previous root", so
+	// refreshing `pow/main.wx` (after opening/editing it directly) looked
+	// like "this file moved from hashing's root to pow's own root" and
+	// wiped hashing's entire cache + published empty diagnostics for every
+	// file hashing owned — including `hashing/main.wx` itself, even though
+	// nothing about hashing's own project changed at all.
+	let hashing_dir = PathBuf::from("/examples/hashing");
+	let hashing_main = hashing_dir.join("main.wx");
+	let pow_dir = PathBuf::from("/examples/pow");
+	let pow_main = pow_dir.join("main.wx");
+
+	let mut state = ServerState::default();
+	state.open_documents.insert(
+		hashing_dir.join("wx.json"),
+		open_document(
+			r#"{
+				"type": "bin",
+				"entry": "main.wx",
+				"dependencies": { "pow": { "type": "local", "path": "../pow" } }
+			}"#,
+		),
+	);
+	state.open_documents.insert(
+		hashing_main.clone(),
+		open_document(
+			"use std::*;\nfn test() -> i32 { pow::pow(2, 3) }\nexport { test }\n",
+		),
+	);
+	state.open_documents.insert(
+		pow_dir.join("wx.json"),
+		open_document(r#"{ "type": "lib", "entry": "main.wx" }"#),
+	);
+	state.open_documents.insert(
+		pow_main.clone(),
+		open_document(
+			"use std::*;\npub fn pow(base: i32, exp: i32) -> i32 { base }\n",
+		),
+	);
+
+	// 1. Open (refresh) hashing/main.wx first — builds and caches hashing's
+	// root, which pulls in pow/main.wx as a dependency file.
+	compute_refresh(&mut state, &hashing_main, &mut Vec::new());
+	assert!(
+		state.cached.contains_key(&hashing_dir),
+		"hashing's root should be cached after its own refresh"
+	);
+
+	// Editing a shared dependency must rebuild its consumer as well as
+	// retaining its own independent package ownership.
+	state.open_documents.insert(
+		pow_main.clone(),
+		open_document(
+			"use std::*; pub fn pow(base: i32, exp: i32) -> bool { true }",
+		),
+	);
+	let mut logs = Vec::new();
+	let publications = crate::compute_active_refresh(
+		&mut state,
+		vec![pow_main.clone(), pow_main],
+		&mut logs,
+	);
+	assert_eq!(
+		logs.len(),
+		2,
+		"each active root must compile once per batch"
+	);
+	let final_diagnostics: HashMap<_, _> = publications.into_iter().collect();
+	assert!(final_diagnostics[&hashing_main].iter().any(|diagnostic| {
+		diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+	}));
+	assert!(!state.cached[&hashing_dir].tir.diagnostics.is_empty());
+
+	assert!(
+		state.cached.contains_key(&hashing_dir),
+		"editing the pow dependency directly must not clear hashing's \
+		 already-cached root"
+	);
+}
+
+#[test]
 #[ignore = "fix lsp later"]
 fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	let root = PathBuf::from("/workspace/app/main.wx");
@@ -184,7 +602,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"module math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
@@ -192,7 +610,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 		open_document("fn add() -> bool {\n    true\n}\n"),
 	);
 
-	let broken = analyze_root(&mut state, &root, &mut Vec::new());
+	let broken = analyze_root(&mut state, &root, &root, &mut Vec::new());
 	assert!(broken.owned_files.contains(&root));
 	assert!(broken.owned_files.contains(&child));
 	assert!(
@@ -210,7 +628,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 		open_document("fn add() -> i32 {\n    1\n}\n"),
 	);
 
-	let fixed = analyze_root(&mut state, &root, &mut Vec::new());
+	let fixed = analyze_root(&mut state, &root, &root, &mut Vec::new());
 	assert!(fixed.owned_files.contains(&root));
 	assert!(fixed.owned_files.contains(&child));
 	assert!(
@@ -239,7 +657,7 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"module math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
@@ -249,8 +667,7 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 
 	let broken_publish = compute_refresh(&mut state, &child, &mut Vec::new());
 
-	assert_eq!(owning_root(&state, &child), Some(root.as_path()));
-	assert_eq!(owning_root(&state, &root), Some(root.as_path()));
+	assert_eq!(state.own_root.get(&child), Some(&root));
 
 	assert!(
 		broken_publish.iter().any(|(path, diags)| {
@@ -283,34 +700,61 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 // ── Completion integration tests
 // ─────────────────────────────────────────────────────
 
-fn compile_source(root: &PathBuf, source: &str) -> (ServerState, CompiledRoot) {
+/// Every test in this module names its entry file directly (e.g.
+/// `/test/main.wx`) rather than a project directory — `analyze_root` now
+/// wants the latter, so this synthesizes the `wx.json` a real project
+/// would have: `{dir}/wx.json` with `entry` set to the entry file's own
+/// name, opened as a virtual document the same way `entry`'s own source
+/// is. Callers are none the wiser; they still pass/receive the entry file
+/// path exactly as before.
+fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
+	let dir = entry
+		.parent()
+		.expect("entry path should have a parent directory")
+		.to_path_buf();
+	let entry_name = entry
+		.file_name()
+		.and_then(|name| name.to_str())
+		.expect("entry path should have a UTF-8 file name");
+	state.open_documents.insert(
+		dir.join("wx.json"),
+		open_document(&format!(
+			r#"{{ "type": "bin", "entry": "{entry_name}" }}"#
+		)),
+	);
+	dir
+}
+
+fn compile_source(root: &Path, source: &str) -> (ServerState, CompiledRoot) {
 	let mut state = ServerState::default();
 	state
 		.open_documents
-		.insert(root.clone(), open_document(source));
-	analyze_root(&mut state, root, &mut Vec::new());
-	let compiled = state.cached.remove(root).expect("compilation failed");
+		.insert(root.to_path_buf(), open_document(source));
+	let dir = open_synthetic_manifest(&mut state, root);
+	analyze_root(&mut state, &dir, root, &mut Vec::new());
+	let compiled = state.cached.remove(&dir).expect("compilation failed");
 	(state, compiled)
 }
 
 /// Compiles `root_source` alongside additional `(path, source)` files (e.g.
-/// files pulled in via `module foo;` declarations).
+/// files pulled in via `mod foo;` declarations).
 fn compile_multi_source(
-	root: &PathBuf,
+	root: &Path,
 	root_source: &str,
-	extra_files: &[(&PathBuf, &str)],
+	extra_files: &[(&Path, &str)],
 ) -> (ServerState, CompiledRoot) {
 	let mut state = ServerState::default();
 	state
 		.open_documents
-		.insert(root.clone(), open_document(root_source));
+		.insert(root.to_path_buf(), open_document(root_source));
 	for (path, source) in extra_files {
 		state
 			.open_documents
-			.insert((*path).clone(), open_document(source));
+			.insert(path.to_path_buf(), open_document(source));
 	}
-	analyze_root(&mut state, root, &mut Vec::new());
-	let compiled = state.cached.remove(root).expect("compilation failed");
+	let dir = open_synthetic_manifest(&mut state, root);
+	analyze_root(&mut state, &dir, root, &mut Vec::new());
+	let compiled = state.cached.remove(&dir).expect("compilation failed");
 	(state, compiled)
 }
 
@@ -328,6 +772,7 @@ fn completion_inside_function_includes_params() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -359,6 +804,7 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -397,10 +843,12 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 		}
 
 		fn test() {
-		    local p:
+		    local p: i32 = 0;
 		}
 	"};
-	let cursor = source.find("local p:").unwrap() + "local p:".len();
+	// After the space, not against the colon: a cursor touching the colon is
+	// still mid-token and completes nothing (`CompletionContext::Unavailable`).
+	let cursor = source.find("local p: ").unwrap() + "local p: ".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
@@ -408,6 +856,7 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -461,6 +910,7 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -515,6 +965,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -545,6 +996,7 @@ fn completion_inside_function_shows_globals_too() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -573,6 +1025,7 @@ fn completion_sorts_locals_before_globals() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -609,6 +1062,7 @@ fn completion_prefix_filters_results() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -680,6 +1134,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -696,7 +1151,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 fn completion_hides_sibling_module_items_without_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nfn main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
@@ -709,6 +1164,7 @@ fn completion_hides_sibling_module_items_without_use() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -730,7 +1186,7 @@ fn completion_hides_sibling_module_items_without_use() {
 fn completion_shows_sibling_module_items_via_wildcard_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nuse math::*;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nuse math::*;\nfn main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
@@ -743,6 +1199,7 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -779,6 +1236,7 @@ fn path_completion_after_enum_lists_variants() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -824,6 +1282,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -845,7 +1304,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 fn path_completion_after_namespace_lists_module_members() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "module math;\nfn test() {\n    math::\n}";
+	let source = "mod math;\nfn test() {\n    math::\n}";
 	let cursor = source.find("math::\n").unwrap() + "math::".len();
 
 	let (_, compiled) = compile_multi_source(
@@ -858,6 +1317,7 @@ fn path_completion_after_namespace_lists_module_members() {
 	let items = completion_items(
 		&compiled.tir,
 		&compiled.graph.interner,
+		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
 		source,
@@ -876,7 +1336,7 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	// Regression test: signature_help used to compute `offset` from
 	// `compiled.graph.files` (the source as of the last save) and then slice
 	// into that same stale, shorter string. Typing new lines above the
-	// cursor without saving (e.g. wrapping existing code in a new `module`
+	// cursor without saving (e.g. wrapping existing code in a new `mod`
 	// block) pushed the live cursor position past the stale source's length
 	// and panicked on `source[..offset]`. `resolve_source_and_offset` is the
 	// shared fix both `completion` and `signature_help` now go through —
@@ -886,7 +1346,7 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	let (mut state, compiled) = compile_source(&root, stale_source);
 	state.cached.insert(root.clone(), compiled);
 
-	let live_source = "module test {\n    fn foo()\n}\n\nfn test() {\n\n}";
+	let live_source = "mod test {\n    fn foo()\n}\n\nfn test() {\n\n}";
 	state
 		.open_documents
 		.insert(root.clone(), open_document(live_source));
@@ -925,13 +1385,13 @@ fn resolve_uri_finds_virtual_stdlib_module() {
 	let (_, compiled) = compile_source(&root, "fn main() {}");
 	let stdlib_file_id = compiled
 		.graph
-		.crates
+		.packages
 		.iter()
 		.flat_map(|cg| cg.modules.iter())
-		.find(|m| m.file_path == "main.wx")
+		.find(|m| m.file_path.as_str() == "/main.wx")
 		.map(|m| m.file_id)
 		.expect("stdlib module should be present in the compiled graph");
-	let uri = crate::file_id_to_uri(&compiled, stdlib_file_id)
+	let uri = crate::file_id_to_uri(&compiled.graph.files, stdlib_file_id)
 		.expect("should construct a wx://std/ URI for the stdlib module");
 
 	let mut state = ServerState::default();
@@ -946,11 +1406,86 @@ fn resolve_uri_finds_virtual_stdlib_module() {
 }
 
 #[test]
+fn cross_package_namespace_token_gets_a_reference() {
+	// Regression test: `build_symbol_index`'s `ModuleDeclarationKind::Package`
+	// arm used to `continue` before recording `ns.accesses`, so a
+	// dependency's own namespace token (`dep` in `dep::helper()`, or the
+	// literal `std` in `use std::*;`) never made it into `references` —
+	// hover/goto-definition/semantic-highlighting had nothing to find at
+	// that token, even though the item it resolves to (`helper`) worked
+	// fine. A locally-declared `mod foo;` never hit this arm at all
+	// (it's `ModuleDeclarationKind::Module`), which is why same-package
+	// modules never showed the bug.
+	use wx_compiler::vfs::{self, VirtualFileSource};
+
+	let source = VirtualFileSource::new(HashMap::from([
+		(
+			vfs::AbsolutePath::new("/app/wx.json"),
+			r#"{
+				"type": "bin",
+				"entry": "main.wx",
+				"dependencies": { "dep": { "type": "local", "path": "../dep" } }
+			}"#
+			.to_string(),
+		),
+		(
+			vfs::AbsolutePath::new("/app/main.wx"),
+			"use std::*;\nfn test() -> i32 { dep::helper() }\nexport { test }\n"
+				.to_string(),
+		),
+		(
+			vfs::AbsolutePath::new("/dep/wx.json"),
+			r#"{ "type": "lib", "entry": "main.wx" }"#.to_string(),
+		),
+		(
+			vfs::AbsolutePath::new("/dep/main.wx"),
+			"use std::*;\npub fn helper() -> i32 { 42 }\n".to_string(),
+		),
+	]));
+
+	let graph = vfs::open_manifest(vfs::AbsolutePath::new("/app"), &source)
+		.expect("both packages should load");
+	let compiled = crate::compile_root(
+		graph,
+		&mut crate::Trace::new(PathBuf::from("/app/main.wx")),
+	);
+
+	let app_file_id = compiled
+		.graph
+		.packages
+		.iter()
+		.flat_map(|cg| cg.modules.iter())
+		.find(|m| m.file_path.as_str() == "/app/main.wx")
+		.expect("app main.wx should be in the graph")
+		.file_id;
+
+	// "dep" in `dep::helper()`, inside
+	// "use std::*;\nfn test() -> i32 { dep::helper() }\n..." — starts right
+	// after "use std::*;\nfn test() -> i32 { ".
+	let dep_token_start = "use std::*;\nfn test() -> i32 { ".len() as u32;
+	let has_dep_reference = compiled.symbol_index.references.iter().any(|r| {
+		r.source.file_id == app_file_id
+			&& r.source.span.start == dep_token_start
+			&& matches!(r.kind, SymbolKind::Namespace(_))
+	});
+	assert!(
+		has_dep_reference,
+		"expected a Namespace reference recorded for the `dep` token; got: {:#?}",
+		compiled
+			.symbol_index
+			.references
+			.iter()
+			.filter(|r| r.source.file_id == app_file_id)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
 fn full_diagnostic_renders_and_handles_bad_index() {
 	let root = PathBuf::from("/test/main.wx");
 	let (_, compiled) = compile_source(
 		&root,
-		"fn main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
+		"use std::*;\nfn main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
 	);
 
 	assert!(
@@ -1089,13 +1624,15 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 
 #[test]
 fn type_alias_used_as_return_type_resolves_to_its_definition() {
-	// Regression test: `build_symbol_index` never visited `tir.type_aliases`
+	// Regression test: `build_symbol_index` never visited `tir.items.type_aliases`
 	// at all, and `SymbolKind` had no `TypeAlias` variant — so a `type Id =
 	// u32;` alias had no definition/reference entries whatsoever. Every
 	// LSP feature keyed off `SymbolKind` (go-to-definition, hover, semantic
 	// tokens) silently did nothing for a name that resolved to a type alias.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
+		use std::*;
+
 		type Id = u32;
 
 		fn test() -> Id {
@@ -1138,9 +1675,14 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 		"a type alias reference should be colored as a type"
 	);
 
-	let hover =
-		symbol_hover_text(&compiled.tir, &compiled.graph.interner, &found.kind)
-			.expect("expected hover text for the type alias");
+	let hover = symbol_hover_text(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.graph.packages,
+		compiled.graph.root_package,
+		&found.kind,
+	)
+	.expect("expected hover text for the type alias");
 	assert_eq!(hover, "type Id = u32");
 }
 
@@ -1663,8 +2205,8 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 	// Regression test: `memory` declarations never recorded any access at
 	// all (unlike struct/enum/trait/const), and `wx-lsp`'s `SymbolKind` had
 	// no `Memory` variant to begin with — so hover/go-to-definition on a
-	// memory name silently did nothing everywhere: as a type (`heap::[]u8`,
-	// `type M = heap;`), as a value receiver (`heap.size()`), and in an
+	// memory name silently did nothing everywhere: as a type (`heap::&[u8]`,
+	// `type M = heap;`), as a value receiver (`heap.size_pages()`), and in an
 	// `export { heap as "..." }` list.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
@@ -1673,7 +2215,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 		#[memory_limits(min_pages = 1)]
 		memory heap: Memory where { Size = u32 };
 		fn heap_size() -> u32 {
-		    heap.size()
+		    heap.size_pages()
 		}
 
 		export {
@@ -1691,17 +2233,19 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 		.find(|d| matches!(d.kind, SymbolKind::Memory(_)))
 		.expect("expected a definition entry for `memory heap`");
 
-	// Value position: `heap.size()`.
-	let value_offset = source.find("heap.size()").unwrap();
+	// Value position: `heap.size_pages()`.
+	let value_offset = source.find("heap.size_pages()").unwrap();
 	let found_value = compiled
 		.symbol_index
 		.find_at_position(file_id, value_offset as u32)
 		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `heap.size()` receiver position")
+			panic!(
+				"expected a symbol at the `heap.size_pages()` receiver position"
+			)
 		});
 	assert_eq!(
 		found_value.kind, definition.kind,
-		"expected `heap` in `heap.size()` to resolve to the memory declaration"
+		"expected `heap` in `heap.size_pages()` to resolve to the memory declaration"
 	);
 
 	// Export-list position: `heap as "memory"`.
@@ -1770,8 +2314,10 @@ fn memory_associated_const_namespace_access_resolves() {
 	let SymbolKind::Const(const_id) = found.kind else {
 		unreachable!("checked above");
 	};
-	let const_index = compiled.tir.const_index(const_id).unwrap();
-	let const_name = compiled.tir.constants[const_index as usize].name.inner;
+	let const_index = compiled.tir.items.const_index(const_id).unwrap();
+	let const_name = compiled.tir.items.constants[usize::from(const_index)]
+		.name
+		.inner;
 	assert_eq!(
 		compiled.graph.interner.resolve(const_name),
 		Some("DATA_END"),
@@ -1779,7 +2325,9 @@ fn memory_associated_const_namespace_access_resolves() {
 	);
 	assert_eq!(
 		definition.source.span,
-		compiled.tir.constants[const_index as usize].name.span,
+		compiled.tir.items.constants[usize::from(const_index)]
+			.name
+			.span,
 		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
 }
@@ -1810,5 +2358,323 @@ fn find_enclosing_function_returns_correct_function() {
 	assert_ne!(
 		first_idx, second_idx,
 		"cursor positions in different functions should map to different indices"
+	);
+}
+
+#[test]
+fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
+	let mut state = ServerState::default();
+	let outer = PathBuf::from("/watch-test");
+	let inner = outer.join("nested");
+	let file = inner.join("main.wx");
+	state
+		.open_documents
+		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	state.open_documents.insert(
+		outer.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"nested/main.wx"}"#),
+	);
+	compute_refresh(&mut state, &file, &mut Vec::new());
+	assert_eq!(state.own_root.get(&file), Some(&outer));
+
+	let manifest = inner.join("wx.json");
+	state.open_documents.insert(
+		manifest.clone(),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	crate::compute_active_refresh(
+		&mut state,
+		vec![manifest.clone(), manifest.clone()],
+		&mut Vec::new(),
+	);
+	assert_eq!(state.own_root.get(&file), Some(&inner));
+	assert!(state.cached.contains_key(&outer));
+	assert!(state.cached.contains_key(&inner));
+
+	state.open_documents.remove(&manifest);
+	compute_refresh(&mut state, &manifest, &mut Vec::new());
+	assert_eq!(state.own_root.get(&file), Some(&outer));
+	assert!(state.cached.contains_key(&outer));
+	assert!(!state.cached.contains_key(&inner));
+	assert!(!state.projects.contains_key(&inner));
+}
+
+#[tokio::test]
+async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
+	use crate::{Command, ManifestState, handle_command};
+	use std::collections::VecDeque;
+	use tokio::sync::oneshot;
+	use tower_lsp_server::ls_types::*;
+
+	let (service, socket) = build_service();
+	let client = &service.inner().client;
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+	let root = PathBuf::from("/manifest-format-test");
+	let manifest_path = root.join("wx.json");
+	let source_path = root.join("main.wx");
+	let dep_path = root.join("dep/wx.json");
+	let manifest = |width| {
+		format!(
+			r#"{{"type":"bin","entry":"main.wx","format":{{"indent_width":{width}}},"dependencies":{{"dep":{{"type":"local","path":"dep"}}}}}}"#
+		)
+	};
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(manifest_path.clone(), open_document(&manifest(2)));
+	state.open_documents.insert(
+		source_path.clone(),
+		open_document("fn main() { local x = true; } export { main }"),
+	);
+	state.open_documents.insert(
+		dep_path.clone(),
+		open_document(r#"{"type":"lib","entry":"main.wx"}"#),
+	);
+	state.open_documents.insert(
+		root.join("dep/main.wx"),
+		open_document("pub fn helper() {}"),
+	);
+
+	async fn format(
+		state: &mut ServerState,
+		client: &tower_lsp_server::Client,
+	) -> Option<Vec<TextEdit>> {
+		let (tx, rx) = oneshot::channel();
+		handle_command(
+			Command::Formatting(
+				DocumentFormattingParams {
+					text_document: TextDocumentIdentifier {
+						uri: Uri::from_str(
+							"file:///manifest-format-test/main.wx",
+						)
+						.unwrap(),
+					},
+					options: FormattingOptions {
+						tab_size: 8,
+						insert_spaces: false,
+						..Default::default()
+					},
+					work_done_progress_params: Default::default(),
+				},
+				tx,
+			),
+			&VecDeque::new(),
+			state,
+			client,
+		)
+		.await;
+		rx.await.unwrap()
+	}
+
+	// First formatting discovers both manifests without requiring a compiled cache.
+	let first = format(&mut state, client).await.unwrap();
+	assert!(state.cached.is_empty());
+	assert_eq!(state.projects.len(), 2);
+	assert!(
+		first[0].new_text.contains("\n  local"),
+		"{}",
+		first[0].new_text
+	);
+
+	// Deliberately alter backing text without an event: both root and dependency
+	// must be reused, not read or parsed again by formatting/package resolution.
+	state.open_documents.get_mut(&manifest_path).unwrap().text = "{".into();
+	state.open_documents.get_mut(&dep_path).unwrap().text = "{".into();
+	assert_eq!(format(&mut state, client).await.unwrap(), first);
+	compute_refresh(&mut state, &source_path, &mut Vec::new());
+	assert_eq!(format(&mut state, client).await.unwrap(), first);
+
+	let pending = VecDeque::from([Command::DidChange {
+		path: manifest_path.clone(),
+		text: manifest(6),
+	}]);
+	handle_command(
+		Command::DidChange {
+			path: manifest_path.clone(),
+			text: manifest(3),
+		},
+		&pending,
+		&mut state,
+		client,
+	)
+	.await;
+	let updated = format(&mut state, client).await.unwrap();
+	assert!(
+		updated[0].new_text.contains("\n   local"),
+		"{}",
+		updated[0].new_text
+	);
+	assert!(!updated[0].new_text.contains("\n      local"));
+
+	// A failed parse replaces the last valid value even if compilation is skipped.
+	handle_command(
+		Command::DidChange {
+			path: manifest_path.clone(),
+			text: "{".into(),
+		},
+		&pending,
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(matches!(
+		state.projects[&root].manifest,
+		ManifestState::Invalid
+	));
+	assert!(format(&mut state, client).await.is_none());
+	state.open_documents.get_mut(&manifest_path).unwrap().text = manifest(4);
+	assert!(
+		format(&mut state, client).await.is_none(),
+		"invalid results are retained until an event"
+	);
+	handle_command(
+		Command::DidChange {
+			path: manifest_path,
+			text: manifest(4),
+		},
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	let edits = format(&mut state, client).await.unwrap();
+	assert!(edits[0].new_text.contains("\n    local"));
+
+	// Feeding that output back in yields no edits at all: an
+	// already-formatted buffer must not be rewritten, or every
+	// format-on-save would dirty the document and force a re-check.
+	state.open_documents.get_mut(&source_path).unwrap().text =
+		edits[0].new_text.clone();
+	assert!(format(&mut state, client).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn watched_file_events_skip_documents_the_editor_already_owns() {
+	use crate::{Command, handle_command};
+	use std::collections::VecDeque;
+
+	let (service, socket) = build_service();
+	let client = &service.inner().client;
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+
+	let root = PathBuf::from("/watch-skip-test");
+	let file = root.join("main.wx");
+	let mut state = ServerState::default();
+	state.open_documents.insert(
+		root.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	state
+		.open_documents
+		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	compute_refresh(&mut state, &file, &mut Vec::new());
+	assert!(state.cached.contains_key(&root));
+
+	// Saving an open buffer writes it to disk and the watcher reports it,
+	// but the overlay already held that exact text: no rebuild.
+	state.cached.clear();
+	handle_command(
+		Command::DidChangeWatchedFiles(vec![file, root.join("wx.json")]),
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(state.cached.is_empty());
+
+	// A file the editor does not own still invalidates: that is the only
+	// way `git checkout` and external edits reach the server.
+	handle_command(
+		Command::DidChangeWatchedFiles(vec![root.join("other.wx")]),
+		&VecDeque::new(),
+		&mut state,
+		client,
+	)
+	.await;
+	assert!(state.cached.contains_key(&root));
+}
+
+/// A path that can't be converted to `&str` must be declined, not turned
+/// into an empty one: `AbsolutePath::new` asserts on a path that doesn't
+/// start with `/`, and it runs here on the state actor task, so the panic
+/// takes down analysis for the rest of the session rather than skipping one
+/// event.
+#[cfg(unix)]
+#[test]
+fn an_unconvertible_manifest_path_does_not_delete_the_project() {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt;
+
+	let mut state = ServerState::default();
+	let root = PathBuf::from("/project");
+	state.projects.insert(
+		root.clone(),
+		crate::ProjectState {
+			manifest: crate::ManifestState::Invalid,
+			published_files: HashSet::from([root.join("main.wx")]),
+		},
+	);
+
+	// `wx.json` itself is valid UTF-8; the directory holding it is not, so
+	// only the whole-path conversion fails.
+	let mut invalid = PathBuf::from(OsStr::from_bytes(b"/project/\xff"));
+	invalid.push("wx.json");
+
+	let publications = refresh_project_manifest(&mut state, &invalid);
+
+	assert!(
+		publications.is_empty(),
+		"an unreadable path must not publish diagnostic clears"
+	);
+	assert!(
+		state.projects.contains_key(&root),
+		"the unrelated project must survive"
+	);
+}
+
+/// A refresh that changes nothing must publish each file once. Clearing an
+/// active root before re-analysing it drained the `published_files` that
+/// `collect_publish_operations` diffs against, so every still-diagnosed file
+/// got an empty publish immediately followed by an identical real one — a
+/// squiggle blinking off and back on for every file on every keystroke.
+#[test]
+fn a_repeated_refresh_publishes_each_file_once() {
+	let mut state = ServerState::default();
+	let root = PathBuf::from("/republish");
+	let main = root.join("main.wx");
+	state.open_documents.insert(
+		root.join("wx.json"),
+		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+	);
+	state.open_documents.insert(
+		main.clone(),
+		open_document("fn main() -> i32 { true }\nexport { main }"),
+	);
+
+	// The first refresh establishes `published_files`; the second is the one
+	// that has something to diff against.
+	compute_refresh(&mut state, &main, &mut Vec::new());
+	let publications = compute_refresh(&mut state, &main, &mut Vec::new());
+
+	let for_main: Vec<_> = publications
+		.iter()
+		.filter(|(path, _)| path == &main)
+		.collect();
+	assert_eq!(
+		for_main.len(),
+		1,
+		"expected one publish for {main:?}, got {for_main:?}"
+	);
+	assert!(
+		!for_main[0].1.is_empty(),
+		"the type error must survive an otherwise-unchanged refresh"
 	);
 }

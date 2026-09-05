@@ -12,3 +12,4 @@ body:
   - LocalTee: 1
   - LocalGet: 1
   - I32Add
+br_table_depths: []

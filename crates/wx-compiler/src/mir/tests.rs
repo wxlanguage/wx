@@ -8,56 +8,30 @@ use crate::{tir, vfs};
 
 #[allow(unused)]
 struct TestCase {
-	graph: vfs::CompilationGraph,
+	graph: vfs::CompilationUnit,
 	tir: tir::TIR,
 	mir: MIR,
 }
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut builder = vfs::CompilationGraphBuilder::new();
-		let stdlib_id = builder.load_stdlib();
-		let prefixed = format!("use std::*;\n{source}");
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
-				"main.wx".to_string(),
-				&vfs::VirtualFileSource::new(HashMap::from([(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
-					prefixed,
+					source.to_string(),
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id, stdlib_id);
+		let mut graph = builder.build(root_id);
 		let tir = tir::TIR::build(&mut graph);
 		let mir = MIR::build(&tir, &graph.interner, graph.id_generator);
 		TestCase { graph, tir, mir }
 	}
 }
-
-// Minimal inline definitions shared across tests that need them.
-
-/// ASCII helper and char methods, purpose-named to avoid colliding with
-/// `std/main.wx`'s own `impl char { fn is_ascii_lowercase / to_ascii_uppercase }`
-/// (a real collision would now correctly be flagged as a duplicate impl).
-const CHAR_ASCII_METHODS: &str = indoc! {"
-    const ASCII_CASE_MASK: u8 = 0b0010_0000;
-
-    impl char {
-        #[inline]
-        pub fn is_test_lowercase(self) -> bool {
-            self >= 'a' && self <= 'z'
-        }
-
-        #[inline]
-        pub fn to_test_uppercase(self) -> char {
-            if self.is_test_lowercase() {
-                ((self as u8) ^ ASCII_CASE_MASK) as char
-            } else {
-                self
-            }
-        }
-    }
-"};
 
 // ── primitives
 // ────────────────────────────────────────────────────────────────
@@ -245,36 +219,64 @@ fn test_tuple_type_alias_transparent_in_mir() {
 
 #[test]
 fn test_struct_method_call() {
-	// Both #[inline] methods get substituted into `to_upper`; the snapshot
-	// shows only the arithmetic body with no Call nodes remaining.
-	let case = TestCase::new(&format!(
-		"{CHAR_ASCII_METHODS}\n{}",
-		indoc! {"
-        fn to_upper(c: char) -> char {
-            c.to_test_uppercase()
+	// A method without `#[inline]` stays a real call: `to_uppercase` survives
+	// as its own MIR function, and `to_upper` reaches it through a `Call`.
+	let case = TestCase::new(indoc! {"
+        struct Letter { code: u8 }
+
+        impl Letter {
+            pub fn to_uppercase(self) -> u8 {
+                self.code ^ 0b0010_0000
+            }
+        }
+
+        fn to_upper(c: u8) -> u8 {
+            Letter::{ code: c }.to_uppercase()
         }
 
         export { to_upper }
-    "}
-	));
-	insta::assert_yaml_snapshot!(case.mir);
+    "});
+	assert_eq!(case.mir.functions.len(), 2, "to_upper + to_uppercase");
+	let mut result = &mir_function(&case, "to_upper").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(matches!(result.kind, ExprKind::Call { .. }));
 }
 
 #[test]
 fn test_inline_method_is_substituted() {
-	// A call to an #[inline] method must be replaced by its body in MIR —
-	// the snapshot shows the inlined if/xor logic with no Call node.
-	let case = TestCase::new(&format!(
-		"{CHAR_ASCII_METHODS}\n{}",
-		indoc! {"
-        fn to_upper(c: char) -> char {
-            c.to_test_uppercase()
+	// A call to an `#[inline]` method is replaced by its body, transitively:
+	// `to_upper` inlines `to_uppercase`, which inlines `is_lowercase`. With no
+	// call left to either, DCE drops both and one function remains.
+	let case = TestCase::new(indoc! {"
+        const ASCII_CASE_MASK: u8 = 0b0010_0000;
+
+        struct Letter { code: u8 }
+
+        impl Letter {
+            #[inline]
+            pub fn is_lowercase(self) -> bool {
+                self.code >= 97 && self.code <= 122
+            }
+
+            #[inline]
+            pub fn to_uppercase(self) -> u8 {
+                if self.is_lowercase() {
+                    self.code ^ ASCII_CASE_MASK
+                } else {
+                    self.code
+                }
+            }
+        }
+
+        fn to_upper(c: u8) -> u8 {
+            Letter::{ code: c }.to_uppercase()
         }
 
         export { to_upper }
-    "}
-	));
-	insta::assert_yaml_snapshot!(case.mir);
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "only `to_upper` should remain");
 }
 
 // ── memory instructions
@@ -297,12 +299,12 @@ fn test_memory_grow_lowers_to_memory_grow() {
 
 #[test]
 fn test_memory_size_lowers_to_memory_size() {
-	// heap.size() → MemorySize { memory_index: 0 }
+	// heap.size_pages() → MemorySize { memory_index: 0 }
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         pub fn f() -> u32 {
-            heap.size()
+            heap.size_pages()
         }
 
         export { f }
@@ -316,7 +318,7 @@ fn test_memory_data_end_lowers_to_memory_offset() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f() -> heap::*u8 {
+        pub fn f() -> heap::&u8 {
             heap::DATA_END
         }
 
@@ -327,12 +329,12 @@ fn test_memory_data_end_lowers_to_memory_offset() {
 
 #[test]
 fn test_memory_index_lowers_to_int() {
-	// heap::MEMORY_INDEX → Int { value: 0 } (the wasm linear memory index)
+	// heap::INDEX → Int { value: 0 } (the wasm linear memory index)
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         pub fn f() -> u32 {
-            heap::MEMORY_INDEX
+            heap::INDEX
         }
 
         export { f }
@@ -347,7 +349,7 @@ fn test_slice_len_lowers_to_aggregate_get() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(s: heap::[]u8) -> u32 {
+        pub fn f(s: heap::&[u8]) -> u32 {
             slice_len(s)
         }
 
@@ -364,7 +366,7 @@ fn test_slice_from_parts_lowers_to_aggregate() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(ptr: heap::*u8, len: u32) -> heap::[]u8 {
+        pub fn f(ptr: heap::&u8, len: u32) -> heap::&[u8] {
             slice_from_parts(ptr, len)
         }
 
@@ -1120,7 +1122,7 @@ fn test_multiple_calls_to_generic_produce_single_mono_instance() {
 // ─────────────────────────────────────────────────────────────
 
 // String literal tests removed: `string` is no longer a named struct type;
-// string literals produce `[]u8` slices. Static-data coverage is provided
+// string literals produce `&[u8]` slices. Static-data coverage is provided
 // by the array literal tests below.
 
 // ── arrays
@@ -1128,11 +1130,11 @@ fn test_multiple_calls_to_generic_produce_single_mono_instance() {
 
 #[test]
 fn test_array_literal_bytes_are_little_endian() {
-	// [1, 2, 3] as heap::[3]i32 → 12 bytes encoding each value as 32-bit LE.
+	// [1, 2, 3] as heap::&[i32; 3] → 12 bytes encoding each value as 32-bit LE.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::[3]i32 {
-            local arr: heap::[3]i32 = [1, 2, 3];
+        fn get() -> heap::&[i32; 3] {
+            local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
         export { get }
@@ -1151,11 +1153,11 @@ fn test_array_literal_bytes_are_little_endian() {
 
 #[test]
 fn test_array_repeat_bytes_repeated() {
-	// [7; 4] as heap::[4]u8 → four bytes each equal to 7.
+	// [7; 4] as heap::&[u8; 4] → four bytes each equal to 7.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::[4]u8 {
-            local arr: heap::[4]u8 = [7; 4];
+        fn get() -> heap::&[u8; 4] {
+            local arr: heap::&[u8; 4] = [7; 4];
             arr
         }
         export { get }
@@ -1172,8 +1174,8 @@ fn test_array_dce_removes_static_data_ownership() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         fn live() -> i32 { 42 }
-        fn dead() -> heap::[3]i32 {
-            local arr: heap::[3]i32 = [1, 2, 3];
+        fn dead() -> heap::&[i32; 3] {
+            local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
         export { live }
@@ -1196,16 +1198,16 @@ fn test_static_entry_alignment_matches_element_type() {
 	// i32 elements → align 4; f64 elements → align 8; u8 elements → align 1.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ints() -> heap::[2]i32 {
-            local a: heap::[2]i32 = [10, 20];
+        fn ints() -> heap::&[i32; 2] {
+            local a: heap::&[i32; 2] = [10, 20];
             a
         }
-        fn doubles() -> heap::[2]f64 {
-            local b: heap::[2]f64 = [1.0; 2];
+        fn doubles() -> heap::&[f64; 2] {
+            local b: heap::&[f64; 2] = [1.0; 2];
             b
         }
-        fn bytes() -> heap::[2]u8 {
-            local c: heap::[2]u8 = [1; 2];
+        fn bytes() -> heap::&[u8; 2] {
+            local c: heap::&[u8; 2] = [1; 2];
             c
         }
         export { ints, doubles, bytes }
@@ -1270,26 +1272,36 @@ fn test_size_of_generic_monomorphizes() {
 }
 
 #[test]
-fn test_generic_impl_slice_count_method_lowers_correctly() {
-	// Uses `count`, not `len`, to avoid colliding with the stdlib's own
-	// `impl<M: Memory, T> M::[]T { fn len(...) }`.
+fn test_generic_slice_impl_method_lowers_correctly() {
+	// The stdlib's `impl<Mem: Memory, T> Mem::&[T] { #[inline] fn len(self) ->
+	// Mem::Size }` at `Mem = heap, T = u8` — the only kind of inherent slice
+	// impl there can be, since nobody defines slices. Two things have to
+	// happen for `s.len()` to lower correctly: `Mem::Size` resolves to
+	// `heap`'s concrete index type, and the `slice_len` intrinsic in the body
+	// becomes a direct read of the slice aggregate's length slot.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        impl<M: Memory, T> M::[]T {
-            pub fn count(self) -> M::Size {
-                slice_len(self)
-            }
-        }
-
-        pub fn get_len(s: heap::[]u8) -> u32 {
-            s.count()
+        pub fn get_len(s: heap::&[u8]) -> u32 {
+            s.len()
         }
 
         export { get_len }
     "});
 	assert!(case.tir.diagnostics.is_empty());
-	insta::assert_yaml_snapshot!(case.mir);
+
+	let mut result = &mir_function(&case, "get_len").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(
+		matches!(result.kind, ExprKind::AggregateGet { value_index: 1, .. }),
+		"`slice_len` should read the slice aggregate's length slot directly"
+	);
+	assert!(
+		matches!(result.ty, Type::U32),
+		"`Mem::Size` should have resolved to `heap`'s index type"
+	);
 }
 
 #[test]
@@ -1303,7 +1315,7 @@ fn test_compound_assign_through_ptr_deref_on_struct_field() {
             cap: u32,
         }
 
-        fn increment_len(p: heap::*mut Vec) {
+        fn increment_len(p: heap::*Vec) {
             p.*.len += 1;
         }
 
@@ -1330,12 +1342,12 @@ fn test_generic_compound_assign_through_ptr_deref() {
         }
 
         impl<T> Vec<T> {
-            pub fn increment_len(self: heap::*mut Self) {
+            pub fn increment_len(self: heap::*Self) {
                 self.*.len += 1;
             }
         }
 
-        fn call_it(p: heap::*mut Vec<u32>) {
+        fn call_it(p: heap::*Vec<u32>) {
             p.increment_len();
         }
 
@@ -1357,9 +1369,9 @@ fn test_string_literal_dedup_is_per_memory() {
         memory first: Memory where { Size = u32 };
         memory second: Memory where { Size = u32 };
 
-        fn a() -> first::[]u8 { \"hi\" }
-        fn b() -> second::[]u8 { \"hi\" }
-        fn c() -> first::[]u8 { \"hi\" }
+        fn a() -> first::&[u8] { \"hi\" }
+        fn b() -> second::&[u8] { \"hi\" }
+        fn c() -> first::&[u8] { \"hi\" }
 
         export { a, b, c }
     "});
@@ -1459,4 +1471,430 @@ fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
 		switch.1.is_none(),
 		"exhaustive enum match without `_` should lower with no default arm"
 	);
+}
+
+// ── struct operator-trait impls
+// ──────────────────────────────────────────
+
+#[test]
+fn test_struct_operator_overload_lowers_to_call() {
+	// Not `#[inline]`, so `a + b` must lower to a genuine `Call` targeting
+	// the resolved `Vec2::add` — the struct-target counterpart of every
+	// other operator-dispatch test, which only ever exercises primitives.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+
+        export { add_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_operator_overload_inline_method_is_substituted() {
+	// Same as above but `#[inline]`, matching the convention every primitive
+	// impl in `std/main.wx` already uses — the snapshot should show the
+	// struct-field arithmetic substituted directly, no Call node left.
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            #[inline]
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+            a + b
+        }
+
+        export { add_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitand_overload_lowers_to_call() {
+	// Bitwise operators reuse the same dispatch path as arithmetic
+	// (`build_operator_dispatch`) once a struct is involved — same shape
+	// as `test_struct_operator_overload_lowers_to_call`, just for `&`.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+
+        export { and_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitand_overload_inline_method_is_substituted() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            #[inline]
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_flags(a: Flags, b: Flags) -> Flags {
+            a & b
+        }
+
+        export { and_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitnot_overload_lowers_to_call() {
+	// Unary `^x` reuses the same dispatch path as `-x` (`Neg`) once a
+	// struct is involved (`build_unary_operator_dispatch`) — same shape
+	// as the binary struct-overload tests, for the one unary bitwise op.
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+
+        export { not_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_bitnot_overload_inline_method_is_substituted() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitNot for Flags {
+            #[inline]
+            fn bitnot(self: Self) -> Self {
+                Flags::{ bits: ^self.bits }
+            }
+        }
+
+        fn not_flags(a: Flags) -> Flags {
+            ^a
+        }
+
+        export { not_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_generic_bitand_bound_resolves_to_primitive_impl() {
+	// A bare type param bounded by `BitAnd` must dispatch through
+	// `resolve_bounded_operator_method` and monomorphize to `i32`'s own
+	// (intrinsic-backed) impl — the generic-bound counterpart of the struct
+	// tests above, exercising primitives instead.
+	let case = TestCase::new(indoc! {"
+        fn and_it<T: BitAnd>(a: T, b: T) -> T {
+            a & b
+        }
+
+        fn use_and(a: i32, b: i32) -> i32 {
+            and_it(a, b)
+        }
+
+        export { use_and }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
+	// Unary counterpart of `test_generic_bitand_bound_resolves_to_primitive_impl`
+	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
+	// branch, so a bare type param bounded by `BitNot` failed to dispatch
+	// at all. Now it goes through `resolve_bounded_operator_method` and
+	// monomorphizes to `i32`'s own (intrinsic-backed) impl, same as the
+	// binary case.
+	let case = TestCase::new(indoc! {"
+        fn not_it<T: BitNot>(a: T) -> T {
+            ^a
+        }
+
+        fn use_not(a: i32) -> i32 {
+            not_it(a)
+        }
+
+        export { use_not }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_compound_assignment_lowers_to_add_call() {
+	let case = TestCase::new(indoc! {"
+        struct Vec2 { x: i32, y: i32 }
+
+        impl Add for Vec2 {
+            fn add(self: Self, rhs: Self) -> Self {
+                Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+        }
+
+        fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
+            a += b;
+            a
+        }
+
+        export { add_assign_vec2 }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_struct_compound_assignment_lowers_to_bitand_call() {
+	let case = TestCase::new(indoc! {"
+        struct Flags { bits: i32 }
+
+        impl BitAnd for Flags {
+            fn bitand(self: Self, rhs: Self) -> Self {
+                Flags::{ bits: self.bits & rhs.bits }
+            }
+        }
+
+        fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+            a &= b;
+            a
+        }
+
+        export { and_assign_flags }
+    "});
+	insta::assert_yaml_snapshot!(case.mir);
+}
+
+// ── local pattern destructuring ──────────────────────────────────────────
+
+/// Warnings are expected in these tests — a binding introduced only to check
+/// where it reads from is genuinely unused — so only errors matter.
+fn assert_no_errors(case: &TestCase) {
+	let errors: Vec<&str> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| d.severity == Severity::Error)
+		.map(|d| d.message.as_str())
+		.collect();
+	assert!(errors.is_empty(), "unexpected errors: {:#?}", errors);
+}
+
+fn mir_function<'a>(case: &'a TestCase, name: &str) -> &'a Function {
+	case.mir
+		.functions
+		.iter()
+		.find(|f| {
+			let tir_index =
+				usize::from(case.tir.items.expect_function_index(f.id));
+			case.graph
+				.interner
+				.resolve(case.tir.items.functions[tir_index].name.inner)
+				== Some(name)
+		})
+		.unwrap_or_else(|| panic!("`{name}` should be in MIR"))
+}
+
+/// The statement list of `name`'s body block.
+fn function_body_statements<'a>(
+	case: &'a TestCase,
+	name: &str,
+) -> &'a [Expression] {
+	match &mir_function(case, name).block.kind {
+		ExprKind::Block { expressions, .. } => expressions,
+		_ => panic!("a function body is a block"),
+	}
+}
+
+/// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
+fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
+	let ExprKind::LocalSet {
+		local_index, value, ..
+	} = &expr.kind
+	else {
+		panic!("expected a `LocalSet`")
+	};
+	let ExprKind::AggregateGet {
+		scope_index: from_scope,
+		local_index: from_local,
+		value_index,
+	} = &value.kind
+	else {
+		panic!("a destructured binding reads its value with `AggregateGet`")
+	};
+	let _ = local_index;
+	(*from_scope, *from_local, *value_index)
+}
+
+/// The whole point of `DestructureDeclaration`: the initializer runs once,
+/// into one temp, and every binding reads back out of that temp.
+#[test]
+fn test_tuple_destructuring_evaluates_initializer_once() {
+	let case = TestCase::new(indoc! {"
+        fn make() -> (i32, i32) { (1, 2) }
+        fn f() -> i32 {
+            local (a, b) = make();
+            a + b
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// [0] spills `make()` into a temp; [1] and [2] read fields out of it.
+	let ExprKind::LocalSet {
+		scope_index: temp_scope,
+		local_index: temp_local,
+		value,
+	} = &statements[0].kind
+	else {
+		panic!("the initializer is spilled into a local first")
+	};
+	assert_eq!(*temp_scope, 0, "temps live in the function root scope");
+	assert!(
+		matches!(value.kind, ExprKind::Call { .. }),
+		"the spilled value is the call itself, evaluated exactly once"
+	);
+
+	let (a_scope, a_local, _) = destructured_store(&statements[1]);
+	let (b_scope, b_local, _) = destructured_store(&statements[2]);
+	assert_eq!((a_scope, a_local), (0, *temp_local));
+	assert_eq!((b_scope, b_local), (0, *temp_local));
+
+	// And the call appears exactly once in the whole body.
+	let calls = statements
+		.iter()
+		.filter(|e| matches!(&e.kind, ExprKind::LocalSet { value, .. } if matches!(value.kind, ExprKind::Call { .. })))
+		.count();
+	assert_eq!(calls, 1, "`make()` must not be re-evaluated per binding");
+}
+
+/// A scrutinee that is already a local is read in place — no copy.
+#[test]
+fn test_destructuring_a_local_scrutinee_skips_the_spill() {
+	let case = TestCase::new(indoc! {"
+        fn f(pair: (i32, i32)) -> i32 {
+            local (a, b) = pair;
+            a + b
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// `pair` is parameter 0 of scope 0, so both bindings read straight from
+	// it and there is no spilling `LocalSet` ahead of them.
+	let (a_scope, a_local, _) = destructured_store(&statements[0]);
+	let (b_scope, b_local, _) = destructured_store(&statements[1]);
+	assert_eq!((a_scope, a_local), (0, 0));
+	assert_eq!((b_scope, b_local), (0, 0));
+}
+
+/// Tuple elements are alignment-sorted exactly like struct fields, so a
+/// binding has to read the *physical* slot. Reading the declaration index
+/// would hand back the wrong element here.
+#[test]
+fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
+	let case = TestCase::new(indoc! {"
+        fn f(t: (bool, i64, u32)) -> i64 {
+            local (a, b, c) = t;
+            b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+
+	let sig_index = mir_function(&case, "f").signature_index as usize;
+	let param_ty = case.mir.signatures[sig_index].params()[0];
+	let Type::Aggregate { aggregate_index } = param_ty else {
+		panic!("a tuple parameter lowers to an aggregate")
+	};
+	let agg = &case.mir.aggregates[aggregate_index as usize];
+	// Sorted by alignment descending: i64, u32, bool.
+	assert_eq!(&*agg.values, &[Type::I64, Type::U32, Type::Bool]);
+	assert_eq!(&*agg.decl_to_phys, &[2, 0, 1]);
+
+	let statements = function_body_statements(&case, "f");
+	let slots: Vec<u32> = statements[..3]
+		.iter()
+		.map(|e| destructured_store(e).2)
+		.collect();
+	assert_eq!(
+		slots,
+		vec![2, 0, 1],
+		"bindings must read physical slots, not declaration indices"
+	);
+}
+
+#[test]
+fn test_struct_destructuring_reads_declared_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Mixed { a: bool, b: i64 }
+        fn f(m: Mixed) -> i64 {
+            local Mixed::{ a, b } = m;
+            b
+        }
+        export { f }
+    "});
+	assert_no_errors(&case);
+	let statements = function_body_statements(&case, "f");
+	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
+	assert_eq!(destructured_store(&statements[0]).2, 1);
+	assert_eq!(destructured_store(&statements[1]).2, 0);
+}
+
+/// Nested patterns are flattened into projection paths, so an inner binding
+/// hops through an intermediate temp rather than nesting `AggregateGet`s.
+#[test]
+fn test_nested_tuple_destructuring_projects_through_a_temp() {
+	let case = TestCase::new(indoc! {"
+        fn f(t: (i32, (i32, i32))) -> i32 {
+            local (x, (y, z)) = t;
+            x + y + z
+        }
+        export { f }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+	let statements = function_body_statements(&case, "f");
+
+	// `t` is already a local, so nothing spills for `x`. Each deeper binding
+	// spills the intermediate `t.1` just before its own store, giving
+	// [x, spill, y, spill, z].
+	let (x_scope, x_local, _) = destructured_store(&statements[0]);
+	assert_eq!((x_scope, x_local), (0, 0), "`x` reads `t` directly");
+
+	let (_, y_from, _) = destructured_store(&statements[2]);
+	let (_, z_from, _) = destructured_store(&statements[4]);
+	assert_ne!(y_from, 0, "`y` reads the spilled inner tuple, not `t`");
+	assert_ne!(z_from, 0, "`z` reads the spilled inner tuple, not `t`");
 }

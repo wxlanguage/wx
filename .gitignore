@@ -3,3 +3,4 @@ target/
 out/
 node_modules/
 cli/npm/*/bin
+thesis/

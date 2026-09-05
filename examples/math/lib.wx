@@ -1,0 +1,58 @@
+mod k_cosf;
+mod k_sinf;
+mod scalbn;
+mod rem_pio2f;
+mod sinf;
+mod cosf;
+mod k_cos;
+mod k_sin;
+mod rem_pio2;
+mod sin;
+mod cos;
+
+pub use sinf::sinf;
+pub use cosf::cosf;
+pub use sin::sin;
+pub use cos::cos;
+
+trait Float {
+    fn cos(self) -> Self;
+
+    fn sin(self) -> Self;
+
+    const PI: Self;
+
+    const FRAC_PI_2: Self;
+}
+
+impl Float for f32 {
+    fn sin(self) -> Self {
+        sinf(self)
+    }
+
+    fn cos(self) -> Self {
+        cosf(self)
+    }
+
+    /// Archimedes' constant (π)
+    const PI: f32 = 3.14159265358979323846264338327950288;
+
+    /// π/2
+    const FRAC_PI_2: Self = 1.0;
+}
+
+impl Float for f64 {
+    fn sin(self) -> Self {
+        sin(self)
+    }
+
+    fn cos(self) -> Self {
+        cos(self)
+    }
+
+    /// Archimedes' constant (π)
+    const PI: f64 = 3.14159265358979323846264338327950288;
+
+    /// π/2
+    const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
+}

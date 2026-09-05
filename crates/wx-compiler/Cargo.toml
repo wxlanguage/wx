@@ -1,6 +1,6 @@
 [package]
 name = "wx-compiler"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -11,16 +11,28 @@ repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-compiler"
 workspace = true
 
 [lib]
+bench = false
+
+[features]
+bench = []
+
+[[bench]]
+name = "lexer"
+harness = false
+# The bench body calls `ast::bench_lex_to_eof`, which only exists under the
+# `bench` feature. Without this, `--all-targets` builds the target unfeatured
+# and fails on the missing import.
+required-features = ["bench"]
 
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }
 leb128fmt = "0.1.0"
 string-interner = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 indoc = "2"
-serde_json = { workspace = true }
 insta = { version = "1.43", features = ["yaml"] }
 wasmtime = "46.0.1"
 wasmprinter = "0.252.0"

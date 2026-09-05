@@ -85,9 +85,14 @@ impl<'mir> Builder<'mir> {
 		// one slot each.
 		let mut wasm_idx = 0u32;
 		for (i, local) in root_scope.locals[..params_count].iter().enumerate() {
-			data_bindings[i] = StackResult::Value(
-				self.build_param_value(local.ty, &mut wasm_idx),
-			);
+			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
+			// WASM param slot — see the matching case in `build_call`.
+			data_bindings[i] = match local.ty {
+				mir::Type::Unit | mir::Type::Never => StackResult::Unit,
+				ty => StackResult::Value(
+					self.build_param_value(ty, &mut wasm_idx),
+				),
+			};
 		}
 		for (i, local) in root_scope.locals[params_count..].iter().enumerate() {
 			data_bindings[params_count + i] = self.default_value(local.ty);
@@ -128,10 +133,10 @@ impl<'mir> Builder<'mir> {
 	/// (`*wasm_idx` tracks the next free slot across the whole call). A
 	/// scalar parameter is just one `Param` node; an aggregate parameter —
 	/// possibly nested — is passed as a flattened run of scalar WASM params
-	/// (mirroring how `flatten_mir_type`/signature flattening lays out a
-	/// call site's arguments), so this recurses to rebuild the matching
-	/// (possibly nested) `Aggregate` literal from them, in the same
-	/// pre-order `flatten_mir_type` itself would visit.
+	/// (mirroring how `wasm::flatten_type_to_scalars`/signature flattening
+	/// lays out a call site's arguments), so this recurses to rebuild the
+	/// matching (possibly nested) `Aggregate` literal from them, in the same
+	/// pre-order `wasm::flatten_type_to_scalars` itself would visit.
 	fn build_param_value(
 		&mut self,
 		ty: mir::Type,
@@ -297,7 +302,10 @@ impl<'mir> Builder<'mir> {
 			| ExprKind::BitOr { left, right }
 			| ExprKind::BitXor { left, right }
 			| ExprKind::LeftShift { left, right }
-			| ExprKind::RightShift { left, right } => {
+			| ExprKind::RightShift { left, right }
+			| ExprKind::Min { left, right }
+			| ExprKind::Max { left, right }
+			| ExprKind::Copysign { left, right } => {
 				self.build_binary(block_idx, bindings, expr, left, right)
 			}
 
@@ -351,6 +359,24 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(
 					self.node(DataNodeKind::Ceil { operand, ty }),
+				)
+			}
+			ExprKind::Trunc { value } => {
+				let ty = ScalarType::try_from(expr.ty)
+					.expect("Trunc must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Trunc { operand, ty }),
+				)
+			}
+			ExprKind::Nearest { value } => {
+				let ty = ScalarType::try_from(expr.ty)
+					.expect("Nearest must be scalar");
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::Nearest { operand, ty }),
 				)
 			}
 			ExprKind::BitNot { value } => {
@@ -512,6 +538,34 @@ impl<'mir> Builder<'mir> {
 					self.build_expr(block_idx, bindings, value).unwrap_value();
 				StackResult::Value(
 					self.node(DataNodeKind::F32DemoteF64 { operand }),
+				)
+			}
+			ExprKind::I32ReinterpretF32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I32ReinterpretF32 { operand }),
+				)
+			}
+			ExprKind::F32ReinterpretI32 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F32ReinterpretI32 { operand }),
+				)
+			}
+			ExprKind::I64ReinterpretF64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::I64ReinterpretF64 { operand }),
+				)
+			}
+			ExprKind::F64ReinterpretI64 { value } => {
+				let operand =
+					self.build_expr(block_idx, bindings, value).unwrap_value();
+				StackResult::Value(
+					self.node(DataNodeKind::F64ReinterpretI64 { operand }),
 				)
 			}
 
@@ -1606,9 +1660,17 @@ impl<'mir> Builder<'mir> {
 		let callee = self
 			.build_expr(block_idx, bindings, callee_expr)
 			.unwrap_value();
+		// Zero-sized arguments (e.g. a `Memory`-typed handle) carry no
+		// runtime bits and occupy no WASM param slot (see
+		// `wasm::flatten_type_to_scalars`'s `Unit`/`Never` case) — drop them
+		// here to match, rather than materializing a nonexistent `Value`.
 		let args: Box<[_]> = arguments
 			.iter()
-			.map(|a| self.build_expr(block_idx, bindings, a).unwrap_value())
+			.filter_map(|a| match self.build_expr(block_idx, bindings, a) {
+				StackResult::Value(idx) => Some(idx),
+				StackResult::Unit => None,
+				StackResult::Never => panic!("expected Value, got Never"),
+			})
 			.collect();
 
 		let result = match result_ty {
@@ -1643,26 +1705,53 @@ impl<'mir> Builder<'mir> {
 
 	// ── Binding helpers ───────────────────────────────────────────────────────
 
-	/// Extend `parent` bindings with the locals of `scope_index`.
+	/// Extend `parent` bindings with the locals of `scope_index`, seeding
+	/// each with a default value — unless it's already been written, which
+	/// happens when an inlined call's `LocalSet`s bind this scope's locals
+	/// (via their global `flat_index`) *before* the scope's own `Block` node
+	/// is reached (`mir::inlining::inline_call` emits the argument
+	/// `LocalSet`s as siblings preceding the callee's body block, not as
+	/// its first statements). Blindly appending a default in that case
+	/// would push it past the slot the `LocalSet` already populated,
+	/// producing a node nothing ever references.
 	fn extend_bindings(
 		&mut self,
 		parent: &[StackResult],
 		scope_index: mir::ScopeIndex,
 	) -> Vec<StackResult> {
 		let mut child = parent.to_vec();
-		for local in &self.mir_func.scopes[scope_index as usize].locals {
+		for (i, local) in self.mir_func.scopes[scope_index as usize]
+			.locals
+			.iter()
+			.enumerate()
+		{
+			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			if idx < child.len() {
+				continue;
+			}
+			debug_assert_eq!(idx, child.len());
 			child.push(self.default_value(local.ty));
 		}
 		child
 	}
 
-	/// Extend `bindings` in-place with the locals of `scope_index`.
+	/// In-place counterpart of `extend_bindings` — see its doc comment for
+	/// why already-written slots must be skipped rather than defaulted.
 	fn extend_bindings_in_place(
 		&mut self,
 		bindings: &mut Vec<StackResult>,
 		scope_index: mir::ScopeIndex,
 	) {
-		for local in &self.mir_func.scopes[scope_index as usize].locals {
+		for (i, local) in self.mir_func.scopes[scope_index as usize]
+			.locals
+			.iter()
+			.enumerate()
+		{
+			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			if idx < bindings.len() {
+				continue;
+			}
+			debug_assert_eq!(idx, bindings.len());
 			bindings.push(self.default_value(local.ty));
 		}
 	}
@@ -2224,6 +2313,9 @@ impl<'mir> Builder<'mir> {
 			E::LeftShift { .. } => N::Shl { left, right, ty },
 			E::RightShift { .. } if unsigned => N::ShrU { left, right, ty },
 			E::RightShift { .. } => N::ShrS { left, right, ty },
+			E::Min { .. } => N::Min { left, right, ty },
+			E::Max { .. } => N::Max { left, right, ty },
+			E::Copysign { .. } => N::Copysign { left, right, ty },
 			_ => unreachable!("build_binary called on a non-binary ExprKind"),
 		};
 		StackResult::Value(self.node(kind))

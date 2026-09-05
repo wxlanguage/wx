@@ -1,0 +1,72 @@
+// scalbn(x, n) = x * 2^n, exact and rounding-independent when it doesn't overflow/underflow.
+// scalbn(±0, n) = ±0, scalbn(x, 0) = x, scalbn(±∞, n) = ±∞. (C99/N3220 §7.12.6.13.)
+//
+// Ported from rust-lang/libm's generic `scalbn.rs`, specialized to `f32`/`f64` (no `Float`
+// trait to be generic over here) and dropping its `f16`-only dynamic-prescale branch — not
+// needed since wx has no `f16`/`f128`.
+//
+// `2^n` itself isn't always representable even when the final result is (e.g. `x = 2^Emin`,
+// `n` just out of `2^Emax`'s range), so the scale is applied in up to 3 multiplications:
+// two fixed prescales by the type's max/min representable power of two, then a final scale
+// built from whatever's left of `n`. The two prescale constants are literals, not
+// `from_bits` calls like the original — wx doesn't constant-fold `from_bits`, so a literal
+// avoids paying a runtime instruction for an always-the-same value.
+
+pub fn scalbnf(x: f32, n: i32) -> f32 {
+    local mut x: f32 = x;
+    local mut n: i32 = n;
+
+    if n > 127 {
+        // 2^Emax (0x1p127)
+        x = x * 1.7014118346046923e38;
+        n = n - 127;
+        if n > 127 {
+            x = x * 1.7014118346046923e38;
+            n = n - 127;
+            if n > 127 { n = 127 };
+        }
+    } else {
+        if n < -126 {
+            // 2^Emin * 2^sig_total_bits (0x1p-126 * 0x1p24) — the largest prescale that
+            // still can't push `x` subnormal, avoiding double rounding.
+            x = x * 1.1754943508222875e-38 * 16777216.0;
+            n = n + 126 - 24;
+            if n < -126 {
+                x = x * 1.1754943508222875e-38 * 16777216.0;
+                n = n + 126 - 24;
+                if n < -126 { n = -126 };
+            }
+        }
+    }
+
+    x * f32::from_bits(((127 + n) as u32) << 23)
+}
+
+pub fn scalbn(x: f64, n: i32) -> f64 {
+    local mut x: f64 = x;
+    local mut n: i32 = n;
+
+    if n > 1023 {
+        // 2^Emax (0x1p1023)
+        x = x * 8.98846567431158e307;
+        n = n - 1023;
+        if n > 1023 {
+            x = x * 8.98846567431158e307;
+            n = n - 1023;
+            if n > 1023 { n = 1023 };
+        }
+    } else {
+        if n < -1022 {
+            // 2^Emin * 2^sig_total_bits (0x1p-1022 * 0x1p53)
+            x = x * 2.2250738585072014e-308 * 9007199254740992.0;
+            n = n + 1022 - 53;
+            if n < -1022 {
+                x = x * 2.2250738585072014e-308 * 9007199254740992.0;
+                n = n + 1022 - 53;
+                if n < -1022 { n = -1022 };
+            }
+        }
+    }
+
+    x * f64::from_bits(i64_extend_i32(1023 + n) as u64 << 52)
+}

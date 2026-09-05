@@ -1,6 +1,6 @@
 {
 	"name": "@wx-lang/cli-darwin-arm64",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Native wx CLI binary for macOS (arm64)",
 	"repository": {
 		"type": "git",

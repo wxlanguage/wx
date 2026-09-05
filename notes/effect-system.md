@@ -30,74 +30,129 @@ perform**. There is exactly one concept — the *effect set* — and everything
 else is a point on its lattice:
 
 | Written      | Meaning              | Lattice position        |
-|--------------|----------------------|-------------------------|
-| `!()`        | empty set — **pure** | bottom                  |
-| `!(trap)`    | the set `{trap}`     | an atom                 |
-| `!(read, trap)` | `{read, trap}`    | a union                 |
-| `!*`         | all effects          | top                     |
-| *(absent)*   | top — identical to `!*` (§4)         | top                     |
+|--------------|-----------------------|--------------------------|
+| `does()`         | empty set — **pure** | bottom                   |
+| `does(trap)`     | the set `{trap}`      | an atom                  |
+| `does(read, trap)` | `{read, trap}`      | a union                  |
+| `does(*)`        | all effects           | top                      |
+| *(absent)*   | top — identical to `does(*)` (§4)     | top                      |
 
 Ordering is subset. `A ⊆ B` means a function with effect set `A` may be used
-wherever `B` is permitted — so a pure function (`!()`) is usable anywhere, and
-nothing is usable where `!()` is required unless it is itself pure. This
+wherever `B` is permitted — so a pure function (`does()`) is usable anywhere, and
+nothing is usable where `does()` is required unless it is itself pure. This
 subtyping is the soundness backbone: it lets the optimizer key off the declared
 bound.
 
-**Top is open-world.** `!*` means *every* effect that could ever exist —
+**Top is open-world.** `does(*)` means *every* effect that could ever exist —
 including host imports and markers not yet declared — never "the union of effects
-known so far." So `X ⊆ !*` is unconditionally true for any `X`, and the checker
-never expands `!*` into members. (If `!*` meant "all currently-known effects,"
-adding a host import later would silently break every `!*` written before it.)
+known so far." So `X ⊆ does(*)` is unconditionally true for any `X`, and the
+checker never expands `does(*)` into members. (If `does(*)` meant "all
+currently-known effects," adding a host import later would silently break every
+`does(*)` written before it.)
 
 "pure" is not a separate keyword or concept. **Pure is just the empty set.**
 Top is just the full set. A single root effect is just an atom. This is why
 there is no `strict` keyword and no separate effect declarations — see §5.
 
+> **Considered for the empty spelling, and dropped:** a dedicated `pure`
+> keyword, or `does(_)`, instead of bare `does()` — the worry being that an
+> accidentally-emptied list (deleting entries during a refactor) silently
+> reads as "pure" instead of a mistake. `does(_)` specifically collides with
+> two meanings `_` already has elsewhere: the type-inference placeholder
+> (irrelevant here — effects are never inferred), and the deliberately-
+> existential memory wildcard `read<_>`/`write<_>` (§6, §8) — the same token
+> would mean "wildcard" in one bracket and "explicitly empty" in another. A
+> `pure` keyword avoids that collision but reopens the minimalism commitment
+> just above. Not worth it: for a *bodied* function this risk is
+> self-correcting — an accidentally over-narrowed `does()` fails loudly the
+> moment the body still calls something effectful, since the bound is
+> checked, not trusted. It's only silent for *bodyless leaves*, where the
+> annotation is ground truth (§4) — and that's the same small, stdlib-internal,
+> deliberately-authored surface the "forgetting to annotate" risk already
+> lives on. One review/testing discipline covers both; it doesn't need its
+> own syntax.
+
 ---
 
 ## 3. Syntax
 
-The effect set is part of the *arrow type*, so it sits after the return type as
-a trailing `!(...)` clause:
+The effect clause sits between the parameter list and the return type — it
+describes what happens *while the function runs*, not a property of its
+output, so it belongs next to the signature's other execution-time qualifiers
+rather than glued onto the return type:
 
 ```wx
-fn add(a: i32, b: i32) -> i32 !()            // pure
-fn log(msg: str) !(io)                        // may perform io
-fn frobnicate() -> T !(io, alloc)             // may perform io and/or alloc
-fn whatever()                                 // no annotation — impure (top)
+fn add(a: i32, b: i32) does() -> i32             // pure
+fn log(msg: str) does(io)                         // may perform io
+fn frobnicate() does(io, alloc) -> T              // may perform io and/or alloc
+fn whatever()                                     // no annotation — impure (top)
 ```
 
 This maps 1:1 onto the permission model the feature grew out of:
 
 ```
-allow(*)        ==  (absent)  or  !*
-allow(x, y, z)  ==  !(x, y, z)
-allow()         ==  !()
+allow(*)        ==  (absent)  or  does(*)
+allow(x, y, z)  ==  does(x, y, z)
+allow()         ==  does()
 ```
 
 The clause has exactly **two shapes** — there is no middle ground:
 
 ```
-effect-clause  :=  "!*"             // top — all effects
-                |  "!(" set ")"     // an explicit set: !() pure, !(a, b, …) bounded
+effect-clause  :=  "does(*)"          // top — all effects
+                |  "does(" set ")"    // an explicit set: does() pure, does(a, b, …) bounded
 ```
 
-`*` is a *distinct form*, never a list member — `!(io, *)` is ungrammatical, so
-"these effects plus everything" (a meaningless state) cannot even be written. A
-single-effect set still takes parens (`!(io)`, not `!io`): mandatory parens keep
-one uniform "the parens hold the set" reading, and make growing a set a pure
-insertion (`!(io)` → `!(io, trap)`) rather than a reshaping.
+`*` is a *distinct form*, never a list member — `does(io, *)` is ungrammatical, so
+"these effects plus everything" (a meaningless state) cannot even be written.
 
-**Formatting.** One space before the clause (`-> i32 !(read)`, and `) !(read)`
-when there is no return type). The sigil binds tight to its delimiter (`!(`,
-`!*` — never `! (`), which is also what keeps it unambiguous with `!` as logical
-negation. Inside the parens, format as an ordinary comma-list (`!(a, b)`).
+**Formatting.** One space before `does` (`) does(read)`, `(a: i32) does()`), no
+space between `does` and its opening paren (`does(`, never `does (`) — `does`
+is a keyword, not an operator, so the parens read as an ordinary clause-header
+argument list, and a space before them would suggest `does` is a value being
+applied to something rather than the start of a clause. Inside the parens,
+format as an ordinary comma-list (`does(a, b)`).
 
-> The `strict fn` spelling from early exploration is dropped: `strict` collides
-> with strict-vs-lazy evaluation, and a leading keyword doesn't scale to the
-> bounded case (`effect(io, alloc) fn` puts a growing list in front of the
-> name). Trailing `!(...)` keeps the effect where it belongs type-theoretically
-> and handles all three tiers with one mechanism.
+> **Rejected alternatives, and why.** Three other spellings were considered
+> and dropped before settling here:
+> - **Trailing after the return type** (`-> i32 !(read)`, a bang sigil).
+>   Mirrors Koka's `A -> e B`, where the effect genuinely is part of the arrow
+>   type — a real, principled tradition, not a bad idea on its face. Dropped
+>   anyway because it frames the effect as a property of *what the function
+>   returns*, when it's actually a property of *what runs while producing
+>   that return* — closer in spirit to Java's `throws` or C++'s `noexcept`,
+>   both of which sit next to the parameter list, independent of the return
+>   type. It was also position-inconsistent in practice: a function with no
+>   written return type had the clause sitting right after the params anyway
+>   (`fn log(msg: str) !(io)`, no arrow at all), so "trailing after the
+>   return type" was never even uniformly true — only "trailing after
+>   whatever the signature happened to end with."
+> - **Bare `<...>`, no keyword, params-adjacent** (`fn div(a: i32, b:
+>   i32)<trap> -> i32`). Terser, but collides with the angle brackets already
+>   used for generic parameters a few tokens to the left —
+>   `read<Mem: Memory>()<read<Mem>>` stacks two unrelated `<...>` groups back
+>   to back with nothing textually announcing the second one is a different
+>   construct. A reader has to disambiguate two different grammars by
+>   position alone.
+> - **`does <...>` — angle brackets with the keyword** (closer to Verse's
+>   actual spelling, `<transacts>`). Keeps the keyword's legibility but keeps
+>   the bracket-collision problem from the bare version — `does <read<Mem>>`
+>   still stacks three `<...>`-shaped things into one signature. Parens don't
+>   collide with anything else in the grammar, so once a keyword is already
+>   doing the disambiguating work, parens are strictly the better delimiter.
+> - The `strict fn` spelling from even earlier exploration is dropped too:
+>   `strict` collides with strict-vs-lazy evaluation, and a leading keyword
+>   doesn't scale to the bounded case (`effect(io, alloc) fn` puts a growing
+>   list in front of the name).
+>
+> `does(...)` won on legibility: a keyword gives the eye a word-shaped anchor
+> instead of a raw punctuation cluster, empty `does()` reads unambiguously as
+> "deliberately nothing" the way bare `<>` right after a closing paren does
+> not, and parens don't compete with the angle brackets generics already own.
+> The extra characters land almost entirely on stdlib leaf declarations and
+> deliberate purity claims — ordinary application code rarely writes an
+> effect clause at all, since unannotated is top by default (§4) — so the
+> verbosity is concentrated exactly where explicitness earns its keep.
 
 ---
 
@@ -107,16 +162,16 @@ A function's annotation means one of two things, decided only by whether it has 
 body:
 
 ```
-no annotation         ⇒  top (!*)        — uniform: say nothing ⇒ assume anything
+no annotation         ⇒  top (does(*))   — uniform: say nothing ⇒ assume anything
 annotated, bodied     ⇒  checked bound    — callees' declared ⊆ declared (one hop)
 annotated, bodyless   ⇒  declared bound   — ground truth; effects originate here
 ```
 
-There is **one default, and it is top.** Omitting the clause always means `!*` —
-for a stdlib intrinsic, a host import, or an ordinary body alike. "I haven't said
-what this does" resolves to "assume it may do anything," everywhere. There is no
-special leaf default to remember; leaf vs bodied only decides whether an
-annotation, once written, is *checked* or *declared*.
+There is **one default, and it is top.** Omitting the clause always means
+`does(*)` — for a stdlib intrinsic, a host import, or an ordinary body alike.
+"I haven't said what this does" resolves to "assume it may do anything,"
+everywhere. There is no special leaf default to remember; leaf vs bodied only
+decides whether an annotation, once written, is *checked* or *declared*.
 
 ### Bodied: the annotation is *checked*
 
@@ -125,14 +180,14 @@ effect sets must be `⊆` its own declared set. One hop: it reads callees'
 signatures, never their bodies.
 
 ```wx
-fn clear(p: heap::*mut i32) !(write<heap>, trap) {
-    store_i32(p, 0)          // store_i32 declares !(write<heap>, trap) ⊆ same ✓
+fn clear(p: heap::*mut i32) does(write<heap>, trap) {
+    store_i32(p, 0)          // store_i32 declares does(write<heap>, trap) ⊆ same ✓
 }
 
 fn helper() { /* ... */ }    // no annotation ⇒ top
 
-fn caller() !() {
-    helper()                 // ERROR: helper is top, !() forbids all effects
+fn caller() does() {
+    helper()                 // ERROR: helper is top, does() forbids all effects
 }
 ```
 
@@ -155,16 +210,16 @@ A bodyless annotation does one of two things:
 *itself* is a new primitive effect; the atom *is* the function identity.
 
 ```wx
-fn trap() -> never !(trap);            // trap is a fresh atom — the effect IS this function
-fn read<Mem: Memory>() !(read<Mem>);   // read<Mem> is a fresh atom, parameterized by Mem
+fn trap() does(trap) -> never;            // trap is a fresh atom — the effect IS this function
+fn read<Mem: Memory>() does(read<Mem>);   // read<Mem> is a fresh atom, parameterized by Mem
 ```
 
 **Reuse existing effects — name others.** A bodyless function whose annotation
 names *other* effects produces exactly those, and mints no identity of its own.
 
 ```wx
-fn store_i32<Mem: Memory>(p: Mem::*mut i32, v: i32) !(write<Mem>, trap);  // exactly {write<Mem>, trap}
-fn div_s(a: i32, b: i32) -> i32 !(trap);                                 // exactly {trap}
+fn store_i32<Mem: Memory>(p: Mem::*mut i32, v: i32) does(write<Mem>, trap);  // exactly {write<Mem>, trap}
+fn div_s(a: i32, b: i32) does(trap) -> i32;                                 // exactly {trap}
 ```
 
 `store_i32` is `{write<Mem>, trap}`, **not** `{write<Mem>, trap, store_i32}` —
@@ -175,13 +230,13 @@ rather than carrying a useless identity atom no caller would name.
 
 ### Why this stays non-circular
 
-`trap`'s annotation `!(trap)` names `trap` — that looks circular, but isn't,
+`trap`'s annotation `does(trap)` names `trap` — that looks circular, but isn't,
 because of the resolution rule for effect terms:
 
 > **A bodyless function named in an effect term denotes *itself, as an atom*. A
 > bodied function named in an effect term denotes its *declared bound*.**
 
-So resolving `!(trap)` is one step: `trap` is bodyless → the atom `trap`, done.
+So resolving `does(trap)` is one step: `trap` is bodyless → the atom `trap`, done.
 You never expand a leaf's annotation to re-derive the leaf; the self-reference is
 reflexive by construction, not a recurrence. This is the one line to state
 explicitly in the spec — without it, someone later makes leaf-resolution expand
@@ -193,24 +248,35 @@ descent.)
 
 Because bare now means top *even for leaves*, forgetting to annotate a new
 intrinsic yields top, not a tight guess — and top propagates. But it fails
-**loud**: any `!()` function reaching the un-annotated leaf gets a compile error
-(top ⊄ `{}`), so the mistake surfaces at the first purity boundary rather than
-miscompiling. And leaves are few, stdlib-internal, and authored deliberately, so
-the risk is concentrated and testable. In exchange the model has **one** default
-instead of three, and the conservative direction (unknown ⇒ top) is the safe one
-for everything uncharacterized — including foreign host imports, where "assume
-anything" is exactly right.
+**loud**: any `does()` function reaching the un-annotated leaf gets a compile
+error (top ⊄ `{}`), so the mistake surfaces at the first purity boundary rather
+than miscompiling. And leaves are few, stdlib-internal, and authored
+deliberately, so the risk is concentrated and testable. In exchange the model
+has **one** default instead of three, and the conservative direction (unknown ⇒
+top) is the safe one for everything uncharacterized — including foreign host
+imports, where "assume anything" is exactly right.
+
+A different, one-directional risk sits at the same leaves: accidentally
+*narrowing* a declared bound (e.g. deleting an entry down to `does()`) is not
+self-correcting the way forgetting-to-annotate is. A bodyless annotation is
+ground truth, not checked against a body, so an over-tight leaf annotation
+fails **silently** rather than loudly — nothing catches "this should have been
+`does(trap)` but got emptied" until something downstream relies on the missing
+effect being tracked. It's the same concentrated, testable surface as above
+though (see §2's note on why this doesn't get its own syntax): leaves are few
+and stdlib-internal, so this is a review/testing discipline problem, not a gap
+that needs a new spelling.
 
 ---
 
 ## 5. No separate effect items — effects are just functions
 
 There is no dedicated `effect` declaration. An effect is just a **bodyless
-function that self-annotates** (`fn trap() -> never !(trap)`), which mints a fresh
-atom whose identity *is* that function (§4). This keeps the "every effect is a
-function" invariant with zero new syntax.
+function that self-annotates** (`fn trap() does(trap) -> never`), which mints a
+fresh atom whose identity *is* that function (§4). This keeps the "every effect
+is a function" invariant with zero new syntax.
 
-An **effect term** inside `!(...)` may be:
+An **effect term** inside `does(...)` may be:
 
 - a **root name** — a bodyless function, resolves to `{itself}` (`trap`, `fd_write`);
 - a **function path** — resolves to that function's *declared* bound (one hop);
@@ -218,15 +284,15 @@ An **effect term** inside `!(...)` may be:
 - an **alias** — a library-defined name bundling a set (e.g. `io`).
 
 Functions and traits **never introduce new atoms** — they only bundle existing
-ones. This is what keeps the vocabulary from sprawling: writing `!(g)` doesn't
-invent an effect, it points at the effects `g` already declares.
+ones. This is what keeps the vocabulary from sprawling: writing `does(g)`
+doesn't invent an effect, it points at the effects `g` already declares.
 
 > **Function-refs inherit the *declared* bound, never the inferred one.**
-> `!(g)` reads `g`'s signature and stops. If it followed `g`'s body, your
+> `does(g)` reads `g`'s signature and stops. If it followed `g`'s body, your
 > contract would silently widen whenever someone edited `g` — an abstraction
 > leak. So a function may appear in an allow-list only if it has an explicit
-> annotation. Prefer named effects (`!(io, write)`, self-documenting) over
-> function-refs (`!(read_file)`, opaque) for common cases.
+> annotation. Prefer named effects (`does(io, write)`, self-documenting) over
+> function-refs (`does(read_file)`, opaque) for common cases.
 
 ### Two layers
 
@@ -238,14 +304,14 @@ independent axes:
   concrete stores/fills/copies). `store_i32` lowers to its store instruction.
   `trap` lowers to `unreachable`.
 - **Effect origin** — where the effect comes from. `trap`/`read`/`write`/`grow`
-  are *their own* effect (bodyless, **self-annotated** — `fn trap() -> never
-  !(trap)`). `store_i32` *reuses* others (bodyless, annotated with
-  `!(write<Mem>, trap)`).
+  are *their own* effect (bodyless, **self-annotated** — `fn trap() does(trap)
+  -> never`). `store_i32` *reuses* others (bodyless, annotated with
+  `does(write<Mem>, trap)`).
 
 Two useful roles fall out of this:
 
 - **Marker functions** — effect *identities*: bodyless, lower to nothing, are
-  their own effect. Their job is to be *named* in `!(...)`. `read`, `write`,
+  their own effect. Their job is to be *named* in `does(...)`. `read`, `write`,
   `grow`.
 - **Operational intrinsics** — bodyless functions that lower to a real
   instruction and *declare* a set of markers. `load_i32`, `store_i32`,
@@ -257,17 +323,17 @@ there is a distinguished 1:1 "trap now" instruction for the effect to attach to,
 whereas `write` has no operational home and stays identity-only.
 
 ```wx
-fn trap() -> never !(trap);                            // identity + lowers to `unreachable`
-fn read<Mem: Memory>() !(read<Mem>);                   // identity only, self-annotated
-fn write<Mem: Memory>() !(write<Mem>);                 // identity only, self-annotated
+fn trap() does(trap) -> never;                             // identity + lowers to `unreachable`
+fn read<Mem: Memory>() does(read<Mem>);                    // identity only, self-annotated
+fn write<Mem: Memory>() does(write<Mem>);                  // identity only, self-annotated
 
-fn store_i32<Mem: Memory>(ptr: Mem::*mut i32, v: i32) !(write<Mem>, trap);  // operational
+fn store_i32<Mem: Memory>(ptr: Mem::*mut i32, v: i32) does(write<Mem>, trap);  // operational
 ```
 
 These self-annotations are **load-bearing**, not decoration: a *bare* marker
 would be top (§4), so calling it — or naming it — would widen the caller to top
 instead of contributing a precise atom. Self-annotating pins each marker to
-exactly its own effect, which is what makes both the named-in-`!(...)` use and
+exactly its own effect, which is what makes both the named-in-`does(...)` use and
 the called-as-a-fence use (below) resolve to a single clean atom.
 
 ### Markers are callable — they are typed fences
@@ -278,9 +344,9 @@ event**: it emits no code but contributes its effect to the enclosing function's
 inferred set, exactly as reaching a real store would. (`trap : () -> never` is
 the exception — calling it genuinely diverges, since it lowers to `unreachable`,
 and the compiler treats everything after the call as dead.) Soundness is
-unaffected: call `write()` inside a `!()` function and the `⊆` check fails with
-an ordinary error, because the checker doesn't distinguish an effect that came
-from a marker call from one that came from an instruction.
+unaffected: call `write()` inside a `does()` function and the `⊆` check fails
+with an ordinary error, because the checker doesn't distinguish an effect that
+came from a marker call from one that came from an instruction.
 
 The direction matters: **calling a marker only ever *widens* the effect set — it
 makes the optimizer more conservative, never more aggressive.** You cannot call a
@@ -312,8 +378,8 @@ trait mixes pure and effectful methods" question — there is no conflict.
 
 ```wx
 trait Container {
-    fn len(&self) -> i32 !()              // pure
-    fn push(&mut self, x: T) !(write)     // may write
+    fn len(&self) does() -> i32              // pure
+    fn push(&mut self, x: T) does(write)     // may write
 }
 ```
 
@@ -332,19 +398,20 @@ tops (i.e. top). You get precision out only where you put precision in — the s
 
 ```wx
 trait Io {
-    fn fd_write(fd: i32, ptr: heap::*u8, len: i32) -> i32 !(fd_write);
-    fn fd_read(fd: i32, ptr: heap::*mut u8, len: i32) -> i32 !(fd_read);
+    fn fd_write(fd: i32, ptr: heap::*u8, len: i32) does(fd_write) -> i32;
+    fn fd_read(fd: i32, ptr: heap::*mut u8, len: i32) does(fd_read) -> i32;
 }
 ```
 
-Now `!(Io)` = `{fd_write, fd_read}` — a real bundle — and every `impl` is checked
-`⊆` its method's bound, so an impl can't secretly exceed it. **The trait is your
-grouping mechanism; you need no separate effect-grouping primitive.** (Where do
-`fd_write`/`fd_read` the effects come from? The host imports the impl actually
-calls — the method bound is a *contract* that the impl's real import stays within
-it.) This is why `io` is just a trait — or a plain `alias io = !(fd_write,
-fd_read, …)` if your host boundary is free functions rather than methods. Either
-reuses an existing language feature; neither is effect-system-specific.
+Now `does(Io)` = `{fd_write, fd_read}` — a real bundle — and every `impl` is
+checked `⊆` its method's bound, so an impl can't secretly exceed it. **The
+trait is your grouping mechanism; you need no separate effect-grouping
+primitive.** (Where do `fd_write`/`fd_read` the effects come from? The host
+imports the impl actually calls — the method bound is a *contract* that the
+impl's real import stays within it.) This is why `io` is just a trait — or a
+plain `alias io = does(fd_write, fd_read, …)` if your host boundary is free
+functions rather than methods. Either reuses an existing language feature;
+neither is effect-system-specific.
 
 ### Import modules group effects too
 
@@ -355,27 +422,27 @@ just an import block instead of a trait.
 
 ```wx
 import "console" as console {
-    fn log(message: heap::&[u8]) !(read<heap>, log);
+    fn log(message: heap::&[u8]) does(read<heap>, log);
 }
 
-fn print(message: heap::&[u8]) !(console) {   // !(console) = {read<heap>, log}
+fn print(message: heap::&[u8]) does(console) {   // does(console) = {read<heap>, log}
     console::log(message);
 }
 ```
 
-The grouping is **transparent**: `!(console)` expands to `{read<heap>, log}`, and
-those atoms flow onward — a caller of `print` sees `read<heap>` and `log`, not an
-opaque `console`. (This is the join reading, not a capability. `console` is
-shorthand for its effects, not an opaque grant that hides them; keeping it
-transparent means `⊆` needs no special module rules — it decomposes to atoms like
-everything else.)
+The grouping is **transparent**: `does(console)` expands to `{read<heap>,
+log}`, and those atoms flow onward — a caller of `print` sees `read<heap>` and
+`log`, not an opaque `console`. (This is the join reading, not a capability.
+`console` is shorthand for its effects, not an opaque grant that hides them;
+keeping it transparent means `⊆` needs no special module rules — it decomposes
+to atoms like everything else.)
 
-Same trade-off as any group: `!(console)` is a bound over the **whole
+Same trade-off as any group: `does(console)` is a bound over the **whole
 interface**, so adding an effectful import to `console` later silently widens
-every `!(console)` annotation. When you want the contract pinned to what you
-actually call, drop to the member projection `!(console::log)`, or name the atoms
-directly (`!(read<heap>, log)`). Reach for `!(console)` when you genuinely mean
-"as effectful as the whole console surface."
+every `does(console)` annotation. When you want the contract pinned to what you
+actually call, drop to the member projection `does(console::log)`, or name the
+atoms directly (`does(read<heap>, log)`). Reach for `does(console)` when you
+genuinely mean "as effectful as the whole console surface."
 
 ### A trait in an effect term = its method bounds, with `Self` supplied
 
@@ -384,11 +451,11 @@ those bounds may mention `Self`, so the term needs a `Self` to project against �
 two cases:
 
 - **Self-independent bounds** (like `Io` — no `Self::` in any method effect): the
-  projection is already ground, so **bare `!(Io)` works anywhere**, whoever `Self`
-  is. The plain grouping case.
+  projection is already ground, so **bare `does(Io)` works anywhere**, whoever
+  `Self` is. The plain grouping case.
 - **Self-dependent bounds** (like `Deref`, effect `read<Self::Mem>`): bare
-  `!(Deref)` has a *free* `Self` and is **ill-formed alone** — the same error as a
-  bare `Self::Target` out of scope. You must supply `Self`.
+  `does(Deref)` has a *free* `Self` and is **ill-formed alone** — the same error
+  as a bare `Self::Target` out of scope. You must supply `Self`.
 
 ### Associated-type effects are substitution, not effect-variable polymorphism
 
@@ -398,7 +465,7 @@ A trait with an associated memory carries it into the effect:
 trait Deref {
     type Mem: Memory;
     type Target;
-    fn deref(&self) -> &Self::Target !(read<Self::Mem>);
+    fn deref(&self) does(read<Self::Mem>) -> &Self::Target;
 }
 ```
 
@@ -406,7 +473,7 @@ trait Deref {
 already mentions, so it needs no new machinery: once `Self` is bound, `Self::Mem`
 substitutes in lockstep with every other associated-type projection in the
 signature. This is **type-argument substitution — the cheap kind** — *not* the
-effect-variable polymorphism of `!E` callbacks (§11), where the effect
+effect-variable polymorphism of `does E` callbacks (§11), where the effect
 *constructor* is unknown. Here the constructor is fixed (`read`); only its
 argument varies.
 
@@ -420,33 +487,33 @@ Where `Self` comes from, and the spellings:
 ```wx
 // enclosing trait Self — bare form works, Self is in scope
 trait Smart: Deref {
-    fn peek(&self) !(Deref);        // = !(Self: Deref) = read<Self::Mem>
+    fn peek(&self) does(Deref);        // = does(Self: Deref) = read<Self::Mem>
 }
 
 // a generic param bound by the trait
-fn first<T: Deref>(x: T) -> &T::Target !(T: Deref) { x.deref() }   // = read<T::Mem>
-fn first<T: Deref>(x: T) -> &T::Target !(Deref)    { x.deref() }   // sugar: unique Self inferred
-fn cnt<T: Deref>(x: T) !(T)                                         // terse: join over ALL of T's bounds
+fn first<T: Deref>(x: T) does(T: Deref) -> &T::Target { x.deref() }   // = read<T::Mem>
+fn first<T: Deref>(x: T) does(Deref) -> &T::Target    { x.deref() }   // sugar: unique Self inferred
+fn cnt<T: Deref>(x: T) does(T)                                         // terse: join over ALL of T's bounds
 
 // concrete type — Self bound, effect ground
-fn conc(p: FilePtr) !(<FilePtr as Deref>) { … }   // = read<FilePtr::Mem>
+fn conc(p: FilePtr) does(<FilePtr as Deref>) { … }   // = read<FilePtr::Mem>
 
 // single method — tighter than the whole trait
-fn only<T: Deref>(x: T) !(T::deref)               // just deref's bound
+fn only<T: Deref>(x: T) does(T::deref)               // just deref's bound
 ```
 
-- `!(T: Deref)` / `!(<T as Deref>)` — the `Deref` facet of `T`, explicit.
-- `!(Deref)` — sugar, valid only when exactly one `Self` is in scope (enclosing
-  trait, or a single generic param bound by `Deref`); ambiguous or absent ⇒
-  error, name it.
-- `!(T)` — the join over *all* of `T`'s trait bounds ("as effectful as `T`
-  permits"); the terse common case, with `!(T: Deref)` as the narrowing.
-- `!(T::deref)` — one method's bound, tighter than the whole trait.
+- `does(T: Deref)` / `does(<T as Deref>)` — the `Deref` facet of `T`, explicit.
+- `does(Deref)` — sugar, valid only when exactly one `Self` is in scope
+  (enclosing trait, or a single generic param bound by `Deref`); ambiguous or
+  absent ⇒ error, name it.
+- `does(T)` — the join over *all* of `T`'s trait bounds ("as effectful as `T`
+  permits"); the terse common case, with `does(T: Deref)` as the narrowing.
+- `does(T::deref)` — one method's bound, tighter than the whole trait.
 
 ### Checking generic bodies
 
 Checking `first`: the body's `x.deref()` has effect `read<T::Mem>`, and the
-declared bound `!(T: Deref)` *is* `read<T::Mem>`. The check
+declared bound `does(T: Deref)` *is* `read<T::Mem>`. The check
 `read<T::Mem> ⊆ read<T::Mem>` holds **syntactically**, without knowing what
 `T::Mem` concretely is — the payoff of writing body and bound against the same
 projection. The rule the checker needs is one line: **compare effect terms up to
@@ -456,25 +523,25 @@ the type-equality you already use for associated types.** `read<A> ⊆ read<B>` 
 
 ### The grouping trade-off, and the existential trap
 
-`!(T: Deref)` grabs *all* of `Deref`'s methods' effects even if you only call
+`does(T: Deref)` grabs *all* of `Deref`'s methods' effects even if you only call
 `deref` — the price of grouping over enumeration (sound, conservative). Drop to
-`!(T::deref)` when you want it tight.
+`does(T::deref)` when you want it tight.
 
-Do **not** give bare `!(Deref)` a silent existential meaning ("`read<M>` for some
-unknown `M`", i.e. `read<_>`). `read<_>` can't be reordered against *any*
+Do **not** give bare `does(Deref)` a silent existential meaning ("`read<M>` for
+some unknown `M`", i.e. `read<_>`). `read<_>` can't be reordered against *any*
 memory's writes, collapsing per-memory precision. It's occasionally what you
 want, but it must be **spelled explicitly** (`read<_>`), never the accidental
 meaning of an unbound trait name. Make the unbound case an *error* pointing at
-either `!(T: Deref)` (bound) or `read<_>` (deliberately existential), so the two
+either `does(T: Deref)` (bound) or `read<_>` (deliberately existential), so the two
 intents never conflate.
 
 > **Operator traits are load-bearing.** `a + b` → `Add::add`, `arr[i]` →
 > `Index::index`, `*p` → `Deref::deref`, `*p = x` → `DerefMut::deref_mut`. If
 > these aren't annotated in the stdlib, *no function containing arithmetic or
 > indexing can ever be pure*, and the feature dies at desugaring. The stdlib's
-> core traits must be meticulous: arithmetic `!()` (or `!(trap)` for
-> overflow-trapping variants), `Index` `!(read<Self::Mem>, trap)`,
-> `DerefMut` `!(write<Self::Mem>)`. User code needs no annotations unless it
+> core traits must be meticulous: arithmetic `does()` (or `does(trap)` for
+> overflow-trapping variants), `Index` `does(read<Self::Mem>, trap)`,
+> `DerefMut` `does(write<Self::Mem>)`. User code needs no annotations unless it
 > wants the guarantee to propagate.
 
 ---
@@ -483,8 +550,8 @@ intents never conflate.
 
 The primitive effects (roots) mirror the effectful subset of wasm instructions.
 Pure instructions (`add`, `mul`, shifts, comparisons, `wrap`, sign-extends,
-`_sat` conversions) are `!()` and inline to instructions; only the effectful
-ones are roots.
+`_sat` conversions) are `does()` and inline to instructions; only the
+effectful ones are roots.
 
 Marker names are **semantic** (`read`/`write`), not instruction names
 (`load`/`store`) — consistent with `trap`/`host`, honest about the many-to-one
@@ -502,9 +569,9 @@ optimizer's own `readnone`/`readonly`/`readwrite` vocabulary.
 
 ### Trap facts (settled)
 
-- **`memory.size` cannot trap** — no operands, always succeeds ⇒ `!(read)`.
+- **`memory.size` cannot trap** — no operands, always succeeds ⇒ `does(read)`.
 - **`memory.grow` cannot trap** — returns `-1` on failure (a value you check),
-  otherwise the previous size ⇒ `!(read, grow)`, **no `trap`**.
+  otherwise the previous size ⇒ `does(read, grow)`, **no `trap`**.
 - **Loads and stores trap** on out-of-bounds ⇒ they carry `trap`.
 - **Pattern:** address-taking ops (loads/stores) can trap; size ops
   (`size`/`grow`) never do. `trap` distinguishes accessing memory *contents* at
@@ -522,19 +589,19 @@ onto one effect. **Host imports don't collapse** — each is distinct — so eac
 import can simply **be its own effect**, self-annotated with itself:
 
 ```wx
-fn fd_write(fd: i32, ptr: heap::*u8, len: i32) -> i32 !(fd_write);
-fn fd_read(fd: i32, ptr: heap::*mut u8, len: i32) -> i32 !(fd_read);
+fn fd_write(fd: i32, ptr: heap::*u8, len: i32) does(fd_write) -> i32;
+fn fd_read(fd: i32, ptr: heap::*mut u8, len: i32) does(fd_read) -> i32;
 ```
 
 Left *bare*, a host import is **top** (§4) — the safe default for a foreign
 function you've said nothing about. Self-annotate it to promote it into a
 distinct, nameable effect that callers can allow specifically. Bundle several
-under a trait or a convenience `alias io = !(fd_write, fd_read, …)` when listing
-gets tedious — a library-defined set, not a compiler concept (§6). This is the
-single recipe for any new effect — trap, a memory marker, or disk I/O: **a
-bodyless function whose annotation names the effect.** There is no separate
-machinery for module-external effects; the OS is just on the other side of a host
-import.
+under a trait or a convenience `alias io = does(fd_write, fd_read, …)` when
+listing gets tedious — a library-defined set, not a compiler concept (§6).
+This is the single recipe for any new effect — trap, a memory marker, or disk
+I/O: **a bodyless function whose annotation names the effect.** There is no
+separate machinery for module-external effects; the OS is just on the other
+side of a host import.
 
 ### Globals and tables — `.get()`/`.set()` over singleton globals
 
@@ -553,9 +620,9 @@ effect term denotes *itself as an atom*. So the effect of a global read *is*
 `global_get`, self-annotated like `trap`:
 
 ```wx
-fn global_get<G: GlobalMut>()          -> G::Value !(global_get<G>);
-fn global_set<G: GlobalMut>(v: G::Value)          !(global_set<G>);
-fn global_get_const<G: Global>()       -> G::Value !();          // immutable ⇒ pure
+fn global_get<G: GlobalMut>()          does(global_get<G>) -> G::Value;
+fn global_set<G: GlobalMut>(v: G::Value)          does(global_set<G>);
+fn global_get_const<G: Global>()       does() -> G::Value;          // immutable ⇒ pure
 ```
 
 Memory needs *shared* `read`/`write` markers because many instructions collapse
@@ -568,17 +635,17 @@ disjoint** — deliberately *not* a base/refinement hierarchy:
 ```wx
 trait Global {                      // immutable — no relation to GlobalMut
     type Value;
-    fn get(self) -> Self::Value !() {
+    fn get(self) does() -> Self::Value {
         global_get_const(self)
     }
 }
 
 trait GlobalMut {                   // mutable — disjoint from Global
     type Value;
-    fn get(self) -> Self::Value !(global_get<Self>) {
+    fn get(self) does(global_get<Self>) -> Self::Value {
         global_get(self)
     }
-    fn set(self, v: Self::Value) !(global_set<Self>) {
+    fn set(self, v: Self::Value) does(global_set<Self>) {
         global_set(self, v)
     }
 }
@@ -587,27 +654,27 @@ global x: Global<i32> = 0;          // singleton: mints a type AND a value
 global y: GlobalMut<i32> = 0;
 
 fn test() {
-    x.get();    // !()               — immutable, pure
-    y.get();    // !(global_get<y>)  — mutable read
-    y.set(1);   // !(global_set<y>)
+    x.get();    // does()                — immutable, pure
+    y.get();    // does(global_get<y>)   — mutable read
+    y.set(1);   // does(global_set<y>)
 }
 ```
 
 Three things make this work, each already in the doc:
 
-- **Method effects project through `Self`** (`!(global_get<Self>)`, not a free
-  `G`) — the same associated-type projection as `read<Self::Mem>` (§6); it
+- **Method effects project through `Self`** (`does(global_get<Self>)`, not a
+  free `G`) — the same associated-type projection as `read<Self::Mem>` (§6); it
   resolves to `global_get<y>` at the `y` impl.
 - **Each `global` decl is a singleton** — it mints both a type (for
   `global_get<y>`) and a canonical value (to pass as `self`), like a `memory`
   decl. `global_get<x>` ≠ `global_get<y>` because `x`/`y` are distinct singleton
   types — per-global non-aliasing straight from the type system. (The index is a
   static identity, so the `<_>` existential never arises.)
-- **The traits are disjoint on purpose.** A shared base `Global::get !()` that
-  `GlobalMut` also satisfied would be *unsound*: generic-over-`Global` code would
-  read a mutable, changing global as if pure. Keeping them unrelated closes that
-  hole — at the cost that you can't be generic over "any global regardless of
-  mutability."
+- **The traits are disjoint on purpose.** A shared base `Global::get does()`
+  that `GlobalMut` also satisfied would be *unsound*: generic-over-`Global`
+  code would read a mutable, changing global as if pure. Keeping them
+  unrelated closes that hole — at the cost that you can't be generic over "any
+  global regardless of mutability."
 
 **Why the `.get()`/`.set()` tax is worth it.** It makes global access
 *syntactically visible*: a mutable global read is a method call, not a bare
@@ -620,13 +687,13 @@ effectful trait methods (§6).
 
 **If disjointness ever bites** — you genuinely want "readable, whatever its
 mutability" — the sound escape is a third trait `GlobalRead` that both implement,
-whose `get` returns the *conservative* effect `!(global_get<Self>)` (never `!()`).
-Reading an immutable global *through* `GlobalRead` then loses purity, which is the
-safe direction; it doesn't reopen the hole because the shared bound is the *loose*
-one, not the pure one. Not needed now.
+whose `get` returns the *conservative* effect `does(global_get<Self>)` (never
+`does()`). Reading an immutable global *through* `GlobalRead` then loses
+purity, which is the safe direction; it doesn't reopen the hole because the
+shared bound is the *loose* one, not the pure one. Not needed now.
 
 **Tables** would follow the same shape parameterized by table identity: reads via
-a `table.get` intrinsic (self-annotated `!(table_get<T>)`), writes via
+a `table.get` intrinsic (self-annotated `does(table_get<T>)`), writes via
 `set`/`grow`/`fill`/`copy`, and `call_indirect` reading the table plus `trap`
 (bad index / null / signature mismatch). Table accesses also trap on
 out-of-bounds. Same experimental caveat applies.
@@ -643,8 +710,8 @@ The memory identity rides on the **pointer type** (`Mem::*i32`,
 `Mem::*mut i32`), and the effect reads it off there:
 
 ```wx
-fn load_i32<Mem: Memory>(ptr: Mem::*i32)      -> i32 !(read<Mem>, trap);
-fn store_i32<Mem: Memory>(ptr: Mem::*mut i32, v: i32) !(write<Mem>, trap);
+fn load_i32<Mem: Memory>(ptr: Mem::*i32)      does(read<Mem>, trap) -> i32;
+fn store_i32<Mem: Memory>(ptr: Mem::*mut i32, v: i32) does(write<Mem>, trap);
 ```
 
 > **Pointer mutability and the `write` effect are complementary, not
@@ -710,8 +777,8 @@ not two threaded generics).
 Intrinsics (corrected effect sets):
 
 ```wx
-fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size !(read<Mem>);
-fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size !(read<Mem>, grow<Mem>);
+fn memory_size<Mem: Memory>(mem: Mem) does(read<Mem>) -> Mem::Size;
+fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) does(read<Mem>, grow<Mem>) -> Mem::Size;
 ```
 
 ---
@@ -720,11 +787,12 @@ fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size !(read<Mem>
 
 The declared bound is what the optimizer trusts. Key thresholds:
 
-- **`!()` — pure / referentially transparent** → CSE, LICM, dead-call
+- **`does()` — pure / referentially transparent** → CSE, LICM, dead-call
   elimination, free reordering, memoization.
-- **`!(trap)` vs `!()` — the totality line.** A pure-but-may-trap function is
-  referentially transparent yet *pinned before a side exit* — reorderable only
-  where a trap can't reorder observably. `!()` is freely movable.
+- **`does(trap)` vs `does()` — the totality line.** A pure-but-may-trap
+  function is referentially transparent yet *pinned before a side exit* —
+  reorderable only where a trap can't reorder observably. `does()` is freely
+  movable.
 - **`read` vs `write` — `readonly` vs `readwrite`.** A read-only function is
   reorderable against other reads and its result is stable within an unwritten
   window (enables CSE/hoisting); a writer isn't.
@@ -733,7 +801,7 @@ The declared bound is what the optimizer trusts. Key thresholds:
   in-bounds proof — so keeping it separate lets ordinary stores not clobber
   bounds-check facts. Pairs directly with **bounds-check elimination**: proving
   an index in range lets you *downgrade* an `Index::index` call from
-  `!(read, trap)` toward `!(read)` (the trap is discharged).
+  `does(read, trap)` toward `does(read)` (the trap is discharged).
 
 ---
 
@@ -749,11 +817,11 @@ an `unsafe`-style cast that *asserts* a bound the compiler can't verify. The
 default is "error"; the escape hatch is a marked way to say "trust me."
 
 Default (§4): a **bodyless function with no annotation is top**, uniform with
-bodied functions — say nothing, assume anything. This fails *loud* (any `!()`
-caller reaching it errors at the purity boundary) and *conservative* (unknown ⇒
-top is the safe direction, exactly right for foreign host imports). A new effect
-is created deliberately, by a bodyless function that self-annotates (§4); the
-compiler never invents one from omission.
+bodied functions — say nothing, assume anything. This fails *loud* (any
+`does()` caller reaching it errors at the purity boundary) and *conservative*
+(unknown ⇒ top is the safe direction, exactly right for foreign host imports).
+A new effect is created deliberately, by a bodyless function that
+self-annotates (§4); the compiler never invents one from omission.
 
 ---
 
@@ -765,32 +833,32 @@ compiler never invents one from omission.
   generic list. Provisional syntax:
 
   ```wx
-  fn map<type T, type U, effect E>(f: fn(T) -> U !E, xs: [T]) -> [U] !E
+  fn map<type T, type U, effect E>(f: fn(T) does(E) -> U, xs: [T]) does(E) -> [U]
   ```
 
   The callback's effect set `E` is bound as a generic and flows to the result, so
   `map` is exactly as effectful as the `f` it is handed. **This is always the
   developer's explicit decision — never inferred or auto-derived.** ("What does
-  `!E` mean here" is not a question the compiler can answer for you; it's a choice
+  `E` mean here" is not a question the compiler can answer for you; it's a choice
   you make.) Being effect-generic is genuinely *different behaviour* from a fixed
   annotation, so it must be opted into deliberately.
 
   Effect generics are needed *only* when you want to be generic over the callback.
   Otherwise you annotate the callback's `fn`-type directly, with the same options
   as any effect set: leave it **unannotated** (the callback may perform any
-  effects — top), or give an **explicit whitelist** (`f: fn(T) -> U !(io)`) so the
-  passed function can't use anything outside that set. All three — generic,
+  effects — top), or give an **explicit whitelist** (`f: fn(T) does(io) -> U`) so
+  the passed function can't use anything outside that set. All three — generic,
   unconstrained, whitelist — are explicit choices the author makes; none is
   inferred. (Syntax provisional; the essential idea is that `effect` is its own
   kind in the generic list, alongside `type`.)
 - **Effect abstraction / handling (algebraic effects).** A function that
   *absorbs* an inner effect and exposes a different, abstract one at a boundary
-  (e.g. a `log` that does `write` internally but presents `!(logging)`). This is
-  the algebraic-effects machinery deliberately kept out. The current model is
+  (e.g. a `log` that does `write` internally but presents `does(logging)`). This
+  is the algebraic-effects machinery deliberately kept out. The current model is
   **transparent propagation only** — effects surface unchanged all the way up,
-  `!()` at the top means "traces to no impure leaf." The transparent model needs
-  zero new machinery; the absorbing model is a real feature with real weight,
-  deferred until a concrete need appears.
+  `does()` at the top means "traces to no impure leaf." The transparent model
+  needs zero new machinery; the absorbing model is a real feature with real
+  weight, deferred until a concrete need appears.
 
 ---
 

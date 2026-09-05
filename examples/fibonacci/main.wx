@@ -1,42 +1,41 @@
-use std::*;
 memory heap: Memory where { Size = u32 };
 
 import "console" as console {
-  fn log(message: heap::[]u8);
+    fn log(message: &[u8]);
 }
 
 fn fibonacci(n: i32) -> i32 {
-  if n <= 1 { return n }
-  
-  console::log("calculating fibonacci");
-  console::log("gewgew");
-  fibonacci(n - 1) + fibonacci(n - 2)
+    if n <= 1 { return n };
+
+    console::log("calculating fibonacci");
+    console::log("gewgew");
+    fibonacci(n - 1) + fibonacci(n - 2)
 }
 
 fn fibonacci_iterative(mut n: i32) -> i32 {
-  if n <= 1 { return n }
-  
-  local mut a: i32 = 0;
-  local mut b: i32 = 1;
-  local mut c: i32 = 0;
-  
-  loop {
-    if n == 0 { break a }
-    if n == 1 { break b }
-    
-    c = a + b;
-    a = b;
-    b = c;
-    n -= 1;
-  }
+    if n <= 1 { return n }
+
+    local mut a: i32 = 0;
+    local mut b: i32 = 1;
+    local mut c: i32 = 0;
+
+    loop {
+        if n == 0 { break a }
+        if n == 1 { break b }
+
+        c = a + b;
+        a = b;
+        b = c;
+        n -= 1;
+    }
 }
 
 fn main() {
-  console::log("hello");
+    console::log("hello");
 }
 
 export {
-  fibonacci,
-  fibonacci_iterative,
-  main,
+    fibonacci,
+    fibonacci_iterative,
+    main,
 }

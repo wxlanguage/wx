@@ -18,262 +18,24 @@
 //!
 //! # Output
 //!
-//! The scheduler produces a [`ScheduledFunction`] containing
+//! The scheduler produces a [`wasm::Function`] containing
 //! - the extra WASM locals needed for spilled nodes (appended after params)
 //! - a flat `Vec<Instruction>` for the function body
 //!
-//! Encoding [`Instruction`]s to bytes is left to the codegen layer.
+//! `wasm::Function`/`Instruction` and everything else describing that
+//! output shape live in `crate::wasm` — not here, since `codegen` (the sole
+//! consumer, which does the actual byte encoding) needs them independent
+//! of this module's own sea-of-nodes-specific types.
 
 use std::collections::HashMap;
 
-use crate::codegen::ValueType;
 use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
 	BlockIndex, ControlNode, DataNode, DataNodeIndex, DataNodeKind, Function,
 	MemAccess, ScalarType, StackResult, SwitchCase,
 };
-
-// ── Output types
-// ──────────────────────────────────────────────────────────────
-
-/// The `memarg` immediate carried by every WebAssembly memory instruction.
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
-#[derive(Clone, Copy)]
-pub struct MemArg {
-	/// Log2 of the alignment hint in bytes (e.g. 2 = 4-byte aligned).
-	pub align: u32,
-	/// Static byte offset added to the runtime address.
-	pub offset: u32,
-	pub memory: crate::ast::DefId,
-}
-
-/// A WASM local variable declaration.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(test, serde(transparent))]
-pub struct Local {
-	pub ty: ScalarType,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ScheduledFunction {
-	/// Locals in declaration order (params first, then spill slots).
-	pub locals: Vec<Local>,
-	/// Flat WASM stack-machine instruction sequence for the function body.
-	pub body: Vec<Instruction>,
-}
-
-/// A subset of WASM instructions produced by the scheduler.
-/// Each variant maps 1-to-1 to a WASM opcode; operands are pushed onto the
-/// implicit value stack by the preceding instructions.
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
-#[derive(Clone)]
-pub enum Instruction {
-	// Constants
-	I32Const(i32),
-	I64Const(i64),
-	F32Const(f32),
-	F64Const(f64),
-	// Locals
-	LocalGet(u32),
-	LocalSet(u32),
-	LocalTee(u32),
-	// Globals
-	GlobalGet(crate::ast::DefId),
-	GlobalSet(crate::ast::DefId),
-	// Arithmetic — i32
-	I32Add,
-	I32Sub,
-	I32Mul,
-	I32DivS,
-	I32DivU,
-	I32RemS,
-	I32RemU,
-	I32And,
-	I32Or,
-	I32Xor,
-	I32Shl,
-	I32ShrS,
-	I32ShrU,
-	I32Eqz,
-	I32Eq,
-	I32Ne,
-	I32LtS,
-	I32LtU,
-	I32LeS,
-	I32LeU,
-	I32GtS,
-	I32GtU,
-	I32GeS,
-	I32GeU,
-	I32Clz,
-	I32Ctz,
-	// Arithmetic — i64
-	I64Add,
-	I64Sub,
-	I64Mul,
-	I64DivS,
-	I64DivU,
-	I64RemS,
-	I64RemU,
-	I64And,
-	I64Or,
-	I64Xor,
-	I64Shl,
-	I64ShrS,
-	I64ShrU,
-	I64Eqz,
-	I64Eq,
-	I64Ne,
-	I64LtS,
-	I64LtU,
-	I64LeS,
-	I64LeU,
-	I64GtS,
-	I64GtU,
-	I64GeS,
-	I64GeU,
-	// Arithmetic — f32 / f64
-	F32Add,
-	F32Sub,
-	F32Mul,
-	F32Div,
-	F32Neg,
-	F32Sqrt,
-	F32Abs,
-	F32Floor,
-	F32Ceil,
-	F64Add,
-	F64Sub,
-	F64Mul,
-	F64Div,
-	F64Neg,
-	F64Sqrt,
-	F64Abs,
-	F64Floor,
-	F64Ceil,
-	F32Eq,
-	F32Ne,
-	F32Lt,
-	F32Le,
-	F32Gt,
-	F32Ge,
-	F64Eq,
-	F64Ne,
-	F64Lt,
-	F64Le,
-	F64Gt,
-	F64Ge,
-	// Control flow
-	Block {
-		ty: BlockType,
-	},
-	Loop {
-		ty: BlockType,
-	},
-	If {
-		ty: BlockType,
-	},
-	Else,
-	End,
-	Br(u32), // break by depth
-	BrIf(u32),
-	/// Branch depth per shifted-selector index, covering every index in the
-	/// case set's `[min, max]` range (including gaps), followed by the
-	/// default depth as the trailing element — i.e. `depths[i]` for
-	/// `i < depths.len() - 1`, `depths[depths.len() - 1]` for anything else
-	/// (per WASM semantics: an out-of-table index, including one that went
-	/// negative before being reinterpreted as unsigned, always falls to the
-	/// default). One field instead of a separate `default_depth` since the
-	/// encoder needs the exact same split either way.
-	BrTable(Box<[u32]>),
-	Return,
-	Unreachable,
-	Drop,
-	// Calls
-	/// Direct call; the encoder resolves the WASM function index from
-	/// `func_wasm_index`, covering both internal and imported functions.
-	Call(crate::ast::DefId),
-	/// Indirect call via the function table; the encoder resolves `type_index`
-	/// from the referenced MIR signature.
-	CallIndirectSym {
-		mir_sig_index: u32,
-	},
-	// Memory
-	MemorySize(crate::ast::DefId),
-	MemoryGrow(crate::ast::DefId),
-	MemoryFill(crate::ast::DefId),
-	MemoryCopy {
-		dst: crate::ast::DefId,
-		src: crate::ast::DefId,
-	},
-	/// Wasm linear-memory index as an `i32.const`, resolved at codegen.
-	MemoryIndex {
-		memory: crate::ast::DefId,
-	},
-	// Pointer load/store
-	I32Load8S(MemArg),
-	I32Load8U(MemArg),
-	I32Load16S(MemArg),
-	I32Load16U(MemArg),
-	I32Load(MemArg),
-	I64Load(MemArg),
-	F32Load(MemArg),
-	F64Load(MemArg),
-	I32Store8(MemArg),
-	I32Store16(MemArg),
-	I32Store(MemArg),
-	I64Store(MemArg),
-	F32Store(MemArg),
-	F64Store(MemArg),
-	// Conversion
-	I64ExtendI32S,
-	I64ExtendI32U,
-	I32WrapI64,
-	F32ConvertI32S,
-	F32ConvertI32U,
-	F32ConvertI64S,
-	F32ConvertI64U,
-	F64ConvertI32S,
-	F64ConvertI32U,
-	F64ConvertI64S,
-	F64ConvertI64U,
-	I32TruncF32S,
-	I32TruncF32U,
-	I32TruncF64S,
-	I32TruncF64U,
-	I64TruncF32S,
-	I64TruncF32U,
-	I64TruncF64S,
-	I64TruncF64U,
-	F64PromoteF32,
-	F32DemoteF64,
-	// Nop (used as a placeholder)
-	Nop,
-	// Symbolic references — resolved to concrete i32.const values by the
-	// codegen encoder, which has access to the string pool and function table.
-	/// A function referenced as a value; the encoder pushes it into the
-	/// function table and emits `i32.const <table_index>`.
-	FunctionPointer(crate::ast::DefId),
-	/// End of the static data section for a given memory (base of writable
-	/// heap); the encoder emits `i32.const <data_section_end>`.
-	DataSectionEnd {
-		memory: crate::ast::DefId,
-	},
-	/// A static array; the encoder resolves the index to a byte offset in the
-	/// data segment and emits `i32.const <byte_offset>`.
-	StaticDataPointer {
-		data_index: u32,
-		ty: ScalarType,
-	},
-}
-
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
-#[derive(Clone, Copy)]
-pub enum BlockType {
-	Empty,
-	Value(ValueType),
-}
+use crate::wasm::{self, BlockType, Instruction, Local, MemArg};
 
 // ── Scheduler
 // ─────────────────────────────────────────────────────────────────
@@ -293,20 +55,24 @@ pub struct Scheduler<'f> {
 	node_to_aggregate_locals: HashMap<DataNodeIndex, Box<[u32]>>,
 	/// Output instruction stream.
 	body: Vec<Instruction>,
+	/// Flat arena backing every emitted `Instruction::BrTable` — see
+	/// `wasm::Function::br_table_depths`.
+	br_table_depths: Vec<u32>,
 	/// Placement decisions for pure values read from more than one block —
 	/// computed once by `compute_value_placement` before emission starts,
 	/// consulted (and drained, one block at a time) by `emit_block`. Indexed
 	/// directly by `BlockIndex` rather than a `HashMap` — both index types
 	/// here are dense `u32`s, the same convention `DataLiveness` uses for
-	/// `DataNodeIndex`. See `compute_value_placement`'s doc comment.
-	placement_by_block: Vec<Vec<DataNodeIndex>>,
+	/// `DataNodeIndex`. Each entry pairs a node with the statement index
+	/// *within that block* it must be materialized before — not just which
+	/// block, since a block can be read from both one of its own statements
+	/// and a nested branch, at different points in program order. See
+	/// `compute_value_placement`'s doc comment.
+	placement_by_block: Vec<Vec<(u32, DataNodeIndex)>>,
 }
 
 impl<'f> Scheduler<'f> {
-	pub fn schedule(
-		func: &'f Function,
-		mir: &'f mir::MIR,
-	) -> ScheduledFunction {
+	pub fn schedule(func: &'f Function, mir: &'f mir::MIR) -> wasm::Function {
 		let sig = &mir.signatures[{
 			// Find the function's signature via its DefId.
 			mir.functions
@@ -321,7 +87,7 @@ impl<'f> Scheduler<'f> {
 			.params()
 			.iter()
 			.copied()
-			.flat_map(|ty| Self::flatten_mir_type(ty, &mir.aggregates))
+			.flat_map(|ty| wasm::flatten_type_to_scalars(ty, &mir.aggregates))
 			.map(|ty| Local { ty })
 			.collect();
 		let params_count = locals.len();
@@ -334,8 +100,11 @@ impl<'f> Scheduler<'f> {
 			node_to_local: HashMap::new(),
 			node_to_aggregate_locals: HashMap::new(),
 			body: Vec::new(),
+			br_table_depths: Vec::new(),
 			placement_by_block: Vec::new(),
 		};
+		#[cfg(debug_assertions)]
+		super::local_dominance::verify_operand_index_ordering(func);
 		sched.placement_by_block = sched.compute_value_placement();
 
 		sched.emit_block(0);
@@ -344,12 +113,21 @@ impl<'f> Scheduler<'f> {
 			sched.body.pop();
 		}
 
-		coalesce_locals(&mut sched.body, &mut sched.locals, params_count);
-		peephole_local_tee(&mut sched.body);
+		#[cfg(debug_assertions)]
+		super::local_dominance::verify_local_dominance(
+			&sched.body,
+			sched.locals.len(),
+			params_count,
+			&sched.br_table_depths,
+		);
 
-		ScheduledFunction {
+		wasm::coalesce_locals(&mut sched.body, &mut sched.locals, params_count);
+		wasm::peephole_local_tee(&mut sched.body);
+
+		wasm::Function {
 			locals: sched.locals,
 			body: sched.body,
+			br_table_depths: sched.br_table_depths,
 		}
 	}
 
@@ -834,29 +612,52 @@ impl<'f> Scheduler<'f> {
 	}
 
 	fn emit_block(&mut self, block_idx: BlockIndex) {
-		// Materialize any pure values placed here by `compute_value_placement`
-		// before this block's own statements — they may be read by more than
-		// one of this block's (mutually exclusive) descendant branches, so
-		// they must exist in a local before any of those branches run, not
-		// lazily on whichever one the scheduler happens to reach first.
-		let nodes = self.placement_by_block[block_idx as usize].clone();
-		for node in nodes {
-			self.ensure_local(node);
-		}
-		for stmt in &self.func.blocks[block_idx as usize]
+		// Materialize pure values placed here by `compute_value_placement`
+		// interleaved with this block's own statements, immediately before
+		// the statement each one was hoisted ahead of — not all at block
+		// start. A value hoisted here may itself depend on something (e.g.
+		// a `Call`) computed by an earlier statement in this very block, so
+		// materializing every hoisted value unconditionally up front would
+		// run it ahead of its own inputs. See `compute_value_placement`'s
+		// doc comment for why each entry's statement index is exactly the
+		// point that's both late enough to follow its own inputs and early
+		// enough to precede every branch that needs it.
+		let mut pending = self.placement_by_block[block_idx as usize].clone();
+		// `compute_value_placement` pushes in ascending `DataNodeIndex`
+		// order; sorting by statement index only (a stable sort) preserves
+		// that at any tied index, which keeps operand-before-consumer
+		// ordering intact — operands always have a lower `DataNodeIndex`
+		// than whatever reads them (see `for_each_operand`'s doc comment).
+		pending.sort_by_key(|&(idx, _)| idx);
+		let mut pending = pending.into_iter().peekable();
+
+		let statements = &self.func.blocks[block_idx as usize]
 			.as_ref()
 			.expect("block scope should be built")
-			.statements
-		{
+			.statements;
+		for (i, stmt) in statements.iter().enumerate() {
+			while pending.peek().is_some_and(|&(idx, _)| idx as usize <= i) {
+				self.ensure_local(pending.next().unwrap().1);
+			}
 			self.emit_control(block_idx, stmt);
 		}
+		debug_assert!(
+			pending.next().is_none(),
+			"placement_by_block[{block_idx}] has an entry past this \
+			 block's last statement — every hoisted node's index must come \
+			 from `owning_statement_index`, which only ever returns a real \
+			 statement position"
+		);
 	}
 
 	// ── Cross-branch value placement ────────────────────────────────────────
 
 	/// Decides, for every pure `DataNode` read from more than one block, the
-	/// single block where it must be materialized: the lowest block that is
-	/// an ancestor of (i.e. always runs before) every block that reads it.
+	/// exact point where it must be materialized: either its own natural
+	/// first-use position (if that already precedes every other reader), or
+	/// an explicit position in their lowest common ancestor block,
+	/// immediately before whichever of that block's statements leads into
+	/// the branch that needs it earliest.
 	///
 	/// `should_spill`/`ensure_local` alone are only sound when a spilled
 	/// node's uses all live in the same block — they materialize a value
@@ -868,30 +669,66 @@ impl<'f> Scheduler<'f> {
 	/// gets a local that branch never actually populated) — or even when one
 	/// reader is inside a branch and another is in the block that contains
 	/// it, since the containing block isn't guaranteed the branch that
-	/// computed the value actually ran.
+	/// computed the value actually ran, *and* since the containing block's
+	/// own direct read of the node might itself come **after** that branch
+	/// in program order, in which case relying on it is exactly as unsound
+	/// as relying on the branch.
 	///
 	/// `Block::parent` already gives this IR a tree over blocks (nesting via
 	/// `if`/`switch`/`loop`, not a general CFG), so "the block guaranteed to
 	/// run before a set of others" is just their lowest common ancestor in
-	/// that tree — no dominator-tree algorithm needed.
+	/// that tree — no dominator-tree algorithm needed. Position *within*
+	/// that block is a second, independent question this function also
+	/// answers, via `own_min`/`desc_min` below.
 	///
 	/// Both `DataNodeIndex` and `BlockIndex` are dense `u32`s (see
 	/// `DataLiveness` for the same convention), so every set below is a
 	/// plain `Vec` indexed directly by one of them rather than a hashmap.
-	/// Finding which blocks read which nodes is a single forward pass
-	/// (`record_block_own_nodes`, direct operands only, no recursion)
-	/// followed by a single backward pass propagating each node's readers
-	/// down to its own operands (`for_each_operand`). That backward pass is
-	/// valid in one sweep because a node's operands always have a lower
+	/// Finding which blocks read which nodes, and at what statement index
+	/// within each, is a single forward pass (`record_block_own_nodes`,
+	/// direct operands only, no recursion) followed by a single backward
+	/// pass propagating each node's `(block, statement index)` readers down
+	/// to its own operands (`for_each_operand`) — an operand is needed at
+	/// exactly the same point its consumer is. That backward pass is valid
+	/// in one sweep because a node's operands always have a lower
 	/// `DataNodeIndex` than the node itself — a node can only reference an
 	/// operand that was already interned (`Builder::intern_node` assigns
 	/// indices in creation order) — so by the time the sweep reaches a
 	/// node, every one of its own readers (all at higher indices) has
-	/// already propagated its blocks into it. This replaces re-deriving each
-	/// node's full transitive closure from scratch at every site that reads
-	/// it, which repeats work across shared sub-expressions.
-	fn compute_value_placement(&self) -> Vec<Vec<DataNodeIndex>> {
-		let mut consuming_blocks: Vec<Vec<BlockIndex>> =
+	/// already propagated its positions into it. This replaces re-deriving
+	/// each node's full transitive closure from scratch at every site that
+	/// reads it, which repeats work across shared sub-expressions.
+	///
+	/// Once a node's LCA block is known, its readers split into two groups:
+	/// - `own_min`: the earliest statement index, within the LCA itself,
+	///   where the LCA directly reads the node (e.g. as an `if`'s own
+	///   condition) — `None` if the LCA never reads it directly, only some
+	///   of its descendants do.
+	/// - `desc_min`: the earliest point, also expressed as a statement index
+	///   within the LCA, that any *descendant* reader is reached — found via
+	///   `owning_statement_index`, which walks a reading block up to the LCA
+	///   through `compute_child_owning_stmt`'s reverse lookup.
+	///
+	/// If `own_min <= desc_min`, the node's existing natural placement (the
+	/// lazy `ensure_local` triggered while emitting that own use) already
+	/// happens no later than every descendant needs it — e.g. `local
+	/// cur_end = heap.size_bytes(); if new_end > cur_end { ... cur_end ...
+	/// }`: `cur_end` is read both by the `if`'s own condition and from
+	/// inside the nested `then` branch, at the same statement, and the
+	/// condition is always evaluated before the branch is entered, so
+	/// nothing needs to change. Equality is safe, not just strict `<`,
+	/// because the only way `own_min` can equal `desc_min` is when the
+	/// direct read *is* that branching statement's own condition/selector —
+	/// `emit_control` always evaluates that before recursing into any
+	/// sub-block. Otherwise (no own use at all, or one that comes strictly
+	/// *after* some descendant reader) an explicit materialization is
+	/// pushed at `desc_min`, replacing the old `!blocks.contains(&lca)`
+	/// check, which only ever asked *whether* the LCA was a reader, not
+	/// *when* — a gap that let a node used inside an `if`'s branch and again
+	/// later in the same containing block silently share program order with
+	/// the branch instead of preceding it.
+	fn compute_value_placement(&self) -> Vec<Vec<(u32, DataNodeIndex)>> {
+		let mut consuming_blocks: Vec<Vec<(BlockIndex, u32)>> =
 			vec![Vec::new(); self.func.data_nodes.len()];
 		for block_idx in 0..self.func.blocks.len() as BlockIndex {
 			if self.func.blocks[block_idx as usize].is_none() {
@@ -901,16 +738,17 @@ impl<'f> Scheduler<'f> {
 		}
 
 		// Propagate downward: a pure node's readers are also, transitively,
-		// readers of its own operands. Impure nodes (CallResult, GlobalGet,
-		// LoopParam, Phi, ...) never propagate past themselves — their own
-		// operands (a call's args, a phi's per-branch inputs, ...) are
-		// always consumed at the single fixed control-node site that
-		// produces the impure value (e.g. a call's args are pushed and
-		// consumed exactly once, right where the call executes), which
-		// `record_block_own_nodes` already recorded directly. Re-deriving
-		// that from wherever the impure *result* is later read would be
-		// redundant at best and wrong at worst, since the result's readers
-		// don't run where the impure computation itself ran.
+		// readers of its own operands, at the same statement position.
+		// Impure nodes (CallResult, GlobalGet, LoopParam, Phi, ...) never
+		// propagate past themselves — their own operands (a call's args, a
+		// phi's per-branch inputs, ...) are always consumed at the single
+		// fixed control-node site that produces the impure value (e.g. a
+		// call's args are pushed and consumed exactly once, right where the
+		// call executes), which `record_block_own_nodes` already recorded
+		// directly. Re-deriving that from wherever the impure *result* is
+		// later read would be redundant at best and wrong at worst, since
+		// the result's readers don't run where the impure computation
+		// itself ran.
 		for node in (0..self.func.data_nodes.len() as DataNodeIndex).rev() {
 			if consuming_blocks[node as usize].is_empty() {
 				continue;
@@ -918,23 +756,25 @@ impl<'f> Scheduler<'f> {
 			if !self.func.data_nodes[node as usize].kind.is_pure() {
 				continue;
 			}
-			let blocks = consuming_blocks[node as usize].clone();
+			let entries = consuming_blocks[node as usize].clone();
 			self.for_each_operand(node, |operand| {
-				for &b in &blocks {
-					push_unique_block(
+				for &(b, idx) in &entries {
+					record_read(
 						&mut consuming_blocks[operand as usize],
 						b,
+						idx,
 					);
 				}
 			});
 		}
 
 		let block_depths = self.compute_block_depths();
-		let mut placement_by_block: Vec<Vec<DataNodeIndex>> =
+		let child_owning_stmt = self.compute_child_owning_stmt();
+		let mut placement_by_block: Vec<Vec<(u32, DataNodeIndex)>> =
 			vec![Vec::new(); self.func.blocks.len()];
 		for node in 0..self.func.data_nodes.len() as DataNodeIndex {
-			let blocks = &consuming_blocks[node as usize];
-			if blocks.len() < 2 {
+			let entries = &consuming_blocks[node as usize];
+			if entries.len() < 2 {
 				continue;
 			}
 			if !self.func.data_nodes[node as usize].kind.is_pure() {
@@ -943,94 +783,184 @@ impl<'f> Scheduler<'f> {
 			if !self.should_spill(&self.func.data_nodes[node as usize]) {
 				continue;
 			}
-			let mut blocks_iter = blocks.iter().copied();
+			let mut blocks_iter = entries.iter().map(|&(b, _)| b);
 			let first = blocks_iter.next().unwrap();
 			let lca = blocks_iter
 				.fold(first, |acc, b| self.lca_block(&block_depths, acc, b));
-			// If the LCA is itself one of the consuming blocks, this node is
-			// already naturally computed there in program order — e.g.
-			// `local cur_end = heap.size() * PAGE_SIZE; if new_end > cur_end
-			// { ... cur_end ... }`: `cur_end` is read both by the condition
-			// (in the block that declares it) and from inside the nested
-			// `then` branch, so its LCA is that same declaring block. That
-			// block's own existing lazy-on-first-use `ensure_local` call
-			// (triggered while emitting the condition, strictly before the
-			// nested branch is even entered) is already correct and
-			// sufficient — forcing materialization at the very *start* of
-			// that block instead would run it before whatever it itself
-			// depends on (here, the `heap.size()` call) has executed.
-			// Hoisting only the cases where the LCA is a strict ancestor —
-			// never a member of `blocks` itself — is exactly what keeps this
-			// pass from ever reordering a value ahead of its own inputs.
-			if !blocks.contains(&lca) {
-				placement_by_block[lca as usize].push(node);
+
+			let own_min = entries
+				.iter()
+				.find(|&&(b, _)| b == lca)
+				.map(|&(_, idx)| idx);
+			// `entries` has at least 2 distinct blocks (checked above) and
+			// at most one of them can equal `lca`, so at least one entry
+			// has `b != lca` — `desc_min` always exists.
+			let desc_min = entries
+				.iter()
+				.filter(|&&(b, _)| b != lca)
+				.map(|&(b, _)| {
+					self.owning_statement_index(&child_owning_stmt, lca, b)
+				})
+				.min()
+				.expect(
+					"at least one entry differs from lca when entries.len() >= 2",
+				);
+
+			let hoist_at = match own_min {
+				Some(om) if om <= desc_min => None,
+				_ => Some(desc_min),
+			};
+			if let Some(idx) = hoist_at {
+				placement_by_block[lca as usize].push((idx, node));
 			}
 		}
 		placement_by_block
 	}
 
-	/// Records every `DataNode` that `block_idx`'s own statements read.
+	/// Reverse lookup from a nested block to the `(parent_block,
+	/// statement_index)` of the `IfElse`/`Switch`/`Loop` statement that owns
+	/// it — the position `owning_statement_index` walks toward when
+	/// resolving a descendant reader up to some ancestor block. Built once,
+	/// in a single forward pass over every block's own statements; `None`
+	/// for the function's root block, which has no owning statement.
+	fn compute_child_owning_stmt(&self) -> Vec<Option<(BlockIndex, u32)>> {
+		let mut table = vec![None; self.func.blocks.len()];
+		for block_idx in 0..self.func.blocks.len() as BlockIndex {
+			let Some(block) = &self.func.blocks[block_idx as usize] else {
+				continue;
+			};
+			for (i, stmt) in block.statements.iter().enumerate() {
+				let i = i as u32;
+				match stmt {
+					ControlNode::IfElse {
+						then_block,
+						else_block,
+						..
+					} => {
+						table[*then_block as usize] = Some((block_idx, i));
+						if let Some(eb) = else_block {
+							table[*eb as usize] = Some((block_idx, i));
+						}
+					}
+					ControlNode::Switch { cases, default, .. } => {
+						for case in cases.iter().chain(default.iter()) {
+							table[case.block as usize] = Some((block_idx, i));
+						}
+					}
+					ControlNode::Loop { body, .. } => {
+						table[*body as usize] = Some((block_idx, i));
+					}
+					_ => {}
+				}
+			}
+		}
+		table
+	}
+
+	/// Walks from `descendant` up to `ancestor` via `child_owning_stmt`,
+	/// returning the statement index in `ancestor` of the top-level
+	/// `IfElse`/`Switch`/`Loop` that (transitively) contains `descendant`.
+	fn owning_statement_index(
+		&self,
+		child_owning_stmt: &[Option<(BlockIndex, u32)>],
+		ancestor: BlockIndex,
+		descendant: BlockIndex,
+	) -> u32 {
+		let mut child = descendant;
+		loop {
+			let (parent, stmt_idx) = child_owning_stmt[child as usize]
+				.expect("descendant must be a descendant of ancestor");
+			if parent == ancestor {
+				return stmt_idx;
+			}
+			child = parent;
+		}
+	}
+
+	/// Records every `DataNode` that `block_idx`'s own statements read,
+	/// paired with the statement index of the read (see `record_read`).
 	///
 	/// A phi's `left`/`right` (`IfElse.outputs`) or a switch arm's own
 	/// contribution (`SwitchCase.own_values`) is recorded against the
 	/// specific branch block that actually produced it — `then_block`/
-	/// `else_block`/`case.block` — never against `block_idx` itself.
-	/// `block_idx` (the block containing the `if`/`switch`) only ever reads
-	/// the phi's *merged* result, a value in its own right that's already
-	/// correctly materialized by the existing `pre_alloc_phi_outputs`/
-	/// `emit_phi_stores_for_branch` machinery — not the branch-local values
-	/// feeding into it. Recording those against `block_idx` instead of their
-	/// true origin block is exactly the bug this function exists to avoid:
-	/// it would misidentify a value that's only ever computed inside one
-	/// specific branch as something already available beforehand.
+	/// `else_block`/`case.block` — never against `block_idx` itself, at that
+	/// branch block's own tail position (`statements.len()`, mirroring
+	/// `Block::result` below): `emit_control` reads both only *after*
+	/// `emit_block` on that branch has run every one of its statements
+	/// (`self.emit_block(*then_block); ...; self.emit_phi_stores_for_branch(...)`
+	/// for `IfElse`; the equivalent sequencing in `emit_switch_case_body`
+	/// for `Switch`). `block_idx` (the block containing the `if`/`switch`)
+	/// only ever reads the phi's *merged* result, a value in its own right
+	/// that's already correctly materialized by the existing
+	/// `pre_alloc_phi_outputs`/`emit_phi_stores_for_branch` machinery — not
+	/// the branch-local values feeding into it. Recording those against
+	/// `block_idx` instead of their true origin block is exactly the bug
+	/// this function exists to avoid: it would misidentify a value that's
+	/// only ever computed inside one specific branch as something already
+	/// available beforehand.
 	///
 	/// Only records the *direct* operand named by each control node —
 	/// transitive propagation to that operand's own operands happens once,
 	/// globally, in `compute_value_placement`'s backward sweep. Every case
 	/// below reduces to the same one-line insertion into `consuming_blocks`
-	/// (`push_unique_block`, shared with that backward sweep) — the size of
-	/// this function is `ControlNode`'s own variant count, not new logic.
+	/// (`record_read`, shared with that backward sweep) — the size of this
+	/// function is `ControlNode`'s own variant count, not new logic.
+	fn block_tail(&self, block_idx: BlockIndex) -> u32 {
+		self.func.blocks[block_idx as usize]
+			.as_ref()
+			.expect("block scope should be built")
+			.statements
+			.len() as u32
+	}
+
 	fn record_block_own_nodes(
 		&self,
 		block_idx: BlockIndex,
-		consuming_blocks: &mut [Vec<BlockIndex>],
+		consuming_blocks: &mut [Vec<(BlockIndex, u32)>],
 	) {
 		let block = self.func.blocks[block_idx as usize]
 			.as_ref()
 			.expect("block scope should be built");
 		// `Block::result` is the block's own exit value (e.g. an if-branch's
-		// tail expression) — separate from `statements`, and where a value
-		// like `map_y_f` in the doc example gets read when a branch's whole
-		// body is just `(oy - map_y_f) * delta_dist_y` with no other
-		// statement.
+		// tail expression) — separate from `statements`, read only after
+		// every one of them has executed, hence `block_tail`.
 		if let StackResult::Value(n) = block.result {
-			push_unique_block(&mut consuming_blocks[n as usize], block_idx);
+			record_read(
+				&mut consuming_blocks[n as usize],
+				block_idx,
+				self.block_tail(block_idx),
+			);
 		}
-		for stmt in &block.statements {
+		for (i, stmt) in block.statements.iter().enumerate() {
+			let i = i as u32;
 			match stmt {
 				ControlNode::Return { value } => {
 					if let StackResult::Value(n) = value {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[*n as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
 				ControlNode::GlobalSet { value, .. } => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*value as usize],
 						block_idx,
+						i,
 					);
 				}
 				ControlNode::Call { callee, args, .. } => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*callee as usize],
 						block_idx,
+						i,
 					);
 					for &a in args.iter() {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[a as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
@@ -1041,15 +971,19 @@ impl<'f> Scheduler<'f> {
 					outputs,
 					..
 				} => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*condition as usize],
 						block_idx,
+						i,
 					);
 					for &phi in outputs.iter() {
-						// The phi's own merged value is read by block_idx.
-						push_unique_block(
+						// The phi's own merged value is read by block_idx,
+						// at this same statement (see this function's doc
+						// comment for why).
+						record_read(
 							&mut consuming_blocks[phi as usize],
 							block_idx,
+							i,
 						);
 						let DataNodeKind::Phi { left, right, .. } =
 							&self.func.data_nodes[phi as usize].kind
@@ -1057,19 +991,28 @@ impl<'f> Scheduler<'f> {
 							continue;
 						};
 						let (l, r) = (*left, *right);
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[l as usize],
 							*then_block,
+							self.block_tail(*then_block),
 						);
 						// No `else`: per `Builder::merge_branches`, `right`
 						// is just whatever `bindings[i]` already held going
 						// into the `if` — i.e. the parent's own pre-existing
 						// value, not anything computed inside a branch — so
-						// it belongs to block_idx.
-						let r_block = else_block.unwrap_or(block_idx);
-						push_unique_block(
+						// it belongs to block_idx. Per `emit_control`'s own
+						// no-else handling, that store happens *before* the
+						// condition is even evaluated (there is no `else`
+						// block for it to live inside), so it's read at this
+						// same statement `i`, not block_idx's own tail.
+						let (r_block, r_idx) = match else_block {
+							Some(eb) => (*eb, self.block_tail(*eb)),
+							None => (block_idx, i),
+						};
+						record_read(
 							&mut consuming_blocks[r as usize],
 							r_block,
+							r_idx,
 						);
 					}
 				}
@@ -1080,22 +1023,26 @@ impl<'f> Scheduler<'f> {
 					outputs,
 					..
 				} => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*selector as usize],
 						block_idx,
+						i,
 					);
 					for &phi in outputs.iter() {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[phi as usize],
 							block_idx,
+							i,
 						);
 					}
 					for case in cases.iter().chain(default.iter()) {
+						let case_tail = self.block_tail(case.block);
 						for &own in case.own_values.iter() {
 							if let StackResult::Value(n) = own {
-								push_unique_block(
+								record_read(
 									&mut consuming_blocks[n as usize],
 									case.block,
+									case_tail,
 								);
 							}
 						}
@@ -1105,9 +1052,10 @@ impl<'f> Scheduler<'f> {
 					// LoopParam nodes themselves are impure (excluded from
 					// placement entirely); nothing pure to record here.
 					for &o in outputs.iter() {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[o as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
@@ -1117,15 +1065,17 @@ impl<'f> Scheduler<'f> {
 					..
 				} => {
 					if let StackResult::Value(n) = value {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[*n as usize],
 							block_idx,
+							i,
 						);
 					}
 					for &(_, current) in loop_param_updates.iter() {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
@@ -1133,9 +1083,10 @@ impl<'f> Scheduler<'f> {
 					loop_param_updates, ..
 				} => {
 					for &(_, current) in loop_param_updates.iter() {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
@@ -1145,38 +1096,43 @@ impl<'f> Scheduler<'f> {
 				// impure-node skip in `compute_value_placement`.
 				ControlNode::MemorySize { .. } => {}
 				ControlNode::MemoryGrow { delta, .. } => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*delta as usize],
 						block_idx,
+						i,
 					);
 				}
 				ControlNode::MemoryFill { dst, val, len, .. } => {
 					for &n in [dst, val, len] {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[n as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
 				ControlNode::MemoryCopy { dst, src, len, .. } => {
 					for &n in [dst, src, len] {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[n as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
 				ControlNode::PointerLoad { address, .. } => {
-					push_unique_block(
+					record_read(
 						&mut consuming_blocks[*address as usize],
 						block_idx,
+						i,
 					);
 				}
 				ControlNode::PointerStore { address, value, .. } => {
 					for &n in [address, value] {
-						push_unique_block(
+						record_read(
 							&mut consuming_blocks[n as usize],
 							block_idx,
+							i,
 						);
 					}
 				}
@@ -1211,6 +1167,9 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::DivU { left, right, .. }
 			| DataNodeKind::RemS { left, right, .. }
 			| DataNodeKind::RemU { left, right, .. }
+			| DataNodeKind::Min { left, right, .. }
+			| DataNodeKind::Max { left, right, .. }
+			| DataNodeKind::Copysign { left, right, .. }
 			| DataNodeKind::BitAnd { left, right, .. }
 			| DataNodeKind::BitOr { left, right, .. }
 			| DataNodeKind::BitXor { left, right, .. }
@@ -1235,6 +1194,8 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::Abs { operand, .. }
 			| DataNodeKind::Floor { operand, .. }
 			| DataNodeKind::Ceil { operand, .. }
+			| DataNodeKind::Trunc { operand, .. }
+			| DataNodeKind::Nearest { operand, .. }
 			| DataNodeKind::BitNot { operand, .. }
 			| DataNodeKind::Eqz { operand }
 			| DataNodeKind::I64ExtendI32S { operand }
@@ -1258,6 +1219,10 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::U64TruncF64 { operand }
 			| DataNodeKind::F64PromoteF32 { operand }
 			| DataNodeKind::F32DemoteF64 { operand }
+			| DataNodeKind::I32ReinterpretF32 { operand }
+			| DataNodeKind::F32ReinterpretI32 { operand }
+			| DataNodeKind::I64ReinterpretF64 { operand }
+			| DataNodeKind::F64ReinterpretI64 { operand }
 			| DataNodeKind::AggregateGet {
 				aggregate: operand, ..
 			} => {
@@ -1289,21 +1254,61 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Depth of each block in the `Block::parent` tree (root = 0), computed
-	/// in one forward pass over `self.func.blocks`. Valid in one pass for
-	/// the same reason `for_each_operand`'s backward sweep is: a block's
-	/// parent always has a lower `BlockIndex` than the block itself (a
-	/// nested scope's index is only minted once its enclosing scope
-	/// already exists), so a block's parent's depth is always already
-	/// final by the time the block itself is visited.
+	/// Depth of each block in the `Block::parent` tree (root = 0).
+	///
+	/// Unlike `for_each_operand`'s backward sweep over `DataNodeIndex`, this
+	/// cannot assume a block's parent always has a lower `BlockIndex` than
+	/// the block itself. That holds for ordinary nested `if`/`loop` scopes
+	/// (a nested scope's index is only minted once its enclosing scope
+	/// already exists), but not for a `Switch` lowered to a `br_table`:
+	/// `Builder::build_switch` allocates its synthetic depth-bookkeeping
+	/// wrapper blocks (`push_synthetic_block`) *after* the case bodies'
+	/// own scope blocks already exist (those scope indices were minted
+	/// earlier, in MIR), purely so `break_depth`/`continue_depth`'s
+	/// generic parent-walk has the right ancestor chain — those two only
+	/// ever follow `.parent` links and never compare indices, so nothing
+	/// there depends on ordering. But it does mean a case body's block
+	/// index can be *lower* than its own (freshly-minted) wrapper parent's,
+	/// which breaks the single-forward-pass shortcut this function used to
+	/// take, and there's no cheaper fix on the `build_switch` side: a
+	/// synthetic wrapper is, by construction, always allocated after (and
+	/// therefore at a higher index than) anything that already exists when
+	/// it's created, including a case body whose own index was fixed long
+	/// before the switch that wraps it was even reached.
+	///
+	/// Each block is still visited (and its depth computed) exactly once
+	/// overall: `block_depth` memoizes into `depths` as it recurses, so a
+	/// block already resolved via an earlier call is an O(1) lookup, not a
+	/// re-walk. Recursion depth is bounded by a function's actual
+	/// control-flow nesting, never deep in practice.
 	fn compute_block_depths(&self) -> Vec<u32> {
-		let mut depths = vec![0u32; self.func.blocks.len()];
-		for (i, block) in self.func.blocks.iter().enumerate() {
-			if let Some(parent) = block.as_ref().and_then(|b| b.parent) {
-				depths[i] = depths[parent as usize] + 1;
+		let mut depths: Vec<Option<u32>> = vec![None; self.func.blocks.len()];
+		for start in 0..self.func.blocks.len() as BlockIndex {
+			if self.func.blocks[start as usize].is_some() {
+				self.block_depth(start, &mut depths);
 			}
 		}
-		depths
+		depths.into_iter().map(|d| d.unwrap_or(0)).collect()
+	}
+
+	fn block_depth(
+		&self,
+		block: BlockIndex,
+		depths: &mut [Option<u32>],
+	) -> u32 {
+		if let Some(d) = depths[block as usize] {
+			return d;
+		}
+		let d = match self.func.blocks[block as usize]
+			.as_ref()
+			.expect("block scope should be built")
+			.parent
+		{
+			Some(parent) => self.block_depth(parent, depths) + 1,
+			None => 0,
+		};
+		depths[block as usize] = Some(d);
+		d
 	}
 
 	/// Lowest common ancestor of two blocks in the `Block::parent` tree —
@@ -1475,6 +1480,33 @@ impl<'f> Scheduler<'f> {
 					_ => unimplemented!("float remainder"),
 				});
 			}
+			DataNodeKind::Min { left, right, ty } => {
+				self.emit_value(left);
+				self.emit_value(right);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Min,
+					ScalarType::F64 => Instruction::F64Min,
+					_ => unimplemented!("integer min"),
+				});
+			}
+			DataNodeKind::Max { left, right, ty } => {
+				self.emit_value(left);
+				self.emit_value(right);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Max,
+					ScalarType::F64 => Instruction::F64Max,
+					_ => unimplemented!("integer max"),
+				});
+			}
+			DataNodeKind::Copysign { left, right, ty } => {
+				self.emit_value(left);
+				self.emit_value(right);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Copysign,
+					ScalarType::F64 => Instruction::F64Copysign,
+					_ => unimplemented!("integer copysign"),
+				});
+			}
 			DataNodeKind::BitAnd { left, right, ty } => {
 				self.emit_value(left);
 				self.emit_value(right);
@@ -1582,6 +1614,22 @@ impl<'f> Scheduler<'f> {
 					_ => unimplemented!(),
 				});
 			}
+			DataNodeKind::Trunc { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Trunc,
+					ScalarType::F64 => Instruction::F64Trunc,
+					_ => unimplemented!(),
+				});
+			}
+			DataNodeKind::Nearest { operand, ty } => {
+				self.emit_value(operand);
+				self.body.push(match ty {
+					ScalarType::F32 => Instruction::F32Nearest,
+					ScalarType::F64 => Instruction::F64Nearest,
+					_ => unimplemented!(),
+				});
+			}
 			DataNodeKind::BitNot { operand, ty } => {
 				// WASM has no bitwise-not; emit `x ^ -1`.
 				self.emit_value(operand);
@@ -1683,6 +1731,22 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::F32DemoteF64 { operand } => {
 				self.emit_value(operand);
 				self.body.push(Instruction::F32DemoteF64);
+			}
+			DataNodeKind::I32ReinterpretF32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I32ReinterpretF32);
+			}
+			DataNodeKind::F32ReinterpretI32 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F32ReinterpretI32);
+			}
+			DataNodeKind::I64ReinterpretF64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::I64ReinterpretF64);
+			}
+			DataNodeKind::F64ReinterpretI64 { operand } => {
+				self.emit_value(operand);
+				self.body.push(Instruction::F64ReinterpretI64);
 			}
 
 			DataNodeKind::Eq { left, right, ty } => {
@@ -1812,7 +1876,8 @@ impl<'f> Scheduler<'f> {
 					.values[..field_index as usize]
 					.iter()
 					.map(|&t| {
-						Self::flatten_mir_type(t, &self.mir.aggregates).len()
+						wasm::flatten_type_to_scalars(t, &self.mir.aggregates)
+							.len()
 					})
 					.sum();
 				let field_local =
@@ -1896,31 +1961,13 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Recursively flatten a MIR type into its constituent scalar types.
-	/// Mirrors `codegen::Builder::flatten_type` but yields `ScalarType`.
-	fn flatten_mir_type(
-		ty: mir::Type,
-		aggregates: &[mir::Aggregate],
-	) -> Vec<ScalarType> {
-		match ty {
-			mir::Type::Unit | mir::Type::Never => vec![],
-			mir::Type::Aggregate { aggregate_index } => aggregates
-				[aggregate_index as usize]
-				.values
-				.iter()
-				.flat_map(|&f| Self::flatten_mir_type(f, aggregates))
-				.collect(),
-			_ => vec![ScalarType::try_from(ty).expect("must be scalar")],
-		}
-	}
-
 	/// Ensure per-*leaf* WASM locals exist for an `Aggregate` node.
 	/// Emits each scalar field expression and spills it to a fresh local; a
 	/// field that is itself an aggregate has no local of its own — it's
 	/// walked into recursively, and its own (already- or newly-computed)
 	/// leaf locals are spliced in directly, so `node_to_aggregate_locals`
 	/// always ends up holding one entry per *leaf* scalar, flattened in the
-	/// same pre-order as `flatten_mir_type`. Records the mapping in
+	/// same pre-order as `wasm::flatten_type_to_scalars`. Records the mapping in
 	/// `node_to_aggregate_locals`.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
@@ -2140,8 +2187,12 @@ impl<'f> Scheduler<'f> {
 		self.body.push(Instruction::LocalGet(selector_local));
 		self.body.push(Instruction::I32Const(min as i32));
 		self.body.push(Instruction::I32Sub);
-		self.body
-			.push(Instruction::BrTable(depths.into_boxed_slice()));
+		let start = self.br_table_depths.len() as u32;
+		self.br_table_depths.extend_from_slice(&depths);
+		self.body.push(Instruction::BrTable {
+			start,
+			len: depths.len() as u32,
+		});
 
 		for (i, case) in cases.iter().enumerate() {
 			self.body.push(Instruction::End); // end $case[i]
@@ -2249,249 +2300,31 @@ impl<'f> Scheduler<'f> {
 			StackResult::Value(node) => {
 				let ty =
 					self.func.data_nodes[node as usize].kind.unwrap_scalar();
-				BlockType::Value(ValueType::from(ty))
+				BlockType::Value(ty)
 			}
 			_ => BlockType::Empty,
 		}
 	}
 }
 
-/// Appends `block` to `blocks` unless it's already present. Each node is
-/// read from only a handful of blocks at most, so a linear scan beats a
-/// `HashSet` here — no hashing, and no allocation at all until a node is
-/// actually read from a second block.
-fn push_unique_block(blocks: &mut Vec<BlockIndex>, block: BlockIndex) {
-	if !blocks.contains(&block) {
-		blocks.push(block);
-	}
-}
-
-// ── Local coalescing ──────────────────────────────────────────────────────────
-
-/// Reuse WASM local slots for spilled values whose live ranges do not overlap.
-///
-/// Each spill slot has a live range `[first_write, last_read]` measured in flat
-/// instruction-list positions. Two slots of the same WASM type can share a slot
-/// number when one range ends strictly before the other begins.
-///
-/// Param slots (indices `0..params_count`) are never remapped — WASM passes
-/// arguments via the first N locals and the ABI cannot be changed.
-fn coalesce_locals(
-	body: &mut [Instruction],
-	locals: &mut Vec<Local>,
-	params_count: usize,
+/// Records that `block` reads a node at (0-indexed) statement position
+/// `stmt_idx` within `block`'s own statement list — or `block.statements
+/// .len()` for a block's own tail value (`Block::result`/a branch's merged
+/// contribution), the position after every real statement. A node may be
+/// read at several positions within the same block; only the earliest is
+/// kept, since every consumer of `consuming_blocks` entries
+/// (`compute_value_placement`'s `own_min`/backward sweep) only ever needs
+/// the earliest one a block's own code depends on. Each node is read from
+/// only a handful of blocks at most, so a linear scan beats a `HashMap`
+/// here — no hashing, and no allocation at all until a node is actually
+/// read from a second block.
+fn record_read(
+	entries: &mut Vec<(BlockIndex, u32)>,
+	block: BlockIndex,
+	stmt_idx: u32,
 ) {
-	let n = locals.len();
-	if n <= params_count {
-		return;
+	match entries.iter_mut().find(|(b, _)| *b == block) {
+		Some((_, idx)) => *idx = (*idx).min(stmt_idx),
+		None => entries.push((block, stmt_idx)),
 	}
-
-	// ── Step 1: compute live ranges ──────────────────────────────────────────
-	let mut first_write = vec![usize::MAX; n];
-	let mut last_read = vec![0usize; n];
-
-	for (i, instr) in body.iter().enumerate() {
-		match instr {
-			Instruction::LocalSet(s) => {
-				let s = *s as usize;
-				if s >= params_count {
-					first_write[s] = first_write[s].min(i);
-				}
-			}
-			Instruction::LocalGet(s) => {
-				let s = *s as usize;
-				if s >= params_count {
-					last_read[s] = last_read[s].max(i);
-				}
-			}
-			Instruction::LocalTee(s) => {
-				let s = *s as usize;
-				if s >= params_count {
-					first_write[s] = first_write[s].min(i);
-					last_read[s] = last_read[s].max(i);
-				}
-			}
-			_ => {}
-		}
-	}
-
-	// A `[first_write, last_read]` window computed from flat textual positions
-	// is only valid for straight-line code: it implicitly assumes every
-	// instruction executes at most once. `Loop` is the one construct that
-	// breaks that assumption — its body is a single textual span that
-	// actually runs many times, via a back-edge (`Br`) to the `Loop`
-	// instruction itself. A slot written once before the loop and read once
-	// inside it gets `last_read` pinned to that first textual occurrence,
-	// even though the same read recurs on every later iteration. If some
-	// other slot's write/read pair falls entirely after that position but
-	// still inside the loop body, the ranges look non-overlapping and the
-	// allocator happily hands them the same physical local — which then
-	// gets clobbered by the second slot's write before the first slot's
-	// value is read again on the next iteration.
-	//
-	// Fix: widen every slot touched anywhere inside a loop so its range
-	// covers that loop's entire `[Loop, End]` span (and transitively every
-	// loop it's nested in, since the same argument applies at each nesting
-	// level). Two slots both live inside the same loop then always overlap
-	// and can never be coalesced together, which is what correctness under
-	// repeated execution requires.
-	let mut frame_starts: Vec<usize> = Vec::new();
-	let mut loop_spans: Vec<(usize, usize)> = Vec::new();
-	for (i, instr) in body.iter().enumerate() {
-		match instr {
-			Instruction::Block { .. } | Instruction::If { .. } => {
-				frame_starts.push(usize::MAX);
-			}
-			Instruction::Loop { .. } => {
-				frame_starts.push(i);
-			}
-			Instruction::End => {
-				if let Some(start) = frame_starts.pop() {
-					if start != usize::MAX {
-						loop_spans.push((start, i));
-					}
-				}
-			}
-			_ => {}
-		}
-	}
-
-	for &(ls, le) in &loop_spans {
-		for instr in &body[ls..=le] {
-			let s = match instr {
-				Instruction::LocalGet(s)
-				| Instruction::LocalSet(s)
-				| Instruction::LocalTee(s) => *s as usize,
-				_ => continue,
-			};
-			if s >= params_count {
-				first_write[s] = first_write[s].min(ls);
-				last_read[s] = last_read[s].max(le);
-			}
-		}
-	}
-
-	// Normalize: dead stores (written, never read) collapse to a point range.
-	// Slots never written (shouldn't normally happen) get range [0, 0].
-	for s in params_count..n {
-		if first_write[s] == usize::MAX {
-			first_write[s] = 0;
-		}
-		if last_read[s] < first_write[s] {
-			last_read[s] = first_write[s];
-		}
-	}
-
-	// ── Step 2: linear scan ──────────────────────────────────────────────────
-	let mut order: Vec<usize> = (params_count..n).collect();
-	order.sort_unstable_by_key(|&s| first_write[s]);
-
-	let ty_idx = |ty: ScalarType| match ty {
-		ScalarType::I32 => 0usize,
-		ScalarType::I64 => 1,
-		ScalarType::F32 => 2,
-		ScalarType::F64 => 3,
-	};
-
-	// Per-type free lists of slot numbers available for reuse.
-	let mut free: [Vec<u32>; 4] =
-		[Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-	// Active intervals: (last_read, new_slot_number, type_index).
-	let mut active: Vec<(usize, u32, usize)> = Vec::new();
-	let mut next_slot = params_count as u32;
-	let mut mapping = vec![0u32; n];
-	for (i, slot) in mapping.iter_mut().enumerate().take(params_count) {
-		*slot = i as u32;
-	}
-
-	for old in order {
-		let start = first_write[old];
-		let end = last_read[old];
-		let ti = ty_idx(locals[old].ty);
-
-		// Expire intervals that ended strictly before this one starts.
-		let mut i = 0;
-		while i < active.len() {
-			if active[i].0 < start {
-				let (_, freed, freed_ti) = active.swap_remove(i);
-				free[freed_ti].push(freed);
-			} else {
-				i += 1;
-			}
-		}
-
-		let new_slot = free[ti].pop().unwrap_or_else(|| {
-			let s = next_slot;
-			next_slot += 1;
-			s
-		});
-
-		mapping[old] = new_slot;
-		active.push((end, new_slot, ti));
-	}
-
-	// ── Step 3: rebuild locals and rewrite instructions ──────────────────────
-	let new_spill_count = (next_slot - params_count as u32) as usize;
-	let mut spill_types = vec![ScalarType::I32; new_spill_count];
-	for old in params_count..n {
-		let new = mapping[old] as usize;
-		if new >= params_count {
-			spill_types[new - params_count] = locals[old].ty;
-		}
-	}
-	locals.truncate(params_count);
-	locals.extend(spill_types.into_iter().map(|ty| Local { ty }));
-
-	for instr in body.iter_mut() {
-		match instr {
-			Instruction::LocalGet(s)
-			| Instruction::LocalSet(s)
-			| Instruction::LocalTee(s) => {
-				*s = mapping[*s as usize];
-			}
-			_ => {}
-		}
-	}
-}
-
-/// Replace `LocalSet(n), LocalGet(n)` pairs with a single `LocalTee(n)`,
-/// and eliminate `LocalTee(n), LocalSet(n)` by dropping the redundant tee.
-///
-/// `local.tee` writes the top-of-stack value to the local *and* leaves a copy
-/// on the stack, which is exactly what set+get does in two instructions.
-/// Conversely, `local.tee(n)` immediately followed by `local.set(n)` writes
-/// the same value to the local twice — the tee is redundant; a plain set suffices.
-fn peephole_local_tee(body: &mut Vec<Instruction>) {
-	let mut out = Vec::with_capacity(body.len());
-	let mut i = 0;
-	while i < body.len() {
-		if let Instruction::LocalSet(s) = body[i] {
-			// set(N), get(N), set(N) → set(N): the middle get feeds back into a set
-			// of the same slot, so both the tee and the redundant write collapse.
-			if i + 2 < body.len() {
-				if let (Instruction::LocalGet(g), Instruction::LocalSet(s2)) =
-					(&body[i + 1], &body[i + 2])
-				{
-					if *g == s && *s2 == s {
-						out.push(Instruction::LocalSet(s));
-						i += 3;
-						continue;
-					}
-				}
-			}
-			// set(N), get(N) → tee(N)
-			if i + 1 < body.len() {
-				if let Instruction::LocalGet(g) = body[i + 1] {
-					if s == g {
-						out.push(Instruction::LocalTee(s));
-						i += 2;
-						continue;
-					}
-				}
-			}
-		}
-		out.push(body[i].clone());
-		i += 1;
-	}
-	*body = out;
 }

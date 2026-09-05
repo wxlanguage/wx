@@ -1,30 +1,29 @@
 #!/bin/bash
-# Compile .wx file to .wasm and optimize with wasm-opt
+# Build a wx project to .wasm and optimize with wasm-opt
 
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 <input.wx> [optimization-level]"
+    echo "Usage: $0 <project-dir> [optimization-level]"
     echo "  optimization-level: -O0, -O1, -O2, -O3, -O4, -Os, -Oz (default: -O3)"
     exit 1
 fi
 
-INPUT_FILE="$1"
+PROJECT_DIR="$1"
 OPT_LEVEL="${2:--O3}"
 
-if [ ! -f "$INPUT_FILE" ]; then
-    echo "Error: File '$INPUT_FILE' not found"
+if [ ! -d "$PROJECT_DIR" ]; then
+    echo "Error: directory '$PROJECT_DIR' not found"
     exit 1
 fi
 
-# Extract filename without extension
-BASENAME=$(basename "$INPUT_FILE" .wx)
+BASENAME=$(basename "$PROJECT_DIR")
 OUTPUT_WASM="${BASENAME}.wasm"
 OPTIMIZED_WASM="${BASENAME}.optimized.wasm"
 
-echo "=== Compiling $INPUT_FILE ==="
-./target/release/wx compile "$INPUT_FILE"
+echo "=== Building $PROJECT_DIR ==="
+./target/release/wx build "$PROJECT_DIR" -o "$OUTPUT_WASM"
 
 if [ $? -ne 0 ]; then
-    echo "Compilation failed!"
+    echo "Build failed!"
     exit 1
 fi
 

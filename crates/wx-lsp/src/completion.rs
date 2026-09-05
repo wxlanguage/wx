@@ -6,9 +6,10 @@ use tower_lsp_server::ls_types::{
 };
 use wx_compiler::ast::StringInterner;
 use wx_compiler::tir::{
-	ImplEntry, ImplTarget, NamespaceIndex, TIR, TypeFormatter,
+	ImplEntry, ImplTarget, ModuleDeclarationKind, NamespaceIndex, TIR,
+	TypeFormatter,
 };
-use wx_compiler::vfs::FileId;
+use wx_compiler::vfs::{FileId, PackageGraph};
 
 use crate::symbol_index::{ImplRef, SymbolIndex, SymbolKind};
 
@@ -25,10 +26,28 @@ pub enum CompletionContext {
 	PathAccess { lhs_end: usize },
 	/// Cursor is in a type annotation position (after `:` that is not `::`).
 	TypeAnnotation,
+	/// Cursor sits directly against a colon run that cannot open a path: a
+	/// lone `:`, or three or more. Nothing is offered rather than guessing
+	/// which of the two a half-typed `::` will become.
+	Unavailable,
 }
 
 /// Classifies the completion trigger context at `offset` bytes into `source`.
 pub fn classify_context(source: &str, offset: usize) -> CompletionContext {
+	// Counted on the raw text, before any trimming: `x:` and `x: ` differ
+	// here, and must — only the first has the cursor pressed against the
+	// colon, mid-token. A run of exactly two is the `::` this is all for; a
+	// run of one is either a half-typed `::` or an annotation whose type
+	// hasn't been started, and neither has anything to offer yet.
+	let trailing_colons = source[..offset]
+		.bytes()
+		.rev()
+		.take_while(|&byte| byte == b':')
+		.count();
+	if trailing_colons == 1 || trailing_colons >= 3 {
+		return CompletionContext::Unavailable;
+	}
+
 	// Strip the identifier prefix currently being typed.
 	let prefix_start = source[..offset]
 		.bytes()
@@ -72,9 +91,10 @@ pub fn find_enclosing_function(
 	file_id: FileId,
 	cursor_offset: u32,
 ) -> Option<usize> {
-	tir.functions.iter().position(|f| {
+	tir.items.functions.iter().position(|f| {
 		f.file_id == file_id
-			&& f.body.as_ref().is_some_and(|body| {
+			&& f.body.is_some_and(|body_idx| {
+				let body = &tir.items.bodies[usize::from(body_idx)];
 				let span = body.stack.scopes[0].span;
 				span.start <= cursor_offset && span.end > cursor_offset
 			})
@@ -87,27 +107,34 @@ pub fn local_completion_items(
 	tir: &TIR,
 	func_index: usize,
 	interner: &StringInterner,
+	packages: &[PackageGraph],
 	cursor_offset: u32,
 	prefix: &str,
 ) -> Vec<CompletionItem> {
-	let formatter = TypeFormatter::new(tir, interner);
-	let function = &tir.functions[func_index];
-	let body = match &function.body {
-		Some(b) => b,
+	let function = &tir.items.functions[func_index];
+	// Names render as the function's own package sees them.
+	let formatter = TypeFormatter::new(
+		&tir.types,
+		&tir.items,
+		&tir.modules,
+		interner,
+		packages,
+		tir.modules.namespaces[usize::from(function.namespace)].package,
+	);
+	let body = match function.body {
+		Some(idx) => &tir.items.bodies[usize::from(idx)],
 		None => return vec![],
 	};
 	let num_params = function.params.len();
 
 	let innermost_idx = body
 		.stack
-		.scopes
-		.iter()
-		.enumerate()
+		.scopes_with_indices()
 		.filter(|(_, s)| {
 			s.span.start <= cursor_offset && s.span.end > cursor_offset
 		})
 		.min_by_key(|(_, s)| s.span.end - s.span.start)
-		.map(|(i, _)| i as u32);
+		.map(|(index, _)| index);
 
 	let innermost_idx = match innermost_idx {
 		Some(i) => i,
@@ -118,9 +145,9 @@ pub fn local_completion_items(
 	let mut current = Some(innermost_idx);
 
 	while let Some(scope_idx) = current {
-		let scope = &body.stack.scopes[scope_idx as usize];
+		let scope = &body.stack.scopes[usize::from(scope_idx)];
 		let is_innermost = scope_idx == innermost_idx;
-		let is_root = scope_idx == 0;
+		let is_root = u32::from(scope_idx) == 0;
 
 		for (local_idx, local) in scope.locals.iter().enumerate() {
 			let is_param = is_root && local_idx < num_params;
@@ -160,11 +187,31 @@ pub fn local_completion_items(
 
 /// Namespace of the module containing `file_id`, for completion requests
 /// that fall outside any function body (no enclosing-function namespace to
-/// fall back on). Only inline `module foo { }` blocks are missed here —
+/// fall back on). Only inline `mod foo { }` blocks are missed here —
 /// those share the file of their enclosing function, which already carries
 /// the right namespace.
+/// TODO: both halves are linear scans. The right fix is `File::package`
+/// (`vfs::Files` gaining a `PackageId` per file), which turns this into a
+/// `package_namespaces` lookup plus one comparison — blocked only on
+/// `cmd_format`, the one caller that still builds a bare `Files` with no
+/// package.
 fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
-	tir.module_decls
+	// A package's entry file has no `mod` declaration of its own — its
+	// scope is the package's root namespace, which records that file id.
+	// Checked first because a compilation holds only a handful of packages,
+	// while `module_decls` grows with every file in it.
+	for &namespace_idx in tir.modules.package_namespaces.values() {
+		if matches!(
+			tir.modules.namespaces[usize::from(namespace_idx)].declaration,
+			ModuleDeclarationKind::Package(package_file)
+				if package_file == file_id
+		) {
+			return Some(namespace_idx);
+		}
+	}
+
+	tir.modules
+		.module_decls
 		.iter()
 		.find(|decl| decl.own_file_id == Some(file_id))
 		.map(|decl| decl.namespace_idx)
@@ -177,26 +224,20 @@ fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
 /// every reachable namespace instead of stopping at the first name match.
 pub fn visible_namespaces(
 	tir: &TIR,
-	start: Option<NamespaceIndex>,
-) -> HashSet<Option<NamespaceIndex>> {
+	start: NamespaceIndex,
+) -> HashSet<NamespaceIndex> {
 	let mut visible = HashSet::new();
-	let mut current = start;
-	loop {
-		if !visible.insert(current) {
+	let mut current = Some(start);
+	// Running out of parents means we've walked off the top of the package.
+	// Its own root namespace was visited on the way, so its wildcard imports
+	// are already in `visible` — there's no separate root scope to splice in.
+	while let Some(idx) = current {
+		if !visible.insert(idx) {
 			break;
 		}
-		match current {
-			Some(idx) => {
-				let ns = &tir.namespaces[idx as usize];
-				visible.extend(ns.wildcard_imports.iter().map(|&i| Some(i)));
-				current = ns.parent;
-			}
-			None => {
-				visible
-					.extend(tir.root_wildcard_imports.iter().map(|&i| Some(i)));
-				break;
-			}
-		}
+		let ns = &tir.modules.namespaces[usize::from(idx)];
+		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
+		current = ns.parent;
 	}
 	visible
 }
@@ -213,8 +254,8 @@ fn global_definition_completion_item(
 ) -> Option<CompletionItem> {
 	Some(match kind {
 		SymbolKind::Function(def_id) => {
-			let fi = tir.function_index(*def_id)? as usize;
-			let func = &tir.functions[fi];
+			let fi = usize::from(tir.items.function_index(*def_id)?);
+			let func = &tir.items.functions[fi];
 			let (insert_text, insert_text_format) = if func.params.is_empty() {
 				(format!("{}()", name), InsertTextFormat::PLAIN_TEXT)
 			} else {
@@ -284,16 +325,16 @@ pub fn global_completion_items(
 	interner: &StringInterner,
 	symbol_index: &SymbolIndex,
 	prefix: &str,
-	visible_from: &HashSet<Option<NamespaceIndex>>,
+	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter_map(|def| {
@@ -342,15 +383,15 @@ pub fn type_completion_items(
 	interner: &StringInterner,
 	symbol_index: &SymbolIndex,
 	prefix: &str,
-	visible_from: &HashSet<Option<NamespaceIndex>>,
+	visible_from: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
-	let lower = symbol_index.global_definitions.partition_point(|def| {
-		interner.resolve(def.name).unwrap_or("") < prefix
-	});
+	let lower = symbol_index
+		.global_definitions
+		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
 	symbol_index.global_definitions[lower..]
 		.iter()
 		.take_while(|def| {
-			interner.resolve(def.name).unwrap_or("").starts_with(prefix)
+			interner.resolve(def.name).unwrap().starts_with(prefix)
 		})
 		.filter(|def| visible_from.contains(&def.namespace))
 		.filter(|def| is_type_like(&def.info.kind))
@@ -381,7 +422,7 @@ fn member_completion_items(
 			}
 			match entry {
 				ImplEntry::Method(fi) => {
-					let func = tir.functions.get(*fi as usize)?;
+					let func = tir.items.functions.get(usize::from(*fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.len() <= 1 {
 						format!("{name}()")
@@ -401,7 +442,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocFunction(fi) => {
-					let func = tir.functions.get(*fi as usize)?;
+					let func = tir.items.functions.get(usize::from(*fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.is_empty() {
 						format!("{name}()")
@@ -421,7 +462,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocConstant(ci) => {
-					let constant = tir.constants.get(*ci as usize)?;
+					let constant = tir.items.constants.get(usize::from(*ci))?;
 					constant.pub_span?;
 					Some(CompletionItem {
 						label: name.to_string(),
@@ -457,12 +498,16 @@ fn impl_member_completion_items(
 		.flatten()
 		.flat_map(|r| {
 			let members = match r {
-				ImplRef::Inherent(idx) => {
-					tir.inherent_impls.get(*idx as usize).map(|b| &b.members)
-				}
-				ImplRef::Trait(idx) => {
-					tir.trait_impls.get(*idx as usize).map(|ti| &ti.members)
-				}
+				ImplRef::Inherent(idx) => tir
+					.items
+					.inherent_impls
+					.get(usize::from(*idx))
+					.map(|b| &b.members),
+				ImplRef::Trait(idx) => tir
+					.items
+					.trait_impls
+					.get(usize::from(*idx))
+					.map(|ti| &ti.members),
 			};
 			members
 				.into_iter()
@@ -482,14 +527,14 @@ fn resolve_bare_name(
 	symbol_index: &SymbolIndex,
 	interner: &StringInterner,
 	name: &str,
-	visible: &HashSet<Option<NamespaceIndex>>,
+	visible: &HashSet<NamespaceIndex>,
 ) -> Option<SymbolKind> {
 	let lower = symbol_index
 		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap_or("") < name);
+		.partition_point(|def| interner.resolve(def.name).unwrap() < name);
 	symbol_index.global_definitions[lower..]
 		.iter()
-		.take_while(|def| interner.resolve(def.name).unwrap_or("") == name)
+		.take_while(|def| interner.resolve(def.name).unwrap() == name)
 		.find(|def| visible.contains(&def.namespace))
 		.map(|def| def.info.kind)
 }
@@ -506,7 +551,7 @@ fn path_completion_items(
 	source: &str,
 	lhs_end: usize,
 	prefix: &str,
-	visible: &HashSet<Option<NamespaceIndex>>,
+	visible: &HashSet<NamespaceIndex>,
 ) -> Vec<CompletionItem> {
 	let lhs_text = &source[..lhs_end];
 	let trimmed_end = lhs_text
@@ -537,7 +582,7 @@ fn path_completion_items(
 		SymbolKind::Namespace(ns_idx) => symbol_index
 			.global_definitions
 			.iter()
-			.filter(|def| def.namespace == Some(ns_idx))
+			.filter(|def| def.namespace == ns_idx)
 			.filter_map(|def| {
 				let name = interner.resolve(def.name)?;
 				if !name.starts_with(prefix) {
@@ -552,8 +597,8 @@ fn path_completion_items(
 			.collect(),
 		SymbolKind::Enum(id) => {
 			let mut items = Vec::new();
-			if let Some(ei) = tir.enum_index(id) {
-				let enum_ = &tir.enums[ei as usize];
+			if let Some(ei) = tir.items.enum_index(id) {
+				let enum_ = &tir.items.enums[usize::from(ei)];
 				items.extend(enum_.variants.iter().filter_map(|v| {
 					let name = interner.resolve(v.name.inner)?;
 					if !name.starts_with(prefix) {
@@ -566,7 +611,7 @@ fn path_completion_items(
 					})
 				}));
 			}
-			if let Some(idx) = tir.enum_index(id) {
+			if let Some(idx) = tir.items.enum_index(id) {
 				items.extend(impl_member_completion_items(
 					tir,
 					interner,
@@ -578,7 +623,7 @@ fn path_completion_items(
 			items
 		}
 		SymbolKind::Struct(id) => {
-			tir.struct_index(id).map_or_else(Vec::new, |idx| {
+			tir.items.struct_index(id).map_or_else(Vec::new, |idx| {
 				impl_member_completion_items(
 					tir,
 					interner,
@@ -589,11 +634,11 @@ fn path_completion_items(
 			})
 		}
 		SymbolKind::Trait(id) => {
-			tir.trait_index(id).map_or_else(Vec::new, |idx| {
+			tir.items.trait_index(id).map_or_else(Vec::new, |idx| {
 				member_completion_items(
 					tir,
 					interner,
-					&tir.traits[idx as usize].entries,
+					&tir.items.traits[usize::from(idx)].entries,
 					prefix,
 				)
 			})
@@ -605,6 +650,7 @@ fn path_completion_items(
 pub fn completion_items(
 	tir: &TIR,
 	interner: &StringInterner,
+	packages: &[PackageGraph],
 	symbol_index: &SymbolIndex,
 	file_id: FileId,
 	source: &str,
@@ -618,8 +664,13 @@ pub fn completion_items(
 	let cursor_offset = offset as u32;
 	let func_index = find_enclosing_function(tir, file_id, cursor_offset);
 	let current_namespace = match func_index {
-		Some(fi) => tir.functions[fi].namespace,
+		Some(fi) => Some(tir.items.functions[fi].namespace),
 		None => file_namespace(tir, file_id),
+	};
+	// No namespace means the file isn't part of the compilation, so nothing
+	// is in scope to complete.
+	let Some(current_namespace) = current_namespace else {
+		return vec![];
 	};
 	let visible = visible_namespaces(tir, current_namespace);
 
@@ -630,6 +681,7 @@ pub fn completion_items(
 					tir,
 					func_index,
 					interner,
+					packages,
 					cursor_offset,
 					prefix,
 				),
@@ -661,6 +713,7 @@ pub fn completion_items(
 		CompletionContext::TypeAnnotation => {
 			type_completion_items(tir, interner, symbol_index, prefix, &visible)
 		}
+		CompletionContext::Unavailable => vec![],
 	}
 }
 
@@ -745,11 +798,41 @@ mod tests {
 		);
 	}
 
+	/// A colon the cursor is pressed against offers nothing — matching
+	/// rust-analyzer, which bails when the token to the immediate left is a
+	/// lone `:` rather than guessing what it will become.
 	#[test]
-	fn single_colon_is_type_annotation() {
+	fn cursor_against_a_lone_colon_is_unavailable() {
 		assert_eq!(
-			classify_context("x:", 2),
+			classify_context("local x:", 8),
+			CompletionContext::Unavailable,
+			"a half-typed annotation has no type to complete yet"
+		);
+		assert_eq!(
+			classify_context("use std:", 8),
+			CompletionContext::Unavailable,
+			"the first colon of a `::` must not offer annotation types"
+		);
+		assert_eq!(
+			classify_context("use std:::", 10),
+			CompletionContext::Unavailable,
+			"three colons cannot open a path"
+		);
+	}
+
+	/// The space is the whole difference: it moves the cursor off the colon,
+	/// so the annotation is now a position to complete rather than a token
+	/// mid-edit.
+	#[test]
+	fn a_space_after_the_colon_restores_type_completions() {
+		assert_eq!(
+			classify_context("local x: ", 9),
 			CompletionContext::TypeAnnotation
+		);
+		assert_eq!(
+			classify_context("local x: i", 10),
+			CompletionContext::TypeAnnotation,
+			"typing the type's first letter must keep completing it"
 		);
 	}
 
@@ -772,15 +855,13 @@ mod tests {
 
 	#[test]
 	fn single_colon_not_confused_with_double_colon() {
-		// Sanity: "::" is PathAccess, single ":" is TypeAnnotation
+		// Sanity: a completed `::` opens a path; one colon is still
+		// mid-token and opens nothing.
 		assert_eq!(
 			classify_context("Foo::", 5),
 			CompletionContext::PathAccess { lhs_end: 3 }
 		);
-		assert_eq!(
-			classify_context("a:", 2),
-			CompletionContext::TypeAnnotation
-		);
+		assert_eq!(classify_context("a:", 2), CompletionContext::Unavailable);
 	}
 
 	#[test]

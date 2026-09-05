@@ -2,36 +2,8 @@ use std::collections::HashMap;
 
 use leb128fmt;
 
+use crate::wasm::{self, ScalarType};
 use crate::{ast, mir};
-
-#[derive(Clone, Copy, PartialEq, Hash, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ValueType {
-	I32,
-	I64,
-	F32,
-	F64,
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum BlockResult {
-	Empty,
-	SingleValue(ValueType),
-	MultiValue(SignatureIndex),
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct LocalIndex(pub u32);
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Local {
-	ty: ValueType,
-}
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct FuncIndex(pub u32);
@@ -44,146 +16,17 @@ pub struct GlobalIndex(pub u32);
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FunctionSignature {
 	pub param_count: usize,
-	pub param_results: Box<[ValueType]>,
+	pub param_results: Box<[ScalarType]>,
 }
 
 impl FunctionSignature {
-	pub fn params(&self) -> &[ValueType] {
+	pub fn params(&self) -> &[ScalarType] {
 		self.param_results.get(..self.param_count).unwrap_or(&[])
 	}
 
-	pub fn results(&self) -> &[ValueType] {
+	pub fn results(&self) -> &[ScalarType] {
 		self.param_results.get(self.param_count..).unwrap_or(&[])
 	}
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum Expression {
-	Nop,
-	I32Const {
-		value: i32,
-	},
-	I64Const {
-		value: i64,
-	},
-	F32Const {
-		value: f32,
-	},
-	F64Const {
-		value: f64,
-	},
-	LocalGet {
-		local_index: LocalIndex,
-	},
-	LocalSet {
-		local_index: LocalIndex,
-	},
-	GlobalGet {
-		global_index: GlobalIndex,
-	},
-	GlobalSet {
-		global: GlobalIndex,
-	},
-	Return,
-	Block {
-		expressions: Box<[Expression]>,
-		result: BlockResult,
-	},
-	Break {
-		depth: u32,
-	},
-	Unreachable,
-	Loop {
-		expressions: Box<[Expression]>,
-		result: BlockResult,
-	},
-	IfElse {
-		result: BlockResult,
-		then_branch: Box<Expression>,
-		else_branch: Option<Box<Expression>>,
-	},
-	Drop,
-	Call {
-		function: FuncIndex,
-	},
-	CallIndirect {
-		table_index: TableIndex,
-		type_index: SignatureIndex,
-	},
-	I32Add,
-	I32Sub,
-	I32Mul,
-	I32DivS,
-	I32DivU,
-	I32RemS,
-	I32RemU,
-	I32Eq,
-	I32Ne,
-	I32And,
-	I32Or,
-	I32Xor,
-	I32Eqz,
-	I32Shl,
-	I32ShrS,
-	I32ShrU,
-	I32LtS,
-	I32LtU,
-	I32GtS,
-	I32GtU,
-	I32LeS,
-	I32LeU,
-	I32GeS,
-	I32GeU,
-	I64Add,
-	I64Sub,
-	I64Mul,
-	I64DivS,
-	I64DivU,
-	I64RemS,
-	I64RemU,
-	I64Eq,
-	I64Eqz,
-	I64Ne,
-	I64And,
-	I64Or,
-	I64Xor,
-	I64Shl,
-	I64ShrS,
-	I64ShrU,
-	I64LtS,
-	I64LtU,
-	I64GtS,
-	I64GtU,
-	I64LeS,
-	I64LeU,
-	I64GeS,
-	I64GeU,
-	F32Add,
-	F32Sub,
-	F32Mul,
-	F64Add,
-	F64Sub,
-	F64Mul,
-	F32Eq,
-	F64Eq,
-	F32Ne,
-	F64Ne,
-	F32Lt,
-	F64Lt,
-	F32Gt,
-	F64Gt,
-	F32Le,
-	F64Le,
-	F32Ge,
-	F64Ge,
-	F32Div,
-	F64Div,
-	F32Neg,
-	F64Neg,
-	F32Trunc,
-	F64Trunc,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -226,7 +69,7 @@ pub struct ExportSection {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionBody {
-	locals: Box<[Local]>,
+	locals: Box<[wasm::Local]>,
 	expressions: Box<[u8]>,
 }
 
@@ -284,9 +127,11 @@ pub enum Mutability {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 struct Global {
-	ty: ValueType,
+	ty: ScalarType,
 	mutability: Mutability,
-	value: Expression,
+	/// Only the four `*Const` variants of `wasm::Instruction` are valid WASM
+	/// global init expressions; anything else is a construction bug upstream.
+	value: wasm::Instruction,
 }
 
 #[derive(Clone)]
@@ -296,7 +141,7 @@ pub enum ImportDesc {
 		signature_index: SignatureIndex,
 	},
 	Global {
-		ty: ValueType,
+		ty: ScalarType,
 		mutability: Mutability,
 	},
 	Memory {
@@ -365,50 +210,7 @@ pub struct Builder {
 	signatures: HashMap<FunctionSignature, SignatureIndex>,
 }
 
-impl TryFrom<mir::Type> for ValueType {
-	type Error = ();
-
-	fn try_from(value: mir::Type) -> Result<Self, Self::Error> {
-		match value {
-			mir::Type::Bool
-			| mir::Type::I8
-			| mir::Type::U8
-			| mir::Type::I16
-			| mir::Type::U16
-			| mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Function { .. } => Ok(ValueType::I32),
-			mir::Type::I64 | mir::Type::U64 => Ok(ValueType::I64),
-			mir::Type::Pointer { kind, .. } => match kind {
-				mir::MemoryKind::Memory32 => Ok(ValueType::I32),
-				mir::MemoryKind::Memory64 => Ok(ValueType::I64),
-			},
-			mir::Type::F32 => Ok(ValueType::F32),
-			mir::Type::F64 => Ok(ValueType::F64),
-			_ => unreachable!(),
-		}
-	}
-}
-
 impl Builder {
-	/// Recursively expand a MIR type into its flat wasm `ValueType`s.
-	/// Unit/Never produce zero slots; Aggregate recurses into its fields.
-	fn flatten_type(
-		ty: mir::Type,
-		aggregates: &[mir::Aggregate],
-	) -> Vec<ValueType> {
-		match ty {
-			mir::Type::Unit | mir::Type::Never => vec![],
-			mir::Type::Aggregate { aggregate_index } => aggregates
-				[aggregate_index as usize]
-				.values
-				.iter()
-				.flat_map(|&f| Self::flatten_type(f, aggregates))
-				.collect(),
-			t => vec![ValueType::try_from(t).unwrap()],
-		}
-	}
-
 	/// Intern a function signature built from a MIR signature + the aggregate
 	/// pool, correctly flattening any aggregate params/results into
 	/// individual wasm types.
@@ -419,10 +221,12 @@ impl Builder {
 	) -> SignatureIndex {
 		let mut param_results = Vec::new();
 		for &param in sig.params() {
-			param_results.extend(Self::flatten_type(param, aggregates));
+			param_results
+				.extend(wasm::flatten_type_to_scalars(param, aggregates));
 		}
 		let param_count = param_results.len();
-		param_results.extend(Self::flatten_type(sig.result(), aggregates));
+		param_results
+			.extend(wasm::flatten_type_to_scalars(sig.result(), aggregates));
 		let signature = FunctionSignature {
 			param_count,
 			param_results: param_results.into_boxed_slice(),
@@ -523,7 +327,7 @@ impl Builder {
 							module: import_module.name.clone(),
 							name: interner.resolve(*name).unwrap().to_string(),
 							desc: ImportDesc::Global {
-								ty: ValueType::I32,
+								ty: ScalarType::I32,
 								mutability: Mutability::Immutable,
 							},
 						});
@@ -605,24 +409,24 @@ impl Builder {
 				.map(|global| {
 					let init_value = match (
 						global.const_init,
-						ValueType::try_from(global.ty).unwrap(),
+						ScalarType::try_from(global.ty).unwrap(),
 					) {
-						(mir::ConstInit::Int(v), ValueType::I32) => {
-							Expression::I32Const { value: v as i32 }
+						(mir::ConstInit::Int(v), ScalarType::I32) => {
+							wasm::Instruction::I32Const(v as i32)
 						}
-						(mir::ConstInit::Int(v), ValueType::I64) => {
-							Expression::I64Const { value: v }
+						(mir::ConstInit::Int(v), ScalarType::I64) => {
+							wasm::Instruction::I64Const(v)
 						}
-						(mir::ConstInit::Float(v), ValueType::F32) => {
-							Expression::F32Const { value: v as f32 }
+						(mir::ConstInit::Float(v), ScalarType::F32) => {
+							wasm::Instruction::F32Const(v as f32)
 						}
-						(mir::ConstInit::Float(v), ValueType::F64) => {
-							Expression::F64Const { value: v }
+						(mir::ConstInit::Float(v), ScalarType::F64) => {
+							wasm::Instruction::F64Const(v)
 						}
 						_ => unreachable!(),
 					};
 					Global {
-						ty: ValueType::try_from(global.ty).unwrap(),
+						ty: ScalarType::try_from(global.ty).unwrap(),
 						mutability: match global.mutability {
 							mir::Mutability::Mutable => Mutability::Mutable,
 							mir::Mutability::Immutable => Mutability::Immutable,
@@ -735,27 +539,27 @@ impl Builder {
 		})
 	}
 
-	/// Encode a [`scheduler::ScheduledFunction`] into a [`FunctionBody`].
+	/// Encode a [`wasm::Function`] into a [`FunctionBody`].
 	///
 	/// All index resolution (function WASM indices, global WASM indices, string
 	/// byte offsets, data section end) is performed here using the maps and
 	/// pools already built on `self`.
 	fn encode_scheduled(
 		&mut self,
-		scheduled: &crate::opt::scheduler::ScheduledFunction,
+		scheduled: &wasm::Function,
 		mir: &mir::MIR,
 	) -> FunctionBody {
-		let locals: Box<[Local]> = scheduled
-			.locals
-			.iter()
-			.map(|l| Local {
-				ty: ValueType::from(l.ty),
-			})
-			.collect();
+		let locals: Box<[wasm::Local]> =
+			scheduled.locals.iter().copied().collect();
 
 		let mut sink = Vec::new();
 		for instr in scheduled.body.iter().cloned() {
-			self.encode_scheduled_instr(instr, mir, &mut sink);
+			self.encode_scheduled_instr(
+				instr,
+				mir,
+				&scheduled.br_table_depths,
+				&mut sink,
+			);
 		}
 
 		FunctionBody {
@@ -766,11 +570,12 @@ impl Builder {
 
 	fn encode_scheduled_instr(
 		&mut self,
-		instr: crate::opt::scheduler::Instruction,
+		instr: wasm::Instruction,
 		mir: &mir::MIR,
+		br_table_depths: &[u32],
 		sink: &mut Vec<u8>,
 	) {
-		use crate::opt::scheduler::Instruction as SI;
+		use wasm::Instruction as SI;
 		match instr {
 			SI::I32Const(v) => {
 				sink.push(Instruction::I32Const as u8);
@@ -869,6 +674,11 @@ impl Builder {
 			SI::F32Abs => sink.push(Instruction::F32Abs as u8),
 			SI::F32Floor => sink.push(Instruction::F32Floor as u8),
 			SI::F32Ceil => sink.push(Instruction::F32Ceil as u8),
+			SI::F32Trunc => sink.push(Instruction::F32Trunc as u8),
+			SI::F32Nearest => sink.push(Instruction::F32Nearest as u8),
+			SI::F32Min => sink.push(Instruction::F32Min as u8),
+			SI::F32Max => sink.push(Instruction::F32Max as u8),
+			SI::F32Copysign => sink.push(Instruction::F32Copysign as u8),
 			SI::F64Add => sink.push(Instruction::F64Add as u8),
 			SI::F64Sub => sink.push(Instruction::F64Sub as u8),
 			SI::F64Mul => sink.push(Instruction::F64Mul as u8),
@@ -878,6 +688,11 @@ impl Builder {
 			SI::F64Abs => sink.push(Instruction::F64Abs as u8),
 			SI::F64Floor => sink.push(Instruction::F64Floor as u8),
 			SI::F64Ceil => sink.push(Instruction::F64Ceil as u8),
+			SI::F64Trunc => sink.push(Instruction::F64Trunc as u8),
+			SI::F64Nearest => sink.push(Instruction::F64Nearest as u8),
+			SI::F64Min => sink.push(Instruction::F64Min as u8),
+			SI::F64Max => sink.push(Instruction::F64Max as u8),
+			SI::F64Copysign => sink.push(Instruction::F64Copysign as u8),
 			SI::F32Eq => sink.push(Instruction::F32Eq as u8),
 			SI::F32Ne => sink.push(Instruction::F32Ne as u8),
 			SI::F32Lt => sink.push(Instruction::F32Lt as u8),
@@ -912,13 +727,16 @@ impl Builder {
 				sink.push(Instruction::BrIf as u8);
 				depth.encode(sink);
 			}
-			SI::BrTable(depths) => {
+			SI::BrTable { start, len } => {
 				sink.push(Instruction::BrTable as u8);
 				// WASM's `br_table` encodes as `vec(labelidx) labelidx` — a
 				// table of length `depths.len() - 1` followed by the
 				// default depth as a separate trailing immediate. The
-				// scheduler folds both into one slice (its trailing element
-				// *is* the default) since both stages need the same split.
+				// scheduler folds both into one `[start, start+len)` range
+				// into `br_table_depths` (its trailing element *is* the
+				// default) since both stages need the same split.
+				let depths =
+					&br_table_depths[start as usize..(start + len) as usize];
 				let (default_depth, table) =
 					depths.split_last().expect("BrTable is never empty");
 				(table.len() as u32).encode(sink);
@@ -1095,6 +913,18 @@ impl Builder {
 			SI::I64TruncF64U => sink.push(Instruction::I64TruncF64U as u8),
 			SI::F64PromoteF32 => sink.push(Instruction::F64PromoteF32 as u8),
 			SI::F32DemoteF64 => sink.push(Instruction::F32DemoteF64 as u8),
+			SI::I32ReinterpretF32 => {
+				sink.push(Instruction::I32ReinterpretF32 as u8)
+			}
+			SI::F32ReinterpretI32 => {
+				sink.push(Instruction::F32ReinterpretI32 as u8)
+			}
+			SI::I64ReinterpretF64 => {
+				sink.push(Instruction::I64ReinterpretF64 as u8)
+			}
+			SI::F64ReinterpretI64 => {
+				sink.push(Instruction::F64ReinterpretI64 as u8)
+			}
 			SI::Nop => sink.push(Instruction::Nop as u8),
 			SI::FunctionPointer(id) => {
 				let wasm_idx = self.func_wasm_index[&id];
@@ -1132,14 +962,10 @@ impl Builder {
 		}
 	}
 
-	fn encode_block_type(
-		ty: crate::opt::scheduler::BlockType,
-		sink: &mut Vec<u8>,
-	) {
-		use crate::opt::scheduler::BlockType;
+	fn encode_block_type(ty: wasm::BlockType, sink: &mut Vec<u8>) {
 		match ty {
-			BlockType::Empty => sink.push(0x40),
-			BlockType::Value(vt) => vt.encode(sink),
+			wasm::BlockType::Empty => sink.push(0x40),
+			wasm::BlockType::Value(vt) => vt.encode(sink),
 		}
 	}
 }
@@ -1441,28 +1267,16 @@ impl Encode for u32 {
 	}
 }
 
-impl Encode for ValueType {
+impl Encode for ScalarType {
 	fn encode(&self, sink: &mut Vec<u8>) {
 		let opcode = match self {
-			ValueType::I32 => 0x7F,
-			ValueType::I64 => 0x7E,
-			ValueType::F32 => 0x7D,
-			ValueType::F64 => 0x7C,
+			ScalarType::I32 => 0x7F,
+			ScalarType::I64 => 0x7E,
+			ScalarType::F32 => 0x7D,
+			ScalarType::F64 => 0x7C,
 		};
 
 		sink.push(opcode);
-	}
-}
-
-impl Encode for BlockResult {
-	fn encode(&self, sink: &mut Vec<u8>) {
-		match self {
-			BlockResult::Empty => sink.push(0x40),
-			BlockResult::SingleValue(ty) => ty.encode(sink),
-			// Multi-value block types are encoded as a type-section index (s33).
-			// Type indices are always small positive integers, so s33 == u32 LEB128.
-			BlockResult::MultiValue(idx) => idx.0.encode(sink),
-		}
 	}
 }
 
@@ -1616,19 +1430,19 @@ impl Encode for Global {
 		});
 
 		match self.value {
-			Expression::I32Const { value } => {
+			wasm::Instruction::I32Const(value) => {
 				sink.push(Instruction::I32Const as u8);
 				value.encode(sink);
 			}
-			Expression::F32Const { value } => {
+			wasm::Instruction::F32Const(value) => {
 				sink.push(Instruction::F32Const as u8);
 				value.encode(sink);
 			}
-			Expression::I64Const { value } => {
+			wasm::Instruction::I64Const(value) => {
 				sink.push(Instruction::I64Const as u8);
 				value.encode(sink);
 			}
-			Expression::F64Const { value } => {
+			wasm::Instruction::F64Const(value) => {
 				sink.push(Instruction::F64Const as u8);
 				value.encode(sink);
 			}
@@ -1678,7 +1492,7 @@ impl FunctionBody {
 		let type_index = module.functions.types[func_index.0 as usize];
 		let func_type = module.types.signatures[type_index.0 as usize].clone();
 
-		let mut grouped_locals = Vec::<(ValueType, u32)>::new();
+		let mut grouped_locals = Vec::<(ScalarType, u32)>::new();
 		for local in self.locals.iter().skip(func_type.param_count) {
 			match grouped_locals.last_mut() {
 				Some((last_ty, count)) if *last_ty == local.ty => {

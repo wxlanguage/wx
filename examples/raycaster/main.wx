@@ -1,5 +1,3 @@
-use std::*;
-
 #[memory_limits(min_pages = 4)]
 memory heap: Memory where { Size = u32 };
 
@@ -18,34 +16,6 @@ const FOV: f64 = 1.2;
 const MOVE_SPEED: f64 = 3.0;
 const ROT_SPEED: f64 = 2.5;
 
-// ── trig (range-reduce + polynomial; validated separately against libm) ──────
-fn reduce(x: f64) -> f64 {
-    local two_pi = f64::PI * 2.0;
-    local k = f64_floor((x + f64::PI) / two_pi);
-    x - k * two_pi
-}
-
-fn sin_poly(y: f64) -> f64 {
-    local y2 = y * y;
-    local y3 = y2 * y;
-    local y5 = y3 * y2;
-    local y7 = y5 * y2;
-    local y9 = y7 * y2;
-    local y11 = y9 * y2;
-    y - y3 / 6.0 + y5 / 120.0 - y7 / 5040.0 + y9 / 362880.0 - y11 / 39916800.0
-}
-
-pub fn wx_sin(x: f64) -> f64 {
-    local half_pi = f64::PI / 2.0;
-    local mut q = reduce(x);
-    if q > half_pi { q = f64::PI - q; } else { if q < -half_pi { q = -f64::PI - q; }; };
-    sin_poly(q)
-}
-
-pub fn wx_cos(x: f64) -> f64 {
-    wx_sin(x + f64::PI / 2.0)
-}
-
 // ── map ────────────────────────────────────────────────────────────────────
 // `map_data` is a plain byte buffer (row-major, MAP_MAX_W*MAP_MAX_H capacity,
 // one byte per cell — 0 = empty, nonzero = wall) that the host writes
@@ -54,7 +24,7 @@ pub fn wx_cos(x: f64) -> f64 {
 // `frame()` call.
 global mut map_w: u32 = 0;
 global mut map_h: u32 = 0;
-global mut map_data: heap::*mut u8 = ptr::null_mut();
+global mut map_data: heap::&u8 = ptr::null_mut();
 
 pub fn map_ptr() -> i32 {
     map_data as i32
@@ -107,20 +77,20 @@ pub fn load_map(w: i32, h: i32) {
 // ── bump allocator (same pattern as examples/snake) ───────────────────────────
 global mut bump: heap::*u8 = heap::DATA_END;
 
-fn alloc_bytes(size: u32, align: u32) -> heap::*mut u8 {
-    local ptr = (bump as u32 + align - 1) / align * align;
+fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
+    local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size;
-    local cur_end = heap.size() * PAGE_SIZE;
+    local cur_end = heap.size_bytes();
     if new_end > cur_end {
-        local needed = (new_end - cur_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        local needed =
+            (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     };
     bump = new_end as heap::*u8;
-    ptr as heap::*mut u8
+    ptr as heap::*u8
 }
 
-// ── framebuffer ────────────────────────────────────────────────────────────
-global mut fb_ptr: heap::*mut u8 = ptr::null_mut();
+global mut fb_ptr: heap::*u8 = ptr::null_mut();
 
 pub fn framebuffer_ptr() -> i32 {
     fb_ptr as i32
@@ -136,34 +106,32 @@ fn put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
     ptr::add_mut(p, 3).* = 255;
 }
 
-// ── player state ─────────────────────────────────────────────────────────────
 global mut player_x: f64 = 3.5;
 global mut player_y: f64 = 3.5;
 global mut player_angle: f64 = 0.0;
 
-// ── raycasting ───────────────────────────────────────────────────────────────
 struct RayHit {
     dist: f64,
     side: i32,
 }
 
 fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
-    local dir_x = wx_cos(angle);
-    local dir_y = wx_sin(angle);
-    
+    local dir_x = angle.cos();
+    local dir_y = angle.sin();
+
     local mut map_x = i32_trunc_f64(f64_floor(ox));
-    local mut map_y = i32_trunc_f64(f64_floor(oy));
+    local mut map_y = i32_trunc_f64(oy.floor());
 
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
-    if dir_x != 0.0 { delta_dist_x = f64_abs(1.0 / dir_x) }
-    if dir_y != 0.0 { delta_dist_y = f64_abs(1.0 / dir_y) }
+    if dir_x != 0.0 { delta_dist_x = (1.0 / dir_x).abs() }
+    if dir_y != 0.0 { delta_dist_y = (1.0 / dir_y).abs() }
 
     local mut step_x: i32 = 0;
     local mut step_y: i32 = 0;
     local mut side_dist_x: f64 = 0.0;
     local mut side_dist_y: f64 = 0.0;
-    
+
     if dir_x < 0.0 {
         step_x = -1;
         side_dist_x = (ox - f64_convert_i32(map_x)) * delta_dist_x;
@@ -178,7 +146,7 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         step_y = 1;
         side_dist_y = (f64_convert_i32(map_y) + 1.0 - oy) * delta_dist_y;
     }
-    
+
     local mut side: i32 = 0;
     local mut hit = false;
     loop {
@@ -194,7 +162,7 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         }
         if map_at(map_x, map_y) != 0 { hit = true }
     }
-    
+
     local dist = if side == 0 {
         (f64_convert_i32(map_x) - ox + (1.0 - f64_convert_i32(step_x)) / 2.0)
             / dir_x
@@ -202,7 +170,7 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         (f64_convert_i32(map_y) - oy + (1.0 - f64_convert_i32(step_y)) / 2.0)
             / dir_y
     };
-    
+
     RayHit::{ dist, side }
 }
 
@@ -215,11 +183,11 @@ pub fn render() {
         local t = f64_convert_i32(x) / f64_convert_i32(SCREEN_W);
         local ray_angle = player_angle - FOV / 2.0 + FOV * t;
         local hit = cast_ray(player_x, player_y, ray_angle);
-        local corrected = hit.dist * wx_cos(ray_angle - player_angle);
+        local corrected = hit.dist * (ray_angle - player_angle).cos();
 
         local mut line_height = SCREEN_H;
         if corrected > 0.0001 {
-            line_height = i32_trunc_f64(f64_convert_i32(SCREEN_H) / corrected);
+            line_height = (f64_convert_i32(SCREEN_H) / corrected).to_i32();
         };
 
         local mut draw_start = SCREEN_H / 2 - line_height / 2;
@@ -261,8 +229,8 @@ pub fn update(dt_ms: i64) {
     if host::key_down(39) != 0 { player_angle += ROT_SPEED * dt; };
     if host::key_down(37) != 0 { player_angle -= ROT_SPEED * dt; };
 
-    local dir_x = wx_cos(player_angle);
-    local dir_y = wx_sin(player_angle);
+    local dir_x = player_angle.cos();
+    local dir_y = player_angle.sin();
     local perp_x = -dir_y;
     local perp_y = dir_x;
 

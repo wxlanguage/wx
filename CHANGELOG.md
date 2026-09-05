@@ -8,6 +8,207 @@ CLI, and LSP are released in lockstep) rather than per-crate. Editor
 integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
 live in their own repos with independent versioning.
 
+## [0.5.0] - 2026-09-05
+
+This release reshapes how a wx program is organized: every compilation is
+now rooted at a `wx.json` package, privacy is genuinely enforced, and
+pointers distinguish exclusive from shared access. Nearly every existing
+program needs edits — see the Changed section, which is ordered roughly by
+how much work each item is likely to cost you.
+
+### Changed
+
+- **Breaking:** `wx.json` is now required, and every subcommand operates on
+  a project directory rather than a single file. `wx compile` is renamed
+  `wx build`, and the anonymous single-file compilation path is gone.
+
+  ```jsonc
+  {
+    "type": "bin",          // "bin" | "lib"
+    "entry": "main.wx",     // required, relative to this manifest
+    "dependencies": { "math": { "type": "local", "path": "../math" } },
+    "format": { "max_line_width": 80, "indent_width": 4, "trailing_comma": true }
+  }
+  ```
+
+  `wx format` is redesigned around the same model: a directory positional,
+  `--files a.wx,b.wx` to restrict to named files, and `--check` for a
+  diff-free exit-code check. Formatting settings now come from the
+  package's own `wx.json`, so `wx format` and the editor's format-on-save
+  produce identical bytes.
+- **Breaking:** the `module` keyword is now `mod`. `module foo;` /
+  `module foo { }` become `mod foo;` / `mod foo { }`.
+- **Breaking:** pointer mutability is now a distinction between *exclusive*
+  and *shared* access, replacing `*mut T`/bare `*T`:
+
+  ```
+  // before          after
+  *mut T             *T      // exclusive
+  *T                 &T      // shared, read-only
+  []mut T            *[T]
+  []T                &[T]
+  [N]T               &[T; N] // or *[T; N]
+  ```
+
+  There is no bare `[]T` any more — slices and arrays always carry a
+  sigil. `.&mut` is removed; `.&` always yields a shared reference.
+- **Breaking:** a module's children now resolve under the module's *own*
+  name, not its file's directory. `a.wx` declaring `mod shared;` resolves
+  `a/shared.wx`, where it previously resolved `shared.wx` as a plain
+  sibling of `a.wx`. This matches Rust, and makes it impossible for two
+  files declaring the same child name to silently collide — previously
+  only the first discoverer's declaration bound anything. `math.wx` and
+  `math/mod.wx` are now fully interchangeable for where `math`'s children
+  live.
+- **Breaking:** an enum variant now requires an explicit anchor value
+  before auto-increment is legal (`E1071`). This closes a silent
+  collision: `enum Ordering { Less, Equal = 0, Greater = 1 }` previously
+  gave `Less` and `Equal` both the value 0.
+- **Breaking:** struct field privacy is now enforced (`E1076`). A field
+  without `pub` is visible to its declaring module and that module's
+  descendants, and nowhere else — matching the rule every other item
+  already followed on paper.
+- **Breaking:** a plain `use` no longer re-exports publicly. Previously
+  every `use` behaved as `pub use`, because a re-export's symbol entry was
+  indistinguishable from a direct declaration's. Relatedly, a private
+  `mod foo;` is now actually inaccessible from outside its parent and
+  descendants for the first time — its `pub` span was always parsed, just
+  never read.
+- **Breaking:** inherent `impl` blocks are restricted to the package that
+  defines the type (`E1077`). `impl f32 { }` in user code is now an error;
+  define a trait and implement that, or wrap the type in your own struct.
+- **Breaking:** `export { .. }` blocks now enforce three invariants — one
+  block per package (`E1072`), at the binary root (`E1073`), and never in
+  a library (`E1074`).
+- **Breaking:** every package now owns a root namespace, so a transitive
+  dependency is no longer nameable from anywhere in the program — only the
+  package that declared it can see it. Two related manifest errors: naming
+  the same package under two keys (`E2005`), and declaring `std` as an
+  explicit dependency (`E2004`). A package no longer has a name of its
+  own; it is known by the key its dependent declared it under.
+- Name collisions between a `wx.json` dependency, an `import "..." { }`
+  block, and a `mod` declaration are now reported as `E1000` instead of
+  one silently replacing another. The worst case was a file-declared
+  `mod std;`, which replaced the real stdlib binding outright and
+  surfaced as a cascade of unrelated type errors with nothing pointing at
+  the cause.
+
+### Added
+
+- `std` is now an implicit prelude — `use std::*;` is no longer needed in
+  any module. It resolves as a final tier, after your own symbols, globs
+  and the parent walk, so a name std defines can never shadow one you
+  wrote or imported, and adding an item to the standard library cannot
+  break a program that already compiles.
+- Operator overloading through trait dispatch: `Add`, `Sub`, `Mul`,
+  `Div`, `Rem`, `Neg`, plus the bitwise `BitAnd`, `BitOr`, `BitXor`,
+  `Shl`, `Shr` and `BitNot`. Primitive impls are `#[inline]`, so
+  monomorphized code still emits native `i32.add` and friends with no call
+  overhead. Generic (`T: Add`) and typeset-bounded (`Mem::Size`) operands
+  defer dispatch to monomorphization. Comparison operators are not
+  overloadable yet.
+- Compound assignment for every overloadable operator: `+=`, `-=`, `*=`,
+  `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`.
+- `local` pattern destructuring — tuples, struct patterns, `_`, arbitrary
+  nesting, and `..` to opt out of exhaustiveness:
+
+  ```
+  local (quotient, remainder) = divmod(a, b);
+  local Point::{ x, y } = origin();
+  local (a, (b, _)) = nested();
+  ```
+
+  This is not sugar: wx has no `t.0`, so destructuring is the only way to
+  read a tuple element. The scrutinee is evaluated exactly once.
+- `crate` and `super` path keywords, including chaining
+  (`super::super::x`). `self` is not implemented.
+- Nested `use` trees — groups, globs and aliases:
+
+  ```
+  use math::{trig::{sin, cos}, ops::*};
+  use math::add as plus;
+  ```
+- Primitive types are now real items rather than a hardcoded name match,
+  so go-to-definition, hover and find-references work on `i32`, `bool`,
+  `char` and the rest.
+- Language server: the server now registers its own file watchers, so
+  edits to `wx.json` and to files you don't have open are picked up even
+  in editors that have no file-watching API of their own. A `.wx` file
+  with no `wx.json` ancestor gets a visible "unlinked file" hint instead
+  of silently doing nothing. Completions trigger on `::`, and no longer
+  fire on a lone `:`.
+- Formatter: comments are now placed by source position. A comment that
+  trails code stays on its line instead of migrating down and appearing to
+  document the *next* item.
+- Std: `ptr::align_up`, `f32::sqrt`/`f64::sqrt`, and integer/float
+  conversion methods (`to_f32`, `to_i32`, `promote`, `demote`, and the
+  rest).
+- New diagnostics: `E0011`, `E0015`, `E1070`-`E1081`, and
+  `E2002`-`E2006`.
+
+### Fixed
+
+- Two sequential `#[inline]` calls at the same site silently clobbered
+  each other's staged values, because each inlined call got its own scope
+  in a flat local-offset range that assumes sibling scopes are mutually
+  exclusive at runtime. Confirmed against wasmtime: `a + (b - a) * t`
+  trapped, and `calc(a, b, c, d) { (a + b) + (c + d) }` returned a wrong
+  result.
+- Scheduler: a pure value read inside a branch and again later in the same
+  containing block could be placed after its first reader, aliasing an
+  unrelated local once locals were coalesced. Separately,
+  `compute_block_depths` assumed a block's parent always has a lower
+  index, which `switch`'s synthetic wrapper blocks violate.
+- Four trait-conformance bugs, including a spurious signature mismatch
+  stacked on top of the error that already explained it, and a false match
+  when the same type is reached under two different generic environments
+  (`(T,)` where `T` means `i32` on one side and a free parameter on the
+  other).
+- Signature cycles are now reported with the whole chain
+  (`` `A` -> `B` -> `C` -> `A` ``) rather than depending on which caller
+  happened to notice. Cycles reached through value position — e.g.
+  `const A = B; const B = A;` — previously panicked or produced a
+  diagnostic with no labels at all.
+- Integer literals are now held as `u64` rather than `i64`, fixing
+  `i8::MIN`-class negation boundary checks against the wrong bound, and
+  constant folding of `/` and `%` using signed semantics regardless of the
+  operand type's actual signedness.
+- An already-reported error no longer cascades: a failed pointer deref no
+  longer reports "type `{unknown}` is not a pointer" on a binding that was
+  already diagnosed, `p.* += x` no longer reports a spurious `E1013`, and
+  a callee that fails to resolve no longer discards its argument list
+  along with it.
+- `E0001` (unknown token) was defined but never constructed, so a stray
+  character like `@` surfaced as a misleading cascade of unrelated parse
+  errors pointing at whatever followed it.
+- `#[tag = ".."]` was silently ignored on `global`, `enum` and `memory`
+  declarations.
+- `local t = (1, 2);` — a plain binding with no destructuring — passed
+  type checking with no diagnostics and then crashed the compiler. It now
+  reports `E1002`.
+- Formatter: comments were silently *deleted* in five places — between
+  struct fields, between enum variants, between match arms, after the last
+  top-level item, and before the first item in a `mod` body. Blank lines
+  no longer carry the previous line's indentation, and an
+  already-formatted file now reports no edits at all, so format-on-save
+  stops dirtying the buffer.
+- Formatter: `pub` and attributes were dropped entirely from constants in
+  `impl` blocks, so formatting `impl f32 { pub const PI }` silently
+  removed its `pub`.
+- Language server: a path that isn't valid UTF-8 crashed the analysis task
+  and left the server connected but permanently dead for the rest of the
+  session. A `todo!()` reached through qualified-bound resolution could do
+  the same.
+- Language server: every keystroke republished every file's diagnostics,
+  because the refresh cleared the state it diffs against before
+  re-analysing.
+- Language server: editing a file in an open dependency package could wipe
+  its dependent's entire cache. Go-to-definition into `std` was broken by
+  a malformed URI, and hover, go-to-definition and semantic highlighting
+  did not work on tokens from a dependency package.
+- Language server: renaming a symbol imported via `use` emitted two
+  overlapping edits at a single range.
+
 ## [0.4.0] - 2026-08-11
 
 ### Changed
