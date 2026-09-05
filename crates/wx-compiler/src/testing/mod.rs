@@ -1,7 +1,7 @@
 //! Test-only support code.
 //!
-//! Split in two: the `serialize_sorted_*` helpers below are referenced by
-//! `serde` attributes on IR types and exist to make snapshot output
+//! Split in two: the [`serialize_sorted_map`] helper below is referenced by
+//! `serde` attributes on IR types and exists to make snapshot output
 //! deterministic, while [`diagnostics`] carries the assertion vocabulary the
 //! test suites share.
 
@@ -29,45 +29,4 @@ where
 		ser.serialize_entry(k, v)?;
 	}
 	ser.end()
-}
-
-/// Serializes a `HashMap<K, HashMap<K2, V>>` with both levels of keys sorted.
-pub fn serialize_sorted_nested_map<K, K2, V, S>(
-	map: &HashMap<K, HashMap<K2, V>>,
-	serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-	K: Ord + serde::Serialize,
-	K2: Ord + serde::Serialize,
-	V: serde::Serialize,
-	S: serde::Serializer,
-{
-	use serde::ser::SerializeMap;
-	let mut outer: Vec<_> = map.iter().collect();
-	outer.sort_by_key(|(k, _)| *k);
-	let mut ser = serializer.serialize_map(Some(outer.len()))?;
-	for (k, inner_map) in outer {
-		let mut inner: Vec<_> = inner_map.iter().collect();
-		inner.sort_by_key(|(k2, _)| *k2);
-		ser.serialize_entry(k, &SortedMapRef(&inner))?;
-	}
-	ser.end()
-}
-
-pub struct SortedMapRef<'a, K, V>(&'a Vec<(&'a K, &'a V)>);
-
-impl<K: serde::Serialize, V: serde::Serialize> serde::Serialize
-	for SortedMapRef<'_, K, V>
-{
-	fn serialize<S: serde::Serializer>(
-		&self,
-		serializer: S,
-	) -> Result<S::Ok, S::Error> {
-		use serde::ser::SerializeMap;
-		let mut ser = serializer.serialize_map(Some(self.0.len()))?;
-		for (k, v) in self.0 {
-			ser.serialize_entry(k, v)?;
-		}
-		ser.end()
-	}
 }

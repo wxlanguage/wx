@@ -12,61 +12,58 @@ mod builder;
 mod tests;
 
 macro_rules! index_newtype {
-	($($name:ident),+ $(,)?) => {
-		$(
-			#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-			#[cfg_attr(test, derive(serde::Serialize, PartialOrd, Ord))]
-			pub struct $name(u32);
+	($name:ident) => {
+		#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+		#[cfg_attr(test, derive(serde::Serialize, PartialOrd, Ord))]
+		pub struct $name(u32);
 
-			impl $name {
-				#[inline]
-				fn new(index: u32) -> Self {
-					Self(index)
-				}
+		impl $name {
+			#[inline]
+			fn new(index: u32) -> Self {
+				Self(index)
 			}
+		}
 
-			impl From<$name> for u32 {
-				#[inline]
-				fn from(index: $name) -> Self {
-					index.0
-				}
+		impl From<$name> for u32 {
+			#[inline]
+			fn from(index: $name) -> Self {
+				index.0
 			}
+		}
 
-			impl From<$name> for usize {
-				#[inline]
-				fn from(index: $name) -> Self {
-					index.0 as usize
-				}
+		impl From<$name> for usize {
+			#[inline]
+			fn from(index: $name) -> Self {
+				index.0 as usize
 			}
-		)+
+		}
 	};
 }
 
-index_newtype!(
-	TypeIndex,
-	LocalIndex,
-	ScopeIndex,
-	LabelIndex,
-	FunctionIndex,
-	GlobalIndex,
-	ConstIndex,
-	NamespaceIndex,
-	MemoryIndex,
-	EnumVariantIndex,
-	EnumIndex,
-	StructIndex,
-	TraitIndex,
-	InherentImplIndex,
-	TraitImplIndex,
-	TypesetIndex,
-	AssocTypeIndex,
-	TypeAliasIndex,
-	UseIndex,
-	UsePrefixIndex,
-	ModuleDeclIndex,
-	ImportDeclIndex,
-	FieldIndex,
-);
+index_newtype!(TypeIndex);
+index_newtype!(LocalIndex);
+index_newtype!(ScopeIndex);
+index_newtype!(LabelIndex);
+index_newtype!(FunctionIndex);
+index_newtype!(GlobalIndex);
+index_newtype!(ConstIndex);
+index_newtype!(NamespaceIndex);
+index_newtype!(MemoryIndex);
+index_newtype!(EnumVariantIndex);
+index_newtype!(EnumIndex);
+index_newtype!(StructIndex);
+index_newtype!(TraitIndex);
+index_newtype!(InherentImplIndex);
+index_newtype!(TraitImplIndex);
+index_newtype!(TypesetIndex);
+index_newtype!(AssocTypeIndex);
+index_newtype!(TypeAliasIndex);
+index_newtype!(UseIndex);
+index_newtype!(UsePrefixIndex);
+index_newtype!(ModuleDeclIndex);
+index_newtype!(ImportDeclIndex);
+index_newtype!(FieldIndex);
+index_newtype!(BodyIndex);
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -114,18 +111,10 @@ impl FunctionSignature {
 pub enum TypeParamOwner {
 	Function(DefId),
 	Struct(DefId),
-	/// `Self` type parameter implicit in trait items (consts, assoc types).
-	Trait(TraitIndex),
-	/// Non-trait generic impl block: `impl<Params> Target { }`.
-	/// Value is the index into `TIR::impl_block_list`.
-	ImplBlock(InherentImplIndex),
-	/// `impl Trait for Target { }` / `impl<Params> Trait for Target { }`.
-	/// Value is the index into `TIR::trait_impls`. `type_params` is empty
-	/// for what used to be called a "concrete" trait impl — the degenerate
-	/// (zero-parameter) case of the same shape as `ImplBlock`.
-	TraitImpl(TraitImplIndex),
-	/// `type Alias<T> = ...;` — the alias's own type parameters.
 	TypeAlias(DefId),
+	Trait(TraitIndex),
+	InherentImpl(InherentImplIndex),
+	TraitImpl(TraitImplIndex),
 }
 
 /// The block a function/constant is a member of, if any — an impl block or
@@ -141,14 +130,13 @@ pub enum TypeParamOwner {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemParent {
-	/// Non-generic inherent `impl Target { }`. `Target` is already fully
-	/// resolved, so this points straight at its `TypeIndex`.
-	Impl(TypeIndex),
-	/// Generic inherent `impl<Params> Target { }`. Index into
-	/// `TIR::inherent_impls`.
-	GenericImpl(InherentImplIndex),
+	/// Inherent `impl Target { }` — generic (`impl<Params> Target { }`) or
+	/// concrete alike. Index into `TIR::inherent_impls`; the target type is
+	/// `TIR::inherent_impls[..].target` (fully resolved for a concrete impl,
+	/// parametric for a generic one).
+	InherentImpl(InherentImplIndex),
 	/// `impl Trait for Target { }` member, generic or not. Named apart from
-	/// the inherent cases because the two differ in more than their target:
+	/// the inherent case because the two differ in more than their target:
 	/// a trait impl's member exists to satisfy a declaration elsewhere, which
 	/// is what exempts it from dead-code reporting. The target is still
 	/// reachable, via `TIR::trait_impls[..].target`.
@@ -458,7 +446,8 @@ pub struct Trait {
 	pub pub_span: Option<TextSpan>,
 	pub name: ast::Spanned<SymbolU32>,
 	/// The implicit `Self` type parameter owned by this trait. All trait
-	/// methods inherit it via `type_param_parent = TypeParamOwner::Trait(idx)`.
+	/// methods inherit it — their [`Function::type_param_parent`] is
+	/// `TypeParamOwner::Trait(idx)`.
 	pub self_type_param: TypeParamInfo,
 	#[cfg_attr(
 		test,
@@ -1908,6 +1897,19 @@ impl Function {
 	pub fn total_type_param_count(&self) -> usize {
 		self.inherited_type_param_count + self.type_params.len()
 	}
+
+	/// The owner of this function's inherited type parameters — the parent
+	/// impl block, trait, or trait impl — or `None` for free and imported
+	/// functions. Derived from [`Function::parent`]: an inherent impl member
+	/// inherits that block's params, a trait member inherits the trait's
+	/// implicit `Self`, a trait-impl member inherits the impl's params.
+	pub fn type_param_parent(&self) -> Option<TypeParamOwner> {
+		Some(match self.parent? {
+			ItemParent::InherentImpl(idx) => TypeParamOwner::InherentImpl(idx),
+			ItemParent::TraitImpl(idx) => TypeParamOwner::TraitImpl(idx),
+			ItemParent::Trait(idx) => TypeParamOwner::Trait(idx),
+		})
+	}
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1922,12 +1924,9 @@ pub struct Function {
 	pub pub_span: Option<ast::TextSpan>,
 	/// Own type parameters only — does not include params inherited from a
 	/// parent impl block. For the full ordered list, prepend the params from
-	/// `type_param_parent`. Empty for monomorphic functions.
+	/// [`Function::type_param_parent`]. Empty for monomorphic functions.
 	pub type_params: Box<[TypeParamInfo]>,
-	/// For functions inside `impl<Params> Target { }`, the impl block that
-	/// owns the inherited type parameters. `None` for top-level functions.
-	pub type_param_parent: Option<TypeParamOwner>,
-	/// Number of type parameters inherited from `type_param_parent`.
+	/// Number of type parameters inherited from [`Function::type_param_parent`].
 	/// `Type::TypeParam::param_index` values for own params start at this
 	/// offset; impl-block params use absolute indices starting at 0.
 	pub inherited_type_param_count: usize,
@@ -1937,12 +1936,19 @@ pub struct Function {
 	pub result: Option<Spanned<TypeIndex>>,
 	pub accesses: Vec<SourceSpan>,
 	pub attributes: Box<[ItemAttribute]>,
-	pub body: Option<FunctionBody>,
+	/// Index into [`ItemRegistry::bodies`], or `None` when there is no body to
+	/// resolve — an imported or abstract-trait-method function — or Phase 3
+	/// (`ensure_body`) has not demanded it yet.
+	pub body: Option<BodyIndex>,
 }
 
+/// A type-checked expression tree plus the lexical frame it was checked in.
+/// Produced in Phase 3 (`ensure_body`) for any item with an expression
+/// implementation — function bodies and global initializers alike — and stored
+/// in the shared [`ItemRegistry::bodies`] arena, referenced by [`BodyIndex`].
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct FunctionBody {
+pub struct Body {
 	pub stack: StackFrame,
 	pub block: Box<Expression>,
 }
@@ -1957,7 +1963,9 @@ pub struct Global {
 	pub ty: Spanned<TypeIndex>,
 	pub pub_span: Option<TextSpan>,
 	pub mut_span: Option<TextSpan>,
-	pub value: Option<FunctionBody>,
+	/// Index into [`ItemRegistry::bodies`] for the initializer expression, or
+	/// `None` until Phase 3 (`ensure_body`) resolves it.
+	pub value: Option<BodyIndex>,
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -2321,7 +2329,7 @@ impl<'a> TypeFormatter<'a> {
 							.inner;
 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
 					}
-					TypeParamOwner::ImplBlock(block_idx) => {
+					TypeParamOwner::InherentImpl(block_idx) => {
 						let symbol = self.items.inherent_impls
 							[usize::from(*block_idx)]
 						.type_params[*param_index as usize]
@@ -2535,6 +2543,11 @@ pub struct ItemRegistry {
 	pub trait_impl_dispatch:
 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 	pub constants: Vec<Constant>,
+	/// Phase 3 (`ensure_body`) output arena — one entry per resolved function
+	/// body or global initializer, referenced by [`BodyIndex`] from
+	/// `Function::body` / `Global::value`. Append order is demand-driven and
+	/// carries no relation to `functions`/`globals` order.
+	pub bodies: Vec<Body>,
 	pub assoc_type_impls: Vec<AssocTypeImpl>,
 	#[cfg_attr(test, serde(skip))]
 	pub tagged_items: HashMap<SymbolU32, DefId>,
@@ -2562,6 +2575,7 @@ impl ItemRegistry {
 			trait_impls: Vec::new(),
 			trait_impl_dispatch: HashMap::new(),
 			constants: Vec::new(),
+			bodies: Vec::new(),
 			assoc_type_impls: Vec::new(),
 			tagged_items: HashMap::new(),
 			typesets: Vec::new(),
@@ -2577,6 +2591,15 @@ impl ItemRegistry {
 		);
 		self.item_lookup.insert(item.id, ItemIndex::Function(index));
 		self.functions.push(item);
+		index
+	}
+
+	fn push_body(&mut self, body: Body) -> BodyIndex {
+		let index = BodyIndex::new(
+			u32::try_from(self.bodies.len())
+				.expect("body arena exceeded u32 index capacity"),
+		);
+		self.bodies.push(body);
 		index
 	}
 
@@ -2850,50 +2873,13 @@ impl ModuleGraph {
 	}
 }
 
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct TIR {
 	pub types: TypeInterner,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
 	pub items: ItemRegistry,
 	pub modules: ModuleGraph,
 	pub export_block: Option<ExportBlock>,
-}
-
-// Keep snapshot output stable while the runtime layout changes. The old flat
-// TIR order is intentional here: storage ownership is not part of the snapshot
-// contract, and reordering every snapshot would hide meaningful changes.
-#[cfg(test)]
-impl serde::Serialize for TIR {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		use serde::ser::SerializeStruct;
-
-		let mut state = serializer.serialize_struct("TIR", 19)?;
-		state.serialize_field("types", &self.types)?;
-		state.serialize_field("diagnostics", &self.diagnostics)?;
-		state.serialize_field("functions", &self.items.functions)?;
-		state.serialize_field("globals", &self.items.globals)?;
-		state.serialize_field("memories", &self.items.memories)?;
-		state.serialize_field("namespaces", &self.modules.namespaces)?;
-		state.serialize_field("module_decls", &self.modules.module_decls)?;
-		state.serialize_field("import_decls", &self.modules.import_decls)?;
-		state.serialize_field("enums", &self.items.enums)?;
-		state.serialize_field("export_block", &self.export_block)?;
-		state.serialize_field("use_items", &self.items.use_items)?;
-		state.serialize_field("use_prefixes", &self.items.use_prefixes)?;
-		state.serialize_field("structs", &self.items.structs)?;
-		state.serialize_field("traits", &self.items.traits)?;
-		state.serialize_field("trait_impls", &self.items.trait_impls)?;
-		state.serialize_field("constants", &self.items.constants)?;
-		state.serialize_field(
-			"assoc_type_impls",
-			&self.items.assoc_type_impls,
-		)?;
-		state.serialize_field("typesets", &self.items.typesets)?;
-		state.serialize_field("type_aliases", &self.items.type_aliases)?;
-		state.end()
-	}
 }
 
 impl ModuleGraph {
@@ -3254,7 +3240,7 @@ impl ItemRegistry {
 		abs_index: usize,
 	) -> &TypeParamInfo {
 		match owner {
-			TypeParamOwner::ImplBlock(block_idx) => {
+			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.inherent_impls[usize::from(block_idx)].type_params
 					[abs_index]
 			}
@@ -3292,7 +3278,7 @@ impl ItemRegistry {
 		abs_index: usize,
 	) -> &mut TypeParamInfo {
 		match owner {
-			TypeParamOwner::ImplBlock(block_idx) => {
+			TypeParamOwner::InherentImpl(block_idx) => {
 				&mut self.inherent_impls[usize::from(block_idx)].type_params
 					[abs_index]
 			}
@@ -3333,8 +3319,8 @@ impl ItemRegistry {
 		func_index: FunctionIndex,
 	) -> impl Iterator<Item = &TypeParamInfo> {
 		let func = &self.functions[usize::from(func_index)];
-		let parent_params: &[TypeParamInfo] = match func.type_param_parent {
-			Some(TypeParamOwner::ImplBlock(block_idx)) => {
+		let parent_params: &[TypeParamInfo] = match func.type_param_parent() {
+			Some(TypeParamOwner::InherentImpl(block_idx)) => {
 				&self.inherent_impls[usize::from(block_idx)].type_params
 			}
 			Some(TypeParamOwner::Trait(trait_idx)) => std::slice::from_ref(

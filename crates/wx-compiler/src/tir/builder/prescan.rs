@@ -44,7 +44,6 @@ impl<'ast> Builder<'ast, '_> {
 						.iter()
 						.map(|tp| TypeParamInfo::new(tp.name))
 						.collect(),
-					type_param_parent: None,
 					inherited_type_param_count: 0,
 					pub_span: *pub_span,
 					signature_index: TypeIndex::ERROR,

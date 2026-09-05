@@ -527,7 +527,7 @@ impl<'ast> Builder<'ast, '_> {
 		owner: TypeParamOwner,
 	) -> &[TypeParamInfo] {
 		match owner {
-			TypeParamOwner::ImplBlock(block_idx) => {
+			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.items.inherent_impls[usize::from(block_idx)].type_params
 			}
 			TypeParamOwner::Function(id) => {
@@ -652,7 +652,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.structs[usize::from(struct_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
-				self.intern_type(Type::Struct {
+				self.types.intern(Type::Struct {
 					struct_index,
 					args: args.into_boxed_slice(),
 				})
@@ -717,7 +717,7 @@ impl<'ast> Builder<'ast, '_> {
 						if substituted == base {
 							ty
 						} else {
-							self.intern_type(Type::AssocTypeProjection {
+							self.types.intern(Type::AssocTypeProjection {
 								trait_index,
 								assoc_name,
 								base: substituted,
@@ -815,7 +815,7 @@ impl<'ast> Builder<'ast, '_> {
 				if next_to == to && next_memory == memory {
 					ty
 				} else {
-					self.intern_type(Type::Pointer {
+					self.types.intern(Type::Pointer {
 						to: next_to,
 						memory: next_memory,
 						ownership,
@@ -835,7 +835,7 @@ impl<'ast> Builder<'ast, '_> {
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
-					self.intern_type(Type::Array {
+					self.types.intern(Type::Array {
 						of: next_of,
 						size,
 						memory: next_memory,
@@ -854,7 +854,7 @@ impl<'ast> Builder<'ast, '_> {
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
-					self.intern_type(Type::Slice {
+					self.types.intern(Type::Slice {
 						of: next_of,
 						memory: next_memory,
 						ownership,
@@ -874,7 +874,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 					.collect();
 				if changed {
-					self.intern_type(Type::Tuple {
+					self.types.intern(Type::Tuple {
 						elements: substituted,
 					})
 				} else {
@@ -895,7 +895,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 					.collect();
 				if changed {
-					self.intern_type(Type::Function {
+					self.types.intern(Type::Function {
 						signature: FunctionSignature {
 							items,
 							params_count: signature.params_count,
@@ -925,7 +925,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 					.collect();
 				if changed {
-					self.intern_type(Type::Struct {
+					self.types.intern(Type::Struct {
 						struct_index,
 						args: substituted,
 					})
@@ -953,7 +953,7 @@ impl<'ast> Builder<'ast, '_> {
 					})
 					.collect();
 				if changed {
-					self.intern_type(Type::FunctionItem {
+					self.types.intern(Type::FunctionItem {
 						id,
 						type_args: substituted,
 					})

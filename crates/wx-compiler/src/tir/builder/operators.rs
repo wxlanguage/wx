@@ -191,6 +191,25 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
+	/// Records `op_span` (an operator token's own span) as a go-to-definition /
+	/// hover access against the operator method `func_idx` resolves to, and
+	/// returns that method's `DefId` for building the call node. Every operator
+	/// dispatch path — binary and unary arithmetic/bitwise, compound
+	/// assignment, concrete and generic — funnels its access recording through
+	/// here, so hover / goto-def on an operator lands on the same method the
+	/// call resolves to, and coverage can't drift between operator families.
+	fn record_operator_method_access(
+		&mut self,
+		ctx: &ExprContext,
+		func_idx: FunctionIndex,
+		op_span: ast::TextSpan,
+	) -> ast::DefId {
+		let func = &mut self.items.functions[usize::from(func_idx)];
+		func.accesses
+			.push(SourceSpan::new(ctx.resolve_context.file_id, op_span));
+		func.id
+	}
+
 	/// The `Type::TypeParam` counterpart of `resolve_trait_method` — which
 	/// only ever resolves a concrete `ImplTarget`, so it fails outright for
 	/// a type param (`ImplTarget::from_type` doesn't handle `TypeParam`).
@@ -294,11 +313,11 @@ impl<'ast> Builder<'ast, '_> {
 				_ => None,
 			};
 			if let Some(func_idx) = deferred {
-				self.items.functions[usize::from(func_idx)].accesses.push(
-					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+				let abstract_method_id = self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
 				);
-				let abstract_method_id =
-					self.items.functions[usize::from(func_idx)].id;
 				return Expression {
 					kind: ExprKind::GenericMethodCall {
 						id: abstract_method_id,
@@ -318,10 +337,11 @@ impl<'ast> Builder<'ast, '_> {
 		);
 		match method {
 			Some(func_idx) => {
-				self.items.functions[usize::from(func_idx)].accesses.push(
-					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+				let method_id = self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
 				);
-				let method_id = self.items.functions[usize::from(func_idx)].id;
 				Expression {
 					kind: ExprKind::MethodCall {
 						arguments: Box::new([left, right]),
@@ -352,44 +372,6 @@ impl<'ast> Builder<'ast, '_> {
 					span,
 				}
 			}
-		}
-	}
-
-	/// Shared by `build_bitwise_binary_expr`'s same-type arm once `ty` is a
-	/// fully concrete type both operands agree on. Concrete integers/`bool`
-	/// stay on the plain `Binary` path unconditionally — that's the
-	/// pre-existing native codegen for bitwise ops on primitives, and it's
-	/// deliberately left untouched (no snapshot churn, no new intrinsics
-	/// needed for the concrete-primitive case). Everything else (a struct,
-	/// a typeset-bounded `Type::TypeParam`/`Type::AssocTypeProjection`, or a
-	/// bare `Type::TypeParam` bounded by one of the bitwise traits) goes
-	/// through real dispatch via `build_operator_dispatch`, which already
-	/// reports "operator cannot be applied" on its own if nothing
-	/// implements it.
-	fn build_bitwise_result(
-		&mut self,
-		ctx: &ExprContext,
-		operator: Spanned<ast::BinaryOp>,
-		left: Expression,
-		right: Expression,
-		ty: TypeIndex,
-		span: ast::TextSpan,
-	) -> Expression {
-		if ty.is_integer() || ty == TypeIndex::BOOL {
-			Expression {
-				kind: ExprKind::Binary {
-					operator: Spanned {
-						inner: BinaryOp::from(operator.inner),
-						span: operator.span,
-					},
-					left: Box::new(left),
-					right: Box::new(right),
-				},
-				ty,
-				span,
-			}
-		} else {
-			self.build_operator_dispatch(ctx, operator, left, right, ty, span)
 		}
 	}
 
@@ -458,28 +440,24 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		if let Some(abstract_func_idx) = abstract_func_idx {
-			self.items.functions[usize::from(abstract_func_idx)]
-				.accesses
-				.push(SourceSpan::new(
-					ctx.resolve_context.file_id,
-					operator.span,
-				));
+			let abstract_method_id = self.record_operator_method_access(
+				ctx,
+				abstract_func_idx,
+				operator.span,
+			);
 			return Ok(CompoundOperatorDispatch::Generic {
-				abstract_method_id: self.items.functions
-					[usize::from(abstract_func_idx)]
-				.id,
+				abstract_method_id,
 			});
 		}
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
-			Some(func_idx) => {
-				self.items.functions[usize::from(func_idx)].accesses.push(
-					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
-				);
-				Ok(CompoundOperatorDispatch::Concrete(
-					self.items.functions[usize::from(func_idx)].id,
-				))
-			}
+			Some(func_idx) => Ok(CompoundOperatorDispatch::Concrete(
+				self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
+				),
+			)),
 			None => {
 				self.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
@@ -562,11 +540,11 @@ impl<'ast> Builder<'ast, '_> {
 			_ => None,
 		};
 		if let Some(func_idx) = deferred {
-			self.items.functions[usize::from(func_idx)].accesses.push(
-				SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+			let abstract_method_id = self.record_operator_method_access(
+				ctx,
+				func_idx,
+				operator.span,
 			);
-			let abstract_method_id =
-				self.items.functions[usize::from(func_idx)].id;
 			return Expression {
 				kind: ExprKind::GenericMethodCall {
 					id: abstract_method_id,
@@ -580,10 +558,11 @@ impl<'ast> Builder<'ast, '_> {
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
 			Some(func_idx) => {
-				self.items.functions[usize::from(func_idx)].accesses.push(
-					SourceSpan::new(ctx.resolve_context.file_id, operator.span),
+				let method_id = self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
 				);
-				let method_id = self.items.functions[usize::from(func_idx)].id;
 				Expression {
 					kind: ExprKind::MethodCall {
 						arguments: Box::new([operand]),
@@ -712,37 +691,30 @@ impl<'ast> Builder<'ast, '_> {
 					ctx, operator, operand, ty, expr.span,
 				))
 			}
+			// `^x` — dispatches through `BitNot`, mirroring `InvertSign` above:
+			// a comptime-number operand has no concrete type to dispatch
+			// against yet, so it stays a deferred `Unary` node
+			// (`coerce_untyped_unary_expr` resolves it once a type is known);
+			// everything else — primitive, struct, or typeset-bounded type
+			// param / associated type — goes through real dispatch and lowers
+			// to a `MethodCall`/`GenericMethodCall`, exactly like the binary
+			// bitwise operators.
+			ast::UnaryOp::BitNot if operand.ty.is_comptime_number() => {
+				let ty = operand.ty;
+				Ok(Expression {
+					kind: ExprKind::Unary {
+						operator,
+						operand: Box::new(operand),
+					},
+					ty,
+					span: expr.span,
+				})
+			}
 			ast::UnaryOp::BitNot => {
-				if operand.ty.is_primitive() || operand.ty.is_comptime_number()
-				{
-					// Native fast path — unchanged from before `BitNot`
-					// had an overload trait at all: primitives and
-					// deferred comptime numbers stay a plain `Unary`
-					// node (no snapshot churn, no new intrinsics needed
-					// for this case).
-					let ty = operand.ty;
-					Ok(Expression {
-						kind: ExprKind::Unary {
-							operator,
-							operand: Box::new(operand),
-						},
-						ty,
-						span: expr.span,
-					})
-				} else {
-					// Anything else (a struct, or a typeset-bounded
-					// `Type::TypeParam`/`Type::AssocTypeProjection`) goes
-					// through real `BitNot` dispatch, which reports
-					// "operator cannot be applied" on its own if nothing
-					// implements it — same shape as `InvertSign`'s
-					// always-dispatch arm above, just gated to the
-					// non-primitive case to match the binary bitwise
-					// operators' native-path split (`build_bitwise_result`).
-					let ty = operand.ty;
-					Ok(self.build_unary_operator_dispatch(
-						ctx, operator, operand, ty, expr.span,
-					))
-				}
+				let ty = operand.ty;
+				Ok(self.build_unary_operator_dispatch(
+					ctx, operator, operand, ty, expr.span,
+				))
 			}
 			ast::UnaryOp::Not => {
 				if operand.ty == TypeIndex::BOOL {
@@ -937,38 +909,25 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
+				// Both operands untyped: no concrete type, so no method to
+				// dispatch to yet. Mirror `build_arithmetic_expr`'s equivalent
+				// arm — coerce to the expected type when one is known and hand
+				// off to `build_operator_dispatch` (which stays a plain
+				// `Binary` node in `Comptime` mode, still directly foldable,
+				// and becomes a `MethodCall` at runtime), or require an
+				// annotation when nothing pins the type down.
 				if access_ctx.expected_type != TypeIndex::INFER {
 					let expected_type = access_ctx.expected_type;
 					self.coerce_untyped_expr(ctx, &mut left, expected_type)?;
 					self.coerce_untyped_expr(ctx, &mut right, expected_type)?;
-
-					if !expected_type.is_integer()
-						&& expected_type != TypeIndex::BOOL
-					{
-						self.diagnostics.push(
-							report_binary_operator_cannot_be_applied(
-								self.formatter(ctx.resolve_context.namespace),
-								BinaryOperatorCannotBeAppliedDiagnostic {
-									file_id: ctx.resolve_context.file_id,
-									operator,
-									operand: Spanned {
-										inner: expected_type,
-										span: left.span,
-									},
-								},
-							),
-						);
-					}
-
-					Ok(Expression {
-						kind: ExprKind::Binary {
-							operator: binary_op,
-							left: Box::new(left),
-							right: Box::new(right),
-						},
-						ty: expected_type,
-						span: expr.span,
-					})
+					Ok(self.build_operator_dispatch(
+						ctx,
+						operator,
+						left,
+						right,
+						expected_type,
+						expr.span,
+					))
 				} else {
 					self.diagnostics.push(report_type_annotation_required(
 						SourceSpan::new(ctx.resolve_context.file_id, expr.span),
@@ -977,63 +936,19 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			(l, right_type) if l.is_comptime_number() => {
-				if !right_type.is_integer() && right_type != TypeIndex::BOOL {
-					self.diagnostics.push(
-						report_binary_operator_cannot_be_applied(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryOperatorCannotBeAppliedDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								operator,
-								operand: Spanned {
-									inner: right_type,
-									span: right.span,
-								},
-							},
-						),
-					);
-				}
 				self.coerce_untyped_expr(ctx, &mut left, right_type)?;
-
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: right_type,
-					span: expr.span,
-				})
+				Ok(self.build_operator_dispatch(
+					ctx, operator, left, right, right_type, expr.span,
+				))
 			}
 			(left_type, r) if r.is_comptime_number() => {
-				if !left_type.is_integer() && left_type != TypeIndex::BOOL {
-					self.diagnostics.push(
-						report_binary_operator_cannot_be_applied(
-							self.formatter(ctx.resolve_context.namespace),
-							BinaryOperatorCannotBeAppliedDiagnostic {
-								file_id: ctx.resolve_context.file_id,
-								operator,
-								operand: Spanned {
-									inner: left_type,
-									span: left.span,
-								},
-							},
-						),
-					);
-				}
 				self.coerce_untyped_expr(ctx, &mut right, left_type)?;
-
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: left_type,
-					span: expr.span,
-				})
+				Ok(self.build_operator_dispatch(
+					ctx, operator, left, right, left_type, expr.span,
+				))
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
-				.build_bitwise_result(
+				.build_operator_dispatch(
 					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {

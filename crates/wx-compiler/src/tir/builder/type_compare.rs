@@ -7,7 +7,7 @@
 //! which is right for the signature phase (the result is stored in TIR) but
 //! wrong for conformance checking, which only ever needs a yes/no answer plus
 //! a diagnostic — it shouldn't grow the type pool to get one. `compare`
-//! never calls `intern_type`: instead of substituting `Self`/an impl's own
+//! never interns a type: instead of substituting `Self`/an impl's own
 //! generics into a *new* type and comparing the result, it walks the trait
 //! side's original type tree and the impl side's original type tree in
 //! lockstep, resolving an abstract node to whatever it means *right here*

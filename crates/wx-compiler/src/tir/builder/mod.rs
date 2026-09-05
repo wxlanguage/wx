@@ -776,18 +776,18 @@ impl<'ast> Builder<'ast, '_> {
 		span: SourceSpan,
 	) {
 		let container = match owner {
-			TypeParamOwner::ImplBlock(_) | TypeParamOwner::TraitImpl(_) => {
+			TypeParamOwner::InherentImpl(_) | TypeParamOwner::TraitImpl(_) => {
 				Some(owner)
 			}
 			TypeParamOwner::Function(id) => {
 				self.items.function_index(id).and_then(|idx| {
-					self.items.functions[usize::from(idx)].type_param_parent
+					self.items.functions[usize::from(idx)].type_param_parent()
 				})
 			}
 			_ => None,
 		};
 		match container {
-			Some(TypeParamOwner::ImplBlock(idx)) => {
+			Some(TypeParamOwner::InherentImpl(idx)) => {
 				self.items.inherent_impls[usize::from(idx)]
 					.self_accesses
 					.push(span);
@@ -816,16 +816,14 @@ impl<'ast> Builder<'ast, '_> {
 			if is_intrinsic || is_imported {
 				continue;
 			}
-			// Trait impl methods/associated functions are never flagged as
+			// Trait members — a trait's own default-body method and every
+			// trait-impl method/associated function — are never flagged as
 			// dead code, matching Rust: implementing a trait is itself the
 			// "use" — the method exists to satisfy the trait's contract
 			// (and may be invoked by generic code the compiler can't
 			// statically trace back to this particular impl), regardless
-			// of whether any accesses were ever recorded against it.
-			// `type_param_parent` already distinguishes this for free:
-			// `TraitImpl(_)` is only ever set by `AstNodeRef::TraitImplFunction`,
-			// never by the inherent-impl path (`ImplBlock(_)`). Inherent
-			// methods get no such exemption.
+			// of whether any accesses were ever recorded against it. Inherent
+			// methods (`ItemParent::InherentImpl`) get no such exemption.
 			//
 			// A leading `_` marks the function as deliberately unused, the
 			// same convention the unused-local check honours.
@@ -834,10 +832,8 @@ impl<'ast> Builder<'ast, '_> {
 				&& function.pub_span.is_none()
 				&& !name.starts_with('_')
 				&& !matches!(
-					function.type_param_parent,
-					Some(
-						TypeParamOwner::Trait(_) | TypeParamOwner::TraitImpl(_)
-					)
+					function.parent,
+					Some(ItemParent::Trait(_) | ItemParent::TraitImpl(_))
 				) {
 				self.diagnostics.push(
 					Diagnostic::warning()

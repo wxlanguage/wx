@@ -151,7 +151,7 @@ impl<'ast> Builder<'ast, '_> {
 			max_pages,
 			accesses: Vec::new(),
 		};
-		let memory_type = self.intern_type(Type::Memory {
+		let memory_type = self.types.intern(Type::Memory {
 			size: memory_size.inner,
 			id: *id,
 		});
@@ -625,7 +625,7 @@ impl<'ast> Builder<'ast, '_> {
 				// this can never re-enter and the status is always `Resolved`.
 				let id = self.items.memories[0].id;
 				let _ = self.ensure_signature(id);
-				Ok(self.intern_type(Type::Memory {
+				Ok(self.types.intern(Type::Memory {
 					id,
 					size: self.items.memories[0].size.inner,
 				}))
@@ -666,7 +666,7 @@ impl<'ast> Builder<'ast, '_> {
 			})
 			.map(|b| b.trait_index);
 		match trait_index {
-			Some(trait_index) => self.intern_type(Type::AssocTypeProjection {
+			Some(trait_index) => self.types.intern(Type::AssocTypeProjection {
 				trait_index,
 				assoc_name: size_sym,
 				base: memory,

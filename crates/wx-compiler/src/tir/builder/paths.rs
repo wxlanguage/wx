@@ -81,7 +81,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.functions[usize::from(func_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_ctx.file_id, expr_span));
-				let ty = self.intern_type(Type::FunctionItem {
+				let ty = self.types.intern(Type::FunctionItem {
 					id: func_id,
 					type_args: vec![TypeIndex::INFER; type_params_len]
 						.into_boxed_slice(),
@@ -138,7 +138,7 @@ impl<'ast> Builder<'ast, '_> {
 					.accesses
 					.push(SourceSpan::new(resolve_ctx.file_id, expr_span));
 				let id = memory.id;
-				let ty = self.intern_type(Type::Memory { size: kind, id });
+				let ty = self.types.intern(Type::Memory { size: kind, id });
 				Ok(Expression {
 					kind: ExprKind::Memory { id },
 					ty,
@@ -417,7 +417,7 @@ impl<'ast> Builder<'ast, '_> {
 				seg.ident.span,
 			));
 			let func_id = func.id;
-			let ty = self.intern_type(Type::FunctionItem {
+			let ty = self.types.intern(Type::FunctionItem {
 				id: func_id,
 				type_args: resolved_args,
 			});
@@ -466,7 +466,7 @@ impl<'ast> Builder<'ast, '_> {
 					self.resolve_type(resolve_context, func_ctx.scope, arg)
 				})
 				.collect();
-			namespace_ty = self.intern_type(Type::Struct {
+			namespace_ty = self.types.intern(Type::Struct {
 				struct_index,
 				args: resolved_args,
 			});
@@ -781,7 +781,7 @@ impl<'ast> Builder<'ast, '_> {
 			at.accesses
 				.push(SourceSpan::new(resolve_context.file_id, member_span));
 		}
-		Ok(Some(self.intern_type(Type::AssocTypeProjection {
+		Ok(Some(self.types.intern(Type::AssocTypeProjection {
 			trait_index,
 			assoc_name: member_name,
 			base,
@@ -1270,7 +1270,7 @@ impl<'ast> Builder<'ast, '_> {
 					);
 				}
 
-				let func_ty = self.intern_type(Type::FunctionItem {
+				let func_ty = self.types.intern(Type::FunctionItem {
 					id: func_id,
 					type_args: combined,
 				});

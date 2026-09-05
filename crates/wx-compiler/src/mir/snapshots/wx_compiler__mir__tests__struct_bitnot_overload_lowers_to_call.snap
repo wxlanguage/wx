@@ -55,9 +55,15 @@ functions:
               Aggregate:
                 aggregate_index: 0
             mutability: Immutable
+          - ty: I32
+            mutability: Immutable
         result:
           Aggregate:
             aggregate_index: 0
+      - kind: Block
+        parent: 0
+        locals: []
+        result: I32
     block:
       kind:
         Block:
@@ -67,14 +73,35 @@ functions:
                 Aggregate:
                   values:
                     - kind:
-                        BitNot:
-                          value:
-                            kind:
-                              AggregateGet:
-                                scope_index: 0
-                                local_index: 0
-                                value_index: 0
-                            ty: I32
+                        Block:
+                          scope_index: 1
+                          expressions:
+                            - kind:
+                                LocalSet:
+                                  scope_index: 0
+                                  local_index: 1
+                                  value:
+                                    kind:
+                                      AggregateGet:
+                                        scope_index: 0
+                                        local_index: 0
+                                        value_index: 0
+                                    ty: I32
+                              ty: Unit
+                            - kind:
+                                Block:
+                                  scope_index: 0
+                                  expressions:
+                                    - kind:
+                                        BitNot:
+                                          value:
+                                            kind:
+                                              LocalGet:
+                                                scope_index: 0
+                                                local_index: 1
+                                            ty: I32
+                                      ty: I32
+                              ty: I32
                       ty: I32
               ty:
                 Aggregate:
