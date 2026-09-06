@@ -1483,70 +1483,78 @@ impl<Mem: Memory> Layout<Mem> {
 pub trait Allocator {
     type Mem: Memory;
 
-    fn reserve(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
+    fn allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    fn alloc<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
-        local ptr = self.reserve(Layout::of::<T>()) as Self::Mem::*T;
+    fn allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+        local ptr = self.allocate(Layout::of::<T>()) as Self::Mem::*T;
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    fn alloc_slice<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
+    fn allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.reserve(Layout::array::<T>(len)) as Self::Mem::&T,
+            self.allocate(Layout::array::<T>(len)) as Self::Mem::&T,
             len,
         ) as _
     }
 }
 
-pub mod ptr {
+pub struct RawPtr<Mem: Memory, T> {
+    addr: Mem::Size,
+}
+
+impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
-    pub fn null<Mem: Memory, T>() -> Mem::&T {
-        0 as _
+    pub fn addr(self) -> Mem::Size {
+        self.addr
     }
 
-    #[inline]
-    pub fn null_mut<Mem: Memory, T>() -> Mem::*T {
-        0 as _
+    pub fn null() -> Self {
+        Self::{ addr: 0 }
     }
 
-    #[inline]
-    pub fn is_null<Mem: Memory, T>(ptr: Mem::&T) -> bool {
-        ptr as Mem::Size == 0
+    pub fn from_ref(ref: Mem::&T) -> Self {
+        Self::{ addr: ref as _ }
     }
 
-    #[inline]
-    pub fn cast_mut<Mem: Memory, T>(ptr: Mem::&T) -> Mem::*T {
-        ptr as _
+    pub fn from_ptr(ptr: Mem::*T) -> Self {
+        Self::{ addr: ptr as _ }
     }
 
-    #[inline]
-    pub fn add<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
-        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
+    pub fn from_addr(addr: Mem::Size) -> Self {
+        Self::{ addr }
     }
 
-    #[inline]
-    pub fn sub<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
-        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
+    pub fn as_ref(self) -> Mem::&T {
+        self.addr as _
     }
 
-    #[inline]
-    pub fn add_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
-        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
+    pub fn as_ptr(self) -> Mem::*T {
+        self.addr as _
     }
 
-    #[inline]
-    pub fn sub_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
-        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
+    pub fn is_null(self) -> bool {
+        self.addr == 0
+    }
+
+    pub fn add(self, count: Mem::Size) -> Self {
+        Self::{ addr: self.addr + count * size_of::<T, Mem>() }
+    }
+
+    pub fn sub(self, count: Mem::Size) -> Self {
+        Self::{ addr: self.addr - count * size_of::<T, Mem>() }
     }
 
     /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
-    #[inline]
-    pub fn align_up<Mem: Memory>(addr: Mem::Size, align: Mem::Size) -> Mem::Size {
-        (addr + align - 1) & ^(align - 1)
+    pub fn align_up(self, align: Mem::Size) -> Self {
+        Self::{ addr: (self.addr + align - 1) & ^(align - 1) }
+    }
+
+    pub fn cast<U>(self) -> RawPtr<Mem, U> {
+        RawPtr::{ addr: self.addr } as _
     }
 }
 

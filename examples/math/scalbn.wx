@@ -43,8 +43,8 @@ pub fn scalbnf(x: f32, n: i32) -> f32 {
 }
 
 pub fn scalbn(x: f64, n: i32) -> f64 {
-    local mut x: f64 = x;
-    local mut n: i32 = n;
+    local mut x = x;
+    local mut n = n;
 
     if n > 1023 {
         // 2^Emax (0x1p1023)

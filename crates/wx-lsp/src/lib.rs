@@ -2516,7 +2516,12 @@ fn symbol_hover_text(
 					let ai = usize::from(tir.items.type_alias_index(*def_id)?);
 					tir.items.type_aliases[ai].type_params.get(param_index)?
 				}
-				TypeParamOwner::TraitImpl(_) => return None,
+				TypeParamOwner::TraitImpl(impl_idx) => tir
+					.items
+					.trait_impls
+					.get(usize::from(*impl_idx))?
+					.type_params
+					.get(param_index)?,
 			};
 			let name = interner.resolve(tp.name.inner).unwrap();
 			let bounds_str = fmt.display_bounds(&tp.bounds).unwrap_or_default();

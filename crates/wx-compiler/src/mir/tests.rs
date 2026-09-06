@@ -683,7 +683,7 @@ fn test_struct_layout_is_alignment_sorted() {
 
 	// The `dummy` function's first parameter is `Mixed`; its MIR type carries
 	// the aggregate index into `mir.aggregates`.
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
 		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
@@ -724,7 +724,7 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
     "});
 	assert!(case.tir.diagnostics.is_empty());
 
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let top_index = match case.mir.signatures[sig_index].params()[0] {
 		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Top to lower to an aggregate"),
@@ -812,7 +812,7 @@ fn test_fixed_order_struct_keeps_declaration_order() {
     "});
 	assert!(case.tir.diagnostics.is_empty());
 
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
 		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
@@ -1003,7 +1003,7 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
 			sig.result() == Type::I32
 		})
 		.expect("get_x_i32 not found");
@@ -1012,19 +1012,21 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
 			sig.result() == Type::F32
 		})
 		.expect("get_x_f32 not found");
 
-	let agg_i32 = match case.mir.signatures[sig_i32.signature_index as usize]
-		.params()[0]
+	let agg_i32 = match case.mir.signatures
+		[usize::from(sig_i32.signature_index)]
+	.params()[0]
 	{
 		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Point<i32> to be an aggregate"),
 	};
-	let agg_f32 = match case.mir.signatures[sig_f32.signature_index as usize]
-		.params()[0]
+	let agg_f32 = match case.mir.signatures
+		[usize::from(sig_f32.signature_index)]
+	.params()[0]
 	{
 		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Point<f32> to be an aggregate"),
@@ -1884,7 +1886,11 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 	else {
 		panic!("the initializer is spilled into a local first")
 	};
-	assert_eq!(*temp_scope, 0, "temps live in the function root scope");
+	assert_eq!(
+		*temp_scope,
+		ScopeIndex::new(0),
+		"temps live in the function root scope"
+	);
 	assert!(
 		matches!(value.kind, ExprKind::Call { .. }),
 		"the spilled value is the call itself, evaluated exactly once"
@@ -1892,8 +1898,8 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 
 	let (a_scope, a_local, _) = destructured_store(&statements[1]);
 	let (b_scope, b_local, _) = destructured_store(&statements[2]);
-	assert_eq!((a_scope, a_local), (0, *temp_local));
-	assert_eq!((b_scope, b_local), (0, *temp_local));
+	assert_eq!((a_scope, a_local), (ScopeIndex::new(0), *temp_local));
+	assert_eq!((b_scope, b_local), (ScopeIndex::new(0), *temp_local));
 
 	// And the call appears exactly once in the whole body.
 	let calls = statements
@@ -1920,8 +1926,8 @@ fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 	// it and there is no spilling `LocalSet` ahead of them.
 	let (a_scope, a_local, _) = destructured_store(&statements[0]);
 	let (b_scope, b_local, _) = destructured_store(&statements[1]);
-	assert_eq!((a_scope, a_local), (0, 0));
-	assert_eq!((b_scope, b_local), (0, 0));
+	assert_eq!((a_scope, a_local), (ScopeIndex::new(0), LocalIndex::new(0)));
+	assert_eq!((b_scope, b_local), (ScopeIndex::new(0), LocalIndex::new(0)));
 }
 
 /// Tuple elements are alignment-sorted exactly like struct fields, so a
@@ -1938,7 +1944,7 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
     "});
 	assert_no_errors(&case);
 
-	let sig_index = mir_function(&case, "f").signature_index as usize;
+	let sig_index = usize::from(mir_function(&case, "f").signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let Type::Aggregate { aggregate_index } = param_ty else {
 		panic!("a tuple parameter lowers to an aggregate")
@@ -1998,10 +2004,22 @@ fn test_nested_tuple_destructuring_projects_through_a_temp() {
 	// spills the intermediate `t.1` just before its own store, giving
 	// [x, spill, y, spill, z].
 	let (x_scope, x_local, _) = destructured_store(&statements[0]);
-	assert_eq!((x_scope, x_local), (0, 0), "`x` reads `t` directly");
+	assert_eq!(
+		(x_scope, x_local),
+		(ScopeIndex::new(0), LocalIndex::new(0)),
+		"`x` reads `t` directly"
+	);
 
 	let (_, y_from, _) = destructured_store(&statements[2]);
 	let (_, z_from, _) = destructured_store(&statements[4]);
-	assert_ne!(y_from, 0, "`y` reads the spilled inner tuple, not `t`");
-	assert_ne!(z_from, 0, "`z` reads the spilled inner tuple, not `t`");
+	assert_ne!(
+		y_from,
+		LocalIndex::new(0),
+		"`y` reads the spilled inner tuple, not `t`"
+	);
+	assert_ne!(
+		z_from,
+		LocalIndex::new(0),
+		"`z` reads the spilled inner tuple, not `t`"
+	);
 }

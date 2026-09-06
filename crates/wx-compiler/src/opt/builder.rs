@@ -63,7 +63,7 @@ impl<'mir> Builder<'mir> {
 		let mut offsets = Vec::with_capacity(scopes.len());
 		offsets.push(0u32);
 		for scope in scopes.iter().skip(1) {
-			let parent = scope.parent.unwrap() as usize;
+			let parent = usize::from(scope.parent.unwrap());
 			offsets.push(offsets[parent] + scopes[parent].locals.len() as u32);
 		}
 		offsets.into_boxed_slice()
@@ -72,7 +72,7 @@ impl<'mir> Builder<'mir> {
 	fn build_function(&mut self) {
 		let mir_func = self.mir_func;
 		let root_scope = &mir_func.scopes[0];
-		let sig = &self.mir.signatures[mir_func.signature_index as usize];
+		let sig = &self.mir.signatures[usize::from(mir_func.signature_index)];
 
 		// Seed data_bindings for the root scope (params + non-param locals).
 		let mut data_bindings =
@@ -728,7 +728,7 @@ impl<'mir> Builder<'mir> {
 					Some(v) => self.build_expr(block_idx, bindings, v),
 					None => StackResult::Unit,
 				};
-				let target = *scope_index as BlockIndex;
+				let target = u32::from(*scope_index);
 				// Captured *before* the merge below (which only concerns the
 				// loop's own trailing value) — this break's own current
 				// contribution to the loop's carried bindings, independent of
@@ -772,7 +772,7 @@ impl<'mir> Builder<'mir> {
 				StackResult::Never
 			}
 			ExprKind::Continue { scope_index } => {
-				let target = *scope_index as BlockIndex;
+				let target = u32::from(*scope_index);
 				let loop_param_updates =
 					self.loop_param_updates(target, bindings);
 				self.push_stmt(
@@ -981,15 +981,18 @@ impl<'mir> Builder<'mir> {
 
 		let (then_scope, then_exprs) = Self::unwrap_block(then_expr);
 		let mut then_bindings = self.extend_bindings(bindings, then_scope);
-		self.func.blocks[then_scope as usize] = Some(Block {
+		self.func.blocks[usize::from(then_scope)] = Some(Block {
 			parent: Some(block_idx),
 			statements: Vec::new(),
 			result: StackResult::Never,
 			loop_index: None,
 		});
-		let then_result =
-			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize]
+		let then_result = self.build_block_exprs(
+			u32::from(then_scope),
+			&mut then_bindings,
+			then_exprs,
+		);
+		self.func.blocks[usize::from(then_scope)]
 			.as_mut()
 			.unwrap()
 			.result = then_result;
@@ -998,15 +1001,19 @@ impl<'mir> Builder<'mir> {
 			Some(e) => {
 				let (scope, exprs) = Self::unwrap_block(e);
 				let mut eb = self.extend_bindings(bindings, scope);
-				self.func.blocks[scope as usize] = Some(Block {
+				self.func.blocks[usize::from(scope)] = Some(Block {
 					parent: Some(block_idx),
 					statements: Vec::new(),
 					result: StackResult::Never,
 					loop_index: None,
 				});
-				let r = self.build_block_exprs(scope, &mut eb, exprs);
-				self.func.blocks[scope as usize].as_mut().unwrap().result = r;
-				(r, eb, Some(scope))
+				let r =
+					self.build_block_exprs(u32::from(scope), &mut eb, exprs);
+				self.func.blocks[usize::from(scope)]
+					.as_mut()
+					.unwrap()
+					.result = r;
+				(r, eb, Some(u32::from(scope)))
 			}
 			None => (StackResult::Unit, bindings.clone(), None),
 		};
@@ -1027,7 +1034,7 @@ impl<'mir> Builder<'mir> {
 			block_idx,
 			ControlNode::IfElse {
 				condition,
-				then_block: then_scope,
+				then_block: u32::from(then_scope),
 				else_block: else_scope,
 				outputs: outputs.into_boxed_slice(),
 				result,
@@ -1168,20 +1175,22 @@ impl<'mir> Builder<'mir> {
 					let (scope, exprs) = Self::unwrap_block(body);
 					let mut scope_bindings =
 						self.extend_bindings(bindings, scope);
-					self.func.blocks[scope as usize] = Some(Block {
+					self.func.blocks[usize::from(scope)] = Some(Block {
 						parent: Some(last_container),
 						statements: Vec::new(),
 						result: StackResult::Never,
 						loop_index: None,
 					});
 					let result = self.build_block_exprs(
-						scope,
+						u32::from(scope),
 						&mut scope_bindings,
 						exprs,
 					);
-					self.func.blocks[scope as usize].as_mut().unwrap().result =
-						result;
-					(scope, result, scope_bindings)
+					self.func.blocks[usize::from(scope)]
+						.as_mut()
+						.unwrap()
+						.result = result;
+					(u32::from(scope), result, scope_bindings)
 				}
 				None => {
 					let unreachable_block =
@@ -1277,20 +1286,23 @@ impl<'mir> Builder<'mir> {
 
 		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
 		let mut then_bindings = self.extend_bindings(bindings, then_scope);
-		self.func.blocks[then_scope as usize] = Some(Block {
+		self.func.blocks[usize::from(then_scope)] = Some(Block {
 			parent: Some(container),
 			statements: Vec::new(),
 			result: StackResult::Never,
 			loop_index: None,
 		});
-		let then_result =
-			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize]
+		let then_result = self.build_block_exprs(
+			u32::from(then_scope),
+			&mut then_bindings,
+			then_exprs,
+		);
+		self.func.blocks[usize::from(then_scope)]
 			.as_mut()
 			.unwrap()
 			.result = then_result;
 
-		(condition, then_scope, then_result, then_bindings)
+		(condition, u32::from(then_scope), then_result, then_bindings)
 	}
 
 	fn build_switch(
@@ -1561,17 +1573,21 @@ impl<'mir> Builder<'mir> {
 	) -> SwitchArmBuild {
 		let (scope, exprs) = Self::unwrap_block(body);
 		let mut arm_bindings = self.extend_bindings(parent_bindings, scope);
-		self.func.blocks[scope as usize] = Some(Block {
+		self.func.blocks[usize::from(scope)] = Some(Block {
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
 			loop_index: None,
 		});
-		let result = self.build_block_exprs(scope, &mut arm_bindings, exprs);
-		self.func.blocks[scope as usize].as_mut().unwrap().result = result;
+		let result =
+			self.build_block_exprs(u32::from(scope), &mut arm_bindings, exprs);
+		self.func.blocks[usize::from(scope)]
+			.as_mut()
+			.unwrap()
+			.result = result;
 		SwitchArmBuild {
 			discriminant,
-			scope,
+			scope: u32::from(scope),
 			result,
 			bindings: arm_bindings,
 		}
@@ -1585,7 +1601,7 @@ impl<'mir> Builder<'mir> {
 		body_expr: &mir::Expression,
 	) -> StackResult {
 		let (body_scope, body_exprs) = Self::unwrap_block(body_expr);
-		let body_block = body_scope as BlockIndex;
+		let body_block = u32::from(body_scope);
 
 		// Create loop-param placeholders for all parent bindings.
 		let loop_params = self.create_loop_params(bindings, body_block);
@@ -1717,12 +1733,13 @@ impl<'mir> Builder<'mir> {
 		scope_index: mir::ScopeIndex,
 	) -> Vec<StackResult> {
 		let mut child = parent.to_vec();
-		for (i, local) in self.mir_func.scopes[scope_index as usize]
+		for (i, local) in self.mir_func.scopes[usize::from(scope_index)]
 			.locals
 			.iter()
 			.enumerate()
 		{
-			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			let idx =
+				self.flat_index(scope_index, mir::LocalIndex::new(i as u32));
 			if idx < child.len() {
 				continue;
 			}
@@ -1739,12 +1756,13 @@ impl<'mir> Builder<'mir> {
 		bindings: &mut Vec<StackResult>,
 		scope_index: mir::ScopeIndex,
 	) {
-		for (i, local) in self.mir_func.scopes[scope_index as usize]
+		for (i, local) in self.mir_func.scopes[usize::from(scope_index)]
 			.locals
 			.iter()
 			.enumerate()
 		{
-			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
+			let idx =
+				self.flat_index(scope_index, mir::LocalIndex::new(i as u32));
 			if idx < bindings.len() {
 				continue;
 			}
@@ -2434,7 +2452,8 @@ impl<'mir> Builder<'mir> {
 		scope_index: mir::ScopeIndex,
 		local_index: mir::LocalIndex,
 	) -> usize {
-		(self.locals_offsets[scope_index as usize] + local_index) as usize
+		(self.locals_offsets[usize::from(scope_index)] + u32::from(local_index))
+			as usize
 	}
 
 	fn ensure_bindings_capacity(

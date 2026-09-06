@@ -412,7 +412,7 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         struct BumpAllocator {}
         impl Allocator for BumpAllocator {
             type Mem = heap;
-            fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+            fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
                 local ptr = (bump as u32 + layout.align() - 1) / layout.align() * layout.align();
                 local new_end = ptr + layout.size();
                 bump = new_end as heap::*u8;
@@ -421,13 +421,13 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         }
 
         fn copy4() {
-            local alloc: heap::*BumpAllocator = ptr::null_mut();
-            local arr = alloc.alloc_slice::<u32>(4);
+            local alloc: heap::*BumpAllocator = 0 as heap::*BumpAllocator;
+            local arr = alloc.allocate_slice_uninit::<u32>(4);
             arr[0] = 10;
             arr[1] = 20;
             arr[2] = 30;
             arr[3] = 40;
-            local out = alloc.alloc_slice::<u32>(4);
+            local out = alloc.allocate_slice_uninit::<u32>(4);
 
             local mut i: u32 = 0;
             loop {
@@ -1029,14 +1029,15 @@ fn test_global_init_if_expression_executes() {
 
 #[test]
 fn test_global_init_generic_null_pointer_executes() {
-	// global mut head: heap::&Node = ptr::null()
-	// null() is a generic function: null<M: Memory, T>() -> M::&T
-	// Type params must be inferred from the global's declared type.
+	// global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
+	// A generic call (`RawPtr::null`, then `as_ref`) in global-initializer
+	// position must be lowered into the start function and execute, leaving
+	// the global at address 0.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        global mut head: heap::&Node = ptr::null()
+        global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
         fn get_head() -> u32 { head as u32 }
         export { get_head }
     "});
@@ -1428,8 +1429,8 @@ fn test_trait_method_with_own_type_param_called_through_generic_bound() {
         memory heap: Memory where { Size = u32 };
 
         fn run() {
-            local value_ptr: heap::&i32 = ptr::null();
-            local counter_ptr: heap::*Counter = ptr::null_mut();
+            local value_ptr: heap::&i32 = 0 as heap::&i32;
+            local counter_ptr: heap::*Counter = 0 as heap::*Counter;
             value_ptr.consume::<heap, Counter>(counter_ptr);
         }
 
@@ -2958,17 +2959,18 @@ fn test_global_initialized_to_data_end() {
 
 #[test]
 fn test_null_pointer_comparison() {
-	// null<M, T>() returns a zero pointer. Verify that:
-	//  1. null() compares equal to another null() (the `node.next == ptr::null()` pattern)
-	//  2. a non-zero pointer does NOT compare equal to null()
+	// `RawPtr::null()` has address 0. Verify that:
+	//  1. `RawPtr::from_ref(p).is_null()` is true for a null-address pointer
+	//     (the `node.next == ptr::null()` pattern, rephrased onto `RawPtr`)
+	//  2. it is false for a non-zero pointer
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
         struct Node { value: i32, next: &Node }
 
-        fn make_null() -> &Node { ptr::null() }
-        fn is_null_ptr(p: &Node) -> bool { p == ptr::null() }
+        fn make_null() -> &Node { RawPtr::<heap, Node>::null().as_ref() }
+        fn is_null_ptr(p: &Node) -> bool { RawPtr::from_ref(p).is_null() }
         fn ptr_from_addr() -> *Node { 4 as heap::*Node }
 
         export { heap, make_null, is_null_ptr, ptr_from_addr }

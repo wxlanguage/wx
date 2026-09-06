@@ -763,6 +763,23 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				.push(ImplRef::Trait(trait_impl_index));
 		}
 
+		for (param_index, tp) in trait_impl.type_params.iter().enumerate() {
+			let kind = SymbolKind::TypeParam {
+				owner: TypeParamOwner::TraitImpl(trait_impl_index),
+				param_index: param_index as u32,
+			};
+			index.definitions.push(SpanInfo {
+				source: SourceSpan::new(trait_impl.file_id, tp.name.span),
+				kind,
+			});
+			for access in &tp.accesses {
+				index.references.push(SpanInfo {
+					source: *access,
+					kind,
+				});
+			}
+		}
+
 		if trait_impl.self_accesses.is_empty() {
 			continue;
 		}

@@ -23,6 +23,7 @@ pub mod scheduler;
 #[cfg(test)]
 mod tests;
 
+use crate::index::index_newtype;
 pub use crate::wasm::ScalarType;
 use crate::{ast, mir};
 
@@ -629,7 +630,7 @@ pub enum ControlNode {
 		/// MIR signature index for this call; used by the scheduler to emit
 		/// `CallIndirectSym` when the callee is not a statically known
 		/// `FunctionRef`.
-		callee_sig: u32,
+		callee_sig: mir::SignatureIndex,
 	},
 	IfElse {
 		condition: DataNodeIndex,
@@ -728,7 +729,10 @@ pub enum ControlNode {
 	},
 }
 
-pub type LoopIndex = u32;
+index_newtype!(
+	/// Index into `Function::loops`, not the block table.
+	LoopIndex
+);
 
 pub struct Block {
 	pub parent: Option<BlockIndex>,
@@ -807,7 +811,7 @@ impl Function {
 
 	/// Registers a new loop's `LoopData` and returns its `LoopIndex`.
 	pub fn push_loop_data(&mut self, data: LoopData) -> LoopIndex {
-		let idx = self.loops.len() as LoopIndex;
+		let idx = LoopIndex::new(self.loops.len() as u32);
 		self.loops.push(data);
 		idx
 	}
@@ -819,7 +823,7 @@ impl Function {
 			.unwrap()
 			.loop_index
 			.expect("loop_data called on a non-loop block");
-		&self.loops[idx as usize]
+		&self.loops[usize::from(idx)]
 	}
 
 	/// Mutable counterpart of `loop_data`.
@@ -829,7 +833,7 @@ impl Function {
 			.unwrap()
 			.loop_index
 			.expect("loop_data_mut called on a non-loop block");
-		&mut self.loops[idx as usize]
+		&mut self.loops[usize::from(idx)]
 	}
 
 	/// Get or create a data node via CSE only. Does not apply any algebraic

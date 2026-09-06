@@ -1038,11 +1038,30 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		for bound in bounds.traits.iter() {
-			match self.items.find_trait_impl(
+			let concrete_impl = self.items.find_trait_impl(
 				&self.types,
 				ty.inner,
 				bound.trait_index,
-			) {
+			);
+			// An *abstract* `ty` (a `TypeParam`/`AssocTypeProjection`) has no
+			// concrete impl but can still satisfy the bound through its own
+			// declared bounds — which is what lets an impl bind an associated
+			// type to one of its own generic params
+			// (`impl<M: Memory> Allocator for Foo<M> { type Mem = M; }`):
+			// `M: Memory` is declared on the impl, so `Allocator::Mem: Memory`
+			// holds. `type_implements_trait` consults those declared bounds;
+			// a bare `find_trait_impl` (concrete impls only) does not. Nothing
+			// further to verify in that case — there's no impl to read
+			// `where`-binding values from.
+			if concrete_impl.is_none()
+				&& self.items.type_implements_trait(
+					&self.types,
+					ty.inner,
+					bound.trait_index,
+				) {
+				continue;
+			}
+			match concrete_impl {
 				Some((impl_idx, impl_type_args)) => {
 					// Verify the impl's *actual* value for each binding on
 					// `bound` matches what's required — not just that the
@@ -1267,10 +1286,11 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		if let Some(typeset) = bounds.typeset
-			&& !self
-				.items
-				.concrete_type_in_typeset(ty.inner, typeset.typeset_index)
-		{
+			&& !self.items.type_in_typeset(
+				&self.types,
+				ty.inner,
+				typeset.typeset_index,
+			) {
 			let typeset_name = self
 				.interner
 				.resolve(

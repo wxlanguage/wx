@@ -2292,23 +2292,6 @@ fn test_assign_to_undeclared_identifier_no_e1013() {
 	));
 }
 
-#[test]
-fn test_compare_mutable_pointer_with_null() {
-	// `cur == ptr::null()` must infer M and T for null<M,T>() from the type of `cur`
-	// (`heap::*Node`), even though null()'s return type is an immutable pointer.
-	// Previously `infer_type_args` required matching mutability, causing E1002.
-	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
-        memory heap: Memory where { Size = u32 }
-        struct Node { x: i32 }
-        fn is_null(p: heap::&Node) -> bool {
-            p == ptr::null()
-        }
-        export { is_null }
-    "});
-	assert!(case.tir.diagnostics.is_empty());
-}
-
 fn has_error_code(tir: &TIR, code: DiagnosticCode) -> bool {
 	tir.diagnostics
 		.iter()

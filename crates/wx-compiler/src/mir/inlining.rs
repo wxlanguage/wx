@@ -23,7 +23,7 @@ pub(super) fn rebase_scope(
 		scope_offset,
 		wrapper_scope,
 		root_scope: scope_offset,
-		root_bias: 0,
+		root_bias: LocalIndex::new(0),
 	}
 	.rebase(expr);
 }
@@ -50,10 +50,12 @@ impl Rebaser {
 	/// `Break`, `Continue` — no local of their own to shift).
 	#[inline]
 	fn rebase_scope(&self, scope_index: &mut ScopeIndex) {
-		if *scope_index == 0 {
+		if *scope_index == ScopeIndex::new(0) {
 			*scope_index = self.root_scope;
 		} else {
-			*scope_index += self.scope_offset;
+			*scope_index = ScopeIndex::new(
+				u32::from(*scope_index) + u32::from(self.scope_offset),
+			);
 		}
 	}
 
@@ -65,11 +67,15 @@ impl Rebaser {
 		scope_index: &mut ScopeIndex,
 		local_index: &mut LocalIndex,
 	) {
-		if *scope_index == 0 {
+		if *scope_index == ScopeIndex::new(0) {
 			*scope_index = self.root_scope;
-			*local_index += self.root_bias;
+			*local_index = LocalIndex::new(
+				u32::from(*local_index) + u32::from(self.root_bias),
+			);
 		} else {
-			*scope_index += self.scope_offset;
+			*scope_index = ScopeIndex::new(
+				u32::from(*scope_index) + u32::from(self.scope_offset),
+			);
 		}
 	}
 
@@ -305,9 +311,10 @@ fn inline_call(
 	let result_ty = callee.block.ty;
 	let callee_root = &callee.scopes[0];
 
-	let root_bias =
-		caller_scopes[call_site_scope as usize].locals.len() as LocalIndex;
-	caller_scopes[call_site_scope as usize]
+	let root_bias = LocalIndex::new(
+		caller_scopes[usize::from(call_site_scope)].locals.len() as u32,
+	);
+	caller_scopes[usize::from(call_site_scope)]
 		.locals
 		.extend(callee_root.locals.iter().cloned());
 
@@ -319,13 +326,13 @@ fn inline_call(
 			ty: Type::Unit,
 			kind: ExprKind::LocalSet {
 				scope_index: call_site_scope,
-				local_index: root_bias + i as LocalIndex,
+				local_index: LocalIndex::new(u32::from(root_bias) + i as u32),
 				value: Box::new(arg),
 			},
 		})
 		.collect();
 
-	let wrapper_scope = caller_scopes.len() as ScopeIndex;
+	let wrapper_scope = ScopeIndex::new(caller_scopes.len() as u32);
 	caller_scopes.push(BlockScope {
 		kind: tir::BlockKind::Block,
 		parent: Some(call_site_scope),
@@ -341,7 +348,9 @@ fn inline_call(
 	// (the callee's own root) becomes `wrapper_scope` by that same formula.
 	for scope in callee.scopes[1..].iter().cloned() {
 		caller_scopes.push(BlockScope {
-			parent: scope.parent.map(|p| p + wrapper_scope),
+			parent: scope.parent.map(|p| {
+				ScopeIndex::new(u32::from(p) + u32::from(wrapper_scope))
+			}),
 			..scope
 		});
 	}
@@ -715,7 +724,7 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 				&mut caller_func.block,
 				&mut caller_func.scopes,
 				&targets,
-				0,
+				ScopeIndex::new(0),
 			);
 
 			for &f_id in &inlined {

@@ -243,7 +243,7 @@ pub enum Instruction {
 	/// Indirect call via the function table; the encoder resolves `type_index`
 	/// from the referenced MIR signature.
 	CallIndirectSym {
-		mir_sig_index: u32,
+		mir_sig_index: mir::SignatureIndex,
 	},
 	// Memory
 	MemorySize(crate::ast::DefId),

@@ -77,11 +77,13 @@ impl<'f> Scheduler<'f> {
 	pub fn schedule(func: &'f Function, mir: &'f mir::MIR) -> wasm::Function {
 		let sig = &mir.signatures[{
 			// Find the function's signature via its DefId.
-			mir.functions
-				.iter()
-				.find(|f| f.id == func.id)
-				.expect("function not found")
-				.signature_index as usize
+			usize::from(
+				mir.functions
+					.iter()
+					.find(|f| f.id == func.id)
+					.expect("function not found")
+					.signature_index,
+			)
 		}];
 
 		// Aggregate params are flattened to one local per scalar.
@@ -2264,7 +2266,11 @@ impl<'f> Scheduler<'f> {
 
 	// ── Index resolution ───────────────────────────────────────────────────────
 
-	fn emit_call(&mut self, callee_node: DataNodeIndex, callee_sig: u32) {
+	fn emit_call(
+		&mut self,
+		callee_node: DataNodeIndex,
+		callee_sig: mir::SignatureIndex,
+	) {
 		match &self.func.data_nodes[callee_node as usize].kind {
 			DataNodeKind::FunctionRef { id } => {
 				self.body.push(Instruction::Call(*id));
