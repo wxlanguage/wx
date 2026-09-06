@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefIdGenerator};
+use crate::index::index_newtype;
 use crate::tir::{self, ItemAttribute};
 
 mod inlining;
@@ -19,7 +20,11 @@ pub type ScopeIndex = u32;
 pub type GlobalIndex = u32;
 pub type SignatureIndex = u32;
 pub type FunctionIndex = u32;
-pub type AggregateIndex = u32;
+index_newtype!(
+	/// Index into `MIR::aggregates`. Reach the aggregate itself with
+	/// [`MIR::aggregate`] rather than indexing the table by hand.
+	AggregateIndex
+);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone)]
@@ -52,12 +57,14 @@ pub enum ExprKind {
 	AggregateGet {
 		scope_index: ScopeIndex,
 		local_index: LocalIndex,
-		value_index: u32,
+		/// Physical, not declaration, order — see [`PhysIndex`].
+		value_index: PhysIndex,
 	},
 	AggregateSet {
 		scope_index: ScopeIndex,
 		local_index: LocalIndex,
-		value_index: u32,
+		/// Physical, not declaration, order — see [`PhysIndex`].
+		value_index: PhysIndex,
 		value: Box<Expression>,
 	},
 	Global {
@@ -358,8 +365,13 @@ pub enum ExprKind {
 	},
 }
 
+// `Debug` is gated on `debug_assertions` rather than `test` so that panics in
+// a debug build can name the offending type. It must *not* also appear in the
+// `test` derive below: `cargo test` enables both cfgs, and two `derive(Debug)`
+// would be conflicting impls.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum Type {
 	I32,
 	I64,
@@ -405,15 +417,153 @@ pub struct Expression {
 	pub ty: Type,
 }
 
+index_newtype!(
+	/// Index into an aggregate's *physical* (layout-order) field list.
+	///
+	/// Physical order is alignment-sorted unless the aggregate is
+	/// `#[fixed_order]`, so this is **not** a declaration index — reach it via
+	/// [`Aggregate::physical`].
+	PhysIndex
+);
+
+index_newtype!(
+	/// Index into an aggregate's flattened scalar list.
+	///
+	/// One scalar is one WebAssembly value: one signature slot, one local, one
+	/// stack entry. Deliberately a different type from [`PhysIndex`], because
+	/// one physical field contributes *many* scalars when it is itself an
+	/// aggregate and *none* when it is zero-sized — the two index spaces
+	/// coincide only for a flat, ZST-free aggregate, and confusing them
+	/// silently emits wrong code.
+	ScalarIndex
+);
+
+/// One field of an aggregate, in physical order. Type and byte offset live in
+/// one struct because both are always reached by the same [`PhysIndex`].
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct Field {
+	pub ty: Type,
+	/// Byte offset from the aggregate's base.
+	pub offset: u32,
+}
+
+/// One WebAssembly value inside an aggregate.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct Scalar {
+	/// Always convertible to a `wasm::ScalarType`, by construction.
+	pub ty: Type,
+	/// Byte offset from the *aggregate's* base, with every enclosing field's
+	/// offset already folded in. Carrying it here is what lets an aggregate
+	/// store or load walk the scalar list flat instead of recursing the field
+	/// tree — it is the one place the memory view and the value view meet.
+	pub offset: u32,
+}
+
+/// An aggregate seen as a flat run of WebAssembly values, in physical-field
+/// pre-order — the same order `wasm::flatten_type_to_scalars` produces and the
+/// WASM signature uses.
+#[derive(Clone)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct ScalarTable {
+	entries: Box<[Scalar]>,
+	/// Physical field `i` owns `entries[field_starts[i]..field_starts[i + 1]]`.
+	/// Monotone, length is `fields + 1`, and the last entry is `entries.len()`.
+	field_starts: Box<[u32]>,
+}
+
+impl ScalarTable {
+	/// Total number of WebAssembly values this aggregate occupies.
+	#[inline]
+	pub fn len(&self) -> usize {
+		self.entries.len()
+	}
+
+	#[inline]
+	pub fn is_empty(&self) -> bool {
+		self.entries.is_empty()
+	}
+
+	#[inline]
+	pub fn get(&self, index: ScalarIndex) -> Scalar {
+		self.entries[usize::from(index)]
+	}
+
+	#[inline]
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = &Scalar> {
+		self.entries.iter()
+	}
+
+	/// The scalars physical field `field` contributes — empty for a ZST field,
+	/// more than one for a field that is itself an aggregate.
+	#[inline]
+	pub fn of_field(&self, field: PhysIndex) -> &[Scalar] {
+		let i = usize::from(field);
+		let (start, end) = (
+			self.field_starts[i] as usize,
+			self.field_starts[i + 1] as usize,
+		);
+		&self.entries[start..end]
+	}
+
+	/// Half-open scalar range owned by physical field `field`.
+	#[inline]
+	pub fn field_range(&self, field: PhysIndex) -> std::ops::Range<u32> {
+		let i = usize::from(field);
+		self.field_starts[i]..self.field_starts[i + 1]
+	}
+
+	/// Which physical field owns `scalar`. Used to fold an `AggregateGet` of a
+	/// literal aggregate back down to the sub-node holding that scalar.
+	pub fn owner(&self, scalar: ScalarIndex) -> PhysIndex {
+		let raw = u32::from(scalar);
+		// `field_starts` is monotone with a terminator, so the owning field is
+		// the last start not exceeding `raw`.
+		let phys = self
+			.field_starts
+			.partition_point(|&start| start <= raw)
+			.saturating_sub(1);
+		PhysIndex::new(phys as u32)
+	}
+}
+
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Aggregate {
-	pub values: Box<[Type]>,
-	/// Byte offset of each field, in physical (layout) order.
-	pub offsets: Box<[u32]>,
+	/// Fields in physical (layout) order.
+	pub fields: Box<[Field]>,
+	/// Size and alignment of the aggregate as a whole.
 	pub layout: Layout,
-	/// `decl_to_phys[decl_index]` = physical slot index.
-	decl_to_phys: Box<[u32]>,
+	/// The same aggregate, seen as a flat run of WebAssembly values.
+	pub scalars: ScalarTable,
+	/// `decl_to_phys[decl_index]` = physical slot. Private so that reaching
+	/// physical order from declaration order always goes through
+	/// [`Aggregate::physical`].
+	decl_to_phys: Box<[PhysIndex]>,
+}
+
+impl Aggregate {
+	/// Physical slot holding the field declared at `decl_index`.
+	#[inline]
+	pub fn physical(&self, decl_index: usize) -> PhysIndex {
+		self.decl_to_phys[decl_index]
+	}
+
+	#[inline]
+	pub fn field(&self, index: PhysIndex) -> Field {
+		self.fields[usize::from(index)]
+	}
+
+	/// Number of physical fields. Note this is *not* the number of scalars —
+	/// see [`ScalarTable::len`].
+	#[inline]
+	pub fn field_count(&self) -> usize {
+		self.fields.len()
+	}
 }
 
 /// Whether a memory is locally defined or provided by the WASM host.
@@ -633,6 +783,12 @@ enum FieldOrder {
 }
 
 impl MIR {
+	/// The aggregate `index` refers to.
+	#[inline]
+	pub fn aggregate(&self, index: AggregateIndex) -> &Aggregate {
+		&self.aggregates[usize::from(index)]
+	}
+
 	pub fn build(
 		tir: &tir::TIR,
 		interner: &ast::StringInterner,
@@ -933,6 +1089,12 @@ struct FunctionContext {
 }
 
 impl<'tir> Builder<'tir> {
+	/// The aggregate `index` refers to, in the table built so far.
+	#[inline]
+	fn aggregate(&self, index: AggregateIndex) -> &Aggregate {
+		&self.aggregates[usize::from(index)]
+	}
+
 	/// Given an `AssocTypeProjection`'s already-known `trait_index`/
 	/// `assoc_name` and a fully concrete `base`, finds the applicable impl
 	/// and its stored associated-type value. That value lives in the
@@ -1118,13 +1280,13 @@ impl<'tir> Builder<'tir> {
 					.collect();
 				let aggregate_index =
 					self.ensure_aggregate(mir_elems, FieldOrder::Sorted);
-				self.aggregates[aggregate_index as usize].layout
+				self.aggregate(aggregate_index).layout
 			}
 			tir::Type::Struct { struct_index, args } => {
 				let si = *struct_index;
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(si, args);
-				self.aggregates[aggregate_index as usize].layout
+				self.aggregate(aggregate_index).layout
 			}
 			_ => unreachable!(),
 		}
@@ -1157,31 +1319,60 @@ impl<'tir> Builder<'tir> {
 
 		// Single pass: total layout, per-field byte offsets, and ordering maps.
 		let mut layout = Layout { size: 0, align: 1 };
-		let mut offsets = Vec::with_capacity(sorted.len());
-		let mut decl_to_phys = vec![0u32; sorted.len()];
+		let mut fields = Vec::with_capacity(sorted.len());
+		let mut decl_to_phys = vec![PhysIndex::new(0); sorted.len()];
 		for (phys, (decl, field_layout)) in sorted.iter().copied().enumerate() {
 			layout.size = (layout.size + field_layout.align - 1)
 				& !(field_layout.align - 1);
-			offsets.push(layout.size);
+			fields.push(Field {
+				ty: mir_fields[decl as usize],
+				offset: layout.size,
+			});
 			layout.size += field_layout.size;
 			layout.align = layout.align.max(field_layout.align);
-			decl_to_phys[decl as usize] = phys as u32;
+			decl_to_phys[decl as usize] = PhysIndex::new(phys as u32);
 		}
 		layout = layout.pad_to_align();
 
-		let values: Box<[Type]> = sorted
-			.iter()
-			.map(|&(decl, _)| mir_fields[decl as usize])
-			.collect();
+		// The flat scalar view. Every nested field's own table already exists
+		// (fields are lowered before their parent is interned), so this splices
+		// rather than recurses: a nested field contributes its child's scalars
+		// with the child's base offset folded in, a ZST field contributes none,
+		// and anything else contributes exactly one.
+		let mut entries: Vec<Scalar> = Vec::with_capacity(fields.len());
+		let mut field_starts: Vec<u32> = Vec::with_capacity(fields.len() + 1);
+		for field in &fields {
+			field_starts.push(entries.len() as u32);
+			match field.ty {
+				Type::Unit | Type::Never => {}
+				Type::Aggregate { aggregate_index } => {
+					let nested = self.aggregate(aggregate_index);
+					entries.extend(nested.scalars.iter().map(|scalar| {
+						Scalar {
+							ty: scalar.ty,
+							offset: field.offset + scalar.offset,
+						}
+					}));
+				}
+				ty => entries.push(Scalar {
+					ty,
+					offset: field.offset,
+				}),
+			}
+		}
+		field_starts.push(entries.len() as u32);
 
-		let aggregate_index = self.aggregates.len() as AggregateIndex;
+		let aggregate_index = AggregateIndex::new(self.aggregates.len() as u32);
 		self.aggregate_index_lookup
 			.insert((order, mir_fields), aggregate_index);
 		self.aggregates.push(Aggregate {
-			decl_to_phys: decl_to_phys.into_boxed_slice(),
+			fields: fields.into_boxed_slice(),
 			layout,
-			offsets: offsets.into_boxed_slice(),
-			values,
+			scalars: ScalarTable {
+				entries: entries.into_boxed_slice(),
+				field_starts: field_starts.into_boxed_slice(),
+			},
+			decl_to_phys: decl_to_phys.into_boxed_slice(),
 		});
 		aggregate_index
 	}
@@ -1202,7 +1393,7 @@ impl<'tir> Builder<'tir> {
 			}
 			Type::Function { .. } => Layout { size: 4, align: 4 },
 			Type::Aggregate { aggregate_index } => {
-				self.aggregates[aggregate_index as usize].layout
+				self.aggregate(aggregate_index).layout
 			}
 		}
 	}
@@ -1794,7 +1985,7 @@ impl<'tir> Builder<'tir> {
 				kind: ExprKind::AggregateGet {
 					scope_index: si,
 					local_index: li,
-					value_index: 0,
+					value_index: PhysIndex::new(0),
 				},
 				ty: ptr_ty,
 			};
@@ -2388,13 +2579,13 @@ impl<'tir> Builder<'tir> {
 					};
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, args);
-				let aggregate = &self.aggregates[aggregate_index as usize];
+				let aggregate = self.aggregate(aggregate_index);
 				let decl_index = usize::from(
 					self.tir.items.structs[usize::from(struct_index)].lookup
 						[&member.inner],
 				);
-				let phys_index = aggregate.decl_to_phys[decl_index];
-				let field_ty = aggregate.values[phys_index as usize];
+				let phys_index = aggregate.physical(decl_index);
+				let field_ty = aggregate.field(phys_index).ty;
 
 				match &object.kind {
 					tir::ExprKind::Local {
@@ -2453,12 +2644,12 @@ impl<'tir> Builder<'tir> {
 					.collect();
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, args);
-				let decl_to_phys =
-					&self.aggregates[aggregate_index as usize].decl_to_phys;
+				let aggregate = self.aggregate(aggregate_index);
 				let mut phys_slots: Vec<Option<Expression>> =
 					(0..lowered.len()).map(|_| None).collect();
 				for (decl, expr) in lowered.into_iter().enumerate() {
-					phys_slots[decl_to_phys[decl] as usize] = Some(expr);
+					phys_slots[usize::from(aggregate.physical(decl))] =
+						Some(expr);
 				}
 				let values: Box<[Expression]> =
 					phys_slots.into_iter().map(|e| e.unwrap()).collect();
@@ -2484,12 +2675,12 @@ impl<'tir> Builder<'tir> {
 					.collect();
 				let aggregate_index =
 					self.ensure_aggregate(types, FieldOrder::Sorted);
-				let decl_to_phys =
-					&self.aggregates[aggregate_index as usize].decl_to_phys;
+				let aggregate = self.aggregate(aggregate_index);
 				let mut phys_slots: Vec<Option<Expression>> =
 					(0..lowered.len()).map(|_| None).collect();
 				for (decl, expr) in lowered.into_iter().enumerate() {
-					phys_slots[decl_to_phys[decl] as usize] = Some(expr);
+					phys_slots[usize::from(aggregate.physical(decl))] =
+						Some(expr);
 				}
 				let values: Box<[Expression]> =
 					phys_slots.into_iter().map(|e| e.unwrap()).collect();
@@ -2687,13 +2878,12 @@ impl<'tir> Builder<'tir> {
 								"destructuring path step must name an aggregate"
 							)
 						};
-						let aggregate =
-							&self.aggregates[aggregate_index as usize];
+						let aggregate = self.aggregate(aggregate_index);
 						// Tuples are alignment-sorted just like structs, so
 						// the declaration index has to be mapped through.
 						let value_index =
-							aggregate.decl_to_phys[step.index as usize];
-						let ty = aggregate.values[value_index as usize];
+							aggregate.physical(step.index as usize);
+						let ty = aggregate.field(value_index).ty;
 
 						projected = Some(Expression {
 							kind: ExprKind::AggregateGet {
@@ -3021,7 +3211,7 @@ impl<'tir> Builder<'tir> {
 							kind: ExprKind::AggregateGet {
 								scope_index: si,
 								local_index: li,
-								value_index: 0,
+								value_index: PhysIndex::new(0),
 							},
 							ty: ptr_ty,
 						};
@@ -3029,7 +3219,7 @@ impl<'tir> Builder<'tir> {
 							kind: ExprKind::AggregateGet {
 								scope_index: si,
 								local_index: li,
-								value_index: 1,
+								value_index: PhysIndex::new(1),
 							},
 							ty: idx_ty,
 						};
@@ -3387,7 +3577,7 @@ impl<'tir> Builder<'tir> {
 						kind: ExprKind::AggregateGet {
 							scope_index: u32::from(*scope_index),
 							local_index: u32::from(*local_index),
-							value_index: 1,
+							value_index: PhysIndex::new(1),
 						},
 						ty: result_ty,
 					},
@@ -3412,7 +3602,7 @@ impl<'tir> Builder<'tir> {
 							kind: ExprKind::AggregateGet {
 								scope_index: 0,
 								local_index: temp_idx,
-								value_index: 1,
+								value_index: PhysIndex::new(1),
 							},
 							ty: result_ty,
 						}
@@ -3430,7 +3620,7 @@ impl<'tir> Builder<'tir> {
 						kind: ExprKind::AggregateGet {
 							scope_index: u32::from(*scope_index),
 							local_index: u32::from(*local_index),
-							value_index: 0,
+							value_index: PhysIndex::new(0),
 						},
 						ty: result_ty,
 					},
@@ -3455,7 +3645,7 @@ impl<'tir> Builder<'tir> {
 							kind: ExprKind::AggregateGet {
 								scope_index: 0,
 								local_index: temp_idx,
-								value_index: 0,
+								value_index: PhysIndex::new(0),
 							},
 							ty: result_ty,
 						}
@@ -4164,10 +4354,9 @@ impl<'tir> Builder<'tir> {
 					self.tir.items.structs[usize::from(struct_index)].lookup
 						[&member.inner],
 				);
-				let phys_index = self.aggregates[aggregate_index as usize]
-					.decl_to_phys[decl_index] as usize;
-				let field_offset = self.aggregates[aggregate_index as usize]
-					.offsets[phys_index];
+				let aggregate = self.aggregate(aggregate_index);
+				let field_offset =
+					aggregate.field(aggregate.physical(decl_index)).offset;
 				(base_ptr, base_offset + field_offset, memory_id)
 			}
 			tir::PlaceKind::Index { object, index } => {
@@ -4243,8 +4432,8 @@ impl<'tir> Builder<'tir> {
 					self.tir.items.structs[usize::from(struct_index)].lookup
 						[&member.inner],
 				);
-				let phys_index = self.aggregates[aggregate_index as usize]
-					.decl_to_phys[decl_index] as usize;
+				let phys_index =
+					self.aggregate(aggregate_index).physical(decl_index);
 				let tir::ExprKind::Local {
 					scope_index,
 					local_index,
@@ -4257,7 +4446,7 @@ impl<'tir> Builder<'tir> {
 				ExprKind::AggregateSet {
 					scope_index: u32::from(*scope_index),
 					local_index: u32::from(*local_index),
-					value_index: phys_index as u32,
+					value_index: phys_index,
 					value: Box::new(value),
 				}
 			}

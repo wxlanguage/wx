@@ -606,7 +606,7 @@ fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I32)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == Type::I32)
 		.expect("Wrapper<i32> aggregate with I32 field not found");
 	assert_eq!(agg.layout.size, 4);
 }
@@ -686,7 +686,7 @@ fn test_struct_layout_is_alignment_sorted() {
 	let sig_index = case.mir.functions[0].signature_index as usize;
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -695,8 +695,105 @@ fn test_struct_layout_is_alignment_sorted() {
 	assert_eq!(agg.layout.size, 24);
 	assert_eq!(agg.layout.align, 8);
 	// Physical order: b(i64)@0, d(f64)@8, c(u32)@16, a(bool)@20
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 20]);
-	assert_eq!(&*agg.values, &[Type::I64, Type::F64, Type::U32, Type::Bool]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 20]);
+	assert_eq!(types, [Type::I64, Type::F64, Type::U32, Type::Bool]);
+}
+
+/// Three levels of nesting, each level alignment-sorted so that the nested
+/// field is reordered *ahead* of a scalar sibling. Pins two things that the
+/// opt/codegen layers both depend on and currently re-derive independently:
+///
+/// - a nested field is a single entry in `values`/`offsets`, so the physical
+///   field count says nothing about how many WASM values the aggregate needs;
+/// - `flatten_type_to_scalars` recurses through that nesting, so `Top` is
+///   *two* physical fields but *three* WASM scalars.
+///
+/// Anything caching a flattened view of an aggregate has to agree with
+/// `flatten_type_to_scalars` here, including the reordering.
+#[test]
+fn test_nested_struct_flattens_to_more_scalars_than_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn dummy(t: Top) -> Top { t }
+        export { dummy }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let sig_index = case.mir.functions[0].signature_index as usize;
+	let top_index = match case.mir.signatures[sig_index].params()[0] {
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		_ => panic!("expected Top to lower to an aggregate"),
+	};
+
+	// Top: `mid` (align 8) sorts ahead of `flag` (align 1); 17B padded to 24.
+	let top = &case.mir.aggregates[top_index];
+	assert_eq!(top.layout.size, 24);
+	assert_eq!(top.layout.align, 8);
+	assert_eq!(top.fields[0].offset, 0);
+	assert_eq!(top.fields[1].offset, 16);
+	assert_eq!(top.fields[1].ty, Type::U8);
+	let mid_index = match top.fields[0].ty {
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		_ => panic!("expected Top's first physical field to be Mid"),
+	};
+
+	// Mid: `deep` (align 8) sorts ahead of `tag` (align 1); 9B padded to 16.
+	let mid = &case.mir.aggregates[mid_index];
+	assert_eq!(mid.layout.size, 16);
+	assert_eq!(mid.layout.align, 8);
+	assert_eq!(mid.fields[0].offset, 0);
+	assert_eq!(mid.fields[1].offset, 8);
+	assert_eq!(mid.fields[1].ty, Type::U8);
+	let deep_index = match mid.fields[0].ty {
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		_ => panic!("expected Mid's first physical field to be Deep"),
+	};
+
+	let deep = &case.mir.aggregates[deep_index];
+	assert_eq!(deep.layout.size, 8);
+	assert_eq!(deep.layout.align, 8);
+	assert_eq!(deep.fields[0].offset, 0);
+	assert_eq!(deep.fields[0].ty, Type::U64);
+
+	// Two physical fields, three WASM scalars — the counts diverge, and the
+	// scalar order follows the alignment-sorted physical order, not the
+	// declaration order (`flag` is declared first but flattens last).
+	assert_eq!(top.field_count(), 2);
+	assert_eq!(top.scalars.len(), 3);
+
+	// Offsets are absolute within `Top`, with every enclosing field folded in.
+	let scalar_offsets: Vec<u32> =
+		top.scalars.iter().map(|s| s.offset).collect();
+	assert_eq!(scalar_offsets, [0, 8, 16]);
+
+	// Each physical field owns a contiguous run: `mid` owns 0..2, `flag` 2..3.
+	assert_eq!(top.scalars.field_range(PhysIndex::new(0)), 0..2);
+	assert_eq!(top.scalars.field_range(PhysIndex::new(1)), 2..3);
+	assert_eq!(top.scalars.owner(ScalarIndex::new(0)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(1)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(2)), PhysIndex::new(1));
+
+	// The precomputed table must agree with a fresh recursive flatten — this
+	// is the invariant every opt/codegen consumer now relies on.
+	let scalars = crate::wasm::flatten_type_to_scalars(
+		Type::Aggregate {
+			aggregate_index: AggregateIndex::new(top_index as u32),
+		},
+		&case.mir.aggregates,
+	);
+	assert_eq!(
+		scalars,
+		vec![
+			crate::wasm::ScalarType::I64, // mid.deep.id
+			crate::wasm::ScalarType::I32, // mid.tag
+			crate::wasm::ScalarType::I32, // flag
+		]
+	);
 }
 
 #[test]
@@ -718,7 +815,7 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	let sig_index = case.mir.functions[0].signature_index as usize;
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -727,9 +824,13 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	// d(f64)@24 (padded) — no alignment-descending reordering.
 	assert_eq!(agg.layout.size, 32);
 	assert_eq!(agg.layout.align, 8);
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 24]);
-	assert_eq!(&*agg.values, &[Type::Bool, Type::I64, Type::U32, Type::F64]);
-	assert_eq!(&*agg.decl_to_phys, &[0, 1, 2, 3]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 24]);
+	assert_eq!(types, [Type::Bool, Type::I64, Type::U32, Type::F64]);
+	let phys: Vec<usize> =
+		(0..4).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [0, 1, 2, 3]);
 }
 
 #[test]
@@ -919,13 +1020,13 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 	let agg_i32 = match case.mir.signatures[sig_i32.signature_index as usize]
 		.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Point<i32> to be an aggregate"),
 	};
 	let agg_f32 = match case.mir.signatures[sig_f32.signature_index as usize]
 		.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
 		_ => panic!("expected Point<f32> to be an aggregate"),
 	};
 
@@ -933,14 +1034,11 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		agg_i32, agg_f32,
 		"Point<i32> and Point<f32> must map to distinct aggregates"
 	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_i32].values,
-		&[Type::I32, Type::I32]
-	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_f32].values,
-		&[Type::F32, Type::F32]
-	);
+	let types = |i: usize| -> Vec<Type> {
+		case.mir.aggregates[i].fields.iter().map(|f| f.ty).collect()
+	};
+	assert_eq!(types(agg_i32), [Type::I32, Type::I32]);
+	assert_eq!(types(agg_f32), [Type::F32, Type::F32]);
 }
 
 /// Constructing and accessing a field on a concrete `Point<i32>` inside a
@@ -973,7 +1071,7 @@ fn test_generic_struct_init_and_field_access_concrete() {
 		.aggregates
 		.iter()
 		.position(|a| {
-			a.values.len() == 2 && a.values.iter().all(|&t| t == Type::I32)
+			a.fields.len() == 2 && a.fields.iter().all(|f| f.ty == Type::I32)
 		})
 		.expect("Point<i32> aggregate not found");
 	assert_eq!(case.mir.aggregates[agg_idx].layout.size, 8);
@@ -1008,7 +1106,7 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I64)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == Type::I64)
 		.expect("Box<i64> aggregate with I64 field not found");
 	assert_eq!(agg.layout.size, 8);
 	assert_eq!(agg.layout.align, 8);
@@ -1295,7 +1393,11 @@ fn test_generic_slice_impl_method_lowers_correctly() {
 		result = expressions.last().expect("a block has a result expression");
 	}
 	assert!(
-		matches!(result.kind, ExprKind::AggregateGet { value_index: 1, .. }),
+		matches!(
+			result.kind,
+			ExprKind::AggregateGet { value_index, .. }
+				if usize::from(value_index) == 1
+		),
 		"`slice_len` should read the slice aggregate's length slot directly"
 	);
 	assert!(
@@ -1737,7 +1839,9 @@ fn function_body_statements<'a>(
 }
 
 /// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
-fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
+fn destructured_store(
+	expr: &Expression,
+) -> (ScopeIndex, LocalIndex, PhysIndex) {
 	let ExprKind::LocalSet {
 		local_index, value, ..
 	} = &expr.kind
@@ -1839,15 +1943,18 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
 	let Type::Aggregate { aggregate_index } = param_ty else {
 		panic!("a tuple parameter lowers to an aggregate")
 	};
-	let agg = &case.mir.aggregates[aggregate_index as usize];
+	let agg = case.mir.aggregate(aggregate_index);
 	// Sorted by alignment descending: i64, u32, bool.
-	assert_eq!(&*agg.values, &[Type::I64, Type::U32, Type::Bool]);
-	assert_eq!(&*agg.decl_to_phys, &[2, 0, 1]);
+	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(types, [Type::I64, Type::U32, Type::Bool]);
+	let phys: Vec<usize> =
+		(0..3).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [2, 0, 1]);
 
 	let statements = function_body_statements(&case, "f");
-	let slots: Vec<u32> = statements[..3]
+	let slots: Vec<usize> = statements[..3]
 		.iter()
-		.map(|e| destructured_store(e).2)
+		.map(|e| usize::from(destructured_store(e).2))
 		.collect();
 	assert_eq!(
 		slots,
@@ -1869,8 +1976,8 @@ fn test_struct_destructuring_reads_declared_fields() {
 	assert_no_errors(&case);
 	let statements = function_body_statements(&case, "f");
 	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
-	assert_eq!(destructured_store(&statements[0]).2, 1);
-	assert_eq!(destructured_store(&statements[1]).2, 0);
+	assert_eq!(usize::from(destructured_store(&statements[0]).2), 1);
+	assert_eq!(usize::from(destructured_store(&statements[1]).2), 0);
 }
 
 /// Nested patterns are flattened into projection paths, so an inner binding

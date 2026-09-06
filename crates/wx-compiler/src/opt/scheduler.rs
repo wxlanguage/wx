@@ -51,7 +51,9 @@ pub struct Scheduler<'f> {
 	locals: Vec<Local>,
 	/// Maps a scalar data-node index to its WASM local index.
 	node_to_local: HashMap<DataNodeIndex, u32>,
-	/// Maps an aggregate data-node index to its per-field WASM local indices.
+	/// Maps an aggregate data-node index to one WASM local per *scalar* it
+	/// contains, in `mir::ScalarTable` order — not one per field, since a
+	/// nested field spans several scalars and a zero-sized field spans none.
 	node_to_aggregate_locals: HashMap<DataNodeIndex, Box<[u32]>>,
 	/// Output instruction stream.
 	body: Vec<Instruction>,
@@ -82,7 +84,7 @@ impl<'f> Scheduler<'f> {
 				.signature_index as usize
 		}];
 
-		// Aggregate params are flattened to one local per field.
+		// Aggregate params are flattened to one local per scalar.
 		let locals: Vec<Local> = sig
 			.params()
 			.iter()
@@ -162,24 +164,29 @@ impl<'f> Scheduler<'f> {
 						DataNodeKind::AggregateCallResult {
 							aggregate_index,
 						} => {
-							// Multi-value return: fields arrive deepest-first; pop in
-							// reverse so each local.set captures the correct field.
+							// Multi-value return: one WASM value per scalar, not
+							// per field — a nested field returns several. This
+							// has to agree with the signature that
+							// `codegen::intern_signature` derived from the same
+							// `ScalarTable`. Values arrive deepest-first, so pop
+							// in reverse.
 							//
 							// Always spill: result may be referenced via control-node
 							// args (return, call) not tracked in DataNode::uses.
-							let mut locals = Vec::with_capacity(
-								self.mir.aggregates[aggregate_index as usize]
-									.values
-									.len(),
-							);
-							for &t in self.mir.aggregates
-								[aggregate_index as usize]
-								.values
+							let scalar_types: Vec<ScalarType> = self
+								.mir
+								.aggregate(aggregate_index)
+								.scalars
 								.iter()
-								.rev()
-							{
-								let ty = ScalarType::try_from(t)
-									.expect("field must be scalar");
+								.map(|scalar| {
+									ScalarType::try_from(scalar.ty).expect(
+										"a ScalarTable entry is scalar by construction",
+									)
+								})
+								.collect();
+							let mut locals =
+								Vec::with_capacity(scalar_types.len());
+							for ty in scalar_types.into_iter().rev() {
 								let local = self.alloc_local(ty);
 								self.body.push(Instruction::LocalSet(local));
 								locals.push(local);
@@ -1847,42 +1854,17 @@ impl<'f> Scheduler<'f> {
 			}
 
 			DataNodeKind::AggregateGet {
-				aggregate,
-				field_index,
-				..
+				aggregate, scalar, ..
 			} => {
-				// Ensure the aggregate's per-*leaf* locals are populated (see
-				// `ensure_aggregate_locals`), then find the one belonging to
-				// this (always-scalar, per `get_aggregate_field`) top-level
-				// field: `node_to_aggregate_locals` is flattened, so a field
-				// preceded by a nested-aggregate sibling doesn't sit at
-				// `field_index` directly — skip past every leaf contributed
-				// by earlier sibling fields first.
+				// `node_to_aggregate_locals` holds one local per WASM value in
+				// `ScalarTable` order, and `scalar` indexes that same order —
+				// so this is a direct lookup. It used to be a field index,
+				// which meant re-deriving the field-to-value mapping here on
+				// every emission.
 				self.ensure_aggregate_locals(aggregate);
-				let aggregate_index =
-					match &self.func.data_nodes[aggregate as usize].kind {
-						DataNodeKind::Aggregate {
-							aggregate_index, ..
-						}
-						| DataNodeKind::AggregateCallResult {
-							aggregate_index,
-						} => *aggregate_index,
-						_ => unreachable!(
-							"AggregateGet::aggregate must itself be an aggregate node"
-						),
-					};
-				let leaf_offset: usize = self.mir.aggregates
-					[aggregate_index as usize]
-					.values[..field_index as usize]
-					.iter()
-					.map(|&t| {
-						wasm::flatten_type_to_scalars(t, &self.mir.aggregates)
-							.len()
-					})
-					.sum();
-				let field_local =
-					self.node_to_aggregate_locals[&aggregate][leaf_offset];
-				self.body.push(Instruction::LocalGet(field_local));
+				let local = self.node_to_aggregate_locals[&aggregate]
+					[usize::from(scalar)];
+				self.body.push(Instruction::LocalGet(local));
 			}
 
 			DataNodeKind::Phi { .. } => {
@@ -1953,7 +1935,7 @@ impl<'f> Scheduler<'f> {
 			// read's descendants), and subsequent uses read the saved local.
 			DataNodeKind::GlobalGet { .. } => true,
 
-			// Aggregates live in per-field locals, not on the stack.
+			// Aggregates live in per-scalar locals, not on the stack.
 			DataNodeKind::Aggregate { .. } => true,
 
 			// For all other ops: spill only if the result is consumed more than once.
@@ -1961,14 +1943,14 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Ensure per-*leaf* WASM locals exist for an `Aggregate` node.
+	/// Ensure per-*scalar* WASM locals exist for an `Aggregate` node.
 	/// Emits each scalar field expression and spills it to a fresh local; a
 	/// field that is itself an aggregate has no local of its own — it's
-	/// walked into recursively, and its own (already- or newly-computed)
-	/// leaf locals are spliced in directly, so `node_to_aggregate_locals`
-	/// always ends up holding one entry per *leaf* scalar, flattened in the
-	/// same pre-order as `wasm::flatten_type_to_scalars`. Records the mapping in
-	/// `node_to_aggregate_locals`.
+	/// walked into recursively and its own (already- or newly-computed)
+	/// locals are spliced in directly, and a zero-sized field contributes
+	/// none. So `node_to_aggregate_locals` always ends up holding one entry
+	/// per scalar, in the same order as the aggregate's `mir::ScalarTable`,
+	/// which is what lets `AggregateGet`'s `ScalarIndex` index it directly.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
 	/// are populated by `emit_control` when the call instruction is emitted.
@@ -1991,19 +1973,20 @@ impl<'f> Scheduler<'f> {
 					"ensure_aggregate_locals called on non-aggregate node"
 				),
 			};
-		let mut locals = Vec::with_capacity(fields.len());
-		for (i, &field_node) in fields.iter().enumerate() {
-			let field_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			match field_ty {
+		let mir = self.mir;
+		let agg = mir.aggregate(aggregate_index);
+		let mut locals = Vec::with_capacity(agg.scalars.len());
+		for (field, &field_node) in agg.fields.iter().zip(fields.iter()) {
+			match field.ty {
+				mir::Type::Unit | mir::Type::Never => {}
 				mir::Type::Aggregate { .. } => {
 					self.ensure_aggregate_locals(field_node);
 					locals.extend_from_slice(
 						&self.node_to_aggregate_locals[&field_node],
 					);
 				}
-				_ => {
-					let scalar_ty = ScalarType::try_from(field_ty)
+				ty => {
+					let scalar_ty = ScalarType::try_from(ty)
 						.expect("non-aggregate field must be scalar");
 					self.emit_value(field_node);
 					let local = self.alloc_local(scalar_ty);

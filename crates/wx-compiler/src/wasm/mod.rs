@@ -45,10 +45,11 @@ impl TryFrom<mir::Type> for ScalarType {
 	}
 }
 
-/// Recursively flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; Aggregate recurses into its fields. The
-/// one place this conversion happens; every producer of a `Function` should
-/// call this rather than repeating the match itself.
+/// Flatten a MIR type into its constituent WASM scalar types.
+/// Unit/Never produce zero slots; an aggregate yields its precomputed
+/// `ScalarTable`, which `mir::MIR::ensure_aggregate` already built in this
+/// same order. The one place this conversion happens; every producer of a
+/// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
 	ty: mir::Type,
 	aggregates: &[mir::Aggregate],
@@ -56,11 +57,14 @@ pub fn flatten_type_to_scalars(
 	match ty {
 		mir::Type::Unit | mir::Type::Never => vec![],
 		mir::Type::Aggregate { aggregate_index } => aggregates
-			[aggregate_index as usize]
-			.values
-			.iter()
-			.flat_map(|&f| flatten_type_to_scalars(f, aggregates))
-			.collect(),
+			[usize::from(aggregate_index)]
+		.scalars
+		.iter()
+		.map(|scalar| {
+			ScalarType::try_from(scalar.ty)
+				.expect("a ScalarTable entry is scalar by construction")
+		})
+		.collect(),
 		t => vec![ScalarType::try_from(t).expect("must be scalar")],
 	}
 }

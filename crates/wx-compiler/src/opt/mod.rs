@@ -415,10 +415,19 @@ pub enum DataNodeKind {
 		fields: Box<[DataNodeIndex]>,
 		aggregate_index: mir::AggregateIndex,
 	},
+	/// Projects a single WASM value out of an aggregate.
+	///
+	/// Indexed by [`mir::ScalarIndex`], *not* by physical field: a nested
+	/// field spans several scalars and a zero-sized field spans none, so a
+	/// field index would not name a value at all. This is why `ty` can be a
+	/// `ScalarType` — a scalar index always names exactly one WASM value.
+	/// To project a whole nested field, build one of these per scalar in the
+	/// field's range and rewrap them (see `Builder::get_aggregate_field`).
+	///
 	/// Folds immediately when `aggregate` is a known `Aggregate` node.
 	AggregateGet {
 		aggregate: DataNodeIndex,
-		field_index: u32,
+		scalar: mir::ScalarIndex,
 		ty: ScalarType,
 	},
 
@@ -627,7 +636,9 @@ pub enum ControlNode {
 		then_block: BlockIndex,
 		else_block: Option<BlockIndex>,
 		/// Phi nodes produced at the join point (one per differing binding).
-		/// Aggregate bindings contribute one phi per field.
+		/// An aggregate binding contributes one phi per differing *scalar*
+		/// (`mir::ScalarTable`), not per field — a nested field spans several
+		/// scalars and a zero-sized field spans none.
 		outputs: Box<[DataNodeIndex]>,
 		result: StackResult,
 	},
@@ -649,7 +660,11 @@ pub enum ControlNode {
 	Loop {
 		body: BlockIndex,
 		/// LoopParam nodes for bindings that change across the loop.
-		/// Aggregate bindings contribute one loop-param per field.
+		/// An aggregate binding contributes one loop-param per *scalar*
+		/// (`mir::ScalarTable`), not per field — a nested field spans several
+		/// scalars and a zero-sized field spans none. Reading this as
+		/// "per field" is what made a nested aggregate crossing a loop
+		/// unrepresentable.
 		outputs: Box<[DataNodeIndex]>,
 		result: StackResult,
 	},

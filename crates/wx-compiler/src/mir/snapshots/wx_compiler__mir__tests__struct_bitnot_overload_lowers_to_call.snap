@@ -296,13 +296,19 @@ exports:
 imports: []
 memories: []
 aggregates:
-  - values:
-      - I32
-    offsets:
-      - 0
+  - fields:
+      - ty: I32
+        offset: 0
     layout:
       size: 4
       align: 4
+    scalars:
+      entries:
+        - ty: I32
+          offset: 0
+      field_starts:
+        - 0
+        - 1
     decl_to_phys:
       - 0
 static_entries: []

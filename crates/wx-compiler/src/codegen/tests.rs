@@ -1890,11 +1890,187 @@ fn test_nested_struct_field_access_on_local() {
 	assert_eq!(mutate.call(&mut store, ()).unwrap(), 77);
 }
 
+/// A second round of the same "aggregate field must be scalar" bug, in the
+/// places the first round did not reach: an aggregate that crosses a
+/// *control-flow join*.
+///
+/// A field is not a WASM value — a nested field is several, a zero-sized one
+/// is none — so anything that needs one slot per value has to flatten to
+/// `mir::ScalarTable` rather than walk `Aggregate::fields`. These four
+/// functions each hit a different consumer that used to get that wrong, and
+/// none of them is reachable from the by-value/pointer tests above:
+///
+/// - `across_loop` → `create_loop_params` + `patch_loop_binding`
+/// - `pick` → `merge_values`, via `merge_branches` (no loop involved)
+/// - `from_call` → `AggregateCallResult`, in the scheduler (no loop, no join)
+/// - `call_across_loop` → the intersection: a call result flattened *and*
+///   carried around a loop, which needs projections synthesized per value
+///
+/// Values are asserted, not just compilation: a wrong loop-param count still
+/// produces valid WASM, it just computes the wrong answer.
+#[test]
+fn test_nested_struct_across_control_flow_joins() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Inner { addr: u32 }
+        struct Outer { buf: Inner, len: u32 }
+
+        fn across_loop() -> u32 {
+            local o = Outer::{ buf: Inner::{ addr: 100 }, len: 3 };
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == o.len { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        fn pick(c: bool) -> u32 {
+            local o = if c {
+                Outer::{ buf: Inner::{ addr: 10 }, len: 1 }
+            } else {
+                Outer::{ buf: Inner::{ addr: 20 }, len: 2 }
+            };
+            o.buf.addr + o.len
+        }
+
+        fn make(n: u32) -> Outer {
+            Outer::{ buf: Inner::{ addr: n }, len: 1 }
+        }
+
+        fn from_call() -> u32 {
+            local o = make(100);
+            o.buf.addr + o.len
+        }
+
+        fn call_across_loop() -> u32 {
+            local o = make(7);
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == 3 { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        export { heap, across_loop, pick, from_call, call_across_loop }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	let across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "across_loop")
+		.unwrap();
+	assert_eq!(across_loop.call(&mut store, ()).unwrap(), 300);
+
+	let pick = instance
+		.get_typed_func::<i32, u32>(&mut store, "pick")
+		.unwrap();
+	assert_eq!(pick.call(&mut store, 1).unwrap(), 11);
+	assert_eq!(pick.call(&mut store, 0).unwrap(), 22);
+
+	let from_call = instance
+		.get_typed_func::<(), u32>(&mut store, "from_call")
+		.unwrap();
+	assert_eq!(from_call.call(&mut store, ()).unwrap(), 101);
+
+	let call_across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "call_across_loop")
+		.unwrap();
+	assert_eq!(call_across_loop.call(&mut store, ()).unwrap(), 21);
+}
+
+/// Depth 3, mutated across a loop. Distinct from the depth-2 cases above:
+/// a non-recursive "handle one more level" patch passes at depth 2 and fails
+/// here, and alignment sorting puts the nested field *ahead* of its `u8`
+/// siblings at every level, so a scalar-order mistake corrupts the siblings
+/// rather than the value being read.
+#[test]
+fn test_deeply_nested_struct_carried_across_loop() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn sum_across_loop() -> u64 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            local mut sum: u64 = 0;
+            loop {
+                if i == 3 { break };
+                sum += t.mid.deep.id;
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            }
+            sum
+        }
+
+        fn siblings_survive() -> u32 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            loop {
+                if i == 3 { break };
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            };
+            (t.flag as u32) * 10 + (t.mid.tag as u32)
+        }
+
+        export { heap, sum_across_loop, siblings_survive }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	// 77 + 78 + 79
+	let sum = instance
+		.get_typed_func::<(), u64>(&mut store, "sum_across_loop")
+		.unwrap();
+	assert_eq!(sum.call(&mut store, ()).unwrap(), 234);
+
+	// `flag` and `mid.tag` are reordered *after* the nested field they are
+	// declared before, so they are where a scalar-order slip shows up.
+	let siblings = instance
+		.get_typed_func::<(), u32>(&mut store, "siblings_survive")
+		.unwrap();
+	assert_eq!(siblings.call(&mut store, ()).unwrap(), 12);
+}
+
 /// The pointer-store/load side of the same bug: a nested literal written
-/// through a pointer in one statement, read back through a pointer, and a
-/// leaf field mutated in place through a pointer-field chain — all at three
-/// levels of nesting, with an inner struct that has more than one field
-/// (the shape that used to corrupt the store sequence).
+/// through a pointer in one statement, read back through a pointer, and an
+/// innermost scalar field mutated in place through a pointer-field chain —
+/// all at three levels of nesting, with an inner struct that has more than
+/// one field (the shape that used to corrupt the store sequence).
 #[test]
 fn test_nested_struct_pointer_store_and_load() {
 	let case = TestCase::new(indoc! {"

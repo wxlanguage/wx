@@ -11,34 +11,7 @@ mod builder;
 #[cfg(test)]
 mod tests;
 
-macro_rules! index_newtype {
-	($name:ident) => {
-		#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-		#[cfg_attr(test, derive(serde::Serialize, PartialOrd, Ord))]
-		pub struct $name(u32);
-
-		impl $name {
-			#[inline]
-			fn new(index: u32) -> Self {
-				Self(index)
-			}
-		}
-
-		impl From<$name> for u32 {
-			#[inline]
-			fn from(index: $name) -> Self {
-				index.0
-			}
-		}
-
-		impl From<$name> for usize {
-			#[inline]
-			fn from(index: $name) -> Self {
-				index.0 as usize
-			}
-		}
-	};
-}
+use crate::index::index_newtype;
 
 index_newtype!(TypeIndex);
 index_newtype!(LocalIndex);

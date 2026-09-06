@@ -390,15 +390,24 @@ exports:
 imports: []
 memories: []
 aggregates:
-  - values:
-      - I32
-      - I32
-    offsets:
-      - 0
-      - 4
+  - fields:
+      - ty: I32
+        offset: 0
+      - ty: I32
+        offset: 4
     layout:
       size: 8
       align: 4
+    scalars:
+      entries:
+        - ty: I32
+          offset: 0
+        - ty: I32
+          offset: 4
+      field_starts:
+        - 0
+        - 1
+        - 2
     decl_to_phys:
       - 0
       - 1

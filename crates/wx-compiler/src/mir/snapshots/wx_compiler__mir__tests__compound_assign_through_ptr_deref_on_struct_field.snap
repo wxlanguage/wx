@@ -310,17 +310,29 @@ memories:
     min_pages: ~
     max_pages: ~
 aggregates:
-  - values:
-      - U32
-      - U32
-      - U32
-    offsets:
-      - 0
-      - 4
-      - 8
+  - fields:
+      - ty: U32
+        offset: 0
+      - ty: U32
+        offset: 4
+      - ty: U32
+        offset: 8
     layout:
       size: 12
       align: 4
+    scalars:
+      entries:
+        - ty: U32
+          offset: 0
+        - ty: U32
+          offset: 4
+        - ty: U32
+          offset: 8
+      field_starts:
+        - 0
+        - 1
+        - 2
+        - 3
     decl_to_phys:
       - 0
       - 1

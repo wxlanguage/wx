@@ -28,7 +28,7 @@ struct SwitchArmBuild {
 
 /// One arm's contribution to an aggregate-typed `Switch` join slot, as
 /// decomposed by `Builder::merge_switch_slot` — either the arm's own
-/// per-field values (reusing the `Box<[DataNodeIndex]>` `extract_aggregate_fields`
+/// per-field values (reusing the `Box<[DataNodeIndex]>` `Builder::fields_of`
 /// already returned, no re-wrapping), or a `Never`/`Unit` marker to
 /// propagate to every field without materializing `field_count` copies of it.
 enum PerArmSlot {
@@ -79,10 +79,10 @@ impl<'mir> Builder<'mir> {
 			vec![StackResult::Unit; root_scope.locals.len()];
 
 		let params_count = sig.params_count;
-		// `wasm_idx` tracks the flattened WASM local index: aggregate params
-		// occupy one slot per *leaf* scalar field (recursively, for nested
-		// aggregates too — see `build_param_value`), scalar params occupy
-		// one slot each.
+		// `wasm_idx` tracks the flattened WASM local index: an aggregate param
+		// occupies one slot per *scalar* it contains (see `mir::ScalarTable`,
+		// which counts through nested aggregates and skips zero-sized fields),
+		// a scalar param one slot each.
 		let mut wasm_idx = 0u32;
 		for (i, local) in root_scope.locals[..params_count].iter().enumerate() {
 			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
@@ -129,14 +129,14 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// Build the data node for a function parameter of type `ty`, consuming
-	/// one flattened WASM param slot per *leaf* scalar field it contains
-	/// (`*wasm_idx` tracks the next free slot across the whole call). A
-	/// scalar parameter is just one `Param` node; an aggregate parameter —
-	/// possibly nested — is passed as a flattened run of scalar WASM params
-	/// (mirroring how `wasm::flatten_type_to_scalars`/signature flattening
-	/// lays out a call site's arguments), so this recurses to rebuild the
-	/// matching (possibly nested) `Aggregate` literal from them, in the same
-	/// pre-order `wasm::flatten_type_to_scalars` itself would visit.
+	/// one flattened WASM param slot per *scalar* it contains (`*wasm_idx`
+	/// tracks the next free slot across the whole call). A scalar parameter is
+	/// just one `Param` node; an aggregate parameter — possibly nested — is
+	/// passed as a flattened run of scalar WASM params (mirroring how
+	/// `wasm::flatten_type_to_scalars`/signature flattening lays out a call
+	/// site's arguments), so this recurses to rebuild the matching (possibly
+	/// nested) `Aggregate` literal from them, in the same pre-order
+	/// `mir::ScalarTable` uses.
 	fn build_param_value(
 		&mut self,
 		ty: mir::Type,
@@ -144,15 +144,12 @@ impl<'mir> Builder<'mir> {
 	) -> DataNodeIndex {
 		match ty {
 			mir::Type::Aggregate { aggregate_index } => {
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[_]> = (0..n)
-					.map(|i| {
-						let field_ty = self.mir.aggregates
-							[aggregate_index as usize]
-							.values[i];
-						self.build_param_value(field_ty, wasm_idx)
-					})
+				let mir = self.mir;
+				let agg = &mir.aggregate(aggregate_index);
+				let fields: Box<[_]> = agg
+					.fields
+					.iter()
+					.map(|field| self.build_param_value(field.ty, wasm_idx))
 					.collect();
 				self.node(DataNodeKind::Aggregate {
 					fields,
@@ -608,7 +605,7 @@ impl<'mir> Builder<'mir> {
 				let node = self.get_aggregate_field(
 					aggregate,
 					aggregate_index,
-					*value_index as usize,
+					*value_index,
 				);
 				StackResult::Value(node)
 			}
@@ -632,17 +629,17 @@ impl<'mir> Builder<'mir> {
 					NodeType::Aggregate(i) => i,
 					_ => panic!("AggregateSet on non-aggregate binding"),
 				};
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[DataNodeIndex]> = (0..n)
-					.map(|i| {
-						if i == *value_index as usize {
+				let n = self.mir.aggregate(aggregate_index).field_count();
+				let fields: Box<[DataNodeIndex]> = (0..n as u32)
+					.map(mir::PhysIndex::new)
+					.map(|phys| {
+						if phys == *value_index {
 							new_val
 						} else {
 							self.get_aggregate_field(
 								old_aggregate,
 								aggregate_index,
-								i,
+								phys,
 							)
 						}
 					})
@@ -1391,14 +1388,14 @@ impl<'mir> Builder<'mir> {
 
 		// Merge each slot across all arms via `merge_switch_slot`. A slot
 		// contributes at most one real `Switch` output per divergent
-		// *scalar leaf*: nothing downstream inspects a Phi's `left`/`right`
+		// *scalar*: nothing downstream inspects a Phi's `left`/`right`
 		// for a Switch (the scheduler reads each arm's raw contribution
 		// from `SwitchCase::own_values` instead), so aggregate-typed slots
 		// are decomposed field-by-field rather than merged as one opaque
 		// unit, and a slot with no real value (only `Never`/`Unit` across
-		// arms) contributes no leaf at all — `outputs` and every arm's row
-		// in `own_values` grow together, one entry per leaf, so the two
-		// stay index-aligned regardless of how many leaves a slot expands
+		// arms) contributes no scalar at all — `outputs` and every arm's row
+		// in `own_values` grow together, one entry per scalar, so the two
+		// stay index-aligned regardless of how many scalars a slot expands
 		// into.
 		let mut outputs: Vec<DataNodeIndex> = Vec::new();
 		let mut merged_per_slot: Vec<StackResult> =
@@ -1451,16 +1448,16 @@ impl<'mir> Builder<'mir> {
 	/// Merges one `Switch` join slot (an outer binding, or the arms' own
 	/// result) across every arm's `values` (one `StackResult` per arm, same
 	/// order as `arms`). A `Switch` output only ever needs a validly-typed
-	/// placeholder node per genuinely divergent *scalar* leaf — the
+	/// placeholder node per genuinely divergent *scalar* — the
 	/// scheduler reads each arm's real contribution from
 	/// `SwitchCase::own_values`, never a Phi's `left`/`right` — so this
 	/// decomposes an aggregate-typed slot field-by-field (recursively, for
 	/// nested aggregates) instead of merging it as one opaque unit, and
 	/// treats a slot whose arms differ only in `Never` vs `Unit` (no arm
-	/// disagrees on a real value) as contributing no leaf at all. Every
+	/// disagrees on a real value) as contributing no scalar at all. Every
 	/// `outputs.push` here is paired with exactly one push into each arm's
 	/// row of `own_values`, so the two always stay index-aligned no matter
-	/// how many leaves a slot expands into or how many slots contribute
+	/// how many scalars a slot expands into or how many slots contribute
 	/// none.
 	fn merge_switch_slot(
 		&mut self,
@@ -1479,36 +1476,37 @@ impl<'mir> Builder<'mir> {
 		}) else {
 			// Every arm is `Never` or `Unit` (a mix of the two — a uniform
 			// value would have taken the fast path above): no real value to
-			// carry, so this slot contributes no leaf.
+			// carry, so this slot contributes no scalar.
 			return StackResult::Unit;
 		};
 
 		match self.func.data_nodes[sample as usize].kind.node_type() {
 			NodeType::Scalar(ty) => {
-				let leaf = match values.iter().copied().find_map(|v| match v {
-					StackResult::Value(n) if n != sample => Some(n),
-					_ => None,
-				}) {
-					Some(other) => self.node(DataNodeKind::Phi {
-						left: sample,
-						right: other,
-						ty,
-					}),
-					// Every value-bearing arm agrees; only `Never`/`Unit`
-					// arms vary, so there's no genuine value divergence.
-					None => sample,
-				};
-				outputs.push(leaf);
+				let merged =
+					match values.iter().copied().find_map(|v| match v {
+						StackResult::Value(n) if n != sample => Some(n),
+						_ => None,
+					}) {
+						Some(other) => self.node(DataNodeKind::Phi {
+							left: sample,
+							right: other,
+							ty,
+						}),
+						// Every value-bearing arm agrees; only `Never`/`Unit`
+						// arms vary, so there's no genuine value divergence.
+						None => sample,
+					};
+				outputs.push(merged);
 				for (arm_values, v) in
 					own_values.iter_mut().zip(values.iter().copied())
 				{
 					arm_values.push(v);
 				}
-				StackResult::Value(leaf)
+				StackResult::Value(merged)
 			}
 			NodeType::Aggregate(aggregate_index) => {
 				let field_count =
-					self.mir.aggregates[aggregate_index as usize].values.len();
+					self.mir.aggregate(aggregate_index).field_count();
 				// Extract each value-bearing arm's fields exactly once (not
 				// once per field below). A `Never`/`Unit` arm propagates
 				// unchanged to every field — its body diverges before
@@ -1520,8 +1518,7 @@ impl<'mir> Builder<'mir> {
 					.copied()
 					.map(|v| match v {
 						StackResult::Value(n) => {
-							let (fields, _) = self.extract_aggregate_fields(n);
-							PerArmSlot::Fields(fields)
+							PerArmSlot::Fields(self.fields_of(n))
 						}
 						other => PerArmSlot::NoValue(other),
 					})
@@ -1779,31 +1776,35 @@ impl<'mir> Builder<'mir> {
 							);
 							StackResult::Value(lp)
 						}
-						NodeType::Aggregate(_) => {
-							// One loop-param per field; reassemble as an Aggregate node.
-							let (fields, aggregate_index) =
-								self.extract_aggregate_fields(node_id);
-							let agg_def =
-								&self.mir.aggregates[aggregate_index as usize];
-							let lp_fields: Box<[_]> = fields
-								.iter()
-								.zip(agg_def.values.iter())
-								.map(|(&field_node, &field_mir_ty)| {
-									let ty = ScalarType::try_from(field_mir_ty)
-										.expect(
-											"aggregate field must be scalar",
-										);
+						NodeType::Aggregate(aggregate_index) => {
+							// One loop-param per WASM *value*, not per field —
+							// a nested field spans several and a zero-sized
+							// one spans none — then reassemble the shape.
+							let scalars = self.scalars_of(node_id);
+							let params: Vec<DataNodeIndex> = scalars
+								.into_iter()
+								.map(|value| {
+									let ty = match self.func.data_nodes
+										[value as usize]
+										.kind
+										.node_type()
+									{
+										NodeType::Scalar(ty) => ty,
+										NodeType::Aggregate(_) => unreachable!(
+											"scalars_of yields only scalars"
+										),
+									};
 									self.func.push_loop_param(
 										block_index,
-										field_node,
+										value,
 										ty,
 									)
 								})
 								.collect();
-							let new_agg = self.node(DataNodeKind::Aggregate {
-								fields: lp_fields,
+							let new_agg = self.aggregate_from_scalars(
 								aggregate_index,
-							});
+								&params,
+							);
 							StackResult::Value(new_agg)
 						}
 					}
@@ -1864,28 +1865,25 @@ impl<'mir> Builder<'mir> {
 				}
 			}
 			NodeType::Aggregate(_) => {
-				let (lp_fields, aggregate_index) =
-					self.extract_aggregate_fields(param);
-				let (after_fields, _) = self.extract_aggregate_fields(after);
+				// One loop-param per WASM value, matching `create_loop_params`.
+				// Reassembling afterwards would be a no-op: every slot already
+				// holds its own loop param, so the rebuilt aggregate is `param`
+				// itself — only the parent binding and the output list change.
+				let lp_scalars = self.scalars_of(param);
+				let after_scalars = self.scalars_of(after);
 				let mut any_changed = false;
-				let mut new_fields = lp_fields.to_vec();
-				for (j, (&lp_field, &after_field)) in
-					lp_fields.iter().zip(after_fields.iter()).enumerate()
+				for (&lp_scalar, &after_scalar) in
+					lp_scalars.iter().zip(after_scalars.iter())
 				{
-					self.func.patch_loop_param(lp_field, after_field);
-					if matches!(self.func.data_nodes[lp_field as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
+					self.func.patch_loop_param(lp_scalar, after_scalar);
+					if matches!(self.func.data_nodes[lp_scalar as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
 					{
-						new_fields[j] = lp_field;
-						outputs.push(lp_field);
+						outputs.push(lp_scalar);
 						any_changed = true;
 					}
 				}
 				if any_changed {
-					let new_agg = self.node(DataNodeKind::Aggregate {
-						fields: new_fields.into_boxed_slice(),
-						aggregate_index,
-					});
-					parent_bindings[i] = StackResult::Value(new_agg);
+					parent_bindings[i] = StackResult::Value(param);
 				}
 			}
 		}
@@ -1943,12 +1941,14 @@ impl<'mir> Builder<'mir> {
 				updates.push((param, current));
 			}
 			(NodeType::Aggregate(_), NodeType::Aggregate(_)) => {
-				let (param_fields, _) = self.extract_aggregate_fields(param);
-				let (current_fields, _) =
-					self.extract_aggregate_fields(current);
-				for (&p, &c) in param_fields.iter().zip(current_fields.iter()) {
-					self.collect_scalar_loop_param_updates(p, c, updates);
-				}
+				let param_scalars = self.scalars_of(param);
+				let current_scalars = self.scalars_of(current);
+				updates.extend(
+					param_scalars
+						.into_iter()
+						.zip(current_scalars)
+						.filter(|(p, c)| p != c),
+				);
 			}
 			_ => {}
 		}
@@ -2023,21 +2023,26 @@ impl<'mir> Builder<'mir> {
 				}
 				phi
 			}
-			(NodeType::Aggregate(_), NodeType::Aggregate(_)) => {
-				let (l_fields, aggregate_index) =
-					self.extract_aggregate_fields(l);
-				let (r_fields, _) = self.extract_aggregate_fields(r);
-				let agg_def = &self.mir.aggregates[aggregate_index as usize];
-				let phi_fields: Box<[_]> = l_fields
-					.iter()
-					.zip(r_fields.iter())
-					.zip(agg_def.values.iter())
-					.map(|((&lf, &rf), &ft)| {
+			(NodeType::Aggregate(aggregate_index), NodeType::Aggregate(_)) => {
+				// One phi per differing WASM value, then reassemble the shape.
+				let l_scalars = self.scalars_of(l);
+				let r_scalars = self.scalars_of(r);
+				let merged: Vec<DataNodeIndex> = l_scalars
+					.into_iter()
+					.zip(r_scalars)
+					.map(|(lf, rf)| {
 						if lf == rf {
 							return lf;
 						}
-						let ty = ScalarType::try_from(ft)
-							.expect("aggregate field must be scalar");
+						let ty = match self.func.data_nodes[lf as usize]
+							.kind
+							.node_type()
+						{
+							NodeType::Scalar(ty) => ty,
+							NodeType::Aggregate(_) => {
+								unreachable!("scalars_of yields only scalars")
+							}
+						};
 						let phi = self.node(DataNodeKind::Phi {
 							left: lf,
 							right: rf,
@@ -2049,94 +2054,200 @@ impl<'mir> Builder<'mir> {
 						phi
 					})
 					.collect();
-				self.node(DataNodeKind::Aggregate {
-					fields: phi_fields,
-					aggregate_index,
-				})
+				self.aggregate_from_scalars(aggregate_index, &merged)
 			}
 			_ => panic!("type mismatch when merging branch values"),
 		}
 	}
 
-	/// Return the data node for aggregate field `phys_index` (physical/MIR
-	/// order), whether that field is scalar or itself a nested aggregate.
+	/// Return the data node for aggregate field `phys_index` (physical order),
+	/// whether that field is scalar or itself a nested aggregate.
 	///
-	/// `DataNodeKind::AggregateGet::ty` can only ever hold a `ScalarType` —
-	/// there's no way to construct one that "returns an aggregate". That's
-	/// fine as long as `aggregate` is a known `Aggregate` literal: its
-	/// `fields` are already-built `DataNodeIndex`es, one per field, with
-	/// whatever `NodeType` each field actually has — nested-aggregate
-	/// fields included — so returning `fields[phys_index]` directly (the
-	/// same identity `self.node()` applies when folding a real
-	/// `AggregateGet` of a known `Aggregate`, see `node()` below) sidesteps
-	/// `AggregateGet` entirely and needs no scalar type at all.
+	/// When `aggregate` is a known `Aggregate` literal its `fields` are
+	/// already-built nodes with whatever `NodeType` each field actually has,
+	/// so returning `fields[phys_index]` directly sidesteps `AggregateGet`
+	/// entirely (the same identity `node()` applies when folding).
 	///
-	/// The fallback path (building a real `AggregateGet` node) only
-	/// tolerates a scalar field — `aggregate` being a non-literal (a `Phi`,
-	/// `LoopParam`, or `AggregateCallResult`) *and* the requested field
-	/// being a nested aggregate is not yet supported.
+	/// Otherwise — a `Phi`, `LoopParam` or `AggregateCallResult` — the field
+	/// is rebuilt out of per-scalar projections. A scalar field is one
+	/// `AggregateGet`; a nested field is one per scalar in its range, rewrapped
+	/// into an `Aggregate` node of the nested shape. This is why
+	/// `AggregateGet` is indexed by `ScalarIndex`: it never has to name
+	/// something that is not a single WASM value.
 	fn get_aggregate_field(
 		&mut self,
 		aggregate: DataNodeIndex,
 		aggregate_index: mir::AggregateIndex,
-		phys_index: usize,
+		phys_index: mir::PhysIndex,
 	) -> DataNodeIndex {
 		if let DataNodeKind::Aggregate { fields, .. } =
 			&self.func.data_nodes[aggregate as usize].kind
 		{
-			return fields[phys_index];
+			return fields[usize::from(phys_index)];
 		}
+		// Copied out of `self` so it keeps its own `'mir` lifetime — reborrowing
+		// through `self` would collide with the `&mut self` calls below.
+		let mir = self.mir;
+		let agg = &mir.aggregate(aggregate_index);
+		let range = agg.scalars.field_range(phys_index);
+		match agg.field(phys_index).ty {
+			mir::Type::Aggregate {
+				aggregate_index: nested,
+			} => {
+				let values: Vec<DataNodeIndex> = range
+					.map(|i| {
+						self.project_scalar(aggregate, mir::ScalarIndex::new(i))
+					})
+					.collect();
+				self.aggregate_from_scalars(nested, &values)
+			}
+			_ => self
+				.project_scalar(aggregate, mir::ScalarIndex::new(range.start)),
+		}
+	}
+
+	/// Build the `AggregateGet` naming a single WASM value of `aggregate`.
+	fn project_scalar(
+		&mut self,
+		aggregate: DataNodeIndex,
+		scalar: mir::ScalarIndex,
+	) -> DataNodeIndex {
+		let aggregate_index = self.aggregate_index_of(aggregate);
 		let ty = ScalarType::try_from(
-			self.mir.aggregates[aggregate_index as usize].values[phys_index],
+			self.mir.aggregate(aggregate_index).scalars.get(scalar).ty,
 		)
-		.expect(
-			"nested-aggregate field access on a non-literal aggregate \
-			 (e.g. a loop-carried or multi-return-call value) is not yet \
-			 supported",
-		);
+		.expect("a ScalarTable entry is scalar by construction");
 		self.node(DataNodeKind::AggregateGet {
 			aggregate,
-			field_index: phys_index as u32,
+			scalar,
 			ty,
 		})
 	}
 
-	/// Return the per-field data node indices for any aggregate node.
+	/// The aggregate shape carried by any aggregate-typed node.
+	fn aggregate_index_of(&self, node: DataNodeIndex) -> mir::AggregateIndex {
+		match self.func.data_nodes[node as usize].kind.node_type() {
+			NodeType::Aggregate(index) => index,
+			NodeType::Scalar(_) => panic!("expected an aggregate-typed node"),
+		}
+	}
+
+	/// One node per *physical field* of an aggregate node — a nested field
+	/// comes back as an `Aggregate` node, not as its constituent values.
 	///
-	/// For `Aggregate { fields }` the existing field nodes are returned
-	/// directly. For `AggregateCallResult` — which has no concrete fields —
-	/// a fresh field node is synthesized for each field via
-	/// `get_aggregate_field` (a real `AggregateGet` for scalar fields, since
-	/// those get nodes do not fold and remain visible to the scheduler,
-	/// which reads them from `node_to_aggregate_locals`; nested-aggregate
-	/// fields of a call result are not yet supported, same caveat as
-	/// `get_aggregate_field` itself).
-	fn extract_aggregate_fields(
+	/// For consumers that recurse structurally, field by field (`merge_switch_slot`).
+	/// Anything that needs one slot per WASM value — loop params, phis, call
+	/// results, signatures — wants [`Builder::scalars_of`] instead; a field is
+	/// not a value.
+	fn fields_of(&mut self, node: DataNodeIndex) -> Box<[DataNodeIndex]> {
+		let aggregate_index = self.aggregate_index_of(node);
+		let count = self.mir.aggregate(aggregate_index).field_count();
+		(0..count as u32)
+			.map(mir::PhysIndex::new)
+			.map(|phys| self.get_aggregate_field(node, aggregate_index, phys))
+			.collect()
+	}
+
+	/// Decompose an aggregate node into one node per WASM value, in
+	/// `mir::ScalarTable` order.
+	///
+	/// The only supported way to take an aggregate apart. Consumers needing
+	/// one slot per value — loop params, phis, call results — come through
+	/// here rather than walking `Aggregate::fields`, because a field is not a
+	/// value: a nested field is several, a zero-sized field is none.
+	fn scalars_of(&mut self, node: DataNodeIndex) -> Vec<DataNodeIndex> {
+		let mut out = Vec::new();
+		self.collect_scalars(node, &mut out);
+		out
+	}
+
+	fn collect_scalars(
 		&mut self,
 		node: DataNodeIndex,
-	) -> (Box<[DataNodeIndex]>, mir::AggregateIndex) {
+		out: &mut Vec<DataNodeIndex>,
+	) {
+		let mir = self.mir;
 		match self.func.data_nodes[node as usize].kind.clone() {
 			DataNodeKind::Aggregate {
 				fields,
 				aggregate_index,
-			} => (fields, aggregate_index),
+			} => {
+				let agg = &mir.aggregate(aggregate_index);
+				for (field, &field_node) in agg.fields.iter().zip(fields.iter())
+				{
+					match field.ty {
+						mir::Type::Unit | mir::Type::Never => {}
+						mir::Type::Aggregate { .. } => {
+							self.collect_scalars(field_node, out)
+						}
+						_ => out.push(field_node),
+					}
+				}
+			}
+			// No field sub-nodes — the values live on the multi-return stack,
+			// so each one has to be named by an explicit projection.
 			DataNodeKind::AggregateCallResult { aggregate_index } => {
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[_]> = (0..n)
-					.map(|i| self.get_aggregate_field(node, aggregate_index, i))
-					.collect();
-				(fields, aggregate_index)
+				let count = mir.aggregate(aggregate_index).scalars.len();
+				out.extend((0..count as u32).map(|i| {
+					self.project_scalar(node, mir::ScalarIndex::new(i))
+				}));
 			}
 			_ => panic!("expected aggregate node"),
 		}
 	}
 
-	/// Recursively store an aggregate value's *leaf* scalar fields through a
-	/// pointer, at successively accumulated byte offsets. A field whose own
-	/// type is itself an aggregate is walked into (offset accumulating)
-	/// rather than stored as a single (nonsensical — `MemAccess` has no
-	/// notion of "store a whole nested struct") memory access.
+	/// Rebuild an aggregate of shape `aggregate_index` from one node per WASM
+	/// value, inverting `scalars_of`.
+	///
+	/// `values` holds exactly this shape's scalars. Each field owns a
+	/// *contiguous* run of them, so a nested field recurses on its own
+	/// subslice — there is no cursor to keep in sync between siblings. Built
+	/// bottom-up, so a pure node's operands always have lower indices than the
+	/// node itself, which is what
+	/// `local_dominance::verify_operand_index_ordering` checks. Goes through
+	/// `node()` so CSE still applies, which is what lets `patch_loop_binding`
+	/// compare a rebuilt aggregate against the original by identity.
+	fn aggregate_from_scalars(
+		&mut self,
+		aggregate_index: mir::AggregateIndex,
+		values: &[DataNodeIndex],
+	) -> DataNodeIndex {
+		let mir = self.mir;
+		let agg = &mir.aggregate(aggregate_index);
+		debug_assert_eq!(
+			values.len(),
+			agg.scalars.len(),
+			"value count must match the aggregate's scalar count"
+		);
+		let mut fields = Vec::with_capacity(agg.field_count());
+		for (i, field) in agg.fields.iter().enumerate() {
+			let range = agg.scalars.field_range(mir::PhysIndex::new(i as u32));
+			let owned = &values[range.start as usize..range.end as usize];
+			fields.push(match field.ty {
+				mir::Type::Aggregate {
+					aggregate_index: nested,
+				} => self.aggregate_from_scalars(nested, owned),
+				mir::Type::Unit | mir::Type::Never => unreachable!(
+					"a zero-sized aggregate field owns no value to rebuild \
+					 from; `DataNodeKind::Aggregate::fields` cannot represent \
+					 one yet"
+				),
+				_ => owned[0],
+			});
+		}
+		self.node(DataNodeKind::Aggregate {
+			fields: fields.into_boxed_slice(),
+			aggregate_index,
+		})
+	}
+
+	/// Store an aggregate value through a pointer, one memory access per WASM
+	/// value.
+	///
+	/// `MemAccess` has no notion of "store a whole nested struct", so this has
+	/// to reach the individual scalars. It used to recurse the field tree
+	/// accumulating offsets; the `ScalarTable` already holds each scalar's
+	/// offset relative to the aggregate base, so it is now a flat zip.
 	fn emit_aggregate_store(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2146,47 +2257,26 @@ impl<'mir> Builder<'mir> {
 		aggregate_index: mir::AggregateIndex,
 		memory: crate::ast::DefId,
 	) {
-		let (fields, _) = self.extract_aggregate_fields(value_node);
-		for i in 0..fields.len() {
-			let field_offset =
-				self.mir.aggregates[aggregate_index as usize].offsets[i];
-			let field_mir_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			let offset = base_offset + field_offset;
-			match field_mir_ty {
-				mir::Type::Aggregate {
-					aggregate_index: nested_index,
-				} => {
-					self.emit_aggregate_store(
-						block_idx,
-						address,
-						offset,
-						fields[i],
-						nested_index,
-						memory,
-					);
-				}
-				_ => {
-					let access = MemAccess::from_mir(field_mir_ty);
-					self.push_stmt(
-						block_idx,
-						ControlNode::PointerStore {
-							address,
-							offset,
-							value: fields[i],
-							memory,
-							access,
-						},
-					);
-				}
-			}
+		let values = self.scalars_of(value_node);
+		let mir = self.mir;
+		let scalars = &mir.aggregate(aggregate_index).scalars;
+		debug_assert_eq!(values.len(), scalars.len());
+		for (&value, scalar) in values.iter().zip(scalars.iter()) {
+			self.push_stmt(
+				block_idx,
+				ControlNode::PointerStore {
+					address,
+					offset: base_offset + scalar.offset,
+					value,
+					memory,
+					access: MemAccess::from_mir(scalar.ty),
+				},
+			);
 		}
 	}
 
-	/// Recursively load an aggregate's *leaf* scalar fields through a
-	/// pointer, re-wrapping them into (possibly nested) `Aggregate` nodes
-	/// matching the aggregate's own field structure. Mirrors
-	/// `emit_aggregate_store`.
+	/// Load an aggregate through a pointer, one memory access per WASM value,
+	/// then reassemble the shape. Mirrors `emit_aggregate_store`.
 	fn build_aggregate_load(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2195,49 +2285,28 @@ impl<'mir> Builder<'mir> {
 		aggregate_index: mir::AggregateIndex,
 		memory: crate::ast::DefId,
 	) -> DataNodeIndex {
-		let n = self.mir.aggregates[aggregate_index as usize].values.len();
-		let mut fields = Vec::with_capacity(n);
-		for i in 0..n {
-			let field_offset =
-				self.mir.aggregates[aggregate_index as usize].offsets[i];
-			let field_mir_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			let offset = base_offset + field_offset;
-			let field_node = match field_mir_ty {
-				mir::Type::Aggregate {
-					aggregate_index: nested_index,
-				} => self.build_aggregate_load(
+		let mir = self.mir;
+		let scalars = &mir.aggregate(aggregate_index).scalars;
+		let values: Vec<DataNodeIndex> = scalars
+			.iter()
+			.map(|scalar| {
+				let access = MemAccess::from_mir(scalar.ty);
+				let result = self
+					.node(DataNodeKind::PointerLoadResult { address, access });
+				self.push_stmt(
 					block_idx,
-					address,
-					offset,
-					nested_index,
-					memory,
-				),
-				_ => {
-					let access = MemAccess::from_mir(field_mir_ty);
-					let result = self.node(DataNodeKind::PointerLoadResult {
+					ControlNode::PointerLoad {
 						address,
+						offset: base_offset + scalar.offset,
+						result,
+						memory,
 						access,
-					});
-					self.push_stmt(
-						block_idx,
-						ControlNode::PointerLoad {
-							address,
-							offset,
-							result,
-							memory,
-							access,
-						},
-					);
-					result
-				}
-			};
-			fields.push(field_node);
-		}
-		self.node(DataNodeKind::Aggregate {
-			fields: fields.into_boxed_slice(),
-			aggregate_index,
-		})
+					},
+				);
+				result
+			})
+			.collect();
+		self.aggregate_from_scalars(aggregate_index, &values)
 	}
 
 	/// Merge two `StackResult`s at a control-flow join. `Never` defers to the
@@ -2382,13 +2451,12 @@ impl<'mir> Builder<'mir> {
 		match ty {
 			mir::Type::Unit | mir::Type::Never => StackResult::Unit,
 			mir::Type::Aggregate { aggregate_index } => {
-				let field_types: Vec<mir::Type> = self.mir.aggregates
-					[aggregate_index as usize]
-					.values
-					.to_vec();
-				let fields: Box<[_]> = field_types
+				let mir = self.mir;
+				let agg = &mir.aggregate(aggregate_index);
+				let fields: Box<[_]> = agg
+					.fields
 					.iter()
-					.map(|&ft| self.default_value(ft).unwrap_value())
+					.map(|field| self.default_value(field.ty).unwrap_value())
 					.collect();
 				StackResult::Value(self.node(DataNodeKind::Aggregate {
 					fields,
@@ -2417,23 +2485,50 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
+	/// If `aggregate` is a literal `Aggregate`, the node already holding the
+	/// value at `scalar`. Descends through nested aggregates, rebasing the
+	/// scalar index to each level, so a projection never survives as a node
+	/// when the value it names is already in hand.
+	fn fold_scalar_projection(
+		&self,
+		aggregate: DataNodeIndex,
+		scalar: mir::ScalarIndex,
+	) -> Option<DataNodeIndex> {
+		let DataNodeKind::Aggregate {
+			fields,
+			aggregate_index,
+		} = &self.func.data_nodes[aggregate as usize].kind
+		else {
+			return None;
+		};
+		let agg = self.mir.aggregate(*aggregate_index);
+		let owner = agg.scalars.owner(scalar);
+		let field_node = fields[usize::from(owner)];
+		match agg.field(owner).ty {
+			mir::Type::Aggregate { .. } => {
+				let start = agg.scalars.field_range(owner).start;
+				let relative = mir::ScalarIndex::new(u32::from(scalar) - start);
+				self.fold_scalar_projection(field_node, relative)
+			}
+			_ => Some(field_node),
+		}
+	}
+
 	// ── Node construction ─────────────────────────────────────────────────────
 
 	/// The primary way to create a node. Applies algebraic simplifications
 	/// then interns via CSE. Call `func.intern_node` directly only when the
 	/// kind is already canonical (e.g. a freshly computed `Int` constant).
 	fn node(&mut self, kind: DataNodeKind) -> DataNodeIndex {
-		// AggregateGet of a known Aggregate returns the field directly.
+		// AggregateGet of a known Aggregate returns the holding node directly.
 		if let DataNodeKind::AggregateGet {
-			aggregate,
-			field_index,
-			..
+			aggregate, scalar, ..
 		} = &kind
 		{
-			if let DataNodeKind::Aggregate { fields, .. } =
-				&self.func.data_nodes[*aggregate as usize].kind
+			if let Some(folded) =
+				self.fold_scalar_projection(*aggregate, *scalar)
 			{
-				return fields[*field_index as usize];
+				return folded;
 			}
 		}
 

@@ -217,17 +217,30 @@ memories:
     min_pages: ~
     max_pages: ~
 aggregates:
-  - values:
-      - Pointer:
-          memory: 471
-          kind: Memory32
-      - U32
-    offsets:
-      - 0
-      - 4
+  - fields:
+      - ty:
+          Pointer:
+            memory: 471
+            kind: Memory32
+        offset: 0
+      - ty: U32
+        offset: 4
     layout:
       size: 8
       align: 4
+    scalars:
+      entries:
+        - ty:
+            Pointer:
+              memory: 471
+              kind: Memory32
+          offset: 0
+        - ty: U32
+          offset: 4
+      field_starts:
+        - 0
+        - 1
+        - 2
     decl_to_phys:
       - 0
       - 1
