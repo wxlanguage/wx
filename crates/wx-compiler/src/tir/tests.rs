@@ -6177,11 +6177,12 @@ fn test_subtrait_method_call_on_generic_param() {
 }
 
 #[test]
-fn test_supertrait_cycle_terminates() {
-	// `trait A: B {} trait B: A {}` is still accepted (no cycle diagnostic
-	// yet), so every walk over the supertrait graph must be visited-guarded
-	// rather than assume a DAG. This test is here to hang or blow the stack
-	// if one ever isn't.
+fn test_supertrait_cycle_is_reported_once_and_terminates() {
+	// The cycle is reported where it closes, and only once — every trait in
+	// it has its bounds written by then, so no later walk re-enters it. It is
+	// still *resolved*, both bounds and all, which is why every walk over the
+	// supertrait graph stays visited-guarded rather than assuming a DAG: this
+	// test hangs or blows the stack if one ever isn't.
 	let case = TestCase::new(indoc! {"
         trait A: B { }
         trait B: A { }
@@ -6189,7 +6190,27 @@ fn test_supertrait_cycle_terminates() {
         fn call<T: B>(x: T) { requires_a(x); }
         export {}
     "});
-	assert_no_errors(&case);
+	let view = case.diagnostics();
+	view.assert_error(DiagnosticCode::CyclicSupertrait);
+	assert_eq!(
+		view.errors().count(),
+		1,
+		"reported where the cycle closes, not once per trait in it"
+	);
+}
+
+#[test]
+fn test_trait_that_is_its_own_supertrait_is_reported() {
+	// `trait A: A` collapses into the reflexive `Self: A` bound every trait
+	// gets, so `Trait::supertraits` filters it back out and nothing
+	// downstream can see it. The cycle walk catches it on the way in, where
+	// the clause is still a clause.
+	let case = TestCase::new(indoc! {"
+        trait A: A { }
+        export {}
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::CyclicSupertrait);
 }
 
 #[test]

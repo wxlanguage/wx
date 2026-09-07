@@ -194,6 +194,7 @@ define_diagnostic_codes! {
 		TraitImplItemKindMismatch => "E1079",
 		TraitImplSignatureMismatch => "E1080",
 		TraitImplConstTypeMismatch => "E1081",
+		CyclicSupertrait => "E1082",
 
 		// VFS diagnostics (E2xxx).
 		ModuleFileNotFound => "E2000",

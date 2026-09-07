@@ -878,17 +878,36 @@ impl<'ast> Builder<'ast, '_> {
 	/// what a transitive walk over the supertrait graph
 	/// ([`ItemRegistry::trait_implies`]) reads.
 	pub(super) fn ensure_trait_supertraits(&mut self, trait_index: TraitIndex) {
+		// The walk's own path, which only it can see and only for as long as
+		// it runs — see `resolve_supertrait_clause`. Never allocates unless
+		// there is a clause left to resolve, since the guard there returns
+		// before the first push.
+		self.resolve_supertrait_clause(trait_index, &mut Vec::new());
+	}
+
+	/// [`Self::ensure_trait_supertraits`], carrying the chain of traits the
+	/// walk is currently inside so that a supertrait which is already on it
+	/// can be told from one that is merely already resolved.
+	///
+	/// That distinction is the whole difference between a diamond and a cycle,
+	/// and the bounds themselves cannot make it: they are written *before* the
+	/// recursion (so the walk terminates at all), which leaves "non-empty"
+	/// meaning done-or-in-progress. The path is also what names the loop in
+	/// the diagnostic, so one structure answers both.
+	///
+	/// A `Vec` threaded through the recursion rather than a field on
+	/// `Builder`: it means something only inside this function's dynamic
+	/// extent, and `sig_stack` — the other stack in the builder — belongs to
+	/// `ensure_signature`, whose frames these are deliberately not.
+	fn resolve_supertrait_clause(
+		&mut self,
+		trait_index: TraitIndex,
+		stack: &mut Vec<TraitIndex>,
+	) {
 		// The write below is the guard: `Self`'s bounds always get at least
 		// the reflexive entry, and they get it *before* this recurses, so a
-		// non-empty list means this trait is either done or is an ancestor of
-		// the call that is asking — which is how `trait A: B {}` alongside
-		// `trait B: A {}` terminates instead of recursing forever.
-		//
-		// TODO(supertrait cycles): that second case is a cycle and is
-		// currently accepted in silence. Telling it apart from "already done"
-		// needs a stack of the traits this walk is inside, which is also
-		// exactly what naming the loop (`A -> B -> A`) in the diagnostic
-		// needs — so both arrive together, here.
+		// non-empty list means this trait is done — or is on `stack`, which
+		// the caller checks before recursing here.
 		if !self.items.traits[usize::from(trait_index)]
 			.self_type_param
 			.bounds
@@ -948,10 +967,65 @@ impl<'ast> Builder<'ast, '_> {
 		// bounds are resolved too, which is what a transitive walk over the
 		// supertrait graph (`ItemRegistry::trait_implies`) reads. Their
 		// *members* stay lazy — nothing here needs them.
+		stack.push(trait_index);
 		for supertrait in bounds.traits.iter() {
-			let supertrait_index = supertrait.trait_index;
-			self.ensure_trait_supertraits(supertrait_index);
+			match stack.iter().position(|&t| t == supertrait.trait_index) {
+				// Reported from here rather than one frame down, because this
+				// is where the bound that closes the loop has a span. A
+				// self-referential `trait A: A` lands here too: it is `A`'s
+				// own frame that the position finds.
+				Some(start) => self.report_supertrait_cycle(
+					&stack[start..],
+					SourceSpan::new(file_id, supertrait.span),
+				),
+				None => self
+					.resolve_supertrait_clause(supertrait.trait_index, stack),
+			}
 		}
+		stack.pop();
+	}
+
+	/// Reports `chain` — the traits from the one the cycle closes back onto
+	/// through to the one whose clause `span` is in — as a supertrait cycle.
+	///
+	/// Reported once per cycle, not once per trait in it: the bounds of every
+	/// trait on `chain` are written by the time this runs, so the walk that
+	/// found the loop is also the last one to enter it.
+	fn report_supertrait_cycle(
+		&mut self,
+		chain: &[TraitIndex],
+		span: SourceSpan,
+	) {
+		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicSupertrait.code())
+			.with_message("cyclic supertrait dependency");
+		for &trait_index in chain {
+			let trait_def = &self.items.traits[usize::from(trait_index)];
+			let name = self.interner.resolve(trait_def.name.inner).unwrap();
+			names.push(name);
+			diagnostic = diagnostic.with_label(
+				SourceSpan::new(trait_def.file_id, trait_def.name.span)
+					.secondary_label()
+					.with_message(format!("`{name}` is declared here")),
+			);
+		}
+		self.diagnostics.push(
+			diagnostic
+				.with_label(span.primary_label().with_message(format!(
+					"this bound closes the cycle back onto `{}`",
+					names[0]
+				)))
+				.with_note(format!(
+					"the cycle is `{}` -> `{}`",
+					names.join("` -> `"),
+					names[0]
+				))
+				.with_note(
+					"a trait cannot be its own supertrait, directly or \
+					 through the chain",
+				),
+		);
 	}
 
 	pub(super) fn signature_trait(
