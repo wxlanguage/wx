@@ -1,11 +1,19 @@
 # TODOs
 
-## Flatten supertrait bounds in `TypeParamInfo`
+## ~~Flatten supertrait bounds in `TypeParamInfo`~~ — done, differently
 
-**Where:** `tir/builder.rs` — `resolve_ast_type_params` (or during `ensure_signature` for each trait)
+**Closed 2026-09-07.** The gap was real: `T: C` recorded only `[C]`, so a
+transitive `C: B: A` never satisfied a bound on `A`.
 
-**What:** `TypeParamInfo.bounds: Box<[TraitIndex]>` currently stores only direct bounds as written by the user (e.g. `T: C` stores `[C]`). For a chain `C: B: A`, the compiler never records that `T` also satisfies `B` and `A`.
+It was closed by walking rather than flattening. `ItemRegistry::trait_implies`
+does a visited-guarded walk up the supertrait graph, and `type_implements_trait`
+asks it when the direct check fails. Flattening at bound-resolution time would
+have needed every trait's supertrait clause resolved before any bound naming it
+could be resolved — an ordering constraint the demand-driven builder does not
+have, and would have had to grow one for. Walking on demand needs only that the
+clause is resolved by the time someone asks, which `ensure_trait_supertraits`
+guarantees.
 
-**Why it matters:** `type_param_satisfies_bound` does a flat `any(|b| b == expected_trait)` lookup, so it would return `false` for a transitive supertrait. Current tests pass vacuously — when `T: C` is passed to `fn requires_a<U: A>`, type inference unifies `U = T` (same TypeIndex), `substitute_expected_type` converts the result to `INFER`, and the bound check is skipped entirely. Soundness is maintained through monomorphization + `check_trait_conformance`, but early call-site errors for violated supertrait bounds are silently missed.
-
-**How:** After resolving each trait bound during `resolve_ast_type_params`, walk the trait's `supertraits` field transitively and append them all to the `bounds` vec before boxing. This makes `type_param_satisfies_bound` correct for deep hierarchies without changing its O(n) lookup structure.
+The note's other claim — that call-site bound checks were being skipped
+vacuously — no longer holds either: `test_type_param_multiple_bounds_missing_impl_is_error`
+was un-ignored in the same pass and now reports E1063 as written.

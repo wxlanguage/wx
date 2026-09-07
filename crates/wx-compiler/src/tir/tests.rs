@@ -7657,7 +7657,6 @@ fn test_assoc_type_impl_bound_violation_is_error() {
 }
 
 #[test]
-#[ignore = "false-positive TraitBoundViolation for an abstract projection's own trait-declared bound — see comment above"]
 fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
 	// `impl<T: Container> Container for Wrap<T> { type Elem = T::Elem; }` —
 	// the impl's own `Elem` value is the still-abstract projection `T::Elem`,
@@ -12189,10 +12188,8 @@ fn test_type_param_multiple_bounds_both_enforced() {
 }
 
 #[test]
-#[ignore = "TODO: TIR does not currently check trait bound satisfaction at generic call sites"]
 fn test_type_param_multiple_bounds_missing_impl_is_error() {
-	// Pass a type that only satisfies one of two bounds — should error once
-	// call-site trait bound checking is implemented.
+	// Pass a type that only satisfies one of two bounds.
 	let case = TestCase::new(indoc! {"
         trait Scalable { fn scale(self, n: i32) -> i32; }
         trait Printable { fn print(self); }
@@ -12201,13 +12198,8 @@ fn test_type_param_multiple_bounds_missing_impl_is_error() {
         impl Scalable for Num { fn scale(self, n: i32) -> i32 { n } }
         fn call() { do_both(Num::{}); }
     "});
-	assert!(
-		case.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.severity == Severity::Error),
-		"expected an error: Num does not implement Printable"
-	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
 }
 
 #[test]
