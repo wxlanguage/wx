@@ -43,6 +43,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
+				self.ensure_typeset_members(typeset_index);
 				Ok(BoundKind::TypeSet(TypesetBound {
 					typeset_index,
 					span: full_span,
@@ -58,6 +59,22 @@ impl<'ast> Builder<'ast, '_> {
 				Err(())
 			}
 		}
+	}
+
+	/// Resolves the members of the typeset a bound just named.
+	///
+	/// A typeset's symbol is registered *resolved* at prescan, so naming one
+	/// never forces its signature the way a `Pending` symbol would — and
+	/// `members`/`intersection_range` stay empty until its own node comes up in
+	/// the sweep. Every membership check in between then reads an empty set and
+	/// reports a perfectly good type as not belonging (E1047), depending on
+	/// nothing but declaration order. Forcing it where the bound is built is
+	/// what makes `T: Integer` mean the same thing wherever it is written.
+	fn ensure_typeset_members(&mut self, typeset_index: TypesetIndex) {
+		let def_id = self.items.typesets[usize::from(typeset_index)].id;
+		// A cycle would mean this typeset's own declaration named itself;
+		// whatever it has resolved so far is all there will ever be.
+		let _ = self.ensure_signature(def_id);
 	}
 
 	/// Resolves a path (possibly `module::Trait`) to a [`BoundKind`] without touching the
@@ -152,6 +169,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
+				self.ensure_typeset_members(typeset_index);
 				Ok(BoundKind::TypeSet(TypesetBound {
 					typeset_index,
 					span: full_span,

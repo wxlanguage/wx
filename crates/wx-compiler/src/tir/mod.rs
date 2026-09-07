@@ -475,6 +475,11 @@ pub struct TraitImpl {
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
 	pub members: HashMap<SymbolU32, ImplEntry>,
+	/// Every member this impl declares, by name — filled when the block's
+	/// header is resolved, ahead of any member's own signature. See
+	/// [`MemberDecl`].
+	#[cfg_attr(test, serde(skip))]
+	pub member_decls: HashMap<SymbolU32, MemberDecl>,
 	/// Span of the trait name in the header; anchors conformance diagnostics.
 	#[cfg_attr(test, serde(skip))]
 	pub span: TextSpan,
@@ -1676,6 +1681,33 @@ pub enum ImplEntry {
 	AssocType(AssocTypeIndex),
 }
 
+/// What an `impl` declares under a name, known from syntax alone — before the
+/// member's signature, its types or even the trait it implements have been
+/// resolved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum MemberKind {
+	Function,
+	Const,
+	AssocType,
+}
+
+/// A member an `impl` block declares, recorded when the block's own header is
+/// resolved rather than when the member is.
+///
+/// An impl is the one item kind nothing can demand by name — it is found by
+/// *type*, through the dispatch index — so a lookup that lands on an impl has
+/// no way to ask for a member that has not been resolved yet. This is what it
+/// asks instead: "do you declare this name, and what is it?" is answerable
+/// from the AST, and `id` then lets the lookup force exactly that one member,
+/// on demand, instead of the block force-resolving all of them up front.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct MemberDecl {
+	pub kind: MemberKind,
+	pub id: ast::DefId,
+}
+
 /// Backing storage for `ImplEntry::AssocType`. One entry per associated-type
 /// declaration (trait side, `ty` is a `Type::AssociatedType` placeholder) or
 /// binding (impl side, `ty` is the concrete type) — gives both cases a real
@@ -1744,6 +1776,10 @@ pub struct InherentImpl {
 	/// point at without re-deriving one from the resolved `Type`.
 	pub target: Spanned<TypeIndex>,
 	pub members: HashMap<SymbolU32, ImplEntry>,
+	/// Every member this block declares, by name — filled when the block's
+	/// header is resolved, ahead of any member's own signature. See
+	/// [`MemberDecl`].
+	pub member_decls: HashMap<SymbolU32, MemberDecl>,
 	/// Spans of every `Self` keyword usage resolved against this block —
 	/// kept separate from `target`'s own struct/enum `accesses` so LSP
 	/// consumers (semantic tokens, rename) can tell "literally named the
@@ -1774,7 +1810,6 @@ pub enum ImplTarget {
 	Struct(StructIndex),
 	Enum(EnumIndex),
 	Memory(DefId),
-	// TODO: should we add tuple and unit here?
 }
 
 impl ImplTarget {

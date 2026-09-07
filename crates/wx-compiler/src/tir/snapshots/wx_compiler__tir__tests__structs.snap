@@ -32,158 +32,20 @@ types:
       args: []
   - TypeParam:
       owner:
-        Trait: 0
+        Struct: 433
       param_index: 0
-  - Function:
-      signature:
-        items:
-          - 21
-          - 21
-          - 21
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 1
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 23
-          - 23
-          - 23
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 2
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 25
-          - 25
-          - 25
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 3
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 27
-          - 27
-          - 27
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 4
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 29
-          - 29
-          - 29
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 5
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 31
-          - 31
-        params_count: 1
-  - TypeParam:
-      owner:
-        Trait: 6
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 33
-          - 33
-          - 33
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 7
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 35
-          - 35
-          - 35
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 8
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 37
-          - 37
-          - 37
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 9
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 39
-          - 39
-          - 39
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 10
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 41
-          - 41
-          - 41
-        params_count: 2
-  - TypeParam:
-      owner:
-        Trait: 11
-      param_index: 0
-  - Function:
-      signature:
-        items:
-          - 43
-          - 43
-        params_count: 1
-  - TypeParam:
-      owner:
-        Function: 37
-      param_index: 0
-  - TypeParam:
-      owner:
-        Function: 37
-      param_index: 1
-  - Slice:
-      of: 46
-      memory: 45
-      ownership: Shared
   - TypeParam:
       owner:
         Trait: 14
       param_index: 0
   - Pointer:
       to: 6
-      memory: 48
+      memory: 22
       ownership: Exclusive
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 48
+      base: 22
   - TypeParam:
       owner:
         Trait: 12
@@ -195,78 +57,265 @@ types:
   - AssocTypeProjection:
       trait_index: 12
       assoc_name: 182
-      base: 50
+      base: 24
   - Function:
       signature:
         items:
-          - 48
-          - 50
-          - 53
+          - 22
+          - 24
+          - 27
         params_count: 2
   - Function:
       signature:
         items:
-          - 48
-          - 50
+          - 22
+          - 24
         params_count: 1
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 45
+      base: 21
+  - TypeParam:
+      owner:
+        InherentImpl: 6
+      param_index: 0
+  - Struct:
+      struct_index: 0
+      args:
+        - 31
+  - TypeParam:
+      owner:
+        Struct: 444
+      param_index: 0
+  - AssocTypeProjection:
+      trait_index: 14
+      assoc_name: 59
+      base: 33
+  - TypeParam:
+      owner:
+        InherentImpl: 7
+      param_index: 0
+  - TypeParam:
+      owner:
+        InherentImpl: 7
+      param_index: 1
+  - Struct:
+      struct_index: 1
+      args:
+        - 35
+        - 36
+  - TypeParam:
+      owner:
+        InherentImpl: 8
+      param_index: 0
+  - TypeParam:
+      owner:
+        InherentImpl: 8
+      param_index: 1
+  - Slice:
+      of: 39
+      memory: 38
+      ownership: Shared
+  - TypeParam:
+      owner:
+        Trait: 0
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 41
+          - 41
+          - 41
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 1
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 43
+          - 43
+          - 43
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 2
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 45
+          - 45
+          - 45
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 3
+      param_index: 0
   - Function:
       signature:
         items:
           - 47
-          - 56
-        params_count: 1
+          - 47
+          - 47
+        params_count: 2
   - TypeParam:
       owner:
-        Function: 38
+        Trait: 4
       param_index: 0
-  - TypeParam:
-      owner:
-        Function: 38
-      param_index: 1
-  - Slice:
-      of: 59
-      memory: 58
-      ownership: Shared
-  - Pointer:
-      to: 59
-      memory: 58
-      ownership: Shared
   - Function:
       signature:
         items:
-          - 60
-          - 61
+          - 49
+          - 49
+          - 49
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 5
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 51
+          - 51
         params_count: 1
   - TypeParam:
       owner:
-        Function: 39
+        Trait: 6
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 53
+          - 53
+          - 53
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 7
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 55
+          - 55
+          - 55
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 8
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 57
+          - 57
+          - 57
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 9
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 59
+          - 59
+          - 59
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 10
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 61
+          - 61
+          - 61
+        params_count: 2
+  - TypeParam:
+      owner:
+        Trait: 11
+      param_index: 0
+  - Function:
+      signature:
+        items:
+          - 63
+          - 63
+        params_count: 1
+  - TypeParam:
+      owner:
+        Function: 37
       param_index: 0
   - TypeParam:
       owner:
-        Function: 39
+        Function: 37
       param_index: 1
-  - Pointer:
-      to: 64
-      memory: 63
+  - Slice:
+      of: 66
+      memory: 65
       ownership: Shared
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 63
+      base: 65
+  - Function:
+      signature:
+        items:
+          - 67
+          - 68
+        params_count: 1
+  - TypeParam:
+      owner:
+        Function: 38
+      param_index: 0
+  - TypeParam:
+      owner:
+        Function: 38
+      param_index: 1
   - Slice:
-      of: 64
-      memory: 63
+      of: 71
+      memory: 70
+      ownership: Shared
+  - Pointer:
+      to: 71
+      memory: 70
       ownership: Shared
   - Function:
       signature:
         items:
-          - 65
-          - 66
-          - 67
+          - 72
+          - 73
+        params_count: 1
+  - TypeParam:
+      owner:
+        Function: 39
+      param_index: 0
+  - TypeParam:
+      owner:
+        Function: 39
+      param_index: 1
+  - Pointer:
+      to: 76
+      memory: 75
+      ownership: Shared
+  - AssocTypeProjection:
+      trait_index: 14
+      assoc_name: 59
+      base: 75
+  - Slice:
+      of: 76
+      memory: 75
+      ownership: Shared
+  - Function:
+      signature:
+        items:
+          - 77
+          - 78
+          - 79
         params_count: 2
   - Function:
       signature:
@@ -538,17 +587,17 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 111
+      base: 123
   - AssocTypeProjection:
       trait_index: 12
       assoc_name: 182
-      base: 112
+      base: 124
   - Function:
       signature:
         items:
-          - 111
-          - 112
-          - 113
+          - 123
+          - 124
+          - 125
         params_count: 2
   - TypeParam:
       owner:
@@ -557,12 +606,12 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 115
+      base: 127
   - Function:
       signature:
         items:
-          - 115
-          - 116
+          - 127
+          - 128
         params_count: 1
   - TypeParam:
       owner:
@@ -570,18 +619,18 @@ types:
       param_index: 0
   - Pointer:
       to: 6
-      memory: 118
+      memory: 130
       ownership: Exclusive
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 118
+      base: 130
   - Function:
       signature:
         items:
-          - 119
+          - 131
           - 6
-          - 120
+          - 132
           - 2
         params_count: 3
   - TypeParam:
@@ -594,7 +643,7 @@ types:
       param_index: 2
   - Pointer:
       to: 6
-      memory: 123
+      memory: 135
       ownership: Exclusive
   - TypeParam:
       owner:
@@ -602,14 +651,14 @@ types:
       param_index: 1
   - Pointer:
       to: 6
-      memory: 125
+      memory: 137
       ownership: Shared
   - Function:
       signature:
         items:
-          - 124
-          - 126
-          - 122
+          - 136
+          - 138
+          - 134
           - 2
         params_count: 3
   - TypeParam:
@@ -619,11 +668,11 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 128
+      base: 140
   - Function:
       signature:
         items:
-          - 129
+          - 141
         params_count: 0
   - TypeParam:
       owner:
@@ -632,48 +681,32 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 131
+      base: 143
   - Function:
       signature:
         items:
-          - 132
+          - 144
         params_count: 0
-  - TypeParam:
-      owner:
-        Struct: 433
-      param_index: 0
-  - AssocTypeProjection:
-      trait_index: 14
-      assoc_name: 59
-      base: 134
-  - TypeParam:
-      owner:
-        InherentImpl: 6
-      param_index: 0
-  - Struct:
-      struct_index: 0
-      args:
-        - 136
   - Function:
       signature:
         items:
-          - 137
+          - 32
         params_count: 0
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 136
+      base: 31
   - Function:
       signature:
         items:
-          - 139
-          - 137
+          - 147
+          - 32
         params_count: 1
   - Function:
       signature:
         items:
-          - 137
-          - 139
+          - 32
+          - 147
         params_count: 1
   - TypeParam:
       owner:
@@ -682,146 +715,125 @@ types:
   - AssocTypeProjection:
       trait_index: 15
       assoc_name: 55
-      base: 142
+      base: 150
   - Pointer:
-      to: 142
-      memory: 143
+      to: 150
+      memory: 151
       ownership: Exclusive
   - TypeParam:
       owner:
         Function: 441
       param_index: 1
   - Pointer:
-      to: 145
-      memory: 143
+      to: 153
+      memory: 151
       ownership: Exclusive
   - Function:
       signature:
         items:
-          - 144
-          - 145
-          - 146
+          - 152
+          - 153
+          - 154
         params_count: 2
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 143
+      base: 151
   - TypeParam:
       owner:
         Function: 442
       param_index: 1
   - Slice:
-      of: 149
-      memory: 143
+      of: 157
+      memory: 151
       ownership: Exclusive
   - Function:
       signature:
         items:
-          - 144
-          - 148
-          - 150
+          - 152
+          - 156
+          - 158
         params_count: 2
   - Struct:
       struct_index: 0
       args:
-        - 143
+        - 151
   - Pointer:
       to: 6
-      memory: 143
+      memory: 151
       ownership: Exclusive
   - Function:
       signature:
         items:
-          - 144
           - 152
-          - 153
+          - 160
+          - 161
         params_count: 2
-  - TypeParam:
-      owner:
-        Struct: 444
-      param_index: 0
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 155
-  - TypeParam:
-      owner:
-        InherentImpl: 7
-      param_index: 0
-  - TypeParam:
-      owner:
-        InherentImpl: 7
-      param_index: 1
-  - Struct:
-      struct_index: 1
-      args:
-        - 157
-        - 158
-  - AssocTypeProjection:
-      trait_index: 14
-      assoc_name: 59
-      base: 157
+      base: 35
   - Function:
       signature:
         items:
-          - 159
-          - 160
+          - 37
+          - 163
         params_count: 1
   - Function:
       signature:
         items:
-          - 159
+          - 37
         params_count: 0
   - Pointer:
-      to: 158
-      memory: 157
+      to: 36
+      memory: 35
       ownership: Shared
   - Function:
       signature:
         items:
-          - 163
-          - 159
+          - 166
+          - 37
         params_count: 1
   - Pointer:
-      to: 158
-      memory: 157
+      to: 36
+      memory: 35
       ownership: Exclusive
   - Function:
       signature:
         items:
-          - 165
-          - 159
+          - 168
+          - 37
         params_count: 1
   - Function:
       signature:
         items:
-          - 160
-          - 159
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 159
           - 163
+          - 37
         params_count: 1
   - Function:
       signature:
         items:
-          - 159
-          - 165
+          - 37
+          - 166
         params_count: 1
   - Function:
       signature:
         items:
-          - 159
+          - 37
+          - 168
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 37
           - 16
         params_count: 1
   - Function:
       signature:
         items:
-          - 159
-          - 160
-          - 159
+          - 37
+          - 163
+          - 37
         params_count: 2
   - TypeParam:
       owner:
@@ -830,44 +842,32 @@ types:
   - Struct:
       struct_index: 1
       args:
-        - 157
-        - 172
+        - 35
+        - 175
   - Function:
       signature:
         items:
-          - 159
-          - 173
+          - 37
+          - 176
         params_count: 1
-  - TypeParam:
-      owner:
-        InherentImpl: 8
-      param_index: 0
-  - TypeParam:
-      owner:
-        InherentImpl: 8
-      param_index: 1
-  - Slice:
-      of: 176
-      memory: 175
-      ownership: Shared
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 175
+      base: 38
   - Function:
       signature:
         items:
-          - 177
+          - 40
           - 178
         params_count: 1
   - Pointer:
-      to: 176
-      memory: 175
+      to: 39
+      memory: 38
       ownership: Shared
   - Function:
       signature:
         items:
-          - 177
+          - 40
           - 180
         params_count: 1
   - Function:
@@ -1171,30 +1171,30 @@ types:
       id: 434
       type_args:
         - 1
-        - 145
+        - 153
   - FunctionItem:
       id: 39
       type_args:
         - 1
         - 1
   - Pointer:
-      to: 149
-      memory: 143
+      to: 157
+      memory: 151
       ownership: Shared
   - FunctionItem:
       id: 435
       type_args:
         - 1
-        - 149
+        - 157
   - Slice:
-      of: 149
-      memory: 143
+      of: 157
+      memory: 151
       ownership: Shared
   - FunctionItem:
       id: 431
       type_args:
-        - 158
-        - 157
+        - 36
+        - 35
   - Struct:
       struct_index: 1
       args:
@@ -1207,7 +1207,7 @@ types:
         - 1
   - Slice:
       of: 1
-      memory: 175
+      memory: 38
       ownership: Shared
   - FunctionItem:
       id: 38
@@ -1289,7 +1289,7 @@ items:
                 start: 1289
                 end: 1290
       inherited_type_param_count: 0
-      signature_index: 57
+      signature_index: 69
       name:
         inner: 54
         span:
@@ -1303,12 +1303,12 @@ items:
               start: 1275
               end: 1280
           ty:
-            inner: 47
+            inner: 67
             span:
               start: 1282
               end: 1291
       result:
-        inner: 56
+        inner: 68
         span:
           start: 1296
           end: 1305
@@ -1368,7 +1368,7 @@ items:
                 start: 1381
                 end: 1382
       inherited_type_param_count: 0
-      signature_index: 62
+      signature_index: 74
       name:
         inner: 60
         span:
@@ -1382,12 +1382,12 @@ items:
               start: 1354
               end: 1359
           ty:
-            inner: 60
+            inner: 72
             span:
               start: 1361
               end: 1370
       result:
-        inner: 61
+        inner: 73
         span:
           start: 1375
           end: 1382
@@ -1451,7 +1451,7 @@ items:
                 start: 1479
                 end: 1480
       inherited_type_param_count: 0
-      signature_index: 68
+      signature_index: 80
       name:
         inner: 61
         span:
@@ -1465,7 +1465,7 @@ items:
               start: 1438
               end: 1442
           ty:
-            inner: 65
+            inner: 77
             span:
               start: 1444
               end: 1451
@@ -1476,12 +1476,12 @@ items:
               start: 1453
               end: 1456
           ty:
-            inner: 66
+            inner: 78
             span:
               start: 1458
               end: 1467
       result:
-        inner: 67
+        inner: 79
         span:
           start: 1472
           end: 1481
@@ -1502,7 +1502,7 @@ items:
         end: 1500
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 69
+      signature_index: 81
       name:
         inner: 64
         span:
@@ -1538,7 +1538,7 @@ items:
         end: 1556
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 70
+      signature_index: 82
       name:
         inner: 66
         span:
@@ -1574,7 +1574,7 @@ items:
         end: 1612
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 71
+      signature_index: 83
       name:
         inner: 67
         span:
@@ -1610,7 +1610,7 @@ items:
         end: 1666
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 68
         span:
@@ -1650,7 +1650,7 @@ items:
         end: 1716
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 69
         span:
@@ -1690,7 +1690,7 @@ items:
         end: 1766
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 70
         span:
@@ -1730,7 +1730,7 @@ items:
         end: 1815
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 71
         span:
@@ -1770,7 +1770,7 @@ items:
         end: 1864
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 72
         span:
@@ -1810,7 +1810,7 @@ items:
         end: 1915
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 73
         span:
@@ -1850,7 +1850,7 @@ items:
         end: 1966
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 74
         span:
@@ -1890,7 +1890,7 @@ items:
         end: 2016
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 75
         span:
@@ -1930,7 +1930,7 @@ items:
         end: 2066
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 76
         span:
@@ -1970,7 +1970,7 @@ items:
         end: 2117
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 77
         span:
@@ -2010,7 +2010,7 @@ items:
         end: 2168
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 78
         span:
@@ -2050,7 +2050,7 @@ items:
         end: 2221
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 79
         span:
@@ -2090,7 +2090,7 @@ items:
         end: 2274
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 80
         span:
@@ -2141,7 +2141,7 @@ items:
         end: 2327
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 83
         span:
@@ -2192,7 +2192,7 @@ items:
         end: 2380
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 84
         span:
@@ -2243,7 +2243,7 @@ items:
         end: 2433
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 85
         span:
@@ -2294,7 +2294,7 @@ items:
         end: 2486
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 86
         span:
@@ -2345,7 +2345,7 @@ items:
         end: 2544
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 87
         span:
@@ -2396,7 +2396,7 @@ items:
         end: 2602
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 76
+      signature_index: 88
       name:
         inner: 88
         span:
@@ -2444,7 +2444,7 @@ items:
         end: 2651
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 77
+      signature_index: 89
       name:
         inner: 89
         span:
@@ -2484,7 +2484,7 @@ items:
         end: 2700
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 90
         span:
@@ -2524,7 +2524,7 @@ items:
         end: 2749
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 91
         span:
@@ -2564,7 +2564,7 @@ items:
         end: 2798
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 92
         span:
@@ -2635,7 +2635,7 @@ items:
         end: 2851
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 93
         span:
@@ -2690,7 +2690,7 @@ items:
         end: 2904
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 94
         span:
@@ -2741,7 +2741,7 @@ items:
         end: 2957
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 95
         span:
@@ -2792,7 +2792,7 @@ items:
         end: 3010
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 96
         span:
@@ -2863,7 +2863,7 @@ items:
         end: 3063
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 97
         span:
@@ -2918,7 +2918,7 @@ items:
         end: 3116
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 98
         span:
@@ -2969,7 +2969,7 @@ items:
         end: 3169
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 99
         span:
@@ -3020,7 +3020,7 @@ items:
         end: 3222
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 100
         span:
@@ -3091,7 +3091,7 @@ items:
         end: 3275
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 101
         span:
@@ -3146,7 +3146,7 @@ items:
         end: 3328
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 102
         span:
@@ -3197,7 +3197,7 @@ items:
         end: 3381
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 103
         span:
@@ -3248,7 +3248,7 @@ items:
         end: 3434
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 104
         span:
@@ -3307,7 +3307,7 @@ items:
         end: 3487
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 105
         span:
@@ -3366,7 +3366,7 @@ items:
         end: 3540
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 106
         span:
@@ -3417,7 +3417,7 @@ items:
         end: 3593
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 107
         span:
@@ -3468,7 +3468,7 @@ items:
         end: 3646
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 108
         span:
@@ -3519,7 +3519,7 @@ items:
         end: 3699
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 109
         span:
@@ -3570,7 +3570,7 @@ items:
         end: 3752
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 110
         span:
@@ -3629,7 +3629,7 @@ items:
         end: 3805
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 111
         span:
@@ -3688,7 +3688,7 @@ items:
         end: 3858
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 112
         span:
@@ -3739,7 +3739,7 @@ items:
         end: 3911
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 113
         span:
@@ -3790,7 +3790,7 @@ items:
         end: 3964
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 114
         span:
@@ -3865,7 +3865,7 @@ items:
         end: 4020
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 115
         span:
@@ -3920,7 +3920,7 @@ items:
         end: 4076
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 116
         span:
@@ -3995,7 +3995,7 @@ items:
         end: 4131
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 117
         span:
@@ -4050,7 +4050,7 @@ items:
         end: 4186
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 118
         span:
@@ -4125,7 +4125,7 @@ items:
         end: 4242
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 119
         span:
@@ -4180,7 +4180,7 @@ items:
         end: 4298
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 120
         span:
@@ -4251,7 +4251,7 @@ items:
         end: 4351
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 121
         span:
@@ -4306,7 +4306,7 @@ items:
         end: 4404
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 122
         span:
@@ -4365,7 +4365,7 @@ items:
         end: 4457
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 123
         span:
@@ -4424,7 +4424,7 @@ items:
         end: 4510
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 124
         span:
@@ -4475,7 +4475,7 @@ items:
         end: 4563
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 125
         span:
@@ -4526,7 +4526,7 @@ items:
         end: 4616
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 76
+      signature_index: 88
       name:
         inner: 126
         span:
@@ -4586,7 +4586,7 @@ items:
         end: 4668
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 77
+      signature_index: 89
       name:
         inner: 127
         span:
@@ -4630,7 +4630,7 @@ items:
         end: 4720
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 82
+      signature_index: 94
       name:
         inner: 128
         span:
@@ -4670,7 +4670,7 @@ items:
         end: 4777
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 95
       name:
         inner: 129
         span:
@@ -4710,7 +4710,7 @@ items:
         end: 4834
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 96
       name:
         inner: 130
         span:
@@ -4750,7 +4750,7 @@ items:
         end: 4891
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 97
       name:
         inner: 131
         span:
@@ -4790,7 +4790,7 @@ items:
         end: 4948
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 98
       name:
         inner: 132
         span:
@@ -4830,7 +4830,7 @@ items:
         end: 5005
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 99
       name:
         inner: 133
         span:
@@ -4870,7 +4870,7 @@ items:
         end: 5062
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 100
       name:
         inner: 134
         span:
@@ -4910,7 +4910,7 @@ items:
         end: 5119
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 101
       name:
         inner: 135
         span:
@@ -4950,7 +4950,7 @@ items:
         end: 5176
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 102
       name:
         inner: 136
         span:
@@ -4990,7 +4990,7 @@ items:
         end: 5231
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 103
       name:
         inner: 137
         span:
@@ -5030,7 +5030,7 @@ items:
         end: 5286
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 104
       name:
         inner: 138
         span:
@@ -5070,7 +5070,7 @@ items:
         end: 5341
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 93
+      signature_index: 105
       name:
         inner: 139
         span:
@@ -5110,7 +5110,7 @@ items:
         end: 5396
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 94
+      signature_index: 106
       name:
         inner: 140
         span:
@@ -5150,7 +5150,7 @@ items:
         end: 5451
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 95
+      signature_index: 107
       name:
         inner: 141
         span:
@@ -5190,7 +5190,7 @@ items:
         end: 5506
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 96
+      signature_index: 108
       name:
         inner: 142
         span:
@@ -5230,7 +5230,7 @@ items:
         end: 5561
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 97
+      signature_index: 109
       name:
         inner: 143
         span:
@@ -5270,7 +5270,7 @@ items:
         end: 5616
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 98
+      signature_index: 110
       name:
         inner: 144
         span:
@@ -5310,7 +5310,7 @@ items:
         end: 5673
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 99
+      signature_index: 111
       name:
         inner: 145
         span:
@@ -5350,7 +5350,7 @@ items:
         end: 5729
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 102
       name:
         inner: 146
         span:
@@ -5390,7 +5390,7 @@ items:
         end: 5790
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 82
+      signature_index: 94
       name:
         inner: 147
         span:
@@ -5430,7 +5430,7 @@ items:
         end: 5851
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 96
+      signature_index: 108
       name:
         inner: 148
         span:
@@ -5470,7 +5470,7 @@ items:
         end: 5912
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 100
       name:
         inner: 149
         span:
@@ -5536,7 +5536,7 @@ items:
                 start: 23792
                 end: 23795
       inherited_type_param_count: 0
-      signature_index: 114
+      signature_index: 126
       name:
         inner: 185
         span:
@@ -5550,7 +5550,7 @@ items:
               start: 23761
               end: 23764
           ty:
-            inner: 111
+            inner: 123
             span:
               start: 23766
               end: 23769
@@ -5561,12 +5561,12 @@ items:
               start: 23771
               end: 23776
           ty:
-            inner: 112
+            inner: 124
             span:
               start: 23778
               end: 23787
       result:
-        inner: 113
+        inner: 125
         span:
           start: 23792
           end: 23809
@@ -5609,7 +5609,7 @@ items:
                 start: 23999
                 end: 24002
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 129
       name:
         inner: 188
         span:
@@ -5623,12 +5623,12 @@ items:
               start: 23986
               end: 23989
           ty:
-            inner: 115
+            inner: 127
             span:
               start: 23991
               end: 23994
       result:
-        inner: 116
+        inner: 128
         span:
           start: 23999
           end: 24008
@@ -5671,7 +5671,7 @@ items:
                 start: 24206
                 end: 24209
       inherited_type_param_count: 0
-      signature_index: 121
+      signature_index: 133
       name:
         inner: 189
         span:
@@ -5685,7 +5685,7 @@ items:
               start: 24177
               end: 24180
           ty:
-            inner: 119
+            inner: 131
             span:
               start: 24182
               end: 24190
@@ -5707,7 +5707,7 @@ items:
               start: 24201
               end: 24204
           ty:
-            inner: 120
+            inner: 132
             span:
               start: 24206
               end: 24215
@@ -5759,7 +5759,7 @@ items:
               - trait_index: 14
                 bindings:
                   - - 59
-                    - Equals: 122
+                    - Equals: 134
                 span:
                   start: 24496
                   end: 24524
@@ -5779,7 +5779,7 @@ items:
               - trait_index: 14
                 bindings:
                   - - 59
-                    - Equals: 122
+                    - Equals: 134
                 span:
                   start: 24538
                   end: 24566
@@ -5790,7 +5790,7 @@ items:
                 start: 24575
                 end: 24581
       inherited_type_param_count: 0
-      signature_index: 127
+      signature_index: 139
       name:
         inner: 192
         span:
@@ -5804,7 +5804,7 @@ items:
               start: 24570
               end: 24573
           ty:
-            inner: 124
+            inner: 136
             span:
               start: 24575
               end: 24586
@@ -5815,7 +5815,7 @@ items:
               start: 24588
               end: 24591
           ty:
-            inner: 126
+            inner: 138
             span:
               start: 24593
               end: 24604
@@ -5826,7 +5826,7 @@ items:
               start: 24606
               end: 24609
           ty:
-            inner: 122
+            inner: 134
             span:
               start: 24611
               end: 24615
@@ -5871,7 +5871,7 @@ items:
                 start: 25921
                 end: 25924
       inherited_type_param_count: 0
-      signature_index: 130
+      signature_index: 142
       name:
         inner: 204
         span:
@@ -5879,7 +5879,7 @@ items:
           end: 25899
       params: []
       result:
-        inner: 129
+        inner: 141
         span:
           start: 25921
           end: 25930
@@ -5939,7 +5939,7 @@ items:
                 start: 25983
                 end: 25986
       inherited_type_param_count: 0
-      signature_index: 133
+      signature_index: 145
       name:
         inner: 205
         span:
@@ -5947,7 +5947,7 @@ items:
           end: 25961
       params: []
       result:
-        inner: 132
+        inner: 144
         span:
           start: 25983
           end: 25992
@@ -5989,6 +5989,126 @@ items:
             end: 116
       attributes: []
       body: 183
+    - id: 427
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 28
+      name:
+        inner: 201
+        span:
+          start: 25466
+          end: 25470
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25471
+              end: 25475
+          ty:
+            inner: 22
+            span:
+              start: 25471
+              end: 25475
+        - mut_span: ~
+          name:
+            inner: 187
+            span:
+              start: 25477
+              end: 25482
+          ty:
+            inner: 24
+            span:
+              start: 25484
+              end: 25494
+      result:
+        inner: 27
+        span:
+          start: 25499
+          end: 25517
+      accesses: []
+      attributes:
+        - Inline
+      body: 147
+    - id: 428
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 29
+      name:
+        inner: 202
+        span:
+          start: 25640
+          end: 25650
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25651
+              end: 25655
+          ty:
+            inner: 22
+            span:
+              start: 25651
+              end: 25655
+      result:
+        inner: 24
+        span:
+          start: 25660
+          end: 25670
+      accesses:
+        - file_id: 0
+          span:
+            start: 25832
+            end: 25842
+      attributes:
+        - Inline
+      body: 148
+    - id: 429
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 29
+      name:
+        inner: 203
+        span:
+          start: 25786
+          end: 25796
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25797
+              end: 25801
+          ty:
+            inner: 22
+            span:
+              start: 25797
+              end: 25801
+      result:
+        inner: 24
+        span:
+          start: 25806
+          end: 25816
+      accesses: []
+      attributes:
+        - Inline
+      body: 149
     - id: 13
       file_id: 0
       namespace: 0
@@ -5997,7 +6117,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 22
+      signature_index: 42
       name:
         inner: 17
         span:
@@ -6011,7 +6131,7 @@ items:
               start: 408
               end: 412
           ty:
-            inner: 21
+            inner: 41
             span:
               start: 408
               end: 412
@@ -6022,12 +6142,12 @@ items:
               start: 414
               end: 417
           ty:
-            inner: 21
+            inner: 41
             span:
               start: 419
               end: 423
       result:
-        inner: 21
+        inner: 41
         span:
           start: 428
           end: 432
@@ -6050,7 +6170,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 24
+      signature_index: 44
       name:
         inner: 23
         span:
@@ -6064,7 +6184,7 @@ items:
               start: 479
               end: 483
           ty:
-            inner: 23
+            inner: 43
             span:
               start: 479
               end: 483
@@ -6075,12 +6195,12 @@ items:
               start: 485
               end: 488
           ty:
-            inner: 23
+            inner: 43
             span:
               start: 490
               end: 494
       result:
-        inner: 23
+        inner: 43
         span:
           start: 499
           end: 503
@@ -6107,7 +6227,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 26
+      signature_index: 46
       name:
         inner: 26
         span:
@@ -6121,7 +6241,7 @@ items:
               start: 550
               end: 554
           ty:
-            inner: 25
+            inner: 45
             span:
               start: 550
               end: 554
@@ -6132,12 +6252,12 @@ items:
               start: 556
               end: 559
           ty:
-            inner: 25
+            inner: 45
             span:
               start: 561
               end: 565
       result:
-        inner: 25
+        inner: 45
         span:
           start: 570
           end: 574
@@ -6168,7 +6288,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 28
+      signature_index: 48
       name:
         inner: 29
         span:
@@ -6182,7 +6302,7 @@ items:
               start: 621
               end: 625
           ty:
-            inner: 27
+            inner: 47
             span:
               start: 621
               end: 625
@@ -6193,12 +6313,12 @@ items:
               start: 627
               end: 630
           ty:
-            inner: 27
+            inner: 47
             span:
               start: 632
               end: 636
       result:
-        inner: 27
+        inner: 47
         span:
           start: 641
           end: 645
@@ -6213,7 +6333,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 30
+      signature_index: 50
       name:
         inner: 32
         span:
@@ -6227,7 +6347,7 @@ items:
               start: 692
               end: 696
           ty:
-            inner: 29
+            inner: 49
             span:
               start: 692
               end: 696
@@ -6238,12 +6358,12 @@ items:
               start: 698
               end: 701
           ty:
-            inner: 29
+            inner: 49
             span:
               start: 703
               end: 707
       result:
-        inner: 29
+        inner: 49
         span:
           start: 712
           end: 716
@@ -6258,7 +6378,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 32
+      signature_index: 52
       name:
         inner: 35
         span:
@@ -6272,12 +6392,12 @@ items:
               start: 763
               end: 767
           ty:
-            inner: 31
+            inner: 51
             span:
               start: 763
               end: 767
       result:
-        inner: 31
+        inner: 51
         span:
           start: 772
           end: 776
@@ -6292,7 +6412,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 34
+      signature_index: 54
       name:
         inner: 38
         span:
@@ -6306,7 +6426,7 @@ items:
               start: 832
               end: 836
           ty:
-            inner: 33
+            inner: 53
             span:
               start: 832
               end: 836
@@ -6317,12 +6437,12 @@ items:
               start: 838
               end: 841
           ty:
-            inner: 33
+            inner: 53
             span:
               start: 843
               end: 847
       result:
-        inner: 33
+        inner: 53
         span:
           start: 852
           end: 856
@@ -6341,7 +6461,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 36
+      signature_index: 56
       name:
         inner: 41
         span:
@@ -6355,7 +6475,7 @@ items:
               start: 909
               end: 913
           ty:
-            inner: 35
+            inner: 55
             span:
               start: 909
               end: 913
@@ -6366,12 +6486,12 @@ items:
               start: 915
               end: 918
           ty:
-            inner: 35
+            inner: 55
             span:
               start: 920
               end: 924
       result:
-        inner: 35
+        inner: 55
         span:
           start: 929
           end: 933
@@ -6386,7 +6506,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 38
+      signature_index: 58
       name:
         inner: 44
         span:
@@ -6400,7 +6520,7 @@ items:
               start: 989
               end: 993
           ty:
-            inner: 37
+            inner: 57
             span:
               start: 989
               end: 993
@@ -6411,12 +6531,12 @@ items:
               start: 995
               end: 998
           ty:
-            inner: 37
+            inner: 57
             span:
               start: 1000
               end: 1004
       result:
-        inner: 37
+        inner: 57
         span:
           start: 1009
           end: 1013
@@ -6431,7 +6551,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 40
+      signature_index: 60
       name:
         inner: 47
         span:
@@ -6445,7 +6565,7 @@ items:
               start: 1060
               end: 1064
           ty:
-            inner: 39
+            inner: 59
             span:
               start: 1060
               end: 1064
@@ -6456,12 +6576,12 @@ items:
               start: 1066
               end: 1069
           ty:
-            inner: 39
+            inner: 59
             span:
               start: 1071
               end: 1075
       result:
-        inner: 39
+        inner: 59
         span:
           start: 1080
           end: 1084
@@ -6476,7 +6596,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 42
+      signature_index: 62
       name:
         inner: 50
         span:
@@ -6490,7 +6610,7 @@ items:
               start: 1131
               end: 1135
           ty:
-            inner: 41
+            inner: 61
             span:
               start: 1131
               end: 1135
@@ -6501,12 +6621,12 @@ items:
               start: 1137
               end: 1140
           ty:
-            inner: 41
+            inner: 61
             span:
               start: 1142
               end: 1146
       result:
-        inner: 41
+        inner: 61
         span:
           start: 1151
           end: 1155
@@ -6521,7 +6641,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 44
+      signature_index: 64
       name:
         inner: 53
         span:
@@ -6535,12 +6655,12 @@ items:
               start: 1211
               end: 1215
           ty:
-            inner: 43
+            inner: 63
             span:
               start: 1211
               end: 1215
       result:
-        inner: 43
+        inner: 63
         span:
           start: 1220
           end: 1224
@@ -6551,126 +6671,6 @@ items:
             end: 28226
       attributes: []
       body: ~
-    - id: 427
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 54
-      name:
-        inner: 201
-        span:
-          start: 25466
-          end: 25470
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25471
-              end: 25475
-          ty:
-            inner: 48
-            span:
-              start: 25471
-              end: 25475
-        - mut_span: ~
-          name:
-            inner: 187
-            span:
-              start: 25477
-              end: 25482
-          ty:
-            inner: 50
-            span:
-              start: 25484
-              end: 25494
-      result:
-        inner: 53
-        span:
-          start: 25499
-          end: 25517
-      accesses: []
-      attributes:
-        - Inline
-      body: 147
-    - id: 428
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 55
-      name:
-        inner: 202
-        span:
-          start: 25640
-          end: 25650
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25651
-              end: 25655
-          ty:
-            inner: 48
-            span:
-              start: 25651
-              end: 25655
-      result:
-        inner: 50
-        span:
-          start: 25660
-          end: 25670
-      accesses:
-        - file_id: 0
-          span:
-            start: 25832
-            end: 25842
-      attributes:
-        - Inline
-      body: 148
-    - id: 429
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 55
-      name:
-        inner: 203
-        span:
-          start: 25786
-          end: 25796
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25797
-              end: 25801
-          ty:
-            inner: 48
-            span:
-              start: 25797
-              end: 25801
-      result:
-        inner: 50
-        span:
-          start: 25806
-          end: 25816
-      accesses: []
-      attributes:
-        - Inline
-      body: 149
     - id: 130
       file_id: 0
       namespace: 0
@@ -6681,7 +6681,7 @@ items:
         end: 6296
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 158
         span:
@@ -6722,7 +6722,7 @@ items:
         end: 6374
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 159
         span:
@@ -6759,7 +6759,7 @@ items:
         end: 6448
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 160
         span:
@@ -6796,7 +6796,7 @@ items:
         end: 6524
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 161
         span:
@@ -6833,7 +6833,7 @@ items:
         end: 6602
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 162
         span:
@@ -6870,7 +6870,7 @@ items:
         end: 6678
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 163
         span:
@@ -6907,7 +6907,7 @@ items:
         end: 6760
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 164
         span:
@@ -6955,7 +6955,7 @@ items:
         end: 6854
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 166
         span:
@@ -7003,7 +7003,7 @@ items:
         end: 6948
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 167
         span:
@@ -7051,7 +7051,7 @@ items:
         end: 7050
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 103
       name:
         inner: 169
         span:
@@ -7088,7 +7088,7 @@ items:
         end: 7146
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 95
       name:
         inner: 170
         span:
@@ -7125,7 +7125,7 @@ items:
         end: 7250
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 98
+      signature_index: 110
       name:
         inner: 172
         span:
@@ -7162,7 +7162,7 @@ items:
         end: 7335
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 102
       name:
         inner: 173
         span:
@@ -7199,7 +7199,7 @@ items:
         end: 7417
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 103
       name:
         inner: 174
         span:
@@ -7236,7 +7236,7 @@ items:
         end: 7499
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 94
+      signature_index: 106
       name:
         inner: 175
         span:
@@ -7273,7 +7273,7 @@ items:
         end: 7581
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 95
+      signature_index: 107
       name:
         inner: 176
         span:
@@ -7310,7 +7310,7 @@ items:
         end: 8019
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 158
         span:
@@ -7351,7 +7351,7 @@ items:
         end: 8097
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 159
         span:
@@ -7388,7 +7388,7 @@ items:
         end: 8171
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 160
         span:
@@ -7425,7 +7425,7 @@ items:
         end: 8247
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 161
         span:
@@ -7462,7 +7462,7 @@ items:
         end: 8325
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 162
         span:
@@ -7499,7 +7499,7 @@ items:
         end: 8401
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 163
         span:
@@ -7536,7 +7536,7 @@ items:
         end: 8483
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 164
         span:
@@ -7584,7 +7584,7 @@ items:
         end: 8577
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 166
         span:
@@ -7632,7 +7632,7 @@ items:
         end: 8671
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 167
         span:
@@ -7680,7 +7680,7 @@ items:
         end: 8773
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 97
+      signature_index: 109
       name:
         inner: 169
         span:
@@ -7717,7 +7717,7 @@ items:
         end: 8869
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 101
       name:
         inner: 170
         span:
@@ -7754,7 +7754,7 @@ items:
         end: 8973
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 99
+      signature_index: 111
       name:
         inner: 177
         span:
@@ -7791,7 +7791,7 @@ items:
         end: 9056
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 104
       name:
         inner: 173
         span:
@@ -7828,7 +7828,7 @@ items:
         end: 9138
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 93
+      signature_index: 105
       name:
         inner: 174
         span:
@@ -7865,7 +7865,7 @@ items:
         end: 9220
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 96
+      signature_index: 108
       name:
         inner: 175
         span:
@@ -7902,7 +7902,7 @@ items:
         end: 9302
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 97
+      signature_index: 109
       name:
         inner: 176
         span:
@@ -7939,7 +7939,7 @@ items:
         end: 9397
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 82
+      signature_index: 94
       name:
         inner: 178
         span:
@@ -7976,7 +7976,7 @@ items:
         end: 9481
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 98
       name:
         inner: 179
         span:
@@ -8011,7 +8011,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 17
         span:
@@ -8057,7 +8057,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 23
         span:
@@ -8103,7 +8103,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 26
         span:
@@ -8149,7 +8149,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 29
         span:
@@ -8195,7 +8195,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 32
         span:
@@ -8241,7 +8241,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 76
+      signature_index: 88
       name:
         inner: 35
         span:
@@ -8276,7 +8276,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 38
         span:
@@ -8322,7 +8322,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 41
         span:
@@ -8368,7 +8368,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 44
         span:
@@ -8414,7 +8414,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 47
         span:
@@ -8460,7 +8460,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 78
+      signature_index: 90
       name:
         inner: 50
         span:
@@ -8506,7 +8506,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 76
+      signature_index: 88
       name:
         inner: 53
         span:
@@ -8543,7 +8543,7 @@ items:
         end: 10863
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 95
       name:
         inner: 178
         span:
@@ -8580,7 +8580,7 @@ items:
         end: 10947
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 99
       name:
         inner: 179
         span:
@@ -8615,7 +8615,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 17
         span:
@@ -8661,7 +8661,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 23
         span:
@@ -8707,7 +8707,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 26
         span:
@@ -8753,7 +8753,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 29
         span:
@@ -8799,7 +8799,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 32
         span:
@@ -8845,7 +8845,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 38
         span:
@@ -8891,7 +8891,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 41
         span:
@@ -8937,7 +8937,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 44
         span:
@@ -8983,7 +8983,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 47
         span:
@@ -9029,7 +9029,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 92
       name:
         inner: 50
         span:
@@ -9075,7 +9075,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 100
+      signature_index: 112
       name:
         inner: 53
         span:
@@ -9112,7 +9112,7 @@ items:
         end: 12399
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 96
       name:
         inner: 178
         span:
@@ -9149,7 +9149,7 @@ items:
         end: 12483
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 100
       name:
         inner: 179
         span:
@@ -9184,7 +9184,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 17
         span:
@@ -9230,7 +9230,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 23
         span:
@@ -9276,7 +9276,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 26
         span:
@@ -9322,7 +9322,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 29
         span:
@@ -9368,7 +9368,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 32
         span:
@@ -9414,7 +9414,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 77
+      signature_index: 89
       name:
         inner: 35
         span:
@@ -9449,7 +9449,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 38
         span:
@@ -9495,7 +9495,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 41
         span:
@@ -9541,7 +9541,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 44
         span:
@@ -9587,7 +9587,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 47
         span:
@@ -9633,7 +9633,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 91
       name:
         inner: 50
         span:
@@ -9679,7 +9679,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 77
+      signature_index: 89
       name:
         inner: 53
         span:
@@ -9716,7 +9716,7 @@ items:
         end: 13865
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 97
       name:
         inner: 178
         span:
@@ -9753,7 +9753,7 @@ items:
         end: 13949
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 101
       name:
         inner: 179
         span:
@@ -9788,7 +9788,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 17
         span:
@@ -9834,7 +9834,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 23
         span:
@@ -9880,7 +9880,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 26
         span:
@@ -9926,7 +9926,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 29
         span:
@@ -9972,7 +9972,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 32
         span:
@@ -10018,7 +10018,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 38
         span:
@@ -10064,7 +10064,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 41
         span:
@@ -10110,7 +10110,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 44
         span:
@@ -10156,7 +10156,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 47
         span:
@@ -10202,7 +10202,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 93
       name:
         inner: 50
         span:
@@ -10248,7 +10248,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 101
+      signature_index: 113
       name:
         inner: 53
         span:
@@ -10283,7 +10283,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 17
         span:
@@ -10329,7 +10329,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 23
         span:
@@ -10379,7 +10379,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 26
         span:
@@ -10429,7 +10429,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 29
         span:
@@ -10479,7 +10479,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 72
+      signature_index: 84
       name:
         inner: 35
         span:
@@ -10514,7 +10514,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 74
+      signature_index: 86
       name:
         inner: 32
         span:
@@ -10560,7 +10560,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 17
         span:
@@ -10606,7 +10606,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 23
         span:
@@ -10656,7 +10656,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 26
         span:
@@ -10706,7 +10706,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 29
         span:
@@ -10756,7 +10756,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 85
       name:
         inner: 35
         span:
@@ -10791,7 +10791,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 75
+      signature_index: 87
       name:
         inner: 32
         span:
@@ -10837,7 +10837,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 17
         span:
@@ -10883,7 +10883,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 23
         span:
@@ -10929,7 +10929,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 26
         span:
@@ -10975,7 +10975,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 29
         span:
@@ -11021,7 +11021,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 32
         span:
@@ -11067,7 +11067,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 103
+      signature_index: 115
       name:
         inner: 35
         span:
@@ -11102,7 +11102,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 38
         span:
@@ -11148,7 +11148,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 41
         span:
@@ -11194,7 +11194,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 44
         span:
@@ -11240,7 +11240,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 47
         span:
@@ -11286,7 +11286,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 114
       name:
         inner: 50
         span:
@@ -11332,7 +11332,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 103
+      signature_index: 115
       name:
         inner: 53
         span:
@@ -11367,7 +11367,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 17
         span:
@@ -11413,7 +11413,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 23
         span:
@@ -11459,7 +11459,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 26
         span:
@@ -11505,7 +11505,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 29
         span:
@@ -11551,7 +11551,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 32
         span:
@@ -11597,7 +11597,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 38
         span:
@@ -11643,7 +11643,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 41
         span:
@@ -11689,7 +11689,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 44
         span:
@@ -11743,7 +11743,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 47
         span:
@@ -11789,7 +11789,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 116
       name:
         inner: 50
         span:
@@ -11835,7 +11835,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 105
+      signature_index: 117
       name:
         inner: 53
         span:
@@ -11870,7 +11870,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 17
         span:
@@ -11916,7 +11916,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 23
         span:
@@ -11962,7 +11962,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 26
         span:
@@ -12008,7 +12008,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 29
         span:
@@ -12054,7 +12054,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 32
         span:
@@ -12100,7 +12100,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 107
+      signature_index: 119
       name:
         inner: 35
         span:
@@ -12135,7 +12135,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 38
         span:
@@ -12181,7 +12181,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 41
         span:
@@ -12227,7 +12227,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 44
         span:
@@ -12273,7 +12273,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 47
         span:
@@ -12319,7 +12319,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 118
       name:
         inner: 50
         span:
@@ -12365,7 +12365,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 107
+      signature_index: 119
       name:
         inner: 53
         span:
@@ -12400,7 +12400,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 17
         span:
@@ -12446,7 +12446,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 23
         span:
@@ -12492,7 +12492,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 26
         span:
@@ -12538,7 +12538,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 29
         span:
@@ -12584,7 +12584,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 32
         span:
@@ -12630,7 +12630,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 38
         span:
@@ -12676,7 +12676,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 41
         span:
@@ -12722,7 +12722,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 44
         span:
@@ -12768,7 +12768,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 47
         span:
@@ -12814,7 +12814,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 120
       name:
         inner: 50
         span:
@@ -12860,7 +12860,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 109
+      signature_index: 121
       name:
         inner: 53
         span:
@@ -12895,7 +12895,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 110
+      signature_index: 122
       name:
         inner: 38
         span:
@@ -12941,7 +12941,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 110
+      signature_index: 122
       name:
         inner: 41
         span:
@@ -13019,7 +13019,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 110
+      signature_index: 122
       name:
         inner: 44
         span:
@@ -13084,7 +13084,7 @@ items:
                 start: 26205
                 end: 26206
       inherited_type_param_count: 1
-      signature_index: 138
+      signature_index: 146
       name:
         inner: 209
         span:
@@ -13092,7 +13092,7 @@ items:
           end: 26133
       params: []
       result:
-        inner: 137
+        inner: 32
         span:
           start: 26142
           end: 26146
@@ -13131,7 +13131,7 @@ items:
                 start: 26337
                 end: 26338
       inherited_type_param_count: 1
-      signature_index: 140
+      signature_index: 148
       name:
         inner: 210
         span:
@@ -13145,12 +13145,12 @@ items:
               start: 26253
               end: 26258
           ty:
-            inner: 139
+            inner: 147
             span:
               start: 26260
               end: 26269
       result:
-        inner: 137
+        inner: 32
         span:
           start: 26274
           end: 26278
@@ -13172,7 +13172,7 @@ items:
         end: 26380
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 141
+      signature_index: 149
       name:
         inner: 207
         span:
@@ -13186,12 +13186,12 @@ items:
               start: 26389
               end: 26393
           ty:
-            inner: 137
+            inner: 32
             span:
               start: 26389
               end: 26393
       result:
-        inner: 139
+        inner: 147
         span:
           start: 26398
           end: 26407
@@ -13209,7 +13209,7 @@ items:
         end: 26456
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 141
+      signature_index: 149
       name:
         inner: 208
         span:
@@ -13223,12 +13223,12 @@ items:
               start: 26466
               end: 26470
           ty:
-            inner: 137
+            inner: 32
             span:
               start: 26466
               end: 26470
       result:
-        inner: 139
+        inner: 147
         span:
           start: 26475
           end: 26484
@@ -13244,7 +13244,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 154
+      signature_index: 162
       name:
         inner: 213
         span:
@@ -13258,7 +13258,7 @@ items:
               start: 26576
               end: 26580
           ty:
-            inner: 144
+            inner: 152
             span:
               start: 26582
               end: 26598
@@ -13269,12 +13269,12 @@ items:
               start: 26600
               end: 26606
           ty:
-            inner: 152
+            inner: 160
             span:
               start: 26608
               end: 26625
       result:
-        inner: 153
+        inner: 161
         span:
           start: 26630
           end: 26644
@@ -13322,7 +13322,7 @@ items:
                 start: 26786
                 end: 26787
       inherited_type_param_count: 1
-      signature_index: 147
+      signature_index: 155
       name:
         inner: 215
         span:
@@ -13336,7 +13336,7 @@ items:
               start: 26686
               end: 26690
           ty:
-            inner: 144
+            inner: 152
             span:
               start: 26692
               end: 26708
@@ -13347,12 +13347,12 @@ items:
               start: 26710
               end: 26715
           ty:
-            inner: 145
+            inner: 153
             span:
               start: 26717
               end: 26718
       result:
-        inner: 146
+        inner: 154
         span:
           start: 26723
           end: 26736
@@ -13389,7 +13389,7 @@ items:
                 start: 27033
                 end: 27034
       inherited_type_param_count: 1
-      signature_index: 151
+      signature_index: 159
       name:
         inner: 217
         span:
@@ -13403,7 +13403,7 @@ items:
               start: 26898
               end: 26902
           ty:
-            inner: 144
+            inner: 152
             span:
               start: 26904
               end: 26920
@@ -13414,12 +13414,12 @@ items:
               start: 26922
               end: 26925
           ty:
-            inner: 148
+            inner: 156
             span:
               start: 26927
               end: 26942
       result:
-        inner: 150
+        inner: 158
         span:
           start: 26947
           end: 26962
@@ -13437,7 +13437,7 @@ items:
         end: 27220
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 161
+      signature_index: 164
       name:
         inner: 219
         span:
@@ -13451,12 +13451,12 @@ items:
               start: 27229
               end: 27233
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27229
               end: 27233
       result:
-        inner: 160
+        inner: 163
         span:
           start: 27238
           end: 27247
@@ -13474,7 +13474,7 @@ items:
         end: 27282
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 162
+      signature_index: 165
       name:
         inner: 220
         span:
@@ -13482,7 +13482,7 @@ items:
           end: 27290
       params: []
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27296
           end: 27300
@@ -13499,7 +13499,7 @@ items:
         end: 27343
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 164
+      signature_index: 167
       name:
         inner: 221
         span:
@@ -13513,12 +13513,12 @@ items:
               start: 27356
               end: 27359
           ty:
-            inner: 163
+            inner: 166
             span:
               start: 27361
               end: 27368
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27373
           end: 27377
@@ -13535,7 +13535,7 @@ items:
         end: 27427
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 166
+      signature_index: 169
       name:
         inner: 223
         span:
@@ -13549,12 +13549,12 @@ items:
               start: 27440
               end: 27443
           ty:
-            inner: 165
+            inner: 168
             span:
               start: 27445
               end: 27452
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27457
           end: 27461
@@ -13571,7 +13571,7 @@ items:
         end: 27511
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 167
+      signature_index: 170
       name:
         inner: 224
         span:
@@ -13585,12 +13585,12 @@ items:
               start: 27525
               end: 27529
           ty:
-            inner: 160
+            inner: 163
             span:
               start: 27531
               end: 27540
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27545
           end: 27549
@@ -13607,7 +13607,7 @@ items:
         end: 27589
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 168
+      signature_index: 171
       name:
         inner: 225
         span:
@@ -13621,12 +13621,12 @@ items:
               start: 27600
               end: 27604
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27600
               end: 27604
       result:
-        inner: 163
+        inner: 166
         span:
           start: 27609
           end: 27616
@@ -13643,7 +13643,7 @@ items:
         end: 27656
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 169
+      signature_index: 172
       name:
         inner: 226
         span:
@@ -13657,12 +13657,12 @@ items:
               start: 27667
               end: 27671
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27667
               end: 27671
       result:
-        inner: 165
+        inner: 168
         span:
           start: 27676
           end: 27683
@@ -13679,7 +13679,7 @@ items:
         end: 27723
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 170
+      signature_index: 173
       name:
         inner: 227
         span:
@@ -13693,7 +13693,7 @@ items:
               start: 27735
               end: 27739
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27735
               end: 27739
@@ -13715,7 +13715,7 @@ items:
         end: 27788
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 171
+      signature_index: 174
       name:
         inner: 17
         span:
@@ -13729,7 +13729,7 @@ items:
               start: 27796
               end: 27800
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27796
               end: 27800
@@ -13740,12 +13740,12 @@ items:
               start: 27802
               end: 27807
           ty:
-            inner: 160
+            inner: 163
             span:
               start: 27809
               end: 27818
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27823
           end: 27827
@@ -13762,7 +13762,7 @@ items:
         end: 27908
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 171
+      signature_index: 174
       name:
         inner: 23
         span:
@@ -13776,7 +13776,7 @@ items:
               start: 27916
               end: 27920
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 27916
               end: 27920
@@ -13787,12 +13787,12 @@ items:
               start: 27922
               end: 27927
           ty:
-            inner: 160
+            inner: 163
             span:
               start: 27929
               end: 27938
       result:
-        inner: 159
+        inner: 37
         span:
           start: 27943
           end: 27947
@@ -13809,7 +13809,7 @@ items:
         end: 28130
       type_params: []
       inherited_type_param_count: 2
-      signature_index: 171
+      signature_index: 174
       name:
         inner: 228
         span:
@@ -13823,7 +13823,7 @@ items:
               start: 28143
               end: 28147
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 28143
               end: 28147
@@ -13834,12 +13834,12 @@ items:
               start: 28149
               end: 28154
           ty:
-            inner: 160
+            inner: 163
             span:
               start: 28156
               end: 28165
       result:
-        inner: 159
+        inner: 37
         span:
           start: 28170
           end: 28174
@@ -13869,7 +13869,7 @@ items:
                 start: 28287
                 end: 28288
       inherited_type_param_count: 2
-      signature_index: 174
+      signature_index: 177
       name:
         inner: 229
         span:
@@ -13883,12 +13883,12 @@ items:
               start: 28266
               end: 28270
           ty:
-            inner: 159
+            inner: 37
             span:
               start: 28266
               end: 28270
       result:
-        inner: 173
+        inner: 176
         span:
           start: 28275
           end: 28289
@@ -13919,7 +13919,7 @@ items:
               start: 28404
               end: 28408
           ty:
-            inner: 177
+            inner: 40
             span:
               start: 28404
               end: 28408
@@ -13956,7 +13956,7 @@ items:
               start: 28485
               end: 28489
           ty:
-            inner: 177
+            inner: 40
             span:
               start: 28485
               end: 28489
@@ -14506,7 +14506,7 @@ items:
               start: 26032
               end: 26036
           ty:
-            inner: 135
+            inner: 30
             span:
               start: 26038
               end: 26047
@@ -14533,7 +14533,7 @@ items:
               start: 26053
               end: 26058
           ty:
-            inner: 135
+            inner: 30
             span:
               start: 26060
               end: 26069
@@ -14621,7 +14621,7 @@ items:
               start: 27141
               end: 27145
           ty:
-            inner: 156
+            inner: 34
             span:
               start: 27147
               end: 27156
@@ -14821,7 +14821,7 @@ items:
               end: 432
       entries:
         17:
-          Method: 93
+          Method: 96
     - id: 16
       file_id: 0
       namespace: 0
@@ -14858,7 +14858,7 @@ items:
               end: 503
       entries:
         23:
-          Method: 94
+          Method: 97
     - id: 18
       file_id: 0
       namespace: 0
@@ -14895,7 +14895,7 @@ items:
               end: 574
       entries:
         26:
-          Method: 95
+          Method: 98
     - id: 20
       file_id: 0
       namespace: 0
@@ -14932,7 +14932,7 @@ items:
               end: 645
       entries:
         29:
-          Method: 96
+          Method: 99
     - id: 22
       file_id: 0
       namespace: 0
@@ -14969,7 +14969,7 @@ items:
               end: 716
       entries:
         32:
-          Method: 97
+          Method: 100
     - id: 24
       file_id: 0
       namespace: 0
@@ -15002,7 +15002,7 @@ items:
               end: 776
       entries:
         35:
-          Method: 98
+          Method: 101
     - id: 26
       file_id: 0
       namespace: 0
@@ -15039,7 +15039,7 @@ items:
               end: 856
       entries:
         38:
-          Method: 99
+          Method: 102
     - id: 28
       file_id: 0
       namespace: 0
@@ -15076,7 +15076,7 @@ items:
               end: 933
       entries:
         41:
-          Method: 100
+          Method: 103
     - id: 30
       file_id: 0
       namespace: 0
@@ -15113,7 +15113,7 @@ items:
               end: 1013
       entries:
         44:
-          Method: 101
+          Method: 104
     - id: 32
       file_id: 0
       namespace: 0
@@ -15150,7 +15150,7 @@ items:
               end: 1084
       entries:
         47:
-          Method: 102
+          Method: 105
     - id: 34
       file_id: 0
       namespace: 0
@@ -15187,7 +15187,7 @@ items:
               end: 1155
       entries:
         50:
-          Method: 103
+          Method: 106
     - id: 36
       file_id: 0
       namespace: 0
@@ -15220,7 +15220,7 @@ items:
               end: 1224
       entries:
         53:
-          Method: 104
+          Method: 107
     - id: 399
       file_id: 0
       namespace: 0
@@ -15351,11 +15351,11 @@ items:
         200:
           AssocConstant: 3
         201:
-          Method: 105
+          Method: 93
         202:
-          Method: 106
+          Method: 94
         203:
-          Method: 107
+          Method: 95
     - id: 443
       file_id: 0
       namespace: 0
@@ -17007,7 +17007,7 @@ items:
           start: 25092
           end: 25100
       ty:
-        inner: 49
+        inner: 23
         span:
           start: 25102
           end: 25111
@@ -17027,7 +17027,7 @@ items:
           start: 25313
           end: 25322
       ty:
-        inner: 50
+        inner: 24
         span:
           start: 25324
           end: 25334
@@ -17035,7 +17035,7 @@ items:
         kind:
           Int:
             value: 65536
-        ty: 50
+        ty: 24
         span:
           start: 25337
           end: 25342
@@ -28092,7 +28092,7 @@ items:
                   span:
                     start: 25471
                     end: 25475
-                ty: 48
+                ty: 22
                 mut_span: ~
                 accesses:
                   - span:
@@ -28104,15 +28104,15 @@ items:
                   span:
                     start: 25477
                     end: 25482
-                ty: 50
+                ty: 24
                 mut_span: ~
                 accesses:
                   - span:
                       start: 25546
                       end: 25551
                     kind: Read
-            inferred_type: 53
-            expected_type: 53
+            inferred_type: 27
+            expected_type: 27
       block:
         kind:
           Block:
@@ -28123,13 +28123,13 @@ items:
                 GenericCall:
                   id: 418
                   type_args:
-                    - 48
+                    - 22
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 48
+                      ty: 22
                       span:
                         start: 25540
                         end: 25544
@@ -28137,15 +28137,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 50
+                      ty: 24
                       span:
                         start: 25546
                         end: 25551
-              ty: 53
+              ty: 27
               span:
                 start: 25528
                 end: 25552
-        ty: 53
+        ty: 27
         span:
           start: 25518
           end: 25558
@@ -28164,15 +28164,15 @@ items:
                   span:
                     start: 25651
                     end: 25655
-                ty: 48
+                ty: 22
                 mut_span: ~
                 accesses:
                   - span:
                       start: 25693
                       end: 25697
                     kind: Read
-            inferred_type: 50
-            expected_type: 50
+            inferred_type: 24
+            expected_type: 24
       block:
         kind:
           Block:
@@ -28183,21 +28183,21 @@ items:
                 GenericCall:
                   id: 419
                   type_args:
-                    - 48
+                    - 22
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 48
+                      ty: 22
                       span:
                         start: 25693
                         end: 25697
-              ty: 50
+              ty: 24
               span:
                 start: 25681
                 end: 25698
-        ty: 50
+        ty: 24
         span:
           start: 25671
           end: 25704
@@ -28216,15 +28216,15 @@ items:
                   span:
                     start: 25797
                     end: 25801
-                ty: 48
+                ty: 22
                 mut_span: ~
                 accesses:
                   - span:
                       start: 25827
                       end: 25831
                     kind: Read
-            inferred_type: 50
-            expected_type: 50
+            inferred_type: 24
+            expected_type: 24
       block:
         kind:
           Block:
@@ -28235,30 +28235,30 @@ items:
                 GenericMethodCall:
                   id: 17
                   type_args:
-                    - 50
+                    - 24
                   arguments:
                     - kind:
                         GenericMethodCall:
                           id: 428
                           type_args:
-                            - 48
+                            - 22
                           arguments:
                             - kind:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 48
+                              ty: 22
                               span:
                                 start: 25827
                                 end: 25831
-                      ty: 50
+                      ty: 24
                       span:
                         start: 25827
                         end: 25844
                     - kind:
                         NamespaceAccess:
                           namespace:
-                            inner: 48
+                            inner: 22
                             span:
                               start: 25847
                               end: 25851
@@ -28266,19 +28266,19 @@ items:
                             kind:
                               Const:
                                 id: 426
-                            ty: 50
+                            ty: 24
                             span:
                               start: 25853
                               end: 25862
-                      ty: 50
+                      ty: 24
                       span:
                         start: 25847
                         end: 25862
-              ty: 50
+              ty: 24
               span:
                 start: 25827
                 end: 25862
-        ty: 50
+        ty: 24
         span:
           start: 25817
           end: 25868
@@ -28292,8 +28292,8 @@ items:
               start: 26147
               end: 26217
             locals: []
-            inferred_type: 137
-            expected_type: 137
+            inferred_type: 32
+            expected_type: 32
       block:
         kind:
           Block:
@@ -28309,9 +28309,9 @@ items:
                           id: 431
                           type_args:
                             - 267
-                            - 136
+                            - 31
                           arguments: []
-                      ty: 139
+                      ty: 147
                       span:
                         start: 26171
                         end: 26185
@@ -28320,17 +28320,17 @@ items:
                           id: 432
                           type_args:
                             - 267
-                            - 136
+                            - 31
                           arguments: []
-                      ty: 139
+                      ty: 147
                       span:
                         start: 26194
                         end: 26209
-              ty: 137
+              ty: 32
               span:
                 start: 26157
                 end: 26211
-        ty: 137
+        ty: 32
         span:
           start: 26147
           end: 26217
@@ -28349,15 +28349,15 @@ items:
                   span:
                     start: 26253
                     end: 26258
-                ty: 139
+                ty: 147
                 mut_span: ~
                 accesses:
                   - span:
                       start: 26344
                       end: 26349
                     kind: Read
-            inferred_type: 137
-            expected_type: 137
+            inferred_type: 32
+            expected_type: 32
       block:
         kind:
           Block:
@@ -28372,16 +28372,16 @@ items:
                         GenericMethodCall:
                           id: 17
                           type_args:
-                            - 139
+                            - 147
                           arguments:
                             - kind:
                                 GenericCall:
                                   id: 431
                                   type_args:
                                     - 270
-                                    - 136
+                                    - 31
                                   arguments: []
-                              ty: 139
+                              ty: 147
                               span:
                                 start: 26327
                                 end: 26341
@@ -28389,11 +28389,11 @@ items:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 139
+                              ty: 147
                               span:
                                 start: 26344
                                 end: 26349
-                      ty: 139
+                      ty: 147
                       span:
                         start: 26327
                         end: 26349
@@ -28402,17 +28402,17 @@ items:
                           id: 432
                           type_args:
                             - 270
-                            - 136
+                            - 31
                           arguments: []
-                      ty: 139
+                      ty: 147
                       span:
                         start: 26304
                         end: 26319
-              ty: 137
+              ty: 32
               span:
                 start: 26289
                 end: 26351
-        ty: 137
+        ty: 32
         span:
           start: 26279
           end: 26357
@@ -28431,15 +28431,15 @@ items:
                   span:
                     start: 26389
                     end: 26393
-                ty: 137
+                ty: 32
                 mut_span: ~
                 accesses:
                   - span:
                       start: 26418
                       end: 26422
                     kind: Read
-            inferred_type: 139
-            expected_type: 139
+            inferred_type: 147
+            expected_type: 147
       block:
         kind:
           Block:
@@ -28453,7 +28453,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 137
+                    ty: 32
                     span:
                       start: 26418
                       end: 26422
@@ -28462,11 +28462,11 @@ items:
                     span:
                       start: 26423
                       end: 26427
-              ty: 139
+              ty: 147
               span:
                 start: 26418
                 end: 26427
-        ty: 139
+        ty: 147
         span:
           start: 26408
           end: 26433
@@ -28485,15 +28485,15 @@ items:
                   span:
                     start: 26466
                     end: 26470
-                ty: 137
+                ty: 32
                 mut_span: ~
                 accesses:
                   - span:
                       start: 26495
                       end: 26499
                     kind: Read
-            inferred_type: 139
-            expected_type: 139
+            inferred_type: 147
+            expected_type: 147
       block:
         kind:
           Block:
@@ -28507,7 +28507,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 137
+                    ty: 32
                     span:
                       start: 26495
                       end: 26499
@@ -28516,11 +28516,11 @@ items:
                     span:
                       start: 26500
                       end: 26505
-              ty: 139
+              ty: 147
               span:
                 start: 26495
                 end: 26505
-        ty: 139
+        ty: 147
         span:
           start: 26485
           end: 26511
@@ -28539,7 +28539,7 @@ items:
                   span:
                     start: 26686
                     end: 26690
-                ty: 144
+                ty: 152
                 mut_span: ~
                 accesses:
                   - span:
@@ -28551,7 +28551,7 @@ items:
                   span:
                     start: 26710
                     end: 26715
-                ty: 145
+                ty: 153
                 mut_span: ~
                 accesses:
                   - span:
@@ -28563,7 +28563,7 @@ items:
                   span:
                     start: 26753
                     end: 26756
-                ty: 146
+                ty: 154
                 mut_span: ~
                 accesses:
                   - span:
@@ -28574,8 +28574,8 @@ items:
                       start: 26841
                       end: 26844
                     kind: Read
-            inferred_type: 146
-            expected_type: 146
+            inferred_type: 154
+            expected_type: 154
       block:
         kind:
           Block:
@@ -28595,13 +28595,13 @@ items:
                         GenericMethodCall:
                           id: 440
                           type_args:
-                            - 142
+                            - 150
                           arguments:
                             - kind:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 144
+                              ty: 152
                               span:
                                 start: 26759
                                 end: 26763
@@ -28609,14 +28609,14 @@ items:
                                 GenericCall:
                                   id: 434
                                   type_args:
-                                    - 143
-                                    - 145
+                                    - 151
+                                    - 153
                                   arguments: []
-                              ty: 152
+                              ty: 160
                               span:
                                 start: 26773
                                 end: 26790
-                      ty: 146
+                      ty: 154
                       span:
                         start: 26759
                         end: 26791
@@ -28634,12 +28634,12 @@ items:
                               Local:
                                 scope_index: 0
                                 local_index: 2
-                            ty: 146
+                            ty: 154
                             span:
                               start: 26818
                               end: 26821
-                      ty: 145
-                      memory: 143
+                      ty: 153
+                      memory: 151
                       mutable: true
                       span:
                         start: 26818
@@ -28649,7 +28649,7 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 145
+                      ty: 153
                       span:
                         start: 26826
                         end: 26831
@@ -28662,11 +28662,11 @@ items:
                 Local:
                   scope_index: 0
                   local_index: 2
-              ty: 146
+              ty: 154
               span:
                 start: 26841
                 end: 26844
-        ty: 146
+        ty: 154
         span:
           start: 26737
           end: 26850
@@ -28685,7 +28685,7 @@ items:
                   span:
                     start: 26898
                     end: 26902
-                ty: 144
+                ty: 152
                 mut_span: ~
                 accesses:
                   - span:
@@ -28697,7 +28697,7 @@ items:
                   span:
                     start: 26922
                     end: 26925
-                ty: 148
+                ty: 156
                 mut_span: ~
                 accesses:
                   - span:
@@ -28708,8 +28708,8 @@ items:
                       start: 27072
                       end: 27075
                     kind: Read
-            inferred_type: 150
-            expected_type: 150
+            inferred_type: 158
+            expected_type: 158
       block:
         kind:
           Block:
@@ -28720,20 +28720,20 @@ items:
                 GenericCall:
                   id: 39
                   type_args:
-                    - 143
-                    - 149
+                    - 151
+                    - 157
                   arguments:
                     - kind:
                         GenericMethodCall:
                           id: 440
                           type_args:
-                            - 142
+                            - 150
                           arguments:
                             - kind:
                                 Local:
                                   scope_index: 0
                                   local_index: 0
-                              ty: 144
+                              ty: 152
                               span:
                                 start: 27003
                                 end: 27007
@@ -28741,18 +28741,18 @@ items:
                                 GenericCall:
                                   id: 435
                                   type_args:
-                                    - 143
-                                    - 149
+                                    - 151
+                                    - 157
                                   arguments:
                                     - kind:
                                         Local:
                                           scope_index: 0
                                           local_index: 1
-                                      ty: 148
+                                      ty: 156
                                       span:
                                         start: 27036
                                         end: 27039
-                              ty: 152
+                              ty: 160
                               span:
                                 start: 27017
                                 end: 27040
@@ -28764,15 +28764,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 148
+                      ty: 156
                       span:
                         start: 27072
                         end: 27075
-              ty: 150
+              ty: 158
               span:
                 start: 26973
                 end: 27086
-        ty: 150
+        ty: 158
         span:
           start: 26963
           end: 27097
@@ -28791,15 +28791,15 @@ items:
                   span:
                     start: 27229
                     end: 27233
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27258
                       end: 27262
                     kind: Read
-            inferred_type: 160
-            expected_type: 160
+            inferred_type: 163
+            expected_type: 163
       block:
         kind:
           Block:
@@ -28813,7 +28813,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 159
+                    ty: 37
                     span:
                       start: 27258
                       end: 27262
@@ -28822,11 +28822,11 @@ items:
                     span:
                       start: 27263
                       end: 27267
-              ty: 160
+              ty: 163
               span:
                 start: 27258
                 end: 27267
-        ty: 160
+        ty: 163
         span:
           start: 27248
           end: 27273
@@ -28840,8 +28840,8 @@ items:
               start: 27301
               end: 27334
             locals: []
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -28855,15 +28855,15 @@ items:
                     - kind:
                         Int:
                           value: 0
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27325
                         end: 27326
-              ty: 159
+              ty: 37
               span:
                 start: 27311
                 end: 27328
-        ty: 159
+        ty: 37
         span:
           start: 27301
           end: 27334
@@ -28882,15 +28882,15 @@ items:
                   span:
                     start: 27356
                     end: 27359
-                ty: 163
+                ty: 166
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27402
                       end: 27405
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -28905,15 +28905,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27402
                         end: 27405
-              ty: 159
+              ty: 37
               span:
                 start: 27388
                 end: 27412
-        ty: 159
+        ty: 37
         span:
           start: 27378
           end: 27418
@@ -28932,15 +28932,15 @@ items:
                   span:
                     start: 27440
                     end: 27443
-                ty: 165
+                ty: 168
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27486
                       end: 27489
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -28955,15 +28955,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27486
                         end: 27489
-              ty: 159
+              ty: 37
               span:
                 start: 27472
                 end: 27496
-        ty: 159
+        ty: 37
         span:
           start: 27462
           end: 27502
@@ -28982,15 +28982,15 @@ items:
                   span:
                     start: 27525
                     end: 27529
-                ty: 160
+                ty: 163
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27568
                       end: 27572
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -29005,15 +29005,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27568
                         end: 27572
-              ty: 159
+              ty: 37
               span:
                 start: 27560
                 end: 27574
-        ty: 159
+        ty: 37
         span:
           start: 27550
           end: 27580
@@ -29032,15 +29032,15 @@ items:
                   span:
                     start: 27600
                     end: 27604
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27627
                       end: 27631
                     kind: Read
-            inferred_type: 163
-            expected_type: 163
+            inferred_type: 166
+            expected_type: 166
       block:
         kind:
           Block:
@@ -29054,7 +29054,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 159
+                    ty: 37
                     span:
                       start: 27627
                       end: 27631
@@ -29063,11 +29063,11 @@ items:
                     span:
                       start: 27632
                       end: 27636
-              ty: 163
+              ty: 166
               span:
                 start: 27627
                 end: 27636
-        ty: 163
+        ty: 166
         span:
           start: 27617
           end: 27647
@@ -29086,15 +29086,15 @@ items:
                   span:
                     start: 27667
                     end: 27671
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27694
                       end: 27698
                     kind: Read
-            inferred_type: 165
-            expected_type: 165
+            inferred_type: 168
+            expected_type: 168
       block:
         kind:
           Block:
@@ -29108,7 +29108,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 159
+                    ty: 37
                     span:
                       start: 27694
                       end: 27698
@@ -29117,11 +29117,11 @@ items:
                     span:
                       start: 27699
                       end: 27703
-              ty: 165
+              ty: 168
               span:
                 start: 27694
                 end: 27703
-        ty: 165
+        ty: 168
         span:
           start: 27684
           end: 27714
@@ -29140,7 +29140,7 @@ items:
                   span:
                     start: 27735
                     end: 27739
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
@@ -29170,7 +29170,7 @@ items:
                             Local:
                               scope_index: 0
                               local_index: 0
-                          ty: 159
+                          ty: 37
                           span:
                             start: 27759
                             end: 27763
@@ -29179,7 +29179,7 @@ items:
                           span:
                             start: 27764
                             end: 27768
-                    ty: 160
+                    ty: 163
                     span:
                       start: 27759
                       end: 27768
@@ -29187,7 +29187,7 @@ items:
                     kind:
                       Int:
                         value: 0
-                    ty: 160
+                    ty: 163
                     span:
                       start: 27772
                       end: 27773
@@ -29214,7 +29214,7 @@ items:
                   span:
                     start: 27796
                     end: 27800
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
@@ -29226,15 +29226,15 @@ items:
                   span:
                     start: 27802
                     end: 27807
-                ty: 160
+                ty: 163
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27864
                       end: 27869
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -29249,7 +29249,7 @@ items:
                         GenericMethodCall:
                           id: 13
                           type_args:
-                            - 160
+                            - 163
                           arguments:
                             - kind:
                                 FieldAccess:
@@ -29258,7 +29258,7 @@ items:
                                       Local:
                                         scope_index: 0
                                         local_index: 0
-                                    ty: 159
+                                    ty: 37
                                     span:
                                       start: 27852
                                       end: 27856
@@ -29267,7 +29267,7 @@ items:
                                     span:
                                       start: 27857
                                       end: 27861
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 27852
                                 end: 27861
@@ -29275,13 +29275,13 @@ items:
                                 GenericMethodCall:
                                   id: 17
                                   type_args:
-                                    - 160
+                                    - 163
                                   arguments:
                                     - kind:
                                         Local:
                                           scope_index: 0
                                           local_index: 1
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 27864
                                         end: 27869
@@ -29289,26 +29289,26 @@ items:
                                         GenericCall:
                                           id: 431
                                           type_args:
-                                            - 158
-                                            - 157
+                                            - 36
+                                            - 35
                                           arguments: []
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 27872
                                         end: 27891
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 27864
                                 end: 27891
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27852
                         end: 27891
-              ty: 159
+              ty: 37
               span:
                 start: 27838
                 end: 27893
-        ty: 159
+        ty: 37
         span:
           start: 27828
           end: 27899
@@ -29327,7 +29327,7 @@ items:
                   span:
                     start: 27916
                     end: 27920
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
@@ -29339,15 +29339,15 @@ items:
                   span:
                     start: 27922
                     end: 27927
-                ty: 160
+                ty: 163
                 mut_span: ~
                 accesses:
                   - span:
                       start: 27984
                       end: 27989
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -29362,7 +29362,7 @@ items:
                         GenericMethodCall:
                           id: 15
                           type_args:
-                            - 160
+                            - 163
                           arguments:
                             - kind:
                                 FieldAccess:
@@ -29371,7 +29371,7 @@ items:
                                       Local:
                                         scope_index: 0
                                         local_index: 0
-                                    ty: 159
+                                    ty: 37
                                     span:
                                       start: 27972
                                       end: 27976
@@ -29380,7 +29380,7 @@ items:
                                     span:
                                       start: 27977
                                       end: 27981
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 27972
                                 end: 27981
@@ -29388,13 +29388,13 @@ items:
                                 GenericMethodCall:
                                   id: 17
                                   type_args:
-                                    - 160
+                                    - 163
                                   arguments:
                                     - kind:
                                         Local:
                                           scope_index: 0
                                           local_index: 1
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 27984
                                         end: 27989
@@ -29402,26 +29402,26 @@ items:
                                         GenericCall:
                                           id: 431
                                           type_args:
-                                            - 158
-                                            - 157
+                                            - 36
+                                            - 35
                                           arguments: []
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 27992
                                         end: 28011
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 27984
                                 end: 28011
-                      ty: 160
+                      ty: 163
                       span:
                         start: 27972
                         end: 28011
-              ty: 159
+              ty: 37
               span:
                 start: 27958
                 end: 28013
-        ty: 159
+        ty: 37
         span:
           start: 27948
           end: 28019
@@ -29440,7 +29440,7 @@ items:
                   span:
                     start: 28143
                     end: 28147
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
@@ -29452,7 +29452,7 @@ items:
                   span:
                     start: 28149
                     end: 28154
-                ty: 160
+                ty: 163
                 mut_span: ~
                 accesses:
                   - span:
@@ -29463,8 +29463,8 @@ items:
                       start: 28227
                       end: 28232
                     kind: Read
-            inferred_type: 159
-            expected_type: 159
+            inferred_type: 37
+            expected_type: 37
       block:
         kind:
           Block:
@@ -29479,19 +29479,19 @@ items:
                         GenericMethodCall:
                           id: 25
                           type_args:
-                            - 160
+                            - 163
                           arguments:
                             - kind:
                                 GenericMethodCall:
                                   id: 15
                                   type_args:
-                                    - 160
+                                    - 163
                                   arguments:
                                     - kind:
                                         GenericMethodCall:
                                           id: 13
                                           type_args:
-                                            - 160
+                                            - 163
                                           arguments:
                                             - kind:
                                                 FieldAccess:
@@ -29500,7 +29500,7 @@ items:
                                                       Local:
                                                         scope_index: 0
                                                         local_index: 0
-                                                    ty: 159
+                                                    ty: 37
                                                     span:
                                                       start: 28200
                                                       end: 28204
@@ -29509,7 +29509,7 @@ items:
                                                     span:
                                                       start: 28205
                                                       end: 28209
-                                              ty: 160
+                                              ty: 163
                                               span:
                                                 start: 28200
                                                 end: 28209
@@ -29517,22 +29517,22 @@ items:
                                                 Local:
                                                   scope_index: 0
                                                   local_index: 1
-                                              ty: 160
+                                              ty: 163
                                               span:
                                                 start: 28212
                                                 end: 28217
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 28200
                                         end: 28217
                                     - kind:
                                         Int:
                                           value: 1
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 28220
                                         end: 28221
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 28200
                                 end: 28221
@@ -29540,46 +29540,46 @@ items:
                                 GenericMethodCall:
                                   id: 35
                                   type_args:
-                                    - 160
+                                    - 163
                                   arguments:
                                     - kind:
                                         GenericMethodCall:
                                           id: 15
                                           type_args:
-                                            - 160
+                                            - 163
                                           arguments:
                                             - kind:
                                                 Local:
                                                   scope_index: 0
                                                   local_index: 1
-                                              ty: 160
+                                              ty: 163
                                               span:
                                                 start: 28227
                                                 end: 28232
                                             - kind:
                                                 Int:
                                                   value: 1
-                                              ty: 160
+                                              ty: 163
                                               span:
                                                 start: 28235
                                                 end: 28236
-                                      ty: 160
+                                      ty: 163
                                       span:
                                         start: 28227
                                         end: 28236
-                              ty: 160
+                              ty: 163
                               span:
                                 start: 28225
                                 end: 28237
-                      ty: 160
+                      ty: 163
                       span:
                         start: 28199
                         end: 28237
-              ty: 159
+              ty: 37
               span:
                 start: 28185
                 end: 28239
-        ty: 159
+        ty: 37
         span:
           start: 28175
           end: 28245
@@ -29598,15 +29598,15 @@ items:
                   span:
                     start: 28266
                     end: 28270
-                ty: 159
+                ty: 37
                 mut_span: ~
                 accesses:
                   - span:
                       start: 28316
                       end: 28320
                     kind: Read
-            inferred_type: 173
-            expected_type: 173
+            inferred_type: 176
+            expected_type: 176
       block:
         kind:
           Block:
@@ -29624,7 +29624,7 @@ items:
                               Local:
                                 scope_index: 0
                                 local_index: 0
-                            ty: 159
+                            ty: 37
                             span:
                               start: 28316
                               end: 28320
@@ -29633,15 +29633,15 @@ items:
                             span:
                               start: 28321
                               end: 28325
-                      ty: 160
+                      ty: 163
                       span:
                         start: 28316
                         end: 28325
-              ty: 173
+              ty: 176
               span:
                 start: 28300
                 end: 28327
-        ty: 173
+        ty: 176
         span:
           start: 28290
           end: 28338
@@ -29660,7 +29660,7 @@ items:
                   span:
                     start: 28404
                     end: 28408
-                ty: 177
+                ty: 40
                 mut_span: ~
                 accesses:
                   - span:
@@ -29679,14 +29679,14 @@ items:
                 GenericCall:
                   id: 37
                   type_args:
-                    - 175
-                    - 176
+                    - 38
+                    - 39
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 177
+                      ty: 40
                       span:
                         start: 28443
                         end: 28447
@@ -29713,7 +29713,7 @@ items:
                   span:
                     start: 28485
                     end: 28489
-                ty: 177
+                ty: 40
                 mut_span: ~
                 accesses:
                   - span:
@@ -29732,14 +29732,14 @@ items:
                 GenericCall:
                   id: 38
                   type_args:
-                    - 175
-                    - 176
+                    - 38
+                    - 39
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 177
+                      ty: 40
                       span:
                         start: 28522
                         end: 28526
@@ -32270,16 +32270,16 @@ items:
             end: 18056
         - file_id: 0
           span:
+            start: 23354
+            end: 23356
+        - file_id: 0
+          span:
             start: 22927
             end: 22929
         - file_id: 0
           span:
             start: 23169
             end: 23171
-        - file_id: 0
-          span:
-            start: 23354
-            end: 23356
         - file_id: 0
           span:
             start: 16765
@@ -32346,10 +32346,6 @@ items:
       accesses:
         - file_id: 0
           span:
-            start: 25109
-            end: 25111
-        - file_id: 0
-          span:
             start: 18163
             end: 18165
         - file_id: 0
@@ -32394,12 +32390,16 @@ items:
             end: 19452
         - file_id: 0
           span:
-            start: 22923
-            end: 22925
-        - file_id: 0
-          span:
             start: 23146
             end: 23148
+        - file_id: 0
+          span:
+            start: 25109
+            end: 25111
+        - file_id: 0
+          span:
+            start: 22923
+            end: 22925
         - file_id: 0
           span:
             start: 23379
@@ -32546,16 +32546,16 @@ items:
             end: 20974
         - file_id: 0
           span:
+            start: 23405
+            end: 23408
+        - file_id: 0
+          span:
             start: 22936
             end: 22939
         - file_id: 0
           span:
             start: 23221
             end: 23224
-        - file_id: 0
-          span:
-            start: 23405
-            end: 23408
         - file_id: 0
           span:
             start: 19661
@@ -32666,12 +32666,12 @@ items:
             end: 22392
         - file_id: 0
           span:
-            start: 22931
-            end: 22934
-        - file_id: 0
-          span:
             start: 23197
             end: 23200
+        - file_id: 0
+          span:
+            start: 22931
+            end: 22934
         - file_id: 0
           span:
             start: 23431
@@ -32736,6 +32736,62 @@ items:
       type_params: []
       body: 11
       accesses:
+        - file_id: 0
+          span:
+            start: 9370
+            end: 9373
+        - file_id: 0
+          span:
+            start: 9559
+            end: 9562
+        - file_id: 0
+          span:
+            start: 9666
+            end: 9669
+        - file_id: 0
+          span:
+            start: 9773
+            end: 9776
+        - file_id: 0
+          span:
+            start: 9880
+            end: 9883
+        - file_id: 0
+          span:
+            start: 9987
+            end: 9990
+        - file_id: 0
+          span:
+            start: 10094
+            end: 10097
+        - file_id: 0
+          span:
+            start: 10188
+            end: 10191
+        - file_id: 0
+          span:
+            start: 10303
+            end: 10306
+        - file_id: 0
+          span:
+            start: 10417
+            end: 10420
+        - file_id: 0
+          span:
+            start: 10530
+            end: 10533
+        - file_id: 0
+          span:
+            start: 10637
+            end: 10640
+        - file_id: 0
+          span:
+            start: 10747
+            end: 10750
+        - file_id: 0
+          span:
+            start: 23458
+            end: 23461
         - file_id: 0
           span:
             start: 1526
@@ -32914,68 +32970,12 @@ items:
             end: 9079
         - file_id: 0
           span:
-            start: 9370
-            end: 9373
-        - file_id: 0
-          span:
-            start: 9559
-            end: 9562
-        - file_id: 0
-          span:
-            start: 9666
-            end: 9669
-        - file_id: 0
-          span:
-            start: 9773
-            end: 9776
-        - file_id: 0
-          span:
-            start: 9880
-            end: 9883
-        - file_id: 0
-          span:
-            start: 9987
-            end: 9990
-        - file_id: 0
-          span:
-            start: 10094
-            end: 10097
-        - file_id: 0
-          span:
-            start: 10188
-            end: 10191
-        - file_id: 0
-          span:
-            start: 10303
-            end: 10306
-        - file_id: 0
-          span:
-            start: 10417
-            end: 10420
-        - file_id: 0
-          span:
-            start: 10530
-            end: 10533
-        - file_id: 0
-          span:
-            start: 10637
-            end: 10640
-        - file_id: 0
-          span:
-            start: 10747
-            end: 10750
-        - file_id: 0
-          span:
             start: 22946
             end: 22949
         - file_id: 0
           span:
             start: 23274
             end: 23277
-        - file_id: 0
-          span:
-            start: 23458
-            end: 23461
         - file_id: 0
           span:
             start: 7217
@@ -33378,6 +33378,62 @@ items:
       accesses:
         - file_id: 0
           span:
+            start: 10836
+            end: 10839
+        - file_id: 0
+          span:
+            start: 11025
+            end: 11028
+        - file_id: 0
+          span:
+            start: 11153
+            end: 11156
+        - file_id: 0
+          span:
+            start: 11281
+            end: 11284
+        - file_id: 0
+          span:
+            start: 11409
+            end: 11412
+        - file_id: 0
+          span:
+            start: 11516
+            end: 11519
+        - file_id: 0
+          span:
+            start: 11626
+            end: 11629
+        - file_id: 0
+          span:
+            start: 11762
+            end: 11765
+        - file_id: 0
+          span:
+            start: 11897
+            end: 11900
+        - file_id: 0
+          span:
+            start: 12031
+            end: 12034
+        - file_id: 0
+          span:
+            start: 12159
+            end: 12162
+        - file_id: 0
+          span:
+            start: 12269
+            end: 12272
+        - file_id: 0
+          span:
+            start: 23250
+            end: 23253
+        - file_id: 0
+          span:
+            start: 24669
+            end: 24672
+        - file_id: 0
+          span:
             start: 24880
             end: 24883
         - file_id: 0
@@ -33454,68 +33510,12 @@ items:
             end: 9161
         - file_id: 0
           span:
-            start: 10836
-            end: 10839
-        - file_id: 0
-          span:
-            start: 11025
-            end: 11028
-        - file_id: 0
-          span:
-            start: 11153
-            end: 11156
-        - file_id: 0
-          span:
-            start: 11281
-            end: 11284
-        - file_id: 0
-          span:
-            start: 11409
-            end: 11412
-        - file_id: 0
-          span:
-            start: 11516
-            end: 11519
-        - file_id: 0
-          span:
-            start: 11626
-            end: 11629
-        - file_id: 0
-          span:
-            start: 11762
-            end: 11765
-        - file_id: 0
-          span:
-            start: 11897
-            end: 11900
-        - file_id: 0
-          span:
-            start: 12031
-            end: 12034
-        - file_id: 0
-          span:
-            start: 12159
-            end: 12162
-        - file_id: 0
-          span:
-            start: 12269
-            end: 12272
-        - file_id: 0
-          span:
             start: 22941
             end: 22944
         - file_id: 0
           span:
-            start: 23250
-            end: 23253
-        - file_id: 0
-          span:
             start: 23484
             end: 23487
-        - file_id: 0
-          span:
-            start: 24669
-            end: 24672
         - file_id: 1
           span:
             start: 26
@@ -33632,6 +33632,62 @@ items:
       type_params: []
       body: 13
       accesses:
+        - file_id: 0
+          span:
+            start: 12372
+            end: 12375
+        - file_id: 0
+          span:
+            start: 12561
+            end: 12564
+        - file_id: 0
+          span:
+            start: 12668
+            end: 12671
+        - file_id: 0
+          span:
+            start: 12775
+            end: 12778
+        - file_id: 0
+          span:
+            start: 12882
+            end: 12885
+        - file_id: 0
+          span:
+            start: 12989
+            end: 12992
+        - file_id: 0
+          span:
+            start: 13096
+            end: 13099
+        - file_id: 0
+          span:
+            start: 13190
+            end: 13193
+        - file_id: 0
+          span:
+            start: 13305
+            end: 13308
+        - file_id: 0
+          span:
+            start: 13419
+            end: 13422
+        - file_id: 0
+          span:
+            start: 13532
+            end: 13535
+        - file_id: 0
+          span:
+            start: 13639
+            end: 13642
+        - file_id: 0
+          span:
+            start: 13749
+            end: 13752
+        - file_id: 0
+          span:
+            start: 23511
+            end: 23514
         - file_id: 0
           span:
             start: 1534
@@ -33810,68 +33866,12 @@ items:
             end: 9243
         - file_id: 0
           span:
-            start: 12372
-            end: 12375
-        - file_id: 0
-          span:
-            start: 12561
-            end: 12564
-        - file_id: 0
-          span:
-            start: 12668
-            end: 12671
-        - file_id: 0
-          span:
-            start: 12775
-            end: 12778
-        - file_id: 0
-          span:
-            start: 12882
-            end: 12885
-        - file_id: 0
-          span:
-            start: 12989
-            end: 12992
-        - file_id: 0
-          span:
-            start: 13096
-            end: 13099
-        - file_id: 0
-          span:
-            start: 13190
-            end: 13193
-        - file_id: 0
-          span:
-            start: 13305
-            end: 13308
-        - file_id: 0
-          span:
-            start: 13419
-            end: 13422
-        - file_id: 0
-          span:
-            start: 13532
-            end: 13535
-        - file_id: 0
-          span:
-            start: 13639
-            end: 13642
-        - file_id: 0
-          span:
-            start: 13749
-            end: 13752
-        - file_id: 0
-          span:
             start: 22956
             end: 22959
         - file_id: 0
           span:
             start: 23327
             end: 23330
-        - file_id: 0
-          span:
-            start: 23511
-            end: 23514
         - file_id: 0
           span:
             start: 8940
@@ -33954,6 +33954,62 @@ items:
       accesses:
         - file_id: 0
           span:
+            start: 13838
+            end: 13841
+        - file_id: 0
+          span:
+            start: 14027
+            end: 14030
+        - file_id: 0
+          span:
+            start: 14155
+            end: 14158
+        - file_id: 0
+          span:
+            start: 14283
+            end: 14286
+        - file_id: 0
+          span:
+            start: 14411
+            end: 14414
+        - file_id: 0
+          span:
+            start: 14518
+            end: 14521
+        - file_id: 0
+          span:
+            start: 14628
+            end: 14631
+        - file_id: 0
+          span:
+            start: 14764
+            end: 14767
+        - file_id: 0
+          span:
+            start: 14899
+            end: 14902
+        - file_id: 0
+          span:
+            start: 15033
+            end: 15036
+        - file_id: 0
+          span:
+            start: 15161
+            end: 15164
+        - file_id: 0
+          span:
+            start: 15271
+            end: 15274
+        - file_id: 0
+          span:
+            start: 23303
+            end: 23306
+        - file_id: 0
+          span:
+            start: 24674
+            end: 24677
+        - file_id: 0
+          span:
             start: 1590
             end: 1593
         - file_id: 0
@@ -34026,68 +34082,12 @@ items:
             end: 9325
         - file_id: 0
           span:
-            start: 13838
-            end: 13841
-        - file_id: 0
-          span:
-            start: 14027
-            end: 14030
-        - file_id: 0
-          span:
-            start: 14155
-            end: 14158
-        - file_id: 0
-          span:
-            start: 14283
-            end: 14286
-        - file_id: 0
-          span:
-            start: 14411
-            end: 14414
-        - file_id: 0
-          span:
-            start: 14518
-            end: 14521
-        - file_id: 0
-          span:
-            start: 14628
-            end: 14631
-        - file_id: 0
-          span:
-            start: 14764
-            end: 14767
-        - file_id: 0
-          span:
-            start: 14899
-            end: 14902
-        - file_id: 0
-          span:
-            start: 15033
-            end: 15036
-        - file_id: 0
-          span:
-            start: 15161
-            end: 15164
-        - file_id: 0
-          span:
-            start: 15271
-            end: 15274
-        - file_id: 0
-          span:
             start: 22951
             end: 22954
         - file_id: 0
           span:
-            start: 23303
-            end: 23306
-        - file_id: 0
-          span:
             start: 23537
             end: 23540
-        - file_id: 0
-          span:
-            start: 24674
-            end: 24677
         - file_id: 0
           span:
             start: 8837
@@ -34140,6 +34140,34 @@ items:
       type_params: []
       body: 14
       accesses:
+        - file_id: 0
+          span:
+            start: 5962
+            end: 5965
+        - file_id: 0
+          span:
+            start: 15382
+            end: 15385
+        - file_id: 0
+          span:
+            start: 15489
+            end: 15492
+        - file_id: 0
+          span:
+            start: 15596
+            end: 15599
+        - file_id: 0
+          span:
+            start: 15703
+            end: 15706
+        - file_id: 0
+          span:
+            start: 15810
+            end: 15813
+        - file_id: 0
+          span:
+            start: 15901
+            end: 15904
         - file_id: 0
           span:
             start: 1686
@@ -34330,10 +34358,6 @@ items:
             end: 5832
         - file_id: 0
           span:
-            start: 5962
-            end: 5965
-        - file_id: 0
-          span:
             start: 5987
             end: 5990
         - file_id: 0
@@ -34380,30 +34404,6 @@ items:
           span:
             start: 13885
             end: 13888
-        - file_id: 0
-          span:
-            start: 15382
-            end: 15385
-        - file_id: 0
-          span:
-            start: 15489
-            end: 15492
-        - file_id: 0
-          span:
-            start: 15596
-            end: 15599
-        - file_id: 0
-          span:
-            start: 15703
-            end: 15706
-        - file_id: 0
-          span:
-            start: 15810
-            end: 15813
-        - file_id: 0
-          span:
-            start: 15901
-            end: 15904
     - id: 9
       file_id: 0
       namespace: 0
@@ -34420,6 +34420,34 @@ items:
       type_params: []
       body: 15
       accesses:
+        - file_id: 0
+          span:
+            start: 7649
+            end: 7652
+        - file_id: 0
+          span:
+            start: 16023
+            end: 16026
+        - file_id: 0
+          span:
+            start: 16130
+            end: 16133
+        - file_id: 0
+          span:
+            start: 16237
+            end: 16240
+        - file_id: 0
+          span:
+            start: 16344
+            end: 16347
+        - file_id: 0
+          span:
+            start: 16451
+            end: 16454
+        - file_id: 0
+          span:
+            start: 16542
+            end: 16545
         - file_id: 0
           span:
             start: 1736
@@ -34614,10 +34642,6 @@ items:
             end: 7274
         - file_id: 0
           span:
-            start: 7649
-            end: 7652
-        - file_id: 0
-          span:
             start: 7674
             end: 7677
         - file_id: 0
@@ -34660,30 +34684,6 @@ items:
           span:
             start: 13969
             end: 13972
-        - file_id: 0
-          span:
-            start: 16023
-            end: 16026
-        - file_id: 0
-          span:
-            start: 16130
-            end: 16133
-        - file_id: 0
-          span:
-            start: 16237
-            end: 16240
-        - file_id: 0
-          span:
-            start: 16344
-            end: 16347
-        - file_id: 0
-          span:
-            start: 16451
-            end: 16454
-        - file_id: 0
-          span:
-            start: 16542
-            end: 16545
     - id: 10
       file_id: 0
       namespace: 0

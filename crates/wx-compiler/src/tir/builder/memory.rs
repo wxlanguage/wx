@@ -177,6 +177,10 @@ impl<'ast> Builder<'ast, '_> {
 				span: name.span,
 			},
 			members,
+			// Synthetic: its members are built right here, in full, rather
+			// than declared in source for a later phase to resolve — so
+			// there is nothing for a lookup to have to force.
+			member_decls: HashMap::new(),
 			namespace: resolve_context.namespace,
 			span: name.span,
 			file_id: resolve_context.file_id,

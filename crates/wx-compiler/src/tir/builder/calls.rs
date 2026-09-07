@@ -1242,6 +1242,7 @@ impl<'ast> Builder<'ast, '_> {
 				// exact equality for concrete impls, so this covers exactly
 				// what the old exact-key `type_trait_impls` lookup did, plus
 				// generic impls.
+				self.ensure_trait_impl_members(target, member_symbol);
 				for (trait_index, impl_index) in self
 					.items
 					.trait_impl_dispatch
@@ -1339,6 +1340,54 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			self.diagnostics.push(diagnostic);
 			MemberLookup::Ambiguous
+		}
+	}
+
+	/// Resolves the signature of `member_symbol` in every trait impl that could
+	/// provide it for `target`, so the candidate scan that follows sees
+	/// resolved members instead of whatever parse order happened to fill in.
+	///
+	/// An impl is the one item nothing can demand by name — it is reached by
+	/// *type* — so its members are resolved only when the sweep reaches them,
+	/// which is why `fn f(v: S::X)` used to depend on `impl Tr for S` being
+	/// written above it. `member_decls`, recorded with the block's header from
+	/// syntax alone, is what makes a member askable-for here: it says which
+	/// `DefId` provides this name before anything about it is resolved.
+	fn ensure_trait_impl_members(
+		&mut self,
+		target: ImplTarget,
+		member_symbol: SymbolU32,
+	) {
+		// Yields nothing — and so allocates nothing — unless an impl declares
+		// this name and has not resolved it yet. Collected because
+		// `ensure_signature` needs `&mut self`, which the bucket borrow would
+		// otherwise outlive.
+		let unresolved: Vec<ast::DefId> = self
+			.items
+			.trait_impl_dispatch
+			.get(&target)
+			.map(|bucket| {
+				bucket
+					.iter()
+					.filter_map(|&(_, impl_index)| {
+						let block =
+							&self.items.trait_impls[usize::from(impl_index)];
+						if block.members.contains_key(&member_symbol) {
+							return None;
+						}
+						block
+							.member_decls
+							.get(&member_symbol)
+							.map(|decl| decl.id)
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		for def_id in unresolved {
+			// A cycle means this member is itself what asked, directly or
+			// otherwise — it is already resolving, so there is nothing to wait
+			// for.
+			let _ = self.ensure_signature(def_id);
 		}
 	}
 

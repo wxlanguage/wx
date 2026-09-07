@@ -13564,6 +13564,61 @@ fn test_type_param_ambiguous_bound_methods_reports_error() {
 }
 
 #[test]
+fn test_trait_impl_assoc_type_resolves_when_impl_is_declared_later() {
+	// `S::X` in a *signature* is resolved during Phase 2, where an impl is
+	// reachable only through the dispatch index its own header fills, and its
+	// members only once each member's signature has run. Both used to happen
+	// wherever parse order put them, so this exact program failed with E1021
+	// and compiled with the `impl` moved above `f`.
+	let case = TestCase::new(indoc! {"
+        trait Tr { type X; }
+        struct S { a: i32 }
+        fn f(v: S::X) -> i32 { v }
+        impl Tr for S { type X = i32; }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_trait_impl_assoc_type_resolves_from_another_module() {
+	// Same, with the impl in a module the entry file declares *after* the use
+	// site — the order the sweep reaches files in must not matter either.
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod impls;
+            struct S { a: i32 }
+            trait Tr { type X; }
+            fn f(v: S::X) -> i32 { v }
+            export { f }
+        "},
+		&[(
+			"src/impls.wx",
+			"impl crate::Tr for crate::S { type X = i32; }",
+		)],
+	);
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_typeset_bound_checked_against_resolved_members() {
+	// A typeset's symbol is registered resolved at prescan, so naming it in a
+	// bound never forced its signature: `members` could still be empty when a
+	// membership check read them, making a legal type fail E1047 purely
+	// because of where the typeset was declared. `Small` is declared after the
+	// bound that names it.
+	let case = TestCase::new(indoc! {"
+        trait Holder { type N: Small; }
+        struct S { a: i32 }
+        impl Holder for S { type N = u8; }
+        typeset Small { u8, u16 }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
 fn test_stdlib_inherent_slice_method_beats_trait_no_ambiguity() {
 	// Same inherent-always-wins rule as the struct case, but on
 	// `ImplTarget::Slice`. The inherent side is the stdlib's own

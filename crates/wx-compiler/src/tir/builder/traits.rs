@@ -670,10 +670,24 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn signature_inherent_impl_block(
 		&mut self,
 		resolve_context: ResolveContext,
-		impl_type_params: &'ast [ast::TypeParam],
-		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
+		item: &'ast ast::Item,
 		block_index: InherentImplIndex,
 	) {
+		let (impl_type_params, impl_target, items) = match item {
+			ast::Item::InherentImpl {
+				type_params,
+				target,
+				items,
+				..
+			} => (type_params.as_ref(), target.as_ref(), items),
+			_ => unreachable!(),
+		};
+
+		// What this block declares, by name, before any member resolves —
+		// see `MemberDecl`.
+		self.items.inherent_impls[usize::from(block_index)].member_decls =
+			Self::collect_member_decls(items);
+
 		self.resolve_type_param_bounds(
 			resolve_context,
 			TypeParamOwner::InherentImpl(block_index),
@@ -1203,14 +1217,14 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		item: &'ast ast::Item,
 	) {
-		let (block_id, type_params, trait_name, target) = match item {
+		let (block_id, type_params, trait_name, target, items) = match item {
 			ast::Item::TraitImpl {
 				id,
 				type_params,
 				trait_name,
 				target,
-				..
-			} => (id, type_params, trait_name, target),
+				items,
+			} => (id, type_params, trait_name, target, items),
 			_ => unreachable!(),
 		};
 
@@ -1257,6 +1271,7 @@ impl<'ast> Builder<'ast, '_> {
 			},
 			namespace: resolve_context.namespace,
 			members: HashMap::new(),
+			member_decls: Self::collect_member_decls(items),
 			span: trait_name_span,
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),
@@ -1288,6 +1303,47 @@ impl<'ast> Builder<'ast, '_> {
 		// `resolve_impl_member` — they are intentionally never
 		// written into `impl_block_list`, which is reserved for
 		// inherent impls only.
+	}
+
+	/// What an `impl` block declares, by name, read straight off the AST.
+	///
+	/// Runs with the block's own header, before any member's signature: an
+	/// impl is reached by type rather than by name, so a lookup that lands on
+	/// one cannot ask for a member that has not been resolved yet — it asks
+	/// this instead, and forces the single member it needs. Duplicates keep
+	/// the first declaration, matching `register_trait_impl_member`, which
+	/// still reports them once the members themselves resolve.
+	fn collect_member_decls(
+		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+	) -> HashMap<SymbolU32, MemberDecl> {
+		let mut decls = HashMap::with_capacity(items.len());
+		for item in items.iter() {
+			let (name, decl) = match &item.inner.inner {
+				ast::ImplItem::Function { id, signature, .. } => (
+					signature.name.inner,
+					MemberDecl {
+						kind: MemberKind::Function,
+						id: *id,
+					},
+				),
+				ast::ImplItem::Constant { id, name, .. } => (
+					name.inner,
+					MemberDecl {
+						kind: MemberKind::Const,
+						id: *id,
+					},
+				),
+				ast::ImplItem::AssocType { id, name, .. } => (
+					name.inner,
+					MemberDecl {
+						kind: MemberKind::AssocType,
+						id: *id,
+					},
+				),
+			};
+			decls.entry(name).or_insert(decl);
+		}
+		decls
 	}
 
 	/// Registers `entry` under `name`, unless the impl already has a member of

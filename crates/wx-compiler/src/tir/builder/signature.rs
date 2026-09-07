@@ -332,16 +332,12 @@ impl<'ast> Builder<'ast, '_> {
 				item,
 				block_index,
 			),
-			AstNodeRef::InherentImplBlock {
-				impl_type_params,
-				impl_target,
-				block_index,
-			} => self.signature_inherent_impl_block(
-				resolve_context,
-				impl_type_params,
-				impl_target,
-				block_index,
-			),
+			AstNodeRef::InherentImplBlock { item, block_index } => self
+				.signature_inherent_impl_block(
+					resolve_context,
+					item,
+					block_index,
+				),
 			AstNodeRef::Trait { trait_index, item } => {
 				self.signature_trait(resolve_context, trait_index, item)
 			}

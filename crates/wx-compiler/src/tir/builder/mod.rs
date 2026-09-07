@@ -299,8 +299,7 @@ enum AstNodeRef<'ast> {
 		item: &'ast ast::ImplItem,
 	},
 	InherentImplBlock {
-		impl_type_params: &'ast [ast::TypeParam],
-		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
+		item: &'ast ast::Item,
 		block_index: InherentImplIndex,
 	},
 	InherentImplFunction {
@@ -659,6 +658,8 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	// Phase 2: demand-resolve signatures in parse order (vec is already ordered).
 	// Nothing is in progress at this level, so the status is always `Resolved`
 	// — a cycle is only ever entered, and reported, further down.
+	// Impls are resolved ahead of the sweep; see `resolve_impl_dispatch`.
+	builder.resolve_impl_dispatch();
 	for i in 0..builder.ast_nodes.len() {
 		let _ = builder.ensure_signature(builder.ast_nodes[i].def_id);
 	}
@@ -679,6 +680,40 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 }
 
 impl<'ast> Builder<'ast, '_> {
+	/// Resolves every `impl` block's own header ahead of the rest of Phase 2,
+	/// registering it for dispatch. Members are left to the sweep.
+	///
+	/// Every other item is found by *name*, so a lookup that reaches one too
+	/// early can force it and carry on. An impl has no name: it is found by
+	/// *type*, through `trait_impl_dispatch`/`inherent_impl_dispatch`, which
+	/// only a block's own signature fills, and through `members`, which only
+	/// each member's signature fills. Nothing can demand it, so an impl the
+	/// sweep reaches late is an impl that every earlier lookup silently
+	/// failed to see — which is why `fn f(v: S::X)` used to resolve only when
+	/// `impl Tr for S` happened to precede it in the file.
+	///
+	/// Headers only, deliberately. Forcing the members here too would resolve
+	/// `S::X` in a signature no matter where the `impl` sits — but it also
+	/// moves every impl member ahead of *all* other items, and that surfaces
+	/// reads elsewhere that trust parse order instead of forcing what they
+	/// read: `concrete_type_in_typeset` consults `typesets[i].members` without
+	/// resolving the typeset first, so `memory heap: Memory where { Size = u32 }`
+	/// starts reporting E1047 against an empty `PointerSize`. Forcing a member
+	/// *by name* at the lookup site is the fix for the member half, and it
+	/// needs those reads fixed first. See
+	/// `notes/item-resolution-granularity-plan.md`.
+	fn resolve_impl_dispatch(&mut self) {
+		for i in 0..self.ast_nodes.len() {
+			if matches!(
+				self.ast_nodes[i].node,
+				AstNodeRef::TraitImplBlock { .. }
+					| AstNodeRef::InherentImplBlock { .. }
+			) {
+				let _ = self.ensure_signature(self.ast_nodes[i].def_id);
+			}
+		}
+	}
+
 	fn finish(self) -> TIR {
 		TIR {
 			items: self.items,

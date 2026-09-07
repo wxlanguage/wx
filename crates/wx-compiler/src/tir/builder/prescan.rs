@@ -435,17 +435,14 @@ impl<'ast> Builder<'ast, '_> {
 						span: target.span,
 					},
 					members: HashMap::new(),
+					member_decls: HashMap::new(),
 					self_accesses: Vec::new(),
 				});
 				self.ast_nodes.push(AstEntry {
 					def_id: *impl_id,
 					file_id,
 					namespace,
-					node: AstNodeRef::InherentImplBlock {
-						impl_type_params: type_params,
-						impl_target: target,
-						block_index,
-					},
+					node: AstNodeRef::InherentImplBlock { item, block_index },
 				});
 				for impl_item in items.iter() {
 					match &impl_item.inner.inner {
