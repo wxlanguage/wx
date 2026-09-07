@@ -85,6 +85,7 @@ impl<'ast> Builder<'ast, '_> {
 						file_id,
 						namespace,
 						name: *name,
+						parent: Some(ItemParent::Trait(trait_index)),
 						bounds: Bounds::default(),
 						accesses: Vec::new(),
 						ty: None,

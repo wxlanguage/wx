@@ -484,6 +484,13 @@ impl<'ast> Builder<'ast, '_> {
 					file_id: original.file_id,
 					namespace: original.namespace,
 					name: original.name,
+					// The owning `TraitImpl` is pushed *after* its members are
+					// built, so its index isn't available here. `Trait(..)`
+					// would be a lie (this is an impl definition, not the
+					// declaration), and the field is only ever read to qualify
+					// a name in a cycle chain — which a fully-synthesized member
+					// can never be in. So: `None`.
+					parent: None,
 					ty: Some(memory_size),
 					attributes: Box::new([]),
 				};

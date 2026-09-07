@@ -40,12 +40,10 @@ impl<'ast> Builder<'ast, '_> {
 		Ok(Some(member.entry(&self.items)))
 	}
 
-	/// Resolve headers before traversing abstract bounds. The temporary list
-	/// ends the registry borrow before a member demand mutates the builder.
-	pub(super) fn bound_traits(
-		&mut self,
-		receiver: TypeIndex,
-	) -> Vec<TraitIndex> {
+	/// `receiver`'s directly declared bound traits, with their supertrait
+	/// clauses resolved. The temporary list ends the registry borrow before
+	/// `ensure_trait_supertraits` mutates the builder.
+	fn bound_trait_roots(&mut self, receiver: TypeIndex) -> Vec<TraitIndex> {
 		let roots: Vec<_> = self
 			.items
 			.abstract_type_bounds(&self.types, receiver)
@@ -54,7 +52,36 @@ impl<'ast> Builder<'ast, '_> {
 		for &root in &roots {
 			self.ensure_trait_supertraits(root);
 		}
+		roots
+	}
+
+	/// Every trait `receiver` is bound by, directly or through a supertrait.
+	pub(super) fn bound_traits(
+		&mut self,
+		receiver: TypeIndex,
+	) -> Vec<TraitIndex> {
+		let roots = self.bound_trait_roots(receiver);
 		self.items.reachable_traits(roots).collect()
+	}
+
+	/// Whether `needle` is one of `receiver`'s bounds, directly or through a
+	/// supertrait. Checks the directly declared bounds first — the common
+	/// case, and allocation-free — before paying for the supertrait walk.
+	pub(super) fn bound_traits_contains(
+		&mut self,
+		receiver: TypeIndex,
+		needle: TraitIndex,
+	) -> bool {
+		let Some(bounds) =
+			self.items.abstract_type_bounds(&self.types, receiver)
+		else {
+			return false;
+		};
+		if bounds.traits.iter().any(|b| b.trait_index == needle) {
+			return true;
+		}
+		let roots = self.bound_trait_roots(receiver);
+		self.items.reachable_traits(roots).any(|t| t == needle)
 	}
 
 	/// Search abstract bounds, retaining the declaring trait for projections

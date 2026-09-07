@@ -1795,6 +1795,12 @@ pub struct AssociatedType {
 	/// report against the right scope without reconstructing one.
 	pub namespace: NamespaceIndex,
 	pub name: Spanned<SymbolU32>,
+	/// The trait that declares it, or the impl that defines it. `None` only
+	/// for a memory impl's synthesized members, which are built complete and
+	/// never take part in demand-driven resolution. Used to qualify the name
+	/// (`A::Elem`, `Container::Elem`) in diagnostics.
+	#[cfg_attr(test, serde(skip))]
+	pub parent: Option<ItemParent>,
 	#[cfg_attr(test, serde(skip))]
 	pub bounds: Bounds,
 	#[cfg_attr(test, serde(skip))]
@@ -2639,6 +2645,12 @@ pub enum ItemIndex {
 	TraitImpl(TraitImplIndex),
 	Enum(EnumIndex),
 	TypeAlias(TypeAliasIndex),
+	/// A trait's associated-type declaration, an impl's associated-type
+	/// definition, or a memory impl's synthesized one — all in
+	/// [`ItemRegistry::associated_types`]. Unlike the other kinds it is a
+	/// trait/impl *member*, not a namespace-level name, so it never installs
+	/// a `Pending` symbol.
+	AssocType(AssocTypeIndex),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2879,6 +2891,8 @@ impl ItemRegistry {
 			u32::try_from(self.associated_types.len())
 				.expect("associated-type registry exceeded u32 index capacity"),
 		);
+		self.item_lookup
+			.insert(item.id, ItemIndex::AssocType(index));
 		self.associated_types.push(item);
 		index
 	}
@@ -3163,6 +3177,10 @@ impl ItemRegistry {
 			}
 			ItemIndex::TypeAlias(i) => {
 				let item = &self.type_aliases[usize::from(i)];
+				(item.name, item.file_id)
+			}
+			ItemIndex::AssocType(i) => {
+				let item = &self.associated_types[usize::from(i)];
 				(item.name, item.file_id)
 			}
 			ItemIndex::TraitImpl(_) => return None,

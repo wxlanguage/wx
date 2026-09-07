@@ -1239,13 +1239,20 @@ impl<'ast> Builder<'ast, '_> {
 				// exact equality for concrete impls, so this covers exactly
 				// what the old exact-key `type_trait_impls` lookup did, plus
 				// generic impls.
-				let impls = self
+				//
+				// Iterated by index with a fresh bucket lookup each step:
+				// `trait_member_via_impl` needs `&mut self`, and the dispatch
+				// index is fully collected before Phase 2 begins (a member
+				// demand never registers a new impl block), so the bucket for
+				// `target` cannot grow or move under the loop.
+				let bucket_len = self
 					.items
 					.trait_impl_dispatch
 					.get(&target)
-					.cloned()
-					.unwrap_or_default();
-				for (trait_index, impl_index) in impls {
+					.map_or(0, Vec::len);
+				for i in 0..bucket_len {
+					let (trait_index, impl_index) =
+						self.items.trait_impl_dispatch[&target][i];
 					let (entry, type_args) = match self.trait_member_via_impl(
 						trait_index,
 						impl_index,
@@ -1496,7 +1503,7 @@ impl<'ast> Builder<'ast, '_> {
 			.abstract_type_bounds(&self.types, target_type)
 			.is_some()
 		{
-			if !self.bound_traits(target_type).contains(&required_trait) {
+			if !self.bound_traits_contains(target_type, required_trait) {
 				return Err(TraitMemberError::NotImplemented);
 			}
 			let entry = self

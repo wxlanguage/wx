@@ -1217,6 +1217,568 @@ types:
 diagnostics: []
 items:
   functions:
+    - id: 13
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 0
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 35
+      name:
+        inner: 17
+        span:
+          start: 404
+          end: 407
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 408
+              end: 412
+          ty:
+            inner: 34
+            span:
+              start: 408
+              end: 412
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 414
+              end: 417
+          ty:
+            inner: 34
+            span:
+              start: 419
+              end: 423
+      result:
+        inner: 34
+        span:
+          start: 428
+          end: 432
+      accesses:
+        - file_id: 0
+          span:
+            start: 27862
+            end: 27863
+        - file_id: 0
+          span:
+            start: 28210
+            end: 28211
+      attributes: []
+      body: ~
+    - id: 15
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 1
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 37
+      name:
+        inner: 23
+        span:
+          start: 475
+          end: 478
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 479
+              end: 483
+          ty:
+            inner: 36
+            span:
+              start: 479
+              end: 483
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 485
+              end: 488
+          ty:
+            inner: 36
+            span:
+              start: 490
+              end: 494
+      result:
+        inner: 36
+        span:
+          start: 499
+          end: 503
+      accesses:
+        - file_id: 0
+          span:
+            start: 27982
+            end: 27983
+        - file_id: 0
+          span:
+            start: 28218
+            end: 28219
+        - file_id: 0
+          span:
+            start: 28233
+            end: 28234
+      attributes: []
+      body: ~
+    - id: 17
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 2
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 39
+      name:
+        inner: 26
+        span:
+          start: 546
+          end: 549
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 550
+              end: 554
+          ty:
+            inner: 38
+            span:
+              start: 550
+              end: 554
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 556
+              end: 559
+          ty:
+            inner: 38
+            span:
+              start: 561
+              end: 565
+      result:
+        inner: 38
+        span:
+          start: 570
+          end: 574
+      accesses:
+        - file_id: 0
+          span:
+            start: 25845
+            end: 25846
+        - file_id: 0
+          span:
+            start: 26342
+            end: 26343
+        - file_id: 0
+          span:
+            start: 27870
+            end: 27871
+        - file_id: 0
+          span:
+            start: 27990
+            end: 27991
+      attributes: []
+      body: ~
+    - id: 19
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 3
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 41
+      name:
+        inner: 29
+        span:
+          start: 617
+          end: 620
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 621
+              end: 625
+          ty:
+            inner: 40
+            span:
+              start: 621
+              end: 625
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 627
+              end: 630
+          ty:
+            inner: 40
+            span:
+              start: 632
+              end: 636
+      result:
+        inner: 40
+        span:
+          start: 641
+          end: 645
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 21
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 4
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 43
+      name:
+        inner: 32
+        span:
+          start: 688
+          end: 691
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 692
+              end: 696
+          ty:
+            inner: 42
+            span:
+              start: 692
+              end: 696
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 698
+              end: 701
+          ty:
+            inner: 42
+            span:
+              start: 703
+              end: 707
+      result:
+        inner: 42
+        span:
+          start: 712
+          end: 716
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 23
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 5
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 45
+      name:
+        inner: 35
+        span:
+          start: 759
+          end: 762
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 763
+              end: 767
+          ty:
+            inner: 44
+            span:
+              start: 763
+              end: 767
+      result:
+        inner: 44
+        span:
+          start: 772
+          end: 776
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 25
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 6
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 47
+      name:
+        inner: 38
+        span:
+          start: 825
+          end: 831
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 832
+              end: 836
+          ty:
+            inner: 46
+            span:
+              start: 832
+              end: 836
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 838
+              end: 841
+          ty:
+            inner: 46
+            span:
+              start: 843
+              end: 847
+      result:
+        inner: 46
+        span:
+          start: 852
+          end: 856
+      accesses:
+        - file_id: 0
+          span:
+            start: 28223
+            end: 28224
+      attributes: []
+      body: ~
+    - id: 27
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 7
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 49
+      name:
+        inner: 41
+        span:
+          start: 903
+          end: 908
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 909
+              end: 913
+          ty:
+            inner: 48
+            span:
+              start: 909
+              end: 913
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 915
+              end: 918
+          ty:
+            inner: 48
+            span:
+              start: 920
+              end: 924
+      result:
+        inner: 48
+        span:
+          start: 929
+          end: 933
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 29
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 8
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 51
+      name:
+        inner: 44
+        span:
+          start: 982
+          end: 988
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 989
+              end: 993
+          ty:
+            inner: 50
+            span:
+              start: 989
+              end: 993
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 995
+              end: 998
+          ty:
+            inner: 50
+            span:
+              start: 1000
+              end: 1004
+      result:
+        inner: 50
+        span:
+          start: 1009
+          end: 1013
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 31
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 9
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 53
+      name:
+        inner: 47
+        span:
+          start: 1056
+          end: 1059
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 1060
+              end: 1064
+          ty:
+            inner: 52
+            span:
+              start: 1060
+              end: 1064
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 1066
+              end: 1069
+          ty:
+            inner: 52
+            span:
+              start: 1071
+              end: 1075
+      result:
+        inner: 52
+        span:
+          start: 1080
+          end: 1084
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 33
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 10
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 55
+      name:
+        inner: 50
+        span:
+          start: 1127
+          end: 1130
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 1131
+              end: 1135
+          ty:
+            inner: 54
+            span:
+              start: 1131
+              end: 1135
+        - mut_span: ~
+          name:
+            inner: 19
+            span:
+              start: 1137
+              end: 1140
+          ty:
+            inner: 54
+            span:
+              start: 1142
+              end: 1146
+      result:
+        inner: 54
+        span:
+          start: 1151
+          end: 1155
+      accesses: []
+      attributes: []
+      body: ~
+    - id: 35
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 11
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 57
+      name:
+        inner: 53
+        span:
+          start: 1204
+          end: 1210
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 1211
+              end: 1215
+          ty:
+            inner: 56
+            span:
+              start: 1211
+              end: 1215
+      result:
+        inner: 56
+        span:
+          start: 1220
+          end: 1224
+      accesses:
+        - file_id: 0
+          span:
+            start: 28225
+            end: 28226
+      attributes: []
+      body: ~
     - id: 37
       file_id: 0
       namespace: 0
@@ -5807,6 +6369,126 @@ items:
       attributes:
         - Intrinsic
       body: ~
+    - id: 427
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 138
+      name:
+        inner: 201
+        span:
+          start: 25466
+          end: 25470
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25471
+              end: 25475
+          ty:
+            inner: 22
+            span:
+              start: 25471
+              end: 25475
+        - mut_span: ~
+          name:
+            inner: 187
+            span:
+              start: 25477
+              end: 25482
+          ty:
+            inner: 136
+            span:
+              start: 25484
+              end: 25494
+      result:
+        inner: 137
+        span:
+          start: 25499
+          end: 25517
+      accesses: []
+      attributes:
+        - Inline
+      body: 147
+    - id: 428
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 139
+      name:
+        inner: 202
+        span:
+          start: 25640
+          end: 25650
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25651
+              end: 25655
+          ty:
+            inner: 22
+            span:
+              start: 25651
+              end: 25655
+      result:
+        inner: 136
+        span:
+          start: 25660
+          end: 25670
+      accesses:
+        - file_id: 0
+          span:
+            start: 25832
+            end: 25842
+      attributes:
+        - Inline
+      body: 148
+    - id: 429
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 139
+      name:
+        inner: 203
+        span:
+          start: 25786
+          end: 25796
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25797
+              end: 25801
+          ty:
+            inner: 22
+            span:
+              start: 25797
+              end: 25801
+      result:
+        inner: 136
+        span:
+          start: 25806
+          end: 25816
+      accesses: []
+      attributes:
+        - Inline
+      body: 149
     - id: 431
       file_id: 0
       namespace: 0
@@ -5935,6 +6617,197 @@ items:
       attributes:
         - Intrinsic
       body: ~
+    - id: 440
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 15
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 155
+      name:
+        inner: 213
+        span:
+          start: 26567
+          end: 26575
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 26576
+              end: 26580
+          ty:
+            inner: 152
+            span:
+              start: 26582
+              end: 26598
+        - mut_span: ~
+          name:
+            inner: 214
+            span:
+              start: 26600
+              end: 26606
+          ty:
+            inner: 153
+            span:
+              start: 26608
+              end: 26625
+      result:
+        inner: 154
+        span:
+          start: 26630
+          end: 26644
+      accesses:
+        - file_id: 0
+          span:
+            start: 26764
+            end: 26772
+        - file_id: 0
+          span:
+            start: 27008
+            end: 27016
+      attributes: []
+      body: ~
+    - id: 441
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 15
+      pub_span: ~
+      type_params:
+        - name:
+            inner: 57
+            span:
+              start: 26683
+              end: 26684
+          bounds:
+            traits: []
+            typeset: ~
+          accesses:
+            - file_id: 0
+              span:
+                start: 26717
+                end: 26718
+            - file_id: 0
+              span:
+                start: 26735
+                end: 26736
+            - file_id: 0
+              span:
+                start: 26807
+                end: 26808
+            - file_id: 0
+              span:
+                start: 26786
+                end: 26787
+      inherited_type_param_count: 1
+      signature_index: 158
+      name:
+        inner: 215
+        span:
+          start: 26668
+          end: 26682
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 26686
+              end: 26690
+          ty:
+            inner: 152
+            span:
+              start: 26692
+              end: 26708
+        - mut_span: ~
+          name:
+            inner: 65
+            span:
+              start: 26710
+              end: 26715
+          ty:
+            inner: 156
+            span:
+              start: 26717
+              end: 26718
+      result:
+        inner: 157
+        span:
+          start: 26723
+          end: 26736
+      accesses: []
+      attributes:
+        - Inline
+      body: 154
+    - id: 442
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 15
+      pub_span: ~
+      type_params:
+        - name:
+            inner: 57
+            span:
+              start: 26895
+              end: 26896
+          bounds:
+            traits: []
+            typeset: ~
+          accesses:
+            - file_id: 0
+              span:
+                start: 26960
+                end: 26961
+            - file_id: 0
+              span:
+                start: 27057
+                end: 27058
+            - file_id: 0
+              span:
+                start: 27033
+                end: 27034
+      inherited_type_param_count: 1
+      signature_index: 162
+      name:
+        inner: 217
+        span:
+          start: 26873
+          end: 26894
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 26898
+              end: 26902
+          ty:
+            inner: 152
+            span:
+              start: 26904
+              end: 26920
+        - mut_span: ~
+          name:
+            inner: 63
+            span:
+              start: 26922
+              end: 26925
+          ty:
+            inner: 159
+            span:
+              start: 26927
+              end: 26942
+      result:
+        inner: 161
+        span:
+          start: 26947
+          end: 26962
+      accesses: []
+      attributes:
+        - Inline
+      body: 155
     - id: 477
       file_id: 1
       namespace: 1
@@ -5961,568 +6834,6 @@ items:
             end: 113
       attributes: []
       body: 183
-    - id: 13
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 0
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 35
-      name:
-        inner: 17
-        span:
-          start: 404
-          end: 407
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 408
-              end: 412
-          ty:
-            inner: 34
-            span:
-              start: 408
-              end: 412
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 414
-              end: 417
-          ty:
-            inner: 34
-            span:
-              start: 419
-              end: 423
-      result:
-        inner: 34
-        span:
-          start: 428
-          end: 432
-      accesses:
-        - file_id: 0
-          span:
-            start: 27862
-            end: 27863
-        - file_id: 0
-          span:
-            start: 28210
-            end: 28211
-      attributes: []
-      body: ~
-    - id: 15
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 1
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 37
-      name:
-        inner: 23
-        span:
-          start: 475
-          end: 478
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 479
-              end: 483
-          ty:
-            inner: 36
-            span:
-              start: 479
-              end: 483
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 485
-              end: 488
-          ty:
-            inner: 36
-            span:
-              start: 490
-              end: 494
-      result:
-        inner: 36
-        span:
-          start: 499
-          end: 503
-      accesses:
-        - file_id: 0
-          span:
-            start: 27982
-            end: 27983
-        - file_id: 0
-          span:
-            start: 28218
-            end: 28219
-        - file_id: 0
-          span:
-            start: 28233
-            end: 28234
-      attributes: []
-      body: ~
-    - id: 17
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 2
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 39
-      name:
-        inner: 26
-        span:
-          start: 546
-          end: 549
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 550
-              end: 554
-          ty:
-            inner: 38
-            span:
-              start: 550
-              end: 554
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 556
-              end: 559
-          ty:
-            inner: 38
-            span:
-              start: 561
-              end: 565
-      result:
-        inner: 38
-        span:
-          start: 570
-          end: 574
-      accesses:
-        - file_id: 0
-          span:
-            start: 25845
-            end: 25846
-        - file_id: 0
-          span:
-            start: 26342
-            end: 26343
-        - file_id: 0
-          span:
-            start: 27870
-            end: 27871
-        - file_id: 0
-          span:
-            start: 27990
-            end: 27991
-      attributes: []
-      body: ~
-    - id: 19
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 3
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 41
-      name:
-        inner: 29
-        span:
-          start: 617
-          end: 620
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 621
-              end: 625
-          ty:
-            inner: 40
-            span:
-              start: 621
-              end: 625
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 627
-              end: 630
-          ty:
-            inner: 40
-            span:
-              start: 632
-              end: 636
-      result:
-        inner: 40
-        span:
-          start: 641
-          end: 645
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 21
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 4
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 43
-      name:
-        inner: 32
-        span:
-          start: 688
-          end: 691
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 692
-              end: 696
-          ty:
-            inner: 42
-            span:
-              start: 692
-              end: 696
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 698
-              end: 701
-          ty:
-            inner: 42
-            span:
-              start: 703
-              end: 707
-      result:
-        inner: 42
-        span:
-          start: 712
-          end: 716
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 23
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 5
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 45
-      name:
-        inner: 35
-        span:
-          start: 759
-          end: 762
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 763
-              end: 767
-          ty:
-            inner: 44
-            span:
-              start: 763
-              end: 767
-      result:
-        inner: 44
-        span:
-          start: 772
-          end: 776
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 25
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 6
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 47
-      name:
-        inner: 38
-        span:
-          start: 825
-          end: 831
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 832
-              end: 836
-          ty:
-            inner: 46
-            span:
-              start: 832
-              end: 836
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 838
-              end: 841
-          ty:
-            inner: 46
-            span:
-              start: 843
-              end: 847
-      result:
-        inner: 46
-        span:
-          start: 852
-          end: 856
-      accesses:
-        - file_id: 0
-          span:
-            start: 28223
-            end: 28224
-      attributes: []
-      body: ~
-    - id: 27
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 7
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 49
-      name:
-        inner: 41
-        span:
-          start: 903
-          end: 908
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 909
-              end: 913
-          ty:
-            inner: 48
-            span:
-              start: 909
-              end: 913
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 915
-              end: 918
-          ty:
-            inner: 48
-            span:
-              start: 920
-              end: 924
-      result:
-        inner: 48
-        span:
-          start: 929
-          end: 933
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 29
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 8
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 51
-      name:
-        inner: 44
-        span:
-          start: 982
-          end: 988
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 989
-              end: 993
-          ty:
-            inner: 50
-            span:
-              start: 989
-              end: 993
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 995
-              end: 998
-          ty:
-            inner: 50
-            span:
-              start: 1000
-              end: 1004
-      result:
-        inner: 50
-        span:
-          start: 1009
-          end: 1013
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 31
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 9
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 53
-      name:
-        inner: 47
-        span:
-          start: 1056
-          end: 1059
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 1060
-              end: 1064
-          ty:
-            inner: 52
-            span:
-              start: 1060
-              end: 1064
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 1066
-              end: 1069
-          ty:
-            inner: 52
-            span:
-              start: 1071
-              end: 1075
-      result:
-        inner: 52
-        span:
-          start: 1080
-          end: 1084
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 33
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 10
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 55
-      name:
-        inner: 50
-        span:
-          start: 1127
-          end: 1130
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 1131
-              end: 1135
-          ty:
-            inner: 54
-            span:
-              start: 1131
-              end: 1135
-        - mut_span: ~
-          name:
-            inner: 19
-            span:
-              start: 1137
-              end: 1140
-          ty:
-            inner: 54
-            span:
-              start: 1142
-              end: 1146
-      result:
-        inner: 54
-        span:
-          start: 1151
-          end: 1155
-      accesses: []
-      attributes: []
-      body: ~
-    - id: 35
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 11
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 57
-      name:
-        inner: 53
-        span:
-          start: 1204
-          end: 1210
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 1211
-              end: 1215
-          ty:
-            inner: 56
-            span:
-              start: 1211
-              end: 1215
-      result:
-        inner: 56
-        span:
-          start: 1220
-          end: 1224
-      accesses:
-        - file_id: 0
-          span:
-            start: 28225
-            end: 28226
-      attributes: []
-      body: ~
     - id: 130
       file_id: 0
       namespace: 0
@@ -12909,126 +13220,6 @@ items:
       attributes:
         - Inline
       body: 146
-    - id: 427
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 138
-      name:
-        inner: 201
-        span:
-          start: 25466
-          end: 25470
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25471
-              end: 25475
-          ty:
-            inner: 22
-            span:
-              start: 25471
-              end: 25475
-        - mut_span: ~
-          name:
-            inner: 187
-            span:
-              start: 25477
-              end: 25482
-          ty:
-            inner: 136
-            span:
-              start: 25484
-              end: 25494
-      result:
-        inner: 137
-        span:
-          start: 25499
-          end: 25517
-      accesses: []
-      attributes:
-        - Inline
-      body: 147
-    - id: 428
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 139
-      name:
-        inner: 202
-        span:
-          start: 25640
-          end: 25650
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25651
-              end: 25655
-          ty:
-            inner: 22
-            span:
-              start: 25651
-              end: 25655
-      result:
-        inner: 136
-        span:
-          start: 25660
-          end: 25670
-      accesses:
-        - file_id: 0
-          span:
-            start: 25832
-            end: 25842
-      attributes:
-        - Inline
-      body: 148
-    - id: 429
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 139
-      name:
-        inner: 203
-        span:
-          start: 25786
-          end: 25796
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25797
-              end: 25801
-          ty:
-            inner: 22
-            span:
-              start: 25797
-              end: 25801
-      result:
-        inner: 136
-        span:
-          start: 25806
-          end: 25816
-      accesses: []
-      attributes:
-        - Inline
-      body: 149
     - id: 434
       file_id: 0
       namespace: 0
@@ -13208,197 +13399,6 @@ items:
       attributes:
         - Inline
       body: 153
-    - id: 440
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 15
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 155
-      name:
-        inner: 213
-        span:
-          start: 26567
-          end: 26575
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 26576
-              end: 26580
-          ty:
-            inner: 152
-            span:
-              start: 26582
-              end: 26598
-        - mut_span: ~
-          name:
-            inner: 214
-            span:
-              start: 26600
-              end: 26606
-          ty:
-            inner: 153
-            span:
-              start: 26608
-              end: 26625
-      result:
-        inner: 154
-        span:
-          start: 26630
-          end: 26644
-      accesses:
-        - file_id: 0
-          span:
-            start: 26764
-            end: 26772
-        - file_id: 0
-          span:
-            start: 27008
-            end: 27016
-      attributes: []
-      body: ~
-    - id: 441
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 15
-      pub_span: ~
-      type_params:
-        - name:
-            inner: 57
-            span:
-              start: 26683
-              end: 26684
-          bounds:
-            traits: []
-            typeset: ~
-          accesses:
-            - file_id: 0
-              span:
-                start: 26717
-                end: 26718
-            - file_id: 0
-              span:
-                start: 26735
-                end: 26736
-            - file_id: 0
-              span:
-                start: 26807
-                end: 26808
-            - file_id: 0
-              span:
-                start: 26786
-                end: 26787
-      inherited_type_param_count: 1
-      signature_index: 158
-      name:
-        inner: 215
-        span:
-          start: 26668
-          end: 26682
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 26686
-              end: 26690
-          ty:
-            inner: 152
-            span:
-              start: 26692
-              end: 26708
-        - mut_span: ~
-          name:
-            inner: 65
-            span:
-              start: 26710
-              end: 26715
-          ty:
-            inner: 156
-            span:
-              start: 26717
-              end: 26718
-      result:
-        inner: 157
-        span:
-          start: 26723
-          end: 26736
-      accesses: []
-      attributes:
-        - Inline
-      body: 154
-    - id: 442
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 15
-      pub_span: ~
-      type_params:
-        - name:
-            inner: 57
-            span:
-              start: 26895
-              end: 26896
-          bounds:
-            traits: []
-            typeset: ~
-          accesses:
-            - file_id: 0
-              span:
-                start: 26960
-                end: 26961
-            - file_id: 0
-              span:
-                start: 27057
-                end: 27058
-            - file_id: 0
-              span:
-                start: 27033
-                end: 27034
-      inherited_type_param_count: 1
-      signature_index: 162
-      name:
-        inner: 217
-        span:
-          start: 26873
-          end: 26894
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 26898
-              end: 26902
-          ty:
-            inner: 152
-            span:
-              start: 26904
-              end: 26920
-        - mut_span: ~
-          name:
-            inner: 63
-            span:
-              start: 26922
-              end: 26925
-          ty:
-            inner: 159
-            span:
-              start: 26927
-              end: 26942
-      result:
-        inner: 161
-        span:
-          start: 26947
-          end: 26962
-      accesses: []
-      attributes:
-        - Inline
-      body: 155
     - id: 445
       file_id: 0
       namespace: 0
@@ -14791,9 +14791,9 @@ items:
             span:
               start: 428
               end: 432
-      entries:
+      members:
         17:
-          Method: 93
+          Function: 0
     - id: 16
       file_id: 0
       namespace: 0
@@ -14828,9 +14828,9 @@ items:
             span:
               start: 499
               end: 503
-      entries:
+      members:
         23:
-          Method: 94
+          Function: 1
     - id: 18
       file_id: 0
       namespace: 0
@@ -14865,9 +14865,9 @@ items:
             span:
               start: 570
               end: 574
-      entries:
+      members:
         26:
-          Method: 95
+          Function: 2
     - id: 20
       file_id: 0
       namespace: 0
@@ -14902,9 +14902,9 @@ items:
             span:
               start: 641
               end: 645
-      entries:
+      members:
         29:
-          Method: 96
+          Function: 3
     - id: 22
       file_id: 0
       namespace: 0
@@ -14939,9 +14939,9 @@ items:
             span:
               start: 712
               end: 716
-      entries:
+      members:
         32:
-          Method: 97
+          Function: 4
     - id: 24
       file_id: 0
       namespace: 0
@@ -14972,9 +14972,9 @@ items:
             span:
               start: 772
               end: 776
-      entries:
+      members:
         35:
-          Method: 98
+          Function: 5
     - id: 26
       file_id: 0
       namespace: 0
@@ -15009,9 +15009,9 @@ items:
             span:
               start: 852
               end: 856
-      entries:
+      members:
         38:
-          Method: 99
+          Function: 6
     - id: 28
       file_id: 0
       namespace: 0
@@ -15046,9 +15046,9 @@ items:
             span:
               start: 929
               end: 933
-      entries:
+      members:
         41:
-          Method: 100
+          Function: 7
     - id: 30
       file_id: 0
       namespace: 0
@@ -15083,9 +15083,9 @@ items:
             span:
               start: 1009
               end: 1013
-      entries:
+      members:
         44:
-          Method: 101
+          Function: 8
     - id: 32
       file_id: 0
       namespace: 0
@@ -15120,9 +15120,9 @@ items:
             span:
               start: 1080
               end: 1084
-      entries:
+      members:
         47:
-          Method: 102
+          Function: 9
     - id: 34
       file_id: 0
       namespace: 0
@@ -15157,9 +15157,9 @@ items:
             span:
               start: 1151
               end: 1155
-      entries:
+      members:
         50:
-          Method: 103
+          Function: 10
     - id: 36
       file_id: 0
       namespace: 0
@@ -15190,9 +15190,9 @@ items:
             span:
               start: 1220
               end: 1224
-      entries:
+      members:
         53:
-          Method: 104
+          Function: 11
     - id: 399
       file_id: 0
       namespace: 0
@@ -15223,9 +15223,9 @@ items:
             span:
               start: 23033
               end: 23037
-      entries:
+      members:
         182:
-          AssocType: 1
+          AssociatedType: 0
     - id: 401
       file_id: 0
       namespace: 0
@@ -15256,9 +15256,9 @@ items:
             span:
               start: 23114
               end: 23118
-      entries:
+      members:
         184:
-          AssocType: 2
+          AssociatedType: 1
     - id: 430
       file_id: 0
       namespace: 0
@@ -15313,21 +15313,21 @@ items:
             span:
               start: 25847
               end: 25851
-      entries:
+      members:
         59:
-          AssocType: 0
+          AssociatedType: 2
         198:
-          AssocConstant: 15
+          Constant: 0
         199:
-          AssocConstant: 16
+          Constant: 1
         200:
-          AssocConstant: 17
+          Constant: 2
         201:
-          Method: 252
+          Function: 102
         202:
-          Method: 253
+          Function: 103
         203:
-          Method: 254
+          Function: 104
     - id: 443
       file_id: 0
       namespace: 0
@@ -15406,15 +15406,15 @@ items:
             span:
               start: 27045
               end: 27049
-      entries:
+      members:
         55:
-          AssocType: 11
+          AssociatedType: 3
         213:
-          Method: 259
+          Function: 107
         215:
-          Method: 260
+          Function: 108
         217:
-          Method: 261
+          Function: 109
   trait_impls:
     - id: 175
       trait_index: 0
@@ -15426,7 +15426,7 @@ items:
           end: 9562
       members:
         17:
-          Method: 139
+          Method: 145
       file_id: 0
       namespace: 0
     - id: 177
@@ -15439,7 +15439,7 @@ items:
           end: 9669
       members:
         23:
-          Method: 140
+          Method: 146
       file_id: 0
       namespace: 0
     - id: 179
@@ -15452,7 +15452,7 @@ items:
           end: 9776
       members:
         26:
-          Method: 141
+          Method: 147
       file_id: 0
       namespace: 0
     - id: 181
@@ -15465,7 +15465,7 @@ items:
           end: 9883
       members:
         29:
-          Method: 142
+          Method: 148
       file_id: 0
       namespace: 0
     - id: 183
@@ -15478,7 +15478,7 @@ items:
           end: 9990
       members:
         32:
-          Method: 143
+          Method: 149
       file_id: 0
       namespace: 0
     - id: 185
@@ -15491,7 +15491,7 @@ items:
           end: 10097
       members:
         35:
-          Method: 144
+          Method: 150
       file_id: 0
       namespace: 0
     - id: 187
@@ -15504,7 +15504,7 @@ items:
           end: 10191
       members:
         38:
-          Method: 145
+          Method: 151
       file_id: 0
       namespace: 0
     - id: 189
@@ -15517,7 +15517,7 @@ items:
           end: 10306
       members:
         41:
-          Method: 146
+          Method: 152
       file_id: 0
       namespace: 0
     - id: 191
@@ -15530,7 +15530,7 @@ items:
           end: 10420
       members:
         44:
-          Method: 147
+          Method: 153
       file_id: 0
       namespace: 0
     - id: 193
@@ -15543,7 +15543,7 @@ items:
           end: 10533
       members:
         47:
-          Method: 148
+          Method: 154
       file_id: 0
       namespace: 0
     - id: 195
@@ -15556,7 +15556,7 @@ items:
           end: 10640
       members:
         50:
-          Method: 149
+          Method: 155
       file_id: 0
       namespace: 0
     - id: 197
@@ -15569,7 +15569,7 @@ items:
           end: 10750
       members:
         53:
-          Method: 150
+          Method: 156
       file_id: 0
       namespace: 0
     - id: 202
@@ -15582,7 +15582,7 @@ items:
           end: 11028
       members:
         17:
-          Method: 153
+          Method: 159
       file_id: 0
       namespace: 0
     - id: 204
@@ -15595,7 +15595,7 @@ items:
           end: 11156
       members:
         23:
-          Method: 154
+          Method: 160
       file_id: 0
       namespace: 0
     - id: 206
@@ -15608,7 +15608,7 @@ items:
           end: 11284
       members:
         26:
-          Method: 155
+          Method: 161
       file_id: 0
       namespace: 0
     - id: 208
@@ -15621,7 +15621,7 @@ items:
           end: 11412
       members:
         29:
-          Method: 156
+          Method: 162
       file_id: 0
       namespace: 0
     - id: 210
@@ -15634,7 +15634,7 @@ items:
           end: 11519
       members:
         32:
-          Method: 157
+          Method: 163
       file_id: 0
       namespace: 0
     - id: 212
@@ -15647,7 +15647,7 @@ items:
           end: 11629
       members:
         38:
-          Method: 158
+          Method: 164
       file_id: 0
       namespace: 0
     - id: 214
@@ -15660,7 +15660,7 @@ items:
           end: 11765
       members:
         41:
-          Method: 159
+          Method: 165
       file_id: 0
       namespace: 0
     - id: 216
@@ -15673,7 +15673,7 @@ items:
           end: 11900
       members:
         44:
-          Method: 160
+          Method: 166
       file_id: 0
       namespace: 0
     - id: 218
@@ -15686,7 +15686,7 @@ items:
           end: 12034
       members:
         47:
-          Method: 161
+          Method: 167
       file_id: 0
       namespace: 0
     - id: 220
@@ -15699,7 +15699,7 @@ items:
           end: 12162
       members:
         50:
-          Method: 162
+          Method: 168
       file_id: 0
       namespace: 0
     - id: 222
@@ -15712,7 +15712,7 @@ items:
           end: 12272
       members:
         53:
-          Method: 163
+          Method: 169
       file_id: 0
       namespace: 0
     - id: 227
@@ -15725,7 +15725,7 @@ items:
           end: 12564
       members:
         17:
-          Method: 166
+          Method: 172
       file_id: 0
       namespace: 0
     - id: 229
@@ -15738,7 +15738,7 @@ items:
           end: 12671
       members:
         23:
-          Method: 167
+          Method: 173
       file_id: 0
       namespace: 0
     - id: 231
@@ -15751,7 +15751,7 @@ items:
           end: 12778
       members:
         26:
-          Method: 168
+          Method: 174
       file_id: 0
       namespace: 0
     - id: 233
@@ -15764,7 +15764,7 @@ items:
           end: 12885
       members:
         29:
-          Method: 169
+          Method: 175
       file_id: 0
       namespace: 0
     - id: 235
@@ -15777,7 +15777,7 @@ items:
           end: 12992
       members:
         32:
-          Method: 170
+          Method: 176
       file_id: 0
       namespace: 0
     - id: 237
@@ -15790,7 +15790,7 @@ items:
           end: 13099
       members:
         35:
-          Method: 171
+          Method: 177
       file_id: 0
       namespace: 0
     - id: 239
@@ -15803,7 +15803,7 @@ items:
           end: 13193
       members:
         38:
-          Method: 172
+          Method: 178
       file_id: 0
       namespace: 0
     - id: 241
@@ -15816,7 +15816,7 @@ items:
           end: 13308
       members:
         41:
-          Method: 173
+          Method: 179
       file_id: 0
       namespace: 0
     - id: 243
@@ -15829,7 +15829,7 @@ items:
           end: 13422
       members:
         44:
-          Method: 174
+          Method: 180
       file_id: 0
       namespace: 0
     - id: 245
@@ -15842,7 +15842,7 @@ items:
           end: 13535
       members:
         47:
-          Method: 175
+          Method: 181
       file_id: 0
       namespace: 0
     - id: 247
@@ -15855,7 +15855,7 @@ items:
           end: 13642
       members:
         50:
-          Method: 176
+          Method: 182
       file_id: 0
       namespace: 0
     - id: 249
@@ -15868,7 +15868,7 @@ items:
           end: 13752
       members:
         53:
-          Method: 177
+          Method: 183
       file_id: 0
       namespace: 0
     - id: 254
@@ -15881,7 +15881,7 @@ items:
           end: 14030
       members:
         17:
-          Method: 180
+          Method: 186
       file_id: 0
       namespace: 0
     - id: 256
@@ -15894,7 +15894,7 @@ items:
           end: 14158
       members:
         23:
-          Method: 181
+          Method: 187
       file_id: 0
       namespace: 0
     - id: 258
@@ -15907,7 +15907,7 @@ items:
           end: 14286
       members:
         26:
-          Method: 182
+          Method: 188
       file_id: 0
       namespace: 0
     - id: 260
@@ -15920,7 +15920,7 @@ items:
           end: 14414
       members:
         29:
-          Method: 183
+          Method: 189
       file_id: 0
       namespace: 0
     - id: 262
@@ -15933,7 +15933,7 @@ items:
           end: 14521
       members:
         32:
-          Method: 184
+          Method: 190
       file_id: 0
       namespace: 0
     - id: 264
@@ -15946,7 +15946,7 @@ items:
           end: 14631
       members:
         38:
-          Method: 185
+          Method: 191
       file_id: 0
       namespace: 0
     - id: 266
@@ -15959,7 +15959,7 @@ items:
           end: 14767
       members:
         41:
-          Method: 186
+          Method: 192
       file_id: 0
       namespace: 0
     - id: 268
@@ -15972,7 +15972,7 @@ items:
           end: 14902
       members:
         44:
-          Method: 187
+          Method: 193
       file_id: 0
       namespace: 0
     - id: 270
@@ -15985,7 +15985,7 @@ items:
           end: 15036
       members:
         47:
-          Method: 188
+          Method: 194
       file_id: 0
       namespace: 0
     - id: 272
@@ -15998,7 +15998,7 @@ items:
           end: 15164
       members:
         50:
-          Method: 189
+          Method: 195
       file_id: 0
       namespace: 0
     - id: 274
@@ -16011,7 +16011,7 @@ items:
           end: 15274
       members:
         53:
-          Method: 190
+          Method: 196
       file_id: 0
       namespace: 0
     - id: 276
@@ -16024,7 +16024,7 @@ items:
           end: 15385
       members:
         17:
-          Method: 191
+          Method: 197
       file_id: 0
       namespace: 0
     - id: 278
@@ -16037,7 +16037,7 @@ items:
           end: 15492
       members:
         23:
-          Method: 192
+          Method: 198
       file_id: 0
       namespace: 0
     - id: 280
@@ -16050,7 +16050,7 @@ items:
           end: 15599
       members:
         26:
-          Method: 193
+          Method: 199
       file_id: 0
       namespace: 0
     - id: 282
@@ -16063,7 +16063,7 @@ items:
           end: 15706
       members:
         29:
-          Method: 194
+          Method: 200
       file_id: 0
       namespace: 0
     - id: 284
@@ -16076,7 +16076,7 @@ items:
           end: 15813
       members:
         35:
-          Method: 195
+          Method: 201
       file_id: 0
       namespace: 0
     - id: 286
@@ -16089,7 +16089,7 @@ items:
           end: 15904
       members:
         32:
-          Method: 196
+          Method: 202
       file_id: 0
       namespace: 0
     - id: 288
@@ -16102,7 +16102,7 @@ items:
           end: 16026
       members:
         17:
-          Method: 197
+          Method: 203
       file_id: 0
       namespace: 0
     - id: 290
@@ -16115,7 +16115,7 @@ items:
           end: 16133
       members:
         23:
-          Method: 198
+          Method: 204
       file_id: 0
       namespace: 0
     - id: 292
@@ -16128,7 +16128,7 @@ items:
           end: 16240
       members:
         26:
-          Method: 199
+          Method: 205
       file_id: 0
       namespace: 0
     - id: 294
@@ -16141,7 +16141,7 @@ items:
           end: 16347
       members:
         29:
-          Method: 200
+          Method: 206
       file_id: 0
       namespace: 0
     - id: 296
@@ -16154,7 +16154,7 @@ items:
           end: 16454
       members:
         35:
-          Method: 201
+          Method: 207
       file_id: 0
       namespace: 0
     - id: 298
@@ -16167,7 +16167,7 @@ items:
           end: 16545
       members:
         32:
-          Method: 202
+          Method: 208
       file_id: 0
       namespace: 0
     - id: 300
@@ -16180,7 +16180,7 @@ items:
           end: 16666
       members:
         17:
-          Method: 203
+          Method: 209
       file_id: 0
       namespace: 0
     - id: 302
@@ -16193,7 +16193,7 @@ items:
           end: 16792
       members:
         23:
-          Method: 204
+          Method: 210
       file_id: 0
       namespace: 0
     - id: 304
@@ -16206,7 +16206,7 @@ items:
           end: 16918
       members:
         26:
-          Method: 205
+          Method: 211
       file_id: 0
       namespace: 0
     - id: 306
@@ -16219,7 +16219,7 @@ items:
           end: 17044
       members:
         29:
-          Method: 206
+          Method: 212
       file_id: 0
       namespace: 0
     - id: 308
@@ -16232,7 +16232,7 @@ items:
           end: 17170
       members:
         32:
-          Method: 207
+          Method: 213
       file_id: 0
       namespace: 0
     - id: 310
@@ -16245,7 +16245,7 @@ items:
           end: 17296
       members:
         35:
-          Method: 208
+          Method: 214
       file_id: 0
       namespace: 0
     - id: 312
@@ -16258,7 +16258,7 @@ items:
           end: 17402
       members:
         38:
-          Method: 209
+          Method: 215
       file_id: 0
       namespace: 0
     - id: 314
@@ -16271,7 +16271,7 @@ items:
           end: 17536
       members:
         41:
-          Method: 210
+          Method: 216
       file_id: 0
       namespace: 0
     - id: 316
@@ -16284,7 +16284,7 @@ items:
           end: 17669
       members:
         44:
-          Method: 211
+          Method: 217
       file_id: 0
       namespace: 0
     - id: 318
@@ -16297,7 +16297,7 @@ items:
           end: 17801
       members:
         47:
-          Method: 212
+          Method: 218
       file_id: 0
       namespace: 0
     - id: 320
@@ -16310,7 +16310,7 @@ items:
           end: 17927
       members:
         50:
-          Method: 213
+          Method: 219
       file_id: 0
       namespace: 0
     - id: 322
@@ -16323,7 +16323,7 @@ items:
           end: 18056
       members:
         53:
-          Method: 214
+          Method: 220
       file_id: 0
       namespace: 0
     - id: 324
@@ -16336,7 +16336,7 @@ items:
           end: 18165
       members:
         17:
-          Method: 215
+          Method: 221
       file_id: 0
       namespace: 0
     - id: 326
@@ -16349,7 +16349,7 @@ items:
           end: 18291
       members:
         23:
-          Method: 216
+          Method: 222
       file_id: 0
       namespace: 0
     - id: 328
@@ -16362,7 +16362,7 @@ items:
           end: 18417
       members:
         26:
-          Method: 217
+          Method: 223
       file_id: 0
       namespace: 0
     - id: 330
@@ -16375,7 +16375,7 @@ items:
           end: 18543
       members:
         29:
-          Method: 218
+          Method: 224
       file_id: 0
       namespace: 0
     - id: 332
@@ -16388,7 +16388,7 @@ items:
           end: 18669
       members:
         32:
-          Method: 219
+          Method: 225
       file_id: 0
       namespace: 0
     - id: 334
@@ -16401,7 +16401,7 @@ items:
           end: 18798
       members:
         38:
-          Method: 220
+          Method: 226
       file_id: 0
       namespace: 0
     - id: 336
@@ -16414,7 +16414,7 @@ items:
           end: 18932
       members:
         41:
-          Method: 221
+          Method: 227
       file_id: 0
       namespace: 0
     - id: 338
@@ -16427,7 +16427,7 @@ items:
           end: 19065
       members:
         44:
-          Method: 222
+          Method: 228
       file_id: 0
       namespace: 0
     - id: 340
@@ -16440,7 +16440,7 @@ items:
           end: 19197
       members:
         47:
-          Method: 223
+          Method: 229
       file_id: 0
       namespace: 0
     - id: 342
@@ -16453,7 +16453,7 @@ items:
           end: 19323
       members:
         50:
-          Method: 224
+          Method: 230
       file_id: 0
       namespace: 0
     - id: 344
@@ -16466,7 +16466,7 @@ items:
           end: 19452
       members:
         53:
-          Method: 225
+          Method: 231
       file_id: 0
       namespace: 0
     - id: 346
@@ -16479,7 +16479,7 @@ items:
           end: 19562
       members:
         17:
-          Method: 226
+          Method: 232
       file_id: 0
       namespace: 0
     - id: 348
@@ -16492,7 +16492,7 @@ items:
           end: 19690
       members:
         23:
-          Method: 227
+          Method: 233
       file_id: 0
       namespace: 0
     - id: 350
@@ -16505,7 +16505,7 @@ items:
           end: 19818
       members:
         26:
-          Method: 228
+          Method: 234
       file_id: 0
       namespace: 0
     - id: 352
@@ -16518,7 +16518,7 @@ items:
           end: 19946
       members:
         29:
-          Method: 229
+          Method: 235
       file_id: 0
       namespace: 0
     - id: 354
@@ -16531,7 +16531,7 @@ items:
           end: 20074
       members:
         32:
-          Method: 230
+          Method: 236
       file_id: 0
       namespace: 0
     - id: 356
@@ -16544,7 +16544,7 @@ items:
           end: 20202
       members:
         35:
-          Method: 231
+          Method: 237
       file_id: 0
       namespace: 0
     - id: 358
@@ -16557,7 +16557,7 @@ items:
           end: 20310
       members:
         38:
-          Method: 232
+          Method: 238
       file_id: 0
       namespace: 0
     - id: 360
@@ -16570,7 +16570,7 @@ items:
           end: 20446
       members:
         41:
-          Method: 233
+          Method: 239
       file_id: 0
       namespace: 0
     - id: 362
@@ -16583,7 +16583,7 @@ items:
           end: 20581
       members:
         44:
-          Method: 234
+          Method: 240
       file_id: 0
       namespace: 0
     - id: 364
@@ -16596,7 +16596,7 @@ items:
           end: 20715
       members:
         47:
-          Method: 235
+          Method: 241
       file_id: 0
       namespace: 0
     - id: 366
@@ -16609,7 +16609,7 @@ items:
           end: 20843
       members:
         50:
-          Method: 236
+          Method: 242
       file_id: 0
       namespace: 0
     - id: 368
@@ -16622,7 +16622,7 @@ items:
           end: 20974
       members:
         53:
-          Method: 237
+          Method: 243
       file_id: 0
       namespace: 0
     - id: 370
@@ -16635,7 +16635,7 @@ items:
           end: 21085
       members:
         17:
-          Method: 238
+          Method: 244
       file_id: 0
       namespace: 0
     - id: 372
@@ -16648,7 +16648,7 @@ items:
           end: 21213
       members:
         23:
-          Method: 239
+          Method: 245
       file_id: 0
       namespace: 0
     - id: 374
@@ -16661,7 +16661,7 @@ items:
           end: 21341
       members:
         26:
-          Method: 240
+          Method: 246
       file_id: 0
       namespace: 0
     - id: 376
@@ -16674,7 +16674,7 @@ items:
           end: 21469
       members:
         29:
-          Method: 241
+          Method: 247
       file_id: 0
       namespace: 0
     - id: 378
@@ -16687,7 +16687,7 @@ items:
           end: 21597
       members:
         32:
-          Method: 242
+          Method: 248
       file_id: 0
       namespace: 0
     - id: 380
@@ -16700,7 +16700,7 @@ items:
           end: 21728
       members:
         38:
-          Method: 243
+          Method: 249
       file_id: 0
       namespace: 0
     - id: 382
@@ -16713,7 +16713,7 @@ items:
           end: 21864
       members:
         41:
-          Method: 244
+          Method: 250
       file_id: 0
       namespace: 0
     - id: 384
@@ -16726,7 +16726,7 @@ items:
           end: 21999
       members:
         44:
-          Method: 245
+          Method: 251
       file_id: 0
       namespace: 0
     - id: 386
@@ -16739,7 +16739,7 @@ items:
           end: 22133
       members:
         47:
-          Method: 246
+          Method: 252
       file_id: 0
       namespace: 0
     - id: 388
@@ -16752,7 +16752,7 @@ items:
           end: 22261
       members:
         50:
-          Method: 247
+          Method: 253
       file_id: 0
       namespace: 0
     - id: 390
@@ -16765,7 +16765,7 @@ items:
           end: 22392
       members:
         53:
-          Method: 248
+          Method: 254
       file_id: 0
       namespace: 0
     - id: 392
@@ -16778,7 +16778,7 @@ items:
           end: 22507
       members:
         38:
-          Method: 249
+          Method: 255
       file_id: 0
       namespace: 0
     - id: 394
@@ -16791,7 +16791,7 @@ items:
           end: 22645
       members:
         41:
-          Method: 250
+          Method: 256
       file_id: 0
       namespace: 0
     - id: 396
@@ -16804,7 +16804,7 @@ items:
           end: 22782
       members:
         44:
-          Method: 251
+          Method: 257
       file_id: 0
       namespace: 0
     - id: 403
@@ -16817,7 +16817,7 @@ items:
           end: 23148
       members:
         182:
-          AssocType: 3
+          AssocType: 4
       file_id: 0
       namespace: 0
     - id: 405
@@ -16830,7 +16830,7 @@ items:
           end: 23200
       members:
         182:
-          AssocType: 4
+          AssocType: 5
       file_id: 0
       namespace: 0
     - id: 407
@@ -16843,7 +16843,7 @@ items:
           end: 23253
       members:
         182:
-          AssocType: 5
+          AssocType: 6
       file_id: 0
       namespace: 0
     - id: 409
@@ -16856,7 +16856,7 @@ items:
           end: 23306
       members:
         182:
-          AssocType: 6
+          AssocType: 7
       file_id: 0
       namespace: 0
     - id: 411
@@ -16869,7 +16869,7 @@ items:
           end: 23356
       members:
         184:
-          AssocType: 7
+          AssocType: 8
       file_id: 0
       namespace: 0
     - id: 413
@@ -16882,7 +16882,7 @@ items:
           end: 23408
       members:
         184:
-          AssocType: 8
+          AssocType: 9
       file_id: 0
       namespace: 0
     - id: 415
@@ -16895,7 +16895,7 @@ items:
           end: 23461
       members:
         184:
-          AssocType: 9
+          AssocType: 10
       file_id: 0
       namespace: 0
     - id: 417
@@ -16908,10 +16908,82 @@ items:
           end: 23514
       members:
         184:
-          AssocType: 10
+          AssocType: 11
       file_id: 0
       namespace: 0
   constants:
+    - id: 424
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 198
+        span:
+          start: 24873
+          end: 24878
+      ty:
+        inner: 10
+        span:
+          start: 24880
+          end: 24883
+      value: ~
+      const_value: ~
+      accesses: []
+      attributes: []
+    - id: 425
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 199
+        span:
+          start: 25092
+          end: 25100
+      ty:
+        inner: 135
+        span:
+          start: 25102
+          end: 25111
+      value: ~
+      const_value: ~
+      accesses: []
+      attributes: []
+    - id: 426
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 200
+        span:
+          start: 25313
+          end: 25322
+      ty:
+        inner: 136
+        span:
+          start: 25324
+          end: 25334
+      value:
+        kind:
+          Int:
+            value: 65536
+        ty: 136
+        span:
+          start: 25337
+          end: 25342
+      const_value:
+        Int: 65536
+      accesses:
+        - file_id: 0
+          span:
+            start: 25853
+            end: 25862
+      attributes: []
     - id: 461
       file_id: 0
       namespace: 0
@@ -17534,78 +17606,6 @@ items:
       const_value:
         Float: 179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
       accesses: []
-      attributes: []
-    - id: 424
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 198
-        span:
-          start: 24873
-          end: 24878
-      ty:
-        inner: 10
-        span:
-          start: 24880
-          end: 24883
-      value: ~
-      const_value: ~
-      accesses: []
-      attributes: []
-    - id: 425
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 199
-        span:
-          start: 25092
-          end: 25100
-      ty:
-        inner: 135
-        span:
-          start: 25102
-          end: 25111
-      value: ~
-      const_value: ~
-      accesses: []
-      attributes: []
-    - id: 426
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 200
-        span:
-          start: 25313
-          end: 25322
-      ty:
-        inner: 136
-        span:
-          start: 25324
-          end: 25334
-      value:
-        kind:
-          Int:
-            value: 65536
-        ty: 136
-        span:
-          start: 25337
-          end: 25342
-      const_value:
-        Int: 65536
-      accesses:
-        - file_id: 0
-          span:
-            start: 25853
-            end: 25862
       attributes: []
   bodies:
     - stack:
@@ -31983,16 +31983,6 @@ items:
           start: 69
           end: 98
   associated_types:
-    - id: 423
-      file_id: 0
-      namespace: 0
-      name:
-        inner: 59
-        span:
-          start: 24709
-          end: 24713
-      ty: ~
-      attributes: []
     - id: 398
       file_id: 0
       namespace: 0
@@ -32011,6 +32001,26 @@ items:
         span:
           start: 23075
           end: 23083
+      ty: ~
+      attributes: []
+    - id: 423
+      file_id: 0
+      namespace: 0
+      name:
+        inner: 59
+        span:
+          start: 24709
+          end: 24713
+      ty: ~
+      attributes: []
+    - id: 439
+      file_id: 0
+      namespace: 0
+      name:
+        inner: 55
+        span:
+          start: 26546
+          end: 26549
       ty: ~
       attributes: []
     - id: 402
@@ -32124,16 +32134,6 @@ items:
         span:
           start: 23537
           end: 23540
-      attributes: []
-    - id: 439
-      file_id: 0
-      namespace: 0
-      name:
-        inner: 55
-        span:
-          start: 26546
-          end: 26549
-      ty: ~
       attributes: []
   typesets:
     - id: 397
@@ -35092,651 +35092,651 @@ modules:
         : Resolved:
             kind:
               Function:
-                func_index: 0
+                func_index: 12
             visibility: Public
         ? - Value
           - 60
         : Resolved:
             kind:
               Function:
-                func_index: 1
+                func_index: 13
             visibility: Public
         ? - Value
           - 61
         : Resolved:
             kind:
               Function:
-                func_index: 2
+                func_index: 14
             visibility: Public
         ? - Value
           - 64
         : Resolved:
             kind:
               Function:
-                func_index: 3
+                func_index: 15
             visibility: Public
         ? - Value
           - 66
         : Resolved:
             kind:
               Function:
-                func_index: 4
+                func_index: 16
             visibility: Public
         ? - Value
           - 67
         : Resolved:
             kind:
               Function:
-                func_index: 5
+                func_index: 17
             visibility: Public
         ? - Value
           - 68
         : Resolved:
             kind:
               Function:
-                func_index: 6
+                func_index: 18
             visibility: Public
         ? - Value
           - 69
         : Resolved:
             kind:
               Function:
-                func_index: 7
+                func_index: 19
             visibility: Public
         ? - Value
           - 70
         : Resolved:
             kind:
               Function:
-                func_index: 8
+                func_index: 20
             visibility: Public
         ? - Value
           - 71
         : Resolved:
             kind:
               Function:
-                func_index: 9
+                func_index: 21
             visibility: Public
         ? - Value
           - 72
         : Resolved:
             kind:
               Function:
-                func_index: 10
+                func_index: 22
             visibility: Public
         ? - Value
           - 73
         : Resolved:
             kind:
               Function:
-                func_index: 11
+                func_index: 23
             visibility: Public
         ? - Value
           - 74
         : Resolved:
             kind:
               Function:
-                func_index: 12
+                func_index: 24
             visibility: Public
         ? - Value
           - 75
         : Resolved:
             kind:
               Function:
-                func_index: 13
+                func_index: 25
             visibility: Public
         ? - Value
           - 76
         : Resolved:
             kind:
               Function:
-                func_index: 14
+                func_index: 26
             visibility: Public
         ? - Value
           - 77
         : Resolved:
             kind:
               Function:
-                func_index: 15
+                func_index: 27
             visibility: Public
         ? - Value
           - 78
         : Resolved:
             kind:
               Function:
-                func_index: 16
+                func_index: 28
             visibility: Public
         ? - Value
           - 79
         : Resolved:
             kind:
               Function:
-                func_index: 17
+                func_index: 29
             visibility: Public
         ? - Value
           - 80
         : Resolved:
             kind:
               Function:
-                func_index: 18
+                func_index: 30
             visibility: Public
         ? - Value
           - 83
         : Resolved:
             kind:
               Function:
-                func_index: 19
+                func_index: 31
             visibility: Public
         ? - Value
           - 84
         : Resolved:
             kind:
               Function:
-                func_index: 20
+                func_index: 32
             visibility: Public
         ? - Value
           - 85
         : Resolved:
             kind:
               Function:
-                func_index: 21
+                func_index: 33
             visibility: Public
         ? - Value
           - 86
         : Resolved:
             kind:
               Function:
-                func_index: 22
+                func_index: 34
             visibility: Public
         ? - Value
           - 87
         : Resolved:
             kind:
               Function:
-                func_index: 23
+                func_index: 35
             visibility: Public
         ? - Value
           - 88
         : Resolved:
             kind:
               Function:
-                func_index: 24
+                func_index: 36
             visibility: Public
         ? - Value
           - 89
         : Resolved:
             kind:
               Function:
-                func_index: 25
+                func_index: 37
             visibility: Public
         ? - Value
           - 90
         : Resolved:
             kind:
               Function:
-                func_index: 26
+                func_index: 38
             visibility: Public
         ? - Value
           - 91
         : Resolved:
             kind:
               Function:
-                func_index: 27
+                func_index: 39
             visibility: Public
         ? - Value
           - 92
         : Resolved:
             kind:
               Function:
-                func_index: 28
+                func_index: 40
             visibility: Public
         ? - Value
           - 93
         : Resolved:
             kind:
               Function:
-                func_index: 29
+                func_index: 41
             visibility: Public
         ? - Value
           - 94
         : Resolved:
             kind:
               Function:
-                func_index: 30
+                func_index: 42
             visibility: Public
         ? - Value
           - 95
         : Resolved:
             kind:
               Function:
-                func_index: 31
+                func_index: 43
             visibility: Public
         ? - Value
           - 96
         : Resolved:
             kind:
               Function:
-                func_index: 32
+                func_index: 44
             visibility: Public
         ? - Value
           - 97
         : Resolved:
             kind:
               Function:
-                func_index: 33
+                func_index: 45
             visibility: Public
         ? - Value
           - 98
         : Resolved:
             kind:
               Function:
-                func_index: 34
+                func_index: 46
             visibility: Public
         ? - Value
           - 99
         : Resolved:
             kind:
               Function:
-                func_index: 35
+                func_index: 47
             visibility: Public
         ? - Value
           - 100
         : Resolved:
             kind:
               Function:
-                func_index: 36
+                func_index: 48
             visibility: Public
         ? - Value
           - 101
         : Resolved:
             kind:
               Function:
-                func_index: 37
+                func_index: 49
             visibility: Public
         ? - Value
           - 102
         : Resolved:
             kind:
               Function:
-                func_index: 38
+                func_index: 50
             visibility: Public
         ? - Value
           - 103
         : Resolved:
             kind:
               Function:
-                func_index: 39
+                func_index: 51
             visibility: Public
         ? - Value
           - 104
         : Resolved:
             kind:
               Function:
-                func_index: 40
+                func_index: 52
             visibility: Public
         ? - Value
           - 105
         : Resolved:
             kind:
               Function:
-                func_index: 41
+                func_index: 53
             visibility: Public
         ? - Value
           - 106
         : Resolved:
             kind:
               Function:
-                func_index: 42
+                func_index: 54
             visibility: Public
         ? - Value
           - 107
         : Resolved:
             kind:
               Function:
-                func_index: 43
+                func_index: 55
             visibility: Public
         ? - Value
           - 108
         : Resolved:
             kind:
               Function:
-                func_index: 44
+                func_index: 56
             visibility: Public
         ? - Value
           - 109
         : Resolved:
             kind:
               Function:
-                func_index: 45
+                func_index: 57
             visibility: Public
         ? - Value
           - 110
         : Resolved:
             kind:
               Function:
-                func_index: 46
+                func_index: 58
             visibility: Public
         ? - Value
           - 111
         : Resolved:
             kind:
               Function:
-                func_index: 47
+                func_index: 59
             visibility: Public
         ? - Value
           - 112
         : Resolved:
             kind:
               Function:
-                func_index: 48
+                func_index: 60
             visibility: Public
         ? - Value
           - 113
         : Resolved:
             kind:
               Function:
-                func_index: 49
+                func_index: 61
             visibility: Public
         ? - Value
           - 114
         : Resolved:
             kind:
               Function:
-                func_index: 50
+                func_index: 62
             visibility: Public
         ? - Value
           - 115
         : Resolved:
             kind:
               Function:
-                func_index: 51
+                func_index: 63
             visibility: Public
         ? - Value
           - 116
         : Resolved:
             kind:
               Function:
-                func_index: 52
+                func_index: 64
             visibility: Public
         ? - Value
           - 117
         : Resolved:
             kind:
               Function:
-                func_index: 53
+                func_index: 65
             visibility: Public
         ? - Value
           - 118
         : Resolved:
             kind:
               Function:
-                func_index: 54
+                func_index: 66
             visibility: Public
         ? - Value
           - 119
         : Resolved:
             kind:
               Function:
-                func_index: 55
+                func_index: 67
             visibility: Public
         ? - Value
           - 120
         : Resolved:
             kind:
               Function:
-                func_index: 56
+                func_index: 68
             visibility: Public
         ? - Value
           - 121
         : Resolved:
             kind:
               Function:
-                func_index: 57
+                func_index: 69
             visibility: Public
         ? - Value
           - 122
         : Resolved:
             kind:
               Function:
-                func_index: 58
+                func_index: 70
             visibility: Public
         ? - Value
           - 123
         : Resolved:
             kind:
               Function:
-                func_index: 59
+                func_index: 71
             visibility: Public
         ? - Value
           - 124
         : Resolved:
             kind:
               Function:
-                func_index: 60
+                func_index: 72
             visibility: Public
         ? - Value
           - 125
         : Resolved:
             kind:
               Function:
-                func_index: 61
+                func_index: 73
             visibility: Public
         ? - Value
           - 126
         : Resolved:
             kind:
               Function:
-                func_index: 62
+                func_index: 74
             visibility: Public
         ? - Value
           - 127
         : Resolved:
             kind:
               Function:
-                func_index: 63
+                func_index: 75
             visibility: Public
         ? - Value
           - 128
         : Resolved:
             kind:
               Function:
-                func_index: 64
+                func_index: 76
             visibility: Public
         ? - Value
           - 129
         : Resolved:
             kind:
               Function:
-                func_index: 65
+                func_index: 77
             visibility: Public
         ? - Value
           - 130
         : Resolved:
             kind:
               Function:
-                func_index: 66
+                func_index: 78
             visibility: Public
         ? - Value
           - 131
         : Resolved:
             kind:
               Function:
-                func_index: 67
+                func_index: 79
             visibility: Public
         ? - Value
           - 132
         : Resolved:
             kind:
               Function:
-                func_index: 68
+                func_index: 80
             visibility: Public
         ? - Value
           - 133
         : Resolved:
             kind:
               Function:
-                func_index: 69
+                func_index: 81
             visibility: Public
         ? - Value
           - 134
         : Resolved:
             kind:
               Function:
-                func_index: 70
+                func_index: 82
             visibility: Public
         ? - Value
           - 135
         : Resolved:
             kind:
               Function:
-                func_index: 71
+                func_index: 83
             visibility: Public
         ? - Value
           - 136
         : Resolved:
             kind:
               Function:
-                func_index: 72
+                func_index: 84
             visibility: Public
         ? - Value
           - 137
         : Resolved:
             kind:
               Function:
-                func_index: 73
+                func_index: 85
             visibility: Public
         ? - Value
           - 138
         : Resolved:
             kind:
               Function:
-                func_index: 74
+                func_index: 86
             visibility: Public
         ? - Value
           - 139
         : Resolved:
             kind:
               Function:
-                func_index: 75
+                func_index: 87
             visibility: Public
         ? - Value
           - 140
         : Resolved:
             kind:
               Function:
-                func_index: 76
+                func_index: 88
             visibility: Public
         ? - Value
           - 141
         : Resolved:
             kind:
               Function:
-                func_index: 77
+                func_index: 89
             visibility: Public
         ? - Value
           - 142
         : Resolved:
             kind:
               Function:
-                func_index: 78
+                func_index: 90
             visibility: Public
         ? - Value
           - 143
         : Resolved:
             kind:
               Function:
-                func_index: 79
+                func_index: 91
             visibility: Public
         ? - Value
           - 144
         : Resolved:
             kind:
               Function:
-                func_index: 80
+                func_index: 92
             visibility: Public
         ? - Value
           - 145
         : Resolved:
             kind:
               Function:
-                func_index: 81
+                func_index: 93
             visibility: Public
         ? - Value
           - 146
         : Resolved:
             kind:
               Function:
-                func_index: 82
+                func_index: 94
             visibility: Public
         ? - Value
           - 147
         : Resolved:
             kind:
               Function:
-                func_index: 83
+                func_index: 95
             visibility: Public
         ? - Value
           - 148
         : Resolved:
             kind:
               Function:
-                func_index: 84
+                func_index: 96
             visibility: Public
         ? - Value
           - 149
         : Resolved:
             kind:
               Function:
-                func_index: 85
+                func_index: 97
             visibility: Public
         ? - Value
           - 185
         : Resolved:
             kind:
               Function:
-                func_index: 86
+                func_index: 98
             visibility: Public
         ? - Value
           - 188
         : Resolved:
             kind:
               Function:
-                func_index: 87
+                func_index: 99
             visibility: Public
         ? - Value
           - 189
         : Resolved:
             kind:
               Function:
-                func_index: 88
+                func_index: 100
             visibility: Public
         ? - Value
           - 192
         : Resolved:
             kind:
               Function:
-                func_index: 89
+                func_index: 101
             visibility: Public
         ? - Value
           - 204
         : Resolved:
             kind:
               Function:
-                func_index: 90
+                func_index: 105
             visibility: Public
         ? - Value
           - 205
         : Resolved:
             kind:
               Function:
-                func_index: 91
+                func_index: 106
             visibility: Public
         ? - Value
           - 231
         : Resolved:
             kind:
               Const:
-                const_index: 0
+                const_index: 3
             visibility: Private
       wildcard_imports: []
       accesses: []
@@ -35771,7 +35771,7 @@ modules:
         : Resolved:
             kind:
               Function:
-                func_index: 92
+                func_index: 110
             visibility: Private
       wildcard_imports: []
       accesses: []

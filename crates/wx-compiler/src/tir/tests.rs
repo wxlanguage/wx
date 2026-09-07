@@ -7720,7 +7720,6 @@ fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
 }
 
 #[test]
-#[ignore = "mutual assoc-type-value reference reports a misleading cascade instead of CyclicTypeDependency — see comment above"]
 fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependency()
  {
 	// `impl Container for A { type Elem = B::Elem; }` next to
@@ -7731,42 +7730,21 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
 	// correctly for `const A: i32 = A;` via `ensure_signature`'s
 	// `ComputeState::InProgress` guard + `report_cyclic_type_dependency`.
 	//
-	// That machinery isn't wired up for this path, though:
-	// `resolve_namespace_type_member`'s catch-all arm (paths.rs, reached
-	// because `B`/`A` are concrete struct types) reads
-	// `self.items.associated_types[idx].ty.unwrap()` straight off the
-	// found `AssociatedType`, without first calling `ensure_signature` on
-	// *that specific assoc-type-impl's own* `DefId` the way
-	// `resolve_bounds`'s `WithBindings` arm (generics.rs) and every
-	// "parent before member" call in traits.rs already do before reading
-	// something another item owns. So instead of catching the cycle via
-	// `ComputeState::InProgress`, whichever impl is processed first (parse
-	// order: `A` here) just finds the other's `Elem` isn't in `members` yet
-	// — not because of a cycle, but because `B`'s own `Elem` member hasn't
-	// been registered at all yet — and reports a plain "not found" instead.
-	// That result (`TypeIndex::ERROR`) then flows into `B`'s `Elem`, which
-	// resolves "successfully" against it, and the whole thing cascades into
-	// two more confusing `TraitBoundViolation`s on top, none of which say
-	// anything about a cycle.
+	// Now caught: `signature_trait_impl_assoc_type` reserves the member's
+	// arena slot (and its `item_lookup` / `ItemIndex::AssocType` entry)
+	// *before* resolving its `ty`, so a re-entrant lookup during that
+	// resolve (`trait_member_via_impl` -> `ensure_signature` -> `Cycle`)
+	// reports E1032 via `report_cyclic_type_dependency`. The slot is not
+	// published into the impl's `members` map until `ty` is filled, so the
+	// cycle is still observed rather than a `ty: None` placeholder being
+	// handed back. `AssociatedType::parent` lets the chain name each frame
+	// by its owner (`A::Elem`, not a bare `Elem`), and — since no aggregate
+	// is in the loop — the "insert indirection" note is correctly omitted.
 	//
-	// Fix sketch: in `resolve_namespace_type_member`'s
-	// `MemberLookup::Trait`/`MemberLookup::Inherent` arms for
-	// `ImplEntry::AssocType(idx)`, call
-	// `self.ensure_signature(self.items.associated_types[idx].id)` first,
-	// and report via `report_cyclic_type_dependency` on `SignatureStatus::
-	// Cycle` — mirroring `resolve_pending_global_symbol`/
-	// `resolve_pending_namespace_symbol` (modules.rs). Each `AssociatedType`
-	// already carries its own registered `id`/`ast_nodes` entry
-	// (`AstNodeRef::TraitImplAssocType`, prescan.rs), so `ensure_signature`
-	// dispatches correctly — it's just never called on this path.
-	//
-	// One more thing the fix needs: `push_associated_type` (tir/mod.rs)
-	// never inserts its `id` into `item_lookup`, unlike every other
-	// `push_*` — so `item_name()`, which `report_cyclic_type_dependency`
-	// uses to label each frame in the "the cycle is `X` -> `Y`" note, has
-	// no case for an associated type and would silently skip that frame.
-	// Needs an `ItemIndex::AssocType` variant added the same way
-	// `push_typeset` registers `ItemIndex::TypeSet` right below it.
+	// One cosmetic edge remains: the errored `Elem` still feeds the
+	// `type Elem: Bound` conformance check, so two follow-on `E1063`
+	// ("`{unknown}: Bound`") land after the E1032 — secondary noise, not a
+	// missing-cycle report.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         impl Bound for u32 {}
@@ -7782,15 +7760,39 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
             type Elem = A::Elem;
         }
     "});
+	let cycle = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"expected a CyclicTypeDependency diagnostic for the A::Elem <-> B::Elem cycle, got: {:?}",
+				case.tir
+					.diagnostics
+					.iter()
+					.map(|d| &d.message)
+					.collect::<Vec<_>>(),
+			)
+		});
+	// The chain names each frame by its owning type, not a bare `Elem`.
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::CyclicTypeDependency),
-		"expected a CyclicTypeDependency diagnostic for the A::Elem <-> \
-		 B::Elem cycle, got: {:?}",
-		case.tir
-			.diagnostics
+		cycle
+			.notes
 			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>(),
+			.any(|n| n.contains("`A::Elem` -> `B::Elem` -> `A::Elem`")),
+		"cycle note should spell out the owner-qualified chain, got: {:?}",
+		cycle.notes,
+	);
+	// A pointer can't break an associated-type-value cycle, so the
+	// aggregate-only "insert indirection" note must not appear.
+	assert!(
+		!cycle.notes.iter().any(|n| n.contains("indirection")),
+		"an assoc-type value cycle should not suggest indirection, got: {:?}",
+		cycle.notes,
 	);
 }
 
@@ -14175,35 +14177,35 @@ fn test_display_bounds_includes_where_clause_assoc_type_bound() {
 	// messages and LSP hover) used to only look at `TraitBound.bindings`'
 	// `Equals` entries when deciding whether to print a `where { }` clause
 	// at all — a bound with *only* a `where { Size: Unsigned }` entry (no
-	// `=` binding) printed as bare `Memory`, silently dropping the
+	// `=` binding) printed as bare `Store`, silently dropping the
 	// constraint from what the user sees on hover.
+	//
+	// The subject is `#[tag]`ged rather than looked up by name: the stdlib
+	// declares its own trait methods (`Memory::grow` and friends), so a
+	// bare name match here is order-dependent.
 	let case = TestCase::new(indoc! {"
         trait Unsigned {}
-        trait Memory { type Size; }
-        fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem, delta: Mem::Size) -> Mem::Size {
+        trait Store { type Size; }
+        #[tag = \"subject\"]
+        fn grow<S: Store where { Size: Unsigned }>(store: S, delta: S::Size) -> S::Size {
             unreachable
         }
     "});
-	let func = case
+	let def_id = *case
 		.tir
 		.items
-		.functions
-		.iter()
-		.find(|f| {
-			case.graph
-				.interner
-				.resolve(f.name.inner)
-				.map(|n| n == "grow")
-				.unwrap_or(false)
-		})
+		.tagged_items
+		.get(&case.graph.interner.get("subject").unwrap())
 		.unwrap();
+	let func = &case.tir.items.functions
+		[usize::from(case.tir.items.function_index(def_id).unwrap())];
 	let fmt = case.tir.formatter(
 		&case.graph.interner,
 		&case.graph.packages,
 		case.graph.root_package,
 	);
 	let s = fmt.display_bounds(&func.type_params[0].bounds).unwrap();
-	assert_eq!(s, "Memory where { Size: Unsigned }");
+	assert_eq!(s, "Store where { Size: Unsigned }");
 }
 
 #[test]

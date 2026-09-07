@@ -1139,12 +1139,11 @@ impl<'ast> Builder<'ast, '_> {
 				base: base_ty.inner,
 			});
 
-			// Fetched fresh here (rather than upfront) so this stays a
+			// Checked fresh here (rather than upfront) so this stays a
 			// borrow of `self.items` alone, not an owned clone kept alive
-			// across the `ensure_signature`/`intern` calls above —
-			// this is the only place it's used.
+			// across the `ensure_signature`/`intern` calls above.
 			let bound_satisfied =
-				self.bound_traits(base_ty.inner).contains(&required_trait);
+				self.bound_traits_contains(base_ty.inner, required_trait);
 			if !bound_satisfied {
 				let type_name = self
 					.formatter(resolve_context.namespace)

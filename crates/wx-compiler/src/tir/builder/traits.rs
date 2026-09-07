@@ -1696,12 +1696,16 @@ impl<'ast> Builder<'ast, '_> {
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
-			let self_scope = GenericScope {
-				owner: TypeParamOwner::TraitImpl(trait_impl_index),
-				self_type: Some(self_type),
-			};
-			let concrete_ty =
-				self.resolve_type(resolve_context, Some(self_scope), ty);
+			// Reserve the arena slot (and its `item_lookup` entry) before
+			// resolving `ty`: a mutually-referential definition
+			// (`impl C for A { type X = B::X }` next to
+			// `impl C for B { type X = A::X }`) re-enters this member's own
+			// `ensure_signature` while `ty` resolves, and
+			// `report_cyclic_type_dependency` needs the `DefId` to be
+			// nameable. The entry is *not* published into the impl's
+			// `members` map until `ty` is filled, so `trait_member_via_impl`
+			// still observes the cycle and reports it rather than handing
+			// back a `ty: None` placeholder.
 			let assoc_type_index =
 				self.items.push_associated_type(AssociatedType {
 					bounds: Bounds::default(),
@@ -1710,11 +1714,20 @@ impl<'ast> Builder<'ast, '_> {
 					file_id: resolve_context.file_id,
 					namespace: resolve_context.namespace,
 					name: *name,
-					ty: Some(Spanned {
-						inner: concrete_ty,
-						span: ty.span,
-					}),
+					parent: Some(ItemParent::TraitImpl(trait_impl_index)),
+					ty: None,
 					attributes,
+				});
+			let self_scope = GenericScope {
+				owner: TypeParamOwner::TraitImpl(trait_impl_index),
+				self_type: Some(self_type),
+			};
+			let concrete_ty =
+				self.resolve_type(resolve_context, Some(self_scope), ty);
+			self.items.associated_types[usize::from(assoc_type_index)].ty =
+				Some(Spanned {
+					inner: concrete_ty,
+					span: ty.span,
 				});
 			let entry = ImplEntry::AssocType(assoc_type_index);
 			self.register_trait_impl_member(
