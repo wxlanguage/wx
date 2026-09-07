@@ -1692,6 +1692,15 @@ pub enum MemberKind {
 	AssocType,
 }
 
+impl MemberKind {
+	pub fn namespace(self) -> SymbolNamespace {
+		match self {
+			Self::AssocType => SymbolNamespace::Type,
+			Self::Function | Self::Const => SymbolNamespace::Value,
+		}
+	}
+}
+
 /// A member an `impl` block declares, recorded when the block's own header is
 /// resolved rather than when the member is.
 ///
@@ -1706,6 +1715,11 @@ pub enum MemberKind {
 pub struct MemberDecl {
 	pub kind: MemberKind,
 	pub id: ast::DefId,
+	/// The name as written, in the declaring block's own `file_id`. Duplicate
+	/// definitions are reported from the declarations rather than from
+	/// resolved members, so the loser's diagnostic must be able to point at
+	/// the winner without either one having resolved.
+	pub span: TextSpan,
 }
 
 /// Backing storage for `ImplEntry::AssocType`. One entry per associated-type

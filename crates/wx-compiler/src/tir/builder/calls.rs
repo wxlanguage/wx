@@ -1228,6 +1228,7 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(target) => target,
 					Err(_) => return MemberLookup::NotFound,
 				};
+				self.ensure_inherent_impl_members(target, member_symbol);
 				if let Some(result) = self.resolve_inherent_member(
 					target,
 					target_type,
@@ -1387,6 +1388,42 @@ impl<'ast> Builder<'ast, '_> {
 			// A cycle means this member is itself what asked, directly or
 			// otherwise — it is already resolving, so there is nothing to wait
 			// for.
+			let _ = self.ensure_signature(def_id);
+		}
+	}
+
+	/// The inherent half of [`Self::ensure_trait_impl_members`]. The bucket is
+	/// keyed by name as well as by target, so it is already the exact set of
+	/// blocks that declare `member_symbol` for this type constructor — the
+	/// candidates are found the same way either resolved or not, and only the
+	/// forcing differs.
+	fn ensure_inherent_impl_members(
+		&mut self,
+		target: ImplTarget,
+		member_symbol: SymbolU32,
+	) {
+		let unresolved: Vec<ast::DefId> = self
+			.items
+			.inherent_impl_dispatch
+			.get(&(target, member_symbol))
+			.map(|bucket| {
+				bucket
+					.iter()
+					.filter_map(|&block_index| {
+						let block = &self.items.inherent_impls
+							[usize::from(block_index)];
+						if block.members.contains_key(&member_symbol) {
+							return None;
+						}
+						block
+							.member_decls
+							.get(&member_symbol)
+							.map(|decl| decl.id)
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		for def_id in unresolved {
 			let _ = self.ensure_signature(def_id);
 		}
 	}

@@ -5,6 +5,7 @@ use indoc::indoc;
 
 use super::*;
 use crate::diagnostics::DiagnosticCode;
+use crate::testing::DiagnosticView;
 use crate::tir::builder::{
 	CharLiteralError, parse_char_literal, unescape_string,
 };
@@ -110,6 +111,10 @@ impl TestCase {
 		let mut graph = builder.build(root_id);
 		let tir = TIR::build(&mut graph);
 		TestCase { graph, tir }
+	}
+
+	fn diagnostics(&self) -> DiagnosticView<'_> {
+		DiagnosticView::new("check", &self.tir.diagnostics, &self.graph.files)
 	}
 }
 
@@ -13598,6 +13603,44 @@ fn test_trait_impl_assoc_type_resolves_from_another_module() {
 			"impl crate::Tr for crate::S { type X = i32; }",
 		)],
 	);
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_two_inherent_blocks_claiming_one_name_report_both_sites() {
+	// Unlike two members of a *single* block, where the first declaration wins
+	// the name outright, both blocks stay candidates — the same shape as
+	// rustc, which reports the collision on the impls and E0034 again at each
+	// use. Dropping the second would silence the call site in favour of one
+	// diagnostic pointing at neither of them.
+	let case = TestCase::new(indoc! {"
+        struct S { a: i32 }
+        impl S { pub fn get(self) -> i32 { self.a } }
+        impl S { pub fn get(self) -> bool { true } }
+        fn f(s: S) -> i32 { s.get() }
+        export { f }
+    "});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::DuplicateDefinition,
+		DiagnosticCode::DuplicateDefinition,
+	]);
+}
+
+#[test]
+fn test_inherent_impl_const_resolves_when_impl_is_declared_later() {
+	// The inherent half of
+	// `test_trait_impl_assoc_type_resolves_when_impl_is_declared_later`, and
+	// the reason `inherent_impl_dispatch` is filled from the block's *header*:
+	// filled per resolved member instead, the bucket `S::N` looks in is still
+	// empty here and the program fails with E1007 — but compiles with the
+	// `impl` moved above the `const`.
+	let case = TestCase::new(indoc! {"
+        struct S { a: i32 }
+        const A: u32 = S::N;
+        impl S { const N: u32 = 4; }
+        fn f() -> u32 { A }
+        export { f }
+    "});
 	assert_no_errors(&case);
 }
 

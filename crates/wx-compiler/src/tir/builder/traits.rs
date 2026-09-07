@@ -429,10 +429,9 @@ impl<'ast> Builder<'ast, '_> {
 					attributes,
 				});
 				self.register_inherent_impl_member(
-					resolve_context,
 					block_index,
-					self_type,
-					*name,
+					*id,
+					name.inner,
 					ImplEntry::AssocConstant(const_index),
 				);
 			}
@@ -534,79 +533,108 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		self.register_inherent_impl_member(
-			resolve_context,
 			block_index,
-			self_type,
-			signature.name,
+			*id,
+			signature.name.inner,
 			entry,
 		);
 	}
 
-	/// Registers `entry` under `name`, unless the block already has a member
-	/// of that name — the first declaration wins and every later one is
-	/// reported, matching [`Self::register_trait_impl_member`].
-	///
-	/// The duplicate is dropped from the dispatch bucket too, not just from
-	/// `members`: a second entry there would make the block a candidate twice
-	/// over for a name it only answers to once.
-	///
-	/// A collision with a *different* block counts too, when the two can ever
-	/// apply to the same receiver — see [`Self::conflicting_inherent_block`].
-	/// `resolve_impl_member` arbitrates between candidates as well, but only
-	/// per call site and only where there is one, so a conflict nobody
-	/// happens to call would otherwise ship unreported.
+	/// Registers `entry` under `name`, if this declaration is the one that
+	/// still holds it: `member_decls` is what a block answers to, and
+	/// [`Self::register_inherent_impl_decls`] has already settled and reported
+	/// every name two declarations wanted.
 	fn register_inherent_impl_member(
 		&mut self,
-		resolve_context: ResolveContext,
 		block_index: InherentImplIndex,
-		self_type: TypeIndex,
-		name: ast::Spanned<SymbolU32>,
+		id: ast::DefId,
+		name: SymbolU32,
 		entry: ImplEntry,
 	) {
-		let target = ImplTarget::from_type(self.types.resolve(self_type)).ok();
-		// The block's own members answer first, and separately from the
-		// bucket below: a block whose target failed to resolve has no
-		// `ImplTarget`, so it never reaches a bucket at all, but its own
-		// members can still collide with each other.
-		let existing = self.items.inherent_impls[usize::from(block_index)]
-			.members
-			.get(&name.inner)
-			.copied();
-		let existing = existing.or_else(|| {
-			let other = self.conflicting_inherent_block(
-				target?,
+		let block = &mut self.items.inherent_impls[usize::from(block_index)];
+		if block
+			.member_decls
+			.get(&name)
+			.is_some_and(|decl| decl.id == id)
+		{
+			block.members.insert(name, entry);
+		}
+	}
+
+	/// Enters the block's declared names into `inherent_impl_dispatch`, and
+	/// reports each one that another block already claimed for a receiver this
+	/// one would also claim — see [`Self::conflicting_inherent_block`].
+	///
+	/// This runs with the header, from `member_decls` alone, because the
+	/// bucket *is* the candidate set: a lookup that finds no bucket entry
+	/// concludes the type has no such member, so a block missing from it until
+	/// its members happen to resolve makes `S::N` an error or not depending on
+	/// where the `impl` was written. Nothing here needs a resolved member —
+	/// which block claims which name is settled by syntax, and only the target
+	/// type has to be resolved first, to key the bucket by.
+	///
+	/// `resolve_impl_member` arbitrates between candidates as well, and still
+	/// does — both blocks stay in the bucket — but only per call site and only
+	/// where there is one, so a conflict nobody happens to call would
+	/// otherwise ship unreported.
+	fn register_inherent_impl_decls(
+		&mut self,
+		block_index: InherentImplIndex,
+		self_type: TypeIndex,
+		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+	) {
+		// A block whose target failed to resolve has no `ImplTarget`, so it
+		// never reaches a bucket at all — and can conflict with nothing, since
+		// there is no receiver it is known to claim.
+		let Ok(target) = ImplTarget::from_type(self.types.resolve(self_type))
+		else {
+			return;
+		};
+		let file_id =
+			self.items.inherent_impls[usize::from(block_index)].file_id;
+		// Source order, rather than `member_decls`' iteration order, so the
+		// diagnostics below come out the same way twice.
+		for item in items.iter() {
+			let name = match &item.inner.inner {
+				ast::ImplItem::Function { signature, .. } => signature.name,
+				ast::ImplItem::Constant { name, .. }
+				| ast::ImplItem::AssocType { name, .. } => *name,
+			};
+			let block = &self.items.inherent_impls[usize::from(block_index)];
+			// A name this block declares twice is already reported, and is in
+			// the bucket once under the winning declaration.
+			if block
+				.member_decls
+				.get(&name.inner)
+				.is_none_or(|decl| decl.span != name.span)
+			{
+				continue;
+			}
+			if let Some(other) = self.conflicting_inherent_block(
+				target,
 				block_index,
 				self_type,
 				name.inner,
-			)?;
-			self.items.inherent_impls[usize::from(other)]
-				.members
-				.get(&name.inner)
-				.copied()
-		});
-		if let Some(existing) = existing {
-			let namespace = match existing {
-				ImplEntry::AssocType(_) => SymbolNamespace::Type,
-				_ => SymbolNamespace::Value,
-			};
-			self.diagnostics.push(report_duplicate_definition(
-				DuplicateDefinitionDiagnostic {
-					name: self.interner.resolve(name.inner).unwrap(),
-					namespace,
-					first_definition: existing.def_span(&self.items),
-					second_definition: SourceSpan::new(
-						resolve_context.file_id,
-						name.span,
-					),
-				},
-			));
-			return;
-		}
-
-		self.items.inherent_impls[usize::from(block_index)]
-			.members
-			.insert(name.inner, entry);
-		if let Some(target) = target {
+			) {
+				let other_block =
+					&self.items.inherent_impls[usize::from(other)];
+				let existing = other_block.member_decls[&name.inner];
+				self.diagnostics.push(report_duplicate_definition(
+					DuplicateDefinitionDiagnostic {
+						name: self.interner.resolve(name.inner).unwrap(),
+						namespace: existing.kind.namespace(),
+						first_definition: SourceSpan::new(
+							other_block.file_id,
+							existing.span,
+						),
+						second_definition: SourceSpan::new(file_id, name.span),
+					},
+				));
+			}
+			// Both blocks stay candidates even so, the way rustc keeps both
+			// inherent impls and reports E0034 at each use: the declaration is
+			// a real one, and dropping it would silence every call site in
+			// favour of one diagnostic pointing at neither of them.
 			self.items
 				.inherent_impl_dispatch
 				.entry((target, name.inner))
@@ -686,7 +714,7 @@ impl<'ast> Builder<'ast, '_> {
 		// What this block declares, by name, before any member resolves —
 		// see `MemberDecl`.
 		self.items.inherent_impls[usize::from(block_index)].member_decls =
-			Self::collect_member_decls(items);
+			self.collect_member_decls(resolve_context, items);
 
 		self.resolve_type_param_bounds(
 			resolve_context,
@@ -734,6 +762,7 @@ impl<'ast> Builder<'ast, '_> {
 		self.items.inherent_impls[usize::from(block_index)]
 			.target
 			.inner = target;
+		self.register_inherent_impl_decls(block_index, target, items);
 	}
 
 	/// The package that defines the type an inherent `impl` targets.
@@ -1253,6 +1282,8 @@ impl<'ast> Builder<'ast, '_> {
 			Err(()) => return,
 		};
 
+		let member_decls = self.collect_member_decls(resolve_context, items);
+
 		// Push a placeholder first (target unresolved), same reason
 		// as `ImplBlock`/`InherentImplBlock`: resolving the target
 		// type expression below needs `TypeParamOwner::TraitImpl(
@@ -1271,7 +1302,7 @@ impl<'ast> Builder<'ast, '_> {
 			},
 			namespace: resolve_context.namespace,
 			members: HashMap::new(),
-			member_decls: Self::collect_member_decls(items),
+			member_decls,
 			span: trait_name_span,
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),
@@ -1310,80 +1341,84 @@ impl<'ast> Builder<'ast, '_> {
 	/// Runs with the block's own header, before any member's signature: an
 	/// impl is reached by type rather than by name, so a lookup that lands on
 	/// one cannot ask for a member that has not been resolved yet — it asks
-	/// this instead, and forces the single member it needs. Duplicates keep
-	/// the first declaration, matching `register_trait_impl_member`, which
-	/// still reports them once the members themselves resolve.
+	/// this instead, and forces the single member it needs.
+	///
+	/// Two members of one block sharing a name is decided here too, and only
+	/// here: the first declaration wins and every later one is reported. Once
+	/// a lookup can force an arbitrary member out of order, "first" is no
+	/// longer whichever happened to resolve first, so the resolved `members`
+	/// map cannot be what answers this — declaration order is a property of
+	/// the source, and this is the one place that still sees it.
 	fn collect_member_decls(
+		&mut self,
+		resolve_context: ResolveContext,
 		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
 	) -> HashMap<SymbolU32, MemberDecl> {
-		let mut decls = HashMap::with_capacity(items.len());
+		let mut decls: HashMap<SymbolU32, MemberDecl> =
+			HashMap::with_capacity(items.len());
 		for item in items.iter() {
-			let (name, decl) = match &item.inner.inner {
-				ast::ImplItem::Function { id, signature, .. } => (
-					signature.name.inner,
-					MemberDecl {
-						kind: MemberKind::Function,
-						id: *id,
-					},
-				),
-				ast::ImplItem::Constant { id, name, .. } => (
-					name.inner,
-					MemberDecl {
-						kind: MemberKind::Const,
-						id: *id,
-					},
-				),
-				ast::ImplItem::AssocType { id, name, .. } => (
-					name.inner,
-					MemberDecl {
-						kind: MemberKind::AssocType,
-						id: *id,
-					},
-				),
+			let (name, kind, id) = match &item.inner.inner {
+				ast::ImplItem::Function { id, signature, .. } => {
+					(signature.name, MemberKind::Function, *id)
+				}
+				ast::ImplItem::Constant { id, name, .. } => {
+					(*name, MemberKind::Const, *id)
+				}
+				ast::ImplItem::AssocType { id, name, .. } => {
+					(*name, MemberKind::AssocType, *id)
+				}
 			};
-			decls.entry(name).or_insert(decl);
+			if let Some(existing) = decls.get(&name.inner) {
+				self.diagnostics.push(report_duplicate_definition(
+					DuplicateDefinitionDiagnostic {
+						name: self.interner.resolve(name.inner).unwrap(),
+						namespace: existing.kind.namespace(),
+						first_definition: SourceSpan::new(
+							resolve_context.file_id,
+							existing.span,
+						),
+						second_definition: SourceSpan::new(
+							resolve_context.file_id,
+							name.span,
+						),
+					},
+				));
+				continue;
+			}
+			decls.insert(
+				name.inner,
+				MemberDecl {
+					kind,
+					id,
+					span: name.span,
+				},
+			);
 		}
 		decls
 	}
 
-	/// Registers `entry` under `name`, unless the impl already has a member of
-	/// that name — the first declaration wins and every later one is reported,
-	/// rather than the last quietly taking the name over. Which one survives
-	/// is deliberately not decided by what the trait declares: an item of the
-	/// wrong kind no longer masks anything, since `check_trait_conformance`
-	/// compares kinds rather than just names.
+	/// Registers `entry` under `name`, unless another member of this block
+	/// already claimed that name — `collect_member_decls` decided and reported
+	/// that when the header ran, so this only has to honour the outcome.
+	/// Which one survives is deliberately not decided by what the trait
+	/// declares: an item of the wrong kind no longer masks anything, since
+	/// `check_trait_conformance` compares kinds rather than just names.
 	fn register_trait_impl_member(
 		&mut self,
-		resolve_context: ResolveContext,
 		trait_impl_index: TraitImplIndex,
-		name: ast::Spanned<SymbolU32>,
+		id: ast::DefId,
+		name: SymbolU32,
 		entry: ImplEntry,
 	) {
-		let existing = self.items.trait_impls[usize::from(trait_impl_index)]
-			.members
-			.get(&name.inner)
-			.copied();
-		if let Some(existing) = existing {
-			let namespace = match existing {
-				ImplEntry::AssocType(_) => SymbolNamespace::Type,
-				_ => SymbolNamespace::Value,
-			};
-			self.diagnostics.push(report_duplicate_definition(
-				DuplicateDefinitionDiagnostic {
-					name: self.interner.resolve(name.inner).unwrap(),
-					namespace,
-					first_definition: existing.def_span(&self.items),
-					second_definition: SourceSpan::new(
-						resolve_context.file_id,
-						name.span,
-					),
-				},
-			));
+		let block = &mut self.items.trait_impls[usize::from(trait_impl_index)];
+		if block
+			.member_decls
+			.get(&name)
+			.is_some_and(|decl| decl.id != id)
+		{
 			return;
 		}
-		self.items.trait_impls[usize::from(trait_impl_index)]
-			.members
-			.insert(name.inner, entry);
+		block.members.insert(name, entry);
 	}
 
 	pub(super) fn signature_trait_impl_function(
@@ -1480,9 +1515,9 @@ impl<'ast> Builder<'ast, '_> {
 				ImplEntry::AssocFunction(func_index)
 			};
 			self.register_trait_impl_member(
-				resolve_context,
 				trait_impl_index,
-				signature.name,
+				*id,
+				signature.name.inner,
 				entry,
 			);
 		}
@@ -1561,9 +1596,9 @@ impl<'ast> Builder<'ast, '_> {
 				});
 				let entry = ImplEntry::AssocConstant(const_index);
 				self.register_trait_impl_member(
-					resolve_context,
 					trait_impl_index,
-					*name,
+					*id,
+					name.inner,
 					entry,
 				);
 			}
@@ -1723,9 +1758,9 @@ impl<'ast> Builder<'ast, '_> {
 				});
 			let entry = ImplEntry::AssocType(assoc_type_index);
 			self.register_trait_impl_member(
-				resolve_context,
 				trait_impl_index,
-				*name,
+				*id,
+				name.inner,
 				entry,
 			);
 			if let Some(at) = self.items.traits[usize::from(trait_index)]
