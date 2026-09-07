@@ -6068,9 +6068,7 @@ fn test_supertrait_resolved() {
 
 	assert_eq!(
 		case.tir.items.traits[usize::from(drawable_idx)]
-			.bounds
-			.traits
-			.iter()
+			.supertraits(drawable_idx)
 			.map(|trait_bound| trait_bound.trait_index)
 			.collect::<Vec<_>>(),
 		vec![sized_idx],
@@ -6109,6 +6107,103 @@ fn test_supertrait_missing_impl_errors() {
 			.diagnostics
 			.iter()
 			.map(|d| (d.code.as_deref(), &d.message))
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_supertrait_method_callable_in_default_body() {
+	// `Self` carries its trait's supertraits as bounds, so a default body can
+	// reach an inherited method — the thing that made supertraits unusable.
+	let case = TestCase::new(indoc! {"
+        trait A { fn a(self) -> i32 { 1 } }
+        trait B: A { fn b(self) -> i32 { self.a() } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_assoc_const_callable_in_default_body() {
+	let case = TestCase::new(indoc! {"
+        trait A { const X: i32; }
+        trait B: A { fn b(self) -> i32 { Self::X } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_assoc_type_usable_in_member_signature() {
+	// Resolved during Phase 2, and prescan registers a trait's members before
+	// the trait itself — so this only works because a member resolves its
+	// parent's supertrait clause (`ensure_trait_supertraits`) first.
+	let case = TestCase::new(indoc! {"
+        trait A { type X; }
+        trait B: A { fn g(self, v: Self::X) { } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_declared_after_its_subtrait() {
+	// Parse order must not matter: `B: A` is resolved before `A` is reached.
+	let case = TestCase::new(indoc! {"
+        trait B: A { fn b(self) -> i32 { self.a() } }
+        trait A { fn a(self) -> i32 { 1 } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_subtrait_method_call_on_generic_param() {
+	// The trait's `Self` param is checked against the call's type arguments
+	// like any other, so `T: B` has to satisfy `B`'s own supertrait `A`
+	// through `trait_implies` rather than by being declared `T: B + A`.
+	let case = TestCase::new(indoc! {"
+        trait A { }
+        trait B: A { fn b(self) -> i32 { 1 } }
+        fn f<T: B>(x: T) -> i32 { x.b() }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_cycle_terminates() {
+	// `trait A: B {} trait B: A {}` is still accepted (no cycle diagnostic
+	// yet), so every walk over the supertrait graph must be visited-guarded
+	// rather than assume a DAG. This test is here to hang or blow the stack
+	// if one ever isn't.
+	let case = TestCase::new(indoc! {"
+        trait A: B { }
+        trait B: A { }
+        fn requires_a<T: A>(x: T) { }
+        fn call<T: B>(x: T) { requires_a(x); }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_unrelated_trait_bound_still_rejected() {
+	// The transitive walk must not turn every bound into a match.
+	let case = TestCase::new(indoc! {"
+        trait A { }
+        trait B { }
+        fn requires_a<T: A>(x: T) { }
+        fn call_with_b<T: B>(x: T) { requires_a(x); }
+        export {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected E1063 for an unrelated bound, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
 			.collect::<Vec<_>>()
 	);
 }
@@ -11728,24 +11823,15 @@ fn test_used_label_reports_no_unused_label_diagnostic() {
 // still-abstract type param into another bounded generic call, as in both
 // tests below.
 //
-// To fix this, `TIR::type_implements_trait`'s abstract branch would need to
-// walk supertraits of a TypeParam's declared bounds, transitively. That
-// requires supertrait-cycle detection first — `trait A: B {} trait B: A {}`
-// is not currently rejected anywhere (`resolve_identifier_as_bound`,
-// builder.rs, resolves a supertrait purely to its `TraitIndex` without
-// forcing the supertrait's own signature to resolve first, so no existing
-// re-entrancy guard — e.g. `ensure_signature`'s `sig_state` — ever sees this
-// case) — an unbounded transitive walk over user-controlled trait
-// declarations could recurse forever. The likely fix: make supertrait
-// resolution (in the `AstNodeRef::Trait` arm of `ensure_signature`,
-// builder.rs) force-resolve each supertrait's own signature first (e.g. via
-// `ensure_signature` on the supertrait's `DefId`), so `sig_state`'s existing
-// `ComputeState::InProgress` re-entrancy check naturally detects the cycle —
-// matching rustc's E0391 — and report a dedicated diagnostic there, rather
-// than adding an ad hoc cycle guard inside the trait-bound-checking walk
-// itself.
+// Both are handled now: `TIR::type_implements_trait`'s abstract branch asks
+// `trait_implies`, which walks the declared bound's supertraits transitively.
+// The walk carries a visited set rather than relying on the graph being
+// acyclic, because `trait A: B {} trait B: A {}` is still accepted silently —
+// nothing forces a supertrait's own signature, so no re-entrancy guard ever
+// sees it. A dedicated cycle diagnostic belongs in
+// `Builder::ensure_trait_supertraits`, which is the one place that walks the
+// clause and already has the `sig_stack` chain to name the loop with.
 #[test]
-#[ignore = "supertrait transitivity through an abstract type param isn't implemented yet — see comment above"]
 fn test_supertrait_single_level_satisfies_bound() {
 	// T: B where B: A — passing T to a fn requiring A should type-check.
 	let case = TestCase::new(indoc! {"
@@ -11759,7 +11845,6 @@ fn test_supertrait_single_level_satisfies_bound() {
 }
 
 #[test]
-#[ignore = "supertrait transitivity through an abstract type param isn't implemented yet — see comment above"]
 fn test_supertrait_two_levels_deep_satisfies_bound() {
 	// T: C where C: B and B: A — passing T to a fn requiring A should type-check.
 	let case = TestCase::new(indoc! {"
@@ -12142,9 +12227,7 @@ fn test_multiple_supertraits_both_resolved() {
 	);
 
 	let supertraits = &case.tir.items.traits[widget_idx]
-		.bounds
-		.traits
-		.iter()
+		.supertraits(TraitIndex::new(widget_idx as u32))
 		.map(|bound| bound.trait_index)
 		.collect::<Vec<_>>();
 	assert_eq!(supertraits.len(), 2, "Widget should have two supertraits");

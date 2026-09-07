@@ -262,7 +262,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 
-			for supertrait in trait_def.bounds.traits.iter() {
+			for supertrait in trait_def.supertraits(trait_impl.trait_index) {
 				if self
 					.items
 					.find_trait_impl(
@@ -813,20 +813,119 @@ impl<'ast> Builder<'ast, '_> {
 		);
 	}
 
+	/// Resolves `trait Sub: Super + Other { .. }`'s supertrait clause into
+	/// `Sub`'s own `Self` bounds — the sole writer of that field, reflexive
+	/// `Self: Sub` entry included. Everything that asks what a type parameter
+	/// satisfies (method and associated-item resolution,
+	/// `type_implements_trait`) then sees a supertrait without knowing
+	/// supertraits exist; `Trait::supertraits` reads them back out by
+	/// filtering the reflexive entry.
+	///
+	/// Idempotent, and deliberately only *part* of the trait's signature —
+	/// `ensure_signature` on a trait also forces every member, and a member
+	/// calling *that* before resolving itself would run the member loop while
+	/// it is `InProgress`: it gets skipped there, and a sibling naming
+	/// `Self::ThatAssocType` then resolves against a trait whose `entries`
+	/// are missing it. Forcing the full signature at the *use* site is safe
+	/// for the opposite reason — the only member skipped there is the one
+	/// asking, which never needs itself.
+	///
+	/// Recurses into each supertrait's own clause, so reading a trait's
+	/// `Self` bounds guarantees its supertraits' bounds are resolved too —
+	/// what a transitive walk over the supertrait graph
+	/// ([`ItemRegistry::trait_implies`]) reads.
+	pub(super) fn ensure_trait_supertraits(&mut self, trait_index: TraitIndex) {
+		// The write below is the guard: `Self`'s bounds always get at least
+		// the reflexive entry, and they get it *before* this recurses, so a
+		// non-empty list means this trait is either done or is an ancestor of
+		// the call that is asking — which is how `trait A: B {}` alongside
+		// `trait B: A {}` terminates instead of recursing forever.
+		//
+		// TODO(supertrait cycles): that second case is a cycle and is
+		// currently accepted in silence. Telling it apart from "already done"
+		// needs a stack of the traits this walk is inside, which is also
+		// exactly what naming the loop (`A -> B -> A`) in the diagnostic
+		// needs — so both arrive together, here.
+		if !self.items.traits[usize::from(trait_index)]
+			.self_type_param
+			.bounds
+			.traits
+			.is_empty()
+		{
+			return;
+		}
+
+		// The trait's own AST node, reached the same way `ensure_signature`
+		// reaches any item's: `sig_state` maps its `DefId` to its
+		// `ast_nodes` slot.
+		let def_id = self.items.traits[usize::from(trait_index)].id;
+		let node_idx = self.sig_state[&def_id].node_idx;
+		let AstEntry {
+			file_id,
+			namespace,
+			node,
+			..
+		} = self.ast_nodes[node_idx].clone();
+		let AstNodeRef::Trait {
+			item: ast::Item::Trait {
+				supertraits, name, ..
+			},
+			..
+		} = node
+		else {
+			unreachable!("a TraitIndex's DefId always maps to a trait node")
+		};
+
+		let bounds = match supertraits {
+			Some(spanned) => self.resolve_bounds(
+				ResolveContext::new(file_id, namespace),
+				None,
+				spanned,
+			),
+			None => Bounds::default(),
+		};
+
+		// `Self: ThisTrait` first — a default body reaches the trait's own
+		// members through it, and `Trait::supertraits` filters it back out by
+		// trait index. A typeset supertrait (`trait Foo: Integer`) fills the
+		// one typeset slot, the same way it would on any other type param.
+		let self_param =
+			&mut self.items.traits[usize::from(trait_index)].self_type_param;
+		let mut traits = Vec::with_capacity(1 + bounds.traits.len());
+		traits.push(TraitBound {
+			trait_index,
+			bindings: Box::new([]),
+			span: name.span,
+		});
+		traits.extend(bounds.traits.iter().cloned());
+		self_param.bounds.traits = traits.into_boxed_slice();
+		self_param.bounds.typeset = bounds.typeset;
+
+		// Up the parent chain: after this returns, every ancestor's `Self`
+		// bounds are resolved too, which is what a transitive walk over the
+		// supertrait graph (`ItemRegistry::trait_implies`) reads. Their
+		// *members* stay lazy — nothing here needs them.
+		for supertrait in bounds.traits.iter() {
+			let supertrait_index = supertrait.trait_index;
+			self.ensure_trait_supertraits(supertrait_index);
+		}
+	}
+
 	pub(super) fn signature_trait(
 		&mut self,
 		resolve_context: ResolveContext,
 		trait_index: TraitIndex,
 		item: &'ast ast::Item,
 	) {
-		let (supertraits, trait_id, attributes, items) = match item {
+		// The supertrait clause itself is read by
+		// `ensure_trait_supertraits`, which may already have run it.
+		let (trait_id, attributes, items) = match item {
 			ast::Item::Trait {
 				id,
-				supertraits,
 				attributes,
 				items,
 				..
-			} => (supertraits, id, attributes, items),
+			} => (id, attributes, items),
 			_ => unreachable!(),
 		};
 		// `Trait` has no `attributes` field of its own to store the
@@ -836,13 +935,10 @@ impl<'ast> Builder<'ast, '_> {
 		// `self.items.tagged_items` map, populated as a side effect
 		// here.
 		self.resolve_attributes(*trait_id, attributes);
-		let bounds = if let Some(spanned) = supertraits {
-			self.resolve_bounds(resolve_context, None, spanned)
-		} else {
-			Bounds::default()
-		};
-
-		self.items.traits[usize::from(trait_index)].bounds = bounds.clone();
+		// Already done if any member got here first — this is idempotent,
+		// and it is the only writer of the supertrait half of `Self`'s
+		// bounds.
+		self.ensure_trait_supertraits(trait_index);
 
 		// Force every member's own signature to resolve right along
 		// with the trait's — `entries`/`assoc_types` only get
@@ -859,8 +955,12 @@ impl<'ast> Builder<'ast, '_> {
 				| ast::TraitItem::Const { id, .. }
 				| ast::TraitItem::AssociatedType { id, .. } => *id,
 			};
-			// A member cannot be resolving this trait: `bounds` is already
-			// written above, which is all a member ever needs from us.
+			// A member may well be what pulled this trait in (it forces
+			// its parent's signature first, and prescan registers members
+			// ahead of the trait): it is `InProgress`, gets `Cycle` back
+			// here, and resolves the rest of its own signature against the
+			// `Self` bounds written above — which is all a member ever
+			// needs from us.
 			let _ = self.ensure_signature(member_id);
 		}
 
@@ -874,7 +974,15 @@ impl<'ast> Builder<'ast, '_> {
 			owner: TypeParamOwner::Trait(trait_index),
 			param_index: 0,
 		});
-		for supertrait in bounds.traits.iter() {
+		// Read back from `Self`'s bounds, where `ensure_trait_supertraits`
+		// put them; owned because `check_assoc_type_bounds` needs `&mut
+		// self`.
+		let supertraits: Vec<TraitBound> = self.items.traits
+			[usize::from(trait_index)]
+		.supertraits(trait_index)
+		.cloned()
+		.collect();
+		for supertrait in supertraits.iter() {
 			for (assoc_name, kind) in supertrait.bindings.iter() {
 				// Only an equality binding (`AssocX = SomeType`) has
 				// a concrete value here to check against `AssocX`'s
@@ -909,6 +1017,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
 		// Self is encoded as TypeParam{0} so default implementations can be
 		// monomorphized: type_args[0] = concrete receiver type at the call site.
 		let self_sym = self.interner.get_or_intern("self");
@@ -988,6 +1104,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
 		// Self is a TypeParam owned by the trait so `Self::*mut u8` is valid.
 		let self_type_param = self.types.intern(Type::TypeParam {
 			owner: TypeParamOwner::Trait(trait_index),
@@ -1396,6 +1520,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
 		if let ast::TraitItem::AssociatedType {
 			id,
 			name,

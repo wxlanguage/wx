@@ -2533,13 +2533,11 @@ fn symbol_hover_text(
 		}
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
-			let trait_ = tir
-				.items
-				.traits
-				.get(usize::from(tir.items.trait_index(*def_id)?))?;
+			let trait_index = tir.items.trait_index(*def_id)?;
+			let trait_ = tir.items.traits.get(usize::from(trait_index))?;
 			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
-				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
+				fmt.display_supertraits(trait_index).unwrap_or_default();
 			if bounds_str.is_empty() {
 				Some(format!("trait {name}"))
 			} else {

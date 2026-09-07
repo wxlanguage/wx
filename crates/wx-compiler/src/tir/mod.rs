@@ -429,9 +429,34 @@ pub struct Trait {
 	pub entries: HashMap<SymbolU32, ImplEntry>,
 	#[cfg_attr(test, serde(skip))]
 	pub assoc_types: HashMap<SymbolU32, TraitAssocType>,
-	pub bounds: Bounds,
 	#[cfg_attr(test, serde(skip))]
 	pub accesses: Vec<SourceSpan>,
+}
+
+impl Trait {
+	/// The supertraits declared after the colon in `trait Sub: Super { .. }`.
+	///
+	/// There is no separate field for these: a supertrait is a bound on this
+	/// trait's own `Self`, so they live in `self_type_param.bounds` alongside
+	/// the reflexive `Self: ThisTrait` entry seeded at prescan — which is the
+	/// one entry filtered out here, and the reason this needs to be told its
+	/// own index. Storing them anywhere else is what used to keep them
+	/// invisible to every lookup that goes through `TypeParamInfo::bounds`
+	/// (method and associated-item resolution, `type_implements_trait`).
+	///
+	/// A self-referential `trait A: A {}` collapses into that same reflexive
+	/// entry and so reports no supertraits at all; it is rejected as a cycle
+	/// before anything reads this.
+	pub fn supertraits(
+		&self,
+		self_index: TraitIndex,
+	) -> impl Iterator<Item = &TraitBound> {
+		self.self_type_param
+			.bounds
+			.traits
+			.iter()
+			.filter(move |bound| bound.trait_index != self_index)
+	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2103,6 +2128,24 @@ impl<'a> TypeFormatter<'a> {
 		Ok(buffer)
 	}
 
+	/// Renders a trait's declared supertraits as they were written after the
+	/// colon — `Sub: Super + Other`. Not `display_bounds` on the trait's
+	/// `Self` bounds, which would also print the reflexive `Self: Sub` entry
+	/// that [`Trait::supertraits`] filters out.
+	pub fn display_supertraits(
+		&self,
+		trait_index: TraitIndex,
+	) -> Result<String, std::fmt::Error> {
+		let trait_def = &self.items.traits[usize::from(trait_index)];
+		let mut buffer = String::new();
+		self.write_bound_list(
+			&mut buffer,
+			trait_def.supertraits(trait_index),
+			trait_def.self_type_param.bounds.typeset.as_ref(),
+		)?;
+		Ok(buffer)
+	}
+
 	fn write_type(
 		&self,
 		f: &mut impl std::fmt::Write,
@@ -2395,8 +2438,21 @@ impl<'a> TypeFormatter<'a> {
 		f: &mut impl std::fmt::Write,
 		bounds: &Bounds,
 	) -> std::fmt::Result {
+		self.write_bound_list(f, bounds.traits.iter(), bounds.typeset.as_ref())
+	}
+
+	/// The shared body of [`Self::write_bounds`] and
+	/// [`Self::display_supertraits`], taking the trait bounds as an iterator
+	/// so a trait's supertraits can be rendered without first materializing
+	/// a [`Bounds`] that filters out its reflexive `Self` entry.
+	fn write_bound_list<'b>(
+		&self,
+		f: &mut impl std::fmt::Write,
+		traits: impl Iterator<Item = &'b TraitBound>,
+		typeset: Option<&TypesetBound>,
+	) -> std::fmt::Result {
 		let mut first = true;
-		for trait_bound in bounds.traits.iter() {
+		for trait_bound in traits {
 			if !first {
 				f.write_str(" + ")?;
 			}
@@ -2435,7 +2491,7 @@ impl<'a> TypeFormatter<'a> {
 				f.write_str(" }")?;
 			}
 		}
-		if let Some(typeset) = &bounds.typeset {
+		if let Some(typeset) = typeset {
 			if !first {
 				f.write_str(" + ")?;
 			}
@@ -2652,15 +2708,11 @@ impl ItemRegistry {
 		index
 	}
 
-	fn push_trait(
-		&mut self,
-		make_item: impl FnOnce(TraitIndex) -> Trait,
-	) -> TraitIndex {
+	fn push_trait(&mut self, item: Trait) -> TraitIndex {
 		let index = TraitIndex::new(
 			u32::try_from(self.traits.len())
 				.expect("trait registry exceeded u32 index capacity"),
 		);
-		let item = make_item(index);
 		self.item_lookup.insert(item.id, ItemIndex::Trait(index));
 		self.traits.push(item);
 		index
@@ -3620,8 +3672,11 @@ impl ItemRegistry {
 	/// `AssocTypeProjection` propagated in from an outer generic scope, not
 	/// concrete yet) is checked against its own declared bounds via
 	/// `abstract_type_bounds`, not `find_trait_impl` — that only knows
-	/// about concrete impls. No supertrait transitivity: `M: Sub` does not
-	/// satisfy a required `Super` even if `Sub: Super`.
+	/// about concrete impls, and a declared bound satisfies the requirement
+	/// through its supertraits as well as itself (see
+	/// [`ItemRegistry::trait_implies`]). The concrete side needs no such walk:
+	/// every impl is already required to implement its trait's supertraits
+	/// directly (`check_trait_conformance`), and that obligation chains.
 	fn type_implements_trait(
 		&self,
 		types: &TypeInterner,
@@ -3629,11 +3684,39 @@ impl ItemRegistry {
 		trait_index: TraitIndex,
 	) -> bool {
 		match self.abstract_type_bounds(types, ty) {
-			Some(declared) => {
-				declared.traits.iter().any(|b| b.trait_index == trait_index)
-			}
+			Some(declared) => declared
+				.traits
+				.iter()
+				.any(|b| self.trait_implies(b.trait_index, trait_index)),
 			None => self.find_trait_impl(types, ty, trait_index).is_some(),
 		}
+	}
+
+	/// Does holding `bound` also give you `required` — is `required` `bound`
+	/// itself, or one of its supertraits, transitively?
+	///
+	/// Walks rather than reading a precomputed closure: the graph is tiny and
+	/// this keeps the answer derived from one place. Visited-guarded because
+	/// a supertrait cycle (`trait A: B {}` alongside `trait B: A {}`) is
+	/// currently accepted, so the graph is not guaranteed acyclic.
+	fn trait_implies(&self, bound: TraitIndex, required: TraitIndex) -> bool {
+		let mut stack = vec![bound];
+		let mut visited: Vec<TraitIndex> = Vec::new();
+		while let Some(current) = stack.pop() {
+			if current == required {
+				return true;
+			}
+			if visited.contains(&current) {
+				continue;
+			}
+			visited.push(current);
+			stack.extend(
+				self.traits[usize::from(current)]
+					.supertraits(current)
+					.map(|supertrait| supertrait.trait_index),
+			);
+		}
+		false
 	}
 
 	/// Does `ty` belong to typeset `typeset_index`? Same abstract/concrete

@@ -338,30 +338,23 @@ impl<'ast> Builder<'ast, '_> {
 				}
 
 				let self_name_sym = self.interner.get_or_intern("Self");
-				let trait_index = self.items.push_trait(|trait_index| Trait {
+				let trait_index = self.items.push_trait(Trait {
 					id: *id,
 					file_id,
 					namespace,
 					pub_span: *pub_span,
 					name: *name,
-					self_type_param: TypeParamInfo {
-						name: Spanned {
-							inner: self_name_sym,
-							span: name.span,
-						},
-						bounds: Bounds {
-							traits: Box::new([TraitBound {
-								trait_index,
-								bindings: Box::new([]),
-								span: name.span,
-							}]),
-							typeset: None,
-						},
-						accesses: Vec::new(),
-					},
+					// Bounds stay empty until `ensure_trait_supertraits`
+					// writes them — both the reflexive `Self: ThisTrait`
+					// entry and any supertrait, in one place, since a
+					// supertrait is nothing but another bound on `Self` and
+					// resolving one needs names this phase doesn't have yet.
+					self_type_param: TypeParamInfo::new(Spanned {
+						inner: self_name_sym,
+						span: name.span,
+					}),
 					entries: HashMap::new(),
 					assoc_types: HashMap::new(),
-					bounds: Bounds::default(),
 					accesses: Vec::new(),
 				});
 				for trait_item in items.iter() {

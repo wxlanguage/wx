@@ -14785,9 +14785,6 @@ items:
       entries:
         17:
           Method: 93
-      bounds:
-        traits: []
-        typeset: ~
     - id: 16
       file_id: 0
       namespace: 0
@@ -14825,9 +14822,6 @@ items:
       entries:
         23:
           Method: 94
-      bounds:
-        traits: []
-        typeset: ~
     - id: 18
       file_id: 0
       namespace: 0
@@ -14865,9 +14859,6 @@ items:
       entries:
         26:
           Method: 95
-      bounds:
-        traits: []
-        typeset: ~
     - id: 20
       file_id: 0
       namespace: 0
@@ -14905,9 +14896,6 @@ items:
       entries:
         29:
           Method: 96
-      bounds:
-        traits: []
-        typeset: ~
     - id: 22
       file_id: 0
       namespace: 0
@@ -14945,9 +14933,6 @@ items:
       entries:
         32:
           Method: 97
-      bounds:
-        traits: []
-        typeset: ~
     - id: 24
       file_id: 0
       namespace: 0
@@ -14981,9 +14966,6 @@ items:
       entries:
         35:
           Method: 98
-      bounds:
-        traits: []
-        typeset: ~
     - id: 26
       file_id: 0
       namespace: 0
@@ -15021,9 +15003,6 @@ items:
       entries:
         38:
           Method: 99
-      bounds:
-        traits: []
-        typeset: ~
     - id: 28
       file_id: 0
       namespace: 0
@@ -15061,9 +15040,6 @@ items:
       entries:
         41:
           Method: 100
-      bounds:
-        traits: []
-        typeset: ~
     - id: 30
       file_id: 0
       namespace: 0
@@ -15101,9 +15077,6 @@ items:
       entries:
         44:
           Method: 101
-      bounds:
-        traits: []
-        typeset: ~
     - id: 32
       file_id: 0
       namespace: 0
@@ -15141,9 +15114,6 @@ items:
       entries:
         47:
           Method: 102
-      bounds:
-        traits: []
-        typeset: ~
     - id: 34
       file_id: 0
       namespace: 0
@@ -15181,9 +15151,6 @@ items:
       entries:
         50:
           Method: 103
-      bounds:
-        traits: []
-        typeset: ~
     - id: 36
       file_id: 0
       namespace: 0
@@ -15217,9 +15184,6 @@ items:
       entries:
         53:
           Method: 104
-      bounds:
-        traits: []
-        typeset: ~
     - id: 399
       file_id: 0
       namespace: 0
@@ -15253,9 +15217,6 @@ items:
       entries:
         182:
           AssocType: 1
-      bounds:
-        traits: []
-        typeset: ~
     - id: 401
       file_id: 0
       namespace: 0
@@ -15289,9 +15250,6 @@ items:
       entries:
         184:
           AssocType: 2
-      bounds:
-        traits: []
-        typeset: ~
     - id: 430
       file_id: 0
       namespace: 0
@@ -15361,9 +15319,6 @@ items:
           Method: 106
         203:
           Method: 107
-      bounds:
-        traits: []
-        typeset: ~
     - id: 443
       file_id: 0
       namespace: 0
@@ -15451,9 +15406,6 @@ items:
           Method: 260
         217:
           Method: 261
-      bounds:
-        traits: []
-        typeset: ~
   trait_impls:
     - id: 175
       trait_index: 0
