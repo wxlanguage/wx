@@ -1134,7 +1134,7 @@ impl<'tir> Builder<'tir> {
 			.unwrap()
 		{
 			tir::ImplEntry::AssocType(idx) => {
-				self.tir.items.assoc_type_impls[usize::from(*idx)]
+				self.tir.items.associated_types[usize::from(*idx)]
 					.ty
 					.unwrap()
 					.inner

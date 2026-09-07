@@ -2609,7 +2609,8 @@ fn symbol_hover_text(
 				.items
 				.traits
 				.get(usize::from(tir.items.trait_index(*trait_id)?))?;
-			let at = trait_.assoc_types.get(assoc_name)?;
+			let at = &tir.items.associated_types
+				[usize::from(trait_.associated_type(*assoc_name)?)];
 			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {

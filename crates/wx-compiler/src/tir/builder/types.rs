@@ -1098,20 +1098,12 @@ impl<'ast> Builder<'ast, '_> {
 			self.types.resolve(base_ty.inner),
 			Type::AssocTypeProjection { .. }
 		) {
-			// Check trait membership first, independent of whether the bound
-			// below actually holds — whether `required_trait` declares this
-			// assoc type is a static fact about the trait itself, not about
-			// whether `base_ty` satisfies it, and knowing it lets us recover
-			// the intended type even when the bound check fails. Best-effort:
-			// in progress means this trait is the one asking, and `entries`
-			// holds whatever it has declared so far.
-			let _ = self.ensure_signature(
-				self.items.traits[usize::from(required_trait)].id,
-			);
 			let has_member = matches!(
-				self.items.traits[usize::from(required_trait)]
-					.entries
-					.get(&member.ident.inner),
+				self.declared_trait_member(
+					required_trait,
+					member.ident.inner,
+					SourceSpan::new(resolve_context.file_id, member.ident.span)
+				)?,
 				Some(ImplEntry::AssocType(_))
 			);
 			if !has_member {
@@ -1132,10 +1124,9 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				return Err(());
 			}
-			if let Some(assoc_type) = self.items.traits
-				[usize::from(required_trait)]
-			.assoc_types
-			.get_mut(&member.ident.inner)
+			if let Some(assoc_type) = self
+				.items
+				.trait_associated_type_mut(required_trait, member.ident.inner)
 			{
 				assoc_type.accesses.push(SourceSpan::new(
 					resolve_context.file_id,
@@ -1152,15 +1143,8 @@ impl<'ast> Builder<'ast, '_> {
 			// borrow of `self.items` alone, not an owned clone kept alive
 			// across the `ensure_signature`/`intern` calls above —
 			// this is the only place it's used.
-			let bound_satisfied = self
-				.items
-				.abstract_type_bounds(&self.types, base_ty.inner)
-				.is_some_and(|bounds| {
-					bounds
-						.traits
-						.iter()
-						.any(|b| b.trait_index == required_trait)
-				});
+			let bound_satisfied =
+				self.bound_traits(base_ty.inner).contains(&required_trait);
 			if !bound_satisfied {
 				let type_name = self
 					.formatter(resolve_context.namespace)
@@ -1198,13 +1182,13 @@ impl<'ast> Builder<'ast, '_> {
 			base_ty.inner,
 			required_trait,
 			member.ident.inner,
+			SourceSpan::new(resolve_context.file_id, member.ident.span),
 		) {
 			Ok((ImplEntry::AssocType(idx), _)) => {
-				if let Some(assoc_type) = self.items.traits
-					[usize::from(required_trait)]
-				.assoc_types
-				.get_mut(&member.ident.inner)
-				{
+				if let Some(assoc_type) = self.items.trait_associated_type_mut(
+					required_trait,
+					member.ident.inner,
+				) {
 					assoc_type.accesses.push(SourceSpan::new(
 						resolve_context.file_id,
 						member.ident.span,
@@ -1228,7 +1212,7 @@ impl<'ast> Builder<'ast, '_> {
 						base: base_ty.inner,
 					})
 				} else {
-					self.items.assoc_type_impls[usize::from(idx)]
+					self.items.associated_types[usize::from(idx)]
 						.ty
 						.unwrap()
 						.inner
@@ -1256,6 +1240,7 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
+			Err(TraitMemberError::ResolutionFailed) => Err(()),
 			Err(TraitMemberError::NotImplemented) => {
 				let type_name = self
 					.formatter(resolve_context.namespace)
@@ -1283,20 +1268,17 @@ impl<'ast> Builder<'ast, '_> {
 				// shape instead of collapsing to `TypeIndex::ERROR`, even
 				// though the bound isn't proven. A trait that doesn't
 				// define the member at all has nothing to recover.
-				// Best-effort, same as the `AssocTypeProjection` branch.
-				let _ = self.ensure_signature(
-					self.items.traits[usize::from(required_trait)].id,
-				);
-				match self.items.traits[usize::from(required_trait)]
-					.entries
-					.get(&member.ident.inner)
-				{
+				match self.declared_trait_member(
+					required_trait,
+					member.ident.inner,
+					member_span,
+				)? {
 					Some(ImplEntry::AssocType(_)) => {
-						if let Some(assoc_type) = self.items.traits
-							[usize::from(required_trait)]
-						.assoc_types
-						.get_mut(&member.ident.inner)
-						{
+						if let Some(assoc_type) =
+							self.items.trait_associated_type_mut(
+								required_trait,
+								member.ident.inner,
+							) {
 							assoc_type.accesses.push(member_span);
 						}
 						Ok(self.types.intern(Type::AssocTypeProjection {

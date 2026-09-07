@@ -559,6 +559,10 @@ impl<'ast> Builder<'ast, '_> {
 						[usize::from(import_module_index)]
 					.namespace_idx;
 					let func_index = self.items.push_function(Function {
+						is_method: signature.params.first().is_some_and(|p| {
+							self.interner.resolve(p.inner.inner.name.inner)
+								== Some("self")
+						}),
 						id: *id,
 						file_id: resolve_context.file_id,
 						namespace: import_ns_idx,

@@ -35,39 +35,6 @@ types:
       owner:
         Trait: 14
       param_index: 0
-  - Pointer:
-      to: 6
-      memory: 21
-      ownership: Exclusive
-  - AssocTypeProjection:
-      trait_index: 14
-      assoc_name: 59
-      base: 21
-  - TypeParam:
-      owner:
-        Trait: 12
-      param_index: 0
-  - TypeParam:
-      owner:
-        Trait: 13
-      param_index: 0
-  - AssocTypeProjection:
-      trait_index: 12
-      assoc_name: 182
-      base: 23
-  - Function:
-      signature:
-        items:
-          - 21
-          - 23
-          - 26
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 21
-          - 23
-        params_count: 1
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
@@ -79,7 +46,7 @@ types:
   - Struct:
       struct_index: 0
       args:
-        - 30
+        - 23
   - TypeParam:
       owner:
         Struct: 444
@@ -87,7 +54,7 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 32
+      base: 25
   - TypeParam:
       owner:
         InherentImpl: 7
@@ -99,8 +66,8 @@ types:
   - Struct:
       struct_index: 1
       args:
-        - 34
-        - 35
+        - 27
+        - 28
   - TypeParam:
       owner:
         InherentImpl: 8
@@ -110,8 +77,8 @@ types:
         InherentImpl: 8
       param_index: 1
   - Slice:
-      of: 38
-      memory: 37
+      of: 31
+      memory: 30
       ownership: Shared
   - TypeParam:
       owner:
@@ -120,9 +87,9 @@ types:
   - Function:
       signature:
         items:
-          - 40
-          - 40
-          - 40
+          - 33
+          - 33
+          - 33
         params_count: 2
   - TypeParam:
       owner:
@@ -131,9 +98,9 @@ types:
   - Function:
       signature:
         items:
-          - 42
-          - 42
-          - 42
+          - 35
+          - 35
+          - 35
         params_count: 2
   - TypeParam:
       owner:
@@ -142,9 +109,9 @@ types:
   - Function:
       signature:
         items:
-          - 44
-          - 44
-          - 44
+          - 37
+          - 37
+          - 37
         params_count: 2
   - TypeParam:
       owner:
@@ -153,9 +120,9 @@ types:
   - Function:
       signature:
         items:
-          - 46
-          - 46
-          - 46
+          - 39
+          - 39
+          - 39
         params_count: 2
   - TypeParam:
       owner:
@@ -164,9 +131,9 @@ types:
   - Function:
       signature:
         items:
-          - 48
-          - 48
-          - 48
+          - 41
+          - 41
+          - 41
         params_count: 2
   - TypeParam:
       owner:
@@ -175,8 +142,8 @@ types:
   - Function:
       signature:
         items:
-          - 50
-          - 50
+          - 43
+          - 43
         params_count: 1
   - TypeParam:
       owner:
@@ -185,9 +152,9 @@ types:
   - Function:
       signature:
         items:
-          - 52
-          - 52
-          - 52
+          - 45
+          - 45
+          - 45
         params_count: 2
   - TypeParam:
       owner:
@@ -196,9 +163,9 @@ types:
   - Function:
       signature:
         items:
-          - 54
-          - 54
-          - 54
+          - 47
+          - 47
+          - 47
         params_count: 2
   - TypeParam:
       owner:
@@ -207,9 +174,9 @@ types:
   - Function:
       signature:
         items:
-          - 56
-          - 56
-          - 56
+          - 49
+          - 49
+          - 49
         params_count: 2
   - TypeParam:
       owner:
@@ -218,9 +185,9 @@ types:
   - Function:
       signature:
         items:
-          - 58
-          - 58
-          - 58
+          - 51
+          - 51
+          - 51
         params_count: 2
   - TypeParam:
       owner:
@@ -229,9 +196,9 @@ types:
   - Function:
       signature:
         items:
-          - 60
-          - 60
-          - 60
+          - 53
+          - 53
+          - 53
         params_count: 2
   - TypeParam:
       owner:
@@ -240,8 +207,8 @@ types:
   - Function:
       signature:
         items:
-          - 62
-          - 62
+          - 55
+          - 55
         params_count: 1
   - TypeParam:
       owner:
@@ -252,18 +219,18 @@ types:
         Function: 37
       param_index: 1
   - Slice:
-      of: 65
-      memory: 64
+      of: 58
+      memory: 57
       ownership: Shared
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 64
+      base: 57
   - Function:
       signature:
         items:
-          - 66
-          - 67
+          - 59
+          - 60
         params_count: 1
   - TypeParam:
       owner:
@@ -274,309 +241,317 @@ types:
         Function: 38
       param_index: 1
   - Slice:
-      of: 70
-      memory: 69
+      of: 63
+      memory: 62
       ownership: Shared
   - Pointer:
-      to: 70
-      memory: 69
+      to: 63
+      memory: 62
       ownership: Shared
   - Function:
       signature:
         items:
+          - 64
+          - 65
+        params_count: 1
+  - TypeParam:
+      owner:
+        Function: 39
+      param_index: 0
+  - TypeParam:
+      owner:
+        Function: 39
+      param_index: 1
+  - Pointer:
+      to: 68
+      memory: 67
+      ownership: Shared
+  - AssocTypeProjection:
+      trait_index: 14
+      assoc_name: 59
+      base: 67
+  - Slice:
+      of: 68
+      memory: 67
+      ownership: Shared
+  - Function:
+      signature:
+        items:
+          - 69
+          - 70
           - 71
-          - 72
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 11
+          - 13
         params_count: 1
+  - Function:
+      signature:
+        items:
+          - 10
+          - 12
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 13
+          - 11
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 14
+          - 14
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 15
+          - 15
+          - 15
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 11
+          - 11
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 13
+          - 13
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 11
+          - 11
+          - 11
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 13
+          - 13
+          - 13
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 10
+          - 10
+          - 10
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 12
+          - 12
+          - 12
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 11
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 10
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 13
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 12
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 11
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 10
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 13
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 12
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 11
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 10
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 11
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 10
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 13
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 12
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 13
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 12
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 14
+          - 15
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 15
+          - 14
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 10
+          - 10
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 12
+          - 12
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 7
+          - 7
+          - 7
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 7
+          - 7
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 6
+          - 6
+          - 6
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 6
+          - 6
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 9
+          - 9
+          - 9
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 9
+          - 9
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 8
+          - 8
+          - 8
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 8
+          - 8
+        params_count: 1
+  - Function:
+      signature:
+        items:
+          - 16
+          - 16
+          - 16
+        params_count: 2
   - TypeParam:
       owner:
-        Function: 39
+        Trait: 12
       param_index: 0
   - TypeParam:
       owner:
-        Function: 39
-      param_index: 1
-  - Pointer:
-      to: 75
-      memory: 74
-      ownership: Shared
-  - AssocTypeProjection:
-      trait_index: 14
-      assoc_name: 59
-      base: 74
-  - Slice:
-      of: 75
-      memory: 74
-      ownership: Shared
-  - Function:
-      signature:
-        items:
-          - 76
-          - 77
-          - 78
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 11
-          - 13
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 10
-          - 12
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 13
-          - 11
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 14
-          - 14
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 15
-          - 15
-          - 15
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 11
-          - 11
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 13
-          - 13
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 11
-          - 11
-          - 11
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 13
-          - 13
-          - 13
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 10
-          - 10
-          - 10
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 12
-          - 12
-          - 12
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 11
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 10
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 13
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 12
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 11
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 10
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 13
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 12
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 11
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 10
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 11
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 10
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 13
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 12
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 13
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 12
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 14
-          - 15
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 15
-          - 14
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 10
-          - 10
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 12
-          - 12
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 7
-          - 7
-          - 7
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 7
-          - 7
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 6
-          - 6
-          - 6
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 6
-          - 6
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 9
-          - 9
-          - 9
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 9
-          - 9
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 8
-          - 8
-          - 8
-        params_count: 2
-  - Function:
-      signature:
-        items:
-          - 8
-          - 8
-        params_count: 1
-  - Function:
-      signature:
-        items:
-          - 16
-          - 16
-          - 16
-        params_count: 2
+        Trait: 13
+      param_index: 0
   - TypeParam:
       owner:
         Function: 418
@@ -584,17 +559,17 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 122
+      base: 117
   - AssocTypeProjection:
       trait_index: 12
       assoc_name: 182
-      base: 123
+      base: 118
   - Function:
       signature:
         items:
-          - 122
-          - 123
-          - 124
+          - 117
+          - 118
+          - 119
         params_count: 2
   - TypeParam:
       owner:
@@ -603,12 +578,12 @@ types:
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 126
+      base: 121
   - Function:
       signature:
         items:
-          - 126
-          - 127
+          - 121
+          - 122
         params_count: 1
   - TypeParam:
       owner:
@@ -616,18 +591,18 @@ types:
       param_index: 0
   - Pointer:
       to: 6
-      memory: 129
+      memory: 124
       ownership: Exclusive
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 129
+      base: 124
   - Function:
       signature:
         items:
-          - 130
+          - 125
           - 6
-          - 131
+          - 126
           - 2
         params_count: 3
   - TypeParam:
@@ -640,7 +615,7 @@ types:
       param_index: 2
   - Pointer:
       to: 6
-      memory: 134
+      memory: 129
       ownership: Exclusive
   - TypeParam:
       owner:
@@ -648,16 +623,41 @@ types:
       param_index: 1
   - Pointer:
       to: 6
-      memory: 136
+      memory: 131
       ownership: Shared
   - Function:
       signature:
         items:
-          - 135
-          - 137
-          - 133
+          - 130
+          - 132
+          - 128
           - 2
         params_count: 3
+  - Pointer:
+      to: 6
+      memory: 21
+      ownership: Exclusive
+  - AssocTypeProjection:
+      trait_index: 14
+      assoc_name: 59
+      base: 21
+  - AssocTypeProjection:
+      trait_index: 12
+      assoc_name: 182
+      base: 135
+  - Function:
+      signature:
+        items:
+          - 21
+          - 135
+          - 136
+        params_count: 2
+  - Function:
+      signature:
+        items:
+          - 21
+          - 135
+        params_count: 1
   - TypeParam:
       owner:
         Function: 431
@@ -687,22 +687,22 @@ types:
   - Function:
       signature:
         items:
-          - 31
+          - 24
         params_count: 0
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 30
+      base: 23
   - Function:
       signature:
         items:
           - 146
-          - 31
+          - 24
         params_count: 1
   - Function:
       signature:
         items:
-          - 31
+          - 24
           - 146
         params_count: 1
   - TypeParam:
@@ -717,40 +717,6 @@ types:
       to: 149
       memory: 150
       ownership: Exclusive
-  - TypeParam:
-      owner:
-        Function: 441
-      param_index: 1
-  - Pointer:
-      to: 152
-      memory: 150
-      ownership: Exclusive
-  - Function:
-      signature:
-        items:
-          - 151
-          - 152
-          - 153
-        params_count: 2
-  - AssocTypeProjection:
-      trait_index: 14
-      assoc_name: 59
-      base: 150
-  - TypeParam:
-      owner:
-        Function: 442
-      param_index: 1
-  - Slice:
-      of: 156
-      memory: 150
-      ownership: Exclusive
-  - Function:
-      signature:
-        items:
-          - 151
-          - 155
-          - 157
-        params_count: 2
   - Struct:
       struct_index: 0
       args:
@@ -763,74 +729,108 @@ types:
       signature:
         items:
           - 151
-          - 159
+          - 152
+          - 153
+        params_count: 2
+  - TypeParam:
+      owner:
+        Function: 441
+      param_index: 1
+  - Pointer:
+      to: 155
+      memory: 150
+      ownership: Exclusive
+  - Function:
+      signature:
+        items:
+          - 151
+          - 155
+          - 156
+        params_count: 2
+  - AssocTypeProjection:
+      trait_index: 14
+      assoc_name: 59
+      base: 150
+  - TypeParam:
+      owner:
+        Function: 442
+      param_index: 1
+  - Slice:
+      of: 159
+      memory: 150
+      ownership: Exclusive
+  - Function:
+      signature:
+        items:
+          - 151
+          - 158
           - 160
         params_count: 2
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 34
+      base: 27
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 162
         params_count: 1
   - Function:
       signature:
         items:
-          - 36
+          - 29
         params_count: 0
   - Pointer:
-      to: 35
-      memory: 34
+      to: 28
+      memory: 27
       ownership: Shared
   - Function:
       signature:
         items:
           - 165
-          - 36
+          - 29
         params_count: 1
   - Pointer:
-      to: 35
-      memory: 34
+      to: 28
+      memory: 27
       ownership: Exclusive
   - Function:
       signature:
         items:
           - 167
-          - 36
+          - 29
         params_count: 1
   - Function:
       signature:
         items:
           - 162
-          - 36
+          - 29
         params_count: 1
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 165
         params_count: 1
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 167
         params_count: 1
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 16
         params_count: 1
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 162
-          - 36
+          - 29
         params_count: 2
   - TypeParam:
       owner:
@@ -839,32 +839,32 @@ types:
   - Struct:
       struct_index: 1
       args:
-        - 34
+        - 27
         - 174
   - Function:
       signature:
         items:
-          - 36
+          - 29
           - 175
         params_count: 1
   - AssocTypeProjection:
       trait_index: 14
       assoc_name: 59
-      base: 37
+      base: 30
   - Function:
       signature:
         items:
-          - 39
+          - 32
           - 177
         params_count: 1
   - Pointer:
-      to: 38
-      memory: 37
+      to: 31
+      memory: 30
       ownership: Shared
   - Function:
       signature:
         items:
-          - 39
+          - 32
           - 179
         params_count: 1
   - Function:
@@ -1175,30 +1175,30 @@ types:
       id: 434
       type_args:
         - 1
-        - 152
+        - 155
   - FunctionItem:
       id: 39
       type_args:
         - 1
         - 1
   - Pointer:
-      to: 156
+      to: 159
       memory: 150
       ownership: Shared
   - FunctionItem:
       id: 435
       type_args:
         - 1
-        - 156
+        - 159
   - Slice:
-      of: 156
+      of: 159
       memory: 150
       ownership: Shared
   - FunctionItem:
       id: 431
       type_args:
-        - 35
-        - 34
+        - 28
+        - 27
   - Struct:
       struct_index: 1
       args:
@@ -1211,7 +1211,7 @@ types:
         - 1
   - Slice:
       of: 1
-      memory: 37
+      memory: 30
       ownership: Shared
   - FunctionItem:
       id: 38
@@ -1282,7 +1282,7 @@ items:
                 start: 1289
                 end: 1290
       inherited_type_param_count: 0
-      signature_index: 68
+      signature_index: 61
       name:
         inner: 54
         span:
@@ -1296,12 +1296,12 @@ items:
               start: 1275
               end: 1280
           ty:
-            inner: 66
+            inner: 59
             span:
               start: 1282
               end: 1291
       result:
-        inner: 67
+        inner: 60
         span:
           start: 1296
           end: 1305
@@ -1361,7 +1361,7 @@ items:
                 start: 1381
                 end: 1382
       inherited_type_param_count: 0
-      signature_index: 73
+      signature_index: 66
       name:
         inner: 60
         span:
@@ -1375,12 +1375,12 @@ items:
               start: 1354
               end: 1359
           ty:
-            inner: 71
+            inner: 64
             span:
               start: 1361
               end: 1370
       result:
-        inner: 72
+        inner: 65
         span:
           start: 1375
           end: 1382
@@ -1444,7 +1444,7 @@ items:
                 start: 1479
                 end: 1480
       inherited_type_param_count: 0
-      signature_index: 79
+      signature_index: 72
       name:
         inner: 61
         span:
@@ -1458,7 +1458,7 @@ items:
               start: 1438
               end: 1442
           ty:
-            inner: 76
+            inner: 69
             span:
               start: 1444
               end: 1451
@@ -1469,12 +1469,12 @@ items:
               start: 1453
               end: 1456
           ty:
-            inner: 77
+            inner: 70
             span:
               start: 1458
               end: 1467
       result:
-        inner: 78
+        inner: 71
         span:
           start: 1472
           end: 1481
@@ -1495,7 +1495,7 @@ items:
         end: 1500
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 80
+      signature_index: 73
       name:
         inner: 64
         span:
@@ -1531,7 +1531,7 @@ items:
         end: 1556
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 81
+      signature_index: 74
       name:
         inner: 66
         span:
@@ -1567,7 +1567,7 @@ items:
         end: 1612
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 82
+      signature_index: 75
       name:
         inner: 67
         span:
@@ -1603,7 +1603,7 @@ items:
         end: 1666
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 68
         span:
@@ -1643,7 +1643,7 @@ items:
         end: 1716
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 69
         span:
@@ -1683,7 +1683,7 @@ items:
         end: 1766
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 70
         span:
@@ -1723,7 +1723,7 @@ items:
         end: 1815
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 71
         span:
@@ -1763,7 +1763,7 @@ items:
         end: 1864
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 72
         span:
@@ -1803,7 +1803,7 @@ items:
         end: 1915
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 73
         span:
@@ -1843,7 +1843,7 @@ items:
         end: 1966
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 74
         span:
@@ -1883,7 +1883,7 @@ items:
         end: 2016
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 75
         span:
@@ -1923,7 +1923,7 @@ items:
         end: 2066
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 76
         span:
@@ -1963,7 +1963,7 @@ items:
         end: 2117
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 77
         span:
@@ -2003,7 +2003,7 @@ items:
         end: 2168
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 78
         span:
@@ -2043,7 +2043,7 @@ items:
         end: 2221
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 79
         span:
@@ -2083,7 +2083,7 @@ items:
         end: 2274
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 80
         span:
@@ -2134,7 +2134,7 @@ items:
         end: 2327
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 83
         span:
@@ -2185,7 +2185,7 @@ items:
         end: 2380
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 84
         span:
@@ -2236,7 +2236,7 @@ items:
         end: 2433
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 85
         span:
@@ -2287,7 +2287,7 @@ items:
         end: 2486
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 86
         span:
@@ -2338,7 +2338,7 @@ items:
         end: 2544
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 87
         span:
@@ -2389,7 +2389,7 @@ items:
         end: 2602
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 80
       name:
         inner: 88
         span:
@@ -2437,7 +2437,7 @@ items:
         end: 2651
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 81
       name:
         inner: 89
         span:
@@ -2477,7 +2477,7 @@ items:
         end: 2700
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 90
         span:
@@ -2517,7 +2517,7 @@ items:
         end: 2749
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 91
         span:
@@ -2557,7 +2557,7 @@ items:
         end: 2798
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 92
         span:
@@ -2628,7 +2628,7 @@ items:
         end: 2851
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 93
         span:
@@ -2683,7 +2683,7 @@ items:
         end: 2904
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 94
         span:
@@ -2734,7 +2734,7 @@ items:
         end: 2957
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 95
         span:
@@ -2785,7 +2785,7 @@ items:
         end: 3010
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 96
         span:
@@ -2856,7 +2856,7 @@ items:
         end: 3063
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 97
         span:
@@ -2911,7 +2911,7 @@ items:
         end: 3116
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 98
         span:
@@ -2962,7 +2962,7 @@ items:
         end: 3169
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 99
         span:
@@ -3013,7 +3013,7 @@ items:
         end: 3222
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 100
         span:
@@ -3084,7 +3084,7 @@ items:
         end: 3275
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 101
         span:
@@ -3139,7 +3139,7 @@ items:
         end: 3328
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 102
         span:
@@ -3190,7 +3190,7 @@ items:
         end: 3381
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 103
         span:
@@ -3241,7 +3241,7 @@ items:
         end: 3434
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 104
         span:
@@ -3300,7 +3300,7 @@ items:
         end: 3487
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 105
         span:
@@ -3359,7 +3359,7 @@ items:
         end: 3540
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 106
         span:
@@ -3410,7 +3410,7 @@ items:
         end: 3593
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 107
         span:
@@ -3461,7 +3461,7 @@ items:
         end: 3646
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 108
         span:
@@ -3512,7 +3512,7 @@ items:
         end: 3699
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 109
         span:
@@ -3563,7 +3563,7 @@ items:
         end: 3752
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 110
         span:
@@ -3622,7 +3622,7 @@ items:
         end: 3805
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 111
         span:
@@ -3681,7 +3681,7 @@ items:
         end: 3858
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 112
         span:
@@ -3732,7 +3732,7 @@ items:
         end: 3911
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 113
         span:
@@ -3783,7 +3783,7 @@ items:
         end: 3964
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 114
         span:
@@ -3858,7 +3858,7 @@ items:
         end: 4020
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 115
         span:
@@ -3913,7 +3913,7 @@ items:
         end: 4076
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 116
         span:
@@ -3988,7 +3988,7 @@ items:
         end: 4131
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 117
         span:
@@ -4043,7 +4043,7 @@ items:
         end: 4186
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 118
         span:
@@ -4118,7 +4118,7 @@ items:
         end: 4242
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 119
         span:
@@ -4173,7 +4173,7 @@ items:
         end: 4298
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 120
         span:
@@ -4244,7 +4244,7 @@ items:
         end: 4351
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 121
         span:
@@ -4299,7 +4299,7 @@ items:
         end: 4404
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 122
         span:
@@ -4358,7 +4358,7 @@ items:
         end: 4457
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 123
         span:
@@ -4417,7 +4417,7 @@ items:
         end: 4510
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 124
         span:
@@ -4468,7 +4468,7 @@ items:
         end: 4563
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 125
         span:
@@ -4519,7 +4519,7 @@ items:
         end: 4616
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 80
       name:
         inner: 126
         span:
@@ -4579,7 +4579,7 @@ items:
         end: 4668
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 81
       name:
         inner: 127
         span:
@@ -4623,7 +4623,7 @@ items:
         end: 4720
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 93
+      signature_index: 86
       name:
         inner: 128
         span:
@@ -4663,7 +4663,7 @@ items:
         end: 4777
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 94
+      signature_index: 87
       name:
         inner: 129
         span:
@@ -4703,7 +4703,7 @@ items:
         end: 4834
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 95
+      signature_index: 88
       name:
         inner: 130
         span:
@@ -4743,7 +4743,7 @@ items:
         end: 4891
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 96
+      signature_index: 89
       name:
         inner: 131
         span:
@@ -4783,7 +4783,7 @@ items:
         end: 4948
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 97
+      signature_index: 90
       name:
         inner: 132
         span:
@@ -4823,7 +4823,7 @@ items:
         end: 5005
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 98
+      signature_index: 91
       name:
         inner: 133
         span:
@@ -4863,7 +4863,7 @@ items:
         end: 5062
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 99
+      signature_index: 92
       name:
         inner: 134
         span:
@@ -4903,7 +4903,7 @@ items:
         end: 5119
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 100
+      signature_index: 93
       name:
         inner: 135
         span:
@@ -4943,7 +4943,7 @@ items:
         end: 5176
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 101
+      signature_index: 94
       name:
         inner: 136
         span:
@@ -4983,7 +4983,7 @@ items:
         end: 5231
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 95
       name:
         inner: 137
         span:
@@ -5023,7 +5023,7 @@ items:
         end: 5286
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 103
+      signature_index: 96
       name:
         inner: 138
         span:
@@ -5063,7 +5063,7 @@ items:
         end: 5341
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 97
       name:
         inner: 139
         span:
@@ -5103,7 +5103,7 @@ items:
         end: 5396
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 105
+      signature_index: 98
       name:
         inner: 140
         span:
@@ -5143,7 +5143,7 @@ items:
         end: 5451
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 99
       name:
         inner: 141
         span:
@@ -5183,7 +5183,7 @@ items:
         end: 5506
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 107
+      signature_index: 100
       name:
         inner: 142
         span:
@@ -5223,7 +5223,7 @@ items:
         end: 5561
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 101
       name:
         inner: 143
         span:
@@ -5263,7 +5263,7 @@ items:
         end: 5616
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 109
+      signature_index: 102
       name:
         inner: 144
         span:
@@ -5303,7 +5303,7 @@ items:
         end: 5673
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 110
+      signature_index: 103
       name:
         inner: 145
         span:
@@ -5343,7 +5343,7 @@ items:
         end: 5729
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 101
+      signature_index: 94
       name:
         inner: 146
         span:
@@ -5383,7 +5383,7 @@ items:
         end: 5790
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 93
+      signature_index: 86
       name:
         inner: 147
         span:
@@ -5423,7 +5423,7 @@ items:
         end: 5851
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 107
+      signature_index: 100
       name:
         inner: 148
         span:
@@ -5463,7 +5463,7 @@ items:
         end: 5912
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 99
+      signature_index: 92
       name:
         inner: 149
         span:
@@ -5529,7 +5529,7 @@ items:
                 start: 23792
                 end: 23795
       inherited_type_param_count: 0
-      signature_index: 125
+      signature_index: 120
       name:
         inner: 185
         span:
@@ -5543,7 +5543,7 @@ items:
               start: 23761
               end: 23764
           ty:
-            inner: 122
+            inner: 117
             span:
               start: 23766
               end: 23769
@@ -5554,12 +5554,12 @@ items:
               start: 23771
               end: 23776
           ty:
-            inner: 123
+            inner: 118
             span:
               start: 23778
               end: 23787
       result:
-        inner: 124
+        inner: 119
         span:
           start: 23792
           end: 23809
@@ -5602,7 +5602,7 @@ items:
                 start: 23999
                 end: 24002
       inherited_type_param_count: 0
-      signature_index: 128
+      signature_index: 123
       name:
         inner: 188
         span:
@@ -5616,12 +5616,12 @@ items:
               start: 23986
               end: 23989
           ty:
-            inner: 126
+            inner: 121
             span:
               start: 23991
               end: 23994
       result:
-        inner: 127
+        inner: 122
         span:
           start: 23999
           end: 24008
@@ -5664,7 +5664,7 @@ items:
                 start: 24206
                 end: 24209
       inherited_type_param_count: 0
-      signature_index: 132
+      signature_index: 127
       name:
         inner: 189
         span:
@@ -5678,7 +5678,7 @@ items:
               start: 24177
               end: 24180
           ty:
-            inner: 130
+            inner: 125
             span:
               start: 24182
               end: 24190
@@ -5700,7 +5700,7 @@ items:
               start: 24201
               end: 24204
           ty:
-            inner: 131
+            inner: 126
             span:
               start: 24206
               end: 24215
@@ -5752,7 +5752,7 @@ items:
               - trait_index: 14
                 bindings:
                   - - 59
-                    - Equals: 133
+                    - Equals: 128
                 span:
                   start: 24496
                   end: 24524
@@ -5772,7 +5772,7 @@ items:
               - trait_index: 14
                 bindings:
                   - - 59
-                    - Equals: 133
+                    - Equals: 128
                 span:
                   start: 24538
                   end: 24566
@@ -5783,7 +5783,7 @@ items:
                 start: 24575
                 end: 24581
       inherited_type_param_count: 0
-      signature_index: 138
+      signature_index: 133
       name:
         inner: 192
         span:
@@ -5797,7 +5797,7 @@ items:
               start: 24570
               end: 24573
           ty:
-            inner: 135
+            inner: 130
             span:
               start: 24575
               end: 24586
@@ -5808,7 +5808,7 @@ items:
               start: 24588
               end: 24591
           ty:
-            inner: 137
+            inner: 132
             span:
               start: 24593
               end: 24604
@@ -5819,7 +5819,7 @@ items:
               start: 24606
               end: 24609
           ty:
-            inner: 133
+            inner: 128
             span:
               start: 24611
               end: 24615
@@ -5978,126 +5978,6 @@ items:
             end: 155
       attributes: []
       body: 183
-    - id: 427
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 27
-      name:
-        inner: 201
-        span:
-          start: 25466
-          end: 25470
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25471
-              end: 25475
-          ty:
-            inner: 21
-            span:
-              start: 25471
-              end: 25475
-        - mut_span: ~
-          name:
-            inner: 187
-            span:
-              start: 25477
-              end: 25482
-          ty:
-            inner: 23
-            span:
-              start: 25484
-              end: 25494
-      result:
-        inner: 26
-        span:
-          start: 25499
-          end: 25517
-      accesses: []
-      attributes:
-        - Inline
-      body: 147
-    - id: 428
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 28
-      name:
-        inner: 202
-        span:
-          start: 25640
-          end: 25650
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25651
-              end: 25655
-          ty:
-            inner: 21
-            span:
-              start: 25651
-              end: 25655
-      result:
-        inner: 23
-        span:
-          start: 25660
-          end: 25670
-      accesses:
-        - file_id: 0
-          span:
-            start: 25832
-            end: 25842
-      attributes:
-        - Inline
-      body: 148
-    - id: 429
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      type_params: []
-      inherited_type_param_count: 1
-      signature_index: 28
-      name:
-        inner: 203
-        span:
-          start: 25786
-          end: 25796
-      params:
-        - mut_span: ~
-          name:
-            inner: 18
-            span:
-              start: 25797
-              end: 25801
-          ty:
-            inner: 21
-            span:
-              start: 25797
-              end: 25801
-      result:
-        inner: 23
-        span:
-          start: 25806
-          end: 25816
-      accesses: []
-      attributes:
-        - Inline
-      body: 149
     - id: 13
       file_id: 0
       namespace: 0
@@ -6106,7 +5986,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 41
+      signature_index: 34
       name:
         inner: 17
         span:
@@ -6120,7 +6000,7 @@ items:
               start: 408
               end: 412
           ty:
-            inner: 40
+            inner: 33
             span:
               start: 408
               end: 412
@@ -6131,12 +6011,12 @@ items:
               start: 414
               end: 417
           ty:
-            inner: 40
+            inner: 33
             span:
               start: 419
               end: 423
       result:
-        inner: 40
+        inner: 33
         span:
           start: 428
           end: 432
@@ -6159,7 +6039,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 43
+      signature_index: 36
       name:
         inner: 23
         span:
@@ -6173,7 +6053,7 @@ items:
               start: 479
               end: 483
           ty:
-            inner: 42
+            inner: 35
             span:
               start: 479
               end: 483
@@ -6184,12 +6064,12 @@ items:
               start: 485
               end: 488
           ty:
-            inner: 42
+            inner: 35
             span:
               start: 490
               end: 494
       result:
-        inner: 42
+        inner: 35
         span:
           start: 499
           end: 503
@@ -6216,7 +6096,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 45
+      signature_index: 38
       name:
         inner: 26
         span:
@@ -6230,7 +6110,7 @@ items:
               start: 550
               end: 554
           ty:
-            inner: 44
+            inner: 37
             span:
               start: 550
               end: 554
@@ -6241,12 +6121,12 @@ items:
               start: 556
               end: 559
           ty:
-            inner: 44
+            inner: 37
             span:
               start: 561
               end: 565
       result:
-        inner: 44
+        inner: 37
         span:
           start: 570
           end: 574
@@ -6277,7 +6157,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 47
+      signature_index: 40
       name:
         inner: 29
         span:
@@ -6291,7 +6171,7 @@ items:
               start: 621
               end: 625
           ty:
-            inner: 46
+            inner: 39
             span:
               start: 621
               end: 625
@@ -6302,12 +6182,12 @@ items:
               start: 627
               end: 630
           ty:
-            inner: 46
+            inner: 39
             span:
               start: 632
               end: 636
       result:
-        inner: 46
+        inner: 39
         span:
           start: 641
           end: 645
@@ -6322,7 +6202,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 49
+      signature_index: 42
       name:
         inner: 32
         span:
@@ -6336,7 +6216,7 @@ items:
               start: 692
               end: 696
           ty:
-            inner: 48
+            inner: 41
             span:
               start: 692
               end: 696
@@ -6347,12 +6227,12 @@ items:
               start: 698
               end: 701
           ty:
-            inner: 48
+            inner: 41
             span:
               start: 703
               end: 707
       result:
-        inner: 48
+        inner: 41
         span:
           start: 712
           end: 716
@@ -6367,7 +6247,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 51
+      signature_index: 44
       name:
         inner: 35
         span:
@@ -6381,12 +6261,12 @@ items:
               start: 763
               end: 767
           ty:
-            inner: 50
+            inner: 43
             span:
               start: 763
               end: 767
       result:
-        inner: 50
+        inner: 43
         span:
           start: 772
           end: 776
@@ -6401,7 +6281,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 53
+      signature_index: 46
       name:
         inner: 38
         span:
@@ -6415,7 +6295,7 @@ items:
               start: 832
               end: 836
           ty:
-            inner: 52
+            inner: 45
             span:
               start: 832
               end: 836
@@ -6426,12 +6306,12 @@ items:
               start: 838
               end: 841
           ty:
-            inner: 52
+            inner: 45
             span:
               start: 843
               end: 847
       result:
-        inner: 52
+        inner: 45
         span:
           start: 852
           end: 856
@@ -6450,7 +6330,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 55
+      signature_index: 48
       name:
         inner: 41
         span:
@@ -6464,7 +6344,7 @@ items:
               start: 909
               end: 913
           ty:
-            inner: 54
+            inner: 47
             span:
               start: 909
               end: 913
@@ -6475,12 +6355,12 @@ items:
               start: 915
               end: 918
           ty:
-            inner: 54
+            inner: 47
             span:
               start: 920
               end: 924
       result:
-        inner: 54
+        inner: 47
         span:
           start: 929
           end: 933
@@ -6495,7 +6375,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 57
+      signature_index: 50
       name:
         inner: 44
         span:
@@ -6509,7 +6389,7 @@ items:
               start: 989
               end: 993
           ty:
-            inner: 56
+            inner: 49
             span:
               start: 989
               end: 993
@@ -6520,12 +6400,12 @@ items:
               start: 995
               end: 998
           ty:
-            inner: 56
+            inner: 49
             span:
               start: 1000
               end: 1004
       result:
-        inner: 56
+        inner: 49
         span:
           start: 1009
           end: 1013
@@ -6540,7 +6420,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 59
+      signature_index: 52
       name:
         inner: 47
         span:
@@ -6554,7 +6434,7 @@ items:
               start: 1060
               end: 1064
           ty:
-            inner: 58
+            inner: 51
             span:
               start: 1060
               end: 1064
@@ -6565,12 +6445,12 @@ items:
               start: 1066
               end: 1069
           ty:
-            inner: 58
+            inner: 51
             span:
               start: 1071
               end: 1075
       result:
-        inner: 58
+        inner: 51
         span:
           start: 1080
           end: 1084
@@ -6585,7 +6465,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 61
+      signature_index: 54
       name:
         inner: 50
         span:
@@ -6599,7 +6479,7 @@ items:
               start: 1131
               end: 1135
           ty:
-            inner: 60
+            inner: 53
             span:
               start: 1131
               end: 1135
@@ -6610,12 +6490,12 @@ items:
               start: 1137
               end: 1140
           ty:
-            inner: 60
+            inner: 53
             span:
               start: 1142
               end: 1146
       result:
-        inner: 60
+        inner: 53
         span:
           start: 1151
           end: 1155
@@ -6630,7 +6510,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 63
+      signature_index: 56
       name:
         inner: 53
         span:
@@ -6644,12 +6524,12 @@ items:
               start: 1211
               end: 1215
           ty:
-            inner: 62
+            inner: 55
             span:
               start: 1211
               end: 1215
       result:
-        inner: 62
+        inner: 55
         span:
           start: 1220
           end: 1224
@@ -6670,7 +6550,7 @@ items:
         end: 6296
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 158
         span:
@@ -6711,7 +6591,7 @@ items:
         end: 6374
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 159
         span:
@@ -6748,7 +6628,7 @@ items:
         end: 6448
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 160
         span:
@@ -6785,7 +6665,7 @@ items:
         end: 6524
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 161
         span:
@@ -6822,7 +6702,7 @@ items:
         end: 6602
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 162
         span:
@@ -6859,7 +6739,7 @@ items:
         end: 6678
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 163
         span:
@@ -6896,7 +6776,7 @@ items:
         end: 6760
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 164
         span:
@@ -6944,7 +6824,7 @@ items:
         end: 6854
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 166
         span:
@@ -6992,7 +6872,7 @@ items:
         end: 6948
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 167
         span:
@@ -7040,7 +6920,7 @@ items:
         end: 7050
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 95
       name:
         inner: 169
         span:
@@ -7077,7 +6957,7 @@ items:
         end: 7146
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 94
+      signature_index: 87
       name:
         inner: 170
         span:
@@ -7114,7 +6994,7 @@ items:
         end: 7250
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 109
+      signature_index: 102
       name:
         inner: 172
         span:
@@ -7151,7 +7031,7 @@ items:
         end: 7335
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 101
+      signature_index: 94
       name:
         inner: 173
         span:
@@ -7188,7 +7068,7 @@ items:
         end: 7417
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 102
+      signature_index: 95
       name:
         inner: 174
         span:
@@ -7225,7 +7105,7 @@ items:
         end: 7499
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 105
+      signature_index: 98
       name:
         inner: 175
         span:
@@ -7262,7 +7142,7 @@ items:
         end: 7581
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 106
+      signature_index: 99
       name:
         inner: 176
         span:
@@ -7299,7 +7179,7 @@ items:
         end: 8019
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 158
         span:
@@ -7340,7 +7220,7 @@ items:
         end: 8097
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 159
         span:
@@ -7377,7 +7257,7 @@ items:
         end: 8171
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 160
         span:
@@ -7414,7 +7294,7 @@ items:
         end: 8247
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 161
         span:
@@ -7451,7 +7331,7 @@ items:
         end: 8325
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 162
         span:
@@ -7488,7 +7368,7 @@ items:
         end: 8401
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 163
         span:
@@ -7525,7 +7405,7 @@ items:
         end: 8483
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 164
         span:
@@ -7573,7 +7453,7 @@ items:
         end: 8577
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 166
         span:
@@ -7621,7 +7501,7 @@ items:
         end: 8671
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 167
         span:
@@ -7669,7 +7549,7 @@ items:
         end: 8773
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 101
       name:
         inner: 169
         span:
@@ -7706,7 +7586,7 @@ items:
         end: 8869
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 100
+      signature_index: 93
       name:
         inner: 170
         span:
@@ -7743,7 +7623,7 @@ items:
         end: 8973
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 110
+      signature_index: 103
       name:
         inner: 177
         span:
@@ -7780,7 +7660,7 @@ items:
         end: 9056
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 103
+      signature_index: 96
       name:
         inner: 173
         span:
@@ -7817,7 +7697,7 @@ items:
         end: 9138
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 104
+      signature_index: 97
       name:
         inner: 174
         span:
@@ -7854,7 +7734,7 @@ items:
         end: 9220
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 107
+      signature_index: 100
       name:
         inner: 175
         span:
@@ -7891,7 +7771,7 @@ items:
         end: 9302
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 108
+      signature_index: 101
       name:
         inner: 176
         span:
@@ -7928,7 +7808,7 @@ items:
         end: 9397
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 93
+      signature_index: 86
       name:
         inner: 178
         span:
@@ -7965,7 +7845,7 @@ items:
         end: 9481
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 97
+      signature_index: 90
       name:
         inner: 179
         span:
@@ -8000,7 +7880,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 17
         span:
@@ -8046,7 +7926,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 23
         span:
@@ -8092,7 +7972,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 26
         span:
@@ -8138,7 +8018,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 29
         span:
@@ -8184,7 +8064,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 32
         span:
@@ -8230,7 +8110,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 80
       name:
         inner: 35
         span:
@@ -8265,7 +8145,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 38
         span:
@@ -8311,7 +8191,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 41
         span:
@@ -8357,7 +8237,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 44
         span:
@@ -8403,7 +8283,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 47
         span:
@@ -8449,7 +8329,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 89
+      signature_index: 82
       name:
         inner: 50
         span:
@@ -8495,7 +8375,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 87
+      signature_index: 80
       name:
         inner: 53
         span:
@@ -8532,7 +8412,7 @@ items:
         end: 10863
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 94
+      signature_index: 87
       name:
         inner: 178
         span:
@@ -8569,7 +8449,7 @@ items:
         end: 10947
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 98
+      signature_index: 91
       name:
         inner: 179
         span:
@@ -8604,7 +8484,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 17
         span:
@@ -8650,7 +8530,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 23
         span:
@@ -8696,7 +8576,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 26
         span:
@@ -8742,7 +8622,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 29
         span:
@@ -8788,7 +8668,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 32
         span:
@@ -8834,7 +8714,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 38
         span:
@@ -8880,7 +8760,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 41
         span:
@@ -8926,7 +8806,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 44
         span:
@@ -8972,7 +8852,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 47
         span:
@@ -9018,7 +8898,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 91
+      signature_index: 84
       name:
         inner: 50
         span:
@@ -9064,7 +8944,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 111
+      signature_index: 104
       name:
         inner: 53
         span:
@@ -9101,7 +8981,7 @@ items:
         end: 12399
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 95
+      signature_index: 88
       name:
         inner: 178
         span:
@@ -9138,7 +9018,7 @@ items:
         end: 12483
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 99
+      signature_index: 92
       name:
         inner: 179
         span:
@@ -9173,7 +9053,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 17
         span:
@@ -9219,7 +9099,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 23
         span:
@@ -9265,7 +9145,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 26
         span:
@@ -9311,7 +9191,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 29
         span:
@@ -9357,7 +9237,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 32
         span:
@@ -9403,7 +9283,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 81
       name:
         inner: 35
         span:
@@ -9438,7 +9318,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 38
         span:
@@ -9484,7 +9364,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 41
         span:
@@ -9530,7 +9410,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 44
         span:
@@ -9576,7 +9456,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 47
         span:
@@ -9622,7 +9502,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 90
+      signature_index: 83
       name:
         inner: 50
         span:
@@ -9668,7 +9548,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 88
+      signature_index: 81
       name:
         inner: 53
         span:
@@ -9705,7 +9585,7 @@ items:
         end: 13865
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 96
+      signature_index: 89
       name:
         inner: 178
         span:
@@ -9742,7 +9622,7 @@ items:
         end: 13949
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 100
+      signature_index: 93
       name:
         inner: 179
         span:
@@ -9777,7 +9657,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 17
         span:
@@ -9823,7 +9703,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 23
         span:
@@ -9869,7 +9749,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 26
         span:
@@ -9915,7 +9795,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 29
         span:
@@ -9961,7 +9841,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 32
         span:
@@ -10007,7 +9887,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 38
         span:
@@ -10053,7 +9933,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 41
         span:
@@ -10099,7 +9979,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 44
         span:
@@ -10145,7 +10025,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 47
         span:
@@ -10191,7 +10071,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 92
+      signature_index: 85
       name:
         inner: 50
         span:
@@ -10237,7 +10117,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 112
+      signature_index: 105
       name:
         inner: 53
         span:
@@ -10272,7 +10152,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 17
         span:
@@ -10318,7 +10198,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 23
         span:
@@ -10368,7 +10248,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 26
         span:
@@ -10418,7 +10298,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 29
         span:
@@ -10468,7 +10348,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 83
+      signature_index: 76
       name:
         inner: 35
         span:
@@ -10503,7 +10383,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 85
+      signature_index: 78
       name:
         inner: 32
         span:
@@ -10549,7 +10429,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 17
         span:
@@ -10595,7 +10475,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 23
         span:
@@ -10645,7 +10525,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 26
         span:
@@ -10695,7 +10575,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 29
         span:
@@ -10745,7 +10625,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 84
+      signature_index: 77
       name:
         inner: 35
         span:
@@ -10780,7 +10660,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 86
+      signature_index: 79
       name:
         inner: 32
         span:
@@ -10826,7 +10706,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 17
         span:
@@ -10872,7 +10752,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 23
         span:
@@ -10918,7 +10798,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 26
         span:
@@ -10964,7 +10844,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 29
         span:
@@ -11010,7 +10890,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 32
         span:
@@ -11056,7 +10936,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 114
+      signature_index: 107
       name:
         inner: 35
         span:
@@ -11091,7 +10971,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 38
         span:
@@ -11137,7 +11017,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 41
         span:
@@ -11183,7 +11063,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 44
         span:
@@ -11229,7 +11109,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 47
         span:
@@ -11275,7 +11155,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 113
+      signature_index: 106
       name:
         inner: 50
         span:
@@ -11321,7 +11201,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 114
+      signature_index: 107
       name:
         inner: 53
         span:
@@ -11356,7 +11236,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 17
         span:
@@ -11402,7 +11282,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 23
         span:
@@ -11448,7 +11328,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 26
         span:
@@ -11494,7 +11374,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 29
         span:
@@ -11540,7 +11420,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 32
         span:
@@ -11586,7 +11466,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 38
         span:
@@ -11632,7 +11512,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 41
         span:
@@ -11678,7 +11558,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 44
         span:
@@ -11732,7 +11612,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 47
         span:
@@ -11778,7 +11658,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 115
+      signature_index: 108
       name:
         inner: 50
         span:
@@ -11824,7 +11704,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 116
+      signature_index: 109
       name:
         inner: 53
         span:
@@ -11859,7 +11739,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 17
         span:
@@ -11905,7 +11785,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 23
         span:
@@ -11951,7 +11831,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 26
         span:
@@ -11997,7 +11877,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 29
         span:
@@ -12043,7 +11923,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 32
         span:
@@ -12089,7 +11969,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 118
+      signature_index: 111
       name:
         inner: 35
         span:
@@ -12124,7 +12004,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 38
         span:
@@ -12170,7 +12050,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 41
         span:
@@ -12216,7 +12096,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 44
         span:
@@ -12262,7 +12142,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 47
         span:
@@ -12308,7 +12188,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 117
+      signature_index: 110
       name:
         inner: 50
         span:
@@ -12354,7 +12234,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 118
+      signature_index: 111
       name:
         inner: 53
         span:
@@ -12389,7 +12269,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 17
         span:
@@ -12435,7 +12315,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 23
         span:
@@ -12481,7 +12361,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 26
         span:
@@ -12527,7 +12407,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 29
         span:
@@ -12573,7 +12453,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 32
         span:
@@ -12619,7 +12499,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 38
         span:
@@ -12665,7 +12545,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 41
         span:
@@ -12711,7 +12591,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 44
         span:
@@ -12757,7 +12637,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 47
         span:
@@ -12803,7 +12683,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 119
+      signature_index: 112
       name:
         inner: 50
         span:
@@ -12849,7 +12729,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 120
+      signature_index: 113
       name:
         inner: 53
         span:
@@ -12884,7 +12764,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 121
+      signature_index: 114
       name:
         inner: 38
         span:
@@ -12930,7 +12810,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 121
+      signature_index: 114
       name:
         inner: 41
         span:
@@ -13008,7 +12888,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 0
-      signature_index: 121
+      signature_index: 114
       name:
         inner: 44
         span:
@@ -13046,6 +12926,126 @@ items:
       attributes:
         - Inline
       body: 146
+    - id: 427
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 137
+      name:
+        inner: 201
+        span:
+          start: 25466
+          end: 25470
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25471
+              end: 25475
+          ty:
+            inner: 21
+            span:
+              start: 25471
+              end: 25475
+        - mut_span: ~
+          name:
+            inner: 187
+            span:
+              start: 25477
+              end: 25482
+          ty:
+            inner: 135
+            span:
+              start: 25484
+              end: 25494
+      result:
+        inner: 136
+        span:
+          start: 25499
+          end: 25517
+      accesses: []
+      attributes:
+        - Inline
+      body: 147
+    - id: 428
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 138
+      name:
+        inner: 202
+        span:
+          start: 25640
+          end: 25650
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25651
+              end: 25655
+          ty:
+            inner: 21
+            span:
+              start: 25651
+              end: 25655
+      result:
+        inner: 135
+        span:
+          start: 25660
+          end: 25670
+      accesses:
+        - file_id: 0
+          span:
+            start: 25832
+            end: 25842
+      attributes:
+        - Inline
+      body: 148
+    - id: 429
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      type_params: []
+      inherited_type_param_count: 1
+      signature_index: 138
+      name:
+        inner: 203
+        span:
+          start: 25786
+          end: 25796
+      params:
+        - mut_span: ~
+          name:
+            inner: 18
+            span:
+              start: 25797
+              end: 25801
+          ty:
+            inner: 21
+            span:
+              start: 25797
+              end: 25801
+      result:
+        inner: 135
+        span:
+          start: 25806
+          end: 25816
+      accesses: []
+      attributes:
+        - Inline
+      body: 149
     - id: 434
       file_id: 0
       namespace: 0
@@ -13081,7 +13081,7 @@ items:
           end: 26133
       params: []
       result:
-        inner: 31
+        inner: 24
         span:
           start: 26142
           end: 26146
@@ -13139,7 +13139,7 @@ items:
               start: 26260
               end: 26269
       result:
-        inner: 31
+        inner: 24
         span:
           start: 26274
           end: 26278
@@ -13175,7 +13175,7 @@ items:
               start: 26389
               end: 26393
           ty:
-            inner: 31
+            inner: 24
             span:
               start: 26389
               end: 26393
@@ -13212,7 +13212,7 @@ items:
               start: 26466
               end: 26470
           ty:
-            inner: 31
+            inner: 24
             span:
               start: 26466
               end: 26470
@@ -13233,7 +13233,7 @@ items:
       pub_span: ~
       type_params: []
       inherited_type_param_count: 1
-      signature_index: 161
+      signature_index: 154
       name:
         inner: 213
         span:
@@ -13258,12 +13258,12 @@ items:
               start: 26600
               end: 26606
           ty:
-            inner: 159
+            inner: 152
             span:
               start: 26608
               end: 26625
       result:
-        inner: 160
+        inner: 153
         span:
           start: 26630
           end: 26644
@@ -13311,7 +13311,7 @@ items:
                 start: 26786
                 end: 26787
       inherited_type_param_count: 1
-      signature_index: 154
+      signature_index: 157
       name:
         inner: 215
         span:
@@ -13336,12 +13336,12 @@ items:
               start: 26710
               end: 26715
           ty:
-            inner: 152
+            inner: 155
             span:
               start: 26717
               end: 26718
       result:
-        inner: 153
+        inner: 156
         span:
           start: 26723
           end: 26736
@@ -13378,7 +13378,7 @@ items:
                 start: 27033
                 end: 27034
       inherited_type_param_count: 1
-      signature_index: 158
+      signature_index: 161
       name:
         inner: 217
         span:
@@ -13403,12 +13403,12 @@ items:
               start: 26922
               end: 26925
           ty:
-            inner: 155
+            inner: 158
             span:
               start: 26927
               end: 26942
       result:
-        inner: 157
+        inner: 160
         span:
           start: 26947
           end: 26962
@@ -13440,7 +13440,7 @@ items:
               start: 27229
               end: 27233
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27229
               end: 27233
@@ -13471,7 +13471,7 @@ items:
           end: 27290
       params: []
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27296
           end: 27300
@@ -13507,7 +13507,7 @@ items:
               start: 27361
               end: 27368
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27373
           end: 27377
@@ -13543,7 +13543,7 @@ items:
               start: 27445
               end: 27452
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27457
           end: 27461
@@ -13579,7 +13579,7 @@ items:
               start: 27531
               end: 27540
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27545
           end: 27549
@@ -13610,7 +13610,7 @@ items:
               start: 27600
               end: 27604
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27600
               end: 27604
@@ -13646,7 +13646,7 @@ items:
               start: 27667
               end: 27671
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27667
               end: 27671
@@ -13682,7 +13682,7 @@ items:
               start: 27735
               end: 27739
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27735
               end: 27739
@@ -13718,7 +13718,7 @@ items:
               start: 27796
               end: 27800
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27796
               end: 27800
@@ -13734,7 +13734,7 @@ items:
               start: 27809
               end: 27818
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27823
           end: 27827
@@ -13765,7 +13765,7 @@ items:
               start: 27916
               end: 27920
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 27916
               end: 27920
@@ -13781,7 +13781,7 @@ items:
               start: 27929
               end: 27938
       result:
-        inner: 36
+        inner: 29
         span:
           start: 27943
           end: 27947
@@ -13812,7 +13812,7 @@ items:
               start: 28143
               end: 28147
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 28143
               end: 28147
@@ -13828,7 +13828,7 @@ items:
               start: 28156
               end: 28165
       result:
-        inner: 36
+        inner: 29
         span:
           start: 28170
           end: 28174
@@ -13872,7 +13872,7 @@ items:
               start: 28266
               end: 28270
           ty:
-            inner: 36
+            inner: 29
             span:
               start: 28266
               end: 28270
@@ -13908,7 +13908,7 @@ items:
               start: 28404
               end: 28408
           ty:
-            inner: 39
+            inner: 32
             span:
               start: 28404
               end: 28408
@@ -13945,7 +13945,7 @@ items:
               start: 28485
               end: 28489
           ty:
-            inner: 39
+            inner: 32
             span:
               start: 28485
               end: 28489
@@ -14539,7 +14539,7 @@ items:
               start: 26032
               end: 26036
           ty:
-            inner: 29
+            inner: 22
             span:
               start: 26038
               end: 26047
@@ -14566,7 +14566,7 @@ items:
               start: 26053
               end: 26058
           ty:
-            inner: 29
+            inner: 22
             span:
               start: 26060
               end: 26069
@@ -14654,7 +14654,7 @@ items:
               start: 27141
               end: 27145
           ty:
-            inner: 33
+            inner: 26
             span:
               start: 27147
               end: 27156
@@ -14792,7 +14792,7 @@ items:
               end: 432
       entries:
         17:
-          Method: 96
+          Method: 93
     - id: 16
       file_id: 0
       namespace: 0
@@ -14829,7 +14829,7 @@ items:
               end: 503
       entries:
         23:
-          Method: 97
+          Method: 94
     - id: 18
       file_id: 0
       namespace: 0
@@ -14866,7 +14866,7 @@ items:
               end: 574
       entries:
         26:
-          Method: 98
+          Method: 95
     - id: 20
       file_id: 0
       namespace: 0
@@ -14903,7 +14903,7 @@ items:
               end: 645
       entries:
         29:
-          Method: 99
+          Method: 96
     - id: 22
       file_id: 0
       namespace: 0
@@ -14940,7 +14940,7 @@ items:
               end: 716
       entries:
         32:
-          Method: 100
+          Method: 97
     - id: 24
       file_id: 0
       namespace: 0
@@ -14973,7 +14973,7 @@ items:
               end: 776
       entries:
         35:
-          Method: 101
+          Method: 98
     - id: 26
       file_id: 0
       namespace: 0
@@ -15010,7 +15010,7 @@ items:
               end: 856
       entries:
         38:
-          Method: 102
+          Method: 99
     - id: 28
       file_id: 0
       namespace: 0
@@ -15047,7 +15047,7 @@ items:
               end: 933
       entries:
         41:
-          Method: 103
+          Method: 100
     - id: 30
       file_id: 0
       namespace: 0
@@ -15084,7 +15084,7 @@ items:
               end: 1013
       entries:
         44:
-          Method: 104
+          Method: 101
     - id: 32
       file_id: 0
       namespace: 0
@@ -15121,7 +15121,7 @@ items:
               end: 1084
       entries:
         47:
-          Method: 105
+          Method: 102
     - id: 34
       file_id: 0
       namespace: 0
@@ -15158,7 +15158,7 @@ items:
               end: 1155
       entries:
         50:
-          Method: 106
+          Method: 103
     - id: 36
       file_id: 0
       namespace: 0
@@ -15191,7 +15191,7 @@ items:
               end: 1224
       entries:
         53:
-          Method: 107
+          Method: 104
     - id: 399
       file_id: 0
       namespace: 0
@@ -15316,17 +15316,17 @@ items:
         59:
           AssocType: 0
         198:
-          AssocConstant: 1
+          AssocConstant: 15
         199:
-          AssocConstant: 2
+          AssocConstant: 16
         200:
-          AssocConstant: 3
+          AssocConstant: 17
         201:
-          Method: 93
+          Method: 252
         202:
-          Method: 94
+          Method: 253
         203:
-          Method: 95
+          Method: 254
     - id: 443
       file_id: 0
       namespace: 0
@@ -15359,6 +15359,18 @@ items:
               end: 26586
           - file_id: 0
             span:
+              start: 26594
+              end: 26598
+          - file_id: 0
+            span:
+              start: 26615
+              end: 26619
+          - file_id: 0
+            span:
+              start: 26630
+              end: 26634
+          - file_id: 0
+            span:
               start: 26692
               end: 26696
           - file_id: 0
@@ -15387,18 +15399,6 @@ items:
               end: 26951
           - file_id: 0
             span:
-              start: 26594
-              end: 26598
-          - file_id: 0
-            span:
-              start: 26615
-              end: 26619
-          - file_id: 0
-            span:
-              start: 26630
-              end: 26634
-          - file_id: 0
-            span:
               start: 26795
               end: 26799
           - file_id: 0
@@ -15425,7 +15425,7 @@ items:
           end: 9562
       members:
         17:
-          Method: 142
+          Method: 139
       file_id: 0
       namespace: 0
     - id: 177
@@ -15438,7 +15438,7 @@ items:
           end: 9669
       members:
         23:
-          Method: 143
+          Method: 140
       file_id: 0
       namespace: 0
     - id: 179
@@ -15451,7 +15451,7 @@ items:
           end: 9776
       members:
         26:
-          Method: 144
+          Method: 141
       file_id: 0
       namespace: 0
     - id: 181
@@ -15464,7 +15464,7 @@ items:
           end: 9883
       members:
         29:
-          Method: 145
+          Method: 142
       file_id: 0
       namespace: 0
     - id: 183
@@ -15477,7 +15477,7 @@ items:
           end: 9990
       members:
         32:
-          Method: 146
+          Method: 143
       file_id: 0
       namespace: 0
     - id: 185
@@ -15490,7 +15490,7 @@ items:
           end: 10097
       members:
         35:
-          Method: 147
+          Method: 144
       file_id: 0
       namespace: 0
     - id: 187
@@ -15503,7 +15503,7 @@ items:
           end: 10191
       members:
         38:
-          Method: 148
+          Method: 145
       file_id: 0
       namespace: 0
     - id: 189
@@ -15516,7 +15516,7 @@ items:
           end: 10306
       members:
         41:
-          Method: 149
+          Method: 146
       file_id: 0
       namespace: 0
     - id: 191
@@ -15529,7 +15529,7 @@ items:
           end: 10420
       members:
         44:
-          Method: 150
+          Method: 147
       file_id: 0
       namespace: 0
     - id: 193
@@ -15542,7 +15542,7 @@ items:
           end: 10533
       members:
         47:
-          Method: 151
+          Method: 148
       file_id: 0
       namespace: 0
     - id: 195
@@ -15555,7 +15555,7 @@ items:
           end: 10640
       members:
         50:
-          Method: 152
+          Method: 149
       file_id: 0
       namespace: 0
     - id: 197
@@ -15568,7 +15568,7 @@ items:
           end: 10750
       members:
         53:
-          Method: 153
+          Method: 150
       file_id: 0
       namespace: 0
     - id: 202
@@ -15581,7 +15581,7 @@ items:
           end: 11028
       members:
         17:
-          Method: 156
+          Method: 153
       file_id: 0
       namespace: 0
     - id: 204
@@ -15594,7 +15594,7 @@ items:
           end: 11156
       members:
         23:
-          Method: 157
+          Method: 154
       file_id: 0
       namespace: 0
     - id: 206
@@ -15607,7 +15607,7 @@ items:
           end: 11284
       members:
         26:
-          Method: 158
+          Method: 155
       file_id: 0
       namespace: 0
     - id: 208
@@ -15620,7 +15620,7 @@ items:
           end: 11412
       members:
         29:
-          Method: 159
+          Method: 156
       file_id: 0
       namespace: 0
     - id: 210
@@ -15633,7 +15633,7 @@ items:
           end: 11519
       members:
         32:
-          Method: 160
+          Method: 157
       file_id: 0
       namespace: 0
     - id: 212
@@ -15646,7 +15646,7 @@ items:
           end: 11629
       members:
         38:
-          Method: 161
+          Method: 158
       file_id: 0
       namespace: 0
     - id: 214
@@ -15659,7 +15659,7 @@ items:
           end: 11765
       members:
         41:
-          Method: 162
+          Method: 159
       file_id: 0
       namespace: 0
     - id: 216
@@ -15672,7 +15672,7 @@ items:
           end: 11900
       members:
         44:
-          Method: 163
+          Method: 160
       file_id: 0
       namespace: 0
     - id: 218
@@ -15685,7 +15685,7 @@ items:
           end: 12034
       members:
         47:
-          Method: 164
+          Method: 161
       file_id: 0
       namespace: 0
     - id: 220
@@ -15698,7 +15698,7 @@ items:
           end: 12162
       members:
         50:
-          Method: 165
+          Method: 162
       file_id: 0
       namespace: 0
     - id: 222
@@ -15711,7 +15711,7 @@ items:
           end: 12272
       members:
         53:
-          Method: 166
+          Method: 163
       file_id: 0
       namespace: 0
     - id: 227
@@ -15724,7 +15724,7 @@ items:
           end: 12564
       members:
         17:
-          Method: 169
+          Method: 166
       file_id: 0
       namespace: 0
     - id: 229
@@ -15737,7 +15737,7 @@ items:
           end: 12671
       members:
         23:
-          Method: 170
+          Method: 167
       file_id: 0
       namespace: 0
     - id: 231
@@ -15750,7 +15750,7 @@ items:
           end: 12778
       members:
         26:
-          Method: 171
+          Method: 168
       file_id: 0
       namespace: 0
     - id: 233
@@ -15763,7 +15763,7 @@ items:
           end: 12885
       members:
         29:
-          Method: 172
+          Method: 169
       file_id: 0
       namespace: 0
     - id: 235
@@ -15776,7 +15776,7 @@ items:
           end: 12992
       members:
         32:
-          Method: 173
+          Method: 170
       file_id: 0
       namespace: 0
     - id: 237
@@ -15789,7 +15789,7 @@ items:
           end: 13099
       members:
         35:
-          Method: 174
+          Method: 171
       file_id: 0
       namespace: 0
     - id: 239
@@ -15802,7 +15802,7 @@ items:
           end: 13193
       members:
         38:
-          Method: 175
+          Method: 172
       file_id: 0
       namespace: 0
     - id: 241
@@ -15815,7 +15815,7 @@ items:
           end: 13308
       members:
         41:
-          Method: 176
+          Method: 173
       file_id: 0
       namespace: 0
     - id: 243
@@ -15828,7 +15828,7 @@ items:
           end: 13422
       members:
         44:
-          Method: 177
+          Method: 174
       file_id: 0
       namespace: 0
     - id: 245
@@ -15841,7 +15841,7 @@ items:
           end: 13535
       members:
         47:
-          Method: 178
+          Method: 175
       file_id: 0
       namespace: 0
     - id: 247
@@ -15854,7 +15854,7 @@ items:
           end: 13642
       members:
         50:
-          Method: 179
+          Method: 176
       file_id: 0
       namespace: 0
     - id: 249
@@ -15867,7 +15867,7 @@ items:
           end: 13752
       members:
         53:
-          Method: 180
+          Method: 177
       file_id: 0
       namespace: 0
     - id: 254
@@ -15880,7 +15880,7 @@ items:
           end: 14030
       members:
         17:
-          Method: 183
+          Method: 180
       file_id: 0
       namespace: 0
     - id: 256
@@ -15893,7 +15893,7 @@ items:
           end: 14158
       members:
         23:
-          Method: 184
+          Method: 181
       file_id: 0
       namespace: 0
     - id: 258
@@ -15906,7 +15906,7 @@ items:
           end: 14286
       members:
         26:
-          Method: 185
+          Method: 182
       file_id: 0
       namespace: 0
     - id: 260
@@ -15919,7 +15919,7 @@ items:
           end: 14414
       members:
         29:
-          Method: 186
+          Method: 183
       file_id: 0
       namespace: 0
     - id: 262
@@ -15932,7 +15932,7 @@ items:
           end: 14521
       members:
         32:
-          Method: 187
+          Method: 184
       file_id: 0
       namespace: 0
     - id: 264
@@ -15945,7 +15945,7 @@ items:
           end: 14631
       members:
         38:
-          Method: 188
+          Method: 185
       file_id: 0
       namespace: 0
     - id: 266
@@ -15958,7 +15958,7 @@ items:
           end: 14767
       members:
         41:
-          Method: 189
+          Method: 186
       file_id: 0
       namespace: 0
     - id: 268
@@ -15971,7 +15971,7 @@ items:
           end: 14902
       members:
         44:
-          Method: 190
+          Method: 187
       file_id: 0
       namespace: 0
     - id: 270
@@ -15984,7 +15984,7 @@ items:
           end: 15036
       members:
         47:
-          Method: 191
+          Method: 188
       file_id: 0
       namespace: 0
     - id: 272
@@ -15997,7 +15997,7 @@ items:
           end: 15164
       members:
         50:
-          Method: 192
+          Method: 189
       file_id: 0
       namespace: 0
     - id: 274
@@ -16010,7 +16010,7 @@ items:
           end: 15274
       members:
         53:
-          Method: 193
+          Method: 190
       file_id: 0
       namespace: 0
     - id: 276
@@ -16023,7 +16023,7 @@ items:
           end: 15385
       members:
         17:
-          Method: 194
+          Method: 191
       file_id: 0
       namespace: 0
     - id: 278
@@ -16036,7 +16036,7 @@ items:
           end: 15492
       members:
         23:
-          Method: 195
+          Method: 192
       file_id: 0
       namespace: 0
     - id: 280
@@ -16049,7 +16049,7 @@ items:
           end: 15599
       members:
         26:
-          Method: 196
+          Method: 193
       file_id: 0
       namespace: 0
     - id: 282
@@ -16062,7 +16062,7 @@ items:
           end: 15706
       members:
         29:
-          Method: 197
+          Method: 194
       file_id: 0
       namespace: 0
     - id: 284
@@ -16075,7 +16075,7 @@ items:
           end: 15813
       members:
         35:
-          Method: 198
+          Method: 195
       file_id: 0
       namespace: 0
     - id: 286
@@ -16088,7 +16088,7 @@ items:
           end: 15904
       members:
         32:
-          Method: 199
+          Method: 196
       file_id: 0
       namespace: 0
     - id: 288
@@ -16101,7 +16101,7 @@ items:
           end: 16026
       members:
         17:
-          Method: 200
+          Method: 197
       file_id: 0
       namespace: 0
     - id: 290
@@ -16114,7 +16114,7 @@ items:
           end: 16133
       members:
         23:
-          Method: 201
+          Method: 198
       file_id: 0
       namespace: 0
     - id: 292
@@ -16127,7 +16127,7 @@ items:
           end: 16240
       members:
         26:
-          Method: 202
+          Method: 199
       file_id: 0
       namespace: 0
     - id: 294
@@ -16140,7 +16140,7 @@ items:
           end: 16347
       members:
         29:
-          Method: 203
+          Method: 200
       file_id: 0
       namespace: 0
     - id: 296
@@ -16153,7 +16153,7 @@ items:
           end: 16454
       members:
         35:
-          Method: 204
+          Method: 201
       file_id: 0
       namespace: 0
     - id: 298
@@ -16166,7 +16166,7 @@ items:
           end: 16545
       members:
         32:
-          Method: 205
+          Method: 202
       file_id: 0
       namespace: 0
     - id: 300
@@ -16179,7 +16179,7 @@ items:
           end: 16666
       members:
         17:
-          Method: 206
+          Method: 203
       file_id: 0
       namespace: 0
     - id: 302
@@ -16192,7 +16192,7 @@ items:
           end: 16792
       members:
         23:
-          Method: 207
+          Method: 204
       file_id: 0
       namespace: 0
     - id: 304
@@ -16205,7 +16205,7 @@ items:
           end: 16918
       members:
         26:
-          Method: 208
+          Method: 205
       file_id: 0
       namespace: 0
     - id: 306
@@ -16218,7 +16218,7 @@ items:
           end: 17044
       members:
         29:
-          Method: 209
+          Method: 206
       file_id: 0
       namespace: 0
     - id: 308
@@ -16231,7 +16231,7 @@ items:
           end: 17170
       members:
         32:
-          Method: 210
+          Method: 207
       file_id: 0
       namespace: 0
     - id: 310
@@ -16244,7 +16244,7 @@ items:
           end: 17296
       members:
         35:
-          Method: 211
+          Method: 208
       file_id: 0
       namespace: 0
     - id: 312
@@ -16257,7 +16257,7 @@ items:
           end: 17402
       members:
         38:
-          Method: 212
+          Method: 209
       file_id: 0
       namespace: 0
     - id: 314
@@ -16270,7 +16270,7 @@ items:
           end: 17536
       members:
         41:
-          Method: 213
+          Method: 210
       file_id: 0
       namespace: 0
     - id: 316
@@ -16283,7 +16283,7 @@ items:
           end: 17669
       members:
         44:
-          Method: 214
+          Method: 211
       file_id: 0
       namespace: 0
     - id: 318
@@ -16296,7 +16296,7 @@ items:
           end: 17801
       members:
         47:
-          Method: 215
+          Method: 212
       file_id: 0
       namespace: 0
     - id: 320
@@ -16309,7 +16309,7 @@ items:
           end: 17927
       members:
         50:
-          Method: 216
+          Method: 213
       file_id: 0
       namespace: 0
     - id: 322
@@ -16322,7 +16322,7 @@ items:
           end: 18056
       members:
         53:
-          Method: 217
+          Method: 214
       file_id: 0
       namespace: 0
     - id: 324
@@ -16335,7 +16335,7 @@ items:
           end: 18165
       members:
         17:
-          Method: 218
+          Method: 215
       file_id: 0
       namespace: 0
     - id: 326
@@ -16348,7 +16348,7 @@ items:
           end: 18291
       members:
         23:
-          Method: 219
+          Method: 216
       file_id: 0
       namespace: 0
     - id: 328
@@ -16361,7 +16361,7 @@ items:
           end: 18417
       members:
         26:
-          Method: 220
+          Method: 217
       file_id: 0
       namespace: 0
     - id: 330
@@ -16374,7 +16374,7 @@ items:
           end: 18543
       members:
         29:
-          Method: 221
+          Method: 218
       file_id: 0
       namespace: 0
     - id: 332
@@ -16387,7 +16387,7 @@ items:
           end: 18669
       members:
         32:
-          Method: 222
+          Method: 219
       file_id: 0
       namespace: 0
     - id: 334
@@ -16400,7 +16400,7 @@ items:
           end: 18798
       members:
         38:
-          Method: 223
+          Method: 220
       file_id: 0
       namespace: 0
     - id: 336
@@ -16413,7 +16413,7 @@ items:
           end: 18932
       members:
         41:
-          Method: 224
+          Method: 221
       file_id: 0
       namespace: 0
     - id: 338
@@ -16426,7 +16426,7 @@ items:
           end: 19065
       members:
         44:
-          Method: 225
+          Method: 222
       file_id: 0
       namespace: 0
     - id: 340
@@ -16439,7 +16439,7 @@ items:
           end: 19197
       members:
         47:
-          Method: 226
+          Method: 223
       file_id: 0
       namespace: 0
     - id: 342
@@ -16452,7 +16452,7 @@ items:
           end: 19323
       members:
         50:
-          Method: 227
+          Method: 224
       file_id: 0
       namespace: 0
     - id: 344
@@ -16465,7 +16465,7 @@ items:
           end: 19452
       members:
         53:
-          Method: 228
+          Method: 225
       file_id: 0
       namespace: 0
     - id: 346
@@ -16478,7 +16478,7 @@ items:
           end: 19562
       members:
         17:
-          Method: 229
+          Method: 226
       file_id: 0
       namespace: 0
     - id: 348
@@ -16491,7 +16491,7 @@ items:
           end: 19690
       members:
         23:
-          Method: 230
+          Method: 227
       file_id: 0
       namespace: 0
     - id: 350
@@ -16504,7 +16504,7 @@ items:
           end: 19818
       members:
         26:
-          Method: 231
+          Method: 228
       file_id: 0
       namespace: 0
     - id: 352
@@ -16517,7 +16517,7 @@ items:
           end: 19946
       members:
         29:
-          Method: 232
+          Method: 229
       file_id: 0
       namespace: 0
     - id: 354
@@ -16530,7 +16530,7 @@ items:
           end: 20074
       members:
         32:
-          Method: 233
+          Method: 230
       file_id: 0
       namespace: 0
     - id: 356
@@ -16543,7 +16543,7 @@ items:
           end: 20202
       members:
         35:
-          Method: 234
+          Method: 231
       file_id: 0
       namespace: 0
     - id: 358
@@ -16556,7 +16556,7 @@ items:
           end: 20310
       members:
         38:
-          Method: 235
+          Method: 232
       file_id: 0
       namespace: 0
     - id: 360
@@ -16569,7 +16569,7 @@ items:
           end: 20446
       members:
         41:
-          Method: 236
+          Method: 233
       file_id: 0
       namespace: 0
     - id: 362
@@ -16582,7 +16582,7 @@ items:
           end: 20581
       members:
         44:
-          Method: 237
+          Method: 234
       file_id: 0
       namespace: 0
     - id: 364
@@ -16595,7 +16595,7 @@ items:
           end: 20715
       members:
         47:
-          Method: 238
+          Method: 235
       file_id: 0
       namespace: 0
     - id: 366
@@ -16608,7 +16608,7 @@ items:
           end: 20843
       members:
         50:
-          Method: 239
+          Method: 236
       file_id: 0
       namespace: 0
     - id: 368
@@ -16621,7 +16621,7 @@ items:
           end: 20974
       members:
         53:
-          Method: 240
+          Method: 237
       file_id: 0
       namespace: 0
     - id: 370
@@ -16634,7 +16634,7 @@ items:
           end: 21085
       members:
         17:
-          Method: 241
+          Method: 238
       file_id: 0
       namespace: 0
     - id: 372
@@ -16647,7 +16647,7 @@ items:
           end: 21213
       members:
         23:
-          Method: 242
+          Method: 239
       file_id: 0
       namespace: 0
     - id: 374
@@ -16660,7 +16660,7 @@ items:
           end: 21341
       members:
         26:
-          Method: 243
+          Method: 240
       file_id: 0
       namespace: 0
     - id: 376
@@ -16673,7 +16673,7 @@ items:
           end: 21469
       members:
         29:
-          Method: 244
+          Method: 241
       file_id: 0
       namespace: 0
     - id: 378
@@ -16686,7 +16686,7 @@ items:
           end: 21597
       members:
         32:
-          Method: 245
+          Method: 242
       file_id: 0
       namespace: 0
     - id: 380
@@ -16699,7 +16699,7 @@ items:
           end: 21728
       members:
         38:
-          Method: 246
+          Method: 243
       file_id: 0
       namespace: 0
     - id: 382
@@ -16712,7 +16712,7 @@ items:
           end: 21864
       members:
         41:
-          Method: 247
+          Method: 244
       file_id: 0
       namespace: 0
     - id: 384
@@ -16725,7 +16725,7 @@ items:
           end: 21999
       members:
         44:
-          Method: 248
+          Method: 245
       file_id: 0
       namespace: 0
     - id: 386
@@ -16738,7 +16738,7 @@ items:
           end: 22133
       members:
         47:
-          Method: 249
+          Method: 246
       file_id: 0
       namespace: 0
     - id: 388
@@ -16751,7 +16751,7 @@ items:
           end: 22261
       members:
         50:
-          Method: 250
+          Method: 247
       file_id: 0
       namespace: 0
     - id: 390
@@ -16764,7 +16764,7 @@ items:
           end: 22392
       members:
         53:
-          Method: 251
+          Method: 248
       file_id: 0
       namespace: 0
     - id: 392
@@ -16777,7 +16777,7 @@ items:
           end: 22507
       members:
         38:
-          Method: 252
+          Method: 249
       file_id: 0
       namespace: 0
     - id: 394
@@ -16790,7 +16790,7 @@ items:
           end: 22645
       members:
         41:
-          Method: 253
+          Method: 250
       file_id: 0
       namespace: 0
     - id: 396
@@ -16803,7 +16803,7 @@ items:
           end: 22782
       members:
         44:
-          Method: 254
+          Method: 251
       file_id: 0
       namespace: 0
     - id: 403
@@ -16945,78 +16945,6 @@ items:
           span:
             start: 28921
             end: 28936
-      attributes: []
-    - id: 424
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 198
-        span:
-          start: 24873
-          end: 24878
-      ty:
-        inner: 10
-        span:
-          start: 24880
-          end: 24883
-      value: ~
-      const_value: ~
-      accesses: []
-      attributes: []
-    - id: 425
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 199
-        span:
-          start: 25092
-          end: 25100
-      ty:
-        inner: 22
-        span:
-          start: 25102
-          end: 25111
-      value: ~
-      const_value: ~
-      accesses: []
-      attributes: []
-    - id: 426
-      file_id: 0
-      namespace: 0
-      parent:
-        Trait: 14
-      pub_span: ~
-      name:
-        inner: 200
-        span:
-          start: 25313
-          end: 25322
-      ty:
-        inner: 23
-        span:
-          start: 25324
-          end: 25334
-      value:
-        kind:
-          Int:
-            value: 65536
-        ty: 23
-        span:
-          start: 25337
-          end: 25342
-      const_value:
-        Int: 65536
-      accesses:
-        - file_id: 0
-          span:
-            start: 25853
-            end: 25862
       attributes: []
     - id: 123
       file_id: 0
@@ -17605,6 +17533,78 @@ items:
       const_value:
         Float: 179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
       accesses: []
+      attributes: []
+    - id: 424
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 198
+        span:
+          start: 24873
+          end: 24878
+      ty:
+        inner: 10
+        span:
+          start: 24880
+          end: 24883
+      value: ~
+      const_value: ~
+      accesses: []
+      attributes: []
+    - id: 425
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 199
+        span:
+          start: 25092
+          end: 25100
+      ty:
+        inner: 134
+        span:
+          start: 25102
+          end: 25111
+      value: ~
+      const_value: ~
+      accesses: []
+      attributes: []
+    - id: 426
+      file_id: 0
+      namespace: 0
+      parent:
+        Trait: 14
+      pub_span: ~
+      name:
+        inner: 200
+        span:
+          start: 25313
+          end: 25322
+      ty:
+        inner: 135
+        span:
+          start: 25324
+          end: 25334
+      value:
+        kind:
+          Int:
+            value: 65536
+        ty: 135
+        span:
+          start: 25337
+          end: 25342
+      const_value:
+        Int: 65536
+      accesses:
+        - file_id: 0
+          span:
+            start: 25853
+            end: 25862
       attributes: []
   bodies:
     - stack:
@@ -28075,15 +28075,15 @@ items:
                   span:
                     start: 25477
                     end: 25482
-                ty: 23
+                ty: 135
                 mut_span: ~
                 accesses:
                   - span:
                       start: 25546
                       end: 25551
                     kind: Read
-            inferred_type: 26
-            expected_type: 26
+            inferred_type: 136
+            expected_type: 136
       block:
         kind:
           Block:
@@ -28108,15 +28108,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 23
+                      ty: 135
                       span:
                         start: 25546
                         end: 25551
-              ty: 26
+              ty: 136
               span:
                 start: 25528
                 end: 25552
-        ty: 26
+        ty: 136
         span:
           start: 25518
           end: 25558
@@ -28142,8 +28142,8 @@ items:
                       start: 25693
                       end: 25697
                     kind: Read
-            inferred_type: 23
-            expected_type: 23
+            inferred_type: 135
+            expected_type: 135
       block:
         kind:
           Block:
@@ -28164,11 +28164,11 @@ items:
                       span:
                         start: 25693
                         end: 25697
-              ty: 23
+              ty: 135
               span:
                 start: 25681
                 end: 25698
-        ty: 23
+        ty: 135
         span:
           start: 25671
           end: 25704
@@ -28194,8 +28194,8 @@ items:
                       start: 25827
                       end: 25831
                     kind: Read
-            inferred_type: 23
-            expected_type: 23
+            inferred_type: 135
+            expected_type: 135
       block:
         kind:
           Block:
@@ -28206,7 +28206,7 @@ items:
                 GenericMethodCall:
                   id: 17
                   type_args:
-                    - 23
+                    - 135
                   arguments:
                     - kind:
                         GenericMethodCall:
@@ -28222,7 +28222,7 @@ items:
                               span:
                                 start: 25827
                                 end: 25831
-                      ty: 23
+                      ty: 135
                       span:
                         start: 25827
                         end: 25844
@@ -28237,19 +28237,19 @@ items:
                             kind:
                               Const:
                                 id: 426
-                            ty: 23
+                            ty: 135
                             span:
                               start: 25853
                               end: 25862
-                      ty: 23
+                      ty: 135
                       span:
                         start: 25847
                         end: 25862
-              ty: 23
+              ty: 135
               span:
                 start: 25827
                 end: 25862
-        ty: 23
+        ty: 135
         span:
           start: 25817
           end: 25868
@@ -28263,8 +28263,8 @@ items:
               start: 26147
               end: 26217
             locals: []
-            inferred_type: 31
-            expected_type: 31
+            inferred_type: 24
+            expected_type: 24
       block:
         kind:
           Block:
@@ -28280,7 +28280,7 @@ items:
                           id: 431
                           type_args:
                             - 267
-                            - 30
+                            - 23
                           arguments: []
                       ty: 146
                       span:
@@ -28291,17 +28291,17 @@ items:
                           id: 432
                           type_args:
                             - 267
-                            - 30
+                            - 23
                           arguments: []
                       ty: 146
                       span:
                         start: 26194
                         end: 26209
-              ty: 31
+              ty: 24
               span:
                 start: 26157
                 end: 26211
-        ty: 31
+        ty: 24
         span:
           start: 26147
           end: 26217
@@ -28327,8 +28327,8 @@ items:
                       start: 26344
                       end: 26349
                     kind: Read
-            inferred_type: 31
-            expected_type: 31
+            inferred_type: 24
+            expected_type: 24
       block:
         kind:
           Block:
@@ -28350,7 +28350,7 @@ items:
                                   id: 431
                                   type_args:
                                     - 270
-                                    - 30
+                                    - 23
                                   arguments: []
                               ty: 146
                               span:
@@ -28373,17 +28373,17 @@ items:
                           id: 432
                           type_args:
                             - 270
-                            - 30
+                            - 23
                           arguments: []
                       ty: 146
                       span:
                         start: 26304
                         end: 26319
-              ty: 31
+              ty: 24
               span:
                 start: 26289
                 end: 26351
-        ty: 31
+        ty: 24
         span:
           start: 26279
           end: 26357
@@ -28402,7 +28402,7 @@ items:
                   span:
                     start: 26389
                     end: 26393
-                ty: 31
+                ty: 24
                 mut_span: ~
                 accesses:
                   - span:
@@ -28424,7 +28424,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 31
+                    ty: 24
                     span:
                       start: 26418
                       end: 26422
@@ -28456,7 +28456,7 @@ items:
                   span:
                     start: 26466
                     end: 26470
-                ty: 31
+                ty: 24
                 mut_span: ~
                 accesses:
                   - span:
@@ -28478,7 +28478,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 31
+                    ty: 24
                     span:
                       start: 26495
                       end: 26499
@@ -28522,7 +28522,7 @@ items:
                   span:
                     start: 26710
                     end: 26715
-                ty: 152
+                ty: 155
                 mut_span: ~
                 accesses:
                   - span:
@@ -28534,7 +28534,7 @@ items:
                   span:
                     start: 26753
                     end: 26756
-                ty: 153
+                ty: 156
                 mut_span: ~
                 accesses:
                   - span:
@@ -28545,8 +28545,8 @@ items:
                       start: 26841
                       end: 26844
                     kind: Read
-            inferred_type: 153
-            expected_type: 153
+            inferred_type: 156
+            expected_type: 156
       block:
         kind:
           Block:
@@ -28581,13 +28581,13 @@ items:
                                   id: 434
                                   type_args:
                                     - 150
-                                    - 152
+                                    - 155
                                   arguments: []
-                              ty: 159
+                              ty: 152
                               span:
                                 start: 26773
                                 end: 26790
-                      ty: 153
+                      ty: 156
                       span:
                         start: 26759
                         end: 26791
@@ -28605,11 +28605,11 @@ items:
                               Local:
                                 scope_index: 0
                                 local_index: 2
-                            ty: 153
+                            ty: 156
                             span:
                               start: 26818
                               end: 26821
-                      ty: 152
+                      ty: 155
                       memory: 150
                       mutable: true
                       span:
@@ -28620,7 +28620,7 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 152
+                      ty: 155
                       span:
                         start: 26826
                         end: 26831
@@ -28633,11 +28633,11 @@ items:
                 Local:
                   scope_index: 0
                   local_index: 2
-              ty: 153
+              ty: 156
               span:
                 start: 26841
                 end: 26844
-        ty: 153
+        ty: 156
         span:
           start: 26737
           end: 26850
@@ -28668,7 +28668,7 @@ items:
                   span:
                     start: 26922
                     end: 26925
-                ty: 155
+                ty: 158
                 mut_span: ~
                 accesses:
                   - span:
@@ -28679,8 +28679,8 @@ items:
                       start: 27072
                       end: 27075
                     kind: Read
-            inferred_type: 157
-            expected_type: 157
+            inferred_type: 160
+            expected_type: 160
       block:
         kind:
           Block:
@@ -28692,7 +28692,7 @@ items:
                   id: 39
                   type_args:
                     - 150
-                    - 156
+                    - 159
                   arguments:
                     - kind:
                         GenericMethodCall:
@@ -28713,17 +28713,17 @@ items:
                                   id: 435
                                   type_args:
                                     - 150
-                                    - 156
+                                    - 159
                                   arguments:
                                     - kind:
                                         Local:
                                           scope_index: 0
                                           local_index: 1
-                                      ty: 155
+                                      ty: 158
                                       span:
                                         start: 27036
                                         end: 27039
-                              ty: 159
+                              ty: 152
                               span:
                                 start: 27017
                                 end: 27040
@@ -28735,15 +28735,15 @@ items:
                         Local:
                           scope_index: 0
                           local_index: 1
-                      ty: 155
+                      ty: 158
                       span:
                         start: 27072
                         end: 27075
-              ty: 157
+              ty: 160
               span:
                 start: 26973
                 end: 27086
-        ty: 157
+        ty: 160
         span:
           start: 26963
           end: 27097
@@ -28762,7 +28762,7 @@ items:
                   span:
                     start: 27229
                     end: 27233
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -28784,7 +28784,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 36
+                    ty: 29
                     span:
                       start: 27258
                       end: 27262
@@ -28811,8 +28811,8 @@ items:
               start: 27301
               end: 27334
             locals: []
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -28830,11 +28830,11 @@ items:
                       span:
                         start: 27325
                         end: 27326
-              ty: 36
+              ty: 29
               span:
                 start: 27311
                 end: 27328
-        ty: 36
+        ty: 29
         span:
           start: 27301
           end: 27334
@@ -28860,8 +28860,8 @@ items:
                       start: 27402
                       end: 27405
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -28880,11 +28880,11 @@ items:
                       span:
                         start: 27402
                         end: 27405
-              ty: 36
+              ty: 29
               span:
                 start: 27388
                 end: 27412
-        ty: 36
+        ty: 29
         span:
           start: 27378
           end: 27418
@@ -28910,8 +28910,8 @@ items:
                       start: 27486
                       end: 27489
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -28930,11 +28930,11 @@ items:
                       span:
                         start: 27486
                         end: 27489
-              ty: 36
+              ty: 29
               span:
                 start: 27472
                 end: 27496
-        ty: 36
+        ty: 29
         span:
           start: 27462
           end: 27502
@@ -28960,8 +28960,8 @@ items:
                       start: 27568
                       end: 27572
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -28980,11 +28980,11 @@ items:
                       span:
                         start: 27568
                         end: 27572
-              ty: 36
+              ty: 29
               span:
                 start: 27560
                 end: 27574
-        ty: 36
+        ty: 29
         span:
           start: 27550
           end: 27580
@@ -29003,7 +29003,7 @@ items:
                   span:
                     start: 27600
                     end: 27604
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29025,7 +29025,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 36
+                    ty: 29
                     span:
                       start: 27627
                       end: 27631
@@ -29057,7 +29057,7 @@ items:
                   span:
                     start: 27667
                     end: 27671
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29079,7 +29079,7 @@ items:
                       Local:
                         scope_index: 0
                         local_index: 0
-                    ty: 36
+                    ty: 29
                     span:
                       start: 27694
                       end: 27698
@@ -29111,7 +29111,7 @@ items:
                   span:
                     start: 27735
                     end: 27739
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29141,7 +29141,7 @@ items:
                             Local:
                               scope_index: 0
                               local_index: 0
-                          ty: 36
+                          ty: 29
                           span:
                             start: 27759
                             end: 27763
@@ -29185,7 +29185,7 @@ items:
                   span:
                     start: 27796
                     end: 27800
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29204,8 +29204,8 @@ items:
                       start: 27864
                       end: 27869
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -29229,7 +29229,7 @@ items:
                                       Local:
                                         scope_index: 0
                                         local_index: 0
-                                    ty: 36
+                                    ty: 29
                                     span:
                                       start: 27852
                                       end: 27856
@@ -29260,8 +29260,8 @@ items:
                                         GenericCall:
                                           id: 431
                                           type_args:
-                                            - 35
-                                            - 34
+                                            - 28
+                                            - 27
                                           arguments: []
                                       ty: 162
                                       span:
@@ -29275,11 +29275,11 @@ items:
                       span:
                         start: 27852
                         end: 27891
-              ty: 36
+              ty: 29
               span:
                 start: 27838
                 end: 27893
-        ty: 36
+        ty: 29
         span:
           start: 27828
           end: 27899
@@ -29298,7 +29298,7 @@ items:
                   span:
                     start: 27916
                     end: 27920
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29317,8 +29317,8 @@ items:
                       start: 27984
                       end: 27989
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -29342,7 +29342,7 @@ items:
                                       Local:
                                         scope_index: 0
                                         local_index: 0
-                                    ty: 36
+                                    ty: 29
                                     span:
                                       start: 27972
                                       end: 27976
@@ -29373,8 +29373,8 @@ items:
                                         GenericCall:
                                           id: 431
                                           type_args:
-                                            - 35
-                                            - 34
+                                            - 28
+                                            - 27
                                           arguments: []
                                       ty: 162
                                       span:
@@ -29388,11 +29388,11 @@ items:
                       span:
                         start: 27972
                         end: 28011
-              ty: 36
+              ty: 29
               span:
                 start: 27958
                 end: 28013
-        ty: 36
+        ty: 29
         span:
           start: 27948
           end: 28019
@@ -29411,7 +29411,7 @@ items:
                   span:
                     start: 28143
                     end: 28147
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29434,8 +29434,8 @@ items:
                       start: 28227
                       end: 28232
                     kind: Read
-            inferred_type: 36
-            expected_type: 36
+            inferred_type: 29
+            expected_type: 29
       block:
         kind:
           Block:
@@ -29471,7 +29471,7 @@ items:
                                                       Local:
                                                         scope_index: 0
                                                         local_index: 0
-                                                    ty: 36
+                                                    ty: 29
                                                     span:
                                                       start: 28200
                                                       end: 28204
@@ -29546,11 +29546,11 @@ items:
                       span:
                         start: 28199
                         end: 28237
-              ty: 36
+              ty: 29
               span:
                 start: 28185
                 end: 28239
-        ty: 36
+        ty: 29
         span:
           start: 28175
           end: 28245
@@ -29569,7 +29569,7 @@ items:
                   span:
                     start: 28266
                     end: 28270
-                ty: 36
+                ty: 29
                 mut_span: ~
                 accesses:
                   - span:
@@ -29595,7 +29595,7 @@ items:
                               Local:
                                 scope_index: 0
                                 local_index: 0
-                            ty: 36
+                            ty: 29
                             span:
                               start: 28316
                               end: 28320
@@ -29631,7 +29631,7 @@ items:
                   span:
                     start: 28404
                     end: 28408
-                ty: 39
+                ty: 32
                 mut_span: ~
                 accesses:
                   - span:
@@ -29650,14 +29650,14 @@ items:
                 GenericCall:
                   id: 37
                   type_args:
-                    - 37
-                    - 38
+                    - 30
+                    - 31
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 39
+                      ty: 32
                       span:
                         start: 28443
                         end: 28447
@@ -29684,7 +29684,7 @@ items:
                   span:
                     start: 28485
                     end: 28489
-                ty: 39
+                ty: 32
                 mut_span: ~
                 accesses:
                   - span:
@@ -29703,14 +29703,14 @@ items:
                 GenericCall:
                   id: 38
                   type_args:
-                    - 37
-                    - 38
+                    - 30
+                    - 31
                   arguments:
                     - kind:
                         Local:
                           scope_index: 0
                           local_index: 0
-                      ty: 39
+                      ty: 32
                       span:
                         start: 28522
                         end: 28526
@@ -32032,7 +32032,7 @@ items:
         span:
           start: 75
           end: 140
-  assoc_type_impls:
+  associated_types:
     - id: 423
       file_id: 0
       namespace: 0
@@ -32430,10 +32430,6 @@ items:
             end: 23148
         - file_id: 0
           span:
-            start: 25109
-            end: 25111
-        - file_id: 0
-          span:
             start: 22923
             end: 22925
         - file_id: 0
@@ -32456,6 +32452,10 @@ items:
           span:
             start: 24602
             end: 24604
+        - file_id: 0
+          span:
+            start: 25109
+            end: 25111
         - file_id: 0
           span:
             start: 26642
@@ -33470,10 +33470,6 @@ items:
             end: 24672
         - file_id: 0
           span:
-            start: 24880
-            end: 24883
-        - file_id: 0
-          span:
             start: 1582
             end: 1585
         - file_id: 0
@@ -33552,6 +33548,10 @@ items:
           span:
             start: 23484
             end: 23487
+        - file_id: 0
+          span:
+            start: 24880
+            end: 24883
         - file_id: 1
           span:
             start: 46

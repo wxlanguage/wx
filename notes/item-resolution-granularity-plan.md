@@ -1,5 +1,20 @@
 # Item resolution granularity — plan
 
+## Implementation update: shared trait member demands
+
+The trait declaration index and per-member demands are now implemented:
+
+- Prescan records `Trait::member_decls`; duplicate names are reported and the first declaration wins.
+- Associated-type declarations and definitions now live in `ItemRegistry::associated_types`. Each `AssociatedType` owns its name, source location, attributes, bounds, accesses, and optional assigned type. `Trait::assoc_types` is removed; readers follow `entries` to the arena. Impl definitions do not copy declaration bounds.
+- `declared_trait_member` demands one signature, distinguishing absence from a diagnosed resolution cycle. Associated-type identities remain usable while their bounds resolve.
+- `member_via_bounds` searches a shared, visited-guarded supertrait traversal. Bound satisfaction and projection formatting use that traversal too; written bounds remain unchanged.
+- Trait ambiguity returns candidates to the caller for shared reporting. Qualified lookup still searches declarations of exactly the named trait, with transitive satisfaction of that trait.
+- `signature_trait` no longer forces every member. The narrow supertrait-clause demand remains: full trait signature processing also validates associated bindings, which members must not recursively demand.
+- Memory impl synthesis explicitly walks declarations in source order, resolving and specializing each member once. It retains trait source locations for definition navigation and stops on resolution failure instead of registering an incomplete impl.
+
+This supersedes the next-step status and trait-side sketches below. Dispatch-key symmetry and merging declaration/resolution storage remain separate work.
+
+
 **Status:** in progress (2026-09-07). The trait-header split and the whole impl side — trait
 impls *and* inherent — have landed; see "What already landed". The trait side of the member
 index and the `ensure_signature` split have not. Step 2 is the next one, and it is sequenced

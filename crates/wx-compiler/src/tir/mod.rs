@@ -404,13 +404,6 @@ pub struct Constant {
 	pub attributes: Box<[ItemAttribute]>,
 }
 
-pub struct TraitAssocType {
-	pub id: ast::DefId,
-	pub name_span: ast::TextSpan,
-	pub bounds: Bounds,
-	pub accesses: Vec<SourceSpan>,
-}
-
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Trait {
 	pub id: ast::DefId,
@@ -426,14 +419,22 @@ pub struct Trait {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub entries: HashMap<SymbolU32, ImplEntry>,
-	#[cfg_attr(test, serde(skip))]
-	pub assoc_types: HashMap<SymbolU32, TraitAssocType>,
+	/// Stable identities allocated during prescan; signature readiness is tracked
+	/// separately by the builder.
+	pub members: HashMap<SymbolU32, MemberIndex>,
 	#[cfg_attr(test, serde(skip))]
 	pub accesses: Vec<SourceSpan>,
 }
 
 impl Trait {
+	/// Resolved associated-type declaration owned by this trait.
+	pub fn associated_type(&self, name: SymbolU32) -> Option<AssocTypeIndex> {
+		match self.members.get(&name) {
+			Some(MemberIndex::AssociatedType(index)) => Some(*index),
+			_ => None,
+		}
+	}
+
 	/// The supertraits declared after the colon in `trait Sub: Super { .. }`.
 	///
 	/// There is no separate field for these: a supertrait is a bound on this
@@ -1671,6 +1672,64 @@ pub enum FileKind {
 	Module,
 }
 
+/// A member's stable arena identity, independent of signature resolution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum MemberIndex {
+	Function(FunctionIndex),
+	Constant(ConstIndex),
+	AssociatedType(AssocTypeIndex),
+}
+
+impl MemberIndex {
+	pub fn id(self, items: &ItemRegistry) -> DefId {
+		match self {
+			Self::Function(i) => items.functions[usize::from(i)].id,
+			Self::Constant(i) => items.constants[usize::from(i)].id,
+			Self::AssociatedType(i) => {
+				items.associated_types[usize::from(i)].id
+			}
+		}
+	}
+
+	pub fn namespace(self) -> SymbolNamespace {
+		match self {
+			Self::AssociatedType(_) => SymbolNamespace::Type,
+			Self::Function(_) | Self::Constant(_) => SymbolNamespace::Value,
+		}
+	}
+
+	pub fn def_span(self, items: &ItemRegistry) -> SourceSpan {
+		match self {
+			Self::Function(i) => {
+				let item = &items.functions[usize::from(i)];
+				SourceSpan::new(item.file_id, item.name.span)
+			}
+			Self::Constant(i) => {
+				let item = &items.constants[usize::from(i)];
+				SourceSpan::new(item.file_id, item.name.span)
+			}
+			Self::AssociatedType(i) => {
+				let item = &items.associated_types[usize::from(i)];
+				SourceSpan::new(item.file_id, item.name.span)
+			}
+		}
+	}
+
+	/// Compatibility view for dispatch consumers. This does not resolve a
+	/// signature; builder callers must demand the member before using its type.
+	pub fn entry(self, items: &ItemRegistry) -> ImplEntry {
+		match self {
+			Self::Function(i) if items.functions[usize::from(i)].is_method => {
+				ImplEntry::Method(i)
+			}
+			Self::Function(i) => ImplEntry::AssocFunction(i),
+			Self::Constant(i) => ImplEntry::AssocConstant(i),
+			Self::AssociatedType(i) => ImplEntry::AssocType(i),
+		}
+	}
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1722,13 +1781,13 @@ pub struct MemberDecl {
 	pub span: TextSpan,
 }
 
-/// Backing storage for `ImplEntry::AssocType`. One entry per associated-type
-/// declaration (trait side, `ty` is a `Type::AssociatedType` placeholder) or
-/// binding (impl side, `ty` is the concrete type) — gives both cases a real
-/// `DefId`/span instead of just a bare `TypeIndex`.
+/// An associated-type declaration or definition. Trait declarations own
+/// their bounds and references here and have no assigned type (`ty: None`).
+/// Impl definitions own their assigned type; required bounds remain on the
+/// trait declaration rather than being copied into each implementation.
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct AssocTypeImpl {
+pub struct AssociatedType {
 	pub id: DefId,
 	pub file_id: FileId,
 	/// The scope it was declared in. Kept alongside `file_id` so trait
@@ -1736,6 +1795,10 @@ pub struct AssocTypeImpl {
 	/// report against the right scope without reconstructing one.
 	pub namespace: NamespaceIndex,
 	pub name: Spanned<SymbolU32>,
+	#[cfg_attr(test, serde(skip))]
+	pub bounds: Bounds,
+	#[cfg_attr(test, serde(skip))]
+	pub accesses: Vec<SourceSpan>,
 	pub ty: Option<Spanned<TypeIndex>>,
 	pub attributes: Box<[ItemAttribute]>,
 }
@@ -1763,7 +1826,7 @@ impl ImplEntry {
 				SourceSpan::new(constant.file_id, constant.name.span)
 			}
 			ImplEntry::AssocType(index) => {
-				let assoc_type = &items.assoc_type_impls[usize::from(index)];
+				let assoc_type = &items.associated_types[usize::from(index)];
 				SourceSpan::new(assoc_type.file_id, assoc_type.name.span)
 			}
 		}
@@ -1962,6 +2025,9 @@ impl Function {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Function {
+	/// Whether the first parameter is the receiver named `self`.
+	#[cfg_attr(test, serde(skip))]
+	pub is_method: bool,
 	pub id: DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIndex,
@@ -2626,7 +2692,7 @@ pub struct ItemRegistry {
 	/// `Function::body` / `Global::value`. Append order is demand-driven and
 	/// carries no relation to `functions`/`globals` order.
 	pub bodies: Vec<Body>,
-	pub assoc_type_impls: Vec<AssocTypeImpl>,
+	pub associated_types: Vec<AssociatedType>,
 	#[cfg_attr(test, serde(skip))]
 	pub tagged_items: HashMap<SymbolU32, DefId>,
 	pub typesets: Vec<TypeSet>,
@@ -2654,7 +2720,7 @@ impl ItemRegistry {
 			trait_impl_dispatch: HashMap::new(),
 			constants: Vec::new(),
 			bodies: Vec::new(),
-			assoc_type_impls: Vec::new(),
+			associated_types: Vec::new(),
 			tagged_items: HashMap::new(),
 			typesets: Vec::new(),
 			type_aliases: Vec::new(),
@@ -2788,12 +2854,32 @@ impl ItemRegistry {
 		index
 	}
 
-	fn push_assoc_type_impl(&mut self, item: AssocTypeImpl) -> AssocTypeIndex {
+	pub fn trait_associated_type(
+		&self,
+		trait_index: TraitIndex,
+		name: SymbolU32,
+	) -> Option<&AssociatedType> {
+		let index =
+			self.traits[usize::from(trait_index)].associated_type(name)?;
+		Some(&self.associated_types[usize::from(index)])
+	}
+
+	fn trait_associated_type_mut(
+		&mut self,
+		trait_index: TraitIndex,
+		name: SymbolU32,
+	) -> Option<&mut AssociatedType> {
+		let index =
+			self.traits[usize::from(trait_index)].associated_type(name)?;
+		Some(&mut self.associated_types[usize::from(index)])
+	}
+
+	fn push_associated_type(&mut self, item: AssociatedType) -> AssocTypeIndex {
 		let index = AssocTypeIndex::new(
-			u32::try_from(self.assoc_type_impls.len())
+			u32::try_from(self.associated_types.len())
 				.expect("associated-type registry exceeded u32 index capacity"),
 		);
-		self.assoc_type_impls.push(item);
+		self.associated_types.push(item);
 		index
 	}
 
@@ -3654,9 +3740,7 @@ impl ItemRegistry {
 						})
 					});
 				from_where_clause.or_else(|| {
-					self.traits[usize::from(*trait_index)]
-						.assoc_types
-						.get(assoc_name)
+					self.trait_associated_type(*trait_index, *assoc_name)
 						.map(|at| &at.bounds)
 				})
 			}
@@ -3664,19 +3748,9 @@ impl ItemRegistry {
 		}
 	}
 
-	/// Would `Base::name` be ambiguous if printed unqualified — i.e. do more
-	/// than one of `base`'s own declared bounds (see
-	/// [`ItemRegistry::abstract_type_bounds`]) declare an associated type named
-	/// `name`? Used by [`TypeFormatter`] to decide between `Base::name` and
-	/// `<Base as Trait>::name` when displaying a
-	/// [`Type::AssocTypeProjection`] — the projection's own `trait_index`
-	/// already disambiguates the *type*, this only asks whether the
-	/// *unqualified spelling* would read as ambiguous to someone looking at
-	/// `base`'s bounds. Short-circuits after the second match, and — unlike
-	/// a version built on `bound_trait_indices`-style helpers that collect a
-	/// list first — never allocates, since the two paths that would ever
-	/// call this (formatting a type, not resolving one) never need to
-	/// interleave a mutable call partway through.
+	/// Whether an unqualified projection would name multiple declarations.
+	/// Formatting follows the same reachable-trait set as member lookup,
+	/// counting a shared ancestor once and stopping at the second match.
 	fn assoc_type_bound_is_ambiguous(
 		&self,
 		types: &TypeInterner,
@@ -3686,16 +3760,14 @@ impl ItemRegistry {
 		let Some(bounds) = self.abstract_type_bounds(types, base) else {
 			return false;
 		};
-		bounds
-			.traits
-			.iter()
-			.filter(|bound| {
-				matches!(
-					self.traits[usize::from(bound.trait_index)]
-						.entries
-						.get(&name),
-					Some(ImplEntry::AssocType(_))
-				)
+		self.reachable_traits(bounds.traits.iter().map(|b| b.trait_index))
+			.filter(|&trait_index| {
+				self.traits[usize::from(trait_index)]
+					.members
+					.get(&name)
+					.is_some_and(|member| {
+						matches!(member, MemberIndex::AssociatedType(_))
+					})
 			})
 			.nth(1)
 			.is_some()
@@ -3741,31 +3813,42 @@ impl ItemRegistry {
 		}
 	}
 
-	/// Does holding `bound` also give you `required` — is `required` `bound`
-	/// itself, or one of its supertraits, transitively?
-	///
-	/// Walks rather than reading a precomputed closure: the graph is tiny and
-	/// this keeps the answer derived from one place. Visited-guarded because
-	/// a supertrait cycle (`trait A: B {}` alongside `trait B: A {}`) is
-	/// currently accepted, so the graph is not guaranteed acyclic.
+	/// Enumerates each reachable trait once, in declared depth-first order.
+	/// The builder must resolve the roots' supertrait clauses before calling.
+	/// Cycles remain guarded because diagnostics do not remove invalid edges.
+	fn reachable_traits(
+		&self,
+		roots: impl IntoIterator<Item = TraitIndex>,
+	) -> impl Iterator<Item = TraitIndex> + '_ {
+		let mut stack: Vec<_> = roots.into_iter().collect();
+		stack.reverse();
+		let mut visited = Vec::new();
+		std::iter::from_fn(move || {
+			while let Some(current) = stack.pop() {
+				if visited.contains(&current) {
+					continue;
+				}
+				visited.push(current);
+				stack.extend(
+					self.traits[usize::from(current)]
+						.self_type_param
+						.bounds
+						.traits
+						.iter()
+						.rev()
+						.map(|b| b.trait_index)
+						.filter(|&index| index != current),
+				);
+				return Some(current);
+			}
+			None
+		})
+	}
+
+	/// A bound implies itself and every transitively reachable supertrait.
 	fn trait_implies(&self, bound: TraitIndex, required: TraitIndex) -> bool {
-		let mut stack = vec![bound];
-		let mut visited: Vec<TraitIndex> = Vec::new();
-		while let Some(current) = stack.pop() {
-			if current == required {
-				return true;
-			}
-			if visited.contains(&current) {
-				continue;
-			}
-			visited.push(current);
-			stack.extend(
-				self.traits[usize::from(current)]
-					.supertraits(current)
-					.map(|supertrait| supertrait.trait_index),
-			);
-		}
-		false
+		self.reachable_traits([bound])
+			.any(|index| index == required)
 	}
 
 	/// Does `ty` belong to typeset `typeset_index`? Same abstract/concrete

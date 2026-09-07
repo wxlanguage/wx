@@ -2023,3 +2023,29 @@ fn test_nested_tuple_destructuring_projects_through_a_temp() {
 		"`z` reads the spilled inner tuple, not `t`"
 	);
 }
+
+#[test]
+fn test_supertrait_member_dispatch_monomorphizes_declaring_trait() {
+	let case = TestCase::new(indoc! {"
+		trait Parent { fn value(self) -> i32; }
+		trait Child: Parent {}
+		trait Grandchild: Child {}
+		struct S { n: i32 }
+		impl Parent for S { fn value(self) -> i32 { self.n } }
+		impl Child for S {}
+		impl Grandchild for S {}
+		fn read<T: Grandchild>(x: T) -> i32 { x.value() }
+		pub fn run(n: i32) -> i32 { read(S::{ n: n }) }
+		export { run }
+	"});
+	crate::testing::DiagnosticView::new(
+		"check",
+		&case.tir.diagnostics,
+		&case.graph.files,
+	)
+	.assert_no_errors();
+	// MIR construction must dispatch the abstract call through Parent's impl,
+	// even though the generic function only declares the Grandchild bound.
+	assert_eq!(case.mir.exports.len(), 1);
+	assert!(case.mir.functions.iter().any(|f| matches!(case.mir.exports[0], ExportItem::Function { id, .. } if id == f.id)));
+}

@@ -14,6 +14,7 @@ mod candidates;
 mod control;
 mod generics;
 mod literal;
+mod members;
 mod memory;
 mod modules;
 mod operators;
@@ -36,6 +37,7 @@ use literal::{
 	report_empty_char_literal, report_integer_literal_out_of_range,
 	report_not_const_evaluatable,
 };
+use members::TraitMemberCandidate;
 use memory::report_cannot_store_through_immutable_pointer;
 use modules::{
 	DuplicateDefinitionDiagnostic, report_duplicate_definition,
@@ -472,7 +474,8 @@ enum MemberLookup {
 		type_args: Box<[TypeIndex]>,
 		trait_index: TraitIndex,
 	},
-	Ambiguous,
+	Ambiguous(Vec<TraitMemberCandidate>),
+	Error,
 	NotFound,
 }
 
@@ -483,6 +486,8 @@ enum MemberLookup {
 /// therefore which existing diagnostic code applies) can pick the right one
 /// instead of getting one blurred "not found."
 enum TraitMemberError {
+	/// A signature dependency has already been diagnosed.
+	ResolutionFailed,
 	/// `target_type` isn't bound by / doesn't implement the trait at all.
 	NotImplemented,
 	/// It does implement the trait, but the trait has no such member.
@@ -784,9 +789,8 @@ impl<'ast> Builder<'ast, '_> {
 				trait_index,
 				assoc_name,
 			} => {
-				self.items.traits[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&assoc_name)
+				self.items
+					.trait_associated_type_mut(trait_index, assoc_name)
 					.unwrap()
 					.accesses
 					.push(span);

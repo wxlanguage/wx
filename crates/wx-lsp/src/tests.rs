@@ -2311,6 +2311,15 @@ fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
 		"Elem",
 		"go-to-definition for `Self::Elem` should land on the trait's `type Elem` declaration"
 	);
+	let hover = symbol_hover_text(
+		&compiled.tir,
+		&compiled.graph.interner,
+		&compiled.graph.packages,
+		compiled.graph.root_package,
+		&found.kind,
+	)
+	.expect("associated-type hover reads its arena-owned bounds");
+	assert_eq!(hover, "type Elem: Bound");
 }
 
 #[test]
@@ -2443,6 +2452,24 @@ fn memory_associated_const_namespace_access_resolves() {
 			.span,
 		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
+	let memory_trait = compiled
+		.tir
+		.items
+		.traits
+		.iter()
+		.find(|trait_def| {
+			compiled.graph.interner.resolve(trait_def.name.inner)
+				== Some("Memory")
+		})
+		.expect("stdlib Memory trait");
+	let wx_compiler::tir::MemberIndex::Constant(template_index) =
+		memory_trait.members[&const_name]
+	else {
+		panic!("Memory::DATA_END must be a constant");
+	};
+	let template = &compiled.tir.items.constants[usize::from(template_index)];
+	assert_eq!(definition.source.file_id, template.file_id);
+	assert_eq!(definition.source.span, template.name.span);
 }
 
 #[test]

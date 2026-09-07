@@ -264,7 +264,17 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
-			MemberLookup::Ambiguous => Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					func_ctx.resolve_context,
+					object.ty,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				Err(())
+			}
+			MemberLookup::Error => Err(()),
 		}
 	}
 
@@ -682,87 +692,28 @@ impl<'ast> Builder<'ast, '_> {
 		member_name: SymbolU32,
 		member_span: TextSpan,
 	) -> Result<Option<TypeIndex>, ()> {
-		// Collected once into an owned `Vec<TraitIndex>` (`TraitIndex` is
-		// `Copy`, so this is just a handful of `u32`s) rather than
-		// re-fetching `abstract_type_bounds(base)` on every iteration —
-		// `ensure_signature` below needs `&mut self`, so it can't interleave
-		// with a live borrow of the bounds list, but for an
-		// `AssocTypeProjection` base `abstract_type_bounds` is a real
-		// recursive scan (see its own doc comment), not a cheap field read,
-		// so re-deriving it per iteration was real wasted work.
-		let bound_trait_indices: Vec<TraitIndex> = self
-			.items
-			.abstract_type_bounds(&self.types, base)
-			.map(|bounds| bounds.traits.iter().map(|b| b.trait_index).collect())
-			.unwrap_or_default();
-		let mut candidates = CandidateSet::new();
-		for trait_index in bound_trait_indices {
-			// In progress means this trait is what put the bound on the stack
-			// in the first place; `entries` is filled in member by member, so
-			// the scan below runs against whatever is there and a member that
-			// hasn't been reached yet simply isn't a candidate.
-			let _ = self.ensure_signature(
-				self.items.traits[usize::from(trait_index)].id,
-			);
-			if !matches!(
-				self.items.traits[usize::from(trait_index)]
-					.entries
-					.get(&member_name),
-				Some(ImplEntry::AssocType(_))
-			) {
-				continue;
-			}
-			candidates.insert(trait_index, trait_index);
-		}
-
-		let selection = candidates.finish();
-		if let CandidateSelection::Many(candidates) = &selection {
-			let member_name_str = self.interner.resolve(member_name).unwrap();
-			let type_name = self
-				.formatter(resolve_context.namespace)
-				.display_type(base)
-				.unwrap_or_default();
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::AmbiguousTraitMember.code().to_string(),
-				),
-				message: "multiple applicable items in scope".to_string(),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
-			diagnostic.labels.push(
-				SourceSpan::new(resolve_context.file_id, member_span)
-					.primary_label()
-					.with_message(format!(
-						"ambiguous — use `<{type_name} as Trait>::{member_name_str}` to specify which trait's `{member_name_str}` is meant"
-					)),
-			);
-			for trait_index in candidates {
-				let trait_ = &self.items.traits[usize::from(*trait_index)];
-				let trait_name =
-					self.interner.resolve(trait_.name.inner).unwrap();
-				let name_span = trait_
-					.assoc_types
-					.get(&member_name)
-					.map(|at| at.name_span)
-					.unwrap_or(trait_.name.span);
-				diagnostic.labels.push(
-					Label::secondary(trait_.file_id, name_span).with_message(
-						format!("candidate: `{trait_name}::{member_name_str}`"),
-					),
+		let trait_index = match self.member_via_bounds(
+			base,
+			member_name,
+			Some(SymbolNamespace::Type),
+			SourceSpan::new(resolve_context.file_id, member_span),
+		)? {
+			CandidateSelection::None => return Ok(None),
+			CandidateSelection::One(candidate) => candidate.trait_index,
+			CandidateSelection::Many(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					base,
+					member_name,
+					member_span,
+					&candidates,
 				);
+				return Err(());
 			}
-			self.diagnostics.push(diagnostic);
-			return Err(());
-		}
-
-		let CandidateSelection::One(trait_index) = selection else {
-			return Ok(None);
 		};
-		if let Some(at) = self.items.traits[usize::from(trait_index)]
-			.assoc_types
-			.get_mut(&member_name)
+		if let Some(at) = self
+			.items
+			.trait_associated_type_mut(trait_index, member_name)
 		{
 			at.accesses
 				.push(SourceSpan::new(resolve_context.file_id, member_span));
@@ -932,17 +883,17 @@ impl<'ast> Builder<'ast, '_> {
 					trait_index,
 					..
 				} => {
-					if let Some(assoc_type) = self.items.traits
-						[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&member.ident.inner)
-					{
+					if let Some(assoc_type) =
+						self.items.trait_associated_type_mut(
+							trait_index,
+							member.ident.inner,
+						) {
 						assoc_type.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
 							member.ident.span,
 						));
 					}
-					Ok(self.items.assoc_type_impls[usize::from(idx)]
+					Ok(self.items.associated_types[usize::from(idx)]
 						.ty
 						.unwrap()
 						.inner)
@@ -950,11 +901,21 @@ impl<'ast> Builder<'ast, '_> {
 				MemberLookup::Inherent {
 					entry: ImplEntry::AssocType(idx),
 					..
-				} => Ok(self.items.assoc_type_impls[usize::from(idx)]
+				} => Ok(self.items.associated_types[usize::from(idx)]
 					.ty
 					.unwrap()
 					.inner),
-				MemberLookup::Ambiguous => Err(()),
+				MemberLookup::Ambiguous(candidates) => {
+					self.report_trait_member_ambiguity(
+						resolve_context,
+						namespace.inner,
+						member.ident.inner,
+						member.ident.span,
+						&candidates,
+					);
+					Err(())
+				}
+				MemberLookup::Error => Err(()),
 				_ => {
 					// TODO: we could improve the diagnostics here
 					// one case for MemberLookup::NotFound and another for Found with not correct kind
@@ -1006,7 +967,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let MemberLookup::Trait { trait_index, .. } = &lookup
 			&& matches!(
 				self.types.resolve(namespace.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				*trait_index,
@@ -1057,7 +1018,17 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			}
 			| MemberLookup::NotFound => {}
-			MemberLookup::Ambiguous => return Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					namespace.inner,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				return Err(());
+			}
+			MemberLookup::Error => return Err(()),
 		}
 
 		match self.types.resolve(namespace.inner) {
@@ -1382,6 +1353,7 @@ impl<'ast> Builder<'ast, '_> {
 			base_ty.inner,
 			required_trait,
 			segment.ident.inner,
+			member_span,
 		);
 		// Same abstract-dispatch bookkeeping as `resolve_namespace_member`'s
 		// identical check: a `TypeParam` receiver resolving through a known
@@ -1391,7 +1363,7 @@ impl<'ast> Builder<'ast, '_> {
 		if lookup.is_ok()
 			&& matches!(
 				self.types.resolve(base_ty.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				required_trait,
@@ -1415,6 +1387,7 @@ impl<'ast> Builder<'ast, '_> {
 				func_index,
 				type_args,
 			},
+			Err(TraitMemberError::ResolutionFailed) => return Err(()),
 			Ok((ImplEntry::AssocType(_), _))
 			| Err(TraitMemberError::NoSuchMember) => {
 				let trait_name = self

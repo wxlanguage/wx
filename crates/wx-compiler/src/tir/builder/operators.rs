@@ -183,10 +183,10 @@ impl<'ast> Builder<'ast, '_> {
 		method_symbol: SymbolU32,
 	) -> FunctionIndex {
 		match self.items.traits[usize::from(trait_index)]
-			.entries
+			.members
 			.get(&method_symbol)
 		{
-			Some(ImplEntry::Method(idx)) => *idx,
+			Some(MemberIndex::Function(idx)) => *idx,
 			_ => unreachable!("operator trait must declare its own method"),
 		}
 	}
