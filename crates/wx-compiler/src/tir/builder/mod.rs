@@ -10,6 +10,7 @@ use crate::{ast::MethodCallExpr, tir::*};
 mod aggregates;
 mod body;
 mod calls;
+mod candidates;
 mod control;
 mod generics;
 mod literal;
@@ -22,6 +23,8 @@ mod signature;
 mod traits;
 mod type_compare;
 mod types;
+
+use candidates::{CandidateSelection, CandidateSet};
 
 use aggregates::{
 	UnknownStructFieldDiagnostic, report_duplicate_struct_field_init,

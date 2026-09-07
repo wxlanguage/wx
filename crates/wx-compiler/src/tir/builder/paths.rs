@@ -695,8 +695,7 @@ impl<'ast> Builder<'ast, '_> {
 			.abstract_type_bounds(&self.types, base)
 			.map(|bounds| bounds.traits.iter().map(|b| b.trait_index).collect())
 			.unwrap_or_default();
-		let mut found: Option<TraitIndex> = None;
-		let mut candidates: Vec<TraitIndex> = Vec::new();
+		let mut candidates = CandidateSet::new();
 		for trait_index in bound_trait_indices {
 			// In progress means this trait is what put the bound on the stack
 			// in the first place; `entries` is filled in member by member, so
@@ -713,24 +712,11 @@ impl<'ast> Builder<'ast, '_> {
 			) {
 				continue;
 			}
-			match found {
-				None => found = Some(trait_index),
-				// The same trait showing up twice (e.g. a redundant `where`
-				// bound repeating what the assoc type's own declaration
-				// already requires, or plain `T: Foo + Foo`) isn't a second
-				// candidate — it's one trait, counted once, same as Rust
-				// silently collapsing a duplicate bound instead of erroring.
-				Some(first) if first == trait_index => {}
-				Some(first) => {
-					if candidates.is_empty() {
-						candidates.push(first);
-					}
-					candidates.push(trait_index);
-				}
-			}
+			candidates.insert(trait_index, trait_index);
 		}
 
-		if !candidates.is_empty() {
+		let selection = candidates.finish();
+		if let CandidateSelection::Many(candidates) = &selection {
 			let member_name_str = self.interner.resolve(member_name).unwrap();
 			let type_name = self
 				.formatter(resolve_context.namespace)
@@ -752,7 +738,7 @@ impl<'ast> Builder<'ast, '_> {
 						"ambiguous — use `<{type_name} as Trait>::{member_name_str}` to specify which trait's `{member_name_str}` is meant"
 					)),
 			);
-			for trait_index in &candidates {
+			for trait_index in candidates {
 				let trait_ = &self.items.traits[usize::from(*trait_index)];
 				let trait_name =
 					self.interner.resolve(trait_.name.inner).unwrap();
@@ -771,7 +757,7 @@ impl<'ast> Builder<'ast, '_> {
 			return Err(());
 		}
 
-		let Some(trait_index) = found else {
+		let CandidateSelection::One(trait_index) = selection else {
 			return Ok(None);
 		};
 		if let Some(at) = self.items.traits[usize::from(trait_index)]

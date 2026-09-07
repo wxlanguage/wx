@@ -1178,8 +1178,7 @@ impl<'ast> Builder<'ast, '_> {
 			entry: ImplEntry,
 			type_args: Box<[TypeIndex]>,
 		}
-		let mut candidates: Vec<MemberCandidate> = Vec::new();
-		let mut candidate: Option<MemberCandidate> = None;
+		let mut candidates = CandidateSet::new();
 
 		match self.types.resolve(target_type) {
 			Type::TypeParam { owner, param_index } => {
@@ -1202,23 +1201,14 @@ impl<'ast> Builder<'ast, '_> {
 					};
 					let type_args =
 						self.pad_type_args(entry, Box::new([target_type]));
-					match candidate.take() {
-						Some(existing) => {
-							candidates.push(existing);
-							candidates.push(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
-						}
-						None => {
-							candidate = Some(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
-						}
-					};
+					candidates.insert(
+						(trait_index, None),
+						MemberCandidate {
+							trait_index,
+							entry,
+							type_args,
+						},
+					);
 				}
 			}
 			_ => {
@@ -1261,87 +1251,66 @@ impl<'ast> Builder<'ast, '_> {
 					) else {
 						continue;
 					};
-					match candidate.take() {
-						Some(existing) => {
-							candidates.push(existing);
-							candidates.push(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
-						}
-						None => {
-							candidate = Some(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							})
-						}
-					}
+					candidates.insert(
+						(trait_index, Some(impl_index)),
+						MemberCandidate {
+							trait_index,
+							entry,
+							type_args,
+						},
+					);
 				}
 			}
 		};
 
-		// Both loops above route their single-match case through `candidate`
-		// and only ever spill into `candidates` once a *second* match shows
-		// up (via `candidate.take()`), so `candidates` is never left holding
-		// exactly one entry — it's either empty or a genuine 2+-way
-		// conflict. `candidate` is therefore the one place a clean match
-		// can come from; `candidates.is_empty()` alone decides `NotFound`
-		// vs. ambiguous.
-		if let Some(candidate) = candidate {
-			debug_assert!(candidates.is_empty());
-			return MemberLookup::Trait {
-				entry: candidate.entry,
-				type_args: candidate.type_args,
-				trait_index: candidate.trait_index,
-			};
-		}
-
-		if candidates.is_empty() {
-			MemberLookup::NotFound
-		} else {
-			let formatter = self.formatter(resolve_context.namespace);
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::AmbiguousTraitMember.code().to_string(),
-				),
-				message: "multiple applicable items in scope".to_string(),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
-			diagnostic.labels.push(
-				SourceSpan::new(resolve_context.file_id, member_span)
-					.primary_label()
-					.with_message(format!(
-						"multiple `{}` found",
-						formatter.interner.resolve(member_symbol).unwrap()
-					)),
-			);
-			let type_name = formatter.display_type(target_type).unwrap();
-			for (idx, candidate) in candidates.iter().enumerate() {
-				let trait_name = self.items.traits
-					[usize::from(candidate.trait_index)]
-				.name
-				.inner;
-				let trait_name =
-					formatter.interner.resolve(trait_name).unwrap();
-				let message = format!(
-					"candidate #{} is defined in an impl of the trait `{trait_name}` for the type `{type_name}`",
-					idx + 1
-				);
-				diagnostic.labels.push(
-					candidate
-						.entry
-						.def_span(&self.items)
-						.secondary_label()
-						.with_message(message),
-				);
+		let candidates = match candidates.finish() {
+			CandidateSelection::None => return MemberLookup::NotFound,
+			CandidateSelection::One(candidate) => {
+				return MemberLookup::Trait {
+					entry: candidate.entry,
+					type_args: candidate.type_args,
+					trait_index: candidate.trait_index,
+				};
 			}
-			self.diagnostics.push(diagnostic);
-			MemberLookup::Ambiguous
+			CandidateSelection::Many(candidates) => candidates,
+		};
+		let formatter = self.formatter(resolve_context.namespace);
+		let mut diagnostic = Diagnostic {
+			severity: Severity::Error,
+			code: Some(DiagnosticCode::AmbiguousTraitMember.code().to_string()),
+			message: "multiple applicable items in scope".to_string(),
+			labels: Vec::with_capacity(candidates.len() + 1),
+			notes: Vec::new(),
+		};
+		diagnostic.labels.push(
+			SourceSpan::new(resolve_context.file_id, member_span)
+				.primary_label()
+				.with_message(format!(
+					"multiple `{}` found",
+					formatter.interner.resolve(member_symbol).unwrap()
+				)),
+		);
+		let type_name = formatter.display_type(target_type).unwrap();
+		for (idx, candidate) in candidates.iter().enumerate() {
+			let trait_name = self.items.traits
+				[usize::from(candidate.trait_index)]
+			.name
+			.inner;
+			let trait_name = formatter.interner.resolve(trait_name).unwrap();
+			let message = format!(
+				"candidate #{} is defined in an impl of the trait `{trait_name}` for the type `{type_name}`",
+				idx + 1
+			);
+			diagnostic.labels.push(
+				candidate
+					.entry
+					.def_span(&self.items)
+					.secondary_label()
+					.with_message(message),
+			);
 		}
+		self.diagnostics.push(diagnostic);
+		MemberLookup::Ambiguous
 	}
 
 	/// Resolves the signature of `member_symbol` in every trait impl that could
@@ -1434,9 +1403,8 @@ impl<'ast> Builder<'ast, '_> {
 	/// no inherent match at all — the caller falls through to the trait
 	/// scan. More than one match is a real conflict (see the comment on
 	/// `resolve_impl_member`'s trait-impl loop) and is reported here as
-	/// `Some(Ambiguous)`. Mirrors the `TypeParam` branch's
-	/// `candidate`/`candidates` split so the common single-match case never
-	/// allocates a `Vec`.
+	/// `Some(Ambiguous)`. Uses the shared candidate collector, which keeps the single-match
+	/// case inline.
 	fn resolve_inherent_member(
 		&mut self,
 		target: ImplTarget,
@@ -1448,8 +1416,7 @@ impl<'ast> Builder<'ast, '_> {
 			entry: ImplEntry,
 			type_args: Box<[TypeIndex]>,
 		}
-		let mut candidate: Option<InherentCandidate> = None;
-		let mut candidates: Vec<InherentCandidate> = Vec::new();
+		let mut candidates = CandidateSet::new();
 
 		for block_idx in self
 			.items
@@ -1475,56 +1442,50 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			};
 			let type_args = self.pad_type_args(entry, type_args);
-			match candidate.take() {
-				Some(existing) => {
-					candidates.push(existing);
-					candidates.push(InherentCandidate { entry, type_args });
-				}
-				None => {
-					candidate = Some(InherentCandidate { entry, type_args })
-				}
-			}
+			candidates
+				.insert(block_idx, InherentCandidate { entry, type_args });
 		}
 
-		if !candidates.is_empty() {
-			let member_name =
-				self.interner.resolve(member_symbol).unwrap().to_string();
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::DuplicateDefinition.code().to_string(),
-				),
-				message: format!(
-					"the name `{member_name}` is defined multiple times"
-				),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
+		let candidates = match candidates.finish() {
+			CandidateSelection::None => return None,
+			CandidateSelection::One(candidate) => {
+				return Some(MemberLookup::Inherent {
+					entry: candidate.entry,
+					type_args: candidate.type_args,
+				});
+			}
+			CandidateSelection::Many(candidates) => candidates,
+		};
+		let member_name =
+			self.interner.resolve(member_symbol).unwrap().to_string();
+		let mut diagnostic = Diagnostic {
+			severity: Severity::Error,
+			code: Some(DiagnosticCode::DuplicateDefinition.code().to_string()),
+			message: format!(
+				"the name `{member_name}` is defined multiple times"
+			),
+			labels: Vec::with_capacity(candidates.len() + 1),
+			notes: Vec::new(),
+		};
+		diagnostic.labels.push(
+			member_span
+				.primary_label()
+				.with_message(format!("multiple `{member_name}` found")),
+		);
+		for (idx, candidate) in candidates.iter().enumerate() {
 			diagnostic.labels.push(
-				member_span
-					.primary_label()
-					.with_message(format!("multiple `{member_name}` found")),
+				candidate
+					.entry
+					.def_span(&self.items)
+					.secondary_label()
+					.with_message(format!(
+						"candidate #{} defined here",
+						idx + 1
+					)),
 			);
-			for (idx, candidate) in candidates.iter().enumerate() {
-				diagnostic.labels.push(
-					candidate
-						.entry
-						.def_span(&self.items)
-						.secondary_label()
-						.with_message(format!(
-							"candidate #{} defined here",
-							idx + 1
-						)),
-				);
-			}
-			self.diagnostics.push(diagnostic);
-			return Some(MemberLookup::Ambiguous);
 		}
-
-		candidate.map(|candidate| MemberLookup::Inherent {
-			entry: candidate.entry,
-			type_args: candidate.type_args,
-		})
+		self.diagnostics.push(diagnostic);
+		Some(MemberLookup::Ambiguous)
 	}
 
 	/// Checks whether `impl_index` (an impl of `trait_index`) or

@@ -15555,3 +15555,110 @@ fn test_inherent_impl_on_slice_rejected_outside_stdlib() {
 		case.tir.diagnostics
 	);
 }
+
+#[test]
+fn test_member_candidates_three_bounds_and_repeated_later_bound() {
+	for bounds in ["A + B + C", "A + B + B + C", "C + B + A"] {
+		let case = TestCase::new(&format!(
+			"
+			trait A {{ fn foo(self) -> i32; }}
+			trait B {{ fn foo(self) -> i32; }}
+			trait C {{ fn foo(self) -> i32; }}
+			fn f<T: {bounds}>(x: T) -> i32 {{ x.foo() }}
+		"
+		));
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+		let diagnostic = diagnostics
+			.errors()
+			.find(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::AmbiguousTraitMember.code())
+			})
+			.expect("three distinct methods must be ambiguous");
+		assert_eq!(
+			diagnostic.labels.len(),
+			4,
+			"one use and three distinct declarations"
+		);
+	}
+}
+
+#[test]
+fn test_member_candidates_repeated_bound_is_unique() {
+	let case = TestCase::new(
+		"trait A { fn foo(self) -> i32; } fn f<T: A + A>(x: T) -> i32 { x.foo() }",
+	);
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_member_candidates_three_inherent_members_have_all_labels() {
+	let case = TestCase::new(
+		"
+		struct S { n: i32 }
+		impl S { fn foo(self) -> i32 { 1 } }
+		impl S { fn foo(self) -> i32 { 2 } }
+		impl S { fn foo(self) -> i32 { 3 } }
+		fn f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::DuplicateDefinition);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| d.labels.iter().any(|l| l.message == "multiple `foo` found"))
+		.expect("three inherent members must be ambiguous at the use");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
+
+#[test]
+fn test_member_candidates_assoc_type_deduplicates_later_bound() {
+	let case = TestCase::new(
+		"
+		trait A { type X; }
+		trait B { type X; }
+		fn f<T: A + B + B>(x: T::X) {}
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("two distinct associated types must be ambiguous");
+	assert_eq!(
+		diagnostic.labels.len(),
+		3,
+		"one use and two distinct declarations"
+	);
+}
+
+#[test]
+fn test_member_candidates_three_trait_impls_are_ambiguous() {
+	let case = TestCase::new(
+		"
+		trait A { fn foo(self) -> i32 { 1 } }
+		trait B { fn foo(self) -> i32 { 2 } }
+		trait C { fn foo(self) -> i32 { 3 } }
+		struct S { n: i32 }
+		impl A for S {}
+		impl B for S {}
+		impl C for S {}
+		fn f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("three applicable trait impls must be ambiguous");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
