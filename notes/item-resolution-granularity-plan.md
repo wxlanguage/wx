@@ -1,8 +1,16 @@
 # Item resolution granularity — plan
 
-**Status:** plan (2026-09-07). One piece has landed — the trait-header split described in
-"What already landed" — the rest is unbuilt. Written out of the supertrait work, because
-the supertrait bug turned out to be one symptom of something more general.
+**Status:** in progress (2026-09-07). The trait-header split and the whole impl side have
+landed — see "What already landed"; the trait side of the member index and the
+`ensure_signature` split have not. Written out of the supertrait work, because the
+supertrait bug turned out to be one symptom of something more general.
+
+The impl side landed in a different shape than steps 2–4 below described, and better: the
+`members` map does not need a parallel `member_ids` index beside it, because a *declaration*
+map (name → kind + `DefId`, read straight off the AST when the block header resolves) is
+enough for a lookup to both recognise a candidate and force the one member it needs. Steps
+2–4 are kept as written for the trait side, where the same substitution applies — read
+`member_decls` for what they call the index.
 
 ## The problem in one sentence
 
@@ -112,10 +120,12 @@ the step and letting prescan record what it iterates.
 Each step leaves the tree compiling and the suite green. Ordered so that the cheap,
 user-visible fixes come first and each later step is made smaller by the one before it.
 
-### 1. Collect impl-block headers
+### 1. Collect impl-block headers — **done**
 
-Prescan records `impl_blocks: Vec<DefId>` — it already walks every item — and the Phase 2
-driver forces that list before the general sweep, which then no-ops over what is `Done`:
+Landed as `Builder::resolve_impl_dispatch`, which filters `ast_nodes` for the two block
+variants rather than keeping a second list: a `Vec<DefId>` built in prescan would be a
+duplicate of what `ast_nodes` already holds, free to drift when a node kind is added. The
+original sketch was:
 
 ```rust
 // Impls are keyed by type, not by name, so nothing can demand them — the
@@ -130,7 +140,11 @@ diagnostics as a side effect, which is fine — see "Independent" below.
 
 ### 2. One helper per member lookup (rides along with supertrait piece D)
 
-Today at least six sites open-code "force the parent, then read `entries`/`members` by name":
+**Partly done** — the impl half now goes through `ensure_trait_impl_members`
+(`calls.rs`), which forces a member by name off `member_decls`. What is left is the trait
+half, where the sites below still force the whole parent.
+
+Today these sites open-code "force the parent, then read `entries`/`members` by name":
 
 - `types.rs:1113`, `types.rs:1291` — projection resolution
 - `paths.rs:710` — `resolve_assoc_type_via_bounds`
@@ -252,7 +266,36 @@ deterministic CLI and LSP output.
 
 ## What already landed
 
-Out of the supertrait work, and it fits this plan as "the header demand" (step 4 absorbs it):
+**The impl side, in full** (commit "Resolve impls by demand rather than by parse order"):
+
+- `Builder::resolve_impl_dispatch` resolves every `impl` block *header* before the Phase 2
+  sweep. Headers only — a block's signature never touched its members, so this stays a
+  collection step rather than a resolution phase.
+- `TraitImpl`/`InherentImpl` carry `member_decls: HashMap<SymbolU32, MemberDecl>`, filled
+  when the block's header resolves. "Does this impl declare this name, and is it a
+  fn/const/type" comes off the AST, so it needs nothing resolved, and the `DefId` it carries
+  is what lets a lookup force one member.
+- `resolve_impl_member` calls `ensure_trait_impl_members` first, forcing exactly the members
+  named `member_symbol` in the impls that could apply. Nothing else moves.
+- Typesets are forced where a bound names them (`resolve_identifier_as_bound`,
+  `resolve_path_segments_as_bound`). Their symbols are registered *resolved* at prescan, so
+  naming one never forced it, and `members` could be read empty — E1047 against a legal type,
+  decided by declaration order alone.
+
+Two findings worth keeping:
+
+- **Eager resolution of impl *members* was tried and rejected.** Pulling every impl member
+  ahead of everything else is the obvious way to make `S::X` resolve, and it surfaced the
+  typeset bug above — unrelated code that trusts parse order rather than forcing what it
+  reads. Forcing by name at the lookup site moves nothing and provokes nothing.
+- **Inherent impls still need their own pass at this.** `inherent_impl_dispatch` is keyed by
+  `(ImplTarget, name)` and filled by `register_inherent_member` at *member* signature time,
+  so a block's header alone does not register it. Pre-filling that index from `member_decls`
+  is the fix, but it interacts with the duplicate-detection logic that reads the same bucket
+  (`conflicting_inherent_block`), so it wants deciding rather than patching.
+
+**The trait-header split**, out of the supertrait work, which fits here as "the header
+demand" (step 5 absorbs it):
 
 - Supertraits are stored as bounds on the trait's own `Self` — there is no separate field —
   and `Trait::supertraits(self_index)` reads them back by filtering the reflexive
