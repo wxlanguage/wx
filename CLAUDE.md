@@ -42,7 +42,7 @@ cargo clippy --workspace --no-deps -- -D warnings
 cargo fmt
 ```
 
-Current baseline: 1006 `wx-compiler` + 43 `wx-fmt` + 62 `wx-lsp` tests pass, clippy clean.
+Current baseline: 1023 `wx-compiler` + 43 `wx-fmt` + 63 `wx-lsp` tests pass, clippy clean.
 
 ## Crates & binaries
 
