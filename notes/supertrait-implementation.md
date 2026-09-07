@@ -16,7 +16,22 @@ Build `supertrait_closure` once and all of those improve. Build the bound checks
 
 ## Current state
 
-Supertraits are *parsed and stored* (`trait_def.bounds.traits`, direct only), and the direct-supertrait impl obligation works (`impl Drawable for Point` needs `impl Sized for Point` → E1034). Missing: transitivity, name resolution through them, cycle detection.
+**Updated 2026-09-07: A, B and C have landed. Only D is left.**
+
+Supertraits are stored as bounds on the trait's own `Self` type param — there is no
+`Trait::bounds` field any more — and `Trait::supertraits(self_index)` reads them back by
+filtering the reflexive `Self: ThisTrait` entry. `ensure_trait_supertraits` resolves the
+clause and nothing else, recursing up the parent chain, so reading any trait's `Self` bounds
+guarantees its ancestors' are resolved too. `ItemRegistry::trait_implies` walks that graph
+transitively (visited-guarded) and `type_implements_trait` asks it, so `T: B` satisfies `A`
+when `B: A` — B and C, in one function each rather than a stored closure.
+
+Cycles are reported as E1082 (`CyclicSupertrait`), naming the whole loop. Not through
+`sig_state` as piece A sketched: a trait resolving only its clause is deliberately never
+`InProgress`, so the walk carries its own path instead — see `resolve_supertrait_clause`.
+
+Missing: **name resolution through the chain** (piece D). `self.grandparent_method()`,
+`T::parent_method()` and `T::ParentAssoc` still fail two levels up.
 
 ## What "supertrait resolution" is — 4 mostly-independent pieces
 
@@ -30,3 +45,9 @@ Supertraits are *parsed and stored* (`trait_def.bounds.traits`, direct only), an
 ## Recommendation
 
 Do **A → B → C** first — small, and it's the exact chain that (a) makes both comparator bound-checks *correct* instead of approximate, (b) un-ignores the two transitivity tests, (c) closes the cycle hole. Then **D** as the standalone user-facing fix. Then return to the comparator for assoc-type bound checking + method-generic bound-compat with `supertrait_closure` already in hand.
+
+**A → C are done.** Sequence D together with step 2 of
+`notes/item-resolution-granularity-plan.md`: D has to edit all six member-lookup sites
+anyway, and routing them through one helper while it does turns that plan's step 4 from a
+six-site change into a one-function change. The decision D forces: a name declared by both a
+trait and its supertrait must report **ambiguous**, not silently pick one.

@@ -1,8 +1,9 @@
 # Item resolution granularity — plan
 
-**Status:** in progress (2026-09-07). The trait-header split and the whole impl side have
-landed — see "What already landed"; the trait side of the member index and the
-`ensure_signature` split have not. Written out of the supertrait work, because the
+**Status:** in progress (2026-09-07). The trait-header split and the whole impl side — trait
+impls *and* inherent — have landed; see "What already landed". The trait side of the member
+index and the `ensure_signature` split have not. Step 2 is the next one, and it is sequenced
+with supertrait piece D (`notes/supertrait-implementation.md`), which edits the same sites. Written out of the supertrait work, because the
 supertrait bug turned out to be one symptom of something more general.
 
 The impl side landed in a different shape than steps 2–4 below described, and better: the
@@ -53,9 +54,9 @@ itself.
 **Landed fix:** `ensure_trait_supertraits` — resolves the clause and nothing else, so a
 member can demand the header without triggering the member loop.
 
-### 2. Impls under-force
+### 2. Impls under-force — **fixed**
 
-Same family, opposite failure, still open. Verified against HEAD (i.e. it predates the
+Same family, opposite failure. Verified against HEAD at the time (i.e. it predated the
 supertrait work):
 
 ```wx
@@ -81,6 +82,10 @@ right after their block, and only a use site earlier in parse order exposes it.
 **Gap 1 cannot be fixed demand-driven.** A trait is reached by name, so a lookup can force
 it. An impl has no name — it is keyed by a *type* — so nothing can demand it. Impl headers
 have to be collected.
+
+Both gaps are closed for both impl kinds: `resolve_impl_dispatch` collects the headers, and
+`ensure_trait_impl_members` / `ensure_inherent_impl_members` force one member by name off
+`member_decls` at the lookup. See "What already landed".
 
 ## What rustc does
 
@@ -288,11 +293,21 @@ Two findings worth keeping:
   ahead of everything else is the obvious way to make `S::X` resolve, and it surfaced the
   typeset bug above — unrelated code that trusts parse order rather than forcing what it
   reads. Forcing by name at the lookup site moves nothing and provokes nothing.
-- **Inherent impls still need their own pass at this.** `inherent_impl_dispatch` is keyed by
-  `(ImplTarget, name)` and filled by `register_inherent_member` at *member* signature time,
-  so a block's header alone does not register it. Pre-filling that index from `member_decls`
-  is the fix, but it interacts with the duplicate-detection logic that reads the same bucket
-  (`conflicting_inherent_block`), so it wants deciding rather than patching.
+- **Inherent impls needed their own pass at this**, and got one (commit "Register inherent
+  impl members from the block header too"). `inherent_impl_dispatch` is keyed by
+  `(ImplTarget, name)` and was filled at *member* signature time, so a block was invisible
+  until the sweep reached its members — `const A: u32 = S::N;` above `impl S { const N ... }`
+  failed with E1007. It is now filled by `register_inherent_impl_decls` from the header.
+
+  That forced the decision the entry above flagged. Duplicate detection used to read the
+  same bucket and the `members` behind it, which is no longer populated when it runs, so it
+  moved onto `member_decls` — a better home regardless: once a lookup can force an arbitrary
+  member out of order, "the first declaration wins" is not answerable from whichever member
+  resolved first. Both `register_*_impl_member` functions are now an insert guarded by what
+  the declarations settled. Two *blocks* claiming one name keep both in the bucket, so a call
+  site reports the ambiguity as well as the declarations — rustc reports E0034 at each use
+  for the same program, and dropping the second candidate would trade every use-site
+  diagnostic for one pointing at neither.
 
 **The trait-header split**, out of the supertrait work, which fits here as "the header
 demand" (step 5 absorbs it):
@@ -312,8 +327,8 @@ demand" (step 5 absorbs it):
   `notes/supertrait-implementation.md`): `self.grandparent_method()` still fails. It is a
   separate change, but it edits exactly the sites step 2 consolidates, so the two are
   deliberately sequenced together — piece D pays for the helper, the helper pays for step 4.
-- **Supertrait cycle diagnostics.** `trait A: B {} trait B: A {}` is still accepted silently.
-  Telling in-progress from done needs a stack of the traits the walk is inside, which is also
-  what naming the loop in the diagnostic needs; both arrive together.
+- ~~**Supertrait cycle diagnostics.**~~ Done — E1082, reported once per cycle and naming the
+  whole loop. The walk carries its own path as a local rather than borrowing `sig_stack`,
+  since a trait resolving only its clause is deliberately never an `ensure_signature` frame.
 - **Visibility of supertrait members** — the trait default-body `pub_span` gap already
   recorded in `CLAUDE.md`.
