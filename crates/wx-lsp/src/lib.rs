@@ -2489,39 +2489,43 @@ fn symbol_hover_text(
 			}
 		}
 		SymbolKind::TypeParam { owner, param_index } => {
-			let param_index = *param_index as usize;
+			let param_index = *param_index;
 			let tp: &TypeParamInfo = match owner {
 				TypeParamOwner::Function(def_id) => {
 					let fi = usize::from(tir.items.function_index(*def_id)?);
 					let func = &tir.items.functions[fi];
 					let local = param_index
 						.checked_sub(func.inherited_type_param_count)?;
-					func.type_params.get(local)?
+					func.type_params.get(local as usize)?
 				}
 				TypeParamOwner::Struct(def_id) => {
 					let si = usize::from(tir.items.struct_index(*def_id)?);
-					tir.items.structs[si].type_params.get(param_index)?
+					tir.items.structs[si]
+						.type_params
+						.get(param_index as usize)?
 				}
 				TypeParamOwner::InherentImpl(block_idx) => tir
 					.items
 					.inherent_impls
 					.get(usize::from(*block_idx))?
 					.type_params
-					.get(param_index)?,
+					.get(param_index as usize)?,
 				TypeParamOwner::Trait(trait_idx) => {
 					let t = tir.items.traits.get(usize::from(*trait_idx))?;
 					&t.self_type_param
 				}
 				TypeParamOwner::TypeAlias(def_id) => {
 					let ai = usize::from(tir.items.type_alias_index(*def_id)?);
-					tir.items.type_aliases[ai].type_params.get(param_index)?
+					tir.items.type_aliases[ai]
+						.type_params
+						.get(param_index as usize)?
 				}
 				TypeParamOwner::TraitImpl(impl_idx) => tir
 					.items
 					.trait_impls
 					.get(usize::from(*impl_idx))?
 					.type_params
-					.get(param_index)?,
+					.get(param_index as usize)?,
 			};
 			let name = interner.resolve(tp.name.inner).unwrap();
 			let bounds_str = fmt.display_bounds(&tp.bounds).unwrap_or_default();

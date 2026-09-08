@@ -1343,6 +1343,48 @@ fn test_trait_associated_const() {
 }
 
 #[test]
+fn test_trait_members_dispatch_through_generic_type_param() {
+	// TIR intentionally leaves both references pointing at the trait
+	// declarations while `T` is abstract. Once `T = Subject`, MIR must select
+	// the impl members instead of trying to lower the bodyless declarations.
+	let case = TestCase::new(indoc! {"
+        trait Values {
+            const VALUE: i32;
+            fn value() -> i32;
+        }
+
+        struct Subject {}
+
+        impl Values for Subject {
+            const VALUE: i32 = 41;
+            fn value() -> i32 { 42 }
+        }
+
+        fn read_const<T: Values>() -> i32 { T::VALUE }
+        fn call_function<T: Values>() -> i32 { T::value() }
+
+        fn const_value() -> i32 { read_const::<Subject>() }
+        fn function_value() -> i32 { call_function::<Subject>() }
+
+        export { const_value, function_value }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let const_value = instance
+		.get_typed_func::<(), i32>(&mut store, "const_value")
+		.unwrap();
+	let function_value = instance
+		.get_typed_func::<(), i32>(&mut store, "function_value")
+		.unwrap();
+	assert_eq!(const_value.call(&mut store, ()).unwrap(), 41);
+	assert_eq!(function_value.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
 fn test_trait_default_method() {
 	// A default method defined in the trait body calls another (abstract) method
 	// on Self.  The default body must compile with `self` having the trait type,

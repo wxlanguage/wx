@@ -229,8 +229,8 @@ impl<'ast> Builder<'ast, '_> {
 				.position(|p| p.name.inner == identifier.inner)
 			{
 				let owner = scope.owner;
-				let abs_index =
-					(self.inherited_type_param_count(owner) + own_idx) as u32;
+				let abs_index = self.inherited_type_param_count(owner)
+					+ u32::try_from(own_idx).unwrap();
 
 				self.items
 					.type_param_info_mut(owner, abs_index as usize)
@@ -421,7 +421,8 @@ impl<'ast> Builder<'ast, '_> {
 			own_params.iter().position(|p| p.name.inner == name)
 		{
 			return Some(
-				(self.inherited_type_param_count(scope.owner) + own_idx) as u32,
+				self.inherited_type_param_count(scope.owner)
+					+ u32::try_from(own_idx).unwrap(),
 			);
 		}
 		if let TypeParamOwner::Function(fn_id) = scope.owner {

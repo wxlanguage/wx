@@ -1175,7 +1175,7 @@ impl<'ast> Builder<'ast, '_> {
 			let export_item = match global_value {
 				SymbolKind::Function { func_index } => {
 					if self.items.functions[usize::from(func_index)]
-						.total_type_param_count()
+						.type_param_count()
 						> 0
 					{
 						self.items.functions[usize::from(func_index)]

@@ -21,25 +21,25 @@ pub enum ScalarType {
 	F64,
 }
 
-impl TryFrom<mir::Type> for ScalarType {
+impl TryFrom<mir::ValueType> for ScalarType {
 	type Error = ();
-	fn try_from(ty: mir::Type) -> Result<Self, ()> {
+	fn try_from(ty: mir::ValueType) -> Result<Self, ()> {
 		Ok(match ty {
-			mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Bool
-			| mir::Type::U8
-			| mir::Type::I8
-			| mir::Type::U16
-			| mir::Type::I16
-			| mir::Type::Function { .. } => ScalarType::I32,
-			mir::Type::I64 | mir::Type::U64 => ScalarType::I64,
-			mir::Type::Pointer { kind, .. } => match kind {
+			mir::ValueType::I32
+			| mir::ValueType::U32
+			| mir::ValueType::Bool
+			| mir::ValueType::U8
+			| mir::ValueType::I8
+			| mir::ValueType::U16
+			| mir::ValueType::I16
+			| mir::ValueType::Function { .. } => ScalarType::I32,
+			mir::ValueType::I64 | mir::ValueType::U64 => ScalarType::I64,
+			mir::ValueType::Pointer { kind, .. } => match kind {
 				mir::MemoryKind::Memory32 => ScalarType::I32,
 				mir::MemoryKind::Memory64 => ScalarType::I64,
 			},
-			mir::Type::F32 => ScalarType::F32,
-			mir::Type::F64 => ScalarType::F64,
+			mir::ValueType::F32 => ScalarType::F32,
+			mir::ValueType::F64 => ScalarType::F64,
 			_ => return Err(()),
 		})
 	}
@@ -51,12 +51,12 @@ impl TryFrom<mir::Type> for ScalarType {
 /// same order. The one place this conversion happens; every producer of a
 /// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
-	ty: mir::Type,
+	ty: mir::ValueType,
 	aggregates: &[mir::Aggregate],
 ) -> Vec<ScalarType> {
 	match ty {
-		mir::Type::Unit | mir::Type::Never => vec![],
-		mir::Type::Aggregate { aggregate_index } => aggregates
+		mir::ValueType::Unit | mir::ValueType::Never => vec![],
+		mir::ValueType::Aggregate { aggregate_index } => aggregates
 			[usize::from(aggregate_index)]
 		.scalars
 		.iter()

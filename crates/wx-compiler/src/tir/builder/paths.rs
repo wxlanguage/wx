@@ -1077,7 +1077,7 @@ impl<'ast> Builder<'ast, '_> {
 						// never bind at the call site.
 						let total = self.items.functions
 							[usize::from(func_index)]
-						.total_type_param_count();
+						.type_param_count() as usize;
 						Ok(ResolvedMember::Function {
 							func_index,
 							type_args: vec![TypeIndex::INFER; total]
@@ -1178,7 +1178,7 @@ impl<'ast> Builder<'ast, '_> {
 				.len();
 				let type_params_len = self.items.functions
 					[usize::from(func_index)]
-				.total_type_param_count();
+				.type_param_count();
 
 				if !segment.type_args.is_empty()
 					&& segment.type_args.len() != fn_params_len
@@ -1215,7 +1215,7 @@ impl<'ast> Builder<'ast, '_> {
 				// turbofish into the function's *own* slots, which start
 				// after the inherited prefix.
 				let mut combined = impl_args;
-				let inherited = type_params_len - fn_params_len;
+				let inherited = (type_params_len as usize) - fn_params_len;
 				for (slot, ast_arg) in combined[inherited..]
 					.iter_mut()
 					.zip(segment.type_args.iter())

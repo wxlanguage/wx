@@ -141,7 +141,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let Some(callee_id) = direct_id {
 			let func_index = self.items.expect_function_index(callee_id);
 			let type_params_len = self.items.functions[usize::from(func_index)]
-				.total_type_param_count();
+				.type_param_count();
 			if type_params_len > 0 {
 				// FunctionItem.type_args is always padded to type_params_len (with
 				// impl-level args pre-filled and remaining slots as INFER) by the time
@@ -151,7 +151,7 @@ impl<'ast> Builder<'ast, '_> {
 					.resolve(callee.ty)
 				{
 					Type::FunctionItem { type_args, .. } => type_args.clone(),
-					_ => vec![TypeIndex::INFER; type_params_len]
+					_ => vec![TypeIndex::INFER; type_params_len as usize]
 						.into_boxed_slice(),
 				};
 
@@ -1136,11 +1136,13 @@ impl<'ast> Builder<'ast, '_> {
 				// call site to resolve. Otherwise (no impl-level generics at
 				// all) start every slot as `INFER`.
 				let type_args = if type_args.is_empty() {
-					vec![TypeIndex::INFER; func.total_type_param_count()]
+					vec![TypeIndex::INFER; func.type_param_count() as usize]
 						.into_boxed_slice()
 				} else {
-					let mut padded =
-						vec![TypeIndex::INFER; func.total_type_param_count()];
+					let mut padded = vec![
+						TypeIndex::INFER;
+						func.type_param_count() as usize
+					];
 					padded[..type_args.len()].copy_from_slice(&type_args);
 					padded.into_boxed_slice()
 				};
@@ -1638,14 +1640,14 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
-				let total = self.items.functions[usize::from(func_index)]
-					.total_type_param_count();
-				if parent_args.len() == total {
+				let total_params = self.items.functions[usize::from(func_index)]
+					.type_param_count() as usize;
+				if parent_args.len() == total_params {
 					return parent_args;
 				}
-				let mut type_args = Vec::with_capacity(total);
+				let mut type_args = Vec::with_capacity(total_params);
 				type_args.extend_from_slice(&parent_args);
-				type_args.resize(total, TypeIndex::INFER);
+				type_args.resize(total_params, TypeIndex::INFER);
 				type_args.into_boxed_slice()
 			}
 			_ => parent_args,

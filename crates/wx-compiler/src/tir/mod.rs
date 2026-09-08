@@ -1730,7 +1730,7 @@ impl MemberIndex {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum ImplEntry {
@@ -2010,8 +2010,8 @@ impl TypeParamInfo {
 impl Function {
 	/// Total number of type parameters visible to this function's body:
 	/// inherited params from the parent impl block plus the function's own params.
-	pub fn total_type_param_count(&self) -> usize {
-		self.inherited_type_param_count + self.type_params.len()
+	pub fn type_param_count(&self) -> usize {
+		self.inherited_type_param_count as usize + self.type_params.len()
 	}
 
 	/// The owner of this function's inherited type parameters — the parent
@@ -2048,7 +2048,7 @@ pub struct Function {
 	/// Number of type parameters inherited from [`Function::type_param_parent`].
 	/// `Type::TypeParam::param_index` values for own params start at this
 	/// offset; impl-block params use absolute indices starting at 0.
-	pub inherited_type_param_count: usize,
+	pub inherited_type_param_count: u32,
 	pub signature_index: TypeIndex,
 	pub name: ast::Spanned<SymbolU32>,
 	pub params: Box<[FunctionParam]>,
@@ -2445,8 +2445,9 @@ impl<'a> TypeFormatter<'a> {
 						let func = &self.items.functions[usize::from(
 							self.items.expect_function_index(*def_id),
 						)];
-						let own_idx = *param_index as usize
-							- func.inherited_type_param_count;
+						let own_idx = (*param_index
+							- func.inherited_type_param_count)
+							as usize;
 						let symbol = func.type_params[own_idx].name.inner;
 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
 					}
@@ -3424,8 +3425,8 @@ impl ItemRegistry {
 			}
 			TypeParamOwner::Function(id) => {
 				let func_idx = usize::from(self.expect_function_index(id));
-				let inherited =
-					self.functions[func_idx].inherited_type_param_count;
+				let inherited = self.functions[func_idx]
+					.inherited_type_param_count as usize;
 				&self.functions[func_idx].type_params[abs_index - inherited]
 			}
 			TypeParamOwner::Struct(id) => {
@@ -3462,8 +3463,8 @@ impl ItemRegistry {
 			}
 			TypeParamOwner::Function(id) => {
 				let func_idx = usize::from(self.expect_function_index(id));
-				let inherited =
-					self.functions[func_idx].inherited_type_param_count;
+				let inherited = self.functions[func_idx]
+					.inherited_type_param_count as usize;
 				&mut self.functions[func_idx].type_params[abs_index - inherited]
 			}
 			TypeParamOwner::Struct(id) => {

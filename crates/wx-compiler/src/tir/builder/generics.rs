@@ -516,7 +516,7 @@ impl<'ast> Builder<'ast, '_> {
 		if ast_params.is_empty() {
 			return;
 		}
-		let offset = self.inherited_type_param_count(owner);
+		let offset = self.inherited_type_param_count(owner) as usize;
 		for (i, tp) in ast_params.iter().enumerate() {
 			let resolved = tp
 				.bounds
@@ -575,7 +575,7 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn inherited_type_param_count(
 		&self,
 		owner: TypeParamOwner,
-	) -> usize {
+	) -> u32 {
 		match owner {
 			TypeParamOwner::Function(id) => {
 				self.items.function_index(id).map_or(0, |idx| {

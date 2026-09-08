@@ -564,9 +564,8 @@ fn test_generic_trait_impl_abstract_dispatch_monomorphizes() {
 /// `impl<T> Container for Box<T> { type Item = Wrapper<T>; ... }` — the
 /// associated type's value is a *composite* (`Wrapper<T>`, not a bare `T`),
 /// so resolving `C::Item` for a monomorphized `C = Box<i32>` must
-/// substitute the impl's own `T` inside `Wrapper<T>`'s structure (via a
-/// `current_substitutions` swap in `lower_type_index`'s
-/// `AssocTypeProjection` arm), not just a top-level `TypeParam` leaf.
+/// instantiate the impl's own `T` inside `Wrapper<T>` under an impl-owned
+/// type environment, not just replace a top-level `TypeParam` leaf.
 #[test]
 fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 	let case = TestCase::new(indoc! {"
@@ -606,7 +605,7 @@ fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.fields.len() == 1 && a.fields[0].ty == Type::I32)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I32)
 		.expect("Wrapper<i32> aggregate with I32 field not found");
 	assert_eq!(agg.layout.size, 4);
 }
@@ -686,7 +685,9 @@ fn test_struct_layout_is_alignment_sorted() {
 	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -696,9 +697,17 @@ fn test_struct_layout_is_alignment_sorted() {
 	assert_eq!(agg.layout.align, 8);
 	// Physical order: b(i64)@0, d(f64)@8, c(u32)@16, a(bool)@20
 	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
-	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
 	assert_eq!(offsets, [0, 8, 16, 20]);
-	assert_eq!(types, [Type::I64, Type::F64, Type::U32, Type::Bool]);
+	assert_eq!(
+		types,
+		[
+			ValueType::I64,
+			ValueType::F64,
+			ValueType::U32,
+			ValueType::Bool
+		]
+	);
 }
 
 /// Three levels of nesting, each level alignment-sorted so that the nested
@@ -726,7 +735,9 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
 
 	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let top_index = match case.mir.signatures[sig_index].params()[0] {
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Top to lower to an aggregate"),
 	};
 
@@ -736,9 +747,11 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
 	assert_eq!(top.layout.align, 8);
 	assert_eq!(top.fields[0].offset, 0);
 	assert_eq!(top.fields[1].offset, 16);
-	assert_eq!(top.fields[1].ty, Type::U8);
+	assert_eq!(top.fields[1].ty, ValueType::U8);
 	let mid_index = match top.fields[0].ty {
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Top's first physical field to be Mid"),
 	};
 
@@ -748,9 +761,11 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
 	assert_eq!(mid.layout.align, 8);
 	assert_eq!(mid.fields[0].offset, 0);
 	assert_eq!(mid.fields[1].offset, 8);
-	assert_eq!(mid.fields[1].ty, Type::U8);
+	assert_eq!(mid.fields[1].ty, ValueType::U8);
 	let deep_index = match mid.fields[0].ty {
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mid's first physical field to be Deep"),
 	};
 
@@ -758,7 +773,7 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
 	assert_eq!(deep.layout.size, 8);
 	assert_eq!(deep.layout.align, 8);
 	assert_eq!(deep.fields[0].offset, 0);
-	assert_eq!(deep.fields[0].ty, Type::U64);
+	assert_eq!(deep.fields[0].ty, ValueType::U64);
 
 	// Two physical fields, three WASM scalars — the counts diverge, and the
 	// scalar order follows the alignment-sorted physical order, not the
@@ -781,7 +796,7 @@ fn test_nested_struct_flattens_to_more_scalars_than_fields() {
 	// The precomputed table must agree with a fresh recursive flatten — this
 	// is the invariant every opt/codegen consumer now relies on.
 	let scalars = crate::wasm::flatten_type_to_scalars(
-		Type::Aggregate {
+		ValueType::Aggregate {
 			aggregate_index: AggregateIndex::new(top_index as u32),
 		},
 		&case.mir.aggregates,
@@ -815,7 +830,9 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -825,9 +842,17 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	assert_eq!(agg.layout.size, 32);
 	assert_eq!(agg.layout.align, 8);
 	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
-	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
 	assert_eq!(offsets, [0, 8, 16, 24]);
-	assert_eq!(types, [Type::Bool, Type::I64, Type::U32, Type::F64]);
+	assert_eq!(
+		types,
+		[
+			ValueType::Bool,
+			ValueType::I64,
+			ValueType::U32,
+			ValueType::F64
+		]
+	);
 	let phys: Vec<usize> =
 		(0..4).map(|d| usize::from(agg.physical(d))).collect();
 	assert_eq!(phys, [0, 1, 2, 3]);
@@ -924,11 +949,9 @@ fn test_different_type_args_produce_separate_mono_instances() {
 ///
 /// Root cause of the former stack overflow: type_args were forwarded raw to
 /// `MonoRegistry::get_or_insert`, so `wrap<TypeParam{0}>` was registered
-/// instead of `wrap<i32>`. When the worklist lowered it with
-/// `current_substitutions = [TypeParam{0}]`, `lower_type_index` entered
-/// infinite mutual recursion: TypeParam{0} → substitutions[0] → TypeParam{0}.
-/// Fix: substitute TypeParam entries in type_args through current_substitutions
-/// before calling get_or_insert (MIR GenericCall arm).
+/// instead of `wrap<i32>`, causing infinite recursion when that unresolved
+/// parameter was lowered. The MIR type context now instantiates every call
+/// argument to a concrete `TypeId` before registering the monomorphization.
 #[test]
 fn test_generic_calls_generic_multi_iteration_worklist() {
 	let case = TestCase::new(indoc! {"
@@ -1004,7 +1027,7 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.iter()
 		.find(|f| {
 			let sig = &case.mir.signatures[usize::from(f.signature_index)];
-			sig.result() == Type::I32
+			sig.result() == ValueType::I32
 		})
 		.expect("get_x_i32 not found");
 	let sig_f32 = case
@@ -1013,7 +1036,7 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.iter()
 		.find(|f| {
 			let sig = &case.mir.signatures[usize::from(f.signature_index)];
-			sig.result() == Type::F32
+			sig.result() == ValueType::F32
 		})
 		.expect("get_x_f32 not found");
 
@@ -1021,14 +1044,18 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		[usize::from(sig_i32.signature_index)]
 	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<i32> to be an aggregate"),
 	};
 	let agg_f32 = match case.mir.signatures
 		[usize::from(sig_f32.signature_index)]
 	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => usize::from(aggregate_index),
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<f32> to be an aggregate"),
 	};
 
@@ -1036,16 +1063,16 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		agg_i32, agg_f32,
 		"Point<i32> and Point<f32> must map to distinct aggregates"
 	);
-	let types = |i: usize| -> Vec<Type> {
+	let types = |i: usize| -> Vec<ValueType> {
 		case.mir.aggregates[i].fields.iter().map(|f| f.ty).collect()
 	};
-	assert_eq!(types(agg_i32), [Type::I32, Type::I32]);
-	assert_eq!(types(agg_f32), [Type::F32, Type::F32]);
+	assert_eq!(types(agg_i32), [ValueType::I32, ValueType::I32]);
+	assert_eq!(types(agg_f32), [ValueType::F32, ValueType::F32]);
 }
 
 /// Constructing and accessing a field on a concrete `Point<i32>` inside a
-/// non-generic function (no outer `current_substitutions`). Verifies that the
-/// struct's own type args are used as substitutions when lowering its fields.
+/// non-generic function. Verifies that the struct's own type environment is
+/// used when lowering its fields.
 #[test]
 fn test_generic_struct_init_and_field_access_concrete() {
 	let case = TestCase::new(indoc! {"
@@ -1073,7 +1100,8 @@ fn test_generic_struct_init_and_field_access_concrete() {
 		.aggregates
 		.iter()
 		.position(|a| {
-			a.fields.len() == 2 && a.fields.iter().all(|f| f.ty == Type::I32)
+			a.fields.len() == 2
+				&& a.fields.iter().all(|f| f.ty == ValueType::I32)
 		})
 		.expect("Point<i32> aggregate not found");
 	assert_eq!(case.mir.aggregates[agg_idx].layout.size, 8);
@@ -1108,7 +1136,7 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.fields.len() == 1 && a.fields[0].ty == Type::I64)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I64)
 		.expect("Box<i64> aggregate with I64 field not found");
 	assert_eq!(agg.layout.size, 8);
 	assert_eq!(agg.layout.align, 8);
@@ -1403,7 +1431,7 @@ fn test_generic_slice_impl_method_lowers_correctly() {
 		"`slice_len` should read the slice aggregate's length slot directly"
 	);
 	assert!(
-		matches!(result.ty, Type::U32),
+		matches!(result.ty, ValueType::U32),
 		"`Mem::Size` should have resolved to `heap`'s index type"
 	);
 }
@@ -1738,7 +1766,7 @@ fn test_generic_bitand_bound_resolves_to_primitive_impl() {
 #[test]
 fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 	// Unary counterpart of `test_generic_bitand_bound_resolves_to_primitive_impl`
-	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
+	// — `build_unary_operator_dispatch` previously had no `ValueType::TypeParam`
 	// branch, so a bare type param bounded by `BitNot` failed to dispatch
 	// at all. Now it goes through `resolve_bounded_operator_method` and
 	// monomorphizes to `i32`'s own (intrinsic-backed) impl, same as the
@@ -1946,13 +1974,13 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
 
 	let sig_index = usize::from(mir_function(&case, "f").signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
-	let Type::Aggregate { aggregate_index } = param_ty else {
+	let ValueType::Aggregate { aggregate_index } = param_ty else {
 		panic!("a tuple parameter lowers to an aggregate")
 	};
 	let agg = case.mir.aggregate(aggregate_index);
 	// Sorted by alignment descending: i64, u32, bool.
-	let types: Vec<Type> = agg.fields.iter().map(|f| f.ty).collect();
-	assert_eq!(types, [Type::I64, Type::U32, Type::Bool]);
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(types, [ValueType::I64, ValueType::U32, ValueType::Bool]);
 	let phys: Vec<usize> =
 		(0..3).map(|d| usize::from(agg.physical(d))).collect();
 	assert_eq!(phys, [2, 0, 1]);

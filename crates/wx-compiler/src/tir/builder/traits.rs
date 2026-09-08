@@ -465,10 +465,12 @@ impl<'ast> Builder<'ast, '_> {
 		let self_type = self.items.inherent_impls[usize::from(block_index)]
 			.target
 			.inner;
-		let inherited_type_param_count = self.items.inherent_impls
-			[usize::from(block_index)]
-		.type_params
-		.len();
+		let inherited_type_param_count = u32::try_from(
+			self.items.inherent_impls[usize::from(block_index)]
+				.type_params
+				.len(),
+		)
+		.unwrap();
 
 		let attributes = self.resolve_attributes(*id, attributes);
 		// Register the function with only its own (method-level) type
@@ -1424,10 +1426,12 @@ impl<'ast> Builder<'ast, '_> {
 		let self_type = self.items.trait_impls[usize::from(trait_impl_index)]
 			.target
 			.inner;
-		let inherited_type_param_count = self.items.trait_impls
-			[usize::from(trait_impl_index)]
-		.type_params
-		.len();
+		let inherited_type_param_count = u32::try_from(
+			self.items.trait_impls[usize::from(trait_impl_index)]
+				.type_params
+				.len(),
+		)
+		.unwrap();
 		let self_symbol = self.interner.get_or_intern("self");
 
 		if let ast::ImplItem::Function {

@@ -16,10 +16,102 @@ impl<Mem: Memory> Arena<Mem> {
     }
 }
 
-impl f32 {
-    const PI: f32 = 3.14;
+memory heap: Memory where { Size = u32 };
+
+struct Range<Idx> {
+    start: Idx,
+    end: Idx,
+}
+
+struct RangeIter<Idx> {
+    start: Idx,
+    end: Idx,
+}
+
+enum Option: u8 {
+    None = 0,
+    Some = 1,
+}
+
+trait Receiver {
+    type Target;
+
+    fn receive(self) -> Self::Target;
+}
+
+impl Receiver for i32 {
+    type Target = i32;
+
+    fn receive(self) -> i32 {
+        self
+    }
+}
+
+impl<Idx> IntoIterator for Range<Idx> {
+    type Item = Idx;
+
+    type IntoIter = RangeIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        RangeIter::{ start: self.start, end: self.end }
+    }
+}
+
+trait Iterator {
+    type Item;
+
+    fn next<R: Receiver where { Target = Self }>(receiver: R) -> (
+        Option,
+        Self::Item,
+    );
+}
+
+impl<Idx> Iterator for RangeIter<Idx> {
+    type Item = Idx;
+
+    fn next<R: Receiver where { Target = RangeIter<Idx> }>(receiver: R) -> (
+        Option,
+        Idx,
+    ) {
+        local x = receiver.receive();
+        unreachable
+    }
+}
+
+trait IntoIterator {
+    type Item;
+
+    type IntoIter: Iterator where { Item = Self::Item };
+
+    fn into_iter(self) -> Self::IntoIter;
+}
+
+struct BumpAllocator {
+    next: RawPtr<heap, u8>,
+}
+
+impl BumpAllocator {
+    pub fn from_addr(start: u32) -> Self {
+        Self::{ next: RawPtr::from_addr(start) }
+    }
+}
+
+impl Allocator for BumpAllocator {
+    type Mem = heap;
+
+    fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+        local aligned_next = self.*.next.align_up(layout.align());
+        self.*.next = aligned_next.add(layout.size());
+        aligned_next.as_ptr()
+    }
 }
 
 fn test() {
-    local x = f32::PI;
+    local range: Range<u32> = Range::{ start: 0, end: 10 };
+    local range_iter = range.into_iter();
+    loop {
+        local x = range_iter.next();
+        if i > 10 { break };
+        i += 1;
+    };
 }

@@ -2102,7 +2102,7 @@ fn test_u32_right_shift_schedules_logical_shift() {
 
 /// A pointer into a `Size = u64` memory is a 64-bit scalar: params,
 /// locals, and address operands must lower to I64, not I32.
-/// `mir::Type::Pointer` carries its memory's width for exactly this.
+/// `mir::ValueType::Pointer` carries its memory's width for exactly this.
 #[test]
 fn test_memory64_pointer_param_is_i64() {
 	let case = TestCase::new(indoc! {"
