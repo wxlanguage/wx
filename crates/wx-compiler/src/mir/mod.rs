@@ -2372,20 +2372,22 @@ impl<'tir> Builder<'tir> {
 					self.intern_tir_function_type(tir_func.signature_index);
 				self.current_substitutions = saved_subs;
 
-				let target_id = if tir_func.body.is_some() {
-					// Default impl: monomorphize with resolved type_args.
-					self.mono_registry.get_or_insert(*id, resolved)
-				} else {
-					// Abstract method called inside a default body: the concrete Self
-					// type is now known, so dispatch directly to the impl.
+				// When `id` is the trait's *own* method entry — an abstract
+				// declaration *or* a default body — the impl that applies to
+				// the now-known concrete `Self` gets first refusal: an impl
+				// override wins over the trait's default body, exactly as
+				// `resolve_impl_member` prefers `from_impl` over `from_default`
+				// at the TIR level. That preference can only be applied here,
+				// once monomorphization has pinned `Self` to a concrete type;
+				// keying off `tir_func.body.is_some()` alone silently ran the
+				// default body even for a type that overrides it.
+				let trait_parent = match tir_func.parent {
+					Some(tir::ItemParent::Trait(idx)) => Some(idx),
+					_ => None,
+				};
+				let target_id = if let Some(trait_index) = trait_parent {
 					let concrete_self = resolved[0];
 					let method_name = tir_func.name.inner;
-					let trait_index = match tir_func.parent {
-						Some(tir::ItemParent::Trait(idx)) => idx,
-						_ => unreachable!(
-							"abstract trait method must be parented by its trait"
-						),
-					};
 					let (trait_impl_idx, impl_type_args) = self
 						.tir
 						.items
@@ -2394,56 +2396,113 @@ impl<'tir> Builder<'tir> {
 							concrete_self,
 							trait_index,
 						)
-						.expect("no impl found for abstract trait method");
-					let impl_func_idx = self.tir.items.trait_impls
+						.expect("no impl found for trait method dispatch");
+					let impl_override = self.tir.items.trait_impls
 						[usize::from(trait_impl_idx)]
 					.members
 					.get(&method_name)
 					.map(|entry| match entry {
-						tir::ImplEntry::Method(idx) => *idx,
-						_ => unreachable!(),
+						tir::ImplEntry::Method(idx)
+						| tir::ImplEntry::AssocFunction(idx) => *idx,
+						_ => unreachable!(
+							"trait method entry resolved to a non-function"
+						),
 					})
-					.expect("no impl found for abstract trait method");
-					let impl_func_id =
-						self.tir.items.functions[usize::from(impl_func_idx)].id;
-					// `impl_type_args` alone only covers the impl block's own
-					// params (e.g. `impl<T> Trait for Box<T>`'s `T`) — the
-					// impl's copy of the method can *also* declare its own
-					// extra params (e.g. `fn write<Mem: Memory>(...)` on an
-					// otherwise-concrete `impl Hasher for DefaultHasher`),
-					// which `impl_type_args` says nothing about. Reusing the
-					// bare `impl_func_id` whenever `impl_type_args` alone is
-					// empty is therefore wrong whenever the method has any
-					// such params of its own: that instance was never
-					// eagerly emitted by `MIR::build`'s main loop (which only
-					// emits functions with zero *total* type params), so the
-					// bare id has no MIR function/wasm index behind it.
-					let impl_own_type_params = &self.tir.items.functions
-						[usize::from(impl_func_idx)]
-					.type_params;
-					if impl_type_args.is_empty()
-						&& impl_own_type_params.is_empty()
-					{
-						// Fully concrete: zero total type params, so it was
-						// already eagerly emitted (with this bare id) — reuse
-						// it directly rather than registering a redundant
-						// duplicate through `mono_registry`.
-						impl_func_id
-					} else {
-						// Needs monomorphizing on demand via the worklist.
-						// Full arg list: the impl block's own args (its
-						// inherited-param prefix) followed by the method's
-						// own args — `resolved`'s tail after the leading
-						// `Self` slot (index 0, already consumed above to
-						// find the impl).
-						let full_args: Box<[tir::TypeIndex]> = impl_type_args
-							.iter()
-							.copied()
-							.chain(resolved[1..].iter().copied())
-							.collect();
-						self.mono_registry
-							.get_or_insert(impl_func_id, full_args)
+					// A `members` entry that points straight back at the trait's
+					// own default function is not a real override: the synthetic
+					// `Memory` trait impl seeds its `members` map with *every*
+					// trait member (methods kept as the trait default verbatim,
+					// see `seed_memory_trait_impl_with`), so "present in
+					// `members`" alone can't be trusted here.
+					.filter(|&idx| {
+						self.tir.items.functions[usize::from(idx)].id != *id
+					});
+					match impl_override {
+						// The impl provides its own body for this method.
+						// `impl_type_args` alone only covers the impl block's
+						// own params (e.g. `impl<T> Trait for Box<T>`'s `T`) —
+						// the impl's copy of the method can *also* declare its
+						// own extra params (e.g. `fn write<Mem: Memory>(...)`
+						// on an otherwise-concrete `impl Hasher for
+						// DefaultHasher`), which `impl_type_args` says nothing
+						// about. Reusing the bare `impl_func_id` whenever
+						// `impl_type_args` alone is empty is therefore wrong
+						// whenever the method has any such params of its own:
+						// that instance was never eagerly emitted by
+						// `MIR::build`'s main loop (which only emits functions
+						// with zero *total* type params), so the bare id has
+						// no MIR function/wasm index behind it.
+						Some(impl_func_idx) => {
+							let impl_func_id = self.tir.items.functions
+								[usize::from(impl_func_idx)]
+							.id;
+							let impl_own_type_params = &self
+								.tir
+								.items
+								.functions[usize::from(impl_func_idx)]
+								.type_params;
+							if impl_type_args.is_empty()
+								&& impl_own_type_params.is_empty()
+							{
+								// Fully concrete: zero total type params, so it
+								// was already eagerly emitted (with this bare
+								// id) — reuse it directly rather than
+								// registering a redundant duplicate through
+								// `mono_registry`.
+								impl_func_id
+							} else {
+								// Needs monomorphizing on demand via the
+								// worklist. Full arg list: the impl block's own
+								// args (its inherited-param prefix) followed by
+								// the method's own args — `resolved`'s tail
+								// after the leading `Self` slot (index 0,
+								// already consumed above to find the impl).
+								let full_args: Box<[tir::TypeIndex]> =
+									impl_type_args
+										.iter()
+										.copied()
+										.chain(resolved[1..].iter().copied())
+										.collect();
+								self.mono_registry
+									.get_or_insert(impl_func_id, full_args)
+							}
+						}
+						// The impl inherits the trait's default body:
+						// monomorphize that, keyed by the trait method id with
+						// the concrete `Self` in `resolved`.
+						None => {
+							// A compiler-synthesized trait impl (today only the
+							// per-`memory` `Memory` impl from
+							// `seed_memory_trait_impl_with`) seeds a `members`
+							// entry for every trait item but does not synthesize
+							// method bodies — a method entry is the trait's own
+							// default verbatim (filtered out just above). So if
+							// such a trait ever grows a *non-defaulted* method,
+							// there is genuinely nothing to lower here. That is
+							// a compiler bug, not a user error: adding the
+							// method must come with a real implementation in the
+							// synthesizing code. This assert turns the
+							// otherwise-opaque bodyless-`lower_function` panic
+							// into a pointed message the first time any debug
+							// build exercises that method.
+							debug_assert!(
+								tir_func.body.is_some(),
+								"trait method `{}` reached MIR with no impl \
+								 override and no default body — a \
+								 compiler-synthesized trait impl left a \
+								 non-defaulted method unimplemented",
+								self.interner
+									.resolve(tir_func.name.inner)
+									.expect("method name is interned"),
+							);
+							self.mono_registry.get_or_insert(*id, resolved)
+						}
 					}
+				} else {
+					// Ordinary generic function, or a concrete impl's own
+					// (generic) method: `id` already is the definition, it
+					// just needs monomorphizing with the resolved type_args.
+					self.mono_registry.get_or_insert(*id, resolved)
 				};
 				self.record_call_edge(target_id);
 
