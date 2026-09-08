@@ -323,7 +323,7 @@ fn inline_call(
 		.into_iter()
 		.enumerate()
 		.map(|(i, arg)| Expression {
-			ty: Type::Unit,
+			ty: ValueType::Unit,
 			kind: ExprKind::LocalSet {
 				scope_index: call_site_scope,
 				local_index: LocalIndex::new(u32::from(root_bias) + i as u32),

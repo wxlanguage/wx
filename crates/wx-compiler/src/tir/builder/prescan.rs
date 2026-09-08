@@ -5,6 +5,97 @@
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
+	fn prescan_trait_member(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		trait_index: TraitIndex,
+		item: &ast::TraitItem,
+	) -> MemberIndex {
+		match item {
+			ast::TraitItem::Function {
+				id,
+				signature,
+				attributes,
+				..
+			} => {
+				let attributes = self.resolve_attributes(*id, attributes);
+				MemberIndex::Function(
+					self.items.push_function(Function {
+						id: *id,
+						file_id,
+						namespace,
+						parent: Some(ItemParent::Trait(trait_index)),
+						is_method: signature.params.first().is_some_and(|p| {
+							self.interner.resolve(p.inner.inner.name.inner)
+								== Some("self")
+						}),
+						body: None,
+						pub_span: None,
+						type_params: signature
+							.type_params
+							.iter()
+							.map(|tp| TypeParamInfo::new(tp.name))
+							.collect(),
+						inherited_type_param_count: 1,
+						signature_index: TypeIndex::ERROR,
+						name: signature.name,
+						accesses: Vec::new(),
+						params: Box::new([]),
+						result: None,
+						attributes,
+					}),
+				)
+			}
+			ast::TraitItem::Const {
+				id,
+				name,
+				ty,
+				attributes,
+				..
+			} => {
+				let attributes = self.resolve_attributes(*id, attributes);
+				MemberIndex::Constant(self.items.push_constant(Constant {
+					id: *id,
+					file_id,
+					namespace,
+					parent: Some(ItemParent::Trait(trait_index)),
+					pub_span: None,
+					name: *name,
+					ty: Spanned {
+						inner: TypeIndex::ERROR,
+						span: ty.span,
+					},
+					value: None,
+					const_value: None,
+					accesses: Vec::new(),
+					attributes,
+				}))
+			}
+			ast::TraitItem::AssociatedType {
+				id,
+				name,
+				attributes,
+				..
+			} => {
+				let attributes = self.resolve_attributes(*id, attributes);
+				MemberIndex::AssociatedType(self.items.push_associated_type(
+					AssociatedType {
+						id: *id,
+						file_id,
+						namespace,
+						name: *name,
+						parent: Some(ItemParent::Trait(trait_index)),
+						bounds: Bounds::default(),
+						accesses: Vec::new(),
+						ty: None,
+						attributes,
+					},
+				))
+			}
+		}
+	}
+
 	pub(super) fn pre_scan_item(
 		&mut self,
 		file_id: FileId,
@@ -34,6 +125,10 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				let attributes = self.resolve_attributes(*id, attributes);
 				self.items.push_function(Function {
+					is_method: signature.params.first().is_some_and(|p| {
+						self.interner.resolve(p.inner.inner.name.inner)
+							== Some("self")
+					}),
 					id: *id,
 					file_id,
 					namespace,
@@ -353,11 +448,50 @@ impl<'ast> Builder<'ast, '_> {
 						inner: self_name_sym,
 						span: name.span,
 					}),
-					entries: HashMap::new(),
-					assoc_types: HashMap::new(),
+					members: HashMap::new(),
 					accesses: Vec::new(),
 				});
 				for trait_item in items.iter() {
+					let member_name = match &trait_item.inner.inner {
+						ast::TraitItem::Function { signature, .. } => {
+							signature.name
+						}
+						ast::TraitItem::Const { name, .. } => *name,
+						ast::TraitItem::AssociatedType { name, .. } => *name,
+					};
+					if let Some(existing) = self.items.traits
+						[usize::from(trait_index)]
+					.members
+					.get(&member_name.inner)
+					.copied()
+					{
+						self.diagnostics.push(report_duplicate_definition(
+							DuplicateDefinitionDiagnostic {
+								name: self
+									.interner
+									.resolve(member_name.inner)
+									.unwrap(),
+								namespace: existing.namespace(),
+								first_definition: existing
+									.def_span(&self.items),
+								second_definition: SourceSpan::new(
+									file_id,
+									member_name.span,
+								),
+							},
+						));
+						continue;
+					}
+					let member = self.prescan_trait_member(
+						file_id,
+						namespace,
+						trait_index,
+						&trait_item.inner.inner,
+					);
+					self.items.traits[usize::from(trait_index)]
+						.members
+						.insert(member_name.inner, member);
+
 					match &trait_item.inner.inner {
 						ast::TraitItem::Function { id, .. } => {
 							self.ast_nodes.push(AstEntry {

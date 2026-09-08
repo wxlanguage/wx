@@ -1343,6 +1343,48 @@ fn test_trait_associated_const() {
 }
 
 #[test]
+fn test_trait_members_dispatch_through_generic_type_param() {
+	// TIR intentionally leaves both references pointing at the trait
+	// declarations while `T` is abstract. Once `T = Subject`, MIR must select
+	// the impl members instead of trying to lower the bodyless declarations.
+	let case = TestCase::new(indoc! {"
+        trait Values {
+            const VALUE: i32;
+            fn value() -> i32;
+        }
+
+        struct Subject {}
+
+        impl Values for Subject {
+            const VALUE: i32 = 41;
+            fn value() -> i32 { 42 }
+        }
+
+        fn read_const<T: Values>() -> i32 { T::VALUE }
+        fn call_function<T: Values>() -> i32 { T::value() }
+
+        fn const_value() -> i32 { read_const::<Subject>() }
+        fn function_value() -> i32 { call_function::<Subject>() }
+
+        export { const_value, function_value }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let const_value = instance
+		.get_typed_func::<(), i32>(&mut store, "const_value")
+		.unwrap();
+	let function_value = instance
+		.get_typed_func::<(), i32>(&mut store, "function_value")
+		.unwrap();
+	assert_eq!(const_value.call(&mut store, ()).unwrap(), 41);
+	assert_eq!(function_value.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
 fn test_trait_default_method() {
 	// A default method defined in the trait body calls another (abstract) method
 	// on Self.  The default body must compile with `self` having the trait type,
@@ -4366,4 +4408,90 @@ fn test_f64_abs_floor_min_max_wasmtime() {
 	assert_eq!(f_copysign.call(&mut store, (3.0, -1.0)).unwrap(), -3.0);
 	assert_eq!(f_copysign.call(&mut store, (-3.0, 1.0)).unwrap(), 3.0);
 	assert_eq!(f_copysign.call(&mut store, (3.0, 1.0)).unwrap(), 3.0);
+}
+
+/// A trait default method must dispatch to an impl's *override* of another
+/// trait method, not silently keep calling the trait's own default body.
+/// Regression for two manifestations of the same MIR bug (`GenericMethodCall`
+/// lowering keyed dispatch off `tir_func.body.is_some()` alone, so a
+/// defaulted-and-overridden method resolved to the default):
+///
+///   * `via_default_body_*` — `doubled`'s default body calls `self.base()`;
+///     `Over` overrides `base`. Plain (non-generic) method call. The bug
+///     returned `2` for `Over` instead of `200`.
+///   * `via_generic_*` — the overridden method reached through a generic
+///     bound (`fn dispatch<T: Scalable>`). The bug returned `1` for `Over`
+///     instead of `100`.
+///
+/// The `Inh` cases (impl inherits the default) pin the other side: the fix
+/// must not break dispatch when there is genuinely no override.
+#[test]
+fn test_trait_default_method_dispatches_to_impl_override() {
+	let case = TestCase::new(indoc! {"
+        trait Scalable {
+            fn base(self) -> i32 { 1 }
+            fn doubled(self) -> i32 { self.base() * 2 }
+        }
+
+        struct Over {}
+        struct Inh {}
+
+        impl Scalable for Over { fn base(self) -> i32 { 100 } }
+        impl Scalable for Inh {}
+
+        fn dispatch<T: Scalable>(t: T) -> i32 { t.base() }
+
+        fn via_default_body_over() -> i32 { local o = Over::{}; o.doubled() }
+        fn via_default_body_inh() -> i32 { local i = Inh::{}; i.doubled() }
+        fn via_generic_over() -> i32 { dispatch(Over::{}) }
+        fn via_generic_inh() -> i32 { dispatch(Inh::{}) }
+
+        export {
+            via_default_body_over,
+            via_default_body_inh,
+            via_generic_over,
+            via_generic_inh,
+        }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let get = |store: &mut wasmtime::Store<()>, name: &str| {
+		instance
+			.get_typed_func::<(), i32>(store, name)
+			.unwrap_or_else(|_| panic!("`{name}` should be exported"))
+	};
+
+	let f = get(&mut store, "via_default_body_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		200,
+		"default `doubled` must call `Over`'s override of `base` (100 * 2)"
+	);
+
+	let f = get(&mut store, "via_default_body_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		2,
+		"default `doubled` on `Inh` uses the default `base` (1 * 2)"
+	);
+
+	let f = get(&mut store, "via_generic_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		100,
+		"`dispatch::<Over>` must call `Over`'s override of `base`"
+	);
+
+	let f = get(&mut store, "via_generic_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		1,
+		"`dispatch::<Inh>` uses the default `base`"
+	);
 }

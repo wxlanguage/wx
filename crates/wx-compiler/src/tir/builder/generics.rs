@@ -261,21 +261,6 @@ impl<'ast> Builder<'ast, '_> {
 					}
 					Err(()) => return Bounds::default(),
 				};
-				// Force the bound trait's own signature — and therefore its
-				// members' `assoc_types` entries — to resolve before looking
-				// up bindings below. Without this, a trait that hasn't been
-				// visited by the main signature-resolution pass yet (e.g. two
-				// traits whose assoc-type `where` clauses reference each
-				// other, such as `trait A { type X: B where { Y = Self } }`
-				// next to `trait B { type Y: A where { X = Self } }`) would
-				// have an empty `assoc_types` map here, silently dropping the
-				// access instead of recording it. Best-effort, hence the
-				// discarded status: in progress means the trait is already
-				// resolving further up the stack, and the access is recorded
-				// against whatever it has populated by now.
-				let _ = self.ensure_signature(
-					self.items.traits[usize::from(trait_index)].id,
-				);
 				// At most one entry per name — a name is only ever
 				// meaningful once per `where { }` block, whether it's
 				// written twice the same way (`Size = u32, Size = u64`) or
@@ -313,11 +298,19 @@ impl<'ast> Builder<'ast, '_> {
 						);
 						continue;
 					}
-					if let Some(at) = self.items.traits
-						[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&binding.name.inner)
-					{
+					// Identity is usable even while recursive associated bounds are resolving.
+					let _ = self.declared_trait_member(
+						trait_index,
+						binding.name.inner,
+						SourceSpan::new(
+							resolve_context.file_id,
+							binding.name.span,
+						),
+					);
+					if let Some(at) = self.items.trait_associated_type_mut(
+						trait_index,
+						binding.name.inner,
+					) {
 						at.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
 							binding.name.span,
@@ -346,12 +339,14 @@ impl<'ast> Builder<'ast, '_> {
 							// place that needs to know about the trait's own
 							// declared bound (`type Size: PointerSize`) to
 							// fold it in and check for a conflict.
-							let declared = self.items.traits
-								[usize::from(trait_index)]
-							.assoc_types
-							.get(&binding.name.inner)
-							.map(|at| at.bounds.clone())
-							.unwrap_or_default();
+							let declared = self
+								.items
+								.trait_associated_type(
+									trait_index,
+									binding.name.inner,
+								)
+								.map(|at| at.bounds.clone())
+								.unwrap_or_default();
 							let merged_typeset = match (
 								declared.typeset,
 								rhs_bounds.typeset,
@@ -521,7 +516,7 @@ impl<'ast> Builder<'ast, '_> {
 		if ast_params.is_empty() {
 			return;
 		}
-		let offset = self.inherited_type_param_count(owner);
+		let offset = self.inherited_type_param_count(owner) as usize;
 		for (i, tp) in ast_params.iter().enumerate() {
 			let resolved = tp
 				.bounds
@@ -534,7 +529,15 @@ impl<'ast> Builder<'ast, '_> {
 					)
 				})
 				.unwrap_or_default();
+			let roots: Vec<_> = resolved
+				.traits
+				.iter()
+				.map(|bound| bound.trait_index)
+				.collect();
 			self.items.type_param_info_mut(owner, offset + i).bounds = resolved;
+			for root in roots {
+				self.ensure_trait_supertraits(root);
+			}
 		}
 	}
 
@@ -572,7 +575,7 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn inherited_type_param_count(
 		&self,
 		owner: TypeParamOwner,
-	) -> usize {
+	) -> u32 {
 		match owner {
 			TypeParamOwner::Function(id) => {
 				self.items.function_index(id).map_or(0, |idx| {
@@ -780,7 +783,7 @@ impl<'ast> Builder<'ast, '_> {
 									Some(ImplEntry::AssocType(idx)) => {
 										let concrete = self
 											.items
-											.assoc_type_impls[usize::from(*idx)]
+											.associated_types[usize::from(*idx)]
 										.ty
 										.unwrap();
 										// The impl's own assoc-type value may
@@ -1022,7 +1025,7 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			Some(ImplEntry::AssocType(idx)) => {
 				let raw =
-					self.items.assoc_type_impls[usize::from(idx)].ty.unwrap();
+					self.items.associated_types[usize::from(idx)].ty.unwrap();
 				Some(self.substitute_type(raw.inner, &impl_type_args))
 			}
 			_ => None,
@@ -1046,9 +1049,20 @@ impl<'ast> Builder<'ast, '_> {
 		ty: Spanned<TypeIndex>,
 	) {
 		let ResolveContext { file_id, namespace } = resolve_context;
-		let Some(bounds) = self.items.traits[usize::from(trait_index)]
-			.assoc_types
-			.get(&name.inner)
+		if self
+			.declared_trait_member(
+				trait_index,
+				name.inner,
+				SourceSpan::new(file_id, name.span),
+			)
+			.is_err()
+		{
+			return;
+		}
+
+		let Some(bounds) = self
+			.items
+			.trait_associated_type(trait_index, name.inner)
 			.map(|assoc_type| assoc_type.bounds.clone())
 		else {
 			// TODO: handle unknown associated type
@@ -1100,7 +1114,7 @@ impl<'ast> Builder<'ast, '_> {
 						.get(&binding_name)
 						{
 							Some(ImplEntry::AssocType(idx)) => {
-								let raw = self.items.assoc_type_impls
+								let raw = self.items.associated_types
 									[usize::from(*idx)]
 								.ty
 								.unwrap();
@@ -1367,9 +1381,8 @@ impl<'ast> Builder<'ast, '_> {
 		else {
 			return false;
 		};
-		self.items.traits[usize::from(*trait_index)]
-			.assoc_types
-			.get(assoc_name)
+		self.items
+			.trait_associated_type(*trait_index, *assoc_name)
 			.is_some_and(|a| a.bounds.typeset.is_some())
 	}
 }

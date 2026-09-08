@@ -1,3 +1,5 @@
+Implementation update: piece D now uses shared member lookup through the transitive trait graph. Methods, constants, and associated types retain the declaring trait; diamonds are deduplicated and distinct declarations are ambiguous. Qualified paths use transitive bound satisfaction while remaining restricted to the explicitly named trait. The implementation uses a shared traversal, not a stored closure. See `notes/item-resolution-granularity-plan.md` for the member-demand and memory-synthesis changes. The original design discussion follows.
+
 Not a hard block — but it's the right thing to do first, for three reasons.
 
 ## Why supertraits first

@@ -526,7 +526,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		// The impl's written value, still in terms of the impl's own params
 		// — hence the new `push_impl` env below.
-		let raw = self.items.assoc_type_impls[usize::from(*assoc_idx)]
+		let raw = self.items.associated_types[usize::from(*assoc_idx)]
 			.ty?
 			.inner;
 		let env = arena.push_impl(impl_index, impl_args, base.env);

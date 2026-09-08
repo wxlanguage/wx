@@ -1980,8 +1980,8 @@ impl<'f> Scheduler<'f> {
 		let mut locals = Vec::with_capacity(agg.scalars.len());
 		for (field, &field_node) in agg.fields.iter().zip(fields.iter()) {
 			match field.ty {
-				mir::Type::Unit | mir::Type::Never => {}
-				mir::Type::Aggregate { .. } => {
+				mir::ValueType::Unit | mir::ValueType::Never => {}
+				mir::ValueType::Aggregate { .. } => {
 					self.ensure_aggregate_locals(field_node);
 					locals.extend_from_slice(
 						&self.node_to_aggregate_locals[&field_node],

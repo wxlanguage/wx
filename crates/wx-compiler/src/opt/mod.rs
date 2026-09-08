@@ -47,16 +47,16 @@ pub enum MemAccess {
 }
 
 impl MemAccess {
-	pub fn from_mir(ty: mir::Type) -> Self {
+	pub fn from_mir(ty: mir::ValueType) -> Self {
 		match ty {
-			mir::Type::I8 => Self::I8S,
-			mir::Type::U8 => Self::I8U,
-			mir::Type::I16 => Self::I16S,
-			mir::Type::U16 => Self::I16U,
-			mir::Type::I64 | mir::Type::U64 => Self::I64,
-			mir::Type::F32 => Self::F32,
-			mir::Type::F64 => Self::F64,
-			mir::Type::Pointer { kind, .. } => match kind {
+			mir::ValueType::I8 => Self::I8S,
+			mir::ValueType::U8 => Self::I8U,
+			mir::ValueType::I16 => Self::I16S,
+			mir::ValueType::U16 => Self::I16U,
+			mir::ValueType::I64 | mir::ValueType::U64 => Self::I64,
+			mir::ValueType::F32 => Self::F32,
+			mir::ValueType::F64 => Self::F64,
+			mir::ValueType::Pointer { kind, .. } => match kind {
 				mir::MemoryKind::Memory32 => Self::I32,
 				mir::MemoryKind::Memory64 => Self::I64,
 			},

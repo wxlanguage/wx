@@ -88,7 +88,9 @@ impl<'mir> Builder<'mir> {
 			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
 			// WASM param slot — see the matching case in `build_call`.
 			data_bindings[i] = match local.ty {
-				mir::Type::Unit | mir::Type::Never => StackResult::Unit,
+				mir::ValueType::Unit | mir::ValueType::Never => {
+					StackResult::Unit
+				}
 				ty => StackResult::Value(
 					self.build_param_value(ty, &mut wasm_idx),
 				),
@@ -139,11 +141,11 @@ impl<'mir> Builder<'mir> {
 	/// `mir::ScalarTable` uses.
 	fn build_param_value(
 		&mut self,
-		ty: mir::Type,
+		ty: mir::ValueType,
 		wasm_idx: &mut u32,
 	) -> DataNodeIndex {
 		match ty {
-			mir::Type::Aggregate { aggregate_index } => {
+			mir::ValueType::Aggregate { aggregate_index } => {
 				let mir = self.mir;
 				let agg = &mir.aggregate(aggregate_index);
 				let fields: Box<[_]> = agg
@@ -569,7 +571,9 @@ impl<'mir> Builder<'mir> {
 			// ── Aggregates ────────────────────────────────────────────────
 			ExprKind::Aggregate { values } => {
 				let aggregate_index = match expr.ty {
-					mir::Type::Aggregate { aggregate_index } => aggregate_index,
+					mir::ValueType::Aggregate { aggregate_index } => {
+						aggregate_index
+					}
 					_ => {
 						panic!("Aggregate expression must have Aggregate type")
 					}
@@ -800,7 +804,7 @@ impl<'mir> Builder<'mir> {
 					.build_expr(block_idx, bindings, pointer)
 					.unwrap_value();
 				match expr.ty {
-					mir::Type::Aggregate { aggregate_index } => {
+					mir::ValueType::Aggregate { aggregate_index } => {
 						StackResult::Value(self.build_aggregate_load(
 							block_idx,
 							address,
@@ -841,7 +845,7 @@ impl<'mir> Builder<'mir> {
 					.build_expr(block_idx, bindings, pointer)
 					.unwrap_value();
 				match value.ty {
-					mir::Type::Aggregate { aggregate_index } => {
+					mir::ValueType::Aggregate { aggregate_index } => {
 						let value_node = self
 							.build_expr(block_idx, bindings, value)
 							.unwrap_value();
@@ -1063,7 +1067,7 @@ impl<'mir> Builder<'mir> {
 	/// and ordinary `i32`/`u32` literals); I64 matches still compile
 	/// correctly, just always via the if-chain.
 	fn should_use_br_table(
-		selector_ty: mir::Type,
+		selector_ty: mir::ValueType,
 		cases: &[(i64, mir::Expression)],
 	) -> bool {
 		if ScalarType::try_from(selector_ty) != Ok(ScalarType::I32) {
@@ -1664,10 +1668,10 @@ impl<'mir> Builder<'mir> {
 		bindings: &mut Vec<StackResult>,
 		callee_expr: &mir::Expression,
 		arguments: &[mir::Expression],
-		result_ty: mir::Type,
+		result_ty: mir::ValueType,
 	) -> StackResult {
 		let callee_sig = match callee_expr.ty {
-			mir::Type::Function { signature_index } => signature_index,
+			mir::ValueType::Function { signature_index } => signature_index,
 			_ => unreachable!(),
 		};
 		let callee = self
@@ -1687,8 +1691,8 @@ impl<'mir> Builder<'mir> {
 			.collect();
 
 		let result = match result_ty {
-			mir::Type::Unit | mir::Type::Never => StackResult::Unit,
-			mir::Type::Aggregate { aggregate_index } => {
+			mir::ValueType::Unit | mir::ValueType::Never => StackResult::Unit,
+			mir::ValueType::Aggregate { aggregate_index } => {
 				StackResult::Value(self.node(
 					DataNodeKind::AggregateCallResult { aggregate_index },
 				))
@@ -2109,7 +2113,7 @@ impl<'mir> Builder<'mir> {
 		let agg = &mir.aggregate(aggregate_index);
 		let range = agg.scalars.field_range(phys_index);
 		match agg.field(phys_index).ty {
-			mir::Type::Aggregate {
+			mir::ValueType::Aggregate {
 				aggregate_index: nested,
 			} => {
 				let values: Vec<DataNodeIndex> = range
@@ -2194,8 +2198,8 @@ impl<'mir> Builder<'mir> {
 				for (field, &field_node) in agg.fields.iter().zip(fields.iter())
 				{
 					match field.ty {
-						mir::Type::Unit | mir::Type::Never => {}
-						mir::Type::Aggregate { .. } => {
+						mir::ValueType::Unit | mir::ValueType::Never => {}
+						mir::ValueType::Aggregate { .. } => {
 							self.collect_scalars(field_node, out)
 						}
 						_ => out.push(field_node),
@@ -2242,10 +2246,10 @@ impl<'mir> Builder<'mir> {
 			let range = agg.scalars.field_range(mir::PhysIndex::new(i as u32));
 			let owned = &values[range.start as usize..range.end as usize];
 			fields.push(match field.ty {
-				mir::Type::Aggregate {
+				mir::ValueType::Aggregate {
 					aggregate_index: nested,
 				} => self.aggregate_from_scalars(nested, owned),
-				mir::Type::Unit | mir::Type::Never => unreachable!(
+				mir::ValueType::Unit | mir::ValueType::Never => unreachable!(
 					"a zero-sized aggregate field owns no value to rebuild \
 					 from; `DataNodeKind::Aggregate::fields` cannot represent \
 					 one yet"
@@ -2466,10 +2470,10 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
-	fn default_value(&mut self, ty: mir::Type) -> StackResult {
+	fn default_value(&mut self, ty: mir::ValueType) -> StackResult {
 		match ty {
-			mir::Type::Unit | mir::Type::Never => StackResult::Unit,
-			mir::Type::Aggregate { aggregate_index } => {
+			mir::ValueType::Unit | mir::ValueType::Never => StackResult::Unit,
+			mir::ValueType::Aggregate { aggregate_index } => {
 				let mir = self.mir;
 				let agg = &mir.aggregate(aggregate_index);
 				let fields: Box<[_]> = agg
@@ -2524,7 +2528,7 @@ impl<'mir> Builder<'mir> {
 		let owner = agg.scalars.owner(scalar);
 		let field_node = fields[usize::from(owner)];
 		match agg.field(owner).ty {
-			mir::Type::Aggregate { .. } => {
+			mir::ValueType::Aggregate { .. } => {
 				let start = agg.scalars.field_range(owner).start;
 				let relative = mir::ScalarIndex::new(u32::from(scalar) - start);
 				self.fold_scalar_projection(field_node, relative)

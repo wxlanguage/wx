@@ -1,16 +1,27 @@
 /// the role of MIR is to desugar the syntax like x += 1 into x = x + 1 and
 /// lower the concepts like enums into primitive constants, convert labels from
 /// symbols in interner into numeric indices
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use string_interner::symbol::SymbolU32;
 
-use crate::ast::{self, DefIdGenerator};
+use crate::ast;
 use crate::index::index_newtype;
 use crate::tir::{self, ItemAttribute};
 
+mod builder;
 mod inlining;
+mod layout;
+mod mono;
+mod signatures;
+mod static_data;
+mod types;
 use inlining::{rebase_scope, run_inlining_pass};
+use layout::{AggregateInterner, FieldOrder};
+use mono::MonoRegistry;
+use signatures::SignatureInterner;
+use static_data::StaticDataPool;
+use types::{ConcreteType, TraitMember, TypeContext, TypeEnvId, TypeId};
 
 #[cfg(test)]
 mod tests;
@@ -379,7 +390,7 @@ pub enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum Type {
+pub enum ValueType {
 	I32,
 	I64,
 	F32,
@@ -405,14 +416,18 @@ pub enum Type {
 	},
 }
 
-impl Type {
+impl ValueType {
 	/// Types whose division, remainder, right shift, and ordered comparisons
 	/// must use the unsigned WASM instruction variants. Pointers are
 	/// unsigned addresses.
 	pub fn is_unsigned(self) -> bool {
 		matches!(
 			self,
-			Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Pointer { .. }
+			ValueType::U8
+				| ValueType::U16
+				| ValueType::U32
+				| ValueType::U64
+				| ValueType::Pointer { .. }
 		)
 	}
 }
@@ -421,7 +436,7 @@ impl Type {
 #[derive(Clone)]
 pub struct Expression {
 	pub kind: ExprKind,
-	pub ty: Type,
+	pub ty: ValueType,
 }
 
 index_newtype!(
@@ -445,13 +460,13 @@ index_newtype!(
 	ScalarIndex
 );
 
-/// One field of an aggregate, in physical order. Type and byte offset live in
-/// one struct because both are always reached by the same [`PhysIndex`].
+/// One field of an aggregate, in physical order. Value type and byte offset live
+/// in one struct because both are always reached by the same [`PhysIndex`].
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Field {
-	pub ty: Type,
+	pub ty: ValueType,
 	/// Byte offset from the aggregate's base.
 	pub offset: u32,
 }
@@ -462,7 +477,7 @@ pub struct Field {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Scalar {
 	/// Always convertible to a `wasm::ScalarType`, by construction.
-	pub ty: Type,
+	pub ty: ValueType,
 	/// Byte offset from the *aggregate's* base, with every enclosing field's
 	/// offset already folded in. Carrying it here is what lets an aggregate
 	/// store or load walk the scalar list flat instead of recursing the field
@@ -701,7 +716,7 @@ pub enum Mutability {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone)]
 pub struct Local {
-	pub ty: Type,
+	pub ty: ValueType,
 	pub mutability: Mutability,
 }
 
@@ -711,22 +726,22 @@ pub struct BlockScope {
 	pub kind: tir::BlockKind,
 	pub parent: Option<ScopeIndex>,
 	pub locals: Vec<Local>,
-	pub result: Type,
+	pub result: ValueType,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionSignature {
-	pub items: Box<[Type]>,
+	pub items: Box<[ValueType]>,
 	pub params_count: usize,
 }
 
 impl FunctionSignature {
-	pub fn params(&self) -> &[Type] {
+	pub fn params(&self) -> &[ValueType] {
 		&self.items[..self.params_count]
 	}
 
-	pub fn result(&self) -> Type {
+	pub fn result(&self) -> ValueType {
 		self.items[self.params_count]
 	}
 }
@@ -754,7 +769,7 @@ pub enum ConstInit {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Global {
 	pub id: ast::DefId,
-	pub ty: Type,
+	pub ty: ValueType,
 	pub mutability: Mutability,
 	/// WASM global section init expression. Mutable globals use zero here
 	/// and are assigned at runtime by the start function. Immutable globals
@@ -768,25 +783,6 @@ pub struct Global {
 pub struct Layout {
 	pub size: u32,
 	pub align: u32,
-}
-
-impl Layout {
-	fn pad_to_align(self) -> Self {
-		Layout {
-			size: (self.size + self.align - 1) & !(self.align - 1),
-			align: self.align,
-		}
-	}
-}
-
-/// How an aggregate's fields are physically ordered in memory.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum FieldOrder {
-	/// Fields are sorted by alignment descending to minimize padding
-	/// (the default for tuples, slices, and plain structs).
-	Sorted,
-	/// Fields keep declaration order — set by `#[fixed_order]`.
-	Fixed,
 }
 
 impl MIR {
@@ -804,16 +800,14 @@ impl MIR {
 		let mut builder = Builder {
 			tir,
 			interner,
-			aggregate_index_lookup: HashMap::new(),
-			aggregates: Vec::new(),
-			signature_pool: Vec::new(),
-			signature_index_lookup: HashMap::new(),
-			current_substitutions: Box::new([]),
+			types: TypeContext::new(tir),
+			aggregates: AggregateInterner::default(),
+			signatures: SignatureInterner::default(),
+			current_type_env: None,
 			mono_registry: MonoRegistry::new(id_generator),
 			current_function_id: None,
 			call_edges: Vec::new(),
-			static_entries: Vec::new(),
-			symbol_to_entry_index: HashMap::new(),
+			static_data: StaticDataPool::default(),
 		};
 
 		// MIR functions: live defined (Internal) monomorphic functions only.
@@ -824,7 +818,7 @@ impl MIR {
 		let mut inline_functions: HashSet<ast::DefId> = HashSet::new();
 		for func in &tir.items.functions {
 			if func.body.is_some()
-				&& func.total_type_param_count() == 0
+				&& func.type_param_count() == 0
 				&& !tir.is_import_namespace(func.namespace)
 				&& !func.attributes.contains(&ItemAttribute::Intrinsic)
 			{
@@ -849,42 +843,32 @@ impl MIR {
 		// Build the start function before the mono loop so that any generic
 		// functions called in global initializers (e.g. null<M, T>()) are added
 		// to the worklist and processed together with the rest.
-		let start_id = builder.mono_registry.id_generator.generate();
+		let start_id = builder.mono_registry.generate_id();
 		let start_function = builder.build_start_function(tir, start_id);
 
 		// Monomorphization: drain the registry worklist populated by lower_expression
 		// when it encountered calls to generic functions. Each iteration may add new
 		// entries (generic-calls-generic), so we loop until the worklist is exhausted.
-		let mut work_cursor = 0;
-		loop {
-			let current_len = builder.mono_registry.worklist.len();
-			if work_cursor >= current_len {
-				break;
-			}
-			let pending = builder.mono_registry.worklist
-				[work_cursor..current_len]
-				.to_vec();
-			work_cursor = current_len;
+		while let Some(pending) = builder.mono_registry.next_pending() {
+			let tir_idx = tir.items.expect_function_index(pending.original_id);
+			let tir_func = &tir.items.functions[usize::from(tir_idx)];
+			let is_inline =
+				tir_func.attributes.contains(&tir::ItemAttribute::Inline);
 
-			for (orig_id, subst, mono_id) in pending {
-				let tir_idx = tir.items.expect_function_index(orig_id);
-				let tir_func = &tir.items.functions[usize::from(tir_idx)];
-				let is_inline =
-					tir_func.attributes.contains(&tir::ItemAttribute::Inline);
+			builder.current_type_env = builder
+				.types
+				.push_function_env(tir_func, &pending.type_args);
+			builder.current_function_id = Some(pending.mono_id);
 
-				builder.current_substitutions = subst;
-				builder.current_function_id = Some(mono_id);
+			// lower_function interns the concrete signature (substitutions active).
+			let mut mir_func = builder.lower_function(tir_func);
+			mir_func.id = pending.mono_id;
 
-				// lower_function interns the concrete signature (substitutions active).
-				let mut mir_func = builder.lower_function(tir_func);
-				mir_func.id = mono_id;
+			builder.current_type_env = None;
+			functions.push(mir_func);
 
-				builder.current_substitutions = Box::new([]);
-				functions.push(mir_func);
-
-				if is_inline {
-					inline_functions.insert(mono_id);
-				}
+			if is_inline {
+				inline_functions.insert(pending.mono_id);
 			}
 		}
 
@@ -932,7 +916,7 @@ impl MIR {
 			})
 			.collect();
 
-		let signatures = builder.signature_pool;
+		let signatures = builder.signatures.finish();
 
 		if let Some(ref f) = start_function {
 			functions.push(f.clone());
@@ -943,7 +927,7 @@ impl MIR {
 			inline_functions,
 			globals,
 			signatures,
-			aggregates: builder.aggregates.into_boxed_slice(),
+			aggregates: builder.aggregates.finish(),
 			imports,
 			start_function: start_function.map(|_| start_id),
 			memories: tir
@@ -1006,45 +990,11 @@ impl MIR {
 				exports
 			},
 			call_edges: builder.call_edges,
-			static_entries: builder.static_entries,
+			static_entries: builder.static_data.finish(),
 		};
 
 		run_inlining_pass(&mut mir);
 		mir
-	}
-}
-
-/// Tracks which generic function instantiations are needed, assigning each
-/// unique `(original_def_id, type_args)` pair a fresh synthetic `DefId`.
-struct MonoRegistry {
-	map: HashMap<(ast::DefId, Box<[tir::TypeIndex]>), ast::DefId>,
-	/// Stable insertion-order worklist; grows as generic-calls-generic paths
-	/// are encountered during lowering.
-	worklist: Vec<(ast::DefId, Box<[tir::TypeIndex]>, ast::DefId)>,
-	id_generator: DefIdGenerator,
-}
-
-impl MonoRegistry {
-	fn new(id_generator: DefIdGenerator) -> Self {
-		Self {
-			map: HashMap::new(),
-			worklist: Vec::new(),
-			id_generator,
-		}
-	}
-
-	fn get_or_insert(
-		&mut self,
-		orig_id: ast::DefId,
-		type_args: Box<[tir::TypeIndex]>,
-	) -> ast::DefId {
-		if let Some(&id) = self.map.get(&(orig_id, type_args.clone())) {
-			return id;
-		}
-		let id = self.id_generator.generate();
-		self.map.insert((orig_id, type_args.clone()), id);
-		self.worklist.push((orig_id, type_args, id));
-		id
 	}
 }
 
@@ -1062,16 +1012,12 @@ enum IndexAddress {
 struct Builder<'tir> {
 	tir: &'tir tir::TIR,
 	interner: &'tir ast::StringInterner,
-	aggregate_index_lookup: HashMap<(FieldOrder, Box<[Type]>), AggregateIndex>,
-	aggregates: Vec<Aggregate>,
-	/// Concrete function signatures, interned on demand. The index into this
-	/// Vec is the MIR `SignatureIndex` used throughout the rest of the IR.
-	signature_pool: Vec<FunctionSignature>,
-	signature_index_lookup: HashMap<FunctionSignature, SignatureIndex>,
-	/// Concrete type substitution for the current generic instantiation.
-	/// Indexed by `param_index`: `current_substitutions[i]` is the concrete
-	/// `TypeIndex` for `TypeParam { param_index: i }`.
-	current_substitutions: Box<[tir::TypeIndex]>,
+	types: TypeContext<'tir>,
+	aggregates: AggregateInterner,
+	signatures: SignatureInterner,
+	/// Owner-scoped concrete substitutions for the function currently being
+	/// lowered. All instantiated types live in `types`, never in TIR's pool.
+	current_type_env: Option<TypeEnvId>,
 	mono_registry: MonoRegistry,
 	/// MIR id of the function currently being lowered. Set by `MIR::build`
 	/// before each `lower_function` call (TIR id in Phase 1, synthetic mono id
@@ -1082,10 +1028,7 @@ struct Builder<'tir> {
 	/// function's `callers` list from actual MIR-level calls rather than
 	/// TIR accesses.
 	call_edges: Vec<(ast::DefId, ast::DefId)>,
-	static_entries: Vec<StaticEntry>,
-	/// String-literal dedup: the same literal may still appear once per
-	/// memory, so the memory is part of the key.
-	symbol_to_entry_index: HashMap<(SymbolU32, ast::DefId), u32>,
+	static_data: StaticDataPool,
 }
 
 struct FunctionContext {
@@ -1099,105 +1042,17 @@ impl<'tir> Builder<'tir> {
 	/// The aggregate `index` refers to, in the table built so far.
 	#[inline]
 	fn aggregate(&self, index: AggregateIndex) -> &Aggregate {
-		&self.aggregates[usize::from(index)]
+		self.aggregates.get(index)
 	}
 
-	/// Given an `AssocTypeProjection`'s already-known `trait_index`/
-	/// `assoc_name` and a fully concrete `base`, finds the applicable impl
-	/// and its stored associated-type value. That value lives in the
-	/// *impl's own* type-param scheme (e.g. `TraitImpl(impl_idx)`'s param 0
-	/// for `impl<T> Trait for Foo<T> { type Assoc = ...; }`), not the
-	/// caller's — so it is only safe to further resolve/lower under
-	/// `impl_type_args`, never under whatever `current_substitutions`
-	/// happens to be active at the call site. Returns `impl_type_args`
-	/// alongside so callers can install it before recursing.
-	fn find_assoc_type_value(
-		&self,
-		base: tir::TypeIndex,
-		trait_index: tir::TraitIndex,
-		assoc_name: SymbolU32,
-	) -> (tir::TraitImplIndex, Box<[tir::TypeIndex]>, tir::TypeIndex) {
-		// `trait_index` is already known (part of the projection itself), so
-		// go straight through `find_trait_impl` rather than
-		// `resolve_impl_member`'s ambiguity-scanning candidate search — no
-		// ambiguity is possible here.
-		let (impl_idx, impl_type_args) = self
-			.tir
-			.items
-			.find_trait_impl(&self.tir.types, base, trait_index)
-			.expect(
-				"no impl found for associated type projection during MIR lowering",
-			);
-		let assoc_ty = match self.tir.items.trait_impls[usize::from(impl_idx)]
-			.members
-			.get(&assoc_name)
-			.unwrap()
-		{
-			tir::ImplEntry::AssocType(idx) => {
-				self.tir.items.assoc_type_impls[usize::from(*idx)]
-					.ty
-					.unwrap()
-					.inner
-			}
-			_ => unreachable!(),
-		};
-		(impl_idx, impl_type_args, assoc_ty)
-	}
-
-	/// Resolve a TIR TypeIndex to a concrete TIR TypeIndex using `current_substitutions`.
-	/// Handles chains of `AssocTypeProjection` by recursing through the base.
-	///
-	/// Only chases direct `TypeParam`/`AssocTypeProjection` leaves — it
-	/// cannot represent a *composite* associated-type value (e.g.
-	/// `type Assoc = Box<T>;`) as a single resolved `TypeIndex` without
-	/// interning a new one, which this `&self` method has no way to do
-	/// (`Builder::tir` is a frozen `&TIR`). Its only callers needing that —
-	/// `resolve_memory_id` and its own recursion on `base` — never hit the
-	/// composite case in practice (a memory type is never wrapped inside
-	/// another type constructor). `lower_type_index`'s `AssocTypeProjection`
-	/// arm handles the general/composite case itself instead of going
-	/// through here, since it can install `impl_type_args` into
-	/// `current_substitutions` before recursing.
-	fn resolve_tir_type(&self, ty: tir::TypeIndex) -> tir::TypeIndex {
-		match self.tir.types.resolve(ty) {
-			tir::Type::TypeParam { param_index, .. } => {
-				self.current_substitutions[*param_index as usize]
-			}
-			tir::Type::AssocTypeProjection {
-				base,
-				assoc_name,
-				trait_index,
-			} => {
-				let (base, assoc_name, trait_index) =
-					(*base, *assoc_name, *trait_index);
-				let concrete_base = self.resolve_tir_type(base);
-				let (impl_idx, impl_type_args, assoc_ty) = self
-					.find_assoc_type_value(
-						concrete_base,
-						trait_index,
-						assoc_name,
-					);
-				let resolved = match self.tir.types.resolve(assoc_ty) {
-					tir::Type::TypeParam { param_index, owner }
-						if *owner
-							== tir::TypeParamOwner::TraitImpl(impl_idx) =>
-					{
-						impl_type_args[*param_index as usize]
-					}
-					_ => assoc_ty,
-				};
-				self.resolve_tir_type(resolved)
-			}
-			_ => ty,
-		}
-	}
-
-	fn resolve_memory_id(&self, memory_ty: tir::TypeIndex) -> ast::DefId {
-		let concrete = self.resolve_tir_type(memory_ty);
-		match self.tir.types.resolve(concrete) {
-			tir::Type::Memory { id, .. } => *id,
+	fn resolve_memory_id(&mut self, memory_ty: tir::TypeIndex) -> ast::DefId {
+		let concrete = self
+			.types
+			.instantiate_type(memory_ty, self.current_type_env);
+		match self.types.get(concrete) {
+			ConcreteType::Memory { id } => *id,
 			_ => unreachable!(
-				"memory TypeIndex does not resolve to Type::Memory"
+				"memory type does not instantiate to ConcreteType::Memory"
 			),
 		}
 	}
@@ -1205,9 +1060,9 @@ impl<'tir> Builder<'tir> {
 	/// The MIR pointer type for a memory, with the memory's width baked in
 	/// so later stages can pick value types and access widths from the type
 	/// alone, without a memory-table lookup.
-	fn pointer_type(&self, memory: ast::DefId) -> Type {
+	fn pointer_type(&self, memory: ast::DefId) -> ValueType {
 		let tir_idx = usize::from(self.tir.items.expect_memory_index(memory));
-		Type::Pointer {
+		ValueType::Pointer {
 			memory,
 			kind: MemoryKind::from_type_index(
 				self.tir.items.memories[tir_idx].size.inner,
@@ -1216,201 +1071,47 @@ impl<'tir> Builder<'tir> {
 	}
 
 	/// Compute the memory layout of a type.
-	///
-	/// Fields of structs and tuples are sorted by alignment descending before
-	/// computing padding, giving optimal (minimal) struct sizes.
-	///
-	/// Panics on `Error`, `Unknown`, `ImportModule`, `Enum`, or non-value
-	/// types.
 	pub fn compute_layout(&mut self, idx: tir::TypeIndex) -> Layout {
-		if idx == tir::TypeIndex::F32
-			|| idx == tir::TypeIndex::I32
-			|| idx == tir::TypeIndex::U32
-			|| idx == tir::TypeIndex::CHAR
-		{
-			return Layout { size: 4, align: 4 };
-		}
-		if idx == tir::TypeIndex::I64
-			|| idx == tir::TypeIndex::U64
-			|| idx == tir::TypeIndex::F64
-		{
-			return Layout { size: 8, align: 8 };
-		}
-		if idx == tir::TypeIndex::U8
-			|| idx == tir::TypeIndex::I8
-			|| idx == tir::TypeIndex::BOOL
-		{
-			return Layout { size: 1, align: 1 };
-		}
-		if idx == tir::TypeIndex::UNIT || idx == tir::TypeIndex::NEVER {
-			return Layout { size: 0, align: 1 };
-		}
-		if idx == tir::TypeIndex::U16 || idx == tir::TypeIndex::I16 {
-			return Layout { size: 2, align: 2 };
-		}
+		let concrete = self.types.instantiate_type(idx, self.current_type_env);
+		self.compute_type_layout(concrete)
+	}
 
-		match self.tir.types.resolve(idx) {
-			tir::Type::Function { .. } | tir::Type::FunctionItem { .. } => {
-				Layout { size: 4, align: 4 }
-			}
-			tir::Type::Pointer { memory, .. }
-			| tir::Type::Array { memory, .. } => {
-				let id = self.resolve_memory_id(*memory);
-				let tir_idx =
-					usize::from(self.tir.items.expect_memory_index(id));
-				let pointer_size = MemoryKind::from_type_index(
-					self.tir.items.memories[tir_idx].size.inner,
-				)
-				.pointer_size();
-				Layout {
-					size: pointer_size,
-					align: pointer_size,
-				}
-			}
-			tir::Type::Slice { memory, .. } => {
-				let id = self.resolve_memory_id(*memory);
-				let tir_idx =
-					usize::from(self.tir.items.expect_memory_index(id));
-				let pointer_size = MemoryKind::from_type_index(
-					self.tir.items.memories[tir_idx].size.inner,
-				)
-				.pointer_size();
-				Layout {
-					size: pointer_size * 2,
-					align: pointer_size,
-				}
-			}
-			tir::Type::Tuple { elements } => {
-				let mir_elems: Box<[Type]> = elements
-					.iter()
-					.map(|&e| self.lower_type_index(e))
-					.collect();
-				let aggregate_index =
-					self.ensure_aggregate(mir_elems, FieldOrder::Sorted);
-				self.aggregate(aggregate_index).layout
-			}
-			tir::Type::Struct { struct_index, args } => {
-				let si = *struct_index;
-				let aggregate_index =
-					self.ensure_aggregate_for_struct(si, args);
-				self.aggregate(aggregate_index).layout
-			}
-			_ => unreachable!(),
-		}
+	fn compute_type_layout(&mut self, concrete: TypeId) -> Layout {
+		let ty = self.lower_type(concrete);
+		self.mir_type_layout(ty)
 	}
 
 	fn ensure_aggregate(
 		&mut self,
-		mir_fields: Box<[Type]>,
+		mir_fields: Box<[ValueType]>,
 		order: FieldOrder,
 	) -> AggregateIndex {
-		let key = (order, mir_fields);
-		if let Some(&index) = self.aggregate_index_lookup.get(&key) {
-			return index;
-		}
-		let (_, mir_fields) = key;
-
-		// TODO: for `FieldOrder::Fixed` the decl-to-phys indirection below is
-		// unnecessary (physical order always equals declaration order) — skip
-		// the sort/lookup scaffolding entirely and build offsets directly for
-		// a leaner fast path once this shows up in profiling.
-		let mut sorted: Vec<(u32, Layout)> = mir_fields
-			.iter()
-			.copied()
-			.enumerate()
-			.map(|(decl, ty)| (decl as u32, self.mir_type_layout(ty)))
-			.collect();
-		if order == FieldOrder::Sorted {
-			sorted.sort_by_key(|(_, b)| std::cmp::Reverse(b.align));
-		}
-
-		// Single pass: total layout, per-field byte offsets, and ordering maps.
-		let mut layout = Layout { size: 0, align: 1 };
-		let mut fields = Vec::with_capacity(sorted.len());
-		let mut decl_to_phys = vec![PhysIndex::new(0); sorted.len()];
-		for (phys, (decl, field_layout)) in sorted.iter().copied().enumerate() {
-			layout.size = (layout.size + field_layout.align - 1)
-				& !(field_layout.align - 1);
-			fields.push(Field {
-				ty: mir_fields[decl as usize],
-				offset: layout.size,
-			});
-			layout.size += field_layout.size;
-			layout.align = layout.align.max(field_layout.align);
-			decl_to_phys[decl as usize] = PhysIndex::new(phys as u32);
-		}
-		layout = layout.pad_to_align();
-
-		// The flat scalar view. Every nested field's own table already exists
-		// (fields are lowered before their parent is interned), so this splices
-		// rather than recurses: a nested field contributes its child's scalars
-		// with the child's base offset folded in, a ZST field contributes none,
-		// and anything else contributes exactly one.
-		let mut entries: Vec<Scalar> = Vec::with_capacity(fields.len());
-		let mut field_starts: Vec<u32> = Vec::with_capacity(fields.len() + 1);
-		for field in &fields {
-			field_starts.push(entries.len() as u32);
-			match field.ty {
-				Type::Unit | Type::Never => {}
-				Type::Aggregate { aggregate_index } => {
-					let nested = self.aggregate(aggregate_index);
-					entries.extend(nested.scalars.iter().map(|scalar| {
-						Scalar {
-							ty: scalar.ty,
-							offset: field.offset + scalar.offset,
-						}
-					}));
-				}
-				ty => entries.push(Scalar {
-					ty,
-					offset: field.offset,
-				}),
-			}
-		}
-		field_starts.push(entries.len() as u32);
-
-		let aggregate_index = AggregateIndex::new(self.aggregates.len() as u32);
-		self.aggregate_index_lookup
-			.insert((order, mir_fields), aggregate_index);
-		self.aggregates.push(Aggregate {
-			fields: fields.into_boxed_slice(),
-			layout,
-			scalars: ScalarTable {
-				entries: entries.into_boxed_slice(),
-				field_starts: field_starts.into_boxed_slice(),
-			},
-			decl_to_phys: decl_to_phys.into_boxed_slice(),
-		});
-		aggregate_index
+		self.aggregates.intern(mir_fields, order)
 	}
 
-	fn mir_type_layout(&self, ty: Type) -> Layout {
-		match ty {
-			Type::I32 | Type::U32 | Type::F32 => Layout { size: 4, align: 4 },
-			Type::I64 | Type::U64 | Type::F64 => Layout { size: 8, align: 8 },
-			Type::U8 | Type::I8 | Type::Bool => Layout { size: 1, align: 1 },
-			Type::U16 | Type::I16 => Layout { size: 2, align: 2 },
-			Type::Unit | Type::Never => Layout { size: 0, align: 1 },
-			Type::Pointer { kind, .. } => {
-				let ptr_size = kind.pointer_size();
-				Layout {
-					size: ptr_size,
-					align: ptr_size,
-				}
-			}
-			Type::Function { .. } => Layout { size: 4, align: 4 },
-			Type::Aggregate { aggregate_index } => {
-				self.aggregate(aggregate_index).layout
-			}
-		}
+	fn mir_type_layout(&self, ty: ValueType) -> Layout {
+		self.aggregates.type_layout(ty)
 	}
 
-	/// Ensures an aggregate exists for a struct, handling generic structs by
-	/// temporarily substituting the struct's own type params from `args`.
+	fn instantiate_struct(
+		&mut self,
+		type_index: tir::TypeIndex,
+	) -> (tir::StructIndex, Box<[TypeId]>) {
+		let ty = self
+			.types
+			.instantiate_type(type_index, self.current_type_env);
+		let ConcreteType::Struct { struct_index, args } = self.types.get(ty)
+		else {
+			unreachable!("expected a concrete struct type")
+		};
+		(*struct_index, args.clone())
+	}
+
+	/// Ensures an aggregate exists for a fully-instantiated struct.
 	fn ensure_aggregate_for_struct(
 		&mut self,
 		struct_index: tir::StructIndex,
-		args: &[tir::TypeIndex],
+		args: &[TypeId],
 	) -> AggregateIndex {
 		// TODO: detect infinite-size cycles caused by generic struct instantiation
 		// (e.g. `struct Node { inner: DirectIdentity<Node> }` where
@@ -1421,25 +1122,8 @@ impl<'tir> Builder<'tir> {
 		// and promote the error to TIR. For now, this will stack-overflow on
 		// truly recursive generic instantiations.
 
-		// For generic structs, resolve TypeParam/AssocTypeProjection entries
-		// in args and temporarily install them as current_substitutions so
-		// lower_type_index resolves fields. Must go through `resolve_tir_type`
-		// (not just a shallow `TypeParam` match) so a struct instantiated with
-		// a projection type arg (e.g. `Layout<Self::M>` inside a trait default
-		// method body) resolves once `Self` is concrete, instead of installing
-		// the unresolved projection itself as the new substitution scope.
-		let saved = if !args.is_empty() {
-			let concrete_args: Box<[tir::TypeIndex]> =
-				args.iter().map(|&a| self.resolve_tir_type(a)).collect();
-			Some(std::mem::replace(
-				&mut self.current_substitutions,
-				concrete_args,
-			))
-		} else {
-			None
-		};
-		// fields: &'tir [StructField] — lifetime tied to TIR, not to Builder
 		let tir_struct = &self.tir.items.structs[usize::from(struct_index)];
+		let env = self.types.push_struct_env(tir_struct, args);
 		let order = if tir_struct
 			.attributes
 			.contains(&tir::ItemAttribute::FixedOrder)
@@ -1448,159 +1132,118 @@ impl<'tir> Builder<'tir> {
 		} else {
 			FieldOrder::Sorted
 		};
-		let mir_fields: Box<[Type]> = tir_struct
+		let mir_fields: Box<[ValueType]> = tir_struct
 			.fields
 			.iter()
-			.map(|f| self.lower_type_index(f.ty.inner))
+			.map(|field| self.lower_type_index_in(field.ty.inner, env))
 			.collect();
-		let aggregate_index = self.ensure_aggregate(mir_fields, order);
-		if let Some(saved) = saved {
-			self.current_substitutions = saved;
-		}
-		aggregate_index
+		self.ensure_aggregate(mir_fields, order)
 	}
 
-	fn lower_type_index(&mut self, type_idx: tir::TypeIndex) -> Type {
-		match type_idx {
-			idx if idx == tir::TypeIndex::ERROR => unreachable!(),
-			idx if idx == tir::TypeIndex::INFER => unreachable!(),
-			idx if idx == tir::TypeIndex::UNIT => return Type::Unit,
-			idx if idx == tir::TypeIndex::NEVER => return Type::Never,
-			idx if idx == tir::TypeIndex::INTEGER => unreachable!(),
-			idx if idx == tir::TypeIndex::I8 => return Type::I8,
-			idx if idx == tir::TypeIndex::U8 => return Type::U8,
-			idx if idx == tir::TypeIndex::I16 => return Type::I16,
-			idx if idx == tir::TypeIndex::U16 => return Type::U16,
-			idx if idx == tir::TypeIndex::I32 => return Type::I32,
-			idx if idx == tir::TypeIndex::U32 => return Type::U32,
-			idx if idx == tir::TypeIndex::I64 => return Type::I64,
-			idx if idx == tir::TypeIndex::U64 => return Type::U64,
-			idx if idx == tir::TypeIndex::F32 => return Type::F32,
-			idx if idx == tir::TypeIndex::F64 => return Type::F64,
-			idx if idx == tir::TypeIndex::BOOL => return Type::Bool,
-			idx if idx == tir::TypeIndex::CHAR => return Type::U32,
-			_ => {}
-		};
+	fn lower_type_index(&mut self, type_idx: tir::TypeIndex) -> ValueType {
+		self.lower_type_index_in(type_idx, self.current_type_env)
+	}
 
-		match self.tir.types.resolve(type_idx) {
-			tir::Type::TypeParam { param_index, .. } => {
-				let param_index = *param_index;
-				let concrete = self.current_substitutions[param_index as usize];
-				self.lower_type_index(concrete)
+	fn lower_type_index_in(
+		&mut self,
+		type_idx: tir::TypeIndex,
+		env: Option<TypeEnvId>,
+	) -> ValueType {
+		let concrete = self.types.instantiate_type(type_idx, env);
+		self.lower_type(concrete)
+	}
+
+	fn lower_type(&mut self, type_id: TypeId) -> ValueType {
+		match self.types.get(type_id) {
+			ConcreteType::Unit => ValueType::Unit,
+			ConcreteType::Never => ValueType::Never,
+			ConcreteType::U8 => ValueType::U8,
+			ConcreteType::I8 => ValueType::I8,
+			ConcreteType::U16 => ValueType::U16,
+			ConcreteType::I16 => ValueType::I16,
+			ConcreteType::U32 | ConcreteType::Char => ValueType::U32,
+			ConcreteType::I32 => ValueType::I32,
+			ConcreteType::U64 => ValueType::U64,
+			ConcreteType::I64 => ValueType::I64,
+			ConcreteType::F32 => ValueType::F32,
+			ConcreteType::F64 => ValueType::F64,
+			ConcreteType::Bool => ValueType::Bool,
+			ConcreteType::Pointer { memory, .. }
+			| ConcreteType::Array { memory, .. } => {
+				let memory = *memory;
+				let ConcreteType::Memory { id } = self.types.get(memory) else {
+					unreachable!("pointer memory is not a concrete memory type")
+				};
+				self.pointer_type(*id)
 			}
-			tir::Type::Function { .. } => Type::Function {
-				signature_index: self.intern_tir_function_type(type_idx),
-			},
-			tir::Type::FunctionItem { id, type_args } => {
-				let fi = usize::from(self.tir.items.expect_function_index(*id));
-				let sig_idx = self.tir.items.functions[fi].signature_index;
-				if type_args.is_empty() {
-					Type::Function {
-						signature_index: self.intern_tir_function_type(sig_idx),
-					}
-				} else {
-					// Resolve any TypeParam entries in type_args through current_substitutions.
-					let concrete_args: Box<[tir::TypeIndex]> = type_args
-						.iter()
-						.map(|&ty| match self.tir.types.resolve(ty) {
-							tir::Type::TypeParam { param_index, .. } => self
-								.current_substitutions
-								.get(*param_index as usize)
-								.copied()
-								.unwrap_or(ty),
-							_ => ty,
-						})
-						.collect();
-					let saved = std::mem::replace(
-						&mut self.current_substitutions,
-						concrete_args,
-					);
-					let signature_index =
-						self.intern_tir_function_type(sig_idx);
-					self.current_substitutions = saved;
-					Type::Function { signature_index }
-				}
-			}
-			tir::Type::AssocTypeProjection {
-				base,
-				assoc_name,
-				trait_index,
-			} => {
-				let concrete_base = self.resolve_tir_type(*base);
-				let (_, impl_type_args, assoc_ty) = self.find_assoc_type_value(
-					concrete_base,
-					*trait_index,
-					*assoc_name,
-				);
-				// Unlike `resolve_tir_type`, this is `&mut self`, so it can
-				// install the impl's own substitutions before recursing —
-				// which is what makes a *composite* associated-type value
-				// (e.g. `type Assoc = Box<T>;`) work: `assoc_ty`'s `T`
-				// belongs to the impl's own param scheme, not whatever
-				// scheme `current_substitutions` holds for the caller right
-				// now, so it must be swapped in before `lower_type_index`
-				// recurses into `assoc_ty`'s structure (e.g. `Box<_>`'s
-				// type arg) and resolves that `TypeParam` leaf.
-				let saved = std::mem::replace(
-					&mut self.current_substitutions,
-					impl_type_args,
-				);
-				let result = self.lower_type_index(assoc_ty);
-				self.current_substitutions = saved;
-				result
-			}
-			tir::Type::Pointer { memory, .. }
-			| tir::Type::Array { memory, .. } => {
-				let memory = self.resolve_memory_id(*memory);
-				self.pointer_type(memory)
-			}
-			tir::Type::Slice { memory, .. } => {
-				let memory = self.resolve_memory_id(*memory);
+			ConcreteType::Slice { memory, .. } => {
+				let memory = *memory;
+				let ConcreteType::Memory { id } = self.types.get(memory) else {
+					unreachable!("slice memory is not a concrete memory type")
+				};
+				let memory = *id;
 				let tir_idx =
 					usize::from(self.tir.items.expect_memory_index(memory));
 				let kind_ty = self.tir.items.memories[tir_idx].size;
-				let len_ty = self.lower_type_index(kind_ty.inner);
+				let len_ty = self.lower_type_index_in(kind_ty.inner, None);
 				// Slice layout is a fixed `{ ptr, len }` ABI contract, not a
 				// sorting outcome — see the pipeline notes on slice lowering.
 				let aggregate_index = self.ensure_aggregate(
 					Box::new([self.pointer_type(memory), len_ty]),
 					FieldOrder::Fixed,
 				);
-				Type::Aggregate { aggregate_index }
+				ValueType::Aggregate { aggregate_index }
 			}
-			tir::Type::Memory { .. } => Type::Unit,
-			tir::Type::Struct { struct_index, args } => {
+			ConcreteType::Memory { .. } => ValueType::Unit,
+			ConcreteType::Struct { struct_index, args } => {
+				let struct_index = *struct_index;
+				let args = args.clone();
 				let aggregate_index =
-					self.ensure_aggregate_for_struct(*struct_index, args);
-				Type::Aggregate { aggregate_index }
+					self.ensure_aggregate_for_struct(struct_index, &args);
+				ValueType::Aggregate { aggregate_index }
 			}
-			tir::Type::Tuple { elements } => {
-				let mir_elems: Box<[Type]> = elements
-					.iter()
-					.map(|&e| self.lower_type_index(e))
-					.collect();
+			ConcreteType::Tuple { elements } => {
+				let elements = elements.clone();
+				let mir_elems =
+					elements.iter().map(|&e| self.lower_type(e)).collect();
 				let aggregate_index =
 					self.ensure_aggregate(mir_elems, FieldOrder::Sorted);
-				Type::Aggregate { aggregate_index }
+				ValueType::Aggregate { aggregate_index }
 			}
-			tir::Type::Enum { enum_index } => {
+			ConcreteType::Enum { enum_index } => {
 				let repr_ty =
 					self.tir.items.enums[usize::from(*enum_index)].repr_type;
-				self.lower_type_index(repr_ty)
+				self.lower_type_index_in(repr_ty, None)
 			}
-			_ => unreachable!(),
+			ConcreteType::Function { params, result } => {
+				let params = params.clone();
+				let result = *result;
+				let items = params
+					.iter()
+					.copied()
+					.chain(std::iter::once(result))
+					.map(|ty| self.lower_type(ty))
+					.collect();
+				let signature_index =
+					self.intern_signature(FunctionSignature {
+						items,
+						params_count: params.len(),
+					});
+				ValueType::Function { signature_index }
+			}
+			ConcreteType::FunctionItem { id, type_args } => {
+				let id = *id;
+				let type_args = type_args.clone();
+				let index = self.tir.items.expect_function_index(id);
+				let function = &self.tir.items.functions[usize::from(index)];
+				let env = self.types.push_function_env(function, &type_args);
+				self.lower_type_index_in(function.signature_index, env)
+			}
 		}
 	}
 
 	fn intern_signature(&mut self, sig: FunctionSignature) -> SignatureIndex {
-		let next = SignatureIndex::new(self.signature_pool.len() as u32);
-		*self
-			.signature_index_lookup
-			.entry(sig.clone())
-			.or_insert_with(|| {
-				self.signature_pool.push(sig);
-				next
-			})
+		self.signatures.intern(sig)
 	}
 
 	/// Converts a TIR function type (by its type-pool index) to a MIR
@@ -1609,25 +1252,72 @@ impl<'tir> Builder<'tir> {
 		&mut self,
 		type_idx: tir::TypeIndex,
 	) -> SignatureIndex {
-		let sig = match self.tir.types.resolve(type_idx) {
-			tir::Type::Function { signature } => signature.clone(),
-			_ => unreachable!("expected Function type"),
+		let ValueType::Function { signature_index } =
+			self.lower_type_index(type_idx)
+		else {
+			unreachable!("expected function type")
 		};
-		let concrete = FunctionSignature {
-			items: sig
-				.params()
-				.iter()
-				.chain(std::iter::once(&sig.result()))
-				.map(|&ty| self.lower_type_index(ty))
-				.collect(),
-			params_count: sig.params().len(),
-		};
-		self.intern_signature(concrete)
+		signature_index
 	}
 
 	fn record_call_edge(&mut self, callee_id: ast::DefId) {
 		if let Some(caller_id) = self.current_function_id {
 			self.call_edges.push((caller_id, callee_id));
+		}
+	}
+
+	/// Resolves a generic function or method after all of its type arguments
+	/// have been instantiated. Trait declarations are redirected to the
+	/// concrete impl member; a trait default is used only when no override is
+	/// present.
+	fn resolve_generic_function(
+		&mut self,
+		function_index: tir::FunctionIndex,
+		resolved: Box<[TypeId]>,
+	) -> ast::DefId {
+		let function = &self.tir.items.functions[usize::from(function_index)];
+		let id = function.id;
+		let name = function.name.inner;
+		let Some(tir::ItemParent::Trait(trait_index)) = function.parent else {
+			return self.mono_registry.get_or_insert(id, resolved);
+		};
+
+		let concrete_self = resolved[0];
+		let (impl_index, impl_args) = self
+			.types
+			.find_trait_impl(concrete_self, trait_index)
+			.expect("no impl found for concrete trait function dispatch");
+		match self
+			.types
+			.trait_member(impl_index, name)
+			.expect("validated trait impl has no callable member")
+		{
+			TraitMember::Impl(
+				tir::ImplEntry::Method(index)
+				| tir::ImplEntry::AssocFunction(index),
+			) => {
+				let function = &self.tir.items.functions[usize::from(index)];
+				let type_args: Box<[TypeId]> = impl_args
+					.iter()
+					.copied()
+					.chain(resolved[1..].iter().copied())
+					.collect();
+				if type_args.is_empty() {
+					function.id
+				} else {
+					self.mono_registry.get_or_insert(function.id, type_args)
+				}
+			}
+			TraitMember::Default(
+				tir::ImplEntry::Method(index)
+				| tir::ImplEntry::AssocFunction(index),
+			) => {
+				let function = &self.tir.items.functions[usize::from(index)];
+				self.mono_registry.get_or_insert(function.id, resolved)
+			}
+			_ => {
+				unreachable!("trait function dispatch selected a non-function")
+			}
 		}
 	}
 
@@ -1700,7 +1390,7 @@ impl<'tir> Builder<'tir> {
 	fn lower_global(&mut self, global: &tir::Global) -> Global {
 		let ty = self.lower_type_index(global.ty.inner);
 		let zero = match ty {
-			Type::F32 | Type::F64 => ConstInit::Float(0.0),
+			ValueType::F32 | ValueType::F64 => ConstInit::Float(0.0),
 			_ => ConstInit::Int(0),
 		};
 		let const_init = match global.value {
@@ -1762,7 +1452,7 @@ impl<'tir> Builder<'tir> {
 			kind: tir::BlockKind::Block,
 			parent: None,
 			locals: vec![],
-			result: Type::Unit,
+			result: ValueType::Unit,
 		};
 		let mut combined_frame: Vec<BlockScope> = vec![root_scope];
 		let mut combined_body: Vec<Expression> = Vec::new();
@@ -1837,13 +1527,13 @@ impl<'tir> Builder<'tir> {
 					id: g.id,
 					value: Box::new(lowered),
 				},
-				ty: Type::Unit,
+				ty: ValueType::Unit,
 			});
 			combined_static_data.extend(ctx.static_data);
 		}
 
 		let unit_sig = FunctionSignature {
-			items: Box::new([Type::Unit]),
+			items: Box::new([ValueType::Unit]),
 			params_count: 0,
 		};
 		let signature_index = self.intern_signature(unit_sig);
@@ -1857,49 +1547,39 @@ impl<'tir> Builder<'tir> {
 					scope_index: ScopeIndex::new(0),
 					expressions: combined_body.into_boxed_slice(),
 				},
-				ty: Type::Unit,
+				ty: ValueType::Unit,
 			},
 			static_data: combined_static_data,
 		})
 	}
 
-	/// Encode one compile-time element (Int or Float ExprKind + its TIR type)
+	/// Encode one compile-time element (Int or Float ExprKind + its MIR type)
 	/// as little-endian bytes appended to `buf`.
-	fn encode_element(
-		buf: &mut Vec<u8>,
-		kind: &tir::ExprKind,
-		ty: tir::TypeIndex,
-	) {
+	fn encode_element(buf: &mut Vec<u8>, kind: &tir::ExprKind, ty: ValueType) {
 		match kind {
-			tir::ExprKind::Int { value } => {
-				let v = *value;
-				if ty == tir::TypeIndex::I8 || ty == tir::TypeIndex::U8 {
-					buf.push(v as u8);
-				} else if ty == tir::TypeIndex::I16 || ty == tir::TypeIndex::U16
-				{
-					buf.extend_from_slice(&(v as u16).to_le_bytes());
-				} else if ty == tir::TypeIndex::I32 || ty == tir::TypeIndex::U32
-				{
-					buf.extend_from_slice(&(v as u32).to_le_bytes());
-				} else if ty == tir::TypeIndex::I64 || ty == tir::TypeIndex::U64
-				{
-					buf.extend_from_slice(&v.to_le_bytes());
-				} else {
-					unreachable!("unexpected int element type");
+			tir::ExprKind::Int { value } => match ty {
+				ValueType::I8 | ValueType::U8 => buf.push(*value as u8),
+				ValueType::I16 | ValueType::U16 => {
+					buf.extend_from_slice(&(*value as u16).to_le_bytes())
 				}
-			}
-			tir::ExprKind::Float { value } => {
-				if ty == tir::TypeIndex::F32 {
-					buf.extend_from_slice(
-						&(*value as f32).to_bits().to_le_bytes(),
-					);
-				} else if ty == tir::TypeIndex::F64 {
-					buf.extend_from_slice(&value.to_bits().to_le_bytes());
-				} else {
-					unreachable!("unexpected float element type");
+				ValueType::I32 | ValueType::U32 => {
+					buf.extend_from_slice(&(*value as u32).to_le_bytes())
 				}
-			}
-			_ => unreachable!("array element must be a compile-time constant"),
+				ValueType::I64 | ValueType::U64 => {
+					buf.extend_from_slice(&value.to_le_bytes())
+				}
+				_ => unreachable!(),
+			},
+			tir::ExprKind::Float { value } => match ty {
+				ValueType::F32 => buf.extend_from_slice(
+					&(*value as f32).to_bits().to_le_bytes(),
+				),
+				ValueType::F64 => {
+					buf.extend_from_slice(&value.to_bits().to_le_bytes())
+				}
+				_ => unreachable!(),
+			},
+			_ => unreachable!(),
 		}
 	}
 
@@ -1911,15 +1591,9 @@ impl<'tir> Builder<'tir> {
 		align: u32,
 		memory: ast::DefId,
 	) -> (u32, u32) {
-		let size = bytes.len() as u32;
-		let idx = self.static_entries.len() as u32;
-		self.static_entries.push(StaticEntry {
-			bytes: bytes.into_boxed_slice(),
-			align,
-			memory,
-		});
-		func_ctx.static_data.push(idx);
-		(idx, size)
+		let (index, size) = self.static_data.push(bytes, align, memory);
+		func_ctx.static_data.push(index);
+		(index, size)
 	}
 
 	/// Add a string literal entry, deduplicating by (symbol, memory);
@@ -1930,25 +1604,14 @@ impl<'tir> Builder<'tir> {
 		symbol: SymbolU32,
 		memory: ast::DefId,
 	) -> (u32, u32) {
-		if let Some(&idx) = self.symbol_to_entry_index.get(&(symbol, memory)) {
-			let size = self.static_entries[idx as usize].bytes.len() as u32;
-			func_ctx.static_data.push(idx);
-			return (idx, size);
-		}
 		let s = self
 			.interner
 			.resolve(symbol)
 			.expect("unresolved string symbol");
-		let size = s.len() as u32;
-		let idx = self.static_entries.len() as u32;
-		self.static_entries.push(StaticEntry {
-			bytes: s.as_bytes().to_vec().into_boxed_slice(),
-			align: 1,
-			memory,
-		});
-		self.symbol_to_entry_index.insert((symbol, memory), idx);
-		func_ctx.static_data.push(idx);
-		(idx, size)
+		let (index, size) =
+			self.static_data.push_string(symbol, s.as_bytes(), memory);
+		func_ctx.static_data.push(index);
+		(index, size)
 	}
 
 	fn lower_index_address(
@@ -1960,13 +1623,22 @@ impl<'tir> Builder<'tir> {
 		sink: &mut Vec<Expression>,
 	) -> IndexAddress {
 		let elem_size = self.compute_layout(elem_ty).size;
+		let object_ty = self
+			.types
+			.instantiate_type(object.ty, self.current_type_env);
+		let slice_memory = match self.types.get(object_ty) {
+			ConcreteType::Slice { memory, .. } => Some(*memory),
+			_ => None,
+		};
 
 		// For slices the lowered object is an aggregate {ptr, len}; extract
 		// the pointer field (index 0) as the base address.
-		let (base, ptr_ty) = if let tir::Type::Slice { memory, .. } =
-			self.tir.types.resolve(object.ty)
-		{
-			let memory_id = self.resolve_memory_id(*memory);
+		let (base, ptr_ty) = if let Some(memory) = slice_memory {
+			let ConcreteType::Memory { id: memory_id } = self.types.get(memory)
+			else {
+				unreachable!("slice memory is not a concrete memory type")
+			};
+			let memory_id = *memory_id;
 			let ptr_ty = self.pointer_type(memory_id);
 			let (si, li) = match &object.kind {
 				tir::ExprKind::Local {
@@ -1991,7 +1663,7 @@ impl<'tir> Builder<'tir> {
 							local_index: temp,
 							value: Box::new(lowered),
 						},
-						ty: Type::Unit,
+						ty: ValueType::Unit,
 					});
 					(ScopeIndex::new(0), temp)
 				}
@@ -2045,7 +1717,10 @@ impl<'tir> Builder<'tir> {
 	/// scalar — shared by every place that reads a `ConstValue` cached on TIR
 	/// (`Constant`, `EnumVariant`) so codegen never has to re-walk the original
 	/// expression tree just to rediscover a value TIR already computed.
-	fn lower_const_value(const_value: tir::ConstValue, ty: Type) -> Expression {
+	fn lower_const_value(
+		const_value: tir::ConstValue,
+		ty: ValueType,
+	) -> Expression {
 		match const_value {
 			tir::ConstValue::Int(value) => Expression {
 				kind: ExprKind::Int { value },
@@ -2094,7 +1769,7 @@ impl<'tir> Builder<'tir> {
 				local_index,
 				value: Box::new(value),
 			},
-			ty: Type::Unit,
+			ty: ValueType::Unit,
 		});
 		local_index
 	}
@@ -2112,11 +1787,11 @@ impl<'tir> Builder<'tir> {
 			| tir::ExprKind::Placeholder
 			| tir::ExprKind::Memory { .. } => Expression {
 				kind: ExprKind::Noop,
-				ty: Type::Unit,
+				ty: ValueType::Unit,
 			},
 			tir::ExprKind::Unreachable => Expression {
 				kind: ExprKind::Unreachable,
-				ty: Type::Never,
+				ty: ValueType::Never,
 			},
 			tir::ExprKind::Int { value } => Expression {
 				kind: ExprKind::Int {
@@ -2130,7 +1805,7 @@ impl<'tir> Builder<'tir> {
 			},
 			tir::ExprKind::Bool { value } => Expression {
 				kind: ExprKind::Bool { value: *value },
-				ty: Type::Bool,
+				ty: ValueType::Bool,
 			},
 			tir::ExprKind::Global { id } => Expression {
 				kind: ExprKind::Global { id: *id },
@@ -2147,47 +1822,37 @@ impl<'tir> Builder<'tir> {
 				ty: self.lower_type_index(expr.ty),
 			},
 			tir::ExprKind::Function { id } => {
-				// If the FunctionItem carries non-empty type_args the reference is a
-				// monomorphized generic function; register the mono instance.
-				match self.tir.types.resolve(expr.ty) {
-					&tir::Type::FunctionItem {
-						id: fn_id,
-						ref type_args,
-					} if !type_args.is_empty() => {
-						let concrete_args: Box<[tir::TypeIndex]> = type_args
-							.iter()
-							.map(|&ty| match self.tir.types.resolve(ty) {
-								tir::Type::TypeParam {
-									param_index, ..
-								} => self
-									.current_substitutions
-									.get(*param_index as usize)
-									.copied()
-									.unwrap_or(ty),
-								_ => ty,
-							})
-							.collect();
-						let mono_id = self
-							.mono_registry
-							.get_or_insert(fn_id, concrete_args.clone());
+				let concrete =
+					self.types.instantiate_type(expr.ty, self.current_type_env);
+				let generic = match self.types.get(concrete) {
+					ConcreteType::FunctionItem { id, type_args }
+						if !type_args.is_empty() =>
+					{
+						Some((*id, type_args.clone()))
+					}
+					_ => None,
+				};
+				match generic {
+					Some((fn_id, concrete_args)) => {
+						let function_index =
+							self.tir.items.expect_function_index(fn_id);
+						let mono_id = self.resolve_generic_function(
+							function_index,
+							concrete_args,
+						);
 						if !self.is_intrinsic(fn_id) {
 							self.record_call_edge(mono_id);
 						}
-						let fi = usize::from(
-							self.tir.items.expect_function_index(fn_id),
-						);
-						let sig_idx =
-							self.tir.items.functions[fi].signature_index;
-						let saved = std::mem::replace(
-							&mut self.current_substitutions,
-							concrete_args,
-						);
-						let signature_index =
-							self.intern_tir_function_type(sig_idx);
-						self.current_substitutions = saved;
+						let ValueType::Function { signature_index } =
+							self.lower_type(concrete)
+						else {
+							unreachable!(
+								"function item lowered to a non-function"
+							)
+						};
 						Expression {
 							kind: ExprKind::Function { id: mono_id },
-							ty: Type::Function { signature_index },
+							ty: ValueType::Function { signature_index },
 						}
 					}
 					_ => {
@@ -2196,7 +1861,7 @@ impl<'tir> Builder<'tir> {
 						}
 						Expression {
 							kind: ExprKind::Function { id: *id },
-							ty: self.lower_type_index(expr.ty),
+							ty: self.lower_type(concrete),
 						}
 					}
 				}
@@ -2205,17 +1870,23 @@ impl<'tir> Builder<'tir> {
 				kind: ExprKind::Int {
 					value: *value as i64,
 				},
-				ty: Type::U32,
+				ty: ValueType::U32,
 			},
 			tir::ExprKind::String { symbol } => {
 				// The literal's slice type says which memory its bytes are
 				// placed in.
-				let memory_id = match self.tir.types.resolve(expr.ty) {
-					tir::Type::Slice { memory, .. } => {
-						self.resolve_memory_id(*memory)
-					}
+				let concrete =
+					self.types.instantiate_type(expr.ty, self.current_type_env);
+				let memory = match self.types.get(concrete) {
+					ConcreteType::Slice { memory, .. } => *memory,
 					_ => unreachable!("string literal must have slice type"),
 				};
+				let ConcreteType::Memory { id: memory_id } =
+					self.types.get(memory)
+				else {
+					unreachable!("string literal memory is not concrete")
+				};
+				let memory_id = *memory_id;
 				let (data_index, size) =
 					self.push_string_data(func_ctx, *symbol, memory_id);
 				let ty = self.lower_type_index(expr.ty);
@@ -2247,7 +1918,7 @@ impl<'tir> Builder<'tir> {
 						Box::new(self.lower_expression(func_ctx, v, sink))
 					}),
 				},
-				ty: Type::Never,
+				ty: ValueType::Never,
 			},
 			tir::ExprKind::EnumVariant {
 				enum_index,
@@ -2290,42 +1961,20 @@ impl<'tir> Builder<'tir> {
 					);
 				}
 
-				// Substitute any TypeParam/AssocTypeProjection entries in
-				// type_args through current_substitutions.  Without this, a
-				// generic calling another generic (e.g. `call_wrap<T>` calling
-				// `wrap<T>`) would register `wrap<TypeParam{0}>` instead of
-				// `wrap<i32>`, causing `lower_type_index` to recurse
-				// infinitely when it later tries to lower `TypeParam{0}` with
-				// substitutions = [TypeParam{0}]. Must go through
-				// `resolve_tir_type` (not just a shallow `TypeParam` match) so
-				// a projection like `Self::M` — inferred as a type arg to a
-				// nested generic call inside a trait default method body —
-				// also resolves once `Self` is concrete, instead of being
-				// passed through unresolved and later failing to find a trait
-				// impl for a still-generic base.
-				let concrete_type_args: Box<[tir::TypeIndex]> = type_args
-					.iter()
-					.map(|&ty| self.resolve_tir_type(ty))
-					.collect();
-				let mono_id = self
-					.mono_registry
-					.get_or_insert(*id, concrete_type_args.clone());
-				self.record_call_edge(mono_id);
-
-				// Intern the callee's concrete signature with the resolved
-				// substitutions active, then restore previous substitutions.
-				let tir_func_sig_idx = {
-					let tir_idx = self.tir.items.expect_function_index(*id);
-					self.tir.items.functions[usize::from(tir_idx)]
-						.signature_index
+				let concrete_type_args = self
+					.types
+					.instantiate_types(type_args, self.current_type_env);
+				let callee_env =
+					self.types.push_function_env(func, &concrete_type_args);
+				let ValueType::Function {
+					signature_index: callee_sig_idx,
+				} = self.lower_type_index_in(func.signature_index, callee_env)
+				else {
+					unreachable!("function signature lowered to a non-function")
 				};
-				let saved_subs = std::mem::replace(
-					&mut self.current_substitutions,
-					concrete_type_args,
-				);
-				let callee_sig_idx =
-					self.intern_tir_function_type(tir_func_sig_idx);
-				self.current_substitutions = saved_subs;
+				let mono_id = self
+					.resolve_generic_function(func_index, concrete_type_args);
+				self.record_call_edge(mono_id);
 
 				let lowered_args: Box<[_]> = arguments
 					.iter()
@@ -2335,7 +1984,7 @@ impl<'tir> Builder<'tir> {
 					kind: ExprKind::Call {
 						callee: Box::new(Expression {
 							kind: ExprKind::Function { id: mono_id },
-							ty: Type::Function {
+							ty: ValueType::Function {
 								signature_index: callee_sig_idx,
 							},
 						}),
@@ -2351,100 +2000,20 @@ impl<'tir> Builder<'tir> {
 			} => {
 				let tir_idx = self.tir.items.expect_function_index(*id);
 				let tir_func = &self.tir.items.functions[usize::from(tir_idx)];
-
-				// Resolve any TypeParam/AssocTypeProjection entries in
-				// type_args through active substitutions — see the matching
-				// comment in the `GenericCall` arm above for why a shallow
-				// `TypeParam`-only match isn't enough (e.g. `Self::M` used as
-				// a nested generic call's type arg inside a trait default
-				// method body).
-				let resolved: Box<[tir::TypeIndex]> = type_args
-					.iter()
-					.map(|&ty| self.resolve_tir_type(ty))
-					.collect();
-
-				// Intern the callee's concrete signature before consuming `resolved`.
-				let saved_subs = std::mem::replace(
-					&mut self.current_substitutions,
-					resolved.clone(),
-				);
-				let callee_sig_idx =
-					self.intern_tir_function_type(tir_func.signature_index);
-				self.current_substitutions = saved_subs;
-
-				let target_id = if tir_func.body.is_some() {
-					// Default impl: monomorphize with resolved type_args.
-					self.mono_registry.get_or_insert(*id, resolved)
-				} else {
-					// Abstract method called inside a default body: the concrete Self
-					// type is now known, so dispatch directly to the impl.
-					let concrete_self = resolved[0];
-					let method_name = tir_func.name.inner;
-					let trait_index = match tir_func.parent {
-						Some(tir::ItemParent::Trait(idx)) => idx,
-						_ => unreachable!(
-							"abstract trait method must be parented by its trait"
-						),
-					};
-					let (trait_impl_idx, impl_type_args) = self
-						.tir
-						.items
-						.find_trait_impl(
-							&self.tir.types,
-							concrete_self,
-							trait_index,
-						)
-						.expect("no impl found for abstract trait method");
-					let impl_func_idx = self.tir.items.trait_impls
-						[usize::from(trait_impl_idx)]
-					.members
-					.get(&method_name)
-					.map(|entry| match entry {
-						tir::ImplEntry::Method(idx) => *idx,
-						_ => unreachable!(),
-					})
-					.expect("no impl found for abstract trait method");
-					let impl_func_id =
-						self.tir.items.functions[usize::from(impl_func_idx)].id;
-					// `impl_type_args` alone only covers the impl block's own
-					// params (e.g. `impl<T> Trait for Box<T>`'s `T`) — the
-					// impl's copy of the method can *also* declare its own
-					// extra params (e.g. `fn write<Mem: Memory>(...)` on an
-					// otherwise-concrete `impl Hasher for DefaultHasher`),
-					// which `impl_type_args` says nothing about. Reusing the
-					// bare `impl_func_id` whenever `impl_type_args` alone is
-					// empty is therefore wrong whenever the method has any
-					// such params of its own: that instance was never
-					// eagerly emitted by `MIR::build`'s main loop (which only
-					// emits functions with zero *total* type params), so the
-					// bare id has no MIR function/wasm index behind it.
-					let impl_own_type_params = &self.tir.items.functions
-						[usize::from(impl_func_idx)]
-					.type_params;
-					if impl_type_args.is_empty()
-						&& impl_own_type_params.is_empty()
-					{
-						// Fully concrete: zero total type params, so it was
-						// already eagerly emitted (with this bare id) — reuse
-						// it directly rather than registering a redundant
-						// duplicate through `mono_registry`.
-						impl_func_id
-					} else {
-						// Needs monomorphizing on demand via the worklist.
-						// Full arg list: the impl block's own args (its
-						// inherited-param prefix) followed by the method's
-						// own args — `resolved`'s tail after the leading
-						// `Self` slot (index 0, already consumed above to
-						// find the impl).
-						let full_args: Box<[tir::TypeIndex]> = impl_type_args
-							.iter()
-							.copied()
-							.chain(resolved[1..].iter().copied())
-							.collect();
-						self.mono_registry
-							.get_or_insert(impl_func_id, full_args)
-					}
+				let resolved = self
+					.types
+					.instantiate_types(type_args, self.current_type_env);
+				let callee_env =
+					self.types.push_function_env(tir_func, &resolved);
+				let ValueType::Function {
+					signature_index: callee_sig_idx,
+				} = self.lower_type_index_in(tir_func.signature_index, callee_env)
+				else {
+					unreachable!("method signature lowered to a non-function")
 				};
+
+				let target_id =
+					self.resolve_generic_function(tir_idx, resolved);
 				self.record_call_edge(target_id);
 
 				let lowered_args: Box<[_]> = arguments
@@ -2455,7 +2024,7 @@ impl<'tir> Builder<'tir> {
 					kind: ExprKind::Call {
 						callee: Box::new(Expression {
 							kind: ExprKind::Function { id: target_id },
-							ty: Type::Function {
+							ty: ValueType::Function {
 								signature_index: callee_sig_idx,
 							},
 						}),
@@ -2504,7 +2073,7 @@ impl<'tir> Builder<'tir> {
 				);
 				let callee = Box::new(Expression {
 					kind: ExprKind::Function { id: *id },
-					ty: Type::Function {
+					ty: ValueType::Function {
 						signature_index: callee_sig_idx,
 					},
 				});
@@ -2520,16 +2089,52 @@ impl<'tir> Builder<'tir> {
 			tir::ExprKind::NamespaceAccess { namespace, member } => {
 				match &member.kind {
 					tir::ExprKind::Const { id } => {
-						let const_idx =
-							usize::from(self.tir.items.expect_const_index(*id));
+						let declared_index =
+							self.tir.items.expect_const_index(*id);
+						let declared = &self.tir.items.constants
+							[usize::from(declared_index)];
+						let parent = declared.parent;
+						let name = declared.name.inner;
+						let receiver = self.types.instantiate_type(
+							namespace.inner,
+							self.current_type_env,
+						);
+						let const_index = match parent {
+							Some(tir::ItemParent::Trait(trait_index)) => {
+								let (impl_index, _) = self
+									.types
+									.find_trait_impl(receiver, trait_index)
+									.expect(
+										"no impl found for concrete trait constant dispatch",
+									);
+								match self
+									.types
+									.trait_member(impl_index, name)
+									.expect(
+										"validated trait impl has no constant member",
+									) {
+									TraitMember::Impl(
+										tir::ImplEntry::AssocConstant(index),
+									)
+									| TraitMember::Default(
+										tir::ImplEntry::AssocConstant(index),
+									) => index,
+									_ => unreachable!(
+										"trait constant dispatch selected a non-constant"
+									),
+								}
+							}
+							_ => declared_index,
+						};
+						let const_idx = usize::from(const_index);
 						let result_ty = self.lower_type_index(expr.ty);
 						// Only `DATA_END`/`INDEX` are compiler-synthesized —
 						// every other `Memory`-trait const (e.g. `PAGE_SIZE`)
 						// is an ordinary default value, already folded to a
 						// `const_value` in TIR, and falls through to the
 						// generic path below like any other const.
-						if let tir::Type::Memory { id, .. } =
-							self.tir.types.resolve(namespace.inner)
+						if let ConcreteType::Memory { id } =
+							self.types.get(receiver)
 						{
 							let const_name_sym =
 								self.tir.items.constants[const_idx].name.inner;
@@ -2586,15 +2191,9 @@ impl<'tir> Builder<'tir> {
 				object,
 				field: member,
 			} => {
-				let (struct_index, args) =
-					match self.tir.types.resolve(object.ty) {
-						tir::Type::Struct { struct_index, args } => {
-							(*struct_index, args)
-						}
-						_ => unreachable!("ObjectAccess on non-struct type"),
-					};
+				let (struct_index, args) = self.instantiate_struct(object.ty);
 				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, args);
+					self.ensure_aggregate_for_struct(struct_index, &args);
 				let aggregate = self.aggregate(aggregate_index);
 				let decl_index = usize::from(
 					self.tir.items.structs[usize::from(struct_index)].lookup
@@ -2638,7 +2237,7 @@ impl<'tir> Builder<'tir> {
 								local_index: temp_idx,
 								value: Box::new(object_lowered),
 							},
-							ty: Type::Unit,
+							ty: ValueType::Unit,
 						});
 
 						Expression {
@@ -2653,19 +2252,13 @@ impl<'tir> Builder<'tir> {
 				}
 			}
 			tir::ExprKind::StructInit { fields, .. } => {
-				let (struct_index, args) = match self.tir.types.resolve(expr.ty)
-				{
-					tir::Type::Struct { struct_index, args } => {
-						(*struct_index, args)
-					}
-					_ => unreachable!("StructInit type must be Struct"),
-				};
+				let (struct_index, args) = self.instantiate_struct(expr.ty);
 				let lowered: Vec<Expression> = fields
 					.iter()
 					.map(|f| self.lower_expression(func_ctx, f, sink))
 					.collect();
 				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, args);
+					self.ensure_aggregate_for_struct(struct_index, &args);
 				let aggregate = self.aggregate(aggregate_index);
 				let mut phys_slots: Vec<Option<Expression>> =
 					(0..lowered.len()).map(|_| None).collect();
@@ -2677,20 +2270,21 @@ impl<'tir> Builder<'tir> {
 					phys_slots.into_iter().map(|e| e.unwrap()).collect();
 				Expression {
 					kind: ExprKind::Aggregate { values },
-					ty: Type::Aggregate { aggregate_index },
+					ty: ValueType::Aggregate { aggregate_index },
 				}
 			}
 			tir::ExprKind::TupleInit { elements } => {
-				let types: Box<[Type]> = match self.tir.types.resolve(expr.ty) {
-					tir::Type::Tuple { elements } => {
-						let elements: Box<[Type]> = elements
-							.iter()
-							.map(|&t| self.lower_type_index(t))
-							.collect();
-						elements
-					}
+				let concrete =
+					self.types.instantiate_type(expr.ty, self.current_type_env);
+				let concrete_elements = match self.types.get(concrete) {
+					ConcreteType::Tuple { elements } => elements.clone(),
 					_ => unreachable!("TupleInit type must be Tuple"),
 				};
+				let types: Box<[ValueType]> = concrete_elements
+					.iter()
+					.copied()
+					.map(|ty| self.lower_type(ty))
+					.collect();
 				let lowered: Vec<Expression> = elements
 					.iter()
 					.map(|expr| self.lower_expression(func_ctx, expr, sink))
@@ -2708,7 +2302,7 @@ impl<'tir> Builder<'tir> {
 					phys_slots.into_iter().map(|e| e.unwrap()).collect();
 				Expression {
 					kind: ExprKind::Aggregate { values },
-					ty: Type::Aggregate { aggregate_index },
+					ty: ValueType::Aggregate { aggregate_index },
 				}
 			}
 			tir::ExprKind::IfElse {
@@ -2790,7 +2384,7 @@ impl<'tir> Builder<'tir> {
 				kind: ExprKind::Continue {
 					scope_index: ScopeIndex::new(u32::from(*scope_index)),
 				},
-				ty: Type::Never,
+				ty: ValueType::Never,
 			},
 			tir::ExprKind::Loop { scope_index, block } => Expression {
 				kind: ExprKind::Loop {
@@ -2808,20 +2402,12 @@ impl<'tir> Builder<'tir> {
 			} => {
 				func_ctx.current_scope_index =
 					ScopeIndex::new(u32::from(*scope_index));
+					
 				let mut inner_sink: Vec<Expression> = Vec::new();
-
-				for e in expressions.iter() {
-					let lowered =
-						self.lower_expression(func_ctx, e, &mut inner_sink);
-					inner_sink.push(lowered);
-				}
-				if let Some(result) = result {
-					let lowered = self.lower_expression(
-						func_ctx,
-						result,
-						&mut inner_sink,
-					);
-					inner_sink.push(lowered);
+				for expr in expressions.iter().chain(result.as_deref()) {
+					let lowered_expr =
+						self.lower_expression(func_ctx, expr, &mut inner_sink);
+					inner_sink.push(lowered_expr);
 				}
 
 				Expression {
@@ -2857,7 +2443,7 @@ impl<'tir> Builder<'tir> {
 						kind: ExprKind::Drop {
 							value: Box::new(value),
 						},
-						ty: Type::Unit,
+						ty: ValueType::Unit,
 					};
 				}
 
@@ -2900,7 +2486,7 @@ impl<'tir> Builder<'tir> {
 							scope_index = ScopeIndex::new(0);
 						}
 
-						let Type::Aggregate { aggregate_index } =
+						let ValueType::Aggregate { aggregate_index } =
 							self.lower_type_index(step.aggregate_ty)
 						else {
 							unreachable!(
@@ -2936,7 +2522,7 @@ impl<'tir> Builder<'tir> {
 							)),
 							value: Box::new(value),
 						},
-						ty: Type::Unit,
+						ty: ValueType::Unit,
 					});
 				}
 
@@ -2962,169 +2548,31 @@ impl<'tir> Builder<'tir> {
 				left,
 				right,
 			} => {
-				use tir::BinaryOp::*;
+				use tir::BinaryOp;
+				let left =
+					Box::new(self.lower_expression(func_ctx, left, sink));
+				let right =
+					Box::new(self.lower_expression(func_ctx, right, sink));
 
 				let kind = match operator.inner {
-					Add => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Add { left, right }
-					}
-					Sub => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Sub { left, right }
-					}
-					Mul => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Mul { left, right }
-					}
-					Div => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Div { left, right }
-					}
-					Rem => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Rem { left, right }
-					}
-					Eq => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Eq { left, right }
-					}
-					NotEq => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::NotEq { left, right }
-					}
-					Less => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Less { left, right }
-					}
-					LessEq => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::LessEq { left, right }
-					}
-					Greater => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Greater { left, right }
-					}
-					GreaterEq => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::GreaterEq { left, right }
-					}
-					And => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::And { left, right }
-					}
-					Or => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::Or { left, right }
-					}
-					BitAnd => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::BitAnd { left, right }
-					}
-					BitOr => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::BitOr { left, right }
-					}
-					BitXor => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::BitXor { left, right }
-					}
-					LeftShift => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
-						ExprKind::LeftShift { left, right }
-					}
-					RightShift => {
-						let left = Box::new(
-							self.lower_expression(func_ctx, left, sink),
-						);
-						let right = Box::new(
-							self.lower_expression(func_ctx, right, sink),
-						);
+					BinaryOp::Add => ExprKind::Add { left, right },
+					BinaryOp::Sub => ExprKind::Sub { left, right },
+					BinaryOp::Mul => ExprKind::Mul { left, right },
+					BinaryOp::Div => ExprKind::Div { left, right },
+					BinaryOp::Rem => ExprKind::Rem { left, right },
+					BinaryOp::Eq => ExprKind::Eq { left, right },
+					BinaryOp::NotEq => ExprKind::NotEq { left, right },
+					BinaryOp::Less => ExprKind::Less { left, right },
+					BinaryOp::LessEq => ExprKind::LessEq { left, right },
+					BinaryOp::Greater => ExprKind::Greater { left, right },
+					BinaryOp::GreaterEq => ExprKind::GreaterEq { left, right },
+					BinaryOp::And => ExprKind::And { left, right },
+					BinaryOp::Or => ExprKind::Or { left, right },
+					BinaryOp::BitAnd => ExprKind::BitAnd { left, right },
+					BinaryOp::BitOr => ExprKind::BitOr { left, right },
+					BinaryOp::BitXor => ExprKind::BitXor { left, right },
+					BinaryOp::LeftShift => ExprKind::LeftShift { left, right },
+					BinaryOp::RightShift => {
 						ExprKind::RightShift { left, right }
 					}
 				};
@@ -3135,15 +2583,18 @@ impl<'tir> Builder<'tir> {
 				}
 			}
 			tir::ExprKind::ArrayLiteral { elements, memory } => {
-				let elem_ty = match self.tir.types.resolve(expr.ty) {
-					tir::Type::Array { of, .. } => *of,
+				let concrete =
+					self.types.instantiate_type(expr.ty, self.current_type_env);
+				let elem_ty = match self.types.get(concrete) {
+					ConcreteType::Array { of, .. } => *of,
 					_ => unreachable!(),
 				};
 				let memory_id = self.resolve_memory_id(*memory);
-				let align = self.compute_layout(elem_ty).align;
+				let align = self.compute_type_layout(elem_ty).align;
+				let elem_value_ty = self.lower_type(elem_ty);
 				let mut bytes = Vec::new();
 				for elem in elements.iter() {
-					Self::encode_element(&mut bytes, &elem.kind, elem_ty);
+					Self::encode_element(&mut bytes, &elem.kind, elem_value_ty);
 				}
 				if bytes.is_empty() {
 					return Expression {
@@ -3163,14 +2614,21 @@ impl<'tir> Builder<'tir> {
 				count,
 				memory,
 			} => {
-				let elem_ty = match self.tir.types.resolve(expr.ty) {
-					tir::Type::Array { of, .. } => *of,
+				let concrete =
+					self.types.instantiate_type(expr.ty, self.current_type_env);
+				let elem_ty = match self.types.get(concrete) {
+					ConcreteType::Array { of, .. } => *of,
 					_ => unreachable!(),
 				};
 				let memory_id = self.resolve_memory_id(*memory);
-				let align = self.compute_layout(elem_ty).align;
+				let align = self.compute_type_layout(elem_ty).align;
+				let elem_value_ty = self.lower_type(elem_ty);
 				let mut elem_bytes = Vec::new();
-				Self::encode_element(&mut elem_bytes, &value.kind, elem_ty);
+				Self::encode_element(
+					&mut elem_bytes,
+					&value.kind,
+					elem_value_ty,
+				);
 				let bytes = elem_bytes.repeat(*count as usize);
 				if bytes.is_empty() {
 					return Expression {
@@ -3186,19 +2644,27 @@ impl<'tir> Builder<'tir> {
 				}
 			}
 			tir::ExprKind::SliceRange { object, start, end } => {
-				let (elem_tir_ty, mem_tir_ty, static_size) =
-					match self.tir.types.resolve(object.ty) {
-						tir::Type::Array {
+				let concrete = self
+					.types
+					.instantiate_type(object.ty, self.current_type_env);
+				let (elem_ty, memory, static_size) =
+					match self.types.get(concrete) {
+						ConcreteType::Array {
 							of, memory, size, ..
 						} => (*of, *memory, Some(*size)),
-						tir::Type::Slice { of, memory, .. } => {
+						ConcreteType::Slice { of, memory, .. } => {
 							(*of, *memory, None)
 						}
 						_ => unreachable!(),
 					};
 
-				let elem_size = self.compute_layout(elem_tir_ty).size;
-				let memory_id = self.resolve_memory_id(mem_tir_ty);
+				let elem_size = self.compute_type_layout(elem_ty).size;
+				let ConcreteType::Memory { id: memory_id } =
+					self.types.get(memory)
+				else {
+					unreachable!("slice range memory is not concrete")
+				};
+				let memory_id = *memory_id;
 				let ptr_ty = self.pointer_type(memory_id);
 				let tir_mem_idx =
 					usize::from(self.tir.items.expect_memory_index(memory_id));
@@ -3236,7 +2702,7 @@ impl<'tir> Builder<'tir> {
 										local_index: temp,
 										value: Box::new(lowered_obj),
 									},
-									ty: Type::Unit,
+									ty: ValueType::Unit,
 								});
 								(ScopeIndex::new(0), temp)
 							}
@@ -3281,7 +2747,7 @@ impl<'tir> Builder<'tir> {
 							local_index: temp,
 							value: Box::new(s_lowered),
 						},
-						ty: Type::Unit,
+						ty: ValueType::Unit,
 					});
 					Some(temp)
 				} else {
@@ -3351,7 +2817,7 @@ impl<'tir> Builder<'tir> {
 									local_index: e_temp,
 									value: Box::new(e_lowered),
 								},
-								ty: Type::Unit,
+								ty: ValueType::Unit,
 							});
 
 							// Allocate a synthetic block scope for the trap branch.
@@ -3361,7 +2827,7 @@ impl<'tir> Builder<'tir> {
 								kind: tir::BlockKind::Block,
 								parent: Some(func_ctx.current_scope_index),
 								locals: vec![],
-								result: Type::Never,
+								result: ValueType::Never,
 							});
 
 							// if from > to { unreachable }
@@ -3386,7 +2852,7 @@ impl<'tir> Builder<'tir> {
 												ty: idx_ty,
 											}),
 										},
-										ty: Type::Bool,
+										ty: ValueType::Bool,
 									}),
 									then_block: Box::new(Expression {
 										kind: ExprKind::Block {
@@ -3394,15 +2860,15 @@ impl<'tir> Builder<'tir> {
 											expressions: Box::new([
 												Expression {
 													kind: ExprKind::Unreachable,
-													ty: Type::Never,
+													ty: ValueType::Never,
 												},
 											]),
 										},
-										ty: Type::Never,
+										ty: ValueType::Never,
 									}),
 									else_block: None,
 								},
-								ty: Type::Unit,
+								ty: ValueType::Unit,
 							});
 
 							Expression {
@@ -3496,12 +2962,12 @@ impl<'tir> Builder<'tir> {
 						offset,
 						memory,
 					},
-					ty: Type::Unit,
+					ty: ValueType::Unit,
 				}
 			}
 			tir::ExprKind::Assign { left, right } => Expression {
 				kind: self.lower_assignment(func_ctx, left, right, sink),
-				ty: Type::Unit,
+				ty: ValueType::Unit,
 			},
 			tir::ExprKind::CompoundAssign {
 				target,
@@ -3543,1141 +3009,6 @@ impl<'tir> Builder<'tir> {
 					func_ctx, target, rhs, method_id, sink,
 				)
 			}
-		}
-	}
-
-	fn lower_intrinsic(
-		&mut self,
-		func_ctx: &mut FunctionContext,
-		name: SymbolU32,
-		expr_ty: tir::TypeIndex,
-		type_args: &[tir::TypeIndex],
-		arguments: &[tir::Expression],
-		sink: &mut Vec<Expression>,
-	) -> Expression {
-		let name_str = self.interner.resolve(name).unwrap();
-		match name_str {
-			"memory_grow" => {
-				let raw_ty = type_args[0];
-				let mem_ty = match self.tir.types.resolve(raw_ty) {
-					tir::Type::TypeParam { param_index, .. } => self
-						.current_substitutions
-						.get(*param_index as usize)
-						.copied()
-						.unwrap_or(raw_ty),
-					_ => raw_ty,
-				};
-				let memory = match self.tir.types.resolve(mem_ty) {
-					tir::Type::Memory { id, .. } => *id,
-					_ => unreachable!(
-						"memory_grow type arg must be a Memory type"
-					),
-				};
-				let delta = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[1],
-					sink,
-				));
-				Expression {
-					kind: ExprKind::MemoryGrow { memory, delta },
-					ty: self.lower_type_index(expr_ty),
-				}
-			}
-			"memory_size" => {
-				let raw_ty = type_args[0];
-				let mem_ty = match self.tir.types.resolve(raw_ty) {
-					tir::Type::TypeParam { param_index, .. } => self
-						.current_substitutions
-						.get(*param_index as usize)
-						.copied()
-						.unwrap_or(raw_ty),
-					_ => raw_ty,
-				};
-				let memory = match self.tir.types.resolve(mem_ty) {
-					tir::Type::Memory { id, .. } => *id,
-					_ => unreachable!(
-						"memory_size type arg must be a Memory type"
-					),
-				};
-				Expression {
-					kind: ExprKind::MemorySize { memory },
-					ty: self.lower_type_index(expr_ty),
-				}
-			}
-			"slice_len" => {
-				let result_ty = self.lower_type_index(expr_ty);
-				let slice_arg = &arguments[0];
-				match &slice_arg.kind {
-					tir::ExprKind::Local {
-						scope_index,
-						local_index,
-					} => Expression {
-						kind: ExprKind::AggregateGet {
-							scope_index: ScopeIndex::new(u32::from(
-								*scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
-								*local_index,
-							)),
-							value_index: PhysIndex::new(1),
-						},
-						ty: result_ty,
-					},
-					_ => {
-						let slice_ty = self.lower_type_index(slice_arg.ty);
-						let lowered =
-							self.lower_expression(func_ctx, slice_arg, sink);
-						let temp_idx = LocalIndex::new(
-							func_ctx.frame[0].locals.len() as u32,
-						);
-						func_ctx.frame[0].locals.push(Local {
-							ty: slice_ty,
-							mutability: Mutability::Immutable,
-						});
-						sink.push(Expression {
-							kind: ExprKind::LocalSet {
-								scope_index: ScopeIndex::new(0),
-								local_index: temp_idx,
-								value: Box::new(lowered),
-							},
-							ty: Type::Unit,
-						});
-						Expression {
-							kind: ExprKind::AggregateGet {
-								scope_index: ScopeIndex::new(0),
-								local_index: temp_idx,
-								value_index: PhysIndex::new(1),
-							},
-							ty: result_ty,
-						}
-					}
-				}
-			}
-			"slice_ptr" => {
-				let result_ty = self.lower_type_index(expr_ty);
-				let slice_arg = &arguments[0];
-				match &slice_arg.kind {
-					tir::ExprKind::Local {
-						scope_index,
-						local_index,
-					} => Expression {
-						kind: ExprKind::AggregateGet {
-							scope_index: ScopeIndex::new(u32::from(
-								*scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
-								*local_index,
-							)),
-							value_index: PhysIndex::new(0),
-						},
-						ty: result_ty,
-					},
-					_ => {
-						let slice_ty = self.lower_type_index(slice_arg.ty);
-						let lowered =
-							self.lower_expression(func_ctx, slice_arg, sink);
-						let temp_idx = LocalIndex::new(
-							func_ctx.frame[0].locals.len() as u32,
-						);
-						func_ctx.frame[0].locals.push(Local {
-							ty: slice_ty,
-							mutability: Mutability::Immutable,
-						});
-						sink.push(Expression {
-							kind: ExprKind::LocalSet {
-								scope_index: ScopeIndex::new(0),
-								local_index: temp_idx,
-								value: Box::new(lowered),
-							},
-							ty: Type::Unit,
-						});
-						Expression {
-							kind: ExprKind::AggregateGet {
-								scope_index: ScopeIndex::new(0),
-								local_index: temp_idx,
-								value_index: PhysIndex::new(0),
-							},
-							ty: result_ty,
-						}
-					}
-				}
-			}
-			"slice_from_parts" => {
-				let data = self.lower_expression(func_ctx, &arguments[0], sink);
-				let len = self.lower_expression(func_ctx, &arguments[1], sink);
-				let result_ty = self.lower_type_index(expr_ty);
-				Expression {
-					kind: ExprKind::Aggregate {
-						values: Box::new([data, len]),
-					},
-					ty: result_ty,
-				}
-			}
-			"size_of" => {
-				let raw_ty = type_args[0];
-				let concrete_t = match self.tir.types.resolve(raw_ty) {
-					tir::Type::TypeParam { param_index, .. } => self
-						.current_substitutions
-						.get(*param_index as usize)
-						.copied()
-						.unwrap_or(raw_ty),
-					_ => raw_ty,
-				};
-				let layout = self.compute_layout(concrete_t);
-				Expression {
-					kind: ExprKind::Int {
-						value: layout.size as i64,
-					},
-					ty: self.lower_type_index(expr_ty),
-				}
-			}
-			"align_of" => {
-				let raw_ty = type_args[0];
-				let concrete_t = match self.tir.types.resolve(raw_ty) {
-					tir::Type::TypeParam { param_index, .. } => self
-						.current_substitutions
-						.get(*param_index as usize)
-						.copied()
-						.unwrap_or(raw_ty),
-					_ => raw_ty,
-				};
-				let layout = self.compute_layout(concrete_t);
-				Expression {
-					kind: ExprKind::Int {
-						value: layout.align as i64,
-					},
-					ty: self.lower_type_index(expr_ty),
-				}
-			}
-			"f32_sqrt" | "f64_sqrt" => Expression {
-				kind: ExprKind::Sqrt {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_abs" | "f64_abs" => Expression {
-				kind: ExprKind::Abs {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_floor" | "f64_floor" => Expression {
-				kind: ExprKind::Floor {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_ceil" | "f64_ceil" => Expression {
-				kind: ExprKind::Ceil {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_trunc" | "f64_trunc" => Expression {
-				kind: ExprKind::Trunc {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_nearest" | "f64_nearest" => Expression {
-				kind: ExprKind::Nearest {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_min" | "f64_min" => Expression {
-				kind: ExprKind::Min {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_max" | "f64_max" => Expression {
-				kind: ExprKind::Max {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_copysign" | "f64_copysign" => Expression {
-				kind: ExprKind::Copysign {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_neg" | "i64_neg" | "f32_neg" | "f64_neg" => Expression {
-				kind: ExprKind::Neg {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_bitnot" | "i64_bitnot" => Expression {
-				kind: ExprKind::BitNot {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_add" | "i64_add" | "f32_add" | "f64_add" => Expression {
-				kind: ExprKind::Add {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_sub" | "i64_sub" | "f32_sub" | "f64_sub" => Expression {
-				kind: ExprKind::Sub {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_mul" | "i64_mul" | "f32_mul" | "f64_mul" => Expression {
-				kind: ExprKind::Mul {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_div" | "u32_div" | "i64_div" | "u64_div" | "f32_div"
-			| "f64_div" => Expression {
-				kind: ExprKind::Div {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_rem" | "u32_rem" | "i64_rem" | "u64_rem" => Expression {
-				kind: ExprKind::Rem {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_bitand" | "i64_bitand" => Expression {
-				kind: ExprKind::BitAnd {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_bitor" | "i64_bitor" => Expression {
-				kind: ExprKind::BitOr {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_bitxor" | "i64_bitxor" => Expression {
-				kind: ExprKind::BitXor {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_shl" | "i64_shl" => Expression {
-				kind: ExprKind::LeftShift {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_shr" | "u32_shr" | "i64_shr" | "u64_shr" => Expression {
-				kind: ExprKind::RightShift {
-					left: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-					right: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[1],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i64_extend_i32" => Expression {
-				kind: ExprKind::I64ExtendI32S {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"u64_extend_u32" => Expression {
-				kind: ExprKind::I64ExtendI32U {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_wrap_i64" => Expression {
-				kind: ExprKind::I32WrapI64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_convert_i32" => Expression {
-				kind: ExprKind::F32ConvertI32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_convert_u32" => Expression {
-				kind: ExprKind::F32ConvertU32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_convert_i64" => Expression {
-				kind: ExprKind::F32ConvertI64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_convert_u64" => Expression {
-				kind: ExprKind::F32ConvertU64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_convert_i32" => Expression {
-				kind: ExprKind::F64ConvertI32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_convert_u32" => Expression {
-				kind: ExprKind::F64ConvertU32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_convert_i64" => Expression {
-				kind: ExprKind::F64ConvertI64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_convert_u64" => Expression {
-				kind: ExprKind::F64ConvertU64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_trunc_f32" => Expression {
-				kind: ExprKind::I32TruncF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"u32_trunc_f32" => Expression {
-				kind: ExprKind::U32TruncF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_trunc_f64" => Expression {
-				kind: ExprKind::I32TruncF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"u32_trunc_f64" => Expression {
-				kind: ExprKind::U32TruncF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i64_trunc_f32" => Expression {
-				kind: ExprKind::I64TruncF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"u64_trunc_f32" => Expression {
-				kind: ExprKind::U64TruncF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i64_trunc_f64" => Expression {
-				kind: ExprKind::I64TruncF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"u64_trunc_f64" => Expression {
-				kind: ExprKind::U64TruncF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_promote_f32" => Expression {
-				kind: ExprKind::F64PromoteF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_demote_f64" => Expression {
-				kind: ExprKind::F32DemoteF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i32_reinterpret_f32" => Expression {
-				kind: ExprKind::I32ReinterpretF32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f32_reinterpret_i32" => Expression {
-				kind: ExprKind::F32ReinterpretI32 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"i64_reinterpret_f64" => Expression {
-				kind: ExprKind::I64ReinterpretF64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"f64_reinterpret_i64" => Expression {
-				kind: ExprKind::F64ReinterpretI64 {
-					value: Box::new(self.lower_expression(
-						func_ctx,
-						&arguments[0],
-						sink,
-					)),
-				},
-				ty: self.lower_type_index(expr_ty),
-			},
-			"memory_fill" => {
-				let raw_ty = type_args[0];
-				let mem_ty = match self.tir.types.resolve(raw_ty) {
-					tir::Type::TypeParam { param_index, .. } => self
-						.current_substitutions
-						.get(*param_index as usize)
-						.copied()
-						.unwrap_or(raw_ty),
-					_ => raw_ty,
-				};
-				let memory = match self.tir.types.resolve(mem_ty) {
-					tir::Type::Memory { id, .. } => *id,
-					_ => unreachable!(
-						"memory_fill type arg must be a Memory type"
-					),
-				};
-				let dst = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[0],
-					sink,
-				));
-				let val = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[1],
-					sink,
-				));
-				let len = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[2],
-					sink,
-				));
-				Expression {
-					kind: ExprKind::MemoryFill {
-						memory,
-						dst,
-						val,
-						len,
-					},
-					ty: Type::Unit,
-				}
-			}
-			"memory_copy" => {
-				let resolve_memory = |raw_ty: tir::TypeIndex| {
-					let mem_ty = match self.tir.types.resolve(raw_ty) {
-						tir::Type::TypeParam { param_index, .. } => self
-							.current_substitutions
-							.get(*param_index as usize)
-							.copied()
-							.unwrap_or(raw_ty),
-						_ => raw_ty,
-					};
-					match self.tir.types.resolve(mem_ty) {
-						tir::Type::Memory { id, .. } => *id,
-						_ => unreachable!(
-							"memory_copy type arg must be a Memory type"
-						),
-					}
-				};
-				let src_memory = resolve_memory(type_args[1]);
-				let dst_memory = resolve_memory(type_args[2]);
-				let dst = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[0],
-					sink,
-				));
-				let src = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[1],
-					sink,
-				));
-				let len = Box::new(self.lower_expression(
-					func_ctx,
-					&arguments[2],
-					sink,
-				));
-				Expression {
-					kind: ExprKind::MemoryCopy {
-						dst_memory,
-						src_memory,
-						dst,
-						src,
-						len,
-					},
-					ty: Type::Unit,
-				}
-			}
-			name => unreachable!("cannot lower unknown intrinsic `{name}`"),
-		}
-	}
-
-	/// Compute the address of a place, returning `(base_ptr, static_byte_offset, memory_id)`.
-	///
-	/// The caller emits a `PointerLoad`/`PointerStore` using the returned triple.
-	///
-	/// - `Deref { pointer }` — evaluate the pointer expression; offset = 0.
-	/// - `Field { object, member }` — recurse on the parent place and add the
-	///   field's static byte offset.
-	/// - `Index { object, index }` — delegate to `lower_index_address`; the
-	///   returned pointer already encodes runtime index arithmetic when needed.
-	fn lower_place_address(
-		&mut self,
-		func_ctx: &mut FunctionContext,
-		place: &tir::Place,
-		sink: &mut Vec<Expression>,
-	) -> (Expression, u32, ast::DefId) {
-		let memory_id = self.resolve_memory_id(place.memory);
-		match &place.kind {
-			tir::PlaceKind::Deref { pointer } => {
-				let ptr = self.lower_expression(func_ctx, pointer, sink);
-				(ptr, 0, memory_id)
-			}
-			tir::PlaceKind::Field { object, member } => {
-				let (base_ptr, base_offset, memory_id) =
-					self.lower_place_address(func_ctx, object, sink);
-				let (struct_index, args) =
-					match self.tir.types.resolve(object.ty) {
-						tir::Type::Struct { struct_index, args } => {
-							(*struct_index, &args[..])
-						}
-						_ => unreachable!(
-							"PlaceKind::Field: parent place must be a struct"
-						),
-					};
-				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, args);
-				let decl_index = usize::from(
-					self.tir.items.structs[usize::from(struct_index)].lookup
-						[&member.inner],
-				);
-				let aggregate = self.aggregate(aggregate_index);
-				let field_offset =
-					aggregate.field(aggregate.physical(decl_index)).offset;
-				(base_ptr, base_offset + field_offset, memory_id)
-			}
-			tir::PlaceKind::Index { object, index } => {
-				let elem_ty = place.ty;
-				match self
-					.lower_index_address(func_ctx, object, index, elem_ty, sink)
-				{
-					IndexAddress::Constant { ptr, byte_offset } => {
-						(ptr, byte_offset, memory_id)
-					}
-					IndexAddress::Dynamic(ptr) => (ptr, 0, memory_id),
-				}
-			}
-		}
-	}
-
-	fn lower_assignment(
-		&mut self,
-		func_ctx: &mut FunctionContext,
-		left: &tir::Expression,
-		right: &tir::Expression,
-		sink: &mut Vec<Expression>,
-	) -> ExprKind {
-		if let tir::ExprKind::Placeholder = &left.kind {
-			// `_ = expr`: evaluate rhs for side effects, discard the value.
-			return ExprKind::Drop {
-				value: Box::new(self.lower_expression(func_ctx, right, sink)),
-			};
-		}
-		let value = self.lower_expression(func_ctx, right, sink);
-		self.lower_assign_target(left, value)
-	}
-
-	/// Builds the `LocalSet`/`GlobalSet`/`AggregateSet` that writes `value`
-	/// to `target` (a `Local`/`Global`/`FieldAccess`). Shared by plain
-	/// assignment (`lower_assignment`, `value` = the lowered rhs) and
-	/// compound assignment (`lower_compound_assign`, `value` = the resolved
-	/// operator method's `Call`) — `target`'s own indices/field-offset are
-	/// pure metadata lookups, never requiring further lowering, so both
-	/// callers can share this exactly.
-	fn lower_assign_target(
-		&mut self,
-		target: &tir::Expression,
-		value: Expression,
-	) -> ExprKind {
-		match &target.kind {
-			tir::ExprKind::Local {
-				scope_index,
-				local_index,
-			} => ExprKind::LocalSet {
-				scope_index: ScopeIndex::new(u32::from(*scope_index)),
-				local_index: LocalIndex::new(u32::from(*local_index)),
-				value: Box::new(value),
-			},
-			tir::ExprKind::Global { id } => ExprKind::GlobalSet {
-				id: *id,
-				value: Box::new(value),
-			},
-			tir::ExprKind::FieldAccess {
-				object,
-				field: member,
-			} => {
-				let (struct_index, args) =
-					match self.tir.types.resolve(object.ty) {
-						tir::Type::Struct { struct_index, args } => {
-							(*struct_index, args.clone())
-						}
-						_ => unreachable!("ObjectAccess on non-struct type"),
-					};
-				let aggregate_index =
-					self.ensure_aggregate_for_struct(struct_index, &args);
-				let decl_index = usize::from(
-					self.tir.items.structs[usize::from(struct_index)].lookup
-						[&member.inner],
-				);
-				let phys_index =
-					self.aggregate(aggregate_index).physical(decl_index);
-				let tir::ExprKind::Local {
-					scope_index,
-					local_index,
-				} = &object.kind
-				else {
-					unreachable!(
-						"ObjectAccess assignment: object must be Local after place/value split"
-					)
-				};
-				ExprKind::AggregateSet {
-					scope_index: ScopeIndex::new(u32::from(*scope_index)),
-					local_index: LocalIndex::new(u32::from(*local_index)),
-					value_index: phys_index,
-					value: Box::new(value),
-				}
-			}
-			_ => unreachable!(
-				"assignment target must be Local/Global/FieldAccess"
-			),
-		}
-	}
-
-	/// Builds the `Call` to `method_id` a compound-assignment operator
-	/// resolves to — `current_value`/`rhs` are its two arguments (mirrors
-	/// `MethodCall`'s lowering), and the call's own MIR type is
-	/// `current_value`'s type, since every operator trait method returns
-	/// `Self`. Records the call-graph edge so the inlining pass considers
-	/// this call a candidate exactly like an ordinary `MethodCall` would —
-	/// primitive impls (`impl Add for i32`, `#[inline]`) only collapse back
-	/// to a native op if this edge exists.
-	fn build_compound_operator_call(
-		&mut self,
-		method_id: ast::DefId,
-		current_value: Expression,
-		rhs: Expression,
-	) -> Expression {
-		self.record_call_edge(method_id);
-		let ty = current_value.ty;
-		let tir_idx = self.tir.items.expect_function_index(method_id);
-		let callee_sig_idx = self.intern_tir_function_type(
-			self.tir.items.functions[usize::from(tir_idx)].signature_index,
-		);
-		Expression {
-			kind: ExprKind::Call {
-				callee: Box::new(Expression {
-					kind: ExprKind::Function { id: method_id },
-					ty: Type::Function {
-						signature_index: callee_sig_idx,
-					},
-				}),
-				arguments: Box::new([current_value, rhs]),
-			},
-			ty,
-		}
-	}
-
-	/// Resolves `GenericCompoundAssign`/`GenericCompoundStore`'s abstract
-	/// trait method to a concrete one now that `self_type` is guaranteed
-	/// concrete (the surrounding function has already been monomorphized
-	/// for this instantiation) — exactly `GenericMethodCall`'s
-	/// abstract-method branch, just factored out since compound assignment
-	/// has two `Place`/non-`Place` shapes that both need it.
-	fn resolve_generic_compound_method(
-		&mut self,
-		abstract_method_id: ast::DefId,
-		self_type: tir::TypeIndex,
-	) -> ast::DefId {
-		let concrete_self = self.resolve_tir_type(self_type);
-		let tir_idx = self.tir.items.expect_function_index(abstract_method_id);
-		let tir_func = &self.tir.items.functions[usize::from(tir_idx)];
-		let method_name = tir_func.name.inner;
-		let trait_index = match tir_func.parent {
-			Some(tir::ItemParent::Trait(idx)) => idx,
-			_ => unreachable!(
-				"abstract trait method must be parented by its trait"
-			),
-		};
-		let (trait_impl_idx, impl_type_args) = self
-			.tir
-			.items
-			.find_trait_impl(&self.tir.types, concrete_self, trait_index)
-			.expect("no impl found for abstract trait method");
-		let impl_func_idx = self.tir.items.trait_impls
-			[usize::from(trait_impl_idx)]
-		.members
-		.get(&method_name)
-		.map(|entry| match entry {
-			tir::ImplEntry::Method(idx) => *idx,
-			_ => unreachable!(),
-		})
-		.expect("no impl found for abstract trait method");
-		let impl_func_id =
-			self.tir.items.functions[usize::from(impl_func_idx)].id;
-		if impl_type_args.is_empty() {
-			impl_func_id
-		} else {
-			self.mono_registry
-				.get_or_insert(impl_func_id, impl_type_args)
-		}
-	}
-
-	/// `CompoundAssign`/`GenericCompoundAssign` (target is `Local`/`Global`/
-	/// `FieldAccess`): read the current value, call the resolved operator
-	/// method, write the result back — `target`'s indices are safe to
-	/// reference twice (`Copy` metadata, not a computation), so no
-	/// once-only-lowering concern here, unlike `lower_compound_store`.
-	fn lower_compound_assign(
-		&mut self,
-		func_ctx: &mut FunctionContext,
-		target: &tir::Expression,
-		rhs: &tir::Expression,
-		method_id: ast::DefId,
-		sink: &mut Vec<Expression>,
-	) -> Expression {
-		let current_value = self.lower_expression(func_ctx, target, sink);
-		let lowered_rhs = self.lower_expression(func_ctx, rhs, sink);
-		let call = self.build_compound_operator_call(
-			method_id,
-			current_value,
-			lowered_rhs,
-		);
-		Expression {
-			kind: self.lower_assign_target(target, call),
-			ty: Type::Unit,
-		}
-	}
-
-	/// `CompoundStore`/`GenericCompoundStore` (target is a `Place`): the
-	/// careful one. Computes `target`'s address exactly once and sinks it
-	/// into a temp local, reused via `LocalGet` for both the old-value read
-	/// and the final store — fixes the pre-existing double-evaluation bug
-	/// where e.g. `arr[i()] += 1` called `i()` twice (once per
-	/// `lower_place_address` call). Mirrors the temp-local idiom already
-	/// used elsewhere in this file (e.g. `lower_intrinsic`'s `slice_len`/
-	/// `slice_ptr` arms).
-	fn lower_compound_store(
-		&mut self,
-		func_ctx: &mut FunctionContext,
-		target: &tir::Place,
-		rhs: &tir::Expression,
-		method_id: ast::DefId,
-		sink: &mut Vec<Expression>,
-	) -> Expression {
-		let (ptr, offset, memory) =
-			self.lower_place_address(func_ctx, target, sink);
-		let ptr_ty = ptr.ty;
-		let temp_idx = LocalIndex::new(func_ctx.frame[0].locals.len() as u32);
-		func_ctx.frame[0].locals.push(Local {
-			ty: ptr_ty,
-			mutability: Mutability::Immutable,
-		});
-		sink.push(Expression {
-			kind: ExprKind::LocalSet {
-				scope_index: ScopeIndex::new(0),
-				local_index: temp_idx,
-				value: Box::new(ptr),
-			},
-			ty: Type::Unit,
-		});
-
-		let current_value = Expression {
-			kind: ExprKind::PointerLoad {
-				pointer: Box::new(Expression {
-					kind: ExprKind::LocalGet {
-						scope_index: ScopeIndex::new(0),
-						local_index: temp_idx,
-					},
-					ty: ptr_ty,
-				}),
-				offset,
-				memory,
-			},
-			ty: self.lower_type_index(target.ty),
-		};
-		let lowered_rhs = self.lower_expression(func_ctx, rhs, sink);
-		let call = self.build_compound_operator_call(
-			method_id,
-			current_value,
-			lowered_rhs,
-		);
-		Expression {
-			kind: ExprKind::PointerStore {
-				pointer: Box::new(Expression {
-					kind: ExprKind::LocalGet {
-						scope_index: ScopeIndex::new(0),
-						local_index: temp_idx,
-					},
-					ty: ptr_ty,
-				}),
-				value: Box::new(call),
-				offset,
-				memory,
-			},
-			ty: Type::Unit,
 		}
 	}
 }

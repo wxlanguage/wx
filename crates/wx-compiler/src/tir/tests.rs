@@ -7266,15 +7266,14 @@ fn has_error_matching(case: &TestCase, substring: &str) {
 
 #[test]
 fn test_assoc_type_declared_in_trait() {
-	// A trait with an associated type must register it in `members` and
-	// `assoc_type_bounds`.
+	// The member index points to one arena-owned declaration with its bounds.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         trait Container {
             type Elem: Bound;
         }
     "});
-	no_errors(&case);
+	case.diagnostics().assert_no_errors();
 
 	let container_trait = case
 		.tir
@@ -7294,15 +7293,27 @@ fn test_assoc_type_declared_in_trait() {
 
 	assert!(
 		matches!(
-			container_trait.entries.get(&elem_sym),
-			Some(ImplEntry::AssocType(_))
+			container_trait.members.get(&elem_sym),
+			Some(MemberIndex::AssociatedType(_))
 		),
 		"expected 'Elem' in Container::members as AssociatedType"
 	);
+	let index = container_trait.associated_type(elem_sym).unwrap();
+	let item = &case.tir.items.associated_types[usize::from(index)];
+	assert_eq!(item.name.inner, elem_sym);
 	assert!(
-		container_trait.assoc_types.contains_key(&elem_sym),
-		"expected 'Elem' in Container::assoc_types"
+		item.ty.is_none(),
+		"a trait declaration has no assigned type"
 	);
+	assert_eq!(
+		item.id,
+		container_trait.members[&elem_sym].id(&case.tir.items)
+	);
+	assert_eq!(item.file_id, container_trait.file_id);
+	assert_eq!(item.bounds.traits.len(), 1);
+	let bound =
+		&case.tir.items.traits[usize::from(item.bounds.traits[0].trait_index)];
+	assert_eq!(case.graph.interner.resolve(bound.name.inner), Some("Bound"));
 }
 
 #[test]
@@ -7490,7 +7501,7 @@ fn test_assoc_type_impl_registers_in_trait_impl() {
 		matches!(
 			ti.members.get(&elem_sym),
 			Some(ImplEntry::AssocType(idx))
-				if case.tir.items.assoc_type_impls[usize::from(*idx)].ty.unwrap().inner == TypeIndex::U32
+				if case.tir.items.associated_types[usize::from(*idx)].ty.unwrap().inner == TypeIndex::U32
 		),
 		"expected 'Elem' → u32 in TraitImpl::members"
 	);
@@ -7502,7 +7513,7 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 	// block resolves `Self` to the concrete `Type::Struct` for `Heap` (not a
 	// `TypeParam`/`AssocTypeProjection`), so the associated-type lookup for
 	// `Elem` fell into `resolve_impl_member`'s inherent/trait-impl fallback —
-	// which never recorded an access on `Container::assoc_types["Elem"]`,
+	// which never recorded an access on `Container::Elem`,
 	// leaving hover/go-to-definition on `Elem` with nothing to find.
 	let source = indoc! {"
         trait Bound {}
@@ -7539,10 +7550,11 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 		.get("Elem")
 		.expect("symbol 'Elem' not interned");
 
-	let elem_assoc_type = container_trait
-		.assoc_types
-		.get(&elem_sym)
-		.expect("expected 'Elem' in Container::assoc_types");
+	let elem_assoc_type = &case.tir.items.associated_types[usize::from(
+		container_trait
+			.associated_type(elem_sym)
+			.expect("expected Container's associated-type declaration"),
+	)];
 
 	let self_elem_offset = source.find("Self::Elem").unwrap() + "Self::".len();
 	assert!(
@@ -7558,14 +7570,14 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 #[test]
 fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	// Regression test: `resolve_bounds`'s `WithBindings` arm looked up
-	// `assoc_types.get_mut(&binding.name)` on the *other* trait before that
+	// the associated-type declaration on the *other* trait before that
 	// trait had necessarily inserted its own entry — for two traits whose
 	// assoc-type `where` clauses reference each other (`A::X` bound by `B
 	// where { Y = Self }`, and vice versa), the first trait processed (`A`,
 	// being earlier in parse order) would reference `B::Y` before `B`'s own
 	// `TraitAssocType` node had run, silently dropping the access (no
 	// diagnostic — the lookup just missed). Fixed by pre-registering the
-	// assoc type in `assoc_types` (with placeholder bounds) before resolving
+	// assoc type in the arena (with placeholder bounds) before resolving
 	// its own bounds, so a same-name lookup during mutual resolution always
 	// finds an entry to record against.
 	//
@@ -7603,10 +7615,11 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	let y_binding_offset = source.find("Y = Self").unwrap();
 	let x_binding_offset = source.find("X = Self").unwrap();
 
-	let x_at = trait_a
-		.assoc_types
-		.get(&x_sym)
-		.expect("expected 'X' in A::assoc_types");
+	let x_at = &case.tir.items.associated_types[usize::from(
+		trait_a
+			.associated_type(x_sym)
+			.expect("expected A's associated-type declaration X"),
+	)];
 	assert!(
 		x_at.accesses
 			.iter()
@@ -7616,10 +7629,11 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 		x_at.accesses
 	);
 
-	let y_at = trait_b
-		.assoc_types
-		.get(&y_sym)
-		.expect("expected 'Y' in B::assoc_types");
+	let y_at = &case.tir.items.associated_types[usize::from(
+		trait_b
+			.associated_type(y_sym)
+			.expect("expected B's associated-type declaration Y"),
+	)];
 	assert!(
 		y_at.accesses
 			.iter()
@@ -7706,7 +7720,6 @@ fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
 }
 
 #[test]
-#[ignore = "mutual assoc-type-value reference reports a misleading cascade instead of CyclicTypeDependency — see comment above"]
 fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependency()
  {
 	// `impl Container for A { type Elem = B::Elem; }` next to
@@ -7717,42 +7730,21 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
 	// correctly for `const A: i32 = A;` via `ensure_signature`'s
 	// `ComputeState::InProgress` guard + `report_cyclic_type_dependency`.
 	//
-	// That machinery isn't wired up for this path, though:
-	// `resolve_namespace_type_member`'s catch-all arm (paths.rs, reached
-	// because `B`/`A` are concrete struct types) reads
-	// `self.items.assoc_type_impls[idx].ty.unwrap()` straight off the
-	// found `AssocTypeImpl`, without first calling `ensure_signature` on
-	// *that specific assoc-type-impl's own* `DefId` the way
-	// `resolve_bounds`'s `WithBindings` arm (generics.rs) and every
-	// "parent before member" call in traits.rs already do before reading
-	// something another item owns. So instead of catching the cycle via
-	// `ComputeState::InProgress`, whichever impl is processed first (parse
-	// order: `A` here) just finds the other's `Elem` isn't in `members` yet
-	// — not because of a cycle, but because `B`'s own `Elem` member hasn't
-	// been registered at all yet — and reports a plain "not found" instead.
-	// That result (`TypeIndex::ERROR`) then flows into `B`'s `Elem`, which
-	// resolves "successfully" against it, and the whole thing cascades into
-	// two more confusing `TraitBoundViolation`s on top, none of which say
-	// anything about a cycle.
+	// Now caught: `signature_trait_impl_assoc_type` reserves the member's
+	// arena slot (and its `item_lookup` / `ItemIndex::AssocType` entry)
+	// *before* resolving its `ty`, so a re-entrant lookup during that
+	// resolve (`trait_member_via_impl` -> `ensure_signature` -> `Cycle`)
+	// reports E1032 via `report_cyclic_type_dependency`. The slot is not
+	// published into the impl's `members` map until `ty` is filled, so the
+	// cycle is still observed rather than a `ty: None` placeholder being
+	// handed back. `AssociatedType::parent` lets the chain name each frame
+	// by its owner (`A::Elem`, not a bare `Elem`), and — since no aggregate
+	// is in the loop — the "insert indirection" note is correctly omitted.
 	//
-	// Fix sketch: in `resolve_namespace_type_member`'s
-	// `MemberLookup::Trait`/`MemberLookup::Inherent` arms for
-	// `ImplEntry::AssocType(idx)`, call
-	// `self.ensure_signature(self.items.assoc_type_impls[idx].id)` first,
-	// and report via `report_cyclic_type_dependency` on `SignatureStatus::
-	// Cycle` — mirroring `resolve_pending_global_symbol`/
-	// `resolve_pending_namespace_symbol` (modules.rs). Each `AssocTypeImpl`
-	// already carries its own registered `id`/`ast_nodes` entry
-	// (`AstNodeRef::TraitImplAssocType`, prescan.rs), so `ensure_signature`
-	// dispatches correctly — it's just never called on this path.
-	//
-	// One more thing the fix needs: `push_assoc_type_impl` (tir/mod.rs)
-	// never inserts its `id` into `item_lookup`, unlike every other
-	// `push_*` — so `item_name()`, which `report_cyclic_type_dependency`
-	// uses to label each frame in the "the cycle is `X` -> `Y`" note, has
-	// no case for an associated type and would silently skip that frame.
-	// Needs an `ItemIndex::AssocType` variant added the same way
-	// `push_typeset` registers `ItemIndex::TypeSet` right below it.
+	// One cosmetic edge remains: the errored `Elem` still feeds the
+	// `type Elem: Bound` conformance check, so two follow-on `E1063`
+	// ("`{unknown}: Bound`") land after the E1032 — secondary noise, not a
+	// missing-cycle report.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         impl Bound for u32 {}
@@ -7768,15 +7760,39 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
             type Elem = A::Elem;
         }
     "});
+	let cycle = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"expected a CyclicTypeDependency diagnostic for the A::Elem <-> B::Elem cycle, got: {:?}",
+				case.tir
+					.diagnostics
+					.iter()
+					.map(|d| &d.message)
+					.collect::<Vec<_>>(),
+			)
+		});
+	// The chain names each frame by its owning type, not a bare `Elem`.
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::CyclicTypeDependency),
-		"expected a CyclicTypeDependency diagnostic for the A::Elem <-> \
-		 B::Elem cycle, got: {:?}",
-		case.tir
-			.diagnostics
+		cycle
+			.notes
 			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>(),
+			.any(|n| n.contains("`A::Elem` -> `B::Elem` -> `A::Elem`")),
+		"cycle note should spell out the owner-qualified chain, got: {:?}",
+		cycle.notes,
+	);
+	// A pointer can't break an associated-type-value cycle, so the
+	// aggregate-only "insert indirection" note must not appear.
+	assert!(
+		!cycle.notes.iter().any(|n| n.contains("indirection")),
+		"an assoc-type value cycle should not suggest indirection, got: {:?}",
+		cycle.notes,
 	);
 }
 
@@ -12305,10 +12321,11 @@ fn test_assoc_type_multiple_bounds_both_stored() {
 		.interner
 		.get("Elem")
 		.expect("symbol 'Elem' not interned");
-	let assoc = container
-		.assoc_types
-		.get(&elem_sym)
-		.expect("assoc type 'Elem' not found");
+	let assoc = &case.tir.items.associated_types[usize::from(
+		container
+			.associated_type(elem_sym)
+			.expect("assoc type 'Elem' not found"),
+	)];
 	assert_eq!(
 		assoc.bounds.traits.len(),
 		2,
@@ -14160,35 +14177,35 @@ fn test_display_bounds_includes_where_clause_assoc_type_bound() {
 	// messages and LSP hover) used to only look at `TraitBound.bindings`'
 	// `Equals` entries when deciding whether to print a `where { }` clause
 	// at all — a bound with *only* a `where { Size: Unsigned }` entry (no
-	// `=` binding) printed as bare `Memory`, silently dropping the
+	// `=` binding) printed as bare `Store`, silently dropping the
 	// constraint from what the user sees on hover.
+	//
+	// The subject is `#[tag]`ged rather than looked up by name: the stdlib
+	// declares its own trait methods (`Memory::grow` and friends), so a
+	// bare name match here is order-dependent.
 	let case = TestCase::new(indoc! {"
         trait Unsigned {}
-        trait Memory { type Size; }
-        fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem, delta: Mem::Size) -> Mem::Size {
+        trait Store { type Size; }
+        #[tag = \"subject\"]
+        fn grow<S: Store where { Size: Unsigned }>(store: S, delta: S::Size) -> S::Size {
             unreachable
         }
     "});
-	let func = case
+	let def_id = *case
 		.tir
 		.items
-		.functions
-		.iter()
-		.find(|f| {
-			case.graph
-				.interner
-				.resolve(f.name.inner)
-				.map(|n| n == "grow")
-				.unwrap_or(false)
-		})
+		.tagged_items
+		.get(&case.graph.interner.get("subject").unwrap())
 		.unwrap();
+	let func = &case.tir.items.functions
+		[usize::from(case.tir.items.function_index(def_id).unwrap())];
 	let fmt = case.tir.formatter(
 		&case.graph.interner,
 		&case.graph.packages,
 		case.graph.root_package,
 	);
 	let s = fmt.display_bounds(&func.type_params[0].bounds).unwrap();
-	assert_eq!(s, "Memory where { Size: Unsigned }");
+	assert_eq!(s, "Store where { Size: Unsigned }");
 }
 
 #[test]
@@ -15554,4 +15571,253 @@ fn test_inherent_impl_on_slice_rejected_outside_stdlib() {
 		"only the inherent impl should be rejected: {:?}",
 		case.tir.diagnostics
 	);
+}
+
+#[test]
+fn test_member_candidates_three_bounds_and_repeated_later_bound() {
+	for bounds in ["A + B + C", "A + B + B + C", "C + B + A"] {
+		let case = TestCase::new(&format!(
+			"
+			trait A {{ fn foo(self) -> i32; }}
+			trait B {{ fn foo(self) -> i32; }}
+			trait C {{ fn foo(self) -> i32; }}
+			fn f<T: {bounds}>(x: T) -> i32 {{ x.foo() }}
+		"
+		));
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+		let diagnostic = diagnostics
+			.errors()
+			.find(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::AmbiguousTraitMember.code())
+			})
+			.expect("three distinct methods must be ambiguous");
+		assert_eq!(
+			diagnostic.labels.len(),
+			4,
+			"one use and three distinct declarations"
+		);
+	}
+}
+
+#[test]
+fn test_member_candidates_repeated_bound_is_unique() {
+	let case = TestCase::new(
+		"trait A { fn foo(self) -> i32; } fn f<T: A + A>(x: T) -> i32 { x.foo() }",
+	);
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_member_candidates_three_inherent_members_have_all_labels() {
+	let case = TestCase::new(
+		"
+		struct S { n: i32 }
+		impl S { fn foo(self) -> i32 { 1 } }
+		impl S { fn foo(self) -> i32 { 2 } }
+		impl S { fn foo(self) -> i32 { 3 } }
+		fn f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::DuplicateDefinition);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| d.labels.iter().any(|l| l.message == "multiple `foo` found"))
+		.expect("three inherent members must be ambiguous at the use");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
+
+#[test]
+fn test_member_candidates_assoc_type_deduplicates_later_bound() {
+	let case = TestCase::new(
+		"
+		trait A { type X; }
+		trait B { type X; }
+		fn f<T: A + B + B>(x: T::X) {}
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("two distinct associated types must be ambiguous");
+	assert_eq!(
+		diagnostic.labels.len(),
+		3,
+		"one use and two distinct declarations"
+	);
+}
+
+#[test]
+fn test_member_candidates_three_trait_impls_are_ambiguous() {
+	let case = TestCase::new(
+		"
+		trait A { fn foo(self) -> i32 { 1 } }
+		trait B { fn foo(self) -> i32 { 2 } }
+		trait C { fn foo(self) -> i32 { 3 } }
+		struct S { n: i32 }
+		impl A for S {}
+		impl B for S {}
+		impl C for S {}
+		fn f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("three applicable trait impls must be ambiguous");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
+
+#[test]
+fn test_trait_member_search_transitive_methods_and_constants() {
+	let case = TestCase::new(indoc! {"
+		trait A { fn value(self) -> i32; const N: i32; }
+		trait B: A {}
+		trait C: B {
+			fn inherited(self) -> i32 { self.value() + Self::N }
+		}
+		fn f<T: C>(x: T) -> i32 { x.value() + T::N }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_diamond_counts_declaration_once() {
+	let case = TestCase::new(indoc! {"
+		trait A { fn value(self) -> i32; type Item; }
+		trait B: A {}
+		trait C: A {}
+		trait D: B + C {}
+		fn f<T: D + A>(x: T) -> i32 { x.value() }
+		fn item<T: D>(x: T::Item) -> T::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_distinct_parent_and_child_are_ambiguous() {
+	let case = TestCase::new(indoc! {"
+		trait A { fn value(self) -> i32; }
+		trait B: A { fn value(self) -> i32; }
+		fn f<T: B>(x: T) -> i32 { x.value() }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::AmbiguousTraitMember);
+}
+
+#[test]
+fn test_trait_member_search_qualified_parent_satisfied_transitively() {
+	let case = TestCase::new(indoc! {"
+		trait A { fn value(self) -> i32; type Item; }
+		trait B: A {}
+		trait C: B {}
+		fn f<T: C>(x: T) -> i32 { <T as A>::value(x) }
+		fn item<T: C>(x: <T as A>::Item) -> T::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_projection_uses_supertraits() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; }
+		trait B: A {}
+		trait C: B {}
+		trait Container { type Element: C; }
+		fn f<T: Container>(x: T::Element::Item) -> <T::Element as A>::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_resolves_later_sibling() {
+	let case = TestCase::new(indoc! {"
+		fn f<T: A>(x: T::Item) -> T::Item { x }
+		trait A {
+			fn first(self, x: Self::Item) -> Self::Item;
+			type Item;
+		}
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_qualified_impl_before_declaration() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; }
+		struct S { n: i32 }
+		fn f(x: <S as A>::Item) -> i32 { x }
+		impl A for S { type Item = i32; }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_duplicate_declarations_are_reported() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; type Item; }
+		fn f<T: A>(x: T::Item) -> T::Item { x }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateDefinition);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::AmbiguousTraitMember);
+}
+
+#[test]
+fn test_trait_member_search_late_supertrait_across_modules() {
+	let case = TestCase::new_multi_file(
+		"main.wx",
+		indoc! {"
+		mod parent;
+		trait Child: parent::Parent {}
+		fn f<T: Child>(x: T) -> i32 { x.value() }
+		fn item<T: Child>(x: T::Item) -> <T as parent::Parent>::Item { x }
+	"},
+		&[(
+			"parent.wx",
+			"pub trait Parent { fn value(self) -> i32; type Item; }",
+		)],
+	);
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_qualified_child_does_not_search_parent() {
+	let case = TestCase::new(indoc! {"
+		trait A { fn value(self) -> i32; }
+		trait B: A {}
+		fn f<T: B>(x: T) -> i32 { <T as B>::value(x) }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredIdentifier);
+}
+
+#[test]
+fn test_trait_member_search_concrete_call_through_generic() {
+	let case = TestCase::new(indoc! {"
+		trait Parent { fn value(self) -> i32; }
+		trait Child: Parent {}
+		trait Grandchild: Child {}
+		struct S { n: i32 }
+		impl Parent for S { fn value(self) -> i32 { self.n } }
+		impl Child for S {}
+		impl Grandchild for S {}
+		fn read<T: Grandchild>(x: T) -> i32 { x.value() }
+		pub fn run(n: i32) -> i32 { read(S::{ n: n }) }
+		export { run }
+	"});
+	case.diagnostics().assert_no_errors();
 }
