@@ -140,17 +140,39 @@ impl<'ast> Builder<'ast, '_> {
 			size: memory_size.inner,
 			id: *id,
 		});
-		let members = match self.seed_memory_trait_impl_with(
-			trait_index,
-			memory_type,
-			memory_size,
-		) {
-			Ok(members) => members,
-			Err(()) => {
-				self.register_placeholder_memory(resolve_context, *id, name);
-				return;
-			}
+		let Ok(declarations) = self.resolve_trait_declarations(trait_index)
+		else {
+			self.register_placeholder_memory(resolve_context, *id, name);
+			return;
 		};
+		// A member's declared type may name another member of this same impl
+		// — `const PAGE_SIZE: Self::Size` — and resolving that projection goes
+		// through `find_trait_impl`, which cannot see an impl that isn't
+		// registered yet. A hand-written impl never trips on this because its
+		// members are resolved on demand from `member_decls`; a synthesized
+		// one has no declarations to force, so it earns the same tolerance by
+		// building in dependency order instead.
+		//
+		// That order is fixed and shallow: an associated type's value here is
+		// this memory's own size, known before any member is touched, so
+		// associated types depend on nothing and everything else may depend on
+		// them. Two passes, never more, and no cycle is constructible.
+		let (assoc_types, dependent): (Vec<_>, Vec<_>) = declarations
+			.into_iter()
+			.partition(|(_, entry)| matches!(entry, ImplEntry::AssocType(_)));
+		let members = assoc_types
+			.into_iter()
+			.map(|(name, entry)| {
+				(
+					name,
+					self.specialize_memory_member(
+						entry,
+						memory_type,
+						memory_size,
+					),
+				)
+			})
+			.collect();
 
 		// Register the memory type as implementing its declared trait so that
 		// check_assoc_type_bounds can verify `type M: Memory` bindings on
@@ -178,6 +200,17 @@ impl<'ast> Builder<'ast, '_> {
 			self_accesses: Vec::new(),
 		});
 		self.register_trait_impl(memory_type, trait_index, trait_impl_index);
+
+		// Second pass: now that the impl is registered carrying its associated
+		// types, a member naming `Self::Size` resolves through the ordinary
+		// `find_trait_impl` path like any other projection.
+		for (member_name, entry) in dependent {
+			let member =
+				self.specialize_memory_member(entry, memory_type, memory_size);
+			self.items.trait_impls[usize::from(trait_impl_index)]
+				.members
+				.insert(member_name, member);
+		}
 
 		// Bind each namespace only if this occurrence still holds its own
 		// `Pending` slot there — see the identical comment on the Struct
@@ -422,12 +455,16 @@ impl<'ast> Builder<'ast, '_> {
 		(min_pages.map(|s| s.inner), max_pages.map(|s| s.inner))
 	}
 
-	fn seed_memory_trait_impl_with(
+	/// Every member `trait_index` declares, resolved and in source order.
+	///
+	/// Resolution is the only fallible part of synthesizing an impl, and it is
+	/// kept separate from specialization so that a failure leaves nothing
+	/// half-built: the caller can still fall back to a placeholder memory
+	/// having pushed no items.
+	fn resolve_trait_declarations(
 		&mut self,
 		trait_index: TraitIndex,
-		memory_self: TypeIndex,
-		memory_size: Spanned<TypeIndex>,
-	) -> Result<HashMap<SymbolU32, ImplEntry>, ()> {
+	) -> Result<Vec<(SymbolU32, ImplEntry)>, ()> {
 		// Synthesizing a complete impl needs every declaration, unlike an
 		// ordinary lookup. Demand them explicitly in source order.
 		let trait_def = &self.items.traits[usize::from(trait_index)];
@@ -437,17 +474,15 @@ impl<'ast> Builder<'ast, '_> {
 			.map(|(&name, &member)| (name, member.def_span(&self.items)))
 			.collect();
 		declarations.sort_unstable_by_key(|(_, decl)| decl.span.start);
-		let mut members = HashMap::with_capacity(declarations.len());
+		let mut resolved = Vec::with_capacity(declarations.len());
 		for (name, decl) in declarations {
 			let entry =
 				self.declared_trait_member(trait_index, name, decl)?.expect(
 					"a collected trait declaration publishes its entry after resolution",
 				);
-			let member =
-				self.specialize_memory_member(entry, memory_self, memory_size);
-			members.insert(name, member);
+			resolved.push((name, entry));
 		}
-		Ok(members)
+		Ok(resolved)
 	}
 
 	/// Generated constants and associated types retain their template's

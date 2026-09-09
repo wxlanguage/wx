@@ -3956,6 +3956,54 @@ fn test_memory_index_const_resolves() {
 	);
 }
 
+/// A memory's synthetic `impl Memory for <mem>` is built in two passes:
+/// associated types first, then the impl is registered, then everything whose
+/// declared type may name one of them. `const PAGE_SIZE: Self::Size` is that
+/// second kind — substituting `Self` leaves a projection that resolves
+/// through `find_trait_impl`, which cannot see an impl that isn't registered
+/// yet. Build it in one pass and `PAGE_SIZE`'s type comes out `ERROR`.
+#[test]
+fn test_memory_impl_resolves_self_projections_in_its_own_members() {
+	let case = TestCase::new(indoc! {"
+        memory MEM: Memory where { Size = u32 };
+        pub fn f() -> MEM::Size { MEM::PAGE_SIZE }
+    "});
+	no_errors(&case);
+	let memory_impl = case
+		.tir
+		.items
+		.trait_impls
+		.iter()
+		.find(|imp| {
+			matches!(
+				case.tir.types.resolve(imp.target.inner),
+				Type::Memory { .. }
+			)
+		})
+		.expect("a memory declaration synthesizes a trait impl");
+	let member = |wanted: &str| {
+		memory_impl
+			.members
+			.iter()
+			.find(|(name, _)| {
+				case.graph.interner.resolve(**name) == Some(wanted)
+			})
+			.map(|(_, entry)| *entry)
+	};
+	assert!(
+		matches!(member("Size"), Some(ImplEntry::AssocType(_))),
+		"the impl must carry its associated types",
+	);
+	let Some(ImplEntry::AssocConstant(index)) = member("PAGE_SIZE") else {
+		panic!("expected a specialized `PAGE_SIZE` constant");
+	};
+	assert_eq!(
+		case.tir.items.constants[usize::from(index)].ty.inner,
+		TypeIndex::U32,
+		"`Self::Size` must have resolved to this memory's size, not `ERROR`",
+	);
+}
+
 #[test]
 fn test_memory_size_call_resolves() {
 	// `.size_pages()` is a method from the Memory trait; calling it should
@@ -10205,6 +10253,392 @@ fn test_generic_call_inferred_with_non_satisfying_type_is_error() {
 	);
 }
 
+// ── bound-consistency matrix ────────────────────────────────────────────────
+//
+// One associated-type constraint of the form `T: Trait where { Assoc = Type }`
+// (or a nested `{ Assoc: Bound where { .. } }`), checked against a concrete
+// `T` whose impl disagrees. `check_bound_bindings` (validation.rs) enforces
+// the declaration form — see `test_declaration_assoc_equality_demands_later_
+// impl_members`, which passes — but the other two entry points into "does
+// this type satisfy these bounds" do not:
+//   * call sites go through the `assoc_checks` pass in calls.rs, which only
+//     re-checks `AssocBindingKind::Bound` entries and never recurses into a
+//     bound's own nested bindings;
+//   * impl selection goes through `type_args_satisfy_bounds` (tir/mod.rs),
+//     which inspects `bounds.traits` / `bounds.typeset` but not
+//     `trait_bound.bindings` at all.
+// Each `#[ignore]`d test flips to passing once a shared bound evaluator backs
+// all three sites.
+
+/// `f`'s bound requires `T::Item == u32`; `u8::Item` is `bool`, so `f(0 as u8)`
+/// picks `T = u8` and violates it. The call site only queues
+/// `AssocBindingKind::Bound` entries into `assoc_checks` — `Equals` bindings
+/// are dropped once `T: Has` itself is satisfied.
+#[test]
+fn test_assoc_equality_binding_mismatch_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = u32 }>(_t: T) {}
+        fn main() { f(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+/// Nested `where` on a `: Bound` binding. `Foo::Mid` is `u8`, `u8: Inner`
+/// holds, but `u8::Out` is `bool`, not the required `u32`. The call-site
+/// second pass checks `required.traits` / `required.typeset` on the concrete
+/// associated value but does not recurse into `required`'s own bindings the
+/// way `check_bound_bindings` does for the declaration form.
+#[test]
+fn test_nested_assoc_binding_mismatch_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+        trait Outer { type Mid: Inner; }
+        impl Inner for u8 { type Out = bool; }
+        struct Foo {}
+        impl Outer for Foo { type Mid = u8; }
+        fn f<T: Outer where { Mid: Inner where { Out = u32 } }>(_t: T) {}
+        fn main() { f(Foo::{}); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+/// Method resolved through `impl<T: Has where { Item = u32 }> W<T>`. Impl
+/// selection runs `type_args_satisfy_bounds`, which walks `param.bounds.traits`
+/// and `.typeset` but never inspects `trait_bound.bindings`, so the impl is
+/// considered applicable to `W<u8>` even though `u8::Item` is `bool`.
+#[test]
+fn test_assoc_binding_mismatch_caught_during_impl_selection() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T: Has where { Item = u32 }> W<T> {
+            fn go(self) {}
+        }
+        fn use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	// A `MethodNotFound` for `go` (the impl correctly not applying) would be
+	// an equally acceptable outcome; today neither is produced.
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation)
+			|| case.tir.diagnostics.iter().any(|d| {
+				d.code.as_deref() == Some(DiagnosticCode::MethodNotFound.code())
+					&& d.message.contains("go")
+			}),
+		"expected an unsatisfied-binding error for `W<u8>.go()`, got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+/// The `: Bound` form of an associated binding at method-call impl selection
+/// (`impl<T: Has where { Item: Marker }> W<T>`) — the sibling above only
+/// covers `= Type`. `u8::Item` is `bool`, which does not implement `Marker`,
+/// so the impl must not apply.
+#[test]
+fn test_bound_kind_assoc_binding_at_impl_selection_rejects() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T: Has where { Item: Marker }> W<T> {
+            fn go(self) {}
+        }
+        fn use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation)
+			|| case.tir.diagnostics.iter().any(|d| {
+				d.code.as_deref() == Some(DiagnosticCode::MethodNotFound.code())
+					&& d.message.contains("go")
+			}),
+		"expected `W<u8>.go()` not to resolve (`u8::Item` = `bool` is not `Marker`), got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+/// The same impl *does* apply once the binding is satisfied — guards
+/// `assoc_bindings_hold` against false-rejecting a valid generic impl.
+#[test]
+fn test_bound_kind_assoc_binding_at_impl_selection_accepts() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        impl Marker for bool {}
+        struct W<T> { v: T }
+        impl<T: Has where { Item: Marker }> W<T> {
+            fn go(self) {}
+        }
+        fn use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+/// Three levels of `Bound` nesting in one `where` clause, with the violation
+/// at the innermost (`TopImpl::A::B::C` resolves to `bool`, which is not
+/// `Marker`). `check_bounds` reaches it only by recursing once per nested
+/// `where`; a one-level check would stop at `A`'s own refinements. Regression
+/// guard for keeping that recursion.
+#[test]
+fn test_deeply_nested_bound_binding_violation_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid { type B: Deep; }
+        trait Top { type A: Mid; }
+
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = bool; }
+
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+
+        struct TopImpl {}
+        impl Top for TopImpl { type A = MidImpl; }
+
+        fn f<T: Top where { A: Mid where { B: Deep where { C: Marker } } }>(_t: T) {}
+        fn main() { f(TopImpl::{}); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `bool: Marker` is not satisfied");
+}
+
+/// The same violation with the callee in another file. Every span a bound
+/// check reports has to be paired with the file that actually contains it:
+/// the nested levels are spanned by the *callee's* `where` clause, so pairing
+/// one of those with the caller's file id put the primary label at an offset
+/// past the end of `main.wx`, which renders as a blank line.
+///
+/// The primary belongs on the call — that is the code whose author can act on
+/// it — and which nested constraint failed is what the secondary label says,
+/// in the file that holds it.
+#[test]
+fn test_nested_bound_violation_labels_the_call_not_the_callees_span() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod dep;
+            struct TopImpl {}
+            impl dep::Top for TopImpl { type A = dep::MidImpl; }
+            fn main() { dep::f(TopImpl::{}); }
+            export { main }
+        "},
+		&[(
+			"src/dep.wx",
+			indoc! {"
+                pub trait Marker {}
+                pub trait Deep { type C; }
+                pub trait Mid { type B: Deep; }
+                pub trait Top { type A: Mid; }
+                pub struct DeepImpl {}
+                impl Deep for DeepImpl { type C = bool; }
+                pub struct MidImpl {}
+                impl Mid for MidImpl { type B = DeepImpl; }
+                pub fn f<T: Top where { A: Mid where { B: Deep where { C: Marker } } }>(_t: T) {}
+            "},
+		)],
+	);
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())
+		})
+		.expect("expected the nested bound violation to be reported");
+	for label in diagnostic.labels.iter() {
+		let file = case.graph.files.get(label.file_id).unwrap();
+		assert!(
+			label.range.end <= file.source.len(),
+			"label range {:?} is outside its own file (len {})",
+			label.range,
+			file.source.len(),
+		);
+	}
+	let primary = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Primary
+		})
+		.unwrap();
+	let primary_file = case.graph.files.get(primary.file_id).unwrap();
+	assert_eq!(
+		&primary_file.source[primary.range.clone()],
+		"TopImpl::{}",
+		"the primary label belongs on the call"
+	);
+	let secondary = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Secondary
+		})
+		.unwrap();
+	assert_ne!(
+		secondary.file_id, primary.file_id,
+		"the bound that imposed this lives in the callee's file"
+	);
+	let secondary_file = case.graph.files.get(secondary.file_id).unwrap();
+	assert_eq!(&secondary_file.source[secondary.range.clone()], "Marker");
+}
+
+/// An `= Type` binding whose RHS is another of the callee's own type
+/// parameters. The RHS is written in `f`'s scope, so at the call it means
+/// whatever `U` was inferred to — `bool` here, which is exactly `u8::Item`.
+/// Comparing the RHS as written would reject this valid call with
+/// "`Item` is `bool`, expected `U`".
+#[test]
+fn test_assoc_equality_binding_rhs_reads_the_calls_type_args() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = U }, U>(_t: T, _u: U) {}
+        fn main() { f(0 as u8, true); }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// The other half of the pair above: substituting the RHS must not blunt the
+/// check. `U` is `u32` here and `u8::Item` is `bool`, so the call is a real
+/// violation.
+#[test]
+fn test_assoc_equality_binding_rhs_type_param_still_catches_mismatch() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = U }, U>(_t: T, _u: U) {}
+        fn main() { f(0 as u8, 0 as u32); }
+        export { main }
+    "});
+	// The message naming `u32` rather than `U` is the substitution itself
+	// showing through.
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// The same substitution, but for a parameter *inherited* from the impl
+/// block rather than one of the method's own — `T` is pinned by the
+/// receiver, not by an argument. Guards that the positional substitution
+/// indexes the whole inherited-then-own chain (`param_index` is absolute)
+/// and not just the method's own slice.
+#[test]
+fn test_assoc_equality_binding_rhs_reads_an_inherited_type_param() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            fn go<U: Has where { Item = T }>(self, _u: U) {}
+        }
+        fn main() { W::<bool>::{ v: true }.go(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_assoc_equality_binding_rhs_inherited_type_param_catches_mismatch() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            fn go<U: Has where { Item = T }>(self, _u: U) {}
+        }
+        fn main() { W::<u32>::{ v: 0 as u32 }.go(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// A phantom parameter in the RHS — `U` appears nowhere in `f`'s signature,
+/// so the call can never pin it down. That is already reported as
+/// un-inferrable; the binding is then unprovable rather than violated, and
+/// must not stack a second error naming the unsubstituted `U`.
+#[test]
+fn test_uninferrable_binding_rhs_reports_only_the_inference_error() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = U }, U>(_t: T) {}
+        fn main() { f(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TypeAnnotationRequired);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+/// A binding is compared even when the subject is *abstract*. Inside `g`,
+/// `f`'s `T` is `U` — a type parameter with no impl to read a value from —
+/// but `U`'s own declared bounds fix `U::Item` as `bool` for the whole of
+/// `g`, which is enough to disprove `Item = u32`. Membership checks already
+/// consulted that side; the binding comparison did not, so this compiled.
+#[test]
+fn test_assoc_equality_binding_violated_through_a_generic_caller() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = u32 }>(_t: T) {}
+        fn g<U: Has where { Item = bool }>(u: U) { f(u); }
+        fn main() { g(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// The other direction: a caller whose declaration agrees must stay clean.
+#[test]
+fn test_assoc_equality_binding_satisfied_through_a_generic_caller() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = bool }>(_t: T) {}
+        fn g<U: Has where { Item = bool }>(u: U) { f(u); }
+        fn main() { g(0 as u8); }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// And a caller that says nothing about `Item` stays silent — nothing
+/// disproves the binding there, so reporting would be a false positive. The
+/// obligation is still checked wherever `g` itself is called with a concrete
+/// type.
+#[test]
+fn test_assoc_equality_binding_unconstrained_caller_is_not_disproved() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        fn f<T: Has where { Item = u32 }>(_t: T) {}
+        fn g<U: Has>(u: U) { f(u); }
+        fn main() { g(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
 // ── enum tests
 // ────────────────────────────────────────────────────────────────
 
@@ -14448,6 +14882,210 @@ fn test_trait_conformance_bound_kind_assoc_binding_satisfied_no_error() {
 	);
 }
 
+/// `Container::Elem`'s declared bound carries `where { Y = Self }`. When an
+/// impl binds `Elem` to a concrete type, conformance must check that type's
+/// `Y` against the impl target (what `Self` resolves to) — the
+/// `substitute_type(Self, [self_ty])` + compare branch in
+/// `check_declared_bounds`, which every abstract-RHS test skips.
+#[test]
+fn test_conformance_declared_self_binding_violation() {
+	let case = TestCase::new(indoc! {"
+        trait X { type Y; }
+        trait Container { type Elem: X where { Y = Self }; }
+
+        struct Foo {}
+        struct Bar {}
+        struct Elem {}
+        impl X for Elem { type Y = Bar; }
+        impl Container for Foo { type Elem = Elem; }
+    "});
+	// `where { Y = Self }` requires `Elem::Y == Foo`; the impl makes it `Bar`.
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a binding mismatch (`Elem::Y` is `Bar`, not `Foo`), got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+#[test]
+fn test_conformance_declared_self_binding_satisfied() {
+	let case = TestCase::new(indoc! {"
+        trait X { type Y; }
+        trait Container { type Elem: X where { Y = Self }; }
+
+        struct Foo {}
+        struct Elem {}
+        impl X for Elem { type Y = Foo; }
+        impl Container for Foo { type Elem = Elem; }
+    "});
+	no_errors(&case);
+}
+
+/// `Self` on the *impl* side of an associated-type value is not a type
+/// parameter: `types.rs` resolves it to the target type itself inside an impl
+/// block or trait impl, and only inside a trait declaration is it the trait's
+/// `self_type_param`. Conformance therefore checks `Foo` against `Y`'s
+/// declared bounds with no substitution of its own — this pins that, since a
+/// change to `Self` resolution would otherwise silently reintroduce the need
+/// for one.
+/// A `where` nested inside a trait's *declared* associated-type bound is an
+/// obligation on whoever implements it, and conformance is the only place it
+/// can be discharged — the declaration site can only check that the clause is
+/// coherent, not that some particular impl satisfies it. `Foo::A` is
+/// `MidImpl`, whose `B` is `DeepImpl`, whose `C` is `bool`, which is not
+/// `Marker`. Checking only the nested bound's trait *membership* and stopping
+/// dropped this.
+#[test]
+fn test_conformance_checks_nested_where_in_a_declared_assoc_bound() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid  { type B: Deep; }
+        trait Top  { type A: Mid where { B: Deep where { C: Marker } }; }
+
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = bool; }
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+        struct Foo {}
+        impl Top for Foo { type A = MidImpl; }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `bool: Marker` is not satisfied");
+}
+
+/// The same shape with the innermost obligation met stays clean — the
+/// recursion must not invent a violation where the written nesting is
+/// satisfied.
+#[test]
+fn test_conformance_nested_where_in_a_declared_assoc_bound_satisfied() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid  { type B: Deep; }
+        trait Top  { type A: Mid where { B: Deep where { C: Marker } }; }
+
+        struct Leaf {}
+        impl Marker for Leaf {}
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = Leaf; }
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+        struct Foo {}
+        impl Top for Foo { type A = MidImpl; }
+    "});
+	no_errors(&case);
+}
+
+/// Mutually-referential declarations must not hang. `check_written_bounds`
+/// only ever descends written syntax and never opens a declaration's bounds,
+/// so the declaration-to-declaration edge that could ping-pong here is
+/// followed exactly once, by `check_declared_bounds`. This is the case that
+/// made the nested check flat in the first place; it is why the fix needs no
+/// `visited` set.
+#[test]
+fn test_mutually_referential_declared_bounds_terminate() {
+	let case = TestCase::new(indoc! {"
+        trait A { type X: B where { Y = Self }; }
+        trait B { type Y: A where { X = Self }; }
+        struct P {}
+        struct Q {}
+        impl A for P { type X = Q; }
+        impl B for Q { type Y = P; }
+    "});
+	no_errors(&case);
+}
+
+/// The same, with the mutual reference written as nested `Bound` refinements
+/// rather than `Equals` — the form the recursion actually descends.
+#[test]
+fn test_mutually_referential_nested_bounds_terminate() {
+	let case = TestCase::new(indoc! {"
+        trait A { type X: B where { Y: A where { X: B } }; }
+        trait B { type Y: A where { X: B where { Y: A } }; }
+        struct P {}
+        struct Q {}
+        impl A for P { type X = Q; }
+        impl B for Q { type Y = P; }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_conformance_reads_self_in_an_impl_value_as_the_target() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X { type Y: Marker; }
+        struct Foo {}
+        impl X for Foo { type Y = Self; }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `Foo: Marker` is not satisfied");
+}
+
+/// Conformance walks the trait's members, which live in a `HashMap`, and
+/// nothing sorts diagnostics downstream — they render in push order. So the
+/// walk is ordered by each member's span *in the impl*, where every one of
+/// these diagnostics puts its primary label. The impl here lists `C, B, A`
+/// against a trait declaring `A, B, C`, so trait order and impl order
+/// disagree and only the intended one produces ascending labels.
+#[test]
+fn test_conformance_diagnostics_follow_the_impls_own_order() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X {
+            type A: Marker;
+            type B: Marker;
+            type C: Marker;
+        }
+        struct Foo {}
+        impl X for Foo {
+            type C = bool;
+            type B = bool;
+            type A = bool;
+        }
+    "});
+	let starts: Vec<u32> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())
+		})
+		.filter_map(|d| {
+			d.labels
+				.iter()
+				.find(|label| {
+					label.style
+						== codespan_reporting::diagnostic::LabelStyle::Primary
+				})
+				.map(|label| label.range.start as u32)
+		})
+		.collect();
+	assert_eq!(
+		starts.len(),
+		3,
+		"expected one violation per associated type"
+	);
+	assert!(
+		starts.windows(2).all(|w| w[0] < w[1]),
+		"diagnostics should follow the impl's source order, got {starts:?}"
+	);
+}
+
+#[test]
+fn test_conformance_self_in_an_impl_value_satisfies_its_bound() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X { type Y: Marker; }
+        struct Foo {}
+        impl Marker for Foo {}
+        impl X for Foo { type Y = Self; }
+    "});
+	no_errors(&case);
+}
+
 #[test]
 fn test_call_site_assoc_bound_satisfied_no_error() {
 	// `needs_marker`'s own `where { Size: Marker }` isn't checked merely by
@@ -14581,6 +15219,41 @@ fn test_where_clause_assoc_type_conflicting_typeset_bound_reports_error() {
 			.iter()
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
+	);
+}
+
+/// The same conflict, but with the offending function actually called. E1048
+/// is a property of the written `where` clause, so it belongs to the
+/// declaration and must be reported exactly once no matter how many call
+/// sites pass through the bound — every copy would carry the *declaration's*
+/// span anyway, so they render as literal duplicates.
+#[test]
+fn test_conflicting_typeset_bound_is_reported_once_not_per_call_site() {
+	let case = TestCase::new(indoc! {"
+        typeset SetA { u8, u16 }
+        typeset SetB { u32, u64 }
+        trait Memory { type Size: SetA; }
+        struct Mem8 {}
+        impl Memory for Mem8 { type Size = u8; }
+
+        fn f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
+        fn main() { f(Mem8::{}); f(Mem8::{}); }
+        export { main }
+    "});
+	let reported = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::MultipleTypesetBounds.code())
+		})
+		.count();
+	assert_eq!(
+		reported,
+		1,
+		"expected exactly one E1048, got {reported}: {:?}",
+		error_messages(&case.tir),
 	);
 }
 
@@ -16302,4 +16975,37 @@ fn test_declaration_validation_checks_inherited_parameters_once() {
 			.count(),
 		1
 	);
+}
+
+/// `type_param_info` addresses a parameter by its *absolute* index in the
+/// owner's visible chain, so index 0 on a method of a generic impl names the
+/// impl block's parameter, not the method's own. The `Function` arm used to
+/// compute `type_params[abs_index - inherited]` and underflow on exactly the
+/// indices its own doc comment promised to accept.
+#[test]
+fn test_type_param_info_resolves_an_inherited_parameter_by_absolute_index() {
+	let case = TestCase::new(indoc! {"
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            fn go<U>(self, u: U) -> U { u }
+        }
+    "});
+	let go = case
+		.tir
+		.items
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("go"))
+		.expect("function `go` not found in TIR");
+	assert_eq!(go.inherited_type_param_count, 1);
+	let owner = TypeParamOwner::Function(go.id);
+	let name_at = |index| {
+		case.graph
+			.interner
+			.resolve(case.tir.items.type_param_info(owner, index).name.inner)
+			.unwrap()
+			.to_string()
+	};
+	assert_eq!(name_at(0), "T", "index 0 is the impl block's parameter");
+	assert_eq!(name_at(1), "U", "index 1 is the method's own");
 }

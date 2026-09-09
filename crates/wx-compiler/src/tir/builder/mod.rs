@@ -9,6 +9,7 @@ use crate::{ast::MethodCallExpr, tir::*};
 
 mod aggregates;
 mod body;
+mod bounds;
 mod calls;
 mod candidates;
 mod control;
@@ -23,10 +24,14 @@ mod prescan;
 mod signature;
 mod traits;
 mod type_compare;
+mod type_ctx;
 mod types;
 mod validation;
 
 use candidates::{CandidateSelection, CandidateSet};
+
+use bounds::{BoundChecker, BoundOrigin, Subject};
+use type_ctx::TypeCtx;
 
 use aggregates::{
 	UnknownStructFieldDiagnostic, report_duplicate_struct_field_init,

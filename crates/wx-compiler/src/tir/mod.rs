@@ -3436,11 +3436,46 @@ impl ItemRegistry {
 		}
 	}
 
+	/// Which owner actually *stores* the type parameter at `abs_index` in
+	/// `owner`'s visible chain, and its index in that owner's own slice.
+	///
+	/// A function's inherited parameters are stored on its parent impl or
+	/// trait, not on the function, yet they share the function's absolute
+	/// numbering — the one [`ItemRegistry::function_type_params_iter`] yields
+	/// and [`Type::TypeParam`]'s `param_index` carries. An absolute index
+	/// below `inherited_type_param_count` therefore addresses the parent's own
+	/// slice at that same index. A parent never inherits in turn, so one hop
+	/// is always enough.
+	///
+	/// Every other owner stores what it declares, so this is the identity.
+	fn owning_type_param(
+		&self,
+		owner: TypeParamOwner,
+		abs_index: usize,
+	) -> (TypeParamOwner, usize) {
+		let TypeParamOwner::Function(id) = owner else {
+			return (owner, abs_index);
+		};
+		let func = &self.functions[usize::from(self.expect_function_index(id))];
+		if abs_index >= func.inherited_type_param_count as usize {
+			return (owner, abs_index);
+		}
+		match func.type_param_parent() {
+			Some(parent) => (parent, abs_index),
+			// `inherited_type_param_count > 0` without a parent is a bug in
+			// whoever built the function; leave the index alone and let the
+			// caller's own bounds check panic on it rather than silently
+			// resolving to the wrong parameter.
+			None => (owner, abs_index),
+		}
+	}
+
 	/// Returns the `TypeParamInfo` for the type parameter at `abs_index`
 	/// (absolute, 0-based across the full owner chain) under `owner`.
 	///
-	/// For `Function` owners, params inherited from a parent `ImplBlock` occupy
-	/// indices `0..inherited_count`; the function's own params start at
+	/// For `Function` owners, params inherited from a parent impl or trait
+	/// occupy indices `0..inherited_count` and are resolved on that parent by
+	/// [`ItemRegistry::owning_type_param`]; the function's own params start at
 	/// `inherited_count`. For all other owners, `abs_index` indexes directly
 	/// into the owner's `type_params` slice.
 	pub fn type_param_info(
@@ -3448,6 +3483,7 @@ impl ItemRegistry {
 		owner: TypeParamOwner,
 		abs_index: usize,
 	) -> &TypeParamInfo {
+		let (owner, abs_index) = self.owning_type_param(owner, abs_index);
 		match owner {
 			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.inherent_impls[usize::from(block_idx)].type_params
@@ -3480,12 +3516,14 @@ impl ItemRegistry {
 		}
 	}
 
-	/// Mutable counterpart of [`ItemRegistry::type_param_info`].
+	/// Mutable counterpart of [`ItemRegistry::type_param_info`], with the same
+	/// absolute-index contract.
 	pub fn type_param_info_mut(
 		&mut self,
 		owner: TypeParamOwner,
 		abs_index: usize,
 	) -> &mut TypeParamInfo {
+		let (owner, abs_index) = self.owning_type_param(owner, abs_index);
 		match owner {
 			TypeParamOwner::InherentImpl(block_idx) => {
 				&mut self.inherent_impls[usize::from(block_idx)].type_params
@@ -3782,6 +3820,36 @@ impl ItemRegistry {
 		}
 	}
 
+	/// The value an *abstract* `ty` declares for `trait_index::assoc_name` in
+	/// its own bounds — `fn g<U: Has where { Item = bool }>` says `U::Item` is
+	/// `bool` for the whole of `g`, with no impl involved.
+	///
+	/// This is the counterpart to reading the value off a concrete impl. A
+	/// type parameter has no impl to read, but its declared bounds are the
+	/// whole truth about it, so they answer the same question. Membership
+	/// checks (`type_implements_trait`) already consult this side; without
+	/// this, a binding on an abstract subject was simply never compared.
+	///
+	/// Only an `= Type` binding gives a value; a `: Bound` refinement
+	/// constrains without naming one.
+	fn declared_assoc_value(
+		&self,
+		types: &TypeInterner,
+		ty: TypeIndex,
+		trait_index: TraitIndex,
+		assoc_name: SymbolU32,
+	) -> Option<TypeIndex> {
+		self.effective_bounds(types, ty)?
+			.traits()
+			.filter(|bound| bound.trait_index == trait_index)
+			.flat_map(|bound| bound.bindings.iter())
+			.find(|binding| binding.name.inner == assoc_name)
+			.and_then(|binding| match &binding.rhs.inner {
+				AssocBindingKind::Equals(value) => Some(*value),
+				AssocBindingKind::Bound(_) => None,
+			})
+	}
+
 	/// Whether an unqualified projection would name multiple declarations.
 	/// Formatting follows the same reachable-trait set as member lookup,
 	/// counting a shared ancestor once and stopping at the second match.
@@ -3959,12 +4027,11 @@ impl ItemRegistry {
 			.map(|()| type_args.into_boxed_slice())
 	}
 
-	/// Does every `type_params[i].bounds` (trait bounds and typeset) accept
-	/// its matching `type_args[i]`? A still-`TypeIndex::INFER` slot is
-	/// skipped — it has no value at all yet, concrete or otherwise, so
-	/// validating it is deferred to whoever eventually resolves it (e.g.
-	/// `check_typeset_bounds_on_type_args` post-call, for an inherent-impl
-	/// param only pinned down by the call's own arguments).
+	/// Does every `type_params[i].bounds` accept its matching `type_args[i]`?
+	/// Trait membership, typeset membership, and each trait bound's
+	/// `where { Assoc = T }` / `where { Assoc: Bound }` refinements. A
+	/// still-`TypeIndex::INFER` slot is skipped — it has no value at all yet,
+	/// so validating it is deferred to whoever eventually resolves it.
 	///
 	/// An abstract slot (`arg_ty` is itself a `TypeParam`/
 	/// `AssocTypeProjection` — e.g. `M` unified against `Self::M` inside a
@@ -3972,10 +4039,15 @@ impl ItemRegistry {
 	/// `effective_bounds`, not looked up in `find_trait_impl`/
 	/// `concrete_type_in_typeset` — those only know about concrete impls,
 	/// and an abstract type isn't concrete yet. This only recognizes an
-	/// exact, directly-declared bound (no supertrait transitivity: `M:
-	/// Sub` does not currently satisfy a required `Super` even if `Sub:
-	/// Super`) — matching the same level of rigor `check_typeset_bounds_on_type_args`
-	/// already applies via `type_param_typeset_bound`.
+	/// exact, directly-declared bound (no supertrait transitivity: `M: Sub`
+	/// does not currently satisfy a required `Super` even if `Sub: Super`).
+	///
+	/// This runs during dispatch (`&self`, no interner to mutate), so an
+	/// associated binding whose value would need a materialised substitution
+	/// — a generic impl with a composite associated value — is left
+	/// unchecked here rather than mint a type (see
+	/// [`ItemRegistry::assoc_bindings_hold`]). `Builder::check_bounds` covers
+	/// those at the sites that report diagnostics.
 	fn type_args_satisfy_bounds(
 		&self,
 		types: &TypeInterner,
@@ -3992,11 +4064,87 @@ impl ItemRegistry {
 							types,
 							arg,
 							bound.trait_index,
-						)
+						) && self.assoc_bindings_hold(types, arg, bound)
 					}) && param.bounds.typeset.is_none_or(|typeset| {
 						self.type_in_typeset(types, arg, typeset.typeset_index)
 					}))
 			})
+	}
+
+	/// Whether `arg` satisfies every associated-type refinement written on
+	/// `bound` (`T: Trait where { Assoc = .. }` / `{ Assoc: .. }`).
+	///
+	/// Every way of failing to *read* the actual value counts as satisfied —
+	/// "not disproved" — because this runs during impl selection, under
+	/// `&self` with no interner to mutate. It has to stay that way: a query
+	/// that grew the type arena would make dispatch depend on what happened
+	/// to be interned already. `Builder::check_bounds` re-checks these
+	/// bindings at the sites that hold `&mut TypeInterner` and report
+	/// diagnostics, so nothing skipped here goes unchecked everywhere.
+	fn assoc_bindings_hold(
+		&self,
+		types: &TypeInterner,
+		arg: TypeIndex,
+		bound: &TraitBound,
+	) -> bool {
+		bound.bindings.iter().all(|binding| {
+			let Some((impl_idx, impl_args)) =
+				self.find_trait_impl(types, arg, bound.trait_index)
+			else {
+				return true;
+			};
+			let Some(ImplEntry::AssocType(idx)) = self.trait_impls
+				[usize::from(impl_idx)]
+			.members
+			.get(&binding.name.inner)
+			.copied() else {
+				return true;
+			};
+			// A member is published into an impl's `members` only once its
+			// value is filled, so this cannot be `None` — see the cycle
+			// comment where trait-impl associated types are resolved.
+			let written = self.associated_types[usize::from(idx)]
+				.ty
+				.expect("a member in an impl's map has its value")
+				.inner;
+			// A non-generic impl's value is already a type. A generic impl's
+			// is readable here only when it is a bare type parameter — then
+			// it is just whichever arg was inferred for it. Anything
+			// composite (`type Item = Wrapper<T>`) would have to be *built*
+			// to be named, which is exactly what this must not do.
+			let actual = if impl_args.is_empty() {
+				written
+			} else {
+				match types.resolve(written) {
+					Type::TypeParam { param_index, .. } => {
+						match impl_args.get(*param_index as usize).copied() {
+							Some(inferred) => inferred,
+							None => return true,
+						}
+					}
+					_ => return true,
+				}
+			};
+			if actual == TypeIndex::ERROR || actual == TypeIndex::INFER {
+				return true;
+			}
+			match &binding.rhs.inner {
+				AssocBindingKind::Equals(expected) => {
+					*expected == TypeIndex::ERROR || actual == *expected
+				}
+				AssocBindingKind::Bound(required) => {
+					required.traits.iter().all(|req| {
+						self.type_implements_trait(
+							types,
+							actual,
+							req.trait_index,
+						)
+					}) && required.typeset.is_none_or(|ts| {
+						self.type_in_typeset(types, actual, ts.typeset_index)
+					})
+				}
+			}
+		})
 	}
 
 	/// Does `inherent_impls[block_idx]`'s target apply to `receiver_ty`, and

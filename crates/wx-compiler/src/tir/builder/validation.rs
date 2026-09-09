@@ -1,5 +1,12 @@
 //! Declaration obligations, checked once after the signature sweep.
 //! Reads written TIR bounds; this pass never demands another signature.
+//!
+//! Two separate questions, both answered once per declaration and never
+//! again: whether a written bound is *sayable*
+//! ([`check_written_bounds`], a free function because it needs three
+//! disjoint `Builder` fields rather than `&mut Builder`, and no
+//! subject at all) and whether the declared subject *satisfies* it
+//! ([`Builder::check_bounds`] in `bounds.rs`, which this module only feeds).
 
 use super::*;
 
@@ -65,21 +72,40 @@ impl Builder<'_, '_> {
 				continue;
 			};
 			let context = ResolveContext::new(item.file_id, item.namespace);
-			let name = item.name.inner;
-			let bounds = item.bounds.clone();
-			if bounds.traits.iter().all(|bound| bound.bindings.is_empty()) {
+			let name = item.name;
+			if item.bounds.traits.iter().all(|b| b.bindings.is_empty()) {
 				continue;
 			}
 			let base = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
 			});
-			let projection = self.types.intern(Type::AssocTypeProjection {
+			let subject = self.types.intern(Type::AssocTypeProjection {
 				base,
 				trait_index,
-				assoc_name: name,
+				assoc_name: name.inner,
 			});
-			self.check_bound_bindings(context, projection, &bounds.traits);
+			let diagnostics = self.check_bounds(
+				context.namespace,
+				Subject::new(
+					SourceSpan::new(context.file_id, name.span),
+					subject,
+				),
+				BoundOrigin::TraitAssocType {
+					trait_index,
+					name: name.inner,
+				},
+				// A declaration checks its bounds as written — nothing has
+				// pinned its type parameters to anything yet.
+				&[],
+			);
+			self.diagnostics.extend(diagnostics);
+			check_written_bounds(
+				&self.items,
+				self.interner,
+				&mut self.diagnostics,
+				&self.items.associated_types[index].bounds,
+			);
 		}
 	}
 
@@ -91,101 +117,110 @@ impl Builder<'_, '_> {
 		let offset = self.inherited_type_param_count(owner) as usize;
 		for local_index in 0..self.owner_type_params(owner).len() {
 			let param_index = offset + local_index;
-			// Release the registry borrow before the checker writes diagnostics
-			// and interns temporary projection types. No deferred storage is needed.
-			let bounds = self
-				.items
-				.type_param_info(owner, param_index)
-				.bounds
-				.clone();
-			if bounds.traits.iter().all(|bound| bound.bindings.is_empty()) {
+			let info = self.items.type_param_info(owner, param_index);
+			// Only written refinements need checking here; a bare `T: Trait`
+			// bound is a constraint on callers, satisfied by definition.
+			if info.bounds.traits.iter().all(|b| b.bindings.is_empty()) {
 				continue;
 			}
+			let name_span = info.name.span;
 			let subject = self.types.intern(Type::TypeParam {
 				owner,
 				param_index: param_index as u32,
 			});
-			self.check_bound_bindings(context, subject, &bounds.traits);
+			let diagnostics = self.check_bounds(
+				context.namespace,
+				Subject::new(
+					SourceSpan::new(context.file_id, name_span),
+					subject,
+				),
+				BoundOrigin::TypeParam {
+					owner,
+					index: param_index,
+				},
+				&[],
+			);
+			self.diagnostics.extend(diagnostics);
+			check_written_bounds(
+				&self.items,
+				self.interner,
+				&mut self.diagnostics,
+				&self.items.type_param_info(owner, param_index).bounds,
+			);
 		}
 	}
+}
 
-	/// Validate written TIR constraints after the declaration's bounds are stored.
-	pub(super) fn check_bound_bindings(
-		&mut self,
-		resolve_context: ResolveContext,
-		self_type: TypeIndex,
-		bounds: &[TraitBound],
-	) {
-		for bound in bounds {
-			for binding in &bound.bindings {
-				let context = ResolveContext::new(
-					binding.file_id,
-					resolve_context.namespace,
-				);
-				match &binding.rhs.inner {
-					AssocBindingKind::Equals(ty) => self
-						.check_assoc_type_bounds(
-							context,
-							bound.trait_index,
-							self_type,
-							binding.name,
-							Spanned {
-								inner: *ty,
-								span: binding.rhs.span,
-							},
-						),
-					AssocBindingKind::Bound(required) => {
-						self.check_binding_typeset(
-							context,
-							bound.trait_index,
-							binding,
-							required,
-						);
-						let projection =
-							self.types.intern(Type::AssocTypeProjection {
-								base: self_type,
-								trait_index: bound.trait_index,
-								assoc_name: binding.name.inner,
-							});
-						self.check_bound_bindings(
-							context,
-							projection,
-							&required.traits,
-						);
-					}
-				}
+/// Reject what a `where` clause is not allowed to *say*, as opposed to
+/// what a type must *satisfy*. Only one rule today: a
+/// `where { A: <typeset> }` binding may not add a typeset when the
+/// trait's own `type A: <typeset>` declaration already carries one, since
+/// [`Bounds`] has a single typeset slot and the second would silently
+/// replace it or be dropped.
+///
+/// This is a property of the written bound alone — no subject, no
+/// substitution — so it belongs to the declaration and is reported once
+/// here. Checking it from inside `check_bounds` instead meant re-reporting
+/// it at every call site that passed through the bound, each copy pointing
+/// back at the same declaration.
+fn check_written_bounds(
+	items: &ItemRegistry,
+	interner: &ast::StringInterner,
+	out: &mut Vec<Diagnostic<FileId>>,
+	bounds: &Bounds,
+) {
+	for trait_bound in bounds.traits.iter() {
+		for binding in trait_bound.bindings.iter() {
+			let AssocBindingKind::Bound(inner) = &binding.rhs.inner else {
+				continue;
+			};
+			if inner.typeset.is_some()
+				&& let Some(declared) = items
+					.trait_associated_type(
+						trait_bound.trait_index,
+						binding.name.inner,
+					)
+					.and_then(|assoc| assoc.bounds.typeset)
+			{
+				out.push(report_redundant_typeset_binding(
+					items,
+					interner,
+					binding,
+					trait_bound.trait_index,
+					declared.span,
+				));
 			}
+			check_written_bounds(items, interner, out, inner);
 		}
 	}
+}
 
-	fn check_binding_typeset(
-		&mut self,
-		context: ResolveContext,
-		trait_index: TraitIndex,
-		binding: &AssocBinding,
-		required: &Bounds,
-	) {
-		if required.typeset.is_none() {
-			return;
-		}
-		let Some(declared) = self
-			.items
-			.trait_associated_type(trait_index, binding.name.inner)
-		else {
-			return;
-		};
-		let Some(typeset) = declared.bounds.typeset else {
-			return;
-		};
-		let assoc_name = self.interner.resolve(binding.name.inner).unwrap();
-		let owner = &self.items.traits[usize::from(trait_index)];
-		let trait_name = self.interner.resolve(owner.name.inner).unwrap();
-		self.diagnostics.push(Diagnostic::error()
-			.with_code(DiagnosticCode::MultipleTypesetBounds.code())
-			.with_message(format!("associated type `{assoc_name}` already has a typeset bound from `{trait_name}`'s own declaration"))
-			.with_label(Label::primary(context.file_id, binding.rhs.span)
-				.with_message("this `where` clause cannot add another typeset bound"))
-			.with_label(Label::secondary(owner.file_id, typeset.span)
-				.with_message(format!("`{assoc_name}`'s typeset bound is already declared here"))));
-	}
+fn report_redundant_typeset_binding(
+	items: &ItemRegistry,
+	interner: &ast::StringInterner,
+	binding: &AssocBinding,
+	trait_index: TraitIndex,
+	declared_span: TextSpan,
+) -> Diagnostic<FileId> {
+	let assoc_name = interner.resolve(binding.name.inner).unwrap().to_string();
+	let trait_ = &items.traits[usize::from(trait_index)];
+	let trait_name = interner.resolve(trait_.name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MultipleTypesetBounds.code())
+		.with_message(format!(
+			"associated type `{assoc_name}` already has a typeset bound from `{trait_name}`'s own declaration"
+		))
+		.with_label(
+			Label::primary(binding.file_id, binding.rhs.span)
+				.with_message(
+					"this `where` clause cannot add another typeset bound",
+				),
+		)
+		.with_label(
+			Label::secondary(trait_.file_id, declared_span).with_message(
+				format!(
+					"`{assoc_name}`'s typeset bound is already declared here"
+				),
+			),
+		)
 }

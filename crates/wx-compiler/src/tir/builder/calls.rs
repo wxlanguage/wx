@@ -544,78 +544,33 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		// Collected here instead of pushed straight to `self.diagnostics`:
-		// `param_info` below borrows `self.items` for the rest of each
-		// iteration (both the trait loop and the typeset check use it, with
-		// `continue`s in between), so nothing in this loop can also hold
-		// `&mut self.diagnostics` at the same time. Costs nothing on the
-		// common no-violation path — `Vec::new()` doesn't allocate until the
-		// first `push` — unlike cloning `param_info.bounds` would on every
-		// call regardless of outcome.
-		let mut diagnostics: Vec<Diagnostic<FileId>> = Vec::new();
-		// Every `(arg_ty, trait_bound)` pair whose bound carries at least one
-		// `where { Assoc: Bound }` constraint — deferred and checked in a
-		// second pass below, once the `function_type_params_iter` borrow
-		// (held across this whole loop, same as the reason `diagnostics`
-		// above is collected rather than pushed live) has ended, since
-		// resolving a concrete associated-type value needs
-		// `self.substitute_type` (`&mut self`), not just `&mut
-		// self.diagnostics`. Cloning `trait_bound` only happens here, on
-		// the path that already found a `: Bound` entry — the common case
-		// (no `where` clause at all, or only `= Type` entries) never
-		// allocates for this.
-		let mut assoc_checks: Vec<(TypeIndex, TraitBound)> = Vec::new();
-		// Zipped once, in lockstep, rather than re-deriving `param_info` via
-		// a fresh `.nth(arg_index)` per iteration (which would re-walk the
-		// chained parent/own type-param iterator from the start every time)
-		// — safe now that nothing in this loop needs `&mut self.items`
-		// (diagnostics are collected above instead), so holding this one
-		// iterator borrowed across the whole loop is fine.
-		for (index, (param_info, arg_ty)) in self
+		// Check each type argument against its parameter's declared bounds:
+		// trait and typeset membership plus the `where { Assoc = .. }` /
+		// `where { Assoc: .. }` refinements, recursively (see `check_bounds`).
+		// Only the *identity* of each parameter is collected up front — the
+		// bounds themselves are fetched by `check_bounds` from the origin, so
+		// nothing here holds a borrow of `self.items` across the call.
+		let func_def_id = self.items.functions[usize::from(func_index)].id;
+		let bound_checks: Vec<(TypeIndex, usize, TextSpan)> = self
 			.items
 			.function_type_params_iter(func_index)
 			.zip(type_args.iter().copied())
 			.enumerate()
-		{
-			if arg_ty == TypeIndex::ERROR {
-				continue;
-			}
-			// A declared bound can list several traits (`T: Foo + Bar`) —
-			// report every one `arg_ty` fails, not just the first.
-			for trait_bound in param_info.bounds.traits.iter() {
-				if self.items.type_implements_trait(
-					&self.types,
-					arg_ty,
-					trait_bound.trait_index,
-				) {
-					if trait_bound.bindings.iter().any(|binding| {
-						matches!(&binding.rhs.inner, AssocBindingKind::Bound(_))
-					}) {
-						assoc_checks.push((arg_ty, trait_bound.clone()));
-					}
-					continue;
-				}
-				let type_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(arg_ty)
-					.unwrap_or_default();
-				let trait_name = self
-					.interner
-					.resolve(
-						self.items.traits[usize::from(trait_bound.trait_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				// Narrow the primary span to whichever argument's declared
-				// type is exactly this type param, if one exists (a
-				// turbofish-only or return-only param has none)
-				let arg_span = self.items.functions[usize::from(func_index)]
+			.filter(|&(_, (param, arg_ty))| {
+				arg_ty != TypeIndex::ERROR
+					&& (!param.bounds.traits.is_empty()
+						|| param.bounds.typeset.is_some())
+			})
+			.map(|(index, (_param, arg_ty))| {
+				// Narrow the span to whichever argument's declared type is
+				// exactly this type param, if any (a turbofish-only or
+				// return-only param has none).
+				let span = self.items.functions[usize::from(func_index)]
 					.params
 					.iter()
 					.zip(arguments.iter())
-					.find_map(|(param, arg)| {
-						match self.types.resolve(param.ty.inner) {
+					.find_map(|(decl, arg)| {
+						match self.types.resolve(decl.ty.inner) {
 							Type::TypeParam { param_index, .. }
 								if *param_index as usize == index =>
 							{
@@ -625,203 +580,24 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					})
 					.unwrap_or(call_span);
-				let func_name = self
-					.interner
-					.resolve(
-						self.items.functions[usize::from(func_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				let func_file_id =
-					self.items.functions[usize::from(func_index)].file_id;
-				diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TraitBoundViolation.code())
-						.with_message(format!(
-							"the trait bound `{type_name}: {trait_name}` is not satisfied"
-						))
-						.with_label(
-							Label::primary(
-								ctx.resolve_context.file_id,
-								arg_span,
-							)
-							.with_message(format!(
-								"the trait `{trait_name}` is not implemented for `{type_name}`"
-							)),
-						)
-						.with_label(
-							Label::secondary(func_file_id, trait_bound.span)
-								.with_message(format!(
-									"required by a bound in `{func_name}`"
-								)),
-						),
-				);
-			}
+				(arg_ty, index, span)
+			})
+			.collect();
 
-			let Some(param_bound) = param_info.bounds.typeset else {
-				continue;
-			};
-			let satisfied = self.items.type_in_typeset(
-				&self.types,
-				arg_ty,
-				param_bound.typeset_index,
-			);
-			if !satisfied {
-				let type_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(arg_ty)
-					.unwrap_or_default();
-				let set_name = self
-					.interner
-					.resolve(
-						self.items.typesets
-							[usize::from(param_bound.typeset_index)]
-						.name
-						.inner,
-					)
-					.unwrap();
-				let param_name_str =
-					self.interner.resolve(param_info.name.inner).unwrap();
-				diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TypesetBoundViolation.code())
-						.with_message(format!(
-							"type `{type_name}` is not a member of typeset `{set_name}`"
-						))
-						.with_label(
-							Label::primary(
-								ctx.resolve_context.file_id,
-								call_span,
-							)
-							.with_message(format!(
-								"`{param_name_str}` requires a type from `{set_name}`"
-							)),
-						),
-				);
-			}
-		}
-		self.diagnostics.extend(diagnostics);
-
-		// Second pass: for each `T: Trait where { Assoc: Bound }` the call's
-		// own arguments satisfied `T: Trait` for, also check that `Assoc`'s
-		// *actual* concrete value (looked up through the now-concrete
-		// `arg_ty`'s own impl) satisfies `Bound` — the part
-		// `type_implements_trait` above can't see, since it only knows
-		// about `trait_bound.trait_index` itself, not any associated-type
-		// constraint layered onto it by the callee's `where` clause.
-		for (arg_ty, trait_bound) in assoc_checks {
-			for binding in trait_bound.bindings.iter() {
-				let assoc_name = binding.name.inner;
-				let AssocBindingKind::Bound(required) = &binding.rhs.inner
-				else {
-					continue;
-				};
-				let Some(concrete) = self.concrete_assoc_type_value(
+		for (arg_ty, index, span) in bound_checks {
+			let diagnostics = self.check_bounds(
+				ctx.resolve_context.namespace,
+				Subject::new(
+					SourceSpan::new(ctx.resolve_context.file_id, span),
 					arg_ty,
-					trait_bound.trait_index,
-					assoc_name,
-				) else {
-					continue;
-				};
-				let assoc_name_str = self.interner.resolve(assoc_name).unwrap();
-				let concrete_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(concrete)
-					.unwrap_or_default();
-				let func_name = self
-					.interner
-					.resolve(
-						self.items.functions[usize::from(func_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				let func_file_id =
-					self.items.functions[usize::from(func_index)].file_id;
-
-				for req_trait in required.traits.iter() {
-					if self.items.type_implements_trait(
-						&self.types,
-						concrete,
-						req_trait.trait_index,
-					) {
-						continue;
-					}
-					let req_trait_name = self
-						.interner
-						.resolve(
-							self.items.traits
-								[usize::from(req_trait.trait_index)]
-							.name
-							.inner,
-						)
-						.unwrap();
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(DiagnosticCode::TraitBoundViolation.code())
-							.with_message(format!(
-								"the trait bound `{concrete_name}: {req_trait_name}` is not satisfied"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
-								)
-								.with_message(format!(
-									"associated type `{assoc_name_str}` is `{concrete_name}`, which does not implement `{req_trait_name}`"
-								)),
-							)
-							.with_label(
-								Label::secondary(func_file_id, trait_bound.span)
-									.with_message(format!(
-										"required by a `where` clause on `{func_name}`"
-									)),
-							),
-					);
-				}
-
-				if let Some(req_typeset) = required.typeset
-					&& !self.items.type_in_typeset(
-						&self.types,
-						concrete,
-						req_typeset.typeset_index,
-					) {
-					let set_name = self
-						.interner
-						.resolve(
-							self.items.typesets
-								[usize::from(req_typeset.typeset_index)]
-							.name
-							.inner,
-						)
-						.unwrap();
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::TypesetBoundViolation.code(),
-							)
-							.with_message(format!(
-								"associated type `{assoc_name_str}` (`{concrete_name}`) is not a member of typeset `{set_name}`"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
-								)
-								.with_message(format!(
-									"`{assoc_name_str}` requires a type from `{set_name}`"
-								)),
-							)
-							.with_label(
-								Label::secondary(func_file_id, trait_bound.span)
-									.with_message(format!(
-										"required by a `where` clause on `{func_name}`"
-									)),
-							),
-					);
-				}
-			}
+				),
+				BoundOrigin::TypeParam {
+					owner: TypeParamOwner::Function(func_def_id),
+					index,
+				},
+				&type_args,
+			);
+			self.diagnostics.extend(diagnostics);
 		}
 
 		type_args
@@ -1140,10 +916,8 @@ impl<'ast> Builder<'ast, '_> {
 					vec![TypeIndex::INFER; func.type_param_count()]
 						.into_boxed_slice()
 				} else {
-					let mut padded = vec![
-						TypeIndex::INFER;
-						func.type_param_count()
-					];
+					let mut padded =
+						vec![TypeIndex::INFER; func.type_param_count()];
 					padded[..type_args.len()].copy_from_slice(&type_args);
 					padded.into_boxed_slice()
 				};
@@ -1641,8 +1415,9 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
-				let total_params = self.items.functions[usize::from(func_index)]
-					.type_param_count();
+				let total_params = self.items.functions
+					[usize::from(func_index)]
+				.type_param_count();
 				if parent_args.len() == total_params {
 					return parent_args;
 				}

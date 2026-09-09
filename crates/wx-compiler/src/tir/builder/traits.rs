@@ -91,7 +91,23 @@ impl<'ast> Builder<'ast, '_> {
 				&self.items.traits[usize::from(trait_impl.trait_index)];
 			let mut missing_items: Vec<(SymbolU32, TextSpan)> = Vec::new();
 
-			for (&name, &def_entry) in trait_def.members.iter() {
+			// `members` is a `HashMap`, so its iteration order varies between
+			// runs, and nothing sorts diagnostics downstream — they render in
+			// push order. Every diagnostic this loop emits has its primary
+			// label on the *impl*, so ordering by the impl's own member span
+			// is what makes them come out top-to-bottom in the file the
+			// reader is looking at. Members the impl doesn't provide emit
+			// nothing here (they accumulate into `missing_items`, reported
+			// once and sorted separately), so where they land is irrelevant.
+			let mut members: Vec<(SymbolU32, MemberIndex)> =
+				trait_def.members.iter().map(|(&n, &m)| (n, m)).collect();
+			members.sort_unstable_by_key(|(name, _)| {
+				trait_impl.members.get(name).map_or(u32::MAX, |entry| {
+					entry.def_span(&self.items).span.start
+				})
+			});
+
+			for (name, def_entry) in members {
 				let def_entry = def_entry.entry(&self.items);
 				match trait_impl.members.get(&name).copied() {
 					Some(provided_impl) => match (provided_impl, def_entry) {
@@ -139,9 +155,45 @@ impl<'ast> Builder<'ast, '_> {
 							}
 						}
 						(
-							ImplEntry::AssocType(_impl_index),
+							ImplEntry::AssocType(impl_index),
 							ImplEntry::AssocType(_def_index),
-						) => {}
+						) => {
+							// The impl's written value has to satisfy the
+							// bounds the trait declared for this associated
+							// type (`type Size: PointerSize where { .. }`).
+							// `Self` on this side is already the target type,
+							// not a type parameter — `types.rs` resolves it
+							// that way inside a trait impl — so no
+							// substitution is needed here.
+							if let Some(value) = self.items.associated_types
+								[usize::from(impl_index)]
+							.ty
+							{
+								let diagnostics = BoundChecker::new(
+									TypeCtx {
+										types: &mut self.types,
+										items: &self.items,
+										interner: self.interner,
+									},
+									&self.modules,
+									self.packages,
+								)
+								.check_assoc_value(
+									trait_impl.namespace,
+									trait_impl.trait_index,
+									name,
+									Subject::new(
+										SourceSpan::new(
+											trait_impl.file_id,
+											value.span,
+										),
+										value.inner,
+									),
+									trait_impl.target.inner,
+								);
+								self.diagnostics.extend(diagnostics);
+							}
+						}
 						_ => {
 							missing_items.push((
 								name,
@@ -318,45 +370,6 @@ impl<'ast> Builder<'ast, '_> {
 							),
 					);
 				}
-			}
-		}
-
-		// iterating without borrowing so that there's no issues when trying to borrow again with mutable reference in check_assoc_type_bounds
-		for trait_impl_index in 0..self.items.trait_impls.len() {
-			let trait_impl = &self.items.trait_impls[trait_impl_index];
-			let trait_index = trait_impl.trait_index;
-			let target_type = trait_impl.target.inner;
-			let resolve_context = ResolveContext {
-				file_id: trait_impl.file_id,
-				namespace: trait_impl.namespace,
-			};
-
-			let mut assoc_types: Box<[_]> = self.items.trait_impls
-				[trait_impl_index]
-				.members
-				.values()
-				.copied()
-				.filter_map(|entry| match entry {
-					ImplEntry::AssocType(idx) => {
-						let assoc_type =
-							&self.items.associated_types[usize::from(idx)];
-						Some((assoc_type.name, assoc_type.ty.unwrap()))
-					}
-					_ => None,
-				})
-				.collect();
-			if assoc_types.is_empty() {
-				continue;
-			};
-			assoc_types.sort_unstable_by_key(|(name, _)| name.span.start);
-			for (name, ty) in assoc_types.into_iter() {
-				self.check_assoc_type_bounds(
-					resolve_context,
-					trait_index,
-					target_type,
-					name,
-					ty,
-				);
 			}
 		}
 	}
