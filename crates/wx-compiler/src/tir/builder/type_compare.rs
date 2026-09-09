@@ -582,10 +582,10 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let expected_offset = self.items.functions
 			[usize::from(self.items.expect_function_index(expected_fn))]
-		.inherited_type_param_count as u32;
+		.inherited_type_param_count;
 		let found_offset = self.items.functions
 			[usize::from(self.items.expect_function_index(found_fn))]
-		.inherited_type_param_count as u32;
+		.inherited_type_param_count;
 		if expected_index - expected_offset == found_index - found_offset {
 			TypeComparison::Equivalent
 		} else {

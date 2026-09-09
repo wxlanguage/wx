@@ -151,7 +151,7 @@ impl<'ast> Builder<'ast, '_> {
 					.resolve(callee.ty)
 				{
 					Type::FunctionItem { type_args, .. } => type_args.clone(),
-					_ => vec![TypeIndex::INFER; type_params_len as usize]
+					_ => vec![TypeIndex::INFER; type_params_len]
 						.into_boxed_slice(),
 				};
 
@@ -1137,12 +1137,12 @@ impl<'ast> Builder<'ast, '_> {
 				// call site to resolve. Otherwise (no impl-level generics at
 				// all) start every slot as `INFER`.
 				let type_args = if type_args.is_empty() {
-					vec![TypeIndex::INFER; func.type_param_count() as usize]
+					vec![TypeIndex::INFER; func.type_param_count()]
 						.into_boxed_slice()
 				} else {
 					let mut padded = vec![
 						TypeIndex::INFER;
-						func.type_param_count() as usize
+						func.type_param_count()
 					];
 					padded[..type_args.len()].copy_from_slice(&type_args);
 					padded.into_boxed_slice()
@@ -1642,7 +1642,7 @@ impl<'ast> Builder<'ast, '_> {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
 				let total_params = self.items.functions[usize::from(func_index)]
-					.type_param_count() as usize;
+					.type_param_count();
 				if parent_args.len() == total_params {
 					return parent_args;
 				}
