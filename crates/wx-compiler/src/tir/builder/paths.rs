@@ -674,7 +674,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// bare reference first and separately re-resolve it with real args
 	/// after, keeps this the one place that both looks up the symbol and
 	/// applies its arguments.
-	/// Searches `base`'s own declared bound traits (via `abstract_type_bounds`
+	/// Searches `base`'s own declared bound traits (via `effective_bounds`
 	/// — works for both a `TypeParam` and a nested `AssocTypeProjection`) for
 	/// ones declaring an associated type named `member_name`, returning the
 	/// resulting `AssocTypeProjection`. `Ok(None)` means no bound trait
@@ -821,7 +821,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			Type::TypeParam { .. } => {
-				// `abstract_type_bounds` already dispatches on `TypeParam`
+				// `effective_bounds` already dispatches on `TypeParam`
 				// vs. the `AssocTypeProjection` case below internally, so
 				// both arms share `resolve_assoc_type_via_bounds` for their
 				// candidate search.

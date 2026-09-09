@@ -588,8 +588,8 @@ impl<'ast> Builder<'ast, '_> {
 					arg_ty,
 					trait_bound.trait_index,
 				) {
-					if trait_bound.bindings.iter().any(|(_, kind)| {
-						matches!(kind, AssocBindingKind::Bound(_))
+					if trait_bound.bindings.iter().any(|binding| {
+						matches!(&binding.rhs.inner, AssocBindingKind::Bound(_))
 					}) {
 						assoc_checks.push((arg_ty, trait_bound.clone()));
 					}
@@ -711,19 +711,20 @@ impl<'ast> Builder<'ast, '_> {
 		// about `trait_bound.trait_index` itself, not any associated-type
 		// constraint layered onto it by the callee's `where` clause.
 		for (arg_ty, trait_bound) in assoc_checks {
-			for (assoc_name, kind) in trait_bound.bindings.iter() {
-				let AssocBindingKind::Bound(required) = kind else {
+			for binding in trait_bound.bindings.iter() {
+				let assoc_name = binding.name.inner;
+				let AssocBindingKind::Bound(required) = &binding.rhs.inner
+				else {
 					continue;
 				};
 				let Some(concrete) = self.concrete_assoc_type_value(
 					arg_ty,
 					trait_bound.trait_index,
-					*assoc_name,
+					assoc_name,
 				) else {
 					continue;
 				};
-				let assoc_name_str =
-					self.interner.resolve(*assoc_name).unwrap();
+				let assoc_name_str = self.interner.resolve(assoc_name).unwrap();
 				let concrete_name = self
 					.formatter(ctx.resolve_context.namespace)
 					.display_type(concrete)
@@ -1502,7 +1503,7 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Result<(ImplEntry, Box<[TypeIndex]>), TraitMemberError> {
 		if self
 			.items
-			.abstract_type_bounds(&self.types, target_type)
+			.effective_bounds(&self.types, target_type)
 			.is_some()
 		{
 			if !self.bound_traits_contains(target_type, required_trait) {

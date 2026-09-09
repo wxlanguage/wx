@@ -46,8 +46,8 @@ impl<'ast> Builder<'ast, '_> {
 	fn bound_trait_roots(&mut self, receiver: TypeIndex) -> Vec<TraitIndex> {
 		let roots: Vec<_> = self
 			.items
-			.abstract_type_bounds(&self.types, receiver)
-			.map(|bounds| bounds.traits.iter().map(|b| b.trait_index).collect())
+			.effective_bounds(&self.types, receiver)
+			.map(|bounds| bounds.traits().map(|b| b.trait_index).collect())
 			.unwrap_or_default();
 		for &root in &roots {
 			self.ensure_trait_supertraits(root);
@@ -65,19 +65,17 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	/// Whether `needle` is one of `receiver`'s bounds, directly or through a
-	/// supertrait. Checks the directly declared bounds first — the common
-	/// case, and allocation-free — before paying for the supertrait walk.
+	/// supertrait. Checks effective direct bounds before walking supertraits.
 	pub(super) fn bound_traits_contains(
 		&mut self,
 		receiver: TypeIndex,
 		needle: TraitIndex,
 	) -> bool {
-		let Some(bounds) =
-			self.items.abstract_type_bounds(&self.types, receiver)
+		let Some(bounds) = self.items.effective_bounds(&self.types, receiver)
 		else {
 			return false;
 		};
-		if bounds.traits.iter().any(|b| b.trait_index == needle) {
+		if bounds.traits().any(|b| b.trait_index == needle) {
 			return true;
 		}
 		let roots = self.bound_trait_roots(receiver);

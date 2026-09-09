@@ -1033,11 +1033,14 @@ impl<'ast> Builder<'ast, '_> {
 						let a = &self.items.type_aliases[usize::from(idx)];
 						SourceSpan::new(a.file_id, a.name.span)
 					}
+					ItemIndex::AssocType(idx) => {
+						let t = &self.items.associated_types[usize::from(idx)];
+						SourceSpan::new(t.file_id, t.name.span)
+					}
 					// TODO: chaugh panic when writing impl for trait, need to revisit this
 					ItemIndex::TypeSet(_)
 					| ItemIndex::Trait(_)
-					| ItemIndex::TraitImpl(_)
-					| ItemIndex::AssocType(_) => unreachable!(
+					| ItemIndex::TraitImpl(_) => unreachable!(
 						"these kinds never install a Pending symbol"
 					),
 				};

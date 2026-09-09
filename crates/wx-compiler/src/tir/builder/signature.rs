@@ -339,7 +339,7 @@ impl<'ast> Builder<'ast, '_> {
 					block_index,
 				),
 			AstNodeRef::Trait { trait_index, item } => {
-				self.signature_trait(resolve_context, trait_index, item)
+				self.signature_trait(trait_index, item)
 			}
 			AstNodeRef::TypeSet {
 				typeset_index,

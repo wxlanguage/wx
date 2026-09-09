@@ -603,16 +603,15 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		assoc_name: SymbolU32,
 	) -> Option<TypeIndex> {
-		let bounds = self.items.abstract_type_bounds(&self.types, base)?;
-		let trait_bound = bounds
-			.traits
-			.iter()
-			.find(|bound| bound.trait_index == trait_index)?;
-		trait_bound
-			.bindings
-			.iter()
-			.find_map(|(name, kind)| match kind {
-				AssocBindingKind::Equals(ty) if *name == assoc_name => {
+		let bounds = self.items.effective_bounds(&self.types, base)?;
+		bounds
+			.traits()
+			.filter(|bound| bound.trait_index == trait_index)
+			.flat_map(|bound| bound.bindings.iter())
+			.find_map(|binding| match &binding.rhs.inner {
+				AssocBindingKind::Equals(ty)
+					if binding.name.inner == assoc_name =>
+				{
 					Some(*ty)
 				}
 				_ => None,

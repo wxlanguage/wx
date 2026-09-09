@@ -879,6 +879,14 @@ types:
           - 17
           - 16
         params_count: 1
+  - AssocTypeProjection:
+      trait_index: 12
+      assoc_name: 182
+      base: 115
+  - AssocTypeProjection:
+      trait_index: 13
+      assoc_name: 184
+      base: 116
   - FunctionItem:
       id: 51
       type_args: []
@@ -1134,12 +1142,12 @@ types:
   - FunctionItem:
       id: 431
       type_args:
-        - 265
+        - 267
         - 1
   - FunctionItem:
       id: 432
       type_args:
-        - 265
+        - 267
         - 1
   - TypeParam:
       owner:
@@ -1148,12 +1156,12 @@ types:
   - FunctionItem:
       id: 432
       type_args:
-        - 268
+        - 270
         - 1
   - FunctionItem:
       id: 431
       type_args:
-        - 268
+        - 270
         - 1
   - Struct:
       struct_index: 0
@@ -6284,8 +6292,18 @@ items:
             traits:
               - trait_index: 14
                 bindings:
-                  - - 59
-                    - Equals: 128
+                  - file_id: 0
+                    name:
+                      inner: 59
+                      span:
+                        start: 24511
+                        end: 24515
+                    rhs:
+                      inner:
+                        Equals: 128
+                      span:
+                        start: 24518
+                        end: 24522
                 span:
                   start: 24496
                   end: 24524
@@ -6304,8 +6322,18 @@ items:
             traits:
               - trait_index: 14
                 bindings:
-                  - - 59
-                    - Equals: 128
+                  - file_id: 0
+                    name:
+                      inner: 59
+                      span:
+                        start: 24553
+                        end: 24557
+                    rhs:
+                      inner:
+                        Equals: 128
+                      span:
+                        start: 24560
+                        end: 24564
                 span:
                   start: 24538
                   end: 24566
@@ -17604,7 +17632,7 @@ items:
                     kind:
                       Function:
                         id: 51
-                    ty: 183
+                    ty: 185
                     span:
                       start: 6330
                       end: 6339
@@ -17661,7 +17689,7 @@ items:
                     kind:
                       Function:
                         id: 45
-                    ty: 184
+                    ty: 186
                     span:
                       start: 6406
                       end: 6413
@@ -17718,7 +17746,7 @@ items:
                     kind:
                       Function:
                         id: 43
-                    ty: 185
+                    ty: 187
                     span:
                       start: 6481
                       end: 6489
@@ -17775,7 +17803,7 @@ items:
                     kind:
                       Function:
                         id: 47
-                    ty: 186
+                    ty: 188
                     span:
                       start: 6558
                       end: 6567
@@ -17832,7 +17860,7 @@ items:
                     kind:
                       Function:
                         id: 49
-                    ty: 187
+                    ty: 189
                     span:
                       start: 6635
                       end: 6643
@@ -17889,7 +17917,7 @@ items:
                     kind:
                       Function:
                         id: 53
-                    ty: 188
+                    ty: 190
                     span:
                       start: 6714
                       end: 6725
@@ -17958,7 +17986,7 @@ items:
                     kind:
                       Function:
                         id: 55
-                    ty: 189
+                    ty: 191
                     span:
                       start: 6805
                       end: 6812
@@ -18035,7 +18063,7 @@ items:
                     kind:
                       Function:
                         id: 57
-                    ty: 190
+                    ty: 192
                     span:
                       start: 6899
                       end: 6906
@@ -18112,7 +18140,7 @@ items:
                     kind:
                       Function:
                         id: 59
-                    ty: 191
+                    ty: 193
                     span:
                       start: 6997
                       end: 7009
@@ -18177,7 +18205,7 @@ items:
                     kind:
                       Function:
                         id: 119
-                    ty: 192
+                    ty: 194
                     span:
                       start: 7085
                       end: 7104
@@ -18234,7 +18262,7 @@ items:
                     kind:
                       Function:
                         id: 120
-                    ty: 193
+                    ty: 195
                     span:
                       start: 7189
                       end: 7208
@@ -18291,7 +18319,7 @@ items:
                     kind:
                       Function:
                         id: 117
-                    ty: 194
+                    ty: 196
                     span:
                       start: 7285
                       end: 7300
@@ -18348,7 +18376,7 @@ items:
                     kind:
                       Function:
                         id: 109
-                    ty: 195
+                    ty: 197
                     span:
                       start: 7369
                       end: 7382
@@ -18405,7 +18433,7 @@ items:
                     kind:
                       Function:
                         id: 110
-                    ty: 196
+                    ty: 198
                     span:
                       start: 7451
                       end: 7464
@@ -18462,7 +18490,7 @@ items:
                     kind:
                       Function:
                         id: 113
-                    ty: 197
+                    ty: 199
                     span:
                       start: 7533
                       end: 7546
@@ -18519,7 +18547,7 @@ items:
                     kind:
                       Function:
                         id: 114
-                    ty: 198
+                    ty: 200
                     span:
                       start: 7615
                       end: 7628
@@ -18576,7 +18604,7 @@ items:
                     kind:
                       Function:
                         id: 52
-                    ty: 199
+                    ty: 201
                     span:
                       start: 8053
                       end: 8062
@@ -18633,7 +18661,7 @@ items:
                     kind:
                       Function:
                         id: 46
-                    ty: 200
+                    ty: 202
                     span:
                       start: 8129
                       end: 8136
@@ -18690,7 +18718,7 @@ items:
                     kind:
                       Function:
                         id: 44
-                    ty: 201
+                    ty: 203
                     span:
                       start: 8204
                       end: 8212
@@ -18747,7 +18775,7 @@ items:
                     kind:
                       Function:
                         id: 48
-                    ty: 202
+                    ty: 204
                     span:
                       start: 8281
                       end: 8290
@@ -18804,7 +18832,7 @@ items:
                     kind:
                       Function:
                         id: 50
-                    ty: 203
+                    ty: 205
                     span:
                       start: 8358
                       end: 8366
@@ -18861,7 +18889,7 @@ items:
                     kind:
                       Function:
                         id: 54
-                    ty: 204
+                    ty: 206
                     span:
                       start: 8437
                       end: 8448
@@ -18930,7 +18958,7 @@ items:
                     kind:
                       Function:
                         id: 56
-                    ty: 205
+                    ty: 207
                     span:
                       start: 8528
                       end: 8535
@@ -19007,7 +19035,7 @@ items:
                     kind:
                       Function:
                         id: 58
-                    ty: 206
+                    ty: 208
                     span:
                       start: 8622
                       end: 8629
@@ -19084,7 +19112,7 @@ items:
                     kind:
                       Function:
                         id: 60
-                    ty: 207
+                    ty: 209
                     span:
                       start: 8720
                       end: 8732
@@ -19149,7 +19177,7 @@ items:
                     kind:
                       Function:
                         id: 121
-                    ty: 208
+                    ty: 210
                     span:
                       start: 8808
                       end: 8827
@@ -19206,7 +19234,7 @@ items:
                     kind:
                       Function:
                         id: 122
-                    ty: 209
+                    ty: 211
                     span:
                       start: 8912
                       end: 8931
@@ -19263,7 +19291,7 @@ items:
                     kind:
                       Function:
                         id: 118
-                    ty: 210
+                    ty: 212
                     span:
                       start: 9007
                       end: 9021
@@ -19320,7 +19348,7 @@ items:
                     kind:
                       Function:
                         id: 111
-                    ty: 211
+                    ty: 213
                     span:
                       start: 9090
                       end: 9103
@@ -19377,7 +19405,7 @@ items:
                     kind:
                       Function:
                         id: 112
-                    ty: 212
+                    ty: 214
                     span:
                       start: 9172
                       end: 9185
@@ -19434,7 +19462,7 @@ items:
                     kind:
                       Function:
                         id: 115
-                    ty: 213
+                    ty: 215
                     span:
                       start: 9254
                       end: 9267
@@ -19491,7 +19519,7 @@ items:
                     kind:
                       Function:
                         id: 116
-                    ty: 214
+                    ty: 216
                     span:
                       start: 9336
                       end: 9349
@@ -19548,7 +19576,7 @@ items:
                     kind:
                       Function:
                         id: 101
-                    ty: 215
+                    ty: 217
                     span:
                       start: 9431
                       end: 9446
@@ -19605,7 +19633,7 @@ items:
                     kind:
                       Function:
                         id: 105
-                    ty: 216
+                    ty: 218
                     span:
                       start: 9515
                       end: 9530
@@ -19674,7 +19702,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 9625
                       end: 9632
@@ -19751,7 +19779,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 9732
                       end: 9739
@@ -19828,7 +19856,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 9839
                       end: 9846
@@ -19905,7 +19933,7 @@ items:
                     kind:
                       Function:
                         id: 77
-                    ty: 220
+                    ty: 222
                     span:
                       start: 9946
                       end: 9953
@@ -19982,7 +20010,7 @@ items:
                     kind:
                       Function:
                         id: 83
-                    ty: 221
+                    ty: 223
                     span:
                       start: 10053
                       end: 10060
@@ -20047,7 +20075,7 @@ items:
                     kind:
                       Function:
                         id: 61
-                    ty: 222
+                    ty: 224
                     span:
                       start: 10149
                       end: 10156
@@ -20116,7 +20144,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 10257
                       end: 10267
@@ -20193,7 +20221,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 10371
                       end: 10380
@@ -20270,7 +20298,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 10486
                       end: 10496
@@ -20347,7 +20375,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 10596
                       end: 10603
@@ -20424,7 +20452,7 @@ items:
                     kind:
                       Function:
                         id: 95
-                    ty: 227
+                    ty: 229
                     span:
                       start: 10703
                       end: 10710
@@ -20489,7 +20517,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 10805
                       end: 10815
@@ -20546,7 +20574,7 @@ items:
                     kind:
                       Function:
                         id: 102
-                    ty: 229
+                    ty: 231
                     span:
                       start: 10897
                       end: 10912
@@ -20603,7 +20631,7 @@ items:
                     kind:
                       Function:
                         id: 106
-                    ty: 230
+                    ty: 232
                     span:
                       start: 10981
                       end: 10996
@@ -20672,7 +20700,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 11091
                       end: 11098
@@ -20749,7 +20777,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 11219
                       end: 11226
@@ -20826,7 +20854,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 11347
                       end: 11354
@@ -20903,7 +20931,7 @@ items:
                     kind:
                       Function:
                         id: 78
-                    ty: 231
+                    ty: 233
                     span:
                       start: 11475
                       end: 11482
@@ -20980,7 +21008,7 @@ items:
                     kind:
                       Function:
                         id: 84
-                    ty: 232
+                    ty: 234
                     span:
                       start: 11582
                       end: 11589
@@ -21057,7 +21085,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 11695
                       end: 11705
@@ -21134,7 +21162,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 11830
                       end: 11839
@@ -21211,7 +21239,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 11966
                       end: 11976
@@ -21288,7 +21316,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 12097
                       end: 12104
@@ -21365,7 +21393,7 @@ items:
                     kind:
                       Function:
                         id: 96
-                    ty: 233
+                    ty: 235
                     span:
                       start: 12225
                       end: 12232
@@ -21430,7 +21458,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 12327
                       end: 12337
@@ -21487,7 +21515,7 @@ items:
                     kind:
                       Function:
                         id: 103
-                    ty: 234
+                    ty: 236
                     span:
                       start: 12433
                       end: 12448
@@ -21544,7 +21572,7 @@ items:
                     kind:
                       Function:
                         id: 107
-                    ty: 235
+                    ty: 237
                     span:
                       start: 12517
                       end: 12532
@@ -21613,7 +21641,7 @@ items:
                     kind:
                       Function:
                         id: 66
-                    ty: 236
+                    ty: 238
                     span:
                       start: 12627
                       end: 12634
@@ -21690,7 +21718,7 @@ items:
                     kind:
                       Function:
                         id: 70
-                    ty: 237
+                    ty: 239
                     span:
                       start: 12734
                       end: 12741
@@ -21767,7 +21795,7 @@ items:
                     kind:
                       Function:
                         id: 74
-                    ty: 238
+                    ty: 240
                     span:
                       start: 12841
                       end: 12848
@@ -21844,7 +21872,7 @@ items:
                     kind:
                       Function:
                         id: 79
-                    ty: 239
+                    ty: 241
                     span:
                       start: 12948
                       end: 12955
@@ -21921,7 +21949,7 @@ items:
                     kind:
                       Function:
                         id: 85
-                    ty: 240
+                    ty: 242
                     span:
                       start: 13055
                       end: 13062
@@ -21986,7 +22014,7 @@ items:
                     kind:
                       Function:
                         id: 62
-                    ty: 241
+                    ty: 243
                     span:
                       start: 13151
                       end: 13158
@@ -22055,7 +22083,7 @@ items:
                     kind:
                       Function:
                         id: 88
-                    ty: 242
+                    ty: 244
                     span:
                       start: 13259
                       end: 13269
@@ -22132,7 +22160,7 @@ items:
                     kind:
                       Function:
                         id: 90
-                    ty: 243
+                    ty: 245
                     span:
                       start: 13373
                       end: 13382
@@ -22209,7 +22237,7 @@ items:
                     kind:
                       Function:
                         id: 92
-                    ty: 244
+                    ty: 246
                     span:
                       start: 13488
                       end: 13498
@@ -22286,7 +22314,7 @@ items:
                     kind:
                       Function:
                         id: 94
-                    ty: 245
+                    ty: 247
                     span:
                       start: 13598
                       end: 13605
@@ -22363,7 +22391,7 @@ items:
                     kind:
                       Function:
                         id: 97
-                    ty: 246
+                    ty: 248
                     span:
                       start: 13705
                       end: 13712
@@ -22428,7 +22456,7 @@ items:
                     kind:
                       Function:
                         id: 100
-                    ty: 247
+                    ty: 249
                     span:
                       start: 13807
                       end: 13817
@@ -22485,7 +22513,7 @@ items:
                     kind:
                       Function:
                         id: 104
-                    ty: 248
+                    ty: 250
                     span:
                       start: 13899
                       end: 13914
@@ -22542,7 +22570,7 @@ items:
                     kind:
                       Function:
                         id: 108
-                    ty: 249
+                    ty: 251
                     span:
                       start: 13983
                       end: 13998
@@ -22611,7 +22639,7 @@ items:
                     kind:
                       Function:
                         id: 66
-                    ty: 236
+                    ty: 238
                     span:
                       start: 14093
                       end: 14100
@@ -22688,7 +22716,7 @@ items:
                     kind:
                       Function:
                         id: 70
-                    ty: 237
+                    ty: 239
                     span:
                       start: 14221
                       end: 14228
@@ -22765,7 +22793,7 @@ items:
                     kind:
                       Function:
                         id: 74
-                    ty: 238
+                    ty: 240
                     span:
                       start: 14349
                       end: 14356
@@ -22842,7 +22870,7 @@ items:
                     kind:
                       Function:
                         id: 80
-                    ty: 250
+                    ty: 252
                     span:
                       start: 14477
                       end: 14484
@@ -22919,7 +22947,7 @@ items:
                     kind:
                       Function:
                         id: 86
-                    ty: 251
+                    ty: 253
                     span:
                       start: 14584
                       end: 14591
@@ -22996,7 +23024,7 @@ items:
                     kind:
                       Function:
                         id: 88
-                    ty: 242
+                    ty: 244
                     span:
                       start: 14697
                       end: 14707
@@ -23073,7 +23101,7 @@ items:
                     kind:
                       Function:
                         id: 90
-                    ty: 243
+                    ty: 245
                     span:
                       start: 14832
                       end: 14841
@@ -23150,7 +23178,7 @@ items:
                     kind:
                       Function:
                         id: 92
-                    ty: 244
+                    ty: 246
                     span:
                       start: 14968
                       end: 14978
@@ -23227,7 +23255,7 @@ items:
                     kind:
                       Function:
                         id: 94
-                    ty: 245
+                    ty: 247
                     span:
                       start: 15099
                       end: 15106
@@ -23304,7 +23332,7 @@ items:
                     kind:
                       Function:
                         id: 98
-                    ty: 252
+                    ty: 254
                     span:
                       start: 15227
                       end: 15234
@@ -23369,7 +23397,7 @@ items:
                     kind:
                       Function:
                         id: 100
-                    ty: 247
+                    ty: 249
                     span:
                       start: 15329
                       end: 15339
@@ -23438,7 +23466,7 @@ items:
                     kind:
                       Function:
                         id: 67
-                    ty: 253
+                    ty: 255
                     span:
                       start: 15448
                       end: 15455
@@ -23515,7 +23543,7 @@ items:
                     kind:
                       Function:
                         id: 71
-                    ty: 254
+                    ty: 256
                     span:
                       start: 15555
                       end: 15562
@@ -23592,7 +23620,7 @@ items:
                     kind:
                       Function:
                         id: 75
-                    ty: 255
+                    ty: 257
                     span:
                       start: 15662
                       end: 15669
@@ -23669,7 +23697,7 @@ items:
                     kind:
                       Function:
                         id: 81
-                    ty: 256
+                    ty: 258
                     span:
                       start: 15769
                       end: 15776
@@ -23734,7 +23762,7 @@ items:
                     kind:
                       Function:
                         id: 63
-                    ty: 257
+                    ty: 259
                     span:
                       start: 15865
                       end: 15872
@@ -23921,7 +23949,7 @@ items:
                     kind:
                       Function:
                         id: 68
-                    ty: 258
+                    ty: 260
                     span:
                       start: 16089
                       end: 16096
@@ -23998,7 +24026,7 @@ items:
                     kind:
                       Function:
                         id: 72
-                    ty: 259
+                    ty: 261
                     span:
                       start: 16196
                       end: 16203
@@ -24075,7 +24103,7 @@ items:
                     kind:
                       Function:
                         id: 76
-                    ty: 260
+                    ty: 262
                     span:
                       start: 16303
                       end: 16310
@@ -24152,7 +24180,7 @@ items:
                     kind:
                       Function:
                         id: 82
-                    ty: 261
+                    ty: 263
                     span:
                       start: 16410
                       end: 16417
@@ -24217,7 +24245,7 @@ items:
                     kind:
                       Function:
                         id: 64
-                    ty: 262
+                    ty: 264
                     span:
                       start: 16506
                       end: 16513
@@ -24404,7 +24432,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 16729
                       end: 16736
@@ -24481,7 +24509,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 16855
                       end: 16862
@@ -24558,7 +24586,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 16981
                       end: 16988
@@ -24635,7 +24663,7 @@ items:
                     kind:
                       Function:
                         id: 77
-                    ty: 220
+                    ty: 222
                     span:
                       start: 17107
                       end: 17114
@@ -24712,7 +24740,7 @@ items:
                     kind:
                       Function:
                         id: 83
-                    ty: 221
+                    ty: 223
                     span:
                       start: 17233
                       end: 17240
@@ -24777,7 +24805,7 @@ items:
                     kind:
                       Function:
                         id: 61
-                    ty: 222
+                    ty: 224
                     span:
                       start: 17348
                       end: 17355
@@ -24846,7 +24874,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 17468
                       end: 17478
@@ -24923,7 +24951,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 17601
                       end: 17610
@@ -25000,7 +25028,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 17735
                       end: 17745
@@ -25077,7 +25105,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 17864
                       end: 17871
@@ -25154,7 +25182,7 @@ items:
                     kind:
                       Function:
                         id: 95
-                    ty: 227
+                    ty: 229
                     span:
                       start: 17990
                       end: 17997
@@ -25219,7 +25247,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 18111
                       end: 18121
@@ -25288,7 +25316,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 18228
                       end: 18235
@@ -25365,7 +25393,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 18354
                       end: 18361
@@ -25442,7 +25470,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 18480
                       end: 18487
@@ -25519,7 +25547,7 @@ items:
                     kind:
                       Function:
                         id: 78
-                    ty: 231
+                    ty: 233
                     span:
                       start: 18606
                       end: 18613
@@ -25596,7 +25624,7 @@ items:
                     kind:
                       Function:
                         id: 84
-                    ty: 232
+                    ty: 234
                     span:
                       start: 18732
                       end: 18739
@@ -25673,7 +25701,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 18864
                       end: 18874
@@ -25750,7 +25778,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 18997
                       end: 19006
@@ -25827,7 +25855,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 19131
                       end: 19141
@@ -25904,7 +25932,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 19260
                       end: 19267
@@ -25981,7 +26009,7 @@ items:
                     kind:
                       Function:
                         id: 96
-                    ty: 233
+                    ty: 235
                     span:
                       start: 19386
                       end: 19393
@@ -26046,7 +26074,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 19507
                       end: 19517
@@ -26115,7 +26143,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 19625
                       end: 19632
@@ -26192,7 +26220,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 19753
                       end: 19760
@@ -26269,7 +26297,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 19881
                       end: 19888
@@ -26346,7 +26374,7 @@ items:
                     kind:
                       Function:
                         id: 77
-                    ty: 220
+                    ty: 222
                     span:
                       start: 20009
                       end: 20016
@@ -26423,7 +26451,7 @@ items:
                     kind:
                       Function:
                         id: 83
-                    ty: 221
+                    ty: 223
                     span:
                       start: 20137
                       end: 20144
@@ -26488,7 +26516,7 @@ items:
                     kind:
                       Function:
                         id: 61
-                    ty: 222
+                    ty: 224
                     span:
                       start: 20254
                       end: 20261
@@ -26557,7 +26585,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 20376
                       end: 20386
@@ -26634,7 +26662,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 20511
                       end: 20520
@@ -26711,7 +26739,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 20647
                       end: 20657
@@ -26788,7 +26816,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 20778
                       end: 20785
@@ -26865,7 +26893,7 @@ items:
                     kind:
                       Function:
                         id: 95
-                    ty: 227
+                    ty: 229
                     span:
                       start: 20906
                       end: 20913
@@ -26930,7 +26958,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 21029
                       end: 21039
@@ -26999,7 +27027,7 @@ items:
                     kind:
                       Function:
                         id: 65
-                    ty: 217
+                    ty: 219
                     span:
                       start: 21148
                       end: 21155
@@ -27076,7 +27104,7 @@ items:
                     kind:
                       Function:
                         id: 69
-                    ty: 218
+                    ty: 220
                     span:
                       start: 21276
                       end: 21283
@@ -27153,7 +27181,7 @@ items:
                     kind:
                       Function:
                         id: 73
-                    ty: 219
+                    ty: 221
                     span:
                       start: 21404
                       end: 21411
@@ -27230,7 +27258,7 @@ items:
                     kind:
                       Function:
                         id: 78
-                    ty: 231
+                    ty: 233
                     span:
                       start: 21532
                       end: 21539
@@ -27307,7 +27335,7 @@ items:
                     kind:
                       Function:
                         id: 84
-                    ty: 232
+                    ty: 234
                     span:
                       start: 21660
                       end: 21667
@@ -27384,7 +27412,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 21794
                       end: 21804
@@ -27461,7 +27489,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 21929
                       end: 21938
@@ -27538,7 +27566,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 22065
                       end: 22075
@@ -27615,7 +27643,7 @@ items:
                     kind:
                       Function:
                         id: 93
-                    ty: 226
+                    ty: 228
                     span:
                       start: 22196
                       end: 22203
@@ -27692,7 +27720,7 @@ items:
                     kind:
                       Function:
                         id: 96
-                    ty: 233
+                    ty: 235
                     span:
                       start: 22324
                       end: 22331
@@ -27757,7 +27785,7 @@ items:
                     kind:
                       Function:
                         id: 99
-                    ty: 228
+                    ty: 230
                     span:
                       start: 22447
                       end: 22457
@@ -27826,7 +27854,7 @@ items:
                     kind:
                       Function:
                         id: 87
-                    ty: 223
+                    ty: 225
                     span:
                       start: 22573
                       end: 22583
@@ -27903,7 +27931,7 @@ items:
                     kind:
                       Function:
                         id: 89
-                    ty: 224
+                    ty: 226
                     span:
                       start: 22710
                       end: 22719
@@ -27980,7 +28008,7 @@ items:
                     kind:
                       Function:
                         id: 91
-                    ty: 225
+                    ty: 227
                     span:
                       start: 22848
                       end: 22858
@@ -28240,7 +28268,7 @@ items:
                         GenericCall:
                           id: 431
                           type_args:
-                            - 265
+                            - 267
                             - 23
                           arguments: []
                       ty: 146
@@ -28251,7 +28279,7 @@ items:
                         GenericCall:
                           id: 432
                           type_args:
-                            - 265
+                            - 267
                             - 23
                           arguments: []
                       ty: 146
@@ -28310,7 +28338,7 @@ items:
                                 GenericCall:
                                   id: 431
                                   type_args:
-                                    - 268
+                                    - 270
                                     - 23
                                   arguments: []
                               ty: 146
@@ -28333,7 +28361,7 @@ items:
                         GenericCall:
                           id: 432
                           type_args:
-                            - 268
+                            - 270
                             - 23
                           arguments: []
                       ty: 146
@@ -28688,7 +28716,7 @@ items:
                               span:
                                 start: 27017
                                 end: 27040
-                      ty: 274
+                      ty: 276
                       span:
                         start: 27003
                         end: 27041
@@ -34983,27 +35011,11 @@ modules:
                 trait_index: 11
             visibility: Public
         ? - Type
-          - 55
-        : Resolved:
-            kind:
-              TraitAssocType:
-                trait_index: 15
-                assoc_name: 55
-            visibility: Public
-        ? - Type
           - 56
         : Resolved:
             kind:
               Trait:
                 trait_index: 14
-            visibility: Public
-        ? - Type
-          - 59
-        : Resolved:
-            kind:
-              TraitAssocType:
-                trait_index: 14
-                assoc_name: 59
             visibility: Public
         ? - Type
           - 180
@@ -35020,27 +35032,11 @@ modules:
                 trait_index: 12
             visibility: Public
         ? - Type
-          - 182
-        : Resolved:
-            kind:
-              TraitAssocType:
-                trait_index: 12
-                assoc_name: 182
-            visibility: Public
-        ? - Type
           - 183
         : Resolved:
             kind:
               Trait:
                 trait_index: 13
-            visibility: Public
-        ? - Type
-          - 184
-        : Resolved:
-            kind:
-              TraitAssocType:
-                trait_index: 13
-                assoc_name: 184
             visibility: Public
         ? - Type
           - 193

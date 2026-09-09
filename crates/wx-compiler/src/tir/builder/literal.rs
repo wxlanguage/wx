@@ -559,8 +559,8 @@ impl<'ast> Builder<'ast, '_> {
 			Ok(())
 		} else if let Some(typeset_index) = self
 			.items
-			.abstract_type_bounds(&self.types, target_idx)
-			.and_then(|bounds| bounds.typeset)
+			.effective_bounds(&self.types, target_idx)
+			.and_then(|bounds| bounds.typeset())
 			.map(|typeset_bound| typeset_bound.typeset_index)
 		{
 			let ts = &self.items.typesets[usize::from(typeset_index)];

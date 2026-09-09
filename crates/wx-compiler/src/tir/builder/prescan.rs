@@ -515,12 +515,9 @@ impl<'ast> Builder<'ast, '_> {
 								},
 							});
 						}
-						ast::TraitItem::AssociatedType { id, name, .. } => {
-							self.insert_pending(
-								namespace,
-								(SymbolNamespace::Type, name.inner),
-								*id,
-							);
+						ast::TraitItem::AssociatedType { id, .. } => {
+							// Associated types live in the trait's member table,
+							// never in the enclosing module's type namespace.
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
@@ -560,6 +557,7 @@ impl<'ast> Builder<'ast, '_> {
 				let block_index = self.items.push_inherent_impl(InherentImpl {
 					id: *impl_id,
 					file_id,
+					namespace,
 					type_params: type_params
 						.iter()
 						.map(|tp| TypeParamInfo::new(tp.name))

@@ -270,13 +270,11 @@ impl<'ast> Builder<'ast, '_> {
 				// is kept; every later one is diagnosed and dropped rather
 				// than resolved — checked directly against this same Vec,
 				// since there's only the one list to check against now.
-				let mut bindings: Vec<(SymbolU32, AssocBindingKind)> =
-					Vec::new();
+				let mut bindings: Vec<AssocBinding> = Vec::new();
 				for binding in where_bindings.iter() {
-					if let Some((_, _)) = bindings
-						.iter()
-						.find(|(name, _)| *name == binding.name.inner)
-					{
+					if bindings.iter().any(|resolved| {
+						resolved.name.inner == binding.name.inner
+					}) {
 						let assoc_name_str =
 							self.interner.resolve(binding.name.inner).unwrap();
 						self.diagnostics.push(
@@ -320,10 +318,14 @@ impl<'ast> Builder<'ast, '_> {
 						ast::AssocTypeBindingKind::Equals(ty) => {
 							let rhs_ty =
 								self.resolve_type(resolve_context, scope, ty);
-							bindings.push((
-								binding.name.inner,
-								AssocBindingKind::Equals(rhs_ty),
-							));
+							bindings.push(AssocBinding {
+								file_id: resolve_context.file_id,
+								name: binding.name,
+								rhs: Spanned {
+									inner: AssocBindingKind::Equals(rhs_ty),
+									span: ty.span,
+								},
+							});
 						}
 						ast::AssocTypeBindingKind::Bound(rhs_bound) => {
 							let rhs_bounds = self.resolve_bounds(
@@ -331,115 +333,14 @@ impl<'ast> Builder<'ast, '_> {
 								scope,
 								rhs_bound,
 							);
-							// Merged once, here, rather than every time
-							// something later asks what this associated
-							// type's bounds are (`abstract_type_bounds`) —
-							// this is the one place resolving this `where`
-							// clause happens at all, so it's also the only
-							// place that needs to know about the trait's own
-							// declared bound (`type Size: PointerSize`) to
-							// fold it in and check for a conflict.
-							let declared = self
-								.items
-								.trait_associated_type(
-									trait_index,
-									binding.name.inner,
-								)
-								.map(|at| at.bounds.clone())
-								.unwrap_or_default();
-							let merged_typeset = match (
-								declared.typeset,
-								rhs_bounds.typeset,
-							) {
-								(Some(declared_ts), Some(_)) => {
-									let assoc_name_str = self
-										.interner
-										.resolve(binding.name.inner)
-										.unwrap();
-									let trait_name_str = self
-										.interner
-										.resolve(
-											self.items.traits
-												[usize::from(trait_index)]
-											.name
-											.inner,
-										)
-										.unwrap();
-									self.diagnostics.push(
-										Diagnostic::error()
-											.with_code(
-												DiagnosticCode::MultipleTypesetBounds
-													.code(),
-											)
-											.with_message(format!(
-												"associated type `{assoc_name_str}` already has a typeset bound from `{trait_name_str}`'s own declaration"
-											))
-											.with_label(
-												Label::primary(
-													resolve_context.file_id,
-													rhs_bound.span,
-												)
-												.with_message(
-													"this `where` clause cannot add another typeset bound",
-												),
-											)
-											.with_label(
-												Label::secondary(
-													self.items.traits
-														[usize::from(trait_index)]
-														.file_id,
-													declared_ts.span,
-												)
-												.with_message(format!(
-													"`{assoc_name_str}`'s typeset bound is already declared here"
-												)),
-											),
-									);
-									Some(declared_ts)
-								}
-								(declared_ts, rhs_ts) => declared_ts.or(rhs_ts),
-							};
-							// A trait bound set is idempotent, same as
-							// writing `T: Foo + Foo` — if the `where` clause
-							// names a trait the assoc type's own declaration
-							// already requires (e.g. `Memory::Size:
-							// PointerSize + UnsignedInt` and a function
-							// separately writes `where { Size: UnsignedInt
-							// }`), that's simply redundant, not a second,
-							// distinct bound. Silently drop it rather than
-							// keeping a duplicate entry: kept, it would make
-							// an unqualified `Mem::Size::Signed` look
-							// ambiguous between two "different" candidates
-							// that are actually the same trait, and would
-							// print as `UnsignedInt + UnsignedInt` on hover.
-							let merged = Bounds {
-								traits: declared
-									.traits
-									.iter()
-									.cloned()
-									.chain(
-										rhs_bounds
-											.traits
-											.iter()
-											.filter(|rhs_bound| {
-												!declared.traits.iter().any(
-													|d| {
-														d.trait_index
-															== rhs_bound
-																.trait_index
-													},
-												)
-											})
-											.cloned(),
-									)
-									.collect::<Vec<_>>()
-									.into_boxed_slice(),
-								typeset: merged_typeset,
-							};
-							bindings.push((
-								binding.name.inner,
-								AssocBindingKind::Bound(merged),
-							));
+							bindings.push(AssocBinding {
+								file_id: resolve_context.file_id,
+								name: binding.name,
+								rhs: Spanned {
+									inner: AssocBindingKind::Bound(rhs_bounds),
+									span: rhs_bound.span,
+								},
+							});
 						}
 					}
 				}
@@ -449,7 +350,7 @@ impl<'ast> Builder<'ast, '_> {
 				// a declared one) needs list order to only ever reflect name
 				// order, not whatever order the `where` clause happened to
 				// be written in.
-				bindings.sort_unstable_by_key(|(name, _)| *name);
+				bindings.sort_unstable_by_key(|binding| binding.name.inner);
 				Bounds {
 					traits: Box::new([TraitBound {
 						trait_index,
@@ -511,7 +412,7 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		owner: TypeParamOwner,
 		self_type: Option<TypeIndex>,
-		ast_params: &[ast::TypeParam],
+		ast_params: &'ast [ast::TypeParam],
 	) {
 		if ast_params.is_empty() {
 			return;
@@ -1049,14 +950,7 @@ impl<'ast> Builder<'ast, '_> {
 		ty: Spanned<TypeIndex>,
 	) {
 		let ResolveContext { file_id, namespace } = resolve_context;
-		if self
-			.declared_trait_member(
-				trait_index,
-				name.inner,
-				SourceSpan::new(file_id, name.span),
-			)
-			.is_err()
-		{
+		if ty.inner == TypeIndex::ERROR {
 			return;
 		}
 
@@ -1094,7 +988,7 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			}
 			match concrete_impl {
-				Some((impl_idx, impl_type_args)) => {
+				Some((impl_index, impl_type_args)) => {
 					// Verify the impl's *actual* value for each binding on
 					// `bound` matches what's required — not just that the
 					// trait itself is implemented. `Equals` bindings
@@ -1106,25 +1000,24 @@ impl<'ast> Builder<'ast, '_> {
 					// call (`concrete_assoc_type_value` + the loop below it)
 					// — this is that same check, applied at
 					// impl-declaration time instead of call time.
-					for (binding_name, kind) in bound.bindings.iter() {
-						let binding_name = *binding_name;
-						let actual = match self.items.trait_impls
-							[usize::from(impl_idx)]
-						.members
-						.get(&binding_name)
-						{
-							Some(ImplEntry::AssocType(idx)) => {
-								let raw = self.items.associated_types
-									[usize::from(*idx)]
-								.ty
-								.unwrap();
-								self.substitute_type(raw.inner, &impl_type_args)
-							}
-							// Missing item is already reported separately by
-							// `check_trait_conformance`'s `MissingItem` check.
-							_ => continue,
+					for binding in bound.bindings.iter() {
+						let binding_name = binding.name.inner;
+						let Some(ImplEntry::AssocType(idx)) =
+							self.items.trait_impls[usize::from(impl_index)]
+								.members
+								.get(&binding_name)
+						else {
+							// Missing members are diagnosed by trait conformance.
+							continue;
 						};
-						match kind {
+						let Some(raw) =
+							self.items.associated_types[usize::from(*idx)].ty
+						else {
+							continue;
+						};
+						let actual =
+							self.substitute_type(raw.inner, &impl_type_args);
+						match &binding.rhs.inner {
 							AssocBindingKind::Equals(expected_ty) => {
 								let expected = self.substitute_type(
 									*expected_ty,
@@ -1287,6 +1180,14 @@ impl<'ast> Builder<'ast, '_> {
 								.inner,
 						)
 						.unwrap();
+					let owner_name = self
+						.interner
+						.resolve(
+							self.items.traits[usize::from(trait_index)]
+								.name
+								.inner,
+						)
+						.unwrap();
 					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
@@ -1309,7 +1210,7 @@ impl<'ast> Builder<'ast, '_> {
 									bound.span,
 								)
 								.with_message(format!(
-									"required by a bound in `{trait_name}::{assoc_name}`"
+									"required by a bound in `{owner_name}::{assoc_name}`"
 								)),
 							),
 					);

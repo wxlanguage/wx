@@ -1851,6 +1851,7 @@ pub struct InherentImpl {
 	/// Synthetic `DefId` used to demand-drive this block's `ensure_signature`.
 	pub id: ast::DefId,
 	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
 	pub type_params: Box<[TypeParamInfo]>,
 	/// `inner` is `TypeIndex::ERROR` until `ensure_signature` for this block
 	/// runs. `span` is the target type expression as written in the impl
@@ -1957,8 +1958,20 @@ pub struct TraitBound {
 	/// deterministic equality. At most one entry per name — `resolve_bounds`
 	/// rejects a second binding for the same associated type regardless of
 	/// which kind either one is, so a name can never appear twice here.
-	pub bindings: Box<[(SymbolU32, AssocBindingKind)]>,
+	pub bindings: Box<[AssocBinding]>,
 	pub span: TextSpan,
+}
+
+/// One resolved associated-type constraint, retaining the locations of both
+/// sides. Spans belong to `file_id`, including when effective lookup consults
+/// this binding from a declaration in another file.
+#[derive(Clone)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct AssocBinding {
+	pub file_id: FileId,
+	pub name: Spanned<SymbolU32>,
+	pub rhs: Spanned<AssocBindingKind>,
 }
 
 /// The right-hand side of one `TraitBound` binding.
@@ -1968,7 +1981,8 @@ pub struct TraitBound {
 pub enum AssocBindingKind {
 	/// `AssocType = RhsType`.
 	Equals(TypeIndex),
-	/// `AssocType: Bound`.
+	/// Only the constraints written in `AssocType: Bound`; declaration
+	/// requirements are consulted separately by `effective_bounds`.
 	Bound(Bounds),
 }
 
@@ -1986,6 +2000,24 @@ pub struct TypesetBound {
 pub struct Bounds {
 	pub traits: Box<[TraitBound]>,
 	pub typeset: Option<TypesetBound>,
+}
+
+/// A borrowed view of all applicable written constraints. Repeated trait
+/// references retain their refinements; member lookup deduplicates candidates.
+struct BoundSources<'a> {
+	sources: Vec<&'a Bounds>,
+}
+
+impl<'a> BoundSources<'a> {
+	fn traits(&self) -> impl Iterator<Item = &'a TraitBound> + '_ {
+		self.sources.iter().flat_map(|bounds| bounds.traits.iter())
+	}
+
+	/// Validation rejects multiple typesets. Prefer the declaration during
+	/// error recovery, matching the source order established by effective_bounds.
+	fn typeset(&self) -> Option<TypesetBound> {
+		self.sources.iter().find_map(|bounds| bounds.typeset)
+	}
 }
 
 #[derive(Clone)]
@@ -2589,17 +2621,15 @@ impl<'a> TypeFormatter<'a> {
 				.and_then(|name| f.write_str(name))?;
 			if !trait_bound.bindings.is_empty() {
 				f.write_str(" where { ")?;
-				for (i, (assoc_name, kind)) in
-					trait_bound.bindings.iter().enumerate()
-				{
+				for (i, binding) in trait_bound.bindings.iter().enumerate() {
 					if i > 0 {
 						f.write_str(", ")?;
 					}
 					self.interner
-						.resolve(*assoc_name)
+						.resolve(binding.name.inner)
 						.ok_or(std::fmt::Error)
 						.and_then(|name| f.write_str(name))?;
-					match kind {
+					match &binding.rhs.inner {
 						AssocBindingKind::Equals(ty) => {
 							f.write_str(" = ")?;
 							self.write_type(f, *ty)?;
@@ -3705,63 +3735,48 @@ impl TypeInterner {
 }
 
 impl ItemRegistry {
-	/// `ty`'s own declared bounds, for the two kinds of type that carry
-	/// bounds without being concrete yet — a `TypeParam` (a function's or
-	/// impl's own generic param) or an `AssocTypeProjection` (`Self::M`,
-	/// bounded by whichever trait declares `M`). `None` for anything
-	/// concrete, which has no bounds of its own to consult — whether it
-	/// satisfies a trait/typeset is a lookup (`find_trait_impl`/
-	/// `concrete_type_in_typeset`), not a declaration.
-	fn abstract_type_bounds(
+	/// Borrow the written bounds contributing to an abstract type. Declaration
+	/// bounds must already be resolved. Projection bases are finite type paths;
+	/// this does not recursively expand traits or associated declarations.
+	fn effective_bounds(
 		&self,
 		types: &TypeInterner,
 		ty: TypeIndex,
-	) -> Option<&Bounds> {
+	) -> Option<BoundSources<'_>> {
 		match types.resolve(ty) {
-			Type::TypeParam { owner, param_index } => Some(
-				&self.type_param_info(*owner, *param_index as usize).bounds,
-			),
+			Type::TypeParam { owner, param_index } => Some(BoundSources {
+				sources: vec![
+					&self.type_param_info(*owner, *param_index as usize).bounds,
+				],
+			}),
 			Type::AssocTypeProjection {
 				trait_index,
 				assoc_name,
 				base,
 			} => {
-				// `base`'s own bounds may already carry a fully-resolved
-				// entry for this exact assoc type — e.g. `Mem: Memory where
-				// { Size: UnsignedInt }` stores the *merge* of `Memory::
-				// Size`'s own `PointerSize` bound with `UnsignedInt` on
-				// `Mem`'s `TraitBound.bindings`, computed once when that
-				// `where` clause was resolved (see `resolve_bounds`'s
-				// `AssocTypeBindingKind::Bound` arm). Preferring that over
-				// the bare trait declaration is what lets a projection see
-				// bounds a plain `type Size: PointerSize` alone never could
-				// — and since it's already the complete, merged picture,
-				// there's nothing left to combine here, just a lookup. A
-				// `= Type` (rather than `: Bound`) entry for this name means
-				// the where clause pinned the type down exactly instead of
-				// adding a bound — nothing for this query to report.
-				let from_where_clause = self
-					.abstract_type_bounds(types, *base)
-					.and_then(|base_bounds| {
-						base_bounds
-							.traits
-							.iter()
-							.find(|b| b.trait_index == *trait_index)
-					})
-					.and_then(|b| {
-						b.bindings.iter().find_map(|(name, kind)| {
-							match (name == assoc_name, kind) {
-								(true, AssocBindingKind::Bound(bounds)) => {
-									Some(bounds)
-								}
-								_ => None,
-							}
-						})
-					});
-				from_where_clause.or_else(|| {
+				let mut sources = Vec::new();
+				if let Some(declaration) =
 					self.trait_associated_type(*trait_index, *assoc_name)
-						.map(|at| &at.bounds)
-				})
+				{
+					sources.push(&declaration.bounds);
+				}
+				if let Some(base_bounds) = self.effective_bounds(types, *base) {
+					for bound in base_bounds
+						.traits()
+						.filter(|b| b.trait_index == *trait_index)
+					{
+						for binding in &bound.bindings {
+							if binding.name.inner == *assoc_name {
+								if let AssocBindingKind::Bound(written) =
+									&binding.rhs.inner
+								{
+									sources.push(written);
+								}
+							}
+						}
+					}
+				}
+				Some(BoundSources { sources })
 			}
 			_ => None,
 		}
@@ -3776,10 +3791,10 @@ impl ItemRegistry {
 		base: TypeIndex,
 		name: SymbolU32,
 	) -> bool {
-		let Some(bounds) = self.abstract_type_bounds(types, base) else {
+		let Some(bounds) = self.effective_bounds(types, base) else {
 			return false;
 		};
-		self.reachable_traits(bounds.traits.iter().map(|b| b.trait_index))
+		self.reachable_traits(bounds.traits().map(|b| b.trait_index))
 			.filter(|&trait_index| {
 				self.traits[usize::from(trait_index)]
 					.members
@@ -3811,7 +3826,7 @@ impl ItemRegistry {
 	/// all-bounds-at-once helper). An abstract `ty` (a `TypeParam`/
 	/// `AssocTypeProjection` propagated in from an outer generic scope, not
 	/// concrete yet) is checked against its own declared bounds via
-	/// `abstract_type_bounds`, not `find_trait_impl` — that only knows
+	/// `effective_bounds`, not `find_trait_impl` — that only knows
 	/// about concrete impls, and a declared bound satisfies the requirement
 	/// through its supertraits as well as itself (see
 	/// [`ItemRegistry::trait_implies`]). The concrete side needs no such walk:
@@ -3823,11 +3838,27 @@ impl ItemRegistry {
 		ty: TypeIndex,
 		trait_index: TraitIndex,
 	) -> bool {
-		match self.abstract_type_bounds(types, ty) {
-			Some(declared) => declared
-				.traits
-				.iter()
-				.any(|b| self.trait_implies(b.trait_index, trait_index)),
+		match self.effective_bounds(types, ty) {
+			Some(declared) => {
+				declared
+					.traits()
+					.any(|b| self.trait_implies(b.trait_index, trait_index))
+					|| declared.typeset().is_some_and(|bound| {
+						// Typesets contain concrete primitives. Their trait guarantee
+						// holds only when every permitted type implements the trait.
+						self.typesets[usize::from(bound.typeset_index)]
+							.members
+							.iter()
+							.all(|member| {
+								self.find_trait_impl(
+									types,
+									*member,
+									trait_index,
+								)
+								.is_some()
+							})
+					})
+			}
 			None => self.find_trait_impl(types, ty, trait_index).is_some(),
 		}
 	}
@@ -3878,9 +3909,9 @@ impl ItemRegistry {
 		ty: TypeIndex,
 		typeset_index: TypesetIndex,
 	) -> bool {
-		match self.abstract_type_bounds(types, ty) {
+		match self.effective_bounds(types, ty) {
 			Some(declared) => declared
-				.typeset
+				.typeset()
 				.is_some_and(|t| t.typeset_index == typeset_index),
 			None => self.concrete_type_in_typeset(ty, typeset_index),
 		}
@@ -3938,7 +3969,7 @@ impl ItemRegistry {
 	/// An abstract slot (`arg_ty` is itself a `TypeParam`/
 	/// `AssocTypeProjection` — e.g. `M` unified against `Self::M` inside a
 	/// trait default body) is checked against *its own* declared bounds via
-	/// `abstract_type_bounds`, not looked up in `find_trait_impl`/
+	/// `effective_bounds`, not looked up in `find_trait_impl`/
 	/// `concrete_type_in_typeset` — those only know about concrete impls,
 	/// and an abstract type isn't concrete yet. This only recognizes an
 	/// exact, directly-declared bound (no supertrait transitivity: `M:

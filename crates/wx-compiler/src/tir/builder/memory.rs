@@ -100,23 +100,8 @@ impl<'ast> Builder<'ast, '_> {
 						binding.name.span,
 					));
 				}
-				// No real `Self` exists yet at this point — the memory's own
-				// `Type::Memory` isn't interned until after this loop (it
-				// depends on `Size`, which is one of these very bindings).
-				// `Memory::Size`'s bound (`PointerSize`) has no `where { .. =
-				// Self }` clause today, so this is a no-op in practice;
-				// `ERROR` only bites if a future bound here starts requiring
-				// one.
-				self.check_assoc_type_bounds(
-					resolve_context,
-					trait_index,
-					TypeIndex::ERROR,
-					binding.name,
-					Spanned {
-						inner: val_ty,
-						span: ty_expr.span,
-					},
-				);
+				// Semantic bounds are checked on the synthesized impl during
+				// trait conformance, once its actual Self type is available.
 			}
 		}
 

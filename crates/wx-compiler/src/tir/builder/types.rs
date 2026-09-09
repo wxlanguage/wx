@@ -309,12 +309,30 @@ impl<'ast> Builder<'ast, '_> {
 		)? {
 			Some(symbol) => symbol,
 			None => {
-				self.diagnostics
-					.push(report_undeclared_type(SourceSpan::new(
-						resolve_context.file_id,
-						identifier.span,
-					)));
-				return Err(());
+				// Offer the associated-type hint only in its owning trait,
+				// after ordinary type lookup has failed. It is not a module binding.
+				if let Some(self_ty) = scope.and_then(|s| s.self_type)
+					&& let Type::TypeParam {
+						owner: TypeParamOwner::Trait(trait_index),
+						..
+					} = self.types.resolve(self_ty)
+					&& self.items.traits[usize::from(*trait_index)]
+						.associated_type(identifier.inner)
+						.is_some()
+				{
+					SymbolKind::TraitAssocType {
+						trait_index: *trait_index,
+						assoc_name: identifier.inner,
+					}
+				} else {
+					self.diagnostics.push(report_undeclared_type(
+						SourceSpan::new(
+							resolve_context.file_id,
+							identifier.span,
+						),
+					));
+					return Err(());
+				}
 			}
 		};
 		match symbol {
@@ -326,10 +344,13 @@ impl<'ast> Builder<'ast, '_> {
 						.with_message(format!(
 							"cannot find type `{name}` in this scope",
 						))
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							identifier.span,
-						))
+						.with_label(
+							Label::primary(
+								resolve_context.file_id,
+								identifier.span,
+							)
+							.with_message(format!("use `Self::{name}` here")),
+						)
 						.with_note(format!(
 							"you might have meant to use the associated type: `Self::{name}`"
 						)),
@@ -340,7 +361,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
-						.with_message("cannot use a bound as a type")
+						.with_message("cannot use bound as a type")
 						.with_label(Label::primary(
 							resolve_context.file_id,
 							identifier.span,
@@ -1203,7 +1224,7 @@ impl<'ast> Builder<'ast, '_> {
 				// other abstract-base case in this file.
 				let ty = if self
 					.items
-					.abstract_type_bounds(&self.types, base_ty.inner)
+					.effective_bounds(&self.types, base_ty.inner)
 					.is_some()
 				{
 					self.types.intern(Type::AssocTypeProjection {

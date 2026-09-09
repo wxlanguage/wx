@@ -7265,6 +7265,406 @@ fn has_error_matching(case: &TestCase, substring: &str) {
 }
 
 #[test]
+fn test_assoc_type_does_not_collide_with_module_alias() {
+	for source in [
+		"trait B { type X; } type X = u32;",
+		"type X = u32; trait B { type X; }",
+	] {
+		let case = TestCase::new(&format!(
+			"{source}
+			trait C {{ type X; }}
+			fn alias(x: X) -> u32 {{ x }}
+			fn projection<T: B>(x: T::X) -> T::X {{ x }}"
+		));
+		case.diagnostics().assert_no_errors();
+	}
+}
+
+#[test]
+fn test_assoc_type_does_not_leak_into_module_scope() {
+	let case = TestCase::new("trait B { type X; } fn f(x: X) {}");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredType);
+}
+
+#[test]
+fn test_assoc_binding_spans_survive_sorting_duplicates_and_nesting() {
+	let source = indoc! {"
+		trait First { type Alpha; type Beta; }
+		trait Nested { type Item; }
+		type Alias<T: First where {
+			Beta: Nested where { Item = u16 },
+			Alpha = u32,
+			Alpha = bool,
+		}> = ();
+	"};
+	let case = TestCase::new(source);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateAssocTypeBinding);
+	let alias = case
+		.tir
+		.items
+		.type_aliases
+		.iter()
+		.find(|alias| {
+			case.graph.interner.resolve(alias.name.inner) == Some("Alias")
+		})
+		.unwrap();
+	let bindings = &alias.type_params[0].bounds.traits[0].bindings;
+	assert_eq!(bindings.len(), 2);
+	assert!(bindings[0].name.inner < bindings[1].name.inner);
+	let alpha = bindings
+		.iter()
+		.find(|binding| {
+			case.graph.interner.resolve(binding.name.inner) == Some("Alpha")
+		})
+		.unwrap();
+	assert_eq!(alpha.file_id, alias.file_id);
+	assert_eq!(
+		alpha.name.span.start as usize,
+		source.find("Alpha = u32").unwrap()
+	);
+	assert_eq!(
+		&source[alpha.name.span.start as usize..alpha.name.span.end as usize],
+		"Alpha"
+	);
+	assert_eq!(
+		&source[alpha.rhs.span.start as usize..alpha.rhs.span.end as usize],
+		"u32"
+	);
+	assert!(matches!(
+		alpha.rhs.inner,
+		AssocBindingKind::Equals(TypeIndex::U32)
+	));
+
+	let beta = bindings
+		.iter()
+		.find(|binding| {
+			case.graph.interner.resolve(binding.name.inner) == Some("Beta")
+		})
+		.unwrap();
+	assert_eq!(
+		&source[beta.rhs.span.start as usize..beta.rhs.span.end as usize],
+		"Nested where { Item = u16 }"
+	);
+	let AssocBindingKind::Bound(nested) = &beta.rhs.inner else {
+		panic!("expected nested bound")
+	};
+	let item = &nested.traits[0].bindings[0];
+	assert_eq!(item.file_id, alias.file_id);
+	assert_eq!(
+		&source[item.name.span.start as usize..item.name.span.end as usize],
+		"Item"
+	);
+	assert_eq!(
+		&source[item.rhs.span.start as usize..item.rhs.span.end as usize],
+		"u16"
+	);
+}
+
+#[test]
+fn test_assoc_binding_spans_retain_inherited_source_file() {
+	let main = "mod defs; trait Extra {} type Alias<T: defs::Outer where { Assoc: Extra }> = ();";
+	let defs = "pub trait Inner { type Item; } pub trait Outer { type Assoc: Inner where { Item = u32 }; }";
+	let case = TestCase::new_multi_file("main.wx", main, &[("defs.wx", defs)]);
+	case.diagnostics().assert_no_errors();
+	let alias = case
+		.tir
+		.items
+		.type_aliases
+		.iter()
+		.find(|alias| {
+			case.graph.interner.resolve(alias.name.inner) == Some("Alias")
+		})
+		.unwrap();
+	let binding = &alias.type_params[0].bounds.traits[0].bindings[0];
+	assert_eq!(binding.file_id, alias.file_id);
+	assert_eq!(
+		&main[binding.rhs.span.start as usize..binding.rhs.span.end as usize],
+		"Extra"
+	);
+	let AssocBindingKind::Bound(written) = &binding.rhs.inner else {
+		panic!("expected written bounds")
+	};
+	assert_eq!(written.traits.len(), 1);
+	let outer = alias.type_params[0].bounds.traits[0].trait_index;
+	let declaration = case
+		.tir
+		.items
+		.trait_associated_type(outer, binding.name.inner)
+		.unwrap();
+	let projection = case
+		.tir
+		.types
+		.entries
+		.iter()
+		.enumerate()
+		.find_map(|(index, ty)| match ty {
+			Type::AssocTypeProjection {
+				base,
+				trait_index,
+				assoc_name,
+			} if *trait_index == outer
+				&& *assoc_name == binding.name.inner
+				&& matches!(
+					case.tir.types.resolve(*base),
+					Type::TypeParam {
+						owner: TypeParamOwner::TypeAlias(_),
+						..
+					}
+				) =>
+			{
+				Some(TypeIndex(index as u32))
+			}
+			_ => None,
+		})
+		.unwrap();
+	let effective = case
+		.tir
+		.items
+		.effective_bounds(&case.tir.types, projection)
+		.unwrap();
+	assert_eq!(effective.traits().count(), 2);
+	let inherited = declaration
+		.bounds
+		.traits
+		.iter()
+		.find(|bound| {
+			case.graph.interner.resolve(
+				case.tir.items.traits[usize::from(bound.trait_index)]
+					.name
+					.inner,
+			) == Some("Inner")
+		})
+		.unwrap();
+	let item = &inherited.bindings[0];
+	assert_ne!(item.file_id, alias.file_id);
+	let file = case.graph.files.get(item.file_id).unwrap();
+	assert_eq!(file.source.as_str(), defs);
+	assert_eq!(
+		&file.source
+			[item.name.span.start as usize..item.name.span.end as usize],
+		"Item"
+	);
+	assert_eq!(
+		&file.source[item.rhs.span.start as usize..item.rhs.span.end as usize],
+		"u32"
+	);
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_alias_function_and_struct() {
+	for declaration in [
+		"type Alias<T: Z where { A = u32 }> = ();",
+		"fn f<T: Z where { A = u32 }>() {}",
+		"struct S<T: Z where { A = u32 }> {}",
+		"trait Child: Z where { A = u32 } {}",
+	] {
+		let source =
+			format!("trait X {{}} trait Z {{ type A: X; }} {declaration}");
+		let case = TestCase::new(&source);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `u32: X` is not satisfied");
+		let diagnostic = case
+			.tir
+			.diagnostics
+			.iter()
+			.find(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.unwrap();
+		let primary = diagnostic
+			.labels
+			.iter()
+			.find(|label| {
+				label.style
+					== codespan_reporting::diagnostic::LabelStyle::Primary
+			})
+			.unwrap();
+		assert_eq!(&source[primary.range.clone()], "u32");
+		assert!(
+			diagnostic
+				.labels
+				.iter()
+				.any(|label| label.message == "required by a bound in `Z::A`"
+					&& &source[label.range.clone()] == "X")
+		);
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_accepts_impl_in_either_order() {
+	for source in [
+		"trait X {} trait Z { type A: X; } impl X for u32 {} type Alias<T: Z where { A = u32 }> = ();",
+		"type Alias<T: Z where { A = u32 }> = (); trait Z { type A: X; } trait X {} impl X for u32 {}",
+	] {
+		TestCase::new(source).diagnostics().assert_no_errors();
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_sees_all_parameter_bounds() {
+	for params in ["T: Z where { A = U }, U: X", "U: X, T: Z where { A = U }"] {
+		let case = TestCase::new(&format!(
+			"trait X {{}} trait Z {{ type A: X; }} type Alias<{params}> = ();"
+		));
+		case.diagnostics().assert_no_errors();
+	}
+	let case = TestCase::new(
+		"trait X {} trait Z { type A: X; } type Alias<T: Z where { A = U }, U> = ();",
+	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_typeset_bounds() {
+	for (ty, valid) in [("u8", true), ("u32", false)] {
+		let case = TestCase::new(&format!(
+			"typeset Small {{ u8, u16 }} trait Z {{ type A: Small; }} type Alias<T: Z where {{ A = {ty} }}> = ();"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TypesetBoundViolation);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_nested_bound_bindings() {
+	let case = TestCase::new(indoc! {"
+		trait Marker {}
+		trait Inner { type Item: Marker; }
+		trait Outer { type Value; }
+		type Alias<T: Outer where { Value: Inner where { Item = u32 } }> = ();
+	"});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+}
+
+#[test]
+fn test_declaration_assoc_equality_handles_bound_lists_and_duplicates() {
+	let case = TestCase::new(indoc! {"
+		trait Marker {}
+		trait First { type Item: Marker; }
+		trait Second { type Item; }
+		impl Marker for u8 {}
+		type Alias<T: First where { Item = u8, Item = u32 } + Second where { Item = u32 }> = ();
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateAssocTypeBinding);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
+fn test_declaration_assoc_equality_proves_trait_for_every_typeset_member() {
+	for (members, valid) in [("u8, u16", true), ("u8, u32", false)] {
+		let case = TestCase::new(&format!(
+			"trait Marker {{}} impl Marker for u8 {{}} impl Marker for u16 {{}}
+			typeset Choices {{ {members} }} trait Z {{ type A: Marker; }}
+			type Alias<T: Z where {{ A = U }}, U: Choices> = ();"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TraitBoundViolation);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_demands_later_impl_members() {
+	for requirement in ["Item = u8", "Item: Marker"] {
+		for (ty, valid) in [("u8", true), ("u16", false)] {
+			let case = TestCase::new(&format!(
+				"trait Marker {{}} impl Marker for u8 {{}}
+				trait HasItem {{ type Item; }}
+				trait Z {{ type A: HasItem where {{ {requirement} }}; }}
+				type Alias<T: Z where {{ A = Node }}> = ();
+				struct Node {{}}
+				impl HasItem for Node {{ type Item = {ty}; }}"
+			));
+			if valid {
+				case.diagnostics().assert_no_errors();
+			} else {
+				case.diagnostics()
+					.assert_error(DiagnosticCode::TraitBoundViolation);
+			}
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_accepts_recursive_trait_bounds() {
+	let case = TestCase::new(indoc! {"
+		trait A { type X: B where { Y = Self }; }
+		trait B { type Y: A where { X = Self }; }
+		type Alias<T: A where { X = U }, U: B where { Y = T }> = ();
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_declaration_assoc_equality_handles_inherited_method_parameters() {
+	for (rhs, valid) in [("U", true), ("u32", false)] {
+		let case = TestCase::new(&format!(
+			"trait Marker {{}} trait Z {{ type A: Marker; }}
+			struct Host<P> {{ value: P }}
+			impl<P> Host<P> {{
+				fn f<T: Z where {{ A = {rhs} }}, U: Marker>() {{}}
+			}}"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TraitBoundViolation);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_in_impl_header_sees_later_impls() {
+	for declaration in [
+		"impl<T: Z where { A = u32 }> Q for Host<T> {}",
+		"impl<T: Z where { A = u32 }> Host<T> {}",
+		"type Alias<T: Z where { A = u32 }> = Host<T>;
+		impl<T: Z> Q for Alias<T> {}",
+	] {
+		for later_impl in ["impl X for u32 {}", ""] {
+			let case = TestCase::new(&format!(
+				"trait X {{}} trait Z {{ type A: X; }} trait Q {{}}
+				struct Host<T> {{ value: T }}
+				{declaration}
+				{later_impl}"
+			));
+			if later_impl.is_empty() {
+				case.diagnostics()
+					.assert_error(DiagnosticCode::TraitBoundViolation);
+			} else {
+				case.diagnostics().assert_no_errors();
+			}
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_does_not_cascade_unresolved_type() {
+	let case = TestCase::new(
+		"trait X {} trait Z { type A: X; } type Alias<T: Z where { A = Missing }> = ();",
+	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredType);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
 fn test_assoc_type_declared_in_trait() {
 	// The member index points to one arena-owned declaration with its bounds.
 	let case = TestCase::new(indoc! {"
@@ -7438,25 +7838,38 @@ fn test_assoc_type_unknown_member_is_error() {
 
 #[test]
 fn test_assoc_type_bare_name_suggests_self_prefix() {
-	// Using the associated type name directly (e.g. `Size` instead of
-	// `Self::Size`) must produce a targeted error with a `Self::` suggestion.
-	let case = TestCase::new(indoc! {"
-        trait Memory {
-            type Size;
-            fn alloc(n: Size) -> *u8;
+	let source = indoc! {"
+        trait B {
+            type X;
+            fn test(u: X) -> u32;
         }
-    "});
-	// report_bare_assoc_type emits E1021 with message "cannot find type `Size` in
-	// this scope" and a note containing the "Self::Size" suggestion.
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::UndeclaredType),
-		"expected E1021 (UndeclaredType) for bare associated type name, got: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>(),
-	);
+    "};
+	let case = TestCase::new(source);
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::UndeclaredType.code())
+		})
+		.expect("bare associated type must be rejected");
+	assert_eq!(diagnostic.message, "cannot find type `X` in this scope");
+	assert!(diagnostic.notes.iter().any(|note| note.contains(
+		"you might have meant to use the associated type: `Self::X`"
+	)));
+	let label = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Primary
+		})
+		.unwrap();
+	assert_eq!(label.range.start, source.find("u: X").unwrap() + 3);
+	assert_eq!(&source[label.range.clone()], "X");
+	assert_eq!(label.message, "use `Self::X` here");
+
+	let corrected = TestCase::new(&source.replace("u: X", "u: Self::X"));
+	corrected.diagnostics().assert_no_errors();
 }
 
 #[test]
@@ -15820,4 +16233,73 @@ fn test_trait_member_search_concrete_call_through_generic() {
 		export { run }
 	"});
 	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_effective_bounds_keep_repeated_trait_refinements() {
+	let case = TestCase::new("
+trait Marker { fn mark(self) -> u32; }
+trait Inner { type Item; }
+trait Outer { type A: Inner; }
+fn refined<T: Outer where { A: Inner where { Item: Marker } }>(value: T::A::Item) -> u32 { value.mark() }
+");
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_written_refinement_equality_is_validated_with_repeated_trait() {
+	let case = TestCase::new(
+		"
+trait Marker {}
+trait Inner { type Item: Marker; }
+trait Outer { type A: Inner; }
+type Alias<T: Outer where { A: Inner where { Item = u32 } }> = ();
+",
+	);
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+}
+
+#[test]
+fn test_declaration_validation_checks_associated_type_written_bounds() {
+	for declarations in [
+		"trait Marker {} trait Inner { type Item: Marker; } trait Outer { type A: Inner where { Item = u32 }; }",
+		"trait Outer { type A: Inner where { Item = u32 }; } trait Inner { type Item: Marker; } trait Marker {}",
+	] {
+		let case = TestCase::new(declarations);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `u32: Marker` is not satisfied",
+		);
+		assert_eq!(
+			case.tir
+				.diagnostics
+				.iter()
+				.filter(|d| d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code()))
+				.count(),
+			1
+		);
+	}
+}
+
+#[test]
+fn test_declaration_validation_checks_inherited_parameters_once() {
+	let case = TestCase::new(
+		"trait Marker {} trait Z { type A: Marker; }
+	struct Host<T> { value: T }
+	impl<T: Z where { A = u32 }> Host<T> {
+		fn first(self) {} fn second(self) {}
+	}",
+	);
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+	assert_eq!(
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(|d| d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code()))
+			.count(),
+		1
+	);
 }

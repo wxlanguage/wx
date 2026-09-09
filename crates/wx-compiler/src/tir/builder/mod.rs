@@ -24,6 +24,7 @@ mod signature;
 mod traits;
 mod type_compare;
 mod types;
+mod validation;
 
 use candidates::{CandidateSelection, CandidateSet};
 
@@ -671,6 +672,9 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	for i in 0..builder.ast_nodes.len() {
 		let _ = builder.ensure_signature(builder.ast_nodes[i].def_id);
 	}
+
+	// All declaration facts and impl candidates are available before validation.
+	builder.validate_declarations();
 
 	builder.operator_traits = Some(builder.resolve_operator_traits());
 

@@ -1032,7 +1032,6 @@ impl<'ast> Builder<'ast, '_> {
 
 	pub(super) fn signature_trait(
 		&mut self,
-		resolve_context: ResolveContext,
 		trait_index: TraitIndex,
 		item: &'ast ast::Item,
 	) {
@@ -1053,52 +1052,6 @@ impl<'ast> Builder<'ast, '_> {
 		// and it is the only writer of the supertrait half of `Self`'s
 		// bounds.
 		self.ensure_trait_supertraits(trait_index);
-
-		// `Self` here is this trait's own — a supertrait binding like
-		// `trait Foo: Bar where { AssocX = SomeType }` states a
-		// constraint that must hold for whatever type ends up
-		// implementing `Foo` (and therefore `Bar`), which is exactly
-		// `Foo`'s own `Self` placeholder — there's no concrete
-		// receiver yet at trait-declaration time.
-		let self_type = self.types.intern(Type::TypeParam {
-			owner: TypeParamOwner::Trait(trait_index),
-			param_index: 0,
-		});
-		// Read back from `Self`'s bounds, where `ensure_trait_supertraits`
-		// put them; owned because `check_assoc_type_bounds` needs `&mut
-		// self`.
-		let supertraits: Vec<TraitBound> = self.items.traits
-			[usize::from(trait_index)]
-		.supertraits(trait_index)
-		.cloned()
-		.collect();
-		for supertrait in supertraits.iter() {
-			for (assoc_name, kind) in supertrait.bindings.iter() {
-				// Only an equality binding (`AssocX = SomeType`) has
-				// a concrete value here to check against `AssocX`'s
-				// own declared bounds — a `: Bound` entry has
-				// already had that same declared bound folded into
-				// it directly by `resolve_bounds`, so there's
-				// nothing left to check against a value that
-				// doesn't exist.
-				let AssocBindingKind::Equals(val_ty) = kind else {
-					continue;
-				};
-				self.check_assoc_type_bounds(
-					resolve_context,
-					supertrait.trait_index,
-					self_type,
-					Spanned {
-						inner: *assoc_name,
-						span: supertrait.span,
-					},
-					Spanned {
-						inner: *val_ty,
-						span: supertrait.span,
-					},
-				);
-			}
-		}
 	}
 
 	pub(super) fn signature_trait_function(
@@ -1613,10 +1566,7 @@ impl<'ast> Builder<'ast, '_> {
 		// Deliberately not `ensure_signature` on the parent — see
 		// `ensure_trait_supertraits`.
 		self.ensure_trait_supertraits(trait_index);
-		if let ast::TraitItem::AssociatedType {
-			id, name, bounds, ..
-		} = item
-		{
+		if let ast::TraitItem::AssociatedType { name, bounds, .. } = item {
 			let self_type_param = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
@@ -1632,29 +1582,6 @@ impl<'ast> Builder<'ast, '_> {
 			else {
 				unreachable!()
 			};
-
-			// Replace Pending with TraitAssocType only if it's still our
-			// own Pending — never clobber a same-named resolved symbol.
-			if matches!(
-				self.lookup_global_symbol(resolve_context.namespace, (SymbolNamespace::Type, name.inner)),
-				Some(SymbolEntry::Pending(d)) if d == *id
-			) {
-				// Shares the trait's own visibility — trait bodies
-				// reject a `pub` qualifier on their own members (see
-				// `symbol_kind_is_gated`'s doc comment), so there's
-				// no separate span of this assoc type's own to read.
-				let trait_pub_span =
-					self.items.traits[usize::from(trait_index)].pub_span;
-				self.insert_symbol(
-					resolve_context.namespace,
-					(SymbolNamespace::Type, name.inner),
-					SymbolKind::TraitAssocType {
-						trait_index,
-						assoc_name: name.inner,
-					},
-					trait_pub_span,
-				);
-			}
 
 			let bounds = bounds
 				.as_ref()
