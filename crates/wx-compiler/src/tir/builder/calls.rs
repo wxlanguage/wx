@@ -558,8 +558,7 @@ impl<'ast> Builder<'ast, '_> {
 			.enumerate()
 			.filter(|&(_, (param, arg_ty))| {
 				arg_ty != TypeIndex::ERROR
-					&& (!param.bounds.traits.is_empty()
-						|| param.bounds.typeset.is_some())
+					&& !param.bounds.traits.is_empty()
 			})
 			.map(|(index, (_param, arg_ty))| {
 				// Narrow the span to whichever argument's declared type is

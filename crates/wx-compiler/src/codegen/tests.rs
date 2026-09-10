@@ -177,6 +177,53 @@ fn test_parse_simple_addition() {
 }
 
 #[test]
+fn test_exact_int_literal_coerces_to_float_end_to_end() {
+	// An integer literal that fits a float exactly is rewritten to a `Float`
+	// node in TIR; check it survives MIR/codegen and produces the right value.
+	let case = TestCase::new(indoc! {"
+        fn half_of(x: f32) -> f32 { x / 2.0 }
+        fn f() -> f32 { half_of(9) }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<(), f32>(&mut store, "f")
+		.unwrap();
+	assert_eq!(f.call(&mut store, ()).unwrap(), 4.5);
+}
+
+#[test]
+fn test_generic_int_literal_monomorphized_to_float_member() {
+	// `5` keeps its `Int` node through TIR under a mixed typeset bound (the body
+	// of `five` never sees a concrete type); the `f32` instantiation must turn
+	// it into a float constant in MIR/codegen.
+	let case = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        fn five<T: Num>() -> T { 5 }
+        fn as_f32() -> f32 { five() }
+        fn as_i32() -> i32 { five() }
+        export { as_f32, as_i32 }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance =
+		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let as_f32 = instance
+		.get_typed_func::<(), f32>(&mut store, "as_f32")
+		.unwrap();
+	let as_i32 = instance
+		.get_typed_func::<(), i32>(&mut store, "as_i32")
+		.unwrap();
+	assert_eq!(as_f32.call(&mut store, ()).unwrap(), 5.0);
+	assert_eq!(as_i32.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
 fn test_arithmetic_operations() {
 	let case = TestCase::new(indoc! {"
         fn sub(a: i32, b: i32) -> i32 { a - b }

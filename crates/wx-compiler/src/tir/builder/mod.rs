@@ -59,7 +59,7 @@ use signature::{
 };
 use traits::report_associated_type_in_inherent_impl;
 use type_compare::{SignatureComparison, TypeComparison};
-use types::report_undeclared_type;
+use types::{report_infer_in_signature, report_undeclared_type};
 
 struct ExprContext {
 	lookup: HashMap<(ScopeIndex, SymbolU32), LocalIndex>,
@@ -210,11 +210,6 @@ enum ComputeState {
 enum SignatureStatus {
 	Resolved,
 	Cycle,
-}
-
-enum BoundKind {
-	Trait(TraitBound),
-	TypeSet(TypesetBound),
 }
 
 #[derive(Clone)]
@@ -1037,9 +1032,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		for enum_index in 0..self.items.enums.len() {
-			let enum_index = EnumIndex::new(enum_index as u32);
-			let enum_ = &self.items.enums[usize::from(enum_index)];
+		for enum_ in self.items.enums.iter() {
 			if enum_.pub_span.is_none() && enum_.accesses.is_empty() {
 				let name = self.interner.resolve(enum_.name.inner).unwrap();
 				self.diagnostics.push(

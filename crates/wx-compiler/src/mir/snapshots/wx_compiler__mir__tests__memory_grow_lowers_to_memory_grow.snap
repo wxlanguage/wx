@@ -251,7 +251,7 @@ globals: []
 exports:
   - Function:
       id: 477
-      name: 247
+      name: 246
 imports: []
 memories:
   - id: 476

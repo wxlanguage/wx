@@ -149,10 +149,10 @@ impl<'ast> Builder<'ast, '_> {
 	/// awareness — callers only call this once they already know evaluation
 	/// mode is `Runtime` (see `build_operator_dispatch`), and decide for
 	/// themselves what a `None` means (a struct with no `Add` impl is a real
-	/// error; a typeset-bounded associated type, which `find_trait_impl` can
-	/// never match since it has no concrete `ImplTarget`, is not — see
-	/// `is_typeset_bounded_assoc_type`). Shared by binary
-	/// (`build_operator_dispatch`), unary (`Neg`), and the
+	/// error; an abstract operand whose bounds still imply the operator —
+	/// handled up front by `abstract_operand_defers_operator` — is not, since
+	/// `find_trait_impl` has no concrete `ImplTarget` to match). Shared by
+	/// binary (`build_operator_dispatch`), unary (`Neg`), and the
 	/// `Type::TypeParam` compound-assignment dispatch.
 	pub(super) fn resolve_trait_method(
 		&self,
@@ -210,44 +210,26 @@ impl<'ast> Builder<'ast, '_> {
 		func.id
 	}
 
-	/// The `Type::TypeParam` counterpart of `resolve_trait_method` — which
-	/// only ever resolves a concrete `ImplTarget`, so it fails outright for
-	/// a type param (`ImplTarget::from_type` doesn't handle `TypeParam`).
-	/// Checks the type param's own declared bounds instead: `None` means
-	/// neither bound applies — a genuinely unbounded `T` — and the caller
-	/// should fall through to the ordinary concrete-resolution path, which
-	/// reports the same "operator cannot be applied" diagnostic either way.
-	///
-	/// Two independent ways a type param can be "bounded enough" for this:
-	/// - A real trait bound matching this operator's own trait (`T: Add`
-	///   for `+`) — could concretize to any type implementing that trait,
-	///   not just a primitive, so resolution stays deferred.
-	/// - A typeset bound (`T: Size`) — every typeset today consists
-	///   entirely of integer primitives (enforced at typeset-declaration
-	///   time, `DiagnosticCode::TypesetMemberNotInteger`), which all carry
-	///   `#[inline]` impls of every operator trait, so it's trusted
-	///   unconditionally for *any* operator trait here, exactly like
-	///   `Type::AssocTypeProjection`'s equivalent trust (see
-	///   `is_typeset_bounded_assoc_type`) — no need to check which trait
-	///   `T` was bounded by.
-	///
-	/// `Some` returns the trait's *abstract* method (no body — resolved for
-	/// real once monomorphization substitutes a concrete `Self`, exactly
-	/// like `GenericMethodCall`'s existing abstract-method fallback).
-	fn resolve_bounded_operator_method(
+	/// Whether an abstract operand `ty` (a `Type::TypeParam` or
+	/// `Type::AssocTypeProjection`) is bound tightly enough to defer this
+	/// operator to monomorphization: its declared bounds must *imply* the
+	/// operator's own trait — directly (`T: Add`) or transitively (`T: Integer`
+	/// where the generated `Integer` trait has `Add` as a supertrait). An
+	/// unbounded `T` fails here and falls through to the concrete-resolution
+	/// path, which reports "operator cannot be applied".
+	fn abstract_operand_defers_operator(
 		&self,
-		owner: TypeParamOwner,
-		param_index: u32,
+		ty: TypeIndex,
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 	) -> Option<FunctionIndex> {
-		let bounds = &self
-			.items
-			.type_param_info(owner, param_index as usize)
-			.bounds;
-		let bounded = bounds.typeset.is_some()
-			|| bounds.traits.iter().any(|tb| tb.trait_index == trait_index);
-		if !bounded {
+		if !matches!(
+			self.types.resolve(ty),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		) {
+			return None;
+		}
+		if !self.items.type_implements_trait(&self.types, ty, trait_index) {
 			return None;
 		}
 		Some(self.operator_trait_method(trait_index, method_symbol))
@@ -259,11 +241,10 @@ impl<'ast> Builder<'ast, '_> {
 	///   comment) — builds a plain `Binary` node, exactly as before operator
 	///   overloading existed, still directly foldable by `eval_const_expr`.
 	/// - `Runtime`, `ty` isn't concrete yet (`Type::TypeParam` or
-	///   `Type::AssocTypeProjection`) but is trusted anyway — a real trait
-	///   bound, or a typeset bound on either shape (see
-	///   `resolve_bounded_operator_method`/`is_typeset_bounded_assoc_type`)
-	///   — builds a `GenericMethodCall`, deferred to real resolution once
-	///   monomorphization substitutes a concrete `Self`.
+	///   `Type::AssocTypeProjection`) but its declared bounds imply the
+	///   operator's trait (see `abstract_operand_defers_operator`) — builds a
+	///   `GenericMethodCall`, deferred to real resolution once monomorphization
+	///   substitutes a concrete `Self`.
 	/// - `Runtime`, dispatch succeeds against a concrete type — records
 	///   `operator`'s own span as a go-to-definition access against the
 	///   resolved method (the same `accesses`-list mechanism ordinary
@@ -297,21 +278,11 @@ impl<'ast> Builder<'ast, '_> {
 		if let Some((trait_index, method_symbol)) =
 			traits.for_op(binary_op.inner)
 		{
-			let deferred = match self.types.resolve(ty) {
-				Type::TypeParam { owner, param_index } => self
-					.resolve_bounded_operator_method(
-						*owner,
-						*param_index,
-						trait_index,
-						method_symbol,
-					),
-				Type::AssocTypeProjection { .. }
-					if self.is_typeset_bounded_assoc_type(ty) =>
-				{
-					Some(self.operator_trait_method(trait_index, method_symbol))
-				}
-				_ => None,
-			};
+			let deferred = self.abstract_operand_defers_operator(
+				ty,
+				trait_index,
+				method_symbol,
+			);
 			if let Some(func_idx) = deferred {
 				let abstract_method_id = self.record_operator_method_access(
 					ctx,
@@ -417,28 +388,17 @@ impl<'ast> Builder<'ast, '_> {
 				)
 			});
 
-		// Typeset-bounded associated types (`Mem::Size`) always defer — their
-		// members are all primitives today (see `is_typeset_bounded_assoc_type`),
-		// so there's no separate trait bound to check. A bare `Type::TypeParam`
-		// is different: it could concretize to any type, so it only defers
-		// when actually bounded by this operator's trait — an unbounded `T`
-		// falls through to the failure path below instead of building a
-		// `GenericCompoundAssign`/`GenericCompoundStore` that would only fail
-		// later, as a raw panic once monomorphization substitutes some
-		// concrete, non-implementing type.
-		let abstract_func_idx = match self.types.resolve(ty) {
-			Type::AssocTypeProjection { .. } => {
-				Some(self.operator_trait_method(trait_index, method_symbol))
-			}
-			Type::TypeParam { owner, param_index } => self
-				.resolve_bounded_operator_method(
-					*owner,
-					*param_index,
-					trait_index,
-					method_symbol,
-				),
-			_ => None,
-		};
+		// An abstract operand (`Mem::Size`, or a bounded `T`) defers to
+		// monomorphization when its bounds imply this operator's trait — an
+		// unbounded `T` falls through to the failure path below instead of
+		// building a `GenericCompoundAssign`/`GenericCompoundStore` that would
+		// only panic later once monomorphization substitutes a concrete,
+		// non-implementing type.
+		let abstract_func_idx = self.abstract_operand_defers_operator(
+			ty,
+			trait_index,
+			method_symbol,
+		);
 		if let Some(abstract_func_idx) = abstract_func_idx {
 			let abstract_method_id = self.record_operator_method_access(
 				ctx,
@@ -524,21 +484,11 @@ impl<'ast> Builder<'ast, '_> {
 		// monomorphization substitutes a concrete `Self`. An unbounded `T`
 		// falls through to the same failure path below as a concrete type
 		// with no matching impl.
-		let deferred = match self.types.resolve(ty) {
-			Type::TypeParam { owner, param_index } => self
-				.resolve_bounded_operator_method(
-					*owner,
-					*param_index,
-					trait_index,
-					method_symbol,
-				),
-			Type::AssocTypeProjection { .. }
-				if self.is_typeset_bounded_assoc_type(ty) =>
-			{
-				Some(self.operator_trait_method(trait_index, method_symbol))
-			}
-			_ => None,
-		};
+		let deferred = self.abstract_operand_defers_operator(
+			ty,
+			trait_index,
+			method_symbol,
+		);
 		if let Some(func_idx) = deferred {
 			let abstract_method_id = self.record_operator_method_access(
 				ctx,

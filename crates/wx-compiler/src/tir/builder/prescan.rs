@@ -449,6 +449,7 @@ impl<'ast> Builder<'ast, '_> {
 						span: name.span,
 					}),
 					members: HashMap::new(),
+					typeset_index: None,
 					accesses: Vec::new(),
 				});
 				for trait_item in items.iter() {
@@ -763,6 +764,28 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			} => {
 				let attributes = self.resolve_attributes(*id, attributes);
+				// The compiler-generated trait that backs this typeset. Shell
+				// only here — its supertraits (from the typeset's bound clause)
+				// and per-member `impl`s are filled during signature
+				// resolution. It gets a synthetic `DefId` and no namespace
+				// symbol: it is never nameable, only reached through the
+				// typeset's own `SymbolKind::TypeSet` entry. Its name/span
+				// mirror the typeset's so diagnostics read naturally.
+				let self_name_sym = self.interner.get_or_intern("Self");
+				let backing_trait = self.items.push_trait(Trait {
+					id: self.id_generator.generate(),
+					file_id,
+					namespace,
+					pub_span: *pub_span,
+					name: *name,
+					self_type_param: TypeParamInfo::new(Spanned {
+						inner: self_name_sym,
+						span: name.span,
+					}),
+					members: HashMap::new(),
+					typeset_index: None,
+					accesses: Vec::new(),
+				});
 				let typeset_index = self.items.push_typeset(TypeSet {
 					id: *id,
 					file_id,
@@ -770,10 +793,12 @@ impl<'ast> Builder<'ast, '_> {
 					name: *name,
 					pub_span: *pub_span,
 					members: Box::new([]),
-					intersection_range: IntegerRange::widest(),
+					trait_index: backing_trait,
 					accesses: Vec::new(),
 					attributes,
 				});
+				self.items.traits[usize::from(backing_trait)].typeset_index =
+					Some(typeset_index);
 				self.insert_symbol(
 					namespace,
 					(SymbolNamespace::Type, name.inner),

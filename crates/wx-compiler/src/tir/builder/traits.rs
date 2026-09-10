@@ -964,8 +964,8 @@ impl<'ast> Builder<'ast, '_> {
 
 		// `Self: ThisTrait` first — a default body reaches the trait's own
 		// members through it, and `Trait::supertraits` filters it back out by
-		// trait index. A typeset supertrait (`trait Foo: Integer`) fills the
-		// one typeset slot, the same way it would on any other type param.
+		// trait index. A typeset supertrait (`trait Foo: Integer`) is just
+		// another trait bound now, on the typeset's generated trait.
 		let self_param =
 			&mut self.items.traits[usize::from(trait_index)].self_type_param;
 		let mut traits = Vec::with_capacity(1 + bounds.traits.len());
@@ -976,7 +976,6 @@ impl<'ast> Builder<'ast, '_> {
 		});
 		traits.extend(bounds.traits.iter().cloned());
 		self_param.bounds.traits = traits.into_boxed_slice();
-		self_param.bounds.typeset = bounds.typeset;
 
 		// Up the parent chain: after this returns, every ancestor's `Self`
 		// bounds are resolved too, which is what a transitive walk over the
@@ -1067,6 +1066,82 @@ impl<'ast> Builder<'ast, '_> {
 		self.ensure_trait_supertraits(trait_index);
 	}
 
+	/// Fills in the compiler-generated trait that backs a `typeset` (the shell
+	/// was created in prescan): its supertraits come from the `typeset X: A + B`
+	/// clause, and every member gets a synthetic `impl` of it. Called from the
+	/// `TypeSet` arm of signature resolution once the members are resolved.
+	///
+	/// The generated trait's `Self` bounds are shaped exactly like a
+	/// hand-written trait's after [`Self::resolve_supertrait_clause`] — the
+	/// reflexive `Self: __X` entry first, then the clause — so
+	/// `check_trait_conformance` verifies each member `impl` against the clause
+	/// with no special-casing, and `trait_implies` walks the chain the same
+	/// way. Unlike a hand-written trait there is no AST node to read the clause
+	/// back from, so it is written here once and for all.
+	pub(super) fn signature_typeset_backing_trait(
+		&mut self,
+		resolve_context: ResolveContext,
+		typeset_index: TypesetIndex,
+		bounds_clause: Option<&ast::Spanned<ast::BoundExpression>>,
+		members: &[Spanned<TypeIndex>],
+	) {
+		let backing_trait =
+			self.items.typesets[usize::from(typeset_index)].trait_index;
+
+		let clause = match bounds_clause {
+			Some(spanned) => {
+				self.resolve_bounds(resolve_context, None, spanned)
+			}
+			None => Bounds::default(),
+		};
+
+		let name_span =
+			self.items.traits[usize::from(backing_trait)].name.span;
+		let mut traits = Vec::with_capacity(1 + clause.traits.len());
+		traits.push(TraitBound {
+			trait_index: backing_trait,
+			bindings: Box::new([]),
+			span: name_span,
+		});
+		traits.extend(clause.traits.iter().cloned());
+		let self_param = &mut self.items.traits[usize::from(backing_trait)]
+			.self_type_param;
+		self_param.bounds.traits = traits.into_boxed_slice();
+
+		// Resolve each clause trait's own supertrait chain so `trait_implies`
+		// can walk it when an operator or bound check consults this typeset.
+		for tb in clause.traits.iter() {
+			self.ensure_trait_supertraits(tb.trait_index);
+		}
+
+		// One synthetic `impl __X for <member>` per member. The trait has no
+		// members, so the impl carries only the supertrait obligations
+		// `check_trait_conformance` checks; `span`/`target.span` point at the
+		// member's type expression so any such diagnostic lands there.
+		for member in members {
+			let impl_index = self.items.push_trait_impl(TraitImpl {
+				id: self.id_generator.generate(),
+				trait_index: backing_trait,
+				type_params: Box::new([]),
+				target: Spanned {
+					inner: member.inner,
+					span: member.span,
+				},
+				members: HashMap::new(),
+				member_decls: HashMap::new(),
+				span: member.span,
+				file_id: resolve_context.file_id,
+				namespace: resolve_context.namespace,
+				self_accesses: Vec::new(),
+			});
+			self.register_trait_impl(
+				member.inner,
+				backing_trait,
+				impl_index,
+			);
+		}
+	}
+
 	pub(super) fn signature_trait_function(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -1154,7 +1229,7 @@ impl<'ast> Builder<'ast, '_> {
 			// expression against it needs no further generic-scope
 			// threading, the same way an ordinary comptime literal
 			// already coerces against a typeset-bounded type param
-			// (see `test_typeset_intersection_range_literal_in_local`).
+			// (see `test_typeset_bounded_literal_in_local_is_checked_against_members`).
 			let (value_expr, const_value) = match value {
 				Some(value_ast) => match self.build_const_context_expression(
 					resolve_context,
@@ -1220,21 +1295,39 @@ impl<'ast> Builder<'ast, '_> {
 			trait_name,
 			trait_name_span,
 		) {
-			Ok(BoundKind::Trait(tb)) => tb.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::ExpectedBound.code())
-						.with_message("expected a trait name")
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							trait_name_span,
-						)),
-				);
-				return;
-			}
+			Ok(tb) => tb.trait_index,
 			Err(()) => return,
 		};
+		// A `typeset` is sealed: its member set is closed at its declaration
+		// and the compiler generates every impl. A hand-written
+		// `impl SomeTypeset for T` would breach that guarantee.
+		if let Some(typeset_index) = self.items.traits
+			[usize::from(trait_index)]
+		.typeset_index
+		{
+			let name = self.interner.resolve(
+				self.items.typesets[usize::from(typeset_index)].name.inner,
+			);
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::CannotImplementTypeset.code())
+					.with_message(format!(
+						"`{}` is a typeset and cannot be implemented",
+						name.unwrap_or("<typeset>"),
+					))
+					.with_label(
+						Label::primary(
+							resolve_context.file_id,
+							trait_name_span,
+						)
+						.with_message(
+							"a typeset is sealed — its members are fixed at \
+							 its declaration",
+						),
+					),
+			);
+			return;
+		}
 
 		let member_decls = self.collect_member_decls(resolve_context, items);
 

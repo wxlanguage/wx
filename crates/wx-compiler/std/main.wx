@@ -1344,7 +1344,16 @@ impl BitXor for bool {
     }
 }
 
-pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }
+pub typeset Integer: Add + Sub + Mul + Div + Rem + BitAnd + BitOr + BitXor + Shl + Shr + BitNot {
+    u8,
+    i8,
+    u16,
+    i16,
+    u32,
+    i32,
+    u64,
+    i64,
+}
 
 pub trait UnsignedInt {
     type Signed: SignedInt where { Unsigned = Self };
@@ -1411,11 +1420,13 @@ pub fn memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-#[tag = "pointer_size"]
-pub typeset PointerSize { u32, u64 }
+pub typeset PointerSize: Add + Sub + Mul + BitAnd + BitNot + UnsignedInt {
+    u32,
+    u64,
+}
 
 pub trait Memory {
-    type Size: PointerSize + UnsignedInt;
+    type Size: PointerSize;
 
     /// This constant exposes internal information about which index this memory will use in the generated wasm module.
     const INDEX: u32;

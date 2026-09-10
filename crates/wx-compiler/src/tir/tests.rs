@@ -2607,18 +2607,36 @@ fn test_f64_nan_infinity_neg_infinity_consts_resolve() {
 }
 
 #[test]
-fn test_coerce_int_literal_for_float_type_errors() {
-	// An untyped integer literal cannot be coerced to f32 (must write 1.0)
-	let case = TestCase::new("fn f() -> f32 { 1 } export { f }");
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::LiteralTypeMismatch),
-		"expected E1006 (int literal for float type), got: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
-	);
+fn test_coerce_exact_int_literal_to_float_succeeds() {
+	// An integer literal coerces to a float target when it fits exactly — no
+	// decimal point required. `16777216` is `2^24`: a single set bit, so its
+	// significant span is 1 and it sits comfortably in an f32.
+	let case = TestCase::new(indoc! {"
+        fn a() -> f32 { 0 }
+        fn b() -> f32 { 1 }
+        fn c() -> f64 { 4503599627370496 }
+        fn d() -> f32 { 16777216 }
+        export { a, b, c, d }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_coerce_inexact_int_literal_to_float_errors() {
+	// `16777217` (`2^24 + 1`) needs 25 significant bits — not exact in f32.
+	let f32_case = TestCase::new("fn f() -> f32 { 16777217 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::IntegerLiteralNotRepresentable
+	));
+
+	// `2^53 + 1` is the same story one width up.
+	let f64_case =
+		TestCase::new("fn f() -> f64 { 9007199254740993 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::IntegerLiteralNotRepresentable
+	));
 }
 
 #[test]
@@ -2678,6 +2696,89 @@ fn test_coerce_float_to_i32_errors() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
 	);
+}
+
+#[test]
+fn test_scientific_notation_float_values() {
+	// The parser only checks a float token's syntax now; the value is
+	// assembled here, by parsing the source slice against the f64 target.
+	let case = TestCase::new(indoc! {"
+        #[tag = \"a\"] const A: f64 = 1e10;
+        #[tag = \"b\"] const B: f64 = 3.4e2;
+        #[tag = \"c\"] const C: f64 = 1e+5;
+        #[tag = \"d\"] const D: f64 = 1.5e-3;
+        #[tag = \"e\"] const E: f64 = 2E3;
+        export {}
+    "});
+	no_errors(&case);
+	let value_of = |tag: &str| {
+		let key = case.graph.interner.get(tag).unwrap();
+		let def_id = *case.tir.items.tagged_items.get(&key).unwrap();
+		let idx = case.tir.items.expect_const_index(def_id);
+		case.tir.items.constants[usize::from(idx)].const_value
+	};
+	assert_eq!(value_of("a"), Some(ConstValue::Float(1e10)));
+	assert_eq!(value_of("b"), Some(ConstValue::Float(3.4e2)));
+	assert_eq!(value_of("c"), Some(ConstValue::Float(1e5)));
+	assert_eq!(value_of("d"), Some(ConstValue::Float(1.5e-3)));
+	assert_eq!(value_of("e"), Some(ConstValue::Float(2e3)));
+}
+
+#[test]
+fn test_f32_literal_is_rounded_once_at_the_target() {
+	// `0.1` is representable in neither f32 nor f64. The stored value must be
+	// the f32 rounding of the decimal — parsed straight to f32 — not the f64
+	// rounding cast down (which double-rounds for boundary decimals).
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: f32 = 0.1;
+        export {}
+    "});
+	no_errors(&case);
+	let key = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.items.tagged_items.get(&key).unwrap();
+	let idx = case.tir.items.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.items.constants[usize::from(idx)].const_value,
+		Some(ConstValue::Float(0.1f32 as f64)),
+	);
+}
+
+#[test]
+fn test_float_literal_overflow_reports_error() {
+	let f32_case = TestCase::new("fn f() -> f32 { 1e40 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::FloatLiteralOverflow
+	));
+
+	let f64_case = TestCase::new("fn f() -> f64 { 1e400 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::FloatLiteralOverflow
+	));
+}
+
+#[test]
+fn test_float_literal_underflow_reports_error() {
+	let f32_case = TestCase::new("fn f() -> f32 { 1e-50 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::FloatLiteralUnderflow
+	));
+
+	let f64_case = TestCase::new("fn f() -> f64 { 1e-400 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::FloatLiteralUnderflow
+	));
+}
+
+#[test]
+fn test_written_zero_float_literal_is_not_underflow() {
+	// `0.0` parses to exactly `0.0` but is a written zero, not an underflow.
+	let case = TestCase::new("fn f() -> f32 { 0.0 } export { f }");
+	no_errors(&case);
 }
 
 // ── binary arithmetic coercion ───────────────────────────────────────────
@@ -7575,8 +7676,9 @@ fn test_declaration_assoc_equality_checks_typeset_bounds() {
 		if valid {
 			case.diagnostics().assert_no_errors();
 		} else {
+			// `u32` has no `impl` of `Small`'s generated trait.
 			case.diagnostics()
-				.assert_error(DiagnosticCode::TypesetBoundViolation);
+				.assert_error(DiagnosticCode::TraitBoundViolation);
 		}
 	}
 }
@@ -7609,18 +7711,22 @@ fn test_declaration_assoc_equality_handles_bound_lists_and_duplicates() {
 }
 
 #[test]
-fn test_declaration_assoc_equality_proves_trait_for_every_typeset_member() {
+fn test_typeset_supertrait_bound_is_proven_for_typeset_bounded_param() {
+	// `typeset Choices: Marker` makes `U: Choices` prove `U: Marker` through
+	// the generated trait's supertrait chain — as long as every member of
+	// `Choices` actually implements `Marker` (checked at the typeset itself).
 	for (members, valid) in [("u8, u16", true), ("u8, u32", false)] {
 		let case = TestCase::new(&format!(
 			"trait Marker {{}} impl Marker for u8 {{}} impl Marker for u16 {{}}
-			typeset Choices {{ {members} }} trait Z {{ type A: Marker; }}
+			typeset Choices: Marker {{ {members} }} trait Z {{ type A: Marker; }}
 			type Alias<T: Z where {{ A = U }}, U: Choices> = ();"
 		));
 		if valid {
 			case.diagnostics().assert_no_errors();
 		} else {
+			// `u32` is a member of `Choices` but does not implement `Marker`.
 			case.diagnostics()
-				.assert_error(DiagnosticCode::TraitBoundViolation);
+				.assert_error(DiagnosticCode::UnsatisfiedTraitBound);
 		}
 	}
 }
@@ -11843,7 +11949,14 @@ fn test_typeset_definition_registers_in_tir() {
 	);
 	// At least stdlib Integer + user Numbers typesets are registered
 	assert!(!case.tir.items.typesets.is_empty());
-	// The user-defined identity function has one type param with one typeset bound
+	// A typeset bound is a trait bound on the typeset's generated trait.
+	let numbers = case
+		.tir
+		.items
+		.typesets
+		.iter()
+		.find(|t| case.graph.interner.resolve(t.name.inner) == Some("Numbers"))
+		.expect("Numbers typeset");
 	let identity = case
 		.tir
 		.items
@@ -11851,11 +11964,72 @@ fn test_typeset_definition_registers_in_tir() {
 		.iter()
 		.find(|f| {
 			case.graph.interner.resolve(f.name.inner) == Some("identity")
-				&& f.type_params.iter().any(|tp| tp.bounds.typeset.is_some())
 		})
-		.expect("no identity function with typeset bounds found");
+		.expect("identity function");
 	assert_eq!(identity.type_params.len(), 1);
-	assert!(identity.type_params[0].bounds.typeset.is_some());
+	assert!(
+		identity.type_params[0]
+			.bounds
+			.traits
+			.iter()
+			.any(|tb| tb.trait_index == numbers.trait_index)
+	);
+}
+
+#[test]
+fn test_typeset_generates_backing_trait_with_member_impls() {
+	let case = TestCase::new(indoc! {"
+        typeset Numbers { u8, u32 }
+        export { }
+    "});
+	assert_no_errors(&case);
+	let ts = case
+		.tir
+		.items
+		.typesets
+		.iter()
+		.find(|t| case.graph.interner.resolve(t.name.inner) == Some("Numbers"))
+		.expect("Numbers typeset");
+	let backing = &case.tir.items.traits[usize::from(ts.trait_index)];
+	assert_eq!(backing.typeset_index, case.tir.items.typeset_index(ts.id));
+	// Empty trait, reflexive `Self: Numbers` bound only (no clause).
+	assert!(backing.members.is_empty());
+	assert_eq!(backing.self_type_param.bounds.traits.len(), 1);
+	// A synthetic `impl` of the backing trait for each member.
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::U8, ts.trait_index)
+			.is_some()
+	);
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::U32, ts.trait_index)
+			.is_some()
+	);
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::I64, ts.trait_index)
+			.is_none()
+	);
+}
+
+#[test]
+fn test_typeset_bound_clause_unsatisfied_by_member_reports_error() {
+	// `bool` does not implement `Add`, so it cannot be a member of a typeset
+	// that requires `Add`.
+	let case = TestCase::new(indoc! {"
+        typeset Addable: Add { u32, bool }
+        export { }
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnsatisfiedTraitBound.code())),
+		"expected E for `bool: Add`, got: {:?}",
+		case.tir.diagnostics
+	);
 }
 
 #[test]
@@ -11869,17 +12043,23 @@ fn test_typeset_bound_violation_reports_error() {
         export { main }
     "});
 	assert!(case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-		== Some(DiagnosticCode::TypesetBoundViolation.code())));
+		== Some(DiagnosticCode::TraitBoundViolation.code())));
 }
 
 #[test]
-fn test_typeset_member_not_integer_reports_error() {
+fn test_typeset_member_not_concrete_reports_error() {
+	// A non-integer *concrete* type is fine now (`f32` here); a type that
+	// isn't a valid `impl` target — the unit type — is not.
 	let case = TestCase::new(indoc! {"
-        typeset BadSet { u32, f32 }
+        typeset BadSet { u32, f32, () }
         export { }
     "});
 	assert!(case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-		== Some(DiagnosticCode::TypesetMemberNotInteger.code())));
+		== Some(DiagnosticCode::TypesetMemberNotConcrete.code())));
+	assert!(
+		!case.tir.diagnostics.iter().any(|d| d.message.contains("f32")),
+		"`f32` should be an accepted concrete member"
+	);
 }
 
 #[test]
@@ -11897,8 +12077,9 @@ fn test_stdlib_integer_typeset_exists() {
 }
 
 #[test]
-fn test_typeset_intersection_range_in_bounds() {
-	// Integer intersection is [0, 127]; literals within that range are accepted
+fn test_typeset_bounded_literal_within_every_member_range_is_accepted() {
+	// `Integer`'s tightest member is `i8`/`u8` → [0, 127] for a value that
+	// must fit every member; literals inside that are fine.
 	let case = TestCase::new(indoc! {"
         fn make<N: Integer>(x: N) -> N { x }
         fn use_zero() -> i32 { make(0 as i32) }
@@ -11914,8 +12095,9 @@ fn test_typeset_intersection_range_in_bounds() {
 }
 
 #[test]
-fn test_typeset_intersection_range_literal_in_local() {
-	// 0 and 100 are within Integer intersection [0, 127]; locals typed as TypeParam should be fine
+fn test_typeset_bounded_literal_in_local_is_checked_against_members() {
+	// 0 and 100 fit every `Integer` member; a local typed as the type param
+	// should be fine.
 	let case = TestCase::new(indoc! {"
         fn with_bounds<N: Integer>(x: N) -> N {
             local _lo: N = 0;
@@ -11937,9 +12119,9 @@ fn test_typeset_intersection_range_literal_in_local() {
 }
 
 #[test]
-fn test_typeset_intersection_range_out_of_bounds_reports_error() {
-	// Integer intersection max is 127; 200 is outside the safe range
-	// This fires when assigning an untyped literal to a local of TypeParam type
+fn test_typeset_bounded_literal_outside_a_member_range_reports_error() {
+	// 200 fits `i32` but not `i8`/`u8`, both `Integer` members — so it cannot
+	// be assigned to a local typed as an `Integer`-bounded type param.
 	let case = TestCase::new(indoc! {"
         fn test<N: Integer>() {
             local x: N = 200;
@@ -11953,6 +12135,96 @@ fn test_typeset_intersection_range_out_of_bounds_reports_error() {
 		"expected E1047, got: {:?}",
 		case.tir.diagnostics
 	);
+}
+
+#[test]
+fn test_float_literal_coerces_to_float_only_typeset_bound() {
+	// `typeset Float { f32, f64 }` is usable: a float literal in range for
+	// every member coerces to a value of the bounded (still abstract) param.
+	let case = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        fn f<T: Float>(_seed: T) {
+            local _x: T = 1.5;
+        }
+        fn use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_float_literal_outside_a_float_member_range_reports_error() {
+	// `1e40` fits f64 but overflows f32, so it cannot coerce to a `Float`-
+	// bounded param (which could concretize to either).
+	let case = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        fn f<T: Float>(_seed: T) {
+            local _x: T = 1e40;
+        }
+        fn use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
+}
+
+#[test]
+fn test_int_literal_coerces_to_float_typeset_member_when_exact() {
+	// An integer literal exactly representable in every (float) member coerces;
+	// `2^24 + 1` (not exact in f32) does not.
+	let ok = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        fn f<T: Float>(_seed: T) {
+            local _x: T = 5;
+        }
+        fn use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	no_errors(&ok);
+
+	let bad = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        fn f<T: Float>(_seed: T) {
+            local _x: T = 16777217;
+        }
+        fn use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&bad.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
+}
+
+#[test]
+fn test_mixed_int_float_typeset_accepts_int_literal_rejects_float_literal() {
+	// A set spanning both kinds: an integer literal fitting every member is
+	// fine (it concretizes to whichever member mono picks); a float literal is
+	// rejected because it cannot become the integer member.
+	let int_ok = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        fn f<T: Num>(_seed: T) {
+            local _x: T = 5;
+        }
+        fn use_it() { f(1 as i32) }
+        export { use_it }
+    "});
+	no_errors(&int_ok);
+
+	let float_bad = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        fn f<T: Num>(_seed: T) {
+            local _x: T = 1.5;
+        }
+        fn use_it() { f(1 as i32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&float_bad.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
 }
 
 // ── operators on typeset-bounded type params ─────────────────────────────
@@ -14841,8 +15113,8 @@ fn test_trait_conformance_checks_bound_kind_assoc_binding_typeset_violation() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::TypesetBoundViolation),
-		"expected a typeset-bound-violation diagnostic for BadElem::Size (bool) not in Ints, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a bound-violation diagnostic for BadElem::Size (bool) not in Ints, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -15195,64 +15467,41 @@ fn test_unqualified_chained_projection_ambiguous_reports_error() {
 }
 
 #[test]
-fn test_where_clause_assoc_type_conflicting_typeset_bound_reports_error() {
-	// `Memory::Size` is already pinned to `SetA` by the trait's own
-	// declaration (`type Size: SetA`); `f`'s `where { Size: SetB }` tries to
-	// layer on a second, different typeset bound for the same associated
-	// type. `Bounds` only ever holds one typeset slot, so this must be
-	// rejected at the point the `where` clause is resolved rather than
-	// silently keeping (or silently dropping) one of the two.
+fn test_where_clause_can_layer_a_second_typeset_bound_on_assoc_type() {
+	// `Memory::Size` is bounded by `SetA` at the trait declaration; `f` layers
+	// a second typeset bound `SetB` via its `where` clause. Two typeset bounds
+	// are just two trait bounds now — the declaration is fine, but any `Mem`
+	// whose `Size` isn't in *both* sets fails at the call site.
 	let case = TestCase::new(indoc! {"
         typeset SetA { u8, u16 }
-        typeset SetB { u32, u64 }
+        typeset SetB { u16, u32 }
         trait Memory { type Size: SetA; }
         struct Mem8 {}
         impl Memory for Mem8 { type Size = u8; }
 
         fn f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
+        fn bad() { f(Mem8::{}); }
+        export { bad }
     "});
+	// The only error is the call-site violation — layering two typeset bounds
+	// on one associated type is legal (they are just two trait bounds).
+	// `Mem8::Size = u8` is in `SetA` but not `SetB`.
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::MultipleTypesetBounds),
-		"expected a multiple-typeset-bounds diagnostic, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected `u8: SetB` violation, got: {:?}",
+		error_messages(&case.tir),
+	);
+	assert_eq!(
 		case.tir
 			.diagnostics
 			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
-	);
-}
-
-/// The same conflict, but with the offending function actually called. E1048
-/// is a property of the written `where` clause, so it belongs to the
-/// declaration and must be reported exactly once no matter how many call
-/// sites pass through the bound — every copy would carry the *declaration's*
-/// span anyway, so they render as literal duplicates.
-#[test]
-fn test_conflicting_typeset_bound_is_reported_once_not_per_call_site() {
-	let case = TestCase::new(indoc! {"
-        typeset SetA { u8, u16 }
-        typeset SetB { u32, u64 }
-        trait Memory { type Size: SetA; }
-        struct Mem8 {}
-        impl Memory for Mem8 { type Size = u8; }
-
-        fn f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
-        fn main() { f(Mem8::{}); f(Mem8::{}); }
-        export { main }
-    "});
-	let reported = case
-		.tir
-		.diagnostics
-		.iter()
-		.filter(|d| {
-			d.code.as_deref()
-				== Some(DiagnosticCode::MultipleTypesetBounds.code())
-		})
-		.count();
-	assert_eq!(
-		reported,
+			.filter(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.count(),
 		1,
-		"expected exactly one E1048, got {reported}: {:?}",
+		"exactly one violation expected: {:?}",
 		error_messages(&case.tir),
 	);
 }

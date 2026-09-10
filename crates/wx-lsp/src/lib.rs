@@ -2168,9 +2168,7 @@ fn push_type_params(
 			s.push_str(", ");
 		}
 		s.push_str(interner.resolve(tp.name.inner).unwrap());
-		let has_bounds =
-			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
-		if has_bounds {
+		if !tp.bounds.traits.is_empty() {
 			s.push_str(": ");
 			let fmt = tir.formatter(interner, packages, from);
 			s.push_str(&fmt.display_bounds(&tp.bounds).unwrap_or_default());
@@ -2554,7 +2552,20 @@ fn symbol_hover_text(
 				.typesets
 				.get(usize::from(tir.items.typeset_index(*def_id)?))?;
 			let name = interner.resolve(typeset.name.inner).unwrap();
-			Some(format!("typeset {name} {{ ... }}"))
+			let pub_prefix =
+				if typeset.pub_span.is_some() { "pub " } else { "" };
+			// Bounds written after the `:` become supertraits of the
+			// typeset's compiler-generated backing trait.
+			let bounds_str = fmt
+				.display_supertraits(typeset.trait_index)
+				.unwrap_or_default();
+			if bounds_str.is_empty() {
+				Some(format!("{pub_prefix}typeset {name} {{ ... }}"))
+			} else {
+				Some(format!(
+					"{pub_prefix}typeset {name}: {bounds_str} {{ ... }}"
+				))
+			}
 		}
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = usize::from(tir.items.type_alias_index(*def_id)?);

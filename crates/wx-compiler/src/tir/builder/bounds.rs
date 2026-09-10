@@ -243,24 +243,21 @@ impl<'a> BoundChecker<'a> {
 			site,
 			subject,
 			&required.traits,
-			required.typeset,
 			enclosing_self,
 			&mut out,
 		);
 		out
 	}
 
-	/// `traits` and `typeset` are passed apart rather than as a `&Bounds`
-	/// because a nested level has no typeset *of its own* — see the recursive
-	/// call below — and there is no `Bounds` in the arena shaped that way to
-	/// borrow. Passing the pieces says so; building one to hold them deep-
-	/// clones a `Box<[TraitBound]>` per nesting level to express `None`.
+	/// Takes `traits` as a slice rather than a `&Bounds` because a nested
+	/// level (see the recursive call below) borrows only the trait list a
+	/// `where` binding carries, and there is no `Bounds` in the arena shaped
+	/// that way to hand over.
 	fn check_inner(
 		&mut self,
 		site: BoundSite<'_>,
 		subject: Subject,
 		traits: &[TraitBound],
-		typeset: Option<TypesetBound>,
 		enclosing_self: TypeIndex,
 		out: &mut Vec<Diagnostic<FileId>>,
 	) {
@@ -375,30 +372,6 @@ impl<'a> BoundChecker<'a> {
 						}
 					}
 					AssocBindingKind::Bound(inner) => {
-						// The nested typeset is a membership obligation only
-						// against a *concrete* associated value (conformance:
-						// `impl … { type Size = bool }` vs
-						// `where { Size: Ints }`). Against an abstract
-						// projection it is not re-checked here — a mismatch
-						// with the trait's own declared typeset is E1048,
-						// reported once at the declaration
-						// (`check_written_bounds`), not a violation of this
-						// bound.
-						if let Some(added) = inner.typeset
-							&& let Some(concrete) = actual
-							&& concrete != TypeIndex::ERROR
-							&& !self.ctx.items.type_in_typeset(
-								self.ctx.types,
-								concrete,
-								added.typeset_index,
-							) {
-							out.push(self.report_missing_typeset(
-								site,
-								subject.with_type(concrete),
-								added,
-							));
-						}
-
 						// Recurse into the nested *trait* bounds — bounded by
 						// how deep the `where` clause is literally written.
 						// Against the subject's concrete associated value if it
@@ -421,18 +394,10 @@ impl<'a> BoundChecker<'a> {
 							// is what the "required by a bound in" secondary
 							// label already points at — in the file that
 							// actually contains it.
-							// `None`: a nested level carries no typeset of
-							// its own. The one written here was already
-							// checked against the concrete value above, and
-							// against an abstract projection it is not a
-							// violation of *this* bound — a clash with the
-							// trait's own declared typeset is E1048, reported
-							// once at the declaration.
 							self.check_inner(
 								site,
 								subject.with_type(value),
 								&inner.traits,
-								None,
 								subject.ty,
 								out,
 							);
@@ -440,15 +405,6 @@ impl<'a> BoundChecker<'a> {
 					}
 				}
 			}
-		}
-
-		if let Some(typeset) = typeset
-			&& !self.ctx.items.type_in_typeset(
-				self.ctx.types,
-				subject.ty,
-				typeset.typeset_index,
-			) {
-			out.push(self.report_missing_typeset(site, subject, typeset));
 		}
 	}
 
@@ -573,15 +529,6 @@ impl<'a> BoundChecker<'a> {
 						),
 				}
 			}
-		}
-
-		if let Some(typeset) = required.typeset
-			&& !self.ctx.items.type_in_typeset(
-				self.ctx.types,
-				value.ty,
-				typeset.typeset_index,
-			) {
-			out.push(self.report_missing_typeset(site, value, typeset));
 		}
 	}
 
@@ -786,42 +733,6 @@ impl<'a> BoundChecker<'a> {
 			)
 			.with_label(
 				Label::secondary(origin_file, trait_bound.span).with_message(
-					format!("required by a bound in `{origin_name}`"),
-				),
-			)
-	}
-
-	fn report_missing_typeset(
-		&self,
-		site: BoundSite<'_>,
-		subject: Subject,
-		typeset: TypesetBound,
-	) -> Diagnostic<FileId> {
-		let subject_name = self
-			.formatter(site.namespace)
-			.display_type(subject.ty)
-			.unwrap_or_default();
-		let set_name = self
-			.ctx
-			.interner
-			.resolve(
-				self.ctx.items.typesets[usize::from(typeset.typeset_index)]
-					.name
-					.inner,
-			)
-			.unwrap()
-			.to_string();
-		let (origin_file, origin_name) = self.origin_label(site.origin);
-		Diagnostic::error()
-			.with_code(DiagnosticCode::TypesetBoundViolation.code())
-			.with_message(format!(
-				"type `{subject_name}` is not a member of typeset `{set_name}`"
-			))
-			.with_label(subject.at.primary_label().with_message(format!(
-				"`{subject_name}` is not a member of typeset `{set_name}`"
-			)))
-			.with_label(
-				Label::secondary(origin_file, typeset.span).with_message(
 					format!("required by a bound in `{origin_name}`"),
 				),
 			)

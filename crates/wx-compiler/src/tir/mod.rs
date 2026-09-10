@@ -422,6 +422,12 @@ pub struct Trait {
 	/// Stable identities allocated during prescan; signature readiness is tracked
 	/// separately by the builder.
 	pub members: HashMap<SymbolU32, MemberIndex>,
+	/// `Some` for a compiler-generated trait that backs a `typeset` — its
+	/// implementor set is closed and enumerable through the pointed-to
+	/// [`TypeSet`]'s `members`. `None` for every hand-written trait. A sealed
+	/// trait is never nameable in source; it is reached only through the
+	/// `typeset`'s own `SymbolKind::TypeSet` entry.
+	pub typeset_index: Option<TypesetIndex>,
 	#[cfg_attr(test, serde(skip))]
 	pub accesses: Vec<SourceSpan>,
 }
@@ -589,6 +595,16 @@ impl IntegerRange {
 	}
 }
 
+/// Whether `value` is exactly representable in a float whose significand has
+/// `mantissa_bits` bits (24 for f32, 53 for f64). A `u64` literal can never
+/// over- or underflow either float type, so the only question is whether its
+/// set bits span more than `mantissa_bits` positions —
+/// `64 - leading_zeros - trailing_zeros` — with `0` (no set bits) always fine.
+pub(crate) fn integer_exact_in_float(value: u64, mantissa_bits: u32) -> bool {
+	value == 0
+		|| 64 - value.leading_zeros() - value.trailing_zeros() <= mantissa_bits
+}
+
 /// A closed compile-time set of concrete types, used as a type param bound.
 /// `typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }`
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -598,11 +614,15 @@ pub struct TypeSet {
 	pub namespace: NamespaceIndex,
 	pub name: ast::Spanned<SymbolU32>,
 	pub pub_span: Option<ast::TextSpan>,
-	pub members: Box<[TypeIndex]>,
-	/// Intersection of the representable ranges of all member types.
-	/// Integer literals inside generic bodies bounded by this typeset are
-	/// validated against this range at TIR time (before monomorphization).
-	pub intersection_range: IntegerRange,
+	/// Each member carries the span of its type expression in the `typeset`
+	/// body, so a coercion failure can point at the specific member.
+	pub members: Box<[ast::Spanned<TypeIndex>]>,
+	/// The compiler-generated trait that backs this typeset. `T: ThisTypeset`
+	/// bounds resolve to a `TraitBound` on it, and every member gets a
+	/// synthetic `impl` of it. The trait shell is created next to the `TypeSet`
+	/// in prescan; its supertraits and member impls are filled in during
+	/// signature resolution.
+	pub trait_index: TraitIndex,
 	pub accesses: Vec<SourceSpan>,
 	pub attributes: Box<[ItemAttribute]>,
 }
@@ -1986,20 +2006,11 @@ pub enum AssocBindingKind {
 	Bound(Bounds),
 }
 
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypesetBound {
-	pub typeset_index: TypesetIndex,
-	pub span: TextSpan,
-}
-
 #[derive(Clone, Default)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Bounds {
 	pub traits: Box<[TraitBound]>,
-	pub typeset: Option<TypesetBound>,
 }
 
 /// A borrowed view of all applicable written constraints. Repeated trait
@@ -2011,12 +2022,6 @@ struct BoundSources<'a> {
 impl<'a> BoundSources<'a> {
 	fn traits(&self) -> impl Iterator<Item = &'a TraitBound> + '_ {
 		self.sources.iter().flat_map(|bounds| bounds.traits.iter())
-	}
-
-	/// Validation rejects multiple typesets. Prefer the declaration during
-	/// error recovery, matching the source order established by effective_bounds.
-	fn typeset(&self) -> Option<TypesetBound> {
-		self.sources.iter().find_map(|bounds| bounds.typeset)
 	}
 }
 
@@ -2294,7 +2299,6 @@ impl<'a> TypeFormatter<'a> {
 		self.write_bound_list(
 			&mut buffer,
 			trait_def.supertraits(trait_index),
-			trait_def.self_type_param.bounds.typeset.as_ref(),
 		)?;
 		Ok(buffer)
 	}
@@ -2448,9 +2452,7 @@ impl<'a> TypeFormatter<'a> {
 							.resolve(param_info.name.inner)
 							.ok_or(std::fmt::Error)
 							.and_then(|name| f.write_str(name))?;
-						let has_bounds = !param_info.bounds.traits.is_empty()
-							|| param_info.bounds.typeset.is_some();
-						if has_bounds {
+						if !param_info.bounds.traits.is_empty() {
 							f.write_str(": ")?;
 							self.write_bounds(f, &param_info.bounds)?;
 						}
@@ -2592,7 +2594,7 @@ impl<'a> TypeFormatter<'a> {
 		f: &mut impl std::fmt::Write,
 		bounds: &Bounds,
 	) -> std::fmt::Result {
-		self.write_bound_list(f, bounds.traits.iter(), bounds.typeset.as_ref())
+		self.write_bound_list(f, bounds.traits.iter())
 	}
 
 	/// The shared body of [`Self::write_bounds`] and
@@ -2603,14 +2605,11 @@ impl<'a> TypeFormatter<'a> {
 		&self,
 		f: &mut impl std::fmt::Write,
 		traits: impl Iterator<Item = &'b TraitBound>,
-		typeset: Option<&TypesetBound>,
 	) -> std::fmt::Result {
-		let mut first = true;
-		for trait_bound in traits {
-			if !first {
+		for (bound_i, trait_bound) in traits.enumerate() {
+			if bound_i > 0 {
 				f.write_str(" + ")?;
 			}
-			first = false;
 			self.interner
 				.resolve(
 					self.items.traits[usize::from(trait_bound.trait_index)]
@@ -2642,19 +2641,6 @@ impl<'a> TypeFormatter<'a> {
 				}
 				f.write_str(" }")?;
 			}
-		}
-		if let Some(typeset) = typeset {
-			if !first {
-				f.write_str(" + ")?;
-			}
-			self.interner
-				.resolve(
-					self.items.typesets[usize::from(typeset.typeset_index)]
-						.name
-						.inner,
-				)
-				.ok_or(std::fmt::Error)
-				.and_then(|name| f.write_str(name))?;
 		}
 		Ok(())
 	}
@@ -3875,17 +3861,6 @@ impl ItemRegistry {
 			.is_some()
 	}
 
-	/// True when concrete `ty` is a member of the given typeset.
-	fn concrete_type_in_typeset(
-		&self,
-		ty: TypeIndex,
-		typeset_index: TypesetIndex,
-	) -> bool {
-		self.typesets[usize::from(typeset_index)]
-			.members
-			.contains(&ty)
-	}
-
 	/// Does `ty` implement trait `trait_index`? Shared single-bound
 	/// predicate behind both `type_args_satisfy_bounds` (impl-target
 	/// unification, short-circuits to a single bool) and call-site bound
@@ -3907,26 +3882,9 @@ impl ItemRegistry {
 		trait_index: TraitIndex,
 	) -> bool {
 		match self.effective_bounds(types, ty) {
-			Some(declared) => {
-				declared
-					.traits()
-					.any(|b| self.trait_implies(b.trait_index, trait_index))
-					|| declared.typeset().is_some_and(|bound| {
-						// Typesets contain concrete primitives. Their trait guarantee
-						// holds only when every permitted type implements the trait.
-						self.typesets[usize::from(bound.typeset_index)]
-							.members
-							.iter()
-							.all(|member| {
-								self.find_trait_impl(
-									types,
-									*member,
-									trait_index,
-								)
-								.is_some()
-							})
-					})
-			}
+			Some(declared) => declared
+				.traits()
+				.any(|b| self.trait_implies(b.trait_index, trait_index)),
 			None => self.find_trait_impl(types, ty, trait_index).is_some(),
 		}
 	}
@@ -3969,20 +3927,18 @@ impl ItemRegistry {
 			.any(|index| index == required)
 	}
 
-	/// Does `ty` belong to typeset `typeset_index`? Same abstract/concrete
-	/// split as `type_implements_trait`, for the typeset side of a bound.
-	fn type_in_typeset(
+	/// The first member of `typeset` that `member_fits` rejects — its
+	/// `TypeIndex` and the span of its type expression in the `typeset` body.
+	fn first_unfit_member(
 		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-		typeset_index: TypesetIndex,
-	) -> bool {
-		match self.effective_bounds(types, ty) {
-			Some(declared) => declared
-				.typeset()
-				.is_some_and(|t| t.typeset_index == typeset_index),
-			None => self.concrete_type_in_typeset(ty, typeset_index),
-		}
+		typeset: TypesetIndex,
+		member_fits: impl Fn(TypeIndex) -> bool,
+	) -> Option<ast::Spanned<TypeIndex>> {
+		self.typesets[usize::from(typeset)]
+			.members
+			.iter()
+			.find(|member| !member_fits(member.inner))
+			.copied()
 	}
 
 	/// Shared core of `unify_inherent_impl_target`/`unify_trait_impl_target`:
@@ -4059,15 +4015,13 @@ impl ItemRegistry {
 			.zip(type_args.iter().copied())
 			.all(|(param, arg)| {
 				arg == TypeIndex::INFER
-					|| (param.bounds.traits.iter().all(|bound| {
+					|| param.bounds.traits.iter().all(|bound| {
 						self.type_implements_trait(
 							types,
 							arg,
 							bound.trait_index,
 						) && self.assoc_bindings_hold(types, arg, bound)
-					}) && param.bounds.typeset.is_none_or(|typeset| {
-						self.type_in_typeset(types, arg, typeset.typeset_index)
-					}))
+					})
 			})
 	}
 
@@ -4139,8 +4093,6 @@ impl ItemRegistry {
 							actual,
 							req.trait_index,
 						)
-					}) && required.typeset.is_none_or(|ts| {
-						self.type_in_typeset(types, actual, ts.typeset_index)
 					})
 				}
 			}

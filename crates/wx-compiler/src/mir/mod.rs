@@ -1568,6 +1568,14 @@ impl<'tir> Builder<'tir> {
 				ValueType::I64 | ValueType::U64 => {
 					buf.extend_from_slice(&value.to_le_bytes())
 				}
+				// An integer literal pinned to a float member of a typeset by
+				// monomorphization (TIR verified it is exactly representable).
+				ValueType::F32 => buf.extend_from_slice(
+					&(*value as f32).to_bits().to_le_bytes(),
+				),
+				ValueType::F64 => buf.extend_from_slice(
+					&(*value as f64).to_bits().to_le_bytes(),
+				),
 				_ => unreachable!(),
 			},
 			tir::ExprKind::Float { value } => match ty {
@@ -1793,12 +1801,25 @@ impl<'tir> Builder<'tir> {
 				kind: ExprKind::Unreachable,
 				ty: ValueType::Never,
 			},
-			tir::ExprKind::Int { value } => Expression {
-				kind: ExprKind::Int {
-					value: *value as i64,
-				},
-				ty: self.lower_type_index(expr.ty),
-			},
+			tir::ExprKind::Int { value } => {
+				// An integer literal bounded by a float-containing typeset keeps
+				// its `Int` node through TIR; once monomorphization pins the
+				// type to a float, it becomes a float constant. TIR already
+				// checked the value is exactly representable.
+				let ty = self.lower_type_index(expr.ty);
+				match ty {
+					ValueType::F32 | ValueType::F64 => Expression {
+						kind: ExprKind::Float { value: *value as f64 },
+						ty,
+					},
+					_ => Expression {
+						kind: ExprKind::Int {
+							value: *value as i64,
+						},
+						ty,
+					},
+				}
+			}
 			tir::ExprKind::Float { value } => Expression {
 				kind: ExprKind::Float { value: *value },
 				ty: self.lower_type_index(expr.ty),

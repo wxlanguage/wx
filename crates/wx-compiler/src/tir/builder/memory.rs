@@ -37,21 +37,16 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		let kind_bounds = self.resolve_bounds(resolve_context, None, kind);
-		let trait_index =
-			match (kind_bounds.traits.as_ref(), kind_bounds.typeset) {
-				([tb], None) => tb.trait_index,
-				_ => {
-					self.diagnostics.push(report_invalid_memory_kind(
-						SourceSpan::new(resolve_context.file_id, kind.span),
-					));
-					self.register_placeholder_memory(
-						resolve_context,
-						*id,
-						name,
-					);
-					return;
-				}
-			};
+		let trait_index = match kind_bounds.traits.as_ref() {
+			[tb] => tb.trait_index,
+			_ => {
+				self.diagnostics.push(report_invalid_memory_kind(
+					SourceSpan::new(resolve_context.file_id, kind.span),
+				));
+				self.register_placeholder_memory(resolve_context, *id, name);
+				return;
+			}
+		};
 
 		let mut bindings: HashMap<SymbolU32, Spanned<TypeIndex>> =
 			HashMap::new();

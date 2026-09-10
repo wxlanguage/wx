@@ -14,11 +14,25 @@ export {
 
 // struct X(i32, i32);
 
+trait Not {
+    fn not(self) -> Self;
+}
+
 enum Ordering: i8 {
     Less = -1,
     Equal = 0,
     Greater = 1,
 }
+
+trait PartialEq {
+    fn eq(self, other: Self) -> bool;
+
+    fn ne(self, other: Self) -> bool {
+        !self.eq(other)
+    }
+}
+
+trait Eq: PartialEq {}
 
 trait PartialOrd {
     fn partial_cmp(self, other: Self) -> Ordering;
@@ -58,3 +72,13 @@ trait Ord: PartialOrd {
         self
     }
 }
+
+struct Box<T> {
+    value: T,
+}
+
+typeset X { Box<_> }
+
+trait Y {}
+
+impl Y for Box<_> {}

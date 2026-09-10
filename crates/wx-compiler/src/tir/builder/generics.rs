@@ -5,14 +5,15 @@
 use super::*;
 
 impl<'ast> Builder<'ast, '_> {
-	/// Resolves a single bound name (identifier or `module::name`) directly to a [`BoundKind`]
-	/// without going through the type pool.
+	/// Resolves a single bound name (identifier or `module::name`) directly to a
+	/// [`TraitBound`] without going through the type pool. A `typeset` name
+	/// resolves to a bound on its compiler-generated trait.
 	fn resolve_identifier_as_bound(
 		&mut self,
 		resolve_context: ResolveContext,
 		identifier: Spanned<SymbolU32>,
 		full_span: TextSpan,
-	) -> Result<BoundKind, ()> {
+	) -> Result<TraitBound, ()> {
 		let file_id = resolve_context.file_id;
 		let symbol =
 			match self.resolve_pending_global_symbol(
@@ -33,21 +34,27 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
-				Ok(BoundKind::Trait(TraitBound {
+				Ok(TraitBound {
 					trait_index,
 					bindings: Box::new([]),
 					span: full_span,
-				}))
+				})
 			}
 			SymbolKind::TypeSet { typeset_index } => {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
 				self.ensure_typeset_members(typeset_index);
-				Ok(BoundKind::TypeSet(TypesetBound {
-					typeset_index,
+				// A `typeset` bound is a bound on its compiler-generated
+				// trait — the closed member set is reachable from there via
+				// `Trait::typeset_index`.
+				Ok(TraitBound {
+					trait_index: self.items.typesets
+						[usize::from(typeset_index)]
+					.trait_index,
+					bindings: Box::new([]),
 					span: full_span,
-				}))
+				})
 			}
 			_ => {
 				self.diagnostics.push(
@@ -64,12 +71,13 @@ impl<'ast> Builder<'ast, '_> {
 	/// Resolves the members of the typeset a bound just named.
 	///
 	/// A typeset's symbol is registered *resolved* at prescan, so naming one
-	/// never forces its signature the way a `Pending` symbol would — and
-	/// `members`/`intersection_range` stay empty until its own node comes up in
-	/// the sweep. Every membership check in between then reads an empty set and
-	/// reports a perfectly good type as not belonging (E1047), depending on
-	/// nothing but declaration order. Forcing it where the bound is built is
-	/// what makes `T: Integer` mean the same thing wherever it is written.
+	/// never forces its signature the way a `Pending` symbol would — and its
+	/// `members` (and its generated trait's member `impl`s) stay empty until
+	/// its own node comes up in the sweep. Every membership check in between
+	/// then reads an empty set and reports a perfectly good type as not
+	/// belonging, depending on nothing but declaration order. Forcing it where
+	/// the bound is built is what makes `T: Integer` mean the same thing
+	/// wherever it is written.
 	fn ensure_typeset_members(&mut self, typeset_index: TypesetIndex) {
 		let def_id = self.items.typesets[usize::from(typeset_index)].id;
 		// A cycle would mean this typeset's own declaration named itself;
@@ -77,15 +85,16 @@ impl<'ast> Builder<'ast, '_> {
 		let _ = self.ensure_signature(def_id);
 	}
 
-	/// Resolves a path (possibly `module::Trait`) to a [`BoundKind`] without touching the
-	/// type pool. Intermediate segments are walked as type namespaces; only the final
-	/// segment is converted to a bound.
+	/// Resolves a path (possibly `module::Trait`) to a [`TraitBound`] without
+	/// touching the type pool. Intermediate segments are walked as type
+	/// namespaces; only the final segment is converted to a bound. A `typeset`
+	/// name resolves to a bound on its compiler-generated trait.
 	pub(super) fn resolve_path_segments_as_bound(
 		&mut self,
 		resolve_context: ResolveContext,
 		segs: &[ast::PathSegment],
 		full_span: TextSpan,
-	) -> Result<BoundKind, ()> {
+	) -> Result<TraitBound, ()> {
 		debug_assert!(!segs.is_empty());
 		if segs.len() == 1 {
 			return self.resolve_identifier_as_bound(
@@ -124,7 +133,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		// Final segment: look up the symbol in the final namespace and convert to BoundKind.
+		// Final segment: look up the symbol in the final namespace and convert to a bound.
 		let last = segs.last().unwrap();
 		let file_id = resolve_context.file_id;
 		let &Type::Namespace { namespace_idx } =
@@ -159,21 +168,27 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
-				Ok(BoundKind::Trait(TraitBound {
+				Ok(TraitBound {
 					trait_index,
 					bindings: Box::new([]),
 					span: full_span,
-				}))
+				})
 			}
 			SymbolKind::TypeSet { typeset_index } => {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
 				self.ensure_typeset_members(typeset_index);
-				Ok(BoundKind::TypeSet(TypesetBound {
-					typeset_index,
+				// A `typeset` bound is a bound on its compiler-generated
+				// trait — the closed member set is reachable from there via
+				// `Trait::typeset_index`.
+				Ok(TraitBound {
+					trait_index: self.items.typesets
+						[usize::from(typeset_index)]
+					.trait_index,
+					bindings: Box::new([]),
 					span: full_span,
-				}))
+				})
 			}
 			_ => {
 				self.diagnostics.push(
@@ -189,9 +204,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Resolves a bound expression into a [`Bounds`], handling `BoundList` (flattening into
-	/// multiple trait/typeset entries), `WithBindings` (resolving associated-type bindings),
-	/// and plain `Path` bounds. At most one typeset bound is allowed; a second one is an error.
+	/// Resolves a bound expression into a [`Bounds`], handling `BoundList`
+	/// (flattening into multiple trait entries), `WithBindings` (resolving
+	/// associated-type bindings), and plain `Path` bounds. A `typeset` name
+	/// resolves like any trait — to a bound on its compiler-generated trait.
 	pub(super) fn resolve_bounds(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -205,13 +221,8 @@ impl<'ast> Builder<'ast, '_> {
 					segs,
 					bound.span,
 				) {
-					Ok(BoundKind::Trait(trait_bound)) => Bounds {
+					Ok(trait_bound) => Bounds {
 						traits: Box::new([trait_bound]),
-						typeset: None,
-					},
-					Ok(BoundKind::TypeSet(typeset_bound)) => Bounds {
-						traits: Box::new([]),
-						typeset: Some(typeset_bound),
 					},
 					Err(()) => Bounds::default(),
 				}
@@ -241,24 +252,7 @@ impl<'ast> Builder<'ast, '_> {
 					segs,
 					bound.span,
 				) {
-					Ok(BoundKind::Trait(tb)) => tb.trait_index,
-					Ok(BoundKind::TypeSet(typeset)) => {
-						self.diagnostics.push(
-							Diagnostic::error()
-								// TODO: add diagnostic code here
-								.with_message(
-									"typesets cannot have associated type bindings",
-								)
-								.with_label(Label::primary(
-									resolve_context.file_id,
-									bound.span,
-								)),
-						);
-						return Bounds {
-							traits: Box::new([]),
-							typeset: Some(typeset),
-						};
-					}
+					Ok(tb) => tb.trait_index,
 					Err(()) => return Bounds::default(),
 				};
 				// At most one entry per name — a name is only ever
@@ -357,40 +351,17 @@ impl<'ast> Builder<'ast, '_> {
 						bindings: bindings.into_boxed_slice(),
 						span: bound.span,
 					}]),
-					typeset: None,
 				}
 			}
 			ast::BoundExpression::BoundList(items) => {
 				let mut traits: Vec<TraitBound> = Vec::new();
-				let mut typeset: Option<TypesetBound> = None;
 				for item in items.iter() {
 					let resolved =
 						self.resolve_bounds(resolve_context, scope, item);
 					traits.extend_from_slice(&resolved.traits);
-					if let Some(ts) = resolved.typeset {
-						if typeset.is_some() {
-							self.diagnostics.push(
-								Diagnostic::error()
-									.with_code(
-										DiagnosticCode::MultipleTypesetBounds
-											.code(),
-									)
-									.with_message(
-										"at most one typeset bound is allowed",
-									)
-									.with_label(Label::primary(
-										resolve_context.file_id,
-										item.span,
-									)),
-							);
-						} else {
-							typeset = Some(ts);
-						}
-					}
 				}
 				Bounds {
 					traits: traits.into_boxed_slice(),
-					typeset,
 				}
 			}
 		}
@@ -634,11 +605,10 @@ impl<'ast> Builder<'ast, '_> {
 	}
 
 	/// `true` when `ty` is an `AssocTypeProjection` (e.g. `M::Size` where
-	/// `type Size: PointerSize`) whose owning trait declares that
-	/// associated type with a typeset bound. Currently all typesets consist
-	/// entirely of integer primitives, so any typeset-bounded projection is
-	/// unconditionally accepted here.
-	/// TODO: re-check each typeset member when non-numeric typesets are added.
+	/// `type Size: PointerSize`) whose owning trait declares that associated
+	/// type with a bound on a typeset — i.e. it will monomorphize to one of a
+	/// closed set of concrete primitives. Used where an abstract operand still
+	/// supports a native operation because every possible instantiation does.
 	pub(super) fn is_typeset_bounded_assoc_type(&self, ty: TypeIndex) -> bool {
 		let Type::AssocTypeProjection {
 			trait_index,
@@ -650,6 +620,12 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		self.items
 			.trait_associated_type(*trait_index, *assoc_name)
-			.is_some_and(|a| a.bounds.typeset.is_some())
+			.is_some_and(|a| {
+				a.bounds.traits.iter().any(|tb| {
+					self.items.traits[usize::from(tb.trait_index)]
+						.typeset_index
+						.is_some()
+				})
+			})
 	}
 }

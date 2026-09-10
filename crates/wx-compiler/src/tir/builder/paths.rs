@@ -541,20 +541,7 @@ impl<'ast> Builder<'ast, '_> {
 			&root.trait_path,
 			root.span,
 		) {
-			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_message(
-							"expected a trait after `as`, found a typeset",
-						)
-						.with_label(Label::primary(
-							func_ctx.resolve_context.file_id,
-							root.span,
-						)),
-				);
-				return Err(());
-			}
+			Ok(trait_bound) => trait_bound.trait_index,
 			Err(()) => return Err(()),
 		};
 

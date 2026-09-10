@@ -479,6 +479,29 @@ fn test_format_typeset_items() {
 	);
 }
 
+#[test]
+fn test_format_typeset_with_bound_clause() {
+	let case = TestCase::new(indoc! {"
+        typeset  Integer :  Add+Sub  { i32 , i64 }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            typeset Integer: Add + Sub { i32, i64 }
+        "}
+	);
+}
+
 /// Regression test for a formatter bug where `Item::Trait`/`Item::Enum`/
 /// `Item::Const`/`Item::Global`'s dispatch arms in `build_item` destructured
 /// `attributes` away via `..` and never passed it to their respective

@@ -973,20 +973,7 @@ impl<'ast> Builder<'ast, '_> {
 			&root.trait_path,
 			root.span,
 		) {
-			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_message(
-							"expected a trait after `as`, found a typeset",
-						)
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							root.span,
-						)),
-				);
-				return TypeIndex::ERROR;
-			}
+			Ok(trait_bound) => trait_bound.trait_index,
 			Err(()) => return TypeIndex::ERROR,
 		};
 
@@ -1551,7 +1538,9 @@ impl<'ast> Builder<'ast, '_> {
 	}
 }
 
-fn report_infer_in_signature(span: SourceSpan) -> Diagnostic<FileId> {
+pub(super) fn report_infer_in_signature(
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InferInSignature.code())
 		.with_message("`_` is not allowed within types on item signatures")

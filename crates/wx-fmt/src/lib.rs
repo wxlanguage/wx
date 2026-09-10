@@ -93,7 +93,6 @@ define_text! {
 		LabelColon       => " :",
 		Space            => " ",
 		SpaceLBrace      => " {",
-		SpaceLBraceSpace => " { ",
 		SpaceRBrace      => " }",
 		Where        => " where ",
 		// compound tokens
@@ -815,28 +814,17 @@ impl<'a> Builder<'a> {
 				pub_span,
 				attributes,
 				name,
+				bounds,
 				members,
 				..
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut items, attributes);
-				if pub_span.is_some() {
-					items.push(self.text(Text::Pub));
-				}
-				items.push(self.text(Text::Typeset));
-				items.push(self.symbol(name.inner));
-				items.push(self.text(Text::SpaceLBraceSpace));
-				for (i, m) in members.iter().enumerate() {
-					if i > 0 {
-						items.push(self.text(Text::CommaSp));
-					}
-					let ty = self.build_type_expression(&m.inner.inner);
-					items.push(ty);
-				}
-				items.push(self.text(Text::SpaceRBrace));
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
-			}
+			} => self.build_typeset_definition(
+				span,
+				*pub_span,
+				attributes,
+				name,
+				bounds.as_ref(),
+				members,
+			),
 			ast::Item::TypeAlias {
 				pub_span,
 				name,
@@ -1530,6 +1518,102 @@ impl<'a> Builder<'a> {
 		self.arena.concat(nodes)
 	}
 
+	/// `typeset Name: A + B { u32, u64 }`. Unlike an `enum`/`struct` body, the
+	/// member list collapses onto one line when it fits `max_line_width` — but
+	/// only when it holds no comments, since a `//` can never share a line with
+	/// the member after it. With a comment present it breaks one-member-per-line
+	/// and routes every gap through `push_between`, exactly like `enum`
+	/// variants, so trailing comments and blank lines are preserved.
+	fn build_typeset_definition(
+		&mut self,
+		span: ast::TextSpan,
+		pub_span: Option<ast::TextSpan>,
+		attributes: &[ast::Attribute],
+		name: &ast::Spanned<SymbolU32>,
+		bounds: Option<&ast::Spanned<ast::BoundExpression>>,
+		members: &[ast::Separated<ast::Spanned<ast::TypeExpression>>],
+	) -> NodeId {
+		let mut items: Vec<NodeId> = Vec::new();
+		self.build_attributes(&mut items, attributes);
+		if pub_span.is_some() {
+			items.push(self.text(Text::Pub));
+		}
+		items.push(self.text(Text::Typeset));
+		items.push(self.symbol(name.inner));
+		if let Some(bounds) = bounds {
+			items.push(self.text(Text::ColonSp));
+			items.push(self.build_bound_expression(&bounds.inner));
+		}
+		items.push(self.text(Text::SpaceLBrace));
+
+		// The comment and empty paths mirror `enum`/`struct`: an ungrouped
+		// concat, always multi-line, `push_between` for every gap. Only the
+		// no-comment path is wrapped in a `group` so `{ u32, u64 }` may
+		// collapse onto one line when it fits `max_line_width`.
+		if members.is_empty() {
+			self.build_empty_braced_comments(&mut items, span);
+			items.push(self.text(Text::RBrace));
+			return self.arena.concat(items);
+		}
+
+		if self.block_has_comments(span) {
+			let mut member_items: Vec<NodeId> = Vec::new();
+			for (index, member) in members.iter().enumerate() {
+				self.push_between(
+					&mut member_items,
+					match index {
+						0 => Before::Opener { from: span.start },
+						_ => Before::Entry {
+							end: members[index - 1].inner.span.end,
+						},
+					},
+					After::Entry {
+						start: member.inner.span.start,
+					},
+				);
+				let mut mn: Vec<NodeId> =
+					vec![self.build_type_expression(&member.inner.inner)];
+				if index + 1 < members.len() {
+					mn.push(self.text(Text::Comma));
+				} else {
+					mn.push(self.if_break_comma());
+				}
+				member_items.push(self.arena.concat(mn));
+			}
+			self.push_between(
+				&mut member_items,
+				Before::Entry {
+					end: members.last().unwrap().inner.span.end,
+				},
+				After::End { at: span.end },
+			);
+
+			let concat = self.arena.concat(member_items);
+			items.push(self.arena.indent(concat));
+			items.push(self.hard_line());
+			items.push(self.text(Text::RBrace));
+			return self.arena.concat(items);
+		}
+
+		let mut inner: Vec<NodeId> = vec![self.soft_line()];
+		for (index, member) in members.iter().enumerate() {
+			inner.push(self.build_type_expression(&member.inner.inner));
+			if index + 1 < members.len() {
+				inner.push(self.text(Text::Comma));
+				inner.push(self.soft_line());
+			} else {
+				inner.push(self.if_break_comma());
+			}
+		}
+		let inner_concat = self.arena.concat(inner);
+		items.push(self.arena.indent(inner_concat));
+		items.push(self.soft_line());
+		items.push(self.text(Text::RBrace));
+
+		let concat = self.arena.concat(items);
+		self.arena.group(concat)
+	}
+
 	fn build_struct_declaration(
 		&mut self,
 		span: ast::TextSpan,
@@ -2139,7 +2223,7 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Int { .. } | ast::Expression::Float { .. } => {
+			ast::Expression::Int { .. } | ast::Expression::Float => {
 				self.source_text(expression.span)
 			}
 			ast::Expression::Grouping { value } => {

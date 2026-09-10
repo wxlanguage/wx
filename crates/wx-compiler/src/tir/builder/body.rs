@@ -637,8 +637,15 @@ impl<'ast> Builder<'ast, '_> {
 				ty: TypeIndex::INTEGER,
 				span: expr.span,
 			}),
-			ast::Expression::Float { value } => Ok(Expression {
-				kind: ExprKind::Float { value: *value },
+			ast::Expression::Float => Ok(Expression {
+				// Sentinel. The literal is parsed from its span against the
+				// resolved target type in `coerce_untyped_float_expr` — the
+				// sole parse site, which re-parses directly to f32 for an f32
+				// target to avoid a double round. An uncoerced float literal is
+				// already a "type annotation required" error, and a literal's
+				// `ty` only becomes concrete through that coercion, so this
+				// `0.0` is never observed as a value.
+				kind: ExprKind::Float { value: 0.0 },
 				ty: TypeIndex::FLOAT,
 				span: expr.span,
 			}),
