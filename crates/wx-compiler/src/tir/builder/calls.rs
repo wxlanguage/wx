@@ -557,8 +557,7 @@ impl<'ast> Builder<'ast, '_> {
 			.zip(type_args.iter().copied())
 			.enumerate()
 			.filter(|&(_, (param, arg_ty))| {
-				arg_ty != TypeIndex::ERROR
-					&& !param.bounds.traits.is_empty()
+				arg_ty != TypeIndex::ERROR && !param.bounds.traits.is_empty()
 			})
 			.map(|(index, (_param, arg_ty))| {
 				// Narrow the span to whichever argument's declared type is
@@ -1324,7 +1323,7 @@ impl<'ast> Builder<'ast, '_> {
 	///
 	/// The caller has already demanded the declaration's signature, including
 	/// when lookup happens during Phase 2. No body demand is needed here.
-	fn entry_has_body(&self, entry: ImplEntry) -> bool {
+	pub(super) fn entry_has_body(&self, entry: ImplEntry) -> bool {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {

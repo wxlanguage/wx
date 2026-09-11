@@ -1935,8 +1935,15 @@ fn test_export_enum_reports_cannot_export_not_undeclared() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>(),
 	);
+	let status = case
+		.tir
+		.items
+		.enums
+		.iter()
+		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("Status"))
+		.expect("the `Status` enum should be registered");
 	assert_eq!(
-		case.tir.items.enums[0].accesses.len(),
+		status.accesses.len(),
 		1,
 		"the `Status` mention in `export {{ Status }}` must still be recorded as an \
 		 access so the LSP can resolve hover/go-to-definition on it despite the error"
@@ -2858,6 +2865,48 @@ fn test_primitive_bitwise_operator_records_access_for_hover() {
 			"<<",
 		),
 		"literal right operand: expected a `Shl::shl` access at the `<<` span"
+	);
+}
+
+/// `==` / `!=` on a primitive still lowers to a native `Binary` node, but the
+/// operator span is recorded as an access against `PartialEq::eq` / `::ne` for
+/// that type, so hover / go-to-definition on `==` works the same as on `+`.
+#[test]
+fn test_primitive_equality_operator_records_access_for_hover() {
+	let access_recorded = |src: &str, op: &str, method: &str| {
+		let case = TestCase::new(src);
+		assert!(
+			case.tir.diagnostics.is_empty(),
+			"unexpected diagnostics for {src:?}: {:?}",
+			case.tir
+				.diagnostics
+				.iter()
+				.map(|d| &d.message)
+				.collect::<Vec<_>>()
+		);
+		let op_start = src.find(op).unwrap() as u32;
+		let method_sym = case.graph.interner.get(method).unwrap();
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == method_sym
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		})
+	};
+
+	assert!(
+		access_recorded(
+			"fn f(a: i32, b: i32) -> bool { a == b } export { f }",
+			"==",
+			"eq",
+		),
+		"expected a `PartialEq::eq` access at the `==` span",
+	);
+	assert!(
+		access_recorded(
+			"fn f(a: char) -> bool { a != 'x' } export { f }",
+			"!=",
+			"ne",
+		),
+		"expected a `PartialEq::ne` access at the `!=` span",
 	);
 }
 
@@ -10860,6 +10909,7 @@ fn test_enum_variant_access_resolves() {
 
 #[test]
 fn test_enum_comparison() {
+	// `==`/`!=` on an enum lower natively (every enum has an integer repr).
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
             Red = 1,
@@ -10867,7 +10917,7 @@ fn test_enum_comparison() {
             Blue,
         }
         fn is_red(c: Color) -> bool {
-            c == Color::Red
+            c == Color::Red && c != Color::Blue
         }
         export { is_red }
     "});
@@ -10881,6 +10931,30 @@ fn test_enum_comparison() {
 		errors.is_empty(),
 		"expected no errors comparing enum values: {:?}",
 		errors
+	);
+}
+
+#[test]
+fn test_enum_ordering_requires_explicit_partial_ord_impl() {
+	// Unlike `==`, `<`/`>` on an enum is *not* implicit — it needs an
+	// `impl PartialOrd`, matching Rust (enums get nothing without `#[derive]`).
+	let case = TestCase::new(indoc! {"
+        enum Dir: i32 {
+            North = 0,
+            South,
+        }
+        fn f(a: Dir, b: Dir) -> bool {
+            a < b
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::BinaryOperatorCannotBeApplied),
+		"expected E1008 for `Dir < Dir` with no `PartialOrd` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
 	);
 }
 
@@ -11962,9 +12036,7 @@ fn test_typeset_definition_registers_in_tir() {
 		.items
 		.functions
 		.iter()
-		.find(|f| {
-			case.graph.interner.resolve(f.name.inner) == Some("identity")
-		})
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("identity"))
 		.expect("identity function");
 	assert_eq!(identity.type_params.len(), 1);
 	assert!(
@@ -12057,7 +12129,11 @@ fn test_typeset_member_not_concrete_reports_error() {
 	assert!(case.tir.diagnostics.iter().any(|d| d.code.as_deref()
 		== Some(DiagnosticCode::TypesetMemberNotConcrete.code())));
 	assert!(
-		!case.tir.diagnostics.iter().any(|d| d.message.contains("f32")),
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.message.contains("f32")),
 		"`f32` should be an accepted concrete member"
 	);
 }
@@ -16319,6 +16395,186 @@ fn test_generic_bitnot_bound_dispatches() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>()
 	);
+}
+
+// ── `PartialEq` overload (`==` / `!=`) ─────────────────────────────────────
+//
+// `==` dispatches through `PartialEq::eq`, `!=` through `PartialEq::ne`.
+// An impl that overrides only `eq` still gets `!=` for free: dispatch falls
+// back to the trait's own bodied default (`!self.eq(other)`), invoked as a
+// `GenericMethodCall` so monomorphization resolves `self.eq` on the concrete
+// type. Primitive `==`/`!=` stay native and never touch dispatch.
+
+#[test]
+fn test_struct_partial_eq_dispatches_both_operators() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        impl PartialEq for Point {
+            fn eq(self, other: Self) -> bool {
+                self.x == other.x && self.y == other.y
+            }
+        }
+
+        pub fn cmp(a: Point, b: Point) -> bool {
+            a == b && !(a != b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_partial_eq_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        pub fn cmp(a: Point, b: Point) -> bool {
+            a == b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Point == Point` \
+		 with no `PartialEq` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_partial_eq_bound_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn equal<T: PartialEq>(a: T, b: T) -> bool {
+            a == b
+        }
+
+        pub fn use_equal(a: bool, b: bool) -> bool {
+            equal(a, b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_primitive_equality_still_type_checks() {
+	// Primitives keep the native comparison path (a plain `Binary` node, not a
+	// `MethodCall`) even though `impl PartialEq for i32` now exists for
+	// generic-bound resolution.
+	let case = TestCase::new(indoc! {"
+        pub fn cmp(a: i32, b: i32) -> bool {
+            a == b && a != b
+        }
+    "});
+	no_errors(&case);
+}
+
+// ── `PartialOrd` overload (`<` / `<=` / `>` / `>=`) ────────────────────────
+//
+// Same machinery as `PartialEq`, one method per operator. Primitives keep the
+// native path; structs dispatch through `impl PartialOrd`; generic `<T:
+// PartialOrd>` resolves per instantiation.
+
+#[test]
+fn test_struct_partial_ord_dispatches_all_operators() {
+	let case = TestCase::new(indoc! {"
+        struct Meters { v: i32 }
+
+        impl PartialEq for Meters {
+            fn eq(self, other: Self) -> bool { self.v == other.v }
+            fn ne(self, other: Self) -> bool { self.v != other.v }
+        }
+
+        impl PartialOrd for Meters {
+            fn lt(self, other: Self) -> bool { self.v < other.v }
+            fn le(self, other: Self) -> bool { self.v <= other.v }
+            fn gt(self, other: Self) -> bool { self.v > other.v }
+            fn ge(self, other: Self) -> bool { self.v >= other.v }
+        }
+
+        pub fn cmp(a: Meters, b: Meters) -> bool {
+            a < b && a <= b && a > b && a >= b
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_partial_ord_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Meters { v: i32 }
+
+        pub fn cmp(a: Meters, b: Meters) -> bool {
+            a < b
+        }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::BinaryOperatorCannotBeApplied),
+		"expected E1008 for `Meters < Meters` with no `PartialOrd` impl, \
+		 got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_partial_ord_bound_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub fn min<T: PartialOrd>(a: T, b: T) -> bool {
+            a < b
+        }
+
+        pub fn use_min(a: u32, b: u32) -> bool {
+            min(a, b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_primitive_ordering_operator_records_access_for_hover() {
+	// `<` on a primitive stays a native `Binary` node but records the operator
+	// span as an access against `PartialOrd::lt` for that type, so hover /
+	// go-to-definition on `<` works.
+	let src = "fn f(a: u32, b: u32) -> bool { a < b } export { f }";
+	let case = TestCase::new(src);
+	assert!(case.tir.diagnostics.is_empty(), "{:?}", case.tir.diagnostics);
+	let op_start = src.find('<').unwrap() as u32;
+	let lt = case.graph.interner.get("lt").unwrap();
+	assert!(
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == lt
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		}),
+		"expected a `PartialOrd::lt` access at the `<` span",
+	);
+}
+
+#[test]
+fn test_ord_cmp_on_primitive_returns_ordering() {
+	// `Ord::cmp` is a plain trait method (no operator maps to it). Its
+	// primitive impls are branchless — `(a > b) - (a < b)` cast to
+	// `Ordering` — so this only checks the type story: `x.cmp(y)` resolves
+	// and yields `Ordering`, and the stdlib `Ordering` variants are not
+	// flagged unused (`impl Ordering`'s `is_*`/`reverse` reference them).
+	let case = TestCase::new(indoc! {"
+        pub fn c(a: i32, b: i32) -> Ordering {
+            a.cmp(b)
+        }
+
+        pub fn less(a: u32, b: u32) -> bool {
+            a.cmp(b).is_lt()
+        }
+    "});
+	no_errors(&case);
 }
 
 #[test]

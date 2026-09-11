@@ -1786,6 +1786,72 @@ fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 }
 
 #[test]
+fn test_not_operator_on_bool_lowers_to_eqz() {
+	// `!x` dispatches through `Not`; `bool`'s `#[inline] impl` is backed by
+	// the `i32_eqz` intrinsic, so after inlining + DCE only `negate` is left
+	// and its result expression is a bare `Eqz` node — the same shape `!`
+	// produced before it became trait-dispatched.
+	let case = TestCase::new(indoc! {"
+        fn negate(a: bool) -> bool {
+            !a
+        }
+
+        export { negate }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "bool::not inlined away");
+	let mut result = &mir_function(&case, "negate").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(
+		matches!(result.kind, ExprKind::Eqz { .. }),
+		"expected `!a` to lower to Eqz"
+	);
+}
+
+#[test]
+fn test_generic_partial_eq_bound_lowers_to_native_eq() {
+	// A `<T: PartialEq>` bound instantiated at `i32` monomorphizes to
+	// `impl PartialEq for i32`, whose `#[inline]` body is the `i32_eq`
+	// intrinsic — so after inlining the comparison is a bare `Eq` node, with
+	// no residual call to an `eq` method.
+	let case = TestCase::new(indoc! {"
+        fn equal<T: PartialEq>(a: T, b: T) -> bool {
+            a == b
+        }
+
+        fn use_equal(a: i32, b: i32) -> bool {
+            equal(a, b)
+        }
+
+        export { use_equal }
+    "});
+	// use_equal + equal<i32> — i32::eq is inlined away, no third function.
+	assert_eq!(case.mir.functions.len(), 2);
+
+	fn contains_eq(expr: &Expression) -> bool {
+		match &expr.kind {
+			ExprKind::Eq { .. } => true,
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_eq)
+			}
+			ExprKind::Call { arguments, .. } => {
+				arguments.iter().any(contains_eq)
+			}
+			ExprKind::LocalSet { value, .. } => contains_eq(value),
+			ExprKind::And { left, right } => {
+				contains_eq(left) || contains_eq(right)
+			}
+			_ => false,
+		}
+	}
+	assert!(
+		case.mir.functions.iter().any(|f| contains_eq(&f.block)),
+		"expected `a == b` to lower to a native Eq node after inlining"
+	);
+}
+
+#[test]
 fn test_struct_compound_assignment_lowers_to_add_call() {
 	let case = TestCase::new(indoc! {"
         struct Vec2 { x: i32, y: i32 }

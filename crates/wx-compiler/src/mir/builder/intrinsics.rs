@@ -283,6 +283,114 @@ impl<'tir> Builder<'tir> {
 				},
 				ty: self.lower_type_index(expr_ty),
 			},
+			"i32_eqz" => Expression {
+				kind: ExprKind::Eqz {
+					value: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_eq" | "i64_eq" | "f32_eq" | "f64_eq" => Expression {
+				kind: ExprKind::Eq {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_ne" | "i64_ne" | "f32_ne" | "f64_ne" => Expression {
+				kind: ExprKind::NotEq {
+					left: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[0],
+						sink,
+					)),
+					right: Box::new(self.lower_expression(
+						func_ctx,
+						&arguments[1],
+						sink,
+					)),
+				},
+				ty: self.lower_type_index(expr_ty),
+			},
+			"i32_lt" | "u32_lt" | "i64_lt" | "u64_lt" | "f32_lt" | "f64_lt" => {
+				Expression {
+					kind: ExprKind::Less {
+						left: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[0],
+							sink,
+						)),
+						right: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[1],
+							sink,
+						)),
+					},
+					ty: self.lower_type_index(expr_ty),
+				}
+			}
+			"i32_le" | "u32_le" | "i64_le" | "u64_le" | "f32_le" | "f64_le" => {
+				Expression {
+					kind: ExprKind::LessEq {
+						left: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[0],
+							sink,
+						)),
+						right: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[1],
+							sink,
+						)),
+					},
+					ty: self.lower_type_index(expr_ty),
+				}
+			}
+			"i32_gt" | "u32_gt" | "i64_gt" | "u64_gt" | "f32_gt" | "f64_gt" => {
+				Expression {
+					kind: ExprKind::Greater {
+						left: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[0],
+							sink,
+						)),
+						right: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[1],
+							sink,
+						)),
+					},
+					ty: self.lower_type_index(expr_ty),
+				}
+			}
+			"i32_ge" | "u32_ge" | "i64_ge" | "u64_ge" | "f32_ge" | "f64_ge" => {
+				Expression {
+					kind: ExprKind::GreaterEq {
+						left: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[0],
+							sink,
+						)),
+						right: Box::new(self.lower_expression(
+							func_ctx,
+							&arguments[1],
+							sink,
+						)),
+					},
+					ty: self.lower_type_index(expr_ty),
+				}
+			}
 			"i32_add" | "i64_add" | "f32_add" | "f64_add" => Expression {
 				kind: ExprKind::Add {
 					left: Box::new(self.lower_expression(

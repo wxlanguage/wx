@@ -58,6 +58,9 @@ impl<'ast> Builder<'ast, '_> {
 					(ast::UnaryOp::BitNot, ConstValue::Int(value)) => {
 						Ok(ConstValue::Int(!value))
 					}
+					(ast::UnaryOp::Not, ConstValue::Bool(value)) => {
+						Ok(ConstValue::Bool(!value))
+					}
 					_ => Err(()),
 				}
 			}
@@ -66,8 +69,69 @@ impl<'ast> Builder<'ast, '_> {
 				left,
 				right,
 			} => {
+				let left_ty = left.ty;
 				let left = self.eval_const_expr(left)?;
 				let right = self.eval_const_expr(right)?;
+				// `==`/`!=` fold for any two same-kind constants (this is the
+				// `Comptime` fallback for `PartialEq` dispatch — a plain
+				// `Binary` node with a `bool` result). Float equality follows
+				// IEEE-754, so `NaN == NaN` is `false`, matching the runtime.
+				if let BinaryOp::Eq | BinaryOp::NotEq = operator.inner {
+					let equal = match (left, right) {
+						(ConstValue::Int(a), ConstValue::Int(b)) => a == b,
+						(ConstValue::Float(a), ConstValue::Float(b)) => a == b,
+						(ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
+						(ConstValue::Char(a), ConstValue::Char(b)) => a == b,
+						_ => return Err(()),
+					};
+					return Ok(ConstValue::Bool(
+						equal == matches!(operator.inner, BinaryOp::Eq),
+					));
+				}
+				// `<`/`<=`/`>`/`>=` — the `Comptime` fallback for `PartialOrd`
+				// dispatch. Integers order by signedness (from the left
+				// operand's type, like `Div`/`Rem` below); floats follow
+				// IEEE-754, so any comparison against `NaN` is `false`.
+				if matches!(
+					operator.inner,
+					BinaryOp::Less
+						| BinaryOp::LessEq
+						| BinaryOp::Greater
+						| BinaryOp::GreaterEq
+				) {
+					let unsigned = matches!(
+						left_ty,
+						TypeIndex::U8
+							| TypeIndex::U16 | TypeIndex::U32
+							| TypeIndex::U64
+					);
+					let ordering = match (left, right) {
+						(ConstValue::Int(a), ConstValue::Int(b)) => {
+							if unsigned {
+								(a as u64).cmp(&(b as u64))
+							} else {
+								a.cmp(&b)
+							}
+						}
+						(ConstValue::Char(a), ConstValue::Char(b)) => a.cmp(&b),
+						(ConstValue::Bool(a), ConstValue::Bool(b)) => a.cmp(&b),
+						(ConstValue::Float(a), ConstValue::Float(b)) => {
+							match a.partial_cmp(&b) {
+								Some(o) => o,
+								None => return Ok(ConstValue::Bool(false)),
+							}
+						}
+						_ => return Err(()),
+					};
+					let result = match operator.inner {
+						BinaryOp::Less => ordering.is_lt(),
+						BinaryOp::LessEq => ordering.is_le(),
+						BinaryOp::Greater => ordering.is_gt(),
+						BinaryOp::GreaterEq => ordering.is_ge(),
+						_ => unreachable!(),
+					};
+					return Ok(ConstValue::Bool(result));
+				}
 				// Float operands are representation-agnostic the same way
 				// int Add/Sub/Mul are: plain `f64` arithmetic already
 				// follows IEEE-754 (division by zero yields ±∞/NaN rather
@@ -507,7 +571,9 @@ impl<'ast> Builder<'ast, '_> {
 			let mantissa_bits =
 				if target_idx == TypeIndex::F32 { 24 } else { 53 };
 			if integer_exact_in_float(value, mantissa_bits) {
-				expr.kind = ExprKind::Float { value: value as f64 };
+				expr.kind = ExprKind::Float {
+					value: value as f64,
+				};
 				expr.ty = target_idx;
 				Ok(())
 			} else {
@@ -523,27 +589,22 @@ impl<'ast> Builder<'ast, '_> {
 		} else if matches!(self.types.resolve(target_idx), Type::Pointer { .. })
 		{
 			match self.type_scalar(target_idx) {
-				Some(WasmScalar::I32) => {
-					if value > u32::MAX as u64 {
-						self.diagnostics.push(
-							report_integer_literal_out_of_range(
-								formatter,
-								IntegerLiteralOutOfRangeDiagnostic {
-									ty: TypeIndex::U32,
-									value: value as i64,
-									span: SourceSpan::new(file_id, expr.span),
-								},
-							),
-						);
-					}
+				Some(WasmScalar::I32) if value > u32::MAX as u64 => {
+					self.diagnostics.push(report_integer_literal_out_of_range(
+						formatter,
+						IntegerLiteralOutOfRangeDiagnostic {
+							ty: TypeIndex::U32,
+							value: value as i64,
+							span: SourceSpan::new(file_id, expr.span),
+						},
+					));
 				}
-				// `value` is a `u64`, so it can never exceed `u64::MAX` —
-				// nothing to check.
-				Some(WasmScalar::I64) => {}
-				// Generic pointer (`*T` in a generic-memory context): the
-				// address width isn't known until monomorphization. Indexing
-				// coerces to `M::Size` (an assoc projection, handled by the
-				// typeset branch below), so nothing reaches here in practice.
+				// Nothing to check: an in-range `I32` address; an `I64` one
+				// (a `u64` can never exceed `u64::MAX`); or a generic pointer
+				// (`*T` in a generic-memory context) whose address width isn't
+				// known until monomorphization — indexing coerces that to
+				// `M::Size`, an assoc projection handled by the typeset branch
+				// below, so nothing reaches here in practice.
 				_ => {}
 			}
 			expr.ty = target_idx;
@@ -586,15 +647,13 @@ impl<'ast> Builder<'ast, '_> {
 		let mut bounded = false;
 		let mut first_fail: Option<(TypesetIndex, ast::Spanned<TypeIndex>)> =
 			None;
-		if let Some(declared) =
-			self.items.effective_bounds(&self.types, target)
+		if let Some(declared) = self.items.effective_bounds(&self.types, target)
 		{
 			'find: for bound in declared.traits() {
 				for reachable in
 					self.items.reachable_traits([bound.trait_index])
 				{
-					let trait_def =
-						&self.items.traits[usize::from(reachable)];
+					let trait_def = &self.items.traits[usize::from(reachable)];
 					let Some(typeset) = trait_def.typeset_index else {
 						continue;
 					};
@@ -641,8 +700,7 @@ impl<'ast> Builder<'ast, '_> {
 		member: ast::Spanned<TypeIndex>,
 	) {
 		let ts = &self.items.typesets[usize::from(typeset)];
-		let ts_name =
-			self.interner.resolve(ts.name.inner).unwrap_or_default();
+		let ts_name = self.interner.resolve(ts.name.inner).unwrap_or_default();
 		let member_decl = SourceSpan::new(ts.file_id, member.span);
 		let member_name = self
 			.formatter(resolve_context.namespace)
@@ -654,12 +712,14 @@ impl<'ast> Builder<'ast, '_> {
 				.with_message(format!(
 					"literal is not representable by every member of typeset `{ts_name}`"
 				))
-				.with_label(literal_span.primary_label().with_message(
-					format!("cannot be represented by `{member_name}`"),
-				))
-				.with_label(member_decl.secondary_label().with_message(
-					format!("`{member_name}` is a member here"),
-				)),
+				.with_label(literal_span.primary_label().with_message(format!(
+					"cannot be represented by `{member_name}`"
+				)))
+				.with_label(
+					member_decl.secondary_label().with_message(format!(
+						"`{member_name}` is a member here"
+					)),
+				),
 		);
 	}
 
@@ -677,8 +737,9 @@ impl<'ast> Builder<'ast, '_> {
 	) -> Result<(), ()> {
 		let file_id = resolve_context.file_id;
 		let span = SourceSpan::new(file_id, expr.span);
-		let raw =
-			expr.span.extract_str(&self.files.get(file_id).unwrap().source);
+		let raw = expr
+			.span
+			.extract_str(&self.files.get(file_id).unwrap().source);
 		let text_is_nonzero =
 			raw.bytes().any(|b| b.is_ascii_digit() && b != b'0');
 
@@ -729,15 +790,13 @@ impl<'ast> Builder<'ast, '_> {
 			},
 		};
 		if parsed.is_infinite() {
-			self.diagnostics.push(report_float_literal_overflow(
-				fmt, target_idx, span,
-			));
+			self.diagnostics
+				.push(report_float_literal_overflow(fmt, target_idx, span));
 			return Err(());
 		}
 		if parsed == 0.0 && text_is_nonzero {
-			self.diagnostics.push(report_float_literal_underflow(
-				fmt, target_idx, span,
-			));
+			self.diagnostics
+				.push(report_float_literal_underflow(fmt, target_idx, span));
 			return Err(());
 		}
 
@@ -843,16 +902,18 @@ impl<'ast> Builder<'ast, '_> {
 		// operator's own span as an access, for `Runtime` mode only.
 		if operator.inner == ast::UnaryOp::InvertSign
 			&& let EvalMode::Runtime(traits) = &ctx.mode
-			&& let Some((trait_index, method_symbol)) =
-				traits.for_unary_op(operator.inner)
-			&& let Some(func_idx) = self.resolve_trait_method(
+		{
+			let (trait_index, method_symbol) =
+				traits.for_unary_op(operator.inner);
+			if let Some(method) = self.resolve_trait_method(
 				trait_index,
 				method_symbol,
 				target_idx,
 			) {
-			self.items.functions[usize::from(func_idx)]
-				.accesses
-				.push(SourceSpan::new(file_id, operator.span));
+				self.items.functions[usize::from(method.function_index())]
+					.accesses
+					.push(SourceSpan::new(file_id, operator.span));
+			}
 		}
 
 		expr.ty = target_idx;
@@ -912,12 +973,12 @@ impl<'ast> Builder<'ast, '_> {
 					&& let EvalMode::Runtime(traits) = &ctx.mode
 					&& let Some((trait_index, method_symbol)) =
 						traits.for_op(operator.inner)
-					&& let Some(func_idx) = self.resolve_trait_method(
+					&& let Some(method) = self.resolve_trait_method(
 						trait_index,
 						method_symbol,
 						target_idx,
 					) {
-					self.items.functions[usize::from(func_idx)]
+					self.items.functions[usize::from(method.function_index())]
 						.accesses
 						.push(SourceSpan::new(file_id, operator.span));
 				}
@@ -1117,7 +1178,8 @@ fn report_integer_literal_not_representable(
 			fmt.display_type(target_type).unwrap()
 		))
 		.with_label(
-			span.primary_label().with_message("not exactly representable"),
+			span.primary_label()
+				.with_message("not exactly representable"),
 		)
 }
 fn report_invalid_cast(

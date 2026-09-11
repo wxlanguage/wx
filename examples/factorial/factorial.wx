@@ -14,47 +14,33 @@ export {
 
 // struct X(i32, i32);
 
-trait Not {
-    fn not(self) -> Self;
-}
+// trait PartialOrd {
+//     fn partial_cmp(self, other: Self) -> Option<Ordering>;
 
-enum Ordering: i8 {
+//     fn lt(self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Less)
+//     }
+
+//     fn le(self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Greater)
+//     }
+
+//     fn gt(self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Greater)
+//     }
+
+//     fn ge(self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Less)
+//     }
+// }
+
+pub enum Ordering: i8 {
     Less = -1,
     Equal = 0,
     Greater = 1,
 }
 
-trait PartialEq {
-    fn eq(self, other: Self) -> bool;
-
-    fn ne(self, other: Self) -> bool {
-        !self.eq(other)
-    }
-}
-
-trait Eq: PartialEq {}
-
-trait PartialOrd {
-    fn partial_cmp(self, other: Self) -> Ordering;
-
-    fn lt(self, other: Self) -> bool {
-        self.partial_cmp(other) == Ordering::Less
-    }
-
-    fn le(self, other: Self) -> bool {
-        self.partial_cmp(other) != Ordering::Greater
-    }
-
-    fn gt(self, other: Self) -> bool {
-        self.partial_cmp(other) == Ordering::Greater
-    }
-
-    fn ge(self, other: Self) -> bool {
-        self.partial_cmp(other) != Ordering::Less
-    }
-}
-
-trait Ord: PartialOrd {
+pub trait Ord: PartialOrd {
     fn cmp(self, other: Self) -> Ordering;
 
     fn min(self, other: Self) -> Self {
@@ -72,13 +58,3 @@ trait Ord: PartialOrd {
         self
     }
 }
-
-struct Box<T> {
-    value: T,
-}
-
-typeset X { Box<_> }
-
-trait Y {}
-
-impl Y for Box<_> {}

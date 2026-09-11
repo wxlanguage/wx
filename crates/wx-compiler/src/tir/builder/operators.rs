@@ -58,13 +58,21 @@ pub(super) struct OperatorTraits {
 	shl: (TraitIndex, SymbolU32),
 	shr: (TraitIndex, SymbolU32),
 	bitnot: (TraitIndex, SymbolU32),
+	not: (TraitIndex, SymbolU32),
+	eq: (TraitIndex, SymbolU32),
+	ne: (TraitIndex, SymbolU32),
+	lt: (TraitIndex, SymbolU32),
+	le: (TraitIndex, SymbolU32),
+	gt: (TraitIndex, SymbolU32),
+	ge: (TraitIndex, SymbolU32),
 }
 
 impl OperatorTraits {
-	/// Maps an arithmetic or bitwise `BinaryOp` to its `(TraitIndex,
-	/// SymbolU32)` entry — the lookup every such operator-dispatch path
-	/// needs, factored out so it's defined once. `None` for an operator with
-	/// no overload trait (comparisons, logical, assignment).
+	/// Maps a `BinaryOp` to its `(TraitIndex, SymbolU32)` entry — the lookup
+	/// every operator-dispatch path needs, factored out so it's defined once.
+	/// Covers arithmetic, bitwise, equality (`==`/`!=` → `PartialEq::eq`/`ne`)
+	/// and ordering (`<`/`<=`/`>`/`>=` → `PartialOrd::lt`/`le`/`gt`/`ge`).
+	/// `None` for an operator with no overload trait (logical, assignment).
 	pub(super) fn for_op(
 		&self,
 		op: BinaryOp,
@@ -80,21 +88,29 @@ impl OperatorTraits {
 			BinaryOp::BitXor => self.bitxor,
 			BinaryOp::LeftShift => self.shl,
 			BinaryOp::RightShift => self.shr,
+			BinaryOp::Eq => self.eq,
+			BinaryOp::NotEq => self.ne,
+			BinaryOp::Less => self.lt,
+			BinaryOp::LessEq => self.le,
+			BinaryOp::Greater => self.gt,
+			BinaryOp::GreaterEq => self.ge,
 			_ => return None,
 		})
 	}
 
-	/// Unary counterpart of `for_op`, for `-x` (`Neg`) and `^x` (`BitNot`).
-	/// `None` for an operator with no overload trait (`!x`, bool-only).
+	/// Unary counterpart of `for_op`, for `-x` (`Neg`), `^x` (`BitNot`) and
+	/// `!x` (`Not`). Every unary operator has an overload trait, so — unlike
+	/// `for_op`, which returns `None` for the non-overloadable binary
+	/// operators — this is total.
 	pub(super) fn for_unary_op(
 		&self,
 		op: ast::UnaryOp,
-	) -> Option<(TraitIndex, SymbolU32)> {
-		Some(match op {
+	) -> (TraitIndex, SymbolU32) {
+		match op {
 			ast::UnaryOp::InvertSign => self.neg,
 			ast::UnaryOp::BitNot => self.bitnot,
-			ast::UnaryOp::Not => return None,
-		})
+			ast::UnaryOp::Not => self.not,
+		}
 	}
 }
 
@@ -110,37 +126,58 @@ enum CompoundOperatorDispatch {
 	Generic { abstract_method_id: ast::DefId },
 }
 
-impl<'ast> Builder<'ast, '_> {
-	/// Resolves one `#[tag = "..."]`-marked stdlib trait to its `TraitIndex`
-	/// plus its single method's name symbol. Panics on failure — by the time
-	/// this runs (right after Phase 2), `std/main.wx` is fully signature-checked,
-	/// so a missing tag is a stdlib/compiler bug, not a recoverable condition.
-	fn resolve_operator_trait(&self, tag: &str) -> (TraitIndex, SymbolU32) {
-		let symbol = self
-			.interner
-			.get(tag)
-			.unwrap_or_else(|| panic!("stdlib missing `{tag}` symbol"));
-		let def_id =
-			*self.items.tagged_items.get(&symbol).unwrap_or_else(|| {
-				panic!("stdlib missing #[tag = \"{tag}\"] item")
-			});
-		(self.items.expect_trait_index(def_id), symbol)
-	}
+/// What `Builder::resolve_trait_method` found for an operator's method on a
+/// concrete type. `Impl` — an impl block provides it directly, so the callee
+/// is fully concrete and dispatch builds a plain `MethodCall`. `Default` —
+/// only the trait's own bodied default supplies it (`PartialEq::ne` when the
+/// impl overrides just `eq`), so `Self` is still abstract inside that body and
+/// dispatch must build a `GenericMethodCall` with the operand type as the
+/// `Self` type arg, exactly like an abstract operand.
+pub(super) enum OperatorMethod {
+	Impl(FunctionIndex),
+	Default(FunctionIndex),
+}
 
+impl OperatorMethod {
+	/// The resolved method's index, regardless of which kind it is — for the
+	/// call sites that only want to record a go-to-definition access against
+	/// it and don't care whether it came from an impl or a trait default.
+	pub(super) fn function_index(&self) -> FunctionIndex {
+		match self {
+			OperatorMethod::Impl(idx) | OperatorMethod::Default(idx) => *idx,
+		}
+	}
+}
+
+impl<'ast> Builder<'ast, '_> {
 	pub(super) fn resolve_operator_traits(&self) -> OperatorTraits {
+		let resolve_operator_method = |trait_name: &str, method_name: &str| {
+			let symbol = self.interner.get(trait_name).unwrap();
+			let method_symbol = self.interner.get(method_name).unwrap();
+			let def_id = *self.items.tagged_items.get(&symbol).unwrap();
+			(self.items.expect_trait_index(def_id), method_symbol)
+		};
+
 		OperatorTraits {
-			add: self.resolve_operator_trait("add"),
-			sub: self.resolve_operator_trait("sub"),
-			mul: self.resolve_operator_trait("mul"),
-			div: self.resolve_operator_trait("div"),
-			rem: self.resolve_operator_trait("rem"),
-			neg: self.resolve_operator_trait("neg"),
-			bitand: self.resolve_operator_trait("bitand"),
-			bitor: self.resolve_operator_trait("bitor"),
-			bitxor: self.resolve_operator_trait("bitxor"),
-			shl: self.resolve_operator_trait("shl"),
-			shr: self.resolve_operator_trait("shr"),
-			bitnot: self.resolve_operator_trait("bitnot"),
+			add: resolve_operator_method("Add", "add"),
+			sub: resolve_operator_method("Sub", "sub"),
+			mul: resolve_operator_method("Mul", "mul"),
+			div: resolve_operator_method("Div", "div"),
+			rem: resolve_operator_method("Rem", "rem"),
+			neg: resolve_operator_method("Neg", "neg"),
+			bitand: resolve_operator_method("BitAnd", "bitand"),
+			bitor: resolve_operator_method("BitOr", "bitor"),
+			bitxor: resolve_operator_method("BitXor", "bitxor"),
+			shl: resolve_operator_method("Shl", "shl"),
+			shr: resolve_operator_method("Shr", "shr"),
+			bitnot: resolve_operator_method("BitNot", "bitnot"),
+			not: resolve_operator_method("Not", "not"),
+			eq: resolve_operator_method("PartialEq", "eq"),
+			ne: resolve_operator_method("PartialEq", "ne"),
+			lt: resolve_operator_method("PartialOrd", "lt"),
+			le: resolve_operator_method("PartialOrd", "le"),
+			gt: resolve_operator_method("PartialOrd", "gt"),
+			ge: resolve_operator_method("PartialOrd", "ge"),
 		}
 	}
 
@@ -154,40 +191,46 @@ impl<'ast> Builder<'ast, '_> {
 	/// `find_trait_impl` has no concrete `ImplTarget` to match). Shared by
 	/// binary (`build_operator_dispatch`), unary (`Neg`), and the
 	/// `Type::TypeParam` compound-assignment dispatch.
+	///
+	/// Distinguishes an impl-provided method (`Impl` — call it as a plain
+	/// `MethodCall`, the callee is fully concrete) from one only the trait's
+	/// own default body supplies (`Default`, e.g. `PartialEq::ne` when the
+	/// impl overrides only `eq` — this still has an abstract `Self`, so the
+	/// caller must build a `GenericMethodCall` with `ty` as the `Self` type
+	/// arg, the same as an abstract operand). The trait's own member
+	/// signatures are resolved in Phase 2, well before any operator dispatch
+	/// runs, so the default-body check here stays a pure read.
 	pub(super) fn resolve_trait_method(
 		&self,
 		trait_index: TraitIndex,
 		method_symbol: SymbolU32,
 		ty: TypeIndex,
-	) -> Option<FunctionIndex> {
+	) -> Option<OperatorMethod> {
 		let (impl_idx, _type_args) =
 			self.items.find_trait_impl(&self.types, ty, trait_index)?;
-		match self.items.trait_impls[usize::from(impl_idx)]
-			.members
-			.get(&method_symbol)?
-		{
-			ImplEntry::Method(func_idx) => Some(*func_idx),
-			_ => None,
-		}
-	}
-
-	/// The operator trait's own declared method for `method_symbol` — every
-	/// operator trait declares exactly one, so this never legitimately
-	/// misses. Shared by every "trust it, don't check the concrete type"
-	/// path: a typeset-bounded type param or associated type (`T: Size`,
-	/// `Mem::Size`) both resolve to this the same way, since neither is a
-	/// concrete `ImplTarget` `resolve_trait_method` could look up.
-	fn operator_trait_method(
-		&self,
-		trait_index: TraitIndex,
-		method_symbol: SymbolU32,
-	) -> FunctionIndex {
-		match self.items.traits[usize::from(trait_index)]
+		if let Some(entry) = self.items.trait_impls[usize::from(impl_idx)]
 			.members
 			.get(&method_symbol)
 		{
-			Some(MemberIndex::Function(idx)) => *idx,
-			_ => unreachable!("operator trait must declare its own method"),
+			return match entry {
+				ImplEntry::Method(func_idx) => {
+					Some(OperatorMethod::Impl(*func_idx))
+				}
+				_ => None,
+			};
+		}
+		// The impl exists but doesn't override this method — fall back to the
+		// trait's own bodied default (`PartialEq::ne`'s `!self.eq(other)`).
+		match self.items.traits[usize::from(trait_index)]
+			.members
+			.get(&method_symbol)?
+		{
+			MemberIndex::Function(func_idx)
+				if self.entry_has_body(ImplEntry::Method(*func_idx)) =>
+			{
+				Some(OperatorMethod::Default(*func_idx))
+			}
+			_ => None,
 		}
 	}
 
@@ -229,18 +272,28 @@ impl<'ast> Builder<'ast, '_> {
 		) {
 			return None;
 		}
-		if !self.items.type_implements_trait(&self.types, ty, trait_index) {
+		if !self
+			.items
+			.type_implements_trait(&self.types, ty, trait_index)
+		{
 			return None;
 		}
-		Some(self.operator_trait_method(trait_index, method_symbol))
+
+		match self.items.traits[usize::from(trait_index)]
+			.members
+			.get(&method_symbol)
+		{
+			Some(MemberIndex::Function(idx)) => Some(*idx),
+			_ => unreachable!("operator trait must declare its own method"),
+		}
 	}
 
-	/// Resolves `operator` for `ty` in `ctx`'s evaluation mode and builds the
-	/// resulting expression:
+	/// Resolves `operator` for `operand_ty` in `ctx`'s evaluation mode and
+	/// builds the resulting expression, whose type is `result_ty`:
 	/// - `Comptime` never attempts dispatch at all (see `EvalMode`'s doc
 	///   comment) — builds a plain `Binary` node, exactly as before operator
 	///   overloading existed, still directly foldable by `eval_const_expr`.
-	/// - `Runtime`, `ty` isn't concrete yet (`Type::TypeParam` or
+	/// - `Runtime`, `operand_ty` isn't concrete yet (`Type::TypeParam` or
 	///   `Type::AssocTypeProjection`) but its declared bounds imply the
 	///   operator's trait (see `abstract_operand_defers_operator`) — builds a
 	///   `GenericMethodCall`, deferred to real resolution once monomorphization
@@ -248,15 +301,23 @@ impl<'ast> Builder<'ast, '_> {
 	/// - `Runtime`, dispatch succeeds against a concrete type — records
 	///   `operator`'s own span as a go-to-definition access against the
 	///   resolved method (the same `accesses`-list mechanism ordinary
-	///   method calls use) and builds a `MethodCall`.
+	///   method calls use) and builds a `MethodCall`, or a `GenericMethodCall`
+	///   when only the trait's own default body supplies the method
+	///   (`OperatorMethod::Default`, e.g. `!=` → `PartialEq::ne`).
 	/// - `Runtime`, dispatch fails — reports "operator cannot be applied".
+	///
+	/// `operand_ty` and `result_ty` are the same for arithmetic and bitwise
+	/// operators (an operator on `T` yields a `T`); they differ for `==`/`!=`,
+	/// where the operands are some `T` but the result is always `bool`.
+	#[allow(clippy::too_many_arguments)]
 	fn build_operator_dispatch(
 		&mut self,
 		ctx: &ExprContext,
 		operator: Spanned<ast::BinaryOp>,
 		left: Expression,
 		right: Expression,
-		ty: TypeIndex,
+		operand_ty: TypeIndex,
+		result_ty: TypeIndex,
 		span: ast::TextSpan,
 	) -> Expression {
 		let binary_op = Spanned {
@@ -270,7 +331,7 @@ impl<'ast> Builder<'ast, '_> {
 					left: Box::new(left),
 					right: Box::new(right),
 				},
-				ty,
+				ty: result_ty,
 				span,
 			};
 		};
@@ -279,7 +340,7 @@ impl<'ast> Builder<'ast, '_> {
 			traits.for_op(binary_op.inner)
 		{
 			let deferred = self.abstract_operand_defers_operator(
-				ty,
+				operand_ty,
 				trait_index,
 				method_symbol,
 			);
@@ -292,10 +353,10 @@ impl<'ast> Builder<'ast, '_> {
 				return Expression {
 					kind: ExprKind::GenericMethodCall {
 						id: abstract_method_id,
-						type_args: Box::new([ty]),
+						type_args: Box::new([operand_ty]),
 						arguments: Box::new([left, right]),
 					},
-					ty,
+					ty: result_ty,
 					span,
 				};
 			}
@@ -303,11 +364,15 @@ impl<'ast> Builder<'ast, '_> {
 
 		let method = traits.for_op(binary_op.inner).and_then(
 			|(trait_index, method_symbol)| {
-				self.resolve_trait_method(trait_index, method_symbol, ty)
+				self.resolve_trait_method(
+					trait_index,
+					method_symbol,
+					operand_ty,
+				)
 			},
 		);
 		match method {
-			Some(func_idx) => {
+			Some(OperatorMethod::Impl(func_idx)) => {
 				let method_id = self.record_operator_method_access(
 					ctx,
 					func_idx,
@@ -318,7 +383,23 @@ impl<'ast> Builder<'ast, '_> {
 						arguments: Box::new([left, right]),
 						id: method_id,
 					},
-					ty,
+					ty: result_ty,
+					span,
+				}
+			}
+			Some(OperatorMethod::Default(func_idx)) => {
+				let method_id = self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
+				);
+				Expression {
+					kind: ExprKind::GenericMethodCall {
+						id: method_id,
+						type_args: Box::new([operand_ty]),
+						arguments: Box::new([left, right]),
+					},
+					ty: result_ty,
 					span,
 				}
 			}
@@ -329,7 +410,10 @@ impl<'ast> Builder<'ast, '_> {
 						BinaryOperatorCannotBeAppliedDiagnostic {
 							file_id: ctx.resolve_context.file_id,
 							operator,
-							operand: Spanned { inner: ty, span },
+							operand: Spanned {
+								inner: operand_ty,
+								span,
+							},
 						},
 					),
 				);
@@ -411,13 +495,28 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
-			Some(func_idx) => Ok(CompoundOperatorDispatch::Concrete(
-				self.record_operator_method_access(
-					ctx,
-					func_idx,
-					operator.span,
-				),
-			)),
+			Some(OperatorMethod::Impl(func_idx)) => {
+				Ok(CompoundOperatorDispatch::Concrete(
+					self.record_operator_method_access(
+						ctx,
+						func_idx,
+						operator.span,
+					),
+				))
+			}
+			// No compound-assignment operator's trait (`Add`..`Shr`) has a
+			// bodied default method, so this is unreachable today — but if one
+			// ever gains one, a default resolves exactly like an abstract
+			// operand: dispatch waits for monomorphization.
+			Some(OperatorMethod::Default(func_idx)) => {
+				Ok(CompoundOperatorDispatch::Generic {
+					abstract_method_id: self.record_operator_method_access(
+						ctx,
+						func_idx,
+						operator.span,
+					),
+				})
+			}
 			None => {
 				self.diagnostics.push(
 					report_binary_operator_cannot_be_applied(
@@ -437,19 +536,17 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Unary counterpart of `build_operator_dispatch`, for `-x` (`Neg`) and
-	/// `^x` (`BitNot`) — `EvalMode` gating, go-to-definition access
-	/// recording, and diagnostic-on-failure all mirror the binary case
-	/// exactly, just with one operand instead of two. Callers only ever
-	/// pass an `operator` `for_unary_op` recognizes (`InvertSign`/
-	/// `BitNot`) — `!x` (`Not`) is bool-only and never reaches here.
+	/// Unary counterpart of `build_operator_dispatch`, for `-x` (`Neg`),
+	/// `^x` (`BitNot`) and `!x` (`Not`) — `EvalMode` gating, go-to-definition
+	/// access recording, and diagnostic-on-failure all mirror the binary case
+	/// exactly, just with one operand instead of two. Every `ast::UnaryOp`
+	/// now has an overload trait, so `for_unary_op` always resolves.
 	///
 	/// TODO: revisit whether this and `build_operator_dispatch` can share
 	/// more than `resolve_trait_method` — the binary/unary duplication here
 	/// is mostly `Box::new([left, right])` vs. `Box::new([operand])` and
 	/// `ExprKind::Binary` vs. `ExprKind::Unary`, which might collapse with a
-	/// small enum over "1 or 2 operands" if a third unary/binary trait op is
-	/// ever added.
+	/// small enum over "1 or 2 operands".
 	fn build_unary_operator_dispatch(
 		&mut self,
 		ctx: &ExprContext,
@@ -468,14 +565,7 @@ impl<'ast> Builder<'ast, '_> {
 				span,
 			};
 		};
-		let Some((trait_index, method_symbol)) =
-			traits.for_unary_op(operator.inner)
-		else {
-			unreachable!(
-				"build_unary_operator_dispatch called with an operator \
-				 that has no overload trait"
-			)
-		};
+		let (trait_index, method_symbol) = traits.for_unary_op(operator.inner);
 
 		// Same reasoning as `build_operator_dispatch`'s equivalent branch: a
 		// bare `Type::TypeParam` or `Type::AssocTypeProjection` isn't
@@ -507,7 +597,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		match self.resolve_trait_method(trait_index, method_symbol, ty) {
-			Some(func_idx) => {
+			Some(OperatorMethod::Impl(func_idx)) => {
 				let method_id = self.record_operator_method_access(
 					ctx,
 					func_idx,
@@ -517,6 +607,22 @@ impl<'ast> Builder<'ast, '_> {
 					kind: ExprKind::MethodCall {
 						arguments: Box::new([operand]),
 						id: method_id,
+					},
+					ty,
+					span,
+				}
+			}
+			Some(OperatorMethod::Default(func_idx)) => {
+				let method_id = self.record_operator_method_access(
+					ctx,
+					func_idx,
+					operator.span,
+				);
+				Expression {
+					kind: ExprKind::GenericMethodCall {
+						id: method_id,
+						type_args: Box::new([ty]),
+						arguments: Box::new([operand]),
 					},
 					ty,
 					span,
@@ -609,7 +715,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			_ => unreachable!(),
 		};
-		let mut operand = self.build_expression(
+		let operand = self.build_expression(
 			ctx,
 			AccessContext {
 				expected_type: access_ctx.expected_type,
@@ -666,61 +772,41 @@ impl<'ast> Builder<'ast, '_> {
 					ctx, operator, operand, ty, expr.span,
 				))
 			}
+			// `!x` — dispatches through `Not`, exactly like `^x`/`-x`. Unlike
+			// those two there is no comptime-number form: `!` is bool-only and
+			// there is no `int -> bool` coercion, so a comptime-number operand
+			// is a hard error (recovered as `bool`). Everything else — `bool`
+			// resolving to the stdlib's `#[inline]` impl, a struct with its own
+			// `impl Not`, or a typeset-bounded type param — goes through real
+			// dispatch. `Comptime` mode leaves a plain `Unary` node behind for
+			// `eval_const_expr` to fold, same as `Neg`/`BitNot`.
+			ast::UnaryOp::Not if operand.ty.is_comptime_number() => {
+				self.diagnostics
+					.push(report_unary_operator_cannot_be_applied(
+						self.formatter(ctx.resolve_context.namespace),
+						UnaryOperatorCannotBeAppliedDiagnostic {
+							file_id: ctx.resolve_context.file_id,
+							operator,
+							operand: Spanned {
+								inner: operand.ty,
+								span: expr.span,
+							},
+						},
+					));
+				Ok(Expression {
+					kind: ExprKind::Unary {
+						operator,
+						operand: Box::new(operand),
+					},
+					ty: TypeIndex::BOOL,
+					span: expr.span,
+				})
+			}
 			ast::UnaryOp::Not => {
-				if operand.ty == TypeIndex::BOOL {
-					Ok(Expression {
-						kind: ExprKind::Unary {
-							operator,
-							operand: Box::new(operand),
-						},
-						ty: TypeIndex::BOOL,
-						span: expr.span,
-					})
-				} else if operand.ty.is_comptime_number() {
-					_ = self.coerce_untyped_expr(
-						ctx,
-						&mut operand,
-						TypeIndex::BOOL,
-					);
-					Ok(Expression {
-						kind: ExprKind::Unary {
-							operator,
-							operand: Box::new(operand),
-						},
-						ty: TypeIndex::BOOL,
-						span: expr.span,
-					})
-				} else {
-					let formatter =
-						self.formatter(ctx.resolve_context.namespace);
-					let diagnostic = Diagnostic::error()
-						.with_code(
-							DiagnosticCode::UnaryOperatorCannotBeApplied.code(),
-						)
-						.with_message(format!(
-							"operator `{}` cannot be applied to type `{}`",
-							operator.inner,
-							formatter.display_type(operand.ty).unwrap()
-						))
-						.with_label(Label::primary(
-							ctx.resolve_context.file_id,
-							operand.span,
-						))
-						.with_label(Label::secondary(
-							ctx.resolve_context.file_id,
-							operator.span,
-						));
-
-					self.diagnostics.push(diagnostic);
-					Ok(Expression {
-						kind: ExprKind::Unary {
-							operator,
-							operand: Box::new(operand),
-						},
-						ty: TypeIndex::BOOL,
-						span: expr.span,
-					})
-				}
+				let ty = operand.ty;
+				Ok(self.build_unary_operator_dispatch(
+					ctx, operator, operand, ty, expr.span,
+				))
 			}
 		}
 	}
@@ -876,6 +962,7 @@ impl<'ast> Builder<'ast, '_> {
 						left,
 						right,
 						expected_type,
+						expected_type,
 						expr.span,
 					))
 				} else {
@@ -888,18 +975,19 @@ impl<'ast> Builder<'ast, '_> {
 			(l, right_type) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, right_type)?;
 				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, right_type, expr.span,
+					ctx, operator, left, right, right_type, right_type,
+					expr.span,
 				))
 			}
 			(left_type, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, left_type)?;
 				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, left_type, expr.span,
+					ctx, operator, left, right, left_type, left_type, expr.span,
 				))
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
 				.build_operator_dispatch(
-					ctx, operator, left, right, left_type, expr.span,
+					ctx, operator, left, right, left_type, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
@@ -928,6 +1016,57 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr.span,
 				})
 			}
+		}
+	}
+
+	/// The result node for a comparison that lowers natively — a plain `Binary`
+	/// with a `bool` result, as every primitive / `bool` / enum / pointer
+	/// comparison does (no `MethodCall`; MIR emits `i32.eq`/`i32.lt_s` etc.
+	/// directly). In `Runtime` mode it still records the operator's own span as
+	/// an access against the `PartialEq` / `PartialOrd` method the operator
+	/// conceptually resolves to for `operand_ty`, so hover / go-to-definition /
+	/// find-references on `==` / `<` / … behave the same as on `+`. An
+	/// `operand_ty` with no matching impl (an enum, a pointer, an abstract
+	/// `Mem::Size`) records nothing.
+	fn native_comparison(
+		&mut self,
+		ctx: &ExprContext,
+		operator: Spanned<ast::BinaryOp>,
+		left: Expression,
+		right: Expression,
+		operand_ty: TypeIndex,
+		span: ast::TextSpan,
+	) -> Expression {
+		let method = match &ctx.mode {
+			EvalMode::Runtime(traits) => traits
+				.for_op(BinaryOp::from(operator.inner))
+				.and_then(|(trait_index, method_symbol)| {
+					self.resolve_trait_method(
+						trait_index,
+						method_symbol,
+						operand_ty,
+					)
+				}),
+			EvalMode::Comptime => None,
+		};
+		if let Some(method) = method {
+			self.record_operator_method_access(
+				ctx,
+				method.function_index(),
+				operator.span,
+			);
+		}
+		Expression {
+			kind: ExprKind::Binary {
+				operator: Spanned {
+					inner: BinaryOp::from(operator.inner),
+					span: operator.span,
+				},
+				left: Box::new(left),
+				right: Box::new(right),
+			},
+			ty: TypeIndex::BOOL,
+			span,
 		}
 	}
 
@@ -970,15 +1109,9 @@ impl<'ast> Builder<'ast, '_> {
 		match (left.ty, right.ty) {
 			// Allow operations with Error type (error already reported elsewhere)
 			(l, r) if l == TypeIndex::ERROR || r == TypeIndex::ERROR => {
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, l, expr.span,
+				))
 			}
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
 				self.diagnostics.push(
@@ -990,85 +1123,59 @@ impl<'ast> Builder<'ast, '_> {
 						),
 					),
 				);
-
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, l, expr.span,
+				))
 			}
 			(l, ty) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, ty)?;
-
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, ty, expr.span,
+				))
 			}
 			(ty, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, ty)?;
-
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, ty, expr.span,
+				))
 			}
-			(l, r) if l == TypeIndex::BOOL && r == TypeIndex::BOOL => {
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
-			}
+			(l, r) if l == TypeIndex::BOOL && r == TypeIndex::BOOL => Ok(self
+				.native_comparison(
+					ctx,
+					operator,
+					left,
+					right,
+					TypeIndex::BOOL,
+					expr.span,
+				)),
 			(left_type, right_type)
 				if left_type == right_type
 					&& (left_type.is_primitive()
 						|| self.is_typeset_bounded_assoc_type(left_type)) =>
 			{
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, left_type, expr.span,
+				))
 			}
+			// Enums compare natively for equality only — every enum has an
+			// integer repr, so `==`/`!=` are always meaningful. Ordering is
+			// not: `<`/`>`/`<=`/`>=` on an enum fall through to
+			// `build_operator_dispatch`, which requires an explicit
+			// `impl PartialOrd for MyEnum` (matching Rust, where enums get
+			// nothing without `#[derive]`).
 			(left_type, right_type)
 				if left_type == right_type
 					&& matches!(
+						operator.inner,
+						ast::BinaryOp::Eq | ast::BinaryOp::NotEq
+					) && matches!(
 						self.types.resolve(left_type),
 						Type::Enum { .. }
 					) =>
 			{
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, left_type, expr.span,
+				))
 			}
 			(left_type, right_type)
 				if matches!(
@@ -1085,16 +1192,26 @@ impl<'ast> Builder<'ast, '_> {
 					) if lt == rt && lm == rm
 				) =>
 			{
-				Ok(Expression {
-					kind: ExprKind::Binary {
-						operator: binary_op,
-						left: Box::new(left),
-						right: Box::new(right),
-					},
-					ty: TypeIndex::BOOL,
-					span: expr.span,
-				})
+				Ok(self.native_comparison(
+					ctx, operator, left, right, left_type, expr.span,
+				))
 			}
+			// Same type, but none of the built-in comparison arms above matched
+			// (not a primitive / bool / enum / pointer pair) — a struct, slice,
+			// tuple, etc. `==`/`!=` dispatch through `PartialEq` and
+			// `<`/`<=`/`>`/`>=` through `PartialOrd` (`build_operator_dispatch`,
+			// result type `bool`); a type with no such impl gets "operator
+			// cannot be applied to type `T`".
+			(left_type, right_type) if left_type == right_type => Ok(self
+				.build_operator_dispatch(
+					ctx,
+					operator,
+					left,
+					right,
+					left_type,
+					TypeIndex::BOOL,
+					expr.span,
+				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
 					self.formatter(ctx.resolve_context.namespace),
@@ -1799,13 +1916,13 @@ impl<'ast> Builder<'ast, '_> {
 			(l, ty) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, ty)?;
 				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, ty, expr.span,
+					ctx, operator, left, right, ty, ty, expr.span,
 				))
 			}
 			(ty, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, ty)?;
 				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, ty, expr.span,
+					ctx, operator, left, right, ty, ty, expr.span,
 				))
 			}
 			(l, _) if l == TypeIndex::NEVER => {
@@ -1824,7 +1941,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
 				.build_operator_dispatch(
-					ctx, operator, left, right, left_type, expr.span,
+					ctx, operator, left, right, left_type, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
