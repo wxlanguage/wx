@@ -37,21 +37,16 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		let kind_bounds = self.resolve_bounds(resolve_context, None, kind);
-		let trait_index =
-			match (kind_bounds.traits.as_ref(), kind_bounds.typeset) {
-				([tb], None) => tb.trait_index,
-				_ => {
-					self.diagnostics.push(report_invalid_memory_kind(
-						SourceSpan::new(resolve_context.file_id, kind.span),
-					));
-					self.register_placeholder_memory(
-						resolve_context,
-						*id,
-						name,
-					);
-					return;
-				}
-			};
+		let trait_index = match kind_bounds.traits.as_ref() {
+			[tb] => tb.trait_index,
+			_ => {
+				self.diagnostics.push(report_invalid_memory_kind(
+					SourceSpan::new(resolve_context.file_id, kind.span),
+				));
+				self.register_placeholder_memory(resolve_context, *id, name);
+				return;
+			}
+		};
 
 		let mut bindings: HashMap<SymbolU32, Spanned<TypeIndex>> =
 			HashMap::new();
@@ -91,32 +86,17 @@ impl<'ast> Builder<'ast, '_> {
 						span: ty_expr.span,
 					},
 				);
-				if let Some(at) = self.items.traits[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&binding.name.inner)
+				if let Some(at) = self
+					.items
+					.trait_associated_type_mut(trait_index, binding.name.inner)
 				{
 					at.accesses.push(SourceSpan::new(
 						resolve_context.file_id,
 						binding.name.span,
 					));
 				}
-				// No real `Self` exists yet at this point — the memory's own
-				// `Type::Memory` isn't interned until after this loop (it
-				// depends on `Size`, which is one of these very bindings).
-				// `Memory::Size`'s bound (`PointerSize`) has no `where { .. =
-				// Self }` clause today, so this is a no-op in practice;
-				// `ERROR` only bites if a future bound here starts requiring
-				// one.
-				self.check_assoc_type_bounds(
-					resolve_context,
-					trait_index,
-					TypeIndex::ERROR,
-					binding.name,
-					Spanned {
-						inner: val_ty,
-						span: ty_expr.span,
-					},
-				);
+				// Semantic bounds are checked on the synthesized impl during
+				// trait conformance, once its actual Self type is available.
 			}
 		}
 
@@ -155,11 +135,39 @@ impl<'ast> Builder<'ast, '_> {
 			size: memory_size.inner,
 			id: *id,
 		});
-		let members = self.seed_memory_trait_impl_with(
-			trait_index,
-			memory_type,
-			memory_size,
-		);
+		let Ok(declarations) = self.resolve_trait_declarations(trait_index)
+		else {
+			self.register_placeholder_memory(resolve_context, *id, name);
+			return;
+		};
+		// A member's declared type may name another member of this same impl
+		// — `const PAGE_SIZE: Self::Size` — and resolving that projection goes
+		// through `find_trait_impl`, which cannot see an impl that isn't
+		// registered yet. A hand-written impl never trips on this because its
+		// members are resolved on demand from `member_decls`; a synthesized
+		// one has no declarations to force, so it earns the same tolerance by
+		// building in dependency order instead.
+		//
+		// That order is fixed and shallow: an associated type's value here is
+		// this memory's own size, known before any member is touched, so
+		// associated types depend on nothing and everything else may depend on
+		// them. Two passes, never more, and no cycle is constructible.
+		let (assoc_types, dependent): (Vec<_>, Vec<_>) = declarations
+			.into_iter()
+			.partition(|(_, entry)| matches!(entry, ImplEntry::AssocType(_)));
+		let members = assoc_types
+			.into_iter()
+			.map(|(name, entry)| {
+				(
+					name,
+					self.specialize_memory_member(
+						entry,
+						memory_type,
+						memory_size,
+					),
+				)
+			})
+			.collect();
 
 		// Register the memory type as implementing its declared trait so that
 		// check_assoc_type_bounds can verify `type M: Memory` bindings on
@@ -177,12 +185,27 @@ impl<'ast> Builder<'ast, '_> {
 				span: name.span,
 			},
 			members,
+			// Synthetic: its members are built right here, in full, rather
+			// than declared in source for a later phase to resolve — so
+			// there is nothing for a lookup to have to force.
+			member_decls: HashMap::new(),
 			namespace: resolve_context.namespace,
 			span: name.span,
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),
 		});
 		self.register_trait_impl(memory_type, trait_index, trait_impl_index);
+
+		// Second pass: now that the impl is registered carrying its associated
+		// types, a member naming `Self::Size` resolves through the ordinary
+		// `find_trait_impl` path like any other projection.
+		for (member_name, entry) in dependent {
+			let member =
+				self.specialize_memory_member(entry, memory_type, memory_size);
+			self.items.trait_impls[usize::from(trait_impl_index)]
+				.members
+				.insert(member_name, member);
+		}
 
 		// Bind each namespace only if this occurrence still holds its own
 		// `Pending` slot there — see the identical comment on the Struct
@@ -427,99 +450,113 @@ impl<'ast> Builder<'ast, '_> {
 		(min_pages.map(|s| s.inner), max_pages.map(|s| s.inner))
 	}
 
-	fn seed_memory_trait_impl_with(
+	/// Every member `trait_index` declares, resolved and in source order.
+	///
+	/// Resolution is the only fallible part of synthesizing an impl, and it is
+	/// kept separate from specialization so that a failure leaves nothing
+	/// half-built: the caller can still fall back to a placeholder memory
+	/// having pushed no items.
+	fn resolve_trait_declarations(
 		&mut self,
 		trait_index: TraitIndex,
+	) -> Result<Vec<(SymbolU32, ImplEntry)>, ()> {
+		// Synthesizing a complete impl needs every declaration, unlike an
+		// ordinary lookup. Demand them explicitly in source order.
+		let trait_def = &self.items.traits[usize::from(trait_index)];
+		let mut declarations: Vec<_> = trait_def
+			.members
+			.iter()
+			.map(|(&name, &member)| (name, member.def_span(&self.items)))
+			.collect();
+		declarations.sort_unstable_by_key(|(_, decl)| decl.span.start);
+		let mut resolved = Vec::with_capacity(declarations.len());
+		for (name, decl) in declarations {
+			let entry =
+				self.declared_trait_member(trait_index, name, decl)?.expect(
+					"a collected trait declaration publishes its entry after resolution",
+				);
+			resolved.push((name, entry));
+		}
+		Ok(resolved)
+	}
+
+	/// Generated constants and associated types retain their template's
+	/// source location, so definition navigation leads to the trait member.
+	fn specialize_memory_member(
+		&mut self,
+		entry: ImplEntry,
 		memory_self: TypeIndex,
 		memory_size: Spanned<TypeIndex>,
-	) -> HashMap<SymbolU32, ImplEntry> {
-		let self_symbol = self.interner.get_or_intern("self");
-		let raw_members: Vec<(SymbolU32, ImplEntry)> = self.items.traits
-			[usize::from(trait_index)]
-		.entries
-		.iter()
-		.map(|(&sym, entry)| (sym, *entry))
-		.collect();
-		let mut members: HashMap<SymbolU32, ImplEntry> =
-			HashMap::with_capacity(raw_members.len());
-		for (sym, entry) in raw_members {
-			let processed = match entry {
-				ImplEntry::Method(fi) => {
-					let func = &self.items.functions[usize::from(fi)];
-					if func
-						.params
-						.first()
-						.map(|param| param.name.inner == self_symbol)
-						.unwrap_or(false)
-					{
-						ImplEntry::Method(fi)
-					} else {
-						ImplEntry::AssocFunction(fi)
-					}
-				}
-				ImplEntry::AssocType(idx) => {
-					let original =
-						&self.items.assoc_type_impls[usize::from(idx)];
-					let new_id = self.id_generator.generate();
-					let new_entry = AssocTypeImpl {
-						id: new_id,
-						file_id: original.file_id,
-						namespace: original.namespace,
-						name: original.name,
-						ty: Some(memory_size),
-						attributes: Box::new([]),
-					};
-					let new_index = self.items.push_assoc_type_impl(new_entry);
-					ImplEntry::AssocType(new_index)
-				}
-				ImplEntry::AssocConstant(index) => {
-					// Fork a copy of the template `Constant` with Self
-					// (TypeParam at param_index 0) substituted for the
-					// concrete memory type. `Constant` can't just be
-					// `.clone()`d (its `value` field holds an
-					// un-Clone-able `Expression`), but nothing else
-					// actually changes here.
-					let original_ty =
-						self.items.constants[usize::from(index)].ty.inner;
-					let concrete_ty =
-						self.substitute_type(original_ty, &[memory_self]);
-					let c = &self.items.constants[usize::from(index)];
-					let new_id = self.id_generator.generate();
-					// `value` itself can't be forked (not `Clone` — see
-					// above), but `const_value` can: it's what MIR lowering
-					// actually reads for a `Memory`-trait const access (see
-					// the `NamespaceAccess` handling in `mir::build`), so a
-					// default value's already-folded result (e.g.
-					// `PAGE_SIZE`'s `Int(65536)`) needs to carry over here
-					// or every memory's clone silently loses it, unlike
-					// `INDEX`/`DATA_END` (always `None` on the template
-					// too, since their values are synthesized by name in
-					// MIR instead).
-					let const_value = c.const_value;
-					let new_constant = Constant {
-						id: new_id,
-						file_id: c.file_id,
-						namespace: c.namespace,
-						parent: c.parent,
-						pub_span: c.pub_span,
-						name: c.name,
-						ty: Spanned {
-							inner: concrete_ty,
-							span: c.ty.span,
-						},
-						value: None,
-						const_value,
-						accesses: Vec::new(),
-						attributes: Box::new([]),
-					};
-					let new_index = self.items.push_constant(new_constant);
-					ImplEntry::AssocConstant(new_index)
-				}
-				other => other,
-			};
-			members.insert(sym, processed);
+	) -> ImplEntry {
+		match entry {
+			ImplEntry::AssocType(idx) => {
+				let original = &self.items.associated_types[usize::from(idx)];
+				let new_id = self.id_generator.generate();
+				let new_entry = AssociatedType {
+					bounds: Bounds::default(),
+					accesses: Vec::new(),
+					id: new_id,
+					file_id: original.file_id,
+					namespace: original.namespace,
+					name: original.name,
+					// The owning `TraitImpl` is pushed *after* its members are
+					// built, so its index isn't available here. `Trait(..)`
+					// would be a lie (this is an impl definition, not the
+					// declaration), and the field is only ever read to qualify
+					// a name in a cycle chain — which a fully-synthesized member
+					// can never be in. So: `None`.
+					parent: None,
+					ty: Some(memory_size),
+					attributes: Box::new([]),
+				};
+				let new_index = self.items.push_associated_type(new_entry);
+				ImplEntry::AssocType(new_index)
+			}
+			ImplEntry::AssocConstant(index) => {
+				// Fork a copy of the template `Constant` with Self
+				// (TypeParam at param_index 0) substituted for the
+				// concrete memory type. `Constant` can't just be
+				// `.clone()`d (its `value` field holds an
+				// un-Clone-able `Expression`), but nothing else
+				// actually changes here.
+				let original_ty =
+					self.items.constants[usize::from(index)].ty.inner;
+				let concrete_ty =
+					self.substitute_type(original_ty, &[memory_self]);
+				let c = &self.items.constants[usize::from(index)];
+				let new_id = self.id_generator.generate();
+				// `value` itself can't be forked (not `Clone` — see
+				// above), but `const_value` can: it's what MIR lowering
+				// actually reads for a `Memory`-trait const access (see
+				// the `NamespaceAccess` handling in `mir::build`), so a
+				// default value's already-folded result (e.g.
+				// `PAGE_SIZE`'s `Int(65536)`) needs to carry over here
+				// or every memory's clone silently loses it, unlike
+				// `INDEX`/`DATA_END` (always `None` on the template
+				// too, since their values are synthesized by name in
+				// MIR instead).
+				let const_value = c.const_value;
+				let new_constant = Constant {
+					id: new_id,
+					file_id: c.file_id,
+					namespace: c.namespace,
+					parent: c.parent,
+					pub_span: c.pub_span,
+					name: c.name,
+					ty: Spanned {
+						inner: concrete_ty,
+						span: c.ty.span,
+					},
+					value: None,
+					const_value,
+					accesses: Vec::new(),
+					attributes: Box::new([]),
+				};
+				let new_index = self.items.push_constant(new_constant);
+				ImplEntry::AssocConstant(new_index)
+			}
+			other => other,
 		}
-		members
 	}
 
 	pub(super) fn build_deref_expression(
@@ -660,9 +697,9 @@ impl<'ast> Builder<'ast, '_> {
 			.traits
 			.iter()
 			.find(|b| {
-				self.items.traits[usize::from(b.trait_index)]
-					.assoc_types
-					.contains_key(&size_sym)
+				self.items
+					.trait_associated_type(b.trait_index, size_sym)
+					.is_some()
 			})
 			.map(|b| b.trait_index);
 		match trait_index {

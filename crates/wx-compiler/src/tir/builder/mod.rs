@@ -9,10 +9,13 @@ use crate::{ast::MethodCallExpr, tir::*};
 
 mod aggregates;
 mod body;
+mod bounds;
 mod calls;
+mod candidates;
 mod control;
 mod generics;
 mod literal;
+mod members;
 mod memory;
 mod modules;
 mod operators;
@@ -21,7 +24,14 @@ mod prescan;
 mod signature;
 mod traits;
 mod type_compare;
+mod type_ctx;
 mod types;
+mod validation;
+
+use candidates::{CandidateSelection, CandidateSet};
+
+use bounds::{BoundChecker, BoundOrigin, Subject};
+use type_ctx::TypeCtx;
 
 use aggregates::{
 	UnknownStructFieldDiagnostic, report_duplicate_struct_field_init,
@@ -33,6 +43,7 @@ use literal::{
 	report_empty_char_literal, report_integer_literal_out_of_range,
 	report_not_const_evaluatable,
 };
+use members::TraitMemberCandidate;
 use memory::report_cannot_store_through_immutable_pointer;
 use modules::{
 	DuplicateDefinitionDiagnostic, report_duplicate_definition,
@@ -48,7 +59,7 @@ use signature::{
 };
 use traits::report_associated_type_in_inherent_impl;
 use type_compare::{SignatureComparison, TypeComparison};
-use types::report_undeclared_type;
+use types::{report_infer_in_signature, report_undeclared_type};
 
 struct ExprContext {
 	lookup: HashMap<(ScopeIndex, SymbolU32), LocalIndex>,
@@ -201,11 +212,6 @@ enum SignatureStatus {
 	Cycle,
 }
 
-enum BoundKind {
-	Trait(TraitBound),
-	TypeSet(TypesetBound),
-}
-
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 struct AstEntry<'ast> {
@@ -299,8 +305,7 @@ enum AstNodeRef<'ast> {
 		item: &'ast ast::ImplItem,
 	},
 	InherentImplBlock {
-		impl_type_params: &'ast [ast::TypeParam],
-		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
+		item: &'ast ast::Item,
 		block_index: InherentImplIndex,
 	},
 	InherentImplFunction {
@@ -470,7 +475,8 @@ enum MemberLookup {
 		type_args: Box<[TypeIndex]>,
 		trait_index: TraitIndex,
 	},
-	Ambiguous,
+	Ambiguous(Vec<TraitMemberCandidate>),
+	Error,
 	NotFound,
 }
 
@@ -481,6 +487,8 @@ enum MemberLookup {
 /// therefore which existing diagnostic code applies) can pick the right one
 /// instead of getting one blurred "not found."
 enum TraitMemberError {
+	/// A signature dependency has already been diagnosed.
+	ResolutionFailed,
 	/// `target_type` isn't bound by / doesn't implement the trait at all.
 	NotImplemented,
 	/// It does implement the trait, but the trait has no such member.
@@ -659,9 +667,14 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 	// Phase 2: demand-resolve signatures in parse order (vec is already ordered).
 	// Nothing is in progress at this level, so the status is always `Resolved`
 	// — a cycle is only ever entered, and reported, further down.
+	// Impls are resolved ahead of the sweep; see `resolve_impl_dispatch`.
+	builder.resolve_impl_dispatch();
 	for i in 0..builder.ast_nodes.len() {
 		let _ = builder.ensure_signature(builder.ast_nodes[i].def_id);
 	}
+
+	// All declaration facts and impl candidates are available before validation.
+	builder.validate_declarations();
 
 	builder.operator_traits = Some(builder.resolve_operator_traits());
 
@@ -679,6 +692,40 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 }
 
 impl<'ast> Builder<'ast, '_> {
+	/// Resolves every `impl` block's own header ahead of the rest of Phase 2,
+	/// registering it for dispatch. Members are left to the sweep.
+	///
+	/// Every other item is found by *name*, so a lookup that reaches one too
+	/// early can force it and carry on. An impl has no name: it is found by
+	/// *type*, through `trait_impl_dispatch`/`inherent_impl_dispatch`, which
+	/// only a block's own signature fills, and through `members`, which only
+	/// each member's signature fills. Nothing can demand it, so an impl the
+	/// sweep reaches late is an impl that every earlier lookup silently
+	/// failed to see — which is why `fn f(v: S::X)` used to resolve only when
+	/// `impl Tr for S` happened to precede it in the file.
+	///
+	/// Headers only, deliberately. Forcing the members here too would resolve
+	/// `S::X` in a signature no matter where the `impl` sits — but it also
+	/// moves every impl member ahead of *all* other items, and that surfaces
+	/// reads elsewhere that trust parse order instead of forcing what they
+	/// read: `concrete_type_in_typeset` consults `typesets[i].members` without
+	/// resolving the typeset first, so `memory heap: Memory where { Size = u32 }`
+	/// starts reporting E1047 against an empty `PointerSize`. Forcing a member
+	/// *by name* at the lookup site is the fix for the member half, and it
+	/// needs those reads fixed first. See
+	/// `notes/item-resolution-granularity-plan.md`.
+	fn resolve_impl_dispatch(&mut self) {
+		for i in 0..self.ast_nodes.len() {
+			if matches!(
+				self.ast_nodes[i].node,
+				AstNodeRef::TraitImplBlock { .. }
+					| AstNodeRef::InherentImplBlock { .. }
+			) {
+				let _ = self.ensure_signature(self.ast_nodes[i].def_id);
+			}
+		}
+	}
+
 	fn finish(self) -> TIR {
 		TIR {
 			items: self.items,
@@ -746,9 +793,8 @@ impl<'ast> Builder<'ast, '_> {
 				trait_index,
 				assoc_name,
 			} => {
-				self.items.traits[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&assoc_name)
+				self.items
+					.trait_associated_type_mut(trait_index, assoc_name)
 					.unwrap()
 					.accesses
 					.push(span);
@@ -986,9 +1032,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		for enum_index in 0..self.items.enums.len() {
-			let enum_index = EnumIndex::new(enum_index as u32);
-			let enum_ = &self.items.enums[usize::from(enum_index)];
+		for enum_ in self.items.enums.iter() {
 			if enum_.pub_span.is_none() && enum_.accesses.is_empty() {
 				let name = self.interner.resolve(enum_.name.inner).unwrap();
 				self.diagnostics.push(

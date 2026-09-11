@@ -141,7 +141,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let Some(callee_id) = direct_id {
 			let func_index = self.items.expect_function_index(callee_id);
 			let type_params_len = self.items.functions[usize::from(func_index)]
-				.total_type_param_count();
+				.type_param_count();
 			if type_params_len > 0 {
 				// FunctionItem.type_args is always padded to type_params_len (with
 				// impl-level args pre-filled and remaining slots as INFER) by the time
@@ -544,78 +544,31 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 
-		// Collected here instead of pushed straight to `self.diagnostics`:
-		// `param_info` below borrows `self.items` for the rest of each
-		// iteration (both the trait loop and the typeset check use it, with
-		// `continue`s in between), so nothing in this loop can also hold
-		// `&mut self.diagnostics` at the same time. Costs nothing on the
-		// common no-violation path — `Vec::new()` doesn't allocate until the
-		// first `push` — unlike cloning `param_info.bounds` would on every
-		// call regardless of outcome.
-		let mut diagnostics: Vec<Diagnostic<FileId>> = Vec::new();
-		// Every `(arg_ty, trait_bound)` pair whose bound carries at least one
-		// `where { Assoc: Bound }` constraint — deferred and checked in a
-		// second pass below, once the `function_type_params_iter` borrow
-		// (held across this whole loop, same as the reason `diagnostics`
-		// above is collected rather than pushed live) has ended, since
-		// resolving a concrete associated-type value needs
-		// `self.substitute_type` (`&mut self`), not just `&mut
-		// self.diagnostics`. Cloning `trait_bound` only happens here, on
-		// the path that already found a `: Bound` entry — the common case
-		// (no `where` clause at all, or only `= Type` entries) never
-		// allocates for this.
-		let mut assoc_checks: Vec<(TypeIndex, TraitBound)> = Vec::new();
-		// Zipped once, in lockstep, rather than re-deriving `param_info` via
-		// a fresh `.nth(arg_index)` per iteration (which would re-walk the
-		// chained parent/own type-param iterator from the start every time)
-		// — safe now that nothing in this loop needs `&mut self.items`
-		// (diagnostics are collected above instead), so holding this one
-		// iterator borrowed across the whole loop is fine.
-		for (index, (param_info, arg_ty)) in self
+		// Check each type argument against its parameter's declared bounds:
+		// trait and typeset membership plus the `where { Assoc = .. }` /
+		// `where { Assoc: .. }` refinements, recursively (see `check_bounds`).
+		// Only the *identity* of each parameter is collected up front — the
+		// bounds themselves are fetched by `check_bounds` from the origin, so
+		// nothing here holds a borrow of `self.items` across the call.
+		let func_def_id = self.items.functions[usize::from(func_index)].id;
+		let bound_checks: Vec<(TypeIndex, usize, TextSpan)> = self
 			.items
 			.function_type_params_iter(func_index)
 			.zip(type_args.iter().copied())
 			.enumerate()
-		{
-			if arg_ty == TypeIndex::ERROR {
-				continue;
-			}
-			// A declared bound can list several traits (`T: Foo + Bar`) —
-			// report every one `arg_ty` fails, not just the first.
-			for trait_bound in param_info.bounds.traits.iter() {
-				if self.items.type_implements_trait(
-					&self.types,
-					arg_ty,
-					trait_bound.trait_index,
-				) {
-					if trait_bound.bindings.iter().any(|(_, kind)| {
-						matches!(kind, AssocBindingKind::Bound(_))
-					}) {
-						assoc_checks.push((arg_ty, trait_bound.clone()));
-					}
-					continue;
-				}
-				let type_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(arg_ty)
-					.unwrap_or_default();
-				let trait_name = self
-					.interner
-					.resolve(
-						self.items.traits[usize::from(trait_bound.trait_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				// Narrow the primary span to whichever argument's declared
-				// type is exactly this type param, if one exists (a
-				// turbofish-only or return-only param has none)
-				let arg_span = self.items.functions[usize::from(func_index)]
+			.filter(|&(_, (param, arg_ty))| {
+				arg_ty != TypeIndex::ERROR && !param.bounds.traits.is_empty()
+			})
+			.map(|(index, (_param, arg_ty))| {
+				// Narrow the span to whichever argument's declared type is
+				// exactly this type param, if any (a turbofish-only or
+				// return-only param has none).
+				let span = self.items.functions[usize::from(func_index)]
 					.params
 					.iter()
 					.zip(arguments.iter())
-					.find_map(|(param, arg)| {
-						match self.types.resolve(param.ty.inner) {
+					.find_map(|(decl, arg)| {
+						match self.types.resolve(decl.ty.inner) {
 							Type::TypeParam { param_index, .. }
 								if *param_index as usize == index =>
 							{
@@ -625,202 +578,24 @@ impl<'ast> Builder<'ast, '_> {
 						}
 					})
 					.unwrap_or(call_span);
-				let func_name = self
-					.interner
-					.resolve(
-						self.items.functions[usize::from(func_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				let func_file_id =
-					self.items.functions[usize::from(func_index)].file_id;
-				diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TraitBoundViolation.code())
-						.with_message(format!(
-							"the trait bound `{type_name}: {trait_name}` is not satisfied"
-						))
-						.with_label(
-							Label::primary(
-								ctx.resolve_context.file_id,
-								arg_span,
-							)
-							.with_message(format!(
-								"the trait `{trait_name}` is not implemented for `{type_name}`"
-							)),
-						)
-						.with_label(
-							Label::secondary(func_file_id, trait_bound.span)
-								.with_message(format!(
-									"required by a bound in `{func_name}`"
-								)),
-						),
-				);
-			}
+				(arg_ty, index, span)
+			})
+			.collect();
 
-			let Some(param_bound) = param_info.bounds.typeset else {
-				continue;
-			};
-			let satisfied = self.items.type_in_typeset(
-				&self.types,
-				arg_ty,
-				param_bound.typeset_index,
-			);
-			if !satisfied {
-				let type_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(arg_ty)
-					.unwrap_or_default();
-				let set_name = self
-					.interner
-					.resolve(
-						self.items.typesets
-							[usize::from(param_bound.typeset_index)]
-						.name
-						.inner,
-					)
-					.unwrap();
-				let param_name_str =
-					self.interner.resolve(param_info.name.inner).unwrap();
-				diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::TypesetBoundViolation.code())
-						.with_message(format!(
-							"type `{type_name}` is not a member of typeset `{set_name}`"
-						))
-						.with_label(
-							Label::primary(
-								ctx.resolve_context.file_id,
-								call_span,
-							)
-							.with_message(format!(
-								"`{param_name_str}` requires a type from `{set_name}`"
-							)),
-						),
-				);
-			}
-		}
-		self.diagnostics.extend(diagnostics);
-
-		// Second pass: for each `T: Trait where { Assoc: Bound }` the call's
-		// own arguments satisfied `T: Trait` for, also check that `Assoc`'s
-		// *actual* concrete value (looked up through the now-concrete
-		// `arg_ty`'s own impl) satisfies `Bound` — the part
-		// `type_implements_trait` above can't see, since it only knows
-		// about `trait_bound.trait_index` itself, not any associated-type
-		// constraint layered onto it by the callee's `where` clause.
-		for (arg_ty, trait_bound) in assoc_checks {
-			for (assoc_name, kind) in trait_bound.bindings.iter() {
-				let AssocBindingKind::Bound(required) = kind else {
-					continue;
-				};
-				let Some(concrete) = self.concrete_assoc_type_value(
+		for (arg_ty, index, span) in bound_checks {
+			let diagnostics = self.check_bounds(
+				ctx.resolve_context.namespace,
+				Subject::new(
+					SourceSpan::new(ctx.resolve_context.file_id, span),
 					arg_ty,
-					trait_bound.trait_index,
-					*assoc_name,
-				) else {
-					continue;
-				};
-				let assoc_name_str =
-					self.interner.resolve(*assoc_name).unwrap();
-				let concrete_name = self
-					.formatter(ctx.resolve_context.namespace)
-					.display_type(concrete)
-					.unwrap_or_default();
-				let func_name = self
-					.interner
-					.resolve(
-						self.items.functions[usize::from(func_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				let func_file_id =
-					self.items.functions[usize::from(func_index)].file_id;
-
-				for req_trait in required.traits.iter() {
-					if self.items.type_implements_trait(
-						&self.types,
-						concrete,
-						req_trait.trait_index,
-					) {
-						continue;
-					}
-					let req_trait_name = self
-						.interner
-						.resolve(
-							self.items.traits
-								[usize::from(req_trait.trait_index)]
-							.name
-							.inner,
-						)
-						.unwrap();
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(DiagnosticCode::TraitBoundViolation.code())
-							.with_message(format!(
-								"the trait bound `{concrete_name}: {req_trait_name}` is not satisfied"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
-								)
-								.with_message(format!(
-									"associated type `{assoc_name_str}` is `{concrete_name}`, which does not implement `{req_trait_name}`"
-								)),
-							)
-							.with_label(
-								Label::secondary(func_file_id, trait_bound.span)
-									.with_message(format!(
-										"required by a `where` clause on `{func_name}`"
-									)),
-							),
-					);
-				}
-
-				if let Some(req_typeset) = required.typeset
-					&& !self.items.type_in_typeset(
-						&self.types,
-						concrete,
-						req_typeset.typeset_index,
-					) {
-					let set_name = self
-						.interner
-						.resolve(
-							self.items.typesets
-								[usize::from(req_typeset.typeset_index)]
-							.name
-							.inner,
-						)
-						.unwrap();
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::TypesetBoundViolation.code(),
-							)
-							.with_message(format!(
-								"associated type `{assoc_name_str}` (`{concrete_name}`) is not a member of typeset `{set_name}`"
-							))
-							.with_label(
-								Label::primary(
-									ctx.resolve_context.file_id,
-									call_span,
-								)
-								.with_message(format!(
-									"`{assoc_name_str}` requires a type from `{set_name}`"
-								)),
-							)
-							.with_label(
-								Label::secondary(func_file_id, trait_bound.span)
-									.with_message(format!(
-										"required by a `where` clause on `{func_name}`"
-									)),
-							),
-					);
-				}
-			}
+				),
+				BoundOrigin::TypeParam {
+					owner: TypeParamOwner::Function(func_def_id),
+					index,
+				},
+				&type_args,
+			);
+			self.diagnostics.extend(diagnostics);
 		}
 
 		type_args
@@ -1086,8 +861,10 @@ impl<'ast> Builder<'ast, '_> {
 		// marked accessed, or dead-code detection would flag all of them
 		// as unused even though any could end up being the one called.
 		if let MemberLookup::Trait { trait_index, .. } = &lookup
-			&& matches!(self.types.resolve(lookup_ty), Type::TypeParam { .. })
-		{
+			&& matches!(
+				self.types.resolve(lookup_ty),
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+			) {
 			self.record_abstract_dispatch_access(
 				*trait_index,
 				method.inner,
@@ -1134,11 +911,11 @@ impl<'ast> Builder<'ast, '_> {
 				// call site to resolve. Otherwise (no impl-level generics at
 				// all) start every slot as `INFER`.
 				let type_args = if type_args.is_empty() {
-					vec![TypeIndex::INFER; func.total_type_param_count()]
+					vec![TypeIndex::INFER; func.type_param_count()]
 						.into_boxed_slice()
 				} else {
 					let mut padded =
-						vec![TypeIndex::INFER; func.total_type_param_count()];
+						vec![TypeIndex::INFER; func.type_param_count()];
 					padded[..type_args.len()].copy_from_slice(&type_args);
 					padded.into_boxed_slice()
 				};
@@ -1162,7 +939,17 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
-			MemberLookup::Ambiguous => Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					lookup_ty,
+					method.inner,
+					method.span,
+					&candidates,
+				);
+				Err(())
+			}
+			MemberLookup::Error => Err(()),
 		}
 	}
 
@@ -1178,48 +965,32 @@ impl<'ast> Builder<'ast, '_> {
 			entry: ImplEntry,
 			type_args: Box<[TypeIndex]>,
 		}
-		let mut candidates: Vec<MemberCandidate> = Vec::new();
-		let mut candidate: Option<MemberCandidate> = None;
+		let mut candidates = CandidateSet::new();
 
 		match self.types.resolve(target_type) {
-			Type::TypeParam { owner, param_index } => {
-				for trait_index in self
-					.items
-					.type_param_info(*owner, *param_index as usize)
-					.bounds
-					.traits
-					.iter()
-					.map(|bound| bound.trait_index)
-				{
-					let entry = match self.items.traits
-						[usize::from(trait_index)]
-					.entries
-					.get(&member_symbol)
-					.cloned()
-					{
-						Some(entry) => entry,
-						None => continue,
-					};
-					let type_args =
-						self.pad_type_args(entry, Box::new([target_type]));
-					match candidate.take() {
-						Some(existing) => {
-							candidates.push(existing);
-							candidates.push(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
+				return match self.member_via_bounds(
+					target_type,
+					member_symbol,
+					None,
+					SourceSpan::new(resolve_context.file_id, member_span),
+				) {
+					Ok(CandidateSelection::None) => MemberLookup::NotFound,
+					Ok(CandidateSelection::One(candidate)) => {
+						MemberLookup::Trait {
+							entry: candidate.entry,
+							type_args: self.pad_type_args(
+								candidate.entry,
+								Box::new([target_type]),
+							),
+							trait_index: candidate.trait_index,
 						}
-						None => {
-							candidate = Some(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
-						}
-					};
-				}
+					}
+					Ok(CandidateSelection::Many(candidates)) => {
+						MemberLookup::Ambiguous(candidates)
+					}
+					Err(()) => MemberLookup::Error,
+				};
 			}
 			_ => {
 				let target = match ImplTarget::from_type(
@@ -1228,6 +999,7 @@ impl<'ast> Builder<'ast, '_> {
 					Ok(target) => target,
 					Err(_) => return MemberLookup::NotFound,
 				};
+				self.ensure_inherent_impl_members(target, member_symbol);
 				if let Some(result) = self.resolve_inherent_member(
 					target,
 					target_type,
@@ -1242,103 +1014,98 @@ impl<'ast> Builder<'ast, '_> {
 				// exact equality for concrete impls, so this covers exactly
 				// what the old exact-key `type_trait_impls` lookup did, plus
 				// generic impls.
-				for (trait_index, impl_index) in self
+				//
+				// Iterated by index with a fresh bucket lookup each step:
+				// `trait_member_via_impl` needs `&mut self`, and the dispatch
+				// index is fully collected before Phase 2 begins (a member
+				// demand never registers a new impl block), so the bucket for
+				// `target` cannot grow or move under the loop.
+				let bucket_len = self
 					.items
 					.trait_impl_dispatch
 					.get(&target)
-					.map(|v| v.as_slice())
-					.unwrap_or_default()
-					.iter()
-					.copied()
-				{
-					let Some((entry, type_args)) = self.trait_member_via_impl(
+					.map_or(0, Vec::len);
+				for i in 0..bucket_len {
+					let (trait_index, impl_index) =
+						self.items.trait_impl_dispatch[&target][i];
+					let (entry, type_args) = match self.trait_member_via_impl(
 						trait_index,
 						impl_index,
 						target_type,
 						member_symbol,
-					) else {
-						continue;
+						SourceSpan::new(resolve_context.file_id, member_span),
+					) {
+						Ok(Some(member)) => member,
+						Ok(None) => continue,
+						Err(()) => return MemberLookup::Error,
 					};
-					match candidate.take() {
-						Some(existing) => {
-							candidates.push(existing);
-							candidates.push(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							});
-						}
-						None => {
-							candidate = Some(MemberCandidate {
-								trait_index,
-								entry,
-								type_args,
-							})
-						}
-					}
+					candidates.insert(
+						impl_index,
+						MemberCandidate {
+							trait_index,
+							entry,
+							type_args,
+						},
+					);
 				}
 			}
 		};
 
-		// Both loops above route their single-match case through `candidate`
-		// and only ever spill into `candidates` once a *second* match shows
-		// up (via `candidate.take()`), so `candidates` is never left holding
-		// exactly one entry — it's either empty or a genuine 2+-way
-		// conflict. `candidate` is therefore the one place a clean match
-		// can come from; `candidates.is_empty()` alone decides `NotFound`
-		// vs. ambiguous.
-		if let Some(candidate) = candidate {
-			debug_assert!(candidates.is_empty());
-			return MemberLookup::Trait {
-				entry: candidate.entry,
-				type_args: candidate.type_args,
-				trait_index: candidate.trait_index,
-			};
-		}
-
-		if candidates.is_empty() {
-			MemberLookup::NotFound
-		} else {
-			let formatter = self.formatter(resolve_context.namespace);
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::AmbiguousTraitMember.code().to_string(),
-				),
-				message: "multiple applicable items in scope".to_string(),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
-			diagnostic.labels.push(
-				SourceSpan::new(resolve_context.file_id, member_span)
-					.primary_label()
-					.with_message(format!(
-						"multiple `{}` found",
-						formatter.interner.resolve(member_symbol).unwrap()
-					)),
-			);
-			let type_name = formatter.display_type(target_type).unwrap();
-			for (idx, candidate) in candidates.iter().enumerate() {
-				let trait_name = self.items.traits
-					[usize::from(candidate.trait_index)]
-				.name
-				.inner;
-				let trait_name =
-					formatter.interner.resolve(trait_name).unwrap();
-				let message = format!(
-					"candidate #{} is defined in an impl of the trait `{trait_name}` for the type `{type_name}`",
-					idx + 1
-				);
-				diagnostic.labels.push(
-					candidate
-						.entry
-						.def_span(&self.items)
-						.secondary_label()
-						.with_message(message),
-				);
+		let candidates = match candidates.finish() {
+			CandidateSelection::None => return MemberLookup::NotFound,
+			CandidateSelection::One(candidate) => {
+				return MemberLookup::Trait {
+					entry: candidate.entry,
+					type_args: candidate.type_args,
+					trait_index: candidate.trait_index,
+				};
 			}
-			self.diagnostics.push(diagnostic);
-			MemberLookup::Ambiguous
+			CandidateSelection::Many(candidates) => candidates,
+		};
+		MemberLookup::Ambiguous(
+			candidates
+				.into_iter()
+				.map(|candidate| TraitMemberCandidate {
+					trait_index: candidate.trait_index,
+					entry: candidate.entry,
+				})
+				.collect(),
+		)
+	}
+
+	/// Demand the named member in inherent candidates. The bucket is
+	/// keyed by name as well as by target, so it is already the exact set of
+	/// blocks that declare `member_symbol` for this type constructor — the
+	/// candidates are found the same way either resolved or not, and only the
+	/// forcing differs.
+	fn ensure_inherent_impl_members(
+		&mut self,
+		target: ImplTarget,
+		member_symbol: SymbolU32,
+	) {
+		let unresolved: Vec<ast::DefId> = self
+			.items
+			.inherent_impl_dispatch
+			.get(&(target, member_symbol))
+			.map(|bucket| {
+				bucket
+					.iter()
+					.filter_map(|&block_index| {
+						let block = &self.items.inherent_impls
+							[usize::from(block_index)];
+						if block.members.contains_key(&member_symbol) {
+							return None;
+						}
+						block
+							.member_decls
+							.get(&member_symbol)
+							.map(|decl| decl.id)
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		for def_id in unresolved {
+			let _ = self.ensure_signature(def_id);
 		}
 	}
 
@@ -1348,9 +1115,8 @@ impl<'ast> Builder<'ast, '_> {
 	/// no inherent match at all — the caller falls through to the trait
 	/// scan. More than one match is a real conflict (see the comment on
 	/// `resolve_impl_member`'s trait-impl loop) and is reported here as
-	/// `Some(Ambiguous)`. Mirrors the `TypeParam` branch's
-	/// `candidate`/`candidates` split so the common single-match case never
-	/// allocates a `Vec`.
+	/// `Some(Ambiguous)`. Uses the shared candidate collector, which keeps the single-match
+	/// case inline.
 	fn resolve_inherent_member(
 		&mut self,
 		target: ImplTarget,
@@ -1362,8 +1128,7 @@ impl<'ast> Builder<'ast, '_> {
 			entry: ImplEntry,
 			type_args: Box<[TypeIndex]>,
 		}
-		let mut candidate: Option<InherentCandidate> = None;
-		let mut candidates: Vec<InherentCandidate> = Vec::new();
+		let mut candidates = CandidateSet::new();
 
 		for block_idx in self
 			.items
@@ -1389,56 +1154,50 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			};
 			let type_args = self.pad_type_args(entry, type_args);
-			match candidate.take() {
-				Some(existing) => {
-					candidates.push(existing);
-					candidates.push(InherentCandidate { entry, type_args });
-				}
-				None => {
-					candidate = Some(InherentCandidate { entry, type_args })
-				}
-			}
+			candidates
+				.insert(block_idx, InherentCandidate { entry, type_args });
 		}
 
-		if !candidates.is_empty() {
-			let member_name =
-				self.interner.resolve(member_symbol).unwrap().to_string();
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::DuplicateDefinition.code().to_string(),
-				),
-				message: format!(
-					"the name `{member_name}` is defined multiple times"
-				),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
+		let candidates = match candidates.finish() {
+			CandidateSelection::None => return None,
+			CandidateSelection::One(candidate) => {
+				return Some(MemberLookup::Inherent {
+					entry: candidate.entry,
+					type_args: candidate.type_args,
+				});
+			}
+			CandidateSelection::Many(candidates) => candidates,
+		};
+		let member_name =
+			self.interner.resolve(member_symbol).unwrap().to_string();
+		let mut diagnostic = Diagnostic {
+			severity: Severity::Error,
+			code: Some(DiagnosticCode::DuplicateDefinition.code().to_string()),
+			message: format!(
+				"the name `{member_name}` is defined multiple times"
+			),
+			labels: Vec::with_capacity(candidates.len() + 1),
+			notes: Vec::new(),
+		};
+		diagnostic.labels.push(
+			member_span
+				.primary_label()
+				.with_message(format!("multiple `{member_name}` found")),
+		);
+		for (idx, candidate) in candidates.iter().enumerate() {
 			diagnostic.labels.push(
-				member_span
-					.primary_label()
-					.with_message(format!("multiple `{member_name}` found")),
+				candidate
+					.entry
+					.def_span(&self.items)
+					.secondary_label()
+					.with_message(format!(
+						"candidate #{} defined here",
+						idx + 1
+					)),
 			);
-			for (idx, candidate) in candidates.iter().enumerate() {
-				diagnostic.labels.push(
-					candidate
-						.entry
-						.def_span(&self.items)
-						.secondary_label()
-						.with_message(format!(
-							"candidate #{} defined here",
-							idx + 1
-						)),
-				);
-			}
-			self.diagnostics.push(diagnostic);
-			return Some(MemberLookup::Ambiguous);
 		}
-
-		candidate.map(|candidate| MemberLookup::Inherent {
-			entry: candidate.entry,
-			type_args: candidate.type_args,
-		})
+		self.diagnostics.push(diagnostic);
+		Some(MemberLookup::Error)
 	}
 
 	/// Checks whether `impl_index` (an impl of `trait_index`) or
@@ -1449,53 +1208,54 @@ impl<'ast> Builder<'ast, '_> {
 	/// and `resolve_trait_member`'s single-known-trait lookup, so the
 	/// unification/default-body rules can't drift between the two callers.
 	fn trait_member_via_impl(
-		&self,
+		&mut self,
 		trait_index: TraitIndex,
 		impl_index: TraitImplIndex,
 		target_type: TypeIndex,
 		member_symbol: SymbolU32,
-	) -> Option<(ImplEntry, Box<[TypeIndex]>)> {
-		// Membership check first — plain `HashMap` lookups, independent of
-		// `target_type` — before paying for `unify_trait_impl_target`'s
-		// unification (which allocates for a generic impl). Most traits
-		// implemented for a constructor won't provide the member being
-		// looked up, so this avoids probing every one of them just to find
-		// out it was never a candidate.
+		span: SourceSpan,
+	) -> Result<Option<(ImplEntry, Box<[TypeIndex]>)>, ()> {
+		if let Some(decl) = self.items.trait_impls[usize::from(impl_index)]
+			.member_decls
+			.get(&member_symbol)
+			.copied()
+		{
+			if self.ensure_signature(decl.id) == SignatureStatus::Cycle
+				&& !self.items.trait_impls[usize::from(impl_index)]
+					.members
+					.contains_key(&member_symbol)
+			{
+				self.report_cyclic_type_dependency(decl.id, span);
+				return Err(());
+			}
+		}
 		let from_impl = self.items.trait_impls[usize::from(impl_index)]
 			.members
 			.get(&member_symbol)
-			.cloned();
-		let from_trait_default = self.items.traits[usize::from(trait_index)]
-			.entries
-			.get(&member_symbol)
-			.cloned()
-			.filter(|entry| self.entry_has_body(*entry));
-		if from_impl.is_none() && from_trait_default.is_none() {
-			return None;
-		}
-
-		let impl_type_args = self.items.unify_trait_impl_target(
+			.copied();
+		let from_default = if from_impl.is_none() {
+			self.declared_trait_member(trait_index, member_symbol, span)?
+				.filter(|entry| self.entry_has_body(*entry))
+		} else {
+			None
+		};
+		let Some(entry) = from_impl.or(from_default) else {
+			return Ok(None);
+		};
+		let Some(impl_args) = self.items.unify_trait_impl_target(
 			&self.types,
 			impl_index,
 			target_type,
-		)?;
-		// `type_args` must match whichever owner `entry` actually inherits
-		// from: the impl's own params (`impl_type_args`, already in that
-		// scheme) when the impl overrides this member itself, or just
-		// `[target_type]` — the receiver, matching `Trait(trait_index)`'s
-		// single inherited `Self` param — when it falls back to the
-		// trait's own default body. These are different owners with
-		// independently-indexed param schemes; using `impl_type_args` for a
-		// trait default would substitute the impl's `T` where `Self`
-		// belongs.
-		let (entry, type_args) = match from_impl {
-			Some(entry) => (entry, impl_type_args),
-			None => (
-				from_trait_default?,
-				Box::new([target_type]) as Box<[TypeIndex]>,
-			),
+		) else {
+			return Ok(None);
 		};
-		Some((entry, self.pad_type_args(entry, type_args)))
+		// Overrides inherit impl parameters; defaults inherit the trait's Self.
+		let args = if from_impl.is_some() {
+			impl_args
+		} else {
+			Box::new([target_type])
+		};
+		Ok(Some((entry, self.pad_type_args(entry, args))))
 	}
 
 	/// Looks up `member_symbol` on `target_type` under exactly
@@ -1507,58 +1267,53 @@ impl<'ast> Builder<'ast, '_> {
 	/// therefore which existing diagnostic code applies), reports the
 	/// specific error itself.
 	pub(super) fn resolve_trait_member(
-		&self,
+		&mut self,
 		target_type: TypeIndex,
 		required_trait: TraitIndex,
 		member_symbol: SymbolU32,
+		span: SourceSpan,
 	) -> Result<(ImplEntry, Box<[TypeIndex]>), TraitMemberError> {
-		match self.types.resolve(target_type) {
-			Type::TypeParam { owner, param_index } => {
-				let bound = self
-					.items
-					.type_param_info(*owner, *param_index as usize)
-					.bounds
-					.traits
-					.iter()
-					.any(|bound| bound.trait_index == required_trait);
-				if !bound {
-					return Err(TraitMemberError::NotImplemented);
-				}
-				let entry = self.items.traits[usize::from(required_trait)]
-					.entries
-					.get(&member_symbol)
-					.cloned()
-					.ok_or(TraitMemberError::NoSuchMember)?;
-				Ok((entry, self.pad_type_args(entry, Box::new([target_type]))))
+		if self
+			.items
+			.effective_bounds(&self.types, target_type)
+			.is_some()
+		{
+			if !self.bound_traits_contains(target_type, required_trait) {
+				return Err(TraitMemberError::NotImplemented);
 			}
-			_ => {
-				let target =
-					ImplTarget::from_type(self.types.resolve(target_type))
-						.map_err(|_| TraitMemberError::NotImplemented)?;
-				let &(_, impl_index) = self
-					.items
-					.trait_impl_dispatch
-					.get(&target)
-					.and_then(|impls| {
-						impls.iter().find(|(t, _)| *t == required_trait)
-					})
-					.ok_or(TraitMemberError::NotImplemented)?;
-				self.trait_member_via_impl(
-					required_trait,
-					impl_index,
-					target_type,
-					member_symbol,
-				)
-				.ok_or(TraitMemberError::NoSuchMember)
-			}
+			let entry = self
+				.declared_trait_member(required_trait, member_symbol, span)
+				.map_err(|()| TraitMemberError::ResolutionFailed)?
+				.ok_or(TraitMemberError::NoSuchMember)?;
+			return Ok((
+				entry,
+				self.pad_type_args(entry, Box::new([target_type])),
+			));
 		}
+		let target = ImplTarget::from_type(self.types.resolve(target_type))
+			.map_err(|_| TraitMemberError::NotImplemented)?;
+		let &(_, impl_index) = self
+			.items
+			.trait_impl_dispatch
+			.get(&target)
+			.and_then(|impls| impls.iter().find(|(t, _)| *t == required_trait))
+			.ok_or(TraitMemberError::NotImplemented)?;
+		self.trait_member_via_impl(
+			required_trait,
+			impl_index,
+			target_type,
+			member_symbol,
+			span,
+		)
+		.map_err(|()| TraitMemberError::ResolutionFailed)?
+		.ok_or(TraitMemberError::NoSuchMember)
 	}
 
 	/// Whether `entry` (an item pulled from a `Trait::members` table) has a
 	/// real, usable definition on its own — a bodied default method — as
 	/// opposed to being a bare declaration that only exists to record the
 	/// item's kind. Trait-level `Const`/`AssociatedType` entries are always
-	/// placeholders — traits cannot give them default values — so they never
+	/// not function bodies, so they never
 	/// act as a fallback default the way a bodied method can.
 	///
 	/// Checks the AST's `body: Option<...>` directly (via `sig_state`)
@@ -1566,13 +1321,9 @@ impl<'ast> Builder<'ast, '_> {
 	/// Phase 3 has actually built that specific function, which is not
 	/// guaranteed yet at every call site that may reach here.
 	///
-	/// No `ensure_signature` call needed: this is only ever reached from
-	/// `resolve_impl_member`, which only runs while building expression
-	/// bodies (Phase 3) — and `TIR::build` runs Phase 2 to completion, for
-	/// every registered `DefId`, before Phase 3 starts for anything. So by
-	/// the time this can run, every signature — including this one — has
-	/// already been ensured.
-	fn entry_has_body(&self, entry: ImplEntry) -> bool {
+	/// The caller has already demanded the declaration's signature, including
+	/// when lookup happens during Phase 2. No body demand is needed here.
+	pub(super) fn entry_has_body(&self, entry: ImplEntry) -> bool {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
@@ -1662,14 +1413,15 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::Method(func_index)
 			| ImplEntry::AssocFunction(func_index) => {
-				let total = self.items.functions[usize::from(func_index)]
-					.total_type_param_count();
-				if parent_args.len() == total {
+				let total_params = self.items.functions
+					[usize::from(func_index)]
+				.type_param_count();
+				if parent_args.len() == total_params {
 					return parent_args;
 				}
-				let mut type_args = Vec::with_capacity(total);
+				let mut type_args = Vec::with_capacity(total_params);
 				type_args.extend_from_slice(&parent_args);
-				type_args.resize(total, TypeIndex::INFER);
+				type_args.resize(total_params, TypeIndex::INFER);
 				type_args.into_boxed_slice()
 			}
 			_ => parent_args,

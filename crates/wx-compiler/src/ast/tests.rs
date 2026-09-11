@@ -634,13 +634,13 @@ fn test_literals() {
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
 
-	let Expression::Float { value } = local_definition_value(statements, 0)
-	else {
-		panic!("expected a float literal")
-	};
-	assert_eq!(*value, 2.75);
-	// `Char` and `String` carry no payload — the text is recovered from the
-	// span, so all the AST records is which kind of literal it was.
+	assert!(
+		matches!(local_definition_value(statements, 0), Expression::Float),
+		"expected a float literal"
+	);
+	// `Float`, `Char` and `String` carry no payload — the text is recovered
+	// from the span, so all the AST records is which kind of literal it was.
+	// (A float's *value* is parsed against its target type in TIR.)
 	assert!(matches!(
 		local_definition_value(statements, 1),
 		Expression::Char
@@ -1212,26 +1212,16 @@ fn test_scientific_notation_float_literals() {
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
 	assert_eq!(statements.len(), 5);
-	assert!(matches!(
-		local_definition_value(statements, 0),
-		Expression::Float { value } if *value == 1e10
-	));
-	assert!(matches!(
-		local_definition_value(statements, 1),
-		Expression::Float { value } if *value == 3.4e2
-	));
-	assert!(matches!(
-		local_definition_value(statements, 2),
-		Expression::Float { value } if *value == 1e+5
-	));
-	assert!(matches!(
-		local_definition_value(statements, 3),
-		Expression::Float { value } if *value == 1.5e-3
-	));
-	assert!(matches!(
-		local_definition_value(statements, 4),
-		Expression::Float { value } if *value == 2E3
-	));
+	// Each `…e…` form parses cleanly as a single float expression; the lexer
+	// commits the whole span to one `Float` token (the tricky run-into-EOF
+	// case is `test_scientific_notation_literal_at_end_of_input_is_float`). The
+	// value is assembled in TIR — see `test_scientific_notation_float_values`.
+	for i in 0..statements.len() {
+		assert!(
+			matches!(local_definition_value(statements, i), Expression::Float),
+			"statement {i} should parse as a float literal"
+		);
+	}
 }
 
 #[test]
@@ -1462,7 +1452,7 @@ fn test_invalid_float_literal_empty_exponent() {
 		.assert_codes(&[DiagnosticCode::InvalidNumericLiteral]);
 	assert!(matches!(
 		statement_expression(case.function_block(0), 0),
-		Expression::Float { value } if *value == 0.0
+		Expression::Float
 	));
 }
 
@@ -1924,6 +1914,46 @@ fn test_typeset_attributes_parsed() {
 		panic!("expected TypeSet")
 	};
 	assert_eq!(attributes.len(), 1, "expected one attribute on the typeset");
+}
+
+#[test]
+fn test_typeset_without_bounds_has_none() {
+	let case = TestCase::new("typeset Foo { u32, u64 }");
+	case.diagnostics().assert_none();
+	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+		panic!("expected TypeSet")
+	};
+	assert!(bounds.is_none());
+	assert_eq!(members.len(), 2);
+}
+
+#[test]
+fn test_typeset_bound_clause_parses() {
+	let case = TestCase::new("typeset Integer: Add + Sub { i32, i64 }");
+	case.diagnostics().assert_none();
+	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+		panic!("expected TypeSet")
+	};
+	assert_eq!(members.len(), 2);
+	let Some(bounds) = bounds else {
+		panic!("expected a bound clause")
+	};
+	assert!(matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 2));
+}
+
+#[test]
+fn test_typeset_bound_clause_with_where_bindings_parses() {
+	let case =
+		TestCase::new("typeset Integer: Add where { Output = Self } { i32, i64 }");
+	case.diagnostics().assert_none();
+	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+		panic!("expected TypeSet")
+	};
+	assert_eq!(members.len(), 2);
+	assert!(matches!(
+		bounds.as_ref().map(|b| &b.inner),
+		Some(BoundExpression::WithBindings { .. })
+	));
 }
 
 // ── binary operators ─────────────────────────────────────────────────────────

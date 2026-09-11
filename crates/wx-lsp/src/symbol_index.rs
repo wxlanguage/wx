@@ -628,13 +628,19 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			});
 		}
 
-		for (assoc_name, at) in &trait_.assoc_types {
+		for (assoc_name, entry) in &trait_.members {
+			let wx_compiler::tir::MemberIndex::AssociatedType(assoc_index) =
+				entry
+			else {
+				continue;
+			};
+			let at = &tir.items.associated_types[usize::from(*assoc_index)];
 			let at_kind = SymbolKind::AssocType {
 				trait_id: trait_.id,
 				assoc_name: *assoc_name,
 			};
 			let at_info = SpanInfo {
-				source: SourceSpan::new(trait_.file_id, at.name_span),
+				source: SourceSpan::new(at.file_id, at.name.span),
 				kind: at_kind,
 			};
 			index.global_definitions.push(GlobalDefinition {
@@ -761,6 +767,23 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				.entry(target)
 				.or_default()
 				.push(ImplRef::Trait(trait_impl_index));
+		}
+
+		for (param_index, tp) in trait_impl.type_params.iter().enumerate() {
+			let kind = SymbolKind::TypeParam {
+				owner: TypeParamOwner::TraitImpl(trait_impl_index),
+				param_index: param_index as u32,
+			};
+			index.definitions.push(SpanInfo {
+				source: SourceSpan::new(trait_impl.file_id, tp.name.span),
+				kind,
+			});
+			for access in &tp.accesses {
+				index.references.push(SpanInfo {
+					source: *access,
+					kind,
+				});
+			}
 		}
 
 		if trait_impl.self_accesses.is_empty() {

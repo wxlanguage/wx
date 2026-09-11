@@ -1,111 +1,127 @@
-use std::*;
+// A growable array built on `std`'s `Allocator` trait — a walk through how
+// generics, traits and raw pointers compose in wx.
+//
+// The `Vec` header and its element buffer both live in linear memory: `push`
+// takes `heap::*Self`, and wx cannot hand out a pointer to a local (locals are
+// wasm locals, not addressable memory), so the header is allocated too.
+//
+//   ┌──────────────┬───────────┬─────────────┬─────────────────┬──── ·· ─┐
+//   │  static data │ allocator │ Vec header  │ element buffer  │  (free) │
+//   └──────────────┴───────────┴─────────────┴─────────────────┴──── ·· ─┘
+//   0          DATA_END                                     next    heap end
 
+#[memory_limits(min_pages = 1)]
 memory heap: Memory where { Size = u32 };
 
-global mut bump: heap::*u8 = heap::DATA_END;
-
-struct Layout<M: Memory> {
-    size: M::Size,
-    align: M::Size,
+// A monotonic bump allocator over `heap`: it only ever moves `next` forward,
+// so there is no individual free — the whole arena is reclaimed at once by
+// dropping the allocator.
+struct BumpAllocator {
+    next: RawPtr<heap, u8>,
 }
 
-impl<M: Memory> Layout<M> {
-    pub fn of<T>() -> Layout<M> {
-        Layout::{ size: size_of::<T>(), align: align_of::<T>() }
-    }
-
-    pub fn array<T>(count: M::Size) -> Layout<M> {
-        Layout::{ size: size_of::<T>() * count, align: align_of::<T>() }
+impl BumpAllocator {
+    pub fn from_addr(start: u32) -> Self {
+        Self::{ next: RawPtr::from_addr(start) }
     }
 }
-
-trait Allocator {
-    type M: Memory;
-
-    fn alloc(mut self, layout: Layout<Self::M>) -> Self::M::*u8;
-
-    fn dealloc(mut self, ptr: Self::M::*u8, layout: Layout<Self::M>);
-}
-
-struct BumpAllocator {}
 
 impl Allocator for BumpAllocator {
-    type M = heap;
+    type Mem = heap;
 
-    fn alloc(x, layout: Layout<heap>) -> heap::*u8 {
-        local ptr = ptr::align_up::<heap>(bump as u32, layout.align);
-        local new_end = ptr + layout.size;
-        local cur_end = heap.size_bytes();
-        if new_end > cur_end {
-            local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-        }
-        bump = new_end as heap::*u8;
-        ptr as heap::*u8
+    fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+        local aligned_next = self.*.next.align_up(layout.align());
+        self.*.next = aligned_next.add(layout.size());
+        aligned_next.as_ptr()
     }
-
-    fn dealloc(x, _ptr: heap::*u8, _layout: Layout<heap>) {}
 }
 
-struct Vec<T, A: Allocator> {
-    pub buf: A::M::*T,
-    len: A::M::Size,
-    cap: A::M::Size,
-    alloc: A,
+pub struct Vec<T> {
+    buf: RawPtr<heap, T>,
+    len: u32,
+    cap: u32,
+    alloc: heap::*BumpAllocator,
 }
 
-impl<T, A: Allocator> Vec<T, A> {
+impl<T> Vec<T> {
     #[inline]
-    pub fn new(alloc: A) -> Vec<T, A> {
-        Vec::{ buf: ptr::null_mut(), len: 0, cap: 0, alloc }
+    pub fn new(alloc: heap::*BumpAllocator) -> Self {
+        Self::{ buf: RawPtr::null(), len: 0, cap: 0, alloc }
     }
 
-    pub fn push(mut self: A::M::*Self, value: T) {
+    // Allocates the header itself through `alloc`, then hands back a pointer to
+    // it — the shape callers actually want, since every other method is on
+    // `heap::*Self`.
+    #[inline]
+    pub fn new_in(alloc: heap::*BumpAllocator) -> heap::*Self {
+        alloc.allocate_value(Self::new(alloc))
+    }
+
+    pub fn push(self: heap::*Self, value: T) {
         if self.*.len == self.*.cap {
             local new_cap = if self.*.cap == 0 { 4 } else { self.*.cap * 2 };
-            
-            local layout = Layout::<A::M>::array::<T>(new_cap);
-            local new_buf = self.*.alloc.alloc(layout);
-            
-            if self.*.cap != 0 {
-                local mut i: A::M::Size = 0;
-                loop {
-                    if i == self.*.len { break; };
-                    
-                    new_buf.add(i).* = self.*.buf.add(i).*;
-                    i += 1;
-                }
-            };
-            
-            self.*.buf = new_buf;
+            local new_buf = self.*.alloc.allocate(Layout::array::<T>(new_cap));
+            memory_copy(
+                new_buf,
+                self.*.buf.cast::<u8>().as_ref(),
+                self.*.len * size_of::<T, heap>(),
+            );
+            self.*.buf = RawPtr::from_ptr(new_buf as heap::*T);
             self.*.cap = new_cap;
-        };
-        
-        self.*.buf.add(self.*.len).* = value;
-        self.*.len = self.*.len + 1;
-    }
+        }
 
-    pub fn get(self: A::M::&Self, index: A::M::Size) -> T {
-        self.*.buf.add(index).*
+        self.*.buf.add(self.*.len).as_ptr().* = value;
+        self.*.len += 1;
     }
 
     #[inline]
-    pub fn len(self: A::M::&Self) -> A::M::Size {
+    pub fn get(self: heap::*Self, index: u32) -> T {
+        self.*.buf.add(index).as_ptr().*
+    }
+
+    #[inline]
+    pub fn len(self: heap::*Self) -> u32 {
         self.*.len
+    }
+
+    #[inline]
+    pub fn capacity(self: heap::*Self) -> u32 {
+        self.*.cap
+    }
+
+    #[inline]
+    pub fn as_slice(self: heap::*Self) -> heap::&[T] {
+        slice_from_parts(self.*.buf.as_ref(), self.*.len)
     }
 }
 
-pub fn reset() {
-    bump = heap::DATA_END;
+// Places a `BumpAllocator` at `DATA_END` and points it just past itself, so
+// every later allocation lands in the free region that follows.
+fn bootstrap_allocator() -> heap::*BumpAllocator {
+    local self_ptr = heap::DATA_END as heap::*BumpAllocator;
+    self_ptr.*
+        = BumpAllocator::from_addr(
+            heap::DATA_END as u32 + size_of::<BumpAllocator, heap>(),
+        );
+    self_ptr
 }
 
+// Pushes 1..=10 through three reallocations and returns their sum (55).
 pub fn demo() -> i32 {
-    local mut v = Vec::<i32, _>::new(BumpAllocator::{});
-    v.push(5);
-    
+    local alloc = bootstrap_allocator();
+    local v = Vec::<i32>::new_in(alloc);
+
+    local mut n: i32 = 1;
+    loop {
+        if n > 10 { break };
+        v.push(n);
+        n += 1;
+    }
+
     local mut sum: i32 = 0;
     local mut i: u32 = 0;
     loop {
-        if i == v.len() { break sum }
+        if i == v.len() { break sum };
         sum += v.get(i);
         i += 1;
     }
@@ -113,6 +129,5 @@ pub fn demo() -> i32 {
 
 export {
     heap as "memory",
-    reset,
     demo,
 }

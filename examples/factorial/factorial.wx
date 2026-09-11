@@ -1,10 +1,60 @@
 fn factorial(n: i32) -> i32 {
-  if n <= 1 {
-    return 1
-  }
-  n * factorial(n - 1)
+    if n <= 1 { return 1 }
+    n * factorial(n - 1)
 }
 
 export {
-  factorial
+    factorial
+}
+
+// variant Option<T> {
+//     Some(T),
+//     None,
+// }
+
+// struct X(i32, i32);
+
+// trait PartialOrd {
+//     fn partial_cmp(self, other: Self) -> Option<Ordering>;
+
+//     fn lt(self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Less)
+//     }
+
+//     fn le(self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Greater)
+//     }
+
+//     fn gt(self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Greater)
+//     }
+
+//     fn ge(self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Less)
+//     }
+// }
+
+pub enum Ordering: i8 {
+    Less = -1,
+    Equal = 0,
+    Greater = 1,
+}
+
+pub trait Ord: PartialOrd {
+    fn cmp(self, other: Self) -> Ordering;
+
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn clamp(self, min: Self, max: Self) -> Self {
+        if min < max { unreachable };
+        if self < min { return min };
+        if self > max { return max };
+        self
+    }
 }

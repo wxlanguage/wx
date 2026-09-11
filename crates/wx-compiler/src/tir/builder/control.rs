@@ -136,6 +136,42 @@ impl<'ast> Builder<'ast, '_> {
 		let scope_index = match label {
 			Some(label) => match ctx.resolve_label(label.inner) {
 				Some((scope_index, label_index)) => {
+					// A labeled `continue` only makes sense against a loop —
+					// unlike `break`, which can legitimately exit a plain
+					// labeled block, there is no "next iteration" for a
+					// plain block to continue into. `resolve_label` itself
+					// doesn't restrict by scope kind (it resolves any
+					// labeled construct, including labeled blocks and
+					// labeled `if`/`else`), so that has to be checked here,
+					// mirroring the unlabeled path's `get_closest_loop_block`
+					// restriction just below.
+					if ctx.stack.scopes[usize::from(scope_index)].kind
+						!= BlockKind::Loop
+					{
+						self.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::ContinueOutsideOfLoop
+										.code(),
+								)
+								.with_message("`continue` outside of a loop")
+								.with_label(
+									SourceSpan::new(
+										ctx.resolve_context.file_id,
+										expr.span,
+									)
+									.primary_label()
+									.with_message(
+										"this label does not name a loop",
+									),
+								),
+						);
+						return Ok(Expression {
+							kind: ExprKind::Error,
+							ty: TypeIndex::NEVER,
+							span: expr.span,
+						});
+					}
 					ctx.stack.labels[usize::from(label_index)]
 						.accesses
 						.push(label.span);

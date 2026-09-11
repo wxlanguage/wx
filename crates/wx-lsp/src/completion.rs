@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use string_interner::symbol::SymbolU32;
 use tower_lsp_server::ls_types::{
@@ -410,19 +410,18 @@ pub fn type_completion_items(
 fn member_completion_items(
 	tir: &TIR,
 	interner: &StringInterner,
-	members: &HashMap<SymbolU32, ImplEntry>,
+	members: impl Iterator<Item = (SymbolU32, ImplEntry)>,
 	prefix: &str,
 ) -> Vec<CompletionItem> {
 	members
-		.iter()
 		.filter_map(|(name_sym, entry)| {
-			let name = interner.resolve(*name_sym)?;
+			let name = interner.resolve(name_sym)?;
 			if !name.starts_with(prefix) {
 				return None;
 			}
 			match entry {
 				ImplEntry::Method(fi) => {
-					let func = tir.items.functions.get(usize::from(*fi))?;
+					let func = tir.items.functions.get(usize::from(fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.len() <= 1 {
 						format!("{name}()")
@@ -442,7 +441,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocFunction(fi) => {
-					let func = tir.items.functions.get(usize::from(*fi))?;
+					let func = tir.items.functions.get(usize::from(fi))?;
 					func.pub_span?;
 					let insert_text = if func.params.is_empty() {
 						format!("{name}()")
@@ -462,7 +461,7 @@ fn member_completion_items(
 					})
 				}
 				ImplEntry::AssocConstant(ci) => {
-					let constant = tir.items.constants.get(usize::from(*ci))?;
+					let constant = tir.items.constants.get(usize::from(ci))?;
 					constant.pub_span?;
 					Some(CompletionItem {
 						label: name.to_string(),
@@ -509,9 +508,14 @@ fn impl_member_completion_items(
 					.get(usize::from(*idx))
 					.map(|ti| &ti.members),
 			};
-			members
-				.into_iter()
-				.flat_map(|m| member_completion_items(tir, interner, m, prefix))
+			members.into_iter().flat_map(|m| {
+				member_completion_items(
+					tir,
+					interner,
+					m.iter().map(|(&name, &entry)| (name, entry)),
+					prefix,
+				)
+			})
 		})
 		.collect()
 }
@@ -638,7 +642,9 @@ fn path_completion_items(
 				member_completion_items(
 					tir,
 					interner,
-					&tir.items.traits[usize::from(idx)].entries,
+					tir.items.traits[usize::from(idx)].members.iter().map(
+						|(&name, &member)| (name, member.entry(&tir.items)),
+					),
 					prefix,
 				)
 			})

@@ -37,64 +37,174 @@ pub type char;
 #[intrinsic]
 pub type never;
 
-#[tag = "add"]
+#[tag = "Add"]
 pub trait Add {
     fn add(self, rhs: Self) -> Self;
 }
 
-#[tag = "sub"]
+#[tag = "Sub"]
 pub trait Sub {
     fn sub(self, rhs: Self) -> Self;
 }
 
-#[tag = "mul"]
+#[tag = "Mul"]
 pub trait Mul {
     fn mul(self, rhs: Self) -> Self;
 }
 
-#[tag = "div"]
+#[tag = "Div"]
 pub trait Div {
     fn div(self, rhs: Self) -> Self;
 }
 
-#[tag = "rem"]
+#[tag = "Rem"]
 pub trait Rem {
     fn rem(self, rhs: Self) -> Self;
 }
 
-#[tag = "neg"]
+#[tag = "Neg"]
 pub trait Neg {
     fn neg(self) -> Self;
 }
 
-#[tag = "bitand"]
+#[tag = "BitAnd"]
 pub trait BitAnd {
     fn bitand(self, rhs: Self) -> Self;
 }
 
-#[tag = "bitor"]
+#[tag = "BitOr"]
 pub trait BitOr {
     fn bitor(self, rhs: Self) -> Self;
 }
 
-#[tag = "bitxor"]
+#[tag = "BitXor"]
 pub trait BitXor {
     fn bitxor(self, rhs: Self) -> Self;
 }
 
-#[tag = "shl"]
+#[tag = "Shl"]
 pub trait Shl {
     fn shl(self, rhs: Self) -> Self;
 }
 
-#[tag = "shr"]
+#[tag = "Shr"]
 pub trait Shr {
     fn shr(self, rhs: Self) -> Self;
 }
 
-#[tag = "bitnot"]
+#[tag = "BitNot"]
 pub trait BitNot {
     fn bitnot(self) -> Self;
+}
+
+#[tag = "Not"]
+pub trait Not {
+    fn not(self) -> Self;
+}
+
+#[tag = "PartialEq"]
+pub trait PartialEq {
+    fn eq(self, other: Self) -> bool;
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        !self.eq(other)
+    }
+}
+
+pub trait Eq: PartialEq {}
+
+#[tag = "PartialOrd"]
+pub trait PartialOrd: PartialEq {
+    fn lt(self, other: Self) -> bool;
+
+    fn le(self, other: Self) -> bool;
+
+    fn gt(self, other: Self) -> bool;
+
+    fn ge(self, other: Self) -> bool;
+}
+
+pub enum Ordering: i8 {
+    Less = -1,
+    Equal = 0,
+    Greater = 1,
+}
+
+impl Ordering {
+    #[inline]
+    pub fn of<T: PartialOrd>(a: T, b: T) -> Ordering {
+        ((a > b) as i8 - (a < b) as i8) as Ordering
+    }
+
+    #[inline]
+    pub fn is_lt(self) -> bool {
+        self == Ordering::Less
+    }
+
+    #[inline]
+    pub fn is_eq(self) -> bool {
+        self == Ordering::Equal
+    }
+
+    #[inline]
+    pub fn is_gt(self) -> bool {
+        self == Ordering::Greater
+    }
+
+    #[inline]
+    pub fn is_le(self) -> bool {
+        self != Ordering::Greater
+    }
+
+    #[inline]
+    pub fn is_ge(self) -> bool {
+        self != Ordering::Less
+    }
+
+    #[inline]
+    pub fn is_ne(self) -> bool {
+        self != Ordering::Equal
+    }
+
+    #[inline]
+    pub fn reverse(self) -> Ordering {
+        match self {
+            Ordering::Less -> { Ordering::Greater },
+            Ordering::Equal -> { Ordering::Equal },
+            Ordering::Greater -> { Ordering::Less },
+        }
+    }
+
+    #[inline]
+    pub fn then(self, other: Ordering) -> Ordering {
+        match self {
+            Ordering::Equal -> { other },
+            _ -> { self },
+        }
+    }
+}
+
+pub trait Ord: PartialOrd + Eq {
+    fn cmp(self, other: Self) -> Ordering;
+
+    #[inline]
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    #[inline]
+    fn max(self, other: Self) -> Self {
+        if self < other { other } else { self }
+    }
+
+    #[inline]
+    fn clamp(self, min: Self, max: Self) -> Self {
+        if max < min { unreachable };
+        if self < min { return min };
+        if self > max { return max };
+        self
+    }
 }
 
 #[intrinsic]
@@ -288,6 +398,105 @@ pub fn i32_bitnot(value: i32) -> i32;
 
 #[intrinsic]
 pub fn i64_bitnot(value: i64) -> i64;
+
+#[intrinsic]
+pub fn i32_eqz(value: i32) -> bool;
+
+#[intrinsic]
+pub fn i32_eq(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn i64_eq(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn f32_eq(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_eq(a: f64, b: f64) -> bool;
+
+#[intrinsic]
+pub fn i32_ne(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn i64_ne(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn f32_ne(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_ne(a: f64, b: f64) -> bool;
+
+#[intrinsic]
+pub fn i32_lt(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn u32_lt(a: u32, b: u32) -> bool;
+
+#[intrinsic]
+pub fn i64_lt(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn u64_lt(a: u64, b: u64) -> bool;
+
+#[intrinsic]
+pub fn f32_lt(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_lt(a: f64, b: f64) -> bool;
+
+#[intrinsic]
+pub fn i32_le(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn u32_le(a: u32, b: u32) -> bool;
+
+#[intrinsic]
+pub fn i64_le(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn u64_le(a: u64, b: u64) -> bool;
+
+#[intrinsic]
+pub fn f32_le(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_le(a: f64, b: f64) -> bool;
+
+#[intrinsic]
+pub fn i32_gt(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn u32_gt(a: u32, b: u32) -> bool;
+
+#[intrinsic]
+pub fn i64_gt(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn u64_gt(a: u64, b: u64) -> bool;
+
+#[intrinsic]
+pub fn f32_gt(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_gt(a: f64, b: f64) -> bool;
+
+#[intrinsic]
+pub fn i32_ge(a: i32, b: i32) -> bool;
+
+#[intrinsic]
+pub fn u32_ge(a: u32, b: u32) -> bool;
+
+#[intrinsic]
+pub fn i64_ge(a: i64, b: i64) -> bool;
+
+#[intrinsic]
+pub fn u64_ge(a: u64, b: u64) -> bool;
+
+#[intrinsic]
+pub fn f32_ge(a: f32, b: f32) -> bool;
+
+#[intrinsic]
+pub fn f64_ge(a: f64, b: f64) -> bool;
 
 #[intrinsic]
 pub fn f32_convert_i32(value: i32) -> f32;
@@ -1344,7 +1553,521 @@ impl BitXor for bool {
     }
 }
 
-pub typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }
+impl Not for bool {
+    #[inline]
+    fn not(self) -> Self {
+        i32_eqz(self as i32)
+    }
+}
+
+impl PartialEq for i32 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self, other)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self, other)
+    }
+}
+
+impl PartialEq for u32 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for i64 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i64_eq(self, other)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i64_ne(self, other)
+    }
+}
+
+impl PartialEq for u64 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i64_eq(self as i64, other as i64)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i64_ne(self as i64, other as i64)
+    }
+}
+
+impl PartialEq for i8 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for u8 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for i16 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for u16 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for f32 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        f32_eq(self, other)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        f32_ne(self, other)
+    }
+}
+
+impl PartialEq for f64 {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        f64_eq(self, other)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        f64_ne(self, other)
+    }
+}
+
+impl PartialEq for bool {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialEq for char {
+    #[inline]
+    fn eq(self, other: Self) -> bool {
+        i32_eq(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ne(self, other: Self) -> bool {
+        i32_ne(self as i32, other as i32)
+    }
+}
+
+impl PartialOrd for i32 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        i32_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        i32_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        i32_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        i32_ge(self, other)
+    }
+}
+
+impl PartialOrd for u32 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u32_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u32_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u32_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u32_ge(self, other)
+    }
+}
+
+impl PartialOrd for i64 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        i64_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        i64_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        i64_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        i64_ge(self, other)
+    }
+}
+
+impl PartialOrd for u64 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u64_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u64_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u64_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u64_ge(self, other)
+    }
+}
+
+impl PartialOrd for i8 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        i32_lt(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        i32_le(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        i32_gt(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        i32_ge(self as i32, other as i32)
+    }
+}
+
+impl PartialOrd for u8 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u32_lt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u32_le(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u32_gt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u32_ge(self as u32, other as u32)
+    }
+}
+
+impl PartialOrd for i16 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        i32_lt(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        i32_le(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        i32_gt(self as i32, other as i32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        i32_ge(self as i32, other as i32)
+    }
+}
+
+impl PartialOrd for u16 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u32_lt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u32_le(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u32_gt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u32_ge(self as u32, other as u32)
+    }
+}
+
+impl PartialOrd for f32 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        f32_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        f32_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        f32_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        f32_ge(self, other)
+    }
+}
+
+impl PartialOrd for f64 {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        f64_lt(self, other)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        f64_le(self, other)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        f64_gt(self, other)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        f64_ge(self, other)
+    }
+}
+
+impl PartialOrd for bool {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u32_lt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u32_le(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u32_gt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u32_ge(self as u32, other as u32)
+    }
+}
+
+impl PartialOrd for char {
+    #[inline]
+    fn lt(self, other: Self) -> bool {
+        u32_lt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn le(self, other: Self) -> bool {
+        u32_le(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn gt(self, other: Self) -> bool {
+        u32_gt(self as u32, other as u32)
+    }
+
+    #[inline]
+    fn ge(self, other: Self) -> bool {
+        u32_ge(self as u32, other as u32)
+    }
+}
+
+impl Eq for u8 {}
+
+impl Eq for u16 {}
+
+impl Eq for u32 {}
+
+impl Eq for u64 {}
+
+impl Eq for i8 {}
+
+impl Eq for i16 {}
+
+impl Eq for i32 {}
+
+impl Eq for i64 {}
+
+impl Eq for bool {}
+
+impl Eq for char {}
+
+impl Ord for u8 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for u16 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for u32 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for u64 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for i8 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for i16 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for i32 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for i64 {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for bool {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+impl Ord for char {
+    #[inline]
+    fn cmp(self, other: Self) -> Ordering {
+        Ordering::of(self, other)
+    }
+}
+
+pub typeset Integer: Add + Sub + Mul + Div + Rem + BitAnd + BitOr + BitXor + Shl + Shr + BitNot + PartialEq + Eq + PartialOrd + Ord {
+    u8,
+    i8,
+    u16,
+    i16,
+    u32,
+    i32,
+    u64,
+    i64,
+}
 
 pub trait UnsignedInt {
     type Signed: SignedInt where { Unsigned = Self };
@@ -1411,11 +2134,10 @@ pub fn memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-#[tag = "pointer_size"]
-pub typeset PointerSize { u32, u64 }
+pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
 
 pub trait Memory {
-    type Size: PointerSize + UnsignedInt;
+    type Size: PointerSize;
 
     /// This constant exposes internal information about which index this memory will use in the generated wasm module.
     const INDEX: u32;
@@ -1483,70 +2205,95 @@ impl<Mem: Memory> Layout<Mem> {
 pub trait Allocator {
     type Mem: Memory;
 
-    fn reserve(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
+    fn allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    fn alloc<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
-        local ptr = self.reserve(Layout::of::<T>()) as Self::Mem::*T;
+    fn allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+        local ptr = self.allocate(Layout::of::<T>()) as Self::Mem::*T;
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    fn alloc_slice<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
+    fn allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.reserve(Layout::array::<T>(len)) as Self::Mem::&T,
+            self.allocate(Layout::array::<T>(len)) as Self::Mem::&T,
             len,
         ) as _
     }
 }
 
-pub mod ptr {
+pub struct RawPtr<Mem: Memory, T> {
+    addr: Mem::Size,
+}
+
+impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
-    pub fn null<Mem: Memory, T>() -> Mem::&T {
-        0 as _
+    pub fn addr(self) -> Mem::Size {
+        self.addr
     }
 
     #[inline]
-    pub fn null_mut<Mem: Memory, T>() -> Mem::*T {
-        0 as _
+    pub fn null() -> Self {
+        Self::{ addr: 0 }
     }
 
     #[inline]
-    pub fn is_null<Mem: Memory, T>(ptr: Mem::&T) -> bool {
-        ptr as Mem::Size == 0
+    pub fn from_ref(ref: Mem::&T) -> Self {
+        Self::{ addr: ref as _ }
     }
 
     #[inline]
-    pub fn cast_mut<Mem: Memory, T>(ptr: Mem::&T) -> Mem::*T {
-        ptr as _
+    pub fn from_ptr(ptr: Mem::*T) -> Self {
+        Self::{ addr: ptr as _ }
     }
 
     #[inline]
-    pub fn add<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
-        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
+    pub fn from_addr(addr: Mem::Size) -> Self {
+        Self::{ addr }
     }
 
     #[inline]
-    pub fn sub<Mem: Memory, T>(ptr: Mem::&T, count: Mem::Size) -> Mem::&T {
-        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
+    pub fn as_ref(self) -> Mem::&T {
+        self.addr as _
     }
 
     #[inline]
-    pub fn add_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
-        (ptr as Mem::Size + count * size_of::<T, Mem>()) as _
+    pub fn as_ptr(self) -> Mem::*T {
+        self.addr as _
     }
 
     #[inline]
-    pub fn sub_mut<Mem: Memory, T>(ptr: Mem::*T, count: Mem::Size) -> Mem::*T {
-        (ptr as Mem::Size - count * size_of::<T, Mem>()) as _
+    pub fn is_null(self) -> bool {
+        self.addr == 0
     }
 
+    #[inline]
+    pub fn cast<U>(self) -> RawPtr<Mem, U> {
+        RawPtr::{ addr: self.addr } as _
+    }
+}
+
+impl<Mem: Memory where { Size: Sub }, T> RawPtr<Mem, T> {
+    #[inline]
+    pub fn sub(self, count: Mem::Size) -> Self {
+        Self::{ addr: self.addr - count * size_of::<T, Mem>() }
+    }
+}
+
+impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
+    #[inline]
+    pub fn add(self, count: Mem::Size) -> Self {
+        Self::{ addr: self.addr + count * size_of::<T, Mem>() }
+    }
+}
+
+impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> {
     /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
     #[inline]
-    pub fn align_up<Mem: Memory>(addr: Mem::Size, align: Mem::Size) -> Mem::Size {
-        (addr + align - 1) & ^(align - 1)
+    pub fn align_up(self, align: Mem::Size) -> Self {
+        Self::{ addr: (self.addr + align - 1) & ^(align - 1) }
     }
 }
 

@@ -58,6 +58,9 @@ impl<'ast> Builder<'ast, '_> {
 					(ast::UnaryOp::BitNot, ConstValue::Int(value)) => {
 						Ok(ConstValue::Int(!value))
 					}
+					(ast::UnaryOp::Not, ConstValue::Bool(value)) => {
+						Ok(ConstValue::Bool(!value))
+					}
 					_ => Err(()),
 				}
 			}
@@ -66,8 +69,69 @@ impl<'ast> Builder<'ast, '_> {
 				left,
 				right,
 			} => {
+				let left_ty = left.ty;
 				let left = self.eval_const_expr(left)?;
 				let right = self.eval_const_expr(right)?;
+				// `==`/`!=` fold for any two same-kind constants (this is the
+				// `Comptime` fallback for `PartialEq` dispatch — a plain
+				// `Binary` node with a `bool` result). Float equality follows
+				// IEEE-754, so `NaN == NaN` is `false`, matching the runtime.
+				if let BinaryOp::Eq | BinaryOp::NotEq = operator.inner {
+					let equal = match (left, right) {
+						(ConstValue::Int(a), ConstValue::Int(b)) => a == b,
+						(ConstValue::Float(a), ConstValue::Float(b)) => a == b,
+						(ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
+						(ConstValue::Char(a), ConstValue::Char(b)) => a == b,
+						_ => return Err(()),
+					};
+					return Ok(ConstValue::Bool(
+						equal == matches!(operator.inner, BinaryOp::Eq),
+					));
+				}
+				// `<`/`<=`/`>`/`>=` — the `Comptime` fallback for `PartialOrd`
+				// dispatch. Integers order by signedness (from the left
+				// operand's type, like `Div`/`Rem` below); floats follow
+				// IEEE-754, so any comparison against `NaN` is `false`.
+				if matches!(
+					operator.inner,
+					BinaryOp::Less
+						| BinaryOp::LessEq
+						| BinaryOp::Greater
+						| BinaryOp::GreaterEq
+				) {
+					let unsigned = matches!(
+						left_ty,
+						TypeIndex::U8
+							| TypeIndex::U16 | TypeIndex::U32
+							| TypeIndex::U64
+					);
+					let ordering = match (left, right) {
+						(ConstValue::Int(a), ConstValue::Int(b)) => {
+							if unsigned {
+								(a as u64).cmp(&(b as u64))
+							} else {
+								a.cmp(&b)
+							}
+						}
+						(ConstValue::Char(a), ConstValue::Char(b)) => a.cmp(&b),
+						(ConstValue::Bool(a), ConstValue::Bool(b)) => a.cmp(&b),
+						(ConstValue::Float(a), ConstValue::Float(b)) => {
+							match a.partial_cmp(&b) {
+								Some(o) => o,
+								None => return Ok(ConstValue::Bool(false)),
+							}
+						}
+						_ => return Err(()),
+					};
+					let result = match operator.inner {
+						BinaryOp::Less => ordering.is_lt(),
+						BinaryOp::LessEq => ordering.is_le(),
+						BinaryOp::Greater => ordering.is_gt(),
+						BinaryOp::GreaterEq => ordering.is_ge(),
+						_ => unreachable!(),
+					};
+					return Ok(ConstValue::Bool(result));
+				}
 				// Float operands are representation-agnostic the same way
 				// int Add/Sub/Mul are: plain `f64` arithmetic already
 				// follows IEEE-754 (division by zero yields ±∞/NaN rather
@@ -500,96 +564,171 @@ impl<'ast> Builder<'ast, '_> {
 			expr.ty = target_idx;
 			Ok(())
 		} else if target_idx == TypeIndex::F32 || target_idx == TypeIndex::F64 {
-			self.diagnostics.push(report_integer_literal_for_float_type(
-				SourceSpan::new(file_id, expr.span),
-			));
-			Err(())
-		} else if matches!(self.types.resolve(target_idx), Type::Pointer { .. })
-		{
-			match self.type_scalar(target_idx) {
-				Some(WasmScalar::I32) => {
-					if value > u32::MAX as u64 {
-						self.diagnostics.push(
-							report_integer_literal_out_of_range(
-								formatter,
-								IntegerLiteralOutOfRangeDiagnostic {
-									ty: TypeIndex::U32,
-									value: value as i64,
-									span: SourceSpan::new(file_id, expr.span),
-								},
-							),
-						);
-					}
-				}
-				// `value` is a `u64`, so it can never exceed `u64::MAX` —
-				// nothing to check.
-				Some(WasmScalar::I64) => {}
-				_ => {
-					// Generic pointer (TypeParam memory) — validate against the
-					// `#[tag = "pointer_size"]` typeset (`PointerSize` in std.wx).
-					if let Some(ts) = self
-						.interner
-						.get("pointer_size")
-						.and_then(|key| self.items.tagged_items.get(&key))
-						.and_then(|tagged_id| {
-							self.items.typeset_index(*tagged_id)
-						})
-						.map(|idx| &self.items.typesets[usize::from(idx)])
-					{
-						if !ts.intersection_range.contains(value as i64) {
-							let ts_name = self
-								.interner
-								.resolve(ts.name.inner)
-								.unwrap_or("PointerSize")
-								.to_string();
-							self.diagnostics.push(
-								report_integer_literal_out_of_typeset_range(
-									value as i64,
-									&ts_name,
-									&ts.intersection_range,
-									SourceSpan::new(file_id, expr.span),
-								),
-							);
-							return Err(());
-						}
-					}
-				}
-			}
-			expr.ty = target_idx;
-			Ok(())
-		} else if let Some(typeset_index) = self
-			.items
-			.abstract_type_bounds(&self.types, target_idx)
-			.and_then(|bounds| bounds.typeset)
-			.map(|typeset_bound| typeset_bound.typeset_index)
-		{
-			let ts = &self.items.typesets[usize::from(typeset_index)];
-			let range = &ts.intersection_range;
-			let ts_name =
-				self.interner.resolve(ts.name.inner).unwrap().to_string();
-			if !range.contains(value as i64) {
+			// An integer literal coerces to a float target only if the float
+			// holds it *exactly* — never a silent round. On success the node
+			// becomes a `Float` (the widening is exact), so nothing downstream
+			// has to special-case an int-typed float.
+			let mantissa_bits =
+				if target_idx == TypeIndex::F32 { 24 } else { 53 };
+			if integer_exact_in_float(value, mantissa_bits) {
+				expr.kind = ExprKind::Float {
+					value: value as f64,
+				};
+				expr.ty = target_idx;
+				Ok(())
+			} else {
 				self.diagnostics.push(
-					report_integer_literal_out_of_typeset_range(
-						value as i64,
-						&ts_name,
-						range,
+					report_integer_literal_not_representable(
+						formatter,
+						target_idx,
 						SourceSpan::new(file_id, expr.span),
 					),
 				);
-				return Err(());
+				Err(())
+			}
+		} else if matches!(self.types.resolve(target_idx), Type::Pointer { .. })
+		{
+			match self.type_scalar(target_idx) {
+				Some(WasmScalar::I32) if value > u32::MAX as u64 => {
+					self.diagnostics.push(report_integer_literal_out_of_range(
+						formatter,
+						IntegerLiteralOutOfRangeDiagnostic {
+							ty: TypeIndex::U32,
+							value: value as i64,
+							span: SourceSpan::new(file_id, expr.span),
+						},
+					));
+				}
+				// Nothing to check: an in-range `I32` address; an `I64` one
+				// (a `u64` can never exceed `u64::MAX`); or a generic pointer
+				// (`*T` in a generic-memory context) whose address width isn't
+				// known until monomorphization — indexing coerces that to
+				// `M::Size`, an assoc projection handled by the typeset branch
+				// below, so nothing reaches here in practice.
+				_ => {}
 			}
 			expr.ty = target_idx;
 			Ok(())
 		} else {
-			self.diagnostics.push(report_unable_to_coerce(
-				formatter,
-				target_idx,
+			self.coerce_literal_to_typeset_bound(
+				resolve_context,
 				SourceSpan::new(file_id, expr.span),
-			));
-			Err(())
+				target_idx,
+				|member| match member {
+					TypeIndex::F32 => integer_exact_in_float(value, 24),
+					TypeIndex::F64 => integer_exact_in_float(value, 53),
+					_ => IntegerRange::for_integer_type(member)
+						.is_some_and(|range| range.contains(value as i64)),
+				},
+			)?;
+			// Node stays `Int` with an abstract `ty`; monomorphization
+			// substitutes a concrete member and MIR lowering turns it into a
+			// `Float` const if that member is `f32`/`f64`.
+			expr.ty = target_idx;
+			Ok(())
 		}
 	}
 
+	/// The abstract-target arm of literal coercion: the literal at `literal_span`
+	/// must fit every member of every typeset bounding `target` — named directly
+	/// (`T: Integer`) or reached through a supertrait chain — since
+	/// monomorphization can substitute any of them. `member_fits` is the
+	/// per-member check (integer range, or exact float representability).
+	/// Reports and returns `Err(())` at the first failing member, or when
+	/// `target` has no typeset bound at all; `Ok(())` means the caller should
+	/// finish the coercion.
+	fn coerce_literal_to_typeset_bound(
+		&mut self,
+		resolve_context: ResolveContext,
+		literal_span: SourceSpan,
+		target: TypeIndex,
+		member_fits: impl Fn(TypeIndex) -> bool,
+	) -> Result<(), ()> {
+		let mut bounded = false;
+		let mut first_fail: Option<(TypesetIndex, ast::Spanned<TypeIndex>)> =
+			None;
+		if let Some(declared) = self.items.effective_bounds(&self.types, target)
+		{
+			'find: for bound in declared.traits() {
+				for reachable in
+					self.items.reachable_traits([bound.trait_index])
+				{
+					let trait_def = &self.items.traits[usize::from(reachable)];
+					let Some(typeset) = trait_def.typeset_index else {
+						continue;
+					};
+					bounded = true;
+					if let Some(member) =
+						self.items.first_unfit_member(typeset, &member_fits)
+					{
+						first_fail = Some((typeset, member));
+						break 'find;
+					}
+				}
+			}
+		}
+
+		match first_fail {
+			Some((typeset, member)) => {
+				self.report_typeset_misfit(
+					resolve_context,
+					literal_span,
+					typeset,
+					member,
+				);
+				Err(())
+			}
+			None if bounded => Ok(()),
+			None => {
+				self.diagnostics.push(report_unable_to_coerce(
+					self.formatter(resolve_context.namespace),
+					target,
+					literal_span,
+				));
+				Err(())
+			}
+		}
+	}
+
+	/// Pushes "literal is not representable by every member of typeset `Y`",
+	/// resolving `Y`'s and the offending member's names from the registry.
+	fn report_typeset_misfit(
+		&mut self,
+		resolve_context: ResolveContext,
+		literal_span: SourceSpan,
+		typeset: TypesetIndex,
+		member: ast::Spanned<TypeIndex>,
+	) {
+		let ts = &self.items.typesets[usize::from(typeset)];
+		let ts_name = self.interner.resolve(ts.name.inner).unwrap_or_default();
+		let member_decl = SourceSpan::new(ts.file_id, member.span);
+		let member_name = self
+			.formatter(resolve_context.namespace)
+			.display_type(member.inner)
+			.unwrap_or_default();
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypesetBoundViolation.code())
+				.with_message(format!(
+					"literal is not representable by every member of typeset `{ts_name}`"
+				))
+				.with_label(literal_span.primary_label().with_message(format!(
+					"cannot be represented by `{member_name}`"
+				)))
+				.with_label(
+					member_decl.secondary_label().with_message(format!(
+						"`{member_name}` is a member here"
+					)),
+				),
+		);
+	}
+
+	/// The sole site that parses a float literal's *value*. The parser only
+	/// checked the token's syntax (see `parse_float_expression`); the AST node
+	/// carries no number. The source slice is parsed at the target's own width
+	/// — an `f32` target goes straight to `f32` (correctly rounded, so a decimal
+	/// just past an f32 round-to-even boundary is not rounded twice via `f64`) —
+	/// range-checked, and written into the `ExprKind::Float` node.
 	fn coerce_untyped_float_expr(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -597,22 +736,75 @@ impl<'ast> Builder<'ast, '_> {
 		target_idx: TypeIndex,
 	) -> Result<(), ()> {
 		let file_id = resolve_context.file_id;
-		if target_idx == TypeIndex::F32 {
-			// TODO: add a diagnostic if the literal is out of range
-			expr.ty = TypeIndex::F32;
-			Ok(())
-		} else if target_idx == TypeIndex::F64 {
-			// TODO: add a diagnostic if the literal is out of range
-			expr.ty = TypeIndex::F64;
-			Ok(())
-		} else {
-			self.diagnostics.push(report_unable_to_coerce(
-				self.formatter(resolve_context.namespace),
+		let span = SourceSpan::new(file_id, expr.span);
+		let raw = expr
+			.span
+			.extract_str(&self.files.get(file_id).unwrap().source);
+		let text_is_nonzero =
+			raw.bytes().any(|b| b.is_ascii_digit() && b != b'0');
+
+		if target_idx != TypeIndex::F32 && target_idx != TypeIndex::F64 {
+			// Abstract target: the literal must fit every float member of every
+			// bounding typeset. The node stays `Float` with the abstract `ty`;
+			// monomorphization substitutes a concrete f32/f64 member, and a
+			// non-float member (float can't become one) is rejected.
+			self.coerce_literal_to_typeset_bound(
+				resolve_context,
+				span,
 				target_idx,
-				SourceSpan::new(file_id, expr.span),
-			));
-			Err(())
+				|member| match member {
+					TypeIndex::F32 => raw.parse::<f32>().is_ok_and(|v| {
+						!v.is_infinite() && (v != 0.0 || !text_is_nonzero)
+					}),
+					TypeIndex::F64 => raw.parse::<f64>().is_ok_and(|v| {
+						!v.is_infinite() && (v != 0.0 || !text_is_nonzero)
+					}),
+					_ => false,
+				},
+			)?;
+			if let Ok(parsed) = raw.parse::<f64>()
+				&& let ExprKind::Float { value } = &mut expr.kind
+			{
+				*value = parsed;
+			}
+			expr.ty = target_idx;
+			return Ok(());
 		}
+
+		let fmt = self.formatter(resolve_context.namespace);
+
+		// Parse at the target's width. `str::parse` only `Err`s on malformed
+		// syntax (already reported by the parser — bail quietly); it yields ±∞
+		// on an overflowed magnitude and `0.0` on underflow. A `Token::Float`
+		// slice is always digit-driven (never `inf`/`nan`), so ±∞ here is
+		// unambiguously overflow, and `0.0` from a slice with a non-zero digit
+		// is underflow. No exactness check — `local x: f32 = 0.1` stays legal.
+		let parsed: f64 = match target_idx {
+			TypeIndex::F32 => match raw.parse::<f32>() {
+				Ok(value) => value as f64,
+				Err(_) => return Err(()),
+			},
+			_ => match raw.parse::<f64>() {
+				Ok(value) => value,
+				Err(_) => return Err(()),
+			},
+		};
+		if parsed.is_infinite() {
+			self.diagnostics
+				.push(report_float_literal_overflow(fmt, target_idx, span));
+			return Err(());
+		}
+		if parsed == 0.0 && text_is_nonzero {
+			self.diagnostics
+				.push(report_float_literal_underflow(fmt, target_idx, span));
+			return Err(());
+		}
+
+		if let ExprKind::Float { value } = &mut expr.kind {
+			*value = parsed;
+		}
+		expr.ty = target_idx;
+		Ok(())
 	}
 
 	fn coerce_untyped_unary_expr(
@@ -710,16 +902,18 @@ impl<'ast> Builder<'ast, '_> {
 		// operator's own span as an access, for `Runtime` mode only.
 		if operator.inner == ast::UnaryOp::InvertSign
 			&& let EvalMode::Runtime(traits) = &ctx.mode
-			&& let Some((trait_index, method_symbol)) =
-				traits.for_unary_op(operator.inner)
-			&& let Some(func_idx) = self.resolve_trait_method(
+		{
+			let (trait_index, method_symbol) =
+				traits.for_unary_op(operator.inner);
+			if let Some(method) = self.resolve_trait_method(
 				trait_index,
 				method_symbol,
 				target_idx,
 			) {
-			self.items.functions[usize::from(func_idx)]
-				.accesses
-				.push(SourceSpan::new(file_id, operator.span));
+				self.items.functions[usize::from(method.function_index())]
+					.accesses
+					.push(SourceSpan::new(file_id, operator.span));
+			}
 		}
 
 		expr.ty = target_idx;
@@ -779,12 +973,12 @@ impl<'ast> Builder<'ast, '_> {
 					&& let EvalMode::Runtime(traits) = &ctx.mode
 					&& let Some((trait_index, method_symbol)) =
 						traits.for_op(operator.inner)
-					&& let Some(func_idx) = self.resolve_trait_method(
+					&& let Some(method) = self.resolve_trait_method(
 						trait_index,
 						method_symbol,
 						target_idx,
 					) {
-					self.items.functions[usize::from(func_idx)]
+					self.items.functions[usize::from(method.function_index())]
 						.accesses
 						.push(SourceSpan::new(file_id, operator.span));
 				}
@@ -944,32 +1138,49 @@ fn report_unable_to_coerce(
 		.with_label(span.primary_label())
 }
 
-fn report_integer_literal_out_of_typeset_range(
-	value: i64,
-	typeset_name: &str,
-	range: &IntegerRange,
+fn report_float_literal_overflow(
+	fmt: TypeFormatter,
+	target_type: TypeIndex,
 	span: SourceSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-        .with_code(DiagnosticCode::TypesetBoundViolation.code())
-        .with_message(format!(
-            "integer literal `{value}` is out of the safe range for typeset `{typeset_name}`"
-        ))
-        .with_label(span.primary_label().with_message(format!(
-            "safe range for `{typeset_name}` is `{}..={}`",
-            range.min_i64(),
-            range.max_u64(),
-        )))
+		.with_code(DiagnosticCode::FloatLiteralOverflow.code())
+		.with_message(format!(
+			"float literal is too large for `{}`",
+			fmt.display_type(target_type).unwrap()
+		))
+		.with_label(span.primary_label().with_message("magnitude overflows"))
 }
 
-fn report_integer_literal_for_float_type(
+fn report_float_literal_underflow(
+	fmt: TypeFormatter,
+	target_type: TypeIndex,
 	span: SourceSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::LiteralTypeMismatch.code())
-		.with_message("cannot use an integer literal for a float type")
-		.with_label(span.primary_label())
-		.with_note("consider adding a decimal point, e.g. `1.0` instead of `1`")
+		.with_code(DiagnosticCode::FloatLiteralUnderflow.code())
+		.with_message(format!(
+			"float literal is too small to represent in `{}`",
+			fmt.display_type(target_type).unwrap()
+		))
+		.with_label(span.primary_label().with_message("rounds to zero"))
+}
+
+fn report_integer_literal_not_representable(
+	fmt: TypeFormatter,
+	target_type: TypeIndex,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::IntegerLiteralNotRepresentable.code())
+		.with_message(format!(
+			"integer literal cannot be represented exactly by `{}`",
+			fmt.display_type(target_type).unwrap()
+		))
+		.with_label(
+			span.primary_label()
+				.with_message("not exactly representable"),
+		)
 }
 fn report_invalid_cast(
 	fmt: TypeFormatter,

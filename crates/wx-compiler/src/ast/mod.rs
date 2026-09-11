@@ -1018,10 +1018,11 @@ pub enum Expression {
 	Int {
 		value: u64,
 	},
-	/// `1.0`
-	Float {
-		value: f64,
-	},
+	/// `1.0` / `3.4e2`. Carries no payload — the text is recovered from the
+	/// span and parsed against the *resolved target type* in TIR
+	/// (`coerce_untyped_float_expr`), because the correct rounding (f32 vs f64)
+	/// isn't known until then. Same span-only treatment as `Char` / `String`.
+	Float,
 	/// `({expr})` — transparent grouping, same type as inner
 	Grouping {
 		value: Box<Spanned<Expression>>,
@@ -1799,12 +1800,16 @@ pub enum Item {
 		supertraits: Option<Spanned<BoundExpression>>,
 		items: Box<[Separated<Spanned<TraitItem>>]>,
 	},
-	/// `typeset Name { T1, T2, ... }` — a closed compile-time set of concrete types.
+	/// `typeset Name: A + B { T1, T2, ... }` — a closed compile-time set of
+	/// concrete types. The optional bound clause after `:` applies to every
+	/// member: each member must satisfy `A + B`, and a body generic over the
+	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
+		bounds: Option<Spanned<BoundExpression>>,
 		members: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
@@ -3935,27 +3940,23 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let token = parser.lexer.next();
-		let value = match token.inner {
-			Token::Float => {
-				token.span.extract_str(parser.source).parse::<f64>().ok()
-			}
-			_ => unreachable!(),
-		};
+		debug_assert!(matches!(token.inner, Token::Float));
 
-		let value = match value {
-			Some(value) => value,
-			None => {
-				parser.ast.diagnostics.push(report_invalid_float_literal(
-					parser.ast.file_id,
-					token.span,
-				));
-
-				0.0
-			}
-		};
+		// Syntactic validity only — `f64::from_str` and `f32::from_str` accept
+		// the identical grammar, so this rejects a malformed token (`1e`,
+		// `1e+`) without committing to a value. The literal's actual value is
+		// parsed against its resolved target type in TIR
+		// (`coerce_untyped_float_expr`), where f32-vs-f64 rounding is finally
+		// known.
+		if token.span.extract_str(parser.source).parse::<f64>().is_err() {
+			parser.ast.diagnostics.push(report_invalid_float_literal(
+				parser.ast.file_id,
+				token.span,
+			));
+		}
 
 		Ok(Spanned {
-			inner: Expression::Float { value },
+			inner: Expression::Float,
 			span: token.span,
 		})
 	}
@@ -5488,6 +5489,18 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		};
 
+		// Optional bound clause: `typeset Name: A + B { .. }` — mirrors a
+		// trait's supertrait list. The `where { .. }` bindings a single bound
+		// may carry are handled by `parse_bounds_expression`; the members
+		// brace that follows is unambiguous because that never continues past
+		// a `+`.
+		let bounds: Option<Spanned<BoundExpression>> =
+			if parser.lexer.next_if(Token::Colon).is_some() {
+				Some(parser.parse_bounds_expression()?)
+			} else {
+				None
+			};
+
 		let members = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
@@ -5504,6 +5517,7 @@ impl<'ctx> Parser<'ctx> {
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
+				bounds,
 				members: members.inner,
 			},
 			span,

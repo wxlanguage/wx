@@ -739,11 +739,12 @@ impl<'ast> Builder<'ast, '_> {
 	) {
 		// The loop is the tail of the stack from `def_id`'s own frame on;
 		// frames before it led to the cycle without being part of it.
-		let chain: Vec<ast::DefId> = self
+		let frames = self
 			.sig_stack
 			.iter()
-			.position(|&id| id == def_id)
-			.map(|start| self.sig_stack[start..].to_vec())
+			.copied()
+			.position(|id| id == def_id)
+			.map(|start| &self.sig_stack[start..])
 			.unwrap_or_default();
 
 		let mut diagnostic = Diagnostic::error()
@@ -751,19 +752,16 @@ impl<'ast> Builder<'ast, '_> {
 			.with_message("cyclic type dependency")
 			.with_label(span.primary_label());
 
-		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
-		for frame in chain {
-			let Some((name, name_span)) = self.items.item_name(frame) else {
-				continue;
-			};
-			let name = self.interner.resolve(name).unwrap();
-			names.push(name);
+		let mut names = Vec::with_capacity(frames.len());
+		for frame in frames.iter().copied() {
+			let (name, span) = self.cycle_frame_name(frame).unwrap();
 			diagnostic = diagnostic.with_label(
-				name_span
-					.secondary_label()
+				span.secondary_label()
 					.with_message(format!("`{name}` is defined here")),
 			);
+			names.push(name);
 		}
+
 		// A cycle closes back onto its first item, so that name repeats at the
 		// end. Only worth spelling out once two items are involved — a
 		// self-referential one is already clear from its single label.
@@ -776,9 +774,69 @@ impl<'ast> Builder<'ast, '_> {
 			diagnostic = diagnostic.with_note(note);
 		}
 
-		self.diagnostics.push(diagnostic.with_note(
-			"types cannot have infinite size; consider using a pointer to break the cycle",
-		));
+		// "Break it with a pointer" only makes sense when a struct or enum in
+		// the loop holds another by value — that is the one shape where
+		// indirection changes the answer. A cycle through type aliases, `const`
+		// values, or associated-type values is not a size problem and a pointer
+		// does not touch it. (By-value struct/enum recursion is normally caught
+		// earlier by `report_recursive_type`, which carries its own note; this
+		// keeps the advice correct if some ordering ever routes one here.)
+		let through_aggregate = frames.iter().any(|frame| {
+			matches!(
+				self.items.item_lookup.get(frame),
+				Some(ItemIndex::Struct(_) | ItemIndex::Enum(_))
+			)
+		});
+		if through_aggregate {
+			diagnostic = diagnostic.with_note(
+				"insert some indirection (e.g. a pointer) to break the cycle",
+			);
+		}
+
+		self.diagnostics.push(diagnostic);
+	}
+
+	/// Display name and defining span for one frame of a cyclic-dependency
+	/// chain. An associated type is qualified by its owner (`A::Elem`,
+	/// `Container::Elem`) — the bare member name is often just `Elem` on
+	/// every side of the cycle and names nothing. Everything else is its
+	/// plain item name.
+	fn cycle_frame_name(&self, id: ast::DefId) -> Option<(String, SourceSpan)> {
+		if let Some(ItemIndex::AssocType(idx)) =
+			self.items.item_lookup.get(&id).copied()
+		{
+			let at = &self.items.associated_types[usize::from(idx)];
+			let member = self.interner.resolve(at.name.inner).unwrap();
+			let span = SourceSpan::new(at.file_id, at.name.span);
+			let qualified = match at.parent {
+				Some(ItemParent::TraitImpl(impl_index)) => {
+					let target = self.items.trait_impls
+						[usize::from(impl_index)]
+					.target
+					.inner;
+					let owner = self
+						.formatter(at.namespace)
+						.display_type(target)
+						.unwrap();
+					format!("{owner}::{member}")
+				}
+				Some(ItemParent::Trait(trait_index)) => {
+					let owner = self
+						.interner
+						.resolve(
+							self.items.traits[usize::from(trait_index)]
+								.name
+								.inner,
+						)
+						.unwrap();
+					format!("{owner}::{member}")
+				}
+				_ => member.to_string(),
+			};
+			return Some((qualified, span));
+		}
+		let (name, span) = self.items.item_name(id)?;
+		Some((self.interner.resolve(name).unwrap().to_string(), span))
 	}
 
 	/// Looks up `key` via [`Self::lookup_global_symbol`], forcing a `Pending`
@@ -974,6 +1032,10 @@ impl<'ast> Builder<'ast, '_> {
 					ItemIndex::TypeAlias(idx) => {
 						let a = &self.items.type_aliases[usize::from(idx)];
 						SourceSpan::new(a.file_id, a.name.span)
+					}
+					ItemIndex::AssocType(idx) => {
+						let t = &self.items.associated_types[usize::from(idx)];
+						SourceSpan::new(t.file_id, t.name.span)
 					}
 					// TODO: chaugh panic when writing impl for trait, need to revisit this
 					ItemIndex::TypeSet(_)

@@ -229,8 +229,8 @@ impl<'ast> Builder<'ast, '_> {
 				.position(|p| p.name.inner == identifier.inner)
 			{
 				let owner = scope.owner;
-				let abs_index =
-					(self.inherited_type_param_count(owner) + own_idx) as u32;
+				let abs_index = self.inherited_type_param_count(owner)
+					+ u32::try_from(own_idx).unwrap();
 
 				self.items
 					.type_param_info_mut(owner, abs_index as usize)
@@ -309,12 +309,30 @@ impl<'ast> Builder<'ast, '_> {
 		)? {
 			Some(symbol) => symbol,
 			None => {
-				self.diagnostics
-					.push(report_undeclared_type(SourceSpan::new(
-						resolve_context.file_id,
-						identifier.span,
-					)));
-				return Err(());
+				// Offer the associated-type hint only in its owning trait,
+				// after ordinary type lookup has failed. It is not a module binding.
+				if let Some(self_ty) = scope.and_then(|s| s.self_type)
+					&& let Type::TypeParam {
+						owner: TypeParamOwner::Trait(trait_index),
+						..
+					} = self.types.resolve(self_ty)
+					&& self.items.traits[usize::from(*trait_index)]
+						.associated_type(identifier.inner)
+						.is_some()
+				{
+					SymbolKind::TraitAssocType {
+						trait_index: *trait_index,
+						assoc_name: identifier.inner,
+					}
+				} else {
+					self.diagnostics.push(report_undeclared_type(
+						SourceSpan::new(
+							resolve_context.file_id,
+							identifier.span,
+						),
+					));
+					return Err(());
+				}
 			}
 		};
 		match symbol {
@@ -326,10 +344,13 @@ impl<'ast> Builder<'ast, '_> {
 						.with_message(format!(
 							"cannot find type `{name}` in this scope",
 						))
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							identifier.span,
-						))
+						.with_label(
+							Label::primary(
+								resolve_context.file_id,
+								identifier.span,
+							)
+							.with_message(format!("use `Self::{name}` here")),
+						)
 						.with_note(format!(
 							"you might have meant to use the associated type: `Self::{name}`"
 						)),
@@ -340,7 +361,7 @@ impl<'ast> Builder<'ast, '_> {
 				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
-						.with_message("cannot use a bound as a type")
+						.with_message("cannot use bound as a type")
 						.with_label(Label::primary(
 							resolve_context.file_id,
 							identifier.span,
@@ -421,7 +442,8 @@ impl<'ast> Builder<'ast, '_> {
 			own_params.iter().position(|p| p.name.inner == name)
 		{
 			return Some(
-				(self.inherited_type_param_count(scope.owner) + own_idx) as u32,
+				self.inherited_type_param_count(scope.owner)
+					+ u32::try_from(own_idx).unwrap(),
 			);
 		}
 		if let TypeParamOwner::Function(fn_id) = scope.owner {
@@ -951,20 +973,7 @@ impl<'ast> Builder<'ast, '_> {
 			&root.trait_path,
 			root.span,
 		) {
-			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_message(
-							"expected a trait after `as`, found a typeset",
-						)
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							root.span,
-						)),
-				);
-				return TypeIndex::ERROR;
-			}
+			Ok(trait_bound) => trait_bound.trait_index,
 			Err(()) => return TypeIndex::ERROR,
 		};
 
@@ -1098,20 +1107,12 @@ impl<'ast> Builder<'ast, '_> {
 			self.types.resolve(base_ty.inner),
 			Type::AssocTypeProjection { .. }
 		) {
-			// Check trait membership first, independent of whether the bound
-			// below actually holds — whether `required_trait` declares this
-			// assoc type is a static fact about the trait itself, not about
-			// whether `base_ty` satisfies it, and knowing it lets us recover
-			// the intended type even when the bound check fails. Best-effort:
-			// in progress means this trait is the one asking, and `entries`
-			// holds whatever it has declared so far.
-			let _ = self.ensure_signature(
-				self.items.traits[usize::from(required_trait)].id,
-			);
 			let has_member = matches!(
-				self.items.traits[usize::from(required_trait)]
-					.entries
-					.get(&member.ident.inner),
+				self.declared_trait_member(
+					required_trait,
+					member.ident.inner,
+					SourceSpan::new(resolve_context.file_id, member.ident.span)
+				)?,
 				Some(ImplEntry::AssocType(_))
 			);
 			if !has_member {
@@ -1132,10 +1133,9 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				return Err(());
 			}
-			if let Some(assoc_type) = self.items.traits
-				[usize::from(required_trait)]
-			.assoc_types
-			.get_mut(&member.ident.inner)
+			if let Some(assoc_type) = self
+				.items
+				.trait_associated_type_mut(required_trait, member.ident.inner)
 			{
 				assoc_type.accesses.push(SourceSpan::new(
 					resolve_context.file_id,
@@ -1148,19 +1148,11 @@ impl<'ast> Builder<'ast, '_> {
 				base: base_ty.inner,
 			});
 
-			// Fetched fresh here (rather than upfront) so this stays a
+			// Checked fresh here (rather than upfront) so this stays a
 			// borrow of `self.items` alone, not an owned clone kept alive
-			// across the `ensure_signature`/`intern` calls above —
-			// this is the only place it's used.
-			let bound_satisfied = self
-				.items
-				.abstract_type_bounds(&self.types, base_ty.inner)
-				.is_some_and(|bounds| {
-					bounds
-						.traits
-						.iter()
-						.any(|b| b.trait_index == required_trait)
-				});
+			// across the `ensure_signature`/`intern` calls above.
+			let bound_satisfied =
+				self.bound_traits_contains(base_ty.inner, required_trait);
 			if !bound_satisfied {
 				let type_name = self
 					.formatter(resolve_context.namespace)
@@ -1198,13 +1190,13 @@ impl<'ast> Builder<'ast, '_> {
 			base_ty.inner,
 			required_trait,
 			member.ident.inner,
+			SourceSpan::new(resolve_context.file_id, member.ident.span),
 		) {
 			Ok((ImplEntry::AssocType(idx), _)) => {
-				if let Some(assoc_type) = self.items.traits
-					[usize::from(required_trait)]
-				.assoc_types
-				.get_mut(&member.ident.inner)
-				{
+				if let Some(assoc_type) = self.items.trait_associated_type_mut(
+					required_trait,
+					member.ident.inner,
+				) {
 					assoc_type.accesses.push(SourceSpan::new(
 						resolve_context.file_id,
 						member.ident.span,
@@ -1219,7 +1211,7 @@ impl<'ast> Builder<'ast, '_> {
 				// other abstract-base case in this file.
 				let ty = if self
 					.items
-					.abstract_type_bounds(&self.types, base_ty.inner)
+					.effective_bounds(&self.types, base_ty.inner)
 					.is_some()
 				{
 					self.types.intern(Type::AssocTypeProjection {
@@ -1228,7 +1220,7 @@ impl<'ast> Builder<'ast, '_> {
 						base: base_ty.inner,
 					})
 				} else {
-					self.items.assoc_type_impls[usize::from(idx)]
+					self.items.associated_types[usize::from(idx)]
 						.ty
 						.unwrap()
 						.inner
@@ -1256,6 +1248,7 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
+			Err(TraitMemberError::ResolutionFailed) => Err(()),
 			Err(TraitMemberError::NotImplemented) => {
 				let type_name = self
 					.formatter(resolve_context.namespace)
@@ -1283,20 +1276,17 @@ impl<'ast> Builder<'ast, '_> {
 				// shape instead of collapsing to `TypeIndex::ERROR`, even
 				// though the bound isn't proven. A trait that doesn't
 				// define the member at all has nothing to recover.
-				// Best-effort, same as the `AssocTypeProjection` branch.
-				let _ = self.ensure_signature(
-					self.items.traits[usize::from(required_trait)].id,
-				);
-				match self.items.traits[usize::from(required_trait)]
-					.entries
-					.get(&member.ident.inner)
-				{
+				match self.declared_trait_member(
+					required_trait,
+					member.ident.inner,
+					member_span,
+				)? {
 					Some(ImplEntry::AssocType(_)) => {
-						if let Some(assoc_type) = self.items.traits
-							[usize::from(required_trait)]
-						.assoc_types
-						.get_mut(&member.ident.inner)
-						{
+						if let Some(assoc_type) =
+							self.items.trait_associated_type_mut(
+								required_trait,
+								member.ident.inner,
+							) {
 							assoc_type.accesses.push(member_span);
 						}
 						Ok(self.types.intern(Type::AssocTypeProjection {
@@ -1548,7 +1538,9 @@ impl<'ast> Builder<'ast, '_> {
 	}
 }
 
-fn report_infer_in_signature(span: SourceSpan) -> Diagnostic<FileId> {
+pub(super) fn report_infer_in_signature(
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InferInSignature.code())
 		.with_message("`_` is not allowed within types on item signatures")

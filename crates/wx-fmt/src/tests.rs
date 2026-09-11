@@ -5,14 +5,14 @@ use wx_compiler::vfs;
 use super::*;
 
 #[allow(unused)]
-struct TestCase {
-	interner: ast::StringInterner,
+pub(super) struct TestCase {
+	pub(super) interner: ast::StringInterner,
 	files: vfs::Files,
-	ast: ast::AST,
+	pub(super) ast: ast::AST,
 }
 
 impl TestCase {
-	fn new(source: &str) -> Self {
+	pub(super) fn new(source: &str) -> Self {
 		let mut interner = ast::StringInterner::new();
 		let mut files = vfs::Files::new();
 		let file_id = files
@@ -479,6 +479,29 @@ fn test_format_typeset_items() {
 	);
 }
 
+#[test]
+fn test_format_typeset_with_bound_clause() {
+	let case = TestCase::new(indoc! {"
+        typeset  Integer :  Add+Sub  { i32 , i64 }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            typeset Integer: Add + Sub { i32, i64 }
+        "}
+	);
+}
+
 /// Regression test for a formatter bug where `Item::Trait`/`Item::Enum`/
 /// `Item::Const`/`Item::Global`'s dispatch arms in `build_item` destructured
 /// `attributes` away via `..` and never passed it to their respective
@@ -633,7 +656,7 @@ fn test_format_struct_init() {
                     z: 3,
                     w: 4,
                     extra_long_field: 99,
-                }
+                };
             }
         "}
 	);
@@ -663,7 +686,7 @@ fn test_format_struct_init_block_value() {
                 local p = Point::{
                     x: g: { break :g 5 },
                     y: 10,
-                }
+                };
             }
         "}
 	);
@@ -749,7 +772,7 @@ fn test_format_impl_trait_items() {
 
 #[test]
 fn test_format_block_like_statement_semicolon() {
-	// Without explicit `;`: formatter does not add one after block-like statements.
+	// Flat non-final block-like expressions acquire a separator.
 	let case = TestCase::new(indoc! {"
         fn f() -> i32 {
             if true {}
@@ -770,14 +793,13 @@ fn test_format_block_like_statement_semicolon() {
 		output,
 		indoc! {"
             fn f() -> i32 {
-                if true {}
+                if true {};
                 42
             }
         "}
 	);
 
-	// With explicit `;`: formatter preserves it so the user can visually
-	// separate the block statement from the expression that follows.
+	// The same flat form results when the source already has a separator.
 	let case = TestCase::new(indoc! {"
         fn f() -> i32 {
             if true {};
@@ -932,7 +954,7 @@ fn test_format_local_definition_wraps() {
 	// Regression test for a bug where each level (the `local =` wrapper, the
 	// call's argument-list wrapper, and every nested struct literal's own
 	// wrapper) stacked its own indent on top of the others, since
-	// `measure_flat` reports groups containing a hard line as short/"fits"
+	// the old `measure_flat` reported hard-line groups as short/"fits"
 	// and `Indent` bumps the indent level regardless of whether the group
 	// it's in is actually rendered Flat or Break.
 	assert_eq!(
@@ -1283,8 +1305,12 @@ fn test_format_comments_preserved() {
 	// Leading/gap/trailing comments around export entries.
 	assert_eq!(
 		fmt(indoc! {"
-            fn heap() -> i32 { 1 }
-            fn other() -> i32 { 2 }
+            fn heap() -> i32 {
+                1
+            }
+            fn other() -> i32 {
+                2
+            }
             export {
                 // leading comment
                 heap,
@@ -1448,7 +1474,9 @@ fn test_format_comments_preserved() {
 #[test]
 fn test_format_long_type_params_wrap() {
 	let case = TestCase::new(indoc! {"
-        pub fn memory_copy<Size: PointerSize, SrcMem: Memory where { Size = Size }, DstMem: Memory where { Size = Size }>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
+        pub fn memory_copy<Size: PointerSize, SrcMem: Memory where {
+            Size = Size
+        }, DstMem: Memory where { Size = Size }>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
     "});
 	let output = format(
 		&case.ast,
@@ -1653,7 +1681,7 @@ fn test_format_trailing_comments_keep_their_line() {
             match v {
                 0 -> { a }, // trailing on arm
                 // own-line before arm
-                _ -> { b }
+                _ -> { b },
             }
             // own-line before closing brace
         }
@@ -1821,7 +1849,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         fn g(v: u32) -> u32 { // opens a block
             match v { // opens a `match`
-                _ -> { v }
+                _ -> { v },
             }
         }
 
@@ -1866,7 +1894,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             // opens a block
             match v {
                 // opens a `match`
-                _ -> { v }
+                _ -> { v },
             }
         }
 

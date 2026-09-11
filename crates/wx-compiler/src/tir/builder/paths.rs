@@ -264,7 +264,17 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
-			MemberLookup::Ambiguous => Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					func_ctx.resolve_context,
+					object.ty,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				Err(())
+			}
+			MemberLookup::Error => Err(()),
 		}
 	}
 
@@ -531,20 +541,7 @@ impl<'ast> Builder<'ast, '_> {
 			&root.trait_path,
 			root.span,
 		) {
-			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_message(
-							"expected a trait after `as`, found a typeset",
-						)
-						.with_label(Label::primary(
-							func_ctx.resolve_context.file_id,
-							root.span,
-						)),
-				);
-				return Err(());
-			}
+			Ok(trait_bound) => trait_bound.trait_index,
 			Err(()) => return Err(()),
 		};
 
@@ -664,7 +661,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// bare reference first and separately re-resolve it with real args
 	/// after, keeps this the one place that both looks up the symbol and
 	/// applies its arguments.
-	/// Searches `base`'s own declared bound traits (via `abstract_type_bounds`
+	/// Searches `base`'s own declared bound traits (via `effective_bounds`
 	/// — works for both a `TypeParam` and a nested `AssocTypeProjection`) for
 	/// ones declaring an associated type named `member_name`, returning the
 	/// resulting `AssocTypeProjection`. `Ok(None)` means no bound trait
@@ -682,101 +679,28 @@ impl<'ast> Builder<'ast, '_> {
 		member_name: SymbolU32,
 		member_span: TextSpan,
 	) -> Result<Option<TypeIndex>, ()> {
-		// Collected once into an owned `Vec<TraitIndex>` (`TraitIndex` is
-		// `Copy`, so this is just a handful of `u32`s) rather than
-		// re-fetching `abstract_type_bounds(base)` on every iteration —
-		// `ensure_signature` below needs `&mut self`, so it can't interleave
-		// with a live borrow of the bounds list, but for an
-		// `AssocTypeProjection` base `abstract_type_bounds` is a real
-		// recursive scan (see its own doc comment), not a cheap field read,
-		// so re-deriving it per iteration was real wasted work.
-		let bound_trait_indices: Vec<TraitIndex> = self
-			.items
-			.abstract_type_bounds(&self.types, base)
-			.map(|bounds| bounds.traits.iter().map(|b| b.trait_index).collect())
-			.unwrap_or_default();
-		let mut found: Option<TraitIndex> = None;
-		let mut candidates: Vec<TraitIndex> = Vec::new();
-		for trait_index in bound_trait_indices {
-			// In progress means this trait is what put the bound on the stack
-			// in the first place; `entries` is filled in member by member, so
-			// the scan below runs against whatever is there and a member that
-			// hasn't been reached yet simply isn't a candidate.
-			let _ = self.ensure_signature(
-				self.items.traits[usize::from(trait_index)].id,
-			);
-			if !matches!(
-				self.items.traits[usize::from(trait_index)]
-					.entries
-					.get(&member_name),
-				Some(ImplEntry::AssocType(_))
-			) {
-				continue;
-			}
-			match found {
-				None => found = Some(trait_index),
-				// The same trait showing up twice (e.g. a redundant `where`
-				// bound repeating what the assoc type's own declaration
-				// already requires, or plain `T: Foo + Foo`) isn't a second
-				// candidate — it's one trait, counted once, same as Rust
-				// silently collapsing a duplicate bound instead of erroring.
-				Some(first) if first == trait_index => {}
-				Some(first) => {
-					if candidates.is_empty() {
-						candidates.push(first);
-					}
-					candidates.push(trait_index);
-				}
-			}
-		}
-
-		if !candidates.is_empty() {
-			let member_name_str = self.interner.resolve(member_name).unwrap();
-			let type_name = self
-				.formatter(resolve_context.namespace)
-				.display_type(base)
-				.unwrap_or_default();
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::AmbiguousTraitMember.code().to_string(),
-				),
-				message: "multiple applicable items in scope".to_string(),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
-			diagnostic.labels.push(
-				SourceSpan::new(resolve_context.file_id, member_span)
-					.primary_label()
-					.with_message(format!(
-						"ambiguous — use `<{type_name} as Trait>::{member_name_str}` to specify which trait's `{member_name_str}` is meant"
-					)),
-			);
-			for trait_index in &candidates {
-				let trait_ = &self.items.traits[usize::from(*trait_index)];
-				let trait_name =
-					self.interner.resolve(trait_.name.inner).unwrap();
-				let name_span = trait_
-					.assoc_types
-					.get(&member_name)
-					.map(|at| at.name_span)
-					.unwrap_or(trait_.name.span);
-				diagnostic.labels.push(
-					Label::secondary(trait_.file_id, name_span).with_message(
-						format!("candidate: `{trait_name}::{member_name_str}`"),
-					),
+		let trait_index = match self.member_via_bounds(
+			base,
+			member_name,
+			Some(SymbolNamespace::Type),
+			SourceSpan::new(resolve_context.file_id, member_span),
+		)? {
+			CandidateSelection::None => return Ok(None),
+			CandidateSelection::One(candidate) => candidate.trait_index,
+			CandidateSelection::Many(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					base,
+					member_name,
+					member_span,
+					&candidates,
 				);
+				return Err(());
 			}
-			self.diagnostics.push(diagnostic);
-			return Err(());
-		}
-
-		let Some(trait_index) = found else {
-			return Ok(None);
 		};
-		if let Some(at) = self.items.traits[usize::from(trait_index)]
-			.assoc_types
-			.get_mut(&member_name)
+		if let Some(at) = self
+			.items
+			.trait_associated_type_mut(trait_index, member_name)
 		{
 			at.accesses
 				.push(SourceSpan::new(resolve_context.file_id, member_span));
@@ -884,7 +808,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			Type::TypeParam { .. } => {
-				// `abstract_type_bounds` already dispatches on `TypeParam`
+				// `effective_bounds` already dispatches on `TypeParam`
 				// vs. the `AssocTypeProjection` case below internally, so
 				// both arms share `resolve_assoc_type_via_bounds` for their
 				// candidate search.
@@ -946,17 +870,17 @@ impl<'ast> Builder<'ast, '_> {
 					trait_index,
 					..
 				} => {
-					if let Some(assoc_type) = self.items.traits
-						[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&member.ident.inner)
-					{
+					if let Some(assoc_type) =
+						self.items.trait_associated_type_mut(
+							trait_index,
+							member.ident.inner,
+						) {
 						assoc_type.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
 							member.ident.span,
 						));
 					}
-					Ok(self.items.assoc_type_impls[usize::from(idx)]
+					Ok(self.items.associated_types[usize::from(idx)]
 						.ty
 						.unwrap()
 						.inner)
@@ -964,11 +888,21 @@ impl<'ast> Builder<'ast, '_> {
 				MemberLookup::Inherent {
 					entry: ImplEntry::AssocType(idx),
 					..
-				} => Ok(self.items.assoc_type_impls[usize::from(idx)]
+				} => Ok(self.items.associated_types[usize::from(idx)]
 					.ty
 					.unwrap()
 					.inner),
-				MemberLookup::Ambiguous => Err(()),
+				MemberLookup::Ambiguous(candidates) => {
+					self.report_trait_member_ambiguity(
+						resolve_context,
+						namespace.inner,
+						member.ident.inner,
+						member.ident.span,
+						&candidates,
+					);
+					Err(())
+				}
+				MemberLookup::Error => Err(()),
 				_ => {
 					// TODO: we could improve the diagnostics here
 					// one case for MemberLookup::NotFound and another for Found with not correct kind
@@ -1020,7 +954,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let MemberLookup::Trait { trait_index, .. } = &lookup
 			&& matches!(
 				self.types.resolve(namespace.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				*trait_index,
@@ -1071,7 +1005,17 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			}
 			| MemberLookup::NotFound => {}
-			MemberLookup::Ambiguous => return Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					namespace.inner,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				return Err(());
+			}
+			MemberLookup::Error => return Err(()),
 		}
 
 		match self.types.resolve(namespace.inner) {
@@ -1120,7 +1064,7 @@ impl<'ast> Builder<'ast, '_> {
 						// never bind at the call site.
 						let total = self.items.functions
 							[usize::from(func_index)]
-						.total_type_param_count();
+						.type_param_count();
 						Ok(ResolvedMember::Function {
 							func_index,
 							type_args: vec![TypeIndex::INFER; total]
@@ -1221,7 +1165,7 @@ impl<'ast> Builder<'ast, '_> {
 				.len();
 				let type_params_len = self.items.functions
 					[usize::from(func_index)]
-				.total_type_param_count();
+				.type_param_count();
 
 				if !segment.type_args.is_empty()
 					&& segment.type_args.len() != fn_params_len
@@ -1396,6 +1340,7 @@ impl<'ast> Builder<'ast, '_> {
 			base_ty.inner,
 			required_trait,
 			segment.ident.inner,
+			member_span,
 		);
 		// Same abstract-dispatch bookkeeping as `resolve_namespace_member`'s
 		// identical check: a `TypeParam` receiver resolving through a known
@@ -1405,7 +1350,7 @@ impl<'ast> Builder<'ast, '_> {
 		if lookup.is_ok()
 			&& matches!(
 				self.types.resolve(base_ty.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				required_trait,
@@ -1429,6 +1374,7 @@ impl<'ast> Builder<'ast, '_> {
 				func_index,
 				type_args,
 			},
+			Err(TraitMemberError::ResolutionFailed) => return Err(()),
 			Ok((ImplEntry::AssocType(_), _))
 			| Err(TraitMemberError::NoSuchMember) => {
 				let trait_name = self

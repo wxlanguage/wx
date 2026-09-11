@@ -2168,9 +2168,7 @@ fn push_type_params(
 			s.push_str(", ");
 		}
 		s.push_str(interner.resolve(tp.name.inner).unwrap());
-		let has_bounds =
-			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
-		if has_bounds {
+		if !tp.bounds.traits.is_empty() {
 			s.push_str(": ");
 			let fmt = tir.formatter(interner, packages, from);
 			s.push_str(&fmt.display_bounds(&tp.bounds).unwrap_or_default());
@@ -2489,34 +2487,43 @@ fn symbol_hover_text(
 			}
 		}
 		SymbolKind::TypeParam { owner, param_index } => {
-			let param_index = *param_index as usize;
+			let param_index = *param_index;
 			let tp: &TypeParamInfo = match owner {
 				TypeParamOwner::Function(def_id) => {
 					let fi = usize::from(tir.items.function_index(*def_id)?);
 					let func = &tir.items.functions[fi];
 					let local = param_index
 						.checked_sub(func.inherited_type_param_count)?;
-					func.type_params.get(local)?
+					func.type_params.get(local as usize)?
 				}
 				TypeParamOwner::Struct(def_id) => {
 					let si = usize::from(tir.items.struct_index(*def_id)?);
-					tir.items.structs[si].type_params.get(param_index)?
+					tir.items.structs[si]
+						.type_params
+						.get(param_index as usize)?
 				}
 				TypeParamOwner::InherentImpl(block_idx) => tir
 					.items
 					.inherent_impls
 					.get(usize::from(*block_idx))?
 					.type_params
-					.get(param_index)?,
+					.get(param_index as usize)?,
 				TypeParamOwner::Trait(trait_idx) => {
 					let t = tir.items.traits.get(usize::from(*trait_idx))?;
 					&t.self_type_param
 				}
 				TypeParamOwner::TypeAlias(def_id) => {
 					let ai = usize::from(tir.items.type_alias_index(*def_id)?);
-					tir.items.type_aliases[ai].type_params.get(param_index)?
+					tir.items.type_aliases[ai]
+						.type_params
+						.get(param_index as usize)?
 				}
-				TypeParamOwner::TraitImpl(_) => return None,
+				TypeParamOwner::TraitImpl(impl_idx) => tir
+					.items
+					.trait_impls
+					.get(usize::from(*impl_idx))?
+					.type_params
+					.get(param_index as usize)?,
 			};
 			let name = interner.resolve(tp.name.inner).unwrap();
 			let bounds_str = fmt.display_bounds(&tp.bounds).unwrap_or_default();
@@ -2528,13 +2535,11 @@ fn symbol_hover_text(
 		}
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
-			let trait_ = tir
-				.items
-				.traits
-				.get(usize::from(tir.items.trait_index(*def_id)?))?;
+			let trait_index = tir.items.trait_index(*def_id)?;
+			let trait_ = tir.items.traits.get(usize::from(trait_index))?;
 			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
-				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
+				fmt.display_supertraits(trait_index).unwrap_or_default();
 			if bounds_str.is_empty() {
 				Some(format!("trait {name}"))
 			} else {
@@ -2547,7 +2552,20 @@ fn symbol_hover_text(
 				.typesets
 				.get(usize::from(tir.items.typeset_index(*def_id)?))?;
 			let name = interner.resolve(typeset.name.inner).unwrap();
-			Some(format!("typeset {name} {{ ... }}"))
+			let pub_prefix =
+				if typeset.pub_span.is_some() { "pub " } else { "" };
+			// Bounds written after the `:` become supertraits of the
+			// typeset's compiler-generated backing trait.
+			let bounds_str = fmt
+				.display_supertraits(typeset.trait_index)
+				.unwrap_or_default();
+			if bounds_str.is_empty() {
+				Some(format!("{pub_prefix}typeset {name} {{ ... }}"))
+			} else {
+				Some(format!(
+					"{pub_prefix}typeset {name}: {bounds_str} {{ ... }}"
+				))
+			}
 		}
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = usize::from(tir.items.type_alias_index(*def_id)?);
@@ -2606,7 +2624,8 @@ fn symbol_hover_text(
 				.items
 				.traits
 				.get(usize::from(tir.items.trait_index(*trait_id)?))?;
-			let at = trait_.assoc_types.get(assoc_name)?;
+			let at = &tir.items.associated_types
+				[usize::from(trait_.associated_type(*assoc_name)?)];
 			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {

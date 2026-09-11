@@ -526,7 +526,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		// The impl's written value, still in terms of the impl's own params
 		// — hence the new `push_impl` env below.
-		let raw = self.items.assoc_type_impls[usize::from(*assoc_idx)]
+		let raw = self.items.associated_types[usize::from(*assoc_idx)]
 			.ty?
 			.inner;
 		let env = arena.push_impl(impl_index, impl_args, base.env);
@@ -582,10 +582,10 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let expected_offset = self.items.functions
 			[usize::from(self.items.expect_function_index(expected_fn))]
-		.inherited_type_param_count as u32;
+		.inherited_type_param_count;
 		let found_offset = self.items.functions
 			[usize::from(self.items.expect_function_index(found_fn))]
-		.inherited_type_param_count as u32;
+		.inherited_type_param_count;
 		if expected_index - expected_offset == found_index - found_offset {
 			TypeComparison::Equivalent
 		} else {
@@ -603,16 +603,15 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		assoc_name: SymbolU32,
 	) -> Option<TypeIndex> {
-		let bounds = self.items.abstract_type_bounds(&self.types, base)?;
-		let trait_bound = bounds
-			.traits
-			.iter()
-			.find(|bound| bound.trait_index == trait_index)?;
-		trait_bound
-			.bindings
-			.iter()
-			.find_map(|(name, kind)| match kind {
-				AssocBindingKind::Equals(ty) if *name == assoc_name => {
+		let bounds = self.items.effective_bounds(&self.types, base)?;
+		bounds
+			.traits()
+			.filter(|bound| bound.trait_index == trait_index)
+			.flat_map(|bound| bound.bindings.iter())
+			.find_map(|binding| match &binding.rhs.inner {
+				AssocBindingKind::Equals(ty)
+					if binding.name.inner == assoc_name =>
+				{
 					Some(*ty)
 				}
 				_ => None,

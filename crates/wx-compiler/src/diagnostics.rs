@@ -109,7 +109,7 @@ define_diagnostic_codes! {
 		UnusedValue => "E1003",
 		IntegerLiteralOutOfRange => "E1004",
 		UnableToCoerce => "E1005",
-		LiteralTypeMismatch => "E1006",
+		IntegerLiteralNotRepresentable => "E1006",
 		UndeclaredIdentifier => "E1007",
 		BinaryOperatorCannotBeApplied => "E1008",
 		CannotCallExpression => "E1009",
@@ -156,9 +156,10 @@ define_diagnostic_codes! {
 		ArraySizeMismatch => "E1043",
 		ArrayRepeatCountNotConst => "E1044",
 		ArrayElementNotConst => "E1045",
-		TypesetMemberNotInteger => "E1046",
+		TypesetMemberNotConcrete => "E1046",
 		TypesetBoundViolation => "E1047",
-		MultipleTypesetBounds => "E1048",
+		// E1048 (MultipleTypesetBounds) retired — a typeset is a trait bound,
+		// so more than one is allowed and needs no dedicated diagnostic.
 		MethodNotFound => "E1049",
 		NotAMethod => "E1050",
 		InferInSignature => "E1051",
@@ -194,6 +195,10 @@ define_diagnostic_codes! {
 		TraitImplItemKindMismatch => "E1079",
 		TraitImplSignatureMismatch => "E1080",
 		TraitImplConstTypeMismatch => "E1081",
+		CyclicSupertrait => "E1082",
+		CannotImplementTypeset => "E1083",
+		FloatLiteralOverflow => "E1084",
+		FloatLiteralUnderflow => "E1085",
 
 		// VFS diagnostics (E2xxx).
 		ModuleFileNotFound => "E2000",

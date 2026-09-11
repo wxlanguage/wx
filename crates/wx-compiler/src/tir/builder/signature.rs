@@ -332,43 +332,69 @@ impl<'ast> Builder<'ast, '_> {
 				item,
 				block_index,
 			),
-			AstNodeRef::InherentImplBlock {
-				impl_type_params,
-				impl_target,
-				block_index,
-			} => self.signature_inherent_impl_block(
-				resolve_context,
-				impl_type_params,
-				impl_target,
-				block_index,
-			),
+			AstNodeRef::InherentImplBlock { item, block_index } => self
+				.signature_inherent_impl_block(
+					resolve_context,
+					item,
+					block_index,
+				),
 			AstNodeRef::Trait { trait_index, item } => {
-				self.signature_trait(resolve_context, trait_index, item)
+				self.signature_trait(trait_index, item)
 			}
 			AstNodeRef::TypeSet {
 				typeset_index,
 				item,
 				..
 			} => {
-				let members = match item {
-					ast::Item::TypeSet { members, .. } => members,
+				let (members, bounds_clause) = match item {
+					ast::Item::TypeSet {
+						members, bounds, ..
+					} => (members, bounds),
 					_ => unreachable!(),
 				};
 
-				let resolved_members: Box<[TypeIndex]> = members
+				// Resolved `TypeIndex` carrying the span of the member's type
+				// expression — the span anchors both the member-validity
+				// diagnostic and any unsatisfied-bound diagnostic the
+				// synthetic `impl` raises during conformance.
+				let resolved_members: Vec<Spanned<TypeIndex>> = members
 					.iter()
 					.filter_map(|m| {
 						let ty =
 							self.resolve_type(resolve_context, None, &m.inner);
-						if !ty.is_integer() {
+						if ty == TypeIndex::ERROR {
+							return None;
+						}
+						// A `_` anywhere in the member (bare, or nested like
+						// `Box<_>`) can't be an `impl` target — reject it the
+						// way an explicit `impl Trait for Box<_>` is, and drop
+						// the member so no synthetic `impl __X for Box<_>` gets
+						// registered against the backing trait.
+						if self.contains_infer(ty) {
+							self.diagnostics.push(report_infer_in_signature(
+								SourceSpan::new(
+									resolve_context.file_id,
+									m.inner.span,
+								),
+							));
+							return None;
+						}
+						// A member must otherwise be a concrete type the
+						// compiler can name outright — a valid `impl` target.
+						// That rules out `Self`, type parameters, `()`, tuples,
+						// bare pointers and function types; primitives, `bool`,
+						// `char`, slices, arrays, structs, enums and memories
+						// all pass.
+						if ImplTarget::from_type(self.types.resolve(ty)).is_err()
+						{
 							self.diagnostics.push(
 								Diagnostic::error()
 									.with_code(
-										DiagnosticCode::TypesetMemberNotInteger
+										DiagnosticCode::TypesetMemberNotConcrete
 											.code(),
 									)
 									.with_message(
-										"typeset member must be an integer type",
+										"typeset member must be a concrete type",
 									)
 									.with_label(
 										Label::primary(
@@ -376,7 +402,7 @@ impl<'ast> Builder<'ast, '_> {
 											m.inner.span,
 										)
 										.with_message(format!(
-											"`{}` is not an integer type",
+											"`{}` cannot be a typeset member",
 											self.formatter(
 												resolve_context.namespace
 											)
@@ -385,21 +411,24 @@ impl<'ast> Builder<'ast, '_> {
 										)),
 									),
 							);
-							None
-						} else {
-							Some(ty)
+							return None;
 						}
+						Some(Spanned {
+							inner: ty,
+							span: m.inner.span,
+						})
 					})
 					.collect();
 
-				let intersection_range = resolved_members
-					.iter()
-					.filter_map(|&ty| IntegerRange::for_integer_type(ty))
-					.fold(IntegerRange::widest(), IntegerRange::intersect);
+				self.signature_typeset_backing_trait(
+					resolve_context,
+					typeset_index,
+					bounds_clause.as_ref(),
+					&resolved_members,
+				);
+
 				self.items.typesets[usize::from(typeset_index)].members =
-					resolved_members;
-				self.items.typesets[usize::from(typeset_index)]
-					.intersection_range = intersection_range;
+					resolved_members.into_boxed_slice();
 			}
 			AstNodeRef::TraitFunction { trait_index, item } => self
 				.signature_trait_function(resolve_context, trait_index, item),
@@ -563,6 +592,10 @@ impl<'ast> Builder<'ast, '_> {
 						[usize::from(import_module_index)]
 					.namespace_idx;
 					let func_index = self.items.push_function(Function {
+						is_method: signature.params.first().is_some_and(|p| {
+							self.interner.resolve(p.inner.inner.name.inner)
+								== Some("self")
+						}),
 						id: *id,
 						file_id: resolve_context.file_id,
 						namespace: import_ns_idx,
@@ -1175,7 +1208,7 @@ impl<'ast> Builder<'ast, '_> {
 			let export_item = match global_value {
 				SymbolKind::Function { func_index } => {
 					if self.items.functions[usize::from(func_index)]
-						.total_type_param_count()
+						.type_param_count()
 						> 0
 					{
 						self.items.functions[usize::from(func_index)]

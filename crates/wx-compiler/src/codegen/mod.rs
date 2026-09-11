@@ -308,7 +308,7 @@ impl Builder {
 						signature_index,
 					} => {
 						let sig_index = builder.register_signature(
-							&mir.signatures[*signature_index as usize],
+							&mir.signatures[usize::from(*signature_index)],
 							&mir.aggregates,
 						);
 						imports.push(Import {
@@ -389,7 +389,7 @@ impl Builder {
 			Vec::<FunctionBody>::with_capacity(mir.functions.len());
 		for func in mir.functions.iter() {
 			let signature_index = builder.register_signature(
-				&mir.signatures[func.signature_index as usize],
+				&mir.signatures[usize::from(func.signature_index)],
 				&mir.aggregates,
 			);
 			function_signatures.push(signature_index);
@@ -755,7 +755,7 @@ impl Builder {
 			}
 			SI::CallIndirectSym { mir_sig_index } => {
 				let type_index = self.register_signature(
-					&mir.signatures[mir_sig_index as usize],
+					&mir.signatures[usize::from(mir_sig_index)],
 					&mir.aggregates,
 				);
 				sink.push(Instruction::CallIndirect as u8);

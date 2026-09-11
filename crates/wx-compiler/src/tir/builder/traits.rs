@@ -91,7 +91,24 @@ impl<'ast> Builder<'ast, '_> {
 				&self.items.traits[usize::from(trait_impl.trait_index)];
 			let mut missing_items: Vec<(SymbolU32, TextSpan)> = Vec::new();
 
-			for (&name, &def_entry) in trait_def.entries.iter() {
+			// `members` is a `HashMap`, so its iteration order varies between
+			// runs, and nothing sorts diagnostics downstream — they render in
+			// push order. Every diagnostic this loop emits has its primary
+			// label on the *impl*, so ordering by the impl's own member span
+			// is what makes them come out top-to-bottom in the file the
+			// reader is looking at. Members the impl doesn't provide emit
+			// nothing here (they accumulate into `missing_items`, reported
+			// once and sorted separately), so where they land is irrelevant.
+			let mut members: Vec<(SymbolU32, MemberIndex)> =
+				trait_def.members.iter().map(|(&n, &m)| (n, m)).collect();
+			members.sort_unstable_by_key(|(name, _)| {
+				trait_impl.members.get(name).map_or(u32::MAX, |entry| {
+					entry.def_span(&self.items).span.start
+				})
+			});
+
+			for (name, def_entry) in members {
+				let def_entry = def_entry.entry(&self.items);
 				match trait_impl.members.get(&name).copied() {
 					Some(provided_impl) => match (provided_impl, def_entry) {
 						(
@@ -138,9 +155,45 @@ impl<'ast> Builder<'ast, '_> {
 							}
 						}
 						(
-							ImplEntry::AssocType(_impl_index),
+							ImplEntry::AssocType(impl_index),
 							ImplEntry::AssocType(_def_index),
-						) => {}
+						) => {
+							// The impl's written value has to satisfy the
+							// bounds the trait declared for this associated
+							// type (`type Size: PointerSize where { .. }`).
+							// `Self` on this side is already the target type,
+							// not a type parameter — `types.rs` resolves it
+							// that way inside a trait impl — so no
+							// substitution is needed here.
+							if let Some(value) = self.items.associated_types
+								[usize::from(impl_index)]
+							.ty
+							{
+								let diagnostics = BoundChecker::new(
+									TypeCtx {
+										types: &mut self.types,
+										items: &self.items,
+										interner: self.interner,
+									},
+									&self.modules,
+									self.packages,
+								)
+								.check_assoc_value(
+									trait_impl.namespace,
+									trait_impl.trait_index,
+									name,
+									Subject::new(
+										SourceSpan::new(
+											trait_impl.file_id,
+											value.span,
+										),
+										value.inner,
+									),
+									trait_impl.target.inner,
+								);
+								self.diagnostics.extend(diagnostics);
+							}
+						}
 						_ => {
 							missing_items.push((
 								name,
@@ -239,7 +292,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 
 			for (&name, &impl_entry) in trait_impl.members.iter() {
-				if !trait_def.entries.contains_key(&name) {
+				if !trait_def.members.contains_key(&name) {
 					let trait_name =
 						self.interner.resolve(trait_def.name.inner).unwrap();
 					let item_name = self.interner.resolve(name).unwrap();
@@ -262,7 +315,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 
-			for supertrait in trait_def.bounds.traits.iter() {
+			for supertrait in trait_def.supertraits(trait_impl.trait_index) {
 				if self
 					.items
 					.find_trait_impl(
@@ -317,45 +370,6 @@ impl<'ast> Builder<'ast, '_> {
 							),
 					);
 				}
-			}
-		}
-
-		// iterating without borrowing so that there's no issues when trying to borrow again with mutable reference in check_assoc_type_bounds
-		for trait_impl_index in 0..self.items.trait_impls.len() {
-			let trait_impl = &self.items.trait_impls[trait_impl_index];
-			let trait_index = trait_impl.trait_index;
-			let target_type = trait_impl.target.inner;
-			let resolve_context = ResolveContext {
-				file_id: trait_impl.file_id,
-				namespace: trait_impl.namespace,
-			};
-
-			let mut assoc_types: Box<[_]> = self.items.trait_impls
-				[trait_impl_index]
-				.members
-				.values()
-				.copied()
-				.filter_map(|entry| match entry {
-					ImplEntry::AssocType(idx) => {
-						let assoc_type =
-							&self.items.assoc_type_impls[usize::from(idx)];
-						Some((assoc_type.name, assoc_type.ty.unwrap()))
-					}
-					_ => None,
-				})
-				.collect();
-			if assoc_types.is_empty() {
-				continue;
-			};
-			assoc_types.sort_unstable_by_key(|(name, _)| name.span.start);
-			for (name, ty) in assoc_types.into_iter() {
-				self.check_assoc_type_bounds(
-					resolve_context,
-					trait_index,
-					target_type,
-					name,
-					ty,
-				);
 			}
 		}
 	}
@@ -429,10 +443,9 @@ impl<'ast> Builder<'ast, '_> {
 					attributes,
 				});
 				self.register_inherent_impl_member(
-					resolve_context,
 					block_index,
-					self_type,
-					*name,
+					*id,
+					name.inner,
 					ImplEntry::AssocConstant(const_index),
 				);
 			}
@@ -465,16 +478,21 @@ impl<'ast> Builder<'ast, '_> {
 		let self_type = self.items.inherent_impls[usize::from(block_index)]
 			.target
 			.inner;
-		let inherited_type_param_count = self.items.inherent_impls
-			[usize::from(block_index)]
-		.type_params
-		.len();
+		let inherited_type_param_count = u32::try_from(
+			self.items.inherent_impls[usize::from(block_index)]
+				.type_params
+				.len(),
+		)
+		.unwrap();
 
 		let attributes = self.resolve_attributes(*id, attributes);
 		// Register the function with only its own (method-level) type
 		// params. Impl-level params (if any) are inherited via
 		// type_param_parent.
 		let func_index = self.items.push_function(Function {
+			is_method: signature.params.first().is_some_and(|p| {
+				self.interner.resolve(p.inner.inner.name.inner) == Some("self")
+			}),
 			id: *id,
 			file_id: resolve_context.file_id,
 			namespace: resolve_context.namespace,
@@ -534,79 +552,108 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		self.register_inherent_impl_member(
-			resolve_context,
 			block_index,
-			self_type,
-			signature.name,
+			*id,
+			signature.name.inner,
 			entry,
 		);
 	}
 
-	/// Registers `entry` under `name`, unless the block already has a member
-	/// of that name — the first declaration wins and every later one is
-	/// reported, matching [`Self::register_trait_impl_member`].
-	///
-	/// The duplicate is dropped from the dispatch bucket too, not just from
-	/// `members`: a second entry there would make the block a candidate twice
-	/// over for a name it only answers to once.
-	///
-	/// A collision with a *different* block counts too, when the two can ever
-	/// apply to the same receiver — see [`Self::conflicting_inherent_block`].
-	/// `resolve_impl_member` arbitrates between candidates as well, but only
-	/// per call site and only where there is one, so a conflict nobody
-	/// happens to call would otherwise ship unreported.
+	/// Registers `entry` under `name`, if this declaration is the one that
+	/// still holds it: `member_decls` is what a block answers to, and
+	/// [`Self::register_inherent_impl_decls`] has already settled and reported
+	/// every name two declarations wanted.
 	fn register_inherent_impl_member(
 		&mut self,
-		resolve_context: ResolveContext,
 		block_index: InherentImplIndex,
-		self_type: TypeIndex,
-		name: ast::Spanned<SymbolU32>,
+		id: ast::DefId,
+		name: SymbolU32,
 		entry: ImplEntry,
 	) {
-		let target = ImplTarget::from_type(self.types.resolve(self_type)).ok();
-		// The block's own members answer first, and separately from the
-		// bucket below: a block whose target failed to resolve has no
-		// `ImplTarget`, so it never reaches a bucket at all, but its own
-		// members can still collide with each other.
-		let existing = self.items.inherent_impls[usize::from(block_index)]
-			.members
-			.get(&name.inner)
-			.copied();
-		let existing = existing.or_else(|| {
-			let other = self.conflicting_inherent_block(
-				target?,
+		let block = &mut self.items.inherent_impls[usize::from(block_index)];
+		if block
+			.member_decls
+			.get(&name)
+			.is_some_and(|decl| decl.id == id)
+		{
+			block.members.insert(name, entry);
+		}
+	}
+
+	/// Enters the block's declared names into `inherent_impl_dispatch`, and
+	/// reports each one that another block already claimed for a receiver this
+	/// one would also claim — see [`Self::conflicting_inherent_block`].
+	///
+	/// This runs with the header, from `member_decls` alone, because the
+	/// bucket *is* the candidate set: a lookup that finds no bucket entry
+	/// concludes the type has no such member, so a block missing from it until
+	/// its members happen to resolve makes `S::N` an error or not depending on
+	/// where the `impl` was written. Nothing here needs a resolved member —
+	/// which block claims which name is settled by syntax, and only the target
+	/// type has to be resolved first, to key the bucket by.
+	///
+	/// `resolve_impl_member` arbitrates between candidates as well, and still
+	/// does — both blocks stay in the bucket — but only per call site and only
+	/// where there is one, so a conflict nobody happens to call would
+	/// otherwise ship unreported.
+	fn register_inherent_impl_decls(
+		&mut self,
+		block_index: InherentImplIndex,
+		self_type: TypeIndex,
+		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+	) {
+		// A block whose target failed to resolve has no `ImplTarget`, so it
+		// never reaches a bucket at all — and can conflict with nothing, since
+		// there is no receiver it is known to claim.
+		let Ok(target) = ImplTarget::from_type(self.types.resolve(self_type))
+		else {
+			return;
+		};
+		let file_id =
+			self.items.inherent_impls[usize::from(block_index)].file_id;
+		// Source order, rather than `member_decls`' iteration order, so the
+		// diagnostics below come out the same way twice.
+		for item in items.iter() {
+			let name = match &item.inner.inner {
+				ast::ImplItem::Function { signature, .. } => signature.name,
+				ast::ImplItem::Constant { name, .. }
+				| ast::ImplItem::AssocType { name, .. } => *name,
+			};
+			let block = &self.items.inherent_impls[usize::from(block_index)];
+			// A name this block declares twice is already reported, and is in
+			// the bucket once under the winning declaration.
+			if block
+				.member_decls
+				.get(&name.inner)
+				.is_none_or(|decl| decl.span != name.span)
+			{
+				continue;
+			}
+			if let Some(other) = self.conflicting_inherent_block(
+				target,
 				block_index,
 				self_type,
 				name.inner,
-			)?;
-			self.items.inherent_impls[usize::from(other)]
-				.members
-				.get(&name.inner)
-				.copied()
-		});
-		if let Some(existing) = existing {
-			let namespace = match existing {
-				ImplEntry::AssocType(_) => SymbolNamespace::Type,
-				_ => SymbolNamespace::Value,
-			};
-			self.diagnostics.push(report_duplicate_definition(
-				DuplicateDefinitionDiagnostic {
-					name: self.interner.resolve(name.inner).unwrap(),
-					namespace,
-					first_definition: existing.def_span(&self.items),
-					second_definition: SourceSpan::new(
-						resolve_context.file_id,
-						name.span,
-					),
-				},
-			));
-			return;
-		}
-
-		self.items.inherent_impls[usize::from(block_index)]
-			.members
-			.insert(name.inner, entry);
-		if let Some(target) = target {
+			) {
+				let other_block =
+					&self.items.inherent_impls[usize::from(other)];
+				let existing = other_block.member_decls[&name.inner];
+				self.diagnostics.push(report_duplicate_definition(
+					DuplicateDefinitionDiagnostic {
+						name: self.interner.resolve(name.inner).unwrap(),
+						namespace: existing.kind.namespace(),
+						first_definition: SourceSpan::new(
+							other_block.file_id,
+							existing.span,
+						),
+						second_definition: SourceSpan::new(file_id, name.span),
+					},
+				));
+			}
+			// Both blocks stay candidates even so, the way rustc keeps both
+			// inherent impls and reports E0034 at each use: the declaration is
+			// a real one, and dropping it would silence every call site in
+			// favour of one diagnostic pointing at neither of them.
 			self.items
 				.inherent_impl_dispatch
 				.entry((target, name.inner))
@@ -670,10 +717,24 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn signature_inherent_impl_block(
 		&mut self,
 		resolve_context: ResolveContext,
-		impl_type_params: &'ast [ast::TypeParam],
-		impl_target: &'ast ast::Spanned<ast::TypeExpression>,
+		item: &'ast ast::Item,
 		block_index: InherentImplIndex,
 	) {
+		let (impl_type_params, impl_target, items) = match item {
+			ast::Item::InherentImpl {
+				type_params,
+				target,
+				items,
+				..
+			} => (type_params.as_ref(), target.as_ref(), items),
+			_ => unreachable!(),
+		};
+
+		// What this block declares, by name, before any member resolves —
+		// see `MemberDecl`.
+		self.items.inherent_impls[usize::from(block_index)].member_decls =
+			self.collect_member_decls(resolve_context, items);
+
 		self.resolve_type_param_bounds(
 			resolve_context,
 			TypeParamOwner::InherentImpl(block_index),
@@ -720,6 +781,7 @@ impl<'ast> Builder<'ast, '_> {
 		self.items.inherent_impls[usize::from(block_index)]
 			.target
 			.inner = target;
+		self.register_inherent_impl_decls(block_index, target, items);
 	}
 
 	/// The package that defines the type an inherent `impl` targets.
@@ -813,20 +875,182 @@ impl<'ast> Builder<'ast, '_> {
 		);
 	}
 
+	/// Resolves `trait Sub: Super + Other { .. }`'s supertrait clause into
+	/// `Sub`'s own `Self` bounds — the sole writer of that field, reflexive
+	/// `Self: Sub` entry included. Everything that asks what a type parameter
+	/// satisfies (method and associated-item resolution,
+	/// `type_implements_trait`) then sees a supertrait without knowing
+	/// supertraits exist; `Trait::supertraits` reads them back out by
+	/// filtering the reflexive entry.
+	///
+	/// Demands only the supertrait clauses. Attribute processing and binding
+	/// validation belong to `signature_trait`; member demands must not pull
+	/// that validation back in while resolving a bound's associated type.
+	/// Members are always demanded separately by declaration identity.
+	///
+	/// Recurses into each supertrait's own clause, so reading a trait's
+	/// `Self` bounds guarantees its supertraits' bounds are resolved too —
+	/// what a transitive walk over the supertrait graph
+	/// ([`ItemRegistry::trait_implies`]) reads.
+	pub(super) fn ensure_trait_supertraits(&mut self, trait_index: TraitIndex) {
+		// The walk's own path, which only it can see and only for as long as
+		// it runs — see `resolve_supertrait_clause`. Never allocates unless
+		// there is a clause left to resolve, since the guard there returns
+		// before the first push.
+		self.resolve_supertrait_clause(trait_index, &mut Vec::new());
+	}
+
+	/// [`Self::ensure_trait_supertraits`], carrying the chain of traits the
+	/// walk is currently inside so that a supertrait which is already on it
+	/// can be told from one that is merely already resolved.
+	///
+	/// That distinction is the whole difference between a diamond and a cycle,
+	/// and the bounds themselves cannot make it: they are written *before* the
+	/// recursion (so the walk terminates at all), which leaves "non-empty"
+	/// meaning done-or-in-progress. The path is also what names the loop in
+	/// the diagnostic, so one structure answers both.
+	///
+	/// A `Vec` threaded through the recursion rather than a field on
+	/// `Builder`: it means something only inside this function's dynamic
+	/// extent, and `sig_stack` — the other stack in the builder — belongs to
+	/// `ensure_signature`, whose frames these are deliberately not.
+	fn resolve_supertrait_clause(
+		&mut self,
+		trait_index: TraitIndex,
+		stack: &mut Vec<TraitIndex>,
+	) {
+		// The write below is the guard: `Self`'s bounds always get at least
+		// the reflexive entry, and they get it *before* this recurses, so a
+		// non-empty list means this trait is done — or is on `stack`, which
+		// the caller checks before recursing here.
+		if !self.items.traits[usize::from(trait_index)]
+			.self_type_param
+			.bounds
+			.traits
+			.is_empty()
+		{
+			return;
+		}
+
+		// The trait's own AST node, reached the same way `ensure_signature`
+		// reaches any item's: `sig_state` maps its `DefId` to its
+		// `ast_nodes` slot.
+		let def_id = self.items.traits[usize::from(trait_index)].id;
+		let node_idx = self.sig_state[&def_id].node_idx;
+		let AstEntry {
+			file_id,
+			namespace,
+			node,
+			..
+		} = self.ast_nodes[node_idx].clone();
+		let AstNodeRef::Trait {
+			item: ast::Item::Trait {
+				supertraits, name, ..
+			},
+			..
+		} = node
+		else {
+			unreachable!("a TraitIndex's DefId always maps to a trait node")
+		};
+
+		let bounds = match supertraits {
+			Some(spanned) => self.resolve_bounds(
+				ResolveContext::new(file_id, namespace),
+				None,
+				spanned,
+			),
+			None => Bounds::default(),
+		};
+
+		// `Self: ThisTrait` first — a default body reaches the trait's own
+		// members through it, and `Trait::supertraits` filters it back out by
+		// trait index. A typeset supertrait (`trait Foo: Integer`) is just
+		// another trait bound now, on the typeset's generated trait.
+		let self_param =
+			&mut self.items.traits[usize::from(trait_index)].self_type_param;
+		let mut traits = Vec::with_capacity(1 + bounds.traits.len());
+		traits.push(TraitBound {
+			trait_index,
+			bindings: Box::new([]),
+			span: name.span,
+		});
+		traits.extend(bounds.traits.iter().cloned());
+		self_param.bounds.traits = traits.into_boxed_slice();
+
+		// Up the parent chain: after this returns, every ancestor's `Self`
+		// bounds are resolved too, which is what a transitive walk over the
+		// supertrait graph (`ItemRegistry::trait_implies`) reads. Their
+		// *members* stay lazy — nothing here needs them.
+		stack.push(trait_index);
+		for supertrait in bounds.traits.iter() {
+			match stack.iter().position(|&t| t == supertrait.trait_index) {
+				// Reported from here rather than one frame down, because this
+				// is where the bound that closes the loop has a span. A
+				// self-referential `trait A: A` lands here too: it is `A`'s
+				// own frame that the position finds.
+				Some(start) => self.report_supertrait_cycle(
+					&stack[start..],
+					SourceSpan::new(file_id, supertrait.span),
+				),
+				None => self
+					.resolve_supertrait_clause(supertrait.trait_index, stack),
+			}
+		}
+		stack.pop();
+	}
+
+	/// Reports `chain` — the traits from the one the cycle closes back onto
+	/// through to the one whose clause `span` is in — as a supertrait cycle.
+	///
+	/// Reported once per cycle, not once per trait in it: the bounds of every
+	/// trait on `chain` are written by the time this runs, so the walk that
+	/// found the loop is also the last one to enter it.
+	fn report_supertrait_cycle(
+		&mut self,
+		chain: &[TraitIndex],
+		span: SourceSpan,
+	) {
+		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicSupertrait.code())
+			.with_message("cyclic supertrait dependency");
+		for &trait_index in chain {
+			let trait_def = &self.items.traits[usize::from(trait_index)];
+			let name = self.interner.resolve(trait_def.name.inner).unwrap();
+			names.push(name);
+			diagnostic = diagnostic.with_label(
+				SourceSpan::new(trait_def.file_id, trait_def.name.span)
+					.secondary_label()
+					.with_message(format!("`{name}` is declared here")),
+			);
+		}
+		self.diagnostics.push(
+			diagnostic
+				.with_label(span.primary_label().with_message(format!(
+					"this bound closes the cycle back onto `{}`",
+					names[0]
+				)))
+				.with_note(format!(
+					"the cycle is `{}` -> `{}`",
+					names.join("` -> `"),
+					names[0]
+				))
+				.with_note(
+					"a trait cannot be its own supertrait, directly or \
+					 through the chain",
+				),
+		);
+	}
+
 	pub(super) fn signature_trait(
 		&mut self,
-		resolve_context: ResolveContext,
 		trait_index: TraitIndex,
 		item: &'ast ast::Item,
 	) {
-		let (supertraits, trait_id, attributes, items) = match item {
-			ast::Item::Trait {
-				id,
-				supertraits,
-				attributes,
-				items,
-				..
-			} => (supertraits, id, attributes, items),
+		// The supertrait clause itself is read by
+		// `ensure_trait_supertraits`, which may already have run it.
+		let (trait_id, attributes) = match item {
+			ast::Item::Trait { id, attributes, .. } => (id, attributes),
 			_ => unreachable!(),
 		};
 		// `Trait` has no `attributes` field of its own to store the
@@ -836,70 +1060,85 @@ impl<'ast> Builder<'ast, '_> {
 		// `self.items.tagged_items` map, populated as a side effect
 		// here.
 		self.resolve_attributes(*trait_id, attributes);
-		let bounds = if let Some(spanned) = supertraits {
-			self.resolve_bounds(resolve_context, None, spanned)
-		} else {
-			Bounds::default()
+		// Already done if any member got here first — this is idempotent,
+		// and it is the only writer of the supertrait half of `Self`'s
+		// bounds.
+		self.ensure_trait_supertraits(trait_index);
+	}
+
+	/// Fills in the compiler-generated trait that backs a `typeset` (the shell
+	/// was created in prescan): its supertraits come from the `typeset X: A + B`
+	/// clause, and every member gets a synthetic `impl` of it. Called from the
+	/// `TypeSet` arm of signature resolution once the members are resolved.
+	///
+	/// The generated trait's `Self` bounds are shaped exactly like a
+	/// hand-written trait's after [`Self::resolve_supertrait_clause`] — the
+	/// reflexive `Self: __X` entry first, then the clause — so
+	/// `check_trait_conformance` verifies each member `impl` against the clause
+	/// with no special-casing, and `trait_implies` walks the chain the same
+	/// way. Unlike a hand-written trait there is no AST node to read the clause
+	/// back from, so it is written here once and for all.
+	pub(super) fn signature_typeset_backing_trait(
+		&mut self,
+		resolve_context: ResolveContext,
+		typeset_index: TypesetIndex,
+		bounds_clause: Option<&ast::Spanned<ast::BoundExpression>>,
+		members: &[Spanned<TypeIndex>],
+	) {
+		let backing_trait =
+			self.items.typesets[usize::from(typeset_index)].trait_index;
+
+		let clause = match bounds_clause {
+			Some(spanned) => {
+				self.resolve_bounds(resolve_context, None, spanned)
+			}
+			None => Bounds::default(),
 		};
 
-		self.items.traits[usize::from(trait_index)].bounds = bounds.clone();
+		let name_span =
+			self.items.traits[usize::from(backing_trait)].name.span;
+		let mut traits = Vec::with_capacity(1 + clause.traits.len());
+		traits.push(TraitBound {
+			trait_index: backing_trait,
+			bindings: Box::new([]),
+			span: name_span,
+		});
+		traits.extend(clause.traits.iter().cloned());
+		let self_param = &mut self.items.traits[usize::from(backing_trait)]
+			.self_type_param;
+		self_param.bounds.traits = traits.into_boxed_slice();
 
-		// Force every member's own signature to resolve right along
-		// with the trait's — `entries`/`assoc_types` only get
-		// populated when a member's own `ensure_signature` (via its
-		// own `AstNodeRef::Trait{Function,Const,AssocType}` entry)
-		// runs, and callers that demand-pull a trait mid-signature
-		// (e.g. resolving `M::Size` for `M: Memory` before `Memory`
-		// itself is reached in parse order) only call
-		// `ensure_signature` on the trait's own id, expecting that
-		// to be transitive over its members.
-		for trait_item in items.iter() {
-			let member_id = match &trait_item.inner.inner {
-				ast::TraitItem::Function { id, .. }
-				| ast::TraitItem::Const { id, .. }
-				| ast::TraitItem::AssociatedType { id, .. } => *id,
-			};
-			// A member cannot be resolving this trait: `bounds` is already
-			// written above, which is all a member ever needs from us.
-			let _ = self.ensure_signature(member_id);
+		// Resolve each clause trait's own supertrait chain so `trait_implies`
+		// can walk it when an operator or bound check consults this typeset.
+		for tb in clause.traits.iter() {
+			self.ensure_trait_supertraits(tb.trait_index);
 		}
 
-		// `Self` here is this trait's own — a supertrait binding like
-		// `trait Foo: Bar where { AssocX = SomeType }` states a
-		// constraint that must hold for whatever type ends up
-		// implementing `Foo` (and therefore `Bar`), which is exactly
-		// `Foo`'s own `Self` placeholder — there's no concrete
-		// receiver yet at trait-declaration time.
-		let self_type = self.types.intern(Type::TypeParam {
-			owner: TypeParamOwner::Trait(trait_index),
-			param_index: 0,
-		});
-		for supertrait in bounds.traits.iter() {
-			for (assoc_name, kind) in supertrait.bindings.iter() {
-				// Only an equality binding (`AssocX = SomeType`) has
-				// a concrete value here to check against `AssocX`'s
-				// own declared bounds — a `: Bound` entry has
-				// already had that same declared bound folded into
-				// it directly by `resolve_bounds`, so there's
-				// nothing left to check against a value that
-				// doesn't exist.
-				let AssocBindingKind::Equals(val_ty) = kind else {
-					continue;
-				};
-				self.check_assoc_type_bounds(
-					resolve_context,
-					supertrait.trait_index,
-					self_type,
-					Spanned {
-						inner: *assoc_name,
-						span: supertrait.span,
-					},
-					Spanned {
-						inner: *val_ty,
-						span: supertrait.span,
-					},
-				);
-			}
+		// One synthetic `impl __X for <member>` per member. The trait has no
+		// members, so the impl carries only the supertrait obligations
+		// `check_trait_conformance` checks; `span`/`target.span` point at the
+		// member's type expression so any such diagnostic lands there.
+		for member in members {
+			let impl_index = self.items.push_trait_impl(TraitImpl {
+				id: self.id_generator.generate(),
+				trait_index: backing_trait,
+				type_params: Box::new([]),
+				target: Spanned {
+					inner: member.inner,
+					span: member.span,
+				},
+				members: HashMap::new(),
+				member_decls: HashMap::new(),
+				span: member.span,
+				file_id: resolve_context.file_id,
+				namespace: resolve_context.namespace,
+				self_accesses: Vec::new(),
+			});
+			self.register_trait_impl(
+				member.inner,
+				backing_trait,
+				impl_index,
+			);
 		}
 	}
 
@@ -909,39 +1148,25 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
 		// Self is encoded as TypeParam{0} so default implementations can be
 		// monomorphized: type_args[0] = concrete receiver type at the call site.
-		let self_sym = self.interner.get_or_intern("self");
-		if let ast::TraitItem::Function {
-			id,
-			attributes,
-			signature,
-			..
-		} = item
-		{
+		if let ast::TraitItem::Function { id, signature, .. } = item {
 			// `Self` is owned by the trait; the function inherits it via
 			// type_param_parent so type_params holds only explicit params.
-			let attributes = self.resolve_attributes(*id, attributes);
-			let func_index = self.items.push_function(Function {
-				id: *id,
-				file_id: resolve_context.file_id,
-				namespace: resolve_context.namespace,
-				parent: Some(ItemParent::Trait(trait_index)),
-				body: None,
-				pub_span: None,
-				type_params: signature
-					.type_params
-					.iter()
-					.map(|tp| TypeParamInfo::new(tp.name))
-					.collect(),
-				inherited_type_param_count: 1,
-				signature_index: TypeIndex::ERROR,
-				name: signature.name,
-				accesses: Vec::new(),
-				params: Box::new([]),
-				result: None,
-				attributes,
-			});
+			let MemberIndex::Function(func_index) = self.items.traits
+				[usize::from(trait_index)]
+			.members[&signature.name.inner] else {
+				unreachable!()
+			};
+
 			let self_type = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
@@ -966,19 +1191,6 @@ impl<'ast> Builder<'ast, '_> {
 			func.params = params;
 			func.result = result;
 			func.signature_index = sig_idx;
-			let is_method = signature
-				.params
-				.first()
-				.map(|p| p.inner.inner.name.inner == self_sym)
-				.unwrap_or(false);
-			let entry = if is_method {
-				ImplEntry::Method(func_index)
-			} else {
-				ImplEntry::AssocFunction(func_index)
-			};
-			self.items.traits[usize::from(trait_index)]
-				.entries
-				.insert(signature.name.inner, entry);
 		}
 	}
 
@@ -988,6 +1200,14 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
 		// Self is a TypeParam owned by the trait so `Self::*mut u8` is valid.
 		let self_type_param = self.types.intern(Type::TypeParam {
 			owner: TypeParamOwner::Trait(trait_index),
@@ -998,23 +1218,18 @@ impl<'ast> Builder<'ast, '_> {
 			self_type: Some(self_type_param),
 		};
 		if let ast::TraitItem::Const {
-			id,
-			name,
-			ty,
-			attributes,
-			value,
+			name, ty, value, ..
 		} = item
 		{
 			let ty_idx =
 				self.resolve_type(resolve_context, Some(self_scope), ty);
-			let attributes = self.resolve_attributes(*id, attributes);
 			// A default value's `Self`-relative type (`Self::Size`)
 			// is already resolved above into `ty_idx`, an abstract
 			// `Type::TypeParam` — building/coercing the value
 			// expression against it needs no further generic-scope
 			// threading, the same way an ordinary comptime literal
 			// already coerces against a typeset-bounded type param
-			// (see `test_typeset_intersection_range_literal_in_local`).
+			// (see `test_typeset_bounded_literal_in_local_is_checked_against_members`).
 			let (value_expr, const_value) = match value {
 				Some(value_ast) => match self.build_const_context_expression(
 					resolve_context,
@@ -1043,34 +1258,15 @@ impl<'ast> Builder<'ast, '_> {
 				},
 				None => (None, None),
 			};
-			// Captured only now, right before the push — building the
-			// value expression above can itself demand-drive other
-			// items' signatures, which may push their own entries
-			// onto `self.items.constants` first. Snapshotting the
-			// index any earlier (as the surrounding TIR structs
-			// mostly do, safely, since they never resolve a value
-			// expression in between) would go stale the moment that
-			// happens, pointing this entry at whatever unrelated
-			// constant ended up in the slot instead.
-			let const_index = self.items.push_constant(Constant {
-				id: *id,
-				file_id: resolve_context.file_id,
-				namespace: resolve_context.namespace,
-				parent: Some(ItemParent::Trait(trait_index)),
-				pub_span: None,
-				name: *name,
-				ty: Spanned {
-					inner: ty_idx,
-					span: ty.span,
-				},
-				value: value_expr,
-				const_value,
-				accesses: Vec::new(),
-				attributes,
-			});
-			self.items.traits[usize::from(trait_index)]
-				.entries
-				.insert(name.inner, ImplEntry::AssocConstant(const_index));
+			let MemberIndex::Constant(index) = self.items.traits
+				[usize::from(trait_index)]
+			.members[&name.inner] else {
+				unreachable!()
+			};
+			let constant = &mut self.items.constants[usize::from(index)];
+			constant.ty.inner = ty_idx;
+			constant.value = value_expr;
+			constant.const_value = const_value;
 		}
 	}
 
@@ -1079,14 +1275,14 @@ impl<'ast> Builder<'ast, '_> {
 		resolve_context: ResolveContext,
 		item: &'ast ast::Item,
 	) {
-		let (block_id, type_params, trait_name, target) = match item {
+		let (block_id, type_params, trait_name, target, items) = match item {
 			ast::Item::TraitImpl {
 				id,
 				type_params,
 				trait_name,
 				target,
-				..
-			} => (id, type_params, trait_name, target),
+				items,
+			} => (id, type_params, trait_name, target, items),
 			_ => unreachable!(),
 		};
 
@@ -1099,21 +1295,41 @@ impl<'ast> Builder<'ast, '_> {
 			trait_name,
 			trait_name_span,
 		) {
-			Ok(BoundKind::Trait(tb)) => tb.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::ExpectedBound.code())
-						.with_message("expected a trait name")
-						.with_label(Label::primary(
-							resolve_context.file_id,
-							trait_name_span,
-						)),
-				);
-				return;
-			}
+			Ok(tb) => tb.trait_index,
 			Err(()) => return,
 		};
+		// A `typeset` is sealed: its member set is closed at its declaration
+		// and the compiler generates every impl. A hand-written
+		// `impl SomeTypeset for T` would breach that guarantee.
+		if let Some(typeset_index) = self.items.traits
+			[usize::from(trait_index)]
+		.typeset_index
+		{
+			let name = self.interner.resolve(
+				self.items.typesets[usize::from(typeset_index)].name.inner,
+			);
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::CannotImplementTypeset.code())
+					.with_message(format!(
+						"`{}` is a typeset and cannot be implemented",
+						name.unwrap_or("<typeset>"),
+					))
+					.with_label(
+						Label::primary(
+							resolve_context.file_id,
+							trait_name_span,
+						)
+						.with_message(
+							"a typeset is sealed — its members are fixed at \
+							 its declaration",
+						),
+					),
+			);
+			return;
+		}
+
+		let member_decls = self.collect_member_decls(resolve_context, items);
 
 		// Push a placeholder first (target unresolved), same reason
 		// as `ImplBlock`/`InherentImplBlock`: resolving the target
@@ -1133,6 +1349,7 @@ impl<'ast> Builder<'ast, '_> {
 			},
 			namespace: resolve_context.namespace,
 			members: HashMap::new(),
+			member_decls,
 			span: trait_name_span,
 			file_id: resolve_context.file_id,
 			self_accesses: Vec::new(),
@@ -1166,44 +1383,89 @@ impl<'ast> Builder<'ast, '_> {
 		// inherent impls only.
 	}
 
-	/// Registers `entry` under `name`, unless the impl already has a member of
-	/// that name — the first declaration wins and every later one is reported,
-	/// rather than the last quietly taking the name over. Which one survives
-	/// is deliberately not decided by what the trait declares: an item of the
-	/// wrong kind no longer masks anything, since `check_trait_conformance`
-	/// compares kinds rather than just names.
-	fn register_trait_impl_member(
+	/// What an `impl` block declares, by name, read straight off the AST.
+	///
+	/// Runs with the block's own header, before any member's signature: an
+	/// impl is reached by type rather than by name, so a lookup that lands on
+	/// one cannot ask for a member that has not been resolved yet — it asks
+	/// this instead, and forces the single member it needs.
+	///
+	/// Two members of one block sharing a name is decided here too, and only
+	/// here: the first declaration wins and every later one is reported. Once
+	/// a lookup can force an arbitrary member out of order, "first" is no
+	/// longer whichever happened to resolve first, so the resolved `members`
+	/// map cannot be what answers this — declaration order is a property of
+	/// the source, and this is the one place that still sees it.
+	fn collect_member_decls(
 		&mut self,
 		resolve_context: ResolveContext,
+		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+	) -> HashMap<SymbolU32, MemberDecl> {
+		let mut decls: HashMap<SymbolU32, MemberDecl> =
+			HashMap::with_capacity(items.len());
+		for item in items.iter() {
+			let (name, kind, id) = match &item.inner.inner {
+				ast::ImplItem::Function { id, signature, .. } => {
+					(signature.name, MemberKind::Function, *id)
+				}
+				ast::ImplItem::Constant { id, name, .. } => {
+					(*name, MemberKind::Const, *id)
+				}
+				ast::ImplItem::AssocType { id, name, .. } => {
+					(*name, MemberKind::AssocType, *id)
+				}
+			};
+			if let Some(existing) = decls.get(&name.inner) {
+				self.diagnostics.push(report_duplicate_definition(
+					DuplicateDefinitionDiagnostic {
+						name: self.interner.resolve(name.inner).unwrap(),
+						namespace: existing.kind.namespace(),
+						first_definition: SourceSpan::new(
+							resolve_context.file_id,
+							existing.span,
+						),
+						second_definition: SourceSpan::new(
+							resolve_context.file_id,
+							name.span,
+						),
+					},
+				));
+				continue;
+			}
+			decls.insert(
+				name.inner,
+				MemberDecl {
+					kind,
+					id,
+					span: name.span,
+				},
+			);
+		}
+		decls
+	}
+
+	/// Registers `entry` under `name`, unless another member of this block
+	/// already claimed that name — `collect_member_decls` decided and reported
+	/// that when the header ran, so this only has to honour the outcome.
+	/// Which one survives is deliberately not decided by what the trait
+	/// declares: an item of the wrong kind no longer masks anything, since
+	/// `check_trait_conformance` compares kinds rather than just names.
+	fn register_trait_impl_member(
+		&mut self,
 		trait_impl_index: TraitImplIndex,
-		name: ast::Spanned<SymbolU32>,
+		id: ast::DefId,
+		name: SymbolU32,
 		entry: ImplEntry,
 	) {
-		let existing = self.items.trait_impls[usize::from(trait_impl_index)]
-			.members
-			.get(&name.inner)
-			.copied();
-		if let Some(existing) = existing {
-			let namespace = match existing {
-				ImplEntry::AssocType(_) => SymbolNamespace::Type,
-				_ => SymbolNamespace::Value,
-			};
-			self.diagnostics.push(report_duplicate_definition(
-				DuplicateDefinitionDiagnostic {
-					name: self.interner.resolve(name.inner).unwrap(),
-					namespace,
-					first_definition: existing.def_span(&self.items),
-					second_definition: SourceSpan::new(
-						resolve_context.file_id,
-						name.span,
-					),
-				},
-			));
+		let block = &mut self.items.trait_impls[usize::from(trait_impl_index)];
+		if block
+			.member_decls
+			.get(&name)
+			.is_some_and(|decl| decl.id != id)
+		{
 			return;
 		}
-		self.items.trait_impls[usize::from(trait_impl_index)]
-			.members
-			.insert(name.inner, entry);
+		block.members.insert(name, entry);
 	}
 
 	pub(super) fn signature_trait_impl_function(
@@ -1223,10 +1485,12 @@ impl<'ast> Builder<'ast, '_> {
 		let self_type = self.items.trait_impls[usize::from(trait_impl_index)]
 			.target
 			.inner;
-		let inherited_type_param_count = self.items.trait_impls
-			[usize::from(trait_impl_index)]
-		.type_params
-		.len();
+		let inherited_type_param_count = u32::try_from(
+			self.items.trait_impls[usize::from(trait_impl_index)]
+				.type_params
+				.len(),
+		)
+		.unwrap();
 		let self_symbol = self.interner.get_or_intern("self");
 
 		if let ast::ImplItem::Function {
@@ -1239,6 +1503,10 @@ impl<'ast> Builder<'ast, '_> {
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
 			let func_index = self.items.push_function(Function {
+				is_method: signature.params.first().is_some_and(|p| {
+					self.interner.resolve(p.inner.inner.name.inner)
+						== Some("self")
+				}),
 				id: *id,
 				file_id: resolve_context.file_id,
 				namespace: resolve_context.namespace,
@@ -1300,9 +1568,9 @@ impl<'ast> Builder<'ast, '_> {
 				ImplEntry::AssocFunction(func_index)
 			};
 			self.register_trait_impl_member(
-				resolve_context,
 				trait_impl_index,
-				signature.name,
+				*id,
+				signature.name.inner,
 				entry,
 			);
 		}
@@ -1381,9 +1649,9 @@ impl<'ast> Builder<'ast, '_> {
 				});
 				let entry = ImplEntry::AssocConstant(const_index);
 				self.register_trait_impl_member(
-					resolve_context,
 					trait_impl_index,
-					*name,
+					*id,
+					name.inner,
 					entry,
 				);
 			}
@@ -1396,14 +1664,15 @@ impl<'ast> Builder<'ast, '_> {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
 	) {
-		if let ast::TraitItem::AssociatedType {
-			id,
-			name,
-			bounds,
-			attributes,
-		} = item
-		{
-			let attributes = self.resolve_attributes(*id, attributes);
+		// Supertraits before member: this member's signature can name an
+		// associated item inherited from one (`Self::AssocFromSupertrait`),
+		// and prescan registers a trait's members *before* the trait
+		// itself, so without this the member usually resolves first,
+		// against a `Self` that only knows the trait it is declared in.
+		// Deliberately not `ensure_signature` on the parent — see
+		// `ensure_trait_supertraits`.
+		self.ensure_trait_supertraits(trait_index);
+		if let ast::TraitItem::AssociatedType { name, bounds, .. } = item {
 			let self_type_param = self.types.intern(Type::TypeParam {
 				owner: TypeParamOwner::Trait(trait_index),
 				param_index: 0,
@@ -1413,60 +1682,12 @@ impl<'ast> Builder<'ast, '_> {
 				self_type: Some(self_type_param),
 			};
 
-			// Register the assoc type (name, entries, symbol) before
-			// resolving its own bounds — a `where` clause can reference
-			// this exact assoc type indirectly through a mutually
-			// recursive trait (e.g. `trait A { type X: B where { Y =
-			// Self } }` next to `trait B { type Y: A where { X = Self }
-			// }`), and that reference needs an already-present
-			// `assoc_types` entry to record its access against, even
-			// though this assoc type's own bounds haven't resolved yet.
-			self.items.traits[usize::from(trait_index)]
-				.assoc_types
-				.insert(
-					name.inner,
-					TraitAssocType {
-						id: *id,
-						name_span: name.span,
-						bounds: Bounds::default(),
-						accesses: Vec::new(),
-					},
-				);
-			let assoc_type_index =
-				self.items.push_assoc_type_impl(AssocTypeImpl {
-					id: *id,
-					file_id: resolve_context.file_id,
-					namespace: resolve_context.namespace,
-					name: *name,
-					ty: None,
-					attributes,
-				});
-			self.items.traits[usize::from(trait_index)]
-				.entries
-				.insert(name.inner, ImplEntry::AssocType(assoc_type_index));
-
-			// Replace Pending with TraitAssocType only if it's still our
-			// own Pending — never clobber a same-named resolved symbol.
-			if matches!(
-				self.lookup_global_symbol(resolve_context.namespace, (SymbolNamespace::Type, name.inner)),
-				Some(SymbolEntry::Pending(d)) if d == *id
-			) {
-				// Shares the trait's own visibility — trait bodies
-				// reject a `pub` qualifier on their own members (see
-				// `symbol_kind_is_gated`'s doc comment), so there's
-				// no separate span of this assoc type's own to read.
-				let trait_pub_span =
-					self.items.traits[usize::from(trait_index)].pub_span;
-				self.insert_symbol(
-					resolve_context.namespace,
-					(SymbolNamespace::Type, name.inner),
-					SymbolKind::TraitAssocType {
-						trait_index,
-						assoc_name: name.inner,
-					},
-					trait_pub_span,
-				);
-			}
+			let MemberIndex::AssociatedType(assoc_type_index) =
+				self.items.traits[usize::from(trait_index)].members
+					[&name.inner]
+			else {
+				unreachable!()
+			};
 
 			let bounds = bounds
 				.as_ref()
@@ -1478,11 +1699,8 @@ impl<'ast> Builder<'ast, '_> {
 					)
 				})
 				.unwrap_or_default();
-			self.items.traits[usize::from(trait_index)]
-				.assoc_types
-				.get_mut(&name.inner)
-				.unwrap()
-				.bounds = bounds;
+			self.items.associated_types[usize::from(assoc_type_index)].bounds =
+				bounds;
 		}
 	}
 
@@ -1515,34 +1733,49 @@ impl<'ast> Builder<'ast, '_> {
 		} = item
 		{
 			let attributes = self.resolve_attributes(*id, attributes);
+			// Reserve the arena slot (and its `item_lookup` entry) before
+			// resolving `ty`: a mutually-referential definition
+			// (`impl C for A { type X = B::X }` next to
+			// `impl C for B { type X = A::X }`) re-enters this member's own
+			// `ensure_signature` while `ty` resolves, and
+			// `report_cyclic_type_dependency` needs the `DefId` to be
+			// nameable. The entry is *not* published into the impl's
+			// `members` map until `ty` is filled, so `trait_member_via_impl`
+			// still observes the cycle and reports it rather than handing
+			// back a `ty: None` placeholder.
+			let assoc_type_index =
+				self.items.push_associated_type(AssociatedType {
+					bounds: Bounds::default(),
+					accesses: Vec::new(),
+					id: *id,
+					file_id: resolve_context.file_id,
+					namespace: resolve_context.namespace,
+					name: *name,
+					parent: Some(ItemParent::TraitImpl(trait_impl_index)),
+					ty: None,
+					attributes,
+				});
 			let self_scope = GenericScope {
 				owner: TypeParamOwner::TraitImpl(trait_impl_index),
 				self_type: Some(self_type),
 			};
 			let concrete_ty =
 				self.resolve_type(resolve_context, Some(self_scope), ty);
-			let assoc_type_index =
-				self.items.push_assoc_type_impl(AssocTypeImpl {
-					id: *id,
-					file_id: resolve_context.file_id,
-					namespace: resolve_context.namespace,
-					name: *name,
-					ty: Some(Spanned {
-						inner: concrete_ty,
-						span: ty.span,
-					}),
-					attributes,
+			self.items.associated_types[usize::from(assoc_type_index)].ty =
+				Some(Spanned {
+					inner: concrete_ty,
+					span: ty.span,
 				});
 			let entry = ImplEntry::AssocType(assoc_type_index);
 			self.register_trait_impl_member(
-				resolve_context,
 				trait_impl_index,
-				*name,
+				*id,
+				name.inner,
 				entry,
 			);
-			if let Some(at) = self.items.traits[usize::from(trait_index)]
-				.assoc_types
-				.get_mut(&name.inner)
+			if let Some(at) = self
+				.items
+				.trait_associated_type_mut(trait_index, name.inner)
 			{
 				at.accesses
 					.push(SourceSpan::new(resolve_context.file_id, name.span));
