@@ -65,7 +65,7 @@ impl<'tir> Builder<'tir> {
 			};
 		}
 		let value = self.lower_expression(func_ctx, right, sink);
-		self.lower_assign_target(left, value)
+		self.lower_assign_target(func_ctx, left, value)
 	}
 
 	/// Builds the `LocalSet`/`GlobalSet`/`AggregateSet` that writes `value`
@@ -77,6 +77,7 @@ impl<'tir> Builder<'tir> {
 	/// callers can share this exactly.
 	fn lower_assign_target(
 		&mut self,
+		func_ctx: &FunctionContext,
 		target: &tir::Expression,
 		value: Expression,
 	) -> ExprKind {
@@ -85,8 +86,7 @@ impl<'tir> Builder<'tir> {
 				scope_index,
 				local_index,
 			} => ExprKind::LocalSet {
-				scope_index: ScopeIndex::new(u32::from(*scope_index)),
-				local_index: LocalIndex::new(u32::from(*local_index)),
+				local_index: func_ctx.flat_local(*scope_index, *local_index),
 				value: Box::new(value),
 			},
 			tir::ExprKind::Global { id } => ExprKind::GlobalSet {
@@ -116,8 +116,8 @@ impl<'tir> Builder<'tir> {
 					)
 				};
 				ExprKind::AggregateSet {
-					scope_index: ScopeIndex::new(u32::from(*scope_index)),
-					local_index: LocalIndex::new(u32::from(*local_index)),
+					local_index: func_ctx
+						.flat_local(*scope_index, *local_index),
 					value_index: phys_index,
 					value: Box::new(value),
 				}
@@ -201,7 +201,7 @@ impl<'tir> Builder<'tir> {
 			lowered_rhs,
 		);
 		Expression {
-			kind: self.lower_assign_target(target, call),
+			kind: self.lower_assign_target(func_ctx, target, call),
 			ty: ValueType::Unit,
 		}
 	}
@@ -225,14 +225,9 @@ impl<'tir> Builder<'tir> {
 		let (ptr, offset, memory) =
 			self.lower_place_address(func_ctx, target, sink);
 		let ptr_ty = ptr.ty;
-		let temp_idx = LocalIndex::new(func_ctx.frame[0].locals.len() as u32);
-		func_ctx.frame[0].locals.push(Local {
-			ty: ptr_ty,
-			mutability: Mutability::Immutable,
-		});
+		let temp_idx = func_ctx.push_temp_local(ptr_ty);
 		sink.push(Expression {
 			kind: ExprKind::LocalSet {
-				scope_index: ScopeIndex::new(0),
 				local_index: temp_idx,
 				value: Box::new(ptr),
 			},
@@ -243,7 +238,6 @@ impl<'tir> Builder<'tir> {
 			kind: ExprKind::PointerLoad {
 				pointer: Box::new(Expression {
 					kind: ExprKind::LocalGet {
-						scope_index: ScopeIndex::new(0),
 						local_index: temp_idx,
 					},
 					ty: ptr_ty,
@@ -263,7 +257,6 @@ impl<'tir> Builder<'tir> {
 			kind: ExprKind::PointerStore {
 				pointer: Box::new(Expression {
 					kind: ExprKind::LocalGet {
-						scope_index: ScopeIndex::new(0),
 						local_index: temp_idx,
 					},
 					ty: ptr_ty,

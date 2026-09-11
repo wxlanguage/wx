@@ -7,12 +7,11 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result:
           Pointer:
             memory: 667
             kind: Memory32
+    locals: []
     block:
       kind:
         Block:

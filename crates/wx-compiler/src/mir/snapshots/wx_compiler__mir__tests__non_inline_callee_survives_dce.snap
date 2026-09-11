@@ -7,19 +7,16 @@ functions:
     signature_index: 1
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: U32
-            mutability: Immutable
-          - ty: U32
-            mutability: Immutable
-          - ty: U32
-            mutability: Immutable
         result: U32
       - kind: Block
-        parent: 0
-        locals: []
         result: U32
+    locals:
+      - ty: U32
+        mutability: Immutable
+      - ty: U32
+        mutability: Immutable
+      - ty: U32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -31,18 +28,15 @@ functions:
                   expressions:
                     - kind:
                         LocalSet:
-                          scope_index: 0
                           local_index: 1
                           value:
                             kind:
                               LocalGet:
-                                scope_index: 0
                                 local_index: 0
                             ty: U32
                       ty: Unit
                     - kind:
                         LocalSet:
-                          scope_index: 0
                           local_index: 2
                           value:
                             kind:
@@ -59,13 +53,11 @@ functions:
                                   left:
                                     kind:
                                       LocalGet:
-                                        scope_index: 0
                                         local_index: 1
                                     ty: I32
                                   right:
                                     kind:
                                       LocalGet:
-                                        scope_index: 0
                                         local_index: 2
                                     ty: I32
                               ty: U32
@@ -77,11 +69,10 @@ functions:
     signature_index: 1
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: U32
-            mutability: Immutable
         result: U32
+    locals:
+      - ty: U32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -99,7 +90,6 @@ functions:
                   arguments:
                     - kind:
                         LocalGet:
-                          scope_index: 0
                           local_index: 0
                       ty: U32
               ty: U32

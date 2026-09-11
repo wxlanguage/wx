@@ -188,11 +188,8 @@ fn test_exact_int_literal_coerces_to_float_end_to_end() {
 	let engine = wasmtime::Engine::default();
 	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
 	let mut store = wasmtime::Store::new(&engine, ());
-	let instance =
-		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
-	let f = instance
-		.get_typed_func::<(), f32>(&mut store, "f")
-		.unwrap();
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), f32>(&mut store, "f").unwrap();
 	assert_eq!(f.call(&mut store, ()).unwrap(), 4.5);
 }
 
@@ -211,8 +208,7 @@ fn test_generic_int_literal_monomorphized_to_float_member() {
 	let engine = wasmtime::Engine::default();
 	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
 	let mut store = wasmtime::Store::new(&engine, ());
-	let instance =
-		wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
 	let as_f32 = instance
 		.get_typed_func::<(), f32>(&mut store, "as_f32")
 		.unwrap();
@@ -4629,4 +4625,249 @@ fn test_continue_inside_diverging_if_commits_mutation() {
 	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
 
 	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+// ── labeled-block `break` (opt::ControlNode::BlockJoin) ─────────────────────
+//
+// A plain `{}` block used to have zero representation in the opt IR —
+// `Builder::build_block_expr` never registered a real `Block`/`ControlNode`
+// for one, so a `break` targeting a labeled plain block (allowed by TIR, no
+// restriction to loop-kind scopes) panicked in `opt`. The compiler's own
+// inliner hits the identical shape internally (an inlined callee's `return`s
+// get rewritten to `break`s targeting a wrapper `BlockKind::Block` scope),
+// fixed by the same change with no inliner-side code touched at all.
+
+#[test]
+fn test_break_out_of_labeled_block_with_value() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local x: i32 = outer: {
+                break :outer 5;
+            };
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_clamp_shaped_multi_break_plus_fallthrough() {
+	// Three distinct value-contributing exits into the same join: two
+	// `break`s with different values, plus a differing fallthrough —
+	// exercises the `break_result_outputs` phi merge across all three.
+	let case = TestCase::new(indoc! {"
+        fn clamp(x: i32) -> i32 {
+            outer: {
+                if x < 0 {
+                    break :outer 0;
+                }
+                if x > 100 {
+                    break :outer 100;
+                }
+                x
+            }
+        }
+
+        export { clamp }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let clamp = instance
+		.get_typed_func::<i32, i32>(&mut store, "clamp")
+		.unwrap();
+
+	assert_eq!(clamp.call(&mut store, -5).unwrap(), 0);
+	assert_eq!(clamp.call(&mut store, 50).unwrap(), 50);
+	assert_eq!(clamp.call(&mut store, 200).unwrap(), 100);
+}
+
+#[test]
+fn test_outer_local_mutation_across_divergent_block_exits() {
+	// Exercises `outputs`/`JoinParam` for an ordinary mutable local — not
+	// the block's own return value — on both the break-taken and
+	// break-not-taken paths.
+	let case = TestCase::new(indoc! {"
+        fn f(take_break: bool) -> i32 {
+            local mut x: i32 = 1;
+            outer: {
+                if take_break {
+                    break :outer;
+                }
+                x = 2;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 1);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 2);
+}
+
+#[test]
+fn test_break_nested_several_levels_deep_inside_labeled_block() {
+	// The break-target is a labeled block wrapping a loop; the actual
+	// `break :outer` fires from inside a further nested `if` within that
+	// loop's body — confirms the eager-placeholder mechanism (JoinParam
+	// minted before the body is built) works regardless of nesting depth.
+	let case = TestCase::new(indoc! {"
+        fn f(n: i32) -> i32 {
+            outer: {
+                local mut i: i32 = 0;
+                loop {
+                    if i >= n {
+                        break;
+                    }
+                    if i == 3 {
+                        break :outer i * 10;
+                    }
+                    i = i + 1;
+                };
+                -1
+            }
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	// Loop exits normally (i never reaches 3 before hitting n) — falls
+	// through to the block's own trailing -1.
+	assert_eq!(f.call(&mut store, 3).unwrap(), -1);
+	// i reaches 3 before n — breaks the labeled block from inside the
+	// nested loop's inner if.
+	assert_eq!(f.call(&mut store, 10).unwrap(), 30);
+}
+
+#[test]
+fn test_break_out_of_labeled_block_with_struct_value() {
+	// Exercises the aggregate-decomposition path in both
+	// create_join_params/finalize_block_join_binding (bindings) and
+	// merge_values (the result phi).
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        fn f(take_break: bool) -> i32 {
+            local p: Point = outer: {
+                if take_break {
+                    break :outer Point::{ x: 1, y: 2 };
+                }
+                Point::{ x: 3, y: 4 }
+            };
+            p.x + p.y
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 3);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 7);
+}
+
+#[test]
+fn test_inline_function_with_early_return_executes_correctly() {
+	// End-to-end confirmation that both originally-reported crashes (a
+	// standalone labeled block, and the compiler's own inliner producing
+	// the identical `Break`-into-`BlockKind::Block` shape internally) are
+	// fixed by the same opt-level change, with zero changes to
+	// `mir::inlining`. See `mir::tests::
+	// test_inline_function_with_early_return_produces_break_into_block` for
+	// the MIR-level confirmation of the shape this exercises.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        fn classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub fn main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let main = instance
+		.get_typed_func::<i32, i32>(&mut store, "main")
+		.unwrap();
+
+	// Early return taken (the branch containing the rewritten Break).
+	assert_eq!(main.call(&mut store, -5).unwrap(), -1);
+	// Fallthrough (no Break taken).
+	assert_eq!(main.call(&mut store, 5).unwrap(), 1);
+}
+
+/// Locals declared inside two sibling branches (not just the outer scope)
+/// get distinct flat indices under the flattened MIR locals model — no
+/// existing MIR snapshot exercises a non-root scope with its own locals, so
+/// this checks the offsets are actually computed correctly, not just that
+/// the outer-visible `outer` binding survives the merge.
+#[test]
+fn test_locals_declared_inside_sibling_branches_get_distinct_slots() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local mut outer: i32 = 100;
+            if x > 0 {
+                local a: i32 = 1;
+                local b: i32 = 2;
+                outer = outer + a + b;
+            } else {
+                local c: i32 = 10;
+                outer = outer + c;
+            }
+            outer
+        }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+	assert_eq!(f.call(&mut store, 5).unwrap(), 103);
+	assert_eq!(f.call(&mut store, -5).unwrap(), 110);
 }

@@ -7,15 +7,14 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty:
-              Aggregate:
-                aggregate_index: 0
-            mutability: Immutable
         result:
           Aggregate:
             aggregate_index: 0
+    locals:
+      - ty:
+          Aggregate:
+            aggregate_index: 0
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -33,7 +32,6 @@ functions:
                   arguments:
                     - kind:
                         LocalGet:
-                          scope_index: 0
                           local_index: 0
                       ty:
                         Aggregate:
@@ -49,21 +47,18 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty:
-              Aggregate:
-                aggregate_index: 0
-            mutability: Immutable
-          - ty: I32
-            mutability: Immutable
         result:
           Aggregate:
             aggregate_index: 0
       - kind: Block
-        parent: 0
-        locals: []
         result: I32
+    locals:
+      - ty:
+          Aggregate:
+            aggregate_index: 0
+        mutability: Immutable
+      - ty: I32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -78,12 +73,10 @@ functions:
                           expressions:
                             - kind:
                                 LocalSet:
-                                  scope_index: 0
                                   local_index: 1
                                   value:
                                     kind:
                                       AggregateGet:
-                                        scope_index: 0
                                         local_index: 0
                                         value_index: 0
                                     ty: I32
@@ -97,7 +90,6 @@ functions:
                                           value:
                                             kind:
                                               LocalGet:
-                                                scope_index: 0
                                                 local_index: 1
                                             ty: I32
                                       ty: I32

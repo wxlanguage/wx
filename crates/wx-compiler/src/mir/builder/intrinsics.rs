@@ -40,12 +40,8 @@ impl<'tir> Builder<'tir> {
 						local_index,
 					} => Expression {
 						kind: ExprKind::AggregateGet {
-							scope_index: ScopeIndex::new(u32::from(
-								*scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
-								*local_index,
-							)),
+							local_index: func_ctx
+								.flat_local(*scope_index, *local_index),
 							value_index: PhysIndex::new(1),
 						},
 						ty: result_ty,
@@ -54,16 +50,9 @@ impl<'tir> Builder<'tir> {
 						let slice_ty = self.lower_type_index(slice_arg.ty);
 						let lowered =
 							self.lower_expression(func_ctx, slice_arg, sink);
-						let temp_idx = LocalIndex::new(
-							func_ctx.frame[0].locals.len() as u32,
-						);
-						func_ctx.frame[0].locals.push(Local {
-							ty: slice_ty,
-							mutability: Mutability::Immutable,
-						});
+						let temp_idx = func_ctx.push_temp_local(slice_ty);
 						sink.push(Expression {
 							kind: ExprKind::LocalSet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value: Box::new(lowered),
 							},
@@ -71,7 +60,6 @@ impl<'tir> Builder<'tir> {
 						});
 						Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value_index: PhysIndex::new(1),
 							},
@@ -89,12 +77,8 @@ impl<'tir> Builder<'tir> {
 						local_index,
 					} => Expression {
 						kind: ExprKind::AggregateGet {
-							scope_index: ScopeIndex::new(u32::from(
-								*scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
-								*local_index,
-							)),
+							local_index: func_ctx
+								.flat_local(*scope_index, *local_index),
 							value_index: PhysIndex::new(0),
 						},
 						ty: result_ty,
@@ -103,16 +87,9 @@ impl<'tir> Builder<'tir> {
 						let slice_ty = self.lower_type_index(slice_arg.ty);
 						let lowered =
 							self.lower_expression(func_ctx, slice_arg, sink);
-						let temp_idx = LocalIndex::new(
-							func_ctx.frame[0].locals.len() as u32,
-						);
-						func_ctx.frame[0].locals.push(Local {
-							ty: slice_ty,
-							mutability: Mutability::Immutable,
-						});
+						let temp_idx = func_ctx.push_temp_local(slice_ty);
 						sink.push(Expression {
 							kind: ExprKind::LocalSet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value: Box::new(lowered),
 							},
@@ -120,7 +97,6 @@ impl<'tir> Builder<'tir> {
 						});
 						Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value_index: PhysIndex::new(0),
 							},

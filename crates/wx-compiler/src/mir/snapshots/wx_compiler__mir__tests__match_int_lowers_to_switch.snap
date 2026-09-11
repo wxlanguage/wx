@@ -7,23 +7,16 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: I32
-            mutability: Immutable
         result: I32
       - kind: Block
-        parent: 0
-        locals: []
         result: I32
       - kind: Block
-        parent: 0
-        locals: []
         result: I32
       - kind: Block
-        parent: 0
-        locals: []
         result: I32
+    locals:
+      - ty: I32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -34,7 +27,6 @@ functions:
                   selector:
                     kind:
                       LocalGet:
-                        scope_index: 0
                         local_index: 0
                     ty: I32
                   cases:

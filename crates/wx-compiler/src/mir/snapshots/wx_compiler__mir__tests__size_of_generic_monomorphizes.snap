@@ -7,9 +7,8 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result: U32
+    locals: []
     block:
       kind:
         Block:
@@ -32,9 +31,8 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result: U32
+    locals: []
     block:
       kind:
         Block:
@@ -57,9 +55,8 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result: U32
+    locals: []
     block:
       kind:
         Block:
@@ -75,9 +72,8 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result: U32
+    locals: []
     block:
       kind:
         Block:

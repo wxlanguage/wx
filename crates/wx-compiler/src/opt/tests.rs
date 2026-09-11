@@ -130,20 +130,16 @@ fn test_simple_add() {
 	let func = case.get_tagged_func("target");
 	let opt = Builder::build(&case.mir, func);
 
-	// 4 data nodes: Param(0), Param(1), a dead Int(0), Add. The dead Int(0)
-	// is `i32::add`'s inlined `self`/`rhs` locals living in `add`'s own root
-	// scope (see `mir::inlining::inline_call`) — `build_function` seeds
-	// every root-scope local past the function's own declared parameters
-	// with a default value before the function body's own `LocalSet`s (here,
-	// forwarding `a`/`b` into those locals) get a chance to run, so one
-	// throwaway default node is unavoidable per inlined call whose site is
-	// the function root. Harmless: nothing uses it, and the same node gets
-	// reused (via `Builder::node`'s CSE) for any other `0`-valued i32 this
-	// function happens to need elsewhere.
+	// 3 data nodes: Param(0), Param(1), Add. `i32::add`'s inlined `self`/
+	// `rhs` locals (see `mir::inlining::inline_call`) never get a node of
+	// their own at all here — bindings start `None` ("not yet declared on
+	// this build path") until each local's own `LocalSet` actually runs, so
+	// `a`/`b` land straight in the inlined `self`/`rhs` slots with no
+	// throwaway default in between.
 	assert_eq!(
 		opt.data_nodes.len(),
-		4,
-		"expected Param(0), Param(1), a dead Int(0), Add — got {:#?}",
+		3,
+		"expected Param(0), Param(1), Add — got {:#?}",
 		opt.data_nodes.iter().map(|n| &n.kind).collect::<Vec<_>>()
 	);
 
@@ -162,7 +158,7 @@ fn test_simple_add() {
 		}
 	));
 	assert!(matches!(
-		opt.data_nodes[3].kind,
+		opt.data_nodes[2].kind,
 		DataNodeKind::Add {
 			left: 0,
 			right: 1,
@@ -174,12 +170,12 @@ fn test_simple_add() {
 	// a use-edge). Params are used by the Add.
 	assert_eq!(
 		opt.data_nodes[0].uses,
-		vec![3],
+		vec![2],
 		"Param(0) should be used by Add"
 	);
 	assert_eq!(
 		opt.data_nodes[1].uses,
-		vec![3],
+		vec![2],
 		"Param(1) should be used by Add"
 	);
 
@@ -189,7 +185,7 @@ fn test_simple_add() {
 	assert!(matches!(
 		root.statements[0],
 		crate::opt::ControlNode::Return {
-			value: StackResult::Value(3)
+			value: StackResult::Value(2)
 		}
 	));
 }
@@ -2406,5 +2402,39 @@ fn test_match_schedules_br_table_for_dense_cases() {
 	assert!(
 		!body.iter().any(|i| matches!(i, Instruction::If { .. })),
 		"a dense match must not also emit an if/else chain; got: {body:?}"
+	);
+}
+
+#[test]
+fn test_untargeted_plain_block_registers_no_block_join() {
+	// A plain `{}` block that nothing ever `break`s to must stay exactly as
+	// cheap as it was before `ControlNode::BlockJoin` existed — no `Block`
+	// entry, no `BlockJoinData`, no wasted WASM nesting. `break_targets`
+	// (computed once up front by `collect_break_targets`) is what lets
+	// `build_block_expr` recognize this and take the fully transparent path.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local y: i32 = {
+                local a: i32 = 1;
+                a + 2
+            };
+            y
+        }
+        export { f }
+    "});
+	let func_mir = case.get_first_func();
+	let opt = Builder::build(&case.mir, func_mir);
+
+	assert!(
+		opt.block_joins.is_empty(),
+		"expected zero BlockJoinData entries for a function with no break \
+		 anywhere; got {} entries",
+		opt.block_joins.len()
+	);
+	assert!(
+		opt.blocks
+			.iter()
+			.all(|b| b.as_ref().is_none_or(|blk| !blk.is_block_join())),
+		"no registered Block should be marked as a block-join"
 	);
 }

@@ -7,18 +7,17 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty:
-              Pointer:
-                memory: 667
-                kind: Memory32
-            mutability: Immutable
-          - ty: U32
-            mutability: Immutable
         result:
           Aggregate:
             aggregate_index: 0
+    locals:
+      - ty:
+          Pointer:
+            memory: 667
+            kind: Memory32
+        mutability: Immutable
+      - ty: U32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -29,7 +28,6 @@ functions:
                   values:
                     - kind:
                         LocalGet:
-                          scope_index: 0
                           local_index: 0
                       ty:
                         Pointer:
@@ -37,7 +35,6 @@ functions:
                           kind: Memory32
                     - kind:
                         LocalGet:
-                          scope_index: 0
                           local_index: 1
                       ty: U32
               ty:

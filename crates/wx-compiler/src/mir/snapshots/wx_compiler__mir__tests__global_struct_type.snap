@@ -7,11 +7,10 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals: []
         result:
           Aggregate:
             aggregate_index: 0
+    locals: []
     block:
       kind:
         Block:

@@ -27,7 +27,8 @@ use types::{ConcreteType, TraitMember, TypeContext, TypeEnvId, TypeId};
 mod tests;
 
 index_newtype!(
-	/// Index into `BlockScope::locals`, distinct from `tir::LocalIndex`.
+	/// Flat, function-wide index into `Function::locals`, distinct from
+	/// `tir::LocalIndex` (which is per-scope).
 	LocalIndex
 );
 index_newtype!(
@@ -61,11 +62,9 @@ pub enum ExprKind {
 		value: f64,
 	},
 	LocalGet {
-		scope_index: ScopeIndex,
 		local_index: LocalIndex,
 	},
 	LocalSet {
-		scope_index: ScopeIndex,
 		local_index: LocalIndex,
 		value: Box<Expression>,
 	},
@@ -73,13 +72,11 @@ pub enum ExprKind {
 		values: Box<[Expression]>,
 	},
 	AggregateGet {
-		scope_index: ScopeIndex,
 		local_index: LocalIndex,
 		/// Physical, not declaration, order — see [`PhysIndex`].
 		value_index: PhysIndex,
 	},
 	AggregateSet {
-		scope_index: ScopeIndex,
 		local_index: LocalIndex,
 		/// Physical, not declaration, order — see [`PhysIndex`].
 		value_index: PhysIndex,
@@ -724,8 +721,6 @@ pub struct Local {
 #[derive(Clone)]
 pub struct BlockScope {
 	pub kind: tir::BlockKind,
-	pub parent: Option<ScopeIndex>,
-	pub locals: Vec<Local>,
 	pub result: ValueType,
 }
 
@@ -752,6 +747,11 @@ pub struct Function {
 	pub id: ast::DefId,
 	pub signature_index: SignatureIndex,
 	pub scopes: Vec<BlockScope>,
+	/// Every local the function owns, in one flat, function-wide space —
+	/// scope 0's locals first, then each subsequent scope's own locals in
+	/// scope order, including MIR-synthesized temporaries (which are just
+	/// appended here directly, not routed through any particular scope).
+	pub locals: Vec<Local>,
 	pub block: Expression,
 	/// Indices into `MIR.static_pool.entries` owned by this function.
 	/// Codegen unions these across all live functions to determine which
@@ -1032,10 +1032,49 @@ struct Builder<'tir> {
 }
 
 struct FunctionContext {
-	frame: Vec<BlockScope>,
+	scopes: Vec<BlockScope>,
+	/// Every local the function owns, in one flat, function-wide space.
+	/// Mirrors `Function::locals` — this is where it's actually built up.
+	locals: Vec<Local>,
+	/// Flat offset where each scope's own locals begin in `locals` —
+	/// transient, build-local scratch used only to translate TIR's
+	/// `(scope_index, local_index)` pairs into flat MIR indices while
+	/// lowering. Built once, up front, in `lower_function`; never persisted
+	/// on `Function`/`BlockScope`.
+	scope_offsets: Vec<u32>,
 	current_scope_index: ScopeIndex,
 	/// Static pool indices referenced by expressions in this function.
 	static_data: Vec<u32>,
+}
+
+impl FunctionContext {
+	/// Translates a TIR-level `(scope_index, local_index)` pair into this
+	/// function's flat MIR `LocalIndex`.
+	fn flat_local(
+		&self,
+		scope_index: tir::ScopeIndex,
+		local_index: tir::LocalIndex,
+	) -> LocalIndex {
+		LocalIndex::new(
+			self.scope_offsets[usize::from(scope_index)]
+				+ u32::from(local_index),
+		)
+	}
+
+	/// Appends a new function-wide temporary local and returns its flat
+	/// index — the sink for every MIR-synthesized spill (bounds-check
+	/// temporaries, non-local object bases, etc.). Replaces the old
+	/// "scope 0" idiom: these temporaries no longer need a fictional home
+	/// scope, since locals are addressed flatly regardless of where they
+	/// live.
+	fn push_temp_local(&mut self, ty: ValueType) -> LocalIndex {
+		let index = LocalIndex::new(self.locals.len() as u32);
+		self.locals.push(Local {
+			ty,
+			mutability: Mutability::Immutable,
+		});
+		index
+	}
 }
 
 impl<'tir> Builder<'tir> {
@@ -1340,29 +1379,27 @@ impl<'tir> Builder<'tir> {
 			.body
 			.expect("lower_function called on bodyless function");
 		let body = &self.tir.items.bodies[usize::from(body_idx)];
-		let frame = body
+
+		let mut locals = Vec::new();
+		let mut scope_offsets = Vec::with_capacity(body.stack.scopes.len());
+		let scopes = body
 			.stack
 			.scopes
 			.iter()
 			.map(|scope| {
 				let result_type_idx =
 					scope.inferred_type.infer_or(tir::TypeIndex::UNIT);
-				let locals = scope
-					.locals
-					.iter()
-					.map(|tir_local| Local {
-						ty: self.lower_type_index(tir_local.ty),
-						mutability: if tir_local.mut_span.is_some() {
-							Mutability::Mutable
-						} else {
-							Mutability::Immutable
-						},
-					})
-					.collect();
+				scope_offsets.push(locals.len() as u32);
+				locals.extend(scope.locals.iter().map(|tir_local| Local {
+					ty: self.lower_type_index(tir_local.ty),
+					mutability: if tir_local.mut_span.is_some() {
+						Mutability::Mutable
+					} else {
+						Mutability::Immutable
+					},
+				}));
 				BlockScope {
 					kind: scope.kind,
-					parent: scope.parent.map(|p| ScopeIndex::new(u32::from(p))),
-					locals,
 					result: self.lower_type_index(result_type_idx),
 				}
 			})
@@ -1370,7 +1407,9 @@ impl<'tir> Builder<'tir> {
 
 		let mut ctx = FunctionContext {
 			current_scope_index: ScopeIndex::new(0),
-			frame,
+			scopes,
+			scope_offsets,
+			locals,
 			static_data: Vec::new(),
 		};
 
@@ -1381,7 +1420,8 @@ impl<'tir> Builder<'tir> {
 			id: func.id,
 			signature_index: self
 				.intern_tir_function_type(func.signature_index),
-			scopes: ctx.frame,
+			scopes: ctx.scopes,
+			locals: ctx.locals,
 			block,
 			static_data: ctx.static_data,
 		}
@@ -1450,42 +1490,36 @@ impl<'tir> Builder<'tir> {
 		// Root scope for the start function body (no params, no locals).
 		let root_scope = BlockScope {
 			kind: tir::BlockKind::Block,
-			parent: None,
-			locals: vec![],
 			result: ValueType::Unit,
 		};
-		let mut combined_frame: Vec<BlockScope> = vec![root_scope];
+		let mut combined_scopes: Vec<BlockScope> = vec![root_scope];
+		let mut combined_locals: Vec<Local> = Vec::new();
 		let mut combined_body: Vec<Expression> = Vec::new();
 		let mut combined_static_data: Vec<u32> = Vec::new();
 
 		for g in globals_with_init {
 			let body = &tir.items.bodies[usize::from(g.value.unwrap())];
 
-			let frame: Vec<BlockScope> = body
+			let mut locals = Vec::new();
+			let mut scope_offsets = Vec::with_capacity(body.stack.scopes.len());
+			let scopes: Vec<BlockScope> = body
 				.stack
 				.scopes
 				.iter()
 				.map(|scope| {
 					let result_ty =
 						scope.inferred_type.infer_or(tir::TypeIndex::UNIT);
-					let locals = scope
-						.locals
-						.iter()
-						.map(|tir_local| Local {
-							ty: self.lower_type_index(tir_local.ty),
-							mutability: if tir_local.mut_span.is_some() {
-								Mutability::Mutable
-							} else {
-								Mutability::Immutable
-							},
-						})
-						.collect();
+					scope_offsets.push(locals.len() as u32);
+					locals.extend(scope.locals.iter().map(|tir_local| Local {
+						ty: self.lower_type_index(tir_local.ty),
+						mutability: if tir_local.mut_span.is_some() {
+							Mutability::Mutable
+						} else {
+							Mutability::Immutable
+						},
+					}));
 					BlockScope {
 						kind: scope.kind,
-						parent: scope
-							.parent
-							.map(|p| ScopeIndex::new(u32::from(p))),
-						locals,
 						result: self.lower_type_index(result_ty),
 					}
 				})
@@ -1493,7 +1527,9 @@ impl<'tir> Builder<'tir> {
 
 			let mut ctx = FunctionContext {
 				current_scope_index: ScopeIndex::new(0),
-				frame,
+				scopes,
+				scope_offsets,
+				locals,
 				static_data: Vec::new(),
 			};
 
@@ -1501,25 +1537,23 @@ impl<'tir> Builder<'tir> {
 			let mut lowered =
 				self.lower_expression(&mut ctx, &body.block, &mut sink);
 
-			// Offset all scope indices so this global's scopes don't collide
-			// with scopes from prior globals in the combined frame.
-			let scope_offset = ScopeIndex::new(combined_frame.len() as u32);
-			rebase_scope(&mut lowered, scope_offset, ScopeIndex::new(0));
+			// Offset all scope indices and local indices so this global's
+			// scopes/locals don't collide with prior globals' in the
+			// combined pool.
+			let scope_offset = ScopeIndex::new(combined_scopes.len() as u32);
+			let local_offset = LocalIndex::new(combined_locals.len() as u32);
+			rebase_scope(
+				&mut lowered,
+				scope_offset,
+				ScopeIndex::new(0),
+				local_offset,
+			);
 			for e in sink.iter_mut() {
-				rebase_scope(e, scope_offset, ScopeIndex::new(0));
+				rebase_scope(e, scope_offset, ScopeIndex::new(0), local_offset);
 			}
 
-			// Append this global's scopes to the combined frame, adjusting
-			// parent pointers so roots become children of the start body scope.
-			for mut scope in ctx.frame {
-				scope.parent = match scope.parent {
-					None => Some(ScopeIndex::new(0)),
-					Some(p) => Some(ScopeIndex::new(
-						u32::from(p) + u32::from(scope_offset),
-					)),
-				};
-				combined_frame.push(scope);
-			}
+			combined_scopes.extend(ctx.scopes);
+			combined_locals.extend(ctx.locals);
 
 			combined_body.extend(sink);
 			combined_body.push(Expression {
@@ -1541,7 +1575,8 @@ impl<'tir> Builder<'tir> {
 		Some(Function {
 			id: start_id,
 			signature_index,
-			scopes: combined_frame,
+			scopes: combined_scopes,
+			locals: combined_locals,
 			block: Expression {
 				kind: ExprKind::Block {
 					scope_index: ScopeIndex::new(0),
@@ -1648,37 +1683,27 @@ impl<'tir> Builder<'tir> {
 			};
 			let memory_id = *memory_id;
 			let ptr_ty = self.pointer_type(memory_id);
-			let (si, li) = match &object.kind {
+			let li = match &object.kind {
 				tir::ExprKind::Local {
 					scope_index,
 					local_index,
-				} => (
-					ScopeIndex::new(u32::from(*scope_index)),
-					LocalIndex::new(u32::from(*local_index)),
-				),
+				} => func_ctx.flat_local(*scope_index, *local_index),
 				_ => {
 					let lowered = self.lower_expression(func_ctx, object, sink);
 					let obj_ty = self.lower_type_index(object.ty);
-					let temp =
-						LocalIndex::new(func_ctx.frame[0].locals.len() as u32);
-					func_ctx.frame[0].locals.push(Local {
-						ty: obj_ty,
-						mutability: Mutability::Immutable,
-					});
+					let temp = func_ctx.push_temp_local(obj_ty);
 					sink.push(Expression {
 						kind: ExprKind::LocalSet {
-							scope_index: ScopeIndex::new(0),
 							local_index: temp,
 							value: Box::new(lowered),
 						},
 						ty: ValueType::Unit,
 					});
-					(ScopeIndex::new(0), temp)
+					temp
 				}
 			};
 			let ptr = Expression {
 				kind: ExprKind::AggregateGet {
-					scope_index: si,
 					local_index: li,
 					value_index: PhysIndex::new(0),
 				},
@@ -1751,29 +1776,24 @@ impl<'tir> Builder<'tir> {
 		}
 	}
 
-	/// Stores `value` into a fresh local and returns its index in scope 0, so
-	/// it can be read back more than once without re-evaluating it.
+	/// Stores `value` into a fresh function-wide local and returns its flat
+	/// index, so it can be read back more than once without re-evaluating
+	/// it.
 	///
 	/// The temp-local idiom used throughout this file: `AggregateGet` and
 	/// friends address a local, never an arbitrary expression, so anything
-	/// they need to read has to be parked in one first. Scope 0 (the function
-	/// root) is where all such temps go — its locals outlive every nested
-	/// scope, and `compute_locals_offsets` lays scopes out after it.
+	/// they need to read has to be parked in one first. Locals are flat and
+	/// function-wide (`Function::locals`), so a temp just gets appended
+	/// directly — there's no "home scope" to route it through.
 	fn spill_to_temp(
 		&mut self,
 		func_ctx: &mut FunctionContext,
 		value: Expression,
 		sink: &mut Vec<Expression>,
 	) -> LocalIndex {
-		let local_index =
-			LocalIndex::new(func_ctx.frame[0].locals.len() as u32);
-		func_ctx.frame[0].locals.push(Local {
-			ty: value.ty,
-			mutability: Mutability::Immutable,
-		});
+		let local_index = func_ctx.push_temp_local(value.ty);
 		sink.push(Expression {
 			kind: ExprKind::LocalSet {
-				scope_index: ScopeIndex::new(0),
 				local_index,
 				value: Box::new(value),
 			},
@@ -1809,7 +1829,9 @@ impl<'tir> Builder<'tir> {
 				let ty = self.lower_type_index(expr.ty);
 				match ty {
 					ValueType::F32 | ValueType::F64 => Expression {
-						kind: ExprKind::Float { value: *value as f64 },
+						kind: ExprKind::Float {
+							value: *value as f64,
+						},
 						ty,
 					},
 					_ => Expression {
@@ -1837,8 +1859,8 @@ impl<'tir> Builder<'tir> {
 				local_index,
 			} => Expression {
 				kind: ExprKind::LocalGet {
-					scope_index: ScopeIndex::new(u32::from(*scope_index)),
-					local_index: LocalIndex::new(u32::from(*local_index)),
+					local_index: func_ctx
+						.flat_local(*scope_index, *local_index),
 				},
 				ty: self.lower_type_index(expr.ty),
 			},
@@ -2229,12 +2251,8 @@ impl<'tir> Builder<'tir> {
 						local_index,
 					} => Expression {
 						kind: ExprKind::AggregateGet {
-							scope_index: ScopeIndex::new(u32::from(
-								*scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
-								*local_index,
-							)),
+							local_index: func_ctx
+								.flat_local(*scope_index, *local_index),
 							value_index: phys_index,
 						},
 						ty: field_ty,
@@ -2244,17 +2262,10 @@ impl<'tir> Builder<'tir> {
 						let object_lowered =
 							self.lower_expression(func_ctx, object, sink);
 
-						let temp_idx = LocalIndex::new(
-							func_ctx.frame[0].locals.len() as u32,
-						);
-						func_ctx.frame[0].locals.push(Local {
-							ty: object_ty,
-							mutability: Mutability::Immutable,
-						});
+						let temp_idx = func_ctx.push_temp_local(object_ty);
 
 						sink.push(Expression {
 							kind: ExprKind::LocalSet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value: Box::new(object_lowered),
 							},
@@ -2263,7 +2274,6 @@ impl<'tir> Builder<'tir> {
 
 						Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index: ScopeIndex::new(0),
 								local_index: temp_idx,
 								value_index: phys_index,
 							},
@@ -2423,7 +2433,7 @@ impl<'tir> Builder<'tir> {
 			} => {
 				func_ctx.current_scope_index =
 					ScopeIndex::new(u32::from(*scope_index));
-					
+
 				let mut inner_sink: Vec<Expression> = Vec::new();
 				for expr in expressions.iter().chain(result.as_deref()) {
 					let lowered_expr =
@@ -2446,8 +2456,8 @@ impl<'tir> Builder<'tir> {
 				..
 			} => Expression {
 				kind: ExprKind::LocalSet {
-					scope_index: ScopeIndex::new(u32::from(*scope_index)),
-					local_index: LocalIndex::new(u32::from(*local_index)),
+					local_index: func_ctx
+						.flat_local(*scope_index, *local_index),
 					value: Box::new(
 						self.lower_expression(func_ctx, value, sink),
 					),
@@ -2475,17 +2485,11 @@ impl<'tir> Builder<'tir> {
 					tir::ExprKind::Local {
 						scope_index,
 						local_index,
-					} => (
-						ScopeIndex::new(u32::from(*scope_index)),
-						LocalIndex::new(u32::from(*local_index)),
-					),
+					} => func_ctx.flat_local(*scope_index, *local_index),
 					_ => {
 						let value =
 							self.lower_expression(func_ctx, value, sink);
-						(
-							ScopeIndex::new(0),
-							self.spill_to_temp(func_ctx, value, sink),
-						)
+						self.spill_to_temp(func_ctx, value, sink)
 					}
 				};
 
@@ -2494,7 +2498,7 @@ impl<'tir> Builder<'tir> {
 				// binding that asked for them.
 				let first_store = sink.len();
 				for binding in bindings.iter() {
-					let (mut scope_index, mut local_index) = scrutinee;
+					let mut local_index = scrutinee;
 					let mut projected: Option<Expression> = None;
 
 					for step in binding.path.iter() {
@@ -2504,7 +2508,6 @@ impl<'tir> Builder<'tir> {
 						if let Some(value) = projected.take() {
 							local_index =
 								self.spill_to_temp(func_ctx, value, sink);
-							scope_index = ScopeIndex::new(0);
 						}
 
 						let ValueType::Aggregate { aggregate_index } =
@@ -2523,7 +2526,6 @@ impl<'tir> Builder<'tir> {
 
 						projected = Some(Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index,
 								local_index,
 								value_index,
 							},
@@ -2535,12 +2537,10 @@ impl<'tir> Builder<'tir> {
 						.expect("a destructured binding has at least one step");
 					sink.push(Expression {
 						kind: ExprKind::LocalSet {
-							scope_index: ScopeIndex::new(u32::from(
+							local_index: func_ctx.flat_local(
 								binding.scope_index,
-							)),
-							local_index: LocalIndex::new(u32::from(
 								binding.local_index,
-							)),
+							),
 							value: Box::new(value),
 						},
 						ty: ValueType::Unit,
@@ -2700,37 +2700,26 @@ impl<'tir> Builder<'tir> {
 				let (base_ptr, opt_slice_len) = match static_size {
 					Some(_) => (lowered_obj, None),
 					None => {
-						let (si, li) = match &object.kind {
+						let li = match &object.kind {
 							tir::ExprKind::Local {
 								scope_index,
 								local_index,
-							} => (
-								ScopeIndex::new(u32::from(*scope_index)),
-								LocalIndex::new(u32::from(*local_index)),
-							),
+							} => func_ctx.flat_local(*scope_index, *local_index),
 							_ => {
 								let obj_ty = self.lower_type_index(object.ty);
-								let temp = LocalIndex::new(
-									func_ctx.frame[0].locals.len() as u32,
-								);
-								func_ctx.frame[0].locals.push(Local {
-									ty: obj_ty,
-									mutability: Mutability::Immutable,
-								});
+								let temp = func_ctx.push_temp_local(obj_ty);
 								sink.push(Expression {
 									kind: ExprKind::LocalSet {
-										scope_index: ScopeIndex::new(0),
 										local_index: temp,
 										value: Box::new(lowered_obj),
 									},
 									ty: ValueType::Unit,
 								});
-								(ScopeIndex::new(0), temp)
+								temp
 							}
 						};
 						let ptr = Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index: si,
 								local_index: li,
 								value_index: PhysIndex::new(0),
 							},
@@ -2738,7 +2727,6 @@ impl<'tir> Builder<'tir> {
 						};
 						let len = Expression {
 							kind: ExprKind::AggregateGet {
-								scope_index: si,
 								local_index: li,
 								value_index: PhysIndex::new(1),
 							},
@@ -2756,15 +2744,9 @@ impl<'tir> Builder<'tir> {
 						start.as_ref().unwrap(),
 						sink,
 					);
-					let temp =
-						LocalIndex::new(func_ctx.frame[0].locals.len() as u32);
-					func_ctx.frame[0].locals.push(Local {
-						ty: idx_ty,
-						mutability: Mutability::Immutable,
-					});
+					let temp = func_ctx.push_temp_local(idx_ty);
 					sink.push(Expression {
 						kind: ExprKind::LocalSet {
-							scope_index: ScopeIndex::new(0),
 							local_index: temp,
 							value: Box::new(s_lowered),
 						},
@@ -2780,10 +2762,7 @@ impl<'tir> Builder<'tir> {
 					None => base_ptr,
 					Some(li) => {
 						let start_val = Expression {
-							kind: ExprKind::LocalGet {
-								scope_index: ScopeIndex::new(0),
-								local_index: li,
-							},
+							kind: ExprKind::LocalGet { local_index: li },
 							ty: idx_ty,
 						};
 						let byte_offset = if elem_size == 1 {
@@ -2825,29 +2804,22 @@ impl<'tir> Builder<'tir> {
 						if let Some(s_li) = start_local {
 							// Spill `to` so it can be read by both the bounds
 							// check and the length subtraction below.
-							let e_temp = LocalIndex::new(
-								func_ctx.frame[0].locals.len() as u32,
-							);
-							func_ctx.frame[0].locals.push(Local {
-								ty: idx_ty,
-								mutability: Mutability::Immutable,
-							});
+							let e_temp = func_ctx.push_temp_local(idx_ty);
 							sink.push(Expression {
 								kind: ExprKind::LocalSet {
-									scope_index: ScopeIndex::new(0),
 									local_index: e_temp,
 									value: Box::new(e_lowered),
 								},
 								ty: ValueType::Unit,
 							});
 
-							// Allocate a synthetic block scope for the trap branch.
+							// Allocate a synthetic block scope for the trap
+							// branch — a fresh scope index beyond the ones
+							// TIR handed us; it holds no locals of its own.
 							let trap_scope =
-								ScopeIndex::new(func_ctx.frame.len() as u32);
-							func_ctx.frame.push(BlockScope {
+								ScopeIndex::new(func_ctx.scopes.len() as u32);
+							func_ctx.scopes.push(BlockScope {
 								kind: tir::BlockKind::Block,
-								parent: Some(func_ctx.current_scope_index),
-								locals: vec![],
 								result: ValueType::Never,
 							});
 
@@ -2858,16 +2830,12 @@ impl<'tir> Builder<'tir> {
 										kind: ExprKind::Greater {
 											left: Box::new(Expression {
 												kind: ExprKind::LocalGet {
-													scope_index:
-														ScopeIndex::new(0),
 													local_index: s_li,
 												},
 												ty: idx_ty,
 											}),
 											right: Box::new(Expression {
 												kind: ExprKind::LocalGet {
-													scope_index:
-														ScopeIndex::new(0),
 													local_index: e_temp,
 												},
 												ty: idx_ty,
@@ -2894,7 +2862,6 @@ impl<'tir> Builder<'tir> {
 
 							Expression {
 								kind: ExprKind::LocalGet {
-									scope_index: ScopeIndex::new(0),
 									local_index: e_temp,
 								},
 								ty: idx_ty,
@@ -2919,10 +2886,7 @@ impl<'tir> Builder<'tir> {
 						kind: ExprKind::Sub {
 							left: Box::new(end_val),
 							right: Box::new(Expression {
-								kind: ExprKind::LocalGet {
-									scope_index: ScopeIndex::new(0),
-									local_index: li,
-								},
+								kind: ExprKind::LocalGet { local_index: li },
 								ty: idx_ty,
 							}),
 						},

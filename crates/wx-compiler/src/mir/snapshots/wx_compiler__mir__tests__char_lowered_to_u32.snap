@@ -7,11 +7,10 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: U32
-            mutability: Immutable
         result: U32
+    locals:
+      - ty: U32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -19,7 +18,6 @@ functions:
           expressions:
             - kind:
                 LocalGet:
-                  scope_index: 0
                   local_index: 0
               ty: U32
       ty: U32

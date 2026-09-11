@@ -7,11 +7,10 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: I32
-            mutability: Immutable
         result: I32
+    locals:
+      - ty: I32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -29,7 +28,6 @@ functions:
                   arguments:
                     - kind:
                         LocalGet:
-                          scope_index: 0
                           local_index: 0
                       ty: I32
               ty: I32
@@ -39,17 +37,14 @@ functions:
     signature_index: 0
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: I32
-            mutability: Immutable
-          - ty: I32
-            mutability: Immutable
         result: I32
       - kind: Block
-        parent: 0
-        locals: []
         result: I32
+    locals:
+      - ty: I32
+        mutability: Immutable
+      - ty: I32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -61,12 +56,10 @@ functions:
                   expressions:
                     - kind:
                         LocalSet:
-                          scope_index: 0
                           local_index: 1
                           value:
                             kind:
                               LocalGet:
-                                scope_index: 0
                                 local_index: 0
                             ty: I32
                       ty: Unit
@@ -79,7 +72,6 @@ functions:
                                   value:
                                     kind:
                                       LocalGet:
-                                        scope_index: 0
                                         local_index: 1
                                     ty: I32
                               ty: I32

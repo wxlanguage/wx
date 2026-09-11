@@ -10948,7 +10948,10 @@ fn test_enum_ordering_requires_explicit_partial_ord_impl() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::BinaryOperatorCannotBeApplied),
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
 		"expected E1008 for `Dir < Dir` with no `PartialOrd` impl, got: {:?}",
 		case.tir
 			.diagnostics
@@ -12932,6 +12935,32 @@ fn test_break_outside_of_loop_reports_diagnostic() {
 fn test_continue_outside_of_loop_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
         pub fn f() { continue; }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::ContinueOutsideOfLoop),
+		"expected E1054 (ContinueOutsideOfLoop), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_continue_targeting_a_labeled_block_reports_diagnostic() {
+	// `resolve_label` resolves any labeled construct (blocks and if/else
+	// included, not just loops) with no restriction on its own — unlike
+	// `break`, which can legitimately exit a plain labeled block, a
+	// `continue` has no sound meaning against one (there is no "next
+	// iteration" to continue into). Regression test: this used to be
+	// silently accepted by TIR and panic downstream in opt instead.
+	let case = TestCase::new(indoc! {"
+        pub fn f() {
+            outer: {
+                continue :outer;
+            }
+        }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::ContinueOutsideOfLoop),
@@ -16514,7 +16543,10 @@ fn test_struct_without_partial_ord_impl_reports_diagnostic() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::BinaryOperatorCannotBeApplied),
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
 		"expected E1008 for `Meters < Meters` with no `PartialOrd` impl, \
 		 got: {:?}",
 		case.tir
@@ -16546,7 +16578,11 @@ fn test_primitive_ordering_operator_records_access_for_hover() {
 	// go-to-definition on `<` works.
 	let src = "fn f(a: u32, b: u32) -> bool { a < b } export { f }";
 	let case = TestCase::new(src);
-	assert!(case.tir.diagnostics.is_empty(), "{:?}", case.tir.diagnostics);
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"{:?}",
+		case.tir.diagnostics
+	);
 	let op_start = src.find('<').unwrap() as u32;
 	let lt = case.graph.interner.get("lt").unwrap();
 	assert!(

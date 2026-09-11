@@ -448,49 +448,127 @@ impl<'f> Scheduler<'f> {
 				self.body.push(Instruction::End); // Block
 			}
 
-			ControlNode::Break {
-				target,
-				value,
-				loop_param_updates,
+			ControlNode::BlockJoin {
+				body,
+				outputs,
+				fallthrough_updates,
+				fallthrough_value,
+				result: _,
 			} => {
-				if let StackResult::Value(v) = value {
-					// Store break value into phi locals; LocalSet in reverse
-					// because emit_value pushes fields lowest-first.
-					let n_phis =
-						self.func.loop_data(*target).break_result_outputs.len();
-					if n_phis > 0 {
+				// Every genuinely divergent binding always goes through a
+				// pre-allocated local — same convention IfElse/Switch/Loop
+				// already follow when they have phi outputs, applied
+				// unconditionally here (an arbitrary, not statically
+				// enumerable, number of exits can reach this join, exactly
+				// like Loop's break-exits). Unlike Loop's own outputs,
+				// JoinParam has no `before` value to initialize with — it's
+				// only ever a write target, never read during construction
+				// (see `DataNodeKind::JoinParam`'s doc comment) — so a plain
+				// `pre_alloc_phi_outputs` (no init store) is exactly right.
+				self.pre_alloc_phi_outputs(outputs);
+
+				// Also pre-allocate locals for the block's own *value* phis
+				// (break_result_outputs — the merged result of every
+				// `break <value>` plus the fallthrough's own tail value),
+				// mirroring Loop's identical separate pre-allocation step
+				// above. Cloned out first to avoid borrowing `self.func`
+				// and `self` mutably at once.
+				let break_result_outputs: Vec<DataNodeIndex> = self
+					.func
+					.block_join_data(*body)
+					.break_result_outputs
+					.clone();
+				self.pre_alloc_phi_outputs(&break_result_outputs);
+
+				self.body.push(Instruction::Block {
+					ty: BlockType::Empty,
+				});
+				self.emit_block(*body);
+
+				// The fallthrough's own contribution to the block's *value*
+				// phis — mirrors exactly what `Break`'s handler does with its
+				// own `value` field, just at the tail of the body instead of
+				// before a `br` (falling off the end has no `ControlNode` of
+				// its own to carry this, hence `fallthrough_value` living on
+				// `BlockJoin` itself).
+				if let StackResult::Value(v) = fallthrough_value {
+					if !break_result_outputs.is_empty() {
 						self.emit_value(*v);
-						for phi in self
-							.func
-							.loop_data(*target)
-							.break_result_outputs
-							.iter()
-							.copied()
-							.rev()
-						{
+						for phi in break_result_outputs.iter().copied().rev() {
 							let phi_local =
 								*self.node_to_local.get(&phi).expect(
-									"break result phi local must be pre-allocated by Loop handler",
+									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
 								);
 							self.body.push(Instruction::LocalSet(phi_local));
 						}
 					}
 				}
-				// This break's own current values for the target loop's
-				// carried bindings — committed here because the loop's normal
-				// "commit, then branch back" tail code only runs on ordinary
-				// fallthrough, which this `br` bypasses entirely. See
-				// `Builder::loop_param_updates`.
-				self.emit_loop_param_updates(loop_param_updates);
+
+				// The fallthrough path's own commit — same role as a
+				// break/continue's carried_binding_updates, but unconditional
+				// at the tail of the body (falling off the end has no
+				// ControlNode of its own to attach this to).
+				self.emit_carried_binding_updates(fallthrough_updates);
+				self.body.push(Instruction::End);
+			}
+
+			ControlNode::Break {
+				target,
+				value,
+				carried_binding_updates,
+			} => {
+				let is_loop = self.func.blocks[*target as usize]
+					.as_ref()
+					.unwrap()
+					.is_loop();
+				if let StackResult::Value(v) = value {
+					// Store break value into phi locals; LocalSet in reverse
+					// because emit_value pushes fields lowest-first.
+					let n_phis = if is_loop {
+						self.func.loop_data(*target).break_result_outputs.len()
+					} else {
+						self.func
+							.block_join_data(*target)
+							.break_result_outputs
+							.len()
+					};
+					if n_phis > 0 {
+						self.emit_value(*v);
+						let phis: Vec<DataNodeIndex> = if is_loop {
+							self.func
+								.loop_data(*target)
+								.break_result_outputs
+								.clone()
+						} else {
+							self.func
+								.block_join_data(*target)
+								.break_result_outputs
+								.clone()
+						};
+						for phi in phis.into_iter().rev() {
+							let phi_local =
+								*self.node_to_local.get(&phi).expect(
+									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
+								);
+							self.body.push(Instruction::LocalSet(phi_local));
+						}
+					}
+				}
+				// This break's own current values for the target's carried
+				// bindings — committed here because the target's normal
+				// "commit, then branch back/fall through" tail code only
+				// runs on the ordinary path, which this `br` bypasses
+				// entirely. See `Builder::carried_binding_updates`.
+				self.emit_carried_binding_updates(carried_binding_updates);
 				let depth = self.break_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
 
 			ControlNode::Continue {
 				target,
-				loop_param_updates,
+				carried_binding_updates,
 			} => {
-				self.emit_loop_param_updates(loop_param_updates);
+				self.emit_carried_binding_updates(carried_binding_updates);
 				let depth = self.continue_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
@@ -1066,9 +1144,39 @@ impl<'f> Scheduler<'f> {
 						);
 					}
 				}
+				ControlNode::BlockJoin {
+					body,
+					outputs,
+					fallthrough_updates,
+					..
+				} => {
+					// JoinParam nodes themselves are impure (excluded from
+					// placement entirely); nothing pure to record for
+					// `outputs` here — mirrors Loop, above.
+					for &o in outputs.iter() {
+						record_read(
+							&mut consuming_blocks[o as usize],
+							block_idx,
+							i,
+						);
+					}
+					// fallthrough_updates is computed at the join block's
+					// own tail, not at the statement holding this
+					// ControlNode — mirrors how IfElse's phi sources
+					// (above) are recorded against then_block/else_block's
+					// own tail, not the parent's position.
+					let body_tail = self.block_tail(*body);
+					for &(_, current) in fallthrough_updates.iter() {
+						record_read(
+							&mut consuming_blocks[current as usize],
+							*body,
+							body_tail,
+						);
+					}
+				}
 				ControlNode::Break {
 					value,
-					loop_param_updates,
+					carried_binding_updates,
 					..
 				} => {
 					if let StackResult::Value(n) = value {
@@ -1078,7 +1186,7 @@ impl<'f> Scheduler<'f> {
 							i,
 						);
 					}
-					for &(_, current) in loop_param_updates.iter() {
+					for &(_, current) in carried_binding_updates.iter() {
 						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
@@ -1087,9 +1195,10 @@ impl<'f> Scheduler<'f> {
 					}
 				}
 				ControlNode::Continue {
-					loop_param_updates, ..
+					carried_binding_updates,
+					..
 				} => {
-					for &(_, current) in loop_param_updates.iter() {
+					for &(_, current) in carried_binding_updates.iter() {
 						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
@@ -1257,7 +1366,8 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::MemoryIndex { .. }
 			| DataNodeKind::MemorySizeResult { .. }
 			| DataNodeKind::AggregateCallResult { .. }
-			| DataNodeKind::LoopParam { .. } => {}
+			| DataNodeKind::LoopParam { .. }
+			| DataNodeKind::JoinParam { .. } => {}
 		}
 	}
 
@@ -1880,6 +1990,21 @@ impl<'f> Scheduler<'f> {
 				self.emit_value(before);
 			}
 
+			DataNodeKind::JoinParam { .. } => {
+				// Unlike LoopParam, a JoinParam has no "before" value to fall
+				// back to — it's never read during construction (see its own
+				// doc comment), only ever committed to by an exit. By
+				// construction, `should_spill` (above) is exact for this
+				// kind: a JoinParam only ever reaches `emit_value` when it's
+				// genuinely divergent, and a genuinely divergent one always
+				// has a pre-allocated local, so `should_spill` returns true
+				// and this arm is never actually reached — if it ever is,
+				// that's a real bug upstream, not something to paper over.
+				unreachable!(
+					"JoinParam reached emit_value_inline: should_spill should always be true for a JoinParam actually referenced"
+				)
+			}
+
 			DataNodeKind::CallResult { .. }
 			| DataNodeKind::MemoryGrowResult { .. }
 			| DataNodeKind::PointerLoadResult { .. } => {
@@ -1924,6 +2049,18 @@ impl<'f> Scheduler<'f> {
 			// `LoopData::divergent_params`), which `outputs`/pre-allocation
 			// already correctly account for.
 			DataNodeKind::LoopParam { .. } => {
+				self.node_to_local.contains_key(&idx)
+			}
+
+			// A join param needs a local exactly when it was found genuinely
+			// divergent and pushed into `ControlNode::BlockJoin::outputs` —
+			// same reasoning as `LoopParam`, above. Deliberately *not* left
+			// to the `uses.len() > 1` catch-all below: `register_uses` never
+			// populates a `JoinParam`'s `.uses` at all (it has no operand
+			// fields — see `Function::register_uses`), so the catch-all
+			// would always read `uses.len() == 0` and wrongly return `false`
+			// even for a genuinely divergent, pre-allocated one.
+			DataNodeKind::JoinParam { .. } => {
 				self.node_to_local.contains_key(&idx)
 			}
 
@@ -2070,12 +2207,13 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Commits a `break`/`continue` site's own current values for its target
-	/// loop's carried bindings, immediately before the `br` that leaves the
-	/// current block. See `Builder::loop_param_updates` for why every such
-	/// site must do this independently rather than relying on the loop's own
-	/// (fallthrough-only) tail code.
-	fn emit_loop_param_updates(
+	/// Commits a `break`/`continue` site's own current values for its
+	/// target's carried bindings, immediately before the `br` that leaves
+	/// the current block — or, for a block-join's fallthrough, immediately
+	/// before falling off the end. See `Builder::carried_binding_updates`
+	/// for why every such site must do this independently rather than
+	/// relying on the target's own (ordinary-path-only) tail code.
+	fn emit_carried_binding_updates(
 		&mut self,
 		updates: &[(DataNodeIndex, DataNodeIndex)],
 	) {
@@ -2091,7 +2229,7 @@ impl<'f> Scheduler<'f> {
 		}
 		for &(param, _) in updates.iter().rev() {
 			let local = *self.node_to_local.get(&param).expect(
-				"loop param local must be pre-allocated by the Loop handler",
+				"carried binding local must be pre-allocated by the Loop/BlockJoin handler",
 			);
 			self.body.push(Instruction::LocalSet(local));
 		}

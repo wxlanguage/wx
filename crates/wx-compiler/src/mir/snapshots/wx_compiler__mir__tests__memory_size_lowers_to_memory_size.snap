@@ -7,15 +7,12 @@ functions:
     signature_index: 1
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty: Unit
-            mutability: Immutable
         result: U32
       - kind: Block
-        parent: 0
-        locals: []
         result: U32
+    locals:
+      - ty: Unit
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -27,7 +24,6 @@ functions:
                   expressions:
                     - kind:
                         LocalSet:
-                          scope_index: 0
                           local_index: 0
                           value:
                             kind: Noop

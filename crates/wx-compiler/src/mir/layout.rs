@@ -116,22 +116,22 @@ impl AggregateInterner {
 
 	pub(super) fn type_layout(&self, ty: ValueType) -> Layout {
 		match ty {
-			ValueType::I32 | ValueType::U32 | ValueType::F32 => {
-				Layout { size: 4, align: 4 }
-			}
-			ValueType::I64 | ValueType::U64 | ValueType::F64 => {
-				Layout { size: 8, align: 8 }
-			}
+			ValueType::Unit | ValueType::Never => Layout { size: 0, align: 1 },
 			ValueType::U8 | ValueType::I8 | ValueType::Bool => {
 				Layout { size: 1, align: 1 }
 			}
 			ValueType::U16 | ValueType::I16 => Layout { size: 2, align: 2 },
-			ValueType::Unit | ValueType::Never => Layout { size: 0, align: 1 },
+			ValueType::I32
+			| ValueType::U32
+			| ValueType::F32
+			| ValueType::Function { .. } => Layout { size: 4, align: 4 },
+			ValueType::I64 | ValueType::U64 | ValueType::F64 => {
+				Layout { size: 8, align: 8 }
+			}
 			ValueType::Pointer { kind, .. } => {
 				let size = kind.pointer_size();
 				Layout { size, align: size }
 			}
-			ValueType::Function { .. } => Layout { size: 4, align: 4 },
 			ValueType::Aggregate { aggregate_index } => {
 				self.get(aggregate_index).layout
 			}

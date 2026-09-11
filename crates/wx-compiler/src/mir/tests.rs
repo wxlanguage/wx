@@ -279,6 +279,64 @@ fn test_inline_method_is_substituted() {
 	assert_eq!(case.mir.functions.len(), 1, "only `to_upper` should remain");
 }
 
+#[test]
+fn test_inline_function_with_early_return_produces_break_into_block() {
+	// `mir::inlining::inline_call` always wraps an inlined callee's body in
+	// a `BlockKind::Block` scope and rewrites every `Return` inside it to a
+	// `Break` targeting that wrapper — this is what used to crash `opt`
+	// (a plain block had no representation there at all). This test only
+	// confirms MIR itself produces that shape correctly for a callee whose
+	// `return` is inside an `if` (not just the callee's own tail position);
+	// the end-to-end execution confirmation lives in
+	// `codegen::tests::test_inline_function_with_early_return_executes_correctly`.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        fn classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub fn main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "only `main` should remain");
+
+	let main = &case.mir.functions[0];
+	fn contains_break(expr: &crate::mir::Expression) -> bool {
+		use crate::mir::ExprKind;
+		match &expr.kind {
+			ExprKind::Break { .. } => true,
+			ExprKind::Return { .. } => {
+				panic!("a Return should never survive inlining unrewritten")
+			}
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_break)
+			}
+			ExprKind::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => {
+				contains_break(condition)
+					|| contains_break(then_block)
+					|| else_block.as_deref().is_some_and(contains_break)
+			}
+			ExprKind::LocalSet { value, .. } => contains_break(value),
+			_ => false,
+		}
+	}
+	assert!(
+		contains_break(&main.block),
+		"classify's early `return` must have been rewritten to a `Break` \
+		 targeting the inliner's wrapper block"
+	);
+}
+
 // ── memory instructions
 // ───────────────────────────────────────────────────────
 
@@ -1934,10 +1992,8 @@ fn function_body_statements<'a>(
 	}
 }
 
-/// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
-fn destructured_store(
-	expr: &Expression,
-) -> (ScopeIndex, LocalIndex, PhysIndex) {
+/// `(local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
+fn destructured_store(expr: &Expression) -> (LocalIndex, PhysIndex) {
 	let ExprKind::LocalSet {
 		local_index, value, ..
 	} = &expr.kind
@@ -1945,7 +2001,6 @@ fn destructured_store(
 		panic!("expected a `LocalSet`")
 	};
 	let ExprKind::AggregateGet {
-		scope_index: from_scope,
 		local_index: from_local,
 		value_index,
 	} = &value.kind
@@ -1953,7 +2008,7 @@ fn destructured_store(
 		panic!("a destructured binding reads its value with `AggregateGet`")
 	};
 	let _ = local_index;
-	(*from_scope, *from_local, *value_index)
+	(*from_local, *value_index)
 }
 
 /// The whole point of `DestructureDeclaration`: the initializer runs once,
@@ -1973,27 +2028,21 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 
 	// [0] spills `make()` into a temp; [1] and [2] read fields out of it.
 	let ExprKind::LocalSet {
-		scope_index: temp_scope,
 		local_index: temp_local,
 		value,
 	} = &statements[0].kind
 	else {
 		panic!("the initializer is spilled into a local first")
 	};
-	assert_eq!(
-		*temp_scope,
-		ScopeIndex::new(0),
-		"temps live in the function root scope"
-	);
 	assert!(
 		matches!(value.kind, ExprKind::Call { .. }),
 		"the spilled value is the call itself, evaluated exactly once"
 	);
 
-	let (a_scope, a_local, _) = destructured_store(&statements[1]);
-	let (b_scope, b_local, _) = destructured_store(&statements[2]);
-	assert_eq!((a_scope, a_local), (ScopeIndex::new(0), *temp_local));
-	assert_eq!((b_scope, b_local), (ScopeIndex::new(0), *temp_local));
+	let (a_local, _) = destructured_store(&statements[1]);
+	let (b_local, _) = destructured_store(&statements[2]);
+	assert_eq!(a_local, *temp_local);
+	assert_eq!(b_local, *temp_local);
 
 	// And the call appears exactly once in the whole body.
 	let calls = statements
@@ -2016,12 +2065,12 @@ fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 	assert!(case.tir.diagnostics.is_empty());
 	let statements = function_body_statements(&case, "f");
 
-	// `pair` is parameter 0 of scope 0, so both bindings read straight from
-	// it and there is no spilling `LocalSet` ahead of them.
-	let (a_scope, a_local, _) = destructured_store(&statements[0]);
-	let (b_scope, b_local, _) = destructured_store(&statements[1]);
-	assert_eq!((a_scope, a_local), (ScopeIndex::new(0), LocalIndex::new(0)));
-	assert_eq!((b_scope, b_local), (ScopeIndex::new(0), LocalIndex::new(0)));
+	// `pair` is flat local 0, so both bindings read straight from it and
+	// there is no spilling `LocalSet` ahead of them.
+	let (a_local, _) = destructured_store(&statements[0]);
+	let (b_local, _) = destructured_store(&statements[1]);
+	assert_eq!(a_local, LocalIndex::new(0));
+	assert_eq!(b_local, LocalIndex::new(0));
 }
 
 /// Tuple elements are alignment-sorted exactly like struct fields, so a
@@ -2054,7 +2103,7 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
 	let statements = function_body_statements(&case, "f");
 	let slots: Vec<usize> = statements[..3]
 		.iter()
-		.map(|e| usize::from(destructured_store(e).2))
+		.map(|e| usize::from(destructured_store(e).1))
 		.collect();
 	assert_eq!(
 		slots,
@@ -2076,8 +2125,8 @@ fn test_struct_destructuring_reads_declared_fields() {
 	assert_no_errors(&case);
 	let statements = function_body_statements(&case, "f");
 	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
-	assert_eq!(usize::from(destructured_store(&statements[0]).2), 1);
-	assert_eq!(usize::from(destructured_store(&statements[1]).2), 0);
+	assert_eq!(usize::from(destructured_store(&statements[0]).1), 1);
+	assert_eq!(usize::from(destructured_store(&statements[1]).1), 0);
 }
 
 /// Nested patterns are flattened into projection paths, so an inner binding
@@ -2097,15 +2146,11 @@ fn test_nested_tuple_destructuring_projects_through_a_temp() {
 	// `t` is already a local, so nothing spills for `x`. Each deeper binding
 	// spills the intermediate `t.1` just before its own store, giving
 	// [x, spill, y, spill, z].
-	let (x_scope, x_local, _) = destructured_store(&statements[0]);
-	assert_eq!(
-		(x_scope, x_local),
-		(ScopeIndex::new(0), LocalIndex::new(0)),
-		"`x` reads `t` directly"
-	);
+	let (x_local, _) = destructured_store(&statements[0]);
+	assert_eq!(x_local, LocalIndex::new(0), "`x` reads `t` directly");
 
-	let (_, y_from, _) = destructured_store(&statements[2]);
-	let (_, z_from, _) = destructured_store(&statements[4]);
+	let (y_from, _) = destructured_store(&statements[2]);
+	let (z_from, _) = destructured_store(&statements[4]);
 	assert_ne!(
 		y_from,
 		LocalIndex::new(0),
