@@ -200,16 +200,19 @@ enum Node {
 		start: u32,
 		len: u32,
 	},
-	/// All lines under this node must either break or not break together
+	/// Owns the mode of its contents. Nested groups may independently
+	/// become flat inside a broken parent.
 	Group(NodeId),
 	/// Increases the indentation level for all lines within this node
 	Indent(NodeId),
-	/// A trailing comma emitted only in Break mode
-	IfBreakComma,
+	/// A fragment emitted only when the owning group is flat.
+	IfFlat(NodeId),
+	/// A fragment emitted only when the owning group is broken.
+	IfBroken(NodeId),
 }
 
 /// TODO: about half of what this holds is duplicates. `Node::HardLine`,
-/// `SoftLine`, `Line`, `BlankLine`, `IfBreakComma` and `Node::Text(_)` carry
+/// `SoftLine`, `Line`, `BlankLine` and `Node::Text(_)` carry
 /// nothing to tell two of them apart, yet every `hard_line()`/`text()` call
 /// allocates a fresh one — measured over `std/main.wx`, 19% of nodes are line
 /// breaks and 32% are fixed tokens, drawn from ~95 distinct values in total.
@@ -397,7 +400,8 @@ impl<'a> Builder<'a> {
 
 	#[inline]
 	fn if_break_comma(&mut self) -> NodeId {
-		self.arena.alloc(Node::IfBreakComma)
+		let comma = self.text(Text::Comma);
+		self.arena.alloc(Node::IfBroken(comma))
 	}
 
 	#[inline]
@@ -665,6 +669,7 @@ impl<'a> Builder<'a> {
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
 				self.build_attributes(&mut items, attributes);
+				let attribute_count = items.len();
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
@@ -672,8 +677,11 @@ impl<'a> Builder<'a> {
 				items.push(self.text(Text::Space));
 				let body = self.build_fn_body(block);
 				items.push(body);
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
+				let declaration = items.split_off(attribute_count);
+				let concat = self.arena.concat(declaration);
+				let declaration = self.arena.group(concat);
+				items.push(declaration);
+				self.arena.concat(items)
 			}
 			ast::Item::FunctionDeclaration {
 				pub_span,
@@ -1155,14 +1163,18 @@ impl<'a> Builder<'a> {
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
 				self.build_attributes(&mut nodes, attributes);
+				let attribute_count = nodes.len();
 				if pub_span.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				self.build_function_signature(&mut nodes, signature);
 				nodes.push(self.text(Text::Space));
 				nodes.push(self.build_fn_body(block));
-				let concat = self.arena.concat(nodes);
-				self.arena.group(concat)
+				let declaration = nodes.split_off(attribute_count);
+				let concat = self.arena.concat(declaration);
+				let declaration = self.arena.group(concat);
+				nodes.push(declaration);
+				self.arena.concat(nodes)
 			}
 			ast::ImplItem::Constant {
 				pub_span,
@@ -1297,13 +1309,17 @@ impl<'a> Builder<'a> {
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
 				self.build_attributes(&mut nodes, attributes);
+				let attribute_count = nodes.len();
 				self.build_function_signature(&mut nodes, signature);
 				match body {
 					Some(body) => {
 						nodes.push(self.text(Text::Space));
 						nodes.push(self.build_fn_body(body));
-						let concat = self.arena.concat(nodes);
-						self.arena.group(concat)
+						let declaration = nodes.split_off(attribute_count);
+						let concat = self.arena.concat(declaration);
+						let declaration = self.arena.group(concat);
+						nodes.push(declaration);
+						self.arena.concat(nodes)
 					}
 					None => {
 						nodes.push(self.text(Text::Semi));
@@ -1535,6 +1551,7 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
+		let attribute_count = items.len();
 		if pub_span.is_some() {
 			items.push(self.text(Text::Pub));
 		}
@@ -1610,8 +1627,11 @@ impl<'a> Builder<'a> {
 		items.push(self.soft_line());
 		items.push(self.text(Text::RBrace));
 
-		let concat = self.arena.concat(items);
-		self.arena.group(concat)
+		let declaration = items.split_off(attribute_count);
+		let concat = self.arena.concat(declaration);
+		let declaration = self.arena.group(concat);
+		items.push(declaration);
+		self.arena.concat(items)
 	}
 
 	fn build_struct_declaration(
@@ -1910,23 +1930,32 @@ impl<'a> Builder<'a> {
 		block: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
 		let statements = block.inner.as_block_statements();
-		self.build_block(block.span, statements, true)
+		if statements.is_empty() {
+			return self.build_block_content(statements, block.span);
+		}
+
+		// Function bodies always put their contents between hard brace lines.
+		// Nested expressions retain their own independent layout groups.
+		let mut inner = Vec::new();
+		self.push_between(
+			&mut inner,
+			Before::Opener {
+				from: block.span.start,
+			},
+			After::Entry {
+				start: statements[0].inner.span.start,
+			},
+		);
+		inner.push(self.build_block_statements(statements, block.span));
+		let inner = self.arena.concat(inner);
+		let open = self.text(Text::LBrace);
+		let inner = self.arena.indent(inner);
+		let line = self.hard_line();
+		let close = self.text(Text::RBrace);
+		self.arena.concat4(open, inner, line, close)
 	}
 
-	fn build_block(
-		&mut self,
-		block_span: ast::TextSpan,
-		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
-		force_break: bool,
-	) -> NodeId {
-		let concat =
-			self.build_block_content(statements, block_span, force_break);
-		self.arena.group(concat)
-	}
-
-	/// Whether a block holds any comment at all — the test `if`/`else` uses to
-	/// force both its branches to break together, since a `//` comment can
-	/// never share a line with the code after it.
+	/// Comments anywhere within a block prevent compact layout.
 	fn block_has_comments(&self, block_span: ast::TextSpan) -> bool {
 		!self
 			.comments
@@ -1934,23 +1963,25 @@ impl<'a> Builder<'a> {
 			.is_empty()
 	}
 
-	/// Same as `build_block`, but leaves the result ungrouped so a caller can
-	/// fold it into a larger group — used by `if`/`else` so the two branches
-	/// share one break decision instead of each block deciding on its own.
+	/// Leaves brace lines ungrouped so paired `if` branches or a block-like
+	/// expression can own the layout decision.
 	fn build_block_content(
 		&mut self,
 		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
 		block_span: ast::TextSpan,
-		force_break: bool,
 	) -> NodeId {
 		let mut items: Vec<NodeId> = vec![self.text(Text::LBrace)];
 
 		if statements.is_empty() {
 			self.build_empty_braced_comments(&mut items, block_span);
 		} else {
-			let single = !force_break
-				&& !self.block_has_comments(block_span)
-				&& statements.len() == 1;
+			let single = statements.len() == 1
+				&& statements[0].separator.is_none()
+				&& matches!(
+					&statements[0].inner.inner,
+					ast::Statement::Expression(expression)
+						if !expression.inner.is_block_like()
+				) && !self.block_has_comments(block_span);
 			let mut inner: Vec<NodeId> = Vec::new();
 			if single {
 				// No comments anywhere in here, so there is no gap to place —
@@ -1969,44 +2000,7 @@ impl<'a> Builder<'a> {
 				);
 			}
 
-			for (index, statement) in statements.iter().enumerate() {
-				// The break between two statements is emitted here rather
-				// than at the end of the previous turn, so that turn can
-				// close its line with `;` and let the gap append whatever
-				// comment trails it.
-				if index > 0 {
-					self.push_between(
-						&mut inner,
-						Before::Entry {
-							end: statements[index - 1].inner.span.end,
-						},
-						After::Entry {
-							start: statement.inner.span.start,
-						},
-					);
-				}
-				inner.push(self.build_statement(&statement.inner.inner));
-				let needs_semi = if index + 1 == statements.len()
-					|| statement.inner.inner.is_block_like()
-				{
-					statement.separator.is_some()
-				} else {
-					true
-				};
-				if needs_semi {
-					inner.push(self.text(Text::Semi));
-				}
-			}
-
-			// Comments after the last statement. The first may still trail
-			// its line; the rest stand on their own above the closing brace.
-			self.push_between(
-				&mut inner,
-				Before::Entry {
-					end: statements.last().unwrap().inner.span.end,
-				},
-				After::End { at: block_span.end },
-			);
+			inner.push(self.build_block_statements(statements, block_span));
 
 			let inner_concat = self.arena.concat(inner);
 			items.push(self.arena.indent(inner_concat));
@@ -2021,20 +2015,73 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
-	/// An expression that already introduces its own hard-broken multi-line
-	/// layout (a struct literal, or a single-argument call hugging one) —
-	/// safe to print attached to whatever precedes it (`(`, `=`, ...)
-	/// without wrapping it in an extra `line()`/`indent()` pair.
-	///
-	/// This matters because `Renderer::measure_flat` stops measuring at the
-	/// first hard line it finds and returns the (short) width accumulated so
-	/// far, so a `Group` containing a struct literal several calls deep is
-	/// always measured as "fits" and rendered `Flat`. `Indent` nodes bump
-	/// `self.indent` unconditionally, even in `Flat` mode where their own
-	/// `line()`/`soft_line()` renders as nothing — so every such wrapper
-	/// still stacks an extra, visually pointless indent level onto the
-	/// struct literal's own fields. Skipping the wrapper for huggable values
-	/// keeps only the indent the literal adds for itself.
+	/// Statement separators and inter-entry comments are shared by function
+	/// bodies and expression blocks; brace layout belongs to their callers.
+	fn build_block_statements(
+		&mut self,
+		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
+		block_span: ast::TextSpan,
+	) -> NodeId {
+		let mut inner = Vec::new();
+
+		for (index, statement) in statements.iter().enumerate() {
+			// The break between two statements is emitted here rather
+			// than at the end of the previous turn, so that turn can
+			// close its line with `;` and let the gap append whatever
+			// comment trails it.
+			if index > 0 {
+				self.push_between(
+					&mut inner,
+					Before::Entry {
+						end: statements[index - 1].inner.span.end,
+					},
+					After::Entry {
+						start: statement.inner.span.start,
+					},
+				);
+			}
+			let last = index + 1 == statements.len();
+			if let ast::Statement::Expression(expression) =
+				&statement.inner.inner
+				&& expression.inner.is_block_like()
+				&& !last
+			{
+				let semi = self.text(Text::Semi);
+				let suffix = self.arena.alloc(Node::IfFlat(semi));
+				// The suffix shares the expression's group so its width and
+				// presence participate in the same layout decision.
+				let contents = self.build_expression_contents(expression);
+				let contents = self.arena.concat2(contents, suffix);
+				inner.push(self.arena.group(contents));
+			} else {
+				inner.push(self.build_statement(&statement.inner.inner));
+				let needs_semi = !last
+					|| statement.separator.is_some()
+					|| matches!(
+						statement.inner.inner,
+						ast::Statement::LocalDefinition { .. }
+					);
+				if needs_semi {
+					inner.push(self.text(Text::Semi));
+				}
+			}
+		}
+
+		// Comments after the last statement. The first may still trail
+		// its line; the rest stand on their own above the closing brace.
+		self.push_between(
+			&mut inner,
+			Before::Entry {
+				end: statements.last().unwrap().inner.span.end,
+			},
+			After::End { at: block_span.end },
+		);
+
+		self.arena.concat(inner)
+	}
+
+	/// Keep a block-like value attached to its call or assignment opener,
+	/// letting its own braces supply indentation rather than adding wrappers.
 	fn is_huggable(expr: &ast::Expression) -> bool {
 		if expr.is_block_like() {
 			return true;
@@ -2080,6 +2127,18 @@ impl<'a> Builder<'a> {
 	}
 
 	fn build_expression(
+		&mut self,
+		expression: &ast::Spanned<ast::Expression>,
+	) -> NodeId {
+		let contents = self.build_expression_contents(expression);
+		if expression.inner.is_block_like() {
+			self.arena.group(contents)
+		} else {
+			contents
+		}
+	}
+
+	fn build_expression_contents(
 		&mut self,
 		expression: &ast::Spanned<ast::Expression>,
 	) -> NodeId {
@@ -2137,7 +2196,7 @@ impl<'a> Builder<'a> {
 				self.arena.group(concat)
 			}
 			ast::Expression::Block { statements } => {
-				self.build_block(expression.span, statements, false)
+				self.build_block_content(statements, expression.span)
 			}
 			ast::Expression::Unreachable => self.text(Text::Unreachable),
 			ast::Expression::True => self.text(Text::True),
@@ -2157,34 +2216,19 @@ impl<'a> Builder<'a> {
 					.as_deref()
 					.map(|b| (b.inner.as_block_statements(), b.span));
 
-				let force_break = then_statements.len() > 1
-					|| self.block_has_comments(then_block.span)
-					|| else_data.is_some_and(|(statements, span)| {
-						statements.len() > 1 || self.block_has_comments(span)
-					});
-
-				let then_id = self.build_block_content(
-					then_statements,
-					then_block.span,
-					force_break,
-				);
+				let then_id =
+					self.build_block_content(then_statements, then_block.span);
 				let mut items: Vec<NodeId> = vec![if_kw, cond, sp, then_id];
 				if let Some((statements, span)) = else_data {
 					items.push(self.text(Text::Else));
-					items.push(self.build_block_content(
-						statements,
-						span,
-						force_break,
-					));
+					items.push(self.build_block_content(statements, span));
 				}
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
+				self.arena.concat(items)
 			}
 			ast::Expression::Loop { block } => {
 				let loop_kw = self.text(Text::Loop);
-				let block_id = self.build_expression(block);
-				let concat = self.arena.concat2(loop_kw, block_id);
-				self.arena.group(concat)
+				let block_id = self.build_expression_contents(block);
+				self.arena.concat2(loop_kw, block_id)
 			}
 			ast::Expression::Match { scrutinee, arms } => {
 				self.build_match_expression(expression.span, scrutinee, arms)
@@ -2261,7 +2305,7 @@ impl<'a> Builder<'a> {
 			ast::Expression::Label { label, block } => {
 				let sym = self.symbol(label.inner);
 				let colon_sp = self.text(Text::ColonSp);
-				let block_id = self.build_expression(block);
+				let block_id = self.build_expression_contents(block);
 				self.arena.concat3(sym, colon_sp, block_id)
 			}
 			ast::Expression::Error => unreachable!(),
@@ -2341,12 +2385,7 @@ impl<'a> Builder<'a> {
 				}
 
 				items.push(self.text(Text::RBrace));
-				if has_block_value {
-					self.arena.concat(items)
-				} else {
-					let concat = self.arena.concat(items);
-					self.arena.group(concat)
-				}
+				self.arena.concat(items)
 			}
 			ast::Expression::TypeApplication { callee, args } => {
 				let callee_id = self.build_expression(callee);
@@ -2874,7 +2913,9 @@ impl<'a> Renderer<'a> {
 			Node::SourceText(span) => {
 				let text = span.extract_str(self.source);
 				self.buffer.push_str(text);
-				self.position += text.len();
+				self.position = text
+					.rsplit_once('\n')
+					.map_or(self.position + text.len(), |(_, last)| last.len());
 			}
 			Node::Symbol { symbol, .. } => {
 				let resolved = self.interner.resolve(symbol).unwrap();
@@ -2903,10 +2944,12 @@ impl<'a> Renderer<'a> {
 				}
 			}
 			Node::Group(inner_id) => {
-				let mode = if self.measure_flat(id)
-					<= (self.config.max_line_width as usize)
-						.saturating_sub(self.position)
-				{
+				let mode = if matches!(mode, RenderMode::Flat)
+					|| self.measure_flat(id).is_some_and(|width| {
+						width
+							<= (self.config.max_line_width as usize)
+								.saturating_sub(self.position)
+					}) {
 					RenderMode::Flat
 				} else {
 					RenderMode::Break
@@ -2918,29 +2961,35 @@ impl<'a> Renderer<'a> {
 				self.render_node(inner_id, mode);
 				self.indent -= self.config.indent_width as usize;
 			}
-			Node::IfBreakComma => match mode {
-				RenderMode::Flat => {}
-				RenderMode::Break => {
-					self.buffer.push(',');
-					self.position += 1;
-				}
-			},
+			Node::IfFlat(fragment) if matches!(mode, RenderMode::Flat) => {
+				self.render_node(fragment, mode);
+			}
+			Node::IfBroken(fragment) if matches!(mode, RenderMode::Break) => {
+				self.render_node(fragment, mode);
+			}
+			Node::IfFlat(_) | Node::IfBroken(_) => {}
 		}
 	}
 
-	fn measure_flat(&self, id: NodeId) -> usize {
+	fn measure_flat(&self, id: NodeId) -> Option<usize> {
 		let mut width = 0usize;
 		let mut stack: Vec<NodeId> = vec![id];
 		while let Some(current_id) = stack.pop() {
 			match self.arena.nodes[current_id as usize] {
 				Node::Text(t) => width += t.as_str().len(),
 				Node::SourceText(span) => {
-					width += (span.end - span.start) as usize
+					let text = span.extract_str(self.source);
+					if text.contains(['\n', '\r']) {
+						return None;
+					}
+					width += text.len()
 				}
 				Node::Symbol { len, .. } => width += len as usize,
 				Node::SoftLine => width += 1,
-				Node::Line | Node::IfBreakComma => {}
-				Node::BlankLine | Node::HardLine => return width,
+				Node::Line => {}
+				Node::IfFlat(fragment) => stack.push(fragment),
+				Node::IfBroken(_) => {}
+				Node::BlankLine | Node::HardLine => return None,
 				Node::Group(inner) | Node::Indent(inner) => stack.push(inner),
 				Node::Concat { start, len } => {
 					for i in (start as usize..(start + len) as usize).rev() {
@@ -2949,7 +2998,7 @@ impl<'a> Renderer<'a> {
 				}
 			}
 		}
-		width
+		Some(width)
 	}
 }
 
@@ -2978,3 +3027,6 @@ pub fn format(
 	let Builder { arena, .. } = builder;
 	Renderer::new(config, interner, source, &arena).render(root)
 }
+
+#[cfg(test)]
+mod block_tests;

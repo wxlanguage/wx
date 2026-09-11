@@ -171,71 +171,33 @@ If any condition fails, the block must render multiline.
 
 An empty block remains `{}` unless it contains comments.
 
-### Function signatures and bodies share the flat decision
+### Function bodies always render multiline
 
-For a function body, condition 7 applies to the complete function declaration,
-not to the body starting at the position after an already-broken signature.
-
-If any part of the function signature breaks, the body must also use multiline
-layout:
-
-```wx
-fn function_with_many_parameters(
-    first: i32,
-    second: i32,
-) -> i32 {
-    foo()
-}
-```
-
-Do not produce a broken signature followed by a newly flattened body:
-
-```wx
-fn function_with_many_parameters(
-    first: i32,
-    second: i32,
-) -> i32 { foo() }
-```
-
-The dependency is intentionally one-way:
-
-```text
-signature breaks -> body breaks
-body breaks       -> parameter list may remain compact
-```
-
-A body may be forced multiline by comments, multiple entries, a terminated
-entry, or a block-like tail even when the signature itself fits. That must not
-needlessly explode a short parameter list:
+Non-empty function bodies always render multiline, even when they contain
+one eligible tail expression and the entire declaration would fit:
 
 ```wx
 fn f(condition: bool) -> i32 {
-    if condition { foo() } else { bar() }
+    foo() + bar()
 }
 ```
 
-Requiring the reverse dependency would instead produce an undesirable form:
+This applies to free functions, implementation methods, and trait default
+methods. Truly empty bodies remain `{}`; comments still require multiline
+layout. Parameter lists retain their own fit decisions, so a short signature
+stays compact above a multiline body.
 
-```wx
-fn f(
-    condition: bool,
-) -> i32 {
-    if condition { foo() } else { bar() }
-}
-```
-
-Therefore an inline function body is allowed only when both conditions hold:
-
-1. The body is structurally eligible under Rule 2.
-2. The complete signature plus flat body fits without any signature group
-   breaking.
+This exception belongs only in the function-body builder. Ordinary expression
+blocks, including nested blocks and `if` branches within a function, retain
+Rule 2's eligibility and width rules. No general `force_break` parameter or
+renderer policy is needed.
 
 ### Consequences
 
-A simple result may be inline:
+A simple result in an ordinary expression block may be inline:
 
 ```wx
-fn f(condition: bool) -> i32 { foo() + bar() }
+{ foo() + bar() }
 ```
 
 A terminated expression records statement intent and forces a multiline block:
@@ -334,7 +296,9 @@ fn calculate(n: i32) -> i32 {
 ```
 
 ```wx
-fn explicit_drop() { _ = calculate() }
+fn explicit_drop() {
+    _ = calculate()
+}
 ```
 
 ```wx
@@ -361,8 +325,25 @@ position regardless of whether its AST separator is present. In this case the
 formatter may normalize the optional separator without changing which
 expression is the containing block's result:
 
-- If the block-like expression renders flat, emit `;`.
-- If it renders multiline, omit `;`.
+- If the governing group selects flat mode, emit `;`.
+- If the governing group selects broken mode, omit `;`.
+
+Punctuation follows the selected group mode, not a prediction of physical
+newlines. A broken group may still render on one line when its braces are
+empty and its nested groups fit independently. For example, at width 17:
+
+```wx
+fn f() {
+    if test(a) {}
+    next()
+}
+```
+
+The `if` line would need 18 columns with its semicolon, so the group selects
+broken mode and omits it. The condition still fits and `{}` stays compact.
+This is accepted; the renderer should not simulate broken rendering or force
+flat mode to preserve punctuation in this edge case. The expression remains
+non-final, so its statement role is unchanged.
 
 Flat form:
 
@@ -429,8 +410,8 @@ The function body is multiline because its only entry is terminated.
 
 | Position in parent block | Block-like layout | Output separator |
 | --- | --- | --- |
-| Non-final | Flat | Emit `;` |
-| Non-final | Multiline | Omit optional `;` |
+| Non-final | Flat group mode | Emit `;` |
+| Non-final | Broken group mode | Omit optional `;` |
 | Final, separator absent | Either | Keep absent |
 | Final, separator present | Either | Keep `;` |
 
@@ -695,51 +676,13 @@ The useful invariant is:
 > flag. A nested `Group` always means an intentionally independent opportunity
 > to become flat inside a broken parent.
 
-### Express function dependency through group ownership
+### Keep function-body wrapping in the function builder
 
-The complete function owns one outer group. The function body's brace lines
-are ungrouped contents of that function group. The parameter list retains its
-own nested group because it is allowed to make an independent decision after
-the function as a whole breaks:
-
-```text
-Function group
-├── Parameter group (nested and independent)
-└── Body contents (ungrouped; owned by Function group)
-```
-
-This yields all desired cases:
-
-- If the complete signature and body fit, the function group is flat, so the
-  body is flat.
-- If the complete function exceeds the width, the function group breaks, so
-  its ungrouped body contents break with it.
-- The nested parameter group then performs its own fit check. It expands only
-  when the signature itself needs it.
-- If the body contains structural hard lines, the function group cannot be
-  flat, while a short nested parameter group can remain compact.
-
-Thus:
-
-```wx
-fn function_with_many_parameters(
-    first: i32,
-    second: i32,
-) -> i32 {
-    foo()
-}
-```
-
-and:
-
-```wx
-fn f(condition: bool) -> i32 {
-    if condition { foo() } else { bar() }
-}
-```
-
-both arise from ordinary tree structure rather than function-specific renderer
-logic.
+The function-body builder emits mandatory brace lines for every non-empty
+body. The ordinary block builder keeps its own flat-eligibility check. Both
+reuse statement and comment construction, preserving the same separator rules.
+Nested expressions and parameter lists retain their own groups, so wrapping
+a function body does not force either of them to expand.
 
 ### Express coordinated `if` branches through the same ownership rule
 
@@ -757,8 +700,8 @@ contains a structural hard line, the `if` cannot flatten and both branches
 break. No separate `force_break` calculation needs to duplicate block
 eligibility rules.
 
-When a compact `if` is the tail of a containing function, the function group
-breaks due to the brace-density rule, but the `if` retains its own nested group.
+When a compact `if` is the tail of a containing function, the function body
+is always multiline, but the `if` retains its own nested group.
 It may therefore stay compact inside the multiline function body.
 
 ### Make flat measurement reject hard lines
@@ -906,16 +849,15 @@ configuration.
 
 1. Make flat measurement return `None` for `HardLine` and `BlankLine`, then
    update group selection and snapshots affected by the bug fix.
-2. Establish the group-ownership invariant and make function bodies expose
-   ungrouped content to the complete function group, as `if` branches already
-   do.
+2. Establish the group-ownership invariant. Give non-empty function bodies
+   mandatory brace lines in their dedicated builder.
 3. Replace `IfBreakComma` with the generic mode-dependent fragment and prove
    existing trailing-comma behavior remains unchanged.
 4. Centralize statement-role and block-eligibility classification.
 5. Refactor group-owning block-like builders so optional suffixes are placed
    inside their governing groups.
-6. Apply the shared owning-group structure to functions and paired `if`
-   branches, then implement the new block and semicolon policies.
+6. Apply the shared owning-group structure to paired `if` branches, then
+   implement the block and semicolon policies.
 7. Re-run comment, width-boundary, idempotence, parser, and TIR-preservation
    tests before removing obsolete `force_break` paths.
 
@@ -1287,14 +1229,16 @@ Add formatter tests covering both source variants and idempotence. At minimum:
 
 ### Function signature/body coordination
 
-- short signature plus eligible short body: both flat,
+- short signature plus eligible short body: compact signature, multiline body,
 - signature that exceeds width plus otherwise eligible body: both broken,
 - signature with parameters forced to break for another reason: body broken,
 - short signature plus block-like tail: signature stays compact and body
   breaks,
 - short signature plus body containing multiple entries: signature stays
   compact and body breaks,
-- width boundaries that differ only by the inline body's contribution.
+- non-empty bodies remain multiline even at very wide line limits,
+- nested expression blocks still flatten when eligible,
+- truly empty function bodies remain `{}`.
 
 ### Block-like tail prevention
 
@@ -1349,16 +1293,16 @@ block-like expressions does not change diagnostics or types.
 
 The change is complete when all of the following hold:
 
-- `{ expression }` is compact only for one unterminated, non-block-like result
-  expression that fits and has no comments.
+- ordinary `{ expression }` blocks are compact only for one unterminated,
+  non-block-like result expression that fits and has no comments.
 - `{ expression; }` is multiline and retains the semicolon.
 - blocks with two or more entries are multiline.
 - a block-like tail prevents its containing block from flattening.
-- a broken function signature always forces a multiline body, while a
-  multiline body does not automatically force a short parameter list to
-  expand.
+- non-empty function bodies always render multiline; short parameter lists
+  and eligible nested expression blocks may remain compact.
 - `if` and `else` branches break together.
-- flat, non-final block-like statements end in `;`.
-- multiline, non-final block-like statements omit the optional `;`.
+- non-final block-like statements in flat group mode end in `;`.
+- non-final block-like statements in broken group mode omit the optional `;`,
+  even if empty braces allow the expression to remain on one physical line.
 - final separators are never normalized across the statement/result boundary.
 - formatting is idempotent and does not require type information.

@@ -172,7 +172,7 @@ impl Ordering {
         match self {
             Ordering::Less -> { Ordering::Greater },
             Ordering::Equal -> { Ordering::Equal },
-            Ordering::Greater -> { Ordering::Less }
+            Ordering::Greater -> { Ordering::Less },
         }
     }
 
@@ -180,7 +180,7 @@ impl Ordering {
     pub fn then(self, other: Ordering) -> Ordering {
         match self {
             Ordering::Equal -> { other },
-            _ -> { self }
+            _ -> { self },
         }
     }
 }

@@ -59,9 +59,9 @@ fn find_spawn() {
                 player_y = f64_convert_i32(y) + 0.5;
                 player_angle = 0.0;
                 found = true;
-            };
+            }
             x += 1;
-        };
+        }
         y += 1;
     };
 }
@@ -87,7 +87,7 @@ fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
         local needed =
             (end.addr() - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
-    };
+    }
     bump = end.as_ptr();
     start.as_ptr()
 }
@@ -99,7 +99,9 @@ pub fn framebuffer_ptr() -> i32 {
 }
 
 fn put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
-    if x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H { return; };
+    if x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H {
+        return;
+    }
     local idx = y as u32 * SCREEN_W as u32 + x as u32;
     local rgba =
         r as u32 | (g as u32 << 8) | (b as u32 << 16) | (255 as u32 << 24);
@@ -124,8 +126,8 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
 
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
-    if dir_x != 0.0 { delta_dist_x = (1.0 / dir_x).abs() }
-    if dir_y != 0.0 { delta_dist_y = (1.0 / dir_y).abs() }
+    if dir_x != 0.0 { delta_dist_x = (1.0 / dir_x).abs() };
+    if dir_y != 0.0 { delta_dist_y = (1.0 / dir_y).abs() };
 
     local mut step_x: i32 = 0;
     local mut step_y: i32 = 0;
@@ -188,14 +190,14 @@ pub fn render() {
         local mut line_height = SCREEN_H;
         if corrected > 0.0001 {
             line_height = (f64_convert_i32(SCREEN_H) / corrected).to_i32();
-        };
+        }
 
         local draw_start =
             (SCREEN_H / 2 - line_height / 2).clamp(0, SCREEN_H - 1);
         local draw_end = (SCREEN_H / 2 + line_height / 2).clamp(0, SCREEN_H - 1);
 
         local mut shade: u8 = 200;
-        if hit.side == 1 { shade = 140; };
+        if hit.side == 1 { shade = 140 };
 
         local mut y: i32 = 0;
         loop {
@@ -208,9 +210,9 @@ pub fn render() {
                 } else {
                     put_pixel(x, y, shade, 0, 0);
                 };
-            };
+            }
             y += 1;
-        };
+        }
         x += 1;
     };
 }
@@ -221,12 +223,16 @@ pub fn update(dt_ms: i64) {
     local mut forward: f64 = 0.0;
     local mut strafe: f64 = 0.0;
 
-    if host::key_down(87) != 0 { forward += 1.0; };
-    if host::key_down(83) != 0 { forward -= 1.0; };
-    if host::key_down(68) != 0 { strafe += 1.0; };
-    if host::key_down(65) != 0 { strafe -= 1.0; };
-    if host::key_down(39) != 0 { player_angle += ROT_SPEED * dt; };
-    if host::key_down(37) != 0 { player_angle -= ROT_SPEED * dt; };
+    if host::key_down(87) != 0 { forward += 1.0 };
+    if host::key_down(83) != 0 { forward -= 1.0 };
+    if host::key_down(68) != 0 { strafe += 1.0 };
+    if host::key_down(65) != 0 { strafe -= 1.0 };
+    if host::key_down(39) != 0 {
+        player_angle += ROT_SPEED * dt;
+    }
+    if host::key_down(37) != 0 {
+        player_angle -= ROT_SPEED * dt;
+    }
 
     local dir_x = player_angle.cos();
     local dir_y = player_angle.sin();
@@ -236,8 +242,12 @@ pub fn update(dt_ms: i64) {
     local nx = player_x + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
     local ny = player_y + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
 
-    if !is_wall(nx, player_y) { player_x = nx; };
-    if !is_wall(player_x, ny) { player_y = ny; };
+    if !is_wall(nx, player_y) {
+        player_x = nx;
+    }
+    if !is_wall(player_x, ny) {
+        player_y = ny;
+    };
 }
 
 pub fn frame(dt_ms: i64) {

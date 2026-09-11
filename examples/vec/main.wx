@@ -113,7 +113,7 @@ pub fn demo() -> i32 {
 
     local mut n: i32 = 1;
     loop {
-        if n > 10 { break; };
+        if n > 10 { break };
         v.push(n);
         n += 1;
     }
@@ -121,7 +121,7 @@ pub fn demo() -> i32 {
     local mut sum: i32 = 0;
     local mut i: u32 = 0;
     loop {
-        if i == v.len() { break sum }
+        if i == v.len() { break sum };
         sum += v.get(i);
         i += 1;
     }
