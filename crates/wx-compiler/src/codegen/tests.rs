@@ -4542,3 +4542,91 @@ fn test_trait_default_method_dispatches_to_impl_override() {
 		"`dispatch::<Inh>` uses the default `base`"
 	);
 }
+
+// ── loop-break divergence union
+// ────────────────────────────────────────────
+//
+// `patch_loop_binding` (opt/builder.rs) decides whether a loop-carried
+// binding needs a real WASM output local by comparing the *fallthrough*
+// path's final value against the value on the way in. A `break`/`continue`
+// nested inside a diverging branch can commit a genuinely different value at
+// its own point, independently of what the fallthrough later does — if the
+// fallthrough happens to leave the binding looking unchanged (or never
+// touches it at all), the early exit's already-recorded commit ends up
+// referencing a local that was never allocated. `LoopData::divergent_params`
+// unions in what every break/continue already found, closing that gap.
+
+#[test]
+fn test_break_inside_diverging_if_commits_mutation() {
+	// `x` is reset to `0` on every normal (non-break) iteration — literally
+	// the same interned node as `x`'s pre-loop value — so the fallthrough
+	// path alone looks like `x` is never mutated. But the `break`, nested in
+	// the `if` with no `else`, sets `x = 5` immediately before firing; that
+	// commit must still survive to the local `x` reads after the loop.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                x = 5;
+                if i > 3 {
+                    break;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_continue_inside_diverging_if_commits_mutation() {
+	// Same gap as `test_break_inside_diverging_if_commits_mutation`, but
+	// through `continue` instead of `break` — `loop_param_updates` is the
+	// single choke point both call through, so this confirms the fix covers
+	// both, not just `Break`. At `i == 2`, `x = 5` is committed and the loop
+	// restarts via `continue` *without* the `x = 0` reset that every other
+	// iteration takes; the very next iteration then breaks immediately (at
+	// `i == 3`), before `x` is ever reassigned again — so the continue's own
+	// commit must be exactly what's left when the loop exits.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                if i > 2 {
+                    break;
+                }
+                x = 5;
+                if i == 2 {
+                    i = i + 1;
+                    continue;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}

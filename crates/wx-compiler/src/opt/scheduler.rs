@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
-	BlockIndex, ControlNode, DataNode, DataNodeIndex, DataNodeKind, Function,
-	MemAccess, ScalarType, StackResult, SwitchCase,
+	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess,
+	ScalarType, StackResult, SwitchCase,
 };
 use crate::wasm::{self, BlockType, Instruction, Local, MemArg};
 
@@ -201,9 +201,7 @@ impl<'f> Scheduler<'f> {
 						}
 						_ => {
 							// Scalar result: spill to a local if used, drop otherwise.
-							if self.should_spill(
-								&self.func.data_nodes[*result_node as usize],
-							) {
+							if self.should_spill(*result_node) {
 								let ty = self.func.data_nodes
 									[*result_node as usize]
 									.kind
@@ -517,7 +515,7 @@ impl<'f> Scheduler<'f> {
 			} => {
 				self.emit_value(*delta);
 				self.body.push(Instruction::MemoryGrow(*memory));
-				if self.should_spill(&self.func.data_nodes[*result as usize]) {
+				if self.should_spill(*result) {
 					let ty = self.func.data_nodes[*result as usize]
 						.kind
 						.unwrap_scalar();
@@ -789,7 +787,7 @@ impl<'f> Scheduler<'f> {
 			if !self.func.data_nodes[node as usize].kind.is_pure() {
 				continue;
 			}
-			if !self.should_spill(&self.func.data_nodes[node as usize]) {
+			if !self.should_spill(node) {
 				continue;
 			}
 			let mut blocks_iter = entries.iter().map(|&(b, _)| b);
@@ -1369,7 +1367,7 @@ impl<'f> Scheduler<'f> {
 			}
 			return;
 		}
-		if self.should_spill(&self.func.data_nodes[node as usize]) {
+		if self.should_spill(node) {
 			let local = self.ensure_local(node);
 			self.body.push(Instruction::LocalGet(local));
 			return;
@@ -1902,8 +1900,8 @@ impl<'f> Scheduler<'f> {
 
 	/// Returns true if this node must be computed into a WASM local rather than
 	/// inlined at each use site.
-	fn should_spill(&self, node: &DataNode) -> bool {
-		match &node.kind {
+	fn should_spill(&self, idx: DataNodeIndex) -> bool {
+		match &self.func.data_nodes[idx as usize].kind {
 			// Constants and params are always cheaper to re-emit than to spill.
 			DataNodeKind::Int { .. }
 			| DataNodeKind::Float { .. }
@@ -1912,8 +1910,22 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::StaticDataRef { .. }
 			| DataNodeKind::MemoryOffset { .. } => false,
 
-			// Loop params whose before == after were never modified; skip.
-			DataNodeKind::LoopParam { before, after, .. } => before != after,
+			// A loop param needs a local exactly when `patch_loop_binding`
+			// (opt/builder.rs) decided it was loop-carried and pushed it into
+			// `ControlNode::Loop::outputs` — which is exactly when the owning
+			// `Loop` handler pre-allocated it a local, below (~line 389). By
+			// the time any reference to a LoopParam reaches here, that
+			// handler has always already run (a loop's own body is scheduled
+			// after its pre-allocation loop, and any reference after the
+			// loop is later still), so this is an exact check — not the
+			// `before != after` shortcut this used to be: that comparison
+			// alone misses a binding a `break`/`continue` mutated on a path
+			// the fallthrough happens to leave unchanged (see
+			// `LoopData::divergent_params`), which `outputs`/pre-allocation
+			// already correctly account for.
+			DataNodeKind::LoopParam { .. } => {
+				self.node_to_local.contains_key(&idx)
+			}
 
 			// Phi nodes that folded away (left == right) don't need a local.
 			DataNodeKind::Phi { left, right, .. } => left != right,
@@ -1941,7 +1953,7 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::Aggregate { .. } => true,
 
 			// For all other ops: spill only if the result is consumed more than once.
-			_ => node.uses.len() > 1,
+			_ => self.func.data_nodes[idx as usize].uses.len() > 1,
 		}
 	}
 

@@ -769,6 +769,16 @@ pub struct LoopData {
 	/// `LoopParam` node corresponds to which binding slot; see
 	/// `ControlNode::Break::loop_param_updates`.
 	pub loop_params: Vec<StackResult>,
+	/// Scalar-level `LoopParam` nodes any `break`/`continue` inside the body
+	/// has ever recorded a genuine commit for (see
+	/// `Builder::loop_param_updates`), independent of what the fallthrough
+	/// path alone would conclude. Unioned into `patch_loop_binding`'s
+	/// divergence decision so a binding a break mutates — but the
+	/// fallthrough never touches, or resets back to the same value — still
+	/// gets a real output local. A plain `Vec` (not a `HashSet`):
+	/// loop-carried bindings are typically few enough that a linear
+	/// `.contains()` check is cheaper than hashing.
+	pub divergent_params: Vec<DataNodeIndex>,
 }
 
 /// One `match` arm, lowered. `own_values` is required because `DataNodeKind::Phi`

@@ -1616,6 +1616,7 @@ impl<'mir> Builder<'mir> {
 		let loop_index = self.func.push_loop_data(LoopData {
 			break_result_outputs: Vec::new(),
 			loop_params: loop_params.clone(),
+			divergent_params: Vec::new(),
 		});
 		self.func.blocks[body_block as usize] = Some(Block {
 			parent: Some(parent_block),
@@ -1638,9 +1639,13 @@ impl<'mir> Builder<'mir> {
 			.unwrap()
 			.result = body_fallthrough;
 
-		// Patch loop params and collect outputs.
+		// Patch loop params and collect outputs. `divergent_params` is
+		// cloned up front (mirrors `loop_params` itself, above) so it can be
+		// passed down without re-borrowing `self.func` inside the loop.
 		let mut outputs = Vec::new();
 		let parent_len = bindings.len();
+		let divergent_params: Vec<DataNodeIndex> =
+			self.func.loop_data(body_block).divergent_params.clone();
 		for i in 0..parent_len {
 			self.patch_loop_binding(
 				i,
@@ -1648,6 +1653,7 @@ impl<'mir> Builder<'mir> {
 				&loop_bindings,
 				bindings,
 				&mut outputs,
+				&divergent_params,
 			);
 		}
 
@@ -1839,6 +1845,17 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// Patch loop params for binding `i` once the loop body is built.
+	///
+	/// `divergent_params` is the loop's running list (see
+	/// `LoopData::divergent_params`) of scalar `LoopParam` nodes some
+	/// `break`/`continue` inside the body already found to differ from the
+	/// placeholder at its own point — independent of, and unioned with, what
+	/// the fallthrough path alone concludes below. Without this union, a
+	/// binding mutated only along a path that ends in an early exit (while
+	/// the fallthrough happens to leave it unchanged, or never touches it at
+	/// all) would be wrongly treated as never loop-carried, and the early
+	/// exit's already-recorded commit would reference a WASM local that was
+	/// never allocated.
 	fn patch_loop_binding(
 		&mut self,
 		i: usize,
@@ -1846,6 +1863,7 @@ impl<'mir> Builder<'mir> {
 		loop_final: &[StackResult],
 		parent_bindings: &mut [StackResult],
 		outputs: &mut Vec<DataNodeIndex>,
+		divergent_params: &[DataNodeIndex],
 	) {
 		let param = match loop_params[i] {
 			StackResult::Value(n) => n,
@@ -1857,31 +1875,50 @@ impl<'mir> Builder<'mir> {
 		};
 
 		// If loop_final still holds the LoopParam (or the same aggregate wrapper)
-		// that was installed at loop entry, the binding was never written inside
-		// the loop body.  Restore the parent binding to the pre-loop value and
-		// skip patching so we don't create a self-referential LoopParam node.
+		// that was installed at loop entry, the binding was never written on the
+		// fallthrough path. That alone doesn't mean it's not loop-carried — some
+		// break/continue inside may have recorded a genuinely different value at
+		// its own point (see `divergent_params`'s doc comment) — so only take the
+		// early-out (restore to the pre-loop value, skip patching, no output) when
+		// nothing has flagged this param as divergent either.
 		if param == after {
-			let before = match self.func.data_nodes[param as usize].kind {
-				DataNodeKind::LoopParam { before, .. } => before,
-				// Aggregate wrapper whose fields were all unmodified.
-				_ => {
-					// Restore the parent binding to whatever it was before the loop.
-					// The original value was `loop_params[i]`'s `before` field, but
-					// for aggregates we just leave the binding as-is (it's already correct
-					// since the aggregate node CSE-deduplicates to the pre-loop one).
-					return;
-				}
-			};
-			parent_bindings[i] = StackResult::Value(before);
-			return;
+			let any_divergent =
+				match self.func.data_nodes[param as usize].kind.node_type() {
+					NodeType::Scalar(_) => divergent_params.contains(&param),
+					NodeType::Aggregate(_) => self
+						.scalars_of(param)
+						.iter()
+						.any(|s| divergent_params.contains(s)),
+				};
+			if !any_divergent {
+				let before = match self.func.data_nodes[param as usize].kind {
+					DataNodeKind::LoopParam { before, .. } => before,
+					// Aggregate wrapper whose fields were all unmodified.
+					_ => {
+						// Restore the parent binding to whatever it was before the loop.
+						// The original value was `loop_params[i]`'s `before` field, but
+						// for aggregates we just leave the binding as-is (it's already correct
+						// since the aggregate node CSE-deduplicates to the pre-loop one).
+						return;
+					}
+				};
+				parent_bindings[i] = StackResult::Value(before);
+				return;
+			}
+			// Else fall through into the match below: `patch_loop_param(param,
+			// after)` there is a no-op (before == after already), but the
+			// `divergent_params` check in each arm still forces the right
+			// scalars into `outputs`.
 		}
 
 		match self.func.data_nodes[param as usize].kind.node_type() {
 			NodeType::Scalar(_) => {
 				self.func.patch_loop_param(param, after);
-				// Only expose as output if the binding was actually mutated.
-				if matches!(self.func.data_nodes[param as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
-				{
+				// Expose as output if the binding was actually mutated on the
+				// fallthrough path, *or* some break/continue already found it
+				// to diverge independently of the fallthrough.
+				let mutated = matches!(self.func.data_nodes[param as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after);
+				if mutated || divergent_params.contains(&param) {
 					parent_bindings[i] = StackResult::Value(param);
 					outputs.push(param);
 				}
@@ -1898,8 +1935,8 @@ impl<'mir> Builder<'mir> {
 					lp_scalars.iter().zip(after_scalars.iter())
 				{
 					self.func.patch_loop_param(lp_scalar, after_scalar);
-					if matches!(self.func.data_nodes[lp_scalar as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
-					{
+					let mutated = matches!(self.func.data_nodes[lp_scalar as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after);
+					if mutated || divergent_params.contains(&lp_scalar) {
 						outputs.push(lp_scalar);
 						any_changed = true;
 					}
@@ -1941,6 +1978,15 @@ impl<'mir> Builder<'mir> {
 				(param, current)
 			{
 				self.collect_scalar_loop_param_updates(p, c, &mut updates);
+			}
+		}
+		// Fold every genuine divergence this call found into the loop's
+		// running record — see `LoopData::divergent_params`'s doc comment.
+		// `updates` is typically tiny, so a linear dedup check stays cheap.
+		let divergent = &mut self.func.loop_data_mut(target).divergent_params;
+		for &(param, _) in &updates {
+			if !divergent.contains(&param) {
+				divergent.push(param);
 			}
 		}
 		updates.into_boxed_slice()
