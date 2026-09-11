@@ -1520,38 +1520,6 @@ fn test_compound_assign_through_ptr_deref_on_struct_field() {
 }
 
 #[test]
-#[ignore = "method lookup for pointer receivers not yet implemented"]
-fn test_generic_compound_assign_through_ptr_deref() {
-	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 };
-
-        struct Vec<T> {
-            buf: u32,
-            len: u32,
-            cap: u32,
-        }
-
-        impl<T> Vec<T> {
-            pub fn increment_len(self: heap::*Self) {
-                self.*.len += 1;
-            }
-        }
-
-        fn call_it(p: heap::*Vec<u32>) {
-            p.increment_len();
-        }
-
-        export { call_it }
-    "});
-	assert!(
-		case.tir.diagnostics.is_empty(),
-		"unexpected TIR diagnostics: {:?}",
-		case.tir.diagnostics
-	);
-	insta::assert_yaml_snapshot!(case.mir);
-}
-
-#[test]
 fn test_string_literal_dedup_is_per_memory() {
 	// The same literal must produce one static entry per *memory* it is
 	// used in — shared within a memory, duplicated across memories.

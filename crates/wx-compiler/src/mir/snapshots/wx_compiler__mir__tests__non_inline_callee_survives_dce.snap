@@ -4,17 +4,11 @@ expression: case.mir
 ---
 functions:
   - id: 667
-    signature_index: 1
+    signature_index: 0
     scopes:
       - kind: Block
         result: U32
-      - kind: Block
-        result: U32
     locals:
-      - ty: U32
-        mutability: Immutable
-      - ty: U32
-        mutability: Immutable
       - ty: U32
         mutability: Immutable
     block:
@@ -23,50 +17,22 @@ functions:
           scope_index: 0
           expressions:
             - kind:
-                Block:
-                  scope_index: 1
-                  expressions:
-                    - kind:
-                        LocalSet:
-                          local_index: 1
-                          value:
-                            kind:
-                              LocalGet:
-                                local_index: 0
-                            ty: U32
-                      ty: Unit
-                    - kind:
-                        LocalSet:
-                          local_index: 2
-                          value:
-                            kind:
-                              Int:
-                                value: 1
-                            ty: U32
-                      ty: Unit
-                    - kind:
-                        Block:
-                          scope_index: 0
-                          expressions:
-                            - kind:
-                                Add:
-                                  left:
-                                    kind:
-                                      LocalGet:
-                                        local_index: 1
-                                    ty: I32
-                                  right:
-                                    kind:
-                                      LocalGet:
-                                        local_index: 2
-                                    ty: I32
-                              ty: U32
-                      ty: U32
+                Add:
+                  left:
+                    kind:
+                      LocalGet:
+                        local_index: 0
+                    ty: U32
+                  right:
+                    kind:
+                      Int:
+                        value: 1
+                    ty: U32
               ty: U32
       ty: U32
     static_data: []
   - id: 668
-    signature_index: 1
+    signature_index: 0
     scopes:
       - kind: Block
         result: U32
@@ -86,7 +52,7 @@ functions:
                         id: 667
                     ty:
                       Function:
-                        signature_index: 1
+                        signature_index: 0
                   arguments:
                     - kind:
                         LocalGet:
@@ -96,11 +62,6 @@ functions:
       ty: U32
     static_data: []
 signatures:
-  - items:
-      - U32
-      - U32
-      - U32
-    params_count: 2
   - items:
       - U32
       - U32
@@ -209,6 +170,11 @@ signatures:
       - U32
       - F64
     params_count: 1
+  - items:
+      - U32
+      - U32
+      - U32
+    params_count: 2
   - items:
       - I64
       - F32

@@ -198,11 +198,7 @@ pub trait Ord: PartialOrd + Eq {
         if self < other { other } else { self }
     }
 
-    // NOT #[inline] yet, unlike `min`/`max` above: this body has statement-
-    // position early `return`s. The inliner rewrites a callee `return` into a
-    // `break` out of a wrapper block, but `opt` can only lower a `break` whose
-    // target is a loop — a `break` to a plain block panics in `loop_data`
-    // (opt/mod.rs). Re-add `#[inline]` once opt learns break-from-block.
+    #[inline]
     fn clamp(self, min: Self, max: Self) -> Self {
         if max < min { unreachable };
         if self < min { return min };

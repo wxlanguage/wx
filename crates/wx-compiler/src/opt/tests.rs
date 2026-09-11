@@ -1740,7 +1740,7 @@ fn test_loop_two_breaks_different_values_creates_phi() {
 		.filter_map(|(i, b)| b.as_ref().map(|b| (i as u32, b)))
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
-	let break_result_outputs = &opt.loop_data(loop_idx).break_result_outputs;
+	let break_result_outputs = &opt.join_data(loop_idx).break_result_outputs;
 	assert_eq!(
 		break_result_outputs.len(),
 		1,
@@ -1784,7 +1784,7 @@ fn test_loop_single_break_no_phi() {
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
+		opt.join_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty for a single-break loop"
 	);
 }
@@ -1819,7 +1819,7 @@ fn test_loop_two_breaks_same_value_phi_folds() {
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
+		opt.join_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty when phi folds"
 	);
 }
@@ -2409,7 +2409,7 @@ fn test_match_schedules_br_table_for_dense_cases() {
 fn test_untargeted_plain_block_registers_no_block_join() {
 	// A plain `{}` block that nothing ever `break`s to must stay exactly as
 	// cheap as it was before `ControlNode::BlockJoin` existed — no `Block`
-	// entry, no `BlockJoinData`, no wasted WASM nesting. `break_targets`
+	// entry, no `JoinData`, no wasted WASM nesting. `break_targets`
 	// (computed once up front by `collect_break_targets`) is what lets
 	// `build_block_expr` recognize this and take the fully transparent path.
 	let case = TestCase::new(indoc! {"
@@ -2426,10 +2426,10 @@ fn test_untargeted_plain_block_registers_no_block_join() {
 	let opt = Builder::build(&case.mir, func_mir);
 
 	assert!(
-		opt.block_joins.is_empty(),
-		"expected zero BlockJoinData entries for a function with no break \
-		 anywhere; got {} entries",
-		opt.block_joins.len()
+		opt.joins.is_empty(),
+		"expected zero JoinData entries for a function with no break \
+		 anywhere (no loop, no block-join); got {} entries",
+		opt.joins.len()
 	);
 	assert!(
 		opt.blocks

@@ -398,7 +398,7 @@ impl<'f> Scheduler<'f> {
 				// Break handlers inside the body can write to them before `br`.
 				for phi in self
 					.func
-					.loop_data(*body)
+					.join_data(*body)
 					.break_result_outputs
 					.iter()
 					.copied()
@@ -473,11 +473,8 @@ impl<'f> Scheduler<'f> {
 				// mirroring Loop's identical separate pre-allocation step
 				// above. Cloned out first to avoid borrowing `self.func`
 				// and `self` mutably at once.
-				let break_result_outputs: Vec<DataNodeIndex> = self
-					.func
-					.block_join_data(*body)
-					.break_result_outputs
-					.clone();
+				let break_result_outputs: Vec<DataNodeIndex> =
+					self.func.join_data(*body).break_result_outputs.clone();
 				self.pre_alloc_phi_outputs(&break_result_outputs);
 
 				self.body.push(Instruction::Block {
@@ -517,34 +514,18 @@ impl<'f> Scheduler<'f> {
 				value,
 				carried_binding_updates,
 			} => {
-				let is_loop = self.func.blocks[*target as usize]
-					.as_ref()
-					.unwrap()
-					.is_loop();
 				if let StackResult::Value(v) = value {
 					// Store break value into phi locals; LocalSet in reverse
 					// because emit_value pushes fields lowest-first.
-					let n_phis = if is_loop {
-						self.func.loop_data(*target).break_result_outputs.len()
-					} else {
-						self.func
-							.block_join_data(*target)
-							.break_result_outputs
-							.len()
-					};
+					let n_phis =
+						self.func.join_data(*target).break_result_outputs.len();
 					if n_phis > 0 {
 						self.emit_value(*v);
-						let phis: Vec<DataNodeIndex> = if is_loop {
-							self.func
-								.loop_data(*target)
-								.break_result_outputs
-								.clone()
-						} else {
-							self.func
-								.block_join_data(*target)
-								.break_result_outputs
-								.clone()
-						};
+						let phis: Vec<DataNodeIndex> = self
+							.func
+							.join_data(*target)
+							.break_result_outputs
+							.clone();
 						for phi in phis.into_iter().rev() {
 							let phi_local =
 								*self.node_to_local.get(&phi).expect(
@@ -903,11 +884,12 @@ impl<'f> Scheduler<'f> {
 	}
 
 	/// Reverse lookup from a nested block to the `(parent_block,
-	/// statement_index)` of the `IfElse`/`Switch`/`Loop` statement that owns
-	/// it — the position `owning_statement_index` walks toward when
-	/// resolving a descendant reader up to some ancestor block. Built once,
-	/// in a single forward pass over every block's own statements; `None`
-	/// for the function's root block, which has no owning statement.
+	/// statement_index)` of the `IfElse`/`Switch`/`Loop`/`BlockJoin`
+	/// statement that owns it — the position `owning_statement_index` walks
+	/// toward when resolving a descendant reader up to some ancestor block.
+	/// Built once, in a single forward pass over every block's own
+	/// statements; `None` for the function's root block, which has no
+	/// owning statement.
 	fn compute_child_owning_stmt(&self) -> Vec<Option<(BlockIndex, u32)>> {
 		let mut table = vec![None; self.func.blocks.len()];
 		for block_idx in 0..self.func.blocks.len() as BlockIndex {
@@ -932,7 +914,8 @@ impl<'f> Scheduler<'f> {
 							table[case.block as usize] = Some((block_idx, i));
 						}
 					}
-					ControlNode::Loop { body, .. } => {
+					ControlNode::Loop { body, .. }
+					| ControlNode::BlockJoin { body, .. } => {
 						table[*body as usize] = Some((block_idx, i));
 					}
 					_ => {}
@@ -2046,7 +2029,7 @@ impl<'f> Scheduler<'f> {
 			// `before != after` shortcut this used to be: that comparison
 			// alone misses a binding a `break`/`continue` mutated on a path
 			// the fallthrough happens to leave unchanged (see
-			// `LoopData::divergent_params`), which `outputs`/pre-allocation
+			// `JoinData::divergent_params`), which `outputs`/pre-allocation
 			// already correctly account for.
 			DataNodeKind::LoopParam { .. } => {
 				self.node_to_local.contains_key(&idx)

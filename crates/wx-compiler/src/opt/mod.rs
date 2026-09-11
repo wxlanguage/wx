@@ -714,8 +714,7 @@ pub enum ControlNode {
 		value: StackResult,
 		/// `(carried_node, current_value_node)` pairs, decomposed to
 		/// scalars — the target's own carried bindings (a loop's
-		/// `LoopData::entry_placeholders`, or a block-join's
-		/// `BlockJoinData::entry_placeholders`) as of this exact break site.
+		/// `JoinData::entry_placeholders`) as of this exact break site.
 		/// The target's normal "commit
 		/// accumulated bindings, then branch back/fall through" tail code
 		/// only runs on the ordinary path (a loop's back-edge, or a block's
@@ -774,14 +773,23 @@ pub enum ControlNode {
 }
 
 index_newtype!(
-	/// Index into `Function::loops`, not the block table.
-	LoopIndex
+	/// Index into `Function::joins`, not the block table.
+	JoinIndex
 );
 
-index_newtype!(
-	/// Index into `Function::block_joins`, not the block table.
-	BlockJoinIndex
-);
+/// A block's shape — mirrors the same `Block`/`Loop` distinction TIR and MIR
+/// already carry per scope (`tir::BlockKind`, `mir::BlockScope::kind`), kept
+/// as opt's own type rather than reused directly since opt's `kind` also
+/// covers synthetic blocks with no MIR scope at all (see
+/// `Builder::push_synthetic_block`). Every `Block` has one, independent of
+/// whether it's an actual break target (`Block::join`) — an ordinary
+/// if/else or switch-arm body is `Block`-shaped without ever being a join.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum BlockKind {
+	Block,
+	Loop,
+}
 
 pub struct Block {
 	pub parent: Option<BlockIndex>,
@@ -793,78 +801,63 @@ pub struct Block {
 	/// from every `break <value>` inside) is saved into
 	/// `ControlNode::Loop.result` before this happens.
 	pub result: StackResult,
-	/// `Some` only for loop blocks — indexes into `Function::loops` for the
-	/// two things only loops need (`break_result_outputs`,
-	/// `entry_placeholders`).
-	/// A separate table rather than always-present-but-usually-empty fields
-	/// on every `Block`, since most blocks aren't loops.
-	pub loop_index: Option<LoopIndex>,
-	/// `Some` only for a plain `{}` block that's an actual `break` target
-	/// (see `Builder::break_targets`) — indexes into `Function::block_joins`.
-	/// A separate sparse table from `loop_index`, not a unified "exit kind"
-	/// enum: most blocks are neither loops nor break targets, and the two
-	/// kinds carry genuinely different data (a loop's back-edge/fixed-point
-	/// bookkeeping has no block-join analogue — see
-	/// `DataNodeKind::JoinParam`'s doc comment).
-	pub block_join_index: Option<BlockJoinIndex>,
+	pub kind: BlockKind,
+	/// `Some` only for a block that's an actual break target — every loop
+	/// body (see `build_loop`), or a plain `{}` block something breaks to
+	/// (see `Builder::break_targets`) — indexing into `Function::joins`.
+	/// Most blocks (ordinary if/else/switch arm bodies) are neither, hence
+	/// `Option` rather than an always-present field. `kind == Loop` always
+	/// implies `Some` (`build_loop` registers both together); `kind ==
+	/// Block` may be either, depending on `Builder::break_targets`.
+	pub join: Option<JoinIndex>,
 }
 
 impl Block {
 	pub fn is_loop(&self) -> bool {
-		self.loop_index.is_some()
+		matches!(self.kind, BlockKind::Loop)
 	}
 
 	pub fn is_block_join(&self) -> bool {
-		self.block_join_index.is_some()
+		self.join.is_some() && matches!(self.kind, BlockKind::Block)
 	}
 }
 
-pub struct LoopData {
-	/// Phi nodes at the loop-exit join point for `break <value>` paths.
-	/// Scheduler pre-allocates WASM locals for these; each `Break` stores
-	/// into them before the `br`. Empty when all breaks carry the same
-	/// value.
+/// Per-join-target extra data for a block that's an actual `break` target —
+/// shared storage shape for both a loop body and a plain `{}` block's
+/// block-join, distinguished by `Block::kind`. Holds
+/// exactly what both forms need identically; the one thing that isn't
+/// identical (a loop's back-edge before/after split) lives on the
+/// `LoopParam`/`JoinParam` `DataNodeKind` variants instead, not here — see
+/// `DataNodeKind::JoinParam`'s doc comment.
+pub struct JoinData {
+	/// Phi nodes at the join point for the merged exit *value* — every
+	/// `break <value>` targeting this block, plus (for a block-join only;
+	/// a loop's own "fallthrough" is its back-edge, already covered by
+	/// `entry_placeholders`) the block's own fallthrough tail value.
+	/// Scheduler pre-allocates WASM locals for these; each exit stores into
+	/// them before branching. Empty when every exit carries the same value.
 	pub break_result_outputs: Vec<DataNodeIndex>,
-	/// This loop's own per-slot `LoopParam` placeholders, exactly as
-	/// returned by `Builder::create_loop_params` — one entry per
+	/// This target's own per-slot carried-binding placeholders — a loop's
+	/// `LoopParam`s (`Builder::create_loop_params`) or a block-join's
+	/// `JoinParam`s (`Builder::create_join_params`) — one entry per
 	/// function-wide local, `Some` only where that local already had a
-	/// value at loop entry (`None` means "not yet declared on this build
-	/// path," e.g. a temp only declared inside the loop body itself; see
+	/// value at entry (`None` means "not yet declared on this build path,"
+	/// e.g. a temp only declared inside the body itself; see
 	/// `Builder::read_binding`'s doc comment). Kept around so a nested
 	/// `break`/`continue` — however deep inside the body — can look up
-	/// which `LoopParam` node corresponds to which binding slot; see
+	/// which placeholder node corresponds to which binding slot; see
 	/// `ControlNode::Break::carried_binding_updates`.
 	pub entry_placeholders: Vec<Option<StackResult>>,
-	/// Scalar-level `LoopParam` nodes any `break`/`continue` inside the body
-	/// has ever recorded a genuine commit for (see
-	/// `Builder::carried_binding_updates`), independent of what the fallthrough
-	/// path alone would conclude. Unioned into `patch_loop_binding`'s
-	/// divergence decision so a binding a break mutates — but the
-	/// fallthrough never touches, or resets back to the same value — still
-	/// gets a real output local. A plain `Vec` (not a `HashSet`):
-	/// loop-carried bindings are typically few enough that a linear
-	/// `.contains()` check is cheaper than hashing.
-	pub divergent_params: Vec<DataNodeIndex>,
-}
-
-/// Per-block-join data for a plain `{}` block that's an actual `break`
-/// target — the block-join analogue of `LoopData`, minus everything that
-/// exists only to solve the loop back-edge problem (`LoopParam`'s
-/// before/after split has no counterpart here; see
-/// `DataNodeKind::JoinParam`'s doc comment).
-pub struct BlockJoinData {
-	/// Phi nodes at the join point for the merged exit *value* — every
-	/// `break <value>` targeting this block, plus the block's own
-	/// fallthrough tail value. Same role as `LoopData::break_result_outputs`.
-	pub break_result_outputs: Vec<DataNodeIndex>,
-	/// This block's own per-slot `JoinParam` placeholders, exactly as
-	/// returned by `Builder::create_join_params`. Same role and same
-	/// `None`-means-not-yet-declared shape as `LoopData::entry_placeholders`.
-	pub entry_placeholders: Vec<Option<StackResult>>,
-	/// Scalar-level `JoinParam` nodes any exit (a `break` targeting this
-	/// block, or the block's own fallthrough) has recorded a genuine commit
-	/// for. Same mechanism, same reason, as `LoopData::divergent_params` — a
-	/// plain `Vec`, not a `HashSet`, for the same reason.
+	/// Scalar-level placeholder nodes any exit (a `break`/`continue` inside
+	/// the body, or — for a block-join — the fallthrough) has ever recorded
+	/// a genuine commit for (see `Builder::carried_binding_updates`),
+	/// independent of what the fallthrough/back-edge path alone would
+	/// conclude. Unioned into `patch_loop_binding`'s/
+	/// `finalize_block_join_binding`'s divergence decision so a binding
+	/// some exit mutates — but the ordinary path never touches, or resets
+	/// back to the same value — still gets a real output local. A plain
+	/// `Vec` (not a `HashSet`): carried bindings are typically few enough
+	/// that a linear `.contains()` check is cheaper than hashing.
 	pub divergent_params: Vec<DataNodeIndex>,
 }
 
@@ -889,10 +882,10 @@ pub struct Function {
 	/// One slot per MIR scope (indexed by scope index). `None` until the scope
 	/// is built.
 	pub blocks: Vec<Option<Block>>,
-	/// Per-loop extra data, indexed by `Block::loop_index`.
-	pub loops: Vec<LoopData>,
-	/// Per-block-join extra data, indexed by `Block::block_join_index`.
-	pub block_joins: Vec<BlockJoinData>,
+	/// Per-join-target extra data, indexed by `Block::join`'s `JoinIndex` —
+	/// shared by both loop bodies and block-joins; see `JoinData`'s doc
+	/// comment.
+	pub joins: Vec<JoinData>,
 	/// CSE map: `DataNodeKind` → existing `DataNodeIndex`. Impure nodes excluded.
 	data_lookup: HashMap<DataNodeKind, DataNodeIndex>,
 }
@@ -903,72 +896,37 @@ impl Function {
 			id,
 			data_nodes: Vec::new(),
 			blocks: (0..scope_count).map(|_| None).collect(),
-			loops: Vec::new(),
-			block_joins: Vec::new(),
+			joins: Vec::new(),
 			data_lookup: HashMap::new(),
 		}
 	}
 
-	/// Registers a new loop's `LoopData` and returns its `LoopIndex`.
-	pub fn push_loop_data(&mut self, data: LoopData) -> LoopIndex {
-		let idx = LoopIndex::new(self.loops.len() as u32);
-		self.loops.push(data);
+	/// Registers a new join target's `JoinData` and returns its `JoinIndex`.
+	pub fn push_join_data(&mut self, data: JoinData) -> JoinIndex {
+		let idx = JoinIndex::new(self.joins.len() as u32);
+		self.joins.push(data);
 		idx
 	}
 
-	/// The `LoopData` for a loop block. Panics if `block_idx` isn't a loop.
-	pub fn loop_data(&self, block_idx: BlockIndex) -> &LoopData {
+	/// The `JoinData` for a loop or block-join target. Panics if `block_idx`
+	/// is neither.
+	pub fn join_data(&self, block_idx: BlockIndex) -> &JoinData {
 		let idx = self.blocks[block_idx as usize]
 			.as_ref()
 			.unwrap()
-			.loop_index
-			.expect("loop_data called on a non-loop block");
-		&self.loops[usize::from(idx)]
+			.join
+			.expect("join_data called on a block with no join entry");
+		&self.joins[usize::from(idx)]
 	}
 
-	/// Mutable counterpart of `loop_data`.
-	pub fn loop_data_mut(&mut self, block_idx: BlockIndex) -> &mut LoopData {
+	/// Mutable counterpart of `join_data`.
+	pub fn join_data_mut(&mut self, block_idx: BlockIndex) -> &mut JoinData {
 		let idx = self.blocks[block_idx as usize]
 			.as_ref()
 			.unwrap()
-			.loop_index
-			.expect("loop_data_mut called on a non-loop block");
-		&mut self.loops[usize::from(idx)]
-	}
-
-	/// Registers a new block-join's `BlockJoinData` and returns its
-	/// `BlockJoinIndex`.
-	pub fn push_block_join_data(
-		&mut self,
-		data: BlockJoinData,
-	) -> BlockJoinIndex {
-		let idx = BlockJoinIndex::new(self.block_joins.len() as u32);
-		self.block_joins.push(data);
-		idx
-	}
-
-	/// The `BlockJoinData` for a block-join block. Panics if `block_idx`
-	/// isn't a block-join.
-	pub fn block_join_data(&self, block_idx: BlockIndex) -> &BlockJoinData {
-		let idx = self.blocks[block_idx as usize]
-			.as_ref()
-			.unwrap()
-			.block_join_index
-			.expect("block_join_data called on a non-block-join block");
-		&self.block_joins[usize::from(idx)]
-	}
-
-	/// Mutable counterpart of `block_join_data`.
-	pub fn block_join_data_mut(
-		&mut self,
-		block_idx: BlockIndex,
-	) -> &mut BlockJoinData {
-		let idx = self.blocks[block_idx as usize]
-			.as_ref()
-			.unwrap()
-			.block_join_index
-			.expect("block_join_data_mut called on a non-block-join block");
-		&mut self.block_joins[usize::from(idx)]
+			.join
+			.expect("join_data_mut called on a block with no join entry");
+		&mut self.joins[usize::from(idx)]
 	}
 
 	/// Get or create a data node via CSE only. Does not apply any algebraic

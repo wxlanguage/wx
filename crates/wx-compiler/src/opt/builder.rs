@@ -1,7 +1,7 @@
 use crate::mir::{self, ExprKind};
 use crate::opt::{
-	Block, BlockIndex, BlockJoinData, ControlNode, DataNodeIndex, DataNodeKind,
-	Function, LoopData, MemAccess, NodeType, ScalarType, StackResult,
+	Block, BlockIndex, BlockKind, ControlNode, DataNodeIndex, DataNodeKind,
+	Function, JoinData, MemAccess, NodeType, ScalarType, StackResult,
 	SwitchCase,
 };
 
@@ -14,7 +14,7 @@ pub struct Builder<'mir> {
 	/// For each MIR scope index, whether some `Break` anywhere in the
 	/// function targets it — computed once, up front, by
 	/// `collect_break_targets`. Lets `build_block_expr` skip registering a
-	/// real `Block`/`BlockJoinData` for the overwhelming majority of plain
+	/// real `Block`/`JoinData` for the overwhelming majority of plain
 	/// `{}` blocks that are never a break target, keeping that case exactly
 	/// as cheap as it is today. A loop scope is always its own real `Block`
 	/// regardless of this (see `build_loop`), so this only matters for
@@ -100,8 +100,8 @@ impl<'mir> Builder<'mir> {
 			parent: None,
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
 
 		let body_exprs = match &mir_func.block.kind {
@@ -925,7 +925,7 @@ impl<'mir> Builder<'mir> {
 		// Two reasons to take the transparent fast path, checked together:
 		//
 		// 1. No `break` anywhere in the function ever targets this scope, so
-		//    registering a real `Block`/`BlockJoinData` for it would be pure
+		//    registering a real `Block`/`JoinData` for it would be pure
 		//    overhead — the overwhelming majority of plain `{}` blocks.
 		//
 		// 2. `scope_u32` is already registered as *something else*. This
@@ -957,12 +957,12 @@ impl<'mir> Builder<'mir> {
 			return result;
 		}
 
-		// Genuine break target — register a real Block + BlockJoinData
-		// before building the body, mirroring build_loop's own setup: any
-		// break discovered while building the body needs somewhere to
-		// commit against immediately (see create_join_params's doc comment).
+		// Genuine break target — register a real Block + JoinData before
+		// building the body, mirroring build_loop's own setup: any break
+		// discovered while building the body needs somewhere to commit
+		// against immediately (see create_join_params's doc comment).
 		let entry_placeholders = self.create_join_params(bindings, scope_u32);
-		let join_index = self.func.push_block_join_data(BlockJoinData {
+		let join_index = self.func.push_join_data(JoinData {
 			break_result_outputs: Vec::new(),
 			entry_placeholders: entry_placeholders.clone(),
 			divergent_params: Vec::new(),
@@ -971,8 +971,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(block_idx),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: Some(join_index),
+			kind: BlockKind::Block,
+			join: Some(join_index),
 		});
 
 		let mut child = bindings.to_vec();
@@ -995,11 +995,8 @@ impl<'mir> Builder<'mir> {
 		// principle Phase 1 fixed for loops, applied natively here.
 		let fallthrough_updates =
 			self.carried_binding_updates(scope_u32, &child[..parent_len]);
-		let divergent_params: Vec<DataNodeIndex> = self
-			.func
-			.block_join_data(scope_u32)
-			.divergent_params
-			.clone();
+		let divergent_params: Vec<DataNodeIndex> =
+			self.func.join_data(scope_u32).divergent_params.clone();
 		let mut outputs = Vec::new();
 		for i in 0..parent_len {
 			self.finalize_block_join_binding(
@@ -1043,8 +1040,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(block_idx),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
 		let then_result = self.build_block_exprs(
 			u32::from(then_scope),
@@ -1064,8 +1061,8 @@ impl<'mir> Builder<'mir> {
 					parent: Some(block_idx),
 					statements: Vec::new(),
 					result: StackResult::Never,
-					loop_index: None,
-					block_join_index: None,
+					kind: BlockKind::Block,
+					join: None,
 				});
 				let r =
 					self.build_block_exprs(u32::from(scope), &mut eb, exprs);
@@ -1156,8 +1153,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(parent),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		}));
 		idx
 	}
@@ -1239,8 +1236,8 @@ impl<'mir> Builder<'mir> {
 						parent: Some(last_container),
 						statements: Vec::new(),
 						result: StackResult::Never,
-						loop_index: None,
-						block_join_index: None,
+						kind: BlockKind::Block,
+						join: None,
 					});
 					let result = self.build_block_exprs(
 						u32::from(scope),
@@ -1357,8 +1354,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(container),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
 		let then_result = self.build_block_exprs(
 			u32::from(then_scope),
@@ -1670,8 +1667,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
-			block_join_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
 		let result =
 			self.build_block_exprs(u32::from(scope), &mut arm_bindings, exprs);
@@ -1705,7 +1702,7 @@ impl<'mir> Builder<'mir> {
 		let entry_placeholders = self.create_loop_params(bindings, body_block);
 		let mut loop_bindings = entry_placeholders.clone();
 
-		let loop_index = self.func.push_loop_data(LoopData {
+		let join_index = self.func.push_join_data(JoinData {
 			break_result_outputs: Vec::new(),
 			entry_placeholders: entry_placeholders.clone(),
 			divergent_params: Vec::new(),
@@ -1714,8 +1711,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: Some(loop_index),
-			block_join_index: None,
+			kind: BlockKind::Loop,
+			join: Some(join_index),
 		});
 		let body_fallthrough =
 			self.build_block_exprs(body_block, &mut loop_bindings, body_exprs);
@@ -1738,7 +1735,7 @@ impl<'mir> Builder<'mir> {
 		let mut outputs = Vec::new();
 		let parent_len = bindings.len();
 		let divergent_params: Vec<DataNodeIndex> =
-			self.func.loop_data(body_block).divergent_params.clone();
+			self.func.join_data(body_block).divergent_params.clone();
 		for i in 0..parent_len {
 			self.patch_loop_binding(
 				i,
@@ -1969,7 +1966,7 @@ impl<'mir> Builder<'mir> {
 	/// Patch loop params for binding `i` once the loop body is built.
 	///
 	/// `divergent_params` is the loop's running list (see
-	/// `LoopData::divergent_params`) of scalar `LoopParam` nodes some
+	/// `JoinData::divergent_params`) of scalar `LoopParam` nodes some
 	/// `break`/`continue` inside the body already found to differ from the
 	/// placeholder at its own point — independent of, and unioned with, what
 	/// the fallthrough path alone concludes below. Without this union, a
@@ -2155,13 +2152,12 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// `(carried_node, current_value_node)` pairs, decomposed to scalars —
-	/// the target's own carried bindings (a loop's
-	/// `LoopData::entry_placeholders`, or a block-join's
-	/// `BlockJoinData::entry_placeholders`) as of this exact
-	/// point, wherever they differ from what the carried node itself
-	/// currently holds. `Break`/`Continue` use this to commit their own
-	/// current values before jumping: the target's normal "commit
-	/// accumulated bindings, then branch back/fall through" tail code
+	/// the target's own carried bindings (`JoinData::entry_placeholders`,
+	/// shared shape for a loop or a block-join) as of this exact point,
+	/// wherever they differ from what the carried node itself currently
+	/// holds. `Break`/`Continue` use this to commit their own current
+	/// values before jumping: the target's normal "commit accumulated
+	/// bindings, then branch back/fall through" tail code
 	/// (`ControlNode::Loop`/`ControlNode::BlockJoin`'s own scheduling) only
 	/// runs on the ordinary path (a loop's back-edge, or a block's own
 	/// fallthrough), so an early exit must commit independently or the next
@@ -2172,18 +2168,11 @@ impl<'mir> Builder<'mir> {
 		target: BlockIndex,
 		bindings: &[Option<StackResult>],
 	) -> Box<[(DataNodeIndex, DataNodeIndex)]> {
-		let is_loop = self.func.blocks[target as usize]
-			.as_ref()
-			.unwrap()
-			.is_loop();
 		// Cloned out up front rather than indexed per-iteration: `self.func`
 		// would otherwise need re-borrowing on every loop, and
 		// `collect_scalar_loop_param_updates` below already needs `&mut self`.
-		let carried: Vec<Option<StackResult>> = if is_loop {
-			self.func.loop_data(target).entry_placeholders.clone()
-		} else {
-			self.func.block_join_data(target).entry_placeholders.clone()
-		};
+		let carried: Vec<Option<StackResult>> =
+			self.func.join_data(target).entry_placeholders.clone();
 		let mut updates = Vec::new();
 		// A `None` on either side means this local isn't genuinely carried
 		// by `target` (never declared before it began) — nothing to commit.
@@ -2197,14 +2186,9 @@ impl<'mir> Builder<'mir> {
 			}
 		}
 		// Fold every genuine divergence this call found into the target's
-		// running record — see `LoopData`/`BlockJoinData::divergent_params`'s
-		// doc comment. `updates` is typically tiny, so a linear dedup check
-		// stays cheap.
-		let divergent = if is_loop {
-			&mut self.func.loop_data_mut(target).divergent_params
-		} else {
-			&mut self.func.block_join_data_mut(target).divergent_params
-		};
+		// running record — see `JoinData::divergent_params`'s doc comment.
+		// `updates` is typically tiny, so a linear dedup check stays cheap.
+		let divergent = &mut self.func.join_data_mut(target).divergent_params;
 		for &(param, _) in &updates {
 			if !divergent.contains(&param) {
 				divergent.push(param);
@@ -2267,18 +2251,7 @@ impl<'mir> Builder<'mir> {
 			(StackResult::Value(l), StackResult::Value(r)) => {
 				let mut outputs = Vec::new();
 				let node = self.merge_values(l, r, &mut outputs);
-				let is_loop = self.func.blocks[target as usize]
-					.as_ref()
-					.unwrap()
-					.is_loop();
-				if is_loop {
-					self.func.loop_data_mut(target).break_result_outputs =
-						outputs;
-				} else {
-					self.func
-						.block_join_data_mut(target)
-						.break_result_outputs = outputs;
-				}
+				self.func.join_data_mut(target).break_result_outputs = outputs;
 				StackResult::Value(node)
 			}
 			_ => {

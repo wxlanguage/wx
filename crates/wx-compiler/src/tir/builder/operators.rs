@@ -149,6 +149,19 @@ impl OperatorMethod {
 	}
 }
 
+/// What a concrete, non-default `impl` match (`OperatorMethod::Impl`)
+/// becomes in `Builder::build_operator_dispatch`. `MethodCall` is the
+/// ordinary shape; `Native` is `Builder::dispatch_binary_op`'s opt-in for a
+/// primitive operand where MIR's inliner would otherwise process a call
+/// only to dissolve it back to the same instruction — skips straight to the
+/// plain `Binary` node that inlining would have produced anyway. Every
+/// other resolution outcome (`Comptime`, deferred-generic, `Default`, no
+/// impl) is unaffected by this choice.
+enum ImplNode {
+	MethodCall,
+	Native,
+}
+
 impl<'ast> Builder<'ast, '_> {
 	pub(super) fn resolve_operator_traits(&self) -> OperatorTraits {
 		let resolve_operator_method = |trait_name: &str, method_name: &str| {
@@ -301,9 +314,12 @@ impl<'ast> Builder<'ast, '_> {
 	/// - `Runtime`, dispatch succeeds against a concrete type — records
 	///   `operator`'s own span as a go-to-definition access against the
 	///   resolved method (the same `accesses`-list mechanism ordinary
-	///   method calls use) and builds a `MethodCall`, or a `GenericMethodCall`
-	///   when only the trait's own default body supplies the method
-	///   (`OperatorMethod::Default`, e.g. `!=` → `PartialEq::ne`).
+	///   method calls use) and builds a `MethodCall` or a native `Binary`
+	///   (per `impl_node`), or a `GenericMethodCall` when only the trait's
+	///   own default body supplies the method (`OperatorMethod::Default`,
+	///   e.g. `!=` → `PartialEq::ne` — always `MethodCall`-shaped regardless
+	///   of `impl_node`, since there's no single concrete impl to treat as
+	///   native).
 	/// - `Runtime`, dispatch fails — reports "operator cannot be applied".
 	///
 	/// `operand_ty` and `result_ty` are the same for arithmetic and bitwise
@@ -319,6 +335,7 @@ impl<'ast> Builder<'ast, '_> {
 		operand_ty: TypeIndex,
 		result_ty: TypeIndex,
 		span: ast::TextSpan,
+		impl_node: ImplNode,
 	) -> Expression {
 		let binary_op = Spanned {
 			inner: BinaryOp::from(operator.inner),
@@ -378,13 +395,24 @@ impl<'ast> Builder<'ast, '_> {
 					func_idx,
 					operator.span,
 				);
-				Expression {
-					kind: ExprKind::MethodCall {
-						arguments: Box::new([left, right]),
-						id: method_id,
+				match impl_node {
+					ImplNode::MethodCall => Expression {
+						kind: ExprKind::MethodCall {
+							arguments: Box::new([left, right]),
+							id: method_id,
+						},
+						ty: result_ty,
+						span,
 					},
-					ty: result_ty,
-					span,
+					ImplNode::Native => Expression {
+						kind: ExprKind::Binary {
+							operator: binary_op,
+							left: Box::new(left),
+							right: Box::new(right),
+						},
+						ty: result_ty,
+						span,
+					},
 				}
 			}
 			Some(OperatorMethod::Default(func_idx)) => {
@@ -945,23 +973,20 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			(l, r) if l.is_comptime_number() && r.is_comptime_number() => {
-				// Both operands untyped: no concrete type, so no method to
-				// dispatch to yet. Mirror `build_arithmetic_expr`'s equivalent
-				// arm — coerce to the expected type when one is known and hand
-				// off to `build_operator_dispatch` (which stays a plain
-				// `Binary` node in `Comptime` mode, still directly foldable,
-				// and becomes a `MethodCall` at runtime), or require an
-				// annotation when nothing pins the type down.
+				// Both operands untyped: no concrete type yet to decide
+				// native-vs-dispatch with. Coerce to the expected type when
+				// one is known and hand off to the shared decision point
+				// (`dispatch_binary_op`), or require an annotation when
+				// nothing pins the type down.
 				if access_ctx.expected_type != TypeIndex::INFER {
 					let expected_type = access_ctx.expected_type;
 					self.coerce_untyped_expr(ctx, &mut left, expected_type)?;
 					self.coerce_untyped_expr(ctx, &mut right, expected_type)?;
-					Ok(self.build_operator_dispatch(
+					Ok(self.dispatch_binary_op(
 						ctx,
 						operator,
 						left,
 						right,
-						expected_type,
 						expected_type,
 						expr.span,
 					))
@@ -974,20 +999,19 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(l, right_type) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, right_type)?;
-				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, right_type, right_type,
-					expr.span,
+				Ok(self.dispatch_binary_op(
+					ctx, operator, left, right, right_type, expr.span,
 				))
 			}
 			(left_type, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, left_type)?;
-				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, left_type, left_type, expr.span,
+				Ok(self.dispatch_binary_op(
+					ctx, operator, left, right, left_type, expr.span,
 				))
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
-				.build_operator_dispatch(
-					ctx, operator, left, right, left_type, left_type, expr.span,
+				.dispatch_binary_op(
+					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
@@ -1068,6 +1092,56 @@ impl<'ast> Builder<'ast, '_> {
 			ty: TypeIndex::BOOL,
 			span,
 		}
+	}
+
+	/// The single decision point `build_arithmetic_expr` and
+	/// `build_bitwise_binary_expr` route every one of their "operands are
+	/// now concretely typed `ty`" arms through — including the
+	/// untyped-literal arms, once `coerce_untyped_expr` has pinned the
+	/// literal down, so `1 + x` gets the native `Binary` path (see
+	/// `ImplNode`) exactly like `y + x` does.
+	///
+	/// Eligibility (inlined below rather than its own predicate, having only
+	/// this one call site) is the single source of truth for arithmetic's
+	/// `is_numeric()` and bitwise's integer-or-`bool` (`&`/`|`/`^`) /
+	/// integer-only (`<<`/`>>`) split: every numeric primitive implements
+	/// the five arithmetic traits directly, every integer primitive (plus
+	/// `bool`, whose `impl BitAnd`/`BitOr`/`BitXor` exist so `&`/`|`/`^`
+	/// work as `&&`/`||`'s eager, non-short-circuit siblings) implements the
+	/// bitwise ones, and none implement shifting except integers. `false`
+	/// for any other operator or type (structs, `char`, float bitwise, ...)
+	/// falls through to `ImplNode::MethodCall`.
+	fn dispatch_binary_op(
+		&mut self,
+		ctx: &ExprContext,
+		operator: Spanned<ast::BinaryOp>,
+		left: Expression,
+		right: Expression,
+		ty: TypeIndex,
+		span: ast::TextSpan,
+	) -> Expression {
+		let eligible = match operator.inner {
+			ast::BinaryOp::Add
+			| ast::BinaryOp::Sub
+			| ast::BinaryOp::Mul
+			| ast::BinaryOp::Div
+			| ast::BinaryOp::Rem => ty.is_numeric(),
+			ast::BinaryOp::BitAnd
+			| ast::BinaryOp::BitOr
+			| ast::BinaryOp::BitXor => ty.is_integer() || ty == TypeIndex::BOOL,
+			ast::BinaryOp::LeftShift | ast::BinaryOp::RightShift => {
+				ty.is_integer()
+			}
+			_ => false,
+		};
+		let impl_node = if eligible {
+			ImplNode::Native
+		} else {
+			ImplNode::MethodCall
+		};
+		self.build_operator_dispatch(
+			ctx, operator, left, right, ty, ty, span, impl_node,
+		)
 	}
 
 	fn build_comparison_binary_expr(
@@ -1169,9 +1243,9 @@ impl<'ast> Builder<'ast, '_> {
 						operator.inner,
 						ast::BinaryOp::Eq | ast::BinaryOp::NotEq
 					) && matches!(
-						self.types.resolve(left_type),
-						Type::Enum { .. }
-					) =>
+					self.types.resolve(left_type),
+					Type::Enum { .. }
+				) =>
 			{
 				Ok(self.native_comparison(
 					ctx, operator, left, right, left_type, expr.span,
@@ -1211,6 +1285,7 @@ impl<'ast> Builder<'ast, '_> {
 					left_type,
 					TypeIndex::BOOL,
 					expr.span,
+					ImplNode::MethodCall,
 				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
@@ -1915,14 +1990,14 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			(l, ty) if l.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut left, ty)?;
-				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, ty, ty, expr.span,
+				Ok(self.dispatch_binary_op(
+					ctx, operator, left, right, ty, expr.span,
 				))
 			}
 			(ty, r) if r.is_comptime_number() => {
 				self.coerce_untyped_expr(ctx, &mut right, ty)?;
-				Ok(self.build_operator_dispatch(
-					ctx, operator, left, right, ty, ty, expr.span,
+				Ok(self.dispatch_binary_op(
+					ctx, operator, left, right, ty, expr.span,
 				))
 			}
 			(l, _) if l == TypeIndex::NEVER => {
@@ -1940,8 +2015,8 @@ impl<'ast> Builder<'ast, '_> {
 				Ok(right)
 			}
 			(left_type, right_type) if left_type == right_type => Ok(self
-				.build_operator_dispatch(
-					ctx, operator, left, right, left_type, left_type, expr.span,
+				.dispatch_binary_op(
+					ctx, operator, left, right, left_type, expr.span,
 				)),
 			(left_type, right_type) => {
 				self.diagnostics.push(report_binary_expression_mistmatch(
