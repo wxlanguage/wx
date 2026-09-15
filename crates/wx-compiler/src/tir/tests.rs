@@ -450,7 +450,7 @@ fn test_group_prefix_is_walked_once() {
 		panic!("`math` should have resolved")
 	};
 	assert_eq!(
-		case.tir.modules.namespaces[usize::from(math_ns)]
+		case.tir.defs.namespaces[usize::from(math_ns)]
 			.accesses
 			.len(),
 		1,
@@ -885,8 +885,8 @@ fn test_glob_import_records_its_path_span() {
 	);
 	no_errors(&case);
 
-	let root = case.tir.modules.file_namespaces[1];
-	let spelled: Vec<&str> = case.tir.modules.namespaces[usize::from(root)]
+	let root = case.tir.defs.file_namespaces[1];
+	let spelled: Vec<&str> = case.tir.defs.namespaces[usize::from(root)]
 		.wildcard_imports
 		.iter()
 		.map(|import| {
@@ -2123,7 +2123,7 @@ fn test_imported_global() {
 			.all(|g| case.tir.is_import_namespace(g.namespace))
 	);
 	// They appear in the import_decl lookup.
-	let decl = &case.tir.modules.import_decls[0];
+	let decl = &case.tir.defs.import_decls[0];
 	assert_eq!(decl.lookup.len(), 2);
 }
 
@@ -2907,6 +2907,59 @@ fn test_primitive_equality_operator_records_access_for_hover() {
 			"ne",
 		),
 		"expected a `PartialEq::ne` access at the `!=` span",
+	);
+}
+
+/// A typeset-bounded associated type (e.g. `Mem::Size: Sub + Add + Div`,
+/// mirroring `PointerSize: Mul + UnsignedInt`) has no bound implying
+/// `PartialEq`, so `==` must go through the same
+/// `abstract_operand_defers_operator` check arithmetic uses — a typeset bound
+/// alone does not imply comparison is supported.
+#[test]
+fn test_typeset_bounded_assoc_type_equality_without_partial_eq_bound_reports_diagnostic()
+ {
+	let case = TestCase::new(indoc! {"
+        fn eq_check<Mem: Memory where { Size: Sub + Add + Div }>(a: Mem::Size, b: Mem::Size) -> bool {
+            a == b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 for `Mem::Size == Mem::Size` with no `PartialEq` bound, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// Once the bound actually implies `PartialEq`, `==` on a typeset-bounded
+/// associated type defers to a `GenericMethodCall` (same as `+` on a
+/// `T: Add` type param) and records the operator span as an access against
+/// `PartialEq::eq`, so hover / go-to-definition work.
+#[test]
+fn test_typeset_bounded_assoc_type_equality_with_partial_eq_bound_dispatches_and_records_access()
+ {
+	let src = indoc! {"
+        fn eq_check<Mem: Memory where { Size: Sub + Add + Div + PartialEq }>(a: Mem::Size, b: Mem::Size) -> bool {
+            a == b
+        }
+    "};
+	let case = TestCase::new(src);
+	no_errors(&case);
+
+	let op_start = src.find("==").unwrap() as u32;
+	let method_sym = case.graph.interner.get("eq").unwrap();
+	assert!(
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == method_sym
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		}),
+		"expected a `PartialEq::eq` access at the `==` span",
 	);
 }
 
@@ -3930,12 +3983,15 @@ fn test_struct_fields_kept_in_declaration_order() {
 			}
 		})
 		.unwrap();
-	let field_names: Vec<&str> = case.tir.items.structs
-		[usize::from(struct_index)]
-	.fields
-	.iter()
-	.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
-	.collect();
+	let StructKind::Record { fields, .. } =
+		&case.tir.items.structs[usize::from(struct_index)].fields
+	else {
+		panic!("expected record struct")
+	};
+	let field_names: Vec<&str> = fields
+		.iter()
+		.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
+		.collect();
 	assert_eq!(field_names, vec!["a", "b", "c", "d"]);
 }
 
@@ -6789,14 +6845,17 @@ fn test_generic_struct_field_type_is_type_param() {
 		.iter()
 		.find(|s| case.graph.interner.resolve(s.name.inner) == Some("Wrapper"))
 		.expect("Wrapper struct not found");
+	let StructKind::Record { fields, .. } = &s.fields else {
+		panic!("expected record struct")
+	};
 	// Field `value` should have type TypeParam { param_index: 0 }.
 	assert!(
 		matches!(
-			case.tir.types.resolve(s.fields[0].ty.inner),
+			case.tir.types.resolve(fields[0].ty.inner),
 			Type::TypeParam { param_index: 0, .. }
 		),
 		"expected TypeParam, got {:?}",
-		case.tir.types.resolve(s.fields[0].ty.inner)
+		case.tir.types.resolve(fields[0].ty.inner)
 	);
 }
 
@@ -7896,8 +7955,8 @@ fn test_assoc_type_declared_in_trait() {
 
 	assert!(
 		matches!(
-			container_trait.members.get(&elem_sym),
-			Some(MemberIndex::AssociatedType(_))
+			container_trait.bindings.get(&elem_sym),
+			Some(TraitMemberKind::AssociatedType(_))
 		),
 		"expected 'Elem' in Container::members as AssociatedType"
 	);
@@ -7910,7 +7969,7 @@ fn test_assoc_type_declared_in_trait() {
 	);
 	assert_eq!(
 		item.id,
-		container_trait.members[&elem_sym].id(&case.tir.items)
+		container_trait.bindings[&elem_sym].id(&case.tir.items)
 	);
 	assert_eq!(item.file_id, container_trait.file_id);
 	assert_eq!(item.bounds.traits.len(), 1);
@@ -12068,7 +12127,7 @@ fn test_typeset_generates_backing_trait_with_member_impls() {
 	let backing = &case.tir.items.traits[usize::from(ts.trait_index)];
 	assert_eq!(backing.typeset_index, case.tir.items.typeset_index(ts.id));
 	// Empty trait, reflexive `Self: Numbers` bound only (no clause).
-	assert!(backing.members.is_empty());
+	assert!(backing.bindings.is_empty());
 	assert_eq!(backing.self_type_param.bounds.traits.len(), 1);
 	// A synthetic `impl` of the backing trait for each member.
 	assert!(
@@ -12414,13 +12473,13 @@ fn test_type_position_inline_module_registers_module_access() {
 	no_errors(&case);
 	assert!(
 		case.tir
-			.modules
+			.defs
 			.namespaces
 			.iter()
 			.any(|ns| !ns.accesses.is_empty()),
 		"expected at least one access registered on a namespace, got: {:?}",
 		case.tir
-			.modules
+			.defs
 			.namespaces
 			.iter()
 			.map(|ns| ns.accesses.len())
@@ -15731,7 +15790,7 @@ fn test_qualified_bound_namespace_segment_records_access() {
 
 	let has_namespace_access = case
 		.tir
-		.modules
+		.defs
 		.namespaces
 		.iter()
 		.any(|ns| !ns.accesses.is_empty());

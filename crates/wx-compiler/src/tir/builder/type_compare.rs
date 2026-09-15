@@ -186,7 +186,6 @@ fn is_env_independent(ty: &Type) -> bool {
 			| Type::Bool
 			| Type::Char
 			| Type::Enum { .. }
-			| Type::Namespace { .. }
 			| Type::Memory { .. }
 			| Type::AssociatedType { .. }
 	)

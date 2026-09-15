@@ -259,7 +259,7 @@ items:
       end: 136
   - inner:
       inner:
-        Struct:
+        RecordStruct:
           id: 4
           pub_span: ~
           attributes: []

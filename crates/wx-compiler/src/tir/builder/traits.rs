@@ -32,7 +32,7 @@ impl<'ast> Builder<'ast, '_> {
 			let imp = &self.items.trait_impls[usize::from(trait_impl_index)];
 			let span = SourceSpan::new(imp.file_id, imp.span);
 			let type_str = self
-				.formatter(self.modules.file_namespaces[imp.file_id.as_usize()])
+				.formatter(self.defs.file_namespaces[imp.file_id.as_usize()])
 				.display_type(target_type)
 				.unwrap();
 			self.diagnostics.push(Diagnostic {
@@ -99,8 +99,8 @@ impl<'ast> Builder<'ast, '_> {
 			// reader is looking at. Members the impl doesn't provide emit
 			// nothing here (they accumulate into `missing_items`, reported
 			// once and sorted separately), so where they land is irrelevant.
-			let mut members: Vec<(SymbolU32, MemberIndex)> =
-				trait_def.members.iter().map(|(&n, &m)| (n, m)).collect();
+			let mut members: Vec<(SymbolU32, TraitMemberKind)> =
+				trait_def.bindings.iter().map(|(&n, &m)| (n, m)).collect();
 			members.sort_unstable_by_key(|(name, _)| {
 				trait_impl.members.get(name).map_or(u32::MAX, |entry| {
 					entry.def_span(&self.items).span.start
@@ -175,7 +175,7 @@ impl<'ast> Builder<'ast, '_> {
 										items: &self.items,
 										interner: self.interner,
 									},
-									&self.modules,
+									&self.defs,
 									self.packages,
 								)
 								.check_assoc_value(
@@ -292,7 +292,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 
 			for (&name, &impl_entry) in trait_impl.members.iter() {
-				if !trait_def.members.contains_key(&name) {
+				if !trait_def.bindings.contains_key(&name) {
 					let trait_name =
 						self.interner.resolve(trait_def.name.inner).unwrap();
 					let item_name = self.interner.resolve(name).unwrap();
@@ -501,7 +501,7 @@ impl<'ast> Builder<'ast, '_> {
 			type_params: signature
 				.type_params
 				.iter()
-				.map(|tp| TypeParamInfo::new(tp.name))
+				.map(|tp| TypeParamDef::new(tp.name))
 				.collect(),
 			inherited_type_param_count,
 			pub_span: *pub_span,
@@ -823,7 +823,7 @@ impl<'ast> Builder<'ast, '_> {
 			| ImplTarget::Bool
 			| ImplTarget::Char => return self.stdlib_package,
 		};
-		self.modules.namespaces[usize::from(namespace)].package
+		self.defs.namespaces[usize::from(namespace)].package_id
 	}
 
 	/// An inherent `impl` may only be written in the package that defines its
@@ -843,12 +843,12 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		resolve_context: ResolveContext,
 		target: ImplTarget,
-		span: ast::TextSpan,
+		span: TextSpan,
 	) {
 		let target_package = self.impl_target_package(target);
-		let declaring_package = self.modules.namespaces
+		let declaring_package = self.defs.namespaces
 			[usize::from(resolve_context.namespace)]
-		.package;
+		.package_id;
 		if target_package == declaring_package {
 			return;
 		}
@@ -1095,8 +1095,7 @@ impl<'ast> Builder<'ast, '_> {
 			None => Bounds::default(),
 		};
 
-		let name_span =
-			self.items.traits[usize::from(backing_trait)].name.span;
+		let name_span = self.items.traits[usize::from(backing_trait)].name.span;
 		let mut traits = Vec::with_capacity(1 + clause.traits.len());
 		traits.push(TraitBound {
 			trait_index: backing_trait,
@@ -1104,8 +1103,8 @@ impl<'ast> Builder<'ast, '_> {
 			span: name_span,
 		});
 		traits.extend(clause.traits.iter().cloned());
-		let self_param = &mut self.items.traits[usize::from(backing_trait)]
-			.self_type_param;
+		let self_param =
+			&mut self.items.traits[usize::from(backing_trait)].self_type_param;
 		self_param.bounds.traits = traits.into_boxed_slice();
 
 		// Resolve each clause trait's own supertrait chain so `trait_implies`
@@ -1120,7 +1119,7 @@ impl<'ast> Builder<'ast, '_> {
 		// member's type expression so any such diagnostic lands there.
 		for member in members {
 			let impl_index = self.items.push_trait_impl(TraitImpl {
-				id: self.id_generator.generate(),
+				id: self.id_generator.next(),
 				trait_index: backing_trait,
 				type_params: Box::new([]),
 				target: Spanned {
@@ -1134,11 +1133,7 @@ impl<'ast> Builder<'ast, '_> {
 				namespace: resolve_context.namespace,
 				self_accesses: Vec::new(),
 			});
-			self.register_trait_impl(
-				member.inner,
-				backing_trait,
-				impl_index,
-			);
+			self.register_trait_impl(member.inner, backing_trait, impl_index);
 		}
 	}
 
@@ -1161,9 +1156,9 @@ impl<'ast> Builder<'ast, '_> {
 		if let ast::TraitItem::Function { id, signature, .. } = item {
 			// `Self` is owned by the trait; the function inherits it via
 			// type_param_parent so type_params holds only explicit params.
-			let MemberIndex::Function(func_index) = self.items.traits
+			let TraitMemberKind::Function(func_index) = self.items.traits
 				[usize::from(trait_index)]
-			.members[&signature.name.inner] else {
+			.bindings[&signature.name.inner] else {
 				unreachable!()
 			};
 
@@ -1258,9 +1253,9 @@ impl<'ast> Builder<'ast, '_> {
 				},
 				None => (None, None),
 			};
-			let MemberIndex::Constant(index) = self.items.traits
+			let TraitMemberKind::Constant(index) = self.items.traits
 				[usize::from(trait_index)]
-			.members[&name.inner] else {
+			.bindings[&name.inner] else {
 				unreachable!()
 			};
 			let constant = &mut self.items.constants[usize::from(index)];
@@ -1301,9 +1296,8 @@ impl<'ast> Builder<'ast, '_> {
 		// A `typeset` is sealed: its member set is closed at its declaration
 		// and the compiler generates every impl. A hand-written
 		// `impl SomeTypeset for T` would breach that guarantee.
-		if let Some(typeset_index) = self.items.traits
-			[usize::from(trait_index)]
-		.typeset_index
+		if let Some(typeset_index) =
+			self.items.traits[usize::from(trait_index)].typeset_index
 		{
 			let name = self.interner.resolve(
 				self.items.typesets[usize::from(typeset_index)].name.inner,
@@ -1341,7 +1335,7 @@ impl<'ast> Builder<'ast, '_> {
 			trait_index,
 			type_params: type_params
 				.iter()
-				.map(|tp| TypeParamInfo::new(tp.name))
+				.map(|tp| TypeParamDef::new(tp.name))
 				.collect(),
 			target: Spanned {
 				inner: TypeIndex::ERROR,
@@ -1518,7 +1512,7 @@ impl<'ast> Builder<'ast, '_> {
 				type_params: signature
 					.type_params
 					.iter()
-					.map(|tp| TypeParamInfo::new(tp.name))
+					.map(|tp| TypeParamDef::new(tp.name))
 					.collect(),
 				inherited_type_param_count,
 				pub_span: *pub_span,
@@ -1682,8 +1676,8 @@ impl<'ast> Builder<'ast, '_> {
 				self_type: Some(self_type_param),
 			};
 
-			let MemberIndex::AssociatedType(assoc_type_index) =
-				self.items.traits[usize::from(trait_index)].members
+			let TraitMemberKind::AssociatedType(assoc_type_index) =
+				self.items.traits[usize::from(trait_index)].bindings
 					[&name.inner]
 			else {
 				unreachable!()

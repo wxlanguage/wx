@@ -15,7 +15,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// restriction. Recursive calls propagate `Err(())` via `?` without pushing a
 	/// diagnostic; only the top-level call site reports one.
 	///
-	/// `Const`/`NamespaceAccess` references read the referenced constant's own
+	/// `Const`/`AbstractConstAccess` references read the referenced constant's own
 	/// already-cached `const_value` rather than re-walking its expression tree, so a
 	/// chain of const-on-const arithmetic stays linear instead of blowing up.
 	pub(super) fn eval_const_expr(
@@ -244,14 +244,17 @@ impl<'ast> Builder<'ast, '_> {
 					_ => Err(()),
 				}
 			}
-			ExprKind::Const { id } => {
+			// `AbstractConstAccess` names a trait's own const declaration
+			// (see its doc comment) — reads the same `const_value` a bare
+			// `Const` would, same as before this was ever wrapped in
+			// `NamespaceAccess`: whether that's precise for a receiver
+			// whose concrete impl overrides the trait's default is a
+			// pre-existing question, unchanged here.
+			ExprKind::Const { id } | ExprKind::AbstractConstAccess { id, .. } => {
 				let const_index = self.items.expect_const_index(*id);
 				self.items.constants[usize::from(const_index)]
 					.const_value
 					.ok_or(())
-			}
-			ExprKind::NamespaceAccess { member, .. } => {
-				self.eval_const_expr(member)
 			}
 			_ => Err(()),
 		}
@@ -460,7 +463,6 @@ impl<'ast> Builder<'ast, '_> {
 			| Type::FunctionItem { .. }
 			| Type::Struct { .. }
 			| Type::Slice { .. }
-			| Type::Namespace { .. }
 			| Type::Memory { .. }
 			| Type::TypeParam { .. }
 			| Type::Error

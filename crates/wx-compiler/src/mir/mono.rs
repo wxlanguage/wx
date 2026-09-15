@@ -29,7 +29,7 @@ impl MonoRegistry {
 	}
 
 	pub(super) fn generate_id(&mut self) -> ast::DefId {
-		self.id_generator.generate()
+		self.id_generator.next()
 	}
 
 	pub(super) fn get_or_insert(
@@ -40,7 +40,7 @@ impl MonoRegistry {
 		match self.map.entry((original_id, type_args)) {
 			Entry::Occupied(entry) => *entry.get(),
 			Entry::Vacant(entry) => {
-				let mono_id = self.id_generator.generate();
+				let mono_id = self.id_generator.next();
 				// The map keeps the original allocation. Only the pending
 				// work item needs a separate owned copy.
 				let type_args = entry.key().1.clone();

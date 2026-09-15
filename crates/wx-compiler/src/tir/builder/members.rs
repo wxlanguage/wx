@@ -23,7 +23,7 @@ impl<'ast> Builder<'ast, '_> {
 		span: SourceSpan,
 	) -> Result<Option<ImplEntry>, ()> {
 		let Some(member) = self.items.traits[usize::from(trait_index)]
-			.members
+			.bindings
 			.get(&name)
 			.copied()
 		else {
@@ -32,7 +32,7 @@ impl<'ast> Builder<'ast, '_> {
 		let id = member.id(&self.items);
 		let status = self.ensure_signature(id);
 		if status == SignatureStatus::Cycle
-			&& !matches!(member, MemberIndex::AssociatedType(_))
+			&& !matches!(member, TraitMemberKind::AssociatedType(_))
 		{
 			self.report_cyclic_type_dependency(id, span);
 			return Err(());
@@ -89,18 +89,18 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		receiver: TypeIndex,
 		name: SymbolU32,
-		namespace: Option<SymbolNamespace>,
+		namespace: Option<BindingNamespace>,
 		span: SourceSpan,
 	) -> Result<CandidateSelection<TraitMemberCandidate>, ()> {
 		let mut candidates = CandidateSet::new();
 		for trait_index in self.bound_traits(receiver) {
 			let Some(member) = self.items.traits[usize::from(trait_index)]
-				.members
+				.bindings
 				.get(&name)
 			else {
 				continue;
 			};
-			if namespace.is_some_and(|ns| ns != member.namespace()) {
+			if namespace.is_some_and(|ns| ns != member.binding_namespace()) {
 				continue;
 			}
 			if let Some(entry) =

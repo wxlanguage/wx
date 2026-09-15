@@ -18,25 +18,104 @@ impl<'ast> Builder<'ast, '_> {
 			_ => unreachable!(),
 		};
 
-		// A callee that failed outright becomes an error-typed expression
-		// rather than propagating `Err`, so it lands in the non-function `_`
-		// arm below — which already builds the arguments (so mistakes inside
-		// the argument list still get reported) and already stays silent
-		// about the callee itself once its type is `ERROR`.
-		let callee = self
-			.build_expression(
-				ctx,
-				AccessContext {
-					expected_type: TypeIndex::INFER,
-					access_kind: AccessKind::Read,
-				},
-				ast_callee,
-			)
-			.unwrap_or(Expression {
-				kind: ExprKind::Error,
-				ty: TypeIndex::ERROR,
-				span: ast_callee.span,
-			});
+		// `Point(1, 2)` reuses call syntax to construct a tuple struct
+		// positionally — `Point` is never a real value (it reserves the
+		// Value namespace only so a colliding `fn Point` is an ordinary
+		// duplicate-definition error, not a silent ambiguity). Checked
+		// before the callee is built as a value expression below, via the
+		// general `resolve_symbol_and_type_args` (not a struct-specific
+		// resolver — reusable for any future callable-via-call-syntax
+		// symbol kind): if the resolved symbol isn't a tuple-kind struct,
+		// nothing is reported and the callee gets built normally,
+		// re-resolving the same path exactly as today (cheap — signature
+		// forcing is idempotent — and every other diagnostic stays as-is).
+		// `Err(())` means a cycle/broken qualifier was *already* reported
+		// inside the resolver — building the callee normally in that case
+		// would re-resolve the same path and report the same error a
+		// second time, so it's poisoned to `ERROR` instead and handed to
+		// the non-function-callee arm below, which already knows to build
+		// (and report on) the arguments while staying silent about an
+		// `ERROR`-typed callee.
+		let callee = if let ast::Expression::Path(path) = &ast_callee.inner {
+			match self.resolve_symbol_and_type_args(ctx, path) {
+				Ok(Some((DefKind::Struct { struct_index }, type_args)))
+					if matches!(
+						self.items.structs[usize::from(struct_index)].fields,
+						StructKind::Tuple { .. }
+					) =>
+				{
+					let type_params_len = self.items.structs
+						[usize::from(struct_index)]
+					.type_params
+					.len();
+					if !type_args.is_empty()
+						&& type_args.len() != type_params_len
+					{
+						self.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::TypeArgCountMismatch.code(),
+								)
+								.with_message(format!(
+									"expected {} type argument{}, found {}",
+									type_params_len,
+									if type_params_len == 1 { "" } else { "s" },
+									type_args.len()
+								))
+								.with_label(
+									SourceSpan::new(
+										ctx.resolve_context.file_id,
+										ast_callee.span,
+									)
+									.primary_label()
+									.with_message(
+										"wrong number of type arguments",
+									),
+								),
+						);
+					}
+					let padded: Box<[TypeIndex]> = type_args
+						.iter()
+						.copied()
+						.chain(std::iter::repeat(TypeIndex::INFER))
+						.take(type_params_len)
+						.collect();
+					return self.build_tuple_struct_call_expression(
+						ctx,
+						struct_index,
+						padded,
+						arguments,
+						access_ctx.expected_type,
+						expr.span,
+					);
+				}
+				Err(()) => Some(Expression {
+					kind: ExprKind::Error,
+					ty: TypeIndex::ERROR,
+					span: ast_callee.span,
+				}),
+				Ok(_) => None,
+			}
+		} else {
+			None
+		};
+		let callee = match callee {
+			Some(callee) => callee,
+			None => self
+				.build_expression(
+					ctx,
+					AccessContext {
+						expected_type: TypeIndex::INFER,
+						access_kind: AccessKind::Read,
+					},
+					ast_callee,
+				)
+				.unwrap_or(Expression {
+					kind: ExprKind::Error,
+					ty: TypeIndex::ERROR,
+					span: ast_callee.span,
+				}),
+		};
 		let signature = match self.types.resolve(callee.ty) {
 			Type::Function { signature } => signature.clone(),
 			Type::FunctionItem { id, .. } => {
@@ -129,13 +208,6 @@ impl<'ast> Builder<'ast, '_> {
 
 		let direct_id = match &callee.kind {
 			ExprKind::Function { id } => Some(*id),
-			ExprKind::NamespaceAccess { member, .. } => {
-				if let ExprKind::Function { id } = &member.kind {
-					Some(*id)
-				} else {
-					None
-				}
-			}
 			_ => None,
 		};
 		if let Some(callee_id) = direct_id {

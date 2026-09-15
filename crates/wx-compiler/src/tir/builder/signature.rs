@@ -3,7 +3,7 @@
 //! aliases, enums, functions, typesets, globals, consts, `import` declarations
 //! and the `export { .. }` block.
 
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, TextSpan};
 
 use super::*;
 
@@ -39,17 +39,17 @@ impl<'ast> Builder<'ast, '_> {
 		let resolve_context = ResolveContext::new(file_id, namespace);
 
 		match node {
-			AstNodeRef::Struct { item } => {
-				let (id, name, ast_type_params, fields, pub_span) = match item {
-					ast::Item::Struct {
-						id,
-						name,
-						type_params,
-						fields,
-						pub_span,
-						..
-					} => (id, name, type_params, fields, pub_span),
-					_ => unreachable!(),
+			AstNodeRef::RecordStruct { item } => {
+				let ast::Item::RecordStruct {
+					id,
+					name,
+					type_params: ast_type_params,
+					fields,
+					pub_span,
+					..
+				} = item
+				else {
+					unreachable!()
 				};
 				let struct_index = self.items.expect_struct_index(*id);
 				// Bind the name now, before resolving fields, exactly like
@@ -61,12 +61,12 @@ impl<'ast> Builder<'ast, '_> {
 				// duplicate itself, if it never held the slot to begin
 				// with), skip the bind: this struct still gets its fields
 				// fully resolved below, it just never becomes referenceable.
-				let key = (SymbolNamespace::Type, name.inner);
+				let key = (BindingNamespace::Type, name.inner);
 				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
-						SymbolKind::Struct { struct_index },
+						DefKind::Struct { struct_index },
 						*pub_span,
 					);
 				}
@@ -89,7 +89,7 @@ impl<'ast> Builder<'ast, '_> {
 				// Resolve all field types. Referenced structs that haven't been
 				// seen yet are pulled in demand-driven via ensure_signature.
 				let field_count = fields.len();
-				let mut seen_fields: HashMap<SymbolU32, ast::TextSpan> =
+				let mut seen_fields: HashMap<SymbolU32, TextSpan> =
 					HashMap::with_capacity(field_count);
 				let mut tir_fields: Vec<StructField> =
 					Vec::with_capacity(field_count);
@@ -135,9 +135,10 @@ impl<'ast> Builder<'ast, '_> {
 
 				// Fill in the placeholder now that all field types are resolved.
 				self.items.structs[usize::from(struct_index)].fields =
-					tir_fields.into_boxed_slice();
-				self.items.structs[usize::from(struct_index)].lookup =
-					field_lookup;
+					StructKind::Record {
+						fields: tir_fields.into_boxed_slice(),
+						lookup: field_lookup,
+					};
 
 				// Check for direct (non-pointer) self-recursion. Cycles through
 				// generic struct instantiation are not caught here — see TODO in
@@ -146,6 +147,114 @@ impl<'ast> Builder<'ast, '_> {
 					struct_index,
 					SourceSpan::new(resolve_context.file_id, name.span),
 				);
+			}
+			AstNodeRef::TupleStruct { item } => {
+				let ast::Item::TupleStruct {
+					id,
+					name,
+					type_params: ast_type_params,
+					fields,
+					pub_span,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let struct_index = self.items.expect_struct_index(*id);
+				let key = (BindingNamespace::Type, name.inner);
+				if self.still_pending(resolve_context.namespace, key, *id) {
+					self.insert_symbol(
+						resolve_context.namespace,
+						key,
+						DefKind::Struct { struct_index },
+						*pub_span,
+					);
+				}
+				self.resolve_type_param_bounds(
+					resolve_context,
+					TypeParamOwner::Struct(*id),
+					None,
+					ast_type_params,
+				);
+				let field_scope = if ast_type_params.is_empty() {
+					None
+				} else {
+					Some(GenericScope {
+						owner: TypeParamOwner::Struct(*id),
+						self_type: None,
+					})
+				};
+
+				// No name-keyed dedup/lookup to build — a tuple field has no
+				// name, so there is nothing for two fields to collide on.
+				let tir_fields: Box<[TupleFieldInfo]> = fields
+					.iter()
+					.map(|f| {
+						let field = &f.inner.inner;
+						let field_ty = self.resolve_signature_type(
+							resolve_context,
+							field_scope,
+							&field.ty,
+						);
+						TupleFieldInfo {
+							ty: Spanned {
+								inner: field_ty,
+								span: field.ty.span,
+							},
+							pub_span: field.pub_span,
+							accesses: Vec::new(),
+						}
+					})
+					.collect();
+
+				// Construction always supplies every field at once, so
+				// there's no such thing as constructing around just the
+				// private ones — if even one field isn't `pub`, the whole
+				// constructor has to be off-limits from outside the
+				// declaring module. Rather than re-deriving that as a
+				// bespoke per-field check inside the call builder, it's
+				// expressed directly as the Value-namespace binding's own
+				// visibility below: never more visible than the struct
+				// itself, and private regardless of the struct's own
+				// visibility if any field is private. Ordinary privacy
+				// checking on that symbol
+				// (`resolve_pending_namespace_symbol`/`resolve_pending_global_symbol`,
+				// both already exercised by `resolve_symbol_and_type_args`)
+				// then rejects an inaccessible call for free, with the same
+				// diagnostic every other private item gets.
+				let all_fields_pub =
+					tir_fields.iter().all(|f| f.pub_span.is_some());
+				let value_visibility =
+					if all_fields_pub { *pub_span } else { None };
+
+				self.items.structs[usize::from(struct_index)].fields =
+					StructKind::Tuple { fields: tir_fields };
+
+				self.check_struct_fields_for_direct_recursion(
+					struct_index,
+					SourceSpan::new(resolve_context.file_id, name.span),
+				);
+
+				// `Point` also claims the Value namespace, using the same
+				// `SymbolKind::Struct` as the Type-namespace claim above —
+				// not because a tuple struct is a real value, but purely for
+				// collision safety, so a colliding `fn Point` becomes an
+				// ordinary duplicate-definition error (E2005) rather than a
+				// silent, lookup-order-dependent ambiguity at a call site.
+				// `Point(1, 2)` never actually reaches this binding through
+				// ordinary value resolution — `build_call_expression`'s
+				// tuple-struct-call pre-check intercepts the callee path
+				// before that would happen (see `calls.rs`).
+				let value_key = (BindingNamespace::Value, name.inner);
+				if self.still_pending(resolve_context.namespace, value_key, *id)
+				{
+					self.insert_symbol(
+						resolve_context.namespace,
+						value_key,
+						DefKind::Struct { struct_index },
+						value_visibility,
+					);
+				}
 			}
 			AstNodeRef::TypeAlias { item } => {
 				let (id, name, ast_type_params, body_expr, pub_span) =
@@ -218,12 +327,12 @@ impl<'ast> Builder<'ast, '_> {
 				// Bind the name only if this occurrence still holds its own
 				// `Pending` slot — see the identical comment on the Struct
 				// branch.
-				let key = (SymbolNamespace::Type, name.inner);
+				let key = (BindingNamespace::Type, name.inner);
 				if self.still_pending(resolve_context.namespace, key, *id) {
 					self.insert_symbol(
 						resolve_context.namespace,
 						key,
-						SymbolKind::TypeAlias { type_alias_index },
+						DefKind::TypeAlias { type_alias_index },
 						*pub_span,
 					);
 				}
@@ -250,12 +359,12 @@ impl<'ast> Builder<'ast, '_> {
 					// Bind the name only if this occurrence still holds its
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
-					let key = (SymbolNamespace::Type, name.inner);
+					let key = (BindingNamespace::Type, name.inner);
 					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
-							SymbolKind::Enum { enum_index },
+							DefKind::Enum { enum_index },
 							*pub_span,
 						);
 					}
@@ -300,12 +409,12 @@ impl<'ast> Builder<'ast, '_> {
 					// Bind the name only if this occurrence still holds its
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
-					let key = (SymbolNamespace::Value, signature.name.inner);
+					let key = (BindingNamespace::Value, signature.name.inner);
 					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
-							SymbolKind::Function { func_index },
+							DefKind::Function { func_index },
 							*pub_span,
 						);
 					}
@@ -385,7 +494,8 @@ impl<'ast> Builder<'ast, '_> {
 						// bare pointers and function types; primitives, `bool`,
 						// `char`, slices, arrays, structs, enums and memories
 						// all pass.
-						if ImplTarget::from_type(self.types.resolve(ty)).is_err()
+						if ImplTarget::from_type(self.types.resolve(ty))
+							.is_err()
 						{
 							self.diagnostics.push(
 								Diagnostic::error()
@@ -475,12 +585,12 @@ impl<'ast> Builder<'ast, '_> {
 					// Bind the name only if this occurrence still holds its
 					// own `Pending` slot — see the identical comment on the
 					// Struct branch.
-					let key = (SymbolNamespace::Value, name.inner);
+					let key = (BindingNamespace::Value, name.inner);
 					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
-							SymbolKind::Global { global_index },
+							DefKind::Global { global_index },
 							*pub_span,
 						);
 					}
@@ -564,12 +674,12 @@ impl<'ast> Builder<'ast, '_> {
 					// why the value failed, and `wx-cli` aborts before
 					// `MIR::build` whenever TIR carries any error, so the
 					// value-less stub never reaches lowering.
-					let key = (SymbolNamespace::Value, name.inner);
+					let key = (BindingNamespace::Value, name.inner);
 					if self.still_pending(resolve_context.namespace, key, *id) {
 						self.insert_symbol(
 							resolve_context.namespace,
 							key,
-							SymbolKind::Const { const_index },
+							DefKind::Const { const_index },
 							*pub_span,
 						);
 					}
@@ -588,7 +698,7 @@ impl<'ast> Builder<'ast, '_> {
 						signature,
 					);
 					let signature_index = self.intern_function(&params, result);
-					let import_ns_idx = self.modules.import_decls
+					let import_ns_idx = self.defs.import_decls
 						[usize::from(import_module_index)]
 					.namespace_idx;
 					let func_index = self.items.push_function(Function {
@@ -611,19 +721,19 @@ impl<'ast> Builder<'ast, '_> {
 						result,
 						attributes: Box::new([]),
 					});
-					let import_decl = &mut self.modules.import_decls
+					let import_decl = &mut self.defs.import_decls
 						[usize::from(import_module_index)];
 					import_decl.lookup.insert(
 						signature.name.inner,
 						ImportValue::Function { id: *id },
 					);
 					let namespace_idx = import_decl.namespace_idx;
-					self.modules.namespaces[usize::from(namespace_idx)]
-						.symbols
+					self.defs.namespaces[usize::from(namespace_idx)]
+						.bindings
 						.insert(
-							(SymbolNamespace::Value, signature.name.inner),
-							SymbolEntry::Resolved {
-								kind: SymbolKind::Function { func_index },
+							(BindingNamespace::Value, signature.name.inner),
+							DefKey::Resolved {
+								kind: DefKind::Function { func_index },
 								visibility: Visibility::Public,
 							},
 						);
@@ -643,7 +753,7 @@ impl<'ast> Builder<'ast, '_> {
 				{
 					let resolved_ty =
 						self.resolve_type(resolve_context, None, ty);
-					let import_ns_idx = self.modules.import_decls
+					let import_ns_idx = self.defs.import_decls
 						[usize::from(import_module_index)]
 					.namespace_idx;
 					let global_index = self.items.push_global(Global {
@@ -660,18 +770,18 @@ impl<'ast> Builder<'ast, '_> {
 						mut_span: *mut_span,
 						accesses: Vec::new(),
 					});
-					let import_decl = &mut self.modules.import_decls
+					let import_decl = &mut self.defs.import_decls
 						[usize::from(import_module_index)];
 					import_decl
 						.lookup
 						.insert(name.inner, ImportValue::Global { id: *id });
 					let namespace_idx = import_decl.namespace_idx;
-					self.modules.namespaces[usize::from(namespace_idx)]
-						.symbols
+					self.defs.namespaces[usize::from(namespace_idx)]
+						.bindings
 						.insert(
-							(SymbolNamespace::Value, name.inner),
-							SymbolEntry::Resolved {
-								kind: SymbolKind::Global { global_index },
+							(BindingNamespace::Value, name.inner),
+							DefKey::Resolved {
+								kind: DefKind::Global { global_index },
 								visibility: Visibility::Public,
 							},
 						);
@@ -735,7 +845,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let keyword = SourceSpan::new(file_id, *keyword_span);
 		let block_package =
-			self.modules.namespaces[usize::from(namespace)].package;
+			self.defs.namespaces[usize::from(namespace)].package_id;
 
 		// A library has no ABI of its own — it is consumed through `pub`, not
 		// through exports. This also catches every block in a dependency,
@@ -753,8 +863,7 @@ impl<'ast> Builder<'ast, '_> {
 		// The entry file's top level is the only namespace equal to its
 		// package's root, so this one comparison rejects both a submodule file
 		// and an inline `mod { .. }` block.
-		let root_namespace =
-			self.modules.package_namespaces[&self.root_package];
+		let root_namespace = self.defs.package_namespaces[&self.root_package];
 		if namespace != root_namespace {
 			self.diagnostics
 				.push(report_export_block_not_at_root(keyword));
@@ -791,7 +900,7 @@ impl<'ast> Builder<'ast, '_> {
 	) -> (Box<[FunctionParam]>, Option<Spanned<TypeIndex>>) {
 		let self_type = scope.and_then(|s| s.self_type);
 		let self_symbol = self.interner.get_or_intern("self");
-		let mut seen_params: HashMap<SymbolU32, ast::TextSpan> = HashMap::new();
+		let mut seen_params: HashMap<SymbolU32, TextSpan> = HashMap::new();
 		let mut params: Vec<FunctionParam> =
 			Vec::with_capacity(signature.params.len());
 		for param in signature.params.iter() {
@@ -946,12 +1055,11 @@ impl<'ast> Builder<'ast, '_> {
 				variant_lookup.get(&ast_variant.name.inner).copied()
 			{
 				let first_span = variants[usize::from(first_index)].name.span;
-				let vname =
-					self.interner.resolve(ast_variant.name.inner).unwrap();
-				self.diagnostics.push(report_duplicate_definition(
+				self.diagnostics.push(
 					DuplicateDefinitionDiagnostic {
-						name: vname,
-						namespace: SymbolNamespace::Value,
+						name: ast_variant.name.inner,
+						strings: self.interner,
+						symbol_namespace: BindingNamespace::Value,
 						first_definition: SourceSpan::new(
 							resolve_context.file_id,
 							first_span,
@@ -960,8 +1068,9 @@ impl<'ast> Builder<'ast, '_> {
 							resolve_context.file_id,
 							ast_variant.name.span,
 						),
-					},
-				));
+					}
+					.report(),
+				);
 				continue;
 			}
 
@@ -1076,7 +1185,7 @@ impl<'ast> Builder<'ast, '_> {
 	fn report_enum_duplicate_values(
 		&mut self,
 		resolve_context: ResolveContext,
-		enum_name_span: ast::TextSpan,
+		enum_name_span: TextSpan,
 		tir_variants: &[EnumVariant],
 	) {
 		let mut by_value: Vec<(i64, &EnumVariant)> = tir_variants
@@ -1156,7 +1265,7 @@ impl<'ast> Builder<'ast, '_> {
 			// then fail here alone.
 			let Ok(value_symbol) = self.resolve_pending_global_symbol(
 				package_namespace,
-				(SymbolNamespace::Value, internal_name.inner),
+				(BindingNamespace::Value, internal_name.inner),
 				span,
 			) else {
 				continue;
@@ -1172,7 +1281,7 @@ impl<'ast> Builder<'ast, '_> {
 					if let Ok(Some(type_value)) = self
 						.resolve_pending_global_symbol(
 							package_namespace,
-							(SymbolNamespace::Type, internal_name.inner),
+							(BindingNamespace::Type, internal_name.inner),
 							span,
 						) {
 						self.record_symbol_access(
@@ -1206,7 +1315,7 @@ impl<'ast> Builder<'ast, '_> {
 				});
 
 			let export_item = match global_value {
-				SymbolKind::Function { func_index } => {
+				DefKind::Function { func_index } => {
 					if self.items.functions[usize::from(func_index)]
 						.type_param_count()
 						> 0
@@ -1235,7 +1344,7 @@ impl<'ast> Builder<'ast, '_> {
 						external_name,
 					}
 				}
-				SymbolKind::Global { global_index } => {
+				DefKind::Global { global_index } => {
 					self.items.globals[usize::from(global_index)]
 						.accesses
 						.push(SourceSpan::new(file_id, internal_name.span));
@@ -1246,7 +1355,7 @@ impl<'ast> Builder<'ast, '_> {
 						external_name,
 					}
 				}
-				SymbolKind::Memory { memory_index, .. } => {
+				DefKind::Memory { memory_index, .. } => {
 					self.items.memories[usize::from(memory_index)]
 						.accesses
 						.push(SourceSpan::new(file_id, internal_name.span));

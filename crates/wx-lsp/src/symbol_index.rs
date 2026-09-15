@@ -3,8 +3,8 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{DefId, StringInterner, TextSpan};
 use wx_compiler::tir::{
 	EnumVariantIndex, ExportItem, FieldIndex, ImplTarget, InherentImplIndex,
-	LocalIndex, ModuleDeclarationKind, NamespaceIndex, ScopeIndex, SourceSpan,
-	TIR, TraitImplIndex, TypeParamOwner,
+	LocalIndex, NamespaceIndex, NamespaceKind, ScopeIndex, SourceSpan, TIR,
+	TraitImplIndex, TypeParamOwner,
 };
 use wx_compiler::vfs::FileId;
 
@@ -500,22 +500,23 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 		}
 	}
 
-	for (ns_idx, ns) in tir.modules.namespaces_with_indices() {
+	for (ns_idx, ns) in tir.defs.namespaces_with_indices() {
 		let kind = SymbolKind::Namespace(ns_idx);
-		let (def_source, name_sym) = match ns.declaration {
-			ModuleDeclarationKind::Module(decl_idx) => {
-				let decl = &tir.modules.module_decls[usize::from(decl_idx)];
-				let source = match decl.own_file_id {
+		let (def_source, name_sym) = match ns.kind {
+			NamespaceKind::Module(decl_idx) => {
+				let decl = &tir.defs.module_decls[usize::from(decl_idx)];
+				let source = match decl.content_file_id {
 					Some(fid) => SourceSpan::new(fid, TextSpan::new(0, 0)),
-					None => {
-						SourceSpan::new(decl.declaring_file_id, decl.name.span)
-					}
+					None => SourceSpan::new(
+						decl.declaration_file_id,
+						decl.name.span,
+					),
 				};
 				// The `mod foo;` name in the declaring file is itself a reference.
-				if decl.own_file_id.is_some() {
+				if decl.content_file_id.is_some() {
 					index.references.push(SpanInfo {
 						source: SourceSpan::new(
-							decl.declaring_file_id,
+							decl.declaration_file_id,
 							decl.name.span,
 						),
 						kind,
@@ -523,8 +524,8 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 				}
 				(source, decl.name.inner)
 			}
-			ModuleDeclarationKind::Import(import_idx) => {
-				let decl = &tir.modules.import_decls[usize::from(import_idx)];
+			NamespaceKind::Import(import_idx) => {
+				let decl = &tir.defs.import_decls[usize::from(import_idx)];
 				let (name_sym, span) = match &decl.internal_name {
 					Some(n) => (n.inner, n.span),
 					None => (decl.external_name.inner, decl.external_name.span),
@@ -548,7 +549,7 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			// TODO: emit one `global_definitions` entry per incoming edge
 			// instead, so a package is completable under the name each
 			// dependent actually uses.
-			ModuleDeclarationKind::Package(file_id) => {
+			NamespaceKind::Package(file_id) => {
 				index.definitions.push(SpanInfo {
 					source: SourceSpan::new(file_id, TextSpan::new(0, 0)),
 					kind,
@@ -628,8 +629,8 @@ pub fn build_symbol_index(tir: &TIR, interner: &StringInterner) -> SymbolIndex {
 			});
 		}
 
-		for (assoc_name, entry) in &trait_.members {
-			let wx_compiler::tir::MemberIndex::AssociatedType(assoc_index) =
+		for (assoc_name, entry) in &trait_.bindings {
+			let wx_compiler::tir::TraitMemberKind::AssociatedType(assoc_index) =
 				entry
 			else {
 				continue;

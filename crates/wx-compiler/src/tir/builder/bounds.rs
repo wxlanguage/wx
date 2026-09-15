@@ -159,7 +159,7 @@ impl Builder<'_, '_> {
 				items,
 				interner: self.interner,
 			},
-			modules: &self.modules,
+			defs: &self.defs,
 			packages: self.packages,
 		}
 		.run(
@@ -176,7 +176,7 @@ impl Builder<'_, '_> {
 
 pub(super) struct BoundChecker<'a> {
 	ctx: TypeCtx<'a>,
-	modules: &'a ModuleGraph,
+	defs: &'a DefinitionRegistry,
 	packages: &'a [PackageGraph],
 }
 
@@ -188,12 +188,12 @@ impl<'a> BoundChecker<'a> {
 	/// `diagnostics` are disjoint fields, so the borrows coexist.
 	pub(super) fn new(
 		ctx: TypeCtx<'a>,
-		modules: &'a ModuleGraph,
+		defs: &'a DefinitionRegistry,
 		packages: &'a [PackageGraph],
 	) -> Self {
 		BoundChecker {
 			ctx,
-			modules,
+			defs,
 			packages,
 		}
 	}
@@ -579,10 +579,10 @@ impl<'a> BoundChecker<'a> {
 		TypeFormatter::new(
 			&*self.ctx.types,
 			self.ctx.items,
-			self.modules,
+			self.defs,
 			self.ctx.interner,
 			self.packages,
-			self.modules.namespaces[usize::from(namespace)].package,
+			self.defs.namespaces[usize::from(namespace)].package_id,
 		)
 	}
 

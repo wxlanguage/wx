@@ -233,7 +233,6 @@ impl<'tir> TypeContext<'tir> {
 			| tir::Type::Infer
 			| tir::Type::Integer
 			| tir::Type::Float
-			| tir::Type::Namespace { .. }
 			| tir::Type::AssociatedType { .. } => unreachable!(
 				"invalid or unresolved TIR type reached MIR instantiation"
 			),
@@ -415,7 +414,7 @@ impl<'tir> TypeContext<'tir> {
 	) -> Option<TraitMember> {
 		let imp = &self.tir.items.trait_impls[usize::from(impl_index)];
 		let member = self.tir.items.traits[usize::from(imp.trait_index)]
-			.members
+			.bindings
 			.get(&name)?;
 		let default = member.entry(&self.tir.items);
 		if let Some(&entry) = imp.members.get(&name)

@@ -175,7 +175,7 @@ impl<'ast> Builder<'ast, '_> {
 		// is an ordinary `TraitImpl` like any hand-written one — its members go
 		// through the same ambiguity-checked trait tier as everything else, no
 		// special-casing.
-		let synthetic_def_id = self.id_generator.generate();
+		let synthetic_def_id = self.id_generator.next();
 		let trait_impl_index = self.items.push_trait_impl(TraitImpl {
 			id: synthetic_def_id,
 			trait_index,
@@ -211,24 +211,24 @@ impl<'ast> Builder<'ast, '_> {
 		// `Pending` slot there — see the identical comment on the Struct
 		// branch. Type and Value are independent claims (mirroring the two
 		// separate `claim_name_binding` calls in `pre_scan_item`).
-		let type_key = (SymbolNamespace::Type, name.inner);
+		let type_key = (BindingNamespace::Type, name.inner);
 		if self.still_pending(resolve_context.namespace, type_key, *id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				type_key,
-				SymbolKind::Memory {
+				DefKind::Memory {
 					memory_index,
 					size: memory_size.inner,
 				},
 				None,
 			);
 		}
-		let value_key = (SymbolNamespace::Value, name.inner);
+		let value_key = (BindingNamespace::Value, name.inner);
 		if self.still_pending(resolve_context.namespace, value_key, *id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				value_key,
-				SymbolKind::Memory {
+				DefKind::Memory {
 					memory_index,
 					size: memory_size.inner,
 				},
@@ -254,24 +254,24 @@ impl<'ast> Builder<'ast, '_> {
 	) {
 		let memory_index = self.items.expect_memory_index(id);
 		let kind = TypeIndex::ERROR;
-		let type_key = (SymbolNamespace::Type, name.inner);
+		let type_key = (BindingNamespace::Type, name.inner);
 		if self.still_pending(resolve_context.namespace, type_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				type_key,
-				SymbolKind::Memory {
+				DefKind::Memory {
 					memory_index,
 					size: kind,
 				},
 				None,
 			);
 		}
-		let value_key = (SymbolNamespace::Value, name.inner);
+		let value_key = (BindingNamespace::Value, name.inner);
 		if self.still_pending(resolve_context.namespace, value_key, id) {
 			self.insert_symbol(
 				resolve_context.namespace,
 				value_key,
-				SymbolKind::Memory {
+				DefKind::Memory {
 					memory_index,
 					size: kind,
 				},
@@ -464,7 +464,7 @@ impl<'ast> Builder<'ast, '_> {
 		// ordinary lookup. Demand them explicitly in source order.
 		let trait_def = &self.items.traits[usize::from(trait_index)];
 		let mut declarations: Vec<_> = trait_def
-			.members
+			.bindings
 			.iter()
 			.map(|(&name, &member)| (name, member.def_span(&self.items)))
 			.collect();
@@ -491,7 +491,7 @@ impl<'ast> Builder<'ast, '_> {
 		match entry {
 			ImplEntry::AssocType(idx) => {
 				let original = &self.items.associated_types[usize::from(idx)];
-				let new_id = self.id_generator.generate();
+				let new_id = self.id_generator.next();
 				let new_entry = AssociatedType {
 					bounds: Bounds::default(),
 					accesses: Vec::new(),
@@ -524,11 +524,11 @@ impl<'ast> Builder<'ast, '_> {
 				let concrete_ty =
 					self.substitute_type(original_ty, &[memory_self]);
 				let c = &self.items.constants[usize::from(index)];
-				let new_id = self.id_generator.generate();
+				let new_id = self.id_generator.next();
 				// `value` itself can't be forked (not `Clone` — see
 				// above), but `const_value` can: it's what MIR lowering
 				// actually reads for a `Memory`-trait const access (see
-				// the `NamespaceAccess` handling in `mir::build`), so a
+				// the `AbstractConstAccess` handling in `mir::build`), so a
 				// default value's already-folded result (e.g.
 				// `PAGE_SIZE`'s `Int(65536)`) needs to carry over here
 				// or every memory's clone silently loses it, unlike
@@ -563,7 +563,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		pointer: &Spanned<ast::Expression>,
 	) -> Result<Expression, ()> {
 		// Always build the pointer expression with Read — we only need to read

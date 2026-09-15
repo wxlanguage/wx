@@ -47,7 +47,6 @@ impl TypeCtx<'_> {
 			| Type::F64
 			| Type::Char
 			| Type::Enum { .. }
-			| Type::Namespace { .. }
 			| Type::Memory { .. }
 			| Type::AssociatedType { .. } => ty,
 			Type::TypeParam { param_index, .. } => type_args

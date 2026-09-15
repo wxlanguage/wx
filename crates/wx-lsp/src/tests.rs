@@ -2462,8 +2462,8 @@ fn memory_associated_const_namespace_access_resolves() {
 				== Some("Memory")
 		})
 		.expect("stdlib Memory trait");
-	let wx_compiler::tir::MemberIndex::Constant(template_index) =
-		memory_trait.members[&const_name]
+	let wx_compiler::tir::TraitMemberKind::Constant(template_index) =
+		memory_trait.bindings[&const_name]
 	else {
 		panic!("Memory::DATA_END must be a constant");
 	};

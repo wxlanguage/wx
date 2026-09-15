@@ -626,11 +626,11 @@ impl<'ast> Builder<'ast, '_> {
 		match &expr.inner {
 			ast::Expression::QualifiedPath { root, segments } => self
 				.build_qualified_path_expression(
-					func_ctx, root, segments, expr.span,
+					func_ctx, access_ctx, root, segments, expr.span,
 				),
 			ast::Expression::Grouped { inner, segments } => self
 				.build_grouped_path_expression(
-					func_ctx, inner, segments, expr.span,
+					func_ctx, access_ctx, inner, segments, expr.span,
 				),
 			ast::Expression::Int { value } => Ok(Expression {
 				kind: ExprKind::Int { value: *value },
@@ -958,7 +958,9 @@ impl<'ast> Builder<'ast, '_> {
 				}),
 				right: Box::new(value),
 			},
-			ast::Pattern::Tuple { .. } | ast::Pattern::Struct { .. } => {
+			ast::Pattern::Tuple { .. }
+			| ast::Pattern::Struct { .. }
+			| ast::Pattern::TupleStruct { .. } => {
 				let mut bindings = Vec::new();
 				let mut path = Vec::new();
 				self.collect_pattern_bindings(

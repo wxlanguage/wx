@@ -34,8 +34,8 @@ use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::ast;
 use wx_compiler::ast::TextSpan;
 use wx_compiler::tir::{
-	ImplTarget, ItemAttribute, ModuleDeclarationKind, SourceSpan, TIR,
-	TypeParamInfo, TypeParamOwner,
+	ImplTarget, ItemAttribute, NamespaceKind, SourceSpan, TIR, TypeParamDef,
+	TypeParamOwner,
 };
 use wx_compiler::vfs::{
 	self, AbsolutePath, FileId, FileSource, NativeFileSource,
@@ -497,10 +497,10 @@ async fn handle_command(
 				// dependency like `std` needs `std`'s own package here, or
 				// `namespace_name` names things from the wrong package's
 				// perspective.
-				let from = compiled.tir.modules.namespaces[usize::from(
-					compiled.tir.modules.file_namespaces[file_id.as_usize()],
+				let from = compiled.tir.defs.namespaces[usize::from(
+					compiled.tir.defs.file_namespaces[file_id.as_usize()],
 				)]
-				.package;
+				.package_id;
 				let text = symbol_hover_text(
 					&compiled.tir,
 					&compiled.graph.interner,
@@ -798,9 +798,9 @@ async fn handle_command(
 				let func = &compiled.tir.items.functions[fi];
 				// The function's own package, not the compilation's overall
 				// root — see the matching fix in the `Hover` handler above.
-				let from = compiled.tir.modules.namespaces
+				let from = compiled.tir.defs.namespaces
 					[usize::from(func.namespace)]
-				.package;
+				.package_id;
 				let fmt = compiled.tir.formatter(
 					&compiled.graph.interner,
 					&compiled.graph.packages,
@@ -2155,9 +2155,9 @@ fn push_type_params(
 	s: &mut String,
 	tir: &TIR,
 	interner: &ast::StringInterner,
-	packages: &[vfs::PackageGraph],
+	packages: &[vfs::Package],
 	from: vfs::PackageId,
-	type_params: &[TypeParamInfo],
+	type_params: &[TypeParamDef],
 ) {
 	if type_params.is_empty() {
 		return;
@@ -2285,7 +2285,7 @@ fn leading_doc_comment(source: &str, anchor_offset: u32) -> Option<String> {
 fn symbol_hover_text(
 	tir: &TIR,
 	interner: &ast::StringInterner,
-	packages: &[vfs::PackageGraph],
+	packages: &[vfs::Package],
 	from: vfs::PackageId,
 	kind: &SymbolKind,
 ) -> Option<String> {
@@ -2448,21 +2448,19 @@ fn symbol_hover_text(
 			Some(format!("{enum_name}::{variant_name}"))
 		}
 		SymbolKind::Namespace(ns_idx) => {
-			let ns = tir.modules.namespaces.get(usize::from(*ns_idx))?;
-			match ns.declaration {
-				ModuleDeclarationKind::Module(decl_idx) => {
+			let ns = tir.defs.namespaces.get(usize::from(*ns_idx))?;
+			match ns.kind {
+				NamespaceKind::Module(decl_idx) => {
 					let decl =
-						tir.modules.module_decls.get(usize::from(decl_idx))?;
+						tir.defs.module_decls.get(usize::from(decl_idx))?;
 					let name = interner.resolve(decl.name.inner).unwrap();
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
 					Some(format!("{pub_prefix}mod {name}"))
 				}
-				ModuleDeclarationKind::Import(import_idx) => {
-					let decl = tir
-						.modules
-						.import_decls
-						.get(usize::from(import_idx))?;
+				NamespaceKind::Import(import_idx) => {
+					let decl =
+						tir.defs.import_decls.get(usize::from(import_idx))?;
 					let external =
 						interner.resolve(decl.external_name.inner).unwrap();
 					match &decl.internal_name {
@@ -2479,7 +2477,7 @@ fn symbol_hover_text(
 				// A package has no name of its own — show it as the package
 				// this hover is rendered from calls it (or, for `crate`/
 				// `super` naming `from`'s own root, as the literal keyword).
-				ModuleDeclarationKind::Package(_) => {
+				NamespaceKind::Package(_) => {
 					let name =
 						tir.namespace_name(*ns_idx, packages, from, interner);
 					Some(format!("package {name}"))
@@ -2488,7 +2486,7 @@ fn symbol_hover_text(
 		}
 		SymbolKind::TypeParam { owner, param_index } => {
 			let param_index = *param_index;
-			let tp: &TypeParamInfo = match owner {
+			let tp: &TypeParamDef = match owner {
 				TypeParamOwner::Function(def_id) => {
 					let fi = usize::from(tir.items.function_index(*def_id)?);
 					let func = &tir.items.functions[fi];
@@ -2552,8 +2550,11 @@ fn symbol_hover_text(
 				.typesets
 				.get(usize::from(tir.items.typeset_index(*def_id)?))?;
 			let name = interner.resolve(typeset.name.inner).unwrap();
-			let pub_prefix =
-				if typeset.pub_span.is_some() { "pub " } else { "" };
+			let pub_prefix = if typeset.pub_span.is_some() {
+				"pub "
+			} else {
+				""
+			};
 			// Bounds written after the `:` become supertraits of the
 			// typeset's compiler-generated backing trait.
 			let bounds_str = fmt

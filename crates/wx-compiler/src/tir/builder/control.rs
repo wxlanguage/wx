@@ -556,11 +556,10 @@ impl<'ast> Builder<'ast, '_> {
 		)?;
 
 		if matches!(self.types.resolve(scrutinee_ty), Type::Enum { .. }) {
-			if let ExprKind::NamespaceAccess { member, .. } = &built.kind
-				&& let ExprKind::EnumVariant {
-					enum_index,
-					variant_index,
-				} = member.kind
+			if let ExprKind::EnumVariant {
+				enum_index,
+				variant_index,
+			} = built.kind
 				&& built.ty == scrutinee_ty
 			{
 				return Ok(Pattern::EnumVariant {
@@ -952,8 +951,33 @@ impl<'ast> Builder<'ast, '_> {
 		path: &mut Vec<PathStep>,
 		out: &mut Vec<PatternBinding>,
 	) {
+		self.collect_pattern_bindings_at(
+			ctx,
+			&pattern.inner,
+			pattern.span,
+			ty,
+			path,
+			out,
+		);
+	}
+
+	/// The actual worker behind [`Self::collect_pattern_bindings`], taking
+	/// the pattern and its span separately rather than bundled as a
+	/// `Spanned<ast::Pattern>`. Needed because a tuple-struct pattern's
+	/// elements (`TupleStructPatternItem::Element`) are bare `ast::Pattern`s
+	/// — the surrounding `Separated<Spanned<_>>` already carries their span,
+	/// so there is no second `Spanned<Pattern>` to hand this a reference to.
+	fn collect_pattern_bindings_at(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &ast::Pattern,
+		span: TextSpan,
+		ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
 		let file_id = ctx.resolve_context.file_id;
-		match &pattern.inner {
+		match pattern {
 			// Binds nothing: the value it would name is simply never read.
 			// Projections are pure reads of the scrutinee, so unlike the
 			// top-level `_` there is nothing to evaluate for effect either.
@@ -1012,7 +1036,7 @@ impl<'ast> Builder<'ast, '_> {
 										"tuple pattern does not match the value",
 									)
 									.with_label(
-										Label::primary(file_id, pattern.span)
+										Label::primary(file_id, span)
 											.with_message(message),
 									),
 							);
@@ -1047,7 +1071,13 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			ast::Pattern::Struct { .. } => self
-				.collect_struct_pattern_bindings(ctx, pattern, ty, path, out),
+				.collect_struct_pattern_bindings(
+					ctx, pattern, span, ty, path, out,
+				),
+			ast::Pattern::TupleStruct { .. } => self
+				.collect_tuple_struct_pattern_bindings(
+					ctx, pattern, span, ty, path, out,
+				),
 		}
 	}
 
@@ -1057,20 +1087,42 @@ impl<'ast> Builder<'ast, '_> {
 	fn collect_struct_pattern_bindings(
 		&mut self,
 		ctx: &mut ExprContext,
-		pattern: &Spanned<ast::Pattern>,
+		pattern: &ast::Pattern,
+		span: TextSpan,
 		ty: TypeIndex,
 		path: &mut Vec<PathStep>,
 		out: &mut Vec<PatternBinding>,
 	) {
 		let ast::Pattern::Struct {
 			path: struct_path,
-			fields,
-			rest,
-		} = &pattern.inner
+			items,
+		} = pattern
 		else {
 			unreachable!()
 		};
 		let file_id = ctx.resolve_context.file_id;
+
+		// The parser hands back the raw parsed sequence without assuming how
+		// many `..` markers are legal or where — more than one is a
+		// diagnostic here, not a silent "last one wins".
+		let mut fields: Vec<&ast::PatternField> = Vec::new();
+		let mut rest_spans: Vec<TextSpan> = Vec::new();
+		for item in items.iter() {
+			match &item.inner.inner {
+				ast::StructPatternItem::Field(field) => fields.push(field),
+				ast::StructPatternItem::Rest => {
+					rest_spans.push(item.inner.span)
+				}
+			}
+		}
+		for extra in rest_spans.iter().skip(1) {
+			self.diagnostics.push(report_duplicate_rest_pattern(
+				file_id,
+				rest_spans[0],
+				*extra,
+			));
+		}
+		let has_rest = !rest_spans.is_empty();
 
 		// The scrutinee decides which struct this is and how it is
 		// instantiated; the written path only has to agree with it.
@@ -1087,7 +1139,7 @@ impl<'ast> Builder<'ast, '_> {
 			ctx.resolve_context,
 			ctx.scope,
 			struct_path,
-			pattern.span,
+			span,
 			TypeArgArity::AllowInfer,
 		);
 		let named_index = match self.types.resolve(named_ty) {
@@ -1131,7 +1183,7 @@ impl<'ast> Builder<'ast, '_> {
 								"struct pattern does not match the value",
 							)
 							.with_label(
-								Label::primary(file_id, pattern.span)
+								Label::primary(file_id, span)
 									.with_message(message),
 							),
 					);
@@ -1139,7 +1191,7 @@ impl<'ast> Builder<'ast, '_> {
 				for field in fields.iter() {
 					self.bind_struct_pattern_field(
 						ctx,
-						&field.inner,
+						field,
 						TypeIndex::ERROR,
 						path,
 						out,
@@ -1149,12 +1201,41 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 
-		let field_count =
-			self.items.structs[usize::from(struct_index)].fields.len();
+		let field_count = match &self.items.structs[usize::from(struct_index)]
+			.fields
+		{
+			StructKind::Record { fields, .. } => fields.len(),
+			StructKind::Tuple { .. } => {
+				let struct_name = self
+					.interner
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
+					.unwrap()
+					.to_string();
+				self.diagnostics.push(report_tuple_struct_brace_pattern(
+					file_id,
+					&struct_name,
+					span,
+				));
+				for field in fields.iter() {
+					self.bind_struct_pattern_field(
+						ctx,
+						field,
+						TypeIndex::ERROR,
+						path,
+						out,
+					);
+				}
+				return;
+			}
+		};
 		let mut first_mention: Vec<Option<TextSpan>> = vec![None; field_count];
 
 		for field in fields.iter() {
-			let name = field.inner.inner.name;
+			let name = field.name;
 			let Some(resolved) = self.resolve_struct_field(
 				ctx.resolve_context,
 				struct_index,
@@ -1183,7 +1264,7 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				self.bind_struct_pattern_field(
 					ctx,
-					&field.inner,
+					field,
 					TypeIndex::ERROR,
 					path,
 					out,
@@ -1210,7 +1291,7 @@ impl<'ast> Builder<'ast, '_> {
 			});
 			self.bind_struct_pattern_field(
 				ctx,
-				&field.inner,
+				field,
 				resolved.ty,
 				path,
 				out,
@@ -1218,20 +1299,23 @@ impl<'ast> Builder<'ast, '_> {
 			path.pop();
 		}
 
-		if rest.is_none() {
+		if !has_rest {
 			let missing: Box<[&str]> = first_mention
 				.iter()
 				.enumerate()
 				.filter(|(_, mention)| mention.is_none())
 				.map(|(index, _)| {
-					self.interner
-						.resolve(
-							self.items.structs[usize::from(struct_index)]
-								.fields[index]
-								.name
-								.inner,
-						)
-						.unwrap()
+					match &self.items.structs[usize::from(struct_index)]
+						.fields
+					{
+						StructKind::Record { fields, .. } => self
+							.interner
+							.resolve(fields[index].name.inner)
+							.unwrap(),
+						StructKind::Tuple { .. } => {
+							unreachable!("tuple structs rejected above")
+						}
+					}
 				})
 				.collect();
 			if !missing.is_empty() {
@@ -1258,10 +1342,316 @@ impl<'ast> Builder<'ast, '_> {
 						.with_note(
 							"add the remaining fields, or end the pattern with `..` to ignore them",
 						)
-						.with_label(Label::primary(file_id, pattern.span)),
+						.with_label(Label::primary(file_id, span)),
 				);
 			}
 		}
+	}
+
+	/// The `Path(...)` arm of `collect_pattern_bindings` — destructures a
+	/// tuple struct positionally, mirroring its `Point(1, 2)` construction
+	/// syntax. Rest-anywhere (Rust-style): elements before `..` bind the
+	/// struct's first fields, elements after `..` bind its last fields;
+	/// with no `..`, the element count must match exactly.
+	fn collect_tuple_struct_pattern_bindings(
+		&mut self,
+		ctx: &mut ExprContext,
+		pattern: &ast::Pattern,
+		span: TextSpan,
+		ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
+		let ast::Pattern::TupleStruct {
+			path: struct_path,
+			elements,
+		} = pattern
+		else {
+			unreachable!()
+		};
+		let file_id = ctx.resolve_context.file_id;
+
+		// Split on the (at most one legal) `..`: elements seen before it
+		// bind from the front, elements after it bind from the back.
+		let mut before: Vec<(&ast::Pattern, TextSpan)> = Vec::new();
+		let mut after: Vec<(&ast::Pattern, TextSpan)> = Vec::new();
+		let mut rest_spans: Vec<TextSpan> = Vec::new();
+		for element in elements.iter() {
+			match &element.inner.inner {
+				ast::TupleStructPatternItem::Element(elem) => {
+					let entry = (elem, element.inner.span);
+					if rest_spans.is_empty() {
+						before.push(entry);
+					} else {
+						after.push(entry);
+					}
+				}
+				ast::TupleStructPatternItem::Rest => {
+					rest_spans.push(element.inner.span)
+				}
+			}
+		}
+		for extra in rest_spans.iter().skip(1) {
+			self.diagnostics.push(report_duplicate_rest_pattern(
+				file_id,
+				rest_spans[0],
+				*extra,
+			));
+		}
+		let has_rest = !rest_spans.is_empty();
+		let all_elements =
+			|| before.iter().chain(after.iter()).copied();
+
+		let scrutinee = match self.types.resolve(ty) {
+			Type::Struct { struct_index, args } => {
+				Some((*struct_index, args.clone()))
+			}
+			_ => None,
+		};
+
+		let named_ty = self.resolve_path_type(
+			ctx.resolve_context,
+			ctx.scope,
+			struct_path,
+			span,
+			TypeArgArity::AllowInfer,
+		);
+		let named_index = match self.types.resolve(named_ty) {
+			Type::Struct { struct_index, .. } => Some(*struct_index),
+			_ => None,
+		};
+		if named_index.is_none() && named_ty != TypeIndex::ERROR {
+			let last = struct_path.last().expect("path is non-empty");
+			let name =
+				self.interner.resolve(last.ident.inner).unwrap().to_string();
+			self.diagnostics.push(report_not_a_struct_type(
+				file_id,
+				name,
+				last.ident.span,
+			));
+		}
+
+		let (struct_index, args) = match scrutinee {
+			Some((struct_index, args))
+				if named_index.is_none_or(|named| named == struct_index) =>
+			{
+				(struct_index, args)
+			}
+			other => {
+				if ty != TypeIndex::ERROR {
+					let fmt = self.formatter(ctx.resolve_context.namespace);
+					let message = match other {
+						Some(_) => format!(
+							"value is `{}`",
+							fmt.display_type(ty).unwrap()
+						),
+						None => format!(
+							"expected a struct, found `{}`",
+							fmt.display_type(ty).unwrap()
+						),
+					};
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::TypeMistmatch.code())
+							.with_message(
+								"struct pattern does not match the value",
+							)
+							.with_label(
+								Label::primary(file_id, span)
+									.with_message(message),
+							),
+					);
+				}
+				for (elem, elem_span) in all_elements() {
+					self.collect_pattern_bindings_at(
+						ctx,
+						elem,
+						elem_span,
+						TypeIndex::ERROR,
+						path,
+						out,
+					);
+				}
+				return;
+			}
+		};
+
+		let field_count = match &self.items.structs[usize::from(struct_index)]
+			.fields
+		{
+			StructKind::Tuple { fields } => fields.len(),
+			StructKind::Record { .. } => {
+				let struct_name = self
+					.interner
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
+					.unwrap()
+					.to_string();
+				self.diagnostics.push(
+					report_record_struct_positional_pattern(
+						file_id,
+						&struct_name,
+						span,
+					),
+				);
+				for (elem, elem_span) in all_elements() {
+					self.collect_pattern_bindings_at(
+						ctx,
+						elem,
+						elem_span,
+						TypeIndex::ERROR,
+						path,
+						out,
+					);
+				}
+				return;
+			}
+		};
+
+		let written = before.len() + after.len();
+		if (has_rest && written > field_count) || (!has_rest && written != field_count)
+		{
+			let fmt = self.formatter(ctx.resolve_context.namespace);
+			let found = fmt.display_type(ty).unwrap();
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeMistmatch.code())
+					.with_message(
+						"tuple struct pattern does not match the value",
+					)
+					.with_label(Label::primary(file_id, span).with_message(
+						format!(
+							"expected {} element{}, found {written} in pattern for `{}`",
+							field_count,
+							if field_count == 1 { "" } else { "s" },
+							found,
+						),
+					)),
+			);
+			for (elem, elem_span) in all_elements() {
+				self.collect_pattern_bindings_at(
+					ctx,
+					elem,
+					elem_span,
+					TypeIndex::ERROR,
+					path,
+					out,
+				);
+			}
+			return;
+		}
+
+		let back_start = field_count - after.len();
+
+		for (position, (elem, elem_span)) in before.iter().enumerate() {
+			self.bind_tuple_struct_pattern_element(
+				ctx,
+				struct_index,
+				&args,
+				position,
+				elem,
+				*elem_span,
+				ty,
+				path,
+				out,
+			);
+		}
+		for (offset, (elem, elem_span)) in after.iter().enumerate() {
+			self.bind_tuple_struct_pattern_element(
+				ctx,
+				struct_index,
+				&args,
+				back_start + offset,
+				elem,
+				*elem_span,
+				ty,
+				path,
+				out,
+			);
+		}
+	}
+
+	/// Binds one positional element of a tuple-struct pattern at declared
+	/// index `position`. Skips the privacy check entirely for a bare `_` —
+	/// discarding a field is not reading it, so a private field can always
+	/// be discarded even from outside the declaring namespace.
+	#[allow(clippy::too_many_arguments)]
+	fn bind_tuple_struct_pattern_element(
+		&mut self,
+		ctx: &mut ExprContext,
+		struct_index: StructIndex,
+		args: &[TypeIndex],
+		position: usize,
+		element: &ast::Pattern,
+		element_span: TextSpan,
+		scrutinee_ty: TypeIndex,
+		path: &mut Vec<PathStep>,
+		out: &mut Vec<PatternBinding>,
+	) {
+		let file_id = ctx.resolve_context.file_id;
+		let StructKind::Tuple { fields } =
+			&self.items.structs[usize::from(struct_index)].fields
+		else {
+			unreachable!("checked by the caller")
+		};
+		let declared_ty = fields[position].ty;
+		let field_ty = if args.is_empty() {
+			declared_ty.inner
+		} else {
+			self.substitute_type(declared_ty.inner, args)
+		};
+
+		if !matches!(element, ast::Pattern::Wildcard) {
+			let visibility = self.field_visibility(
+				struct_index,
+				FieldIndex::new(position as u32),
+			);
+			let declaring_namespace =
+				self.items.structs[usize::from(struct_index)].namespace;
+			if !self.is_accessible_from(
+				ctx.resolve_context.namespace,
+				declaring_namespace,
+				visibility,
+			) {
+				let struct_name = self
+					.interner
+					.resolve(
+						self.items.structs[usize::from(struct_index)]
+							.name
+							.inner,
+					)
+					.unwrap();
+				self.diagnostics.push(report_private_tuple_field_pattern(
+					struct_name,
+					position,
+					SourceSpan::new(file_id, element_span),
+					SourceSpan::new(file_id, declared_ty.span),
+				));
+			}
+
+			let StructKind::Tuple { fields } =
+				&mut self.items.structs[usize::from(struct_index)].fields
+			else {
+				unreachable!("checked above")
+			};
+			fields[position].accesses.push(FieldAccess {
+				kind: FieldAccessKind::Read,
+				file_id,
+				span: element_span,
+			});
+		}
+
+		path.push(PathStep {
+			aggregate_ty: scrutinee_ty,
+			index: position as u32,
+		});
+		self.collect_pattern_bindings_at(
+			ctx, element, element_span, field_ty, path, out,
+		);
+		path.pop();
 	}
 
 	/// Binds one entry of a struct pattern. `{ x }` is shorthand for
@@ -1270,12 +1660,12 @@ impl<'ast> Builder<'ast, '_> {
 	fn bind_struct_pattern_field(
 		&mut self,
 		ctx: &mut ExprContext,
-		field: &Spanned<ast::PatternField>,
+		field: &ast::PatternField,
 		field_ty: TypeIndex,
 		path: &mut Vec<PathStep>,
 		out: &mut Vec<PatternBinding>,
 	) {
-		match &field.inner.pattern {
+		match &field.pattern {
 			Some(sub_pattern) => self.collect_pattern_bindings(
 				ctx,
 				sub_pattern,
@@ -1285,7 +1675,7 @@ impl<'ast> Builder<'ast, '_> {
 			),
 			None => {
 				let local_index = ctx.push_local(Local {
-					name: field.inner.name,
+					name: field.name,
 					ty: field_ty,
 					mut_span: None,
 					accesses: Vec::new(),
@@ -1431,4 +1821,67 @@ fn report_break_outside_of_loop(span: SourceSpan) -> Diagnostic<FileId> {
 		.with_message("`break` outside of a loop or labeled block")
 		.with_label(span.primary_label())
 		.with_note("cannot `break` outside of a loop or labeled block")
+}
+
+fn report_duplicate_rest_pattern(
+	file_id: FileId,
+	first_span: TextSpan,
+	second_span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateRestPattern.code())
+		.with_message("`..` can only appear once in a pattern")
+		.with_label(SourceSpan::new(file_id, second_span).primary_label())
+		.with_label(
+			SourceSpan::new(file_id, first_span)
+				.secondary_label()
+				.with_message("first use of `..` here"),
+		)
+}
+
+fn report_tuple_struct_brace_pattern(
+	file_id: FileId,
+	struct_name: &str,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TupleStructBracePattern.code())
+		.with_message(format!(
+			"tuple struct `{struct_name}` cannot be destructured with \
+			 `{struct_name}::{{ ... }}`, use `{struct_name}(...)`"
+		))
+		.with_label(Label::primary(file_id, span))
+}
+
+fn report_record_struct_positional_pattern(
+	file_id: FileId,
+	struct_name: &str,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::RecordStructPositionalPattern.code())
+		.with_message(format!(
+			"struct `{struct_name}` cannot be destructured with \
+			 `{struct_name}(...)`, use `{struct_name}::{{ ... }}`"
+		))
+		.with_label(Label::primary(file_id, span))
+}
+
+fn report_private_tuple_field_pattern(
+	struct_name: &str,
+	field_index: usize,
+	access: SourceSpan,
+	declared_at: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::PrivateTupleField.code())
+		.with_message(format!(
+			"field {field_index} of struct `{struct_name}` is private"
+		))
+		.with_label(access.primary_label().with_message("private field"))
+		.with_label(
+			declared_at
+				.secondary_label()
+				.with_message("declared without `pub` here"),
+		)
 }

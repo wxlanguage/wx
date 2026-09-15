@@ -113,7 +113,7 @@ impl TestCase {
 		&self,
 		index: usize,
 	) -> &[Separated<Spanned<StructField>>] {
-		let Item::Struct { fields, .. } = self.item(index) else {
+		let Item::RecordStruct { fields, .. } = self.item(index) else {
 			panic!(
 				"item {index} is {}, not a struct",
 				item_kind(self.item(index))
@@ -162,7 +162,8 @@ fn item_kind(item: &Item) -> &'static str {
 		Item::Enum { .. } => "an enum",
 		Item::InherentImpl { .. } => "an inherent impl",
 		Item::TraitImpl { .. } => "a trait impl",
-		Item::Struct { .. } => "a struct",
+		Item::RecordStruct { .. } => "a record struct",
+		Item::TupleStruct { .. } => "a tuple struct",
 		Item::Memory { .. } => "a memory",
 		Item::Const { .. } => "a const",
 		Item::Module { .. } => "an inline module",
@@ -335,7 +336,7 @@ fn test_type_expression_forms() {
     "});
 
 	case.diagnostics().assert_none();
-	let Item::Struct { fields, .. } = case.item(0) else {
+	let Item::RecordStruct { fields, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 
@@ -1320,49 +1321,67 @@ fn test_pattern_struct_destructuring() {
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
 
-	let Pattern::Struct { path, fields, rest } =
-		local_definition_pattern(stmts, 0)
+	let Pattern::Struct { path, items } = local_definition_pattern(stmts, 0)
 	else {
 		panic!("expected struct pattern")
 	};
+	let (fields, rest) = struct_pattern_fields(items);
 	assert_eq!(path.len(), 1);
 	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("Point"));
-	assert!(rest.is_none());
+	assert!(rest.is_empty());
 	assert_eq!(fields.len(), 2);
 	assert!(
-		fields[0].inner.inner.pattern.is_none(),
+		fields[0].pattern.is_none(),
 		"shorthand field should have no sub-pattern"
 	);
 	assert!(
-		fields[1].inner.inner.pattern.is_none(),
+		fields[1].pattern.is_none(),
 		"shorthand field should have no sub-pattern"
 	);
 
-	let Pattern::Struct { fields, .. } = local_definition_pattern(stmts, 1)
+	let Pattern::Struct { items, .. } = local_definition_pattern(stmts, 1)
 	else {
 		panic!("expected struct pattern")
 	};
+	let (fields, _) = struct_pattern_fields(items);
 	assert!(
-		fields[0].inner.inner.pattern.is_some(),
+		fields[0].pattern.is_some(),
 		"renamed field should have sub-pattern"
 	);
 	assert!(
-		fields[1].inner.inner.pattern.is_some(),
+		fields[1].pattern.is_some(),
 		"renamed field should have sub-pattern"
 	);
 
 	// A multi-segment path names a struct in another module, and `..` stands
 	// in for the fields the pattern does not bind.
-	let Pattern::Struct { path, fields, rest } =
-		local_definition_pattern(stmts, 2)
+	let Pattern::Struct { path, items } = local_definition_pattern(stmts, 2)
 	else {
 		panic!("expected struct pattern")
 	};
+	let (fields, rest) = struct_pattern_fields(items);
 	assert_eq!(path.len(), 2);
 	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("geom"));
 	assert_eq!(case.interner.resolve(path[1].ident.inner), Some("Point"));
 	assert_eq!(fields.len(), 1);
-	assert!(rest.is_some());
+	assert!(!rest.is_empty());
+}
+
+/// Splits a `Pattern::Struct`'s raw `items` sequence into its named fields
+/// and its `..` rest markers — the same split `control.rs`'s
+/// `collect_struct_pattern_bindings` does on the real (non-test) path.
+fn struct_pattern_fields(
+	items: &[Separated<Spanned<StructPatternItem>>],
+) -> (Vec<&PatternField>, Vec<&Spanned<StructPatternItem>>) {
+	let mut fields = Vec::new();
+	let mut rest = Vec::new();
+	for item in items {
+		match &item.inner.inner {
+			StructPatternItem::Field(field) => fields.push(field),
+			StructPatternItem::Rest => rest.push(&item.inner),
+		}
+	}
+	(fields, rest)
 }
 
 #[test]
@@ -1577,14 +1596,14 @@ fn test_module_pub_items_and_associated_types() {
 	};
 	assert!(pub_span.is_some());
 	assert!(matches!(
-		items[0].inner.inner,
+		items.inner[0].inner.inner,
 		Item::Function {
 			pub_span: Some(_),
 			..
 		}
 	));
 
-	let Item::Struct { pub_span, .. } = case.item(1) else {
+	let Item::RecordStruct { pub_span, .. } = case.item(1) else {
 		panic!("expected public struct")
 	};
 	assert!(pub_span.is_some());
@@ -1625,7 +1644,7 @@ fn test_external_module_item() {
 
 	case.diagnostics().assert_none();
 
-	let Item::ModuleDeclaration { pub_span, name } = case.item(0) else {
+	let Item::ModuleDeclaration { pub_span, name, .. } = case.item(0) else {
 		panic!("expected external module")
 	};
 
@@ -1699,7 +1718,7 @@ fn test_generic_struct() {
         }
     "});
 	case.diagnostics().assert_none();
-	let Item::Struct {
+	let Item::RecordStruct {
 		name,
 		type_params,
 		fields,
@@ -1725,7 +1744,7 @@ fn test_generic_struct_with_bounds() {
         }
     "});
 	case.diagnostics().assert_none();
-	let Item::Struct { type_params, .. } = case.item(0) else {
+	let Item::RecordStruct { type_params, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 	assert_eq!(type_params.len(), 1);
@@ -1746,26 +1765,33 @@ fn test_import_alias_and_entry_kinds() {
     "});
 
 	case.diagnostics().assert_none();
-	let Item::Import { alias, entries, .. } = case.item(0) else {
+	let Item::Import {
+		internal_name,
+		items,
+		..
+	} = case.item(0)
+	else {
 		panic!("expected import block")
 	};
 	assert_eq!(
-		alias.as_ref().and_then(|a| case.interner.resolve(a.inner)),
+		internal_name
+			.as_ref()
+			.and_then(|a| case.interner.resolve(a.inner)),
 		Some("host")
 	);
 	assert!(matches!(
-		entries[0].inner.inner.declaration,
+		items.inner[0].inner.inner.declaration,
 		ImportDeclaration::Function { .. }
 	));
 	assert!(matches!(
-		entries[1].inner.inner.declaration,
+		items.inner[1].inner.inner.declaration,
 		ImportDeclaration::Global {
 			mut_span: Some(_),
 			..
 		}
 	));
 	assert!(matches!(
-		entries[2].inner.inner.declaration,
+		items.inner[2].inner.inner.declaration,
 		ImportDeclaration::Memory { .. }
 	));
 }
@@ -1920,7 +1946,10 @@ fn test_typeset_attributes_parsed() {
 fn test_typeset_without_bounds_has_none() {
 	let case = TestCase::new("typeset Foo { u32, u64 }");
 	case.diagnostics().assert_none();
-	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+	let Item::TypeSet {
+		bounds, members, ..
+	} = case.item(0)
+	else {
 		panic!("expected TypeSet")
 	};
 	assert!(bounds.is_none());
@@ -1931,22 +1960,31 @@ fn test_typeset_without_bounds_has_none() {
 fn test_typeset_bound_clause_parses() {
 	let case = TestCase::new("typeset Integer: Add + Sub { i32, i64 }");
 	case.diagnostics().assert_none();
-	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+	let Item::TypeSet {
+		bounds, members, ..
+	} = case.item(0)
+	else {
 		panic!("expected TypeSet")
 	};
 	assert_eq!(members.len(), 2);
 	let Some(bounds) = bounds else {
 		panic!("expected a bound clause")
 	};
-	assert!(matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 2));
+	assert!(
+		matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 2)
+	);
 }
 
 #[test]
 fn test_typeset_bound_clause_with_where_bindings_parses() {
-	let case =
-		TestCase::new("typeset Integer: Add where { Output = Self } { i32, i64 }");
+	let case = TestCase::new(
+		"typeset Integer: Add where { Output = Self } { i32, i64 }",
+	);
 	case.diagnostics().assert_none();
-	let Item::TypeSet { bounds, members, .. } = case.item(0) else {
+	let Item::TypeSet {
+		bounds, members, ..
+	} = case.item(0)
+	else {
 		panic!("expected TypeSet")
 	};
 	assert_eq!(members.len(), 2);
@@ -2313,7 +2351,7 @@ fn test_imported_function_is_a_declaration_without_a_body() {
     "});
 	case.diagnostics().assert_none();
 
-	let Item::Import { entries, .. } = case.item(0) else {
+	let Item::Import { items: entries, .. } = case.item(0) else {
 		panic!("item 0 is {}, not an import", item_kind(case.item(0)))
 	};
 	assert_eq!(entries.len(), 1);

@@ -720,7 +720,7 @@ impl<'a> Builder<'a> {
 			ast::Item::Import {
 				module,
 				alias,
-				entries,
+				items: entries,
 			} => self.build_import_definition(
 				span,
 				module,
@@ -868,7 +868,11 @@ impl<'a> Builder<'a> {
 	fn build_use_tree(&mut self, tree: &ast::UseTree) -> NodeId {
 		match tree {
 			ast::UseTree::Glob => self.text(Text::Star),
-			ast::UseTree::Name { name, alias, .. } => {
+			ast::UseTree::Name {
+				segment: name,
+				alias,
+				..
+			} => {
 				let mut items: Vec<NodeId> = vec![self.symbol(name.inner)];
 				if let Some(alias) = alias {
 					items.push(self.text(Text::As));

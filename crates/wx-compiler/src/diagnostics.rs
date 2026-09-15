@@ -4,7 +4,7 @@
 //! stage-specific number range: `ast` uses E0xxx, `tir` uses E1xxx, and `vfs`
 //! uses E2xxx.
 //!
-use codespan_reporting::diagnostic::{Diagnostic, Severity};
+use codespan_reporting::diagnostic::{Diagnostic, Label, Severity};
 
 use crate::vfs::FileId;
 
@@ -99,6 +99,7 @@ define_diagnostic_codes! {
 		InvalidNamespace => "E0013",
 		InvalidLabel => "E0014",
 		InvalidBindingPattern => "E0015",
+		MissingImportAlias => "E0016",
 		CrlfLineEndings => "W0001",
 		VisibilityNotPermitted => "W0002",
 
@@ -170,7 +171,6 @@ define_diagnostic_codes! {
 		EnumDuplicateValue => "E1056",
 		NotConstEvaluatable => "E1057",
 		UnusedEnumVariant => "W1009",
-		MissingImportAlias => "E1058",
 		AmbiguousTraitMember => "E1059",
 		NotAField => "E1060",
 		DuplicateTraitImpl => "E1061",
@@ -199,6 +199,13 @@ define_diagnostic_codes! {
 		CannotImplementTypeset => "E1083",
 		FloatLiteralOverflow => "E1084",
 		FloatLiteralUnderflow => "E1085",
+		TupleStructBraceLiteral => "E1086",
+		DuplicateRestPattern => "E1087",
+		TupleStructBracePattern => "E1088",
+		RecordStructPositionalPattern => "E1089",
+		PrivateTupleField => "E1090",
+		NamespaceUsedAsType => "E1091",
+		DuplicateGenericParam => "E1092",
 
 		// VFS diagnostics (E2xxx).
 		ModuleFileNotFound => "E2000",
@@ -208,5 +215,53 @@ define_diagnostic_codes! {
 		StdPackageAsDependency => "E2004",
 		PackageDeclaredTwice => "E2005",
 		NestedModuleDeclaration => "E2006",
+	}
+}
+
+#[derive(Copy, Clone, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct TextSpan {
+	pub start: u32,
+	pub end: u32,
+}
+
+impl TextSpan {
+	pub fn new(start: u32, end: u32) -> TextSpan {
+		debug_assert!(end >= start);
+		TextSpan { start, end }
+	}
+
+	#[inline]
+	pub fn extract_str<'a>(&self, source: &'a str) -> &'a str {
+		&source[self.start as usize..self.end as usize]
+	}
+}
+
+impl From<TextSpan> for core::ops::Range<usize> {
+	fn from(val: TextSpan) -> Self {
+		val.start as usize..val.end as usize
+	}
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy, PartialEq)]
+pub struct SourceSpan {
+	pub file_id: FileId,
+	pub span: TextSpan,
+}
+
+impl SourceSpan {
+	pub fn new(file_id: FileId, span: TextSpan) -> Self {
+		Self { file_id, span }
+	}
+
+	pub fn primary_label(self) -> Label<FileId> {
+		Label::primary(self.file_id, self.span)
+	}
+
+	pub fn secondary_label(self) -> Label<FileId> {
+		Label::secondary(self.file_id, self.span)
 	}
 }

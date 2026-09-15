@@ -4,29 +4,30 @@ use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
 use crate::diagnostics::DiagnosticCode;
-use crate::vfs::{Files, PackageGraph, PackageKind};
+use crate::tir::builder::prescan::DefinitionRegistry;
+use crate::vfs::{Files, Package, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
-mod aggregates;
-mod body;
-mod bounds;
-mod calls;
-mod candidates;
-mod control;
-mod generics;
+// mod aggregates;
+// mod body;
+// mod bounds;
+// mod calls;
+// mod candidates;
+// mod control;
+// mod generics;
 mod literal;
-mod members;
-mod memory;
-mod modules;
-mod operators;
-mod paths;
+// mod members;
+// mod memory;
+// mod modules;
+// mod operators;
+// mod paths;
 mod prescan;
-mod signature;
-mod traits;
-mod type_compare;
-mod type_ctx;
-mod types;
-mod validation;
+// mod signature;
+// mod traits;
+// mod type_compare;
+// mod type_ctx;
+// mod types;
+// mod validation;
 
 use candidates::{CandidateSelection, CandidateSet};
 
@@ -45,13 +46,11 @@ use literal::{
 };
 use members::TraitMemberCandidate;
 use memory::report_cannot_store_through_immutable_pointer;
-use modules::{
-	DuplicateDefinitionDiagnostic, report_duplicate_definition,
-	report_missing_import_alias,
-};
+use modules::DuplicateDefinitionDiagnostic;
 use operators::{EvalMode, OperatorTraits};
 use paths::{
-	report_cannot_take_address_of_value, report_qualified_path_no_such_type,
+	PathQualifier, report_cannot_take_address_of_value,
+	report_qualified_path_no_such_type,
 	report_qualified_path_trait_not_satisfied,
 };
 use signature::{
@@ -159,7 +158,7 @@ struct Builder<'ast, 'graph> {
 	files: &'graph Files,
 	/// Read only to resolve what a package calls its dependencies, which is
 	/// where a package's canonical name lives (see `PackageGraph::dependency_names`).
-	packages: &'graph [PackageGraph],
+	packages: &'graph [Package],
 	/// The package being compiled. Only `export { .. }` needs this: exports
 	/// are a property of the artifact as a whole, so the sole legal home for
 	/// a block is this package's entry file — a dependency that declares one
@@ -169,7 +168,7 @@ struct Builder<'ast, 'graph> {
 	/// prelude every lookup falls back to. See [`Builder::lookup_scope_chain`].
 	stdlib_package: PackageId,
 	items: ItemRegistry,
-	modules: ModuleGraph,
+	defs: DefinitionRegistry,
 	types: TypeInterner,
 	diagnostics: Vec<Diagnostic<FileId>>,
 	export_block: Option<ExportBlock>,
@@ -212,15 +211,6 @@ enum SignatureStatus {
 	Cycle,
 }
 
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-struct AstEntry<'ast> {
-	def_id: ast::DefId,
-	file_id: FileId,
-	namespace: NamespaceIndex,
-	node: AstNodeRef<'ast>,
-}
-
 #[derive(Clone, Copy)]
 struct SigEntry {
 	node_idx: usize,
@@ -243,103 +233,6 @@ impl ResolveContext {
 	fn new(file_id: FileId, namespace: NamespaceIndex) -> Self {
 		Self { file_id, namespace }
 	}
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-enum AstNodeRef<'ast> {
-	Function {
-		item: &'ast ast::Item,
-	},
-	Struct {
-		item: &'ast ast::Item,
-	},
-	Enum {
-		item: &'ast ast::Item,
-	},
-	Global {
-		item: &'ast ast::Item,
-	},
-	Memory {
-		item: &'ast ast::Item,
-	},
-	Constant {
-		item: &'ast ast::Item,
-	},
-	TypeSet {
-		typeset_index: TypesetIndex,
-		item: &'ast ast::Item,
-	},
-	TypeAlias {
-		item: &'ast ast::Item,
-	},
-	Trait {
-		trait_index: TraitIndex,
-		item: &'ast ast::Item,
-	},
-	TraitFunction {
-		trait_index: TraitIndex,
-		item: &'ast ast::TraitItem,
-	},
-	TraitConst {
-		trait_index: TraitIndex,
-		item: &'ast ast::TraitItem,
-	},
-	TraitAssocType {
-		trait_index: TraitIndex,
-		item: &'ast ast::TraitItem,
-	},
-	TraitImplBlock {
-		item: &'ast ast::Item,
-	},
-	TraitImplFunction {
-		parent_id: ast::DefId,
-		item: &'ast ast::ImplItem,
-	},
-	TraitImplConstant {
-		parent_id: ast::DefId,
-		item: &'ast ast::ImplItem,
-	},
-	TraitImplAssocType {
-		parent_id: ast::DefId,
-		item: &'ast ast::ImplItem,
-	},
-	InherentImplBlock {
-		item: &'ast ast::Item,
-		block_index: InherentImplIndex,
-	},
-	InherentImplFunction {
-		block_id: ast::DefId,
-		item: &'ast ast::ImplItem,
-		block_index: InherentImplIndex,
-	},
-	InherentImplConst {
-		block_id: ast::DefId,
-		item: &'ast ast::ImplItem,
-		block_index: InherentImplIndex,
-	},
-	ImportedFunction {
-		import_module_index: ImportDeclIndex,
-		decl: &'ast ast::ImportDeclaration,
-	},
-	ImportedGlobal {
-		import_module_index: ImportDeclIndex,
-		decl: &'ast ast::ImportDeclaration,
-	},
-	/// One named leaf of a `use` tree. Everything it needs is already in
-	/// `tir.use_items[use_index]` — the syntactic prefix, the name, the
-	/// alias — so unlike every other variant here it holds no `&'ast`
-	/// reference.
-	Use {
-		use_index: UseIndex,
-	},
-	/// An `export { .. }` block. Carries no type of its own — its
-	/// "signature" is the act of resolving each listed name to an
-	/// `ExportItem`, which is why it rides the Phase 2 sweep like any
-	/// other item instead of needing a pass of its own.
-	Export {
-		item: &'ast ast::Item,
-	},
 }
 
 fn report_unused_enum_variants(
@@ -510,14 +403,12 @@ fn report_cannot_mutate_immutable(span: SourceSpan) -> Diagnostic<FileId> {
 }
 
 pub fn build(graph: &mut CompilationUnit) -> TIR {
-	let source_modules: Vec<_> = graph
-		.packages
-		.iter()
-		.flat_map(|package_graph| package_graph.modules.iter())
-		.collect();
-	assert!(
-		!source_modules.is_empty(),
-		"TIR::build requires at least one AST"
+	let mut diagnostics = Vec::new();
+	let defs = DefinitionRegistry::build(
+		&graph.packages,
+		&graph.files,
+		&mut graph.interner,
+		&mut diagnostics,
 	);
 
 	let mut builder = Builder {
@@ -528,129 +419,15 @@ pub fn build(graph: &mut CompilationUnit) -> TIR {
 		root_package: graph.root_package,
 		stdlib_package: graph.stdlib_package,
 		items: ItemRegistry::new(),
-		modules: ModuleGraph::new(graph.files.len()),
+		defs,
 		types: TypeInterner::new(),
-		diagnostics: Vec::new(),
+		diagnostics,
 		export_block: None,
 		sig_state: HashMap::new(),
 		sig_stack: Vec::new(),
 		ast_nodes: Vec::new(),
 		operator_traits: None,
 	};
-
-	// Every package gets a root namespace of its own, the root package
-	// included. That is what makes `parent: None` mean "nothing above this"
-	// and nothing else — previously it also meant "the root package's own
-	// scope", which is why a lookup walking past any package boundary fell
-	// through into the root's items, and why `is_ancestor_or_self` needed a
-	// hand-written stop at package roots.
-	//
-	// Created by walking `graph.packages` in order, so `NamespaceIndex`
-	// values never depend on `HashMap` iteration order: they end up in
-	// snapshots.
-	for package_graph in &graph.packages {
-		let namespace_idx = builder.modules.push_namespace(ModuleNamespace {
-			parent: None,
-			package: package_graph.id,
-			declaration: ModuleDeclarationKind::Package(
-				package_graph.modules[package_graph.root.as_usize()].file_id,
-			),
-			symbols: HashMap::new(),
-			wildcard_imports: Vec::new(),
-			accesses: Vec::new(),
-		});
-		builder
-			.modules
-			.package_namespaces
-			.insert(package_graph.id, namespace_idx);
-		// `crate` at a package root points at itself — there's no `super`
-		// here, since `parent: None` is exactly what marks a package
-		// boundary everywhere else in the resolver.
-		let crate_sym = builder.interner.get_or_intern("crate");
-		builder.modules.namespaces[usize::from(namespace_idx)]
-			.symbols
-			.insert(
-				(SymbolNamespace::Type, crate_sym),
-				SymbolEntry::Resolved {
-					kind: SymbolKind::Module { namespace_idx },
-					visibility: Visibility::Public,
-				},
-			);
-	}
-
-	// A dependency is an implicit `mod <key>;` at the top of the declaring
-	// package's entry file, so its name is an ordinary `Module` symbol in
-	// that package's own namespace. Nothing global is involved, which is what
-	// keeps a package's dependencies invisible to everyone else — including
-	// to its own dependents, who never declared them.
-	for package in &graph.packages {
-		let owner = builder.modules.package_namespaces[&package.id];
-		for (&name, target) in &package.dependencies {
-			let target_namespace = builder.modules.package_namespaces[target];
-			builder.modules.namespaces[usize::from(owner)]
-				.symbols
-				.insert(
-					(SymbolNamespace::Type, name),
-					SymbolEntry::Resolved {
-						kind: SymbolKind::Module {
-							namespace_idx: target_namespace,
-						},
-						visibility: Visibility::Public,
-					},
-				);
-		}
-	}
-
-	// Phase 1a: one namespace per file, created directly from the
-	// `SourceModule` tree vfs already built. `ModuleId`s are assigned in
-	// push order and vfs always pushes a parent before loading any child,
-	// so a child's `ModuleId` — and therefore its position in
-	// `source_modules` — always comes after its parent's; a child's parent
-	// namespace is therefore always already in `file_namespaces` by the
-	// time the child is processed. Every field of every `ModuleDecl` is set
-	// exactly once, here, straight from vfs's data — nothing downstream
-	// ever writes to one afterward.
-	for source_module in source_modules.iter().copied() {
-		let package = &builder.packages[source_module.package_id.as_usize()];
-		let namespace = match &source_module.declaration {
-			None => builder.modules.package_namespaces[&package.id],
-			Some(declaration) => {
-				let parent_module =
-					&package.modules[declaration.parent.as_usize()];
-				let parent_namespace = builder.modules.file_namespaces
-					[parent_module.file_id.as_usize()];
-				match builder.check_module_collision(
-					parent_module.file_id,
-					parent_namespace,
-					declaration.name,
-				) {
-					Some(existing) => existing,
-					None => builder.create_module_namespace(
-						parent_module.file_id,
-						parent_namespace,
-						declaration.name,
-						declaration.pub_span,
-						Some(source_module.file_id),
-					),
-				}
-			}
-		};
-		builder.modules.file_namespaces[source_module.file_id.as_usize()] =
-			namespace;
-	}
-
-	// Phase 1b: register all top-level items into ast_nodes / pending.
-	for source_module in source_modules.iter().copied() {
-		let namespace =
-			builder.modules.file_namespaces[source_module.file_id.as_usize()];
-		for item in source_module.ast.items.iter() {
-			builder.pre_scan_item(
-				source_module.file_id,
-				namespace,
-				&item.inner.inner,
-			);
-		}
-	}
 
 	// Build sig_state from ast_nodes with exact capacity; all start as Pending.
 	builder.sig_state = HashMap::with_capacity(builder.ast_nodes.len());
@@ -729,67 +506,75 @@ impl<'ast> Builder<'ast, '_> {
 	fn finish(self) -> TIR {
 		TIR {
 			items: self.items,
-			modules: self.modules,
+			defs: self.defs,
 			types: self.types,
 			diagnostics: self.diagnostics,
 			export_block: self.export_block,
 		}
 	}
 
+	fn symbol_status(&self, symbol_key: DefKey) -> ComputeState {
+		let def_id = self.defs.namespaces
+			[usize::from(symbol_key.namespace_idx)]
+		.defs[usize::from(symbol_key.def_idx)]
+		.def_id;
+		self.sig_state.get(&def_id).unwrap().state
+	}
+
 	fn record_symbol_access(
 		&mut self,
 		file_id: FileId,
-		kind: SymbolKind,
+		kind: DefKind,
 		span: TextSpan,
 	) {
 		let span = SourceSpan::new(file_id, span);
 		match kind {
-			SymbolKind::Struct { struct_index } => {
+			DefKind::Struct { struct_index } => {
 				self.items.structs[usize::from(struct_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Enum { enum_index } => {
+			DefKind::Enum { enum_index } => {
 				self.items.enums[usize::from(enum_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Trait { trait_index } => {
+			DefKind::Trait { trait_index } => {
 				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::TypeSet { typeset_index } => {
+			DefKind::TypeSet { typeset_index } => {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::TypeAlias { type_alias_index } => {
+			DefKind::TypeAlias { type_alias_index } => {
 				self.items.type_aliases[usize::from(type_alias_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Const { const_index } => {
+			DefKind::Const { const_index } => {
 				self.items.constants[usize::from(const_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Memory { memory_index, .. } => {
+			DefKind::Memory { memory_index, .. } => {
 				self.items.memories[usize::from(memory_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Function { func_index } => {
+			DefKind::Function { func_index } => {
 				self.items.functions[usize::from(func_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Global { global_index } => {
+			DefKind::Global { global_index } => {
 				self.items.globals[usize::from(global_index)]
 					.accesses
 					.push(span);
 			}
-			SymbolKind::TraitAssocType {
+			DefKind::TraitAssocType {
 				trait_index,
 				assoc_name,
 			} => {
@@ -799,8 +584,8 @@ impl<'ast> Builder<'ast, '_> {
 					.accesses
 					.push(span);
 			}
-			SymbolKind::Module { namespace_idx } => {
-				self.modules.namespaces[usize::from(namespace_idx)]
+			DefKind::Namespace { namespace_idx } => {
+				self.defs.namespaces[usize::from(namespace_idx)]
 					.accesses
 					.push(span);
 			}
@@ -855,9 +640,8 @@ impl<'ast> Builder<'ast, '_> {
 			let is_intrinsic =
 				function.attributes.contains(&ItemAttribute::Intrinsic);
 			let is_imported = matches!(
-				self.modules.namespaces[usize::from(function.namespace)]
-					.declaration,
-				ModuleDeclarationKind::Import(_)
+				self.defs.namespaces[usize::from(function.namespace)].kind,
+				NamespaceKind::Import(_)
 			);
 			if is_intrinsic || is_imported {
 				continue;
@@ -924,9 +708,8 @@ impl<'ast> Builder<'ast, '_> {
 
 		for global in self.items.globals.iter() {
 			let is_imported = matches!(
-				self.modules.namespaces[usize::from(global.namespace)]
-					.declaration,
-				ModuleDeclarationKind::Import(_)
+				self.defs.namespaces[usize::from(global.namespace)].kind,
+				NamespaceKind::Import(_)
 			);
 			if !is_imported && global.accesses.is_empty() {
 				let name = self.interner.resolve(global.name.inner).unwrap();
@@ -996,37 +779,76 @@ impl<'ast> Builder<'ast, '_> {
 				);
 			} else {
 				// Struct is live — warn about fields that are initialized but never read.
-				for field in struct_.fields.iter() {
-					if field.pub_span.is_some() {
-						continue;
+				match &struct_.fields {
+					StructKind::Record { fields, .. } => {
+						for field in fields.iter() {
+							if field.pub_span.is_some() {
+								continue;
+							}
+							let has_read = field.accesses.iter().any(|a| {
+								matches!(
+									a.kind,
+									FieldAccessKind::Read
+										| FieldAccessKind::ReadWrite
+								)
+							});
+							let has_init = field.accesses.iter().any(|a| {
+								matches!(a.kind, FieldAccessKind::Init)
+							});
+							if has_init && !has_read {
+								let name = self
+									.interner
+									.resolve(field.name.inner)
+									.unwrap();
+								self.diagnostics.push(
+									Diagnostic::warning()
+										.with_code(field_code)
+										.with_message(format!(
+											"field `{name}` is never read"
+										))
+										.with_label(
+											SourceSpan::new(
+												struct_.file_id,
+												field.name.span,
+											)
+											.primary_label(),
+										),
+								);
+							}
+						}
 					}
-					let has_read = field.accesses.iter().any(|a| {
-						matches!(
-							a.kind,
-							FieldAccessKind::Read | FieldAccessKind::ReadWrite
-						)
-					});
-					let has_init = field
-						.accesses
-						.iter()
-						.any(|a| matches!(a.kind, FieldAccessKind::Init));
-					if has_init && !has_read {
-						let name =
-							self.interner.resolve(field.name.inner).unwrap();
-						self.diagnostics.push(
-							Diagnostic::warning()
-								.with_code(field_code)
-								.with_message(format!(
-									"field `{name}` is never read"
-								))
-								.with_label(
-									SourceSpan::new(
-										struct_.file_id,
-										field.name.span,
-									)
-									.primary_label(),
-								),
-						);
+					StructKind::Tuple { fields } => {
+						for (index, field) in fields.iter().enumerate() {
+							if field.pub_span.is_some() {
+								continue;
+							}
+							let has_read = field.accesses.iter().any(|a| {
+								matches!(
+									a.kind,
+									FieldAccessKind::Read
+										| FieldAccessKind::ReadWrite
+								)
+							});
+							let has_init = field.accesses.iter().any(|a| {
+								matches!(a.kind, FieldAccessKind::Init)
+							});
+							if has_init && !has_read {
+								self.diagnostics.push(
+									Diagnostic::warning()
+										.with_code(field_code)
+										.with_message(format!(
+											"field {index} is never read"
+										))
+										.with_label(
+											SourceSpan::new(
+												struct_.file_id,
+												field.ty.span,
+											)
+											.primary_label(),
+										),
+								);
+							}
+						}
 					}
 				}
 			}

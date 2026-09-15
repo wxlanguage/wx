@@ -235,10 +235,10 @@ impl<'ast> Builder<'ast, '_> {
 		// The impl exists but doesn't override this method — fall back to the
 		// trait's own bodied default (`PartialEq::ne`'s `!self.eq(other)`).
 		match self.items.traits[usize::from(trait_index)]
-			.members
+			.bindings
 			.get(&method_symbol)?
 		{
-			MemberIndex::Function(func_idx)
+			TraitMemberKind::Function(func_idx)
 				if self.entry_has_body(ImplEntry::Method(*func_idx)) =>
 			{
 				Some(OperatorMethod::Default(*func_idx))
@@ -258,7 +258,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		ctx: &ExprContext,
 		func_idx: FunctionIndex,
-		op_span: ast::TextSpan,
+		op_span: TextSpan,
 	) -> ast::DefId {
 		let func = &mut self.items.functions[usize::from(func_idx)];
 		func.accesses
@@ -293,10 +293,10 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		match self.items.traits[usize::from(trait_index)]
-			.members
+			.bindings
 			.get(&method_symbol)
 		{
-			Some(MemberIndex::Function(idx)) => Some(*idx),
+			Some(TraitMemberKind::Function(idx)) => Some(*idx),
 			_ => unreachable!("operator trait must declare its own method"),
 		}
 	}
@@ -334,7 +334,7 @@ impl<'ast> Builder<'ast, '_> {
 		right: Expression,
 		operand_ty: TypeIndex,
 		result_ty: TypeIndex,
-		span: ast::TextSpan,
+		span: TextSpan,
 		impl_node: ImplNode,
 	) -> Expression {
 		let binary_op = Spanned {
@@ -484,7 +484,7 @@ impl<'ast> Builder<'ast, '_> {
 		ctx: &ExprContext,
 		operator: Spanned<ast::BinaryOp>,
 		ty: TypeIndex,
-		operand_span: ast::TextSpan,
+		operand_span: TextSpan,
 	) -> Result<CompoundOperatorDispatch, ()> {
 		let EvalMode::Runtime(traits) = &ctx.mode else {
 			unreachable!(
@@ -581,7 +581,7 @@ impl<'ast> Builder<'ast, '_> {
 		operator: Spanned<ast::UnaryOp>,
 		operand: Expression,
 		ty: TypeIndex,
-		span: ast::TextSpan,
+		span: TextSpan,
 	) -> Expression {
 		let EvalMode::Runtime(traits) = &ctx.mode else {
 			return Expression {
@@ -1050,8 +1050,11 @@ impl<'ast> Builder<'ast, '_> {
 	/// an access against the `PartialEq` / `PartialOrd` method the operator
 	/// conceptually resolves to for `operand_ty`, so hover / go-to-definition /
 	/// find-references on `==` / `<` / … behave the same as on `+`. An
-	/// `operand_ty` with no matching impl (an enum, a pointer, an abstract
-	/// `Mem::Size`) records nothing.
+	/// `operand_ty` with no matching impl (an enum, a pointer) records
+	/// nothing. Only ever called with a concrete `operand_ty` — an abstract
+	/// `TypeParam`/`AssocTypeProjection` (e.g. `Mem::Size`) goes through
+	/// `build_operator_dispatch` instead, which can defer to a
+	/// `GenericMethodCall`.
 	fn native_comparison(
 		&mut self,
 		ctx: &ExprContext,
@@ -1059,7 +1062,7 @@ impl<'ast> Builder<'ast, '_> {
 		left: Expression,
 		right: Expression,
 		operand_ty: TypeIndex,
-		span: ast::TextSpan,
+		span: TextSpan,
 	) -> Expression {
 		let method = match &ctx.mode {
 			EvalMode::Runtime(traits) => traits
@@ -1118,7 +1121,7 @@ impl<'ast> Builder<'ast, '_> {
 		left: Expression,
 		right: Expression,
 		ty: TypeIndex,
-		span: ast::TextSpan,
+		span: TextSpan,
 	) -> Expression {
 		let eligible = match operator.inner {
 			ast::BinaryOp::Add
@@ -1223,9 +1226,7 @@ impl<'ast> Builder<'ast, '_> {
 					expr.span,
 				)),
 			(left_type, right_type)
-				if left_type == right_type
-					&& (left_type.is_primitive()
-						|| self.is_typeset_bounded_assoc_type(left_type)) =>
+				if left_type == right_type && left_type.is_primitive() =>
 			{
 				Ok(self.native_comparison(
 					ctx, operator, left, right, left_type, expr.span,
@@ -1272,10 +1273,15 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			// Same type, but none of the built-in comparison arms above matched
 			// (not a primitive / bool / enum / pointer pair) — a struct, slice,
-			// tuple, etc. `==`/`!=` dispatch through `PartialEq` and
-			// `<`/`<=`/`>`/`>=` through `PartialOrd` (`build_operator_dispatch`,
-			// result type `bool`); a type with no such impl gets "operator
-			// cannot be applied to type `T`".
+			// tuple, a `TypeParam`/`AssocTypeProjection` (e.g. `M::Size`), etc.
+			// `==`/`!=` dispatch through `PartialEq` and `<`/`<=`/`>`/`>=`
+			// through `PartialOrd` (`build_operator_dispatch`, result type
+			// `bool`). For an abstract operand this defers to a
+			// `GenericMethodCall` when its bounds actually imply the trait
+			// (`abstract_operand_defers_operator`) — a typeset bound alone,
+			// e.g. `Size: Sub + Add + Div`, is not enough — otherwise, like a
+			// concrete type with no such impl, it's "operator cannot be
+			// applied to type `T`".
 			(left_type, right_type) if left_type == right_type => Ok(self
 				.build_operator_dispatch(
 					ctx,

@@ -18,7 +18,7 @@ impl<'ast> Builder<'ast, '_> {
 		let symbol =
 			match self.resolve_pending_global_symbol(
 				resolve_context.namespace,
-				(SymbolNamespace::Type, identifier.inner),
+				(BindingNamespace::Type, identifier.inner),
 				SourceSpan::new(file_id, identifier.span),
 			)? {
 				Some(symbol) => symbol,
@@ -30,7 +30,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 		match symbol {
-			SymbolKind::Trait { trait_index } => {
+			DefKind::Trait { trait_index } => {
 				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
@@ -40,7 +40,7 @@ impl<'ast> Builder<'ast, '_> {
 					span: full_span,
 				})
 			}
-			SymbolKind::TypeSet { typeset_index } => {
+			DefKind::TypeSet { typeset_index } => {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, identifier.span));
@@ -105,7 +105,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 		// Walk all but the last segment as type namespaces (modules).
 		let first = &segs[0];
-		let Ok(mut namespace_ty) = self.resolve_type_identifier(
+		let Ok(mut qualifier) = self.resolve_type_identifier(
 			resolve_context,
 			None,
 			first.ident,
@@ -115,18 +115,18 @@ impl<'ast> Builder<'ast, '_> {
 		};
 		let mut namespace_span = first.ident.span;
 		for seg in &segs[1..segs.len() - 1] {
-			match self.resolve_namespace_type_member(
+			match self.advance_path_qualifier(
 				resolve_context,
 				None,
 				Spanned {
-					inner: namespace_ty,
+					inner: qualifier,
 					span: namespace_span,
 				},
 				seg,
 				TypeArgArity::RequireExact,
 			) {
-				Ok(ty) => {
-					namespace_ty = ty;
+				Ok(q) => {
+					qualifier = q;
 					namespace_span = seg.ident.span;
 				}
 				Err(()) => return Err(()),
@@ -136,9 +136,7 @@ impl<'ast> Builder<'ast, '_> {
 		// Final segment: look up the symbol in the final namespace and convert to a bound.
 		let last = segs.last().unwrap();
 		let file_id = resolve_context.file_id;
-		let &Type::Namespace { namespace_idx } =
-			self.types.resolve(namespace_ty)
-		else {
+		let PathQualifier::Namespace(namespace_idx) = qualifier else {
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_message(
@@ -152,7 +150,7 @@ impl<'ast> Builder<'ast, '_> {
 			match self.resolve_pending_namespace_symbol(
 				resolve_context.namespace,
 				namespace_idx,
-				(SymbolNamespace::Type, last.ident.inner),
+				(BindingNamespace::Type, last.ident.inner),
 				SourceSpan::new(file_id, last.ident.span),
 			)? {
 				Some(kind) => kind,
@@ -164,7 +162,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 		match kind {
-			SymbolKind::Trait { trait_index } => {
+			DefKind::Trait { trait_index } => {
 				self.items.traits[usize::from(trait_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
@@ -174,7 +172,7 @@ impl<'ast> Builder<'ast, '_> {
 					span: full_span,
 				})
 			}
-			SymbolKind::TypeSet { typeset_index } => {
+			DefKind::TypeSet { typeset_index } => {
 				self.items.typesets[usize::from(typeset_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, last.ident.span));
@@ -418,7 +416,7 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn owner_type_params(
 		&self,
 		owner: TypeParamOwner,
-	) -> &[TypeParamInfo] {
+	) -> &[TypeParamDef] {
 		match owner {
 			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.items.inherent_impls[usize::from(block_idx)].type_params
@@ -487,17 +485,17 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn resolve_generic_type_application(
 		&mut self,
 		resolve_context: ResolveContext,
-		symbol_kind: SymbolKind,
+		symbol_kind: DefKind,
 		resolved_args: &[TypeIndex],
 		span: TextSpan,
 		arity: TypeArgArity,
 	) -> TypeIndex {
 		let (expected, name_sym) = match symbol_kind {
-			SymbolKind::Struct { struct_index } => {
+			DefKind::Struct { struct_index } => {
 				let s = &self.items.structs[usize::from(struct_index)];
 				(s.type_params.len(), s.name.inner)
 			}
-			SymbolKind::TypeAlias { type_alias_index } => {
+			DefKind::TypeAlias { type_alias_index } => {
 				let a = &self.items.type_aliases[usize::from(type_alias_index)];
 				(a.type_params.len(), a.name.inner)
 			}
@@ -541,7 +539,7 @@ impl<'ast> Builder<'ast, '_> {
 		};
 
 		match symbol_kind {
-			SymbolKind::Struct { struct_index } => {
+			DefKind::Struct { struct_index } => {
 				self.items.structs[usize::from(struct_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
@@ -550,7 +548,7 @@ impl<'ast> Builder<'ast, '_> {
 					args: args.into_boxed_slice(),
 				})
 			}
-			SymbolKind::TypeAlias { type_alias_index } => {
+			DefKind::TypeAlias { type_alias_index } => {
 				self.items.type_aliases[usize::from(type_alias_index)]
 					.accesses
 					.push(SourceSpan::new(resolve_context.file_id, span));
@@ -602,30 +600,5 @@ impl<'ast> Builder<'ast, '_> {
 			| Type::Error => TypeIndex::INFER,
 			_ => result,
 		}
-	}
-
-	/// `true` when `ty` is an `AssocTypeProjection` (e.g. `M::Size` where
-	/// `type Size: PointerSize`) whose owning trait declares that associated
-	/// type with a bound on a typeset — i.e. it will monomorphize to one of a
-	/// closed set of concrete primitives. Used where an abstract operand still
-	/// supports a native operation because every possible instantiation does.
-	pub(super) fn is_typeset_bounded_assoc_type(&self, ty: TypeIndex) -> bool {
-		let Type::AssocTypeProjection {
-			trait_index,
-			assoc_name,
-			..
-		} = self.types.resolve(ty)
-		else {
-			return false;
-		};
-		self.items
-			.trait_associated_type(*trait_index, *assoc_name)
-			.is_some_and(|a| {
-				a.bounds.traits.iter().any(|tb| {
-					self.items.traits[usize::from(tb.trait_index)]
-						.typeset_index
-						.is_some()
-				})
-			})
 	}
 }

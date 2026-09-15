@@ -6,10 +6,9 @@ use tower_lsp_server::ls_types::{
 };
 use wx_compiler::ast::StringInterner;
 use wx_compiler::tir::{
-	ImplEntry, ImplTarget, ModuleDeclarationKind, NamespaceIndex, TIR,
-	TypeFormatter,
+	ImplEntry, ImplTarget, NamespaceIndex, NamespaceKind, TIR, TypeFormatter,
 };
-use wx_compiler::vfs::{FileId, PackageGraph};
+use wx_compiler::vfs::{FileId, Package};
 
 use crate::symbol_index::{ImplRef, SymbolIndex, SymbolKind};
 
@@ -107,7 +106,7 @@ pub fn local_completion_items(
 	tir: &TIR,
 	func_index: usize,
 	interner: &StringInterner,
-	packages: &[PackageGraph],
+	packages: &[Package],
 	cursor_offset: u32,
 	prefix: &str,
 ) -> Vec<CompletionItem> {
@@ -116,10 +115,10 @@ pub fn local_completion_items(
 	let formatter = TypeFormatter::new(
 		&tir.types,
 		&tir.items,
-		&tir.modules,
+		&tir.defs,
 		interner,
 		packages,
-		tir.modules.namespaces[usize::from(function.namespace)].package,
+		tir.defs.namespaces[usize::from(function.namespace)].package_id,
 	);
 	let body = match function.body {
 		Some(idx) => &tir.items.bodies[usize::from(idx)],
@@ -200,20 +199,20 @@ fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
 	// scope is the package's root namespace, which records that file id.
 	// Checked first because a compilation holds only a handful of packages,
 	// while `module_decls` grows with every file in it.
-	for &namespace_idx in tir.modules.package_namespaces.values() {
+	for &namespace_idx in tir.defs.package_namespaces.values() {
 		if matches!(
-			tir.modules.namespaces[usize::from(namespace_idx)].declaration,
-			ModuleDeclarationKind::Package(package_file)
+			tir.defs.namespaces[usize::from(namespace_idx)].kind,
+			NamespaceKind::Package(package_file)
 				if package_file == file_id
 		) {
 			return Some(namespace_idx);
 		}
 	}
 
-	tir.modules
+	tir.defs
 		.module_decls
 		.iter()
-		.find(|decl| decl.own_file_id == Some(file_id))
+		.find(|decl| decl.content_file_id == Some(file_id))
 		.map(|decl| decl.namespace_idx)
 }
 
@@ -235,7 +234,7 @@ pub fn visible_namespaces(
 		if !visible.insert(idx) {
 			break;
 		}
-		let ns = &tir.modules.namespaces[usize::from(idx)];
+		let ns = &tir.defs.namespaces[usize::from(idx)];
 		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
 		current = ns.parent;
 	}
@@ -642,7 +641,7 @@ fn path_completion_items(
 				member_completion_items(
 					tir,
 					interner,
-					tir.items.traits[usize::from(idx)].members.iter().map(
+					tir.items.traits[usize::from(idx)].bindings.iter().map(
 						|(&name, &member)| (name, member.entry(&tir.items)),
 					),
 					prefix,
@@ -656,7 +655,7 @@ fn path_completion_items(
 pub fn completion_items(
 	tir: &TIR,
 	interner: &StringInterner,
-	packages: &[PackageGraph],
+	packages: &[Package],
 	symbol_index: &SymbolIndex,
 	file_id: FileId,
 	source: &str,

@@ -28,13 +28,10 @@ impl<'tir> Builder<'tir> {
 				let (struct_index, args) = self.instantiate_struct(object.ty);
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, &args);
-				let decl_index = usize::from(
-					self.tir.items.structs[usize::from(struct_index)].lookup
-						[&member.inner],
-				);
 				let aggregate = self.aggregate(aggregate_index);
-				let field_offset =
-					aggregate.field(aggregate.physical(decl_index)).offset;
+				let field_offset = aggregate
+					.field(aggregate.physical(usize::from(member.inner)))
+					.offset;
 				(base_ptr, base_offset + field_offset, memory_id)
 			}
 			tir::PlaceKind::Index { object, index } => {
@@ -100,12 +97,9 @@ impl<'tir> Builder<'tir> {
 				let (struct_index, args) = self.instantiate_struct(object.ty);
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, &args);
-				let decl_index = usize::from(
-					self.tir.items.structs[usize::from(struct_index)].lookup
-						[&member.inner],
-				);
-				let phys_index =
-					self.aggregate(aggregate_index).physical(decl_index);
+				let phys_index = self
+					.aggregate(aggregate_index)
+					.physical(usize::from(member.inner));
 				let tir::ExprKind::Local {
 					scope_index,
 					local_index,

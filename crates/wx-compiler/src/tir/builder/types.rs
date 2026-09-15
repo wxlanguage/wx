@@ -127,59 +127,60 @@ impl<'ast> Builder<'ast, '_> {
 		TypeFormatter::new(
 			&self.types,
 			&self.items,
-			&self.modules,
+			&self.defs,
 			self.interner,
 			self.packages,
-			self.modules.namespaces[usize::from(namespace)].package,
+			self.defs.namespaces[usize::from(namespace)].package_id,
 		)
 	}
 
 	pub(super) fn symbol_kind_to_type(
 		&mut self,
-		kind: SymbolKind,
+		kind: DefKind,
 	) -> Option<TypeIndex> {
 		match kind {
-			SymbolKind::Memory {
+			DefKind::Memory {
 				size: kind,
 				memory_index,
 			} => {
 				let id = self.items.memories[usize::from(memory_index)].id;
 				Some(self.types.intern(Type::Memory { size: kind, id }))
 			}
-			SymbolKind::Module { namespace_idx } => {
-				Some(self.types.intern(Type::Namespace { namespace_idx }))
-			}
-			SymbolKind::Enum { enum_index } => {
+			DefKind::Enum { enum_index } => {
 				Some(self.types.intern(Type::Enum { enum_index }))
 			}
-			SymbolKind::Struct { struct_index } => {
+			DefKind::Struct { struct_index } => {
 				Some(self.types.intern(Type::Struct {
 					struct_index,
 					args: Box::new([]),
 				}))
 			}
-			SymbolKind::Const { const_index } => {
+			DefKind::Const { const_index } => {
 				let constant = &self.items.constants[usize::from(const_index)];
 				Some(constant.ty.inner)
 			}
-			SymbolKind::Global { global_index } => {
+			DefKind::Global { global_index } => {
 				let global = &self.items.globals[usize::from(global_index)];
 				Some(global.ty.inner)
 			}
-			SymbolKind::Function { func_index } => {
+			DefKind::Function { func_index } => {
 				let function = &self.items.functions[usize::from(func_index)];
 				Some(function.signature_index)
 			}
-			SymbolKind::TypeAlias { type_alias_index } => Some(
+			DefKind::TypeAlias { type_alias_index } => Some(
 				self.items.type_aliases[usize::from(type_alias_index)].body,
 			),
-			SymbolKind::Trait { .. }
-			| SymbolKind::TypeSet { .. }
-			| SymbolKind::TraitAssocType { .. } => None,
+			DefKind::Namespace { .. }
+			| DefKind::Trait { .. }
+			| DefKind::TypeSet { .. }
+			| DefKind::TraitAssocType { .. } => None,
 		}
 	}
 
-	/// Resolve a bare identifier symbol to a `TypeIndex`.
+	/// Resolve a bare identifier symbol to a `PathQualifier` — either a real
+	/// type, or (uniquely among type-position resolutions) a module, since
+	/// this doubles as the head resolver for a longer `::`-separated path
+	/// whose first segment may legitimately name a namespace to walk into.
 	/// Extracted from the `TypeExpression::Identifier` arm so it can be called
 	/// directly from path-walking code without constructing AST nodes.
 	pub(super) fn resolve_type_identifier(
@@ -188,10 +189,10 @@ impl<'ast> Builder<'ast, '_> {
 		scope: Option<GenericScope>,
 		identifier: Spanned<SymbolU32>,
 		arity: TypeArgArity,
-	) -> Result<TypeIndex, ()> {
+	) -> Result<PathQualifier, ()> {
 		if let Some(scope) = scope {
 			// Search the owner's own type params first (innermost scope wins).
-			let own_params: &[TypeParamInfo] = match scope.owner {
+			let own_params: &[TypeParamDef] = match scope.owner {
 				TypeParamOwner::InherentImpl(block_idx) => {
 					&self.items.inherent_impls[usize::from(block_idx)]
 						.type_params
@@ -239,10 +240,12 @@ impl<'ast> Builder<'ast, '_> {
 						resolve_context.file_id,
 						identifier.span,
 					));
-				return Ok(self.types.intern(Type::TypeParam {
-					owner,
-					param_index: abs_index,
-				}));
+				return Ok(PathQualifier::Type(self.types.intern(
+					Type::TypeParam {
+						owner,
+						param_index: abs_index,
+					},
+				)));
 			}
 			// Not found in own params — check the parent impl block (if any).
 			if let TypeParamOwner::Function(fn_id) = scope.owner {
@@ -269,10 +272,12 @@ impl<'ast> Builder<'ast, '_> {
 									resolve_context.file_id,
 									identifier.span,
 								));
-							return Ok(self.types.intern(Type::TypeParam {
-								owner: parent_owner,
-								param_index: abs_index,
-							}));
+							return Ok(PathQualifier::Type(self.types.intern(
+								Type::TypeParam {
+									owner: parent_owner,
+									param_index: abs_index,
+								},
+							)));
 						}
 					}
 				}
@@ -300,11 +305,11 @@ impl<'ast> Builder<'ast, '_> {
 			if let Some(owner) = scope.map(|s| s.owner) {
 				self.record_self_keyword_access(owner, span);
 			}
-			return Ok(self_ty);
+			return Ok(PathQualifier::Type(self_ty));
 		}
 		let symbol = match self.resolve_pending_global_symbol(
 			resolve_context.namespace,
-			(SymbolNamespace::Type, identifier.inner),
+			(BindingNamespace::Type, identifier.inner),
 			SourceSpan::new(resolve_context.file_id, identifier.span),
 		)? {
 			Some(symbol) => symbol,
@@ -320,7 +325,7 @@ impl<'ast> Builder<'ast, '_> {
 						.associated_type(identifier.inner)
 						.is_some()
 				{
-					SymbolKind::TraitAssocType {
+					DefKind::TraitAssocType {
 						trait_index: *trait_index,
 						assoc_name: identifier.inner,
 					}
@@ -336,7 +341,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		};
 		match symbol {
-			SymbolKind::TraitAssocType { assoc_name, .. } => {
+			DefKind::TraitAssocType { assoc_name, .. } => {
 				let name = self.interner.resolve(assoc_name).unwrap();
 				self.diagnostics.push(
 					Diagnostic::error()
@@ -357,7 +362,7 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				Err(())
 			}
-			SymbolKind::Trait { .. } | SymbolKind::TypeSet { .. } => {
+			DefKind::Trait { .. } | DefKind::TypeSet { .. } => {
 				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ExpectedBound.code())
@@ -369,7 +374,7 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				Err(())
 			}
-			SymbolKind::Struct { .. } | SymbolKind::TypeAlias { .. } => {
+			DefKind::Struct { .. } | DefKind::TypeAlias { .. } => {
 				let ty = self.resolve_generic_type_application(
 					resolve_context,
 					symbol,
@@ -380,8 +385,16 @@ impl<'ast> Builder<'ast, '_> {
 				if ty == TypeIndex::ERROR {
 					Err(())
 				} else {
-					Ok(ty)
+					Ok(PathQualifier::Type(ty))
 				}
+			}
+			DefKind::Namespace { namespace_idx } => {
+				self.record_symbol_access(
+					resolve_context.file_id,
+					symbol,
+					identifier.span,
+				);
+				Ok(PathQualifier::Namespace(namespace_idx))
 			}
 			symbol => {
 				self.record_symbol_access(
@@ -390,7 +403,7 @@ impl<'ast> Builder<'ast, '_> {
 					identifier.span,
 				);
 				if let Some(ty) = self.symbol_kind_to_type(symbol) {
-					return Ok(ty);
+					return Ok(PathQualifier::Type(ty));
 				}
 				self.diagnostics
 					.push(report_undeclared_type(SourceSpan::new(
@@ -398,6 +411,29 @@ impl<'ast> Builder<'ast, '_> {
 						identifier.span,
 					)));
 				Err(())
+			}
+		}
+	}
+
+	/// Collapses a fully-resolved `PathQualifier` down to the `TypeIndex` a
+	/// type-position caller actually needs, reporting
+	/// [`DiagnosticCode::NamespaceUsedAsType`] if the path turned out to name
+	/// a module rather than a type (e.g. `local x: some_module;`).
+	fn qualifier_to_type_or_report(
+		&mut self,
+		resolve_context: ResolveContext,
+		qualifier: PathQualifier,
+		span: TextSpan,
+	) -> TypeIndex {
+		match qualifier {
+			PathQualifier::Type(ty) => ty,
+			PathQualifier::Namespace(namespace_idx) => {
+				self.diagnostics.push(report_namespace_used_as_type(
+					self.formatter(resolve_context.namespace),
+					namespace_idx,
+					SourceSpan::new(resolve_context.file_id, span),
+				));
+				TypeIndex::ERROR
 			}
 		}
 	}
@@ -414,7 +450,7 @@ impl<'ast> Builder<'ast, '_> {
 		scope: GenericScope,
 		name: SymbolU32,
 	) -> Option<u32> {
-		let own_params: &[TypeParamInfo] = match scope.owner {
+		let own_params: &[TypeParamDef] = match scope.owner {
 			TypeParamOwner::InherentImpl(block_idx) => {
 				&self.items.inherent_impls[usize::from(block_idx)].type_params
 			}
@@ -490,6 +526,66 @@ impl<'ast> Builder<'ast, '_> {
 		ty
 	}
 
+	/// Resolves a `memory::`/`Self::M::`-style memory tag (the segment list
+	/// before `::` in `heap::&[u8]`) to the `TypeIndex` it names, rejecting
+	/// anything that isn't a memory declaration or a still-generic
+	/// type-param/associated-type standing in for one. `Err(())` means a
+	/// diagnostic was already pushed.
+	fn resolve_memory_tag(
+		&mut self,
+		resolve_context: ResolveContext,
+		scope: Option<GenericScope>,
+		memory: &[ast::PathSegment],
+	) -> Result<TypeIndex, ()> {
+		let first = &memory[0];
+		let mut qualifier = self.resolve_type_identifier(
+			resolve_context,
+			scope,
+			first.ident,
+			TypeArgArity::RequireExact,
+		)?;
+		// Walk remaining segments (e.g. `Self::M` has two: `Self`, then `M`).
+		let mut namespace_span = first.ident.span;
+		for segment in &memory[1..] {
+			qualifier = self.advance_path_qualifier(
+				resolve_context,
+				scope,
+				Spanned {
+					inner: qualifier,
+					span: namespace_span,
+				},
+				segment,
+				TypeArgArity::RequireExact,
+			)?;
+			namespace_span = segment.ident.span;
+		}
+
+		let span = TextSpan::new(
+			memory.first().unwrap().ident.span.start,
+			memory.last().unwrap().ident.span.end,
+		);
+		match qualifier {
+			PathQualifier::Type(ty)
+				if matches!(
+					self.types.resolve(ty),
+					Type::Memory { .. }
+						| Type::TypeParam { .. }
+						| Type::AssocTypeProjection { .. }
+				) =>
+			{
+				Ok(ty)
+			}
+			_ => {
+				self.diagnostics.push(report_not_a_memory_declaration(
+					self.formatter(resolve_context.namespace),
+					qualifier,
+					SourceSpan::new(resolve_context.file_id, span),
+				));
+				Err(())
+			}
+		}
+	}
+
 	pub fn resolve_type(
 		&mut self,
 		resolve_context: ResolveContext,
@@ -503,7 +599,6 @@ impl<'ast> Builder<'ast, '_> {
 					scope,
 					root,
 					segments,
-					TypeArgArity::RequireExact,
 				),
 			ast::TypeExpression::Grouped { inner, segments } => self
 				.resolve_grouped_path_type(
@@ -617,59 +712,10 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			ast::TypeExpression::MemoryTagged { memory, inner } => {
-				let first = &memory[0];
-				let Ok(mut memory_ty) = self.resolve_type_identifier(
-					resolve_context,
-					scope,
-					first.ident,
-					TypeArgArity::RequireExact,
-				) else {
+				let Ok(memory_ty) =
+					self.resolve_memory_tag(resolve_context, scope, memory)
+				else {
 					return TypeIndex::ERROR;
-				};
-				// Walk remaining segments (e.g. `Self::M` has two: `Self`, then `M`).
-				let mut namespace_span = first.ident.span;
-				for segment in &memory[1..] {
-					match self.resolve_namespace_type_member(
-						resolve_context,
-						scope,
-						Spanned {
-							inner: memory_ty,
-							span: namespace_span,
-						},
-						segment,
-						TypeArgArity::RequireExact,
-					) {
-						Ok(ty) => {
-							memory_ty = ty;
-							namespace_span = segment.ident.span;
-						}
-						Err(()) => return TypeIndex::ERROR,
-					}
-				}
-				match self.types.resolve(memory_ty) {
-					Type::Memory { .. }
-					| Type::TypeParam { .. }
-					| Type::AssocTypeProjection { .. } => {}
-					_ => {
-						let span = TextSpan::new(
-							memory.first().unwrap().ident.span.start,
-							memory.last().unwrap().ident.span.end,
-						);
-						self.diagnostics.push(
-							Diagnostic::error()
-								.with_message(format!(
-									"`{}` is not a memory declaration",
-									self.formatter(resolve_context.namespace)
-										.display_type(memory_ty)
-										.unwrap()
-								))
-								.with_label(Label::primary(
-									resolve_context.file_id,
-									span,
-								)),
-						);
-						return TypeIndex::ERROR;
-					}
 				};
 				// Resolve the inner expression directly by AST kind so the outer
 				// memory is applied without triggering ambient memory resolution
@@ -735,10 +781,10 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			}
 			ast::TypeExpression::GenericApplication { name, args } => {
-				if let Some(SymbolEntry::Pending(def_id)) = self
+				if let Some(DefKey::Pending(def_id)) = self
 					.lookup_global_symbol_reporting(
 						resolve_context.namespace,
-						(SymbolNamespace::Type, name.inner),
+						(BindingNamespace::Type, name.inner),
 						SourceSpan::new(resolve_context.file_id, name.span),
 					) && self.ensure_signature(def_id) == SignatureStatus::Cycle
 				{
@@ -751,13 +797,13 @@ impl<'ast> Builder<'ast, '_> {
 				match self
 					.lookup_global_symbol(
 						resolve_context.namespace,
-						(SymbolNamespace::Type, name.inner),
+						(BindingNamespace::Type, name.inner),
 					)
-					.and_then(SymbolEntry::resolved_kind)
+					.and_then(DefKey::resolved_kind)
 				{
 					Some(
-						kind @ (SymbolKind::Struct { .. }
-						| SymbolKind::TypeAlias { .. }),
+						kind @ (DefKind::Struct { .. }
+						| DefKind::TypeAlias { .. }),
 					) => {
 						let mut resolved_args: Vec<TypeIndex> =
 							Vec::with_capacity(args.len());
@@ -819,14 +865,19 @@ impl<'ast> Builder<'ast, '_> {
 
 		// ── single segment, no type args: plain identifier ─────────────
 		if path.len() == 1 && last.type_args.is_empty() {
-			return self
-				.resolve_type_identifier(
+			return match self.resolve_type_identifier(
+				resolve_context,
+				scope,
+				last.ident,
+				arity,
+			) {
+				Ok(qualifier) => self.qualifier_to_type_or_report(
 					resolve_context,
-					scope,
-					last.ident,
-					arity,
-				)
-				.unwrap_or(TypeIndex::ERROR);
+					qualifier,
+					last.ident.span,
+				),
+				Err(()) => TypeIndex::ERROR,
+			};
 		}
 
 		// ── single segment with turbofish args: `Wrapper::<T>` ─────────
@@ -850,10 +901,10 @@ impl<'ast> Builder<'ast, '_> {
 				);
 				return TypeIndex::ERROR;
 			}
-			if let Some(SymbolEntry::Pending(def_id)) = self
+			if let Some(DefKey::Pending(def_id)) = self
 				.lookup_global_symbol_reporting(
 					resolve_context.namespace,
-					(SymbolNamespace::Type, last.ident.inner),
+					(BindingNamespace::Type, last.ident.inner),
 					SourceSpan::new(resolve_context.file_id, last.ident.span),
 				) && self.ensure_signature(def_id) == SignatureStatus::Cycle
 			{
@@ -866,9 +917,9 @@ impl<'ast> Builder<'ast, '_> {
 			let Some(symbol_kind) = self
 				.lookup_global_symbol(
 					resolve_context.namespace,
-					(SymbolNamespace::Type, last.ident.inner),
+					(BindingNamespace::Type, last.ident.inner),
 				)
-				.and_then(SymbolEntry::resolved_kind)
+				.and_then(DefKey::resolved_kind)
 			else {
 				self.diagnostics.push(
 					Diagnostic::error()
@@ -903,7 +954,7 @@ impl<'ast> Builder<'ast, '_> {
 		// namespace node so each intermediate segment carries its own span and
 		// TypeIndex.  Until then each lookup registers only its own segment span.
 		let first = &path[0];
-		let Ok(mut namespace_ty) = self.resolve_type_identifier(
+		let Ok(mut qualifier) = self.resolve_type_identifier(
 			resolve_context,
 			scope,
 			first.ident,
@@ -914,18 +965,18 @@ impl<'ast> Builder<'ast, '_> {
 		let mut namespace_span = first.ident.span;
 
 		for segment in &path[1..path.len() - 1] {
-			match self.resolve_namespace_type_member(
+			match self.advance_path_qualifier(
 				resolve_context,
 				scope,
 				Spanned {
-					inner: namespace_ty,
+					inner: qualifier,
 					span: namespace_span,
 				},
 				segment,
 				arity,
 			) {
-				Ok(ty) => {
-					namespace_ty = ty;
+				Ok(q) => {
+					qualifier = q;
 					namespace_span = segment.ident.span;
 				}
 				Err(()) => return TypeIndex::ERROR,
@@ -933,18 +984,25 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		// Resolve the last segment (and its turbofish, if any) within the
-		// current namespace.
-		self.resolve_namespace_type_member(
+		// current namespace — a final hop is resolved identically to an
+		// intermediate one in type position, so this reuses the same step.
+		match self.advance_path_qualifier(
 			resolve_context,
 			scope,
 			Spanned {
-				inner: namespace_ty,
+				inner: qualifier,
 				span: namespace_span,
 			},
 			last,
 			arity,
-		)
-		.unwrap_or(TypeIndex::ERROR)
+		) {
+			Ok(q) => self.qualifier_to_type_or_report(
+				resolve_context,
+				q,
+				last.ident.span,
+			),
+			Err(()) => TypeIndex::ERROR,
+		}
 	}
 
 	/// Resolves `<Type as Trait>::Item` in type position. Resolves
@@ -962,7 +1020,6 @@ impl<'ast> Builder<'ast, '_> {
 		scope: Option<GenericScope>,
 		root: &ast::QualifiedPathRoot,
 		segments: &[ast::PathSegment],
-		arity: TypeArgArity,
 	) -> TypeIndex {
 		let base_ty = Spanned {
 			inner: self.resolve_type(resolve_context, scope, &root.self_type),
@@ -993,13 +1050,11 @@ impl<'ast> Builder<'ast, '_> {
 		for segment in &segments[1..] {
 			match self.resolve_namespace_type_member(
 				resolve_context,
-				scope,
 				Spanned {
 					inner: namespace_ty,
 					span: namespace_span,
 				},
 				segment,
-				arity,
 			) {
 				Ok(ty) => {
 					namespace_ty = ty;
@@ -1009,6 +1064,37 @@ impl<'ast> Builder<'ast, '_> {
 			}
 		}
 		namespace_ty
+	}
+
+	/// Resolves a type expression that may itself legitimately name a bare
+	/// module — the one spot (`<inner>::segments`'s `inner`) where that's a
+	/// valid thing to write (`<mymodule>::Foo`), unlike everywhere else a
+	/// type expression is resolved. A single bare-identifier, no-turbofish
+	/// path is the only shape that can possibly name a module, so that one
+	/// case goes through `resolve_type_identifier` directly; everything else
+	/// can never be namespace-shaped and goes through ordinary `resolve_type`.
+	pub(super) fn resolve_type_expr_as_qualifier(
+		&mut self,
+		resolve_context: ResolveContext,
+		scope: Option<GenericScope>,
+		type_expr: &Spanned<ast::TypeExpression>,
+	) -> Result<PathQualifier, ()> {
+		if let ast::TypeExpression::Path(path) = &type_expr.inner
+			&& path.len() == 1
+			&& path[0].type_args.is_empty()
+		{
+			return self.resolve_type_identifier(
+				resolve_context,
+				scope,
+				path[0].ident,
+				TypeArgArity::RequireExact,
+			);
+		}
+		Ok(PathQualifier::Type(self.resolve_type(
+			resolve_context,
+			scope,
+			type_expr,
+		)))
 	}
 
 	/// Resolves `<Type>::Item` in type position — a bare bracketed
@@ -1024,9 +1110,10 @@ impl<'ast> Builder<'ast, '_> {
 		segments: &[ast::PathSegment],
 		arity: TypeArgArity,
 	) -> TypeIndex {
-		let base_ty = Spanned {
-			inner: self.resolve_type(resolve_context, scope, inner),
-			span: inner.span,
+		let Ok(base) =
+			self.resolve_type_expr_as_qualifier(resolve_context, scope, inner)
+		else {
+			return TypeIndex::ERROR;
 		};
 		let first = &segments[0];
 		let last_arity = if segments.len() == 1 {
@@ -1034,37 +1121,44 @@ impl<'ast> Builder<'ast, '_> {
 		} else {
 			TypeArgArity::AllowInfer
 		};
-		let mut namespace_ty = match self.resolve_namespace_type_member(
+		let mut qualifier = match self.advance_path_qualifier(
 			resolve_context,
 			scope,
-			base_ty,
+			Spanned {
+				inner: base,
+				span: inner.span,
+			},
 			first,
 			last_arity,
 		) {
-			Ok(ty) => ty,
+			Ok(q) => q,
 			Err(()) => return TypeIndex::ERROR,
 		};
 
 		let mut namespace_span = first.ident.span;
 		for segment in &segments[1..] {
-			match self.resolve_namespace_type_member(
+			match self.advance_path_qualifier(
 				resolve_context,
 				scope,
 				Spanned {
-					inner: namespace_ty,
+					inner: qualifier,
 					span: namespace_span,
 				},
 				segment,
 				arity,
 			) {
-				Ok(ty) => {
-					namespace_ty = ty;
+				Ok(q) => {
+					qualifier = q;
 					namespace_span = segment.ident.span;
 				}
 				Err(()) => return TypeIndex::ERROR,
 			}
 		}
-		namespace_ty
+		self.qualifier_to_type_or_report(
+			resolve_context,
+			qualifier,
+			namespace_span,
+		)
 	}
 
 	/// Resolves `member` on `base_ty` under exactly `required_trait` — the
@@ -1459,17 +1553,29 @@ impl<'ast> Builder<'ast, '_> {
 					return false;
 				}
 				visited.push(*struct_index);
-				let found = self.items.structs[usize::from(*struct_index)]
-					.fields
-					.iter()
-					.map(|field| field.ty.inner)
-					.any(|field_type| {
-						self.find_direct_struct_recursion(
-							field_type,
-							root_struct_index,
-							visited,
-						)
-					});
+				let found = match &self.items.structs
+					[usize::from(*struct_index)]
+				.fields
+				{
+					StructKind::Record { fields, .. } => {
+						fields.iter().map(|f| f.ty.inner).any(|field_type| {
+							self.find_direct_struct_recursion(
+								field_type,
+								root_struct_index,
+								visited,
+							)
+						})
+					}
+					StructKind::Tuple { fields } => {
+						fields.iter().map(|f| f.ty.inner).any(|field_type| {
+							self.find_direct_struct_recursion(
+								field_type,
+								root_struct_index,
+								visited,
+							)
+						})
+					}
+				};
 				visited.pop();
 				found
 			}
@@ -1500,40 +1606,51 @@ impl<'ast> Builder<'ast, '_> {
 		struct_span: SourceSpan,
 	) {
 		let mut visited = vec![struct_index];
-		for (field_ty, field_span) in self.items.structs
+		let cycle_span: Option<TextSpan> = match &self.items.structs
 			[usize::from(struct_index)]
 		.fields
-		.iter()
-		.map(|field| {
-			(
-				field.ty.inner,
-				SourceSpan::new(
-					self.items.structs[usize::from(struct_index)].file_id,
-					field.ty.span,
-				),
-			)
-		}) {
-			if self.find_direct_struct_recursion(
-				field_ty,
-				struct_index,
-				&mut visited,
-			) {
-				let name = self
-					.interner
-					.resolve(
-						self.items.structs[usize::from(struct_index)]
-							.name
-							.inner,
-					)
-					.unwrap();
-				self.diagnostics.push(report_recursive_type(
-					name,
-					struct_span,
-					field_span,
-				));
-				return;
-			}
-			visited.truncate(1);
+		{
+			StructKind::Record { fields, .. } => fields.iter().find_map(|f| {
+				if self.find_direct_struct_recursion(
+					f.ty.inner,
+					struct_index,
+					&mut visited,
+				) {
+					Some(f.ty.span)
+				} else {
+					visited.truncate(1);
+					None
+				}
+			}),
+			StructKind::Tuple { fields } => fields.iter().find_map(|f| {
+				if self.find_direct_struct_recursion(
+					f.ty.inner,
+					struct_index,
+					&mut visited,
+				) {
+					Some(f.ty.span)
+				} else {
+					visited.truncate(1);
+					None
+				}
+			}),
+		};
+		if let Some(field_span) = cycle_span {
+			let field_span = SourceSpan::new(
+				self.items.structs[usize::from(struct_index)].file_id,
+				field_span,
+			);
+			let name = self
+				.interner
+				.resolve(
+					self.items.structs[usize::from(struct_index)].name.inner,
+				)
+				.unwrap();
+			self.diagnostics.push(report_recursive_type(
+				name,
+				struct_span,
+				field_span,
+			));
 		}
 	}
 }
@@ -1554,6 +1671,36 @@ pub(super) fn report_undeclared_type(span: SourceSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::UndeclaredType.code())
 		.with_message("undeclared type")
+		.with_label(span.primary_label())
+}
+
+fn report_namespace_used_as_type(
+	formatter: TypeFormatter,
+	namespace_idx: NamespaceIndex,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NamespaceUsedAsType.code())
+		.with_message(format!(
+			"expected a type, found module `{}`",
+			formatter.display_namespace(namespace_idx)
+		))
+		.with_label(span.primary_label())
+}
+
+fn report_not_a_memory_declaration(
+	formatter: TypeFormatter,
+	qualifier: PathQualifier,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	let name = match qualifier {
+		PathQualifier::Namespace(namespace_idx) => {
+			formatter.display_namespace(namespace_idx).to_owned()
+		}
+		PathQualifier::Type(ty) => formatter.display_type(ty).unwrap(),
+	};
+	Diagnostic::error()
+		.with_message(format!("`{name}` is not a memory declaration"))
 		.with_label(span.primary_label())
 }
 

@@ -873,7 +873,7 @@ impl MIR {
 		}
 
 		let imports: Vec<ImportModule> = tir
-			.modules
+			.defs
 			.import_decls
 			.iter()
 			.map(|module| ImportModule {
@@ -1171,11 +1171,16 @@ impl<'tir> Builder<'tir> {
 		} else {
 			FieldOrder::Sorted
 		};
-		let mir_fields: Box<[ValueType]> = tir_struct
-			.fields
-			.iter()
-			.map(|field| self.lower_type_index_in(field.ty.inner, env))
-			.collect();
+		let mir_fields: Box<[ValueType]> = match &tir_struct.fields {
+			tir::StructKind::Record { fields, .. } => fields
+				.iter()
+				.map(|field| self.lower_type_index_in(field.ty.inner, env))
+				.collect(),
+			tir::StructKind::Tuple { fields } => fields
+				.iter()
+				.map(|field| self.lower_type_index_in(field.ty.inner, env))
+				.collect(),
+		};
 		self.ensure_aggregate(mir_fields, order)
 	}
 
@@ -2129,89 +2134,76 @@ impl<'tir> Builder<'tir> {
 					ty: self.lower_type_index(expr.ty),
 				}
 			}
-			tir::ExprKind::NamespaceAccess { namespace, member } => {
-				match &member.kind {
-					tir::ExprKind::Const { id } => {
-						let declared_index =
-							self.tir.items.expect_const_index(*id);
-						let declared = &self.tir.items.constants
-							[usize::from(declared_index)];
-						let parent = declared.parent;
-						let name = declared.name.inner;
-						let receiver = self.types.instantiate_type(
-							namespace.inner,
-							self.current_type_env,
-						);
-						let const_index = match parent {
-							Some(tir::ItemParent::Trait(trait_index)) => {
-								let (impl_index, _) = self
-									.types
-									.find_trait_impl(receiver, trait_index)
-									.expect(
-										"no impl found for concrete trait constant dispatch",
-									);
-								match self
-									.types
-									.trait_member(impl_index, name)
-									.expect(
-										"validated trait impl has no constant member",
-									) {
-									TraitMember::Impl(
-										tir::ImplEntry::AssocConstant(index),
-									)
-									| TraitMember::Default(
-										tir::ImplEntry::AssocConstant(index),
-									) => index,
-									_ => unreachable!(
-										"trait constant dispatch selected a non-constant"
-									),
-								}
-							}
-							_ => declared_index,
-						};
-						let const_idx = usize::from(const_index);
-						let result_ty = self.lower_type_index(expr.ty);
-						// Only `DATA_END`/`INDEX` are compiler-synthesized —
-						// every other `Memory`-trait const (e.g. `PAGE_SIZE`)
-						// is an ordinary default value, already folded to a
-						// `const_value` in TIR, and falls through to the
-						// generic path below like any other const.
-						if let ConcreteType::Memory { id } =
-							self.types.get(receiver)
-						{
-							let const_name_sym =
-								self.tir.items.constants[const_idx].name.inner;
-							let const_name =
-								self.interner.resolve(const_name_sym).unwrap();
-							match const_name {
-								"DATA_END" => {
-									return Expression {
-										kind: ExprKind::MemoryOffset {
-											memory: *id,
-										},
-										ty: result_ty,
-									};
-								}
-								"INDEX" => {
-									return Expression {
-										kind: ExprKind::MemoryIndex {
-											memory: *id,
-										},
-										ty: result_ty,
-									};
-								}
-								_ => {}
-							}
-						};
-
-						match self.tir.items.constants[const_idx].const_value {
-							Some(const_value) => {
-								Self::lower_const_value(const_value, result_ty)
-							}
-							None => unreachable!(),
+			tir::ExprKind::AbstractConstAccess { receiver, id } => {
+				// Always a trait's own declaration — see the variant's
+				// doc comment: a const already resolved through a
+				// concrete `impl Trait for Target` (or an inherent
+				// impl, or a plain module-level const) never becomes
+				// this node, only bare `ExprKind::Const`.
+				let declared_index = self.tir.items.expect_const_index(*id);
+				let declared =
+					&self.tir.items.constants[usize::from(declared_index)];
+				let Some(tir::ItemParent::Trait(trait_index)) = declared.parent
+				else {
+					unreachable!(
+						"AbstractConstAccess always names a trait's own const declaration"
+					)
+				};
+				let name = declared.name.inner;
+				let receiver = self
+					.types
+					.instantiate_type(*receiver, self.current_type_env);
+				let (impl_index, _) =
+					self.types.find_trait_impl(receiver, trait_index).expect(
+						"no impl found for concrete trait constant dispatch",
+					);
+				let const_index = match self
+					.types
+					.trait_member(impl_index, name)
+					.expect("validated trait impl has no constant member")
+				{
+					TraitMember::Impl(tir::ImplEntry::AssocConstant(index))
+					| TraitMember::Default(tir::ImplEntry::AssocConstant(
+						index,
+					)) => index,
+					_ => unreachable!(
+						"trait constant dispatch selected a non-constant"
+					),
+				};
+				let const_idx = usize::from(const_index);
+				let result_ty = self.lower_type_index(expr.ty);
+				// Only `DATA_END`/`INDEX` are compiler-synthesized —
+				// every other `Memory`-trait const (e.g. `PAGE_SIZE`)
+				// is an ordinary default value, already folded to a
+				// `const_value` in TIR, and falls through to the
+				// generic path below like any other const.
+				if let ConcreteType::Memory { id } = self.types.get(receiver) {
+					let const_name_sym =
+						self.tir.items.constants[const_idx].name.inner;
+					let const_name =
+						self.interner.resolve(const_name_sym).unwrap();
+					match const_name {
+						"DATA_END" => {
+							return Expression {
+								kind: ExprKind::MemoryOffset { memory: *id },
+								ty: result_ty,
+							};
 						}
+						"INDEX" => {
+							return Expression {
+								kind: ExprKind::MemoryIndex { memory: *id },
+								ty: result_ty,
+							};
+						}
+						_ => {}
 					}
-					_ => self.lower_expression(func_ctx, member, sink),
+				};
+
+				match self.tir.items.constants[const_idx].const_value {
+					Some(const_value) => {
+						Self::lower_const_value(const_value, result_ty)
+					}
+					None => unreachable!(),
 				}
 			}
 			tir::ExprKind::Const { id } => {
@@ -2238,11 +2230,7 @@ impl<'tir> Builder<'tir> {
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, &args);
 				let aggregate = self.aggregate(aggregate_index);
-				let decl_index = usize::from(
-					self.tir.items.structs[usize::from(struct_index)].lookup
-						[&member.inner],
-				);
-				let phys_index = aggregate.physical(decl_index);
+				let phys_index = aggregate.physical(usize::from(member.inner));
 				let field_ty = aggregate.field(phys_index).ty;
 
 				match &object.kind {
@@ -2282,19 +2270,54 @@ impl<'tir> Builder<'tir> {
 					}
 				}
 			}
-			tir::ExprKind::StructInit { fields, .. } => {
+			tir::ExprKind::RecordStructInit { fields, .. } => {
 				let (struct_index, args) = self.instantiate_struct(expr.ty);
-				let lowered: Vec<Expression> = fields
+				// `fields` is in source-written order, not declaration order
+				// (see `tir::ExprKind::RecordStructInit`) — lower in that
+				// order so side effects run as written, then use each
+				// entry's own `FieldIndex` (not its position here) to place
+				// it.
+				let lowered: Vec<(tir::FieldIndex, Expression)> = fields
 					.iter()
-					.map(|f| self.lower_expression(func_ctx, f, sink))
+					.map(|(field_index, f)| {
+						(*field_index, self.lower_expression(func_ctx, f, sink))
+					})
 					.collect();
 				let aggregate_index =
 					self.ensure_aggregate_for_struct(struct_index, &args);
 				let aggregate = self.aggregate(aggregate_index);
 				let mut phys_slots: Vec<Option<Expression>> =
 					(0..lowered.len()).map(|_| None).collect();
-				for (decl, expr) in lowered.into_iter().enumerate() {
-					phys_slots[usize::from(aggregate.physical(decl))] =
+				for (decl, expr) in lowered {
+					phys_slots
+						[usize::from(aggregate.physical(usize::from(decl)))] = Some(expr);
+				}
+				let values: Box<[Expression]> =
+					phys_slots.into_iter().map(|e| e.unwrap()).collect();
+				Expression {
+					kind: ExprKind::Aggregate { values },
+					ty: ValueType::Aggregate { aggregate_index },
+				}
+			}
+			tir::ExprKind::TupleStructInit { arguments, .. } => {
+				let (struct_index, args) = self.instantiate_struct(expr.ty);
+				// Lowered fully before `aggregate` borrows `self` below —
+				// `lower_expression` needs `&mut self`. Position *is* the
+				// declared field index here (no `FieldIndex` to read),
+				// still lowered left to right, matching source order —
+				// which for a tuple struct is always also declaration
+				// order.
+				let lowered: Vec<Expression> = arguments
+					.iter()
+					.map(|arg| self.lower_expression(func_ctx, arg, sink))
+					.collect();
+				let aggregate_index =
+					self.ensure_aggregate_for_struct(struct_index, &args);
+				let aggregate = self.aggregate(aggregate_index);
+				let mut phys_slots: Vec<Option<Expression>> =
+					(0..lowered.len()).map(|_| None).collect();
+				for (position, expr) in lowered.into_iter().enumerate() {
+					phys_slots[usize::from(aggregate.physical(position))] =
 						Some(expr);
 				}
 				let values: Box<[Expression]> =

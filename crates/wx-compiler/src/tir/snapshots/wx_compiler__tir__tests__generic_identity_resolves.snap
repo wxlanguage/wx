@@ -20505,6 +20505,14 @@ items:
                 end: 39236
             - file_id: 0
               span:
+                start: 39235
+                end: 39236
+            - file_id: 0
+              span:
+                start: 39259
+                end: 39260
+            - file_id: 0
+              span:
                 start: 39259
                 end: 39260
       inherited_type_param_count: 1
@@ -20549,6 +20557,14 @@ items:
               span:
                 start: 39369
                 end: 39370
+            - file_id: 0
+              span:
+                start: 39369
+                end: 39370
+            - file_id: 0
+              span:
+                start: 39391
+                end: 39392
             - file_id: 0
               span:
                 start: 39391
@@ -21960,8 +21976,20 @@ items:
             end: 34721
         - file_id: 0
           span:
+            start: 34713
+            end: 34721
+        - file_id: 0
+          span:
             start: 34833
             end: 34841
+        - file_id: 0
+          span:
+            start: 34833
+            end: 34841
+        - file_id: 0
+          span:
+            start: 34953
+            end: 34961
         - file_id: 0
           span:
             start: 34953
@@ -21972,8 +22000,20 @@ items:
             end: 35081
         - file_id: 0
           span:
+            start: 35073
+            end: 35081
+        - file_id: 0
+          span:
             start: 35192
             end: 35200
+        - file_id: 0
+          span:
+            start: 35192
+            end: 35200
+        - file_id: 0
+          span:
+            start: 35312
+            end: 35320
         - file_id: 0
           span:
             start: 35312
@@ -21984,12 +22024,28 @@ items:
             end: 35440
         - file_id: 0
           span:
+            start: 35432
+            end: 35440
+        - file_id: 0
+          span:
+            start: 35552
+            end: 35560
+        - file_id: 0
+          span:
             start: 35552
             end: 35560
         - file_id: 0
           span:
             start: 35673
             end: 35681
+        - file_id: 0
+          span:
+            start: 35673
+            end: 35681
+        - file_id: 0
+          span:
+            start: 35794
+            end: 35802
         - file_id: 0
           span:
             start: 35794
@@ -22032,63 +22088,65 @@ items:
                 end: 39117
       attributes: []
       fields:
-        - name:
-            inner: 269
-            span:
-              start: 39086
-              end: 39090
-          ty:
-            inner: 23
-            span:
-              start: 39092
-              end: 39101
-          pub_span: ~
-          accesses:
-            - kind: Init
-              file_id: 0
-              span:
-                start: 39219
-                end: 39223
-            - kind: Init
-              file_id: 0
-              span:
-                start: 39375
-                end: 39379
-            - kind: Read
-              file_id: 0
-              span:
-                start: 39477
-                end: 39481
-        - name:
-            inner: 270
-            span:
-              start: 39107
-              end: 39112
-          ty:
-            inner: 23
-            span:
-              start: 39114
-              end: 39123
-          pub_span: ~
-          accesses:
-            - kind: Init
-              file_id: 0
-              span:
-                start: 39241
-                end: 39246
-            - kind: Init
-              file_id: 0
-              span:
-                start: 39351
-                end: 39356
-            - kind: Read
-              file_id: 0
-              span:
-                start: 39554
-                end: 39559
-      lookup:
-        269: 0
-        270: 1
+        Record:
+          fields:
+            - name:
+                inner: 269
+                span:
+                  start: 39086
+                  end: 39090
+              ty:
+                inner: 23
+                span:
+                  start: 39092
+                  end: 39101
+              pub_span: ~
+              accesses:
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 39219
+                    end: 39223
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 39375
+                    end: 39379
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 39477
+                    end: 39481
+            - name:
+                inner: 270
+                span:
+                  start: 39107
+                  end: 39112
+              ty:
+                inner: 23
+                span:
+                  start: 39114
+                  end: 39123
+              pub_span: ~
+              accesses:
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 39241
+                    end: 39246
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 39351
+                    end: 39356
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 39554
+                    end: 39559
+          lookup:
+            269: 0
+            270: 1
       accesses:
         - file_id: 0
           span:
@@ -22102,6 +22160,14 @@ items:
           span:
             start: 39827
             end: 39833
+        - file_id: 0
+          span:
+            start: 39827
+            end: 39833
+        - file_id: 0
+          span:
+            start: 40071
+            end: 40077
         - file_id: 0
           span:
             start: 40071
@@ -22145,100 +22211,102 @@ items:
           accesses: []
       attributes: []
       fields:
-        - name:
-            inner: 280
-            span:
-              start: 40195
-              end: 40199
-          ty:
-            inner: 27
-            span:
-              start: 40201
-              end: 40210
-          pub_span: ~
-          accesses:
-            - kind: Read
-              file_id: 0
-              span:
-                start: 40317
-                end: 40321
-            - kind: Init
-              file_id: 0
-              span:
-                start: 40387
-                end: 40391
-            - kind: Init
-              file_id: 0
-              span:
-                start: 40478
-                end: 40482
-            - kind: Init
-              file_id: 0
-              span:
-                start: 40576
-                end: 40580
-            - kind: Init
-              file_id: 0
-              span:
-                start: 40678
-                end: 40682
-            - kind: Read
-              file_id: 0
-              span:
-                start: 40756
-                end: 40760
-            - kind: Read
-              file_id: 0
-              span:
-                start: 40837
-                end: 40841
-            - kind: Read
-              file_id: 0
-              span:
-                start: 40916
-                end: 40920
-            - kind: Init
-              file_id: 0
-              span:
-                start: 41010
-                end: 41014
-            - kind: Read
-              file_id: 0
-              span:
-                start: 41021
-                end: 41025
-            - kind: Init
-              file_id: 0
-              span:
-                start: 41179
-                end: 41183
-            - kind: Read
-              file_id: 0
-              span:
-                start: 41190
-                end: 41194
-            - kind: Init
-              file_id: 0
-              span:
-                start: 41373
-                end: 41377
-            - kind: Read
-              file_id: 0
-              span:
-                start: 41384
-                end: 41388
-            - kind: Init
-              file_id: 0
-              span:
-                start: 41698
-                end: 41702
-            - kind: Read
-              file_id: 0
-              span:
-                start: 41710
-                end: 41714
-      lookup:
-        280: 0
+        Record:
+          fields:
+            - name:
+                inner: 280
+                span:
+                  start: 40195
+                  end: 40199
+              ty:
+                inner: 27
+                span:
+                  start: 40201
+                  end: 40210
+              pub_span: ~
+              accesses:
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 40317
+                    end: 40321
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 40387
+                    end: 40391
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 40478
+                    end: 40482
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 40576
+                    end: 40580
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 40678
+                    end: 40682
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 40756
+                    end: 40760
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 40837
+                    end: 40841
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 40916
+                    end: 40920
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 41010
+                    end: 41014
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 41021
+                    end: 41025
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 41179
+                    end: 41183
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 41190
+                    end: 41194
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 41373
+                    end: 41377
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 41384
+                    end: 41388
+                - kind: Init
+                  file_id: 0
+                  span:
+                    start: 41698
+                    end: 41702
+                - kind: Read
+                  file_id: 0
+                  span:
+                    start: 41710
+                    end: 41714
+          lookup:
+            280: 0
       accesses:
         - file_id: 0
           span:
@@ -26510,21 +26578,9 @@ items:
                       end: 1976
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 1980
-                            end: 1988
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 0
-                          ty: 18
-                          span:
-                            start: 1990
-                            end: 1994
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 0
                     ty: 18
                     span:
                       start: 1980
@@ -26585,21 +26641,9 @@ items:
                       end: 2061
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 2065
-                            end: 2073
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 1
-                          ty: 18
-                          span:
-                            start: 2075
-                            end: 2080
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 1
                     ty: 18
                     span:
                       start: 2065
@@ -26660,21 +26704,9 @@ items:
                       end: 2147
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 2151
-                            end: 2159
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 2
-                          ty: 18
-                          span:
-                            start: 2161
-                            end: 2168
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 2
                     ty: 18
                     span:
                       start: 2151
@@ -26735,21 +26767,9 @@ items:
                       end: 2235
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 2239
-                            end: 2247
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 2
-                          ty: 18
-                          span:
-                            start: 2249
-                            end: 2256
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 2
                     ty: 18
                     span:
                       start: 2239
@@ -26810,21 +26830,9 @@ items:
                       end: 2323
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 2327
-                            end: 2335
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 0
-                          ty: 18
-                          span:
-                            start: 2337
-                            end: 2341
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 0
                     ty: 18
                     span:
                       start: 2327
@@ -26885,21 +26893,9 @@ items:
                       end: 2408
                   right:
                     kind:
-                      NamespaceAccess:
-                        namespace:
-                          inner: 18
-                          span:
-                            start: 2412
-                            end: 2420
-                        member:
-                          kind:
-                            EnumVariant:
-                              enum_index: 0
-                              variant_index: 1
-                          ty: 18
-                          span:
-                            start: 2422
-                            end: 2427
+                      EnumVariant:
+                        enum_index: 0
+                        variant_index: 1
                     ty: 18
                     span:
                       start: 2412
@@ -26995,21 +26991,9 @@ items:
                             expressions: []
                             result:
                               kind:
-                                NamespaceAccess:
-                                  namespace:
-                                    inner: 18
-                                    span:
-                                      start: 2541
-                                      end: 2549
-                                  member:
-                                    kind:
-                                      EnumVariant:
-                                        enum_index: 0
-                                        variant_index: 2
-                                    ty: 18
-                                    span:
-                                      start: 2551
-                                      end: 2558
+                                EnumVariant:
+                                  enum_index: 0
+                                  variant_index: 2
                               ty: 18
                               span:
                                 start: 2541
@@ -27032,21 +27016,9 @@ items:
                             expressions: []
                             result:
                               kind:
-                                NamespaceAccess:
-                                  namespace:
-                                    inner: 18
-                                    span:
-                                      start: 2595
-                                      end: 2603
-                                  member:
-                                    kind:
-                                      EnumVariant:
-                                        enum_index: 0
-                                        variant_index: 1
-                                    ty: 18
-                                    span:
-                                      start: 2605
-                                      end: 2610
+                                EnumVariant:
+                                  enum_index: 0
+                                  variant_index: 1
                               ty: 18
                               span:
                                 start: 2595
@@ -27069,21 +27041,9 @@ items:
                             expressions: []
                             result:
                               kind:
-                                NamespaceAccess:
-                                  namespace:
-                                    inner: 18
-                                    span:
-                                      start: 2649
-                                      end: 2657
-                                  member:
-                                    kind:
-                                      EnumVariant:
-                                        enum_index: 0
-                                        variant_index: 0
-                                    ty: 18
-                                    span:
-                                      start: 2659
-                                      end: 2663
+                                EnumVariant:
+                                  enum_index: 0
+                                  variant_index: 0
                               ty: 18
                               span:
                                 start: 2649
@@ -44768,20 +44728,9 @@ items:
                         start: 38881
                         end: 38898
                     - kind:
-                        NamespaceAccess:
-                          namespace:
-                            inner: 22
-                            span:
-                              start: 38901
-                              end: 38905
-                          member:
-                            kind:
-                              Const:
-                                id: 614
-                            ty: 183
-                            span:
-                              start: 38907
-                              end: 38916
+                        AbstractConstAccess:
+                          receiver: 22
+                          id: 614
                       ty: 183
                       span:
                         start: 38901
@@ -44813,31 +44762,33 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 0
                   fields:
-                    - kind:
-                        GenericCall:
-                          id: 619
-                          type_args:
-                            - 356
-                            - 24
-                          arguments: []
-                      ty: 194
-                      span:
-                        start: 39225
-                        end: 39239
-                    - kind:
-                        GenericCall:
-                          id: 620
-                          type_args:
-                            - 356
-                            - 24
-                          arguments: []
-                      ty: 194
-                      span:
-                        start: 39248
-                        end: 39263
+                    - - 0
+                      - kind:
+                          GenericCall:
+                            id: 619
+                            type_args:
+                              - 356
+                              - 24
+                            arguments: []
+                        ty: 194
+                        span:
+                          start: 39225
+                          end: 39239
+                    - - 1
+                      - kind:
+                          GenericCall:
+                            id: 620
+                            type_args:
+                              - 356
+                              - 24
+                            arguments: []
+                        ty: 194
+                        span:
+                          start: 39248
+                          end: 39263
               ty: 25
               span:
                 start: 39211
@@ -44877,49 +44828,51 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 0
                   fields:
-                    - kind:
-                        GenericMethodCall:
-                          id: 17
-                          type_args:
-                            - 194
-                          arguments:
-                            - kind:
-                                GenericCall:
-                                  id: 619
-                                  type_args:
-                                    - 359
-                                    - 24
-                                  arguments: []
-                              ty: 194
-                              span:
-                                start: 39381
-                                end: 39395
-                            - kind:
-                                Local:
-                                  scope_index: 0
-                                  local_index: 0
-                              ty: 194
-                              span:
-                                start: 39398
-                                end: 39403
-                      ty: 194
-                      span:
-                        start: 39381
-                        end: 39403
-                    - kind:
-                        GenericCall:
-                          id: 620
-                          type_args:
-                            - 359
-                            - 24
-                          arguments: []
-                      ty: 194
-                      span:
-                        start: 39358
-                        end: 39373
+                    - - 1
+                      - kind:
+                          GenericCall:
+                            id: 620
+                            type_args:
+                              - 359
+                              - 24
+                            arguments: []
+                        ty: 194
+                        span:
+                          start: 39358
+                          end: 39373
+                    - - 0
+                      - kind:
+                          GenericMethodCall:
+                            id: 17
+                            type_args:
+                              - 194
+                            arguments:
+                              - kind:
+                                  GenericCall:
+                                    id: 619
+                                    type_args:
+                                      - 359
+                                      - 24
+                                    arguments: []
+                                ty: 194
+                                span:
+                                  start: 39381
+                                  end: 39395
+                              - kind:
+                                  Local:
+                                    scope_index: 0
+                                    local_index: 0
+                                ty: 194
+                                span:
+                                  start: 39398
+                                  end: 39403
+                        ty: 194
+                        span:
+                          start: 39381
+                          end: 39403
               ty: 25
               span:
                 start: 39343
@@ -44970,7 +44923,7 @@ items:
                       start: 39472
                       end: 39476
                   field:
-                    inner: 269
+                    inner: 0
                     span:
                       start: 39477
                       end: 39481
@@ -45024,7 +44977,7 @@ items:
                       start: 39549
                       end: 39553
                   field:
-                    inner: 270
+                    inner: 1
                     span:
                       start: 39554
                       end: 39559
@@ -45330,7 +45283,7 @@ items:
                       start: 40312
                       end: 40316
                   field:
-                    inner: 280
+                    inner: 0
                     span:
                       start: 40317
                       end: 40321
@@ -45361,16 +45314,17 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        Int:
-                          value: 0
-                      ty: 210
-                      span:
-                        start: 40393
-                        end: 40394
+                    - - 0
+                      - kind:
+                          Int:
+                            value: 0
+                        ty: 210
+                        span:
+                          start: 40393
+                          end: 40394
               ty: 30
               span:
                 start: 40379
@@ -45410,17 +45364,18 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        Local:
-                          scope_index: 0
-                          local_index: 0
-                      ty: 210
-                      span:
-                        start: 40484
-                        end: 40487
+                    - - 0
+                      - kind:
+                          Local:
+                            scope_index: 0
+                            local_index: 0
+                        ty: 210
+                        span:
+                          start: 40484
+                          end: 40487
               ty: 30
               span:
                 start: 40470
@@ -45460,17 +45415,18 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        Local:
-                          scope_index: 0
-                          local_index: 0
-                      ty: 210
-                      span:
-                        start: 40582
-                        end: 40585
+                    - - 0
+                      - kind:
+                          Local:
+                            scope_index: 0
+                            local_index: 0
+                        ty: 210
+                        span:
+                          start: 40582
+                          end: 40585
               ty: 30
               span:
                 start: 40568
@@ -45510,17 +45466,18 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        Local:
-                          scope_index: 0
-                          local_index: 0
-                      ty: 210
-                      span:
-                        start: 40678
-                        end: 40682
+                    - - 0
+                      - kind:
+                          Local:
+                            scope_index: 0
+                            local_index: 0
+                        ty: 210
+                        span:
+                          start: 40678
+                          end: 40682
               ty: 30
               span:
                 start: 40670
@@ -45571,7 +45528,7 @@ items:
                       start: 40751
                       end: 40755
                   field:
-                    inner: 280
+                    inner: 0
                     span:
                       start: 40756
                       end: 40760
@@ -45625,7 +45582,7 @@ items:
                       start: 40832
                       end: 40836
                   field:
-                    inner: 280
+                    inner: 0
                     span:
                       start: 40837
                       end: 40841
@@ -45687,7 +45644,7 @@ items:
                             start: 40911
                             end: 40915
                         field:
-                          inner: 280
+                          inner: 0
                           span:
                             start: 40916
                             end: 40920
@@ -45742,29 +45699,30 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        FieldAccess:
-                          object:
-                            kind:
-                              Local:
-                                scope_index: 0
-                                local_index: 0
-                            ty: 30
-                            span:
-                              start: 41016
-                              end: 41020
-                          field:
-                            inner: 280
-                            span:
-                              start: 41021
-                              end: 41025
-                      ty: 210
-                      span:
-                        start: 41016
-                        end: 41025
+                    - - 0
+                      - kind:
+                          FieldAccess:
+                            object:
+                              kind:
+                                Local:
+                                  scope_index: 0
+                                  local_index: 0
+                              ty: 30
+                              span:
+                                start: 41016
+                                end: 41020
+                            field:
+                              inner: 0
+                              span:
+                                start: 41021
+                                end: 41025
+                        ty: 210
+                        span:
+                          start: 41016
+                          end: 41025
               ty: 222
               span:
                 start: 41000
@@ -45816,68 +45774,69 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        GenericMethodCall:
-                          id: 15
-                          type_args:
-                            - 224
-                          arguments:
-                            - kind:
-                                FieldAccess:
-                                  object:
-                                    kind:
-                                      Local:
-                                        scope_index: 0
-                                        local_index: 0
-                                    ty: 33
-                                    span:
-                                      start: 41185
-                                      end: 41189
-                                  field:
-                                    inner: 280
-                                    span:
-                                      start: 41190
-                                      end: 41194
-                              ty: 224
-                              span:
-                                start: 41185
-                                end: 41194
-                            - kind:
-                                GenericMethodCall:
-                                  id: 17
-                                  type_args:
-                                    - 224
-                                  arguments:
-                                    - kind:
+                    - - 0
+                      - kind:
+                          GenericMethodCall:
+                            id: 15
+                            type_args:
+                              - 224
+                            arguments:
+                              - kind:
+                                  FieldAccess:
+                                    object:
+                                      kind:
                                         Local:
                                           scope_index: 0
-                                          local_index: 1
-                                      ty: 224
+                                          local_index: 0
+                                      ty: 33
                                       span:
-                                        start: 41197
-                                        end: 41202
-                                    - kind:
-                                        GenericCall:
-                                          id: 619
-                                          type_args:
-                                            - 32
-                                            - 31
-                                          arguments: []
-                                      ty: 224
+                                        start: 41185
+                                        end: 41189
+                                    field:
+                                      inner: 0
                                       span:
-                                        start: 41205
-                                        end: 41224
-                              ty: 224
-                              span:
-                                start: 41197
-                                end: 41224
-                      ty: 224
-                      span:
-                        start: 41185
-                        end: 41224
+                                        start: 41190
+                                        end: 41194
+                                ty: 224
+                                span:
+                                  start: 41185
+                                  end: 41194
+                              - kind:
+                                  GenericMethodCall:
+                                    id: 17
+                                    type_args:
+                                      - 224
+                                    arguments:
+                                      - kind:
+                                          Local:
+                                            scope_index: 0
+                                            local_index: 1
+                                        ty: 224
+                                        span:
+                                          start: 41197
+                                          end: 41202
+                                      - kind:
+                                          GenericCall:
+                                            id: 619
+                                            type_args:
+                                              - 32
+                                              - 31
+                                            arguments: []
+                                        ty: 224
+                                        span:
+                                          start: 41205
+                                          end: 41224
+                                ty: 224
+                                span:
+                                  start: 41197
+                                  end: 41224
+                        ty: 224
+                        span:
+                          start: 41185
+                          end: 41224
               ty: 33
               span:
                 start: 41171
@@ -45929,68 +45888,69 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        GenericMethodCall:
-                          id: 13
-                          type_args:
-                            - 226
-                          arguments:
-                            - kind:
-                                FieldAccess:
-                                  object:
-                                    kind:
-                                      Local:
-                                        scope_index: 0
-                                        local_index: 0
-                                    ty: 36
-                                    span:
-                                      start: 41379
-                                      end: 41383
-                                  field:
-                                    inner: 280
-                                    span:
-                                      start: 41384
-                                      end: 41388
-                              ty: 226
-                              span:
-                                start: 41379
-                                end: 41388
-                            - kind:
-                                GenericMethodCall:
-                                  id: 17
-                                  type_args:
-                                    - 226
-                                  arguments:
-                                    - kind:
+                    - - 0
+                      - kind:
+                          GenericMethodCall:
+                            id: 13
+                            type_args:
+                              - 226
+                            arguments:
+                              - kind:
+                                  FieldAccess:
+                                    object:
+                                      kind:
                                         Local:
                                           scope_index: 0
-                                          local_index: 1
-                                      ty: 226
+                                          local_index: 0
+                                      ty: 36
                                       span:
-                                        start: 41391
-                                        end: 41396
-                                    - kind:
-                                        GenericCall:
-                                          id: 619
-                                          type_args:
-                                            - 35
-                                            - 34
-                                          arguments: []
-                                      ty: 226
+                                        start: 41379
+                                        end: 41383
+                                    field:
+                                      inner: 0
                                       span:
-                                        start: 41399
-                                        end: 41418
-                              ty: 226
-                              span:
-                                start: 41391
-                                end: 41418
-                      ty: 226
-                      span:
-                        start: 41379
-                        end: 41418
+                                        start: 41384
+                                        end: 41388
+                                ty: 226
+                                span:
+                                  start: 41379
+                                  end: 41388
+                              - kind:
+                                  GenericMethodCall:
+                                    id: 17
+                                    type_args:
+                                      - 226
+                                    arguments:
+                                      - kind:
+                                          Local:
+                                            scope_index: 0
+                                            local_index: 1
+                                        ty: 226
+                                        span:
+                                          start: 41391
+                                          end: 41396
+                                      - kind:
+                                          GenericCall:
+                                            id: 619
+                                            type_args:
+                                              - 35
+                                              - 34
+                                            arguments: []
+                                        ty: 226
+                                        span:
+                                          start: 41399
+                                          end: 41418
+                                ty: 226
+                                span:
+                                  start: 41391
+                                  end: 41418
+                        ty: 226
+                        span:
+                          start: 41379
+                          end: 41418
               ty: 36
               span:
                 start: 41365
@@ -46046,109 +46006,110 @@ items:
             expressions: []
             result:
               kind:
-                StructInit:
+                RecordStructInit:
                   struct_index: 1
                   fields:
-                    - kind:
-                        GenericMethodCall:
-                          id: 25
-                          type_args:
-                            - 228
-                          arguments:
-                            - kind:
-                                GenericMethodCall:
-                                  id: 15
-                                  type_args:
-                                    - 228
-                                  arguments:
-                                    - kind:
-                                        GenericMethodCall:
-                                          id: 13
-                                          type_args:
-                                            - 228
-                                          arguments:
-                                            - kind:
-                                                FieldAccess:
-                                                  object:
-                                                    kind:
-                                                      Local:
-                                                        scope_index: 0
-                                                        local_index: 0
-                                                    ty: 39
-                                                    span:
-                                                      start: 41705
-                                                      end: 41709
-                                                  field:
-                                                    inner: 280
-                                                    span:
-                                                      start: 41710
-                                                      end: 41714
-                                              ty: 228
-                                              span:
-                                                start: 41705
-                                                end: 41714
-                                            - kind:
-                                                Local:
-                                                  scope_index: 0
-                                                  local_index: 1
-                                              ty: 228
-                                              span:
-                                                start: 41717
-                                                end: 41722
-                                      ty: 228
-                                      span:
-                                        start: 41705
-                                        end: 41722
-                                    - kind:
-                                        Int:
-                                          value: 1
-                                      ty: 228
-                                      span:
-                                        start: 41725
-                                        end: 41726
-                              ty: 228
-                              span:
-                                start: 41705
-                                end: 41726
-                            - kind:
-                                GenericMethodCall:
-                                  id: 35
-                                  type_args:
-                                    - 228
-                                  arguments:
-                                    - kind:
-                                        GenericMethodCall:
-                                          id: 15
-                                          type_args:
-                                            - 228
-                                          arguments:
-                                            - kind:
-                                                Local:
-                                                  scope_index: 0
-                                                  local_index: 1
-                                              ty: 228
-                                              span:
-                                                start: 41732
-                                                end: 41737
-                                            - kind:
-                                                Int:
-                                                  value: 1
-                                              ty: 228
-                                              span:
-                                                start: 41740
-                                                end: 41741
-                                      ty: 228
-                                      span:
-                                        start: 41732
-                                        end: 41741
-                              ty: 228
-                              span:
-                                start: 41730
-                                end: 41742
-                      ty: 228
-                      span:
-                        start: 41704
-                        end: 41742
+                    - - 0
+                      - kind:
+                          GenericMethodCall:
+                            id: 25
+                            type_args:
+                              - 228
+                            arguments:
+                              - kind:
+                                  GenericMethodCall:
+                                    id: 15
+                                    type_args:
+                                      - 228
+                                    arguments:
+                                      - kind:
+                                          GenericMethodCall:
+                                            id: 13
+                                            type_args:
+                                              - 228
+                                            arguments:
+                                              - kind:
+                                                  FieldAccess:
+                                                    object:
+                                                      kind:
+                                                        Local:
+                                                          scope_index: 0
+                                                          local_index: 0
+                                                      ty: 39
+                                                      span:
+                                                        start: 41705
+                                                        end: 41709
+                                                    field:
+                                                      inner: 0
+                                                      span:
+                                                        start: 41710
+                                                        end: 41714
+                                                ty: 228
+                                                span:
+                                                  start: 41705
+                                                  end: 41714
+                                              - kind:
+                                                  Local:
+                                                    scope_index: 0
+                                                    local_index: 1
+                                                ty: 228
+                                                span:
+                                                  start: 41717
+                                                  end: 41722
+                                        ty: 228
+                                        span:
+                                          start: 41705
+                                          end: 41722
+                                      - kind:
+                                          Int:
+                                            value: 1
+                                        ty: 228
+                                        span:
+                                          start: 41725
+                                          end: 41726
+                                ty: 228
+                                span:
+                                  start: 41705
+                                  end: 41726
+                              - kind:
+                                  GenericMethodCall:
+                                    id: 35
+                                    type_args:
+                                      - 228
+                                    arguments:
+                                      - kind:
+                                          GenericMethodCall:
+                                            id: 15
+                                            type_args:
+                                              - 228
+                                            arguments:
+                                              - kind:
+                                                  Local:
+                                                    scope_index: 0
+                                                    local_index: 1
+                                                ty: 228
+                                                span:
+                                                  start: 41732
+                                                  end: 41737
+                                              - kind:
+                                                  Int:
+                                                    value: 1
+                                                ty: 228
+                                                span:
+                                                  start: 41740
+                                                  end: 41741
+                                        ty: 228
+                                        span:
+                                          start: 41732
+                                          end: 41741
+                                ty: 228
+                                span:
+                                  start: 41730
+                                  end: 41742
+                        ty: 228
+                        span:
+                          start: 41704
+                          end: 41742
               ty: 39
               span:
                 start: 41690

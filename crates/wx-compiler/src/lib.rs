@@ -1,9 +1,9 @@
 pub mod ast;
-pub mod codegen;
+// pub mod codegen;
 pub mod diagnostics;
 mod index;
-pub mod mir;
-pub mod opt;
+// pub mod mir;
+// pub mod opt;
 #[cfg(test)]
 pub mod testing;
 pub mod tir;
