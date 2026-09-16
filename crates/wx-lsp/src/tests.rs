@@ -17,6 +17,7 @@ use crate::{
 	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
+use wx_compiler::diagnostics::DiagnosticCode;
 use wx_compiler::tir::TypeParamOwner;
 
 /// Exercises `Backend` through its real `LanguageServer` trait methods
@@ -1489,11 +1490,8 @@ fn full_diagnostic_renders_and_handles_bad_index() {
 	);
 
 	assert!(
-		compiled
-			.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.code.as_deref() == Some("W1001")),
+		compiled.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedVariable.code())),
 		"expected an unused-variable warning to drive this test's diagnostic"
 	);
 
@@ -1557,9 +1555,10 @@ fn unused_enum_variants_get_one_squiggle_each() {
 	let unused: Vec<_> = diagnostics
 		.iter()
 		.filter(|d| {
-			d.code.as_ref().is_some_and(
-				|code| matches!(code, NumberOrString::String(s) if s == "W1009"),
-			)
+			d.code.as_ref().is_some_and(|code| {
+				matches!(code, NumberOrString::String(s)
+					if s == DiagnosticCode::UnusedEnumVariant.code())
+			})
 		})
 		.collect();
 

@@ -1,5 +1,6 @@
 use super::tests::TestCase;
 use super::*;
+use wx_compiler::diagnostics::DiagnosticCode;
 use wx_compiler::vfs;
 
 fn checked_format(source: &str, width: u32, indent: u8) -> String {
@@ -384,10 +385,8 @@ fn diagnostics_and_tir_types_survive_formatting() {
 			);
 		}
 		assert_eq!(
-			before
-				.diagnostics
-				.iter()
-				.any(|d| d.code.as_deref() == Some("E1003")),
+			before.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::UnusedValue.code())),
 			invalid,
 			"{:#?}",
 			before.diagnostics

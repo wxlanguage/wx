@@ -1733,7 +1733,6 @@ pub enum Item {
 		entries: Box<[Separated<Spanned<ExportEntry>>]>,
 	},
 	Import {
-		id: DefId,
 		external_name: TextSpan,
 		internal_name: Spanned<SymbolU32>,
 		items: Spanned<Box<[Separated<Spanned<ImportEntry>>]>>,
@@ -2020,13 +2019,22 @@ macro_rules! define_keywords {
 			}
 		}
 
-		fn create_string_interner() -> StringInterner {
-			const KEYWORDS: &[&str] = &[$($text),+];
-			let mut strings = StringInterner::with_capacity(KEYWORDS.len());
-			for keyword in KEYWORDS {
-				strings.get_or_intern(keyword);
+		impl Keyword {
+			/// A fresh interner with every keyword string pre-interned, in
+			/// declaration order, so each keyword's raw index lines up with
+			/// what [`Keyword::symbol`] fabricates directly from the enum
+			/// discriminant. Any interner backing a compilation must be
+			/// built from this rather than `StringInterner::new()` — one
+			/// that skips this seeding step will hand out those same raw
+			/// indices to the first ordinary identifiers it interns instead.
+			pub(crate) fn create_interner() -> StringInterner {
+				const KEYWORDS: &[&str] = &[$($text),+];
+				let mut strings = StringInterner::with_capacity(KEYWORDS.len());
+				for keyword in KEYWORDS {
+					strings.get_or_intern(keyword);
+				}
+				strings
 			}
-			strings
 		}
 	};
 }
@@ -6134,7 +6142,6 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Import {
-				id: parser.id_generator.next(),
 				external_name,
 				internal_name,
 				items,

@@ -1,6 +1,7 @@
 use indoc::indoc;
 
 use super::*;
+use crate::diagnostics::DiagnosticCode;
 use crate::testing::DiagnosticView;
 use crate::vfs::{FileOrigin, Files};
 
@@ -1531,15 +1532,17 @@ fn test_missing_initializer() {
         }
         global y: i32
     "});
-	let e0010_count = case
+	let missing_initializer_count = case
 		.ast
 		.diagnostics
 		.iter()
-		.filter(|d| d.code.as_deref() == Some("E0010"))
+		.filter(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::MissingInitializer.code())
+		})
 		.count();
 	assert_eq!(
-		e0010_count, 2,
-		"expected one E0010 for local and one for global"
+		missing_initializer_count, 2,
+		"expected one MissingInitializer for local and one for global"
 	);
 	assert_eq!(case.ast.items.len(), 1);
 	assert!(case.function_block(0).is_empty());
@@ -1773,12 +1776,7 @@ fn test_import_alias_and_entry_kinds() {
 	else {
 		panic!("expected import block")
 	};
-	assert_eq!(
-		internal_name
-			.as_ref()
-			.and_then(|a| case.interner.resolve(a.inner)),
-		Some("host")
-	);
+	assert_eq!(case.interner.resolve(internal_name.inner), Some("host"));
 	assert!(matches!(
 		items.inner[0].inner.inner.declaration,
 		ImportDeclaration::Function { .. }
@@ -2354,9 +2352,9 @@ fn test_imported_function_is_a_declaration_without_a_body() {
 	let Item::Import { items: entries, .. } = case.item(0) else {
 		panic!("item 0 is {}, not an import", item_kind(case.item(0)))
 	};
-	assert_eq!(entries.len(), 1);
+	assert_eq!(entries.inner.len(), 1);
 	let ImportDeclaration::Function { signature, .. } =
-		&entries[0].inner.inner.declaration
+		&entries.inner[0].inner.inner.declaration
 	else {
 		panic!("expected an imported function")
 	};

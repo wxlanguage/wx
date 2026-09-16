@@ -487,7 +487,7 @@ impl CompilationUnitBuilder {
 		Self {
 			files: Files::new(),
 			id_generator: ast::DefIdGenerator::new(),
-			interner: ast::StringInterner::new(),
+			interner: ast::Keyword::create_interner(),
 			packages: Vec::new(),
 			stdlib: None,
 		}

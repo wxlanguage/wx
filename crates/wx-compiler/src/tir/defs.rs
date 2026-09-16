@@ -13,44 +13,64 @@ use crate::{
 	ast::{self, DefId, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	index::index_newtype,
-	tir::builder::unescape_string,
+	tir::literals::unescape_string_literal,
 	vfs::{FileId, Files, Package, PackageId},
 };
 
-struct DefinitionRegistryBuilder<'a> {
-	diagnostics: &'a mut Vec<Diagnostic<FileId>>,
-	strings: &'a mut StringInterner,
-	files: &'a Files,
+use super::imports;
+
+// `'ast` (borrowed by `ast_nodes`) is kept separate from `'ctx`
+// (`diagnostics`/`strings`/`files`) so that building a registry doesn't pin
+// down how long the caller's diagnostics list or string interner stay
+// borrowed — only `packages` needs to outlive `ast_nodes`, which `build()`
+// hands back separately from the (lifetime-free) `DefinitionRegistry`
+// itself, for Phase 2's demand-driven signature pass to walk.
+struct DefinitionRegistryBuilder<'ast, 'ctx> {
+	diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
+	strings: &'ctx mut StringInterner,
+	files: &'ctx Files,
 
 	namespaces: Vec<Namespace>,
 	package_namespaces: Vec<NamespaceIndex>,
 	module_decls: Vec<ModuleDeclaration>,
 	import_decls: Vec<ImportDeclaration>,
-	ast_nodes: Vec<AstEntry<'a>>,
+	ast_nodes: Vec<AstEntry<'ast>>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
+	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
+	pending_named_imports:
+		HashMap<(NamespaceIndex, SymbolU32), Vec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
 index_newtype!(UseItemIndex);
 
-struct UsePathSegment {
-	segment: Spanned<SymbolU32>,
-	parent: Option<UsePathIndex>,
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) struct UsePathSegment {
+	pub(super) segment: Spanned<SymbolU32>,
+	pub(super) parent: Option<UsePathIndex>,
 }
 
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum UseItemKind {
-	Name { alias: Option<Spanned<SymbolU32>> },
-	Glob,
+	Name {
+		name: Spanned<SymbolU32>,
+		alias: Option<Spanned<SymbolU32>>,
+		prefix: Option<UsePathIndex>,
+	},
+	Glob {
+		path: UsePathIndex,
+	},
 }
 
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct UseItemDef {
 	pub namespace: NamespaceIndex,
 	pub pub_span: Option<TextSpan>,
-	pub path: UsePathIndex,
 	pub kind: UseItemKind,
 }
 
@@ -73,20 +93,20 @@ impl BindingNamespace {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
-struct BindingKey {
+pub(super) struct BindingKey {
 	namespace: BindingNamespace,
-	symbol: SymbolU32,
+	pub(super) symbol: SymbolU32,
 }
 
 impl BindingKey {
-	fn Type(symbol: SymbolU32) -> Self {
+	pub(super) fn ty(symbol: SymbolU32) -> Self {
 		Self {
 			namespace: BindingNamespace::Type,
 			symbol,
 		}
 	}
 
-	fn Value(symbol: SymbolU32) -> Self {
+	pub(super) fn value(symbol: SymbolU32) -> Self {
 		Self {
 			namespace: BindingNamespace::Value,
 			symbol,
@@ -159,6 +179,7 @@ pub struct TraitMemberDef {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct InherentMemberDef {
 	pub kind: MemberKind,
+	pub visibility: Visibility,
 	pub accesses: Vec<SourceSpan>,
 	pub span: TextSpan,
 }
@@ -171,7 +192,8 @@ impl LocalDefIndex {
 
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-struct AstEntry<'ast> {
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) struct AstEntry<'ast> {
 	def_id: DefId,
 	file_id: FileId,
 	namespace: NamespaceIndex,
@@ -180,7 +202,8 @@ struct AstEntry<'ast> {
 
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-enum AstNodeRef<'ast> {
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) enum AstNodeRef<'ast> {
 	Function {
 		item: &'ast ast::Item,
 	},
@@ -281,6 +304,11 @@ pub(super) struct DefinitionRegistry {
 	pub file_namespaces: Vec<NamespaceIndex>,
 	pub module_decls: Vec<ModuleDeclaration>,
 	pub import_decls: Vec<ImportDeclaration>,
+	pub traits: Vec<TraitDef>,
+	pub trait_impls: Vec<TraitImplDef>,
+	pub inherent_impls: Vec<InherentImplDef>,
+	pub use_items: Vec<UseItemDef>,
+	pub use_paths: Vec<UsePathSegment>,
 }
 
 /// Back-pointer to whichever declaration created this namespace.
@@ -309,6 +337,18 @@ impl From<Option<TextSpan>> for Visibility {
 		match value {
 			Some(_) => Visibility::Public,
 			None => Visibility::Private,
+		}
+	}
+}
+
+impl Visibility {
+	/// The narrower of the two — a re-export can never be more visible than
+	/// what it re-exports, so a `use`'s own visibility and the visibility of
+	/// whatever it resolved to both cap the installed binding's visibility.
+	pub(super) fn cap(self, other: Visibility) -> Visibility {
+		match (self, other) {
+			(Visibility::Public, Visibility::Public) => Visibility::Public,
+			_ => Visibility::Private,
 		}
 	}
 }
@@ -350,9 +390,23 @@ impl DefKind {
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
-struct NamespaceDef {
-	kind: DefKind,
+pub(super) struct ItemDef {
+	pub(super) kind: DefKind,
 	span: TextSpan,
+	/// Every source location that referenced this def — go-to-definition
+	/// and find-references read from here. Populated after construction
+	/// via `record_access`, not at `NamespaceDef::new` time.
+	accesses: Vec<SourceSpan>,
+}
+
+impl ItemDef {
+	fn new(kind: DefKind, span: TextSpan) -> Self {
+		Self {
+			kind,
+			span,
+			accesses: Vec::new(),
+		}
+	}
 }
 
 /// The symbol table for a module namespace — shared concept for both local
@@ -370,16 +424,195 @@ pub struct Namespace {
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
 	pub bindings: HashMap<BindingKey, Binding>,
-	pub defs: Vec<NamespaceDef>,
+	pub items: Vec<ItemDef>,
 	/// Namespaces brought into scope via `use path::*;`.  Checked during lookup
 	/// after direct symbols but before walking to the parent.
 	pub glob_imports: Vec<GlobImport>,
 }
 
+/// Lookup helpers over a namespace graph. Implemented on `[Namespace]`
+/// rather than a dedicated wrapper type so it applies uniformly to
+/// `DefinitionRegistryBuilder`'s still-growing `Vec<Namespace>`,
+/// `DefinitionRegistry`'s frozen storage, and `ImportResolver`'s borrowed
+/// `&mut [Namespace]` — all of them deref to `[Namespace]`.
+pub(super) trait NamespaceLookup {
+	/// Whether `namespace` is `ancestor` itself, or nested inside it.
+	fn namespace_contains(
+		&self,
+		ancestor: NamespaceIndex,
+		namespace: NamespaceIndex,
+	) -> bool;
+
+	/// An item declared `visibility` in `declaring_namespace` is reachable
+	/// from `accessor` if it's `Public`, or if `declaring_namespace`
+	/// contains `accessor`.
+	fn is_accessible_from(
+		&self,
+		accessor: NamespaceIndex,
+		declaring_namespace: NamespaceIndex,
+		visibility: Visibility,
+	) -> bool;
+
+	/// Inserts `binding` under `key` in `namespace_idx`. `Err` carries the
+	/// colliding `DefKey` when one was already there and both count as
+	/// real occupants of the name — this is an error state, not merely an
+	/// optional value, hence `Result` over `Option`. No diagnostics here —
+	/// this only touches the namespace graph; a caller with
+	/// `diagnostics`/`strings` on hand (see
+	/// `DefinitionRegistryBuilder`/`ImportResolver`'s own `insert_binding`)
+	/// is what turns a collision into a reported error.
+	fn try_insert_binding(
+		&mut self,
+		namespace_idx: NamespaceIndex,
+		key: BindingKey,
+		binding: Binding,
+	) -> Result<(), DefKey>;
+
+	/// Records that `def_key` was referenced at `span` — go-to-definition
+	/// and find-references over the *definition itself*, regardless of
+	/// which name/path was used to reach it (a re-export's own consult of
+	/// the original item counts here too, same as a direct reference).
+	fn record_access(&mut self, def_key: DefKey, span: SourceSpan);
+
+	/// Records that the binding under `key` in `namespace_idx` was
+	/// consulted at `span` — distinct from `record_access`: this tracks
+	/// whether *this specific name slot* (a direct declaration or a `use`)
+	/// was ever looked up, which is what unused-import/unused-declaration
+	/// diagnostics need and `record_access` alone can't answer (a
+	/// re-export's own binding can sit unused while the original
+	/// definition it points to is still referenced elsewhere).
+	fn record_binding_access(
+		&mut self,
+		namespace_idx: NamespaceIndex,
+		key: BindingKey,
+		span: SourceSpan,
+	);
+}
+
+impl NamespaceLookup for [Namespace] {
+	fn namespace_contains(
+		&self,
+		ancestor: NamespaceIndex,
+		namespace: NamespaceIndex,
+	) -> bool {
+		let mut current = Some(namespace);
+		while let Some(ns) = current {
+			if ns == ancestor {
+				return true;
+			}
+			current = self[usize::from(ns)].parent;
+		}
+		false
+	}
+
+	fn is_accessible_from(
+		&self,
+		accessor: NamespaceIndex,
+		declaring_namespace: NamespaceIndex,
+		visibility: Visibility,
+	) -> bool {
+		match visibility {
+			Visibility::Public => true,
+			Visibility::Private => {
+				self.namespace_contains(declaring_namespace, accessor)
+			}
+		}
+	}
+
+	fn try_insert_binding(
+		&mut self,
+		namespace_idx: NamespaceIndex,
+		key: BindingKey,
+		binding: Binding,
+	) -> Result<(), DefKey> {
+		use std::collections::hash_map::Entry;
+
+		match self[usize::from(namespace_idx)].bindings.entry(key) {
+			Entry::Vacant(entry) => {
+				entry.insert(binding);
+				Ok(())
+			}
+			Entry::Occupied(mut entry) => {
+				match (entry.get().target, binding.target) {
+					// Two equally-legitimate bindings compete for the same
+					// name.
+					(
+						BindingTarget::Accessible(collision),
+						BindingTarget::Accessible(_),
+					)
+					| (
+						BindingTarget::Inaccessible(collision),
+						BindingTarget::Inaccessible(_),
+					) => Err(collision),
+					// An accessible binding always wins over an
+					// inaccessible one, silently — an inaccessible claim
+					// isn't a real competing declaration, so this isn't a
+					// collision to report either way.
+					(
+						BindingTarget::Inaccessible(_),
+						BindingTarget::Accessible(_),
+					) => {
+						entry.insert(binding);
+						Ok(())
+					}
+					(
+						BindingTarget::Accessible(_),
+						BindingTarget::Inaccessible(_),
+					) => Ok(()),
+					// A real binding replaces previous recovery state.
+					(
+						BindingTarget::Error,
+						BindingTarget::Accessible(_)
+						| BindingTarget::Inaccessible(_),
+					) => {
+						entry.insert(binding);
+						Ok(())
+					}
+					// Recovery state must never hide a real binding.
+					(
+						BindingTarget::Accessible(_)
+						| BindingTarget::Inaccessible(_),
+						BindingTarget::Error,
+					) => Ok(()),
+					// Nothing useful to diagnose here.
+					(BindingTarget::Error, BindingTarget::Error) => Ok(()),
+				}
+			}
+		}
+	}
+
+	fn record_access(&mut self, def_key: DefKey, span: SourceSpan) {
+		self[usize::from(def_key.namespace_idx)].items
+			[usize::from(def_key.def_idx)]
+		.accesses
+		.push(span);
+	}
+
+	fn record_binding_access(
+		&mut self,
+		namespace_idx: NamespaceIndex,
+		key: BindingKey,
+		span: SourceSpan,
+	) {
+		if let Some(binding) =
+			self[usize::from(namespace_idx)].bindings.get_mut(&key)
+		{
+			binding.accesses.push(span);
+		}
+	}
+}
+
 #[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-enum BindingTarget {
-	Def(DefKey),
+pub(super) enum BindingTarget {
+	Accessible(DefKey),
+	/// Resolved to a real def, but the source wasn't visible from the
+	/// writing namespace when a `use` resolved it. Not poisoned like
+	/// `Error` — whatever already enforces privacy at reference sites for
+	/// direct qualified paths should apply the same check here, reporting
+	/// (or not) each time this binding is actually used, not just once.
+	Inaccessible(DefKey),
 	Error,
 }
 
@@ -392,38 +625,33 @@ enum BindingSource {
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-struct Binding {
-	target: BindingTarget,
-	visibility: Visibility,
-	accesses: Vec<SourceSpan>,
+pub(super) struct Binding {
+	pub(super) target: BindingTarget,
+	pub(super) visibility: Visibility,
+	pub(super) accesses: Vec<SourceSpan>,
 	source: BindingSource,
 }
 
 impl Binding {
-	fn PrivateDef(key: DefKey) -> Self {
+	fn definition(key: DefKey, visibility: Visibility) -> Self {
 		Self {
-			target: BindingTarget::Def(key),
-			accesses: Vec::new(),
-			visibility: Visibility::Private,
-			source: BindingSource::Definition,
-		}
-	}
-
-	fn PublicDef(key: DefKey) -> Self {
-		Self {
-			target: BindingTarget::Def(key),
-			accesses: Vec::new(),
-			visibility: Visibility::Public,
-			source: BindingSource::Definition,
-		}
-	}
-
-	fn Def(key: DefKey, visibility: Visibility) -> Self {
-		Self {
-			target: BindingTarget::Def(key),
+			target: BindingTarget::Accessible(key),
 			accesses: Vec::new(),
 			visibility,
 			source: BindingSource::Definition,
+		}
+	}
+
+	pub(super) fn import(
+		target: BindingTarget,
+		visibility: Visibility,
+		index: UseItemIndex,
+	) -> Self {
+		Self {
+			target,
+			accesses: Vec::new(),
+			visibility,
+			source: BindingSource::Import(index),
 		}
 	}
 }
@@ -492,8 +720,8 @@ impl MemberKind {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct DefKey {
-	namespace_idx: NamespaceIndex,
-	def_idx: LocalDefIndex,
+	pub(super) namespace_idx: NamespaceIndex,
+	pub(super) def_idx: LocalDefIndex,
 }
 
 impl DefKey {
@@ -506,17 +734,17 @@ impl DefKey {
 	}
 
 	#[inline]
-	pub fn source_span(self, namespaces: &Vec<Namespace>) -> SourceSpan {
+	pub fn source_span(self, namespaces: &[Namespace]) -> SourceSpan {
 		let namespace = &namespaces[usize::from(self.namespace_idx)];
 		SourceSpan::new(
 			namespace.file_id,
-			namespace.defs[usize::from(self.def_idx)].span,
+			namespace.items[usize::from(self.def_idx)].span,
 		)
 	}
 
 	#[inline]
-	pub fn text_span(self, namespaces: &Vec<Namespace>) -> TextSpan {
-		namespaces[usize::from(self.namespace_idx)].defs
+	pub fn text_span(self, namespaces: &[Namespace]) -> TextSpan {
+		namespaces[usize::from(self.namespace_idx)].items
 			[usize::from(self.def_idx)]
 		.span
 	}
@@ -524,16 +752,7 @@ impl DefKey {
 	#[inline]
 	pub fn symbol_kind(self, defs: &DefinitionRegistry) -> DefKind {
 		let namespace = &defs.namespaces[usize::from(self.namespace_idx)];
-		namespace.defs[usize::from(self.def_idx)].kind
-	}
-}
-
-impl DefinitionRegistry {
-	pub(super) fn record_access(&mut self, def_key: DefKey, span: SourceSpan) {
-		self.namespaces[usize::from(def_key.namespace_idx)].defs
-			[usize::from(def_key.def_idx)]
-		.accesses
-		.push(span);
+		namespace.items[usize::from(self.def_idx)].kind
 	}
 }
 
@@ -583,7 +802,7 @@ impl<T: Copy> Declared<T> {
 	}
 }
 
-struct DuplicateDefinitionDiagnostic<'strings> {
+pub(super) struct DuplicateDefinitionDiagnostic<'strings> {
 	pub(super) strings: &'strings ast::StringInterner,
 	pub(super) key: BindingKey,
 	pub(super) file_id: FileId,
@@ -591,7 +810,7 @@ struct DuplicateDefinitionDiagnostic<'strings> {
 }
 
 impl DuplicateDefinitionDiagnostic<'_> {
-	fn report(self) -> Diagnostic<FileId> {
+	pub(super) fn report(self) -> Diagnostic<FileId> {
 		let name = self.strings.resolve(self.key.symbol).unwrap();
 
 		let (a, b) = self.definitions;
@@ -616,23 +835,30 @@ impl DuplicateDefinitionDiagnostic<'_> {
 }
 
 impl DefinitionRegistry {
-	pub(super) fn build(
-		packages: &[Package],
+	/// Returns the registry alongside `ast_nodes` — every top-level item in
+	/// parse order, for Phase 2's demand-driven `ensure_signature` to walk.
+	/// Kept separate rather than a field: the registry itself needs no
+	/// lifetime, since nothing else in it borrows the AST, and callers who
+	/// only need the registry (like tests exercising this phase alone) can
+	/// drop `ast_nodes` immediately instead of carrying an AST borrow
+	/// alongside it.
+	pub(super) fn build<'ast>(
+		packages: &'ast [Package],
 		files: &Files,
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
-	) -> Self {
+	) -> (Self, Vec<AstEntry<'ast>>) {
 		DefinitionRegistryBuilder::build(packages, files, strings, diagnostics)
 	}
 }
 
-impl<'a> DefinitionRegistryBuilder<'a> {
+impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	fn build(
-		packages: &[Package],
-		files: &Files,
-		strings: &mut ast::StringInterner,
-		diagnostics: &mut Vec<Diagnostic<FileId>>,
-	) -> DefinitionRegistry {
+		packages: &'ast [Package],
+		files: &'ctx Files,
+		strings: &'ctx mut ast::StringInterner,
+		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
+	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
 		let package_namespaces: Vec<NamespaceIndex> = (0..packages.len())
 			.into_iter()
 			.map(|i| NamespaceIndex(u32::try_from(i).unwrap()))
@@ -652,25 +878,25 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 					),
 					file_id: package.modules[package.root.as_usize()].file_id,
 					bindings: HashMap::new(),
-					defs: vec![NamespaceDef {
-						kind: DefKind::Namespace(namespace_idx),
-						span: TextSpan::new(0, 0),
-					}],
+					items: vec![ItemDef::new(
+						DefKind::Namespace(namespace_idx),
+						TextSpan::new(0, 0),
+					)],
 					glob_imports: Vec::new(),
 				};
 				namespace.bindings.insert(
-					BindingKey::Type(ast::Keyword::SelfLower.symbol()),
-					Binding::PublicDef(DefKey::new(
-						namespace_idx,
-						LocalDefIndex::SELF,
-					)),
+					BindingKey::ty(ast::Keyword::SelfLower.symbol()),
+					Binding::definition(
+						DefKey::new(namespace_idx, LocalDefIndex::SELF),
+						Visibility::Public,
+					),
 				);
 				namespace.bindings.insert(
-					BindingKey::Type(ast::Keyword::Crate.symbol()),
-					Binding::PublicDef(DefKey::new(
-						namespace_idx,
-						LocalDefIndex::SELF,
-					)),
+					BindingKey::ty(ast::Keyword::Crate.symbol()),
+					Binding::definition(
+						DefKey::new(namespace_idx, LocalDefIndex::SELF),
+						Visibility::Public,
+					),
 				);
 
 				// TODO: I want to remove this later, the declaration should be defined in the crate itself
@@ -682,11 +908,14 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 				// this will be a neat way to expose peer dependencies
 				for (&name, &dependency_id) in package.dependencies.iter() {
 					namespace.bindings.insert(
-						BindingKey::Type(name),
-						Binding::PublicDef(DefKey::new(
-							package_namespaces[dependency_id.as_usize()],
-							LocalDefIndex::SELF,
-						)),
+						BindingKey::ty(name),
+						Binding::definition(
+							DefKey::new(
+								package_namespaces[dependency_id.as_usize()],
+								LocalDefIndex::SELF,
+							),
+							Visibility::Public,
+						),
 					);
 				}
 
@@ -694,7 +923,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			})
 			.collect();
 
-		let builder = Self {
+		let mut builder = Self {
 			ast_nodes: Vec::new(),
 			diagnostics,
 			namespaces,
@@ -708,6 +937,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			inherent_impls: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
+			pending_named_imports: HashMap::new(),
 		};
 
 		let file_namespaces = builder.compute_file_namespaces(packages);
@@ -717,20 +947,55 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 		{
 			let namespace_idx =
 				file_namespaces[source_module.file_id.as_usize()];
+			for item in source_module.ast.items.iter() {
+				builder.scan_item(
+					source_module.file_id,
+					namespace_idx,
+					&item.inner.inner,
+				);
+			}
 		}
 
-		todo!()
+		builder.resolve_use_paths();
+
+		let registry = DefinitionRegistry {
+			namespaces: builder.namespaces,
+			package_namespaces: builder.package_namespaces,
+			file_namespaces,
+			module_decls: builder.module_decls,
+			import_decls: builder.import_decls,
+			traits: builder.traits,
+			trait_impls: builder.trait_impls,
+			inherent_impls: builder.inherent_impls,
+			use_items: builder.use_items,
+			use_paths: builder.use_paths,
+		};
+		(registry, builder.ast_nodes)
 	}
 
+	/// Phase 1a — one namespace per file. Runs before any item is scanned,
+	/// so a `mod foo;` declaration (Phase 1b) always finds its content
+	/// file's namespace already in place. Pushed in the same order vfs
+	/// assigned `FileId`s (each package's whole module tree is loaded, in
+	/// module-push order, before the next package starts — see
+	/// `Loader::load_module` in `vfs/mod.rs`), so this traversal always has
+	/// a parent's namespace ready before any of its children need it, and
+	/// `push` alone keeps every entry aligned to its `FileId` without
+	/// needing to index ahead of the vec's current length.
 	fn compute_file_namespaces(
 		&mut self,
 		packages: &[Package],
 	) -> Vec<NamespaceIndex> {
-		let file_namespaces = Vec::new();
+		let mut file_namespaces = Vec::with_capacity(self.files.len());
 		for source_module in packages
 			.iter()
 			.flat_map(|package_graph| package_graph.modules.iter())
 		{
+			debug_assert_eq!(
+				file_namespaces.len(),
+				source_module.file_id.as_usize(),
+				"vfs must assign FileIds in package/module push order",
+			);
 			let package = &packages[source_module.package_id.as_usize()];
 			let namespace_idx = match &source_module.declaration {
 				None => self.package_namespaces[package.id.as_usize()],
@@ -750,19 +1015,35 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 							name: declaration.name,
 							pub_span: declaration.pub_span,
 						});
-					self.declare_child_namespace(
-						parent_namespace,
-						source_module.file_id,
-						declaration.name.inner,
-						NamespaceKind::Module(module_declaration_idx),
-						TextSpan::new(0, u32::MAX),
-						Visibility::from(declaration.pub_span),
-					)
-					.report_with(|collision| todo!());
+					debug_assert_eq!(
+						namespace_idx,
+						self.declare_child_namespace(
+							parent_namespace,
+							source_module.file_id,
+							declaration.name.inner,
+							NamespaceKind::Module(module_declaration_idx),
+							TextSpan::new(0, u32::MAX),
+							Visibility::from(declaration.pub_span),
+						)
+						.report_with(|collision| {
+							self.diagnostics.push(
+								DuplicateDefinitionDiagnostic {
+									strings: self.strings,
+									key: BindingKey::ty(declaration.name.inner),
+									file_id: parent_module.file_id,
+									definitions: (
+										collision.text_span(&self.namespaces),
+										declaration.name.span,
+									),
+								}
+								.report(),
+							)
+						})
+					);
 					namespace_idx
 				}
 			};
-			file_namespaces[source_module.file_id.as_usize()] = namespace_idx;
+			file_namespaces.push(namespace_idx);
 		}
 
 		file_namespaces
@@ -789,7 +1070,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 		item: InherentImplDef,
 	) -> InherentImplIndex {
 		let index = InherentImplIndex::new(
-			u32::try_from(self.trait_impls.len()).unwrap(),
+			u32::try_from(self.inherent_impls.len()).unwrap(),
 		);
 		self.inherent_impls.push(item);
 		index
@@ -797,62 +1078,33 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 
 	fn push_use_path(&mut self, segment: UsePathSegment) -> UsePathIndex {
 		let index =
-			UsePathIndex::new(u32::try_from(self.trait_impls.len()).unwrap());
+			UsePathIndex::new(u32::try_from(self.use_paths.len()).unwrap());
 		self.use_paths.push(segment);
+		index
+	}
+
+	fn push_use_item(&mut self, item: UseItemDef) -> UseItemIndex {
+		let index =
+			UseItemIndex::new(u32::try_from(self.use_items.len()).unwrap());
+		self.use_items.push(item);
 		index
 	}
 
 	fn push_def(
 		&mut self,
 		namespace_idx: NamespaceIndex,
-		definition: NamespaceDef,
+		definition: ItemDef,
 	) -> DefKey {
 		let symbol_idx = LocalDefIndex::new(
 			u32::try_from(
-				self.namespaces[usize::from(namespace_idx)].defs.len(),
+				self.namespaces[usize::from(namespace_idx)].items.len(),
 			)
 			.unwrap(),
 		);
 		self.namespaces[usize::from(namespace_idx)]
-			.defs
+			.items
 			.push(definition);
 		DefKey::new(namespace_idx, symbol_idx)
-	}
-
-	fn try_insert_binding(
-		&mut self,
-		namespace_idx: NamespaceIndex,
-		key: BindingKey,
-		binding: Binding,
-	) -> Option<DefKey> {
-		use std::collections::hash_map::Entry;
-
-		match self.namespaces[usize::from(namespace_idx)]
-			.bindings
-			.entry(key)
-		{
-			Entry::Vacant(entry) => {
-				entry.insert(binding);
-				None
-			}
-			Entry::Occupied(mut entry) => {
-				match (entry.get().target, binding.target) {
-					// Two actual bindings compete for the same name.
-					(BindingTarget::Def(collision), BindingTarget::Def(_)) => {
-						Some(collision)
-					}
-					// A real binding replaces previous recovery state.
-					(BindingTarget::Error, BindingTarget::Def(_)) => {
-						entry.insert(binding);
-						None
-					}
-					// Recovery state must never hide a real binding.
-					(BindingTarget::Def(_), BindingTarget::Error) => None,
-					// Nothing useful to diagnose here.
-					(BindingTarget::Error, BindingTarget::Error) => None,
-				}
-			}
-		}
 	}
 
 	fn insert_binding(
@@ -862,8 +1114,9 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 		binding: Binding,
 		span: TextSpan,
 	) {
-		if let Some(collision_key) =
-			self.try_insert_binding(namespace_idx, key, binding)
+		if let Err(collision_key) =
+			self.namespaces
+				.try_insert_binding(namespace_idx, key, binding)
 		{
 			self.diagnostics.push(
 				DuplicateDefinitionDiagnostic {
@@ -902,46 +1155,56 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			package_id,
 			kind,
 			bindings: HashMap::new(),
-			defs: vec![NamespaceDef {
-				kind: DefKind::Namespace(namespace_idx),
-				span: content_span,
-			}],
+			items: vec![ItemDef::new(
+				DefKind::Namespace(namespace_idx),
+				content_span,
+			)],
 			glob_imports: Vec::new(),
 		};
 		namespace.bindings.insert(
-			BindingKey::Type(name),
-			Binding::PublicDef(DefKey::new(namespace_idx, LocalDefIndex::SELF)),
+			BindingKey::ty(name),
+			Binding::definition(
+				DefKey::new(namespace_idx, LocalDefIndex::SELF),
+				Visibility::Public,
+			),
+		);
+		namespace.bindings.insert(
+			BindingKey::ty(ast::Keyword::SelfLower.symbol()),
+			Binding::definition(
+				DefKey::new(namespace_idx, LocalDefIndex::SELF),
+				Visibility::Public,
+			),
 		);
 
 		let crate_root_namespace =
 			self.package_namespaces[package_id.as_usize()];
 		namespace.bindings.insert(
-			BindingKey::Type(ast::Keyword::Crate.symbol()),
-			Binding::PublicDef(DefKey::new(
-				crate_root_namespace,
-				LocalDefIndex::SELF,
-			)),
+			BindingKey::ty(ast::Keyword::Crate.symbol()),
+			Binding::definition(
+				DefKey::new(crate_root_namespace, LocalDefIndex::SELF),
+				Visibility::Public,
+			),
 		);
 		namespace.bindings.insert(
-			BindingKey::Type(ast::Keyword::Super.symbol()),
-			Binding::PublicDef(DefKey::new(
-				parent_namespace,
-				LocalDefIndex::SELF,
-			)),
+			BindingKey::ty(ast::Keyword::Super.symbol()),
+			Binding::definition(
+				DefKey::new(parent_namespace, LocalDefIndex::SELF),
+				Visibility::Public,
+			),
 		);
 		self.namespaces.push(namespace);
-		match self.try_insert_binding(
+		match self.namespaces.try_insert_binding(
 			parent_namespace,
-			BindingKey::Type(name),
-			Binding::Def(
+			BindingKey::ty(name),
+			Binding::definition(
 				DefKey::new(namespace_idx, LocalDefIndex::SELF),
 				visibility,
 			),
 		) {
-			Some(collision) => {
+			Err(collision) => {
 				Declared::with_collision(namespace_idx, collision)
 			}
-			None => Declared::new(namespace_idx),
+			Ok(()) => Declared::new(namespace_idx),
 		}
 	}
 
@@ -968,12 +1231,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 	}
 }
 
-impl<'a> DefinitionRegistryBuilder<'a> {
+impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	pub(super) fn scan_item(
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIndex,
-		item: &'a ast::Item,
+		item: &'ast ast::Item,
 	) {
 		match item {
 			ast::Item::Function {
@@ -990,15 +1253,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Function(*id),
-						span: signature.name.span,
-					},
+					ItemDef::new(DefKind::Function(*id), signature.name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Value(signature.name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::value(signature.name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					signature.name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1009,23 +1269,16 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 				});
 			}
 			ast::Item::Global {
-				id,
-				pub_span,
-				mut_span,
-				name,
-				..
+				id, pub_span, name, ..
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Global(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Global(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Value(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::value(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1040,15 +1293,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Struct(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Struct(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1063,21 +1313,18 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Struct(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Struct(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Value(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::value(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1092,15 +1339,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Enum(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Enum(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1115,15 +1359,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::TypeAlias(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::TypeAlias(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1136,21 +1377,18 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			ast::Item::Memory { id, name, .. } => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Memory(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Memory(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::Private),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::Private),
 					name.span,
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Value(name.inner),
-					Binding::Def(def_key, Visibility::Private),
+					BindingKey::value(name.inner),
+					Binding::definition(def_key, Visibility::Private),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1165,15 +1403,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Const(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Const(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Value(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::value(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1213,7 +1448,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
-								key: BindingKey::Type(name.inner),
+								key: BindingKey::ty(name.inner),
 								file_id,
 								definitions: (
 									collision_key.text_span(&self.namespaces),
@@ -1242,15 +1477,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::Trait(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::Trait(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				let trait_index =
@@ -1262,8 +1494,9 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 					node: AstNodeRef::Trait { trait_index, item },
 				});
 
-				let members: Vec<TraitMemberDef> = Vec::new();
-				let bindings: HashMap<BindingKey, MemberIndex> = HashMap::new();
+				let mut members: Vec<TraitMemberDef> = Vec::new();
+				let mut bindings: HashMap<BindingKey, MemberIndex> =
+					HashMap::new();
 				for item in items.iter() {
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, id, .. } => {
@@ -1282,7 +1515,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									accesses: Vec::new(),
 									span: signature.name.span,
 								},
-								BindingKey::Value(signature.name.inner),
+								BindingKey::value(signature.name.inner),
 							)
 						}
 						ast::TraitItem::Const { name, id, .. } => {
@@ -1301,7 +1534,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									accesses: Vec::new(),
 									span: name.span,
 								},
-								BindingKey::Value(name.inner),
+								BindingKey::value(name.inner),
 							)
 						}
 						ast::TraitItem::AssociatedType { name, id, .. } => {
@@ -1320,13 +1553,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									accesses: Vec::new(),
 									span: name.span,
 								},
-								BindingKey::Type(name.inner),
+								BindingKey::ty(name.inner),
 							)
 						}
 					};
 					let member_index =
 						MemberIndex::new(u32::try_from(members.len()).unwrap());
-					members.push(member);
 					if let Some(collision) = bindings.get(&key).copied() {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
@@ -1343,6 +1575,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 					} else {
 						bindings.insert(key, member_index);
 					}
+					members.push(member);
 				}
 
 				debug_assert_eq!(
@@ -1365,11 +1598,11 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			ast::Item::InherentImpl {
 				id: impl_id,
 				type_params,
-				target,
 				items,
+				..
 			} => {
-				let members: Vec<InherentMemberDef> = Vec::new();
-				let bindings: HashMap<BindingKey, (MemberIndex, Visibility)> =
+				let mut members: Vec<InherentMemberDef> = Vec::new();
+				let mut bindings: HashMap<BindingKey, MemberIndex> =
 					HashMap::new();
 				let block_index = InherentImplIndex(
 					u32::try_from(self.inherent_impls.len()).unwrap(),
@@ -1404,10 +1637,11 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 								InherentMemberDef {
 									accesses: Vec::new(),
 									kind: MemberKind::Function(*id),
+									visibility: Visibility::from(*pub_span),
 									span: signature.name.span,
 								},
-								BindingKey::Value(signature.name.inner),
-								(member_index, Visibility::from(*pub_span)),
+								BindingKey::value(signature.name.inner),
+								member_index,
 							)
 						}
 						ast::ImplItem::Constant {
@@ -1427,18 +1661,18 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 								InherentMemberDef {
 									accesses: Vec::new(),
 									kind: MemberKind::Constant(*id),
+									visibility: Visibility::from(*pub_span),
 									span: name.span,
 								},
-								BindingKey::Value(name.inner),
-								(member_index, Visibility::from(*pub_span)),
+								BindingKey::value(name.inner),
+								member_index,
 							)
 						}
 						ast::ImplItem::AssocType { .. } => {
 							todo!()
 						}
 					};
-					members.push(member);
-					if let Some((collision, _)) = bindings.get(&key).copied() {
+					if let Some(collision) = bindings.get(&key).copied() {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
@@ -1454,30 +1688,33 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 					} else {
 						bindings.insert(key, binding);
 					}
+					members.push(member);
 				}
 
-				let block_index = self.push_inherent_impl(InherentImplDef {
-					def_id: *impl_id,
-					file_id,
-					namespace,
-					type_params: type_params
-						.iter()
-						.map(|tp| TypeParamDef::new(tp.name))
-						.collect(),
-					members: Vec::new(),
-					bindings: HashMap::new(),
-					self_accesses: Vec::new(),
-				});
+				debug_assert_eq!(
+					block_index,
+					self.push_inherent_impl(InherentImplDef {
+						def_id: *impl_id,
+						file_id,
+						namespace,
+						type_params: type_params
+							.iter()
+							.map(|tp| TypeParamDef::new(tp.name))
+							.collect(),
+						members,
+						bindings,
+						self_accesses: Vec::new(),
+					})
+				);
 			}
 			ast::Item::Import {
 				internal_name,
 				external_name,
 				items,
-				id,
 			} => {
 				let external_name = {
 					let unquoted =
-						unescape_string(external_name.extract_str(
+						unescape_string_literal(external_name.extract_str(
 							&self.files.get(file_id).unwrap().source,
 						));
 					Spanned {
@@ -1510,7 +1747,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
-								key: BindingKey::Type(internal_name.inner),
+								key: BindingKey::ty(internal_name.inner),
 								file_id,
 								definitions: (
 									collision.text_span(&self.namespaces),
@@ -1527,21 +1764,24 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 						ast::ImportDeclaration::Memory { id, name, .. } => {
 							let def_key = self.push_def(
 								namespace_idx,
-								NamespaceDef {
-									kind: DefKind::Memory(*id),
-									span: name.span,
-								},
+								ItemDef::new(DefKind::Memory(*id), name.span),
 							);
 							self.insert_binding(
 								namespace_idx,
-								BindingKey::Type(name.inner),
-								Binding::Def(def_key, Visibility::Public),
+								BindingKey::ty(name.inner),
+								Binding::definition(
+									def_key,
+									Visibility::Public,
+								),
 								name.span,
 							);
 							self.insert_binding(
 								namespace_idx,
-								BindingKey::Value(name.inner),
-								Binding::Def(def_key, Visibility::Public),
+								BindingKey::value(name.inner),
+								Binding::definition(
+									def_key,
+									Visibility::Public,
+								),
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -1557,15 +1797,18 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 						ast::ImportDeclaration::Function { id, signature } => {
 							let def_key = self.push_def(
 								namespace_idx,
-								NamespaceDef {
-									kind: DefKind::Memory(*id),
-									span: signature.name.span,
-								},
+								ItemDef::new(
+									DefKind::Memory(*id),
+									signature.name.span,
+								),
 							);
 							self.insert_binding(
 								namespace_idx,
-								BindingKey::Value(signature.name.inner),
-								Binding::Def(def_key, Visibility::Public),
+								BindingKey::value(signature.name.inner),
+								Binding::definition(
+									def_key,
+									Visibility::Public,
+								),
 								signature.name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -1581,15 +1824,15 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 						ast::ImportDeclaration::Global { id, name, .. } => {
 							let def_key = self.push_def(
 								namespace_idx,
-								NamespaceDef {
-									kind: DefKind::Memory(*id),
-									span: name.span,
-								},
+								ItemDef::new(DefKind::Memory(*id), name.span),
 							);
 							self.insert_binding(
 								namespace_idx,
-								BindingKey::Value(name.inner),
-								Binding::Def(def_key, Visibility::Public),
+								BindingKey::value(name.inner),
+								Binding::definition(
+									def_key,
+									Visibility::Public,
+								),
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -1621,15 +1864,12 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 			} => {
 				let def_key = self.push_def(
 					namespace,
-					NamespaceDef {
-						kind: DefKind::TypeSet(*id),
-						span: name.span,
-					},
+					ItemDef::new(DefKind::TypeSet(*id), name.span),
 				);
 				self.insert_binding(
 					namespace,
-					BindingKey::Type(name.inner),
-					Binding::Def(def_key, Visibility::from(*pub_span)),
+					BindingKey::ty(name.inner),
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -1645,8 +1885,9 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 				type_params,
 				..
 			} => {
-				let members: Vec<TraitMemberDef> = Vec::new();
-				let bindings: HashMap<BindingKey, MemberIndex> = HashMap::new();
+				let mut members: Vec<TraitMemberDef> = Vec::new();
+				let mut bindings: HashMap<BindingKey, MemberIndex> =
+					HashMap::new();
 				self.ast_nodes.push(AstEntry {
 					def_id: *impl_id,
 					file_id,
@@ -1671,7 +1912,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									kind: MemberKind::Function(*id),
 									span: signature.name.span,
 								},
-								BindingKey::Value(signature.name.inner),
+								BindingKey::value(signature.name.inner),
 							)
 						}
 						ast::ImplItem::Constant { id, name, .. } => {
@@ -1690,7 +1931,7 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									kind: MemberKind::Constant(*id),
 									span: name.span,
 								},
-								BindingKey::Value(name.inner),
+								BindingKey::value(name.inner),
 							)
 						}
 						ast::ImplItem::AssocType { id, name, .. } => {
@@ -1709,14 +1950,13 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 									kind: MemberKind::AssociatedType(*id),
 									span: name.span,
 								},
-								BindingKey::Type(name.inner),
+								BindingKey::ty(name.inner),
 							)
 						}
 					};
 
 					let member_index =
 						MemberIndex::new(u32::try_from(members.len()).unwrap());
-					members.push(member);
 					if let Some(collision) = bindings.get(&key).copied() {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
@@ -1733,9 +1973,10 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 					} else {
 						bindings.insert(key, member_index);
 					}
+					members.push(member);
 				}
 
-				let params = Vec::with_capacity(type_params.len());
+				let mut params = Vec::with_capacity(type_params.len());
 				for param in type_params.iter() {
 					params.push(TypeParamDef {
 						accesses: Vec::new(),
@@ -1797,27 +2038,30 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 	) {
 		match tree {
 			ast::UseTree::Name { segment, alias } => {
-				let path = self.push_use_path(UsePathSegment {
-					segment: *segment,
-					parent: parent_segment,
-				});
-				self.use_items.push(UseItemDef {
-					kind: UseItemKind::Name { alias: *alias },
+				let local_name = (*alias).unwrap_or(*segment).inner;
+				let item_index = self.push_use_item(UseItemDef {
+					kind: UseItemKind::Name {
+						name: *segment,
+						alias: *alias,
+						prefix: parent_segment,
+					},
 					namespace,
 					pub_span,
-					path,
 				});
+				self.pending_named_imports
+					.entry((namespace, local_name))
+					.or_default()
+					.push(item_index);
 			}
 			ast::UseTree::Glob { segment } => {
 				let path = self.push_use_path(UsePathSegment {
 					segment: *segment,
 					parent: parent_segment,
 				});
-				self.use_items.push(UseItemDef {
-					kind: UseItemKind::Glob,
+				self.push_use_item(UseItemDef {
+					kind: UseItemKind::Glob { path },
 					namespace,
 					pub_span,
-					path,
 				});
 			}
 			ast::UseTree::Path { segment, rest } => {
@@ -1850,136 +2094,190 @@ impl<'a> DefinitionRegistryBuilder<'a> {
 	}
 }
 
-#[derive(Clone, Copy)]
-enum ImportScope {
-	Namespace(NamespaceIndex),
-	// TODO: Enum, Variant etc..
-}
-
-impl ImportScope {
-	fn resolve_member(
-		self,
-		defs: &DefinitionRegistryBuilder,
-		segment: Spanned<SymbolU32>,
-	) {
-		match self {
-			ImportScope::Namespace(namespace) => {
-				// ...
-			}
-		}
-	}
-}
-
-#[derive(Clone, Copy)]
-enum UsePathStatus {
-	Pending,
-	Resolving,
-	Resolved(ImportScope),
-	Error,
-}
-
-impl<'a> DefinitionRegistryBuilder<'a> {
+impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	fn resolve_use_paths(&mut self) {
-		let state: Vec<UsePathStatus> =
-			vec![UsePathStatus::Pending; self.use_paths.len()];
-		for item in self.use_items.iter() {
-			let import_scope = match self.ensure_import_scope(
-				item.namespace,
-				item.path,
-				&mut state,
-			) {
-				Ok(scope) => scope,
-				Err(_) => continue,
-			};
-			match item.kind {
-				UseItemKind::Glob => {}
-				UseItemKind::Name { alias } => {}
-			}
+		imports::resolve_use_paths(
+			self.diagnostics,
+			self.strings,
+			&mut self.namespaces,
+			&self.use_items,
+			&self.use_paths,
+			&self.pending_named_imports,
+		);
+	}
+}
 
-			todo!()
-		}
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use indoc::indoc;
+
+	use super::*;
+	use crate::testing::DiagnosticView;
+	use crate::vfs;
+
+	struct TestCase {
+		graph: vfs::CompilationUnit,
+		defs: DefinitionRegistry,
+		diagnostics: Vec<Diagnostic<FileId>>,
 	}
 
-	fn ensure_import_scope(
-		&mut self,
-		origin: NamespaceIndex,
-		path: UsePathIndex,
-		cache: &mut [UsePathStatus],
-	) -> Result<ImportScope, ()> {
-		match cache[usize::from(path)] {
-			UsePathStatus::Resolved(scope) => return Ok(scope),
-			UsePathStatus::Error => return Err(()),
-			UsePathStatus::Resolving => {
-				// cyclic explicit re-export / path dependency
-				// self.report_use_cycle(path);
-				cache[usize::from(path)] = UsePathStatus::Error;
-				return Err(());
+	impl TestCase {
+		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+			let mut diagnostics = Vec::new();
+			let (defs, ast_nodes) = DefinitionRegistry::build(
+				&graph.packages,
+				&graph.files,
+				&mut graph.interner,
+				&mut diagnostics,
+			);
+			// Only Phase 1 (this file) is under test here — `ast_nodes` is
+			// Phase 2's input, and dropping it now is what lets `defs` (and
+			// `graph`, moved below) outlive this constructor with no
+			// lingering borrow between them.
+			drop(ast_nodes);
+
+			TestCase {
+				graph,
+				defs,
+				diagnostics,
 			}
-			UsePathStatus::Pending => {}
 		}
 
-		cache[usize::from(path)] = UsePathStatus::Resolving;
-
-		let segment = self.use_paths[usize::from(path)];
-		let result = match segment.parent {
-			None => {
-				let Some(binding) = self.namespaces[usize::from(origin)]
-					.bindings
-					.get(&BindingKey::Type(segment.segment.inner))
-				else {
-					// self.report_unresolved_use_segment(origin, segment);
-					// return Err(())
-					todo!()
-				};
-
-				self.binding_to_import_scope(binding, segment.segment.span)
-			}
-			Some(parent) => {
-				let parent_scope =
-					self.ensure_import_scope(origin, parent, cache)?;
-				self.resolve_import_scope_member(
-					origin,
-					parent_scope,
-					segment.segment,
+		fn new(source: &str) -> Self {
+			let mut builder = vfs::CompilationUnitBuilder::new();
+			builder.load_stdlib();
+			let root_id = builder
+				.load_binary(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)])),
 				)
-			}
-		};
+				.unwrap();
+			Self::from_graph(builder.build(root_id))
+		}
 
-		match result {
-			Ok(scope) => {
-				cache[usize::from(path)] = UsePathStatus::Resolved(scope);
-				Ok(scope)
-			}
-			Err(()) => {
-				cache[usize::from(path)] = UsePathStatus::Error;
-				Err(())
+		fn new_multi_file(
+			entry_path: vfs::AbsolutePath,
+			workspace: HashMap<vfs::AbsolutePath, String>,
+		) -> Self {
+			let mut builder = vfs::CompilationUnitBuilder::new();
+			builder.load_stdlib();
+			let root_id = builder
+				.load_binary(
+					entry_path,
+					&vfs::VirtualFileSource::new(workspace),
+				)
+				.unwrap();
+			Self::from_graph(builder.build(root_id))
+		}
+
+		fn root_namespace(&self) -> NamespaceIndex {
+			self.defs.package_namespaces[self.graph.root_package.as_usize()]
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new(
+				"prescan",
+				&self.diagnostics,
+				&self.graph.files,
+			)
+		}
+
+		fn lookup_type(
+			&mut self,
+			namespace: NamespaceIndex,
+			name: &str,
+		) -> Option<BindingTarget> {
+			let symbol = self.graph.interner.get_or_intern(name);
+			self.defs.namespaces[usize::from(namespace)]
+				.bindings
+				.get(&BindingKey::ty(symbol))
+				.map(|binding| binding.target)
+		}
+
+		fn lookup_value(
+			&mut self,
+			namespace: NamespaceIndex,
+			name: &str,
+		) -> Option<BindingTarget> {
+			let symbol = self.graph.interner.get_or_intern(name);
+			self.defs.namespaces[usize::from(namespace)]
+				.bindings
+				.get(&BindingKey::value(symbol))
+				.map(|binding| binding.target)
+		}
+
+		/// Follows a bound name to the namespace it names — e.g. the
+		/// namespace a `mod inner { ... }` or `mod inner;` declares.
+		fn child_namespace(
+			&mut self,
+			namespace: NamespaceIndex,
+			name: &str,
+		) -> NamespaceIndex {
+			let target = self
+				.lookup_type(namespace, name)
+				.unwrap_or_else(|| panic!("`{name}` should be bound"));
+			let BindingTarget::Accessible(def_key) = target else {
+				panic!("`{name}` should be accessible here");
+			};
+			match self.defs.namespaces[usize::from(def_key.namespace_idx)].items
+				[usize::from(def_key.def_idx)]
+			.kind
+			{
+				DefKind::Namespace(namespace) => namespace,
+				other => panic!("`{name}` is not a module: {other:?}"),
 			}
 		}
 	}
 
-	fn binding_to_import_scope(
-		&mut self,
-		binding: &Binding,
-		span: TextSpan,
-	) -> Result<ImportScope, ()> {
-		if binding.visibility == Visibility::Private {
-			// self.report_private_import(span, binding);
-			return Err(());
-		}
-		let BindingTarget::Def(def_key) = binding.target else {
-			return Err(());
-		};
+	#[test]
+	fn function_and_struct_get_bindings() {
+		let mut case = TestCase::new(indoc! {"
+			pub fn add(a: i32, b: i32) -> i32 { a + b }
+			struct Point { x: i32, y: i32 }
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 
-		let def = &self.namespaces[usize::from(def_key.namespace_idx)].defs
-			[usize::from(def_key.def_idx)];
-		match def.kind {
-			DefKind::Namespace(namespace) => {
-				Ok(ImportScope::Namespace(namespace))
-			}
-			_ => {
-				// self.report_expected_import_scope(span, def.kind);
-				Err(())
-			}
-		}
+		let add_symbol = case.graph.interner.get_or_intern("add");
+		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let root_namespace = case.root_namespace();
+		let bindings =
+			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+
+		let add_binding = bindings
+			.get(&BindingKey::value(add_symbol))
+			.expect("`add` should be bound in the value namespace");
+		assert!(matches!(add_binding.target, BindingTarget::Accessible(_)));
+
+		let point_binding = bindings
+			.get(&BindingKey::ty(point_symbol))
+			.expect("`Point` should be bound in the type namespace");
+		assert!(matches!(point_binding.target, BindingTarget::Accessible(_)));
+	}
+
+	#[test]
+	fn module_declared_in_another_file_gets_a_namespace() {
+		let mut case = TestCase::new_multi_file(
+			vfs::AbsolutePath::new("/main.wx"),
+			HashMap::from([
+				(vfs::AbsolutePath::new("/main.wx"), "mod math;".to_string()),
+				(
+					vfs::AbsolutePath::new("/math.wx"),
+					"pub fn add() -> i32 { 1 }".to_string(),
+				),
+			]),
+		);
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let math = case.child_namespace(root, "math");
+		assert!(matches!(
+			case.lookup_value(math, "add"),
+			Some(BindingTarget::Accessible(_))
+		));
 	}
 }

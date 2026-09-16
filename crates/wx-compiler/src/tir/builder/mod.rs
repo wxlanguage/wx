@@ -4,7 +4,7 @@ use codespan_reporting::diagnostic::Severity;
 
 use crate::ast::Statement;
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::builder::prescan::DefinitionRegistry;
+use crate::tir::builder::defs::DefinitionRegistry;
 use crate::vfs::{Files, Package, PackageKind};
 use crate::{ast::MethodCallExpr, tir::*};
 
@@ -21,7 +21,7 @@ mod literal;
 // mod modules;
 // mod operators;
 // mod paths;
-mod prescan;
+mod defs;
 // mod signature;
 // mod traits;
 // mod type_compare;

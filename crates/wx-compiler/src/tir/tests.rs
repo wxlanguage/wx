@@ -13696,7 +13696,7 @@ fn test_invalid_self_type_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -13720,7 +13720,7 @@ fn test_invalid_self_type_rejected_in_trait_declaration() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -13743,7 +13743,7 @@ fn test_invalid_self_type_rejected_in_trait_impl() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -13766,7 +13766,7 @@ fn test_duplicate_param_name_in_method_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -13856,7 +13856,7 @@ fn test_duplicate_method_name_in_impl_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -13877,7 +13877,7 @@ fn test_duplicate_method_name_in_generic_impl_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);

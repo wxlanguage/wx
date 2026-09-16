@@ -8,4 +8,4 @@ mod index;
 pub mod testing;
 pub mod tir;
 pub mod vfs;
-pub mod wasm;
+// pub mod wasm;

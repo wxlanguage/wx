@@ -114,6 +114,22 @@ impl<'a> DiagnosticView<'a> {
 		self.assert_reported_inner(code.code(), Some(Severity::Error), "error");
 	}
 
+	/// Like [`Self::assert_error`], but also runs `check` against the first
+	/// matching diagnostic — for assertions `assert_error_saying`'s
+	/// message/notes-only substring search can't express, such as a
+	/// label's own text or span.
+	pub fn assert_error_with(
+		&self,
+		code: DiagnosticCode,
+		check: impl FnOnce(&Diagnostic<FileId>),
+	) {
+		check(self.assert_reported_inner(
+			code.code(),
+			Some(Severity::Error),
+			"error",
+		));
+	}
+
 	/// At least one *warning* carrying `code`.
 	///
 	/// Severity is genuinely checked here, unlike the `has_error_code` helper
@@ -190,21 +206,23 @@ impl<'a> DiagnosticView<'a> {
 		wanted: &str,
 		severity: Option<Severity>,
 		noun: &str,
-	) {
-		let found = self.items.iter().any(|d| {
-			d.code.as_deref() == Some(wanted)
-				&& severity.is_none_or(|expected| d.severity == expected)
-		});
-		if !found {
-			panic!(
-				"expected {} `{}` during {}, found {}:\n{}",
-				noun,
-				wanted,
-				self.stage,
-				self.describe_count(),
-				self.render(self.items.iter()),
-			);
-		}
+	) -> &'a Diagnostic<FileId> {
+		self.items
+			.iter()
+			.find(|d| {
+				d.code.as_deref() == Some(wanted)
+					&& severity.is_none_or(|expected| d.severity == expected)
+			})
+			.unwrap_or_else(|| {
+				panic!(
+					"expected {} `{}` during {}, found {}:\n{}",
+					noun,
+					wanted,
+					self.stage,
+					self.describe_count(),
+					self.render(self.items.iter()),
+				)
+			})
 	}
 
 	fn describe_count(&self) -> String {
