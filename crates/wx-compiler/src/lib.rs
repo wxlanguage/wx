@@ -2,6 +2,7 @@ pub mod ast;
 // pub mod codegen;
 pub mod diagnostics;
 mod index;
+mod small_vec;
 // pub mod mir;
 // pub mod opt;
 #[cfg(test)]

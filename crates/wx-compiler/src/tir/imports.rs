@@ -10,6 +10,7 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::StringInterner,
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	small_vec::SmallVec,
 	vfs::FileId,
 };
 
@@ -24,24 +25,6 @@ use super::defs::{
 enum ImportScope {
 	Namespace(NamespaceIndex),
 	// TODO: Enum, Variant etc..
-}
-
-#[derive(Clone, Copy)]
-struct ResolvedImport {
-	type_def: ImportSlot,
-	value_def: ImportSlot,
-}
-
-impl ResolvedImport {
-	/// Neither namespace resolved to anything — used when resolution is
-	/// abandoned early (a cycle, an unresolved path), not a "default"
-	/// value in the ordinary sense.
-	fn unresolved() -> Self {
-		Self {
-			type_def: ImportSlot::Absent,
-			value_def: ImportSlot::Absent,
-		}
-	}
 }
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
@@ -144,10 +127,10 @@ struct ImportResolver<'r> {
 	use_items: &'r [UseItemDef],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
-		&'r HashMap<(NamespaceIndex, SymbolU32), Vec<UseItemIndex>>,
+		&'r HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
 
 	path_state: &'r mut [ResolveStatus<ImportScope>],
-	item_state: &'r mut [ResolveStatus<ResolvedImport>],
+	item_state: &'r mut [ResolveStatus<()>],
 }
 
 /// Entry point for `DefinitionRegistryBuilder::resolve_use_paths` — the only
@@ -159,7 +142,10 @@ pub(super) fn resolve_use_paths(
 	namespaces: &mut [Namespace],
 	use_items: &[UseItemDef],
 	use_paths: &[UsePathSegment],
-	pending_named_imports: &HashMap<(NamespaceIndex, SymbolU32), Vec<UseItemIndex>>,
+	pending_named_imports: &HashMap<
+		(NamespaceIndex, SymbolU32),
+		SmallVec<UseItemIndex>,
+	>,
 ) {
 	let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 	let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -196,19 +182,28 @@ impl<'r> ImportResolver<'r> {
 		binding: Binding,
 		span: TextSpan,
 	) {
-		if let Err(collision_key) =
-			self.namespaces
-				.try_insert_binding(namespace_idx, key, binding)
+		if self
+			.namespaces
+			.try_insert_binding(namespace_idx, key, binding)
+			.is_err()
 		{
+			let collision_span = self.namespaces[usize::from(namespace_idx)]
+				.bindings
+				.get(&key)
+				.expect(
+					"a rejected insertion must leave the existing binding in place",
+				)
+				.declaration_span(self.namespaces, self.use_items);
 			self.diagnostics.push(
 				DuplicateDefinitionDiagnostic {
 					strings: self.strings,
 					key,
-					file_id: self.namespaces[usize::from(namespace_idx)]
-						.file_id,
 					definitions: (
-						collision_key.text_span(self.namespaces),
-						span,
+						collision_span,
+						SourceSpan::new(
+							self.namespaces[usize::from(namespace_idx)].file_id,
+							span,
+						),
 					),
 				}
 				.report(),
@@ -216,35 +211,46 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	fn ensure_use_item(&mut self, index: UseItemIndex) -> ResolvedImport {
+	fn ensure_use_item(&mut self, index: UseItemIndex) {
 		match self.item_state[usize::from(index)].poll() {
-			ResolveStep::Ready(Ok(result)) => return result,
-			ResolveStep::Ready(Err(())) => return ResolvedImport::unresolved(),
+			ResolveStep::Ready(_) => return,
 			ResolveStep::Cycle => {
 				let item = &self.use_items[usize::from(index)];
-				let UseItemKind::Name { name, .. } = item.kind else {
+				let UseItemKind::Name { name, alias, .. } = item.kind else {
 					unreachable!("globs aren't tracked in item_state");
 				};
-				let file_id =
-					self.namespaces[usize::from(item.namespace)].file_id;
-				let diagnostic = self
-					.report_use_cycle(SourceSpan::new(file_id, name.span));
+				let namespace = item.namespace;
+				let local_name = alias.unwrap_or(name);
+				let visibility = Visibility::from(item.pub_span);
+				let file_id = self.namespaces[usize::from(namespace)].file_id;
+				let diagnostic =
+					self.report_use_cycle(SourceSpan::new(file_id, name.span));
 				self.diagnostics.push(diagnostic);
-				return ResolvedImport::unresolved();
+				self.insert_binding(
+					namespace,
+					BindingKey::ty(local_name.inner),
+					Binding::import(BindingTarget::Error, visibility, index),
+					local_name.span,
+				);
+				self.insert_binding(
+					namespace,
+					BindingKey::value(local_name.inner),
+					Binding::import(BindingTarget::Error, visibility, index),
+					local_name.span,
+				);
+				return;
 			}
 			ResolveStep::Proceed => {}
 		}
 
-		let result = self.compute_use_item(index);
-		let _ = self.item_state[usize::from(index)].finish(Ok(result));
-		result
+		self.compute_use_item(index);
+		let _ = self.item_state[usize::from(index)].finish(Ok(()));
 	}
 
 	/// The actual named-import resolution logic — free to `return` early on
 	/// failure, since `ensure_use_item` above is the only thing that
-	/// touches `item_state`, and it always feeds this function's result to
-	/// `finish`.
-	fn compute_use_item(&mut self, index: UseItemIndex) -> ResolvedImport {
+	/// touches `item_state` and marks the item resolved after this returns.
+	fn compute_use_item(&mut self, index: UseItemIndex) {
 		let item = &self.use_items[usize::from(index)];
 		let namespace = item.namespace;
 		let UseItemKind::Name {
@@ -257,11 +263,12 @@ impl<'r> ImportResolver<'r> {
 		};
 
 		let scope = match prefix {
-			Some(prefix) => match self.ensure_use_path(namespace, prefix, index)
-			{
-				Ok(ImportScope::Namespace(ns)) => ns,
-				Err(()) => return ResolvedImport::unresolved(),
-			},
+			Some(prefix) => {
+				match self.ensure_use_path(namespace, prefix, index) {
+					Ok(ImportScope::Namespace(ns)) => ns,
+					Err(()) => return,
+				}
+			}
 			// Bare `use foo;` — look up `foo` directly in the writing
 			// namespace, same as the first segment of any `use` path.
 			None => namespace,
@@ -280,10 +287,34 @@ impl<'r> ImportResolver<'r> {
 		if let Some(candidates) =
 			self.pending_named_imports.get(&(scope, name.inner))
 		{
-			for candidate in candidates.iter().copied() {
-				if candidate != index {
-					self.ensure_use_item(candidate);
+			for candidate in candidates.iter() {
+				if candidate == index {
+					continue;
 				}
+
+				if matches!(
+					self.item_state[usize::from(candidate)],
+					ResolveStatus::Resolving
+				) {
+					// A concrete type or value already answers this lookup, so
+					// re-entering a candidate would create a spurious cycle.
+					let bindings =
+						&self.namespaces[usize::from(scope)].bindings;
+					let has_real_binding = bindings
+						.get(&BindingKey::ty(name.inner))
+						.is_some_and(|binding| {
+							!matches!(binding.target, BindingTarget::Error)
+						}) || bindings
+						.get(&BindingKey::value(name.inner))
+						.is_some_and(|binding| {
+							!matches!(binding.target, BindingTarget::Error)
+						});
+					if has_real_binding {
+						continue;
+					}
+				}
+
+				self.ensure_use_item(candidate);
 			}
 		}
 
@@ -329,16 +360,24 @@ impl<'r> ImportResolver<'r> {
 			self.insert_binding(
 				namespace,
 				BindingKey::ty(local_name.inner),
-				Binding::import(BindingTarget::Error, declared_visibility, index),
+				Binding::import(
+					BindingTarget::Error,
+					declared_visibility,
+					index,
+				),
 				local_name.span,
 			);
 			self.insert_binding(
 				namespace,
 				BindingKey::value(local_name.inner),
-				Binding::import(BindingTarget::Error, declared_visibility, index),
+				Binding::import(
+					BindingTarget::Error,
+					declared_visibility,
+					index,
+				),
 				local_name.span,
 			);
-			return ResolvedImport::unresolved();
+			return;
 		}
 
 		if let Some((target, source_visibility)) = type_def.resolved() {
@@ -384,11 +423,6 @@ impl<'r> ImportResolver<'r> {
 				),
 				local_name.span,
 			);
-		}
-
-		ResolvedImport {
-			type_def,
-			value_def,
 		}
 	}
 
@@ -566,7 +600,7 @@ impl<'r> ImportResolver<'r> {
 			.pending_named_imports
 			.get(&(declaring_namespace, segment.segment.inner))
 		{
-			for candidate in candidates.iter().copied() {
+			for candidate in candidates.iter() {
 				if candidate != current_item {
 					self.ensure_use_item(candidate);
 				}
@@ -611,8 +645,8 @@ impl<'r> ImportResolver<'r> {
 			// problem further down the path — the next segment, or the
 			// leaf, not existing — still gets its own diagnostic instead
 			// of being silently swallowed by this one.
-			let diagnostic = self
-				.report_private_import(segment.segment.inner, source_span);
+			let diagnostic =
+				self.report_private_import(segment.segment.inner, source_span);
 			self.diagnostics.push(diagnostic);
 		}
 		let BindingTarget::Accessible(def_key) = target else {
@@ -699,9 +733,10 @@ impl<'r> ImportResolver<'r> {
 		Diagnostic::error()
 			.with_code(DiagnosticCode::NotANamespace.code())
 			.with_message(format!("`{name}` is not a module"))
-			.with_label(span.primary_label().with_message(
-				"only a module can be used as a path prefix",
-			))
+			.with_label(
+				span.primary_label()
+					.with_message("only a module can be used as a path prefix"),
+			)
 	}
 
 	fn report_use_cycle(&self, span: SourceSpan) -> Diagnostic<FileId> {
@@ -709,8 +744,9 @@ impl<'r> ImportResolver<'r> {
 			.with_code(DiagnosticCode::CyclicImport.code())
 			.with_message("cyclic import")
 			.with_label(
-				span.primary_label()
-					.with_message("import resolution cycles back to itself here"),
+				span.primary_label().with_message(
+					"import resolution cycles back to itself here",
+				),
 			)
 	}
 
@@ -722,7 +758,9 @@ impl<'r> ImportResolver<'r> {
 		let name = self.strings.resolve(name).unwrap();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::PrivateReexport.code())
-			.with_message(format!("`{name}` is private, and cannot be re-exported"))
+			.with_message(format!(
+				"`{name}` is private, and cannot be re-exported"
+			))
 			.with_label(span.primary_label())
 			.with_note(format!(
 				"consider marking `{name}` as `pub` in the imported module"
@@ -903,10 +941,10 @@ mod tests {
 		// rather than deferred — deferring would risk the problem never
 		// being reported at all if nothing else ever consults this
 		// binding again.
-		case.diagnostics().assert_error_with(
-			DiagnosticCode::PrivateItem,
-			|diagnostic| assert_eq!(diagnostic.message, "`secret` is private"),
-		);
+		case.diagnostics()
+			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
+				assert_eq!(diagnostic.message, "`secret` is private")
+			});
 
 		let root = case.root_namespace();
 		match case.lookup_value(root, "secret") {
@@ -974,7 +1012,8 @@ mod tests {
 					diagnostic
 						.labels
 						.iter()
-						.any(|label| label.message == "no `add` in `math::inner`"),
+						.any(|label| label.message
+							== "no `add` in `math::inner`"),
 					"{:#?}",
 					diagnostic.labels
 				);
@@ -1047,10 +1086,10 @@ mod tests {
 			use outer::inner::helper;
 		"});
 
-		case.diagnostics().assert_error_with(
-			DiagnosticCode::PrivateItem,
-			|diagnostic| assert_eq!(diagnostic.message, "`inner` is private"),
-		);
+		case.diagnostics()
+			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
+				assert_eq!(diagnostic.message, "`inner` is private")
+			});
 	}
 
 	#[test]
@@ -1081,9 +1120,110 @@ mod tests {
 			}
 		"});
 
+		case.diagnostics()
+			.assert_error_with(DiagnosticCode::CyclicImport, |diagnostic| {
+				assert_eq!(diagnostic.message, "cyclic import")
+			});
+	}
+
+	/// A cycle is already the root cause. It should not also make one of its
+	/// participants look like an independently missing name while the resolver
+	/// unwinds the cycle.
+	#[test]
+	fn cyclic_reexports_do_not_cascade_into_unresolved_import() {
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use super::b::x;
+			}
+
+			mod b {
+				pub use super::a::x;
+			}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
+	}
+
+	#[test]
+	fn direct_definition_anchors_an_apparent_import_cycle() {
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn x() -> i32 { 1 }
+				pub use super::b::x;
+			}
+
+			mod b {
+				pub use super::a::x;
+			}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+	}
+
+	#[test]
+	fn pending_import_still_fills_the_other_symbol_namespace() {
+		let mut case = TestCase::new(indoc! {"
+			use a::X;
+
+			mod a {
+				pub fn X() -> i32 { 1 }
+				pub use super::source::X;
+			}
+
+			mod source {
+				pub type X = u32;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		assert!(matches!(
+			case.lookup_type(root, "X"),
+			Some(BindingTarget::Accessible(_))
+		));
+		assert!(matches!(
+			case.lookup_value(root, "X"),
+			Some(BindingTarget::Accessible(_))
+		));
+	}
+
+	/// Both definitions competing here are the local `use` declarations. The
+	/// original function in `a` is merely the first import's target and should
+	/// not be presented as the previous definition of the local binding.
+	#[test]
+	fn duplicate_named_import_labels_the_first_use() {
+		let source = indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				pub fn pick() -> i32 { 2 }
+			}
+
+			use a::pick;
+			use b::pick;
+		"};
+		let case = TestCase::new(source);
+		let expected_start =
+			source.find("use a::pick").unwrap() + "use a::".len();
+
 		case.diagnostics().assert_error_with(
-			DiagnosticCode::CyclicImport,
-			|diagnostic| assert_eq!(diagnostic.message, "cyclic import"),
+			DiagnosticCode::DuplicateDefinition,
+			|diagnostic| {
+				let secondary = diagnostic
+					.labels
+					.iter()
+					.find(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Secondary
+					})
+					.expect(
+						"duplicate definition should identify the first binding",
+					);
+				assert_eq!(secondary.range, expected_start..expected_start + 4);
+			},
 		);
 	}
 
@@ -1133,7 +1273,10 @@ mod tests {
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::UnresolvedImport,
 			|diagnostic| {
-				assert_eq!(diagnostic.message, "unresolved import `super::a::x`");
+				assert_eq!(
+					diagnostic.message,
+					"unresolved import `super::a::x`"
+				);
 			},
 		);
 	}
@@ -1150,10 +1293,13 @@ mod tests {
 			use x::x;
 		"});
 
-		case.diagnostics().assert_codes(&[DiagnosticCode::UnresolvedImport]);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::UnresolvedImport,
-			|diagnostic| assert_eq!(diagnostic.message, "unresolved import `x`"),
+			|diagnostic| {
+				assert_eq!(diagnostic.message, "unresolved import `x`")
+			},
 		);
 	}
 

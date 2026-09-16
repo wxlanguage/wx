@@ -13,6 +13,7 @@ use crate::{
 	ast::{self, DefId, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	index::index_newtype,
+	small_vec::SmallVec,
 	tir::literals::unescape_string_literal,
 	vfs::{FileId, Files, Package, PackageId},
 };
@@ -42,7 +43,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	use_paths: Vec<UsePathSegment>,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
-		HashMap<(NamespaceIndex, SymbolU32), Vec<UseItemIndex>>,
+		HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -654,6 +655,39 @@ impl Binding {
 			source: BindingSource::Import(index),
 		}
 	}
+
+	/// Where this binding itself was declared. For an import this is the local
+	/// name at the `use` site, not the definition its target eventually names.
+	pub(super) fn declaration_span(
+		&self,
+		namespaces: &[Namespace],
+		use_items: &[UseItemDef],
+	) -> SourceSpan {
+		match self.source {
+			BindingSource::Definition => {
+				let def_key = match self.target {
+					BindingTarget::Accessible(key)
+					| BindingTarget::Inaccessible(key) => key,
+					BindingTarget::Error => {
+						unreachable!(
+							"a definition binding cannot target recovery state"
+						)
+					}
+				};
+				def_key.source_span(namespaces)
+			}
+			BindingSource::Import(index) => {
+				let item = &use_items[usize::from(index)];
+				let UseItemKind::Name { name, alias, .. } = item.kind else {
+					unreachable!("a glob import never installs a named binding")
+				};
+				SourceSpan::new(
+					namespaces[usize::from(item.namespace)].file_id,
+					alias.unwrap_or(name).span,
+				)
+			}
+		}
+	}
 }
 
 /// Declaration-site metadata for a locally-defined module (`mod foo;` / `mod foo { }`).
@@ -743,13 +777,6 @@ impl DefKey {
 	}
 
 	#[inline]
-	pub fn text_span(self, namespaces: &[Namespace]) -> TextSpan {
-		namespaces[usize::from(self.namespace_idx)].items
-			[usize::from(self.def_idx)]
-		.span
-	}
-
-	#[inline]
 	pub fn symbol_kind(self, defs: &DefinitionRegistry) -> DefKind {
 		let namespace = &defs.namespaces[usize::from(self.namespace_idx)];
 		namespace.items[usize::from(self.def_idx)].kind
@@ -805,8 +832,7 @@ impl<T: Copy> Declared<T> {
 pub(super) struct DuplicateDefinitionDiagnostic<'strings> {
 	pub(super) strings: &'strings ast::StringInterner,
 	pub(super) key: BindingKey,
-	pub(super) file_id: FileId,
-	pub(super) definitions: (TextSpan, TextSpan),
+	pub(super) definitions: (SourceSpan, SourceSpan),
 }
 
 impl DuplicateDefinitionDiagnostic<'_> {
@@ -814,7 +840,15 @@ impl DuplicateDefinitionDiagnostic<'_> {
 		let name = self.strings.resolve(self.key.symbol).unwrap();
 
 		let (a, b) = self.definitions;
-		let (first, second) = if a.start <= b.start { (a, b) } else { (b, a) };
+		// Most declarations in one namespace share a file, but file modules and
+		// imported bindings can make a collision span files. Preserve insertion
+		// order across files; within one file, keep diagnostics source-ordered.
+		let (first, second) =
+			if a.file_id == b.file_id && a.span.start > b.span.start {
+				(b, a)
+			} else {
+				(a, b)
+			};
 
 		Diagnostic::error()
 			.with_code(DiagnosticCode::DuplicateDefinition.code())
@@ -822,15 +856,14 @@ impl DuplicateDefinitionDiagnostic<'_> {
 				"the name `{name}` is defined multiple times"
 			))
 			.with_label(
-				Label::primary(self.file_id, second)
+				second
+					.primary_label()
 					.with_message(format!("`{name}` redefined here")),
 			)
-			.with_label(Label::secondary(self.file_id, first).with_message(
-				format!(
-					"previous definition of the {} `{name}` here",
-					self.key.namespace.noun(),
-				),
-			))
+			.with_label(first.secondary_label().with_message(format!(
+				"previous definition of the {} `{name}` here",
+				self.key.namespace.noun(),
+			)))
 	}
 }
 
@@ -1030,10 +1063,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								DuplicateDefinitionDiagnostic {
 									strings: self.strings,
 									key: BindingKey::ty(declaration.name.inner),
-									file_id: parent_module.file_id,
 									definitions: (
-										collision.text_span(&self.namespaces),
-										declaration.name.span,
+										collision.source_span(&self.namespaces),
+										SourceSpan::new(
+											parent_module.file_id,
+											declaration.name.span,
+										),
 									),
 								}
 								.report(),
@@ -1122,11 +1157,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				DuplicateDefinitionDiagnostic {
 					strings: self.strings,
 					key,
-					file_id: self.namespaces[usize::from(namespace_idx)]
-						.file_id,
 					definitions: (
-						collision_key.text_span(&self.namespaces),
-						span,
+						collision_key.source_span(&self.namespaces),
+						SourceSpan::new(
+							self.namespaces[usize::from(namespace_idx)].file_id,
+							span,
+						),
 					),
 				}
 				.report(),
@@ -1449,10 +1485,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
 								key: BindingKey::ty(name.inner),
-								file_id,
 								definitions: (
-									collision_key.text_span(&self.namespaces),
-									name.span,
+									collision_key.source_span(&self.namespaces),
+									SourceSpan::new(file_id, name.span),
 								),
 							}
 							.report(),
@@ -1564,10 +1599,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
 								key,
-								file_id,
 								definitions: (
-									members[usize::from(collision)].span,
-									member.span,
+									SourceSpan::new(
+										file_id,
+										members[usize::from(collision)].span,
+									),
+									SourceSpan::new(file_id, member.span),
 								),
 							}
 							.report(),
@@ -1677,10 +1714,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
 								key,
-								file_id,
 								definitions: (
-									members[usize::from(collision)].span,
-									member.span,
+									SourceSpan::new(
+										file_id,
+										members[usize::from(collision)].span,
+									),
+									SourceSpan::new(file_id, member.span),
 								),
 							}
 							.report(),
@@ -1748,10 +1787,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
 								key: BindingKey::ty(internal_name.inner),
-								file_id,
 								definitions: (
-									collision.text_span(&self.namespaces),
-									internal_name.span,
+									collision.source_span(&self.namespaces),
+									SourceSpan::new(
+										file_id,
+										internal_name.span,
+									),
 								),
 							}
 							.report(),
@@ -1962,10 +2003,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
 								key,
-								file_id,
 								definitions: (
-									members[usize::from(collision)].span,
-									member.span,
+									SourceSpan::new(
+										file_id,
+										members[usize::from(collision)].span,
+									),
+									SourceSpan::new(file_id, member.span),
 								),
 							}
 							.report(),
@@ -2050,8 +2093,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 				self.pending_named_imports
 					.entry((namespace, local_name))
-					.or_default()
-					.push(item_index);
+					.and_modify(|items| items.push(item_index))
+					.or_insert_with(|| SmallVec::new(item_index));
 			}
 			ast::UseTree::Glob { segment } => {
 				let path = self.push_use_path(UsePathSegment {
