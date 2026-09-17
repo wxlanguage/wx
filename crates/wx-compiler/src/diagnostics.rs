@@ -216,6 +216,7 @@ define_diagnostic_codes! {
 		UnresolvedImport => "E2093",
 		CyclicImport => "E2094",
 		PrivateReexport => "E2095",
+		AmbiguousReexport => "E2096",
 	}
 }
 

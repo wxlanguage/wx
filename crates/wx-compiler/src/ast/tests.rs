@@ -571,6 +571,20 @@ fn test_pub_not_applicable_to_memory_item_recovers() {
 }
 
 #[test]
+fn test_bare_glob_with_no_path_reports_unexpected_token() {
+	// `*` needs at least one namespace segment before it — `parse_use_tree`
+	// always parses an identifier first, so a lone `*` right after `use`
+	// (or `pub use`) is a plain parse error, not a valid "glob the current
+	// scope" form.
+	let case = TestCase::new(indoc! {"
+        use *;
+    "});
+
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+}
+
+#[test]
 fn test_pub_use_reexports_without_diagnostic() {
 	let case = TestCase::new(indoc! {"
         pub use foo::*;

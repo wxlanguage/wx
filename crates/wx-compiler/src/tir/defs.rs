@@ -44,6 +44,11 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
 		HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
+	/// Every `pub use path::*;` item, grouped by the namespace it's
+	/// *declared* in — no name dimension, unlike `pending_named_imports`,
+	/// since a glob doesn't claim one. Lets glob resolution find "what does
+	/// this namespace re-export" without scanning every `use_items` entry.
+	pending_pub_glob_reexports: HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -65,6 +70,12 @@ pub enum UseItemKind {
 	},
 	Glob {
 		path: UsePathIndex,
+		/// The `x::*` span — the path through the star, never the `use`
+		/// keyword — for diagnostics that need to blame this glob
+		/// specifically. For a glob nested in a group (`use a::{b::*, c}`)
+		/// this covers only `b::*`, since a span reaching back to `a`
+		/// wouldn't be a contiguous range of source.
+		span: TextSpan,
 	},
 }
 
@@ -394,9 +405,6 @@ impl DefKind {
 pub(super) struct ItemDef {
 	pub(super) kind: DefKind,
 	span: TextSpan,
-	/// Every source location that referenced this def — go-to-definition
-	/// and find-references read from here. Populated after construction
-	/// via `record_access`, not at `NamespaceDef::new` time.
 	accesses: Vec<SourceSpan>,
 }
 
@@ -488,6 +496,66 @@ pub(super) trait NamespaceLookup {
 		key: BindingKey,
 		span: SourceSpan,
 	);
+
+	/// `namespace`'s own binding for `key` — a direct declaration or a
+	/// resolved named `use`. No glob involved, so no ambiguity is
+	/// possible: a `HashMap` has at most one entry per key.
+	fn direct_lookup(
+		&self,
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> Option<BindingCandidate>;
+
+	/// What `namespace` exposes *only* through its own `pub use path::*;`
+	/// edges — never a private one, which stays local to that namespace's
+	/// own body lookups (a separate, richer walk that isn't this: own
+	/// bindings, then *every* glob regardless of visibility, then the
+	/// parent, then the prelude). Recurses via `lookup` at each hop, not
+	/// into itself, so a re-export chain composes through direct
+	/// declarations and further re-exports alike. Terminates because
+	/// `compute_glob_item` already rejects a cycle in this exact edge set
+	/// before it can be walked.
+	fn indirect_lookup(
+		&self,
+		use_items: &[UseItemDef],
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> BindingLookup;
+
+	/// What `namespace` exposes to an outside consumer, full stop —
+	/// `direct_lookup`, falling back to `indirect_lookup`. What a named
+	/// `use a::b;` and a glob `use a::*;` should both find when asking `a`
+	/// for the same name.
+	fn lookup(
+		&self,
+		use_items: &[UseItemDef],
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> BindingLookup;
+}
+
+/// One thing a name could resolve to: what it targets, and how visible it
+/// was declared where it was actually found. The two travel together
+/// everywhere a lookup result is consumed — an accessibility check and
+/// re-export capping both need both at once.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct BindingCandidate {
+	pub(super) target: BindingTarget,
+	pub(super) visibility: Visibility,
+}
+
+/// The result of [`NamespaceLookup::lookup`]/[`NamespaceLookup::indirect_lookup`].
+/// `Ambiguous` carries every surviving candidate paired with the `pub use`
+/// edge responsible for it — the diagnostic needs to name each one, same as
+/// two colliding ordinary globs already do. The same target reached through
+/// two different edges is deduplicated before it ever becomes a candidate,
+/// not after.
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum BindingLookup {
+	NotFound,
+	Found(BindingCandidate),
+	Ambiguous(Box<[(BindingCandidate, SourceSpan)]>),
 }
 
 impl NamespaceLookup for [Namespace] {
@@ -601,9 +669,90 @@ impl NamespaceLookup for [Namespace] {
 			binding.accesses.push(span);
 		}
 	}
+
+	fn direct_lookup(
+		&self,
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> Option<BindingCandidate> {
+		self[usize::from(namespace)].bindings.get(&key).map(
+			|binding| BindingCandidate {
+				target: binding.target,
+				visibility: binding.visibility,
+			},
+		)
+	}
+
+	fn indirect_lookup(
+		&self,
+		use_items: &[UseItemDef],
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> BindingLookup {
+		let mut candidates: Vec<(BindingCandidate, SourceSpan)> = Vec::new();
+		for glob in self[usize::from(namespace)].glob_imports.iter() {
+			let item = &use_items[usize::from(glob.use_item)];
+			if item.pub_span.is_none() {
+				continue;
+			}
+			let UseItemKind::Glob { span, .. } = item.kind else {
+				unreachable!("a glob edge is always produced by a glob item")
+			};
+			let edge_span =
+				SourceSpan::new(self[usize::from(namespace)].file_id, span);
+
+			match self.lookup(use_items, glob.namespace, key) {
+				BindingLookup::NotFound => {}
+				BindingLookup::Found(candidate) => {
+					push_candidate(&mut candidates, candidate, edge_span);
+				}
+				BindingLookup::Ambiguous(nested) => {
+					for (candidate, span) in nested.iter().copied() {
+						push_candidate(&mut candidates, candidate, span);
+					}
+				}
+			}
+		}
+
+		match candidates.len() {
+			0 => BindingLookup::NotFound,
+			1 => BindingLookup::Found(candidates[0].0),
+			_ => BindingLookup::Ambiguous(candidates.into_boxed_slice()),
+		}
+	}
+
+	fn lookup(
+		&self,
+		use_items: &[UseItemDef],
+		namespace: NamespaceIndex,
+		key: BindingKey,
+	) -> BindingLookup {
+		match self.direct_lookup(namespace, key) {
+			Some(candidate) => BindingLookup::Found(candidate),
+			None => self.indirect_lookup(use_items, namespace, key),
+		}
+	}
 }
 
-#[derive(Clone, Copy)]
+/// Adds `candidate` to an in-progress ambiguity scan, unless the same
+/// target is already there — the same target reached through two `pub`
+/// edges (e.g. a diamond re-export) isn't a conflict, so it must be
+/// deduplicated before it ever becomes a candidate rather than after.
+fn push_candidate(
+	candidates: &mut Vec<(BindingCandidate, SourceSpan)>,
+	candidate: BindingCandidate,
+	span: SourceSpan,
+) {
+	if candidates
+		.iter()
+		.any(|(existing, _)| existing.target == candidate.target)
+	{
+		return;
+	}
+	candidates.push((candidate, span));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) enum BindingTarget {
@@ -678,12 +827,15 @@ impl Binding {
 			}
 			BindingSource::Import(index) => {
 				let item = &use_items[usize::from(index)];
-				let UseItemKind::Name { name, alias, .. } = item.kind else {
-					unreachable!("a glob import never installs a named binding")
+				let span = match item.kind {
+					UseItemKind::Name { name, alias, .. } => {
+						alias.unwrap_or(name).span
+					}
+					UseItemKind::Glob { span, .. } => span,
 				};
 				SourceSpan::new(
 					namespaces[usize::from(item.namespace)].file_id,
-					alias.unwrap_or(name).span,
+					span,
 				)
 			}
 		}
@@ -702,20 +854,23 @@ pub struct ModuleDeclaration {
 	pub pub_span: Option<TextSpan>,
 }
 
-/// One `use path::*;` edge — the namespace it opens, plus where it was
-/// written.
+/// One `use path::*;` edge — the namespace it resolved to, plus which item
+/// produced it.
 ///
-/// The span is what makes a wildcard ambiguity reportable: when two globs
-/// supply the same name, the thing to point at is the `use` statements, not
-/// the definitions (which are each perfectly fine on their own). Covers the
-/// path and the star, `x::*`, not the `use` keyword — and for a glob nested
-/// in a group (`use a::{b::*, c}`) only `b::*`, since a span reaching back
-/// to `a` wouldn't be a contiguous range of source.
+/// `use_item` is a back-reference, not a copy: `pub_span`, the declaring
+/// namespace, and (via `UseItemKind::Glob`) the `x::*` span all already live
+/// on the `UseItemDef` — duplicating them here would just be two copies of
+/// the same fact able to drift, the same reason `Binding::source` points at
+/// a `UseItemIndex` instead of cloning what it needs out of it. `namespace`
+/// is the one genuinely new fact this pass computes: the item only ever
+/// stores its *unresolved* `path`, and resolving it to a namespace is this
+/// whole pass's job.
+#[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct GlobImport {
+	pub use_item: UseItemIndex,
 	pub namespace: NamespaceIndex,
-	pub span: SourceSpan,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -971,6 +1126,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			pending_named_imports: HashMap::new(),
+			pending_pub_glob_reexports: HashMap::new(),
 		};
 
 		let file_namespaces = builder.compute_file_namespaces(packages);
@@ -1890,7 +2046,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 			}
 			ast::Item::Use { tree, pub_span } => {
-				self.scan_use_tree(namespace, &tree.inner, None, *pub_span);
+				self.scan_use_tree(namespace, tree, None, *pub_span);
 			}
 			ast::Item::Export { id, .. } => {
 				self.ast_nodes.push(AstEntry {
@@ -2075,11 +2231,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	fn scan_use_tree(
 		&mut self,
 		namespace: NamespaceIndex,
-		tree: &ast::UseTree,
+		tree: &ast::Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
 		pub_span: Option<TextSpan>,
 	) {
-		match tree {
+		match &tree.inner {
 			ast::UseTree::Name { segment, alias } => {
 				let local_name = (*alias).unwrap_or(*segment).inner;
 				let item_index = self.push_use_item(UseItemDef {
@@ -2101,23 +2257,27 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					segment: *segment,
 					parent: parent_segment,
 				});
-				self.push_use_item(UseItemDef {
-					kind: UseItemKind::Glob { path },
+				let item_index = self.push_use_item(UseItemDef {
+					kind: UseItemKind::Glob {
+						path,
+						span: tree.span,
+					},
 					namespace,
 					pub_span,
 				});
+				if pub_span.is_some() {
+					self.pending_pub_glob_reexports
+						.entry(namespace)
+						.and_modify(|items| items.push(item_index))
+						.or_insert_with(|| SmallVec::new(item_index));
+				}
 			}
 			ast::UseTree::Path { segment, rest } => {
 				let path = self.push_use_path(UsePathSegment {
 					segment: *segment,
 					parent: parent_segment,
 				});
-				self.scan_use_tree(
-					namespace,
-					&rest.inner,
-					Some(path),
-					pub_span,
-				);
+				self.scan_use_tree(namespace, rest, Some(path), pub_span);
 			}
 			ast::UseTree::Group { segment, branches } => {
 				let path = self.push_use_path(UsePathSegment {
@@ -2127,7 +2287,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for branch in branches.inner.iter() {
 					self.scan_use_tree(
 						namespace,
-						&branch.inner.inner,
+						&branch.inner,
 						Some(path),
 						pub_span,
 					);
@@ -2146,6 +2306,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			&self.use_items,
 			&self.use_paths,
 			&self.pending_named_imports,
+			&self.pending_pub_glob_reexports,
 		);
 	}
 }
@@ -2223,11 +2384,7 @@ mod tests {
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new(
-				"prescan",
-				&self.diagnostics,
-				&self.graph.files,
-			)
+			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
 		}
 
 		fn lookup_type(
