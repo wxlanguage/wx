@@ -499,12 +499,14 @@ pub(super) trait NamespaceLookup {
 
 	/// `namespace`'s own binding for `key` — a direct declaration or a
 	/// resolved named `use`. No glob involved, so no ambiguity is
-	/// possible: a `HashMap` has at most one entry per key.
+	/// possible: a `HashMap` has at most one entry per key. Accessor-blind
+	/// by design — filtering happens one level up, once multiple
+	/// candidates are actually competing.
 	fn direct_lookup(
 		&self,
 		namespace: NamespaceIndex,
 		key: BindingKey,
-	) -> Option<BindingCandidate>;
+	) -> Option<(BindingTarget, Visibility)>;
 
 	/// What `namespace` exposes *only* through its own `pub use path::*;`
 	/// edges — never a private one, which stays local to that namespace's
@@ -515,11 +517,19 @@ pub(super) trait NamespaceLookup {
 	/// declarations and further re-exports alike. Terminates because
 	/// `compute_glob_item` already rejects a cycle in this exact edge set
 	/// before it can be walked.
+	///
+	/// `accessor` only matters once two *distinct* candidates compete: a
+	/// candidate `accessor` could never legally choose is excluded right
+	/// then, rather than surviving into a misleading `Ambiguous`. A lone
+	/// candidate is always returned `Found`, visibility included,
+	/// regardless of whether `accessor` can see it — deferred to the
+	/// caller, same as a direct (non-glob) hit already is.
 	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
 		namespace: NamespaceIndex,
 		key: BindingKey,
+		accessor: NamespaceIndex,
 	) -> BindingLookup;
 
 	/// What `namespace` exposes to an outside consumer, full stop —
@@ -531,31 +541,190 @@ pub(super) trait NamespaceLookup {
 		use_items: &[UseItemDef],
 		namespace: NamespaceIndex,
 		key: BindingKey,
+		accessor: NamespaceIndex,
 	) -> BindingLookup;
 }
 
-/// One thing a name could resolve to: what it targets, and how visible it
-/// was declared where it was actually found. The two travel together
-/// everywhere a lookup result is consumed — an accessibility check and
-/// re-export capping both need both at once.
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) struct BindingCandidate {
-	pub(super) target: BindingTarget,
-	pub(super) visibility: Visibility,
-}
-
 /// The result of [`NamespaceLookup::lookup`]/[`NamespaceLookup::indirect_lookup`].
+/// `Found` pairs a target with its visibility — an accessibility check and
+/// re-export capping both need both at once, and this holds regardless of
+/// whether `accessor` can actually see it; that's left for the caller to
+/// decide, same as a direct (non-glob) hit always has been.
+///
 /// `Ambiguous` carries every surviving candidate paired with the `pub use`
 /// edge responsible for it — the diagnostic needs to name each one, same as
-/// two colliding ordinary globs already do. The same target reached through
-/// two different edges is deduplicated before it ever becomes a candidate,
-/// not after.
+/// two colliding ordinary globs already do. The same `DefKey` reached through
+/// two different edges is merged into one candidate before it ever becomes
+/// an entry here, not after — see `indirect_lookup`. No visibility here: by
+/// construction, every entry that survives into this variant was already
+/// confirmed accessible to whichever `accessor` `indirect_lookup` was asked
+/// on behalf of, so there's nothing left for it to say.
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum BindingLookup {
 	NotFound,
-	Found(BindingCandidate),
-	Ambiguous(Box<[(BindingCandidate, SourceSpan)]>),
+	Found(BindingTarget, Visibility),
+	Ambiguous(Box<[(BindingTarget, SourceSpan)]>),
+}
+
+/// `indirect_lookup`'s in-progress merge of the glob candidates it's walked
+/// so far, for one `accessor`. Owns the whole merge policy so the walk
+/// itself just has to `push` and, at the end, `finish`.
+///
+/// Two different kinds of "accessible" are in play here, at two different
+/// times. `BindingTarget::Accessible`/`Inaccessible` records whether *the
+/// edge that installed a binding* could see its def — baked in once. The
+/// same `DefKey` reached through two `pub` edges (e.g. a diamond re-export)
+/// isn't a conflict, and when the two edges disagree, `Accessible` wins
+/// silently, same as `try_insert_binding` resolves the same disagreement
+/// for a direct same-namespace collision.
+///
+/// Separately, `is_accessible_from(accessor, ..)` asks whether *this
+/// query's* accessor can see a given def at all, checked fresh. A lone real
+/// candidate is always kept as `One`, visibility included, regardless of
+/// that check — deferred to the caller, same as a direct hit. It's only
+/// consulted the moment a second, distinct `DefKey` would otherwise promote
+/// this into a real ambiguity: a candidate `accessor` could never legally
+/// choose is excluded right then, rather than surviving into a misleading
+/// `Ambiguous`.
+struct CandidateMerge<'a> {
+	namespaces: &'a [Namespace],
+	accessor: NamespaceIndex,
+	candidates: Candidates,
+}
+
+enum Candidates {
+	Empty,
+	// An already-diagnosed broken edge. Never competes with a real
+	// candidate for ambiguity — kept only as a fallback, and only the
+	// first one seen, so a later re-export sees `Errored` instead of
+	// re-diagnosing `Absent`, mirroring how a broken named `use` installs
+	// its own `Error` placeholder. The moment a real candidate arrives,
+	// this becomes moot for good: `finish` never looks at it again once
+	// `One`/`Many` is reached, so there's nothing to keep it for.
+	Error(Visibility),
+	// `finish` itself never reads this span — `Found` doesn't carry one.
+	// It's kept for `push`: if a second, distinct `DefKey` arrives later
+	// and this candidate turns out to still be a real competitor, its
+	// span is what seeds the new `Many` entry.
+	One(BindingTarget, Visibility, SourceSpan),
+	Many(Vec<(BindingTarget, SourceSpan)>),
+}
+
+impl<'a> CandidateMerge<'a> {
+	fn new(namespaces: &'a [Namespace], accessor: NamespaceIndex) -> Self {
+		Self {
+			namespaces,
+			accessor,
+			candidates: Candidates::Empty,
+		}
+	}
+
+	fn push(
+		&mut self,
+		target: BindingTarget,
+		visibility: Visibility,
+		span: SourceSpan,
+	) {
+		let Some(def_key) = target.def_key() else {
+			if matches!(self.candidates, Candidates::Empty) {
+				self.candidates = Candidates::Error(visibility);
+			}
+			return;
+		};
+
+		match &mut self.candidates {
+			Candidates::Empty | Candidates::Error(..) => {
+				self.candidates = Candidates::One(target, visibility, span);
+			}
+			Candidates::One(first_target, first_visibility, first_span) => {
+				let first_key = first_target
+					.def_key()
+					.expect("a real candidate always carries a DefKey");
+
+				if first_key == def_key {
+					if matches!(target, BindingTarget::Accessible(_))
+						&& matches!(
+							*first_target,
+							BindingTarget::Inaccessible(_)
+						) {
+						*first_target = target;
+						*first_visibility = visibility;
+						*first_span = span;
+					}
+					return;
+				}
+
+				let first_reachable = self.namespaces.is_accessible_from(
+					self.accessor,
+					first_key.namespace_idx,
+					*first_visibility,
+				);
+				let this_reachable = self.namespaces.is_accessible_from(
+					self.accessor,
+					def_key.namespace_idx,
+					visibility,
+				);
+
+				match (first_reachable, this_reachable) {
+					(true, true) => {
+						self.candidates = Candidates::Many(vec![
+							(*first_target, *first_span),
+							(target, span),
+						]);
+					}
+					// Only one side is a real option for `accessor` — that
+					// one just replaces `first` outright (or stays, if it
+					// already was `first`); neither case is an ambiguity.
+					(true, false) => {}
+					(false, true) => {
+						self.candidates =
+							Candidates::One(target, visibility, span);
+					}
+					(false, false) => {}
+				}
+			}
+			Candidates::Many(items) => {
+				if !self.namespaces.is_accessible_from(
+					self.accessor,
+					def_key.namespace_idx,
+					visibility,
+				) {
+					return;
+				}
+				let slot = items
+					.iter_mut()
+					.find(|(t, _)| t.def_key() == Some(def_key));
+				match slot {
+					Some(slot)
+						if matches!(target, BindingTarget::Accessible(_))
+							&& matches!(
+								slot.0,
+								BindingTarget::Inaccessible(_)
+							) =>
+					{
+						*slot = (target, span);
+					}
+					Some(_) => {}
+					None => items.push((target, span)),
+				}
+			}
+		}
+	}
+
+	fn finish(self) -> BindingLookup {
+		match self.candidates {
+			Candidates::Empty => BindingLookup::NotFound,
+			Candidates::Error(visibility) => {
+				BindingLookup::Found(BindingTarget::Error, visibility)
+			}
+			Candidates::One(target, visibility, _) => {
+				BindingLookup::Found(target, visibility)
+			}
+			Candidates::Many(items) => {
+				BindingLookup::Ambiguous(items.into_boxed_slice())
+			}
+		}
+	}
 }
 
 impl NamespaceLookup for [Namespace] {
@@ -674,13 +843,11 @@ impl NamespaceLookup for [Namespace] {
 		&self,
 		namespace: NamespaceIndex,
 		key: BindingKey,
-	) -> Option<BindingCandidate> {
-		self[usize::from(namespace)].bindings.get(&key).map(
-			|binding| BindingCandidate {
-				target: binding.target,
-				visibility: binding.visibility,
-			},
-		)
+	) -> Option<(BindingTarget, Visibility)> {
+		self[usize::from(namespace)]
+			.bindings
+			.get(&key)
+			.map(|binding| (binding.target, binding.visibility))
 	}
 
 	fn indirect_lookup(
@@ -688,9 +855,11 @@ impl NamespaceLookup for [Namespace] {
 		use_items: &[UseItemDef],
 		namespace: NamespaceIndex,
 		key: BindingKey,
+		accessor: NamespaceIndex,
 	) -> BindingLookup {
-		let mut candidates: Vec<(BindingCandidate, SourceSpan)> = Vec::new();
-		for glob in self[usize::from(namespace)].glob_imports.iter() {
+		let mut candidates = CandidateMerge::new(self, accessor);
+
+		for glob in self[usize::from(namespace)].glob_imports.iter().copied() {
 			let item = &use_items[usize::from(glob.use_item)];
 			if item.pub_span.is_none() {
 				continue;
@@ -701,24 +870,26 @@ impl NamespaceLookup for [Namespace] {
 			let edge_span =
 				SourceSpan::new(self[usize::from(namespace)].file_id, span);
 
-			match self.lookup(use_items, glob.namespace, key) {
+			match self.lookup(use_items, glob.namespace, key, accessor) {
 				BindingLookup::NotFound => {}
-				BindingLookup::Found(candidate) => {
-					push_candidate(&mut candidates, candidate, edge_span);
+				BindingLookup::Found(target, visibility) => {
+					candidates.push(target, visibility, edge_span);
 				}
 				BindingLookup::Ambiguous(nested) => {
-					for (candidate, span) in nested.iter().copied() {
-						push_candidate(&mut candidates, candidate, span);
+					// Every nested entry was already confirmed accessible
+					// to this same `accessor` one recursion level down
+					// (that's what let it survive into `Ambiguous` at
+					// all) — `Public` is just a stand-in that reproduces
+					// that same "yes" when re-checked just below, not a
+					// claim about its real declared visibility.
+					for (target, span) in nested.iter().copied() {
+						candidates.push(target, Visibility::Public, span);
 					}
 				}
 			}
 		}
 
-		match candidates.len() {
-			0 => BindingLookup::NotFound,
-			1 => BindingLookup::Found(candidates[0].0),
-			_ => BindingLookup::Ambiguous(candidates.into_boxed_slice()),
-		}
+		candidates.finish()
 	}
 
 	fn lookup(
@@ -726,30 +897,15 @@ impl NamespaceLookup for [Namespace] {
 		use_items: &[UseItemDef],
 		namespace: NamespaceIndex,
 		key: BindingKey,
+		accessor: NamespaceIndex,
 	) -> BindingLookup {
 		match self.direct_lookup(namespace, key) {
-			Some(candidate) => BindingLookup::Found(candidate),
-			None => self.indirect_lookup(use_items, namespace, key),
+			Some((target, visibility)) => {
+				BindingLookup::Found(target, visibility)
+			}
+			None => self.indirect_lookup(use_items, namespace, key, accessor),
 		}
 	}
-}
-
-/// Adds `candidate` to an in-progress ambiguity scan, unless the same
-/// target is already there — the same target reached through two `pub`
-/// edges (e.g. a diamond re-export) isn't a conflict, so it must be
-/// deduplicated before it ever becomes a candidate rather than after.
-fn push_candidate(
-	candidates: &mut Vec<(BindingCandidate, SourceSpan)>,
-	candidate: BindingCandidate,
-	span: SourceSpan,
-) {
-	if candidates
-		.iter()
-		.any(|(existing, _)| existing.target == candidate.target)
-	{
-		return;
-	}
-	candidates.push((candidate, span));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -764,6 +920,18 @@ pub(super) enum BindingTarget {
 	/// (or not) each time this binding is actually used, not just once.
 	Inaccessible(DefKey),
 	Error,
+}
+
+impl BindingTarget {
+	/// The underlying definition this target names, if it names one at all
+	/// — `Error` doesn't, since it's recovery state for an already-diagnosed
+	/// failure rather than a reference to anything real.
+	fn def_key(self) -> Option<DefKey> {
+		match self {
+			Self::Accessible(key) | Self::Inaccessible(key) => Some(key),
+			Self::Error => None,
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -784,8 +952,20 @@ pub(super) struct Binding {
 
 impl Binding {
 	fn definition(key: DefKey, visibility: Visibility) -> Self {
+		Self::definition_with_target(BindingTarget::Accessible(key), visibility)
+	}
+
+	/// Like `definition`, but for the rare case where a direct declaration
+	/// doesn't bind `Accessible` outright — a tuple struct's own value-namespace
+	/// binding (its constructor) is `Inaccessible` when any field is private,
+	/// since the type itself is still fine to name, but nothing outside the
+	/// declaring namespace can construct it.
+	fn definition_with_target(
+		target: BindingTarget,
+		visibility: Visibility,
+	) -> Self {
 		Self {
-			target: BindingTarget::Accessible(key),
+			target,
 			accesses: Vec::new(),
 			visibility,
 			source: BindingSource::Definition,
@@ -1501,7 +1681,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::TupleStruct {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				fields,
+				..
 			} => {
 				let def_key = self.push_def(
 					namespace,
@@ -1513,10 +1697,26 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				// The type itself is always nameable if `pub`, but a field
+				// that isn't `pub` can't be initialized from outside this
+				// namespace — so the constructor (the value binding) is
+				// only ever `Accessible` when every field is. This is
+				// purely syntactic (each field's own `pub_span`), so it's
+				// known here in prescan without needing any type resolved.
+				let all_fields_pub =
+					fields.iter().all(|f| f.inner.inner.pub_span.is_some());
+				let value_target = if all_fields_pub {
+					BindingTarget::Accessible(def_key)
+				} else {
+					BindingTarget::Inaccessible(def_key)
+				};
 				self.insert_binding(
 					namespace,
 					BindingKey::value(name.inner),
-					Binding::definition(def_key, Visibility::from(*pub_span)),
+					Binding::definition_with_target(
+						value_target,
+						Visibility::from(*pub_span),
+					),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -2457,6 +2657,53 @@ mod tests {
 			.get(&BindingKey::ty(point_symbol))
 			.expect("`Point` should be bound in the type namespace");
 		assert!(matches!(point_binding.target, BindingTarget::Accessible(_)));
+	}
+
+	#[test]
+	fn tuple_struct_with_all_pub_fields_has_an_accessible_constructor() {
+		let mut case = TestCase::new(indoc! {"
+			pub struct Point(pub i32, pub i32);
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let root_namespace = case.root_namespace();
+		let bindings =
+			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+
+		let value_binding = bindings
+			.get(&BindingKey::value(point_symbol))
+			.expect("`Point` should be bound in the value namespace");
+		assert!(matches!(value_binding.target, BindingTarget::Accessible(_)));
+	}
+
+	#[test]
+	fn tuple_struct_with_a_private_field_has_an_inaccessible_constructor() {
+		let mut case = TestCase::new(indoc! {"
+			pub struct Point(pub i32, i32);
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let root_namespace = case.root_namespace();
+		let bindings =
+			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+
+		// The type itself stays fully nameable...
+		let type_binding = bindings
+			.get(&BindingKey::ty(point_symbol))
+			.expect("`Point` should be bound in the type namespace");
+		assert!(matches!(type_binding.target, BindingTarget::Accessible(_)));
+
+		// ...but the constructor can't be, since a private field can't be
+		// initialized from outside this namespace.
+		let value_binding = bindings
+			.get(&BindingKey::value(point_symbol))
+			.expect("`Point` should be bound in the value namespace");
+		assert!(matches!(
+			value_binding.target,
+			BindingTarget::Inaccessible(_)
+		));
 	}
 
 	#[test]

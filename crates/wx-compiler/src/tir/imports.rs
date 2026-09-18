@@ -15,10 +15,10 @@ use crate::{
 };
 
 use super::defs::{
-	Binding, BindingCandidate, BindingKey, BindingLookup, BindingTarget,
-	DefKey, DefKind, DuplicateDefinitionDiagnostic, GlobImport, Namespace,
-	NamespaceIndex, NamespaceLookup, UseItemDef, UseItemIndex, UseItemKind,
-	UsePathIndex, UsePathSegment, Visibility,
+	Binding, BindingKey, BindingLookup, BindingTarget, DefKey, DefKind,
+	DuplicateDefinitionDiagnostic, GlobImport, Namespace, NamespaceIndex,
+	NamespaceLookup, UseItemDef, UseItemIndex, UseItemKind, UsePathIndex,
+	UsePathSegment, Visibility,
 };
 
 #[derive(Clone, Copy)]
@@ -148,7 +148,10 @@ pub(super) fn resolve_use_paths(
 		(NamespaceIndex, SymbolU32),
 		SmallVec<UseItemIndex>,
 	>,
-	pending_pub_glob_reexports: &HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+	pending_pub_glob_reexports: &HashMap<
+		NamespaceIndex,
+		SmallVec<UseItemIndex>,
+	>,
 ) {
 	let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 	let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -256,8 +259,8 @@ impl<'r> ImportResolver<'r> {
 					// plain (non-`pub`) fallback registration, if it
 					// already happened, is untouched.
 					UseItemKind::Glob { span, .. } => {
-						let diagnostic =
-							self.report_use_cycle(SourceSpan::new(file_id, span));
+						let diagnostic = self
+							.report_use_cycle(SourceSpan::new(file_id, span));
 						self.diagnostics.push(diagnostic);
 					}
 				}
@@ -312,7 +315,7 @@ impl<'r> ImportResolver<'r> {
 		if let Some(candidates) =
 			self.pending_named_imports.get(&(scope, name.inner))
 		{
-			for candidate in candidates.iter() {
+			for candidate in candidates {
 				if candidate == index {
 					continue;
 				}
@@ -485,7 +488,7 @@ impl<'r> ImportResolver<'r> {
 		else {
 			return;
 		};
-		for candidate in candidates.iter() {
+		for candidate in candidates {
 			self.ensure_use_item(candidate);
 		}
 	}
@@ -507,10 +510,14 @@ impl<'r> ImportResolver<'r> {
 			span,
 		);
 
-		let candidate = match self.namespaces.lookup(self.use_items, scope, key)
-		{
+		let (target, visibility) = match self.namespaces.lookup(
+			self.use_items,
+			scope,
+			key,
+			accessor,
+		) {
 			BindingLookup::NotFound => return ImportSlot::Absent,
-			BindingLookup::Found(candidate) => candidate,
+			BindingLookup::Found(target, visibility) => (target, visibility),
 			BindingLookup::Ambiguous(candidates) => {
 				let diagnostic = self.report_ambiguous_reexport(
 					key.symbol,
@@ -518,11 +525,15 @@ impl<'r> ImportResolver<'r> {
 					&candidates,
 				);
 				self.diagnostics.push(diagnostic);
-				candidates[0].0
+				// Every surviving candidate here was already confirmed
+				// accessible to `accessor` by `indirect_lookup` — `Public`
+				// is just a stand-in that reproduces that same "yes" below,
+				// not a claim about its real declared visibility.
+				(candidates[0].0, Visibility::Public)
 			}
 		};
-		let (visibility, target) = (candidate.visibility, candidate.target);
-		self.namespaces.record_binding_access(scope, key, source_span);
+		self.namespaces
+			.record_binding_access(scope, key, source_span);
 
 		let slot = match target {
 			// Already flagged by an earlier link in a re-export chain —
@@ -673,7 +684,7 @@ impl<'r> ImportResolver<'r> {
 			.pending_named_imports
 			.get(&(declaring_namespace, segment.segment.inner))
 		{
-			for candidate in candidates.iter() {
+			for candidate in candidates {
 				if candidate != current_item {
 					self.ensure_use_item(candidate);
 				}
@@ -685,10 +696,11 @@ impl<'r> ImportResolver<'r> {
 			segment.segment.span,
 		);
 
-		let candidate = match self.namespaces.lookup(
+		let (target, visibility) = match self.namespaces.lookup(
 			self.use_items,
 			declaring_namespace,
 			key,
+			accessor,
 		) {
 			BindingLookup::NotFound => {
 				let diagnostic = self.report_unresolved_import(
@@ -699,7 +711,7 @@ impl<'r> ImportResolver<'r> {
 				self.diagnostics.push(diagnostic);
 				return Err(());
 			}
-			BindingLookup::Found(candidate) => candidate,
+			BindingLookup::Found(target, visibility) => (target, visibility),
 			BindingLookup::Ambiguous(candidates) => {
 				let diagnostic = self.report_ambiguous_reexport(
 					segment.segment.inner,
@@ -707,7 +719,11 @@ impl<'r> ImportResolver<'r> {
 					&candidates,
 				);
 				self.diagnostics.push(diagnostic);
-				candidates[0].0
+				// Every surviving candidate here was already confirmed
+				// accessible to `accessor` by `indirect_lookup` — `Public`
+				// is just a stand-in that reproduces that same "yes" below,
+				// not a claim about its real declared visibility.
+				(candidates[0].0, Visibility::Public)
 			}
 		};
 		self.namespaces.record_binding_access(
@@ -715,7 +731,6 @@ impl<'r> ImportResolver<'r> {
 			key,
 			source_span,
 		);
-		let (visibility, target) = (candidate.visibility, candidate.target);
 
 		if let BindingTarget::Accessible(def_key)
 		| BindingTarget::Inaccessible(def_key) = target
@@ -867,7 +882,7 @@ impl<'r> ImportResolver<'r> {
 		&self,
 		name: SymbolU32,
 		span: SourceSpan,
-		candidates: &[(BindingCandidate, SourceSpan)],
+		candidates: &[(BindingTarget, SourceSpan)],
 	) -> Diagnostic<FileId> {
 		let resolved_name = self.strings.resolve(name).unwrap();
 		let mut diagnostic = Diagnostic::error()
@@ -875,9 +890,11 @@ impl<'r> ImportResolver<'r> {
 			.with_message(format!("`{resolved_name}` is ambiguous"))
 			.with_label(span.primary_label().with_message("ambiguous name"));
 		for (_, candidate_span) in candidates {
-			diagnostic = diagnostic.with_label(candidate_span.secondary_label().with_message(
-				format!("`{resolved_name}` could refer to the item re-exported here"),
-			));
+			diagnostic = diagnostic.with_label(
+				candidate_span.secondary_label().with_message(format!(
+					"`{resolved_name}` could refer to the item re-exported here"
+				)),
+			);
 		}
 		diagnostic.with_note(format!(
 			"consider adding an explicit `use` of `{resolved_name}` to disambiguate"
@@ -998,7 +1015,10 @@ mod tests {
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.
-		fn glob_targets(&self, namespace: NamespaceIndex) -> Vec<NamespaceIndex> {
+		fn glob_targets(
+			&self,
+			namespace: NamespaceIndex,
+		) -> Vec<NamespaceIndex> {
 			self.defs.namespaces[usize::from(namespace)]
 				.glob_imports
 				.iter()
@@ -1797,6 +1817,162 @@ mod tests {
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AmbiguousReexport]);
+	}
+
+	#[test]
+	fn diamond_reexport_through_two_pub_globs_is_not_ambiguous() {
+		// `b` and `c` both re-export everything from `a`, and `d` globs
+		// both `b` and `c` — the same `a::helper` is reached twice, once
+		// via each edge. That's a diamond, not a conflict: both edges name
+		// the exact same `DefKey`, so it must collapse into one candidate
+		// rather than reading as two re-exports disagreeing on the name.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			mod b {
+				pub use crate::a::*;
+			}
+			mod c {
+				pub use crate::a::*;
+			}
+			mod d {
+				pub use crate::b::*;
+				pub use crate::c::*;
+			}
+			use d::helper;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+	}
+
+	#[test]
+	fn broken_glob_edge_does_not_make_a_real_candidate_ambiguous() {
+		// `broken` re-exports a name that doesn't exist under the alias
+		// `helper`, which installs its own `Error`-recovery placeholder
+		// under that key. `d` globs both `a` (the real `helper`) and
+		// `broken` (the placeholder) — the placeholder must not read as a
+		// second, competing candidate: that would both misreport a
+		// perfectly fine `helper` as ambiguous and re-diagnose a problem
+		// `broken`'s own `use` already reported.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			mod broken {
+				pub use crate::a::nonexistent_fn as helper;
+			}
+			mod d {
+				pub use crate::a::*;
+				pub use crate::broken::*;
+			}
+			use d::helper;
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
+	}
+
+	#[test]
+	fn all_glob_edges_broken_does_not_cascade() {
+		// Unlike `broken_glob_edge_does_not_make_a_real_candidate_ambiguous`,
+		// `hub` here has no real candidate at all — every edge it walks is
+		// broken, so `Candidates::Error` has to survive all the way to
+		// `finish` as the final result (`Found(Error, _)`, not `NotFound`).
+		// If it didn't, `use hub::helper;` would fall through to a second,
+		// redundant "unresolved import" diagnostic on top of the one
+		// `broken`'s own `use` already reported.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn something_else() -> i32 { 1 }
+			}
+			mod broken {
+				pub use crate::a::nonexistent_fn as helper;
+			}
+			mod hub {
+				pub use crate::broken::*;
+			}
+			use hub::helper;
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
+	}
+
+	#[test]
+	fn private_candidate_does_not_participate_in_ambiguity() {
+		// `a::pick` is public, `b::pick` is private — `hub` re-exports both
+		// under the same name. Only `a::pick` is a real option for an
+		// accessor outside `b`'s own subtree, so this must resolve cleanly
+		// to it rather than reporting a spurious ambiguity between a real
+		// choice and one that was never actually reachable.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				fn pick() -> i32 { 2 }
+			}
+			mod hub {
+				pub use crate::a::*;
+				pub use crate::b::*;
+			}
+			use hub::pick;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let Some(BindingTarget::Accessible(a_pick)) =
+			case.lookup_value(a, "pick")
+		else {
+			panic!("a::pick should resolve directly");
+		};
+		let Some(BindingTarget::Accessible(resolved)) =
+			case.lookup_value(root, "pick")
+		else {
+			panic!("hub::pick should resolve to a::pick, not be swallowed");
+		};
+		assert_eq!(resolved, a_pick);
+	}
+
+	#[test]
+	fn private_candidate_does_not_participate_in_ambiguity_regardless_of_glob_order()
+	 {
+		// Same shape as above with the two globs declared in the opposite
+		// order — the outcome must not depend on which glob happened to be
+		// written (and therefore walked) first. This ordering specifically
+		// exercises the case where the unreachable `b::pick` is the first
+		// real candidate seen (so it's provisionally kept, deferred, as
+		// the sole candidate) and the later, reachable `a::pick` has to
+		// *replace* it outright rather than merge into an ambiguity — as
+		// opposed to the other test's ordering, where the reachable one
+		// arrives first and the unreachable one is simply turned away.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				fn pick() -> i32 { 2 }
+			}
+			mod hub {
+				pub use crate::b::*;
+				pub use crate::a::*;
+			}
+			use hub::pick;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let Some(BindingTarget::Accessible(a_pick)) =
+			case.lookup_value(a, "pick")
+		else {
+			panic!("a::pick should resolve directly");
+		};
+		let Some(BindingTarget::Accessible(resolved)) =
+			case.lookup_value(root, "pick")
+		else {
+			panic!("hub::pick should resolve to a::pick, not be swallowed");
+		};
+		assert_eq!(resolved, a_pick);
 	}
 
 	#[test]

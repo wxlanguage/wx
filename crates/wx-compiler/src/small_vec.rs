@@ -18,14 +18,32 @@ impl<T: Copy> SmallVec<T> {
 			Self::Many(items) => items.push(item),
 		}
 	}
+}
 
-	pub(crate) fn iter(&self) -> impl Iterator<Item = T> + '_ {
+impl<'a, T: Copy> IntoIterator for &'a SmallVec<T> {
+	type Item = T;
+	type IntoIter = std::iter::Copied<std::slice::Iter<'a, T>>;
+
+	fn into_iter(self) -> Self::IntoIter {
 		match self {
-			Self::One(item) => std::slice::from_ref(item),
-			Self::Many(items) => items,
+			SmallVec::One(item) => std::slice::from_ref(item),
+			SmallVec::Many(items) => items,
 		}
 		.iter()
 		.copied()
+	}
+}
+
+impl<'a, T: Copy> IntoIterator for &'a mut SmallVec<T> {
+	type Item = &'a mut T;
+	type IntoIter = std::slice::IterMut<'a, T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		match self {
+			SmallVec::One(item) => std::slice::from_mut(item),
+			SmallVec::Many(items) => items,
+		}
+		.iter_mut()
 	}
 }
 
@@ -36,10 +54,10 @@ mod tests {
 	#[test]
 	fn stores_one_item_inline_and_promotes_on_push() {
 		let mut items = SmallVec::new(1);
-		assert_eq!(items.iter().collect::<Vec<_>>(), [1]);
+		assert_eq!((&items).into_iter().collect::<Vec<_>>(), [1]);
 
 		items.push(2);
 		items.push(3);
-		assert_eq!(items.iter().collect::<Vec<_>>(), [1, 2, 3]);
+		assert_eq!((&items).into_iter().collect::<Vec<_>>(), [1, 2, 3]);
 	}
 }
