@@ -14,7 +14,7 @@ use crate::{
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	index::index_newtype,
 	small_vec::SmallVec,
-	tir::literals::unescape_string_literal,
+	tir::{imports::ImportResolver, literals::unescape_string_literal},
 	vfs::{FileId, Files, Package, PackageId},
 };
 
@@ -44,11 +44,17 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
 		HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
-	/// Every `pub use path::*;` item, grouped by the namespace it's
+	/// Every glob `use` item — `pub` or not — grouped by the namespace it's
 	/// *declared* in — no name dimension, unlike `pending_named_imports`,
 	/// since a glob doesn't claim one. Lets glob resolution find "what does
-	/// this namespace re-export" without scanning every `use_items` entry.
-	pending_pub_glob_reexports: HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+	/// this namespace glob-import" without scanning every `use_items` entry.
+	/// Covers private globs too (not just `pub` re-exports) because
+	/// `imports::compute_glob_item` chases *every* glob a target declares
+	/// before adding its own edge — the graph `indirect_lookup` walks at
+	/// lookup time includes private edges just as much as `pub` ones, so
+	/// cycle detection has to see the whole graph, not just its `pub`
+	/// subset.
+	pending_glob_targets: HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -452,13 +458,13 @@ pub(super) trait NamespaceLookup {
 		namespace: NamespaceIndex,
 	) -> bool;
 
-	/// An item declared `visibility` in `declaring_namespace` is reachable
-	/// from `accessor` if it's `Public`, or if `declaring_namespace`
+	/// An item declared `visibility` in `target_namespace` is reachable
+	/// from `accessor` if it's `Public`, or if `target_namespace`
 	/// contains `accessor`.
 	fn is_accessible_from(
 		&self,
 		accessor: NamespaceIndex,
-		declaring_namespace: NamespaceIndex,
+		target_namespace: NamespaceIndex,
 		visibility: Visibility,
 	) -> bool;
 
@@ -504,44 +510,45 @@ pub(super) trait NamespaceLookup {
 	/// candidates are actually competing.
 	fn direct_lookup(
 		&self,
-		namespace: NamespaceIndex,
+		target_namespace: NamespaceIndex,
 		key: BindingKey,
 	) -> Option<(BindingTarget, Visibility)>;
 
-	/// What `namespace` exposes *only* through its own `pub use path::*;`
-	/// edges — never a private one, which stays local to that namespace's
-	/// own body lookups (a separate, richer walk that isn't this: own
-	/// bindings, then *every* glob regardless of visibility, then the
-	/// parent, then the prelude). Recurses via `lookup` at each hop, not
-	/// into itself, so a re-export chain composes through direct
-	/// declarations and further re-exports alike. Terminates because
-	/// `compute_glob_item` already rejects a cycle in this exact edge set
-	/// before it can be walked.
+	/// What `target_namespace` exposes through its `use path::*;` edges,
+	/// filtered to the ones `accessor` may actually see — a glob is just
+	/// another binding with a visibility, so a `pub` one is visible to
+	/// anyone and a private one only to `target_namespace` itself and its
+	/// descendants, the same rule `is_accessible_from` applies everywhere
+	/// else. Recurses via `lookup` at each hop, not into itself, so a
+	/// re-export chain composes through direct declarations and further
+	/// re-exports alike. Terminates because `compute_glob_item` already
+	/// rejects a cycle in this exact edge set before it can be walked.
 	///
-	/// `accessor` only matters once two *distinct* candidates compete: a
+	/// `accessor` also matters once two *distinct* candidates compete: a
 	/// candidate `accessor` could never legally choose is excluded right
 	/// then, rather than surviving into a misleading `Ambiguous`. A lone
 	/// candidate is always returned `Found`, visibility included,
-	/// regardless of whether `accessor` can see it — deferred to the
-	/// caller, same as a direct (non-glob) hit already is.
+	/// regardless of whether `accessor` can see *that candidate* — deferred
+	/// to the caller, same as a direct (non-glob) hit already is.
 	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
-		namespace: NamespaceIndex,
-		key: BindingKey,
 		accessor: NamespaceIndex,
+		target_namespace: NamespaceIndex,
+		key: BindingKey,
 	) -> BindingLookup;
 
-	/// What `namespace` exposes to an outside consumer, full stop —
-	/// `direct_lookup`, falling back to `indirect_lookup`. What a named
-	/// `use a::b;` and a glob `use a::*;` should both find when asking `a`
-	/// for the same name.
+	/// What `target_namespace` exposes to `accessor` — `direct_lookup`,
+	/// falling back to `indirect_lookup`. What a named `use a::b;` and a
+	/// glob `use a::*;` should both find when asking `a` for the same
+	/// name, whether `accessor` is `a` itself (or a descendant, consulting
+	/// `a`'s own private globs) or is reaching in from elsewhere.
 	fn lookup(
 		&self,
 		use_items: &[UseItemDef],
-		namespace: NamespaceIndex,
-		key: BindingKey,
 		accessor: NamespaceIndex,
+		target_namespace: NamespaceIndex,
+		key: BindingKey,
 	) -> BindingLookup;
 }
 
@@ -731,9 +738,9 @@ impl NamespaceLookup for [Namespace] {
 	fn namespace_contains(
 		&self,
 		ancestor: NamespaceIndex,
-		namespace: NamespaceIndex,
+		current: NamespaceIndex,
 	) -> bool {
-		let mut current = Some(namespace);
+		let mut current = Some(current);
 		while let Some(ns) = current {
 			if ns == ancestor {
 				return true;
@@ -746,13 +753,13 @@ impl NamespaceLookup for [Namespace] {
 	fn is_accessible_from(
 		&self,
 		accessor: NamespaceIndex,
-		declaring_namespace: NamespaceIndex,
+		target_namespace: NamespaceIndex,
 		visibility: Visibility,
 	) -> bool {
 		match visibility {
 			Visibility::Public => true,
 			Visibility::Private => {
-				self.namespace_contains(declaring_namespace, accessor)
+				self.namespace_contains(target_namespace, accessor)
 			}
 		}
 	}
@@ -841,10 +848,10 @@ impl NamespaceLookup for [Namespace] {
 
 	fn direct_lookup(
 		&self,
-		namespace: NamespaceIndex,
+		target_namespace: NamespaceIndex,
 		key: BindingKey,
 	) -> Option<(BindingTarget, Visibility)> {
-		self[usize::from(namespace)]
+		self[usize::from(target_namespace)]
 			.bindings
 			.get(&key)
 			.map(|binding| (binding.target, binding.visibility))
@@ -853,24 +860,35 @@ impl NamespaceLookup for [Namespace] {
 	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
-		namespace: NamespaceIndex,
-		key: BindingKey,
 		accessor: NamespaceIndex,
+		target_namespace: NamespaceIndex,
+		key: BindingKey,
 	) -> BindingLookup {
 		let mut candidates = CandidateMerge::new(self, accessor);
 
-		for glob in self[usize::from(namespace)].glob_imports.iter().copied() {
+		for glob in self[usize::from(target_namespace)]
+			.glob_imports
+			.iter()
+			.copied()
+		{
 			let item = &use_items[usize::from(glob.use_item)];
-			if item.pub_span.is_none() {
+			let glob_visibility = Visibility::from(item.pub_span);
+			if !self.is_accessible_from(
+				accessor,
+				target_namespace,
+				glob_visibility,
+			) {
 				continue;
 			}
 			let UseItemKind::Glob { span, .. } = item.kind else {
 				unreachable!("a glob edge is always produced by a glob item")
 			};
-			let edge_span =
-				SourceSpan::new(self[usize::from(namespace)].file_id, span);
+			let edge_span = SourceSpan::new(
+				self[usize::from(target_namespace)].file_id,
+				span,
+			);
 
-			match self.lookup(use_items, glob.namespace, key, accessor) {
+			match self.lookup(use_items, accessor, glob.namespace, key) {
 				BindingLookup::NotFound => {}
 				BindingLookup::Found(target, visibility) => {
 					candidates.push(target, visibility, edge_span);
@@ -895,15 +913,17 @@ impl NamespaceLookup for [Namespace] {
 	fn lookup(
 		&self,
 		use_items: &[UseItemDef],
-		namespace: NamespaceIndex,
-		key: BindingKey,
 		accessor: NamespaceIndex,
+		target_namespace: NamespaceIndex,
+		key: BindingKey,
 	) -> BindingLookup {
-		match self.direct_lookup(namespace, key) {
+		match self.direct_lookup(target_namespace, key) {
 			Some((target, visibility)) => {
 				BindingLookup::Found(target, visibility)
 			}
-			None => self.indirect_lookup(use_items, namespace, key, accessor),
+			None => {
+				self.indirect_lookup(use_items, accessor, target_namespace, key)
+			}
 		}
 	}
 }
@@ -926,7 +946,7 @@ impl BindingTarget {
 	/// The underlying definition this target names, if it names one at all
 	/// — `Error` doesn't, since it's recovery state for an already-diagnosed
 	/// failure rather than a reference to anything real.
-	fn def_key(self) -> Option<DefKey> {
+	pub(super) fn def_key(self) -> Option<DefKey> {
 		match self {
 			Self::Accessible(key) | Self::Inaccessible(key) => Some(key),
 			Self::Error => None,
@@ -1228,7 +1248,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
 		let package_namespaces: Vec<NamespaceIndex> = (0..packages.len())
-			.into_iter()
 			.map(|i| NamespaceIndex(u32::try_from(i).unwrap()))
 			.collect();
 
@@ -1306,7 +1325,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			pending_named_imports: HashMap::new(),
-			pending_pub_glob_reexports: HashMap::new(),
+			pending_glob_targets: HashMap::new(),
 		};
 
 		let file_namespaces = builder.compute_file_namespaces(packages);
@@ -1325,7 +1344,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 		}
 
-		builder.resolve_use_paths();
+		ImportResolver::resolve_imports(
+			builder.diagnostics,
+			builder.strings,
+			&mut builder.namespaces,
+			&builder.use_items,
+			&builder.use_paths,
+			&builder.pending_named_imports,
+			&builder.pending_glob_targets,
+		);
 
 		let registry = DefinitionRegistry {
 			namespaces: builder.namespaces,
@@ -2465,12 +2492,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					namespace,
 					pub_span,
 				});
-				if pub_span.is_some() {
-					self.pending_pub_glob_reexports
-						.entry(namespace)
-						.and_modify(|items| items.push(item_index))
-						.or_insert_with(|| SmallVec::new(item_index));
-				}
+				self.pending_glob_targets
+					.entry(namespace)
+					.and_modify(|items| items.push(item_index))
+					.or_insert_with(|| SmallVec::new(item_index));
 			}
 			ast::UseTree::Path { segment, rest } => {
 				let path = self.push_use_path(UsePathSegment {
@@ -2494,20 +2519,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 			}
 		}
-	}
-}
-
-impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
-	fn resolve_use_paths(&mut self) {
-		imports::resolve_use_paths(
-			self.diagnostics,
-			self.strings,
-			&mut self.namespaces,
-			&self.use_items,
-			&self.use_paths,
-			&self.pending_named_imports,
-			&self.pending_pub_glob_reexports,
-		);
 	}
 }
 
@@ -2564,7 +2575,7 @@ mod tests {
 			Self::from_graph(builder.build(root_id))
 		}
 
-		fn new_multi_file(
+		fn new_workspace(
 			entry_path: vfs::AbsolutePath,
 			workspace: HashMap<vfs::AbsolutePath, String>,
 		) -> Self {
@@ -2708,7 +2719,7 @@ mod tests {
 
 	#[test]
 	fn module_declared_in_another_file_gets_a_namespace() {
-		let mut case = TestCase::new_multi_file(
+		let mut case = TestCase::new_workspace(
 			vfs::AbsolutePath::new("/main.wx"),
 			HashMap::from([
 				(vfs::AbsolutePath::new("/main.wx"), "mod math;".to_string()),
@@ -2726,5 +2737,238 @@ mod tests {
 			case.lookup_value(math, "add"),
 			Some(BindingTarget::Accessible(_))
 		));
+	}
+
+	#[test]
+	fn direct_lookup_never_falls_back_to_a_glob() {
+		// `direct_lookup` is a plain `HashMap` read with no notion of globs
+		// at all — `lookup`'s indirect half is what chases those. Checking
+		// this directly, rather than only through the bindings a `use`
+		// installs, pins down that boundary explicitly.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			use a::*;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let helper = case.graph.interner.get_or_intern("helper");
+
+		assert!(matches!(
+			case.defs.namespaces.lookup(
+				&case.defs.use_items,
+				root,
+				root,
+				BindingKey::value(helper),
+			),
+			BindingLookup::Found(..)
+		));
+		assert!(
+			case.defs
+				.namespaces
+				.direct_lookup(root, BindingKey::value(helper))
+				.is_none(),
+			"a glob installs no binding of its own, so `direct_lookup` \
+			 must not find `helper` even though `lookup` does"
+		);
+	}
+
+	#[test]
+	fn indirect_lookup_ignores_private_globs_from_outside_the_declaring_namespace()
+	 {
+		// `b`'s glob is private, and `root` is neither `b` itself nor a
+		// descendant of it — so from `root`'s perspective this is exactly
+		// like any other private item: not visible. (A descendant of `b`
+		// asking the same question gets a different answer — see
+		// `indirect_lookup_reaches_a_private_glob_from_a_descendant_namespace`.)
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			mod b {
+				use crate::a::*;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let b = case.child_namespace(root, "b");
+		let helper = case.graph.interner.get_or_intern("helper");
+
+		assert!(matches!(
+			case.defs.namespaces.indirect_lookup(
+				&case.defs.use_items,
+				root,
+				b,
+				BindingKey::value(helper),
+			),
+			BindingLookup::NotFound
+		));
+	}
+
+	#[test]
+	fn indirect_lookup_reaches_a_private_glob_from_a_descendant_namespace() {
+		// Same private glob as the test above, but queried from `m::inner`
+		// — a genuine descendant of the declaring namespace `m`, which
+		// (same as any other private item) must see it. A blanket "only
+		// `pub` globs are ever visible" rule would get this wrong: `pub`
+		// only governs visibility to namespaces *outside* `m`'s own
+		// subtree, not to `m` and its descendants, which already have
+		// access to everything `m` privately imports.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			mod m {
+				use crate::a::*;
+				mod inner {}
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let m = case.child_namespace(root, "m");
+		let inner = case.child_namespace(m, "inner");
+		let helper = case.graph.interner.get_or_intern("helper");
+
+		match case.defs.namespaces.indirect_lookup(
+			&case.defs.use_items,
+			inner,
+			m,
+			BindingKey::value(helper),
+		) {
+			BindingLookup::Found(BindingTarget::Accessible(_), _) => {}
+			other => panic!(
+				"a descendant of `m` should see `m`'s own private glob, \
+				 got {other:?}"
+			),
+		}
+	}
+
+	#[test]
+	fn indirect_lookup_finds_a_single_pub_glob_candidate() {
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn helper() -> i32 { 1 }
+			}
+			mod hub {
+				pub use crate::a::*;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let hub = case.child_namespace(root, "hub");
+		let helper = case.graph.interner.get_or_intern("helper");
+
+		let Some(BindingTarget::Accessible(original)) =
+			case.lookup_value(a, "helper")
+		else {
+			panic!("`a::helper` should resolve directly");
+		};
+
+		match case.defs.namespaces.indirect_lookup(
+			&case.defs.use_items,
+			root,
+			hub,
+			BindingKey::value(helper),
+		) {
+			BindingLookup::Found(
+				BindingTarget::Accessible(found),
+				visibility,
+			) => {
+				assert_eq!(found, original);
+				assert_eq!(visibility, Visibility::Public);
+			}
+			other => panic!("expected a single found candidate, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn indirect_lookup_reports_ambiguous_for_two_disagreeing_pub_globs() {
+		// Same shape the end-to-end `imports.rs` ambiguity tests use, but
+		// nothing here ever consults `hub::pick` through a `use` item — the
+		// raw primitive can still see (and report) the disagreement on
+		// demand; the pipeline just never happens to ask.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				pub fn pick() -> i32 { 2 }
+			}
+			mod hub {
+				pub use crate::a::*;
+				pub use crate::b::*;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let hub = case.child_namespace(root, "hub");
+		let pick = case.graph.interner.get_or_intern("pick");
+
+		match case.defs.namespaces.indirect_lookup(
+			&case.defs.use_items,
+			root,
+			hub,
+			BindingKey::value(pick),
+		) {
+			BindingLookup::Ambiguous(candidates) => {
+				assert_eq!(candidates.len(), 2);
+			}
+			other => {
+				panic!("expected two disagreeing candidates, got {other:?}")
+			}
+		}
+	}
+
+	#[test]
+	fn lookup_prefers_a_direct_binding_over_a_colliding_pub_glob() {
+		// `hub` has both its own (private) `pick` and a `pub use a::*;`
+		// that would also supply a *different* `pick` through the glob.
+		// `lookup`'s direct-then-indirect composition must return the
+		// direct one without ever consulting the indirect half.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod hub {
+				pub use crate::a::*;
+				fn pick() -> i32 { 2 }
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let hub = case.child_namespace(root, "hub");
+		let pick = case.graph.interner.get_or_intern("pick");
+
+		let Some(BindingTarget::Accessible(direct)) =
+			case.lookup_value(hub, "pick")
+		else {
+			panic!("`hub::pick` should be bound directly");
+		};
+
+		match case.defs.namespaces.lookup(
+			&case.defs.use_items,
+			root,
+			hub,
+			BindingKey::value(pick),
+		) {
+			BindingLookup::Found(BindingTarget::Accessible(found), _) => {
+				assert_eq!(
+					found, direct,
+					"lookup should return hub's own `pick`, not a::pick \
+					 through the glob"
+				);
+			}
+			other => {
+				panic!("expected the direct binding to win, got {other:?}")
+			}
+		}
 	}
 }

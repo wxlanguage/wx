@@ -8,7 +8,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
-	ast::StringInterner,
+	ast::{Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	small_vec::SmallVec,
 	vfs::FileId,
@@ -42,7 +42,7 @@ enum ImportSlot {
 	/// earlier failure already diagnosed elsewhere. Kept distinct from
 	/// `Absent` so a consulting `use` item knows not to report "not
 	/// found" a second time for the same underlying problem — see its
-	/// use in `compute_use_item`.
+	/// use in `compute_import_item`.
 	Errored,
 }
 
@@ -119,7 +119,7 @@ impl<T: Copy> ResolveStatus<T> {
 /// owned `Vec`/`HashMap` fields `DefinitionRegistryBuilder` has) means
 /// reading them never competes with the `&mut self` calls that touch
 /// `namespaces`/`diagnostics`.
-struct ImportResolver<'r> {
+pub(super) struct ImportResolver<'r> {
 	diagnostics: &'r mut Vec<Diagnostic<FileId>>,
 	strings: &'r StringInterner,
 	namespaces: &'r mut [Namespace],
@@ -128,55 +128,56 @@ struct ImportResolver<'r> {
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
 		&'r HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
-	pending_pub_glob_reexports:
-		&'r HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+	pending_glob_targets: &'r HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
 
 	path_state: &'r mut [ResolveStatus<ImportScope>],
 	item_state: &'r mut [ResolveStatus<()>],
-}
-
-/// Entry point for `DefinitionRegistryBuilder::resolve_use_paths` — the only
-/// thing `defs.rs` needs to know about this module. Keeps `ImportResolver`'s
-/// fields private to this file rather than exposing the struct itself.
-pub(super) fn resolve_use_paths(
-	diagnostics: &mut Vec<Diagnostic<FileId>>,
-	strings: &StringInterner,
-	namespaces: &mut [Namespace],
-	use_items: &[UseItemDef],
-	use_paths: &[UsePathSegment],
-	pending_named_imports: &HashMap<
-		(NamespaceIndex, SymbolU32),
-		SmallVec<UseItemIndex>,
-	>,
-	pending_pub_glob_reexports: &HashMap<
-		NamespaceIndex,
-		SmallVec<UseItemIndex>,
-	>,
-) {
-	let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
-	let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
-	ImportResolver {
-		diagnostics,
-		strings,
-		namespaces,
-		use_items,
-		use_paths,
-		pending_named_imports,
-		pending_pub_glob_reexports,
-		path_state: &mut path_state,
-		item_state: &mut item_state,
-	}
-	.run();
+	/// Every `use` item currently being resolved, innermost last — pushed
+	/// and popped, generically, by `ensure_import_item` for both named leaves
+	/// and globs, in lockstep with `item_state` flipping to/from
+	/// `Resolving`. Unlike `item_state`'s flat per-item fact, this
+	/// preserves the actual call chain, so `resolve_stack[pos..]` can name
+	/// a whole loop, not just report that one exists.
+	resolve_stack: Vec<UseItemIndex>,
 }
 
 impl<'r> ImportResolver<'r> {
-	fn run(&mut self) {
+	/// Entry point for `DefinitionRegistryBuilder::resolve_imports` — the
+	/// only thing `defs.rs` needs to know about this module. Keeps every
+	/// other field/method on `ImportResolver` private to this file.
+	pub(super) fn resolve_imports(
+		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		strings: &StringInterner,
+		namespaces: &mut [Namespace],
+		use_items: &[UseItemDef],
+		use_paths: &[UsePathSegment],
+		pending_named_imports: &HashMap<
+			(NamespaceIndex, SymbolU32),
+			SmallVec<UseItemIndex>,
+		>,
+		pending_glob_targets: &HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+	) {
+		let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
+		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
+		let mut resolver = ImportResolver {
+			diagnostics,
+			strings,
+			namespaces,
+			use_items,
+			use_paths,
+			pending_named_imports,
+			pending_glob_targets,
+			path_state: &mut path_state,
+			item_state: &mut item_state,
+			resolve_stack: Vec::new(),
+		};
+
 		// A named leaf installs a real binding; a glob only ever records a
 		// lookup-time fallback edge (`Namespace::glob_imports`) plus, if
 		// `pub`, chases the target's own `pub` globs so cycles are caught
 		// here rather than at some arbitrary later lookup.
-		for (index, _) in self.use_items.iter().enumerate() {
-			self.ensure_use_item(UseItemIndex::new(
+		for (index, _) in use_items.iter().enumerate() {
+			resolver.ensure_import_item(UseItemIndex::new(
 				u32::try_from(index).unwrap(),
 			));
 		}
@@ -218,21 +219,35 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	fn ensure_use_item(&mut self, index: UseItemIndex) {
+	fn ensure_import_item(&mut self, index: UseItemIndex) {
 		match self.item_state[usize::from(index)].poll() {
 			ResolveStep::Ready(_) => return,
 			ResolveStep::Cycle => {
 				let item = &self.use_items[usize::from(index)];
 				let namespace = item.namespace;
-				let file_id = self.namespaces[usize::from(namespace)].file_id;
 				match item.kind {
 					UseItemKind::Name { name, alias, .. } => {
 						let local_name = alias.unwrap_or(name);
 						let visibility = Visibility::from(item.pub_span);
-						let diagnostic = self.report_use_cycle(
-							SourceSpan::new(file_id, name.span),
+
+						// `index`'s own (still-paused, outer) call already
+						// pushed it here before ever reaching this
+						// re-entrant one, so it's always found.
+						let pos = self
+							.resolve_stack
+							.iter()
+							.position(|&stacked| stacked == index)
+							.expect(
+								"an item whose poll() just found itself \
+								 Resolving must already be on resolve_stack",
+							);
+						let diagnostic = self.report_cyclic_import(
+							"cyclic import",
+							"this import depends on itself",
+							&self.resolve_stack[pos..],
 						);
 						self.diagnostics.push(diagnostic);
+
 						self.insert_binding(
 							namespace,
 							BindingKey::ty(local_name.inner),
@@ -254,45 +269,62 @@ impl<'r> ImportResolver<'r> {
 							local_name.span,
 						);
 					}
-					// No binding to poison — a glob never installs one. The
-					// cyclic edge just stops contributing further; the
-					// plain (non-`pub`) fallback registration, if it
-					// already happened, is untouched.
-					UseItemKind::Glob { span, .. } => {
-						let diagnostic = self
-							.report_use_cycle(SourceSpan::new(file_id, span));
-						self.diagnostics.push(diagnostic);
-					}
+					// A glob item is never re-entered through this generic
+					// path: `compute_glob_import` chases a target's globs
+					// through `resolve_stack`, not `ensure_import_item`,
+					// checking for re-entrancy itself *before* ever calling
+					// back in — see `glob_cycle_is_unsafe`. So by the time
+					// `ensure_import_item` would poll a glob item that's
+					// already `Resolving`, something upstream failed to
+					// guard against it.
+					UseItemKind::Glob { .. } => unreachable!(
+						"glob cycles are detected and reported via \
+						 resolve_stack in compute_glob_import, not here"
+					),
 				}
 				return;
 			}
 			ResolveStep::Proceed => {}
 		}
 
-		self.compute_use_item(index);
+		self.resolve_stack.push(index);
+		self.compute_import_item(index);
+		self.resolve_stack.pop();
 		let _ = self.item_state[usize::from(index)].finish(Ok(()));
 	}
 
-	/// The actual named-import resolution logic — free to `return` early on
-	/// failure, since `ensure_use_item` above is the only thing that
-	/// touches `item_state` and marks the item resolved after this returns.
-	fn compute_use_item(&mut self, index: UseItemIndex) {
+	/// Dispatches to whichever kind `index` actually is — `ensure_import_item`
+	/// is the only thing that touches `item_state` and marks the item
+	/// resolved once this returns, so both `compute_*` functions below are
+	/// free to `return` early on failure.
+	fn compute_import_item(&mut self, index: UseItemIndex) {
 		let item = &self.use_items[usize::from(index)];
-		let namespace = item.namespace;
-		let (name, alias, prefix) = match item.kind {
+		match item.kind {
 			UseItemKind::Name {
 				name,
 				alias,
 				prefix,
-			} => (name, alias, prefix),
+			} => self.compute_named_import(index, name, alias, prefix),
 			UseItemKind::Glob { path, .. } => {
-				return self.compute_glob_item(index, path);
+				self.compute_glob_import(index, path);
 			}
-		};
+		}
+	}
+
+	/// The actual named-import resolution logic.
+	fn compute_named_import(
+		&mut self,
+		index: UseItemIndex,
+		name: Spanned<SymbolU32>,
+		alias: Option<Spanned<SymbolU32>>,
+		prefix: Option<UsePathIndex>,
+	) {
+		let item = &self.use_items[usize::from(index)];
+		let namespace = item.namespace;
 
 		let scope = match prefix {
 			Some(prefix) => {
-				match self.ensure_use_path(namespace, prefix, index) {
+				match self.ensure_import_path(namespace, prefix, index) {
 					Ok(ImportScope::Namespace(ns)) => ns,
 					Err(()) => return,
 				}
@@ -302,16 +334,18 @@ impl<'r> ImportResolver<'r> {
 			None => namespace,
 		};
 
-		// Force any not-yet-resolved `use` in `scope` that could produce
-		// this name to resolve first — it might be a re-export chain that
-		// hasn't installed its binding into `scope`'s bindings yet. Skips
-		// its own index: a bare, unaliased `use foo;` registers itself
-		// under the very key it then searches for, so without this it
-		// would always find itself as a "candidate" and force itself
-		// while still `Resolving`, reporting a spurious cycle for what is
-		// really just "nothing else defines this name" (a genuine cycle
-		// still gets caught — that self-match only ever comes from
-		// another item's own chain looping back, never from this one).
+		// Force any not-yet-resolved `use` in `scope` first — it might be
+		// a re-export chain that hasn't installed its binding yet:
+		//
+		//   use inner::helper;
+		//   mod inner { pub use other::helper; }
+		//
+		// Skips its own index: a bare `use foo;` binds under the very
+		// key "foo" it then searches for, so without the skip it would
+		// always find itself `Resolving` and report a spurious cycle for
+		// what's really just "nothing else defines this name" (a genuine
+		// cycle still gets caught — that only ever comes from another
+		// item's chain looping back, never from this one).
 		if let Some(candidates) =
 			self.pending_named_imports.get(&(scope, name.inner))
 		{
@@ -342,7 +376,7 @@ impl<'r> ImportResolver<'r> {
 					}
 				}
 
-				self.ensure_use_item(candidate);
+				self.ensure_import_item(candidate);
 			}
 		}
 
@@ -454,43 +488,141 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	/// The actual glob-import resolution logic. A plain `use path::*;` just
-	/// resolves its path and records a lookup-time fallback edge — nothing
-	/// else here can fail or cycle, since nothing downstream of it depends
-	/// on what it produces. A `pub use path::*;` additionally has to make
-	/// the target's own `pub` globs resolve first, because *this*
-	/// namespace's re-export surface now includes theirs — and that
-	/// recursion, through `ensure_use_item`, is where a genuine re-export
-	/// cycle gets caught, via the same cycle detection path resolution
-	/// already relies on.
-	fn compute_glob_item(&mut self, index: UseItemIndex, path: UsePathIndex) {
+	/// The actual glob-import resolution logic. Resolves the glob's own
+	/// path, then — `pub` or not — forces every glob `target` itself
+	/// declares to resolve first, because `indirect_lookup` will walk
+	/// straight through this edge into `target`'s own glob edges later,
+	/// regardless of either one's visibility. That chase, via
+	/// `resolve_stack` rather than `ensure_import_item`'s generic re-entrancy
+	/// check, is where a cyclic glob graph is caught — and, unlike a cyclic
+	/// named import, *not every* glob cycle is actually dangerous to leave
+	/// standing (see `glob_cycle_is_unsafe`), so only the unsafe ones stop
+	/// this edge from ever being recorded into `glob_imports` at all.
+	/// That's what makes `indirect_lookup`'s own "terminates because a
+	/// cycle can't reach here" assumption actually true, instead of merely
+	/// hoped for.
+	fn compute_glob_import(&mut self, index: UseItemIndex, path: UsePathIndex) {
 		let item = &self.use_items[usize::from(index)];
 		let namespace = item.namespace;
-		let is_pub = item.pub_span.is_some();
 
 		let Ok(ImportScope::Namespace(target)) =
-			self.ensure_use_path(namespace, path, index)
+			self.ensure_import_path(namespace, path, index)
 		else {
 			return;
 		};
 
+		let mut unsafe_cycle = false;
+		if let Some(candidates) = self.pending_glob_targets.get(&target) {
+			for candidate in candidates {
+				// O(1) first: `item_state[candidate] == Resolving` iff
+				// `candidate` is on `resolve_stack` right now — the two are
+				// pushed/popped in lockstep around the exact same
+				// `poll()`/`finish()` window in `ensure_import_item` — so this
+				// is exactly as accurate as searching the stack directly,
+				// just without walking it for every candidate examined,
+				// cyclic or not (the overwhelmingly common case).
+				if matches!(
+					self.item_state[usize::from(candidate)],
+					ResolveStatus::Resolving
+				) {
+					let pos = self
+						.resolve_stack
+						.iter()
+						.position(|&stacked| stacked == candidate)
+						.expect(
+							"item_state and resolve_stack are kept in \
+							 lockstep, so a Resolving item is always found \
+							 here",
+						);
+					if self.glob_cycle_is_unsafe(&self.resolve_stack[pos..]) {
+						let diagnostic = self.report_cyclic_import(
+							"cyclic glob import",
+							"this glob import depends on itself",
+							&self.resolve_stack[pos..],
+						);
+						self.diagnostics.push(diagnostic);
+						unsafe_cycle = true;
+					}
+					// A safe cycle needs nothing further here: `candidate`
+					// is already mid-resolution further up this very
+					// stack, and that frame will record its own edge (or
+					// not) once it gets back control.
+					continue;
+				}
+				self.ensure_import_item(candidate);
+			}
+		}
+
+		if unsafe_cycle {
+			// Recording this edge would put the exact cycle just diagnosed
+			// into `glob_imports` for `indirect_lookup` to walk into later.
+			return;
+		}
 		self.namespaces[usize::from(namespace)]
 			.glob_imports
 			.push(GlobImport {
 				use_item: index,
 				namespace: target,
 			});
+	}
 
-		if !is_pub {
-			return;
+	/// Whether some accessor could actually walk `cycle` forever through
+	/// `indirect_lookup` — if not, it's safe to leave the edge that closes
+	/// it standing rather than reject it. A `pub` edge is crossable by
+	/// any accessor; a `private` edge only by one already inside its
+	/// declaring namespace. Two siblings privately glob-importing each
+	/// other are safe — no accessor is ever inside both at once:
+	///
+	///   mod a { use crate::b::*; }
+	///   mod b { use crate::a::*; }
+	///
+	/// Nest one inside the other and it's unsafe — an accessor inside
+	/// `inner` is automatically inside `a` too, satisfying both edges:
+	///
+	///   mod a {
+	///       use crate::a::inner::*;
+	///       mod inner { use super::*; }
+	///   }
+	///
+	/// Checked with a single running-`deepest` fold rather than a full
+	/// pairwise comparison: on a tree, anything ancestor-or-descendant of
+	/// a common `deepest` is automatically ancestor-or-descendant of
+	/// everything else already folded in, so one incomparable pair
+	/// against `deepest` is enough to prove the whole set isn't a chain.
+	fn glob_cycle_is_unsafe(&self, cycle: &[UseItemIndex]) -> bool {
+		let mut deepest: Option<NamespaceIndex> = None;
+		for use_item in cycle.iter().copied() {
+			let item = &self.use_items[usize::from(use_item)];
+			if item.pub_span.is_some() {
+				continue;
+			}
+			let candidate = item.namespace;
+			deepest = Some(match deepest {
+				None => candidate,
+				Some(deepest)
+					if self
+						.namespaces
+						.namespace_contains(candidate, deepest) =>
+				{
+					deepest
+				}
+				Some(deepest)
+					if self
+						.namespaces
+						.namespace_contains(deepest, candidate) =>
+				{
+					candidate
+				}
+				// Two private edges on separate branches: no single
+				// accessor can be inside both namespaces at once, so this
+				// cycle can never actually be walked.
+				Some(_) => return false,
+			});
 		}
-		let Some(candidates) = self.pending_pub_glob_reexports.get(&target)
-		else {
-			return;
-		};
-		for candidate in candidates {
-			self.ensure_use_item(candidate);
-		}
+		// Either no private edges at all (an all-`pub` cycle, walkable by
+		// any accessor), or every private edge's namespace lies on one
+		// straight ancestor chain (walkable by `deepest` itself).
+		true
 	}
 
 	/// A single `BindingKey` slot lookup — deliberately simpler than
@@ -512,9 +644,9 @@ impl<'r> ImportResolver<'r> {
 
 		let (target, visibility) = match self.namespaces.lookup(
 			self.use_items,
+			accessor,
 			scope,
 			key,
-			accessor,
 		) {
 			BindingLookup::NotFound => return ImportSlot::Absent,
 			BindingLookup::Found(target, visibility) => (target, visibility),
@@ -575,7 +707,7 @@ impl<'r> ImportResolver<'r> {
 		slot
 	}
 
-	fn ensure_use_path(
+	fn ensure_import_path(
 		&mut self,
 		origin: NamespaceIndex,
 		path: UsePathIndex,
@@ -584,27 +716,37 @@ impl<'r> ImportResolver<'r> {
 		match self.path_state[usize::from(path)].poll() {
 			ResolveStep::Ready(result) => return result,
 			ResolveStep::Cycle => {
+				// A path-segment cycle, not an item cycle — `path_state` is
+				// keyed by `UsePathIndex`, which a segment can share across
+				// several items (`use a::{b, c};`), so there's no single
+				// `resolve_stack` frame to build a full-chain report from.
 				let segment = self.use_paths[usize::from(path)];
 				let file_id = self.namespaces[usize::from(origin)].file_id;
-				let diagnostic = self.report_use_cycle(SourceSpan::new(
-					file_id,
-					segment.segment.span,
-				));
+				let diagnostic = Diagnostic::error()
+					.with_code(DiagnosticCode::CyclicImport.code())
+					.with_message("cyclic import")
+					.with_label(
+						SourceSpan::new(file_id, segment.segment.span)
+							.primary_label()
+							.with_message(
+								"import resolution cycles back to itself here",
+							),
+					);
 				self.diagnostics.push(diagnostic);
 				return Err(());
 			}
 			ResolveStep::Proceed => {}
 		}
 
-		let result = self.compute_use_path(origin, path, current_item);
+		let result = self.compute_import_path(origin, path, current_item);
 		self.path_state[usize::from(path)].finish(result)
 	}
 
 	/// The actual path-segment resolution logic, free to `match`/return
-	/// however it likes — `ensure_use_path` above is the only thing that
+	/// however it likes — `ensure_import_path` above is the only thing that
 	/// touches `path_state`, and it always feeds this function's result to
 	/// `finish`, so nothing here can leave a slot stuck `Resolving`.
-	fn compute_use_path(
+	fn compute_import_path(
 		&mut self,
 		origin: NamespaceIndex,
 		path: UsePathIndex,
@@ -617,7 +759,7 @@ impl<'r> ImportResolver<'r> {
 			}
 			Some(parent) => {
 				let parent_scope =
-					self.ensure_use_path(origin, parent, current_item)?;
+					self.ensure_import_path(origin, parent, current_item)?;
 				self.resolve_import_scope_member(
 					origin,
 					parent_scope,
@@ -631,7 +773,7 @@ impl<'r> ImportResolver<'r> {
 	/// One step further down an already-resolved scope — looks up `path`'s
 	/// own segment inside `scope` itself, rather than `origin`. Used for
 	/// every path segment after the first; the first segment is looked up
-	/// directly in `origin`'s own bindings by `compute_use_path`'s `None`
+	/// directly in `origin`'s own bindings by `compute_import_path`'s `None`
 	/// branch, since there's no prior scope yet to look inside of.
 	fn resolve_import_scope_member(
 		&mut self,
@@ -647,7 +789,7 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	/// Looks up `path`'s own segment in `declaring_namespace`'s bindings,
+	/// Looks up `path`'s own segment in `target_namespace`'s bindings,
 	/// records both kinds of access (the binding slot itself, and — if it
 	/// points to a real def — the def), and validates it as a walkable
 	/// scope. `accessor` is who's asking, for the visibility check and for
@@ -661,7 +803,7 @@ impl<'r> ImportResolver<'r> {
 	/// forcing *that one* would just be forcing itself mid-resolution.
 	fn binding_to_import_scope(
 		&mut self,
-		declaring_namespace: NamespaceIndex,
+		target_namespace: NamespaceIndex,
 		accessor: NamespaceIndex,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
@@ -670,23 +812,23 @@ impl<'r> ImportResolver<'r> {
 		let key = BindingKey::ty(segment.segment.inner);
 
 		// Force any not-yet-resolved `use` that might install this exact
-		// name in `declaring_namespace` first — same reasoning as leaf
-		// resolution's own forcing in `compute_use_item`: a path prefix
-		// can just as well be a `use`-created alias (not yet installed
-		// only because its own item hasn't run yet) as a directly
-		// declared `mod`, and the two must be equally order-independent.
-		// Skips `current_item`: e.g. `use x::x;` registers itself as a
-		// candidate for its own prefix segment "x", and forcing it here
-		// would just be forcing this same resolution from inside itself —
-		// a spurious cycle, not a real one, since nothing else claims "x"
-		// either (same reasoning as the leaf-level self-skip).
+		// name first — a path prefix can be a `use`-created alias, not
+		// just a direct `mod`, and the two must resolve in either order:
+		//
+		//   use alias::helper;
+		//   use real as alias;
+		//   mod real { pub fn helper() {} }
+		//
+		// Skips `current_item`: `use x::x;` registers itself as a
+		// candidate for its own prefix segment "x", so forcing it here
+		// would just be forcing this same resolution from inside itself.
 		if let Some(candidates) = self
 			.pending_named_imports
-			.get(&(declaring_namespace, segment.segment.inner))
+			.get(&(target_namespace, segment.segment.inner))
 		{
 			for candidate in candidates {
 				if candidate != current_item {
-					self.ensure_use_item(candidate);
+					self.ensure_import_item(candidate);
 				}
 			}
 		}
@@ -698,9 +840,9 @@ impl<'r> ImportResolver<'r> {
 
 		let (target, visibility) = match self.namespaces.lookup(
 			self.use_items,
-			declaring_namespace,
-			key,
 			accessor,
+			target_namespace,
+			key,
 		) {
 			BindingLookup::NotFound => {
 				let diagnostic = self.report_unresolved_import(
@@ -727,7 +869,7 @@ impl<'r> ImportResolver<'r> {
 			}
 		};
 		self.namespaces.record_binding_access(
-			declaring_namespace,
+			target_namespace,
 			key,
 			source_span,
 		);
@@ -740,7 +882,7 @@ impl<'r> ImportResolver<'r> {
 
 		if !self.namespaces.is_accessible_from(
 			accessor,
-			declaring_namespace,
+			target_namespace,
 			visibility,
 		) {
 			// Reported here and now, not deferred like a leaf's
@@ -778,10 +920,12 @@ impl<'r> ImportResolver<'r> {
 	/// Reconstructs the literal `::`-joined text of a `use` path prefix, as
 	/// the user wrote it, from `path`'s root down to (but not including) the
 	/// segment that failed — purely for naming what was searched in a
-	/// diagnostic; nothing else needs this text.
-	fn use_path_text(&self, path: Option<UsePathIndex>) -> String {
+	/// diagnostic; nothing else needs this text. A bare leaf with no prefix
+	/// at all has no `path` to pass here — callers handle that `None` case
+	/// themselves, since an empty path has nothing for this to walk.
+	fn format_import_path(&self, path: UsePathIndex) -> String {
 		let mut segments = Vec::new();
-		let mut current = path;
+		let mut current = Some(path);
 		while let Some(index) = current {
 			let segment = self.use_paths[usize::from(index)];
 			segments.push(self.strings.resolve(segment.segment.inner).unwrap());
@@ -798,16 +942,15 @@ impl<'r> ImportResolver<'r> {
 		span: SourceSpan,
 	) -> Diagnostic<FileId> {
 		let name = self.strings.resolve(name).unwrap();
-		let prefix_text = self.use_path_text(prefix);
-		let full_path = if prefix_text.is_empty() {
-			name.to_string()
-		} else {
-			format!("{prefix_text}::{name}")
-		};
-		let label_message = if prefix_text.is_empty() {
-			"not found in this module".to_string()
-		} else {
-			format!("no `{name}` in `{prefix_text}`")
+		let (full_path, label_message) = match prefix {
+			Some(prefix) => {
+				let prefix_text = self.format_import_path(prefix);
+				(
+					format!("{prefix_text}::{name}"),
+					format!("no `{name}` in `{prefix_text}`"),
+				)
+			}
+			None => (name.to_string(), "not found in this module".to_string()),
 		};
 		Diagnostic::error()
 			.with_code(DiagnosticCode::UnresolvedImport.code())
@@ -844,15 +987,78 @@ impl<'r> ImportResolver<'r> {
 			)
 	}
 
-	fn report_use_cycle(&self, span: SourceSpan) -> Diagnostic<FileId> {
-		Diagnostic::error()
+	/// The label for one frame of a reported cycle: the source path it's
+	/// importing from, not the local name it binds:
+	///
+	///   mod a { pub use super::b::x; }
+	///   mod b { pub use super::a::x; }
+	///
+	/// Both bind the local name `x`, so showing that would read as
+	/// `x -> x -> x`; the source path (`super::b::x`, `super::a::x`) is
+	/// what actually tells the two hops apart. A glob has no local name
+	/// to fall back on anyway, so this keeps named leaves consistent.
+	fn cycle_frame_label(&self, index: UseItemIndex) -> (String, SourceSpan) {
+		let item = &self.use_items[usize::from(index)];
+		let file_id = self.namespaces[usize::from(item.namespace)].file_id;
+		match item.kind {
+			UseItemKind::Name { name, prefix, .. } => {
+				let leaf = self.strings.resolve(name.inner).unwrap();
+				let text = match prefix {
+					Some(prefix) => {
+						format!("{}::{leaf}", self.format_import_path(prefix))
+					}
+					None => leaf.to_string(),
+				};
+				(text, SourceSpan::new(file_id, name.span))
+			}
+			UseItemKind::Glob { path, span } => {
+				let text = format!("{}::*", self.format_import_path(path));
+				(text, SourceSpan::new(file_id, span))
+			}
+		}
+	}
+
+	/// Reports a cyclic import, naming every item in the loop rather than
+	/// only the edge that happened to close it (mirrors
+	/// `report_cyclic_type_dependency`'s use of `sig_stack`, on signature
+	/// cycles). Shared by named-leaf and glob cycles, which differ only in
+	/// wording, not shape — callers pass `message`/`primary_label`
+	/// directly rather than this function reconstructing them from a
+	/// flag. `frames` is the cycle as `resolve_stack` recorded it.
+	fn report_cyclic_import(
+		&self,
+		message: &str,
+		primary_label: &str,
+		frames: &[UseItemIndex],
+	) -> Diagnostic<FileId> {
+		let (first_text, first_span) = self.cycle_frame_label(frames[0]);
+		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CyclicImport.code())
-			.with_message("cyclic import")
-			.with_label(
-				span.primary_label().with_message(
-					"import resolution cycles back to itself here",
-				),
-			)
+			.with_message(message)
+			.with_label(first_span.primary_label().with_message(primary_label));
+
+		let mut texts = Vec::with_capacity(frames.len());
+		texts.push(first_text);
+		for &frame in &frames[1..] {
+			let (text, span) = self.cycle_frame_label(frame);
+			diagnostic = diagnostic.with_label(
+				span.secondary_label().with_message("through here"),
+			);
+			texts.push(text);
+		}
+
+		// A cycle closes back onto its first item, so that name repeats at
+		// the end. Only worth spelling out once two items are involved — a
+		// self-referential one is already clear from its single label.
+		if texts.len() > 1 {
+			diagnostic = diagnostic.with_note(format!(
+				"cycle: `{}` -> `{}`",
+				texts.join("` -> `"),
+				texts[0],
+			));
+		}
+
+		diagnostic
 	}
 
 	fn report_private_reexport(
@@ -889,15 +1095,25 @@ impl<'r> ImportResolver<'r> {
 			.with_code(DiagnosticCode::AmbiguousReexport.code())
 			.with_message(format!("`{resolved_name}` is ambiguous"))
 			.with_label(span.primary_label().with_message("ambiguous name"));
-		for (_, candidate_span) in candidates {
+		for (index, (target, candidate_span)) in candidates.iter().enumerate() {
+			let def_key = target.def_key().expect(
+				"an ambiguity candidate always carries a real DefKey — \
+				 CandidateMerge::push never lets a BindingTarget::Error \
+				 become one",
+			);
+			let noun = self.namespaces[usize::from(def_key.namespace_idx)]
+				.items[usize::from(def_key.def_idx)]
+			.kind
+			.noun();
+			let also = if index == 0 { "" } else { "also " };
 			diagnostic = diagnostic.with_label(
 				candidate_span.secondary_label().with_message(format!(
-					"`{resolved_name}` could refer to the item re-exported here"
+					"could {also}refer to the {noun} imported here"
 				)),
 			);
 		}
 		diagnostic.with_note(format!(
-			"consider adding an explicit `use` of `{resolved_name}` to disambiguate"
+			"consider adding an explicit import of `{resolved_name}` to disambiguate"
 		))
 	}
 }
@@ -922,20 +1138,7 @@ mod tests {
 	}
 
 	impl TestCase {
-		fn new(source: &str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
-			builder.load_stdlib();
-			let root_id = builder
-				.load_binary(
-					vfs::AbsolutePath::new("/main.wx"),
-					&vfs::VirtualFileSource::from_relative(HashMap::from([(
-						"main.wx".to_string(),
-						source.to_string(),
-					)])),
-				)
-				.unwrap();
-			let mut graph = builder.build(root_id);
-
+		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
 			let mut diagnostics = Vec::new();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
@@ -954,6 +1157,36 @@ mod tests {
 				defs,
 				diagnostics,
 			}
+		}
+
+		fn new(source: &str) -> Self {
+			let mut builder = vfs::CompilationUnitBuilder::new();
+			builder.load_stdlib();
+			let root_id = builder
+				.load_binary(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)])),
+				)
+				.unwrap();
+			Self::from_graph(builder.build(root_id))
+		}
+
+		fn new_workspace(
+			entry_path: vfs::AbsolutePath,
+			workspace: HashMap<vfs::AbsolutePath, String>,
+		) -> Self {
+			let mut builder = vfs::CompilationUnitBuilder::new();
+			builder.load_stdlib();
+			let root_id = builder
+				.load_binary(
+					entry_path,
+					&vfs::VirtualFileSource::new(workspace),
+				)
+				.unwrap();
+			Self::from_graph(builder.build(root_id))
 		}
 
 		fn root_namespace(&self) -> NamespaceIndex {
@@ -1048,6 +1281,42 @@ mod tests {
 			case.lookup_value(root, "helper")
 		else {
 			panic!("`use inner::helper;` should install a binding at the root");
+		};
+		assert_eq!(imported, original);
+	}
+
+	/// Every other test in this module resolves within a single virtual
+	/// file, same as `mod { ... }` blocks — this pins down that a `use`
+	/// target behind a `mod math;` file declaration resolves exactly the
+	/// same way across the file boundary.
+	#[test]
+	fn use_resolves_a_name_declared_in_another_file() {
+		let mut case = TestCase::new_workspace(
+			vfs::AbsolutePath::new("/main.wx"),
+			HashMap::from([
+				(
+					vfs::AbsolutePath::new("/main.wx"),
+					"mod math;\nuse math::add;".to_string(),
+				),
+				(
+					vfs::AbsolutePath::new("/math.wx"),
+					"pub fn add() -> i32 { 1 }".to_string(),
+				),
+			]),
+		);
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let math = case.child_namespace(root, "math");
+		let Some(BindingTarget::Accessible(original)) =
+			case.lookup_value(math, "add")
+		else {
+			panic!("`math::add` should resolve directly");
+		};
+		let Some(BindingTarget::Accessible(imported)) =
+			case.lookup_value(root, "add")
+		else {
+			panic!("`use math::add;` should resolve across the file boundary");
 		};
 		assert_eq!(imported, original);
 	}
@@ -1254,6 +1523,13 @@ mod tests {
 		);
 	}
 
+	/// Covers three properties of the same mutually-recursive re-export at
+	/// once (previously three separate tests, each compiling this identical
+	/// fixture on its own): the diagnostic's message, that a cycle does not
+	/// also cascade into a spurious "unresolved import" for one of its own
+	/// participants while the resolver unwinds it, and that the note names
+	/// each hop by its source path (not the shared local name `x`, which
+	/// would tell a reader nothing about which `x` is which).
 	#[test]
 	fn mutually_recursive_reexports_report_cyclic_import() {
 		let case = TestCase::new(indoc! {"
@@ -1267,28 +1543,19 @@ mod tests {
 		"});
 
 		case.diagnostics()
-			.assert_error_with(DiagnosticCode::CyclicImport, |diagnostic| {
-				assert_eq!(diagnostic.message, "cyclic import")
-			});
-	}
-
-	/// A cycle is already the root cause. It should not also make one of its
-	/// participants look like an independently missing name while the resolver
-	/// unwinds the cycle.
-	#[test]
-	fn cyclic_reexports_do_not_cascade_into_unresolved_import() {
-		let case = TestCase::new(indoc! {"
-			mod a {
-				pub use super::b::x;
-			}
-
-			mod b {
-				pub use super::a::x;
-			}
-		"});
-
-		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CyclicImport]);
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::CyclicImport,
+			|diagnostic| {
+				assert_eq!(diagnostic.message, "cyclic import");
+				assert!(
+					diagnostic.notes.iter().any(|note| note
+						== "cycle: `super::b::x` -> `super::a::x` -> `super::b::x`"),
+					"expected the full chain in a note, got: {:?}",
+					diagnostic.notes
+				);
+			},
+		);
 	}
 
 	#[test]
@@ -1693,24 +1960,6 @@ mod tests {
 	}
 
 	#[test]
-	fn mutually_pub_globs_report_cyclic_import() {
-		let case = TestCase::new(indoc! {"
-			mod a {
-				pub use crate::b::*;
-			}
-
-			mod b {
-				pub use crate::a::*;
-			}
-		"});
-
-		case.diagnostics()
-			.assert_error_with(DiagnosticCode::CyclicImport, |diagnostic| {
-				assert_eq!(diagnostic.message, "cyclic import")
-			});
-	}
-
-	#[test]
 	fn self_targeting_pub_glob_reports_cyclic_import() {
 		let case = TestCase::new(indoc! {"
 			pub use crate::*;
@@ -1817,6 +2066,47 @@ mod tests {
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AmbiguousReexport]);
+	}
+
+	#[test]
+	fn ambiguous_reexport_names_each_candidates_def_kind() {
+		// A function and a constant, not two functions, so the "function"
+		// vs "constant" wording is actually exercised.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				pub const pick: i32 = 2;
+			}
+			mod hub {
+				pub use crate::a::*;
+				pub use crate::b::*;
+			}
+			use hub::pick;
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::AmbiguousReexport,
+			|diagnostic| {
+				let secondary: Vec<_> = diagnostic
+					.labels
+					.iter()
+					.filter(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Secondary
+					})
+					.map(|label| label.message.as_str())
+					.collect();
+				assert_eq!(
+					secondary,
+					vec![
+						"could refer to the function imported here",
+						"could also refer to the constant imported here",
+					]
+				);
+			},
+		);
 	}
 
 	#[test]
@@ -1994,5 +2284,439 @@ mod tests {
 			case.lookup_value(root, "X"),
 			Some(BindingTarget::Accessible(_))
 		));
+	}
+
+	#[test]
+	fn glob_of_unresolved_path_reports_unresolved_import() {
+		// A glob's own path is resolved eagerly, same as a named import's —
+		// only *ambiguity between candidates* is on-demand, not the path
+		// itself. `math` exists but `inner` doesn't, so this must report
+		// exactly like the named-import equivalent
+		// (`unresolved_leaf_reports_unresolved_import`) does.
+		let case = TestCase::new(indoc! {"
+			mod math {
+				pub fn helper() -> i32 { 1 }
+			}
+
+			use math::inner::*;
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::UnresolvedImport,
+			|diagnostic| {
+				assert_eq!(
+					diagnostic.message,
+					"unresolved import `math::inner`"
+				);
+				assert!(
+					diagnostic
+						.labels
+						.iter()
+						.any(|label| label.message == "no `inner` in `math`"),
+					"{:#?}",
+					diagnostic.labels
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn glob_of_non_module_path_reports_not_a_namespace() {
+		// Mirrors `non_module_path_prefix_reports_not_a_namespace`, but for
+		// a glob's own path rather than a named leaf's prefix.
+		let case = TestCase::new(indoc! {"
+			struct Helper { x: i32 }
+
+			use Helper::*;
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::NotANamespace,
+			|diagnostic| {
+				assert_eq!(diagnostic.message, "`Helper` is not a module")
+			},
+		);
+	}
+
+	#[test]
+	fn named_use_silently_wins_over_a_colliding_pub_glob() {
+		// Mirrors `local_definition_silently_wins_over_a_colliding_pub_glob`,
+		// but the shadowing declaration is itself a `use` rather than a
+		// direct definition. A named `use` and a direct item both install a
+		// *direct* binding via `insert_binding`, and `lookup` only ever
+		// falls back to a glob's fallback edge when no direct binding
+		// exists — so this should resolve to `b::pick` without a
+		// duplicate-definition or ambiguity diagnostic, the same way the
+		// direct-definition case does.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				pub fn pick() -> i32 { 2 }
+			}
+			pub use a::*;
+			use b::pick;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let b = case.child_namespace(root, "b");
+		let Some(BindingTarget::Accessible(b_pick)) =
+			case.lookup_value(b, "pick")
+		else {
+			panic!("`b::pick` should resolve directly");
+		};
+		let Some(BindingTarget::Accessible(resolved)) =
+			case.lookup_value(root, "pick")
+		else {
+			panic!(
+				"`use b::pick;` should win over the colliding `pub use a::*;`"
+			);
+		};
+		assert_eq!(resolved, b_pick);
+	}
+
+	#[test]
+	fn unreferenced_ambiguous_glob_names_report_nothing() {
+		// Same shape as `two_pub_globs_disagreeing_on_a_name_report_ambiguous_reexport`,
+		// but nothing ever consults `hub::pick` — no `use hub::pick;`, no
+		// other reference. Ambiguity between glob candidates is only ever
+		// computed on demand (inside `resolve_member_def`/
+		// `binding_to_import_scope`, both driven by an actual lookup), so
+		// two globs merely *disagreeing* on a name, unreferenced, must
+		// produce no diagnostic at all — matching rustc, where an ambiguous
+		// glob import (E0659) is only ever reported at a use site.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub fn pick() -> i32 { 1 }
+			}
+			mod b {
+				pub fn pick() -> i32 { 2 }
+			}
+			mod hub {
+				pub use crate::a::*;
+				pub use crate::b::*;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+	}
+
+	#[test]
+	fn three_way_mutual_pub_globs_report_cyclic_import() {
+		// Cycle detection is generic per-item `Resolving` state, not
+		// pairwise special-cased — worth checking it still finds exactly
+		// one cycle, not three (one per participant), once the loop has
+		// three hops instead of two.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use crate::b::*;
+			}
+			mod b {
+				pub use crate::c::*;
+			}
+			mod c {
+				pub use crate::a::*;
+			}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
+	}
+
+	#[test]
+	fn use_group_with_glob_branch_binds_every_name() {
+		// `scan_use_tree`'s `Group` arm recurses into `Name`, `Path`,
+		// `Group` and `Glob` branches alike — this exercises a glob branch
+		// sitting alongside a named one in the same group.
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				pub mod b {
+					pub fn helper() -> i32 { 1 }
+				}
+				pub fn c() -> i32 { 2 }
+			}
+			use a::{b::*, c};
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		assert!(
+			matches!(
+				case.lookup_value(root, "c"),
+				Some(BindingTarget::Accessible(_))
+			),
+			"the named branch of the group should install a direct binding"
+		);
+
+		let a = case.child_namespace(root, "a");
+		let b = case.child_namespace(a, "b");
+		assert_eq!(
+			case.glob_targets(root),
+			vec![b],
+			"the glob branch of the group should record its own fallback edge"
+		);
+	}
+
+	#[test]
+	fn nested_self_targeting_pub_glob_reports_cyclic_import() {
+		// Extends `self_targeting_pub_glob_reports_cyclic_import` (root
+		// only) to a non-root namespace, checking that `self` resolves to
+		// the enclosing namespace itself in the general case, not just at
+		// the package root.
+		let case = TestCase::new(indoc! {"
+			mod inner {
+				pub use self::*;
+			}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
+	}
+
+	#[test]
+	fn self_targeting_private_glob_reports_cyclic_import() {
+		// The private counterpart of `self_targeting_pub_glob_reports_cyclic_import`.
+		// A self-glob is always a genuine cycle regardless of visibility —
+		// `namespace_contains(inner, inner)` trivially holds, so *any*
+		// accessor already inside `inner` (including `inner` itself) can
+		// walk this edge forever. This used to overflow the stack instead
+		// of reaching this diagnostic, since nothing stopped the
+		// self-referential edge from ever being recorded.
+		let case = TestCase::new(indoc! {"
+			mod inner {
+				use self::*;
+				use undefined_name;
+			}
+		"});
+
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CyclicImport,
+			DiagnosticCode::UnresolvedImport,
+		]);
+	}
+
+	#[test]
+	fn mutually_pub_globs_do_not_overflow_when_actually_looked_up() {
+		// `mutually_pub_globs_report_cyclic_import` only checks that the
+		// cycle itself is diagnosed; it never exercises a lookup that would
+		// actually walk `glob_imports` through the pair. Doing so used to
+		// overflow the stack, because the old pub-only cycle chase reported
+		// a diagnostic without ever stopping the cyclic edge from being
+		// recorded — `indirect_lookup` had nothing stopping it from walking
+		// straight back and forth between `a` and `b` forever.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use crate::b::*;
+			}
+			mod b {
+				pub use crate::a::*;
+			}
+			use a::whatever;
+		"});
+
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CyclicImport,
+			DiagnosticCode::UnresolvedImport,
+		]);
+	}
+
+	#[test]
+	fn nested_mutual_private_globs_report_cyclic_import() {
+		// Unlike `mutually_private_globs_are_not_a_cycle`'s siblings, `a`
+		// and `inner` here are nested (`inner` is a descendant of `a`) —
+		// so an accessor inside `inner` satisfies *both* edges' private
+		// containment check at once (`inner` is inside `a`'s subtree, and
+		// trivially inside its own), and the walk can loop forever. This
+		// is exactly the shape `mutually_private_globs_are_not_a_cycle`
+		// deliberately avoids by keeping the two namespaces as siblings.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				use crate::a::inner::*;
+				mod inner {
+					use super::*;
+					use undefined_name;
+				}
+			}
+		"});
+
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CyclicImport,
+			DiagnosticCode::UnresolvedImport,
+		]);
+	}
+
+	#[test]
+	fn sibling_private_globs_still_resolve_a_name_without_overflow() {
+		// Extends `mutually_private_globs_are_not_a_cycle` with an actual
+		// lookup through the pair (a plain, still-legal case per the
+		// language design: sibling private glob cycles are never walkable
+		// by any single accessor, so they're deliberately left standing).
+		let mut case = TestCase::new(indoc! {"
+			mod a {
+				use crate::b::*;
+				pub fn only_in_a() -> i32 { 1 }
+			}
+			mod b {
+				use crate::a::*;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let b = case.child_namespace(root, "b");
+		assert_eq!(case.glob_targets(a), vec![b]);
+		assert_eq!(case.glob_targets(b), vec![a]);
+	}
+
+	#[test]
+	fn cyclic_named_reexports_report_the_full_loop() {
+		// Aliased in both directions — the label shows each frame's
+		// *source* path (`super::b::y`, `super::a::x`), not the local
+		// name it's renamed to on arrival, since the source is what
+		// actually explains the dependency between the two hops.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use super::b::y as x;
+			}
+			mod b {
+				pub use super::a::x as y;
+			}
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::CyclicImport,
+			|diagnostic| {
+				assert!(
+					diagnostic.notes.iter().any(|note| note
+						== "cycle: `super::b::y` -> `super::a::x` -> `super::b::y`"),
+					"expected the full chain in a note, got: {:?}",
+					diagnostic.notes
+				);
+				// One primary label for the item whose re-entrant lookup
+				// closed the loop, plus one secondary label per other
+				// item in it.
+				assert_eq!(
+					diagnostic.labels.len(),
+					2,
+					"expected one label per item in the two-item cycle"
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn cyclic_glob_reexports_report_the_full_loop() {
+		// Direct two-node case. Same shape as a named cycle's diagnostic —
+		// one primary label plus one secondary per remaining hop, and a
+		// `cycle: ...` note — but with glob-specific wording ("cyclic glob
+		// import", "this glob import depends on itself").
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use crate::b::*;
+			}
+			mod b {
+				pub use crate::a::*;
+			}
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::CyclicImport,
+			|diagnostic| {
+				assert_eq!(diagnostic.message, "cyclic glob import");
+
+				let primary = diagnostic
+					.labels
+					.iter()
+					.find(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Primary
+					})
+					.expect("expected a primary label");
+				assert_eq!(
+					primary.message,
+					"this glob import depends on itself"
+				);
+
+				let secondary: Vec<_> = diagnostic
+					.labels
+					.iter()
+					.filter(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Secondary
+					})
+					.map(|label| label.message.as_str())
+					.collect();
+				assert_eq!(secondary, vec!["through here"]);
+
+				assert!(
+					diagnostic.notes.iter().any(|note| note
+						== "cycle: `crate::b::*` -> `crate::a::*` -> `crate::b::*`"),
+					"expected the full chain in a note, got: {:?}",
+					diagnostic.notes
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn three_way_cyclic_glob_reexports_report_every_hop() {
+		// Extends the direct two-node case to three hops — matches the
+		// exact shape requested for the diagnostic: primary label on the
+		// glob where the cycle starts/closes, the remaining imports as
+		// secondary labels in traversal order, and the starting glob's own
+		// target path repeated at the end of the `cycle: ...` note.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub use crate::b::*;
+			}
+			mod b {
+				pub use crate::c::*;
+			}
+			mod c {
+				pub use crate::a::*;
+			}
+		"});
+
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::CyclicImport,
+			|diagnostic| {
+				assert_eq!(diagnostic.message, "cyclic glob import");
+
+				let primary = diagnostic
+					.labels
+					.iter()
+					.find(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Primary
+					})
+					.expect("expected a primary label");
+				assert_eq!(
+					primary.message,
+					"this glob import depends on itself"
+				);
+
+				let secondary: Vec<_> = diagnostic
+					.labels
+					.iter()
+					.filter(|label| {
+						label.style
+							== codespan_reporting::diagnostic::LabelStyle::Secondary
+					})
+					.map(|label| label.message.as_str())
+					.collect();
+				assert_eq!(secondary, vec!["through here", "through here"]);
+
+				assert!(
+					diagnostic.notes.iter().any(|note| {
+						note == "cycle: `crate::b::*` -> `crate::c::*` -> \
+						         `crate::a::*` -> `crate::b::*`"
+					}),
+					"expected the full chain in a note, got: {:?}",
+					diagnostic.notes
+				);
+			},
+		);
 	}
 }

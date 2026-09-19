@@ -1690,7 +1690,7 @@ impl DefIdGenerator {
 	}
 
 	#[inline]
-	pub fn next(&mut self) -> DefId {
+	pub fn next_id(&mut self) -> DefId {
 		let id = self.next_id;
 		self.next_id += 1;
 		DefId(id)
@@ -2903,13 +2903,13 @@ impl<'ctx> Parser<'ctx> {
 					attributes: Box::new([]),
 					signature: signature.inner,
 					block,
-					id: parser.id_generator.next(),
+					id: parser.id_generator.next_id(),
 				},
 				None => Item::FunctionDeclaration {
 					pub_span: None,
 					attributes: Box::new([]),
 					signature: signature.inner,
-					id: parser.id_generator.next(),
+					id: parser.id_generator.next_id(),
 				},
 			},
 			span,
@@ -4883,7 +4883,7 @@ impl<'ctx> Parser<'ctx> {
 				name,
 				ty,
 				value: Box::new(value),
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				attributes: Box::new([]),
 			},
 			span,
@@ -4907,7 +4907,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(const_span.start, value.span.end);
 		Ok(Spanned {
 			inner: Item::Const {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -5025,7 +5025,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Export {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				keyword_span: export_keyword.span,
 				entries: entries.inner,
 			},
@@ -5086,7 +5086,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Enum {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				repr,
 				name: Spanned {
@@ -5117,7 +5117,7 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(type_span.start, ty.span.end);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
-						id: parser.id_generator.next(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5148,7 +5148,7 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(const_span.start, value.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
-						id: parser.id_generator.next(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5194,7 +5194,7 @@ impl<'ctx> Parser<'ctx> {
 				let method_span = TextSpan::new(fn_span.start, block.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Function {
-						id: parser.id_generator.next(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						attributes: attrs,
 						signature: FunctionSignature {
@@ -5298,7 +5298,7 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
 				inner: Item::TraitImpl {
-					id: parser.id_generator.next(),
+					id: parser.id_generator.next_id(),
 					type_params,
 					items: items.inner,
 					target,
@@ -5322,7 +5322,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::InherentImpl {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				type_params,
 				items: items.inner,
 				target: first_ty,
@@ -5404,7 +5404,7 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::AssociatedType {
-									id: parser.id_generator.next(),
+									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5440,7 +5440,7 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::Const {
-									id: parser.id_generator.next(),
+									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5474,7 +5474,7 @@ impl<'ctx> Parser<'ctx> {
 
 							Ok(Spanned {
 								inner: TraitItem::Function {
-									id: parser.id_generator.next(),
+									id: parser.id_generator.next_id(),
 									attributes,
 									signature: signature.inner,
 									body,
@@ -5504,7 +5504,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(trait_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::Trait {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5548,7 +5548,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(typeset_span.start, members.span.end);
 		Ok(Spanned {
 			inner: Item::TypeSet {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5613,7 +5613,7 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(struct_span.start, fields.span.end);
 			return Ok(Spanned {
 				inner: Item::TupleStruct {
-					id: parser.id_generator.next(),
+					id: parser.id_generator.next_id(),
 					pub_span: None,
 					attributes: Box::new([]),
 					name,
@@ -5662,7 +5662,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
 			inner: Item::RecordStruct {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5707,7 +5707,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(type_span.start, end);
 		Ok(Spanned {
 			inner: Item::TypeAlias {
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -5792,7 +5792,7 @@ impl<'ctx> Parser<'ctx> {
 				attributes: Box::new([]),
 				name,
 				bound: kind,
-				id: parser.id_generator.next(),
+				id: parser.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5825,7 +5825,7 @@ impl<'ctx> Parser<'ctx> {
 				mut_span,
 				name,
 				ty: Box::new(type_expr),
-				id: self.id_generator.next(),
+				id: self.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5847,7 +5847,7 @@ impl<'ctx> Parser<'ctx> {
 			inner: ImportDeclaration::Memory {
 				name,
 				kind,
-				id: self.id_generator.next(),
+				id: self.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5870,7 +5870,7 @@ impl<'ctx> Parser<'ctx> {
 						external_name: None,
 						declaration: ImportDeclaration::Function {
 							signature: signature.inner,
-							id: parser.id_generator.next(),
+							id: parser.id_generator.next_id(),
 						},
 					},
 					span: signature.span,
@@ -6081,10 +6081,10 @@ impl<'ctx> Parser<'ctx> {
 				None => segment.span.end,
 			},
 		);
-		return Ok(Spanned {
+		Ok(Spanned {
 			inner: UseTree::Name { segment, alias },
 			span,
-		});
+		})
 	}
 
 	fn parse_import_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
