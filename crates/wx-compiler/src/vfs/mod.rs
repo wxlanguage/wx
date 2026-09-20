@@ -370,7 +370,7 @@ pub struct CompilationUnit {
 	/// stdlib.
 	pub stdlib_package: PackageId,
 	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
+	pub strings: ast::StringInterner,
 }
 
 impl CompilationUnit {
@@ -408,7 +408,7 @@ impl CompilationUnit {
 pub struct CompilationUnitBuilder {
 	pub files: Files,
 	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
+	pub strings: ast::StringInterner,
 	pub packages: Vec<Package>,
 	/// Set once the stdlib exists, and seeded into every package loaded
 	/// afterwards as its implicit `std` dependency. `None` only while the
@@ -487,7 +487,7 @@ impl CompilationUnitBuilder {
 		Self {
 			files: Files::new(),
 			id_generator: ast::DefIdGenerator::new(),
-			interner: ast::Keyword::create_interner(),
+			strings: ast::Keyword::create_interner(),
 			packages: Vec::new(),
 			stdlib: None,
 		}
@@ -566,8 +566,8 @@ impl CompilationUnitBuilder {
 				.with_message(format!(
 					"this package is already declared as `{}`, so it cannot \
 			 also be declared as `{}`",
-					self.interner.resolve(existing).unwrap(),
-					self.interner.resolve(name).unwrap(),
+					self.strings.resolve(existing).unwrap(),
+					self.strings.resolve(name).unwrap(),
 				));
 			package.diagnostics.push(diagnostic);
 			return;
@@ -578,7 +578,7 @@ impl CompilationUnitBuilder {
 				.with_message(format!(
 					"the name `{}` is already used by another package this one \
 			 depends on",
-					self.interner.resolve(name).unwrap()
+					self.strings.resolve(name).unwrap()
 				));
 			package.diagnostics.push(diagnostic);
 			return;
@@ -611,7 +611,7 @@ impl CompilationUnitBuilder {
 		// Computed before the loader takes its `&mut self`.
 		let (dependencies, dependency_names) = match self.stdlib {
 			Some(stdlib) => {
-				let std = self.interner.get_or_intern("std");
+				let std = self.strings.get_or_intern("std");
 				(
 					HashMap::from([(std, stdlib)]),
 					HashMap::from([(stdlib, std)]),
@@ -662,7 +662,7 @@ impl CompilationUnitBuilder {
 			root_package,
 			stdlib_package,
 			id_generator: self.id_generator,
-			interner: self.interner,
+			strings: self.strings,
 		}
 	}
 }
@@ -723,7 +723,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		let ast = ast::Parser::parse(
 			file_id,
 			&self.ctx.files,
-			&mut self.ctx.interner,
+			&mut self.ctx.strings,
 			&mut self.ctx.id_generator,
 		);
 
@@ -775,7 +775,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			// same `owned_dir` for its children (both `src/math/`), same as
 			// Rust's `foo.rs`/`foo/mod.rs` being interchangeable.
 			let child_name_str =
-				self.ctx.interner.resolve(module.name.inner).expect(
+				self.ctx.strings.resolve(module.name.inner).expect(
 					"module symbol should resolve while loading package",
 				);
 			let child_owned_dir =
@@ -863,7 +863,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	) -> Option<AbsolutePath> {
 		let module_name = self
 			.ctx
-			.interner
+			.strings
 			.resolve(child_module_name.inner)
 			.expect("module symbol should resolve while loading package");
 		let sibling_file =

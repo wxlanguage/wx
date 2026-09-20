@@ -330,8 +330,8 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	abort_if_errors(tir.diagnostics.error_count());
 
 	let mir =
-		mir::MIR::build(&tir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner).unwrap();
+		mir::MIR::build(&tir, &compilation.strings, compilation.id_generator);
+	let module = codegen::Builder::build(&mir, &compilation.strings).unwrap();
 	let bytecode = module.encode();
 
 	if output == Some("-") {

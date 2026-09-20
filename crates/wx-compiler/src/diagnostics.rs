@@ -133,7 +133,7 @@ define_diagnostic_codes! {
 		InvalidCharacterLiteral => "E2017",
 		DuplicateExport => "E2018",
 		CannotExportItem => "E2019",
-		NotANamespace => "E2020",
+		CannotUseAsNamespace => "E2020",
 		UndeclaredType => "E2021",
 		DuplicateStructField => "E2022",
 		UnknownStructField => "E2025",
@@ -151,8 +151,8 @@ define_diagnostic_codes! {
 		MissingFunctionBody => "E2028",
 		InvalidMemoryKind => "E2029",
 		NamespaceUsedAsValue => "E2030",
-		ExpectedBound => "E2031",
-		CyclicTypeDependency => "E2032",
+		ExpectedTraitBound => "E2031",
+		RecursiveTypeWithoutIndirection => "E2032",
 		IncompleteTraitImpl => "E2033",
 		UnsatisfiedTraitBound => "E2034",
 		AssociatedTypeInInherentImpl => "E2035",
@@ -195,7 +195,7 @@ define_diagnostic_codes! {
 		DuplicateExportBlock => "E2072",
 		ExportBlockNotAtRoot => "E2073",
 		LibraryCannotExport => "E2074",
-		AmbiguousWildcardImport => "E2075",
+		AmbiguousIdentifier => "E2075",
 		PrivateStructField => "E2076",
 		ForeignImplTarget => "E2077",
 		NotATraitMember => "E2078",
@@ -216,7 +216,7 @@ define_diagnostic_codes! {
 		UnresolvedImport => "E2093",
 		CyclicImport => "E2094",
 		PrivateReexport => "E2095",
-		AmbiguousReexport => "E2096",
+		CyclicTypeAlias => "E2096",
 	}
 }
 

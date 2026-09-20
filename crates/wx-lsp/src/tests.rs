@@ -772,7 +772,7 @@ fn completion_inside_function_includes_params() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -804,7 +804,7 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -856,7 +856,7 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -910,7 +910,7 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -965,7 +965,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -996,7 +996,7 @@ fn completion_inside_function_shows_globals_too() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1025,7 +1025,7 @@ fn completion_sorts_locals_before_globals() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1062,7 +1062,7 @@ fn completion_prefix_filters_results() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1134,7 +1134,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	// after "al" should still see it as a two-character prefix.
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1164,7 +1164,7 @@ fn completion_hides_sibling_module_items_without_use() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1199,7 +1199,7 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1236,7 +1236,7 @@ fn path_completion_after_enum_lists_variants() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1282,7 +1282,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1317,7 +1317,7 @@ fn path_completion_after_namespace_lists_module_members() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1676,7 +1676,7 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 
 	let hover = symbol_hover_text(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		compiled.graph.root_package,
 		&found.kind,
@@ -1753,7 +1753,7 @@ fn trait_impl_type_params_have_hover_definitions_and_isolated_references() {
 				assert_eq!(
 					symbol_hover_text(
 						&compiled.tir,
-						&compiled.graph.interner,
+						&compiled.graph.strings,
 						&compiled.graph.packages,
 						compiled.graph.root_package,
 						&symbol.kind,
@@ -2312,7 +2312,7 @@ fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
 	);
 	let hover = symbol_hover_text(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		compiled.graph.root_package,
 		&found.kind,
@@ -2440,7 +2440,7 @@ fn memory_associated_const_namespace_access_resolves() {
 		.name
 		.inner;
 	assert_eq!(
-		compiled.graph.interner.resolve(const_name),
+		compiled.graph.strings.resolve(const_name),
 		Some("DATA_END"),
 		"expected the resolved const to be named `DATA_END`"
 	);
@@ -2457,7 +2457,7 @@ fn memory_associated_const_namespace_access_resolves() {
 		.traits
 		.iter()
 		.find(|trait_def| {
-			compiled.graph.interner.resolve(trait_def.name.inner)
+			compiled.graph.strings.resolve(trait_def.name.inner)
 				== Some("Memory")
 		})
 		.expect("stdlib Memory trait");

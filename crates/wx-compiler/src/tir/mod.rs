@@ -15,6 +15,9 @@
 mod defs;
 mod imports;
 mod literals;
+mod paths;
+mod signatures;
+mod types;
 
 // use crate::index::index_newtype;
 

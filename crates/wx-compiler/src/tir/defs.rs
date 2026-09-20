@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use codespan_reporting::diagnostic::{Diagnostic, Label};
+use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
@@ -30,6 +30,9 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	strings: &'ctx mut StringInterner,
 	files: &'ctx Files,
+	/// The package a builtin name (`u8`, `Add`, ...) is only recognized in.
+	/// Always present, from `CompilationUnit::stdlib_package`.
+	stdlib_package: PackageId,
 
 	namespaces: Vec<Namespace>,
 	package_namespaces: Vec<NamespaceIndex>,
@@ -41,6 +44,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	inherent_impls: Vec<InherentImplDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
+	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
 		HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
@@ -101,7 +105,7 @@ pub enum BindingNamespace {
 }
 
 impl BindingNamespace {
-	fn noun(self) -> &'static str {
+	pub(super) fn noun(self) -> &'static str {
 		match self {
 			BindingNamespace::Type => "type",
 			BindingNamespace::Value => "value",
@@ -112,11 +116,15 @@ impl BindingNamespace {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct BindingKey {
-	namespace: BindingNamespace,
+	pub(super) namespace: BindingNamespace,
 	pub(super) symbol: SymbolU32,
 }
 
 impl BindingKey {
+	pub(super) fn new(namespace: BindingNamespace, symbol: SymbolU32) -> Self {
+		Self { namespace, symbol }
+	}
+
 	pub(super) fn ty(symbol: SymbolU32) -> Self {
 		Self {
 			namespace: BindingNamespace::Type,
@@ -139,7 +147,6 @@ pub struct TraitDef {
 	pub namespace: NamespaceIndex,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
-	pub self_param: TypeParamDef,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -153,7 +160,6 @@ pub struct TraitImplDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIndex,
-	pub type_params: Box<[TypeParamDef]>,
 	pub members: Vec<TraitMemberDef>,
 	#[cfg_attr(
 		test,
@@ -168,7 +174,6 @@ pub struct InherentImplDef {
 	pub def_id: ast::DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIndex,
-	pub type_params: Box<[TypeParamDef]>,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -205,17 +210,17 @@ pub struct InherentMemberDef {
 impl LocalDefIndex {
 	/// each module has a `self` binding which is the first binding in the list of it's bindings
 	/// other modules can use it to reference it, for example `super`
-	const SELF: Self = LocalDefIndex(0);
+	pub(super) const SELF: Self = LocalDefIndex(0);
 }
 
 #[derive(Clone)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct AstEntry<'ast> {
-	def_id: DefId,
-	file_id: FileId,
-	namespace: NamespaceIndex,
-	node: AstNodeRef<'ast>,
+	pub(super) def_id: DefId,
+	pub(super) file_id: FileId,
+	pub(super) namespace: NamespaceIndex,
+	pub(super) node: AstNodeRef<'ast>,
 }
 
 #[derive(Clone)]
@@ -267,30 +272,29 @@ pub(super) enum AstNodeRef<'ast> {
 	},
 	TraitImplBlock {
 		item: &'ast ast::Item,
+		block_index: TraitImplIndex,
 	},
 	TraitImplFunction {
-		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
+		block_index: TraitImplIndex,
 	},
 	TraitImplConstant {
-		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
+		block_index: TraitImplIndex,
 	},
 	TraitImplAssocType {
-		parent_id: ast::DefId,
 		item: &'ast ast::ImplItem,
+		block_index: TraitImplIndex,
 	},
 	InherentImplBlock {
 		item: &'ast ast::Item,
 		block_index: InherentImplIndex,
 	},
 	InherentImplFunction {
-		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
 		block_index: InherentImplIndex,
 	},
 	InherentImplConst {
-		block_id: ast::DefId,
 		item: &'ast ast::ImplItem,
 		block_index: InherentImplIndex,
 	},
@@ -327,6 +331,104 @@ pub(super) struct DefinitionRegistry {
 	pub inherent_impls: Vec<InherentImplDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
+	/// The `DefKey` of every language builtin recognized by name in the
+	/// stdlib package — primitive types (`u8`, `char`, `never`, ...) and
+	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
+	/// prescan never found declared there. No `#[intrinsic]` marker is
+	/// involved: recognition is implicit — a reserved name, of the right
+	/// declaration kind, declared in the stdlib package *is* that builtin.
+	/// This is std's own responsibility to get right, same as any other
+	/// name collision within a single package. Same epistemic status as
+	/// everything else on this registry: what was recorded, not a judgment
+	/// about completeness.
+	pub intrinsics: IntrinsicDefs,
+}
+
+/// One struct rather than one per kind — the recognized-name list only
+/// needs to be written once — but [`IntrinsicDefs::type_slot_mut`] and
+/// [`IntrinsicDefs::trait_slot_mut`] are kept as two separate lookups
+/// (rather than one covering all fields) so a type alias and a trait can
+/// never contend for the same slot just because they happen to share a
+/// name — e.g. a stray `type Add;` in std can't clobber the `Add` trait's
+/// entry, since only `trait_slot_mut` ever resolves `"Add"`.
+#[derive(Default)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct IntrinsicDefs {
+	pub u8: Option<DefKey>,
+	pub i8: Option<DefKey>,
+	pub u16: Option<DefKey>,
+	pub i16: Option<DefKey>,
+	pub u32: Option<DefKey>,
+	pub i32: Option<DefKey>,
+	pub u64: Option<DefKey>,
+	pub i64: Option<DefKey>,
+	pub f32: Option<DefKey>,
+	pub f64: Option<DefKey>,
+	pub bool: Option<DefKey>,
+	pub char: Option<DefKey>,
+	pub never: Option<DefKey>,
+	pub add: Option<DefKey>,
+	pub sub: Option<DefKey>,
+	pub mul: Option<DefKey>,
+	pub div: Option<DefKey>,
+	pub rem: Option<DefKey>,
+	pub neg: Option<DefKey>,
+	pub bitand: Option<DefKey>,
+	pub bitor: Option<DefKey>,
+	pub bitxor: Option<DefKey>,
+	pub shl: Option<DefKey>,
+	pub shr: Option<DefKey>,
+	pub bitnot: Option<DefKey>,
+	pub not: Option<DefKey>,
+	pub partial_eq: Option<DefKey>,
+	pub partial_ord: Option<DefKey>,
+}
+
+impl IntrinsicDefs {
+	/// The mutable slot for `name` if it's one of the recognized primitive
+	/// type names — the one place that list is written.
+	fn type_slot_mut(&mut self, name: &str) -> Option<&mut Option<DefKey>> {
+		Some(match name {
+			"u8" => &mut self.u8,
+			"i8" => &mut self.i8,
+			"u16" => &mut self.u16,
+			"i16" => &mut self.i16,
+			"u32" => &mut self.u32,
+			"i32" => &mut self.i32,
+			"u64" => &mut self.u64,
+			"i64" => &mut self.i64,
+			"f32" => &mut self.f32,
+			"f64" => &mut self.f64,
+			"bool" => &mut self.bool,
+			"char" => &mut self.char,
+			"never" => &mut self.never,
+			_ => return None,
+		})
+	}
+
+	/// The mutable slot for `name` if it's one of the recognized operator
+	/// trait names — the one place that list is written.
+	fn trait_slot_mut(&mut self, name: &str) -> Option<&mut Option<DefKey>> {
+		Some(match name {
+			"Add" => &mut self.add,
+			"Sub" => &mut self.sub,
+			"Mul" => &mut self.mul,
+			"Div" => &mut self.div,
+			"Rem" => &mut self.rem,
+			"Neg" => &mut self.neg,
+			"BitAnd" => &mut self.bitand,
+			"BitOr" => &mut self.bitor,
+			"BitXor" => &mut self.bitxor,
+			"Shl" => &mut self.shl,
+			"Shr" => &mut self.shr,
+			"BitNot" => &mut self.bitnot,
+			"Not" => &mut self.not,
+			"PartialEq" => &mut self.partial_eq,
+			"PartialOrd" => &mut self.partial_ord,
+			_ => return None,
+		})
+	}
 }
 
 /// Back-pointer to whichever declaration created this namespace.
@@ -1144,23 +1246,6 @@ struct Declared<T: Copy> {
 	collision: Option<DefKey>,
 }
 
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypeParamDef {
-	pub name: Spanned<SymbolU32>,
-	pub accesses: Vec<SourceSpan>,
-}
-
-impl TypeParamDef {
-	pub fn new(name: Spanned<SymbolU32>) -> Self {
-		Self {
-			name,
-			accesses: Vec::new(),
-		}
-	}
-}
-
 impl<T: Copy> Declared<T> {
 	fn new(value: T) -> Self {
 		Self {
@@ -1235,8 +1320,15 @@ impl DefinitionRegistry {
 		files: &Files,
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		stdlib_package: PackageId,
 	) -> (Self, Vec<AstEntry<'ast>>) {
-		DefinitionRegistryBuilder::build(packages, files, strings, diagnostics)
+		DefinitionRegistryBuilder::build(
+			packages,
+			files,
+			strings,
+			diagnostics,
+			stdlib_package,
+		)
 	}
 }
 
@@ -1246,6 +1338,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		files: &'ctx Files,
 		strings: &'ctx mut ast::StringInterner,
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
+		stdlib_package: PackageId,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
 		let package_namespaces: Vec<NamespaceIndex> = (0..packages.len())
 			.map(|i| NamespaceIndex(u32::try_from(i).unwrap()))
@@ -1319,11 +1412,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			module_decls: Vec::new(),
 			strings,
 			files,
+			stdlib_package,
 			traits: Vec::new(),
 			trait_impls: Vec::new(),
 			inherent_impls: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
+			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: HashMap::new(),
 			pending_glob_targets: HashMap::new(),
 		};
@@ -1365,6 +1460,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			inherent_impls: builder.inherent_impls,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
+			intrinsics: builder.intrinsics,
 		};
 		(registry, builder.ast_nodes)
 	}
@@ -1774,7 +1870,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::TypeAlias {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				body,
+				..
 			} => {
 				let def_key = self.push_def(
 					namespace,
@@ -1786,6 +1886,18 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				if body.is_none()
+					&& self.namespaces[usize::from(namespace)].package_id
+						== self.stdlib_package
+				{
+					if let Some(name_str) = self.strings.resolve(name.inner) {
+						if let Some(slot) =
+							self.intrinsics.type_slot_mut(name_str)
+						{
+							*slot = Some(def_key);
+						}
+					}
+				}
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -1903,6 +2015,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				if self.namespaces[usize::from(namespace)].package_id
+					== self.stdlib_package
+				{
+					if let Some(name_str) = self.strings.resolve(name.inner) {
+						if let Some(slot) =
+							self.intrinsics.trait_slot_mut(name_str)
+						{
+							*slot = Some(def_key);
+						}
+					}
+				}
 				let trait_index =
 					TraitIndex(u32::try_from(self.traits.len()).unwrap());
 				self.ast_nodes.push(AstEntry {
@@ -2006,20 +2129,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						namespace,
 						pub_span: *pub_span,
 						name: *name,
-						self_param: TypeParamDef::new(Spanned {
-							inner: ast::Keyword::SelfPascal.symbol(),
-							span: name.span,
-						}),
 						bindings,
 						members,
 					})
 				);
 			}
 			ast::Item::InherentImpl {
-				id: impl_id,
-				type_params,
-				items,
-				..
+				id: impl_id, items, ..
 			} => {
 				let mut members: Vec<InherentMemberDef> = Vec::new();
 				let mut bindings: HashMap<BindingKey, MemberIndex> =
@@ -2048,7 +2164,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplFunction {
-									block_id: *impl_id,
 									item: &impl_item.inner.inner,
 									block_index,
 								},
@@ -2072,7 +2187,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplConst {
-									block_id: *impl_id,
 									item: &impl_item.inner.inner,
 									block_index,
 								},
@@ -2119,10 +2233,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						def_id: *impl_id,
 						file_id,
 						namespace,
-						type_params: type_params
-							.iter()
-							.map(|tp| TypeParamDef::new(tp.name))
-							.collect(),
 						members,
 						bindings,
 						self_accesses: Vec::new(),
@@ -2304,19 +2414,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::TraitImpl {
-				id: impl_id,
-				items,
-				type_params,
-				..
+				id: impl_id, items, ..
 			} => {
 				let mut members: Vec<TraitMemberDef> = Vec::new();
 				let mut bindings: HashMap<BindingKey, MemberIndex> =
 					HashMap::new();
+				let block_index = TraitImplIndex(
+					u32::try_from(self.trait_impls.len()).unwrap(),
+				);
 				self.ast_nodes.push(AstEntry {
 					def_id: *impl_id,
 					file_id,
 					namespace,
-					node: AstNodeRef::TraitImplBlock { item },
+					node: AstNodeRef::TraitImplBlock { item, block_index },
 				});
 				for item in items.iter() {
 					let (member, key) = match &item.inner.inner {
@@ -2326,8 +2436,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplFunction {
-									parent_id: *impl_id,
 									item: &item.inner.inner,
+									block_index,
 								},
 							});
 							(
@@ -2345,8 +2455,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplConstant {
-									parent_id: *impl_id,
 									item: &item.inner.inner,
+									block_index,
 								},
 							});
 							(
@@ -2364,8 +2474,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplAssocType {
-									parent_id: *impl_id,
 									item: &item.inner.inner,
+									block_index,
 								},
 							});
 							(
@@ -2402,55 +2512,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				let mut params = Vec::with_capacity(type_params.len());
-				for param in type_params.iter() {
-					params.push(TypeParamDef {
-						accesses: Vec::new(),
-						name: param.name,
-					});
-					if let Some(collision) =
-						params.iter().find(|p| p.name.inner == param.name.inner)
-					{
-						let name =
-							self.strings.resolve(collision.name.inner).unwrap();
-						self.diagnostics.push(
-								Diagnostic::error()
-									.with_code(
-										DiagnosticCode::DuplicateGenericParam,
-									)
-									.with_message(format!(
-										"the name `{name}` is already used for a generic parameter in this item's generic parameters"
-									))
-									.with_label(
-										Label::primary(
-											file_id,
-											param.name.span,
-										)
-										.with_message("already used"),
-									)
-									.with_label(
-										Label::secondary(
-											file_id,
-											collision.name.span,
-										)
-										.with_message(format!(
-											"first use of `{}`",
-											name
-										)),
-									),
-							);
-					}
-				}
-
-				self.push_trait_impl(TraitImplDef {
-					def_id: *impl_id,
-					file_id,
-					namespace,
-					self_accesses: Vec::new(),
-					bindings,
-					members,
-					type_params: params.into_boxed_slice(),
-				});
+				debug_assert_eq!(
+					block_index,
+					self.push_trait_impl(TraitImplDef {
+						def_id: *impl_id,
+						file_id,
+						namespace,
+						self_accesses: Vec::new(),
+						bindings,
+						members,
+					})
+				);
 			}
 		}
 	}
@@ -2544,8 +2616,9 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.interner,
+				&mut graph.strings,
 				&mut diagnostics,
+				graph.stdlib_package,
 			);
 			// Only Phase 1 (this file) is under test here — `ast_nodes` is
 			// Phase 2's input, and dropping it now is what lets `defs` (and
@@ -2590,6 +2663,25 @@ mod tests {
 			Self::from_graph(builder.build(root_id))
 		}
 
+		/// A `"type": "std"` root — no embedded stdlib loaded, so `source`
+		/// is the *entire* package graph, and `stdlib_package == root_package`.
+		/// For tests that need to control every `#[intrinsic]` declaration
+		/// themselves rather than asserting against the real, separately
+		/// evolving `std/main.wx`.
+		fn new_stdlib(source: &str) -> Self {
+			let workspace = vfs::VirtualFileSource::new(HashMap::from([
+				(
+					vfs::AbsolutePath::new("/std/wx.json"),
+					r#"{ "type": "std", "entry": "main.wx" }"#.to_string(),
+				),
+				(vfs::AbsolutePath::new("/std/main.wx"), source.to_string()),
+			]));
+			let graph =
+				vfs::open_manifest(vfs::AbsolutePath::new("/std"), &workspace)
+					.unwrap();
+			Self::from_graph(graph)
+		}
+
 		fn root_namespace(&self) -> NamespaceIndex {
 			self.defs.package_namespaces[self.graph.root_package.as_usize()]
 		}
@@ -2603,7 +2695,7 @@ mod tests {
 			namespace: NamespaceIndex,
 			name: &str,
 		) -> Option<BindingTarget> {
-			let symbol = self.graph.interner.get_or_intern(name);
+			let symbol = self.graph.strings.get_or_intern(name);
 			self.defs.namespaces[usize::from(namespace)]
 				.bindings
 				.get(&BindingKey::ty(symbol))
@@ -2615,7 +2707,7 @@ mod tests {
 			namespace: NamespaceIndex,
 			name: &str,
 		) -> Option<BindingTarget> {
-			let symbol = self.graph.interner.get_or_intern(name);
+			let symbol = self.graph.strings.get_or_intern(name);
 			self.defs.namespaces[usize::from(namespace)]
 				.bindings
 				.get(&BindingKey::value(symbol))
@@ -2646,6 +2738,139 @@ mod tests {
 	}
 
 	#[test]
+	fn stdlib_declares_every_primitive() {
+		let case = TestCase::new_stdlib(indoc! {"
+			type u8;
+			type i8;
+			type u16;
+			type i16;
+			type u32;
+			type i32;
+			type u64;
+			type i64;
+			type f32;
+			type f64;
+			type bool;
+			type char;
+			type never;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let intrinsics = &case.defs.intrinsics;
+		assert!(intrinsics.u8.is_some(), "u8 should be found");
+		assert!(intrinsics.i8.is_some(), "i8 should be found");
+		assert!(intrinsics.u16.is_some(), "u16 should be found");
+		assert!(intrinsics.i16.is_some(), "i16 should be found");
+		assert!(intrinsics.u32.is_some(), "u32 should be found");
+		assert!(intrinsics.i32.is_some(), "i32 should be found");
+		assert!(intrinsics.u64.is_some(), "u64 should be found");
+		assert!(intrinsics.i64.is_some(), "i64 should be found");
+		assert!(intrinsics.f32.is_some(), "f32 should be found");
+		assert!(intrinsics.f64.is_some(), "f64 should be found");
+		assert!(intrinsics.bool.is_some(), "bool should be found");
+		assert!(intrinsics.char.is_some(), "char should be found");
+		assert!(intrinsics.never.is_some(), "never should be found");
+	}
+
+	#[test]
+	fn stdlib_declares_every_operator_trait() {
+		let case = TestCase::new_stdlib(indoc! {"
+			trait Add { fn add(self, rhs: Self) -> Self; }
+			trait Sub { fn sub(self, rhs: Self) -> Self; }
+			trait Mul { fn mul(self, rhs: Self) -> Self; }
+			trait Div { fn div(self, rhs: Self) -> Self; }
+			trait Rem { fn rem(self, rhs: Self) -> Self; }
+			trait Neg { fn neg(self) -> Self; }
+			trait BitAnd { fn bitand(self, rhs: Self) -> Self; }
+			trait BitOr { fn bitor(self, rhs: Self) -> Self; }
+			trait BitXor { fn bitxor(self, rhs: Self) -> Self; }
+			trait Shl { fn shl(self, rhs: Self) -> Self; }
+			trait Shr { fn shr(self, rhs: Self) -> Self; }
+			trait BitNot { fn bitnot(self) -> Self; }
+			trait Not { fn not(self) -> Self; }
+			trait PartialEq { fn eq(self, other: Self) -> bool; }
+			trait PartialOrd { fn lt(self, other: Self) -> bool; }
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let intrinsics = &case.defs.intrinsics;
+		assert!(intrinsics.add.is_some(), "Add should be found");
+		assert!(intrinsics.sub.is_some(), "Sub should be found");
+		assert!(intrinsics.mul.is_some(), "Mul should be found");
+		assert!(intrinsics.div.is_some(), "Div should be found");
+		assert!(intrinsics.rem.is_some(), "Rem should be found");
+		assert!(intrinsics.neg.is_some(), "Neg should be found");
+		assert!(intrinsics.bitand.is_some(), "BitAnd should be found");
+		assert!(intrinsics.bitor.is_some(), "BitOr should be found");
+		assert!(intrinsics.bitxor.is_some(), "BitXor should be found");
+		assert!(intrinsics.shl.is_some(), "Shl should be found");
+		assert!(intrinsics.shr.is_some(), "Shr should be found");
+		assert!(intrinsics.bitnot.is_some(), "BitNot should be found");
+		assert!(intrinsics.not.is_some(), "Not should be found");
+		assert!(intrinsics.partial_eq.is_some(), "PartialEq should be found");
+		assert!(
+			intrinsics.partial_ord.is_some(),
+			"PartialOrd should be found"
+		);
+	}
+
+	#[test]
+	fn stdlib_missing_an_intrinsic_leaves_its_slot_empty() {
+		let case = TestCase::new_stdlib(indoc! {"
+			type u8;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(case.defs.intrinsics.u8.is_some());
+		assert!(case.defs.intrinsics.char.is_none());
+		assert!(case.defs.intrinsics.add.is_none());
+	}
+
+	#[test]
+	fn reserved_name_outside_stdlib_is_not_recorded_as_intrinsic() {
+		let case = TestCase::new(indoc! {"
+			type u8;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		// The real stdlib's own `u8` must still be the one on record — the
+		// same-named declaration in the binary package must not clobber it,
+		// and (since it isn't in the stdlib package) must not be recorded
+		// as an intrinsic at all.
+		let root_namespace = case.root_namespace();
+		let stdlib_namespace =
+			case.defs.package_namespaces[case.graph.stdlib_package.as_usize()];
+		assert_ne!(
+			root_namespace, stdlib_namespace,
+			"the binary package must not be the stdlib package"
+		);
+		let u8_key = case.defs.intrinsics.u8.expect("u8 should still resolve");
+		assert_eq!(
+			u8_key.namespace_idx, stdlib_namespace,
+			"u8 must still point into the stdlib package, not the binary one"
+		);
+	}
+
+	#[test]
+	fn type_and_trait_intrinsics_cannot_clobber_each_other() {
+		// A type alias and a trait sharing a reserved name must land in
+		// distinct slots — `type_slot_mut`/`trait_slot_mut` are separate
+		// lookups specifically so this can't happen.
+		let case = TestCase::new_stdlib(indoc! {"
+			type Add;
+			trait u8 { fn f(self) -> Self; }
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.defs.intrinsics.add.is_none(),
+			"a type alias named `Add` must not populate the trait slot"
+		);
+		assert!(
+			case.defs.intrinsics.u8.is_none(),
+			"a trait named `u8` must not populate the type slot"
+		);
+	}
+
+	#[test]
 	fn function_and_struct_get_bindings() {
 		let mut case = TestCase::new(indoc! {"
 			pub fn add(a: i32, b: i32) -> i32 { a + b }
@@ -2653,8 +2878,8 @@ mod tests {
 		"});
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 
-		let add_symbol = case.graph.interner.get_or_intern("add");
-		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let add_symbol = case.graph.strings.get_or_intern("add");
+		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
 			&case.defs.namespaces[usize::from(root_namespace)].bindings;
@@ -2677,7 +2902,7 @@ mod tests {
 		"});
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 
-		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
 			&case.defs.namespaces[usize::from(root_namespace)].bindings;
@@ -2695,7 +2920,7 @@ mod tests {
 		"});
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 
-		let point_symbol = case.graph.interner.get_or_intern("Point");
+		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
 			&case.defs.namespaces[usize::from(root_namespace)].bindings;
@@ -2754,7 +2979,7 @@ mod tests {
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 
 		let root = case.root_namespace();
-		let helper = case.graph.interner.get_or_intern("helper");
+		let helper = case.graph.strings.get_or_intern("helper");
 
 		assert!(matches!(
 			case.defs.namespaces.lookup(
@@ -2795,7 +3020,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let b = case.child_namespace(root, "b");
-		let helper = case.graph.interner.get_or_intern("helper");
+		let helper = case.graph.strings.get_or_intern("helper");
 
 		assert!(matches!(
 			case.defs.namespaces.indirect_lookup(
@@ -2831,7 +3056,7 @@ mod tests {
 		let root = case.root_namespace();
 		let m = case.child_namespace(root, "m");
 		let inner = case.child_namespace(m, "inner");
-		let helper = case.graph.interner.get_or_intern("helper");
+		let helper = case.graph.strings.get_or_intern("helper");
 
 		match case.defs.namespaces.indirect_lookup(
 			&case.defs.use_items,
@@ -2862,7 +3087,7 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let hub = case.child_namespace(root, "hub");
-		let helper = case.graph.interner.get_or_intern("helper");
+		let helper = case.graph.strings.get_or_intern("helper");
 
 		let Some(BindingTarget::Accessible(original)) =
 			case.lookup_value(a, "helper")
@@ -2909,7 +3134,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let hub = case.child_namespace(root, "hub");
-		let pick = case.graph.interner.get_or_intern("pick");
+		let pick = case.graph.strings.get_or_intern("pick");
 
 		match case.defs.namespaces.indirect_lookup(
 			&case.defs.use_items,
@@ -2945,7 +3170,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let hub = case.child_namespace(root, "hub");
-		let pick = case.graph.interner.get_or_intern("pick");
+		let pick = case.graph.strings.get_or_intern("pick");
 
 		let Some(BindingTarget::Accessible(direct)) =
 			case.lookup_value(hub, "pick")

@@ -503,7 +503,7 @@ async fn handle_command(
 				.package_id;
 				let text = symbol_hover_text(
 					&compiled.tir,
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					from,
 					&info.kind,
@@ -741,7 +741,7 @@ async fn handle_command(
 					let formatted = trace.step("render", || {
 						wx_fmt::format(
 							&module.ast,
-							&graph.interner,
+							&graph.strings,
 							source,
 							config,
 						)
@@ -802,11 +802,11 @@ async fn handle_command(
 					[usize::from(func.namespace)]
 				.package_id;
 				let fmt = compiled.tir.formatter(
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					from,
 				);
-				let interner = &compiled.graph.interner;
+				let interner = &compiled.graph.strings;
 
 				let name = interner.resolve(func.name.inner).unwrap();
 				let mut label = format!("fn {name}(");
@@ -974,7 +974,7 @@ async fn handle_command(
 				let completion_start = web_time::Instant::now();
 				let items = completion::completion_items(
 					&compiled.tir,
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					&compiled.symbol_index,
 					file_id,
@@ -1786,7 +1786,7 @@ fn compile_root(
 	trace: &mut Trace,
 ) -> CompiledRoot {
 	let tir = trace.step("typecheck", || TIR::build(&mut graph));
-	let symbol_index = build_symbol_index(&tir, &graph.interner);
+	let symbol_index = build_symbol_index(&tir, &graph.strings);
 	CompiledRoot {
 		graph,
 		tir,

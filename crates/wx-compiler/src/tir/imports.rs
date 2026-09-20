@@ -651,7 +651,9 @@ impl<'r> ImportResolver<'r> {
 			BindingLookup::NotFound => return ImportSlot::Absent,
 			BindingLookup::Found(target, visibility) => (target, visibility),
 			BindingLookup::Ambiguous(candidates) => {
-				let diagnostic = self.report_ambiguous_reexport(
+				let diagnostic = report_ambiguous_identifier(
+					self.namespaces,
+					self.strings,
 					key.symbol,
 					source_span,
 					&candidates,
@@ -687,8 +689,13 @@ impl<'r> ImportResolver<'r> {
 					// nothing ever consulting this binding again and the
 					// problem going unreported. Recover as `Accessible`:
 					// having reported it, there's nothing left to defer.
-					let diagnostic =
-						self.report_private_import(key.symbol, source_span);
+					let diagnostic = report_private_identifier(
+						self.namespaces,
+						self.strings,
+						key.symbol,
+						source_span,
+						Some(def_key),
+					);
 					self.diagnostics.push(diagnostic);
 					ImportSlot::Accessible(def_key, visibility)
 				}
@@ -855,7 +862,9 @@ impl<'r> ImportResolver<'r> {
 			}
 			BindingLookup::Found(target, visibility) => (target, visibility),
 			BindingLookup::Ambiguous(candidates) => {
-				let diagnostic = self.report_ambiguous_reexport(
+				let diagnostic = report_ambiguous_identifier(
+					self.namespaces,
+					self.strings,
 					segment.segment.inner,
 					source_span,
 					&candidates,
@@ -892,8 +901,13 @@ impl<'r> ImportResolver<'r> {
 			// problem further down the path — the next segment, or the
 			// leaf, not existing — still gets its own diagnostic instead
 			// of being silently swallowed by this one.
-			let diagnostic =
-				self.report_private_import(segment.segment.inner, source_span);
+			let diagnostic = report_private_identifier(
+				self.namespaces,
+				self.strings,
+				segment.segment.inner,
+				source_span,
+				target.def_key(),
+			);
 			self.diagnostics.push(diagnostic);
 		}
 		let BindingTarget::Accessible(def_key) = target else {
@@ -907,9 +921,12 @@ impl<'r> ImportResolver<'r> {
 				Ok(ImportScope::Namespace(namespace))
 			}
 			_ => {
-				let diagnostic = self.report_expected_import_scope(
+				let diagnostic = report_cannot_use_as_namespace(
+					self.namespaces,
+					self.strings,
 					segment.segment.inner,
 					source_span,
+					def_key,
 				);
 				self.diagnostics.push(diagnostic);
 				Err(())
@@ -958,34 +975,6 @@ impl<'r> ImportResolver<'r> {
 			.with_label(span.primary_label().with_message(label_message))
 	}
 
-	fn report_private_import(
-		&self,
-		name: SymbolU32,
-		span: SourceSpan,
-	) -> Diagnostic<FileId> {
-		let name = self.strings.resolve(name).unwrap();
-		Diagnostic::error()
-			.with_code(DiagnosticCode::PrivateItem.code())
-			.with_message(format!("`{name}` is private"))
-			.with_label(
-				span.primary_label().with_message("this item is not `pub`"),
-			)
-	}
-
-	fn report_expected_import_scope(
-		&self,
-		name: SymbolU32,
-		span: SourceSpan,
-	) -> Diagnostic<FileId> {
-		let name = self.strings.resolve(name).unwrap();
-		Diagnostic::error()
-			.with_code(DiagnosticCode::NotANamespace.code())
-			.with_message(format!("`{name}` is not a module"))
-			.with_label(
-				span.primary_label()
-					.with_message("only a module can be used as a path prefix"),
-			)
-	}
 
 	/// The label for one frame of a reported cycle: the source path it's
 	/// importing from, not the local name it binds:
@@ -1078,44 +1067,119 @@ impl<'r> ImportResolver<'r> {
 			))
 	}
 
-	/// Modelled on rustc's E0659: several `pub use path::*;` re-exports
-	/// supply the same name, and nothing here picks one over another. The
-	/// labels point at the responsible `pub use` edges, not the ultimate
-	/// definitions — each definition is perfectly fine on its own, and
-	/// it's re-exporting more than one of them under the same name that
-	/// isn't.
-	fn report_ambiguous_reexport(
-		&self,
-		name: SymbolU32,
-		span: SourceSpan,
-		candidates: &[(BindingTarget, SourceSpan)],
-	) -> Diagnostic<FileId> {
-		let resolved_name = self.strings.resolve(name).unwrap();
-		let mut diagnostic = Diagnostic::error()
-			.with_code(DiagnosticCode::AmbiguousReexport.code())
-			.with_message(format!("`{resolved_name}` is ambiguous"))
-			.with_label(span.primary_label().with_message("ambiguous name"));
-		for (index, (target, candidate_span)) in candidates.iter().enumerate() {
-			let def_key = target.def_key().expect(
-				"an ambiguity candidate always carries a real DefKey — \
-				 CandidateMerge::push never lets a BindingTarget::Error \
-				 become one",
-			);
-			let noun = self.namespaces[usize::from(def_key.namespace_idx)]
-				.items[usize::from(def_key.def_idx)]
-			.kind
-			.noun();
-			let also = if index == 0 { "" } else { "also " };
-			diagnostic = diagnostic.with_label(
-				candidate_span.secondary_label().with_message(format!(
-					"could {also}refer to the {noun} imported here"
-				)),
-			);
-		}
-		diagnostic.with_note(format!(
-			"consider adding an explicit import of `{resolved_name}` to disambiguate"
-		))
+}
+
+/// Modelled on rustc's E0659: several `pub use path::*;` re-exports supply
+/// the same name, and nothing here picks one over another. The labels
+/// point at the responsible `pub use` edges, not the ultimate definitions
+/// — each definition is perfectly fine on its own, and it's exposing more
+/// than one of them under the same name that isn't.
+///
+/// A free function, not an `ImportResolver` method — `paths.rs`'s general
+/// path walker hits the exact same `BindingLookup::Ambiguous` case (rustc
+/// reports the same E0659 regardless of whether the ambiguous name was
+/// reached through a bare reference, a `use` import, or an arbitrary path
+/// segment, verified empirically against all three), and pulls this in
+/// from here rather than duplicating it, since ambiguity is fundamentally
+/// a glob-import concept that belongs with the rest of import resolution.
+pub(super) fn report_ambiguous_identifier(
+	namespaces: &[Namespace],
+	strings: &StringInterner,
+	name: SymbolU32,
+	span: SourceSpan,
+	candidates: &[(BindingTarget, SourceSpan)],
+) -> Diagnostic<FileId> {
+	let resolved_name = strings.resolve(name).unwrap();
+	let mut diagnostic = Diagnostic::error()
+		.with_code(DiagnosticCode::AmbiguousIdentifier.code())
+		.with_message(format!("`{resolved_name}` is ambiguous"))
+		.with_label(span.primary_label().with_message("ambiguous name"));
+	for (index, (target, candidate_span)) in candidates.iter().enumerate() {
+		let def_key = target.def_key().expect(
+			"an ambiguity candidate always carries a real DefKey — \
+			 CandidateMerge::push never lets a BindingTarget::Error \
+			 become one",
+		);
+		let noun = namespaces[usize::from(def_key.namespace_idx)].items
+			[usize::from(def_key.def_idx)]
+		.kind
+		.noun();
+		let also = if index == 0 { "" } else { "also " };
+		diagnostic = diagnostic.with_label(
+			candidate_span.secondary_label().with_message(format!(
+				"could {also}refer to the {noun} imported here"
+			)),
+		);
 	}
+	diagnostic.with_note(format!(
+		"consider adding an explicit import of `{resolved_name}` to disambiguate"
+	))
+}
+
+/// A free function for the same reason `report_ambiguous_identifier` is:
+/// `paths.rs` hits the same "resolved, but not visible" case and reuses
+/// this rather than duplicating it.
+///
+/// `def_key` is `Option` so the message can name the item's kind when
+/// known (matching rustc's `` struct `Priv` is private ``) — `None` only
+/// for a `Found(BindingTarget::Error, _)` reached through an
+/// already-errored glob candidate (see `CandidateMerge::push`), which has
+/// a `Visibility` to fail the check with but no real item behind it.
+pub(super) fn report_private_identifier(
+	namespaces: &[Namespace],
+	strings: &StringInterner,
+	name: SymbolU32,
+	span: SourceSpan,
+	def_key: Option<DefKey>,
+) -> Diagnostic<FileId> {
+	let name = strings.resolve(name).unwrap();
+	let noun = def_key.map(|def_key| {
+		namespaces[usize::from(def_key.namespace_idx)].items
+			[usize::from(def_key.def_idx)]
+		.kind
+		.noun()
+	});
+	let message = match noun {
+		Some(noun) => format!("{noun} `{name}` is private"),
+		None => format!("`{name}` is private"),
+	};
+	Diagnostic::error()
+		.with_code(DiagnosticCode::PrivateItem.code())
+		.with_message(message)
+		.with_label(span.primary_label().with_message("this item is not `pub`"))
+}
+
+/// A free function for the same reason its siblings above are: `paths.rs`'s
+/// general path walker hits this too (a segment resolved to something
+/// real, but there are more segments after it and it isn't a namespace).
+///
+/// `imports.rs`'s call site is a permanent fact about `use` paths — they
+/// can only ever traverse namespace-graph entries. `paths.rs`'s is only
+/// provisional: it stops being automatically fatal once `impls.rs`'s
+/// dispatch tables let a caller try member-lookup first. That's a
+/// difference in whether a caller invokes this at all, not in what it says
+/// once it does — hence one function, not two.
+///
+/// `def_key` is required, not `Option`, unlike `report_private_identifier`:
+/// both call sites already know they have a real item in hand (a
+/// `BindingTarget::Error` mid-path is handled — or skipped — before either
+/// one gets here).
+pub(super) fn report_cannot_use_as_namespace(
+	namespaces: &[Namespace],
+	strings: &StringInterner,
+	name: SymbolU32,
+	span: SourceSpan,
+	def_key: DefKey,
+) -> Diagnostic<FileId> {
+	let name = strings.resolve(name).unwrap();
+	let noun = namespaces[usize::from(def_key.namespace_idx)].items
+		[usize::from(def_key.def_idx)]
+	.kind
+	.noun();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::CannotUseAsNamespace.code())
+		.with_message(format!("cannot use {noun} `{name}` as a namespace"))
+		.with_label(span.primary_label())
 }
 
 #[cfg(test)]
@@ -1143,8 +1207,9 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.interner,
+				&mut graph.strings,
 				&mut diagnostics,
+				graph.stdlib_package,
 			);
 			// Only Phase 1 (defs.rs + this module) is under test here —
 			// `ast_nodes` is Phase 2's input, and dropping it now is what
@@ -1206,7 +1271,7 @@ mod tests {
 			namespace: NamespaceIndex,
 			name: &str,
 		) -> Option<BindingTarget> {
-			let symbol = self.graph.interner.get_or_intern(name);
+			let symbol = self.graph.strings.get_or_intern(name);
 			self.defs.namespaces[usize::from(namespace)]
 				.bindings
 				.get(&BindingKey::ty(symbol))
@@ -1218,7 +1283,7 @@ mod tests {
 			namespace: NamespaceIndex,
 			name: &str,
 		) -> Option<BindingTarget> {
-			let symbol = self.graph.interner.get_or_intern(name);
+			let symbol = self.graph.strings.get_or_intern(name);
 			self.defs.namespaces[usize::from(namespace)]
 				.bindings
 				.get(&BindingKey::value(symbol))
@@ -1358,7 +1423,7 @@ mod tests {
 		// binding again.
 		case.diagnostics()
 			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
-				assert_eq!(diagnostic.message, "`secret` is private")
+				assert_eq!(diagnostic.message, "function `secret` is private")
 			});
 
 		let root = case.root_namespace();
@@ -1503,7 +1568,7 @@ mod tests {
 
 		case.diagnostics()
 			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
-				assert_eq!(diagnostic.message, "`inner` is private")
+				assert_eq!(diagnostic.message, "module `inner` is private")
 			});
 	}
 
@@ -1516,9 +1581,9 @@ mod tests {
 		"});
 
 		case.diagnostics().assert_error_with(
-			DiagnosticCode::NotANamespace,
+			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
-				assert_eq!(diagnostic.message, "`Helper` is not a module")
+				assert_eq!(diagnostic.message, "cannot use struct `Helper` as a namespace")
 			},
 		);
 	}
@@ -2065,7 +2130,7 @@ mod tests {
 		"});
 
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::AmbiguousReexport]);
+			.assert_codes(&[DiagnosticCode::AmbiguousIdentifier]);
 	}
 
 	#[test]
@@ -2087,7 +2152,7 @@ mod tests {
 		"});
 
 		case.diagnostics().assert_error_with(
-			DiagnosticCode::AmbiguousReexport,
+			DiagnosticCode::AmbiguousIdentifier,
 			|diagnostic| {
 				let secondary: Vec<_> = diagnostic
 					.labels
@@ -2331,9 +2396,9 @@ mod tests {
 		"});
 
 		case.diagnostics().assert_error_with(
-			DiagnosticCode::NotANamespace,
+			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
-				assert_eq!(diagnostic.message, "`Helper` is not a module")
+				assert_eq!(diagnostic.message, "cannot use struct `Helper` as a namespace")
 			},
 		);
 	}
