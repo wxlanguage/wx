@@ -1,6 +1,6 @@
 # TIR Phase 2 (signature/type resolution) — handoff
 
-Status as of this note: committed on branch `tir-refactor`, 2026-09-21.
+Status as of this note: committed on branch `tir-refactor`, 2026-09-22.
 
 ## What this task is
 
@@ -17,6 +17,10 @@ task started. This task's own code lives in two new files:
   params + bounds, the demand-driven `ensure_signature` driver, and one
   vertical slice per item kind on top of it.
 
+A struct's field *identity* (names, `pub_span`, dedup) lives in `defs.rs`'s
+own Phase 1 prescan instead — see `defs::StructDef`/`StructFields`. Only
+field *types* are resolved here, in `signatures.rs`'s `StructSignature`.
+
 ## Important context before touching anything here
 
 `tir/mod.rs` currently only wires in `defs`/`imports`/`literals`/`paths`/
@@ -29,13 +33,14 @@ is commented out, and so are `mir`/`opt`/`codegen`/`wasm` at the crate root
   This is **pre-existing, expected, mid-refactor state**, not something this
   task broke or should fix.
 - The only meaningful verification surface right now is
-  `cargo test -p wx-compiler --lib tir::` (96 passed, 1 ignored as of this
+  `cargo test -p wx-compiler --lib tir::` (111 passed, 0 ignored as of this
   commit). `cargo test -p wx-compiler --lib` (the whole crate) also currently
   fails 3 unrelated, pre-existing `ast::tests` snapshot tests — untouched by
-  anything in this task's diff, not investigated further.
-- The user has said explicitly: ignore clippy on this branch for now, and
-  don't chase build/test failures outside of what a given task actually
-  touches.
+  anything in this task's diff, not investigated further. `cargo clippy` is
+  currently noisy on this branch too (dead-code warnings from `types.rs`/
+  `signatures.rs` not being reachable from any wired-in root yet) — the user
+  has said explicitly: ignore clippy on this branch for now, and don't chase
+  build/test failures outside of what a given task actually touches.
 
 ## What's implemented and tested in `signatures.rs`
 
@@ -43,19 +48,33 @@ is commented out, and so are `mir`/`opt`/`codegen`/`wasm` at the crate root
   `collect_bounds`. Diagnostics: `DuplicateGenericParam` (E2092),
   `ExpectedTraitBound` (E2031, rustc E0404-style).
 - **The demand-driven driver**: `ensure_signature(&mut self, query: QueryInfo)`,
-  guarded by `signature_state: HashMap<DefId, SignatureEntry>` holding
-  `ComputeState::{Pending,InProgress,Done}`. `signature_stack: Vec<QueryInfo>`
-  records in-progress frames in call order, mirroring
-  `rustc_query_system::QueryInfo`/`CycleError` — `QueryInfo.requested_at` is
-  the span of the reference that demanded an item, attached at the call site,
-  never mutated after the fact.
-- **`ItemLocation`**: `Trait`/`TraitImpl`/`InherentImpl` point into `defs.rs`'s
-  own Phase-1 arenas (already fully known); every other kind points into this
-  module's own `SignatureRegistry`, populated only once that kind's signature
-  actually finishes resolving.
-- **`TypeAlias` vertical slice**: `resolve_type` (only `TypeExpression::Path`
-  implemented so far). Primitives (`#[intrinsic] pub type u8;`, or in the
-  stdlib package generally — no attribute actually required, see
+  guarded by `query_state: HashMap<QueryKey, QueryEntry>` holding
+  `ComputeState::{Pending,InProgress,CycleReported,Done}`. `QueryKey` wraps a
+  `QueryKind` (one variant, `Signature`, today — deliberately kept as an enum
+  so a later, genuinely separate query, e.g. body-checking, has a home to
+  plug into without re-deriving this state machine) plus a `DefId`.
+  `query_stack: Vec<QueryFrame>` records in-progress frames in call order,
+  mirroring `rustc_query_system::QueryInfo`/`CycleError` —
+  `QueryFrame.requested_at` is the span of the reference that demanded an
+  item, attached at the call site, never mutated after the fact.
+  `ComputeState::CycleReported` mirrors `imports.rs`'s `ResolveStatus::Error`:
+  the *first* re-entrant discovery of a still-`InProgress` query flips it to
+  `CycleReported` atomically (inside `ensure_signature`'s own entry check)
+  and returns `Cycle`; every *later* independent path that re-discovers the
+  same query sees `CycleReported` and returns `Resolved` silently. This is
+  what makes a struct/trait with two fields/bounds that both lead back to the
+  same cycle report it once, not twice — confirmed as a real, previously
+  untested latent bug in the trait-supertrait cycle check too (regression
+  test: `a_supertrait_cycle_via_two_different_bounds_is_reported_once`).
+- **`ItemLocation`**: `Trait`/`TraitImpl`/`InherentImpl`/`Struct` point into
+  `defs.rs`'s own Phase-1 arenas (already fully known — a struct's identity
+  doesn't need its own fields resolved, so `StructIndex` is pre-seeded here
+  just like `TraitIndex`, not lazily assigned); every other kind
+  (`TypeAlias`, `Function`) points into this module's own
+  `SignatureRegistry`, populated only once that kind's signature actually
+  finishes resolving.
+- **`TypeAlias` vertical slice**: primitives (`#[intrinsic] pub type u8;`, or
+  in the stdlib package generally — no attribute actually required, see
   `defs.rs`'s own doc comment on `intrinsics`) are resolved *eagerly* once at
   `SignatureBuilder::new()`, fully bypassing `ensure_signature`'s dispatch —
   the shared `TypeAlias` arm can then assume its body is always real.
@@ -65,61 +84,97 @@ is commented out, and so are `mir`/`opt`/`codegen`/`wasm` at the crate root
   `resolve_bounds` generic-param bounds already use, then recurses
   `ensure_signature` into each supertrait to catch `trait A: B; trait B: A;`
   — same cycle machinery as type aliases, reported as `CyclicSupertrait`
-  (E2082). Both cycle diagnostics now share one `report_cycle` helper
-  (factored out once this became the second real consumer — see "Design
-  conventions" below). Resolved bounds land in a new
+  (E2082). Both cycle diagnostics share one `report_cycle` helper (factored
+  out once this became the second real consumer). Resolved bounds land in
   `trait_supertraits: Vec<Box<[TraitBound]>>`, indexed by the same
-  `TraitIndex` `defs.traits` already assigns (no new index space needed,
-  unlike `TypeAlias` which had none in Phase 1).
+  `TraitIndex` `defs.traits` already assigns.
+- **`Struct` (`RecordStruct`/`TupleStruct`) vertical slice**: resolves each
+  field's type via `resolve_type`, one-to-one with `defs.structs[..].fields`
+  (a duplicate field name still gets its own resolved slot — name dedup
+  already happened in `defs.rs`). Direct-recursion ("infinite size without
+  indirection") detection is folded into the existing cycle machinery rather
+  than a separate pass: `check_struct_direct_recursion` calls
+  `ensure_signature` on any directly-embedded struct type (following into
+  `Type::Tuple` elements, since a tuple embeds inline the same way a struct
+  does; stopping at `Type::Pointer`/`Slice`/`Array`, since those always carry
+  an indirection sigil in wx), and reports `RecursiveTypeWithoutIndirection`
+  via a rustc-E0072-style diagnostic (`report_recursive_struct_cycle`) if a
+  cycle closes. **Deliberately out of scope**: generic-instantiation-aware
+  substitution — `struct Wrapper<T>{v:T} struct A{w:Wrapper<A>}` is not
+  detected (rustc's own `params_in_repr`-style check needs the type-param
+  substitution utilities the old builder had; that machinery hasn't been
+  reintroduced yet). Also out of scope: bound-checking on a struct's own
+  type arguments at a reference site (`resolve_type`'s `DefKind::Struct` arm
+  resolves identity only, `todo!()`s on any non-empty `type_args`) — a
+  struct's bounds require the struct's own signature to be `Done`, which
+  would reintroduce the exact cycle risk `Struct` identity resolution is
+  built to avoid.
+- **`Function` (`Item::Function`/`Item::FunctionDeclaration`) vertical
+  slice**: both AST variants share one `ast::FunctionSignature` shape (the
+  only difference is whether a body block follows), so both funnel through
+  one `AstNodeRef::Function` arm. Resolves the function's own generic params,
+  then each param's type (`TypeIndex::ERROR` for an untyped param — legal
+  grammar for a method's bare `self`, but `Item::Function`/
+  `FunctionDeclaration` are always free functions, so there's no `Self` to
+  default to), then the return type (`TypeIndex::UNIT` when `-> Result` is
+  omitted). Duplicate param names are reported (`DuplicateDefinition`,
+  E2000, reusing the code the old builder used for the same check) but every
+  param still gets its own resolved slot, same reasoning as struct fields.
+  Lands in a new `functions: Vec<FunctionSignature>`, indexed by a lazily-
+  assigned `FunctionIndex` (same lazy-allocation pattern as `TypeAlias` — a
+  function's identity is never referenced from inside its own signature the
+  way a struct's can be, so no pre-seeding is needed).
+- **`resolve_type`**: handles `TypeExpression::Path` (including a generic
+  scope's own type params, and both `TypeAlias`/`Struct` path targets) and
+  `TypeExpression::Tuple`. Everything else (`Pointer`, `Array`, `Slice`,
+  `Function`, `GenericApplication`, `MemoryTagged`, `QualifiedPath`,
+  `Grouped`) is still `todo!()`.
 - **`ensure_all_signatures(&mut self)`**: the real outer Phase 2 driver —
   iterates every registered item in parse order and calls `ensure_signature`.
-  Not selective by item kind, so it cannot yet run over a real program (see
-  gap below).
+  Not selective by item kind, so it still cannot run over a real program
+  (`Enum`/`Global`/`Memory`/`Constant`/`TypeSet`/`TraitImpl`/`InherentImpl`
+  are all still `_ => todo!()`; the real stdlib uses several of these).
 - **`SignatureBuilder::finish(self) -> SignatureRegistry`**: assembles the
-  frozen output (`type_aliases`, `trait_supertraits`, `item_lookup`, `types`)
-  — mirrors `DefinitionRegistryBuilder::build`'s shape, just consuming `self`
-  instead of being the constructor, since a `SignatureBuilder` stays alive
-  across many `ensure_signature` calls rather than running once.
+  frozen output (`type_aliases`, `trait_supertraits`, `structs`, `functions`,
+  `item_lookup`, `types`) — mirrors `DefinitionRegistryBuilder::build`'s
+  shape, just consuming `self` instead of being the constructor, since a
+  `SignatureBuilder` stays alive across many `ensure_signature` calls rather
+  than running once.
 - **Tests**: one `TestCase::new(source)` drives the real pipeline end to end
   (parse → prescan → `ensure_all_signatures` → `finish()`), then looks things
-  up via real path resolution (`TestCase::resolve`, `::`-separated paths —
-  not a linear scan over an internal arena by name, which wouldn't respect
-  namespacing/shadowing the way a real reference does).
-
-## The one known gap: `Struct` isn't implemented yet
-
-`a_bound_naming_a_non_trait_is_rejected` is `#[ignore]`d — its source
-declares `struct NotATrait { x: i32 }` purely as a bound target, and
-`ensure_all_signatures` isn't selective: it calls `ensure_signature` on
-*every* registered item, including that struct, and panics on the `_ =>
-todo!()` fallback since `Struct` has no arm yet. This is also why tests
-build their own minimal `set_stdlib`-based source instead of loading the
-real embedded stdlib (`builder.load_stdlib()`) — the real stdlib is almost
-entirely `fn`/`trait`/`impl`, and `ensure_all_signatures` would panic on the
-very first one.
-
-Everything other than `TypeAlias`/`Trait` is still `_ => todo!()` in
-`ensure_signature`: `Function`, `RecordStruct`/`TupleStruct`, `Enum`,
-`Global`, `Memory`, `Constant`, `TypeSet`, `TraitImpl`, `InherentImpl`.
-`resolve_type` likewise only handles `TypeExpression::Path` — `Pointer`,
-`Array`, `Slice`, `Function`, `GenericApplication`, `Tuple`, `MemoryTagged`,
-`QualifiedPath`, `Grouped` are all `todo!()`.
+  up via real path resolution (`TestCase::resolve(namespace, path)` —
+  `BindingNamespace::Type` for types/traits/structs, `::Value` for functions
+  — `::`-separated paths, not a linear scan over an internal arena by name,
+  which wouldn't respect namespacing/shadowing the way a real reference
+  does). `defs.rs`'s own test module grew the identical `resolve` helper
+  (`BindingNamespace::Type` only, so far — no `defs.rs` test has needed a
+  value-namespace lookup yet), reusing the same `PathResolver` production
+  machinery rather than hand-rolled lookup boilerplate.
 
 ## What's next
 
-1. **`Struct` (`RecordStruct`/`TupleStruct`)** — the natural next slice, and
-   the one that unblocks the last ignored test. Needs a
-   `StructSignature`/`structs: Vec<StructSignature>` arena in
-   `SignatureRegistry` (the `StructIndex` type already exists, unused, in
-   `types.rs`), `resolve_generic_params` for the struct's own type params,
-   and a `resolve_type` call per field — which will also force `resolve_type`
-   to grow past bare `Path`, since struct fields commonly need `Pointer`/
-   `Array`/`Slice`.
-2. **`Function`** next — params + return type, similar shape to a struct's
-   fields.
-3. **`InherentImpl`/`TraitImpl`** after that — will eventually need real
-   trait-conformance checking, not just signature resolution.
-4. Once enough kinds exist to walk a real program (stdlib included) without
+1. **`InherentImpl`/`TraitImpl`** — the next natural slice. Will eventually
+   need real trait-conformance checking (comparing a trait's required items
+   against what an impl provides), not just signature resolution for the
+   impl block itself.
+2. **`Enum`** — no `EnumIndex` pre-allocation exists in `defs.rs` yet (unlike
+   `StructIndex`); needs the same "identity before signature" treatment if
+   an enum can self-reference (it likely can't need to, since variants don't
+   embed the enum type directly the way a struct field can — worth
+   confirming before assuming `Enum` needs pre-seeding at all).
+3. **`resolve_type` growing past `Path`/`Tuple`** — `Pointer`/`Array`/
+   `Slice` are the highest-value next forms (needed for `Global`/`Memory`
+   declarations and for any realistic function signature — e.g. `&[u8]`
+   params), which also means ambient-memory resolution needs to exist
+   first (ownership sigil + explicit-or-ambient memory, per the language's
+   `heap::&[u8]` syntax).
+4. **Generic struct/function instantiation** — both `resolve_type`'s
+   `DefKind::Struct` arm and any call/reference site that supplies
+   `type_args` currently `todo!()` on a non-empty argument list. Needs the
+   type-parameter substitution utilities the old builder had before either
+   bound-checking or the deferred `params_in_repr`-style recursion check
+   (point 4 in the previous version of this note) can be reintroduced.
+5. Once enough kinds exist to walk a real program (stdlib included) without
    hitting `todo!()`, wire `ensure_all_signatures` into `tir::mod.rs`'s
    top-level `build()` as the actual Phase 2 entry point, and revisit
    whether it needs to become selective (skip dependency packages' items
@@ -139,20 +194,34 @@ Everything other than `TypeAlias`/`Trait` is still `_ => todo!()` in
   everywhere downstream — same pattern `BindingTarget::Error` already uses
   at the identity layer.
 - **Cycle diagnostics attach the span to the destination at call time**
-  (`QueryInfo.requested_at`, a required field set when `ensure_signature` is
-  called), never mutated onto a stack frame after the fact — mirrors
-  rustc's actual `QueryInfo` shape, confirmed by reading its source rather
-  than guessing.
+  (`QueryFrame.requested_at`, set when `ensure_signature` pushes a frame),
+  never mutated onto a stack frame after the fact — mirrors rustc's actual
+  `QueryInfo` shape, confirmed by reading its source rather than guessing.
+- **A query that's still running but already reported its own cycle needs a
+  third state, not a side table.** Adding a `HashSet<DefId>`/`Vec<bool>`
+  "already reported" tracker alongside `query_state` was tried and rejected
+  — it duplicates information `ComputeState` should just represent directly.
+  `CycleReported` (an `InProgress`-equivalent state that stays silent for
+  everyone else) is the general fix; it isn't struct-specific, so it also
+  silently fixed the same latent bug in `CyclicSupertrait`.
 - **Add generality only once a second real consumer exists** — `report_cycle`
   was factored out of `report_cyclic_type_alias` only once `Trait` needed the
-  same shape for `CyclicSupertrait`, not speculatively ahead of that.
+  same shape for `CyclicSupertrait`, not speculatively ahead of that. Same
+  reasoning kept `QueryKind` to one variant (`Signature`) rather than adding
+  a speculative `Body` variant before anything demands one.
 - **Test lookups go through real path resolution**, never a linear scan over
   an internal arena by name — a scan would find *an* item with that spelling
   anywhere in the whole compilation, not necessarily the one namespace rules
   would actually pick, so it can silently grab the wrong item in a way real
-  resolution can't.
+  resolution can't. Don't assume arena index 0 is "the first thing you
+  declared", either — the real stdlib (loaded by `defs.rs`'s own tests, via
+  `load_stdlib()`) declares its own items (e.g. `Layout`, `RawPtr` structs)
+  that can occupy earlier indices than anything in the test's own source.
 - **Verify diagnostic codes against existing ones before adding new codes,
   and check what Rust does for the equivalent situation** — e.g.
-  `CyclicTypeAlias`/`CyclicSupertrait` were confirmed as genuinely distinct
-  from each other (and from `RecursiveTypeWithoutIndirection`) via rustc's
-  own E0391/E0072 distinction before adding codes, not assumed.
+  `CyclicTypeAlias`/`CyclicSupertrait`/`RecursiveTypeWithoutIndirection` were
+  confirmed as genuinely distinct from each other via rustc's own
+  E0391/E0072 distinction before adding codes, not assumed; the duplicate
+  function-param diagnostic reuses `DuplicateDefinition` (E2000) rather than
+  minting a new code, matching what the old (now-dead) builder did for the
+  identical check.

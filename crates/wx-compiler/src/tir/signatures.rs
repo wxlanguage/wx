@@ -49,6 +49,7 @@ pub(super) struct TraitBound {
 }
 
 index_newtype!(TypeAliasIndex);
+index_newtype!(FunctionIndex);
 
 /// A resolved `type Name<...> = TypeExpr;` — including a primitive
 /// (`#[intrinsic] pub type u8;`), which is just one with no type params and
@@ -60,6 +61,20 @@ struct TypeAliasSignature {
 	/// What this alias transparently stands for. `TypeIndex::ERROR` if its
 	/// body failed to resolve or closed a cycle.
 	target: TypeIndex,
+}
+
+/// A resolved `fn name<...>(params) -> Result { ... }` — covers both
+/// `Item::Function` and `Item::FunctionDeclaration` (an `import` block's
+/// bodiless signature), which share one `FunctionSignature` shape in the
+/// AST and so share one resolved shape here too. No name/identity fields:
+/// unlike `TypeAliasSignature`, nothing needs to display a function's name
+/// from just this struct — the one place that will (diagnostics, once
+/// bodies exist) already has the `DefId` to look the name up from `defs`.
+struct FunctionSignature {
+	type_params: Box<[GenericParam]>,
+	param_types: Box<[TypeIndex]>,
+	/// `TypeIndex::UNIT` when the source omits `-> Result`.
+	return_type: TypeIndex,
 }
 
 /// Field *types* only — names/dedup/lookup already settled in
@@ -80,6 +95,7 @@ struct SignatureRegistry {
 	/// Indexed by the same `StructIndex` `defs.structs` already uses — see
 	/// `trait_supertraits`.
 	structs: Vec<StructSignature>,
+	functions: Vec<FunctionSignature>,
 	item_lookup: HashMap<DefId, ItemLocation>,
 	types: TypeInterner,
 }
@@ -97,6 +113,7 @@ enum ItemLocation {
 	InherentImpl(InherentImplIndex),
 	Struct(StructIndex),
 	TypeAlias(TypeAliasIndex),
+	Function(FunctionIndex),
 }
 
 /// What `ensure_signature` found. `Cycle` is never stored anywhere — it's a
@@ -216,6 +233,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	type_aliases: Vec<TypeAliasSignature>,
 	trait_supertraits: Vec<Box<[TraitBound]>>,
 	structs: Vec<StructSignature>,
+	functions: Vec<FunctionSignature>,
 }
 
 impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
@@ -357,6 +375,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			type_aliases,
 			trait_supertraits,
 			structs,
+			functions: Vec::new(),
 		}
 	}
 
@@ -613,6 +632,88 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					field_types: field_types.into_boxed_slice(),
 				};
 			}
+			AstNodeRef::Function { item } => {
+				let (ast::Item::Function { signature, .. }
+				| ast::Item::FunctionDeclaration { signature, .. }) =
+					item
+				else {
+					unreachable!()
+				};
+
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					&signature.type_params,
+				);
+
+				// Positional, so a duplicate name still gets its own
+				// resolved slot in `param_types` — same reasoning as
+				// struct fields (see `defs::StructFields`'s doc comment).
+				// Names themselves aren't kept past this loop: nothing
+				// downstream looks a parameter up by name yet, unlike a
+				// struct field.
+				let mut seen_params: Vec<Spanned<SymbolU32>> =
+					Vec::with_capacity(signature.params.len());
+				let mut param_types: Vec<TypeIndex> =
+					Vec::with_capacity(signature.params.len());
+				for param in signature.params.iter() {
+					let name = param.inner.inner.name;
+					if let Some(first) = seen_params
+						.iter()
+						.find(|p| p.inner == name.inner)
+						.copied()
+					{
+						self.diagnostics.push(
+							report_duplicate_function_param(
+								self.strings,
+								file_id,
+								name,
+								first,
+							),
+						);
+					}
+					seen_params.push(name);
+
+					let ty = match &param.inner.inner.ty {
+						Some(ty) => self.resolve_type(
+							file_id,
+							namespace,
+							def_id,
+							&resolved_params,
+							ty,
+						),
+						// Only ever `None` when the source omits `: Type`
+						// entirely — legal grammar (methods rely on it for
+						// an untyped `self`), but `Item::Function`/
+						// `FunctionDeclaration` are always free functions,
+						// so there's no `Self` to default to here.
+						None => TypeIndex::ERROR,
+					};
+					param_types.push(ty);
+				}
+
+				let return_type = match &signature.result {
+					Some(result) => self.resolve_type(
+						file_id,
+						namespace,
+						def_id,
+						&resolved_params,
+						result,
+					),
+					None => TypeIndex::UNIT,
+				};
+
+				let index = FunctionIndex::new(
+					u32::try_from(self.functions.len()).unwrap(),
+				);
+				self.functions.push(FunctionSignature {
+					type_params: resolved_params,
+					param_types: param_types.into_boxed_slice(),
+					return_type,
+				});
+				self.item_lookup
+					.insert(def_id, ItemLocation::Function(index));
+			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
 
@@ -645,6 +746,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			type_aliases: self.type_aliases,
 			trait_supertraits: self.trait_supertraits,
 			structs: self.structs,
+			functions: self.functions,
 			item_lookup: self.item_lookup,
 			types: self.types,
 		}
@@ -1167,6 +1269,26 @@ fn report_duplicate_generic_param(
 		)
 }
 
+fn report_duplicate_function_param(
+	strings: &StringInterner,
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+	first: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateDefinition.code())
+		.with_message(format!(
+			"identifier `{name_str}` is bound more than once in this parameter list"
+		))
+		.with_label(SourceSpan::new(file_id, name.span).primary_label())
+		.with_label(
+			SourceSpan::new(file_id, first.span)
+				.secondary_label()
+				.with_message(format!("first use of `{name_str}` as a parameter")),
+		)
+}
+
 fn report_expected_trait_bound(
 	file_id: FileId,
 	strings: &StringInterner,
@@ -1272,7 +1394,7 @@ mod tests {
 		/// discarded — a path a test asks for is always expected to resolve
 		/// cleanly, so any diagnostic here would only ever be a bug in the
 		/// test, not something worth asserting on.
-		fn resolve(&self, path: &str) -> DefKind {
+		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
 			let root = self.defs.package_namespaces
 				[self.graph.root_package.as_usize()];
 			let file_id = self.defs.namespaces[usize::from(root)].file_id;
@@ -1305,7 +1427,7 @@ mod tests {
 				file_id,
 				root,
 				&segments,
-				BindingNamespace::Type,
+				ns,
 			);
 			let def_key = target.def_key().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
@@ -1314,7 +1436,7 @@ mod tests {
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIndex {
-			let DefKind::Trait(def_id) = self.resolve(path) else {
+			let DefKind::Trait(def_id) = self.resolve(BindingNamespace::Type, path) else {
 				panic!("expected `{path}` to be a trait");
 			};
 			let Some(&ItemLocation::Trait(index)) =
@@ -1331,7 +1453,7 @@ mod tests {
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
-			let DefKind::TypeAlias(def_id) = self.resolve(path) else {
+			let DefKind::TypeAlias(def_id) = self.resolve(BindingNamespace::Type, path) else {
 				panic!("expected `{path}` to be a type alias");
 			};
 			let Some(&ItemLocation::TypeAlias(index)) =
@@ -1343,7 +1465,7 @@ mod tests {
 		}
 
 		fn struct_signature(&self, path: &str) -> &StructSignature {
-			let DefKind::Struct(def_id) = self.resolve(path) else {
+			let DefKind::Struct(def_id) = self.resolve(BindingNamespace::Type, path) else {
 				panic!("expected `{path}` to be a struct");
 			};
 			let Some(&ItemLocation::Struct(index)) =
@@ -1352,6 +1474,18 @@ mod tests {
 				panic!("expected a Struct location for `{path}`");
 			};
 			&self.registry.structs[usize::from(index)]
+		}
+
+		fn function_signature(&self, path: &str) -> &FunctionSignature {
+			let DefKind::Function(def_id) = self.resolve(BindingNamespace::Value, path) else {
+				panic!("expected `{path}` to be a function");
+			};
+			let Some(&ItemLocation::Function(index)) =
+				self.registry.item_lookup.get(&def_id)
+			else {
+				panic!("expected a Function location for `{path}`");
+			};
+			&self.registry.functions[usize::from(index)]
 		}
 	}
 
@@ -1633,5 +1767,67 @@ mod tests {
 			case.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
+	}
+
+	#[test]
+	fn a_function_with_primitive_params_and_return_resolves() {
+		let case = TestCase::new(indoc! {"
+			pub type i32;
+			pub type bool;
+			fn add(a: i32, b: i32) -> bool { true }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("add");
+		assert_eq!(signature.param_types.len(), 2);
+		assert_eq!(signature.param_types[0], TypeIndex::I32);
+		assert_eq!(signature.param_types[1], TypeIndex::I32);
+		assert_eq!(signature.return_type, TypeIndex::BOOL);
+	}
+
+	#[test]
+	fn a_function_with_no_return_type_defaults_to_unit() {
+		let case = TestCase::new("fn f() { }");
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.function_signature("f").return_type, TypeIndex::UNIT);
+	}
+
+	#[test]
+	fn a_generic_function_param_resolves_to_its_type_param() {
+		let case = TestCase::new("fn identity<T>(x: T) -> T { x }");
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("identity");
+		assert_eq!(signature.type_params.len(), 1);
+		assert_eq!(signature.param_types[0], signature.return_type);
+	}
+
+	#[test]
+	fn duplicate_function_param_name_is_reported_but_both_entries_survive() {
+		let case = TestCase::new(indoc! {"
+			pub type i32;
+			fn f(x: i32, x: i32) { }
+		"});
+
+		assert_eq!(case.function_signature("f").param_types.len(), 2);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateDefinition.code())
+		);
+	}
+
+	#[test]
+	fn a_bodiless_function_declaration_resolves_like_a_function() {
+		let case = TestCase::new(indoc! {"
+			pub type i32;
+			fn imported(x: i32) -> i32;
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("imported");
+		assert_eq!(signature.param_types[0], TypeIndex::I32);
+		assert_eq!(signature.return_type, TypeIndex::I32);
 	}
 }
