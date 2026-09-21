@@ -5,9 +5,11 @@
 //! this module only answers "given a `Type`, what `TypeIndex` names it",
 //! never "what type does this path/expression have". It depends on `defs`
 //! for `TraitIndex` (an associated-type projection names the trait that
-//! declares it) but nothing here calls into name resolution, and nothing in
-//! `defs` depends back on this module — see `tir/defs.rs`'s own doc comment
-//! for why that direction has to stay one-way.
+//! declares it) and `StructIndex` (pre-allocated in `defs.rs`'s Phase 1, for
+//! the same reason as `TraitIndex`) but nothing here calls into name
+//! resolution, and nothing in `defs` depends back on this module — see
+//! `tir/defs.rs`'s own doc comment for why that direction has to stay
+//! one-way.
 //!
 //! A type parameter's owner is a bare `ast::DefId` rather than a dedicated
 //! `TypeParamOwner` enum (the old builder's shape, one variant per arena a
@@ -22,14 +24,12 @@ use crate::ast::DefId;
 use crate::index::index_newtype;
 use string_interner::symbol::SymbolU32;
 
-use super::defs::TraitIndex;
+use super::defs::{StructIndex, TraitIndex};
 
 index_newtype!(TypeIndex);
-// Which arena `Type::Struct`/`Type::Enum` point into — declared here rather
-// than in `signatures.rs`, so this module doesn't have to name anything
-// signature-storage owns. `signatures::SignatureRegistry` indexes its own
-// `structs`/`enums` vecs with these same types.
-index_newtype!(StructIndex);
+// `EnumIndex` stays here (rather than moving to `defs.rs` like `StructIndex`
+// did) since nothing pre-allocates it in Phase 1 yet — `Enum` isn't
+// implemented in `signatures.rs`.
 index_newtype!(EnumIndex);
 
 /// A function type's parameters and result packed into one interned slice —

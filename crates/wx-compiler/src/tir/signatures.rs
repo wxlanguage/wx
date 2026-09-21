@@ -28,7 +28,7 @@ use crate::vfs::{FileId, PackageId};
 
 use super::defs::{
 	AstEntry, AstNodeRef, BindingNamespace, DefKind, DefinitionRegistry,
-	InherentImplIndex, NamespaceIndex, TraitImplIndex, TraitIndex,
+	InherentImplIndex, NamespaceIndex, StructIndex, TraitImplIndex, TraitIndex,
 };
 use super::paths::PathResolver;
 use super::types::{Type, TypeIndex, TypeInterner};
@@ -62,6 +62,14 @@ struct TypeAliasSignature {
 	target: TypeIndex,
 }
 
+/// Field *types* only — names/dedup/lookup already settled in
+/// `defs::StructDef`, index-aligned with whichever `StructFields` variant
+/// that struct has, so record vs. tuple doesn't need re-deriving here.
+struct StructSignature {
+	type_params: Box<[GenericParam]>,
+	field_types: Box<[TypeIndex]>,
+}
+
 struct SignatureRegistry {
 	type_aliases: Vec<TypeAliasSignature>,
 	/// Each trait's resolved `trait X: Y + Z { ... }` bounds, indexed by the
@@ -69,14 +77,17 @@ struct SignatureRegistry {
 	/// space of their own here, unlike `type_aliases`, since Phase 1 already
 	/// has one.
 	trait_supertraits: Vec<Box<[TraitBound]>>,
+	/// Indexed by the same `StructIndex` `defs.structs` already uses — see
+	/// `trait_supertraits`.
+	structs: Vec<StructSignature>,
 	item_lookup: HashMap<DefId, ItemLocation>,
 	types: TypeInterner,
 }
 
 /// Where a `DefId`'s data actually lives — one arena per item kind
-/// `ensure_signature` can be asked about. `Trait`/`TraitImpl`/`InherentImpl`
-/// point into `defs.rs`'s own arenas (Phase 1 already knows everything about
-/// them); every other kind points into this module's own
+/// `ensure_signature` can be asked about. `Trait`/`TraitImpl`/`InherentImpl`/
+/// `Struct` point into `defs.rs`'s own arenas (Phase 1 already knows
+/// everything about them); every other kind points into this module's own
 /// `SignatureRegistry`, populated only once that kind's signature actually
 /// finishes resolving.
 #[derive(Clone, Copy)]
@@ -84,13 +95,14 @@ enum ItemLocation {
 	Trait(TraitIndex),
 	TraitImpl(TraitImplIndex),
 	InherentImpl(InherentImplIndex),
+	Struct(StructIndex),
 	TypeAlias(TypeAliasIndex),
 }
 
 /// What `ensure_signature` found. `Cycle` is never stored anywhere — it's a
-/// transient signal for whichever call is re-entering a `DefId` still
+/// transient signal for whichever call is re-entering a query still
 /// `InProgress` further down the stack; that caller reports the cycle once
-/// (using `signature_stack` to know what closed the loop) and substitutes
+/// (using `query_stack` to know what closed the loop) and substitutes
 /// `TypeIndex::ERROR`, then keeps going. Every item in the cycle still
 /// reaches its own `Done` normally.
 pub(super) enum SignatureStatus {
@@ -98,35 +110,90 @@ pub(super) enum SignatureStatus {
 	Cycle,
 }
 
-/// Cycle detection state for one `DefId`'s demand-driven resolution —
-/// mirrors `imports.rs`'s `ResolveStatus`, but without its `Error` variant:
-/// a signature always has *some* value once resolution reaches `Done` (a
-/// failed piece becomes `TypeIndex::ERROR`, the same recovery-value pattern
-/// `BindingTarget::Error` already uses at the identity layer), so there's
-/// never a case where `Done` needs a "no value" alternative the way
-/// `Resolved(T)` does for imports.
+/// Cycle detection state for one query's demand-driven resolution — mirrors
+/// `imports.rs`'s `ResolveStatus`, including its `Error`-like third state
+/// (`CycleReported` here): `ResolveStatus::poll` flips `Resolving` straight
+/// to `Error` the instant it's re-entered, so a *second* independent path
+/// re-discovering the same still-running item finds `Error` (silent, already
+/// handled) rather than `Resolving` (which would mean "report a fresh
+/// cycle"). `CycleReported` plays the identical role here — e.g. `trait A: B
+/// + C {}` where both `B` and `C` separately supertrait back to `A`, or a
+/// struct with two fields that each separately lead back to it, would
+/// otherwise report the same finding twice, once per path, since nothing
+/// would otherwise distinguish "the first path to notice" from "a second
+/// path rediscovering what the first already reported." Unlike `Error`,
+/// this is never a final state: it's overwritten to `Done` unconditionally
+/// once the query's own execution actually finishes, same as `InProgress`
+/// would be — a signature always has *some* value once resolution reaches
+/// `Done` (a failed piece becomes `TypeIndex::ERROR`, the same
+/// recovery-value pattern `BindingTarget::Error` already uses at the
+/// identity layer), so there's never a case where `Done` itself needs a "no
+/// value" alternative the way `Resolved(T)` does for imports.
 #[derive(Clone, Copy)]
 enum ComputeState {
 	Pending,
 	InProgress,
+	/// Still `InProgress` — this query's own execution hasn't actually
+	/// finished — but a cycle closing back through it has already been
+	/// reported once. See the enum's own doc comment.
+	CycleReported,
 	Done,
 }
 
-/// `ast_index` is this `DefId`'s position in `SignatureBuilder::ast_nodes` —
-/// set once, at construction, from `defs.rs`'s parse-order record, so
+/// Which question is being asked about a `DefId`. The state/stack this
+/// keys into (`query_state`/`query_stack` below) is shared across every
+/// kind — mirrors rustc's own query system: one active stack for cycle
+/// detection across all query kinds, even though each kind's actual
+/// *result* storage (`type_aliases`, `structs`, ...) stays completely
+/// separate, untouched by this. Only one variant exists right now; this
+/// exists so a later, genuinely separate question (e.g. a future body/const
+/// -evaluation pass) has a home to plug into without re-deriving this same
+/// state machine a second time.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum QueryKind {
+	Signature,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct QueryKey {
+	kind: QueryKind,
+	def_id: DefId,
+}
+
+impl QueryKey {
+	fn signature(def_id: DefId) -> Self {
+		Self {
+			kind: QueryKind::Signature,
+			def_id,
+		}
+	}
+}
+
+/// `ast_index` is this key's position in `SignatureBuilder::ast_nodes` — set
+/// once, at construction, from `defs.rs`'s parse-order record, so
 /// `ensure_signature` never needs a second lookup to find the AST it's
 /// supposed to resolve.
-struct SignatureEntry {
+struct QueryEntry {
 	ast_index: u32,
 	state: ComputeState,
 }
 
-/// One in-progress `ensure_signature` frame — mirrors `rustc_query_system`'s
+/// One in-progress query frame — mirrors `rustc_query_system`'s own
 /// `QueryInfo`. `requested_at` is the span of the reference that demanded
-/// `def_id`, i.e. "the reason for which this [item] was required"; `None`
-/// only for a top-level, non-reference demand (the eventual per-`DefId`
-/// driver loop) — `resolve_type` always supplies `Some` when it recurses
-/// because of a written reference.
+/// `key`, i.e. "the reason for which this was required"; `None` only for a
+/// top-level, non-reference demand (the per-`DefId` driver loop) —
+/// `resolve_type` always supplies `Some` when it recurses because of a
+/// written reference.
+#[derive(Clone, Copy)]
+struct QueryFrame {
+	key: QueryKey,
+	requested_at: Option<SourceSpan>,
+}
+
+/// What a caller passes to `ensure_signature` — kept `DefId`-shaped (every
+/// call site already constructs one of these) rather than exposing
+/// `QueryKey` itself, since every current caller only ever means the
+/// `Signature` kind; it's wrapped into a `QueryKey` internally.
 #[derive(Clone, Copy)]
 pub(super) struct QueryInfo {
 	pub(super) def_id: DefId,
@@ -142,12 +209,13 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	ast_nodes: &'ast [AstEntry<'ast>],
 	stdlib_root: NamespaceIndex,
 	item_lookup: HashMap<DefId, ItemLocation>,
-	signature_state: HashMap<DefId, SignatureEntry>,
-	/// In-progress items, in call order.
-	signature_stack: Vec<QueryInfo>,
+	query_state: HashMap<QueryKey, QueryEntry>,
+	/// In-progress queries, in call order — shared across every `QueryKind`.
+	query_stack: Vec<QueryFrame>,
 	types: TypeInterner,
 	type_aliases: Vec<TypeAliasSignature>,
 	trait_supertraits: Vec<Box<[TraitBound]>>,
+	structs: Vec<StructSignature>,
 }
 
 impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
@@ -166,11 +234,25 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		let trait_supertraits: Vec<Box<[TraitBound]>> =
 			defs.traits.iter().map(|_| Box::default()).collect();
 
+		// Same idea, but each slot starts as an (empty type_params, empty
+		// field_types) placeholder rather than `Box::default()` alone — see
+		// `StructSignature`. Never read before its own struct reaches `Done`.
+		let structs: Vec<StructSignature> = defs
+			.structs
+			.iter()
+			.map(|_| StructSignature {
+				type_params: Box::default(),
+				field_types: Box::default(),
+			})
+			.collect();
+
 		let mut item_lookup = HashMap::new();
 		for (index, trait_def) in defs.traits.iter().enumerate() {
 			item_lookup.insert(
 				trait_def.def_id,
-				ItemLocation::Trait(TraitIndex::new(u32::try_from(index).unwrap())),
+				ItemLocation::Trait(TraitIndex::new(
+					u32::try_from(index).unwrap(),
+				)),
 			);
 		}
 		for (index, impl_def) in defs.trait_impls.iter().enumerate() {
@@ -189,14 +271,25 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				)),
 			);
 		}
+		// Pre-allocated, like `Trait` — see `StructIndex`'s own doc comment
+		// in `defs.rs` for why a struct can't wait until `Done` the way
+		// `TypeAlias` does.
+		for (index, struct_def) in defs.structs.iter().enumerate() {
+			item_lookup.insert(
+				struct_def.def_id,
+				ItemLocation::Struct(StructIndex::new(
+					u32::try_from(index).unwrap(),
+				)),
+			);
+		}
 
-		let mut signature_state: HashMap<DefId, SignatureEntry> = ast_nodes
+		let mut query_state: HashMap<QueryKey, QueryEntry> = ast_nodes
 			.iter()
 			.enumerate()
 			.map(|(index, entry)| {
 				(
-					entry.def_id,
-					SignatureEntry {
+					QueryKey::signature(entry.def_id),
+					QueryEntry {
 						ast_index: u32::try_from(index).unwrap(),
 						state: ComputeState::Pending,
 					},
@@ -233,17 +326,18 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			// Only ever absent when `ast_nodes` is deliberately partial (a
 			// test convenience) — real callers always pass the full prescan
 			// output, which covers every primitive by construction.
-			let Some(entry) = signature_state.get_mut(&def_id) else {
+			let key = QueryKey::signature(def_id);
+			let Some(entry) = query_state.get_mut(&key) else {
 				continue;
 			};
+			let ast_index = entry.ast_index;
 			entry.state = ComputeState::Done;
 
-			let index = TypeAliasIndex::new(
-				u32::try_from(type_aliases.len()).unwrap(),
-			);
+			let index =
+				TypeAliasIndex::new(u32::try_from(type_aliases.len()).unwrap());
 			type_aliases.push(TypeAliasSignature {
 				def_id,
-				name: item_name(ast_nodes, &signature_state, def_id),
+				name: item_name(ast_nodes, ast_index),
 				type_params: Box::new([]),
 				target: type_index,
 			});
@@ -257,11 +351,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			ast_nodes,
 			stdlib_root,
 			item_lookup,
-			signature_state,
-			signature_stack: Vec::new(),
+			query_state,
+			query_stack: Vec::new(),
 			types: TypeInterner::new(),
 			type_aliases,
 			trait_supertraits,
+			structs,
 		}
 	}
 
@@ -309,23 +404,42 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 	/// The demand-driven driver: computes `def_id`'s signature if it hasn't
 	/// been already. The two checks below are safe to return early from —
-	/// nothing has been pushed onto `signature_stack` yet at that point.
-	/// Past that, no early `return`: `signature_stack`'s frame has to pop
-	/// and `state` has to reach `Done` no matter which arm runs below, or
-	/// `def_id` is left `InProgress` forever.
-	pub(super) fn ensure_signature(&mut self, query: QueryInfo) -> SignatureStatus {
+	/// nothing has been pushed onto `query_stack` yet at that point. Past
+	/// that, no early `return`: `query_stack`'s frame has to pop and
+	/// `state` has to reach `Done` no matter which arm runs below, or this
+	/// query is left `InProgress` forever.
+	pub(super) fn ensure_signature(
+		&mut self,
+		query: QueryInfo,
+	) -> SignatureStatus {
 		let def_id = query.def_id;
-		match self.signature_state[&def_id].state {
-			ComputeState::Done => return SignatureStatus::Resolved,
-			ComputeState::InProgress => return SignatureStatus::Cycle,
+		let key = QueryKey::signature(def_id);
+		match self.query_state[&key].state {
+			ComputeState::Done | ComputeState::CycleReported => {
+				return SignatureStatus::Resolved;
+			}
+			// First re-entrant discovery: flip to `CycleReported` right
+			// here, atomically, before returning `Cycle` — mirrors
+			// `ResolveStatus::poll`'s `Resolving -> Error` transition. This
+			// is what makes a *second*, independent path that re-discovers
+			// the same still-running query see `CycleReported` (silent)
+			// instead of `InProgress` (which would mean "report again").
+			ComputeState::InProgress => {
+				self.query_state.get_mut(&key).unwrap().state =
+					ComputeState::CycleReported;
+				return SignatureStatus::Cycle;
+			}
 			ComputeState::Pending => {}
 		}
 
-		self.signature_state.get_mut(&def_id).unwrap().state =
+		self.query_state.get_mut(&key).unwrap().state =
 			ComputeState::InProgress;
-		self.signature_stack.push(query);
+		self.query_stack.push(QueryFrame {
+			key,
+			requested_at: query.requested_at,
+		});
 
-		let ast_index = self.signature_state[&def_id].ast_index;
+		let ast_index = self.query_state[&key].ast_index;
 		let ast_nodes = self.ast_nodes;
 		let entry = &ast_nodes[ast_index as usize];
 		let file_id = entry.file_id;
@@ -335,7 +449,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		match node {
 			AstNodeRef::TypeAlias { item } => {
 				let ast::Item::TypeAlias {
-					name, type_params, body, ..
+					name,
+					type_params,
+					body,
+					..
 				} = item
 				else {
 					unreachable!()
@@ -344,10 +461,18 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					"bodiless type aliases are already Done before construction finishes",
 				);
 
-				let resolved_params =
-					self.resolve_generic_params(file_id, namespace, type_params);
-				let target =
-					self.resolve_type(file_id, namespace, def_id, &resolved_params, body);
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					type_params,
+				);
+				let target = self.resolve_type(
+					file_id,
+					namespace,
+					def_id,
+					&resolved_params,
+					body,
+				);
 
 				let index = TypeAliasIndex::new(
 					u32::try_from(self.type_aliases.len()).unwrap(),
@@ -358,7 +483,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params: resolved_params,
 					target,
 				});
-				self.item_lookup.insert(def_id, ItemLocation::TypeAlias(index));
+				self.item_lookup
+					.insert(def_id, ItemLocation::TypeAlias(index));
 			}
 			AstNodeRef::Trait { trait_index, item } => {
 				let ast::Item::Trait { supertraits, .. } = item else {
@@ -366,7 +492,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				};
 
 				let bounds = match supertraits {
-					Some(bound) => self.resolve_bounds(file_id, namespace, bound),
+					Some(bound) => {
+						self.resolve_bounds(file_id, namespace, bound)
+					}
 					None => Box::new([]),
 				};
 
@@ -379,19 +507,117 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						requested_at: Some(reference),
 					});
 					if let SignatureStatus::Cycle = status {
-						let diagnostic =
-							self.report_cyclic_supertrait(super_def_id, reference);
+						let diagnostic = self
+							.report_cyclic_supertrait(super_def_id, reference);
 						self.diagnostics.push(diagnostic);
 					}
 				}
 
 				self.trait_supertraits[usize::from(trait_index)] = bounds;
 			}
+			AstNodeRef::RecordStruct { item } => {
+				let ast::Item::RecordStruct {
+					type_params: ast_type_params,
+					fields,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let Some(&ItemLocation::Struct(struct_index)) =
+					self.item_lookup.get(&def_id)
+				else {
+					unreachable!(
+						"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
+					)
+				};
+
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					ast_type_params,
+				);
+
+				// One-to-one with `defs.structs[..].fields` — a duplicate
+				// name still gets its own slot resolved there, so it does
+				// here too (name lookup, not type resolution, is where a
+				// duplicate is unreachable).
+				let mut field_types: Vec<TypeIndex> =
+					Vec::with_capacity(fields.len());
+				for f in fields.iter() {
+					let ty_expr = &f.inner.inner.ty;
+					let ty = self.resolve_type(
+						file_id,
+						namespace,
+						def_id,
+						&resolved_params,
+						ty_expr,
+					);
+					self.check_struct_direct_recursion(
+						file_id,
+						ty_expr.span,
+						ty,
+					);
+					field_types.push(ty);
+				}
+
+				self.structs[usize::from(struct_index)] = StructSignature {
+					type_params: resolved_params,
+					field_types: field_types.into_boxed_slice(),
+				};
+			}
+			AstNodeRef::TupleStruct { item } => {
+				let ast::Item::TupleStruct {
+					type_params: ast_type_params,
+					fields,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let Some(&ItemLocation::Struct(struct_index)) =
+					self.item_lookup.get(&def_id)
+				else {
+					unreachable!(
+						"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
+					)
+				};
+
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					ast_type_params,
+				);
+
+				let mut field_types: Vec<TypeIndex> =
+					Vec::with_capacity(fields.len());
+				for f in fields.iter() {
+					let ty_expr = &f.inner.inner.ty;
+					let ty = self.resolve_type(
+						file_id,
+						namespace,
+						def_id,
+						&resolved_params,
+						ty_expr,
+					);
+					self.check_struct_direct_recursion(
+						file_id,
+						ty_expr.span,
+						ty,
+					);
+					field_types.push(ty);
+				}
+
+				self.structs[usize::from(struct_index)] = StructSignature {
+					type_params: resolved_params,
+					field_types: field_types.into_boxed_slice(),
+				};
+			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
 
-		self.signature_stack.pop();
-		self.signature_state.get_mut(&def_id).unwrap().state = ComputeState::Done;
+		self.query_stack.pop();
+		self.query_state.get_mut(&key).unwrap().state = ComputeState::Done;
 		SignatureStatus::Resolved
 	}
 
@@ -418,6 +644,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		SignatureRegistry {
 			type_aliases: self.type_aliases,
 			trait_supertraits: self.trait_supertraits,
+			structs: self.structs,
 			item_lookup: self.item_lookup,
 			types: self.types,
 		}
@@ -439,10 +666,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			ast::TypeExpression::Path(segments) => {
 				if let [segment] = &segments[..]
 					&& segment.type_args.is_empty()
-					&& let Some(param_index) = generic_scope
-						.iter()
-						.position(|param| param.name.inner == segment.ident.inner)
-				{
+					&& let Some(param_index) =
+						generic_scope.iter().position(|param| {
+							param.name.inner == segment.ident.inner
+						}) {
 					return self.types.intern(Type::TypeParam {
 						owner,
 						param_index: u32::try_from(param_index).unwrap(),
@@ -470,7 +697,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						let last = segments
 							.last()
 							.expect("a path always has at least one segment");
-						let reference = SourceSpan::new(file_id, last.ident.span);
+						let reference =
+							SourceSpan::new(file_id, last.ident.span);
 
 						let status = self.ensure_signature(QueryInfo {
 							def_id,
@@ -478,8 +706,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						});
 						match status {
 							SignatureStatus::Cycle => {
-								let diagnostic =
-									self.report_cyclic_type_alias(def_id, reference);
+								let diagnostic = self.report_cyclic_type_alias(
+									def_id, reference,
+								);
 								self.diagnostics.push(diagnostic);
 								TypeIndex::ERROR
 							}
@@ -493,17 +722,65 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							}
 						}
 					}
+					DefKind::Struct(struct_def_id) => {
+						let Some(&ItemLocation::Struct(struct_index)) =
+							self.item_lookup.get(&struct_def_id)
+						else {
+							unreachable!(
+								"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
+							)
+						};
+
+						// Identity only — deliberately not `ensure_signature`:
+						// a struct's fields don't need to be resolved to name
+						// the struct itself, which is what lets a self-/
+						// mutually-referencing pointer field resolve without
+						// falsely tripping the cycle machinery `TypeAlias`
+						// needs.
+						let last = segments
+							.last()
+							.expect("a path always has at least one segment");
+						if !last.type_args.is_empty() {
+							todo!(
+								"generic struct instantiation at a reference site isn't implemented yet"
+							)
+						}
+
+						self.types.intern(Type::Struct {
+							struct_index,
+							args: Box::new([]),
+						})
+					}
 					_ => todo!(
 						"resolving a path to this kind of item isn't implemented yet"
 					),
 				}
+			}
+			ast::TypeExpression::Tuple { elements } => {
+				if elements.is_empty() {
+					return TypeIndex::UNIT;
+				}
+				let mut elems: Vec<TypeIndex> =
+					Vec::with_capacity(elements.len());
+				for element in elements.iter() {
+					elems.push(self.resolve_type(
+						file_id,
+						namespace,
+						owner,
+						generic_scope,
+						element,
+					));
+				}
+				self.types.intern(Type::Tuple {
+					elements: elems.into_boxed_slice(),
+				})
 			}
 			_ => todo!("this type-expression form isn't implemented yet"),
 		}
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
-	/// re-enter `def_id` (found `InProgress` somewhere on `signature_stack`).
+	/// re-enter `def_id` (found `InProgress` somewhere on `query_stack`).
 	/// Mirrors rustc's E0391 structure: walks the stack from `def_id`'s own
 	/// frame to the top, and for hop `i` shows the span of the *next*
 	/// frame's `requested_at` — i.e. the reference inside hop `i`'s own body
@@ -514,11 +791,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// already has that span in hand at the point it detects `Cycle`, so it
 	/// passes it in directly as `closing_reference`.
 	///
-	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicSupertrait`, ...)
-	/// — they differ only in which diagnostic code applies and how to phrase
-	/// "why `name` was needed" (`describe`), e.g. `"expanding type alias
-	/// \`A\`"` or `"computing the supertraits of \`A\`"`. Callers append their
-	/// own closing notes on top of the returned diagnostic.
+	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicSupertrait`,
+	/// `RecursiveTypeWithoutIndirection`, ...) — they differ only in which
+	/// diagnostic code applies and how to phrase "why `name` was needed"
+	/// (`describe`), e.g. `"expanding type alias \`A\`"` or `"computing the
+	/// supertraits of \`A\`"`. Callers append their own closing notes on top
+	/// of the returned diagnostic.
 	fn report_cycle(
 		&self,
 		def_id: DefId,
@@ -526,25 +804,29 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		code: DiagnosticCode,
 		describe: impl Fn(&str) -> String,
 	) -> Diagnostic<FileId> {
+		let key = QueryKey::signature(def_id);
 		let position = self
-			.signature_stack
+			.query_stack
 			.iter()
-			.position(|query| query.def_id == def_id)
-			.expect("Cycle is only ever returned for a DefId currently in progress");
-		let chain = &self.signature_stack[position..];
+			.position(|frame| frame.key == key)
+			.expect(
+				"Cycle is only ever returned for a query currently in progress",
+			);
+		let chain = &self.query_stack[position..];
 
 		let hop_span = |i: usize| -> SourceSpan {
 			chain
 				.get(i + 1)
-				.map(|query| {
-					query.requested_at.expect(
+				.map(|frame| {
+					frame.requested_at.expect(
 						"a non-root frame always records why it was required",
 					)
 				})
 				.unwrap_or(closing_reference)
 		};
 
-		let root_name = item_name(self.ast_nodes, &self.signature_state, def_id);
+		let root_name =
+			item_name(self.ast_nodes, self.query_state[&key].ast_index);
 		let root_name_str = self.strings.resolve(root_name.inner).unwrap();
 
 		let mut diagnostic = Diagnostic::error()
@@ -555,13 +837,17 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			))
 			.with_label(hop_span(0).primary_label());
 
-		for (i, query) in chain.iter().enumerate().skip(1) {
-			let name = item_name(self.ast_nodes, &self.signature_state, query.def_id);
+		for (i, frame) in chain.iter().enumerate().skip(1) {
+			let name = item_name(
+				self.ast_nodes,
+				self.query_state[&frame.key].ast_index,
+			);
 			let name_str = self.strings.resolve(name.inner).unwrap();
 			diagnostic = diagnostic.with_label(
-				hop_span(i)
-					.secondary_label()
-					.with_message(format!("...which requires {}...", describe(name_str))),
+				hop_span(i).secondary_label().with_message(format!(
+					"...which requires {}...",
+					describe(name_str)
+				)),
 			);
 		}
 
@@ -600,6 +886,145 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			|name| format!("computing the supertraits of `{name}`"),
 		)
 		.with_note("a trait cannot require itself as a supertrait")
+	}
+
+	/// Renders the rustc-E0072-style diagnostic: every struct in the cycle
+	/// gets its own primary label (at its own declaration name) plus a
+	/// secondary label at the specific field that continues the cycle,
+	/// rather than the single-root "cycle detected when..." chain
+	/// `report_cycle` renders for `CyclicTypeAlias`/`CyclicSupertrait`. The
+	/// full chain is already sitting in `query_stack[position..]` — built up
+	/// by the ordinary recursive `ensure_signature` forcing that got us
+	/// here — so there's nothing to separately collect first.
+	fn report_recursive_struct_cycle(
+		&self,
+		def_id: DefId,
+		closing_reference: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let key = QueryKey::signature(def_id);
+		let position = self
+			.query_stack
+			.iter()
+			.position(|frame| frame.key == key)
+			.expect(
+				"Cycle is only ever returned for a query currently in progress",
+			);
+		let chain = &self.query_stack[position..];
+
+		let hop_span = |i: usize| -> SourceSpan {
+			chain
+				.get(i + 1)
+				.map(|frame| {
+					frame.requested_at.expect(
+						"a non-root frame always records why it was required",
+					)
+				})
+				.unwrap_or(closing_reference)
+		};
+
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::RecursiveTypeWithoutIndirection.code());
+		let mut names = Vec::with_capacity(chain.len());
+		for (i, frame) in chain.iter().enumerate() {
+			let ast_index = self.query_state[&frame.key].ast_index;
+			let file_id = self.ast_nodes[ast_index as usize].file_id;
+			let name = item_name(self.ast_nodes, ast_index);
+			names.push(self.strings.resolve(name.inner).unwrap());
+			diagnostic = diagnostic
+				.with_label(SourceSpan::new(file_id, name.span).primary_label())
+				.with_label(
+					hop_span(i)
+						.secondary_label()
+						.with_message("recursive without indirection"),
+				);
+		}
+
+		let message = match names.as_slice() {
+			[] => unreachable!("a cycle always has at least one participant"),
+			[only] => format!("recursive type `{only}` has infinite size"),
+			[rest @ .., last] => {
+				let joined = rest
+					.iter()
+					.map(|n| format!("`{n}`"))
+					.collect::<Vec<_>>()
+					.join(", ");
+				format!(
+					"recursive types {joined} and `{last}` have infinite size"
+				)
+			}
+		};
+
+		diagnostic
+			.with_message(message)
+			.with_note("insert a pointer or slice field to break the cycle")
+	}
+
+	/// One element of a resolved `Type::Tuple`, re-resolving `ty` fresh
+	/// rather than holding onto a borrowed slice — lets
+	/// `check_struct_direct_recursion` iterate elements without cloning the
+	/// whole `Box<[TypeIndex]>` just to sidestep borrowing `self.types`
+	/// across its own recursive (`&mut self`) call.
+	fn tuple_element(&self, ty: TypeIndex, index: usize) -> TypeIndex {
+		let Type::Tuple { elements } = self.types.resolve(ty) else {
+			unreachable!("only called when ty is already known to be a Tuple")
+		};
+		elements[index]
+	}
+
+	/// Walks `ty` for directly-embedded (non-indirected) struct references —
+	/// `Type::Struct`/`Type::Tuple` embed inline and are followed;
+	/// `Type::Pointer`/`Slice`/`Array` always carry their own memory +
+	/// ownership sigil and live out-of-line, so the walk stops there. Each
+	/// struct reference found is *forced* via `ensure_signature` — reusing
+	/// the exact same demand-driven cycle detection every other kind in this
+	/// file already has, rather than a separate visited-set walk: if that
+	/// forcing call returns `Cycle`, this reports it via
+	/// `report_recursive_struct_cycle`, which reads the full chain straight
+	/// out of `query_stack`.
+	///
+	/// `args` is ignored entirely — a generic struct's own type arguments
+	/// are never substituted into its fields here, so
+	/// `struct Wrapper<T> { v: T } struct A { w: Wrapper<A> }` isn't
+	/// caught. That's sound, not just incomplete: ignoring substitution can
+	/// only remove edges from the graph being walked, never invent one, so
+	/// this can under-detect but never falsely flag a cycle. Catching that
+	/// case needs `params_in_repr`-style type-parameter substitution
+	/// utilities that don't exist yet — deliberately deferred, not
+	/// forgotten.
+	fn check_struct_direct_recursion(
+		&mut self,
+		file_id: FileId,
+		field_span: TextSpan,
+		ty: TypeIndex,
+	) {
+		match self.types.resolve(ty) {
+			Type::Struct { struct_index, .. } => {
+				let embedded_def_id =
+					self.defs.structs[usize::from(*struct_index)].def_id;
+				let reference = SourceSpan::new(file_id, field_span);
+				let status = self.ensure_signature(QueryInfo {
+					def_id: embedded_def_id,
+					requested_at: Some(reference),
+				});
+				if let SignatureStatus::Cycle = status {
+					let diagnostic = self.report_recursive_struct_cycle(
+						embedded_def_id,
+						reference,
+					);
+					self.diagnostics.push(diagnostic);
+				}
+			}
+			Type::Tuple { elements } => {
+				let len = elements.len();
+				for i in 0..len {
+					let element = self.tuple_element(ty, i);
+					self.check_struct_direct_recursion(
+						file_id, field_span, element,
+					);
+				}
+			}
+			_ => {}
+		}
 	}
 
 	fn resolve_bounds(
@@ -690,12 +1115,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 /// finished resolving yet (a cycle's participants never do), or, in
 /// `SignatureBuilder::new`'s primitive pre-pass, before a `SignatureBuilder`
 /// exists at all to call a method on.
-fn item_name(
-	ast_nodes: &[AstEntry],
-	signature_state: &HashMap<DefId, SignatureEntry>,
-	def_id: DefId,
-) -> Spanned<SymbolU32> {
-	let ast_index = signature_state[&def_id].ast_index;
+fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 	match ast_nodes[ast_index as usize].node.clone() {
 		AstNodeRef::TypeAlias { item } => {
 			let ast::Item::TypeAlias { name, .. } = item else {
@@ -705,6 +1125,18 @@ fn item_name(
 		}
 		AstNodeRef::Trait { item, .. } => {
 			let ast::Item::Trait { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::RecordStruct { item } => {
+			let ast::Item::RecordStruct { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::TupleStruct { item } => {
+			let ast::Item::TupleStruct { name, .. } = item else {
 				unreachable!()
 			};
 			*name
@@ -751,7 +1183,6 @@ fn report_expected_trait_bound(
 				.with_message("not a trait"),
 		)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -842,10 +1273,11 @@ mod tests {
 		/// cleanly, so any diagnostic here would only ever be a bug in the
 		/// test, not something worth asserting on.
 		fn resolve(&self, path: &str) -> DefKind {
-			let root = self.defs.package_namespaces[self.graph.root_package.as_usize()];
+			let root = self.defs.package_namespaces
+				[self.graph.root_package.as_usize()];
 			let file_id = self.defs.namespaces[usize::from(root)].file_id;
-			let stdlib_root =
-				self.defs.package_namespaces[self.graph.stdlib_package.as_usize()];
+			let stdlib_root = self.defs.package_namespaces
+				[self.graph.stdlib_package.as_usize()];
 
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
@@ -875,9 +1307,9 @@ mod tests {
 				&segments,
 				BindingNamespace::Type,
 			);
-			let def_key = target
-				.def_key()
-				.unwrap_or_else(|| panic!("expected `{path}` to resolve: {scratch:?}"));
+			let def_key = target.def_key().unwrap_or_else(|| {
+				panic!("expected `{path}` to resolve: {scratch:?}")
+			});
 			def_key.symbol_kind(&self.defs)
 		}
 
@@ -885,7 +1317,8 @@ mod tests {
 			let DefKind::Trait(def_id) = self.resolve(path) else {
 				panic!("expected `{path}` to be a trait");
 			};
-			let Some(&ItemLocation::Trait(index)) = self.registry.item_lookup.get(&def_id)
+			let Some(&ItemLocation::Trait(index)) =
+				self.registry.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Trait location for `{path}`");
 			};
@@ -893,7 +1326,8 @@ mod tests {
 		}
 
 		fn trait_supertraits(&self, path: &str) -> &[TraitBound] {
-			&self.registry.trait_supertraits[usize::from(self.trait_index(path))]
+			&self.registry.trait_supertraits
+				[usize::from(self.trait_index(path))]
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
@@ -907,6 +1341,18 @@ mod tests {
 			};
 			&self.registry.type_aliases[usize::from(index)]
 		}
+
+		fn struct_signature(&self, path: &str) -> &StructSignature {
+			let DefKind::Struct(def_id) = self.resolve(path) else {
+				panic!("expected `{path}` to be a struct");
+			};
+			let Some(&ItemLocation::Struct(index)) =
+				self.registry.item_lookup.get(&def_id)
+			else {
+				panic!("expected a Struct location for `{path}`");
+			};
+			&self.registry.structs[usize::from(index)]
+		}
 	}
 
 	#[test]
@@ -914,8 +1360,7 @@ mod tests {
 		let case = TestCase::new("type A<T, U> = T;");
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let type_params =
-			&case.type_alias("A").type_params;
+		let type_params = &case.type_alias("A").type_params;
 		assert_eq!(type_params.len(), 2);
 		assert!(type_params.iter().all(|p| p.bounds.is_empty()));
 	}
@@ -924,8 +1369,7 @@ mod tests {
 	fn duplicate_param_name_is_reported_but_both_entries_survive() {
 		let case = TestCase::new("type A<T, T> = T;");
 
-		let type_params =
-			&case.type_alias("A").type_params;
+		let type_params = &case.type_alias("A").type_params;
 		assert_eq!(type_params.len(), 2, "a duplicate name isn't dropped");
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
@@ -953,20 +1397,13 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		assert_eq!(
-			case.type_alias("A").type_params[0]
-				.bounds
-				.len(),
-			1
-		);
+		assert_eq!(case.type_alias("A").type_params[0].bounds.len(), 1);
 	}
 
 	#[test]
-	#[ignore = "ensure_all_signatures panics on this source's own `struct` \
-	            declaration — Struct isn't dispatched in ensure_signature yet. \
-	            Re-enable once that arm lands."]
 	fn a_bound_naming_a_non_trait_is_rejected() {
 		let case = TestCase::new(indoc! {"
+			pub type i32;
 			struct NotATrait { x: i32 }
 			type A<T: NotATrait> = T;
 		"});
@@ -986,12 +1423,7 @@ mod tests {
 	fn a_bound_naming_nothing_is_reported_by_path_resolution_itself() {
 		let case = TestCase::new("type A<T: DoesNotExist> = T;");
 
-		assert_eq!(
-			case.type_alias("A").type_params[0]
-				.bounds
-				.len(),
-			0
-		);
+		assert_eq!(case.type_alias("A").type_params[0].bounds.len(), 0);
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
@@ -1012,18 +1444,9 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		assert_eq!(
-			case.type_alias("A").target,
-			TypeIndex::I32
-		);
-		assert_eq!(
-			case.type_alias("B").target,
-			TypeIndex::BOOL
-		);
-		assert_eq!(
-			case.type_alias("C").target,
-			TypeIndex::CHAR
-		);
+		assert_eq!(case.type_alias("A").target, TypeIndex::I32);
+		assert_eq!(case.type_alias("B").target, TypeIndex::BOOL);
+		assert_eq!(case.type_alias("C").target, TypeIndex::CHAR);
 	}
 
 	#[test]
@@ -1092,6 +1515,123 @@ mod tests {
 			case.trait_supertraits("B")[0].trait_index,
 			case.trait_index("A"),
 			"B must still finish, not get stuck, even though it's only reached transitively"
+		);
+	}
+
+	#[test]
+	fn a_supertrait_cycle_via_two_different_bounds_is_reported_once() {
+		// Regression test for the double-report bug this session's
+		// `ComputeState::CycleReported` fix closes: `A` stays `InProgress`
+		// for its whole bound list, so both `B` and `C` independently
+		// re-discover it — without the fix, each would report its own
+		// cycle diagnostic for what's really one finding.
+		let case = TestCase::new(indoc! {"
+			trait A: B + C { }
+			trait B: A { }
+			trait C: A { }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::CyclicSupertrait.code())
+		);
+	}
+
+	#[test]
+	fn a_struct_with_primitive_fields_resolves() {
+		let case = TestCase::new(indoc! {"
+			pub type i32;
+			struct Point { x: i32, y: i32 }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let field_types = &case.struct_signature("Point").field_types;
+		assert_eq!(field_types.len(), 2);
+		assert_eq!(field_types[0], TypeIndex::I32);
+		assert_eq!(field_types[1], TypeIndex::I32);
+	}
+
+	#[test]
+	fn a_tuple_struct_resolves() {
+		let case = TestCase::new(indoc! {"
+			pub type i32;
+			struct Pair(i32, i32);
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.struct_signature("Pair").field_types.len(), 2);
+	}
+
+	#[test]
+	fn a_struct_referencing_another_struct_resolves() {
+		let case = TestCase::new(indoc! {"
+			struct Inner { }
+			struct Outer { inner: Inner }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+	}
+
+	#[test]
+	fn a_directly_self_recursive_struct_is_rejected() {
+		let case = TestCase::new("struct A { a: A }");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
+		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"recursive type `A` has infinite size"
+		);
+	}
+
+	#[test]
+	fn a_tuple_field_embedding_the_struct_directly_is_rejected() {
+		let case = TestCase::new("struct A { a: (A, A) }");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
+		);
+	}
+
+	#[test]
+	fn a_mutually_recursive_struct_pair_is_rejected_once() {
+		let case = TestCase::new(indoc! {"
+			struct A { b: B }
+			struct B { a: A }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
+		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"recursive types `A` and `B` have infinite size"
+		);
+	}
+
+	#[test]
+	fn a_struct_cyclic_via_two_different_fields_is_reported_once() {
+		// Same double-report shape as the supertrait regression test above,
+		// but for structs: `A` has two fields (`b`, `c`) that each
+		// independently lead back to `A`.
+		let case = TestCase::new(indoc! {"
+			struct A { b: B, c: C }
+			struct B { a: A }
+			struct C { a: A }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
 	}
 }

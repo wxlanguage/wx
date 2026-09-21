@@ -42,6 +42,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
+	structs: Vec<StructDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
@@ -183,6 +184,44 @@ pub struct InherentImplDef {
 	pub self_accesses: Vec<SourceSpan>,
 }
 
+/// Field identity only (names, `pub_span`, dedup/lookup) — field *types*
+/// are `signatures::StructSignature::field_types`, index-aligned with
+/// whichever `StructFields` variant is used here.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct StructDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
+	pub fields: StructFields,
+}
+
+/// `Tuple` carries no `lookup` — a tuple field has no name to look up by.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum StructFields {
+	Record {
+		fields: Box<[RecordFieldDef]>,
+		#[cfg_attr(
+			test,
+			serde(serialize_with = "crate::testing::serialize_sorted_map")
+		)]
+		lookup: HashMap<SymbolU32, FieldIndex>,
+	},
+	Tuple {
+		fields: Box<[TupleFieldDef]>,
+	},
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct RecordFieldDef {
+	pub name: Spanned<SymbolU32>,
+	pub pub_span: Option<TextSpan>,
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct TupleFieldDef {
+	pub pub_span: Option<TextSpan>,
+}
+
 index_newtype!(LocalDefIndex);
 index_newtype!(MemberIndex);
 index_newtype!(ModuleDeclIndex);
@@ -191,6 +230,13 @@ index_newtype!(NamespaceIndex);
 index_newtype!(TraitIndex);
 index_newtype!(InherentImplIndex);
 index_newtype!(TraitImplIndex);
+// Pre-allocated here (like `TraitIndex`), not lazily in `signatures.rs`
+// (like `TypeAlias`) — a struct's identity doesn't depend on its own
+// fields being resolved, so a self-/mutually-referencing pointer field
+// needs a stable index without waiting on `ensure_signature`.
+index_newtype!(StructIndex);
+// A field's declaration-order position within its struct.
+index_newtype!(FieldIndex);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -329,6 +375,7 @@ pub(super) struct DefinitionRegistry {
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
+	pub structs: Vec<StructDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
@@ -1416,6 +1463,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			traits: Vec::new(),
 			trait_impls: Vec::new(),
 			inherent_impls: Vec::new(),
+			structs: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1458,6 +1506,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
+			structs: builder.structs,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
@@ -1784,7 +1833,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::RecordStruct {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				fields,
+				..
 			} => {
 				let def_key = self.push_def(
 					namespace,
@@ -1796,6 +1849,48 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+
+				// Every written field gets a real `FieldIndex` and keeps its
+				// storage slot — including a duplicate name, which is only
+				// unreachable by name (`lookup` keeps the first occurrence),
+				// not dropped: dropping it would shift every later field's
+				// index and hide its type from the recursion check below.
+				let mut record_fields: Vec<RecordFieldDef> =
+					Vec::with_capacity(fields.len());
+				let mut lookup: HashMap<SymbolU32, FieldIndex> =
+					HashMap::with_capacity(fields.len());
+				for f in fields.iter() {
+					let field = &f.inner.inner;
+					let index = FieldIndex::new(
+						u32::try_from(record_fields.len()).unwrap(),
+					);
+					if let Some(&first_index) = lookup.get(&field.name.inner) {
+						let first_name =
+							record_fields[usize::from(first_index)].name;
+						self.diagnostics.push(report_duplicate_struct_field(
+							self.strings,
+							file_id,
+							field.name,
+							first_name,
+						));
+					} else {
+						lookup.insert(field.name.inner, index);
+					}
+					record_fields.push(RecordFieldDef {
+						name: field.name,
+						pub_span: field.pub_span,
+					});
+				}
+				self.structs.push(StructDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					fields: StructFields::Record {
+						fields: record_fields.into_boxed_slice(),
+						lookup,
+					},
+				});
+
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -1842,6 +1937,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					),
 					name.span,
 				);
+
+				self.structs.push(StructDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					fields: StructFields::Tuple {
+						fields: fields
+							.iter()
+							.map(|f| TupleFieldDef {
+								pub_span: f.inner.inner.pub_span,
+							})
+							.collect(),
+					},
+				});
+
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2594,12 +2704,35 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	}
 }
 
+fn report_duplicate_struct_field(
+	strings: &StringInterner,
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+	first: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateStructField.code())
+		.with_message(format!("field `{name_str}` is already declared"))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("already declared"),
+		)
+		.with_label(
+			SourceSpan::new(file_id, first.span)
+				.secondary_label()
+				.with_message(format!("`{name_str}` first declared here")),
+		)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
 
 	use indoc::indoc;
 
+	use super::super::paths::PathResolver;
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::vfs;
@@ -2688,6 +2821,52 @@ mod tests {
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
+		}
+
+		/// Resolves `path` (`::`-separated) as a type-position path from the
+		/// root namespace, via the real `PathResolver` — the same mechanism
+		/// production code uses, so a test asking for `"a::Foo"` gets
+		/// whatever namespacing/shadowing rules would actually pick, not
+		/// just *an* item with that spelling somewhere. Mirrors
+		/// `signatures.rs`'s own `TestCase::resolve`.
+		fn resolve(&self, path: &str) -> DefKind {
+			let root = self.root_namespace();
+			let file_id = self.defs.namespaces[usize::from(root)].file_id;
+			let stdlib_root = self.defs.package_namespaces
+				[self.graph.stdlib_package.as_usize()];
+
+			let segments: Box<[ast::PathSegment]> = path
+				.split("::")
+				.map(|segment| ast::PathSegment {
+					ident: Spanned {
+						inner: self
+							.graph
+							.strings
+							.get(segment)
+							.expect("already interned from source"),
+						span: TextSpan::new(0, 0),
+					},
+					type_args: Box::new([]),
+				})
+				.collect();
+			let mut scratch = Vec::new();
+			let target = PathResolver::new(
+				&self.defs.namespaces,
+				&self.defs.use_items,
+				stdlib_root,
+			)
+			.resolve_path(
+				&mut scratch,
+				&self.graph.strings,
+				file_id,
+				root,
+				&segments,
+				BindingNamespace::Type,
+			);
+			let def_key = target.def_key().unwrap_or_else(|| {
+				panic!("expected `{path}` to resolve: {scratch:?}")
+			});
+			def_key.symbol_kind(&self.defs)
 		}
 
 		fn lookup_type(
@@ -2940,6 +3119,46 @@ mod tests {
 			value_binding.target,
 			BindingTarget::Inaccessible(_)
 		));
+	}
+
+	#[test]
+	fn duplicate_record_field_is_reported_but_keeps_its_own_slot() {
+		let mut case = TestCase::new(indoc! {"
+			struct Point { x: i32, x: i32 }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateStructField.code())
+		);
+
+		// `Point` isn't necessarily `defs.structs[0]` — the real stdlib
+		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
+		// `RawPtr`), so look it up by name rather than assuming an index.
+		let DefKind::Struct(point_def_id) = case.resolve("Point") else {
+			panic!("expected `Point` to be a struct")
+		};
+		let struct_def = case
+			.defs
+			.structs
+			.iter()
+			.find(|s| s.def_id == point_def_id)
+			.expect("Point should have its own StructDef entry");
+
+		let StructFields::Record { fields, lookup } = &struct_def.fields else {
+			panic!("expected a record struct");
+		};
+		// Both occurrences keep a real field slot — duplicate name isn't
+		// dropped, only unreachable by name — so a later field's index
+		// still matches its declaration position.
+		assert_eq!(fields.len(), 2);
+		assert_eq!(fields[0].name.inner, fields[1].name.inner);
+		// `lookup` only ever points at the first occurrence.
+		assert_eq!(
+			lookup.get(&fields[1].name.inner),
+			Some(&FieldIndex::new(0))
+		);
 	}
 
 	#[test]
