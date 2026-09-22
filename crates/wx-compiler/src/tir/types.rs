@@ -5,11 +5,11 @@
 //! this module only answers "given a `Type`, what `TypeIndex` names it",
 //! never "what type does this path/expression have". It depends on `defs`
 //! for `TraitIndex` (an associated-type projection names the trait that
-//! declares it) and `StructIndex` (pre-allocated in `defs.rs`'s Phase 1, for
-//! the same reason as `TraitIndex`) but nothing here calls into name
-//! resolution, and nothing in `defs` depends back on this module — see
-//! `tir/defs.rs`'s own doc comment for why that direction has to stay
-//! one-way.
+//! declares it) and `StructIndex`/`EnumIndex` (both pre-allocated in
+//! `defs.rs`'s Phase 1, for the same reason as `TraitIndex`) but nothing
+//! here calls into name resolution, and nothing in `defs` depends back on
+//! this module — see `tir/defs.rs`'s own doc comment for why that direction
+//! has to stay one-way.
 //!
 //! A type parameter's owner is a bare `ast::DefId` rather than a dedicated
 //! `TypeParamOwner` enum (the old builder's shape, one variant per arena a
@@ -24,13 +24,9 @@ use crate::ast::DefId;
 use crate::index::index_newtype;
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{StructIndex, TraitIndex};
+use super::defs::{EnumIndex, StructIndex, TraitIndex};
 
 index_newtype!(TypeIndex);
-// `EnumIndex` stays here (rather than moving to `defs.rs` like `StructIndex`
-// did) since nothing pre-allocates it in Phase 1 yet — `Enum` isn't
-// implemented in `signatures.rs`.
-index_newtype!(EnumIndex);
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]

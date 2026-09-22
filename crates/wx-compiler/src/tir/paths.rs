@@ -17,10 +17,11 @@
 //! qualified path's later segments are never "unqualified."
 //!
 //! Deliberately stops at the namespace graph's edge. Once a segment
-//! resolves to something that isn't itself a `DefKind::Namespace` — a
-//! struct, enum, trait, ... — there's nowhere left to look up the next
-//! segment using this module's own machinery: namespace bindings are the
-//! only kind it knows about. Resolving `Type::member` needs the
+//! resolves to a `DefKind` that doesn't own a namespace of its own
+//! (`DefKind::as_namespace` returns `None`) — a struct, an enum variant, a
+//! trait, ... — there's nowhere left to look up the next segment using this
+//! module's own machinery: namespace bindings are the only kind it knows
+//! about. Resolving `Type::member` needs the
 //! inherent/trait impl dispatch tables instead (not built yet); that case
 //! surfaces as `PathResolution::stopped_with` being `Found` while
 //! `stopped_at` is still short of the last segment, for
@@ -204,9 +205,9 @@ impl<'r> PathResolver<'r> {
 							first_inaccessible,
 						};
 					};
-					match self.def_kind(def_key) {
-						DefKind::Namespace(next) => base = next,
-						_ => {
+					match self.def_kind(def_key).as_namespace() {
+						Some(next) => base = next,
+						None => {
 							return PathResolution {
 								stopped_at: index as u32,
 								stopped_with: outcome,
@@ -563,9 +564,8 @@ mod tests {
 		"});
 		let root = case.root_namespace();
 		let inner_key = assert_resolved(case.resolve_type(root, "inner"));
-		let DefKind::Namespace(inner) = inner_key.symbol_kind(&case.defs)
-		else {
-			panic!("expected a namespace");
+		let DefKind::Module(inner) = inner_key.symbol_kind(&case.defs) else {
+			panic!("expected a module");
 		};
 
 		let resolution = case.resolve_type(inner, "Outer");

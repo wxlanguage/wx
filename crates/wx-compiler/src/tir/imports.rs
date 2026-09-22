@@ -21,12 +21,6 @@ use super::defs::{
 	UsePathSegment, Visibility,
 };
 
-#[derive(Clone, Copy)]
-enum ImportScope {
-	Namespace(NamespaceIndex),
-	// TODO: Enum, Variant etc..
-}
-
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
 /// name. Kept distinct from a plain `Option<DefKey>` so the caller can
 /// tell "nothing by this name here" apart from "something's here, but not
@@ -130,7 +124,7 @@ pub(super) struct ImportResolver<'r> {
 		&'r HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
 	pending_glob_targets: &'r HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
 
-	path_state: &'r mut [ResolveStatus<ImportScope>],
+	path_state: &'r mut [ResolveStatus<NamespaceIndex>],
 	item_state: &'r mut [ResolveStatus<()>],
 	/// Every `use` item currently being resolved, innermost last — pushed
 	/// and popped, generically, by `ensure_import_item` for both named leaves
@@ -325,7 +319,7 @@ impl<'r> ImportResolver<'r> {
 		let scope = match prefix {
 			Some(prefix) => {
 				match self.ensure_import_path(namespace, prefix, index) {
-					Ok(ImportScope::Namespace(ns)) => ns,
+					Ok(ns) => ns,
 					Err(()) => return,
 				}
 			}
@@ -505,9 +499,7 @@ impl<'r> ImportResolver<'r> {
 		let item = &self.use_items[usize::from(index)];
 		let namespace = item.namespace;
 
-		let Ok(ImportScope::Namespace(target)) =
-			self.ensure_import_path(namespace, path, index)
-		else {
+		let Ok(target) = self.ensure_import_path(namespace, path, index) else {
 			return;
 		};
 
@@ -628,8 +620,8 @@ impl<'r> ImportResolver<'r> {
 	/// A single `BindingKey` slot lookup — deliberately simpler than
 	/// `binding_to_import_scope`: the terminal leaf of a `use` can be any
 	/// def kind (function, struct, const...), not just a namespace, so
-	/// there's no `DefKind::Namespace` requirement here, just visibility
-	/// and `Def`-ness.
+	/// there's no `as_namespace` requirement here, just visibility and
+	/// `Def`-ness.
 	fn resolve_member_def(
 		&mut self,
 		accessor: NamespaceIndex,
@@ -719,7 +711,7 @@ impl<'r> ImportResolver<'r> {
 		origin: NamespaceIndex,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<ImportScope, ()> {
+	) -> Result<NamespaceIndex, ()> {
 		match self.path_state[usize::from(path)].poll() {
 			ResolveStep::Ready(result) => return result,
 			ResolveStep::Cycle => {
@@ -758,40 +750,26 @@ impl<'r> ImportResolver<'r> {
 		origin: NamespaceIndex,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<ImportScope, ()> {
+	) -> Result<NamespaceIndex, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		match segment.parent {
 			None => {
 				self.binding_to_import_scope(origin, origin, path, current_item)
 			}
+			// Every segment after the first looks its own name up inside
+			// the namespace the previous segment resolved to, rather than
+			// `origin` — the first segment is the only one looked up
+			// directly in `origin`'s own bindings (the `None` branch above),
+			// since there's no prior scope yet to look inside of.
 			Some(parent) => {
 				let parent_scope =
 					self.ensure_import_path(origin, parent, current_item)?;
-				self.resolve_import_scope_member(
-					origin,
+				self.binding_to_import_scope(
 					parent_scope,
+					origin,
 					path,
 					current_item,
 				)
-			}
-		}
-	}
-
-	/// One step further down an already-resolved scope — looks up `path`'s
-	/// own segment inside `scope` itself, rather than `origin`. Used for
-	/// every path segment after the first; the first segment is looked up
-	/// directly in `origin`'s own bindings by `compute_import_path`'s `None`
-	/// branch, since there's no prior scope yet to look inside of.
-	fn resolve_import_scope_member(
-		&mut self,
-		origin: NamespaceIndex,
-		scope: ImportScope,
-		path: UsePathIndex,
-		current_item: UseItemIndex,
-	) -> Result<ImportScope, ()> {
-		match scope {
-			ImportScope::Namespace(ns) => {
-				self.binding_to_import_scope(ns, origin, path, current_item)
 			}
 		}
 	}
@@ -814,7 +792,7 @@ impl<'r> ImportResolver<'r> {
 		accessor: NamespaceIndex,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<ImportScope, ()> {
+	) -> Result<NamespaceIndex, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		let key = BindingKey::ty(segment.segment.inner);
 
@@ -916,11 +894,9 @@ impl<'r> ImportResolver<'r> {
 
 		let def = &self.namespaces[usize::from(def_key.namespace_idx)].items
 			[usize::from(def_key.def_idx)];
-		match def.kind {
-			DefKind::Namespace(namespace) => {
-				Ok(ImportScope::Namespace(namespace))
-			}
-			_ => {
+		match def.kind.as_namespace() {
+			Some(namespace) => Ok(namespace),
+			None => {
 				let diagnostic = report_cannot_use_as_namespace(
 					self.namespaces,
 					self.strings,
@@ -1301,13 +1277,11 @@ mod tests {
 			let BindingTarget::Accessible(def_key) = target else {
 				panic!("`{name}` should be accessible here");
 			};
-			match self.defs.namespaces[usize::from(def_key.namespace_idx)].items
-				[usize::from(def_key.def_idx)]
-			.kind
-			{
-				DefKind::Namespace(namespace) => namespace,
-				other => panic!("`{name}` is not a module: {other:?}"),
-			}
+			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
+				.items[usize::from(def_key.def_idx)]
+				.kind;
+			kind.as_namespace()
+				.unwrap_or_else(|| panic!("`{name}` is not a namespace: {kind:?}"))
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.
@@ -1344,6 +1318,29 @@ mod tests {
 			case.lookup_value(root, "helper")
 		else {
 			panic!("`use inner::helper;` should install a binding at the root");
+		};
+		assert_eq!(imported, original);
+	}
+
+	#[test]
+	fn use_resolves_an_enum_variant() {
+		let mut case = TestCase::new(indoc! {"
+			enum Color { Red, Green, Blue }
+			use Color::Red;
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let root = case.root_namespace();
+		let color = case.child_namespace(root, "Color");
+		let Some(BindingTarget::Accessible(original)) =
+			case.lookup_value(color, "Red")
+		else {
+			panic!("`Color::Red` should resolve directly");
+		};
+		let Some(BindingTarget::Accessible(imported)) =
+			case.lookup_value(root, "Red")
+		else {
+			panic!("`use Color::Red;` should install a binding at the root");
 		};
 		assert_eq!(imported, original);
 	}

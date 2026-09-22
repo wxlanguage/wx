@@ -43,6 +43,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
 	structs: Vec<StructDef>,
+	enums: Vec<EnumDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
@@ -222,6 +223,14 @@ pub struct TupleFieldDef {
 	pub pub_span: Option<TextSpan>,
 }
 
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct EnumDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
+	pub variants_namespace: NamespaceIndex,
+}
+
 index_newtype!(LocalDefIndex);
 index_newtype!(MemberIndex);
 index_newtype!(ModuleDeclIndex);
@@ -237,6 +246,10 @@ index_newtype!(TraitImplIndex);
 index_newtype!(StructIndex);
 // A field's declaration-order position within its struct.
 index_newtype!(FieldIndex);
+// Pre-allocated here (like `StructIndex`) — an enum's variant namespace is
+// created in Phase 1, so `NamespaceKind::Enum` needs a stable index to point
+// at before `signatures.rs` has any reason to resolve this enum.
+index_newtype!(EnumIndex);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -376,6 +389,7 @@ pub(super) struct DefinitionRegistry {
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
 	pub structs: Vec<StructDef>,
+	pub enums: Vec<EnumDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
@@ -489,6 +503,14 @@ pub enum NamespaceKind {
 	/// for diagnostic spans; which package it is lives on
 	/// [`ModuleNamespace::package`], the same as for every other namespace.
 	Package(FileId),
+	/// An enum's own variant scope — lets `Enum::Variant` (and eventually
+	/// `use Enum::*;`) resolve through the same segment-walking `PathResolver`
+	/// already uses for `module::item`, rather than a bespoke lookup. Unlike
+	/// a module, this namespace is never the binding installed for the
+	/// enum's own name — that stays `DefKind::Enum` so the enum keeps its
+	/// own identity (diagnostics, type resolution) rather than being
+	/// mistaken for a plain module. See `EnumDef::variants_namespace`.
+	Enum(EnumIndex),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -524,8 +546,11 @@ impl Visibility {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum DefKind {
-	Namespace(NamespaceIndex),
-	Enum(DefId),
+	Module(NamespaceIndex),
+	Import(NamespaceIndex),
+	Package(NamespaceIndex),
+	Enum(NamespaceIndex),
+	EnumVariant(DefId),
 	Struct(DefId),
 	Memory(DefId),
 	Trait(DefId),
@@ -541,9 +566,12 @@ impl DefKind {
 	/// What kind of symbol this is, for diagnostics.
 	pub fn noun(self) -> &'static str {
 		match self {
+			DefKind::Module(_) => "module",
+			DefKind::Import(_) => "import block",
+			DefKind::Package(_) => "package",
 			DefKind::Enum(_) => "enum",
+			DefKind::EnumVariant(_) => "enum variant",
 			DefKind::Struct(_) => "struct",
-			DefKind::Namespace(_) => "module",
 			DefKind::Memory(_) => "memory",
 			DefKind::Trait(_) => "trait",
 			DefKind::TypeSet(_) => "typeset",
@@ -552,6 +580,31 @@ impl DefKind {
 			DefKind::Const(_) => "constant",
 			DefKind::TraitAssocType(_) => "associated type",
 			DefKind::TypeAlias(_) => "type alias",
+		}
+	}
+
+	/// The namespace a path can continue walking into through this def, if
+	/// any — every kind whose own identity *is* owning a `NamespaceIndex`.
+	/// `Struct`/`Trait`/... are excluded even though some will eventually
+	/// gain their own member namespaces too (impl/trait members): those are
+	/// resolved through dedicated member lookups, never through this
+	/// module's segment walk, so they never belong here.
+	pub(super) fn as_namespace(self) -> Option<NamespaceIndex> {
+		match self {
+			DefKind::Module(idx)
+			| DefKind::Import(idx)
+			| DefKind::Package(idx)
+			| DefKind::Enum(idx) => Some(idx),
+			DefKind::EnumVariant(_)
+			| DefKind::Struct(_)
+			| DefKind::Memory(_)
+			| DefKind::Trait(_)
+			| DefKind::TypeSet(_)
+			| DefKind::Global(_)
+			| DefKind::Function(_)
+			| DefKind::Const(_)
+			| DefKind::TraitAssocType(_)
+			| DefKind::TypeAlias(_) => None,
 		}
 	}
 }
@@ -1406,7 +1459,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					file_id: package.modules[package.root.as_usize()].file_id,
 					bindings: HashMap::new(),
 					items: vec![ItemDef::new(
-						DefKind::Namespace(namespace_idx),
+						DefKind::Package(namespace_idx),
 						TextSpan::new(0, 0),
 					)],
 					glob_imports: Vec::new(),
@@ -1464,6 +1517,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			trait_impls: Vec::new(),
 			inherent_impls: Vec::new(),
 			structs: Vec::new(),
+			enums: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1507,6 +1561,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
 			structs: builder.structs,
+			enums: builder.enums,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
@@ -1693,16 +1748,25 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		);
 		let package_id =
 			self.namespaces[usize::from(parent_namespace)].package_id;
+		// Only `Module`/`Import` are ever declared through this helper —
+		// `Package` roots are built directly (they have no parent to
+		// declare them from) and `Enum`'s variant namespace is built by its
+		// own prescan arm (it needs neither the `self`/`crate`/`super`
+		// bindings below nor a name claimed in `parent_namespace`).
+		let def_kind = match kind {
+			NamespaceKind::Module(_) => DefKind::Module(namespace_idx),
+			NamespaceKind::Import(_) => DefKind::Import(namespace_idx),
+			NamespaceKind::Package(_) | NamespaceKind::Enum(_) => {
+				unreachable!("only Module/Import namespaces are declared here")
+			}
+		};
 		let mut namespace = Namespace {
 			parent: Some(parent_namespace),
 			file_id,
 			package_id,
 			kind,
 			bindings: HashMap::new(),
-			items: vec![ItemDef::new(
-				DefKind::Namespace(namespace_idx),
-				content_span,
-			)],
+			items: vec![ItemDef::new(def_kind, content_span)],
 			glob_imports: Vec::new(),
 		};
 		namespace.bindings.insert(
@@ -1960,11 +2024,41 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Enum {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				name,
+				variants,
+				..
 			} => {
+				let enum_index =
+					EnumIndex::new(u32::try_from(self.enums.len()).unwrap());
+				let variants_namespace = NamespaceIndex::new(
+					u32::try_from(self.namespaces.len()).unwrap(),
+				);
+				let package_id =
+					self.namespaces[usize::from(namespace)].package_id;
+				self.namespaces.push(Namespace {
+					parent: Some(namespace),
+					file_id,
+					package_id,
+					kind: NamespaceKind::Enum(enum_index),
+					bindings: HashMap::new(),
+					items: Vec::new(),
+					glob_imports: Vec::new(),
+				});
+				self.enums.push(EnumDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					variants_namespace,
+				});
+
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Enum(*id), name.span),
+					ItemDef::new(
+						DefKind::Enum(variants_namespace),
+						name.span,
+					),
 				);
 				self.insert_binding(
 					namespace,
@@ -1972,6 +2066,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+
+				for v in variants.iter() {
+					let variant = &v.inner.inner;
+					let variant_key = self.push_def(
+						variants_namespace,
+						ItemDef::new(
+							DefKind::EnumVariant(variant.id),
+							variant.name.span,
+						),
+					);
+					self.insert_binding(
+						variants_namespace,
+						BindingKey::value(variant.name.inner),
+						Binding::definition(variant_key, Visibility::Public),
+						variant.name.span,
+					);
+				}
+
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2906,13 +3018,11 @@ mod tests {
 			let BindingTarget::Accessible(def_key) = target else {
 				panic!("`{name}` should be accessible here");
 			};
-			match self.defs.namespaces[usize::from(def_key.namespace_idx)].items
-				[usize::from(def_key.def_idx)]
-			.kind
-			{
-				DefKind::Namespace(namespace) => namespace,
-				other => panic!("`{name}` is not a module: {other:?}"),
-			}
+			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
+				.items[usize::from(def_key.def_idx)]
+				.kind;
+			kind.as_namespace()
+				.unwrap_or_else(|| panic!("`{name}` is not a namespace: {kind:?}"))
 		}
 	}
 

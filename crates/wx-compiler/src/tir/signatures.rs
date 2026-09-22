@@ -28,7 +28,8 @@ use crate::vfs::{FileId, PackageId};
 
 use super::defs::{
 	AstEntry, AstNodeRef, BindingNamespace, DefKind, DefinitionRegistry,
-	InherentImplIndex, NamespaceIndex, StructIndex, TraitImplIndex, TraitIndex,
+	EnumIndex, InherentImplIndex, NamespaceIndex, NamespaceKind, StructIndex,
+	TraitImplIndex, TraitIndex,
 };
 use super::impls::ImplTarget;
 use super::paths::PathResolver;
@@ -83,6 +84,16 @@ pub struct StructSignature {
 	field_types: Box<[TypeIndex]>,
 }
 
+/// Just the repr type for now — variant identity/dedup already settled in
+/// `defs::EnumDef`'s namespace; resolving each variant's value (explicit or
+/// auto-incremented) needs constant-expression evaluation, which doesn't
+/// exist yet, so it's deferred to the body phase rather than blocking this.
+/// `TypeIndex::ERROR` if `repr` was missing or resolved to a non-integer
+/// type — either way already diagnosed once, here, when that happened.
+pub struct EnumSignature {
+	repr: TypeIndex,
+}
+
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
 /// separate queries; names and identities already live in `defs.rs`.
 pub struct InherentImplSignature {
@@ -107,6 +118,7 @@ enum InferSignatureKind {
 	TypeAlias,
 	InherentImpl,
 	TraitImpl,
+	EnumRepr,
 }
 
 impl InferSignatureKind {
@@ -118,6 +130,7 @@ impl InferSignatureKind {
 			Self::TypeAlias => "type aliases",
 			Self::InherentImpl => "inherent impls",
 			Self::TraitImpl => "trait impls",
+			Self::EnumRepr => "enum reprs",
 		}
 	}
 }
@@ -140,6 +153,9 @@ pub struct SignatureRegistry {
 	/// Indexed by the same `StructIndex` `defs.structs` already uses — see
 	/// `trait_supertraits`.
 	pub structs: Vec<StructSignature>,
+	/// Indexed by the same `EnumIndex` `defs.enums` already uses — see
+	/// `trait_supertraits`.
+	pub enums: Vec<EnumSignature>,
 	pub functions: Vec<FunctionSignature>,
 	/// Index-aligned with the corresponding `defs.rs` impl arenas. A slot is
 	/// `None` until its header query completes, even if that query later
@@ -194,6 +210,7 @@ impl SignatureRegistry {
 			type_aliases: builder.type_aliases,
 			trait_supertraits: builder.trait_supertraits,
 			structs: builder.structs,
+			enums: builder.enums,
 			functions: builder.functions,
 			inherent_impls: builder.inherent_impls,
 			trait_impls: builder.trait_impls,
@@ -216,6 +233,7 @@ pub enum ItemLocation {
 	TraitImpl(TraitImplIndex),
 	InherentImpl(InherentImplIndex),
 	Struct(StructIndex),
+	Enum(EnumIndex),
 	TypeAlias(TypeAliasIndex),
 	Function(FunctionIndex),
 }
@@ -337,6 +355,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	type_aliases: Vec<TypeAliasSignature>,
 	trait_supertraits: Vec<Box<[TraitBound]>>,
 	structs: Vec<StructSignature>,
+	enums: Vec<EnumSignature>,
 	functions: Vec<FunctionSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
@@ -385,6 +404,14 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			item_lookup.insert(
 				struct_def.def_id,
 				ItemLocation::Struct(StructIndex::new(
+					u32::try_from(index).unwrap(),
+				)),
+			);
+		}
+		for (index, enum_def) in defs.enums.iter().enumerate() {
+			item_lookup.insert(
+				enum_def.def_id,
+				ItemLocation::Enum(EnumIndex::new(
 					u32::try_from(index).unwrap(),
 				)),
 			);
@@ -473,6 +500,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				.map(|_| StructSignature {
 					type_params: Box::default(),
 					field_types: Box::default(),
+				})
+				.collect(),
+			enums: defs
+				.enums
+				.iter()
+				.map(|_| EnumSignature {
+					repr: TypeIndex::ERROR,
 				})
 				.collect(),
 			functions: Vec::new(),
@@ -925,6 +959,53 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							span: target.span,
 						},
 					});
+			}
+			AstNodeRef::Enum { item } => {
+				let ast::Item::Enum { repr, name, .. } = item else {
+					unreachable!()
+				};
+				let Some(&ItemLocation::Enum(enum_index)) =
+					self.item_lookup.get(&def_id)
+				else {
+					unreachable!(
+						"every enum's EnumIndex is pre-seeded in SignatureBuilder::new"
+					)
+				};
+
+				let repr_type = match repr {
+					Some(repr_expr) => {
+						let resolved = self.resolve_type(
+							file_id,
+							namespace,
+							def_id,
+							&[],
+							repr_expr,
+							InferPolicy::Reject(InferSignatureKind::EnumRepr),
+						);
+						if resolved != TypeIndex::ERROR
+							&& !resolved.is_integer()
+						{
+							self.diagnostics.push(
+								report_enum_repr_not_integer(
+									file_id,
+									repr_expr.span,
+								),
+							);
+							TypeIndex::ERROR
+						} else {
+							resolved
+						}
+					}
+					None => {
+						self.diagnostics.push(report_missing_enum_repr(
+							file_id, name.span,
+						));
+						TypeIndex::ERROR
+					}
+				};
+
+				self.enums[usize::from(enum_index)] =
+					EnumSignature { repr: repr_type };
 			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
@@ -1487,6 +1568,34 @@ fn report_infer_in_signature(
 		)
 }
 
+fn report_missing_enum_repr(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingEnumRepr.code())
+		.with_message("enum requires a repr type")
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("add `: <type>` here"),
+		)
+}
+
+fn report_enum_repr_not_integer(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::EnumReprNotInteger.code())
+		.with_message("enum repr type must be an integer type")
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("not an integer type"),
+		)
+}
+
 fn report_duplicate_generic_param(
 	strings: &StringInterner,
 	file_id: FileId,
@@ -1719,6 +1828,20 @@ mod tests {
 				panic!("expected a Struct location for `{path}`");
 			};
 			&self.signatures.structs[usize::from(index)]
+		}
+
+		fn enum_signature(&self, path: &str) -> &EnumSignature {
+			let DefKind::Enum(namespace_idx) =
+				self.resolve(BindingNamespace::Type, path)
+			else {
+				panic!("expected `{path}` to be an enum");
+			};
+			let NamespaceKind::Enum(index) =
+				self.defs.namespaces[usize::from(namespace_idx)].kind
+			else {
+				unreachable!("an enum's own binding always names its Enum namespace")
+			};
+			&self.signatures.enums[usize::from(index)]
 		}
 
 		fn function_signature(&self, path: &str) -> &FunctionSignature {
@@ -2400,5 +2523,43 @@ mod tests {
 		let signature = case.function_signature("imported");
 		assert_eq!(signature.param_types[0], TypeIndex::I32);
 		assert_eq!(signature.return_type, TypeIndex::I32);
+	}
+
+	#[test]
+	fn an_enum_repr_resolves_to_the_named_integer_type() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			enum Color: i32 { Red, Green, Blue }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.enum_signature("Color").repr, TypeIndex::I32);
+	}
+
+	#[test]
+	fn an_enum_without_a_repr_is_diagnosed() {
+		let case = TestCase::new("enum Color { Red, Green, Blue }");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::MissingEnumRepr.code())
+		);
+		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
+	}
+
+	#[test]
+	fn an_enum_with_a_non_integer_repr_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type bool;
+			enum Color: bool { Red, Green, Blue }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::EnumReprNotInteger.code())
+		);
+		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
 	}
 }

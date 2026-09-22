@@ -1663,6 +1663,7 @@ pub struct ImportEntry {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct EnumVariant {
+	pub id: DefId,
 	pub name: Spanned<SymbolU32>,
 	pub value: Option<Box<Spanned<Expression>>>,
 }
@@ -5070,6 +5071,7 @@ impl<'ctx> Parser<'ctx> {
 
 					Ok(Spanned {
 						inner: EnumVariant {
+							id: parser.id_generator.next_id(),
 							name: Spanned {
 								inner: name_symbol,
 								span: name_token.span,

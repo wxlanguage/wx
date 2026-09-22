@@ -13,9 +13,11 @@ use crate::{
 };
 
 use super::{
-	defs::{InherentImplIndex, StructIndex, TraitImplIndex, TraitIndex},
+	defs::{
+		EnumIndex, InherentImplIndex, StructIndex, TraitImplIndex, TraitIndex,
+	},
 	signatures::{SignatureBuilder, SignatureRegistry},
-	types::{EnumIndex, Type},
+	types::Type,
 };
 
 /// The outer, injective part of a resolved type. Type arguments and array

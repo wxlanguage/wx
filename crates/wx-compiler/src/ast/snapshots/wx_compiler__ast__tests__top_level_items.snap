@@ -394,7 +394,7 @@ items:
   - inner:
       inner:
         Enum:
-          id: 6
+          id: 9
           pub_span: ~
           repr: ~
           name:
@@ -405,6 +405,7 @@ items:
           variants:
             - inner:
                 inner:
+                  id: 6
                   name:
                     inner: 18
                     span:
@@ -419,6 +420,7 @@ items:
                 end: 258
             - inner:
                 inner:
+                  id: 7
                   name:
                     inner: 19
                     span:
@@ -439,6 +441,7 @@ items:
                 end: 273
             - inner:
                 inner:
+                  id: 8
                   name:
                     inner: 20
                     span:
