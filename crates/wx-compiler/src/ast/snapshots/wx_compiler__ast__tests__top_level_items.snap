@@ -331,60 +331,62 @@ items:
   - inner:
       inner:
         Import:
-          module:
+          external_name:
+            start: 191
+            end: 196
+          internal_name:
             inner: 13
-            span:
-              start: 191
-              end: 196
-          alias:
-            inner: 14
             span:
               start: 200
               end: 203
-          entries:
-            - inner:
-                inner:
-                  external_name: ~
-                  declaration:
-                    Function:
-                      id: 5
-                      signature:
-                        name:
-                          inner: 15
-                          span:
-                            start: 213
-                            end: 216
-                        type_params: []
-                        params:
-                          - inner:
-                              inner:
-                                mut_span: ~
-                                name:
-                                  inner: 16
-                                  span:
-                                    start: 217
-                                    end: 224
-                                ty:
-                                  inner:
-                                    Path:
-                                      - ident:
-                                          inner: 17
-                                          span:
-                                            start: 226
-                                            end: 232
-                                        type_args: []
-                                  span:
-                                    start: 226
-                                    end: 232
-                              span:
-                                start: 217
-                                end: 232
-                            separator: ~
-                        result: ~
-                span:
-                  start: 210
-                  end: 233
-              separator: ~
+          items:
+            inner:
+              - inner:
+                  inner:
+                    external_name: ~
+                    declaration:
+                      Function:
+                        id: 5
+                        signature:
+                          name:
+                            inner: 14
+                            span:
+                              start: 213
+                              end: 216
+                          type_params: []
+                          params:
+                            - inner:
+                                inner:
+                                  mut_span: ~
+                                  name:
+                                    inner: 15
+                                    span:
+                                      start: 217
+                                      end: 224
+                                  ty:
+                                    inner:
+                                      Path:
+                                        - ident:
+                                            inner: 16
+                                            span:
+                                              start: 226
+                                              end: 232
+                                          type_args: []
+                                    span:
+                                      start: 226
+                                      end: 232
+                                span:
+                                  start: 217
+                                  end: 232
+                              separator: ~
+                          result: ~
+                  span:
+                    start: 210
+                    end: 233
+                separator: ~
+            span:
+              start: 204
+              end: 235
       span:
         start: 184
         end: 235
@@ -396,7 +398,7 @@ items:
           pub_span: ~
           repr: ~
           name:
-            inner: 18
+            inner: 17
             span:
               start: 242
               end: 247
@@ -404,7 +406,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 19
+                    inner: 18
                     span:
                       start: 254
                       end: 257
@@ -418,7 +420,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 20
+                    inner: 19
                     span:
                       start: 263
                       end: 268
@@ -438,7 +440,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 21
+                    inner: 20
                     span:
                       start: 278
                       end: 282

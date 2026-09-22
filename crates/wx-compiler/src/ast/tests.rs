@@ -2357,7 +2357,7 @@ fn test_type_alias_item() {
 #[test]
 fn test_imported_function_is_a_declaration_without_a_body() {
 	let case = TestCase::new(indoc! {"
-        import \"env\" {
+        import \"env\" as env {
             fn log(x: i32)
         }
     "});

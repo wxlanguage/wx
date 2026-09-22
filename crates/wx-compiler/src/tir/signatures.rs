@@ -30,6 +30,7 @@ use super::defs::{
 	AstEntry, AstNodeRef, BindingNamespace, DefKind, DefinitionRegistry,
 	InherentImplIndex, NamespaceIndex, StructIndex, TraitImplIndex, TraitIndex,
 };
+use super::impls::ImplTarget;
 use super::paths::PathResolver;
 use super::types::{Type, TypeIndex, TypeInterner};
 
@@ -51,10 +52,7 @@ pub(super) struct TraitBound {
 index_newtype!(TypeAliasIndex);
 index_newtype!(FunctionIndex);
 
-/// A resolved `type Name<...> = TypeExpr;` — including a primitive
-/// (`#[intrinsic] pub type u8;`), which is just one with no type params and
-/// a `target` that was already known rather than resolved from a body.
-struct TypeAliasSignature {
+pub struct TypeAliasSignature {
 	def_id: DefId,
 	name: Spanned<SymbolU32>,
 	type_params: Box<[GenericParam]>,
@@ -70,7 +68,7 @@ struct TypeAliasSignature {
 /// unlike `TypeAliasSignature`, nothing needs to display a function's name
 /// from just this struct — the one place that will (diagnostics, once
 /// bodies exist) already has the `DefId` to look the name up from `defs`.
-struct FunctionSignature {
+pub struct FunctionSignature {
 	type_params: Box<[GenericParam]>,
 	param_types: Box<[TypeIndex]>,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
@@ -80,34 +78,140 @@ struct FunctionSignature {
 /// Field *types* only — names/dedup/lookup already settled in
 /// `defs::StructDef`, index-aligned with whichever `StructFields` variant
 /// that struct has, so record vs. tuple doesn't need re-deriving here.
-struct StructSignature {
+pub struct StructSignature {
 	type_params: Box<[GenericParam]>,
 	field_types: Box<[TypeIndex]>,
 }
 
-struct SignatureRegistry {
-	type_aliases: Vec<TypeAliasSignature>,
+/// The resolved header of `impl<...> Target { ... }`. Member signatures are
+/// separate queries; names and identities already live in `defs.rs`.
+pub struct InherentImplSignature {
+	pub type_params: Box<[GenericParam]>,
+	pub target: Spanned<TypeIndex>,
+}
+
+/// The resolved header of `impl<...> Trait for Target { ... }`.
+pub struct TraitImplSignature {
+	pub type_params: Box<[GenericParam]>,
+	/// `None` if resolving the written trait path failed. Its span is kept
+	/// for diagnostics when impl dispatch is built.
+	pub trait_ref: Option<Spanned<TraitIndex>>,
+	pub target: Spanned<TypeIndex>,
+}
+
+#[derive(Clone, Copy)]
+enum InferSignatureKind {
+	Function,
+	ReturnType,
+	Struct,
+	TypeAlias,
+	InherentImpl,
+	TraitImpl,
+}
+
+impl InferSignatureKind {
+	fn noun(self) -> &'static str {
+		match self {
+			Self::Function => "functions",
+			Self::ReturnType => "return types",
+			Self::Struct => "structs",
+			Self::TypeAlias => "type aliases",
+			Self::InherentImpl => "inherent impls",
+			Self::TraitImpl => "trait impls",
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+enum InferPolicy {
+	Reject(InferSignatureKind),
+	/// Used by type-resolution contexts that can infer a written `_`.
+	#[allow(dead_code)] // No such caller in the signature registry yet.
+	Allow,
+}
+
+pub struct SignatureRegistry {
+	pub type_aliases: Vec<TypeAliasSignature>,
 	/// Each trait's resolved `trait X: Y + Z { ... }` bounds, indexed by the
 	/// same `TraitIndex` `defs.traits` already uses — traits need no index
 	/// space of their own here, unlike `type_aliases`, since Phase 1 already
 	/// has one.
-	trait_supertraits: Vec<Box<[TraitBound]>>,
+	pub trait_supertraits: Vec<Box<[TraitBound]>>,
 	/// Indexed by the same `StructIndex` `defs.structs` already uses — see
 	/// `trait_supertraits`.
-	structs: Vec<StructSignature>,
-	functions: Vec<FunctionSignature>,
-	item_lookup: HashMap<DefId, ItemLocation>,
-	types: TypeInterner,
+	pub structs: Vec<StructSignature>,
+	pub functions: Vec<FunctionSignature>,
+	/// Index-aligned with the corresponding `defs.rs` impl arenas. A slot is
+	/// `None` until its header query completes, even if that query later
+	/// recovers with `TypeIndex::ERROR` or an unresolved trait path.
+	pub inherent_impls: Vec<Option<InherentImplSignature>>,
+	pub trait_impls: Vec<Option<TraitImplSignature>>,
+	pub(super) inherent_impl_dispatch:
+		HashMap<ImplTarget, Vec<InherentImplIndex>>,
+	pub(super) trait_impl_dispatch:
+		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
+	pub item_lookup: HashMap<DefId, ItemLocation>,
+	pub types: TypeInterner,
+}
+
+impl SignatureRegistry {
+	fn build<'ctx>(
+		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		strings: &StringInterner,
+		defs: &DefinitionRegistry,
+		ast_nodes: &[AstEntry<'ctx>],
+		stdlib_package: PackageId,
+	) -> Self {
+		let mut builder = SignatureBuilder::new(
+			diagnostics,
+			strings,
+			defs,
+			ast_nodes,
+			stdlib_package,
+		);
+
+		for impl_def in &defs.trait_impls {
+			builder.ensure_signature(QueryInfo {
+				def_id: impl_def.def_id,
+				requested_at: None,
+			});
+		}
+		for impl_def in &defs.inherent_impls {
+			builder.ensure_signature(QueryInfo {
+				def_id: impl_def.def_id,
+				requested_at: None,
+			});
+		}
+		builder.build_impl_dispatch();
+		for entry in ast_nodes {
+			builder.ensure_signature(QueryInfo {
+				def_id: entry.def_id,
+				requested_at: None,
+			});
+		}
+
+		Self {
+			type_aliases: builder.type_aliases,
+			trait_supertraits: builder.trait_supertraits,
+			structs: builder.structs,
+			functions: builder.functions,
+			inherent_impls: builder.inherent_impls,
+			trait_impls: builder.trait_impls,
+			inherent_impl_dispatch: builder.inherent_impl_dispatch,
+			trait_impl_dispatch: builder.trait_impl_dispatch,
+			item_lookup: builder.item_lookup,
+			types: builder.types,
+		}
+	}
 }
 
 /// Where a `DefId`'s data actually lives — one arena per item kind
 /// `ensure_signature` can be asked about. `Trait`/`TraitImpl`/`InherentImpl`/
-/// `Struct` point into `defs.rs`'s own arenas (Phase 1 already knows
-/// everything about them); every other kind points into this module's own
-/// `SignatureRegistry`, populated only once that kind's signature actually
-/// finishes resolving.
+/// `Struct` use indices allocated in `defs.rs` and keep resolved data in
+/// index-aligned slots here; aliases and functions get indices as their
+/// signatures finish resolving.
 #[derive(Clone, Copy)]
-enum ItemLocation {
+pub enum ItemLocation {
 	Trait(TraitIndex),
 	TraitImpl(TraitImplIndex),
 	InherentImpl(InherentImplIndex),
@@ -147,7 +251,7 @@ pub(super) enum SignatureStatus {
 /// identity layer), so there's never a case where `Done` itself needs a "no
 /// value" alternative the way `Resolved(T)` does for imports.
 #[derive(Clone, Copy)]
-enum ComputeState {
+enum QueryState {
 	Pending,
 	InProgress,
 	/// Still `InProgress` — this query's own execution hasn't actually
@@ -192,7 +296,7 @@ impl QueryKey {
 /// supposed to resolve.
 struct QueryEntry {
 	ast_index: u32,
-	state: ComputeState,
+	state: QueryState,
 }
 
 /// One in-progress query frame — mirrors `rustc_query_system`'s own
@@ -220,20 +324,26 @@ pub(super) struct QueryInfo {
 /// The Phase 2 driver. Holds `defs` — Phase 1's finished output, read-only
 /// from here on — plus whatever this phase needs on top of it.
 pub(super) struct SignatureBuilder<'ast, 'ctx> {
-	diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
-	strings: &'ctx StringInterner,
-	defs: &'ctx DefinitionRegistry,
+	pub(super) diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
+	pub(super) strings: &'ctx StringInterner,
+	pub(super) defs: &'ctx DefinitionRegistry,
 	ast_nodes: &'ast [AstEntry<'ast>],
 	stdlib_root: NamespaceIndex,
 	item_lookup: HashMap<DefId, ItemLocation>,
 	query_state: HashMap<QueryKey, QueryEntry>,
 	/// In-progress queries, in call order — shared across every `QueryKind`.
 	query_stack: Vec<QueryFrame>,
-	types: TypeInterner,
+	pub(super) types: TypeInterner,
 	type_aliases: Vec<TypeAliasSignature>,
 	trait_supertraits: Vec<Box<[TraitBound]>>,
 	structs: Vec<StructSignature>,
 	functions: Vec<FunctionSignature>,
+	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
+	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
+	pub(super) inherent_impl_dispatch:
+		HashMap<ImplTarget, Vec<InherentImplIndex>>,
+	pub(super) trait_impl_dispatch:
+		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 }
 
 impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
@@ -245,24 +355,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		stdlib_package: PackageId,
 	) -> Self {
 		let stdlib_root = defs.package_namespaces[stdlib_package.as_usize()];
-
-		// Empty until each trait's own `ensure_signature` call fills its
-		// slot in; a plain empty slice rather than `Option` since nothing
-		// reads one before its owning trait reaches `Done`.
-		let trait_supertraits: Vec<Box<[TraitBound]>> =
-			defs.traits.iter().map(|_| Box::default()).collect();
-
-		// Same idea, but each slot starts as an (empty type_params, empty
-		// field_types) placeholder rather than `Box::default()` alone — see
-		// `StructSignature`. Never read before its own struct reaches `Done`.
-		let structs: Vec<StructSignature> = defs
-			.structs
-			.iter()
-			.map(|_| StructSignature {
-				type_params: Box::default(),
-				field_types: Box::default(),
-			})
-			.collect();
 
 		let mut item_lookup = HashMap::new();
 		for (index, trait_def) in defs.traits.iter().enumerate() {
@@ -289,9 +381,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				)),
 			);
 		}
-		// Pre-allocated, like `Trait` — see `StructIndex`'s own doc comment
-		// in `defs.rs` for why a struct can't wait until `Done` the way
-		// `TypeAlias` does.
 		for (index, struct_def) in defs.structs.iter().enumerate() {
 			item_lookup.insert(
 				struct_def.def_id,
@@ -309,7 +398,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					QueryKey::signature(entry.def_id),
 					QueryEntry {
 						ast_index: u32::try_from(index).unwrap(),
-						state: ComputeState::Pending,
+						state: QueryState::Pending,
 					},
 				)
 			})
@@ -349,7 +438,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				continue;
 			};
 			let ast_index = entry.ast_index;
-			entry.state = ComputeState::Done;
+			entry.state = QueryState::Done;
 
 			let index =
 				TypeAliasIndex::new(u32::try_from(type_aliases.len()).unwrap());
@@ -373,9 +462,24 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			query_stack: Vec::new(),
 			types: TypeInterner::new(),
 			type_aliases,
-			trait_supertraits,
-			structs,
+			trait_supertraits: defs
+				.traits
+				.iter()
+				.map(|_| Box::default())
+				.collect(),
+			structs: defs
+				.structs
+				.iter()
+				.map(|_| StructSignature {
+					type_params: Box::default(),
+					field_types: Box::default(),
+				})
+				.collect(),
 			functions: Vec::new(),
+			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
+			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
+			inherent_impl_dispatch: HashMap::new(),
+			trait_impl_dispatch: HashMap::new(),
 		}
 	}
 
@@ -434,7 +538,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		let def_id = query.def_id;
 		let key = QueryKey::signature(def_id);
 		match self.query_state[&key].state {
-			ComputeState::Done | ComputeState::CycleReported => {
+			QueryState::Done | QueryState::CycleReported => {
 				return SignatureStatus::Resolved;
 			}
 			// First re-entrant discovery: flip to `CycleReported` right
@@ -443,16 +547,15 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			// is what makes a *second*, independent path that re-discovers
 			// the same still-running query see `CycleReported` (silent)
 			// instead of `InProgress` (which would mean "report again").
-			ComputeState::InProgress => {
+			QueryState::InProgress => {
 				self.query_state.get_mut(&key).unwrap().state =
-					ComputeState::CycleReported;
+					QueryState::CycleReported;
 				return SignatureStatus::Cycle;
 			}
-			ComputeState::Pending => {}
+			QueryState::Pending => {}
 		}
 
-		self.query_state.get_mut(&key).unwrap().state =
-			ComputeState::InProgress;
+		self.query_state.get_mut(&key).unwrap().state = QueryState::InProgress;
 		self.query_stack.push(QueryFrame {
 			key,
 			requested_at: query.requested_at,
@@ -491,6 +594,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					def_id,
 					&resolved_params,
 					body,
+					InferPolicy::Reject(InferSignatureKind::TypeAlias),
 				);
 
 				let index = TypeAliasIndex::new(
@@ -571,6 +675,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						def_id,
 						&resolved_params,
 						ty_expr,
+						InferPolicy::Reject(InferSignatureKind::Struct),
 					);
 					self.check_struct_direct_recursion(
 						file_id,
@@ -618,6 +723,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						def_id,
 						&resolved_params,
 						ty_expr,
+						InferPolicy::Reject(InferSignatureKind::Struct),
 					);
 					self.check_struct_direct_recursion(
 						file_id,
@@ -634,8 +740,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			}
 			AstNodeRef::Function { item } => {
 				let (ast::Item::Function { signature, .. }
-				| ast::Item::FunctionDeclaration { signature, .. }) =
-					item
+				| ast::Item::FunctionDeclaration { signature, .. }) = item
 				else {
 					unreachable!()
 				};
@@ -663,14 +768,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						.find(|p| p.inner == name.inner)
 						.copied()
 					{
-						self.diagnostics.push(
-							report_duplicate_function_param(
-								self.strings,
-								file_id,
-								name,
-								first,
-							),
-						);
+						self.diagnostics.push(report_duplicate_function_param(
+							self.strings,
+							file_id,
+							name,
+							first,
+						));
 					}
 					seen_params.push(name);
 
@@ -681,6 +784,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							def_id,
 							&resolved_params,
 							ty,
+							InferPolicy::Reject(InferSignatureKind::Function),
 						),
 						// Only ever `None` when the source omits `: Type`
 						// entirely — legal grammar (methods rely on it for
@@ -699,6 +803,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						def_id,
 						&resolved_params,
 						result,
+						InferPolicy::Reject(InferSignatureKind::ReturnType),
 					),
 					None => TypeIndex::UNIT,
 				};
@@ -714,48 +819,124 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.item_lookup
 					.insert(def_id, ItemLocation::Function(index));
 			}
+			AstNodeRef::InherentImplBlock { item, block_index } => {
+				let ast::Item::InherentImpl {
+					type_params,
+					target,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					type_params,
+				);
+				let target_type = self.resolve_type(
+					file_id,
+					namespace,
+					def_id,
+					&resolved_params,
+					target,
+					InferPolicy::Reject(InferSignatureKind::InherentImpl),
+				);
+				self.inherent_impls[usize::from(block_index)] =
+					Some(InherentImplSignature {
+						type_params: resolved_params,
+						target: Spanned {
+							inner: target_type,
+							span: target.span,
+						},
+					});
+			}
+			AstNodeRef::TraitImplBlock { item, block_index } => {
+				let ast::Item::TraitImpl {
+					type_params,
+					trait_name,
+					target,
+					..
+				} = item
+				else {
+					unreachable!()
+				};
+				let resolved_params = self.resolve_generic_params(
+					file_id,
+					namespace,
+					type_params,
+				);
+				let trait_target = PathResolver::new(
+					&self.defs.namespaces,
+					&self.defs.use_items,
+					self.stdlib_root,
+				)
+				.resolve_path(
+					self.diagnostics,
+					self.strings,
+					file_id,
+					namespace,
+					trait_name,
+					BindingNamespace::Type,
+				);
+				let trait_ref = trait_target.def_key().and_then(|key| {
+					let trait_index = match key.symbol_kind(self.defs) {
+						DefKind::Trait(trait_def_id) => {
+							let Some(&ItemLocation::Trait(index)) =
+								self.item_lookup.get(&trait_def_id)
+							else {
+								unreachable!()
+							};
+							index
+						}
+						other => {
+							let last = trait_name.last().unwrap();
+							self.diagnostics.push(report_expected_trait_bound(
+								file_id,
+								self.strings,
+								last.ident,
+								other.noun(),
+							));
+							return None;
+						}
+					};
+					let span = TextSpan::new(
+						trait_name.first().unwrap().ident.span.start,
+						trait_name.last().unwrap().ident.span.end,
+					);
+					Some(Spanned {
+						inner: trait_index,
+						span,
+					})
+				});
+				let target_type = self.resolve_type(
+					file_id,
+					namespace,
+					def_id,
+					&resolved_params,
+					target,
+					InferPolicy::Reject(InferSignatureKind::TraitImpl),
+				);
+				self.trait_impls[usize::from(block_index)] =
+					Some(TraitImplSignature {
+						type_params: resolved_params,
+						trait_ref,
+						target: Spanned {
+							inner: target_type,
+							span: target.span,
+						},
+					});
+			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
 
 		self.query_stack.pop();
-		self.query_state.get_mut(&key).unwrap().state = ComputeState::Done;
+		self.query_state.get_mut(&key).unwrap().state = QueryState::Done;
 		SignatureStatus::Resolved
 	}
 
-	/// Drives `ensure_signature` for every registered item, in parse order —
-	/// `ensure_signature`'s own recursion only ever reaches an item when
-	/// something else's body references it, so this is the entry point that
-	/// reaches everything else: every top-level declaration in the whole
-	/// compilation, whether anything happens to reference it yet or not.
-	pub(super) fn ensure_all_signatures(&mut self) {
-		for entry in self.ast_nodes {
-			self.ensure_signature(QueryInfo {
-				def_id: entry.def_id,
-				requested_at: None,
-			});
-		}
-	}
-
-	/// Freezes everything resolved so far into the dependency-free
-	/// [`SignatureRegistry`] — mirrors `DefinitionRegistryBuilder::build`'s
-	/// role, just consuming `self` instead of being the constructor itself,
-	/// since a `SignatureBuilder` is also the demand-driven driver and stays
-	/// alive across many `ensure_signature` calls rather than running once.
-	pub(super) fn finish(self) -> SignatureRegistry {
-		SignatureRegistry {
-			type_aliases: self.type_aliases,
-			trait_supertraits: self.trait_supertraits,
-			structs: self.structs,
-			functions: self.functions,
-			item_lookup: self.item_lookup,
-			types: self.types,
-		}
-	}
-
-	/// Resolves a written type expression to a `TypeIndex`. Only
-	/// `TypeExpression::Path` is implemented so far — everything else
-	/// (`Pointer`, `Array`, `Function`, `GenericApplication`, ...) is a
-	/// `todo!()` until the item kinds that actually need them exist.
+	/// Resolves a written type. `Reject` diagnoses `_` at its own span and
+	/// recovers as `TypeIndex::ERROR`; `Allow` preserves it as `INFER`.
+	/// Nested types retain their shape. Other forms are still being implemented.
 	fn resolve_type(
 		&mut self,
 		file_id: FileId,
@@ -763,8 +944,20 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		owner: DefId,
 		generic_scope: &[GenericParam],
 		type_expr: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		match &type_expr.inner {
+			ast::TypeExpression::Infer => match infer_policy {
+				InferPolicy::Allow => TypeIndex::INFER,
+				InferPolicy::Reject(kind) => {
+					self.diagnostics.push(report_infer_in_signature(
+						file_id,
+						type_expr.span,
+						kind,
+					));
+					TypeIndex::ERROR
+				}
+			},
 			ast::TypeExpression::Path(segments) => {
 				if let [segment] = &segments[..]
 					&& segment.type_args.is_empty()
@@ -858,6 +1051,34 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					),
 				}
 			}
+			ast::TypeExpression::Function { params, result } => {
+				let mut param_types = Vec::with_capacity(params.len());
+				for param in params.iter() {
+					param_types.push(self.resolve_type(
+						file_id,
+						namespace,
+						owner,
+						generic_scope,
+						&param.inner.inner.ty,
+						infer_policy,
+					));
+				}
+				let result_type = match result {
+					Some(result) => self.resolve_type(
+						file_id,
+						namespace,
+						owner,
+						generic_scope,
+						result,
+						infer_policy,
+					),
+					None => TypeIndex::UNIT,
+				};
+				self.types.intern(Type::Function {
+					params: param_types.into_boxed_slice(),
+					result: result_type,
+				})
+			}
 			ast::TypeExpression::Tuple { elements } => {
 				if elements.is_empty() {
 					return TypeIndex::UNIT;
@@ -871,6 +1092,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						owner,
 						generic_scope,
 						element,
+						infer_policy,
 					));
 				}
 				self.types.intern(Type::Tuple {
@@ -1247,6 +1469,24 @@ fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 	}
 }
 
+fn report_infer_in_signature(
+	file_id: FileId,
+	span: TextSpan,
+	kind: InferSignatureKind,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InferInSignature.code())
+		.with_message(format!(
+			"the placeholder `_` is not allowed within types on item signatures for {}",
+			kind.noun(),
+		))
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("not allowed in type signatures"),
+		)
+}
+
 fn report_duplicate_generic_param(
 	strings: &StringInterner,
 	file_id: FileId,
@@ -1285,7 +1525,9 @@ fn report_duplicate_function_param(
 		.with_label(
 			SourceSpan::new(file_id, first.span)
 				.secondary_label()
-				.with_message(format!("first use of `{name_str}` as a parameter")),
+				.with_message(format!(
+					"first use of `{name_str}` as a parameter"
+				)),
 		)
 }
 
@@ -1323,7 +1565,7 @@ mod tests {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
 		diagnostics: Vec<Diagnostic<FileId>>,
-		registry: SignatureRegistry,
+		signatures: SignatureRegistry,
 	}
 
 	impl TestCase {
@@ -1331,10 +1573,9 @@ mod tests {
 		/// mechanism a real `"type": "std"` package uses) instead of loading
 		/// the real ~250-line embedded stdlib: `ensure_all_signatures` isn't
 		/// selective about which item kinds it drives, so any real stdlib
-		/// content — almost entirely `fn`/`trait`/`impl`, none of which
-		/// `ensure_signature` dispatches yet — would panic on its first
-		/// non-`TypeAlias` item before a test even runs. A test that needs a
-		/// primitive declares its own bodiless `pub type i32;` — no
+		/// content — including item kinds and members whose signatures are
+		/// not implemented yet — would panic before a test even runs. A test
+		/// that needs a primitive declares its own bodiless `pub type i32;` — no
 		/// `#[intrinsic]` marker required, recognition is implicit for a
 		/// reserved name declared in whichever package is `stdlib_package`
 		/// (see `defs.rs`'s own doc comment on `intrinsics`) — so this still
@@ -1364,21 +1605,19 @@ mod tests {
 				graph.stdlib_package,
 			);
 
-			let mut signature_builder = SignatureBuilder::new(
+			let signatures = SignatureRegistry::build(
 				&mut diagnostics,
 				&graph.strings,
 				&defs,
 				&ast_nodes,
 				graph.stdlib_package,
 			);
-			signature_builder.ensure_all_signatures();
-			let registry = signature_builder.finish();
 
 			TestCase {
 				graph,
 				defs,
 				diagnostics,
-				registry,
+				signatures,
 			}
 		}
 
@@ -1436,11 +1675,13 @@ mod tests {
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIndex {
-			let DefKind::Trait(def_id) = self.resolve(BindingNamespace::Type, path) else {
+			let DefKind::Trait(def_id) =
+				self.resolve(BindingNamespace::Type, path)
+			else {
 				panic!("expected `{path}` to be a trait");
 			};
 			let Some(&ItemLocation::Trait(index)) =
-				self.registry.item_lookup.get(&def_id)
+				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Trait location for `{path}`");
 			};
@@ -1448,44 +1689,50 @@ mod tests {
 		}
 
 		fn trait_supertraits(&self, path: &str) -> &[TraitBound] {
-			&self.registry.trait_supertraits
+			&self.signatures.trait_supertraits
 				[usize::from(self.trait_index(path))]
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
-			let DefKind::TypeAlias(def_id) = self.resolve(BindingNamespace::Type, path) else {
+			let DefKind::TypeAlias(def_id) =
+				self.resolve(BindingNamespace::Type, path)
+			else {
 				panic!("expected `{path}` to be a type alias");
 			};
 			let Some(&ItemLocation::TypeAlias(index)) =
-				self.registry.item_lookup.get(&def_id)
+				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a TypeAlias location for `{path}`");
 			};
-			&self.registry.type_aliases[usize::from(index)]
+			&self.signatures.type_aliases[usize::from(index)]
 		}
 
 		fn struct_signature(&self, path: &str) -> &StructSignature {
-			let DefKind::Struct(def_id) = self.resolve(BindingNamespace::Type, path) else {
+			let DefKind::Struct(def_id) =
+				self.resolve(BindingNamespace::Type, path)
+			else {
 				panic!("expected `{path}` to be a struct");
 			};
 			let Some(&ItemLocation::Struct(index)) =
-				self.registry.item_lookup.get(&def_id)
+				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Struct location for `{path}`");
 			};
-			&self.registry.structs[usize::from(index)]
+			&self.signatures.structs[usize::from(index)]
 		}
 
 		fn function_signature(&self, path: &str) -> &FunctionSignature {
-			let DefKind::Function(def_id) = self.resolve(BindingNamespace::Value, path) else {
+			let DefKind::Function(def_id) =
+				self.resolve(BindingNamespace::Value, path)
+			else {
 				panic!("expected `{path}` to be a function");
 			};
 			let Some(&ItemLocation::Function(index)) =
-				self.registry.item_lookup.get(&def_id)
+				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Function location for `{path}`");
 			};
-			&self.registry.functions[usize::from(index)]
+			&self.signatures.functions[usize::from(index)]
 		}
 	}
 
@@ -1497,6 +1744,330 @@ mod tests {
 		let type_params = &case.type_alias("A").type_params;
 		assert_eq!(type_params.len(), 2);
 		assert!(type_params.iter().all(|p| p.bounds.is_empty()));
+	}
+
+	#[test]
+	fn written_infer_in_an_alias_is_reported_at_its_own_span_once() {
+		let source = "type B = A; type A = _;";
+		let case = TestCase::new(source);
+
+		assert_eq!(case.type_alias("A").target, TypeIndex::ERROR);
+		assert_eq!(case.type_alias("B").target, TypeIndex::ERROR);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		let diagnostic = &case.diagnostics[0];
+		assert_eq!(
+			diagnostic.code.as_deref(),
+			Some(DiagnosticCode::InferInSignature.code())
+		);
+		assert_eq!(
+			diagnostic.message,
+			"the placeholder `_` is not allowed within types on item signatures for type aliases"
+		);
+		assert_eq!(diagnostic.labels.len(), 1);
+		assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
+		assert_eq!(
+			diagnostic.labels[0].message,
+			"not allowed in type signatures"
+		);
+	}
+
+	#[test]
+	fn function_type_ignores_parameter_names_for_identity() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type bool;
+			type Named = fn(x: i32, y: bool) -> i32;
+			type Unnamed = fn(i32, bool) -> i32;
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let named = case.type_alias("Named").target;
+		assert_eq!(named, case.type_alias("Unnamed").target);
+		assert!(matches!(
+			case.signatures.types.resolve(named),
+			Type::Function { params, result }
+				if params.as_ref() == [TypeIndex::I32, TypeIndex::BOOL]
+					&& *result == TypeIndex::I32
+		));
+	}
+
+	#[test]
+	fn nested_function_type_uses_generic_scope_and_defaults_to_unit() {
+		let case = TestCase::new("type Callback<T> = fn(T) -> fn();");
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let alias = case.type_alias("Callback");
+		let Type::Function { params, result } =
+			case.signatures.types.resolve(alias.target)
+		else {
+			panic!("expected outer function type");
+		};
+		assert_eq!(params.len(), 1);
+		assert_eq!(
+			case.signatures.types.resolve(params[0]),
+			&Type::TypeParam {
+				owner: alias.def_id,
+				param_index: 0,
+			}
+		);
+		assert!(matches!(
+			case.signatures.types.resolve(*result),
+			Type::Function { params, result }
+				if params.is_empty() && *result == TypeIndex::UNIT
+		));
+	}
+
+	#[test]
+	fn function_type_placeholders_are_reported_in_source_order() {
+		let source = "type Callback = fn((_, _)) -> _;";
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 3, "{:?}", case.diagnostics);
+		let mut last_start = 0;
+		for diagnostic in &case.diagnostics {
+			assert_eq!(
+				diagnostic.code.as_deref(),
+				Some(DiagnosticCode::InferInSignature.code())
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			let range = &diagnostic.labels[0].range;
+			assert_eq!(&source[range.clone()], "_");
+			assert!(range.start >= last_start);
+			last_start = range.end;
+		}
+		let Type::Function { params, result } = case
+			.signatures
+			.types
+			.resolve(case.type_alias("Callback").target)
+		else {
+			panic!("expected function type");
+		};
+		assert_eq!(params.len(), 1);
+		assert_eq!(*result, TypeIndex::ERROR);
+		assert!(matches!(
+			case.signatures.types.resolve(params[0]),
+			Type::Tuple { elements }
+				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
+		));
+	}
+
+	#[test]
+	fn impl_headers_use_defs_indices_and_resolve_targets_through_aliases() {
+		let case = TestCase::new(indoc! {"
+			trait Tr {}
+			impl Tr for Alias {}
+			impl Alias {}
+			type Alias = S;
+			struct S {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.signatures.trait_impls.len(),
+			case.defs.trait_impls.len()
+		);
+		assert_eq!(
+			case.signatures.inherent_impls.len(),
+			case.defs.inherent_impls.len()
+		);
+		let trait_header = case.signatures.trait_impls[0].as_ref().unwrap();
+		let inherent_header =
+			case.signatures.inherent_impls[0].as_ref().unwrap();
+		assert_eq!(
+			trait_header.trait_ref.unwrap().inner,
+			case.trait_index("Tr")
+		);
+		assert_eq!(trait_header.target.inner, case.type_alias("Alias").target);
+		assert_eq!(inherent_header.target.inner, trait_header.target.inner);
+		assert!(matches!(
+			case.signatures.types.resolve(trait_header.target.inner),
+			Type::Struct { .. }
+		));
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(trait_header.target.inner),
+		)
+		.unwrap();
+		assert_eq!(case.signatures.inherent_candidates(target).len(), 1);
+		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+		assert_eq!(
+			case.signatures.trait_candidates(target)[0].0,
+			case.trait_index("Tr")
+		);
+	}
+
+	#[test]
+	fn impl_dispatch_rejects_duplicate_trait_for_same_constructor() {
+		let case = TestCase::new(indoc! {"
+			trait Tr {}
+			struct S {}
+			impl Tr for S {}
+			impl Tr for S {}
+		"});
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(
+				case.signatures.trait_impls[0]
+					.as_ref()
+					.unwrap()
+					.target
+					.inner,
+			),
+		)
+		.unwrap();
+		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateTraitImpl.code())
+		);
+	}
+
+	#[test]
+	fn impl_dispatch_does_not_index_invalid_targets() {
+		let case = TestCase::new(indoc! {"
+			impl<T> T {}
+			impl Missing {}
+		"});
+		assert!(case.signatures.impl_dispatch_is_empty());
+		assert_eq!(
+			case.diagnostics
+				.iter()
+				.filter(|d| d.code.as_deref()
+					== Some(DiagnosticCode::InvalidImplTarget.code()))
+				.count(),
+			1,
+			"{:?}",
+			case.diagnostics
+		);
+	}
+
+	#[test]
+	fn impl_header_resolves_generic_bounds() {
+		let case = TestCase::new(indoc! {"
+			trait Bound {}
+			struct S {}
+			impl<T: Bound> S {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let header = case.signatures.inherent_impls[0].as_ref().unwrap();
+		assert_eq!(header.type_params.len(), 1);
+		assert_eq!(header.type_params[0].bounds.len(), 1);
+		assert_eq!(
+			header.type_params[0].bounds[0].trait_index,
+			case.trait_index("Bound")
+		);
+	}
+
+	#[test]
+	fn trait_impl_header_keeps_target_when_trait_path_is_not_a_trait() {
+		let case = TestCase::new(indoc! {"
+			struct S {}
+			impl S for S {}
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::ExpectedTraitBound.code())
+		);
+		let header = case.signatures.trait_impls[0].as_ref().unwrap();
+		assert!(header.trait_ref.is_none());
+		assert!(matches!(
+			case.signatures.types.resolve(header.target.inner),
+			Type::Struct { .. }
+		));
+	}
+
+	#[test]
+	fn inherent_impl_header_recovers_an_infer_target() {
+		let source = "impl _ {}";
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::InferInSignature.code())
+		);
+		assert_eq!(&source[case.diagnostics[0].labels[0].range.clone()], "_");
+		assert_eq!(
+			case.signatures.inherent_impls[0]
+				.as_ref()
+				.unwrap()
+				.target
+				.inner,
+			TypeIndex::ERROR
+		);
+	}
+
+	#[test]
+	fn function_parameter_placeholders_get_separate_diagnostics() {
+		let source = "fn f(x: (_, _)) { }";
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		for diagnostic in &case.diagnostics {
+			assert_eq!(
+				diagnostic.code.as_deref(),
+				Some(DiagnosticCode::InferInSignature.code())
+			);
+			assert_eq!(
+				diagnostic.message,
+				"the placeholder `_` is not allowed within types on item signatures for functions"
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
+			assert_eq!(
+				diagnostic.labels[0].message,
+				"not allowed in type signatures"
+			);
+		}
+		assert_ne!(
+			case.diagnostics[0].labels[0].range,
+			case.diagnostics[1].labels[0].range
+		);
+	}
+
+	#[test]
+	fn return_type_placeholders_get_separate_diagnostics() {
+		let source = "fn f() -> (_, _) { }";
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		for diagnostic in &case.diagnostics {
+			assert_eq!(
+				diagnostic.message,
+				"the placeholder `_` is not allowed within types on item signatures for return types"
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
+			assert_eq!(
+				diagnostic.labels[0].message,
+				"not allowed in type signatures"
+			);
+		}
+		assert_ne!(
+			case.diagnostics[0].labels[0].range,
+			case.diagnostics[1].labels[0].range
+		);
+		let return_type = case.function_signature("f").return_type;
+		assert!(matches!(
+			case.signatures.types.resolve(return_type),
+			Type::Tuple { elements }
+				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
+		));
+	}
+
+	#[test]
+	fn tuple_struct_placeholders_get_separate_diagnostics() {
+		let case = TestCase::new("struct Pair(_, _);");
+
+		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		for diagnostic in &case.diagnostics {
+			assert_eq!(
+				diagnostic.message,
+				"the placeholder `_` is not allowed within types on item signatures for structs"
+			);
+		}
 	}
 
 	#[test]
@@ -1537,7 +2108,7 @@ mod tests {
 	#[test]
 	fn a_bound_naming_a_non_trait_is_rejected() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
+			type i32;
 			struct NotATrait { x: i32 }
 			type A<T: NotATrait> = T;
 		"});
@@ -1568,9 +2139,9 @@ mod tests {
 	#[test]
 	fn type_aliases_to_primitives_resolve_to_the_primitive() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
-			pub type bool;
-			pub type char;
+			type i32;
+			type bool;
+			type char;
 
 			type A = i32;
 			type B = bool;
@@ -1675,7 +2246,7 @@ mod tests {
 	#[test]
 	fn a_struct_with_primitive_fields_resolves() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
+			type i32;
 			struct Point { x: i32, y: i32 }
 		"});
 
@@ -1689,7 +2260,7 @@ mod tests {
 	#[test]
 	fn a_tuple_struct_resolves() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
+			type i32;
 			struct Pair(i32, i32);
 		"});
 
@@ -1772,8 +2343,8 @@ mod tests {
 	#[test]
 	fn a_function_with_primitive_params_and_return_resolves() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
-			pub type bool;
+			type i32;
+			type bool;
 			fn add(a: i32, b: i32) -> bool { true }
 		"});
 
@@ -1806,7 +2377,7 @@ mod tests {
 	#[test]
 	fn duplicate_function_param_name_is_reported_but_both_entries_survive() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
+			type i32;
 			fn f(x: i32, x: i32) { }
 		"});
 
@@ -1821,7 +2392,7 @@ mod tests {
 	#[test]
 	fn a_bodiless_function_declaration_resolves_like_a_function() {
 		let case = TestCase::new(indoc! {"
-			pub type i32;
+			type i32;
 			fn imported(x: i32) -> i32;
 		"});
 

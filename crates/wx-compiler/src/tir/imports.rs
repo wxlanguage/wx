@@ -975,7 +975,6 @@ impl<'r> ImportResolver<'r> {
 			.with_label(span.primary_label().with_message(label_message))
 	}
 
-
 	/// The label for one frame of a reported cycle: the source path it's
 	/// importing from, not the local name it binds:
 	///
@@ -1066,7 +1065,6 @@ impl<'r> ImportResolver<'r> {
 				"consider marking `{name}` as `pub` in the imported module"
 			))
 	}
-
 }
 
 /// Modelled on rustc's E0659: several `pub use path::*;` re-exports supply
@@ -1421,10 +1419,12 @@ mod tests {
 		// rather than deferred — deferring would risk the problem never
 		// being reported at all if nothing else ever consults this
 		// binding again.
-		case.diagnostics()
-			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::PrivateItem,
+			|diagnostic| {
 				assert_eq!(diagnostic.message, "function `secret` is private")
-			});
+			},
+		);
 
 		let root = case.root_namespace();
 		match case.lookup_value(root, "secret") {
@@ -1566,10 +1566,12 @@ mod tests {
 			use outer::inner::helper;
 		"});
 
-		case.diagnostics()
-			.assert_error_with(DiagnosticCode::PrivateItem, |diagnostic| {
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::PrivateItem,
+			|diagnostic| {
 				assert_eq!(diagnostic.message, "module `inner` is private")
-			});
+			},
+		);
 	}
 
 	#[test]
@@ -1583,7 +1585,10 @@ mod tests {
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
-				assert_eq!(diagnostic.message, "cannot use struct `Helper` as a namespace")
+				assert_eq!(
+					diagnostic.message,
+					"cannot use struct `Helper` as a namespace"
+				)
 			},
 		);
 	}
@@ -2398,7 +2403,10 @@ mod tests {
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
-				assert_eq!(diagnostic.message, "cannot use struct `Helper` as a namespace")
+				assert_eq!(
+					diagnostic.message,
+					"cannot use struct `Helper` as a namespace"
+				)
 			},
 		);
 	}

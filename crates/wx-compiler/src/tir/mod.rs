@@ -13,6 +13,7 @@
 // mod tests;
 
 mod defs;
+mod impls;
 mod imports;
 mod literals;
 mod paths;

@@ -32,40 +32,6 @@ index_newtype!(TypeIndex);
 // implemented in `signatures.rs`.
 index_newtype!(EnumIndex);
 
-/// A function type's parameters and result packed into one interned slice —
-/// `items[..params_count]` are the parameters, `items[params_count]` is the
-/// result. One `Vec` rather than two separate `Box<[TypeIndex]>` fields
-/// halves the allocations a `Type::Function` needs and keeps `Type`'s
-/// `Hash`/`Eq` (which drive interning) from having to combine two slices.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FunctionSignature {
-	items: Box<[TypeIndex]>,
-	params_count: u32,
-}
-
-impl FunctionSignature {
-	pub fn new(params: &[TypeIndex], result: TypeIndex) -> Self {
-		let mut items = Vec::with_capacity(params.len() + 1);
-		items.extend_from_slice(params);
-		items.push(result);
-		Self {
-			items: items.into_boxed_slice(),
-			params_count: u32::try_from(params.len())
-				.expect("a function signature exceeded u32 param capacity"),
-		}
-	}
-
-	pub fn params(&self) -> &[TypeIndex] {
-		&self.items[..self.params_count as usize]
-	}
-
-	pub fn result(&self) -> TypeIndex {
-		self.items[self.params_count as usize]
-	}
-}
-
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -110,7 +76,10 @@ pub enum Type {
 		args: Box<[TypeIndex]>,
 	},
 	Function {
-		signature: FunctionSignature,
+		params: Box<[TypeIndex]>,
+		/// `TypeIndex::UNIT` when the written function type omits its result.
+		/// A tuple result is one `TypeIndex`.
+		result: TypeIndex,
 	},
 	/// Named function reference before coercion to a fn pointer. Encodes
 	/// three states via length, same convention as `Struct::args`.
@@ -245,7 +214,11 @@ impl TypeIndex {
 	/// fallback is needed.
 	#[inline]
 	pub fn infer_or(self, other: TypeIndex) -> TypeIndex {
-		if self == TypeIndex::INFER { other } else { self }
+		if self == TypeIndex::INFER {
+			other
+		} else {
+			self
+		}
 	}
 
 	#[inline]

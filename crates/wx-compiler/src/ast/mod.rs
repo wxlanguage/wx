@@ -1290,10 +1290,15 @@ pub enum Ownership {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum TypeExpression {
-	/// `_` — explicit inference placeholder; resolved to `TypeIndex::INFER`.
+	/// `_` — explicit inference placeholder; type-resolution context decides
+	/// whether it stays `INFER` or is rejected as `ERROR`.
 	Infer,
 	/// `i32`, `module::Type`, `module::Wrapper::<T>` — a flat path of segments.
 	Path(Box<[PathSegment]>),
+	/// `(T, U, V)` or `()`
+	Tuple {
+		elements: Box<[Spanned<TypeExpression>]>,
+	},
 	/// `fn(i32, i32) -> i32`
 	Function {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
@@ -1314,10 +1319,6 @@ pub enum TypeExpression {
 		ownership: Ownership,
 		inner: Box<Spanned<TypeExpression>>,
 		size: Spanned<usize>,
-	},
-	/// `(T, U, V)` or `()`
-	Tuple {
-		elements: Box<[Spanned<TypeExpression>]>,
 	},
 	/// `heap::*u8`, `heap::&[i32]` — memory-tagged pointer/slice/array.
 	/// The memory is always a single-segment path naming the memory
