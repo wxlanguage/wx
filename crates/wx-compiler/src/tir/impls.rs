@@ -3,8 +3,6 @@
 //! without depending on declaration order. A bucket is not a match: generic
 //! arguments and bounds must still be checked against the full receiver.
 
-use std::collections::HashMap;
-
 use codespan_reporting::diagnostic::Diagnostic;
 
 use crate::{
@@ -138,9 +136,7 @@ impl SignatureBuilder<'_, '_> {
 				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::InvalidImplTarget.code())
-						.with_message(
-							"cannot implement a trait for this type",
-						)
+						.with_message("cannot implement a trait for this type")
 						.with_label(
 							SourceSpan::new(file_id, target.span)
 								.primary_label(),

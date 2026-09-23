@@ -16,6 +16,7 @@ mod defs;
 mod impls;
 mod imports;
 mod literals;
+mod members;
 mod paths;
 mod signatures;
 mod types;

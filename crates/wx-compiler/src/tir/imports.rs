@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::defs::{
-	Binding, BindingKey, BindingLookup, BindingTarget, DefKey, DefKind,
+	Binding, BindingKey, BindingLookup, BindingTarget, DefKey,
 	DuplicateDefinitionDiagnostic, GlobImport, Namespace, NamespaceIndex,
 	NamespaceLookup, UseItemDef, UseItemIndex, UseItemKind, UsePathIndex,
 	UsePathSegment, Visibility,
@@ -1279,9 +1279,10 @@ mod tests {
 			};
 			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
 				.items[usize::from(def_key.def_idx)]
-				.kind;
-			kind.as_namespace()
-				.unwrap_or_else(|| panic!("`{name}` is not a namespace: {kind:?}"))
+			.kind;
+			kind.as_namespace().unwrap_or_else(|| {
+				panic!("`{name}` is not a namespace: {kind:?}")
+			})
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.

@@ -21,12 +21,15 @@
 //! (`DefKind::as_namespace` returns `None`) — a struct, an enum variant, a
 //! trait, ... — there's nowhere left to look up the next segment using this
 //! module's own machinery: namespace bindings are the only kind it knows
-//! about. Resolving `Type::member` needs the
-//! inherent/trait impl dispatch tables instead (not built yet); that case
-//! surfaces as `PathResolution::stopped_with` being `Found` while
-//! `stopped_at` is still short of the last segment, for
-//! `resolve_path` to route onward however it can once that machinery
-//! exists, or diagnose, if there's nowhere onward to route it to yet.
+//! about. Resolving `Type::member` needs the inherent/trait impl dispatch
+//! tables or a bound instead (`members.rs`'s job). [`Self::walk_path`] is
+//! the raw primitive: it never decides whether stopping early is fine,
+//! just hands back whichever segment it actually reached and where.
+//! [`Self::resolve_path`] is built on top of it for the common case — a
+//! caller that never continues (a bound's own trait path, a `use` path, ...)
+//! and wants stopping early to be `CannotUseAsNamespace`; a caller that
+//! *can* continue past this module's own edge calls `walk_path` directly
+//! and decides for itself.
 //!
 //! Doesn't diagnose anything itself. Rustc splits privacy-checking off
 //! into a wholly separate later pass over already-resolved paths — I
@@ -83,11 +86,10 @@ use super::imports::{
 /// placeholder; no separate "errored" case is needed since `BindingTarget`
 /// already says so.
 ///
-/// Both fields are private. [`PathResolver::resolve_path`] is the
-/// intended way to consume a resolution — it turns this raw shape into a
-/// plain `BindingTarget`, reporting whatever went wrong, so a caller never
-/// needs to know this struct's shape at all. `try_resolve_path` itself still
-/// stays diagnostics-free internally (same reasoning as
+/// Both fields are private — [`PathResolver::walk_path`] is the intended
+/// way to consume a resolution, turning this raw shape into the smaller,
+/// already-diagnosed [`PathWalk`]. `try_resolve_path` itself still stays
+/// diagnostics-free internally (same reasoning as
 /// `NamespaceLookup::try_insert_binding`); it's just that nothing outside
 /// this file gets to see its raw result anymore.
 ///
@@ -107,6 +109,23 @@ struct PathResolution {
 	/// which is what makes "a hop, but no DefKey" unrepresentable here
 	/// rather than a case this type has to account for.
 	first_inaccessible: Option<(u32, DefKey)>,
+}
+
+/// [`PathResolver::walk_path`]'s result: the target reached, and which
+/// segment it was reached at. Whether the whole path was consumed is a
+/// plain comparison ([`Self::is_complete`]) rather than its own variant
+/// (`Full`/`Partial`) — every caller needs `stopped_at` regardless, either
+/// to know where to continue from, or (a caller that never continues) to
+/// point its own diagnostic at the right segment.
+pub(super) struct PathWalk {
+	pub(super) target: BindingTarget,
+	pub(super) stopped_at: u32,
+}
+
+impl PathWalk {
+	pub(super) fn is_complete(&self, segments: &[PathSegment]) -> bool {
+		self.stopped_at as usize + 1 == segments.len()
+	}
 }
 
 /// Namespace-graph path resolution, holding just the read-only inputs
@@ -230,26 +249,28 @@ impl<'r> PathResolver<'r> {
 		)
 	}
 
-	/// Resolves `segments` and turns the result into a single
-	/// `BindingTarget`, reporting a diagnostic for everything that can go
-	/// wrong along the way:
-	/// - `NotFound` / `Ambiguous` / reaching a non-module mid-path — nothing
-	///   real to hand back, so this reports and returns `BindingTarget::Error`.
+	/// Walks `segments`, diagnosing only what's *always* an error
+	/// regardless of caller:
+	/// - `NotFound` / `Ambiguous` — nothing real to hand back.
 	/// - A hop that resolved to something real but isn't visible to
-	///   `accessor` — reported too, but *not* turned into `Error`: matching
+	///   `accessor` — reported, but *not* turned into `Error`: matching
 	///   rustc (verified empirically — a privacy violation doesn't stop
 	///   type-checking from also reporting its own, unrelated errors on the
 	///   same resolved item), the real target is still returned, so a
 	///   caller building on top of it doesn't get a spurious cascade on top
 	///   of the privacy diagnostic.
 	///
-	/// This is the intended entry point for every other module — see
-	/// [`PathResolution`]'s doc comment for why its raw shape isn't exposed
-	/// directly.
+	/// Stopping before the last segment is deliberately left undiagnosed —
+	/// whether that's fine depends entirely on what the caller does next,
+	/// which this method has no way to know. [`Self::resolve_path`] is the
+	/// convenience for a caller that doesn't; a caller that can continue
+	/// past this module's own edge (`members.rs`'s territory) calls this
+	/// directly and decides for itself, using [`PathWalk::stopped_at`] to
+	/// know where to pick up from.
 	///
 	/// The exact diagnostic codes/wording below are still open — see the
 	/// `report_*` stubs.
-	pub(super) fn resolve_path(
+	pub(super) fn walk_path(
 		&self,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
@@ -257,10 +278,10 @@ impl<'r> PathResolver<'r> {
 		accessor: NamespaceIndex,
 		segments: &[PathSegment],
 		tier: BindingNamespace,
-	) -> BindingTarget {
+	) -> PathWalk {
 		let resolution = self.try_resolve_path(accessor, segments, tier);
-		let stopped_at = resolution.stopped_at as usize;
-		let is_last = stopped_at + 1 == segments.len();
+		let stopped_at = resolution.stopped_at;
+		let is_last = stopped_at as usize + 1 == segments.len();
 		// Every segment but the last is always looked up in the `Type`
 		// tier (see `try_resolve_path`) — `tier` only applies once we've
 		// actually reached the last one.
@@ -269,10 +290,10 @@ impl<'r> PathResolver<'r> {
 		} else {
 			BindingNamespace::Type
 		};
-		let span = segments[stopped_at].ident.span;
+		let span = segments[stopped_at as usize].ident.span;
 
-		match &resolution.stopped_with {
-			BindingLookup::Found(target, _) if is_last => {
+		let target = match &resolution.stopped_with {
+			BindingLookup::Found(target, _) => {
 				let target = *target;
 				if let Some((bad, def_key)) = resolution.first_inaccessible {
 					diagnostics.push(report_private_identifier(
@@ -288,28 +309,13 @@ impl<'r> PathResolver<'r> {
 				}
 				target
 			}
-			BindingLookup::Found(target, _) => {
-				// `None` here means an already-errored placeholder
-				// (`BindingTarget::Error`) mid-path — already diagnosed
-				// by whoever caused that, nothing new to report.
-				if let Some(def_key) = target.def_key() {
-					diagnostics.push(report_cannot_use_as_namespace(
-						self.namespaces,
-						strings,
-						segments[stopped_at].ident.inner,
-						SourceSpan::new(file_id, span),
-						def_key,
-					));
-				}
-				BindingTarget::Error
-			}
 			BindingLookup::NotFound => {
 				diagnostics.push(report_not_found(
 					strings,
 					file_id,
 					span,
 					seg_tier,
-					segments[stopped_at].ident.inner,
+					segments[stopped_at as usize].ident.inner,
 				));
 				BindingTarget::Error
 			}
@@ -317,13 +323,53 @@ impl<'r> PathResolver<'r> {
 				diagnostics.push(report_ambiguous_identifier(
 					self.namespaces,
 					strings,
-					segments[stopped_at].ident.inner,
+					segments[stopped_at as usize].ident.inner,
 					SourceSpan::new(file_id, span),
 					candidates,
 				));
 				BindingTarget::Error
 			}
+		};
+
+		PathWalk { target, stopped_at }
+	}
+
+	/// The surface most callers want: resolves `segments` and requires the
+	/// whole path to have been consumed, reporting `CannotUseAsNamespace`
+	/// if [`Self::walk_path`] stopped early — built entirely out of that
+	/// plus the one thing every non-continuing caller does with its second
+	/// outcome, not a special path through it.
+	pub(super) fn resolve_path(
+		&self,
+		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		strings: &StringInterner,
+		file_id: FileId,
+		accessor: NamespaceIndex,
+		segments: &[PathSegment],
+		tier: BindingNamespace,
+	) -> BindingTarget {
+		let walk = self.walk_path(
+			diagnostics, strings, file_id, accessor, segments, tier,
+		);
+		if walk.is_complete(segments) {
+			return walk.target;
 		}
+		// `None` here means an already-errored placeholder
+		// (`BindingTarget::Error`) mid-path — already diagnosed by
+		// whoever caused that, nothing new to report.
+		if let Some(def_key) = walk.target.def_key() {
+			diagnostics.push(report_cannot_use_as_namespace(
+				self.namespaces,
+				strings,
+				segments[walk.stopped_at as usize].ident.inner,
+				SourceSpan::new(
+					file_id,
+					segments[walk.stopped_at as usize].ident.span,
+				),
+				def_key,
+			));
+		}
+		BindingTarget::Error
 	}
 
 	fn def_kind(&self, def_key: DefKey) -> DefKind {
