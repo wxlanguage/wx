@@ -169,7 +169,6 @@ pub struct TraitImplDef {
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
 	pub bindings: HashMap<BindingKey, MemberIndex>,
-	pub self_accesses: Vec<SourceSpan>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -183,7 +182,6 @@ pub struct InherentImplDef {
 	)]
 	pub bindings: HashMap<BindingKey, MemberIndex>,
 	pub members: Vec<InherentMemberDef>,
-	pub self_accesses: Vec<SourceSpan>,
 }
 
 /// Field identity only (names, `pub_span`, dedup/lookup) — field *types*
@@ -2496,7 +2494,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						namespace,
 						members,
 						bindings,
-						self_accesses: Vec::new(),
 					})
 				);
 			}
@@ -2693,7 +2690,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							namespace,
 							members: Vec::new(),
 							bindings: HashMap::new(),
-							self_accesses: Vec::new(),
 						})
 					})
 					.collect();
@@ -2820,7 +2816,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						def_id: *impl_id,
 						file_id,
 						namespace,
-						self_accesses: Vec::new(),
 						bindings,
 						members,
 					})

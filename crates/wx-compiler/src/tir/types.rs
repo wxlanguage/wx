@@ -1,15 +1,20 @@
 //! Type identity: the structurally hash-consed `Type` arena every resolved
-//! signature and expression points into.
+//! signature and expression points into, plus `TypeEnvArena` — the
+//! complementary arena answering "what does this *written name* currently
+//! mean," rather than "what does this *shape* mean."
 //!
 //! Deliberately independent of `defs`/`signatures`' resolution machinery —
-//! this module only answers "given a `Type`, what `TypeIndex` names it",
-//! never "what type does this path/expression have". It depends on `defs`
-//! for `TraitIndex` (an associated-type projection names the trait that
-//! declares it) and `StructIndex`/`EnumIndex` (both pre-allocated in
+//! this module only answers identity questions, never "what type does this
+//! path/expression have" or "what scope am I resolving in." It depends on
+//! `defs` for `TraitIndex` (an associated-type projection names the trait
+//! that declares it) and `StructIndex`/`EnumIndex` (both pre-allocated in
 //! `defs.rs`'s Phase 1, for the same reason as `TraitIndex`) but nothing
 //! here calls into name resolution, and nothing in `defs` depends back on
 //! this module — see `tir/defs.rs`'s own doc comment for why that direction
-//! has to stay one-way.
+//! has to stay one-way. `TypeEnvArena` fits the same charter: given a name,
+//! it hands back a `TypeIndex` already sitting in this module, with no
+//! namespace lookup, no diagnostics, and no notion of `signatures.rs`'s
+//! demand-driven queries at all.
 //!
 //! A type parameter's owner is a bare `ast::DefId` rather than a dedicated
 //! `TypeParamOwner` enum (the old builder's shape, one variant per arena a
@@ -20,7 +25,8 @@
 
 use std::collections::HashMap;
 
-use crate::ast::DefId;
+use crate::ast::{DefId, Spanned};
+use crate::diagnostics::SourceSpan;
 use crate::index::index_newtype;
 use string_interner::symbol::SymbolU32;
 
@@ -202,6 +208,112 @@ impl TypeInterner {
 impl Default for TypeInterner {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+// A `Copy` handle into a `TypeEnvArena` — see that type's doc comment.
+index_newtype!(TypeEnvId);
+
+/// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
+/// interned as `Type::TypeParam { owner, param_index }` the moment its frame
+/// is built, or `Self`, bound to whatever it means right here: a trait's own
+/// abstract `TypeParam { owner: trait_id, param_index: 0 }`, or an impl's
+/// already-concrete `target`. Both are just "this name resolves to this
+/// `TypeIndex`" once interning is out of the way — one shape covers both, so
+/// `resolve_name` never needs a separate concrete-vs-abstract case.
+///
+/// No bounds here — a frame is never asked for a param's bounds, and those
+/// are a resolved-signature fact anyway (see `signatures.rs`'s own doc
+/// comment), not an identity one.
+pub(super) struct EnvParam {
+	pub(super) name: Spanned<SymbolU32>,
+	pub(super) ty: TypeIndex,
+	pub(super) accesses: Vec<SourceSpan>,
+}
+
+/// One frame of the chain of generic-parameter names visible while resolving
+/// one item's own signature — composed parent-first, the way lexical scopes
+/// are: a trait's synthetic single-entry `Self` frame, or an impl's own
+/// `<T>` frame; then, for an impl member, a `Self` frame rebinding it to a
+/// concrete type; then the item's own explicit `<T>`.
+enum TypeEnv {
+	Root,
+	Frame { params: Box<[EnvParam]>, parent: TypeEnvId },
+}
+
+/// Owns every [`TypeEnv`] frame ever pushed while resolving *any* item's
+/// signature — one arena for the whole Phase 2 run, same lifetime and shape
+/// as `TypeInterner` (append-only, addressed by a cheap `Copy` id, never
+/// invalidated). A signature struct stores the `TypeEnvId` of its own frame
+/// rather than an owned param list.
+///
+/// Generalizes `builder::type_compare::TypeEnv` (which answers "what does
+/// this abstract variable mean, once an impl's own args are known," for
+/// read-only structural comparison after signatures already exist) to also
+/// answer "what does this written name refer to" — and, since this frame
+/// persists for the rest of the compilation rather than being torn down
+/// once its own item finishes, "where has it been referenced since" — while
+/// a signature is being built in the first place. Being append-only is what
+/// makes that persistence safe under reentrancy: `ensure_signature` calling
+/// back into itself for some *other* item (a field type naming another
+/// struct, say) pushes that item's own frames on top without disturbing —
+/// or invalidating the `TypeEnvId` of — anything the outer call already
+/// holds, the exact same guarantee `TypeInterner::intern` already gives for
+/// `TypeIndex`.
+pub(super) struct TypeEnvArena {
+	envs: Vec<TypeEnv>,
+}
+
+impl TypeEnvId {
+	/// The always-present slot-0 frame — a [`TypeEnv::Root`]. A sentinel
+	/// constant on the id type itself, same as `TypeIndex::INFER`/`ERROR`/…
+	/// below rather than on the arena that produces the rest — built via the
+	/// tuple constructor directly since `TypeEnvId::new` isn't `const fn`,
+	/// the one place within this module that's allowed to reach past it.
+	pub(super) const ROOT: TypeEnvId = TypeEnvId(0);
+}
+
+impl TypeEnvArena {
+	pub(super) fn new() -> Self {
+		Self {
+			envs: vec![TypeEnv::Root],
+		}
+	}
+
+	pub(super) fn push_frame(
+		&mut self,
+		params: Box<[EnvParam]>,
+		parent: TypeEnvId,
+	) -> TypeEnvId {
+		let id = TypeEnvId::new(u32::try_from(self.envs.len()).unwrap());
+		self.envs.push(TypeEnv::Frame { params, parent });
+		id
+	}
+
+	/// Resolves `name` (written at `span`), walking from `id` towards
+	/// `Root`, recording the access against whichever entry matched. `None`
+	/// means no frame in the chain declares it.
+	pub(super) fn resolve_name(
+		&mut self,
+		id: TypeEnvId,
+		name: SymbolU32,
+		span: SourceSpan,
+	) -> Option<TypeIndex> {
+		match &mut self.envs[usize::from(id)] {
+			TypeEnv::Root => None,
+			TypeEnv::Frame { params, parent } => {
+				match params.iter().position(|p| p.name.inner == name) {
+					Some(index) => {
+						params[index].accesses.push(span);
+						Some(params[index].ty)
+					}
+					None => {
+						let parent = *parent;
+						self.resolve_name(parent, name, span)
+					}
+				}
+			}
+		}
 	}
 }
 
