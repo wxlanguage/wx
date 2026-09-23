@@ -119,8 +119,17 @@ pub enum Type {
 	/// visible chain: a method's own parameters start counting only after
 	/// its parent impl/trait block's, mirroring how `signatures::GenericParam`
 	/// slices compose (see that module's doc comment).
+	///
+	/// `env` is the `TypeEnvId` of the frame this param's own `EnvParam`
+	/// lives in (predicted via `TypeEnvArena::next_id` before that frame
+	/// exists — see its doc comment), with `param_index` local to that one
+	/// frame. It's the lookup key `signatures.rs`'s bound resolution
+	/// actually uses; `owner` stays alongside it for identity/diagnostics
+	/// purposes (naming which item declared this param), not because
+	/// anything here still needs it to find the frame.
 	TypeParam {
 		owner: DefId,
+		env: TypeEnvId,
 		param_index: u32,
 	},
 	/// `M::Size` — opaque until monomorphization substitutes `M`.
@@ -238,7 +247,10 @@ pub(super) struct EnvParam {
 /// concrete type; then the item's own explicit `<T>`.
 enum TypeEnv {
 	Root,
-	Frame { params: Box<[EnvParam]>, parent: TypeEnvId },
+	Frame {
+		params: Box<[EnvParam]>,
+		parent: TypeEnvId,
+	},
 }
 
 /// Owns every [`TypeEnv`] frame ever pushed while resolving *any* item's
@@ -280,12 +292,23 @@ impl TypeEnvArena {
 		}
 	}
 
+	/// The `TypeEnvId` the *next* `push_frame` call will hand back. Exposed
+	/// so a caller can mint a frame's own `Type::TypeParam { env, .. }`
+	/// values *before* the frame exists — those values are exactly what
+	/// `push_frame`'s own `params` needs, so the id has to be knowable
+	/// ahead of the call that assigns it. Safe to predict: this arena only
+	/// ever grows by appending, and nothing reentrant can push in between
+	/// a caller reading this and then calling `push_frame`.
+	pub(super) fn next_id(&self) -> TypeEnvId {
+		TypeEnvId::new(u32::try_from(self.envs.len()).unwrap())
+	}
+
 	pub(super) fn push_frame(
 		&mut self,
 		params: Box<[EnvParam]>,
 		parent: TypeEnvId,
 	) -> TypeEnvId {
-		let id = TypeEnvId::new(u32::try_from(self.envs.len()).unwrap());
+		let id = self.next_id();
 		self.envs.push(TypeEnv::Frame { params, parent });
 		id
 	}

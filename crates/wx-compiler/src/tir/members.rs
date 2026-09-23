@@ -9,15 +9,14 @@
 
 use string_interner::symbol::SymbolU32;
 
-use crate::ast::DefId;
-
 use super::defs::{
 	BindingKey, BindingNamespace, InherentImplIndex, MemberKind,
 	TraitImplIndex, TraitIndex,
 };
 use super::impls::ImplTarget;
 use super::signatures::{
-	AssocBindingKind, ItemLocation, QueryInfo, SignatureBuilder, TraitBound,
+	AssocBindingKind, AssocTypeIndex, ItemLocation, QueryInfo,
+	SignatureBuilder, TraitBound,
 };
 use super::types::{Type, TypeIndex};
 
@@ -152,52 +151,122 @@ impl SignatureBuilder<'_, '_> {
 	/// function/struct/impl's own `T: B + C` never is, because nothing
 	/// else ever reuses that specific combination — so if `B` and `C`
 	/// disagree about some associated type, nothing has caught it before
-	/// now. This is where that combination is finally checked, lazily,
-	/// via the same `merge_trait_bound` a trait's own header uses.
+	/// now. This is where that combination is finally checked, lazily —
+	/// and, since nothing else ever reuses it either, cached the first
+	/// time it's actually demanded (`SignatureBuilder::param_bounds`), so
+	/// a second projection through the same receiver reuses the merge
+	/// instead of re-running `merge_trait_bound` (and, if it disagrees,
+	/// re-diagnosing it) from scratch.
 	fn resolve_bound_member(
 		&mut self,
 		receiver: TypeIndex,
 		key: BindingKey,
 	) -> TypeMemberLookup {
-		let declared: Box<[TraitBound]> = match self.types.resolve(receiver) {
-			Type::TypeParam { owner, param_index } => {
-				self.type_param_bounds(*owner, *param_index).into()
+		match self.types.resolve(receiver) {
+			Type::TypeParam {
+				owner,
+				env,
+				param_index,
+			} => {
+				let (owner, env, param_index) = (*owner, *env, *param_index);
+				// A trait's own `Self` never needs a cache slot of its
+				// own: its combination was already checked, once,
+				// eagerly, when the trait's header resolved —
+				// `implied_bounds` already *is* the fully merged,
+				// already-diagnosed transitive closure. Prepending the
+				// reflexive `Self: ThisTrait` entry (`declared_bounds[0]`
+				// — never itself part of `implied_bounds`, see that
+				// field's own doc comment) is all that's missing to
+				// answer this lookup directly, no merge needed.
+				if let ItemLocation::Trait(idx) = self.item_lookup[&owner] {
+					let trait_sig = &self.traits[usize::from(idx)];
+					let bounds = std::iter::once(&trait_sig.declared_bounds[0])
+						.chain(trait_sig.implied_bounds.iter());
+					return self.candidates_from_reachable(bounds, key);
+				}
+
+				if let Some(cached) = self.reachable_bounds(env, param_index) {
+					return self.candidates_from_reachable(cached.iter(), key);
+				}
+				let declared: Box<[TraitBound]> =
+					self.declared_bounds(env, param_index).into();
+				let reachable = self.compute_reachable(&declared);
+				let result =
+					self.candidates_from_reachable(reachable.iter(), key);
+				self.store_reachable_bounds(env, param_index, reachable);
+				result
 			}
 			Type::AssocTypeProjection {
 				trait_index,
 				assoc_name,
 				..
-			} => self.assoc_type_bounds(*trait_index, *assoc_name),
+			} => {
+				let (trait_index, assoc_name) = (*trait_index, *assoc_name);
+				let Some(index) =
+					self.assoc_type_index(trait_index, assoc_name)
+				else {
+					return TypeMemberLookup::NotFound;
+				};
+				if let Some(cached) =
+					&self.assoc_types[usize::from(index)].reachable_bounds
+				{
+					return self.candidates_from_reachable(cached.iter(), key);
+				}
+				let declared =
+					self.assoc_types[usize::from(index)].bounds.clone();
+				let reachable = self.compute_reachable(&declared);
+				let result =
+					self.candidates_from_reachable(reachable.iter(), key);
+				self.assoc_types[usize::from(index)].reachable_bounds =
+					Some(reachable);
+				result
+			}
 			// Error/Infer/anything else `ImplTarget` also can't bucket and
 			// that isn't one of the two abstract shapes — nothing to look
 			// a member up on.
-			_ => return TypeMemberLookup::NotFound,
-		};
+			_ => TypeMemberLookup::NotFound,
+		}
+	}
 
-		// The full reachable set: every declared bound (one hop — for a
-		// trait's own `Self` this already includes the trait itself,
-		// reflexively, at index 0), plus everything each one transitively
-		// implies (precomputed per-trait, so this is just union over
-		// already-finished data, not a walk). Merged, not just deduped by
-		// identity: `declared` can combine multiple, mutually unrelated
-		// bounds (`T: B + C`) whose own transitive sets were never checked
-		// against *each other* before.
+	/// Builds the transitive closure of `declared` — every bound, plus
+	/// everything each one implies (precomputed per-trait, so this is just
+	/// union over already-finished data, not a walk) — merged, not just
+	/// deduped by identity: `declared` can combine multiple, mutually
+	/// unrelated bounds (`T: B + C`) whose own transitive sets were never
+	/// checked against *each other* before. `merge_trait_bound` pushes a
+	/// diagnostic the first time two of them disagree; every caller here
+	/// only ever calls this once per receiver and caches the result, so
+	/// that diagnostic fires exactly once too.
+	fn compute_reachable(
+		&mut self,
+		declared: &[TraitBound],
+	) -> Box<[TraitBound]> {
 		let mut reachable: Vec<TraitBound> = Vec::new();
-		for bound in declared.iter() {
+		for bound in declared {
 			self.merge_trait_bound(&mut reachable, bound);
 		}
-		for bound in declared.iter() {
-			let implied: Box<[TraitBound]> =
-				self.traits[usize::from(bound.trait_index)]
-					.implied_bounds
-					.clone();
+		for bound in declared {
+			let implied: Box<[TraitBound]> = self.traits
+				[usize::from(bound.trait_index)]
+			.implied_bounds
+			.clone();
 			for further in implied.iter() {
 				self.merge_trait_bound(&mut reachable, further);
 			}
 		}
+		reachable.into_boxed_slice()
+	}
 
+	/// Turns an already-merged reachable set into a lookup result —
+	/// shared between the cached and freshly-computed paths, and between
+	/// the `TypeParam` and `AssocTypeProjection` receivers.
+	fn candidates_from_reachable<'a>(
+		&self,
+		bounds: impl Iterator<Item = &'a TraitBound>,
+		key: BindingKey,
+	) -> TypeMemberLookup {
 		let mut candidates = Vec::new();
-		for bound in &reachable {
+		for bound in bounds {
 			let trait_def = &self.defs.traits[usize::from(bound.trait_index)];
 			if let Some(&member_index) = trait_def.bindings.get(&key) {
 				// A poisoned `where{}` binding for this exact name means the
@@ -206,10 +275,7 @@ impl SignatureBuilder<'_, '_> {
 				// to report here, poisoned or not.
 				let poisoned = bound.bindings.iter().any(|binding| {
 					binding.name == key.symbol
-						&& matches!(
-							binding.kind,
-							AssocBindingKind::Conflicting
-						)
+						&& matches!(binding.kind, AssocBindingKind::Conflicting)
 				});
 				if poisoned {
 					return TypeMemberLookup::Conflicted;
@@ -224,87 +290,27 @@ impl SignatureBuilder<'_, '_> {
 		Self::classify(candidates)
 	}
 
-	/// The one-hop declared bounds on generic parameter `param_index`,
-	/// declared by whichever item `owner` names. Every kind that can ever
-	/// appear as a `TypeParam`'s `owner` stores its params' bounds
-	/// somewhere — this is the one place that knows where, for each of
-	/// them. Transitive expansion (supertraits-of-supertraits) is the
-	/// caller's job (`resolve_bound_member`), via each returned bound's own
-	/// `TraitSignature::implied_bounds` — not this method's concern.
-	fn type_param_bounds(
-		&self,
-		owner: DefId,
-		param_index: u32,
-	) -> &[TraitBound] {
-		let index = param_index as usize;
-		match self.item_lookup[&owner] {
-			// A trait's own `Self` — always index 0, the trait having no
-			// generic params of its own to share the space with.
-			// `declared_bounds` already has the reflexive `Self: ThisTrait`
-			// entry at its own index 0 (see `TraitSignature`'s doc
-			// comment), so there's nothing extra to add here.
-			ItemLocation::Trait(idx) => {
-				&self.traits[usize::from(idx)].declared_bounds
-			}
-			ItemLocation::Function(idx) => {
-				&self.functions[usize::from(idx)].type_param_bounds[index]
-			}
-			ItemLocation::Struct(idx) => {
-				&self.structs[usize::from(idx)].type_param_bounds[index]
-			}
-			ItemLocation::InherentImpl(idx) => {
-				&self.inherent_impls[usize::from(idx)]
-					.as_ref()
-					.expect(
-						"a TypeParam can only reference an impl whose header \
-						 already resolved — that's what minted the TypeParam",
-					)
-					.type_param_bounds[index]
-			}
-			ItemLocation::TraitImpl(idx) => {
-				&self.trait_impls[usize::from(idx)]
-					.as_ref()
-					.expect(
-						"a TypeParam can only reference an impl whose header \
-						 already resolved — that's what minted the TypeParam",
-					)
-					.type_param_bounds[index]
-			}
-			ItemLocation::TypeAlias(_) => &[],
-			ItemLocation::Enum(_)
-			| ItemLocation::TypeSet(_)
-			| ItemLocation::Constant(_)
-			| ItemLocation::TraitAssocType(_) => unreachable!(
-				"none of these ever declare a generic param, so no \
-				 `Type::TypeParam` can name one as its owner"
-			),
-		}
-	}
-
-	/// The resolved bounds on trait `trait_index`'s own associated type
-	/// named `assoc_name` — forces that one associated type's own signature
-	/// first, same reasoning as forcing `Self` before reading it.
-	fn assoc_type_bounds(
+	/// Resolves `assoc_name` against trait `trait_index`'s own associated
+	/// types, forcing that one associated type's own signature first (same
+	/// reasoning as forcing `Self` before reading it). `None` if the name
+	/// isn't actually one of the trait's associated types — already
+	/// diagnosed wherever this projection was built, since a projection is
+	/// only ever constructed against a name the trait really declares.
+	fn assoc_type_index(
 		&mut self,
 		trait_index: TraitIndex,
 		assoc_name: SymbolU32,
-	) -> Box<[TraitBound]> {
+	) -> Option<AssocTypeIndex> {
 		let key = BindingKey::ty(assoc_name);
-		let Some(&member_index) = self.defs.traits[usize::from(trait_index)]
+		let &member_index = self.defs.traits[usize::from(trait_index)]
 			.bindings
-			.get(&key)
-		else {
-			// Already diagnosed wherever this projection was built — a
-			// projection is only ever constructed against a name the trait
-			// really declares.
-			return Box::new([]);
-		};
+			.get(&key)?;
 		let MemberKind::AssociatedType(def_id) = self.defs.traits
 			[usize::from(trait_index)]
 		.members[usize::from(member_index)]
 		.kind
 		else {
-			return Box::new([]);
+			return None;
 		};
 		let _ = self.ensure_signature(QueryInfo {
 			def_id,
@@ -315,7 +321,7 @@ impl SignatureBuilder<'_, '_> {
 		else {
 			unreachable!()
 		};
-		self.assoc_types[usize::from(index)].bounds.clone()
+		Some(index)
 	}
 
 	fn classify(mut candidates: Vec<TypeMemberTarget>) -> TypeMemberLookup {

@@ -98,6 +98,35 @@ pub(super) enum AssocBindingKind {
 	Conflicting,
 }
 
+/// One generic parameter's bounds — everything about a `Type::TypeParam`
+/// beyond its own identity (which lives in `TypeEnvArena`, addressed by the
+/// same `(env, param_index)` pair; see that module's own doc comment for
+/// why the two are split apart rather than living on `EnvParam` directly).
+/// Stored in `SignatureBuilder::param_bounds`, index-aligned with
+/// `TypeEnvArena`'s own frames — one `Box<[ParamBounds]>` per frame,
+/// pushed together with it by `push_type_env_frame` so the two arrays can
+/// never drift out of length.
+struct ParamBounds {
+	/// One-hop, as written (`T: A + B`) — used for display and as the seed
+	/// `compute_reachable` merges from. Left empty for a frame whose one
+	/// entry is never itself abstract (an impl's own `Self`, bound
+	/// directly to a concrete type) — nothing ever queries bounds for one
+	/// of those, so there's nothing to fill in.
+	declared: Box<[TraitBound]>,
+	/// Filled the first time `resolve_bound_member` needs this param's
+	/// transitive, conflict-merged bound set — `None` until then.
+	reachable: Option<Box<[TraitBound]>>,
+}
+
+impl ParamBounds {
+	fn empty() -> Self {
+		Self {
+			declared: Box::new([]),
+			reachable: None,
+		}
+	}
+}
+
 index_newtype!(TypeAliasIndex);
 index_newtype!(FunctionIndex);
 index_newtype!(AssocTypeIndex);
@@ -105,10 +134,10 @@ index_newtype!(AssocTypeIndex);
 pub struct TypeAliasSignature {
 	def_id: DefId,
 	name: Spanned<SymbolU32>,
+	/// Bounds on this alias's own params, if any, live in
+	/// `SignatureBuilder::param_bounds`, addressed by this same id — see
+	/// that field's own doc comment for why they aren't a field here.
 	type_params: TypeEnvId,
-	/// Index-aligned with `type_params`'s own frame — see the module doc
-	/// comment for why bounds live here rather than in that frame.
-	type_param_bounds: Box<[Box<[TraitBound]>]>,
 	/// What this alias transparently stands for. `TypeIndex::ERROR` if its
 	/// body failed to resolve or closed a cycle.
 	target: TypeIndex,
@@ -156,9 +185,9 @@ pub struct TraitSignature {
 /// from just this struct — the one place that will (diagnostics, once
 /// bodies exist) already has the `DefId` to look the name up from `defs`.
 pub struct FunctionSignature {
+	/// See `TypeAliasSignature::type_params` — bounds live in
+	/// `SignatureBuilder::param_bounds`, not here.
 	pub(super) type_params: TypeEnvId,
-	/// Index-aligned with `type_params`'s own frame.
-	pub(super) type_param_bounds: Box<[Box<[TraitBound]>]>,
 	param_types: Box<[TypeIndex]>,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
 	return_type: TypeIndex,
@@ -168,9 +197,8 @@ pub struct FunctionSignature {
 /// `defs::StructDef`, index-aligned with whichever `StructFields` variant
 /// that struct has, so record vs. tuple doesn't need re-deriving here.
 pub struct StructSignature {
+	/// See `TypeAliasSignature::type_params`.
 	pub(super) type_params: TypeEnvId,
-	/// Index-aligned with `type_params`'s own frame.
-	pub(super) type_param_bounds: Box<[Box<[TraitBound]>]>,
 	field_types: Box<[TypeIndex]>,
 }
 
@@ -212,14 +240,19 @@ pub struct ConstantSignature {
 /// provides is a separate query (`TraitImplAssocType`), not tracked here.
 pub struct AssocTypeSignature {
 	pub(super) bounds: Box<[TraitBound]>,
+	/// Same reasoning as `ParamBounds::reachable` — filled the first time
+	/// `resolve_bound_member` needs this associated type's transitive,
+	/// conflict-merged bound set. A single slot rather than one per param,
+	/// since there's one associated type per query rather than a whole
+	/// param list, so it isn't addressed through `param_bounds` at all.
+	pub(super) reachable_bounds: Option<Box<[TraitBound]>>,
 }
 
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
 /// separate queries; names and identities already live in `defs.rs`.
 pub struct InherentImplSignature {
+	/// See `TypeAliasSignature::type_params`.
 	pub type_params: TypeEnvId,
-	/// Index-aligned with `type_params`'s own frame.
-	pub type_param_bounds: Box<[Box<[TraitBound]>]>,
 	pub target: Spanned<TypeIndex>,
 	/// The frame binding `Self` to `target`, parented at `type_params` and
 	/// pushed once, right here, rather than separately by each member —
@@ -236,9 +269,8 @@ pub struct InherentImplSignature {
 
 /// The resolved header of `impl<...> Trait for Target { ... }`.
 pub struct TraitImplSignature {
+	/// See `TypeAliasSignature::type_params`.
 	pub type_params: TypeEnvId,
-	/// Index-aligned with `type_params`'s own frame.
-	pub type_param_bounds: Box<[Box<[TraitBound]>]>,
 	/// `None` if resolving the written trait path failed. Its span is kept
 	/// for diagnostics when impl dispatch is built.
 	pub trait_ref: Option<Spanned<TraitIndex>>,
@@ -321,6 +353,8 @@ pub struct SignatureRegistry {
 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 	pub item_lookup: HashMap<DefId, ItemLocation>,
 	pub types: TypeInterner,
+	/// See `SignatureBuilder::param_bounds`.
+	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
 }
 
 impl SignatureRegistry {
@@ -390,6 +424,7 @@ impl SignatureRegistry {
 			trait_impl_dispatch: builder.trait_impl_dispatch,
 			item_lookup: builder.item_lookup,
 			types: builder.types,
+			param_bounds: builder.param_bounds,
 		}
 	}
 }
@@ -531,6 +566,16 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	query_stack: Vec<QueryFrame>,
 	pub(super) types: TypeInterner,
 	pub(super) type_envs: TypeEnvArena,
+	/// Every generic-param-bearing frame's bounds, index-aligned with
+	/// `type_envs`'s own frames (one `Box<[ParamBounds]>` per `TypeEnvId`,
+	/// itself index-aligned with that frame's `params`) — kept as a
+	/// sibling table here rather than inside `TypeEnvArena` itself, since
+	/// `types.rs` is deliberately independent of this module's
+	/// resolved-signature data (`TraitBound`, diagnostics, ...; see that
+	/// module's own doc comment). Grown only through
+	/// `push_type_env_frame`, the one place that pushes to this and to
+	/// `type_envs` together, so the two arrays can never drift in length.
+	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
 	type_aliases: Vec<TypeAliasSignature>,
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
@@ -671,7 +716,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				def_id,
 				name: item_name(ast_nodes, ast_index),
 				type_params: TypeEnvId::ROOT,
-				type_param_bounds: Box::new([]),
 				target: type_index,
 			});
 			item_lookup.insert(def_id, ItemLocation::TypeAlias(index));
@@ -688,6 +732,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			query_stack: Vec::new(),
 			types: TypeInterner::new(),
 			type_envs: TypeEnvArena::new(),
+			// `TypeEnvArena::new()` seeds one `Root` entry (`TypeEnvId::ROOT`)
+			// before anything else is pushed — matched here with one empty
+			// placeholder so the two arrays start, and stay, the same length.
+			param_bounds: vec![Box::new([])],
 			type_aliases,
 			traits: defs
 				.traits
@@ -703,7 +751,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				.iter()
 				.map(|_| StructSignature {
 					type_params: TypeEnvId::ROOT,
-					type_param_bounds: Box::default(),
 					field_types: Box::default(),
 				})
 				.collect(),
@@ -742,9 +789,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// Returns that frame — parented at `parent`, so a bound naming
 	/// something from outer context (`Self`, an enclosing impl's own `<T>`)
 	/// still resolves, and for the caller to go on using as the scope for
-	/// the rest of this item's own signature — and each param's bounds,
-	/// index-aligned with `ast_params`, for the caller to persist directly
-	/// onto its own signature struct's `type_param_bounds`.
+	/// the rest of this item's own signature. Each param's bounds are
+	/// resolved here too, but no longer handed back — they're persisted
+	/// directly into `self.param_bounds`, index-aligned with the returned
+	/// frame, the same place every other item's bounds live (see that
+	/// field's own doc comment for why this replaced a per-signature-struct
+	/// `type_param_bounds` field).
 	pub(super) fn resolve_generic_params(
 		&mut self,
 		file_id: FileId,
@@ -752,7 +802,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		owner: DefId,
 		parent: TypeEnvId,
 		ast_params: &[ast::TypeParam],
-	) -> (TypeEnvId, Box<[Box<[TraitBound]>]>) {
+	) -> TypeEnvId {
 		// The overwhelmingly common case (a non-generic function/struct/impl)
 		// needs no frame at all: an empty frame would never match a lookup,
 		// so resolving through one is behaviorally identical to resolving
@@ -760,8 +810,15 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		// an arena slot that lives for the rest of the compilation for
 		// nothing. Skip it.
 		if ast_params.is_empty() {
-			return (parent, Box::new([]));
+			return parent;
 		}
+
+		// Predicted *before* `params` is built: each param's own
+		// `Type::TypeParam` needs to carry the frame's id, but the frame
+		// itself (`push_type_env_frame`) can only be created once every
+		// `EnvParam` — each already holding its own interned `TypeParam` —
+		// already exists. See `TypeEnvArena::next_id`'s own doc comment.
+		let frame = self.type_envs.next_id();
 
 		let mut params: Vec<EnvParam> = Vec::with_capacity(ast_params.len());
 		for (index, ast_param) in ast_params.iter().enumerate() {
@@ -783,6 +840,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 			let ty = self.types.intern(Type::TypeParam {
 				owner,
+				env: frame,
 				param_index: u32::try_from(index).unwrap(),
 			});
 			params.push(EnvParam {
@@ -792,8 +850,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			});
 		}
 
-		let frame =
-			self.type_envs.push_frame(params.into_boxed_slice(), parent);
+		let pushed =
+			self.push_type_env_frame(params.into_boxed_slice(), parent);
+		debug_assert_eq!(
+			pushed, frame,
+			"nothing can push another frame between `next_id` and this call"
+		);
 
 		let bounds = ast_params
 			.iter()
@@ -804,8 +866,78 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				None => Box::new([]),
 			})
 			.collect();
+		self.set_declared_bounds(frame, bounds);
 
-		(frame, bounds)
+		frame
+	}
+
+	/// Pushes a new `TypeEnvArena` frame and its (initially empty)
+	/// `param_bounds` slot together — the combining call `push_frame`
+	/// itself can't make, since `types.rs` is deliberately independent of
+	/// `TraitBound` and the rest of this module's resolved-signature data
+	/// (see that module's own doc comment). This is the one place
+	/// `type_envs` is ever pushed to, so the two arrays can never drift in
+	/// length.
+	fn push_type_env_frame(
+		&mut self,
+		params: Box<[EnvParam]>,
+		parent: TypeEnvId,
+	) -> TypeEnvId {
+		let count = params.len();
+		let id = self.type_envs.push_frame(params, parent);
+		debug_assert_eq!(usize::from(id), self.param_bounds.len());
+		self.param_bounds
+			.push((0..count).map(|_| ParamBounds::empty()).collect());
+		id
+	}
+
+	/// Fills in `env`'s real declared bounds, once bound resolution (which
+	/// needed `env` to already exist, to resolve sibling-param references
+	/// within the bounds) has produced them. A `Self` frame (trait or
+	/// impl) never calls this, leaving the empty placeholder
+	/// `push_type_env_frame` reserved in place — correct either way, since
+	/// neither is ever queried through here (an impl's `Self` is never
+	/// abstract at all; a trait's own `Self` is answered directly from
+	/// `TraitSignature::implied_bounds` instead — see
+	/// `resolve_bound_member`'s own doc comment).
+	fn set_declared_bounds(
+		&mut self,
+		env: TypeEnvId,
+		bounds: Box<[Box<[TraitBound]>]>,
+	) {
+		let slots = &mut self.param_bounds[usize::from(env)];
+		debug_assert_eq!(slots.len(), bounds.len());
+		for (slot, declared) in slots.iter_mut().zip(bounds) {
+			slot.declared = declared;
+		}
+	}
+
+	pub(super) fn declared_bounds(
+		&self,
+		env: TypeEnvId,
+		param_index: u32,
+	) -> &[TraitBound] {
+		&self.param_bounds[usize::from(env)][param_index as usize].declared
+	}
+
+	pub(super) fn reachable_bounds(
+		&self,
+		env: TypeEnvId,
+		param_index: u32,
+	) -> Option<&[TraitBound]> {
+		self.param_bounds[usize::from(env)][param_index as usize]
+			.reachable
+			.as_deref()
+	}
+
+	pub(super) fn store_reachable_bounds(
+		&mut self,
+		env: TypeEnvId,
+		param_index: u32,
+		value: Box<[TraitBound]>,
+	) {
+		self.param_bounds[usize::from(env)][param_index as usize].reachable =
+			Some(value);
 	}
 
 	/// Unions `bound` into `accum`, merging its `where { .. }` bindings
@@ -955,7 +1087,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					"bodiless type aliases are already Done before construction finishes",
 				);
 
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -977,7 +1109,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					def_id,
 					name: *name,
 					type_params: scope,
-					type_param_bounds,
 					target,
 				});
 				self.item_lookup
@@ -998,11 +1129,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// every member's own resolution (`TraitFunction`/
 				// `TraitConst`) parents its own frame at this same one
 				// rather than each minting its own `Self` binding.
+				let self_scope_id = self.type_envs.next_id();
 				let self_ty = self.types.intern(Type::TypeParam {
 					owner: def_id,
+					env: self_scope_id,
 					param_index: 0,
 				});
-				let self_scope = self.type_envs.push_frame(
+				let self_scope = self.push_type_env_frame(
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
@@ -1013,6 +1146,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					}]),
 					TypeEnvId::ROOT,
 				);
+				debug_assert_eq!(self_scope, self_scope_id);
 
 				let bounds = match supertraits {
 					Some(bound) => self
@@ -1087,7 +1221,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let self_scope =
 					self.traits[usize::from(trait_index)].self_scope;
 
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1105,7 +1239,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				self.functions.push(FunctionSignature {
 					type_params: scope,
-					type_param_bounds,
 					param_types: Box::new([]),
 					return_type: TypeIndex::ERROR,
 				});
@@ -1149,8 +1282,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						// `self_scope`) since nothing was actually written
 						// here for an access to attach to — the source
 						// says `self`, never `Self`.
+						// Must intern with the *same* `env` the trait's own
+						// header already used for `Self` (`self_scope`) —
+						// otherwise `self` and `Self` would dedup to two
+						// different `TypeIndex`es instead of one.
 						None => self.types.intern(Type::TypeParam {
 							owner: trait_def_id,
+							env: self_scope,
 							param_index: 0,
 						}),
 					};
@@ -1226,6 +1364,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				self.assoc_types.push(AssocTypeSignature {
 					bounds: resolved_bounds,
+					reachable_bounds: None,
 				});
 				self.item_lookup
 					.insert(def_id, ItemLocation::TraitAssocType(index));
@@ -1247,7 +1386,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					)
 				};
 
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1280,7 +1419,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.structs[usize::from(struct_index)] = StructSignature {
 					type_params: scope,
-					type_param_bounds,
 					field_types: field_types.into_boxed_slice(),
 				};
 			}
@@ -1301,7 +1439,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					)
 				};
 
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1330,7 +1468,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.structs[usize::from(struct_index)] = StructSignature {
 					type_params: scope,
-					type_param_bounds,
 					field_types: field_types.into_boxed_slice(),
 				};
 			}
@@ -1341,7 +1478,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					unreachable!()
 				};
 
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1363,7 +1500,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				self.functions.push(FunctionSignature {
 					type_params: scope,
-					type_param_bounds,
 					param_types: Box::new([]),
 					return_type: TypeIndex::ERROR,
 				});
@@ -1438,7 +1574,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				else {
 					unreachable!()
 				};
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1456,7 +1592,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					inner: target_type,
 					span: target.span,
 				};
-				let self_scope = self.type_envs.push_frame(
+				// Bound directly to the already-resolved concrete type, never
+				// wrapped in `Type::TypeParam` — an impl's own `Self` is
+				// never abstract, so no `next_id`-prediction dance needed
+				// (see `resolve_generic_params`'s own, for the abstract case).
+				let self_scope = self.push_type_env_frame(
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
@@ -1470,7 +1610,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.inherent_impls[usize::from(block_index)] =
 					Some(InherentImplSignature {
 						type_params: scope,
-						type_param_bounds,
 						target: target_spanned,
 						self_scope,
 					});
@@ -1490,7 +1629,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				else {
 					unreachable!()
 				};
-				let (scope, type_param_bounds) = self.resolve_generic_params(
+				let scope = self.resolve_generic_params(
 					file_id,
 					namespace,
 					def_id,
@@ -1551,7 +1690,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					inner: target_type,
 					span: target.span,
 				};
-				let self_scope = self.type_envs.push_frame(
+				// Bound directly to the already-resolved concrete type, same
+				// reasoning as the inherent-impl arm above.
+				let self_scope = self.push_type_env_frame(
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
@@ -1565,7 +1706,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.trait_impls[usize::from(block_index)] =
 					Some(TraitImplSignature {
 						type_params: scope,
-						type_param_bounds,
 						trait_ref,
 						target: target_spanned,
 						self_scope,
@@ -1651,11 +1791,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// hand-written `trait X: A + B {}`, `Self` included (e.g.
 				// `typeset Int: Add where { Rhs = Self } { ... }`). Members
 				// don't get this frame — see below, where they're resolved.
+				let self_scope_id = self.type_envs.next_id();
 				let self_ty = self.types.intern(Type::TypeParam {
 					owner: trait_def_id,
+					env: self_scope_id,
 					param_index: 0,
 				});
-				let self_scope = self.type_envs.push_frame(
+				let self_scope = self.push_type_env_frame(
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
@@ -1666,6 +1808,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					}]),
 					TypeEnvId::ROOT,
 				);
+				debug_assert_eq!(self_scope, self_scope_id);
 
 				let clause_bounds = match bounds {
 					Some(bound) => self
@@ -1750,7 +1893,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					self.trait_impls[usize::from(impl_index)] =
 						Some(TraitImplSignature {
 							type_params: TypeEnvId::ROOT,
-							type_param_bounds: Box::new([]),
 							trait_ref: Some(Spanned {
 								inner: trait_index,
 								span: m.inner.span,
@@ -3093,6 +3235,23 @@ mod tests {
 			};
 			&self.signatures.functions[usize::from(index)]
 		}
+
+		/// The one-hop declared bounds on generic parameter `param_index` of
+		/// whichever item owns `env` — bounds no longer live on the
+		/// signature struct itself, see `SignatureBuilder::param_bounds`.
+		fn declared_bounds(
+			&self,
+			env: TypeEnvId,
+			param_index: u32,
+		) -> &[TraitBound] {
+			&self.signatures.param_bounds[usize::from(env)]
+				[param_index as usize]
+				.declared
+		}
+
+		fn param_count(&self, env: TypeEnvId) -> usize {
+			self.signatures.param_bounds[usize::from(env)].len()
+		}
 	}
 
 	#[test]
@@ -3100,9 +3259,9 @@ mod tests {
 		let case = TestCase::new("type A<T, U> = T;");
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let type_param_bounds = &case.type_alias("A").type_param_bounds;
-		assert_eq!(type_param_bounds.len(), 2);
-		assert!(type_param_bounds.iter().all(|b| b.is_empty()));
+		let env = case.type_alias("A").type_params;
+		assert_eq!(case.param_count(env), 2);
+		assert!((0..2).all(|i| case.declared_bounds(env, i).is_empty()));
 	}
 
 	#[test]
@@ -3166,6 +3325,7 @@ mod tests {
 			case.signatures.types.resolve(params[0]),
 			&Type::TypeParam {
 				owner: alias.def_id,
+				env: alias.type_params,
 				param_index: 0,
 			}
 		);
@@ -3309,12 +3469,10 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let header = case.signatures.inherent_impls[0].as_ref().unwrap();
-		assert_eq!(header.type_param_bounds.len(), 1);
-		assert_eq!(header.type_param_bounds[0].len(), 1);
-		assert_eq!(
-			header.type_param_bounds[0][0].trait_index,
-			case.trait_index("Bound")
-		);
+		assert_eq!(case.param_count(header.type_params), 1);
+		let bounds = case.declared_bounds(header.type_params, 0);
+		assert_eq!(bounds.len(), 1);
+		assert_eq!(bounds[0].trait_index, case.trait_index("Bound"));
 	}
 
 	#[test]
@@ -3433,9 +3591,8 @@ mod tests {
 	fn duplicate_param_name_is_reported_but_both_entries_survive() {
 		let case = TestCase::new("type A<T, T> = T;");
 
-		let type_param_bounds = &case.type_alias("A").type_param_bounds;
 		assert_eq!(
-			type_param_bounds.len(),
+			case.param_count(case.type_alias("A").type_params),
 			2,
 			"a duplicate name isn't dropped"
 		);
@@ -3465,7 +3622,8 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		assert_eq!(case.type_alias("A").type_param_bounds[0].len(), 1);
+		let env = case.type_alias("A").type_params;
+		assert_eq!(case.declared_bounds(env, 0).len(), 1);
 	}
 
 	#[test]
@@ -3491,7 +3649,8 @@ mod tests {
 	fn a_bound_naming_nothing_is_reported_by_path_resolution_itself() {
 		let case = TestCase::new("type A<T: DoesNotExist> = T;");
 
-		assert_eq!(case.type_alias("A").type_param_bounds[0].len(), 0);
+		let env = case.type_alias("A").type_params;
+		assert_eq!(case.declared_bounds(env, 0).len(), 0);
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
@@ -3733,7 +3892,7 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let signature = case.function_signature("identity");
-		assert_eq!(signature.type_param_bounds.len(), 1);
+		assert_eq!(case.param_count(signature.type_params), 1);
 		assert_eq!(signature.param_types[0], signature.return_type);
 	}
 
@@ -3915,7 +4074,8 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let bounds = &case.function_signature("f").type_param_bounds[0];
+		let env = case.function_signature("f").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.trait_index("Memory"));
 		assert_eq!(bounds[0].bindings.len(), 1);
@@ -3937,7 +4097,8 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let bounds = &case.function_signature("f").type_param_bounds[0];
+		let env = case.function_signature("f").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].bindings.len(), 1);
 		let AssocBindingKind::Bound(rhs_bounds) = &bounds[0].bindings[0].kind
@@ -3961,7 +4122,8 @@ mod tests {
 			case.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
-		let bounds = &case.function_signature("f").type_param_bounds[0];
+		let env = case.function_signature("f").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds[0].bindings.len(), 1);
 	}
 
@@ -3978,7 +4140,8 @@ mod tests {
 			case.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
-		let bounds = &case.function_signature("f").type_param_bounds[0];
+		let env = case.function_signature("f").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		assert!(bounds[0].bindings.is_empty());
 	}
 
@@ -3991,7 +4154,8 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let bounds = &case.function_signature("copy").type_param_bounds[0];
+		let env = case.function_signature("copy").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		let AssocBindingKind::Equals(ty) = bounds[0].bindings[0].kind else {
 			panic!("expected an `Equals` binding kind");
 		};
@@ -4011,7 +4175,8 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let bounds = &case.function_signature("f").type_param_bounds[0];
+		let env = case.function_signature("f").type_params;
+		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.typeset_trait_index("Int"));
 	}
