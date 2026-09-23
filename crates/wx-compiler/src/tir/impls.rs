@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use codespan_reporting::diagnostic::Diagnostic;
 
 use crate::{
-	ast::DefId,
+	ast::{DefId, Spanned},
 	diagnostics::{DiagnosticCode, SourceSpan},
+	vfs::FileId,
 };
 
 use super::{
@@ -17,7 +18,7 @@ use super::{
 		EnumIndex, InherentImplIndex, StructIndex, TraitImplIndex, TraitIndex,
 	},
 	signatures::{SignatureBuilder, SignatureRegistry},
-	types::Type,
+	types::{Type, TypeIndex},
 };
 
 /// The outer, injective part of a resolved type. Type arguments and array
@@ -82,112 +83,104 @@ impl ImplTarget {
 }
 
 impl SignatureBuilder<'_, '_> {
-	/// Called after every impl header query completes. The slices stay
-	/// index-aligned with the impl arenas in `defs`; members need not have
-	/// signatures yet because their names already live there.
-	pub(super) fn build_impl_dispatch(&mut self) {
-		assert_eq!(self.inherent_impls.len(), self.defs.inherent_impls.len());
-		assert_eq!(self.trait_impls.len(), self.defs.trait_impls.len());
-		let mut inherent_dispatch: HashMap<ImplTarget, Vec<InherentImplIndex>> =
-			HashMap::new();
-		let mut trait_dispatch: HashMap<
-			ImplTarget,
-			Vec<(TraitIndex, TraitImplIndex)>,
-		> = HashMap::new();
+	/// Buckets one resolved inherent impl into dispatch, reporting
+	/// `InvalidImplTarget` if its target isn't a legal impl target. Called
+	/// the moment an impl header finishes resolving — right where its
+	/// `InherentImplSignature` slot is written — so dispatch is complete by
+	/// construction the moment every item has resolved, with no separate
+	/// "resolve everything, then build dispatch" pass needed (and nothing
+	/// to keep in sync when a *new* kind of impl-producing item shows up —
+	/// see `register_trait_impl`'s doc comment).
+	pub(super) fn register_inherent_impl(
+		&mut self,
+		index: InherentImplIndex,
+		file_id: FileId,
+		target: Spanned<TypeIndex>,
+	) {
+		let ty = self.types.resolve(target.inner);
+		if let Some(impl_target) = ImplTarget::from_type(ty) {
+			self.inherent_impl_dispatch
+				.entry(impl_target)
+				.or_default()
+				.push(index);
+		} else if !matches!(ty, Type::Error) {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::InvalidImplTarget.code())
+					.with_message("cannot define an `impl` block for this type")
+					.with_label(
+						SourceSpan::new(file_id, target.span).primary_label(),
+					),
+			);
+		}
+	}
 
-		for (i, header) in self.inherent_impls.iter().enumerate() {
-			let header = header.as_ref().expect("impl header not resolved");
-			let def = &self.defs.inherent_impls[i];
-			let ty = self.types.resolve(header.target.inner);
-			if let Some(target) = ImplTarget::from_type(ty) {
-				inherent_dispatch
-					.entry(target)
-					.or_default()
-					.push(InherentImplIndex::new(u32::try_from(i).unwrap()));
-			} else if !matches!(ty, Type::Error) {
+	/// Buckets one resolved trait impl into dispatch, reporting
+	/// `InvalidImplTarget`/`DuplicateTraitImpl` as needed. Called the
+	/// moment a trait impl's header finishes resolving — both a
+	/// hand-written `impl Trait for Type {}` (from its own
+	/// `TraitImplBlock` arm) and a typeset's synthetic per-member impl
+	/// (from the owning typeset's own arm, once per member) go through
+	/// this same call, so a typeset needs no special-casing here at all:
+	/// whichever caller resolves a target type against a `TraitIndex`
+	/// registers it, and dispatch never has an "is everything resolved
+	/// yet" question to answer.
+	pub(super) fn register_trait_impl(
+		&mut self,
+		index: TraitImplIndex,
+		trait_index: TraitIndex,
+		file_id: FileId,
+		target: Spanned<TypeIndex>,
+	) {
+		let ty = self.types.resolve(target.inner);
+		let Some(impl_target) = ImplTarget::from_type(ty) else {
+			if !matches!(ty, Type::Error) {
 				self.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::InvalidImplTarget.code())
 						.with_message(
-							"cannot define an `impl` block for this type",
+							"cannot implement a trait for this type",
 						)
 						.with_label(
-							SourceSpan::new(def.file_id, header.target.span)
+							SourceSpan::new(file_id, target.span)
 								.primary_label(),
 						),
 				);
 			}
-		}
-
-		for (i, header) in self.trait_impls.iter().enumerate() {
-			let header = header.as_ref().expect("impl header not resolved");
-			let def = &self.defs.trait_impls[i];
-			let ty = self.types.resolve(header.target.inner);
-			let Some(target) = ImplTarget::from_type(ty) else {
-				if !matches!(ty, Type::Error) {
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(DiagnosticCode::InvalidImplTarget.code())
-							.with_message(
-								"cannot implement a trait for this type",
-							)
-							.with_label(
-								SourceSpan::new(
-									def.file_id,
-									header.target.span,
-								)
-								.primary_label(),
-							),
-					);
-				}
-				continue;
-			};
-			let Some(trait_ref) = header.trait_ref else {
-				continue; // The path error was reported by the header query.
-			};
-			let bucket = trait_dispatch.entry(target).or_default();
-			if let Some(&(_, earlier)) =
-				bucket.iter().find(|(t, _)| *t == trait_ref.inner)
-			{
-				let name = self
-					.strings
-					.resolve(
-						self.defs.traits[usize::from(trait_ref.inner)]
-							.name
-							.inner,
+			return;
+		};
+		let bucket = self.trait_impl_dispatch.entry(impl_target).or_default();
+		if let Some(&(_, earlier)) =
+			bucket.iter().find(|(t, _)| *t == trait_index)
+		{
+			let name = self
+				.strings
+				.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
+				.unwrap();
+			let earlier_def = &self.defs.trait_impls[usize::from(earlier)];
+			let earlier_header =
+				self.trait_impls[usize::from(earlier)].as_ref().unwrap();
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::DuplicateTraitImpl.code())
+					.with_message(format!(
+						"`{name}` is already implemented for this type constructor"
+					))
+					.with_label(
+						SourceSpan::new(file_id, target.span).primary_label(),
 					)
-					.unwrap();
-				let earlier_def = &self.defs.trait_impls[usize::from(earlier)];
-				let earlier_header =
-					self.trait_impls[usize::from(earlier)].as_ref().unwrap();
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::DuplicateTraitImpl.code())
-						.with_message(format!(
-							"`{name}` is already implemented for this type constructor"
-						))
-						.with_label(
-							SourceSpan::new(def.file_id, header.target.span)
-								.primary_label(),
+					.with_label(
+						SourceSpan::new(
+							earlier_def.file_id,
+							earlier_header.target.span,
 						)
-						.with_label(
-							SourceSpan::new(
-								earlier_def.file_id,
-								earlier_header.target.span,
-							)
-							.secondary_label()
-							.with_message("first implementation here"),
-						),
-				);
-				continue;
-			}
-			bucket.push((
-				trait_ref.inner,
-				TraitImplIndex::new(u32::try_from(i).unwrap()),
-			));
+						.secondary_label()
+						.with_message("first implementation here"),
+					),
+			);
+			return;
 		}
-		self.inherent_impl_dispatch = inherent_dispatch;
-		self.trait_impl_dispatch = trait_dispatch;
+		bucket.push((trait_index, index));
 	}
 }
 

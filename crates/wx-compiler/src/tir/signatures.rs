@@ -27,9 +27,10 @@ use crate::index::index_newtype;
 use crate::vfs::{FileId, PackageId};
 
 use super::defs::{
-	AstEntry, AstNodeRef, BindingNamespace, DefKind, DefinitionRegistry,
-	EnumIndex, InherentImplIndex, NamespaceIndex, NamespaceKind, StructIndex,
-	TraitImplIndex, TraitIndex,
+	AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
+	DefinitionRegistry, EnumIndex, InherentImplIndex, MemberKind,
+	NamespaceIndex, NamespaceKind, StructIndex, TraitImplIndex, TraitIndex,
+	TypeSetIndex,
 };
 use super::impls::ImplTarget;
 use super::paths::PathResolver;
@@ -48,10 +49,35 @@ pub(super) struct GenericParam {
 pub(super) struct TraitBound {
 	pub(super) trait_index: TraitIndex,
 	pub(super) span: TextSpan,
+	/// `Trait where { Assoc = T, .. }` bindings — empty for a plain `Trait`
+	/// bound with no `where` clause.
+	pub(super) bindings: Box<[AssocBinding]>,
+}
+
+/// One `Assoc = T` or `Assoc: Bound` entry inside a `Trait where { .. }`
+/// bound.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) struct AssocBinding {
+	pub(super) name: SymbolU32,
+	/// Which of the trait's declared associated types this binds — found
+	/// directly from `defs.rs`'s member bindings, no signature resolution
+	/// needed to know *which* member a name means.
+	pub(super) assoc_type_def_id: DefId,
+	pub(super) kind: AssocBindingKind,
+	pub(super) span: TextSpan,
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) enum AssocBindingKind {
+	/// `Size = u32` — the associated type must equal exactly this type.
+	Equals(TypeIndex),
+	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
+	Bound(Box<[TraitBound]>),
 }
 
 index_newtype!(TypeAliasIndex);
 index_newtype!(FunctionIndex);
+index_newtype!(AssocTypeIndex);
 
 pub struct TypeAliasSignature {
 	def_id: DefId,
@@ -94,6 +120,24 @@ pub struct EnumSignature {
 	repr: TypeIndex,
 }
 
+/// Resolved member types only — identity (the backing trait, the
+/// pre-allocated synthetic impl slots) already lives in `defs::TypeSetDef`.
+/// Index-aligned with the written member list; an invalid member (not a
+/// legal `impl` target) still gets a slot here, carrying `TypeIndex::ERROR`,
+/// same reasoning as a duplicate struct field still getting its own slot.
+pub struct TypeSetSignature {
+	members: Box<[Spanned<TypeIndex>]>,
+}
+
+/// A trait associated type's resolved bounds (`type Name: Bound1 +
+/// Bound2;`). `Self`-referencing bounds aren't resolvable yet — path
+/// resolution has no notion of `Self` at all so far, same as every other
+/// bound-resolution site in this phase. The concrete type each `impl`
+/// provides is a separate query (`TraitImplAssocType`), not tracked here.
+pub struct AssocTypeSignature {
+	bounds: Box<[TraitBound]>,
+}
+
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
 /// separate queries; names and identities already live in `defs.rs`.
 pub struct InherentImplSignature {
@@ -119,6 +163,8 @@ enum InferSignatureKind {
 	InherentImpl,
 	TraitImpl,
 	EnumRepr,
+	AssocTypeBinding,
+	TypeSetMember,
 }
 
 impl InferSignatureKind {
@@ -131,6 +177,8 @@ impl InferSignatureKind {
 			Self::InherentImpl => "inherent impls",
 			Self::TraitImpl => "trait impls",
 			Self::EnumRepr => "enum reprs",
+			Self::AssocTypeBinding => "associated type bindings",
+			Self::TypeSetMember => "typeset members",
 		}
 	}
 }
@@ -156,6 +204,12 @@ pub struct SignatureRegistry {
 	/// Indexed by the same `EnumIndex` `defs.enums` already uses — see
 	/// `trait_supertraits`.
 	pub enums: Vec<EnumSignature>,
+	/// Indexed by the same `TypeSetIndex` `defs.typesets` already uses —
+	/// see `trait_supertraits`.
+	pub typesets: Vec<TypeSetSignature>,
+	/// Indexed by `AssocTypeIndex`, allocated lazily as each associated
+	/// type's signature resolves — see `type_aliases`.
+	pub assoc_types: Vec<AssocTypeSignature>,
 	pub functions: Vec<FunctionSignature>,
 	/// Index-aligned with the corresponding `defs.rs` impl arenas. A slot is
 	/// `None` until its header query completes, even if that query later
@@ -186,19 +240,12 @@ impl SignatureRegistry {
 			stdlib_package,
 		);
 
-		for impl_def in &defs.trait_impls {
-			builder.ensure_signature(QueryInfo {
-				def_id: impl_def.def_id,
-				requested_at: None,
-			});
-		}
-		for impl_def in &defs.inherent_impls {
-			builder.ensure_signature(QueryInfo {
-				def_id: impl_def.def_id,
-				requested_at: None,
-			});
-		}
-		builder.build_impl_dispatch();
+		// Impl headers (and, once typesets exist, their synthetic
+		// per-member impls) register themselves into dispatch the moment
+		// their own `ensure_signature` arm resolves them — see
+		// `register_inherent_impl`/`register_trait_impl` in `impls.rs` —
+		// so a single sweep over every registered item is enough; no
+		// separate early pass or later dispatch-building step is needed.
 		for entry in ast_nodes {
 			builder.ensure_signature(QueryInfo {
 				def_id: entry.def_id,
@@ -211,6 +258,8 @@ impl SignatureRegistry {
 			trait_supertraits: builder.trait_supertraits,
 			structs: builder.structs,
 			enums: builder.enums,
+			typesets: builder.typesets,
+			assoc_types: builder.assoc_types,
 			functions: builder.functions,
 			inherent_impls: builder.inherent_impls,
 			trait_impls: builder.trait_impls,
@@ -234,8 +283,10 @@ pub enum ItemLocation {
 	InherentImpl(InherentImplIndex),
 	Struct(StructIndex),
 	Enum(EnumIndex),
+	TypeSet(TypeSetIndex),
 	TypeAlias(TypeAliasIndex),
 	Function(FunctionIndex),
+	TraitAssocType(AssocTypeIndex),
 }
 
 /// What `ensure_signature` found. `Cycle` is never stored anywhere — it's a
@@ -356,6 +407,8 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	trait_supertraits: Vec<Box<[TraitBound]>>,
 	structs: Vec<StructSignature>,
 	enums: Vec<EnumSignature>,
+	typesets: Vec<TypeSetSignature>,
+	assoc_types: Vec<AssocTypeSignature>,
 	functions: Vec<FunctionSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
@@ -412,6 +465,22 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			item_lookup.insert(
 				enum_def.def_id,
 				ItemLocation::Enum(EnumIndex::new(
+					u32::try_from(index).unwrap(),
+				)),
+			);
+		}
+		// Last, deliberately: a typeset's backing trait and synthetic
+		// per-member impls (seeded just above, as ordinary `Trait`/
+		// `TraitImpl` entries) reuse the typeset's own `def_id` — see
+		// `defs::TypeSetDef`'s doc comment — so this insert intentionally
+		// overwrites theirs. Nothing ever looks up that `def_id` expecting
+		// `ItemLocation::Trait`/`TraitImpl` (a name bound to a typeset only
+		// ever resolves to `DefKind::TypeSet`), so `ItemLocation::TypeSet`
+		// is the only entry that's ever actually read back for it.
+		for (index, typeset_def) in defs.typesets.iter().enumerate() {
+			item_lookup.insert(
+				typeset_def.def_id,
+				ItemLocation::TypeSet(TypeSetIndex::new(
 					u32::try_from(index).unwrap(),
 				)),
 			);
@@ -509,6 +578,14 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					repr: TypeIndex::ERROR,
 				})
 				.collect(),
+			typesets: defs
+				.typesets
+				.iter()
+				.map(|_| TypeSetSignature {
+					members: Box::default(),
+				})
+				.collect(),
+			assoc_types: Vec::new(),
 			functions: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
@@ -524,8 +601,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIndex,
+		owner: DefId,
 		ast_params: &[ast::TypeParam],
 	) -> Box<[GenericParam]> {
+		// Two passes: a bound can name a sibling param declared *later* in
+		// the same list (`Src: Memory where { Size = S }, S: PointerSize`),
+		// and `resolve_type`'s generic-scope lookup only ever finds a name
+		// already present in the slice it's given. Registering every name
+		// up front — bounds filled in as `Box::new([])` for now — gives
+		// pass two a complete scope to resolve every param's bounds
+		// against, sibling order no longer mattering.
 		let mut params: Vec<GenericParam> =
 			Vec::with_capacity(ast_params.len());
 		for ast_param in ast_params {
@@ -545,17 +630,21 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				));
 			}
 
-			let bounds = match &ast_param.bounds {
-				Some(bound) => self.resolve_bounds(file_id, namespace, bound),
-				None => Box::new([]),
-			};
-
 			params.push(GenericParam {
 				name: ast_param.name,
 				accesses: Vec::new(),
-				bounds,
+				bounds: Box::new([]),
 			});
 		}
+
+		for (index, ast_param) in ast_params.iter().enumerate() {
+			let Some(bound) = &ast_param.bounds else {
+				continue;
+			};
+			params[index].bounds =
+				self.resolve_bounds(file_id, namespace, owner, &params, bound);
+		}
+
 		params.into_boxed_slice()
 	}
 
@@ -620,6 +709,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					type_params,
 				);
 				let target = self.resolve_type(
@@ -649,9 +739,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				};
 
 				let bounds = match supertraits {
-					Some(bound) => {
-						self.resolve_bounds(file_id, namespace, bound)
-					}
+					// Traits have no generic params of their own in this
+					// language — `owner`/`generic_scope` only matter for a
+					// `where`-bound's `Equals` right-hand side, which has
+					// nothing to resolve against here.
+					Some(bound) => self
+						.resolve_bounds(file_id, namespace, def_id, &[], bound),
 					None => Box::new([]),
 				};
 
@@ -671,6 +764,27 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				}
 
 				self.trait_supertraits[usize::from(trait_index)] = bounds;
+			}
+			AstNodeRef::TraitAssocType { item, .. } => {
+				let ast::TraitItem::AssociatedType { bounds, .. } = item
+				else {
+					unreachable!()
+				};
+
+				let resolved_bounds = match bounds {
+					Some(bound) => self
+						.resolve_bounds(file_id, namespace, def_id, &[], bound),
+					None => Box::new([]),
+				};
+
+				let index = AssocTypeIndex::new(
+					u32::try_from(self.assoc_types.len()).unwrap(),
+				);
+				self.assoc_types.push(AssocTypeSignature {
+					bounds: resolved_bounds,
+				});
+				self.item_lookup
+					.insert(def_id, ItemLocation::TraitAssocType(index));
 			}
 			AstNodeRef::RecordStruct { item } => {
 				let ast::Item::RecordStruct {
@@ -692,6 +806,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					ast_type_params,
 				);
 
@@ -744,6 +859,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					ast_type_params,
 				);
 
@@ -782,6 +898,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					&signature.type_params,
 				);
 
@@ -865,6 +982,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					type_params,
 				);
 				let target_type = self.resolve_type(
@@ -875,14 +993,20 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					target,
 					InferPolicy::Reject(InferSignatureKind::InherentImpl),
 				);
+				let target_spanned = Spanned {
+					inner: target_type,
+					span: target.span,
+				};
 				self.inherent_impls[usize::from(block_index)] =
 					Some(InherentImplSignature {
 						type_params: resolved_params,
-						target: Spanned {
-							inner: target_type,
-							span: target.span,
-						},
+						target: target_spanned,
 					});
+				self.register_inherent_impl(
+					block_index,
+					file_id,
+					target_spanned,
+				);
 			}
 			AstNodeRef::TraitImplBlock { item, block_index } => {
 				let ast::Item::TraitImpl {
@@ -897,6 +1021,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let resolved_params = self.resolve_generic_params(
 					file_id,
 					namespace,
+					def_id,
 					type_params,
 				);
 				let trait_target = PathResolver::new(
@@ -950,15 +1075,24 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					target,
 					InferPolicy::Reject(InferSignatureKind::TraitImpl),
 				);
+				let target_spanned = Spanned {
+					inner: target_type,
+					span: target.span,
+				};
 				self.trait_impls[usize::from(block_index)] =
 					Some(TraitImplSignature {
 						type_params: resolved_params,
 						trait_ref,
-						target: Spanned {
-							inner: target_type,
-							span: target.span,
-						},
+						target: target_spanned,
 					});
+				if let Some(trait_ref) = trait_ref {
+					self.register_trait_impl(
+						block_index,
+						trait_ref.inner,
+						file_id,
+						target_spanned,
+					);
+				}
 			}
 			AstNodeRef::Enum { item } => {
 				let ast::Item::Enum { repr, name, .. } = item else {
@@ -1006,6 +1140,96 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };
+			}
+			AstNodeRef::TypeSet { typeset_index, item } => {
+				let ast::Item::TypeSet { bounds, members, .. } = item else {
+					unreachable!()
+				};
+				let trait_index =
+					self.defs.typesets[usize::from(typeset_index)]
+						.trait_index;
+				let member_impls =
+					self.defs.typesets[usize::from(typeset_index)]
+						.member_impls
+						.clone();
+
+				// The typeset's own `: A + B` clause becomes its backing
+				// trait's supertraits — same shape and cycle-forcing as a
+				// hand-written `trait X: A + B {}`.
+				let clause_bounds = match bounds {
+					Some(bound) => self.resolve_bounds(
+						file_id, namespace, def_id, &[], bound,
+					),
+					None => Box::new([]),
+				};
+				for bound in &clause_bounds {
+					let super_def_id = self.defs.traits
+						[usize::from(bound.trait_index)]
+					.def_id;
+					let reference = SourceSpan::new(file_id, bound.span);
+					let status = self.ensure_signature(QueryInfo {
+						def_id: super_def_id,
+						requested_at: Some(reference),
+					});
+					if let SignatureStatus::Cycle = status {
+						let diagnostic = self.report_cyclic_supertrait(
+							super_def_id,
+							reference,
+						);
+						self.diagnostics.push(diagnostic);
+					}
+				}
+				self.trait_supertraits[usize::from(trait_index)] =
+					clause_bounds;
+
+				// Each written member becomes a synthetic `impl
+				// <trait_index> for <member>`, fed through the same
+				// dispatch registration real impls use — "does concrete
+				// type T satisfy this typeset" later is just an ordinary
+				// trait-impl lookup, no special-casing downstream.
+				let mut resolved_members =
+					Vec::with_capacity(members.len());
+				for (m, &impl_index) in members.iter().zip(member_impls.iter())
+				{
+					let member_ty = self.resolve_type(
+						file_id,
+						namespace,
+						def_id,
+						&[],
+						&m.inner,
+						InferPolicy::Reject(InferSignatureKind::TypeSetMember),
+					);
+					// No separate "is this a legal typeset member" check —
+					// `register_trait_impl` already reports
+					// `InvalidImplTarget` for exactly this (a typeset
+					// member *is* a synthetic impl target), and skips
+					// bucketing it, so nothing further to do here.
+					let target_spanned = Spanned {
+						inner: member_ty,
+						span: m.inner.span,
+					};
+					self.trait_impls[usize::from(impl_index)] =
+						Some(TraitImplSignature {
+							type_params: Box::new([]),
+							trait_ref: Some(Spanned {
+								inner: trait_index,
+								span: m.inner.span,
+							}),
+							target: target_spanned,
+						});
+					self.register_trait_impl(
+						impl_index,
+						trait_index,
+						file_id,
+						target_spanned,
+					);
+					resolved_members.push(target_spanned);
+				}
+
+				self.typesets[usize::from(typeset_index)] =
+					TypeSetSignature {
+						members: resolved_members.into_boxed_slice(),
+					};
 			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
@@ -1436,10 +1660,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIndex,
+		owner: DefId,
+		generic_scope: &[GenericParam],
 		bound: &Spanned<ast::BoundExpression>,
 	) -> Box<[TraitBound]> {
 		let mut traits = Vec::new();
-		self.collect_bounds(file_id, namespace, bound, &mut traits);
+		self.collect_bounds(
+			file_id,
+			namespace,
+			owner,
+			generic_scope,
+			bound,
+			&mut traits,
+		);
 		traits.into_boxed_slice()
 	}
 
@@ -1450,66 +1683,202 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIndex,
+		owner: DefId,
+		generic_scope: &[GenericParam],
 		bound: &Spanned<ast::BoundExpression>,
 		out: &mut Vec<TraitBound>,
 	) {
 		match &bound.inner {
 			ast::BoundExpression::BoundList(list) => {
 				for entry in list.iter() {
-					self.collect_bounds(file_id, namespace, entry, out);
+					self.collect_bounds(
+						file_id,
+						namespace,
+						owner,
+						generic_scope,
+						entry,
+						out,
+					);
 				}
 			}
 			ast::BoundExpression::Path(segments) => {
-				let target = PathResolver::new(
-					&self.defs.namespaces,
-					&self.defs.use_items,
-					self.stdlib_root,
-				)
-				.resolve_path(
-					self.diagnostics,
-					self.strings,
-					file_id,
-					namespace,
-					segments,
-					BindingNamespace::Type,
-				);
-				let Some(def_key) = target.def_key() else {
-					// Already diagnosed by `resolve_path` itself.
-					return;
-				};
-				match def_key.symbol_kind(self.defs) {
-					DefKind::Trait(def_id) => {
-						let Some(&ItemLocation::Trait(trait_index)) =
-							self.item_lookup.get(&def_id)
-						else {
-							unreachable!()
-						};
-						out.push(TraitBound {
-							trait_index,
-							span: bound.span,
-						});
-					}
-					// A `typeset` bound resolves to its own compiler-generated
-					// trait — not modeled here yet, so it falls into the
-					// same "expected trait" diagnostic as any other
-					// non-trait path for now.
-					other => {
-						let last = segments
-							.last()
-							.expect("a path always has at least one segment");
-						self.diagnostics.push(report_expected_trait_bound(
-							file_id,
-							self.strings,
-							last.ident,
-							other.noun(),
-						));
-					}
+				if let Some(trait_index) =
+					self.resolve_trait_bound_path(file_id, namespace, segments)
+				{
+					out.push(TraitBound {
+						trait_index,
+						span: bound.span,
+						bindings: Box::new([]),
+					});
 				}
 			}
-			ast::BoundExpression::WithBindings { .. } => {
-				todo!(
-					"associated-type bindings in bounds (`Trait where {{ Assoc = T }}`) — not yet implemented"
+			ast::BoundExpression::WithBindings { path, bindings } => {
+				// The parser only ever builds `WithBindings.path` as
+				// `Box::new(BoundExpression::Path(..))` (`parse_bound` in
+				// `ast/mod.rs`) — never a list or another `WithBindings`.
+				let ast::BoundExpression::Path(segments) = path.as_ref()
+				else {
+					unreachable!(
+						"`WithBindings.path` is always a plain `Path`"
+					)
+				};
+				let Some(trait_index) =
+					self.resolve_trait_bound_path(file_id, namespace, segments)
+				else {
+					return;
+				};
+
+				let mut resolved_bindings: Vec<AssocBinding> =
+					Vec::with_capacity(bindings.len());
+				for binding in bindings.iter() {
+					if resolved_bindings
+						.iter()
+						.any(|b| b.name == binding.name.inner)
+					{
+						self.diagnostics.push(
+							report_duplicate_assoc_type_binding(
+								file_id,
+								self.strings,
+								binding.name,
+							),
+						);
+						continue;
+					}
+
+					let trait_def = &self.defs.traits[usize::from(trait_index)];
+					let assoc_type_def_id = trait_def
+						.bindings
+						.get(&BindingKey::ty(binding.name.inner))
+						.map(|&member_index| {
+							trait_def.members[usize::from(member_index)].kind
+						})
+						.and_then(|kind| match kind {
+							MemberKind::AssociatedType(id) => Some(id),
+							MemberKind::Function(_) | MemberKind::Constant(_) => {
+								None
+							}
+						});
+					let Some(assoc_type_def_id) = assoc_type_def_id else {
+						self.diagnostics.push(report_not_an_associated_type(
+							file_id,
+							self.strings,
+							binding.name,
+							trait_def.name.inner,
+						));
+						continue;
+					};
+
+					let kind = match &binding.kind {
+						ast::AssocTypeBindingKind::Equals(ty) => {
+							let resolved = self.resolve_type(
+								file_id,
+								namespace,
+								owner,
+								generic_scope,
+								ty,
+								InferPolicy::Reject(
+									InferSignatureKind::AssocTypeBinding,
+								),
+							);
+							AssocBindingKind::Equals(resolved)
+						}
+						ast::AssocTypeBindingKind::Bound(rhs_bound) => {
+							let rhs_bounds = self.resolve_bounds(
+								file_id,
+								namespace,
+								owner,
+								generic_scope,
+								rhs_bound,
+							);
+							AssocBindingKind::Bound(rhs_bounds)
+						}
+					};
+
+					resolved_bindings.push(AssocBinding {
+						name: binding.name.inner,
+						assoc_type_def_id,
+						kind,
+						span: binding.name.span,
+					});
+				}
+
+				out.push(TraitBound {
+					trait_index,
+					span: bound.span,
+					bindings: resolved_bindings.into_boxed_slice(),
+				});
+			}
+		}
+	}
+
+	/// Resolves a bound's own path to the trait it names — shared between a
+	/// bare `Trait` bound and `WithBindings`'s left-hand `Trait` part.
+	/// `None` if the path failed to resolve to a real trait; already
+	/// diagnosed either way, by `resolve_path` itself or by the "expected a
+	/// trait" report below.
+	fn resolve_trait_bound_path(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIndex,
+		segments: &[ast::PathSegment],
+	) -> Option<TraitIndex> {
+		let target = PathResolver::new(
+			&self.defs.namespaces,
+			&self.defs.use_items,
+			self.stdlib_root,
+		)
+		.resolve_path(
+			self.diagnostics,
+			self.strings,
+			file_id,
+			namespace,
+			segments,
+			BindingNamespace::Type,
+		);
+		let def_key = target.def_key()?;
+		match def_key.symbol_kind(self.defs) {
+			DefKind::Trait(def_id) => {
+				let Some(&ItemLocation::Trait(trait_index)) =
+					self.item_lookup.get(&def_id)
+				else {
+					unreachable!()
+				};
+				Some(trait_index)
+			}
+			// A `typeset` bound resolves to its own compiler-generated
+			// trait — `TypeSetIndex` (and, through it, `trait_index`) is
+			// Phase 1 data, seeded into `item_lookup` before any Phase 2
+			// resolution runs, exactly like `TraitIndex` above. No
+			// forcing needed here for the same reason the `Trait` arm
+			// doesn't force anything either: this function only answers
+			// "which item does this name refer to," not "is its data
+			// complete yet" — that's for whichever later consumer
+			// actually reads `trait_supertraits`/dispatch to force, at
+			// its own point of need.
+			DefKind::TypeSet(def_id) => {
+				let Some(&ItemLocation::TypeSet(typeset_index)) =
+					self.item_lookup.get(&def_id)
+				else {
+					unreachable!(
+						"every typeset's TypeSetIndex is pre-seeded in SignatureBuilder::new"
+					)
+				};
+				Some(
+					self.defs.typesets[usize::from(typeset_index)]
+						.trait_index,
 				)
+			}
+			other => {
+				let last = segments
+					.last()
+					.expect("a path always has at least one segment");
+				self.diagnostics.push(report_expected_trait_bound(
+					file_id,
+					self.strings,
+					last.ident,
+					other.noun(),
+				));
+				None
 			}
 		}
 	}
@@ -1542,6 +1911,12 @@ fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 		}
 		AstNodeRef::TupleStruct { item } => {
 			let ast::Item::TupleStruct { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::TypeSet { item, .. } => {
+			let ast::Item::TypeSet { name, .. } = item else {
 				unreachable!()
 			};
 			*name
@@ -1655,6 +2030,40 @@ fn report_expected_trait_bound(
 				.primary_label()
 				.with_message("not a trait"),
 		)
+}
+
+fn report_duplicate_assoc_type_binding(
+	file_id: FileId,
+	strings: &StringInterner,
+	name: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateAssocTypeBinding.code())
+		.with_message(format!(
+			"associated type `{name_str}` is bound more than once in this `where` clause"
+		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("duplicate binding"),
+		)
+}
+
+fn report_not_an_associated_type(
+	file_id: FileId,
+	strings: &StringInterner,
+	name: Spanned<SymbolU32>,
+	trait_name: SymbolU32,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	let trait_str = strings.resolve(trait_name).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NotATraitMember.code())
+		.with_message(format!(
+			"`{name_str}` is not an associated type of trait `{trait_str}`"
+		))
+		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }
 
 #[cfg(test)]
@@ -1800,6 +2209,72 @@ mod tests {
 		fn trait_supertraits(&self, path: &str) -> &[TraitBound] {
 			&self.signatures.trait_supertraits
 				[usize::from(self.trait_index(path))]
+		}
+
+		fn typeset_index(&self, path: &str) -> TypeSetIndex {
+			let DefKind::TypeSet(def_id) =
+				self.resolve(BindingNamespace::Type, path)
+			else {
+				panic!("expected `{path}` to be a typeset");
+			};
+			let Some(&ItemLocation::TypeSet(index)) =
+				self.signatures.item_lookup.get(&def_id)
+			else {
+				panic!("expected a TypeSet location for `{path}`");
+			};
+			index
+		}
+
+		fn typeset_signature(&self, path: &str) -> &TypeSetSignature {
+			&self.signatures.typesets[usize::from(self.typeset_index(path))]
+		}
+
+		/// The `TraitIndex` of `path`'s compiler-generated backing trait —
+		/// what a `T: <path>` bound actually resolves to.
+		fn typeset_trait_index(&self, path: &str) -> TraitIndex {
+			self.defs.typesets[usize::from(self.typeset_index(path))]
+				.trait_index
+		}
+
+		fn typeset_supertraits(&self, path: &str) -> &[TraitBound] {
+			&self.signatures.trait_supertraits
+				[usize::from(self.typeset_trait_index(path))]
+		}
+
+		/// `name` is looked up directly against the trait's own member
+		/// bindings rather than through `resolve` — trait members aren't
+		/// namespace-path-continuable yet (see `DefKind::as_namespace`), so
+		/// `Trait::Assoc` isn't a resolvable path in this rewrite so far.
+		fn assoc_type_signature(
+			&self,
+			trait_path: &str,
+			name: &str,
+		) -> &AssocTypeSignature {
+			let trait_index = self.trait_index(trait_path);
+			let symbol = self
+				.graph
+				.strings
+				.get(name)
+				.expect("already interned from source");
+			let trait_def = &self.defs.traits[usize::from(trait_index)];
+			let &member_index =
+				trait_def.bindings.get(&BindingKey::ty(symbol)).unwrap_or_else(
+					|| {
+						panic!(
+							"expected `{trait_path}` to have an associated type `{name}`"
+						)
+					},
+				);
+			let member = &trait_def.members[usize::from(member_index)];
+			let MemberKind::AssociatedType(def_id) = member.kind else {
+				panic!("expected `{name}` to be an associated type");
+			};
+			let Some(&ItemLocation::TraitAssocType(index)) =
+				self.signatures.item_lookup.get(&def_id)
+			else {
+				panic!("expected a TraitAssocType location for `{name}`");
+			};
+			&self.signatures.assoc_types[usize::from(index)]
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
@@ -2561,5 +3036,234 @@ mod tests {
 			Some(DiagnosticCode::EnumReprNotInteger.code())
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
+	}
+
+	#[test]
+	fn an_unbounded_trait_associated_type_resolves_with_no_bounds() {
+		let case = TestCase::new("trait Container { type Item; }");
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.assoc_type_signature("Container", "Item").bounds.is_empty()
+		);
+	}
+
+	#[test]
+	fn a_trait_associated_type_bound_resolves_to_the_named_traits() {
+		let case = TestCase::new(indoc! {"
+			trait Bound1 {}
+			trait Bound2 {}
+			trait Container { type Item: Bound1 + Bound2; }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let bounds = &case.assoc_type_signature("Container", "Item").bounds;
+		assert_eq!(bounds.len(), 2);
+		assert_eq!(bounds[0].trait_index, case.trait_index("Bound1"));
+		assert_eq!(bounds[1].trait_index, case.trait_index("Bound2"));
+	}
+
+	#[test]
+	fn a_trait_associated_type_bound_to_a_non_trait_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			struct S {}
+			trait Container { type Item: S; }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::ExpectedTraitBound.code())
+		);
+		assert!(
+			case.assoc_type_signature("Container", "Item").bounds.is_empty()
+		);
+	}
+
+	#[test]
+	fn a_where_binding_resolves_an_equals_assoc_type_to_a_concrete_type() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Memory { type Size; }
+			fn f<Mem: Memory where { Size = i32 }>() {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let bounds = &case.function_signature("f").type_params[0].bounds;
+		assert_eq!(bounds.len(), 1);
+		assert_eq!(bounds[0].trait_index, case.trait_index("Memory"));
+		assert_eq!(bounds[0].bindings.len(), 1);
+		assert!(matches!(
+			bounds[0].bindings[0].kind,
+			AssocBindingKind::Equals(TypeIndex::I32)
+		));
+	}
+
+	#[test]
+	fn a_where_binding_resolves_a_bound_assoc_type_to_a_trait() {
+		let case = TestCase::new(indoc! {"
+			trait Unsigned {}
+			trait Memory { type Size; }
+			fn f<Mem: Memory where { Size: Unsigned }>() {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let bounds = &case.function_signature("f").type_params[0].bounds;
+		assert_eq!(bounds.len(), 1);
+		assert_eq!(bounds[0].bindings.len(), 1);
+		let AssocBindingKind::Bound(rhs_bounds) = &bounds[0].bindings[0].kind
+		else {
+			panic!("expected a `Bound` binding kind");
+		};
+		assert_eq!(rhs_bounds.len(), 1);
+		assert_eq!(rhs_bounds[0].trait_index, case.trait_index("Unsigned"));
+	}
+
+	#[test]
+	fn a_duplicate_where_binding_is_diagnosed_and_only_the_first_is_kept() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Memory { type Size; }
+			fn f<Mem: Memory where { Size = i32, Size = i32 }>() {}
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
+		);
+		let bounds = &case.function_signature("f").type_params[0].bounds;
+		assert_eq!(bounds[0].bindings.len(), 1);
+	}
+
+	#[test]
+	fn a_where_binding_naming_an_unknown_associated_type_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Memory { type Size; }
+			fn f<Mem: Memory where { Nope = i32 }>() {}
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::NotATraitMember.code())
+		);
+		let bounds = &case.function_signature("f").type_params[0].bounds;
+		assert!(bounds[0].bindings.is_empty());
+	}
+
+	#[test]
+	fn a_where_binding_may_reference_a_sibling_param_declared_later() {
+		let case = TestCase::new(indoc! {"
+			trait PointerSize {}
+			trait Memory { type Size; }
+			fn copy<Src: Memory where { Size = S }, S: PointerSize>() {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let bounds = &case.function_signature("copy").type_params[0].bounds;
+		let AssocBindingKind::Equals(ty) = bounds[0].bindings[0].kind else {
+			panic!("expected an `Equals` binding kind");
+		};
+		assert!(matches!(
+			case.signatures.types.resolve(ty),
+			Type::TypeParam { param_index: 1, .. }
+		));
+	}
+
+	#[test]
+	fn a_typeset_bound_resolves_to_its_backing_trait() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type i32;
+			typeset Int { u32, i32 }
+			fn f<T: Int>() {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let bounds = &case.function_signature("f").type_params[0].bounds;
+		assert_eq!(bounds.len(), 1);
+		assert_eq!(bounds[0].trait_index, case.typeset_trait_index("Int"));
+	}
+
+	#[test]
+	fn a_typesets_own_clause_becomes_its_backing_traits_supertraits() {
+		let case = TestCase::new(indoc! {"
+			trait Bound {}
+			typeset Int: Bound {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let supertraits = case.typeset_supertraits("Int");
+		assert_eq!(supertraits.len(), 1);
+		assert_eq!(supertraits[0].trait_index, case.trait_index("Bound"));
+	}
+
+	#[test]
+	fn a_typeset_member_registers_a_synthetic_impl() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset Int { u32 }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.typeset_signature("Int").members[0].inner,
+			TypeIndex::U32
+		);
+		let target =
+			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
+				.unwrap();
+		let candidates = case.signatures.trait_candidates(target);
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].0, case.typeset_trait_index("Int"));
+	}
+
+	#[test]
+	fn a_typeset_used_before_its_own_declaration_still_sees_its_members() {
+		let case = TestCase::new(indoc! {"
+			fn f<T: Int>() {}
+			type u32;
+			typeset Int { u32 }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let target =
+			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
+				.unwrap();
+		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+	}
+
+	#[test]
+	fn duplicate_typeset_members_are_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset Int { u32, u32 }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateTraitImpl.code())
+		);
+		let target =
+			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
+				.unwrap();
+		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+	}
+
+	#[test]
+	fn a_non_concrete_typeset_member_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			typeset Bad { (i32, i32) }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::InvalidImplTarget.code())
+		);
 	}
 }

@@ -44,6 +44,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	inherent_impls: Vec<InherentImplDef>,
 	structs: Vec<StructDef>,
 	enums: Vec<EnumDef>,
+	typesets: Vec<TypeSetDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
@@ -231,6 +232,27 @@ pub struct EnumDef {
 	pub variants_namespace: NamespaceIndex,
 }
 
+/// `typeset X: A + B { m1, m2 }` — `trait_index` is a compiler-generated
+/// trait with no AST node of its own, reusing this typeset's own `def_id`
+/// rather than minting a fresh one (nothing ever names it independently,
+/// and "force this trait's signature" has to mean the same query as
+/// "force this typeset's signature" anyway, since the trait's data — its
+/// supertraits, from the typeset's own `: A + B` clause — is written as a
+/// direct side effect of the typeset's own Phase 2 resolution, not through
+/// an independent `ensure_signature` call on the trait itself).
+/// `member_impls` is index-aligned with the AST's own `members` list —
+/// one pre-allocated synthetic `impl <trait_index> for <member>` slot per
+/// written member, same `def_id`-reuse reasoning, filled in with each
+/// member's resolved type during that same Phase 2 pass.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct TypeSetDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
+	pub trait_index: TraitIndex,
+	pub member_impls: Box<[TraitImplIndex]>,
+}
+
 index_newtype!(LocalDefIndex);
 index_newtype!(MemberIndex);
 index_newtype!(ModuleDeclIndex);
@@ -250,6 +272,11 @@ index_newtype!(FieldIndex);
 // created in Phase 1, so `NamespaceKind::Enum` needs a stable index to point
 // at before `signatures.rs` has any reason to resolve this enum.
 index_newtype!(EnumIndex);
+// Pre-allocated here — a typeset's backing trait and per-member impl slots
+// are created in Phase 1 (see `TypeSetDef`), so bound resolution can force
+// them via `ensure_signature` before `signatures.rs` would otherwise reach
+// this typeset in the general sweep.
+index_newtype!(TypeSetIndex);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -308,6 +335,7 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 	},
 	TypeSet {
+		typeset_index: TypeSetIndex,
 		item: &'ast ast::Item,
 	},
 	TypeAlias {
@@ -390,6 +418,7 @@ pub(super) struct DefinitionRegistry {
 	pub inherent_impls: Vec<InherentImplDef>,
 	pub structs: Vec<StructDef>,
 	pub enums: Vec<EnumDef>,
+	pub typesets: Vec<TypeSetDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
@@ -1518,6 +1547,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			inherent_impls: Vec::new(),
 			structs: Vec::new(),
 			enums: Vec::new(),
+			typesets: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1562,6 +1592,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			inherent_impls: builder.inherent_impls,
 			structs: builder.structs,
 			enums: builder.enums,
+			typesets: builder.typesets,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
@@ -1659,6 +1690,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		let index =
 			TraitImplIndex::new(u32::try_from(self.trait_impls.len()).unwrap());
 		self.trait_impls.push(item);
+		index
+	}
+
+	#[inline]
+	fn push_typeset(&mut self, item: TypeSetDef) -> TypeSetIndex {
+		let index =
+			TypeSetIndex::new(u32::try_from(self.typesets.len()).unwrap());
+		self.typesets.push(item);
 		index
 	}
 
@@ -2616,7 +2655,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::TypeSet {
-				id, name, pub_span, ..
+				id,
+				name,
+				pub_span,
+				members,
+				..
 			} => {
 				let def_key = self.push_def(
 					namespace,
@@ -2628,11 +2671,48 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+
+				// See `TypeSetDef`'s doc comment for why the backing trait
+				// and every member impl below reuse this typeset's own
+				// `def_id` rather than minting fresh ones.
+				let trait_index = self.push_trait(TraitDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					pub_span: None,
+					name: *name,
+					bindings: HashMap::new(),
+					members: Vec::new(),
+				});
+				let member_impls: Box<[TraitImplIndex]> = members
+					.iter()
+					.map(|_| {
+						self.push_trait_impl(TraitImplDef {
+							def_id: *id,
+							file_id,
+							namespace,
+							members: Vec::new(),
+							bindings: HashMap::new(),
+							self_accesses: Vec::new(),
+						})
+					})
+					.collect();
+				let typeset_index = self.push_typeset(TypeSetDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					trait_index,
+					member_impls,
+				});
+
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::TypeSet { item },
+					node: AstNodeRef::TypeSet {
+						typeset_index,
+						item,
+					},
 				});
 			}
 			ast::Item::TraitImpl {
