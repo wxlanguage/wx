@@ -202,7 +202,7 @@ define_diagnostic_codes! {
 		TraitImplItemKindMismatch => "E2079",
 		TraitImplSignatureMismatch => "E2080",
 		TraitImplConstTypeMismatch => "E2081",
-		CyclicSupertrait => "E2082",
+		CyclicTraitBounds => "E2082",
 		CannotImplementTypeset => "E2083",
 		FloatLiteralOverflow => "E2084",
 		FloatLiteralUnderflow => "E2085",

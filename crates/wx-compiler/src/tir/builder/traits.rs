@@ -1012,7 +1012,7 @@ impl<'ast> Builder<'ast, '_> {
 	) {
 		let mut names: Vec<&str> = Vec::with_capacity(chain.len());
 		let mut diagnostic = Diagnostic::error()
-			.with_code(DiagnosticCode::CyclicSupertrait.code())
+			.with_code(DiagnosticCode::CyclicTraitBounds.code())
 			.with_message("cyclic supertrait dependency");
 		for &trait_index in chain {
 			let trait_def = &self.items.traits[usize::from(trait_index)];

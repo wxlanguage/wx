@@ -6445,7 +6445,7 @@ fn test_supertrait_cycle_is_reported_once_and_terminates() {
         export {}
     "});
 	let view = case.diagnostics();
-	view.assert_error(DiagnosticCode::CyclicSupertrait);
+	view.assert_error(DiagnosticCode::CyclicTraitBounds);
 	assert_eq!(
 		view.errors().count(),
 		1,
@@ -6464,7 +6464,7 @@ fn test_trait_that_is_its_own_supertrait_is_reported() {
         export {}
     "});
 	case.diagnostics()
-		.assert_error(DiagnosticCode::CyclicSupertrait);
+		.assert_error(DiagnosticCode::CyclicTraitBounds);
 }
 
 #[test]

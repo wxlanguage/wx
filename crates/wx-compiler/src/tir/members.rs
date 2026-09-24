@@ -9,14 +9,14 @@
 
 use string_interner::symbol::SymbolU32;
 
+use super::bounds::MergedTraitBound;
 use super::defs::{
 	BindingKey, BindingNamespace, InherentImplIndex, MemberKind,
 	TraitImplIndex, TraitIndex,
 };
 use super::impls::ImplTarget;
 use super::signatures::{
-	AssocBindingKind, AssocTypeIndex, ItemLocation, QueryInfo,
-	SignatureBuilder, TraitBound,
+	AssocTypeIndex, ItemLocation, QueryInfo, SignatureBuilder,
 };
 use super::types::{Type, TypeIndex};
 
@@ -29,13 +29,6 @@ pub(super) enum TypeMemberLookup {
 	/// always wins outright, checked before any trait candidate at all), so
 	/// this only ever holds trait-sourced candidates.
 	Ambiguous(Box<[TypeMemberTarget]>),
-	/// The bound combination itself already disagrees about this
-	/// associated type's value (`merge_trait_bound` found two different
-	/// `where{}` bindings for it and poisoned the merged entry to `ERROR`)
-	/// — there is no candidate to name here, since the conflict is on the
-	/// *value*, not on which trait provides it. The diagnostic was already
-	/// pushed during the merge, so the caller reports nothing further.
-	Conflicted,
 }
 
 pub(super) struct TypeMemberTarget {
@@ -155,7 +148,7 @@ impl SignatureBuilder<'_, '_> {
 	/// and, since nothing else ever reuses it either, cached the first
 	/// time it's actually demanded (`SignatureBuilder::param_bounds`), so
 	/// a second projection through the same receiver reuses the merge
-	/// instead of re-running `merge_trait_bound` (and, if it disagrees,
+	/// instead of re-running `union_trait_bound` (and, if it disagrees,
 	/// re-diagnosing it) from scratch.
 	fn resolve_bound_member(
 		&mut self,
@@ -174,27 +167,22 @@ impl SignatureBuilder<'_, '_> {
 				// eagerly, when the trait's header resolved —
 				// `implied_bounds` already *is* the fully merged,
 				// already-diagnosed transitive closure. Prepending the
-				// reflexive `Self: ThisTrait` entry (`declared_bounds[0]`
-				// — never itself part of `implied_bounds`, see that
-				// field's own doc comment) is all that's missing to
+				// reflexive `Self: ThisTrait` entry is all that's missing to
 				// answer this lookup directly, no merge needed.
 				if let ItemLocation::Trait(idx) = self.item_lookup[&owner] {
 					let trait_sig = &self.traits[usize::from(idx)];
-					let bounds = std::iter::once(&trait_sig.declared_bounds[0])
-						.chain(trait_sig.implied_bounds.iter());
-					return self.candidates_from_reachable(bounds, key);
+					return self.candidates_from_implied(
+						&trait_sig.implied_bounds,
+						key,
+						Some(idx),
+					);
 				}
 
-				if let Some(cached) = self.reachable_bounds(env, param_index) {
-					return self.candidates_from_reachable(cached.iter(), key);
-				}
-				let declared: Box<[TraitBound]> =
-					self.declared_bounds(env, param_index).into();
-				let reachable = self.compute_reachable(&declared);
-				let result =
-					self.candidates_from_reachable(reachable.iter(), key);
-				self.store_reachable_bounds(env, param_index, reachable);
-				result
+				self.candidates_from_implied(
+					self.implied_bounds(env, param_index),
+					key,
+					None,
+				)
 			}
 			Type::AssocTypeProjection {
 				trait_index,
@@ -207,19 +195,11 @@ impl SignatureBuilder<'_, '_> {
 				else {
 					return TypeMemberLookup::NotFound;
 				};
-				if let Some(cached) =
-					&self.assoc_types[usize::from(index)].reachable_bounds
-				{
-					return self.candidates_from_reachable(cached.iter(), key);
-				}
-				let declared =
-					self.assoc_types[usize::from(index)].bounds.clone();
-				let reachable = self.compute_reachable(&declared);
-				let result =
-					self.candidates_from_reachable(reachable.iter(), key);
-				self.assoc_types[usize::from(index)].reachable_bounds =
-					Some(reachable);
-				result
+				self.candidates_from_implied(
+					&self.assoc_types[usize::from(index)].implied_bounds,
+					key,
+					None,
+				)
 			}
 			// Error/Infer/anything else `ImplTarget` also can't bucket and
 			// that isn't one of the two abstract shapes — nothing to look
@@ -228,62 +208,34 @@ impl SignatureBuilder<'_, '_> {
 		}
 	}
 
-	/// Builds the transitive closure of `declared` — every bound, plus
-	/// everything each one implies (precomputed per-trait, so this is just
-	/// union over already-finished data, not a walk) — merged, not just
-	/// deduped by identity: `declared` can combine multiple, mutually
-	/// unrelated bounds (`T: B + C`) whose own transitive sets were never
-	/// checked against *each other* before. `merge_trait_bound` pushes a
-	/// diagnostic the first time two of them disagree; every caller here
-	/// only ever calls this once per receiver and caches the result, so
-	/// that diagnostic fires exactly once too.
-	fn compute_reachable(
-		&mut self,
-		declared: &[TraitBound],
-	) -> Box<[TraitBound]> {
-		let mut reachable: Vec<TraitBound> = Vec::new();
-		for bound in declared {
-			self.merge_trait_bound(&mut reachable, bound);
-		}
-		for bound in declared {
-			let implied: Box<[TraitBound]> = self.traits
-				[usize::from(bound.trait_index)]
-			.implied_bounds
-			.clone();
-			for further in implied.iter() {
-				self.merge_trait_bound(&mut reachable, further);
-			}
-		}
-		reachable.into_boxed_slice()
-	}
-
-	/// Turns an already-merged reachable set into a lookup result —
-	/// shared between the cached and freshly-computed paths, and between
-	/// the `TypeParam` and `AssocTypeProjection` receivers.
-	fn candidates_from_reachable<'a>(
+	/// Turns an already-merged implied set into a lookup result — shared
+	/// between all three receiver shapes `resolve_bound_member` handles.
+	/// Purely identity: which trait/`DefId` this name names. Whether the
+	/// combination's `where { .. }` bindings for it actually agree
+	/// (`MergedBindingKind::Conflicting`, already diagnosed once by
+	/// `union_trait_bound`) is a fact about this associated type's *value*,
+	/// not about its identity — `A::X` is `A::X` regardless of whether `B`
+	/// and `C` agree what it equals — so it's irrelevant here. It only
+	/// matters to whatever eventually normalizes/substitutes this
+	/// projection, which isn't this function's job.
+	fn candidates_from_implied(
 		&self,
-		bounds: impl Iterator<Item = &'a TraitBound>,
+		bounds: &[MergedTraitBound],
 		key: BindingKey,
+		reflexive: Option<TraitIndex>,
 	) -> TypeMemberLookup {
 		let mut candidates = Vec::new();
-		for bound in bounds {
-			let trait_def = &self.defs.traits[usize::from(bound.trait_index)];
+		for (trait_index, _bound) in reflexive
+			.into_iter()
+			.map(|index| (index, None))
+			.chain(bounds.iter().map(|bound| (bound.trait_index, Some(bound))))
+		{
+			let trait_def = &self.defs.traits[usize::from(trait_index)];
 			if let Some(&member_index) = trait_def.bindings.get(&key) {
-				// A poisoned `where{}` binding for this exact name means the
-				// combination already disagrees about its value — already
-				// diagnosed by `merge_trait_bound`, so there's no candidate
-				// to report here, poisoned or not.
-				let poisoned = bound.bindings.iter().any(|binding| {
-					binding.name == key.symbol
-						&& matches!(binding.kind, AssocBindingKind::Conflicting)
-				});
-				if poisoned {
-					return TypeMemberLookup::Conflicted;
-				}
 				let kind = trait_def.members[usize::from(member_index)].kind;
 				candidates.push(TypeMemberTarget {
 					kind,
-					source: MemberSource::Bound(bound.trait_index),
+					source: MemberSource::Bound(trait_index),
 				});
 			}
 		}

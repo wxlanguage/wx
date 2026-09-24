@@ -33,6 +33,13 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::index::index_newtype;
 use crate::vfs::{FileId, PackageId};
 
+use super::bounds::{
+	BindingRequirement, BoundArena, BoundId, MergedTraitBound,
+	SourceAssocBinding, SourceTraitBound, report_duplicate_assoc_type_binding,
+	report_expected_trait_bound, report_not_an_associated_type,
+};
+#[cfg(test)]
+use super::bounds::{MergedBindingKind, equals_type};
 use super::defs::{
 	AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
 	DefinitionRegistry, EnumIndex, InherentImplIndex, MemberKind,
@@ -46,58 +53,6 @@ use super::types::{
 	EnvParam, Type, TypeEnvArena, TypeEnvId, TypeIndex, TypeInterner,
 };
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub(super) struct TraitBound {
-	pub(super) trait_index: TraitIndex,
-	pub(super) span: TextSpan,
-	/// `Trait where { Assoc = T, .. }` bindings — empty for a plain `Trait`
-	/// bound with no `where` clause.
-	pub(super) bindings: Box<[AssocBinding]>,
-}
-
-/// One `Assoc = T` or `Assoc: Bound` entry inside a `Trait where { .. }`
-/// bound.
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub(super) struct AssocBinding {
-	pub(super) name: SymbolU32,
-	/// Which of the trait's declared associated types this binds — found
-	/// directly from `defs.rs`'s member bindings, no signature resolution
-	/// needed to know *which* member a name means.
-	pub(super) assoc_type_def_id: DefId,
-	pub(super) kind: AssocBindingKind,
-	pub(super) span: TextSpan,
-	/// The file `span` is relative to. A `TraitBound` carrying this binding
-	/// gets cloned into `implied_bounds` and merged into other items' own
-	/// bound combinations wholesale — by the time a conflict is diagnosed,
-	/// the file resolving it (a function, another trait, ...) is very
-	/// often not the file that originally wrote this binding, so the span
-	/// needs to carry its own file rather than borrowing whichever `file_id`
-	/// happens to be ambient at the diagnosing call site.
-	pub(super) file_id: FileId,
-}
-
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub(super) enum AssocBindingKind {
-	/// `Size = u32` — the associated type must equal exactly this type.
-	/// Spanned at the written type (`u32`), not the associated type's own
-	/// name — a conflicting-binding diagnostic points at what disagrees
-	/// (the value), not at the name shared by both sides.
-	Equals(Spanned<TypeIndex>),
-	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
-	Bound(Box<[TraitBound]>),
-	/// Two bounds reached through different supertrait paths pinned this
-	/// name to disagreeing values — set by `merge_trait_bound`, which also
-	/// pushes the diagnostic. A dedicated variant rather than smuggling
-	/// this through `Equals(TypeIndex::ERROR)`: that would make `ERROR`
-	/// mean two different things (a bogus type, and "this name is
-	/// poisoned"), and a reader of `TypeMemberTarget`'s eventual consumer
-	/// would have to know to specifically distrust that one `TypeIndex`.
-	Conflicting,
-}
-
 /// One generic parameter's bounds — everything about a `Type::TypeParam`
 /// beyond its own identity (which lives in `TypeEnvArena`, addressed by the
 /// same `(env, param_index)` pair; see that module's own doc comment for
@@ -106,23 +61,27 @@ pub(super) enum AssocBindingKind {
 /// `TypeEnvArena`'s own frames — one `Box<[ParamBounds]>` per frame,
 /// pushed together with it by `push_type_env_frame` so the two arrays can
 /// never drift out of length.
-struct ParamBounds {
+pub struct ParamBounds {
 	/// One-hop, as written (`T: A + B`) — used for display and as the seed
-	/// `compute_reachable` merges from. Left empty for a frame whose one
+	/// `compute_implied_bounds` merges from. Left empty for a frame whose one
 	/// entry is never itself abstract (an impl's own `Self`, bound
 	/// directly to a concrete type) — nothing ever queries bounds for one
 	/// of those, so there's nothing to fill in.
-	declared: Box<[TraitBound]>,
-	/// Filled the first time `resolve_bound_member` needs this param's
-	/// transitive, conflict-merged bound set — `None` until then.
-	reachable: Option<Box<[TraitBound]>>,
+	pub declared_bounds: Box<[BoundId]>,
+	/// The transitive, conflict-merged closure of `declared_bounds` —
+	/// computed eagerly by `resolve_generic_params`, the same point
+	/// `TraitSignature::implied_bounds` computes its own (see that field's
+	/// doc comment): a conflicting bound combination has to be diagnosed
+	/// whether or not any code ever ends up projecting a member through
+	/// this param, so it can't wait for `resolve_bound_member` to demand it.
+	pub implied_bounds: Box<[MergedTraitBound]>,
 }
 
 impl ParamBounds {
 	fn empty() -> Self {
 		Self {
-			declared: Box::new([]),
-			reachable: None,
+			declared_bounds: Box::new([]),
+			implied_bounds: Box::new([]),
 		}
 	}
 }
@@ -147,18 +106,13 @@ pub struct TypeAliasSignature {
 /// signatures (`TraitFunction`/`TraitConst`/`TraitAssocType`) are separate
 /// queries, same as an impl's; identity already lives in `defs.rs`.
 pub struct TraitSignature {
-	/// One hop: `Self: ThisTrait` — always index 0, reflexive, never
-	/// written by anyone — followed by the written `: A + B` clause, if
-	/// any. Matches what hovering `Self` shows in rustc (`Self: Trait +
-	/// Sized`) even though nothing wrote the first part: Self structurally
-	/// satisfies the trait it's declared in, not just whatever it also
-	/// `: Super`s.
-	pub declared_bounds: Box<[TraitBound]>,
-	/// The transitive closure of `declared_bounds[1..]` — self excluded,
-	/// already accounted for at index 0 above — every supertrait reachable
+	/// The written `: A + B` clause. The reflexive `Self: ThisTrait`
+	/// bound is implicit and is added when looking up a member on `Self`.
+	pub declared_bounds: Box<[BoundId]>,
+	/// The transitive closure of `declared_bounds` — every supertrait implied
 	/// through the chain, each carrying whatever `where { .. }` bindings
 	/// apply to it once merged across every path that reaches it (see
-	/// `merge_trait_bound`).
+	/// `union_trait_bound`).
 	///
 	/// Precomputed once, right here, rather than walked per-query (the
 	/// legacy builder's `reachable_traits`/`trait_implies` did a fresh DFS
@@ -167,7 +121,7 @@ pub struct TraitSignature {
 	/// own arm finishes, so each one's own `implied_bounds` is already
 	/// sitting there, finished, to union in directly — no repeated walk
 	/// needed at any point after this.
-	pub implied_bounds: Box<[TraitBound]>,
+	pub implied_bounds: Box<[MergedTraitBound]>,
 	/// The trait's single-entry `Self` frame — `Self` bound to its own
 	/// abstract `TypeParam { owner: <this trait's DefId>, param_index: 0 }`
 	/// — pushed once here and reused by every member's own resolution
@@ -239,13 +193,10 @@ pub struct ConstantSignature {
 /// bound-resolution site in this phase. The concrete type each `impl`
 /// provides is a separate query (`TraitImplAssocType`), not tracked here.
 pub struct AssocTypeSignature {
-	pub(super) bounds: Box<[TraitBound]>,
-	/// Same reasoning as `ParamBounds::reachable` — filled the first time
-	/// `resolve_bound_member` needs this associated type's transitive,
-	/// conflict-merged bound set. A single slot rather than one per param,
-	/// since there's one associated type per query rather than a whole
-	/// param list, so it isn't addressed through `param_bounds` at all.
-	pub(super) reachable_bounds: Option<Box<[TraitBound]>>,
+	pub(super) declared_bounds: Box<[BoundId]>,
+	/// See `ParamBounds::implied_bounds` — same reasoning, computed eagerly
+	/// right alongside `declared_bounds` rather than on first demand.
+	pub(super) implied_bounds: Box<[MergedTraitBound]>,
 }
 
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
@@ -353,6 +304,7 @@ pub struct SignatureRegistry {
 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 	pub item_lookup: HashMap<DefId, ItemLocation>,
 	pub types: TypeInterner,
+	pub(super) bounds: BoundArena,
 	/// See `SignatureBuilder::param_bounds`.
 	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
 }
@@ -424,6 +376,7 @@ impl SignatureRegistry {
 			trait_impl_dispatch: builder.trait_impl_dispatch,
 			item_lookup: builder.item_lookup,
 			types: builder.types,
+			bounds: builder.bounds,
 			param_bounds: builder.param_bounds,
 		}
 	}
@@ -456,6 +409,9 @@ pub enum ItemLocation {
 /// reaches its own `Done` normally.
 pub(super) enum SignatureStatus {
 	Resolved,
+	/// Still being computed; the first re-entry has already been reported.
+	CycleReported,
+	/// The first re-entry into this unfinished signature.
 	Cycle,
 }
 
@@ -565,13 +521,14 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	/// In-progress queries, in call order — shared across every `QueryKind`.
 	query_stack: Vec<QueryFrame>,
 	pub(super) types: TypeInterner,
+	pub(super) bounds: BoundArena,
 	pub(super) type_envs: TypeEnvArena,
 	/// Every generic-param-bearing frame's bounds, index-aligned with
 	/// `type_envs`'s own frames (one `Box<[ParamBounds]>` per `TypeEnvId`,
 	/// itself index-aligned with that frame's `params`) — kept as a
 	/// sibling table here rather than inside `TypeEnvArena` itself, since
 	/// `types.rs` is deliberately independent of this module's
-	/// resolved-signature data (`TraitBound`, diagnostics, ...; see that
+	/// resolved-signature data (`BoundId`, diagnostics, ...; see that
 	/// module's own doc comment). Grown only through
 	/// `push_type_env_frame`, the one place that pushes to this and to
 	/// `type_envs` together, so the two arrays can never drift in length.
@@ -731,6 +688,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			query_state,
 			query_stack: Vec::new(),
 			types: TypeInterner::new(),
+			bounds: BoundArena::default(),
 			type_envs: TypeEnvArena::new(),
 			// `TypeEnvArena::new()` seeds one `Root` entry (`TypeEnvId::ROOT`)
 			// before anything else is pushed — matched here with one empty
@@ -857,16 +815,26 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			"nothing can push another frame between `next_id` and this call"
 		);
 
-		let bounds = ast_params
-			.iter()
-			.map(|ast_param| match &ast_param.bounds {
+		// Resolved only now that `frame` exists (a bound can reference a
+		// sibling param, e.g. `T: Trait<U>`), and merged into
+		// `implied_bounds` right here, eagerly — see
+		// `ParamBounds::implied_bounds`'s own doc comment for why that
+		// can't wait for first demand.
+		for (index, ast_param) in ast_params.iter().enumerate() {
+			let declared_bounds = match &ast_param.bounds {
 				Some(bound) => {
 					self.resolve_bounds(file_id, namespace, frame, bound)
 				}
 				None => Box::new([]),
-			})
-			.collect();
-		self.set_declared_bounds(frame, bounds);
+			};
+			let implied_bounds = self
+				.compute_implied_bounds(&declared_bounds, ast_param.name.inner)
+				.into_boxed_slice();
+			self.param_bounds[usize::from(frame)][index] = ParamBounds {
+				declared_bounds,
+				implied_bounds,
+			};
+		}
 
 		frame
 	}
@@ -874,10 +842,21 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// Pushes a new `TypeEnvArena` frame and its (initially empty)
 	/// `param_bounds` slot together — the combining call `push_frame`
 	/// itself can't make, since `types.rs` is deliberately independent of
-	/// `TraitBound` and the rest of this module's resolved-signature data
+	/// `BoundId` and the rest of this module's resolved-signature data
 	/// (see that module's own doc comment). This is the one place
 	/// `type_envs` is ever pushed to, so the two arrays can never drift in
 	/// length.
+	///
+	/// The empty placeholder is filled in by `resolve_generic_params`,
+	/// right after it resolves the bounds that needed this frame to exist
+	/// first (a bound can reference a sibling param). A `Self` frame
+	/// (trait or impl, pushed straight from here at its own call sites
+	/// rather than through `resolve_generic_params`) never gets filled in
+	/// and keeps the empty placeholder — correct either way, since neither
+	/// is ever queried through it: an impl's `Self` is never abstract at
+	/// all, and a trait's own `Self` is answered directly from
+	/// `TraitSignature::implied_bounds` instead (see
+	/// `resolve_bound_member`'s own doc comment).
 	fn push_type_env_frame(
 		&mut self,
 		params: Box<[EnvParam]>,
@@ -891,142 +870,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		id
 	}
 
-	/// Fills in `env`'s real declared bounds, once bound resolution (which
-	/// needed `env` to already exist, to resolve sibling-param references
-	/// within the bounds) has produced them. A `Self` frame (trait or
-	/// impl) never calls this, leaving the empty placeholder
-	/// `push_type_env_frame` reserved in place — correct either way, since
-	/// neither is ever queried through here (an impl's `Self` is never
-	/// abstract at all; a trait's own `Self` is answered directly from
-	/// `TraitSignature::implied_bounds` instead — see
-	/// `resolve_bound_member`'s own doc comment).
-	fn set_declared_bounds(
-		&mut self,
-		env: TypeEnvId,
-		bounds: Box<[Box<[TraitBound]>]>,
-	) {
-		let slots = &mut self.param_bounds[usize::from(env)];
-		debug_assert_eq!(slots.len(), bounds.len());
-		for (slot, declared) in slots.iter_mut().zip(bounds) {
-			slot.declared = declared;
-		}
-	}
-
-	pub(super) fn declared_bounds(
+	pub(super) fn implied_bounds(
 		&self,
 		env: TypeEnvId,
 		param_index: u32,
-	) -> &[TraitBound] {
-		&self.param_bounds[usize::from(env)][param_index as usize].declared
-	}
-
-	pub(super) fn reachable_bounds(
-		&self,
-		env: TypeEnvId,
-		param_index: u32,
-	) -> Option<&[TraitBound]> {
-		self.param_bounds[usize::from(env)][param_index as usize]
-			.reachable
-			.as_deref()
-	}
-
-	pub(super) fn store_reachable_bounds(
-		&mut self,
-		env: TypeEnvId,
-		param_index: u32,
-		value: Box<[TraitBound]>,
-	) {
-		self.param_bounds[usize::from(env)][param_index as usize].reachable =
-			Some(value);
-	}
-
-	/// Unions `bound` into `accum`, merging its `where { .. }` bindings
-	/// with any already recorded for the same trait rather than pushing a
-	/// duplicate — two different supertrait paths reaching the same trait
-	/// is normal (a diamond), not a conflict on its own; it only becomes
-	/// one if they pin the same associated type to two different things.
-	///
-	/// `pub(super)`: also used by `members.rs`'s `resolve_bound_member` —
-	/// unlike a trait's own declaration (checked once, eagerly, right here
-	/// in this same file, since its closure is read by every future bound
-	/// against it), a function/struct/impl's own `T: B + C` is never
-	/// eagerly validated — nothing else ever reuses *that* combination —
-	/// so the identical conflict can only be caught lazily, at the point
-	/// something actually resolves a projection through it. No `file_id`
-	/// param: every `AssocBinding` carries its own (see its doc comment) —
-	/// this can merge bounds that were originally written in completely
-	/// different files from the item currently combining them.
-	pub(super) fn merge_trait_bound(
-		&mut self,
-		accum: &mut Vec<TraitBound>,
-		bound: &TraitBound,
-	) {
-		let Some(existing) = accum
-			.iter_mut()
-			.find(|b| b.trait_index == bound.trait_index)
-		else {
-			accum.push(bound.clone());
-			return;
-		};
-
-		let mut merged: Vec<AssocBinding> = existing.bindings.to_vec();
-		for incoming in bound.bindings.iter() {
-			match merged.iter().position(|b| b.name == incoming.name) {
-				None => merged.push(incoming.clone()),
-				Some(index) => {
-					if matches!(
-						merged[index].kind,
-						AssocBindingKind::Conflicting
-					) {
-						// Already poisoned by an earlier merge — the
-						// diagnostic was already pushed then, so a third
-						// (or later) bound naming the same conflict adds
-						// nothing further.
-					} else if !Self::assoc_bindings_agree(
-						&merged[index],
-						incoming,
-					) {
-						self.diagnostics.push(
-							report_conflicting_assoc_type_binding(
-								self.strings,
-								&merged[index],
-								incoming,
-							),
-						);
-						// Unlike a plain duplicate elsewhere in this file
-						// (a duplicate generic param, a duplicate
-						// `where`-binding naming the *same* value twice),
-						// there's no "first wins" to fall back on here: `B`
-						// and `C` each pin the associated type to a
-						// genuinely different, non-negotiable concrete
-						// type, so neither candidate is more correct than
-						// the other. Poison the merged entry so every
-						// later consumer of this bound — both a trait's
-						// own eager `implied_bounds` and
-						// `resolve_bound_member`'s lazy re-merge — sees
-						// the conflict rather than an arbitrarily-chosen
-						// value.
-						merged[index].kind = AssocBindingKind::Conflicting;
-					}
-				}
-			}
-		}
-		existing.bindings = merged.into_boxed_slice();
-	}
-
-	/// Whether two bindings for the *same* associated type, reached
-	/// through two different supertrait paths, can coexist.
-	fn assoc_bindings_agree(a: &AssocBinding, b: &AssocBinding) -> bool {
-		match (&a.kind, &b.kind) {
-			(AssocBindingKind::Equals(x), AssocBindingKind::Equals(y)) => {
-				x.inner == y.inner
-			}
-			_ => todo!(
-				"merging a Bound-kind or mixed-kind associated type binding \
-				 across a diamond isn't implemented yet — only the common \
-				 Equals-vs-Equals case is checked so far"
-			),
-		}
+	) -> &[MergedTraitBound] {
+		&self.param_bounds[usize::from(env)][param_index as usize]
+			.implied_bounds
 	}
 
 	/// The demand-driven driver: computes `def_id`'s signature if it hasn't
@@ -1042,8 +892,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		let def_id = query.def_id;
 		let key = QueryKey::signature(def_id);
 		match self.query_state[&key].state {
-			QueryState::Done | QueryState::CycleReported => {
-				return SignatureStatus::Resolved;
+			QueryState::Done => return SignatureStatus::Resolved,
+			QueryState::CycleReported => {
+				return SignatureStatus::CycleReported;
 			}
 			// First re-entrant discovery: flip to `CycleReported` right
 			// here, atomically, before returning `Cycle` — mirrors
@@ -1148,16 +999,17 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				debug_assert_eq!(self_scope, self_scope_id);
 
-				let bounds = match supertraits {
+				let declared_bounds = match supertraits {
 					Some(bound) => self
 						.resolve_bounds(file_id, namespace, self_scope, bound),
 					None => Box::new([]),
 				};
 
-				for bound in &bounds {
+				for bound in declared_bounds.iter().copied() {
+					let bound = self.bounds.get(bound);
 					let super_def_id =
 						self.defs.traits[usize::from(bound.trait_index)].def_id;
-					let reference = SourceSpan::new(file_id, bound.span);
+					let reference = bound.span;
 					let status = self.ensure_signature(QueryInfo {
 						def_id: super_def_id,
 						requested_at: Some(reference),
@@ -1169,33 +1021,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					}
 				}
 
-				// `implied_bounds`: each direct supertrait itself, plus
-				// everything *it* transitively implies (already fully
-				// computed by now — the loop just above forced it, or
-				// degraded gracefully to whatever a cycle left behind).
-				// Pure union of already-finished data, no walking.
-				let mut implied_bounds: Vec<TraitBound> = Vec::new();
-				for bound in bounds.iter() {
-					self.merge_trait_bound(&mut implied_bounds, bound);
-					let further: Box<[TraitBound]> = self.traits
-						[usize::from(bound.trait_index)]
-					.implied_bounds
-					.clone();
-					for f in further.iter() {
-						self.merge_trait_bound(&mut implied_bounds, f);
-					}
-				}
-
-				let mut declared_bounds = Vec::with_capacity(bounds.len() + 1);
-				declared_bounds.push(TraitBound {
-					trait_index,
-					span: name.span,
-					bindings: Box::new([]),
-				});
-				declared_bounds.extend(bounds.into_vec());
-
+				let implied_bounds =
+					self.compute_implied_bounds(&declared_bounds, name.inner);
 				self.traits[usize::from(trait_index)] = TraitSignature {
-					declared_bounds: declared_bounds.into_boxed_slice(),
+					declared_bounds,
 					implied_bounds: implied_bounds.into_boxed_slice(),
 					self_scope,
 				};
@@ -1345,7 +1174,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					.insert(def_id, ItemLocation::Constant(index));
 			}
 			AstNodeRef::TraitAssocType { item, .. } => {
-				let ast::TraitItem::AssociatedType { bounds, .. } = item else {
+				let ast::TraitItem::AssociatedType { name, bounds, .. } = item
+				else {
 					unreachable!()
 				};
 
@@ -1358,13 +1188,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					),
 					None => Box::new([]),
 				};
+				// Eager, same reasoning as `ParamBounds::implied_bounds`: a
+				// conflicting bound combination must be diagnosed whether or
+				// not any impl ever projects a member through this
+				// associated type.
+				let implied_bounds =
+					self.compute_implied_bounds(&resolved_bounds, name.inner);
 
 				let index = AssocTypeIndex::new(
 					u32::try_from(self.assoc_types.len()).unwrap(),
 				);
 				self.assoc_types.push(AssocTypeSignature {
-					bounds: resolved_bounds,
-					reachable_bounds: None,
+					declared_bounds: resolved_bounds,
+					implied_bounds: implied_bounds.into_boxed_slice(),
 				});
 				self.item_lookup
 					.insert(def_id, ItemLocation::TraitAssocType(index));
@@ -1816,9 +1652,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					None => Box::new([]),
 				};
 				for bound in &clause_bounds {
+					let bound = self.bounds.get(*bound);
 					let super_def_id =
 						self.defs.traits[usize::from(bound.trait_index)].def_id;
-					let reference = SourceSpan::new(file_id, bound.span);
+					let reference = bound.span;
 					let status = self.ensure_signature(QueryInfo {
 						def_id: super_def_id,
 						requested_at: Some(reference),
@@ -1830,32 +1667,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					}
 				}
 
-				// See the hand-written `Trait` arm — identical reasoning,
-				// just against the typeset's own clause instead of a
-				// written `trait X: A + B {}`.
-				let mut implied_bounds: Vec<TraitBound> = Vec::new();
-				for bound in clause_bounds.iter() {
-					self.merge_trait_bound(&mut implied_bounds, bound);
-					let further: Box<[TraitBound]> = self.traits
-						[usize::from(bound.trait_index)]
-					.implied_bounds
-					.clone();
-					for f in further.iter() {
-						self.merge_trait_bound(&mut implied_bounds, f);
-					}
-				}
-
-				let mut declared_bounds =
-					Vec::with_capacity(clause_bounds.len() + 1);
-				declared_bounds.push(TraitBound {
-					trait_index,
-					span: name.span,
-					bindings: Box::new([]),
-				});
-				declared_bounds.extend(clause_bounds.into_vec());
-
+				let implied_bounds =
+					self.compute_implied_bounds(&clause_bounds, name.inner);
 				self.traits[usize::from(trait_index)] = TraitSignature {
-					declared_bounds: declared_bounds.into_boxed_slice(),
+					declared_bounds: clause_bounds,
 					implied_bounds: implied_bounds.into_boxed_slice(),
 					self_scope,
 				};
@@ -1953,7 +1768,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// at the first segment *not yet* consumed.
 				let first = &segments[0];
 				let (mut current, mut next) = if first.type_args.is_empty()
-					&& let Some(ty) = self.type_envs.resolve_name(
+					&& let Some(ty) = self.type_envs.resolve(
 						env,
 						first.ident.inner,
 						SourceSpan::new(file_id, first.ident.span),
@@ -1993,6 +1808,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 											def_id, reference,
 										);
 									self.diagnostics.push(diagnostic);
+									TypeIndex::ERROR
+								}
+								SignatureStatus::CycleReported => {
 									TypeIndex::ERROR
 								}
 								SignatureStatus::Resolved => {
@@ -2109,13 +1927,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							);
 							return TypeIndex::ERROR;
 						}
-						TypeMemberLookup::Conflicted => {
-							// Already diagnosed inside `merge_trait_bound`
-							// — the bound combination itself disagrees
-							// about this name's value, so there's nothing
-							// more to report here.
-							return TypeIndex::ERROR;
-						}
 					}
 					next += 1;
 				}
@@ -2183,7 +1994,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// already has that span in hand at the point it detects `Cycle`, so it
 	/// passes it in directly as `closing_reference`.
 	///
-	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicSupertrait`,
+	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicTraitBounds`,
 	/// `RecursiveTypeWithoutIndirection`, ...) — they differ only in which
 	/// diagnostic code applies and how to phrase "why `name` was needed"
 	/// (`describe`), e.g. `"expanding type alias \`A\`"` or `"computing the
@@ -2274,17 +2085,30 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		self.report_cycle(
 			def_id,
 			closing_reference,
-			DiagnosticCode::CyclicSupertrait,
+			DiagnosticCode::CyclicTraitBounds,
 			|name| format!("computing the supertraits of `{name}`"),
 		)
 		.with_note("a trait cannot require itself as a supertrait")
+	}
+
+	pub(super) fn report_cyclic_implied_trait_bounds(
+		&self,
+		def_id: DefId,
+		closing_reference: SourceSpan,
+	) -> Diagnostic<FileId> {
+		self.report_cycle(
+			def_id,
+			closing_reference,
+			DiagnosticCode::CyclicTraitBounds,
+			|name| format!("computing the implied bounds of `{name}`"),
+		)
 	}
 
 	/// Renders the rustc-E0072-style diagnostic: every struct in the cycle
 	/// gets its own primary label (at its own declaration name) plus a
 	/// secondary label at the specific field that continues the cycle,
 	/// rather than the single-root "cycle detected when..." chain
-	/// `report_cycle` renders for `CyclicTypeAlias`/`CyclicSupertrait`. The
+	/// `report_cycle` renders for `CyclicTypeAlias`/`CyclicTraitBounds`. The
 	/// full chain is already sitting in `query_stack[position..]` — built up
 	/// by the ordinary recursive `ensure_signature` forcing that got us
 	/// here — so there's nothing to separately collect first.
@@ -2425,38 +2249,38 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		namespace: NamespaceIndex,
 		env: TypeEnvId,
 		bound: &Spanned<ast::BoundExpression>,
-	) -> Box<[TraitBound]> {
-		let mut traits = Vec::new();
-		self.collect_bounds(file_id, namespace, env, bound, &mut traits);
-		traits.into_boxed_slice()
+	) -> Box<[BoundId]> {
+		let mut ids = Vec::new();
+		self.collect_bounds(file_id, namespace, env, bound, &mut ids);
+		ids.into_boxed_slice()
 	}
 
 	/// `+`-joined bounds flatten into one `Vec` — `T: Add + PartialEq`
-	/// produces two `TraitBound`s, not a nested structure mirroring
+	/// produces two `BoundId`s, not a nested structure mirroring
 	/// `BoundList`.
 	fn collect_bounds(
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIndex,
 		env: TypeEnvId,
-		bound: &Spanned<ast::BoundExpression>,
-		out: &mut Vec<TraitBound>,
+		expr: &Spanned<ast::BoundExpression>,
+		bounds: &mut Vec<BoundId>,
 	) {
-		match &bound.inner {
+		match &expr.inner {
 			ast::BoundExpression::BoundList(list) => {
 				for entry in list.iter() {
-					self.collect_bounds(file_id, namespace, env, entry, out);
+					self.collect_bounds(file_id, namespace, env, entry, bounds);
 				}
 			}
 			ast::BoundExpression::Path(segments) => {
 				if let Some(trait_index) =
 					self.resolve_trait_bound_path(file_id, namespace, segments)
 				{
-					out.push(TraitBound {
+					bounds.push(self.bounds.push(SourceTraitBound {
 						trait_index,
-						span: bound.span,
+						span: SourceSpan::new(file_id, expr.span),
 						bindings: Box::new([]),
-					});
+					}));
 				}
 			}
 			ast::BoundExpression::WithBindings { path, bindings } => {
@@ -2472,12 +2296,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					return;
 				};
 
-				let mut resolved_bindings: Vec<AssocBinding> =
+				let mut source_bindings: Vec<SourceAssocBinding> =
 					Vec::with_capacity(bindings.len());
 				for binding in bindings.iter() {
-					if resolved_bindings
+					if source_bindings
 						.iter()
-						.any(|b| b.name == binding.name.inner)
+						.any(|b| b.name.inner == binding.name.inner)
 					{
 						self.diagnostics.push(
 							report_duplicate_assoc_type_binding(
@@ -2522,33 +2346,31 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 									InferSignatureKind::AssocTypeBinding,
 								),
 							);
-							AssocBindingKind::Equals(Spanned {
+							let value = Spanned {
 								inner: resolved,
 								span: ty.span,
-							})
+							};
+							BindingRequirement::Equals(value)
 						}
 						ast::AssocTypeBindingKind::Bound(rhs_bound) => {
-							let rhs_bounds = self.resolve_bounds(
+							BindingRequirement::Bound(self.resolve_bounds(
 								file_id, namespace, env, rhs_bound,
-							);
-							AssocBindingKind::Bound(rhs_bounds)
+							))
 						}
 					};
 
-					resolved_bindings.push(AssocBinding {
-						name: binding.name.inner,
+					source_bindings.push(SourceAssocBinding {
+						name: binding.name,
 						assoc_type_def_id,
 						kind,
-						span: binding.name.span,
-						file_id,
 					});
 				}
 
-				out.push(TraitBound {
+				bounds.push(self.bounds.push(SourceTraitBound {
 					trait_index,
-					span: bound.span,
-					bindings: resolved_bindings.into_boxed_slice(),
-				});
+					span: SourceSpan::new(file_id, expr.span),
+					bindings: source_bindings.into_boxed_slice(),
+				}));
 			}
 		}
 	}
@@ -2754,94 +2576,6 @@ fn report_duplicate_function_param(
 		)
 }
 
-fn report_expected_trait_bound(
-	file_id: FileId,
-	strings: &StringInterner,
-	name: Spanned<SymbolU32>,
-	noun: &str,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::ExpectedTraitBound.code())
-		.with_message(format!("expected trait, found {noun} `{name_str}`"))
-		.with_label(
-			SourceSpan::new(file_id, name.span)
-				.primary_label()
-				.with_message("not a trait"),
-		)
-}
-
-fn report_duplicate_assoc_type_binding(
-	file_id: FileId,
-	strings: &StringInterner,
-	name: Spanned<SymbolU32>,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::DuplicateAssocTypeBinding.code())
-		.with_message(format!(
-			"associated type `{name_str}` is bound more than once in this `where` clause"
-		))
-		.with_label(
-			SourceSpan::new(file_id, name.span)
-				.primary_label()
-				.with_message("duplicate binding"),
-		)
-}
-
-/// Two different supertrait paths reaching the same trait pin the same
-/// associated type to two incompatible things — `incoming` is the second
-/// one seen; the first is left as-is (see `SignatureBuilder::merge_trait_bound`).
-fn report_conflicting_assoc_type_binding(
-	strings: &StringInterner,
-	existing: &AssocBinding,
-	incoming: &AssocBinding,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(incoming.name).unwrap();
-	// `assoc_bindings_agree` only calls this once both sides are `Equals`
-	// (the only kind it compares so far) — pointing at the written value
-	// (`u32`/`u64`), not the shared name, is what actually shows the
-	// reader what disagrees.
-	let (
-		AssocBindingKind::Equals(incoming_ty),
-		AssocBindingKind::Equals(existing_ty),
-	) = (&incoming.kind, &existing.kind)
-	else {
-		unreachable!("only reached once both sides are Equals bindings")
-	};
-	Diagnostic::error()
-		.with_code(DiagnosticCode::DuplicateAssocTypeBinding.code())
-		.with_message(format!(
-			"associated type `{name_str}` is bound to two different types through different supertraits"
-		))
-		.with_label(
-			SourceSpan::new(incoming.file_id, incoming_ty.span)
-				.primary_label()
-				.with_message("conflicting value bound here"),
-		)
-		.with_label(
-			SourceSpan::new(existing.file_id, existing_ty.span)
-				.secondary_label()
-				.with_message("first bound to this value here"),
-		)
-}
-
-fn report_not_an_associated_type(
-	file_id: FileId,
-	strings: &StringInterner,
-	name: Spanned<SymbolU32>,
-	trait_name: SymbolU32,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	let trait_str = strings.resolve(trait_name).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::NotATraitMember.code())
-		.with_message(format!(
-			"`{name_str}` is not an associated type of trait `{trait_str}`"
-		))
-		.with_label(SourceSpan::new(file_id, name.span).primary_label())
-}
-
 fn report_no_such_type_member(
 	file_id: FileId,
 	strings: &StringInterner,
@@ -3031,11 +2765,13 @@ mod tests {
 			index
 		}
 
-		/// The *written* clause only — skips `declared_bounds[0]`, the
-		/// reflexive `Self: ThisTrait` entry nothing wrote.
-		fn trait_supertraits(&self, path: &str) -> &[TraitBound] {
-			&self.signatures.traits[usize::from(self.trait_index(path))]
-				.declared_bounds[1..]
+		/// The written clause excludes the implicit `Self: ThisTrait` bound.
+		fn trait_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
+			self.signatures.traits[usize::from(self.trait_index(path))]
+				.declared_bounds
+				.iter()
+				.map(|&id| self.signatures.bounds.get(id))
+				.collect()
 		}
 
 		fn typeset_index(&self, path: &str) -> TypeSetIndex {
@@ -3071,10 +2807,13 @@ mod tests {
 				.trait_index
 		}
 
-		/// See `trait_supertraits` — same reflexive-entry skip.
-		fn typeset_supertraits(&self, path: &str) -> &[TraitBound] {
-			&self.signatures.traits[usize::from(self.typeset_trait_index(path))]
-				.declared_bounds[1..]
+		/// See `trait_supertraits` — only the written clause.
+		fn typeset_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
+			self.signatures.traits[usize::from(self.typeset_trait_index(path))]
+				.declared_bounds
+				.iter()
+				.map(|&id| self.signatures.bounds.get(id))
+				.collect()
 		}
 
 		/// `name` is looked up directly against the trait's own member
@@ -3243,10 +2982,12 @@ mod tests {
 			&self,
 			env: TypeEnvId,
 			param_index: u32,
-		) -> &[TraitBound] {
-			&self.signatures.param_bounds[usize::from(env)]
-				[param_index as usize]
-				.declared
+		) -> Vec<&SourceTraitBound> {
+			self.signatures.param_bounds[usize::from(env)][param_index as usize]
+				.declared_bounds
+				.iter()
+				.map(|&id| self.signatures.bounds.get(id))
+				.collect()
 		}
 
 		fn param_count(&self, env: TypeEnvId) -> usize {
@@ -3727,7 +3468,7 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::CyclicSupertrait.code())
+			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
 		assert_eq!(
 			case.diagnostics[0].message,
@@ -3761,8 +3502,39 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::CyclicSupertrait.code())
+			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
+	}
+
+	#[test]
+	fn a_direct_self_supertrait_reports_a_supertrait_cycle() {
+		let case = TestCase::new("trait D: D {}");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::CyclicTraitBounds.code())
+		);
+	}
+
+	#[test]
+	fn a_nested_self_bound_reports_an_implied_bounds_cycle_once() {
+		let source = indoc! {"
+			trait Outer { type Item; }
+			trait D: Outer where { Item: D + D } {}
+		"};
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::CyclicTraitBounds.code())
+		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"cycle detected when computing the implied bounds of `D`"
+		);
+		assert_eq!(&source[case.diagnostics[0].labels[0].range.clone()], "D");
 	}
 
 	#[test]
@@ -3969,7 +3741,7 @@ mod tests {
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
-				.bounds
+				.declared_bounds
 				.is_empty()
 		);
 	}
@@ -3983,10 +3755,18 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let bounds = &case.assoc_type_signature("Container", "Item").bounds;
+		let bounds = &case
+			.assoc_type_signature("Container", "Item")
+			.declared_bounds;
 		assert_eq!(bounds.len(), 2);
-		assert_eq!(bounds[0].trait_index, case.trait_index("Bound1"));
-		assert_eq!(bounds[1].trait_index, case.trait_index("Bound2"));
+		assert_eq!(
+			case.signatures.bounds.get(bounds[0]).trait_index,
+			case.trait_index("Bound1")
+		);
+		assert_eq!(
+			case.signatures.bounds.get(bounds[1]).trait_index,
+			case.trait_index("Bound2")
+		);
 	}
 
 	#[test]
@@ -4060,7 +3840,7 @@ mod tests {
 		);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
-				.bounds
+				.declared_bounds
 				.is_empty()
 		);
 	}
@@ -4081,7 +3861,7 @@ mod tests {
 		assert_eq!(bounds[0].bindings.len(), 1);
 		assert!(matches!(
 			bounds[0].bindings[0].kind,
-			AssocBindingKind::Equals(Spanned {
+			BindingRequirement::Equals(Spanned {
 				inner: TypeIndex::I32,
 				..
 			})
@@ -4101,12 +3881,15 @@ mod tests {
 		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].bindings.len(), 1);
-		let AssocBindingKind::Bound(rhs_bounds) = &bounds[0].bindings[0].kind
+		let BindingRequirement::Bound(rhs_bounds) = &bounds[0].bindings[0].kind
 		else {
 			panic!("expected a `Bound` binding kind");
 		};
 		assert_eq!(rhs_bounds.len(), 1);
-		assert_eq!(rhs_bounds[0].trait_index, case.trait_index("Unsigned"));
+		assert_eq!(
+			case.signatures.bounds.get(rhs_bounds[0]).trait_index,
+			case.trait_index("Unsigned")
+		);
 	}
 
 	#[test]
@@ -4156,7 +3939,7 @@ mod tests {
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let env = case.function_signature("copy").type_params;
 		let bounds = case.declared_bounds(env, 0);
-		let AssocBindingKind::Equals(ty) = bounds[0].bindings[0].kind else {
+		let BindingRequirement::Equals(ty) = &bounds[0].bindings[0].kind else {
 			panic!("expected an `Equals` binding kind");
 		};
 		assert!(matches!(
@@ -4348,12 +4131,16 @@ mod tests {
 		);
 	}
 
-	/// Verified against real rustc: `fn f<T: B + C>(x: <T as A>::X)` fails
-	/// at the parameter with "cannot infer type" — `<T: B + C>` alone
-	/// compiles fine, since nothing else ever reuses that specific
-	/// combination to have caught it earlier.
+	/// Verified against real rustc (`trait B: A<X = u32> {}`, `trait C: A<X
+	/// = u64> {}`, `fn f<T: B + C>() {}`): rejected immediately with
+	/// `E0284`, zero uses of `T` anywhere past the bound list — bound
+	/// well-formedness is checked once at declaration, not deferred to
+	/// first use. wx matches that here (see `ParamBounds::implied_bounds`);
+	/// `a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed`
+	/// below re-checks the fully-unused case, which the old
+	/// lazy-on-first-projection design let compile silently.
 	#[test]
-	fn a_functions_own_bound_combination_with_conflicting_assoc_type_bindings_is_diagnosed_lazily()
+	fn a_functions_own_bound_combination_with_conflicting_assoc_type_bindings_is_diagnosed_eagerly()
 	 {
 		let case = TestCase::new(indoc! {"
 			type u32;
@@ -4372,17 +4159,36 @@ mod tests {
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
 		assert_eq!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
+			case.diagnostics[0].message,
+			"`T` requires conflicting bindings for `A::X`"
 		);
+		// The conflict is a fact about `A::X`'s *value*, not its identity —
+		// `T::X` still names a perfectly real item (`A::X`), so it still
+		// resolves to a normal projection rather than `TypeIndex::ERROR`.
+		// No substitution logic exists to ever normalize it (and none ever
+		// will need to: no concrete type can satisfy `T: B + C` in the
+		// first place, since `B` and `C` each require a different, already
+		// conflicting `A::X` from any type implementing them), so the
+		// diagnostic above is the only signal this program gets — same as
+		// real rustc, which also reports only `E0284` here and nothing
+		// further.
+		let param_ty = case.function_signature("f").param_types[0];
+		match case.signatures.types.resolve(param_ty) {
+			Type::AssocTypeProjection { trait_index, .. } => {
+				assert_eq!(*trait_index, case.trait_index("A"));
+			}
+			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+		}
 	}
 
-	/// Verified against real rustc: `trait D: B + C {}` alone — no use of
-	/// `Self::X` anywhere in `D`'s own body — still fails immediately,
-	/// unlike the function case: `D`'s own closure is what every future
-	/// `T: D` bound would reuse, so it's checked once, eagerly, right here.
+	/// Same source as the test above with the parameter dropped — `T` is
+	/// never named anywhere past the bound list, so nothing would ever
+	/// have demanded its merged closure under the old
+	/// lazy-on-first-projection design, and this would have compiled
+	/// clean. Verified this is still rejected (`E0284`) in real rustc too;
+	/// eager computation in `resolve_generic_params` matches that.
 	#[test]
-	fn a_traits_own_supertrait_combination_with_conflicting_assoc_type_bindings_is_diagnosed_eagerly()
+	fn a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed()
 	 {
 		let case = TestCase::new(indoc! {"
 			type u32;
@@ -4390,13 +4196,237 @@ mod tests {
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
-			trait D: B + C {}
+			fn f<T: B + C>() { }
 		"});
+
+		case.diagnostics().print();
 
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"`T` requires conflicting bindings for `A::X`"
+		);
+	}
+
+	/// Verified against real rustc: `trait D: B + C {}` alone — no use of
+	/// `Self::X` anywhere in `D`'s own body — still fails immediately
+	/// (`E0284`), same as the function case above. `D`'s own closure is
+	/// additionally what every future `T: D` bound would reuse, so it's
+	/// computed once, right here, rather than re-merged per use site.
+	#[test]
+	fn a_traits_own_supertrait_combination_with_conflicting_assoc_type_bindings_is_diagnosed_eagerly()
+	 {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait A { type X; }
+			trait B: A where { X = u32 } {}
+			trait C: A where { X = u64 } {}
+			trait D: B + C {}
+		"};
+		let case = TestCase::new(source);
+
+		case.diagnostics().print();
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
+		);
+		let labels = &case.diagnostics[0].labels;
+		assert_eq!(labels.len(), 3);
+		assert_eq!(&source[labels[0].range.clone()], "u64");
+		assert_eq!(&source[labels[1].range.clone()], "u32");
+		assert_eq!(&source[labels[2].range.clone()], "C");
+	}
+
+	#[test]
+	fn direct_supertrait_conflict_points_to_second_bound() {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait A { type X; }
+			trait D: A where { X = u32 } + A where { X = u64 } {}
+		"};
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		let labels = &case.diagnostics[0].labels;
+		assert_eq!(labels.len(), 3);
+		assert_eq!(&source[labels[0].range.clone()], "u64");
+		assert_eq!(&source[labels[1].range.clone()], "u32");
+		assert_eq!(&source[labels[2].range.clone()], "A where { X = u64 }");
+	}
+
+	#[test]
+	fn conflicting_binding_does_not_poison_another_associated_type() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type u64;
+			trait A { type X; type Y; }
+			trait B: A where { X = u32 } {}
+			trait C: A where { X = u64 } {}
+			fn f<T: B + C>(x: T::Y) {}
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_ne!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
+	}
+
+	#[test]
+	fn nested_bound_conflict_is_still_diagnosed() {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait Inner { type X; }
+			trait Outer { type Item; }
+			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item: Inner where { X = u64 } } {}
+		"};
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		let labels = &case.diagnostics[0].labels;
+		assert_eq!(&source[labels[0].range.clone()], "u64");
+		assert_eq!(&source[labels[1].range.clone()], "u32");
+	}
+
+	#[test]
+	fn conflict_within_one_nested_bound_list_is_diagnosed() {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait Inner { type X; }
+			trait Outer { type Item; }
+			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
+		"};
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		let labels = &case.diagnostics[0].labels;
+		assert_eq!(&source[labels[0].range.clone()], "u64");
+		assert_eq!(&source[labels[1].range.clone()], "u32");
+	}
+
+	#[test]
+	fn nested_supertrait_conflict_is_diagnosed_with_forward_references() {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait Inner { type X; }
+			trait Outer { type Item; }
+			trait D: Outer where { Item: B + C } {}
+			trait B: Inner where { X = u32 } {}
+			trait C: Inner where { X = u64 } {}
+		"};
+		let case = TestCase::new(source);
+
+		case.diagnostics().print();
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"`D` requires conflicting bindings for `Inner::X`"
+		);
+		let labels = &case.diagnostics[0].labels;
+		assert_eq!(&source[labels[0].range.clone()], "u64");
+		assert_eq!(&source[labels[1].range.clone()], "u32");
+		let merged = case.signatures.traits[usize::from(case.trait_index("D"))]
+			.implied_bounds
+			.iter()
+			.find(|bound| bound.trait_index == case.trait_index("Outer"))
+			.unwrap();
+		let inner = &merged.bindings[0].required_bounds;
+		assert!(inner.iter().any(|bound| {
+			bound.trait_index == case.trait_index("Inner")
+				&& matches!(
+					bound.bindings[0].kind,
+					MergedBindingKind::Conflicting
+				)
+		}));
+	}
+
+	#[test]
+	fn nested_conflict_survives_outer_equality_in_either_order() {
+		let source = indoc! {"
+			type u32;
+			type u64;
+			trait Inner { type X; }
+			trait Outer { type Item; }
+			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item = u32 } {}
+			trait E: Outer where { Item = u32 } + Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } {}
+		"};
+		let case = TestCase::new(source);
+
+		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		for trait_name in ["D", "E"] {
+			let merged = case.signatures.traits
+				[usize::from(case.trait_index(trait_name))]
+			.implied_bounds
+			.iter()
+			.find(|bound| bound.trait_index == case.trait_index("Outer"))
+			.unwrap();
+			assert!(matches!(
+				merged.bindings[0].kind,
+				MergedBindingKind::Equals(_)
+			));
+			let inner = &merged.bindings[0].required_bounds;
+			assert_eq!(inner.len(), 1);
+			assert!(matches!(
+				inner[0].bindings[0].kind,
+				MergedBindingKind::Conflicting
+			));
+		}
+	}
+
+	#[test]
+	fn inherited_nested_conflict_is_not_reported_again() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type u64;
+			trait Inner { type X; }
+			trait Outer { type Item; }
+			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
+			trait E: D {}
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+	}
+
+	#[test]
+	fn equality_wins_over_associated_type_bounds_in_either_order() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			trait Mark {}
+			trait A { type X; }
+			trait D: A where { X: Mark } + A where { X = u32 } {}
+			trait E: A where { X = u32 } + A where { X: Mark } {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for trait_name in ["D", "E"] {
+			let signature = &case.signatures.traits
+				[usize::from(case.trait_index(trait_name))];
+			let merged = signature
+				.implied_bounds
+				.iter()
+				.find(|bound| bound.trait_index == case.trait_index("A"))
+				.unwrap();
+			assert_eq!(merged.source, signature.declared_bounds[0]);
+			let MergedBindingKind::Equals(reference) = merged.bindings[0].kind
+			else {
+				panic!("expected equality to win")
+			};
+			assert_eq!(
+				equals_type(&case.signatures.bounds, reference),
+				TypeIndex::U32
+			);
+		}
 	}
 }

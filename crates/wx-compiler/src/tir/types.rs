@@ -313,27 +313,38 @@ impl TypeEnvArena {
 		id
 	}
 
+	pub(super) fn param_name(
+		&self,
+		env: TypeEnvId,
+		param_index: u32,
+	) -> SymbolU32 {
+		let TypeEnv::Frame { params, .. } = &self.envs[usize::from(env)] else {
+			unreachable!("a type parameter belongs to a frame")
+		};
+		params[param_index as usize].name.inner
+	}
+
 	/// Resolves `name` (written at `span`), walking from `id` towards
 	/// `Root`, recording the access against whichever entry matched. `None`
 	/// means no frame in the chain declares it.
-	pub(super) fn resolve_name(
+	pub(super) fn resolve(
 		&mut self,
-		id: TypeEnvId,
+		env: TypeEnvId,
 		name: SymbolU32,
 		span: SourceSpan,
 	) -> Option<TypeIndex> {
-		match &mut self.envs[usize::from(id)] {
-			TypeEnv::Root => None,
-			TypeEnv::Frame { params, parent } => {
-				match params.iter().position(|p| p.name.inner == name) {
-					Some(index) => {
-						params[index].accesses.push(span);
-						Some(params[index].ty)
+		let mut current = env;
+		loop {
+			match &mut self.envs[usize::from(current)] {
+				TypeEnv::Root => return None,
+				TypeEnv::Frame { params, parent } => {
+					if let Some(param) =
+						params.iter_mut().find(|p| p.name.inner == name)
+					{
+						param.accesses.push(span);
+						return Some(param.ty);
 					}
-					None => {
-						let parent = *parent;
-						self.resolve_name(parent, name, span)
-					}
+					current = *parent;
 				}
 			}
 		}

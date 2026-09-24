@@ -12,6 +12,7 @@
 // #[cfg(test)]
 // mod tests;
 
+mod bounds;
 mod defs;
 mod impls;
 mod imports;
