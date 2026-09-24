@@ -135,7 +135,9 @@ impl SignatureBuilder<'_, '_> {
 				def_id,
 				requested_at: Some(reference),
 			}) {
-				SignatureStatus::Resolved => {}
+				// Already have `trait_index`; this call is purely to force
+				// `self.traits[trait_index]` to be populated below.
+				SignatureStatus::Resolved(_) => {}
 				SignatureStatus::Cycle => {
 					let diagnostic = self
 						.report_cyclic_implied_trait_bounds(def_id, reference);

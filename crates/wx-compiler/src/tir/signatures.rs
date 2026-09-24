@@ -188,10 +188,11 @@ pub struct ConstantSignature {
 }
 
 /// A trait associated type's resolved bounds (`type Name: Bound1 +
-/// Bound2;`). `Self`-referencing bounds aren't resolvable yet — path
-/// resolution has no notion of `Self` at all so far, same as every other
-/// bound-resolution site in this phase. The concrete type each `impl`
-/// provides is a separate query (`TraitImplAssocType`), not tracked here.
+/// Bound2;`). Resolved against its trait's own `self_scope` (forced first,
+/// same as `TraitFunction`/`TraitConst`), so a bound may reference `Self`
+/// (`type Size: Memory where { X = Self::Size }`). The concrete type each
+/// `impl` provides is a separate query (`TraitImplAssocType`), not tracked
+/// here.
 pub struct AssocTypeSignature {
 	pub(super) declared_bounds: Box<[BoundId]>,
 	/// See `ParamBounds::implied_bounds` — same reasoning, computed eagerly
@@ -302,11 +303,20 @@ pub struct SignatureRegistry {
 		HashMap<ImplTarget, Vec<InherentImplIndex>>,
 	pub(super) trait_impl_dispatch:
 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
-	pub item_lookup: HashMap<DefId, ItemLocation>,
 	pub types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	/// See `SignatureBuilder::param_bounds`.
 	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
+	/// Derived once, here, from `SignatureBuilder::query_state` — every
+	/// entry is `Resolved` by construction (`build`'s own sweep below
+	/// forces every `ast_nodes` entry, and `ensure_signature` has no early
+	/// `return` that could skip installing one), so this is a straight
+	/// `DefId -> SignatureLocation` projection, not a filter. No production
+	/// code needs a `DefId`-keyed reverse lookup once building is over
+	/// (every real consumer already holds the index it wants by then) —
+	/// this exists for tests, which only ever have a path they've resolved
+	/// to a `DefId`, never the index.
+	pub item_lookup: HashMap<DefId, SignatureLocation>,
 }
 
 impl SignatureRegistry {
@@ -338,14 +348,18 @@ impl SignatureRegistry {
 		// later in the file (or in a package not yet touched) has resolved.
 		// Header-only: members are ordinary, separately-queried items,
 		// reached the same demand-driven way as everything else below.
+		// Each call's own `SignatureLocation` is never needed here — this
+		// loop exists purely to force every item's signature (and whatever
+		// diagnostics that produces) into existence, not to read any of
+		// them back.
 		for inherent_impl in &defs.inherent_impls {
-			builder.ensure_signature(QueryInfo {
+			let _ = builder.ensure_signature(QueryInfo {
 				def_id: inherent_impl.def_id,
 				requested_at: None,
 			});
 		}
 		for trait_impl in &defs.trait_impls {
-			builder.ensure_signature(QueryInfo {
+			let _ = builder.ensure_signature(QueryInfo {
 				def_id: trait_impl.def_id,
 				requested_at: None,
 			});
@@ -355,7 +369,7 @@ impl SignatureRegistry {
 		// impl's own *members*, which the pass above deliberately left
 		// untouched.
 		for entry in ast_nodes {
-			builder.ensure_signature(QueryInfo {
+			let _ = builder.ensure_signature(QueryInfo {
 				def_id: entry.def_id,
 				requested_at: None,
 			});
@@ -374,10 +388,21 @@ impl SignatureRegistry {
 			trait_impls: builder.trait_impls,
 			inherent_impl_dispatch: builder.inherent_impl_dispatch,
 			trait_impl_dispatch: builder.trait_impl_dispatch,
-			item_lookup: builder.item_lookup,
 			types: builder.types,
 			bounds: builder.bounds,
 			param_bounds: builder.param_bounds,
+			item_lookup: builder
+				.query_state
+				.into_iter()
+				.map(|(def_id, entry)| {
+					let QueryState::Resolved(location) = entry.state else {
+						unreachable!(
+							"build()'s own sweep visits every ast_nodes entry, so every query_state entry is Resolved by the time this runs"
+						)
+					};
+					(def_id, location)
+				})
+				.collect(),
 		}
 	}
 }
@@ -388,7 +413,7 @@ impl SignatureRegistry {
 /// index-aligned slots here; aliases and functions get indices as their
 /// signatures finish resolving.
 #[derive(Clone, Copy)]
-pub enum ItemLocation {
+pub enum SignatureLocation {
 	Trait(TraitIndex),
 	TraitImpl(TraitImplIndex),
 	InherentImpl(InherentImplIndex),
@@ -407,8 +432,22 @@ pub enum ItemLocation {
 /// (using `query_stack` to know what closed the loop) and substitutes
 /// `TypeIndex::ERROR`, then keeps going. Every item in the cycle still
 /// reaches its own `Done` normally.
+///
+/// `#[must_use]`: a bare `self.ensure_signature(..);` silently throwing away
+/// the result is always a mistake — either the caller wants the resolved
+/// `SignatureLocation` (and has to handle `Cycle`/`CycleReported` to get
+/// one safely) or it only wants the forcing side effect and should say so
+/// with an explicit `let _ = ..`, the way `TraitFunction`/`TraitConst`
+/// already do (with a comment proving why `Cycle` can't actually happen for
+/// that particular call).
+#[must_use]
 pub(super) enum SignatureStatus {
-	Resolved,
+	/// Carries *where* — not just *that* — the query's target now lives, so
+	/// a caller that only has a `DefId` (an associated type, a type alias,
+	/// ...) doesn't need a second `item_lookup` lookup to find out: the one
+	/// `ensure_signature` itself already did, right as it finished, is
+	/// handed back here instead of being thrown away.
+	Resolved(SignatureLocation),
 	/// Still being computed; the first re-entry has already been reported.
 	CycleReported,
 	/// The first re-entry into this unfinished signature.
@@ -427,13 +466,29 @@ pub(super) enum SignatureStatus {
 /// otherwise report the same finding twice, once per path, since nothing
 /// would otherwise distinguish "the first path to notice" from "a second
 /// path rediscovering what the first already reported." Unlike `Error`,
-/// this is never a final state: it's overwritten to `Done` unconditionally
+/// this is never a final state: it's overwritten to `Resolved` unconditionally
 /// once the query's own execution actually finishes, same as `InProgress`
 /// would be — a signature always has *some* value once resolution reaches
-/// `Done` (a failed piece becomes `TypeIndex::ERROR`, the same
+/// `Resolved` (a failed piece becomes `TypeIndex::ERROR`, the same
 /// recovery-value pattern `BindingTarget::Error` already uses at the
-/// identity layer), so there's never a case where `Done` itself needs a "no
-/// value" alternative the way `Resolved(T)` does for imports.
+/// identity layer), so there's never a case where reaching this state needs
+/// a "no value" alternative.
+///
+/// `Resolved` carries the `SignatureLocation` itself — folding in what used
+/// to be a separate `item_lookup: HashMap<DefId, SignatureLocation>` map.
+/// The two facts ("is this query done" and "where did it land") are only
+/// ever true or absent *together* for the kinds that actually go through
+/// this state machine (`TypeAlias`/`Function`/`Constant`/`TraitAssocType`),
+/// so carrying the payload here makes the "resolved but no location" /
+/// "location but still pending" combinations unrepresentable, rather than
+/// merely unobserved.
+///
+/// The other six item kinds (`Trait`/`TraitImpl`/`InherentImpl`/`Struct`/
+/// `Enum`/`TypeSet`) get a `SignatureLocation` too — every arm sets one as
+/// its last step, same as the lazy kinds — but their *identity* is knowable
+/// long before that, straight from `defs.rs`'s own output
+/// (`SignatureBuilder::ast_node`), which is what lets code read one of
+/// those without forcing this query at all.
 #[derive(Clone, Copy)]
 enum QueryState {
 	Pending,
@@ -442,42 +497,22 @@ enum QueryState {
 	/// finished — but a cycle closing back through it has already been
 	/// reported once. See the enum's own doc comment.
 	CycleReported,
-	Done,
+	Resolved(SignatureLocation),
 }
 
-/// Which question is being asked about a `DefId`. The state/stack this
-/// keys into (`query_state`/`query_stack` below) is shared across every
-/// kind — mirrors rustc's own query system: one active stack for cycle
-/// detection across all query kinds, even though each kind's actual
-/// *result* storage (`type_aliases`, `structs`, ...) stays completely
-/// separate, untouched by this. Only one variant exists right now; this
-/// exists so a later, genuinely separate question (e.g. a future body/const
-/// -evaluation pass) has a home to plug into without re-deriving this same
-/// state machine a second time.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum QueryKind {
-	Signature,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct QueryKey {
-	kind: QueryKind,
-	def_id: DefId,
-}
-
-impl QueryKey {
-	fn signature(def_id: DefId) -> Self {
-		Self {
-			kind: QueryKind::Signature,
-			def_id,
-		}
-	}
-}
-
-/// `ast_index` is this key's position in `SignatureBuilder::ast_nodes` — set
-/// once, at construction, from `defs.rs`'s parse-order record, so
+/// `ast_index` is this `DefId`'s position in `SignatureBuilder::ast_nodes`
+/// — set once, at construction, from `defs.rs`'s parse-order record, so
 /// `ensure_signature` never needs a second lookup to find the AST it's
 /// supposed to resolve.
+///
+/// Keyed directly by `DefId` (`query_state: HashMap<DefId, QueryEntry>`
+/// below) rather than through a `QueryKind`-tagged wrapper: signature
+/// resolution is the only query this engine runs — a body doesn't get one
+/// of its own, since (unlike a signature) it can't depend on anything that
+/// could loop back through it, so it has nothing to force demand-driven or
+/// detect a cycle in. Reintroduce the wrapper if a second kind that
+/// genuinely needs this same state machine ever materializes; until then
+/// it's speculative indirection with nothing to distinguish.
 struct QueryEntry {
 	ast_index: u32,
 	state: QueryState,
@@ -485,20 +520,17 @@ struct QueryEntry {
 
 /// One in-progress query frame — mirrors `rustc_query_system`'s own
 /// `QueryInfo`. `requested_at` is the span of the reference that demanded
-/// `key`, i.e. "the reason for which this was required"; `None` only for a
-/// top-level, non-reference demand (the per-`DefId` driver loop) —
+/// `def_id`, i.e. "the reason for which this was required"; `None` only for
+/// a top-level, non-reference demand (the per-`DefId` driver loop) —
 /// `resolve_type` always supplies `Some` when it recurses because of a
 /// written reference.
 #[derive(Clone, Copy)]
 struct QueryFrame {
-	key: QueryKey,
+	def_id: DefId,
 	requested_at: Option<SourceSpan>,
 }
 
-/// What a caller passes to `ensure_signature` — kept `DefId`-shaped (every
-/// call site already constructs one of these) rather than exposing
-/// `QueryKey` itself, since every current caller only ever means the
-/// `Signature` kind; it's wrapped into a `QueryKey` internally.
+/// What a caller passes to `ensure_signature`.
 #[derive(Clone, Copy)]
 pub(super) struct QueryInfo {
 	pub(super) def_id: DefId,
@@ -516,9 +548,8 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	// `pub(super)` from here down: read cross-file by `members.rs`, the same
 	// way `impls.rs` already needs `inherent_impl_dispatch`/
 	// `trait_impl_dispatch` below.
-	pub(super) item_lookup: HashMap<DefId, ItemLocation>,
-	query_state: HashMap<QueryKey, QueryEntry>,
-	/// In-progress queries, in call order — shared across every `QueryKind`.
+	query_state: HashMap<DefId, QueryEntry>,
+	/// In-progress queries, in call order.
 	query_stack: Vec<QueryFrame>,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
@@ -559,70 +590,21 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	) -> Self {
 		let stdlib_root = defs.package_namespaces[stdlib_package.as_usize()];
 
-		let mut item_lookup = HashMap::new();
-		for (index, trait_def) in defs.traits.iter().enumerate() {
-			item_lookup.insert(
-				trait_def.def_id,
-				ItemLocation::Trait(TraitIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-		for (index, impl_def) in defs.trait_impls.iter().enumerate() {
-			item_lookup.insert(
-				impl_def.def_id,
-				ItemLocation::TraitImpl(TraitImplIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-		for (index, impl_def) in defs.inherent_impls.iter().enumerate() {
-			item_lookup.insert(
-				impl_def.def_id,
-				ItemLocation::InherentImpl(InherentImplIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-		for (index, struct_def) in defs.structs.iter().enumerate() {
-			item_lookup.insert(
-				struct_def.def_id,
-				ItemLocation::Struct(StructIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-		for (index, enum_def) in defs.enums.iter().enumerate() {
-			item_lookup.insert(
-				enum_def.def_id,
-				ItemLocation::Enum(EnumIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-		// Last, deliberately: a typeset's backing trait and synthetic
-		// per-member impls (seeded just above, as ordinary `Trait`/
-		// `TraitImpl` entries) reuse the typeset's own `def_id` — see
-		// `defs::TypeSetDef`'s doc comment — so this insert intentionally
-		// overwrites theirs. Nothing ever looks up that `def_id` expecting
-		// `ItemLocation::Trait`/`TraitImpl` (a name bound to a typeset only
-		// ever resolves to `DefKind::TypeSet`), so `ItemLocation::TypeSet`
-		// is the only entry that's ever actually read back for it.
-		for (index, typeset_def) in defs.typesets.iter().enumerate() {
-			item_lookup.insert(
-				typeset_def.def_id,
-				ItemLocation::TypeSet(TypeSetIndex::new(
-					u32::try_from(index).unwrap(),
-				)),
-			);
-		}
-
-		let mut query_state: HashMap<QueryKey, QueryEntry> = ast_nodes
+		// A pre-seeded kind's own `SignatureLocation` used to be seeded here
+		// too, via a separate pass over `defs.traits`/`defs.structs`/... —
+		// removed, since it duplicated a fact `ast_nodes` already carries
+		// (`AstNodeRef::Trait { trait_index, .. }` etc.) and `ast_node`
+		// reads directly. `query_state` itself only ever needs `Pending`
+		// here; each item's own arm in `ensure_signature` sets its real
+		// `Resolved(SignatureLocation)` once it actually finishes — for a
+		// pre-seeded kind that's still worth doing (its *data*, not just its
+		// identity, isn't ready before then), just not from this loop.
+		let mut query_state: HashMap<DefId, QueryEntry> = ast_nodes
 			.iter()
 			.enumerate()
 			.map(|(index, entry)| {
 				(
-					QueryKey::signature(entry.def_id),
+					entry.def_id,
 					QueryEntry {
 						ast_index: u32::try_from(index).unwrap(),
 						state: QueryState::Pending,
@@ -660,12 +642,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			// Only ever absent when `ast_nodes` is deliberately partial (a
 			// test convenience) — real callers always pass the full prescan
 			// output, which covers every primitive by construction.
-			let key = QueryKey::signature(def_id);
-			let Some(entry) = query_state.get_mut(&key) else {
+			let Some(entry) = query_state.get_mut(&def_id) else {
 				continue;
 			};
 			let ast_index = entry.ast_index;
-			entry.state = QueryState::Done;
 
 			let index =
 				TypeAliasIndex::new(u32::try_from(type_aliases.len()).unwrap());
@@ -675,7 +655,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				type_params: TypeEnvId::ROOT,
 				target: type_index,
 			});
-			item_lookup.insert(def_id, ItemLocation::TypeAlias(index));
+			entry.state =
+				QueryState::Resolved(SignatureLocation::TypeAlias(index));
 		}
 
 		Self {
@@ -684,7 +665,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			defs,
 			ast_nodes,
 			stdlib_root,
-			item_lookup,
 			query_state,
 			query_stack: Vec::new(),
 			types: TypeInterner::new(),
@@ -879,20 +859,36 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			.implied_bounds
 	}
 
+	/// `def_id`'s own `AstNodeRef` — `defs.rs`'s output, so this is pure
+	/// identity: reading it never forces `ensure_signature` and is valid
+	/// the moment `SignatureBuilder` exists, before any query has run at
+	/// all. This is how a pre-seeded kind's own index
+	/// (`AstNodeRef::Trait { trait_index, .. }` and friends) is read
+	/// without forcing that item's signature — the six pre-seeded kinds no
+	/// longer get an early `SignatureLocation` seeded into `query_state`
+	/// the way they briefly got one seeded into the old, separate
+	/// `item_lookup` map; they get this instead, which was already sitting
+	/// there.
+	pub(super) fn ast_node(&self, def_id: DefId) -> &AstNodeRef<'ast> {
+		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
+	}
+
 	/// The demand-driven driver: computes `def_id`'s signature if it hasn't
 	/// been already. The two checks below are safe to return early from —
 	/// nothing has been pushed onto `query_stack` yet at that point. Past
 	/// that, no early `return`: `query_stack`'s frame has to pop and
-	/// `state` has to reach `Done` no matter which arm runs below, or this
-	/// query is left `InProgress` forever.
+	/// `state` has to reach `Resolved` no matter which arm runs below, or
+	/// this query is left `InProgress` forever.
 	pub(super) fn ensure_signature(
 		&mut self,
 		query: QueryInfo,
 	) -> SignatureStatus {
 		let def_id = query.def_id;
-		let key = QueryKey::signature(def_id);
-		match self.query_state[&key].state {
-			QueryState::Done => return SignatureStatus::Resolved,
+		match self.query_state[&def_id].state {
+			// Already finished on an earlier call.
+			QueryState::Resolved(location) => {
+				return SignatureStatus::Resolved(location);
+			}
 			QueryState::CycleReported => {
 				return SignatureStatus::CycleReported;
 			}
@@ -903,20 +899,21 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			// the same still-running query see `CycleReported` (silent)
 			// instead of `InProgress` (which would mean "report again").
 			QueryState::InProgress => {
-				self.query_state.get_mut(&key).unwrap().state =
+				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::CycleReported;
 				return SignatureStatus::Cycle;
 			}
 			QueryState::Pending => {}
 		}
 
-		self.query_state.get_mut(&key).unwrap().state = QueryState::InProgress;
+		self.query_state.get_mut(&def_id).unwrap().state =
+			QueryState::InProgress;
 		self.query_stack.push(QueryFrame {
-			key,
+			def_id,
 			requested_at: query.requested_at,
 		});
 
-		let ast_index = self.query_state[&key].ast_index;
+		let ast_index = self.query_state[&def_id].ast_index;
 		let ast_nodes = self.ast_nodes;
 		let entry = &ast_nodes[ast_index as usize];
 		let file_id = entry.file_id;
@@ -962,8 +959,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params: scope,
 					target,
 				});
-				self.item_lookup
-					.insert(def_id, ItemLocation::TypeAlias(index));
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::TypeAlias(index));
 			}
 			AstNodeRef::Trait { trait_index, item } => {
 				let ast::Item::Trait {
@@ -1028,6 +1025,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					implied_bounds: implied_bounds.into_boxed_slice(),
 					self_scope,
 				};
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Trait(trait_index));
 			}
 			AstNodeRef::TraitFunction { trait_index, item } => {
 				let ast::TraitItem::Function { signature, .. } = item else {
@@ -1061,8 +1060,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// Pre-allocate now — see the free-function `Function` arm's
 				// identical comment for why: this member's own explicit
 				// generic param can reference its own bound within its own
-				// signature (`fn get<T: HasSize>(x: T::Size)`), which needs
-				// `item_lookup[def_id]` to already resolve.
+				// signature (`fn get<T: HasSize>(x: T::Size)`). Unlike
+				// `item_lookup`, `query_state` already has an entry (still
+				// `Pending`) for every `DefId` from construction, so this
+				// pre-allocation is only for `self.functions`' own slot —
+				// `resolve_bound_member`'s self-reference case falls through
+				// correctly on `Pending` alone, no early `Resolved` needed
+				// (and setting one early here would be actively wrong: it
+				// would let a second, unrelated reference to this same
+				// function observe it as finished before `param_types`/
+				// `return_type` are actually backfilled below).
 				let index = FunctionIndex::new(
 					u32::try_from(self.functions.len()).unwrap(),
 				);
@@ -1071,8 +1078,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					param_types: Box::new([]),
 					return_type: TypeIndex::ERROR,
 				});
-				self.item_lookup
-					.insert(def_id, ItemLocation::Function(index));
 
 				// Positional, so a duplicate name still gets its own
 				// resolved slot in `param_types` — same reasoning as
@@ -1138,6 +1143,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.functions[usize::from(index)].param_types =
 					param_types.into_boxed_slice();
 				self.functions[usize::from(index)].return_type = return_type;
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Function(index));
 			}
 			AstNodeRef::TraitConst { trait_index, item } => {
 				let ast::TraitItem::Const { ty, .. } = item else {
@@ -1170,22 +1177,31 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					u32::try_from(self.constants.len()).unwrap(),
 				);
 				self.constants.push(ConstantSignature { ty: resolved_ty });
-				self.item_lookup
-					.insert(def_id, ItemLocation::Constant(index));
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Constant(index));
 			}
-			AstNodeRef::TraitAssocType { item, .. } => {
+			AstNodeRef::TraitAssocType { trait_index, item } => {
 				let ast::TraitItem::AssociatedType { name, bounds, .. } = item
 				else {
 					unreachable!()
 				};
 
+				// See `TraitFunction`'s identical force — same reasoning:
+				// this member's own declared bound can reference the
+				// trait's `Self` (`type Size: Memory where { X = Self::Y }`),
+				// which needs `self_scope` in scope to resolve at all.
+				let trait_def_id =
+					self.defs.traits[usize::from(trait_index)].def_id;
+				let _ = self.ensure_signature(QueryInfo {
+					def_id: trait_def_id,
+					requested_at: None,
+				});
+				let self_scope =
+					self.traits[usize::from(trait_index)].self_scope;
+
 				let resolved_bounds = match bounds {
-					Some(bound) => self.resolve_bounds(
-						file_id,
-						namespace,
-						TypeEnvId::ROOT,
-						bound,
-					),
+					Some(bound) => self
+						.resolve_bounds(file_id, namespace, self_scope, bound),
 					None => Box::new([]),
 				};
 				// Eager, same reasoning as `ParamBounds::implied_bounds`: a
@@ -1202,10 +1218,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					declared_bounds: resolved_bounds,
 					implied_bounds: implied_bounds.into_boxed_slice(),
 				});
-				self.item_lookup
-					.insert(def_id, ItemLocation::TraitAssocType(index));
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::TraitAssocType(
+						index,
+					));
 			}
-			AstNodeRef::RecordStruct { item } => {
+			AstNodeRef::RecordStruct { struct_index, item } => {
 				let ast::Item::RecordStruct {
 					type_params: ast_type_params,
 					fields,
@@ -1213,13 +1231,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				} = item
 				else {
 					unreachable!()
-				};
-				let Some(&ItemLocation::Struct(struct_index)) =
-					self.item_lookup.get(&def_id)
-				else {
-					unreachable!(
-						"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
-					)
 				};
 
 				let scope = self.resolve_generic_params(
@@ -1257,8 +1268,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params: scope,
 					field_types: field_types.into_boxed_slice(),
 				};
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Struct(
+						struct_index,
+					));
 			}
-			AstNodeRef::TupleStruct { item } => {
+			AstNodeRef::TupleStruct { struct_index, item } => {
 				let ast::Item::TupleStruct {
 					type_params: ast_type_params,
 					fields,
@@ -1266,13 +1281,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				} = item
 				else {
 					unreachable!()
-				};
-				let Some(&ItemLocation::Struct(struct_index)) =
-					self.item_lookup.get(&def_id)
-				else {
-					unreachable!(
-						"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
-					)
 				};
 
 				let scope = self.resolve_generic_params(
@@ -1306,6 +1314,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params: scope,
 					field_types: field_types.into_boxed_slice(),
 				};
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Struct(
+						struct_index,
+					));
 			}
 			AstNodeRef::Function { item } => {
 				let (ast::Item::Function { signature, .. }
@@ -1322,15 +1334,15 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					&signature.type_params,
 				);
 
-				// Pre-allocate the slot now, before resolving params/return
-				// type: a param's own bound can reference itself
-				// (`fn f<T: HasSize>(x: T::Size)`), which needs
-				// `item_lookup[def_id]` to already point somewhere.
-				// Structs get this for free via `SignatureBuilder::new`'s
-				// upfront pre-allocation; a function has no stable index
-				// that early, so this is the earliest point one can exist
-				// — backfilled with the real `param_types`/`return_type`
-				// once they're resolved, below.
+				// Pre-allocate `self.functions`' own slot now, before
+				// resolving params/return type — a function has no stable
+				// index any earlier than this. See `TraitFunction`'s
+				// identical comment for why this no longer also needs an
+				// early `query_state` write the way it needed an early
+				// `item_lookup` one: `query_state` already has a (`Pending`)
+				// entry for this `def_id` from construction, which is all
+				// `resolve_bound_member`'s self-reference case
+				// (`fn f<T: HasSize>(x: T::Size)`) actually needs.
 				let index = FunctionIndex::new(
 					u32::try_from(self.functions.len()).unwrap(),
 				);
@@ -1339,8 +1351,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					param_types: Box::new([]),
 					return_type: TypeIndex::ERROR,
 				});
-				self.item_lookup
-					.insert(def_id, ItemLocation::Function(index));
 
 				// Positional, so a duplicate name still gets its own
 				// resolved slot in `param_types` — same reasoning as
@@ -1400,6 +1410,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.functions[usize::from(index)].param_types =
 					param_types.into_boxed_slice();
 				self.functions[usize::from(index)].return_type = return_type;
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Function(index));
 			}
 			AstNodeRef::InherentImplBlock { item, block_index } => {
 				let ast::Item::InherentImpl {
@@ -1454,6 +1466,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					file_id,
 					target_spanned,
 				);
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::InherentImpl(
+						block_index,
+					));
 			}
 			AstNodeRef::TraitImplBlock { item, block_index } => {
 				let ast::Item::TraitImpl {
@@ -1488,12 +1504,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let trait_ref = trait_target.def_key().and_then(|key| {
 					let trait_index = match key.symbol_kind(self.defs) {
 						DefKind::Trait(trait_def_id) => {
-							let Some(&ItemLocation::Trait(index)) =
-								self.item_lookup.get(&trait_def_id)
+							// Identity only, not forced: a trait's own
+							// `TraitIndex` is carried directly on its
+							// `AstNodeRef::Trait` entry, known from `defs.rs`
+							// regardless of whether that trait's own
+							// signature has resolved yet.
+							let AstNodeRef::Trait { trait_index, .. } =
+								self.ast_node(trait_def_id)
 							else {
-								unreachable!()
+								unreachable!(
+									"a DefKind::Trait DefId always has an AstNodeRef::Trait entry"
+								)
 							};
-							index
+							*trait_index
 						}
 						other => {
 							let last = trait_name.last().unwrap();
@@ -1554,17 +1577,14 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						target_spanned,
 					);
 				}
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::TraitImpl(
+						block_index,
+					));
 			}
-			AstNodeRef::Enum { item } => {
+			AstNodeRef::Enum { enum_index, item } => {
 				let ast::Item::Enum { repr, name, .. } = item else {
 					unreachable!()
-				};
-				let Some(&ItemLocation::Enum(enum_index)) =
-					self.item_lookup.get(&def_id)
-				else {
-					unreachable!(
-						"every enum's EnumIndex is pre-seeded in SignatureBuilder::new"
-					)
 				};
 
 				let repr_type = match repr {
@@ -1599,6 +1619,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::Enum(enum_index));
 			}
 			AstNodeRef::TypeSet {
 				typeset_index,
@@ -1727,13 +1749,24 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.typesets[usize::from(typeset_index)] = TypeSetSignature {
 					members: resolved_members.into_boxed_slice(),
 				};
+				self.query_state.get_mut(&def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::TypeSet(
+						typeset_index,
+					));
 			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
 
 		self.query_stack.pop();
-		self.query_state.get_mut(&key).unwrap().state = QueryState::Done;
-		SignatureStatus::Resolved
+		// Every arm of the match above sets its own `Resolved(..)` state as
+		// its last step, so this is never anything else here.
+		let QueryState::Resolved(location) = self.query_state[&def_id].state
+		else {
+			unreachable!(
+				"every arm above sets Resolved(..) before falling through to here"
+			)
+		};
+		SignatureStatus::Resolved(location)
 	}
 
 	/// Resolves a written type. `Reject` diagnoses `_` at its own span and
@@ -1813,23 +1846,31 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								SignatureStatus::CycleReported => {
 									TypeIndex::ERROR
 								}
-								SignatureStatus::Resolved => {
-									let Some(&ItemLocation::TypeAlias(index)) =
-										self.item_lookup.get(&def_id)
-									else {
-										unreachable!()
-									};
+								SignatureStatus::Resolved(
+									SignatureLocation::TypeAlias(index),
+								) => {
 									self.type_aliases[usize::from(index)].target
 								}
+								SignatureStatus::Resolved(_) => unreachable!(
+									"a TypeAlias DefId always resolves to SignatureLocation::TypeAlias"
+								),
 							}
 						}
 						DefKind::Struct(struct_def_id) => {
-							let Some(&ItemLocation::Struct(struct_index)) =
-								self.item_lookup.get(&struct_def_id)
-							else {
-								unreachable!(
-									"every struct's StructIndex is pre-seeded in SignatureBuilder::new"
-								)
+							let struct_index = match self
+								.ast_node(struct_def_id)
+							{
+								AstNodeRef::RecordStruct {
+									struct_index,
+									..
+								}
+								| AstNodeRef::TupleStruct {
+									struct_index,
+									..
+								} => *struct_index,
+								_ => unreachable!(
+									"a DefKind::Struct DefId always has a RecordStruct/TupleStruct AstNodeRef entry"
+								),
 							};
 
 							// Identity only — deliberately not
@@ -1872,6 +1913,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						current,
 						BindingNamespace::Type,
 						segment.ident.inner,
+						SourceSpan::new(file_id, segment.ident.span),
 					) {
 						TypeMemberLookup::Found(member) => {
 							current = match member.kind {
@@ -2007,11 +2049,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		code: DiagnosticCode,
 		describe: impl Fn(&str) -> String,
 	) -> Diagnostic<FileId> {
-		let key = QueryKey::signature(def_id);
 		let position = self
 			.query_stack
 			.iter()
-			.position(|frame| frame.key == key)
+			.position(|frame| frame.def_id == def_id)
 			.expect(
 				"Cycle is only ever returned for a query currently in progress",
 			);
@@ -2029,7 +2070,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		};
 
 		let root_name =
-			item_name(self.ast_nodes, self.query_state[&key].ast_index);
+			item_name(self.ast_nodes, self.query_state[&def_id].ast_index);
 		let root_name_str = self.strings.resolve(root_name.inner).unwrap();
 
 		let mut diagnostic = Diagnostic::error()
@@ -2043,7 +2084,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		for (i, frame) in chain.iter().enumerate().skip(1) {
 			let name = item_name(
 				self.ast_nodes,
-				self.query_state[&frame.key].ast_index,
+				self.query_state[&frame.def_id].ast_index,
 			);
 			let name_str = self.strings.resolve(name.inner).unwrap();
 			diagnostic = diagnostic.with_label(
@@ -2104,6 +2145,23 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		)
 	}
 
+	/// Same family as `report_cyclic_implied_trait_bounds` — a trait
+	/// associated type's own declared bound (`type Size: PointerSize`)
+	/// closed a cycle while being forced, e.g. by
+	/// `members::ensure_assoc_type_signature`.
+	pub(super) fn report_cyclic_assoc_type_bound(
+		&self,
+		def_id: DefId,
+		closing_reference: SourceSpan,
+	) -> Diagnostic<FileId> {
+		self.report_cycle(
+			def_id,
+			closing_reference,
+			DiagnosticCode::CyclicTraitBounds,
+			|name| format!("computing the bound of associated type `{name}`"),
+		)
+	}
+
 	/// Renders the rustc-E0072-style diagnostic: every struct in the cycle
 	/// gets its own primary label (at its own declaration name) plus a
 	/// secondary label at the specific field that continues the cycle,
@@ -2117,11 +2175,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		def_id: DefId,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
-		let key = QueryKey::signature(def_id);
 		let position = self
 			.query_stack
 			.iter()
-			.position(|frame| frame.key == key)
+			.position(|frame| frame.def_id == def_id)
 			.expect(
 				"Cycle is only ever returned for a query currently in progress",
 			);
@@ -2142,7 +2199,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			.with_code(DiagnosticCode::RecursiveTypeWithoutIndirection.code());
 		let mut names = Vec::with_capacity(chain.len());
 		for (i, frame) in chain.iter().enumerate() {
-			let ast_index = self.query_state[&frame.key].ast_index;
+			let ast_index = self.query_state[&frame.def_id].ast_index;
 			let file_id = self.ast_nodes[ast_index as usize].file_id;
 			let name = item_name(self.ast_nodes, ast_index);
 			names.push(self.strings.resolve(name.inner).unwrap());
@@ -2402,32 +2459,40 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		let def_key = target.def_key()?;
 		match def_key.symbol_kind(self.defs) {
 			DefKind::Trait(def_id) => {
-				let Some(&ItemLocation::Trait(trait_index)) =
-					self.item_lookup.get(&def_id)
-				else {
-					unreachable!()
-				};
-				Some(trait_index)
-			}
-			// A `typeset` bound resolves to its own compiler-generated
-			// trait — `TypeSetIndex` (and, through it, `trait_index`) is
-			// Phase 1 data, seeded into `item_lookup` before any Phase 2
-			// resolution runs, exactly like `TraitIndex` above. No
-			// forcing needed here for the same reason the `Trait` arm
-			// doesn't force anything either: this function only answers
-			// "which item does this name refer to," not "is its data
-			// complete yet" — that's for whichever later consumer
-			// actually reads `traits`/dispatch to force, at
-			// its own point of need.
-			DefKind::TypeSet(def_id) => {
-				let Some(&ItemLocation::TypeSet(typeset_index)) =
-					self.item_lookup.get(&def_id)
+				let AstNodeRef::Trait { trait_index, .. } =
+					self.ast_node(def_id)
 				else {
 					unreachable!(
-						"every typeset's TypeSetIndex is pre-seeded in SignatureBuilder::new"
+						"a DefKind::Trait DefId always has an AstNodeRef::Trait entry"
 					)
 				};
-				Some(self.defs.typesets[usize::from(typeset_index)].trait_index)
+				Some(*trait_index)
+			}
+			// A `typeset` bound resolves to its own compiler-generated
+			// trait — `typeset_index` (and, through it, `trait_index`) is
+			// Phase 1 data, read straight off `defs.rs`'s own output. No
+			// forcing needed here for the same reason the `Trait` arm just
+			// above doesn't force anything either — see `ast_node`'s own
+			// doc comment: this function only answers "which item does
+			// this name refer to," not "is its data ready yet," and
+			// forcing here would actively break supertrait-cycle
+			// reporting (this runs *inside* `collect_bounds`, called
+			// while the referencing item's own query is still
+			// `InProgress` — forcing here could flip a genuine cycle
+			// straight to `CycleReported` before the one call site that
+			// can actually report it, `Trait`'s own supertrait-forcing
+			// loop, ever gets a turn).
+			DefKind::TypeSet(def_id) => {
+				let AstNodeRef::TypeSet { typeset_index, .. } =
+					self.ast_node(def_id)
+				else {
+					unreachable!(
+						"a DefKind::TypeSet DefId always has an AstNodeRef::TypeSet entry"
+					)
+				};
+				Some(
+					self.defs.typesets[usize::from(*typeset_index)].trait_index,
+				)
 			}
 			other => {
 				let last = segments
@@ -2464,13 +2529,13 @@ fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 			};
 			*name
 		}
-		AstNodeRef::RecordStruct { item } => {
+		AstNodeRef::RecordStruct { item, .. } => {
 			let ast::Item::RecordStruct { name, .. } = item else {
 				unreachable!()
 			};
 			*name
 		}
-		AstNodeRef::TupleStruct { item } => {
+		AstNodeRef::TupleStruct { item, .. } => {
 			let ast::Item::TupleStruct { name, .. } = item else {
 				unreachable!()
 			};
@@ -2757,7 +2822,7 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a trait");
 			};
-			let Some(&ItemLocation::Trait(index)) =
+			let Some(&SignatureLocation::Trait(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Trait location for `{path}`");
@@ -2780,7 +2845,7 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a typeset");
 			};
-			let Some(&ItemLocation::TypeSet(index)) =
+			let Some(&SignatureLocation::TypeSet(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a TypeSet location for `{path}`");
@@ -2844,7 +2909,7 @@ mod tests {
 			let MemberKind::AssociatedType(def_id) = member.kind else {
 				panic!("expected `{name}` to be an associated type");
 			};
-			let Some(&ItemLocation::TraitAssocType(index)) =
+			let Some(&SignatureLocation::TraitAssocType(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a TraitAssocType location for `{name}`");
@@ -2879,7 +2944,7 @@ mod tests {
 			let MemberKind::Function(def_id) = member.kind else {
 				panic!("expected `{name}` to be a function");
 			};
-			let Some(&ItemLocation::Function(index)) =
+			let Some(&SignatureLocation::Function(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Function location for `{name}`");
@@ -2909,7 +2974,7 @@ mod tests {
 			let MemberKind::Constant(def_id) = member.kind else {
 				panic!("expected `{name}` to be a const");
 			};
-			let Some(&ItemLocation::Constant(index)) =
+			let Some(&SignatureLocation::Constant(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Constant location for `{name}`");
@@ -2923,7 +2988,7 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a type alias");
 			};
-			let Some(&ItemLocation::TypeAlias(index)) =
+			let Some(&SignatureLocation::TypeAlias(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a TypeAlias location for `{path}`");
@@ -2937,7 +3002,7 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a struct");
 			};
-			let Some(&ItemLocation::Struct(index)) =
+			let Some(&SignatureLocation::Struct(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Struct location for `{path}`");
@@ -2967,7 +3032,7 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a function");
 			};
-			let Some(&ItemLocation::Function(index)) =
+			let Some(&SignatureLocation::Function(index)) =
 				self.signatures.item_lookup.get(&def_id)
 			else {
 				panic!("expected a Function location for `{path}`");
@@ -4070,6 +4135,63 @@ mod tests {
 					*base, sig.param_types[0],
 					"base should be `self`'s own type — the trait's Self"
 				);
+			}
+			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+		}
+	}
+
+	/// Regression test: `TraitAssocType`'s own arm used to resolve at
+	/// `TypeEnvId::ROOT` instead of forcing the trait header and using its
+	/// `self_scope`, the way `TraitFunction`/`TraitConst` already did — so
+	/// `Self` silently failed to resolve inside a declared bound's own
+	/// `where { .. }` clause (`type Item: Elem where { Assoc = Self::Item }`
+	/// below). Fixed to mirror its sibling arms exactly.
+	#[test]
+	fn assoc_type_declared_bound_can_reference_the_traits_own_self() {
+		let case = TestCase::new(indoc! {"
+			trait Elem { type Assoc; }
+			trait Container {
+				type Item: Elem where { Assoc = Self::Item };
+			}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let sig = case.assoc_type_signature("Container", "Item");
+		let bound = case.signatures.bounds.get(sig.declared_bounds[0]);
+		let SourceAssocBinding {
+			kind: BindingRequirement::Equals(value),
+			..
+		} = &bound.bindings[0]
+		else {
+			panic!("expected an `Assoc = ..` binding");
+		};
+
+		let container_index = case.trait_index("Container");
+		match case.signatures.types.resolve(value.inner) {
+			Type::AssocTypeProjection {
+				trait_index, base, ..
+			} => {
+				assert_eq!(*trait_index, container_index);
+				match case.signatures.types.resolve(*base) {
+					Type::TypeParam {
+						owner, param_index, ..
+					} => {
+						assert_eq!(
+							*owner,
+							case.defs.traits[usize::from(container_index)]
+								.def_id
+						);
+						assert_eq!(
+							*param_index, 0,
+							"should resolve to the trait's own Self"
+						);
+					}
+					other => {
+						panic!(
+							"expected base to be Self (a TypeParam), got {other:?}"
+						)
+					}
+				}
 			}
 			other => panic!("expected an AssocTypeProjection, got {other:?}"),
 		}

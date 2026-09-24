@@ -9,14 +9,17 @@
 
 use string_interner::symbol::SymbolU32;
 
+use crate::diagnostics::SourceSpan;
+
 use super::bounds::MergedTraitBound;
 use super::defs::{
-	BindingKey, BindingNamespace, InherentImplIndex, MemberKind,
+	AstNodeRef, BindingKey, BindingNamespace, InherentImplIndex, MemberKind,
 	TraitImplIndex, TraitIndex,
 };
 use super::impls::ImplTarget;
 use super::signatures::{
-	AssocTypeIndex, ItemLocation, QueryInfo, SignatureBuilder,
+	AssocTypeIndex, QueryInfo, SignatureBuilder, SignatureLocation,
+	SignatureStatus,
 };
 use super::types::{Type, TypeIndex};
 
@@ -62,17 +65,21 @@ pub(super) enum MemberSource {
 impl SignatureBuilder<'_, '_> {
 	/// Resolves `name` (in binding tier `tier` — `Value` for a
 	/// function/const, `Type` for an associated type) as a member of
-	/// `receiver`.
+	/// `receiver`. `reference` is the span of whatever named `receiver` in
+	/// the first place — threaded through to `ensure_assoc_type_signature`,
+	/// the one path below that can force another item's signature and so
+	/// needs a real "why" to attach to a cycle diagnostic.
 	pub(super) fn resolve_type_member(
 		&mut self,
 		receiver: TypeIndex,
 		tier: BindingNamespace,
 		name: SymbolU32,
+		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		let key = BindingKey::new(tier, name);
 		match ImplTarget::from_type(self.types.resolve(receiver)) {
 			Some(target) => self.resolve_concrete_member(target, key),
-			None => self.resolve_bound_member(receiver, key),
+			None => self.resolve_bound_member(receiver, key, reference),
 		}
 	}
 
@@ -154,6 +161,7 @@ impl SignatureBuilder<'_, '_> {
 		&mut self,
 		receiver: TypeIndex,
 		key: BindingKey,
+		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		match self.types.resolve(receiver) {
 			Type::TypeParam {
@@ -169,7 +177,18 @@ impl SignatureBuilder<'_, '_> {
 				// already-diagnosed transitive closure. Prepending the
 				// reflexive `Self: ThisTrait` entry is all that's missing to
 				// answer this lookup directly, no merge needed.
-				if let ItemLocation::Trait(idx) = self.item_lookup[&owner] {
+				//
+				// `ast_node`, not `signature_location`/`ensure_signature`:
+				// `owner` can be the *currently in-progress* item's own
+				// `DefId` (a function's own generic param references
+				// itself — `fn f<T: HasSize>(x: T::Size)` — via `owner`),
+				// so this has to work identically whether `owner`'s own
+				// query has finished or not. It's a pure "is this a
+				// trait" identity question either way.
+				if let AstNodeRef::Trait { trait_index: idx, .. } =
+					self.ast_node(owner)
+				{
+					let idx = *idx;
 					let trait_sig = &self.traits[usize::from(idx)];
 					return self.candidates_from_implied(
 						&trait_sig.implied_bounds,
@@ -190,9 +209,11 @@ impl SignatureBuilder<'_, '_> {
 				..
 			} => {
 				let (trait_index, assoc_name) = (*trait_index, *assoc_name);
-				let Some(index) =
-					self.assoc_type_index(trait_index, assoc_name)
-				else {
+				let Some(index) = self.ensure_assoc_type_signature(
+					trait_index,
+					assoc_name,
+					reference,
+				) else {
 					return TypeMemberLookup::NotFound;
 				};
 				self.candidates_from_implied(
@@ -242,16 +263,29 @@ impl SignatureBuilder<'_, '_> {
 		Self::classify(candidates)
 	}
 
-	/// Resolves `assoc_name` against trait `trait_index`'s own associated
-	/// types, forcing that one associated type's own signature first (same
-	/// reasoning as forcing `Self` before reading it). `None` if the name
-	/// isn't actually one of the trait's associated types — already
-	/// diagnosed wherever this projection was built, since a projection is
-	/// only ever constructed against a name the trait really declares.
-	fn assoc_type_index(
+	/// Ensures trait `trait_index`'s associated type named `assoc_name` has
+	/// a resolved signature, and returns its index — `type Size: PointerSize`
+	/// doesn't get its own signature computed until something demands it,
+	/// same reasoning as forcing `Self` before reading it.
+	///
+	/// `None` covers two situations a caller doesn't need to tell apart:
+	/// `assoc_name` isn't actually one of `trait_index`'s associated types
+	/// (already diagnosed wherever this projection/binding was built, since
+	/// one is only ever constructed against a name the trait really
+	/// declares), or the query closed a cycle — diagnosed here, once, by
+	/// whichever call is the first to discover it (see `SignatureStatus`'s
+	/// own `CycleReported` doc comment for why a second, independent
+	/// rediscovery has to stay silent instead of reporting again).
+	///
+	/// `pub(super)`: also the entry point `bounds.rs` uses to find an
+	/// associated-type binding's own declared bound (`type Size: Bound`)
+	/// when checking a written `where { Size = T }` against it — see
+	/// `satisfaction::type_satisfies_trait`.
+	pub(super) fn ensure_assoc_type_signature(
 		&mut self,
 		trait_index: TraitIndex,
 		assoc_name: SymbolU32,
+		requested_at: SourceSpan,
 	) -> Option<AssocTypeIndex> {
 		let key = BindingKey::ty(assoc_name);
 		let &member_index = self.defs.traits[usize::from(trait_index)]
@@ -264,16 +298,24 @@ impl SignatureBuilder<'_, '_> {
 		else {
 			return None;
 		};
-		let _ = self.ensure_signature(QueryInfo {
+		match self.ensure_signature(QueryInfo {
 			def_id,
-			requested_at: None,
-		});
-		let Some(&ItemLocation::TraitAssocType(index)) =
-			self.item_lookup.get(&def_id)
-		else {
-			unreachable!()
-		};
-		Some(index)
+			requested_at: Some(requested_at),
+		}) {
+			SignatureStatus::Resolved(SignatureLocation::TraitAssocType(
+				index,
+			)) => Some(index),
+			SignatureStatus::Resolved(_) => unreachable!(
+				"an AssociatedType member's DefId always resolves to SignatureLocation::TraitAssocType"
+			),
+			SignatureStatus::Cycle => {
+				let diagnostic =
+					self.report_cyclic_assoc_type_bound(def_id, requested_at);
+				self.diagnostics.push(diagnostic);
+				None
+			}
+			SignatureStatus::CycleReported => None,
+		}
 	}
 
 	fn classify(mut candidates: Vec<TypeMemberTarget>) -> TypeMemberLookup {

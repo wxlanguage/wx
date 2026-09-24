@@ -315,12 +315,15 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 	},
 	RecordStruct {
+		struct_index: StructIndex,
 		item: &'ast ast::Item,
 	},
 	TupleStruct {
+		struct_index: StructIndex,
 		item: &'ast ast::Item,
 	},
 	Enum {
+		enum_index: EnumIndex,
 		item: &'ast ast::Item,
 	},
 	Global {
@@ -1982,6 +1985,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						pub_span: field.pub_span,
 					});
 				}
+				let struct_index =
+					StructIndex::new(u32::try_from(self.structs.len()).unwrap());
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
@@ -1996,7 +2001,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::RecordStruct { item },
+					node: AstNodeRef::RecordStruct { struct_index, item },
 				});
 			}
 			ast::Item::TupleStruct {
@@ -2039,6 +2044,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
+				let struct_index =
+					StructIndex::new(u32::try_from(self.structs.len()).unwrap());
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
@@ -2057,7 +2064,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::TupleStruct { item },
+					node: AstNodeRef::TupleStruct { struct_index, item },
 				});
 			}
 			ast::Item::Enum {
@@ -2125,7 +2132,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Enum { item },
+					node: AstNodeRef::Enum { enum_index, item },
 				});
 			}
 			ast::Item::TypeAlias {
