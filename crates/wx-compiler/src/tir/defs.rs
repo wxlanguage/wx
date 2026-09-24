@@ -10,7 +10,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
-	ast::{self, DefId, Spanned, StringInterner},
+	ast::{self, DefId, Keyword, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	index::index_newtype,
 	small_vec::SmallVec,
@@ -45,6 +45,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	structs: Vec<StructDef>,
 	enums: Vec<EnumDef>,
 	typesets: Vec<TypeSetDef>,
+	functions: Vec<FunctionDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
@@ -251,6 +252,19 @@ pub struct TypeSetDef {
 	pub member_impls: Box<[TraitImplIndex]>,
 }
 
+/// Shared by a free function, a trait member, and an impl method — one
+/// arena, the same reason `signatures::FunctionSignature` covers all
+/// three. Field *types* stay in that struct, index-aligned with `params`
+/// here, same split as `StructDef`/`StructSignature`.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct FunctionDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIndex,
+	pub name: Spanned<SymbolU32>,
+	pub params: Box<[Spanned<SymbolU32>]>,
+}
+
 index_newtype!(LocalDefIndex);
 index_newtype!(MemberIndex);
 index_newtype!(ModuleDeclIndex);
@@ -275,6 +289,11 @@ index_newtype!(EnumIndex);
 // them via `ensure_signature` before `signatures.rs` would otherwise reach
 // this typeset in the general sweep.
 index_newtype!(TypeSetIndex);
+// Pre-allocated here (like `StructIndex`) — shared by a free function, a
+// trait member, and an impl method alike (see `FunctionDef`), so a
+// self-/mutually-referencing signature (`fn f<T: HasSize>(x: T::Size)`)
+// needs a stable index the same way a struct field does.
+index_newtype!(FunctionIndex);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -313,6 +332,7 @@ pub(super) struct AstEntry<'ast> {
 pub(super) enum AstNodeRef<'ast> {
 	Function {
 		item: &'ast ast::Item,
+		function_index: FunctionIndex,
 	},
 	RecordStruct {
 		struct_index: StructIndex,
@@ -349,6 +369,7 @@ pub(super) enum AstNodeRef<'ast> {
 	TraitFunction {
 		trait_index: TraitIndex,
 		item: &'ast ast::TraitItem,
+		function_index: FunctionIndex,
 	},
 	TraitConst {
 		trait_index: TraitIndex,
@@ -365,6 +386,7 @@ pub(super) enum AstNodeRef<'ast> {
 	TraitImplFunction {
 		item: &'ast ast::ImplItem,
 		block_index: TraitImplIndex,
+		function_index: FunctionIndex,
 	},
 	TraitImplConstant {
 		item: &'ast ast::ImplItem,
@@ -381,6 +403,7 @@ pub(super) enum AstNodeRef<'ast> {
 	InherentImplFunction {
 		item: &'ast ast::ImplItem,
 		block_index: InherentImplIndex,
+		function_index: FunctionIndex,
 	},
 	InherentImplConst {
 		item: &'ast ast::ImplItem,
@@ -420,6 +443,7 @@ pub(super) struct DefinitionRegistry {
 	pub structs: Vec<StructDef>,
 	pub enums: Vec<EnumDef>,
 	pub typesets: Vec<TypeSetDef>,
+	pub functions: Vec<FunctionDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
@@ -1316,6 +1340,7 @@ pub struct ImportDeclaration {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum MemberKind {
 	Function(DefId),
+	Method(DefId),
 	Constant(DefId),
 	AssociatedType(DefId),
 }
@@ -1324,6 +1349,7 @@ impl MemberKind {
 	pub fn def_id(self) -> DefId {
 		match self {
 			Self::Function(id) => id,
+			Self::Method(id) => id,
 			Self::Constant(id) => id,
 			Self::AssociatedType(id) => id,
 		}
@@ -1332,7 +1358,9 @@ impl MemberKind {
 	pub fn binding_namespace(self) -> BindingNamespace {
 		match self {
 			Self::AssociatedType(_) => BindingNamespace::Type,
-			Self::Function(_) | Self::Constant(_) => BindingNamespace::Value,
+			Self::Function(_) | Self::Method(_) | Self::Constant(_) => {
+				BindingNamespace::Value
+			}
 		}
 	}
 }
@@ -1549,6 +1577,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			structs: Vec::new(),
 			enums: Vec::new(),
 			typesets: Vec::new(),
+			functions: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1594,6 +1623,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			structs: builder.structs,
 			enums: builder.enums,
 			typesets: builder.typesets,
+			functions: builder.functions,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
@@ -1699,6 +1729,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		let index =
 			TypeSetIndex::new(u32::try_from(self.typesets.len()).unwrap());
 		self.typesets.push(item);
+		index
+	}
+
+	#[inline]
+	fn push_function(&mut self, item: FunctionDef) -> FunctionIndex {
+		let index =
+			FunctionIndex::new(u32::try_from(self.functions.len()).unwrap());
+		self.functions.push(item);
 		index
 	}
 
@@ -1909,11 +1947,60 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					signature.name.span,
 				);
+
+				// `self` has no meaning in a free function — no `Self` to
+				// bind it to — so every occurrence is a position error,
+				// same diagnostic as one in the wrong spot within a
+				// method's own list (`validate_method_params`).
+				let mut params: Vec<Spanned<SymbolU32>> =
+					Vec::with_capacity(signature.params.len());
+				for param in signature.params.iter() {
+					let p = &param.inner.inner;
+					let name = p.name;
+
+					if let Some(&first) =
+						params.iter().find(|s| s.inner == name.inner)
+					{
+						self.diagnostics.push(
+							report_duplicate_function_parameter(
+								self.strings,
+								file_id,
+								name,
+								first,
+							),
+						);
+					}
+
+					if name.inner == Keyword::SelfLower.symbol() {
+						self.diagnostics.push(report_self_param_position(
+							file_id, name.span,
+						));
+					} else if p.ty.is_none() {
+						self.diagnostics.push(report_missing_parameter_type(
+							self.strings,
+							file_id,
+							name,
+						));
+					}
+
+					params.push(name);
+				}
+				let function_index = self.push_function(FunctionDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					name: signature.name,
+					params: params.into_boxed_slice(),
+				});
+
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Function { item },
+					node: AstNodeRef::Function {
+						item,
+						function_index,
+					},
 				});
 			}
 			ast::Item::Global {
@@ -1985,8 +2072,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						pub_span: field.pub_span,
 					});
 				}
-				let struct_index =
-					StructIndex::new(u32::try_from(self.structs.len()).unwrap());
+				let struct_index = StructIndex::new(
+					u32::try_from(self.structs.len()).unwrap(),
+				);
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
@@ -2044,8 +2132,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				let struct_index =
-					StructIndex::new(u32::try_from(self.structs.len()).unwrap());
+				let struct_index = StructIndex::new(
+					u32::try_from(self.structs.len()).unwrap(),
+				);
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
@@ -2099,10 +2188,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(
-						DefKind::Enum(variants_namespace),
-						name.span,
-					),
+					ItemDef::new(DefKind::Enum(variants_namespace), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2305,8 +2391,23 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let mut bindings: HashMap<BindingKey, MemberIndex> =
 					HashMap::new();
 				for item in items.iter() {
+					let member_index =
+						MemberIndex::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, id, .. } => {
+							let params = self
+								.scan_method_params(file_id, &signature.params);
+							let is_method = params.first().is_some_and(|p| {
+								p.inner == Keyword::SelfLower.symbol()
+							});
+							let function_index =
+								self.push_function(FunctionDef {
+									def_id: *id,
+									file_id,
+									namespace,
+									name: signature.name,
+									params,
+								});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
@@ -2314,11 +2415,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitFunction {
 									trait_index,
 									item: &item.inner.inner,
+									function_index,
 								},
 							});
 							(
 								TraitMemberDef {
-									kind: MemberKind::Function(*id),
+									kind: if is_method {
+										MemberKind::Method(*id)
+									} else {
+										MemberKind::Function(*id)
+									},
 									accesses: Vec::new(),
 									span: signature.name.span,
 								},
@@ -2364,8 +2470,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 					};
-					let member_index =
-						MemberIndex::new(u32::try_from(members.len()).unwrap());
 					if let Some(collision) = bindings.get(&key).copied() {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
@@ -2425,6 +2529,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							pub_span,
 							..
 						} => {
+							let params = self
+								.scan_method_params(file_id, &signature.params);
+							let is_method = params.first().is_some_and(|p| {
+								p.inner == Keyword::SelfLower.symbol()
+							});
+							let function_index =
+								self.push_function(FunctionDef {
+									def_id: *id,
+									file_id,
+									namespace,
+									name: signature.name,
+									params,
+								});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
@@ -2432,12 +2549,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::InherentImplFunction {
 									item: &impl_item.inner.inner,
 									block_index,
+									function_index,
 								},
 							});
 							(
 								InherentMemberDef {
 									accesses: Vec::new(),
-									kind: MemberKind::Function(*id),
+									kind: if is_method {
+										MemberKind::Method(*id)
+									} else {
+										MemberKind::Function(*id)
+									},
 									visibility: Visibility::from(*pub_span),
 									span: signature.name.span,
 								},
@@ -2734,8 +2856,23 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					node: AstNodeRef::TraitImplBlock { item, block_index },
 				});
 				for item in items.iter() {
+					let member_index =
+						MemberIndex::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::ImplItem::Function { id, signature, .. } => {
+							let params = self
+								.scan_method_params(file_id, &signature.params);
+							let is_method = params.first().is_some_and(|p| {
+								p.inner == Keyword::SelfLower.symbol()
+							});
+							let function_index =
+								self.push_function(FunctionDef {
+									def_id: *id,
+									file_id,
+									namespace,
+									name: signature.name,
+									params,
+								});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
@@ -2743,12 +2880,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitImplFunction {
 									item: &item.inner.inner,
 									block_index,
+									function_index,
 								},
 							});
 							(
 								TraitMemberDef {
 									accesses: Vec::new(),
-									kind: MemberKind::Function(*id),
+									kind: if is_method {
+										MemberKind::Method(*id)
+									} else {
+										MemberKind::Function(*id)
+									},
 									span: signature.name.span,
 								},
 								BindingKey::value(signature.name.inner),
@@ -2794,8 +2936,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						}
 					};
 
-					let member_index =
-						MemberIndex::new(u32::try_from(members.len()).unwrap());
 					if let Some(collision) = bindings.get(&key).copied() {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
@@ -2896,6 +3036,53 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 		}
 	}
+
+	/// Validates a trait/impl method's parameter list: every name unique,
+	/// `self` (if present) only as the very first parameter, every other
+	/// parameter explicitly typed. Whether `self` is actually present —
+	/// i.e. whether this member is `MemberKind::Method` or
+	/// `MemberKind::Function` — is for the caller to read straight off
+	/// `params.first()` against `Keyword::SelfLower.symbol()`, same
+	/// constant-time check this uses; nothing here needs to hand that
+	/// fact back out.
+	fn scan_method_params(
+		&mut self,
+		file_id: FileId,
+		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+	) -> Box<[Spanned<SymbolU32>]> {
+		let mut names: Vec<Spanned<SymbolU32>> =
+			Vec::with_capacity(params.len());
+		for (index, param) in params.iter().enumerate() {
+			let p = &param.inner.inner;
+			let name = p.name;
+
+			if let Some(&first) = names.iter().find(|s| s.inner == name.inner) {
+				self.diagnostics.push(report_duplicate_function_parameter(
+					self.strings,
+					file_id,
+					name,
+					first,
+				));
+			}
+
+			let is_self = name.inner == Keyword::SelfLower.symbol();
+			if is_self {
+				if index != 0 {
+					self.diagnostics
+						.push(report_self_param_position(file_id, name.span));
+				}
+			} else if p.ty.is_none() {
+				self.diagnostics.push(report_missing_parameter_type(
+					self.strings,
+					file_id,
+					name,
+				));
+			}
+
+			names.push(name);
+		}
+		names.into_boxed_slice()
+	}
 }
 
 fn report_duplicate_struct_field(
@@ -2917,6 +3104,62 @@ fn report_duplicate_struct_field(
 			SourceSpan::new(file_id, first.span)
 				.secondary_label()
 				.with_message(format!("`{name_str}` first declared here")),
+		)
+}
+
+fn report_duplicate_function_parameter(
+	strings: &StringInterner,
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+	first: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::DuplicateFunctionParameter.code())
+		.with_message(format!(
+			"identifier `{name_str}` is bound more than once in this parameter list"
+		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("used as parameter more than once"),
+		)
+		.with_label(
+			SourceSpan::new(file_id, first.span)
+				.secondary_label()
+				.with_message(format!(
+					"first use of `{name_str}` as a parameter"
+				)),
+		)
+}
+
+fn report_self_param_position(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::SelfParamPosition.code())
+		.with_message(
+			"`self` parameter is only allowed as the first parameter of an associated function",
+		)
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+}
+
+fn report_missing_parameter_type(
+	strings: &StringInterner,
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingParameterType.code())
+		.with_message(format!(
+			"parameter `{name_str}` requires an explicit type"
+		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("expected `: Type` here"),
 		)
 }
 
@@ -3017,13 +3260,13 @@ mod tests {
 			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
 		}
 
-		/// Resolves `path` (`::`-separated) as a type-position path from the
-		/// root namespace, via the real `PathResolver` — the same mechanism
-		/// production code uses, so a test asking for `"a::Foo"` gets
-		/// whatever namespacing/shadowing rules would actually pick, not
-		/// just *an* item with that spelling somewhere. Mirrors
+		/// Resolves `path` (`::`-separated) from the root namespace in
+		/// binding tier `ns`, via the real `PathResolver` — the same
+		/// mechanism production code uses, so a test asking for `"a::Foo"`
+		/// gets whatever namespacing/shadowing rules would actually pick,
+		/// not just *an* item with that spelling somewhere. Mirrors
 		/// `signatures.rs`'s own `TestCase::resolve`.
-		fn resolve(&self, path: &str) -> DefKind {
+		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
 			let root = self.root_namespace();
 			let file_id = self.defs.namespaces[usize::from(root)].file_id;
 			let stdlib_root = self.defs.package_namespaces
@@ -3055,7 +3298,7 @@ mod tests {
 				file_id,
 				root,
 				&segments,
-				BindingNamespace::Type,
+				ns,
 			);
 			let def_key = target.def_key().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
@@ -3087,6 +3330,23 @@ mod tests {
 				.map(|binding| binding.target)
 		}
 
+		/// `resolve`'s `DefKind::Function` case, followed to its own
+		/// `FunctionDef` entry.
+		fn function_def(&self, name: &str) -> &FunctionDef {
+			let DefKind::Function(def_id) =
+				self.resolve(BindingNamespace::Value, name)
+			else {
+				panic!("expected `{name}` to be a function");
+			};
+			self.defs
+				.functions
+				.iter()
+				.find(|f| f.def_id == def_id)
+				.unwrap_or_else(|| {
+					panic!("`{name}` should have its own FunctionDef entry")
+				})
+		}
+
 		/// Follows a bound name to the namespace it names — e.g. the
 		/// namespace a `mod inner { ... }` or `mod inner;` declares.
 		fn child_namespace(
@@ -3102,9 +3362,10 @@ mod tests {
 			};
 			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
 				.items[usize::from(def_key.def_idx)]
-				.kind;
-			kind.as_namespace()
-				.unwrap_or_else(|| panic!("`{name}` is not a namespace: {kind:?}"))
+			.kind;
+			kind.as_namespace().unwrap_or_else(|| {
+				panic!("`{name}` is not a namespace: {kind:?}")
+			})
 		}
 	}
 
@@ -3328,7 +3589,9 @@ mod tests {
 		// `Point` isn't necessarily `defs.structs[0]` — the real stdlib
 		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
 		// `RawPtr`), so look it up by name rather than assuming an index.
-		let DefKind::Struct(point_def_id) = case.resolve("Point") else {
+		let DefKind::Struct(point_def_id) =
+			case.resolve(BindingNamespace::Type, "Point")
+		else {
 			panic!("expected `Point` to be a struct")
 		};
 		let struct_def = case
@@ -3351,6 +3614,83 @@ mod tests {
 			lookup.get(&fields[1].name.inner),
 			Some(&FieldIndex::new(0))
 		);
+	}
+
+	#[test]
+	fn duplicate_function_parameter_is_reported_but_keeps_its_own_slot() {
+		let case = TestCase::new(indoc! {"
+			fn f(x: i32, x: i32) {}
+		"});
+
+		case.diagnostics()
+			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
+
+		// Positional, same as a duplicate struct field — the second `x`
+		// still gets its own slot rather than being dropped.
+		let params = &case.function_def("f").params;
+		assert_eq!(params.len(), 2);
+		assert_eq!(params[0].inner, params[1].inner);
+	}
+
+	#[test]
+	fn self_in_a_free_function_is_rejected() {
+		let case = TestCase::new(indoc! {"
+			fn f(self) {}
+		"});
+
+		case.diagnostics().assert_error(DiagnosticCode::SelfParamPosition);
+	}
+
+	#[test]
+	fn self_not_first_in_a_method_is_rejected() {
+		let case = TestCase::new(indoc! {"
+			trait T {
+				fn f(x: i32, self);
+			}
+		"});
+
+		case.diagnostics().assert_error(DiagnosticCode::SelfParamPosition);
+	}
+
+	#[test]
+	fn missing_parameter_type_is_reported() {
+		let case = TestCase::new(indoc! {"
+			fn f(x) {}
+		"});
+
+		case.diagnostics().assert_error(DiagnosticCode::MissingParameterType);
+	}
+
+	#[test]
+	fn self_as_the_first_method_parameter_is_accepted_and_classified() {
+		let mut case = TestCase::new(indoc! {"
+			trait T {
+				fn f(self);
+			}
+		"});
+
+		case.diagnostics().assert_no_errors();
+
+		let DefKind::Trait(trait_def_id) =
+			case.resolve(BindingNamespace::Type, "T")
+		else {
+			panic!("expected `T` to be a trait");
+		};
+		let trait_def = case
+			.defs
+			.traits
+			.iter()
+			.find(|t| t.def_id == trait_def_id)
+			.expect("T should have its own TraitDef entry");
+		let f_symbol = case.graph.strings.get_or_intern("f");
+		let &member_index = trait_def
+			.bindings
+			.get(&BindingKey::value(f_symbol))
+			.expect("expected `T` to have a function `f`");
+		assert!(matches!(
+			trait_def.members[usize::from(member_index)].kind,
+			MemberKind::Method(_)
+		));
 	}
 
 	#[test]

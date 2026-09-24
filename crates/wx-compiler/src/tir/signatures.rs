@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-use crate::ast::{self, DefId, Spanned, StringInterner};
+use crate::ast::{self, DefId, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::index::index_newtype;
 use crate::vfs::{FileId, PackageId};
@@ -42,9 +42,9 @@ use super::bounds::{
 use super::bounds::{MergedBindingKind, equals_type};
 use super::defs::{
 	AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
-	DefinitionRegistry, EnumIndex, InherentImplIndex, MemberKind,
-	NamespaceIndex, NamespaceKind, StructIndex, TraitImplIndex, TraitIndex,
-	TypeSetIndex,
+	DefinitionRegistry, EnumIndex, FunctionIndex, InherentImplIndex,
+	MemberKind, NamespaceIndex, NamespaceKind, StructIndex, TraitImplIndex,
+	TraitIndex, TypeSetIndex,
 };
 use super::impls::ImplTarget;
 use super::members::{MemberSource, TypeMemberLookup, TypeMemberTarget};
@@ -87,7 +87,6 @@ impl ParamBounds {
 }
 
 index_newtype!(TypeAliasIndex);
-index_newtype!(FunctionIndex);
 index_newtype!(AssocTypeIndex);
 
 pub struct TypeAliasSignature {
@@ -518,6 +517,19 @@ struct QueryEntry {
 	state: QueryState,
 }
 
+/// See `SignatureBuilder::ast_lookup`.
+#[derive(Clone, Copy)]
+pub(super) struct AstNodeLookup<'a, 'ast> {
+	ast_nodes: &'a [AstEntry<'ast>],
+	query_state: &'a HashMap<DefId, QueryEntry>,
+}
+
+impl<'a, 'ast> AstNodeLookup<'a, 'ast> {
+	pub(super) fn get(&self, def_id: DefId) -> &'a AstNodeRef<'ast> {
+		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
+	}
+}
+
 /// One in-progress query frame — mirrors `rustc_query_system`'s own
 /// `QueryInfo`. `requested_at` is the span of the reference that demanded
 /// `def_id`, i.e. "the reason for which this was required"; `None` only for
@@ -707,7 +719,15 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				})
 				.collect(),
 			assoc_types: Vec::new(),
-			functions: Vec::new(),
+			functions: defs
+				.functions
+				.iter()
+				.map(|_| FunctionSignature {
+					type_params: TypeEnvId::ROOT,
+					param_types: Box::default(),
+					return_type: TypeIndex::ERROR,
+				})
+				.collect(),
 			constants: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
@@ -870,7 +890,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// `item_lookup` map; they get this instead, which was already sitting
 	/// there.
 	pub(super) fn ast_node(&self, def_id: DefId) -> &AstNodeRef<'ast> {
-		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
+		self.ast_lookup().get(def_id)
+	}
+
+	/// A narrow, `Copy` view onto just the two fields `ast_node` needs —
+	/// for a caller (`format.rs`'s `TypeFormatter`) that wants that one
+	/// capability without borrowing the rest of `SignatureBuilder` (its
+	/// diagnostics sink, the in-progress `query_stack`, every
+	/// still-growing signature vector, ...) alongside it.
+	pub(super) fn ast_lookup(&self) -> AstNodeLookup<'_, 'ast> {
+		AstNodeLookup {
+			ast_nodes: self.ast_nodes,
+			query_state: &self.query_state,
+		}
 	}
 
 	/// The demand-driven driver: computes `def_id`'s signature if it hasn't
@@ -1028,7 +1060,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::Trait(trait_index));
 			}
-			AstNodeRef::TraitFunction { trait_index, item } => {
+			AstNodeRef::TraitFunction {
+				trait_index,
+				item,
+				function_index,
+			} => {
 				let ast::TraitItem::Function { signature, .. } = item else {
 					unreachable!()
 				};
@@ -1057,51 +1093,18 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					&signature.type_params,
 				);
 
-				// Pre-allocate now — see the free-function `Function` arm's
-				// identical comment for why: this member's own explicit
-				// generic param can reference its own bound within its own
-				// signature (`fn get<T: HasSize>(x: T::Size)`). Unlike
-				// `item_lookup`, `query_state` already has an entry (still
-				// `Pending`) for every `DefId` from construction, so this
-				// pre-allocation is only for `self.functions`' own slot —
-				// `resolve_bound_member`'s self-reference case falls through
-				// correctly on `Pending` alone, no early `Resolved` needed
-				// (and setting one early here would be actively wrong: it
-				// would let a second, unrelated reference to this same
-				// function observe it as finished before `param_types`/
-				// `return_type` are actually backfilled below).
-				let index = FunctionIndex::new(
-					u32::try_from(self.functions.len()).unwrap(),
-				);
-				self.functions.push(FunctionSignature {
-					type_params: scope,
-					param_types: Box::new([]),
-					return_type: TypeIndex::ERROR,
+				// `defs.rs` already validated this member's parameter list
+				// (`validate_method_params`) — a `self` in any other
+				// position is already diagnosed there, so this only needs
+				// to answer "does the first slot default to `Self`", the
+				// same constant-time check that decided it there.
+				let is_method = signature.params.first().is_some_and(|p| {
+					p.inner.inner.name.inner == Keyword::SelfLower.symbol()
 				});
 
-				// Positional, so a duplicate name still gets its own
-				// resolved slot in `param_types` — same reasoning as
-				// struct fields (see `defs::StructFields`'s doc comment).
-				let mut seen_params: Vec<Spanned<SymbolU32>> =
-					Vec::with_capacity(signature.params.len());
 				let mut param_types: Vec<TypeIndex> =
 					Vec::with_capacity(signature.params.len());
-				for param in signature.params.iter() {
-					let name = param.inner.inner.name;
-					if let Some(first) = seen_params
-						.iter()
-						.find(|p| p.inner == name.inner)
-						.copied()
-					{
-						self.diagnostics.push(report_duplicate_function_param(
-							self.strings,
-							file_id,
-							name,
-							first,
-						));
-					}
-					seen_params.push(name);
-
+				for (index, param) in signature.params.iter().enumerate() {
 					let ty = match &param.inner.inner.ty {
 						Some(ty) => self.resolve_type(
 							file_id,
@@ -1110,21 +1113,26 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							ty,
 							InferPolicy::Reject(InferSignatureKind::Function),
 						),
-						// An untyped parameter is legal only for `self` —
-						// its type is this trait's own abstract `Self`.
+						// `self`'s type is this trait's own abstract `Self`.
 						// Constructed directly (not looked up through
 						// `self_scope`) since nothing was actually written
 						// here for an access to attach to — the source
-						// says `self`, never `Self`.
-						// Must intern with the *same* `env` the trait's own
-						// header already used for `Self` (`self_scope`) —
-						// otherwise `self` and `Self` would dedup to two
-						// different `TypeIndex`es instead of one.
-						None => self.types.intern(Type::TypeParam {
-							owner: trait_def_id,
-							env: self_scope,
-							param_index: 0,
-						}),
+						// says `self`, never `Self`. Must intern with the
+						// *same* `env` the trait's own header already used
+						// for `Self` (`self_scope`) — otherwise `self` and
+						// `Self` would dedup to two different `TypeIndex`es
+						// instead of one.
+						None if index == 0 && is_method => {
+							self.types.intern(Type::TypeParam {
+								owner: trait_def_id,
+								env: self_scope,
+								param_index: 0,
+							})
+						}
+						// Already diagnosed by `defs.rs`
+						// (`MissingParameterType`) — nothing left to do here
+						// but recover.
+						None => TypeIndex::ERROR,
 					};
 					param_types.push(ty);
 				}
@@ -1140,11 +1148,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					None => TypeIndex::UNIT,
 				};
 
-				self.functions[usize::from(index)].param_types =
-					param_types.into_boxed_slice();
-				self.functions[usize::from(index)].return_type = return_type;
+				self.functions[usize::from(function_index)] =
+					FunctionSignature {
+						type_params: scope,
+						param_types: param_types.into_boxed_slice(),
+						return_type,
+					};
 				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Function(index));
+					QueryState::Resolved(SignatureLocation::Function(
+						function_index,
+					));
 			}
 			AstNodeRef::TraitConst { trait_index, item } => {
 				let ast::TraitItem::Const { ty, .. } = item else {
@@ -1319,7 +1332,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						struct_index,
 					));
 			}
-			AstNodeRef::Function { item } => {
+			AstNodeRef::Function { item, function_index } => {
 				let (ast::Item::Function { signature, .. }
 				| ast::Item::FunctionDeclaration { signature, .. }) = item
 				else {
@@ -1334,51 +1347,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					&signature.type_params,
 				);
 
-				// Pre-allocate `self.functions`' own slot now, before
-				// resolving params/return type — a function has no stable
-				// index any earlier than this. See `TraitFunction`'s
-				// identical comment for why this no longer also needs an
-				// early `query_state` write the way it needed an early
-				// `item_lookup` one: `query_state` already has a (`Pending`)
-				// entry for this `def_id` from construction, which is all
-				// `resolve_bound_member`'s self-reference case
-				// (`fn f<T: HasSize>(x: T::Size)`) actually needs.
-				let index = FunctionIndex::new(
-					u32::try_from(self.functions.len()).unwrap(),
-				);
-				self.functions.push(FunctionSignature {
-					type_params: scope,
-					param_types: Box::new([]),
-					return_type: TypeIndex::ERROR,
-				});
-
-				// Positional, so a duplicate name still gets its own
-				// resolved slot in `param_types` — same reasoning as
-				// struct fields (see `defs::StructFields`'s doc comment).
-				// Names themselves aren't kept past this loop: nothing
-				// downstream looks a parameter up by name yet, unlike a
-				// struct field.
-				let mut seen_params: Vec<Spanned<SymbolU32>> =
-					Vec::with_capacity(signature.params.len());
-				let mut param_types: Vec<TypeIndex> =
-					Vec::with_capacity(signature.params.len());
-				for param in signature.params.iter() {
-					let name = param.inner.inner.name;
-					if let Some(first) = seen_params
-						.iter()
-						.find(|p| p.inner == name.inner)
-						.copied()
-					{
-						self.diagnostics.push(report_duplicate_function_param(
-							self.strings,
-							file_id,
-							name,
-							first,
-						));
-					}
-					seen_params.push(name);
-
-					let ty = match &param.inner.inner.ty {
+				// `defs.rs` already validated this parameter list (every
+				// name unique, every parameter explicitly typed — `self`
+				// has no meaning in a free function, so it's rejected
+				// there too). An untyped parameter surviving here is
+				// already a diagnosed `MissingParameterType`/
+				// `SelfParamPosition` — nothing left to do but recover.
+				let param_types: Vec<TypeIndex> = signature
+					.params
+					.iter()
+					.map(|param| match &param.inner.inner.ty {
 						Some(ty) => self.resolve_type(
 							file_id,
 							namespace,
@@ -1386,15 +1364,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							ty,
 							InferPolicy::Reject(InferSignatureKind::Function),
 						),
-						// Only ever `None` when the source omits `: Type`
-						// entirely — legal grammar (methods rely on it for
-						// an untyped `self`), but `Item::Function`/
-						// `FunctionDeclaration` are always free functions,
-						// so there's no `Self` to default to here.
 						None => TypeIndex::ERROR,
-					};
-					param_types.push(ty);
-				}
+					})
+					.collect();
 
 				let return_type = match &signature.result {
 					Some(result) => self.resolve_type(
@@ -1407,11 +1379,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					None => TypeIndex::UNIT,
 				};
 
-				self.functions[usize::from(index)].param_types =
-					param_types.into_boxed_slice();
-				self.functions[usize::from(index)].return_type = return_type;
+				self.functions[usize::from(function_index)] =
+					FunctionSignature {
+						type_params: scope,
+						param_types: param_types.into_boxed_slice(),
+						return_type,
+					};
 				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Function(index));
+					QueryState::Resolved(SignatureLocation::Function(
+						function_index,
+					));
 			}
 			AstNodeRef::InherentImplBlock { item, block_index } => {
 				let ast::Item::InherentImpl {
@@ -1941,9 +1918,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								}
 								// `resolve_type_member` was called with
 								// `BindingNamespace::Type` — a Function/
-								// Constant is Value-tier, so `bindings`
-								// (keyed by tier) can never match one here.
+								// Method/Constant is Value-tier, so
+								// `bindings` (keyed by tier) can never
+								// match one here.
 								MemberKind::Function(_)
+								| MemberKind::Method(_)
 								| MemberKind::Constant(_) => unreachable!(
 									"a Type-tier lookup cannot resolve to a Value-tier member"
 								),
@@ -2380,6 +2359,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						.and_then(|kind| match kind {
 							MemberKind::AssociatedType(id) => Some(id),
 							MemberKind::Function(_)
+							| MemberKind::Method(_)
 							| MemberKind::Constant(_) => None,
 						});
 					let Some(assoc_type_def_id) = assoc_type_def_id else {
@@ -2941,7 +2921,9 @@ mod tests {
 					)
 				});
 			let member = &trait_def.members[usize::from(member_index)];
-			let MemberKind::Function(def_id) = member.kind else {
+			let (MemberKind::Function(def_id) | MemberKind::Method(def_id)) =
+				member.kind
+			else {
 				panic!("expected `{name}` to be a function");
 			};
 			let Some(&SignatureLocation::Function(index)) =
@@ -3744,7 +3726,7 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::DuplicateDefinition.code())
+			Some(DiagnosticCode::DuplicateFunctionParameter.code())
 		);
 	}
 

@@ -14,6 +14,7 @@
 
 mod bounds;
 mod defs;
+mod format;
 mod impls;
 mod imports;
 mod literals;
