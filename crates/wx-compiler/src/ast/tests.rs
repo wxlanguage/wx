@@ -419,13 +419,35 @@ fn test_impl_trait_for_type() {
 	else {
 		panic!("item 0 is {}, not a trait impl", item_kind(case.item(0)))
 	};
-	assert_eq!(trait_name.len(), 1);
-	assert_eq!(case.name(trait_name[0].ident.inner), "Drawable");
-	let TypeExpression::Path(segments) = &target.inner else {
-		panic!("expected a path target")
-	};
-	assert_eq!(case.name(segments[0].ident.inner), "Point");
+	assert_eq!(trait_name.segments.len(), 1);
+	assert_eq!(case.name(trait_name.segments[0].ident.inner), "Drawable");
+	assert_eq!(case.name(target.segments[0].ident.inner), "Point");
 	assert_eq!(items.len(), 1);
+}
+
+#[test]
+fn test_impl_placeholder_is_rejected_by_parser() {
+	let case = TestCase::new("impl _ {}");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
+}
+
+#[test]
+fn test_impl_target_must_be_a_path() {
+	let case = TestCase::new("impl (Point) {}");
+	assert_eq!(
+		case.ast.diagnostics[0].code.as_deref(),
+		Some(DiagnosticCode::UnexpectedToken.code())
+	);
+}
+
+#[test]
+fn test_typeset_member_must_be_a_path() {
+	let case = TestCase::new("typeset Bad { (i32, i32) }");
+	assert_eq!(
+		case.ast.diagnostics[0].code.as_deref(),
+		Some(DiagnosticCode::UnexpectedToken.code())
+	);
 }
 
 #[test]
@@ -1867,36 +1889,24 @@ fn test_generic_application_type_args() {
 		panic!("expected function")
 	};
 	let param_ty = &signature.params[0].inner.inner.ty.as_ref().unwrap().inner;
-	assert!(matches!(
-		param_ty,
-		TypeExpression::GenericApplication { args, .. } if args.len() == 2
-	));
-	if let TypeExpression::GenericApplication { args, .. } = param_ty {
-		assert!(matches!(
-			&args[0].inner,
-			Spanned {
-				inner: TypeExpression::Path(_),
-				..
-			}
-		));
-		assert!(matches!(
-			&args[1].inner,
-			Spanned {
-				inner: TypeExpression::Path(_),
-				..
-			}
-		));
-	}
+	let TypeExpression::Path(segments) = param_ty else {
+		panic!("expected a path")
+	};
+	assert_eq!(segments.len(), 1);
+	let type_args = &segments[0].type_args;
+	assert_eq!(type_args.len(), 2);
+	assert!(matches!(type_args[0].inner, TypeExpression::Path(_)));
+	assert!(matches!(type_args[1].inner, TypeExpression::Path(_)));
 }
 
 #[test]
 fn test_double_right_arrow_split() {
 	// Regression: `>>` in nested generics was eagerly lexed as `DoubleRightArrow`
-	// instead of two separate `>` tokens. Test across type expressions and
-	// turbofish in bounds.
+	// instead of two separate `>` tokens. Test across type expressions,
+	// bare generics in a bound, and turbofish in an expression.
 	let case = TestCase::new(indoc! {"
         fn type_expr(x: Outer<Inner<u32>>) {}
-        fn bound_turbofish<T: Wrapper::<Inner<u32>>>(t: T) {}
+        fn bound_generic<T: Wrapper<Inner<u32>>>(t: T) {}
         fn method_turbofish(obj: Foo) { obj.transform::<Vec<u32>>() }
     "});
 	case.diagnostics().assert_none();
@@ -1935,7 +1945,7 @@ fn test_impl_trait_multi_segment_trait_name() {
 		panic!("expected ImplTrait")
 	};
 	assert_eq!(
-		trait_name.len(),
+		trait_name.segments.len(),
 		2,
 		"expected two path segments: gfx, Drawable"
 	);

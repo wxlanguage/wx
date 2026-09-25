@@ -18,8 +18,6 @@ use crate::{
 	vfs::{FileId, Files, Package, PackageId},
 };
 
-use super::imports;
-
 // `'ast` (borrowed by `ast_nodes`) is kept separate from `'ctx`
 // (`diagnostics`/`strings`/`files`) so that building a registry doesn't pin
 // down how long the caller's diagnostics list or string interner stay
@@ -3638,7 +3636,8 @@ mod tests {
 			fn f(self) {}
 		"});
 
-		case.diagnostics().assert_error(DiagnosticCode::SelfParamPosition);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::SelfParamPosition);
 	}
 
 	#[test]
@@ -3649,7 +3648,8 @@ mod tests {
 			}
 		"});
 
-		case.diagnostics().assert_error(DiagnosticCode::SelfParamPosition);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::SelfParamPosition);
 	}
 
 	#[test]
@@ -3658,7 +3658,8 @@ mod tests {
 			fn f(x) {}
 		"});
 
-		case.diagnostics().assert_error(DiagnosticCode::MissingParameterType);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::MissingParameterType);
 	}
 
 	#[test]

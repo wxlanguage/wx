@@ -2297,17 +2297,21 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
     }
 }
 
-impl<Mem: Memory, T> Mem::&[T] {
-    #[inline]
-    pub fn len(self) -> Mem::Size {
-        slice_len(self)
-    }
-
-    #[inline]
-    pub fn ptr(self) -> Mem::&T {
-        slice_ptr(self)
-    }
-}
+// Slices are being reworked into a real nominal struct (`Slice<M, T>`) so
+// they can be an ordinary impl target; `Mem::&[T]` isn't a path, so it can't
+// be one under the current impl-target grammar. Re-add `len`/`ptr` once
+// that lands.
+// impl<Mem: Memory, T> Mem::&[T] {
+//     #[inline]
+//     pub fn len(self) -> Mem::Size {
+//         slice_len(self)
+//     }
+//
+//     #[inline]
+//     pub fn ptr(self) -> Mem::&T {
+//         slice_ptr(self)
+//     }
+// }
 
 const ASCII_CASE_MASK: u8 = 0b0010_0000;
 

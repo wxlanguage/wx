@@ -1180,13 +1180,38 @@ pub struct MatchArm {
 
 /// One segment of a `::` path, with optional turbofish type args.
 /// `Point` → `PathSegment { ident: "Point", type_args: [] }`
-/// `Point::<i32>` → `PathSegment { ident: "Point", type_args: [i32] }`
+/// `Point<i32>` → `PathSegment { ident: "Point", type_args: [i32] }`. The
+/// spelling of `type_args` depends on which parser produced the segment —
+/// bare `<...>` from `parse_type_path`, turbofish `::<...>` from
+/// `parse_value_path` — never both; empty when no type args are provided.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
-	/// Turbofish args (`::<T, U>`). Empty when no type args are provided.
 	pub type_args: Box<[Spanned<TypeExpression>]>,
+}
+
+/// A parsed, non-empty `::`-separated path — `i32`, `module::Type`,
+/// `Point<i32>`. Its own type rather than a bare `Box<[PathSegment]>`
+/// specifically so its span can be a real method: Rust doesn't allow an
+/// inherent impl on `[PathSegment]` itself, only on a named local type, and
+/// a stored `Spanned` wrapper around the box would just duplicate what
+/// `span()` recomputes on demand from the segments themselves.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct Path {
+	pub segments: Box<[PathSegment]>,
+}
+
+impl Path {
+	/// The span of the whole path, from its first segment's identifier to
+	/// its last — not including any trailing generic arguments.
+	pub fn span(&self) -> TextSpan {
+		TextSpan::new(
+			self.segments.first().unwrap().ident.span.start,
+			self.segments.last().unwrap().ident.span.end,
+		)
+	}
 }
 
 /// The `<Type as Trait>` clause of a qualified path (`<Type as
@@ -1293,7 +1318,10 @@ pub enum TypeExpression {
 	/// `_` — explicit inference placeholder; type-resolution context decides
 	/// whether it stays `INFER` or is rejected as `ERROR`.
 	Infer,
-	/// `i32`, `module::Type`, `module::Wrapper::<T>` — a flat path of segments.
+	/// `i32`, `module::Type`, `Point<i32>`, `module::Wrapper<T>` — a flat path
+	/// of segments; any segment (including the first) may carry bare
+	/// `<...>` generic arguments. Turbofish is never accepted in type
+	/// position, only in expression position (see `parse_value_path`).
 	Path(Box<[PathSegment]>),
 	/// `(T, U, V)` or `()`
 	Tuple {
@@ -1327,11 +1355,6 @@ pub enum TypeExpression {
 	MemoryTagged {
 		memory: Box<[PathSegment]>,
 		inner: Box<Spanned<TypeExpression>>,
-	},
-	/// `Point<i32>` — generic type application with positional type arguments.
-	GenericApplication {
-		name: Spanned<SymbolU32>,
-		args: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
 	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
 	/// which trait's item is meant, disambiguating a name that would
@@ -1751,7 +1774,7 @@ pub enum Item {
 	InherentImpl {
 		id: DefId,
 		type_params: Box<[TypeParam]>,
-		target: Box<Spanned<TypeExpression>>,
+		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
@@ -1759,8 +1782,8 @@ pub enum Item {
 		id: DefId,
 		type_params: Box<[TypeParam]>,
 		/// Plain path to the trait, e.g. `module::Trait`.
-		trait_name: Box<[PathSegment]>,
-		target: Box<Spanned<TypeExpression>>,
+		trait_name: Path,
+		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
 	/// `struct Point { x: i32, y: i32 }`
@@ -1828,7 +1851,10 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		bounds: Option<Spanned<BoundExpression>>,
-		members: Box<[Separated<Spanned<TypeExpression>>]>,
+		/// `SeparatedGroup` always wraps each item in `Spanned<T>`; `Path`'s
+		/// own `span()` makes that wrapper redundant here, but there's no
+		/// avoiding it without changing `SeparatedGroup` itself.
+		members: Box<[Separated<Spanned<Path>>]>,
 	},
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
@@ -2788,51 +2814,6 @@ impl<'ctx> Parser<'ctx> {
 		Ok((args.into_boxed_slice(), close_span))
 	}
 
-	/// Parse `<GenericArg, ...>` — the angle-bracket arg list on a
-	/// `GenericApplication` type. Handles `>>` splitting so that
-	/// `Foo<Bar<T>>` parses without a space before the closing `>>`.
-	/// Parse `<T, U, ...>` — positional type arguments on a `GenericApplication`.
-	/// Handles `>>` splitting so that `Foo<Bar<T>>` parses without a space.
-	fn parse_generic_arg_list(
-		&mut self,
-	) -> Result<Spanned<Box<[Separated<Spanned<TypeExpression>>]>>, ()> {
-		let open_span = self.next_expect(Token::LeftArrow)?.span;
-		let mut args: Vec<Separated<Spanned<TypeExpression>>> = Vec::new();
-
-		let close_span = loop {
-			let peeked = self.lexer.peek();
-			if peeked.inner == Token::RightArrow {
-				break self.lexer.next().span;
-			}
-			if peeked.inner == Token::DoubleRightArrow {
-				break self.lexer.split_double_right_arrow();
-			}
-			if peeked.inner == Token::Eof {
-				self.ast.diagnostics.push(report_unclosed_delimiter(
-					UnclosedDelimiterDiagnostic {
-						file_id: self.ast.file_id,
-						open_span,
-						close_token: Token::RightArrow,
-						expected_close_span: peeked.span,
-					},
-				));
-				break peeked.span;
-			}
-
-			let ty = self.parse_type_expression()?;
-			let separator = self.lexer.next_if(Token::Comma).map(|t| t.span);
-			args.push(Separated {
-				inner: ty,
-				separator,
-			});
-		};
-
-		Ok(Spanned {
-			inner: args.into_boxed_slice(),
-			span: TextSpan::new(open_span.start, close_span.end),
-		})
-	}
-
 	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
 	/// following a type. Returns a `Spanned` whose span covers from `{`
 	/// through `}`. The `where` keyword must already be confirmed as the next
@@ -2918,25 +2899,27 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// Parse a `::` separated path with optional turbofish type args per segment.
-	/// Returns `Spanned<Box<[PathSegment]>>`.
-	fn parse_path_segments(
-		&mut self,
-	) -> Result<Spanned<Box<[PathSegment]>>, ()> {
+	/// Parse a path in expression/value position: a call-site path
+	/// (`math::add`), a constructor path, a qualified-path-expression
+	/// segment list. Generic arguments are only ever spelled as turbofish
+	/// (`::<T>`) — a bare `<` here would be ambiguous with the `<`/`>`
+	/// comparison operators, so it's left untouched for the expression
+	/// parser to consume. See `parse_type_path` for the type-directed twin,
+	/// which is the reverse: bare `<...>` only, no turbofish, since type
+	/// position has no such ambiguity to avoid.
+	fn parse_value_path(&mut self) -> Result<Path, ()> {
 		let first_ident = self.parse_path_ident()?;
 		let mut segments: Vec<PathSegment> = vec![PathSegment {
 			ident: first_ident,
 			type_args: Box::new([]),
 		}];
-		let mut end = first_ident.span.end;
 
 		while self.lexer.peek().inner == Token::ColonColon {
 			self.lexer.next(); // consume `::`
 			match self.lexer.peek().inner {
 				Token::LeftArrow => {
-					let (type_args, close_span) = self.parse_type_args()?;
+					let (type_args, _) = self.parse_type_args()?;
 					segments.last_mut().unwrap().type_args = type_args;
-					end = close_span.end;
 				}
 				Token::Identifier => {
 					let ident = self.parse_path_ident()?;
@@ -2944,7 +2927,6 @@ impl<'ctx> Parser<'ctx> {
 						ident,
 						type_args: Box::new([]),
 					});
-					end = ident.span.end;
 				}
 				_ => {
 					// `::` consumed but no valid continuation — stop and let the caller handle it
@@ -2953,16 +2935,45 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let span = TextSpan::new(first_ident.span.start, end);
-		Ok(Spanned {
-			inner: segments.into_boxed_slice(),
-			span,
+		Ok(Path {
+			segments: segments.into_boxed_slice(),
+		})
+	}
+
+	/// Parse a path in a type-directed position: an ordinary type
+	/// expression's name, a bound, a trait name, an impl target, or a
+	/// typeset member. Every segment — including the first — may carry
+	/// bare `<...>` generic arguments; turbofish is never accepted here
+	/// (see `parse_value_path` for why the two positions differ). Once a
+	/// segment carries generic arguments the path ends there — there is no
+	/// continuation past `Foo<T>::` in this style.
+	fn parse_type_path(&mut self) -> Result<Path, ()> {
+		let mut ident = self.parse_path_ident()?;
+		let mut segments: Vec<PathSegment> = Vec::new();
+		loop {
+			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
+			let has_args = self.lexer.peek().inner == Token::LeftArrow;
+			if has_args {
+				let (args, _) = self.parse_type_args()?;
+				type_args = args;
+			}
+			segments.push(PathSegment { ident, type_args });
+			if has_args || self.lexer.peek().inner != Token::ColonColon {
+				break;
+			}
+			self.lexer.next(); // consume `::`
+			ident = self.parse_path_ident()?;
+		}
+
+		Ok(Path {
+			segments: segments.into_boxed_slice(),
 		})
 	}
 
 	/// Parse a single bound: a path optionally followed by `where { ... }` bindings.
 	fn parse_bound(&mut self) -> Result<Spanned<BoundExpression>, ()> {
-		let path = self.parse_path_segments()?;
+		let path = self.parse_type_path()?;
+		let path_span = path.span();
 
 		let peeked = self.lexer.peek();
 		if peeked.inner == Token::Identifier
@@ -2971,10 +2982,10 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Keyword::Where)
 			) {
 			let bindings = self.parse_where_bindings()?;
-			let span = TextSpan::new(path.span.start, bindings.span.end);
+			let span = TextSpan::new(path_span.start, bindings.span.end);
 			return Ok(Spanned {
 				inner: BoundExpression::WithBindings {
-					path: Box::new(BoundExpression::Path(path.inner)),
+					path: Box::new(BoundExpression::Path(path.segments)),
 					bindings: bindings.inner,
 				},
 				span,
@@ -2982,8 +2993,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		Ok(Spanned {
-			inner: BoundExpression::Path(path.inner),
-			span: path.span,
+			inner: BoundExpression::Path(path.segments),
+			span: path_span,
 		})
 	}
 
@@ -3059,54 +3070,36 @@ impl<'ctx> Parser<'ctx> {
 				};
 				let first_span = first_tok.span;
 
-				// `Type<T>` — direct `<` without `::` → GenericApplication.
-				if self.lexer.peek().inner == Token::LeftArrow {
-					let args = self.parse_generic_arg_list()?;
-					let span = TextSpan::new(first_span.start, args.span.end);
-					return Ok(Spanned {
-						inner: TypeExpression::GenericApplication {
-							name: Spanned {
-								inner: first_sym,
-								span: first_span,
-							},
-							args: args.inner,
-						},
-						span,
-					});
-				}
-
-				// Greedy path: consume `::ident` and `::<T>` eagerly.
-				// When `::` is consumed but the next token is a non-path atom
-				// (e.g., `*`, `[`), this is a memory-tagged type (`heap::*T`).
-				let mut segments: Vec<PathSegment> = vec![PathSegment {
-					ident: Spanned {
-						inner: first_sym,
-						span: first_span,
-					},
-					type_args: Box::new([]),
-				}];
-				let mut path_end = first_span.end;
-
-				loop {
-					if self.lexer.peek().inner != Token::ColonColon {
-						break;
+				// Every segment — including this first one — may carry bare
+				// `<...>` generic arguments (`Type<T>`, `module::Wrapper<T>`);
+				// once a segment carries them the path ends there. `::`
+				// continues to another segment; `::` followed by neither an
+				// identifier nor `<` is a memory-tagged type (`heap::*T`).
+				let mut ident = Spanned {
+					inner: first_sym,
+					span: first_span,
+				};
+				let mut segments: Vec<PathSegment> = Vec::new();
+				let path_end = loop {
+					let mut type_args: Box<[Spanned<TypeExpression>]> =
+						Box::new([]);
+					let mut end = ident.span.end;
+					let has_args = self.lexer.peek().inner == Token::LeftArrow;
+					if has_args {
+						let (args, close_span) = self.parse_type_args()?;
+						type_args = args;
+						end = close_span.end;
+					}
+					segments.push(PathSegment { ident, type_args });
+					if has_args
+						|| self.lexer.peek().inner != Token::ColonColon
+					{
+						break end;
 					}
 					self.lexer.next(); // consume `::`
 					match self.lexer.peek().inner {
-						Token::LeftArrow => {
-							let (type_args, close_span) =
-								self.parse_type_args()?;
-							path_end = close_span.end;
-							segments.last_mut().unwrap().type_args = type_args;
-							break;
-						}
 						Token::Identifier => {
-							let ident = self.parse_path_ident()?;
-							path_end = ident.span.end;
-							segments.push(PathSegment {
-								ident,
-								type_args: Box::new([]),
-							});
+							ident = self.parse_path_ident()?;
 						}
 						_ => {
 							// `::` consumed; non-identifier follows — memory-tagged type.
@@ -3122,7 +3115,7 @@ impl<'ctx> Parser<'ctx> {
 							});
 						}
 					}
-				}
+				};
 
 				let path_span = TextSpan::new(first_span.start, path_end);
 				Ok(Spanned {
@@ -3155,31 +3148,31 @@ impl<'ctx> Parser<'ctx> {
 		let self_type = self.parse_type_expression()?;
 		if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
-			let trait_path = self.parse_path_segments()?;
+			let trait_path = self.parse_type_path()?;
 			let close_span = self.expect_close_angle(open_span);
 			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = self.parse_type_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: TypeExpression::QualifiedPath {
 					root: QualifiedPathRoot {
 						self_type: Box::new(self_type),
-						trait_path: trait_path.inner,
+						trait_path: trait_path.segments,
 						span: TextSpan::new(open_span.start, close_span.end),
 					},
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
 		} else {
 			self.expect_close_angle(open_span);
 			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = self.parse_type_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: TypeExpression::Grouped {
 					inner: Box::new(self_type),
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
@@ -3582,31 +3575,31 @@ impl<'ctx> Parser<'ctx> {
 		let self_type = parser.parse_type_expression()?;
 		if matches!(parser.peek_keyword(), Some(Keyword::As)) {
 			parser.lexer.next(); // consume `as`
-			let trait_path = parser.parse_path_segments()?;
+			let trait_path = parser.parse_type_path()?;
 			let close_span = parser.expect_close_angle(open_span);
 			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = parser.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: Expression::QualifiedPath {
 					root: QualifiedPathRoot {
 						self_type: Box::new(self_type),
-						trait_path: trait_path.inner,
+						trait_path: trait_path.segments,
 						span: TextSpan::new(open_span.start, close_span.end),
 					},
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
 		} else {
 			parser.expect_close_angle(open_span);
 			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = parser.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: Expression::Grouped {
 					inner: Box::new(self_type),
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
@@ -5235,25 +5228,10 @@ impl<'ctx> Parser<'ctx> {
 			Box::new([])
 		};
 
-		let first_ty = Box::new(parser.parse_type_expression()?);
+		let first_path = parser.parse_type_path()?;
 		if let Some(Keyword::For) = parser.peek_keyword() {
 			parser.lexer.next(); // consume `for`
-			let target = Box::new(parser.parse_type_expression()?);
-
-			let trait_name = match first_ty.inner {
-				TypeExpression::Path(segments) => segments,
-				_ => {
-					parser.ast.diagnostics.push(
-						Diagnostic::error()
-							.with_message("expected a trait name")
-							.with_label(Label::primary(
-								parser.ast.file_id,
-								first_ty.span,
-							)),
-					);
-					return Err(());
-				}
-			};
+			let target = parser.parse_type_path()?;
 
 			let items = SeparatedGroup {
 				open_token: Token::OpenBrace,
@@ -5305,7 +5283,7 @@ impl<'ctx> Parser<'ctx> {
 					type_params,
 					items: items.inner,
 					target,
-					trait_name,
+					trait_name: first_path,
 				},
 				span,
 			});
@@ -5328,7 +5306,7 @@ impl<'ctx> Parser<'ctx> {
 				id: parser.id_generator.next_id(),
 				type_params,
 				items: items.inner,
-				target: first_ty,
+				target: first_path,
 			},
 			span,
 		})
@@ -5543,7 +5521,11 @@ impl<'ctx> Parser<'ctx> {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
-			item_handler: |parser: &mut Parser| parser.parse_type_expression(),
+			item_handler: |parser: &mut Parser| {
+				let path = parser.parse_type_path()?;
+				let span = path.span();
+				Ok(Spanned { inner: path, span })
+			},
 			should_warn_missing_separator: None,
 		}
 		.parse(parser)?;

@@ -77,7 +77,7 @@ impl SignatureBuilder<'_, '_> {
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		let key = BindingKey::new(tier, name);
-		match ImplTarget::from_type(self.types.resolve(receiver)) {
+		match ImplTarget::from_type(self.types.resolve(receiver), self.defs) {
 			Some(target) => self.resolve_concrete_member(target, key),
 			None => self.resolve_bound_member(receiver, key, reference),
 		}
@@ -88,20 +88,12 @@ impl SignatureBuilder<'_, '_> {
 		target: ImplTarget,
 		key: BindingKey,
 	) -> TypeMemberLookup {
-		// No forcing needed here: `SignatureRegistry::build` resolves every
-		// impl header, inherent and trait alike, in its own dedicated pass
-		// before anything else runs, precisely so `inherent_impl_dispatch`/
-		// `trait_impl_dispatch` are already complete by the time any other
-		// item's resolution — this included — could possibly reach here.
+		// No forcing needed here: ImplDispatch was built from declarations
+		// before signature resolution began.
 
 		// Inherent always wins outright — no trait candidate is even
 		// consulted once one matches.
-		for &index in self
-			.inherent_impl_dispatch
-			.get(&target)
-			.map(Vec::as_slice)
-			.unwrap_or(&[])
-		{
+		for &index in self.impl_dispatch.inherent_candidates(target) {
 			let impl_def = &self.defs.inherent_impls[usize::from(index)];
 			if let Some(&member_index) = impl_def.bindings.get(&key) {
 				let kind = impl_def.members[usize::from(member_index)].kind;
@@ -113,12 +105,10 @@ impl SignatureBuilder<'_, '_> {
 		}
 
 		let mut candidates = Vec::new();
-		for &(trait_index, impl_index) in self
-			.trait_impl_dispatch
-			.get(&target)
-			.map(Vec::as_slice)
-			.unwrap_or(&[])
+		for &(trait_def_id, impl_index) in
+			self.impl_dispatch.trait_candidates(target)
 		{
+			let trait_index = self.impl_trait_index(trait_def_id);
 			let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
 			if let Some(&member_index) = impl_def.bindings.get(&key) {
 				let kind = impl_def.members[usize::from(member_index)].kind;
@@ -185,8 +175,9 @@ impl SignatureBuilder<'_, '_> {
 				// so this has to work identically whether `owner`'s own
 				// query has finished or not. It's a pure "is this a
 				// trait" identity question either way.
-				if let AstNodeRef::Trait { trait_index: idx, .. } =
-					self.ast_node(owner)
+				if let AstNodeRef::Trait {
+					trait_index: idx, ..
+				} = self.ast_node(owner)
 				{
 					let idx = *idx;
 					let trait_sig = &self.traits[usize::from(idx)];

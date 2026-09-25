@@ -8,16 +8,6 @@
 /// `mir::ScalarIndex`: two index spaces over the *same* aggregate that
 /// coincide only when it is flat and free of zero-sized fields, so a mix-up
 /// compiles fine and silently emits wrong code for everything else.
-///
-/// Leading attributes are accepted so the generated type can carry its own
-/// doc comment:
-///
-/// ```ignore
-/// index_newtype!(
-///     /// Index into an aggregate's physical field list.
-///     PhysIndex
-/// );
-/// ```
 macro_rules! index_newtype {
 	($(#[$meta:meta])* $name:ident) => {
 		$(#[$meta])*

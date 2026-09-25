@@ -43,10 +43,10 @@ use super::bounds::{MergedBindingKind, equals_type};
 use super::defs::{
 	AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
 	DefinitionRegistry, EnumIndex, FunctionIndex, InherentImplIndex,
-	MemberKind, NamespaceIndex, NamespaceKind, StructIndex, TraitImplIndex,
-	TraitIndex, TypeSetIndex,
+	MemberKind, NamespaceIndex, StructIndex, TraitImplIndex, TraitIndex,
+	TypeSetIndex,
 };
-use super::impls::ImplTarget;
+use super::impls::ImplDispatch;
 use super::members::{MemberSource, TypeMemberLookup, TypeMemberTarget};
 use super::paths::PathResolver;
 use super::types::{
@@ -222,9 +222,6 @@ pub struct InherentImplSignature {
 pub struct TraitImplSignature {
 	/// See `TypeAliasSignature::type_params`.
 	pub type_params: TypeEnvId,
-	/// `None` if resolving the written trait path failed. Its span is kept
-	/// for diagnostics when impl dispatch is built.
-	pub trait_ref: Option<Spanned<TraitIndex>>,
 	pub target: Spanned<TypeIndex>,
 	/// See `InherentImplSignature::self_scope`.
 	pub self_scope: TypeEnvId,
@@ -236,11 +233,8 @@ enum InferSignatureKind {
 	ReturnType,
 	Struct,
 	TypeAlias,
-	InherentImpl,
-	TraitImpl,
 	EnumRepr,
 	AssocTypeBinding,
-	TypeSetMember,
 	Const,
 }
 
@@ -251,11 +245,8 @@ impl InferSignatureKind {
 			Self::ReturnType => "return types",
 			Self::Struct => "structs",
 			Self::TypeAlias => "type aliases",
-			Self::InherentImpl => "inherent impls",
-			Self::TraitImpl => "trait impls",
 			Self::EnumRepr => "enum reprs",
 			Self::AssocTypeBinding => "associated type bindings",
-			Self::TypeSetMember => "typeset members",
 			Self::Const => "consts",
 		}
 	}
@@ -298,10 +289,7 @@ pub struct SignatureRegistry {
 	/// recovers with `TypeIndex::ERROR` or an unresolved trait path.
 	pub inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub trait_impls: Vec<Option<TraitImplSignature>>,
-	pub(super) inherent_impl_dispatch:
-		HashMap<ImplTarget, Vec<InherentImplIndex>>,
-	pub(super) trait_impl_dispatch:
-		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
+	pub(super) impl_dispatch: ImplDispatch,
 	pub types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	/// See `SignatureBuilder::param_bounds`.
@@ -326,47 +314,24 @@ impl SignatureRegistry {
 		ast_nodes: &[AstEntry<'ctx>],
 		stdlib_package: PackageId,
 	) -> Self {
-		let mut builder = SignatureBuilder::new(
+		let impl_dispatch = ImplDispatch::build(
 			diagnostics,
 			strings,
 			defs,
 			ast_nodes,
 			stdlib_package,
 		);
-
-		// Impl headers resolve first, deliberately, in their own pass
-		// ahead of everything else: `resolve_type_member` (`members.rs`)
-		// reads `inherent_impl_dispatch`/`trait_impl_dispatch` assuming
-		// every impl in the whole compilation has already registered
-		// itself, which is only true once every one of them has been
-		// through `register_inherent_impl`/`register_trait_impl`
-		// (`impls.rs`) — not yet guaranteed by the general sweep below on
-		// its own, since that visits items in parse order and a demand-
-		// driven `ensure_signature` call reaching for a concrete member
-		// partway through it could easily run before an impl declared
-		// later in the file (or in a package not yet touched) has resolved.
-		// Header-only: members are ordinary, separately-queried items,
-		// reached the same demand-driven way as everything else below.
-		// Each call's own `SignatureLocation` is never needed here — this
-		// loop exists purely to force every item's signature (and whatever
-		// diagnostics that produces) into existence, not to read any of
-		// them back.
-		for inherent_impl in &defs.inherent_impls {
-			let _ = builder.ensure_signature(QueryInfo {
-				def_id: inherent_impl.def_id,
-				requested_at: None,
-			});
-		}
-		for trait_impl in &defs.trait_impls {
-			let _ = builder.ensure_signature(QueryInfo {
-				def_id: trait_impl.def_id,
-				requested_at: None,
-			});
-		}
-
-		// Everything else, demand-driven from here — including every
-		// impl's own *members*, which the pass above deliberately left
-		// untouched.
+		let mut builder = SignatureBuilder::new(
+			diagnostics,
+			strings,
+			defs,
+			ast_nodes,
+			stdlib_package,
+			impl_dispatch,
+		);
+		// Dispatch is complete before any signature query can resolve a
+		// concrete member. Impl parameter bounds are resolved here along
+		// with all other signatures, without an earlier header query.
 		for entry in ast_nodes {
 			let _ = builder.ensure_signature(QueryInfo {
 				def_id: entry.def_id,
@@ -385,8 +350,7 @@ impl SignatureRegistry {
 			constants: builder.constants,
 			inherent_impls: builder.inherent_impls,
 			trait_impls: builder.trait_impls,
-			inherent_impl_dispatch: builder.inherent_impl_dispatch,
-			trait_impl_dispatch: builder.trait_impl_dispatch,
+			impl_dispatch: builder.impl_dispatch,
 			types: builder.types,
 			bounds: builder.bounds,
 			param_bounds: builder.param_bounds,
@@ -557,9 +521,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	pub(super) defs: &'ctx DefinitionRegistry,
 	ast_nodes: &'ast [AstEntry<'ast>],
 	stdlib_root: NamespaceIndex,
-	// `pub(super)` from here down: read cross-file by `members.rs`, the same
-	// way `impls.rs` already needs `inherent_impl_dispatch`/
-	// `trait_impl_dispatch` below.
+	// The resolved data below is read across the sibling TIR modules.
 	query_state: HashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
 	query_stack: Vec<QueryFrame>,
@@ -586,10 +548,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	pub(super) constants: Vec<ConstantSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
-	pub(super) inherent_impl_dispatch:
-		HashMap<ImplTarget, Vec<InherentImplIndex>>,
-	pub(super) trait_impl_dispatch:
-		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
+	pub(super) impl_dispatch: ImplDispatch,
 }
 
 impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
@@ -599,6 +558,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
 		stdlib_package: PackageId,
+		impl_dispatch: ImplDispatch,
 	) -> Self {
 		let stdlib_root = defs.package_namespaces[stdlib_package.as_usize()];
 
@@ -731,8 +691,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			constants: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
-			inherent_impl_dispatch: HashMap::new(),
-			trait_impl_dispatch: HashMap::new(),
+			impl_dispatch,
 		}
 	}
 
@@ -1332,7 +1291,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						struct_index,
 					));
 			}
-			AstNodeRef::Function { item, function_index } => {
+			AstNodeRef::Function {
+				item,
+				function_index,
+			} => {
 				let (ast::Item::Function { signature, .. }
 				| ast::Item::FunctionDeclaration { signature, .. }) = item
 				else {
@@ -1406,16 +1368,14 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					TypeEnvId::ROOT,
 					type_params,
 				);
-				let target_type = self.resolve_type(
-					file_id,
-					namespace,
-					scope,
+				let target_type = self.resolve_impl_target(
 					target,
-					InferPolicy::Reject(InferSignatureKind::InherentImpl),
+					self.impl_dispatch.inherent_target(block_index),
 				);
+				let target_span = target.span();
 				let target_spanned = Spanned {
 					inner: target_type,
-					span: target.span,
+					span: target_span,
 				};
 				// Bound directly to the already-resolved concrete type, never
 				// wrapped in `Type::TypeParam` — an impl's own `Self` is
@@ -1425,7 +1385,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
-							span: target.span,
+							span: target_span,
 						},
 						ty: target_type,
 						accesses: Vec::new(),
@@ -1438,11 +1398,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						target: target_spanned,
 						self_scope,
 					});
-				self.register_inherent_impl(
-					block_index,
-					file_id,
-					target_spanned,
-				);
 				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::InherentImpl(
 						block_index,
@@ -1451,7 +1406,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			AstNodeRef::TraitImplBlock { item, block_index } => {
 				let ast::Item::TraitImpl {
 					type_params,
-					trait_name,
 					target,
 					..
 				} = item
@@ -1465,66 +1419,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					TypeEnvId::ROOT,
 					type_params,
 				);
-				let trait_target = PathResolver::new(
-					&self.defs.namespaces,
-					&self.defs.use_items,
-					self.stdlib_root,
-				)
-				.resolve_path(
-					self.diagnostics,
-					self.strings,
-					file_id,
-					namespace,
-					trait_name,
-					BindingNamespace::Type,
-				);
-				let trait_ref = trait_target.def_key().and_then(|key| {
-					let trait_index = match key.symbol_kind(self.defs) {
-						DefKind::Trait(trait_def_id) => {
-							// Identity only, not forced: a trait's own
-							// `TraitIndex` is carried directly on its
-							// `AstNodeRef::Trait` entry, known from `defs.rs`
-							// regardless of whether that trait's own
-							// signature has resolved yet.
-							let AstNodeRef::Trait { trait_index, .. } =
-								self.ast_node(trait_def_id)
-							else {
-								unreachable!(
-									"a DefKind::Trait DefId always has an AstNodeRef::Trait entry"
-								)
-							};
-							*trait_index
-						}
-						other => {
-							let last = trait_name.last().unwrap();
-							self.diagnostics.push(report_expected_trait_bound(
-								file_id,
-								self.strings,
-								last.ident,
-								other.noun(),
-							));
-							return None;
-						}
-					};
-					let span = TextSpan::new(
-						trait_name.first().unwrap().ident.span.start,
-						trait_name.last().unwrap().ident.span.end,
-					);
-					Some(Spanned {
-						inner: trait_index,
-						span,
-					})
-				});
-				let target_type = self.resolve_type(
-					file_id,
-					namespace,
-					scope,
-					target,
-					InferPolicy::Reject(InferSignatureKind::TraitImpl),
-				);
+				let header = self.impl_dispatch.trait_header(block_index);
+				let target_type =
+					self.resolve_impl_target(target, header.target);
+				let target_span = target.span();
 				let target_spanned = Spanned {
 					inner: target_type,
-					span: target.span,
+					span: target_span,
 				};
 				// Bound directly to the already-resolved concrete type, same
 				// reasoning as the inherent-impl arm above.
@@ -1532,7 +1433,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					Box::new([EnvParam {
 						name: Spanned {
 							inner: ast::Keyword::SelfPascal.symbol(),
-							span: target.span,
+							span: target_span,
 						},
 						ty: target_type,
 						accesses: Vec::new(),
@@ -1542,18 +1443,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.trait_impls[usize::from(block_index)] =
 					Some(TraitImplSignature {
 						type_params: scope,
-						trait_ref,
 						target: target_spanned,
 						self_scope,
 					});
-				if let Some(trait_ref) = trait_ref {
-					self.register_trait_impl(
-						block_index,
-						trait_ref.inner,
-						file_id,
-						target_spanned,
-					);
-				}
 				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::TraitImpl(
 						block_index,
@@ -1674,26 +1566,15 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					self_scope,
 				};
 
-				// Each written member becomes a synthetic `impl
-				// <trait_index> for <member>`, fed through the same
-				// dispatch registration real impls use — "does concrete
-				// type T satisfy this typeset" later is just an ordinary
-				// trait-impl lookup, no special-casing downstream.
+				// Dispatch already registered each member as a synthetic impl.
+				// Resolve its complete type and fill the pre-allocated signature.
 				let mut resolved_members = Vec::with_capacity(members.len());
 				for (m, &impl_index) in members.iter().zip(member_impls.iter())
 				{
-					let member_ty = self.resolve_type(
-						file_id,
-						namespace,
-						TypeEnvId::ROOT,
-						&m.inner,
-						InferPolicy::Reject(InferSignatureKind::TypeSetMember),
+					let member_ty = self.resolve_impl_target(
+						&m.inner.inner,
+						self.impl_dispatch.trait_header(impl_index).target,
 					);
-					// No separate "is this a legal typeset member" check —
-					// `register_trait_impl` already reports
-					// `InvalidImplTarget` for exactly this (a typeset
-					// member *is* a synthetic impl target), and skips
-					// bucketing it, so nothing further to do here.
 					let target_spanned = Spanned {
 						inner: member_ty,
 						span: m.inner.span,
@@ -1707,19 +1588,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					self.trait_impls[usize::from(impl_index)] =
 						Some(TraitImplSignature {
 							type_params: TypeEnvId::ROOT,
-							trait_ref: Some(Spanned {
-								inner: trait_index,
-								span: m.inner.span,
-							}),
 							target: target_spanned,
 							self_scope: TypeEnvId::ROOT,
 						});
-					self.register_trait_impl(
-						impl_index,
-						trait_index,
-						file_id,
-						target_spanned,
-					);
 					resolved_members.push(target_spanned);
 				}
 
@@ -2675,7 +2546,8 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::DefinitionRegistry;
+	use crate::tir::defs::{DefinitionRegistry, NamespaceKind};
+	use crate::tir::impls::ImplTarget;
 	use crate::vfs;
 
 	/// Drives the real pipeline — parse, prescan, resolve — and keeps only
@@ -3159,7 +3031,7 @@ mod tests {
 	}
 
 	#[test]
-	fn impl_headers_use_defs_indices_and_resolve_targets_through_aliases() {
+	fn user_aliases_are_rejected_as_impl_targets_without_dispatch() {
 		let case = TestCase::new(indoc! {"
 			trait Tr {}
 			impl Tr for Alias {}
@@ -3168,7 +3040,14 @@ mod tests {
 			struct S {}
 		"});
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		assert!(
+			case.diagnostics.iter().all(|diagnostic| diagnostic
+				.code
+				.as_deref() == Some(
+				DiagnosticCode::InvalidImplTarget.code()
+			))
+		);
 		assert_eq!(
 			case.signatures.trait_impls.len(),
 			case.defs.trait_impls.len()
@@ -3181,25 +3060,87 @@ mod tests {
 		let inherent_header =
 			case.signatures.inherent_impls[0].as_ref().unwrap();
 		assert_eq!(
-			trait_header.trait_ref.unwrap().inner,
-			case.trait_index("Tr")
+			case.signatures
+				.impl_dispatch
+				.trait_header(TraitImplIndex::new(0))
+				.trait_def
+				.unwrap()
+				.inner,
+			case.defs.traits[usize::from(case.trait_index("Tr"))].def_id,
 		);
-		assert_eq!(trait_header.target.inner, case.type_alias("Alias").target);
+		assert_eq!(trait_header.target.inner, TypeIndex::ERROR);
 		assert_eq!(inherent_header.target.inner, trait_header.target.inner);
-		assert!(matches!(
-			case.signatures.types.resolve(trait_header.target.inner),
-			Type::Struct { .. }
-		));
-		let target = ImplTarget::from_type(
-			case.signatures.types.resolve(trait_header.target.inner),
-		)
-		.unwrap();
-		assert_eq!(case.signatures.inherent_candidates(target).len(), 1);
-		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+		assert!(case.signatures.impl_dispatch_is_empty());
+	}
+
+	#[test]
+	fn intrinsic_primitive_can_be_an_impl_target() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			trait Tr {}
+			impl Tr for u32 {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		assert_eq!(
-			case.signatures.trait_candidates(target)[0].0,
-			case.trait_index("Tr")
+			case.signatures.trait_candidates(ImplTarget::U32),
+			&[(
+				case.defs.traits[usize::from(case.trait_index("Tr"))].def_id,
+				TraitImplIndex::new(0),
+			)],
 		);
+	}
+
+	#[test]
+	fn intrinsic_never_is_invalid_impl_target() {
+		let case = TestCase::new(indoc! {"
+			type never;
+			trait Tr {}
+			impl Tr for never {}
+		"});
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::InvalidImplTarget.code()),
+		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"cannot use this type alias as an impl target"
+		);
+	}
+
+	#[test]
+	fn impl_type_parameter_does_not_resolve_to_a_same_named_struct() {
+		let case = TestCase::new(indoc! {"
+			struct T {}
+			trait Tr {}
+			impl<T> Tr for T {}
+		"});
+		assert!(case.signatures.impl_dispatch_is_empty());
+		assert_eq!(
+			case.diagnostics
+				.iter()
+				.filter(|diagnostic| diagnostic.code.as_deref()
+					== Some(DiagnosticCode::InvalidImplTarget.code()))
+				.count(),
+			1,
+			"{:?}",
+			case.diagnostics,
+		);
+	}
+
+	#[test]
+	fn typeset_member_alias_is_rejected_without_a_synthetic_impl() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type Alias = u32;
+			typeset Int { Alias }
+		"});
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::InvalidImplTarget.code()),
+		);
+		assert!(case.signatures.impl_dispatch_is_empty());
 	}
 
 	#[test]
@@ -3218,6 +3159,7 @@ mod tests {
 					.target
 					.inner,
 			),
+			&case.defs,
 		)
 		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
@@ -3276,32 +3218,17 @@ mod tests {
 			Some(DiagnosticCode::ExpectedTraitBound.code())
 		);
 		let header = case.signatures.trait_impls[0].as_ref().unwrap();
-		assert!(header.trait_ref.is_none());
+		assert!(
+			case.signatures
+				.impl_dispatch
+				.trait_header(TraitImplIndex::new(0))
+				.trait_def
+				.is_none()
+		);
 		assert!(matches!(
 			case.signatures.types.resolve(header.target.inner),
 			Type::Struct { .. }
 		));
-	}
-
-	#[test]
-	fn inherent_impl_header_recovers_an_infer_target() {
-		let source = "impl _ {}";
-		let case = TestCase::new(source);
-
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::InferInSignature.code())
-		);
-		assert_eq!(&source[case.diagnostics[0].labels[0].range.clone()], "_");
-		assert_eq!(
-			case.signatures.inherent_impls[0]
-				.as_ref()
-				.unwrap()
-				.target
-				.inner,
-			TypeIndex::ERROR
-		);
 	}
 
 	#[test]
@@ -4038,11 +3965,16 @@ mod tests {
 		);
 		let target = ImplTarget::from_type(
 			case.signatures.types.resolve(TypeIndex::U32),
+			&case.defs,
 		)
 		.unwrap();
 		let candidates = case.signatures.trait_candidates(target);
 		assert_eq!(candidates.len(), 1);
-		assert_eq!(candidates[0].0, case.typeset_trait_index("Int"));
+		assert_eq!(
+			candidates[0].0,
+			case.defs.traits[usize::from(case.typeset_trait_index("Int"))]
+				.def_id
+		);
 	}
 
 	#[test]
@@ -4056,6 +3988,7 @@ mod tests {
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let target = ImplTarget::from_type(
 			case.signatures.types.resolve(TypeIndex::U32),
+			&case.defs,
 		)
 		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
@@ -4075,23 +4008,10 @@ mod tests {
 		);
 		let target = ImplTarget::from_type(
 			case.signatures.types.resolve(TypeIndex::U32),
+			&case.defs,
 		)
 		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
-	}
-
-	#[test]
-	fn a_non_concrete_typeset_member_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
-			type i32;
-			typeset Bad { (i32, i32) }
-		"});
-
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::InvalidImplTarget.code())
-		);
 	}
 
 	#[test]
