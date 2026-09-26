@@ -30,10 +30,9 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, DefId, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::index::index_newtype;
 use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
-use crate::vfs::{FileId, PackageId};
+use crate::vfs::FileId;
 
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundId, ImpliedTraitBound,
@@ -43,9 +42,9 @@ use super::bounds::{
 #[cfg(test)]
 use super::bounds::{ImpliedBindingKind, equals_type};
 use super::defs::{
-	AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
-	DefinitionRegistry, EnumIdx, FunctionIdx, InherentImplIdx, MemberKind,
-	NamespaceIdx, StructIdx, TraitIdx, TraitImplIdx, TypesetIdx,
+	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingNamespace, ConstIdx,
+	DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, InherentImplIdx,
+	MemberKind, NamespaceIdx, StructIdx, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::ImplDispatch;
 use super::members::{MemberSource, TypeMemberLookup, TypeMemberTarget};
@@ -86,8 +85,6 @@ impl ParamBounds {
 		}
 	}
 }
-
-index_newtype!(AssocTypeIndex);
 
 pub struct TypeAliasSignature {
 	type_params: TypeEnvIdx,
@@ -144,8 +141,6 @@ pub struct EnumSignature {
 pub struct TypeSetSignature {
 	members: Box<[Spanned<TypeIndex>]>,
 }
-
-index_newtype!(ConstIndex);
 
 /// A `const`'s resolved type — covers both a free top-level `const` and a
 /// trait/impl associated const, which share one shape the same reason
@@ -246,14 +241,13 @@ pub struct SignatureRegistry {
 	/// Indexed by the same `TypeSetIndex` `defs.typesets` already uses —
 	/// see `traits`.
 	pub typesets: Vec<TypeSetSignature>,
-	/// Indexed by `AssocTypeIndex`, allocated lazily as each associated
-	/// type's signature resolves — see `type_aliases`.
-	pub assoc_types: Vec<AssocTypeSignature>,
+	/// Indexed by `defs::AssocTypeIdx`. Only resolved trait declarations
+	/// have bounds signatures here; impl definitions have distinct identities
+	/// and will need target-type resolution, which is not implemented yet.
+	pub assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub functions: Vec<FunctionSignature>,
-	/// Indexed by `ConstIndex`, allocated lazily as each const's signature
-	/// resolves — see `type_aliases`. Covers trait/impl associated consts
-	/// only so far, not free top-level `const`s (`AstNodeRef::Constant`
-	/// isn't implemented yet).
+	/// Index-aligned with `defs.constants`. Only trait constant signatures
+	/// are resolved so far; free and impl constants are not implemented yet.
 	pub constants: Vec<ConstantSignature>,
 	/// Index-aligned with the corresponding `defs.rs` impl arenas. A slot is
 	/// `None` until its header query completes, even if that query later
@@ -283,21 +277,14 @@ impl SignatureRegistry {
 		strings: &StringInterner,
 		defs: &DefinitionRegistry,
 		ast_nodes: &[AstEntry<'ctx>],
-		stdlib_package: PackageId,
 	) -> Self {
-		let impl_dispatch = ImplDispatch::build(
-			diagnostics,
-			strings,
-			defs,
-			ast_nodes,
-			stdlib_package,
-		);
+		let impl_dispatch =
+			ImplDispatch::build(diagnostics, strings, defs, ast_nodes);
 		let mut builder = SignatureBuilder::new(
 			diagnostics,
 			strings,
 			defs,
 			ast_nodes,
-			stdlib_package,
 			impl_dispatch,
 		);
 		// Dispatch is complete before any signature query can resolve a
@@ -343,9 +330,8 @@ impl SignatureRegistry {
 
 /// Where a `DefId`'s data actually lives — one arena per item kind
 /// `ensure_signature` can be asked about. `Trait`/`TraitImpl`/`InherentImpl`/
-/// `Struct` use indices allocated in `defs.rs` and keep resolved data in
-/// index-aligned slots here; aliases and functions get indices as their
-/// signatures finish resolving.
+/// `Struct` and the other item kinds use indices allocated in `defs.rs`
+/// and keep resolved data in index-aligned slots here.
 #[derive(Clone, Copy)]
 pub enum SignatureLocation {
 	Trait(TraitIdx),
@@ -356,8 +342,8 @@ pub enum SignatureLocation {
 	TypeSet(TypesetIdx),
 	TypeAlias(TypeAliasIdx),
 	Function(FunctionIdx),
-	Constant(ConstIndex),
-	TraitAssocType(AssocTypeIndex),
+	Constant(ConstIdx),
+	TraitAssocType(AssocTypeIdx),
 }
 
 /// What `ensure_signature` found. `Cycle` is never stored anywhere — it's a
@@ -410,19 +396,9 @@ pub(super) enum SignatureStatus {
 ///
 /// `Resolved` carries the `SignatureLocation` itself — folding in what used
 /// to be a separate `item_lookup: HashMap<DefId, SignatureLocation>` map.
-/// The two facts ("is this query done" and "where did it land") are only
-/// ever true or absent *together* for the kinds that actually go through
-/// this state machine (`TypeAlias`/`Function`/`Constant`/`TraitAssocType`),
-/// so carrying the payload here makes the "resolved but no location" /
-/// "location but still pending" combinations unrepresentable, rather than
-/// merely unobserved.
-///
-/// The other six item kinds (`Trait`/`TraitImpl`/`InherentImpl`/`Struct`/
-/// `Enum`/`TypeSet`) get a `SignatureLocation` too — every arm sets one as
-/// its last step, same as the lazy kinds — but their *identity* is knowable
-/// long before that, straight from `defs.rs`'s own output
-/// (`SignatureBuilder::ast_node`), which is what lets code read one of
-/// those without forcing this query at all.
+/// Definition indices are already known from prescan; `Resolved` records
+/// that the signature at that location is ready to read. Each resolver
+/// installs this state only after writing its signature data.
 #[derive(Clone, Copy)]
 enum QueryState {
 	Pending,
@@ -452,19 +428,6 @@ struct QueryEntry {
 	state: QueryState,
 }
 
-/// See `SignatureBuilder::ast_lookup`.
-#[derive(Clone, Copy)]
-pub(super) struct AstNodeLookup<'a, 'ast> {
-	ast_nodes: &'a [AstEntry<'ast>],
-	query_state: &'a HashMap<DefId, QueryEntry>,
-}
-
-impl<'a, 'ast> AstNodeLookup<'a, 'ast> {
-	pub(super) fn get(&self, def_id: DefId) -> &'a AstNodeRef<'ast> {
-		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
-	}
-}
-
 /// One in-progress query frame — mirrors `rustc_query_system`'s own
 /// `QueryInfo`. `requested_at` is the span of the reference that demanded
 /// `def_id`, i.e. "the reason for which this was required"; `None` only for
@@ -491,7 +454,6 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	pub(super) strings: &'ctx StringInterner,
 	pub(super) defs: &'ctx DefinitionRegistry,
 	ast_nodes: &'ast [AstEntry<'ast>],
-	stdlib_root: NamespaceIdx,
 	// The resolved data below is read across the sibling TIR modules.
 	query_state: HashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
@@ -515,7 +477,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	pub(super) structs: Vec<StructSignature>,
 	enums: Vec<EnumSignature>,
 	typesets: Vec<TypeSetSignature>,
-	pub(super) assoc_types: Vec<AssocTypeSignature>,
+	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
@@ -529,11 +491,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		strings: &'ctx StringInterner,
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
-		stdlib_package: PackageId,
 		impl_dispatch: ImplDispatch,
 	) -> Self {
-		let stdlib_root = stdlib_package.root_namespace();
-
 		// A pre-seeded kind's own `SignatureLocation` used to be seeded here
 		// too, via a separate pass over `defs.traits`/`defs.structs`/... —
 		// removed, since it duplicated a fact `ast_nodes` already carries
@@ -562,7 +521,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			strings,
 			defs,
 			ast_nodes,
-			stdlib_root,
 			query_state,
 			query_stack: Vec::new(),
 			types: TypeInterner::new(),
@@ -609,7 +567,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					members: Box::default(),
 				})
 				.collect(),
-			assoc_types: Vec::new(),
+			assoc_types: defs.assoc_types.iter().map(|_| None).collect(),
 			functions: defs
 				.functions
 				.iter()
@@ -619,7 +577,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					return_type: TypeIndex::ERROR,
 				})
 				.collect(),
-			constants: Vec::new(),
+			constants: defs
+				.constants
+				.iter()
+				.map(|_| ConstantSignature {
+					ty: TypeIndex::ERROR,
+				})
+				.collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
 			impl_dispatch,
@@ -749,19 +713,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// `item_lookup` map; they get this instead, which was already sitting
 	/// there.
 	pub(super) fn ast_node(&self, def_id: DefId) -> &AstNodeRef<'ast> {
-		self.ast_lookup().get(def_id)
-	}
-
-	/// A narrow, `Copy` view onto just the two fields `ast_node` needs —
-	/// for a caller (`format.rs`'s `TypeFormatter`) that wants that one
-	/// capability without borrowing the rest of `SignatureBuilder` (its
-	/// diagnostics sink, the in-progress `query_stack`, every
-	/// still-growing signature vector, ...) alongside it.
-	pub(super) fn ast_lookup(&self) -> AstNodeLookup<'_, 'ast> {
-		AstNodeLookup {
-			ast_nodes: self.ast_nodes,
-			query_state: &self.query_state,
-		}
+		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
 	}
 
 	/// The demand-driven driver: computes `def_id`'s signature if it hasn't
@@ -831,39 +783,38 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// `defs.intrinsics`, so there's nothing here to resolve.
 				// Checked first so a real, non-intrinsic alias can assume
 				// its body is always present below.
-				let signature = match self
-					.defs
-					.intrinsics
-					.identity_of(type_alias_index)
-				{
-					Some(target) => TypeAliasSignature {
-						type_params: TypeEnvIdx::ROOT,
-						target,
-					},
-					None => {
-						let body = body.as_ref().expect(
-							"a non-intrinsic type alias always has a body",
-						);
-						let type_env = self.resolve_generic_params(
-							file_id,
-							namespace,
-							TypeEnvOwner::TypeAlias(type_alias_index),
-							TypeEnvIdx::ROOT,
-							type_params,
-						);
-						let target = self.resolve_type(
-							file_id,
-							namespace,
-							type_env,
-							body,
-							InferPolicy::Reject(InferSignatureKind::TypeAlias),
-						);
-						TypeAliasSignature {
-							type_params: type_env,
+				let signature =
+					match self.defs.intrinsics.identity_of(type_alias_index) {
+						Some(target) => TypeAliasSignature {
+							type_params: TypeEnvIdx::ROOT,
 							target,
+						},
+						None => {
+							let body = body.as_ref().expect(
+								"a non-intrinsic type alias always has a body",
+							);
+							let type_env = self.resolve_generic_params(
+								file_id,
+								namespace,
+								TypeEnvOwner::TypeAlias(type_alias_index),
+								TypeEnvIdx::ROOT,
+								type_params,
+							);
+							let target = self.resolve_type(
+								file_id,
+								namespace,
+								type_env,
+								body,
+								InferPolicy::Reject(
+									InferSignatureKind::TypeAlias,
+								),
+							);
+							TypeAliasSignature {
+								type_params: type_env,
+								target,
+							}
 						}
-					}
-				};
+					};
 
 				self.type_aliases[usize::from(type_alias_index)] = signature;
 				self.query_state.get_mut(&def_id).unwrap().state =
@@ -925,9 +876,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					declared_bounds,
 					implied_bounds: implied_bounds.into_boxed_slice(),
 				};
-				self.traits[usize::from(trait_index)] = TraitSignature {
-					env: self_scope,
-				};
+				self.traits[usize::from(trait_index)] =
+					TraitSignature { env: self_scope };
 				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::Trait(trait_index));
 			}
@@ -1028,7 +978,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						function_index,
 					));
 			}
-			AstNodeRef::TraitConst { trait_index, item } => {
+			AstNodeRef::TraitConst {
+				const_index,
+				trait_index,
+				item,
+			} => {
 				let ast::TraitItem::Const { ty, .. } = item else {
 					unreachable!()
 				};
@@ -1054,14 +1008,18 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					InferPolicy::Reject(InferSignatureKind::Const),
 				);
 
-				let index = ConstIndex::new(
-					u32::try_from(self.constants.len()).unwrap(),
-				);
-				self.constants.push(ConstantSignature { ty: resolved_ty });
+				self.constants[usize::from(const_index)] =
+					ConstantSignature { ty: resolved_ty };
 				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Constant(index));
+					QueryState::Resolved(SignatureLocation::Constant(
+						const_index,
+					));
 			}
-			AstNodeRef::TraitAssocType { trait_index, item } => {
+			AstNodeRef::TraitAssocType {
+				assoc_type_index,
+				trait_index,
+				item,
+			} => {
 				let ast::TraitItem::AssociatedType { name, bounds, .. } = item
 				else {
 					unreachable!()
@@ -1091,16 +1049,14 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let implied_bounds =
 					self.compute_implied_bounds(&resolved_bounds, name.inner);
 
-				let index = AssocTypeIndex::new(
-					u32::try_from(self.assoc_types.len()).unwrap(),
-				);
-				self.assoc_types.push(AssocTypeSignature {
-					declared_bounds: resolved_bounds,
-					implied_bounds: implied_bounds.into_boxed_slice(),
-				});
+				self.assoc_types[usize::from(assoc_type_index)] =
+					Some(AssocTypeSignature {
+						declared_bounds: resolved_bounds,
+						implied_bounds: implied_bounds.into_boxed_slice(),
+					});
 				self.query_state.get_mut(&def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::TraitAssocType(
-						index,
+						assoc_type_index,
 					));
 			}
 			AstNodeRef::RecordStruct { struct_index, item } => {
@@ -1562,15 +1518,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					) {
 					(ty, 1)
 				} else {
-					let walk = PathResolver::new(
-						&self.defs.namespaces,
-						&self.defs.use_items,
-						&self.defs.enums,
-						&self.defs.imports,
-						&self.defs.modules,
-						self.stdlib_root,
-					)
-					.walk_path(
+					let walk = PathResolver::new(self.defs).walk_path(
 						self.diagnostics,
 						self.strings,
 						file_id,
@@ -1649,7 +1597,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 										span: arg.span,
 									})
 									.collect();
-							let args = self.resolve_type_args(
+							let type_args = self.resolve_type_args(
 								file_id,
 								stopped.ident.span,
 								params_env,
@@ -1657,8 +1605,10 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								TypeEnvOwner::Struct(struct_index),
 							);
 
-							self.types
-								.intern(Type::Struct { struct_index, args })
+							self.types.intern(Type::Struct {
+								struct_index,
+								type_args,
+							})
 						}
 						_ => todo!(
 							"resolving a path to this kind of item isn't implemented yet"
@@ -2142,19 +2092,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					}
 
 					let trait_def = &self.defs.traits[usize::from(trait_index)];
-					let assoc_type_def_id = trait_def
+					let assoc_type_index = trait_def
 						.bindings
 						.get(&BindingKey::ty(binding.name.inner))
 						.map(|&member_index| {
 							trait_def.members[usize::from(member_index)].kind
 						})
 						.and_then(|kind| match kind {
-							MemberKind::AssociatedType(id) => Some(id),
+							MemberKind::AssociatedType(index) => Some(index),
 							MemberKind::Function(_)
 							| MemberKind::Method(_)
 							| MemberKind::Constant(_) => None,
 						});
-					let Some(assoc_type_def_id) = assoc_type_def_id else {
+					let Some(assoc_type_index) = assoc_type_index else {
 						self.diagnostics.push(report_not_an_associated_type(
 							file_id,
 							self.strings,
@@ -2190,7 +2140,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 					source_bindings.push(SourceAssocBinding {
 						name: binding.name,
-						assoc_type_def_id,
+						assoc_type_index,
 						kind,
 					});
 				}
@@ -2215,15 +2165,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		namespace: NamespaceIdx,
 		segments: &[ast::PathSegment],
 	) -> Option<TraitIdx> {
-		let target = PathResolver::new(
-			&self.defs.namespaces,
-			&self.defs.use_items,
-			&self.defs.enums,
-			&self.defs.imports,
-			&self.defs.modules,
-			self.stdlib_root,
-		)
-		.resolve_path(
+		let target = PathResolver::new(self.defs).resolve_path(
 			self.diagnostics,
 			self.strings,
 			file_id,
@@ -2248,9 +2190,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			// straight to `CycleReported` before the one call site that
 			// can actually report it, `Trait`'s own supertrait-forcing
 			// loop, ever gets a turn).
-			DefKind::TypeSet(typeset_index) => Some(
-				self.defs.typesets[usize::from(typeset_index)].trait_index,
-			),
+			DefKind::TypeSet(typeset_index) => {
+				Some(self.defs.typesets[usize::from(typeset_index)].trait_index)
+			}
 			other => {
 				let last = segments
 					.last()
@@ -2503,6 +2445,7 @@ mod tests {
 				&mut graph.strings,
 				&mut diagnostics,
 				graph.stdlib_package,
+				graph.root_package,
 			);
 
 			let signatures = SignatureRegistry::build(
@@ -2510,7 +2453,6 @@ mod tests {
 				&graph.strings,
 				&defs,
 				&ast_nodes,
-				graph.stdlib_package,
 			);
 
 			TestCase {
@@ -2534,9 +2476,8 @@ mod tests {
 		/// cleanly, so any diagnostic here would only ever be a bug in the
 		/// test, not something worth asserting on.
 		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
-			let root = self.graph.root_package.root_namespace();
+			let root = self.defs.root_package.root_namespace();
 			let file_id = self.defs.namespaces[usize::from(root)].file_id;
-			let stdlib_root = self.graph.stdlib_package.root_namespace();
 
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
@@ -2553,15 +2494,7 @@ mod tests {
 				})
 				.collect();
 			let mut scratch = Vec::new();
-			let target = PathResolver::new(
-				&self.defs.namespaces,
-				&self.defs.use_items,
-				&self.defs.enums,
-				&self.defs.imports,
-				&self.defs.modules,
-				stdlib_root,
-			)
-			.resolve_path(
+			let target = PathResolver::new(&self.defs).resolve_path(
 				&mut scratch,
 				&self.graph.strings,
 				file_id,
@@ -2586,8 +2519,8 @@ mod tests {
 
 		/// The written clause excludes the implicit `Self: ThisTrait` bound.
 		fn trait_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
-			let env = self.signatures.traits[usize::from(self.trait_index(path))]
-				.env;
+			let env =
+				self.signatures.traits[usize::from(self.trait_index(path))].env;
 			self.signatures.param_bounds[usize::from(env)][0]
 				.declared_bounds
 				.iter()
@@ -2659,15 +2592,12 @@ mod tests {
 					)
 				});
 			let member = &trait_def.members[usize::from(member_index)];
-			let MemberKind::AssociatedType(def_id) = member.kind else {
+			let MemberKind::AssociatedType(index) = member.kind else {
 				panic!("expected `{name}` to be an associated type");
 			};
-			let Some(&SignatureLocation::TraitAssocType(index)) =
-				self.signatures.item_lookup.get(&def_id)
-			else {
-				panic!("expected a TraitAssocType location for `{name}`");
-			};
-			&self.signatures.assoc_types[usize::from(index)]
+			self.signatures.assoc_types[usize::from(index)]
+				.as_ref()
+				.expect("trait associated type signature is resolved")
 		}
 
 		/// Same reasoning as `assoc_type_signature` — trait members aren't
@@ -2694,15 +2624,10 @@ mod tests {
 					)
 				});
 			let member = &trait_def.members[usize::from(member_index)];
-			let (MemberKind::Function(def_id) | MemberKind::Method(def_id)) =
+			let (MemberKind::Function(index) | MemberKind::Method(index)) =
 				member.kind
 			else {
 				panic!("expected `{name}` to be a function");
-			};
-			let Some(&SignatureLocation::Function(index)) =
-				self.signatures.item_lookup.get(&def_id)
-			else {
-				panic!("expected a Function location for `{name}`");
 			};
 			&self.signatures.functions[usize::from(index)]
 		}
@@ -2726,13 +2651,8 @@ mod tests {
 					panic!("expected `{trait_path}` to have a const `{name}`")
 				});
 			let member = &trait_def.members[usize::from(member_index)];
-			let MemberKind::Constant(def_id) = member.kind else {
+			let MemberKind::Constant(index) = member.kind else {
 				panic!("expected `{name}` to be a const");
-			};
-			let Some(&SignatureLocation::Constant(index)) =
-				self.signatures.item_lookup.get(&def_id)
-			else {
-				panic!("expected a Constant location for `{name}`");
 			};
 			&self.signatures.constants[usize::from(index)]
 		}
@@ -3030,13 +2950,15 @@ mod tests {
 			impl Tr for S {}
 			impl Tr for S {}
 		"});
-		let target = ImplTarget::from_type(case.signatures.types.resolve(
-			case.signatures.trait_impls[0]
-				.as_ref()
-				.unwrap()
-				.target
-				.inner,
-		))
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(
+				case.signatures.trait_impls[0]
+					.as_ref()
+					.unwrap()
+					.target
+					.inner,
+			),
+		)
 		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
@@ -3476,8 +3398,10 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let field_ty = case.struct_signature("Holder").field_types[0];
-		let Type::Struct { struct_index, args } =
-			case.signatures.types.resolve(field_ty)
+		let Type::Struct {
+			struct_index,
+			type_args: args,
+		} = case.signatures.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -3511,7 +3435,9 @@ mod tests {
 			"struct `Wrapper` takes 2 generic arguments but 1 generic argument was supplied"
 		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
-		let Type::Struct { args, .. } = case.signatures.types.resolve(field_ty)
+		let Type::Struct {
+			type_args: args, ..
+		} = case.signatures.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -3558,7 +3484,9 @@ mod tests {
 			"the trait bound `S: Bound` is not satisfied"
 		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
-		let Type::Struct { args, .. } = case.signatures.types.resolve(field_ty)
+		let Type::Struct {
+			type_args: args, ..
+		} = case.signatures.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -3577,7 +3505,9 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let field_ty = case.struct_signature("Holder").field_types[0];
-		let Type::Struct { args, .. } = case.signatures.types.resolve(field_ty)
+		let Type::Struct {
+			type_args: args, ..
+		} = case.signatures.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -3776,6 +3706,63 @@ mod tests {
 	}
 
 	#[test]
+	fn associated_type_signatures_keep_definition_indices_when_resolved_out_of_order()
+	 {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type bool;
+			trait Result { type Value; const FLAG: bool; }
+			trait Source { type Value; }
+			trait Container {
+				type First: Result where { Value = Self::Second::Value };
+				type Second: Source;
+				const COUNT: i32;
+			}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		// Resolving First's bound forces Second before First finishes.
+		for (name, expected_trait) in
+			[("First", "Result"), ("Second", "Source")]
+		{
+			let signature = case.assoc_type_signature("Container", name);
+			assert_eq!(signature.declared_bounds.len(), 1);
+			assert_eq!(
+				case.signatures
+					.bounds
+					.get(signature.declared_bounds[0])
+					.trait_index,
+				case.trait_index(expected_trait),
+			);
+		}
+		assert_eq!(
+			case.signatures.assoc_types.len(),
+			case.defs.assoc_types.len()
+		);
+		assert_eq!(case.signatures.constants.len(), case.defs.constants.len());
+		assert_eq!(
+			case.trait_const_signature("Result", "FLAG").ty,
+			TypeIndex::BOOL
+		);
+		assert_eq!(
+			case.trait_const_signature("Container", "COUNT").ty,
+			TypeIndex::I32
+		);
+		for (index, def) in case.defs.assoc_types.iter().enumerate() {
+			assert!(matches!(
+				case.signatures.item_lookup[&def.def_id],
+				SignatureLocation::TraitAssocType(found) if usize::from(found) == index
+			));
+		}
+		for (index, def) in case.defs.constants.iter().enumerate() {
+			assert!(matches!(
+				case.signatures.item_lookup[&def.def_id],
+				SignatureLocation::Constant(found) if usize::from(found) == index
+			));
+		}
+	}
+
+	#[test]
 	fn a_trait_const_resolves_its_declared_type() {
 		let case = TestCase::new("type i32; trait Foo { const X: i32; }");
 
@@ -3964,9 +3951,10 @@ mod tests {
 			case.typeset_signature("Int").members[0].inner,
 			TypeIndex::U32
 		);
-		let target =
-			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
-				.unwrap();
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(TypeIndex::U32),
+		)
+		.unwrap();
 		let candidates = case.signatures.trait_candidates(target);
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, case.typeset_trait_index("Int"));
@@ -3981,9 +3969,10 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let target =
-			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
-				.unwrap();
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(TypeIndex::U32),
+		)
+		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
 	}
 
@@ -3999,9 +3988,10 @@ mod tests {
 			case.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateTraitImpl.code())
 		);
-		let target =
-			ImplTarget::from_type(case.signatures.types.resolve(TypeIndex::U32))
-				.unwrap();
+		let target = ImplTarget::from_type(
+			case.signatures.types.resolve(TypeIndex::U32),
+		)
+		.unwrap();
 		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
 	}
 
@@ -4069,8 +4059,9 @@ mod tests {
 					Type::TypeParam { env, param_index } => {
 						assert_eq!(
 							*env,
-							case.signatures.traits[usize::from(container_index)]
-								.env
+							case.signatures.traits
+								[usize::from(container_index)]
+							.env
 						);
 						assert_eq!(
 							*param_index, 0,
@@ -4350,7 +4341,8 @@ mod tests {
 		let labels = &case.diagnostics[0].labels;
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
-		let env = case.signatures.traits[usize::from(case.trait_index("D"))].env;
+		let env =
+			case.signatures.traits[usize::from(case.trait_index("D"))].env;
 		let merged = case.signatures.param_bounds[usize::from(env)][0]
 			.implied_bounds
 			.iter()

@@ -11,7 +11,7 @@ use crate::{
 	ast::{self, DefId, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	tir::defs::{EnumIdx, StructIdx},
-	vfs::{FileId, PackageId},
+	vfs::FileId,
 };
 
 use super::{
@@ -104,7 +104,6 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	strings: &'a StringInterner,
 	defs: &'a DefinitionRegistry,
 	ast_nodes: &'a [AstEntry<'ast>],
-	stdlib_package: PackageId,
 	inherent: HashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: HashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
@@ -117,16 +116,8 @@ impl ImplDispatch {
 		strings: &StringInterner,
 		defs: &DefinitionRegistry,
 		ast_nodes: &[AstEntry<'_>],
-		stdlib_package: PackageId,
 	) -> Self {
-		ImplDispatchBuilder::new(
-			diagnostics,
-			strings,
-			defs,
-			ast_nodes,
-			stdlib_package,
-		)
-		.build()
+		ImplDispatchBuilder::new(diagnostics, strings, defs, ast_nodes).build()
 	}
 
 	pub(super) fn inherent_target(
@@ -166,14 +157,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		strings: &'a StringInterner,
 		defs: &'a DefinitionRegistry,
 		ast_nodes: &'a [AstEntry<'ast>],
-		stdlib_package: PackageId,
 	) -> Self {
 		Self {
 			diagnostics,
 			strings,
 			defs,
 			ast_nodes,
-			stdlib_package,
 			inherent: HashMap::new(),
 			traits: HashMap::new(),
 			inherent_targets: vec![None; defs.inherent_impls.len()],
@@ -438,15 +427,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			);
 			return Err(());
 		}
-		let binding = PathResolver::new(
-			&self.defs.namespaces,
-			&self.defs.use_items,
-			&self.defs.enums,
-			&self.defs.imports,
-			&self.defs.modules,
-			self.stdlib_package.root_namespace(),
-		)
-		.resolve_path(
+		let binding = PathResolver::new(self.defs).resolve_path(
 			self.diagnostics,
 			self.strings,
 			file_id,
@@ -487,15 +468,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		namespace: NamespaceIdx,
 		path: &ast::Path,
 	) -> Option<TraitIdx> {
-		let binding = PathResolver::new(
-			&self.defs.namespaces,
-			&self.defs.use_items,
-			&self.defs.enums,
-			&self.defs.imports,
-			&self.defs.modules,
-			self.stdlib_package.root_namespace(),
-		)
-		.resolve_path(
+		let binding = PathResolver::new(self.defs).resolve_path(
 			self.diagnostics,
 			self.strings,
 			file_id,
@@ -584,7 +557,7 @@ impl SignatureBuilder<'_, '_> {
 			ImplTarget::Struct(struct_index) => {
 				self.types.intern(Type::Struct {
 					struct_index,
-					args: Box::new([]),
+					type_args: Box::new([]),
 				})
 			}
 			ImplTarget::Enum(enum_index) => {

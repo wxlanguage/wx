@@ -5,12 +5,12 @@
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-use crate::ast::{DefId, Spanned, StringInterner};
+use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{DefinitionRegistry, TraitIdx};
+use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
 use super::signatures::{QueryInfo, SignatureBuilder, SignatureStatus};
 use super::types::TypeIndex;
 
@@ -36,7 +36,7 @@ pub(super) struct SourceTraitBound {
 /// One `Assoc = Type` or `Assoc: Bounds` clause inside a written bound.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct SourceAssocBinding {
-	pub(super) assoc_type_def_id: DefId,
+	pub(super) assoc_type_index: AssocTypeIdx,
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
 }
@@ -253,10 +253,9 @@ fn union_trait_bound(
 	}
 
 	for incoming in bound.bindings {
-		let assoc_type_def_id =
-			arena.binding(incoming.source).assoc_type_def_id;
+		let assoc_type_index = arena.binding(incoming.source).assoc_type_index;
 		match existing.bindings.iter().position(|b| {
-			arena.binding(b.source).assoc_type_def_id == assoc_type_def_id
+			arena.binding(b.source).assoc_type_index == assoc_type_index
 		}) {
 			None => existing.bindings.push(incoming),
 			Some(index) => {

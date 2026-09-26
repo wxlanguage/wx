@@ -14,13 +14,12 @@ use crate::tir::types::TypeEnvOwner;
 
 use super::bounds::ImpliedTraitBound;
 use super::defs::{
-	AstNodeRef, BindingKey, BindingNamespace, InherentImplIdx, MemberKind,
-	TraitImplIdx, TraitIdx,
+	AssocTypeIdx, BindingKey, BindingNamespace, InherentImplIdx, MemberKind,
+	TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
 use super::signatures::{
-	AssocTypeIndex, QueryInfo, SignatureBuilder, SignatureLocation,
-	SignatureStatus,
+	QueryInfo, SignatureBuilder, SignatureLocation, SignatureStatus,
 };
 use super::types::{Type, TypeIndex};
 
@@ -36,8 +35,7 @@ pub(super) enum TypeMemberLookup {
 }
 
 pub(super) struct TypeMemberTarget {
-	/// Carries the member's own `DefId` already — no separate `id` field
-	/// needed alongside it.
+	/// Carries the index into the member's definition arena.
 	pub(super) kind: MemberKind,
 	pub(super) source: MemberSource,
 }
@@ -164,6 +162,8 @@ impl SignatureBuilder<'_, '_> {
 				};
 				self.candidates_from_implied(
 					&self.assoc_types[usize::from(assoc_type_index)]
+						.as_ref()
+						.expect("trait associated type signature is resolved")
 						.implied_bounds,
 					key,
 					None,
@@ -178,7 +178,7 @@ impl SignatureBuilder<'_, '_> {
 
 	/// Turns an already-merged implied set into a lookup result — shared
 	/// between all three receiver shapes `resolve_bound_member` handles.
-	/// Purely identity: which trait/`DefId` this name names. Whether the
+	/// Purely identity: which member definition this name names. Whether the
 	/// combination's `where { .. }` bindings for it actually agree
 	/// (`MergedBindingKind::Conflicting`, already diagnosed once by
 	/// `union_trait_bound`) is a fact about this associated type's *value*,
@@ -233,18 +233,20 @@ impl SignatureBuilder<'_, '_> {
 		trait_index: TraitIdx,
 		assoc_name: SymbolU32,
 		requested_at: SourceSpan,
-	) -> Option<AssocTypeIndex> {
+	) -> Option<AssocTypeIdx> {
 		let key = BindingKey::ty(assoc_name);
 		let &member_index = self.defs.traits[usize::from(trait_index)]
 			.bindings
 			.get(&key)?;
-		let MemberKind::AssociatedType(def_id) = self.defs.traits
+		let MemberKind::AssociatedType(assoc_type_index) = self.defs.traits
 			[usize::from(trait_index)]
 		.members[usize::from(member_index)]
 		.kind
 		else {
 			return None;
 		};
+		let def_id =
+			self.defs.assoc_types[usize::from(assoc_type_index)].def_id;
 		match self.ensure_signature(QueryInfo {
 			def_id,
 			requested_at: Some(requested_at),

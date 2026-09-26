@@ -1184,14 +1184,11 @@ mod tests {
 	use indoc::indoc;
 
 	use super::*;
-	use crate::tir::defs::DefinitionRegistry;
+	use crate::testing::DiagnosticView;
+	use crate::tir::defs::{BindingNamespace, DefinitionRegistry};
 	use crate::vfs;
 
-	/// Small, `use`-resolution-only duplicate of `defs::tests::TestCase` —
-	/// kept separate rather than shared across the two files so each test
-	/// module stays self-contained; see the two files' own tests for the
-	/// scanning-focused cases this one doesn't need to cover
-	/// (`new_multi_file`, direct `.defs`/`.graph` access).
+	/// Builds definitions and inspects the bindings installed by `use` resolution.
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
@@ -1200,6 +1197,13 @@ mod tests {
 
 	impl TestCase {
 		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+			let parser_diagnostics = graph.collect_parser_diagnostics();
+			DiagnosticView::new("parse", &parser_diagnostics, &graph.files)
+				.assert_no_errors();
+			let linker_diagnostics = graph.collect_linker_diagnostics();
+			DiagnosticView::new("link", &linker_diagnostics, &graph.files)
+				.assert_no_errors();
+
 			let mut diagnostics = Vec::new();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
@@ -1207,6 +1211,7 @@ mod tests {
 				&mut graph.strings,
 				&mut diagnostics,
 				graph.stdlib_package,
+				graph.root_package,
 			);
 			// Only Phase 1 (defs.rs + this module) is under test here —
 			// `ast_nodes` is Phase 2's input, and dropping it now is what
@@ -1252,57 +1257,56 @@ mod tests {
 		}
 
 		fn root_namespace(&self) -> NamespaceIdx {
-			self.graph.root_package.root_namespace()
+			self.defs.root_package.root_namespace()
 		}
 
-		fn diagnostics(&self) -> crate::testing::DiagnosticView<'_> {
-			crate::testing::DiagnosticView::new(
-				"prescan",
-				&self.diagnostics,
-				&self.graph.files,
-			)
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
 		}
 
-		fn lookup_type(
-			&mut self,
+		/// Inspects a stored binding without following glob imports or checking privacy.
+		fn direct_binding(
+			&self,
 			namespace: NamespaceIdx,
+			tier: BindingNamespace,
 			name: &str,
-		) -> Option<BindingTarget> {
-			let symbol = self.graph.strings.get_or_intern(name);
+		) -> Option<&Binding> {
+			let symbol = self.graph.strings.get(name)?;
 			self.defs.namespaces[usize::from(namespace)]
 				.bindings
-				.get(&BindingKey::ty(symbol))
-				.map(|binding| binding.target)
+				.get(&BindingKey::new(tier, symbol))
 		}
 
-		fn lookup_value(
-			&mut self,
+		#[track_caller]
+		fn expect_direct_def(
+			&self,
 			namespace: NamespaceIdx,
+			tier: BindingNamespace,
 			name: &str,
-		) -> Option<BindingTarget> {
-			let symbol = self.graph.strings.get_or_intern(name);
-			self.defs.namespaces[usize::from(namespace)]
-				.bindings
-				.get(&BindingKey::value(symbol))
-				.map(|binding| binding.target)
+		) -> DefKey {
+			let target = self
+				.direct_binding(namespace, tier, name)
+				.map(|binding| binding.target);
+			let Some(BindingTarget::Accessible(key)) = target else {
+				panic!(
+					"expected an Accessible direct {} binding for `{name}` in {namespace:?}, got {target:?}",
+					tier.noun(),
+				);
+			};
+			key
 		}
 
 		/// Follows a bound name to the namespace it names — e.g. the
 		/// namespace a `mod inner { ... }` or `mod inner;` declares.
+		#[track_caller]
 		fn child_namespace(
-			&mut self,
+			&self,
 			namespace: NamespaceIdx,
 			name: &str,
 		) -> NamespaceIdx {
-			let target = self
-				.lookup_type(namespace, name)
-				.unwrap_or_else(|| panic!("`{name}` should be bound"));
-			let BindingTarget::Accessible(def_key) = target else {
-				panic!("`{name}` should be accessible here");
-			};
-			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
-				.items[usize::from(def_key.def_idx)]
-			.kind;
+			let key =
+				self.expect_direct_def(namespace, BindingNamespace::Type, name);
+			let kind = key.symbol_kind(&self.defs);
 			self.defs.namespace_of(kind).unwrap_or_else(|| {
 				panic!("`{name}` is not a namespace: {kind:?}")
 			})
@@ -1320,49 +1324,37 @@ mod tests {
 
 	#[test]
 	fn use_binds_to_the_same_def_as_the_original() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod inner {
 				pub fn helper() -> i32 { 1 }
 			}
 			use inner::helper;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let inner = case.child_namespace(root, "inner");
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(inner, "helper")
-		else {
-			panic!("`inner::helper` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(imported)) =
-			case.lookup_value(root, "helper")
-		else {
-			panic!("`use inner::helper;` should install a binding at the root");
-		};
+		let original =
+			case.expect_direct_def(inner, BindingNamespace::Value, "helper");
+		let imported =
+			case.expect_direct_def(root, BindingNamespace::Value, "helper");
 		assert_eq!(imported, original);
 	}
 
 	#[test]
 	fn use_resolves_an_enum_variant() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			enum Color { Red, Green, Blue }
 			use Color::Red;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let color = case.child_namespace(root, "Color");
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(color, "Red")
-		else {
-			panic!("`Color::Red` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(imported)) =
-			case.lookup_value(root, "Red")
-		else {
-			panic!("`use Color::Red;` should install a binding at the root");
-		};
+		let original =
+			case.expect_direct_def(color, BindingNamespace::Value, "Red");
+		let imported =
+			case.expect_direct_def(root, BindingNamespace::Value, "Red");
 		assert_eq!(imported, original);
 	}
 
@@ -1372,7 +1364,7 @@ mod tests {
 	/// same way across the file boundary.
 	#[test]
 	fn use_resolves_a_name_declared_in_another_file() {
-		let mut case = TestCase::new_workspace(
+		let case = TestCase::new_workspace(
 			vfs::AbsolutePath::new("/main.wx"),
 			HashMap::from([
 				(
@@ -1385,48 +1377,36 @@ mod tests {
 				),
 			]),
 		);
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let math = case.child_namespace(root, "math");
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(math, "add")
-		else {
-			panic!("`math::add` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(imported)) =
-			case.lookup_value(root, "add")
-		else {
-			panic!("`use math::add;` should resolve across the file boundary");
-		};
+		let original =
+			case.expect_direct_def(math, BindingNamespace::Value, "add");
+		let imported =
+			case.expect_direct_def(root, BindingNamespace::Value, "add");
 		assert_eq!(imported, original);
 	}
 
 	#[test]
 	fn use_with_alias_binds_under_the_alias_name() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			fn add() -> i32 { 1 }
 			use add as sub;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(root, "add")
-		else {
-			panic!("`add` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(aliased)) =
-			case.lookup_value(root, "sub")
-		else {
-			panic!("`use add as sub;` should install a binding under `sub`");
-		};
+		let original =
+			case.expect_direct_def(root, BindingNamespace::Value, "add");
+		let aliased =
+			case.expect_direct_def(root, BindingNamespace::Value, "sub");
 		assert_eq!(aliased, original);
 	}
 
 	#[test]
 	fn use_of_private_item_reports_immediately_and_recovers_as_accessible() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod inner {
 				fn secret() -> i32 { 1 }
 			}
@@ -1437,6 +1417,8 @@ mod tests {
 		// rather than deferred — deferring would risk the problem never
 		// being reported at all if nothing else ever consults this
 		// binding again.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PrivateItem]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::PrivateItem,
 			|diagnostic| {
@@ -1445,19 +1427,12 @@ mod tests {
 		);
 
 		let root = case.root_namespace();
-		match case.lookup_value(root, "secret") {
-			Some(BindingTarget::Accessible(_)) => {}
-			other => panic!(
-				"having already reported the privacy error, `secret` \
-				 should recover as Accessible rather than deferring \
-				 further, got {other:?}"
-			),
-		}
+		case.expect_direct_def(root, BindingNamespace::Value, "secret");
 	}
 
 	#[test]
 	fn use_imports_both_namespaces_when_a_name_occupies_both() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod x {
 				pub type Y = u32;
 
@@ -1468,23 +1443,11 @@ mod tests {
 
 			use x::Y;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(
-			matches!(
-				case.lookup_type(root, "Y"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"the type `Y` should also be imported"
-		);
-		assert!(
-			matches!(
-				case.lookup_value(root, "Y"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"the function `Y` should also be imported"
-		);
+		case.expect_direct_def(root, BindingNamespace::Type, "Y");
+		case.expect_direct_def(root, BindingNamespace::Value, "Y");
 	}
 
 	#[test]
@@ -1499,6 +1462,8 @@ mod tests {
 			use math::inner::add;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::UnresolvedImport,
 			|diagnostic| {
@@ -1584,6 +1549,8 @@ mod tests {
 			use outer::inner::helper;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PrivateItem]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::PrivateItem,
 			|diagnostic| {
@@ -1600,6 +1567,8 @@ mod tests {
 			use Helper::something;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotUseAsNamespace]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
@@ -1665,7 +1634,7 @@ mod tests {
 
 	#[test]
 	fn pending_import_still_fills_the_other_symbol_namespace() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			use a::X;
 
 			mod a {
@@ -1677,17 +1646,11 @@ mod tests {
 				pub type X = u32;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(matches!(
-			case.lookup_type(root, "X"),
-			Some(BindingTarget::Accessible(_))
-		));
-		assert!(matches!(
-			case.lookup_value(root, "X"),
-			Some(BindingTarget::Accessible(_))
-		));
+		case.expect_direct_def(root, BindingNamespace::Type, "X");
+		case.expect_direct_def(root, BindingNamespace::Value, "X");
 	}
 
 	/// Both definitions competing here are the local `use` declarations. The
@@ -1710,6 +1673,8 @@ mod tests {
 		let expected_start =
 			source.find("use a::pick").unwrap() + "use a::".len();
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::DuplicateDefinition,
 			|diagnostic| {
@@ -1730,7 +1695,7 @@ mod tests {
 
 	#[test]
 	fn reexport_chain_of_two_hops_resolves_to_the_original_def() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				mod b {
 					pub fn f() -> i32 { 1 }
@@ -1739,21 +1704,14 @@ mod tests {
 			}
 			use a::f;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(b, "f")
-		else {
-			panic!("`b::f` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(reexported)) =
-			case.lookup_value(root, "f")
-		else {
-			panic!("`use a::f;` should resolve through the re-export chain");
-		};
+		let original = case.expect_direct_def(b, BindingNamespace::Value, "f");
+		let reexported =
+			case.expect_direct_def(root, BindingNamespace::Value, "f");
 		assert_eq!(reexported, original);
 	}
 
@@ -1771,6 +1729,8 @@ mod tests {
 			}
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::UnresolvedImport,
 			|diagnostic| {
@@ -1806,46 +1766,37 @@ mod tests {
 
 	#[test]
 	fn use_group_binds_every_name() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod math {
 				pub fn add() -> i32 { 1 }
 				pub fn sub() -> i32 { 2 }
 			}
 			use math::{add, sub};
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(matches!(
-			case.lookup_value(root, "add"),
-			Some(BindingTarget::Accessible(_))
-		));
-		assert!(matches!(
-			case.lookup_value(root, "sub"),
-			Some(BindingTarget::Accessible(_))
-		));
+		case.expect_direct_def(root, BindingNamespace::Value, "add");
+		case.expect_direct_def(root, BindingNamespace::Value, "sub");
 	}
 
 	#[test]
 	fn use_before_the_module_it_imports_from_still_resolves() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			use inner::helper;
 			mod inner {
 				pub fn helper() -> i32 { 1 }
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(matches!(
-			case.lookup_value(root, "helper"),
-			Some(BindingTarget::Accessible(_))
-		));
+		case.expect_direct_def(root, BindingNamespace::Value, "helper");
 	}
 
 	#[test]
 	fn use_via_self_crate_and_super() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod outer {
 				pub fn helper() -> i32 { 1 }
 				use self::helper as via_self;
@@ -1855,29 +1806,20 @@ mod tests {
 				}
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let outer = case.child_namespace(root, "outer");
 		let inner = case.child_namespace(outer, "inner");
 
-		assert!(matches!(
-			case.lookup_value(outer, "via_self"),
-			Some(BindingTarget::Accessible(_))
-		));
-		assert!(matches!(
-			case.lookup_value(inner, "via_super"),
-			Some(BindingTarget::Accessible(_))
-		));
-		assert!(matches!(
-			case.lookup_value(inner, "via_crate"),
-			Some(BindingTarget::Accessible(_))
-		));
+		case.expect_direct_def(outer, BindingNamespace::Value, "via_self");
+		case.expect_direct_def(inner, BindingNamespace::Value, "via_super");
+		case.expect_direct_def(inner, BindingNamespace::Value, "via_crate");
 	}
 
 	#[test]
 	fn import_only_claims_the_namespace_it_occupies() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			fn Y() -> i32 { 1 }
 
 			mod x {
@@ -1886,46 +1828,28 @@ mod tests {
 
 			use x::Y;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(
-			matches!(
-				case.lookup_value(root, "Y"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"the directly-defined value `Y` should be untouched"
-		);
-		assert!(
-			matches!(
-				case.lookup_type(root, "Y"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"the imported type `Y` should occupy only the type namespace"
-		);
+		case.expect_direct_def(root, BindingNamespace::Value, "Y");
+		case.expect_direct_def(root, BindingNamespace::Type, "Y");
 	}
 
 	#[test]
 	fn reexport_of_a_public_item_stays_accessible() {
 		// Control case — no capping needed here (pub -> pub), so this
 		// should already pass and should keep passing once capping exists.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod inner {
 				pub fn helper() -> i32 { 1 }
 				pub use helper as public_helper;
 			}
 			use inner::public_helper;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(
-			matches!(
-				case.lookup_value(root, "public_helper"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"re-exporting an already-public item should stay accessible"
-		);
+		case.expect_direct_def(root, BindingNamespace::Value, "public_helper");
 	}
 
 	#[test]
@@ -1937,7 +1861,7 @@ mod tests {
 		// everything needed to check accessibility, so it's reported
 		// there too rather than silently deferred. Having reported both,
 		// each recovers as `Accessible` rather than cascading further.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod inner {
 				fn secret() -> i32 { 1 }
 				pub use secret as public_secret;
@@ -1951,15 +1875,7 @@ mod tests {
 		]);
 
 		let root = case.root_namespace();
-		assert!(
-			matches!(
-				case.lookup_value(root, "public_secret"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"having already reported both problems, `public_secret` \
-			 should recover as Accessible, found: {:?}",
-			case.lookup_value(root, "public_secret")
-		);
+		case.expect_direct_def(root, BindingNamespace::Value, "public_secret");
 	}
 
 	#[test]
@@ -1970,20 +1886,17 @@ mod tests {
 		// `use` item resolves. A path prefix depending on it must force
 		// that resolution the same way a leaf name would, regardless of
 		// which one appears first in the file.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			use alias::helper;
 			use real as alias;
 			mod real {
 				pub fn helper() -> i32 { 1 }
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(matches!(
-			case.lookup_value(root, "helper"),
-			Some(BindingTarget::Accessible(_))
-		));
+		case.expect_direct_def(root, BindingNamespace::Value, "helper");
 	}
 
 	#[test]
@@ -2007,19 +1920,22 @@ mod tests {
 
 	#[test]
 	fn plain_glob_records_a_fallback_edge_to_its_target() {
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod math {
 				pub fn add() -> i32 { 1 }
 			}
 			use math::*;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let math = case.child_namespace(root, "math");
 		assert_eq!(case.glob_targets(root), vec![math]);
 		// A plain glob never installs a binding — only the fallback edge.
-		assert!(case.lookup_value(root, "add").is_none());
+		assert!(
+			case.direct_binding(root, BindingNamespace::Value, "add")
+				.is_none()
+		);
 	}
 
 	#[test]
@@ -2029,7 +1945,7 @@ mod tests {
 		// This is the case that would need real fixed-point iteration in
 		// a Rust-style resolver; here it's just two independent, harmless
 		// facts.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				use crate::b::*;
 			}
@@ -2038,7 +1954,7 @@ mod tests {
 				use crate::a::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
@@ -2063,7 +1979,7 @@ mod tests {
 		// re-export surface (empty, no further `pub` globs of its own)
 		// must not be mistaken for a cycle just because it's reached
 		// twice, once via `b` and once via `c`'s recursion into `b`.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub fn helper() -> i32 { 1 }
 			}
@@ -2074,7 +1990,7 @@ mod tests {
 				pub use crate::b::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
@@ -2089,7 +2005,7 @@ mod tests {
 		// `b` doesn't define `helper` itself — it only sees it via its own
 		// `pub use a::*;` — so `use b::helper;` has to fall through
 		// `lookup`'s indirect half to find it at all.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub fn helper() -> i32 { 1 }
 			}
@@ -2098,22 +2014,14 @@ mod tests {
 			}
 			use b::helper;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(a, "helper")
-		else {
-			panic!("`a::helper` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(reexported)) =
-			case.lookup_value(root, "helper")
-		else {
-			panic!(
-				"`use b::helper;` should resolve through `b`'s own pub glob"
-			);
-		};
+		let original =
+			case.expect_direct_def(a, BindingNamespace::Value, "helper");
+		let reexported =
+			case.expect_direct_def(root, BindingNamespace::Value, "helper");
 		assert_eq!(reexported, original);
 	}
 
@@ -2174,6 +2082,8 @@ mod tests {
 			use hub::pick;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AmbiguousIdentifier]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::AmbiguousIdentifier,
 			|diagnostic| {
@@ -2220,7 +2130,15 @@ mod tests {
 			}
 			use d::helper;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let original =
+			case.expect_direct_def(a, BindingNamespace::Value, "helper");
+		let imported =
+			case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		assert_eq!(imported, original);
 	}
 
 	#[test]
@@ -2281,7 +2199,7 @@ mod tests {
 		// accessor outside `b`'s own subtree, so this must resolve cleanly
 		// to it rather than reporting a spurious ambiguity between a real
 		// choice and one that was never actually reachable.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub fn pick() -> i32 { 1 }
 			}
@@ -2294,20 +2212,13 @@ mod tests {
 			}
 			use hub::pick;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let Some(BindingTarget::Accessible(a_pick)) =
-			case.lookup_value(a, "pick")
-		else {
-			panic!("a::pick should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(resolved)) =
-			case.lookup_value(root, "pick")
-		else {
-			panic!("hub::pick should resolve to a::pick, not be swallowed");
-		};
+		let a_pick = case.expect_direct_def(a, BindingNamespace::Value, "pick");
+		let resolved =
+			case.expect_direct_def(root, BindingNamespace::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2323,7 +2234,7 @@ mod tests {
 		// *replace* it outright rather than merge into an ambiguity — as
 		// opposed to the other test's ordering, where the reachable one
 		// arrives first and the unreachable one is simply turned away.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub fn pick() -> i32 { 1 }
 			}
@@ -2336,20 +2247,13 @@ mod tests {
 			}
 			use hub::pick;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let Some(BindingTarget::Accessible(a_pick)) =
-			case.lookup_value(a, "pick")
-		else {
-			panic!("a::pick should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(resolved)) =
-			case.lookup_value(root, "pick")
-		else {
-			panic!("hub::pick should resolve to a::pick, not be swallowed");
-		};
+		let a_pick = case.expect_direct_def(a, BindingNamespace::Value, "pick");
+		let resolved =
+			case.expect_direct_def(root, BindingNamespace::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2358,20 +2262,22 @@ mod tests {
 		// The exact shape from the design discussion: a local `X` must
 		// never even trigger a duplicate-definition check against
 		// something a glob happens to also offer under the same name.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub const X: i32 = 0;
 			}
 			pub use a::*;
 			const X: i32 = 1;
+			use X as selected;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(matches!(
-			case.lookup_value(root, "X"),
-			Some(BindingTarget::Accessible(_))
-		));
+		let local = case.expect_direct_def(root, BindingNamespace::Value, "X");
+		assert_eq!(local.namespace_idx, root);
+		let selected =
+			case.expect_direct_def(root, BindingNamespace::Value, "selected");
+		assert_eq!(selected, local);
 	}
 
 	#[test]
@@ -2389,6 +2295,8 @@ mod tests {
 			use math::inner::*;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::UnresolvedImport,
 			|diagnostic| {
@@ -2418,6 +2326,8 @@ mod tests {
 			use Helper::*;
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotUseAsNamespace]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CannotUseAsNamespace,
 			|diagnostic| {
@@ -2439,7 +2349,7 @@ mod tests {
 		// exists — so this should resolve to `b::pick` without a
 		// duplicate-definition or ambiguity diagnostic, the same way the
 		// direct-definition case does.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub fn pick() -> i32 { 1 }
 			}
@@ -2449,22 +2359,13 @@ mod tests {
 			pub use a::*;
 			use b::pick;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let b = case.child_namespace(root, "b");
-		let Some(BindingTarget::Accessible(b_pick)) =
-			case.lookup_value(b, "pick")
-		else {
-			panic!("`b::pick` should resolve directly");
-		};
-		let Some(BindingTarget::Accessible(resolved)) =
-			case.lookup_value(root, "pick")
-		else {
-			panic!(
-				"`use b::pick;` should win over the colliding `pub use a::*;`"
-			);
-		};
+		let b_pick = case.expect_direct_def(b, BindingNamespace::Value, "pick");
+		let resolved =
+			case.expect_direct_def(root, BindingNamespace::Value, "pick");
 		assert_eq!(resolved, b_pick);
 	}
 
@@ -2490,7 +2391,7 @@ mod tests {
 				pub use crate::b::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -2520,7 +2421,7 @@ mod tests {
 		// `scan_use_tree`'s `Group` arm recurses into `Name`, `Path`,
 		// `Group` and `Glob` branches alike — this exercises a glob branch
 		// sitting alongside a named one in the same group.
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				pub mod b {
 					pub fn helper() -> i32 { 1 }
@@ -2529,16 +2430,10 @@ mod tests {
 			}
 			use a::{b::*, c};
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		assert!(
-			matches!(
-				case.lookup_value(root, "c"),
-				Some(BindingTarget::Accessible(_))
-			),
-			"the named branch of the group should install a direct binding"
-		);
+		case.expect_direct_def(root, BindingNamespace::Value, "c");
 
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
@@ -2643,22 +2538,26 @@ mod tests {
 		// lookup through the pair (a plain, still-legal case per the
 		// language design: sibling private glob cycles are never walkable
 		// by any single accessor, so they're deliberately left standing).
-		let mut case = TestCase::new(indoc! {"
+		let case = TestCase::new(indoc! {"
 			mod a {
 				use crate::b::*;
 				pub fn only_in_a() -> i32 { 1 }
 			}
 			mod b {
 				use crate::a::*;
+				use only_in_a as selected;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(root, "b");
-		assert_eq!(case.glob_targets(a), vec![b]);
-		assert_eq!(case.glob_targets(b), vec![a]);
+		let original =
+			case.expect_direct_def(a, BindingNamespace::Value, "only_in_a");
+		let selected =
+			case.expect_direct_def(b, BindingNamespace::Value, "selected");
+		assert_eq!(selected, original);
 	}
 
 	#[test]
@@ -2676,6 +2575,8 @@ mod tests {
 			}
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CyclicImport,
 			|diagnostic| {
@@ -2712,6 +2613,8 @@ mod tests {
 			}
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CyclicImport,
 			|diagnostic| {
@@ -2770,6 +2673,8 @@ mod tests {
 			}
 		"});
 
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicImport]);
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::CyclicImport,
 			|diagnostic| {

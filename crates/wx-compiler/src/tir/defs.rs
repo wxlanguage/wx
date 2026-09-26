@@ -44,6 +44,9 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	enums: Vec<EnumDef>,
 	typesets: Vec<TypeSetDef>,
 	functions: Vec<FunctionDef>,
+	memories: Vec<MemoryDef>,
+	constants: Vec<ConstDef>,
+	assoc_types: Vec<AssocTypeDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
@@ -273,11 +276,53 @@ pub struct FunctionDef {
 	pub params: Box<[Spanned<SymbolU32>]>,
 }
 
+/// Identity shared by local and imported memories. Size and bound
+/// expressions remain in the AST for later resolution.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct MemoryDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+}
+
+/// Identity of a free, trait, or impl constant. Its type and value are
+/// resolved in later phases.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct ConstDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+}
+
+/// Each trait declaration and each impl definition has its own identity.
+/// Declared bounds and impl target types remain in the AST for resolution.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct AssocTypeDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+}
+
 index_newtype!(LocalDefIdx);
 index_newtype!(MemberIdx);
 index_newtype!(ModuleIdx);
 index_newtype!(ImportIdx);
 index_newtype!(NamespaceIdx);
+index_newtype!(TraitIdx);
+index_newtype!(InherentImplIdx);
+index_newtype!(TraitImplIdx);
+index_newtype!(StructIdx);
+index_newtype!(FieldIdx);
+index_newtype!(EnumIdx);
+index_newtype!(TypesetIdx);
+index_newtype!(TypeAliasIdx);
+index_newtype!(FunctionIdx);
+index_newtype!(MemoryIdx);
+index_newtype!(ConstIdx);
+index_newtype!(AssocTypeIdx);
 
 impl PackageId {
 	/// Packages preallocate their own root namespace 1:1, in `PackageId`
@@ -289,16 +334,6 @@ impl PackageId {
 		NamespaceIdx::new(self.as_u32())
 	}
 }
-
-index_newtype!(TraitIdx);
-index_newtype!(InherentImplIdx);
-index_newtype!(TraitImplIdx);
-index_newtype!(StructIdx);
-index_newtype!(FieldIdx);
-index_newtype!(EnumIdx);
-index_newtype!(TypesetIdx);
-index_newtype!(TypeAliasIdx);
-index_newtype!(FunctionIdx);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -327,6 +362,10 @@ impl LocalDefIdx {
 pub(super) struct AstEntry<'ast> {
 	pub(super) def_id: DefId,
 	pub(super) file_id: FileId,
+	/// The item's owning namespace. For imported declarations this is
+	/// the import block's own namespace, whose `NamespaceOwner::Import`
+	/// identifies its `ImportDef`. Use that definition's `parent_namespace`
+	/// when resolving the declaration's signature in the enclosing scope.
 	pub(super) namespace: NamespaceIdx,
 	pub(super) node: AstNodeRef<'ast>,
 }
@@ -355,9 +394,11 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 	},
 	Memory {
+		memory_index: MemoryIdx,
 		item: &'ast ast::Item,
 	},
 	Constant {
+		const_index: ConstIdx,
 		item: &'ast ast::Item,
 	},
 	TypeSet {
@@ -378,10 +419,12 @@ pub(super) enum AstNodeRef<'ast> {
 		function_index: FunctionIdx,
 	},
 	TraitConst {
+		const_index: ConstIdx,
 		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
 	},
 	TraitAssocType {
+		assoc_type_index: AssocTypeIdx,
 		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
 	},
@@ -395,10 +438,12 @@ pub(super) enum AstNodeRef<'ast> {
 		function_index: FunctionIdx,
 	},
 	TraitImplConstant {
+		const_index: ConstIdx,
 		item: &'ast ast::ImplItem,
 		block_index: TraitImplIdx,
 	},
 	TraitImplAssocType {
+		assoc_type_index: AssocTypeIdx,
 		item: &'ast ast::ImplItem,
 		block_index: TraitImplIdx,
 	},
@@ -412,19 +457,19 @@ pub(super) enum AstNodeRef<'ast> {
 		function_index: FunctionIdx,
 	},
 	InherentImplConst {
+		const_index: ConstIdx,
 		item: &'ast ast::ImplItem,
 		block_index: InherentImplIdx,
 	},
 	ImportedMemory {
-		import_module_index: ImportIdx,
+		memory_index: MemoryIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedFunction {
-		import_module_index: ImportIdx,
+		function_index: FunctionIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedGlobal {
-		import_module_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	Export {
@@ -434,6 +479,8 @@ pub(super) enum AstNodeRef<'ast> {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct DefinitionRegistry {
+	pub stdlib_package: PackageId,
+	pub root_package: PackageId,
 	pub namespaces: Vec<Namespace>,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
 	#[cfg_attr(test, serde(skip))]
@@ -447,6 +494,9 @@ pub(super) struct DefinitionRegistry {
 	pub enums: Vec<EnumDef>,
 	pub typesets: Vec<TypeSetDef>,
 	pub functions: Vec<FunctionDef>,
+	pub memories: Vec<MemoryDef>,
+	pub constants: Vec<ConstDef>,
+	pub assoc_types: Vec<AssocTypeDef>,
 	pub type_aliases: Vec<TypeAliasDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
@@ -592,13 +642,13 @@ pub enum DefKind {
 	Enum(EnumIdx),
 	EnumVariant(DefId),
 	Struct(StructIdx),
-	Memory(DefId),
+	Memory(MemoryIdx),
 	Trait(TraitIdx),
 	TypeSet(TypesetIdx),
 	Global(DefId),
 	Function(FunctionIdx),
-	Const(DefId),
-	TraitAssocType(DefId),
+	Const(ConstIdx),
+	TraitAssocType(AssocTypeIdx),
 	TypeAlias(TypeAliasIdx),
 }
 
@@ -1339,19 +1389,22 @@ pub struct ImportDef {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum MemberKind {
-	Function(DefId),
-	Method(DefId),
-	Constant(DefId),
-	AssociatedType(DefId),
+	Function(FunctionIdx),
+	Method(FunctionIdx),
+	Constant(ConstIdx),
+	AssociatedType(AssocTypeIdx),
 }
 
 impl MemberKind {
-	pub fn def_id(self) -> DefId {
+	pub(super) fn def_id(self, defs: &DefinitionRegistry) -> DefId {
 		match self {
-			Self::Function(id) => id,
-			Self::Method(id) => id,
-			Self::Constant(id) => id,
-			Self::AssociatedType(id) => id,
+			Self::Function(index) | Self::Method(index) => {
+				defs.functions[usize::from(index)].def_id
+			}
+			Self::Constant(index) => defs.constants[usize::from(index)].def_id,
+			Self::AssociatedType(index) => {
+				defs.assoc_types[usize::from(index)].def_id
+			}
 		}
 	}
 
@@ -1479,6 +1532,7 @@ impl DefinitionRegistry {
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		stdlib_package: PackageId,
+		root_package: PackageId,
 	) -> (Self, Vec<AstEntry<'ast>>) {
 		DefinitionRegistryBuilder::build(
 			packages,
@@ -1486,6 +1540,7 @@ impl DefinitionRegistry {
 			strings,
 			diagnostics,
 			stdlib_package,
+			root_package,
 		)
 	}
 }
@@ -1497,6 +1552,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		strings: &'ctx mut ast::StringInterner,
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		stdlib_package: PackageId,
+		root_package: PackageId,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
 		let namespaces: Vec<Namespace> = packages
 			.iter()
@@ -1570,6 +1626,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			enums: Vec::new(),
 			typesets: Vec::new(),
 			functions: Vec::new(),
+			memories: Vec::new(),
+			constants: Vec::new(),
+			assoc_types: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
@@ -1608,6 +1667,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		);
 
 		let defs = DefinitionRegistry {
+			stdlib_package,
+			root_package,
 			namespaces: builder.namespaces,
 			file_namespaces,
 			modules: builder.modules,
@@ -1619,6 +1680,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			enums: builder.enums,
 			typesets: builder.typesets,
 			functions: builder.functions,
+			memories: builder.memories,
+			constants: builder.constants,
+			assoc_types: builder.assoc_types,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
@@ -1671,9 +1735,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							name: declaration.name,
 							pub_span: declaration.pub_span,
 						});
-					debug_assert_eq!(
-						own_namespace,
-						self.declare_child_namespace(
+					let actual_index = self
+						.declare_child_namespace(
 							parent_namespace,
 							source_module.file_id,
 							declaration.name.inner,
@@ -1687,7 +1750,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									strings: self.strings,
 									key: BindingKey::ty(declaration.name.inner),
 									definitions: (
-										collision.source_span(&self.namespaces),
+										self.definition_span(collision),
 										SourceSpan::new(
 											parent_module.file_id,
 											declaration.name.span,
@@ -1696,8 +1759,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								}
 								.report(),
 							)
-						})
-					);
+						});
+					debug_assert_eq!(own_namespace, actual_index);
 					own_namespace
 				}
 			};
@@ -1780,6 +1843,29 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		DefKey::new(namespace_idx, symbol_idx)
 	}
 
+	/// Namespace self entries describe their contents; collision labels need
+	/// the declaration name, which may be written in a different file.
+	fn definition_span(&self, key: DefKey) -> SourceSpan {
+		match self.namespaces[usize::from(key.namespace_idx)].items
+			[usize::from(key.def_idx)]
+		.kind
+		{
+			DefKind::Module(index) => {
+				let module = &self.modules[usize::from(index)];
+				SourceSpan::new(module.declaration_file, module.name.span)
+			}
+			DefKind::Import(index) => {
+				let import = &self.imports[usize::from(index)];
+				SourceSpan::new(
+					self.namespaces[usize::from(import.parent_namespace)]
+						.file_id,
+					import.internal_name.span,
+				)
+			}
+			_ => key.source_span(&self.namespaces),
+		}
+	}
+
 	fn insert_binding(
 		&mut self,
 		namespace_idx: NamespaceIdx,
@@ -1796,7 +1882,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					strings: self.strings,
 					key,
 					definitions: (
-						collision_key.source_span(&self.namespaces),
+						self.definition_span(collision_key),
 						SourceSpan::new(
 							self.namespaces[usize::from(namespace_idx)].file_id,
 							span,
@@ -1939,50 +2025,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					signature.name.span,
 				);
 
-				// `self` has no meaning in a free function — no `Self` to
-				// bind it to — so every occurrence is a position error,
-				// same diagnostic as one in the wrong spot within a
-				// method's own list (`validate_method_params`).
-				let mut params: Vec<Spanned<SymbolU32>> =
-					Vec::with_capacity(signature.params.len());
-				for param in
-					signature.params.iter().map(|param| &param.inner.inner)
-				{
-					if let Some(&first) =
-						params.iter().find(|s| s.inner == param.name.inner)
-					{
-						self.diagnostics.push(
-							report_duplicate_function_parameter(
-								self.strings,
-								file_id,
-								param.name,
-								first,
-							),
-						);
-					}
-
-					if param.name.inner == Keyword::SelfLower.symbol() {
-						self.diagnostics.push(report_self_param_position(
-							file_id,
-							param.name.span,
-						));
-					} else if param.ty.is_none() {
-						// TODO: remove this, this is semantic error which should be reported from signature builder
-						self.diagnostics.push(report_missing_parameter_type(
-							self.strings,
-							file_id,
-							param.name,
-						));
-					}
-
-					params.push(param.name);
-				}
+				let params =
+					self.scan_free_function_params(file_id, &signature.params);
 				self.functions.push(FunctionDef {
 					def_id: *id,
 					file_id,
 					namespace,
 					name: signature.name,
-					params: params.into_boxed_slice(),
+					params,
 				});
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
@@ -2248,9 +2298,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Memory { id, name, .. } => {
+				let memory_index =
+					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
+				self.memories.push(MemoryDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					name: *name,
+				});
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Memory(*id), name.span),
+					ItemDef::new(DefKind::Memory(memory_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2268,15 +2326,23 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Memory { item },
+					node: AstNodeRef::Memory { memory_index, item },
 				});
 			}
 			ast::Item::Const {
 				id, pub_span, name, ..
 			} => {
+				let const_index =
+					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
+				self.constants.push(ConstDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					name: *name,
+				});
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Const(*id), name.span),
+					ItemDef::new(DefKind::Const(const_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2288,7 +2354,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Constant { item },
+					node: AstNodeRef::Constant { const_index, item },
 				});
 			}
 			ast::Item::Module {
@@ -2307,9 +2373,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						name: *name,
 						pub_span: *pub_span,
 					});
-				debug_assert_eq!(
-					own_namespace_idx,
-					self.declare_child_namespace(
+				let actual_index = self
+					.declare_child_namespace(
 						namespace,
 						file_id,
 						name.inner,
@@ -2323,14 +2388,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								strings: self.strings,
 								key: BindingKey::ty(name.inner),
 								definitions: (
-									collision_key.source_span(&self.namespaces),
+									self.definition_span(collision_key),
 									SourceSpan::new(file_id, name.span),
 								),
 							}
 							.report(),
 						)
-					})
-				);
+					});
+				debug_assert_eq!(own_namespace_idx, actual_index);
 
 				for item in items.inner.iter() {
 					self.scan_item(
@@ -2387,8 +2452,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, id, .. } => {
-							let params = self
-								.scan_method_params(file_id, &signature.params);
+							let params = self.scan_impl_function_params(
+								file_id,
+								&signature.params,
+							);
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
@@ -2413,9 +2480,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							(
 								TraitMemberDef {
 									kind: if is_method {
-										MemberKind::Method(*id)
+										MemberKind::Method(function_index)
 									} else {
-										MemberKind::Function(*id)
+										MemberKind::Function(function_index)
 									},
 									accesses: Vec::new(),
 									span: signature.name.span,
@@ -2424,18 +2491,28 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 						ast::TraitItem::Const { name, id, .. } => {
+							let const_index = ConstIdx::new(
+								u32::try_from(self.constants.len()).unwrap(),
+							);
+							self.constants.push(ConstDef {
+								def_id: *id,
+								file_id,
+								namespace,
+								name: *name,
+							});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitConst {
+									const_index,
 									trait_index,
 									item: &item.inner.inner,
 								},
 							});
 							(
 								TraitMemberDef {
-									kind: MemberKind::Constant(*id),
+									kind: MemberKind::Constant(const_index),
 									accesses: Vec::new(),
 									span: name.span,
 								},
@@ -2443,18 +2520,30 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 						ast::TraitItem::AssociatedType { name, id, .. } => {
+							let assoc_type_index = AssocTypeIdx::new(
+								u32::try_from(self.assoc_types.len()).unwrap(),
+							);
+							self.assoc_types.push(AssocTypeDef {
+								def_id: *id,
+								file_id,
+								namespace,
+								name: *name,
+							});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitAssocType {
+									assoc_type_index,
 									trait_index,
 									item: &item.inner.inner,
 								},
 							});
 							(
 								TraitMemberDef {
-									kind: MemberKind::AssociatedType(*id),
+									kind: MemberKind::AssociatedType(
+										assoc_type_index,
+									),
 									accesses: Vec::new(),
 									span: name.span,
 								},
@@ -2483,18 +2572,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				debug_assert_eq!(
-					trait_index,
-					self.push_trait(TraitDef {
-						def_id: *id,
-						file_id,
-						namespace,
-						pub_span: *pub_span,
-						name: *name,
-						bindings,
-						members,
-					})
-				);
+				let actual_index = self.push_trait(TraitDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					pub_span: *pub_span,
+					name: *name,
+					bindings,
+					members,
+				});
+				debug_assert_eq!(trait_index, actual_index);
 			}
 			ast::Item::InherentImpl {
 				id: impl_id, items, ..
@@ -2521,8 +2608,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							pub_span,
 							..
 						} => {
-							let params = self
-								.scan_method_params(file_id, &signature.params);
+							let params = self.scan_impl_function_params(
+								file_id,
+								&signature.params,
+							);
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
@@ -2548,9 +2637,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								InherentMemberDef {
 									accesses: Vec::new(),
 									kind: if is_method {
-										MemberKind::Method(*id)
+										MemberKind::Method(function_index)
 									} else {
-										MemberKind::Function(*id)
+										MemberKind::Function(function_index)
 									},
 									visibility: Visibility::from(*pub_span),
 									span: signature.name.span,
@@ -2562,11 +2651,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						ast::ImplItem::Constant {
 							id, name, pub_span, ..
 						} => {
+							let const_index = ConstIdx::new(
+								u32::try_from(self.constants.len()).unwrap(),
+							);
+							self.constants.push(ConstDef {
+								def_id: *id,
+								file_id,
+								namespace,
+								name: *name,
+							});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplConst {
+									const_index,
 									item: &impl_item.inner.inner,
 									block_index,
 								},
@@ -2574,7 +2673,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							(
 								InherentMemberDef {
 									accesses: Vec::new(),
-									kind: MemberKind::Constant(*id),
+									kind: MemberKind::Constant(const_index),
 									visibility: Visibility::from(*pub_span),
 									span: name.span,
 								},
@@ -2607,16 +2706,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				debug_assert_eq!(
-					block_index,
-					self.push_inherent_impl(InherentImplDef {
-						def_id: *impl_id,
-						file_id,
-						namespace,
-						members,
-						bindings,
-					})
-				);
+				let actual_index = self.push_inherent_impl(InherentImplDef {
+					def_id: *impl_id,
+					file_id,
+					namespace,
+					members,
+					bindings,
+				});
+				debug_assert_eq!(block_index, actual_index);
 			}
 			ast::Item::Import {
 				internal_name,
@@ -2644,9 +2741,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						parent_namespace: namespace,
 						own_namespace: own_namespace_idx,
 					});
-				debug_assert_eq!(
-					own_namespace_idx,
-					self.declare_child_namespace(
+				let actual_index = self
+					.declare_child_namespace(
 						namespace,
 						file_id,
 						internal_name.inner,
@@ -2660,7 +2756,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								strings: self.strings,
 								key: BindingKey::ty(internal_name.inner),
 								definitions: (
-									collision.source_span(&self.namespaces),
+									self.definition_span(collision),
 									SourceSpan::new(
 										file_id,
 										internal_name.span,
@@ -2669,15 +2765,27 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							}
 							.report(),
 						)
-					})
-				);
+					});
+				debug_assert_eq!(own_namespace_idx, actual_index);
 
 				for item in items.inner.iter() {
 					match &item.inner.inner.declaration {
 						ast::ImportDeclaration::Memory { id, name, .. } => {
+							let memory_index = MemoryIdx::new(
+								u32::try_from(self.memories.len()).unwrap(),
+							);
+							self.memories.push(MemoryDef {
+								def_id: *id,
+								file_id,
+								namespace: own_namespace_idx,
+								name: *name,
+							});
 							let def_key = self.push_def(
 								own_namespace_idx,
-								ItemDef::new(DefKind::Memory(*id), name.span),
+								ItemDef::new(
+									DefKind::Memory(memory_index),
+									name.span,
+								),
 							);
 							self.insert_binding(
 								own_namespace_idx,
@@ -2700,18 +2808,30 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace,
+								namespace: own_namespace_idx,
 								node: AstNodeRef::ImportedMemory {
-									import_module_index: import_declaration_idx,
+									memory_index,
 									decl: &item.inner.inner.declaration,
 								},
 							});
 						}
 						ast::ImportDeclaration::Function { id, signature } => {
+							let params = self.scan_free_function_params(
+								file_id,
+								&signature.params,
+							);
+							let function_index =
+								self.push_function(FunctionDef {
+									def_id: *id,
+									file_id,
+									namespace: own_namespace_idx,
+									name: signature.name,
+									params,
+								});
 							let def_key = self.push_def(
 								own_namespace_idx,
 								ItemDef::new(
-									DefKind::Memory(*id),
+									DefKind::Function(function_index),
 									signature.name.span,
 								),
 							);
@@ -2727,9 +2847,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace,
+								namespace: own_namespace_idx,
 								node: AstNodeRef::ImportedFunction {
-									import_module_index: import_declaration_idx,
+									function_index,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -2737,7 +2857,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						ast::ImportDeclaration::Global { id, name, .. } => {
 							let def_key = self.push_def(
 								own_namespace_idx,
-								ItemDef::new(DefKind::Memory(*id), name.span),
+								ItemDef::new(DefKind::Global(*id), name.span),
 							);
 							self.insert_binding(
 								own_namespace_idx,
@@ -2751,9 +2871,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace,
+								namespace: own_namespace_idx,
 								node: AstNodeRef::ImportedGlobal {
-									import_module_index: import_declaration_idx,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -2850,8 +2969,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::ImplItem::Function { id, signature, .. } => {
-							let params = self
-								.scan_method_params(file_id, &signature.params);
+							let params = self.scan_impl_function_params(
+								file_id,
+								&signature.params,
+							);
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
@@ -2877,9 +2998,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								TraitMemberDef {
 									accesses: Vec::new(),
 									kind: if is_method {
-										MemberKind::Method(*id)
+										MemberKind::Method(function_index)
 									} else {
-										MemberKind::Function(*id)
+										MemberKind::Function(function_index)
 									},
 									span: signature.name.span,
 								},
@@ -2887,11 +3008,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 						ast::ImplItem::Constant { id, name, .. } => {
+							let const_index = ConstIdx::new(
+								u32::try_from(self.constants.len()).unwrap(),
+							);
+							self.constants.push(ConstDef {
+								def_id: *id,
+								file_id,
+								namespace,
+								name: *name,
+							});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplConstant {
+									const_index,
 									item: &item.inner.inner,
 									block_index,
 								},
@@ -2899,18 +3030,28 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							(
 								TraitMemberDef {
 									accesses: Vec::new(),
-									kind: MemberKind::Constant(*id),
+									kind: MemberKind::Constant(const_index),
 									span: name.span,
 								},
 								BindingKey::value(name.inner),
 							)
 						}
 						ast::ImplItem::AssocType { id, name, .. } => {
+							let assoc_type_index = AssocTypeIdx::new(
+								u32::try_from(self.assoc_types.len()).unwrap(),
+							);
+							self.assoc_types.push(AssocTypeDef {
+								def_id: *id,
+								file_id,
+								namespace,
+								name: *name,
+							});
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplAssocType {
+									assoc_type_index,
 									item: &item.inner.inner,
 									block_index,
 								},
@@ -2918,7 +3059,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							(
 								TraitMemberDef {
 									accesses: Vec::new(),
-									kind: MemberKind::AssociatedType(*id),
+									kind: MemberKind::AssociatedType(
+										assoc_type_index,
+									),
 									span: name.span,
 								},
 								BindingKey::ty(name.inner),
@@ -2947,16 +3090,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				debug_assert_eq!(
-					block_index,
-					self.push_trait_impl(TraitImplDef {
-						def_id: *impl_id,
-						file_id,
-						namespace,
-						bindings,
-						members,
-					})
-				);
+				let actual_index = self.push_trait_impl(TraitImplDef {
+					def_id: *impl_id,
+					file_id,
+					namespace,
+					bindings,
+					members,
+				});
+				debug_assert_eq!(block_index, actual_index);
 			}
 		}
 	}
@@ -3027,7 +3168,44 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		}
 	}
 
-	/// Validates a trait/impl method's parameter list: every name unique,
+	/// Collects parameters for free definitions, declarations, and imports.
+	/// Reports duplicate names, rejects `self`, and preserves every slot.
+	fn scan_free_function_params(
+		&mut self,
+		file_id: FileId,
+		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+	) -> Box<[Spanned<SymbolU32>]> {
+		let mut names: Vec<Spanned<SymbolU32>> =
+			Vec::with_capacity(params.len());
+		for param in params.iter().map(|param| &param.inner.inner) {
+			if let Some(&first) =
+				names.iter().find(|s| s.inner == param.name.inner)
+			{
+				self.diagnostics.push(report_duplicate_function_parameter(
+					self.strings,
+					file_id,
+					param.name,
+					first,
+				));
+			}
+
+			if param.name.inner == Keyword::SelfLower.symbol() {
+				self.diagnostics
+					.push(report_self_param_position(file_id, param.name.span));
+			} else if param.ty.is_none() {
+				// TODO: report missing types during signature resolution.
+				self.diagnostics.push(report_missing_parameter_type(
+					self.strings,
+					file_id,
+					param.name,
+				));
+			}
+			names.push(param.name);
+		}
+		names.into_boxed_slice()
+	}
+
+	/// Validates a trait/impl function's parameter list: every name unique,
 	/// `self` (if present) only as the very first parameter, every other
 	/// parameter explicitly typed. Whether `self` is actually present —
 	/// i.e. whether this member is `MemberKind::Method` or
@@ -3035,7 +3213,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// `params.first()` against `Keyword::SelfLower.symbol()`, same
 	/// constant-time check this uses; nothing here needs to hand that
 	/// fact back out.
-	fn scan_method_params(
+	fn scan_impl_function_params(
 		&mut self,
 		file_id: FileId,
 		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
@@ -3170,8 +3348,47 @@ mod tests {
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
 
+	#[must_use]
+	struct ResolutionResult<'a> {
+		case: &'a TestCase,
+		target: BindingTarget,
+		diagnostics: Vec<Diagnostic<FileId>>,
+	}
+
+	impl ResolutionResult<'_> {
+		fn target(&self) -> BindingTarget {
+			self.target
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new(
+				"resolution",
+				&self.diagnostics,
+				&self.case.graph.files,
+			)
+		}
+
+		fn expect_success(&self) -> DefKind {
+			self.diagnostics().assert_none();
+			let BindingTarget::Accessible(key) = self.target else {
+				panic!(
+					"expected an accessible definition, got {:?}",
+					self.target
+				);
+			};
+			key.symbol_kind(&self.case.defs)
+		}
+	}
+
 	impl TestCase {
 		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+			let parser_diagnostics = graph.collect_parser_diagnostics();
+			DiagnosticView::new("parse", &parser_diagnostics, &graph.files)
+				.assert_no_errors();
+			let linker_diagnostics = graph.collect_linker_diagnostics();
+			DiagnosticView::new("link", &linker_diagnostics, &graph.files)
+				.assert_no_errors();
+
 			let mut diagnostics = Vec::new();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
@@ -3179,6 +3396,7 @@ mod tests {
 				&mut graph.strings,
 				&mut diagnostics,
 				graph.stdlib_package,
+				graph.root_package,
 			);
 			// Only Phase 1 (this file) is under test here — `ast_nodes` is
 			// Phase 2's input, and dropping it now is what lets `defs` (and
@@ -3243,120 +3461,148 @@ mod tests {
 		}
 
 		fn root_namespace(&self) -> NamespaceIdx {
-			self.graph.root_package.root_namespace()
+			self.defs.root_package.root_namespace()
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
 		}
 
-		/// Resolves `path` (`::`-separated) from the root namespace in
-		/// binding tier `ns`, via the real `PathResolver` — the same
-		/// mechanism production code uses, so a test asking for `"a::Foo"`
-		/// gets whatever namespacing/shadowing rules would actually pick,
-		/// not just *an* item with that spelling somewhere. Mirrors
-		/// `signatures.rs`'s own `TestCase::resolve`.
-		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
-			let root = self.root_namespace();
-			let file_id = self.defs.namespaces[usize::from(root)].file_id;
-			let stdlib_root = self.graph.stdlib_package.root_namespace();
+		/// String queries use synthetic spans. Use `resolve_segments` with
+		/// source path segments when asserting diagnostic locations.
+		fn resolve(
+			&mut self,
+			tier: BindingNamespace,
+			path: &str,
+		) -> ResolutionResult<'_> {
+			self.resolve_from(self.root_namespace(), tier, path)
+		}
 
+		fn resolve_from(
+			&mut self,
+			namespace: NamespaceIdx,
+			tier: BindingNamespace,
+			path: &str,
+		) -> ResolutionResult<'_> {
+			let file_id = self.defs.namespaces[usize::from(namespace)].file_id;
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
-						inner: self
-							.graph
-							.strings
-							.get(segment)
-							.expect("already interned from source"),
+						inner: self.graph.strings.get_or_intern(segment),
 						span: TextSpan::new(0, 0),
 					},
 					type_args: Box::new([]),
 				})
 				.collect();
-			let mut scratch = Vec::new();
-			let target = PathResolver::new(
-				&self.defs.namespaces,
-				&self.defs.use_items,
-				&self.defs.enums,
-				&self.defs.imports,
-				&self.defs.modules,
-				stdlib_root,
-			)
-			.resolve_path(
-				&mut scratch,
+			self.resolve_segments(file_id, namespace, tier, &segments)
+		}
+
+		fn resolve_segments(
+			&self,
+			file_id: FileId,
+			namespace: NamespaceIdx,
+			tier: BindingNamespace,
+			segments: &[ast::PathSegment],
+		) -> ResolutionResult<'_> {
+			let mut diagnostics = Vec::new();
+			let target = PathResolver::new(&self.defs).resolve_path(
+				&mut diagnostics,
 				&self.graph.strings,
 				file_id,
-				root,
-				&segments,
-				ns,
+				namespace,
+				segments,
+				tier,
 			);
-			let def_key = target.def_key().unwrap_or_else(|| {
-				panic!("expected `{path}` to resolve: {scratch:?}")
-			});
-			def_key.symbol_kind(&self.defs)
+			ResolutionResult {
+				case: self,
+				target,
+				diagnostics,
+			}
 		}
 
-		fn lookup_type(
-			&mut self,
-			namespace: NamespaceIdx,
-			name: &str,
-		) -> Option<BindingTarget> {
-			let symbol = self.graph.strings.get_or_intern(name);
-			self.defs.namespaces[usize::from(namespace)]
-				.bindings
-				.get(&BindingKey::ty(symbol))
-				.map(|binding| binding.target)
-		}
-
-		fn lookup_value(
-			&mut self,
-			namespace: NamespaceIdx,
-			name: &str,
-		) -> Option<BindingTarget> {
-			let symbol = self.graph.strings.get_or_intern(name);
-			self.defs.namespaces[usize::from(namespace)]
-				.bindings
-				.get(&BindingKey::value(symbol))
-				.map(|binding| binding.target)
-		}
-
-		/// `resolve`'s `DefKind::Function` case, followed to its own
-		/// `FunctionDef` entry.
-		fn function_def(&self, name: &str) -> &FunctionDef {
-			let DefKind::Function(func_index) =
-				self.resolve(BindingNamespace::Value, name)
-			else {
-				panic!("expected `{name}` to be a function");
-			};
-			&self.defs.functions[usize::from(func_index)]
-		}
-
-		/// Follows a bound name to the namespace it names — e.g. the
-		/// namespace a `mod inner { ... }` or `mod inner;` declares.
-		fn child_namespace(
-			&mut self,
-			namespace: NamespaceIdx,
-			name: &str,
-		) -> NamespaceIdx {
-			let target = self
-				.lookup_type(namespace, name)
-				.unwrap_or_else(|| panic!("`{name}` should be bound"));
-			let BindingTarget::Accessible(def_key) = target else {
-				panic!("`{name}` should be accessible here");
-			};
-			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
-				.items[usize::from(def_key.def_idx)]
-			.kind;
-			self.defs.namespace_of(kind).unwrap_or_else(|| {
-				panic!("`{name}` is not a namespace: {kind:?}")
-			})
+		fn namespace(&mut self, path: &str) -> NamespaceIdx {
+			let kind =
+				self.resolve(BindingNamespace::Type, path).expect_success();
+			self.defs.namespace_of(kind).expect("expected a namespace")
 		}
 	}
 
 	#[test]
-	fn stdlib_declares_every_primitive() {
+	fn resolution_diagnostics_are_kept_separate_from_other_queries_and_prescan()
+	{
+		let mut case = TestCase::new("fn f(x: i32, x: i32) {}");
+		case.diagnostics()
+			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
+
+		let missing = case.resolve(BindingNamespace::Value, "missing");
+		missing
+			.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+		assert!(matches!(missing.target(), BindingTarget::Error));
+
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "f").expect_success(),
+			DefKind::Function(_)
+		));
+		assert_eq!(case.diagnostics().all().len(), 1);
+	}
+
+	#[test]
+	fn resolution_preserves_privacy_diagnostics_and_source_spans_with_a_recovered_target()
+	 {
+		let case = TestCase::new(indoc! {"
+			mod outer {
+				mod hidden { pub struct Visible {} }
+			}
+			type Alias = outer::hidden::Visible;
+		"});
+		case.diagnostics().assert_none();
+		let package = &case.graph.packages[case.defs.root_package.as_usize()];
+		let module = &package.modules[package.root.as_usize()];
+		let ast::Item::TypeAlias {
+			body: Some(body), ..
+		} = &module.ast.items.last().unwrap().inner.inner
+		else {
+			panic!("expected an alias");
+		};
+		let ast::TypeExpression::Path(segments) = &body.inner else {
+			panic!("expected a type path");
+		};
+		let result = case.resolve_segments(
+			module.file_id,
+			case.root_namespace(),
+			BindingNamespace::Type,
+			segments,
+		);
+		result.diagnostics().assert_error_with(
+			DiagnosticCode::PrivateItem,
+			|diagnostic| {
+				assert_eq!(diagnostic.labels[0].file_id, module.file_id);
+				assert_eq!(
+					diagnostic.labels[0].range,
+					std::ops::Range::from(segments[1].ident.span)
+				);
+			},
+		);
+		let BindingTarget::Accessible(key) = result.target() else {
+			panic!("expected the public terminal definition to be recovered");
+		};
+		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Struct(_)));
+	}
+
+	#[test]
+	#[should_panic(expected = "expected no resolution diagnostics")]
+	fn resolution_success_rejects_privacy_errors_even_with_an_accessible_target()
+	 {
+		let mut case =
+			TestCase::new("mod outer { mod hidden { pub struct Visible {} } }");
+		case.resolve(BindingNamespace::Type, "outer::hidden::Visible")
+			.expect_success();
+	}
+
+	#[test]
+	fn stdlib_primitive_slots_reference_the_matching_aliases() {
 		let case = TestCase::new_stdlib(indoc! {"
 			type u8;
 			type i8;
@@ -3372,64 +3618,77 @@ mod tests {
 			type char;
 			type never;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let intrinsics = &case.defs.intrinsics;
-		assert!(intrinsics.u8.is_some(), "u8 should be found");
-		assert!(intrinsics.i8.is_some(), "i8 should be found");
-		assert!(intrinsics.u16.is_some(), "u16 should be found");
-		assert!(intrinsics.i16.is_some(), "i16 should be found");
-		assert!(intrinsics.u32.is_some(), "u32 should be found");
-		assert!(intrinsics.i32.is_some(), "i32 should be found");
-		assert!(intrinsics.u64.is_some(), "u64 should be found");
-		assert!(intrinsics.i64.is_some(), "i64 should be found");
-		assert!(intrinsics.f32.is_some(), "f32 should be found");
-		assert!(intrinsics.f64.is_some(), "f64 should be found");
-		assert!(intrinsics.bool.is_some(), "bool should be found");
-		assert!(intrinsics.char.is_some(), "char should be found");
-		assert!(intrinsics.never.is_some(), "never should be found");
+		for (slot, expected_name) in [
+			(intrinsics.u8, "u8"),
+			(intrinsics.i8, "i8"),
+			(intrinsics.u16, "u16"),
+			(intrinsics.i16, "i16"),
+			(intrinsics.u32, "u32"),
+			(intrinsics.i32, "i32"),
+			(intrinsics.u64, "u64"),
+			(intrinsics.i64, "i64"),
+			(intrinsics.f32, "f32"),
+			(intrinsics.f64, "f64"),
+			(intrinsics.bool, "bool"),
+			(intrinsics.char, "char"),
+			(intrinsics.never, "never"),
+		] {
+			let index = slot.unwrap_or_else(|| {
+				panic!("missing intrinsic `{expected_name}`")
+			});
+			let name = case.defs.type_aliases[usize::from(index)].name.inner;
+			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
+		}
 	}
 
 	#[test]
-	fn stdlib_declares_every_operator_trait() {
+	fn stdlib_operator_slots_reference_the_matching_traits() {
 		let case = TestCase::new_stdlib(indoc! {"
-			trait Add { fn add(self, rhs: Self) -> Self; }
-			trait Sub { fn sub(self, rhs: Self) -> Self; }
-			trait Mul { fn mul(self, rhs: Self) -> Self; }
-			trait Div { fn div(self, rhs: Self) -> Self; }
-			trait Rem { fn rem(self, rhs: Self) -> Self; }
-			trait Neg { fn neg(self) -> Self; }
-			trait BitAnd { fn bitand(self, rhs: Self) -> Self; }
-			trait BitOr { fn bitor(self, rhs: Self) -> Self; }
-			trait BitXor { fn bitxor(self, rhs: Self) -> Self; }
-			trait Shl { fn shl(self, rhs: Self) -> Self; }
-			trait Shr { fn shr(self, rhs: Self) -> Self; }
-			trait BitNot { fn bitnot(self) -> Self; }
-			trait Not { fn not(self) -> Self; }
-			trait PartialEq { fn eq(self, other: Self) -> bool; }
-			trait PartialOrd { fn lt(self, other: Self) -> bool; }
+			trait Add {}
+			trait Sub {}
+			trait Mul {}
+			trait Div {}
+			trait Rem {}
+			trait Neg {}
+			trait BitAnd {}
+			trait BitOr {}
+			trait BitXor {}
+			trait Shl {}
+			trait Shr {}
+			trait BitNot {}
+			trait Not {}
+			trait PartialEq {}
+			trait PartialOrd {}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let intrinsics = &case.defs.intrinsics;
-		assert!(intrinsics.add.is_some(), "Add should be found");
-		assert!(intrinsics.sub.is_some(), "Sub should be found");
-		assert!(intrinsics.mul.is_some(), "Mul should be found");
-		assert!(intrinsics.div.is_some(), "Div should be found");
-		assert!(intrinsics.rem.is_some(), "Rem should be found");
-		assert!(intrinsics.neg.is_some(), "Neg should be found");
-		assert!(intrinsics.bitand.is_some(), "BitAnd should be found");
-		assert!(intrinsics.bitor.is_some(), "BitOr should be found");
-		assert!(intrinsics.bitxor.is_some(), "BitXor should be found");
-		assert!(intrinsics.shl.is_some(), "Shl should be found");
-		assert!(intrinsics.shr.is_some(), "Shr should be found");
-		assert!(intrinsics.bitnot.is_some(), "BitNot should be found");
-		assert!(intrinsics.not.is_some(), "Not should be found");
-		assert!(intrinsics.partial_eq.is_some(), "PartialEq should be found");
-		assert!(
-			intrinsics.partial_ord.is_some(),
-			"PartialOrd should be found"
-		);
+		for (slot, expected_name) in [
+			(intrinsics.add, "Add"),
+			(intrinsics.sub, "Sub"),
+			(intrinsics.mul, "Mul"),
+			(intrinsics.div, "Div"),
+			(intrinsics.rem, "Rem"),
+			(intrinsics.neg, "Neg"),
+			(intrinsics.bitand, "BitAnd"),
+			(intrinsics.bitor, "BitOr"),
+			(intrinsics.bitxor, "BitXor"),
+			(intrinsics.shl, "Shl"),
+			(intrinsics.shr, "Shr"),
+			(intrinsics.bitnot, "BitNot"),
+			(intrinsics.not, "Not"),
+			(intrinsics.partial_eq, "PartialEq"),
+			(intrinsics.partial_ord, "PartialOrd"),
+		] {
+			let index = slot.unwrap_or_else(|| {
+				panic!("missing intrinsic `{expected_name}`")
+			});
+			let name = case.defs.traits[usize::from(index)].name.inner;
+			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
+		}
 	}
 
 	#[test]
@@ -3437,7 +3696,7 @@ mod tests {
 		let case = TestCase::new_stdlib(indoc! {"
 			type u8;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 		assert!(case.defs.intrinsics.u8.is_some());
 		assert!(case.defs.intrinsics.char.is_none());
 		assert!(case.defs.intrinsics.add.is_none());
@@ -3448,7 +3707,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			type u8;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		// The real stdlib's own `u8` must still be the one on record — the
 		// same-named declaration in the binary package must not clobber it,
@@ -3478,7 +3737,7 @@ mod tests {
 			type Add;
 			trait u8 { fn f(self) -> Self; }
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 		assert!(
 			case.defs.intrinsics.add.is_none(),
 			"a type alias named `Add` must not populate the trait slot"
@@ -3490,28 +3749,325 @@ mod tests {
 	}
 
 	#[test]
-	fn function_and_struct_get_bindings() {
-		let mut case = TestCase::new(indoc! {"
-			pub fn add(a: i32, b: i32) -> i32 { a + b }
-			struct Point { x: i32, y: i32 }
+	fn memory_identity_is_registered_without_resolving_bounds() {
+		let mut case = TestCase::new(indoc! {r#"
+			memory heap: UnknownMemory where { Size = UnknownSize };
+			import "env" as host {
+				memory shared: UnknownMemory where { Size = UnknownSize };
+				fn log(value: UnknownType);
+				global counter: UnknownType;
+			}
+			use host::shared as shared_alias;
+		"#});
+		case.diagnostics().assert_no_errors();
+
+		let root = case.root_namespace();
+		let host = case.namespace("host");
+		let mut indices = Vec::new();
+		for (path, name, namespace) in
+			[("heap", "heap", root), ("host::shared", "shared", host)]
+		{
+			let kind =
+				case.resolve(BindingNamespace::Type, path).expect_success();
+			assert_eq!(
+				kind,
+				case.resolve(BindingNamespace::Value, path).expect_success()
+			);
+			let DefKind::Memory(index) = kind else {
+				panic!("expected `{path}` to be a memory");
+			};
+			let memory = &case.defs.memories[usize::from(index)];
+			assert_eq!(
+				case.graph.strings.resolve(memory.name.inner),
+				Some(name)
+			);
+			assert_eq!(memory.namespace, namespace);
+			assert_eq!(
+				memory.file_id,
+				case.defs.namespaces[usize::from(root)].file_id
+			);
+			indices.push(index);
+		}
+		assert_ne!(indices[0], indices[1]);
+		assert_ne!(
+			case.defs.memories[usize::from(indices[0])].def_id,
+			case.defs.memories[usize::from(indices[1])].def_id,
+		);
+		for tier in [BindingNamespace::Type, BindingNamespace::Value] {
+			assert_eq!(
+				case.resolve(tier, "shared_alias").expect_success(),
+				DefKind::Memory(indices[1]),
+			);
+		}
+		let DefKind::Function(index) = case
+			.resolve(BindingNamespace::Value, "host::log")
+			.expect_success()
+		else {
+			panic!("expected an imported function");
+		};
+		let function = &case.defs.functions[usize::from(index)];
+		assert_eq!(function.namespace, host);
+		assert_eq!(
+			case.graph.strings.resolve(function.name.inner),
+			Some("log")
+		);
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "host::counter")
+				.expect_success(),
+			DefKind::Global(_),
+		));
+	}
+
+	#[test]
+	fn member_identities_and_function_kinds_are_preserved_without_resolving_types()
+	 {
+		let mut case = TestCase::new_stdlib(indoc! {"
+			const VALUE: Unknown = missing;
+			trait Api {
+				fn make() -> Unknown;
+				fn get(self, value: Unknown) -> Unknown;
+				const VALUE: Unknown;
+				type Item: Unknown;
+			}
+			struct Host {}
+			impl Host {
+				fn make() -> Unknown { missing }
+				fn get(self, value: Unknown) -> Unknown { missing }
+				const VALUE: Unknown = missing;
+			}
+			impl Api for Host {
+				fn make() -> Unknown { missing }
+				fn get(self, value: Unknown) -> Unknown { missing }
+				const VALUE: Unknown = missing;
+				type Item = Unknown;
+			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_no_errors();
 
-		let add_symbol = case.graph.strings.get_or_intern("add");
-		let point_symbol = case.graph.strings.get_or_intern("Point");
-		let root_namespace = case.root_namespace();
-		let bindings =
-			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+		let DefKind::Const(free_constant) = case
+			.resolve(BindingNamespace::Value, "VALUE")
+			.expect_success()
+		else {
+			panic!("expected a free constant");
+		};
+		let mut ids = std::collections::HashSet::from([case.defs.constants
+			[usize::from(free_constant)]
+		.def_id]);
+		let members = case.defs.traits[0]
+			.members
+			.iter()
+			.map(|member| member.kind)
+			.chain(
+				case.defs.inherent_impls[0]
+					.members
+					.iter()
+					.map(|member| member.kind),
+			)
+			.chain(
+				case.defs.trait_impls[0]
+					.members
+					.iter()
+					.map(|member| member.kind),
+			);
+		for kind in members {
+			assert!(
+				ids.insert(kind.def_id(&case.defs)),
+				"members must have distinct identities"
+			);
+			let (name, expected) = match kind {
+				MemberKind::Function(index) => {
+					(case.defs.functions[usize::from(index)].name, "make")
+				}
+				MemberKind::Method(index) => {
+					(case.defs.functions[usize::from(index)].name, "get")
+				}
+				MemberKind::Constant(index) => {
+					(case.defs.constants[usize::from(index)].name, "VALUE")
+				}
+				MemberKind::AssociatedType(index) => {
+					(case.defs.assoc_types[usize::from(index)].name, "Item")
+				}
+			};
+			assert_eq!(case.graph.strings.resolve(name.inner), Some(expected));
+		}
+		assert_eq!(ids.len(), 12);
+		for def in &case.defs.constants {
+			assert_eq!(def.namespace, case.root_namespace());
+		}
+		for def in &case.defs.assoc_types {
+			assert_eq!(def.namespace, case.root_namespace());
+		}
+	}
 
-		let add_binding = bindings
-			.get(&BindingKey::value(add_symbol))
-			.expect("`add` should be bound in the value namespace");
-		assert!(matches!(add_binding.target, BindingTarget::Accessible(_)));
+	#[test]
+	fn type_and_value_definitions_can_share_a_name() {
+		let mut case = TestCase::new("struct Item {} fn Item() {}");
+		case.diagnostics().assert_none();
+		assert!(matches!(
+			case.resolve(BindingNamespace::Type, "Item")
+				.expect_success(),
+			DefKind::Struct(_)
+		));
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "Item")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+	}
 
-		let point_binding = bindings
-			.get(&BindingKey::ty(point_symbol))
-			.expect("`Point` should be bound in the type namespace");
-		assert!(matches!(point_binding.target, BindingTarget::Accessible(_)));
+	#[test]
+	fn duplicate_function_keeps_the_original_binding_and_continues_collection()
+	{
+		let source =
+			"fn f(original: i32) {} fn f(replacement: i32) {} fn after() {}";
+		let mut case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		let file_id =
+			case.defs.namespaces[usize::from(case.root_namespace())].file_id;
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::DuplicateDefinition,
+			|diagnostic| {
+				let first = source.find("f(").unwrap();
+				let second = source.rfind("f(").unwrap();
+				assert_eq!(diagnostic.labels[0].file_id, file_id);
+				assert_eq!(diagnostic.labels[0].range, second..second + 1);
+				assert_eq!(diagnostic.labels[1].file_id, file_id);
+				assert_eq!(diagnostic.labels[1].range, first..first + 1);
+			},
+		);
+		let DefKind::Function(index) =
+			case.resolve(BindingNamespace::Value, "f").expect_success()
+		else {
+			panic!("expected a function");
+		};
+		assert_eq!(
+			case.graph.strings.resolve(
+				case.defs.functions[usize::from(index)].params[0].inner
+			),
+			Some("original")
+		);
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "after")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+	}
+
+	#[test]
+	fn duplicate_module_labels_declarations_in_source_order_and_keeps_the_file_module()
+	 {
+		// File modules are registered before inline modules, independently of source order.
+		let source =
+			"mod clash { pub fn inline_only() {} } mod clash; fn after() {}";
+		let mut case = TestCase::new_workspace(
+			vfs::AbsolutePath::new("/main.wx"),
+			HashMap::from([
+				(vfs::AbsolutePath::new("/main.wx"), source.to_string()),
+				(
+					vfs::AbsolutePath::new("/clash.wx"),
+					"pub fn file_only() {}".to_string(),
+				),
+			]),
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		let file_id =
+			case.defs.namespaces[usize::from(case.root_namespace())].file_id;
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::DuplicateDefinition,
+			|diagnostic| {
+				let first = source.find("clash").unwrap();
+				let second = source.rfind("clash").unwrap();
+				assert_eq!(diagnostic.labels[0].file_id, file_id);
+				assert_eq!(diagnostic.labels[0].range, second..second + 5);
+				assert_eq!(diagnostic.labels[1].file_id, file_id);
+				assert_eq!(diagnostic.labels[1].range, first..first + 5);
+			},
+		);
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "clash::file_only")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "after")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+	}
+
+	#[test]
+	fn duplicate_enum_variant_keeps_the_original_binding_and_later_variants() {
+		let source = "enum E { Same, Same, After }";
+		let mut case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		let result = case.resolve(BindingNamespace::Value, "E::Same");
+		assert!(matches!(result.expect_success(), DefKind::EnumVariant(_)));
+		let key = result.target().def_key().unwrap();
+		let first = source.find("Same").unwrap();
+		assert_eq!(
+			std::ops::Range::from(key.source_span(&case.defs.namespaces).span),
+			first..first + 4
+		);
+		assert!(matches!(
+			case.resolve(BindingNamespace::Value, "E::After")
+				.expect_success(),
+			DefKind::EnumVariant(_)
+		));
+	}
+
+	#[test]
+	fn duplicate_members_keep_the_original_binding_and_later_members() {
+		for source in [
+			"trait T { fn f(original: i32); fn f(replacement: i32); fn after(); }",
+			"struct S {} impl S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
+			"trait T {} struct S {} impl T for S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
+		] {
+			let case = TestCase::new_stdlib(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+			let f = BindingKey::value(case.graph.strings.get("f").unwrap());
+			let after =
+				BindingKey::value(case.graph.strings.get("after").unwrap());
+			let (original, later) =
+				if let Some(owner) = case.defs.inherent_impls.first() {
+					(
+						owner.members[usize::from(owner.bindings[&f])].kind,
+						owner.members[usize::from(owner.bindings[&after])].kind,
+					)
+				} else if let Some(owner) = case.defs.trait_impls.first() {
+					(
+						owner.members[usize::from(owner.bindings[&f])].kind,
+						owner.members[usize::from(owner.bindings[&after])].kind,
+					)
+				} else {
+					let owner = &case.defs.traits[0];
+					(
+						owner.members[usize::from(owner.bindings[&f])].kind,
+						owner.members[usize::from(owner.bindings[&after])].kind,
+					)
+				};
+			let MemberKind::Function(index) = original else {
+				panic!("expected an associated function");
+			};
+			assert_eq!(
+				case.graph.strings.resolve(
+					case.defs.functions[usize::from(index)].params[0].inner
+				),
+				Some("original")
+			);
+			let MemberKind::Function(index) = later else {
+				panic!("expected a later associated function");
+			};
+			assert_eq!(
+				case.graph.strings.resolve(
+					case.defs.functions[usize::from(index)].name.inner
+				),
+				Some("after")
+			);
+		}
 	}
 
 	#[test]
@@ -3519,7 +4075,7 @@ mod tests {
 		let mut case = TestCase::new(indoc! {"
 			pub struct Point(pub i32, pub i32);
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
@@ -3537,7 +4093,7 @@ mod tests {
 		let mut case = TestCase::new(indoc! {"
 			pub struct Point(pub i32, i32);
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
@@ -3576,8 +4132,9 @@ mod tests {
 		// `Point` isn't necessarily `defs.structs[0]` — the real stdlib
 		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
 		// `RawPtr`), so look it up by name rather than assuming an index.
-		let DefKind::Struct(point_struct_index) =
-			case.resolve(BindingNamespace::Type, "Point")
+		let DefKind::Struct(point_struct_index) = case
+			.resolve(BindingNamespace::Type, "Point")
+			.expect_success()
 		else {
 			panic!("expected `Point` to be a struct")
 		};
@@ -3597,77 +4154,183 @@ mod tests {
 
 	#[test]
 	fn duplicate_function_parameter_is_reported_but_keeps_its_own_slot() {
-		let case = TestCase::new(indoc! {"
-			fn f(x: i32, x: i32) {}
-		"});
+		for (source, path) in [
+			("fn f(x: i32, x: i32) {}", "f"),
+			("fn f(x: i32, x: i32);", "f"),
+			(
+				r#"import "env" as host { fn f(x: i32, x: i32); }"#,
+				"host::f",
+			),
+		] {
+			let mut case = TestCase::new(source);
+			case.diagnostics()
+				.assert_error(DiagnosticCode::DuplicateFunctionParameter);
 
-		case.diagnostics()
-			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
-
-		// Positional, same as a duplicate struct field — the second `x`
-		// still gets its own slot rather than being dropped.
-		let params = &case.function_def("f").params;
-		assert_eq!(params.len(), 2);
-		assert_eq!(params[0].inner, params[1].inner);
+			// Duplicate names still keep their positional slots.
+			let DefKind::Function(index) =
+				case.resolve(BindingNamespace::Value, path).expect_success()
+			else {
+				panic!("expected `{path}` to be a function");
+			};
+			let params = &case.defs.functions[usize::from(index)].params;
+			assert_eq!(params.len(), 2);
+			assert_eq!(params[0].inner, params[1].inner);
+			let labels = &case.diagnostics[0].labels;
+			assert_eq!(labels[0].range, std::ops::Range::from(params[1].span));
+			assert_eq!(labels[1].range, std::ops::Range::from(params[0].span));
+		}
 	}
 
 	#[test]
 	fn self_in_a_free_function_is_rejected() {
-		let case = TestCase::new(indoc! {"
-			fn f(self) {}
-		"});
-
-		case.diagnostics()
-			.assert_error(DiagnosticCode::SelfParamPosition);
+		for source in [
+			"fn f(self) {}",
+			"fn f(self);",
+			r#"import "env" as host { fn f(self); }"#,
+			r#"import "env" as host { fn f(x: i32, self); }"#,
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_error(DiagnosticCode::SelfParamPosition);
+		}
 	}
 
 	#[test]
-	fn self_not_first_in_a_method_is_rejected() {
-		let case = TestCase::new(indoc! {"
-			trait T {
-				fn f(x: i32, self);
-			}
-		"});
+	fn duplicate_associated_function_parameters_keep_their_slots() {
+		for source in [
+			"trait T { fn f(x: i32, x: i32, tail: i32); }",
+			"struct S {} impl S { fn f(x: i32, x: i32, tail: i32) {} }",
+			"trait T {} struct S {} impl T for S { fn f(x: i32, x: i32, tail: i32) {} }",
+		] {
+			let case = TestCase::new_stdlib(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::DuplicateFunctionParameter]);
+			let function = &case.defs.functions[0];
+			let names: Vec<_> = function
+				.params
+				.iter()
+				.map(|param| case.graph.strings.resolve(param.inner).unwrap())
+				.collect();
+			assert_eq!(names, ["x", "x", "tail"]);
+			case.diagnostics().assert_error_with(
+				DiagnosticCode::DuplicateFunctionParameter,
+				|diagnostic| {
+					let first = source.find("x:").unwrap();
+					let second = source.rfind("x:").unwrap();
+					assert_eq!(diagnostic.labels[0].range, second..second + 1);
+					assert_eq!(diagnostic.labels[1].range, first..first + 1);
+				},
+			);
+		}
+	}
 
-		case.diagnostics()
-			.assert_error(DiagnosticCode::SelfParamPosition);
+	#[test]
+	fn self_not_first_in_an_associated_function_is_rejected() {
+		for source in [
+			"trait T { fn f(x: i32, self); }",
+			"struct S {} impl S { fn f(x: i32, self) {} }",
+			"trait T {} struct S {} impl T for S { fn f(x: i32, self) {} }",
+		] {
+			let case = TestCase::new_stdlib(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::SelfParamPosition]);
+			case.diagnostics().assert_error_with(
+				DiagnosticCode::SelfParamPosition,
+				|diagnostic| {
+					let start = source.find("self").unwrap();
+					assert_eq!(diagnostic.labels[0].range, start..start + 4);
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn repeated_self_reports_both_duplicate_name_and_invalid_position() {
+		let source = "trait T { fn f(self, self); }";
+		let case = TestCase::new_stdlib(source);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::SelfParamPosition,
+		]);
+		let params = &case.defs.functions[0].params;
+		assert_eq!(params.len(), 2);
+		let first = source.find("self").unwrap();
+		let second = source.rfind("self").unwrap();
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::DuplicateFunctionParameter,
+			|diagnostic| {
+				assert_eq!(diagnostic.labels[0].range, second..second + 4);
+				assert_eq!(diagnostic.labels[1].range, first..first + 4);
+			},
+		);
+		case.diagnostics().assert_error_with(
+			DiagnosticCode::SelfParamPosition,
+			|diagnostic| {
+				assert_eq!(diagnostic.labels[0].range, second..second + 4);
+			},
+		);
 	}
 
 	#[test]
 	fn missing_parameter_type_is_reported() {
-		let case = TestCase::new(indoc! {"
-			fn f(x) {}
-		"});
-
-		case.diagnostics()
-			.assert_error(DiagnosticCode::MissingParameterType);
+		for source in [
+			"fn f(x) {}",
+			"fn f(x);",
+			r#"import "env" as host { fn f(x); }"#,
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_error(DiagnosticCode::MissingParameterType);
+		}
 	}
 
 	#[test]
-	fn self_as_the_first_method_parameter_is_accepted_and_classified() {
-		let mut case = TestCase::new(indoc! {"
+	fn receiver_presence_classifies_trait_and_impl_functions() {
+		let case = TestCase::new_stdlib(indoc! {"
 			trait T {
-				fn f(self);
+				fn method(self, x: i32);
+				fn associated(x: i32);
+			}
+			struct S {}
+			impl S {
+				fn method(self, x: i32) {}
+				fn associated(x: i32) {}
+			}
+			impl T for S {
+				fn method(self, x: i32) {}
+				fn associated(x: i32) {}
 			}
 		"});
-
-		case.diagnostics().assert_no_errors();
-
-		let DefKind::Trait(trait_index) =
-			case.resolve(BindingNamespace::Type, "T")
-		else {
-			panic!("expected `T` to be a trait");
-		};
-		let trait_def = &case.defs.traits[usize::from(trait_index)];
-		let f_symbol = case.graph.strings.get_or_intern("f");
-		let &member_index = trait_def
-			.bindings
-			.get(&BindingKey::value(f_symbol))
-			.expect("expected `T` to have a function `f`");
-		assert!(matches!(
-			trait_def.members[usize::from(member_index)].kind,
-			MemberKind::Method(_)
-		));
+		case.diagnostics().assert_none();
+		let members = case.defs.traits[0]
+			.members
+			.iter()
+			.map(|member| member.kind)
+			.chain(
+				case.defs.inherent_impls[0]
+					.members
+					.iter()
+					.map(|member| member.kind),
+			)
+			.chain(
+				case.defs.trait_impls[0]
+					.members
+					.iter()
+					.map(|member| member.kind),
+			);
+		for kind in members {
+			let (index, expected_name) = match kind {
+				MemberKind::Method(index) => (index, "method"),
+				MemberKind::Function(index) => (index, "associated"),
+				_ => panic!("expected a function member"),
+			};
+			assert_eq!(
+				case.graph.strings.resolve(
+					case.defs.functions[usize::from(index)].name.inner
+				),
+				Some(expected_name)
+			);
+		}
 	}
 
 	#[test]
@@ -3682,13 +4345,12 @@ mod tests {
 				),
 			]),
 		);
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
-		let root = case.root_namespace();
-		let math = case.child_namespace(root, "math");
 		assert!(matches!(
-			case.lookup_value(math, "add"),
-			Some(BindingTarget::Accessible(_))
+			case.resolve(BindingNamespace::Value, "math::add")
+				.expect_success(),
+			DefKind::Function(_)
 		));
 	}
 
@@ -3704,7 +4366,7 @@ mod tests {
 			}
 			use a::*;
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
 		let helper = case.graph.strings.get_or_intern("helper");
@@ -3744,10 +4406,10 @@ mod tests {
 				use crate::a::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let b = case.child_namespace(root, "b");
+		let b = case.namespace("b");
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		assert!(matches!(
@@ -3779,11 +4441,13 @@ mod tests {
 				mod inner {}
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
-		let root = case.root_namespace();
-		let m = case.child_namespace(root, "m");
-		let inner = case.child_namespace(m, "inner");
+		let m = case.namespace("m");
+		let inner_kind = case
+			.resolve_from(m, BindingNamespace::Type, "inner")
+			.expect_success();
+		let inner = case.defs.namespace_of(inner_kind).unwrap();
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		match case.defs.namespaces.indirect_lookup(
@@ -3810,15 +4474,17 @@ mod tests {
 				pub use crate::a::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let a = case.child_namespace(root, "a");
-		let hub = case.child_namespace(root, "hub");
+		let a = case.namespace("a");
+		let hub = case.namespace("hub");
 		let helper = case.graph.strings.get_or_intern("helper");
 
-		let Some(BindingTarget::Accessible(original)) =
-			case.lookup_value(a, "helper")
+		let Some((BindingTarget::Accessible(original), _)) = case
+			.defs
+			.namespaces
+			.direct_lookup(a, BindingKey::value(helper))
 		else {
 			panic!("`a::helper` should resolve directly");
 		};
@@ -3858,10 +4524,10 @@ mod tests {
 				pub use crate::b::*;
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let hub = case.child_namespace(root, "hub");
+		let hub = case.namespace("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
 		match case.defs.namespaces.indirect_lookup(
@@ -3894,14 +4560,16 @@ mod tests {
 				fn pick() -> i32 { 2 }
 			}
 		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let hub = case.child_namespace(root, "hub");
+		let hub = case.namespace("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
-		let Some(BindingTarget::Accessible(direct)) =
-			case.lookup_value(hub, "pick")
+		let Some((BindingTarget::Accessible(direct), _)) = case
+			.defs
+			.namespaces
+			.direct_lookup(hub, BindingKey::value(pick))
 		else {
 			panic!("`hub::pick` should be bound directly");
 		};

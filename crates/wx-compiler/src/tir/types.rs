@@ -6,9 +6,10 @@
 //! Deliberately independent of `defs`/`signatures`' resolution machinery —
 //! this module only answers identity questions, never "what type does this
 //! path/expression have" or "what scope am I resolving in." It depends on
-//! `defs` for `TraitIndex` (an associated-type projection names the trait
-//! that declares it) and `StructIndex`/`EnumIndex` (both pre-allocated in
-//! `defs.rs`'s Phase 1, for the same reason as `TraitIndex`) but nothing
+//! `defs` for `TraitIdx` (an associated-type projection names the trait
+//! that declares it) and `StructIdx`/`EnumIdx`/`FunctionIdx`/`MemoryIdx`
+//! (all pre-allocated in `defs.rs`'s Phase 1, for the same reason as
+//! `TraitIdx`) but nothing
 //! here calls into name resolution, and nothing in `defs` depends back on
 //! this module — see `tir/defs.rs`'s own doc comment for why that direction
 //! has to stay one-way. `TypeEnvArena` fits the same charter: given a name,
@@ -22,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{DefId, Spanned};
+use crate::ast::Spanned;
 use crate::diagnostics::SourceSpan;
 use crate::index::index_newtype;
 use crate::tir::defs::{
@@ -32,7 +33,7 @@ use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{
-	EnumIdx, InherentImplIdx, StructIdx, TraitIdx, TraitImplIdx,
+	EnumIdx, InherentImplIdx, MemoryIdx, StructIdx, TraitIdx, TraitImplIdx,
 };
 
 index_newtype!(TypeIndex);
@@ -78,7 +79,7 @@ pub enum Type {
 		/// empty), generic and not yet instantiated (empty), generic and
 		/// instantiated (one entry per type param, e.g. `Vec<i32, u8>` →
 		/// `[i32_idx, u8_idx]`).
-		args: Box<[TypeIndex]>,
+		type_args: Box<[TypeIndex]>,
 	},
 	Function {
 		params: Box<[TypeIndex]>,
@@ -89,7 +90,7 @@ pub enum Type {
 	/// Named function reference before coercion to a fn pointer. Encodes
 	/// three states via length, same convention as `Struct::args`.
 	FunctionItem {
-		id: DefId,
+		func_index: FunctionIdx,
 		type_args: Box<[TypeIndex]>,
 	},
 	Pointer {
@@ -112,7 +113,7 @@ pub enum Type {
 		enum_index: EnumIdx,
 	},
 	Memory {
-		id: DefId,
+		memory_index: MemoryIdx,
 		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
 		size: TypeIndex,
 	},

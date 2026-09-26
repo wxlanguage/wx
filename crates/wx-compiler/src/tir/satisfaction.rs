@@ -77,7 +77,12 @@ impl SignatureBuilder<'_, '_> {
 					base_trait, assoc_name, reference,
 				) {
 					Some(index) => implies(
-						&self.assoc_types[usize::from(index)].implied_bounds,
+						&self.assoc_types[usize::from(index)]
+							.as_ref()
+							.expect(
+								"trait associated type signature is resolved",
+							)
+							.implied_bounds,
 						trait_index,
 					),
 					// Not actually one of `base_trait`'s associated types,
@@ -182,7 +187,7 @@ impl SignatureBuilder<'_, '_> {
 		bound_id: BoundId,
 		owner: TypeEnvOwner,
 	) -> Diagnostic<FileId> {
-		let arg_name = self.formatter().display_type(argument.inner);
+		let arg_name = self.type_formatter().display_type(argument.inner);
 		let trait_name = self
 			.strings
 			.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
@@ -337,20 +342,19 @@ mod tests {
 			&mut graph.strings,
 			&mut diagnostics,
 			graph.stdlib_package,
+			graph.root_package,
 		);
 		let impl_dispatch = ImplDispatch::build(
 			&mut diagnostics,
 			&graph.strings,
 			&defs,
 			&ast_nodes,
-			graph.stdlib_package,
 		);
 		let mut builder = SignatureBuilder::new(
 			&mut diagnostics,
 			&graph.strings,
 			&defs,
 			&ast_nodes,
-			graph.stdlib_package,
 			impl_dispatch,
 		);
 		for entry in ast_nodes.iter() {
@@ -374,7 +378,6 @@ mod tests {
 		path: &str,
 	) -> DefKind {
 		let root = graph.root_package.root_namespace();
-		let stdlib_root = graph.stdlib_package.root_namespace();
 		let file_id = builder.defs.namespaces[usize::from(root)].file_id;
 
 		let segments: Box<[ast::PathSegment]> = path
@@ -391,15 +394,7 @@ mod tests {
 			})
 			.collect();
 		let mut diagnostics = Vec::new();
-		let target = PathResolver::new(
-			&builder.defs.namespaces,
-			&builder.defs.use_items,
-			&builder.defs.enums,
-			&builder.defs.imports,
-			&builder.defs.modules,
-			stdlib_root,
-		)
-		.resolve_path(
+		let target = PathResolver::new(builder.defs).resolve_path(
 			&mut diagnostics,
 			&graph.strings,
 			file_id,
@@ -459,7 +454,7 @@ mod tests {
 		};
 		builder.types.intern(Type::Struct {
 			struct_index,
-			args: Box::new([]),
+			type_args: Box::new([]),
 		})
 	}
 
