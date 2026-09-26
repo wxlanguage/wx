@@ -10,7 +10,7 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{self, DefId, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	tir::defs::DefKey,
+	tir::defs::{EnumIdx, StructIdx},
 	vfs::{FileId, PackageId},
 };
 
@@ -18,8 +18,8 @@ use super::{
 	bounds::report_expected_trait_bound,
 	defs::{
 		AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
-		DefinitionRegistry, DuplicateDefinitionDiagnostic, InherentImplIndex,
-		NamespaceIndex, NamespaceKind, TraitImplIndex, TraitIndex,
+		DefinitionRegistry, DuplicateDefinitionDiagnostic, InherentImplIdx,
+		NamespaceIdx, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
 	signatures::{SignatureBuilder, SignatureRegistry},
@@ -45,15 +45,12 @@ pub(super) enum ImplTarget {
 	Char,
 	Array,
 	Slice,
-	Struct(DefId),
-	Enum(DefId),
+	Struct(StructIdx),
+	Enum(EnumIdx),
 }
 
 impl ImplTarget {
-	pub(super) fn from_type(
-		ty: &Type,
-		defs: &DefinitionRegistry,
-	) -> Option<Self> {
+	pub(super) fn from_type(ty: &Type) -> Option<Self> {
 		Some(match ty {
 			Type::U8 => Self::U8,
 			Type::I8 => Self::I8,
@@ -69,12 +66,8 @@ impl ImplTarget {
 			Type::Char => Self::Char,
 			Type::Array { .. } => Self::Array,
 			Type::Slice { .. } => Self::Slice,
-			Type::Struct { struct_index, .. } => {
-				Self::Struct(defs.structs[usize::from(*struct_index)].def_id)
-			}
-			Type::Enum { enum_index } => {
-				Self::Enum(defs.enums[usize::from(*enum_index)].def_id)
-			}
+			Type::Struct { struct_index, .. } => Self::Struct(*struct_index),
+			Type::Enum { enum_index } => Self::Enum(*enum_index),
 			Type::Error
 			| Type::Infer
 			| Type::Unit
@@ -95,13 +88,13 @@ impl ImplTarget {
 
 #[derive(Clone, Copy)]
 pub(super) struct TraitImplHead {
-	pub(super) trait_def: Option<Spanned<DefId>>,
+	pub(super) trait_def: Option<Spanned<TraitIdx>>,
 	pub(super) target: Option<Spanned<ImplTarget>>,
 }
 
 pub(super) struct ImplDispatch {
-	inherent: HashMap<ImplTarget, Vec<InherentImplIndex>>,
-	traits: HashMap<ImplTarget, Vec<(DefId, TraitImplIndex)>>,
+	inherent: HashMap<ImplTarget, Vec<InherentImplIdx>>,
+	traits: HashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
@@ -112,8 +105,8 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	defs: &'a DefinitionRegistry,
 	ast_nodes: &'a [AstEntry<'ast>],
 	stdlib_package: PackageId,
-	inherent: HashMap<ImplTarget, Vec<InherentImplIndex>>,
-	traits: HashMap<ImplTarget, Vec<(DefId, TraitImplIndex)>>,
+	inherent: HashMap<ImplTarget, Vec<InherentImplIdx>>,
+	traits: HashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
@@ -138,26 +131,26 @@ impl ImplDispatch {
 
 	pub(super) fn inherent_target(
 		&self,
-		index: InherentImplIndex,
+		index: InherentImplIdx,
 	) -> Option<Spanned<ImplTarget>> {
 		self.inherent_targets[usize::from(index)]
 	}
 
-	pub(super) fn trait_header(&self, index: TraitImplIndex) -> TraitImplHead {
+	pub(super) fn trait_header(&self, index: TraitImplIdx) -> TraitImplHead {
 		self.trait_headers[usize::from(index)]
 	}
 
 	pub(super) fn inherent_candidates(
 		&self,
 		target: ImplTarget,
-	) -> &[InherentImplIndex] {
+	) -> &[InherentImplIdx] {
 		self.inherent.get(&target).map(Vec::as_slice).unwrap_or(&[])
 	}
 
 	pub(super) fn trait_candidates(
 		&self,
 		target: ImplTarget,
-	) -> &[(DefId, TraitImplIndex)] {
+	) -> &[(TraitIdx, TraitImplIdx)] {
 		self.traits.get(&target).map(Vec::as_slice).unwrap_or(&[])
 	}
 
@@ -202,55 +195,68 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				AstNodeRef::InherentImplBlock { item, block_index } => {
 					let ast::Item::InherentImpl {
 						type_params,
-						target,
+						target: target_path,
 						..
 					} = item
 					else {
 						unreachable!()
 					};
-					let target = self.resolve_target(
+					let Ok(target) = self.resolve_target(
 						entry.file_id,
 						entry.namespace,
-						target,
+						target_path,
 						type_params,
-					);
-					self.inherent_targets[usize::from(*block_index)] = target;
-					if let Some(target) = target {
-						self.register_inherent(
-							target,
-							*block_index,
-							entry.file_id,
-						);
-					}
+					) else {
+						continue;
+					};
+					let target = Spanned {
+						inner: target,
+						span: target_path.span(),
+					};
+					self.inherent_targets[usize::from(*block_index)] =
+						Some(target);
+					self.register_inherent(target, *block_index, entry.file_id);
 				}
 				AstNodeRef::TraitImplBlock { item, block_index } => {
 					let ast::Item::TraitImpl {
 						type_params,
 						trait_name,
-						target,
+						target: target_path,
 						..
 					} = item
 					else {
 						unreachable!()
 					};
-					let target = self.resolve_target(
-						entry.file_id,
-						entry.namespace,
-						target,
-						type_params,
-					);
-					let trait_def = self.resolve_trait(
+					let target = self
+						.resolve_target(
+							entry.file_id,
+							entry.namespace,
+							target_path,
+							type_params,
+						)
+						.ok()
+						.map(|inner| Spanned {
+							inner,
+							span: target_path.span(),
+						});
+					let trait_idx = self.resolve_trait(
 						entry.file_id,
 						entry.namespace,
 						trait_name,
 					);
 					self.trait_headers[usize::from(*block_index)] =
-						TraitImplHead { trait_def, target };
-					if let (Some(trait_def), Some(target)) = (trait_def, target)
+						TraitImplHead {
+							trait_def: trait_idx.map(|idx| Spanned {
+								inner: idx,
+								span: trait_name.span(),
+							}),
+							target,
+						};
+					if let (Some(trait_idx), Some(target)) = (trait_idx, target)
 					{
 						self.register_trait(
 							target,
-							trait_def.inner,
+							trait_idx,
 							trait_name.segments.last().unwrap().ident.inner,
 							*block_index,
 							entry.file_id,
@@ -268,26 +274,30 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					for (member, &impl_index) in
 						members.iter().zip(def.member_impls.iter())
 					{
-						let target = self.resolve_target(
-							entry.file_id,
-							entry.namespace,
-							&member.inner.inner,
-							&[],
-						);
-						let trait_def = Spanned {
-							inner: defs.traits[usize::from(def.trait_index)]
-								.def_id,
-							span: member.inner.span,
-						};
+						let target = self
+							.resolve_target(
+								entry.file_id,
+								entry.namespace,
+								&member.inner.inner,
+								&[],
+							)
+							.ok()
+							.map(|inner| Spanned {
+								inner,
+								span: member.inner.span,
+							});
 						self.trait_headers[usize::from(impl_index)] =
 							TraitImplHead {
-								trait_def: Some(trait_def),
+								trait_def: Some(Spanned {
+									inner: def.trait_index,
+									span: member.inner.span,
+								}),
 								target,
 							};
 						if let Some(target) = target {
 							self.register_trait(
 								target,
-								trait_def.inner,
+								def.trait_index,
 								name.inner,
 								impl_index,
 								entry.file_id,
@@ -309,14 +319,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn register_trait(
 		&mut self,
 		target: Spanned<ImplTarget>,
-		trait_def: DefId,
+		trait_idx: TraitIdx,
 		trait_name: SymbolU32,
-		index: TraitImplIndex,
+		trait_impl_idx: TraitImplIdx,
 		file_id: FileId,
 	) {
 		let bucket = self.traits.entry(target.inner).or_default();
 		if let Some(&(_, earlier)) =
-			bucket.iter().find(|(item, _)| *item == trait_def)
+			bucket.iter().find(|(idx, _)| *idx == trait_idx)
 		{
 			let name = self.strings.resolve(trait_name).unwrap();
 			let earlier_target =
@@ -341,7 +351,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			);
 			return;
 		}
-		bucket.push((trait_def, index));
+		bucket.push((trait_idx, trait_impl_idx));
 	}
 
 	/// Buckets one inherent impl under `target`, reporting
@@ -356,7 +366,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn register_inherent(
 		&mut self,
 		target: Spanned<ImplTarget>,
-		index: InherentImplIndex,
+		index: InherentImplIdx,
 		file_id: FileId,
 	) {
 		let defs = self.defs;
@@ -408,89 +418,93 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn resolve_target(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIndex,
+		namespace: NamespaceIdx,
 		path: &ast::Path,
 		params: &[ast::TypeParam],
-	) -> Option<Spanned<ImplTarget>> {
-		let defs = self.defs;
-		let stdlib_root =
-			defs.package_namespaces[self.stdlib_package.as_usize()];
-		let segments = &path.segments;
-		let span = path.span();
-		let invalid = |message: String| {
-			Diagnostic::error()
-				.with_code(DiagnosticCode::InvalidImplTarget.code())
-				.with_message(message)
-				.with_label(SourceSpan::new(file_id, span).primary_label())
-		};
-		// Normal type resolution checks local type parameters before namespace
-		// bindings. The dispatch-only path walk must make the same distinction.
+	) -> Result<ImplTarget, ()> {
 		if params
 			.iter()
-			.any(|param| param.name.inner == segments[0].ident.inner)
+			.any(|param| param.name.inner == path.segments[0].ident.inner)
 		{
-			self.diagnostics.push(invalid(
-				"cannot use a type parameter as an impl target".into(),
-			));
-			return None;
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::InvalidImplTarget.code())
+					.with_message(
+						"cannot use a type parameter as an impl target",
+					)
+					.with_label(
+						SourceSpan::new(file_id, path.span()).primary_label(),
+					),
+			);
+			return Err(());
 		}
-		let binding =
-			PathResolver::new(&defs.namespaces, &defs.use_items, stdlib_root)
-				.resolve_path(
-					self.diagnostics,
-					self.strings,
-					file_id,
-					namespace,
-					segments,
-					BindingNamespace::Type,
-				);
-		let Some(key) = binding.def_key() else {
-			return None;
+		let binding = PathResolver::new(
+			&self.defs.namespaces,
+			&self.defs.use_items,
+			&self.defs.enums,
+			&self.defs.imports,
+			&self.defs.modules,
+			self.stdlib_package.root_namespace(),
+		)
+		.resolve_path(
+			self.diagnostics,
+			self.strings,
+			file_id,
+			namespace,
+			&path.segments,
+			BindingNamespace::Type,
+		);
+		let kind = binding.def_key().ok_or(())?.symbol_kind(self.defs);
+		let target = match kind {
+			DefKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
+			DefKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
+			// A user-written alias (`type Foo = Bar;`) has no identity of
+			// its own to dispatch on — only the closed set of std's own
+			// bodiless `#[intrinsic]` aliases (`u8`, `char`, ...) do, via
+			// their pre-interned `TypeIndex`. `intrinsic_target` returns
+			// `None` for every other alias, same as any non-namespace kind.
+			DefKind::TypeAlias(idx) => self.intrinsic_target(idx),
+			_ => None,
 		};
-		let kind = key.symbol_kind(defs);
-		let head = match kind {
-			DefKind::Struct(id) => Some(ImplTarget::Struct(id)),
-			DefKind::Enum(namespace) => {
-				match defs.namespaces[usize::from(namespace)].kind {
-					NamespaceKind::Enum(index) => Some(ImplTarget::Enum(
-						defs.enums[usize::from(index)].def_id,
-					)),
-					_ => unreachable!(),
-				}
-			}
-			_ => self.intrinsic_target(key),
-		};
-		if head.is_none() {
-			self.diagnostics.push(invalid(format!(
-				"cannot use this {} as an impl target",
-				kind.noun(),
-			)));
-		}
-		head.map(|inner| Spanned { inner, span })
+		target.ok_or_else(|| {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::InvalidImplTarget.code())
+					.with_message(format!(
+						"cannot use {} as an impl target",
+						kind.noun()
+					))
+					.with_label(
+						SourceSpan::new(file_id, path.span()).primary_label(),
+					),
+			);
+		})
 	}
 
 	fn resolve_trait(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIndex,
+		namespace: NamespaceIdx,
 		path: &ast::Path,
-	) -> Option<Spanned<DefId>> {
-		let defs = self.defs;
-		let stdlib_root =
-			defs.package_namespaces[self.stdlib_package.as_usize()];
-		let binding =
-			PathResolver::new(&defs.namespaces, &defs.use_items, stdlib_root)
-				.resolve_path(
-					self.diagnostics,
-					self.strings,
-					file_id,
-					namespace,
-					&path.segments,
-					BindingNamespace::Type,
-				);
-		let key = binding.def_key()?;
-		let id = match key.symbol_kind(defs) {
-			DefKind::Trait(id) => id,
+	) -> Option<TraitIdx> {
+		let binding = PathResolver::new(
+			&self.defs.namespaces,
+			&self.defs.use_items,
+			&self.defs.enums,
+			&self.defs.imports,
+			&self.defs.modules,
+			self.stdlib_package.root_namespace(),
+		)
+		.resolve_path(
+			self.diagnostics,
+			self.strings,
+			file_id,
+			namespace,
+			&path.segments,
+			BindingNamespace::Type,
+		);
+		match binding.def_key()?.symbol_kind(self.defs) {
+			DefKind::Trait(idx) => Some(idx),
 			other => {
 				self.diagnostics.push(report_expected_trait_bound(
 					file_id,
@@ -498,36 +512,33 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					path.segments.last().unwrap().ident,
 					other.noun(),
 				));
-				return None;
-			}
-		};
-		Some(Spanned {
-			inner: id,
-			span: path.span(),
-		})
-	}
-
-	fn intrinsic_target(&self, key: DefKey) -> Option<ImplTarget> {
-		let intrinsic = &self.defs.intrinsics;
-		for (candidate, target) in [
-			(intrinsic.u8, ImplTarget::U8),
-			(intrinsic.i8, ImplTarget::I8),
-			(intrinsic.u16, ImplTarget::U16),
-			(intrinsic.i16, ImplTarget::I16),
-			(intrinsic.u32, ImplTarget::U32),
-			(intrinsic.i32, ImplTarget::I32),
-			(intrinsic.u64, ImplTarget::U64),
-			(intrinsic.i64, ImplTarget::I64),
-			(intrinsic.f32, ImplTarget::F32),
-			(intrinsic.f64, ImplTarget::F64),
-			(intrinsic.bool, ImplTarget::Bool),
-			(intrinsic.char, ImplTarget::Char),
-		] {
-			if candidate == Some(key) {
-				return Some(target);
+				None
 			}
 		}
-		None
+	}
+
+	/// The dispatch bucket for `idx`, if it's one of std's own
+	/// `#[intrinsic]` primitive aliases — `None` for an ordinary alias.
+	/// `never` has no bucket here (nothing can be implemented on it), so
+	/// it's the one `IntrinsicDefs` type slot this deliberately excludes.
+	fn intrinsic_target(&self, idx: TypeAliasIdx) -> Option<ImplTarget> {
+		let intrinsics = &self.defs.intrinsics;
+		[
+			(intrinsics.u8, ImplTarget::U8),
+			(intrinsics.i8, ImplTarget::I8),
+			(intrinsics.u16, ImplTarget::U16),
+			(intrinsics.i16, ImplTarget::I16),
+			(intrinsics.u32, ImplTarget::U32),
+			(intrinsics.i32, ImplTarget::I32),
+			(intrinsics.u64, ImplTarget::U64),
+			(intrinsics.i64, ImplTarget::I64),
+			(intrinsics.f32, ImplTarget::F32),
+			(intrinsics.f64, ImplTarget::F64),
+			(intrinsics.bool, ImplTarget::Bool),
+			(intrinsics.char, ImplTarget::Char),
+		]
+		.into_iter()
+		.find_map(|(slot, target)| (slot == Some(idx)).then_some(target))
 	}
 }
 
@@ -570,27 +581,14 @@ impl SignatureBuilder<'_, '_> {
 			ImplTarget::F64 => TypeIndex::F64,
 			ImplTarget::Bool => TypeIndex::BOOL,
 			ImplTarget::Char => TypeIndex::CHAR,
-			ImplTarget::Struct(def_id) => {
-				let struct_index = match self.ast_node(def_id) {
-					AstNodeRef::RecordStruct { struct_index, .. }
-					| AstNodeRef::TupleStruct { struct_index, .. } => *struct_index,
-					_ => unreachable!(
-						"struct target must name a struct definition"
-					),
-				};
+			ImplTarget::Struct(struct_index) => {
 				self.types.intern(Type::Struct {
 					struct_index,
 					args: Box::new([]),
 				})
 			}
-			ImplTarget::Enum(def_id) => {
-				let AstNodeRef::Enum { enum_index, .. } = self.ast_node(def_id)
-				else {
-					unreachable!("enum target must name an enum definition")
-				};
-				self.types.intern(Type::Enum {
-					enum_index: *enum_index,
-				})
+			ImplTarget::Enum(enum_index) => {
+				self.types.intern(Type::Enum { enum_index })
 			}
 			ImplTarget::Array | ImplTarget::Slice => {
 				unreachable!(
@@ -600,7 +598,7 @@ impl SignatureBuilder<'_, '_> {
 		}
 	}
 
-	pub(super) fn impl_trait_index(&self, def_id: DefId) -> TraitIndex {
+	pub(super) fn impl_trait_index(&self, def_id: DefId) -> TraitIdx {
 		match self.ast_node(def_id) {
 			AstNodeRef::Trait { trait_index, .. } => *trait_index,
 			AstNodeRef::TypeSet { typeset_index, .. } => {
@@ -620,14 +618,14 @@ impl SignatureRegistry {
 	pub(super) fn inherent_candidates(
 		&self,
 		target: ImplTarget,
-	) -> &[InherentImplIndex] {
+	) -> &[InherentImplIdx] {
 		self.impl_dispatch.inherent_candidates(target)
 	}
 
 	pub(super) fn trait_candidates(
 		&self,
 		target: ImplTarget,
-	) -> &[(DefId, TraitImplIndex)] {
+	) -> &[(TraitIdx, TraitImplIdx)] {
 		self.impl_dispatch.trait_candidates(target)
 	}
 }

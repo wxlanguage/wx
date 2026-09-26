@@ -160,7 +160,7 @@ define_diagnostic_codes! {
 		CannotDerefNonPointer => "E2037",
 		NoMemoryForPointer => "E2038",
 		AmbiguousPointerMemory => "E2039",
-		TypeArgCountMismatch => "E2040",
+		TypeArgumentCountMismatch => "E2040",
 		InvalidCast => "E2041",
 		IndexOnNonIndexable => "E2042",
 		ArraySizeMismatch => "E2043",

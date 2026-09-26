@@ -10,11 +10,12 @@
 use string_interner::symbol::SymbolU32;
 
 use crate::diagnostics::SourceSpan;
+use crate::tir::types::TypeEnvOwner;
 
-use super::bounds::MergedTraitBound;
+use super::bounds::ImpliedTraitBound;
 use super::defs::{
-	AstNodeRef, BindingKey, BindingNamespace, InherentImplIndex, MemberKind,
-	TraitImplIndex, TraitIndex,
+	AstNodeRef, BindingKey, BindingNamespace, InherentImplIdx, MemberKind,
+	TraitImplIdx, TraitIdx,
 };
 use super::impls::ImplTarget;
 use super::signatures::{
@@ -42,9 +43,9 @@ pub(super) struct TypeMemberTarget {
 }
 
 pub(super) enum MemberSource {
-	Inherent(InherentImplIndex),
+	Inherent(InherentImplIdx),
 	/// A concrete `impl Trait for Type` provides (or overrides) this member.
-	TraitImpl(TraitIndex, TraitImplIndex),
+	TraitImpl(TraitIdx, TraitImplIdx),
 	/// No impl overrides it for this concrete type — the trait's own
 	/// declaration applies as-is. Whether that declaration has a body is
 	/// not this lookup's concern: an impl missing a required override is an
@@ -54,12 +55,12 @@ pub(super) enum MemberSource {
 	/// never reports an error at an access site for an incorrectly
 	/// implemented trait member, only at the `impl` block that's missing
 	/// it.
-	TraitDefault(TraitIndex),
+	TraitDefault(TraitIdx),
 	/// Receiver is abstract (`TypeParam`/`AssocTypeProjection`): resolved
 	/// through one of its own bounds, not a concrete impl at all. Concrete
 	/// dispatch is deferred to monomorphization (mirrors the existing
 	/// `GenericMethodCall`/`AbstractConstAccess` shape).
-	Bound(TraitIndex),
+	Bound(TraitIdx),
 }
 
 impl SignatureBuilder<'_, '_> {
@@ -77,7 +78,7 @@ impl SignatureBuilder<'_, '_> {
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		let key = BindingKey::new(tier, name);
-		match ImplTarget::from_type(self.types.resolve(receiver), self.defs) {
+		match ImplTarget::from_type(self.types.resolve(receiver)) {
 			Some(target) => self.resolve_concrete_member(target, key),
 			None => self.resolve_bound_member(receiver, key, reference),
 		}
@@ -105,10 +106,9 @@ impl SignatureBuilder<'_, '_> {
 		}
 
 		let mut candidates = Vec::new();
-		for &(trait_def_id, impl_index) in
+		for &(trait_index, impl_index) in
 			self.impl_dispatch.trait_candidates(target)
 		{
-			let trait_index = self.impl_trait_index(trait_def_id);
 			let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
 			if let Some(&member_index) = impl_def.bindings.get(&key) {
 				let kind = impl_def.members[usize::from(member_index)].kind;
@@ -132,21 +132,6 @@ impl SignatureBuilder<'_, '_> {
 		Self::classify(candidates)
 	}
 
-	/// `declared`'s bounds are only ever validated in isolation, each
-	/// against its *own* supertrait chain, at the point that trait's own
-	/// header resolved (`TraitSignature::implied_bounds`) — never as a
-	/// *combination*. A trait's own `Self: B + C` is the one place that
-	/// combination *is* checked eagerly (right there, since `D`'s own
-	/// closure is what every future `T: D` bound will reuse); a
-	/// function/struct/impl's own `T: B + C` never is, because nothing
-	/// else ever reuses that specific combination — so if `B` and `C`
-	/// disagree about some associated type, nothing has caught it before
-	/// now. This is where that combination is finally checked, lazily —
-	/// and, since nothing else ever reuses it either, cached the first
-	/// time it's actually demanded (`SignatureBuilder::param_bounds`), so
-	/// a second projection through the same receiver reuses the merge
-	/// instead of re-running `union_trait_bound` (and, if it disagrees,
-	/// re-diagnosing it) from scratch.
 	fn resolve_bound_member(
 		&mut self,
 		receiver: TypeIndex,
@@ -154,61 +139,32 @@ impl SignatureBuilder<'_, '_> {
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		match self.types.resolve(receiver) {
-			Type::TypeParam {
-				owner,
-				env,
-				param_index,
-			} => {
-				let (owner, env, param_index) = (*owner, *env, *param_index);
-				// A trait's own `Self` never needs a cache slot of its
-				// own: its combination was already checked, once,
-				// eagerly, when the trait's header resolved —
-				// `implied_bounds` already *is* the fully merged,
-				// already-diagnosed transitive closure. Prepending the
-				// reflexive `Self: ThisTrait` entry is all that's missing to
-				// answer this lookup directly, no merge needed.
-				//
-				// `ast_node`, not `signature_location`/`ensure_signature`:
-				// `owner` can be the *currently in-progress* item's own
-				// `DefId` (a function's own generic param references
-				// itself — `fn f<T: HasSize>(x: T::Size)` — via `owner`),
-				// so this has to work identically whether `owner`'s own
-				// query has finished or not. It's a pure "is this a
-				// trait" identity question either way.
-				if let AstNodeRef::Trait {
-					trait_index: idx, ..
-				} = self.ast_node(owner)
-				{
-					let idx = *idx;
-					let trait_sig = &self.traits[usize::from(idx)];
-					return self.candidates_from_implied(
-						&trait_sig.implied_bounds,
-						key,
-						Some(idx),
-					);
-				}
-
-				self.candidates_from_implied(
-					self.implied_bounds(env, param_index),
+			Type::TypeParam { env, param_index } => self
+				.candidates_from_implied(
+					&self.param_bounds[usize::from(*env)]
+						[*param_index as usize]
+						.implied_bounds,
 					key,
-					None,
-				)
-			}
+					match self.type_envs.frame_owner(*env) {
+						TypeEnvOwner::Trait(trait_index) => Some(trait_index),
+						_ => None,
+					},
+				),
 			Type::AssocTypeProjection {
 				trait_index,
 				assoc_name,
 				..
 			} => {
-				let (trait_index, assoc_name) = (*trait_index, *assoc_name);
-				let Some(index) = self.ensure_assoc_type_signature(
-					trait_index,
-					assoc_name,
+				let Some(assoc_type_index) = self.ensure_assoc_type_signature(
+					*trait_index,
+					*assoc_name,
 					reference,
 				) else {
 					return TypeMemberLookup::NotFound;
 				};
 				self.candidates_from_implied(
-					&self.assoc_types[usize::from(index)].implied_bounds,
+					&self.assoc_types[usize::from(assoc_type_index)]
+						.implied_bounds,
 					key,
 					None,
 				)
@@ -232,9 +188,9 @@ impl SignatureBuilder<'_, '_> {
 	/// projection, which isn't this function's job.
 	fn candidates_from_implied(
 		&self,
-		bounds: &[MergedTraitBound],
+		bounds: &[ImpliedTraitBound],
 		key: BindingKey,
-		reflexive: Option<TraitIndex>,
+		reflexive: Option<TraitIdx>,
 	) -> TypeMemberLookup {
 		let mut candidates = Vec::new();
 		for (trait_index, _bound) in reflexive
@@ -274,7 +230,7 @@ impl SignatureBuilder<'_, '_> {
 	/// `satisfaction::type_satisfies_trait`.
 	pub(super) fn ensure_assoc_type_signature(
 		&mut self,
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		assoc_name: SymbolU32,
 		requested_at: SourceSpan,
 	) -> Option<AssocTypeIndex> {

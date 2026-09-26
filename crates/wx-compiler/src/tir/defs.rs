@@ -33,14 +33,14 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	stdlib_package: PackageId,
 
 	namespaces: Vec<Namespace>,
-	package_namespaces: Vec<NamespaceIndex>,
-	module_decls: Vec<ModuleDeclaration>,
-	import_decls: Vec<ImportDeclaration>,
+	modules: Vec<ModuleDef>,
+	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
 	structs: Vec<StructDef>,
+	type_aliases: Vec<TypeAliasDef>,
 	enums: Vec<EnumDef>,
 	typesets: Vec<TypeSetDef>,
 	functions: Vec<FunctionDef>,
@@ -49,7 +49,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
-		HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
+		HashMap<(NamespaceIdx, SymbolU32), SmallVec<UseItemIndex>>,
 	/// Every glob `use` item — `pub` or not — grouped by the namespace it's
 	/// *declared* in — no name dimension, unlike `pending_named_imports`,
 	/// since a glob doesn't claim one. Lets glob resolution find "what does
@@ -60,7 +60,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// lookup time includes private edges just as much as `pub` ones, so
 	/// cycle detection has to see the whole graph, not just its `pub`
 	/// subset.
-	pending_glob_targets: HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+	pending_glob_targets: HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -93,7 +93,7 @@ pub enum UseItemKind {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct UseItemDef {
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 	pub pub_span: Option<TextSpan>,
 	pub kind: UseItemKind,
 }
@@ -146,14 +146,14 @@ impl BindingKey {
 pub struct TraitDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIndex>,
+	pub bindings: HashMap<BindingKey, MemberIdx>,
 	pub members: Vec<TraitMemberDef>,
 }
 
@@ -161,25 +161,25 @@ pub struct TraitDef {
 pub struct TraitImplDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 	pub members: Vec<TraitMemberDef>,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIndex>,
+	pub bindings: HashMap<BindingKey, MemberIdx>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct InherentImplDef {
 	pub def_id: ast::DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIndex>,
+	pub bindings: HashMap<BindingKey, MemberIdx>,
 	pub members: Vec<InherentMemberDef>,
 }
 
@@ -190,7 +190,8 @@ pub struct InherentImplDef {
 pub struct StructDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
 	pub fields: StructFields,
 }
 
@@ -203,7 +204,7 @@ pub enum StructFields {
 			test,
 			serde(serialize_with = "crate::testing::serialize_sorted_map")
 		)]
-		lookup: HashMap<SymbolU32, FieldIndex>,
+		lookup: HashMap<SymbolU32, FieldIdx>,
 	},
 	Tuple {
 		fields: Box<[TupleFieldDef]>,
@@ -225,8 +226,17 @@ pub struct TupleFieldDef {
 pub struct EnumDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub variants_namespace: NamespaceIndex,
+	pub parent_namespace: NamespaceIdx,
+	pub own_namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct TypeAliasDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
 }
 
 /// `typeset X: A + B { m1, m2 }` — `trait_index` is a compiler-generated
@@ -245,9 +255,9 @@ pub struct EnumDef {
 pub struct TypeSetDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub trait_index: TraitIndex,
-	pub member_impls: Box<[TraitImplIndex]>,
+	pub namespace: NamespaceIdx,
+	pub trait_index: TraitIdx,
+	pub member_impls: Box<[TraitImplIdx]>,
 }
 
 /// Shared by a free function, a trait member, and an impl method — one
@@ -258,40 +268,37 @@ pub struct TypeSetDef {
 pub struct FunctionDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 	pub name: Spanned<SymbolU32>,
 	pub params: Box<[Spanned<SymbolU32>]>,
 }
 
-index_newtype!(LocalDefIndex);
-index_newtype!(MemberIndex);
-index_newtype!(ModuleDeclIndex);
-index_newtype!(ImportDeclIndex);
-index_newtype!(NamespaceIndex);
-index_newtype!(TraitIndex);
-index_newtype!(InherentImplIndex);
-index_newtype!(TraitImplIndex);
-// Pre-allocated here (like `TraitIndex`), not lazily in `signatures.rs`
-// (like `TypeAlias`) — a struct's identity doesn't depend on its own
-// fields being resolved, so a self-/mutually-referencing pointer field
-// needs a stable index without waiting on `ensure_signature`.
-index_newtype!(StructIndex);
-// A field's declaration-order position within its struct.
-index_newtype!(FieldIndex);
-// Pre-allocated here (like `StructIndex`) — an enum's variant namespace is
-// created in Phase 1, so `NamespaceKind::Enum` needs a stable index to point
-// at before `signatures.rs` has any reason to resolve this enum.
-index_newtype!(EnumIndex);
-// Pre-allocated here — a typeset's backing trait and per-member impl slots
-// are created in Phase 1 (see `TypeSetDef`), so bound resolution can force
-// them via `ensure_signature` before `signatures.rs` would otherwise reach
-// this typeset in the general sweep.
-index_newtype!(TypeSetIndex);
-// Pre-allocated here (like `StructIndex`) — shared by a free function, a
-// trait member, and an impl method alike (see `FunctionDef`), so a
-// self-/mutually-referencing signature (`fn f<T: HasSize>(x: T::Size)`)
-// needs a stable index the same way a struct field does.
-index_newtype!(FunctionIndex);
+index_newtype!(LocalDefIdx);
+index_newtype!(MemberIdx);
+index_newtype!(ModuleIdx);
+index_newtype!(ImportIdx);
+index_newtype!(NamespaceIdx);
+
+impl PackageId {
+	/// Packages preallocate their own root namespace 1:1, in `PackageId`
+	/// order, before anything else — see
+	/// `DefinitionRegistryBuilder::build`. So a package's own namespace
+	/// never needs a lookup table; it's this same index reinterpreted.
+	#[inline]
+	pub(super) fn root_namespace(self) -> NamespaceIdx {
+		NamespaceIdx::new(self.as_u32())
+	}
+}
+
+index_newtype!(TraitIdx);
+index_newtype!(InherentImplIdx);
+index_newtype!(TraitImplIdx);
+index_newtype!(StructIdx);
+index_newtype!(FieldIdx);
+index_newtype!(EnumIdx);
+index_newtype!(TypesetIdx);
+index_newtype!(TypeAliasIdx);
+index_newtype!(FunctionIdx);
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -308,10 +315,10 @@ pub struct InherentMemberDef {
 	pub span: TextSpan,
 }
 
-impl LocalDefIndex {
+impl LocalDefIdx {
 	/// each module has a `self` binding which is the first binding in the list of it's bindings
 	/// other modules can use it to reference it, for example `super`
-	pub(super) const SELF: Self = LocalDefIndex(0);
+	pub(super) const SELF: Self = LocalDefIdx(0);
 }
 
 #[derive(Clone)]
@@ -320,7 +327,7 @@ impl LocalDefIndex {
 pub(super) struct AstEntry<'ast> {
 	pub(super) def_id: DefId,
 	pub(super) file_id: FileId,
-	pub(super) namespace: NamespaceIndex,
+	pub(super) namespace: NamespaceIdx,
 	pub(super) node: AstNodeRef<'ast>,
 }
 
@@ -330,18 +337,18 @@ pub(super) struct AstEntry<'ast> {
 pub(super) enum AstNodeRef<'ast> {
 	Function {
 		item: &'ast ast::Item,
-		function_index: FunctionIndex,
+		func_index: FunctionIdx,
 	},
 	RecordStruct {
-		struct_index: StructIndex,
+		struct_index: StructIdx,
 		item: &'ast ast::Item,
 	},
 	TupleStruct {
-		struct_index: StructIndex,
+		struct_index: StructIdx,
 		item: &'ast ast::Item,
 	},
 	Enum {
-		enum_index: EnumIndex,
+		enum_index: EnumIdx,
 		item: &'ast ast::Item,
 	},
 	Global {
@@ -354,69 +361,70 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 	},
 	TypeSet {
-		typeset_index: TypeSetIndex,
+		typeset_index: TypesetIdx,
 		item: &'ast ast::Item,
 	},
 	TypeAlias {
 		item: &'ast ast::Item,
+		type_alias_index: TypeAliasIdx,
 	},
 	Trait {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		item: &'ast ast::Item,
 	},
 	TraitFunction {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
-		function_index: FunctionIndex,
+		function_index: FunctionIdx,
 	},
 	TraitConst {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
 	},
 	TraitAssocType {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
 	},
 	TraitImplBlock {
 		item: &'ast ast::Item,
-		block_index: TraitImplIndex,
+		block_index: TraitImplIdx,
 	},
 	TraitImplFunction {
 		item: &'ast ast::ImplItem,
-		block_index: TraitImplIndex,
-		function_index: FunctionIndex,
+		block_index: TraitImplIdx,
+		function_index: FunctionIdx,
 	},
 	TraitImplConstant {
 		item: &'ast ast::ImplItem,
-		block_index: TraitImplIndex,
+		block_index: TraitImplIdx,
 	},
 	TraitImplAssocType {
 		item: &'ast ast::ImplItem,
-		block_index: TraitImplIndex,
+		block_index: TraitImplIdx,
 	},
 	InherentImplBlock {
 		item: &'ast ast::Item,
-		block_index: InherentImplIndex,
+		block_index: InherentImplIdx,
 	},
 	InherentImplFunction {
 		item: &'ast ast::ImplItem,
-		block_index: InherentImplIndex,
-		function_index: FunctionIndex,
+		block_index: InherentImplIdx,
+		function_index: FunctionIdx,
 	},
 	InherentImplConst {
 		item: &'ast ast::ImplItem,
-		block_index: InherentImplIndex,
+		block_index: InherentImplIdx,
 	},
 	ImportedMemory {
-		import_module_index: ImportDeclIndex,
+		import_module_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedFunction {
-		import_module_index: ImportDeclIndex,
+		import_module_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedGlobal {
-		import_module_index: ImportDeclIndex,
+		import_module_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	Export {
@@ -427,14 +435,11 @@ pub(super) enum AstNodeRef<'ast> {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct DefinitionRegistry {
 	pub namespaces: Vec<Namespace>,
-	/// Each package's own root namespace.
-	#[cfg_attr(test, serde(skip))]
-	pub package_namespaces: Vec<NamespaceIndex>,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
 	#[cfg_attr(test, serde(skip))]
-	pub file_namespaces: Vec<NamespaceIndex>,
-	pub module_decls: Vec<ModuleDeclaration>,
-	pub import_decls: Vec<ImportDeclaration>,
+	pub file_namespaces: Vec<NamespaceIdx>,
+	pub modules: Vec<ModuleDef>,
+	pub imports: Vec<ImportDef>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -442,6 +447,7 @@ pub(super) struct DefinitionRegistry {
 	pub enums: Vec<EnumDef>,
 	pub typesets: Vec<TypeSetDef>,
 	pub functions: Vec<FunctionDef>,
+	pub type_aliases: Vec<TypeAliasDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
@@ -468,40 +474,43 @@ pub(super) struct DefinitionRegistry {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct IntrinsicDefs {
-	pub u8: Option<DefKey>,
-	pub i8: Option<DefKey>,
-	pub u16: Option<DefKey>,
-	pub i16: Option<DefKey>,
-	pub u32: Option<DefKey>,
-	pub i32: Option<DefKey>,
-	pub u64: Option<DefKey>,
-	pub i64: Option<DefKey>,
-	pub f32: Option<DefKey>,
-	pub f64: Option<DefKey>,
-	pub bool: Option<DefKey>,
-	pub char: Option<DefKey>,
-	pub never: Option<DefKey>,
-	pub add: Option<DefKey>,
-	pub sub: Option<DefKey>,
-	pub mul: Option<DefKey>,
-	pub div: Option<DefKey>,
-	pub rem: Option<DefKey>,
-	pub neg: Option<DefKey>,
-	pub bitand: Option<DefKey>,
-	pub bitor: Option<DefKey>,
-	pub bitxor: Option<DefKey>,
-	pub shl: Option<DefKey>,
-	pub shr: Option<DefKey>,
-	pub bitnot: Option<DefKey>,
-	pub not: Option<DefKey>,
-	pub partial_eq: Option<DefKey>,
-	pub partial_ord: Option<DefKey>,
+	pub u8: Option<TypeAliasIdx>,
+	pub i8: Option<TypeAliasIdx>,
+	pub u16: Option<TypeAliasIdx>,
+	pub i16: Option<TypeAliasIdx>,
+	pub u32: Option<TypeAliasIdx>,
+	pub i32: Option<TypeAliasIdx>,
+	pub u64: Option<TypeAliasIdx>,
+	pub i64: Option<TypeAliasIdx>,
+	pub f32: Option<TypeAliasIdx>,
+	pub f64: Option<TypeAliasIdx>,
+	pub bool: Option<TypeAliasIdx>,
+	pub char: Option<TypeAliasIdx>,
+	pub never: Option<TypeAliasIdx>,
+	pub add: Option<TraitIdx>,
+	pub sub: Option<TraitIdx>,
+	pub mul: Option<TraitIdx>,
+	pub div: Option<TraitIdx>,
+	pub rem: Option<TraitIdx>,
+	pub neg: Option<TraitIdx>,
+	pub bitand: Option<TraitIdx>,
+	pub bitor: Option<TraitIdx>,
+	pub bitxor: Option<TraitIdx>,
+	pub shl: Option<TraitIdx>,
+	pub shr: Option<TraitIdx>,
+	pub bitnot: Option<TraitIdx>,
+	pub not: Option<TraitIdx>,
+	pub partial_eq: Option<TraitIdx>,
+	pub partial_ord: Option<TraitIdx>,
 }
 
 impl IntrinsicDefs {
 	/// The mutable slot for `name` if it's one of the recognized primitive
 	/// type names — the one place that list is written.
-	fn type_slot_mut(&mut self, name: &str) -> Option<&mut Option<DefKey>> {
+	fn type_slot_mut(
+		&mut self,
+		name: &str,
+	) -> Option<&mut Option<TypeAliasIdx>> {
 		Some(match name {
 			"u8" => &mut self.u8,
 			"i8" => &mut self.i8,
@@ -522,7 +531,7 @@ impl IntrinsicDefs {
 
 	/// The mutable slot for `name` if it's one of the recognized operator
 	/// trait names — the one place that list is written.
-	fn trait_slot_mut(&mut self, name: &str) -> Option<&mut Option<DefKey>> {
+	fn trait_slot_mut(&mut self, name: &str) -> Option<&mut Option<TraitIdx>> {
 		Some(match name {
 			"Add" => &mut self.add,
 			"Sub" => &mut self.sub,
@@ -542,27 +551,6 @@ impl IntrinsicDefs {
 			_ => return None,
 		})
 	}
-}
-
-/// Back-pointer to whichever declaration created this namespace.
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum NamespaceKind {
-	/// Index into `TIR::module_decls`.
-	Module(ModuleDeclIndex),
-	/// Index into `TIR::import_decls`.
-	Import(ImportDeclIndex),
-	/// A package's own root namespace. Carries the entry module's `FileId`
-	/// for diagnostic spans; which package it is lives on
-	/// [`ModuleNamespace::package`], the same as for every other namespace.
-	Package(FileId),
-	/// An enum's own variant scope — lets `Enum::Variant` (and eventually
-	/// `use Enum::*;`) resolve through the same segment-walking `PathResolver`
-	/// already uses for `module::item`, rather than a bespoke lookup. Unlike
-	/// a module, this namespace is never the binding installed for the
-	/// enum's own name — that stays `DefKind::Enum` so the enum keeps its
-	/// own identity (diagnostics, type resolution) rather than being
-	/// mistaken for a plain module. See `EnumDef::variants_namespace`.
-	Enum(EnumIndex),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -598,20 +586,20 @@ impl Visibility {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum DefKind {
-	Module(NamespaceIndex),
-	Import(NamespaceIndex),
-	Package(NamespaceIndex),
-	Enum(NamespaceIndex),
+	Module(ModuleIdx),
+	Import(ImportIdx),
+	Package(PackageId),
+	Enum(EnumIdx),
 	EnumVariant(DefId),
-	Struct(DefId),
+	Struct(StructIdx),
 	Memory(DefId),
-	Trait(DefId),
-	TypeSet(DefId),
+	Trait(TraitIdx),
+	TypeSet(TypesetIdx),
 	Global(DefId),
-	Function(DefId),
+	Function(FunctionIdx),
 	Const(DefId),
 	TraitAssocType(DefId),
-	TypeAlias(DefId),
+	TypeAlias(TypeAliasIdx),
 }
 
 impl DefKind {
@@ -634,38 +622,31 @@ impl DefKind {
 			DefKind::TypeAlias(_) => "type alias",
 		}
 	}
+}
 
-	/// The namespace a path can continue walking into through this def, if
-	/// any — every kind whose own identity *is* owning a `NamespaceIndex`.
-	/// `Struct`/`Trait`/... are excluded even though some will eventually
-	/// gain their own member namespaces too (impl/trait members): those are
-	/// resolved through dedicated member lookups, never through this
-	/// module's segment walk, so they never belong here.
-	pub(super) fn as_namespace(self) -> Option<NamespaceIndex> {
-		match self {
-			DefKind::Module(idx)
-			| DefKind::Import(idx)
-			| DefKind::Package(idx)
-			| DefKind::Enum(idx) => Some(idx),
-			DefKind::EnumVariant(_)
-			| DefKind::Struct(_)
-			| DefKind::Memory(_)
-			| DefKind::Trait(_)
-			| DefKind::TypeSet(_)
-			| DefKind::Global(_)
-			| DefKind::Function(_)
-			| DefKind::Const(_)
-			| DefKind::TraitAssocType(_)
-			| DefKind::TypeAlias(_) => None,
-		}
+impl DefinitionRegistry {
+	/// The namespace `kind` lets a path continue walking into, if any —
+	/// the four kinds that are themselves a namespace.
+	pub(super) fn namespace_of(&self, kind: DefKind) -> Option<NamespaceIdx> {
+		Some(match kind {
+			DefKind::Package(package) => package.root_namespace(),
+			DefKind::Enum(idx) => self.enums[usize::from(idx)].own_namespace,
+			DefKind::Module(idx) => {
+				self.modules[usize::from(idx)].own_namespace
+			}
+			DefKind::Import(idx) => {
+				self.imports[usize::from(idx)].own_namespace
+			}
+			_ => return None,
+		})
 	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct ItemDef {
 	pub(super) kind: DefKind,
-	span: TextSpan,
-	accesses: Vec<SourceSpan>,
+	pub(super) span: TextSpan,
+	pub(super) accesses: Vec<SourceSpan>,
 }
 
 impl ItemDef {
@@ -678,16 +659,24 @@ impl ItemDef {
 	}
 }
 
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum NamespaceOwner {
+	Module(ModuleIdx),
+	Import(ImportIdx),
+	Package(PackageId),
+	Enum(EnumIdx),
+}
+
 /// The symbol table for a module namespace — shared concept for both local
 /// modules (`mod foo;` / `mod foo { }`) and import blocks (`import "env" { }`).
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Namespace {
-	pub parent: Option<NamespaceIndex>,
+	pub parent: Option<NamespaceIdx>,
 	pub file_id: FileId,
 	/// The package this namespace belongs to — every namespace is inside
 	/// exactly one, so it's stored rather than recovered by walking parents.
 	pub package_id: PackageId,
-	pub kind: NamespaceKind,
+	pub owner: NamespaceOwner,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -708,8 +697,8 @@ pub(super) trait NamespaceLookup {
 	/// Whether `namespace` is `ancestor` itself, or nested inside it.
 	fn namespace_contains(
 		&self,
-		ancestor: NamespaceIndex,
-		namespace: NamespaceIndex,
+		ancestor: NamespaceIdx,
+		namespace: NamespaceIdx,
 	) -> bool;
 
 	/// An item declared `visibility` in `target_namespace` is reachable
@@ -717,8 +706,8 @@ pub(super) trait NamespaceLookup {
 	/// contains `accessor`.
 	fn is_accessible_from(
 		&self,
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		visibility: Visibility,
 	) -> bool;
 
@@ -732,7 +721,7 @@ pub(super) trait NamespaceLookup {
 	/// is what turns a collision into a reported error.
 	fn try_insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		binding: Binding,
 	) -> Result<(), DefKey>;
@@ -752,7 +741,7 @@ pub(super) trait NamespaceLookup {
 	/// definition it points to is still referenced elsewhere).
 	fn record_binding_access(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		span: SourceSpan,
 	);
@@ -764,7 +753,7 @@ pub(super) trait NamespaceLookup {
 	/// candidates are actually competing.
 	fn direct_lookup(
 		&self,
-		target_namespace: NamespaceIndex,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> Option<(BindingTarget, Visibility)>;
 
@@ -787,8 +776,8 @@ pub(super) trait NamespaceLookup {
 	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> BindingLookup;
 
@@ -800,8 +789,8 @@ pub(super) trait NamespaceLookup {
 	fn lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> BindingLookup;
 }
@@ -849,7 +838,7 @@ pub(super) enum BindingLookup {
 /// `Ambiguous`.
 struct CandidateMerge<'a> {
 	namespaces: &'a [Namespace],
-	accessor: NamespaceIndex,
+	accessor: NamespaceIdx,
 	candidates: Candidates,
 }
 
@@ -872,7 +861,7 @@ enum Candidates {
 }
 
 impl<'a> CandidateMerge<'a> {
-	fn new(namespaces: &'a [Namespace], accessor: NamespaceIndex) -> Self {
+	fn new(namespaces: &'a [Namespace], accessor: NamespaceIdx) -> Self {
 		Self {
 			namespaces,
 			accessor,
@@ -991,8 +980,8 @@ impl<'a> CandidateMerge<'a> {
 impl NamespaceLookup for [Namespace] {
 	fn namespace_contains(
 		&self,
-		ancestor: NamespaceIndex,
-		current: NamespaceIndex,
+		ancestor: NamespaceIdx,
+		current: NamespaceIdx,
 	) -> bool {
 		let mut current = Some(current);
 		while let Some(ns) = current {
@@ -1006,8 +995,8 @@ impl NamespaceLookup for [Namespace] {
 
 	fn is_accessible_from(
 		&self,
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		visibility: Visibility,
 	) -> bool {
 		match visibility {
@@ -1020,7 +1009,7 @@ impl NamespaceLookup for [Namespace] {
 
 	fn try_insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		binding: Binding,
 	) -> Result<(), DefKey> {
@@ -1089,7 +1078,7 @@ impl NamespaceLookup for [Namespace] {
 
 	fn record_binding_access(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		span: SourceSpan,
 	) {
@@ -1102,7 +1091,7 @@ impl NamespaceLookup for [Namespace] {
 
 	fn direct_lookup(
 		&self,
-		target_namespace: NamespaceIndex,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> Option<(BindingTarget, Visibility)> {
 		self[usize::from(target_namespace)]
@@ -1114,8 +1103,8 @@ impl NamespaceLookup for [Namespace] {
 	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> BindingLookup {
 		let mut candidates = CandidateMerge::new(self, accessor);
@@ -1167,8 +1156,8 @@ impl NamespaceLookup for [Namespace] {
 	fn lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIndex,
-		target_namespace: NamespaceIndex,
+		accessor: NamespaceIdx,
+		target_namespace: NamespaceIdx,
 		key: BindingKey,
 	) -> BindingLookup {
 		match self.direct_lookup(target_namespace, key) {
@@ -1296,14 +1285,26 @@ impl Binding {
 	}
 }
 
-/// Declaration-site metadata for a locally-defined module (`mod foo;` / `mod foo { }`).
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct ModuleDeclaration {
-	pub namespace_idx: NamespaceIndex,
-	/// File containing the `mod foo;` or `mod foo { }` declaration.
-	pub declaration_file_id: FileId,
-	/// File that IS this module (`foo.wx`). `None` for inline modules.
-	pub content_file_id: Option<FileId>,
+pub struct ModuleDef {
+	/// The scope `mod foo;` was written in — where the name `foo` itself
+	/// gets bound. The "outside" of the module.
+	pub parent_namespace: NamespaceIdx,
+	/// The scope `foo`'s own items live in — what a path continues into
+	/// after `foo::`. The "inside" of the module.
+	pub own_namespace: NamespaceIdx,
+	/// The file containing the `mod foo;` (or `mod foo { .. }`) text
+	/// itself — not necessarily where `foo`'s own items live.
+	///
+	/// For inline `mod foo { .. }`, the module's content lives in this
+	/// same file, so `declaration_file == own_file`. For file-backed
+	/// `mod foo;`, the declaration is one line in this file but `foo`'s
+	/// actual content lives in `foo.wx`, so `own_file` points there
+	/// instead and the two differ.
+	pub declaration_file: FileId,
+	/// The file that IS `foo`'s content: `foo.wx` for `mod foo;`, or the
+	/// same file as `declaration_file` for inline `mod foo { .. }`.
+	pub own_file: FileId,
 	pub name: ast::Spanned<SymbolU32>,
 	pub pub_span: Option<TextSpan>,
 }
@@ -1324,12 +1325,13 @@ pub struct ModuleDeclaration {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct GlobImport {
 	pub use_item: UseItemIndex,
-	pub namespace: NamespaceIndex,
+	pub namespace: NamespaceIdx,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct ImportDeclaration {
-	pub namespace_idx: NamespaceIndex,
+pub struct ImportDef {
+	pub parent_namespace: NamespaceIdx,
+	pub own_namespace: NamespaceIdx,
 	pub external_name: ast::Spanned<SymbolU32>,
 	pub internal_name: ast::Spanned<SymbolU32>,
 }
@@ -1367,13 +1369,13 @@ impl MemberKind {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct DefKey {
-	pub(super) namespace_idx: NamespaceIndex,
-	pub(super) def_idx: LocalDefIndex,
+	pub(super) namespace_idx: NamespaceIdx,
+	pub(super) def_idx: LocalDefIdx,
 }
 
 impl DefKey {
 	#[inline]
-	pub fn new(namespace_idx: NamespaceIndex, def_idx: LocalDefIndex) -> Self {
+	pub fn new(namespace_idx: NamespaceIdx, def_idx: LocalDefIdx) -> Self {
 		Self {
 			namespace_idx,
 			def_idx,
@@ -1496,26 +1498,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		stdlib_package: PackageId,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
-		let package_namespaces: Vec<NamespaceIndex> = (0..packages.len())
-			.map(|i| NamespaceIndex(u32::try_from(i).unwrap()))
-			.collect();
-
 		let namespaces: Vec<Namespace> = packages
 			.iter()
 			.enumerate()
 			.map(|(index, package)| {
-				let namespace_idx =
-					NamespaceIndex(u32::try_from(index).unwrap());
+				let namespace_idx = NamespaceIdx(u32::try_from(index).unwrap());
 				let mut namespace = Namespace {
 					parent: None,
 					package_id: package.id,
-					kind: NamespaceKind::Package(
-						package.modules[package.root.as_usize()].file_id,
-					),
+					owner: NamespaceOwner::Package(package.id),
 					file_id: package.modules[package.root.as_usize()].file_id,
 					bindings: HashMap::new(),
 					items: vec![ItemDef::new(
-						DefKind::Package(namespace_idx),
+						DefKind::Package(package.id),
 						TextSpan::new(0, 0),
 					)],
 					glob_imports: Vec::new(),
@@ -1523,14 +1518,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				namespace.bindings.insert(
 					BindingKey::ty(ast::Keyword::SelfLower.symbol()),
 					Binding::definition(
-						DefKey::new(namespace_idx, LocalDefIndex::SELF),
+						DefKey::new(namespace_idx, LocalDefIdx::SELF),
 						Visibility::Public,
 					),
 				);
 				namespace.bindings.insert(
 					BindingKey::ty(ast::Keyword::Crate.symbol()),
 					Binding::definition(
-						DefKey::new(namespace_idx, LocalDefIndex::SELF),
+						DefKey::new(namespace_idx, LocalDefIdx::SELF),
 						Visibility::Public,
 					),
 				);
@@ -1547,8 +1542,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						BindingKey::ty(name),
 						Binding::definition(
 							DefKey::new(
-								package_namespaces[dependency_id.as_usize()],
-								LocalDefIndex::SELF,
+								dependency_id.root_namespace(),
+								LocalDefIdx::SELF,
 							),
 							Visibility::Public,
 						),
@@ -1560,24 +1555,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			.collect();
 
 		let mut builder = Self {
-			ast_nodes: Vec::new(),
 			diagnostics,
 			namespaces,
-			package_namespaces,
-			import_decls: Vec::new(),
-			module_decls: Vec::new(),
 			strings,
 			files,
 			stdlib_package,
+			imports: Vec::new(),
+			modules: Vec::new(),
 			traits: Vec::new(),
 			trait_impls: Vec::new(),
 			inherent_impls: Vec::new(),
+			type_aliases: Vec::new(),
 			structs: Vec::new(),
 			enums: Vec::new(),
 			typesets: Vec::new(),
 			functions: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
+			ast_nodes: Vec::new(),
 			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: HashMap::new(),
 			pending_glob_targets: HashMap::new(),
@@ -1603,18 +1598,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			builder.diagnostics,
 			builder.strings,
 			&mut builder.namespaces,
+			&builder.modules,
+			&builder.enums,
+			&builder.imports,
 			&builder.use_items,
 			&builder.use_paths,
 			&builder.pending_named_imports,
 			&builder.pending_glob_targets,
 		);
 
-		let registry = DefinitionRegistry {
+		let defs = DefinitionRegistry {
 			namespaces: builder.namespaces,
-			package_namespaces: builder.package_namespaces,
 			file_namespaces,
-			module_decls: builder.module_decls,
-			import_decls: builder.import_decls,
+			modules: builder.modules,
+			imports: builder.imports,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
@@ -1625,8 +1622,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
 			intrinsics: builder.intrinsics,
+			type_aliases: builder.type_aliases,
 		};
-		(registry, builder.ast_nodes)
+
+		(defs, builder.ast_nodes)
 	}
 
 	/// Phase 1a — one namespace per file. Runs before any item is scanned,
@@ -1641,7 +1640,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	fn compute_file_namespaces(
 		&mut self,
 		packages: &[Package],
-	) -> Vec<NamespaceIndex> {
+	) -> Vec<NamespaceIdx> {
 		let mut file_namespaces = Vec::with_capacity(self.files.len());
 		for source_module in packages
 			.iter()
@@ -1654,30 +1653,31 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			);
 			let package = &packages[source_module.package_id.as_usize()];
 			let namespace_idx = match &source_module.declaration {
-				None => self.package_namespaces[package.id.as_usize()],
+				None => package.id.root_namespace(),
 				Some(declaration) => {
 					let parent_module =
 						&package.modules[declaration.parent.as_usize()];
 					let parent_namespace =
 						file_namespaces[parent_module.file_id.as_usize()];
-					let namespace_idx = NamespaceIndex(
+					let own_namespace = NamespaceIdx(
 						u32::try_from(self.namespaces.len()).unwrap(),
 					);
 					let module_declaration_idx =
-						self.push_module_declaration(ModuleDeclaration {
-							namespace_idx,
-							declaration_file_id: parent_module.file_id,
-							content_file_id: Some(source_module.file_id),
+						self.push_module_declaration(ModuleDef {
+							declaration_file: parent_module.file_id,
+							own_file: source_module.file_id,
+							own_namespace,
+							parent_namespace,
 							name: declaration.name,
 							pub_span: declaration.pub_span,
 						});
 					debug_assert_eq!(
-						namespace_idx,
+						own_namespace,
 						self.declare_child_namespace(
 							parent_namespace,
 							source_module.file_id,
 							declaration.name.inner,
-							NamespaceKind::Module(module_declaration_idx),
+							NamespaceOwner::Module(module_declaration_idx),
 							TextSpan::new(0, u32::MAX),
 							Visibility::from(declaration.pub_span),
 						)
@@ -1698,7 +1698,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						})
 					);
-					namespace_idx
+					own_namespace
 				}
 			};
 			file_namespaces.push(namespace_idx);
@@ -1708,48 +1708,46 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	}
 
 	#[inline]
-	fn push_trait(&mut self, item: TraitDef) -> TraitIndex {
-		let index = TraitIndex::new(u32::try_from(self.traits.len()).unwrap());
+	fn push_trait(&mut self, item: TraitDef) -> TraitIdx {
+		let index = TraitIdx::new(u32::try_from(self.traits.len()).unwrap());
 		self.traits.push(item);
 		index
 	}
 
 	#[inline]
-	fn push_trait_impl(&mut self, item: TraitImplDef) -> TraitImplIndex {
+	fn push_trait_impl(&mut self, item: TraitImplDef) -> TraitImplIdx {
 		let index =
-			TraitImplIndex::new(u32::try_from(self.trait_impls.len()).unwrap());
+			TraitImplIdx::new(u32::try_from(self.trait_impls.len()).unwrap());
 		self.trait_impls.push(item);
 		index
 	}
 
 	#[inline]
-	fn push_typeset(&mut self, item: TypeSetDef) -> TypeSetIndex {
+	fn push_typeset(&mut self, item: TypeSetDef) -> TypesetIdx {
 		let index =
-			TypeSetIndex::new(u32::try_from(self.typesets.len()).unwrap());
+			TypesetIdx::new(u32::try_from(self.typesets.len()).unwrap());
 		self.typesets.push(item);
 		index
 	}
 
 	#[inline]
-	fn push_function(&mut self, item: FunctionDef) -> FunctionIndex {
+	fn push_function(&mut self, item: FunctionDef) -> FunctionIdx {
 		let index =
-			FunctionIndex::new(u32::try_from(self.functions.len()).unwrap());
+			FunctionIdx::new(u32::try_from(self.functions.len()).unwrap());
 		self.functions.push(item);
 		index
 	}
 
 	#[inline]
-	fn push_inherent_impl(
-		&mut self,
-		item: InherentImplDef,
-	) -> InherentImplIndex {
-		let index = InherentImplIndex::new(
+	fn push_inherent_impl(&mut self, item: InherentImplDef) -> InherentImplIdx {
+		let index = InherentImplIdx::new(
 			u32::try_from(self.inherent_impls.len()).unwrap(),
 		);
 		self.inherent_impls.push(item);
 		index
 	}
 
+	#[inline]
 	fn push_use_path(&mut self, segment: UsePathSegment) -> UsePathIndex {
 		let index =
 			UsePathIndex::new(u32::try_from(self.use_paths.len()).unwrap());
@@ -1757,6 +1755,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		index
 	}
 
+	#[inline]
 	fn push_use_item(&mut self, item: UseItemDef) -> UseItemIndex {
 		let index =
 			UseItemIndex::new(u32::try_from(self.use_items.len()).unwrap());
@@ -1766,10 +1765,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn push_def(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		definition: ItemDef,
 	) -> DefKey {
-		let symbol_idx = LocalDefIndex::new(
+		let symbol_idx = LocalDefIdx::new(
 			u32::try_from(
 				self.namespaces[usize::from(namespace_idx)].items.len(),
 			)
@@ -1783,7 +1782,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		binding: Binding,
 		span: TextSpan,
@@ -1811,14 +1810,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn declare_child_namespace(
 		&mut self,
-		parent_namespace: NamespaceIndex,
+		parent_namespace: NamespaceIdx,
 		file_id: FileId,
 		name: SymbolU32,
-		kind: NamespaceKind,
+		kind: NamespaceOwner,
 		content_span: TextSpan,
 		visibility: Visibility,
-	) -> Declared<NamespaceIndex> {
-		let namespace_idx = NamespaceIndex::new(
+	) -> Declared<NamespaceIdx> {
+		let namespace_idx = NamespaceIdx::new(
 			u32::try_from(self.namespaces.len())
 				.expect("namespace graph exceeded u32 index capacity"),
 		);
@@ -1830,9 +1829,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		// own prescan arm (it needs neither the `self`/`crate`/`super`
 		// bindings below nor a name claimed in `parent_namespace`).
 		let def_kind = match kind {
-			NamespaceKind::Module(_) => DefKind::Module(namespace_idx),
-			NamespaceKind::Import(_) => DefKind::Import(namespace_idx),
-			NamespaceKind::Package(_) | NamespaceKind::Enum(_) => {
+			NamespaceOwner::Module(idx) => DefKind::Module(idx),
+			NamespaceOwner::Import(idx) => DefKind::Import(idx),
+			NamespaceOwner::Package(_) | NamespaceOwner::Enum(_) => {
 				unreachable!("only Module/Import namespaces are declared here")
 			}
 		};
@@ -1840,7 +1839,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			parent: Some(parent_namespace),
 			file_id,
 			package_id,
-			kind,
+			owner: kind,
 			bindings: HashMap::new(),
 			items: vec![ItemDef::new(def_kind, content_span)],
 			glob_imports: Vec::new(),
@@ -1848,31 +1847,29 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		namespace.bindings.insert(
 			BindingKey::ty(name),
 			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIndex::SELF),
+				DefKey::new(namespace_idx, LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
 		namespace.bindings.insert(
 			BindingKey::ty(ast::Keyword::SelfLower.symbol()),
 			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIndex::SELF),
+				DefKey::new(namespace_idx, LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
 
-		let crate_root_namespace =
-			self.package_namespaces[package_id.as_usize()];
 		namespace.bindings.insert(
 			BindingKey::ty(ast::Keyword::Crate.symbol()),
 			Binding::definition(
-				DefKey::new(crate_root_namespace, LocalDefIndex::SELF),
+				DefKey::new(package_id.root_namespace(), LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
 		namespace.bindings.insert(
 			BindingKey::ty(ast::Keyword::Super.symbol()),
 			Binding::definition(
-				DefKey::new(parent_namespace, LocalDefIndex::SELF),
+				DefKey::new(parent_namespace, LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
@@ -1881,7 +1878,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			parent_namespace,
 			BindingKey::ty(name),
 			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIndex::SELF),
+				DefKey::new(namespace_idx, LocalDefIdx::SELF),
 				visibility,
 			),
 		) {
@@ -1892,25 +1889,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		}
 	}
 
-	fn push_module_declaration(
-		&mut self,
-		decl: ModuleDeclaration,
-	) -> ModuleDeclIndex {
-		let index = ModuleDeclIndex::new(
-			u32::try_from(self.module_decls.len()).unwrap(),
-		);
-		self.module_decls.push(decl);
+	fn push_module_declaration(&mut self, decl: ModuleDef) -> ModuleIdx {
+		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
+		self.modules.push(decl);
 		index
 	}
 
-	fn push_import_declaration(
-		&mut self,
-		decl: ImportDeclaration,
-	) -> ImportDeclIndex {
-		let index = ImportDeclIndex::new(
-			u32::try_from(self.import_decls.len()).unwrap(),
-		);
-		self.import_decls.push(decl);
+	fn push_import_declaration(&mut self, decl: ImportDef) -> ImportIdx {
+		let index = ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
+		self.imports.push(decl);
 		index
 	}
 }
@@ -1919,7 +1906,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	pub(super) fn scan_item(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIndex,
+		namespace: NamespaceIdx,
 		item: &'ast ast::Item,
 	) {
 		match item {
@@ -1935,9 +1922,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				pub_span,
 				..
 			} => {
+				let func_index = FunctionIdx::new(
+					u32::try_from(self.functions.len()).unwrap(),
+				);
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Function(*id), signature.name.span),
+					ItemDef::new(
+						DefKind::Function(func_index),
+						signature.name.span,
+					),
 				);
 				self.insert_binding(
 					namespace,
@@ -1952,53 +1945,50 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				// method's own list (`validate_method_params`).
 				let mut params: Vec<Spanned<SymbolU32>> =
 					Vec::with_capacity(signature.params.len());
-				for param in signature.params.iter() {
-					let p = &param.inner.inner;
-					let name = p.name;
-
+				for param in
+					signature.params.iter().map(|param| &param.inner.inner)
+				{
 					if let Some(&first) =
-						params.iter().find(|s| s.inner == name.inner)
+						params.iter().find(|s| s.inner == param.name.inner)
 					{
 						self.diagnostics.push(
 							report_duplicate_function_parameter(
 								self.strings,
 								file_id,
-								name,
+								param.name,
 								first,
 							),
 						);
 					}
 
-					if name.inner == Keyword::SelfLower.symbol() {
+					if param.name.inner == Keyword::SelfLower.symbol() {
 						self.diagnostics.push(report_self_param_position(
-							file_id, name.span,
+							file_id,
+							param.name.span,
 						));
-					} else if p.ty.is_none() {
+					} else if param.ty.is_none() {
+						// TODO: remove this, this is semantic error which should be reported from signature builder
 						self.diagnostics.push(report_missing_parameter_type(
 							self.strings,
 							file_id,
-							name,
+							param.name,
 						));
 					}
 
-					params.push(name);
+					params.push(param.name);
 				}
-				let function_index = self.push_function(FunctionDef {
+				self.functions.push(FunctionDef {
 					def_id: *id,
 					file_id,
 					namespace,
 					name: signature.name,
 					params: params.into_boxed_slice(),
 				});
-
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Function {
-						item,
-						function_index,
-					},
+					node: AstNodeRef::Function { item, func_index },
 				});
 			}
 			ast::Item::Global {
@@ -2028,9 +2018,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				fields,
 				..
 			} => {
+				let struct_index =
+					StructIdx::new(u32::try_from(self.structs.len()).unwrap());
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Struct(*id), name.span),
+					ItemDef::new(DefKind::Struct(struct_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2039,18 +2031,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				// Every written field gets a real `FieldIndex` and keeps its
-				// storage slot — including a duplicate name, which is only
-				// unreachable by name (`lookup` keeps the first occurrence),
-				// not dropped: dropping it would shift every later field's
-				// index and hide its type from the recursion check below.
 				let mut record_fields: Vec<RecordFieldDef> =
 					Vec::with_capacity(fields.len());
-				let mut lookup: HashMap<SymbolU32, FieldIndex> =
+				let mut lookup: HashMap<SymbolU32, FieldIdx> =
 					HashMap::with_capacity(fields.len());
-				for f in fields.iter() {
-					let field = &f.inner.inner;
-					let index = FieldIndex::new(
+				for field in fields.iter().map(|f| &f.inner.inner) {
+					let index = FieldIdx::new(
 						u32::try_from(record_fields.len()).unwrap(),
 					);
 					if let Some(&first_index) = lookup.get(&field.name.inner) {
@@ -2070,19 +2056,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						pub_span: field.pub_span,
 					});
 				}
-				let struct_index = StructIndex::new(
-					u32::try_from(self.structs.len()).unwrap(),
-				);
+
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
 					namespace,
+					name: *name,
 					fields: StructFields::Record {
 						fields: record_fields.into_boxed_slice(),
 						lookup,
 					},
 				});
-
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2097,9 +2081,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				fields,
 				..
 			} => {
+				let struct_index =
+					StructIdx::new(u32::try_from(self.structs.len()).unwrap());
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Struct(*id), name.span),
+					ItemDef::new(DefKind::Struct(struct_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2107,15 +2093,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-				// The type itself is always nameable if `pub`, but a field
-				// that isn't `pub` can't be initialized from outside this
-				// namespace — so the constructor (the value binding) is
-				// only ever `Accessible` when every field is. This is
-				// purely syntactic (each field's own `pub_span`), so it's
-				// known here in prescan without needing any type resolved.
-				let all_fields_pub =
-					fields.iter().all(|f| f.inner.inner.pub_span.is_some());
-				let value_target = if all_fields_pub {
+				let value_target = if fields
+					.iter()
+					.all(|f| f.inner.inner.pub_span.is_some())
+				{
 					BindingTarget::Accessible(def_key)
 				} else {
 					BindingTarget::Inaccessible(def_key)
@@ -2130,13 +2111,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				let struct_index = StructIndex::new(
-					u32::try_from(self.structs.len()).unwrap(),
-				);
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
 					namespace,
+					name: *name,
 					fields: StructFields::Tuple {
 						fields: fields
 							.iter()
@@ -2146,7 +2125,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							.collect(),
 					},
 				});
-
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2162,8 +2140,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				..
 			} => {
 				let enum_index =
-					EnumIndex::new(u32::try_from(self.enums.len()).unwrap());
-				let variants_namespace = NamespaceIndex::new(
+					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
+				let own_namespace = NamespaceIdx::new(
 					u32::try_from(self.namespaces.len()).unwrap(),
 				);
 				let package_id =
@@ -2172,7 +2150,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					parent: Some(namespace),
 					file_id,
 					package_id,
-					kind: NamespaceKind::Enum(enum_index),
+					owner: NamespaceOwner::Enum(enum_index),
 					bindings: HashMap::new(),
 					items: Vec::new(),
 					glob_imports: Vec::new(),
@@ -2180,13 +2158,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				self.enums.push(EnumDef {
 					def_id: *id,
 					file_id,
-					namespace,
-					variants_namespace,
+					parent_namespace: namespace,
+					own_namespace,
+					name: *name,
 				});
-
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Enum(variants_namespace), name.span),
+					ItemDef::new(DefKind::Enum(enum_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2195,17 +2173,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				for v in variants.iter() {
-					let variant = &v.inner.inner;
+				for variant in variants.iter().map(|v| &v.inner.inner) {
 					let variant_key = self.push_def(
-						variants_namespace,
+						own_namespace,
 						ItemDef::new(
 							DefKind::EnumVariant(variant.id),
 							variant.name.span,
 						),
 					);
 					self.insert_binding(
-						variants_namespace,
+						own_namespace,
 						BindingKey::value(variant.name.inner),
 						Binding::definition(variant_key, Visibility::Public),
 						variant.name.span,
@@ -2226,9 +2203,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				body,
 				..
 			} => {
+				let type_alias_index = TypeAliasIdx::new(
+					u32::try_from(self.type_aliases.len()).unwrap(),
+				);
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::TypeAlias(*id), name.span),
+					ItemDef::new(
+						DefKind::TypeAlias(type_alias_index),
+						name.span,
+					),
 				);
 				self.insert_binding(
 					namespace,
@@ -2244,15 +2227,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						if let Some(slot) =
 							self.intrinsics.type_slot_mut(name_str)
 						{
-							*slot = Some(def_key);
+							*slot = Some(type_alias_index);
 						}
 					}
 				}
+				self.type_aliases.push(TypeAliasDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					name: *name,
+				});
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::TypeAlias { item },
+					node: AstNodeRef::TypeAlias {
+						item,
+						type_alias_index,
+					},
 				});
 			}
 			ast::Item::Memory { id, name, .. } => {
@@ -2304,24 +2296,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				items,
 				pub_span,
 			} => {
-				let namespace_idx = NamespaceIndex(
-					u32::try_from(self.namespaces.len()).unwrap(),
-				);
+				let own_namespace_idx =
+					NamespaceIdx(u32::try_from(self.namespaces.len()).unwrap());
 				let module_declaration_idx =
-					self.push_module_declaration(ModuleDeclaration {
-						namespace_idx,
-						declaration_file_id: file_id,
-						content_file_id: None,
+					self.push_module_declaration(ModuleDef {
+						parent_namespace: namespace,
+						own_namespace: own_namespace_idx,
+						declaration_file: file_id,
+						own_file: file_id,
 						name: *name,
 						pub_span: *pub_span,
 					});
 				debug_assert_eq!(
-					namespace_idx,
+					own_namespace_idx,
 					self.declare_child_namespace(
 						namespace,
 						file_id,
 						name.inner,
-						NamespaceKind::Module(module_declaration_idx),
+						NamespaceOwner::Module(module_declaration_idx),
 						items.span,
 						Visibility::from(*pub_span),
 					)
@@ -2341,7 +2333,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				);
 
 				for item in items.inner.iter() {
-					self.scan_item(file_id, namespace_idx, &item.inner.inner);
+					self.scan_item(
+						file_id,
+						own_namespace_idx,
+						&item.inner.inner,
+					);
 				}
 			}
 			// Nothing to do: Phase 1a already created this module's
@@ -2355,9 +2351,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				pub_span,
 				..
 			} => {
+				let trait_index =
+					TraitIdx(u32::try_from(self.traits.len()).unwrap());
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Trait(*id), name.span),
+					ItemDef::new(DefKind::Trait(trait_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2368,16 +2366,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				if self.namespaces[usize::from(namespace)].package_id
 					== self.stdlib_package
 				{
-					if let Some(name_str) = self.strings.resolve(name.inner) {
-						if let Some(slot) =
-							self.intrinsics.trait_slot_mut(name_str)
-						{
-							*slot = Some(def_key);
-						}
+					if let Some(slot) = self.intrinsics.trait_slot_mut(
+						self.strings.resolve(name.inner).unwrap(),
+					) {
+						*slot = Some(trait_index);
 					}
 				}
-				let trait_index =
-					TraitIndex(u32::try_from(self.traits.len()).unwrap());
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2386,11 +2380,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 
 				let mut members: Vec<TraitMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIndex> =
+				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
 				for item in items.iter() {
 					let member_index =
-						MemberIndex::new(u32::try_from(members.len()).unwrap());
+						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, id, .. } => {
 							let params = self
@@ -2506,9 +2500,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				id: impl_id, items, ..
 			} => {
 				let mut members: Vec<InherentMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIndex> =
+				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
-				let block_index = InherentImplIndex(
+				let block_index = InherentImplIdx(
 					u32::try_from(self.inherent_impls.len()).unwrap(),
 				);
 				self.ast_nodes.push(AstEntry {
@@ -2519,7 +2513,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 				for impl_item in items.iter() {
 					let member_index =
-						MemberIndex::new(u32::try_from(members.len()).unwrap());
+						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key, binding) = match &impl_item.inner.inner {
 						ast::ImplItem::Function {
 							id,
@@ -2641,22 +2635,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				};
 				let internal_name = *internal_name;
 
-				let namespace_idx = NamespaceIndex(
-					u32::try_from(self.namespaces.len()).unwrap(),
-				);
+				let own_namespace_idx =
+					NamespaceIdx(u32::try_from(self.namespaces.len()).unwrap());
 				let import_declaration_idx =
-					self.push_import_declaration(ImportDeclaration {
+					self.push_import_declaration(ImportDef {
 						external_name,
 						internal_name,
-						namespace_idx,
+						parent_namespace: namespace,
+						own_namespace: own_namespace_idx,
 					});
 				debug_assert_eq!(
-					namespace_idx,
+					own_namespace_idx,
 					self.declare_child_namespace(
 						namespace,
 						file_id,
 						internal_name.inner,
-						NamespaceKind::Import(import_declaration_idx),
+						NamespaceOwner::Import(import_declaration_idx),
 						items.span,
 						Visibility::Public,
 					)
@@ -2682,11 +2676,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					match &item.inner.inner.declaration {
 						ast::ImportDeclaration::Memory { id, name, .. } => {
 							let def_key = self.push_def(
-								namespace_idx,
+								own_namespace_idx,
 								ItemDef::new(DefKind::Memory(*id), name.span),
 							);
 							self.insert_binding(
-								namespace_idx,
+								own_namespace_idx,
 								BindingKey::ty(name.inner),
 								Binding::definition(
 									def_key,
@@ -2695,7 +2689,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name.span,
 							);
 							self.insert_binding(
-								namespace_idx,
+								own_namespace_idx,
 								BindingKey::value(name.inner),
 								Binding::definition(
 									def_key,
@@ -2715,14 +2709,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						}
 						ast::ImportDeclaration::Function { id, signature } => {
 							let def_key = self.push_def(
-								namespace_idx,
+								own_namespace_idx,
 								ItemDef::new(
 									DefKind::Memory(*id),
 									signature.name.span,
 								),
 							);
 							self.insert_binding(
-								namespace_idx,
+								own_namespace_idx,
 								BindingKey::value(signature.name.inner),
 								Binding::definition(
 									def_key,
@@ -2742,11 +2736,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						}
 						ast::ImportDeclaration::Global { id, name, .. } => {
 							let def_key = self.push_def(
-								namespace_idx,
+								own_namespace_idx,
 								ItemDef::new(DefKind::Memory(*id), name.span),
 							);
 							self.insert_binding(
-								namespace_idx,
+								own_namespace_idx,
 								BindingKey::value(name.inner),
 								Binding::definition(
 									def_key,
@@ -2785,9 +2779,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				members,
 				..
 			} => {
+				let typeset_index = TypesetIdx::new(
+					u32::try_from(self.typesets.len()).unwrap(),
+				);
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::TypeSet(*id), name.span),
+					ItemDef::new(DefKind::TypeSet(typeset_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2795,20 +2792,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-
-				// See `TypeSetDef`'s doc comment for why the backing trait
-				// and every member impl below reuse this typeset's own
-				// `def_id` rather than minting fresh ones.
 				let trait_index = self.push_trait(TraitDef {
 					def_id: *id,
 					file_id,
 					namespace,
-					pub_span: None,
+					pub_span: *pub_span,
 					name: *name,
 					bindings: HashMap::new(),
 					members: Vec::new(),
 				});
-				let member_impls: Box<[TraitImplIndex]> = members
+				let member_impls: Box<[TraitImplIdx]> = members
 					.iter()
 					.map(|_| {
 						self.push_trait_impl(TraitImplDef {
@@ -2820,14 +2813,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						})
 					})
 					.collect();
-				let typeset_index = self.push_typeset(TypeSetDef {
+				self.typesets.push(TypeSetDef {
 					def_id: *id,
 					file_id,
 					namespace,
 					trait_index,
 					member_impls,
 				});
-
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
@@ -2842,9 +2834,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				id: impl_id, items, ..
 			} => {
 				let mut members: Vec<TraitMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIndex> =
+				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
-				let block_index = TraitImplIndex(
+				let block_index = TraitImplIdx(
 					u32::try_from(self.trait_impls.len()).unwrap(),
 				);
 				self.ast_nodes.push(AstEntry {
@@ -2855,7 +2847,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 				for item in items.iter() {
 					let member_index =
-						MemberIndex::new(u32::try_from(members.len()).unwrap());
+						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
 						ast::ImplItem::Function { id, signature, .. } => {
 							let params = self
@@ -2971,7 +2963,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn scan_use_tree(
 		&mut self,
-		namespace: NamespaceIndex,
+		namespace: NamespaceIdx,
 		tree: &ast::Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
 		pub_span: Option<TextSpan>,
@@ -3250,8 +3242,8 @@ mod tests {
 			Self::from_graph(graph)
 		}
 
-		fn root_namespace(&self) -> NamespaceIndex {
-			self.defs.package_namespaces[self.graph.root_package.as_usize()]
+		fn root_namespace(&self) -> NamespaceIdx {
+			self.graph.root_package.root_namespace()
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -3267,8 +3259,7 @@ mod tests {
 		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
 			let root = self.root_namespace();
 			let file_id = self.defs.namespaces[usize::from(root)].file_id;
-			let stdlib_root = self.defs.package_namespaces
-				[self.graph.stdlib_package.as_usize()];
+			let stdlib_root = self.graph.stdlib_package.root_namespace();
 
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
@@ -3288,6 +3279,9 @@ mod tests {
 			let target = PathResolver::new(
 				&self.defs.namespaces,
 				&self.defs.use_items,
+				&self.defs.enums,
+				&self.defs.imports,
+				&self.defs.modules,
 				stdlib_root,
 			)
 			.resolve_path(
@@ -3306,7 +3300,7 @@ mod tests {
 
 		fn lookup_type(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
 		) -> Option<BindingTarget> {
 			let symbol = self.graph.strings.get_or_intern(name);
@@ -3318,7 +3312,7 @@ mod tests {
 
 		fn lookup_value(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
 		) -> Option<BindingTarget> {
 			let symbol = self.graph.strings.get_or_intern(name);
@@ -3331,27 +3325,21 @@ mod tests {
 		/// `resolve`'s `DefKind::Function` case, followed to its own
 		/// `FunctionDef` entry.
 		fn function_def(&self, name: &str) -> &FunctionDef {
-			let DefKind::Function(def_id) =
+			let DefKind::Function(func_index) =
 				self.resolve(BindingNamespace::Value, name)
 			else {
 				panic!("expected `{name}` to be a function");
 			};
-			self.defs
-				.functions
-				.iter()
-				.find(|f| f.def_id == def_id)
-				.unwrap_or_else(|| {
-					panic!("`{name}` should have its own FunctionDef entry")
-				})
+			&self.defs.functions[usize::from(func_index)]
 		}
 
 		/// Follows a bound name to the namespace it names — e.g. the
 		/// namespace a `mod inner { ... }` or `mod inner;` declares.
 		fn child_namespace(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
-		) -> NamespaceIndex {
+		) -> NamespaceIdx {
 			let target = self
 				.lookup_type(namespace, name)
 				.unwrap_or_else(|| panic!("`{name}` should be bound"));
@@ -3361,7 +3349,7 @@ mod tests {
 			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
 				.items[usize::from(def_key.def_idx)]
 			.kind;
-			kind.as_namespace().unwrap_or_else(|| {
+			self.defs.namespace_of(kind).unwrap_or_else(|| {
 				panic!("`{name}` is not a namespace: {kind:?}")
 			})
 		}
@@ -3467,15 +3455,16 @@ mod tests {
 		// and (since it isn't in the stdlib package) must not be recorded
 		// as an intrinsic at all.
 		let root_namespace = case.root_namespace();
-		let stdlib_namespace =
-			case.defs.package_namespaces[case.graph.stdlib_package.as_usize()];
+		let stdlib_namespace = case.graph.stdlib_package.root_namespace();
 		assert_ne!(
 			root_namespace, stdlib_namespace,
 			"the binary package must not be the stdlib package"
 		);
-		let u8_key = case.defs.intrinsics.u8.expect("u8 should still resolve");
+		let u8_index =
+			case.defs.intrinsics.u8.expect("u8 should still resolve");
 		assert_eq!(
-			u8_key.namespace_idx, stdlib_namespace,
+			case.defs.type_aliases[usize::from(u8_index)].namespace,
+			stdlib_namespace,
 			"u8 must still point into the stdlib package, not the binary one"
 		);
 	}
@@ -3587,17 +3576,12 @@ mod tests {
 		// `Point` isn't necessarily `defs.structs[0]` — the real stdlib
 		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
 		// `RawPtr`), so look it up by name rather than assuming an index.
-		let DefKind::Struct(point_def_id) =
+		let DefKind::Struct(point_struct_index) =
 			case.resolve(BindingNamespace::Type, "Point")
 		else {
 			panic!("expected `Point` to be a struct")
 		};
-		let struct_def = case
-			.defs
-			.structs
-			.iter()
-			.find(|s| s.def_id == point_def_id)
-			.expect("Point should have its own StructDef entry");
+		let struct_def = &case.defs.structs[usize::from(point_struct_index)];
 
 		let StructFields::Record { fields, lookup } = &struct_def.fields else {
 			panic!("expected a record struct");
@@ -3608,10 +3592,7 @@ mod tests {
 		assert_eq!(fields.len(), 2);
 		assert_eq!(fields[0].name.inner, fields[1].name.inner);
 		// `lookup` only ever points at the first occurrence.
-		assert_eq!(
-			lookup.get(&fields[1].name.inner),
-			Some(&FieldIndex::new(0))
-		);
+		assert_eq!(lookup.get(&fields[1].name.inner), Some(&FieldIdx::new(0)));
 	}
 
 	#[test]
@@ -3672,17 +3653,12 @@ mod tests {
 
 		case.diagnostics().assert_no_errors();
 
-		let DefKind::Trait(trait_def_id) =
+		let DefKind::Trait(trait_index) =
 			case.resolve(BindingNamespace::Type, "T")
 		else {
 			panic!("expected `T` to be a trait");
 		};
-		let trait_def = case
-			.defs
-			.traits
-			.iter()
-			.find(|t| t.def_id == trait_def_id)
-			.expect("T should have its own TraitDef entry");
+		let trait_def = &case.defs.traits[usize::from(trait_index)];
 		let f_symbol = case.graph.strings.get_or_intern("f");
 		let &member_index = trait_def
 			.bindings

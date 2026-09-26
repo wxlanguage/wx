@@ -16,21 +16,24 @@
 //! namespace lookup, no diagnostics, and no notion of `signatures.rs`'s
 //! demand-driven queries at all.
 //!
-//! A type parameter's owner is a bare `ast::DefId` rather than a dedicated
-//! `TypeParamOwner` enum (the old builder's shape, one variant per arena a
-//! generic-bearing item could live in): every such item — function, struct,
-//! type alias, trait, inherent impl, trait impl — already carries its own
-//! `DefId`, so a separate enum would only be re-deriving a distinction the
-//! id space already makes for free.
+//! A generic-parameter frame's owner (`TypeEnvOwner`) is a dedicated enum
+//! rather than a bare `ast::DefId`, so it indexes straight into the right
+//! registry array (`defs.structs`, `defs.functions`, ...) without a lookup.
 
 use std::collections::HashMap;
 
 use crate::ast::{DefId, Spanned};
 use crate::diagnostics::SourceSpan;
 use crate::index::index_newtype;
+use crate::tir::defs::{
+	DefinitionRegistry, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
+};
+use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{EnumIndex, StructIndex, TraitIndex};
+use super::defs::{
+	EnumIdx, InherentImplIdx, StructIdx, TraitIdx, TraitImplIdx,
+};
 
 index_newtype!(TypeIndex);
 
@@ -70,7 +73,7 @@ pub enum Type {
 		elements: Box<[TypeIndex]>,
 	},
 	Struct {
-		struct_index: StructIndex,
+		struct_index: StructIdx,
 		/// Encodes three states via length: non-generic struct (always
 		/// empty), generic and not yet instantiated (empty), generic and
 		/// instantiated (one entry per type param, e.g. `Vec<i32, u8>` →
@@ -106,7 +109,7 @@ pub enum Type {
 		ownership: crate::ast::Ownership,
 	},
 	Enum {
-		enum_index: EnumIndex,
+		enum_index: EnumIdx,
 	},
 	Memory {
 		id: DefId,
@@ -128,20 +131,19 @@ pub enum Type {
 	/// purposes (naming which item declared this param), not because
 	/// anything here still needs it to find the frame.
 	TypeParam {
-		owner: DefId,
-		env: TypeEnvId,
+		env: TypeEnvIdx,
 		param_index: u32,
 	},
 	/// `M::Size` — opaque until monomorphization substitutes `M`.
 	AssociatedType {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		assoc_name: SymbolU32,
 	},
 	/// `M::Size` or `A::M::Size` in a signature: a projection from a base
 	/// type (a `TypeParam` or another `AssocTypeProjection`), resolved once
 	/// the base is substituted with a concrete type.
 	AssocTypeProjection {
-		trait_index: TraitIndex,
+		trait_index: TraitIdx,
 		assoc_name: SymbolU32,
 		base: TypeIndex,
 	},
@@ -221,7 +223,7 @@ impl Default for TypeInterner {
 }
 
 // A `Copy` handle into a `TypeEnvArena` — see that type's doc comment.
-index_newtype!(TypeEnvId);
+index_newtype!(TypeEnvIdx);
 
 /// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
 /// interned as `Type::TypeParam { owner, param_index }` the moment its frame
@@ -234,10 +236,85 @@ index_newtype!(TypeEnvId);
 /// No bounds here — a frame is never asked for a param's bounds, and those
 /// are a resolved-signature fact anyway (see `signatures.rs`'s own doc
 /// comment), not an identity one.
-pub(super) struct EnvParam {
+pub(super) struct TypeParam {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) ty: TypeIndex,
 	pub(super) accesses: Vec<SourceSpan>,
+}
+
+/// A generic reference site's target, identified the same way dispatch and
+/// every other `defs.rs`-facing lookup already is — by index into its own
+/// registry array, not by `DefId` — so `name`/`file_id` can reach straight
+/// into `defs.structs[..]` instead of re-deriving the index from a walk
+/// through `ast_node` first. Grows one variant per item kind
+/// `resolve_type_args` learns to instantiate (a type alias next).
+#[derive(Clone, Copy)]
+pub(super) enum TypeEnvOwner {
+	Struct(StructIdx),
+	Function(FunctionIdx),
+	Trait(TraitIdx),
+	TypeAlias(TypeAliasIdx),
+	/// An impl block's own `<T>` frame — has no written name (see `name`).
+	InherentImpl(InherentImplIdx),
+	TraitImpl(TraitImplIdx),
+}
+
+impl TypeEnvOwner {
+	pub(super) fn noun(self) -> &'static str {
+		match self {
+			Self::Struct(_) => "struct",
+			Self::Trait(_) => "trait",
+			Self::Function(_) => "function",
+			Self::TypeAlias(_) => "type alias",
+			Self::InherentImpl(_) | Self::TraitImpl(_) => "impl block",
+		}
+	}
+
+	/// `None` for `InherentImpl`/`TraitImpl` — an impl block has no
+	/// written name to report.
+	pub(super) fn name(
+		self,
+		defs: &DefinitionRegistry,
+	) -> Option<Spanned<SymbolU32>> {
+		Some(match self {
+			Self::Struct(struct_index) => {
+				defs.structs[usize::from(struct_index)].name
+			}
+			Self::Function(func_index) => {
+				defs.functions[usize::from(func_index)].name
+			}
+			Self::Trait(trait_index) => {
+				defs.traits[usize::from(trait_index)].name
+			}
+			Self::TypeAlias(type_alias_index) => {
+				defs.type_aliases[usize::from(type_alias_index)].name
+			}
+			Self::InherentImpl(_) | Self::TraitImpl(_) => return None,
+		})
+	}
+
+	pub(super) fn file_id(self, defs: &DefinitionRegistry) -> FileId {
+		match self {
+			Self::Struct(struct_index) => {
+				defs.structs[usize::from(struct_index)].file_id
+			}
+			Self::Function(func_index) => {
+				defs.functions[usize::from(func_index)].file_id
+			}
+			Self::Trait(trait_index) => {
+				defs.traits[usize::from(trait_index)].file_id
+			}
+			Self::TypeAlias(type_alias_index) => {
+				defs.type_aliases[usize::from(type_alias_index)].file_id
+			}
+			Self::InherentImpl(index) => {
+				defs.inherent_impls[usize::from(index)].file_id
+			}
+			Self::TraitImpl(index) => {
+				defs.trait_impls[usize::from(index)].file_id
+			}
+		}
+	}
 }
 
 /// One frame of the chain of generic-parameter names visible while resolving
@@ -248,8 +325,9 @@ pub(super) struct EnvParam {
 enum TypeEnv {
 	Root,
 	Frame {
-		params: Box<[EnvParam]>,
-		parent: TypeEnvId,
+		owner: TypeEnvOwner,
+		params: Box<[TypeParam]>,
+		parent: TypeEnvIdx,
 	},
 }
 
@@ -276,13 +354,13 @@ pub(super) struct TypeEnvArena {
 	envs: Vec<TypeEnv>,
 }
 
-impl TypeEnvId {
+impl TypeEnvIdx {
 	/// The always-present slot-0 frame — a [`TypeEnv::Root`]. A sentinel
 	/// constant on the id type itself, same as `TypeIndex::INFER`/`ERROR`/…
 	/// below rather than on the arena that produces the rest — built via the
 	/// tuple constructor directly since `TypeEnvId::new` isn't `const fn`,
 	/// the one place within this module that's allowed to reach past it.
-	pub(super) const ROOT: TypeEnvId = TypeEnvId(0);
+	pub(super) const ROOT: TypeEnvIdx = TypeEnvIdx(0);
 }
 
 impl TypeEnvArena {
@@ -292,36 +370,82 @@ impl TypeEnvArena {
 		}
 	}
 
-	/// The `TypeEnvId` the *next* `push_frame` call will hand back. Exposed
-	/// so a caller can mint a frame's own `Type::TypeParam { env, .. }`
-	/// values *before* the frame exists — those values are exactly what
-	/// `push_frame`'s own `params` needs, so the id has to be knowable
-	/// ahead of the call that assigns it. Safe to predict: this arena only
-	/// ever grows by appending, and nothing reentrant can push in between
-	/// a caller reading this and then calling `push_frame`.
-	pub(super) fn next_id(&self) -> TypeEnvId {
-		TypeEnvId::new(u32::try_from(self.envs.len()).unwrap())
-	}
-
 	pub(super) fn push_frame(
 		&mut self,
-		params: Box<[EnvParam]>,
-		parent: TypeEnvId,
-	) -> TypeEnvId {
-		let id = self.next_id();
-		self.envs.push(TypeEnv::Frame { params, parent });
-		id
+		params: Box<[TypeParam]>,
+		owner: TypeEnvOwner,
+		parent: TypeEnvIdx,
+	) -> TypeEnvIdx {
+		let idx = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
+		self.envs.push(TypeEnv::Frame {
+			params,
+			parent,
+			owner,
+		});
+		idx
 	}
 
-	pub(super) fn param_name(
-		&self,
-		env: TypeEnvId,
-		param_index: u32,
-	) -> SymbolU32 {
-		let TypeEnv::Frame { params, .. } = &self.envs[usize::from(env)] else {
-			unreachable!("a type parameter belongs to a frame")
-		};
-		params[param_index as usize].name.inner
+	/// Builds a new frame out of `owner`'s own declared parameter names —
+	/// the "insert the identities" step, and *only* that: no bounds (a
+	/// bound can reference a sibling param, so it can only resolve once the
+	/// frame this returns already exists — the caller's job, strictly
+	/// afterward) and no duplicate-name checking (a diagnostic concern this
+	/// module has no vocabulary for, and just as cheaply done over the
+	/// caller's own name list before ever calling this). Covers both a
+	/// fresh `<T, U>` list and a single-entry abstract `Self` frame (trait,
+	/// typeset) — anything that mints new `Type::TypeParam` identities
+	/// rather than rebinding `Self` to an already-concrete type, which
+	/// stays a direct `push_frame` call at its own two sites.
+	///
+	/// Interns each name's own `Type::TypeParam` against the frame's id
+	/// before the frame exists, predicted via `next_id` — the id has to be
+	/// knowable ahead of building the `params` that will fill it.
+	#[inline]
+	pub(super) fn push_param_frame(
+		&mut self,
+		types: &mut TypeInterner,
+		owner: TypeEnvOwner,
+		parent: TypeEnvIdx,
+		names: impl IntoIterator<Item = Spanned<SymbolU32>>,
+	) -> TypeEnvIdx {
+		let frame = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
+		let params: Box<[TypeParam]> = names
+			.into_iter()
+			.enumerate()
+			.map(|(index, name)| {
+				let ty = types.intern(Type::TypeParam {
+					env: frame,
+					param_index: u32::try_from(index).unwrap(),
+				});
+				TypeParam {
+					name,
+					ty,
+					accesses: Vec::new(),
+				}
+			})
+			.collect();
+		self.envs.push(TypeEnv::Frame {
+			params,
+			parent,
+			owner,
+		});
+		frame
+	}
+
+	#[inline]
+	pub(super) fn frame(&self, env: TypeEnvIdx) -> &[TypeParam] {
+		match &self.envs[usize::from(env)] {
+			TypeEnv::Frame { params, .. } => params,
+			_ => unreachable!(),
+		}
+	}
+
+	#[inline]
+	pub(super) fn frame_owner(&self, env: TypeEnvIdx) -> TypeEnvOwner {
+		match &self.envs[usize::from(env)] {
+			TypeEnv::Frame { owner, .. } => *owner,
+			_ => unreachable!(),
+		}
 	}
 
 	/// Resolves `name` (written at `span`), walking from `id` towards
@@ -329,7 +453,7 @@ impl TypeEnvArena {
 	/// means no frame in the chain declares it.
 	pub(super) fn resolve(
 		&mut self,
-		env: TypeEnvId,
+		env: TypeEnvIdx,
 		name: SymbolU32,
 		span: SourceSpan,
 	) -> Option<TypeIndex> {
@@ -337,7 +461,7 @@ impl TypeEnvArena {
 		loop {
 			match &mut self.envs[usize::from(current)] {
 				TypeEnv::Root => return None,
-				TypeEnv::Frame { params, parent } => {
+				TypeEnv::Frame { params, parent, .. } => {
 					if let Some(param) =
 						params.iter_mut().find(|p| p.name.inner == name)
 					{
@@ -411,4 +535,32 @@ impl TypeIndex {
 	pub const F64: TypeIndex = TypeIndex(15);
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	pub const CHAR: TypeIndex = TypeIndex(17);
+}
+
+impl IntrinsicDefs {
+	/// `idx`'s real identity as a primitive type, if it has one. `None` for
+	/// the common case — an ordinary, non-primitive alias — and `Some` only
+	/// for the handful of reserved names (`u8`, `char`, `never`, ...) that
+	/// prescan recognized as one of std's own `#[intrinsic]` type aliases.
+	/// Those are bodiless by design, so this pre-interned `TypeIndex` *is*
+	/// their identity — nothing else names what they resolve to.
+	pub(super) fn identity_of(&self, idx: TypeAliasIdx) -> Option<TypeIndex> {
+		[
+			(self.u8, TypeIndex::U8),
+			(self.i8, TypeIndex::I8),
+			(self.u16, TypeIndex::U16),
+			(self.i16, TypeIndex::I16),
+			(self.u32, TypeIndex::U32),
+			(self.i32, TypeIndex::I32),
+			(self.u64, TypeIndex::U64),
+			(self.i64, TypeIndex::I64),
+			(self.f32, TypeIndex::F32),
+			(self.f64, TypeIndex::F64),
+			(self.bool, TypeIndex::BOOL),
+			(self.char, TypeIndex::CHAR),
+			(self.never, TypeIndex::NEVER),
+		]
+		.into_iter()
+		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
+	}
 }

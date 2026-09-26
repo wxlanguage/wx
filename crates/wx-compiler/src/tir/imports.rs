@@ -11,12 +11,13 @@ use crate::{
 	ast::{Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	small_vec::SmallVec,
+	tir::defs::{DefKind, EnumDef, ImportDef, ModuleDef},
 	vfs::FileId,
 };
 
 use super::defs::{
 	Binding, BindingKey, BindingLookup, BindingTarget, DefKey,
-	DuplicateDefinitionDiagnostic, GlobImport, Namespace, NamespaceIndex,
+	DuplicateDefinitionDiagnostic, GlobImport, Namespace, NamespaceIdx,
 	NamespaceLookup, UseItemDef, UseItemIndex, UseItemKind, UsePathIndex,
 	UsePathSegment, Visibility,
 };
@@ -118,13 +119,18 @@ pub(super) struct ImportResolver<'r> {
 	strings: &'r StringInterner,
 	namespaces: &'r mut [Namespace],
 
+	// these items necessary in order to get namespace by DefKind
+	modules: &'r [ModuleDef],
+	enums: &'r [EnumDef],
+	imports: &'r [ImportDef],
+
 	use_items: &'r [UseItemDef],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
-		&'r HashMap<(NamespaceIndex, SymbolU32), SmallVec<UseItemIndex>>,
-	pending_glob_targets: &'r HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+		&'r HashMap<(NamespaceIdx, SymbolU32), SmallVec<UseItemIndex>>,
+	pending_glob_targets: &'r HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
 
-	path_state: &'r mut [ResolveStatus<NamespaceIndex>],
+	path_state: &'r mut [ResolveStatus<NamespaceIdx>],
 	item_state: &'r mut [ResolveStatus<()>],
 	/// Every `use` item currently being resolved, innermost last — pushed
 	/// and popped, generically, by `ensure_import_item` for both named leaves
@@ -143,13 +149,16 @@ impl<'r> ImportResolver<'r> {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
 		namespaces: &mut [Namespace],
+		modules: &[ModuleDef],
+		enums: &[EnumDef],
+		imports: &[ImportDef],
 		use_items: &[UseItemDef],
 		use_paths: &[UsePathSegment],
 		pending_named_imports: &HashMap<
-			(NamespaceIndex, SymbolU32),
+			(NamespaceIdx, SymbolU32),
 			SmallVec<UseItemIndex>,
 		>,
-		pending_glob_targets: &HashMap<NamespaceIndex, SmallVec<UseItemIndex>>,
+		pending_glob_targets: &HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
 	) {
 		let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -159,6 +168,9 @@ impl<'r> ImportResolver<'r> {
 			namespaces,
 			use_items,
 			use_paths,
+			enums,
+			imports,
+			modules,
 			pending_named_imports,
 			pending_glob_targets,
 			path_state: &mut path_state,
@@ -170,7 +182,7 @@ impl<'r> ImportResolver<'r> {
 		// lookup-time fallback edge (`Namespace::glob_imports`) plus, if
 		// `pub`, chases the target's own `pub` globs so cycles are caught
 		// here rather than at some arbitrary later lookup.
-		for (index, _) in use_items.iter().enumerate() {
+		for index in 0..use_items.len() {
 			resolver.ensure_import_item(UseItemIndex::new(
 				u32::try_from(index).unwrap(),
 			));
@@ -179,7 +191,7 @@ impl<'r> ImportResolver<'r> {
 
 	fn insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIndex,
+		namespace_idx: NamespaceIdx,
 		key: BindingKey,
 		binding: Binding,
 		span: TextSpan,
@@ -582,7 +594,7 @@ impl<'r> ImportResolver<'r> {
 	/// everything else already folded in, so one incomparable pair
 	/// against `deepest` is enough to prove the whole set isn't a chain.
 	fn glob_cycle_is_unsafe(&self, cycle: &[UseItemIndex]) -> bool {
-		let mut deepest: Option<NamespaceIndex> = None;
+		let mut deepest: Option<NamespaceIdx> = None;
 		for use_item in cycle.iter().copied() {
 			let item = &self.use_items[usize::from(use_item)];
 			if item.pub_span.is_some() {
@@ -624,8 +636,8 @@ impl<'r> ImportResolver<'r> {
 	/// `Def`-ness.
 	fn resolve_member_def(
 		&mut self,
-		accessor: NamespaceIndex,
-		scope: NamespaceIndex,
+		accessor: NamespaceIdx,
+		scope: NamespaceIdx,
 		key: BindingKey,
 		span: TextSpan,
 	) -> ImportSlot {
@@ -708,10 +720,10 @@ impl<'r> ImportResolver<'r> {
 
 	fn ensure_import_path(
 		&mut self,
-		origin: NamespaceIndex,
+		origin: NamespaceIdx,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIndex, ()> {
+	) -> Result<NamespaceIdx, ()> {
 		match self.path_state[usize::from(path)].poll() {
 			ResolveStep::Ready(result) => return result,
 			ResolveStep::Cycle => {
@@ -747,10 +759,10 @@ impl<'r> ImportResolver<'r> {
 	/// `finish`, so nothing here can leave a slot stuck `Resolving`.
 	fn compute_import_path(
 		&mut self,
-		origin: NamespaceIndex,
+		origin: NamespaceIdx,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIndex, ()> {
+	) -> Result<NamespaceIdx, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		match segment.parent {
 			None => {
@@ -788,11 +800,11 @@ impl<'r> ImportResolver<'r> {
 	/// forcing *that one* would just be forcing itself mid-resolution.
 	fn binding_to_import_scope(
 		&mut self,
-		target_namespace: NamespaceIndex,
-		accessor: NamespaceIndex,
+		target_namespace: NamespaceIdx,
+		accessor: NamespaceIdx,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIndex, ()> {
+	) -> Result<NamespaceIdx, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		let key = BindingKey::ty(segment.segment.inner);
 
@@ -894,9 +906,20 @@ impl<'r> ImportResolver<'r> {
 
 		let def = &self.namespaces[usize::from(def_key.namespace_idx)].items
 			[usize::from(def_key.def_idx)];
-		match def.kind.as_namespace() {
-			Some(namespace) => Ok(namespace),
-			None => {
+		match def.kind {
+			DefKind::Package(package) => {
+				Ok(NamespaceIdx::new(package.as_u32()))
+			}
+			DefKind::Module(module_idx) => {
+				Ok(self.modules[usize::from(module_idx)].own_namespace)
+			}
+			DefKind::Import(import_idx) => {
+				Ok(self.imports[usize::from(import_idx)].own_namespace)
+			}
+			DefKind::Enum(enum_idx) => {
+				Ok(self.enums[usize::from(enum_idx)].own_namespace)
+			}
+			_ => {
 				let diagnostic = report_cannot_use_as_namespace(
 					self.namespaces,
 					self.strings,
@@ -1228,8 +1251,8 @@ mod tests {
 			Self::from_graph(builder.build(root_id))
 		}
 
-		fn root_namespace(&self) -> NamespaceIndex {
-			self.defs.package_namespaces[self.graph.root_package.as_usize()]
+		fn root_namespace(&self) -> NamespaceIdx {
+			self.graph.root_package.root_namespace()
 		}
 
 		fn diagnostics(&self) -> crate::testing::DiagnosticView<'_> {
@@ -1242,7 +1265,7 @@ mod tests {
 
 		fn lookup_type(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
 		) -> Option<BindingTarget> {
 			let symbol = self.graph.strings.get_or_intern(name);
@@ -1254,7 +1277,7 @@ mod tests {
 
 		fn lookup_value(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
 		) -> Option<BindingTarget> {
 			let symbol = self.graph.strings.get_or_intern(name);
@@ -1268,9 +1291,9 @@ mod tests {
 		/// namespace a `mod inner { ... }` or `mod inner;` declares.
 		fn child_namespace(
 			&mut self,
-			namespace: NamespaceIndex,
+			namespace: NamespaceIdx,
 			name: &str,
-		) -> NamespaceIndex {
+		) -> NamespaceIdx {
 			let target = self
 				.lookup_type(namespace, name)
 				.unwrap_or_else(|| panic!("`{name}` should be bound"));
@@ -1280,16 +1303,13 @@ mod tests {
 			let kind = self.defs.namespaces[usize::from(def_key.namespace_idx)]
 				.items[usize::from(def_key.def_idx)]
 			.kind;
-			kind.as_namespace().unwrap_or_else(|| {
+			self.defs.namespace_of(kind).unwrap_or_else(|| {
 				panic!("`{name}` is not a namespace: {kind:?}")
 			})
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.
-		fn glob_targets(
-			&self,
-			namespace: NamespaceIndex,
-		) -> Vec<NamespaceIndex> {
+		fn glob_targets(&self, namespace: NamespaceIdx) -> Vec<NamespaceIdx> {
 			self.defs.namespaces[usize::from(namespace)]
 				.glob_imports
 				.iter()

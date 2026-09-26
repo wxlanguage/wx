@@ -58,12 +58,13 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{PathSegment, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	tir::defs::{EnumDef, ImportDef, ModuleDef},
 	vfs::FileId,
 };
 
 use super::defs::{
 	BindingKey, BindingLookup, BindingNamespace, BindingTarget, DefKey,
-	DefKind, Namespace, NamespaceIndex, NamespaceLookup, UseItemDef,
+	DefKind, Namespace, NamespaceIdx, NamespaceLookup, UseItemDef,
 };
 use super::imports::{
 	report_ambiguous_identifier, report_cannot_use_as_namespace,
@@ -133,19 +134,28 @@ impl PathWalk {
 /// cover.
 pub(super) struct PathResolver<'r> {
 	namespaces: &'r [Namespace],
+	enums: &'r [EnumDef],
+	imports: &'r [ImportDef],
+	modules: &'r [ModuleDef],
 	use_items: &'r [UseItemDef],
-	stdlib_root: NamespaceIndex,
+	stdlib_root: NamespaceIdx,
 }
 
 impl<'r> PathResolver<'r> {
 	pub(super) fn new(
 		namespaces: &'r [Namespace],
 		use_items: &'r [UseItemDef],
-		stdlib_root: NamespaceIndex,
+		enums: &'r [EnumDef],
+		imports: &'r [ImportDef],
+		modules: &'r [ModuleDef],
+		stdlib_root: NamespaceIdx,
 	) -> Self {
 		Self {
 			namespaces,
 			use_items,
+			enums,
+			imports,
+			modules,
 			stdlib_root,
 		}
 	}
@@ -161,7 +171,7 @@ impl<'r> PathResolver<'r> {
 	/// use — see [`PathResolution`]'s own doc comment for why.
 	fn try_resolve_path(
 		&self,
-		accessor: NamespaceIndex,
+		accessor: NamespaceIdx,
 		segments: &[PathSegment],
 		tier: BindingNamespace,
 	) -> PathResolution {
@@ -224,16 +234,25 @@ impl<'r> PathResolver<'r> {
 							first_inaccessible,
 						};
 					};
-					match self.def_kind(def_key).as_namespace() {
-						Some(next) => base = next,
-						None => {
+					base = match self.def_kind(def_key) {
+						DefKind::Package(package) => package.root_namespace(),
+						DefKind::Enum(enum_idx) => {
+							self.enums[usize::from(enum_idx)].own_namespace
+						}
+						DefKind::Module(module_idx) => {
+							self.modules[usize::from(module_idx)].own_namespace
+						}
+						DefKind::Import(import_idx) => {
+							self.imports[usize::from(import_idx)].own_namespace
+						}
+						_ => {
 							return PathResolution {
 								stopped_at: index as u32,
 								stopped_with: outcome,
 								first_inaccessible,
 							};
 						}
-					}
+					};
 				}
 				BindingLookup::NotFound | BindingLookup::Ambiguous(_) => {
 					return PathResolution {
@@ -275,7 +294,7 @@ impl<'r> PathResolver<'r> {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
 		file_id: FileId,
-		accessor: NamespaceIndex,
+		accessor: NamespaceIdx,
 		segments: &[PathSegment],
 		tier: BindingNamespace,
 	) -> PathWalk {
@@ -344,12 +363,17 @@ impl<'r> PathResolver<'r> {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
 		file_id: FileId,
-		accessor: NamespaceIndex,
+		accessor: NamespaceIdx,
 		segments: &[PathSegment],
 		tier: BindingNamespace,
 	) -> BindingTarget {
 		let walk = self.walk_path(
-			diagnostics, strings, file_id, accessor, segments, tier,
+			diagnostics,
+			strings,
+			file_id,
+			accessor,
+			segments,
+			tier,
 		);
 		if walk.is_complete(segments) {
 			return walk.target;
@@ -488,22 +512,25 @@ mod tests {
 			TestCase { graph, defs }
 		}
 
-		fn root_namespace(&self) -> NamespaceIndex {
-			self.defs.package_namespaces[self.graph.root_package.as_usize()]
+		fn root_namespace(&self) -> NamespaceIdx {
+			self.graph.root_package.root_namespace()
 		}
 
 		fn root_file(&self) -> FileId {
 			self.defs.namespaces[usize::from(self.root_namespace())].file_id
 		}
 
-		fn stdlib_root(&self) -> NamespaceIndex {
-			self.defs.package_namespaces[self.graph.stdlib_package.as_usize()]
+		fn stdlib_root(&self) -> NamespaceIdx {
+			self.graph.stdlib_package.root_namespace()
 		}
 
 		fn resolver(&self) -> PathResolver<'_> {
 			PathResolver::new(
 				&self.defs.namespaces,
 				&self.defs.use_items,
+				&self.defs.enums,
+				&self.defs.imports,
+				&self.defs.modules,
 				self.stdlib_root(),
 			)
 		}
@@ -522,7 +549,7 @@ mod tests {
 
 		fn resolve_type(
 			&mut self,
-			from: NamespaceIndex,
+			from: NamespaceIdx,
 			path: &str,
 		) -> PathResolution {
 			let segments = self.segments(path);
@@ -535,7 +562,7 @@ mod tests {
 
 		fn resolve_value(
 			&mut self,
-			from: NamespaceIndex,
+			from: NamespaceIdx,
 			path: &str,
 		) -> PathResolution {
 			let segments = self.segments(path);
@@ -613,8 +640,9 @@ mod tests {
 		let DefKind::Module(inner) = inner_key.symbol_kind(&case.defs) else {
 			panic!("expected a module");
 		};
+		let inner_namespace = case.defs.modules[usize::from(inner)].own_namespace;
 
-		let resolution = case.resolve_type(inner, "Outer");
+		let resolution = case.resolve_type(inner_namespace, "Outer");
 		assert_eq!(resolution.stopped_at, 0);
 		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
 	}

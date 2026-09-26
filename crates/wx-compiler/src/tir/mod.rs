@@ -20,6 +20,7 @@ mod imports;
 mod literals;
 mod members;
 mod paths;
+mod satisfaction;
 mod signatures;
 mod types;
 

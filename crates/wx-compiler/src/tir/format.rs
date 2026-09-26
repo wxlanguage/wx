@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 
 use crate::ast::{self, DefId, Ownership, StringInterner};
 
-use super::defs::{AstNodeRef, DefinitionRegistry, TraitIndex};
+use super::defs::{AstNodeRef, DefinitionRegistry, TraitIdx};
 use super::signatures::{AstNodeLookup, SignatureBuilder};
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
@@ -156,7 +156,9 @@ impl TypeFormatter<'_, '_> {
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.param_name(*env, *param_index);
+				let symbol = self.type_envs.frame(*env)[*param_index as usize]
+					.name
+					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::AssociatedType {
@@ -202,7 +204,7 @@ impl TypeFormatter<'_, '_> {
 		f.push('>');
 	}
 
-	fn write_trait_name(&self, f: &mut String, trait_index: TraitIndex) {
+	fn write_trait_name(&self, f: &mut String, trait_index: TraitIdx) {
 		let def_id = self.defs.traits[usize::from(trait_index)].def_id;
 		self.write_item_name(f, def_id);
 	}
@@ -242,7 +244,7 @@ impl TypeFormatter<'_, '_> {
 				};
 				name.inner
 			}
-			AstNodeRef::TypeAlias { item } => {
+			AstNodeRef::TypeAlias { item, .. } => {
 				let ast::Item::TypeAlias { name, .. } = item else {
 					unreachable!()
 				};
@@ -254,7 +256,7 @@ impl TypeFormatter<'_, '_> {
 				};
 				name.inner
 			}
-			AstNodeRef::Function { function_index, .. } => {
+			AstNodeRef::Function { func_index: function_index, .. } => {
 				self.defs.functions[usize::from(*function_index)].name.inner
 			}
 			AstNodeRef::TraitFunction { function_index, .. } => {

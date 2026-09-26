@@ -10,7 +10,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{DefinitionRegistry, TraitIndex};
+use super::defs::{DefinitionRegistry, TraitIdx};
 use super::signatures::{QueryInfo, SignatureBuilder, SignatureStatus};
 use super::types::TypeIndex;
 
@@ -28,7 +28,7 @@ pub(super) struct BindingRef {
 /// One resolved trait bound as written, including its source location.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct SourceTraitBound {
-	pub(super) trait_index: TraitIndex,
+	pub(super) trait_index: TraitIdx,
 	pub(super) span: SourceSpan,
 	pub(super) bindings: Box<[SourceAssocBinding]>,
 }
@@ -51,25 +51,25 @@ pub(super) enum BindingRequirement {
 /// occurrence that introduced the trait; bindings hold their own origins.
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub(super) struct MergedTraitBound {
-	pub(super) trait_index: TraitIndex,
+pub(super) struct ImpliedTraitBound {
+	pub(super) trait_index: TraitIdx,
 	pub(super) source: BoundId,
-	pub(super) bindings: Vec<MergedAssocBinding>,
+	pub(super) bindings: Vec<ImpliedAssocBinding>,
 }
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub(super) struct MergedAssocBinding {
+pub(super) struct ImpliedAssocBinding {
 	pub(super) source: BindingRef,
-	pub(super) kind: MergedBindingKind,
+	pub(super) kind: ImpliedBindingKind,
 	/// Trait requirements on this associated type remain in force even when
 	/// an equality supplies its concrete type.
-	pub(super) required_bounds: Vec<MergedTraitBound>,
+	pub(super) required_bounds: Vec<ImpliedTraitBound>,
 }
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub(super) enum MergedBindingKind {
+pub(super) enum ImpliedBindingKind {
 	Equals(BindingRef),
 	Bound,
 	Conflicting,
@@ -104,7 +104,7 @@ impl SignatureBuilder<'_, '_> {
 		&mut self,
 		bounds: &[BoundId],
 		subject: SymbolU32,
-	) -> Vec<MergedTraitBound> {
+	) -> Vec<ImpliedTraitBound> {
 		let mut conflicts = Vec::new();
 		let implied = self.merge_bound_set(bounds, &mut conflicts);
 		for conflict in conflicts {
@@ -123,7 +123,7 @@ impl SignatureBuilder<'_, '_> {
 		&mut self,
 		bounds: &[BoundId],
 		conflicts: &mut Vec<AssocBindingConflict>,
-	) -> Vec<MergedTraitBound> {
+	) -> Vec<ImpliedTraitBound> {
 		let mut implied = Vec::new();
 		for id in bounds.iter().copied() {
 			let bound = self.merged_from_source(id, conflicts);
@@ -146,11 +146,11 @@ impl SignatureBuilder<'_, '_> {
 				}
 				SignatureStatus::CycleReported => continue,
 			}
-			for inherited in self.traits[usize::from(trait_index)]
-				.implied_bounds
-				.iter()
-				.cloned()
-			{
+
+			let trait_env = self.traits[usize::from(trait_index)].env;
+			let trait_bounds =
+				&self.param_bounds[usize::from(trait_env)][0].implied_bounds;
+			for inherited in trait_bounds.iter().cloned() {
 				// Borrowed from the trait's own cached signature, which must
 				// survive for future queries against it — this is the one
 				// place this data is genuinely shared, so it's the one place
@@ -171,7 +171,7 @@ impl SignatureBuilder<'_, '_> {
 		&mut self,
 		id: BoundId,
 		conflicts: &mut Vec<AssocBindingConflict>,
-	) -> MergedTraitBound {
+	) -> ImpliedTraitBound {
 		let source = self.bounds.get(id);
 		let trait_index = source.trait_index;
 		let binding_count = source.bindings.len();
@@ -185,13 +185,13 @@ impl SignatureBuilder<'_, '_> {
 			let (kind, nested_ids) = match &self.bounds.binding(reference).kind
 			{
 				BindingRequirement::Equals(_) => {
-					(MergedBindingKind::Equals(reference), None)
+					(ImpliedBindingKind::Equals(reference), None)
 				}
 				BindingRequirement::Bound(ids) => {
-					(MergedBindingKind::Bound, Some(ids.to_vec()))
+					(ImpliedBindingKind::Bound, Some(ids.to_vec()))
 				}
 			};
-			bindings.push(MergedAssocBinding {
+			bindings.push(ImpliedAssocBinding {
 				source: reference,
 				kind,
 				required_bounds: nested_ids
@@ -199,7 +199,7 @@ impl SignatureBuilder<'_, '_> {
 					.unwrap_or_default(),
 			});
 		}
-		MergedTraitBound {
+		ImpliedTraitBound {
 			trait_index,
 			source: id,
 			bindings,
@@ -227,9 +227,9 @@ pub(super) fn equals_type(
 
 fn union_trait_bound(
 	arena: &BoundArena,
-	accum: &mut Vec<MergedTraitBound>,
+	accum: &mut Vec<ImpliedTraitBound>,
 	conflicts: &mut Vec<AssocBindingConflict>,
-	bound: MergedTraitBound,
+	bound: ImpliedTraitBound,
 	merge_point: BoundId,
 ) {
 	let existing = match accum
@@ -271,13 +271,13 @@ fn union_trait_bound(
 					);
 				}
 				match (&mut merged.kind, incoming.kind) {
-					(MergedBindingKind::Conflicting, _) => {}
-					(kind, MergedBindingKind::Conflicting) => {
-						*kind = MergedBindingKind::Conflicting;
+					(ImpliedBindingKind::Conflicting, _) => {}
+					(kind, ImpliedBindingKind::Conflicting) => {
+						*kind = ImpliedBindingKind::Conflicting;
 					}
 					(
-						MergedBindingKind::Equals(first),
-						MergedBindingKind::Equals(second),
+						ImpliedBindingKind::Equals(first),
+						ImpliedBindingKind::Equals(second),
 					) if equals_type(arena, *first)
 						!= equals_type(arena, second) =>
 					{
@@ -286,23 +286,23 @@ fn union_trait_bound(
 							second,
 							merge_point,
 						});
-						merged.kind = MergedBindingKind::Conflicting;
+						merged.kind = ImpliedBindingKind::Conflicting;
 					}
 					(
-						kind @ MergedBindingKind::Bound,
-						MergedBindingKind::Equals(second),
+						kind @ ImpliedBindingKind::Bound,
+						ImpliedBindingKind::Equals(second),
 					) => {
-						*kind = MergedBindingKind::Equals(second);
+						*kind = ImpliedBindingKind::Equals(second);
 					}
 					(
-						MergedBindingKind::Equals(_),
-						MergedBindingKind::Bound,
+						ImpliedBindingKind::Equals(_),
+						ImpliedBindingKind::Bound,
 					)
 					| (
-						MergedBindingKind::Equals(_),
-						MergedBindingKind::Equals(_),
+						ImpliedBindingKind::Equals(_),
+						ImpliedBindingKind::Equals(_),
 					)
-					| (MergedBindingKind::Bound, MergedBindingKind::Bound) => {}
+					| (ImpliedBindingKind::Bound, ImpliedBindingKind::Bound) => {}
 				}
 			}
 		}
