@@ -1,7 +1,8 @@
 use crate::mir::{self, ExprKind};
 use crate::opt::{
-	Block, BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function,
-	LoopData, MemAccess, NodeType, ScalarType, StackResult, SwitchCase,
+	Block, BlockIndex, BlockKind, ControlNode, DataNodeIndex, DataNodeKind,
+	Function, JoinData, MemAccess, NodeType, ScalarType, StackResult,
+	SwitchCase,
 };
 
 pub struct Builder<'mir> {
@@ -10,10 +11,15 @@ pub struct Builder<'mir> {
 	/// `mir.functions` by index, which would be wrong for non-first functions).
 	mir_func: &'mir mir::Function,
 	func: Function,
-	/// For each MIR scope, the flat offset into `data_bindings` where its
-	/// locals start. Computed once from the scope parent-chain before
-	/// building begins.
-	locals_offsets: Box<[u32]>,
+	/// For each MIR scope index, whether some `Break` anywhere in the
+	/// function targets it — computed once, up front, by
+	/// `collect_break_targets`. Lets `build_block_expr` skip registering a
+	/// real `Block`/`JoinData` for the overwhelming majority of plain
+	/// `{}` blocks that are never a break target, keeping that case exactly
+	/// as cheap as it is today. A loop scope is always its own real `Block`
+	/// regardless of this (see `build_loop`), so this only matters for
+	/// plain blocks.
+	break_targets: Box<[bool]>,
 }
 
 /// One `match` arm as built so far: its own scope/bindings plus what it
@@ -23,12 +29,12 @@ struct SwitchArmBuild {
 	discriminant: Option<i64>,
 	scope: BlockIndex,
 	result: StackResult,
-	bindings: Vec<StackResult>,
+	bindings: Vec<Option<StackResult>>,
 }
 
 /// One arm's contribution to an aggregate-typed `Switch` join slot, as
 /// decomposed by `Builder::merge_switch_slot` — either the arm's own
-/// per-field values (reusing the `Box<[DataNodeIndex]>` `extract_aggregate_fields`
+/// per-field values (reusing the `Box<[DataNodeIndex]>` `Builder::fields_of`
 /// already returned, no re-wrapping), or a `Never`/`Unit` marker to
 /// propagate to every field without materializing `field_count` copies of it.
 enum PerArmSlot {
@@ -42,67 +48,60 @@ impl<'mir> Builder<'mir> {
 		mir: &'mir mir::MIR,
 		mir_func: &'mir mir::Function,
 	) -> Function {
-		let locals_offsets = Self::compute_locals_offsets(&mir_func.scopes);
+		let mut break_targets = vec![false; mir_func.scopes.len()];
+		collect_break_targets(&mir_func.block, &mut break_targets);
 		let mut b = Builder {
 			mir,
 			mir_func,
 			func: Function::new(mir_func.id, mir_func.scopes.len()),
-			locals_offsets,
+			break_targets: break_targets.into_boxed_slice(),
 		};
 		b.build_function();
 		b.func
 	}
 
-	/// Compute the flat `data_bindings` offset for each scope.
-	///
-	/// Each scope's locals are appended directly after its parent's locals.
-	/// Sibling scopes share the same offset range (they are never active
-	/// simultaneously), so `data_bindings` grows to the depth of the
-	/// deepest path through the scope tree.
-	fn compute_locals_offsets(scopes: &[mir::BlockScope]) -> Box<[u32]> {
-		let mut offsets = Vec::with_capacity(scopes.len());
-		offsets.push(0u32);
-		for scope in scopes.iter().skip(1) {
-			let parent = scope.parent.unwrap() as usize;
-			offsets.push(offsets[parent] + scopes[parent].locals.len() as u32);
-		}
-		offsets.into_boxed_slice()
-	}
-
 	fn build_function(&mut self) {
 		let mir_func = self.mir_func;
-		let root_scope = &mir_func.scopes[0];
-		let sig = &self.mir.signatures[mir_func.signature_index as usize];
+		let sig = &self.mir.signatures[usize::from(mir_func.signature_index)];
 
-		// Seed data_bindings for the root scope (params + non-param locals).
-		let mut data_bindings =
-			vec![StackResult::Unit; root_scope.locals.len()];
+		// Seed data_bindings for the whole function at once — locals are
+		// flat and function-wide (`mir::Function::locals`), so every local's
+		// index is already its final position here. Params are genuinely
+		// available from function entry, so they're seeded `Some`; every
+		// other local starts `None` ("not yet declared on this build path")
+		// and only becomes `Some` when its own `LocalSet` is actually built
+		// — see `read_binding`'s doc comment for why this matters.
+		let mut data_bindings: Vec<Option<StackResult>> =
+			vec![None; mir_func.locals.len()];
 
 		let params_count = sig.params_count;
-		// `wasm_idx` tracks the flattened WASM local index: aggregate params
-		// occupy one slot per *leaf* scalar field (recursively, for nested
-		// aggregates too — see `build_param_value`), scalar params occupy
-		// one slot each.
+		// `wasm_idx` tracks the flattened WASM local index: an aggregate param
+		// occupies one slot per *scalar* it contains (see `mir::ScalarTable`,
+		// which counts through nested aggregates and skips zero-sized fields),
+		// a scalar param one slot each. Params are always the first
+		// `params_count` entries of `mir_func.locals` — scope 0 (the root) is
+		// always flattened first by construction, and TIR itself lists a
+		// scope's params before its other locals.
 		let mut wasm_idx = 0u32;
-		for (i, local) in root_scope.locals[..params_count].iter().enumerate() {
+		for (i, local) in mir_func.locals[..params_count].iter().enumerate() {
 			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
 			// WASM param slot — see the matching case in `build_call`.
-			data_bindings[i] = match local.ty {
-				mir::Type::Unit | mir::Type::Never => StackResult::Unit,
+			data_bindings[i] = Some(match local.ty {
+				mir::ValueType::Unit | mir::ValueType::Never => {
+					StackResult::Unit
+				}
 				ty => StackResult::Value(
 					self.build_param_value(ty, &mut wasm_idx),
 				),
-			};
-		}
-		for (i, local) in root_scope.locals[params_count..].iter().enumerate() {
-			data_bindings[params_count + i] = self.default_value(local.ty);
+			});
 		}
 
 		self.func.blocks[0] = Some(Block {
 			parent: None,
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
 
 		let body_exprs = match &mir_func.block.kind {
@@ -129,30 +128,27 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// Build the data node for a function parameter of type `ty`, consuming
-	/// one flattened WASM param slot per *leaf* scalar field it contains
-	/// (`*wasm_idx` tracks the next free slot across the whole call). A
-	/// scalar parameter is just one `Param` node; an aggregate parameter —
-	/// possibly nested — is passed as a flattened run of scalar WASM params
-	/// (mirroring how `wasm::flatten_type_to_scalars`/signature flattening
-	/// lays out a call site's arguments), so this recurses to rebuild the
-	/// matching (possibly nested) `Aggregate` literal from them, in the same
-	/// pre-order `wasm::flatten_type_to_scalars` itself would visit.
+	/// one flattened WASM param slot per *scalar* it contains (`*wasm_idx`
+	/// tracks the next free slot across the whole call). A scalar parameter is
+	/// just one `Param` node; an aggregate parameter — possibly nested — is
+	/// passed as a flattened run of scalar WASM params (mirroring how
+	/// `wasm::flatten_type_to_scalars`/signature flattening lays out a call
+	/// site's arguments), so this recurses to rebuild the matching (possibly
+	/// nested) `Aggregate` literal from them, in the same pre-order
+	/// `mir::ScalarTable` uses.
 	fn build_param_value(
 		&mut self,
-		ty: mir::Type,
+		ty: mir::ValueType,
 		wasm_idx: &mut u32,
 	) -> DataNodeIndex {
 		match ty {
-			mir::Type::Aggregate { aggregate_index } => {
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[_]> = (0..n)
-					.map(|i| {
-						let field_ty = self.mir.aggregates
-							[aggregate_index as usize]
-							.values[i];
-						self.build_param_value(field_ty, wasm_idx)
-					})
+			mir::ValueType::Aggregate { aggregate_index } => {
+				let mir = self.mir;
+				let agg = &mir.aggregate(aggregate_index);
+				let fields: Box<[_]> = agg
+					.fields
+					.iter()
+					.map(|field| self.build_param_value(field.ty, wasm_idx))
 					.collect();
 				self.node(DataNodeKind::Aggregate {
 					fields,
@@ -177,7 +173,7 @@ impl<'mir> Builder<'mir> {
 	fn build_expr(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		expr: &mir::Expression,
 	) -> StackResult {
 		match &expr.kind {
@@ -208,23 +204,12 @@ impl<'mir> Builder<'mir> {
 			ExprKind::Noop => StackResult::Unit,
 
 			// ── Locals ───────────────────────────────────────────────────
-			ExprKind::LocalGet {
-				scope_index,
-				local_index,
-			} => {
-				let idx = self.flat_index(*scope_index, *local_index);
-				self.ensure_bindings_capacity(bindings, idx + 1);
-				bindings[idx]
+			ExprKind::LocalGet { local_index } => {
+				self.read_binding(bindings, usize::from(*local_index))
 			}
-			ExprKind::LocalSet {
-				scope_index,
-				local_index,
-				value,
-			} => {
+			ExprKind::LocalSet { local_index, value } => {
 				let new_val = self.build_expr(block_idx, bindings, value);
-				let idx = self.flat_index(*scope_index, *local_index);
-				self.ensure_bindings_capacity(bindings, idx + 1);
-				bindings[idx] = new_val;
+				bindings[usize::from(*local_index)] = Some(new_val);
 				StackResult::Unit
 			}
 
@@ -572,7 +557,9 @@ impl<'mir> Builder<'mir> {
 			// ── Aggregates ────────────────────────────────────────────────
 			ExprKind::Aggregate { values } => {
 				let aggregate_index = match expr.ty {
-					mir::Type::Aggregate { aggregate_index } => aggregate_index,
+					mir::ValueType::Aggregate { aggregate_index } => {
+						aggregate_index
+					}
 					_ => {
 						panic!("Aggregate expression must have Aggregate type")
 					}
@@ -590,13 +577,11 @@ impl<'mir> Builder<'mir> {
 				StackResult::Value(node)
 			}
 			ExprKind::AggregateGet {
-				scope_index,
 				local_index,
 				value_index,
 			} => {
-				let idx = self.flat_index(*scope_index, *local_index);
-				self.ensure_bindings_capacity(bindings, idx + 1);
-				let aggregate = bindings[idx].unwrap_value();
+				let idx = usize::from(*local_index);
+				let aggregate = self.read_binding(bindings, idx).unwrap_value();
 				let aggregate_index = match self.func.data_nodes
 					[aggregate as usize]
 					.kind
@@ -608,22 +593,21 @@ impl<'mir> Builder<'mir> {
 				let node = self.get_aggregate_field(
 					aggregate,
 					aggregate_index,
-					*value_index as usize,
+					*value_index,
 				);
 				StackResult::Value(node)
 			}
 
 			ExprKind::AggregateSet {
-				scope_index,
 				local_index,
 				value_index,
 				value,
 			} => {
 				let new_val =
 					self.build_expr(block_idx, bindings, value).unwrap_value();
-				let idx = self.flat_index(*scope_index, *local_index);
-				self.ensure_bindings_capacity(bindings, idx + 1);
-				let old_aggregate = bindings[idx].unwrap_value();
+				let idx = usize::from(*local_index);
+				let old_aggregate =
+					self.read_binding(bindings, idx).unwrap_value();
 				let aggregate_index = match self.func.data_nodes
 					[old_aggregate as usize]
 					.kind
@@ -632,26 +616,27 @@ impl<'mir> Builder<'mir> {
 					NodeType::Aggregate(i) => i,
 					_ => panic!("AggregateSet on non-aggregate binding"),
 				};
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[DataNodeIndex]> = (0..n)
-					.map(|i| {
-						if i == *value_index as usize {
+				let n = self.mir.aggregate(aggregate_index).field_count();
+				let fields: Box<[DataNodeIndex]> = (0..n as u32)
+					.map(mir::PhysIndex::new)
+					.map(|phys| {
+						if phys == *value_index {
 							new_val
 						} else {
 							self.get_aggregate_field(
 								old_aggregate,
 								aggregate_index,
-								i,
+								phys,
 							)
 						}
 					})
 					.collect();
-				bindings[idx] =
-					StackResult::Value(self.node(DataNodeKind::Aggregate {
+				bindings[idx] = Some(StackResult::Value(self.node(
+					DataNodeKind::Aggregate {
 						fields,
 						aggregate_index,
-					}));
+					},
+				)));
 				StackResult::Unit
 			}
 
@@ -731,58 +716,37 @@ impl<'mir> Builder<'mir> {
 					Some(v) => self.build_expr(block_idx, bindings, v),
 					None => StackResult::Unit,
 				};
-				let target = *scope_index as BlockIndex;
+				let target = u32::from(*scope_index);
 				// Captured *before* the merge below (which only concerns the
-				// loop's own trailing value) — this break's own current
-				// contribution to the loop's carried bindings, independent of
-				// its break value. See `loop_param_updates`.
-				let loop_param_updates =
-					self.loop_param_updates(target, bindings);
-				let existing =
-					self.func.blocks[target as usize].as_ref().unwrap().result;
-				// Merge the break value with any previously-seen break result.
-				// When two distinct values are merged, phi nodes are created and
-				// stored in break_result_outputs so the scheduler can pre-allocate
-				// WASM locals for them. The outputs vec is replaced (not appended)
-				// so it always reflects the current phi set: all break sites write
-				// directly to the final phi's local at runtime.
-				let merged = match (existing, val) {
-					(StackResult::Never, other)
-					| (other, StackResult::Never) => other,
-					(StackResult::Unit, StackResult::Unit) => StackResult::Unit,
-					(StackResult::Value(l), StackResult::Value(r)) => {
-						let mut outputs = Vec::new();
-						let node = self.merge_values(l, r, &mut outputs);
-						self.func.loop_data_mut(target).break_result_outputs =
-							outputs;
-						StackResult::Value(node)
-					}
-					_ => panic!(
-						"cannot merge break results {:?} and {:?}",
-						existing, val
-					),
-				};
-				self.func.blocks[target as usize].as_mut().unwrap().result =
-					merged;
+				// target's own trailing value) — this break's own current
+				// contribution to the target's carried bindings, independent
+				// of its break value. See `carried_binding_updates`.
+				let carried_binding_updates =
+					self.carried_binding_updates(target, bindings);
+				// Return value unused here — merge_exit_value's only job at
+				// a break site is its side effect (updating the target's
+				// accumulated result and break_result_outputs); nothing
+				// downstream of a Break needs its own merged value back.
+				self.merge_exit_value(target, val);
 				self.push_stmt(
 					block_idx,
 					ControlNode::Break {
 						target,
 						value: val,
-						loop_param_updates,
+						carried_binding_updates,
 					},
 				);
 				StackResult::Never
 			}
 			ExprKind::Continue { scope_index } => {
-				let target = *scope_index as BlockIndex;
-				let loop_param_updates =
-					self.loop_param_updates(target, bindings);
+				let target = u32::from(*scope_index);
+				let carried_binding_updates =
+					self.carried_binding_updates(target, bindings);
 				self.push_stmt(
 					block_idx,
 					ControlNode::Continue {
 						target,
-						loop_param_updates,
+						carried_binding_updates,
 					},
 				);
 				StackResult::Never
@@ -803,7 +767,7 @@ impl<'mir> Builder<'mir> {
 					.build_expr(block_idx, bindings, pointer)
 					.unwrap_value();
 				match expr.ty {
-					mir::Type::Aggregate { aggregate_index } => {
+					mir::ValueType::Aggregate { aggregate_index } => {
 						StackResult::Value(self.build_aggregate_load(
 							block_idx,
 							address,
@@ -844,7 +808,7 @@ impl<'mir> Builder<'mir> {
 					.build_expr(block_idx, bindings, pointer)
 					.unwrap_value();
 				match value.ty {
-					mir::Type::Aggregate { aggregate_index } => {
+					mir::ValueType::Aggregate { aggregate_index } => {
 						let value_node = self
 							.build_expr(block_idx, bindings, value)
 							.unwrap_value();
@@ -952,28 +916,116 @@ impl<'mir> Builder<'mir> {
 	fn build_block_expr(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut [StackResult],
+		bindings: &mut [Option<StackResult>],
 		scope_index: mir::ScopeIndex,
 		expressions: &[mir::Expression],
 	) -> StackResult {
-		let mut child = self.extend_bindings(bindings, scope_index);
-		let mut result = StackResult::Unit;
-		for expr in expressions {
-			result = self.build_expr(block_idx, &mut child, expr);
-			if result == StackResult::Never {
-				break;
-			}
+		let scope_u32 = u32::from(scope_index);
+
+		// Two reasons to take the transparent fast path, checked together:
+		//
+		// 1. No `break` anywhere in the function ever targets this scope, so
+		//    registering a real `Block`/`JoinData` for it would be pure
+		//    overhead — the overwhelming majority of plain `{}` blocks.
+		//
+		// 2. `scope_u32` is already registered as *something else*. This
+		//    happens because `mir::inlining::Rebaser` redirects an inlined
+		//    callee's own root scope to the call site's scope (see its doc
+		//    comment: a reference to the callee's scope `0` is rewritten to
+		//    `root_scope`, i.e. wherever the call itself lived) — so an
+		//    inlined call's dissolved wrapper can carry the *same*
+		//    `scope_index` as an already-built ancestor (e.g. an enclosing
+		//    loop's own body scope, if the call happens directly in a loop
+		//    body). That's not a genuine second occurrence of a nested
+		//    scope needing its own registration; it's fully dissolved into
+		//    whatever it aliases, so it must be built exactly like an
+		//    ordinary untargeted block — spliced into the *current*
+		//    enclosing block (`block_idx`), never re-registered at
+		//    `scope_u32`, which would silently clobber the real owner's
+		//    entry (confirmed via `test_loop_param`: an inlined `i + 1`
+		//    dissolving into the loop's own body scope otherwise overwrote
+		//    the loop's `Block` with a fresh, non-loop one).
+		if self.func.blocks[scope_u32 as usize].is_some()
+			|| !self.break_targets[usize::from(scope_index)]
+		{
+			let mut child = bindings.to_vec();
+			let result =
+				self.build_block_exprs(block_idx, &mut child, expressions);
+			// Write back mutations to parent locals.
+			let parent_len = bindings.len();
+			bindings[..parent_len].copy_from_slice(&child[..parent_len]);
+			return result;
 		}
-		// Write back mutations to parent locals.
+
+		// Genuine break target — register a real Block + JoinData before
+		// building the body, mirroring build_loop's own setup: any break
+		// discovered while building the body needs somewhere to commit
+		// against immediately (see create_join_params's doc comment).
+		let entry_placeholders = self.create_join_params(bindings, scope_u32);
+		let join_index = self.func.push_join_data(JoinData {
+			break_result_outputs: Vec::new(),
+			entry_placeholders: entry_placeholders.clone(),
+			divergent_params: Vec::new(),
+		});
+		self.func.blocks[scope_u32 as usize] = Some(Block {
+			parent: Some(block_idx),
+			statements: Vec::new(),
+			result: StackResult::Never,
+			kind: BlockKind::Block,
+			join: Some(join_index),
+		});
+
+		let mut child = bindings.to_vec();
+		let fallthrough_result =
+			self.build_block_exprs(scope_u32, &mut child, expressions);
+
+		// "Once more, for the fallthrough" — the same fold every break
+		// already goes through (via merge_exit_value, inside the
+		// ExprKind::Break arm), applied one final time for falling off the
+		// end of the body.
+		let merged_result =
+			self.merge_exit_value(scope_u32, fallthrough_result);
+
 		let parent_len = bindings.len();
-		bindings[..parent_len].copy_from_slice(&child[..parent_len]);
-		result
+		// Order matters: this call is what folds the fallthrough's own
+		// contribution into divergent_params in the first place — must run
+		// before the clone below, so the finalize loop sees the *complete*
+		// union of every exit (every break already folded in as it was
+		// built, plus this one). Same "union of all exits, not just one"
+		// principle Phase 1 fixed for loops, applied natively here.
+		let fallthrough_updates =
+			self.carried_binding_updates(scope_u32, &child[..parent_len]);
+		let divergent_params: Vec<DataNodeIndex> =
+			self.func.join_data(scope_u32).divergent_params.clone();
+		let mut outputs = Vec::new();
+		for i in 0..parent_len {
+			self.finalize_block_join_binding(
+				i,
+				&entry_placeholders,
+				&child,
+				bindings,
+				&mut outputs,
+				&divergent_params,
+			);
+		}
+
+		self.push_stmt(
+			block_idx,
+			ControlNode::BlockJoin {
+				body: scope_u32,
+				outputs: outputs.into_boxed_slice(),
+				fallthrough_updates,
+				fallthrough_value: fallthrough_result,
+				result: merged_result,
+			},
+		);
+		merged_result
 	}
 
 	fn build_if_else(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		condition_expr: &mir::Expression,
 		then_expr: &mir::Expression,
 		else_expr: Option<&mir::Expression>,
@@ -983,16 +1035,20 @@ impl<'mir> Builder<'mir> {
 			.unwrap_value();
 
 		let (then_scope, then_exprs) = Self::unwrap_block(then_expr);
-		let mut then_bindings = self.extend_bindings(bindings, then_scope);
-		self.func.blocks[then_scope as usize] = Some(Block {
+		let mut then_bindings = bindings.clone();
+		self.func.blocks[usize::from(then_scope)] = Some(Block {
 			parent: Some(block_idx),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
-		let then_result =
-			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize]
+		let then_result = self.build_block_exprs(
+			u32::from(then_scope),
+			&mut then_bindings,
+			then_exprs,
+		);
+		self.func.blocks[usize::from(then_scope)]
 			.as_mut()
 			.unwrap()
 			.result = then_result;
@@ -1000,16 +1056,21 @@ impl<'mir> Builder<'mir> {
 		let (else_result, else_bindings, else_scope) = match else_expr {
 			Some(e) => {
 				let (scope, exprs) = Self::unwrap_block(e);
-				let mut eb = self.extend_bindings(bindings, scope);
-				self.func.blocks[scope as usize] = Some(Block {
+				let mut eb = bindings.clone();
+				self.func.blocks[usize::from(scope)] = Some(Block {
 					parent: Some(block_idx),
 					statements: Vec::new(),
 					result: StackResult::Never,
-					loop_index: None,
+					kind: BlockKind::Block,
+					join: None,
 				});
-				let r = self.build_block_exprs(scope, &mut eb, exprs);
-				self.func.blocks[scope as usize].as_mut().unwrap().result = r;
-				(r, eb, Some(scope))
+				let r =
+					self.build_block_exprs(u32::from(scope), &mut eb, exprs);
+				self.func.blocks[usize::from(scope)]
+					.as_mut()
+					.unwrap()
+					.result = r;
+				(r, eb, Some(u32::from(scope)))
 			}
 			None => (StackResult::Unit, bindings.clone(), None),
 		};
@@ -1030,7 +1091,7 @@ impl<'mir> Builder<'mir> {
 			block_idx,
 			ControlNode::IfElse {
 				condition,
-				then_block: then_scope,
+				then_block: u32::from(then_scope),
 				else_block: else_scope,
 				outputs: outputs.into_boxed_slice(),
 				result,
@@ -1059,7 +1120,7 @@ impl<'mir> Builder<'mir> {
 	/// and ordinary `i32`/`u32` literals); I64 matches still compile
 	/// correctly, just always via the if-chain.
 	fn should_use_br_table(
-		selector_ty: mir::Type,
+		selector_ty: mir::ValueType,
 		cases: &[(i64, mir::Expression)],
 	) -> bool {
 		if ScalarType::try_from(selector_ty) != Ok(ScalarType::I32) {
@@ -1092,7 +1153,8 @@ impl<'mir> Builder<'mir> {
 			parent: Some(parent),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		}));
 		idx
 	}
@@ -1121,7 +1183,7 @@ impl<'mir> Builder<'mir> {
 	fn build_switch_as_if_chain(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		selector_expr: &mir::Expression,
 		cases: &[(i64, mir::Expression)],
 		default_expr: Option<&mir::Expression>,
@@ -1169,22 +1231,24 @@ impl<'mir> Builder<'mir> {
 			match default_expr {
 				Some(body) => {
 					let (scope, exprs) = Self::unwrap_block(body);
-					let mut scope_bindings =
-						self.extend_bindings(bindings, scope);
-					self.func.blocks[scope as usize] = Some(Block {
+					let mut scope_bindings = bindings.clone();
+					self.func.blocks[usize::from(scope)] = Some(Block {
 						parent: Some(last_container),
 						statements: Vec::new(),
 						result: StackResult::Never,
-						loop_index: None,
+						kind: BlockKind::Block,
+						join: None,
 					});
 					let result = self.build_block_exprs(
-						scope,
+						u32::from(scope),
 						&mut scope_bindings,
 						exprs,
 					);
-					self.func.blocks[scope as usize].as_mut().unwrap().result =
-						result;
-					(scope, result, scope_bindings)
+					self.func.blocks[usize::from(scope)]
+						.as_mut()
+						.unwrap()
+						.result = result;
+					(u32::from(scope), result, scope_bindings)
 				}
 				None => {
 					let unreachable_block =
@@ -1224,7 +1288,8 @@ impl<'mir> Builder<'mir> {
 					&mut outputs,
 				);
 			} else {
-				let mut scratch = vec![StackResult::Unit; parent_len];
+				let mut scratch: Vec<Option<StackResult>> =
+					vec![None; parent_len];
 				result = self.merge_branches(
 					then_result,
 					else_result,
@@ -1262,12 +1327,17 @@ impl<'mir> Builder<'mir> {
 	fn build_if_chain_then_branch(
 		&mut self,
 		container: BlockIndex,
-		bindings: &[StackResult],
+		bindings: &[Option<StackResult>],
 		selector: DataNodeIndex,
 		selector_ty: ScalarType,
 		discriminant: i64,
 		case_body: &mir::Expression,
-	) -> (DataNodeIndex, BlockIndex, StackResult, Vec<StackResult>) {
+	) -> (
+		DataNodeIndex,
+		BlockIndex,
+		StackResult,
+		Vec<Option<StackResult>>,
+	) {
 		let const_node = self.node(DataNodeKind::Int {
 			value: discriminant,
 			ty: selector_ty,
@@ -1279,27 +1349,31 @@ impl<'mir> Builder<'mir> {
 		});
 
 		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
-		let mut then_bindings = self.extend_bindings(bindings, then_scope);
-		self.func.blocks[then_scope as usize] = Some(Block {
+		let mut then_bindings = bindings.to_vec();
+		self.func.blocks[usize::from(then_scope)] = Some(Block {
 			parent: Some(container),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
-		let then_result =
-			self.build_block_exprs(then_scope, &mut then_bindings, then_exprs);
-		self.func.blocks[then_scope as usize]
+		let then_result = self.build_block_exprs(
+			u32::from(then_scope),
+			&mut then_bindings,
+			then_exprs,
+		);
+		self.func.blocks[usize::from(then_scope)]
 			.as_mut()
 			.unwrap()
 			.result = then_result;
 
-		(condition, then_scope, then_result, then_bindings)
+		(condition, u32::from(then_scope), then_result, then_bindings)
 	}
 
 	fn build_switch(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		selector_expr: &mir::Expression,
 		mir_cases: &[(i64, mir::Expression)],
 		default_expr: Option<&mir::Expression>,
@@ -1381,33 +1455,36 @@ impl<'mir> Builder<'mir> {
 		// One slot per parent binding, plus one more for each arm's own result.
 		let total_slots = parent_len + 1;
 
-		let slot_value = |arm: &SwitchArmBuild, slot: usize| -> StackResult {
-			if slot < parent_len {
-				arm.bindings[slot]
-			} else {
-				arm.result
-			}
-		};
+		// The result slot is always populated — an arm's trailing value is
+		// never "not yet declared" the way a binding slot can be.
+		let slot_value =
+			|arm: &SwitchArmBuild, slot: usize| -> Option<StackResult> {
+				if slot < parent_len {
+					arm.bindings[slot]
+				} else {
+					Some(arm.result)
+				}
+			};
 
 		// Merge each slot across all arms via `merge_switch_slot`. A slot
 		// contributes at most one real `Switch` output per divergent
-		// *scalar leaf*: nothing downstream inspects a Phi's `left`/`right`
+		// *scalar*: nothing downstream inspects a Phi's `left`/`right`
 		// for a Switch (the scheduler reads each arm's raw contribution
 		// from `SwitchCase::own_values` instead), so aggregate-typed slots
 		// are decomposed field-by-field rather than merged as one opaque
 		// unit, and a slot with no real value (only `Never`/`Unit` across
-		// arms) contributes no leaf at all — `outputs` and every arm's row
-		// in `own_values` grow together, one entry per leaf, so the two
-		// stay index-aligned regardless of how many leaves a slot expands
+		// arms) contributes no scalar at all — `outputs` and every arm's row
+		// in `own_values` grow together, one entry per scalar, so the two
+		// stay index-aligned regardless of how many scalars a slot expands
 		// into.
 		let mut outputs: Vec<DataNodeIndex> = Vec::new();
-		let mut merged_per_slot: Vec<StackResult> =
+		let mut merged_per_slot: Vec<Option<StackResult>> =
 			Vec::with_capacity(total_slots);
 		let mut own_values: Vec<Vec<StackResult>> =
 			vec![Vec::new(); arms.len()];
 
 		for slot in 0..total_slots {
-			let values: Vec<StackResult> =
+			let values: Vec<Option<StackResult>> =
 				arms.iter().map(|arm| slot_value(arm, slot)).collect();
 			let merged =
 				self.merge_switch_slot(&values, &mut outputs, &mut own_values);
@@ -1415,7 +1492,8 @@ impl<'mir> Builder<'mir> {
 		}
 
 		bindings[..parent_len].copy_from_slice(&merged_per_slot[..parent_len]);
-		let result = merged_per_slot[parent_len];
+		let result = merged_per_slot[parent_len]
+			.expect("the switch's own result slot is always populated");
 
 		let mut switch_cases: Vec<SwitchCase> = arms
 			.into_iter()
@@ -1451,26 +1529,38 @@ impl<'mir> Builder<'mir> {
 	/// Merges one `Switch` join slot (an outer binding, or the arms' own
 	/// result) across every arm's `values` (one `StackResult` per arm, same
 	/// order as `arms`). A `Switch` output only ever needs a validly-typed
-	/// placeholder node per genuinely divergent *scalar* leaf — the
+	/// placeholder node per genuinely divergent *scalar* — the
 	/// scheduler reads each arm's real contribution from
 	/// `SwitchCase::own_values`, never a Phi's `left`/`right` — so this
 	/// decomposes an aggregate-typed slot field-by-field (recursively, for
 	/// nested aggregates) instead of merging it as one opaque unit, and
 	/// treats a slot whose arms differ only in `Never` vs `Unit` (no arm
-	/// disagrees on a real value) as contributing no leaf at all. Every
+	/// disagrees on a real value) as contributing no scalar at all. Every
 	/// `outputs.push` here is paired with exactly one push into each arm's
 	/// row of `own_values`, so the two always stay index-aligned no matter
-	/// how many leaves a slot expands into or how many slots contribute
+	/// how many scalars a slot expands into or how many slots contribute
 	/// none.
 	fn merge_switch_slot(
 		&mut self,
-		values: &[StackResult],
+		values: &[Option<StackResult>],
 		outputs: &mut Vec<DataNodeIndex>,
 		own_values: &mut [Vec<StackResult>],
-	) -> StackResult {
+	) -> Option<StackResult> {
+		// A slot that isn't `Some` in every arm is private to whichever
+		// arm(s) actually declared it — since every local gets a distinct
+		// flat index (no sharing between arms), a `None` here can only mean
+		// "this arm never touches that local," not "unrelated arms
+		// disagree." Nothing outside any arm could ever reference it, so it
+		// never gets merged or output — it just stays `None`.
+		if values.iter().any(|v| v.is_none()) {
+			return None;
+		}
+		let values: Vec<StackResult> =
+			values.iter().map(|v| v.unwrap()).collect();
+
 		let first = values[0];
 		if values[1..].iter().copied().all(|v| v == first) {
-			return first;
+			return Some(first);
 		}
 
 		let Some(sample) = values.iter().copied().find_map(|v| match v {
@@ -1479,36 +1569,37 @@ impl<'mir> Builder<'mir> {
 		}) else {
 			// Every arm is `Never` or `Unit` (a mix of the two — a uniform
 			// value would have taken the fast path above): no real value to
-			// carry, so this slot contributes no leaf.
-			return StackResult::Unit;
+			// carry, so this slot contributes no scalar.
+			return Some(StackResult::Unit);
 		};
 
 		match self.func.data_nodes[sample as usize].kind.node_type() {
 			NodeType::Scalar(ty) => {
-				let leaf = match values.iter().copied().find_map(|v| match v {
-					StackResult::Value(n) if n != sample => Some(n),
-					_ => None,
-				}) {
-					Some(other) => self.node(DataNodeKind::Phi {
-						left: sample,
-						right: other,
-						ty,
-					}),
-					// Every value-bearing arm agrees; only `Never`/`Unit`
-					// arms vary, so there's no genuine value divergence.
-					None => sample,
-				};
-				outputs.push(leaf);
+				let merged =
+					match values.iter().copied().find_map(|v| match v {
+						StackResult::Value(n) if n != sample => Some(n),
+						_ => None,
+					}) {
+						Some(other) => self.node(DataNodeKind::Phi {
+							left: sample,
+							right: other,
+							ty,
+						}),
+						// Every value-bearing arm agrees; only `Never`/`Unit`
+						// arms vary, so there's no genuine value divergence.
+						None => sample,
+					};
+				outputs.push(merged);
 				for (arm_values, v) in
 					own_values.iter_mut().zip(values.iter().copied())
 				{
 					arm_values.push(v);
 				}
-				StackResult::Value(leaf)
+				Some(StackResult::Value(merged))
 			}
 			NodeType::Aggregate(aggregate_index) => {
 				let field_count =
-					self.mir.aggregates[aggregate_index as usize].values.len();
+					self.mir.aggregate(aggregate_index).field_count();
 				// Extract each value-bearing arm's fields exactly once (not
 				// once per field below). A `Never`/`Unit` arm propagates
 				// unchanged to every field — its body diverges before
@@ -1520,8 +1611,7 @@ impl<'mir> Builder<'mir> {
 					.copied()
 					.map(|v| match v {
 						StackResult::Value(n) => {
-							let (fields, _) = self.extract_aggregate_fields(n);
-							PerArmSlot::Fields(fields)
+							PerArmSlot::Fields(self.fields_of(n))
 						}
 						other => PerArmSlot::NoValue(other),
 					})
@@ -1529,19 +1619,28 @@ impl<'mir> Builder<'mir> {
 
 				let merged_fields: Box<[DataNodeIndex]> = (0..field_count)
 					.map(|field| {
-						let field_values: Vec<StackResult> = per_arm
+						// Every arm structurally owns this field (it's part
+						// of the same aggregate type on every arm), so this
+						// is always `Some` — never subject to the "private
+						// to one arm" exclusion above.
+						let field_values: Vec<Option<StackResult>> = per_arm
 							.iter()
-							.map(|slot| match slot {
-								PerArmSlot::Fields(fields) => {
-									StackResult::Value(fields[field])
-								}
-								PerArmSlot::NoValue(v) => *v,
+							.map(|slot| {
+								Some(match slot {
+									PerArmSlot::Fields(fields) => {
+										StackResult::Value(fields[field])
+									}
+									PerArmSlot::NoValue(v) => *v,
+								})
 							})
 							.collect();
 						self.merge_switch_slot(
 							&field_values,
 							outputs,
 							own_values,
+						)
+						.expect(
+							"every arm structurally owns this field, so it's always Some",
 						)
 						.unwrap_value()
 					})
@@ -1550,7 +1649,7 @@ impl<'mir> Builder<'mir> {
 					fields: merged_fields,
 					aggregate_index,
 				});
-				StackResult::Value(agg)
+				Some(StackResult::Value(agg))
 			}
 		}
 	}
@@ -1558,23 +1657,28 @@ impl<'mir> Builder<'mir> {
 	fn build_switch_arm(
 		&mut self,
 		parent_block: BlockIndex,
-		parent_bindings: &[StackResult],
+		parent_bindings: &[Option<StackResult>],
 		discriminant: Option<i64>,
 		body: &mir::Expression,
 	) -> SwitchArmBuild {
 		let (scope, exprs) = Self::unwrap_block(body);
-		let mut arm_bindings = self.extend_bindings(parent_bindings, scope);
-		self.func.blocks[scope as usize] = Some(Block {
+		let mut arm_bindings = parent_bindings.to_vec();
+		self.func.blocks[usize::from(scope)] = Some(Block {
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: None,
+			kind: BlockKind::Block,
+			join: None,
 		});
-		let result = self.build_block_exprs(scope, &mut arm_bindings, exprs);
-		self.func.blocks[scope as usize].as_mut().unwrap().result = result;
+		let result =
+			self.build_block_exprs(u32::from(scope), &mut arm_bindings, exprs);
+		self.func.blocks[usize::from(scope)]
+			.as_mut()
+			.unwrap()
+			.result = result;
 		SwitchArmBuild {
 			discriminant,
-			scope,
+			scope: u32::from(scope),
 			result,
 			bindings: arm_bindings,
 		}
@@ -1583,28 +1687,32 @@ impl<'mir> Builder<'mir> {
 	fn build_loop(
 		&mut self,
 		parent_block: BlockIndex,
-		bindings: &mut [StackResult],
+		bindings: &mut [Option<StackResult>],
 		_scope_index: mir::ScopeIndex,
 		body_expr: &mir::Expression,
 	) -> StackResult {
 		let (body_scope, body_exprs) = Self::unwrap_block(body_expr);
-		let body_block = body_scope as BlockIndex;
+		let body_block = u32::from(body_scope);
 
-		// Create loop-param placeholders for all parent bindings.
-		let loop_params = self.create_loop_params(bindings, body_block);
-		let mut loop_bindings = loop_params.clone();
-		// Extend for the body scope's own locals.
-		self.extend_bindings_in_place(&mut loop_bindings, body_scope);
+		// Create loop-param placeholders for all parent bindings — one per
+		// entry, so this is already the full function-wide length; no
+		// further growth needed for the body scope's own locals (every
+		// local, function-wide, already has a slot from function-build
+		// start).
+		let entry_placeholders = self.create_loop_params(bindings, body_block);
+		let mut loop_bindings = entry_placeholders.clone();
 
-		let loop_index = self.func.push_loop_data(LoopData {
+		let join_index = self.func.push_join_data(JoinData {
 			break_result_outputs: Vec::new(),
-			loop_params: loop_params.clone(),
+			entry_placeholders: entry_placeholders.clone(),
+			divergent_params: Vec::new(),
 		});
 		self.func.blocks[body_block as usize] = Some(Block {
 			parent: Some(parent_block),
 			statements: Vec::new(),
 			result: StackResult::Never,
-			loop_index: Some(loop_index),
+			kind: BlockKind::Loop,
+			join: Some(join_index),
 		});
 		let body_fallthrough =
 			self.build_block_exprs(body_block, &mut loop_bindings, body_exprs);
@@ -1621,16 +1729,21 @@ impl<'mir> Builder<'mir> {
 			.unwrap()
 			.result = body_fallthrough;
 
-		// Patch loop params and collect outputs.
+		// Patch loop params and collect outputs. `divergent_params` is
+		// cloned up front (mirrors `entry_placeholders` itself, above) so it
+		// can be passed down without re-borrowing `self.func` inside the loop.
 		let mut outputs = Vec::new();
 		let parent_len = bindings.len();
+		let divergent_params: Vec<DataNodeIndex> =
+			self.func.join_data(body_block).divergent_params.clone();
 		for i in 0..parent_len {
 			self.patch_loop_binding(
 				i,
-				&loop_params,
+				&entry_placeholders,
 				&loop_bindings,
 				bindings,
 				&mut outputs,
+				&divergent_params,
 			);
 		}
 
@@ -1648,13 +1761,13 @@ impl<'mir> Builder<'mir> {
 	fn build_call(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		callee_expr: &mir::Expression,
 		arguments: &[mir::Expression],
-		result_ty: mir::Type,
+		result_ty: mir::ValueType,
 	) -> StackResult {
 		let callee_sig = match callee_expr.ty {
-			mir::Type::Function { signature_index } => signature_index,
+			mir::ValueType::Function { signature_index } => signature_index,
 			_ => unreachable!(),
 		};
 		let callee = self
@@ -1674,8 +1787,8 @@ impl<'mir> Builder<'mir> {
 			.collect();
 
 		let result = match result_ty {
-			mir::Type::Unit | mir::Type::Never => StackResult::Unit,
-			mir::Type::Aggregate { aggregate_index } => {
+			mir::ValueType::Unit | mir::ValueType::Never => StackResult::Unit,
+			mir::ValueType::Aggregate { aggregate_index } => {
 				StackResult::Value(self.node(
 					DataNodeKind::AggregateCallResult { aggregate_index },
 				))
@@ -1705,108 +1818,143 @@ impl<'mir> Builder<'mir> {
 
 	// ── Binding helpers ───────────────────────────────────────────────────────
 
-	/// Extend `parent` bindings with the locals of `scope_index`, seeding
-	/// each with a default value — unless it's already been written, which
-	/// happens when an inlined call's `LocalSet`s bind this scope's locals
-	/// (via their global `flat_index`) *before* the scope's own `Block` node
-	/// is reached (`mir::inlining::inline_call` emits the argument
-	/// `LocalSet`s as siblings preceding the callee's body block, not as
-	/// its first statements). Blindly appending a default in that case
-	/// would push it past the slot the `LocalSet` already populated,
-	/// producing a node nothing ever references.
-	fn extend_bindings(
-		&mut self,
-		parent: &[StackResult],
-		scope_index: mir::ScopeIndex,
-	) -> Vec<StackResult> {
-		let mut child = parent.to_vec();
-		for (i, local) in self.mir_func.scopes[scope_index as usize]
-			.locals
-			.iter()
-			.enumerate()
-		{
-			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
-			if idx < child.len() {
-				continue;
-			}
-			debug_assert_eq!(idx, child.len());
-			child.push(self.default_value(local.ty));
-		}
-		child
-	}
-
-	/// In-place counterpart of `extend_bindings` — see its doc comment for
-	/// why already-written slots must be skipped rather than defaulted.
-	fn extend_bindings_in_place(
-		&mut self,
-		bindings: &mut Vec<StackResult>,
-		scope_index: mir::ScopeIndex,
-	) {
-		for (i, local) in self.mir_func.scopes[scope_index as usize]
-			.locals
-			.iter()
-			.enumerate()
-		{
-			let idx = self.flat_index(scope_index, i as mir::LocalIndex);
-			if idx < bindings.len() {
-				continue;
-			}
-			debug_assert_eq!(idx, bindings.len());
-			bindings.push(self.default_value(local.ty));
-		}
-	}
-
 	/// Create loop-param placeholders for every scalar / aggregate binding in
-	/// `parent`.
+	/// `parent`. A `None` entry — this local hasn't actually been declared
+	/// yet on this build path, e.g. a temp local only declared inside the
+	/// loop body itself — passes straight through as `None`: no placeholder
+	/// is minted for it, so it can never be mistaken for a genuinely
+	/// loop-carried binding (see `read_binding`'s doc comment for why `None`
+	/// must never be papered over here).
 	fn create_loop_params(
 		&mut self,
-		parent: &[StackResult],
+		parent: &[Option<StackResult>],
 		block_index: BlockIndex,
-	) -> Vec<StackResult> {
+	) -> Vec<Option<StackResult>> {
 		let mut params = Vec::with_capacity(parent.len());
 		for &binding in parent {
 			let param = match binding {
-				StackResult::Value(node_id) => {
-					match self.func.data_nodes[node_id as usize]
-						.kind
-						.node_type()
-					{
-						NodeType::Scalar(ty) => {
-							let lp = self.func.push_loop_param(
-								block_index,
-								node_id,
-								ty,
-							);
-							StackResult::Value(lp)
-						}
-						NodeType::Aggregate(_) => {
-							// One loop-param per field; reassemble as an Aggregate node.
-							let (fields, aggregate_index) =
-								self.extract_aggregate_fields(node_id);
-							let agg_def =
-								&self.mir.aggregates[aggregate_index as usize];
-							let lp_fields: Box<[_]> = fields
-								.iter()
-								.zip(agg_def.values.iter())
-								.map(|(&field_node, &field_mir_ty)| {
-									let ty = ScalarType::try_from(field_mir_ty)
-										.expect(
-											"aggregate field must be scalar",
-										);
-									self.func.push_loop_param(
-										block_index,
-										field_node,
-										ty,
-									)
-								})
-								.collect();
-							let new_agg = self.node(DataNodeKind::Aggregate {
-								fields: lp_fields,
-								aggregate_index,
-							});
-							StackResult::Value(new_agg)
-						}
-					}
+				Some(StackResult::Value(node_id)) => {
+					Some(
+						match self.func.data_nodes[node_id as usize]
+							.kind
+							.node_type()
+						{
+							NodeType::Scalar(ty) => {
+								let lp = self.func.push_loop_param(
+									block_index,
+									node_id,
+									ty,
+								);
+								StackResult::Value(lp)
+							}
+							NodeType::Aggregate(aggregate_index) => {
+								// One loop-param per WASM *value*, not per field —
+								// a nested field spans several and a zero-sized
+								// one spans none — then reassemble the shape.
+								let scalars = self.scalars_of(node_id);
+								let params: Vec<DataNodeIndex> = scalars
+									.into_iter()
+									.map(|value| {
+										let ty = match self.func.data_nodes
+											[value as usize]
+											.kind
+											.node_type()
+										{
+											NodeType::Scalar(ty) => ty,
+											NodeType::Aggregate(_) => {
+												unreachable!(
+													"scalars_of yields only scalars"
+												)
+											}
+										};
+										self.func.push_loop_param(
+											block_index,
+											value,
+											ty,
+										)
+									})
+									.collect();
+								let new_agg = self.aggregate_from_scalars(
+									aggregate_index,
+									&params,
+								);
+								StackResult::Value(new_agg)
+							}
+						},
+					)
+				}
+				other => other,
+			};
+			params.push(param);
+		}
+		params
+	}
+
+	/// The block-join analogue of `create_loop_params`. Mints a stable
+	/// `JoinParam` placeholder for every parent binding *before* the block's
+	/// body is built, so any `break` targeting it — however deeply nested,
+	/// discovered at an arbitrary point in the single top-to-bottom build —
+	/// has something fixed to commit its own current value against
+	/// immediately, without waiting to know the final divergent set.
+	///
+	/// Unlike `create_loop_params`, these placeholders are *not* fed into
+	/// the block's own live bindings afterward (there is no back-edge, so no
+	/// "current iteration's value" ambiguity to paper over — see
+	/// `DataNodeKind::JoinParam`'s doc comment) — the caller
+	/// (`build_block_expr`) builds the body against the ordinary
+	/// `extend_bindings`-produced bindings, completely unrelated to this
+	/// return value, which exists purely for commit-diffing and the final
+	/// `outputs`/local identity.
+	fn create_join_params(
+		&mut self,
+		parent: &[Option<StackResult>],
+		block_index: BlockIndex,
+	) -> Vec<Option<StackResult>> {
+		let mut params = Vec::with_capacity(parent.len());
+		for &binding in parent {
+			let param = match binding {
+				Some(StackResult::Value(node_id)) => {
+					Some(
+						match self.func.data_nodes[node_id as usize]
+							.kind
+							.node_type()
+						{
+							NodeType::Scalar(ty) => {
+								let jp =
+									self.func.push_join_param(block_index, ty);
+								StackResult::Value(jp)
+							}
+							NodeType::Aggregate(aggregate_index) => {
+								// One join-param per WASM *value*, not per field —
+								// mirrors create_loop_params exactly.
+								let scalars = self.scalars_of(node_id);
+								let params: Vec<DataNodeIndex> = scalars
+									.into_iter()
+									.map(|value| {
+										let ty = match self.func.data_nodes
+											[value as usize]
+											.kind
+											.node_type()
+										{
+											NodeType::Scalar(ty) => ty,
+											NodeType::Aggregate(_) => {
+												unreachable!(
+													"scalars_of yields only scalars"
+												)
+											}
+										};
+										self.func
+											.push_join_param(block_index, ty)
+									})
+									.collect();
+								let new_agg = self.aggregate_from_scalars(
+									aggregate_index,
+									&params,
+								);
+								StackResult::Value(new_agg)
+							}
+						},
+					)
 				}
 				other => other,
 			};
@@ -1816,111 +1964,234 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// Patch loop params for binding `i` once the loop body is built.
+	///
+	/// `divergent_params` is the loop's running list (see
+	/// `JoinData::divergent_params`) of scalar `LoopParam` nodes some
+	/// `break`/`continue` inside the body already found to differ from the
+	/// placeholder at its own point — independent of, and unioned with, what
+	/// the fallthrough path alone concludes below. Without this union, a
+	/// binding mutated only along a path that ends in an early exit (while
+	/// the fallthrough happens to leave it unchanged, or never touches it at
+	/// all) would be wrongly treated as never loop-carried, and the early
+	/// exit's already-recorded commit would reference a WASM local that was
+	/// never allocated.
 	fn patch_loop_binding(
 		&mut self,
 		i: usize,
-		loop_params: &[StackResult],
-		loop_final: &[StackResult],
-		parent_bindings: &mut [StackResult],
+		entry_placeholders: &[Option<StackResult>],
+		loop_final: &[Option<StackResult>],
+		parent_bindings: &mut [Option<StackResult>],
 		outputs: &mut Vec<DataNodeIndex>,
+		divergent_params: &[DataNodeIndex],
 	) {
-		let param = match loop_params[i] {
-			StackResult::Value(n) => n,
+		// `None` at `entry_placeholders[i]` means this local was never
+		// declared before the loop began — e.g. a temp only declared inside
+		// the loop body itself, never genuinely loop-carried — so there's
+		// nothing to patch or track divergence for.
+		let param = match entry_placeholders[i] {
+			Some(StackResult::Value(n)) => n,
 			_ => return,
 		};
 		let after = match loop_final[i] {
-			StackResult::Value(n) => n,
+			Some(StackResult::Value(n)) => n,
 			_ => return,
 		};
 
 		// If loop_final still holds the LoopParam (or the same aggregate wrapper)
-		// that was installed at loop entry, the binding was never written inside
-		// the loop body.  Restore the parent binding to the pre-loop value and
-		// skip patching so we don't create a self-referential LoopParam node.
+		// that was installed at loop entry, the binding was never written on the
+		// fallthrough path. That alone doesn't mean it's not loop-carried — some
+		// break/continue inside may have recorded a genuinely different value at
+		// its own point (see `divergent_params`'s doc comment) — so only take the
+		// early-out (restore to the pre-loop value, skip patching, no output) when
+		// nothing has flagged this param as divergent either.
 		if param == after {
-			let before = match self.func.data_nodes[param as usize].kind {
-				DataNodeKind::LoopParam { before, .. } => before,
-				// Aggregate wrapper whose fields were all unmodified.
-				_ => {
-					// Restore the parent binding to whatever it was before the loop.
-					// The original value was `loop_params[i]`'s `before` field, but
-					// for aggregates we just leave the binding as-is (it's already correct
-					// since the aggregate node CSE-deduplicates to the pre-loop one).
-					return;
-				}
-			};
-			parent_bindings[i] = StackResult::Value(before);
-			return;
+			let any_divergent =
+				match self.func.data_nodes[param as usize].kind.node_type() {
+					NodeType::Scalar(_) => divergent_params.contains(&param),
+					NodeType::Aggregate(_) => self
+						.scalars_of(param)
+						.iter()
+						.any(|s| divergent_params.contains(s)),
+				};
+			if !any_divergent {
+				let before = match self.func.data_nodes[param as usize].kind {
+					DataNodeKind::LoopParam { before, .. } => before,
+					// Aggregate wrapper whose fields were all unmodified.
+					_ => {
+						// Restore the parent binding to whatever it was before the loop.
+						// The original value was `entry_placeholders[i]`'s `before` field, but
+						// for aggregates we just leave the binding as-is (it's already correct
+						// since the aggregate node CSE-deduplicates to the pre-loop one).
+						return;
+					}
+				};
+				parent_bindings[i] = Some(StackResult::Value(before));
+				return;
+			}
+			// Else fall through into the match below: `patch_loop_param(param,
+			// after)` there is a no-op (before == after already), but the
+			// `divergent_params` check in each arm still forces the right
+			// scalars into `outputs`.
 		}
 
 		match self.func.data_nodes[param as usize].kind.node_type() {
 			NodeType::Scalar(_) => {
 				self.func.patch_loop_param(param, after);
-				// Only expose as output if the binding was actually mutated.
-				if matches!(self.func.data_nodes[param as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
-				{
-					parent_bindings[i] = StackResult::Value(param);
+				// Expose as output if the binding was actually mutated on the
+				// fallthrough path, *or* some break/continue already found it
+				// to diverge independently of the fallthrough.
+				let mutated = matches!(self.func.data_nodes[param as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after);
+				if mutated || divergent_params.contains(&param) {
+					parent_bindings[i] = Some(StackResult::Value(param));
 					outputs.push(param);
 				}
 			}
 			NodeType::Aggregate(_) => {
-				let (lp_fields, aggregate_index) =
-					self.extract_aggregate_fields(param);
-				let (after_fields, _) = self.extract_aggregate_fields(after);
+				// One loop-param per WASM value, matching `create_loop_params`.
+				// Reassembling afterwards would be a no-op: every slot already
+				// holds its own loop param, so the rebuilt aggregate is `param`
+				// itself — only the parent binding and the output list change.
+				let lp_scalars = self.scalars_of(param);
+				let after_scalars = self.scalars_of(after);
 				let mut any_changed = false;
-				let mut new_fields = lp_fields.to_vec();
-				for (j, (&lp_field, &after_field)) in
-					lp_fields.iter().zip(after_fields.iter()).enumerate()
+				for (&lp_scalar, &after_scalar) in
+					lp_scalars.iter().zip(after_scalars.iter())
 				{
-					self.func.patch_loop_param(lp_field, after_field);
-					if matches!(self.func.data_nodes[lp_field as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after)
-					{
-						new_fields[j] = lp_field;
-						outputs.push(lp_field);
+					self.func.patch_loop_param(lp_scalar, after_scalar);
+					let mutated = matches!(self.func.data_nodes[lp_scalar as usize].kind, DataNodeKind::LoopParam { before, after, .. } if before != after);
+					if mutated || divergent_params.contains(&lp_scalar) {
+						outputs.push(lp_scalar);
 						any_changed = true;
 					}
 				}
 				if any_changed {
-					let new_agg = self.node(DataNodeKind::Aggregate {
-						fields: new_fields.into_boxed_slice(),
-						aggregate_index,
-					});
-					parent_bindings[i] = StackResult::Value(new_agg);
+					parent_bindings[i] = Some(StackResult::Value(param));
 				}
 			}
 		}
 	}
 
-	/// `(loop_param_node, current_value_node)` pairs, decomposed to scalars —
-	/// the target loop's own carried bindings (`LoopData::loop_params`) as of
-	/// this exact point, wherever they differ from what the loop param
-	/// itself currently holds. `Break`/`Continue` use this to commit their
-	/// own current values before jumping: the loop's normal "commit
-	/// accumulated bindings, then branch back" tail code
-	/// (`ControlNode::Loop`'s own scheduling) only runs on ordinary
-	/// fallthrough, so an early exit must commit independently or the next
-	/// iteration (for `continue`) — or code after the loop (for `break`) —
-	/// would see stale values.
-	fn loop_param_updates(
+	/// The block-join analogue of `patch_loop_binding` — finalizes binding
+	/// `i` once a block-join's body has been fully built (fallthrough
+	/// reached). Unlike a loop, there is no "patch a placeholder in place"
+	/// step at all: a `JoinParam` is either divergent (some exit — a break,
+	/// or the fallthrough — found a genuinely different value for it, per
+	/// `divergent_params`) or it isn't, decided purely from that
+	/// already-accumulated union, with no `before`/`after` two-phase commit
+	/// to run.
+	///
+	/// For a scalar slot, a non-divergent binding resolves directly to
+	/// `current` (the fallthrough's own raw value) — never to the
+	/// placeholder, which (unlike `LoopParam`) has no fallback value of its
+	/// own to read if referenced (see `DataNodeKind::JoinParam`'s doc
+	/// comment). For an aggregate slot that's only *partially* divergent
+	/// (some scalar fields differ across exits, others don't), the
+	/// reassembled result mixes: each divergent scalar uses its own
+	/// `JoinParam` (so every exit's commit for it lands in the same local),
+	/// each non-divergent scalar uses `current`'s own value for that field
+	/// directly — so every scalar actually referenced downstream is
+	/// self-sufficient, never routing through a placeholder with nothing
+	/// backing it.
+	fn finalize_block_join_binding(
+		&mut self,
+		i: usize,
+		entry_placeholders: &[Option<StackResult>],
+		fallthrough_bindings: &[Option<StackResult>],
+		parent_bindings: &mut [Option<StackResult>],
+		outputs: &mut Vec<DataNodeIndex>,
+		divergent_params: &[DataNodeIndex],
+	) {
+		// `None` at `entry_placeholders[i]` means this local was never
+		// declared before the block began — a block-inner temp, never
+		// genuinely outer-visible — so there's nothing to finalize for it.
+		let param = match entry_placeholders[i] {
+			Some(StackResult::Value(n)) => n,
+			_ => return,
+		};
+		let current = match fallthrough_bindings[i] {
+			Some(StackResult::Value(n)) => n,
+			_ => return,
+		};
+
+		match self.func.data_nodes[param as usize].kind.node_type() {
+			NodeType::Scalar(_) => {
+				if divergent_params.contains(&param) {
+					outputs.push(param);
+					parent_bindings[i] = Some(StackResult::Value(param));
+				} else {
+					parent_bindings[i] = Some(StackResult::Value(current));
+				}
+			}
+			NodeType::Aggregate(aggregate_index) => {
+				let param_scalars = self.scalars_of(param);
+				let current_scalars = self.scalars_of(current);
+				let mut any_changed = false;
+				let mut result_scalars =
+					Vec::with_capacity(param_scalars.len());
+				for (&p_scalar, &c_scalar) in
+					param_scalars.iter().zip(current_scalars.iter())
+				{
+					if divergent_params.contains(&p_scalar) {
+						outputs.push(p_scalar);
+						any_changed = true;
+						result_scalars.push(p_scalar);
+					} else {
+						result_scalars.push(c_scalar);
+					}
+				}
+				parent_bindings[i] = Some(if any_changed {
+					StackResult::Value(self.aggregate_from_scalars(
+						aggregate_index,
+						&result_scalars,
+					))
+				} else {
+					StackResult::Value(current)
+				});
+			}
+		}
+	}
+
+	/// `(carried_node, current_value_node)` pairs, decomposed to scalars —
+	/// the target's own carried bindings (`JoinData::entry_placeholders`,
+	/// shared shape for a loop or a block-join) as of this exact point,
+	/// wherever they differ from what the carried node itself currently
+	/// holds. `Break`/`Continue` use this to commit their own current
+	/// values before jumping: the target's normal "commit accumulated
+	/// bindings, then branch back/fall through" tail code
+	/// (`ControlNode::Loop`/`ControlNode::BlockJoin`'s own scheduling) only
+	/// runs on the ordinary path (a loop's back-edge, or a block's own
+	/// fallthrough), so an early exit must commit independently or the next
+	/// iteration (for `continue`, always a loop) — or code after the target
+	/// (for `break`) — would see stale values.
+	fn carried_binding_updates(
 		&mut self,
 		target: BlockIndex,
-		bindings: &[StackResult],
+		bindings: &[Option<StackResult>],
 	) -> Box<[(DataNodeIndex, DataNodeIndex)]> {
 		// Cloned out up front rather than indexed per-iteration: `self.func`
 		// would otherwise need re-borrowing on every loop, and
 		// `collect_scalar_loop_param_updates` below already needs `&mut self`.
-		let loop_params = self.func.loop_data(target).loop_params.clone();
+		let carried: Vec<Option<StackResult>> =
+			self.func.join_data(target).entry_placeholders.clone();
 		let mut updates = Vec::new();
-		// `bindings` may hold more entries than `loop_params` (deeper scopes
-		// nested inside the loop) — `zip` stops at the shorter one, same as
-		// the original `0..loop_params.len()` bound.
+		// A `None` on either side means this local isn't genuinely carried
+		// by `target` (never declared before it began) — nothing to commit.
 		for (param, current) in
-			loop_params.iter().copied().zip(bindings.iter().copied())
+			carried.iter().copied().zip(bindings.iter().copied())
 		{
-			if let (StackResult::Value(p), StackResult::Value(c)) =
+			if let (Some(StackResult::Value(p)), Some(StackResult::Value(c))) =
 				(param, current)
 			{
 				self.collect_scalar_loop_param_updates(p, c, &mut updates);
+			}
+		}
+		// Fold every genuine divergence this call found into the target's
+		// running record — see `JoinData::divergent_params`'s doc comment.
+		// `updates` is typically tiny, so a linear dedup check stays cheap.
+		let divergent = &mut self.func.join_data_mut(target).divergent_params;
+		for &(param, _) in &updates {
+			if !divergent.contains(&param) {
+				divergent.push(param);
 			}
 		}
 		updates.into_boxed_slice()
@@ -1943,15 +2214,52 @@ impl<'mir> Builder<'mir> {
 				updates.push((param, current));
 			}
 			(NodeType::Aggregate(_), NodeType::Aggregate(_)) => {
-				let (param_fields, _) = self.extract_aggregate_fields(param);
-				let (current_fields, _) =
-					self.extract_aggregate_fields(current);
-				for (&p, &c) in param_fields.iter().zip(current_fields.iter()) {
-					self.collect_scalar_loop_param_updates(p, c, updates);
-				}
+				let param_scalars = self.scalars_of(param);
+				let current_scalars = self.scalars_of(current);
+				updates.extend(
+					param_scalars
+						.into_iter()
+						.zip(current_scalars)
+						.filter(|(p, c)| p != c),
+				);
 			}
 			_ => {}
 		}
+	}
+
+	/// Merges a `break`'s own value (or, for a block-join, the fallthrough's
+	/// own tail value) into whatever `target`'s accumulated trailing value is
+	/// so far, exactly like `Loop`'s own trailing-value merge — this is the
+	/// loop-vs-block-join-agnostic core the `ExprKind::Break` arm and
+	/// `build_block_expr`'s fallthrough step both call into. When two
+	/// distinct values are merged, phi nodes are created and stored in
+	/// `break_result_outputs` (on whichever side table `target` actually
+	/// has) so the scheduler can pre-allocate WASM locals for them — the
+	/// outputs vec is replaced (not appended) each call so it always
+	/// reflects the current phi set: every exit writes directly to the
+	/// final phi's local at runtime.
+	fn merge_exit_value(
+		&mut self,
+		target: BlockIndex,
+		val: StackResult,
+	) -> StackResult {
+		let existing =
+			self.func.blocks[target as usize].as_ref().unwrap().result;
+		let merged = match (existing, val) {
+			(StackResult::Never, other) | (other, StackResult::Never) => other,
+			(StackResult::Unit, StackResult::Unit) => StackResult::Unit,
+			(StackResult::Value(l), StackResult::Value(r)) => {
+				let mut outputs = Vec::new();
+				let node = self.merge_values(l, r, &mut outputs);
+				self.func.join_data_mut(target).break_result_outputs = outputs;
+				StackResult::Value(node)
+			}
+			_ => {
+				panic!("cannot merge exit results {:?} and {:?}", existing, val)
+			}
+		};
+		self.func.blocks[target as usize].as_mut().unwrap().result = merged;
+		merged
 	}
 
 	/// Merge bindings from two branches, creating Phi nodes for values that
@@ -1962,26 +2270,37 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		then_result: StackResult,
 		else_result: StackResult,
-		then_bindings: &[StackResult],
-		else_bindings: &[StackResult],
+		then_bindings: &[Option<StackResult>],
+		else_bindings: &[Option<StackResult>],
 		parent_len: usize,
-		parent_bindings: &mut [StackResult],
+		parent_bindings: &mut [Option<StackResult>],
 		outputs: &mut Vec<DataNodeIndex>,
 	) -> StackResult {
 		for i in 0..parent_len {
-			let t = then_bindings[i];
-			let e = else_bindings[i];
+			let (t, e) = match (then_bindings[i], else_bindings[i]) {
+				(Some(t), Some(e)) => (t, e),
+				// Not declared in at least one branch — private to
+				// whichever branch (if either) actually declared it, since
+				// every local gets a distinct flat index (no sharing
+				// between branches). Nothing outside either branch could
+				// ever reference it, so it never gets merged/output; stays
+				// `None`.
+				_ => {
+					parent_bindings[i] = None;
+					continue;
+				}
+			};
 			if t == e {
-				parent_bindings[i] = t;
+				parent_bindings[i] = Some(t);
 				continue;
 			}
 			match (t, e) {
 				(StackResult::Value(l), StackResult::Value(r)) => {
 					let merged = self.merge_values(l, r, outputs);
-					parent_bindings[i] = StackResult::Value(merged);
+					parent_bindings[i] = Some(StackResult::Value(merged));
 				}
 				(StackResult::Never, other) | (other, StackResult::Never) => {
-					parent_bindings[i] = other;
+					parent_bindings[i] = Some(other);
 				}
 				_ => {}
 			}
@@ -2023,21 +2342,26 @@ impl<'mir> Builder<'mir> {
 				}
 				phi
 			}
-			(NodeType::Aggregate(_), NodeType::Aggregate(_)) => {
-				let (l_fields, aggregate_index) =
-					self.extract_aggregate_fields(l);
-				let (r_fields, _) = self.extract_aggregate_fields(r);
-				let agg_def = &self.mir.aggregates[aggregate_index as usize];
-				let phi_fields: Box<[_]> = l_fields
-					.iter()
-					.zip(r_fields.iter())
-					.zip(agg_def.values.iter())
-					.map(|((&lf, &rf), &ft)| {
+			(NodeType::Aggregate(aggregate_index), NodeType::Aggregate(_)) => {
+				// One phi per differing WASM value, then reassemble the shape.
+				let l_scalars = self.scalars_of(l);
+				let r_scalars = self.scalars_of(r);
+				let merged: Vec<DataNodeIndex> = l_scalars
+					.into_iter()
+					.zip(r_scalars)
+					.map(|(lf, rf)| {
 						if lf == rf {
 							return lf;
 						}
-						let ty = ScalarType::try_from(ft)
-							.expect("aggregate field must be scalar");
+						let ty = match self.func.data_nodes[lf as usize]
+							.kind
+							.node_type()
+						{
+							NodeType::Scalar(ty) => ty,
+							NodeType::Aggregate(_) => {
+								unreachable!("scalars_of yields only scalars")
+							}
+						};
 						let phi = self.node(DataNodeKind::Phi {
 							left: lf,
 							right: rf,
@@ -2049,94 +2373,200 @@ impl<'mir> Builder<'mir> {
 						phi
 					})
 					.collect();
-				self.node(DataNodeKind::Aggregate {
-					fields: phi_fields,
-					aggregate_index,
-				})
+				self.aggregate_from_scalars(aggregate_index, &merged)
 			}
 			_ => panic!("type mismatch when merging branch values"),
 		}
 	}
 
-	/// Return the data node for aggregate field `phys_index` (physical/MIR
-	/// order), whether that field is scalar or itself a nested aggregate.
+	/// Return the data node for aggregate field `phys_index` (physical order),
+	/// whether that field is scalar or itself a nested aggregate.
 	///
-	/// `DataNodeKind::AggregateGet::ty` can only ever hold a `ScalarType` —
-	/// there's no way to construct one that "returns an aggregate". That's
-	/// fine as long as `aggregate` is a known `Aggregate` literal: its
-	/// `fields` are already-built `DataNodeIndex`es, one per field, with
-	/// whatever `NodeType` each field actually has — nested-aggregate
-	/// fields included — so returning `fields[phys_index]` directly (the
-	/// same identity `self.node()` applies when folding a real
-	/// `AggregateGet` of a known `Aggregate`, see `node()` below) sidesteps
-	/// `AggregateGet` entirely and needs no scalar type at all.
+	/// When `aggregate` is a known `Aggregate` literal its `fields` are
+	/// already-built nodes with whatever `NodeType` each field actually has,
+	/// so returning `fields[phys_index]` directly sidesteps `AggregateGet`
+	/// entirely (the same identity `node()` applies when folding).
 	///
-	/// The fallback path (building a real `AggregateGet` node) only
-	/// tolerates a scalar field — `aggregate` being a non-literal (a `Phi`,
-	/// `LoopParam`, or `AggregateCallResult`) *and* the requested field
-	/// being a nested aggregate is not yet supported.
+	/// Otherwise — a `Phi`, `LoopParam` or `AggregateCallResult` — the field
+	/// is rebuilt out of per-scalar projections. A scalar field is one
+	/// `AggregateGet`; a nested field is one per scalar in its range, rewrapped
+	/// into an `Aggregate` node of the nested shape. This is why
+	/// `AggregateGet` is indexed by `ScalarIndex`: it never has to name
+	/// something that is not a single WASM value.
 	fn get_aggregate_field(
 		&mut self,
 		aggregate: DataNodeIndex,
 		aggregate_index: mir::AggregateIndex,
-		phys_index: usize,
+		phys_index: mir::PhysIndex,
 	) -> DataNodeIndex {
 		if let DataNodeKind::Aggregate { fields, .. } =
 			&self.func.data_nodes[aggregate as usize].kind
 		{
-			return fields[phys_index];
+			return fields[usize::from(phys_index)];
 		}
+		// Copied out of `self` so it keeps its own `'mir` lifetime — reborrowing
+		// through `self` would collide with the `&mut self` calls below.
+		let mir = self.mir;
+		let agg = &mir.aggregate(aggregate_index);
+		let range = agg.scalars.field_range(phys_index);
+		match agg.field(phys_index).ty {
+			mir::ValueType::Aggregate {
+				aggregate_index: nested,
+			} => {
+				let values: Vec<DataNodeIndex> = range
+					.map(|i| {
+						self.project_scalar(aggregate, mir::ScalarIndex::new(i))
+					})
+					.collect();
+				self.aggregate_from_scalars(nested, &values)
+			}
+			_ => self
+				.project_scalar(aggregate, mir::ScalarIndex::new(range.start)),
+		}
+	}
+
+	/// Build the `AggregateGet` naming a single WASM value of `aggregate`.
+	fn project_scalar(
+		&mut self,
+		aggregate: DataNodeIndex,
+		scalar: mir::ScalarIndex,
+	) -> DataNodeIndex {
+		let aggregate_index = self.aggregate_index_of(aggregate);
 		let ty = ScalarType::try_from(
-			self.mir.aggregates[aggregate_index as usize].values[phys_index],
+			self.mir.aggregate(aggregate_index).scalars.get(scalar).ty,
 		)
-		.expect(
-			"nested-aggregate field access on a non-literal aggregate \
-			 (e.g. a loop-carried or multi-return-call value) is not yet \
-			 supported",
-		);
+		.expect("a ScalarTable entry is scalar by construction");
 		self.node(DataNodeKind::AggregateGet {
 			aggregate,
-			field_index: phys_index as u32,
+			scalar,
 			ty,
 		})
 	}
 
-	/// Return the per-field data node indices for any aggregate node.
+	/// The aggregate shape carried by any aggregate-typed node.
+	fn aggregate_index_of(&self, node: DataNodeIndex) -> mir::AggregateIndex {
+		match self.func.data_nodes[node as usize].kind.node_type() {
+			NodeType::Aggregate(index) => index,
+			NodeType::Scalar(_) => panic!("expected an aggregate-typed node"),
+		}
+	}
+
+	/// One node per *physical field* of an aggregate node — a nested field
+	/// comes back as an `Aggregate` node, not as its constituent values.
 	///
-	/// For `Aggregate { fields }` the existing field nodes are returned
-	/// directly. For `AggregateCallResult` — which has no concrete fields —
-	/// a fresh field node is synthesized for each field via
-	/// `get_aggregate_field` (a real `AggregateGet` for scalar fields, since
-	/// those get nodes do not fold and remain visible to the scheduler,
-	/// which reads them from `node_to_aggregate_locals`; nested-aggregate
-	/// fields of a call result are not yet supported, same caveat as
-	/// `get_aggregate_field` itself).
-	fn extract_aggregate_fields(
+	/// For consumers that recurse structurally, field by field (`merge_switch_slot`).
+	/// Anything that needs one slot per WASM value — loop params, phis, call
+	/// results, signatures — wants [`Builder::scalars_of`] instead; a field is
+	/// not a value.
+	fn fields_of(&mut self, node: DataNodeIndex) -> Box<[DataNodeIndex]> {
+		let aggregate_index = self.aggregate_index_of(node);
+		let count = self.mir.aggregate(aggregate_index).field_count();
+		(0..count as u32)
+			.map(mir::PhysIndex::new)
+			.map(|phys| self.get_aggregate_field(node, aggregate_index, phys))
+			.collect()
+	}
+
+	/// Decompose an aggregate node into one node per WASM value, in
+	/// `mir::ScalarTable` order.
+	///
+	/// The only supported way to take an aggregate apart. Consumers needing
+	/// one slot per value — loop params, phis, call results — come through
+	/// here rather than walking `Aggregate::fields`, because a field is not a
+	/// value: a nested field is several, a zero-sized field is none.
+	fn scalars_of(&mut self, node: DataNodeIndex) -> Vec<DataNodeIndex> {
+		let mut out = Vec::new();
+		self.collect_scalars(node, &mut out);
+		out
+	}
+
+	fn collect_scalars(
 		&mut self,
 		node: DataNodeIndex,
-	) -> (Box<[DataNodeIndex]>, mir::AggregateIndex) {
+		out: &mut Vec<DataNodeIndex>,
+	) {
+		let mir = self.mir;
 		match self.func.data_nodes[node as usize].kind.clone() {
 			DataNodeKind::Aggregate {
 				fields,
 				aggregate_index,
-			} => (fields, aggregate_index),
+			} => {
+				let agg = &mir.aggregate(aggregate_index);
+				for (field, &field_node) in agg.fields.iter().zip(fields.iter())
+				{
+					match field.ty {
+						mir::ValueType::Unit | mir::ValueType::Never => {}
+						mir::ValueType::Aggregate { .. } => {
+							self.collect_scalars(field_node, out)
+						}
+						_ => out.push(field_node),
+					}
+				}
+			}
+			// No field sub-nodes — the values live on the multi-return stack,
+			// so each one has to be named by an explicit projection.
 			DataNodeKind::AggregateCallResult { aggregate_index } => {
-				let n =
-					self.mir.aggregates[aggregate_index as usize].values.len();
-				let fields: Box<[_]> = (0..n)
-					.map(|i| self.get_aggregate_field(node, aggregate_index, i))
-					.collect();
-				(fields, aggregate_index)
+				let count = mir.aggregate(aggregate_index).scalars.len();
+				out.extend((0..count as u32).map(|i| {
+					self.project_scalar(node, mir::ScalarIndex::new(i))
+				}));
 			}
 			_ => panic!("expected aggregate node"),
 		}
 	}
 
-	/// Recursively store an aggregate value's *leaf* scalar fields through a
-	/// pointer, at successively accumulated byte offsets. A field whose own
-	/// type is itself an aggregate is walked into (offset accumulating)
-	/// rather than stored as a single (nonsensical — `MemAccess` has no
-	/// notion of "store a whole nested struct") memory access.
+	/// Rebuild an aggregate of shape `aggregate_index` from one node per WASM
+	/// value, inverting `scalars_of`.
+	///
+	/// `values` holds exactly this shape's scalars. Each field owns a
+	/// *contiguous* run of them, so a nested field recurses on its own
+	/// subslice — there is no cursor to keep in sync between siblings. Built
+	/// bottom-up, so a pure node's operands always have lower indices than the
+	/// node itself, which is what
+	/// `local_dominance::verify_operand_index_ordering` checks. Goes through
+	/// `node()` so CSE still applies, which is what lets `patch_loop_binding`
+	/// compare a rebuilt aggregate against the original by identity.
+	fn aggregate_from_scalars(
+		&mut self,
+		aggregate_index: mir::AggregateIndex,
+		values: &[DataNodeIndex],
+	) -> DataNodeIndex {
+		let mir = self.mir;
+		let agg = &mir.aggregate(aggregate_index);
+		debug_assert_eq!(
+			values.len(),
+			agg.scalars.len(),
+			"value count must match the aggregate's scalar count"
+		);
+		let mut fields = Vec::with_capacity(agg.field_count());
+		for (i, field) in agg.fields.iter().enumerate() {
+			let range = agg.scalars.field_range(mir::PhysIndex::new(i as u32));
+			let owned = &values[range.start as usize..range.end as usize];
+			fields.push(match field.ty {
+				mir::ValueType::Aggregate {
+					aggregate_index: nested,
+				} => self.aggregate_from_scalars(nested, owned),
+				mir::ValueType::Unit | mir::ValueType::Never => unreachable!(
+					"a zero-sized aggregate field owns no value to rebuild \
+					 from; `DataNodeKind::Aggregate::fields` cannot represent \
+					 one yet"
+				),
+				_ => owned[0],
+			});
+		}
+		self.node(DataNodeKind::Aggregate {
+			fields: fields.into_boxed_slice(),
+			aggregate_index,
+		})
+	}
+
+	/// Store an aggregate value through a pointer, one memory access per WASM
+	/// value.
+	///
+	/// `MemAccess` has no notion of "store a whole nested struct", so this has
+	/// to reach the individual scalars. It used to recurse the field tree
+	/// accumulating offsets; the `ScalarTable` already holds each scalar's
+	/// offset relative to the aggregate base, so it is now a flat zip.
 	fn emit_aggregate_store(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2146,47 +2576,26 @@ impl<'mir> Builder<'mir> {
 		aggregate_index: mir::AggregateIndex,
 		memory: crate::ast::DefId,
 	) {
-		let (fields, _) = self.extract_aggregate_fields(value_node);
-		for i in 0..fields.len() {
-			let field_offset =
-				self.mir.aggregates[aggregate_index as usize].offsets[i];
-			let field_mir_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			let offset = base_offset + field_offset;
-			match field_mir_ty {
-				mir::Type::Aggregate {
-					aggregate_index: nested_index,
-				} => {
-					self.emit_aggregate_store(
-						block_idx,
-						address,
-						offset,
-						fields[i],
-						nested_index,
-						memory,
-					);
-				}
-				_ => {
-					let access = MemAccess::from_mir(field_mir_ty);
-					self.push_stmt(
-						block_idx,
-						ControlNode::PointerStore {
-							address,
-							offset,
-							value: fields[i],
-							memory,
-							access,
-						},
-					);
-				}
-			}
+		let values = self.scalars_of(value_node);
+		let mir = self.mir;
+		let scalars = &mir.aggregate(aggregate_index).scalars;
+		debug_assert_eq!(values.len(), scalars.len());
+		for (&value, scalar) in values.iter().zip(scalars.iter()) {
+			self.push_stmt(
+				block_idx,
+				ControlNode::PointerStore {
+					address,
+					offset: base_offset + scalar.offset,
+					value,
+					memory,
+					access: MemAccess::from_mir(scalar.ty),
+				},
+			);
 		}
 	}
 
-	/// Recursively load an aggregate's *leaf* scalar fields through a
-	/// pointer, re-wrapping them into (possibly nested) `Aggregate` nodes
-	/// matching the aggregate's own field structure. Mirrors
-	/// `emit_aggregate_store`.
+	/// Load an aggregate through a pointer, one memory access per WASM value,
+	/// then reassemble the shape. Mirrors `emit_aggregate_store`.
 	fn build_aggregate_load(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2195,49 +2604,28 @@ impl<'mir> Builder<'mir> {
 		aggregate_index: mir::AggregateIndex,
 		memory: crate::ast::DefId,
 	) -> DataNodeIndex {
-		let n = self.mir.aggregates[aggregate_index as usize].values.len();
-		let mut fields = Vec::with_capacity(n);
-		for i in 0..n {
-			let field_offset =
-				self.mir.aggregates[aggregate_index as usize].offsets[i];
-			let field_mir_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			let offset = base_offset + field_offset;
-			let field_node = match field_mir_ty {
-				mir::Type::Aggregate {
-					aggregate_index: nested_index,
-				} => self.build_aggregate_load(
+		let mir = self.mir;
+		let scalars = &mir.aggregate(aggregate_index).scalars;
+		let values: Vec<DataNodeIndex> = scalars
+			.iter()
+			.map(|scalar| {
+				let access = MemAccess::from_mir(scalar.ty);
+				let result = self
+					.node(DataNodeKind::PointerLoadResult { address, access });
+				self.push_stmt(
 					block_idx,
-					address,
-					offset,
-					nested_index,
-					memory,
-				),
-				_ => {
-					let access = MemAccess::from_mir(field_mir_ty);
-					let result = self.node(DataNodeKind::PointerLoadResult {
+					ControlNode::PointerLoad {
 						address,
+						offset: base_offset + scalar.offset,
+						result,
+						memory,
 						access,
-					});
-					self.push_stmt(
-						block_idx,
-						ControlNode::PointerLoad {
-							address,
-							offset,
-							result,
-							memory,
-							access,
-						},
-					);
-					result
-				}
-			};
-			fields.push(field_node);
-		}
-		self.node(DataNodeKind::Aggregate {
-			fields: fields.into_boxed_slice(),
-			aggregate_index,
-		})
+					},
+				);
+				result
+			})
+			.collect();
+		self.aggregate_from_scalars(aggregate_index, &values)
 	}
 
 	/// Merge two `StackResult`s at a control-flow join. `Never` defers to the
@@ -2263,7 +2651,7 @@ impl<'mir> Builder<'mir> {
 	fn build_block_exprs(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		expressions: &[mir::Expression],
 	) -> StackResult {
 		let mut result = StackResult::Unit;
@@ -2285,7 +2673,7 @@ impl<'mir> Builder<'mir> {
 	fn build_binary(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		expr: &mir::Expression,
 		lhs: &mir::Expression,
 		rhs: &mir::Expression,
@@ -2328,7 +2716,7 @@ impl<'mir> Builder<'mir> {
 	fn build_cmp(
 		&mut self,
 		block_idx: BlockIndex,
-		bindings: &mut Vec<StackResult>,
+		bindings: &mut Vec<Option<StackResult>>,
 		expr: &mir::Expression,
 		lhs: &mir::Expression,
 		rhs: &mir::Expression,
@@ -2357,38 +2745,36 @@ impl<'mir> Builder<'mir> {
 		StackResult::Value(self.node(kind))
 	}
 
-	/// Flat index into `data_bindings` for a MIR (scope_index, local_index)
-	/// pair.
-	#[inline]
-	fn flat_index(
-		&self,
-		scope_index: mir::ScopeIndex,
-		local_index: mir::LocalIndex,
-	) -> usize {
-		(self.locals_offsets[scope_index as usize] + local_index) as usize
-	}
-
-	fn ensure_bindings_capacity(
-		&self,
-		bindings: &mut Vec<StackResult>,
-		len: usize,
-	) {
-		if bindings.len() < len {
-			bindings.resize(len, StackResult::Unit);
+	/// Reads binding slot `idx`, falling back to a fresh type default —
+	/// never memoized back into `bindings` — if this local was never
+	/// actually written on this particular build path (e.g. code reachable
+	/// only through a branch that traps/never executes at runtime, but
+	/// still gets built). `None` must keep meaning "not yet declared" for
+	/// every other consumer (divergence-merge, `create_loop_params`/
+	/// `create_join_params`): writing the default back here would make a
+	/// scope-private local look outer-visible just because one path
+	/// happened to read it before writing it.
+	fn read_binding(
+		&mut self,
+		bindings: &[Option<StackResult>],
+		idx: usize,
+	) -> StackResult {
+		match bindings[idx] {
+			Some(v) => v,
+			None => self.default_value(self.mir_func.locals[idx].ty),
 		}
 	}
 
-	fn default_value(&mut self, ty: mir::Type) -> StackResult {
+	fn default_value(&mut self, ty: mir::ValueType) -> StackResult {
 		match ty {
-			mir::Type::Unit | mir::Type::Never => StackResult::Unit,
-			mir::Type::Aggregate { aggregate_index } => {
-				let field_types: Vec<mir::Type> = self.mir.aggregates
-					[aggregate_index as usize]
-					.values
-					.to_vec();
-				let fields: Box<[_]> = field_types
+			mir::ValueType::Unit | mir::ValueType::Never => StackResult::Unit,
+			mir::ValueType::Aggregate { aggregate_index } => {
+				let mir = self.mir;
+				let agg = &mir.aggregate(aggregate_index);
+				let fields: Box<[_]> = agg
+					.fields
 					.iter()
-					.map(|&ft| self.default_value(ft).unwrap_value())
+					.map(|field| self.default_value(field.ty).unwrap_value())
 					.collect();
 				StackResult::Value(self.node(DataNodeKind::Aggregate {
 					fields,
@@ -2417,23 +2803,50 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
+	/// If `aggregate` is a literal `Aggregate`, the node already holding the
+	/// value at `scalar`. Descends through nested aggregates, rebasing the
+	/// scalar index to each level, so a projection never survives as a node
+	/// when the value it names is already in hand.
+	fn fold_scalar_projection(
+		&self,
+		aggregate: DataNodeIndex,
+		scalar: mir::ScalarIndex,
+	) -> Option<DataNodeIndex> {
+		let DataNodeKind::Aggregate {
+			fields,
+			aggregate_index,
+		} = &self.func.data_nodes[aggregate as usize].kind
+		else {
+			return None;
+		};
+		let agg = self.mir.aggregate(*aggregate_index);
+		let owner = agg.scalars.owner(scalar);
+		let field_node = fields[usize::from(owner)];
+		match agg.field(owner).ty {
+			mir::ValueType::Aggregate { .. } => {
+				let start = agg.scalars.field_range(owner).start;
+				let relative = mir::ScalarIndex::new(u32::from(scalar) - start);
+				self.fold_scalar_projection(field_node, relative)
+			}
+			_ => Some(field_node),
+		}
+	}
+
 	// ── Node construction ─────────────────────────────────────────────────────
 
 	/// The primary way to create a node. Applies algebraic simplifications
 	/// then interns via CSE. Call `func.intern_node` directly only when the
 	/// kind is already canonical (e.g. a freshly computed `Int` constant).
 	fn node(&mut self, kind: DataNodeKind) -> DataNodeIndex {
-		// AggregateGet of a known Aggregate returns the field directly.
+		// AggregateGet of a known Aggregate returns the holding node directly.
 		if let DataNodeKind::AggregateGet {
-			aggregate,
-			field_index,
-			..
+			aggregate, scalar, ..
 		} = &kind
 		{
-			if let DataNodeKind::Aggregate { fields, .. } =
-				&self.func.data_nodes[*aggregate as usize].kind
+			if let Some(folded) =
+				self.fold_scalar_projection(*aggregate, *scalar)
 			{
-				return fields[*field_index as usize];
+				return folded;
 			}
 		}
 
@@ -2790,5 +3203,170 @@ impl<'mir> Builder<'mir> {
 			} => (*scope_index, expressions),
 			_ => panic!("expected Block expression"),
 		}
+	}
+}
+
+/// Marks `out[scope_index] = true` for every `ExprKind::Break { scope_index,
+/// .. }` reachable from `expr`. Walked exhaustively over every `ExprKind`
+/// variant that can hold a nested `Expression` — mirrors
+/// `mir::inlining::Rebaser::rebase`'s identical full recursive-descent shape
+/// (same file's `inline_expr` is the same shape again), just read-only and
+/// recording instead of rewriting.
+///
+/// `Continue` is deliberately not collected here: TIR guarantees every
+/// `Continue` always targets a loop scope (see
+/// `tir::builder::control::build_continue_expression`), so its target is
+/// never a block-join candidate — only `Break` can reach a plain block.
+fn collect_break_targets(expr: &mir::Expression, out: &mut [bool]) {
+	match &expr.kind {
+		ExprKind::Break { scope_index, value } => {
+			out[usize::from(*scope_index)] = true;
+			if let Some(v) = value {
+				collect_break_targets(v, out);
+			}
+		}
+		ExprKind::LocalSet { value, .. }
+		| ExprKind::AggregateSet { value, .. }
+		| ExprKind::Drop { value }
+		| ExprKind::GlobalSet { value, .. }
+		| ExprKind::Neg { value }
+		| ExprKind::Sqrt { value }
+		| ExprKind::Abs { value }
+		| ExprKind::Floor { value }
+		| ExprKind::Ceil { value }
+		| ExprKind::Trunc { value }
+		| ExprKind::Nearest { value }
+		| ExprKind::BitNot { value }
+		| ExprKind::Eqz { value }
+		| ExprKind::I64ExtendI32S { value }
+		| ExprKind::I64ExtendI32U { value }
+		| ExprKind::I32WrapI64 { value }
+		| ExprKind::F32ConvertI32 { value }
+		| ExprKind::F32ConvertU32 { value }
+		| ExprKind::F32ConvertI64 { value }
+		| ExprKind::F32ConvertU64 { value }
+		| ExprKind::F64ConvertI32 { value }
+		| ExprKind::F64ConvertU32 { value }
+		| ExprKind::F64ConvertI64 { value }
+		| ExprKind::F64ConvertU64 { value }
+		| ExprKind::I32TruncF32 { value }
+		| ExprKind::U32TruncF32 { value }
+		| ExprKind::I32TruncF64 { value }
+		| ExprKind::U32TruncF64 { value }
+		| ExprKind::I64TruncF32 { value }
+		| ExprKind::U64TruncF32 { value }
+		| ExprKind::I64TruncF64 { value }
+		| ExprKind::U64TruncF64 { value }
+		| ExprKind::F64PromoteF32 { value }
+		| ExprKind::F32DemoteF64 { value }
+		| ExprKind::I32ReinterpretF32 { value }
+		| ExprKind::F32ReinterpretI32 { value }
+		| ExprKind::I64ReinterpretF64 { value }
+		| ExprKind::F64ReinterpretI64 { value }
+		| ExprKind::PointerLoad { pointer: value, .. }
+		| ExprKind::MemoryGrow { delta: value, .. } => {
+			collect_break_targets(value, out)
+		}
+		ExprKind::Loop { block: value, .. } => {
+			collect_break_targets(value, out)
+		}
+		ExprKind::Block { expressions, .. } => {
+			for e in expressions.iter() {
+				collect_break_targets(e, out);
+			}
+		}
+		ExprKind::Return { value } => {
+			if let Some(v) = value {
+				collect_break_targets(v, out);
+			}
+		}
+		ExprKind::Add { left, right }
+		| ExprKind::Sub { left, right }
+		| ExprKind::Mul { left, right }
+		| ExprKind::Div { left, right }
+		| ExprKind::Rem { left, right }
+		| ExprKind::And { left, right }
+		| ExprKind::Or { left, right }
+		| ExprKind::Eq { left, right }
+		| ExprKind::NotEq { left, right }
+		| ExprKind::Less { left, right }
+		| ExprKind::LessEq { left, right }
+		| ExprKind::Greater { left, right }
+		| ExprKind::GreaterEq { left, right }
+		| ExprKind::BitAnd { left, right }
+		| ExprKind::BitOr { left, right }
+		| ExprKind::BitXor { left, right }
+		| ExprKind::LeftShift { left, right }
+		| ExprKind::RightShift { left, right }
+		| ExprKind::Min { left, right }
+		| ExprKind::Max { left, right }
+		| ExprKind::Copysign { left, right }
+		| ExprKind::PointerStore {
+			pointer: left,
+			value: right,
+			..
+		} => {
+			collect_break_targets(left, out);
+			collect_break_targets(right, out);
+		}
+		ExprKind::MemoryFill { dst, val, len, .. } => {
+			collect_break_targets(dst, out);
+			collect_break_targets(val, out);
+			collect_break_targets(len, out);
+		}
+		ExprKind::MemoryCopy { dst, src, len, .. } => {
+			collect_break_targets(dst, out);
+			collect_break_targets(src, out);
+			collect_break_targets(len, out);
+		}
+		ExprKind::Aggregate { values } => {
+			for e in values.iter() {
+				collect_break_targets(e, out);
+			}
+		}
+		ExprKind::Call { callee, arguments } => {
+			collect_break_targets(callee, out);
+			for a in arguments.iter() {
+				collect_break_targets(a, out);
+			}
+		}
+		ExprKind::IfElse {
+			condition,
+			then_block,
+			else_block,
+		} => {
+			collect_break_targets(condition, out);
+			collect_break_targets(then_block, out);
+			if let Some(e) = else_block {
+				collect_break_targets(e, out);
+			}
+		}
+		ExprKind::Switch {
+			selector,
+			cases,
+			default,
+		} => {
+			collect_break_targets(selector, out);
+			for (_, body) in cases.iter() {
+				collect_break_targets(body, out);
+			}
+			if let Some(d) = default {
+				collect_break_targets(d, out);
+			}
+		}
+		ExprKind::Noop
+		| ExprKind::Bool { .. }
+		| ExprKind::Function { .. }
+		| ExprKind::Int { .. }
+		| ExprKind::Float { .. }
+		| ExprKind::Global { .. }
+		| ExprKind::Unreachable
+		| ExprKind::MemoryOffset { .. }
+		| ExprKind::MemoryIndex { .. }
+		| ExprKind::MemorySize { .. }
+		| ExprKind::StaticPointer { .. }
+		| ExprKind::LocalGet { .. }
+		| ExprKind::AggregateGet { .. }
+		| ExprKind::Continue { .. } => {}
 	}
 }

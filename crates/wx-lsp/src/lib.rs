@@ -34,8 +34,8 @@ use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::ast;
 use wx_compiler::ast::TextSpan;
 use wx_compiler::tir::{
-	ImplTarget, ItemAttribute, ModuleDeclarationKind, SourceSpan, TIR,
-	TypeParamInfo, TypeParamOwner,
+	ImplTarget, ItemAttribute, NamespaceKind, SourceSpan, TIR, TypeParamDef,
+	TypeParamOwner,
 };
 use wx_compiler::vfs::{
 	self, AbsolutePath, FileId, FileSource, NativeFileSource,
@@ -497,13 +497,13 @@ async fn handle_command(
 				// dependency like `std` needs `std`'s own package here, or
 				// `namespace_name` names things from the wrong package's
 				// perspective.
-				let from = compiled.tir.modules.namespaces[usize::from(
-					compiled.tir.modules.file_namespaces[file_id.as_usize()],
+				let from = compiled.tir.defs.namespaces[usize::from(
+					compiled.tir.defs.file_namespaces[file_id.as_usize()],
 				)]
-				.package;
+				.package_id;
 				let text = symbol_hover_text(
 					&compiled.tir,
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					from,
 					&info.kind,
@@ -741,7 +741,7 @@ async fn handle_command(
 					let formatted = trace.step("render", || {
 						wx_fmt::format(
 							&module.ast,
-							&graph.interner,
+							&graph.strings,
 							source,
 							config,
 						)
@@ -798,15 +798,15 @@ async fn handle_command(
 				let func = &compiled.tir.items.functions[fi];
 				// The function's own package, not the compilation's overall
 				// root — see the matching fix in the `Hover` handler above.
-				let from = compiled.tir.modules.namespaces
+				let from = compiled.tir.defs.namespaces
 					[usize::from(func.namespace)]
-				.package;
+				.package_id;
 				let fmt = compiled.tir.formatter(
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					from,
 				);
-				let interner = &compiled.graph.interner;
+				let interner = &compiled.graph.strings;
 
 				let name = interner.resolve(func.name.inner).unwrap();
 				let mut label = format!("fn {name}(");
@@ -974,7 +974,7 @@ async fn handle_command(
 				let completion_start = web_time::Instant::now();
 				let items = completion::completion_items(
 					&compiled.tir,
-					&compiled.graph.interner,
+					&compiled.graph.strings,
 					&compiled.graph.packages,
 					&compiled.symbol_index,
 					file_id,
@@ -1786,7 +1786,7 @@ fn compile_root(
 	trace: &mut Trace,
 ) -> CompiledRoot {
 	let tir = trace.step("typecheck", || TIR::build(&mut graph));
-	let symbol_index = build_symbol_index(&tir, &graph.interner);
+	let symbol_index = build_symbol_index(&tir, &graph.strings);
 	CompiledRoot {
 		graph,
 		tir,
@@ -2155,9 +2155,9 @@ fn push_type_params(
 	s: &mut String,
 	tir: &TIR,
 	interner: &ast::StringInterner,
-	packages: &[vfs::PackageGraph],
+	packages: &[vfs::Package],
 	from: vfs::PackageId,
-	type_params: &[TypeParamInfo],
+	type_params: &[TypeParamDef],
 ) {
 	if type_params.is_empty() {
 		return;
@@ -2168,9 +2168,7 @@ fn push_type_params(
 			s.push_str(", ");
 		}
 		s.push_str(interner.resolve(tp.name.inner).unwrap());
-		let has_bounds =
-			!tp.bounds.traits.is_empty() || tp.bounds.typeset.is_some();
-		if has_bounds {
+		if !tp.bounds.traits.is_empty() {
 			s.push_str(": ");
 			let fmt = tir.formatter(interner, packages, from);
 			s.push_str(&fmt.display_bounds(&tp.bounds).unwrap_or_default());
@@ -2287,7 +2285,7 @@ fn leading_doc_comment(source: &str, anchor_offset: u32) -> Option<String> {
 fn symbol_hover_text(
 	tir: &TIR,
 	interner: &ast::StringInterner,
-	packages: &[vfs::PackageGraph],
+	packages: &[vfs::Package],
 	from: vfs::PackageId,
 	kind: &SymbolKind,
 ) -> Option<String> {
@@ -2450,21 +2448,19 @@ fn symbol_hover_text(
 			Some(format!("{enum_name}::{variant_name}"))
 		}
 		SymbolKind::Namespace(ns_idx) => {
-			let ns = tir.modules.namespaces.get(usize::from(*ns_idx))?;
-			match ns.declaration {
-				ModuleDeclarationKind::Module(decl_idx) => {
+			let ns = tir.defs.namespaces.get(usize::from(*ns_idx))?;
+			match ns.kind {
+				NamespaceKind::Module(decl_idx) => {
 					let decl =
-						tir.modules.module_decls.get(usize::from(decl_idx))?;
+						tir.defs.module_decls.get(usize::from(decl_idx))?;
 					let name = interner.resolve(decl.name.inner).unwrap();
 					let pub_prefix =
 						if decl.pub_span.is_some() { "pub " } else { "" };
 					Some(format!("{pub_prefix}mod {name}"))
 				}
-				ModuleDeclarationKind::Import(import_idx) => {
-					let decl = tir
-						.modules
-						.import_decls
-						.get(usize::from(import_idx))?;
+				NamespaceKind::Import(import_idx) => {
+					let decl =
+						tir.defs.import_decls.get(usize::from(import_idx))?;
 					let external =
 						interner.resolve(decl.external_name.inner).unwrap();
 					match &decl.internal_name {
@@ -2481,7 +2477,7 @@ fn symbol_hover_text(
 				// A package has no name of its own — show it as the package
 				// this hover is rendered from calls it (or, for `crate`/
 				// `super` naming `from`'s own root, as the literal keyword).
-				ModuleDeclarationKind::Package(_) => {
+				NamespaceKind::Package(_) => {
 					let name =
 						tir.namespace_name(*ns_idx, packages, from, interner);
 					Some(format!("package {name}"))
@@ -2489,34 +2485,43 @@ fn symbol_hover_text(
 			}
 		}
 		SymbolKind::TypeParam { owner, param_index } => {
-			let param_index = *param_index as usize;
-			let tp: &TypeParamInfo = match owner {
+			let param_index = *param_index;
+			let tp: &TypeParamDef = match owner {
 				TypeParamOwner::Function(def_id) => {
 					let fi = usize::from(tir.items.function_index(*def_id)?);
 					let func = &tir.items.functions[fi];
 					let local = param_index
 						.checked_sub(func.inherited_type_param_count)?;
-					func.type_params.get(local)?
+					func.type_params.get(local as usize)?
 				}
 				TypeParamOwner::Struct(def_id) => {
 					let si = usize::from(tir.items.struct_index(*def_id)?);
-					tir.items.structs[si].type_params.get(param_index)?
+					tir.items.structs[si]
+						.type_params
+						.get(param_index as usize)?
 				}
 				TypeParamOwner::InherentImpl(block_idx) => tir
 					.items
 					.inherent_impls
 					.get(usize::from(*block_idx))?
 					.type_params
-					.get(param_index)?,
+					.get(param_index as usize)?,
 				TypeParamOwner::Trait(trait_idx) => {
 					let t = tir.items.traits.get(usize::from(*trait_idx))?;
 					&t.self_type_param
 				}
 				TypeParamOwner::TypeAlias(def_id) => {
 					let ai = usize::from(tir.items.type_alias_index(*def_id)?);
-					tir.items.type_aliases[ai].type_params.get(param_index)?
+					tir.items.type_aliases[ai]
+						.type_params
+						.get(param_index as usize)?
 				}
-				TypeParamOwner::TraitImpl(_) => return None,
+				TypeParamOwner::TraitImpl(impl_idx) => tir
+					.items
+					.trait_impls
+					.get(usize::from(*impl_idx))?
+					.type_params
+					.get(param_index as usize)?,
 			};
 			let name = interner.resolve(tp.name.inner).unwrap();
 			let bounds_str = fmt.display_bounds(&tp.bounds).unwrap_or_default();
@@ -2528,13 +2533,11 @@ fn symbol_hover_text(
 		}
 		SymbolKind::Label { .. } => None,
 		SymbolKind::Trait(def_id) => {
-			let trait_ = tir
-				.items
-				.traits
-				.get(usize::from(tir.items.trait_index(*def_id)?))?;
+			let trait_index = tir.items.trait_index(*def_id)?;
+			let trait_ = tir.items.traits.get(usize::from(trait_index))?;
 			let name = interner.resolve(trait_.name.inner).unwrap();
 			let bounds_str =
-				fmt.display_bounds(&trait_.bounds).unwrap_or_default();
+				fmt.display_supertraits(trait_index).unwrap_or_default();
 			if bounds_str.is_empty() {
 				Some(format!("trait {name}"))
 			} else {
@@ -2547,7 +2550,23 @@ fn symbol_hover_text(
 				.typesets
 				.get(usize::from(tir.items.typeset_index(*def_id)?))?;
 			let name = interner.resolve(typeset.name.inner).unwrap();
-			Some(format!("typeset {name} {{ ... }}"))
+			let pub_prefix = if typeset.pub_span.is_some() {
+				"pub "
+			} else {
+				""
+			};
+			// Bounds written after the `:` become supertraits of the
+			// typeset's compiler-generated backing trait.
+			let bounds_str = fmt
+				.display_supertraits(typeset.trait_index)
+				.unwrap_or_default();
+			if bounds_str.is_empty() {
+				Some(format!("{pub_prefix}typeset {name} {{ ... }}"))
+			} else {
+				Some(format!(
+					"{pub_prefix}typeset {name}: {bounds_str} {{ ... }}"
+				))
+			}
 		}
 		SymbolKind::TypeAlias(def_id) => {
 			let ai = usize::from(tir.items.type_alias_index(*def_id)?);
@@ -2606,7 +2625,8 @@ fn symbol_hover_text(
 				.items
 				.traits
 				.get(usize::from(tir.items.trait_index(*trait_id)?))?;
-			let at = trait_.assoc_types.get(assoc_name)?;
+			let at = &tir.items.associated_types
+				[usize::from(trait_.associated_type(*assoc_name)?)];
 			let name = interner.resolve(*assoc_name).unwrap();
 			let bounds_str = fmt.display_bounds(&at.bounds).unwrap_or_default();
 			if bounds_str.is_empty() {

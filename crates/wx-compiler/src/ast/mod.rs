@@ -1,39 +1,13 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
-use string_interner::symbol::SymbolU32;
+use string_interner::symbol::{Symbol, SymbolU32};
 
 use crate::{
-	diagnostics::DiagnosticCode,
+	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	vfs::{self, FileId},
 };
 
 #[cfg(test)]
 mod tests;
-
-#[derive(Copy, Clone, PartialEq)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct TextSpan {
-	pub start: u32,
-	pub end: u32,
-}
-
-impl TextSpan {
-	pub fn new(start: u32, end: u32) -> TextSpan {
-		debug_assert!(end >= start);
-		TextSpan { start, end }
-	}
-
-	#[inline]
-	pub fn extract_str<'a>(&self, source: &'a str) -> &'a str {
-		&source[self.start as usize..self.end as usize]
-	}
-}
-
-impl From<TextSpan> for core::ops::Range<usize> {
-	fn from(val: TextSpan) -> Self {
-		val.start as usize..val.end as usize
-	}
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CommentKind {
@@ -1018,10 +992,11 @@ pub enum Expression {
 	Int {
 		value: u64,
 	},
-	/// `1.0`
-	Float {
-		value: f64,
-	},
+	/// `1.0` / `3.4e2`. Carries no payload — the text is recovered from the
+	/// span and parsed against the *resolved target type* in TIR
+	/// (`coerce_untyped_float_expr`), because the correct rounding (f32 vs f64)
+	/// isn't known until then. Same span-only treatment as `Char` / `String`.
+	Float,
 	/// `({expr})` — transparent grouping, same type as inner
 	Grouping {
 		value: Box<Spanned<Expression>>,
@@ -1205,13 +1180,38 @@ pub struct MatchArm {
 
 /// One segment of a `::` path, with optional turbofish type args.
 /// `Point` → `PathSegment { ident: "Point", type_args: [] }`
-/// `Point::<i32>` → `PathSegment { ident: "Point", type_args: [i32] }`
+/// `Point<i32>` → `PathSegment { ident: "Point", type_args: [i32] }`. The
+/// spelling of `type_args` depends on which parser produced the segment —
+/// bare `<...>` from `parse_type_path`, turbofish `::<...>` from
+/// `parse_value_path` — never both; empty when no type args are provided.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
-	/// Turbofish args (`::<T, U>`). Empty when no type args are provided.
 	pub type_args: Box<[Spanned<TypeExpression>]>,
+}
+
+/// A parsed, non-empty `::`-separated path — `i32`, `module::Type`,
+/// `Point<i32>`. Its own type rather than a bare `Box<[PathSegment]>`
+/// specifically so its span can be a real method: Rust doesn't allow an
+/// inherent impl on `[PathSegment]` itself, only on a named local type, and
+/// a stored `Spanned` wrapper around the box would just duplicate what
+/// `span()` recomputes on demand from the segments themselves.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct Path {
+	pub segments: Box<[PathSegment]>,
+}
+
+impl Path {
+	/// The span of the whole path, from its first segment's identifier to
+	/// its last — not including any trailing generic arguments.
+	pub fn span(&self) -> TextSpan {
+		TextSpan::new(
+			self.segments.first().unwrap().ident.span.start,
+			self.segments.last().unwrap().ident.span.end,
+		)
+	}
 }
 
 /// The `<Type as Trait>` clause of a qualified path (`<Type as
@@ -1315,10 +1315,18 @@ pub enum Ownership {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum TypeExpression {
-	/// `_` — explicit inference placeholder; resolved to `TypeIndex::INFER`.
+	/// `_` — explicit inference placeholder; type-resolution context decides
+	/// whether it stays `INFER` or is rejected as `ERROR`.
 	Infer,
-	/// `i32`, `module::Type`, `module::Wrapper::<T>` — a flat path of segments.
+	/// `i32`, `module::Type`, `Point<i32>`, `module::Wrapper<T>` — a flat path
+	/// of segments; any segment (including the first) may carry bare
+	/// `<...>` generic arguments. Turbofish is never accepted in type
+	/// position, only in expression position (see `parse_value_path`).
 	Path(Box<[PathSegment]>),
+	/// `(T, U, V)` or `()`
+	Tuple {
+		elements: Box<[Spanned<TypeExpression>]>,
+	},
 	/// `fn(i32, i32) -> i32`
 	Function {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
@@ -1340,10 +1348,6 @@ pub enum TypeExpression {
 		inner: Box<Spanned<TypeExpression>>,
 		size: Spanned<usize>,
 	},
-	/// `(T, U, V)` or `()`
-	Tuple {
-		elements: Box<[Spanned<TypeExpression>]>,
-	},
 	/// `heap::*u8`, `heap::&[i32]` — memory-tagged pointer/slice/array.
 	/// The memory is always a single-segment path naming the memory
 	/// declaration; the inner is a Pointer, Slice, or Array type, and so
@@ -1351,11 +1355,6 @@ pub enum TypeExpression {
 	MemoryTagged {
 		memory: Box<[PathSegment]>,
 		inner: Box<Spanned<TypeExpression>>,
-	},
-	/// `Point<i32>` — generic type application with positional type arguments.
-	GenericApplication {
-		name: Spanned<SymbolU32>,
-		args: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
 	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
 	/// which trait's item is meant, disambiguating a name that would
@@ -1383,13 +1382,28 @@ pub struct PatternField {
 	pub pattern: Option<Spanned<Pattern>>,
 }
 
-/// One entry inside a `Path::{ ... }` pattern body. `SeparatedGroup`'s
-/// `item_handler` is a plain `fn` pointer that yields exactly one item, so the
-/// `..` rest marker has to come back through the same channel as a field and
-/// get partitioned out afterwards — that way `..` still benefits from the
-/// group's separator handling and error recovery.
-enum StructPatternItem {
+/// One entry inside a `Path::{ ... }` pattern body, exactly as written.
+/// `SeparatedGroup`'s `item_handler` is a plain `fn` pointer that yields
+/// exactly one item, so the `..` rest marker has to come back through the
+/// same channel as a field — that's the only reason this sum type exists.
+/// The parser does *not* collapse the sequence (e.g. assume there's at most
+/// one `Rest`, or that its position is meaningless): it hands the raw
+/// sequence to TIR exactly as parsed, and TIR is the one that decides what a
+/// duplicate or misplaced `..` means.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum StructPatternItem {
 	Field(PatternField),
+	Rest,
+}
+
+/// One entry inside a `Path(...)` tuple-struct pattern body — the positional
+/// analogue of [`StructPatternItem`], same "raw sequence, no parser-side
+/// assumptions" rationale.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum TupleStructPatternItem {
+	Element(Pattern),
 	Rest,
 }
 
@@ -1410,13 +1424,23 @@ pub enum Pattern {
 	/// `Name::{ field, other: pat, ... }` or `module::Name::{ field, .. }` —
 	/// the `::{` mirrors `Expression::StructInit`'s syntax rather than Rust's
 	/// bare `Name { .. }`, so a pattern and a literal for the same struct read
-	/// the same way.
+	/// the same way. `items` is the raw parsed sequence (see
+	/// [`StructPatternItem`]) — how many `Rest` entries it holds and where is
+	/// a semantic question TIR answers, not a parse-time assumption.
 	Struct {
 		path: Box<[PathSegment]>,
-		fields: Box<[Separated<Spanned<PatternField>>]>,
-		/// Span of a trailing `..`. `None` means the pattern must bind every
-		/// field of the struct.
-		rest: Option<TextSpan>,
+		items: Box<[Separated<Spanned<StructPatternItem>>]>,
+	},
+	/// `Name(pat, pat, ...)` or `module::Name(pat, ..)` — destructures a
+	/// tuple struct, mirroring its `Name(1, 2)` construction syntax the way
+	/// `Struct`'s `::{ }` mirrors `Expression::StructInit`'s. `elements` is
+	/// the raw parsed sequence (see [`TupleStructPatternItem`]); unlike the
+	/// named-field form, a tuple struct's positions are meaningful, so where
+	/// a `Rest` sits among `elements` is not incidental — TIR decides what a
+	/// duplicate or a given position means.
+	TupleStruct {
+		path: Box<[PathSegment]>,
+		elements: Box<[Separated<Spanned<TupleStructPatternItem>>]>,
 	},
 }
 
@@ -1601,13 +1625,12 @@ pub struct FunctionSignature {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum UseTree {
 	/// `*` — every visible name in the namespace walked to so far.
-	Glob,
+	Glob { segment: Spanned<SymbolU32> },
 	/// A single imported name, optionally renamed: `add`, `add as plus`.
 	/// Carries its own `DefId` — this leaf is what binds a local name, so
 	/// it is what `claim_name_binding` and `item_lookup` key on.
 	Name {
-		id: DefId,
-		name: Spanned<SymbolU32>,
+		segment: Spanned<SymbolU32>,
 		alias: Option<Spanned<SymbolU32>>,
 	},
 	/// One `::`-separated segment and whatever follows it.
@@ -1620,7 +1643,10 @@ pub enum UseTree {
 	/// matches `ExportEntry`'s shape. Nothing reads the separator spans: a
 	/// `use` group is formatted on one line, so it never emits a trailing
 	/// comma the way a broken `export` block does.
-	Group(Box<[Separated<Spanned<UseTree>>]>),
+	Group {
+		segment: Spanned<SymbolU32>,
+		branches: Spanned<Box<[Separated<Spanned<UseTree>>]>>,
+	},
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1660,6 +1686,7 @@ pub struct ImportEntry {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct EnumVariant {
+	pub id: DefId,
 	pub name: Spanned<SymbolU32>,
 	pub value: Option<Box<Spanned<Expression>>>,
 }
@@ -1688,7 +1715,7 @@ impl DefIdGenerator {
 	}
 
 	#[inline]
-	pub fn generate(&mut self) -> DefId {
+	pub fn next_id(&mut self) -> DefId {
 		let id = self.next_id;
 		self.next_id += 1;
 		DefId(id)
@@ -1731,9 +1758,9 @@ pub enum Item {
 		entries: Box<[Separated<Spanned<ExportEntry>>]>,
 	},
 	Import {
-		module: Spanned<SymbolU32>,
-		alias: Option<Spanned<SymbolU32>>,
-		entries: Box<[Separated<Spanned<ImportEntry>>]>,
+		external_name: TextSpan,
+		internal_name: Spanned<SymbolU32>,
+		items: Spanned<Box<[Separated<Spanned<ImportEntry>>]>>,
 	},
 	Enum {
 		id: DefId,
@@ -1747,7 +1774,7 @@ pub enum Item {
 	InherentImpl {
 		id: DefId,
 		type_params: Box<[TypeParam]>,
-		target: Box<Spanned<TypeExpression>>,
+		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
@@ -1755,17 +1782,32 @@ pub enum Item {
 		id: DefId,
 		type_params: Box<[TypeParam]>,
 		/// Plain path to the trait, e.g. `module::Trait`.
-		trait_name: Box<[PathSegment]>,
-		target: Box<Spanned<TypeExpression>>,
+		trait_name: Path,
+		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
-	Struct {
+	/// `struct Point { x: i32, y: i32 }`
+	RecordStruct {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		type_params: Box<[TypeParam]>,
 		fields: Box<[Separated<Spanned<StructField>>]>,
+	},
+	/// `struct Point(i32, i32);` — positional fields, no names. A genuinely
+	/// different item from [`Item::RecordStruct`] rather than an alternate
+	/// field-list shape on the same variant: the two have different
+	/// construction syntax (`Point(1, 2)` vs. `Point::{ x: 1, y: 2 }`) and
+	/// destructuring syntax (see [`Pattern::TupleStruct`]), and a tuple
+	/// field has no name to carry at all.
+	TupleStruct {
+		id: DefId,
+		pub_span: Option<TextSpan>,
+		attributes: Box<[Attribute]>,
+		name: Spanned<SymbolU32>,
+		type_params: Box<[TypeParam]>,
+		fields: Box<[Separated<Spanned<TupleField>>]>,
 	},
 	Memory {
 		id: DefId,
@@ -1784,7 +1826,7 @@ pub enum Item {
 	Module {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		items: Box<[Separated<Spanned<Item>>]>,
+		items: Spanned<Box<[Separated<Spanned<Item>>]>>,
 	},
 	ModuleDeclaration {
 		pub_span: Option<TextSpan>,
@@ -1799,13 +1841,20 @@ pub enum Item {
 		supertraits: Option<Spanned<BoundExpression>>,
 		items: Box<[Separated<Spanned<TraitItem>>]>,
 	},
-	/// `typeset Name { T1, T2, ... }` — a closed compile-time set of concrete types.
+	/// `typeset Name: A + B { T1, T2, ... }` — a closed compile-time set of
+	/// concrete types. The optional bound clause after `:` applies to every
+	/// member: each member must satisfy `A + B`, and a body generic over the
+	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
-		members: Box<[Separated<Spanned<TypeExpression>>]>,
+		bounds: Option<Spanned<BoundExpression>>,
+		/// `SeparatedGroup` always wraps each item in `Spanned<T>`; `Path`'s
+		/// own `span()` makes that wrapper redundant here, but there's no
+		/// avoiding it without changing `SeparatedGroup` itself.
+		members: Box<[Separated<Spanned<Path>>]>,
 	},
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
@@ -1840,6 +1889,15 @@ pub struct StructField {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
+/// One element of a [`Item::TupleStruct`]'s field list — `StructField` minus
+/// the name, since a tuple field has none.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct TupleField {
+	pub pub_span: Option<TextSpan>,
+	pub ty: Box<Spanned<TypeExpression>>,
+}
+
 impl Item {
 	pub fn is_block_like(&self) -> bool {
 		match self {
@@ -1849,7 +1907,7 @@ impl Item {
 			| Item::Enum { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. }
-			| Item::Struct { .. }
+			| Item::RecordStruct { .. }
 			| Item::Module { .. }
 			| Item::Trait { .. }
 			| Item::TypeSet { .. } => true,
@@ -1859,6 +1917,7 @@ impl Item {
 			| Item::FunctionDeclaration { .. }
 			| Item::ModuleDeclaration { .. }
 			| Item::TypeAlias { .. }
+			| Item::TupleStruct { .. }
 			| Item::Use { .. } => false,
 		}
 	}
@@ -1876,7 +1935,8 @@ impl Item {
 			| Item::Enum { attributes, .. }
 			| Item::TypeAlias { attributes, .. }
 			| Item::Memory { attributes, .. }
-			| Item::Struct { attributes, .. } => {
+			| Item::RecordStruct { attributes, .. }
+			| Item::TupleStruct { attributes, .. } => {
 				*attributes = attrs;
 			}
 			Item::Export { .. }
@@ -1961,101 +2021,102 @@ impl From<BinaryOp> for BindingPower {
 	}
 }
 
-#[derive(Clone, Copy)]
-pub enum Keyword {
-	Export,
-	Import,
-	Local,
-	Global,
-	Mut,
-	Enum,
-	Fn,
-	Loop,
-	Break,
-	Continue,
-	Return,
-	If,
-	Else,
-	As,
-	Unreachable,
-	True,
-	False,
-	Impl,
-	SelfKw,
-	Struct,
-	Pub,
-	Memory,
-	Const,
-	Mod,
-	Trait,
-	For,
-	SelfType,
-	Type,
-	Typeset,
-	Match,
-	/// `_` — wildcard in patterns, inference placeholder in types, discard in
-	/// value position.  Kept as a keyword so all three uses share one token.
-	Underscore,
-	Use,
-	Where,
-	/// `crate` — a path root, resolved to a real `SymbolKind::Module` entry
-	/// every namespace is pre-populated with at creation (see
-	/// `tir::builder::create_module_namespace` and the package-root setup
-	/// in `tir::builder::build`), not special-cased in the parser beyond
-	/// being accepted as ordinary path-segment text.
-	Crate,
-	/// `super` — same story as `Crate`, one parent-hop per namespace.
-	Super,
-}
-
-impl TryFrom<&str> for Keyword {
-	type Error = ();
-
-	fn try_from(text: &str) -> Result<Self, Self::Error> {
-		match text {
-			"local" => Ok(Keyword::Local),
-			"export" => Ok(Keyword::Export),
-			"import" => Ok(Keyword::Import),
-			"global" => Ok(Keyword::Global),
-			"mut" => Ok(Keyword::Mut),
-			"return" => Ok(Keyword::Return),
-			"fn" => Ok(Keyword::Fn),
-			"if" => Ok(Keyword::If),
-			"else" => Ok(Keyword::Else),
-			"enum" => Ok(Keyword::Enum),
-			"loop" => Ok(Keyword::Loop),
-			"break" => Ok(Keyword::Break),
-			"continue" => Ok(Keyword::Continue),
-			"as" => Ok(Keyword::As),
-			"unreachable" => Ok(Keyword::Unreachable),
-			"true" => Ok(Keyword::True),
-			"false" => Ok(Keyword::False),
-			"impl" => Ok(Keyword::Impl),
-			"self" => Ok(Keyword::SelfKw),
-			"struct" => Ok(Keyword::Struct),
-			"pub" => Ok(Keyword::Pub),
-			"memory" => Ok(Keyword::Memory),
-			"const" => Ok(Keyword::Const),
-			"mod" => Ok(Keyword::Mod),
-			"trait" => Ok(Keyword::Trait),
-			"for" => Ok(Keyword::For),
-			"Self" => Ok(Keyword::SelfType),
-			"type" => Ok(Keyword::Type),
-			"typeset" => Ok(Keyword::Typeset),
-			"match" => Ok(Keyword::Match),
-			"_" => Ok(Keyword::Underscore),
-			"use" => Ok(Keyword::Use),
-			"where" => Ok(Keyword::Where),
-			"crate" => Ok(Keyword::Crate),
-			"super" => Ok(Keyword::Super),
-			_ => Err(()),
+macro_rules! define_keywords {
+	(
+		$(
+			$(#[$meta:meta])*
+			$variant:ident => $text:literal
+		),+ $(,)?
+	) => {
+		#[derive(Clone, Copy)]
+		pub enum Keyword {
+			$(
+				$(#[$meta])*
+				$variant,
+			)+
 		}
-	}
+
+		impl TryFrom<&str> for Keyword {
+			type Error = ();
+
+			fn try_from(text: &str) -> Result<Self, <Keyword as TryFrom<&str>>::Error> {
+				match text {
+					$( $text => Ok(Keyword::$variant), )+
+					_ => Err(()),
+				}
+			}
+		}
+
+		impl Keyword {
+			/// A fresh interner with every keyword string pre-interned, in
+			/// declaration order, so each keyword's raw index lines up with
+			/// what [`Keyword::symbol`] fabricates directly from the enum
+			/// discriminant. Any interner backing a compilation must be
+			/// built from this rather than `StringInterner::new()` — one
+			/// that skips this seeding step will hand out those same raw
+			/// indices to the first ordinary identifiers it interns instead.
+			pub(crate) fn create_interner() -> StringInterner {
+				const KEYWORDS: &[&str] = &[$($text),+];
+				let mut strings = StringInterner::with_capacity(KEYWORDS.len());
+				for keyword in KEYWORDS {
+					strings.get_or_intern(keyword);
+				}
+				strings
+			}
+		}
+	};
 }
 
 pub type StringInterner = string_interner::StringInterner<
 	string_interner::backend::StringBackend<SymbolU32>,
 >;
+
+define_keywords! {
+	Error => "<error>",
+	Export => "export",
+	Import => "import",
+	Local => "local",
+	Global => "global",
+	Mut => "mut",
+	Enum => "enum",
+	Fn => "fn",
+	Loop => "loop",
+	Break => "break",
+	Continue => "continue",
+	Return => "return",
+	If => "if",
+	Else => "else",
+	As => "as",
+	Unreachable => "unreachable",
+	True => "true",
+	False => "false",
+	Impl => "impl",
+	SelfLower => "self",
+	SelfPascal => "Self",
+	Struct => "struct",
+	Pub => "pub",
+	Memory => "memory",
+	Const => "const",
+	Mod => "mod",
+	Trait => "trait",
+	For => "for",
+	Type => "type",
+	Typeset => "typeset",
+	Match => "match",
+	Underscore => "_",
+	Use => "use",
+	Where => "where",
+	Crate => "crate",
+	Super => "super",
+}
+
+impl Keyword {
+	#[inline]
+	pub fn symbol(self) -> SymbolU32 {
+		SymbolU32::try_from_usize(self as usize)
+			.expect("keyword index always fits in a SymbolU32")
+	}
+}
 
 pub struct Parser<'input> {
 	source: &'input str,
@@ -2412,27 +2473,6 @@ impl<'ctx> Parser<'ctx> {
 		self.interner.get_or_intern(text)
 	}
 
-	/// Same as [`Self::intern_identifier`], for a `::`-path segment
-	/// specifically: `crate`/`super` are reserved everywhere else, but
-	/// legal here at any position — the resolver pre-populates every
-	/// namespace's own symbol table with `crate`/`super` entries
-	/// (`tir::builder::create_module_namespace` and the package-root setup
-	/// in `tir::builder::build`), so a path segment spelled `crate`/`super`
-	/// just needs to intern to the same text an ordinary reference would.
-	fn intern_path_segment(&mut self, span: TextSpan) -> SymbolU32 {
-		let text = span.extract_str(self.source);
-		if !matches!(
-			Keyword::try_from(text),
-			Ok(Keyword::Crate) | Ok(Keyword::Super) | Err(())
-		) {
-			self.ast
-				.diagnostics
-				.push(report_reserved_identifier(self.ast.file_id, span));
-		}
-
-		self.interner.get_or_intern(text)
-	}
-
 	fn parse_attributes(parser: &mut Parser) -> Result<Box<[Attribute]>, ()> {
 		let mut attrs = Vec::new();
 		loop {
@@ -2563,7 +2603,7 @@ impl<'ctx> Parser<'ctx> {
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let text = name_span.extract_str(parser.source);
 		match Keyword::try_from(text) {
-			Ok(Keyword::SelfKw) | Err(_) => {}
+			Ok(Keyword::SelfLower) | Err(_) => {}
 			Ok(_) => {
 				parser.ast.diagnostics.push(report_reserved_identifier(
 					parser.ast.file_id,
@@ -2774,51 +2814,6 @@ impl<'ctx> Parser<'ctx> {
 		Ok((args.into_boxed_slice(), close_span))
 	}
 
-	/// Parse `<GenericArg, ...>` — the angle-bracket arg list on a
-	/// `GenericApplication` type. Handles `>>` splitting so that
-	/// `Foo<Bar<T>>` parses without a space before the closing `>>`.
-	/// Parse `<T, U, ...>` — positional type arguments on a `GenericApplication`.
-	/// Handles `>>` splitting so that `Foo<Bar<T>>` parses without a space.
-	fn parse_generic_arg_list(
-		&mut self,
-	) -> Result<Spanned<Box<[Separated<Spanned<TypeExpression>>]>>, ()> {
-		let open_span = self.next_expect(Token::LeftArrow)?.span;
-		let mut args: Vec<Separated<Spanned<TypeExpression>>> = Vec::new();
-
-		let close_span = loop {
-			let peeked = self.lexer.peek();
-			if peeked.inner == Token::RightArrow {
-				break self.lexer.next().span;
-			}
-			if peeked.inner == Token::DoubleRightArrow {
-				break self.lexer.split_double_right_arrow();
-			}
-			if peeked.inner == Token::Eof {
-				self.ast.diagnostics.push(report_unclosed_delimiter(
-					UnclosedDelimiterDiagnostic {
-						file_id: self.ast.file_id,
-						open_span,
-						close_token: Token::RightArrow,
-						expected_close_span: peeked.span,
-					},
-				));
-				break peeked.span;
-			}
-
-			let ty = self.parse_type_expression()?;
-			let separator = self.lexer.next_if(Token::Comma).map(|t| t.span);
-			args.push(Separated {
-				inner: ty,
-				separator,
-			});
-		};
-
-		Ok(Spanned {
-			inner: args.into_boxed_slice(),
-			span: TextSpan::new(open_span.start, close_span.end),
-		})
-	}
-
 	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
 	/// following a type. Returns a `Spanned` whose span covers from `{`
 	/// through `}`. The `where` keyword must already be confirmed as the next
@@ -2891,54 +2886,47 @@ impl<'ctx> Parser<'ctx> {
 					attributes: Box::new([]),
 					signature: signature.inner,
 					block,
-					id: parser.id_generator.generate(),
+					id: parser.id_generator.next_id(),
 				},
 				None => Item::FunctionDeclaration {
 					pub_span: None,
 					attributes: Box::new([]),
 					signature: signature.inner,
-					id: parser.id_generator.generate(),
+					id: parser.id_generator.next_id(),
 				},
 			},
 			span,
 		})
 	}
 
-	/// Parse a `::` separated path with optional turbofish type args per segment.
-	/// Returns `Spanned<Box<[PathSegment]>>`.
-	fn parse_path_segments(
-		&mut self,
-	) -> Result<Spanned<Box<[PathSegment]>>, ()> {
-		let first_span = self.next_expect(Token::Identifier)?.span;
-		let first_sym = self.intern_path_segment(first_span);
+	/// Parse a path in expression/value position: a call-site path
+	/// (`math::add`), a constructor path, a qualified-path-expression
+	/// segment list. Generic arguments are only ever spelled as turbofish
+	/// (`::<T>`) — a bare `<` here would be ambiguous with the `<`/`>`
+	/// comparison operators, so it's left untouched for the expression
+	/// parser to consume. See `parse_type_path` for the type-directed twin,
+	/// which is the reverse: bare `<...>` only, no turbofish, since type
+	/// position has no such ambiguity to avoid.
+	fn parse_value_path(&mut self) -> Result<Path, ()> {
+		let first_ident = self.parse_path_ident()?;
 		let mut segments: Vec<PathSegment> = vec![PathSegment {
-			ident: Spanned {
-				inner: first_sym,
-				span: first_span,
-			},
+			ident: first_ident,
 			type_args: Box::new([]),
 		}];
-		let mut end = first_span.end;
 
 		while self.lexer.peek().inner == Token::ColonColon {
 			self.lexer.next(); // consume `::`
 			match self.lexer.peek().inner {
 				Token::LeftArrow => {
-					let (type_args, close_span) = self.parse_type_args()?;
+					let (type_args, _) = self.parse_type_args()?;
 					segments.last_mut().unwrap().type_args = type_args;
-					end = close_span.end;
 				}
 				Token::Identifier => {
-					let seg_span = self.next_expect(Token::Identifier)?.span;
-					let seg_sym = self.intern_path_segment(seg_span);
+					let ident = self.parse_path_ident()?;
 					segments.push(PathSegment {
-						ident: Spanned {
-							inner: seg_sym,
-							span: seg_span,
-						},
+						ident,
 						type_args: Box::new([]),
 					});
-					end = seg_span.end;
 				}
 				_ => {
 					// `::` consumed but no valid continuation — stop and let the caller handle it
@@ -2947,16 +2935,45 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let span = TextSpan::new(first_span.start, end);
-		Ok(Spanned {
-			inner: segments.into_boxed_slice(),
-			span,
+		Ok(Path {
+			segments: segments.into_boxed_slice(),
+		})
+	}
+
+	/// Parse a path in a type-directed position: an ordinary type
+	/// expression's name, a bound, a trait name, an impl target, or a
+	/// typeset member. Every segment — including the first — may carry
+	/// bare `<...>` generic arguments; turbofish is never accepted here
+	/// (see `parse_value_path` for why the two positions differ). Once a
+	/// segment carries generic arguments the path ends there — there is no
+	/// continuation past `Foo<T>::` in this style.
+	fn parse_type_path(&mut self) -> Result<Path, ()> {
+		let mut ident = self.parse_path_ident()?;
+		let mut segments: Vec<PathSegment> = Vec::new();
+		loop {
+			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
+			let has_args = self.lexer.peek().inner == Token::LeftArrow;
+			if has_args {
+				let (args, _) = self.parse_type_args()?;
+				type_args = args;
+			}
+			segments.push(PathSegment { ident, type_args });
+			if has_args || self.lexer.peek().inner != Token::ColonColon {
+				break;
+			}
+			self.lexer.next(); // consume `::`
+			ident = self.parse_path_ident()?;
+		}
+
+		Ok(Path {
+			segments: segments.into_boxed_slice(),
 		})
 	}
 
 	/// Parse a single bound: a path optionally followed by `where { ... }` bindings.
 	fn parse_bound(&mut self) -> Result<Spanned<BoundExpression>, ()> {
-		let path = self.parse_path_segments()?;
+		let path = self.parse_type_path()?;
+		let path_span = path.span();
 
 		let peeked = self.lexer.peek();
 		if peeked.inner == Token::Identifier
@@ -2965,10 +2982,10 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Keyword::Where)
 			) {
 			let bindings = self.parse_where_bindings()?;
-			let span = TextSpan::new(path.span.start, bindings.span.end);
+			let span = TextSpan::new(path_span.start, bindings.span.end);
 			return Ok(Spanned {
 				inner: BoundExpression::WithBindings {
-					path: Box::new(BoundExpression::Path(path.inner)),
+					path: Box::new(BoundExpression::Path(path.segments)),
 					bindings: bindings.inner,
 				},
 				span,
@@ -2976,8 +2993,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		Ok(Spanned {
-			inner: BoundExpression::Path(path.inner),
-			span: path.span,
+			inner: BoundExpression::Path(path.segments),
+			span: path_span,
 		})
 	}
 
@@ -3036,7 +3053,7 @@ impl<'ctx> Parser<'ctx> {
 					// pre-populates every namespace with (see
 					// `intern_path_segment`) — none of the three are ever
 					// reserved here, so they intern like ordinary text.
-					Ok(Keyword::SelfType)
+					Ok(Keyword::SelfPascal)
 					| Ok(Keyword::Crate)
 					| Ok(Keyword::Super) => {
 						let tok = self.lexer.next();
@@ -3053,59 +3070,36 @@ impl<'ctx> Parser<'ctx> {
 				};
 				let first_span = first_tok.span;
 
-				// `Type<T>` — direct `<` without `::` → GenericApplication.
-				if self.lexer.peek().inner == Token::LeftArrow {
-					let args = self.parse_generic_arg_list()?;
-					let span = TextSpan::new(first_span.start, args.span.end);
-					return Ok(Spanned {
-						inner: TypeExpression::GenericApplication {
-							name: Spanned {
-								inner: first_sym,
-								span: first_span,
-							},
-							args: args.inner,
-						},
-						span,
-					});
-				}
-
-				// Greedy path: consume `::ident` and `::<T>` eagerly.
-				// When `::` is consumed but the next token is a non-path atom
-				// (e.g., `*`, `[`), this is a memory-tagged type (`heap::*T`).
-				let mut segments: Vec<PathSegment> = vec![PathSegment {
-					ident: Spanned {
-						inner: first_sym,
-						span: first_span,
-					},
-					type_args: Box::new([]),
-				}];
-				let mut path_end = first_span.end;
-
-				loop {
-					if self.lexer.peek().inner != Token::ColonColon {
-						break;
+				// Every segment — including this first one — may carry bare
+				// `<...>` generic arguments (`Type<T>`, `module::Wrapper<T>`);
+				// once a segment carries them the path ends there. `::`
+				// continues to another segment; `::` followed by neither an
+				// identifier nor `<` is a memory-tagged type (`heap::*T`).
+				let mut ident = Spanned {
+					inner: first_sym,
+					span: first_span,
+				};
+				let mut segments: Vec<PathSegment> = Vec::new();
+				let path_end = loop {
+					let mut type_args: Box<[Spanned<TypeExpression>]> =
+						Box::new([]);
+					let mut end = ident.span.end;
+					let has_args = self.lexer.peek().inner == Token::LeftArrow;
+					if has_args {
+						let (args, close_span) = self.parse_type_args()?;
+						type_args = args;
+						end = close_span.end;
+					}
+					segments.push(PathSegment { ident, type_args });
+					if has_args
+						|| self.lexer.peek().inner != Token::ColonColon
+					{
+						break end;
 					}
 					self.lexer.next(); // consume `::`
 					match self.lexer.peek().inner {
-						Token::LeftArrow => {
-							let (type_args, close_span) =
-								self.parse_type_args()?;
-							path_end = close_span.end;
-							segments.last_mut().unwrap().type_args = type_args;
-							break;
-						}
 						Token::Identifier => {
-							let seg_tok = self.lexer.next();
-							let seg_sym =
-								self.intern_path_segment(seg_tok.span);
-							path_end = seg_tok.span.end;
-							segments.push(PathSegment {
-								ident: Spanned {
-									inner: seg_sym,
-									span: seg_tok.span,
-								},
-								type_args: Box::new([]),
-							});
+							ident = self.parse_path_ident()?;
 						}
 						_ => {
 							// `::` consumed; non-identifier follows — memory-tagged type.
@@ -3121,7 +3115,7 @@ impl<'ctx> Parser<'ctx> {
 							});
 						}
 					}
-				}
+				};
 
 				let path_span = TextSpan::new(first_span.start, path_end);
 				Ok(Spanned {
@@ -3154,31 +3148,31 @@ impl<'ctx> Parser<'ctx> {
 		let self_type = self.parse_type_expression()?;
 		if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
-			let trait_path = self.parse_path_segments()?;
+			let trait_path = self.parse_type_path()?;
 			let close_span = self.expect_close_angle(open_span);
 			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = self.parse_type_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: TypeExpression::QualifiedPath {
 					root: QualifiedPathRoot {
 						self_type: Box::new(self_type),
-						trait_path: trait_path.inner,
+						trait_path: trait_path.segments,
 						span: TextSpan::new(open_span.start, close_span.end),
 					},
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
 		} else {
 			self.expect_close_angle(open_span);
 			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = self.parse_type_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: TypeExpression::Grouped {
 					inner: Box::new(self_type),
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
@@ -3581,31 +3575,31 @@ impl<'ctx> Parser<'ctx> {
 		let self_type = parser.parse_type_expression()?;
 		if matches!(parser.peek_keyword(), Some(Keyword::As)) {
 			parser.lexer.next(); // consume `as`
-			let trait_path = parser.parse_path_segments()?;
+			let trait_path = parser.parse_type_path()?;
 			let close_span = parser.expect_close_angle(open_span);
 			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = parser.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: Expression::QualifiedPath {
 					root: QualifiedPathRoot {
 						self_type: Box::new(self_type),
-						trait_path: trait_path.inner,
+						trait_path: trait_path.segments,
 						span: TextSpan::new(open_span.start, close_span.end),
 					},
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
 		} else {
 			parser.expect_close_angle(open_span);
 			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_path_segments()?;
-			let span = TextSpan::new(open_span.start, segments.span.end);
+			let segments = parser.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
 			Ok(Spanned {
 				inner: Expression::Grouped {
 					inner: Box::new(self_type),
-					segments: segments.inner,
+					segments: segments.segments,
 				},
 				span,
 			})
@@ -3619,8 +3613,8 @@ impl<'ctx> Parser<'ctx> {
 		let text = token.span.extract_str(parser.source);
 
 		match Keyword::try_from(text) {
-			Ok(Keyword::SelfKw)
-			| Ok(Keyword::SelfType)
+			Ok(Keyword::SelfLower)
+			| Ok(Keyword::SelfPascal)
 			| Ok(Keyword::Underscore)
 			| Ok(Keyword::Crate)
 			| Ok(Keyword::Super)
@@ -3935,27 +3929,28 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let token = parser.lexer.next();
-		let value = match token.inner {
-			Token::Float => {
-				token.span.extract_str(parser.source).parse::<f64>().ok()
-			}
-			_ => unreachable!(),
-		};
+		debug_assert!(matches!(token.inner, Token::Float));
 
-		let value = match value {
-			Some(value) => value,
-			None => {
-				parser.ast.diagnostics.push(report_invalid_float_literal(
-					parser.ast.file_id,
-					token.span,
-				));
-
-				0.0
-			}
-		};
+		// Syntactic validity only — `f64::from_str` and `f32::from_str` accept
+		// the identical grammar, so this rejects a malformed token (`1e`,
+		// `1e+`) without committing to a value. The literal's actual value is
+		// parsed against its resolved target type in TIR
+		// (`coerce_untyped_float_expr`), where f32-vs-f64 rounding is finally
+		// known.
+		if token
+			.span
+			.extract_str(parser.source)
+			.parse::<f64>()
+			.is_err()
+		{
+			parser.ast.diagnostics.push(report_invalid_float_literal(
+				parser.ast.file_id,
+				token.span,
+			));
+		}
 
 		Ok(Spanned {
-			inner: Expression::Float { value },
+			inner: Expression::Float,
 			span: token.span,
 		})
 	}
@@ -4573,9 +4568,9 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Parses the `::{ ... }` body of a struct pattern, with `path` already
-	/// consumed. Splits the parsed items into real fields plus the span of a
-	/// `..`, if one was written; where `..` sits among the fields carries no
-	/// meaning, so nothing here inspects its position.
+	/// consumed. Hands the raw parsed sequence straight to `Pattern::Struct`
+	/// — see [`StructPatternItem`] for why this doesn't collapse it into
+	/// separate fields/rest here.
 	fn parse_struct_pattern(
 		parser: &mut Parser,
 		path: Box<[PathSegment]>,
@@ -4590,29 +4585,54 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse(parser)?;
 
-		let mut fields: Vec<Separated<Spanned<PatternField>>> =
-			Vec::with_capacity(items.inner.len());
-		let mut rest: Option<TextSpan> = None;
-
-		for Separated { inner, separator } in items.inner.into_vec() {
-			match inner.inner {
-				StructPatternItem::Field(field) => fields.push(Separated {
-					inner: Spanned {
-						inner: field,
-						span: inner.span,
-					},
-					separator,
-				}),
-				StructPatternItem::Rest => rest = Some(inner.span),
-			}
-		}
-
 		let span = TextSpan::new(path_start, items.span.end);
 		Ok(Spanned {
 			inner: Pattern::Struct {
 				path,
-				fields: fields.into_boxed_slice(),
-				rest,
+				items: items.inner,
+			},
+			span,
+		})
+	}
+
+	fn parse_tuple_struct_pattern_item(
+		parser: &mut Parser,
+	) -> Result<Spanned<TupleStructPatternItem>, ()> {
+		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
+			return Ok(Spanned {
+				inner: TupleStructPatternItem::Rest,
+				span: dot_dot.span,
+			});
+		}
+		let pattern = Parser::parse_pattern(parser)?;
+		Ok(Spanned {
+			inner: TupleStructPatternItem::Element(pattern.inner),
+			span: pattern.span,
+		})
+	}
+
+	/// Parses the `(...)` body of a tuple-struct pattern, with `path` already
+	/// consumed — the positional analogue of `parse_struct_pattern`, same
+	/// "hand TIR the raw sequence" rationale.
+	fn parse_tuple_struct_pattern(
+		parser: &mut Parser,
+		path: Box<[PathSegment]>,
+	) -> Result<Spanned<Pattern>, ()> {
+		let path_start = path.first().unwrap().ident.span.start;
+		let items = SeparatedGroup {
+			open_token: Token::OpenParen,
+			close_token: Token::CloseParen,
+			separator_token: Token::Comma,
+			should_warn_missing_separator: None,
+			item_handler: Parser::parse_tuple_struct_pattern_item,
+		}
+		.parse(parser)?;
+
+		let span = TextSpan::new(path_start, items.span.end);
+		Ok(Spanned {
+			inner: Pattern::TupleStruct {
+				path,
+				elements: items.inner,
 			},
 			span,
 		})
@@ -4717,8 +4737,19 @@ impl<'ctx> Parser<'ctx> {
 					}
 				}
 
-				// The path never reached `::{`, so it can only be a binding —
-				// and a binding is a single plain name.
+				// `Path(...)` — tuple-struct pattern body. Checked before the
+				// "must be a plain binding" fallback below, same as `::{`
+				// is checked inside the loop, since a multi-segment path is
+				// legal here too (`module::Point(x, y)`).
+				if parser.lexer.peek().inner == Token::OpenParen {
+					return Parser::parse_tuple_struct_pattern(
+						parser,
+						segments.into(),
+					);
+				}
+
+				// The path never reached `::{` or `(`, so it can only be a
+				// binding — and a binding is a single plain name.
 				if segments.len() > 1 || !segments[0].type_args.is_empty() {
 					let span = TextSpan::new(
 						name_token.span.start,
@@ -4847,7 +4878,7 @@ impl<'ctx> Parser<'ctx> {
 				name,
 				ty,
 				value: Box::new(value),
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				attributes: Box::new([]),
 			},
 			span,
@@ -4871,7 +4902,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(const_span.start, value.span.end);
 		Ok(Spanned {
 			inner: Item::Const {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -4989,7 +5020,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Export {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				keyword_span: export_keyword.span,
 				entries: entries.inner,
 			},
@@ -5033,6 +5064,7 @@ impl<'ctx> Parser<'ctx> {
 
 					Ok(Spanned {
 						inner: EnumVariant {
+							id: parser.id_generator.next_id(),
 							name: Spanned {
 								inner: name_symbol,
 								span: name_token.span,
@@ -5050,7 +5082,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Enum {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				repr,
 				name: Spanned {
@@ -5081,7 +5113,7 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(type_span.start, ty.span.end);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
-						id: parser.id_generator.generate(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5112,7 +5144,7 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(const_span.start, value.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
-						id: parser.id_generator.generate(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5158,7 +5190,7 @@ impl<'ctx> Parser<'ctx> {
 				let method_span = TextSpan::new(fn_span.start, block.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Function {
-						id: parser.id_generator.generate(),
+						id: parser.id_generator.next_id(),
 						pub_span,
 						attributes: attrs,
 						signature: FunctionSignature {
@@ -5196,25 +5228,10 @@ impl<'ctx> Parser<'ctx> {
 			Box::new([])
 		};
 
-		let first_ty = Box::new(parser.parse_type_expression()?);
+		let first_path = parser.parse_type_path()?;
 		if let Some(Keyword::For) = parser.peek_keyword() {
 			parser.lexer.next(); // consume `for`
-			let target = Box::new(parser.parse_type_expression()?);
-
-			let trait_name = match first_ty.inner {
-				TypeExpression::Path(segments) => segments,
-				_ => {
-					parser.ast.diagnostics.push(
-						Diagnostic::error()
-							.with_message("expected a trait name")
-							.with_label(Label::primary(
-								parser.ast.file_id,
-								first_ty.span,
-							)),
-					);
-					return Err(());
-				}
-			};
+			let target = parser.parse_type_path()?;
 
 			let items = SeparatedGroup {
 				open_token: Token::OpenBrace,
@@ -5262,11 +5279,11 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
 				inner: Item::TraitImpl {
-					id: parser.id_generator.generate(),
+					id: parser.id_generator.next_id(),
 					type_params,
 					items: items.inner,
 					target,
-					trait_name,
+					trait_name: first_path,
 				},
 				span,
 			});
@@ -5286,10 +5303,10 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::InherentImpl {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				type_params,
 				items: items.inner,
-				target: first_ty,
+				target: first_path,
 			},
 			span,
 		})
@@ -5368,7 +5385,7 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::AssociatedType {
-									id: parser.id_generator.generate(),
+									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5404,7 +5421,7 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::Const {
-									id: parser.id_generator.generate(),
+									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5438,7 +5455,7 @@ impl<'ctx> Parser<'ctx> {
 
 							Ok(Spanned {
 								inner: TraitItem::Function {
-									id: parser.id_generator.generate(),
+									id: parser.id_generator.next_id(),
 									attributes,
 									signature: signature.inner,
 									body,
@@ -5468,7 +5485,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(trait_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::Trait {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5488,11 +5505,27 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		};
 
+		// Optional bound clause: `typeset Name: A + B { .. }` — mirrors a
+		// trait's supertrait list. The `where { .. }` bindings a single bound
+		// may carry are handled by `parse_bounds_expression`; the members
+		// brace that follows is unambiguous because that never continues past
+		// a `+`.
+		let bounds: Option<Spanned<BoundExpression>> =
+			if parser.lexer.next_if(Token::Colon).is_some() {
+				Some(parser.parse_bounds_expression()?)
+			} else {
+				None
+			};
+
 		let members = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
-			item_handler: |parser: &mut Parser| parser.parse_type_expression(),
+			item_handler: |parser: &mut Parser| {
+				let path = parser.parse_type_path()?;
+				let span = path.span();
+				Ok(Spanned { inner: path, span })
+			},
 			should_warn_missing_separator: None,
 		}
 		.parse(parser)?;
@@ -5500,14 +5533,23 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(typeset_span.start, members.span.end);
 		Ok(Spanned {
 			inner: Item::TypeSet {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
+				bounds,
 				members: members.inner,
 			},
 			span,
 		})
+	}
+
+	fn parse_struct_field_pub_span(parser: &mut Parser) -> Option<TextSpan> {
+		let peek = parser.lexer.peek();
+		match Keyword::try_from(peek.span.extract_str(parser.source)) {
+			Ok(Keyword::Pub) => Some(parser.lexer.next().span),
+			_ => None,
+		}
 	}
 
 	fn parse_struct_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
@@ -5522,19 +5564,58 @@ impl<'ctx> Parser<'ctx> {
 			Box::new([])
 		};
 
+		let name = Spanned {
+			inner: name_symbol,
+			span: name_span,
+		};
+
+		if parser.lexer.peek().inner == Token::OpenParen {
+			let fields = SeparatedGroup {
+				open_token: Token::OpenParen,
+				close_token: Token::CloseParen,
+				separator_token: Token::Comma,
+				item_handler:
+					|parser: &mut Parser| -> Result<Spanned<TupleField>, ()> {
+						let pub_span =
+							Parser::parse_struct_field_pub_span(parser);
+						let ty = parser.parse_type_expression()?;
+						let span = TextSpan::new(
+							pub_span.unwrap_or(ty.span).start,
+							ty.span.end,
+						);
+						Ok(Spanned {
+							inner: TupleField {
+								pub_span,
+								ty: Box::new(ty),
+							},
+							span,
+						})
+					},
+				should_warn_missing_separator: None,
+			}
+			.parse(parser)?;
+
+			let span = TextSpan::new(struct_span.start, fields.span.end);
+			return Ok(Spanned {
+				inner: Item::TupleStruct {
+					id: parser.id_generator.next_id(),
+					pub_span: None,
+					attributes: Box::new([]),
+					name,
+					type_params,
+					fields: fields.inner,
+				},
+				span,
+			});
+		}
+
 		let fields = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
 			item_handler:
 				|parser: &mut Parser| -> Result<Spanned<StructField>, ()> {
-					let peek = parser.lexer.peek();
-					let pub_span = match Keyword::try_from(
-						peek.span.extract_str(parser.source),
-					) {
-						Ok(Keyword::Pub) => Some(parser.lexer.next().span),
-						_ => None,
-					};
+					let pub_span = Parser::parse_struct_field_pub_span(parser);
 
 					let name_token = parser.next_expect(Token::Identifier)?;
 					let name_symbol = parser.intern_identifier(name_token.span);
@@ -5565,14 +5646,11 @@ impl<'ctx> Parser<'ctx> {
 
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
-			inner: Item::Struct {
-				id: parser.id_generator.generate(),
+			inner: Item::RecordStruct {
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
-				name: Spanned {
-					inner: name_symbol,
-					span: name_span,
-				},
+				name,
 				type_params,
 				fields: fields.inner,
 			},
@@ -5614,7 +5692,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(type_span.start, end);
 		Ok(Spanned {
 			inner: Item::TypeAlias {
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -5648,7 +5726,8 @@ impl<'ctx> Parser<'ctx> {
 			| Item::FunctionDeclaration { pub_span: span, .. }
 			| Item::Global { pub_span: span, .. }
 			| Item::Enum { pub_span: span, .. }
-			| Item::Struct { pub_span: span, .. }
+			| Item::RecordStruct { pub_span: span, .. }
+			| Item::TupleStruct { pub_span: span, .. }
 			| Item::Const { pub_span: span, .. }
 			| Item::Module { pub_span: span, .. }
 			| Item::ModuleDeclaration { pub_span: span, .. }
@@ -5698,7 +5777,7 @@ impl<'ctx> Parser<'ctx> {
 				attributes: Box::new([]),
 				name,
 				bound: kind,
-				id: parser.id_generator.generate(),
+				id: parser.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5731,7 +5810,7 @@ impl<'ctx> Parser<'ctx> {
 				mut_span,
 				name,
 				ty: Box::new(type_expr),
-				id: self.id_generator.generate(),
+				id: self.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5753,7 +5832,7 @@ impl<'ctx> Parser<'ctx> {
 			inner: ImportDeclaration::Memory {
 				name,
 				kind,
-				id: self.id_generator.generate(),
+				id: self.id_generator.next_id(),
 			},
 			span,
 		})
@@ -5776,7 +5855,7 @@ impl<'ctx> Parser<'ctx> {
 						external_name: None,
 						declaration: ImportDeclaration::Function {
 							signature: signature.inner,
-							id: parser.id_generator.generate(),
+							id: parser.id_generator.next_id(),
 						},
 					},
 					span: signature.span,
@@ -5857,7 +5936,7 @@ impl<'ctx> Parser<'ctx> {
 						inner: name_symbol,
 						span: name_span,
 					},
-					items: items.inner,
+					items,
 				},
 				span,
 			})
@@ -5892,108 +5971,150 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
+	fn parse_path_ident(&mut self) -> Result<Spanned<SymbolU32>, ()> {
+		let token = self.next_expect(Token::Identifier)?;
+		let text = token.span.extract_str(self.source);
+		let symbol = match Keyword::try_from(text) {
+			Ok(Keyword::Crate | Keyword::Super | Keyword::SelfLower)
+			| Err(_) => self.interner.get_or_intern(text),
+			Ok(kwd) => {
+				self.ast.diagnostics.push(report_reserved_identifier(
+					self.ast.file_id,
+					token.span,
+				));
+				kwd.symbol()
+			}
+		};
+		Ok(Spanned {
+			inner: symbol,
+			span: token.span,
+		})
+	}
+
 	/// One node of a `use` tree, recursing on `::` and `{ .. }`.
 	///
 	/// `a::b` is left-nested as `Path{a, Path{b, ..}}` rather than collected
 	/// into a flat prefix + leaf, because a `Group` can appear at any depth
 	/// (`a::{b::{c, d}, e}`) — there is no single prefix to collect.
 	fn parse_use_tree(parser: &mut Parser) -> Result<Spanned<UseTree>, ()> {
+		let segment = parser.parse_path_ident()?;
 		let token = parser.lexer.peek();
-
-		if token.inner == Token::Star {
-			let span = parser.lexer.next().span;
-			return Ok(Spanned {
-				inner: UseTree::Glob,
-				span,
-			});
-		}
-
-		if token.inner == Token::OpenBrace {
-			let group = SeparatedGroup {
-				open_token: Token::OpenBrace,
-				close_token: Token::CloseBrace,
-				separator_token: Token::Comma,
-				item_handler: Self::parse_use_tree,
-				should_warn_missing_separator: None,
+		if token.inner == Token::ColonColon {
+			_ = parser.lexer.next();
+			let token = parser.lexer.peek();
+			match token.inner {
+				Token::Star => {
+					let span = TextSpan::new(
+						segment.span.start,
+						parser.lexer.next().span.end,
+					);
+					return Ok(Spanned {
+						inner: UseTree::Glob { segment },
+						span,
+					});
+				}
+				Token::OpenBrace => {
+					let branches = SeparatedGroup {
+						open_token: Token::OpenBrace,
+						close_token: Token::CloseBrace,
+						separator_token: Token::Comma,
+						item_handler: Self::parse_use_tree,
+						should_warn_missing_separator: None,
+					}
+					.parse(parser)?;
+					let span =
+						TextSpan::new(segment.span.start, branches.span.end);
+					return Ok(Spanned {
+						inner: UseTree::Group { segment, branches },
+						span,
+					});
+				}
+				Token::Identifier => {
+					let rest = Parser::parse_use_tree(parser)?;
+					let span = TextSpan::new(segment.span.start, rest.span.end);
+					return Ok(Spanned {
+						inner: UseTree::Path {
+							segment,
+							rest: Box::new(rest),
+						},
+						span,
+					});
+				}
+				_ => unreachable!(),
 			}
-			.parse(parser)?;
-			return Ok(Spanned {
-				inner: UseTree::Group(group.inner),
-				span: group.span,
-			});
 		}
 
-		let name_token = parser.next_expect(Token::Identifier)?;
-		let name = Spanned {
-			inner: parser.intern_path_segment(name_token.span),
-			span: name_token.span,
-		};
+		let alias = if token.inner == Token::Identifier
+			&& let Ok(Keyword::As) =
+				Keyword::try_from(token.span.extract_str(parser.source))
+		{
+			_ = parser.lexer.next(); // consume "as"
+			let alias = parser.next_expect(Token::Identifier)?;
+			let alias_symbol = parser.intern_identifier(alias.span);
 
-		// `::` — this identifier is a segment, not the leaf.
-		if parser.lexer.peek().inner == Token::ColonColon {
-			parser.lexer.next(); // consume `::`
-			let rest = Self::parse_use_tree(parser)?;
-			return Ok(Spanned {
-				span: TextSpan::new(name.span.start, rest.span.end),
-				inner: UseTree::Path {
-					segment: name,
-					rest: Box::new(rest),
-				},
-			});
-		}
-
-		// Leaf: a name, optionally renamed. Unlike an export alias — which
-		// renames into the wasm ABI and so takes a string — this renames
-		// into wx's own scope, so it takes an identifier.
-		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
-			parser.lexer.next(); // consume `as`
-			let alias_token = parser.next_expect(Token::Identifier)?;
 			Some(Spanned {
-				inner: parser.intern_identifier(alias_token.span),
-				span: alias_token.span,
+				inner: alias_symbol,
+				span: alias.span,
 			})
 		} else {
 			None
 		};
-
-		Ok(Spanned {
-			span: TextSpan::new(
-				name.span.start,
-				alias.map_or(name.span.end, |a| a.span.end),
-			),
-			inner: UseTree::Name {
-				id: parser.id_generator.generate(),
-				name,
-				alias,
+		let span = TextSpan::new(
+			segment.span.start,
+			match alias {
+				Some(alias) => alias.span.end,
+				None => segment.span.end,
 			},
+		);
+		Ok(Spanned {
+			inner: UseTree::Name { segment, alias },
+			span,
 		})
 	}
 
 	fn parse_import_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let import_keyword = parser.lexer.next();
+		let external_name = parser.next_expect(Token::String)?.span;
 
-		let module_token = parser.next_expect(Token::String)?;
-		let module_symbol = parser.intern_identifier(module_token.span);
-		let module = Spanned {
-			inner: module_symbol,
-			span: module_token.span,
+		let token = parser.lexer.peek();
+		let internal_name = match token.inner {
+			Token::Identifier
+				if matches!(
+					Keyword::try_from(token.span.extract_str(parser.source)),
+					Ok(Keyword::As)
+				) =>
+			{
+				_ = parser.lexer.next(); // consume "as"
+
+				let alias_token = parser.next_expect(Token::Identifier)?;
+				let alias_symbol = parser.intern_identifier(alias_token.span);
+
+				Spanned {
+					inner: alias_symbol,
+					span: alias_token.span,
+				}
+			}
+			_ => {
+				parser.ast.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MissingImportAlias.code())
+						.with_message("import requires an `as` alias")
+						.with_label(
+							SourceSpan::new(parser.ast.file_id, token.span)
+								.primary_label()
+								.with_message("expected `as <name>` here"),
+						),
+				);
+
+				let recovery_point = token.span.start;
+				Spanned {
+					inner: Keyword::Error.symbol(),
+					span: TextSpan::new(recovery_point, recovery_point),
+				}
+			}
 		};
 
-		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
-			_ = parser.lexer.next(); // consume "as"
-
-			let alias_token = parser.next_expect(Token::Identifier)?;
-			let alias_symbol = parser.intern_identifier(alias_token.span);
-
-			Some(Spanned {
-				inner: alias_symbol,
-				span: alias_token.span,
-			})
-		} else {
-			None
-		};
-
-		let entries = SeparatedGroup {
+		let items = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::SemiColon,
@@ -6002,13 +6123,13 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse(parser)?;
 
-		let span = TextSpan::new(import_keyword.span.start, entries.span.end);
+		let span = TextSpan::new(import_keyword.span.start, items.span.end);
 
 		Ok(Spanned {
 			inner: Item::Import {
-				module,
-				alias,
-				entries: entries.inner,
+				external_name,
+				internal_name,
+				items,
 			},
 			span,
 		})

@@ -4,24 +4,24 @@ import "console" as console {
     fn log(message: &[u8]);
 }
 
-fn fibonacci(n: i32) -> i32 {
-    if n <= 1 { return n };
+// fn fibonacci(n: i32, b: i32, c: i32, d: i32, e: i32, h: i32) -> i32 {
+//     if n <= 1 { return n };
 
-    console::log("calculating fibonacci");
-    console::log("gewgew");
-    fibonacci(n - 1) + fibonacci(n - 2)
-}
+//     console::log("calculating fibonacci");
+//     console::log("gewgew");
+//     fibonacci(n - 1) + fibonacci(n - 2)
+// }
 
 fn fibonacci_iterative(mut n: i32) -> i32 {
-    if n <= 1 { return n }
+    if n <= 1 { return n };
 
     local mut a: i32 = 0;
     local mut b: i32 = 1;
     local mut c: i32 = 0;
 
     loop {
-        if n == 0 { break a }
-        if n == 1 { break b }
+        if n == 0 { break a };
+        if n == 1 { break b };
 
         c = a + b;
         a = b;
@@ -35,7 +35,59 @@ fn main() {
 }
 
 export {
-    fibonacci,
+    // fibonacci,
     fibonacci_iterative,
     main,
+}
+
+// struct Point {
+//     r: i32,
+//     g: i32,
+//     b: i32,
+// }
+
+// fn test() {
+//     Point({
+//         r: 5,
+//         g: 1,
+//         b: 1
+//     })
+//     Point(1, 2, 3)
+// }
+
+// fn Point(r: i32, g: i32, b: i32) -> Point {
+//     Point({ r, g, b })
+
+// struct Point(i32, i32);
+
+// fn test() -> Point {
+//     Point(5, 2)
+// }
+
+// variant Option<T> {
+//     Some(T),
+//     None,
+// }
+
+// fn test() -> Option<i32> {
+//     Option::Some(5)
+// }
+
+fn binary_search<
+    M: Memory where { Size: Sub + Add + Div + Eq },
+    T: Ord,
+>(arr: M::&[T], target: T) -> (bool, M::Size) {
+    local mut low: M::Size = 0;
+    local mut high = arr.len();
+
+    loop {
+        if low == high { return (false, 0) };
+
+        local mid = low + (high - low) / 2;
+        match arr[mid].cmp(target) {
+            Ordering::Less -> { low = mid + 1 },
+            Ordering::Greater -> { high = mid },
+            Ordering::Equal -> { return (true, mid) },
+        }
+    }
 }

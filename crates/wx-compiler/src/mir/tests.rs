@@ -279,6 +279,64 @@ fn test_inline_method_is_substituted() {
 	assert_eq!(case.mir.functions.len(), 1, "only `to_upper` should remain");
 }
 
+#[test]
+fn test_inline_function_with_early_return_produces_break_into_block() {
+	// `mir::inlining::inline_call` always wraps an inlined callee's body in
+	// a `BlockKind::Block` scope and rewrites every `Return` inside it to a
+	// `Break` targeting that wrapper — this is what used to crash `opt`
+	// (a plain block had no representation there at all). This test only
+	// confirms MIR itself produces that shape correctly for a callee whose
+	// `return` is inside an `if` (not just the callee's own tail position);
+	// the end-to-end execution confirmation lives in
+	// `codegen::tests::test_inline_function_with_early_return_executes_correctly`.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        fn classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub fn main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "only `main` should remain");
+
+	let main = &case.mir.functions[0];
+	fn contains_break(expr: &crate::mir::Expression) -> bool {
+		use crate::mir::ExprKind;
+		match &expr.kind {
+			ExprKind::Break { .. } => true,
+			ExprKind::Return { .. } => {
+				panic!("a Return should never survive inlining unrewritten")
+			}
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_break)
+			}
+			ExprKind::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => {
+				contains_break(condition)
+					|| contains_break(then_block)
+					|| else_block.as_deref().is_some_and(contains_break)
+			}
+			ExprKind::LocalSet { value, .. } => contains_break(value),
+			_ => false,
+		}
+	}
+	assert!(
+		contains_break(&main.block),
+		"classify's early `return` must have been rewritten to a `Break` \
+		 targeting the inliner's wrapper block"
+	);
+}
+
 // ── memory instructions
 // ───────────────────────────────────────────────────────
 
@@ -564,9 +622,8 @@ fn test_generic_trait_impl_abstract_dispatch_monomorphizes() {
 /// `impl<T> Container for Box<T> { type Item = Wrapper<T>; ... }` — the
 /// associated type's value is a *composite* (`Wrapper<T>`, not a bare `T`),
 /// so resolving `C::Item` for a monomorphized `C = Box<i32>` must
-/// substitute the impl's own `T` inside `Wrapper<T>`'s structure (via a
-/// `current_substitutions` swap in `lower_type_index`'s
-/// `AssocTypeProjection` arm), not just a top-level `TypeParam` leaf.
+/// instantiate the impl's own `T` inside `Wrapper<T>` under an impl-owned
+/// type environment, not just replace a top-level `TypeParam` leaf.
 #[test]
 fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 	let case = TestCase::new(indoc! {"
@@ -606,7 +663,7 @@ fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I32)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I32)
 		.expect("Wrapper<i32> aggregate with I32 field not found");
 	assert_eq!(agg.layout.size, 4);
 }
@@ -683,10 +740,12 @@ fn test_struct_layout_is_alignment_sorted() {
 
 	// The `dummy` function's first parameter is `Mixed`; its MIR type carries
 	// the aggregate index into `mir.aggregates`.
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -695,8 +754,119 @@ fn test_struct_layout_is_alignment_sorted() {
 	assert_eq!(agg.layout.size, 24);
 	assert_eq!(agg.layout.align, 8);
 	// Physical order: b(i64)@0, d(f64)@8, c(u32)@16, a(bool)@20
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 20]);
-	assert_eq!(&*agg.values, &[Type::I64, Type::F64, Type::U32, Type::Bool]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 20]);
+	assert_eq!(
+		types,
+		[
+			ValueType::I64,
+			ValueType::F64,
+			ValueType::U32,
+			ValueType::Bool
+		]
+	);
+}
+
+/// Three levels of nesting, each level alignment-sorted so that the nested
+/// field is reordered *ahead* of a scalar sibling. Pins two things that the
+/// opt/codegen layers both depend on and currently re-derive independently:
+///
+/// - a nested field is a single entry in `values`/`offsets`, so the physical
+///   field count says nothing about how many WASM values the aggregate needs;
+/// - `flatten_type_to_scalars` recurses through that nesting, so `Top` is
+///   *two* physical fields but *three* WASM scalars.
+///
+/// Anything caching a flattened view of an aggregate has to agree with
+/// `flatten_type_to_scalars` here, including the reordering.
+#[test]
+fn test_nested_struct_flattens_to_more_scalars_than_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn dummy(t: Top) -> Top { t }
+        export { dummy }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
+	let top_index = match case.mir.signatures[sig_index].params()[0] {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Top to lower to an aggregate"),
+	};
+
+	// Top: `mid` (align 8) sorts ahead of `flag` (align 1); 17B padded to 24.
+	let top = &case.mir.aggregates[top_index];
+	assert_eq!(top.layout.size, 24);
+	assert_eq!(top.layout.align, 8);
+	assert_eq!(top.fields[0].offset, 0);
+	assert_eq!(top.fields[1].offset, 16);
+	assert_eq!(top.fields[1].ty, ValueType::U8);
+	let mid_index = match top.fields[0].ty {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Top's first physical field to be Mid"),
+	};
+
+	// Mid: `deep` (align 8) sorts ahead of `tag` (align 1); 9B padded to 16.
+	let mid = &case.mir.aggregates[mid_index];
+	assert_eq!(mid.layout.size, 16);
+	assert_eq!(mid.layout.align, 8);
+	assert_eq!(mid.fields[0].offset, 0);
+	assert_eq!(mid.fields[1].offset, 8);
+	assert_eq!(mid.fields[1].ty, ValueType::U8);
+	let deep_index = match mid.fields[0].ty {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Mid's first physical field to be Deep"),
+	};
+
+	let deep = &case.mir.aggregates[deep_index];
+	assert_eq!(deep.layout.size, 8);
+	assert_eq!(deep.layout.align, 8);
+	assert_eq!(deep.fields[0].offset, 0);
+	assert_eq!(deep.fields[0].ty, ValueType::U64);
+
+	// Two physical fields, three WASM scalars — the counts diverge, and the
+	// scalar order follows the alignment-sorted physical order, not the
+	// declaration order (`flag` is declared first but flattens last).
+	assert_eq!(top.field_count(), 2);
+	assert_eq!(top.scalars.len(), 3);
+
+	// Offsets are absolute within `Top`, with every enclosing field folded in.
+	let scalar_offsets: Vec<u32> =
+		top.scalars.iter().map(|s| s.offset).collect();
+	assert_eq!(scalar_offsets, [0, 8, 16]);
+
+	// Each physical field owns a contiguous run: `mid` owns 0..2, `flag` 2..3.
+	assert_eq!(top.scalars.field_range(PhysIndex::new(0)), 0..2);
+	assert_eq!(top.scalars.field_range(PhysIndex::new(1)), 2..3);
+	assert_eq!(top.scalars.owner(ScalarIndex::new(0)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(1)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(2)), PhysIndex::new(1));
+
+	// The precomputed table must agree with a fresh recursive flatten — this
+	// is the invariant every opt/codegen consumer now relies on.
+	let scalars = crate::wasm::flatten_type_to_scalars(
+		ValueType::Aggregate {
+			aggregate_index: AggregateIndex::new(top_index as u32),
+		},
+		&case.mir.aggregates,
+	);
+	assert_eq!(
+		scalars,
+		vec![
+			crate::wasm::ScalarType::I64, // mid.deep.id
+			crate::wasm::ScalarType::I32, // mid.tag
+			crate::wasm::ScalarType::I32, // flag
+		]
+	);
 }
 
 #[test]
@@ -715,10 +885,12 @@ fn test_fixed_order_struct_keeps_declaration_order() {
     "});
 	assert!(case.tir.diagnostics.is_empty());
 
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -727,9 +899,21 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	// d(f64)@24 (padded) — no alignment-descending reordering.
 	assert_eq!(agg.layout.size, 32);
 	assert_eq!(agg.layout.align, 8);
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 24]);
-	assert_eq!(&*agg.values, &[Type::Bool, Type::I64, Type::U32, Type::F64]);
-	assert_eq!(&*agg.decl_to_phys, &[0, 1, 2, 3]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 24]);
+	assert_eq!(
+		types,
+		[
+			ValueType::Bool,
+			ValueType::I64,
+			ValueType::U32,
+			ValueType::F64
+		]
+	);
+	let phys: Vec<usize> =
+		(0..4).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [0, 1, 2, 3]);
 }
 
 #[test]
@@ -823,11 +1007,9 @@ fn test_different_type_args_produce_separate_mono_instances() {
 ///
 /// Root cause of the former stack overflow: type_args were forwarded raw to
 /// `MonoRegistry::get_or_insert`, so `wrap<TypeParam{0}>` was registered
-/// instead of `wrap<i32>`. When the worklist lowered it with
-/// `current_substitutions = [TypeParam{0}]`, `lower_type_index` entered
-/// infinite mutual recursion: TypeParam{0} → substitutions[0] → TypeParam{0}.
-/// Fix: substitute TypeParam entries in type_args through current_substitutions
-/// before calling get_or_insert (MIR GenericCall arm).
+/// instead of `wrap<i32>`, causing infinite recursion when that unresolved
+/// parameter was lowered. The MIR type context now instantiates every call
+/// argument to a concrete `TypeId` before registering the monomorphization.
 #[test]
 fn test_generic_calls_generic_multi_iteration_worklist() {
 	let case = TestCase::new(indoc! {"
@@ -902,8 +1084,8 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
-			sig.result() == Type::I32
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
+			sig.result() == ValueType::I32
 		})
 		.expect("get_x_i32 not found");
 	let sig_f32 = case
@@ -911,21 +1093,27 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
-			sig.result() == Type::F32
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
+			sig.result() == ValueType::F32
 		})
 		.expect("get_x_f32 not found");
 
-	let agg_i32 = match case.mir.signatures[sig_i32.signature_index as usize]
-		.params()[0]
+	let agg_i32 = match case.mir.signatures
+		[usize::from(sig_i32.signature_index)]
+	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<i32> to be an aggregate"),
 	};
-	let agg_f32 = match case.mir.signatures[sig_f32.signature_index as usize]
-		.params()[0]
+	let agg_f32 = match case.mir.signatures
+		[usize::from(sig_f32.signature_index)]
+	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<f32> to be an aggregate"),
 	};
 
@@ -933,19 +1121,16 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		agg_i32, agg_f32,
 		"Point<i32> and Point<f32> must map to distinct aggregates"
 	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_i32].values,
-		&[Type::I32, Type::I32]
-	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_f32].values,
-		&[Type::F32, Type::F32]
-	);
+	let types = |i: usize| -> Vec<ValueType> {
+		case.mir.aggregates[i].fields.iter().map(|f| f.ty).collect()
+	};
+	assert_eq!(types(agg_i32), [ValueType::I32, ValueType::I32]);
+	assert_eq!(types(agg_f32), [ValueType::F32, ValueType::F32]);
 }
 
 /// Constructing and accessing a field on a concrete `Point<i32>` inside a
-/// non-generic function (no outer `current_substitutions`). Verifies that the
-/// struct's own type args are used as substitutions when lowering its fields.
+/// non-generic function. Verifies that the struct's own type environment is
+/// used when lowering its fields.
 #[test]
 fn test_generic_struct_init_and_field_access_concrete() {
 	let case = TestCase::new(indoc! {"
@@ -973,7 +1158,8 @@ fn test_generic_struct_init_and_field_access_concrete() {
 		.aggregates
 		.iter()
 		.position(|a| {
-			a.values.len() == 2 && a.values.iter().all(|&t| t == Type::I32)
+			a.fields.len() == 2
+				&& a.fields.iter().all(|f| f.ty == ValueType::I32)
 		})
 		.expect("Point<i32> aggregate not found");
 	assert_eq!(case.mir.aggregates[agg_idx].layout.size, 8);
@@ -1008,7 +1194,7 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I64)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I64)
 		.expect("Box<i64> aggregate with I64 field not found");
 	assert_eq!(agg.layout.size, 8);
 	assert_eq!(agg.layout.align, 8);
@@ -1295,11 +1481,15 @@ fn test_generic_slice_impl_method_lowers_correctly() {
 		result = expressions.last().expect("a block has a result expression");
 	}
 	assert!(
-		matches!(result.kind, ExprKind::AggregateGet { value_index: 1, .. }),
+		matches!(
+			result.kind,
+			ExprKind::AggregateGet { value_index, .. }
+				if usize::from(value_index) == 1
+		),
 		"`slice_len` should read the slice aggregate's length slot directly"
 	);
 	assert!(
-		matches!(result.ty, Type::U32),
+		matches!(result.ty, ValueType::U32),
 		"`Mem::Size` should have resolved to `heap`'s index type"
 	);
 }
@@ -1320,38 +1510,6 @@ fn test_compound_assign_through_ptr_deref_on_struct_field() {
         }
 
         export { increment_len }
-    "});
-	assert!(
-		case.tir.diagnostics.is_empty(),
-		"unexpected TIR diagnostics: {:?}",
-		case.tir.diagnostics
-	);
-	insta::assert_yaml_snapshot!(case.mir);
-}
-
-#[test]
-#[ignore = "method lookup for pointer receivers not yet implemented"]
-fn test_generic_compound_assign_through_ptr_deref() {
-	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 };
-
-        struct Vec<T> {
-            buf: u32,
-            len: u32,
-            cap: u32,
-        }
-
-        impl<T> Vec<T> {
-            pub fn increment_len(self: heap::*Self) {
-                self.*.len += 1;
-            }
-        }
-
-        fn call_it(p: heap::*Vec<u32>) {
-            p.increment_len();
-        }
-
-        export { call_it }
     "});
 	assert!(
 		case.tir.diagnostics.is_empty(),
@@ -1634,7 +1792,7 @@ fn test_generic_bitand_bound_resolves_to_primitive_impl() {
 #[test]
 fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 	// Unary counterpart of `test_generic_bitand_bound_resolves_to_primitive_impl`
-	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
+	// — `build_unary_operator_dispatch` previously had no `ValueType::TypeParam`
 	// branch, so a bare type param bounded by `BitNot` failed to dispatch
 	// at all. Now it goes through `resolve_bounded_operator_method` and
 	// monomorphizes to `i32`'s own (intrinsic-backed) impl, same as the
@@ -1651,6 +1809,72 @@ fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
         export { use_not }
     "});
 	insta::assert_yaml_snapshot!(case.mir);
+}
+
+#[test]
+fn test_not_operator_on_bool_lowers_to_eqz() {
+	// `!x` dispatches through `Not`; `bool`'s `#[inline] impl` is backed by
+	// the `i32_eqz` intrinsic, so after inlining + DCE only `negate` is left
+	// and its result expression is a bare `Eqz` node — the same shape `!`
+	// produced before it became trait-dispatched.
+	let case = TestCase::new(indoc! {"
+        fn negate(a: bool) -> bool {
+            !a
+        }
+
+        export { negate }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "bool::not inlined away");
+	let mut result = &mir_function(&case, "negate").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(
+		matches!(result.kind, ExprKind::Eqz { .. }),
+		"expected `!a` to lower to Eqz"
+	);
+}
+
+#[test]
+fn test_generic_partial_eq_bound_lowers_to_native_eq() {
+	// A `<T: PartialEq>` bound instantiated at `i32` monomorphizes to
+	// `impl PartialEq for i32`, whose `#[inline]` body is the `i32_eq`
+	// intrinsic — so after inlining the comparison is a bare `Eq` node, with
+	// no residual call to an `eq` method.
+	let case = TestCase::new(indoc! {"
+        fn equal<T: PartialEq>(a: T, b: T) -> bool {
+            a == b
+        }
+
+        fn use_equal(a: i32, b: i32) -> bool {
+            equal(a, b)
+        }
+
+        export { use_equal }
+    "});
+	// use_equal + equal<i32> — i32::eq is inlined away, no third function.
+	assert_eq!(case.mir.functions.len(), 2);
+
+	fn contains_eq(expr: &Expression) -> bool {
+		match &expr.kind {
+			ExprKind::Eq { .. } => true,
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_eq)
+			}
+			ExprKind::Call { arguments, .. } => {
+				arguments.iter().any(contains_eq)
+			}
+			ExprKind::LocalSet { value, .. } => contains_eq(value),
+			ExprKind::And { left, right } => {
+				contains_eq(left) || contains_eq(right)
+			}
+			_ => false,
+		}
+	}
+	assert!(
+		case.mir.functions.iter().any(|f| contains_eq(&f.block)),
+		"expected `a == b` to lower to a native Eq node after inlining"
+	);
 }
 
 #[test]
@@ -1736,8 +1960,8 @@ fn function_body_statements<'a>(
 	}
 }
 
-/// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
-fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
+/// `(local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
+fn destructured_store(expr: &Expression) -> (LocalIndex, PhysIndex) {
 	let ExprKind::LocalSet {
 		local_index, value, ..
 	} = &expr.kind
@@ -1745,7 +1969,6 @@ fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
 		panic!("expected a `LocalSet`")
 	};
 	let ExprKind::AggregateGet {
-		scope_index: from_scope,
 		local_index: from_local,
 		value_index,
 	} = &value.kind
@@ -1753,7 +1976,7 @@ fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
 		panic!("a destructured binding reads its value with `AggregateGet`")
 	};
 	let _ = local_index;
-	(*from_scope, *from_local, *value_index)
+	(*from_local, *value_index)
 }
 
 /// The whole point of `DestructureDeclaration`: the initializer runs once,
@@ -1773,23 +1996,21 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 
 	// [0] spills `make()` into a temp; [1] and [2] read fields out of it.
 	let ExprKind::LocalSet {
-		scope_index: temp_scope,
 		local_index: temp_local,
 		value,
 	} = &statements[0].kind
 	else {
 		panic!("the initializer is spilled into a local first")
 	};
-	assert_eq!(*temp_scope, 0, "temps live in the function root scope");
 	assert!(
 		matches!(value.kind, ExprKind::Call { .. }),
 		"the spilled value is the call itself, evaluated exactly once"
 	);
 
-	let (a_scope, a_local, _) = destructured_store(&statements[1]);
-	let (b_scope, b_local, _) = destructured_store(&statements[2]);
-	assert_eq!((a_scope, a_local), (0, *temp_local));
-	assert_eq!((b_scope, b_local), (0, *temp_local));
+	let (a_local, _) = destructured_store(&statements[1]);
+	let (b_local, _) = destructured_store(&statements[2]);
+	assert_eq!(a_local, *temp_local);
+	assert_eq!(b_local, *temp_local);
 
 	// And the call appears exactly once in the whole body.
 	let calls = statements
@@ -1812,12 +2033,12 @@ fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 	assert!(case.tir.diagnostics.is_empty());
 	let statements = function_body_statements(&case, "f");
 
-	// `pair` is parameter 0 of scope 0, so both bindings read straight from
-	// it and there is no spilling `LocalSet` ahead of them.
-	let (a_scope, a_local, _) = destructured_store(&statements[0]);
-	let (b_scope, b_local, _) = destructured_store(&statements[1]);
-	assert_eq!((a_scope, a_local), (0, 0));
-	assert_eq!((b_scope, b_local), (0, 0));
+	// `pair` is flat local 0, so both bindings read straight from it and
+	// there is no spilling `LocalSet` ahead of them.
+	let (a_local, _) = destructured_store(&statements[0]);
+	let (b_local, _) = destructured_store(&statements[1]);
+	assert_eq!(a_local, LocalIndex::new(0));
+	assert_eq!(b_local, LocalIndex::new(0));
 }
 
 /// Tuple elements are alignment-sorted exactly like struct fields, so a
@@ -1834,20 +2055,23 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
     "});
 	assert_no_errors(&case);
 
-	let sig_index = mir_function(&case, "f").signature_index as usize;
+	let sig_index = usize::from(mir_function(&case, "f").signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
-	let Type::Aggregate { aggregate_index } = param_ty else {
+	let ValueType::Aggregate { aggregate_index } = param_ty else {
 		panic!("a tuple parameter lowers to an aggregate")
 	};
-	let agg = &case.mir.aggregates[aggregate_index as usize];
+	let agg = case.mir.aggregate(aggregate_index);
 	// Sorted by alignment descending: i64, u32, bool.
-	assert_eq!(&*agg.values, &[Type::I64, Type::U32, Type::Bool]);
-	assert_eq!(&*agg.decl_to_phys, &[2, 0, 1]);
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(types, [ValueType::I64, ValueType::U32, ValueType::Bool]);
+	let phys: Vec<usize> =
+		(0..3).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [2, 0, 1]);
 
 	let statements = function_body_statements(&case, "f");
-	let slots: Vec<u32> = statements[..3]
+	let slots: Vec<usize> = statements[..3]
 		.iter()
-		.map(|e| destructured_store(e).2)
+		.map(|e| usize::from(destructured_store(e).1))
 		.collect();
 	assert_eq!(
 		slots,
@@ -1869,8 +2093,8 @@ fn test_struct_destructuring_reads_declared_fields() {
 	assert_no_errors(&case);
 	let statements = function_body_statements(&case, "f");
 	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
-	assert_eq!(destructured_store(&statements[0]).2, 1);
-	assert_eq!(destructured_store(&statements[1]).2, 0);
+	assert_eq!(usize::from(destructured_store(&statements[0]).1), 1);
+	assert_eq!(usize::from(destructured_store(&statements[1]).1), 0);
 }
 
 /// Nested patterns are flattened into projection paths, so an inner binding
@@ -1890,11 +2114,45 @@ fn test_nested_tuple_destructuring_projects_through_a_temp() {
 	// `t` is already a local, so nothing spills for `x`. Each deeper binding
 	// spills the intermediate `t.1` just before its own store, giving
 	// [x, spill, y, spill, z].
-	let (x_scope, x_local, _) = destructured_store(&statements[0]);
-	assert_eq!((x_scope, x_local), (0, 0), "`x` reads `t` directly");
+	let (x_local, _) = destructured_store(&statements[0]);
+	assert_eq!(x_local, LocalIndex::new(0), "`x` reads `t` directly");
 
-	let (_, y_from, _) = destructured_store(&statements[2]);
-	let (_, z_from, _) = destructured_store(&statements[4]);
-	assert_ne!(y_from, 0, "`y` reads the spilled inner tuple, not `t`");
-	assert_ne!(z_from, 0, "`z` reads the spilled inner tuple, not `t`");
+	let (y_from, _) = destructured_store(&statements[2]);
+	let (z_from, _) = destructured_store(&statements[4]);
+	assert_ne!(
+		y_from,
+		LocalIndex::new(0),
+		"`y` reads the spilled inner tuple, not `t`"
+	);
+	assert_ne!(
+		z_from,
+		LocalIndex::new(0),
+		"`z` reads the spilled inner tuple, not `t`"
+	);
+}
+
+#[test]
+fn test_supertrait_member_dispatch_monomorphizes_declaring_trait() {
+	let case = TestCase::new(indoc! {"
+		trait Parent { fn value(self) -> i32; }
+		trait Child: Parent {}
+		trait Grandchild: Child {}
+		struct S { n: i32 }
+		impl Parent for S { fn value(self) -> i32 { self.n } }
+		impl Child for S {}
+		impl Grandchild for S {}
+		fn read<T: Grandchild>(x: T) -> i32 { x.value() }
+		pub fn run(n: i32) -> i32 { read(S::{ n: n }) }
+		export { run }
+	"});
+	crate::testing::DiagnosticView::new(
+		"check",
+		&case.tir.diagnostics,
+		&case.graph.files,
+	)
+	.assert_no_errors();
+	// MIR construction must dispatch the abstract call through Parent's impl,
+	// even though the generic function only declares the Grandchild bound.
+	assert_eq!(case.mir.exports.len(), 1);
+	assert!(case.mir.functions.iter().any(|f| matches!(case.mir.exports[0], ExportItem::Function { id, .. } if id == f.id)));
 }

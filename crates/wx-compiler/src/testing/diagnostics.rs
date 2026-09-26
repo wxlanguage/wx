@@ -80,6 +80,22 @@ impl<'a> DiagnosticView<'a> {
 		self.items.is_empty()
 	}
 
+	/// Renders every diagnostic with its source context.
+	///
+	/// Useful while developing a test that needs to inspect the compiler's
+	/// complete output without first choosing an assertion.
+	pub fn render(&self) -> String {
+		self.render_items(self.items.iter())
+	}
+
+	/// Prints every rendered diagnostic to stdout.
+	///
+	/// Rust's test harness captures stdout by default; pass `--nocapture` when
+	/// running the test to see this output immediately.
+	pub fn print(&self) {
+		print!("{}", self.render());
+	}
+
 	// ── assertions ──────────────────────────────────────────────────────
 
 	/// Nothing was reported at all, warnings included.
@@ -89,7 +105,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no {} diagnostics, found {}:\n{}",
 				self.stage,
 				self.items.len(),
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -104,7 +120,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no {} errors, found {}:\n{}",
 				self.stage,
 				errors.len(),
-				self.render(errors.into_iter()),
+				self.render_items(errors.into_iter()),
 			);
 		}
 	}
@@ -112,6 +128,22 @@ impl<'a> DiagnosticView<'a> {
 	/// At least one *error* carrying `code`.
 	pub fn assert_error(&self, code: DiagnosticCode) {
 		self.assert_reported_inner(code.code(), Some(Severity::Error), "error");
+	}
+
+	/// Like [`Self::assert_error`], but also runs `check` against the first
+	/// matching diagnostic — for assertions `assert_error_saying`'s
+	/// message/notes-only substring search can't express, such as a
+	/// label's own text or span.
+	pub fn assert_error_with(
+		&self,
+		code: DiagnosticCode,
+		check: impl FnOnce(&Diagnostic<FileId>),
+	) {
+		check(self.assert_reported_inner(
+			code.code(),
+			Some(Severity::Error),
+			"error",
+		));
 	}
 
 	/// At least one *warning* carrying `code`.
@@ -141,7 +173,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no `{}` during {}, but it was reported:\n{}",
 				wanted,
 				self.stage,
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -158,7 +190,7 @@ impl<'a> DiagnosticView<'a> {
 				self.stage,
 				substring,
 				self.describe_count(),
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -178,7 +210,7 @@ impl<'a> DiagnosticView<'a> {
 				self.stage,
 				expected,
 				actual,
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -190,21 +222,23 @@ impl<'a> DiagnosticView<'a> {
 		wanted: &str,
 		severity: Option<Severity>,
 		noun: &str,
-	) {
-		let found = self.items.iter().any(|d| {
-			d.code.as_deref() == Some(wanted)
-				&& severity.is_none_or(|expected| d.severity == expected)
-		});
-		if !found {
-			panic!(
-				"expected {} `{}` during {}, found {}:\n{}",
-				noun,
-				wanted,
-				self.stage,
-				self.describe_count(),
-				self.render(self.items.iter()),
-			);
-		}
+	) -> &'a Diagnostic<FileId> {
+		self.items
+			.iter()
+			.find(|d| {
+				d.code.as_deref() == Some(wanted)
+					&& severity.is_none_or(|expected| d.severity == expected)
+			})
+			.unwrap_or_else(|| {
+				panic!(
+					"expected {} `{}` during {}, found {}:\n{}",
+					noun,
+					wanted,
+					self.stage,
+					self.describe_count(),
+					self.render_items(self.items.iter()),
+				)
+			})
 	}
 
 	fn describe_count(&self) -> String {
@@ -216,7 +250,7 @@ impl<'a> DiagnosticView<'a> {
 
 	/// Renders with source context, so a failure shows the offending line
 	/// rather than only a code and a message.
-	fn render(
+	fn render_items(
 		&self,
 		diagnostics: impl Iterator<Item = &'a Diagnostic<FileId>>,
 	) -> String {
@@ -307,6 +341,15 @@ mod tests {
 		assert!(message.contains("expected no check errors"), "{message}");
 		// the whole point: the failure shows the source, not just a bool
 		assert!(message.contains("fn f() {}"), "{message}");
+	}
+
+	#[test]
+	fn render_exposes_diagnostics_with_source_context() {
+		let (files, items) =
+			fixture(&[(DiagnosticCode::PrivateItem, Severity::Error)]);
+		let rendered = view(&files, &items).render();
+		assert!(rendered.contains(DiagnosticCode::PrivateItem.code()));
+		assert!(rendered.contains("fn f() {}"));
 	}
 
 	#[test]

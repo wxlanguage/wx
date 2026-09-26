@@ -273,7 +273,7 @@ fn resolve_dependencies(
 			}
 		};
 
-		let name = builder.interner.get_or_intern(key.as_str());
+		let name = builder.strings.get_or_intern(key.as_str());
 		builder.add_dependency(owner, name, dependency_id);
 	}
 
@@ -318,7 +318,7 @@ mod tests {
 		owner: PackageId,
 		name: &str,
 	) -> Option<PackageId> {
-		let symbol = compilation.interner.get(name)?;
+		let symbol = compilation.strings.get(name)?;
 		compilation.packages[owner.as_usize()]
 			.dependencies
 			.get(&symbol)

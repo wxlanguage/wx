@@ -21,46 +21,50 @@ pub enum ScalarType {
 	F64,
 }
 
-impl TryFrom<mir::Type> for ScalarType {
+impl TryFrom<mir::ValueType> for ScalarType {
 	type Error = ();
-	fn try_from(ty: mir::Type) -> Result<Self, ()> {
+	fn try_from(ty: mir::ValueType) -> Result<Self, ()> {
 		Ok(match ty {
-			mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Bool
-			| mir::Type::U8
-			| mir::Type::I8
-			| mir::Type::U16
-			| mir::Type::I16
-			| mir::Type::Function { .. } => ScalarType::I32,
-			mir::Type::I64 | mir::Type::U64 => ScalarType::I64,
-			mir::Type::Pointer { kind, .. } => match kind {
+			mir::ValueType::I32
+			| mir::ValueType::U32
+			| mir::ValueType::Bool
+			| mir::ValueType::U8
+			| mir::ValueType::I8
+			| mir::ValueType::U16
+			| mir::ValueType::I16
+			| mir::ValueType::Function { .. } => ScalarType::I32,
+			mir::ValueType::I64 | mir::ValueType::U64 => ScalarType::I64,
+			mir::ValueType::Pointer { kind, .. } => match kind {
 				mir::MemoryKind::Memory32 => ScalarType::I32,
 				mir::MemoryKind::Memory64 => ScalarType::I64,
 			},
-			mir::Type::F32 => ScalarType::F32,
-			mir::Type::F64 => ScalarType::F64,
+			mir::ValueType::F32 => ScalarType::F32,
+			mir::ValueType::F64 => ScalarType::F64,
 			_ => return Err(()),
 		})
 	}
 }
 
-/// Recursively flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; Aggregate recurses into its fields. The
-/// one place this conversion happens; every producer of a `Function` should
-/// call this rather than repeating the match itself.
+/// Flatten a MIR type into its constituent WASM scalar types.
+/// Unit/Never produce zero slots; an aggregate yields its precomputed
+/// `ScalarTable`, which `mir::MIR::ensure_aggregate` already built in this
+/// same order. The one place this conversion happens; every producer of a
+/// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
-	ty: mir::Type,
+	ty: mir::ValueType,
 	aggregates: &[mir::Aggregate],
 ) -> Vec<ScalarType> {
 	match ty {
-		mir::Type::Unit | mir::Type::Never => vec![],
-		mir::Type::Aggregate { aggregate_index } => aggregates
-			[aggregate_index as usize]
-			.values
-			.iter()
-			.flat_map(|&f| flatten_type_to_scalars(f, aggregates))
-			.collect(),
+		mir::ValueType::Unit | mir::ValueType::Never => vec![],
+		mir::ValueType::Aggregate { aggregate_index } => aggregates
+			[usize::from(aggregate_index)]
+		.scalars
+		.iter()
+		.map(|scalar| {
+			ScalarType::try_from(scalar.ty)
+				.expect("a ScalarTable entry is scalar by construction")
+		})
+		.collect(),
 		t => vec![ScalarType::try_from(t).expect("must be scalar")],
 	}
 }
@@ -239,7 +243,7 @@ pub enum Instruction {
 	/// Indirect call via the function table; the encoder resolves `type_index`
 	/// from the referenced MIR signature.
 	CallIndirectSym {
-		mir_sig_index: u32,
+		mir_sig_index: mir::SignatureIndex,
 	},
 	// Memory
 	MemorySize(crate::ast::DefId),

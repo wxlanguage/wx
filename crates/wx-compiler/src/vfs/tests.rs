@@ -44,7 +44,7 @@ impl TestCase {
 		TestCase { builder, package }
 	}
 
-	fn graph(&self) -> &PackageGraph {
+	fn graph(&self) -> &Package {
 		&self.builder.packages[self.package.as_usize()]
 	}
 
@@ -79,7 +79,7 @@ impl TestCase {
 
 	fn name(&self, symbol: SymbolU32) -> &str {
 		self.builder
-			.interner
+			.strings
 			.resolve(symbol)
 			.expect("symbol was interned while loading")
 	}

@@ -2,9 +2,21 @@
 //! (`<T as Trait>::x`) and grouped paths, field/method access on a value, and
 //! turning an already-resolved symbol or namespace member into an expression.
 
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, TextSpan};
 
 use super::*;
+
+/// The qualifier accumulated while walking a `::`-separated path's leading
+/// segments. Not interned, never reaches `Type`/`TypeIndex` as a real type —
+/// purely a TIR-builder-internal resolution intermediate. A namespace used to
+/// be smuggled through as a `Type::Namespace` value so the walk could stay
+/// `TypeIndex`-shaped throughout; this makes it a first-class case in the
+/// walker instead.
+#[derive(Clone, Copy)]
+pub(super) enum PathQualifier {
+	Namespace(NamespaceIndex),
+	Type(TypeIndex),
+}
 
 impl<'ast> Builder<'ast, '_> {
 	/// Converts a `ResolvedSymbol` into an `Expression`, registering any
@@ -68,11 +80,11 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		resolve_ctx: ResolveContext,
 		access_ctx: AccessContext,
-		kind: SymbolKind,
+		kind: DefKind,
 		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
 		match kind {
-			SymbolKind::Function { func_index } => {
+			DefKind::Function { func_index } => {
 				let func_id = self.items.functions[usize::from(func_index)].id;
 				let type_params_len = self.items.functions
 					[usize::from(func_index)]
@@ -92,7 +104,7 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			SymbolKind::Global { global_index } => {
+			DefKind::Global { global_index } => {
 				let global = &mut self.items.globals[usize::from(global_index)];
 				global
 					.accesses
@@ -114,7 +126,7 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			SymbolKind::Const { const_index } => {
+			DefKind::Const { const_index } => {
 				let constant =
 					&mut self.items.constants[usize::from(const_index)];
 				constant
@@ -128,7 +140,7 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			SymbolKind::Memory {
+			DefKind::Memory {
 				memory_index,
 				size: kind,
 			} => {
@@ -145,12 +157,12 @@ impl<'ast> Builder<'ast, '_> {
 					span: expr_span,
 				})
 			}
-			SymbolKind::Enum { .. }
-			| SymbolKind::Module { .. }
-			| SymbolKind::Struct { .. }
-			| SymbolKind::Trait { .. }
-			| SymbolKind::TypeSet { .. }
-			| SymbolKind::TypeAlias { .. } => {
+			DefKind::Enum { .. }
+			| DefKind::Namespace { .. }
+			| DefKind::Struct { .. }
+			| DefKind::Trait { .. }
+			| DefKind::TypeSet { .. }
+			| DefKind::TypeAlias { .. } => {
 				self.diagnostics.push(report_namespace_used_as_value(
 					SourceSpan::new(resolve_ctx.file_id, expr_span),
 				));
@@ -161,7 +173,7 @@ impl<'ast> Builder<'ast, '_> {
 				})
 			}
 			#[cfg(debug_assertions)]
-			SymbolKind::TraitAssocType { .. } => unreachable!(),
+			DefKind::TraitAssocType { .. } => unreachable!(),
 			#[cfg(not(debug_assertions))]
 			_ => unreachable!(),
 		}
@@ -198,7 +210,10 @@ impl<'ast> Builder<'ast, '_> {
 								place: Box::new(Place {
 									kind: PlaceKind::Field {
 										object: place,
-										member,
+										member: Spanned {
+											inner: resolved.index,
+											span: member.span,
+										},
 									},
 									ty: field_ty,
 									memory,
@@ -213,7 +228,10 @@ impl<'ast> Builder<'ast, '_> {
 					_ => Ok(Expression {
 						kind: ExprKind::FieldAccess {
 							object: Box::new(object),
-							field: member,
+							field: Spanned {
+								inner: resolved.index,
+								span: member.span,
+							},
 						},
 						ty: field_ty,
 						span: expr_span,
@@ -264,7 +282,17 @@ impl<'ast> Builder<'ast, '_> {
 				));
 				Err(())
 			}
-			MemberLookup::Ambiguous => Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					func_ctx.resolve_context,
+					object.ty,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				Err(())
+			}
+			MemberLookup::Error => Err(()),
 		}
 	}
 
@@ -325,15 +353,15 @@ impl<'ast> Builder<'ast, '_> {
 			let func_index = match self
 				.lookup_global_symbol_reporting(
 					func_ctx.resolve_context.namespace,
-					(SymbolNamespace::Value, seg.ident.inner),
+					(BindingNamespace::Value, seg.ident.inner),
 					SourceSpan::new(
 						func_ctx.resolve_context.file_id,
 						seg.ident.span,
 					),
 				)
-				.and_then(SymbolEntry::resolved_kind)
+				.and_then(DefKey::resolved_kind)
 			{
-				Some(SymbolKind::Function { func_index }) => func_index,
+				Some(DefKind::Function { func_index }) => func_index,
 				_ => {
 					self.diagnostics.push(report_undeclared_identifier(
 						SourceSpan::new(
@@ -429,9 +457,9 @@ impl<'ast> Builder<'ast, '_> {
 		}
 
 		// ── multi-segment: resolve namespace chain then dispatch on last member ─
-		// Walk segments[0..n-1] left-to-right: each resolves to a namespace TypeIndex.
+		// Walk segments[0..n-1] left-to-right: each resolves to a PathQualifier.
 		let first = &path[0];
-		let mut namespace_ty = self.resolve_type_identifier(
+		let mut qualifier = self.resolve_type_identifier(
 			func_ctx.resolve_context,
 			func_ctx.scope,
 			first.ident,
@@ -443,21 +471,23 @@ impl<'ast> Builder<'ast, '_> {
 		// `Wrapper::<u32>::new(...)` → instantiate to `Wrapper<u32>`.
 		if !first.type_args.is_empty() {
 			let resolve_context = func_ctx.resolve_context;
-			let struct_index = match self.types.resolve(namespace_ty) {
-				Type::Struct { struct_index, .. } => *struct_index,
-				_ => {
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_message(
-								"type arguments are not supported here",
-							)
-							.with_label(Label::primary(
-								resolve_context.file_id,
-								first.ident.span,
-							)),
-					);
-					return Err(());
-				}
+			let struct_index = match qualifier {
+				PathQualifier::Type(ty) => match self.types.resolve(ty) {
+					Type::Struct { struct_index, .. } => Some(*struct_index),
+					_ => None,
+				},
+				PathQualifier::Namespace(_) => None,
+			};
+			let Some(struct_index) = struct_index else {
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_message("type arguments are not supported here")
+						.with_label(Label::primary(
+							resolve_context.file_id,
+							first.ident.span,
+						)),
+				);
+				return Err(());
 			};
 			let resolved_args: Box<[TypeIndex]> = first
 				.type_args
@@ -466,20 +496,20 @@ impl<'ast> Builder<'ast, '_> {
 					self.resolve_type(resolve_context, func_ctx.scope, arg)
 				})
 				.collect();
-			namespace_ty = self.types.intern(Type::Struct {
+			qualifier = PathQualifier::Type(self.types.intern(Type::Struct {
 				struct_index,
 				args: resolved_args,
-			});
+			}));
 		}
 
 		for segment in &path[1..path.len() - 1] {
 			// namespace_span grows to cover all qualifier segments so far.
 			// TODO: per-segment span requires a nested namespace expression node.
-			namespace_ty = self.resolve_namespace_type_member(
+			qualifier = self.advance_path_qualifier(
 				func_ctx.resolve_context,
 				func_ctx.scope,
 				Spanned {
-					inner: namespace_ty,
+					inner: qualifier,
 					span: namespace_span,
 				},
 				segment,
@@ -491,8 +521,9 @@ impl<'ast> Builder<'ast, '_> {
 
 		self.build_namespace_member_expression(
 			func_ctx,
+			access_ctx,
 			ast::Spanned {
-				inner: namespace_ty,
+				inner: qualifier,
 				span: namespace_span,
 			},
 			last,
@@ -514,6 +545,7 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn build_qualified_path_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
+		access_ctx: AccessContext,
 		root: &ast::QualifiedPathRoot,
 		segments: &[ast::PathSegment],
 		expr_span: TextSpan,
@@ -531,20 +563,7 @@ impl<'ast> Builder<'ast, '_> {
 			&root.trait_path,
 			root.span,
 		) {
-			Ok(BoundKind::Trait(trait_bound)) => trait_bound.trait_index,
-			Ok(BoundKind::TypeSet(_)) => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_message(
-							"expected a trait after `as`, found a typeset",
-						)
-						.with_label(Label::primary(
-							func_ctx.resolve_context.file_id,
-							root.span,
-						)),
-				);
-				return Err(());
-			}
+			Ok(trait_bound) => trait_bound.trait_index,
 			Err(()) => return Err(()),
 		};
 
@@ -571,13 +590,11 @@ impl<'ast> Builder<'ast, '_> {
 		for segment in &segments[1..segments.len() - 1] {
 			namespace_ty = self.resolve_namespace_type_member(
 				func_ctx.resolve_context,
-				func_ctx.scope,
 				Spanned {
 					inner: namespace_ty,
 					span: namespace_span,
 				},
 				segment,
-				TypeArgArity::AllowInfer,
 			)?;
 			namespace_span =
 				TextSpan::new(namespace_span.start, segment.ident.span.end);
@@ -585,8 +602,9 @@ impl<'ast> Builder<'ast, '_> {
 
 		self.build_namespace_member_expression(
 			func_ctx,
+			access_ctx,
 			Spanned {
-				inner: namespace_ty,
+				inner: PathQualifier::Type(namespace_ty),
 				span: namespace_span,
 			},
 			segments.last().unwrap(),
@@ -597,44 +615,47 @@ impl<'ast> Builder<'ast, '_> {
 	/// Resolves `<Type>::item` in expression position — a bare bracketed
 	/// self-type with no trait qualification. Structurally identical to
 	/// `build_path_expression`'s multi-segment case; `inner` just fills the
-	/// role the first segment normally plays.
+	/// role the first segment normally plays (which, unlike a plain
+	/// identifier, can itself legitimately name a bare module —
+	/// `resolve_type_expr_as_qualifier` is what allows that).
 	pub(super) fn build_grouped_path_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
+		access_ctx: AccessContext,
 		inner: &ast::Spanned<ast::TypeExpression>,
 		segments: &[ast::PathSegment],
 		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let base_ty = Spanned {
-			inner: self.resolve_type(
+		let base = Spanned {
+			inner: self.resolve_type_expr_as_qualifier(
 				func_ctx.resolve_context,
 				func_ctx.scope,
 				inner,
-			),
+			)?,
 			span: inner.span,
 		};
 
 		let first = &segments[0];
 		if segments.len() == 1 {
 			return self.build_namespace_member_expression(
-				func_ctx, base_ty, first, expr_span,
+				func_ctx, access_ctx, base, first, expr_span,
 			);
 		}
 
-		let mut namespace_ty = self.resolve_namespace_type_member(
+		let mut qualifier = self.advance_path_qualifier(
 			func_ctx.resolve_context,
 			func_ctx.scope,
-			base_ty,
+			base,
 			first,
 			TypeArgArity::AllowInfer,
 		)?;
 		let mut namespace_span = first.ident.span;
 		for segment in &segments[1..segments.len() - 1] {
-			namespace_ty = self.resolve_namespace_type_member(
+			qualifier = self.advance_path_qualifier(
 				func_ctx.resolve_context,
 				func_ctx.scope,
 				Spanned {
-					inner: namespace_ty,
+					inner: qualifier,
 					span: namespace_span,
 				},
 				segment,
@@ -646,8 +667,9 @@ impl<'ast> Builder<'ast, '_> {
 
 		self.build_namespace_member_expression(
 			func_ctx,
+			access_ctx,
 			Spanned {
-				inner: namespace_ty,
+				inner: qualifier,
 				span: namespace_span,
 			},
 			segments.last().unwrap(),
@@ -664,7 +686,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// bare reference first and separately re-resolve it with real args
 	/// after, keeps this the one place that both looks up the symbol and
 	/// applies its arguments.
-	/// Searches `base`'s own declared bound traits (via `abstract_type_bounds`
+	/// Searches `base`'s own declared bound traits (via `effective_bounds`
 	/// — works for both a `TypeParam` and a nested `AssocTypeProjection`) for
 	/// ones declaring an associated type named `member_name`, returning the
 	/// resulting `AssocTypeProjection`. `Ok(None)` means no bound trait
@@ -682,101 +704,28 @@ impl<'ast> Builder<'ast, '_> {
 		member_name: SymbolU32,
 		member_span: TextSpan,
 	) -> Result<Option<TypeIndex>, ()> {
-		// Collected once into an owned `Vec<TraitIndex>` (`TraitIndex` is
-		// `Copy`, so this is just a handful of `u32`s) rather than
-		// re-fetching `abstract_type_bounds(base)` on every iteration —
-		// `ensure_signature` below needs `&mut self`, so it can't interleave
-		// with a live borrow of the bounds list, but for an
-		// `AssocTypeProjection` base `abstract_type_bounds` is a real
-		// recursive scan (see its own doc comment), not a cheap field read,
-		// so re-deriving it per iteration was real wasted work.
-		let bound_trait_indices: Vec<TraitIndex> = self
-			.items
-			.abstract_type_bounds(&self.types, base)
-			.map(|bounds| bounds.traits.iter().map(|b| b.trait_index).collect())
-			.unwrap_or_default();
-		let mut found: Option<TraitIndex> = None;
-		let mut candidates: Vec<TraitIndex> = Vec::new();
-		for trait_index in bound_trait_indices {
-			// In progress means this trait is what put the bound on the stack
-			// in the first place; `entries` is filled in member by member, so
-			// the scan below runs against whatever is there and a member that
-			// hasn't been reached yet simply isn't a candidate.
-			let _ = self.ensure_signature(
-				self.items.traits[usize::from(trait_index)].id,
-			);
-			if !matches!(
-				self.items.traits[usize::from(trait_index)]
-					.entries
-					.get(&member_name),
-				Some(ImplEntry::AssocType(_))
-			) {
-				continue;
-			}
-			match found {
-				None => found = Some(trait_index),
-				// The same trait showing up twice (e.g. a redundant `where`
-				// bound repeating what the assoc type's own declaration
-				// already requires, or plain `T: Foo + Foo`) isn't a second
-				// candidate — it's one trait, counted once, same as Rust
-				// silently collapsing a duplicate bound instead of erroring.
-				Some(first) if first == trait_index => {}
-				Some(first) => {
-					if candidates.is_empty() {
-						candidates.push(first);
-					}
-					candidates.push(trait_index);
-				}
-			}
-		}
-
-		if !candidates.is_empty() {
-			let member_name_str = self.interner.resolve(member_name).unwrap();
-			let type_name = self
-				.formatter(resolve_context.namespace)
-				.display_type(base)
-				.unwrap_or_default();
-			let mut diagnostic = Diagnostic {
-				severity: Severity::Error,
-				code: Some(
-					DiagnosticCode::AmbiguousTraitMember.code().to_string(),
-				),
-				message: "multiple applicable items in scope".to_string(),
-				labels: Vec::with_capacity(candidates.len() + 1),
-				notes: Vec::new(),
-			};
-			diagnostic.labels.push(
-				SourceSpan::new(resolve_context.file_id, member_span)
-					.primary_label()
-					.with_message(format!(
-						"ambiguous — use `<{type_name} as Trait>::{member_name_str}` to specify which trait's `{member_name_str}` is meant"
-					)),
-			);
-			for trait_index in &candidates {
-				let trait_ = &self.items.traits[usize::from(*trait_index)];
-				let trait_name =
-					self.interner.resolve(trait_.name.inner).unwrap();
-				let name_span = trait_
-					.assoc_types
-					.get(&member_name)
-					.map(|at| at.name_span)
-					.unwrap_or(trait_.name.span);
-				diagnostic.labels.push(
-					Label::secondary(trait_.file_id, name_span).with_message(
-						format!("candidate: `{trait_name}::{member_name_str}`"),
-					),
+		let trait_index = match self.member_via_bounds(
+			base,
+			member_name,
+			Some(BindingNamespace::Type),
+			SourceSpan::new(resolve_context.file_id, member_span),
+		)? {
+			CandidateSelection::None => return Ok(None),
+			CandidateSelection::One(candidate) => candidate.trait_index,
+			CandidateSelection::Many(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					base,
+					member_name,
+					member_span,
+					&candidates,
 				);
+				return Err(());
 			}
-			self.diagnostics.push(diagnostic);
-			return Err(());
-		}
-
-		let Some(trait_index) = found else {
-			return Ok(None);
 		};
-		if let Some(at) = self.items.traits[usize::from(trait_index)]
-			.assoc_types
-			.get_mut(&member_name)
+		if let Some(at) = self
+			.items
+			.trait_associated_type_mut(trait_index, member_name)
 		{
 			at.accesses
 				.push(SourceSpan::new(resolve_context.file_id, member_span));
@@ -788,53 +737,30 @@ impl<'ast> Builder<'ast, '_> {
 		})))
 	}
 
-	pub(super) fn resolve_namespace_type_member(
+	/// Advances a [`PathQualifier`] by one path segment — the sole extension
+	/// point where a qualifier chain can still be walking through modules
+	/// (`PathQualifier::Namespace`) rather than a genuine type
+	/// (`PathQualifier::Type`, delegated to [`Self::resolve_namespace_type_member`]).
+	pub(super) fn advance_path_qualifier(
 		&mut self,
 		resolve_context: ResolveContext,
 		scope: Option<GenericScope>,
-		namespace: Spanned<TypeIndex>,
+		qualifier: Spanned<PathQualifier>,
 		member: &ast::PathSegment,
 		arity: TypeArgArity,
-	) -> Result<TypeIndex, ()> {
-		// Type args are only ever meaningful on a struct/alias found in a
-		// module namespace (below); every other kind of member (an
-		// associated type reached through a type param or a nested
-		// projection) can never carry them.
-		if !member.type_args.is_empty()
-			&& !matches!(
-				self.types.resolve(namespace.inner),
-				Type::Namespace { .. }
-			) {
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_message("type arguments are not supported here")
-					.with_label(Label::primary(
-						resolve_context.file_id,
-						// TODO: improve diagnostic span, point to the actaul turbofish
-						member.ident.span,
-					)),
-			);
-			return Err(());
-		}
-		match self.types.resolve(namespace.inner) {
-			// No access recorded for `namespace` itself here: a
-			// `Type::Namespace` value only ever comes from
-			// `symbol_kind_to_type`, whose only two call sites both call
-			// `record_symbol_access` immediately beforehand, at the
-			// exact segment span that produced it — recording it again
-			// here would duplicate that entry.
-			Type::Namespace { namespace_idx } => {
-				let namespace_idx = *namespace_idx;
+	) -> Result<PathQualifier, ()> {
+		match qualifier.inner {
+			PathQualifier::Namespace(namespace_idx) => {
 				let kind = self.resolve_pending_namespace_symbol(
 					resolve_context.namespace,
 					namespace_idx,
-					(SymbolNamespace::Type, member.ident.inner),
+					(BindingNamespace::Type, member.ident.inner),
 					SourceSpan::new(resolve_context.file_id, member.ident.span),
 				)?;
 				match kind {
 					Some(
-						kind @ (SymbolKind::Struct { .. }
-						| SymbolKind::TypeAlias { .. }),
+						kind @ (DefKind::Struct { .. }
+						| DefKind::TypeAlias { .. }),
 					) => {
 						let resolved_args: Vec<_> = member
 							.type_args
@@ -853,8 +779,16 @@ impl<'ast> Builder<'ast, '_> {
 						if ty == TypeIndex::ERROR {
 							Err(())
 						} else {
-							Ok(ty)
+							Ok(PathQualifier::Type(ty))
 						}
+					}
+					Some(kind @ DefKind::Namespace { namespace_idx }) => {
+						self.record_symbol_access(
+							resolve_context.file_id,
+							kind,
+							member.ident.span,
+						);
+						Ok(PathQualifier::Namespace(namespace_idx))
 					}
 					Some(kind) => {
 						self.record_symbol_access(
@@ -862,14 +796,16 @@ impl<'ast> Builder<'ast, '_> {
 							kind,
 							member.ident.span,
 						);
-						self.symbol_kind_to_type(kind).ok_or_else(|| {
-							self.diagnostics.push(report_undeclared_type(
-								SourceSpan::new(
-									resolve_context.file_id,
-									member.ident.span,
-								),
-							));
-						})
+						self.symbol_kind_to_type(kind)
+							.map(PathQualifier::Type)
+							.ok_or_else(|| {
+								self.diagnostics.push(report_undeclared_type(
+									SourceSpan::new(
+										resolve_context.file_id,
+										member.ident.span,
+									),
+								));
+							})
 					}
 					None => {
 						self.diagnostics.push(report_undeclared_type(
@@ -883,8 +819,44 @@ impl<'ast> Builder<'ast, '_> {
 					}
 				}
 			}
+			PathQualifier::Type(ty) => self
+				.resolve_namespace_type_member(
+					resolve_context,
+					Spanned {
+						inner: ty,
+						span: qualifier.span,
+					},
+					member,
+				)
+				.map(PathQualifier::Type),
+		}
+	}
+
+	pub(super) fn resolve_namespace_type_member(
+		&mut self,
+		resolve_context: ResolveContext,
+		namespace: Spanned<TypeIndex>,
+		member: &ast::PathSegment,
+	) -> Result<TypeIndex, ()> {
+		// Type args are only ever meaningful on a struct/alias found in a
+		// module namespace, handled one level up in `advance_path_qualifier`
+		// before a plain `TypeIndex` ever reaches this function — so by the
+		// time we're here, type args are never meaningful.
+		if !member.type_args.is_empty() {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_message("type arguments are not supported here")
+					.with_label(Label::primary(
+						resolve_context.file_id,
+						// TODO: improve diagnostic span, point to the actaul turbofish
+						member.ident.span,
+					)),
+			);
+			return Err(());
+		}
+		match self.types.resolve(namespace.inner) {
 			Type::TypeParam { .. } => {
-				// `abstract_type_bounds` already dispatches on `TypeParam`
+				// `effective_bounds` already dispatches on `TypeParam`
 				// vs. the `AssocTypeProjection` case below internally, so
 				// both arms share `resolve_assoc_type_via_bounds` for their
 				// candidate search.
@@ -946,17 +918,17 @@ impl<'ast> Builder<'ast, '_> {
 					trait_index,
 					..
 				} => {
-					if let Some(assoc_type) = self.items.traits
-						[usize::from(trait_index)]
-					.assoc_types
-					.get_mut(&member.ident.inner)
-					{
+					if let Some(assoc_type) =
+						self.items.trait_associated_type_mut(
+							trait_index,
+							member.ident.inner,
+						) {
 						assoc_type.accesses.push(SourceSpan::new(
 							resolve_context.file_id,
 							member.ident.span,
 						));
 					}
-					Ok(self.items.assoc_type_impls[usize::from(idx)]
+					Ok(self.items.associated_types[usize::from(idx)]
 						.ty
 						.unwrap()
 						.inner)
@@ -964,11 +936,21 @@ impl<'ast> Builder<'ast, '_> {
 				MemberLookup::Inherent {
 					entry: ImplEntry::AssocType(idx),
 					..
-				} => Ok(self.items.assoc_type_impls[usize::from(idx)]
+				} => Ok(self.items.associated_types[usize::from(idx)]
 					.ty
 					.unwrap()
 					.inner),
-				MemberLookup::Ambiguous => Err(()),
+				MemberLookup::Ambiguous(candidates) => {
+					self.report_trait_member_ambiguity(
+						resolve_context,
+						namespace.inner,
+						member.ident.inner,
+						member.ident.span,
+						&candidates,
+					);
+					Err(())
+				}
+				MemberLookup::Error => Err(()),
 				_ => {
 					// TODO: we could improve the diagnostics here
 					// one case for MemberLookup::NotFound and another for Found with not correct kind
@@ -1020,7 +1002,7 @@ impl<'ast> Builder<'ast, '_> {
 		if let MemberLookup::Trait { trait_index, .. } = &lookup
 			&& matches!(
 				self.types.resolve(namespace.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				*trait_index,
@@ -1071,7 +1053,17 @@ impl<'ast> Builder<'ast, '_> {
 				..
 			}
 			| MemberLookup::NotFound => {}
-			MemberLookup::Ambiguous => return Err(()),
+			MemberLookup::Ambiguous(candidates) => {
+				self.report_trait_member_ambiguity(
+					resolve_context,
+					namespace.inner,
+					member.inner,
+					member.span,
+					&candidates,
+				);
+				return Err(());
+			}
+			MemberLookup::Error => return Err(()),
 		}
 
 		match self.types.resolve(namespace.inner) {
@@ -1093,50 +1085,6 @@ impl<'ast> Builder<'ast, '_> {
 						variant_index,
 					}),
 					None => {
-						self.diagnostics.push(report_undeclared_identifier(
-							SourceSpan::new(file_id, member.span),
-						));
-						Err(())
-					}
-				}
-			}
-			Type::Namespace { namespace_idx } => {
-				let ns_idx = *namespace_idx;
-				let resolved = self.resolve_pending_namespace_symbol(
-					resolve_context.namespace,
-					ns_idx,
-					(SymbolNamespace::Value, member.inner),
-					SourceSpan::new(file_id, member.span),
-				)?;
-				match resolved {
-					Some(SymbolKind::Function { func_index }) => {
-						// A plain module-level function has no impl/trait to
-						// inherit a substitution from, but still needs its
-						// own `type_params` slots present — `INFER` for all
-						// of them, same as any other never-yet-called
-						// generic function reference. Without this, `combined`
-						// in the caller below would be built from a
-						// too-short array and its own type params could
-						// never bind at the call site.
-						let total = self.items.functions
-							[usize::from(func_index)]
-						.total_type_param_count();
-						Ok(ResolvedMember::Function {
-							func_index,
-							type_args: vec![TypeIndex::INFER; total]
-								.into_boxed_slice(),
-						})
-					}
-					Some(SymbolKind::Global { global_index }) => {
-						Ok(ResolvedMember::Global { global_index })
-					}
-					Some(SymbolKind::Const { const_index }) => {
-						Ok(ResolvedMember::Const {
-							const_index,
-							type_args: Box::new([]),
-						})
-					}
-					_ => {
 						self.diagnostics.push(report_undeclared_identifier(
 							SourceSpan::new(file_id, member.span),
 						));
@@ -1166,30 +1114,74 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Core namespace-member dispatch: look up `member` inside a type whose
-	/// `TypeIndex` has already been resolved.
+	/// Core namespace-member dispatch — the expression-position twin of
+	/// [`Self::advance_path_qualifier`], for a segment that's the *last* one
+	/// in its path (so it needs to become a value, not another qualifier).
 	///
-	/// No access recorded for `namespace` itself here: a `Type::Namespace`
-	/// value only ever comes from `symbol_kind_to_type`, whose only two
-	/// call sites both call `record_symbol_access` immediately
-	/// beforehand, at the exact segment span that produced it — recording
-	/// it again here would duplicate that entry.
+	/// The `PathQualifier::Namespace` case deliberately does **not** go
+	/// through [`Self::resolve_namespace_member`]/[`Self::build_resolved_member_expression`]
+	/// — a module has no `TypeIndex` to carry there any more, and a plain
+	/// module-level item never needed one anyway (only a trait's own const
+	/// declaration, accessed abstractly, needs a receiver type — see
+	/// `ExprKind::AbstractConstAccess`). Reusing
+	/// [`Self::global_symbol_to_expression`] instead yields the same bare
+	/// `ExprKind::Const`/`Global`/`Function`/`Memory` every consumer already
+	/// expects, and gets the mutability check on `module::global = x` for
+	/// free (this function didn't receive `access_ctx` before, so that
+	/// check was silently skipped for a namespace-qualified assignment
+	/// target).
 	fn build_namespace_member_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
-		namespace: Spanned<TypeIndex>,
+		access_ctx: AccessContext,
+		namespace: Spanned<PathQualifier>,
 		segment: &ast::PathSegment,
 		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
-		let resolved = self.resolve_namespace_member(
-			func_ctx.resolve_context,
-			namespace,
-			segment.ident,
-		)?;
-
-		self.build_resolved_member_expression(
-			func_ctx, namespace, resolved, segment, expr_span,
-		)
+		match namespace.inner {
+			PathQualifier::Namespace(namespace_idx) => {
+				let kind = self.resolve_pending_namespace_symbol(
+					func_ctx.resolve_context.namespace,
+					namespace_idx,
+					(BindingNamespace::Value, segment.ident.inner),
+					SourceSpan::new(
+						func_ctx.resolve_context.file_id,
+						segment.ident.span,
+					),
+				)?;
+				match kind {
+					Some(kind) => self.global_symbol_to_expression(
+						func_ctx.resolve_context,
+						access_ctx,
+						kind,
+						expr_span,
+					),
+					None => {
+						self.diagnostics.push(report_undeclared_identifier(
+							SourceSpan::new(
+								func_ctx.resolve_context.file_id,
+								segment.ident.span,
+							),
+						));
+						Err(())
+					}
+				}
+			}
+			PathQualifier::Type(ty) => {
+				let ns = Spanned {
+					inner: ty,
+					span: namespace.span,
+				};
+				let resolved = self.resolve_namespace_member(
+					func_ctx.resolve_context,
+					ns,
+					segment.ident,
+				)?;
+				self.build_resolved_member_expression(
+					func_ctx, ns, resolved, segment, expr_span,
+				)
+			}
+		}
 	}
 
 	/// Turns an already-resolved [`ResolvedMember`] into an [`Expression`] —
@@ -1197,8 +1189,8 @@ impl<'ast> Builder<'ast, '_> {
 	/// ordinary, searching lookup) and qualified-path expression resolution
 	/// (`<Type as Trait>::item`, which resolves the member itself via
 	/// `resolve_trait_member` instead but still needs the same
-	/// turbofish-count check, access recording, and `NamespaceAccess`
-	/// wrapping once it has one).
+	/// turbofish-count check and access recording, and (for a trait's own
+	/// const) the same `AbstractConstAccess` wrapping.
 	fn build_resolved_member_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
@@ -1221,7 +1213,7 @@ impl<'ast> Builder<'ast, '_> {
 				.len();
 				let type_params_len = self.items.functions
 					[usize::from(func_index)]
-				.total_type_param_count();
+				.type_param_count();
 
 				if !segment.type_args.is_empty()
 					&& segment.type_args.len() != fn_params_len
@@ -1275,14 +1267,7 @@ impl<'ast> Builder<'ast, '_> {
 					type_args: combined,
 				});
 				Ok(Expression {
-					kind: ExprKind::NamespaceAccess {
-						namespace,
-						member: Box::new(Expression {
-							kind: ExprKind::Function { id: func_id },
-							ty: func_ty,
-							span: member_span,
-						}),
-					},
+					kind: ExprKind::Function { id: func_id },
 					ty: func_ty,
 					span: expr_span,
 				})
@@ -1294,9 +1279,9 @@ impl<'ast> Builder<'ast, '_> {
 				self.items.constants[usize::from(const_index)]
 					.accesses
 					.push(SourceSpan::new(file_id, member_span));
-				let id = self.items.constants[usize::from(const_index)].id;
-				let raw_ty =
-					self.items.constants[usize::from(const_index)].ty.inner;
+				let constant = &self.items.constants[usize::from(const_index)];
+				let id = constant.id;
+				let raw_ty = constant.ty.inner;
 				// Substitutes the owning trait's `Self` for the receiver's
 				// own type — a no-op (`type_args` empty) for a plain
 				// module-level const, and for a trait const whose type
@@ -1310,15 +1295,27 @@ impl<'ast> Builder<'ast, '_> {
 				// deferred until monomorphization substitutes a concrete
 				// `Self`.
 				let ty = self.substitute_type(raw_ty, &type_args);
+				// Only a const naming a *trait's own* declaration (its
+				// default value, referenced abstractly — e.g. through a
+				// generic `T: SomeTrait` bound, or `Self::CONST` inside the
+				// trait's own default bodies) has its concrete per-impl
+				// value picked later, at monomorphization, once `namespace`
+				// is concrete. A const reached through a specific `impl
+				// Trait for Target` (or an inherent impl, or a plain
+				// module-level const) already names the exact value — no
+				// receiver-type bookkeeping needed.
+				let constant = &self.items.constants[usize::from(const_index)];
+				let kind =
+					if matches!(constant.parent, Some(ItemParent::Trait(_))) {
+						ExprKind::AbstractConstAccess {
+							receiver: namespace.inner,
+							id,
+						}
+					} else {
+						ExprKind::Const { id }
+					};
 				Ok(Expression {
-					kind: ExprKind::NamespaceAccess {
-						namespace,
-						member: Box::new(Expression {
-							kind: ExprKind::Const { id },
-							ty,
-							span: member_span,
-						}),
-					},
+					kind,
 					ty,
 					span: expr_span,
 				})
@@ -1329,14 +1326,7 @@ impl<'ast> Builder<'ast, '_> {
 				let global_id = global.id;
 				let ty = global.ty.inner;
 				Ok(Expression {
-					kind: ExprKind::NamespaceAccess {
-						namespace,
-						member: Box::new(Expression {
-							kind: ExprKind::Global { id: global_id },
-							ty,
-							span: member_span,
-						}),
-					},
+					kind: ExprKind::Global { id: global_id },
 					ty,
 					span: expr_span,
 				})
@@ -1350,16 +1340,9 @@ impl<'ast> Builder<'ast, '_> {
 				.accesses
 				.push(SourceSpan::new(file_id, member_span));
 				Ok(Expression {
-					kind: ExprKind::NamespaceAccess {
-						namespace,
-						member: Box::new(Expression {
-							kind: ExprKind::EnumVariant {
-								enum_index,
-								variant_index,
-							},
-							ty: namespace.inner,
-							span: member_span,
-						}),
+					kind: ExprKind::EnumVariant {
+						enum_index,
+						variant_index,
 					},
 					ty: namespace.inner,
 					span: expr_span,
@@ -1396,6 +1379,7 @@ impl<'ast> Builder<'ast, '_> {
 			base_ty.inner,
 			required_trait,
 			segment.ident.inner,
+			member_span,
 		);
 		// Same abstract-dispatch bookkeeping as `resolve_namespace_member`'s
 		// identical check: a `TypeParam` receiver resolving through a known
@@ -1405,7 +1389,7 @@ impl<'ast> Builder<'ast, '_> {
 		if lookup.is_ok()
 			&& matches!(
 				self.types.resolve(base_ty.inner),
-				Type::TypeParam { .. }
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) {
 			self.record_abstract_dispatch_access(
 				required_trait,
@@ -1429,6 +1413,7 @@ impl<'ast> Builder<'ast, '_> {
 				func_index,
 				type_args,
 			},
+			Err(TraitMemberError::ResolutionFailed) => return Err(()),
 			Ok((ImplEntry::AssocType(_), _))
 			| Err(TraitMemberError::NoSuchMember) => {
 				let trait_name = self
@@ -1482,7 +1467,7 @@ impl<'ast> Builder<'ast, '_> {
 		func_ctx: &mut ExprContext,
 		callee: &Spanned<ast::Expression>,
 		_args: &[Spanned<ast::TypeExpression>],
-		expr_span: ast::TextSpan,
+		expr_span: TextSpan,
 	) -> Result<Expression, ()> {
 		// TypeApplication on a non-path callee, e.g. a bare `obj.field::<T>`
 		// without a following call.  Method turbofish calls (`obj.m::<T>(args)`)

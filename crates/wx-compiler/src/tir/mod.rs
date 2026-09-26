@@ -1,3909 +1,3833 @@
-use std::collections::HashMap;
-use std::hash::Hash;
-
-use codespan_reporting::diagnostic::{Diagnostic, Label};
-use string_interner::symbol::SymbolU32;
-
-use crate::ast::{self, DefId, Separated, Spanned, TextSpan};
-use crate::vfs::{CompilationUnit, FileId, PackageGraph, PackageId};
-
-mod builder;
-#[cfg(test)]
-mod tests;
-
-macro_rules! index_newtype {
-	($name:ident) => {
-		#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-		#[cfg_attr(test, derive(serde::Serialize, PartialOrd, Ord))]
-		pub struct $name(u32);
-
-		impl $name {
-			#[inline]
-			fn new(index: u32) -> Self {
-				Self(index)
-			}
-		}
-
-		impl From<$name> for u32 {
-			#[inline]
-			fn from(index: $name) -> Self {
-				index.0
-			}
-		}
-
-		impl From<$name> for usize {
-			#[inline]
-			fn from(index: $name) -> Self {
-				index.0 as usize
-			}
-		}
-	};
-}
-
-index_newtype!(TypeIndex);
-index_newtype!(LocalIndex);
-index_newtype!(ScopeIndex);
-index_newtype!(LabelIndex);
-index_newtype!(FunctionIndex);
-index_newtype!(GlobalIndex);
-index_newtype!(ConstIndex);
-index_newtype!(NamespaceIndex);
-index_newtype!(MemoryIndex);
-index_newtype!(EnumVariantIndex);
-index_newtype!(EnumIndex);
-index_newtype!(StructIndex);
-index_newtype!(TraitIndex);
-index_newtype!(InherentImplIndex);
-index_newtype!(TraitImplIndex);
-index_newtype!(TypesetIndex);
-index_newtype!(AssocTypeIndex);
-index_newtype!(TypeAliasIndex);
-index_newtype!(UseIndex);
-index_newtype!(UsePrefixIndex);
-index_newtype!(ModuleDeclIndex);
-index_newtype!(ImportDeclIndex);
-index_newtype!(FieldIndex);
-index_newtype!(BodyIndex);
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy, PartialEq)]
-pub struct SourceSpan {
-	pub file_id: FileId,
-	pub span: TextSpan,
-}
-
-impl SourceSpan {
-	pub fn new(file_id: FileId, span: TextSpan) -> Self {
-		Self { file_id, span }
-	}
-
-	fn primary_label(self) -> Label<FileId> {
-		Label::primary(self.file_id, self.span)
-	}
-
-	fn secondary_label(self) -> Label<FileId> {
-		Label::secondary(self.file_id, self.span)
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FunctionSignature {
-	items: Box<[TypeIndex]>,
-	params_count: u32,
-}
-
-impl FunctionSignature {
-	pub fn params(&self) -> &[TypeIndex] {
-		&self.items[..self.params_count as usize]
-	}
-
-	pub fn result(&self) -> TypeIndex {
-		self.items.get(self.params_count as usize).copied().unwrap()
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TypeParamOwner {
-	Function(DefId),
-	Struct(DefId),
-	TypeAlias(DefId),
-	Trait(TraitIndex),
-	InherentImpl(InherentImplIndex),
-	TraitImpl(TraitImplIndex),
-}
-
-/// The block a function/constant is a member of, if any — an impl block or
-/// a trait declaration. `None` means the item is free-standing: callable by
-/// its bare name (subject to namespace visibility). This answers a
-/// different question than `TypeParamOwner`: that's about where an item's
-/// *inherited* type parameters come from, and only applies when there's
-/// something to inherit. A non-generic `impl Point { }` has an `ItemParent`
-/// but no `TypeParamOwner` — there's nothing to inherit, but it's still a
-/// member of a block that gates how the item can be referenced (`Point::new()`,
-/// never bare `new()`).
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ItemParent {
-	/// Inherent `impl Target { }` — generic (`impl<Params> Target { }`) or
-	/// concrete alike. Index into `TIR::inherent_impls`; the target type is
-	/// `TIR::inherent_impls[..].target` (fully resolved for a concrete impl,
-	/// parametric for a generic one).
-	InherentImpl(InherentImplIndex),
-	/// `impl Trait for Target { }` member, generic or not. Named apart from
-	/// the inherent case because the two differ in more than their target:
-	/// a trait impl's member exists to satisfy a declaration elsewhere, which
-	/// is what exempts it from dead-code reporting. The target is still
-	/// reachable, via `TIR::trait_impls[..].target`.
-	TraitImpl(TraitImplIndex),
-	/// Trait item — a method/const declaration or default body, scoped to
-	/// the trait's implicit `Self`.
-	Trait(TraitIndex),
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum Type {
-	Error,
-	/// A type inference placeholder — written `_` in source, or injected
-	/// internally when a generic type argument cannot yet be determined.
-	/// Must never reach MIR or codegen; the TIR checker reports an error
-	/// whenever `Infer` survives past the call site that created it.
-	Infer,
-	Unit,
-	Never,
-	Integer,
-	Float,
-	U8,
-	I8,
-	U16,
-	I16,
-	U32,
-	I32,
-	U64,
-	I64,
-	F32,
-	F64,
-	Bool,
-	Char,
-	Tuple {
-		elements: Box<[TypeIndex]>,
-	},
-	Struct {
-		struct_index: StructIndex,
-		/// Encodes three states via length:
-		///   - non-generic struct → always empty
-		///   - generic struct, not yet instantiated → empty
-		///   - generic struct, instantiated → one entry per type param, e.g. `Vec<i32, u8>` → `[i32_idx, u8_idx]`
-		args: Box<[TypeIndex]>,
-	},
-	Function {
-		signature: FunctionSignature,
-	},
-	/// Named function reference before coercion to a fn pointer.
-	/// Encodes three states via length (same convention as `Struct::args`):
-	///   - non-generic function → always empty
-	///   - generic function, not yet instantiated → empty
-	///   - generic function, instantiated → one entry per type param
-	FunctionItem {
-		id: DefId,
-		type_args: Box<[TypeIndex]>,
-	},
-	Pointer {
-		to: TypeIndex,
-		memory: TypeIndex,
-		ownership: ast::Ownership,
-	},
-	Array {
-		of: TypeIndex,
-		size: u32,
-		memory: TypeIndex,
-		ownership: ast::Ownership,
-	},
-	Slice {
-		of: TypeIndex,
-		memory: TypeIndex,
-		ownership: ast::Ownership,
-	},
-	Namespace {
-		namespace_idx: NamespaceIndex,
-	},
-	Enum {
-		enum_index: EnumIndex,
-	},
-	Memory {
-		id: DefId,
-		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
-		size: TypeIndex,
-	},
-	/// Index into `Function::type_params`. All uses of the same param in a
-	/// function share one interned instance.
-	TypeParam {
-		owner: TypeParamOwner,
-		param_index: u32,
-	},
-	/// `M::Size` — opaque until monomorphisation substitutes `M`.
-	AssociatedType {
-		trait_index: TraitIndex,
-		assoc_name: SymbolU32,
-	},
-	/// `M::Size` or `A::M::Size` in a signature: a projection from a base type
-	/// (a `TypeParam` or another `AssocTypeProjection`) resolved by `substitute_type`.
-	AssocTypeProjection {
-		trait_index: TraitIndex,
-		assoc_name: SymbolU32,
-		base: TypeIndex,
-	},
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(test, serde(transparent))]
-pub struct TypeInterner {
-	entries: Vec<Type>,
-	#[cfg_attr(test, serde(skip))]
-	index_lookup: HashMap<Type, TypeIndex>,
-}
-
-impl TypeInterner {
-	pub fn new() -> Self {
-		let entries = vec![
-			// Order must match the `TypeIndex` constants below.
-			Type::Error,
-			Type::Infer,
-			Type::Unit,
-			Type::Never,
-			Type::Integer,
-			Type::Float,
-			Type::U8,
-			Type::I8,
-			Type::U16,
-			Type::I16,
-			Type::U32,
-			Type::I32,
-			Type::U64,
-			Type::I64,
-			Type::F32,
-			Type::F64,
-			Type::Bool,
-			Type::Char,
-		];
-		let index_lookup = entries
-			.iter()
-			.cloned()
-			.enumerate()
-			.map(|(index, ty)| {
-				let index = u32::try_from(index)
-					.expect("type interner exceeded u32 index capacity");
-				(ty, TypeIndex::new(index))
-			})
-			.collect();
-		Self {
-			entries,
-			index_lookup,
-		}
-	}
-
-	pub fn intern(&mut self, ty: Type) -> TypeIndex {
-		if let Some(&index) = self.index_lookup.get(&ty) {
-			return index;
-		}
-
-		let index = u32::try_from(self.entries.len())
-			.expect("type interner exceeded u32 index capacity");
-		let index = TypeIndex::new(index);
-		self.entries.push(ty.clone());
-		self.index_lookup.insert(ty, index);
-		index
-	}
-
-	#[inline]
-	pub fn resolve(&self, index: TypeIndex) -> &Type {
-		&self.entries[usize::from(index)]
-	}
-}
-
-impl Default for TypeInterner {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl TypeIndex {
-	/// Use wherever `INFER` acts as an absent-type sentinel and a concrete fallback is needed.
-	#[inline]
-	pub fn infer_or(self, other: TypeIndex) -> TypeIndex {
-		if self == TypeIndex::INFER {
-			other
-		} else {
-			self
-		}
-	}
-
-	#[inline]
-	pub fn is_comptime_number(self) -> bool {
-		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
-	}
-
-	#[inline]
-	pub fn is_primitive(self) -> bool {
-		self == TypeIndex::U8
-			|| self == TypeIndex::I8
-			|| self == TypeIndex::U16
-			|| self == TypeIndex::I16
-			|| self == TypeIndex::U32
-			|| self == TypeIndex::I32
-			|| self == TypeIndex::U64
-			|| self == TypeIndex::I64
-			|| self == TypeIndex::F32
-			|| self == TypeIndex::F64
-			|| self == TypeIndex::CHAR
-	}
-
-	#[inline]
-	pub fn is_integer(self) -> bool {
-		self == TypeIndex::U8
-			|| self == TypeIndex::I8
-			|| self == TypeIndex::U16
-			|| self == TypeIndex::I16
-			|| self == TypeIndex::U32
-			|| self == TypeIndex::I32
-			|| self == TypeIndex::U64
-			|| self == TypeIndex::I64
-	}
-
-	#[inline]
-	pub fn is_float(self) -> bool {
-		self == TypeIndex::F32 || self == TypeIndex::F64
-	}
-
-	#[inline]
-	pub fn is_numeric(self) -> bool {
-		self.is_integer() || self.is_float()
-	}
-
-	// Pre-allocated indices for primitive types. The `TypeInterner` reserves these
-	// slots at startup so comparisons like `ty == TypeIndex::U32` work without
-	// a pool lookup.
-	pub const ERROR: TypeIndex = TypeIndex(0);
-	pub const INFER: TypeIndex = TypeIndex(1);
-	pub const UNIT: TypeIndex = TypeIndex(2);
-	pub const NEVER: TypeIndex = TypeIndex(3);
-	pub const INTEGER: TypeIndex = TypeIndex(4);
-	pub const FLOAT: TypeIndex = TypeIndex(5);
-	pub const U8: TypeIndex = TypeIndex(6);
-	pub const I8: TypeIndex = TypeIndex(7);
-	pub const U16: TypeIndex = TypeIndex(8);
-	pub const I16: TypeIndex = TypeIndex(9);
-	pub const U32: TypeIndex = TypeIndex(10);
-	pub const I32: TypeIndex = TypeIndex(11);
-	pub const U64: TypeIndex = TypeIndex(12);
-	pub const I64: TypeIndex = TypeIndex(13);
-	pub const F32: TypeIndex = TypeIndex(14);
-	pub const F64: TypeIndex = TypeIndex(15);
-	pub const BOOL: TypeIndex = TypeIndex(16);
-	pub const CHAR: TypeIndex = TypeIndex(17);
-}
-
-impl TryFrom<&str> for Type {
-	type Error = ();
-
-	fn try_from(value: &str) -> Result<Self, ()> {
-		match value {
-			"i32" => Ok(Type::I32),
-			"i64" => Ok(Type::I64),
-			"f32" => Ok(Type::F32),
-			"f64" => Ok(Type::F64),
-			"u32" => Ok(Type::U32),
-			"u64" => Ok(Type::U64),
-			"bool" => Ok(Type::Bool),
-			"char" => Ok(Type::Char),
-			"u8" => Ok(Type::U8),
-			"i8" => Ok(Type::I8),
-			"u16" => Ok(Type::U16),
-			"i16" => Ok(Type::I16),
-			"never" => Ok(Type::Never),
-			_ => Err(()),
-		}
-	}
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Constant {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	/// `Some` for associated consts (`impl Target { const FOO }` / trait
-	/// consts) — `None` for free top-level consts. See `ItemParent`.
-	pub parent: Option<ItemParent>,
-	pub pub_span: Option<TextSpan>,
-	pub name: ast::Spanned<SymbolU32>,
-	pub ty: ast::Spanned<TypeIndex>,
-	pub value: Option<Box<Expression>>,
-	/// Compile-time value of `value`, if it folds — see `Builder::eval_const_expr`.
-	pub const_value: Option<ConstValue>,
-	pub accesses: Vec<SourceSpan>,
-	pub attributes: Box<[ItemAttribute]>,
-}
-
-pub struct TraitAssocType {
-	pub id: ast::DefId,
-	pub name_span: ast::TextSpan,
-	pub bounds: Bounds,
-	pub accesses: Vec<SourceSpan>,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Trait {
-	pub id: ast::DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub pub_span: Option<TextSpan>,
-	pub name: ast::Spanned<SymbolU32>,
-	/// The implicit `Self` type parameter owned by this trait. All trait
-	/// methods inherit it — their [`Function::type_param_parent`] is
-	/// `TypeParamOwner::Trait(idx)`.
-	pub self_type_param: TypeParamInfo,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub entries: HashMap<SymbolU32, ImplEntry>,
-	#[cfg_attr(test, serde(skip))]
-	pub assoc_types: HashMap<SymbolU32, TraitAssocType>,
-	pub bounds: Bounds,
-	#[cfg_attr(test, serde(skip))]
-	pub accesses: Vec<SourceSpan>,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TraitImpl {
-	pub id: ast::DefId,
-	pub trait_index: TraitIndex,
-	/// Empty for what used to be called a "concrete" trait impl
-	/// (`impl Trait for Target { .. }`) — the degenerate (zero-parameter)
-	/// case of the same shape as a generic one, mirroring `ImplBlock`.
-	pub type_params: Box<[TypeParamInfo]>,
-	/// See `ImplBlock::target` — `span` here is the target type expression
-	/// in `impl Trait for «this» { .. }`.
-	pub target: Spanned<TypeIndex>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub members: HashMap<SymbolU32, ImplEntry>,
-	/// Span of the trait name in the header; anchors conformance diagnostics.
-	#[cfg_attr(test, serde(skip))]
-	pub span: TextSpan,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	/// See `ImplBlock::self_accesses`.
-	#[cfg_attr(test, serde(skip))]
-	pub self_accesses: Vec<SourceSpan>,
-}
-
-/// The intersection of representable value ranges across a set of integer types.
-///
-/// `min` is stored as the two's-complement bit pattern of an `i64` (reinterpret with `as i64`).
-/// `max` is stored as a plain `u64` upper bound.
-///
-/// Use [`IntegerRange::contains`] to test whether a literal fits; use
-/// [`IntegerRange::intersect`] to narrow two ranges to their overlap.
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct IntegerRange {
-	min: u64,
-	max: u64,
-}
-
-impl IntegerRange {
-	/// Returns the range for a single integer primitive type, or `None` if `ty` is not one.
-	pub fn for_integer_type(ty: TypeIndex) -> Option<Self> {
-		if ty == TypeIndex::I8 {
-			Some(Self {
-				min: i8::MIN as i64 as u64,
-				max: i8::MAX as u64,
-			})
-		} else if ty == TypeIndex::U8 {
-			Some(Self {
-				min: 0,
-				max: u8::MAX as u64,
-			})
-		} else if ty == TypeIndex::I16 {
-			Some(Self {
-				min: i16::MIN as i64 as u64,
-				max: i16::MAX as u64,
-			})
-		} else if ty == TypeIndex::U16 {
-			Some(Self {
-				min: 0,
-				max: u16::MAX as u64,
-			})
-		} else if ty == TypeIndex::I32 {
-			Some(Self {
-				min: i32::MIN as i64 as u64,
-				max: i32::MAX as u64,
-			})
-		} else if ty == TypeIndex::U32 {
-			Some(Self {
-				min: 0,
-				max: u32::MAX as u64,
-			})
-		} else if ty == TypeIndex::I64 {
-			Some(Self {
-				min: i64::MIN as u64,
-				max: i64::MAX as u64,
-			})
-		} else if ty == TypeIndex::U64 {
-			Some(Self {
-				min: 0,
-				max: u64::MAX,
-			})
-		} else {
-			None
-		}
-	}
-
-	/// The widest possible range — the identity element for [`intersect`](Self::intersect).
-	pub fn widest() -> Self {
-		Self {
-			min: i64::MIN as u64,
-			max: u64::MAX,
-		}
-	}
-
-	/// Narrows this range to the overlap with `other` (greatest lower bound, least upper bound).
-	pub fn intersect(self, other: Self) -> Self {
-		let min = if (self.min as i64) >= (other.min as i64) {
-			self.min
-		} else {
-			other.min
-		};
-		let max = self.max.min(other.max);
-		Self { min, max }
-	}
-
-	/// Returns `true` if the i64 `value` falls within this range.
-	pub fn contains(&self, value: i64) -> bool {
-		if value < 0 {
-			value >= (self.min as i64)
-		} else {
-			(value as u64) <= self.max
-		}
-	}
-
-	pub fn min_i64(&self) -> i64 {
-		self.min as i64
-	}
-
-	pub fn max_u64(&self) -> u64 {
-		self.max
-	}
-}
-
-/// A closed compile-time set of concrete types, used as a type param bound.
-/// `typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }`
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypeSet {
-	pub id: ast::DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub name: ast::Spanned<SymbolU32>,
-	pub pub_span: Option<ast::TextSpan>,
-	pub members: Box<[TypeIndex]>,
-	/// Intersection of the representable ranges of all member types.
-	/// Integer literals inside generic bodies bounded by this typeset are
-	/// validated against this range at TIR time (before monomorphization).
-	pub intersection_range: IntegerRange,
-	pub accesses: Vec<SourceSpan>,
-	pub attributes: Box<[ItemAttribute]>,
-}
-
-/// A location that lives inside linear memory (a "place" in the sense of
-/// Rust's place / value distinction).  Every `Place` carries the memory it
-/// belongs to and whether it was reached through a mutable pointer — both
-/// propagated at build time so callers never need a recursive walk.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Place {
-	pub kind: PlaceKind,
-	/// Type of the value stored at this location.
-	pub ty: TypeIndex,
-	/// `TypeIndex` of the `Type::Memory` this place lives in.
-	pub memory: TypeIndex,
-	/// `true` if the root `Deref` was through a mutable pointer.
-	pub mutable: bool,
-	pub span: ast::TextSpan,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum PlaceKind {
-	/// `ptr.*` — the only way to enter linear memory.
-	Deref { pointer: Box<Expression> },
-	/// `place.field` — field projection; memory/mutable inherited from object.
-	Field {
-		object: Box<Place>,
-		member: ast::Spanned<SymbolU32>,
-	},
-	/// `expr[index]` — index into an array/slice value; memory/mutable come from
-	/// the expression's type, not from a parent place.
-	Index {
-		object: Box<Expression>,
-		index: Box<Expression>,
-	},
-}
-
-/// `ast::BinaryOp` minus its six assignment variants (`Assign` and the five
-/// `*Assign` compound forms). By the time an expression reaches
-/// `ExprKind::Binary`, assignment has already been routed to its own nodes
-/// (`Assign`, `Store`, `CompoundAssign`, `GenericCompoundAssign`,
-/// `CompoundStore`, `GenericCompoundStore`) — giving `Binary` its own operator
-/// type makes that split enforced by the compiler (an exhaustive match can
-/// never again accidentally construct `Binary` with an assignment operator)
-/// rather than merely a convention.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum BinaryOp {
-	Add,
-	Sub,
-	Mul,
-	Div,
-	Rem,
-	Eq,
-	NotEq,
-	Less,
-	LessEq,
-	Greater,
-	GreaterEq,
-	And,
-	Or,
-	BitAnd,
-	BitOr,
-	BitXor,
-	LeftShift,
-	RightShift,
-}
-
-impl From<ast::BinaryOp> for BinaryOp {
-	fn from(op: ast::BinaryOp) -> Self {
-		match op {
-			ast::BinaryOp::Add => BinaryOp::Add,
-			ast::BinaryOp::Sub => BinaryOp::Sub,
-			ast::BinaryOp::Mul => BinaryOp::Mul,
-			ast::BinaryOp::Div => BinaryOp::Div,
-			ast::BinaryOp::Rem => BinaryOp::Rem,
-			ast::BinaryOp::Eq => BinaryOp::Eq,
-			ast::BinaryOp::NotEq => BinaryOp::NotEq,
-			ast::BinaryOp::Less => BinaryOp::Less,
-			ast::BinaryOp::LessEq => BinaryOp::LessEq,
-			ast::BinaryOp::Greater => BinaryOp::Greater,
-			ast::BinaryOp::GreaterEq => BinaryOp::GreaterEq,
-			ast::BinaryOp::And => BinaryOp::And,
-			ast::BinaryOp::Or => BinaryOp::Or,
-			ast::BinaryOp::BitAnd => BinaryOp::BitAnd,
-			ast::BinaryOp::BitOr => BinaryOp::BitOr,
-			ast::BinaryOp::BitXor => BinaryOp::BitXor,
-			ast::BinaryOp::LeftShift => BinaryOp::LeftShift,
-			ast::BinaryOp::RightShift => BinaryOp::RightShift,
-			ast::BinaryOp::Assign
-			| ast::BinaryOp::AddAssign
-			| ast::BinaryOp::SubAssign
-			| ast::BinaryOp::MulAssign
-			| ast::BinaryOp::DivAssign
-			| ast::BinaryOp::RemAssign
-			| ast::BinaryOp::BitAndAssign
-			| ast::BinaryOp::BitOrAssign
-			| ast::BinaryOp::BitXorAssign
-			| ast::BinaryOp::LeftShiftAssign
-			| ast::BinaryOp::RightShiftAssign => unreachable!(
-				"assignment operators never reach tir::ExprKind::Binary — \
-				 they are represented by dedicated Assign/CompoundAssign-family nodes"
-			),
-		}
-	}
-}
-
-impl BinaryOp {
-	pub fn is_arithmetic(&self) -> bool {
-		matches!(
-			self,
-			BinaryOp::Add
-				| BinaryOp::Sub
-				| BinaryOp::Mul
-				| BinaryOp::Div
-				| BinaryOp::Rem
-		)
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ExprKind {
-	Error,
-	Placeholder,
-	Unreachable,
-	/// Mirrors `ast::Expression::Int`: the raw, non-negative magnitude as
-	/// written, never itself negative — see that type's doc comment.
-	Int {
-		value: u64,
-	},
-	Float {
-		value: f64,
-	},
-	Bool {
-		value: bool,
-	},
-	Global {
-		id: DefId,
-	},
-	Function {
-		id: DefId,
-	},
-	Memory {
-		id: DefId,
-	},
-	LocalDeclaration {
-		name: ast::Spanned<SymbolU32>,
-		scope_index: ScopeIndex,
-		local_index: LocalIndex,
-		value: Box<Expression>,
-	},
-	/// `local (a, b) = expr;` — binds several locals from a *single*
-	/// evaluation of `value`.
-	///
-	/// Deliberately not desugared into one `LocalDeclaration` per binding:
-	/// TIR is a tree, so code is emitted once per occurrence of a node, and
-	/// handing the same `value` to several declarations would re-evaluate it
-	/// per binding. Holding the bindings together lets MIR spill `value` into
-	/// one temp — the idiom it already uses in `lower_compound_store` and
-	/// friends — and read every binding out of that. It also keeps the temp
-	/// on the MIR side, where `Local` has no name, rather than forcing a
-	/// nameless local into TIR where every local is a user-written binding.
-	///
-	/// `bindings` may be empty (`local Point::{ .. } = p;`), in which case
-	/// this is just "evaluate `value`, discard it".
-	DestructureDeclaration {
-		value: Box<Expression>,
-		bindings: Box<[PatternBinding]>,
-	},
-	Local {
-		scope_index: ScopeIndex,
-		local_index: LocalIndex,
-	},
-	Return {
-		value: Option<Box<Expression>>,
-	},
-	EnumVariant {
-		enum_index: EnumIndex,
-		variant_index: EnumVariantIndex,
-	},
-	Unary {
-		operator: ast::Spanned<ast::UnaryOp>,
-		operand: Box<Expression>,
-	},
-	Binary {
-		operator: ast::Spanned<BinaryOp>,
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Call {
-		callee: Box<Expression>,
-		arguments: Box<[Expression]>,
-	},
-	/// `type_args[i]` = concrete type substituted for `TypeParam { param_index:
-	/// i }`.
-	GenericCall {
-		id: DefId,
-		type_args: Box<[TypeIndex]>,
-		arguments: Box<[Expression]>,
-	},
-	/// `type_args[0]` = Self (receiver), `type_args[1..]` = explicit generics.
-	GenericMethodCall {
-		id: DefId,
-		type_args: Box<[TypeIndex]>,
-		arguments: Box<[Expression]>,
-	},
-	MethodCall {
-		arguments: Box<[Expression]>,
-		id: ast::DefId,
-	},
-	Block {
-		scope_index: ScopeIndex,
-		expressions: Box<[Expression]>,
-		result: Option<Box<Expression>>,
-	},
-	IfElse {
-		condition: Box<Expression>,
-		then_block: Box<Expression>,
-		else_block: Option<Box<Expression>>,
-	},
-	Match {
-		scrutinee: Box<Expression>,
-		arms: Box<[MatchArm]>,
-	},
-	Break {
-		scope_index: ScopeIndex,
-		value: Option<Box<Expression>>,
-	},
-	Continue {
-		scope_index: ScopeIndex,
-	},
-	Loop {
-		scope_index: ScopeIndex,
-		block: Box<Expression>,
-	},
-	NamespaceAccess {
-		namespace: ast::Spanned<TypeIndex>,
-		member: Box<Expression>,
-	},
-	Const {
-		id: ast::DefId,
-	},
-	String {
-		symbol: SymbolU32,
-	},
-	Char {
-		value: char,
-	},
-	FieldAccess {
-		object: Box<Expression>,
-		field: ast::Spanned<SymbolU32>,
-	},
-
-	StructInit {
-		struct_index: StructIndex,
-		fields: Box<[Expression]>,
-	},
-	TupleInit {
-		elements: Box<[Expression]>,
-	},
-	/// `[a, b, c]` — all elements are compile-time constants; placed in static data.
-	ArrayLiteral {
-		elements: Box<[Expression]>,
-		memory: TypeIndex,
-	},
-	/// `[value; count]` — repeat form; placed in static data.
-	ArrayRepeat {
-		value: Box<Expression>,
-		count: u32,
-		memory: TypeIndex,
-	},
-
-	/// `object[start..end]` — exclusive slice range.
-	/// `None` means the bound was omitted: `start = None` is `0`, `end = None`
-	/// is the object's length.  MIR fills these in during lowering.
-	SliceRange {
-		object: Box<Expression>,
-		start: Option<Box<Expression>>,
-		end: Option<Box<Expression>>,
-	},
-	/// Load a value from a memory place (`place.*` or `place.field`, etc.).
-	Load {
-		place: Box<Place>,
-	},
-	/// Take the address of a memory place (`.&` postfix operator). Always
-	/// produces a shared reference.
-	AddressOf {
-		place: Box<Place>,
-	},
-	/// Store a value to a memory place (assignment through a place).
-	Store {
-		target: Box<Place>,
-		value: Box<Expression>,
-	},
-	/// `x = y` for a `Local`/`Global`/`FieldAccess`/`Placeholder` target —
-	/// the non-`Place` counterpart of `Store`. Kept as its own node (rather
-	/// than reusing `Binary`) so `Binary`'s operator can be the assignment-
-	/// free `tir::BinaryOp` — see that type's doc comment.
-	Assign {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	/// `x += y` and friends where `x`'s type is already concrete and a real
-	/// `Add`-style impl was found — sugar over `x = x.add(y)`, but its own
-	/// node (rather than desugared into a `MethodCall` at TIR-build time,
-	/// the way plain `+` is) because `target` would otherwise have to be
-	/// built twice — once to read the current value, once as the
-	/// assignment target — which isn't safe in general since `Expression`
-	/// isn't `Clone` and a `target` may itself embed side-effecting
-	/// sub-expressions. `target` is `Local`/`Global`/`FieldAccess` only —
-	/// `Load{place}` targets use `CompoundStore` instead, since a `Place`
-	/// needs its own once-only-lowering treatment distinct from an
-	/// `Expression`'s. `method_id` is the resolved `Add`-style impl method.
-	CompoundAssign {
-		target: Box<Expression>,
-		rhs: Box<Expression>,
-		method_id: ast::DefId,
-	},
-	/// The `CompoundAssign` counterpart for when `target`'s type isn't
-	/// concrete yet at TIR-build time (a bare `TypeParam` or a
-	/// typeset-bounded `AssocTypeProjection`) — `abstract_method_id` is the
-	/// trait's own abstract method declaration (no body) and `self_type` is
-	/// `target`'s (still abstract) type, mirroring `GenericMethodCall`'s
-	/// `type_args[0] = Self` convention (stored bare rather than as a
-	/// single-element `type_args` slice since none of the operator traits'
-	/// methods carry any generics of their own beyond the implicit `Self`).
-	/// Resolved for real once monomorphization substitutes a concrete
-	/// `Self`, via the exact same `find_trait_impl` fallback
-	/// `GenericMethodCall` already uses for abstract trait methods at
-	/// MIR-lowering time — no new resolution machinery.
-	GenericCompoundAssign {
-		target: Box<Expression>,
-		rhs: Box<Expression>,
-		abstract_method_id: ast::DefId,
-		self_type: TypeIndex,
-	},
-	/// The `Load{place}`-targeted analogue of `CompoundAssign`, named to
-	/// mirror `Store`. Needed as a distinct node (rather than reusing
-	/// `CompoundAssign` with `target: Load{place}`) because a `Place`'s
-	/// address must be computed exactly once and reused for both the old-
-	/// value read and the store — MIR lowers `target` directly as a
-	/// `Place`, not as an `Expression` wrapping one.
-	CompoundStore {
-		target: Box<Place>,
-		rhs: Box<Expression>,
-		method_id: ast::DefId,
-	},
-	/// The `Load{place}`-targeted analogue of `GenericCompoundAssign` — see
-	/// both `CompoundStore` and `GenericCompoundAssign`'s doc comments.
-	GenericCompoundStore {
-		target: Box<Place>,
-		rhs: Box<Expression>,
-		abstract_method_id: ast::DefId,
-		self_type: TypeIndex,
-	},
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Expression {
-	pub kind: ExprKind,
-	pub ty: TypeIndex,
-	pub span: ast::TextSpan,
-}
-
-/// The compile-time value of a constant expression (enum variant value, `const`
-/// initializer). Cached alongside the built `Expression` tree rather than replacing
-/// it, so the tree stays available for LSP/semantic-analysis use while codegen and
-/// validation can read the value directly without re-interpreting the tree.
-#[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ConstValue {
-	Int(i64),
-	Float(f64),
-	Bool(bool),
-	Char(char),
-}
-
-#[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum AccessKind {
-	Read,
-	Write,
-	ReadWrite,
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-struct AccessContext {
-	/// Hint for type inference at this expression site.
-	/// `TypeIndex::INFER` means "no constraint".
-	/// A type containing `TypeIndex::INFER` (e.g. `Layout<_>`) is a partial
-	/// constraint — positions marked INFER act as wildcards.
-	expected_type: TypeIndex,
-	access_kind: AccessKind,
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct LocalAccess {
-	pub span: TextSpan,
-	pub kind: AccessKind,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Local {
-	pub name: Spanned<SymbolU32>,
-	pub ty: TypeIndex,
-	pub mut_span: Option<TextSpan>,
-	pub accesses: Vec<LocalAccess>,
-}
-
-/// One step of a destructuring projection: "take field `index` of an
-/// aggregate of type `aggregate_ty`".
-///
-/// `aggregate_ty` is carried explicitly so MIR never has to re-derive the
-/// type it is indexing into — `lower_type_index(aggregate_ty)` hands back the
-/// interned `Aggregate` directly, generic substitution already applied, and
-/// its `decl_to_phys` maps `index` onto the alignment-sorted slot.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy)]
-pub struct PathStep {
-	pub aggregate_ty: TypeIndex,
-	/// Declaration-order index — the field's position as written in the
-	/// `struct`, or the element's position in the tuple. Not the physical
-	/// slot; MIR maps it through `decl_to_phys`.
-	pub index: u32,
-}
-
-/// One name bound by a `DestructureDeclaration`, plus the projection path
-/// reaching its value from the scrutinee. Nested patterns are flattened, so
-/// `local (x, (y, z)) = t;` yields paths `[0]`, `[1, 0]`, `[1, 1]` rather
-/// than a nested structure.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct PatternBinding {
-	pub scope_index: ScopeIndex,
-	pub local_index: LocalIndex,
-	pub path: Box<[PathStep]>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy, PartialEq)]
-pub enum BlockKind {
-	Block,
-	/// Type inferred from `break`, not the final expression.
-	Loop,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct BlockLabel {
-	pub name: Spanned<SymbolU32>,
-	pub accesses: Vec<TextSpan>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct BlockScope {
-	pub kind: BlockKind,
-	pub label: Option<LabelIndex>,
-	pub parent: Option<ScopeIndex>,
-	pub span: TextSpan,
-	pub locals: Vec<Local>,
-	/// Type accumulated from `break` arms; `INFER` means nothing seen yet.
-	pub inferred_type: TypeIndex,
-	/// Hint from the surrounding context; `INFER` means unconstrained.
-	pub expected_type: TypeIndex,
-}
-
-impl BlockScope {
-	#[inline]
-	pub fn locals_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (LocalIndex, &Local)> {
-		self.locals
-			.iter()
-			.enumerate()
-			.map(|(index, local)| (LocalIndex::new(index as u32), local))
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct StackFrame {
-	pub labels: Vec<BlockLabel>,
-	pub scopes: Vec<BlockScope>,
-}
-
-impl StackFrame {
-	#[inline]
-	pub fn scopes_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (ScopeIndex, &BlockScope)> {
-		self.scopes
-			.iter()
-			.enumerate()
-			.map(|(index, scope)| (ScopeIndex::new(index as u32), scope))
-	}
-
-	#[inline]
-	fn push_local(
-		&mut self,
-		scope_index: ScopeIndex,
-		local: Local,
-	) -> LocalIndex {
-		let scope = &mut self.scopes[usize::from(scope_index)];
-		let local_index = LocalIndex::new(scope.locals.len() as u32);
-		scope.locals.push(local);
-		local_index
-	}
-
-	#[inline]
-	fn push_label(&mut self, label: Spanned<SymbolU32>) -> LabelIndex {
-		let label_index = LabelIndex::new(self.labels.len() as u32);
-		self.labels.push(BlockLabel {
-			name: label,
-			accesses: Vec::new(),
-		});
-		label_index
-	}
-
-	#[inline]
-	fn get_local(
-		&self,
-		scope_index: ScopeIndex,
-		local_index: LocalIndex,
-	) -> &Local {
-		&self.scopes[usize::from(scope_index)].locals[usize::from(local_index)]
-	}
-
-	#[inline]
-	fn record_local_access(
-		&mut self,
-		scope_index: ScopeIndex,
-		local_index: LocalIndex,
-		access: LocalAccess,
-	) {
-		self.scopes[usize::from(scope_index)].locals[usize::from(local_index)]
-			.accesses
-			.push(access);
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone)]
-pub struct FunctionParam {
-	pub mut_span: Option<ast::TextSpan>,
-	pub name: ast::Spanned<SymbolU32>,
-	pub ty: ast::Spanned<TypeIndex>,
-}
-
-/// One named leaf of a `use` tree — `sin` in `use math::trig::{sin, cos};`.
-/// One per leaf, so it is 1:1 with a `DefId`. Globs have no entry here:
-/// they register a [`WildcardImport`] at prescan and bind no name.
-///
-/// This exists so that a `use` leaf is an *item* like any other.
-/// `SymbolKind::Pending(def_id)` universally means "a stub for `def_id` is
-/// already materialized, reachable through `item_lookup`" — that invariant
-/// is what lets `get_symbol_location` produce a declaration span for a name
-/// whose signature hasn't been computed yet. A leaf that bound a name
-/// without a stub would be a `Pending` with nothing behind it, and the
-/// duplicate-definition diagnostic for `use a::foo;` alongside `fn foo`
-/// would panic on the missing key rather than report.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct UseItem {
-	pub id: DefId,
-	pub file_id: FileId,
-	/// The namespace the `use` was written in — where `local_name` binds.
-	pub namespace: NamespaceIndex,
-	/// Index into [`ItemRegistry::use_prefixes`] — the `math` of `use math::sin;`,
-	/// shared with every sibling leaf that named the same tokens.
-	pub prefix: UsePrefixIndex,
-	pub name: ast::Spanned<SymbolU32>,
-	pub alias: Option<ast::Spanned<SymbolU32>>,
-	/// The `use` statement's own visibility qualifier — `Some` for `pub use`.
-	/// Distinct from the visibility of whatever item this leaf re-exports:
-	/// that was already checked once, when this leaf's own prefix resolved
-	/// (`resolve_pending_namespace_symbol` from the writing namespace).
-	/// This is what governs whether *this* binding is reachable from
-	/// outside the writing namespace — see [`SymbolEntry::visibility`].
-	pub pub_span: Option<ast::TextSpan>,
-}
-
-/// One occurrence of a `use` prefix — `math` in `use math::{sin, cos};`,
-/// named once in the source and therefore stored once here, however many
-/// leaves sit under it.
-///
-/// Walking it per leaf would resolve the same path repeatedly and record
-/// the same access repeatedly; since the LSP turns every access into a
-/// reference, the duplicates would give find-references repeats and make a
-/// rename emit two overlapping edits at one range. Whichever leaf needs it
-/// first walks it and stores the outcome; the rest read that.
-///
-/// Two separate statements — `use math::add; use math::sub;` — get two
-/// entries, correctly: they are two distinct mentions of `math`.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct UsePrefix {
-	/// The segments as written. Purely syntactic — prescan cannot resolve
-	/// them, which is exactly why named leaves defer to Phase 2. Recorded
-	/// here rather than recovered from the AST later because the prescan
-	/// walk builds this anyway to resolve sibling globs.
-	pub path: Box<[ast::Spanned<SymbolU32>]>,
-	pub target: PrefixTarget,
-}
-
-/// Where a [`UsePrefix`] leads. Three states rather than an
-/// `Option<NamespaceIndex>`, because "nobody has walked this yet" and
-/// "walked, and it goes nowhere" need different answers: the first means
-/// walk it, the second means stay quiet, since the diagnostic was already
-/// reported by whoever walked it.
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum PrefixTarget {
-	Unwalked,
-	Resolved(NamespaceIndex),
-	Failed,
-}
-
-impl UseItem {
-	/// The name this import binds locally — the alias when renamed, else
-	/// the imported name itself.
-	#[inline]
-	pub fn local_name(&self) -> ast::Spanned<SymbolU32> {
-		self.alias.unwrap_or(self.name)
-	}
-}
-
-/// A package's `export { .. }` block — its single exit point, and so
-/// either present exactly once or absent entirely.
-///
-/// The resolved items live *inside* the block rather than in a `TIR`-level
-/// map beside a separate "have we already seen a block?" flag, so that one
-/// `Option` answers both questions and the two can never disagree: the
-/// check that rejects a second block is a read of the very value that
-/// holds the first block's exports.
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
-pub struct ExportBlock {
-	/// The `export` keyword itself — what a "previous export block here"
-	/// label points at, and the only span an empty block has.
-	pub keyword: SourceSpan,
-	/// Keyed by *external* name (`alias ?? internal_name`): what has to be
-	/// unique is the name the WASM ABI exposes, not the item's internal
-	/// spelling.
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub items: HashMap<SymbolU32, ExportItem>,
-}
-
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
-#[derive(Clone)]
-pub enum ExportItem {
-	Function {
-		internal_name: Spanned<SymbolU32>,
-		external_name: Option<Spanned<SymbolU32>>,
-		id: DefId,
-	},
-	Global {
-		internal_name: Spanned<SymbolU32>,
-		external_name: Option<Spanned<SymbolU32>>,
-		id: DefId,
-	},
-	Memory {
-		internal_name: Spanned<SymbolU32>,
-		external_name: Option<Spanned<SymbolU32>>,
-		id: DefId,
-	},
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Enum {
-	pub id: ast::DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub pub_span: Option<ast::TextSpan>,
-	pub name: ast::Spanned<SymbolU32>,
-	pub repr_type: TypeIndex,
-	pub self_type: TypeIndex,
-	pub variants: Box<[EnumVariant]>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub variant_lookup: HashMap<SymbolU32, EnumVariantIndex>,
-	pub accesses: Vec<SourceSpan>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct EnumVariant {
-	pub name: ast::Spanned<SymbolU32>,
-	pub value: Option<Box<Expression>>,
-	/// Compile-time value of `value`, if it folds — see `Builder::eval_const_expr`.
-	pub const_value: Option<ConstValue>,
-	pub accesses: Vec<SourceSpan>,
-}
-
-impl Enum {
-	#[inline]
-	pub fn variants_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (EnumVariantIndex, &EnumVariant)> {
-		self.variants.iter().enumerate().map(|(index, variant)| {
-			(EnumVariantIndex::new(index as u32), variant)
-		})
-	}
-}
-
-/// A resolved `match` arm pattern. v1 supports only patterns whose legality
-/// can be checked by re-running the ordinary expression builder on the arm's
-/// syntax (see `Builder::build_pattern`) — no bindings, no or-patterns, no
-/// guards.
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum Pattern {
-	Int(i64),
-	Bool(bool),
-	Char(char),
-	EnumVariant {
-		enum_index: EnumIndex,
-		variant_index: EnumVariantIndex,
-	},
-	Wildcard,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct MatchArm {
-	pub pattern: Pattern,
-	pub pattern_span: ast::TextSpan,
-	pub body: Box<Expression>,
-}
-
-/// `PartialEq` is item identity: every variant is a plain index into a
-/// `TIR` collection, so two equal `SymbolKind`s name the same item. That is
-/// what lets a name reachable through two different globs be recognised as
-/// one item rather than an ambiguity — two modules that each `pub use
-/// c::foo;` both store the identical `Function { func_index }`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum SymbolKind {
-	Enum {
-		enum_index: EnumIndex,
-	},
-	Struct {
-		struct_index: StructIndex,
-	},
-	Module {
-		namespace_idx: NamespaceIndex,
-	},
-	Memory {
-		memory_index: MemoryIndex,
-		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
-		size: TypeIndex,
-	},
-	Trait {
-		trait_index: TraitIndex,
-	},
-	TypeSet {
-		typeset_index: TypesetIndex,
-	},
-	Global {
-		global_index: GlobalIndex,
-	},
-	Function {
-		func_index: FunctionIndex,
-	},
-	Const {
-		const_index: ConstIndex,
-	},
-	/// Resolved form of a trait associated type (`type Size`). Replaces a
-	/// `SymbolEntry::Pending` in the symbol table after `ensure_signature`
-	/// processes the declaration, so bare uses of `Size` as a type
-	/// identifier don't stall.
-	TraitAssocType {
-		trait_index: TraitIndex,
-		assoc_name: SymbolU32,
-	},
-	TypeAlias {
-		type_alias_index: TypeAliasIndex,
-	},
-}
-
-impl SymbolKind {
-	/// What kind of symbol this is, for diagnostics.
-	pub fn noun(self) -> &'static str {
-		match self {
-			SymbolKind::Enum { .. } => "enum",
-			SymbolKind::Struct { .. } => "struct",
-			SymbolKind::Module { .. } => "module",
-			SymbolKind::Memory { .. } => "memory",
-			SymbolKind::Trait { .. } => "trait",
-			SymbolKind::TypeSet { .. } => "type set",
-			SymbolKind::Global { .. } => "global",
-			SymbolKind::Function { .. } => "function",
-			SymbolKind::Const { .. } => "constant",
-			SymbolKind::TraitAssocType { .. } => "associated type",
-			SymbolKind::TypeAlias { .. } => "type alias",
-		}
-	}
-}
-
-/// Whether a resolved [`SymbolEntry`] is reachable from outside its own
-/// namespace. Kinds that aren't subject to `pub`/private at all — memories,
-/// import-block members, and a `Module` reached via `crate`/a dependency
-/// name — are represented as `Public` too: not a claim that they were
-/// written `pub`, just the honest, unconditionally-visible behavior for
-/// something privacy doesn't apply to (see `symbol_kind_is_gated`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum Visibility {
-	Public,
-	/// Visible only to this entry's own namespace and its descendants.
-	Private,
-}
-
-/// One entry in a [`ModuleNamespace`]'s symbol table — either a claim
-/// registered at pre-scan with nothing resolved yet, or a settled binding.
-///
-/// Split out of `SymbolKind` itself (which used to carry a `Pending(DefId)`
-/// variant of its own) so a still-unresolved claim simply has no
-/// `visibility` to read: the underlying item's own `pub_span` (or a `use`
-/// leaf's) isn't known until `ensure_signature` runs, so instead of
-/// inventing a placeholder value, that state isn't representable here at
-/// all. Every lookup that only wants "what does this name mean" and
-/// doesn't care about visibility can still get a plain `SymbolKind` back
-/// via [`Self::resolved_kind`] — `None` while still pending.
-///
-/// `visibility` on `Resolved` is the visibility of *this binding* — not
-/// necessarily the same as whatever the underlying item declared. A direct
-/// declaration's entry and the item's own visibility always agree
-/// (`insert_symbol` derives one from the other). A `use` re-export's entry
-/// does not: it carries the `use` leaf's own `pub_span`, since re-export
-/// privacy is independent of the original item's — that's already checked
-/// once, when the leaf's own prefix resolved. This is what lets
-/// `SymbolKind` stay a pure item identity (needed so the same item reached
-/// through two globs compares equal) while still tracking per-binding
-/// privacy.
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum SymbolEntry {
-	/// Registered during pre-scan but not yet resolved; replaced by
-	/// `Resolved` when `ensure_signature` runs for this `DefId`.
-	Pending(ast::DefId),
-	Resolved {
-		kind: SymbolKind,
-		visibility: Visibility,
-	},
-}
-
-impl SymbolEntry {
-	/// What kind of symbol this entry contains, for diagnostics. Pending
-	/// entries stay vague because their signatures have not been computed.
-	pub fn noun(self) -> &'static str {
-		match self {
-			SymbolEntry::Pending(_) => "item",
-			SymbolEntry::Resolved { kind, .. } => kind.noun(),
-		}
-	}
-
-	/// The `SymbolKind` this entry names, or `None` while still pending —
-	/// for a lookup that only cares "what does this name mean" and doesn't
-	/// need to force resolution or read visibility.
-	pub fn resolved_kind(self) -> Option<SymbolKind> {
-		match self {
-			SymbolEntry::Pending(_) => None,
-			SymbolEntry::Resolved { kind, .. } => Some(kind),
-		}
-	}
-}
-
-/// Item identity only — mirrors `SymbolKind`'s own `PartialEq` (a plain
-/// index comparison), ignoring `visibility` on `Resolved`. This is what
-/// lets a name reachable through two different globs, one via a `pub use`
-/// and one direct, still collapse into "the same item" rather than a false
-/// ambiguity even though the two entries' visibility can legitimately
-/// differ.
-impl PartialEq for SymbolEntry {
-	fn eq(&self, other: &Self) -> bool {
-		match (self, other) {
-			(SymbolEntry::Pending(a), SymbolEntry::Pending(b)) => a == b,
-			(
-				SymbolEntry::Resolved { kind: a, .. },
-				SymbolEntry::Resolved { kind: b, .. },
-			) => a == b,
-			_ => false,
-		}
-	}
-}
-impl Eq for SymbolEntry {}
-
-/// Result of resolving a single-segment name. Separates the two categories
-/// of symbols: global items (registered in the symbol table) and local
-/// variables (stack-scoped within a function body).
-#[derive(Clone, Copy)]
-pub enum ResolvedSymbol {
-	Local {
-		scope_index: ScopeIndex,
-		local_index: LocalIndex,
-	},
-	Global(SymbolKind),
-}
-
-/// The kind of item found when resolving a member within a type namespace.
-#[derive(Clone)]
-pub enum ResolvedMember {
-	Function {
-		func_index: FunctionIndex,
-		type_args: Box<[TypeIndex]>,
-	},
-	Const {
-		const_index: ConstIndex,
-		/// Substitutes the owning trait's `Self` (and any of its own type
-		/// params) when the constant's declared type references them, e.g.
-		/// `Mem::PAGE_SIZE` where the trait declares `const PAGE_SIZE:
-		/// Self::Size` — empty for a plain (non-`Self`-relative) const type,
-		/// same convention as `Function`'s `type_args`.
-		type_args: Box<[TypeIndex]>,
-	},
-	Global {
-		global_index: GlobalIndex,
-	},
-	EnumVariant {
-		enum_index: EnumIndex,
-		variant_index: EnumVariantIndex,
-	},
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ImportValue {
-	Function { id: DefId },
-	Global { id: DefId },
-	Memory { id: DefId },
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Memory {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub name: ast::Spanned<SymbolU32>,
-	pub size: Spanned<TypeIndex>,
-	pub min_pages: Option<u32>,
-	pub max_pages: Option<u32>,
-	pub accesses: Vec<SourceSpan>,
-}
-
-/// Back-pointer to whichever declaration created this namespace.
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ModuleDeclarationKind {
-	/// Index into `TIR::module_decls`.
-	Module(ModuleDeclIndex),
-	/// Index into `TIR::import_decls`.
-	Import(ImportDeclIndex),
-	/// A package's own root namespace. Carries the entry module's `FileId`
-	/// for diagnostic spans; which package it is lives on
-	/// [`ModuleNamespace::package`], the same as for every other namespace.
-	Package(FileId),
-}
-
-/// The symbol table for a module namespace — shared concept for both local
-/// modules (`mod foo;` / `mod foo { }`) and import blocks (`import "env" { }`).
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ModuleNamespace {
-	/// `None` for a package's own root namespace, which has no ancestor.
-	///
-	/// No name: that belongs to the declaration that introduced this
-	/// namespace, and a package has no single one.
-	pub parent: Option<NamespaceIndex>,
-	/// The package this namespace belongs to — every namespace is inside
-	/// exactly one, so it's stored rather than recovered by walking parents.
-	pub package: PackageId,
-	pub declaration: ModuleDeclarationKind,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub symbols: HashMap<(SymbolNamespace, SymbolU32), SymbolEntry>,
-	/// Namespaces brought into scope via `use path::*;`.  Checked during lookup
-	/// after direct symbols but before walking to the parent.
-	pub wildcard_imports: Vec<WildcardImport>,
-	/// Source spans where this namespace is referenced (e.g. path segments in
-	/// `use` statements).  Used by the IDE for go-to-definition.
-	pub accesses: Vec<SourceSpan>,
-}
-
-/// Declaration-site metadata for a locally-defined module (`mod foo;` / `mod foo { }`).
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ModuleDecl {
-	/// Index into `TIR::namespaces` for this module's symbol table.
-	pub namespace_idx: NamespaceIndex,
-	/// File containing the `mod foo;` or `mod foo { }` declaration.
-	pub declaring_file_id: FileId,
-	/// File that IS this module (`foo.wx`). `None` for inline modules.
-	pub own_file_id: Option<FileId>,
-	pub name: ast::Spanned<SymbolU32>,
-	pub pub_span: Option<ast::TextSpan>,
-}
-
-/// One `use path::*;` edge — the namespace it opens, plus where it was
-/// written.
-///
-/// The span is what makes a wildcard ambiguity reportable: when two globs
-/// supply the same name, the thing to point at is the `use` statements, not
-/// the definitions (which are each perfectly fine on their own). Covers the
-/// path and the star, `x::*`, not the `use` keyword — and for a glob nested
-/// in a group (`use a::{b::*, c}`) only `b::*`, since a span reaching back
-/// to `a` wouldn't be a contiguous range of source.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct WildcardImport {
-	pub namespace: NamespaceIndex,
-	pub span: SourceSpan,
-}
-
-/// Declaration-site metadata for an import block (`import "env" { }`).
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ImportDecl {
-	/// Index into `TIR::namespaces` for this import module's symbol table.
-	pub namespace_idx: NamespaceIndex,
-	pub file_id: FileId,
-	pub external_name: ast::Spanned<SymbolU32>,
-	pub internal_name: Option<ast::Spanned<SymbolU32>>,
-	/// Maps item names to imported values — used by MIR to emit the WASM import section.
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub lookup: HashMap<SymbolU32, ImportValue>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum SymbolNamespace {
-	Type,
-	Value,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-	/// Unused-item warnings are suppressed.
-	Library,
-	Module,
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ImplEntry {
-	Method(FunctionIndex),
-	AssocFunction(FunctionIndex),
-	AssocConstant(ConstIndex),
-	AssocType(AssocTypeIndex),
-}
-
-/// Backing storage for `ImplEntry::AssocType`. One entry per associated-type
-/// declaration (trait side, `ty` is a `Type::AssociatedType` placeholder) or
-/// binding (impl side, `ty` is the concrete type) — gives both cases a real
-/// `DefId`/span instead of just a bare `TypeIndex`.
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct AssocTypeImpl {
-	pub id: DefId,
-	pub file_id: FileId,
-	/// The scope it was declared in. Kept alongside `file_id` so trait
-	/// conformance checking, which walks impls rather than source, can
-	/// report against the right scope without reconstructing one.
-	pub namespace: NamespaceIndex,
-	pub name: Spanned<SymbolU32>,
-	pub ty: Option<Spanned<TypeIndex>>,
-	pub attributes: Box<[ItemAttribute]>,
-}
-
-impl ImplEntry {
-	/// What kind of item this is, for diagnostics.
-	pub fn noun(self) -> &'static str {
-		match self {
-			ImplEntry::AssocFunction(_) => "function",
-			ImplEntry::Method(_) => "method",
-			ImplEntry::AssocConstant(_) => "constant",
-			ImplEntry::AssocType(_) => "type",
-		}
-	}
-
-	pub fn def_span(self, items: &ItemRegistry) -> SourceSpan {
-		match self {
-			ImplEntry::Method(func_index)
-			| ImplEntry::AssocFunction(func_index) => {
-				let func = &items.functions[usize::from(func_index)];
-				SourceSpan::new(func.file_id, func.name.span)
-			}
-			ImplEntry::AssocConstant(index) => {
-				let constant = &items.constants[usize::from(index)];
-				SourceSpan::new(constant.file_id, constant.name.span)
-			}
-			ImplEntry::AssocType(index) => {
-				let assoc_type = &items.assoc_type_impls[usize::from(index)];
-				SourceSpan::new(assoc_type.file_id, assoc_type.name.span)
-			}
-		}
-	}
-}
-
-/// One `impl<Params> Target { ... }` block — inherent, not a trait impl.
-/// This is the canonical owner of the impl-level type parameters; member
-/// functions reference them via `TypeParamOwner::ImplBlock` rather than
-/// storing a copy. `type_params` is empty for what used to be called a
-/// "concrete" impl (`impl Target { .. }`) — that's no longer a structurally
-/// different thing, just the degenerate (zero-parameter) case of the same
-/// shape, so a concrete and a generic inherent impl can be compared/detected
-/// as conflicting on equal footing instead of living in separate registries.
-pub struct InherentImpl {
-	/// Synthetic `DefId` used to demand-drive this block's `ensure_signature`.
-	pub id: ast::DefId,
-	pub file_id: FileId,
-	pub type_params: Box<[TypeParamInfo]>,
-	/// `inner` is `TypeIndex::ERROR` until `ensure_signature` for this block
-	/// runs. `span` is the target type expression as written in the impl
-	/// header (`impl «this» { .. }`) — kept alongside the resolved type so
-	/// consumers (e.g. `Self`'s go-to-definition) have a source location to
-	/// point at without re-deriving one from the resolved `Type`.
-	pub target: Spanned<TypeIndex>,
-	pub members: HashMap<SymbolU32, ImplEntry>,
-	/// Spans of every `Self` keyword usage resolved against this block —
-	/// kept separate from `target`'s own struct/enum `accesses` so LSP
-	/// consumers (semantic tokens, rename) can tell "literally named the
-	/// type" apart from "used the `Self` keyword", which read the same at
-	/// the type-resolution level but must be treated differently: renaming
-	/// the type must not rewrite `Self` text, and `Self` shouldn't be
-	/// colored like an identifier reference.
-	pub self_accesses: Vec<SourceSpan>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum ImplTarget {
-	U8,
-	I8,
-	U16,
-	I16,
-	U32,
-	I32,
-	U64,
-	I64,
-	F32,
-	F64,
-	Bool,
-	Char,
-	Slice,
-	Array,
-	Struct(StructIndex),
-	Enum(EnumIndex),
-	Memory(DefId),
-	// TODO: should we add tuple and unit here?
-}
-
-impl ImplTarget {
-	pub fn from_type(ty: &Type) -> Result<Self, ()> {
-		match ty {
-			Type::Slice { .. } => Ok(Self::Slice),
-			Type::Array { .. } => Ok(Self::Array),
-			Type::Struct { struct_index, .. } => {
-				Ok(Self::Struct(*struct_index))
-			}
-			Type::Enum { enum_index } => Ok(Self::Enum(*enum_index)),
-			Type::Memory { id, .. } => Ok(Self::Memory(*id)),
-			Type::U8 => Ok(Self::U8),
-			Type::I8 => Ok(Self::I8),
-			Type::U16 => Ok(Self::U16),
-			Type::I16 => Ok(Self::I16),
-			Type::U32 => Ok(Self::U32),
-			Type::I32 => Ok(Self::I32),
-			Type::U64 => Ok(Self::U64),
-			Type::I64 => Ok(Self::I64),
-			Type::F32 => Ok(Self::F32),
-			Type::F64 => Ok(Self::F64),
-			Type::Bool => Ok(Self::Bool),
-			Type::Char => Ok(Self::Char),
-			Type::Error
-			| Type::Infer
-			| Type::Never
-			| Type::Integer
-			| Type::Float
-			| Type::Function { .. }
-			| Type::FunctionItem { .. }
-			| Type::Pointer { .. }
-			| Type::Namespace { .. }
-			| Type::TypeParam { .. }
-			| Type::AssociatedType { .. }
-			| Type::AssocTypeProjection { .. }
-			| Type::Unit
-			| Type::Tuple { .. } => Err(()),
-		}
-	}
-}
-
-#[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum ItemAttribute {
-	Inline,
-	Intrinsic,
-	Tag(SymbolU32),
-	/// `#[fixed_order]` — struct fields keep declaration order in memory
-	/// instead of being sorted by alignment descending.
-	FixedOrder,
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TraitBound {
-	pub trait_index: TraitIndex,
-	/// Resolved RHS of each `where { AssocType = RhsType }` / `where {
-	/// AssocType: Bound }` binding, sorted by assoc-type name for
-	/// deterministic equality. At most one entry per name — `resolve_bounds`
-	/// rejects a second binding for the same associated type regardless of
-	/// which kind either one is, so a name can never appear twice here.
-	pub bindings: Box<[(SymbolU32, AssocBindingKind)]>,
-	pub span: TextSpan,
-}
-
-/// The right-hand side of one `TraitBound` binding.
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum AssocBindingKind {
-	/// `AssocType = RhsType`.
-	Equals(TypeIndex),
-	/// `AssocType: Bound`.
-	Bound(Bounds),
-}
-
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypesetBound {
-	pub typeset_index: TypesetIndex,
-	pub span: TextSpan,
-}
-
-#[derive(Clone, Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Bounds {
-	pub traits: Box<[TraitBound]>,
-	pub typeset: Option<TypesetBound>,
-}
-
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypeParamInfo {
-	pub name: Spanned<SymbolU32>,
-	pub bounds: Bounds,
-	pub accesses: Vec<SourceSpan>,
-}
-
-impl TypeParamInfo {
-	pub fn new(name: Spanned<SymbolU32>) -> Self {
-		Self {
-			name,
-			bounds: Bounds::default(),
-			accesses: Vec::new(),
-		}
-	}
-}
-
-impl Function {
-	/// Total number of type parameters visible to this function's body:
-	/// inherited params from the parent impl block plus the function's own params.
-	pub fn total_type_param_count(&self) -> usize {
-		self.inherited_type_param_count + self.type_params.len()
-	}
-
-	/// The owner of this function's inherited type parameters — the parent
-	/// impl block, trait, or trait impl — or `None` for free and imported
-	/// functions. Derived from [`Function::parent`]: an inherent impl member
-	/// inherits that block's params, a trait member inherits the trait's
-	/// implicit `Self`, a trait-impl member inherits the impl's params.
-	pub fn type_param_parent(&self) -> Option<TypeParamOwner> {
-		Some(match self.parent? {
-			ItemParent::InherentImpl(idx) => TypeParamOwner::InherentImpl(idx),
-			ItemParent::TraitImpl(idx) => TypeParamOwner::TraitImpl(idx),
-			ItemParent::Trait(idx) => TypeParamOwner::Trait(idx),
-		})
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Function {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	/// `Some` for methods/associated functions (impl or trait members) —
-	/// `None` for free top-level and imported functions. See `ItemParent`.
-	pub parent: Option<ItemParent>,
-	pub pub_span: Option<ast::TextSpan>,
-	/// Own type parameters only — does not include params inherited from a
-	/// parent impl block. For the full ordered list, prepend the params from
-	/// [`Function::type_param_parent`]. Empty for monomorphic functions.
-	pub type_params: Box<[TypeParamInfo]>,
-	/// Number of type parameters inherited from [`Function::type_param_parent`].
-	/// `Type::TypeParam::param_index` values for own params start at this
-	/// offset; impl-block params use absolute indices starting at 0.
-	pub inherited_type_param_count: usize,
-	pub signature_index: TypeIndex,
-	pub name: ast::Spanned<SymbolU32>,
-	pub params: Box<[FunctionParam]>,
-	pub result: Option<Spanned<TypeIndex>>,
-	pub accesses: Vec<SourceSpan>,
-	pub attributes: Box<[ItemAttribute]>,
-	/// Index into [`ItemRegistry::bodies`], or `None` when there is no body to
-	/// resolve — an imported or abstract-trait-method function — or Phase 3
-	/// (`ensure_body`) has not demanded it yet.
-	pub body: Option<BodyIndex>,
-}
-
-/// A type-checked expression tree plus the lexical frame it was checked in.
-/// Produced in Phase 3 (`ensure_body`) for any item with an expression
-/// implementation — function bodies and global initializers alike — and stored
-/// in the shared [`ItemRegistry::bodies`] arena, referenced by [`BodyIndex`].
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Body {
-	pub stack: StackFrame,
-	pub block: Box<Expression>,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Global {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub accesses: Vec<SourceSpan>,
-	pub name: Spanned<SymbolU32>,
-	pub ty: Spanned<TypeIndex>,
-	pub pub_span: Option<TextSpan>,
-	pub mut_span: Option<TextSpan>,
-	/// Index into [`ItemRegistry::bodies`] for the initializer expression, or
-	/// `None` until Phase 3 (`ensure_body`) resolves it.
-	pub value: Option<BodyIndex>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum FieldAccessKind {
-	Read,
-	Write,
-	/// A compound assignment (`s.a += 1`): reads the field *and* stores back
-	/// to it. Kept distinct rather than folded into `Read` so that neither
-	/// question — "was this field ever read?" (`Read | ReadWrite`) nor "was
-	/// it ever written?" (`Write | ReadWrite`) — has to be answered wrongly.
-	/// Collapsing it would force a choice of which consumer gets the truth.
-	ReadWrite,
-	/// A field given its value in a struct literal. The one kind with no
-	/// [`AccessKind`] counterpart, since it is not an expression-position
-	/// mention of the field at all.
-	Init,
-}
-
-impl FieldAccessKind {
-	/// How to record a field mention in expression position, given what the
-	/// surrounding expression does to it.
-	pub fn for_access(kind: AccessKind) -> FieldAccessKind {
-		match kind {
-			AccessKind::Read => FieldAccessKind::Read,
-			AccessKind::Write => FieldAccessKind::Write,
-			AccessKind::ReadWrite => FieldAccessKind::ReadWrite,
-		}
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct FieldAccess {
-	pub kind: FieldAccessKind,
-	pub file_id: FileId,
-	pub span: TextSpan,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct StructField {
-	pub name: Spanned<SymbolU32>,
-	pub ty: Spanned<TypeIndex>,
-	pub pub_span: Option<TextSpan>,
-	pub accesses: Vec<FieldAccess>,
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Struct {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub pub_span: Option<TextSpan>,
-	pub name: Spanned<SymbolU32>,
-	/// Empty for non-generic structs.
-	pub type_params: Box<[TypeParamInfo]>,
-	/// `Type::Struct { struct_index, args: [] }` for this struct.
-	#[cfg_attr(test, serde(skip))]
-	pub self_type: TypeIndex,
-	pub attributes: Box<[ItemAttribute]>,
-	pub fields: Box<[StructField]>,
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub lookup: HashMap<SymbolU32, FieldIndex>,
-	pub accesses: Vec<SourceSpan>,
-}
-
-impl Struct {
-	#[inline]
-	pub fn fields_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (FieldIndex, &StructField)> {
-		self.fields
-			.iter()
-			.enumerate()
-			.map(|(index, field)| (FieldIndex::new(index as u32), field))
-	}
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypeAlias {
-	pub id: DefId,
-	pub file_id: FileId,
-	pub namespace: NamespaceIndex,
-	pub pub_span: Option<TextSpan>,
-	pub name: Spanned<SymbolU32>,
-	pub attributes: Box<[ItemAttribute]>,
-	/// Empty for non-generic aliases.
-	pub type_params: Box<[TypeParamInfo]>,
-	/// The alias's target type, fully resolved. For a generic alias this may
-	/// contain `Type::TypeParam { owner: TypeParamOwner::TypeAlias(id), .. }`
-	/// placeholders, substituted via `substitute_type` at each reference site
-	/// that supplies concrete type arguments — the alias is transparent and
-	/// never appears past TIR.
-	///
-	/// Not `Option<TypeIndex>`: always resolved by the time anyone reads it
-	/// (falls back to `TypeIndex::ERROR`, never absent), even for bodiless
-	/// `#[intrinsic] type u8;` declarations. To check whether source actually
-	/// wrote `= Type`, look at `attributes` for `ItemAttribute::Intrinsic`.
-	pub body: TypeIndex,
-	pub accesses: Vec<SourceSpan>,
-}
-
-fn ownership_sigil(ownership: ast::Ownership) -> char {
-	match ownership {
-		ast::Ownership::Exclusive => '*',
-		ast::Ownership::Shared => '&',
-	}
-}
-
-pub struct TypeFormatter<'a> {
-	types: &'a TypeInterner,
-	items: &'a ItemRegistry,
-	modules: &'a ModuleGraph,
-	pub interner: &'a ast::StringInterner,
-	/// Needed to name a package, which has no name of its own — see
-	/// [`TIR::namespace_name`].
-	packages: &'a [PackageGraph],
-	/// The package whose point of view names are rendered from.
-	from: PackageId,
-}
-
-impl<'a> TypeFormatter<'a> {
-	pub fn new(
-		types: &'a TypeInterner,
-		items: &'a ItemRegistry,
-		modules: &'a ModuleGraph,
-		interner: &'a ast::StringInterner,
-		packages: &'a [PackageGraph],
-		from: PackageId,
-	) -> Self {
-		Self {
-			types,
-			items,
-			modules,
-			interner,
-			packages,
-			from,
-		}
-	}
-
-	pub fn display_type(
-		&self,
-		idx: TypeIndex,
-	) -> Result<String, std::fmt::Error> {
-		let mut buffer = String::new();
-		self.write_type(&mut buffer, idx)?;
-		Ok(buffer)
-	}
-
-	pub fn display_bounds(
-		&self,
-		bounds: &Bounds,
-	) -> Result<String, std::fmt::Error> {
-		let mut buffer = String::new();
-		self.write_bounds(&mut buffer, bounds)?;
-		Ok(buffer)
-	}
-
-	fn write_type(
-		&self,
-		f: &mut impl std::fmt::Write,
-		idx: TypeIndex,
-	) -> std::fmt::Result {
-		match self.types.resolve(idx) {
-			Type::Integer => f.write_str("{integer}"),
-			Type::Float => f.write_str("{float}"),
-			Type::Error => f.write_str("{unknown}"),
-			Type::Infer => f.write_str("_"),
-			Type::Unit => f.write_str("()"),
-			Type::Bool => f.write_str("bool"),
-			Type::Char => f.write_str("char"),
-			Type::U8 => f.write_str("u8"),
-			Type::I8 => f.write_str("i8"),
-			Type::U16 => f.write_str("u16"),
-			Type::I16 => f.write_str("i16"),
-			Type::Never => f.write_str("never"),
-			Type::I32 => f.write_str("i32"),
-			Type::I64 => f.write_str("i64"),
-			Type::F32 => f.write_str("f32"),
-			Type::F64 => f.write_str("f64"),
-			Type::U32 => f.write_str("u32"),
-			Type::U64 => f.write_str("u64"),
-			Type::Pointer {
-				to,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory)?;
-				f.write_str("::")?;
-				f.write_char(ownership_sigil(*ownership))?;
-				self.write_type(f, *to)?;
-				Ok(())
-			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory)?;
-				f.write_str("::")?;
-				f.write_char(ownership_sigil(*ownership))?;
-				f.write_char('[')?;
-				self.write_type(f, *of)?;
-				f.write_char(']')?;
-				Ok(())
-			}
-			Type::Array {
-				of,
-				size,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory)?;
-				f.write_str("::")?;
-				f.write_char(ownership_sigil(*ownership))?;
-				f.write_char('[')?;
-				self.write_type(f, *of)?;
-				write!(f, "; {}]", size)?;
-				Ok(())
-			}
-			Type::Tuple { elements } => {
-				f.write_char('(')?;
-				for (i, element) in elements.iter().copied().enumerate() {
-					if i > 0 {
-						f.write_str(", ")?;
-					}
-					self.write_type(f, element)?;
-				}
-				f.write_char(')')?;
-				Ok(())
-			}
-			Type::Struct { struct_index, args } => {
-				self.interner
-					.resolve(
-						self.items.structs[usize::from(*struct_index)]
-							.name
-							.inner,
-					)
-					.ok_or(std::fmt::Error)
-					.and_then(|name| f.write_str(name))?;
-				if !args.is_empty() {
-					f.write_char('<')?;
-					for (i, arg) in args.iter().copied().enumerate() {
-						if i > 0 {
-							f.write_str(", ")?;
-						}
-						self.write_type(f, arg)?;
-					}
-					f.write_char('>')?;
-				}
-				Ok(())
-			}
-			Type::Enum { enum_index } => self
-				.interner
-				.resolve(self.items.enums[usize::from(*enum_index)].name.inner)
-				.ok_or(std::fmt::Error)
-				.and_then(|name| f.write_str(name)),
-			Type::Memory { id, .. } => {
-				let memory_index = self.items.expect_memory_index(*id);
-				self.interner
-					.resolve(
-						self.items.memories[usize::from(memory_index)]
-							.name
-							.inner,
-					)
-					.ok_or(std::fmt::Error)
-					.and_then(|name| f.write_str(name))
-			}
-			Type::Namespace { namespace_idx } => {
-				f.write_str(self.modules.namespace_name(
-					*namespace_idx,
-					self.packages,
-					self.from,
-					self.interner,
-				))
-			}
-			Type::Function { signature } => {
-				f.write_str("fn(")?;
-				for (i, param) in signature.params().iter().copied().enumerate()
-				{
-					if i > 0 {
-						f.write_str(", ")?;
-					}
-					self.write_type(f, param)?;
-				}
-				f.write_str(") -> ")?;
-				self.write_type(f, signature.result())?;
-				Ok(())
-			}
-			Type::FunctionItem { id, .. } => {
-				f.write_str("fn ")?;
-				let func = &self.items.functions
-					[usize::from(self.items.expect_function_index(*id))];
-				self.interner
-					.resolve(func.name.inner)
-					.ok_or(std::fmt::Error)
-					.and_then(|name| f.write_str(name))?;
-				if !func.type_params.is_empty() {
-					f.write_char('<')?;
-					for (i, param_info) in func.type_params.iter().enumerate() {
-						if i > 0 {
-							f.write_str(", ")?;
-						}
-						self.interner
-							.resolve(param_info.name.inner)
-							.ok_or(std::fmt::Error)
-							.and_then(|name| f.write_str(name))?;
-						let has_bounds = !param_info.bounds.traits.is_empty()
-							|| param_info.bounds.typeset.is_some();
-						if has_bounds {
-							f.write_str(": ")?;
-							self.write_bounds(f, &param_info.bounds)?;
-						}
-					}
-					f.write_char('>')?;
-				}
-				f.write_char('(')?;
-				for (i, param) in func.params.iter().enumerate() {
-					if i > 0 {
-						f.write_str(", ")?;
-					}
-					self.write_type(f, param.ty.inner)?;
-				}
-				f.write_str(") -> ")?;
-				match &func.result {
-					Some(result) => self.write_type(f, result.inner)?,
-					None => f.write_str("()")?,
-				};
-				Ok(())
-			}
-			Type::TypeParam { owner, param_index } => {
-				let name = match owner {
-					TypeParamOwner::Function(def_id) => {
-						let func = &self.items.functions[usize::from(
-							self.items.expect_function_index(*def_id),
-						)];
-						let own_idx = *param_index as usize
-							- func.inherited_type_param_count;
-						let symbol = func.type_params[own_idx].name.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-					TypeParamOwner::Struct(def_id) => {
-						let symbol = self.items.structs[usize::from(
-							self.items.expect_struct_index(*def_id),
-						)]
-						.type_params[*param_index as usize]
-							.name
-							.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-					TypeParamOwner::Trait(trait_idx) => {
-						let symbol = self.items.traits[usize::from(*trait_idx)]
-							.self_type_param
-							.name
-							.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-					TypeParamOwner::InherentImpl(block_idx) => {
-						let symbol = self.items.inherent_impls
-							[usize::from(*block_idx)]
-						.type_params[*param_index as usize]
-							.name
-							.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-					TypeParamOwner::TypeAlias(def_id) => {
-						let symbol = self.items.type_aliases[usize::from(
-							self.items.expect_type_alias_index(*def_id),
-						)]
-						.type_params[*param_index as usize]
-							.name
-							.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-					TypeParamOwner::TraitImpl(impl_idx) => {
-						let symbol = self.items.trait_impls
-							[usize::from(*impl_idx)]
-						.type_params[*param_index as usize]
-							.name
-							.inner;
-						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
-					}
-				};
-				f.write_str(name)
-			}
-			Type::AssociatedType {
-				assoc_name,
-				trait_index,
-			} => {
-				self.interner
-					.resolve(
-						self.items.traits[usize::from(*trait_index)].name.inner,
-					)
-					.ok_or(std::fmt::Error)
-					.and_then(|trait_name| f.write_str(trait_name))?;
-				f.write_str("::")?;
-				self.interner
-					.resolve(*assoc_name)
-					.ok_or(std::fmt::Error)
-					.and_then(|type_name| f.write_str(type_name))?;
-				Ok(())
-			}
-			Type::AssocTypeProjection {
-				trait_index,
-				assoc_name,
-				base,
-			} => {
-				let (trait_index, assoc_name, base) =
-					(*trait_index, *assoc_name, *base);
-				// `trait_index` already disambiguates the *type* — this is
-				// purely about whether the unqualified *spelling*
-				// `base::assoc_name` would read as ambiguous to someone
-				// looking at `base`'s own bounds (i.e. more than one bound
-				// trait declares an assoc type with this name), in which
-				// case spell out which one via `<base as Trait>::assoc_name`
-				// instead, matching rustc's own qualified-path printing.
-				if self
-					.items
-					.assoc_type_bound_is_ambiguous(self.types, base, assoc_name)
-				{
-					f.write_str("<")?;
-					self.write_type(f, base)?;
-					f.write_str(" as ")?;
-					self.interner
-						.resolve(
-							self.items.traits[usize::from(trait_index)]
-								.name
-								.inner,
-						)
-						.ok_or(std::fmt::Error)
-						.and_then(|trait_name| f.write_str(trait_name))?;
-					f.write_str(">::")?;
-				} else {
-					self.write_type(f, base)?;
-					f.write_str("::")?;
-				}
-				self.interner
-					.resolve(assoc_name)
-					.ok_or(std::fmt::Error)
-					.and_then(|type_name| f.write_str(type_name))?;
-				Ok(())
-			}
-		}
-	}
-
-	fn write_bounds(
-		&self,
-		f: &mut impl std::fmt::Write,
-		bounds: &Bounds,
-	) -> std::fmt::Result {
-		let mut first = true;
-		for trait_bound in bounds.traits.iter() {
-			if !first {
-				f.write_str(" + ")?;
-			}
-			first = false;
-			self.interner
-				.resolve(
-					self.items.traits[usize::from(trait_bound.trait_index)]
-						.name
-						.inner,
-				)
-				.ok_or(std::fmt::Error)
-				.and_then(|name| f.write_str(name))?;
-			if !trait_bound.bindings.is_empty() {
-				f.write_str(" where { ")?;
-				for (i, (assoc_name, kind)) in
-					trait_bound.bindings.iter().enumerate()
-				{
-					if i > 0 {
-						f.write_str(", ")?;
-					}
-					self.interner
-						.resolve(*assoc_name)
-						.ok_or(std::fmt::Error)
-						.and_then(|name| f.write_str(name))?;
-					match kind {
-						AssocBindingKind::Equals(ty) => {
-							f.write_str(" = ")?;
-							self.write_type(f, *ty)?;
-						}
-						AssocBindingKind::Bound(bound) => {
-							f.write_str(": ")?;
-							self.write_bounds(f, bound)?;
-						}
-					}
-				}
-				f.write_str(" }")?;
-			}
-		}
-		if let Some(typeset) = &bounds.typeset {
-			if !first {
-				f.write_str(" + ")?;
-			}
-			self.interner
-				.resolve(
-					self.items.typesets[usize::from(typeset.typeset_index)]
-						.name
-						.inner,
-				)
-				.ok_or(std::fmt::Error)
-				.and_then(|name| f.write_str(name))?;
-		}
-		Ok(())
-	}
-}
-
-/// Index of a named item in its kind-specific Vec, carried by
-/// [`ItemRegistry::item_lookup`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ItemIndex {
-	Function(FunctionIndex),
-	/// Index into [`ItemRegistry::use_items`] — one named `use` leaf.
-	Use(UseIndex),
-	Global(GlobalIndex),
-	Memory(MemoryIndex),
-	Struct(StructIndex),
-	Const(ConstIndex),
-	TypeSet(TypesetIndex),
-	Trait(TraitIndex),
-	TraitImpl(TraitImplIndex),
-	Enum(EnumIndex),
-	TypeAlias(TypeAliasIndex),
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ItemRegistry {
-	pub functions: Vec<Function>,
-	pub globals: Vec<Global>,
-	pub memories: Vec<Memory>,
-	pub enums: Vec<Enum>,
-	/// Every named `use` leaf, in prescan order. See [`UseItem`].
-	pub use_items: Vec<UseItem>,
-	/// Every distinct `use` prefix occurrence. See [`UsePrefix`].
-	pub use_prefixes: Vec<UsePrefix>,
-	pub structs: Vec<Struct>,
-	/// Every inherent impl block — concrete (`impl Target { .. }`, empty
-	/// `type_params`) and generic (`impl<T> Target { .. }`) alike. See
-	/// `ImplBlock`.
-	#[cfg_attr(test, serde(skip))]
-	pub inherent_impls: Vec<InherentImpl>,
-	/// Dispatch index: `(outer type constructor, member name) → every block
-	/// index that provides that name for that shape`. Coarse on purpose — a
-	/// struct with several separate concrete impls for different type
-	/// arguments (e.g. `impl Box<i32> { .. }` and `impl Box<bool> { .. }`)
-	/// legitimately share one entry here without conflicting; resolution
-	/// checks each candidate against the actual receiver
-	/// (`ItemRegistry::unify_inherent_impl_target`) to find out which ones really apply,
-	/// and it's *that* per-receiver count — not this bucket's raw length —
-	/// that decides whether there's a genuine conflict.
-	#[cfg_attr(test, serde(skip))]
-	pub inherent_impl_dispatch:
-		HashMap<(ImplTarget, SymbolU32), Vec<InherentImplIndex>>,
-	pub traits: Vec<Trait>,
-	pub trait_impls: Vec<TraitImpl>,
-	/// Every trait impl (concrete or generic alike — mirrors
-	/// `impl_block_list`/`impl_block_dispatch`'s treatment of inherent
-	/// impls), coarsely bucketed by outer type constructor only — not by
-	/// trait, since a type rarely has more than a handful of trait impls of
-	/// any kind, so a cheap linear scan filtering by trait index (done in
-	/// `ItemRegistry::find_trait_impl`) is simpler than a second key component.
-	/// `ItemRegistry::unify_trait_impl_target` unifies each candidate's `target` against the
-	/// actual receiver and checks its declared bounds — for a concrete
-	/// (zero-param) impl this degenerates to exact `TypeIndex` equality, so
-	/// `impl Show for Foo<i32>` and `impl Show for Foo<bool>` coexist here
-	/// without conflating: the bucket is only a coarse first-pass filter,
-	/// per-candidate unification is what actually disambiguates.
-	#[cfg_attr(test, serde(skip))]
-	pub trait_impl_dispatch:
-		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
-	pub constants: Vec<Constant>,
-	/// Phase 3 (`ensure_body`) output arena — one entry per resolved function
-	/// body or global initializer, referenced by [`BodyIndex`] from
-	/// `Function::body` / `Global::value`. Append order is demand-driven and
-	/// carries no relation to `functions`/`globals` order.
-	pub bodies: Vec<Body>,
-	pub assoc_type_impls: Vec<AssocTypeImpl>,
-	#[cfg_attr(test, serde(skip))]
-	pub tagged_items: HashMap<SymbolU32, DefId>,
-	pub typesets: Vec<TypeSet>,
-	pub type_aliases: Vec<TypeAlias>,
-	/// Unified lookup: maps every named item's `DefId` to its kind and dense Vec index.
-	/// Replaces the previous per-kind hashmaps (`function_index_lookup`, etc.).
-	#[cfg_attr(test, serde(skip))]
-	pub item_lookup: HashMap<DefId, ItemIndex>,
-}
-
-impl ItemRegistry {
-	pub fn new() -> Self {
-		Self {
-			functions: Vec::new(),
-			globals: Vec::new(),
-			memories: Vec::new(),
-			enums: Vec::new(),
-			use_items: Vec::new(),
-			use_prefixes: Vec::new(),
-			structs: Vec::new(),
-			inherent_impls: Vec::new(),
-			inherent_impl_dispatch: HashMap::new(),
-			traits: Vec::new(),
-			trait_impls: Vec::new(),
-			trait_impl_dispatch: HashMap::new(),
-			constants: Vec::new(),
-			bodies: Vec::new(),
-			assoc_type_impls: Vec::new(),
-			tagged_items: HashMap::new(),
-			typesets: Vec::new(),
-			type_aliases: Vec::new(),
-			item_lookup: HashMap::new(),
-		}
-	}
-
-	fn push_function(&mut self, item: Function) -> FunctionIndex {
-		let index = FunctionIndex::new(
-			u32::try_from(self.functions.len())
-				.expect("function registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::Function(index));
-		self.functions.push(item);
-		index
-	}
-
-	fn push_body(&mut self, body: Body) -> BodyIndex {
-		let index = BodyIndex::new(
-			u32::try_from(self.bodies.len())
-				.expect("body arena exceeded u32 index capacity"),
-		);
-		self.bodies.push(body);
-		index
-	}
-
-	fn push_global(&mut self, item: Global) -> GlobalIndex {
-		let index = GlobalIndex::new(
-			u32::try_from(self.globals.len())
-				.expect("global registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::Global(index));
-		self.globals.push(item);
-		index
-	}
-
-	fn push_memory(&mut self, item: Memory) -> MemoryIndex {
-		let index = MemoryIndex::new(
-			u32::try_from(self.memories.len())
-				.expect("memory registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::Memory(index));
-		self.memories.push(item);
-		index
-	}
-
-	fn push_enum(
-		&mut self,
-		make_item: impl FnOnce(EnumIndex) -> Enum,
-	) -> EnumIndex {
-		let index = EnumIndex::new(
-			u32::try_from(self.enums.len())
-				.expect("enum registry exceeded u32 index capacity"),
-		);
-		let item = make_item(index);
-		self.item_lookup.insert(item.id, ItemIndex::Enum(index));
-		self.enums.push(item);
-		index
-	}
-
-	fn push_use_item(&mut self, item: UseItem) -> UseIndex {
-		let index = UseIndex::new(
-			u32::try_from(self.use_items.len())
-				.expect("use-item registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::Use(index));
-		self.use_items.push(item);
-		index
-	}
-
-	fn push_use_prefix(&mut self, prefix: UsePrefix) -> UsePrefixIndex {
-		let index = UsePrefixIndex::new(
-			u32::try_from(self.use_prefixes.len())
-				.expect("use-prefix registry exceeded u32 index capacity"),
-		);
-		self.use_prefixes.push(prefix);
-		index
-	}
-
-	fn push_struct(
-		&mut self,
-		make_item: impl FnOnce(StructIndex) -> Struct,
-	) -> StructIndex {
-		let index = StructIndex::new(
-			u32::try_from(self.structs.len())
-				.expect("struct registry exceeded u32 index capacity"),
-		);
-		let item = make_item(index);
-		self.item_lookup.insert(item.id, ItemIndex::Struct(index));
-		self.structs.push(item);
-		index
-	}
-
-	fn push_inherent_impl(&mut self, item: InherentImpl) -> InherentImplIndex {
-		let index = InherentImplIndex::new(
-			u32::try_from(self.inherent_impls.len())
-				.expect("inherent-impl registry exceeded u32 index capacity"),
-		);
-		self.inherent_impls.push(item);
-		index
-	}
-
-	fn push_trait(
-		&mut self,
-		make_item: impl FnOnce(TraitIndex) -> Trait,
-	) -> TraitIndex {
-		let index = TraitIndex::new(
-			u32::try_from(self.traits.len())
-				.expect("trait registry exceeded u32 index capacity"),
-		);
-		let item = make_item(index);
-		self.item_lookup.insert(item.id, ItemIndex::Trait(index));
-		self.traits.push(item);
-		index
-	}
-
-	fn push_trait_impl(&mut self, item: TraitImpl) -> TraitImplIndex {
-		let index = TraitImplIndex::new(
-			u32::try_from(self.trait_impls.len())
-				.expect("trait-impl registry exceeded u32 index capacity"),
-		);
-		self.item_lookup
-			.insert(item.id, ItemIndex::TraitImpl(index));
-		self.trait_impls.push(item);
-		index
-	}
-
-	fn push_constant(&mut self, item: Constant) -> ConstIndex {
-		let index = ConstIndex::new(
-			u32::try_from(self.constants.len())
-				.expect("constant registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::Const(index));
-		self.constants.push(item);
-		index
-	}
-
-	fn push_assoc_type_impl(&mut self, item: AssocTypeImpl) -> AssocTypeIndex {
-		let index = AssocTypeIndex::new(
-			u32::try_from(self.assoc_type_impls.len())
-				.expect("associated-type registry exceeded u32 index capacity"),
-		);
-		self.assoc_type_impls.push(item);
-		index
-	}
-
-	fn push_typeset(&mut self, item: TypeSet) -> TypesetIndex {
-		let index = TypesetIndex::new(
-			u32::try_from(self.typesets.len())
-				.expect("typeset registry exceeded u32 index capacity"),
-		);
-		self.item_lookup.insert(item.id, ItemIndex::TypeSet(index));
-		self.typesets.push(item);
-		index
-	}
-
-	fn push_type_alias(&mut self, item: TypeAlias) -> TypeAliasIndex {
-		let index = TypeAliasIndex::new(
-			u32::try_from(self.type_aliases.len())
-				.expect("type-alias registry exceeded u32 index capacity"),
-		);
-		self.item_lookup
-			.insert(item.id, ItemIndex::TypeAlias(index));
-		self.type_aliases.push(item);
-		index
-	}
-}
-
-impl Default for ItemRegistry {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ModuleGraph {
-	pub namespaces: Vec<ModuleNamespace>,
-	/// Each package's own root namespace. Every package has one, so a
-	/// top-level item always lives in a real namespace rather than in a
-	/// separate global table — which is what lets `parent: None` mean
-	/// "nothing above this" and nothing else.
-	#[cfg_attr(test, serde(skip))]
-	pub package_namespaces: HashMap<PackageId, NamespaceIndex>,
-	/// The scope each file's top-level items live in, indexed by `FileId`.
-	#[cfg_attr(test, serde(skip))]
-	pub file_namespaces: Vec<NamespaceIndex>,
-	pub module_decls: Vec<ModuleDecl>,
-	pub import_decls: Vec<ImportDecl>,
-}
-
-impl ModuleGraph {
-	pub fn new(file_count: usize) -> Self {
-		Self {
-			namespaces: Vec::new(),
-			package_namespaces: HashMap::new(),
-			file_namespaces: vec![NamespaceIndex::new(0); file_count],
-			module_decls: Vec::new(),
-			import_decls: Vec::new(),
-		}
-	}
-
-	fn push_namespace(&mut self, namespace: ModuleNamespace) -> NamespaceIndex {
-		let index = NamespaceIndex::new(
-			u32::try_from(self.namespaces.len())
-				.expect("namespace graph exceeded u32 index capacity"),
-		);
-		self.namespaces.push(namespace);
-		index
-	}
-
-	fn push_module_decl(&mut self, decl: ModuleDecl) -> ModuleDeclIndex {
-		let index = ModuleDeclIndex::new(
-			u32::try_from(self.module_decls.len()).expect(
-				"module-declaration registry exceeded u32 index capacity",
-			),
-		);
-		self.module_decls.push(decl);
-		index
-	}
-
-	fn push_import_decl(&mut self, decl: ImportDecl) -> ImportDeclIndex {
-		let index = ImportDeclIndex::new(
-			u32::try_from(self.import_decls.len()).expect(
-				"import-declaration registry exceeded u32 index capacity",
-			),
-		);
-		self.import_decls.push(decl);
-		index
-	}
-
-	fn push_module(
-		&mut self,
-		parent: NamespaceIndex,
-		package: PackageId,
-		declaring_file_id: FileId,
-		own_file_id: Option<FileId>,
-		name: Spanned<SymbolU32>,
-		pub_span: Option<TextSpan>,
-	) -> NamespaceIndex {
-		let decl_index = ModuleDeclIndex::new(
-			u32::try_from(self.module_decls.len()).expect(
-				"module-declaration registry exceeded u32 index capacity",
-			),
-		);
-		let namespace_index = self.push_namespace(ModuleNamespace {
-			parent: Some(parent),
-			package,
-			declaration: ModuleDeclarationKind::Module(decl_index),
-			symbols: HashMap::new(),
-			wildcard_imports: Vec::new(),
-			accesses: Vec::new(),
-		});
-		let pushed_decl_index = self.push_module_decl(ModuleDecl {
-			namespace_idx: namespace_index,
-			declaring_file_id,
-			own_file_id,
-			name,
-			pub_span,
-		});
-		debug_assert_eq!(pushed_decl_index, decl_index);
-		namespace_index
-	}
-
-	fn push_import(
-		&mut self,
-		parent: NamespaceIndex,
-		package: PackageId,
-		file_id: FileId,
-		external_name: Spanned<SymbolU32>,
-		internal_name: Option<Spanned<SymbolU32>>,
-	) -> (NamespaceIndex, ImportDeclIndex) {
-		let decl_index = ImportDeclIndex::new(
-			u32::try_from(self.import_decls.len()).expect(
-				"import-declaration registry exceeded u32 index capacity",
-			),
-		);
-		let namespace_index = self.push_namespace(ModuleNamespace {
-			parent: Some(parent),
-			package,
-			declaration: ModuleDeclarationKind::Import(decl_index),
-			symbols: HashMap::new(),
-			wildcard_imports: Vec::new(),
-			accesses: Vec::new(),
-		});
-		let pushed_decl_index = self.push_import_decl(ImportDecl {
-			namespace_idx: namespace_index,
-			file_id,
-			external_name,
-			internal_name,
-			lookup: HashMap::new(),
-		});
-		debug_assert_eq!(pushed_decl_index, decl_index);
-		(namespace_index, decl_index)
-	}
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct TIR {
-	pub types: TypeInterner,
-	pub diagnostics: Vec<Diagnostic<FileId>>,
-	pub items: ItemRegistry,
-	pub modules: ModuleGraph,
-	pub export_block: Option<ExportBlock>,
-}
-
-impl ModuleGraph {
-	#[inline]
-	pub fn namespaces_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (NamespaceIndex, &ModuleNamespace)> {
-		self.namespaces
-			.iter()
-			.enumerate()
-			.map(|(index, namespace)| {
-				(NamespaceIndex::new(index as u32), namespace)
-			})
-	}
-
-	/// The name `namespace` goes by, as seen from package `from`.
-	pub fn namespace_name<'a>(
-		&self,
-		namespace: NamespaceIndex,
-		packages: &[PackageGraph],
-		from: PackageId,
-		interner: &'a ast::StringInterner,
-	) -> &'a str {
-		match self.namespaces[usize::from(namespace)].declaration {
-			ModuleDeclarationKind::Module(decl_idx) => {
-				let sym = self.module_decls[usize::from(decl_idx)].name.inner;
-				interner.resolve(sym).unwrap()
-			}
-			ModuleDeclarationKind::Import(decl_idx) => {
-				let decl = &self.import_decls[usize::from(decl_idx)];
-				let sym =
-					decl.internal_name.unwrap_or(decl.external_name).inner;
-				interner.resolve(sym).unwrap()
-			}
-			ModuleDeclarationKind::Package(_) => {
-				let target = self.namespaces[usize::from(namespace)].package;
-				if target == from {
-					"crate"
-				} else {
-					let sym =
-						packages[from.as_usize()].dependency_names[&target];
-					interner.resolve(sym).unwrap()
-				}
-			}
-		}
-	}
-
-	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
-		matches!(
-			self.namespaces[usize::from(namespace)].declaration,
-			ModuleDeclarationKind::Import(_)
-		)
-	}
-}
-
-impl ItemRegistry {
-	#[inline]
-	pub fn inherent_impls_with_indices(
-		&self,
-	) -> impl ExactSizeIterator<Item = (InherentImplIndex, &InherentImpl)> {
-		self.inherent_impls
-			.iter()
-			.enumerate()
-			.map(|(index, inherent_impl)| {
-				(InherentImplIndex::new(index as u32), inherent_impl)
-			})
-	}
-
-	#[inline]
-	pub fn function_index(&self, id: ast::DefId) -> Option<FunctionIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Function(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	/// Name and defining span of a named item. `None` for a `DefId` that is
-	/// not a registered item, and for a trait impl — the one kind with no
-	/// name of its own, `impl Trait for Type` being known by the two names it
-	/// joins rather than by one of its own.
-	///
-	/// Exhaustive over [`ItemIndex`] deliberately: a new item kind must fail
-	/// to compile here rather than silently go unnamed at every call site.
-	pub fn item_name(&self, id: DefId) -> Option<(SymbolU32, SourceSpan)> {
-		let (name, file_id) = match *self.item_lookup.get(&id)? {
-			ItemIndex::Function(i) => {
-				let item = &self.functions[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Use(i) => {
-				let item = &self.use_items[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Global(i) => {
-				let item = &self.globals[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Memory(i) => {
-				let item = &self.memories[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Struct(i) => {
-				let item = &self.structs[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Const(i) => {
-				let item = &self.constants[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::TypeSet(i) => {
-				let item = &self.typesets[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Trait(i) => {
-				let item = &self.traits[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::Enum(i) => {
-				let item = &self.enums[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::TypeAlias(i) => {
-				let item = &self.type_aliases[usize::from(i)];
-				(item.name, item.file_id)
-			}
-			ItemIndex::TraitImpl(_) => return None,
-		};
-		Some((name.inner, SourceSpan::new(file_id, name.span)))
-	}
-
-	#[inline]
-	pub fn expect_function_index(&self, id: DefId) -> FunctionIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Function(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected Function for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn struct_index(&self, id: DefId) -> Option<StructIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Struct(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_struct_index(&self, id: DefId) -> StructIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Struct(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected Struct for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn type_alias_index(&self, id: DefId) -> Option<TypeAliasIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::TypeAlias(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_type_alias_index(&self, id: DefId) -> TypeAliasIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::TypeAlias(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected TypeAlias for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn const_index(&self, id: DefId) -> Option<ConstIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Const(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_const_index(&self, id: DefId) -> ConstIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Const(i) => i,
-			#[cfg(debug_assertions)]
-			other => unreachable!("expected Const for {id:?}, found {other:?}"),
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn global_index(&self, id: DefId) -> Option<GlobalIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Global(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_global_index(&self, id: DefId) -> GlobalIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Global(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected Global for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn memory_index(&self, id: DefId) -> Option<MemoryIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Memory(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_memory_index(&self, id: DefId) -> MemoryIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Memory(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected Memory for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn typeset_index(&self, id: DefId) -> Option<TypesetIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::TypeSet(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_typeset_index(&self, id: DefId) -> TypesetIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::TypeSet(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected TypeSet for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn trait_index(&self, id: DefId) -> Option<TraitIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Trait(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_trait_index(&self, id: DefId) -> TraitIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Trait(i) => i,
-			#[cfg(debug_assertions)]
-			other => unreachable!("expected Trait for {id:?}, found {other:?}"),
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn trait_impl_index(&self, id: DefId) -> Option<TraitImplIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::TraitImpl(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_trait_impl_index(&self, id: DefId) -> TraitImplIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::TraitImpl(i) => i,
-			#[cfg(debug_assertions)]
-			other => {
-				unreachable!("expected TraitImpl for {id:?}, found {other:?}")
-			}
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	#[inline]
-	pub fn enum_index(&self, id: DefId) -> Option<EnumIndex> {
-		match self.item_lookup.get(&id)? {
-			ItemIndex::Enum(i) => Some(*i),
-			_ => None,
-		}
-	}
-
-	/// The source location where `ty` was declared, if it names a struct or
-	/// enum directly (`None` for primitives, pointers, type params, etc. —
-	/// nothing to point at).
-	pub fn type_declaration_span(
-		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-	) -> Option<SourceSpan> {
-		match types.resolve(ty) {
-			Type::Struct { struct_index, .. } => {
-				let s = self.structs.get(usize::from(*struct_index))?;
-				Some(SourceSpan::new(s.file_id, s.name.span))
-			}
-			Type::Enum { enum_index } => {
-				let e = self.enums.get(usize::from(*enum_index))?;
-				Some(SourceSpan::new(e.file_id, e.name.span))
-			}
-			_ => None,
-		}
-	}
-
-	#[inline]
-	pub fn expect_enum_index(&self, id: DefId) -> EnumIndex {
-		match self.item_lookup[&id] {
-			ItemIndex::Enum(index) => index,
-			#[cfg(debug_assertions)]
-			other => unreachable!("expected Enum for {id:?}, found {other:?}"),
-			#[cfg(not(debug_assertions))]
-			_ => unreachable!(),
-		}
-	}
-
-	/// Returns the `TypeParamInfo` for the type parameter at `abs_index`
-	/// (absolute, 0-based across the full owner chain) under `owner`.
-	///
-	/// For `Function` owners, params inherited from a parent `ImplBlock` occupy
-	/// indices `0..inherited_count`; the function's own params start at
-	/// `inherited_count`. For all other owners, `abs_index` indexes directly
-	/// into the owner's `type_params` slice.
-	pub fn type_param_info(
-		&self,
-		owner: TypeParamOwner,
-		abs_index: usize,
-	) -> &TypeParamInfo {
-		match owner {
-			TypeParamOwner::InherentImpl(block_idx) => {
-				&self.inherent_impls[usize::from(block_idx)].type_params
-					[abs_index]
-			}
-			TypeParamOwner::Function(id) => {
-				let func_idx = usize::from(self.expect_function_index(id));
-				let inherited =
-					self.functions[func_idx].inherited_type_param_count;
-				&self.functions[func_idx].type_params[abs_index - inherited]
-			}
-			TypeParamOwner::Struct(id) => {
-				let struct_idx = usize::from(self.expect_struct_index(id));
-				&self.structs[struct_idx].type_params[abs_index]
-			}
-			TypeParamOwner::Trait(trait_idx) => {
-				debug_assert_eq!(
-					abs_index, 0,
-					"only Self (index 0) is owned by a Trait"
-				);
-				&self.traits[usize::from(trait_idx)].self_type_param
-			}
-			TypeParamOwner::TypeAlias(id) => {
-				let alias_idx = usize::from(self.expect_type_alias_index(id));
-				&self.type_aliases[alias_idx].type_params[abs_index]
-			}
-			TypeParamOwner::TraitImpl(impl_idx) => {
-				&self.trait_impls[usize::from(impl_idx)].type_params[abs_index]
-			}
-		}
-	}
-
-	/// Mutable counterpart of [`ItemRegistry::type_param_info`].
-	pub fn type_param_info_mut(
-		&mut self,
-		owner: TypeParamOwner,
-		abs_index: usize,
-	) -> &mut TypeParamInfo {
-		match owner {
-			TypeParamOwner::InherentImpl(block_idx) => {
-				&mut self.inherent_impls[usize::from(block_idx)].type_params
-					[abs_index]
-			}
-			TypeParamOwner::Function(id) => {
-				let func_idx = usize::from(self.expect_function_index(id));
-				let inherited =
-					self.functions[func_idx].inherited_type_param_count;
-				&mut self.functions[func_idx].type_params[abs_index - inherited]
-			}
-			TypeParamOwner::Struct(id) => {
-				let struct_idx = usize::from(self.expect_struct_index(id));
-				&mut self.structs[struct_idx].type_params[abs_index]
-			}
-			TypeParamOwner::Trait(trait_idx) => {
-				debug_assert_eq!(
-					abs_index, 0,
-					"only Self (index 0) is owned by a Trait"
-				);
-				&mut self.traits[usize::from(trait_idx)].self_type_param
-			}
-			TypeParamOwner::TypeAlias(id) => {
-				let alias_idx = usize::from(self.expect_type_alias_index(id));
-				&mut self.type_aliases[alias_idx].type_params[abs_index]
-			}
-			TypeParamOwner::TraitImpl(impl_idx) => {
-				&mut self.trait_impls[usize::from(impl_idx)].type_params
-					[abs_index]
-			}
-		}
-	}
-
-	/// Iterates all type parameters visible to `func_index` in absolute-index
-	/// order: inherited params from the parent first, then the function's own
-	/// params. For trait methods the parent is the trait's implicit `Self`;
-	/// for generic impl methods the parent is the impl block's type params.
-	pub fn function_type_params_iter(
-		&self,
-		func_index: FunctionIndex,
-	) -> impl Iterator<Item = &TypeParamInfo> {
-		let func = &self.functions[usize::from(func_index)];
-		let parent_params: &[TypeParamInfo] = match func.type_param_parent() {
-			Some(TypeParamOwner::InherentImpl(block_idx)) => {
-				&self.inherent_impls[usize::from(block_idx)].type_params
-			}
-			Some(TypeParamOwner::Trait(trait_idx)) => std::slice::from_ref(
-				&self.traits[usize::from(trait_idx)].self_type_param,
-			),
-			Some(TypeParamOwner::TraitImpl(impl_idx)) => {
-				&self.trait_impls[usize::from(impl_idx)].type_params
-			}
-			_ => &[],
-		};
-		parent_params.iter().chain(func.type_params.iter())
-	}
-}
-
-impl TypeInterner {
-	/// Structural unification: for every `TypeParam` slot reachable inside
-	/// `pattern_ty`, bind the corresponding position in `actual_ty` into
-	/// `type_args` (first binding wins — a later occurrence of an
-	/// already-bound slot, or an explicit pre-seeded turbofish value, is
-	/// checked for consistency rather than overwritten). Shared by
-	/// inherent-impl matching and trait-impl matching. It lives with the
-	/// interned type graph because it only walks type structure.
-	///
-	/// `Err(())` when `pattern_ty` can't possibly describe `actual_ty` — a
-	/// `TypeParam` bound to two different values, or a fixed (non-generic)
-	/// position in `pattern_ty` that doesn't equal the corresponding
-	/// `actual_ty` position. Traversal never stops early on an `Err(())`,
-	/// even though the overall result is already decided: binding keeps
-	/// happening for every other, independent position exactly as it
-	/// always has, so a caller that ignores the return value (most of them
-	/// — the diagnostic-reporting ones report their own mismatch from the
-	/// substituted result afterward, not from this) sees no behavior
-	/// change at all. Only `unify_impl_target` currently reads it, to
-	/// reject a candidate this function would otherwise silently
-	/// over-accept (see its doc). Not a real error in the diagnostic
-	/// sense — nothing here is user-facing, `Result` is just a
-	/// `#[must_use]` `bool` so every other call site has to spell out
-	/// `let _ =` and make ignoring it a visible choice.
-	fn infer_type_args(
-		&self,
-		type_args: &mut [TypeIndex],
-		pattern_ty: TypeIndex,
-		actual_ty: TypeIndex,
-	) -> Result<(), ()> {
-		// Unresolved comptime literals have no concrete type yet; inferring T = INTEGER would give the wrong answer once the literal is coerced.
-		// Skip ERROR and INFER actuals too — they must not fill a still-unresolved slot.
-		if actual_ty == TypeIndex::INTEGER
-			|| actual_ty == TypeIndex::FLOAT
-			|| actual_ty == TypeIndex::ERROR
-			|| actual_ty == TypeIndex::INFER
-		{
-			return Ok(());
-		}
-
-		match (self.resolve(pattern_ty), self.resolve(actual_ty)) {
-			(Type::TypeParam { param_index, .. }, _) => {
-				match type_args.get_mut(*param_index as usize) {
-					Some(slot) if *slot == TypeIndex::INFER => {
-						*slot = actual_ty;
-						Ok(())
-					}
-					// Already bound (turbofish or an earlier occurrence) —
-					// consistent only if it's the same value.
-					Some(slot) if *slot == actual_ty => Ok(()),
-					Some(_) => Err(()),
-					None => Ok(()),
-				}
-			}
-			(
-				Type::AssocTypeProjection {
-					assoc_name,
-					trait_index,
-					base,
-					..
-				},
-				Type::AssocTypeProjection {
-					assoc_name: actual_assoc,
-					trait_index: actual_trait,
-					base: actual_base,
-					..
-				},
-			) if assoc_name == actual_assoc && trait_index == actual_trait => {
-				self.infer_type_args(type_args, *base, *actual_base)
-			}
-			(
-				Type::Tuple { elements: pattern },
-				Type::Tuple { elements: actual },
-			) if pattern.len() == actual.len() => pattern
-				.iter()
-				.copied()
-				.zip(actual.iter().copied())
-				.try_fold((), |_, (pattern, actual)| {
-					self.infer_type_args(type_args, pattern, actual)
-				}),
-			(
-				Type::Function {
-					signature: pattern_sig,
-				},
-				Type::Function {
-					signature: actual_sig,
-				},
-			) if pattern_sig.params_count == actual_sig.params_count
-				&& pattern_sig.items.len() == actual_sig.items.len() =>
-			{
-				pattern_sig
-					.items
-					.iter()
-					.copied()
-					.zip(actual_sig.items.iter().copied())
-					.try_fold((), |_, (pattern, actual)| {
-						self.infer_type_args(type_args, pattern, actual)
-					})
-			}
-			(
-				Type::Pointer {
-					to: pattern_to,
-					memory: pattern_memory,
-					..
-				},
-				Type::Pointer {
-					to: actual_to,
-					memory: actual_memory,
-					..
-				},
-			) => {
-				let to_result =
-					self.infer_type_args(type_args, *pattern_to, *actual_to);
-				let memory_result = self.infer_type_args(
-					type_args,
-					*pattern_memory,
-					*actual_memory,
-				);
-				to_result.and(memory_result)
-			}
-			(
-				Type::Array {
-					of: pattern_of,
-					size: pattern_size,
-					memory: pattern_memory,
-					..
-				},
-				Type::Array {
-					of: actual_of,
-					size: actual_size,
-					memory: actual_memory,
-					..
-				},
-			) if pattern_size == actual_size => {
-				let of_result =
-					self.infer_type_args(type_args, *pattern_of, *actual_of);
-				let memory_result = self.infer_type_args(
-					type_args,
-					*pattern_memory,
-					*actual_memory,
-				);
-				of_result.and(memory_result)
-			}
-			(
-				Type::Slice {
-					of: pattern_of,
-					memory: pattern_memory,
-					..
-				},
-				Type::Slice {
-					of: actual_of,
-					memory: actual_memory,
-					..
-				},
-			) => {
-				let of_result =
-					self.infer_type_args(type_args, *pattern_of, *actual_of);
-				let memory_result = self.infer_type_args(
-					type_args,
-					*pattern_memory,
-					*actual_memory,
-				);
-				of_result.and(memory_result)
-			}
-			(
-				Type::Struct {
-					struct_index: pattern_struct,
-					args: pattern_args,
-				},
-				Type::Struct {
-					struct_index: actual_struct,
-					args: actual_args,
-				},
-			) if pattern_struct == actual_struct
-				&& pattern_args.len() == actual_args.len() =>
-			{
-				pattern_args
-					.iter()
-					.copied()
-					.zip(actual_args.iter().copied())
-					.try_fold((), |_, (pattern, actual)| {
-						self.infer_type_args(type_args, pattern, actual)
-					})
-			}
-			_ if pattern_ty == actual_ty => Ok(()),
-			_ => Err(()),
-		}
-	}
-}
-
-impl ItemRegistry {
-	/// `ty`'s own declared bounds, for the two kinds of type that carry
-	/// bounds without being concrete yet — a `TypeParam` (a function's or
-	/// impl's own generic param) or an `AssocTypeProjection` (`Self::M`,
-	/// bounded by whichever trait declares `M`). `None` for anything
-	/// concrete, which has no bounds of its own to consult — whether it
-	/// satisfies a trait/typeset is a lookup (`find_trait_impl`/
-	/// `concrete_type_in_typeset`), not a declaration.
-	fn abstract_type_bounds(
-		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-	) -> Option<&Bounds> {
-		match types.resolve(ty) {
-			Type::TypeParam { owner, param_index } => Some(
-				&self.type_param_info(*owner, *param_index as usize).bounds,
-			),
-			Type::AssocTypeProjection {
-				trait_index,
-				assoc_name,
-				base,
-			} => {
-				// `base`'s own bounds may already carry a fully-resolved
-				// entry for this exact assoc type — e.g. `Mem: Memory where
-				// { Size: UnsignedInt }` stores the *merge* of `Memory::
-				// Size`'s own `PointerSize` bound with `UnsignedInt` on
-				// `Mem`'s `TraitBound.bindings`, computed once when that
-				// `where` clause was resolved (see `resolve_bounds`'s
-				// `AssocTypeBindingKind::Bound` arm). Preferring that over
-				// the bare trait declaration is what lets a projection see
-				// bounds a plain `type Size: PointerSize` alone never could
-				// — and since it's already the complete, merged picture,
-				// there's nothing left to combine here, just a lookup. A
-				// `= Type` (rather than `: Bound`) entry for this name means
-				// the where clause pinned the type down exactly instead of
-				// adding a bound — nothing for this query to report.
-				let from_where_clause = self
-					.abstract_type_bounds(types, *base)
-					.and_then(|base_bounds| {
-						base_bounds
-							.traits
-							.iter()
-							.find(|b| b.trait_index == *trait_index)
-					})
-					.and_then(|b| {
-						b.bindings.iter().find_map(|(name, kind)| {
-							match (name == assoc_name, kind) {
-								(true, AssocBindingKind::Bound(bounds)) => {
-									Some(bounds)
-								}
-								_ => None,
-							}
-						})
-					});
-				from_where_clause.or_else(|| {
-					self.traits[usize::from(*trait_index)]
-						.assoc_types
-						.get(assoc_name)
-						.map(|at| &at.bounds)
-				})
-			}
-			_ => None,
-		}
-	}
-
-	/// Would `Base::name` be ambiguous if printed unqualified — i.e. do more
-	/// than one of `base`'s own declared bounds (see
-	/// [`ItemRegistry::abstract_type_bounds`]) declare an associated type named
-	/// `name`? Used by [`TypeFormatter`] to decide between `Base::name` and
-	/// `<Base as Trait>::name` when displaying a
-	/// [`Type::AssocTypeProjection`] — the projection's own `trait_index`
-	/// already disambiguates the *type*, this only asks whether the
-	/// *unqualified spelling* would read as ambiguous to someone looking at
-	/// `base`'s bounds. Short-circuits after the second match, and — unlike
-	/// a version built on `bound_trait_indices`-style helpers that collect a
-	/// list first — never allocates, since the two paths that would ever
-	/// call this (formatting a type, not resolving one) never need to
-	/// interleave a mutable call partway through.
-	fn assoc_type_bound_is_ambiguous(
-		&self,
-		types: &TypeInterner,
-		base: TypeIndex,
-		name: SymbolU32,
-	) -> bool {
-		let Some(bounds) = self.abstract_type_bounds(types, base) else {
-			return false;
-		};
-		bounds
-			.traits
-			.iter()
-			.filter(|bound| {
-				matches!(
-					self.traits[usize::from(bound.trait_index)]
-						.entries
-						.get(&name),
-					Some(ImplEntry::AssocType(_))
-				)
-			})
-			.nth(1)
-			.is_some()
-	}
-
-	/// True when concrete `ty` is a member of the given typeset.
-	fn concrete_type_in_typeset(
-		&self,
-		ty: TypeIndex,
-		typeset_index: TypesetIndex,
-	) -> bool {
-		self.typesets[usize::from(typeset_index)]
-			.members
-			.contains(&ty)
-	}
-
-	/// Does `ty` implement trait `trait_index`? Shared single-bound
-	/// predicate behind both `type_args_satisfy_bounds` (impl-target
-	/// unification, short-circuits to a single bool) and call-site bound
-	/// checking (which needs to loop over every trait in `T: Foo + Bar` and
-	/// report each failure separately, so it can't use an
-	/// all-bounds-at-once helper). An abstract `ty` (a `TypeParam`/
-	/// `AssocTypeProjection` propagated in from an outer generic scope, not
-	/// concrete yet) is checked against its own declared bounds via
-	/// `abstract_type_bounds`, not `find_trait_impl` — that only knows
-	/// about concrete impls. No supertrait transitivity: `M: Sub` does not
-	/// satisfy a required `Super` even if `Sub: Super`.
-	fn type_implements_trait(
-		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-		trait_index: TraitIndex,
-	) -> bool {
-		match self.abstract_type_bounds(types, ty) {
-			Some(declared) => {
-				declared.traits.iter().any(|b| b.trait_index == trait_index)
-			}
-			None => self.find_trait_impl(types, ty, trait_index).is_some(),
-		}
-	}
-
-	/// Does `ty` belong to typeset `typeset_index`? Same abstract/concrete
-	/// split as `type_implements_trait`, for the typeset side of a bound.
-	fn type_in_typeset(
-		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-		typeset_index: TypesetIndex,
-	) -> bool {
-		match self.abstract_type_bounds(types, ty) {
-			Some(declared) => declared
-				.typeset
-				.is_some_and(|t| t.typeset_index == typeset_index),
-			None => self.concrete_type_in_typeset(ty, typeset_index),
-		}
-	}
-
-	/// Shared core of `unify_inherent_impl_target`/`unify_trait_impl_target`:
-	/// does a target with `type_params_len` free slots apply to
-	/// `receiver_ty`, and if so what's the substitution? `None` if it
-	/// doesn't apply at all.
-	///
-	/// The no-type-params case is handled separately rather than via
-	/// `infer_type_args`: with an empty `type_args` slice it has nothing to
-	/// bind, so it would silently accept any receiver of the same outer
-	/// shape instead of rejecting a mismatch.
-	///
-	/// Doesn't judge whether a leftover `TypeIndex::INFER` slot is
-	/// acceptable — that differs between the two callers, so it's their
-	/// call, made after this returns.
-	///
-	/// Does reject an inconsistent substitution itself, though (`None`
-	/// when `infer_type_args` returns `Err(())`) — e.g. `impl<T> Pair<T,
-	/// T>` against a receiver `Pair<i32, bool>`: `infer_type_args`'s
-	/// first-binding-wins would otherwise bind `T = i32` from the first
-	/// field and silently drop the conflicting `bool` from the second,
-	/// reporting this block as a match when no consistent `T` makes it one.
-	fn unify_impl_target(
-		&self,
-		types: &TypeInterner,
-		type_params_len: usize,
-		target: TypeIndex,
-		receiver_ty: TypeIndex,
-	) -> Option<Box<[TypeIndex]>> {
-		if type_params_len == 0 {
-			// `ImplTarget` is coarser than the full concrete type, so
-			// multiple non-generic impls can share a bucket (e.g. `impl
-			// Box<i32>` and `impl Box<bool>`) — this is what tells them
-			// apart for a given receiver.
-			return (target == receiver_ty).then(|| Box::new([]) as _);
-		}
-		let mut type_args: Vec<TypeIndex> =
-			vec![TypeIndex::INFER; type_params_len];
-		types
-			.infer_type_args(&mut type_args, target, receiver_ty)
-			.ok()
-			.map(|()| type_args.into_boxed_slice())
-	}
-
-	/// Does every `type_params[i].bounds` (trait bounds and typeset) accept
-	/// its matching `type_args[i]`? A still-`TypeIndex::INFER` slot is
-	/// skipped — it has no value at all yet, concrete or otherwise, so
-	/// validating it is deferred to whoever eventually resolves it (e.g.
-	/// `check_typeset_bounds_on_type_args` post-call, for an inherent-impl
-	/// param only pinned down by the call's own arguments).
-	///
-	/// An abstract slot (`arg_ty` is itself a `TypeParam`/
-	/// `AssocTypeProjection` — e.g. `M` unified against `Self::M` inside a
-	/// trait default body) is checked against *its own* declared bounds via
-	/// `abstract_type_bounds`, not looked up in `find_trait_impl`/
-	/// `concrete_type_in_typeset` — those only know about concrete impls,
-	/// and an abstract type isn't concrete yet. This only recognizes an
-	/// exact, directly-declared bound (no supertrait transitivity: `M:
-	/// Sub` does not currently satisfy a required `Super` even if `Sub:
-	/// Super`) — matching the same level of rigor `check_typeset_bounds_on_type_args`
-	/// already applies via `type_param_typeset_bound`.
-	fn type_args_satisfy_bounds(
-		&self,
-		types: &TypeInterner,
-		type_params: &[TypeParamInfo],
-		type_args: &[TypeIndex],
-	) -> bool {
-		type_params
-			.iter()
-			.zip(type_args.iter().copied())
-			.all(|(param, arg)| {
-				arg == TypeIndex::INFER
-					|| (param.bounds.traits.iter().all(|bound| {
-						self.type_implements_trait(
-							types,
-							arg,
-							bound.trait_index,
-						)
-					}) && param.bounds.typeset.is_none_or(|typeset| {
-						self.type_in_typeset(types, arg, typeset.typeset_index)
-					}))
-			})
-	}
-
-	/// Does `inherent_impls[block_idx]`'s target apply to `receiver_ty`, and
-	/// if so what's the substitution? `None` if it doesn't apply at all,
-	/// including when a declared bound on an inferred (non-`INFER`) type arg
-	/// isn't satisfied.
-	///
-	/// Slots `unify_impl_target` couldn't resolve from the receiver stay
-	/// `TypeIndex::INFER` so the call site can still fill them in — not from
-	/// an explicit turbofish (that only ever fills a method's *own* generic
-	/// slots, never impl-inherited ones — see `own_start` in
-	/// `build_namespace_member_expression`), but from the call's own
-	/// arguments: `Holder::make(5)` with no turbofish on `Holder` passes a
-	/// namespace type whose own args are themselves still `INFER` at this
-	/// point, so `T` here stays `INFER` too until `build_generic_call_arguments`
-	/// infers it from the `5` argument afterward.
-	fn unify_inherent_impl_target(
-		&self,
-		types: &TypeInterner,
-		block_idx: usize,
-		receiver_ty: TypeIndex,
-	) -> Option<Box<[TypeIndex]>> {
-		let block = &self.inherent_impls[block_idx];
-		let type_args = self.unify_impl_target(
-			types,
-			block.type_params.len(),
-			block.target.inner,
-			receiver_ty,
-		)?;
-		self.type_args_satisfy_bounds(types, &block.type_params, &type_args)
-			.then_some(type_args)
-	}
-
-	/// Does `trait_impls[impl_idx]`'s target apply to `receiver_ty`, and if
-	/// so what's the substitution? `None` if it doesn't apply, including
-	/// when a declared bound on an inferred type arg isn't satisfied.
-	///
-	/// Unlike an inherent impl (see `unify_inherent_impl_target`), a trait
-	/// impl's type params are never reached through an unresolved namespace
-	/// type — every caller of `find_trait_impl` already has a fully-resolved
-	/// concrete receiver in hand, so the receiver is the only place a trait
-	/// impl's own type params can ever come from. So, unlike
-	/// `unify_inherent_impl_target`, any slot left `TypeIndex::INFER` after
-	/// `unify_impl_target` means this impl doesn't apply, full stop: letting
-	/// `INFER` through would eventually reach MIR/codegen, which must never
-	/// happen.
-	fn unify_trait_impl_target(
-		&self,
-		types: &TypeInterner,
-		impl_idx: TraitImplIndex,
-		receiver_ty: TypeIndex,
-	) -> Option<Box<[TypeIndex]>> {
-		let imp = &self.trait_impls[usize::from(impl_idx)];
-		let type_args = self.unify_impl_target(
-			types,
-			imp.type_params.len(),
-			imp.target.inner,
-			receiver_ty,
-		)?;
-		if type_args.contains(&TypeIndex::INFER) {
-			return None;
-		}
-		self.type_args_satisfy_bounds(types, &imp.type_params, &type_args)
-			.then_some(type_args)
-	}
-
-	/// Finds the trait impl (concrete or generic) that makes `ty` implement
-	/// `trait_index`, if any, along with the type-arg substitution inferred
-	/// from `ty` (empty for a concrete impl). The single entry point for
-	/// every "does this specific trait apply here" query — associated-type
-	/// projection resolution, supertrait conformance checks, and `where`
-	/// bound checks all go through this rather than reading
-	/// `trait_impl_dispatch` directly.
-	pub fn find_trait_impl(
-		&self,
-		types: &TypeInterner,
-		ty: TypeIndex,
-		trait_index: TraitIndex,
-	) -> Option<(TraitImplIndex, Box<[TypeIndex]>)> {
-		let kind = ImplTarget::from_type(types.resolve(ty)).ok()?;
-		let &(_, idx) = self
-			.trait_impl_dispatch
-			.get(&kind)?
-			.iter()
-			.find(|(ti, _)| *ti == trait_index)?;
-		self.unify_trait_impl_target(types, idx, ty)
-			.map(|args| (idx, args))
-	}
-}
-
-#[derive(PartialEq)]
-enum WasmScalar {
-	I32,
-	I64,
-	F32,
-	F64,
-}
-
-impl TIR {
-	pub fn formatter<'a>(
-		&'a self,
-		interner: &'a ast::StringInterner,
-		packages: &'a [PackageGraph],
-		from: PackageId,
-	) -> TypeFormatter<'a> {
-		TypeFormatter::new(
-			&self.types,
-			&self.items,
-			&self.modules,
-			interner,
-			packages,
-			from,
-		)
-	}
-
-	/// The name `namespace` goes by, as seen from package `from`.
-	///
-	/// Contextual because a package has no name of its own: it's known by the
-	/// `dependencies` key of whoever declared it, so the same package can be
-	/// `foo` in one package and `bar` in another. Modules and imports are
-	/// named by their own declaration and ignore `from`.
-	///
-	/// Returns the resolved `&str` directly rather than a `SymbolU32` —
-	/// every call site immediately resolves it anyway, and it lets the one
-	/// case with no real name of its own (`crate`/`super` naming `from`'s
-	/// own package root, where nothing depends on itself so there's no
-	/// `dependencies` key to read) answer with the literal keyword text
-	/// instead of needing a symbol interned for it.
-	pub fn namespace_name<'a>(
-		&self,
-		namespace: NamespaceIndex,
-		packages: &[PackageGraph],
-		from: PackageId,
-		interner: &'a ast::StringInterner,
-	) -> &'a str {
-		self.modules
-			.namespace_name(namespace, packages, from, interner)
-	}
-
-	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
-		self.modules.is_import_namespace(namespace)
-	}
-
-	#[inline]
-	pub fn build(compilation: &mut CompilationUnit) -> TIR {
-		builder::build(compilation)
-	}
-}
+// use std::collections::HashMap;
+// use std::hash::Hash;
+
+// use codespan_reporting::diagnostic::{Diagnostic, Label};
+// use string_interner::symbol::SymbolU32;
+
+// use crate::ast::{self, DefId, Separated, Spanned};
+// use crate::diagnostics::{SourceSpan, TextSpan};
+// use crate::vfs::{self, CompilationUnit, FileId, Package, PackageId};
+
+// mod builder;
+// #[cfg(test)]
+// mod tests;
+
+mod bounds;
+mod defs;
+mod format;
+mod impls;
+mod imports;
+mod literals;
+mod members;
+mod paths;
+mod satisfaction;
+mod signatures;
+mod types;
+
+// use crate::index::index_newtype;
+
+// index_newtype!(TypeIndex);
+// index_newtype!(LocalIndex);
+// index_newtype!(ScopeIndex);
+// index_newtype!(LabelIndex);
+// index_newtype!(FunctionIndex);
+// index_newtype!(GlobalIndex);
+// index_newtype!(ConstIndex);
+// index_newtype!(MemoryIndex);
+// index_newtype!(EnumVariantIndex);
+// index_newtype!(EnumIndex);
+// index_newtype!(StructIndex);
+// index_newtype!(TypesetIndex);
+// index_newtype!(AssocTypeIndex);
+// index_newtype!(TypeAliasIndex);
+// index_newtype!(UseIndex);
+// index_newtype!(UsePrefixIndex);
+// index_newtype!(FieldIndex);
+// index_newtype!(BodyIndex);
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, PartialEq, Eq, Hash)]
+// pub struct FunctionSignature {
+// 	items: Box<[TypeIndex]>,
+// 	params_count: u32,
+// }
+
+// impl FunctionSignature {
+// 	pub fn params(&self) -> &[TypeIndex] {
+// 		&self.items[..self.params_count as usize]
+// 	}
+
+// 	pub fn result(&self) -> TypeIndex {
+// 		self.items.get(self.params_count as usize).copied().unwrap()
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+// pub enum TypeParamOwner {
+// 	Function(DefId),
+// 	Struct(DefId),
+// 	TypeAlias(DefId),
+// 	Trait(TraitIndex),
+// 	InherentImpl(InherentImplIndex),
+// 	TraitImpl(TraitImplIndex),
+// }
+
+// /// The block a function/constant is a member of, if any — an impl block or
+// /// a trait declaration. `None` means the item is free-standing: callable by
+// /// its bare name (subject to namespace visibility). This answers a
+// /// different question than `TypeParamOwner`: that's about where an item's
+// /// *inherited* type parameters come from, and only applies when there's
+// /// something to inherit. A non-generic `impl Point { }` has an `ItemParent`
+// /// but no `TypeParamOwner` — there's nothing to inherit, but it's still a
+// /// member of a block that gates how the item can be referenced (`Point::new()`,
+// /// never bare `new()`).
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+// pub enum ItemParent {
+// 	/// Inherent `impl Target { }` — generic (`impl<Params> Target { }`) or
+// 	/// concrete alike. Index into `TIR::inherent_impls`; the target type is
+// 	/// `TIR::inherent_impls[..].target` (fully resolved for a concrete impl,
+// 	/// parametric for a generic one).
+// 	InherentImpl(InherentImplIndex),
+// 	/// `impl Trait for Target { }` member, generic or not. Named apart from
+// 	/// the inherent case because the two differ in more than their target:
+// 	/// a trait impl's member exists to satisfy a declaration elsewhere, which
+// 	/// is what exempts it from dead-code reporting. The target is still
+// 	/// reachable, via `TIR::trait_impls[..].target`.
+// 	TraitImpl(TraitImplIndex),
+// 	/// Trait item — a method/const declaration or default body, scoped to
+// 	/// the trait's implicit `Self`.
+// 	Trait(TraitIndex),
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, PartialEq, Eq, Hash)]
+// pub enum Type {
+// 	Error,
+// 	/// A type inference placeholder — written `_` in source, or injected
+// 	/// internally when a generic type argument cannot yet be determined.
+// 	/// Must never reach MIR or codegen; the TIR checker reports an error
+// 	/// whenever `Infer` survives past the call site that created it.
+// 	Infer,
+// 	Unit,
+// 	Never,
+// 	Integer,
+// 	Float,
+// 	U8,
+// 	I8,
+// 	U16,
+// 	I16,
+// 	U32,
+// 	I32,
+// 	U64,
+// 	I64,
+// 	F32,
+// 	F64,
+// 	Bool,
+// 	Char,
+// 	Tuple {
+// 		elements: Box<[TypeIndex]>,
+// 	},
+// 	Struct {
+// 		struct_index: StructIndex,
+// 		/// Encodes three states via length:
+// 		///   - non-generic struct → always empty
+// 		///   - generic struct, not yet instantiated → empty
+// 		///   - generic struct, instantiated → one entry per type param, e.g. `Vec<i32, u8>` → `[i32_idx, u8_idx]`
+// 		args: Box<[TypeIndex]>,
+// 	},
+// 	Function {
+// 		signature: FunctionSignature,
+// 	},
+// 	/// Named function reference before coercion to a fn pointer.
+// 	/// Encodes three states via length (same convention as `Struct::args`):
+// 	///   - non-generic function → always empty
+// 	///   - generic function, not yet instantiated → empty
+// 	///   - generic function, instantiated → one entry per type param
+// 	FunctionItem {
+// 		id: DefId,
+// 		type_args: Box<[TypeIndex]>,
+// 	},
+// 	Pointer {
+// 		to: TypeIndex,
+// 		memory: TypeIndex,
+// 		ownership: ast::Ownership,
+// 	},
+// 	Array {
+// 		of: TypeIndex,
+// 		size: u32,
+// 		memory: TypeIndex,
+// 		ownership: ast::Ownership,
+// 	},
+// 	Slice {
+// 		of: TypeIndex,
+// 		memory: TypeIndex,
+// 		ownership: ast::Ownership,
+// 	},
+// 	Enum {
+// 		enum_index: EnumIndex,
+// 	},
+// 	Memory {
+// 		id: DefId,
+// 		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
+// 		size: TypeIndex,
+// 	},
+// 	/// Index into `Function::type_params`. All uses of the same param in a
+// 	/// function share one interned instance.
+// 	TypeParam {
+// 		owner: TypeParamOwner,
+// 		param_index: u32,
+// 	},
+// 	/// `M::Size` — opaque until monomorphisation substitutes `M`.
+// 	AssociatedType {
+// 		trait_index: TraitIndex,
+// 		assoc_name: SymbolU32,
+// 	},
+// 	/// `M::Size` or `A::M::Size` in a signature: a projection from a base type
+// 	/// (a `TypeParam` or another `AssocTypeProjection`) resolved by `substitute_type`.
+// 	AssocTypeProjection {
+// 		trait_index: TraitIndex,
+// 		assoc_name: SymbolU32,
+// 		base: TypeIndex,
+// 	},
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(test, serde(transparent))]
+// pub struct TypeInterner {
+// 	entries: Vec<Type>,
+// 	#[cfg_attr(test, serde(skip))]
+// 	index_lookup: HashMap<Type, TypeIndex>,
+// }
+
+// impl TypeInterner {
+// 	pub fn new() -> Self {
+// 		let entries = vec![
+// 			// Order must match the `TypeIndex` constants below.
+// 			Type::Error,
+// 			Type::Infer,
+// 			Type::Unit,
+// 			Type::Never,
+// 			Type::Integer,
+// 			Type::Float,
+// 			Type::U8,
+// 			Type::I8,
+// 			Type::U16,
+// 			Type::I16,
+// 			Type::U32,
+// 			Type::I32,
+// 			Type::U64,
+// 			Type::I64,
+// 			Type::F32,
+// 			Type::F64,
+// 			Type::Bool,
+// 			Type::Char,
+// 		];
+// 		let index_lookup = entries
+// 			.iter()
+// 			.cloned()
+// 			.enumerate()
+// 			.map(|(index, ty)| {
+// 				let index = u32::try_from(index)
+// 					.expect("type interner exceeded u32 index capacity");
+// 				(ty, TypeIndex::new(index))
+// 			})
+// 			.collect();
+// 		Self {
+// 			entries,
+// 			index_lookup,
+// 		}
+// 	}
+
+// 	pub fn intern(&mut self, ty: Type) -> TypeIndex {
+// 		if let Some(&index) = self.index_lookup.get(&ty) {
+// 			return index;
+// 		}
+
+// 		let index = u32::try_from(self.entries.len())
+// 			.expect("type interner exceeded u32 index capacity");
+// 		let index = TypeIndex::new(index);
+// 		self.entries.push(ty.clone());
+// 		self.index_lookup.insert(ty, index);
+// 		index
+// 	}
+
+// 	#[inline]
+// 	pub fn resolve(&self, index: TypeIndex) -> &Type {
+// 		&self.entries[usize::from(index)]
+// 	}
+// }
+
+// impl Default for TypeInterner {
+// 	fn default() -> Self {
+// 		Self::new()
+// 	}
+// }
+
+// impl TypeIndex {
+// 	/// Use wherever `INFER` acts as an absent-type sentinel and a concrete fallback is needed.
+// 	#[inline]
+// 	pub fn infer_or(self, other: TypeIndex) -> TypeIndex {
+// 		if self == TypeIndex::INFER {
+// 			other
+// 		} else {
+// 			self
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn is_comptime_number(self) -> bool {
+// 		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
+// 	}
+
+// 	#[inline]
+// 	pub fn is_primitive(self) -> bool {
+// 		self == TypeIndex::U8
+// 			|| self == TypeIndex::I8
+// 			|| self == TypeIndex::U16
+// 			|| self == TypeIndex::I16
+// 			|| self == TypeIndex::U32
+// 			|| self == TypeIndex::I32
+// 			|| self == TypeIndex::U64
+// 			|| self == TypeIndex::I64
+// 			|| self == TypeIndex::F32
+// 			|| self == TypeIndex::F64
+// 			|| self == TypeIndex::CHAR
+// 	}
+
+// 	#[inline]
+// 	pub fn is_integer(self) -> bool {
+// 		self == TypeIndex::U8
+// 			|| self == TypeIndex::I8
+// 			|| self == TypeIndex::U16
+// 			|| self == TypeIndex::I16
+// 			|| self == TypeIndex::U32
+// 			|| self == TypeIndex::I32
+// 			|| self == TypeIndex::U64
+// 			|| self == TypeIndex::I64
+// 	}
+
+// 	#[inline]
+// 	pub fn is_float(self) -> bool {
+// 		self == TypeIndex::F32 || self == TypeIndex::F64
+// 	}
+
+// 	#[inline]
+// 	pub fn is_numeric(self) -> bool {
+// 		self.is_integer() || self.is_float()
+// 	}
+
+// 	// Pre-allocated indices for primitive types. The `TypeInterner` reserves these
+// 	// slots at startup so comparisons like `ty == TypeIndex::U32` work without
+// 	// a pool lookup.
+// 	pub const ERROR: TypeIndex = TypeIndex(0);
+// 	pub const INFER: TypeIndex = TypeIndex(1);
+// 	pub const UNIT: TypeIndex = TypeIndex(2);
+// 	pub const NEVER: TypeIndex = TypeIndex(3);
+// 	pub const INTEGER: TypeIndex = TypeIndex(4);
+// 	pub const FLOAT: TypeIndex = TypeIndex(5);
+// 	pub const U8: TypeIndex = TypeIndex(6);
+// 	pub const I8: TypeIndex = TypeIndex(7);
+// 	pub const U16: TypeIndex = TypeIndex(8);
+// 	pub const I16: TypeIndex = TypeIndex(9);
+// 	pub const U32: TypeIndex = TypeIndex(10);
+// 	pub const I32: TypeIndex = TypeIndex(11);
+// 	pub const U64: TypeIndex = TypeIndex(12);
+// 	pub const I64: TypeIndex = TypeIndex(13);
+// 	pub const F32: TypeIndex = TypeIndex(14);
+// 	pub const F64: TypeIndex = TypeIndex(15);
+// 	pub const BOOL: TypeIndex = TypeIndex(16);
+// 	pub const CHAR: TypeIndex = TypeIndex(17);
+// }
+
+// impl TryFrom<&str> for Type {
+// 	type Error = ();
+
+// 	fn try_from(value: &str) -> Result<Self, ()> {
+// 		match value {
+// 			"i32" => Ok(Type::I32),
+// 			"i64" => Ok(Type::I64),
+// 			"f32" => Ok(Type::F32),
+// 			"f64" => Ok(Type::F64),
+// 			"u32" => Ok(Type::U32),
+// 			"u64" => Ok(Type::U64),
+// 			"bool" => Ok(Type::Bool),
+// 			"char" => Ok(Type::Char),
+// 			"u8" => Ok(Type::U8),
+// 			"i8" => Ok(Type::I8),
+// 			"u16" => Ok(Type::U16),
+// 			"i16" => Ok(Type::I16),
+// 			"never" => Ok(Type::Never),
+// 			_ => Err(()),
+// 		}
+// 	}
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Constant {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	/// `Some` for associated consts (`impl Target { const FOO }` / trait
+// 	/// consts) — `None` for free top-level consts. See `ItemParent`.
+// 	pub parent: Option<ItemParent>,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub ty: ast::Spanned<TypeIndex>,
+// 	pub value: Option<Box<Expression>>,
+// 	/// Compile-time value of `value`, if it folds — see `Builder::eval_const_expr`.
+// 	pub const_value: Option<ConstValue>,
+// 	pub accesses: Vec<SourceSpan>,
+// 	pub attributes: Box<[ItemAttribute]>,
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Trait {
+// 	pub id: ast::DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub self_type_param: TypeParamDef,
+// 	#[cfg_attr(
+// 		test,
+// 		serde(serialize_with = "crate::testing::serialize_sorted_map")
+// 	)]
+// 	pub bindings: HashMap<(BindingNamespace, SymbolU32), MemberIndex>,
+// 	pub members: Vec<MemberDef>,
+// 	pub typeset_index: Option<TypesetIndex>,
+// }
+
+// impl Trait {
+// 	/// Resolved associated-type declaration owned by this trait.
+// 	pub fn associated_type(&self, name: SymbolU32) -> Option<AssocTypeIndex> {
+// 		match self.bindings.get(&name) {
+// 			Some(TraitMemberKind::AssociatedType(index)) => Some(*index),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	/// The supertraits declared after the colon in `trait Sub: Super { .. }`.
+// 	///
+// 	/// There is no separate field for these: a supertrait is a bound on this
+// 	/// trait's own `Self`, so they live in `self_type_param.bounds` alongside
+// 	/// the reflexive `Self: ThisTrait` entry seeded at prescan — which is the
+// 	/// one entry filtered out here, and the reason this needs to be told its
+// 	/// own index. Storing them anywhere else is what used to keep them
+// 	/// invisible to every lookup that goes through `TypeParamInfo::bounds`
+// 	/// (method and associated-item resolution, `type_implements_trait`).
+// 	///
+// 	/// A self-referential `trait A: A {}` collapses into that same reflexive
+// 	/// entry and so reports no supertraits at all; it is rejected as a cycle
+// 	/// before anything reads this.
+// 	pub fn supertraits(
+// 		&self,
+// 		self_index: TraitIndex,
+// 	) -> impl Iterator<Item = &TraitBound> {
+// 		self.self_type_param
+// 			.bounds
+// 			.traits
+// 			.iter()
+// 			.filter(move |bound| bound.trait_index != self_index)
+// 	}
+// }
+
+// /// The intersection of representable value ranges across a set of integer types.
+// ///
+// /// `min` is stored as the two's-complement bit pattern of an `i64` (reinterpret with `as i64`).
+// /// `max` is stored as a plain `u64` upper bound.
+// ///
+// /// Use [`IntegerRange::contains`] to test whether a literal fits; use
+// /// [`IntegerRange::intersect`] to narrow two ranges to their overlap.
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct IntegerRange {
+// 	min: u64,
+// 	max: u64,
+// }
+
+// impl IntegerRange {
+// 	/// Returns the range for a single integer primitive type, or `None` if `ty` is not one.
+// 	pub fn for_integer_type(ty: TypeIndex) -> Option<Self> {
+// 		if ty == TypeIndex::I8 {
+// 			Some(Self {
+// 				min: i8::MIN as i64 as u64,
+// 				max: i8::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::U8 {
+// 			Some(Self {
+// 				min: 0,
+// 				max: u8::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::I16 {
+// 			Some(Self {
+// 				min: i16::MIN as i64 as u64,
+// 				max: i16::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::U16 {
+// 			Some(Self {
+// 				min: 0,
+// 				max: u16::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::I32 {
+// 			Some(Self {
+// 				min: i32::MIN as i64 as u64,
+// 				max: i32::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::U32 {
+// 			Some(Self {
+// 				min: 0,
+// 				max: u32::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::I64 {
+// 			Some(Self {
+// 				min: i64::MIN as u64,
+// 				max: i64::MAX as u64,
+// 			})
+// 		} else if ty == TypeIndex::U64 {
+// 			Some(Self {
+// 				min: 0,
+// 				max: u64::MAX,
+// 			})
+// 		} else {
+// 			None
+// 		}
+// 	}
+
+// 	/// The widest possible range — the identity element for [`intersect`](Self::intersect).
+// 	pub fn widest() -> Self {
+// 		Self {
+// 			min: i64::MIN as u64,
+// 			max: u64::MAX,
+// 		}
+// 	}
+
+// 	/// Narrows this range to the overlap with `other` (greatest lower bound, least upper bound).
+// 	pub fn intersect(self, other: Self) -> Self {
+// 		let min = if (self.min as i64) >= (other.min as i64) {
+// 			self.min
+// 		} else {
+// 			other.min
+// 		};
+// 		let max = self.max.min(other.max);
+// 		Self { min, max }
+// 	}
+
+// 	/// Returns `true` if the i64 `value` falls within this range.
+// 	pub fn contains(&self, value: i64) -> bool {
+// 		if value < 0 {
+// 			value >= (self.min as i64)
+// 		} else {
+// 			(value as u64) <= self.max
+// 		}
+// 	}
+
+// 	pub fn min_i64(&self) -> i64 {
+// 		self.min as i64
+// 	}
+
+// 	pub fn max_u64(&self) -> u64 {
+// 		self.max
+// 	}
+// }
+
+// /// Whether `value` is exactly representable in a float whose significand has
+// /// `mantissa_bits` bits (24 for f32, 53 for f64). A `u64` literal can never
+// /// over- or underflow either float type, so the only question is whether its
+// /// set bits span more than `mantissa_bits` positions —
+// /// `64 - leading_zeros - trailing_zeros` — with `0` (no set bits) always fine.
+// pub(crate) fn integer_exact_in_float(value: u64, mantissa_bits: u32) -> bool {
+// 	value == 0
+// 		|| 64 - value.leading_zeros() - value.trailing_zeros() <= mantissa_bits
+// }
+
+// /// A closed compile-time set of concrete types, used as a type param bound.
+// /// `typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }`
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct TypeSet {
+// 	pub id: ast::DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub pub_span: Option<TextSpan>,
+// 	/// Each member carries the span of its type expression in the `typeset`
+// 	/// body, so a coercion failure can point at the specific member.
+// 	pub members: Box<[ast::Spanned<TypeIndex>]>,
+// 	/// The compiler-generated trait that backs this typeset. `T: ThisTypeset`
+// 	/// bounds resolve to a `TraitBound` on it, and every member gets a
+// 	/// synthetic `impl` of it. The trait shell is created next to the `TypeSet`
+// 	/// in prescan; its supertraits and member impls are filled in during
+// 	/// signature resolution.
+// 	pub trait_index: TraitIndex,
+// 	pub accesses: Vec<SourceSpan>,
+// 	pub attributes: Box<[ItemAttribute]>,
+// }
+
+// /// A location that lives inside linear memory (a "place" in the sense of
+// /// Rust's place / value distinction).  Every `Place` carries the memory it
+// /// belongs to and whether it was reached through a mutable pointer — both
+// /// propagated at build time so callers never need a recursive walk.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Place {
+// 	pub kind: PlaceKind,
+// 	/// Type of the value stored at this location.
+// 	pub ty: TypeIndex,
+// 	/// `TypeIndex` of the `Type::Memory` this place lives in.
+// 	pub memory: TypeIndex,
+// 	/// `true` if the root `Deref` was through a mutable pointer.
+// 	pub mutable: bool,
+// 	pub span: TextSpan,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum PlaceKind {
+// 	/// `ptr.*` — the only way to enter linear memory.
+// 	Deref { pointer: Box<Expression> },
+// 	/// `place.field` — field projection; memory/mutable inherited from object.
+// 	Field {
+// 		object: Box<Place>,
+// 		/// Resolved once, at construction (`resolve_struct_field`'s
+// 		/// `ResolvedField::index`) — MIR only ever needs the declaration
+// 		/// index, never the name, so there's no reason to make it redo the
+// 		/// name lookup (or care which `StructKind` the struct is; `.field`
+// 		/// syntax only ever resolves against `StructKind::Record`).
+// 		member: ast::Spanned<FieldIndex>,
+// 	},
+// 	/// `expr[index]` — index into an array/slice value; memory/mutable come from
+// 	/// the expression's type, not from a parent place.
+// 	Index {
+// 		object: Box<Expression>,
+// 		index: Box<Expression>,
+// 	},
+// }
+
+// /// `ast::BinaryOp` minus its six assignment variants (`Assign` and the five
+// /// `*Assign` compound forms). By the time an expression reaches
+// /// `ExprKind::Binary`, assignment has already been routed to its own nodes
+// /// (`Assign`, `Store`, `CompoundAssign`, `GenericCompoundAssign`,
+// /// `CompoundStore`, `GenericCompoundStore`) — giving `Binary` its own operator
+// /// type makes that split enforced by the compiler (an exhaustive match can
+// /// never again accidentally construct `Binary` with an assignment operator)
+// /// rather than merely a convention.
+// #[derive(Clone, Copy, PartialEq, Eq)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum BinaryOp {
+// 	Add,
+// 	Sub,
+// 	Mul,
+// 	Div,
+// 	Rem,
+// 	Eq,
+// 	NotEq,
+// 	Less,
+// 	LessEq,
+// 	Greater,
+// 	GreaterEq,
+// 	And,
+// 	Or,
+// 	BitAnd,
+// 	BitOr,
+// 	BitXor,
+// 	LeftShift,
+// 	RightShift,
+// }
+
+// impl From<ast::BinaryOp> for BinaryOp {
+// 	fn from(op: ast::BinaryOp) -> Self {
+// 		match op {
+// 			ast::BinaryOp::Add => BinaryOp::Add,
+// 			ast::BinaryOp::Sub => BinaryOp::Sub,
+// 			ast::BinaryOp::Mul => BinaryOp::Mul,
+// 			ast::BinaryOp::Div => BinaryOp::Div,
+// 			ast::BinaryOp::Rem => BinaryOp::Rem,
+// 			ast::BinaryOp::Eq => BinaryOp::Eq,
+// 			ast::BinaryOp::NotEq => BinaryOp::NotEq,
+// 			ast::BinaryOp::Less => BinaryOp::Less,
+// 			ast::BinaryOp::LessEq => BinaryOp::LessEq,
+// 			ast::BinaryOp::Greater => BinaryOp::Greater,
+// 			ast::BinaryOp::GreaterEq => BinaryOp::GreaterEq,
+// 			ast::BinaryOp::And => BinaryOp::And,
+// 			ast::BinaryOp::Or => BinaryOp::Or,
+// 			ast::BinaryOp::BitAnd => BinaryOp::BitAnd,
+// 			ast::BinaryOp::BitOr => BinaryOp::BitOr,
+// 			ast::BinaryOp::BitXor => BinaryOp::BitXor,
+// 			ast::BinaryOp::LeftShift => BinaryOp::LeftShift,
+// 			ast::BinaryOp::RightShift => BinaryOp::RightShift,
+// 			ast::BinaryOp::Assign
+// 			| ast::BinaryOp::AddAssign
+// 			| ast::BinaryOp::SubAssign
+// 			| ast::BinaryOp::MulAssign
+// 			| ast::BinaryOp::DivAssign
+// 			| ast::BinaryOp::RemAssign
+// 			| ast::BinaryOp::BitAndAssign
+// 			| ast::BinaryOp::BitOrAssign
+// 			| ast::BinaryOp::BitXorAssign
+// 			| ast::BinaryOp::LeftShiftAssign
+// 			| ast::BinaryOp::RightShiftAssign => unreachable!(
+// 				"assignment operators never reach tir::ExprKind::Binary — \
+// 				 they are represented by dedicated Assign/CompoundAssign-family nodes"
+// 			),
+// 		}
+// 	}
+// }
+
+// impl BinaryOp {
+// 	pub fn is_arithmetic(&self) -> bool {
+// 		matches!(
+// 			self,
+// 			BinaryOp::Add
+// 				| BinaryOp::Sub
+// 				| BinaryOp::Mul
+// 				| BinaryOp::Div
+// 				| BinaryOp::Rem
+// 		)
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum ExprKind {
+// 	Error,
+// 	Placeholder,
+// 	Unreachable,
+// 	/// Mirrors `ast::Expression::Int`: the raw, non-negative magnitude as
+// 	/// written, never itself negative — see that type's doc comment.
+// 	Int {
+// 		value: u64,
+// 	},
+// 	Float {
+// 		value: f64,
+// 	},
+// 	Bool {
+// 		value: bool,
+// 	},
+// 	Global {
+// 		id: DefId,
+// 	},
+// 	Function {
+// 		id: DefId,
+// 	},
+// 	Memory {
+// 		id: DefId,
+// 	},
+// 	LocalDeclaration {
+// 		name: ast::Spanned<SymbolU32>,
+// 		scope_index: ScopeIndex,
+// 		local_index: LocalIndex,
+// 		value: Box<Expression>,
+// 	},
+// 	/// `local (a, b) = expr;` — binds several locals from a *single*
+// 	/// evaluation of `value`.
+// 	///
+// 	/// Deliberately not desugared into one `LocalDeclaration` per binding:
+// 	/// TIR is a tree, so code is emitted once per occurrence of a node, and
+// 	/// handing the same `value` to several declarations would re-evaluate it
+// 	/// per binding. Holding the bindings together lets MIR spill `value` into
+// 	/// one temp — the idiom it already uses in `lower_compound_store` and
+// 	/// friends — and read every binding out of that. It also keeps the temp
+// 	/// on the MIR side, where `Local` has no name, rather than forcing a
+// 	/// nameless local into TIR where every local is a user-written binding.
+// 	///
+// 	/// `bindings` may be empty (`local Point::{ .. } = p;`), in which case
+// 	/// this is just "evaluate `value`, discard it".
+// 	DestructureDeclaration {
+// 		value: Box<Expression>,
+// 		bindings: Box<[PatternBinding]>,
+// 	},
+// 	Local {
+// 		scope_index: ScopeIndex,
+// 		local_index: LocalIndex,
+// 	},
+// 	Return {
+// 		value: Option<Box<Expression>>,
+// 	},
+// 	EnumVariant {
+// 		enum_index: EnumIndex,
+// 		variant_index: EnumVariantIndex,
+// 	},
+// 	Unary {
+// 		operator: ast::Spanned<ast::UnaryOp>,
+// 		operand: Box<Expression>,
+// 	},
+// 	Binary {
+// 		operator: ast::Spanned<BinaryOp>,
+// 		left: Box<Expression>,
+// 		right: Box<Expression>,
+// 	},
+// 	Call {
+// 		callee: Box<Expression>,
+// 		arguments: Box<[Expression]>,
+// 	},
+// 	/// `type_args[i]` = concrete type substituted for `TypeParam { param_index:
+// 	/// i }`.
+// 	GenericCall {
+// 		id: DefId,
+// 		type_args: Box<[TypeIndex]>,
+// 		arguments: Box<[Expression]>,
+// 	},
+// 	/// `type_args[0]` = Self (receiver), `type_args[1..]` = explicit generics.
+// 	GenericMethodCall {
+// 		id: DefId,
+// 		type_args: Box<[TypeIndex]>,
+// 		arguments: Box<[Expression]>,
+// 	},
+// 	MethodCall {
+// 		arguments: Box<[Expression]>,
+// 		id: ast::DefId,
+// 	},
+// 	Block {
+// 		scope_index: ScopeIndex,
+// 		expressions: Box<[Expression]>,
+// 		result: Option<Box<Expression>>,
+// 	},
+// 	IfElse {
+// 		condition: Box<Expression>,
+// 		then_block: Box<Expression>,
+// 		else_block: Option<Box<Expression>>,
+// 	},
+// 	Match {
+// 		scrutinee: Box<Expression>,
+// 		arms: Box<[MatchArm]>,
+// 	},
+// 	Break {
+// 		scope_index: ScopeIndex,
+// 		value: Option<Box<Expression>>,
+// 	},
+// 	Continue {
+// 		scope_index: ScopeIndex,
+// 	},
+// 	Loop {
+// 		scope_index: ScopeIndex,
+// 		block: Box<Expression>,
+// 	},
+// 	/// A trait-owned const (its own declared/default value, e.g. referenced
+// 	/// as `Self::CONST` inside a default method body, or `T::CONST` through
+// 	/// a generic `T: SomeTrait` bound) whose concrete per-impl value can't
+// 	/// be picked until `receiver` is monomorphized — MIR re-resolves the
+// 	/// real `ImplEntry::AssocConstant` via `find_trait_impl(receiver, ..)`
+// 	/// at that point. Every *other* member access (a function, a global, a
+// 	/// non-trait-owned const, an enum variant, or a trait const already
+// 	/// resolved through a concrete `impl Trait for Target` rather than the
+// 	/// trait's own declaration) needs no receiver-type bookkeeping at all
+// 	/// and lowers as the bare `Function`/`Global`/`Const`/`EnumVariant` node
+// 	/// it already would be outside a `::`-qualified path — this variant
+// 	/// exists for the one case that's genuinely different, not as a general
+// 	/// "accessed via `::`" wrapper.
+// 	AbstractConstAccess {
+// 		receiver: TypeIndex,
+// 		id: DefId,
+// 	},
+// 	Const {
+// 		id: ast::DefId,
+// 	},
+// 	String {
+// 		symbol: SymbolU32,
+// 	},
+// 	Char {
+// 		value: char,
+// 	},
+// 	FieldAccess {
+// 		object: Box<Expression>,
+// 		/// See `PlaceKind::Field::member` — resolved once at construction,
+// 		/// never re-looked-up by name.
+// 		field: ast::Spanned<FieldIndex>,
+// 	},
+
+// 	RecordStructInit {
+// 		struct_index: StructIndex,
+// 		/// One entry per initializer expression, in source-written order —
+// 		/// *not* declaration order — so evaluation order (and therefore any
+// 		/// side effects field initializers contain) matches what the user
+// 		/// wrote, even when named fields are supplied out of declaration
+// 		/// order. `FieldIndex` records which declared field each value goes
+// 		/// to, so MIR can still place it correctly after lowering.
+// 		fields: Box<[(FieldIndex, Expression)]>,
+// 	},
+// 	/// `Point(1, 2)` — positional tuple-struct construction. Shaped like
+// 	/// [`Self::Call`] (a callee-like `struct_index` instead of a callee
+// 	/// expression) rather than like [`Self::RecordStructInit`]: a tuple
+// 	/// struct's arguments are always supplied in declaration order (there's
+// 	/// no name-based reordering possible for unnamed fields), so there is
+// 	/// nothing for a per-entry `FieldIndex` to record — position alone
+// 	/// already *is* the declared index. No `type_args` field either, for the
+// 	/// same reason `RecordStructInit` has none: the resolved args live on
+// 	/// this expression's own `ty` (`Type::Struct { struct_index, args }`),
+// 	/// which — unlike a function's return type — always mentions every one
+// 	/// of the struct's type params, so nothing is lost by not storing them
+// 	/// again here.
+// 	TupleStructInit {
+// 		struct_index: StructIndex,
+// 		arguments: Box<[Expression]>,
+// 	},
+// 	TupleInit {
+// 		elements: Box<[Expression]>,
+// 	},
+// 	/// `[a, b, c]` — all elements are compile-time constants; placed in static data.
+// 	ArrayLiteral {
+// 		elements: Box<[Expression]>,
+// 		memory: TypeIndex,
+// 	},
+// 	/// `[value; count]` — repeat form; placed in static data.
+// 	ArrayRepeat {
+// 		value: Box<Expression>,
+// 		count: u32,
+// 		memory: TypeIndex,
+// 	},
+
+// 	/// `object[start..end]` — exclusive slice range.
+// 	/// `None` means the bound was omitted: `start = None` is `0`, `end = None`
+// 	/// is the object's length.  MIR fills these in during lowering.
+// 	SliceRange {
+// 		object: Box<Expression>,
+// 		start: Option<Box<Expression>>,
+// 		end: Option<Box<Expression>>,
+// 	},
+// 	/// Load a value from a memory place (`place.*` or `place.field`, etc.).
+// 	Load {
+// 		place: Box<Place>,
+// 	},
+// 	/// Take the address of a memory place (`.&` postfix operator). Always
+// 	/// produces a shared reference.
+// 	AddressOf {
+// 		place: Box<Place>,
+// 	},
+// 	/// Store a value to a memory place (assignment through a place).
+// 	Store {
+// 		target: Box<Place>,
+// 		value: Box<Expression>,
+// 	},
+// 	/// `x = y` for a `Local`/`Global`/`FieldAccess`/`Placeholder` target —
+// 	/// the non-`Place` counterpart of `Store`. Kept as its own node (rather
+// 	/// than reusing `Binary`) so `Binary`'s operator can be the assignment-
+// 	/// free `tir::BinaryOp` — see that type's doc comment.
+// 	Assign {
+// 		left: Box<Expression>,
+// 		right: Box<Expression>,
+// 	},
+// 	/// `x += y` and friends where `x`'s type is already concrete and a real
+// 	/// `Add`-style impl was found — sugar over `x = x.add(y)`, but its own
+// 	/// node (rather than desugared into a `MethodCall` at TIR-build time,
+// 	/// the way plain `+` is) because `target` would otherwise have to be
+// 	/// built twice — once to read the current value, once as the
+// 	/// assignment target — which isn't safe in general since `Expression`
+// 	/// isn't `Clone` and a `target` may itself embed side-effecting
+// 	/// sub-expressions. `target` is `Local`/`Global`/`FieldAccess` only —
+// 	/// `Load{place}` targets use `CompoundStore` instead, since a `Place`
+// 	/// needs its own once-only-lowering treatment distinct from an
+// 	/// `Expression`'s. `method_id` is the resolved `Add`-style impl method.
+// 	CompoundAssign {
+// 		target: Box<Expression>,
+// 		rhs: Box<Expression>,
+// 		method_id: ast::DefId,
+// 	},
+// 	/// The `CompoundAssign` counterpart for when `target`'s type isn't
+// 	/// concrete yet at TIR-build time (a bare `TypeParam` or a
+// 	/// typeset-bounded `AssocTypeProjection`) — `abstract_method_id` is the
+// 	/// trait's own abstract method declaration (no body) and `self_type` is
+// 	/// `target`'s (still abstract) type, mirroring `GenericMethodCall`'s
+// 	/// `type_args[0] = Self` convention (stored bare rather than as a
+// 	/// single-element `type_args` slice since none of the operator traits'
+// 	/// methods carry any generics of their own beyond the implicit `Self`).
+// 	/// Resolved for real once monomorphization substitutes a concrete
+// 	/// `Self`, via the exact same `find_trait_impl` fallback
+// 	/// `GenericMethodCall` already uses for abstract trait methods at
+// 	/// MIR-lowering time — no new resolution machinery.
+// 	GenericCompoundAssign {
+// 		target: Box<Expression>,
+// 		rhs: Box<Expression>,
+// 		abstract_method_id: ast::DefId,
+// 		self_type: TypeIndex,
+// 	},
+// 	/// The `Load{place}`-targeted analogue of `CompoundAssign`, named to
+// 	/// mirror `Store`. Needed as a distinct node (rather than reusing
+// 	/// `CompoundAssign` with `target: Load{place}`) because a `Place`'s
+// 	/// address must be computed exactly once and reused for both the old-
+// 	/// value read and the store — MIR lowers `target` directly as a
+// 	/// `Place`, not as an `Expression` wrapping one.
+// 	CompoundStore {
+// 		target: Box<Place>,
+// 		rhs: Box<Expression>,
+// 		method_id: ast::DefId,
+// 	},
+// 	/// The `Load{place}`-targeted analogue of `GenericCompoundAssign` — see
+// 	/// both `CompoundStore` and `GenericCompoundAssign`'s doc comments.
+// 	GenericCompoundStore {
+// 		target: Box<Place>,
+// 		rhs: Box<Expression>,
+// 		abstract_method_id: ast::DefId,
+// 		self_type: TypeIndex,
+// 	},
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Expression {
+// 	pub kind: ExprKind,
+// 	pub ty: TypeIndex,
+// 	pub span: TextSpan,
+// }
+
+// /// The compile-time value of a constant expression (enum variant value, `const`
+// /// initializer). Cached alongside the built `Expression` tree rather than replacing
+// /// it, so the tree stays available for LSP/semantic-analysis use while codegen and
+// /// validation can read the value directly without re-interpreting the tree.
+// #[derive(Clone, Copy, PartialEq)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum ConstValue {
+// 	Int(i64),
+// 	Float(f64),
+// 	Bool(bool),
+// 	Char(char),
+// }
+
+// #[derive(Clone, Copy, PartialEq)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum AccessKind {
+// 	Read,
+// 	Write,
+// 	ReadWrite,
+// }
+
+// #[derive(Clone, Copy)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// struct AccessContext {
+// 	/// Hint for type inference at this expression site.
+// 	/// `TypeIndex::INFER` means "no constraint".
+// 	/// A type containing `TypeIndex::INFER` (e.g. `Layout<_>`) is a partial
+// 	/// constraint — positions marked INFER act as wildcards.
+// 	expected_type: TypeIndex,
+// 	access_kind: AccessKind,
+// }
+
+// #[derive(Clone, Copy)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct LocalAccess {
+// 	pub span: TextSpan,
+// 	pub kind: AccessKind,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Local {
+// 	pub name: Spanned<SymbolU32>,
+// 	pub ty: TypeIndex,
+// 	pub mut_span: Option<TextSpan>,
+// 	pub accesses: Vec<LocalAccess>,
+// }
+
+// /// One step of a destructuring projection: "take field `index` of an
+// /// aggregate of type `aggregate_ty`".
+// ///
+// /// `aggregate_ty` is carried explicitly so MIR never has to re-derive the
+// /// type it is indexing into — `lower_type_index(aggregate_ty)` hands back the
+// /// interned `Aggregate` directly, generic substitution already applied, and
+// /// its `decl_to_phys` maps `index` onto the alignment-sorted slot.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, Copy)]
+// pub struct PathStep {
+// 	pub aggregate_ty: TypeIndex,
+// 	/// Declaration-order index — the field's position as written in the
+// 	/// `struct`, or the element's position in the tuple. Not the physical
+// 	/// slot; MIR maps it through `decl_to_phys`.
+// 	pub index: u32,
+// }
+
+// /// One name bound by a `DestructureDeclaration`, plus the projection path
+// /// reaching its value from the scrutinee. Nested patterns are flattened, so
+// /// `local (x, (y, z)) = t;` yields paths `[0]`, `[1, 0]`, `[1, 1]` rather
+// /// than a nested structure.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct PatternBinding {
+// 	pub scope_index: ScopeIndex,
+// 	pub local_index: LocalIndex,
+// 	pub path: Box<[PathStep]>,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone, Copy, PartialEq)]
+// pub enum BlockKind {
+// 	Block,
+// 	/// Type inferred from `break`, not the final expression.
+// 	Loop,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct BlockLabel {
+// 	pub name: Spanned<SymbolU32>,
+// 	pub accesses: Vec<TextSpan>,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct BlockScope {
+// 	pub kind: BlockKind,
+// 	pub label: Option<LabelIndex>,
+// 	pub parent: Option<ScopeIndex>,
+// 	pub span: TextSpan,
+// 	pub locals: Vec<Local>,
+// 	/// Type accumulated from `break` arms; `INFER` means nothing seen yet.
+// 	pub inferred_type: TypeIndex,
+// 	/// Hint from the surrounding context; `INFER` means unconstrained.
+// 	pub expected_type: TypeIndex,
+// }
+
+// impl BlockScope {
+// 	#[inline]
+// 	pub fn locals_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (LocalIndex, &Local)> {
+// 		self.locals
+// 			.iter()
+// 			.enumerate()
+// 			.map(|(index, local)| (LocalIndex::new(index as u32), local))
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct StackFrame {
+// 	pub labels: Vec<BlockLabel>,
+// 	pub scopes: Vec<BlockScope>,
+// }
+
+// impl StackFrame {
+// 	#[inline]
+// 	pub fn scopes_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (ScopeIndex, &BlockScope)> {
+// 		self.scopes
+// 			.iter()
+// 			.enumerate()
+// 			.map(|(index, scope)| (ScopeIndex::new(index as u32), scope))
+// 	}
+
+// 	#[inline]
+// 	fn push_local(
+// 		&mut self,
+// 		scope_index: ScopeIndex,
+// 		local: Local,
+// 	) -> LocalIndex {
+// 		let scope = &mut self.scopes[usize::from(scope_index)];
+// 		let local_index = LocalIndex::new(scope.locals.len() as u32);
+// 		scope.locals.push(local);
+// 		local_index
+// 	}
+
+// 	#[inline]
+// 	fn push_label(&mut self, label: Spanned<SymbolU32>) -> LabelIndex {
+// 		let label_index = LabelIndex::new(self.labels.len() as u32);
+// 		self.labels.push(BlockLabel {
+// 			name: label,
+// 			accesses: Vec::new(),
+// 		});
+// 		label_index
+// 	}
+
+// 	#[inline]
+// 	fn get_local(
+// 		&self,
+// 		scope_index: ScopeIndex,
+// 		local_index: LocalIndex,
+// 	) -> &Local {
+// 		&self.scopes[usize::from(scope_index)].locals[usize::from(local_index)]
+// 	}
+
+// 	#[inline]
+// 	fn record_local_access(
+// 		&mut self,
+// 		scope_index: ScopeIndex,
+// 		local_index: LocalIndex,
+// 		access: LocalAccess,
+// 	) {
+// 		self.scopes[usize::from(scope_index)].locals[usize::from(local_index)]
+// 			.accesses
+// 			.push(access);
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// #[derive(Clone)]
+// pub struct FunctionParam {
+// 	pub mut_span: Option<TextSpan>,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub ty: ast::Spanned<TypeIndex>,
+// }
+
+// /// One named leaf of a `use` tree — `sin` in `use math::trig::{sin, cos};`.
+// /// One per leaf, so it is 1:1 with a `DefId`. Globs have no entry here:
+// /// they register a [`WildcardImport`] at prescan and bind no name.
+// ///
+// /// This exists so that a `use` leaf is an *item* like any other.
+// /// `SymbolKind::Pending(def_id)` universally means "a stub for `def_id` is
+// /// already materialized, reachable through `item_lookup`" — that invariant
+// /// is what lets `get_symbol_location` produce a declaration span for a name
+// /// whose signature hasn't been computed yet. A leaf that bound a name
+// /// without a stub would be a `Pending` with nothing behind it, and the
+// /// duplicate-definition diagnostic for `use a::foo;` alongside `fn foo`
+// /// would panic on the missing key rather than report.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct UseItem {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	/// The namespace the `use` was written in — where `local_name` binds.
+// 	pub namespace: NamespaceIndex,
+// 	/// Index into [`ItemRegistry::use_prefixes`] — the `math` of `use math::sin;`,
+// 	/// shared with every sibling leaf that named the same tokens.
+// 	pub prefix: UsePrefixIndex,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub alias: Option<ast::Spanned<SymbolU32>>,
+// 	/// The `use` statement's own visibility qualifier — `Some` for `pub use`.
+// 	/// Distinct from the visibility of whatever item this leaf re-exports:
+// 	/// that was already checked once, when this leaf's own prefix resolved
+// 	/// (`resolve_pending_namespace_symbol` from the writing namespace).
+// 	/// This is what governs whether *this* binding is reachable from
+// 	/// outside the writing namespace — see [`SymbolEntry::visibility`].
+// 	pub pub_span: Option<TextSpan>,
+// }
+
+// /// One occurrence of a `use` prefix — `math` in `use math::{sin, cos};`,
+// /// named once in the source and therefore stored once here, however many
+// /// leaves sit under it.
+// ///
+// /// Walking it per leaf would resolve the same path repeatedly and record
+// /// the same access repeatedly; since the LSP turns every access into a
+// /// reference, the duplicates would give find-references repeats and make a
+// /// rename emit two overlapping edits at one range. Whichever leaf needs it
+// /// first walks it and stores the outcome; the rest read that.
+// ///
+// /// Two separate statements — `use math::add; use math::sub;` — get two
+// /// entries, correctly: they are two distinct mentions of `math`.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct UsePrefix {
+// 	/// The segments as written. Purely syntactic — prescan cannot resolve
+// 	/// them, which is exactly why named leaves defer to Phase 2. Recorded
+// 	/// here rather than recovered from the AST later because the prescan
+// 	/// walk builds this anyway to resolve sibling globs.
+// 	pub path: Box<[ast::Spanned<SymbolU32>]>,
+// 	pub target: PrefixTarget,
+// }
+
+// /// Where a [`UsePrefix`] leads. Three states rather than an
+// /// `Option<NamespaceIndex>`, because "nobody has walked this yet" and
+// /// "walked, and it goes nowhere" need different answers: the first means
+// /// walk it, the second means stay quiet, since the diagnostic was already
+// /// reported by whoever walked it.
+// #[derive(Clone, Copy)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum PrefixTarget {
+// 	Unwalked,
+// 	Resolved(NamespaceIndex),
+// 	Failed,
+// }
+
+// impl UseItem {
+// 	/// The name this import binds locally — the alias when renamed, else
+// 	/// the imported name itself.
+// 	#[inline]
+// 	pub fn local_name(&self) -> ast::Spanned<SymbolU32> {
+// 		self.alias.unwrap_or(self.name)
+// 	}
+// }
+
+// /// A package's `export { .. }` block — its single exit point, and so
+// /// either present exactly once or absent entirely.
+// ///
+// /// The resolved items live *inside* the block rather than in a `TIR`-level
+// /// map beside a separate "have we already seen a block?" flag, so that one
+// /// `Option` answers both questions and the two can never disagree: the
+// /// check that rejects a second block is a read of the very value that
+// /// holds the first block's exports.
+// #[cfg_attr(test, derive(Debug, serde::Serialize))]
+// pub struct ExportBlock {
+// 	/// The `export` keyword itself — what a "previous export block here"
+// 	/// label points at, and the only span an empty block has.
+// 	pub keyword: SourceSpan,
+// 	/// Keyed by *external* name (`alias ?? internal_name`): what has to be
+// 	/// unique is the name the WASM ABI exposes, not the item's internal
+// 	/// spelling.
+// 	#[cfg_attr(
+// 		test,
+// 		serde(serialize_with = "crate::testing::serialize_sorted_map")
+// 	)]
+// 	pub items: HashMap<SymbolU32, ExportItem>,
+// }
+
+// #[cfg_attr(test, derive(Debug, serde::Serialize))]
+// #[derive(Clone)]
+// pub enum ExportItem {
+// 	Function {
+// 		internal_name: Spanned<SymbolU32>,
+// 		external_name: Option<Spanned<SymbolU32>>,
+// 		id: DefId,
+// 	},
+// 	Global {
+// 		internal_name: Spanned<SymbolU32>,
+// 		external_name: Option<Spanned<SymbolU32>>,
+// 		id: DefId,
+// 	},
+// 	Memory {
+// 		internal_name: Spanned<SymbolU32>,
+// 		external_name: Option<Spanned<SymbolU32>>,
+// 		id: DefId,
+// 	},
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Enum {
+// 	pub id: ast::DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub repr_type: TypeIndex,
+// 	pub self_type: TypeIndex,
+// 	pub variants: Box<[EnumVariant]>,
+// 	#[cfg_attr(
+// 		test,
+// 		serde(serialize_with = "crate::testing::serialize_sorted_map")
+// 	)]
+// 	pub variant_lookup: HashMap<SymbolU32, EnumVariantIndex>,
+// 	pub accesses: Vec<SourceSpan>,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct EnumVariant {
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub value: Option<Box<Expression>>,
+// 	/// Compile-time value of `value`, if it folds — see `Builder::eval_const_expr`.
+// 	pub const_value: Option<ConstValue>,
+// 	pub accesses: Vec<SourceSpan>,
+// }
+
+// impl Enum {
+// 	#[inline]
+// 	pub fn variants_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (EnumVariantIndex, &EnumVariant)> {
+// 		self.variants.iter().enumerate().map(|(index, variant)| {
+// 			(EnumVariantIndex::new(index as u32), variant)
+// 		})
+// 	}
+// }
+
+// /// A resolved `match` arm pattern. v1 supports only patterns whose legality
+// /// can be checked by re-running the ordinary expression builder on the arm's
+// /// syntax (see `Builder::build_pattern`) — no bindings, no or-patterns, no
+// /// guards.
+// #[derive(Clone, Copy)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum Pattern {
+// 	Int(i64),
+// 	Bool(bool),
+// 	Char(char),
+// 	EnumVariant {
+// 		enum_index: EnumIndex,
+// 		variant_index: EnumVariantIndex,
+// 	},
+// 	Wildcard,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct MatchArm {
+// 	pub pattern: Pattern,
+// 	pub pattern_span: TextSpan,
+// 	pub body: Box<Expression>,
+// }
+
+// /// `PartialEq` is item identity: every variant is a plain index into a
+// /// `TIR` collection, so two equal `SymbolKind`s name the same item. That is
+// /// what lets a name reachable through two different globs be recognised as
+// /// one item rather than an ambiguity — two modules that each `pub use
+// /// c::foo;` both store the identical `Function { func_index }`.
+
+// /// Whether a resolved [`SymbolEntry`] is reachable from outside its own
+// /// namespace. Kinds that aren't subject to `pub`/private at all — memories,
+// /// import-block members, and a `Module` reached via `crate`/a dependency
+// /// name — are represented as `Public` too: not a claim that they were
+// /// written `pub`, just the honest, unconditionally-visible behavior for
+// /// something privacy doesn't apply to (see `symbol_kind_is_gated`).
+
+// /// One entry in a [`ModuleNamespace`]'s symbol table — either a claim
+// /// registered at pre-scan with nothing resolved yet, or a settled binding.
+// ///
+// /// Split out of `SymbolKind` itself (which used to carry a `Pending(DefId)`
+// /// variant of its own) so a still-unresolved claim simply has no
+// /// `visibility` to read: the underlying item's own `pub_span` (or a `use`
+// /// leaf's) isn't known until `ensure_signature` runs, so instead of
+// /// inventing a placeholder value, that state isn't representable here at
+// /// all. Every lookup that only wants "what does this name mean" and
+// /// doesn't care about visibility can still get a plain `SymbolKind` back
+// /// via [`Self::resolved_kind`] — `None` while still pending.
+// ///
+// /// `visibility` on `Resolved` is the visibility of *this binding* — not
+// /// necessarily the same as whatever the underlying item declared. A direct
+// /// declaration's entry and the item's own visibility always agree
+// /// (`insert_symbol` derives one from the other). A `use` re-export's entry
+// /// does not: it carries the `use` leaf's own `pub_span`, since re-export
+// /// privacy is independent of the original item's — that's already checked
+// /// once, when the leaf's own prefix resolved. This is what lets
+// /// `SymbolKind` stay a pure item identity (needed so the same item reached
+// /// through two globs compares equal) while still tracking per-binding
+// /// privacy.
+
+// /// Result of resolving a single-segment name. Separates the two categories
+// /// of symbols: global items (registered in the symbol table) and local
+// /// variables (stack-scoped within a function body).
+// #[derive(Clone, Copy)]
+// pub enum ResolvedSymbol {
+// 	Local {
+// 		scope_index: ScopeIndex,
+// 		local_index: LocalIndex,
+// 	},
+// 	Global(DefKind),
+// }
+
+// /// The kind of item found when resolving a member within a type namespace.
+// #[derive(Clone)]
+// pub enum ResolvedMember {
+// 	Function {
+// 		func_index: FunctionIndex,
+// 		type_args: Box<[TypeIndex]>,
+// 	},
+// 	Const {
+// 		const_index: ConstIndex,
+// 		/// Substitutes the owning trait's `Self` (and any of its own type
+// 		/// params) when the constant's declared type references them, e.g.
+// 		/// `Mem::PAGE_SIZE` where the trait declares `const PAGE_SIZE:
+// 		/// Self::Size` — empty for a plain (non-`Self`-relative) const type,
+// 		/// same convention as `Function`'s `type_args`.
+// 		type_args: Box<[TypeIndex]>,
+// 	},
+// 	Global {
+// 		global_index: GlobalIndex,
+// 	},
+// 	EnumVariant {
+// 		enum_index: EnumIndex,
+// 		variant_index: EnumVariantIndex,
+// 	},
+// }
+
+// #[derive(Clone, Copy)]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum ImportValue {
+// 	Function { id: DefId },
+// 	Global { id: DefId },
+// 	Memory { id: DefId },
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Memory {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub size: Spanned<TypeIndex>,
+// 	pub min_pages: Option<u32>,
+// 	pub max_pages: Option<u32>,
+// 	pub accesses: Vec<SourceSpan>,
+// }
+
+// #[derive(Clone, Copy, PartialEq, Eq)]
+// pub enum FileKind {
+// 	/// Unused-item warnings are suppressed.
+// 	Library,
+// 	Module,
+// }
+
+// /// A member's stable arena identity, independent of signature resolution.
+// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum TraitMemberKind {
+// 	Function(DefId),
+// 	Constant(DefId),
+// 	AssociatedType(DefId),
+// }
+
+// impl TraitMemberKind {
+// 	pub fn id(self) -> DefId {
+// 		match self {
+// 			Self::Function(id) => id,
+// 			Self::Constant(id) => id,
+// 			Self::AssociatedType(id) => id,
+// 		}
+// 	}
+
+// 	pub fn binding_namespace(self) -> BindingNamespace {
+// 		match self {
+// 			Self::AssociatedType(_) => BindingNamespace::Type,
+// 			Self::Function(_) | Self::Constant(_) => BindingNamespace::Value,
+// 		}
+// 	}
+
+// 	pub fn def_span(self, items: &ItemRegistry) -> SourceSpan {
+// 		match self {
+// 			Self::Function(i) => {
+// 				let item = &items.functions[usize::from(i)];
+// 				SourceSpan::new(item.file_id, item.name.span)
+// 			}
+// 			Self::Constant(i) => {
+// 				let item = &items.constants[usize::from(i)];
+// 				SourceSpan::new(item.file_id, item.name.span)
+// 			}
+// 			Self::AssociatedType(i) => {
+// 				let item = &items.associated_types[usize::from(i)];
+// 				SourceSpan::new(item.file_id, item.name.span)
+// 			}
+// 		}
+// 	}
+
+// 	/// Compatibility view for dispatch consumers. This does not resolve a
+// 	/// signature; builder callers must demand the member before using its type.
+// 	pub fn entry(self, items: &ItemRegistry) -> ImplEntry {
+// 		match self {
+// 			Self::Function(i) if items.functions[usize::from(i)].is_method => {
+// 				ImplEntry::Method(i)
+// 			}
+// 			Self::Function(i) => ImplEntry::AssocFunction(i),
+// 			Self::Constant(i) => ImplEntry::AssocConstant(i),
+// 			Self::AssociatedType(i) => ImplEntry::AssocType(i),
+// 		}
+// 	}
+// }
+
+// #[derive(Clone, Copy, PartialEq, Eq)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum ImplEntry {
+// 	Method(FunctionIndex),
+// 	AssocFunction(FunctionIndex),
+// 	AssocConstant(ConstIndex),
+// 	AssocType(AssocTypeIndex),
+// }
+
+// /// An associated-type declaration or definition. Trait declarations own
+// /// their bounds and references here and have no assigned type (`ty: None`).
+// /// Impl definitions own their assigned type; required bounds remain on the
+// /// trait declaration rather than being copied into each implementation.
+// #[derive(Clone)]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct AssociatedType {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	/// The scope it was declared in. Kept alongside `file_id` so trait
+// 	/// conformance checking, which walks impls rather than source, can
+// 	/// report against the right scope without reconstructing one.
+// 	pub namespace: NamespaceIndex,
+// 	pub name: Spanned<SymbolU32>,
+// 	/// The trait that declares it, or the impl that defines it. `None` only
+// 	/// for a memory impl's synthesized members, which are built complete and
+// 	/// never take part in demand-driven resolution. Used to qualify the name
+// 	/// (`A::Elem`, `Container::Elem`) in diagnostics.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub parent: Option<ItemParent>,
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub bounds: Bounds,
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub accesses: Vec<SourceSpan>,
+// 	pub ty: Option<Spanned<TypeIndex>>,
+// 	pub attributes: Box<[ItemAttribute]>,
+// }
+
+// impl ImplEntry {
+// 	/// What kind of item this is, for diagnostics.
+// 	pub fn noun(self) -> &'static str {
+// 		match self {
+// 			ImplEntry::AssocFunction(_) => "function",
+// 			ImplEntry::Method(_) => "method",
+// 			ImplEntry::AssocConstant(_) => "constant",
+// 			ImplEntry::AssocType(_) => "type",
+// 		}
+// 	}
+
+// 	pub fn def_span(self, items: &ItemRegistry) -> SourceSpan {
+// 		match self {
+// 			ImplEntry::Method(func_index)
+// 			| ImplEntry::AssocFunction(func_index) => {
+// 				let func = &items.functions[usize::from(func_index)];
+// 				SourceSpan::new(func.file_id, func.name.span)
+// 			}
+// 			ImplEntry::AssocConstant(index) => {
+// 				let constant = &items.constants[usize::from(index)];
+// 				SourceSpan::new(constant.file_id, constant.name.span)
+// 			}
+// 			ImplEntry::AssocType(index) => {
+// 				let assoc_type = &items.associated_types[usize::from(index)];
+// 				SourceSpan::new(assoc_type.file_id, assoc_type.name.span)
+// 			}
+// 		}
+// 	}
+// }
+
+// /// One `impl<Params> Target { ... }` block — inherent, not a trait impl.
+// /// This is the canonical owner of the impl-level type parameters; member
+// /// functions reference them via `TypeParamOwner::ImplBlock` rather than
+// /// storing a copy. `type_params` is empty for what used to be called a
+// /// "concrete" impl (`impl Target { .. }`) — that's no longer a structurally
+// /// different thing, just the degenerate (zero-parameter) case of the same
+// /// shape, so a concrete and a generic inherent impl can be compared/detected
+// /// as conflicting on equal footing instead of living in separate registries.
+// pub struct InherentImpl {
+// 	/// Synthetic `DefId` used to demand-drive this block's `ensure_signature`.
+// 	pub id: ast::DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub type_params: Box<[TypeParamDef]>,
+// 	/// `inner` is `TypeIndex::ERROR` until `ensure_signature` for this block
+// 	/// runs. `span` is the target type expression as written in the impl
+// 	/// header (`impl «this» { .. }`) — kept alongside the resolved type so
+// 	/// consumers (e.g. `Self`'s go-to-definition) have a source location to
+// 	/// point at without re-deriving one from the resolved `Type`.
+// 	pub target: Spanned<TypeIndex>,
+// 	pub members: HashMap<SymbolU32, ImplEntry>,
+// 	/// Every member this block declares, by name — filled when the block's
+// 	/// header is resolved, ahead of any member's own signature. See
+// 	/// [`MemberDecl`].
+// 	pub member_decls: HashMap<SymbolU32, MemberDecl>,
+// 	/// Spans of every `Self` keyword usage resolved against this block —
+// 	/// kept separate from `target`'s own struct/enum `accesses` so LSP
+// 	/// consumers (semantic tokens, rename) can tell "literally named the
+// 	/// type" apart from "used the `Self` keyword", which read the same at
+// 	/// the type-resolution level but must be treated differently: renaming
+// 	/// the type must not rewrite `Self` text, and `Self` shouldn't be
+// 	/// colored like an identifier reference.
+// 	pub self_accesses: Vec<SourceSpan>,
+// }
+
+// #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// pub enum ImplTarget {
+// 	U8,
+// 	I8,
+// 	U16,
+// 	I16,
+// 	U32,
+// 	I32,
+// 	U64,
+// 	I64,
+// 	F32,
+// 	F64,
+// 	Bool,
+// 	Char,
+// 	Slice,
+// 	Array,
+// 	Struct(DefId),
+// 	Enum(DefId),
+// 	Memory(DefId),
+// }
+
+// impl ImplTarget {
+// 	pub fn from_type(ty: &Type) -> Result<Self, ()> {
+// 		match ty {
+// 			Type::Slice { .. } => Ok(Self::Slice),
+// 			Type::Array { .. } => Ok(Self::Array),
+// 			Type::Struct { struct_index, .. } => {
+// 				Ok(Self::Struct(*struct_index))
+// 			}
+// 			Type::Enum { enum_index } => Ok(Self::Enum(*enum_index)),
+// 			Type::Memory { id, .. } => Ok(Self::Memory(*id)),
+// 			Type::U8 => Ok(Self::U8),
+// 			Type::I8 => Ok(Self::I8),
+// 			Type::U16 => Ok(Self::U16),
+// 			Type::I16 => Ok(Self::I16),
+// 			Type::U32 => Ok(Self::U32),
+// 			Type::I32 => Ok(Self::I32),
+// 			Type::U64 => Ok(Self::U64),
+// 			Type::I64 => Ok(Self::I64),
+// 			Type::F32 => Ok(Self::F32),
+// 			Type::F64 => Ok(Self::F64),
+// 			Type::Bool => Ok(Self::Bool),
+// 			Type::Char => Ok(Self::Char),
+// 			Type::Error
+// 			| Type::Infer
+// 			| Type::Never
+// 			| Type::Integer
+// 			| Type::Float
+// 			| Type::Function { .. }
+// 			| Type::FunctionItem { .. }
+// 			| Type::Pointer { .. }
+// 			| Type::TypeParam { .. }
+// 			| Type::AssociatedType { .. }
+// 			| Type::AssocTypeProjection { .. }
+// 			| Type::Unit
+// 			| Type::Tuple { .. } => Err(()),
+// 		}
+// 	}
+// }
+
+// #[derive(Clone, PartialEq)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum ItemAttribute {
+// 	Inline,
+// 	Intrinsic,
+// 	Tag(SymbolU32),
+// 	/// `#[fixed_order]` — struct fields keep declaration order in memory
+// 	/// instead of being sorted by alignment descending.
+// 	FixedOrder,
+// }
+
+// #[derive(Clone)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct TraitBound {
+// 	pub trait_index: TraitIndex,
+// 	/// Resolved RHS of each `where { AssocType = RhsType }` / `where {
+// 	/// AssocType: Bound }` binding, sorted by assoc-type name for
+// 	/// deterministic equality. At most one entry per name — `resolve_bounds`
+// 	/// rejects a second binding for the same associated type regardless of
+// 	/// which kind either one is, so a name can never appear twice here.
+// 	pub bindings: Box<[AssocBinding]>,
+// 	pub span: TextSpan,
+// }
+
+// /// One resolved associated-type constraint, retaining the locations of both
+// /// sides. Spans belong to `file_id`, including when effective lookup consults
+// /// this binding from a declaration in another file.
+// #[derive(Clone)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct AssocBinding {
+// 	pub file_id: FileId,
+// 	pub name: Spanned<SymbolU32>,
+// 	pub rhs: Spanned<AssocBindingKind>,
+// }
+
+// /// The right-hand side of one `TraitBound` binding.
+// #[derive(Clone)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum AssocBindingKind {
+// 	/// `AssocType = RhsType`.
+// 	Equals(TypeIndex),
+// 	/// Only the constraints written in `AssocType: Bound`; declaration
+// 	/// requirements are consulted separately by `effective_bounds`.
+// 	Bound(Bounds),
+// }
+
+// #[derive(Clone, Default)]
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Bounds {
+// 	pub traits: Box<[TraitBound]>,
+// }
+
+// /// A borrowed view of all applicable written constraints. Repeated trait
+// /// references retain their refinements; member lookup deduplicates candidates.
+// struct BoundSources<'a> {
+// 	sources: Vec<&'a Bounds>,
+// }
+
+// impl<'a> BoundSources<'a> {
+// 	fn traits(&self) -> impl Iterator<Item = &'a TraitBound> + '_ {
+// 		self.sources.iter().flat_map(|bounds| bounds.traits.iter())
+// 	}
+// }
+
+// impl Function {
+// 	/// Total number of type parameters visible to this function's body:
+// 	/// inherited params from the parent impl block plus the function's own params.
+// 	pub fn type_param_count(&self) -> usize {
+// 		self.inherited_type_param_count as usize + self.type_params.len()
+// 	}
+
+// 	/// The owner of this function's inherited type parameters — the parent
+// 	/// impl block, trait, or trait impl — or `None` for free and imported
+// 	/// functions. Derived from [`Function::parent`]: an inherent impl member
+// 	/// inherits that block's params, a trait member inherits the trait's
+// 	/// implicit `Self`, a trait-impl member inherits the impl's params.
+// 	pub fn type_param_parent(&self) -> Option<TypeParamOwner> {
+// 		Some(match self.parent? {
+// 			ItemParent::InherentImpl(idx) => TypeParamOwner::InherentImpl(idx),
+// 			ItemParent::TraitImpl(idx) => TypeParamOwner::TraitImpl(idx),
+// 			ItemParent::Trait(idx) => TypeParamOwner::Trait(idx),
+// 		})
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Function {
+// 	/// Whether the first parameter is the receiver named `self`.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub is_method: bool,
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	/// `Some` for methods/associated functions (impl or trait members) —
+// 	/// `None` for free top-level and imported functions. See `ItemParent`.
+// 	pub parent: Option<ItemParent>,
+// 	pub pub_span: Option<TextSpan>,
+// 	/// Own type parameters only — does not include params inherited from a
+// 	/// parent impl block. For the full ordered list, prepend the params from
+// 	/// [`Function::type_param_parent`]. Empty for monomorphic functions.
+// 	pub type_params: Box<[TypeParamDef]>,
+// 	/// Number of type parameters inherited from [`Function::type_param_parent`].
+// 	/// `Type::TypeParam::param_index` values for own params start at this
+// 	/// offset; impl-block params use absolute indices starting at 0.
+// 	pub inherited_type_param_count: u32,
+// 	pub signature_index: TypeIndex,
+// 	pub name: ast::Spanned<SymbolU32>,
+// 	pub params: Box<[FunctionParam]>,
+// 	pub result: Option<Spanned<TypeIndex>>,
+// 	pub accesses: Vec<SourceSpan>,
+// 	pub attributes: Box<[ItemAttribute]>,
+// 	/// Index into [`ItemRegistry::bodies`], or `None` when there is no body to
+// 	/// resolve — an imported or abstract-trait-method function — or Phase 3
+// 	/// (`ensure_body`) has not demanded it yet.
+// 	pub body: Option<BodyIndex>,
+// }
+
+// /// A type-checked expression tree plus the lexical frame it was checked in.
+// /// Produced in Phase 3 (`ensure_body`) for any item with an expression
+// /// implementation — function bodies and global initializers alike — and stored
+// /// in the shared [`ItemRegistry::bodies`] arena, referenced by [`BodyIndex`].
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Body {
+// 	pub stack: StackFrame,
+// 	pub block: Box<Expression>,
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Global {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub accesses: Vec<SourceSpan>,
+// 	pub name: Spanned<SymbolU32>,
+// 	pub ty: Spanned<TypeIndex>,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub mut_span: Option<TextSpan>,
+// 	/// Index into [`ItemRegistry::bodies`] for the initializer expression, or
+// 	/// `None` until Phase 3 (`ensure_body`) resolves it.
+// 	pub value: Option<BodyIndex>,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum FieldAccessKind {
+// 	Read,
+// 	Write,
+// 	/// A compound assignment (`s.a += 1`): reads the field *and* stores back
+// 	/// to it. Kept distinct rather than folded into `Read` so that neither
+// 	/// question — "was this field ever read?" (`Read | ReadWrite`) nor "was
+// 	/// it ever written?" (`Write | ReadWrite`) — has to be answered wrongly.
+// 	/// Collapsing it would force a choice of which consumer gets the truth.
+// 	ReadWrite,
+// 	/// A field given its value in a struct literal. The one kind with no
+// 	/// [`AccessKind`] counterpart, since it is not an expression-position
+// 	/// mention of the field at all.
+// 	Init,
+// }
+
+// impl FieldAccessKind {
+// 	/// How to record a field mention in expression position, given what the
+// 	/// surrounding expression does to it.
+// 	pub fn for_access(kind: AccessKind) -> FieldAccessKind {
+// 		match kind {
+// 			AccessKind::Read => FieldAccessKind::Read,
+// 			AccessKind::Write => FieldAccessKind::Write,
+// 			AccessKind::ReadWrite => FieldAccessKind::ReadWrite,
+// 		}
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct FieldAccess {
+// 	pub kind: FieldAccessKind,
+// 	pub file_id: FileId,
+// 	pub span: TextSpan,
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct StructField {
+// 	pub name: Spanned<SymbolU32>,
+// 	pub ty: Spanned<TypeIndex>,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub accesses: Vec<FieldAccess>,
+// }
+
+// /// One element of a tuple struct's field list — `StructField` minus the
+// /// name (there is none). Access tracking works the same as `StructField`'s:
+// /// construction (`Point(1, 2)`) pushes `Init` per positional argument,
+// /// destructuring (`local Point(x, y) = p;`) pushes a read kind per bound
+// /// (non-`_`, non-rest) element — position stands in for a name wherever the
+// /// dead-field-write lint or a diagnostic needs to name the field.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct TupleFieldInfo {
+// 	pub ty: Spanned<TypeIndex>,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub accesses: Vec<FieldAccess>,
+// }
+
+// /// A struct's field storage, genuinely different in shape between the two
+// /// declaration forms — not one shape with synthesized names standing in for
+// /// the other. See `notes`/CLAUDE.md's tuple-struct design writeup for why
+// /// this is a shape enum on one `Struct` type rather than two separate item
+// /// types: every other struct-level concern (impls, generics, monomorphization,
+// /// layout) is already keyed purely by `StructIndex`/`TypeIndex` identity and
+// /// never inspects field shape at all.
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub enum StructKind {
+// 	Record {
+// 		fields: Box<[StructField]>,
+// 		#[cfg_attr(
+// 			test,
+// 			serde(serialize_with = "crate::testing::serialize_sorted_map")
+// 		)]
+// 		lookup: HashMap<SymbolU32, FieldIndex>,
+// 	},
+// 	Tuple {
+// 		fields: Box<[TupleFieldInfo]>,
+// 	},
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct Struct {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub name: Spanned<SymbolU32>,
+// 	/// Empty for non-generic structs.
+// 	pub type_params: Box<[TypeParamDef]>,
+// 	/// `Type::Struct { struct_index, args: [] }` for this struct.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub self_type: TypeIndex,
+// 	pub attributes: Box<[ItemAttribute]>,
+// 	pub fields: StructKind,
+// 	pub accesses: Vec<SourceSpan>,
+// }
+
+// impl Struct {
+// 	#[inline]
+// 	pub fn fields_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (FieldIndex, &StructField)> {
+// 		let fields: &[StructField] = match &self.fields {
+// 			StructKind::Record { fields, .. } => fields,
+// 			StructKind::Tuple { .. } => &[],
+// 		};
+// 		fields
+// 			.iter()
+// 			.enumerate()
+// 			.map(|(index, field)| (FieldIndex::new(index as u32), field))
+// 	}
+// }
+
+// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct TypeAlias {
+// 	pub id: DefId,
+// 	pub file_id: FileId,
+// 	pub namespace: NamespaceIndex,
+// 	pub pub_span: Option<TextSpan>,
+// 	pub name: Spanned<SymbolU32>,
+// 	pub attributes: Box<[ItemAttribute]>,
+// 	/// Empty for non-generic aliases.
+// 	pub type_params: Box<[TypeParamDef]>,
+// 	/// The alias's target type, fully resolved. For a generic alias this may
+// 	/// contain `Type::TypeParam { owner: TypeParamOwner::TypeAlias(id), .. }`
+// 	/// placeholders, substituted via `substitute_type` at each reference site
+// 	/// that supplies concrete type arguments — the alias is transparent and
+// 	/// never appears past TIR.
+// 	///
+// 	/// Not `Option<TypeIndex>`: always resolved by the time anyone reads it
+// 	/// (falls back to `TypeIndex::ERROR`, never absent), even for bodiless
+// 	/// `#[intrinsic] type u8;` declarations. To check whether source actually
+// 	/// wrote `= Type`, look at `attributes` for `ItemAttribute::Intrinsic`.
+// 	pub body: TypeIndex,
+// 	pub accesses: Vec<SourceSpan>,
+// }
+
+// fn ownership_sigil(ownership: ast::Ownership) -> char {
+// 	match ownership {
+// 		ast::Ownership::Exclusive => '*',
+// 		ast::Ownership::Shared => '&',
+// 	}
+// }
+
+// pub struct TypeFormatter<'a> {
+// 	types: &'a TypeInterner,
+// 	items: &'a ItemRegistry,
+// 	defs: &'a DefinitionRegistry,
+// 	pub interner: &'a ast::StringInterner,
+// 	/// Needed to name a package, which has no name of its own — see
+// 	/// [`TIR::namespace_name`].
+// 	packages: &'a [Package],
+// 	/// The package whose point of view names are rendered from.
+// 	from: PackageId,
+// }
+
+// impl<'a> TypeFormatter<'a> {
+// 	pub fn new(
+// 		types: &'a TypeInterner,
+// 		items: &'a ItemRegistry,
+// 		defs: &'a DefinitionRegistry,
+// 		interner: &'a ast::StringInterner,
+// 		packages: &'a [Package],
+// 		from: PackageId,
+// 	) -> Self {
+// 		Self {
+// 			types,
+// 			items,
+// 			defs,
+// 			interner,
+// 			packages,
+// 			from,
+// 		}
+// 	}
+
+// 	/// Names a namespace the same way a `Type::Namespace` value used to
+// 	/// render itself before that variant existed — kept as a `TypeFormatter`
+// 	/// method since it already carries every piece `ModuleGraph::namespace_name`
+// 	/// needs, for the rare diagnostic that must name a namespace directly
+// 	/// rather than the type a path eventually resolved to.
+// 	pub fn display_namespace(&self, namespace_idx: NamespaceIndex) -> &'a str {
+// 		let symbol =
+// 			self.defs
+// 				.namespace_name(namespace_idx, self.packages, self.from);
+// 		self.interner.resolve(symbol).unwrap()
+// 	}
+
+// 	pub fn display_type(
+// 		&self,
+// 		idx: TypeIndex,
+// 	) -> Result<String, std::fmt::Error> {
+// 		let mut buffer = String::new();
+// 		self.write_type(&mut buffer, idx)?;
+// 		Ok(buffer)
+// 	}
+
+// 	pub fn display_bounds(
+// 		&self,
+// 		bounds: &Bounds,
+// 	) -> Result<String, std::fmt::Error> {
+// 		let mut buffer = String::new();
+// 		self.write_bounds(&mut buffer, bounds)?;
+// 		Ok(buffer)
+// 	}
+
+// 	/// Renders a trait's declared supertraits as they were written after the
+// 	/// colon — `Sub: Super + Other`. Not `display_bounds` on the trait's
+// 	/// `Self` bounds, which would also print the reflexive `Self: Sub` entry
+// 	/// that [`Trait::supertraits`] filters out.
+// 	pub fn display_supertraits(
+// 		&self,
+// 		trait_index: TraitIndex,
+// 	) -> Result<String, std::fmt::Error> {
+// 		let trait_def = &self.items.traits[usize::from(trait_index)];
+// 		let mut buffer = String::new();
+// 		self.write_bound_list(&mut buffer, trait_def.supertraits(trait_index))?;
+// 		Ok(buffer)
+// 	}
+
+// 	fn write_type(
+// 		&self,
+// 		f: &mut impl std::fmt::Write,
+// 		idx: TypeIndex,
+// 	) -> std::fmt::Result {
+// 		match self.types.resolve(idx) {
+// 			Type::Integer => f.write_str("{integer}"),
+// 			Type::Float => f.write_str("{float}"),
+// 			Type::Error => f.write_str("{unknown}"),
+// 			Type::Infer => f.write_str("_"),
+// 			Type::Unit => f.write_str("()"),
+// 			Type::Bool => f.write_str("bool"),
+// 			Type::Char => f.write_str("char"),
+// 			Type::U8 => f.write_str("u8"),
+// 			Type::I8 => f.write_str("i8"),
+// 			Type::U16 => f.write_str("u16"),
+// 			Type::I16 => f.write_str("i16"),
+// 			Type::Never => f.write_str("never"),
+// 			Type::I32 => f.write_str("i32"),
+// 			Type::I64 => f.write_str("i64"),
+// 			Type::F32 => f.write_str("f32"),
+// 			Type::F64 => f.write_str("f64"),
+// 			Type::U32 => f.write_str("u32"),
+// 			Type::U64 => f.write_str("u64"),
+// 			Type::Pointer {
+// 				to,
+// 				memory,
+// 				ownership,
+// 			} => {
+// 				self.write_type(f, *memory)?;
+// 				f.write_str("::")?;
+// 				f.write_char(ownership_sigil(*ownership))?;
+// 				self.write_type(f, *to)?;
+// 				Ok(())
+// 			}
+// 			Type::Slice {
+// 				of,
+// 				memory,
+// 				ownership,
+// 			} => {
+// 				self.write_type(f, *memory)?;
+// 				f.write_str("::")?;
+// 				f.write_char(ownership_sigil(*ownership))?;
+// 				f.write_char('[')?;
+// 				self.write_type(f, *of)?;
+// 				f.write_char(']')?;
+// 				Ok(())
+// 			}
+// 			Type::Array {
+// 				of,
+// 				size,
+// 				memory,
+// 				ownership,
+// 			} => {
+// 				self.write_type(f, *memory)?;
+// 				f.write_str("::")?;
+// 				f.write_char(ownership_sigil(*ownership))?;
+// 				f.write_char('[')?;
+// 				self.write_type(f, *of)?;
+// 				write!(f, "; {}]", size)?;
+// 				Ok(())
+// 			}
+// 			Type::Tuple { elements } => {
+// 				f.write_char('(')?;
+// 				for (i, element) in elements.iter().copied().enumerate() {
+// 					if i > 0 {
+// 						f.write_str(", ")?;
+// 					}
+// 					self.write_type(f, element)?;
+// 				}
+// 				f.write_char(')')?;
+// 				Ok(())
+// 			}
+// 			Type::Struct { struct_index, args } => {
+// 				self.interner
+// 					.resolve(
+// 						self.items.structs[usize::from(*struct_index)]
+// 							.name
+// 							.inner,
+// 					)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|name| f.write_str(name))?;
+// 				if !args.is_empty() {
+// 					f.write_char('<')?;
+// 					for (i, arg) in args.iter().copied().enumerate() {
+// 						if i > 0 {
+// 							f.write_str(", ")?;
+// 						}
+// 						self.write_type(f, arg)?;
+// 					}
+// 					f.write_char('>')?;
+// 				}
+// 				Ok(())
+// 			}
+// 			Type::Enum { enum_index } => self
+// 				.interner
+// 				.resolve(self.items.enums[usize::from(*enum_index)].name.inner)
+// 				.ok_or(std::fmt::Error)
+// 				.and_then(|name| f.write_str(name)),
+// 			Type::Memory { id, .. } => {
+// 				let memory_index = self.items.expect_memory_index(*id);
+// 				self.interner
+// 					.resolve(
+// 						self.items.memories[usize::from(memory_index)]
+// 							.name
+// 							.inner,
+// 					)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|name| f.write_str(name))
+// 			}
+// 			Type::Function { signature } => {
+// 				f.write_str("fn(")?;
+// 				for (i, param) in signature.params().iter().copied().enumerate()
+// 				{
+// 					if i > 0 {
+// 						f.write_str(", ")?;
+// 					}
+// 					self.write_type(f, param)?;
+// 				}
+// 				f.write_str(") -> ")?;
+// 				self.write_type(f, signature.result())?;
+// 				Ok(())
+// 			}
+// 			Type::FunctionItem { id, .. } => {
+// 				f.write_str("fn ")?;
+// 				let func = &self.items.functions
+// 					[usize::from(self.items.expect_function_index(*id))];
+// 				self.interner
+// 					.resolve(func.name.inner)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|name| f.write_str(name))?;
+// 				if !func.type_params.is_empty() {
+// 					f.write_char('<')?;
+// 					for (i, param_info) in func.type_params.iter().enumerate() {
+// 						if i > 0 {
+// 							f.write_str(", ")?;
+// 						}
+// 						self.interner
+// 							.resolve(param_info.name.inner)
+// 							.ok_or(std::fmt::Error)
+// 							.and_then(|name| f.write_str(name))?;
+// 						if !param_info.bounds.traits.is_empty() {
+// 							f.write_str(": ")?;
+// 							self.write_bounds(f, &param_info.bounds)?;
+// 						}
+// 					}
+// 					f.write_char('>')?;
+// 				}
+// 				f.write_char('(')?;
+// 				for (i, param) in func.params.iter().enumerate() {
+// 					if i > 0 {
+// 						f.write_str(", ")?;
+// 					}
+// 					self.write_type(f, param.ty.inner)?;
+// 				}
+// 				f.write_str(") -> ")?;
+// 				match &func.result {
+// 					Some(result) => self.write_type(f, result.inner)?,
+// 					None => f.write_str("()")?,
+// 				};
+// 				Ok(())
+// 			}
+// 			Type::TypeParam { owner, param_index } => {
+// 				let name = match owner {
+// 					TypeParamOwner::Function(def_id) => {
+// 						let func = &self.items.functions[usize::from(
+// 							self.items.expect_function_index(*def_id),
+// 						)];
+// 						let own_idx = (*param_index
+// 							- func.inherited_type_param_count)
+// 							as usize;
+// 						let symbol = func.type_params[own_idx].name.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 					TypeParamOwner::Struct(def_id) => {
+// 						let symbol = self.items.structs[usize::from(
+// 							self.items.expect_struct_index(*def_id),
+// 						)]
+// 						.type_params[*param_index as usize]
+// 							.name
+// 							.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 					TypeParamOwner::Trait(trait_idx) => {
+// 						let symbol = self.items.traits[usize::from(*trait_idx)]
+// 							.self_type_param
+// 							.name
+// 							.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 					TypeParamOwner::InherentImpl(block_idx) => {
+// 						let symbol = self.items.inherent_impls
+// 							[usize::from(*block_idx)]
+// 						.type_params[*param_index as usize]
+// 							.name
+// 							.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 					TypeParamOwner::TypeAlias(def_id) => {
+// 						let symbol = self.items.type_aliases[usize::from(
+// 							self.items.expect_type_alias_index(*def_id),
+// 						)]
+// 						.type_params[*param_index as usize]
+// 							.name
+// 							.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 					TypeParamOwner::TraitImpl(impl_idx) => {
+// 						let symbol = self.items.trait_impls
+// 							[usize::from(*impl_idx)]
+// 						.type_params[*param_index as usize]
+// 							.name
+// 							.inner;
+// 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
+// 					}
+// 				};
+// 				f.write_str(name)
+// 			}
+// 			Type::AssociatedType {
+// 				assoc_name,
+// 				trait_index,
+// 			} => {
+// 				self.interner
+// 					.resolve(
+// 						self.items.traits[usize::from(*trait_index)].name.inner,
+// 					)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|trait_name| f.write_str(trait_name))?;
+// 				f.write_str("::")?;
+// 				self.interner
+// 					.resolve(*assoc_name)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|type_name| f.write_str(type_name))?;
+// 				Ok(())
+// 			}
+// 			Type::AssocTypeProjection {
+// 				trait_index,
+// 				assoc_name,
+// 				base,
+// 			} => {
+// 				let (trait_index, assoc_name, base) =
+// 					(*trait_index, *assoc_name, *base);
+// 				// `trait_index` already disambiguates the *type* — this is
+// 				// purely about whether the unqualified *spelling*
+// 				// `base::assoc_name` would read as ambiguous to someone
+// 				// looking at `base`'s own bounds (i.e. more than one bound
+// 				// trait declares an assoc type with this name), in which
+// 				// case spell out which one via `<base as Trait>::assoc_name`
+// 				// instead, matching rustc's own qualified-path printing.
+// 				if self
+// 					.items
+// 					.assoc_type_bound_is_ambiguous(self.types, base, assoc_name)
+// 				{
+// 					f.write_str("<")?;
+// 					self.write_type(f, base)?;
+// 					f.write_str(" as ")?;
+// 					self.interner
+// 						.resolve(
+// 							self.items.traits[usize::from(trait_index)]
+// 								.name
+// 								.inner,
+// 						)
+// 						.ok_or(std::fmt::Error)
+// 						.and_then(|trait_name| f.write_str(trait_name))?;
+// 					f.write_str(">::")?;
+// 				} else {
+// 					self.write_type(f, base)?;
+// 					f.write_str("::")?;
+// 				}
+// 				self.interner
+// 					.resolve(assoc_name)
+// 					.ok_or(std::fmt::Error)
+// 					.and_then(|type_name| f.write_str(type_name))?;
+// 				Ok(())
+// 			}
+// 		}
+// 	}
+
+// 	fn write_bounds(
+// 		&self,
+// 		f: &mut impl std::fmt::Write,
+// 		bounds: &Bounds,
+// 	) -> std::fmt::Result {
+// 		self.write_bound_list(f, bounds.traits.iter())
+// 	}
+
+// 	/// The shared body of [`Self::write_bounds`] and
+// 	/// [`Self::display_supertraits`], taking the trait bounds as an iterator
+// 	/// so a trait's supertraits can be rendered without first materializing
+// 	/// a [`Bounds`] that filters out its reflexive `Self` entry.
+// 	fn write_bound_list<'b>(
+// 		&self,
+// 		f: &mut impl std::fmt::Write,
+// 		traits: impl Iterator<Item = &'b TraitBound>,
+// 	) -> std::fmt::Result {
+// 		for (bound_i, trait_bound) in traits.enumerate() {
+// 			if bound_i > 0 {
+// 				f.write_str(" + ")?;
+// 			}
+// 			self.interner
+// 				.resolve(
+// 					self.items.traits[usize::from(trait_bound.trait_index)]
+// 						.name
+// 						.inner,
+// 				)
+// 				.ok_or(std::fmt::Error)
+// 				.and_then(|name| f.write_str(name))?;
+// 			if !trait_bound.bindings.is_empty() {
+// 				f.write_str(" where { ")?;
+// 				for (i, binding) in trait_bound.bindings.iter().enumerate() {
+// 					if i > 0 {
+// 						f.write_str(", ")?;
+// 					}
+// 					self.interner
+// 						.resolve(binding.name.inner)
+// 						.ok_or(std::fmt::Error)
+// 						.and_then(|name| f.write_str(name))?;
+// 					match &binding.rhs.inner {
+// 						AssocBindingKind::Equals(ty) => {
+// 							f.write_str(" = ")?;
+// 							self.write_type(f, *ty)?;
+// 						}
+// 						AssocBindingKind::Bound(bound) => {
+// 							f.write_str(": ")?;
+// 							self.write_bounds(f, bound)?;
+// 						}
+// 					}
+// 				}
+// 				f.write_str(" }")?;
+// 			}
+// 		}
+// 		Ok(())
+// 	}
+// }
+
+// /// Index of a named item in its kind-specific Vec, carried by
+// /// [`ItemRegistry::item_lookup`].
+// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// pub enum ItemIndex {
+// 	Function(FunctionIndex),
+// 	/// Index into [`ItemRegistry::use_items`] — one named `use` leaf.
+// 	Use(UseIndex),
+// 	Global(GlobalIndex),
+// 	Memory(MemoryIndex),
+// 	Struct(StructIndex),
+// 	Const(ConstIndex),
+// 	TypeSet(TypesetIndex),
+// 	Trait(TraitIndex),
+// 	TraitImpl(TraitImplIndex),
+// 	Enum(EnumIndex),
+// 	TypeAlias(TypeAliasIndex),
+// 	/// A trait's associated-type declaration, an impl's associated-type
+// 	/// definition, or a memory impl's synthesized one — all in
+// 	/// [`ItemRegistry::associated_types`]. Unlike the other kinds it is a
+// 	/// trait/impl *member*, not a namespace-level name, so it never installs
+// 	/// a `Pending` symbol.
+// 	AssocType(AssocTypeIndex),
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct ItemRegistry {
+// 	pub functions: Vec<Function>,
+// 	pub globals: Vec<Global>,
+// 	pub memories: Vec<Memory>,
+// 	pub enums: Vec<Enum>,
+// 	/// Every named `use` leaf, in prescan order. See [`UseItem`].
+// 	pub use_items: Vec<UseItem>,
+// 	/// Every distinct `use` prefix occurrence. See [`UsePrefix`].
+// 	pub use_prefixes: Vec<UsePrefix>,
+// 	pub structs: Vec<Struct>,
+// 	/// Every inherent impl block — concrete (`impl Target { .. }`, empty
+// 	/// `type_params`) and generic (`impl<T> Target { .. }`) alike. See
+// 	/// `ImplBlock`.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub inherent_impls: Vec<InherentImpl>,
+// 	/// Dispatch index: `(outer type constructor, member name) → every block
+// 	/// index that provides that name for that shape`. Coarse on purpose — a
+// 	/// struct with several separate concrete impls for different type
+// 	/// arguments (e.g. `impl Box<i32> { .. }` and `impl Box<bool> { .. }`)
+// 	/// legitimately share one entry here without conflicting; resolution
+// 	/// checks each candidate against the actual receiver
+// 	/// (`ItemRegistry::unify_inherent_impl_target`) to find out which ones really apply,
+// 	/// and it's *that* per-receiver count — not this bucket's raw length —
+// 	/// that decides whether there's a genuine conflict.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub inherent_impl_dispatch:
+// 		HashMap<(ImplTarget, SymbolU32), Vec<InherentImplIndex>>,
+// 	pub traits: Vec<Trait>,
+// 	pub trait_impls: Vec<TraitImpl>,
+// 	/// Every trait impl (concrete or generic alike — mirrors
+// 	/// `impl_block_list`/`impl_block_dispatch`'s treatment of inherent
+// 	/// impls), coarsely bucketed by outer type constructor only — not by
+// 	/// trait, since a type rarely has more than a handful of trait impls of
+// 	/// any kind, so a cheap linear scan filtering by trait index (done in
+// 	/// `ItemRegistry::find_trait_impl`) is simpler than a second key component.
+// 	/// `ItemRegistry::unify_trait_impl_target` unifies each candidate's `target` against the
+// 	/// actual receiver and checks its declared bounds — for a concrete
+// 	/// (zero-param) impl this degenerates to exact `TypeIndex` equality, so
+// 	/// `impl Show for Foo<i32>` and `impl Show for Foo<bool>` coexist here
+// 	/// without conflating: the bucket is only a coarse first-pass filter,
+// 	/// per-candidate unification is what actually disambiguates.
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub trait_impl_dispatch:
+// 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
+// 	pub constants: Vec<Constant>,
+// 	/// Phase 3 (`ensure_body`) output arena — one entry per resolved function
+// 	/// body or global initializer, referenced by [`BodyIndex`] from
+// 	/// `Function::body` / `Global::value`. Append order is demand-driven and
+// 	/// carries no relation to `functions`/`globals` order.
+// 	pub bodies: Vec<Body>,
+// 	pub associated_types: Vec<AssociatedType>,
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub tagged_items: HashMap<SymbolU32, DefId>,
+// 	pub typesets: Vec<TypeSet>,
+// 	pub type_aliases: Vec<TypeAlias>,
+// 	/// Unified lookup: maps every named item's `DefId` to its kind and dense Vec index.
+// 	/// Replaces the previous per-kind hashmaps (`function_index_lookup`, etc.).
+// 	#[cfg_attr(test, serde(skip))]
+// 	pub item_lookup: HashMap<DefId, ItemIndex>,
+// }
+
+// impl ItemRegistry {
+// 	pub fn new() -> Self {
+// 		Self {
+// 			functions: Vec::new(),
+// 			globals: Vec::new(),
+// 			memories: Vec::new(),
+// 			enums: Vec::new(),
+// 			use_items: Vec::new(),
+// 			use_prefixes: Vec::new(),
+// 			structs: Vec::new(),
+// 			inherent_impls: Vec::new(),
+// 			inherent_impl_dispatch: HashMap::new(),
+// 			traits: Vec::new(),
+// 			trait_impls: Vec::new(),
+// 			trait_impl_dispatch: HashMap::new(),
+// 			constants: Vec::new(),
+// 			bodies: Vec::new(),
+// 			associated_types: Vec::new(),
+// 			tagged_items: HashMap::new(),
+// 			typesets: Vec::new(),
+// 			type_aliases: Vec::new(),
+// 			item_lookup: HashMap::new(),
+// 		}
+// 	}
+
+// 	fn push_function(&mut self, item: Function) -> FunctionIndex {
+// 		let index = FunctionIndex::new(
+// 			u32::try_from(self.functions.len())
+// 				.expect("function registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Function(index));
+// 		self.functions.push(item);
+// 		index
+// 	}
+
+// 	fn push_body(&mut self, body: Body) -> BodyIndex {
+// 		let index = BodyIndex::new(
+// 			u32::try_from(self.bodies.len())
+// 				.expect("body arena exceeded u32 index capacity"),
+// 		);
+// 		self.bodies.push(body);
+// 		index
+// 	}
+
+// 	fn push_global(&mut self, item: Global) -> GlobalIndex {
+// 		let index = GlobalIndex::new(
+// 			u32::try_from(self.globals.len())
+// 				.expect("global registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Global(index));
+// 		self.globals.push(item);
+// 		index
+// 	}
+
+// 	fn push_memory(&mut self, item: Memory) -> MemoryIndex {
+// 		let index = MemoryIndex::new(
+// 			u32::try_from(self.memories.len())
+// 				.expect("memory registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Memory(index));
+// 		self.memories.push(item);
+// 		index
+// 	}
+
+// 	fn push_enum(
+// 		&mut self,
+// 		make_item: impl FnOnce(EnumIndex) -> Enum,
+// 	) -> EnumIndex {
+// 		let index = EnumIndex::new(
+// 			u32::try_from(self.enums.len())
+// 				.expect("enum registry exceeded u32 index capacity"),
+// 		);
+// 		let item = make_item(index);
+// 		self.item_lookup.insert(item.id, ItemIndex::Enum(index));
+// 		self.enums.push(item);
+// 		index
+// 	}
+
+// 	fn push_use_item(&mut self, item: UseItem) -> UseIndex {
+// 		let index = UseIndex::new(
+// 			u32::try_from(self.use_items.len())
+// 				.expect("use-item registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Use(index));
+// 		self.use_items.push(item);
+// 		index
+// 	}
+
+// 	fn push_use_prefix(&mut self, prefix: UsePrefix) -> UsePrefixIndex {
+// 		let index = UsePrefixIndex::new(
+// 			u32::try_from(self.use_prefixes.len())
+// 				.expect("use-prefix registry exceeded u32 index capacity"),
+// 		);
+// 		self.use_prefixes.push(prefix);
+// 		index
+// 	}
+
+// 	fn push_struct(
+// 		&mut self,
+// 		make_item: impl FnOnce(StructIndex) -> Struct,
+// 	) -> StructIndex {
+// 		let index = StructIndex::new(
+// 			u32::try_from(self.structs.len())
+// 				.expect("struct registry exceeded u32 index capacity"),
+// 		);
+// 		let item = make_item(index);
+// 		self.item_lookup.insert(item.id, ItemIndex::Struct(index));
+// 		self.structs.push(item);
+// 		index
+// 	}
+
+// 	fn push_inherent_impl(&mut self, item: InherentImpl) -> InherentImplIndex {
+// 		let index = InherentImplIndex::new(
+// 			u32::try_from(self.inherent_impls.len())
+// 				.expect("inherent-impl registry exceeded u32 index capacity"),
+// 		);
+// 		self.inherent_impls.push(item);
+// 		index
+// 	}
+
+// 	fn push_trait(&mut self, item: Trait) -> TraitIndex {
+// 		let index = TraitIndex::new(
+// 			u32::try_from(self.traits.len())
+// 				.expect("trait registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Trait(index));
+// 		self.traits.push(item);
+// 		index
+// 	}
+
+// 	fn push_trait_impl(&mut self, item: TraitImpl) -> TraitImplIndex {
+// 		let index = TraitImplIndex::new(
+// 			u32::try_from(self.trait_impls.len())
+// 				.expect("trait-impl registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup
+// 			.insert(item.id, ItemIndex::TraitImpl(index));
+// 		self.trait_impls.push(item);
+// 		index
+// 	}
+
+// 	fn push_constant(&mut self, item: Constant) -> ConstIndex {
+// 		let index = ConstIndex::new(
+// 			u32::try_from(self.constants.len())
+// 				.expect("constant registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::Const(index));
+// 		self.constants.push(item);
+// 		index
+// 	}
+
+// 	pub fn trait_associated_type(
+// 		&self,
+// 		trait_index: TraitIndex,
+// 		name: SymbolU32,
+// 	) -> Option<&AssociatedType> {
+// 		let index =
+// 			self.traits[usize::from(trait_index)].associated_type(name)?;
+// 		Some(&self.associated_types[usize::from(index)])
+// 	}
+
+// 	fn trait_associated_type_mut(
+// 		&mut self,
+// 		trait_index: TraitIndex,
+// 		name: SymbolU32,
+// 	) -> Option<&mut AssociatedType> {
+// 		let index =
+// 			self.traits[usize::from(trait_index)].associated_type(name)?;
+// 		Some(&mut self.associated_types[usize::from(index)])
+// 	}
+
+// 	fn push_associated_type(&mut self, item: AssociatedType) -> AssocTypeIndex {
+// 		let index = AssocTypeIndex::new(
+// 			u32::try_from(self.associated_types.len())
+// 				.expect("associated-type registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup
+// 			.insert(item.id, ItemIndex::AssocType(index));
+// 		self.associated_types.push(item);
+// 		index
+// 	}
+
+// 	fn push_typeset(&mut self, item: TypeSet) -> TypesetIndex {
+// 		let index = TypesetIndex::new(
+// 			u32::try_from(self.typesets.len())
+// 				.expect("typeset registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup.insert(item.id, ItemIndex::TypeSet(index));
+// 		self.typesets.push(item);
+// 		index
+// 	}
+
+// 	fn push_type_alias(&mut self, item: TypeAlias) -> TypeAliasIndex {
+// 		let index = TypeAliasIndex::new(
+// 			u32::try_from(self.type_aliases.len())
+// 				.expect("type-alias registry exceeded u32 index capacity"),
+// 		);
+// 		self.item_lookup
+// 			.insert(item.id, ItemIndex::TypeAlias(index));
+// 		self.type_aliases.push(item);
+// 		index
+// 	}
+// }
+
+// impl Default for ItemRegistry {
+// 	fn default() -> Self {
+// 		Self::new()
+// 	}
+// }
+
+// #[cfg_attr(test, derive(serde::Serialize))]
+// pub struct TIR {
+// 	pub types: TypeInterner,
+// 	pub diagnostics: Vec<Diagnostic<FileId>>,
+// 	pub items: ItemRegistry,
+// 	pub defs: DefinitionRegistry,
+// 	pub export_block: Option<ExportBlock>,
+// }
+
+// impl DefinitionRegistry {
+// 	#[inline]
+// 	pub fn namespaces_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (NamespaceIndex, &Namespace)> {
+// 		self.namespaces
+// 			.iter()
+// 			.enumerate()
+// 			.map(|(index, namespace)| {
+// 				(NamespaceIndex::new(index as u32), namespace)
+// 			})
+// 	}
+
+// 	/// The name `namespace` goes by, as seen from package `from`.
+// 	pub fn namespace_name<'a>(
+// 		&self,
+// 		namespace: NamespaceIndex,
+// 		packages: &[Package],
+// 		from_package: PackageId,
+// 	) -> SymbolU32 {
+// 		match self.namespaces[usize::from(namespace)].kind {
+// 			NamespaceKind::Module(decl_idx) => {
+// 				self.module_decls[usize::from(decl_idx)].name.inner
+// 			}
+// 			NamespaceKind::Import(decl_idx) => {
+// 				self.import_decls[usize::from(decl_idx)].internal_name.inner
+// 			}
+// 			NamespaceKind::Package(_) => {
+// 				let target = self.namespaces[usize::from(namespace)].package_id;
+// 				if target == from_package {
+// 					ast::Keyword::Crate.symbol()
+// 				} else {
+// 					packages[from_package.as_usize()].dependency_names[&target]
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
+// 		matches!(
+// 			self.namespaces[usize::from(namespace)].kind,
+// 			NamespaceKind::Import(_)
+// 		)
+// 	}
+// }
+
+// impl ItemRegistry {
+// 	#[inline]
+// 	pub fn inherent_impls_with_indices(
+// 		&self,
+// 	) -> impl ExactSizeIterator<Item = (InherentImplIndex, &InherentImpl)> {
+// 		self.inherent_impls
+// 			.iter()
+// 			.enumerate()
+// 			.map(|(index, inherent_impl)| {
+// 				(InherentImplIndex::new(index as u32), inherent_impl)
+// 			})
+// 	}
+
+// 	#[inline]
+// 	pub fn function_index(&self, id: ast::DefId) -> Option<FunctionIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Function(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	/// Name and defining span of a named item. `None` for a `DefId` that is
+// 	/// not a registered item, and for a trait impl — the one kind with no
+// 	/// name of its own, `impl Trait for Type` being known by the two names it
+// 	/// joins rather than by one of its own.
+// 	///
+// 	/// Exhaustive over [`ItemIndex`] deliberately: a new item kind must fail
+// 	/// to compile here rather than silently go unnamed at every call site.
+// 	pub fn item_name(&self, id: DefId) -> Option<(SymbolU32, SourceSpan)> {
+// 		let (name, file_id) = match *self.item_lookup.get(&id)? {
+// 			ItemIndex::Function(i) => {
+// 				let item = &self.functions[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Use(i) => {
+// 				let item = &self.use_items[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Global(i) => {
+// 				let item = &self.globals[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Memory(i) => {
+// 				let item = &self.memories[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Struct(i) => {
+// 				let item = &self.structs[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Const(i) => {
+// 				let item = &self.constants[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::TypeSet(i) => {
+// 				let item = &self.typesets[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Trait(i) => {
+// 				let item = &self.traits[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::Enum(i) => {
+// 				let item = &self.enums[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::TypeAlias(i) => {
+// 				let item = &self.type_aliases[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::AssocType(i) => {
+// 				let item = &self.associated_types[usize::from(i)];
+// 				(item.name, item.file_id)
+// 			}
+// 			ItemIndex::TraitImpl(_) => return None,
+// 		};
+// 		Some((name.inner, SourceSpan::new(file_id, name.span)))
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_function_index(&self, id: DefId) -> FunctionIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Function(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected Function for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn struct_index(&self, id: DefId) -> Option<StructIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Struct(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_struct_index(&self, id: DefId) -> StructIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Struct(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected Struct for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn type_alias_index(&self, id: DefId) -> Option<TypeAliasIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::TypeAlias(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_type_alias_index(&self, id: DefId) -> TypeAliasIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::TypeAlias(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected TypeAlias for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn const_index(&self, id: DefId) -> Option<ConstIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Const(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_const_index(&self, id: DefId) -> ConstIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Const(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => unreachable!("expected Const for {id:?}, found {other:?}"),
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn global_index(&self, id: DefId) -> Option<GlobalIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Global(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_global_index(&self, id: DefId) -> GlobalIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Global(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected Global for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn memory_index(&self, id: DefId) -> Option<MemoryIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Memory(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_memory_index(&self, id: DefId) -> MemoryIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Memory(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected Memory for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn typeset_index(&self, id: DefId) -> Option<TypesetIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::TypeSet(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_typeset_index(&self, id: DefId) -> TypesetIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::TypeSet(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected TypeSet for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn trait_index(&self, id: DefId) -> Option<TraitIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Trait(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_trait_index(&self, id: DefId) -> TraitIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Trait(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => unreachable!("expected Trait for {id:?}, found {other:?}"),
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn trait_impl_index(&self, id: DefId) -> Option<TraitImplIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::TraitImpl(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_trait_impl_index(&self, id: DefId) -> TraitImplIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::TraitImpl(i) => i,
+// 			#[cfg(debug_assertions)]
+// 			other => {
+// 				unreachable!("expected TraitImpl for {id:?}, found {other:?}")
+// 			}
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn enum_index(&self, id: DefId) -> Option<EnumIndex> {
+// 		match self.item_lookup.get(&id)? {
+// 			ItemIndex::Enum(i) => Some(*i),
+// 			_ => None,
+// 		}
+// 	}
+
+// 	/// The source location where `ty` was declared, if it names a struct or
+// 	/// enum directly (`None` for primitives, pointers, type params, etc. —
+// 	/// nothing to point at).
+// 	pub fn type_declaration_span(
+// 		&self,
+// 		types: &TypeInterner,
+// 		ty: TypeIndex,
+// 	) -> Option<SourceSpan> {
+// 		match types.resolve(ty) {
+// 			Type::Struct { struct_index, .. } => {
+// 				let s = self.structs.get(usize::from(*struct_index))?;
+// 				Some(SourceSpan::new(s.file_id, s.name.span))
+// 			}
+// 			Type::Enum { enum_index } => {
+// 				let e = self.enums.get(usize::from(*enum_index))?;
+// 				Some(SourceSpan::new(e.file_id, e.name.span))
+// 			}
+// 			_ => None,
+// 		}
+// 	}
+
+// 	#[inline]
+// 	pub fn expect_enum_index(&self, id: DefId) -> EnumIndex {
+// 		match self.item_lookup[&id] {
+// 			ItemIndex::Enum(index) => index,
+// 			#[cfg(debug_assertions)]
+// 			other => unreachable!("expected Enum for {id:?}, found {other:?}"),
+// 			#[cfg(not(debug_assertions))]
+// 			_ => unreachable!(),
+// 		}
+// 	}
+
+// 	/// Which owner actually *stores* the type parameter at `abs_index` in
+// 	/// `owner`'s visible chain, and its index in that owner's own slice.
+// 	///
+// 	/// A function's inherited parameters are stored on its parent impl or
+// 	/// trait, not on the function, yet they share the function's absolute
+// 	/// numbering — the one [`ItemRegistry::function_type_params_iter`] yields
+// 	/// and [`Type::TypeParam`]'s `param_index` carries. An absolute index
+// 	/// below `inherited_type_param_count` therefore addresses the parent's own
+// 	/// slice at that same index. A parent never inherits in turn, so one hop
+// 	/// is always enough.
+// 	///
+// 	/// Every other owner stores what it declares, so this is the identity.
+// 	fn owning_type_param(
+// 		&self,
+// 		owner: TypeParamOwner,
+// 		abs_index: usize,
+// 	) -> (TypeParamOwner, usize) {
+// 		let TypeParamOwner::Function(id) = owner else {
+// 			return (owner, abs_index);
+// 		};
+// 		let func = &self.functions[usize::from(self.expect_function_index(id))];
+// 		if abs_index >= func.inherited_type_param_count as usize {
+// 			return (owner, abs_index);
+// 		}
+// 		match func.type_param_parent() {
+// 			Some(parent) => (parent, abs_index),
+// 			// `inherited_type_param_count > 0` without a parent is a bug in
+// 			// whoever built the function; leave the index alone and let the
+// 			// caller's own bounds check panic on it rather than silently
+// 			// resolving to the wrong parameter.
+// 			None => (owner, abs_index),
+// 		}
+// 	}
+
+// 	/// Returns the `TypeParamInfo` for the type parameter at `abs_index`
+// 	/// (absolute, 0-based across the full owner chain) under `owner`.
+// 	///
+// 	/// For `Function` owners, params inherited from a parent impl or trait
+// 	/// occupy indices `0..inherited_count` and are resolved on that parent by
+// 	/// [`ItemRegistry::owning_type_param`]; the function's own params start at
+// 	/// `inherited_count`. For all other owners, `abs_index` indexes directly
+// 	/// into the owner's `type_params` slice.
+// 	pub fn type_param_info(
+// 		&self,
+// 		owner: TypeParamOwner,
+// 		abs_index: usize,
+// 	) -> &TypeParamDef {
+// 		let (owner, abs_index) = self.owning_type_param(owner, abs_index);
+// 		match owner {
+// 			TypeParamOwner::InherentImpl(block_idx) => {
+// 				&self.inherent_impls[usize::from(block_idx)].type_params
+// 					[abs_index]
+// 			}
+// 			TypeParamOwner::Function(id) => {
+// 				let func_idx = usize::from(self.expect_function_index(id));
+// 				let inherited = self.functions[func_idx]
+// 					.inherited_type_param_count as usize;
+// 				&self.functions[func_idx].type_params[abs_index - inherited]
+// 			}
+// 			TypeParamOwner::Struct(id) => {
+// 				let struct_idx = usize::from(self.expect_struct_index(id));
+// 				&self.structs[struct_idx].type_params[abs_index]
+// 			}
+// 			TypeParamOwner::Trait(trait_idx) => {
+// 				debug_assert_eq!(
+// 					abs_index, 0,
+// 					"only Self (index 0) is owned by a Trait"
+// 				);
+// 				&self.traits[usize::from(trait_idx)].self_type_param
+// 			}
+// 			TypeParamOwner::TypeAlias(id) => {
+// 				let alias_idx = usize::from(self.expect_type_alias_index(id));
+// 				&self.type_aliases[alias_idx].type_params[abs_index]
+// 			}
+// 			TypeParamOwner::TraitImpl(impl_idx) => {
+// 				&self.trait_impls[usize::from(impl_idx)].type_params[abs_index]
+// 			}
+// 		}
+// 	}
+
+// 	/// Mutable counterpart of [`ItemRegistry::type_param_info`], with the same
+// 	/// absolute-index contract.
+// 	pub fn type_param_info_mut(
+// 		&mut self,
+// 		owner: TypeParamOwner,
+// 		abs_index: usize,
+// 	) -> &mut TypeParamDef {
+// 		let (owner, abs_index) = self.owning_type_param(owner, abs_index);
+// 		match owner {
+// 			TypeParamOwner::InherentImpl(block_idx) => {
+// 				&mut self.inherent_impls[usize::from(block_idx)].type_params
+// 					[abs_index]
+// 			}
+// 			TypeParamOwner::Function(id) => {
+// 				let func_idx = usize::from(self.expect_function_index(id));
+// 				let inherited = self.functions[func_idx]
+// 					.inherited_type_param_count as usize;
+// 				&mut self.functions[func_idx].type_params[abs_index - inherited]
+// 			}
+// 			TypeParamOwner::Struct(id) => {
+// 				let struct_idx = usize::from(self.expect_struct_index(id));
+// 				&mut self.structs[struct_idx].type_params[abs_index]
+// 			}
+// 			TypeParamOwner::Trait(trait_idx) => {
+// 				debug_assert_eq!(
+// 					abs_index, 0,
+// 					"only Self (index 0) is owned by a Trait"
+// 				);
+// 				&mut self.traits[usize::from(trait_idx)].self_type_param
+// 			}
+// 			TypeParamOwner::TypeAlias(id) => {
+// 				let alias_idx = usize::from(self.expect_type_alias_index(id));
+// 				&mut self.type_aliases[alias_idx].type_params[abs_index]
+// 			}
+// 			TypeParamOwner::TraitImpl(impl_idx) => {
+// 				&mut self.trait_impls[usize::from(impl_idx)].type_params
+// 					[abs_index]
+// 			}
+// 		}
+// 	}
+
+// 	/// Iterates all type parameters visible to `func_index` in absolute-index
+// 	/// order: inherited params from the parent first, then the function's own
+// 	/// params. For trait methods the parent is the trait's implicit `Self`;
+// 	/// for generic impl methods the parent is the impl block's type params.
+// 	pub fn function_type_params_iter(
+// 		&self,
+// 		func_index: FunctionIndex,
+// 	) -> impl Iterator<Item = &TypeParamDef> {
+// 		let func = &self.functions[usize::from(func_index)];
+// 		let parent_params: &[TypeParamDef] = match func.type_param_parent() {
+// 			Some(TypeParamOwner::InherentImpl(block_idx)) => {
+// 				&self.inherent_impls[usize::from(block_idx)].type_params
+// 			}
+// 			Some(TypeParamOwner::Trait(trait_idx)) => std::slice::from_ref(
+// 				&self.traits[usize::from(trait_idx)].self_type_param,
+// 			),
+// 			Some(TypeParamOwner::TraitImpl(impl_idx)) => {
+// 				&self.trait_impls[usize::from(impl_idx)].type_params
+// 			}
+// 			_ => &[],
+// 		};
+// 		parent_params.iter().chain(func.type_params.iter())
+// 	}
+// }
+
+// impl TypeInterner {
+// 	/// Structural unification: for every `TypeParam` slot reachable inside
+// 	/// `pattern_ty`, bind the corresponding position in `actual_ty` into
+// 	/// `type_args` (first binding wins — a later occurrence of an
+// 	/// already-bound slot, or an explicit pre-seeded turbofish value, is
+// 	/// checked for consistency rather than overwritten). Shared by
+// 	/// inherent-impl matching and trait-impl matching. It lives with the
+// 	/// interned type graph because it only walks type structure.
+// 	///
+// 	/// `Err(())` when `pattern_ty` can't possibly describe `actual_ty` — a
+// 	/// `TypeParam` bound to two different values, or a fixed (non-generic)
+// 	/// position in `pattern_ty` that doesn't equal the corresponding
+// 	/// `actual_ty` position. Traversal never stops early on an `Err(())`,
+// 	/// even though the overall result is already decided: binding keeps
+// 	/// happening for every other, independent position exactly as it
+// 	/// always has, so a caller that ignores the return value (most of them
+// 	/// — the diagnostic-reporting ones report their own mismatch from the
+// 	/// substituted result afterward, not from this) sees no behavior
+// 	/// change at all. Only `unify_impl_target` currently reads it, to
+// 	/// reject a candidate this function would otherwise silently
+// 	/// over-accept (see its doc). Not a real error in the diagnostic
+// 	/// sense — nothing here is user-facing, `Result` is just a
+// 	/// `#[must_use]` `bool` so every other call site has to spell out
+// 	/// `let _ =` and make ignoring it a visible choice.
+// 	fn infer_type_args(
+// 		&self,
+// 		type_args: &mut [TypeIndex],
+// 		pattern_ty: TypeIndex,
+// 		actual_ty: TypeIndex,
+// 	) -> Result<(), ()> {
+// 		// Unresolved comptime literals have no concrete type yet; inferring T = INTEGER would give the wrong answer once the literal is coerced.
+// 		// Skip ERROR and INFER actuals too — they must not fill a still-unresolved slot.
+// 		if actual_ty == TypeIndex::INTEGER
+// 			|| actual_ty == TypeIndex::FLOAT
+// 			|| actual_ty == TypeIndex::ERROR
+// 			|| actual_ty == TypeIndex::INFER
+// 		{
+// 			return Ok(());
+// 		}
+
+// 		match (self.resolve(pattern_ty), self.resolve(actual_ty)) {
+// 			(Type::TypeParam { param_index, .. }, _) => {
+// 				match type_args.get_mut(*param_index as usize) {
+// 					Some(slot) if *slot == TypeIndex::INFER => {
+// 						*slot = actual_ty;
+// 						Ok(())
+// 					}
+// 					// Already bound (turbofish or an earlier occurrence) —
+// 					// consistent only if it's the same value.
+// 					Some(slot) if *slot == actual_ty => Ok(()),
+// 					Some(_) => Err(()),
+// 					None => Ok(()),
+// 				}
+// 			}
+// 			(
+// 				Type::AssocTypeProjection {
+// 					assoc_name,
+// 					trait_index,
+// 					base,
+// 					..
+// 				},
+// 				Type::AssocTypeProjection {
+// 					assoc_name: actual_assoc,
+// 					trait_index: actual_trait,
+// 					base: actual_base,
+// 					..
+// 				},
+// 			) if assoc_name == actual_assoc && trait_index == actual_trait => {
+// 				self.infer_type_args(type_args, *base, *actual_base)
+// 			}
+// 			(
+// 				Type::Tuple { elements: pattern },
+// 				Type::Tuple { elements: actual },
+// 			) if pattern.len() == actual.len() => pattern
+// 				.iter()
+// 				.copied()
+// 				.zip(actual.iter().copied())
+// 				.try_fold((), |_, (pattern, actual)| {
+// 					self.infer_type_args(type_args, pattern, actual)
+// 				}),
+// 			(
+// 				Type::Function {
+// 					signature: pattern_sig,
+// 				},
+// 				Type::Function {
+// 					signature: actual_sig,
+// 				},
+// 			) if pattern_sig.params_count == actual_sig.params_count
+// 				&& pattern_sig.items.len() == actual_sig.items.len() =>
+// 			{
+// 				pattern_sig
+// 					.items
+// 					.iter()
+// 					.copied()
+// 					.zip(actual_sig.items.iter().copied())
+// 					.try_fold((), |_, (pattern, actual)| {
+// 						self.infer_type_args(type_args, pattern, actual)
+// 					})
+// 			}
+// 			(
+// 				Type::Pointer {
+// 					to: pattern_to,
+// 					memory: pattern_memory,
+// 					..
+// 				},
+// 				Type::Pointer {
+// 					to: actual_to,
+// 					memory: actual_memory,
+// 					..
+// 				},
+// 			) => {
+// 				let to_result =
+// 					self.infer_type_args(type_args, *pattern_to, *actual_to);
+// 				let memory_result = self.infer_type_args(
+// 					type_args,
+// 					*pattern_memory,
+// 					*actual_memory,
+// 				);
+// 				to_result.and(memory_result)
+// 			}
+// 			(
+// 				Type::Array {
+// 					of: pattern_of,
+// 					size: pattern_size,
+// 					memory: pattern_memory,
+// 					..
+// 				},
+// 				Type::Array {
+// 					of: actual_of,
+// 					size: actual_size,
+// 					memory: actual_memory,
+// 					..
+// 				},
+// 			) if pattern_size == actual_size => {
+// 				let of_result =
+// 					self.infer_type_args(type_args, *pattern_of, *actual_of);
+// 				let memory_result = self.infer_type_args(
+// 					type_args,
+// 					*pattern_memory,
+// 					*actual_memory,
+// 				);
+// 				of_result.and(memory_result)
+// 			}
+// 			(
+// 				Type::Slice {
+// 					of: pattern_of,
+// 					memory: pattern_memory,
+// 					..
+// 				},
+// 				Type::Slice {
+// 					of: actual_of,
+// 					memory: actual_memory,
+// 					..
+// 				},
+// 			) => {
+// 				let of_result =
+// 					self.infer_type_args(type_args, *pattern_of, *actual_of);
+// 				let memory_result = self.infer_type_args(
+// 					type_args,
+// 					*pattern_memory,
+// 					*actual_memory,
+// 				);
+// 				of_result.and(memory_result)
+// 			}
+// 			(
+// 				Type::Struct {
+// 					struct_index: pattern_struct,
+// 					args: pattern_args,
+// 				},
+// 				Type::Struct {
+// 					struct_index: actual_struct,
+// 					args: actual_args,
+// 				},
+// 			) if pattern_struct == actual_struct
+// 				&& pattern_args.len() == actual_args.len() =>
+// 			{
+// 				pattern_args
+// 					.iter()
+// 					.copied()
+// 					.zip(actual_args.iter().copied())
+// 					.try_fold((), |_, (pattern, actual)| {
+// 						self.infer_type_args(type_args, pattern, actual)
+// 					})
+// 			}
+// 			_ if pattern_ty == actual_ty => Ok(()),
+// 			_ => Err(()),
+// 		}
+// 	}
+// }
+
+// impl ItemRegistry {
+// 	/// Borrow the written bounds contributing to an abstract type. Declaration
+// 	/// bounds must already be resolved. Projection bases are finite type paths;
+// 	/// this does not recursively expand traits or associated declarations.
+// 	fn effective_bounds(
+// 		&self,
+// 		types: &TypeInterner,
+// 		ty: TypeIndex,
+// 	) -> Option<BoundSources<'_>> {
+// 		match types.resolve(ty) {
+// 			Type::TypeParam { owner, param_index } => Some(BoundSources {
+// 				sources: vec![
+// 					&self.type_param_info(*owner, *param_index as usize).bounds,
+// 				],
+// 			}),
+// 			Type::AssocTypeProjection {
+// 				trait_index,
+// 				assoc_name,
+// 				base,
+// 			} => {
+// 				let mut sources = Vec::new();
+// 				if let Some(declaration) =
+// 					self.trait_associated_type(*trait_index, *assoc_name)
+// 				{
+// 					sources.push(&declaration.bounds);
+// 				}
+// 				if let Some(base_bounds) = self.effective_bounds(types, *base) {
+// 					for bound in base_bounds
+// 						.traits()
+// 						.filter(|b| b.trait_index == *trait_index)
+// 					{
+// 						for binding in &bound.bindings {
+// 							if binding.name.inner == *assoc_name {
+// 								if let AssocBindingKind::Bound(written) =
+// 									&binding.rhs.inner
+// 								{
+// 									sources.push(written);
+// 								}
+// 							}
+// 						}
+// 					}
+// 				}
+// 				Some(BoundSources { sources })
+// 			}
+// 			_ => None,
+// 		}
+// 	}
+
+// 	/// The value an *abstract* `ty` declares for `trait_index::assoc_name` in
+// 	/// its own bounds — `fn g<U: Has where { Item = bool }>` says `U::Item` is
+// 	/// `bool` for the whole of `g`, with no impl involved.
+// 	///
+// 	/// This is the counterpart to reading the value off a concrete impl. A
+// 	/// type parameter has no impl to read, but its declared bounds are the
+// 	/// whole truth about it, so they answer the same question. Membership
+// 	/// checks (`type_implements_trait`) already consult this side; without
+// 	/// this, a binding on an abstract subject was simply never compared.
+// 	///
+// 	/// Only an `= Type` binding gives a value; a `: Bound` refinement
+// 	/// constrains without naming one.
+// 	fn declared_assoc_value(
+// 		&self,
+// 		types: &TypeInterner,
+// 		ty: TypeIndex,
+// 		trait_index: TraitIndex,
+// 		assoc_name: SymbolU32,
+// 	) -> Option<TypeIndex> {
+// 		self.effective_bounds(types, ty)?
+// 			.traits()
+// 			.filter(|bound| bound.trait_index == trait_index)
+// 			.flat_map(|bound| bound.bindings.iter())
+// 			.find(|binding| binding.name.inner == assoc_name)
+// 			.and_then(|binding| match &binding.rhs.inner {
+// 				AssocBindingKind::Equals(value) => Some(*value),
+// 				AssocBindingKind::Bound(_) => None,
+// 			})
+// 	}
+
+// 	/// Whether an unqualified projection would name multiple declarations.
+// 	/// Formatting follows the same reachable-trait set as member lookup,
+// 	/// counting a shared ancestor once and stopping at the second match.
+// 	fn assoc_type_bound_is_ambiguous(
+// 		&self,
+// 		types: &TypeInterner,
+// 		base: TypeIndex,
+// 		name: SymbolU32,
+// 	) -> bool {
+// 		let Some(bounds) = self.effective_bounds(types, base) else {
+// 			return false;
+// 		};
+// 		self.reachable_traits(bounds.traits().map(|b| b.trait_index))
+// 			.filter(|&trait_index| {
+// 				self.traits[usize::from(trait_index)]
+// 					.bindings
+// 					.get(&name)
+// 					.is_some_and(|member| {
+// 						matches!(member, TraitMemberKind::AssociatedType(_))
+// 					})
+// 			})
+// 			.nth(1)
+// 			.is_some()
+// 	}
+
+// 	/// Does `ty` implement trait `trait_index`? Shared single-bound
+// 	/// predicate behind both `type_args_satisfy_bounds` (impl-target
+// 	/// unification, short-circuits to a single bool) and call-site bound
+// 	/// checking (which needs to loop over every trait in `T: Foo + Bar` and
+// 	/// report each failure separately, so it can't use an
+// 	/// all-bounds-at-once helper). An abstract `ty` (a `TypeParam`/
+// 	/// `AssocTypeProjection` propagated in from an outer generic scope, not
+// 	/// concrete yet) is checked against its own declared bounds via
+// 	/// `effective_bounds`, not `find_trait_impl` — that only knows
+// 	/// about concrete impls, and a declared bound satisfies the requirement
+// 	/// through its supertraits as well as itself (see
+// 	/// [`ItemRegistry::trait_implies`]). The concrete side needs no such walk:
+// 	/// every impl is already required to implement its trait's supertraits
+// 	/// directly (`check_trait_conformance`), and that obligation chains.
+// 	fn type_implements_trait(
+// 		&self,
+// 		types: &TypeInterner,
+// 		ty: TypeIndex,
+// 		trait_index: TraitIndex,
+// 	) -> bool {
+// 		match self.effective_bounds(types, ty) {
+// 			Some(declared) => declared
+// 				.traits()
+// 				.any(|b| self.trait_implies(b.trait_index, trait_index)),
+// 			None => self.find_trait_impl(types, ty, trait_index).is_some(),
+// 		}
+// 	}
+
+// 	/// Enumerates each reachable trait once, in declared depth-first order.
+// 	/// The builder must resolve the roots' supertrait clauses before calling.
+// 	/// Cycles remain guarded because diagnostics do not remove invalid edges.
+// 	fn reachable_traits(
+// 		&self,
+// 		roots: impl IntoIterator<Item = TraitIndex>,
+// 	) -> impl Iterator<Item = TraitIndex> + '_ {
+// 		let mut stack: Vec<_> = roots.into_iter().collect();
+// 		stack.reverse();
+// 		let mut visited = Vec::new();
+// 		std::iter::from_fn(move || {
+// 			while let Some(current) = stack.pop() {
+// 				if visited.contains(&current) {
+// 					continue;
+// 				}
+// 				visited.push(current);
+// 				stack.extend(
+// 					self.traits[usize::from(current)]
+// 						.self_type_param
+// 						.bounds
+// 						.traits
+// 						.iter()
+// 						.rev()
+// 						.map(|b| b.trait_index)
+// 						.filter(|&index| index != current),
+// 				);
+// 				return Some(current);
+// 			}
+// 			None
+// 		})
+// 	}
+
+// 	/// A bound implies itself and every transitively reachable supertrait.
+// 	fn trait_implies(&self, bound: TraitIndex, required: TraitIndex) -> bool {
+// 		self.reachable_traits([bound])
+// 			.any(|index| index == required)
+// 	}
+
+// 	/// The first member of `typeset` that `member_fits` rejects — its
+// 	/// `TypeIndex` and the span of its type expression in the `typeset` body.
+// 	fn first_unfit_member(
+// 		&self,
+// 		typeset: TypesetIndex,
+// 		member_fits: impl Fn(TypeIndex) -> bool,
+// 	) -> Option<ast::Spanned<TypeIndex>> {
+// 		self.typesets[usize::from(typeset)]
+// 			.members
+// 			.iter()
+// 			.find(|member| !member_fits(member.inner))
+// 			.copied()
+// 	}
+
+// 	/// Shared core of `unify_inherent_impl_target`/`unify_trait_impl_target`:
+// 	/// does a target with `type_params_len` free slots apply to
+// 	/// `receiver_ty`, and if so what's the substitution? `None` if it
+// 	/// doesn't apply at all.
+// 	///
+// 	/// The no-type-params case is handled separately rather than via
+// 	/// `infer_type_args`: with an empty `type_args` slice it has nothing to
+// 	/// bind, so it would silently accept any receiver of the same outer
+// 	/// shape instead of rejecting a mismatch.
+// 	///
+// 	/// Doesn't judge whether a leftover `TypeIndex::INFER` slot is
+// 	/// acceptable — that differs between the two callers, so it's their
+// 	/// call, made after this returns.
+// 	///
+// 	/// Does reject an inconsistent substitution itself, though (`None`
+// 	/// when `infer_type_args` returns `Err(())`) — e.g. `impl<T> Pair<T,
+// 	/// T>` against a receiver `Pair<i32, bool>`: `infer_type_args`'s
+// 	/// first-binding-wins would otherwise bind `T = i32` from the first
+// 	/// field and silently drop the conflicting `bool` from the second,
+// 	/// reporting this block as a match when no consistent `T` makes it one.
+// 	fn unify_impl_target(
+// 		&self,
+// 		types: &TypeInterner,
+// 		type_params_len: usize,
+// 		target: TypeIndex,
+// 		receiver_ty: TypeIndex,
+// 	) -> Option<Box<[TypeIndex]>> {
+// 		if type_params_len == 0 {
+// 			// `ImplTarget` is coarser than the full concrete type, so
+// 			// multiple non-generic impls can share a bucket (e.g. `impl
+// 			// Box<i32>` and `impl Box<bool>`) — this is what tells them
+// 			// apart for a given receiver.
+// 			return (target == receiver_ty).then(|| Box::new([]) as _);
+// 		}
+// 		let mut type_args: Vec<TypeIndex> =
+// 			vec![TypeIndex::INFER; type_params_len];
+// 		types
+// 			.infer_type_args(&mut type_args, target, receiver_ty)
+// 			.ok()
+// 			.map(|()| type_args.into_boxed_slice())
+// 	}
+
+// 	/// Does every `type_params[i].bounds` accept its matching `type_args[i]`?
+// 	/// Trait membership, typeset membership, and each trait bound's
+// 	/// `where { Assoc = T }` / `where { Assoc: Bound }` refinements. A
+// 	/// still-`TypeIndex::INFER` slot is skipped — it has no value at all yet,
+// 	/// so validating it is deferred to whoever eventually resolves it.
+// 	///
+// 	/// An abstract slot (`arg_ty` is itself a `TypeParam`/
+// 	/// `AssocTypeProjection` — e.g. `M` unified against `Self::M` inside a
+// 	/// trait default body) is checked against *its own* declared bounds via
+// 	/// `effective_bounds`, not looked up in `find_trait_impl`/
+// 	/// `concrete_type_in_typeset` — those only know about concrete impls,
+// 	/// and an abstract type isn't concrete yet. This only recognizes an
+// 	/// exact, directly-declared bound (no supertrait transitivity: `M: Sub`
+// 	/// does not currently satisfy a required `Super` even if `Sub: Super`).
+// 	///
+// 	/// This runs during dispatch (`&self`, no interner to mutate), so an
+// 	/// associated binding whose value would need a materialised substitution
+// 	/// — a generic impl with a composite associated value — is left
+// 	/// unchecked here rather than mint a type (see
+// 	/// [`ItemRegistry::assoc_bindings_hold`]). `Builder::check_bounds` covers
+// 	/// those at the sites that report diagnostics.
+// 	fn type_args_satisfy_bounds(
+// 		&self,
+// 		types: &TypeInterner,
+// 		type_params: &[TypeParamDef],
+// 		type_args: &[TypeIndex],
+// 	) -> bool {
+// 		type_params
+// 			.iter()
+// 			.zip(type_args.iter().copied())
+// 			.all(|(param, arg)| {
+// 				arg == TypeIndex::INFER
+// 					|| param.bounds.traits.iter().all(|bound| {
+// 						self.type_implements_trait(
+// 							types,
+// 							arg,
+// 							bound.trait_index,
+// 						) && self.assoc_bindings_hold(types, arg, bound)
+// 					})
+// 			})
+// 	}
+
+// 	/// Whether `arg` satisfies every associated-type refinement written on
+// 	/// `bound` (`T: Trait where { Assoc = .. }` / `{ Assoc: .. }`).
+// 	///
+// 	/// Every way of failing to *read* the actual value counts as satisfied —
+// 	/// "not disproved" — because this runs during impl selection, under
+// 	/// `&self` with no interner to mutate. It has to stay that way: a query
+// 	/// that grew the type arena would make dispatch depend on what happened
+// 	/// to be interned already. `Builder::check_bounds` re-checks these
+// 	/// bindings at the sites that hold `&mut TypeInterner` and report
+// 	/// diagnostics, so nothing skipped here goes unchecked everywhere.
+// 	fn assoc_bindings_hold(
+// 		&self,
+// 		types: &TypeInterner,
+// 		arg: TypeIndex,
+// 		bound: &TraitBound,
+// 	) -> bool {
+// 		bound.bindings.iter().all(|binding| {
+// 			let Some((impl_idx, impl_args)) =
+// 				self.find_trait_impl(types, arg, bound.trait_index)
+// 			else {
+// 				return true;
+// 			};
+// 			let Some(ImplEntry::AssocType(idx)) = self.trait_impls
+// 				[usize::from(impl_idx)]
+// 			.members
+// 			.get(&binding.name.inner)
+// 			.copied() else {
+// 				return true;
+// 			};
+// 			// A member is published into an impl's `members` only once its
+// 			// value is filled, so this cannot be `None` — see the cycle
+// 			// comment where trait-impl associated types are resolved.
+// 			let written = self.associated_types[usize::from(idx)]
+// 				.ty
+// 				.expect("a member in an impl's map has its value")
+// 				.inner;
+// 			// A non-generic impl's value is already a type. A generic impl's
+// 			// is readable here only when it is a bare type parameter — then
+// 			// it is just whichever arg was inferred for it. Anything
+// 			// composite (`type Item = Wrapper<T>`) would have to be *built*
+// 			// to be named, which is exactly what this must not do.
+// 			let actual = if impl_args.is_empty() {
+// 				written
+// 			} else {
+// 				match types.resolve(written) {
+// 					Type::TypeParam { param_index, .. } => {
+// 						match impl_args.get(*param_index as usize).copied() {
+// 							Some(inferred) => inferred,
+// 							None => return true,
+// 						}
+// 					}
+// 					_ => return true,
+// 				}
+// 			};
+// 			if actual == TypeIndex::ERROR || actual == TypeIndex::INFER {
+// 				return true;
+// 			}
+// 			match &binding.rhs.inner {
+// 				AssocBindingKind::Equals(expected) => {
+// 					*expected == TypeIndex::ERROR || actual == *expected
+// 				}
+// 				AssocBindingKind::Bound(required) => {
+// 					required.traits.iter().all(|req| {
+// 						self.type_implements_trait(
+// 							types,
+// 							actual,
+// 							req.trait_index,
+// 						)
+// 					})
+// 				}
+// 			}
+// 		})
+// 	}
+
+// 	/// Does `inherent_impls[block_idx]`'s target apply to `receiver_ty`, and
+// 	/// if so what's the substitution? `None` if it doesn't apply at all,
+// 	/// including when a declared bound on an inferred (non-`INFER`) type arg
+// 	/// isn't satisfied.
+// 	///
+// 	/// Slots `unify_impl_target` couldn't resolve from the receiver stay
+// 	/// `TypeIndex::INFER` so the call site can still fill them in — not from
+// 	/// an explicit turbofish (that only ever fills a method's *own* generic
+// 	/// slots, never impl-inherited ones — see `own_start` in
+// 	/// `build_namespace_member_expression`), but from the call's own
+// 	/// arguments: `Holder::make(5)` with no turbofish on `Holder` passes a
+// 	/// namespace type whose own args are themselves still `INFER` at this
+// 	/// point, so `T` here stays `INFER` too until `build_generic_call_arguments`
+// 	/// infers it from the `5` argument afterward.
+// 	fn unify_inherent_impl_target(
+// 		&self,
+// 		types: &TypeInterner,
+// 		block_idx: usize,
+// 		receiver_ty: TypeIndex,
+// 	) -> Option<Box<[TypeIndex]>> {
+// 		let block = &self.inherent_impls[block_idx];
+// 		let type_args = self.unify_impl_target(
+// 			types,
+// 			block.type_params.len(),
+// 			block.target.inner,
+// 			receiver_ty,
+// 		)?;
+// 		self.type_args_satisfy_bounds(types, &block.type_params, &type_args)
+// 			.then_some(type_args)
+// 	}
+
+// 	/// Does `trait_impls[impl_idx]`'s target apply to `receiver_ty`, and if
+// 	/// so what's the substitution? `None` if it doesn't apply, including
+// 	/// when a declared bound on an inferred type arg isn't satisfied.
+// 	///
+// 	/// Unlike an inherent impl (see `unify_inherent_impl_target`), a trait
+// 	/// impl's type params are never reached through an unresolved namespace
+// 	/// type — every caller of `find_trait_impl` already has a fully-resolved
+// 	/// concrete receiver in hand, so the receiver is the only place a trait
+// 	/// impl's own type params can ever come from. So, unlike
+// 	/// `unify_inherent_impl_target`, any slot left `TypeIndex::INFER` after
+// 	/// `unify_impl_target` means this impl doesn't apply, full stop: letting
+// 	/// `INFER` through would eventually reach MIR/codegen, which must never
+// 	/// happen.
+// 	fn unify_trait_impl_target(
+// 		&self,
+// 		types: &TypeInterner,
+// 		impl_idx: TraitImplIndex,
+// 		receiver_ty: TypeIndex,
+// 	) -> Option<Box<[TypeIndex]>> {
+// 		let imp = &self.trait_impls[usize::from(impl_idx)];
+// 		let type_args = self.unify_impl_target(
+// 			types,
+// 			imp.type_params.len(),
+// 			imp.target.inner,
+// 			receiver_ty,
+// 		)?;
+// 		if type_args.contains(&TypeIndex::INFER) {
+// 			return None;
+// 		}
+// 		self.type_args_satisfy_bounds(types, &imp.type_params, &type_args)
+// 			.then_some(type_args)
+// 	}
+
+// 	/// Finds the trait impl (concrete or generic) that makes `ty` implement
+// 	/// `trait_index`, if any, along with the type-arg substitution inferred
+// 	/// from `ty` (empty for a concrete impl). The single entry point for
+// 	/// every "does this specific trait apply here" query — associated-type
+// 	/// projection resolution, supertrait conformance checks, and `where`
+// 	/// bound checks all go through this rather than reading
+// 	/// `trait_impl_dispatch` directly.
+// 	pub fn find_trait_impl(
+// 		&self,
+// 		types: &TypeInterner,
+// 		ty: TypeIndex,
+// 		trait_index: TraitIndex,
+// 	) -> Option<(TraitImplIndex, Box<[TypeIndex]>)> {
+// 		let kind = ImplTarget::from_type(types.resolve(ty)).ok()?;
+// 		let &(_, idx) = self
+// 			.trait_impl_dispatch
+// 			.get(&kind)?
+// 			.iter()
+// 			.find(|(ti, _)| *ti == trait_index)?;
+// 		self.unify_trait_impl_target(types, idx, ty)
+// 			.map(|args| (idx, args))
+// 	}
+// }
+
+// #[derive(PartialEq)]
+// enum WasmScalar {
+// 	I32,
+// 	I64,
+// 	F32,
+// 	F64,
+// }
+
+// impl TIR {
+// 	pub fn formatter<'a>(
+// 		&'a self,
+// 		interner: &'a ast::StringInterner,
+// 		packages: &'a [Package],
+// 		from: PackageId,
+// 	) -> TypeFormatter<'a> {
+// 		TypeFormatter::new(
+// 			&self.types,
+// 			&self.items,
+// 			&self.defs,
+// 			interner,
+// 			packages,
+// 			from,
+// 		)
+// 	}
+
+// 	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
+// 		self.defs.is_import_namespace(namespace)
+// 	}
+
+// 	#[inline]
+// 	pub fn build(compilation: &mut CompilationUnit) -> TIR {
+// 		builder::build(compilation)
+// 	}
+// }

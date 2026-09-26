@@ -17,6 +17,7 @@ use crate::{
 	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
+use wx_compiler::diagnostics::DiagnosticCode;
 use wx_compiler::tir::TypeParamOwner;
 
 /// Exercises `Backend` through its real `LanguageServer` trait methods
@@ -771,7 +772,7 @@ fn completion_inside_function_includes_params() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -803,7 +804,7 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -855,7 +856,7 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -909,7 +910,7 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -964,7 +965,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -995,7 +996,7 @@ fn completion_inside_function_shows_globals_too() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1024,7 +1025,7 @@ fn completion_sorts_locals_before_globals() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1061,7 +1062,7 @@ fn completion_prefix_filters_results() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1133,7 +1134,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	// after "al" should still see it as a two-character prefix.
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1163,7 +1164,7 @@ fn completion_hides_sibling_module_items_without_use() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1198,7 +1199,7 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1235,7 +1236,7 @@ fn path_completion_after_enum_lists_variants() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1281,7 +1282,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1316,7 +1317,7 @@ fn path_completion_after_namespace_lists_module_members() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1489,11 +1490,8 @@ fn full_diagnostic_renders_and_handles_bad_index() {
 	);
 
 	assert!(
-		compiled
-			.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.code.as_deref() == Some("W1001")),
+		compiled.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedVariable.code())),
 		"expected an unused-variable warning to drive this test's diagnostic"
 	);
 
@@ -1557,9 +1555,10 @@ fn unused_enum_variants_get_one_squiggle_each() {
 	let unused: Vec<_> = diagnostics
 		.iter()
 		.filter(|d| {
-			d.code.as_ref().is_some_and(
-				|code| matches!(code, NumberOrString::String(s) if s == "W1009"),
-			)
+			d.code.as_ref().is_some_and(|code| {
+				matches!(code, NumberOrString::String(s)
+					if s == DiagnosticCode::UnusedEnumVariant.code())
+			})
 		})
 		.collect();
 
@@ -1677,13 +1676,126 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 
 	let hover = symbol_hover_text(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		compiled.graph.root_package,
 		&found.kind,
 	)
 	.expect("expected hover text for the type alias");
 	assert_eq!(hover, "type Id = u32");
+}
+
+#[test]
+fn trait_impl_type_params_have_hover_definitions_and_isolated_references() {
+	use wx_compiler::diagnostics::Diagnostics as _;
+
+	let root = PathBuf::from("/test/main.wx");
+	for implementation in [
+		"trait Marker {}\nimpl<Mem: Memory, T> Marker for RawPtr<Mem, T> {}",
+		indoc::indoc! {"
+			trait Identity { fn identity(value: Self) -> Self; }
+			impl<Mem: Memory, T> Identity for RawPtr<Mem, T> {
+			    fn identity(value: RawPtr<Mem, T>) -> RawPtr<Mem, T> { value }
+			}
+		"},
+	] {
+		let source = format!(
+			"struct RawPtr<Mem: Memory, T> {{ addr: Mem::Size, }}\n{implementation}"
+		);
+		let (_, compiled) = compile_source(&root, &source);
+		assert!(
+			!compiled.tir.diagnostics.has_errors(),
+			"unexpected diagnostics: {:?}",
+			compiled.tir.diagnostics
+		);
+		let file_id = file_id_for(&compiled, &root);
+		let index = &compiled.symbol_index;
+		let impl_start = source.find("impl<").unwrap();
+
+		for (param_index, name, hover, argument_offset) in
+			[(0, "Mem", "Mem: Memory", 0), (1, "T", "T", "Mem, ".len())]
+		{
+			let declaration = if param_index == 0 {
+				impl_start + "impl<".len()
+			} else {
+				impl_start + source[impl_start..].find(", T>").unwrap() + 2
+			};
+			let found = index
+				.find_at_position(file_id, declaration as u32)
+				.expect("impl parameter declaration should be indexed");
+			assert!(matches!(
+				found.kind,
+				SymbolKind::TypeParam {
+					owner: TypeParamOwner::TraitImpl(_),
+					param_index: actual,
+				} if actual == param_index
+			));
+			let expected_references: Vec<_> = source
+				.match_indices("RawPtr<Mem, T>")
+				.map(|(start, _)| {
+					(start + "RawPtr<".len() + argument_offset) as u32
+				})
+				.collect();
+			for position in std::iter::once(declaration as u32)
+				.chain(expected_references.iter().copied())
+			{
+				let symbol = index.find_at_position(file_id, position).unwrap();
+				assert_eq!(symbol.kind, found.kind);
+				assert_eq!(
+					index
+						.definition_for_kind(symbol.kind)
+						.unwrap()
+						.source
+						.span
+						.start,
+					declaration as u32
+				);
+				assert_eq!(
+					symbol_hover_text(
+						&compiled.tir,
+						&compiled.graph.strings,
+						&compiled.graph.packages,
+						compiled.graph.root_package,
+						&symbol.kind,
+					)
+					.as_deref(),
+					Some(hover)
+				);
+				assert!(matches!(
+					symbol_kind_to_token_type(symbol.kind),
+					Some(TokenType::TypeParameter)
+				));
+			}
+
+			let search_kinds =
+				reference_search_kinds(&compiled.tir, index, found.kind);
+			let references: Vec<_> = index
+				.references
+				.iter()
+				.filter(|entry| search_kinds.contains(&entry.kind))
+				.map(|entry| entry.source.span.start)
+				.collect();
+			assert_eq!(references, expected_references);
+
+			// Rename uses exact-kind matching across references and definitions.
+			// It must leave the struct's identically named parameters alone.
+			let mut rename_positions: Vec<_> = index
+				.references
+				.iter()
+				.chain(index.definitions.iter())
+				.filter(|entry| entry.kind == found.kind)
+				.map(|entry| {
+					assert_eq!(entry.source.file_id, file_id);
+					assert_eq!(entry.source.span.extract_str(&source), name);
+					entry.source.span.start
+				})
+				.collect();
+			rename_positions.sort_unstable();
+			let mut expected_rename = vec![declaration as u32];
+			expected_rename.extend(expected_references);
+			assert_eq!(rename_positions, expected_rename);
+		}
+	}
 }
 
 #[test]
@@ -2198,6 +2310,15 @@ fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
 		"Elem",
 		"go-to-definition for `Self::Elem` should land on the trait's `type Elem` declaration"
 	);
+	let hover = symbol_hover_text(
+		&compiled.tir,
+		&compiled.graph.strings,
+		&compiled.graph.packages,
+		compiled.graph.root_package,
+		&found.kind,
+	)
+	.expect("associated-type hover reads its arena-owned bounds");
+	assert_eq!(hover, "type Elem: Bound");
 }
 
 #[test]
@@ -2319,7 +2440,7 @@ fn memory_associated_const_namespace_access_resolves() {
 		.name
 		.inner;
 	assert_eq!(
-		compiled.graph.interner.resolve(const_name),
+		compiled.graph.strings.resolve(const_name),
 		Some("DATA_END"),
 		"expected the resolved const to be named `DATA_END`"
 	);
@@ -2330,6 +2451,24 @@ fn memory_associated_const_namespace_access_resolves() {
 			.span,
 		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
+	let memory_trait = compiled
+		.tir
+		.items
+		.traits
+		.iter()
+		.find(|trait_def| {
+			compiled.graph.strings.resolve(trait_def.name.inner)
+				== Some("Memory")
+		})
+		.expect("stdlib Memory trait");
+	let wx_compiler::tir::TraitMemberKind::Constant(template_index) =
+		memory_trait.bindings[&const_name]
+	else {
+		panic!("Memory::DATA_END must be a constant");
+	};
+	let template = &compiled.tir.items.constants[usize::from(template_index)];
+	assert_eq!(definition.source.file_id, template.file_id);
+	assert_eq!(definition.source.span, template.name.span);
 }
 
 #[test]

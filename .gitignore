@@ -1,5 +1,7 @@
 target/
 .DS_Store
+*.snap.new
+*.pending-snap
 out/
 node_modules/
 cli/npm/*/bin

@@ -7,7 +7,7 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 
 mod manifest;
 pub use manifest::{
@@ -302,7 +302,7 @@ pub struct ModuleDeclaration {
 	pub name: ast::Spanned<SymbolU32>,
 	/// Whether the declaration was `pub`. Independently optional — a
 	/// declaration that exists but isn't `pub` is a normal, valid state.
-	pub pub_span: Option<ast::TextSpan>,
+	pub pub_span: Option<TextSpan>,
 }
 
 pub struct SourceModule {
@@ -329,7 +329,7 @@ pub enum PackageKind {
 	Library,
 }
 
-pub struct PackageGraph {
+pub struct Package {
 	pub id: PackageId,
 	pub root: ModuleId,
 	pub kind: PackageKind,
@@ -361,7 +361,7 @@ pub struct PackageGraph {
 
 pub struct CompilationUnit {
 	pub files: Files,
-	pub packages: Vec<PackageGraph>,
+	pub packages: Vec<Package>,
 	pub root_package: PackageId,
 	/// The package providing the language's `#[tag = "..."]` items (the
 	/// twelve operator traits `resolve_operator_traits` looks up). Always
@@ -370,7 +370,7 @@ pub struct CompilationUnit {
 	/// stdlib.
 	pub stdlib_package: PackageId,
 	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
+	pub strings: ast::StringInterner,
 }
 
 impl CompilationUnit {
@@ -408,8 +408,8 @@ impl CompilationUnit {
 pub struct CompilationUnitBuilder {
 	pub files: Files,
 	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
-	pub packages: Vec<PackageGraph>,
+	pub strings: ast::StringInterner,
+	pub packages: Vec<Package>,
 	/// Set once the stdlib exists, and seeded into every package loaded
 	/// afterwards as its implicit `std` dependency. `None` only while the
 	/// stdlib itself is being loaded — which is exactly what keeps it from
@@ -487,7 +487,7 @@ impl CompilationUnitBuilder {
 		Self {
 			files: Files::new(),
 			id_generator: ast::DefIdGenerator::new(),
-			interner: ast::StringInterner::new(),
+			strings: ast::Keyword::create_interner(),
 			packages: Vec::new(),
 			stdlib: None,
 		}
@@ -566,8 +566,8 @@ impl CompilationUnitBuilder {
 				.with_message(format!(
 					"this package is already declared as `{}`, so it cannot \
 			 also be declared as `{}`",
-					self.interner.resolve(existing).unwrap(),
-					self.interner.resolve(name).unwrap(),
+					self.strings.resolve(existing).unwrap(),
+					self.strings.resolve(name).unwrap(),
 				));
 			package.diagnostics.push(diagnostic);
 			return;
@@ -578,7 +578,7 @@ impl CompilationUnitBuilder {
 				.with_message(format!(
 					"the name `{}` is already used by another package this one \
 			 depends on",
-					self.interner.resolve(name).unwrap()
+					self.strings.resolve(name).unwrap()
 				));
 			package.diagnostics.push(diagnostic);
 			return;
@@ -611,7 +611,7 @@ impl CompilationUnitBuilder {
 		// Computed before the loader takes its `&mut self`.
 		let (dependencies, dependency_names) = match self.stdlib {
 			Some(stdlib) => {
-				let std = self.interner.get_or_intern("std");
+				let std = self.strings.get_or_intern("std");
 				(
 					HashMap::from([(std, stdlib)]),
 					HashMap::from([(stdlib, std)]),
@@ -627,7 +627,7 @@ impl CompilationUnitBuilder {
 
 		// Built into a local first: moving the loader's fields out here is
 		// what ends its borrow of `self`, which the push then needs.
-		let package_graph = PackageGraph {
+		let package_graph = Package {
 			id: package_id,
 			kind,
 			dependencies,
@@ -662,7 +662,7 @@ impl CompilationUnitBuilder {
 			root_package,
 			stdlib_package,
 			id_generator: self.id_generator,
-			interner: self.interner,
+			strings: self.strings,
 		}
 	}
 }
@@ -723,26 +723,33 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		let ast = ast::Parser::parse(
 			file_id,
 			&self.ctx.files,
-			&mut self.ctx.interner,
+			&mut self.ctx.strings,
 			&mut self.ctx.id_generator,
 		);
-		let child_decls: Box<
-			[(ast::Spanned<SymbolU32>, Option<ast::TextSpan>)],
-		> = ast.items
+
+		let module_id = ModuleId(self.modules.len() as u32);
+		let child_decls: Box<[ModuleDeclaration]> = ast
+			.items
 			.iter()
 			.filter_map(|item| match &item.inner.inner {
 				ast::Item::ModuleDeclaration { name, pub_span } => {
-					Some((*name, *pub_span))
+					Some(ModuleDeclaration {
+						parent: module_id,
+						name: *name,
+						pub_span: *pub_span,
+					})
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(
+						file_id,
+						&items.inner,
+					);
 					None
 				}
 				_ => None,
 			})
 			.collect();
 
-		let module_id = ModuleId(self.modules.len() as u32);
 		self.path_to_module.insert(file_path.clone(), module_id);
 		self.modules.push(SourceModule {
 			package_id: self.package_id,
@@ -754,10 +761,12 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		});
 
 		let mut children = Vec::with_capacity(child_decls.len());
-		for (child_name, child_pub_span) in child_decls {
-			let Some(child_path) =
-				self.resolve_child_module_path(&owned_dir, child_name, file_id)
-			else {
+		for module in child_decls.into_iter() {
+			let Some(child_path) = self.resolve_child_module_path(
+				&owned_dir,
+				module.name,
+				file_id,
+			) else {
 				continue; // already diagnosed as ambiguous
 			};
 			// A module's own children always live under a directory named
@@ -766,18 +775,15 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			// same `owned_dir` for its children (both `src/math/`), same as
 			// Rust's `foo.rs`/`foo/mod.rs` being interchangeable.
 			let child_name_str =
-				self.ctx.interner.resolve(child_name.inner).expect(
+				self.ctx.strings.resolve(module.name.inner).expect(
 					"module symbol should resolve while loading package",
 				);
 			let child_owned_dir =
 				owned_dir.join(&RelativePath::new(child_name_str.to_string()));
+			let name_span = SourceSpan::new(file_id, module.name.span);
 			match self.load_module(
 				child_path.clone(),
-				Some(ModuleDeclaration {
-					parent: module_id,
-					name: child_name,
-					pub_span: child_pub_span,
-				}),
+				Some(module),
 				child_owned_dir,
 			) {
 				Ok(child_id) => children.push(child_id),
@@ -788,13 +794,9 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 							"module file not found: `{}`",
 							child_path.as_str()
 						))
-						.with_label(
-							Label::primary(file_id, child_name.span)
-								.with_message(format!(
-									"no such file: `{}`",
-									child_path.as_str()
-								)),
-						);
+						.with_label(name_span.primary_label().with_message(
+							format!("no such file: `{}`", child_path.as_str()),
+						));
 					self.diagnostics.push(diagnostic);
 				}
 			}
@@ -810,7 +812,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	/// require walking up through however many inline wrappers enclose it
 	/// (unlike Rust, which resolves it by accumulating a directory segment
 	/// per inline level).
-	fn diagnose_nested_module_declarations(
+	fn check_nested_module_declarations(
 		&mut self,
 		file_id: FileId,
 		items: &[ast::Separated<ast::Spanned<ast::Item>>],
@@ -834,7 +836,10 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 					self.diagnostics.push(diagnostic);
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(
+						file_id,
+						&items.inner,
+					);
 				}
 				_ => {}
 			}
@@ -858,7 +863,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	) -> Option<AbsolutePath> {
 		let module_name = self
 			.ctx
-			.interner
+			.strings
 			.resolve(child_module_name.inner)
 			.expect("module symbol should resolve while loading package");
 		let sibling_file =

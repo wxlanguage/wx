@@ -11,17 +11,12 @@ items:
           pub_span: ~
           tree:
             inner:
-              Path:
+              Glob:
                 segment:
                   inner: 0
                   span:
                     start: 4
                     end: 8
-                rest:
-                  inner: Glob
-                  span:
-                    start: 10
-                    end: 11
             span:
               start: 4
               end: 11
@@ -46,8 +41,7 @@ items:
                 rest:
                   inner:
                     Name:
-                      id: 0
-                      name:
+                      segment:
                         inner: 1
                         span:
                           start: 23
@@ -80,8 +74,7 @@ items:
                 rest:
                   inner:
                     Name:
-                      id: 1
-                      name:
+                      segment:
                         inner: 1
                         span:
                           start: 38
@@ -109,45 +102,42 @@ items:
           pub_span: ~
           tree:
             inner:
-              Path:
+              Group:
                 segment:
                   inner: 0
                   span:
                     start: 55
                     end: 59
-                rest:
+                branches:
                   inner:
-                    Group:
-                      - inner:
-                          inner:
-                            Name:
-                              id: 2
-                              name:
-                                inner: 1
-                                span:
-                                  start: 62
-                                  end: 65
-                              alias: ~
-                          span:
-                            start: 62
-                            end: 65
-                        separator:
-                          start: 65
-                          end: 66
-                      - inner:
-                          inner:
-                            Name:
-                              id: 3
-                              name:
-                                inner: 3
-                                span:
-                                  start: 67
-                                  end: 70
-                              alias: ~
-                          span:
-                            start: 67
-                            end: 70
-                        separator: ~
+                    - inner:
+                        inner:
+                          Name:
+                            segment:
+                              inner: 1
+                              span:
+                                start: 62
+                                end: 65
+                            alias: ~
+                        span:
+                          start: 62
+                          end: 65
+                      separator:
+                        start: 65
+                        end: 66
+                    - inner:
+                        inner:
+                          Name:
+                            segment:
+                              inner: 3
+                              span:
+                                start: 67
+                                end: 70
+                            alias: ~
+                        span:
+                          start: 67
+                          end: 70
+                      separator: ~
                   span:
                     start: 61
                     end: 71
@@ -166,82 +156,73 @@ items:
           pub_span: ~
           tree:
             inner:
-              Path:
+              Group:
                 segment:
                   inner: 0
                   span:
                     start: 77
                     end: 81
-                rest:
+                branches:
                   inner:
-                    Group:
-                      - inner:
-                          inner:
-                            Path:
-                              segment:
-                                inner: 4
-                                span:
-                                  start: 84
-                                  end: 88
-                              rest:
-                                inner:
-                                  Group:
-                                    - inner:
-                                        inner:
-                                          Name:
-                                            id: 4
-                                            name:
-                                              inner: 5
-                                              span:
-                                                start: 91
-                                                end: 94
-                                            alias: ~
-                                        span:
-                                          start: 91
-                                          end: 94
-                                      separator:
-                                        start: 94
-                                        end: 95
-                                    - inner:
-                                        inner:
-                                          Name:
-                                            id: 5
-                                            name:
-                                              inner: 6
-                                              span:
-                                                start: 96
-                                                end: 99
-                                            alias: ~
-                                        span:
-                                          start: 96
-                                          end: 99
-                                      separator: ~
-                                span:
-                                  start: 90
-                                  end: 100
-                          span:
-                            start: 84
-                            end: 100
-                        separator:
-                          start: 100
-                          end: 101
-                      - inner:
-                          inner:
-                            Path:
-                              segment:
-                                inner: 7
-                                span:
-                                  start: 102
-                                  end: 105
-                              rest:
-                                inner: Glob
-                                span:
-                                  start: 107
-                                  end: 108
-                          span:
-                            start: 102
-                            end: 108
-                        separator: ~
+                    - inner:
+                        inner:
+                          Group:
+                            segment:
+                              inner: 4
+                              span:
+                                start: 84
+                                end: 88
+                            branches:
+                              inner:
+                                - inner:
+                                    inner:
+                                      Name:
+                                        segment:
+                                          inner: 5
+                                          span:
+                                            start: 91
+                                            end: 94
+                                        alias: ~
+                                    span:
+                                      start: 91
+                                      end: 94
+                                  separator:
+                                    start: 94
+                                    end: 95
+                                - inner:
+                                    inner:
+                                      Name:
+                                        segment:
+                                          inner: 6
+                                          span:
+                                            start: 96
+                                            end: 99
+                                        alias: ~
+                                    span:
+                                      start: 96
+                                      end: 99
+                                  separator: ~
+                              span:
+                                start: 90
+                                end: 100
+                        span:
+                          start: 84
+                          end: 100
+                      separator:
+                        start: 100
+                        end: 101
+                    - inner:
+                        inner:
+                          Glob:
+                            segment:
+                              inner: 7
+                              span:
+                                start: 102
+                                end: 105
+                        span:
+                          start: 102
+                          end: 108
+                      separator: ~
                   span:
                     start: 83
                     end: 109
@@ -285,8 +266,7 @@ items:
                             rest:
                               inner:
                                 Name:
-                                  id: 6
-                                  name:
+                                  segment:
                                     inner: 11
                                     span:
                                       start: 124

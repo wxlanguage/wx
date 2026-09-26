@@ -4,37 +4,43 @@ use crate::ast;
 use crate::mir::*;
 use crate::tir;
 
-/// Offsets every scope index in `expr` by `scope_offset` (in place), and
-/// rewrites `Return { value }` into `Break { scope_index: wrapper_scope,
-/// value }`. Used for combining multiple globals' own scope trees into one
-/// synthesized start function (`mir::MIR::build_start_function`) — a plain
-/// uniform shift, no root-scope redirect needed, since each global's own
-/// root scope becomes a genuinely new, disjoint scope of its own rather
-/// than dissolving into an existing one. Implemented as the no-redirect
-/// case of `Rebaser` (`root_scope: scope_offset, root_bias: 0` — redirecting
-/// scope `0` to exactly where a plain `+= scope_offset` shift would already
-/// send it) rather than a second, separately-maintained walk.
+/// Offsets every scope index and local index in `expr` by `scope_offset`/
+/// `local_offset` (in place), and rewrites `Return { value }` into
+/// `Break { scope_index: wrapper_scope, value }`. Used for combining
+/// multiple globals' own scope trees and locals into one synthesized start
+/// function (`mir::MIR::build_start_function`) — a plain uniform shift, no
+/// root-scope redirect needed, since each global's own root scope becomes a
+/// genuinely new, disjoint scope of its own rather than dissolving into an
+/// existing one. Implemented as the no-redirect case of `Rebaser`
+/// (`root_scope: scope_offset` — redirecting scope `0` to exactly where a
+/// plain `+= scope_offset` shift would already send it) rather than a
+/// second, separately-maintained walk.
 pub(super) fn rebase_scope(
 	expr: &mut Expression,
 	scope_offset: ScopeIndex,
 	wrapper_scope: ScopeIndex,
+	local_offset: LocalIndex,
 ) {
 	Rebaser {
 		scope_offset,
 		wrapper_scope,
 		root_scope: scope_offset,
-		root_bias: 0,
+		local_offset,
 	}
 	.rebase(expr);
 }
 
-/// Rewrites scope/local references while splicing one scope tree into
-/// another. Every scope index shifts by `scope_offset`, *except* index `0`
-/// (a tree's own root, in its own numbering), which redirects to
-/// `root_scope` instead, with `local_index` shifted by `root_bias` — the
-/// callee's-parameters-become-more-locals-on-an-existing-scope case
-/// `mir::inlining::inline_call` needs. `rebase_scope` (above) is the
-/// special case of this where root scope `0` redirects to exactly
+/// Rewrites scope/local references while splicing one scope tree (and its
+/// locals) into another. Every scope index shifts by `scope_offset`,
+/// *except* index `0` (a tree's own root, in its own numbering), which
+/// redirects to `root_scope` instead — a purely control-flow concern
+/// (`Block`/`Loop`/`Break`/`Continue` targets). Every local index shifts by
+/// `local_offset` unconditionally, with no such scope-0 special case:
+/// `Function::locals` is one flat, function-wide space, so splicing a
+/// callee's entire local space into a caller's is always a single
+/// contiguous append, regardless of which of the callee's own scopes a
+/// given local reference originally belonged to. `rebase_scope` (above) is
+/// the special case of this where root scope `0` redirects to exactly
 /// `scope_offset`, i.e. nowhere special — a plain uniform shift, which is
 /// all `MIR::build_start_function`'s use (combining separate globals' own
 /// scope trees, each becoming a genuinely new disjoint scope) ever needs.
@@ -42,66 +48,52 @@ struct Rebaser {
 	scope_offset: ScopeIndex,
 	wrapper_scope: ScopeIndex,
 	root_scope: ScopeIndex,
-	root_bias: LocalIndex,
+	local_offset: LocalIndex,
 }
 
 impl Rebaser {
 	/// For a reference that carries only a scope index (`Block`, `Loop`,
-	/// `Break`, `Continue` — no local of their own to shift).
+	/// `Break`, `Continue`).
 	#[inline]
 	fn rebase_scope(&self, scope_index: &mut ScopeIndex) {
-		if *scope_index == 0 {
+		if *scope_index == ScopeIndex::new(0) {
 			*scope_index = self.root_scope;
 		} else {
-			*scope_index += self.scope_offset;
+			*scope_index = ScopeIndex::new(
+				u32::from(*scope_index) + u32::from(self.scope_offset),
+			);
 		}
 	}
 
-	/// For a reference that carries both a scope index and a local index
-	/// within it (`LocalGet`/`LocalSet`/`AggregateGet`/`AggregateSet`).
+	/// For a local reference (`LocalGet`/`LocalSet`/`AggregateGet`/
+	/// `AggregateSet`) — always an unconditional shift, since
+	/// `Function::locals` has no per-scope grouping to special-case.
 	#[inline]
-	fn rebase_scope_and_local(
-		&self,
-		scope_index: &mut ScopeIndex,
-		local_index: &mut LocalIndex,
-	) {
-		if *scope_index == 0 {
-			*scope_index = self.root_scope;
-			*local_index += self.root_bias;
-		} else {
-			*scope_index += self.scope_offset;
-		}
+	fn rebase_local(&self, local_index: &mut LocalIndex) {
+		*local_index = LocalIndex::new(
+			u32::from(*local_index) + u32::from(self.local_offset),
+		);
 	}
 
 	fn rebase(&self, expr: &mut Expression) {
 		match &mut expr.kind {
-			ExprKind::LocalGet {
-				scope_index,
-				local_index,
-			} => self.rebase_scope_and_local(scope_index, local_index),
-			ExprKind::AggregateGet {
-				scope_index,
-				local_index,
-				..
-			} => self.rebase_scope_and_local(scope_index, local_index),
+			ExprKind::LocalGet { local_index } => {
+				self.rebase_local(local_index)
+			}
+			ExprKind::AggregateGet { local_index, .. } => {
+				self.rebase_local(local_index)
+			}
 			ExprKind::Continue { scope_index } => {
 				self.rebase_scope(scope_index)
 			}
-			ExprKind::LocalSet {
-				scope_index,
-				local_index,
-				value,
-			} => {
-				self.rebase_scope_and_local(scope_index, local_index);
+			ExprKind::LocalSet { local_index, value } => {
+				self.rebase_local(local_index);
 				self.rebase(value);
 			}
 			ExprKind::AggregateSet {
-				scope_index,
-				local_index,
-				value,
-				..
+				local_index, value, ..
 			} => {
-				self.rebase_scope_and_local(scope_index, local_index);
+				self.rebase_local(local_index);
 				self.rebase(value);
 			}
 			ExprKind::Loop {
@@ -273,85 +265,88 @@ impl Rebaser {
 
 /// Substitutes a direct call at the call site with the callee's body inlined
 /// into the caller. Appends any scopes the callee needs beyond its root to
-/// `caller_scopes`.
+/// `caller_scopes`, and the callee's entire flat local space to
+/// `caller_locals`.
 ///
-/// The callee's own root-scope locals — its parameters, and any `local` it
-/// declares directly in its own body — become more locals on
-/// `caller_scopes[call_site_scope]` itself, not a new sibling scope. A
-/// second inlined call at the same site (another argument of the same
-/// expression, or a later, separate inlining sweep substituting a sibling)
-/// simply finds more locals already there and gets index ranges past them —
-/// the same way a second ordinary `local` declaration would. Nothing needs
-/// protecting: `Vec::push` can't collide with itself.
+/// `Function::locals` is flat and function-wide, so splicing a callee's
+/// locals in is always a single contiguous append — `local_offset` records
+/// where that block now starts, and `Rebaser::rebase_local` shifts every
+/// local reference in the rebased callee body by exactly that amount,
+/// regardless of which of the callee's own scopes it originally belonged
+/// to. A second inlined call at the same site (another argument of the same
+/// expression, or a later, separate inlining sweep) simply appends past
+/// whatever's already there — the same way a second ordinary `local`
+/// declaration would. Nothing needs protecting: `Vec::extend` can't collide
+/// with itself.
 ///
-/// (This is what `compute_locals_offsets` in `opt/builder.rs` used to get
-/// wrong: it gives every scope the same flat local-offset as its
-/// `parent`-siblings, assuming — correctly for `if`/`else`/`match` arms,
-/// the only shape ordinary lowering produces — that same-parent scopes are
-/// mutually exclusive at runtime. Inlining used to create a *new* sibling
-/// scope per call for exactly this data, which made that assumption false.
-/// Not creating that scope removes the false assumption instead of working
-/// around it.)
+/// (This is what `compute_locals_offsets` in `opt/builder.rs` — since
+/// removed — used to get wrong: it gave every scope the same flat
+/// local-offset as its sibling scopes, assuming — correctly for
+/// `if`/`else`/`match` arms, the only shape ordinary lowering produces —
+/// that same-parent scopes were mutually exclusive at runtime. Inlining
+/// used to create a *new* sibling scope per call for exactly this data,
+/// which made that assumption false. A flat, always-distinct local space
+/// has no such assumption left to violate.)
 ///
 /// The wrapper scope below still exists, unconditionally, as the `break`
-/// target for the callee's own `Return`s — but it never holds any locals
-/// itself, so it's always safe to parent directly at the call site.
+/// target for the callee's own `Return`s. The callee's own root scope
+/// (scope `0` in its own numbering) is never copied as a new entry — any
+/// control-flow reference to it (a nested `Block`/`Loop`/`Break`/`Continue`
+/// targeting it) is redirected to `call_site_scope` instead, via
+/// `Rebaser::root_scope`. This can make `call_site_scope` get visited twice
+/// under the same scope index — once for its own pre-existing statements,
+/// once (transparently) for the dissolved callee root — which
+/// `opt::Builder::build_block_expr` already tolerates as ordinary
+/// scope-index aliasing.
 fn inline_call(
 	callee: &Function,
 	arguments: Box<[Expression]>,
 	caller_scopes: &mut Vec<BlockScope>,
+	caller_locals: &mut Vec<Local>,
 	call_site_scope: ScopeIndex,
 ) -> Expression {
 	let result_ty = callee.block.ty;
-	let callee_root = &callee.scopes[0];
 
-	let root_bias =
-		caller_scopes[call_site_scope as usize].locals.len() as LocalIndex;
-	caller_scopes[call_site_scope as usize]
-		.locals
-		.extend(callee_root.locals.iter().cloned());
+	let local_offset = LocalIndex::new(caller_locals.len() as u32);
+	caller_locals.extend(callee.locals.iter().cloned());
 
 	let mut exprs: Vec<Expression> = arguments
 		.into_vec()
 		.into_iter()
 		.enumerate()
 		.map(|(i, arg)| Expression {
-			ty: Type::Unit,
+			ty: ValueType::Unit,
 			kind: ExprKind::LocalSet {
-				scope_index: call_site_scope,
-				local_index: root_bias + i as LocalIndex,
+				local_index: LocalIndex::new(
+					u32::from(local_offset) + i as u32,
+				),
 				value: Box::new(arg),
 			},
 		})
 		.collect();
 
-	let wrapper_scope = caller_scopes.len() as ScopeIndex;
+	let wrapper_scope = ScopeIndex::new(caller_scopes.len() as u32);
 	caller_scopes.push(BlockScope {
 		kind: tir::BlockKind::Block,
-		parent: Some(call_site_scope),
-		locals: vec![],
 		result: result_ty,
 	});
 
 	// Any scopes the callee's own body nests beyond its root (its own
 	// if/else, loops, ...) still need their own entries, following the
 	// wrapper — the callee's root itself is never copied; it was just
-	// dissolved into `call_site_scope` above. Scope `k` (k >= 1) in the
-	// callee's own numbering lands at `k + wrapper_scope`; a parent of `0`
-	// (the callee's own root) becomes `wrapper_scope` by that same formula.
-	for scope in callee.scopes[1..].iter().cloned() {
-		caller_scopes.push(BlockScope {
-			parent: scope.parent.map(|p| p + wrapper_scope),
-			..scope
-		});
-	}
+	// dissolved into `call_site_scope`'s numbering above. Scope `k` (k >= 1)
+	// in the callee's own numbering lands at `k + wrapper_scope`, handled by
+	// `Rebaser::rebase_scope`'s plain shift when the callee body is rebased
+	// below — the scopes themselves carry no index of their own to adjust
+	// here now that `BlockScope` has no `parent` field.
+	caller_scopes.extend(callee.scopes[1..].iter().cloned());
 
 	let mut body = callee.block.clone();
 	Rebaser {
 		scope_offset: wrapper_scope,
 		wrapper_scope,
 		root_scope: call_site_scope,
-		root_bias,
+		local_offset,
 	}
 	.rebase(&mut body);
 	exprs.push(body);
@@ -378,13 +373,13 @@ fn inline_call(
 /// (e.g. `v * (2.0 + z * r)`, mixing `Mul::mul` and `Add::add`) gets
 /// resolved in the *same* walk that created that wrapper — so `current_scope`
 /// is never re-derived from scratch against an already-substituted tree,
-/// which is what let a later, separate pass mistake a wrapper block (meant
-/// to always stay empty — see `inline_call`'s doc comment) for a real
-/// caller scope and silently alias two calls' locals via
-/// `compute_locals_offsets` in `opt/builder.rs`.
+/// which is what let a later, separate pass mistake a wrapper block for a
+/// real caller scope and misattribute a nested call's locals/control-flow
+/// target to the wrong place.
 fn inline_expr(
 	expr: &mut Expression,
 	caller_scopes: &mut Vec<BlockScope>,
+	caller_locals: &mut Vec<Local>,
 	targets: &HashMap<ast::DefId, Function>,
 	current_scope: ScopeIndex,
 ) {
@@ -427,13 +422,23 @@ fn inline_expr(
 		| ExprKind::I32ReinterpretF32 { value }
 		| ExprKind::F32ReinterpretI32 { value }
 		| ExprKind::I64ReinterpretF64 { value }
-		| ExprKind::F64ReinterpretI64 { value } => {
-			inline_expr(value, caller_scopes, targets, current_scope)
-		}
+		| ExprKind::F64ReinterpretI64 { value } => inline_expr(
+			value,
+			caller_scopes,
+			caller_locals,
+			targets,
+			current_scope,
+		),
 
 		ExprKind::Aggregate { values: fields } => {
 			for e in fields.iter_mut() {
-				inline_expr(e, caller_scopes, targets, current_scope);
+				inline_expr(
+					e,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 		}
 		ExprKind::Block {
@@ -443,16 +448,32 @@ fn inline_expr(
 		} => {
 			let block_scope = *scope_index;
 			for e in expressions.iter_mut() {
-				inline_expr(e, caller_scopes, targets, block_scope);
+				inline_expr(
+					e,
+					caller_scopes,
+					caller_locals,
+					targets,
+					block_scope,
+				);
 			}
 		}
-		ExprKind::Loop { block, .. } => {
-			inline_expr(block, caller_scopes, targets, current_scope)
-		}
+		ExprKind::Loop { block, .. } => inline_expr(
+			block,
+			caller_scopes,
+			caller_locals,
+			targets,
+			current_scope,
+		),
 
 		ExprKind::Break { value, .. } | ExprKind::Return { value } => {
 			if let Some(v) = value {
-				inline_expr(v, caller_scopes, targets, current_scope);
+				inline_expr(
+					v,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 		}
 		ExprKind::IfElse {
@@ -460,10 +481,28 @@ fn inline_expr(
 			then_block,
 			else_block,
 		} => {
-			inline_expr(condition, caller_scopes, targets, current_scope);
-			inline_expr(then_block, caller_scopes, targets, current_scope);
+			inline_expr(
+				condition,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				then_block,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 			if let Some(e) = else_block {
-				inline_expr(e, caller_scopes, targets, current_scope);
+				inline_expr(
+					e,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 		}
 		ExprKind::Switch {
@@ -471,18 +510,48 @@ fn inline_expr(
 			cases,
 			default,
 		} => {
-			inline_expr(selector, caller_scopes, targets, current_scope);
+			inline_expr(
+				selector,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 			for (_, body) in cases.iter_mut() {
-				inline_expr(body, caller_scopes, targets, current_scope);
+				inline_expr(
+					body,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 			if let Some(e) = default {
-				inline_expr(e, caller_scopes, targets, current_scope);
+				inline_expr(
+					e,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 		}
 		ExprKind::Call { callee, arguments } => {
-			inline_expr(callee, caller_scopes, targets, current_scope);
+			inline_expr(
+				callee,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 			for a in arguments.iter_mut() {
-				inline_expr(a, caller_scopes, targets, current_scope);
+				inline_expr(
+					a,
+					caller_scopes,
+					caller_locals,
+					targets,
+					current_scope,
+				);
 			}
 		}
 		ExprKind::Add { left, right }
@@ -506,28 +575,96 @@ fn inline_expr(
 		| ExprKind::Min { left, right }
 		| ExprKind::Max { left, right }
 		| ExprKind::Copysign { left, right } => {
-			inline_expr(left, caller_scopes, targets, current_scope);
-			inline_expr(right, caller_scopes, targets, current_scope);
+			inline_expr(
+				left,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				right,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 		}
-		ExprKind::MemoryGrow { delta, .. } => {
-			inline_expr(delta, caller_scopes, targets, current_scope)
-		}
+		ExprKind::MemoryGrow { delta, .. } => inline_expr(
+			delta,
+			caller_scopes,
+			caller_locals,
+			targets,
+			current_scope,
+		),
 		ExprKind::MemoryFill { dst, val, len, .. } => {
-			inline_expr(dst, caller_scopes, targets, current_scope);
-			inline_expr(val, caller_scopes, targets, current_scope);
-			inline_expr(len, caller_scopes, targets, current_scope);
+			inline_expr(
+				dst,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				val,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				len,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 		}
 		ExprKind::MemoryCopy { dst, src, len, .. } => {
-			inline_expr(dst, caller_scopes, targets, current_scope);
-			inline_expr(src, caller_scopes, targets, current_scope);
-			inline_expr(len, caller_scopes, targets, current_scope);
+			inline_expr(
+				dst,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				src,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				len,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 		}
-		ExprKind::PointerLoad { pointer, .. } => {
-			inline_expr(pointer, caller_scopes, targets, current_scope)
-		}
+		ExprKind::PointerLoad { pointer, .. } => inline_expr(
+			pointer,
+			caller_scopes,
+			caller_locals,
+			targets,
+			current_scope,
+		),
 		ExprKind::PointerStore { pointer, value, .. } => {
-			inline_expr(pointer, caller_scopes, targets, current_scope);
-			inline_expr(value, caller_scopes, targets, current_scope);
+			inline_expr(
+				pointer,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
+			inline_expr(
+				value,
+				caller_scopes,
+				caller_locals,
+				targets,
+				current_scope,
+			);
 		}
 		// Leaf variants — nothing to recurse into.
 		ExprKind::Noop
@@ -563,7 +700,13 @@ fn inline_expr(
 		ExprKind::Call { arguments, .. } => arguments,
 		_ => unreachable!(),
 	};
-	*expr = inline_call(body, arguments, caller_scopes, current_scope);
+	*expr = inline_call(
+		body,
+		arguments,
+		caller_scopes,
+		caller_locals,
+		current_scope,
+	);
 }
 
 /// Directed call graph over MIR function `DefId`s.
@@ -714,8 +857,9 @@ pub fn run_inlining_pass(mir: &mut MIR) {
 			inline_expr(
 				&mut caller_func.block,
 				&mut caller_func.scopes,
+				&mut caller_func.locals,
 				&targets,
-				0,
+				ScopeIndex::new(0),
 			);
 
 			for &f_id in &inlined {

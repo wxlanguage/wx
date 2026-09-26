@@ -177,6 +177,49 @@ fn test_parse_simple_addition() {
 }
 
 #[test]
+fn test_exact_int_literal_coerces_to_float_end_to_end() {
+	// An integer literal that fits a float exactly is rewritten to a `Float`
+	// node in TIR; check it survives MIR/codegen and produces the right value.
+	let case = TestCase::new(indoc! {"
+        fn half_of(x: f32) -> f32 { x / 2.0 }
+        fn f() -> f32 { half_of(9) }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), f32>(&mut store, "f").unwrap();
+	assert_eq!(f.call(&mut store, ()).unwrap(), 4.5);
+}
+
+#[test]
+fn test_generic_int_literal_monomorphized_to_float_member() {
+	// `5` keeps its `Int` node through TIR under a mixed typeset bound (the body
+	// of `five` never sees a concrete type); the `f32` instantiation must turn
+	// it into a float constant in MIR/codegen.
+	let case = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        fn five<T: Num>() -> T { 5 }
+        fn as_f32() -> f32 { five() }
+        fn as_i32() -> i32 { five() }
+        export { as_f32, as_i32 }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let as_f32 = instance
+		.get_typed_func::<(), f32>(&mut store, "as_f32")
+		.unwrap();
+	let as_i32 = instance
+		.get_typed_func::<(), i32>(&mut store, "as_i32")
+		.unwrap();
+	assert_eq!(as_f32.call(&mut store, ()).unwrap(), 5.0);
+	assert_eq!(as_i32.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
 fn test_arithmetic_operations() {
 	let case = TestCase::new(indoc! {"
         fn sub(a: i32, b: i32) -> i32 { a - b }
@@ -412,7 +455,7 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         struct BumpAllocator {}
         impl Allocator for BumpAllocator {
             type Mem = heap;
-            fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+            fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
                 local ptr = (bump as u32 + layout.align() - 1) / layout.align() * layout.align();
                 local new_end = ptr + layout.size();
                 bump = new_end as heap::*u8;
@@ -421,13 +464,13 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         }
 
         fn copy4() {
-            local alloc: heap::*BumpAllocator = ptr::null_mut();
-            local arr = alloc.alloc_slice::<u32>(4);
+            local alloc: heap::*BumpAllocator = 0 as heap::*BumpAllocator;
+            local arr = alloc.allocate_slice_uninit::<u32>(4);
             arr[0] = 10;
             arr[1] = 20;
             arr[2] = 30;
             arr[3] = 40;
-            local out = alloc.alloc_slice::<u32>(4);
+            local out = alloc.allocate_slice_uninit::<u32>(4);
 
             local mut i: u32 = 0;
             loop {
@@ -1029,14 +1072,15 @@ fn test_global_init_if_expression_executes() {
 
 #[test]
 fn test_global_init_generic_null_pointer_executes() {
-	// global mut head: heap::&Node = ptr::null()
-	// null() is a generic function: null<M: Memory, T>() -> M::&T
-	// Type params must be inferred from the global's declared type.
+	// global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
+	// A generic call (`RawPtr::null`, then `as_ref`) in global-initializer
+	// position must be lowered into the start function and execute, leaving
+	// the global at address 0.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        global mut head: heap::&Node = ptr::null()
+        global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
         fn get_head() -> u32 { head as u32 }
         export { get_head }
     "});
@@ -1342,6 +1386,48 @@ fn test_trait_associated_const() {
 }
 
 #[test]
+fn test_trait_members_dispatch_through_generic_type_param() {
+	// TIR intentionally leaves both references pointing at the trait
+	// declarations while `T` is abstract. Once `T = Subject`, MIR must select
+	// the impl members instead of trying to lower the bodyless declarations.
+	let case = TestCase::new(indoc! {"
+        trait Values {
+            const VALUE: i32;
+            fn value() -> i32;
+        }
+
+        struct Subject {}
+
+        impl Values for Subject {
+            const VALUE: i32 = 41;
+            fn value() -> i32 { 42 }
+        }
+
+        fn read_const<T: Values>() -> i32 { T::VALUE }
+        fn call_function<T: Values>() -> i32 { T::value() }
+
+        fn const_value() -> i32 { read_const::<Subject>() }
+        fn function_value() -> i32 { call_function::<Subject>() }
+
+        export { const_value, function_value }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let const_value = instance
+		.get_typed_func::<(), i32>(&mut store, "const_value")
+		.unwrap();
+	let function_value = instance
+		.get_typed_func::<(), i32>(&mut store, "function_value")
+		.unwrap();
+	assert_eq!(const_value.call(&mut store, ()).unwrap(), 41);
+	assert_eq!(function_value.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
 fn test_trait_default_method() {
 	// A default method defined in the trait body calls another (abstract) method
 	// on Self.  The default body must compile with `self` having the trait type,
@@ -1428,8 +1514,8 @@ fn test_trait_method_with_own_type_param_called_through_generic_bound() {
         memory heap: Memory where { Size = u32 };
 
         fn run() {
-            local value_ptr: heap::&i32 = ptr::null();
-            local counter_ptr: heap::*Counter = ptr::null_mut();
+            local value_ptr: heap::&i32 = 0 as heap::&i32;
+            local counter_ptr: heap::*Counter = 0 as heap::*Counter;
             value_ptr.consume::<heap, Counter>(counter_ptr);
         }
 
@@ -1890,11 +1976,187 @@ fn test_nested_struct_field_access_on_local() {
 	assert_eq!(mutate.call(&mut store, ()).unwrap(), 77);
 }
 
+/// A second round of the same "aggregate field must be scalar" bug, in the
+/// places the first round did not reach: an aggregate that crosses a
+/// *control-flow join*.
+///
+/// A field is not a WASM value — a nested field is several, a zero-sized one
+/// is none — so anything that needs one slot per value has to flatten to
+/// `mir::ScalarTable` rather than walk `Aggregate::fields`. These four
+/// functions each hit a different consumer that used to get that wrong, and
+/// none of them is reachable from the by-value/pointer tests above:
+///
+/// - `across_loop` → `create_loop_params` + `patch_loop_binding`
+/// - `pick` → `merge_values`, via `merge_branches` (no loop involved)
+/// - `from_call` → `AggregateCallResult`, in the scheduler (no loop, no join)
+/// - `call_across_loop` → the intersection: a call result flattened *and*
+///   carried around a loop, which needs projections synthesized per value
+///
+/// Values are asserted, not just compilation: a wrong loop-param count still
+/// produces valid WASM, it just computes the wrong answer.
+#[test]
+fn test_nested_struct_across_control_flow_joins() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Inner { addr: u32 }
+        struct Outer { buf: Inner, len: u32 }
+
+        fn across_loop() -> u32 {
+            local o = Outer::{ buf: Inner::{ addr: 100 }, len: 3 };
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == o.len { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        fn pick(c: bool) -> u32 {
+            local o = if c {
+                Outer::{ buf: Inner::{ addr: 10 }, len: 1 }
+            } else {
+                Outer::{ buf: Inner::{ addr: 20 }, len: 2 }
+            };
+            o.buf.addr + o.len
+        }
+
+        fn make(n: u32) -> Outer {
+            Outer::{ buf: Inner::{ addr: n }, len: 1 }
+        }
+
+        fn from_call() -> u32 {
+            local o = make(100);
+            o.buf.addr + o.len
+        }
+
+        fn call_across_loop() -> u32 {
+            local o = make(7);
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == 3 { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        export { heap, across_loop, pick, from_call, call_across_loop }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	let across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "across_loop")
+		.unwrap();
+	assert_eq!(across_loop.call(&mut store, ()).unwrap(), 300);
+
+	let pick = instance
+		.get_typed_func::<i32, u32>(&mut store, "pick")
+		.unwrap();
+	assert_eq!(pick.call(&mut store, 1).unwrap(), 11);
+	assert_eq!(pick.call(&mut store, 0).unwrap(), 22);
+
+	let from_call = instance
+		.get_typed_func::<(), u32>(&mut store, "from_call")
+		.unwrap();
+	assert_eq!(from_call.call(&mut store, ()).unwrap(), 101);
+
+	let call_across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "call_across_loop")
+		.unwrap();
+	assert_eq!(call_across_loop.call(&mut store, ()).unwrap(), 21);
+}
+
+/// Depth 3, mutated across a loop. Distinct from the depth-2 cases above:
+/// a non-recursive "handle one more level" patch passes at depth 2 and fails
+/// here, and alignment sorting puts the nested field *ahead* of its `u8`
+/// siblings at every level, so a scalar-order mistake corrupts the siblings
+/// rather than the value being read.
+#[test]
+fn test_deeply_nested_struct_carried_across_loop() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        fn sum_across_loop() -> u64 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            local mut sum: u64 = 0;
+            loop {
+                if i == 3 { break };
+                sum += t.mid.deep.id;
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            }
+            sum
+        }
+
+        fn siblings_survive() -> u32 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            loop {
+                if i == 3 { break };
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            };
+            (t.flag as u32) * 10 + (t.mid.tag as u32)
+        }
+
+        export { heap, sum_across_loop, siblings_survive }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	// 77 + 78 + 79
+	let sum = instance
+		.get_typed_func::<(), u64>(&mut store, "sum_across_loop")
+		.unwrap();
+	assert_eq!(sum.call(&mut store, ()).unwrap(), 234);
+
+	// `flag` and `mid.tag` are reordered *after* the nested field they are
+	// declared before, so they are where a scalar-order slip shows up.
+	let siblings = instance
+		.get_typed_func::<(), u32>(&mut store, "siblings_survive")
+		.unwrap();
+	assert_eq!(siblings.call(&mut store, ()).unwrap(), 12);
+}
+
 /// The pointer-store/load side of the same bug: a nested literal written
-/// through a pointer in one statement, read back through a pointer, and a
-/// leaf field mutated in place through a pointer-field chain — all at three
-/// levels of nesting, with an inner struct that has more than one field
-/// (the shape that used to corrupt the store sequence).
+/// through a pointer in one statement, read back through a pointer, and an
+/// innermost scalar field mutated in place through a pointer-field chain —
+/// all at three levels of nesting, with an inner struct that has more than
+/// one field (the shape that used to corrupt the store sequence).
 #[test]
 fn test_nested_struct_pointer_store_and_load() {
 	let case = TestCase::new(indoc! {"
@@ -2782,17 +3044,18 @@ fn test_global_initialized_to_data_end() {
 
 #[test]
 fn test_null_pointer_comparison() {
-	// null<M, T>() returns a zero pointer. Verify that:
-	//  1. null() compares equal to another null() (the `node.next == ptr::null()` pattern)
-	//  2. a non-zero pointer does NOT compare equal to null()
+	// `RawPtr::null()` has address 0. Verify that:
+	//  1. `RawPtr::from_ref(p).is_null()` is true for a null-address pointer
+	//     (the `node.next == ptr::null()` pattern, rephrased onto `RawPtr`)
+	//  2. it is false for a non-zero pointer
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
         struct Node { value: i32, next: &Node }
 
-        fn make_null() -> &Node { ptr::null() }
-        fn is_null_ptr(p: &Node) -> bool { p == ptr::null() }
+        fn make_null() -> &Node { RawPtr::<heap, Node>::null().as_ref() }
+        fn is_null_ptr(p: &Node) -> bool { RawPtr::from_ref(p).is_null() }
         fn ptr_from_addr() -> *Node { 4 as heap::*Node }
 
         export { heap, make_null, is_null_ptr, ptr_from_addr }
@@ -4188,4 +4451,423 @@ fn test_f64_abs_floor_min_max_wasmtime() {
 	assert_eq!(f_copysign.call(&mut store, (3.0, -1.0)).unwrap(), -3.0);
 	assert_eq!(f_copysign.call(&mut store, (-3.0, 1.0)).unwrap(), 3.0);
 	assert_eq!(f_copysign.call(&mut store, (3.0, 1.0)).unwrap(), 3.0);
+}
+
+/// A trait default method must dispatch to an impl's *override* of another
+/// trait method, not silently keep calling the trait's own default body.
+/// Regression for two manifestations of the same MIR bug (`GenericMethodCall`
+/// lowering keyed dispatch off `tir_func.body.is_some()` alone, so a
+/// defaulted-and-overridden method resolved to the default):
+///
+///   * `via_default_body_*` — `doubled`'s default body calls `self.base()`;
+///     `Over` overrides `base`. Plain (non-generic) method call. The bug
+///     returned `2` for `Over` instead of `200`.
+///   * `via_generic_*` — the overridden method reached through a generic
+///     bound (`fn dispatch<T: Scalable>`). The bug returned `1` for `Over`
+///     instead of `100`.
+///
+/// The `Inh` cases (impl inherits the default) pin the other side: the fix
+/// must not break dispatch when there is genuinely no override.
+#[test]
+fn test_trait_default_method_dispatches_to_impl_override() {
+	let case = TestCase::new(indoc! {"
+        trait Scalable {
+            fn base(self) -> i32 { 1 }
+            fn doubled(self) -> i32 { self.base() * 2 }
+        }
+
+        struct Over {}
+        struct Inh {}
+
+        impl Scalable for Over { fn base(self) -> i32 { 100 } }
+        impl Scalable for Inh {}
+
+        fn dispatch<T: Scalable>(t: T) -> i32 { t.base() }
+
+        fn via_default_body_over() -> i32 { local o = Over::{}; o.doubled() }
+        fn via_default_body_inh() -> i32 { local i = Inh::{}; i.doubled() }
+        fn via_generic_over() -> i32 { dispatch(Over::{}) }
+        fn via_generic_inh() -> i32 { dispatch(Inh::{}) }
+
+        export {
+            via_default_body_over,
+            via_default_body_inh,
+            via_generic_over,
+            via_generic_inh,
+        }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let get = |store: &mut wasmtime::Store<()>, name: &str| {
+		instance
+			.get_typed_func::<(), i32>(store, name)
+			.unwrap_or_else(|_| panic!("`{name}` should be exported"))
+	};
+
+	let f = get(&mut store, "via_default_body_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		200,
+		"default `doubled` must call `Over`'s override of `base` (100 * 2)"
+	);
+
+	let f = get(&mut store, "via_default_body_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		2,
+		"default `doubled` on `Inh` uses the default `base` (1 * 2)"
+	);
+
+	let f = get(&mut store, "via_generic_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		100,
+		"`dispatch::<Over>` must call `Over`'s override of `base`"
+	);
+
+	let f = get(&mut store, "via_generic_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		1,
+		"`dispatch::<Inh>` uses the default `base`"
+	);
+}
+
+// ── loop-break divergence union
+// ────────────────────────────────────────────
+//
+// `patch_loop_binding` (opt/builder.rs) decides whether a loop-carried
+// binding needs a real WASM output local by comparing the *fallthrough*
+// path's final value against the value on the way in. A `break`/`continue`
+// nested inside a diverging branch can commit a genuinely different value at
+// its own point, independently of what the fallthrough later does — if the
+// fallthrough happens to leave the binding looking unchanged (or never
+// touches it at all), the early exit's already-recorded commit ends up
+// referencing a local that was never allocated. `LoopData::divergent_params`
+// unions in what every break/continue already found, closing that gap.
+
+#[test]
+fn test_break_inside_diverging_if_commits_mutation() {
+	// `x` is reset to `0` on every normal (non-break) iteration — literally
+	// the same interned node as `x`'s pre-loop value — so the fallthrough
+	// path alone looks like `x` is never mutated. But the `break`, nested in
+	// the `if` with no `else`, sets `x = 5` immediately before firing; that
+	// commit must still survive to the local `x` reads after the loop.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                x = 5;
+                if i > 3 {
+                    break;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_continue_inside_diverging_if_commits_mutation() {
+	// Same gap as `test_break_inside_diverging_if_commits_mutation`, but
+	// through `continue` instead of `break` — `loop_param_updates` is the
+	// single choke point both call through, so this confirms the fix covers
+	// both, not just `Break`. At `i == 2`, `x = 5` is committed and the loop
+	// restarts via `continue` *without* the `x = 0` reset that every other
+	// iteration takes; the very next iteration then breaks immediately (at
+	// `i == 3`), before `x` is ever reassigned again — so the continue's own
+	// commit must be exactly what's left when the loop exits.
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                if i > 2 {
+                    break;
+                }
+                x = 5;
+                if i == 2 {
+                    i = i + 1;
+                    continue;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+// ── labeled-block `break` (opt::ControlNode::BlockJoin) ─────────────────────
+//
+// A plain `{}` block used to have zero representation in the opt IR —
+// `Builder::build_block_expr` never registered a real `Block`/`ControlNode`
+// for one, so a `break` targeting a labeled plain block (allowed by TIR, no
+// restriction to loop-kind scopes) panicked in `opt`. The compiler's own
+// inliner hits the identical shape internally (an inlined callee's `return`s
+// get rewritten to `break`s targeting a wrapper `BlockKind::Block` scope),
+// fixed by the same change with no inliner-side code touched at all.
+
+#[test]
+fn test_break_out_of_labeled_block_with_value() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local x: i32 = outer: {
+                break :outer 5;
+            };
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_clamp_shaped_multi_break_plus_fallthrough() {
+	// Three distinct value-contributing exits into the same join: two
+	// `break`s with different values, plus a differing fallthrough —
+	// exercises the `break_result_outputs` phi merge across all three.
+	let case = TestCase::new(indoc! {"
+        fn clamp(x: i32) -> i32 {
+            outer: {
+                if x < 0 {
+                    break :outer 0;
+                }
+                if x > 100 {
+                    break :outer 100;
+                }
+                x
+            }
+        }
+
+        export { clamp }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let clamp = instance
+		.get_typed_func::<i32, i32>(&mut store, "clamp")
+		.unwrap();
+
+	assert_eq!(clamp.call(&mut store, -5).unwrap(), 0);
+	assert_eq!(clamp.call(&mut store, 50).unwrap(), 50);
+	assert_eq!(clamp.call(&mut store, 200).unwrap(), 100);
+}
+
+#[test]
+fn test_outer_local_mutation_across_divergent_block_exits() {
+	// Exercises `outputs`/`JoinParam` for an ordinary mutable local — not
+	// the block's own return value — on both the break-taken and
+	// break-not-taken paths.
+	let case = TestCase::new(indoc! {"
+        fn f(take_break: bool) -> i32 {
+            local mut x: i32 = 1;
+            outer: {
+                if take_break {
+                    break :outer;
+                }
+                x = 2;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 1);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 2);
+}
+
+#[test]
+fn test_break_nested_several_levels_deep_inside_labeled_block() {
+	// The break-target is a labeled block wrapping a loop; the actual
+	// `break :outer` fires from inside a further nested `if` within that
+	// loop's body — confirms the eager-placeholder mechanism (JoinParam
+	// minted before the body is built) works regardless of nesting depth.
+	let case = TestCase::new(indoc! {"
+        fn f(n: i32) -> i32 {
+            outer: {
+                local mut i: i32 = 0;
+                loop {
+                    if i >= n {
+                        break;
+                    }
+                    if i == 3 {
+                        break :outer i * 10;
+                    }
+                    i = i + 1;
+                };
+                -1
+            }
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	// Loop exits normally (i never reaches 3 before hitting n) — falls
+	// through to the block's own trailing -1.
+	assert_eq!(f.call(&mut store, 3).unwrap(), -1);
+	// i reaches 3 before n — breaks the labeled block from inside the
+	// nested loop's inner if.
+	assert_eq!(f.call(&mut store, 10).unwrap(), 30);
+}
+
+#[test]
+fn test_break_out_of_labeled_block_with_struct_value() {
+	// Exercises the aggregate-decomposition path in both
+	// create_join_params/finalize_block_join_binding (bindings) and
+	// merge_values (the result phi).
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        fn f(take_break: bool) -> i32 {
+            local p: Point = outer: {
+                if take_break {
+                    break :outer Point::{ x: 1, y: 2 };
+                }
+                Point::{ x: 3, y: 4 }
+            };
+            p.x + p.y
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 3);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 7);
+}
+
+#[test]
+fn test_inline_function_with_early_return_executes_correctly() {
+	// End-to-end confirmation that both originally-reported crashes (a
+	// standalone labeled block, and the compiler's own inliner producing
+	// the identical `Break`-into-`BlockKind::Block` shape internally) are
+	// fixed by the same opt-level change, with zero changes to
+	// `mir::inlining`. See `mir::tests::
+	// test_inline_function_with_early_return_produces_break_into_block` for
+	// the MIR-level confirmation of the shape this exercises.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        fn classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub fn main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let main = instance
+		.get_typed_func::<i32, i32>(&mut store, "main")
+		.unwrap();
+
+	// Early return taken (the branch containing the rewritten Break).
+	assert_eq!(main.call(&mut store, -5).unwrap(), -1);
+	// Fallthrough (no Break taken).
+	assert_eq!(main.call(&mut store, 5).unwrap(), 1);
+}
+
+/// Locals declared inside two sibling branches (not just the outer scope)
+/// get distinct flat indices under the flattened MIR locals model — no
+/// existing MIR snapshot exercises a non-root scope with its own locals, so
+/// this checks the offsets are actually computed correctly, not just that
+/// the outer-visible `outer` binding survives the merge.
+#[test]
+fn test_locals_declared_inside_sibling_branches_get_distinct_slots() {
+	let case = TestCase::new(indoc! {"
+        fn f(x: i32) -> i32 {
+            local mut outer: i32 = 100;
+            if x > 0 {
+                local a: i32 = 1;
+                local b: i32 = 2;
+                outer = outer + a + b;
+            } else {
+                local c: i32 = 10;
+                outer = outer + c;
+            }
+            outer
+        }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+	assert_eq!(f.call(&mut store, 5).unwrap(), 103);
+	assert_eq!(f.call(&mut store, -5).unwrap(), 110);
 }

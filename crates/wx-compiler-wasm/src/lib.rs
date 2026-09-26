@@ -117,8 +117,8 @@ pub fn compile(
 	}
 
 	let mir =
-		mir::MIR::build(&hir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner)
+		mir::MIR::build(&hir, &compilation.strings, compilation.id_generator);
+	let module = codegen::Builder::build(&mir, &compilation.strings)
 		.map_err(|_| "codegen failed".to_string())?;
 	let bytecode = module.encode();
 

@@ -626,19 +626,26 @@ impl<'ast> Builder<'ast, '_> {
 		match &expr.inner {
 			ast::Expression::QualifiedPath { root, segments } => self
 				.build_qualified_path_expression(
-					func_ctx, root, segments, expr.span,
+					func_ctx, access_ctx, root, segments, expr.span,
 				),
 			ast::Expression::Grouped { inner, segments } => self
 				.build_grouped_path_expression(
-					func_ctx, inner, segments, expr.span,
+					func_ctx, access_ctx, inner, segments, expr.span,
 				),
 			ast::Expression::Int { value } => Ok(Expression {
 				kind: ExprKind::Int { value: *value },
 				ty: TypeIndex::INTEGER,
 				span: expr.span,
 			}),
-			ast::Expression::Float { value } => Ok(Expression {
-				kind: ExprKind::Float { value: *value },
+			ast::Expression::Float => Ok(Expression {
+				// Sentinel. The literal is parsed from its span against the
+				// resolved target type in `coerce_untyped_float_expr` — the
+				// sole parse site, which re-parses directly to f32 for an f32
+				// target to avoid a double round. An uncoerced float literal is
+				// already a "type annotation required" error, and a literal's
+				// `ty` only becomes concrete through that coercion, so this
+				// `0.0` is never observed as a value.
+				kind: ExprKind::Float { value: 0.0 },
 				ty: TypeIndex::FLOAT,
 				span: expr.span,
 			}),
@@ -951,7 +958,9 @@ impl<'ast> Builder<'ast, '_> {
 				}),
 				right: Box::new(value),
 			},
-			ast::Pattern::Tuple { .. } | ast::Pattern::Struct { .. } => {
+			ast::Pattern::Tuple { .. }
+			| ast::Pattern::Struct { .. }
+			| ast::Pattern::TupleStruct { .. } => {
 				let mut bindings = Vec::new();
 				let mut path = Vec::new();
 				self.collect_pattern_bindings(

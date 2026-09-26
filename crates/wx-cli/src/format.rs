@@ -63,7 +63,7 @@ pub fn expand_project(
 
 	Ok(FormatSelection {
 		files: builder.files,
-		interner: builder.interner,
+		interner: builder.strings,
 		modules,
 		config,
 	})
