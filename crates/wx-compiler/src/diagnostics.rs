@@ -151,7 +151,7 @@ define_diagnostic_codes! {
 		MissingFunctionBody => "E2028",
 		InvalidMemoryKind => "E2029",
 		NamespaceUsedAsValue => "E2030",
-		ExpectedTraitBound => "E2031",
+		NotATraitBound => "E2031",
 		RecursiveTypeWithoutIndirection => "E2032",
 		IncompleteTraitImpl => "E2033",
 		UnsatisfiedTraitBound => "E2034",
@@ -211,7 +211,7 @@ define_diagnostic_codes! {
 		TupleStructBracePattern => "E2088",
 		RecordStructPositionalPattern => "E2089",
 		PrivateTupleField => "E2090",
-		NamespaceUsedAsType => "E2091",
+		NotAType => "E2091",
 		DuplicateGenericParam => "E2092",
 		UnresolvedImport => "E2093",
 		CyclicImport => "E2094",
@@ -220,6 +220,8 @@ define_diagnostic_codes! {
 		DuplicateFunctionParameter => "E2097",
 		SelfParamPosition => "E2098",
 		MissingParameterType => "E2099",
+		MissingGlobalType => "E2100",
+		NotAMemory => "E2101",
 	}
 }
 

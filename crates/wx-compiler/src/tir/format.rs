@@ -170,6 +170,11 @@ impl TypeFormatter<'_> {
 					self.defs.memories[usize::from(*memory_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
+			Type::Global { global_index } => {
+				let symbol =
+					self.defs.globals[usize::from(*global_index)].name.inner;
+				f.push_str(self.strings.resolve(symbol).unwrap());
+			}
 			Type::Pointer {
 				to,
 				memory,
@@ -238,13 +243,17 @@ impl TypeFormatter<'_> {
 			}
 			Type::AssociatedType {
 				trait_index,
-				assoc_name,
+				assoc_type_index,
 			} => {
 				let symbol =
 					self.defs.traits[usize::from(*trait_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str("::");
-				f.push_str(self.strings.resolve(*assoc_name).unwrap());
+				let assoc_symbol = self.defs.assoc_types
+					[usize::from(*assoc_type_index)]
+				.name
+				.inner;
+				f.push_str(self.strings.resolve(assoc_symbol).unwrap());
 			}
 			// Always qualified (`<Base as Trait>::name`), never the shorter
 			// `base::name` a formatter with ambiguity detection could use
@@ -254,7 +263,7 @@ impl TypeFormatter<'_> {
 			// it isn't built. Always-qualified is longer but never wrong.
 			Type::AssocTypeProjection {
 				trait_index,
-				assoc_name,
+				assoc_type_index,
 				base,
 			} => {
 				f.push('<');
@@ -264,7 +273,11 @@ impl TypeFormatter<'_> {
 					self.defs.traits[usize::from(*trait_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str(">::");
-				f.push_str(self.strings.resolve(*assoc_name).unwrap());
+				let assoc_symbol = self.defs.assoc_types
+					[usize::from(*assoc_type_index)]
+				.name
+				.inner;
+				f.push_str(self.strings.resolve(assoc_symbol).unwrap());
 			}
 		}
 	}
@@ -300,7 +313,8 @@ mod tests {
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::tir::defs::{
-		BindingKey, BindingNamespace, BindingTarget, DefKind, FunctionIdx,
+		AssocTypeIdx, BindingKey, BindingNamespace, BindingTarget, DefKind,
+		FunctionIdx, MemberKind, TraitIdx,
 	};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
@@ -456,6 +470,35 @@ mod tests {
 			&self.param_bounds[usize::from(env)][index].declared_bounds
 		}
 
+		/// `name` is looked up directly against the trait's own member
+		/// bindings, same reasoning as `signatures::tests::TestCase`'s own
+		/// `assoc_type_signature` — `Trait::Assoc` isn't a resolvable path
+		/// yet.
+		fn assoc_type_index(
+			&self,
+			trait_index: TraitIdx,
+			name: &str,
+		) -> AssocTypeIdx {
+			let symbol = self
+				.graph
+				.strings
+				.get(name)
+				.expect("already interned from source");
+			let trait_def = &self.defs.traits[usize::from(trait_index)];
+			let &member_index = trait_def
+				.bindings
+				.get(&BindingKey::ty(symbol))
+				.unwrap_or_else(|| {
+					panic!("expected the trait to have an associated type `{name}`")
+				});
+			let MemberKind::AssociatedType(index) =
+				trait_def.members[usize::from(member_index)].kind
+			else {
+				panic!("expected `{name}` to be an associated type");
+			};
+			index
+		}
+
 		fn bound_formatter(&self) -> BoundFormatter<'_> {
 			BoundFormatter {
 				type_formatter: self.type_formatter(),
@@ -517,14 +560,14 @@ mod tests {
 		else {
 			panic!("expected Iterable to be a trait");
 		};
-		let assoc_name = case.graph.strings.get("Item").unwrap();
+		let assoc_type_index = case.assoc_type_index(trait_index, "Item");
 		let associated = case.types.intern(Type::AssociatedType {
 			trait_index,
-			assoc_name,
+			assoc_type_index,
 		});
 		let projection = case.types.intern(Type::AssocTypeProjection {
 			trait_index,
-			assoc_name,
+			assoc_type_index,
 			base: param,
 		});
 		let function = case.types.intern(Type::FunctionItem {

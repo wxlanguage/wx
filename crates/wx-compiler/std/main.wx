@@ -172,7 +172,7 @@ impl Ordering {
         match self {
             Ordering::Less -> { Ordering::Greater },
             Ordering::Equal -> { Ordering::Equal },
-            Ordering::Greater -> { Ordering::Less },
+            Ordering::Greater -> { Ordering::Less }
         }
     }
 
@@ -180,7 +180,7 @@ impl Ordering {
     pub fn then(self, other: Ordering) -> Ordering {
         match self {
             Ordering::Equal -> { other },
-            _ -> { self },
+            _ -> { self }
         }
     }
 }
@@ -2135,6 +2135,26 @@ pub fn memory_copy<
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
 pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
+
+#[intrinsic]
+fn global_get<G: Global>(g: G) -> G::Value;
+
+#[intrinsic]
+fn global_set<G: Global>(g: G, value: G::Value);
+
+pub trait Global {
+    type Value;
+
+    fn get(self) -> Self::Value {
+        global_get(self)
+    }
+}
+
+pub trait GlobalMut: Global {
+    fn set(self, value: Self::Value) {
+        global_set(self, value)
+    }
+}
 
 pub trait Memory {
     type Size: PointerSize;

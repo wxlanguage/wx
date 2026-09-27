@@ -45,6 +45,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	typesets: Vec<TypeSetDef>,
 	functions: Vec<FunctionDef>,
 	memories: Vec<MemoryDef>,
+	globals: Vec<GlobalDef>,
 	constants: Vec<ConstDef>,
 	assoc_types: Vec<AssocTypeDef>,
 	use_items: Vec<UseItemDef>,
@@ -276,14 +277,51 @@ pub struct FunctionDef {
 	pub params: Box<[Spanned<SymbolU32>]>,
 }
 
-/// Identity shared by local and imported memories. Size and bound
-/// expressions remain in the AST for later resolution.
+/// Identity shared by local and imported memories. The written size
+/// expression remains in the AST for later resolution.
+///
+/// `trait_impl_index`/`size_assoc_type_index` are this memory's synthetic
+/// `impl Memory for <memory>` — pre-allocated unconditionally, here, same
+/// `def_id`-reuse reasoning as `TypeSetDef`'s own synthetic impls (see that
+/// struct's doc comment): nothing ever forces these through their own
+/// `ensure_signature` query, they're populated directly as a side effect of
+/// resolving this memory's own signature. Allocating the slot never depends
+/// on `IntrinsicDefs::memory` — it's just an index and a name, no reference
+/// to the `Memory` trait itself. That trait is only needed later, to bucket
+/// this impl for dispatch (`impls.rs`); if std never declared one, that's
+/// where it's diagnosed as the broken-stdlib error it is, not something
+/// every reader of this struct has to keep re-checking for.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemoryDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIdx,
 	pub name: Spanned<SymbolU32>,
+	pub trait_impl_index: TraitImplIdx,
+	pub size_assoc_type_index: AssocTypeIdx,
+}
+
+/// Identity shared by local and imported globals. The written value type
+/// remains in the AST for later resolution (and may be entirely absent —
+/// `global x = 0;` infers it from the value, which needs the body phase
+/// this architecture doesn't have yet).
+///
+/// `trait_impl_index`/`value_assoc_type_index` are this global's synthetic
+/// `impl Global for <global>`, unconditionally pre-allocated for the same
+/// reason as `MemoryDef`'s own fields. `mut_trait_impl_index` is the
+/// additional `impl GlobalMut for <global>` a `global mut` declaration also
+/// gets (`GlobalMut` declares no members of its own — an empty impl is
+/// enough to make it a dispatch candidate) — genuinely absent for a
+/// non-`mut` global, unlike the other two fields.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct GlobalDef {
+	pub def_id: DefId,
+	pub file_id: FileId,
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+	pub trait_impl_index: TraitImplIdx,
+	pub value_assoc_type_index: AssocTypeIdx,
+	pub mut_trait_impl_index: Option<TraitImplIdx>,
 }
 
 /// Identity of a free, trait, or impl constant. Its type and value are
@@ -321,6 +359,7 @@ index_newtype!(TypesetIdx);
 index_newtype!(TypeAliasIdx);
 index_newtype!(FunctionIdx);
 index_newtype!(MemoryIdx);
+index_newtype!(GlobalIdx);
 index_newtype!(ConstIdx);
 index_newtype!(AssocTypeIdx);
 
@@ -370,7 +409,7 @@ pub(super) struct AstEntry<'ast> {
 	pub(super) node: AstNodeRef<'ast>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) enum AstNodeRef<'ast> {
@@ -391,6 +430,7 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 	},
 	Global {
+		global_index: GlobalIdx,
 		item: &'ast ast::Item,
 	},
 	Memory {
@@ -470,6 +510,7 @@ pub(super) enum AstNodeRef<'ast> {
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedGlobal {
+		global_index: GlobalIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	Export {
@@ -495,6 +536,7 @@ pub(super) struct DefinitionRegistry {
 	pub typesets: Vec<TypeSetDef>,
 	pub functions: Vec<FunctionDef>,
 	pub memories: Vec<MemoryDef>,
+	pub globals: Vec<GlobalDef>,
 	pub constants: Vec<ConstDef>,
 	pub assoc_types: Vec<AssocTypeDef>,
 	pub type_aliases: Vec<TypeAliasDef>,
@@ -552,6 +594,9 @@ pub struct IntrinsicDefs {
 	pub not: Option<TraitIdx>,
 	pub partial_eq: Option<TraitIdx>,
 	pub partial_ord: Option<TraitIdx>,
+	pub memory: Option<TraitIdx>,
+	pub global: Option<TraitIdx>,
+	pub global_mut: Option<TraitIdx>,
 }
 
 impl IntrinsicDefs {
@@ -598,6 +643,9 @@ impl IntrinsicDefs {
 			"Not" => &mut self.not,
 			"PartialEq" => &mut self.partial_eq,
 			"PartialOrd" => &mut self.partial_ord,
+			"Memory" => &mut self.memory,
+			"Global" => &mut self.global,
+			"GlobalMut" => &mut self.global_mut,
 			_ => return None,
 		})
 	}
@@ -645,7 +693,7 @@ pub enum DefKind {
 	Memory(MemoryIdx),
 	Trait(TraitIdx),
 	TypeSet(TypesetIdx),
-	Global(DefId),
+	Global(GlobalIdx),
 	Function(FunctionIdx),
 	Const(ConstIdx),
 	TraitAssocType(AssocTypeIdx),
@@ -1627,6 +1675,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			typesets: Vec::new(),
 			functions: Vec::new(),
 			memories: Vec::new(),
+			globals: Vec::new(),
 			constants: Vec::new(),
 			assoc_types: Vec::new(),
 			use_items: Vec::new(),
@@ -1681,6 +1730,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			typesets: builder.typesets,
 			functions: builder.functions,
 			memories: builder.memories,
+			globals: builder.globals,
 			constants: builder.constants,
 			assoc_types: builder.assoc_types,
 			use_items: builder.use_items,
@@ -1783,6 +1833,97 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			TraitImplIdx::new(u32::try_from(self.trait_impls.len()).unwrap());
 		self.trait_impls.push(item);
 		index
+	}
+
+	/// Pre-allocates a memory declaration's synthetic `impl Memory for
+	/// <memory>` — see `MemoryDef`'s own doc comment for why this never
+	/// needs `IntrinsicDefs::memory` to already be resolved.
+	fn synthesize_memory_impl(
+		&mut self,
+		def_id: DefId,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		name_span: TextSpan,
+	) -> (TraitImplIdx, AssocTypeIdx) {
+		let size_symbol = self.strings.get_or_intern("Size");
+		let size_assoc_type_index =
+			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
+		self.assoc_types.push(AssocTypeDef {
+			def_id,
+			file_id,
+			namespace,
+			name: Spanned {
+				inner: size_symbol,
+				span: name_span,
+			},
+		});
+		let trait_impl_index = self.push_trait_impl(TraitImplDef {
+			def_id,
+			file_id,
+			namespace,
+			members: vec![TraitMemberDef {
+				kind: MemberKind::AssociatedType(size_assoc_type_index),
+				accesses: Vec::new(),
+				span: name_span,
+			}],
+			bindings: HashMap::from([(
+				BindingKey::ty(size_symbol),
+				MemberIdx::new(0),
+			)]),
+		});
+		(trait_impl_index, size_assoc_type_index)
+	}
+
+	/// Pre-allocates a global declaration's synthetic `impl Global for
+	/// <global>` and, if `mutable`, the additional `impl GlobalMut for
+	/// <global>` — see `GlobalDef`'s own doc comment.
+	fn synthesize_global_impl(
+		&mut self,
+		def_id: DefId,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		name_span: TextSpan,
+		mutable: bool,
+	) -> (TraitImplIdx, AssocTypeIdx, Option<TraitImplIdx>) {
+		let value_symbol = self.strings.get_or_intern("Value");
+		let value_assoc_type_index =
+			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
+		self.assoc_types.push(AssocTypeDef {
+			def_id,
+			file_id,
+			namespace,
+			name: Spanned {
+				inner: value_symbol,
+				span: name_span,
+			},
+		});
+		let trait_impl_index = self.push_trait_impl(TraitImplDef {
+			def_id,
+			file_id,
+			namespace,
+			members: vec![TraitMemberDef {
+				kind: MemberKind::AssociatedType(value_assoc_type_index),
+				accesses: Vec::new(),
+				span: name_span,
+			}],
+			bindings: HashMap::from([(
+				BindingKey::ty(value_symbol),
+				MemberIdx::new(0),
+			)]),
+		});
+		// `GlobalMut` declares no members of its own (`fn set` has a
+		// default body reusing `Global::Value`) — an empty impl is enough
+		// to make it a dispatch candidate.
+		let mut_trait_impl_index = mutable.then(|| {
+			self.push_trait_impl(TraitImplDef {
+				def_id,
+				file_id,
+				namespace,
+				members: Vec::new(),
+				bindings: HashMap::new(),
+			})
+		});
+		(trait_impl_index, value_assoc_type_index, mut_trait_impl_index)
 	}
 
 	#[inline]
@@ -2042,11 +2183,37 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Global {
-				id, pub_span, name, ..
+				id,
+				pub_span,
+				mut_span,
+				name,
+				..
 			} => {
+				let global_index =
+					GlobalIdx::new(u32::try_from(self.globals.len()).unwrap());
+				let (
+					trait_impl_index,
+					value_assoc_type_index,
+					mut_trait_impl_index,
+				) = self.synthesize_global_impl(
+					*id,
+					file_id,
+					namespace,
+					name.span,
+					mut_span.is_some(),
+				);
+				self.globals.push(GlobalDef {
+					def_id: *id,
+					file_id,
+					namespace,
+					name: *name,
+					trait_impl_index,
+					value_assoc_type_index,
+					mut_trait_impl_index,
+				});
 				let def_key = self.push_def(
 					namespace,
-					ItemDef::new(DefKind::Global(*id), name.span),
+					ItemDef::new(DefKind::Global(global_index), name.span),
 				);
 				self.insert_binding(
 					namespace,
@@ -2058,7 +2225,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::Global { item },
+					node: AstNodeRef::Global { global_index, item },
 				});
 			}
 			ast::Item::RecordStruct {
@@ -2300,11 +2467,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			ast::Item::Memory { id, name, .. } => {
 				let memory_index =
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
+				let (trait_impl_index, size_assoc_type_index) = self
+					.synthesize_memory_impl(*id, file_id, namespace, name.span);
 				self.memories.push(MemoryDef {
 					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
+					trait_impl_index,
+					size_assoc_type_index,
 				});
 				let def_key = self.push_def(
 					namespace,
@@ -2774,11 +2945,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							let memory_index = MemoryIdx::new(
 								u32::try_from(self.memories.len()).unwrap(),
 							);
+							let (trait_impl_index, size_assoc_type_index) =
+								self.synthesize_memory_impl(
+									*id,
+									file_id,
+									own_namespace_idx,
+									name.span,
+								);
 							self.memories.push(MemoryDef {
 								def_id: *id,
 								file_id,
 								namespace: own_namespace_idx,
 								name: *name,
+								trait_impl_index,
+								size_assoc_type_index,
 							});
 							let def_key = self.push_def(
 								own_namespace_idx,
@@ -2854,10 +3034,41 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								},
 							});
 						}
-						ast::ImportDeclaration::Global { id, name, .. } => {
+						ast::ImportDeclaration::Global {
+							id,
+							mut_span,
+							name,
+							..
+						} => {
+							let global_index = GlobalIdx::new(
+								u32::try_from(self.globals.len()).unwrap(),
+							);
+							let (
+								trait_impl_index,
+								value_assoc_type_index,
+								mut_trait_impl_index,
+							) = self.synthesize_global_impl(
+								*id,
+								file_id,
+								own_namespace_idx,
+								name.span,
+								mut_span.is_some(),
+							);
+							self.globals.push(GlobalDef {
+								def_id: *id,
+								file_id,
+								namespace: own_namespace_idx,
+								name: *name,
+								trait_impl_index,
+								value_assoc_type_index,
+								mut_trait_impl_index,
+							});
 							let def_key = self.push_def(
 								own_namespace_idx,
-								ItemDef::new(DefKind::Global(*id), name.span),
+								ItemDef::new(
+									DefKind::Global(global_index),
+									name.span,
+								),
 							);
 							self.insert_binding(
 								own_namespace_idx,
@@ -2873,6 +3084,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								namespace: own_namespace_idx,
 								node: AstNodeRef::ImportedGlobal {
+									global_index,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -3192,13 +3404,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			if param.name.inner == Keyword::SelfLower.symbol() {
 				self.diagnostics
 					.push(report_self_param_position(file_id, param.name.span));
-			} else if param.ty.is_none() {
-				// TODO: report missing types during signature resolution.
-				self.diagnostics.push(report_missing_parameter_type(
-					self.strings,
-					file_id,
-					param.name,
-				));
 			}
 			names.push(param.name);
 		}
@@ -3206,13 +3411,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	}
 
 	/// Validates a trait/impl function's parameter list: every name unique,
-	/// `self` (if present) only as the very first parameter, every other
-	/// parameter explicitly typed. Whether `self` is actually present —
-	/// i.e. whether this member is `MemberKind::Method` or
-	/// `MemberKind::Function` — is for the caller to read straight off
-	/// `params.first()` against `Keyword::SelfLower.symbol()`, same
-	/// constant-time check this uses; nothing here needs to hand that
-	/// fact back out.
+	/// `self` (if present) only as the very first parameter. Whether `self`
+	/// is actually present — i.e. whether this member is
+	/// `MemberKind::Method` or `MemberKind::Function` — is for the caller
+	/// to read straight off `params.first()` against
+	/// `Keyword::SelfLower.symbol()`, same constant-time check this uses;
+	/// nothing here needs to hand that fact back out. Whether every other
+	/// parameter is explicitly typed is a signature-phase concern
+	/// (`MissingParameterType`), not this prescan's.
 	fn scan_impl_function_params(
 		&mut self,
 		file_id: FileId,
@@ -3234,17 +3440,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 
 			let is_self = name.inner == Keyword::SelfLower.symbol();
-			if is_self {
-				if index != 0 {
-					self.diagnostics
-						.push(report_self_param_position(file_id, name.span));
-				}
-			} else if p.ty.is_none() {
-				self.diagnostics.push(report_missing_parameter_type(
-					self.strings,
-					file_id,
-					name,
-				));
+			if is_self && index != 0 {
+				self.diagnostics
+					.push(report_self_param_position(file_id, name.span));
 			}
 
 			names.push(name);
@@ -3311,24 +3509,6 @@ fn report_self_param_position(
 			"`self` parameter is only allowed as the first parameter of an associated function",
 		)
 		.with_label(SourceSpan::new(file_id, span).primary_label())
-}
-
-fn report_missing_parameter_type(
-	strings: &StringInterner,
-	file_id: FileId,
-	name: Spanned<SymbolU32>,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::MissingParameterType.code())
-		.with_message(format!(
-			"parameter `{name_str}` requires an explicit type"
-		))
-		.with_label(
-			SourceSpan::new(file_id, name.span)
-				.primary_label()
-				.with_message("expected `: Type` here"),
-		)
 }
 
 #[cfg(test)]
@@ -3751,9 +3931,9 @@ mod tests {
 	#[test]
 	fn memory_identity_is_registered_without_resolving_bounds() {
 		let mut case = TestCase::new(indoc! {r#"
-			memory heap: UnknownMemory where { Size = UnknownSize };
+			memory heap: UnknownSize;
 			import "env" as host {
-				memory shared: UnknownMemory where { Size = UnknownSize };
+				memory shared: UnknownSize;
 				fn log(value: UnknownType);
 				global counter: UnknownType;
 			}
@@ -4269,19 +4449,6 @@ mod tests {
 				assert_eq!(diagnostic.labels[0].range, second..second + 4);
 			},
 		);
-	}
-
-	#[test]
-	fn missing_parameter_type_is_reported() {
-		for source in [
-			"fn f(x) {}",
-			"fn f(x);",
-			r#"import "env" as host { fn f(x); }"#,
-		] {
-			let case = TestCase::new(source);
-			case.diagnostics()
-				.assert_error(DiagnosticCode::MissingParameterType);
-		}
 	}
 
 	#[test]

@@ -7,9 +7,9 @@
 //! this module only answers identity questions, never "what type does this
 //! path/expression have" or "what scope am I resolving in." It depends on
 //! `defs` for `TraitIdx` (an associated-type projection names the trait
-//! that declares it) and `StructIdx`/`EnumIdx`/`FunctionIdx`/`MemoryIdx`
-//! (all pre-allocated in `defs.rs`'s Phase 1, for the same reason as
-//! `TraitIdx`) but nothing
+//! that declares it) and `StructIdx`/`EnumIdx`/`FunctionIdx`/`MemoryIdx`/
+//! `GlobalIdx` (all pre-allocated in `defs.rs`'s Phase 1, for the same
+//! reason as `TraitIdx`) but nothing
 //! here calls into name resolution, and nothing in `defs` depends back on
 //! this module — see `tir/defs.rs`'s own doc comment for why that direction
 //! has to stay one-way. `TypeEnvArena` fits the same charter: given a name,
@@ -33,7 +33,8 @@ use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{
-	EnumIdx, InherentImplIdx, MemoryIdx, StructIdx, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, EnumIdx, GlobalIdx, InherentImplIdx, MemoryIdx, StructIdx,
+	TraitIdx, TraitImplIdx,
 };
 
 index_newtype!(TypeIndex);
@@ -112,10 +113,20 @@ pub enum Type {
 	Enum {
 		enum_index: EnumIdx,
 	},
+	/// Every `memory` declaration is its own nominal type constructor. Its
+	/// `Size` — and anything else `Memory`'s synthetic impl carries — is
+	/// never duplicated here; query it through that impl instead (see
+	/// `MemoryDef::size_assoc_type_index`), the same way a struct's own
+	/// field types live on `StructDef`/`StructSignature`, not on
+	/// `Type::Struct` itself.
 	Memory {
 		memory_index: MemoryIdx,
-		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
-		size: TypeIndex,
+	},
+	/// Every `global` declaration is its own nominal type constructor, same
+	/// reasoning as `Memory` above — `Value` lives on the synthetic impl
+	/// (`GlobalDef::value_assoc_type_index`), not here.
+	Global {
+		global_index: GlobalIdx,
 	},
 	/// One occurrence of a generic parameter declared by `owner` — every use
 	/// of the same parameter across `owner`'s signature/body shares one
@@ -138,14 +149,14 @@ pub enum Type {
 	/// `M::Size` — opaque until monomorphization substitutes `M`.
 	AssociatedType {
 		trait_index: TraitIdx,
-		assoc_name: SymbolU32,
+		assoc_type_index: AssocTypeIdx,
 	},
 	/// `M::Size` or `A::M::Size` in a signature: a projection from a base
 	/// type (a `TypeParam` or another `AssocTypeProjection`), resolved once
 	/// the base is substituted with a concrete type.
 	AssocTypeProjection {
 		trait_index: TraitIdx,
-		assoc_name: SymbolU32,
+		assoc_type_index: AssocTypeIdx,
 		base: TypeIndex,
 	},
 }

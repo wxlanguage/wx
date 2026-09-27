@@ -143,120 +143,99 @@ items:
             span:
               start: 52
               end: 55
-          bound:
+          size:
             inner:
-              WithBindings:
-                path:
-                  Path:
-                    - ident:
-                        inner: 5
-                        span:
-                          start: 57
-                          end: 63
-                      type_args: []
-                bindings:
-                  - name:
-                      inner: 6
-                      span:
-                        start: 72
-                        end: 76
-                    kind:
-                      Equals:
-                        inner:
-                          Path:
-                            - ident:
-                                inner: 7
-                                span:
-                                  start: 79
-                                  end: 82
-                              type_args: []
-                        span:
-                          start: 79
-                          end: 82
+              Path:
+                - ident:
+                    inner: 5
+                    span:
+                      start: 57
+                      end: 60
+                  type_args: []
             span:
               start: 57
-              end: 84
+              end: 60
       span:
         start: 45
-        end: 84
+        end: 60
     separator:
-      start: 84
-      end: 85
+      start: 60
+      end: 61
   - inner:
       inner:
         Global:
           id: 2
           pub_span: ~
           mut_span:
-            start: 93
-            end: 96
+            start: 69
+            end: 72
           name:
-            inner: 8
+            inner: 6
             span:
-              start: 97
-              end: 104
+              start: 73
+              end: 80
           ty:
             inner:
               Path:
                 - ident:
                     inner: 2
                     span:
-                      start: 106
-                      end: 109
+                      start: 82
+                      end: 85
                   type_args: []
             span:
-              start: 106
-              end: 109
+              start: 82
+              end: 85
           value:
             inner:
               Int:
                 value: 0
             span:
-              start: 112
-              end: 113
+              start: 88
+              end: 89
           attributes: []
       span:
-        start: 86
-        end: 113
+        start: 62
+        end: 89
     separator:
-      start: 113
-      end: 114
+      start: 89
+      end: 90
   - inner:
       inner:
         Const:
           id: 3
           pub_span: ~
           name:
-            inner: 9
+            inner: 7
             span:
-              start: 121
-              end: 124
+              start: 97
+              end: 100
           ty:
             inner:
               Path:
                 - ident:
                     inner: 2
                     span:
-                      start: 126
-                      end: 129
+                      start: 102
+                      end: 105
                   type_args: []
             span:
-              start: 126
-              end: 129
+              start: 102
+              end: 105
           value:
             inner:
               Int:
                 value: 100
             span:
-              start: 132
-              end: 135
+              start: 108
+              end: 111
           attributes: []
       span:
-        start: 115
-        end: 135
+        start: 91
+        end: 111
     separator:
-      start: 135
-      end: 136
+      start: 111
+      end: 112
   - inner:
       inner:
         RecordStruct:
@@ -264,81 +243,81 @@ items:
           pub_span: ~
           attributes: []
           name:
-            inner: 10
+            inner: 8
             span:
-              start: 145
-              end: 150
+              start: 121
+              end: 126
           type_params: []
           fields:
             - inner:
                 inner:
                   pub_span:
-                    start: 157
-                    end: 160
+                    start: 133
+                    end: 136
                   name:
-                    inner: 11
+                    inner: 9
                     span:
-                      start: 161
-                      end: 162
+                      start: 137
+                      end: 138
                   ty:
                     inner:
                       Path:
                         - ident:
                             inner: 2
                             span:
-                              start: 164
-                              end: 167
+                              start: 140
+                              end: 143
                           type_args: []
                     span:
-                      start: 164
-                      end: 167
+                      start: 140
+                      end: 143
                 span:
-                  start: 157
-                  end: 167
+                  start: 133
+                  end: 143
               separator:
-                start: 167
-                end: 168
+                start: 143
+                end: 144
             - inner:
                 inner:
                   pub_span: ~
                   name:
-                    inner: 12
+                    inner: 10
                     span:
-                      start: 173
-                      end: 174
+                      start: 149
+                      end: 150
                   ty:
                     inner:
                       Path:
                         - ident:
                             inner: 2
                             span:
-                              start: 176
-                              end: 179
+                              start: 152
+                              end: 155
                           type_args: []
                     span:
-                      start: 176
-                      end: 179
+                      start: 152
+                      end: 155
                 span:
-                  start: 173
-                  end: 179
+                  start: 149
+                  end: 155
               separator:
-                start: 179
-                end: 180
+                start: 155
+                end: 156
       span:
-        start: 138
-        end: 182
+        start: 114
+        end: 158
     separator: ~
   - inner:
       inner:
         Import:
           external_name:
-            start: 191
-            end: 196
+            start: 167
+            end: 172
           internal_name:
-            inner: 13
+            inner: 11
             span:
-              start: 200
-              end: 203
+              start: 176
+              end: 179
           items:
             inner:
               - inner:
@@ -349,47 +328,47 @@ items:
                         id: 5
                         signature:
                           name:
-                            inner: 14
+                            inner: 12
                             span:
-                              start: 213
-                              end: 216
+                              start: 189
+                              end: 192
                           type_params: []
                           params:
                             - inner:
                                 inner:
                                   mut_span: ~
                                   name:
-                                    inner: 15
+                                    inner: 13
                                     span:
-                                      start: 217
-                                      end: 224
+                                      start: 193
+                                      end: 200
                                   ty:
                                     inner:
                                       Path:
                                         - ident:
-                                            inner: 16
+                                            inner: 14
                                             span:
-                                              start: 226
-                                              end: 232
+                                              start: 202
+                                              end: 208
                                           type_args: []
                                     span:
-                                      start: 226
-                                      end: 232
+                                      start: 202
+                                      end: 208
                                 span:
-                                  start: 217
-                                  end: 232
+                                  start: 193
+                                  end: 208
                               separator: ~
                           result: ~
                   span:
-                    start: 210
-                    end: 233
+                    start: 186
+                    end: 209
                 separator: ~
             span:
-              start: 204
-              end: 235
+              start: 180
+              end: 211
       span:
-        start: 184
-        end: 235
+        start: 160
+        end: 211
     separator: ~
   - inner:
       inner:
@@ -398,64 +377,64 @@ items:
           pub_span: ~
           repr: ~
           name:
-            inner: 17
+            inner: 15
             span:
-              start: 242
-              end: 247
+              start: 218
+              end: 223
           variants:
             - inner:
                 inner:
                   id: 6
                   name:
-                    inner: 18
+                    inner: 16
                     span:
-                      start: 254
-                      end: 257
+                      start: 230
+                      end: 233
                   value: ~
                 span:
-                  start: 254
-                  end: 257
+                  start: 230
+                  end: 233
               separator:
-                start: 257
-                end: 258
+                start: 233
+                end: 234
             - inner:
                 inner:
                   id: 7
                   name:
-                    inner: 19
+                    inner: 17
                     span:
-                      start: 263
-                      end: 268
+                      start: 239
+                      end: 244
                   value:
                     inner:
                       Int:
                         value: 1
                     span:
-                      start: 271
-                      end: 272
+                      start: 247
+                      end: 248
                 span:
-                  start: 263
-                  end: 272
+                  start: 239
+                  end: 248
               separator:
-                start: 272
-                end: 273
+                start: 248
+                end: 249
             - inner:
                 inner:
                   id: 8
                   name:
-                    inner: 20
+                    inner: 18
                     span:
-                      start: 278
-                      end: 282
+                      start: 254
+                      end: 258
                   value: ~
                 span:
-                  start: 278
-                  end: 282
+                  start: 254
+                  end: 258
               separator:
-                start: 282
-                end: 283
+                start: 258
+                end: 259
           attributes: []
       span:
-        start: 237
-        end: 285
+        start: 213
+        end: 261
     separator: ~

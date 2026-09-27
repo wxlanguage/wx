@@ -178,6 +178,28 @@ fn report_unexpected_token(
 		)
 }
 
+/// `report_unexpected_token` only ever names one expected token; right
+/// after a path's `::`, the actual expected set is "another path segment,
+/// or a pointer/slice/array sigil starting a memory tag" — reusing the same
+/// code (this is still the same class of diagnostic, just with more than
+/// one token that would have been accepted) rather than naming just `*`
+/// and leaving out `&` and plain continuation.
+fn report_expected_path_segment_or_memory_tag(
+	file_id: FileId,
+	received: Spanned<Token>,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UnexpectedToken.code())
+		.with_message(format!(
+			"expected a path segment or a pointer type after `::`, found `{}`",
+			received.inner
+		))
+		.with_label(
+			Label::primary(file_id, received.span)
+				.with_message("expected an identifier, `*`, or `&` here"),
+		)
+}
+
 fn report_missing_separator(
 	file_id: FileId,
 	span: TextSpan,
@@ -1332,29 +1354,28 @@ pub enum TypeExpression {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
 	},
-	/// `*u8` or `&u8`
+	/// `*u8` or `&u8`; `heap::*u8` tags the memory explicitly instead of
+	/// leaving it to ambient resolution — carried on the pointer itself
+	/// (rather than as a separate wrapper node) so only a pointer/slice/
+	/// array can ever be tagged, a constraint the parser otherwise has to
+	/// enforce by hand against an arbitrary inner type expression.
 	Pointer {
 		ownership: Ownership,
+		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `*[u8]` or `&[u8]`
+	/// `*[u8]` or `&[u8]`; see `Pointer` for the optional `heap::` tag.
 	Slice {
 		ownership: Ownership,
+		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `*[u8; 5]` or `&[u8; 5]`
+	/// `*[u8; 5]` or `&[u8; 5]`; see `Pointer` for the optional `heap::` tag.
 	Array {
 		ownership: Ownership,
+		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 		size: Spanned<usize>,
-	},
-	/// `heap::*u8`, `heap::&[i32]` — memory-tagged pointer/slice/array.
-	/// The memory is always a single-segment path naming the memory
-	/// declaration; the inner is a Pointer, Slice, or Array type, and so
-	/// always carries its own `*`/`&` ownership sigil.
-	MemoryTagged {
-		memory: Box<[PathSegment]>,
-		inner: Box<Spanned<TypeExpression>>,
 	},
 	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
 	/// which trait's item is meant, disambiguating a name that would
@@ -1672,7 +1693,7 @@ pub enum ImportDeclaration {
 	Memory {
 		id: DefId,
 		name: Spanned<SymbolU32>,
-		kind: Spanned<BoundExpression>,
+		size: Box<Spanned<TypeExpression>>,
 	},
 }
 
@@ -1813,7 +1834,7 @@ pub enum Item {
 		id: DefId,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
-		bound: Spanned<BoundExpression>,
+		size: Box<Spanned<TypeExpression>>,
 	},
 	Const {
 		id: DefId,
@@ -2944,21 +2965,21 @@ impl<'ctx> Parser<'ctx> {
 	/// expression's name, a bound, a trait name, an impl target, or a
 	/// typeset member. Every segment — including the first — may carry
 	/// bare `<...>` generic arguments; turbofish is never accepted here
-	/// (see `parse_value_path` for why the two positions differ). Once a
-	/// segment carries generic arguments the path ends there — there is no
-	/// continuation past `Foo<T>::` in this style.
+	/// (see `parse_value_path` for why the two positions differ). `::`
+	/// continues to another segment regardless of whether the one just
+	/// parsed carried args — `Vec<T>::Item` is a plain path here, same as
+	/// `Vec::Item`.
 	fn parse_type_path(&mut self) -> Result<Path, ()> {
 		let mut ident = self.parse_path_ident()?;
 		let mut segments: Vec<PathSegment> = Vec::new();
 		loop {
 			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
-			let has_args = self.lexer.peek().inner == Token::LeftArrow;
-			if has_args {
+			if self.lexer.peek().inner == Token::LeftArrow {
 				let (args, _) = self.parse_type_args()?;
 				type_args = args;
 			}
 			segments.push(PathSegment { ident, type_args });
-			if has_args || self.lexer.peek().inner != Token::ColonColon {
+			if self.lexer.peek().inner != Token::ColonColon {
 				break;
 			}
 			self.lexer.next(); // consume `::`
@@ -3026,13 +3047,7 @@ impl<'ctx> Parser<'ctx> {
 		let token = self.lexer.peek();
 		match token.inner {
 			Token::Star | Token::Amper => {
-				let sigil = self.lexer.next();
-				let ownership = if sigil.inner == Token::Star {
-					Ownership::Exclusive
-				} else {
-					Ownership::Shared
-				};
-				self.parse_pointer_type_expression(ownership, sigil.span)
+				self.parse_pointer_type_expression(None)
 			}
 			Token::Identifier => {
 				let (first_tok, first_sym) = match Keyword::try_from(
@@ -3072,9 +3087,10 @@ impl<'ctx> Parser<'ctx> {
 
 				// Every segment — including this first one — may carry bare
 				// `<...>` generic arguments (`Type<T>`, `module::Wrapper<T>`);
-				// once a segment carries them the path ends there. `::`
-				// continues to another segment; `::` followed by neither an
-				// identifier nor `<` is a memory-tagged type (`heap::*T`).
+				// `::` continues to another segment regardless of whether the
+				// one just parsed had args (`Vec<T>::Item` is a plain `Path`,
+				// no bracket needed), and `::` followed by neither an
+				// identifier nor `*`/`&` is a memory-tagged type (`heap::*T`).
 				let mut ident = Spanned {
 					inner: first_sym,
 					span: first_span,
@@ -3084,16 +3100,13 @@ impl<'ctx> Parser<'ctx> {
 					let mut type_args: Box<[Spanned<TypeExpression>]> =
 						Box::new([]);
 					let mut end = ident.span.end;
-					let has_args = self.lexer.peek().inner == Token::LeftArrow;
-					if has_args {
+					if self.lexer.peek().inner == Token::LeftArrow {
 						let (args, close_span) = self.parse_type_args()?;
 						type_args = args;
 						end = close_span.end;
 					}
 					segments.push(PathSegment { ident, type_args });
-					if has_args
-						|| self.lexer.peek().inner != Token::ColonColon
-					{
+					if self.lexer.peek().inner != Token::ColonColon {
 						break end;
 					}
 					self.lexer.next(); // consume `::`
@@ -3101,18 +3114,24 @@ impl<'ctx> Parser<'ctx> {
 						Token::Identifier => {
 							ident = self.parse_path_ident()?;
 						}
+						Token::Star | Token::Amper => {
+							// `::` consumed, followed by a pointer/slice/
+							// array sigil — a memory-tagged type
+							// (`heap::*u8`), tagged with the path built up
+							// so far.
+							return self.parse_pointer_type_expression(Some(
+								segments.into_boxed_slice(),
+							));
+						}
 						_ => {
-							// `::` consumed; non-identifier follows — memory-tagged type.
-							let inner = self.parse_type_expression()?;
-							let span =
-								TextSpan::new(first_span.start, inner.span.end);
-							return Ok(Spanned {
-								inner: TypeExpression::MemoryTagged {
-									memory: segments.into_boxed_slice(),
-									inner: Box::new(inner),
-								},
-								span,
-							});
+							let token = self.lexer.next();
+							self.ast.diagnostics.push(
+								report_expected_path_segment_or_memory_tag(
+									self.ast.file_id,
+									token,
+								),
+							);
+							return Err(());
 						}
 					}
 				};
@@ -3179,20 +3198,35 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
-	/// Parses everything after a leading `*`/`&` sigil: a bare type (`*T`,
+	/// Parses a leading `*`/`&` sigil (not yet consumed — the caller only
+	/// peeks to route here) and everything after it: a bare type (`*T`,
 	/// `&T` → `Pointer`), or a bracketed one (`*[T]`/`&[T]` → `Slice`,
-	/// `*[T; N]`/`&[T; N]` → `Array`).
+	/// `*[T; N]`/`&[T; N]` → `Array`). `memory` is the path already parsed
+	/// before an explicit `heap::` tag, if any — its first segment's start
+	/// becomes the whole expression's span start instead of the sigil's
+	/// own, since the tag is written before it.
 	fn parse_pointer_type_expression(
 		&mut self,
-		ownership: Ownership,
-		sigil_span: TextSpan,
+		memory: Option<Box<[PathSegment]>>,
 	) -> Result<Spanned<TypeExpression>, ()> {
+		let sigil = self.lexer.next();
+		let ownership = if sigil.inner == Token::Star {
+			Ownership::Exclusive
+		} else {
+			Ownership::Shared
+		};
+		let start = memory
+			.as_ref()
+			.and_then(|segments| segments.first())
+			.map_or(sigil.span.start, |segment| segment.ident.span.start);
+
 		if self.lexer.peek().inner != Token::OpenBracket {
 			let inner = self.parse_type_expression()?;
-			let span = TextSpan::new(sigil_span.start, inner.span.end);
+			let span = TextSpan::new(start, inner.span.end);
 			return Ok(Spanned {
 				inner: TypeExpression::Pointer {
 					ownership,
+					memory,
 					inner: Box::new(inner),
 				},
 				span,
@@ -3204,10 +3238,11 @@ impl<'ctx> Parser<'ctx> {
 		let next = self.lexer.next();
 		match next.inner {
 			Token::CloseBracket => {
-				let span = TextSpan::new(sigil_span.start, next.span.end);
+				let span = TextSpan::new(start, next.span.end);
 				Ok(Spanned {
 					inner: TypeExpression::Slice {
 						ownership,
+						memory,
 						inner: Box::new(inner),
 					},
 					span,
@@ -3232,10 +3267,11 @@ impl<'ctx> Parser<'ctx> {
 					span: size_token.span,
 				};
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
-				let span = TextSpan::new(sigil_span.start, close_span.end);
+				let span = TextSpan::new(start, close_span.end);
 				Ok(Spanned {
 					inner: TypeExpression::Array {
 						ownership,
+						memory,
 						inner: Box::new(inner),
 						size,
 					},
@@ -5769,14 +5805,14 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		parser.next_expect(Token::Colon)?;
-		let kind = parser.parse_bound()?;
+		let size = Box::new(parser.parse_type_expression()?);
 
-		let span = TextSpan::new(memory_span.start, kind.span.end);
+		let span = TextSpan::new(memory_span.start, size.span.end);
 		Ok(Spanned {
 			inner: Item::Memory {
 				attributes: Box::new([]),
 				name,
-				bound: kind,
+				size,
 				id: parser.id_generator.next_id(),
 			},
 			span,
@@ -5826,12 +5862,12 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		};
 		let _ = self.next_expect(Token::Colon)?;
-		let kind = self.parse_bound()?;
-		let span = TextSpan::new(keyword_span.start, kind.span.end);
+		let size = Box::new(self.parse_type_expression()?);
+		let span = TextSpan::new(keyword_span.start, size.span.end);
 		Ok(Spanned {
 			inner: ImportDeclaration::Memory {
 				name,
-				kind,
+				size,
 				id: self.id_generator.next_id(),
 			},
 			span,

@@ -37,17 +37,17 @@ use crate::vfs::FileId;
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundId, ImpliedTraitBound,
 	SourceAssocBinding, SourceTraitBound, report_duplicate_assoc_type_binding,
-	report_expected_trait_bound, report_not_an_associated_type,
+	report_not_a_trait_bound, report_not_an_associated_type,
 };
 #[cfg(test)]
 use super::bounds::{ImpliedBindingKind, equals_type};
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingNamespace, ConstIdx,
-	DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, InherentImplIdx,
-	MemberKind, NamespaceIdx, StructIdx, TraitIdx, TraitImplIdx, TypesetIdx,
+	DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx,
+	InherentImplIdx, MemberKind, MemoryIdx, NamespaceIdx, StructIdx, TraitIdx,
+	TraitImplIdx, TypesetIdx,
 };
 use super::impls::ImplDispatch;
-use super::members::{MemberSource, TypeMemberLookup, TypeMemberTarget};
 use super::paths::PathResolver;
 use super::types::{
 	Type, TypeEnvArena, TypeEnvIdx, TypeIndex, TypeInterner, TypeParam,
@@ -152,17 +152,24 @@ pub struct ConstantSignature {
 	ty: TypeIndex,
 }
 
-/// A trait associated type's resolved bounds (`type Name: Bound1 +
-/// Bound2;`). Resolved against its trait's own `self_scope` (forced first,
-/// same as `TraitFunction`/`TraitConst`), so a bound may reference `Self`
-/// (`type Size: Memory where { X = Self::Size }`). The concrete type each
-/// `impl` provides is a separate query (`TraitImplAssocType`), not tracked
-/// here.
+/// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
+/// `implied_bounds` (`type Name: Bound1 + Bound2;`, resolved against the
+/// trait's own `self_scope` — forced first, same as `TraitFunction`/
+/// `TraitConst` — so a bound may reference `Self`, e.g. `type Size: Memory
+/// where { X = Self::Size }`) only ever come from a trait's own declaration.
+/// `value` is the concrete type this slot is set to: `None` for a trait
+/// declaration with no default (there's no syntax for one yet, but nothing
+/// here assumes there won't be), `Some` for an `impl`'s own `type Name =
+/// Ty;` (a separate query, `TraitImplAssocType`, and a separate `AssocTypeIdx`
+/// from the trait's declaration even for "the same" name — it never sets
+/// `declared_bounds`/`implied_bounds`, since an impl provides a value, it
+/// doesn't declare a requirement).
 pub struct AssocTypeSignature {
 	pub(super) declared_bounds: Box<[BoundId]>,
 	/// See `ParamBounds::implied_bounds` — same reasoning, computed eagerly
 	/// right alongside `declared_bounds` rather than on first demand.
 	pub(super) implied_bounds: Box<[ImpliedTraitBound]>,
+	pub(super) value: Option<TypeIndex>,
 }
 
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
@@ -343,7 +350,12 @@ pub enum SignatureLocation {
 	TypeAlias(TypeAliasIdx),
 	Function(FunctionIdx),
 	Constant(ConstIdx),
-	TraitAssocType(AssocTypeIdx),
+	/// One `AssocTypeIdx`'s slot — a trait's own declaration or an impl's
+	/// provided value; see `AssocTypeSignature`'s own doc comment for why
+	/// the two don't need distinct variants here.
+	AssocType(AssocTypeIdx),
+	Memory(MemoryIdx),
+	Global(GlobalIdx),
 }
 
 /// What `ensure_signature` found. `Cycle` is never stored anywhere — it's a
@@ -428,19 +440,12 @@ struct QueryEntry {
 	state: QueryState,
 }
 
-/// One in-progress query frame — mirrors `rustc_query_system`'s own
-/// `QueryInfo`. `requested_at` is the span of the reference that demanded
-/// `def_id`, i.e. "the reason for which this was required"; `None` only for
-/// a top-level, non-reference demand (the per-`DefId` driver loop) —
+/// What a caller passes to `ensure_signature` — also pushed as-is onto
+/// `query_stack` as that in-progress query's own frame. `requested_at` is
+/// the span of the reference that demanded `def_id`; `None` only for a
+/// top-level, non-reference demand (the per-`DefId` driver loop) —
 /// `resolve_type` always supplies `Some` when it recurses because of a
 /// written reference.
-#[derive(Clone, Copy)]
-struct QueryFrame {
-	def_id: DefId,
-	requested_at: Option<SourceSpan>,
-}
-
-/// What a caller passes to `ensure_signature`.
 #[derive(Clone, Copy)]
 pub(super) struct QueryInfo {
 	pub(super) def_id: DefId,
@@ -457,7 +462,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	// The resolved data below is read across the sibling TIR modules.
 	query_state: HashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
-	query_stack: Vec<QueryFrame>,
+	query_stack: Vec<QueryInfo>,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	pub(super) type_envs: TypeEnvArena,
@@ -502,7 +507,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		// `Resolved(SignatureLocation)` once it actually finishes — for a
 		// pre-seeded kind that's still worth doing (its *data*, not just its
 		// identity, isn't ready before then), just not from this loop.
-		let mut query_state: HashMap<DefId, QueryEntry> = ast_nodes
+		let query_state: HashMap<DefId, QueryEntry> = ast_nodes
 			.iter()
 			.enumerate()
 			.map(|(index, entry)| {
@@ -634,7 +639,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			}
 		}
 
-		let frame = self.type_envs.push_param_frame(
+		let type_env = self.type_envs.push_param_frame(
 			&mut self.types,
 			owner,
 			parent,
@@ -651,20 +656,20 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		for (index, ast_param) in params.iter().enumerate() {
 			let declared_bounds = match &ast_param.bounds {
 				Some(bound) => {
-					self.resolve_bounds(file_id, namespace, frame, bound)
+					self.resolve_bounds(file_id, namespace, type_env, bound)
 				}
 				None => Box::new([]),
 			};
 			let implied_bounds = self
 				.compute_implied_bounds(&declared_bounds, ast_param.name.inner)
 				.into_boxed_slice();
-			self.param_bounds[usize::from(frame)][index] = ParamBounds {
+			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
 				declared_bounds,
 				implied_bounds,
 			};
 		}
 
-		frame
+		type_env
 	}
 
 	/// Reserves `frame`'s own `param_bounds` slot, initially empty —
@@ -726,44 +731,238 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		&mut self,
 		query: QueryInfo,
 	) -> SignatureStatus {
-		let def_id = query.def_id;
-		match self.query_state[&def_id].state {
-			// Already finished on an earlier call.
+		match self.query_state[&query.def_id].state {
 			QueryState::Resolved(location) => {
 				return SignatureStatus::Resolved(location);
 			}
 			QueryState::CycleReported => {
 				return SignatureStatus::CycleReported;
 			}
-			// First re-entrant discovery: flip to `CycleReported` right
-			// here, atomically, before returning `Cycle` — mirrors
-			// `ResolveStatus::poll`'s `Resolving -> Error` transition. This
-			// is what makes a *second*, independent path that re-discovers
-			// the same still-running query see `CycleReported` (silent)
-			// instead of `InProgress` (which would mean "report again").
 			QueryState::InProgress => {
-				self.query_state.get_mut(&def_id).unwrap().state =
+				self.query_state.get_mut(&query.def_id).unwrap().state =
 					QueryState::CycleReported;
 				return SignatureStatus::Cycle;
 			}
 			QueryState::Pending => {}
 		}
 
-		self.query_state.get_mut(&def_id).unwrap().state =
+		self.query_state.get_mut(&query.def_id).unwrap().state =
 			QueryState::InProgress;
-		self.query_stack.push(QueryFrame {
-			def_id,
-			requested_at: query.requested_at,
-		});
+		self.query_stack.push(query);
 
-		let ast_index = self.query_state[&def_id].ast_index;
-		let ast_nodes = self.ast_nodes;
-		let entry = &ast_nodes[ast_index as usize];
-		let file_id = entry.file_id;
-		let namespace = entry.namespace;
-		let node = entry.node.clone();
+		let entry =
+			&self.ast_nodes[self.query_state[&query.def_id].ast_index as usize];
+		let location =
+			self.compute_signature(entry.file_id, entry.namespace, entry.node);
 
-		match node {
+		self.query_stack.pop();
+		self.query_state.get_mut(&query.def_id).unwrap().state =
+			QueryState::Resolved(location);
+		SignatureStatus::Resolved(location)
+	}
+
+	/// Resolves a `fn`'s generic params, parameter types and return type.
+	/// Shared by `AstNodeRef::Function` and `AstNodeRef::ImportedFunction` —
+	/// both a plain/declared free function and an imported one carry the
+	/// exact same `ast::FunctionSignature` shape, so there's nothing about
+	/// resolution itself that differs once that signature is in hand.
+	fn resolve_function_signature(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		function_index: FunctionIdx,
+		signature: &ast::FunctionSignature,
+	) -> SignatureLocation {
+		let type_env = self.resolve_generic_params(
+			file_id,
+			namespace,
+			TypeEnvOwner::Function(function_index),
+			TypeEnvIdx::ROOT,
+			&signature.type_params,
+		);
+
+		let param_types: Box<[TypeIndex]> = signature
+			.params
+			.iter()
+			.map(|param| match &param.inner.inner.ty {
+				Some(ty) => self.resolve_type(
+					file_id,
+					namespace,
+					type_env,
+					ty,
+					InferPolicy::Reject(InferSignatureKind::Function),
+				),
+				None => {
+					let name = param.inner.inner.name;
+					if name.inner != Keyword::SelfLower.symbol() {
+						self.diagnostics.push(report_missing_parameter_type(
+							self.strings,
+							file_id,
+							name,
+						));
+					}
+					TypeIndex::ERROR
+				}
+			})
+			.collect();
+
+		let return_type = match &signature.result {
+			Some(result) => self.resolve_type(
+				file_id,
+				namespace,
+				type_env,
+				result,
+				InferPolicy::Reject(InferSignatureKind::ReturnType),
+			),
+			None => TypeIndex::UNIT,
+		};
+
+		self.functions[usize::from(function_index)] = FunctionSignature {
+			type_params: type_env,
+			param_types,
+			return_type,
+		};
+		SignatureLocation::Function(function_index)
+	}
+
+	/// Resolves and validates a `memory` declaration's `Size` and fills in
+	/// its synthetic `Memory` impl. Shared by `AstNodeRef::Memory` and
+	/// `AstNodeRef::ImportedMemory` — a declared memory and an imported one
+	/// resolve identically once their `size` type expression is in hand.
+	fn resolve_memory_signature(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		memory_index: MemoryIdx,
+		name: Spanned<SymbolU32>,
+		size: &Spanned<ast::TypeExpression>,
+	) -> SignatureLocation {
+		let memory_def = &self.defs.memories[usize::from(memory_index)];
+		let trait_impl_index = memory_def.trait_impl_index;
+		let size_assoc_type_index = memory_def.size_assoc_type_index;
+
+		let resolved_size = self.resolve_type(
+			file_id,
+			namespace,
+			TypeEnvIdx::ROOT,
+			size,
+			InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+		);
+
+		// `Size`'s actual constraint (`PointerSize`) lives on `Memory`'s own
+		// declaration, not hardcoded here — this looks it up and lets
+		// `check_assoc_type_value` validate against it, the same bound-
+		// satisfaction path any other associated-type binding goes through.
+		let memory_trait = self.defs.intrinsics.memory.expect(
+			"checked by impls.rs's dispatch pass before any signature is resolved",
+		);
+		let size_symbol = self
+			.strings
+			.get("Size")
+			.expect("interned by synthesize_memory_impl during pre-scan");
+		let declared_size_index = {
+			let trait_def = &self.defs.traits[usize::from(memory_trait)];
+			let &member_index = trait_def
+				.bindings
+				.get(&BindingKey::ty(size_symbol))
+				.expect("the stdlib's `Memory` trait must declare `Size`");
+			let MemberKind::AssociatedType(index) =
+				trait_def.members[usize::from(member_index)].kind
+			else {
+				panic!(
+					"the stdlib's `Memory::Size` must be an associated type"
+				)
+			};
+			index
+		};
+		let checked_size = self.check_assoc_type_value(
+			declared_size_index,
+			Spanned {
+				inner: resolved_size,
+				span: size.span,
+			},
+			file_id,
+			TypeEnvOwner::Trait(memory_trait),
+		);
+
+		let memory_type = self.types.intern(Type::Memory { memory_index });
+
+		self.assoc_types[usize::from(size_assoc_type_index)] =
+			Some(AssocTypeSignature {
+				declared_bounds: Box::new([]),
+				implied_bounds: Box::new([]),
+				value: Some(checked_size),
+			});
+		self.trait_impls[usize::from(trait_impl_index)] =
+			Some(TraitImplSignature {
+				type_params: TypeEnvIdx::ROOT,
+				target: Spanned {
+					inner: memory_type,
+					span: name.span,
+				},
+				self_scope: TypeEnvIdx::ROOT,
+			});
+		SignatureLocation::Memory(memory_index)
+	}
+
+	/// Fills in a `global` declaration's synthetic `Global` impl (and, for
+	/// `global mut`, its `GlobalMut` impl too) once its `Value` type is
+	/// already resolved. Shared by `AstNodeRef::Global` and
+	/// `AstNodeRef::ImportedGlobal`, which differ only in how they arrive at
+	/// `resolved_value` — a written global may omit its type and gets
+	/// diagnosed for it, an imported one's type is mandatory in the grammar.
+	fn resolve_global_signature(
+		&mut self,
+		global_index: GlobalIdx,
+		name: Spanned<SymbolU32>,
+		mut_span: Option<TextSpan>,
+		resolved_value: TypeIndex,
+	) -> SignatureLocation {
+		let global_def = &self.defs.globals[usize::from(global_index)];
+		let trait_impl_index = global_def.trait_impl_index;
+		let value_assoc_type_index = global_def.value_assoc_type_index;
+		let mut_trait_impl_index = global_def.mut_trait_impl_index;
+
+		let global_type = self.types.intern(Type::Global { global_index });
+
+		self.assoc_types[usize::from(value_assoc_type_index)] =
+			Some(AssocTypeSignature {
+				declared_bounds: Box::new([]),
+				implied_bounds: Box::new([]),
+				value: Some(resolved_value),
+			});
+
+		self.trait_impls[usize::from(trait_impl_index)] =
+			Some(TraitImplSignature {
+				type_params: TypeEnvIdx::ROOT,
+				target: Spanned {
+					inner: global_type,
+					span: name.span,
+				},
+				self_scope: TypeEnvIdx::ROOT,
+			});
+		if let Some(mut_trait_impl_index) = mut_trait_impl_index {
+			debug_assert!(mut_span.is_some());
+			self.trait_impls[usize::from(mut_trait_impl_index)] =
+				Some(TraitImplSignature {
+					type_params: TypeEnvIdx::ROOT,
+					target: Spanned {
+						inner: global_type,
+						span: name.span,
+					},
+					self_scope: TypeEnvIdx::ROOT,
+				});
+		}
+		SignatureLocation::Global(global_index)
+	}
+
+	fn compute_signature(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		ast_node: AstNodeRef<'_>,
+	) -> SignatureLocation {
+		match ast_node {
 			AstNodeRef::TypeAlias {
 				item,
 				type_alias_index,
@@ -781,8 +980,8 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// A `#[intrinsic]` primitive (`type u8;`) is bodiless by
 				// design — its identity already comes from
 				// `defs.intrinsics`, so there's nothing here to resolve.
-				// Checked first so a real, non-intrinsic alias can assume
-				// its body is always present below.
+				// Checked first so a real, non-intrinsic alias only needs
+				// to handle a missing body as a diagnosed error below.
 				let signature =
 					match self.defs.intrinsics.identity_of(type_alias_index) {
 						Some(target) => TypeAliasSignature {
@@ -790,9 +989,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							target,
 						},
 						None => {
-							let body = body.as_ref().expect(
-								"a non-intrinsic type alias always has a body",
-							);
 							let type_env = self.resolve_generic_params(
 								file_id,
 								namespace,
@@ -800,15 +996,25 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								TypeEnvIdx::ROOT,
 								type_params,
 							);
-							let target = self.resolve_type(
-								file_id,
-								namespace,
-								type_env,
-								body,
-								InferPolicy::Reject(
-									InferSignatureKind::TypeAlias,
+							let target = match body {
+								Some(body) => self.resolve_type(
+									file_id,
+									namespace,
+									type_env,
+									body,
+									InferPolicy::Reject(
+										InferSignatureKind::TypeAlias,
+									),
 								),
-							);
+								None => {
+									self.diagnostics.push(
+										report_missing_type_alias_body(
+											file_id, name.span,
+										),
+									);
+									TypeIndex::ERROR
+								}
+							};
 							TypeAliasSignature {
 								type_params: type_env,
 								target,
@@ -817,10 +1023,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					};
 
 				self.type_aliases[usize::from(type_alias_index)] = signature;
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::TypeAlias(
-						type_alias_index,
-					));
+				SignatureLocation::TypeAlias(type_alias_index)
 			}
 			AstNodeRef::Trait { trait_index, item } => {
 				let ast::Item::Trait {
@@ -878,8 +1081,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				};
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Trait(trait_index));
+				SignatureLocation::Trait(trait_index)
 			}
 			AstNodeRef::TraitFunction {
 				trait_index,
@@ -915,9 +1117,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				// `defs.rs` already validated this member's parameter list
 				// (`validate_method_params`) — a `self` in any other
-				// position is already diagnosed there, so this only needs
-				// to answer "does the first slot default to `Self`", the
-				// same constant-time check that decided it there.
+				// position is already diagnosed there (`SelfParamPosition`),
+				// so a `self`-named parameter is never re-diagnosed here
+				// regardless of where it sits. This only needs to answer
+				// "does the first slot default to `Self`", the same
+				// constant-time check that decided it there.
 				let is_method = signature.params.first().is_some_and(|p| {
 					p.inner.inner.name.inner == Keyword::SelfLower.symbol()
 				});
@@ -948,10 +1152,19 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								param_index: 0,
 							})
 						}
-						// Already diagnosed by `defs.rs`
-						// (`MissingParameterType`) — nothing left to do here
-						// but recover.
-						None => TypeIndex::ERROR,
+						None => {
+							let name = param.inner.inner.name;
+							if name.inner != Keyword::SelfLower.symbol() {
+								self.diagnostics.push(
+									report_missing_parameter_type(
+										self.strings,
+										file_id,
+										name,
+									),
+								);
+							}
+							TypeIndex::ERROR
+						}
 					};
 					param_types.push(ty);
 				}
@@ -973,10 +1186,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						param_types: param_types.into_boxed_slice(),
 						return_type,
 					};
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Function(
-						function_index,
-					));
+				SignatureLocation::Function(function_index)
 			}
 			AstNodeRef::TraitConst {
 				const_index,
@@ -1010,10 +1220,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.constants[usize::from(const_index)] =
 					ConstantSignature { ty: resolved_ty };
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Constant(
-						const_index,
-					));
+				SignatureLocation::Constant(const_index)
 			}
 			AstNodeRef::TraitAssocType {
 				assoc_type_index,
@@ -1053,11 +1260,144 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					Some(AssocTypeSignature {
 						declared_bounds: resolved_bounds,
 						implied_bounds: implied_bounds.into_boxed_slice(),
+						value: None,
 					});
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::TraitAssocType(
-						assoc_type_index,
-					));
+				SignatureLocation::AssocType(assoc_type_index)
+			}
+			AstNodeRef::TraitImplAssocType {
+				assoc_type_index,
+				item,
+				block_index,
+			} => {
+				let ast::ImplItem::AssocType { ty, .. } = item else {
+					unreachable!()
+				};
+
+				// Forces the impl's own header — its generic params and,
+				// what this member actually needs, its `Self` frame (bound
+				// to the impl's target type) — before resolving anything
+				// against it. Same reasoning as `TraitFunction`'s force of
+				// its trait, and equally cycle-free: an impl's own header
+				// only ever depends on other items' signatures, never on
+				// one of its own members'.
+				let impl_def_id =
+					self.defs.trait_impls[usize::from(block_index)].def_id;
+				let _ = self.ensure_signature(QueryInfo {
+					def_id: impl_def_id,
+					requested_at: None,
+				});
+				let self_scope = self.trait_impls[usize::from(block_index)]
+					.as_ref()
+					.expect(
+						"an impl's own header resolves before any of its members are forced",
+					)
+					.self_scope;
+
+				let resolved_ty = self.resolve_type(
+					file_id,
+					namespace,
+					self_scope,
+					ty,
+					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+				);
+
+				// An impl provides a value, it doesn't declare a
+				// requirement — `declared_bounds`/`implied_bounds` stay
+				// empty; only a trait's own declaration (the
+				// `TraitAssocType` arm above) ever populates those.
+				self.assoc_types[usize::from(assoc_type_index)] =
+					Some(AssocTypeSignature {
+						declared_bounds: Box::new([]),
+						implied_bounds: Box::new([]),
+						value: Some(resolved_ty),
+					});
+				SignatureLocation::AssocType(assoc_type_index)
+			}
+			AstNodeRef::Memory { memory_index, item } => {
+				let ast::Item::Memory { name, size, .. } = item else {
+					unreachable!()
+				};
+				self.resolve_memory_signature(
+					file_id,
+					namespace,
+					memory_index,
+					*name,
+					size,
+				)
+			}
+			AstNodeRef::ImportedMemory { memory_index, decl } => {
+				let ast::ImportDeclaration::Memory { name, size, .. } = decl
+				else {
+					unreachable!()
+				};
+				self.resolve_memory_signature(
+					file_id,
+					namespace,
+					memory_index,
+					*name,
+					size,
+				)
+			}
+			AstNodeRef::Global { global_index, item } => {
+				let ast::Item::Global {
+					name, ty, mut_span, ..
+				} = item
+				else {
+					unreachable!()
+				};
+
+				// `global x = 0;` (no explicit type) would need the value
+				// expression's own type to stand in for it, which needs the
+				// body phase this architecture doesn't have yet — rather
+				// than leave this global's `Value` silently unresolved,
+				// require the annotation and fall back to `ERROR`.
+				let resolved_value = match ty {
+					Some(ty) => self.resolve_type(
+						file_id,
+						namespace,
+						TypeEnvIdx::ROOT,
+						ty,
+						InferPolicy::Reject(
+							InferSignatureKind::AssocTypeBinding,
+						),
+					),
+					None => {
+						self.diagnostics
+							.push(report_missing_global_type(file_id, *name));
+						TypeIndex::ERROR
+					}
+				};
+				self.resolve_global_signature(
+					global_index,
+					*name,
+					*mut_span,
+					resolved_value,
+				)
+			}
+			AstNodeRef::ImportedGlobal { global_index, decl } => {
+				let ast::ImportDeclaration::Global {
+					name, ty, mut_span, ..
+				} = decl
+				else {
+					unreachable!()
+				};
+				// Unlike `Item::Global`, an imported global's type is
+				// mandatory in the grammar itself — there's no initializer
+				// expression to fall back to anyway, so there's nothing to
+				// diagnose here.
+				let resolved_value = self.resolve_type(
+					file_id,
+					namespace,
+					TypeEnvIdx::ROOT,
+					ty,
+					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+				);
+				self.resolve_global_signature(
+					global_index,
+					*name,
+					*mut_span,
+					resolved_value,
+				)
 			}
 			AstNodeRef::RecordStruct { struct_index, item } => {
 				let ast::Item::RecordStruct {
@@ -1069,7 +1409,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					unreachable!()
 				};
 
-				let scope = self.resolve_generic_params(
+				let type_env = self.resolve_generic_params(
 					file_id,
 					namespace,
 					TypeEnvOwner::Struct(struct_index),
@@ -1084,7 +1424,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// bounds instead of the placeholder `ROOT` frame it started
 				// in. Same reasoning as `ast_node` already letting identity
 				// be read before a query finishes, just for one more fact.
-				self.structs[usize::from(struct_index)].type_params = scope;
+				self.structs[usize::from(struct_index)].type_params = type_env;
 
 				// One-to-one with `defs.structs[..].fields` — a duplicate
 				// name still gets its own slot resolved there, so it does
@@ -1097,7 +1437,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					let ty = self.resolve_type(
 						file_id,
 						namespace,
-						scope,
+						type_env,
 						ty_expr,
 						InferPolicy::Reject(InferSignatureKind::Struct),
 					);
@@ -1111,10 +1451,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.structs[usize::from(struct_index)].field_types =
 					field_types.into_boxed_slice();
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Struct(
-						struct_index,
-					));
+				SignatureLocation::Struct(struct_index)
 			}
 			AstNodeRef::TupleStruct { struct_index, item } => {
 				let ast::Item::TupleStruct {
@@ -1157,10 +1494,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.structs[usize::from(struct_index)].field_types =
 					field_types.into_boxed_slice();
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Struct(
-						struct_index,
-					));
+				SignatureLocation::Struct(struct_index)
 			}
 			AstNodeRef::Function {
 				item,
@@ -1171,57 +1505,27 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				else {
 					unreachable!()
 				};
-
-				let scope = self.resolve_generic_params(
+				self.resolve_function_signature(
 					file_id,
 					namespace,
-					TypeEnvOwner::Function(function_index),
-					TypeEnvIdx::ROOT,
-					&signature.type_params,
-				);
-
-				// `defs.rs` already validated this parameter list (every
-				// name unique, every parameter explicitly typed — `self`
-				// has no meaning in a free function, so it's rejected
-				// there too). An untyped parameter surviving here is
-				// already a diagnosed `MissingParameterType`/
-				// `SelfParamPosition` — nothing left to do but recover.
-				let param_types: Vec<TypeIndex> = signature
-					.params
-					.iter()
-					.map(|param| match &param.inner.inner.ty {
-						Some(ty) => self.resolve_type(
-							file_id,
-							namespace,
-							scope,
-							ty,
-							InferPolicy::Reject(InferSignatureKind::Function),
-						),
-						None => TypeIndex::ERROR,
-					})
-					.collect();
-
-				let return_type = match &signature.result {
-					Some(result) => self.resolve_type(
-						file_id,
-						namespace,
-						scope,
-						result,
-						InferPolicy::Reject(InferSignatureKind::ReturnType),
-					),
-					None => TypeIndex::UNIT,
+					function_index,
+					signature,
+				)
+			}
+			AstNodeRef::ImportedFunction {
+				function_index,
+				decl,
+			} => {
+				let ast::ImportDeclaration::Function { signature, .. } = decl
+				else {
+					unreachable!()
 				};
-
-				self.functions[usize::from(function_index)] =
-					FunctionSignature {
-						type_params: scope,
-						param_types: param_types.into_boxed_slice(),
-						return_type,
-					};
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Function(
-						function_index,
-					));
+				self.resolve_function_signature(
+					file_id,
+					namespace,
+					function_index,
+					signature,
+				)
 			}
 			AstNodeRef::InherentImplBlock { item, block_index } => {
 				let ast::Item::InherentImpl {
@@ -1267,10 +1571,144 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						target: target_spanned,
 						self_scope,
 					});
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::InherentImpl(
-						block_index,
-					));
+				SignatureLocation::InherentImpl(block_index)
+			}
+			AstNodeRef::InherentImplFunction {
+				item,
+				block_index,
+				function_index,
+			} => {
+				let ast::ImplItem::Function { signature, .. } = item else {
+					unreachable!()
+				};
+
+				// Forces the impl block's own header — its target type and
+				// `self` frame — before resolving anything against it. Can
+				// never close a cycle back through *this* member: the
+				// block's own header only depends on its target path/
+				// generic bounds, never on one of its members' signatures.
+				let impl_def_id =
+					self.defs.inherent_impls[usize::from(block_index)].def_id;
+				let _ = self.ensure_signature(QueryInfo {
+					def_id: impl_def_id,
+					requested_at: None,
+				});
+				let self_scope = self.inherent_impls[usize::from(block_index)]
+					.as_ref()
+					.expect("inherent impl header is resolved")
+					.self_scope;
+				let target_type = self.inherent_impls[usize::from(block_index)]
+					.as_ref()
+					.expect("inherent impl header is resolved")
+					.target
+					.inner;
+
+				let scope = self.resolve_generic_params(
+					file_id,
+					namespace,
+					TypeEnvOwner::Function(function_index),
+					self_scope,
+					&signature.type_params,
+				);
+
+				let is_method = signature.params.first().is_some_and(|p| {
+					p.inner.inner.name.inner == Keyword::SelfLower.symbol()
+				});
+
+				let mut param_types: Vec<TypeIndex> =
+					Vec::with_capacity(signature.params.len());
+				for (index, param) in signature.params.iter().enumerate() {
+					let ty = match &param.inner.inner.ty {
+						Some(ty) => self.resolve_type(
+							file_id,
+							namespace,
+							scope,
+							ty,
+							InferPolicy::Reject(InferSignatureKind::Function),
+						),
+						// `self`'s type is this impl's own concrete target —
+						// unlike a trait's abstract `Self`, there's already a
+						// real type to point at, so no `Type::TypeParam` is
+						// interned for it.
+						None if index == 0 && is_method => target_type,
+						None => {
+							let name = param.inner.inner.name;
+							if name.inner != Keyword::SelfLower.symbol() {
+								self.diagnostics.push(
+									report_missing_parameter_type(
+										self.strings,
+										file_id,
+										name,
+									),
+								);
+							}
+							TypeIndex::ERROR
+						}
+					};
+					param_types.push(ty);
+				}
+
+				let return_type = match &signature.result {
+					Some(result) => self.resolve_type(
+						file_id,
+						namespace,
+						scope,
+						result,
+						InferPolicy::Reject(InferSignatureKind::ReturnType),
+					),
+					None => TypeIndex::UNIT,
+				};
+
+				self.functions[usize::from(function_index)] =
+					FunctionSignature {
+						type_params: scope,
+						param_types: param_types.into_boxed_slice(),
+						return_type,
+					};
+				SignatureLocation::Function(function_index)
+			}
+			AstNodeRef::InherentImplConst {
+				const_index,
+				item,
+				block_index,
+			} => {
+				let ast::ImplItem::Constant { ty, .. } = item else {
+					unreachable!()
+				};
+
+				// See `InherentImplFunction`'s identical force — same
+				// reasoning.
+				let impl_def_id =
+					self.defs.inherent_impls[usize::from(block_index)].def_id;
+				let _ = self.ensure_signature(QueryInfo {
+					def_id: impl_def_id,
+					requested_at: None,
+				});
+				let self_scope = self.inherent_impls[usize::from(block_index)]
+					.as_ref()
+					.expect("inherent impl header is resolved")
+					.self_scope;
+
+				let resolved_ty = match ty {
+					Some(ty) => self.resolve_type(
+						file_id,
+						namespace,
+						self_scope,
+						ty,
+						InferPolicy::Reject(InferSignatureKind::Const),
+					),
+					// No default-value evaluation yet — inferring the
+					// omitted type from `value` needs constant-expression
+					// evaluation, which doesn't exist in this architecture
+					// yet (see `ConstantSignature`'s own doc comment).
+					None => todo!(
+						"inferring an impl const's type from its initializer isn't implemented yet"
+					),
+				};
+
+				self.constants[usize::from(const_index)] =
+					ConstantSignature { ty: resolved_ty };
+				SignatureLocation::Constant(const_index)
 			}
 			AstNodeRef::TraitImplBlock { item, block_index } => {
 				let ast::Item::TraitImpl {
@@ -1315,10 +1753,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						target: target_spanned,
 						self_scope,
 					});
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::TraitImpl(
-						block_index,
-					));
+				SignatureLocation::TraitImpl(block_index)
 			}
 			AstNodeRef::Enum { enum_index, item } => {
 				let ast::Item::Enum { repr, name, .. } = item else {
@@ -1357,8 +1792,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 				self.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::Enum(enum_index));
+				SignatureLocation::Enum(enum_index)
 			}
 			AstNodeRef::TypeSet {
 				typeset_index,
@@ -1375,8 +1809,6 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				};
 				let trait_index =
 					self.defs.typesets[usize::from(typeset_index)].trait_index;
-				let trait_def_id =
-					self.defs.traits[usize::from(trait_index)].def_id;
 				let member_impls = self.defs.typesets
 					[usize::from(typeset_index)]
 				.member_impls
@@ -1459,24 +1891,100 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.typesets[usize::from(typeset_index)] = TypeSetSignature {
 					members: resolved_members.into_boxed_slice(),
 				};
-				self.query_state.get_mut(&def_id).unwrap().state =
-					QueryState::Resolved(SignatureLocation::TypeSet(
-						typeset_index,
-					));
+				SignatureLocation::TypeSet(typeset_index)
 			}
 			_ => todo!("this item kind's signature isn't implemented yet"),
 		}
+	}
 
-		self.query_stack.pop();
-		// Every arm of the match above sets its own `Resolved(..)` state as
-		// its last step, so this is never anything else here.
-		let QueryState::Resolved(location) = self.query_state[&def_id].state
-		else {
-			unreachable!(
-				"every arm above sets Resolved(..) before falling through to here"
-			)
+	/// The memory an untagged pointer/slice/array type implicitly belongs
+	/// to: the sole `memory` declaration visible to the whole compilation,
+	/// if there's exactly one. Zero or several are both errors — there's no
+	/// sense in which one memory could be "the" ambient one among several,
+	/// and nothing to be ambient at all with none declared. A concrete
+	/// memory needs none of its own signature forced to be interned here:
+	/// `Type::Memory` carries only `memory_index`, so this is pure identity,
+	/// unlike the legacy builder's version (which had to force the size).
+	fn resolve_ambient_memory(
+		&mut self,
+		file_id: FileId,
+		span: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		match self.defs.memories.len() {
+			0 => {
+				self.diagnostics
+					.push(report_no_memory_for_pointer(file_id, span));
+				Err(())
+			}
+			1 => {
+				let memory_index = MemoryIdx::new(0);
+				Ok(self.types.intern(Type::Memory { memory_index }))
+			}
+			_ => {
+				self.diagnostics
+					.push(report_ambiguous_pointer_memory(file_id, span));
+				Err(())
+			}
+		}
+	}
+
+	/// Resolves a memory tag's own path (`heap` in `heap::*u8`) to the
+	/// concrete memory it names. This doesn't go through `resolve_type`'s
+	/// own `Path` arm — that arm resolves a full `Spanned<TypeExpression>`,
+	/// and a memory tag is a bare `&[ast::PathSegment]` with no such node
+	/// to hand it (`TypeExpression` isn't `Clone`, so there's no cheap way
+	/// to wrap it into one either) — so this walks the path directly. Only
+	/// a concrete memory is accepted for now; tagging by a generic `M:
+	/// Memory` type parameter is a separate, deferred feature.
+	fn resolve_memory_tag(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		segments: &[ast::PathSegment],
+	) -> Result<TypeIndex, ()> {
+		let walk = PathResolver::new(self.defs).walk_path(
+			self.diagnostics,
+			self.strings,
+			file_id,
+			namespace,
+			segments,
+			BindingNamespace::Type,
+		);
+		let Some(def_key) = walk.target.def_key() else {
+			return Err(());
 		};
-		SignatureStatus::Resolved(location)
+		match def_key.symbol_kind(self.defs) {
+			DefKind::Memory(memory_index) => {
+				Ok(self.types.intern(Type::Memory { memory_index }))
+			}
+			kind => {
+				let stopped = &segments[walk.stopped_at as usize];
+				self.diagnostics.push(report_not_a_memory(
+					file_id,
+					self.strings,
+					stopped.ident,
+					kind,
+				));
+				Err(())
+			}
+		}
+	}
+
+	/// The memory a pointer/slice/array type belongs to — an explicit
+	/// `heap::` tag if it has one, the ambient one otherwise. Shared by
+	/// `Pointer`/`Slice`/`Array`'s three arms in `resolve_type`, which
+	/// otherwise differ only in which `Type` variant they intern.
+	fn resolve_pointer_memory(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		memory: &Option<Box<[ast::PathSegment]>>,
+		span: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		match memory {
+			Some(segments) => self.resolve_memory_tag(file_id, namespace, segments),
+			None => self.resolve_ambient_memory(file_id, span),
+		}
 	}
 
 	/// Resolves a written type. `Reject` diagnoses `_` at its own span and
@@ -1510,7 +2018,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// namespace graph get a turn. Either branch leaves `next`
 				// at the first segment *not yet* consumed.
 				let first = &segments[0];
-				let (mut current, mut next) = if first.type_args.is_empty()
+				let (current, next) = if first.type_args.is_empty()
 					&& let Some(ty) = self.type_envs.resolve(
 						env,
 						first.ident.inner,
@@ -1565,19 +2073,29 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 							}
 						}
 						DefKind::Struct(struct_index) => {
-							// Identity and param bounds only —
-							// deliberately not `ensure_signature`: a
-							// struct's fields don't need to be resolved to
-							// name the struct itself or check its own type
-							// arguments, which is what lets a self-/
-							// mutually-referencing pointer field resolve
-							// without falsely tripping the cycle machinery
-							// `TypeAlias` needs. `type_params` is written
-							// as soon as the struct's own generic
-							// parameters are resolved (see the
-							// `RecordStruct`/`TupleStruct` arms above),
-							// specifically so this read is safe even
-							// mid-resolution.
+							// Only forces resolution for a genuine forward
+							// reference (`Pending`); an in-progress struct
+							// is left alone so `check_struct_direct_recursion`
+							// downstream still gets to observe `Cycle`
+							// itself. Either way `type_params` (written
+							// before fields, see `RecordStruct`/
+							// `TupleStruct` above) is already valid to
+							// read by the time we get here.
+							let def_id = self.defs.structs
+								[usize::from(struct_index)]
+							.def_id;
+							if matches!(
+								self.query_state[&def_id].state,
+								QueryState::Pending
+							) {
+								let _ = self.ensure_signature(QueryInfo {
+									def_id,
+									requested_at: Some(SourceSpan::new(
+										file_id,
+										stopped.ident.span,
+									)),
+								});
+							}
 							let params_env = self.structs
 								[usize::from(struct_index)]
 							.type_params;
@@ -1610,8 +2128,45 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 								type_args,
 							})
 						}
-						_ => todo!(
-							"resolving a path to this kind of item isn't implemented yet"
+						DefKind::Enum(_) => todo!(
+							"resolving a path to an enum isn't implemented yet"
+						),
+						// A bare memory name in type position — unusual (its
+						// only real use is as a memory tag's prefix, e.g.
+						// `heap::*u8`, which resolves through
+						// `resolve_memory_tag` instead), but well-defined:
+						// every `memory` declaration is its own nominal type
+						// constructor, same as a struct or enum.
+						DefKind::Memory(memory_index) => {
+							self.types.intern(Type::Memory { memory_index })
+						}
+						kind @ (DefKind::Module(_)
+						| DefKind::Package(_)
+						| DefKind::Import(_)
+						| DefKind::Trait(_)
+						| DefKind::TypeSet(_)) => {
+							self.diagnostics.push(report_not_a_type(
+								file_id,
+								self.strings,
+								stopped.ident,
+								kind,
+							));
+							TypeIndex::ERROR
+						}
+						// Value-tier only — a `BindingNamespace::Type` walk
+						// can never stop on one of these.
+						DefKind::EnumVariant(_)
+						| DefKind::Global(_)
+						| DefKind::Function(_)
+						| DefKind::Const(_) => unreachable!(
+							"value-tier DefKind from a type-namespace path walk"
+						),
+						// Never constructed anywhere — associated types are
+						// only ever reached through `resolve_type_member`'s
+						// own `MemberKind::AssociatedType`, never as a
+						// top-level namespace symbol.
+						DefKind::TraitAssocType(_) => unreachable!(
+							"TraitAssocType is never registered as a namespace symbol"
 						),
 					};
 
@@ -1621,80 +2176,56 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// Whatever's left continues through impl dispatch or a
 				// bound instead of the namespace graph — `members.rs`'s
 				// job, not this module's.
-				while next < segments.len() {
-					let segment = &segments[next];
-					if !segment.type_args.is_empty() {
-						todo!(
-							"generic args on a type-relative path segment aren't implemented yet"
-						)
-					}
-					match self.resolve_type_member(
-						current,
-						BindingNamespace::Type,
-						segment.ident.inner,
-						SourceSpan::new(file_id, segment.ident.span),
-					) {
-						TypeMemberLookup::Found(member) => {
-							current = match member.kind {
-								MemberKind::AssociatedType(_) => {
-									match member.source {
-										MemberSource::Bound(trait_index) => {
-											self.types.intern(
-												Type::AssocTypeProjection {
-													trait_index,
-													assoc_name: segment
-														.ident
-														.inner,
-													base: current,
-												},
-											)
-										}
-										MemberSource::Inherent(_)
-										| MemberSource::TraitImpl(..)
-										| MemberSource::TraitDefault(_) => {
-											todo!(
-												"associated-type projection off a concrete receiver isn't implemented yet — needs TraitImplAssocType's own signature resolution"
-											)
-										}
-									}
-								}
-								// `resolve_type_member` was called with
-								// `BindingNamespace::Type` — a Function/
-								// Method/Constant is Value-tier, so
-								// `bindings` (keyed by tier) can never
-								// match one here.
-								MemberKind::Function(_)
-								| MemberKind::Method(_)
-								| MemberKind::Constant(_) => unreachable!(
-									"a Type-tier lookup cannot resolve to a Value-tier member"
-								),
-							};
-						}
-						TypeMemberLookup::NotFound => {
-							self.diagnostics.push(report_no_such_type_member(
-								file_id,
-								self.strings,
-								segment.ident,
-							));
-							return TypeIndex::ERROR;
-						}
-						TypeMemberLookup::Ambiguous(candidates) => {
-							self.diagnostics.push(
-								report_ambiguous_type_member(
-									file_id,
-									self.strings,
-									self.defs,
-									segment.ident,
-									&candidates,
-								),
-							);
-							return TypeIndex::ERROR;
-						}
-					}
-					next += 1;
-				}
+				self.resolve_type_member_path(
+					file_id,
+					current,
+					&segments[next..],
+				)
+			}
+			ast::TypeExpression::Grouped { inner, segments } => {
+				// `<T>::Item` — no namespace-tier prefix to consume first
+				// (unlike `Path`'s `T::Item`, where `T` might itself be a
+				// multi-segment namespace path): `inner` is already a full
+				// type expression, so the member walk starts on it directly.
+				let current = self.resolve_type(
+					file_id, namespace, env, inner, infer_policy,
+				);
+				self.resolve_type_member_path(file_id, current, segments)
+			}
+			ast::TypeExpression::QualifiedPath { root, segments } => {
+				let base_ty = self.resolve_type(
+					file_id, namespace, env, &root.self_type, infer_policy,
+				);
+				let Some(required_trait) = self.resolve_trait_bound_path(
+					file_id,
+					namespace,
+					&root.trait_path,
+				) else {
+					return TypeIndex::ERROR;
+				};
 
-				current
+				// Only the first segment is ever trait-qualified — it pins
+				// down *which* trait provides that one name; everything
+				// after it is projected off whatever that named, same as
+				// `Grouped`/`Path`, through the ordinary
+				// `resolve_type_member_path`.
+				let first = &segments[0];
+				if !first.type_args.is_empty() {
+					todo!(
+						"generic args on a type-relative path segment aren't implemented yet"
+					)
+				}
+				let Ok(member) = self.resolve_trait_qualified_member(
+					base_ty,
+					required_trait,
+					BindingNamespace::Type,
+					first.ident,
+					file_id,
+				) else {
+					return TypeIndex::ERROR;
+				};
+				let current = self.project_type_member(base_ty, member);
+				self.resolve_type_member_path(file_id, current, &segments[1..])
 			}
 			ast::TypeExpression::Function { params, result } => {
 				let mut param_types = Vec::with_capacity(params.len());
@@ -1720,6 +2251,71 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.types.intern(Type::Function {
 					params: param_types.into_boxed_slice(),
 					result: result_type,
+				})
+			}
+			ast::TypeExpression::Pointer {
+				ownership,
+				memory,
+				inner,
+			} => {
+				let to =
+					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let Ok(memory) = self.resolve_pointer_memory(
+					file_id,
+					namespace,
+					memory,
+					type_expr.span,
+				) else {
+					return TypeIndex::ERROR;
+				};
+				self.types.intern(Type::Pointer {
+					to,
+					memory,
+					ownership: *ownership,
+				})
+			}
+			ast::TypeExpression::Slice {
+				ownership,
+				memory,
+				inner,
+			} => {
+				let of =
+					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let Ok(memory) = self.resolve_pointer_memory(
+					file_id,
+					namespace,
+					memory,
+					type_expr.span,
+				) else {
+					return TypeIndex::ERROR;
+				};
+				self.types.intern(Type::Slice {
+					of,
+					memory,
+					ownership: *ownership,
+				})
+			}
+			ast::TypeExpression::Array {
+				ownership,
+				memory,
+				inner,
+				size,
+			} => {
+				let of =
+					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let Ok(memory) = self.resolve_pointer_memory(
+					file_id,
+					namespace,
+					memory,
+					type_expr.span,
+				) else {
+					return TypeIndex::ERROR;
+				};
+				self.types.intern(Type::Array {
+					of,
+					size: size.inner as u32,
+					memory,
+					ownership: *ownership,
 				})
 			}
 			ast::TypeExpression::Tuple { elements } => {
@@ -2125,11 +2721,24 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 									InferSignatureKind::AssocTypeBinding,
 								),
 							);
-							let value = Spanned {
+							let unchecked = Spanned {
 								inner: resolved,
 								span: ty.span,
 							};
-							BindingRequirement::Equals(value)
+							// Validates against the trait's own declared
+							// bound for this member (`Memory::Size:
+							// PointerSize`, ...) — the same check any other
+							// provided associated-type value goes through.
+							let checked = self.check_assoc_type_value(
+								assoc_type_index,
+								unchecked,
+								file_id,
+								TypeEnvOwner::Trait(trait_index),
+							);
+							BindingRequirement::Equals(Spanned {
+								inner: checked,
+								span: ty.span,
+							})
 						}
 						ast::AssocTypeBindingKind::Bound(rhs_bound) => {
 							BindingRequirement::Bound(self.resolve_bounds(
@@ -2197,11 +2806,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let last = segments
 					.last()
 					.expect("a path always has at least one segment");
-				self.diagnostics.push(report_expected_trait_bound(
+				self.diagnostics.push(report_not_a_trait_bound(
 					file_id,
 					self.strings,
 					last.ident,
-					other.noun(),
+					other,
 				));
 				None
 			}
@@ -2268,6 +2877,46 @@ fn report_infer_in_signature(
 		)
 }
 
+fn report_not_a_type(
+	file_id: FileId,
+	strings: &StringInterner,
+	name: Spanned<SymbolU32>,
+	kind: DefKind,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NotAType.code())
+		.with_message(format!(
+			"expected type, found {} `{name_str}`",
+			kind.noun()
+		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("not a type"),
+		)
+}
+
+fn report_not_a_memory(
+	file_id: FileId,
+	strings: &StringInterner,
+	name: Spanned<SymbolU32>,
+	kind: DefKind,
+) -> Diagnostic<FileId> {
+	let name_str = strings.resolve(name.inner).unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NotAMemory.code())
+		.with_message(format!(
+			"expected a memory, found {} `{name_str}`",
+			kind.noun()
+		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("not a memory"),
+		)
+}
+
 fn report_missing_enum_repr(
 	file_id: FileId,
 	span: TextSpan,
@@ -2279,6 +2928,20 @@ fn report_missing_enum_repr(
 			SourceSpan::new(file_id, span)
 				.primary_label()
 				.with_message("add `: <type>` here"),
+		)
+}
+
+fn report_missing_type_alias_body(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingTypeAliasBody.code())
+		.with_message("free type alias without body")
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("provide a definition for the type: `= <type>;`"),
 		)
 }
 
@@ -2340,52 +3003,57 @@ fn report_duplicate_function_param(
 		)
 }
 
-fn report_no_such_type_member(
-	file_id: FileId,
+fn report_missing_parameter_type(
 	strings: &StringInterner,
+	file_id: FileId,
 	name: Spanned<SymbolU32>,
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	Diagnostic::error()
-		.with_code(DiagnosticCode::NotATraitMember.code())
+		.with_code(DiagnosticCode::MissingParameterType.code())
 		.with_message(format!(
-			"no associated type named `{name_str}` found for this type"
+			"parameter `{name_str}` requires an explicit type"
 		))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("expected `: Type` here"),
+		)
+}
+
+/// Same wording as rustc's own `missing type for \`const\` item` message.
+/// No suggested type yet, unlike rustc's `help:` — worth adding once this
+/// architecture can infer one from the value expression.
+fn report_missing_global_type(
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingGlobalType.code())
+		.with_message("missing type for `global` item")
 		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }
 
-/// `candidates` never holds a `MemberSource::Inherent` entry — inherent
-/// always wins outright in `resolve_concrete_member`, before any trait
-/// candidate is even gathered, so nothing ever reaches `Ambiguous` through
-/// it.
-fn report_ambiguous_type_member(
+fn report_no_memory_for_pointer(
 	file_id: FileId,
-	strings: &StringInterner,
-	defs: &DefinitionRegistry,
-	name: Spanned<SymbolU32>,
-	candidates: &[TypeMemberTarget],
+	span: TextSpan,
 ) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	let mut diagnostic = Diagnostic::error()
-		.with_code(DiagnosticCode::AmbiguousTraitMember.code())
-		.with_message(format!(
-			"`{name_str}` is ambiguous between multiple traits"
-		))
-		.with_label(SourceSpan::new(file_id, name.span).primary_label());
-	for candidate in candidates {
-		let trait_index = match candidate.source {
-			MemberSource::TraitImpl(trait_index, _)
-			| MemberSource::TraitDefault(trait_index)
-			| MemberSource::Bound(trait_index) => trait_index,
-			MemberSource::Inherent(_) => continue,
-		};
-		let trait_name = strings
-			.resolve(defs.traits[usize::from(trait_index)].name.inner)
-			.unwrap();
-		diagnostic =
-			diagnostic.with_note(format!("provided by trait `{trait_name}`"));
-	}
-	diagnostic
+	Diagnostic::error()
+		.with_code(DiagnosticCode::NoMemoryForPointer.code())
+		.with_message("a pointer type requires a linear memory")
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note("declare a memory in this module: `memory <name>: u32;`")
+}
+
+fn report_ambiguous_pointer_memory(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::AmbiguousPointerMemory.code())
+		.with_message("pointer type is ambiguous: multiple memories are declared")
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note("specify which memory with `<memory_name>::*T` syntax")
 }
 
 #[cfg(test)]
@@ -2651,6 +3319,68 @@ mod tests {
 					panic!("expected `{trait_path}` to have a const `{name}`")
 				});
 			let member = &trait_def.members[usize::from(member_index)];
+			let MemberKind::Constant(index) = member.kind else {
+				panic!("expected `{name}` to be a const");
+			};
+			&self.signatures.constants[usize::from(index)]
+		}
+
+		/// The `InherentImplIdx` of `struct_path`'s own (single, in these
+		/// tests) inherent `impl` block, found the same way dispatch itself
+		/// would at a method call site.
+		fn inherent_impl_index(&self, struct_path: &str) -> InherentImplIdx {
+			let target = ImplTarget::Struct(self.struct_index(struct_path));
+			self.signatures.impl_dispatch.inherent_candidates(target)[0]
+		}
+
+		fn inherent_function_signature(
+			&self,
+			struct_path: &str,
+			name: &str,
+		) -> &FunctionSignature {
+			let impl_index = self.inherent_impl_index(struct_path);
+			let symbol = self
+				.graph
+				.strings
+				.get(name)
+				.expect("already interned from source");
+			let impl_def = &self.defs.inherent_impls[usize::from(impl_index)];
+			let &member_index = impl_def
+				.bindings
+				.get(&BindingKey::value(symbol))
+				.unwrap_or_else(|| {
+					panic!(
+						"expected `{struct_path}` to have a function `{name}`"
+					)
+				});
+			let member = &impl_def.members[usize::from(member_index)];
+			let (MemberKind::Function(index) | MemberKind::Method(index)) =
+				member.kind
+			else {
+				panic!("expected `{name}` to be a function");
+			};
+			&self.signatures.functions[usize::from(index)]
+		}
+
+		fn inherent_const_signature(
+			&self,
+			struct_path: &str,
+			name: &str,
+		) -> &ConstantSignature {
+			let impl_index = self.inherent_impl_index(struct_path);
+			let symbol = self
+				.graph
+				.strings
+				.get(name)
+				.expect("already interned from source");
+			let impl_def = &self.defs.inherent_impls[usize::from(impl_index)];
+			let &member_index = impl_def
+				.bindings
+				.get(&BindingKey::value(symbol))
+				.unwrap_or_else(|| {
+					panic!("expected `{struct_path}` to have a const `{name}`")
+				});
+			let member = &impl_def.members[usize::from(member_index)];
 			let MemberKind::Constant(index) = member.kind else {
 				panic!("expected `{name}` to be a const");
 			};
@@ -3013,7 +3743,7 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::ExpectedTraitBound.code())
+			Some(DiagnosticCode::NotATraitBound.code())
 		);
 		let header = case.signatures.trait_impls[0].as_ref().unwrap();
 		assert!(
@@ -3150,7 +3880,7 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::ExpectedTraitBound.code())
+			Some(DiagnosticCode::NotATraitBound.code())
 		);
 		assert_eq!(
 			case.diagnostics[0].message,
@@ -3418,6 +4148,45 @@ mod tests {
 	}
 
 	#[test]
+	fn a_forward_reference_to_a_generic_struct_resolves() {
+		let case = TestCase::new(indoc! {"
+			struct Holder { w: Wrapper<S> }
+			struct Wrapper<T> { value: T }
+			struct S {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let field_ty = case.struct_signature("Holder").field_types[0];
+		let Type::Struct {
+			struct_index,
+			type_args: args,
+		} = case.signatures.types.resolve(field_ty)
+		else {
+			panic!("expected a Struct type");
+		};
+		assert_eq!(*struct_index, case.struct_index("Wrapper"));
+		assert_eq!(args.len(), 1);
+	}
+
+	#[test]
+	fn a_trait_used_as_a_type_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			trait Bound {}
+			struct Holder { w: Bound }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::NotAType.code())
+		);
+		assert_eq!(
+			case.diagnostics[0].message,
+			"expected type, found trait `Bound`"
+		);
+	}
+
+	#[test]
 	fn a_struct_reference_with_too_few_type_arguments_is_diagnosed() {
 		let case = TestCase::new(indoc! {"
 			struct Wrapper<A, B> { a: A, b: B }
@@ -3602,6 +4371,48 @@ mod tests {
 	}
 
 	#[test]
+	fn a_non_intrinsic_type_alias_without_a_body_is_diagnosed() {
+		let case = TestCase::new("type X;");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::MissingTypeAliasBody.code())
+		);
+		assert_eq!(case.type_alias("X").target, TypeIndex::ERROR);
+	}
+
+	#[test]
+	fn an_untyped_free_function_parameter_is_diagnosed_here_not_in_prescan() {
+		for source in ["fn f(x) { }", "fn f(x);"] {
+			let case = TestCase::new(source);
+
+			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+			assert_eq!(
+				case.diagnostics[0].code.as_deref(),
+				Some(DiagnosticCode::MissingParameterType.code())
+			);
+			assert_eq!(
+				case.function_signature("f").param_types[0],
+				TypeIndex::ERROR
+			);
+		}
+	}
+
+	#[test]
+	fn an_untyped_non_self_trait_function_parameter_is_diagnosed() {
+		let case = TestCase::new("trait Foo { fn get(self, x) -> Self; }");
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::MissingParameterType.code())
+		);
+		let sig = case.trait_function_signature("Foo", "get");
+		assert_eq!(sig.param_types[1], TypeIndex::ERROR);
+	}
+
+	#[test]
 	fn an_enum_repr_resolves_to_the_named_integer_type() {
 		let case = TestCase::new(indoc! {"
 			type i32;
@@ -3652,6 +4463,493 @@ mod tests {
 	}
 
 	#[test]
+	fn trait_impl_assoc_type_resolves_to_its_provided_value() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let container = case.trait_index("Container");
+		let target = ImplTarget::Struct(case.struct_index("Wrapper"));
+		let &(_, impl_index) = case
+			.signatures
+			.trait_candidates(target)
+			.iter()
+			.find(|&&(trait_index, _)| trait_index == container)
+			.expect("Container is implemented for Wrapper");
+
+		let impl_def = &case.defs.trait_impls[usize::from(impl_index)];
+		let item_symbol = case
+			.graph
+			.strings
+			.get("Item")
+			.expect("already interned from source");
+		let &member_index = impl_def
+			.bindings
+			.get(&BindingKey::ty(item_symbol))
+			.expect("impl provides `Item`");
+		let MemberKind::AssociatedType(assoc_type_index) =
+			impl_def.members[usize::from(member_index)].kind
+		else {
+			panic!("expected `Item` to be an associated type");
+		};
+
+		let signature = case.signatures.assoc_types
+			[usize::from(assoc_type_index)]
+		.as_ref()
+		.expect("impl's associated type value is resolved");
+		assert_eq!(signature.value, Some(TypeIndex::I32));
+		assert!(signature.declared_bounds.is_empty());
+	}
+
+	#[test]
+	fn memory_declaration_registers_a_synthetic_impl_with_a_checked_size() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let DefKind::Memory(memory_index) =
+			case.resolve(BindingNamespace::Type, "heap")
+		else {
+			panic!("expected `heap` to be a memory");
+		};
+
+		let memory_trait = case.trait_index("Memory");
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Memory(memory_index));
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].0, memory_trait);
+
+		let memory_def = &case.defs.memories[usize::from(memory_index)];
+		let size_signature = case.signatures.assoc_types
+			[usize::from(memory_def.size_assoc_type_index)]
+		.as_ref()
+		.expect("memory's Size value is resolved");
+		assert_eq!(size_signature.value, Some(TypeIndex::U32));
+	}
+
+	#[test]
+	fn memory_size_violating_pointer_size_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type bool;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: bool;
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+
+		let DefKind::Memory(memory_index) =
+			case.resolve(BindingNamespace::Type, "heap")
+		else {
+			panic!("expected `heap` to be a memory");
+		};
+		let memory_def = &case.defs.memories[usize::from(memory_index)];
+		let size_signature = case.signatures.assoc_types
+			[usize::from(memory_def.size_assoc_type_index)]
+		.as_ref()
+		.expect("memory's Size value is resolved, even poisoned");
+		assert_eq!(size_signature.value, Some(TypeIndex::ERROR));
+	}
+
+	#[test]
+	fn global_declaration_registers_a_synthetic_impl_with_its_value_type() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			trait Global { type Value; }
+			global counter: u32 = 0;
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let DefKind::Global(global_index) =
+			case.resolve(BindingNamespace::Value, "counter")
+		else {
+			panic!("expected `counter` to be a global");
+		};
+
+		let global_trait = case.trait_index("Global");
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Global(global_index));
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].0, global_trait);
+
+		let global_def = &case.defs.globals[usize::from(global_index)];
+		assert!(global_def.mut_trait_impl_index.is_none());
+		let value_signature = case.signatures.assoc_types
+			[usize::from(global_def.value_assoc_type_index)]
+		.as_ref()
+		.expect("global's Value is resolved");
+		assert_eq!(value_signature.value, Some(TypeIndex::U32));
+	}
+
+	#[test]
+	fn mutable_global_also_registers_a_global_mut_impl() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			trait Global { type Value; }
+			trait GlobalMut: Global {}
+			global mut counter: u32 = 0;
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+
+		let DefKind::Global(global_index) =
+			case.resolve(BindingNamespace::Value, "counter")
+		else {
+			panic!("expected `counter` to be a global");
+		};
+		let global_mut_trait = case.trait_index("GlobalMut");
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Global(global_index));
+		assert!(
+			candidates.iter().any(|&(t, _)| t == global_mut_trait),
+			"expected a `GlobalMut` impl to be registered too"
+		);
+	}
+
+	#[test]
+	fn global_without_a_type_annotation_is_diagnosed_and_falls_back_to_error() {
+		let case = TestCase::new(indoc! {"
+			trait Global { type Value; }
+			global counter = 0;
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::MissingGlobalType.code())
+		);
+
+		let DefKind::Global(global_index) =
+			case.resolve(BindingNamespace::Value, "counter")
+		else {
+			panic!("expected `counter` to be a global");
+		};
+		let global_def = &case.defs.globals[usize::from(global_index)];
+		let value_signature = case.signatures.assoc_types
+			[usize::from(global_def.value_assoc_type_index)]
+		.as_ref()
+		.expect("global's Value is resolved, even poisoned");
+		assert_eq!(value_signature.value, Some(TypeIndex::ERROR));
+	}
+
+	#[test]
+	fn imported_memory_registers_a_synthetic_impl_with_a_checked_size() {
+		let case = TestCase::new(indoc! {r#"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			import "env" as host {
+				memory shared: u32;
+			}
+		"#});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Memory(memory_index) =
+			case.resolve(BindingNamespace::Type, "host::shared")
+		else {
+			panic!("expected `host::shared` to be a memory");
+		};
+		let memory_trait = case.trait_index("Memory");
+		let candidates =
+			case.signatures.trait_candidates(ImplTarget::Memory(memory_index));
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].0, memory_trait);
+		let memory_def = &case.defs.memories[usize::from(memory_index)];
+		let size_signature = case.signatures.assoc_types
+			[usize::from(memory_def.size_assoc_type_index)]
+		.as_ref()
+		.expect("memory's Size value is resolved");
+		assert_eq!(size_signature.value, Some(TypeIndex::U32));
+	}
+
+	#[test]
+	fn imported_global_registers_a_synthetic_impl_with_its_value_type() {
+		let case = TestCase::new(indoc! {r#"
+			type u32;
+			trait Global { type Value; }
+			import "env" as host {
+				global counter: u32;
+			}
+		"#});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Global(global_index) =
+			case.resolve(BindingNamespace::Value, "host::counter")
+		else {
+			panic!("expected `host::counter` to be a global");
+		};
+		let global_trait = case.trait_index("Global");
+		let candidates =
+			case.signatures.trait_candidates(ImplTarget::Global(global_index));
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].0, global_trait);
+		let global_def = &case.defs.globals[usize::from(global_index)];
+		assert!(global_def.mut_trait_impl_index.is_none());
+		let value_signature = case.signatures.assoc_types
+			[usize::from(global_def.value_assoc_type_index)]
+		.as_ref()
+		.expect("global's Value is resolved");
+		assert_eq!(value_signature.value, Some(TypeIndex::U32));
+	}
+
+	#[test]
+	fn imported_mutable_global_also_registers_a_global_mut_impl() {
+		let case = TestCase::new(indoc! {r#"
+			type u32;
+			trait Global { type Value; }
+			trait GlobalMut: Global {}
+			import "env" as host {
+				global mut counter: u32;
+			}
+		"#});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Global(global_index) =
+			case.resolve(BindingNamespace::Value, "host::counter")
+		else {
+			panic!("expected `host::counter` to be a global");
+		};
+		let global_mut_trait = case.trait_index("GlobalMut");
+		let candidates =
+			case.signatures.trait_candidates(ImplTarget::Global(global_index));
+		assert!(
+			candidates.iter().any(|&(t, _)| t == global_mut_trait),
+			"expected a `GlobalMut` impl to be registered too"
+		);
+	}
+
+	#[test]
+	fn imported_function_resolves_its_parameter_and_return_types() {
+		let case = TestCase::new(indoc! {r#"
+			type u32;
+			import "env" as host {
+				fn log(value: u32) -> u32;
+			}
+		"#});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "host::log")
+		else {
+			panic!("expected `host::log` to be a function");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		assert_eq!(signature.param_types.as_ref(), [TypeIndex::U32]);
+		assert_eq!(signature.return_type, TypeIndex::U32);
+	}
+
+	#[test]
+	fn pointer_type_resolves_through_the_sole_declared_memory() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			fn f(x: *u32);
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let DefKind::Memory(memory_index) =
+			case.resolve(BindingNamespace::Type, "heap")
+		else {
+			panic!("expected `heap` to be a memory");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		let &[param_type] = signature.param_types.as_ref() else {
+			panic!("expected exactly one parameter");
+		};
+		let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = case.signatures.types.resolve(param_type)
+		else {
+			panic!("expected `x` to resolve to a pointer type");
+		};
+		assert_eq!(*to, TypeIndex::U32);
+		assert_eq!(*ownership, ast::Ownership::Exclusive);
+		assert_eq!(
+			case.signatures.types.resolve(*memory),
+			&Type::Memory { memory_index }
+		);
+	}
+
+	#[test]
+	fn pointer_type_with_no_memory_declared_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			fn f(x: *u32);
+		"});
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::NoMemoryForPointer.code())
+		);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+	}
+
+	#[test]
+	fn pointer_type_with_multiple_memories_is_diagnosed_as_ambiguous() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			memory heap2: u32;
+			fn f(x: *u32);
+		"});
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::AmbiguousPointerMemory.code())
+		);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+	}
+
+	#[test]
+	fn slice_and_array_types_resolve_through_the_sole_declared_memory() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			fn f(s: &[u32], a: *[u32; 4]);
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let DefKind::Memory(memory_index) =
+			case.resolve(BindingNamespace::Type, "heap")
+		else {
+			panic!("expected `heap` to be a memory");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		let &[slice_type, array_type] = signature.param_types.as_ref() else {
+			panic!("expected exactly two parameters");
+		};
+		let Type::Slice { of, memory, ownership } =
+			case.signatures.types.resolve(slice_type)
+		else {
+			panic!("expected `s` to resolve to a slice type");
+		};
+		assert_eq!(*of, TypeIndex::U32);
+		assert_eq!(*ownership, ast::Ownership::Shared);
+		assert_eq!(
+			case.signatures.types.resolve(*memory),
+			&Type::Memory { memory_index }
+		);
+		let Type::Array {
+			of,
+			size,
+			memory,
+			ownership,
+		} = case.signatures.types.resolve(array_type)
+		else {
+			panic!("expected `a` to resolve to an array type");
+		};
+		assert_eq!(*of, TypeIndex::U32);
+		assert_eq!(*size, 4);
+		assert_eq!(*ownership, ast::Ownership::Exclusive);
+		assert_eq!(
+			case.signatures.types.resolve(*memory),
+			&Type::Memory { memory_index }
+		);
+	}
+
+	#[test]
+	fn memory_tagged_pointer_resolves_the_explicit_memory_despite_ambiguity() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			memory heap2: u32;
+			fn f(x: heap2::*u32);
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let DefKind::Memory(heap2_index) =
+			case.resolve(BindingNamespace::Type, "heap2")
+		else {
+			panic!("expected `heap2` to be a memory");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		let &[param_type] = signature.param_types.as_ref() else {
+			panic!("expected exactly one parameter");
+		};
+		let Type::Pointer { memory, .. } =
+			case.signatures.types.resolve(param_type)
+		else {
+			panic!("expected `x` to resolve to a pointer type");
+		};
+		assert_eq!(
+			case.signatures.types.resolve(*memory),
+			&Type::Memory {
+				memory_index: heap2_index
+			}
+		);
+	}
+
+	#[test]
+	fn memory_tag_naming_a_non_memory_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			struct Foo {}
+			fn f(x: Foo::*u32);
+		"});
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::NotAMemory.code())
+		);
+		let DefKind::Function(function_index) =
+			case.resolve(BindingNamespace::Value, "f")
+		else {
+			panic!("expected `f` to be a function");
+		};
+		let signature = &case.signatures.functions[usize::from(function_index)];
+		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+	}
+
+	#[test]
 	fn a_trait_associated_type_bound_resolves_to_the_named_traits() {
 		let case = TestCase::new(indoc! {"
 			trait Bound1 {}
@@ -3686,6 +4984,60 @@ mod tests {
 			"`self`'s type and a written `Self` return type should be the \
 			 exact same TypeParam"
 		);
+	}
+
+	#[test]
+	fn an_untyped_self_param_resolves_to_the_impls_own_concrete_target() {
+		let case = TestCase::new(indoc! {"
+			struct S {}
+			impl S { fn get(self) -> Self { self } }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let sig = case.inherent_function_signature("S", "get");
+		assert_eq!(sig.param_types.len(), 1);
+		assert_eq!(
+			sig.param_types[0], sig.return_type,
+			"`self` and a written `Self` return type should both resolve to \
+			 the impl's own concrete target"
+		);
+		assert!(
+			matches!(
+				case.signatures.types.resolve(sig.param_types[0]),
+				Type::Struct { .. }
+			),
+			"an inherent impl's `self` is a concrete type, not an abstract \
+			 TypeParam"
+		);
+	}
+
+	#[test]
+	fn an_inherent_impl_const_resolves_its_declared_type() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			struct S {}
+			impl S { const X: i32 = 0; }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let sig = case.inherent_const_signature("S", "X");
+		assert_eq!(sig.ty, TypeIndex::I32);
+	}
+
+	#[test]
+	fn a_non_self_untyped_inherent_impl_function_parameter_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			struct S {}
+			impl S { fn get(self, x) -> Self { self } }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::MissingParameterType.code())
+		);
+		let sig = case.inherent_function_signature("S", "get");
+		assert_eq!(sig.param_types[1], TypeIndex::ERROR);
 	}
 
 	#[test]
@@ -3751,7 +5103,7 @@ mod tests {
 		for (index, def) in case.defs.assoc_types.iter().enumerate() {
 			assert!(matches!(
 				case.signatures.item_lookup[&def.def_id],
-				SignatureLocation::TraitAssocType(found) if usize::from(found) == index
+				SignatureLocation::AssocType(found) if usize::from(found) == index
 			));
 		}
 		for (index, def) in case.defs.constants.iter().enumerate() {
@@ -3798,7 +5150,7 @@ mod tests {
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
 			case.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::ExpectedTraitBound.code())
+			Some(DiagnosticCode::NotATraitBound.code())
 		);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
@@ -4021,6 +5373,152 @@ mod tests {
 			}
 			other => panic!("expected an AssocTypeProjection, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn grouped_bracketed_self_type_projects_the_same_as_a_bare_path() {
+		let case = TestCase::new(indoc! {"
+			trait Global {
+				type Value;
+				fn get(self) -> <Self>::Value;
+			}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let sig = case.trait_function_signature("Global", "get");
+		let trait_index = case.trait_index("Global");
+		match case.signatures.types.resolve(sig.return_type) {
+			Type::AssocTypeProjection {
+				trait_index: found_trait,
+				base,
+				..
+			} => {
+				assert_eq!(*found_trait, trait_index);
+				assert_eq!(*base, sig.param_types[0]);
+			}
+			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn qualified_path_disambiguates_between_two_bounds_with_the_same_associated_type()
+	 {
+		let case = TestCase::new(indoc! {"
+			trait A { type X; }
+			trait B { type X; }
+			fn f<T: A + B>(x: <T as A>::X) { }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let trait_a = case.trait_index("A");
+		match case.signatures.types.resolve(case.function_signature("f").param_types[0])
+		{
+			Type::AssocTypeProjection { trait_index, .. } => {
+				assert_eq!(*trait_index, trait_a);
+			}
+			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn qualified_path_continues_projecting_after_its_first_segment() {
+		let case = TestCase::new(indoc! {"
+			trait B { type Y; }
+			trait A { type X: B; }
+			fn f<T: A>(x: <T as A>::X::Y) { }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let trait_b = case.trait_index("B");
+		match case.signatures.types.resolve(case.function_signature("f").param_types[0])
+		{
+			Type::AssocTypeProjection { trait_index, .. } => {
+				assert_eq!(*trait_index, trait_b);
+			}
+			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn qualified_path_naming_a_member_the_trait_does_not_declare_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			trait A { type X; }
+			fn f<T: A>(x: <T as A>::Y) { }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::NotATraitMember.code())
+		);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
+	}
+
+	#[test]
+	fn qualified_path_naming_a_trait_the_type_param_does_not_have_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			trait A { type X; }
+			trait B {}
+			fn f<T: B>(x: <T as A>::X) { }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
+	}
+
+	/// Blocked on `project_type_member`'s own `TraitImpl`/`TraitDefault`/
+	/// `Inherent` arm, still `todo!("associated-type projection off a
+	/// concrete receiver isn't implemented yet — needs TraitImplAssocType's
+	/// own signature resolution")` — a pre-existing gap, not something this
+	/// `QualifiedPath` feature introduces or needs to fix. `find_trait_impl`
+	/// itself already succeeds (`Wrapper` genuinely implements `Container`);
+	/// it's turning that found member into a `Type` that panics.
+	#[test]
+	#[ignore = "concrete-receiver associated-type projection isn't implemented yet (see project_type_member's todo!)"]
+	fn qualified_path_resolves_a_concrete_impls_associated_type() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+			fn f(x: <Wrapper as Container>::Item) { }
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::I32
+		);
+	}
+
+	#[test]
+	fn qualified_path_naming_a_trait_the_concrete_type_does_not_implement_is_diagnosed()
+	 {
+		let case = TestCase::new(indoc! {"
+			trait Container { type Item; }
+			struct Wrapper {}
+			fn f(x: <Wrapper as Container>::Item) { }
+		"});
+
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
 	}
 
 	/// Regression test: `TraitAssocType`'s own arm used to resolve at

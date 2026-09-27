@@ -222,7 +222,7 @@ fn test_top_level_items() {
             a + b
         }
 
-        memory MEM: Memory where { Size = u32 };
+        memory MEM: u32;
         global mut counter: i32 = 0;
         const MAX: i32 = 100;
 
@@ -582,7 +582,7 @@ fn test_pub_on_impl_assoc_type_is_recorded() {
 #[test]
 fn test_pub_not_applicable_to_memory_item_recovers() {
 	let case = TestCase::new(indoc! {"
-        pub memory MEM: Memory where { Size = u32 };
+        pub memory MEM: u32;
         fn add(a: i32, b: i32) -> i32 { a + b }
     "});
 
@@ -1799,7 +1799,7 @@ fn test_import_alias_and_entry_kinds() {
         import \"env\" as host {
             fn log(message: string);
             global mut counter: i32;
-            memory MEM: Memory where { Size = u32 };
+            memory MEM: u32;
         }
     "});
 
@@ -1897,6 +1897,26 @@ fn test_generic_application_type_args() {
 	assert_eq!(type_args.len(), 2);
 	assert!(matches!(type_args[0].inner, TypeExpression::Path(_)));
 	assert!(matches!(type_args[1].inner, TypeExpression::Path(_)));
+}
+
+#[test]
+fn test_path_continues_after_a_segment_with_type_args() {
+	let case = TestCase::new(indoc! {"
+        fn make(x: Vec<i32>::Item) {}
+    "});
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(0) else {
+		panic!("expected function")
+	};
+	let param_ty = &signature.params[0].inner.inner.ty.as_ref().unwrap().inner;
+	let TypeExpression::Path(segments) = param_ty else {
+		panic!("expected a path")
+	};
+	assert_eq!(segments.len(), 2);
+	assert_eq!(case.name(segments[0].ident.inner), "Vec");
+	assert_eq!(segments[0].type_args.len(), 1);
+	assert_eq!(case.name(segments[1].ident.inner), "Item");
+	assert!(segments[1].type_args.is_empty());
 }
 
 #[test]
@@ -2322,8 +2342,12 @@ fn test_infer_and_memory_tagged_types() {
 			.as_ref()
 			.expect("annotated")
 			.inner;
-		let TypeExpression::MemoryTagged { memory, .. } = ty else {
-			panic!("expected a memory-tagged type")
+		let memory = match ty {
+			TypeExpression::Pointer { memory, .. }
+			| TypeExpression::Slice { memory, .. } => memory
+				.as_ref()
+				.expect("tagged with an explicit memory"),
+			_ => panic!("expected a pointer or slice type"),
 		};
 		assert_eq!(case.name(memory[0].ident.inner), "heap");
 	}
@@ -2441,7 +2465,7 @@ fn test_attribute_with_arguments() {
 	// third shape, `#[name(arg = value, ...)]`.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1, max_pages = 4)]
-        memory m: Memory where { Size = u32 };
+        memory m: u32;
     "});
 	case.diagnostics().assert_none();
 

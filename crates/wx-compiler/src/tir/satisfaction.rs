@@ -13,16 +13,14 @@
 //! supertrait closure by `bounds.rs`, *is* the whole truth about it.
 
 use codespan_reporting::diagnostic::Diagnostic;
-use string_interner::symbol::SymbolU32;
 
 use super::bounds::{BoundId, ImpliedTraitBound};
-use super::defs::{DefinitionRegistry, TraitIdx};
+use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
 use super::impls::ImplTarget;
 use super::signatures::SignatureBuilder;
 use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::defs::FunctionIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
@@ -68,16 +66,14 @@ impl SignatureBuilder<'_, '_> {
 				}
 			}
 			Type::AssocTypeProjection {
-				trait_index: base_trait,
-				assoc_name,
-				..
+				assoc_type_index, ..
 			} => {
-				let (base_trait, assoc_name) = (*base_trait, *assoc_name);
-				match self.ensure_assoc_type_signature(
-					base_trait, assoc_name, reference,
-				) {
-					Some(index) => implies(
-						&self.assoc_types[usize::from(index)]
+				let assoc_type_index = *assoc_type_index;
+				match self
+					.ensure_assoc_type_signature(assoc_type_index, reference)
+				{
+					Ok(()) => implies(
+						&self.assoc_types[usize::from(assoc_type_index)]
 							.as_ref()
 							.expect(
 								"trait associated type signature is resolved",
@@ -85,11 +81,7 @@ impl SignatureBuilder<'_, '_> {
 							.implied_bounds,
 						trait_index,
 					),
-					// Not actually one of `base_trait`'s associated types,
-					// or a cycle — either way already diagnosed once, by
-					// whoever built this projection or by
-					// `ensure_assoc_type_signature` itself.
-					None => true,
+					Err(()) => true,
 				}
 			}
 			resolved => {
@@ -107,6 +99,66 @@ impl SignatureBuilder<'_, '_> {
 					.any(|&(candidate, _)| candidate == trait_index)
 			}
 		}
+	}
+
+	/// Checks a provided associated-type value against the trait's own
+	/// declared bound for that member (forcing it first) — `where { Size =
+	/// u32 }` against `Memory::Size: PointerSize`, an impl's `type Y = Z;`,
+	/// or a synthesized memory/global's own value. `declared_assoc_type`
+	/// must be the trait's own declaration (`TraitAssocType`'s own
+	/// `AssocTypeIdx`), never an impl's provided-value slot — same
+	/// requirement `ensure_assoc_type_signature` already has, which this
+	/// forces first.
+	///
+	/// Diagnoses and returns `TypeIndex::ERROR` for the first bound `value`
+	/// fails; `value.inner` unchanged if every bound is satisfied, or if
+	/// the declaration turned out cyclic (already diagnosed by the force
+	/// above — same shortcut `type_satisfies_trait` takes for `Error`/
+	/// `Infer`, rather than piling a second failure on top).
+	///
+	/// Re-indexes `self.assoc_types[declared_assoc_type]` fresh on each
+	/// iteration instead of holding a slice across the loop, so the
+	/// `&Copy` pair it needs (`trait_index`, `source`) is extracted in a
+	/// scope that ends before the `&mut self` call below — no allocation,
+	/// no cloning the bound list.
+	pub(super) fn check_assoc_type_value(
+		&mut self,
+		declared_assoc_type: AssocTypeIdx,
+		value: Spanned<TypeIndex>,
+		file_id: FileId,
+		owner: TypeEnvOwner,
+	) -> TypeIndex {
+		let reference = SourceSpan::new(file_id, value.span);
+		if self
+			.ensure_assoc_type_signature(declared_assoc_type, reference)
+			.is_err()
+		{
+			return value.inner;
+		}
+		let len = self.assoc_types[usize::from(declared_assoc_type)]
+			.as_ref()
+			.expect("trait associated type signature is resolved")
+			.implied_bounds
+			.len();
+		for i in 0..len {
+			let (trait_index, bound_id) = {
+				let bound = &self.assoc_types
+					[usize::from(declared_assoc_type)]
+				.as_ref()
+				.expect("trait associated type signature is resolved")
+				.implied_bounds[i];
+				(bound.trait_index, bound.source)
+			};
+			if !self.type_satisfies_trait(value.inner, trait_index, reference)
+			{
+				let diagnostic = self.report_trait_bound_violation(
+					file_id, value, trait_index, bound_id, owner,
+				);
+				self.diagnostics.push(diagnostic);
+				return TypeIndex::ERROR;
+			}
+		}
+		value.inner
 	}
 
 	/// Resolves a written type-argument list against `params_env`'s own

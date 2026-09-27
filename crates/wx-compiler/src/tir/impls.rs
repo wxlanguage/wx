@@ -10,12 +10,12 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{self, DefId, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	tir::defs::{EnumIdx, StructIdx},
+	tir::defs::{EnumIdx, GlobalIdx, MemoryIdx, StructIdx},
 	vfs::FileId,
 };
 
 use super::{
-	bounds::report_expected_trait_bound,
+	bounds::report_not_a_trait_bound,
 	defs::{
 		AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
 		DefinitionRegistry, DuplicateDefinitionDiagnostic, InherentImplIdx,
@@ -47,6 +47,13 @@ pub(super) enum ImplTarget {
 	Slice,
 	Struct(StructIdx),
 	Enum(EnumIdx),
+	/// Never a *written* impl target — reached only via `from_type` (looking
+	/// up members on a concrete receiver) and via the synthetic impl each
+	/// `memory`/`global` declaration gets registered under directly, since
+	/// its target is already known from the declaration itself, with no
+	/// path for `resolve_target` to parse.
+	Memory(MemoryIdx),
+	Global(GlobalIdx),
 }
 
 impl ImplTarget {
@@ -68,6 +75,8 @@ impl ImplTarget {
 			Type::Slice { .. } => Self::Slice,
 			Type::Struct { struct_index, .. } => Self::Struct(*struct_index),
 			Type::Enum { enum_index } => Self::Enum(*enum_index),
+			Type::Memory { memory_index } => Self::Memory(*memory_index),
+			Type::Global { global_index } => Self::Global(*global_index),
 			Type::Error
 			| Type::Infer
 			| Type::Unit
@@ -75,7 +84,6 @@ impl ImplTarget {
 			| Type::Integer
 			| Type::Float
 			| Type::Tuple { .. }
-			| Type::Memory { .. }
 			| Type::Function { .. }
 			| Type::FunctionItem { .. }
 			| Type::Pointer { .. }
@@ -294,6 +302,53 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						}
 					}
 				}
+				AstNodeRef::Memory { memory_index, item } => {
+					let ast::Item::Memory { name, .. } = item else {
+						unreachable!()
+					};
+					self.register_memory_impl(
+						*memory_index,
+						name.span,
+						entry.file_id,
+					);
+				}
+				AstNodeRef::ImportedMemory { memory_index, decl } => {
+					let ast::ImportDeclaration::Memory { name, .. } = decl
+					else {
+						unreachable!()
+					};
+					self.register_memory_impl(
+						*memory_index,
+						name.span,
+						entry.file_id,
+					);
+				}
+				AstNodeRef::Global { global_index, item } => {
+					let ast::Item::Global { name, mut_span, .. } = item
+					else {
+						unreachable!()
+					};
+					self.register_global_impl(
+						*global_index,
+						name.span,
+						*mut_span,
+						entry.file_id,
+					);
+				}
+				AstNodeRef::ImportedGlobal { global_index, decl } => {
+					let ast::ImportDeclaration::Global {
+						name, mut_span, ..
+					} = decl
+					else {
+						unreachable!()
+					};
+					self.register_global_impl(
+						*global_index,
+						name.span,
+						*mut_span,
+						entry.file_id,
+					);
+				}
 				_ => {}
 			}
 		}
@@ -341,6 +396,118 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			return;
 		}
 		bucket.push((trait_idx, trait_impl_idx));
+	}
+
+	/// Registers a `memory` declaration's synthetic `Memory` impl under its
+	/// own `ImplTarget::Memory` bucket. Shared by `AstNodeRef::Memory` and
+	/// `AstNodeRef::ImportedMemory` — a memory's target is its own identity
+	/// either way, so a locally declared memory and an imported one register
+	/// exactly the same way.
+	fn register_memory_impl(
+		&mut self,
+		memory_index: MemoryIdx,
+		name_span: TextSpan,
+		file_id: FileId,
+	) {
+		let defs = self.defs;
+		let memory_def = &defs.memories[usize::from(memory_index)];
+		let trait_idx = defs.intrinsics.memory.unwrap_or_else(|| {
+			panic!(
+				"the stdlib package must declare a `Memory` trait — every `memory` declaration needs one to synthesize its impl against"
+			)
+		});
+		self.trait_headers[usize::from(memory_def.trait_impl_index)] =
+			TraitImplHead {
+				trait_def: Some(Spanned {
+					inner: trait_idx,
+					span: name_span,
+				}),
+				target: Some(Spanned {
+					inner: ImplTarget::Memory(memory_index),
+					span: name_span,
+				}),
+			};
+		self.register_trait(
+			Spanned {
+				inner: ImplTarget::Memory(memory_index),
+				span: name_span,
+			},
+			trait_idx,
+			defs.traits[usize::from(trait_idx)].name.inner,
+			memory_def.trait_impl_index,
+			file_id,
+		);
+	}
+
+	/// Registers a `global` declaration's synthetic `Global` impl (and, for
+	/// `global mut`, its `GlobalMut` impl too) under its own
+	/// `ImplTarget::Global` bucket. Shared by `AstNodeRef::Global` and
+	/// `AstNodeRef::ImportedGlobal`, same reasoning as `register_memory_impl`.
+	fn register_global_impl(
+		&mut self,
+		global_index: GlobalIdx,
+		name_span: TextSpan,
+		mut_span: Option<TextSpan>,
+		file_id: FileId,
+	) {
+		let defs = self.defs;
+		let global_def = &defs.globals[usize::from(global_index)];
+		let global_trait_idx = defs.intrinsics.global.unwrap_or_else(|| {
+			panic!(
+				"the stdlib package must declare a `Global` trait — every `global` declaration needs one to synthesize its impl against"
+			)
+		});
+		self.trait_headers[usize::from(global_def.trait_impl_index)] =
+			TraitImplHead {
+				trait_def: Some(Spanned {
+					inner: global_trait_idx,
+					span: name_span,
+				}),
+				target: Some(Spanned {
+					inner: ImplTarget::Global(global_index),
+					span: name_span,
+				}),
+			};
+		self.register_trait(
+			Spanned {
+				inner: ImplTarget::Global(global_index),
+				span: name_span,
+			},
+			global_trait_idx,
+			defs.traits[usize::from(global_trait_idx)].name.inner,
+			global_def.trait_impl_index,
+			file_id,
+		);
+		if let Some(mut_trait_impl_index) = global_def.mut_trait_impl_index {
+			debug_assert!(mut_span.is_some());
+			let global_mut_trait_idx =
+				defs.intrinsics.global_mut.unwrap_or_else(|| {
+					panic!(
+						"the stdlib package must declare a `GlobalMut` trait — every `global mut` declaration needs one to synthesize its impl against"
+					)
+				});
+			self.trait_headers[usize::from(mut_trait_impl_index)] =
+				TraitImplHead {
+					trait_def: Some(Spanned {
+						inner: global_mut_trait_idx,
+						span: name_span,
+					}),
+					target: Some(Spanned {
+						inner: ImplTarget::Global(global_index),
+						span: name_span,
+					}),
+				};
+			self.register_trait(
+				Spanned {
+					inner: ImplTarget::Global(global_index),
+					span: name_span,
+				},
+				global_mut_trait_idx,
+				defs.traits[usize::from(global_mut_trait_idx)].name.inner,
+				mut_trait_impl_index,
+				file_id,
+			);
+		}
 	}
 
 	/// Buckets one inherent impl under `target`, reporting
@@ -479,11 +646,11 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		match binding.def_key()?.symbol_kind(self.defs) {
 			DefKind::Trait(idx) => Some(idx),
 			other => {
-				self.diagnostics.push(report_expected_trait_bound(
+				self.diagnostics.push(report_not_a_trait_bound(
 					file_id,
 					self.strings,
 					path.segments.last().unwrap().ident,
-					other.noun(),
+					other,
 				));
 				None
 			}
@@ -568,6 +735,9 @@ impl SignatureBuilder<'_, '_> {
 					"array and slice types cannot be path-only impl targets"
 				)
 			}
+			ImplTarget::Memory(_) | ImplTarget::Global(_) => unreachable!(
+				"memory/global impls are never resolved through a written path — see ImplTarget's own doc comment"
+			),
 		}
 	}
 

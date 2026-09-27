@@ -10,7 +10,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
+use super::defs::{AssocTypeIdx, DefKind, DefinitionRegistry, TraitIdx};
 use super::signatures::{QueryInfo, SignatureBuilder, SignatureStatus};
 use super::types::TypeIndex;
 
@@ -308,16 +308,19 @@ fn union_trait_bound(
 	}
 }
 
-pub(super) fn report_expected_trait_bound(
+pub(super) fn report_not_a_trait_bound(
 	file_id: FileId,
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,
-	noun: &str,
+	kind: DefKind,
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	Diagnostic::error()
-		.with_code(DiagnosticCode::ExpectedTraitBound.code())
-		.with_message(format!("expected trait, found {noun} `{name_str}`"))
+		.with_code(DiagnosticCode::NotATraitBound.code())
+		.with_message(format!(
+			"expected trait, found {} `{name_str}`",
+			kind.noun()
+		))
 		.with_label(
 			SourceSpan::new(file_id, name.span)
 				.primary_label()
