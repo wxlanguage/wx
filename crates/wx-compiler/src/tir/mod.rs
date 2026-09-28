@@ -19,6 +19,7 @@ mod impls;
 mod imports;
 mod literals;
 mod members;
+mod normalize;
 mod paths;
 mod satisfaction;
 mod signatures;

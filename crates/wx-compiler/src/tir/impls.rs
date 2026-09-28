@@ -47,11 +47,6 @@ pub(super) enum ImplTarget {
 	Slice,
 	Struct(StructIdx),
 	Enum(EnumIdx),
-	/// Never a *written* impl target — reached only via `from_type` (looking
-	/// up members on a concrete receiver) and via the synthetic impl each
-	/// `memory`/`global` declaration gets registered under directly, since
-	/// its target is already known from the declaration itself, with no
-	/// path for `resolve_target` to parse.
 	Memory(MemoryIdx),
 	Global(GlobalIdx),
 }
@@ -324,8 +319,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 				}
 				AstNodeRef::Global { global_index, item } => {
-					let ast::Item::Global { name, mut_span, .. } = item
-					else {
+					let ast::Item::Global { name, mut_span, .. } = item else {
 						unreachable!()
 					};
 					self.register_global_impl(
@@ -683,30 +677,6 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 }
 
 impl SignatureBuilder<'_, '_> {
-	/// Resolves a target's type to intern as `Self`. Dispatch (`impls.rs`'s
-	/// own build pass) only ever buckets by outer constructor identity —
-	/// two `impl Foo { }` blocks are just two sources of members for the
-	/// same bucket, checked against each other only for duplicate member
-	/// names (`ImplDispatchBuilder::register_inherent`), the same way
-	/// `register_trait` allows only one trait impl per bucket. A target's
-	/// own generic arguments (`impl<Mem, T> RawPtr<Mem, T> { }`) still need
-	/// real resolution against the struct/enum's own declared parameters —
-	/// not implemented yet, so a written argument is a `todo!()` here
-	/// rather than silently dropped.
-	pub(super) fn resolve_impl_target(
-		&mut self,
-		path: &ast::Path,
-		head: Option<Spanned<ImplTarget>>,
-	) -> TypeIndex {
-		let Some(head) = head else {
-			return TypeIndex::ERROR;
-		};
-		if !path.segments.last().unwrap().type_args.is_empty() {
-			todo!("generic impl target arguments aren't resolved yet")
-		}
-		self.impl_target_type(head.inner)
-	}
-
 	pub(super) fn impl_target_type(&mut self, target: ImplTarget) -> TypeIndex {
 		match target {
 			ImplTarget::U8 => TypeIndex::U8,

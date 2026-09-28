@@ -35,19 +35,20 @@ use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
 use super::bounds::{
-	BindingRequirement, BoundArena, BoundId, ImpliedTraitBound,
-	SourceAssocBinding, SourceTraitBound, report_duplicate_assoc_type_binding,
+	BindingRequirement, BoundArena, BoundFacts, BoundId, ImpliedAssocBinding,
+	ImpliedBindingKind, ImpliedTraitBound, SourceAssocBinding,
+	SourceTraitBound, report_duplicate_assoc_type_binding,
 	report_not_a_trait_bound, report_not_an_associated_type,
 };
-#[cfg(test)]
-use super::bounds::{ImpliedBindingKind, equals_type};
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingNamespace, ConstIdx,
 	DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx,
 	InherentImplIdx, MemberKind, MemoryIdx, NamespaceIdx, StructIdx, TraitIdx,
 	TraitImplIdx, TypesetIdx,
 };
-use super::impls::ImplDispatch;
+use super::impls::{ImplDispatch, ImplTarget};
+use super::members::AssocTypeProvider;
+use super::normalize::NormalizationState;
 use super::paths::PathResolver;
 use super::types::{
 	Type, TypeEnvArena, TypeEnvIdx, TypeIndex, TypeInterner, TypeParam,
@@ -68,22 +69,83 @@ pub struct ParamBounds {
 	/// directly to a concrete type) — nothing ever queries bounds for one
 	/// of those, so there's nothing to fill in.
 	pub declared_bounds: Box<[BoundId]>,
-	/// The transitive, conflict-merged closure of `declared_bounds` —
-	/// computed eagerly by `resolve_generic_params`, the same point
-	/// `TraitSignature::implied_bounds` computes its own (see that field's
-	/// doc comment): a conflicting bound combination has to be diagnosed
-	/// whether or not any code ever ends up projecting a member through
-	/// this param, so it can't wait for `resolve_bound_member` to demand it.
-	pub implied_bounds: Box<[ImpliedTraitBound]>,
+	/// Includes inherited and nested facts. Memberships are published before
+	/// equality RHS resolution — see `BoundFacts` — and the completed merge
+	/// diagnoses only conflicts already established by incompatible outer
+	/// constructors.
+	pub(super) facts: BoundFacts,
 }
 
 impl ParamBounds {
 	fn empty() -> Self {
 		Self {
 			declared_bounds: Box::new([]),
-			implied_bounds: Box::new([]),
+			facts: BoundFacts::empty(),
 		}
 	}
+}
+
+/// One accepted bound occurrence, decided once by
+/// `SignatureBuilder::collect_bound_occurrences` and shared by both the
+/// provisional-membership builder (`provisional_from_occurrences`) and the
+/// source-bound resolver (`SignatureBuilder::resolve_source_bounds_from`),
+/// so the two cannot disagree about which occurrences exist.
+struct BoundOccurrence<'expr> {
+	id: BoundId,
+	trait_index: TraitIdx,
+	span: SourceSpan,
+	bindings: Vec<BindingOccurrence<'expr>>,
+}
+
+struct BindingOccurrence<'expr> {
+	assoc_type_index: AssocTypeIdx,
+	name: Spanned<SymbolU32>,
+	kind: BindingOccurrenceKind<'expr>,
+}
+
+enum BindingOccurrenceKind<'expr> {
+	/// RHS not resolved yet — `resolve_source_bounds_from` resolves it once
+	/// every sibling param has provisional memberships published.
+	Equals(&'expr Spanned<ast::TypeExpression>),
+	Bound(Vec<BoundOccurrence<'expr>>),
+}
+
+/// Builds direct memberships from a decided occurrence tree, with
+/// `ImpliedBindingKind::Bound` standing in for every equality binding until
+/// `merge_implied_memberships` resolves its RHS. Whether any equality
+/// binding exists at all — the fact that decides if that merge pass is
+/// needed — is answered by `collect_bound_occurrences` itself, which
+/// already visits every binding once; it isn't rediscovered here.
+fn provisional_from_occurrences(
+	occurrences: &[BoundOccurrence<'_>],
+) -> Vec<ImpliedTraitBound> {
+	occurrences
+		.iter()
+		.map(|occurrence| {
+			let bindings = occurrence
+				.bindings
+				.iter()
+				.map(|binding| {
+					let required_bounds = match &binding.kind {
+						BindingOccurrenceKind::Equals(_) => Vec::new(),
+						BindingOccurrenceKind::Bound(nested) => {
+							provisional_from_occurrences(nested)
+						}
+					};
+					ImpliedAssocBinding {
+						assoc_type_index: binding.assoc_type_index,
+						kind: ImpliedBindingKind::Bound,
+						required_bounds,
+					}
+				})
+				.collect();
+			ImpliedTraitBound {
+				trait_index: occurrence.trait_index,
+				source: occurrence.id,
+				bindings,
+			}
+		})
+		.collect()
 }
 
 pub struct TypeAliasSignature {
@@ -166,9 +228,10 @@ pub struct ConstantSignature {
 /// doesn't declare a requirement).
 pub struct AssocTypeSignature {
 	pub(super) declared_bounds: Box<[BoundId]>,
-	/// See `ParamBounds::implied_bounds` — same reasoning, computed eagerly
-	/// right alongside `declared_bounds` rather than on first demand.
-	pub(super) implied_bounds: Box<[ImpliedTraitBound]>,
+	/// Effective facts from the declaration — see `BoundFacts`. A
+	/// provisional membership table can be read while equality RHS types
+	/// are still being resolved.
+	pub(super) facts: BoundFacts,
 	pub(super) value: Option<TypeIndex>,
 }
 
@@ -452,6 +515,12 @@ pub(super) struct QueryInfo {
 	pub(super) requested_at: Option<SourceSpan>,
 }
 
+#[derive(Clone, Copy)]
+enum BoundSubject {
+	Param { env: TypeEnvIdx, index: usize },
+	Assoc(AssocTypeIdx),
+}
+
 /// The Phase 2 driver. Holds `defs` — Phase 1's finished output, read-only
 /// from here on — plus whatever this phase needs on top of it.
 pub(super) struct SignatureBuilder<'ast, 'ctx> {
@@ -463,6 +532,7 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	query_state: HashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
 	query_stack: Vec<QueryInfo>,
+	pub(super) normalization: NormalizationState,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	pub(super) type_envs: TypeEnvArena,
@@ -528,6 +598,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			ast_nodes,
 			query_state,
 			query_stack: Vec::new(),
+			normalization: NormalizationState::default(),
 			types: TypeInterner::new(),
 			bounds: BoundArena::default(),
 			type_envs: TypeEnvArena::new(),
@@ -648,24 +719,79 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		self.param_bounds
 			.push((0..params.len()).map(|_| ParamBounds::empty()).collect());
 
-		// Resolved only now that `frame` exists (a bound can reference a
-		// sibling param, e.g. `T: Trait<U>`), and merged into
-		// `implied_bounds` right here, eagerly — see
-		// `ParamBounds::implied_bounds`'s own doc comment for why that
-		// can't wait for first demand.
-		for (index, ast_param) in params.iter().enumerate() {
-			let declared_bounds = match &ast_param.bounds {
-				Some(bound) => {
-					self.resolve_bounds(file_id, namespace, type_env, bound)
-				}
-				None => Box::new([]),
+		// A single walk per param decides which bound occurrences exist;
+		// both the provisional-membership pass below and the source-bound
+		// pass after it consume that same decided tree, so they cannot
+		// disagree about what they saw. See `collect_bound_occurrences`.
+		let mut occurrences_per_param = Vec::with_capacity(params.len());
+		let mut has_equalities = false;
+		for ast_param in params {
+			let mut occurrences = Vec::new();
+			if let Some(bound) = &ast_param.bounds {
+				has_equalities |= self.collect_bound_occurrences(
+					file_id,
+					namespace,
+					bound,
+					&mut occurrences,
+				);
+			}
+			occurrences_per_param.push(occurrences);
+		}
+
+		// Publish direct memberships for every sibling first. No binding RHS
+		// types or signature dependencies are resolved here.
+		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
+			let memberships = provisional_from_occurrences(occurrences);
+			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
+				declared_bounds: occurrences.iter().map(|o| o.id).collect(),
+				facts: BoundFacts::Provisional(memberships.into_boxed_slice()),
 			};
+		}
+		// Only equality expressions can need memberships during construction.
+		if has_equalities {
+			for index in 0..params.len() {
+				let subject = self.type_envs.frame(type_env)[index].ty;
+				let memberships = self.param_bounds[usize::from(type_env)]
+					[index]
+					.facts
+					.take();
+				self.param_bounds[usize::from(type_env)][index].facts =
+					BoundFacts::Provisional(
+						self.merge_implied_memberships(memberships, subject)
+							.into_boxed_slice(),
+					);
+			}
+		}
+
+		// Resolve source bounds now that every sibling has provisional
+		// memberships published, so an equality RHS can reference them.
+		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
+			let ids = self.resolve_source_bounds_from(
+				file_id,
+				namespace,
+				type_env,
+				occurrences,
+			);
+			self.param_bounds[usize::from(type_env)][index].declared_bounds =
+				ids.into_boxed_slice();
+		}
+
+		for (index, ast_param) in params.iter().enumerate() {
+			let subject = self.type_envs.frame(type_env)[index].ty;
+			let declared_bounds = std::mem::take(
+				&mut self.param_bounds[usize::from(type_env)][index]
+					.declared_bounds,
+			);
 			let implied_bounds = self
-				.compute_implied_bounds(&declared_bounds, ast_param.name.inner)
+				.compute_implied_bounds(
+					&declared_bounds,
+					ast_param.name.inner,
+					subject,
+				)
 				.into_boxed_slice();
 			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
 				declared_bounds,
-				implied_bounds,
+				facts: BoundFacts::Ready(implied_bounds),
 			};
 		}
 
@@ -698,13 +824,212 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			.push((0..count).map(|_| ParamBounds::empty()).collect());
 	}
 
+	/// Resolves a written impl target in the impl's own parameter frame. The
+	/// dispatch head only identifies candidates; its arguments are checked and
+	/// retained here so matching can use the full target later.
+	fn resolve_impl_target(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		env: TypeEnvIdx,
+		path: &ast::Path,
+		head: Option<Spanned<ImplTarget>>,
+	) -> TypeIndex {
+		let Some(head) = head else {
+			return TypeIndex::ERROR;
+		};
+		let Some(segment) = path.segments.last() else {
+			unreachable!("an impl target path is nonempty")
+		};
+		let ImplTarget::Struct(struct_index) = head.inner else {
+			if !segment.type_args.is_empty() {
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::TypeArgumentCountMismatch.code(),
+						)
+						.with_message(
+							"this impl target does not take type arguments",
+						)
+						.with_label(
+							SourceSpan::new(file_id, segment.ident.span)
+								.primary_label(),
+						),
+				);
+				return TypeIndex::ERROR;
+			}
+			return self.impl_target_type(head.inner);
+		};
+		let def_id = self.defs.structs[usize::from(struct_index)].def_id;
+		if matches!(self.query_state[&def_id].state, QueryState::Pending) {
+			let _ = self.ensure_signature(QueryInfo {
+				def_id,
+				requested_at: Some(SourceSpan::new(
+					file_id,
+					segment.ident.span,
+				)),
+			});
+		}
+		let params_env = self.structs[usize::from(struct_index)].type_params;
+		let resolved_args: Box<[Spanned<TypeIndex>]> = segment
+			.type_args
+			.iter()
+			.map(|arg| Spanned {
+				inner: self.resolve_type(
+					file_id,
+					namespace,
+					env,
+					arg,
+					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+				),
+				span: arg.span,
+			})
+			.collect();
+		let args = self.resolve_type_args(
+			file_id,
+			segment.ident.span,
+			params_env,
+			&resolved_args,
+			TypeEnvOwner::Struct(struct_index),
+		);
+		self.types.intern(Type::Struct {
+			struct_index,
+			type_args: args,
+		})
+	}
+
+	/// Demand an impl header, match its complete target, then validate the
+	/// arguments against the impl's own parameter bounds. The returned
+	/// arguments belong only to this lookup; no declaration frame is changed.
+	pub(super) fn match_trait_impl_candidate(
+		&mut self,
+		impl_index: TraitImplIdx,
+		receiver: TypeIndex,
+		reference: SourceSpan,
+	) -> Option<Box<[TypeIndex]>> {
+		if self.trait_impls[usize::from(impl_index)].is_none() {
+			let def_id = self.defs.trait_impls[usize::from(impl_index)].def_id;
+			// Memory/global synthetic impls have a unique nominal target
+			// already fixed by prescan. Keep their owner query lazy until an
+			// associated value is actually demanded.
+			if matches!(
+				self.ast_node(def_id),
+				AstNodeRef::Memory { .. }
+					| AstNodeRef::ImportedMemory { .. }
+					| AstNodeRef::Global { .. }
+					| AstNodeRef::ImportedGlobal { .. }
+			) {
+				let head = self.impl_dispatch.trait_header(impl_index).target?;
+				return (ImplTarget::from_type(self.types.resolve(receiver))
+					== Some(head.inner))
+				.then(Box::<[TypeIndex]>::default);
+			}
+			let _ = self.ensure_signature(QueryInfo {
+				def_id,
+				requested_at: Some(reference),
+			});
+		}
+		let header = self.trait_impls[usize::from(impl_index)].as_ref()?;
+		self.match_impl_target_and_bounds(
+			header.type_params,
+			header.target.inner,
+			receiver,
+			reference,
+		)
+	}
+
+	pub(super) fn match_inherent_impl_candidate(
+		&mut self,
+		impl_index: InherentImplIdx,
+		receiver: TypeIndex,
+		reference: SourceSpan,
+	) -> bool {
+		if self.inherent_impls[usize::from(impl_index)].is_none() {
+			let def_id =
+				self.defs.inherent_impls[usize::from(impl_index)].def_id;
+			let _ = self.ensure_signature(QueryInfo {
+				def_id,
+				requested_at: Some(reference),
+			});
+		}
+		let Some(header) =
+			self.inherent_impls[usize::from(impl_index)].as_ref()
+		else {
+			return false;
+		};
+		self.match_impl_target_and_bounds(
+			header.type_params,
+			header.target.inner,
+			receiver,
+			reference,
+		)
+		.is_some()
+	}
+
+	fn match_impl_target_and_bounds(
+		&mut self,
+		env: TypeEnvIdx,
+		target: TypeIndex,
+		receiver: TypeIndex,
+		reference: SourceSpan,
+	) -> Option<Box<[TypeIndex]>> {
+		// Structural matching below compares `receiver`'s nested children
+		// against `target`'s pattern directly, with no normalization of its
+		// own (`TypeInterner::match_pattern` is `&self`, with no access to
+		// this builder's normalization machinery) — so a receiver whose
+		// *nested* type argument is still an unreduced projection (e.g.
+		// `Wrap<S::Item>`) would otherwise fail to match a concrete impl
+		// (`impl Result for Wrap<i32>`) even when that projection reduces to
+		// exactly what the impl requires. Every caller of this function
+		// (`find_trait_impl`, `type_satisfies_trait`, generic-impl matching)
+		// converges here, so normalizing once, here, closes the gap for all
+		// of them instead of requiring each to remember it independently.
+		let receiver = self.normalize_type(receiver, reference);
+		let count = if env == TypeEnvIdx::ROOT {
+			0
+		} else {
+			self.type_envs.frame(env).len()
+		};
+		let args =
+			self.types.match_impl_target(target, receiver, env, count)?;
+		for (index, &arg) in args.iter().enumerate() {
+			let bound_count = self.param_bounds[usize::from(env)][index]
+				.facts
+				.current()
+				.len();
+			for bound_index in 0..bound_count {
+				let bound = &self.param_bounds[usize::from(env)][index]
+					.facts
+					.current()[bound_index];
+				// Equality and nested associated-type requirements need the
+				// assumption solver from checkpoint 4. Until then they must
+				// not be accepted on trait membership alone.
+				if !bound.bindings.is_empty() {
+					return None;
+				}
+				let trait_index = bound.trait_index;
+				let normalized = self.normalize_head(arg, reference);
+				if normalized == TypeIndex::ERROR
+					|| !self.type_satisfies_trait(
+						normalized,
+						trait_index,
+						reference,
+					) {
+					return None;
+				}
+			}
+		}
+		Some(args)
+	}
+
 	pub(super) fn implied_bounds(
 		&self,
 		env: TypeEnvIdx,
 		param_index: u32,
 	) -> &[ImpliedTraitBound] {
-		&self.param_bounds[usize::from(env)][param_index as usize]
-			.implied_bounds
+		self.param_bounds[usize::from(env)][param_index as usize]
+			.facts
+			.current()
 	}
 
 	/// `def_id`'s own `AstNodeRef` — `defs.rs`'s output, so this is pure
@@ -759,6 +1084,45 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		self.query_state.get_mut(&query.def_id).unwrap().state =
 			QueryState::Resolved(location);
 		SignatureStatus::Resolved(location)
+	}
+
+	/// Demands the query that owns this provider's slot. Written impl members
+	/// own a query; synthetic members reuse their memory/global owner's DefId.
+	/// Read the associated-type slot, not the owner's query result kind.
+	/// The value was normalized in its definition environment. Instantiation
+	/// and any normalization made possible by substitution belong to the caller.
+	pub(super) fn ensure_assoc_type_value(
+		&mut self,
+		provider: AssocTypeProvider,
+		reference: SourceSpan,
+	) -> TypeIndex {
+		let index = provider.index();
+		let def_id = self.defs.assoc_types[usize::from(index)].def_id;
+		match self.ensure_signature(QueryInfo {
+			def_id,
+			requested_at: Some(reference),
+		}) {
+			SignatureStatus::Resolved(_) => self.assoc_types
+				[usize::from(index)]
+			.as_ref()
+			.expect("the provider's owner populates its associated-type slot")
+			.value
+			.expect("an impl provider has a value, including error recovery"),
+			SignatureStatus::Cycle => {
+				self.diagnostics.push(self.report_cycle(
+					def_id,
+					reference,
+					DiagnosticCode::CyclicAssociatedType,
+					|name| {
+						format!(
+							"computing the associated-type value supplied by `{name}`"
+						)
+					},
+				));
+				TypeIndex::ERROR
+			}
+			SignatureStatus::CycleReported => TypeIndex::ERROR,
+		}
 	}
 
 	/// Resolves a `fn`'s generic params, parameter types and return type.
@@ -849,6 +1213,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
 		);
 
+		let resolved_size = self
+			.normalize_type(resolved_size, SourceSpan::new(file_id, size.span));
+
 		// `Size`'s actual constraint (`PointerSize`) lives on `Memory`'s own
 		// declaration, not hardcoded here — this looks it up and lets
 		// `check_assoc_type_value` validate against it, the same bound-
@@ -869,9 +1236,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 			let MemberKind::AssociatedType(index) =
 				trait_def.members[usize::from(member_index)].kind
 			else {
-				panic!(
-					"the stdlib's `Memory::Size` must be an associated type"
-				)
+				panic!("the stdlib's `Memory::Size` must be an associated type")
 			};
 			index
 		};
@@ -890,7 +1255,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		self.assoc_types[usize::from(size_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				implied_bounds: Box::new([]),
+				facts: BoundFacts::Ready(Box::new([])),
 				value: Some(checked_size),
 			});
 		self.trait_impls[usize::from(trait_impl_index)] =
@@ -923,12 +1288,16 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		let value_assoc_type_index = global_def.value_assoc_type_index;
 		let mut_trait_impl_index = global_def.mut_trait_impl_index;
 
+		let resolved_value = self.normalize_type(
+			resolved_value,
+			SourceSpan::new(global_def.file_id, name.span),
+		);
 		let global_type = self.types.intern(Type::Global { global_index });
 
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				implied_bounds: Box::new([]),
+				facts: BoundFacts::Ready(Box::new([])),
 				value: Some(resolved_value),
 			});
 
@@ -1051,33 +1420,27 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				self.reserve_param_bounds(self_scope);
 
-				let declared_bounds = match supertraits {
-					Some(bound) => self
-						.resolve_bounds(file_id, namespace, self_scope, bound),
-					None => Box::new([]),
-				};
-
-				for bound in declared_bounds.iter().copied() {
-					let bound = self.bounds.get(bound);
-					let super_def_id =
-						self.defs.traits[usize::from(bound.trait_index)].def_id;
-					let reference = bound.span;
-					let status = self.ensure_signature(QueryInfo {
-						def_id: super_def_id,
-						requested_at: Some(reference),
-					});
-					if let SignatureStatus::Cycle = status {
-						let diagnostic = self
-							.report_cyclic_supertrait(super_def_id, reference);
-						self.diagnostics.push(diagnostic);
-					}
-				}
-
-				let implied_bounds =
-					self.compute_implied_bounds(&declared_bounds, name.inner);
+				// The Self identity is available while its facts are collected;
+				// the surrounding signature query remains in progress.
+				self.traits[usize::from(trait_index)] =
+					TraitSignature { env: self_scope };
+				let subject = self.type_envs.frame(self_scope)[0].ty;
+				let (declared_bounds, implied_bounds) = self
+					.resolve_subject_bounds(
+						file_id,
+						namespace,
+						self_scope,
+						supertraits.as_ref(),
+						BoundSubject::Param {
+							env: self_scope,
+							index: 0,
+						},
+						subject,
+						name.inner,
+					);
 				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
 					declared_bounds,
-					implied_bounds: implied_bounds.into_boxed_slice(),
+					facts: BoundFacts::Ready(implied_bounds.into_boxed_slice()),
 				};
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
@@ -1244,22 +1607,28 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
 
-				let resolved_bounds = match bounds {
-					Some(bound) => self
-						.resolve_bounds(file_id, namespace, self_scope, bound),
-					None => Box::new([]),
-				};
-				// Eager, same reasoning as `ParamBounds::implied_bounds`: a
-				// conflicting bound combination must be diagnosed whether or
-				// not any impl ever projects a member through this
-				// associated type.
-				let implied_bounds =
-					self.compute_implied_bounds(&resolved_bounds, name.inner);
-
+				let base = self.type_envs.frame(self_scope)[0].ty;
+				let subject = self.types.intern(Type::AssocTypeProjection {
+					base,
+					trait_index,
+					assoc_type_index,
+				});
+				let (resolved_bounds, implied_bounds) = self
+					.resolve_subject_bounds(
+						file_id,
+						namespace,
+						self_scope,
+						bounds.as_ref(),
+						BoundSubject::Assoc(assoc_type_index),
+						subject,
+						name.inner,
+					);
 				self.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: resolved_bounds,
-						implied_bounds: implied_bounds.into_boxed_slice(),
+						facts: BoundFacts::Ready(
+							implied_bounds.into_boxed_slice(),
+						),
 						value: None,
 					});
 				SignatureLocation::AssocType(assoc_type_index)
@@ -1301,6 +1670,11 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
 				);
 
+				let resolved_ty = self.normalize_type(
+					resolved_ty,
+					SourceSpan::new(file_id, ty.span),
+				);
+
 				// An impl provides a value, it doesn't declare a
 				// requirement — `declared_bounds`/`implied_bounds` stay
 				// empty; only a trait's own declaration (the
@@ -1308,7 +1682,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				self.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: Box::new([]),
-						implied_bounds: Box::new([]),
+						facts: BoundFacts::Ready(Box::new([])),
 						value: Some(resolved_ty),
 					});
 				SignatureLocation::AssocType(assoc_type_index)
@@ -1544,6 +1918,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params,
 				);
 				let target_type = self.resolve_impl_target(
+					file_id,
+					namespace,
+					scope,
 					target,
 					self.impl_dispatch.inherent_target(block_index),
 				);
@@ -1727,8 +2104,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					type_params,
 				);
 				let header = self.impl_dispatch.trait_header(block_index);
-				let target_type =
-					self.resolve_impl_target(target, header.target);
+				let target_type = self.resolve_impl_target(
+					file_id,
+					namespace,
+					scope,
+					target,
+					header.target,
+				);
 				let target_span = target.span();
 				let target_spanned = Spanned {
 					inner: target_type,
@@ -1830,32 +2212,27 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				);
 				self.param_bounds.push(Box::new([ParamBounds::empty()]));
 
-				let clause_bounds = match bounds {
-					Some(bound) => self
-						.resolve_bounds(file_id, namespace, self_scope, bound),
-					None => Box::new([]),
-				};
-				for bound in &clause_bounds {
-					let bound = self.bounds.get(*bound);
-					let super_def_id =
-						self.defs.traits[usize::from(bound.trait_index)].def_id;
-					let reference = bound.span;
-					let status = self.ensure_signature(QueryInfo {
-						def_id: super_def_id,
-						requested_at: Some(reference),
-					});
-					if let SignatureStatus::Cycle = status {
-						let diagnostic = self
-							.report_cyclic_supertrait(super_def_id, reference);
-						self.diagnostics.push(diagnostic);
-					}
-				}
-
-				let implied_bounds =
-					self.compute_implied_bounds(&clause_bounds, name.inner);
+				// The Self identity is available while its facts are collected;
+				// the surrounding signature query remains in progress.
+				self.traits[usize::from(trait_index)] =
+					TraitSignature { env: self_scope };
+				let subject = self.type_envs.frame(self_scope)[0].ty;
+				let (clause_bounds, implied_bounds) = self
+					.resolve_subject_bounds(
+						file_id,
+						namespace,
+						self_scope,
+						bounds.as_ref(),
+						BoundSubject::Param {
+							env: self_scope,
+							index: 0,
+						},
+						subject,
+						name.inner,
+					);
 				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
 					declared_bounds: clause_bounds,
-					implied_bounds: implied_bounds.into_boxed_slice(),
+					facts: BoundFacts::Ready(implied_bounds.into_boxed_slice()),
 				};
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
@@ -1866,6 +2243,9 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				for (m, &impl_index) in members.iter().zip(member_impls.iter())
 				{
 					let member_ty = self.resolve_impl_target(
+						file_id,
+						namespace,
+						TypeEnvIdx::ROOT,
 						&m.inner.inner,
 						self.impl_dispatch.trait_header(impl_index).target,
 					);
@@ -1982,15 +2362,37 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		span: TextSpan,
 	) -> Result<TypeIndex, ()> {
 		match memory {
-			Some(segments) => self.resolve_memory_tag(file_id, namespace, segments),
+			Some(segments) => {
+				self.resolve_memory_tag(file_id, namespace, segments)
+			}
 			None => self.resolve_ambient_memory(file_id, span),
 		}
 	}
 
-	/// Resolves a written type. `Reject` diagnoses `_` at its own span and
-	/// recovers as `TypeIndex::ERROR`; `Allow` preserves it as `INFER`.
-	/// Nested types retain their shape. Other forms are still being implemented.
+	/// Resolve a written signature type and normalize the result. `_` follows
+	/// the caller's inference policy; nominal types retain their structure.
 	fn resolve_type(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		env: TypeEnvIdx,
+		type_expr: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		let ty = self.resolve_type_expression(
+			file_id,
+			namespace,
+			env,
+			type_expr,
+			infer_policy,
+		);
+		self.normalize_type(ty, SourceSpan::new(file_id, type_expr.span))
+	}
+
+	/// Resolve identities and structure without reducing the resulting type.
+	/// Member lookup can still normalize a receiver when needed to discover a
+	/// member, but stored equality expressions retain symbolic projections.
+	fn resolve_type_expression(
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIdx,
@@ -2105,7 +2507,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 									.type_args
 									.iter()
 									.map(|arg| Spanned {
-										inner: self.resolve_type(
+										inner: self.resolve_type_expression(
 											file_id,
 											namespace,
 											env,
@@ -2187,15 +2589,26 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				// (unlike `Path`'s `T::Item`, where `T` might itself be a
 				// multi-segment namespace path): `inner` is already a full
 				// type expression, so the member walk starts on it directly.
-				let current = self.resolve_type(
-					file_id, namespace, env, inner, infer_policy,
+				let current = self.resolve_type_expression(
+					file_id,
+					namespace,
+					env,
+					inner,
+					infer_policy,
 				);
 				self.resolve_type_member_path(file_id, current, segments)
 			}
 			ast::TypeExpression::QualifiedPath { root, segments } => {
-				let base_ty = self.resolve_type(
-					file_id, namespace, env, &root.self_type, infer_policy,
+				let base_ty = self.resolve_type_expression(
+					file_id,
+					namespace,
+					env,
+					&root.self_type,
+					infer_policy,
 				);
+				if base_ty == TypeIndex::ERROR {
+					return TypeIndex::ERROR;
+				}
 				let Some(required_trait) = self.resolve_trait_bound_path(
 					file_id,
 					namespace,
@@ -2225,12 +2638,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					return TypeIndex::ERROR;
 				};
 				let current = self.project_type_member(base_ty, member);
+
 				self.resolve_type_member_path(file_id, current, &segments[1..])
 			}
 			ast::TypeExpression::Function { params, result } => {
 				let mut param_types = Vec::with_capacity(params.len());
 				for param in params.iter() {
-					param_types.push(self.resolve_type(
+					param_types.push(self.resolve_type_expression(
 						file_id,
 						namespace,
 						env,
@@ -2239,7 +2653,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 					));
 				}
 				let result_type = match result {
-					Some(result) => self.resolve_type(
+					Some(result) => self.resolve_type_expression(
 						file_id,
 						namespace,
 						env,
@@ -2258,8 +2672,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				memory,
 				inner,
 			} => {
-				let to =
-					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let to = self.resolve_type_expression(
+					file_id,
+					namespace,
+					env,
+					inner,
+					infer_policy,
+				);
 				let Ok(memory) = self.resolve_pointer_memory(
 					file_id,
 					namespace,
@@ -2279,8 +2698,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				memory,
 				inner,
 			} => {
-				let of =
-					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let of = self.resolve_type_expression(
+					file_id,
+					namespace,
+					env,
+					inner,
+					infer_policy,
+				);
 				let Ok(memory) = self.resolve_pointer_memory(
 					file_id,
 					namespace,
@@ -2301,8 +2725,13 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				inner,
 				size,
 			} => {
-				let of =
-					self.resolve_type(file_id, namespace, env, inner, infer_policy);
+				let of = self.resolve_type_expression(
+					file_id,
+					namespace,
+					env,
+					inner,
+					infer_policy,
+				);
 				let Ok(memory) = self.resolve_pointer_memory(
 					file_id,
 					namespace,
@@ -2325,7 +2754,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				let mut elems: Vec<TypeIndex> =
 					Vec::with_capacity(elements.len());
 				for element in elements.iter() {
-					elems.push(self.resolve_type(
+					elems.push(self.resolve_type_expression(
 						file_id,
 						namespace,
 						env,
@@ -2465,7 +2894,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// Same family as `report_cyclic_implied_trait_bounds` — a trait
 	/// associated type's own declared bound (`type Size: PointerSize`)
 	/// closed a cycle while being forced, e.g. by
-	/// `members::ensure_assoc_type_signature`.
+	/// `members::ensure_assoc_type_bounds`.
 	pub(super) fn report_cyclic_assoc_type_bound(
 		&self,
 		def_id: DefId,
@@ -2617,102 +3046,206 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		}
 	}
 
-	fn resolve_bounds(
+	fn resolve_subject_bounds(
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIdx,
 		env: TypeEnvIdx,
-		bound: &Spanned<ast::BoundExpression>,
-	) -> Box<[BoundId]> {
-		let mut ids = Vec::new();
-		self.collect_bounds(file_id, namespace, env, bound, &mut ids);
-		ids.into_boxed_slice()
+		bound: Option<&Spanned<ast::BoundExpression>>,
+		location: BoundSubject,
+		subject: TypeIndex,
+		name: SymbolU32,
+	) -> (Box<[BoundId]>, Vec<ImpliedTraitBound>) {
+		let mut occurrences = Vec::new();
+		let has_equalities = bound.is_some_and(|bound| {
+			self.collect_bound_occurrences(
+				file_id,
+				namespace,
+				bound,
+				&mut occurrences,
+			)
+		});
+		let memberships = provisional_from_occurrences(&occurrences);
+		if matches!(location, BoundSubject::Param { .. })
+			&& matches!(self.type_envs.frame_owner(env), TypeEnvOwner::Trait(_))
+		{
+			for occurrence in &occurrences {
+				let def_id = self.defs.traits
+					[usize::from(occurrence.trait_index)]
+				.def_id;
+				let reference = occurrence.span;
+				if let SignatureStatus::Cycle =
+					self.ensure_signature(QueryInfo {
+						def_id,
+						requested_at: Some(reference),
+					}) {
+					let diagnostic =
+						self.report_cyclic_supertrait(def_id, reference);
+					self.diagnostics.push(diagnostic);
+				}
+			}
+		}
+		let memberships = if has_equalities {
+			self.merge_implied_memberships(memberships, subject)
+		} else {
+			memberships
+		}
+		.into_boxed_slice();
+		match location {
+			BoundSubject::Param { env, index } => {
+				self.param_bounds[usize::from(env)][index].facts =
+					BoundFacts::Provisional(memberships)
+			}
+			BoundSubject::Assoc(index) => {
+				self.assoc_types[usize::from(index)] =
+					Some(AssocTypeSignature {
+						declared_bounds: Box::new([]),
+						facts: BoundFacts::Provisional(memberships),
+						value: None,
+					})
+			}
+		}
+		let ids = self.resolve_source_bounds_from(
+			file_id,
+			namespace,
+			env,
+			&occurrences,
+		);
+		let implied = self.compute_implied_bounds(&ids, name, subject);
+		(ids.into_boxed_slice(), implied)
 	}
 
-	/// `+`-joined bounds flatten into one `Vec` — `T: Add + PartialEq`
-	/// produces two `BoundId`s, not a nested structure mirroring
-	/// `BoundList`.
-	fn collect_bounds(
+	/// Walks a bound expression exactly once, resolving trait paths,
+	/// reserving a `BoundId` per accepted occurrence, and reporting the
+	/// "not an associated type"/duplicate-binding diagnostics. The result is
+	/// consumed twice — once by `provisional_from_occurrences` to publish
+	/// direct memberships (no equality RHS types resolved), once by
+	/// `resolve_source_bounds_from` to resolve those RHS types and fill in
+	/// `self.bounds` — but which occurrences exist, and which bindings on
+	/// them are accepted, is decided exactly once, here. The two former
+	/// consumers used to re-walk the raw AST independently and could only be
+	/// proven to agree by comparing how many `BoundId`s each had reserved;
+	/// walking a shared `BoundOccurrence` tree instead makes that agreement
+	/// structural rather than an invariant to maintain by hand.
+	/// Returns whether any equality binding (nested ones included) was seen
+	/// — the fact `resolve_generic_params`/`resolve_subject_bounds` need to
+	/// decide whether `merge_implied_memberships` is worth running at all —
+	/// since this walk already visits every binding once and would
+	/// otherwise make a caller re-derive the same fact from its output.
+	fn collect_bound_occurrences<'expr>(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		expr: &'expr Spanned<ast::BoundExpression>,
+		out: &mut Vec<BoundOccurrence<'expr>>,
+	) -> bool {
+		let (segments, bindings) = match &expr.inner {
+			ast::BoundExpression::BoundList(list) => {
+				let mut has_equalities = false;
+				for entry in list.iter() {
+					has_equalities |= self.collect_bound_occurrences(
+						file_id, namespace, entry, out,
+					);
+				}
+				return has_equalities;
+			}
+			ast::BoundExpression::Path(segments) => {
+				(segments.as_ref(), &[][..])
+			}
+			ast::BoundExpression::WithBindings { path, bindings } => {
+				let ast::BoundExpression::Path(segments) = path.as_ref() else {
+					unreachable!("WithBindings.path is always a plain Path")
+				};
+				(segments.as_ref(), bindings.as_ref())
+			}
+		};
+		let Some(trait_index) =
+			self.resolve_trait_bound_path(file_id, namespace, segments)
+		else {
+			return false;
+		};
+		let span = SourceSpan::new(file_id, expr.span);
+		let id = self.bounds.reserve(trait_index, span);
+		let mut occurrence_bindings = Vec::new();
+		let mut has_equalities = false;
+		for binding in bindings.iter() {
+			let Some(assoc_type_index) =
+				self.assoc_binding_index(trait_index, binding.name.inner)
+			else {
+				self.diagnostics.push(report_not_an_associated_type(
+					file_id,
+					self.strings,
+					binding.name,
+					self.defs.traits[usize::from(trait_index)].name.inner,
+				));
+				continue;
+			};
+			if occurrence_bindings
+				.iter()
+				.any(|b: &BindingOccurrence<'expr>| {
+					b.assoc_type_index == assoc_type_index
+				}) {
+				self.diagnostics.push(report_duplicate_assoc_type_binding(
+					file_id,
+					self.strings,
+					binding.name,
+				));
+				continue;
+			}
+			let kind = match &binding.kind {
+				ast::AssocTypeBindingKind::Equals(ty) => {
+					has_equalities = true;
+					BindingOccurrenceKind::Equals(ty)
+				}
+				ast::AssocTypeBindingKind::Bound(rhs) => {
+					let mut nested = Vec::new();
+					has_equalities |= self.collect_bound_occurrences(
+						file_id,
+						namespace,
+						rhs,
+						&mut nested,
+					);
+					BindingOccurrenceKind::Bound(nested)
+				}
+			};
+			occurrence_bindings.push(BindingOccurrence {
+				assoc_type_index,
+				name: binding.name,
+				kind,
+			});
+		}
+		out.push(BoundOccurrence {
+			id,
+			trait_index,
+			span,
+			bindings: occurrence_bindings,
+		});
+		has_equalities
+	}
+
+	/// Resolves every equality binding's RHS type and fills `self.bounds` at
+	/// each occurrence's already-reserved `BoundId`. Run once every sibling
+	/// param has provisional memberships published, so an equality RHS can
+	/// reference a sibling's associated types.
+	fn resolve_source_bounds_from(
 		&mut self,
 		file_id: FileId,
 		namespace: NamespaceIdx,
 		env: TypeEnvIdx,
-		expr: &Spanned<ast::BoundExpression>,
-		bounds: &mut Vec<BoundId>,
-	) {
-		match &expr.inner {
-			ast::BoundExpression::BoundList(list) => {
-				for entry in list.iter() {
-					self.collect_bounds(file_id, namespace, env, entry, bounds);
-				}
-			}
-			ast::BoundExpression::Path(segments) => {
-				if let Some(trait_index) =
-					self.resolve_trait_bound_path(file_id, namespace, segments)
-				{
-					bounds.push(self.bounds.push(SourceTraitBound {
-						trait_index,
-						span: SourceSpan::new(file_id, expr.span),
-						bindings: Box::new([]),
-					}));
-				}
-			}
-			ast::BoundExpression::WithBindings { path, bindings } => {
-				// The parser only ever builds `WithBindings.path` as
-				// `Box::new(BoundExpression::Path(..))` (`parse_bound` in
-				// `ast/mod.rs`) — never a list or another `WithBindings`.
-				let ast::BoundExpression::Path(segments) = path.as_ref() else {
-					unreachable!("`WithBindings.path` is always a plain `Path`")
-				};
-				let Some(trait_index) =
-					self.resolve_trait_bound_path(file_id, namespace, segments)
-				else {
-					return;
-				};
-
-				let mut source_bindings: Vec<SourceAssocBinding> =
-					Vec::with_capacity(bindings.len());
-				for binding in bindings.iter() {
-					if source_bindings
-						.iter()
-						.any(|b| b.name.inner == binding.name.inner)
-					{
-						self.diagnostics.push(
-							report_duplicate_assoc_type_binding(
-								file_id,
-								self.strings,
-								binding.name,
-							),
-						);
-						continue;
-					}
-
-					let trait_def = &self.defs.traits[usize::from(trait_index)];
-					let assoc_type_index = trait_def
-						.bindings
-						.get(&BindingKey::ty(binding.name.inner))
-						.map(|&member_index| {
-							trait_def.members[usize::from(member_index)].kind
-						})
-						.and_then(|kind| match kind {
-							MemberKind::AssociatedType(index) => Some(index),
-							MemberKind::Function(_)
-							| MemberKind::Method(_)
-							| MemberKind::Constant(_) => None,
-						});
-					let Some(assoc_type_index) = assoc_type_index else {
-						self.diagnostics.push(report_not_an_associated_type(
-							file_id,
-							self.strings,
-							binding.name,
-							trait_def.name.inner,
-						));
-						continue;
-					};
-
+		occurrences: &[BoundOccurrence<'_>],
+	) -> Vec<BoundId> {
+		occurrences
+			.iter()
+			.map(|occurrence| {
+				let mut source_bindings =
+					Vec::with_capacity(occurrence.bindings.len());
+				for binding in &occurrence.bindings {
 					let kind = match &binding.kind {
-						ast::AssocTypeBindingKind::Equals(ty) => {
-							let resolved = self.resolve_type(
+						BindingOccurrenceKind::Equals(ty) => {
+							// Store the resolved expression without reducing
+							// its final value. Member lookup may still need
+							// to expose a receiver's constructor.
+							let value = self.resolve_type_expression(
 								file_id,
 								namespace,
 								env,
@@ -2721,45 +3254,49 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 									InferSignatureKind::AssocTypeBinding,
 								),
 							);
-							let unchecked = Spanned {
-								inner: resolved,
-								span: ty.span,
-							};
-							// Validates against the trait's own declared
-							// bound for this member (`Memory::Size:
-							// PointerSize`, ...) — the same check any other
-							// provided associated-type value goes through.
-							let checked = self.check_assoc_type_value(
-								assoc_type_index,
-								unchecked,
-								file_id,
-								TypeEnvOwner::Trait(trait_index),
-							);
 							BindingRequirement::Equals(Spanned {
-								inner: checked,
+								inner: value,
 								span: ty.span,
 							})
 						}
-						ast::AssocTypeBindingKind::Bound(rhs_bound) => {
-							BindingRequirement::Bound(self.resolve_bounds(
-								file_id, namespace, env, rhs_bound,
-							))
+						BindingOccurrenceKind::Bound(nested) => {
+							let nested_ids = self.resolve_source_bounds_from(
+								file_id, namespace, env, nested,
+							);
+							BindingRequirement::Bound(
+								nested_ids.into_boxed_slice(),
+							)
 						}
 					};
-
 					source_bindings.push(SourceAssocBinding {
+						assoc_type_index: binding.assoc_type_index,
 						name: binding.name,
-						assoc_type_index,
 						kind,
 					});
 				}
+				self.bounds.fill(
+					occurrence.id,
+					SourceTraitBound {
+						trait_index: occurrence.trait_index,
+						span: occurrence.span,
+						bindings: source_bindings.into_boxed_slice(),
+					},
+				);
+				occurrence.id
+			})
+			.collect()
+	}
 
-				bounds.push(self.bounds.push(SourceTraitBound {
-					trait_index,
-					span: SourceSpan::new(file_id, expr.span),
-					bindings: source_bindings.into_boxed_slice(),
-				}));
-			}
+	fn assoc_binding_index(
+		&self,
+		trait_index: TraitIdx,
+		name: SymbolU32,
+	) -> Option<AssocTypeIdx> {
+		let trait_def = &self.defs.traits[usize::from(trait_index)];
+		let &member_index = trait_def.bindings.get(&BindingKey::ty(name))?;
+		match trait_def.members[usize::from(member_index)].kind {
+			MemberKind::AssociatedType(index) => Some(index),
+			_ => None,
 		}
 	}
 
@@ -2851,6 +3388,35 @@ fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 		}
 		AstNodeRef::TypeSet { item, .. } => {
 			let ast::Item::TypeSet { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::TraitAssocType { item, .. } => {
+			let ast::TraitItem::AssociatedType { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::TraitImplAssocType { item, .. } => {
+			let ast::ImplItem::AssocType { name, .. } = item else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::Memory { item, .. } | AstNodeRef::Global { item, .. } => {
+			let (ast::Item::Memory { name, .. }
+			| ast::Item::Global { name, .. }) = item
+			else {
+				unreachable!()
+			};
+			*name
+		}
+		AstNodeRef::ImportedMemory { decl, .. }
+		| AstNodeRef::ImportedGlobal { decl, .. } => {
+			let (ast::ImportDeclaration::Memory { name, .. }
+			| ast::ImportDeclaration::Global { name, .. }) = decl
+			else {
 				unreachable!()
 			};
 			*name
@@ -3051,13 +3617,15 @@ fn report_ambiguous_pointer_memory(
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::AmbiguousPointerMemory.code())
-		.with_message("pointer type is ambiguous: multiple memories are declared")
+		.with_message(
+			"pointer type is ambiguous: multiple memories are declared",
+		)
 		.with_label(SourceSpan::new(file_id, span).primary_label())
 		.with_note("specify which memory with `<memory_name>::*T` syntax")
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
 	use indoc::indoc;
 
 	use super::*;
@@ -3065,6 +3633,126 @@ mod tests {
 	use crate::tir::defs::DefinitionRegistry;
 	use crate::tir::impls::ImplTarget;
 	use crate::vfs;
+
+	/// Stops before the signature sweep so tests can exercise demand order.
+	pub(in crate::tir) fn with_pending_signatures(
+		source: &str,
+		check: impl FnOnce(&mut SignatureBuilder<'_, '_>),
+	) {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		let root = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
+					"main.wx".to_string(),
+					source.to_string(),
+				)])),
+			)
+			.unwrap();
+		builder.set_stdlib(root);
+		let mut graph = builder.build(root);
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_parser_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		DiagnosticView::new(
+			"link",
+			&graph.collect_linker_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		let mut diagnostics = Vec::new();
+		let (defs, ast_nodes) = DefinitionRegistry::build(
+			&graph.packages,
+			&graph.files,
+			&mut graph.strings,
+			&mut diagnostics,
+			graph.stdlib_package,
+			graph.root_package,
+		);
+		let dispatch = ImplDispatch::build(
+			&mut diagnostics,
+			&graph.strings,
+			&defs,
+			&ast_nodes,
+		);
+		DiagnosticView::new("prescan/dispatch", &diagnostics, &graph.files)
+			.assert_none();
+		check(&mut SignatureBuilder::new(
+			&mut diagnostics,
+			&graph.strings,
+			&defs,
+			&ast_nodes,
+			dispatch,
+		));
+	}
+
+	fn pending_provider(
+		builder: &mut SignatureBuilder<'_, '_>,
+		receiver: TypeIndex,
+		name: &str,
+	) -> (AssocTypeIdx, AssocTypeProvider, SourceSpan) {
+		use crate::tir::members::{MemberSource, TypeMemberLookup};
+		let file_id = builder.defs.namespaces
+			[usize::from(builder.defs.root_package.root_namespace())]
+		.file_id;
+		let reference = SourceSpan::new(file_id, TextSpan::new(0, 1));
+		let name = builder.strings.get(name).unwrap();
+		let TypeMemberLookup::Found(member) = builder.resolve_type_member(
+			receiver,
+			BindingNamespace::Type,
+			name,
+			reference,
+		) else {
+			panic!("expected one associated type");
+		};
+		let MemberKind::AssociatedType(declaration) = member.kind else {
+			panic!("expected an associated type")
+		};
+		let MemberSource::TraitImpl(trait_index, impl_index) = member.source
+		else {
+			panic!("expected an impl override")
+		};
+		let qualified = builder
+			.resolve_trait_qualified_member(
+				receiver,
+				trait_index,
+				BindingNamespace::Type,
+				Spanned {
+					inner: name,
+					span: reference.span,
+				},
+				file_id,
+			)
+			.unwrap();
+		assert!(
+			matches!(qualified.kind, MemberKind::AssociatedType(index) if index == declaration)
+		);
+		let projection = builder.project_type_member(receiver, member);
+		assert!(
+			matches!(builder.types.resolve(projection), Type::AssocTypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
+		);
+		let provider = builder
+			.assoc_type_provider(impl_index, declaration)
+			.unwrap();
+		assert_ne!(declaration, provider.index());
+		assert!(matches!(
+			builder.ast_node(
+				builder.defs.assoc_types[usize::from(declaration)].def_id
+			),
+			AstNodeRef::TraitAssocType { .. }
+		));
+		let provider_def_id =
+			builder.defs.assoc_types[usize::from(provider.index())].def_id;
+		assert!(matches!(
+			builder.query_state[&provider_def_id].state,
+			QueryState::Pending
+		));
+		assert!(builder.assoc_types[usize::from(provider.index())].is_none());
+		(declaration, provider, reference)
+	}
 
 	/// Drives the real pipeline — parse, prescan, resolve — and keeps only
 	/// what a test needs to check afterward. `defs` and `ast_nodes` are local
@@ -4507,6 +5195,342 @@ mod tests {
 	}
 
 	#[test]
+	fn concrete_member_lookup_preserves_value_overrides_and_defaults() {
+		use crate::tir::members::{MemberSource, TypeMemberLookup};
+		with_pending_signatures(
+			indoc! {"
+			trait Container { fn overridden() {} fn inherited() {} }
+			struct Wrapper {}
+			impl Container for Wrapper { fn overridden() {} type Extra = (); }
+		"},
+			|builder| {
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let trait_index = TraitIdx::new(0);
+				let impl_index = TraitImplIdx::new(0);
+				let reference = SourceSpan::new(
+					builder.defs.traits[0].file_id,
+					TextSpan::new(0, 1),
+				);
+				for (name, overridden) in
+					[("overridden", true), ("inherited", false)]
+				{
+					let name = builder.strings.get(name).unwrap();
+					let key = BindingKey::new(BindingNamespace::Value, name);
+					let TypeMemberLookup::Found(member) = builder
+						.resolve_type_member(
+							receiver,
+							BindingNamespace::Value,
+							name,
+							reference,
+						)
+					else {
+						panic!("expected value member")
+					};
+					let MemberKind::Function(actual) = member.kind else {
+						panic!("expected function")
+					};
+					let expected = if overridden {
+						let def = &builder.defs.trait_impls[0];
+						assert!(
+							matches!(member.source, MemberSource::TraitImpl(t, i) if t == trait_index && i == impl_index)
+						);
+						def.members[usize::from(def.bindings[&key])].kind
+					} else {
+						let def = &builder.defs.traits[0];
+						assert!(
+							matches!(member.source, MemberSource::TraitDefault(t, i) if t == trait_index && i == impl_index)
+						);
+						def.members[usize::from(def.bindings[&key])].kind
+					};
+					assert!(
+						matches!(expected, MemberKind::Function(index) if index == actual)
+					);
+					let qualified = builder
+						.resolve_trait_qualified_member(
+							receiver,
+							trait_index,
+							BindingNamespace::Value,
+							Spanned {
+								inner: name,
+								span: reference.span,
+							},
+							reference.file_id,
+						)
+						.unwrap();
+					assert!(
+						matches!(qualified.kind, MemberKind::Function(index) if index == actual)
+					);
+				}
+				// No declaration exists for this impl member, so it must not
+				// become a projection with a provider index as its identity.
+				assert!(matches!(
+					builder.resolve_type_member(
+						receiver,
+						BindingNamespace::Type,
+						builder.strings.get("Extra").unwrap(),
+						reference
+					),
+					TypeMemberLookup::NotFound
+				));
+				assert!(builder.diagnostics.is_empty());
+			},
+		);
+	}
+
+	#[test]
+	fn associated_value_access_demands_a_pending_written_provider() {
+		with_pending_signatures(
+			indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = Later; }
+			type Later = i32;
+		"},
+			|builder| {
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let (declaration, provider, reference) =
+					pending_provider(builder, receiver, "Item");
+				assert_eq!(
+					builder.ensure_assoc_type_value(provider, reference),
+					TypeIndex::I32
+				);
+				assert_eq!(
+					builder.ensure_assoc_type_value(provider, reference),
+					TypeIndex::I32
+				);
+				builder
+					.ensure_assoc_type_bounds(declaration, reference)
+					.unwrap();
+				assert!(
+					builder.assoc_types[usize::from(declaration)]
+						.as_ref()
+						.unwrap()
+						.value
+						.is_none()
+				);
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn associated_value_access_demands_pending_synthetic_owners() {
+		for (source, memory) in [
+			(
+				"type u32; typeset PointerSize { u32 } trait Memory { type Size: PointerSize; } memory heap: u32;",
+				true,
+			),
+			(
+				"type u32; typeset PointerSize { u32 } trait Memory { type Size: PointerSize; } import \"env\" as host { memory heap: u32; }",
+				true,
+			),
+			(
+				"type u32; trait Global { type Value; } global counter: u32 = 0;",
+				false,
+			),
+			(
+				"type u32; trait Global { type Value; } import \"env\" as host { global counter: u32; }",
+				false,
+			),
+		] {
+			with_pending_signatures(source, |builder| {
+				let receiver = builder.types.intern(if memory {
+					Type::Memory {
+						memory_index: MemoryIdx::new(0),
+					}
+				} else {
+					Type::Global {
+						global_index: GlobalIdx::new(0),
+					}
+				});
+				let (_, provider, reference) = pending_provider(
+					builder,
+					receiver,
+					if memory { "Size" } else { "Value" },
+				);
+				assert_eq!(
+					builder.ensure_assoc_type_value(provider, reference),
+					TypeIndex::U32
+				);
+				let def_id = builder.defs.assoc_types
+					[usize::from(provider.index())]
+				.def_id;
+				assert!(
+					matches!(builder.query_state[&def_id].state,
+					QueryState::Resolved(SignatureLocation::Memory(_)) if memory)
+						|| matches!(builder.query_state[&def_id].state,
+					QueryState::Resolved(SignatureLocation::Global(_)) if !memory)
+				);
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			});
+		}
+	}
+
+	#[test]
+	fn associated_value_query_cycle_is_reported_once() {
+		with_pending_signatures(
+			indoc! {r#"
+			type i32;
+			type u32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+			trait Memory { type Size; }
+			trait Global { type Value; }
+			memory heap: u32;
+			global counter: u32 = 0;
+			import "env" as host { memory shared: u32; global counter: u32; }
+		"#},
+			|builder| {
+				for (ty, name) in [
+					(
+						Type::Struct {
+							struct_index: StructIdx::new(0),
+							type_args: Box::new([]),
+						},
+						"Item",
+					),
+					(
+						Type::Memory {
+							memory_index: MemoryIdx::new(0),
+						},
+						"Size",
+					),
+					(
+						Type::Global {
+							global_index: GlobalIdx::new(0),
+						},
+						"Value",
+					),
+					(
+						Type::Memory {
+							memory_index: MemoryIdx::new(1),
+						},
+						"Size",
+					),
+					(
+						Type::Global {
+							global_index: GlobalIdx::new(1),
+						},
+						"Value",
+					),
+				] {
+					let receiver = builder.types.intern(ty);
+					let (_, provider, reference) =
+						pending_provider(builder, receiver, name);
+					let def_id = builder.defs.assoc_types
+						[usize::from(provider.index())]
+					.def_id;
+					// Simulate re-entry while the provider's owner is computing.
+					// End-to-end source cycles belong to the normalization checkpoint.
+					builder.query_state.get_mut(&def_id).unwrap().state =
+						QueryState::InProgress;
+					builder.query_stack.push(QueryInfo {
+						def_id,
+						requested_at: None,
+					});
+					let before = builder.diagnostics.len();
+					assert_eq!(
+						builder.ensure_assoc_type_value(provider, reference),
+						TypeIndex::ERROR
+					);
+					assert_eq!(
+						builder.ensure_assoc_type_value(provider, reference),
+						TypeIndex::ERROR
+					);
+					assert_eq!(builder.diagnostics.len(), before + 1);
+					let diagnostic = &builder.diagnostics[before];
+					assert_eq!(
+						diagnostic.code.as_deref(),
+						Some(DiagnosticCode::CyclicAssociatedType.code())
+					);
+					assert!(
+						diagnostic.message.contains("associated-type value")
+					);
+					assert_eq!(
+						diagnostic.labels[0].range,
+						reference.span.into()
+					);
+					assert_eq!(builder.query_stack.len(), 1);
+					builder.query_stack.pop();
+				}
+			},
+		);
+	}
+
+	#[test]
+	fn associated_value_access_preserves_an_already_diagnosed_error() {
+		with_pending_signatures(
+			indoc! {"
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = Missing; }
+		"},
+			|builder| {
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let (_, provider, reference) =
+					pending_provider(builder, receiver, "Item");
+				assert_eq!(
+					builder.ensure_assoc_type_value(provider, reference),
+					TypeIndex::ERROR
+				);
+				assert_eq!(builder.diagnostics.len(), 1);
+				assert_eq!(
+					builder.ensure_assoc_type_value(provider, reference),
+					TypeIndex::ERROR
+				);
+				assert_eq!(builder.diagnostics.len(), 1);
+			},
+		);
+	}
+
+	#[test]
+	fn missing_associated_type_recovers_without_diagnostics() {
+		for path in [
+			"<Wrapper as Container>::Item",
+			"Wrapper::Item",
+			"<Wrapper>::Item::Next",
+		] {
+			let case = TestCase::new(&format!(
+				"
+				trait Container {{ type Item; }}
+				struct Wrapper {{}}
+				impl Container for Wrapper {{}}
+				fn f(x: {path}) {{}}
+				fn g(x: {path}) {{}}
+			"
+			));
+			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert_eq!(
+				case.function_signature("f").param_types[0],
+				TypeIndex::ERROR
+			);
+			assert_eq!(
+				case.function_signature("g").param_types[0],
+				TypeIndex::ERROR
+			);
+		}
+	}
+
+	#[test]
 	fn memory_declaration_registers_a_synthetic_impl_with_a_checked_size() {
 		let case = TestCase::new(indoc! {"
 			type u32;
@@ -4668,8 +5692,9 @@ mod tests {
 			panic!("expected `host::shared` to be a memory");
 		};
 		let memory_trait = case.trait_index("Memory");
-		let candidates =
-			case.signatures.trait_candidates(ImplTarget::Memory(memory_index));
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Memory(memory_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, memory_trait);
 		let memory_def = &case.defs.memories[usize::from(memory_index)];
@@ -4696,8 +5721,9 @@ mod tests {
 			panic!("expected `host::counter` to be a global");
 		};
 		let global_trait = case.trait_index("Global");
-		let candidates =
-			case.signatures.trait_candidates(ImplTarget::Global(global_index));
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Global(global_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, global_trait);
 		let global_def = &case.defs.globals[usize::from(global_index)];
@@ -4726,8 +5752,9 @@ mod tests {
 			panic!("expected `host::counter` to be a global");
 		};
 		let global_mut_trait = case.trait_index("GlobalMut");
-		let candidates =
-			case.signatures.trait_candidates(ImplTarget::Global(global_index));
+		let candidates = case
+			.signatures
+			.trait_candidates(ImplTarget::Global(global_index));
 		assert!(
 			candidates.iter().any(|&(t, _)| t == global_mut_trait),
 			"expected a `GlobalMut` impl to be registered too"
@@ -4861,8 +5888,11 @@ mod tests {
 		let &[slice_type, array_type] = signature.param_types.as_ref() else {
 			panic!("expected exactly two parameters");
 		};
-		let Type::Slice { of, memory, ownership } =
-			case.signatures.types.resolve(slice_type)
+		let Type::Slice {
+			of,
+			memory,
+			ownership,
+		} = case.signatures.types.resolve(slice_type)
 		else {
 			panic!("expected `s` to resolve to a slice type");
 		};
@@ -5411,7 +6441,10 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let trait_a = case.trait_index("A");
-		match case.signatures.types.resolve(case.function_signature("f").param_types[0])
+		match case
+			.signatures
+			.types
+			.resolve(case.function_signature("f").param_types[0])
 		{
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_a);
@@ -5430,7 +6463,10 @@ mod tests {
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
 		let trait_b = case.trait_index("B");
-		match case.signatures.types.resolve(case.function_signature("f").param_types[0])
+		match case
+			.signatures
+			.types
+			.resolve(case.function_signature("f").param_types[0])
 		{
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_b);
@@ -5440,7 +6476,8 @@ mod tests {
 	}
 
 	#[test]
-	fn qualified_path_naming_a_member_the_trait_does_not_declare_is_diagnosed() {
+	fn qualified_path_naming_a_member_the_trait_does_not_declare_is_diagnosed()
+	{
 		let case = TestCase::new(indoc! {"
 			trait A { type X; }
 			fn f<T: A>(x: <T as A>::Y) { }
@@ -5458,7 +6495,8 @@ mod tests {
 	}
 
 	#[test]
-	fn qualified_path_naming_a_trait_the_type_param_does_not_have_is_diagnosed() {
+	fn qualified_path_naming_a_trait_the_type_param_does_not_have_is_diagnosed()
+	{
 		let case = TestCase::new(indoc! {"
 			trait A { type X; }
 			trait B {}
@@ -5476,15 +6514,512 @@ mod tests {
 		);
 	}
 
-	/// Blocked on `project_type_member`'s own `TraitImpl`/`TraitDefault`/
-	/// `Inherent` arm, still `todo!("associated-type projection off a
-	/// concrete receiver isn't implemented yet — needs TraitImplAssocType's
-	/// own signature resolution")` — a pre-existing gap, not something this
-	/// `QualifiedPath` feature introduces or needs to fix. `find_trait_impl`
-	/// itself already succeeds (`Wrapper` genuinely implements `Container`);
-	/// it's turning that found member into a `Type` that panics.
 	#[test]
-	#[ignore = "concrete-receiver associated-type projection isn't implemented yet (see project_type_member's todo!)"]
+	fn concrete_projection_paths_normalize_forward_references_and_chains() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			fn f(a: Wrapper::Item::Value, b: <Wrapper>::Item::Value,
+				c: <Wrapper as Container>::Item::Value) {}
+			trait Container { type Item; }
+			trait Element { type Value; }
+			struct Wrapper {}
+			struct Inner {}
+			impl Container for Wrapper { type Item = Inner; }
+			impl Element for Inner { type Value = i32; }
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("f").param_types.as_ref(),
+			[TypeIndex::I32; 3]
+		);
+	}
+
+	#[test]
+	fn concrete_projections_normalize_in_compound_signatures() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type u32;
+			trait Memory { type Size; }
+			memory heap: u32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+			type Actual = fn((Wrapper::Item, Wrapper::Item), *Wrapper::Item) -> Wrapper::Item;
+			type Expected = fn((i32, i32), *i32) -> i32;
+			fn f(a: Actual, b: Expected) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			case.function_signature("f").param_types[1]
+		);
+	}
+
+	#[test]
+	fn unused_associated_values_are_checked_for_direct_and_mutual_cycles() {
+		for definitions in [
+			"type First = Self::First; type Second = i32;",
+			"type First = Self::Second; type Second = Self::First;",
+			"type First = (Self::Second, Self::Second); type Second = Self::First;",
+		] {
+			let case = TestCase::new(&format!(
+				"
+				type i32;
+				trait Pair {{ type First; type Second; }}
+				struct Example {{}}
+				impl Pair for Example {{ {definitions} }}
+				fn independent(x: i32) {{}}
+			"
+			));
+			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+			assert_eq!(
+				case.diagnostics[0].code.as_deref(),
+				Some(DiagnosticCode::CyclicAssociatedType.code())
+			);
+			assert_eq!(
+				case.function_signature("independent").param_types[0],
+				TypeIndex::I32
+			);
+		}
+	}
+
+	#[test]
+	fn synthetic_values_normalize_and_synthetic_cycles_recover() {
+		let case = TestCase::new(indoc! {r#"
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			trait Global { type Value; }
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = u32; }
+			fn f(a: heap::Size, b: host::shared::Size) {}
+			memory heap: Wrapper::Item;
+			global counter: Wrapper::Item = 0;
+			import "env" as host { memory shared: Wrapper::Item; global counter: Wrapper::Item; }
+		"#});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("f").param_types.as_ref(),
+			[TypeIndex::U32; 2]
+		);
+		for def in &case.defs.globals {
+			assert_eq!(
+				case.signatures.assoc_types
+					[usize::from(def.value_assoc_type_index)]
+				.as_ref()
+				.unwrap()
+				.value,
+				Some(TypeIndex::U32)
+			);
+		}
+		for declaration in [
+			"memory heap: heap::Size;",
+			"import \"env\" as host { memory heap: host::heap::Size; }",
+		] {
+			let case = TestCase::new(&format!(
+				"trait Memory {{ type Size; }} {declaration}"
+			));
+			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+			assert_eq!(
+				case.diagnostics[0].code.as_deref(),
+				Some(DiagnosticCode::CyclicAssociatedType.code())
+			);
+		}
+	}
+
+	#[test]
+	fn head_normalization_exposes_constructor_without_traversing_children() {
+		with_pending_signatures(
+			indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+		"},
+			|builder| {
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let (declaration, provider, reference) =
+					pending_provider(builder, receiver, "Item");
+				let projection =
+					builder.types.intern(Type::AssocTypeProjection {
+						base: receiver,
+						trait_index: TraitIdx::new(0),
+						assoc_type_index: declaration,
+					});
+				let tuple = builder.types.intern(Type::Tuple {
+					elements: Box::new([projection, TypeIndex::I32]),
+				});
+				let provider_def_id = builder.defs.assoc_types
+					[usize::from(provider.index())]
+				.def_id;
+				// A completed stored value can still contain an abstract projection
+				// that becomes reducible later. Here it models that result directly.
+				builder.assoc_types[usize::from(provider.index())] =
+					Some(AssocTypeSignature {
+						declared_bounds: Box::new([]),
+						facts: BoundFacts::Ready(Box::new([])),
+						value: Some(tuple),
+					});
+				builder.query_state.get_mut(&provider_def_id).unwrap().state =
+					QueryState::Resolved(SignatureLocation::AssocType(
+						provider.index(),
+					));
+				assert_eq!(
+					builder.normalize_head(projection, reference),
+					tuple
+				);
+				assert_eq!(builder.normalize_head(tuple, reference), tuple);
+				assert_eq!(
+					builder.normalize_type(projection, reference),
+					TypeIndex::ERROR
+				);
+				assert_eq!(builder.diagnostics.len(), 1);
+				assert_eq!(
+					builder.diagnostics[0].code.as_deref(),
+					Some(DiagnosticCode::CyclicAssociatedType.code())
+				);
+				assert_eq!(
+					builder.normalize_type(TypeIndex::I32, reference),
+					TypeIndex::I32
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn normalization_preserves_abstract_and_inference_projections() {
+		with_pending_signatures(
+			"trait Container { type Item; } fn f<T>() {}",
+			|builder| {
+				let def_id = builder.defs.functions[0].def_id;
+				let _ = builder.ensure_signature(QueryInfo {
+					def_id,
+					requested_at: None,
+				});
+				let env = builder.functions[0].type_params;
+				let reference = SourceSpan::new(
+					builder.defs.traits[0].file_id,
+					TextSpan::new(0, 1),
+				);
+				let declaration = match builder.defs.traits[0].members[0].kind {
+					MemberKind::AssociatedType(index) => index,
+					_ => unreachable!(),
+				};
+				for base in [
+					builder.types.intern(Type::TypeParam {
+						env,
+						param_index: 0,
+					}),
+					TypeIndex::INFER,
+				] {
+					let projection =
+						builder.types.intern(Type::AssocTypeProjection {
+							base,
+							trait_index: TraitIdx::new(0),
+							assoc_type_index: declaration,
+						});
+					assert_eq!(
+						builder.normalize_head(projection, reference),
+						projection
+					);
+					assert_eq!(
+						builder.normalize_type(projection, reference),
+						projection
+					);
+				}
+				let error = builder.types.intern(Type::AssocTypeProjection {
+					base: TypeIndex::ERROR,
+					trait_index: TraitIdx::new(0),
+					assoc_type_index: declaration,
+				});
+				assert_eq!(
+					builder.normalize_type(error, reference),
+					TypeIndex::ERROR
+				);
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn deep_normalization_visits_all_supported_children_and_preserves_metadata()
+	{
+		with_pending_signatures(
+			indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+			fn marker() {}
+		"},
+			|builder| {
+				use crate::ast::Ownership;
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let (declaration, _, reference) =
+					pending_provider(builder, receiver, "Item");
+				let projection =
+					builder.types.intern(Type::AssocTypeProjection {
+						base: receiver,
+						trait_index: TraitIdx::new(0),
+						assoc_type_index: declaration,
+					});
+				let cases = [
+					(
+						Type::Tuple {
+							elements: Box::new([projection, TypeIndex::I32]),
+						},
+						Type::Tuple {
+							elements: Box::new([
+								TypeIndex::I32,
+								TypeIndex::I32,
+							]),
+						},
+					),
+					(
+						Type::Struct {
+							struct_index: StructIdx::new(0),
+							type_args: Box::new([projection]),
+						},
+						Type::Struct {
+							struct_index: StructIdx::new(0),
+							type_args: Box::new([TypeIndex::I32]),
+						},
+					),
+					(
+						Type::FunctionItem {
+							func_index: FunctionIdx::new(0),
+							type_args: Box::new([projection]),
+						},
+						Type::FunctionItem {
+							func_index: FunctionIdx::new(0),
+							type_args: Box::new([TypeIndex::I32]),
+						},
+					),
+					(
+						Type::Function {
+							params: Box::new([projection, TypeIndex::I32]),
+							result: projection,
+						},
+						Type::Function {
+							params: Box::new([TypeIndex::I32, TypeIndex::I32]),
+							result: TypeIndex::I32,
+						},
+					),
+					(
+						Type::Pointer {
+							to: projection,
+							memory: projection,
+							ownership: Ownership::Shared,
+						},
+						Type::Pointer {
+							to: TypeIndex::I32,
+							memory: TypeIndex::I32,
+							ownership: Ownership::Shared,
+						},
+					),
+					(
+						Type::Array {
+							of: projection,
+							size: 7,
+							memory: projection,
+							ownership: Ownership::Exclusive,
+						},
+						Type::Array {
+							of: TypeIndex::I32,
+							size: 7,
+							memory: TypeIndex::I32,
+							ownership: Ownership::Exclusive,
+						},
+					),
+					(
+						Type::Slice {
+							of: projection,
+							memory: projection,
+							ownership: Ownership::Shared,
+						},
+						Type::Slice {
+							of: TypeIndex::I32,
+							memory: TypeIndex::I32,
+							ownership: Ownership::Shared,
+						},
+					),
+				];
+				for (before, after) in cases {
+					let before = builder.types.intern(before);
+					let after = builder.types.intern(after);
+					assert_eq!(
+						builder.normalize_head(before, reference),
+						before
+					);
+					assert_eq!(
+						builder.normalize_type(before, reference),
+						after
+					);
+					assert_eq!(builder.normalize_type(after, reference), after);
+				}
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn repeated_sibling_projections_are_not_a_cycle() {
+		with_pending_signatures(
+			"type i32; trait Container { type Item; } struct Wrapper {} impl Container for Wrapper { type Item = i32; }",
+			|builder| {
+				let receiver = builder.types.intern(Type::Struct {
+					struct_index: StructIdx::new(0),
+					type_args: Box::new([]),
+				});
+				let (declaration, _, reference) =
+					pending_provider(builder, receiver, "Item");
+				let projection =
+					builder.types.intern(Type::AssocTypeProjection {
+						base: receiver,
+						trait_index: TraitIdx::new(0),
+						assoc_type_index: declaration,
+					});
+				let pair = builder.types.intern(Type::Tuple {
+					elements: Box::new([projection, projection]),
+				});
+				let expected = builder.types.intern(Type::Tuple {
+					elements: Box::new([TypeIndex::I32, TypeIndex::I32]),
+				});
+				assert_eq!(builder.normalize_type(pair, reference), expected);
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			},
+		);
+	}
+
+	#[test]
+	fn normalization_depth_limit_reports_once_and_unwinds() {
+		with_pending_signatures("trait Container { type Item; }", |builder| {
+			let reference = SourceSpan::new(
+				builder.defs.traits[0].file_id,
+				TextSpan::new(0, 1),
+			);
+			builder.normalization.set_limit_for_test(4);
+			let mut nested = TypeIndex::I32;
+			for _ in 0..5 {
+				nested = builder.types.intern(Type::Tuple {
+					elements: Box::new([nested]),
+				});
+			}
+			assert_eq!(
+				builder.normalize_type(nested, reference),
+				TypeIndex::ERROR
+			);
+			assert_eq!(builder.diagnostics.len(), 1);
+			assert_eq!(
+				builder.diagnostics[0].code.as_deref(),
+				Some(DiagnosticCode::TypeNormalizationOverflow.code())
+			);
+			assert_eq!(
+				builder.normalize_type(TypeIndex::I32, reference),
+				TypeIndex::I32
+			);
+		});
+	}
+
+	#[test]
+	fn distinct_projection_chain_hits_depth_limit_without_exact_repetition() {
+		with_pending_signatures(
+			"trait Container { type Item; } fn f<T>() {}",
+			|builder| {
+				let def_id = builder.defs.functions[0].def_id;
+				let _ = builder.ensure_signature(QueryInfo {
+					def_id,
+					requested_at: None,
+				});
+				let env = builder.functions[0].type_params;
+				let reference = SourceSpan::new(
+					builder.defs.traits[0].file_id,
+					TextSpan::new(0, 1),
+				);
+				let declaration = match builder.defs.traits[0].members[0].kind {
+					MemberKind::AssociatedType(index) => index,
+					_ => unreachable!(),
+				};
+				builder.normalization.set_limit_for_test(6);
+				let mut nested = builder.types.intern(Type::TypeParam {
+					env,
+					param_index: 0,
+				});
+				for _ in 0..8 {
+					nested = builder.types.intern(Type::AssocTypeProjection {
+						base: nested,
+						trait_index: TraitIdx::new(0),
+						assoc_type_index: declaration,
+					});
+				}
+				assert_eq!(
+					builder.normalize_type(nested, reference),
+					TypeIndex::ERROR
+				);
+				assert_eq!(builder.diagnostics.len(), 1);
+				assert_eq!(
+					builder.diagnostics[0].code.as_deref(),
+					Some(DiagnosticCode::TypeNormalizationOverflow.code())
+				);
+				builder.normalization.set_limit_for_test(128);
+				assert_eq!(builder.normalize_type(nested, reference), nested);
+				assert_eq!(builder.diagnostics.len(), 1);
+			},
+		);
+	}
+
+	#[test]
+	fn failed_projection_receivers_do_not_report_missing_members() {
+		for ty in [
+			"Missing::Item",
+			"<Missing>::Item",
+			"<Missing as Container>::Item",
+			"<Wrapper as Container>::Item::Next",
+		] {
+			let case = TestCase::new(&format!(
+				"
+				trait Container {{ type Item; }}
+				struct Wrapper {{}}
+				impl Container for Wrapper {{ type Item = Missing; }}
+				fn f(x: {ty}) {{}}
+			"
+			));
+			// The invalid impl RHS and (where present) the written Missing
+			// receiver each own an error, with no member-lookup cascades.
+			let expected = if ty.contains("Missing") { 2 } else { 1 };
+			assert_eq!(
+				case.diagnostics.len(),
+				expected,
+				"{:?}",
+				case.diagnostics
+			);
+			assert_eq!(
+				case.function_signature("f").param_types[0],
+				TypeIndex::ERROR
+			);
+		}
+	}
+
+	#[test]
 	fn qualified_path_resolves_a_concrete_impls_associated_type() {
 		let case = TestCase::new(indoc! {"
 			type i32;
@@ -5495,9 +7030,191 @@ mod tests {
 		"});
 
 		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
+	}
+
+	#[test]
+	fn generic_impl_projection_substitutes_its_own_target_arguments() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type u32;
+			trait Container { type Item; }
+			struct Wrapper<T> {}
+			impl<T> Container for Wrapper<T> { type Item = T; }
+			fn first(x: <Wrapper<i32> as Container>::Item) {}
+			fn second(x: <Wrapper<u32> as Container>::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("first").param_types[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("second").param_types[0],
+			TypeIndex::U32
+		);
+	}
+
+	#[test]
+	fn generic_impl_target_matches_nested_and_repeated_arguments() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type u32;
+			trait Container { type Item; }
+			struct Inner<T> {}
+			struct Pair<A, B> {}
+			impl<T> Container for Pair<Inner<T>, Inner<T>> { type Item = T; }
+			fn good(x: <Pair<Inner<i32>, Inner<i32>> as Container>::Item) {}
+			fn bad(x: <Pair<Inner<i32>, Inner<u32>> as Container>::Item) {}
+		"});
+		assert_eq!(
+			case.function_signature("good").param_types[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("bad").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+	}
+
+	#[test]
+	fn generic_impl_requires_its_inferred_arguments_bounds() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Good {}
+			trait Container { type Item; }
+			struct Yes {}
+			struct No {}
+			struct Wrapper<T> {}
+			impl Good for Yes {}
+			impl<T: Good> Container for Wrapper<T> { type Item = i32; }
+			fn good(x: <Wrapper<Yes> as Container>::Item) {}
+			fn bad(x: <Wrapper<No> as Container>::Item) {}
+		"});
+		assert_eq!(
+			case.function_signature("good").param_types[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("bad").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+	}
+
+	#[test]
+	fn generic_impl_bound_checks_descend_through_nested_targets() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Mark {}
+			trait Container { type Item; }
+			struct Leaf {}
+			struct Missing {}
+			struct Wrap<T> {}
+			impl Mark for Leaf {}
+			impl<T: Mark> Mark for Wrap<T> {}
+			impl<T: Mark> Container for Wrap<T> { type Item = i32; }
+			fn good(x: <Wrap<Wrap<Leaf>> as Container>::Item) {}
+			fn bad(x: <Wrap<Wrap<Missing>> as Container>::Item) {}
+		"});
+		assert_eq!(
+			case.function_signature("good").param_types[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("bad").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::TraitBoundViolation.code())
+		);
+	}
+
+	#[test]
+	fn generic_impl_with_undetermined_parameter_does_not_match() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper<T> {}
+			impl<T> Container for Wrapper<i32> { type Item = T; }
+			fn f(x: <Wrapper<i32> as Container>::Item) {}
+		"});
 		assert_eq!(
 			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert!(
+			case.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())),
+			"{:?}",
+			case.diagnostics
+		);
+	}
+
+	#[test]
+	fn generic_impl_bound_equalities_are_not_silently_assumed() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Source { type Item; }
+			trait Container { type Item; }
+			struct Value {}
+			struct Wrapper<T> {}
+			impl Source for Value { type Item = i32; }
+			impl<T: Source where { Item = i32 }> Container for Wrapper<T> {
+				type Item = i32;
+			}
+			fn f(x: <Wrapper<Value> as Container>::Item) {}
+		"});
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert!(
+			case.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())),
+			"{:?}",
+			case.diagnostics
+		);
+	}
+
+	#[test]
+	fn generic_projection_cycle_appears_only_after_substitution() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Project { type Out; }
+			struct Wrap<T> {}
+			struct End {}
+			struct Loop {}
+			impl<T: Project> Project for Wrap<T> { type Out = T::Out; }
+			impl Project for End { type Out = i32; }
+			impl Project for Loop { type Out = Wrap<Loop>::Out; }
+			fn finite(x: <Wrap<End> as Project>::Out) {}
+			fn cyclic(x: <Wrap<Loop> as Project>::Out) {}
+		"});
+		assert_eq!(
+			case.function_signature("finite").param_types[0],
 			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("cyclic").param_types[0],
+			TypeIndex::ERROR
+		);
+		assert!(
+			case.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::CyclicAssociatedType.code())),
+			"{:?}",
+			case.diagnostics
 		);
 	}
 
@@ -5667,13 +7384,8 @@ mod tests {
 		// The conflict is a fact about `A::X`'s *value*, not its identity —
 		// `T::X` still names a perfectly real item (`A::X`), so it still
 		// resolves to a normal projection rather than `TypeIndex::ERROR`.
-		// No substitution logic exists to ever normalize it (and none ever
-		// will need to: no concrete type can satisfy `T: B + C` in the
-		// first place, since `B` and `C` each require a different, already
-		// conflicting `A::X` from any type implementing them), so the
-		// diagnostic above is the only signal this program gets — same as
-		// real rustc, which also reports only `E0284` here and nothing
-		// further.
+		// Normalization cannot select either conflicting value, so the
+		// existing bound-conflict diagnostic remains the only error.
 		let param_ty = case.function_signature("f").param_types[0];
 		match case.signatures.types.resolve(param_ty) {
 			Type::AssocTypeProjection { trait_index, .. } => {
@@ -5842,7 +7554,8 @@ mod tests {
 		let env =
 			case.signatures.traits[usize::from(case.trait_index("D"))].env;
 		let merged = case.signatures.param_bounds[usize::from(env)][0]
-			.implied_bounds
+			.facts
+			.current()
 			.iter()
 			.find(|bound| bound.trait_index == case.trait_index("Outer"))
 			.unwrap();
@@ -5874,7 +7587,8 @@ mod tests {
 				[usize::from(case.trait_index(trait_name))]
 			.env;
 			let merged = case.signatures.param_bounds[usize::from(env)][0]
-				.implied_bounds
+				.facts
+				.current()
 				.iter()
 				.find(|bound| bound.trait_index == case.trait_index("Outer"))
 				.unwrap();
@@ -5922,7 +7636,8 @@ mod tests {
 			.env;
 			let bounds = &case.signatures.param_bounds[usize::from(env)][0];
 			let merged = bounds
-				.implied_bounds
+				.facts
+				.current()
 				.iter()
 				.find(|bound| bound.trait_index == case.trait_index("A"))
 				.unwrap();
@@ -5931,10 +7646,518 @@ mod tests {
 			else {
 				panic!("expected equality to win")
 			};
+			assert_eq!(reference.value, TypeIndex::U32);
+		}
+	}
+	#[test]
+	fn normalization_uses_direct_and_chained_equality_facts() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrapper {}
+			impl Container for Wrapper { type Item = i32; }
+			fn direct<T: Container where { Item = i32 }>(x: T::Item) {}
+			fn chained<T: Container where { Item = <Wrapper as Container>::Item }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["direct", "chained"] {
 			assert_eq!(
-				equals_type(&case.signatures.bounds, reference),
-				TypeIndex::U32
+				case.function_signature(name).param_types[0],
+				TypeIndex::I32
 			);
 		}
+	}
+
+	#[test]
+	fn normalization_rebinds_self_through_multiple_supertraits() {
+		let case = TestCase::new(indoc! {"
+			trait Base { type Item; }
+			trait Middle: Base where { Item = Self } {}
+			trait Final: Middle {}
+			fn f<T: Final>(x: T::Item) {}
+			fn g<U: Final>(x: U::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g"] {
+			let signature = case.function_signature(name);
+			assert!(
+				matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+			);
+		}
+	}
+
+	#[test]
+	fn normalization_reads_nested_constraints_and_deduplicates_memberships() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Inner { type Value; }
+			trait Outer { type Item: Inner; }
+			fn f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
+			fn g<T: Outer where { Item: Inner where { Value = i32 } }>(x: <T::Item as Inner>::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g"] {
+			assert_eq!(
+				case.function_signature(name).param_types[0],
+				TypeIndex::I32
+			);
+		}
+	}
+
+	#[test]
+	fn normalization_reads_nested_constraints_without_a_declared_trait_bound() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Inner { type Value; }
+			trait Outer { type Item; }
+			fn f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
+	}
+
+	#[test]
+	fn normalization_rebinds_self_in_inherited_nested_facts() {
+		let case = TestCase::new(indoc! {"
+			trait Inner { type Value; }
+			trait Outer { type Item; }
+			trait Middle: Outer where { Item: Inner where { Value = Self } } {}
+			trait Final: Middle {}
+			fn f<T: Final>(x: T::Item::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("f");
+		assert!(
+			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+		);
+	}
+
+	#[test]
+	fn normalization_rebinds_self_in_associated_declaration_facts() {
+		let case = TestCase::new(indoc! {"
+			trait Inner { type Value; }
+			trait Outer { type Item: Inner where { Value = Self }; }
+			fn f<T: Outer>(x: T::Item::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("f");
+		assert!(
+			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+		);
+	}
+
+	#[test]
+	fn normalization_preserves_nested_facts_when_an_outer_equality_supplies_a_value()
+	 {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Inner { type Value; }
+			trait Outer { type Item; }
+			fn f<T: Outer where { Item = U } + Outer where { Item: Inner where { Value = i32 } }, U>(x: T::Item::Value) {}
+			fn g<T: Outer where { Item: Inner where { Value = i32 } } + Outer where { Item = U }, U>(x: <T::Item as Inner>::Value) {}
+			fn h<T: Outer where { Item = U } + Outer where { Item: Inner where { Value = i32 } }, U>(x: <T::Item>::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g", "h"] {
+			assert_eq!(
+				case.function_signature(name).param_types[0],
+				TypeIndex::I32
+			);
+		}
+	}
+
+	#[test]
+	fn normalization_resolves_sibling_projection_equalities_in_either_order() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			fn f<T: Container where { Item = U::Item }, U: Container where { Item = i32 }>(x: T::Item) {}
+			fn g<U: Container where { Item = i32 }, T: Container where { Item = U::Item }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g"] {
+			assert_eq!(
+				case.function_signature(name).param_types[0],
+				TypeIndex::I32
+			);
+		}
+	}
+
+	#[test]
+	fn normalization_handles_reciprocal_integer_facts_without_conformance_checks()
+	 {
+		let case = TestCase::new(indoc! {"
+			type u8;
+			type i8;
+			trait UnsignedInt { type Signed: SignedInt where { Unsigned = Self }; }
+			trait SignedInt { type Unsigned: UnsignedInt where { Signed = Self }; }
+			impl UnsignedInt for u8 { type Signed = i8; }
+			impl SignedInt for i8 { type Unsigned = u8; }
+			fn f<T: UnsignedInt>(x: <T::Signed as SignedInt>::Unsigned) {}
+			fn g<T: SignedInt>(x: <T::Unsigned as UnsignedInt>::Signed) {}
+			fn concrete(x: <u8 as UnsignedInt>::Signed::Unsigned) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g"] {
+			let signature = case.function_signature(name);
+			assert!(
+				matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+			);
+		}
+		assert_eq!(
+			case.function_signature("concrete").param_types[0],
+			TypeIndex::U8
+		);
+	}
+
+	#[test]
+	fn normalization_blocks_tautological_mutual_and_structural_abstract_equalities()
+	 {
+		let case = TestCase::new(indoc! {"
+			trait Pair { type First; type Second; }
+			fn tautology<T: Pair where { First = T::First }>(x: T::First) {}
+			fn mutual<T: Pair where { First = T::Second, Second = T::First }>(x: T::First, y: T::Second) {}
+			fn structural<T: Pair where { First = (T::First,) }>(x: T::First) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["tautology", "mutual", "structural"] {
+			for &ty in &case.function_signature(name).param_types {
+				assert!(matches!(
+					case.signatures.types.resolve(ty),
+					Type::AssocTypeProjection { .. }
+				));
+			}
+		}
+	}
+
+	#[test]
+	fn normalization_leaves_competing_symbolic_equalities_unresolved() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			fn f<T: Container where { Item = U } + Container where { Item = V }, U, V>(x: T::Item) {}
+			fn equivalent<T: Container where { Item = U::Item } + Container where { Item = i32 }, U: Container where { Item = i32 }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "equivalent"] {
+			assert!(matches!(
+				case.signatures
+					.types
+					.resolve(case.function_signature(name).param_types[0]),
+				Type::AssocTypeProjection { .. }
+			));
+		}
+	}
+
+	#[test]
+	fn collecting_equality_facts_does_not_check_associated_value_conformance() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Mark {}
+			trait Container { type Item: Mark; }
+			fn f<T: Container where { Item = i32 }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
+	}
+
+	#[test]
+	fn normalization_does_not_cache_an_unfinished_assumption_set() {
+		with_pending_signatures(
+			"type i32; trait Container { type Item; } fn f<T: Container where { Item = i32 }>() {}",
+			|builder| {
+				let def_id = builder.defs.functions[0].def_id;
+				let _ = builder.ensure_signature(QueryInfo {
+					def_id,
+					requested_at: None,
+				});
+				let env = builder.functions[0].type_params;
+				let base = builder.type_envs.frame(env)[0].ty;
+				let assoc_type_index =
+					match builder.defs.traits[0].members[0].kind {
+						MemberKind::AssociatedType(index) => index,
+						_ => unreachable!(),
+					};
+				let projection =
+					builder.types.intern(Type::AssocTypeProjection {
+						base,
+						trait_index: TraitIdx::new(0),
+						assoc_type_index,
+					});
+				let reference = SourceSpan::new(
+					builder.defs.traits[0].file_id,
+					TextSpan::new(0, 1),
+				);
+				let facts = builder.param_bounds[usize::from(env)][0]
+					.facts
+					.current()
+					.to_vec()
+					.into_boxed_slice();
+				builder.param_bounds[usize::from(env)][0].facts =
+					BoundFacts::Provisional(facts.clone());
+				assert_eq!(
+					builder.normalize_type(projection, reference),
+					projection
+				);
+				builder.param_bounds[usize::from(env)][0].facts =
+					BoundFacts::Ready(facts);
+				assert_eq!(
+					builder.normalize_type(projection, reference),
+					TypeIndex::I32
+				);
+				assert!(
+					builder.diagnostics.is_empty(),
+					"{:?}",
+					builder.diagnostics
+				);
+			},
+		);
+	}
+	#[test]
+	fn contextual_equalities_agree_after_self_substitution() {
+		let case = TestCase::new(indoc! {"
+			trait Inner { type Value; }
+			trait Outer { type Item: Inner where { Value = Self }; }
+			fn f<T: Outer where { Item: Inner where { Value = T } }>(x: T::Item::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("f");
+		assert!(
+			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+		);
+	}
+
+	#[test]
+	fn equality_rhs_can_read_a_later_siblings_nested_memberships() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Inner { type Value; }
+			trait Outer { type Item; }
+			fn f<T: Outer where { Item = U::Item::Value }, U: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
+	}
+
+	#[test]
+	fn mutually_referencing_associated_bound_facts_do_not_require_conformance()
+	{
+		let case = TestCase::new(indoc! {"
+			trait Value { type Item; }
+			trait Pair {
+				type First: Value where { Item = Self::Second::Item };
+				type Second: Value where { Item = Self::First::Item };
+			}
+			fn f<T: Pair>(x: T::First::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(matches!(
+			case.signatures
+				.types
+				.resolve(case.function_signature("f").param_types[0]),
+			Type::AssocTypeProjection { .. }
+		));
+	}
+	#[test]
+	fn normalization_reads_facts_through_multiple_nested_projection_sources() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Leaf { type Value; }
+			trait Branch { type Item; }
+			trait Outer { type Branch; }
+			fn f<T: Outer where { Branch: Branch where { Item: Leaf where { Value = i32 } } }>(x: T::Branch::Item::Value) {}
+			fn g<T: Outer where { Branch: Branch where { Item: Leaf where { Value = i32 } } }>(x: <T::Branch::Item as Leaf>::Value) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for name in ["f", "g"] {
+			assert_eq!(
+				case.function_signature(name).param_types[0],
+				TypeIndex::I32
+			);
+		}
+	}
+
+	#[test]
+	fn nested_projection_sources_keep_the_declaring_self_context() {
+		let case = TestCase::new(indoc! {"
+			trait Leaf { type Value; }
+			trait Branch { type Item; }
+			trait Marked: Branch where { Item: Leaf where { Value = Self } } {}
+			trait Outer { type Branch: Marked; }
+			fn f<T: Outer>(x: T::Branch::Item::Value, y: T::Branch) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		let signature = case.function_signature("f");
+		assert_eq!(signature.param_types[0], signature.param_types[1]);
+	}
+
+	#[test]
+	fn source_equalities_preserve_projections_inside_compound_types() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container { type Item; }
+			struct Wrap<X> {}
+			fn f<U: Container where { Item = i32 }, T: Container where { Item = Wrap<(U::Item,)> }>(x: T::Item) {}
+			fn g<T: Container where { Item = Wrap<(U::Item,)> }, U: Container where { Item = i32 }>(x: T::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		for (name, t_index, u_index) in [("f", 1, 0), ("g", 0, 1)] {
+			let signature = case.function_signature(name);
+			let source = case.declared_bounds(signature.type_params, t_index);
+			let BindingRequirement::Equals(value) = source[0].bindings[0].kind
+			else {
+				panic!("expected equality");
+			};
+			let types = &case.signatures.types;
+			let Type::Struct { type_args, .. } = types.resolve(value.inner)
+			else {
+				panic!("expected Wrap");
+			};
+			let Type::Tuple { elements } = types.resolve(type_args[0]) else {
+				panic!("expected tuple");
+			};
+			let Type::AssocTypeProjection { base, .. } =
+				types.resolve(elements[0])
+			else {
+				panic!("source must retain U::Item");
+			};
+			assert!(
+				matches!(types.resolve(*base), Type::TypeParam { env, param_index } if *env == signature.type_params && *param_index == u_index)
+			);
+			let Type::Struct { type_args, .. } =
+				types.resolve(signature.param_types[0])
+			else {
+				panic!("expected normalized Wrap");
+			};
+			let Type::Tuple { elements } = types.resolve(type_args[0]) else {
+				panic!("expected normalized tuple");
+			};
+			assert_eq!(elements.as_ref(), &[TypeIndex::I32]);
+		}
+	}
+
+	#[test]
+	fn bound_reservations_survive_invalid_occurrences_and_signature_demands() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Leaf { type Value; }
+			trait Outer { type Item; }
+			fn f<T: i32 + Outer where { Missing: Leaf, Item: i32 + Leaf where { Value = Later<U> }, Item: Leaf }, U: Outer>(x: T::Item::Value) {}
+			struct Later<X: Outer> {}
+		"});
+		assert_eq!(case.diagnostics.len(), 4, "{:?}", case.diagnostics);
+		for (code, count) in [
+			(DiagnosticCode::NotATraitBound, 2),
+			(DiagnosticCode::NotATraitMember, 1),
+			(DiagnosticCode::DuplicateAssocTypeBinding, 1),
+		] {
+			assert_eq!(
+				case.diagnostics
+					.iter()
+					.filter(|d| d.code.as_deref() == Some(code.code()))
+					.count(),
+				count
+			);
+		}
+		let signature = case.function_signature("f");
+		let Type::Struct {
+			struct_index,
+			type_args,
+		} = case.signatures.types.resolve(signature.param_types[0])
+		else {
+			panic!("valid nested facts must remain usable");
+		};
+		assert_eq!(*struct_index, case.struct_index("Later"));
+		assert!(
+			matches!(case.signatures.types.resolve(type_args[0]), Type::TypeParam { env, param_index: 1 } if *env == signature.type_params)
+		);
+	}
+
+	/// Regression test: `type_satisfies_trait` (satisfaction.rs) used to
+	/// check only an abstract projection's effective trait memberships and
+	/// never normalize it, so a projection that reduces to a concrete type
+	/// satisfying the trait (here `U::Item` reduces to `i32`, and `i32:
+	/// Marker`) was rejected outright. Fixed by falling back to
+	/// `normalize_head` the same way `find_trait_impl` (members.rs) does.
+	#[test]
+	fn satisfaction_normalizes_an_abstract_projection_before_checking_trait_membership()
+	 {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Marker {}
+			impl Marker for i32 {}
+			trait Value { type Item; }
+			struct Need<X: Marker> {}
+
+			fn f<U: Value where { Item = i32 }>(x: Need<U::Item>) {}
+		"});
+		assert_eq!(case.diagnostics, Vec::new(), "{:?}", case.diagnostics);
+	}
+
+	/// Regression test: structural impl matching used to normalize only the
+	/// receiver's head (`normalize_head`), so a receiver whose *nested* type
+	/// argument was an unreduced projection (`Wrap<S::Item>` where
+	/// `S::Item` reduces to `i32`) failed to match a concrete impl (`impl
+	/// Result for Wrap<i32>`) even though the reduced receiver would match.
+	/// Fixed by deep-normalizing the receiver once in
+	/// `match_impl_target_and_bounds`, the point every matching caller
+	/// converges on.
+	#[test]
+	fn structural_match_normalizes_nested_receiver_type_arguments() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Value { type Item; }
+			trait Result { type Out; }
+			struct Wrap<T> {}
+			impl Result for Wrap<i32> { type Out = i32; }
+
+			fn f<S: Value where { Item = i32 }>(x: <Wrap<S::Item> as Result>::Out) {}
+		"});
+		assert_eq!(case.diagnostics, Vec::new(), "{:?}", case.diagnostics);
+	}
+
+	/// Regression test for a bug in `union_trait_bound`'s merge: a concrete
+	/// conflict (`u32` vs `u64`) arriving with a symbolic fact (`V::Item`)
+	/// merged in between used to go completely undiagnosed, because the
+	/// `Ambiguous`-vs-`Equals` merge case only deduped by value equality
+	/// instead of also checking `known_distinct` against every existing
+	/// candidate. `add_equality_fact` now runs that check uniformly for
+	/// every merge shape, so this and the reordered case below (where the
+	/// two concrete facts merge before the symbolic one arrives) both
+	/// diagnose the same way regardless of order.
+	#[test]
+	fn conflicting_equality_is_diagnosed_around_a_symbolic_middle_term() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type u64;
+			trait A { type Item; }
+			trait Value { type Item; }
+
+			fn f<V: Value, T: A where { Item = u32 } + A where { Item = V::Item } + A where { Item = u64 }>() {}
+		"});
+		assert!(
+			case.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::DuplicateAssocTypeBinding.code())),
+			"expected u32/u64 to still be flagged as conflicting even with a symbolic term between them: {:?}",
+			case.diagnostics
+		);
+	}
+
+	#[test]
+	fn conflicting_equality_is_diagnosed_with_symbolic_term_last() {
+		let case = TestCase::new(indoc! {"
+			type u32;
+			type u64;
+			trait A { type Item; }
+			trait Value { type Item; }
+
+			fn f<V: Value, T: A where { Item = u32 } + A where { Item = u64 } + A where { Item = V::Item }>() {}
+		"});
+		assert!(
+			case.diagnostics.iter().any(|d| d.code.as_deref()
+				== Some(DiagnosticCode::DuplicateAssocTypeBinding.code())),
+			"{:?}",
+			case.diagnostics
+		);
 	}
 }

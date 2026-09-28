@@ -12,12 +12,11 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
-use super::bounds::{ImpliedTraitBound, report_not_an_associated_type};
+use super::bounds::report_not_an_associated_type;
 use super::defs::{
-	AssocTypeIdx, BindingKey, BindingNamespace, DefinitionRegistry,
+	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
 	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
@@ -28,6 +27,8 @@ use super::types::{Type, TypeIndex};
 
 /// What a type-relative member lookup found.
 pub(super) enum TypeMemberLookup {
+	/// A dependency has already failed; the caller must not diagnose absence.
+	Error,
 	NotFound,
 	Found(TypeMemberTarget),
 	/// Two or more *unrelated* traits each provide this name for this
@@ -38,7 +39,9 @@ pub(super) enum TypeMemberLookup {
 }
 
 pub(super) struct TypeMemberTarget {
-	/// Carries the index into the member's definition arena.
+	/// Trait-associated types always name the trait declaration, even when
+	/// `source` selects an impl override. Value members name the selected
+	/// definition as before. Provider values are accessed separately.
 	pub(super) kind: MemberKind,
 	pub(super) source: MemberSource,
 }
@@ -47,16 +50,10 @@ pub(super) enum MemberSource {
 	Inherent(InherentImplIdx),
 	/// A concrete `impl Trait for Type` provides (or overrides) this member.
 	TraitImpl(TraitIdx, TraitImplIdx),
-	/// No impl overrides it for this concrete type — the trait's own
-	/// declaration applies as-is. Whether that declaration has a body is
-	/// not this lookup's concern: an impl missing a required override is an
-	/// ill-formed program, caught later by trait-conformance checking (the
-	/// last checking phase, run only once every body is resolved) — not
-	/// something name resolution needs to gate on. Mirrors rustc, which
-	/// never reports an error at an access site for an incorrectly
-	/// implemented trait member, only at the `impl` block that's missing
-	/// it.
-	TraitDefault(TraitIdx),
+	/// No impl override: value members can use their trait definition.
+	/// Associated types currently have no defaults; a missing provider needs
+	/// error recovery. Conformance checking owns the diagnostic.
+	TraitDefault(TraitIdx, TraitImplIdx),
 	/// Receiver is abstract (`TypeParam`/`AssocTypeProjection`): resolved
 	/// through one of its own bounds, not a concrete impl at all. Concrete
 	/// dispatch is deferred to monomorphization (mirrors the existing
@@ -64,12 +61,27 @@ pub(super) enum MemberSource {
 	Bound(TraitIdx),
 }
 
+/// An associated-type definition supplied by an impl. Constructed only by
+/// looking up the declaration in an impl, so a required trait declaration
+/// cannot accidentally be passed to the value accessor.
+#[derive(Clone, Copy)]
+pub(super) struct AssocTypeProvider(AssocTypeIdx);
+
+impl AssocTypeProvider {
+	pub(super) fn index(self) -> AssocTypeIdx {
+		self.0
+	}
+}
+
 /// How `required_trait` applies to a receiver, per `find_trait_impl`.
 pub(super) enum TraitImplLookup {
 	/// Concrete receiver, with a registered `impl required_trait for
 	/// receiver` (`impls.rs`'s dispatch) — `TraitImplIdx` names it, in
 	/// case it overrides the member being looked up.
-	Concrete(TraitImplIdx),
+	Concrete {
+		impl_index: TraitImplIdx,
+		args: Box<[TypeIndex]>,
+	},
 	/// Abstract receiver (`TypeParam`/`AssocTypeProjection`) whose implied
 	/// bounds (or, inside the trait itself, its own reflexive `Self`
 	/// bound) include `required_trait`. Concrete dispatch is deferred to
@@ -81,7 +93,7 @@ impl SignatureBuilder<'_, '_> {
 	/// Resolves `name` (in binding tier `tier` — `Value` for a
 	/// function/const, `Type` for an associated type) as a member of
 	/// `receiver`. `reference` is the span of whatever named `receiver` in
-	/// the first place — threaded through to `ensure_assoc_type_signature`,
+	/// the first place — threaded through to `ensure_assoc_type_bounds`,
 	/// the one path below that can force another item's signature and so
 	/// needs a real "why" to attach to a cycle diagnostic.
 	pub(super) fn resolve_type_member(
@@ -92,15 +104,32 @@ impl SignatureBuilder<'_, '_> {
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		let key = BindingKey::new(tier, name);
+		if matches!(
+			self.types.resolve(receiver),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		) {
+			match self.resolve_bound_member(receiver, key, reference) {
+				TypeMemberLookup::NotFound => {}
+				found => return found,
+			}
+		}
+		let receiver = self.normalize_head(receiver, reference);
+		if receiver == TypeIndex::ERROR {
+			return TypeMemberLookup::Error;
+		}
 		match ImplTarget::from_type(self.types.resolve(receiver)) {
-			Some(target) => self.resolve_concrete_member(target, key),
+			Some(target) => {
+				self.resolve_concrete_member(receiver, target, key, reference)
+			}
 			None => self.resolve_bound_member(receiver, key, reference),
 		}
 	}
 
 	/// Walks `segments` as member lookups off of `current` — a struct
 	/// field, associated type, or method, resolved by name rather than
-	/// through the namespace graph. Shared by `resolve_type`'s own `Path`
+	/// through the namespace graph. Intermediate projections retain their
+	/// nested facts. The caller decides whether to normalize the completed type.
+	/// Shared by `resolve_type`'s own `Path`
 	/// arm (for whatever's left once its namespace-tier prefix is
 	/// consumed), its `Grouped` arm (`<T>::Item`, which has no namespace-
 	/// tier prefix at all — `current` starts as `T` itself), and its
@@ -112,6 +141,9 @@ impl SignatureBuilder<'_, '_> {
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
 	) -> TypeIndex {
+		if current == TypeIndex::ERROR {
+			return current;
+		}
 		for segment in segments {
 			if !segment.type_args.is_empty() {
 				todo!(
@@ -124,6 +156,7 @@ impl SignatureBuilder<'_, '_> {
 				segment.ident.inner,
 				SourceSpan::new(file_id, segment.ident.span),
 			) {
+				TypeMemberLookup::Error => return TypeIndex::ERROR,
 				TypeMemberLookup::Found(member) => {
 					current = self.project_type_member(current, member);
 				}
@@ -162,22 +195,31 @@ impl SignatureBuilder<'_, '_> {
 		member: TypeMemberTarget,
 	) -> TypeIndex {
 		match member.kind {
-			MemberKind::AssociatedType(assoc_type_index) => match member.source {
-				MemberSource::Bound(trait_index) => {
-					self.types.intern(Type::AssocTypeProjection {
-						trait_index,
-						assoc_type_index,
-						base,
-					})
-				}
-				MemberSource::Inherent(_)
-				| MemberSource::TraitImpl(..)
-				| MemberSource::TraitDefault(_) => {
-					todo!(
-						"associated-type projection off a concrete receiver isn't implemented yet — needs TraitImplAssocType's own signature resolution"
-					)
-				}
-			},
+			MemberKind::AssociatedType(assoc_type_index) => {
+				let trait_index = match member.source {
+					MemberSource::Bound(trait_index)
+					| MemberSource::TraitImpl(trait_index, _) => trait_index,
+					MemberSource::TraitDefault(trait_index, impl_index) => {
+						if self
+							.assoc_type_provider(impl_index, assoc_type_index)
+							.is_none()
+						{
+							return TypeIndex::ERROR;
+						}
+						trait_index
+					}
+					MemberSource::Inherent(_) => {
+						todo!("inherent associated types")
+					}
+				};
+				// Projection identity is independent of the selected provider.
+				// Path consumers normalize the constructed projection.
+				self.types.intern(Type::AssocTypeProjection {
+					trait_index,
+					assoc_type_index,
+					base,
+				})
+			}
 			// Every caller resolves in `BindingNamespace::Type` — a
 			// Function/Method/Constant is Value-tier, so `bindings` (keyed
 			// by tier) can never match one here.
@@ -204,6 +246,9 @@ impl SignatureBuilder<'_, '_> {
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
 	) -> Result<TypeMemberTarget, ()> {
+		if receiver == TypeIndex::ERROR {
+			return Err(());
+		}
 		let key = BindingKey::new(tier, name.inner);
 		let trait_def = &self.defs.traits[usize::from(required_trait)];
 		let Some(&member_index) = trait_def.bindings.get(&key) else {
@@ -220,22 +265,9 @@ impl SignatureBuilder<'_, '_> {
 		let found =
 			self.find_trait_impl(receiver, required_trait, file_id, name.span)?;
 		Ok(match found {
-			TraitImplLookup::Concrete(impl_index) => {
-				let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-				match impl_def.bindings.get(&key) {
-					Some(&member_index) => TypeMemberTarget {
-						kind: impl_def.members[usize::from(member_index)].kind,
-						source: MemberSource::TraitImpl(
-							required_trait,
-							impl_index,
-						),
-					},
-					None => TypeMemberTarget {
-						kind: declared_kind,
-						source: MemberSource::TraitDefault(required_trait),
-					},
-				}
-			}
+			TraitImplLookup::Concrete { impl_index, .. } => self
+				.concrete_trait_member(required_trait, impl_index, key)
+				.expect("the requested trait member was found above"),
 			TraitImplLookup::Abstract => TypeMemberTarget {
 				kind: declared_kind,
 				source: MemberSource::Bound(required_trait),
@@ -259,53 +291,49 @@ impl SignatureBuilder<'_, '_> {
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<TraitImplLookup, ()> {
+		if matches!(
+			self.types.resolve(receiver),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		) {
+			self.prepare_effective_bounds(
+				receiver,
+				SourceSpan::new(file_id, span),
+			)?;
+			if self.has_effective_trait(receiver, required_trait) {
+				return Ok(TraitImplLookup::Abstract);
+			}
+		}
+		let receiver =
+			self.normalize_head(receiver, SourceSpan::new(file_id, span));
+		if receiver == TypeIndex::ERROR {
+			return Err(());
+		}
 		let found = match ImplTarget::from_type(self.types.resolve(receiver)) {
 			Some(target) => {
-				self.impl_dispatch.trait_candidates(target).iter().find_map(
-					|&(trait_index, impl_index)| {
-						(trait_index == required_trait)
-							.then_some(TraitImplLookup::Concrete(impl_index))
-					},
-				)
+				let candidate = self
+					.impl_dispatch
+					.trait_candidates(target)
+					.iter()
+					.find_map(|&(trait_index, impl_index)| {
+						(trait_index == required_trait).then_some(impl_index)
+					});
+				candidate.and_then(|impl_index| {
+					self.match_trait_impl_candidate(
+						impl_index,
+						receiver,
+						SourceSpan::new(file_id, span),
+					)
+					.map(|args| TraitImplLookup::Concrete { impl_index, args })
+				})
 			}
 			None => match self.types.resolve(receiver) {
-				Type::TypeParam { env, param_index } => {
-					let is_reflexive = matches!(
-						self.type_envs.frame_owner(*env),
-						TypeEnvOwner::Trait(trait_index)
-							if trait_index == required_trait
-					);
-					let implied = &self.param_bounds[usize::from(*env)]
-						[*param_index as usize]
-						.implied_bounds;
-					(is_reflexive
-						|| implied
-							.iter()
-							.any(|bound| bound.trait_index == required_trait))
-					.then_some(TraitImplLookup::Abstract)
-				}
-				Type::AssocTypeProjection {
-					assoc_type_index, ..
-				} => {
-					let assoc_type_index = *assoc_type_index;
-					if self
-						.ensure_assoc_type_signature(
-							assoc_type_index,
-							SourceSpan::new(file_id, span),
-						)
-						.is_err()
-					{
-						// Already diagnosed (a cycle) — don't pile the
-						// "doesn't implement this trait" diagnostic below
-						// on top of it.
-						return Err(());
-					}
-					self.assoc_types[usize::from(assoc_type_index)]
-						.as_ref()
-						.expect("trait associated type signature is resolved")
-						.implied_bounds
-						.iter()
-						.any(|bound| bound.trait_index == required_trait)
+				Type::Infer => Some(TraitImplLookup::Abstract),
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
+					self.prepare_effective_bounds(
+						receiver,
+						SourceSpan::new(file_id, span),
+					)?;
+					self.has_effective_trait(receiver, required_trait)
 						.then_some(TraitImplLookup::Abstract)
 				}
 				_ => None,
@@ -356,15 +384,18 @@ impl SignatureBuilder<'_, '_> {
 
 	fn resolve_concrete_member(
 		&mut self,
+		receiver: TypeIndex,
 		target: ImplTarget,
 		key: BindingKey,
+		reference: SourceSpan,
 	) -> TypeMemberLookup {
-		// No forcing needed here: ImplDispatch was built from declarations
-		// before signature resolution began.
-
 		// Inherent always wins outright — no trait candidate is even
 		// consulted once one matches.
-		for &index in self.impl_dispatch.inherent_candidates(target) {
+		for i in 0..self.impl_dispatch.inherent_candidates(target).len() {
+			let index = self.impl_dispatch.inherent_candidates(target)[i];
+			if !self.match_inherent_impl_candidate(index, receiver, reference) {
+				continue;
+			}
 			let impl_def = &self.defs.inherent_impls[usize::from(index)];
 			if let Some(&member_index) = impl_def.bindings.get(&key) {
 				let kind = impl_def.members[usize::from(member_index)].kind;
@@ -376,30 +407,76 @@ impl SignatureBuilder<'_, '_> {
 		}
 
 		let mut candidates = Vec::new();
-		for &(trait_index, impl_index) in
-			self.impl_dispatch.trait_candidates(target)
-		{
-			let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-			if let Some(&member_index) = impl_def.bindings.get(&key) {
-				let kind = impl_def.members[usize::from(member_index)].kind;
-				candidates.push(TypeMemberTarget {
-					kind,
-					source: MemberSource::TraitImpl(trait_index, impl_index),
-				});
+		for i in 0..self.impl_dispatch.trait_candidates(target).len() {
+			let (trait_index, impl_index) =
+				self.impl_dispatch.trait_candidates(target)[i];
+			if self
+				.match_trait_impl_candidate(impl_index, receiver, reference)
+				.is_none()
+			{
 				continue;
 			}
-			let trait_def = &self.defs.traits[usize::from(trait_index)];
-			if let Some(&member_index) = trait_def.bindings.get(&key) {
-				let kind = trait_def.members[usize::from(member_index)].kind;
-				candidates.push(TypeMemberTarget {
-					kind,
-					source: MemberSource::TraitDefault(trait_index),
-				});
+			if let Some(member) =
+				self.concrete_trait_member(trait_index, impl_index, key)
+			{
+				candidates.push(member);
 			}
-			// Else: this trait doesn't declare `name` at all — not a
-			// candidate, nothing to record.
 		}
 		Self::classify(candidates)
+	}
+
+	/// Keeps type identity on the declaration while preserving value-member
+	/// override selection. An undeclared impl-associated type is not a trait
+	/// projection; full impl conformance checking will diagnose that member.
+	fn concrete_trait_member(
+		&self,
+		trait_index: TraitIdx,
+		impl_index: TraitImplIdx,
+		key: BindingKey,
+	) -> Option<TypeMemberTarget> {
+		let trait_def = &self.defs.traits[usize::from(trait_index)];
+		let declared = trait_def
+			.bindings
+			.get(&key)
+			.map(|&index| trait_def.members[usize::from(index)].kind);
+		let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
+		if let Some(&index) = impl_def.bindings.get(&key) {
+			let kind = match impl_def.members[usize::from(index)].kind {
+				MemberKind::AssociatedType(_) => declared?,
+				kind => kind,
+			};
+			Some(TypeMemberTarget {
+				kind,
+				source: MemberSource::TraitImpl(trait_index, impl_index),
+			})
+		} else {
+			declared.map(|kind| TypeMemberTarget {
+				kind,
+				source: MemberSource::TraitDefault(trait_index, impl_index),
+			})
+		}
+	}
+
+	/// Selects a provided value for a declaration of the implemented trait.
+	/// This does not force signatures or emit diagnostics. A missing provider
+	/// returns `None` so callers can recover with an error type; conformance
+	/// checking after signature resolution owns the missing-member diagnostic.
+	pub(super) fn assoc_type_provider(
+		&self,
+		impl_index: TraitImplIdx,
+		declaration: AssocTypeIdx,
+	) -> Option<AssocTypeProvider> {
+		let declaration = &self.defs.assoc_types[usize::from(declaration)];
+		let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
+		let &index = impl_def
+			.bindings
+			.get(&BindingKey::ty(declaration.name.inner))?;
+		let MemberKind::AssociatedType(provider) =
+			impl_def.members[usize::from(index)].kind
+		else {
+			unreachable!("a type-tier impl member is an associated type")
+		};
+		Some(AssocTypeProvider(provider))
 	}
 
 	fn resolve_bound_member(
@@ -408,71 +485,33 @@ impl SignatureBuilder<'_, '_> {
 		key: BindingKey,
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
-		match self.types.resolve(receiver) {
-			Type::TypeParam { env, param_index } => self
-				.candidates_from_implied(
-					&self.param_bounds[usize::from(*env)]
-						[*param_index as usize]
-						.implied_bounds,
-					key,
-					match self.type_envs.frame_owner(*env) {
-						TypeEnvOwner::Trait(trait_index) => Some(trait_index),
-						_ => None,
-					},
-				),
-			Type::AssocTypeProjection {
-				assoc_type_index, ..
-			} => {
-				let assoc_type_index = *assoc_type_index;
-				if self
-					.ensure_assoc_type_signature(assoc_type_index, reference)
-					.is_err()
-				{
-					return TypeMemberLookup::NotFound;
-				}
-				self.candidates_from_implied(
-					&self.assoc_types[usize::from(assoc_type_index)]
-						.as_ref()
-						.expect("trait associated type signature is resolved")
-						.implied_bounds,
-					key,
-					None,
-				)
-			}
-			// Error/Infer/anything else `ImplTarget` also can't bucket and
-			// that isn't one of the two abstract shapes — nothing to look
-			// a member up on.
-			_ => TypeMemberLookup::NotFound,
+		if !matches!(
+			self.types.resolve(receiver),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		) {
+			return TypeMemberLookup::NotFound;
 		}
-	}
-
-	/// Turns an already-merged implied set into a lookup result — shared
-	/// between all three receiver shapes `resolve_bound_member` handles.
-	/// Purely identity: which member definition this name names. Whether the
-	/// combination's `where { .. }` bindings for it actually agree
-	/// (`MergedBindingKind::Conflicting`, already diagnosed once by
-	/// `union_trait_bound`) is a fact about this associated type's *value*,
-	/// not about its identity — `A::X` is `A::X` regardless of whether `B`
-	/// and `C` agree what it equals — so it's irrelevant here. It only
-	/// matters to whatever eventually normalizes/substitutes this
-	/// projection, which isn't this function's job.
-	fn candidates_from_implied(
-		&self,
-		bounds: &[ImpliedTraitBound],
-		key: BindingKey,
-		reflexive: Option<TraitIdx>,
-	) -> TypeMemberLookup {
+		if self.prepare_effective_bounds(receiver, reference).is_err() {
+			return TypeMemberLookup::Error;
+		}
 		let mut candidates = Vec::new();
-		for (trait_index, _bound) in reflexive
+		let bounds = self.effective_bounds(receiver);
+		for trait_index in bounds
+			.reflexive_trait
 			.into_iter()
-			.map(|index| (index, None))
-			.chain(bounds.iter().map(|bound| (bound.trait_index, Some(bound))))
+			.chain(bounds.map(|view| view.bound.trait_index))
 		{
+			// The same trait can be supplied by a declaration and a nested
+			// receiver constraint; that does not make its member ambiguous.
+			if candidates.iter().any(|candidate: &TypeMemberTarget| {
+				matches!(candidate.source, MemberSource::Bound(index) if index == trait_index)
+			}) {
+				continue;
+			}
 			let trait_def = &self.defs.traits[usize::from(trait_index)];
 			if let Some(&member_index) = trait_def.bindings.get(&key) {
-				let kind = trait_def.members[usize::from(member_index)].kind;
 				candidates.push(TypeMemberTarget {
-					kind,
+					kind: trait_def.members[usize::from(member_index)].kind,
 					source: MemberSource::Bound(trait_index),
 				});
 			}
@@ -480,25 +519,29 @@ impl SignatureBuilder<'_, '_> {
 		Self::classify(candidates)
 	}
 
-	/// Forces `assoc_type_index`'s own signature to be resolved. The only
-	/// failure is a cycle, diagnosed here once — `CycleReported` means
-	/// another call already did.
-	pub(super) fn ensure_assoc_type_signature(
+	/// Forces a trait declaration's bounds, never an impl provider's value.
+	/// The only failure is a cycle, diagnosed here once — `CycleReported`
+	/// means another call already did.
+	pub(super) fn ensure_assoc_type_bounds(
 		&mut self,
 		assoc_type_index: AssocTypeIdx,
 		requested_at: SourceSpan,
 	) -> Result<(), ()> {
 		let def_id =
 			self.defs.assoc_types[usize::from(assoc_type_index)].def_id;
+		assert!(
+			matches!(self.ast_node(def_id), AstNodeRef::TraitAssocType { .. }),
+			"bound access requires a trait declaration, not a provider"
+		);
 		match self.ensure_signature(QueryInfo {
 			def_id,
 			requested_at: Some(requested_at),
 		}) {
-			SignatureStatus::Resolved(SignatureLocation::AssocType(
-				..,
-			)) => Ok(()),
+			SignatureStatus::Resolved(SignatureLocation::AssocType(..)) => {
+				Ok(())
+			}
 			SignatureStatus::Resolved(_) => unreachable!(
-				"an AssociatedType member's DefId always resolves to SignatureLocation::AssocType"
+				"a trait associated-type declaration has its own signature query"
 			),
 			SignatureStatus::Cycle => {
 				let diagnostic =
@@ -554,7 +597,7 @@ fn report_ambiguous_type_member(
 	for candidate in candidates {
 		let trait_index = match candidate.source {
 			MemberSource::TraitImpl(trait_index, _)
-			| MemberSource::TraitDefault(trait_index)
+			| MemberSource::TraitDefault(trait_index, _)
 			| MemberSource::Bound(trait_index) => trait_index,
 			MemberSource::Inherent(_) => continue,
 		};

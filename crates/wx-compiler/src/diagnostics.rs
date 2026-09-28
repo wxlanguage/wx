@@ -222,6 +222,8 @@ define_diagnostic_codes! {
 		MissingParameterType => "E2099",
 		MissingGlobalType => "E2100",
 		NotAMemory => "E2101",
+		CyclicAssociatedType => "E2102",
+		TypeNormalizationOverflow => "E2103",
 	}
 }
 

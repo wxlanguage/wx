@@ -3,18 +3,14 @@
 //! impl-target validation, call-site type-argument checking, `where`-clause
 //! verification — will eventually go through, once any of those exist.
 //!
-//! Deliberately asks nothing about substitution: `ImplDispatch` (`impls.rs`)
-//! only ever buckets by outer type-constructor identity, never inspecting an
-//! impl's own generic parameters (see that module's doc comment), so a
-//! concrete receiver's satisfaction check is a flat bucket lookup, not a
-//! unification problem. An abstract receiver (a generic type parameter, or
-//! an associated-type projection off one) has no impl to look up at all —
-//! its own declared/implied bound set, already fully merged with its
-//! supertrait closure by `bounds.rs`, *is* the whole truth about it.
+//! Concrete membership uses dispatch candidate discovery followed by full
+//! impl-target matching. Abstract membership reads the same effective facts
+//! as normalization and member lookup. This module does not prove associated
+//! equality requirements or validate impl conformance.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{BoundId, ImpliedTraitBound};
+use super::bounds::BoundId;
 use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
 use super::impls::ImplTarget;
 use super::signatures::SignatureBuilder;
@@ -27,87 +23,69 @@ use crate::vfs::FileId;
 impl SignatureBuilder<'_, '_> {
 	/// Does `ty` satisfy `trait_index`? `reference` is the span of whatever
 	/// is being checked against this bound, threaded through to
-	/// `ensure_assoc_type_signature` for its own cycle diagnostic, same role
+	/// `ensure_assoc_type_bounds` for its own cycle diagnostic, same role
 	/// it plays in `resolve_type_member`/`resolve_bound_member`.
 	///
 	/// `Error`/`Infer` satisfy everything — both are already diagnosed
 	/// wherever they were produced, so failing a bound check here too would
 	/// only cascade that one root cause into every bound that happens to
-	/// mention it.
+	/// mention it. Same reasoning applies to a projection that fails to
+	/// normalize below: normalization already diagnosed that failure.
+	///
+	/// An abstract receiver tries its effective bound facts first — cheap,
+	/// and the common case for a bare generic parameter — before falling
+	/// back to normalizing and dispatching structurally, the same order
+	/// `find_trait_impl` (members.rs) uses. Without that fallback, a
+	/// projection that reduces to a concrete type satisfying the trait
+	/// (`U::Item` where `U: Value where { Item = i32 }` and `i32: Marker`)
+	/// was rejected outright merely for not having `Marker` as a directly
+	/// asserted bound.
 	pub(super) fn type_satisfies_trait(
 		&mut self,
 		ty: TypeIndex,
 		trait_index: TraitIdx,
 		reference: SourceSpan,
 	) -> bool {
-		match self.types.resolve(ty) {
-			Type::Error | Type::Infer => true,
-			Type::TypeParam { env, param_index } => {
-				match self.type_envs.frame_owner(*env) {
-					// A trait's own `Self` is bound reflexively to that trait,
-					// which its `implied_bounds` (built from its *written*
-					// supertrait clause) never lists on its own — same
-					// reasoning as `resolve_bound_member`'s `reflexive`
-					// argument.
-					TypeEnvOwner::Trait(self_trait) => {
-						self_trait == trait_index
-							|| self.param_bounds[usize::from(
-								self.traits[usize::from(self_trait)].env,
-							)][0]
-								.implied_bounds
-								.iter()
-								.any(|bound| bound.trait_index == trait_index)
-					}
-					_ => self.param_bounds[usize::from(*env)]
-						[*param_index as usize]
-						.implied_bounds
-						.iter()
-						.any(|bound| bound.trait_index == trait_index),
-				}
+		if matches!(self.types.resolve(ty), Type::Error | Type::Infer) {
+			return true;
+		}
+		if matches!(
+			self.types.resolve(ty),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		) {
+			if self.prepare_effective_bounds(ty, reference).is_err() {
+				return true;
 			}
-			Type::AssocTypeProjection {
-				assoc_type_index, ..
-			} => {
-				let assoc_type_index = *assoc_type_index;
-				match self
-					.ensure_assoc_type_signature(assoc_type_index, reference)
-				{
-					Ok(()) => implies(
-						&self.assoc_types[usize::from(assoc_type_index)]
-							.as_ref()
-							.expect(
-								"trait associated type signature is resolved",
-							)
-							.implied_bounds,
-						trait_index,
-					),
-					Err(()) => true,
-				}
-			}
-			resolved => {
-				let Some(target) = ImplTarget::from_type(resolved) else {
-					return false;
-				};
-				// Every trait impl — and every typeset membership, which
-				// `ImplDispatch` already normalizes to its backing trait —
-				// is already bucketed by declaration, before any signature
-				// resolved. No unification needed: dispatch never looks at
-				// an impl's own type arguments at all.
-				self.impl_dispatch
-					.trait_candidates(target)
-					.iter()
-					.any(|&(candidate, _)| candidate == trait_index)
+			if self.has_effective_trait(ty, trait_index) {
+				return true;
 			}
 		}
+		let ty = self.normalize_head(ty, reference);
+		if ty == TypeIndex::ERROR {
+			return true;
+		}
+		let Some(target) = ImplTarget::from_type(self.types.resolve(ty)) else {
+			return false;
+		};
+		let candidate =
+			self.impl_dispatch.trait_candidates(target).iter().find_map(
+				|&(candidate, impl_index)| {
+					(candidate == trait_index).then_some(impl_index)
+				},
+			);
+		candidate.is_some_and(|impl_index| {
+			self.match_trait_impl_candidate(impl_index, ty, reference)
+				.is_some()
+		})
 	}
 
 	/// Checks a provided associated-type value against the trait's own
-	/// declared bound for that member (forcing it first) — `where { Size =
-	/// u32 }` against `Memory::Size: PointerSize`, an impl's `type Y = Z;`,
-	/// or a synthesized memory/global's own value. `declared_assoc_type`
-	/// must be the trait's own declaration (`TraitAssocType`'s own
+	/// declared bound for that member (forcing it first). Synthetic memory
+	/// sizes still use this existing check. Equality fact collection and
+	/// written impl providers leave conformance checking to a later phase.
+	/// `declared_assoc_type` must be the trait's own declaration (`TraitAssocType`'s own
 	/// `AssocTypeIdx`), never an impl's provided-value slot — same
-	/// requirement `ensure_assoc_type_signature` already has, which this
+	/// requirement `ensure_assoc_type_bounds` already has, which this
 	/// forces first.
 	///
 	/// Diagnoses and returns `TypeIndex::ERROR` for the first bound `value`
@@ -130,7 +108,7 @@ impl SignatureBuilder<'_, '_> {
 	) -> TypeIndex {
 		let reference = SourceSpan::new(file_id, value.span);
 		if self
-			.ensure_assoc_type_signature(declared_assoc_type, reference)
+			.ensure_assoc_type_bounds(declared_assoc_type, reference)
 			.is_err()
 		{
 			return value.inner;
@@ -138,21 +116,25 @@ impl SignatureBuilder<'_, '_> {
 		let len = self.assoc_types[usize::from(declared_assoc_type)]
 			.as_ref()
 			.expect("trait associated type signature is resolved")
-			.implied_bounds
+			.facts
+			.current()
 			.len();
 		for i in 0..len {
 			let (trait_index, bound_id) = {
-				let bound = &self.assoc_types
-					[usize::from(declared_assoc_type)]
-				.as_ref()
-				.expect("trait associated type signature is resolved")
-				.implied_bounds[i];
+				let bound = &self.assoc_types[usize::from(declared_assoc_type)]
+					.as_ref()
+					.expect("trait associated type signature is resolved")
+					.facts
+					.current()[i];
 				(bound.trait_index, bound.source)
 			};
-			if !self.type_satisfies_trait(value.inner, trait_index, reference)
-			{
+			if !self.type_satisfies_trait(value.inner, trait_index, reference) {
 				let diagnostic = self.report_trait_bound_violation(
-					file_id, value, trait_index, bound_id, owner,
+					file_id,
+					value,
+					trait_index,
+					bound_id,
+					owner,
 				);
 				self.diagnostics.push(diagnostic);
 				return TypeIndex::ERROR;
@@ -335,10 +317,6 @@ fn report_type_arg_count_mismatch(
 			if found == 1 { "was" } else { "were" },
 		))
 		.with_labels(labels)
-}
-
-fn implies(bounds: &[ImpliedTraitBound], trait_index: TraitIdx) -> bool {
-	bounds.iter().any(|bound| bound.trait_index == trait_index)
 }
 
 #[cfg(test)]

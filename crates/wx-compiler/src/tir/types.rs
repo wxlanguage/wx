@@ -16,6 +16,8 @@
 //! it hands back a `TypeIndex` already sitting in this module, with no
 //! namespace lookup, no diagnostics, and no notion of `signatures.rs`'s
 //! demand-driven queries at all.
+//! Structural substitution likewise only replaces parameter identities in
+//! an existing type; it never resolves or normalizes associated types.
 //!
 //! A generic-parameter frame's owner (`TypeEnvOwner`) is a dedicated enum
 //! rather than a bare `ast::DefId`, so it indexes straight into the right
@@ -128,20 +130,11 @@ pub enum Type {
 	Global {
 		global_index: GlobalIdx,
 	},
-	/// One occurrence of a generic parameter declared by `owner` — every use
-	/// of the same parameter across `owner`'s signature/body shares one
-	/// interned instance. `param_index` is absolute across `owner`'s full
-	/// visible chain: a method's own parameters start counting only after
-	/// its parent impl/trait block's, mirroring how `signatures::GenericParam`
-	/// slices compose (see that module's doc comment).
-	///
-	/// `env` is the `TypeEnvId` of the frame this param's own `EnvParam`
-	/// lives in (predicted via `TypeEnvArena::next_id` before that frame
-	/// exists — see its doc comment), with `param_index` local to that one
-	/// frame. It's the lookup key `signatures.rs`'s bound resolution
-	/// actually uses; `owner` stays alongside it for identity/diagnostics
-	/// purposes (naming which item declared this param), not because
-	/// anything here still needs it to find the frame.
+	/// One generic parameter, identified by its declaring frame and its
+	/// index within that frame. Every use shares one interned instance.
+	/// A method's own parameter zero and its parent impl's parameter zero
+	/// have different `env`s; lookup and substitution must respect both
+	/// parts of the identity. The frame itself records its declaration owner.
 	TypeParam {
 		env: TypeEnvIdx,
 		param_index: u32,
@@ -151,9 +144,10 @@ pub enum Type {
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
 	},
-	/// `M::Size` or `A::M::Size` in a signature: a projection from a base
-	/// type (a `TypeParam` or another `AssocTypeProjection`), resolved once
-	/// the base is substituted with a concrete type.
+	/// `<Base as Trait>::Item`, pending normalization. The base can be
+	/// concrete or abstract. `assoc_type_index` always names the trait's
+	/// declaration, never an impl's value provider; substitution preserves
+	/// this identity and only transforms the base.
 	AssocTypeProjection {
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -170,6 +164,167 @@ pub struct TypeInterner {
 }
 
 impl TypeInterner {
+	/// Match a resolved impl target against one receiver. Only parameters
+	/// declared by `env` are holes; parameters from every other frame are
+	/// ordinary identities. All holes must be determined by the target.
+	pub(super) fn match_impl_target(
+		&self,
+		pattern: TypeIndex,
+		actual: TypeIndex,
+		env: TypeEnvIdx,
+		param_count: usize,
+	) -> Option<Box<[TypeIndex]>> {
+		let mut args = vec![None; param_count];
+		self.match_pattern(pattern, actual, env, &mut args)?;
+		args.into_iter().collect::<Option<Box<[TypeIndex]>>>()
+	}
+
+	fn match_pattern(
+		&self,
+		pattern: TypeIndex,
+		actual: TypeIndex,
+		env: TypeEnvIdx,
+		args: &mut [Option<TypeIndex>],
+	) -> Option<()> {
+		let (expected, found) = (self.resolve(pattern), self.resolve(actual));
+		if matches!(expected, Type::Error | Type::Infer)
+			|| matches!(found, Type::Error | Type::Infer)
+		{
+			return None;
+		}
+		match (expected, found) {
+			(
+				Type::TypeParam {
+					env: owner,
+					param_index,
+				},
+				_,
+			) if *owner == env => {
+				let slot = args.get_mut(*param_index as usize)?;
+				match slot {
+					Some(previous) if *previous != actual => None,
+					Some(_) => Some(()),
+					None => {
+						*slot = Some(actual);
+						Some(())
+					}
+				}
+			}
+			(
+				Type::Struct {
+					struct_index: a,
+					type_args: xs,
+				},
+				Type::Struct {
+					struct_index: b,
+					type_args: ys,
+				},
+			) if a == b => self.match_patterns(xs, ys, env, args),
+			(Type::Tuple { elements: xs }, Type::Tuple { elements: ys }) => {
+				self.match_patterns(xs, ys, env, args)
+			}
+			(
+				Type::FunctionItem {
+					func_index: a,
+					type_args: xs,
+				},
+				Type::FunctionItem {
+					func_index: b,
+					type_args: ys,
+				},
+			) if a == b => self.match_patterns(xs, ys, env, args),
+			(
+				Type::Function {
+					params: xs,
+					result: xr,
+				},
+				Type::Function {
+					params: ys,
+					result: yr,
+				},
+			) => {
+				self.match_patterns(xs, ys, env, args)?;
+				self.match_pattern(*xr, *yr, env, args)
+			}
+			(
+				Type::Pointer {
+					to: x,
+					memory: xm,
+					ownership: xo,
+				},
+				Type::Pointer {
+					to: y,
+					memory: ym,
+					ownership: yo,
+				},
+			) if xo == yo => {
+				self.match_pattern(*x, *y, env, args)?;
+				self.match_pattern(*xm, *ym, env, args)
+			}
+			(
+				Type::Array {
+					of: x,
+					size: xs,
+					memory: xm,
+					ownership: xo,
+				},
+				Type::Array {
+					of: y,
+					size: ys,
+					memory: ym,
+					ownership: yo,
+				},
+			) if xs == ys && xo == yo => {
+				self.match_pattern(*x, *y, env, args)?;
+				self.match_pattern(*xm, *ym, env, args)
+			}
+			(
+				Type::Slice {
+					of: x,
+					memory: xm,
+					ownership: xo,
+				},
+				Type::Slice {
+					of: y,
+					memory: ym,
+					ownership: yo,
+				},
+			) if xo == yo => {
+				self.match_pattern(*x, *y, env, args)?;
+				self.match_pattern(*xm, *ym, env, args)
+			}
+			(
+				Type::AssocTypeProjection {
+					trait_index: at,
+					assoc_type_index: aa,
+					base: x,
+				},
+				Type::AssocTypeProjection {
+					trait_index: bt,
+					assoc_type_index: ba,
+					base: y,
+				},
+			) if at == bt && aa == ba => self.match_pattern(*x, *y, env, args),
+			_ if pattern == actual => Some(()),
+			_ => None,
+		}
+	}
+
+	fn match_patterns(
+		&self,
+		expected: &[TypeIndex],
+		found: &[TypeIndex],
+		env: TypeEnvIdx,
+		args: &mut [Option<TypeIndex>],
+	) -> Option<()> {
+		if expected.len() != found.len() {
+			return None;
+		}
+		for (&pattern, &actual) in expected.iter().zip(found) {
+			self.match_pattern(pattern, actual, env, args)?;
+		}
+		Some(())
+	}
 	pub fn new() -> Self {
 		let entries = vec![
 			// Order must match the `TypeIndex` constants below — see
@@ -226,6 +381,224 @@ impl TypeInterner {
 	pub fn resolve(&self, index: TypeIndex) -> &Type {
 		&self.entries[usize::from(index)]
 	}
+
+	/// Replaces parameters from one frame throughout `ty`. Parameters from
+	/// other frames stay unchanged, and replacements are inserted as-is:
+	/// this does not recursively substitute inside `substitution.args`.
+	/// Projections keep their identity and only substitute their receiver;
+	/// selecting an impl or normalizing its value is a separate operation.
+	/// Unchanged types retain their indices without allocating. Child lists
+	/// are copied only after a change requires a new owning type node.
+	///
+	/// Panics if an encountered parameter in the targeted frame has no
+	/// corresponding argument. Argument arity is the caller's responsibility.
+	pub(super) fn substitute(
+		&mut self,
+		ty: TypeIndex,
+		substitution: &Substitution<'_>,
+	) -> TypeIndex {
+		match self.resolve(ty) {
+			Type::TypeParam { env, param_index } => {
+				if *env == substitution.env {
+					*substitution.args.get(*param_index as usize).expect(
+						"substitution is missing an argument for its parameter frame",
+					)
+				} else {
+					ty
+				}
+			}
+			Type::Tuple { .. } => {
+				let elements = self.substitute_list(ty, substitution, |ty| {
+					let Type::Tuple { elements } = ty else {
+						unreachable!()
+					};
+					elements
+				});
+				match elements {
+					Some(elements) => self.intern(Type::Tuple { elements }),
+					None => ty,
+				}
+			}
+			Type::Struct { struct_index, .. } => {
+				let struct_index = *struct_index;
+				let type_args = self.substitute_list(ty, substitution, |ty| {
+					let Type::Struct { type_args, .. } = ty else {
+						unreachable!()
+					};
+					type_args
+				});
+				match type_args {
+					Some(type_args) => self.intern(Type::Struct {
+						struct_index,
+						type_args,
+					}),
+					None => ty,
+				}
+			}
+			Type::FunctionItem { func_index, .. } => {
+				let func_index = *func_index;
+				let type_args = self.substitute_list(ty, substitution, |ty| {
+					let Type::FunctionItem { type_args, .. } = ty else {
+						unreachable!()
+					};
+					type_args
+				});
+				match type_args {
+					Some(type_args) => self.intern(Type::FunctionItem {
+						func_index,
+						type_args,
+					}),
+					None => ty,
+				}
+			}
+			Type::Function { result, .. } => {
+				let result = *result;
+				let params = self.substitute_list(ty, substitution, |ty| {
+					let Type::Function { params, .. } = ty else {
+						unreachable!()
+					};
+					params
+				});
+				let next_result = self.substitute(result, substitution);
+				if params.is_none() && next_result == result {
+					return ty;
+				}
+				// A changed result still needs an owned parameter list, even
+				// when none of those parameters changed.
+				let params = params.unwrap_or_else(|| {
+					let Type::Function { params, .. } = self.resolve(ty) else {
+						unreachable!()
+					};
+					params.clone()
+				});
+				self.intern(Type::Function {
+					params,
+					result: next_result,
+				})
+			}
+			Type::Pointer {
+				to,
+				memory,
+				ownership,
+			} => {
+				let (to, memory, ownership) = (*to, *memory, *ownership);
+				let next_to = self.substitute(to, substitution);
+				let next_memory = self.substitute(memory, substitution);
+				if next_to == to && next_memory == memory {
+					ty
+				} else {
+					self.intern(Type::Pointer {
+						to: next_to,
+						memory: next_memory,
+						ownership,
+					})
+				}
+			}
+			Type::Array {
+				of,
+				size,
+				memory,
+				ownership,
+			} => {
+				let (of, size, memory, ownership) =
+					(*of, *size, *memory, *ownership);
+				let next_of = self.substitute(of, substitution);
+				let next_memory = self.substitute(memory, substitution);
+				if next_of == of && next_memory == memory {
+					ty
+				} else {
+					self.intern(Type::Array {
+						of: next_of,
+						size,
+						memory: next_memory,
+						ownership,
+					})
+				}
+			}
+			Type::Slice {
+				of,
+				memory,
+				ownership,
+			} => {
+				let (of, memory, ownership) = (*of, *memory, *ownership);
+				let next_of = self.substitute(of, substitution);
+				let next_memory = self.substitute(memory, substitution);
+				if next_of == of && next_memory == memory {
+					ty
+				} else {
+					self.intern(Type::Slice {
+						of: next_of,
+						memory: next_memory,
+						ownership,
+					})
+				}
+			}
+			Type::AssocTypeProjection {
+				base,
+				trait_index,
+				assoc_type_index,
+			} => {
+				let (base, trait_index, assoc_type_index) =
+					(*base, *trait_index, *assoc_type_index);
+				let next_base = self.substitute(base, substitution);
+				if next_base == base {
+					ty
+				} else {
+					self.intern(Type::AssocTypeProjection {
+						base: next_base,
+						trait_index,
+						assoc_type_index,
+					})
+				}
+			}
+			Type::Error
+			| Type::Infer
+			| Type::Unit
+			| Type::Never
+			| Type::Integer
+			| Type::Float
+			| Type::U8
+			| Type::I8
+			| Type::U16
+			| Type::I16
+			| Type::U32
+			| Type::I32
+			| Type::U64
+			| Type::I64
+			| Type::F32
+			| Type::F64
+			| Type::Bool
+			| Type::Char
+			| Type::Enum { .. }
+			| Type::Memory { .. }
+			| Type::Global { .. }
+			| Type::AssociatedType { .. } => ty,
+		}
+	}
+
+	/// Copies a child list only when its first changed element is found.
+	/// Re-reads the original through its stable type index before each use:
+	/// recursive substitution can grow `entries`, invalidating a borrow,
+	/// but cannot modify an already-interned type or its list.
+	fn substitute_list(
+		&mut self,
+		ty: TypeIndex,
+		substitution: &Substitution<'_>,
+		list: impl Fn(&Type) -> &[TypeIndex],
+	) -> Option<Box<[TypeIndex]>> {
+		let len = list(self.resolve(ty)).len();
+		let mut substituted: Option<Box<[TypeIndex]>> = None;
+		for index in 0..len {
+			let original = list(self.resolve(ty))[index];
+			let next = self.substitute(original, substitution);
+			if next != original {
+				let items = substituted
+					.get_or_insert_with(|| Box::from(list(self.resolve(ty))));
+				items[index] = next;
+			}
+		}
+		substituted
+	}
 }
 
 impl Default for TypeInterner {
@@ -237,10 +610,20 @@ impl Default for TypeInterner {
 // A `Copy` handle into a `TypeEnvArena` — see that type's doc comment.
 index_newtype!(TypeEnvIdx);
 
+/// Replacements for all parameters in one declaring frame. `args[i]`
+/// replaces `TypeParam { env, param_index: i }`; other frames are untouched.
+/// Callers supply one argument per parameter in `env`, in declaration order.
+/// This borrows an instantiation's arguments without changing the original
+/// lexical environment. Replacement types may themselves contain parameters.
+pub(super) struct Substitution<'a> {
+	pub(super) env: TypeEnvIdx,
+	pub(super) args: &'a [TypeIndex],
+}
+
 /// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
-/// interned as `Type::TypeParam { owner, param_index }` the moment its frame
+/// interned as `Type::TypeParam { env, param_index }` the moment its frame
 /// is built, or `Self`, bound to whatever it means right here: a trait's own
-/// abstract `TypeParam { owner: trait_id, param_index: 0 }`, or an impl's
+/// abstract `TypeParam { env, param_index: 0 }`, or an impl's
 /// already-concrete `target`. Both are just "this name resolves to this
 /// `TypeIndex`" once interning is out of the way — one shape covers both, so
 /// `resolve_name` never needs a separate concrete-vs-abstract case.
@@ -574,5 +957,366 @@ impl IntrinsicDefs {
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ast::Ownership;
+
+	fn parameter(
+		types: &mut TypeInterner,
+		env: TypeEnvIdx,
+		param_index: u32,
+	) -> TypeIndex {
+		types.intern(Type::TypeParam { env, param_index })
+	}
+
+	#[test]
+	fn substitution_replaces_only_the_targeted_frames_parameters() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let u = parameter(&mut types, env, 1);
+		let other = parameter(&mut types, TypeEnvIdx::new(2), 0);
+		let original = types.intern(Type::Tuple {
+			elements: Box::new([t, u, other]),
+		});
+		let expected = types.intern(Type::Tuple {
+			elements: Box::new([TypeIndex::I32, TypeIndex::BOOL, other]),
+		});
+		let count = types.entries.len();
+
+		let actual = types.substitute(
+			original,
+			&Substitution {
+				env,
+				args: &[TypeIndex::I32, TypeIndex::BOOL],
+			},
+		);
+
+		assert_eq!(actual, expected);
+		assert_eq!(types.entries.len(), count, "reuse the interned result");
+		assert_eq!(
+			types.resolve(original),
+			&Type::Tuple {
+				elements: Box::new([t, u, other])
+			},
+			"the generic template must remain unchanged"
+		);
+	}
+
+	/// A function containing every compound type shape. Both the element
+	/// and memory are parameters, including beneath chained projections.
+	fn nested_signature(
+		types: &mut TypeInterner,
+		element: TypeIndex,
+		memory: TypeIndex,
+	) -> TypeIndex {
+		let wrapper = types.intern(Type::Struct {
+			struct_index: StructIdx::new(0),
+			type_args: Box::new([element]),
+		});
+		let item = types.intern(Type::AssocTypeProjection {
+			trait_index: TraitIdx::new(0),
+			assoc_type_index: AssocTypeIdx::new(0),
+			base: wrapper,
+		});
+		let next = types.intern(Type::AssocTypeProjection {
+			trait_index: TraitIdx::new(1),
+			assoc_type_index: AssocTypeIdx::new(1),
+			base: item,
+		});
+		let pointer = types.intern(Type::Pointer {
+			to: next,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		let array = types.intern(Type::Array {
+			of: pointer,
+			size: 7,
+			memory,
+			ownership: Ownership::Exclusive,
+		});
+		let slice = types.intern(Type::Slice {
+			of: element,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		let function_item = types.intern(Type::FunctionItem {
+			func_index: FunctionIdx::new(0),
+			type_args: Box::new([element, memory]),
+		});
+		let tuple = types.intern(Type::Tuple {
+			elements: Box::new([array, slice, function_item]),
+		});
+		types.intern(Type::Function {
+			params: Box::new([tuple]),
+			result: next,
+		})
+	}
+
+	#[test]
+	fn substitution_traverses_nested_types_without_normalizing_projections() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let m = parameter(&mut types, env, 1);
+		let memory = types.intern(Type::Memory {
+			memory_index: MemoryIdx::new(0),
+		});
+		let original = nested_signature(&mut types, t, m);
+
+		let actual = types.substitute(
+			original,
+			&Substitution {
+				env,
+				args: &[TypeIndex::I32, memory],
+			},
+		);
+		let expected = nested_signature(&mut types, TypeIndex::I32, memory);
+		assert_eq!(actual, expected);
+		assert_ne!(actual, original);
+		assert_eq!(nested_signature(&mut types, t, m), original);
+	}
+
+	#[test]
+	fn unchanged_substitution_preserves_indices_without_growing_the_interner() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let m = parameter(&mut types, env, 1);
+		let original = nested_signature(&mut types, t, m);
+		let count = types.entries.len();
+
+		assert_eq!(
+			types.substitute(
+				original,
+				&Substitution {
+					env: TypeEnvIdx::new(2),
+					args: &[]
+				},
+			),
+			original
+		);
+		assert_eq!(
+			types.substitute(original, &Substitution { env, args: &[t, m] }),
+			original
+		);
+		assert_eq!(types.entries.len(), count);
+	}
+
+	#[test]
+	fn substitution_preserves_unchanged_list_elements_around_late_changes() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let u = parameter(&mut types, env, 1);
+		let substitution = Substitution {
+			env,
+			args: &[TypeIndex::I32, TypeIndex::U8],
+		};
+		let cases = [
+			(
+				[TypeIndex::BOOL, TypeIndex::CHAR, t],
+				[TypeIndex::BOOL, TypeIndex::CHAR, TypeIndex::I32],
+			),
+			(
+				[TypeIndex::BOOL, t, TypeIndex::CHAR],
+				[TypeIndex::BOOL, TypeIndex::I32, TypeIndex::CHAR],
+			),
+			(
+				[t, TypeIndex::BOOL, u],
+				[TypeIndex::I32, TypeIndex::BOOL, TypeIndex::U8],
+			),
+		];
+		for (original, expected) in cases {
+			let original = types.intern(Type::Tuple {
+				elements: Box::new(original),
+			});
+			let actual = types.substitute(original, &substitution);
+			assert_eq!(
+				types.resolve(actual),
+				&Type::Tuple {
+					elements: Box::new(expected)
+				}
+			);
+		}
+	}
+
+	#[test]
+	fn substitution_handles_independent_function_parameter_and_result_changes()
+	{
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let substitution = Substitution {
+			env,
+			args: &[TypeIndex::I32],
+		};
+		let cases = [
+			(
+				Type::Function {
+					params: Box::new([TypeIndex::BOOL]),
+					result: t,
+				},
+				Type::Function {
+					params: Box::new([TypeIndex::BOOL]),
+					result: TypeIndex::I32,
+				},
+			),
+			(
+				Type::Function {
+					params: Box::new([TypeIndex::BOOL, t]),
+					result: TypeIndex::CHAR,
+				},
+				Type::Function {
+					params: Box::new([TypeIndex::BOOL, TypeIndex::I32]),
+					result: TypeIndex::CHAR,
+				},
+			),
+			(
+				Type::Function {
+					params: Box::new([]),
+					result: t,
+				},
+				Type::Function {
+					params: Box::new([]),
+					result: TypeIndex::I32,
+				},
+			),
+		];
+		for (original, expected) in cases {
+			let original = types.intern(original);
+			let actual = types.substitute(original, &substitution);
+			assert_eq!(types.resolve(actual), &expected);
+		}
+	}
+
+	#[test]
+	fn substitution_inserts_replacements_without_substituting_them_again() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		let u = parameter(&mut types, env, 1);
+		let original = types.intern(Type::Tuple {
+			elements: Box::new([t, u]),
+		});
+		let replacement = types.intern(Type::Tuple {
+			elements: Box::new([t]),
+		});
+		let expected = types.intern(Type::Tuple {
+			elements: Box::new([u, replacement]),
+		});
+
+		assert_eq!(
+			types.substitute(
+				original,
+				&Substitution {
+					env,
+					args: &[u, replacement]
+				}
+			),
+			expected,
+			"T -> U and U -> (T,) are simultaneous replacements"
+		);
+	}
+
+	#[test]
+	fn substitution_preserves_leaf_types() {
+		let mut types = TypeInterner::new();
+		let leaves = [
+			Type::Error,
+			Type::Infer,
+			Type::Unit,
+			Type::Never,
+			Type::Integer,
+			Type::Float,
+			Type::U8,
+			Type::I8,
+			Type::U16,
+			Type::I16,
+			Type::U32,
+			Type::I32,
+			Type::U64,
+			Type::I64,
+			Type::F32,
+			Type::F64,
+			Type::Bool,
+			Type::Char,
+			Type::Enum {
+				enum_index: EnumIdx::new(0),
+			},
+			Type::Memory {
+				memory_index: MemoryIdx::new(0),
+			},
+			Type::Global {
+				global_index: GlobalIdx::new(0),
+			},
+			Type::AssociatedType {
+				trait_index: TraitIdx::new(0),
+				assoc_type_index: AssocTypeIdx::new(0),
+			},
+			Type::Struct {
+				struct_index: StructIdx::new(0),
+				type_args: Box::new([]),
+			},
+			Type::FunctionItem {
+				func_index: FunctionIdx::new(0),
+				type_args: Box::new([]),
+			},
+		];
+		for leaf in leaves {
+			let ty = types.intern(leaf);
+			let count = types.entries.len();
+			assert_eq!(
+				types.substitute(
+					ty,
+					&Substitution {
+						env: TypeEnvIdx::new(1),
+						args: &[]
+					}
+				),
+				ty
+			);
+			assert_eq!(types.entries.len(), count);
+		}
+	}
+
+	#[test]
+	fn substitution_keeps_error_and_inference_arguments_as_supplied() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let t = parameter(&mut types, env, 0);
+		for replacement in [TypeIndex::ERROR, TypeIndex::INFER] {
+			assert_eq!(
+				types.substitute(
+					t,
+					&Substitution {
+						env,
+						args: &[replacement]
+					}
+				),
+				replacement
+			);
+		}
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "substitution is missing an argument for its parameter frame"
+	)]
+	fn substitution_rejects_missing_arguments_for_the_targeted_frame() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let u = parameter(&mut types, env, 1);
+		types.substitute(
+			u,
+			&Substitution {
+				env,
+				args: &[TypeIndex::I32],
+			},
+		);
 	}
 }

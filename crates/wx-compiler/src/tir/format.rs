@@ -489,7 +489,9 @@ mod tests {
 				.bindings
 				.get(&BindingKey::ty(symbol))
 				.unwrap_or_else(|| {
-					panic!("expected the trait to have an associated type `{name}`")
+					panic!(
+						"expected the trait to have an associated type `{name}`"
+					)
 				});
 			let MemberKind::AssociatedType(index) =
 				trait_def.members[usize::from(member_index)].kind

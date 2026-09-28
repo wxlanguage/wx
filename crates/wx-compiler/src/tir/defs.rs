@@ -338,6 +338,8 @@ pub struct ConstDef {
 /// Declared bounds and impl target types remain in the AST for resolution.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct AssocTypeDef {
+	/// Query that populates this slot: the member itself for written items,
+	/// or the owning memory/global for synthetic impl members.
 	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIdx,
