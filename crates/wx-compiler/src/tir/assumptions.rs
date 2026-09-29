@@ -356,7 +356,7 @@ impl<'a> AssumptionFacts<'a> {
 	}
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Lend fact storage and the interner separately, so traversing facts can
 	/// intern projected subjects without cloning or mutating their bound trees.
 	pub(super) fn assumptions(

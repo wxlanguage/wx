@@ -676,7 +676,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	}
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	pub(super) fn impl_target_type(&mut self, target: ImplTarget) -> TypeIndex {
 		match target {
 			ImplTarget::U8 => TypeIndex::U8,

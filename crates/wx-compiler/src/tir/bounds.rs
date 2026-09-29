@@ -232,7 +232,7 @@ impl BoundArena {
 	}
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Merge completed source facts, including inherited bounds.
 	pub(super) fn compute_implied_bounds(
 		&mut self,
@@ -555,7 +555,7 @@ struct ContextualEquality {
 	context: Option<SelfSubstitution>,
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Demand declaration bounds only where a projected receiver needs them.
 	/// A published provisional table is usable for identity/membership lookup,
 	/// but does not authorize equality reduction.
@@ -658,7 +658,7 @@ impl<'a> AssumptionReader<'a> {
 	}
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	pub(super) fn effective_bounds(
 		&self,
 		receiver: TypeIndex,

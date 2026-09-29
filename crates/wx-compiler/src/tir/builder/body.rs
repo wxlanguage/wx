@@ -675,7 +675,7 @@ impl<'ast> Builder<'ast, '_> {
 				span: expr.span,
 			}),
 			ast::Expression::String(symbol) => {
-                let symbol = *symbol;
+				let symbol = *symbol;
 				// An expected slice type pins the literal's memory (`local
 				// s: other::&[u8] = "…"`); ambient resolution is the
 				// fallback and is ambiguous with more than one memory.

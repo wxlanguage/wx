@@ -1600,15 +1600,15 @@ pub enum TraitItem {
 		ty: Box<Spanned<TypeExpression>>,
 		value: Option<Box<Spanned<Expression>>>,
 	},
-	/// An associated type declaration: `type Name;` or `type Name: Bound1 +
-	/// Bound2;` The concrete type is provided by each impl; bounds
-	/// constrain what is allowed.
+	/// An associated type declaration, optionally with a default value.
 	AssociatedType {
 		id: DefId,
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		/// Trait bounds the concrete type must satisfy. `None` = unconstrained.
 		bounds: Option<Spanned<BoundExpression>>,
+		/// Used when an impl does not provide this associated type.
+		value: Option<Box<Spanned<TypeExpression>>>,
 	},
 }
 
@@ -5390,11 +5390,20 @@ impl<'ctx> Parser<'ctx> {
 								} else {
 									None
 								};
+							let value =
+								if parser.lexer.next_if(Token::Eq).is_some() {
+									Some(Box::new(
+										parser.parse_type_expression()?,
+									))
+								} else {
+									None
+								};
 							let span = TextSpan::new(
 								type_span.start,
-								bounds
+								value
 									.as_ref()
-									.map(|b| b.span)
+									.map(|v| v.span)
+									.or_else(|| bounds.as_ref().map(|b| b.span))
 									.unwrap_or(name_span)
 									.end,
 							);
@@ -5406,6 +5415,7 @@ impl<'ctx> Parser<'ctx> {
 										span: name_span,
 									},
 									bounds,
+									value,
 									attributes,
 								},
 								span,

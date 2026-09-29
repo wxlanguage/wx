@@ -59,9 +59,9 @@ pub(super) enum MemberSource {
 	Inherent(InherentImplIdx),
 	/// A concrete `impl Trait for Type` provides (or overrides) this member.
 	TraitImpl(TraitIdx, TraitImplIdx),
-	/// No impl override: value members can use their trait definition.
-	/// Associated types currently have no defaults; a missing provider needs
-	/// error recovery. Conformance checking owns the diagnostic.
+	/// No impl override: the trait declaration may supply a default.
+	/// An absent required member needs error recovery; conformance checking
+	/// owns the diagnostic.
 	TraitDefault(TraitIdx, TraitImplIdx),
 	/// Receiver is abstract (`TypeParam`/`AssocTypeProjection`): resolved
 	/// through one of its own bounds, not a concrete impl at all. Concrete
@@ -70,15 +70,87 @@ pub(super) enum MemberSource {
 	Bound(TraitIdx),
 }
 
-/// An associated-type definition supplied by an impl. Constructed only by
-/// looking up the declaration in an impl, so a required trait declaration
-/// cannot accidentally be passed to the value accessor.
+/// An associated-type index known to refer to a value provided by an impl:
+///
+/// ```text
+/// trait Trait { type Item; }          // declaration
+/// impl Trait for T { type Item = U; } // value provider
+/// ```
+///
+/// This wraps the impl's `Item` index. Its value may still need to be resolved,
+/// but callers can rely on that value being present after resolution.
 #[derive(Clone, Copy)]
-pub(super) struct AssocTypeProvider(AssocTypeIdx);
+pub(super) struct ImplAssocTypeIdx(AssocTypeIdx);
 
-impl AssocTypeProvider {
+impl ImplAssocTypeIdx {
 	pub(super) fn index(self) -> AssocTypeIdx {
 		self.0
+	}
+}
+
+impl DefinitionRegistry {
+	pub(super) fn declared_trait_member(
+		&self,
+		trait_index: TraitIdx,
+		key: BindingKey,
+	) -> Option<MemberKind> {
+		let definition = &self.traits[usize::from(trait_index)];
+		definition
+			.bindings
+			.get(&key)
+			.map(|&index| definition.members[usize::from(index)].kind)
+	}
+
+	/// Keeps type identity on the declaration while preserving value-member
+	/// override selection. An undeclared impl-associated type is not a trait
+	/// projection; full impl conformance checking will diagnose that member.
+	pub(super) fn concrete_trait_member(
+		&self,
+		trait_index: TraitIdx,
+		impl_index: TraitImplIdx,
+		key: BindingKey,
+	) -> Option<TypeMemberTarget> {
+		let trait_def = &self.traits[usize::from(trait_index)];
+		let declared = trait_def
+			.bindings
+			.get(&key)
+			.map(|&index| trait_def.members[usize::from(index)].kind);
+		let impl_def = &self.trait_impls[usize::from(impl_index)];
+		if let Some(&index) = impl_def.bindings.get(&key) {
+			let kind = match impl_def.members[usize::from(index)].kind {
+				MemberKind::AssociatedType(_) => declared?,
+				kind => kind,
+			};
+			Some(TypeMemberTarget {
+				kind,
+				source: MemberSource::TraitImpl(trait_index, impl_index),
+			})
+		} else {
+			declared.map(|kind| TypeMemberTarget {
+				kind,
+				source: MemberSource::TraitDefault(trait_index, impl_index),
+			})
+		}
+	}
+
+	/// Returns the impl's value-providing associated type for this declaration.
+	pub(super) fn impl_assoc_type_for(
+		&self,
+		impl_index: TraitImplIdx,
+		declaration: AssocTypeIdx,
+	) -> Option<ImplAssocTypeIdx> {
+		let declaration = &self.assoc_types[usize::from(declaration)];
+		let impl_def = &self.trait_impls[usize::from(impl_index)];
+		let member_idx = impl_def
+			.bindings
+			.get(&BindingKey::ty(declaration.name.inner))
+			.copied()?;
+		let MemberKind::AssociatedType(provider) =
+			impl_def.members[usize::from(member_idx)].kind
+		else {
+			unreachable!("a type-tier impl member is an associated type")
+		};
+		Some(ImplAssocTypeIdx(provider))
 	}
 }
 
@@ -97,7 +169,7 @@ pub(super) enum TraitImplLookup {
 	Abstract,
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Resolves `name` (in binding tier `tier` — `Value` for a
 	/// function/const, `Type` for an associated type) as a member of
 	/// `receiver`. `reference` is the span of whatever named `receiver` in
@@ -236,16 +308,8 @@ impl SignatureBuilder<'_, '_> {
 			MemberKind::AssociatedType(assoc_type_index) => {
 				let trait_index = match member.source {
 					MemberSource::Bound(trait_index)
-					| MemberSource::TraitImpl(trait_index, _) => trait_index,
-					MemberSource::TraitDefault(trait_index, impl_index) => {
-						if self
-							.assoc_type_provider(impl_index, assoc_type_index)
-							.is_none()
-						{
-							return TypeIndex::ERROR;
-						}
-						trait_index
-					}
+					| MemberSource::TraitImpl(trait_index, _)
+					| MemberSource::TraitDefault(trait_index, _) => trait_index,
 					MemberSource::Inherent(_) => {
 						todo!("inherent associated types")
 					}
@@ -310,6 +374,7 @@ impl SignatureBuilder<'_, '_> {
 		)?;
 		Ok(match found {
 			TraitImplLookup::Concrete { impl_index, .. } => self
+				.defs
 				.concrete_trait_member(required_trait, impl_index, key)
 				.expect("the requested trait member was found above"),
 			TraitImplLookup::Abstract => TypeMemberTarget {
@@ -472,8 +537,7 @@ impl SignatureBuilder<'_, '_> {
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
 		// Only a candidate that declares this name can affect precedence.
-		for i in 0..self.impl_dispatch.inherent_candidates(target).len() {
-			let index = self.impl_dispatch.inherent_candidates(target)[i];
+		for &index in self.impl_dispatch.inherent_candidates(target) {
 			let impl_def = &self.defs.inherent_impls[usize::from(index)];
 			let Some(&member_index) = impl_def.bindings.get(&key) else {
 				continue;
@@ -495,7 +559,7 @@ impl SignatureBuilder<'_, '_> {
 		}
 		let mut traits = Vec::new();
 		for &(trait_index, _) in self.impl_dispatch.trait_candidates(target) {
-			if self.declared_trait_member(trait_index, key).is_some() {
+			if self.defs.declared_trait_member(trait_index, key).is_some() {
 				traits.push(trait_index);
 			}
 		}
@@ -592,15 +656,17 @@ impl SignatureBuilder<'_, '_> {
 				reference,
 			) {
 				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
-					if let Some(member) =
-						self.concrete_trait_member(trait_index, impl_index, key)
-					{
+					if let Some(member) = self.defs.concrete_trait_member(
+						trait_index,
+						impl_index,
+						key,
+					) {
 						Self::push_candidate(&mut candidates, member);
 					}
 				}
 				Ok(Some(TraitImplLookup::Abstract)) => {
 					if let Some(kind) =
-						self.declared_trait_member(trait_index, key)
+						self.defs.declared_trait_member(trait_index, key)
 					{
 						Self::push_candidate(
 							&mut candidates,
@@ -627,72 +693,6 @@ impl SignatureBuilder<'_, '_> {
 		} else {
 			Self::classify(candidates)
 		}
-	}
-
-	fn declared_trait_member(
-		&self,
-		trait_index: TraitIdx,
-		key: BindingKey,
-	) -> Option<MemberKind> {
-		let definition = &self.defs.traits[usize::from(trait_index)];
-		definition
-			.bindings
-			.get(&key)
-			.map(|&index| definition.members[usize::from(index)].kind)
-	}
-
-	/// Keeps type identity on the declaration while preserving value-member
-	/// override selection. An undeclared impl-associated type is not a trait
-	/// projection; full impl conformance checking will diagnose that member.
-	fn concrete_trait_member(
-		&self,
-		trait_index: TraitIdx,
-		impl_index: TraitImplIdx,
-		key: BindingKey,
-	) -> Option<TypeMemberTarget> {
-		let trait_def = &self.defs.traits[usize::from(trait_index)];
-		let declared = trait_def
-			.bindings
-			.get(&key)
-			.map(|&index| trait_def.members[usize::from(index)].kind);
-		let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-		if let Some(&index) = impl_def.bindings.get(&key) {
-			let kind = match impl_def.members[usize::from(index)].kind {
-				MemberKind::AssociatedType(_) => declared?,
-				kind => kind,
-			};
-			Some(TypeMemberTarget {
-				kind,
-				source: MemberSource::TraitImpl(trait_index, impl_index),
-			})
-		} else {
-			declared.map(|kind| TypeMemberTarget {
-				kind,
-				source: MemberSource::TraitDefault(trait_index, impl_index),
-			})
-		}
-	}
-
-	/// Selects a provided value for a declaration of the implemented trait.
-	/// This does not force signatures or emit diagnostics. A missing provider
-	/// returns `None` so callers can recover with an error type; conformance
-	/// checking after signature resolution owns the missing-member diagnostic.
-	pub(super) fn assoc_type_provider(
-		&self,
-		impl_index: TraitImplIdx,
-		declaration: AssocTypeIdx,
-	) -> Option<AssocTypeProvider> {
-		let declaration = &self.defs.assoc_types[usize::from(declaration)];
-		let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-		let &index = impl_def
-			.bindings
-			.get(&BindingKey::ty(declaration.name.inner))?;
-		let MemberKind::AssociatedType(provider) =
-			impl_def.members[usize::from(index)].kind
-		else {
-			unreachable!("a type-tier impl member is an associated type")
-		};
-		Some(AssocTypeProvider(provider))
 	}
 
 	fn resolve_bound_member(

@@ -39,7 +39,7 @@ pub(super) struct BoundFormatter<'a> {
 	bounds: &'a BoundArena,
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	pub(super) fn type_formatter(&self) -> TypeFormatter<'_> {
 		TypeFormatter {
 			types: &self.types,
@@ -381,7 +381,7 @@ mod tests {
 				&graph.strings,
 				&defs,
 				&ast_nodes,
-				dispatch,
+				&dispatch,
 			);
 			for entry in &ast_nodes {
 				let _ = signatures.ensure_signature(QueryInfo {

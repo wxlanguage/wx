@@ -48,7 +48,7 @@ use super::defs::{
 	StructIdx, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
-use super::members::AssocTypeProvider;
+use super::members::ImplAssocTypeIdx;
 use super::normalize::NormalizationState;
 use super::obligations::{
 	BoundRequirements, InvalidateTraitDependents, Obligation, ObligationArena,
@@ -234,13 +234,9 @@ pub struct ConstantSignature {
 /// trait's own `self_scope` — forced first, same as `TraitFunction`/
 /// `TraitConst` — so a bound may reference `Self`, e.g. `type Size: Memory
 /// where { X = Self::Size }`) only ever come from a trait's own declaration.
-/// `value` is the concrete type this slot is set to: `None` for a trait
-/// declaration with no default (there's no syntax for one yet, but nothing
-/// here assumes there won't be), `Some` for an `impl`'s own `type Name =
-/// Ty;` (a separate query, `TraitImplAssocType`, and a separate `AssocTypeIdx`
-/// from the trait's declaration even for "the same" name — it never sets
-/// `declared_bounds`/`implied_bounds`, since an impl provides a value, it
-/// doesn't declare a requirement).
+/// `value` holds a trait default or an impl's provided type, when present.
+/// Each impl definition has a separate `AssocTypeIdx` from its declaration;
+/// only the declaration carries bounds and implied facts.
 pub struct AssocTypeSignature {
 	pub(super) declared_bounds: Box<[BoundId]>,
 	/// Effective facts from the declaration — see `BoundFacts`. A
@@ -381,7 +377,7 @@ impl SignatureRegistry {
 			strings,
 			defs,
 			ast_nodes,
-			impl_dispatch,
+			&impl_dispatch,
 		);
 		// Dispatch is complete before any signature query can resolve a
 		// concrete member. Impl parameter bounds are resolved here along
@@ -395,26 +391,45 @@ impl SignatureRegistry {
 		builder.obligations.assert_drained();
 
 		let exports = builder.resolve_exports();
+		// Release the builder's read-only dispatch borrow before moving the
+		// completed dispatch into the finished registry.
+		let SignatureBuilder {
+			type_aliases,
+			traits,
+			structs,
+			enums,
+			typesets,
+			assoc_types,
+			functions,
+			constants,
+			inherent_impls,
+			trait_impls,
+			types,
+			bounds,
+			type_envs,
+			param_bounds,
+			query_state,
+			..
+		} = builder;
 
 		Self {
 			exports,
-			type_aliases: builder.type_aliases,
-			traits: builder.traits,
-			structs: builder.structs,
-			enums: builder.enums,
-			typesets: builder.typesets,
-			assoc_types: builder.assoc_types,
-			functions: builder.functions,
-			constants: builder.constants,
-			inherent_impls: builder.inherent_impls,
-			trait_impls: builder.trait_impls,
-			impl_dispatch: builder.impl_dispatch,
-			types: builder.types,
-			bounds: builder.bounds,
-			type_envs: builder.type_envs,
-			param_bounds: builder.param_bounds,
-			item_lookup: builder
-				.query_state
+			type_aliases,
+			traits,
+			structs,
+			enums,
+			typesets,
+			assoc_types,
+			functions,
+			constants,
+			inherent_impls,
+			trait_impls,
+			impl_dispatch,
+			types,
+			bounds,
+			type_envs,
+			param_bounds,
+			item_lookup: query_state
 				.into_iter()
 				.map(|(def_id, entry)| {
 					let QueryState::Resolved(location) = entry.state else {
@@ -430,7 +445,7 @@ impl SignatureRegistry {
 	}
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// All declaration signatures are available; only the selected crate's entries remain.
 	fn resolve_exports(&mut self) -> HashMap<SymbolU32, ExportedItem> {
 		let mut exports = HashMap::with_capacity(self.defs.exports.len());
@@ -593,7 +608,7 @@ enum BoundSubject {
 
 /// The Phase 2 driver. Holds `defs` — Phase 1's finished output, read-only
 /// from here on — plus whatever this phase needs on top of it.
-pub(super) struct SignatureBuilder<'ast, 'ctx> {
+pub(super) struct SignatureBuilder<'ast, 'ctx, 'dispatch> {
 	pub(super) diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	pub(super) strings: &'ctx StringInterner,
 	pub(super) defs: &'ctx DefinitionRegistry,
@@ -628,16 +643,17 @@ pub(super) struct SignatureBuilder<'ast, 'ctx> {
 	pub(super) constants: Vec<ConstantSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
-	pub(super) impl_dispatch: ImplDispatch,
+	/// Built before the signature sweep and never mutated by its queries.
+	pub(super) impl_dispatch: &'dispatch ImplDispatch,
 }
 
-impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
+impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		strings: &'ctx StringInterner,
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
-		impl_dispatch: ImplDispatch,
+		impl_dispatch: &'dispatch ImplDispatch,
 	) -> Self {
 		// A pre-seeded kind's own `SignatureLocation` used to be seeded here
 		// too, via a separate pass over `defs.traits`/`defs.structs`/... —
@@ -1599,7 +1615,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 
 	pub(super) fn ensure_assoc_type_value_query(
 		&mut self,
-		provider: AssocTypeProvider,
+		provider: ImplAssocTypeIdx,
 		reference: SourceSpan,
 	) -> QueryResult<TypeIndex> {
 		let value = self.ensure_assoc_type_value(provider, reference);
@@ -1610,6 +1626,49 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 		Ok(value)
 	}
 
+	/// A trait declaration can supply a default when the selected impl omits
+	/// the member. Its signature owns the value in the trait's `Self` scope.
+	pub(super) fn ensure_assoc_type_default_value_query(
+		&mut self,
+		declaration: AssocTypeIdx,
+		reference: SourceSpan,
+	) -> QueryResult<Option<TypeIndex>> {
+		let def_id = self.defs.assoc_types[usize::from(declaration)].def_id;
+		match self.ensure_signature(QueryInfo {
+			def_id,
+			requested_at: Some(reference),
+		}) {
+			SignatureStatus::Available(SignatureLocation::AssocType(_)) => {
+				let value = self.assoc_types[usize::from(declaration)]
+					.as_ref()
+					.expect("the declaration query populates its slot")
+					.value;
+				if value == Some(TypeIndex::ERROR) {
+					Err(QueryError::Failed)
+				} else {
+					Ok(value)
+				}
+			}
+			SignatureStatus::Available(_) => {
+				unreachable!("an associated-type declaration has its own query")
+			}
+			SignatureStatus::Cycle => {
+				self.diagnostics.push(self.report_cycle(
+					def_id,
+					reference,
+					DiagnosticCode::CyclicAssociatedType,
+					|name| {
+						format!(
+							"computing the associated-type default of `{name}`"
+						)
+					},
+				));
+				Err(QueryError::Failed)
+			}
+			SignatureStatus::CycleReported => Err(QueryError::Failed),
+		}
+	}
+
 	/// Demands the query that owns this provider's slot. Written impl members
 	/// own a query; synthetic members reuse their memory/global owner's DefId.
 	/// Read the associated-type slot, not the owner's query result kind.
@@ -1617,7 +1676,7 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 	/// and any normalization made possible by substitution belong to the caller.
 	pub(super) fn ensure_assoc_type_value(
 		&mut self,
-		provider: AssocTypeProvider,
+		provider: ImplAssocTypeIdx,
 		reference: SourceSpan,
 	) -> TypeIndex {
 		let index = provider.index();
@@ -2159,7 +2218,12 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 				trait_index,
 				item,
 			} => {
-				let ast::TraitItem::AssociatedType { name, bounds, .. } = item
+				let ast::TraitItem::AssociatedType {
+					name,
+					bounds,
+					value,
+					..
+				} = item
 				else {
 					unreachable!()
 				};
@@ -2192,13 +2256,24 @@ impl<'ast, 'ctx> SignatureBuilder<'ast, 'ctx> {
 						subject,
 						name.inner,
 					);
+				let resolved_value = value.as_ref().map(|value| {
+					self.resolve_type(
+						file_id,
+						namespace,
+						self_scope,
+						value,
+						InferPolicy::Reject(
+							InferSignatureKind::AssocTypeBinding,
+						),
+					)
+				});
 				self.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: resolved_bounds,
 						facts: BoundFacts::Ready(
 							implied_bounds.into_boxed_slice(),
 						),
-						value: None,
+						value: resolved_value,
 					});
 				SignatureLocation::AssocType(assoc_type_index)
 			}
@@ -4763,7 +4838,7 @@ pub(super) mod tests {
 	/// Stops before the signature sweep so tests can exercise demand order.
 	pub(in crate::tir) fn with_pending_signatures(
 		source: &str,
-		check: impl FnOnce(&mut SignatureBuilder<'_, '_>),
+		check: impl FnOnce(&mut SignatureBuilder<'_, '_, '_>),
 	) {
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		let root = builder
@@ -4811,15 +4886,15 @@ pub(super) mod tests {
 			&graph.strings,
 			&defs,
 			&ast_nodes,
-			dispatch,
+			&dispatch,
 		));
 	}
 
 	fn pending_provider(
-		builder: &mut SignatureBuilder<'_, '_>,
+		builder: &mut SignatureBuilder<'_, '_, '_>,
 		receiver: TypeIndex,
 		name: &str,
-	) -> (AssocTypeIdx, AssocTypeProvider, SourceSpan) {
+	) -> (AssocTypeIdx, ImplAssocTypeIdx, SourceSpan) {
 		use crate::tir::members::{MemberSource, TypeMemberLookup};
 		let file_id = builder.defs.namespaces
 			[usize::from(builder.defs.root_package.root_namespace())]
@@ -4863,7 +4938,8 @@ pub(super) mod tests {
 			matches!(builder.types.resolve(projection), Type::AssocTypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
 		);
 		let provider = builder
-			.assoc_type_provider(impl_index, declaration)
+			.defs
+			.impl_assoc_type_for(impl_index, declaration)
 			.unwrap();
 		assert_ne!(declaration, provider.index());
 		assert!(matches!(
@@ -6593,6 +6669,108 @@ pub(super) mod tests {
 			case.assoc_type_signature("Container", "Item")
 				.declared_bounds
 				.is_empty()
+		);
+	}
+
+	#[test]
+	fn associated_type_defaults_apply_without_hiding_impl_overrides() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			type u32;
+			trait Container { type Item = i32; }
+			struct Defaulted {}
+			struct Overridden {}
+			impl Container for Defaulted {}
+			impl Container for Overridden { type Item = u32; }
+			fn inherited(x: Defaulted::Item) {}
+			fn overridden(x: Overridden::Item) {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("inherited").param_types[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.function_signature("overridden").param_types[0],
+			TypeIndex::U32
+		);
+	}
+
+	#[test]
+	fn associated_type_defaults_substitute_self_and_resolve_other_members() {
+		let case = TestCase::new(indoc! {"
+			type i32;
+			trait Container {
+				type SelfType = Self;
+				type Item = Self::Other;
+				type Other;
+			}
+			struct Wrapper<T> {}
+			impl<T> Container for Wrapper<T> { type Other = T; }
+			fn self_type(x: <Wrapper<i32> as Container>::SelfType) {}
+			fn item(x: <Wrapper<i32> as Container>::Item) {}
+			fn abstract_item<T: Container>(x: T::Item) {}
+		"});
+
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert_eq!(
+			case.function_signature("item").param_types[0],
+			TypeIndex::I32
+		);
+		let self_type = case.function_signature("self_type").param_types[0];
+		assert!(matches!(
+			case.signatures.types.resolve(self_type),
+			Type::Struct { type_args, .. } if type_args.as_ref() == [TypeIndex::I32]
+		));
+		let abstract_item =
+			case.function_signature("abstract_item").param_types[0];
+		assert!(matches!(
+			case.signatures.types.resolve(abstract_item),
+			Type::AssocTypeProjection { .. }
+		));
+	}
+
+	#[test]
+	fn bounded_associated_type_default_resolves_forward_type() {
+		let case = TestCase::new(indoc! {"
+			trait Marker {}
+			trait Container { type Item: Marker = Later; }
+			struct Later {}
+			struct Wrapper {}
+			impl Marker for Later {}
+			impl Container for Wrapper {}
+			fn f(x: Wrapper::Item) {}
+		"});
+		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(matches!(
+			case.signatures.types.resolve(
+				case.function_signature("f").param_types[0]
+			),
+			Type::Struct { struct_index, .. }
+				if *struct_index == case.struct_index("Later")
+		));
+	}
+
+	#[test]
+	fn associated_type_default_cycle_is_diagnosed() {
+		let case = TestCase::new(indoc! {"
+			trait Container { type Item = Self::Item; }
+			struct Wrapper {}
+			impl Container for Wrapper {}
+			fn f(x: Wrapper::Item) {}
+		"});
+		assert!(
+			case.diagnostics.iter().any(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::CyclicAssociatedType.code())
+			}),
+			"{:?}",
+			case.diagnostics
+		);
+		assert_eq!(
+			case.function_signature("f").param_types[0],
+			TypeIndex::ERROR
 		);
 	}
 

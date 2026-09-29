@@ -23,7 +23,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Prove membership from declaration-local assumptions before dispatching
 	/// concrete impls. Impl requirements are proved in this same caller context.
 	pub(super) fn check_trait(
@@ -553,7 +553,7 @@ mod tests {
 			&graph.strings,
 			&defs,
 			&ast_nodes,
-			impl_dispatch,
+			&impl_dispatch,
 		);
 		for entry in ast_nodes.iter() {
 			let _ = builder.ensure_signature(QueryInfo {

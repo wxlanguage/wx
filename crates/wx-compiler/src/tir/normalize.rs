@@ -71,7 +71,7 @@ enum Mode {
 	Assumptions,
 }
 
-impl SignatureBuilder<'_, '_> {
+impl SignatureBuilder<'_, '_, '_> {
 	/// Budget exhaustion is a diagnosed failure, never an unfinished fact.
 	/// Poison an active normalization only; a top-level proof can be retried.
 	pub(super) fn normalization_overflow(
@@ -333,23 +333,39 @@ impl SignatureBuilder<'_, '_> {
 		let TraitImplLookup::Concrete { impl_index, args } = found else {
 			return Ok(projection);
 		};
-		let Some(provider) =
-			self.assoc_type_provider(impl_index, assoc_type_index)
-		else {
-			// The later conformance pass owns missing-member diagnostics.
-			return Err(QueryError::Failed);
-		};
-		let value = self.ensure_assoc_type_value_query(provider, reference)?;
-		let instantiated = if args.is_empty() {
-			value
+		let instantiated = if let Some(provider) =
+			self.defs.impl_assoc_type_for(impl_index, assoc_type_index)
+		{
+			let value =
+				self.ensure_assoc_type_value_query(provider, reference)?;
+			if args.is_empty() {
+				value
+			} else {
+				let env = self.trait_impls[usize::from(impl_index)]
+					.as_ref()
+					.expect("a generic selected impl has a resolved header")
+					.type_params;
+				debug_assert_ne!(env, TypeEnvIdx::ROOT);
+				self.types
+					.substitute(value, &Substitution { env, args: &args })
+			}
 		} else {
-			let env = self.trait_impls[usize::from(impl_index)]
-				.as_ref()
-				.expect("a generic selected impl has a resolved header")
-				.type_params;
-			debug_assert_ne!(env, TypeEnvIdx::ROOT);
-			self.types
-				.substitute(value, &Substitution { env, args: &args })
+			let Some(value) = self.ensure_assoc_type_default_value_query(
+				assoc_type_index,
+				reference,
+			)?
+			else {
+				// The later conformance pass owns missing-member diagnostics.
+				return Err(QueryError::Failed);
+			};
+			let env = self.traits[usize::from(trait_index)].env;
+			self.types.substitute(
+				value,
+				&Substitution {
+					env,
+					args: &[next_base],
+				},
+			)
 		};
 		self.normalize(cx, instantiated, reference, mode)
 	}
