@@ -38,7 +38,7 @@ use aggregates::{
 	UnknownStructFieldDiagnostic, report_duplicate_struct_field_init,
 	report_not_a_struct_type, report_unknown_struct_field,
 };
-pub use literal::{CharLiteralError, parse_char_literal, unescape_string};
+pub use literal::{CharLiteralError, parse_char_literal};
 use literal::{
 	IntegerLiteralOutOfRangeDiagnostic, report_char_literal_too_long,
 	report_empty_char_literal, report_integer_literal_out_of_range,

@@ -12,14 +12,19 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
-use super::bounds::report_not_an_associated_type;
+use super::assumptions::{
+	AssumptionContext, AssumptionKind, QueryError, QueryResult,
+};
+use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
 	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
+use super::obligations::Obligation;
 use super::signatures::{
 	QueryInfo, SignatureBuilder, SignatureLocation, SignatureStatus,
 };
@@ -29,6 +34,8 @@ use super::types::{Type, TypeIndex};
 pub(super) enum TypeMemberLookup {
 	/// A dependency has already failed; the caller must not diagnose absence.
 	Error,
+	/// Selecting a declaration needs facts that are not ready yet.
+	Pending,
 	NotFound,
 	Found(TypeMemberTarget),
 	/// Two or more *unrelated* traits each provide this name for this
@@ -38,6 +45,7 @@ pub(super) enum TypeMemberLookup {
 	Ambiguous(Box<[TypeMemberTarget]>),
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct TypeMemberTarget {
 	/// Trait-associated types always name the trait declaration, even when
 	/// `source` selects an impl override. Value members name the selected
@@ -46,6 +54,7 @@ pub(super) struct TypeMemberTarget {
 	pub(super) source: MemberSource,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum MemberSource {
 	Inherent(InherentImplIdx),
 	/// A concrete `impl Trait for Type` provides (or overrides) this member.
@@ -82,10 +91,9 @@ pub(super) enum TraitImplLookup {
 		impl_index: TraitImplIdx,
 		args: Box<[TypeIndex]>,
 	},
-	/// Abstract receiver (`TypeParam`/`AssocTypeProjection`) whose implied
-	/// bounds (or, inside the trait itself, its own reflexive `Self`
-	/// bound) include `required_trait`. Concrete dispatch is deferred to
-	/// monomorphization, so there's no impl index to name yet.
+	/// Membership supplied by the caller's assumptions, including evidence
+	/// on an equivalent subject. No concrete provider was selected; dispatch
+	/// remains symbolic until instantiation.
 	Abstract,
 }
 
@@ -98,6 +106,7 @@ impl SignatureBuilder<'_, '_> {
 	/// needs a real "why" to attach to a cycle diagnostic.
 	pub(super) fn resolve_type_member(
 		&mut self,
+		cx: AssumptionContext,
 		receiver: TypeIndex,
 		tier: BindingNamespace,
 		name: SymbolU32,
@@ -108,20 +117,24 @@ impl SignatureBuilder<'_, '_> {
 			self.types.resolve(receiver),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			match self.resolve_bound_member(receiver, key, reference) {
+			match self.resolve_bound_member(cx, receiver, key, reference) {
 				TypeMemberLookup::NotFound => {}
 				found => return found,
 			}
 		}
-		let receiver = self.normalize_head(receiver, reference);
+		let receiver = match self.normalize_head_query(cx, receiver, reference)
+		{
+			Ok(receiver) => receiver,
+			Err(QueryError::Pending) => return TypeMemberLookup::Pending,
+			Err(QueryError::Failed) => return TypeMemberLookup::Error,
+		};
 		if receiver == TypeIndex::ERROR {
 			return TypeMemberLookup::Error;
 		}
 		match ImplTarget::from_type(self.types.resolve(receiver)) {
-			Some(target) => {
-				self.resolve_concrete_member(receiver, target, key, reference)
-			}
-			None => self.resolve_bound_member(receiver, key, reference),
+			Some(target) => self
+				.resolve_concrete_member(cx, receiver, target, key, reference),
+			None => self.resolve_bound_member(cx, receiver, key, reference),
 		}
 	}
 
@@ -137,6 +150,7 @@ impl SignatureBuilder<'_, '_> {
 	/// qualified segment).
 	pub(super) fn resolve_type_member_path(
 		&mut self,
+		cx: AssumptionContext,
 		file_id: FileId,
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
@@ -151,11 +165,35 @@ impl SignatureBuilder<'_, '_> {
 				)
 			}
 			match self.resolve_type_member(
+				cx,
 				current,
 				BindingNamespace::Type,
 				segment.ident.inner,
 				SourceSpan::new(file_id, segment.ident.span),
 			) {
+				TypeMemberLookup::Pending => {
+					let receiver = self.type_formatter().display_type(current);
+					let name =
+						self.strings.resolve(segment.ident.inner).unwrap();
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::TypeMemberNeedsQualification
+									.code(),
+							)
+							.with_message(format!(
+								"selecting associated type `{name}` depends on unfinished bounds"
+							))
+							.with_label(
+								SourceSpan::new(file_id, segment.ident.span)
+									.primary_label(),
+							)
+							.with_note(format!(
+								"qualify the declaring trait with `<{receiver} as Trait>::{name}`"
+							)),
+					);
+					return TypeIndex::ERROR;
+				}
 				TypeMemberLookup::Error => return TypeIndex::ERROR,
 				TypeMemberLookup::Found(member) => {
 					current = self.project_type_member(current, member);
@@ -240,6 +278,7 @@ impl SignatureBuilder<'_, '_> {
 	/// projected off whatever that named.
 	pub(super) fn resolve_trait_qualified_member(
 		&mut self,
+		cx: AssumptionContext,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		tier: BindingNamespace,
@@ -262,8 +301,13 @@ impl SignatureBuilder<'_, '_> {
 		};
 		let declared_kind = trait_def.members[usize::from(member_index)].kind;
 
-		let found =
-			self.find_trait_impl(receiver, required_trait, file_id, name.span)?;
+		let found = self.find_trait_impl(
+			cx,
+			receiver,
+			required_trait,
+			file_id,
+			name.span,
+		)?;
 		Ok(match found {
 			TraitImplLookup::Concrete { impl_index, .. } => self
 				.concrete_trait_member(required_trait, impl_index, key)
@@ -286,68 +330,105 @@ impl SignatureBuilder<'_, '_> {
 	/// completeness is `check_trait_conformance`'s own, separate job.
 	pub(super) fn find_trait_impl(
 		&mut self,
+		cx: AssumptionContext,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<TraitImplLookup, ()> {
-		if matches!(
-			self.types.resolve(receiver),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		let reference = SourceSpan::new(file_id, span);
+		match self.find_trait_impl_query(
+			cx,
+			receiver,
+			required_trait,
+			reference,
 		) {
-			self.prepare_effective_bounds(
-				receiver,
-				SourceSpan::new(file_id, span),
-			)?;
-			if self.has_effective_trait(receiver, required_trait) {
-				return Ok(TraitImplLookup::Abstract);
+			Ok(Some(found)) => Ok(found),
+			Ok(None) => {
+				let diagnostic = self.report_type_does_not_implement_trait(
+					file_id,
+					span,
+					receiver,
+					required_trait,
+				);
+				self.diagnostics.push(diagnostic);
+				Err(())
+			}
+			Err(QueryError::Failed) => Err(()),
+			Err(QueryError::Pending) => {
+				// A qualified member already has a declaration identity.
+				// Membership is checked before the owning query completes.
+				self.register_obligation(Obligation::CheckTraitMembership {
+					context: cx,
+					subject: receiver,
+					required: required_trait,
+					reference,
+				});
+				Ok(TraitImplLookup::Abstract)
 			}
 		}
-		let receiver =
-			self.normalize_head(receiver, SourceSpan::new(file_id, span));
-		if receiver == TypeIndex::ERROR {
-			return Err(());
+	}
+
+	pub(super) fn find_trait_impl_query(
+		&mut self,
+		cx: AssumptionContext,
+		receiver: TypeIndex,
+		required_trait: TraitIdx,
+		reference: SourceSpan,
+	) -> QueryResult<Option<TraitImplLookup>> {
+		if matches!(self.types.resolve(receiver), Type::Error | Type::Infer) {
+			return Err(QueryError::Failed);
 		}
-		let found = match ImplTarget::from_type(self.types.resolve(receiver)) {
-			Some(target) => {
-				let candidate = self
-					.impl_dispatch
-					.trait_candidates(target)
-					.iter()
-					.find_map(|&(trait_index, impl_index)| {
-						(trait_index == required_trait).then_some(impl_index)
-					});
-				candidate.and_then(|impl_index| {
-					self.match_trait_impl_candidate(
-						impl_index,
-						receiver,
-						SourceSpan::new(file_id, span),
-					)
-					.map(|args| TraitImplLookup::Concrete { impl_index, args })
-				})
-			}
-			None => match self.types.resolve(receiver) {
-				Type::Infer => Some(TraitImplLookup::Abstract),
-				Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
-					self.prepare_effective_bounds(
-						receiver,
-						SourceSpan::new(file_id, span),
-					)?;
-					self.has_effective_trait(receiver, required_trait)
-						.then_some(TraitImplLookup::Abstract)
-				}
-				_ => None,
-			},
-		};
-		found.ok_or_else(|| {
-			let diagnostic = self.report_type_does_not_implement_trait(
-				file_id,
-				span,
-				receiver,
+		let mut assumed =
+			self.check_assumed_trait(cx, receiver, required_trait, reference);
+		if assumed == Err(QueryError::Failed) {
+			return Err(QueryError::Failed);
+		}
+		if assumed == Ok(true)
+			&& ImplTarget::from_type(self.types.resolve(receiver)).is_none()
+		{
+			return Ok(Some(TraitImplLookup::Abstract));
+		}
+		let normalized = self.normalize_head_query(cx, receiver, reference)?;
+		if normalized == TypeIndex::ERROR {
+			return Err(QueryError::Failed);
+		}
+		if normalized != receiver {
+			match self.check_assumed_trait(
+				cx,
+				normalized,
 				required_trait,
-			);
-			self.diagnostics.push(diagnostic);
-		})
+				reference,
+			) {
+				Ok(true) => assumed = Ok(true),
+				Err(QueryError::Failed) => return Err(QueryError::Failed),
+				Err(QueryError::Pending) if assumed != Ok(true) => {
+					assumed = Err(QueryError::Pending)
+				}
+				_ => {}
+			}
+		}
+		if let Some(target) =
+			ImplTarget::from_type(self.types.resolve(normalized))
+		{
+			let candidate =
+				self.impl_dispatch.trait_candidates(target).iter().find_map(
+					|&(trait_index, impl_index)| {
+						(trait_index == required_trait).then_some(impl_index)
+					},
+				);
+			if let Some(impl_index) = candidate {
+				if let Some(args) = self.match_trait_impl_candidate_query(
+					cx, impl_index, normalized, reference,
+				)? {
+					return Ok(Some(TraitImplLookup::Concrete {
+						impl_index,
+						args,
+					}));
+				}
+			}
+		}
+		assumed.map(|proven| proven.then_some(TraitImplLookup::Abstract))
 	}
 
 	/// Same code and wording as `check_assoc_type_value`'s own
@@ -356,7 +437,7 @@ impl SignatureBuilder<'_, '_> {
 	/// that same condition, just reached with no declared bound clause to
 	/// point a "required by a bound in `X`" secondary label at, since a
 	/// qualified path's `as Trait` isn't one.
-	fn report_type_does_not_implement_trait(
+	pub(super) fn report_type_does_not_implement_trait(
 		&self,
 		file_id: FileId,
 		span: TextSpan,
@@ -384,45 +465,180 @@ impl SignatureBuilder<'_, '_> {
 
 	fn resolve_concrete_member(
 		&mut self,
+		cx: AssumptionContext,
 		receiver: TypeIndex,
 		target: ImplTarget,
 		key: BindingKey,
 		reference: SourceSpan,
 	) -> TypeMemberLookup {
-		// Inherent always wins outright — no trait candidate is even
-		// consulted once one matches.
+		// Only a candidate that declares this name can affect precedence.
 		for i in 0..self.impl_dispatch.inherent_candidates(target).len() {
 			let index = self.impl_dispatch.inherent_candidates(target)[i];
-			if !self.match_inherent_impl_candidate(index, receiver, reference) {
-				continue;
-			}
 			let impl_def = &self.defs.inherent_impls[usize::from(index)];
-			if let Some(&member_index) = impl_def.bindings.get(&key) {
-				let kind = impl_def.members[usize::from(member_index)].kind;
-				return TypeMemberLookup::Found(TypeMemberTarget {
-					kind,
-					source: MemberSource::Inherent(index),
-				});
-			}
-		}
-
-		let mut candidates = Vec::new();
-		for i in 0..self.impl_dispatch.trait_candidates(target).len() {
-			let (trait_index, impl_index) =
-				self.impl_dispatch.trait_candidates(target)[i];
-			if self
-				.match_trait_impl_candidate(impl_index, receiver, reference)
-				.is_none()
-			{
+			let Some(&member_index) = impl_def.bindings.get(&key) else {
 				continue;
-			}
-			if let Some(member) =
-				self.concrete_trait_member(trait_index, impl_index, key)
-			{
-				candidates.push(member);
+			};
+			let kind = impl_def.members[usize::from(member_index)].kind;
+			match self.match_inherent_impl_candidate_query(
+				cx, index, receiver, reference,
+			) {
+				Ok(true) => {
+					return TypeMemberLookup::Found(TypeMemberTarget {
+						kind,
+						source: MemberSource::Inherent(index),
+					});
+				}
+				Ok(false) => {}
+				Err(QueryError::Pending) => return TypeMemberLookup::Pending,
+				Err(QueryError::Failed) => return TypeMemberLookup::Error,
 			}
 		}
-		Self::classify(candidates)
+		let mut traits = Vec::new();
+		for &(trait_index, _) in self.impl_dispatch.trait_candidates(target) {
+			if self.declared_trait_member(trait_index, key).is_some() {
+				traits.push(trait_index);
+			}
+		}
+		let (scoped, readiness) =
+			match self.assumed_member_traits(cx, key, reference) {
+				Ok(traits) => traits,
+				Err(()) => return TypeMemberLookup::Error,
+			};
+		for trait_index in scoped {
+			if !traits.contains(&trait_index) {
+				traits.push(trait_index);
+			}
+		}
+		self.resolve_trait_member_candidates(
+			cx, receiver, key, reference, traits, readiness,
+		)
+	}
+
+	/// Discover trait declarations from finite scoped evidence, rather than
+	/// scanning every trait in the program. Applicability uses the shared proof.
+	fn assumed_member_traits(
+		&mut self,
+		cx: AssumptionContext,
+		key: BindingKey,
+		reference: SourceSpan,
+	) -> Result<(Vec<TraitIdx>, Readiness), ()> {
+		let defs = self.defs;
+		let mut traits = Vec::new();
+		let mut equalities = Vec::new();
+		let mut readiness;
+		{
+			let (reader, types) = self.assumptions();
+			let mut facts = reader.scoped_facts(cx, types);
+			readiness = facts.readiness;
+			while let Some(fact) = facts.next(types) {
+				match fact.kind {
+					AssumptionKind::Trait { trait_index, .. }
+						if defs.traits[usize::from(trait_index)]
+							.bindings
+							.contains_key(&key) =>
+					{
+						if !traits.contains(&trait_index) {
+							traits.push(trait_index);
+						}
+					}
+					AssumptionKind::Equality(
+						super::bounds::ImpliedBindingKind::Equals(_),
+					) => equalities.push(fact.subject),
+					_ => {}
+				}
+			}
+		}
+		// An equality's projection path can carry associated declaration bounds.
+		for subject in equalities {
+			self.prepare_effective_bounds(subject, reference)?;
+			let depth = self.normalization.remaining_depth();
+			let (reader, types) = self.assumptions();
+			let mut facts = reader.subject_facts(subject, types, depth);
+			readiness = readiness.and(facts.readiness);
+			while let Some(fact) = facts.next(types) {
+				if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
+					if defs.traits[usize::from(trait_index)]
+						.bindings
+						.contains_key(&key)
+						&& !traits.contains(&trait_index)
+					{
+						traits.push(trait_index);
+					}
+				}
+			}
+		}
+		if readiness == Readiness::Overflowed {
+			self.normalization_overflow(reference);
+			return Err(());
+		}
+		Ok((traits, readiness))
+	}
+
+	fn resolve_trait_member_candidates(
+		&mut self,
+		cx: AssumptionContext,
+		receiver: TypeIndex,
+		key: BindingKey,
+		reference: SourceSpan,
+		traits: Vec<TraitIdx>,
+		mut readiness: Readiness,
+	) -> TypeMemberLookup {
+		let mut candidates: Option<SmallVec<TypeMemberTarget>> = None;
+		for trait_index in traits {
+			match self.find_trait_impl_query(
+				cx,
+				receiver,
+				trait_index,
+				reference,
+			) {
+				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
+					if let Some(member) =
+						self.concrete_trait_member(trait_index, impl_index, key)
+					{
+						Self::push_candidate(&mut candidates, member);
+					}
+				}
+				Ok(Some(TraitImplLookup::Abstract)) => {
+					if let Some(kind) =
+						self.declared_trait_member(trait_index, key)
+					{
+						Self::push_candidate(
+							&mut candidates,
+							TypeMemberTarget {
+								kind,
+								source: MemberSource::Bound(trait_index),
+							},
+						);
+					}
+				}
+				Ok(None) => {}
+				Err(QueryError::Pending) => {
+					readiness = readiness.and(Readiness::Pending)
+				}
+				Err(QueryError::Failed) => return TypeMemberLookup::Error,
+			}
+		}
+		// Two known declarations already establish ambiguity. Otherwise pending
+		// discovery or applicability could change a unique or absent answer.
+		if !matches!(candidates, Some(SmallVec::Many(_)))
+			&& readiness == Readiness::Pending
+		{
+			TypeMemberLookup::Pending
+		} else {
+			Self::classify(candidates)
+		}
+	}
+
+	fn declared_trait_member(
+		&self,
+		trait_index: TraitIdx,
+		key: BindingKey,
+	) -> Option<MemberKind> {
+		let definition = &self.defs.traits[usize::from(trait_index)];
+		definition
+			.bindings
+			.get(&key)
+			.map(|&index| definition.members[usize::from(index)].kind)
 	}
 
 	/// Keeps type identity on the declaration while preserving value-member
@@ -481,6 +697,7 @@ impl SignatureBuilder<'_, '_> {
 
 	fn resolve_bound_member(
 		&mut self,
+		cx: AssumptionContext,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -494,7 +711,7 @@ impl SignatureBuilder<'_, '_> {
 		if self.prepare_effective_bounds(receiver, reference).is_err() {
 			return TypeMemberLookup::Error;
 		}
-		let mut candidates = Vec::new();
+		let mut candidates: Option<SmallVec<TypeMemberTarget>> = None;
 		let bounds = self.effective_bounds(receiver);
 		for trait_index in bounds
 			.reflexive_trait
@@ -503,20 +720,38 @@ impl SignatureBuilder<'_, '_> {
 		{
 			// The same trait can be supplied by a declaration and a nested
 			// receiver constraint; that does not make its member ambiguous.
-			if candidates.iter().any(|candidate: &TypeMemberTarget| {
-				matches!(candidate.source, MemberSource::Bound(index) if index == trait_index)
+			if candidates.as_ref().is_some_and(|items| {
+				items.into_iter().any(|candidate| {
+					matches!(candidate.source, MemberSource::Bound(index) if index == trait_index)
+				})
 			}) {
 				continue;
 			}
 			let trait_def = &self.defs.traits[usize::from(trait_index)];
 			if let Some(&member_index) = trait_def.bindings.get(&key) {
-				candidates.push(TypeMemberTarget {
-					kind: trait_def.members[usize::from(member_index)].kind,
-					source: MemberSource::Bound(trait_index),
-				});
+				Self::push_candidate(
+					&mut candidates,
+					TypeMemberTarget {
+						kind: trait_def.members[usize::from(member_index)].kind,
+						source: MemberSource::Bound(trait_index),
+					},
+				);
 			}
 		}
-		Self::classify(candidates)
+		// Preserve direct declaration lookup, including known provisional
+		// memberships. Equality-based discovery is a fallback when these bounds
+		// do not identify the requested name.
+		if candidates.is_some() {
+			return Self::classify(candidates);
+		}
+		let (traits, readiness) =
+			match self.assumed_member_traits(cx, key, reference) {
+				Ok(traits) => traits,
+				Err(_) => return TypeMemberLookup::Error,
+			};
+		self.resolve_trait_member_candidates(
+			cx, receiver, key, reference, traits, readiness,
+		)
 	}
 
 	/// Forces a trait declaration's bounds, never an impl provider's value.
@@ -537,10 +772,10 @@ impl SignatureBuilder<'_, '_> {
 			def_id,
 			requested_at: Some(requested_at),
 		}) {
-			SignatureStatus::Resolved(SignatureLocation::AssocType(..)) => {
+			SignatureStatus::Available(SignatureLocation::AssocType(..)) => {
 				Ok(())
 			}
-			SignatureStatus::Resolved(_) => unreachable!(
+			SignatureStatus::Available(_) => unreachable!(
 				"a trait associated-type declaration has its own signature query"
 			),
 			SignatureStatus::Cycle => {
@@ -553,11 +788,27 @@ impl SignatureBuilder<'_, '_> {
 		}
 	}
 
-	fn classify(mut candidates: Vec<TypeMemberTarget>) -> TypeMemberLookup {
-		match candidates.len() {
-			0 => TypeMemberLookup::NotFound,
-			1 => TypeMemberLookup::Found(candidates.pop().unwrap()),
-			_ => TypeMemberLookup::Ambiguous(candidates.into_boxed_slice()),
+	fn push_candidate(
+		candidates: &mut Option<SmallVec<TypeMemberTarget>>,
+		candidate: TypeMemberTarget,
+	) {
+		match candidates {
+			Some(items) => items.push(candidate),
+			None => *candidates = Some(SmallVec::new(candidate)),
+		}
+	}
+
+	fn classify(
+		candidates: Option<SmallVec<TypeMemberTarget>>,
+	) -> TypeMemberLookup {
+		match candidates {
+			None => TypeMemberLookup::NotFound,
+			Some(SmallVec::One(candidate)) => {
+				TypeMemberLookup::Found(candidate)
+			}
+			Some(SmallVec::Many(candidates)) => {
+				TypeMemberLookup::Ambiguous(candidates.into_boxed_slice())
+			}
 		}
 	}
 }

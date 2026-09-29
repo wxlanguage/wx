@@ -12,6 +12,7 @@
 // #[cfg(test)]
 // mod tests;
 
+mod assumptions;
 mod bounds;
 mod defs;
 mod format;
@@ -20,6 +21,7 @@ mod imports;
 mod literals;
 mod members;
 mod normalize;
+mod obligations;
 mod paths;
 mod satisfaction;
 mod signatures;

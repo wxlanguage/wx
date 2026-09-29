@@ -832,9 +832,6 @@ impl<'ast> Builder<'ast, '_> {
 		namespace: NamespaceIndex,
 		item: &'ast ast::Item,
 	) {
-		// The block's own `DefId` is only ever the `ast_nodes` / `sig_state`
-		// key that got us here; nothing downstream of resolution refers to a
-		// block by id.
 		let ast::Item::Export {
 			keyword_span,
 			entries,
@@ -987,9 +984,7 @@ impl<'ast> Builder<'ast, '_> {
 						Some(ItemAttribute::FixedOrder)
 					}
 					(ast::AttributeValue::NameValue(value), Some("tag")) => {
-						let raw = self.interner.resolve(value.inner).unwrap();
-						let key =
-							self.interner.get_or_intern(unescape_string(raw));
+						let key = value.inner;
 						self.items.tagged_items.insert(key, id);
 						Some(ItemAttribute::Tag(key))
 					}
@@ -1302,17 +1297,7 @@ impl<'ast> Builder<'ast, '_> {
 				}
 			};
 
-			let external_name =
-				entry.inner.inner.alias.as_ref().map(|alias_span| {
-					let escaped_text =
-						self.interner.resolve(alias_span.inner).unwrap();
-					let unescaped = unescape_string(escaped_text);
-					let symbol = self.interner.get_or_intern(&unescaped);
-					ast::Spanned {
-						inner: symbol,
-						span: alias_span.span,
-					}
-				});
+			let external_name = entry.inner.inner.alias;
 
 			let export_item = match global_value {
 				DefKind::Function { func_index } => {

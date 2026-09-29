@@ -6,9 +6,7 @@ use indoc::indoc;
 use super::*;
 use crate::diagnostics::DiagnosticCode;
 use crate::testing::DiagnosticView;
-use crate::tir::builder::{
-	CharLiteralError, parse_char_literal, unescape_string,
-};
+use crate::tir::builder::{CharLiteralError, parse_char_literal};
 use crate::vfs;
 
 #[allow(unused)]
@@ -213,24 +211,6 @@ fn test_stdlib_typechecks_as_root_package() {
 		"stdlib failed to typecheck standalone:\n{}",
 		type_errors.join("\n")
 	);
-}
-
-#[test]
-fn test_unescape_string() {
-	assert_eq!(unescape_string(r#""hello""#), "hello");
-	assert_eq!(unescape_string(r#""hello\nworld""#), "hello\nworld");
-	assert_eq!(unescape_string(r#""tab\tthere""#), "tab\tthere");
-	assert_eq!(unescape_string(r#""quote\"here""#), "quote\"here");
-	assert_eq!(unescape_string(r#""backslash\\here""#), "backslash\\here");
-	assert_eq!(unescape_string(r#""null\0byte""#), "null\0byte");
-	assert_eq!(unescape_string(r#""carriage\rreturn""#), "carriage\rreturn");
-	// Multiple escapes
-	assert_eq!(
-		unescape_string(r#""line1\nline2\nline3""#),
-		"line1\nline2\nline3"
-	);
-	// No quotes (should return as-is)
-	assert_eq!(unescape_string("hello"), "hello");
 }
 
 #[test]

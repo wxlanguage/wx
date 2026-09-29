@@ -2141,3 +2141,62 @@ fn test_format_no_blank_line_after_a_list_opener() {
 	assert_eq!(fmt(source), expected);
 	assert_eq!(fmt(expected), expected);
 }
+
+#[test]
+fn export_aliases_preserve_their_quoted_source_spelling() {
+	let fmt = |src: &str| {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+				trailing_comma: true,
+			},
+		)
+	};
+	let source = r#"export { f as "line\n", f as "slash\\n", f as "quote\"" }
+"#;
+	let formatted = fmt(source);
+	assert!(formatted.contains(r#""line\n""#));
+	assert!(formatted.contains(r#""slash\\n""#));
+	assert!(formatted.contains(r#""quote\"""#));
+	assert_eq!(fmt(&formatted), formatted);
+}
+
+#[test]
+fn raw_ast_strings_preserve_original_spelling_when_formatted() {
+	let fmt = |source: &str| {
+		let case = TestCase::new(source);
+		format(
+			&case.ast,
+			&case.interner,
+			source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+				trailing_comma: true,
+			},
+		)
+	};
+	let source = indoc! {"
+        #[tag = \"line\\nslash\\\\n\"]
+        #[other(value = \"line\\nslash\\\\n\")]
+        fn f() {
+            local text = \"line\\nslash\\\\n\";
+        }
+
+        import \"line\\nslash\\\\n\" as host {
+            fn imported();
+        }
+
+        export {
+            f as \"line\\nslash\\\\n\",
+        }
+    "};
+	let formatted = fmt(source);
+	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 5);
+	assert_eq!(fmt(&formatted), formatted);
+}

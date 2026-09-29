@@ -158,7 +158,8 @@ fn item_kind(item: &Item) -> &'static str {
 		Item::Function { .. } => "a function",
 		Item::FunctionDeclaration { .. } => "a function declaration",
 		Item::Global { .. } => "a global",
-		Item::Export { .. } => "an export block",
+		Item::Export { .. } => "an export",
+		Item::ExportBlock { .. } => "an export block",
 		Item::Import { .. } => "an import block",
 		Item::Enum { .. } => "an enum",
 		Item::InherentImpl { .. } => "an inherent impl",
@@ -644,7 +645,7 @@ fn test_export_alias() {
     "});
 	case.diagnostics().assert_none();
 
-	let Item::Export { entries, .. } = case.item(1) else {
+	let Item::ExportBlock { entries, .. } = case.item(1) else {
 		panic!("item 1 is {}, not an export block", item_kind(case.item(1)))
 	};
 	assert_eq!(entries.len(), 1);
@@ -653,8 +654,52 @@ fn test_export_alias() {
 	let alias = entry
 		.alias
 		.expect("`as \"wasm_add\"` should record an alias");
-	// the alias keeps its quotes: it is the raw WASM export name
-	assert_eq!(case.name(alias.inner), "\"wasm_add\"");
+	assert_eq!(
+		alias.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		r#""wasm_add""#
+	);
+}
+
+#[test]
+fn single_exports_preserve_raw_aliases_and_use_item_separators() {
+	let source = indoc! {"
+        export foo
+        export foo;
+        export foo as \"line\\n\"
+        export foo as \"line\\n\";
+
+        fn foo() {
+        }
+    "};
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	assert_eq!(case.ast.items.len(), 5);
+	assert!(case.interner.get("line\n").is_none());
+
+	for index in 0..4 {
+		let item = &case.ast.items[index];
+		let Item::Export { entry } = &item.inner.inner else {
+			panic!("expected single export");
+		};
+		assert_eq!(case.name(entry.inner.name.inner), "foo");
+		assert_eq!(item.separator.is_some(), index % 2 == 1);
+		if index < 2 {
+			assert!(entry.inner.alias.is_none());
+			assert_eq!(entry.span.extract_str(source), "foo");
+			assert_eq!(item.inner.span.extract_str(source), "export foo");
+		} else {
+			assert_eq!(
+				entry.inner.alias.unwrap().extract_str(source),
+				"\"line\\n\""
+			);
+			assert_eq!(entry.span.extract_str(source), "foo as \"line\\n\"");
+			assert_eq!(
+				item.inner.span.extract_str(source),
+				"export foo as \"line\\n\""
+			);
+		}
+	}
+	assert!(matches!(case.item(4), Item::Function { .. }));
 }
 
 // ── Expressions ──────────────────────────────────────────────────────────────
@@ -676,9 +721,7 @@ fn test_literals() {
 		matches!(local_definition_value(statements, 0), Expression::Float),
 		"expected a float literal"
 	);
-	// `Float`, `Char` and `String` carry no payload — the text is recovered
-	// from the span, so all the AST records is which kind of literal it was.
-	// (A float's *value* is parsed against its target type in TIR.)
+	// Literal contents are recovered from spans and interpreted in TIR.
 	assert!(matches!(
 		local_definition_value(statements, 1),
 		Expression::Char
@@ -2344,9 +2387,9 @@ fn test_infer_and_memory_tagged_types() {
 			.inner;
 		let memory = match ty {
 			TypeExpression::Pointer { memory, .. }
-			| TypeExpression::Slice { memory, .. } => memory
-				.as_ref()
-				.expect("tagged with an explicit memory"),
+			| TypeExpression::Slice { memory, .. } => {
+				memory.as_ref().expect("tagged with an explicit memory")
+			}
 			_ => panic!("expected a pointer or slice type"),
 		};
 		assert_eq!(case.name(memory[0].ident.inner), "heap");
@@ -2548,4 +2591,111 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnknownToken]);
 	}
+}
+
+#[test]
+fn export_blocks_do_not_consume_definition_ids() {
+	let case =
+		TestCase::new("export {} fn first() {} export {} fn second() {}");
+	case.diagnostics().assert_none();
+	let Item::Function { id: first, .. } = case.item(1) else {
+		panic!("expected function");
+	};
+	let Item::Function { id: second, .. } = case.item(3) else {
+		panic!("expected function");
+	};
+	assert_eq!(*first, DefId(0));
+	assert_eq!(*second, DefId(1));
+}
+
+#[test]
+fn string_contexts_preserve_raw_spans_without_interning_contents() {
+	let source = indoc! {"
+        #[tag = \"line\\nslash\\\\n\"]
+        #[other(value = \"line\\nslash\\\\n\")]
+        fn f() {
+            local text = \"line\\nslash\\\\n\";
+        }
+
+        import \"line\\nslash\\\\n\" as host {
+            fn imported();
+        }
+
+        export {
+            f as \"line\\nslash\\\\n\",
+        }
+    "};
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	assert!(case.interner.get("line\nslash\\n").is_none());
+	assert!(case.interner.get(r#""line\nslash\\n""#).is_none());
+	let Item::Function { attributes, .. } = case.item(0) else {
+		panic!("expected function");
+	};
+	let AttributeValue::NameValue(tag) = &attributes[0].value else {
+		panic!("expected name/value attribute");
+	};
+	let AttributeValue::Args(args) = &attributes[1].value else {
+		panic!("expected attribute args");
+	};
+	let AttributeArgValue::String(arg) = &args[0].inner.inner.value else {
+		panic!("expected string argument");
+	};
+	let Item::Import { external_name, .. } = case.item(1) else {
+		panic!("expected import");
+	};
+	let Item::ExportBlock { entries, .. } = case.item(2) else {
+		panic!("expected export");
+	};
+	for span in [
+		tag,
+		arg,
+		external_name,
+		entries[0].inner.inner.alias.as_ref().unwrap(),
+	] {
+		assert_eq!(span.extract_str(source), r#""line\nslash\\n""#);
+	}
+	assert!(matches!(
+		local_definition_value(case.function_block(0), 0),
+		Expression::String
+	));
+}
+
+#[test]
+fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
+	let source = indoc! {"
+        #[tag = \"\\o\"]
+        #[other(value = \"\\o\")]
+        fn f() {
+            local bad = \"\\o\";
+            local good = \"ok\";
+        }
+
+        import \"\\o\" as host {
+            fn imported();
+        }
+
+        export {
+            f as \"\\o\",
+            f as \"valid\",
+        }
+
+        fn after() {}
+    "};
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	assert_eq!(case.ast.items.len(), 4);
+	assert!(case.interner.get("ok").is_none());
+	assert!(case.interner.get(r#""\o""#).is_none());
+	let statements = case.function_block(0);
+	for index in [0, 1] {
+		assert!(matches!(
+			local_definition_value(statements, index),
+			Expression::String
+		));
+	}
+	let Item::ExportBlock { entries, .. } = case.item(2) else {
+		panic!("expected export");
+	};
+	assert_eq!(entries.len(), 2);
 }

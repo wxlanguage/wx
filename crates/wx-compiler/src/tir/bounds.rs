@@ -11,6 +11,7 @@ use crate::index::index_newtype;
 use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
+use super::assumptions::{AssumptionContext, AssumptionReader};
 use super::defs::{AssocTypeIdx, DefKind, DefinitionRegistry, TraitIdx};
 use super::signatures::{QueryInfo, SignatureBuilder, SignatureStatus};
 use super::types::{
@@ -116,6 +117,12 @@ impl BoundFacts {
 		}
 	}
 
+	pub(super) fn current_mut(&mut self) -> &mut [ImpliedTraitBound] {
+		match self {
+			Self::Provisional(facts) | Self::Ready(facts) => facts,
+		}
+	}
+
 	pub(super) fn is_ready(&self) -> bool {
 		matches!(self, BoundFacts::Ready(_))
 	}
@@ -179,6 +186,26 @@ impl BoundArena {
 			BoundEntry::Reserved { trait_index, .. } => *trait_index,
 			BoundEntry::Resolved(bound) => bound.trait_index,
 		}
+	}
+
+	/// Error recovery changes a value, preserving occurrence identity and spans.
+	/// Ordinary construction and normalization keep source terms immutable.
+	pub(super) fn recover_value(
+		&mut self,
+		reference: BindingRef,
+		value: TypeIndex,
+	) {
+		let BoundEntry::Resolved(bound) =
+			&mut self.bounds[usize::from(reference.bound)]
+		else {
+			unreachable!("only completed source terms can fail validation");
+		};
+		let BindingRequirement::Equals(term) =
+			&mut bound.bindings[reference.index as usize].kind
+		else {
+			unreachable!()
+		};
+		term.inner = value;
 	}
 
 	pub(super) fn fill(&mut self, id: BoundId, bound: SourceTraitBound) {
@@ -289,7 +316,7 @@ impl SignatureBuilder<'_, '_> {
 			def_id,
 			requested_at: Some(reference),
 		}) {
-			SignatureStatus::Resolved(_) => {}
+			SignatureStatus::Available(_) => {}
 			SignatureStatus::Cycle => {
 				let diagnostic =
 					self.report_cyclic_implied_trait_bounds(def_id, reference);
@@ -413,7 +440,7 @@ pub(super) struct BoundView<'a> {
 /// the dependency it's waiting on resolves; `Overflowed` never resolves no
 /// matter how many times it's retried, and needs its own diagnostic instead
 /// of silently masquerading as "not resolved yet".
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Readiness {
 	Ready,
 	Pending,
@@ -423,7 +450,7 @@ pub(super) enum Readiness {
 impl Readiness {
 	/// Keeps the more severe of two readiness observations gathered while
 	/// walking a receiver path — order of collection shouldn't matter.
-	fn and(self, other: Readiness) -> Readiness {
+	pub(super) fn and(self, other: Readiness) -> Readiness {
 		match (self, other) {
 			(Readiness::Overflowed, _) | (_, Readiness::Overflowed) => {
 				Readiness::Overflowed
@@ -435,7 +462,7 @@ impl Readiness {
 		}
 	}
 
-	fn from_ready(ready: bool) -> Readiness {
+	pub(super) fn from_ready(ready: bool) -> Readiness {
 		if ready {
 			Readiness::Ready
 		} else {
@@ -550,14 +577,18 @@ impl SignatureBuilder<'_, '_> {
 		}
 		Ok(())
 	}
+}
 
+impl<'a> AssumptionReader<'a> {
 	/// The caller prepares declaration bounds first. Readiness is computed
 	/// for the whole receiver path even if a consumer stops iteration early.
 	pub(super) fn effective_bounds(
 		&self,
+		types: &TypeInterner,
 		mut receiver: TypeIndex,
-	) -> EffectiveBounds<'_> {
-		let reflexive_trait = match *self.types.resolve(receiver) {
+		remaining_depth: usize,
+	) -> EffectiveBounds<'a> {
+		let reflexive_trait = match *types.resolve(receiver) {
 			Type::TypeParam { env, .. } => {
 				match self.type_envs.frame_owner(env) {
 					TypeEnvOwner::Trait(index) => Some(index),
@@ -569,9 +600,9 @@ impl SignatureBuilder<'_, '_> {
 		let mut projections = None;
 		let mut root = &[][..];
 		let mut readiness = Readiness::Ready;
-		let mut remaining = self.normalization.remaining_depth();
+		let mut remaining = remaining_depth;
 		while remaining > 0 {
-			match *self.types.resolve(receiver) {
+			match *types.resolve(receiver) {
 				Type::TypeParam { env, param_index } => {
 					let bounds = &self.param_bounds[usize::from(env)]
 						[param_index as usize];
@@ -625,6 +656,25 @@ impl SignatureBuilder<'_, '_> {
 			reflexive_trait,
 		}
 	}
+}
+
+impl SignatureBuilder<'_, '_> {
+	pub(super) fn effective_bounds(
+		&self,
+		receiver: TypeIndex,
+	) -> EffectiveBounds<'_> {
+		AssumptionReader {
+			type_envs: &self.type_envs,
+			param_bounds: &self.param_bounds,
+			traits: &self.traits,
+			assoc_types: &self.assoc_types,
+		}
+		.effective_bounds(
+			&self.types,
+			receiver,
+			self.normalization.remaining_depth(),
+		)
+	}
 
 	pub(super) fn has_effective_trait(
 		&self,
@@ -645,6 +695,7 @@ impl SignatureBuilder<'_, '_> {
 
 	pub(super) fn projection_equality(
 		&mut self,
+		_cx: AssumptionContext,
 		receiver: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -693,17 +744,7 @@ impl SignatureBuilder<'_, '_> {
 			Readiness::Ready => {}
 			Readiness::Pending => return Ok(EqualityLookup::Pending),
 			Readiness::Overflowed => {
-				self.diagnostics.push(
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::TypeNormalizationOverflow.code(),
-						)
-						.with_message(
-							"type normalization exceeded its recursion limit",
-						)
-						.with_label(reference.primary_label()),
-				);
-				self.normalization.mark_failed();
+				self.normalization_overflow(reference);
 				return Err(());
 			}
 		}

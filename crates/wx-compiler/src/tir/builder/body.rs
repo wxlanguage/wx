@@ -674,15 +674,8 @@ impl<'ast> Builder<'ast, '_> {
 				ty: TypeIndex::ERROR,
 				span: expr.span,
 			}),
-			ast::Expression::String => {
-				let source = &self
-					.files
-					.get(func_ctx.resolve_context.file_id)
-					.unwrap()
-					.source;
-				let raw = expr.span.extract_str(source);
-				let unescaped = unescape_string(raw);
-				let symbol = self.interner.get_or_intern(&unescaped);
+			ast::Expression::String(symbol) => {
+                let symbol = *symbol;
 				// An expected slice type pins the literal's memory (`local
 				// s: other::&[u8] = "…"`); ambient resolution is the
 				// fallback and is ambiguous with more than one memory.

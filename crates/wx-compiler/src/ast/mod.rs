@@ -1110,7 +1110,7 @@ pub enum Expression {
 	False,
 	/// `_` — discard in value position (e.g. `_ = expr;`)
 	Placeholder,
-	/// "hello world" — raw source text (including quotes) is recovered from span
+	/// Raw quoted string text is recovered from the expression span.
 	String,
 	/// 'a' — raw source text (including quotes) is recovered from span
 	Char,
@@ -1501,8 +1501,8 @@ pub struct FunctionParam {
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
 	Word,
-	/// `#[tag = "memory"]` — name plus a string literal (stored raw, including quotes).
-	NameValue(Spanned<SymbolU32>),
+	/// `#[tag = "memory"]` — the span of the raw quoted string.
+	NameValue(TextSpan),
 	/// `#[memory_limits(min_pages = 1, max_pages = 10)]` — name plus a
 	/// parenthesized, comma-separated list of `name = value` arguments.
 	Args(Box<[Separated<Spanned<AttributeArg>>]>),
@@ -1532,8 +1532,8 @@ pub enum AttributeArgValue {
 	/// Range/sign validity for a given attribute is a semantic question,
 	/// checked where the attribute is resolved (TIR), not here.
 	Int(Spanned<i64>),
-	/// Stored raw, including quotes — consistent with `AttributeValue::NameValue`.
-	String(Spanned<SymbolU32>),
+	/// The span of the raw quoted string.
+	String(TextSpan),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1674,7 +1674,8 @@ pub enum UseTree {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct ExportEntry {
 	pub name: Spanned<SymbolU32>,
-	pub alias: Option<Spanned<SymbolU32>>,
+	/// The span of the raw quoted external name.
+	pub alias: Option<TextSpan>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1769,12 +1770,10 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 	},
 	Export {
-		id: DefId,
-		/// Span of the `export` keyword alone. The block's invariants —
-		/// only one, at the package root, not in a library — are properties
-		/// of the block itself rather than of any name it lists, so they
-		/// need a span that doesn't belong to an entry. It's also the only
-		/// span an empty `export { }` has.
+		entry: Spanned<ExportEntry>,
+	},
+	ExportBlock {
+		/// Span of the `export` keyword.
 		keyword_span: TextSpan,
 		entries: Box<[Separated<Spanned<ExportEntry>>]>,
 	},
@@ -1923,7 +1922,7 @@ impl Item {
 	pub fn is_block_like(&self) -> bool {
 		match self {
 			Item::Function { .. }
-			| Item::Export { .. }
+			| Item::ExportBlock { .. }
 			| Item::Import { .. }
 			| Item::Enum { .. }
 			| Item::InherentImpl { .. }
@@ -1933,6 +1932,7 @@ impl Item {
 			| Item::Trait { .. }
 			| Item::TypeSet { .. } => true,
 			Item::Global { .. }
+			| Item::Export { .. }
 			| Item::Const { .. }
 			| Item::Memory { .. }
 			| Item::FunctionDeclaration { .. }
@@ -1961,6 +1961,7 @@ impl Item {
 				*attributes = attrs;
 			}
 			Item::Export { .. }
+			| Item::ExportBlock { .. }
 			| Item::Import { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. }
@@ -2419,7 +2420,7 @@ impl<'ctx> Parser<'ctx> {
 		match keyword {
 			Some(Keyword::Fn) => Ok(Parser::parse_function_definition_item),
 			Some(Keyword::Global) => Ok(Parser::parse_global_definition_item),
-			Some(Keyword::Export) => Ok(Parser::parse_export_block),
+			Some(Keyword::Export) => Ok(Parser::parse_export_item),
 			Some(Keyword::Import) => Ok(Parser::parse_import_block),
 			Some(Keyword::Enum) => Ok(Parser::parse_enum_item),
 			Some(Keyword::Impl) => Ok(Parser::parse_impl_item),
@@ -2517,12 +2518,7 @@ impl<'ctx> Parser<'ctx> {
 
 			let value = if parser.lexer.next_if(Token::Eq).is_some() {
 				let str_token = parser.next_expect(Token::String)?;
-				let raw = str_token.span.extract_str(parser.source);
-				let sym = parser.interner.get_or_intern(raw);
-				AttributeValue::NameValue(Spanned {
-					inner: sym,
-					span: str_token.span,
-				})
+				AttributeValue::NameValue(str_token.span)
 			} else if parser.lexer.peek().inner == Token::OpenParen {
 				let args = SeparatedGroup {
 					open_token: Token::OpenParen,
@@ -2583,14 +2579,7 @@ impl<'ctx> Parser<'ctx> {
 					span: value_token.span,
 				})
 			}
-			Token::String => {
-				let raw = value_token.span.extract_str(parser.source);
-				let sym = parser.interner.get_or_intern(raw);
-				AttributeArgValue::String(Spanned {
-					inner: sym,
-					span: value_token.span,
-				})
-			}
+			Token::String => AttributeArgValue::String(value_token.span),
 			_ => {
 				parser.ast.diagnostics.push(report_unexpected_token(
 					parser.ast.file_id,
@@ -2602,7 +2591,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 		let value_span = match &value {
 			AttributeArgValue::Int(v) => v.span,
-			AttributeArgValue::String(v) => v.span,
+			AttributeArgValue::String(v) => *v,
 		};
 		let span = TextSpan::new(name_span.start, value_span.end);
 		Ok(Spanned {
@@ -4992,62 +4981,23 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_export_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
+	fn parse_export_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let export_keyword = parser.lexer.next();
+
+		if parser.lexer.peek().inner != Token::OpenBrace {
+			let entry = Parser::parse_export_entry(parser)?;
+			let span = TextSpan::new(export_keyword.span.start, entry.span.end);
+			return Ok(Spanned {
+				inner: Item::Export { entry },
+				span,
+			});
+		}
 
 		let entries = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<ExportEntry>, ()> {
-					// Parse: name or name as "alias"
-					let name_token = parser.next_expect(Token::Identifier)?;
-					let name_symbol = parser.intern_identifier(name_token.span);
-
-					// Check for optional "as" alias
-					let alias =
-						if let Token::Identifier = parser.lexer.peek().inner {
-							let potential_as = parser.lexer.peek();
-							if let Ok(Keyword::As) = Keyword::try_from(
-								potential_as.span.extract_str(parser.source),
-							) {
-								_ = parser.lexer.next(); // consume "as"
-
-								let alias_token =
-									parser.next_expect(Token::String)?;
-								let alias_symbol =
-									parser.intern_identifier(alias_token.span);
-
-								Some(Spanned {
-									inner: alias_symbol,
-									span: alias_token.span,
-								})
-							} else {
-								None
-							}
-						} else {
-							None
-						};
-
-					let span = match &alias {
-						Some(alias) => {
-							TextSpan::new(name_token.span.start, alias.span.end)
-						}
-						None => name_token.span,
-					};
-
-					Ok(Spanned {
-						inner: ExportEntry {
-							name: Spanned {
-								inner: name_symbol,
-								span: name_token.span,
-							},
-							alias,
-						},
-						span,
-					})
-				},
+			item_handler: Parser::parse_export_entry,
 			should_warn_missing_separator: None,
 		}
 		.parse(parser)?;
@@ -5055,10 +5005,39 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(export_keyword.span.start, entries.span.end);
 
 		Ok(Spanned {
-			inner: Item::Export {
-				id: parser.id_generator.next_id(),
+			inner: Item::ExportBlock {
 				keyword_span: export_keyword.span,
 				entries: entries.inner,
+			},
+			span,
+		})
+	}
+
+	fn parse_export_entry(
+		parser: &mut Parser,
+	) -> Result<Spanned<ExportEntry>, ()> {
+		let name_token = parser.next_expect(Token::Identifier)?;
+		let name_symbol = parser.intern_identifier(name_token.span);
+
+		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
+			parser.lexer.next();
+			Some(parser.next_expect(Token::String)?.span)
+		} else {
+			None
+		};
+
+		let span = match alias {
+			Some(alias) => TextSpan::new(name_token.span.start, alias.end),
+			None => name_token.span,
+		};
+
+		Ok(Spanned {
+			inner: ExportEntry {
+				name: Spanned {
+					inner: name_symbol,
+					span: name_token.span,
+				},
+				alias,
 			},
 			span,
 		})
@@ -5772,6 +5751,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::TypeAlias { pub_span: span, .. }
 			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
 			Item::Export { .. }
+			| Item::ExportBlock { .. }
 			| Item::Import { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. }
@@ -6110,7 +6090,8 @@ impl<'ctx> Parser<'ctx> {
 
 	fn parse_import_block(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let import_keyword = parser.lexer.next();
-		let external_name = parser.next_expect(Token::String)?.span;
+		let external_span = parser.next_expect(Token::String)?.span;
+		let external_name = external_span;
 
 		let token = parser.lexer.peek();
 		let internal_name = match token.inner {

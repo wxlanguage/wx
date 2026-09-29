@@ -718,14 +718,14 @@ impl<'a> Builder<'a> {
 				self.build_export_definition(span, entries)
 			}
 			ast::Item::Import {
-				module,
-				alias,
+				external_name,
+				internal_name,
 				items: entries,
 			} => self.build_import_definition(
 				span,
-				module,
-				alias.as_ref(),
-				entries,
+				external_name,
+				Some(internal_name),
+				&entries.inner,
 			),
 			ast::Item::Memory {
 				name,
@@ -904,12 +904,12 @@ impl<'a> Builder<'a> {
 	fn build_import_definition(
 		&mut self,
 		span: ast::TextSpan,
-		module: &ast::Spanned<SymbolU32>,
+		module: &wx_compiler::diagnostics::TextSpan,
 		alias: Option<&ast::Spanned<SymbolU32>>,
 		entries: &[ast::Separated<ast::Spanned<ast::ImportEntry>>],
 	) -> NodeId {
 		let mut items: Vec<NodeId> =
-			vec![self.text(Text::Import), self.symbol(module.inner)];
+			vec![self.text(Text::Import), self.source_text(*module)];
 
 		if let Some(alias) = alias {
 			items.push(self.text(Text::As));
@@ -1741,7 +1741,7 @@ impl<'a> Builder<'a> {
 					vec![self.symbol(entry.inner.inner.name.inner)];
 				if let Some(alias) = &entry.inner.inner.alias {
 					en.push(self.text(Text::As));
-					en.push(self.symbol(alias.inner));
+					en.push(self.source_text(*alias));
 				}
 				if entry.separator.is_some() {
 					en.push(self.text(Text::Comma));
@@ -1799,7 +1799,7 @@ impl<'a> Builder<'a> {
 				ast::AttributeValue::Word => {}
 				ast::AttributeValue::NameValue(value) => {
 					out.push(self.text(Text::EqSp));
-					out.push(self.symbol(value.inner));
+					out.push(self.source_text(*value));
 				}
 				ast::AttributeValue::Args(args) => {
 					out.push(self.text(Text::LParen));
@@ -1812,7 +1812,7 @@ impl<'a> Builder<'a> {
 								out.push(self.source_text(value.span));
 							}
 							ast::AttributeArgValue::String(value) => {
-								out.push(self.symbol(value.inner));
+								out.push(self.source_text(*value));
 							}
 						}
 						if index + 1 < args.len() {

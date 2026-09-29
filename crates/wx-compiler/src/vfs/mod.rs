@@ -324,8 +324,8 @@ pub struct SourceModule {
 pub enum PackageKind {
 	/// Produces a WASM module and cannot be imported.
 	Binary,
-	/// Importable, and subject to the library restrictions (no `export`,
-	/// no `memory`, ...).
+	/// Importable, and subject to library restrictions (no `memory`, ...).
+	/// Export blocks describe compilation metadata only for the selected crate.
 	Library,
 }
 

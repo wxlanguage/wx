@@ -1,6 +1,7 @@
 //! Phase 1 — the prescan. Walks every item in every file, allocates its TIR
 //! entry and claims its name, and records it in `ast_nodes` for the
-//! demand-driven signature pass to pick up. No type checking happens here.
+//! demand-driven signature pass to pick up. Import and export names are
+//! decoded and interned here; no body checking happens in this phase.
 
 // use super::*;
 
@@ -31,11 +32,13 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// The package a builtin name (`u8`, `Add`, ...) is only recognized in.
 	/// Always present, from `CompilationUnit::stdlib_package`.
 	stdlib_package: PackageId,
+	root_package: PackageId,
 
 	namespaces: Vec<Namespace>,
 	modules: Vec<ModuleDef>,
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
+	exports: HashMap<SymbolU32, ExportEntrySource>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
@@ -515,9 +518,13 @@ pub(super) enum AstNodeRef<'ast> {
 		global_index: GlobalIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
-	Export {
-		item: &'ast ast::Item,
-	},
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(super) struct ExportEntrySource {
+	pub namespace: NamespaceIdx,
+	pub name: Spanned<SymbolU32>,
+	pub external_span: SourceSpan,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -530,6 +537,8 @@ pub(super) struct DefinitionRegistry {
 	pub file_namespaces: Vec<NamespaceIdx>,
 	pub modules: Vec<ModuleDef>,
 	pub imports: Vec<ImportDef>,
+	/// Selected crate's compilation exports, keyed by decoded external name.
+	pub exports: HashMap<SymbolU32, ExportEntrySource>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -1666,6 +1675,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			strings,
 			files,
 			stdlib_package,
+			root_package,
 			imports: Vec::new(),
 			modules: Vec::new(),
 			traits: Vec::new(),
@@ -1683,6 +1693,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
+			exports: HashMap::new(),
 			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: HashMap::new(),
 			pending_glob_targets: HashMap::new(),
@@ -1724,6 +1735,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			file_namespaces,
 			modules: builder.modules,
 			imports: builder.imports,
+			exports: builder.exports,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
@@ -1742,6 +1754,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		};
 
 		(defs, builder.ast_nodes)
+	}
+
+	fn intern_string(
+		&mut self,
+		file_id: FileId,
+		span: TextSpan,
+	) -> Result<SymbolU32, ()> {
+		let source = &self.files.get(file_id).unwrap().source;
+		let decoded = unescape_string_literal(span.extract_str(source))
+			.map_err(|error| {
+				self.diagnostics
+					.push(error.diagnostic(SourceSpan::new(file_id, span)))
+			})?;
+		Ok(self.strings.get_or_intern(decoded))
 	}
 
 	/// Phase 1a — one namespace per file. Runs before any item is scanned,
@@ -1925,7 +1951,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				bindings: HashMap::new(),
 			})
 		});
-		(trait_impl_index, value_assoc_type_index, mut_trait_impl_index)
+		(
+			trait_impl_index,
+			value_assoc_type_index,
+			mut_trait_impl_index,
+		)
 	}
 
 	#[inline]
@@ -2132,6 +2162,62 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 }
 
 impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
+	fn scan_export_entry(
+		&mut self,
+		file_id: FileId,
+		namespace: NamespaceIdx,
+		entry: &ast::ExportEntry,
+	) {
+		let package = self.namespaces[usize::from(namespace)].package_id;
+		if package != self.root_package {
+			return;
+		}
+		let external = match entry.alias {
+			Some(span) => {
+				let Ok(symbol) = self.intern_string(file_id, span) else {
+					return;
+				};
+				Spanned {
+					inner: symbol,
+					span,
+				}
+			}
+			None => entry.name,
+		};
+		let reference = SourceSpan::new(file_id, external.span);
+		match self.exports.entry(external.inner) {
+			std::collections::hash_map::Entry::Occupied(first) => {
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::DuplicateExport.code())
+						.with_message(format!(
+							"duplicate export name `{}`",
+							self.strings.resolve(external.inner).unwrap()
+						))
+						.with_label(
+							reference
+								.primary_label()
+								.with_message("exported again here"),
+						)
+						.with_label(
+							first
+								.get()
+								.external_span
+								.secondary_label()
+								.with_message("first exported here"),
+						),
+				);
+			}
+			std::collections::hash_map::Entry::Vacant(slot) => {
+				slot.insert(ExportEntrySource {
+					namespace,
+					name: entry.name,
+					external_span: reference,
+				});
+			}
+		}
+	}
+
 	pub(super) fn scan_item(
 		&mut self,
 		file_id: FileId,
@@ -2893,17 +2979,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				external_name,
 				items,
 			} => {
-				let external_name = {
-					let unquoted =
-						unescape_string_literal(external_name.extract_str(
-							&self.files.get(file_id).unwrap().source,
-						));
-					Spanned {
-						inner: self.strings.get_or_intern(&unquoted),
-						span: *external_name,
-					}
-				};
 				let internal_name = *internal_name;
+				let external_name = Spanned {
+					inner: self
+						.intern_string(file_id, *external_name)
+						.unwrap_or(Keyword::Error.symbol()),
+					span: *external_name,
+				};
 
 				let own_namespace_idx =
 					NamespaceIdx(u32::try_from(self.namespaces.len()).unwrap());
@@ -3097,13 +3179,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			ast::Item::Use { tree, pub_span } => {
 				self.scan_use_tree(namespace, tree, None, *pub_span);
 			}
-			ast::Item::Export { id, .. } => {
-				self.ast_nodes.push(AstEntry {
-					def_id: *id,
-					file_id,
-					namespace,
-					node: AstNodeRef::Export { item },
-				});
+			ast::Item::Export { entry } => {
+				self.scan_export_entry(file_id, namespace, &entry.inner);
+			}
+			ast::Item::ExportBlock { entries, .. } => {
+				for entry in entries {
+					self.scan_export_entry(
+						file_id,
+						namespace,
+						&entry.inner.inner,
+					);
+				}
 			}
 			ast::Item::TypeSet {
 				id,
@@ -4760,5 +4846,265 @@ mod tests {
 				panic!("expected the direct binding to win, got {other:?}")
 			}
 		}
+	}
+
+	#[test]
+	fn import_external_names_are_decoded_during_prescan() {
+		let case = TestCase::new(indoc! {"
+            import \"slash\\\\n\" as host {
+                fn f();
+            }
+        "});
+		case.diagnostics().assert_none();
+		let import = &case.defs.imports[0];
+		assert_eq!(
+			case.graph
+				.strings
+				.resolve(import.external_name.inner)
+				.unwrap(),
+			"slash\\n"
+		);
+		let source = &case
+			.graph
+			.files
+			.get(
+				case.defs.namespaces[usize::from(import.parent_namespace)]
+					.file_id,
+			)
+			.unwrap()
+			.source;
+		assert_eq!(
+			import.external_name.span.extract_str(source),
+			r#""slash\\n""#
+		);
+	}
+
+	#[test]
+	fn exports_merge_items_by_decoded_external_name() {
+		let case = TestCase::new(indoc! {"
+            export {
+                f as \"run\",
+            }
+
+            export f as \"start\";
+
+            fn f() {
+            }
+
+            fn g() {
+            }
+
+            export g
+        "});
+		case.diagnostics().assert_none();
+		assert_eq!(case.defs.exports.len(), 3);
+		let f = case.graph.strings.get("f").unwrap();
+		for name in ["run", "start"] {
+			let export =
+				&case.defs.exports[&case.graph.strings.get(name).unwrap()];
+			assert_eq!(export.name.inner, f);
+			assert_eq!(
+				export.external_span.span.extract_str(
+					&case
+						.graph
+						.files
+						.get(export.external_span.file_id)
+						.unwrap()
+						.source
+				),
+				format!("\"{name}\"")
+			);
+		}
+		assert!(
+			!case
+				.defs
+				.exports
+				.contains_key(&case.graph.strings.get("f").unwrap())
+		);
+	}
+
+	#[test]
+	fn duplicate_exports_keep_the_first_target_across_forms() {
+		let case = TestCase::new(indoc! {"
+            fn first() {}
+            fn second() {}
+
+            export {
+                first as \"run\",
+            }
+
+            export second as \"run\"
+        "});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateExport]);
+		assert_eq!(case.defs.exports.len(), 1);
+		let export =
+			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.graph.strings.get("first").unwrap());
+	}
+
+	#[test]
+	fn duplicate_exports_share_one_map_across_namespaces() {
+		let case = TestCase::new(indoc! {"
+            fn first() {}
+
+            export {
+                first as \"run\",
+            }
+
+            mod nested {
+                fn run() {}
+
+                export run
+            }
+        "});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateExport]);
+		assert_eq!(case.defs.exports.len(), 1);
+		let export =
+			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.graph.strings.get("first").unwrap());
+		assert_eq!(export.namespace, case.defs.root_package.root_namespace());
+		let diagnostic = &case.diagnostics[0];
+		assert_eq!(diagnostic.labels.len(), 2);
+	}
+
+	#[test]
+	fn export_aliases_are_decoded_once_and_retain_literal_spans() {
+		let source = indoc! {"
+            fn f() {}
+
+            export {
+                f as \"line\\n\",
+                f as \"slash\\\\n\",
+                f as \"quote\\\"\",
+                f as \"\",
+            }
+        "};
+		let case = TestCase::new(source);
+		case.diagnostics().assert_none();
+		assert_eq!(case.defs.exports.len(), 4);
+		for expected in ["line\n", "slash\\n", "quote\"", ""] {
+			let symbol = case.graph.strings.get(expected).unwrap();
+			let export = &case.defs.exports[&symbol];
+			let file =
+				case.graph.files.get(export.external_span.file_id).unwrap();
+			let written = export.external_span.span.extract_str(&file.source);
+			assert!(written.starts_with('"') && written.ends_with('"'));
+		}
+		assert!(case.graph.strings.get(r#""line\n""#).is_none());
+	}
+
+	#[test]
+	fn unknown_escapes_in_import_and_export_names_are_semantic_errors() {
+		for source in [
+			indoc! {"
+            import \"\\o\" as host {
+                fn f();
+            }
+
+            fn after() {}
+        "},
+			indoc! {"
+            fn f() {}
+
+            export {
+                f as \"\\o\",
+                f as \"valid\",
+            }
+        "},
+			indoc! {"
+            fn f() {
+            }
+
+            export f as \"\\o\"
+            export f as \"valid\"
+        "},
+		] {
+			let case = TestCase::new(source);
+			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+			let diagnostic = &case.diagnostics[0];
+			assert_eq!(
+				diagnostic.code.as_deref(),
+				Some(DiagnosticCode::UnknownCharacterEscape.code())
+			);
+			assert_eq!(diagnostic.message, "unknown character escape: `o`");
+			assert_eq!(diagnostic.labels.len(), 1);
+			let offset = source.find(r"\o").unwrap() + 1;
+			assert_eq!(diagnostic.labels[0].range, offset..offset + 1);
+			assert_eq!(
+				diagnostic.labels[0].message,
+				"unknown character escape"
+			);
+			assert!(case.graph.strings.get(r#""\o""#).is_none());
+			assert!(case.graph.strings.get(r"\o").is_none());
+			if source.starts_with("import") {
+				assert_eq!(
+					case.defs.imports[0].external_name.inner,
+					Keyword::Error.symbol()
+				);
+				assert!(case.graph.strings.get("after").is_some());
+			} else {
+				assert_eq!(case.defs.exports.len(), 1);
+				assert!(
+					case.defs.exports.contains_key(
+						&case.graph.strings.get("valid").unwrap()
+					)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn unknown_escape_labels_use_utf8_byte_offsets() {
+		let source = indoc! {"
+            import \"λ\\💥\" as host {
+                fn f();
+            }
+        "};
+		let case = TestCase::new(source);
+		assert_eq!(case.diagnostics.len(), 1);
+		let diagnostic = &case.diagnostics[0];
+		assert_eq!(
+			diagnostic.code.as_deref(),
+			Some(DiagnosticCode::UnknownCharacterEscape.code())
+		);
+		assert_eq!(diagnostic.message, "unknown character escape: `💥`");
+		assert_eq!(&source[diagnostic.labels[0].range.clone()], "💥");
+	}
+
+	#[test]
+	fn discarded_attributes_do_not_produce_literal_diagnostics() {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
+					"main.wx".to_string(),
+					indoc! {"
+            #[tag = \"\\o\"
+        "}
+					.to_string(),
+				)])),
+			)
+			.unwrap();
+		let mut graph = builder.build(root_id);
+		let parser_diagnostics = graph.collect_parser_diagnostics();
+		assert_eq!(parser_diagnostics.len(), 1, "{parser_diagnostics:?}");
+		assert_eq!(
+			parser_diagnostics[0].code.as_deref(),
+			Some(DiagnosticCode::UnclosedDelimiter.code())
+		);
+		let mut diagnostics = Vec::new();
+		let _ = DefinitionRegistry::build(
+			&graph.packages,
+			&graph.files,
+			&mut graph.strings,
+			&mut diagnostics,
+			graph.stdlib_package,
+			graph.root_package,
+		);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
 }

@@ -193,7 +193,6 @@ define_diagnostic_codes! {
 		MissingTypeAliasBody => "E2070",
 		EnumVariantRequiresExplicitValue => "E2071",
 		DuplicateExportBlock => "E2072",
-		ExportBlockNotAtRoot => "E2073",
 		LibraryCannotExport => "E2074",
 		AmbiguousIdentifier => "E2075",
 		PrivateStructField => "E2076",
@@ -221,9 +220,12 @@ define_diagnostic_codes! {
 		SelfParamPosition => "E2098",
 		MissingParameterType => "E2099",
 		MissingGlobalType => "E2100",
-		NotAMemory => "E2101",
 		CyclicAssociatedType => "E2102",
 		TypeNormalizationOverflow => "E2103",
+		TypeMemberNeedsQualification => "E2104",
+		MissingConstantType => "E2105",
+		UnknownCharacterEscape => "E2106",
+		UnterminatedStringLiteral => "E2107",
 	}
 }
 

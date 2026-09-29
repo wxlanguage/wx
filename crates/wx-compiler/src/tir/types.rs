@@ -35,8 +35,8 @@ use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{
-	AssocTypeIdx, EnumIdx, GlobalIdx, InherentImplIdx, MemoryIdx, StructIdx,
-	TraitIdx, TraitImplIdx,
+	AssocTypeIdx, ConstIdx, EnumIdx, GlobalIdx, InherentImplIdx, MemoryIdx,
+	StructIdx, TraitIdx, TraitImplIdx,
 };
 
 index_newtype!(TypeIndex);
@@ -161,6 +161,18 @@ pub struct TypeInterner {
 	entries: Vec<Type>,
 	#[cfg_attr(test, serde(skip))]
 	index_lookup: HashMap<Type, TypeIndex>,
+}
+
+/// Override a node's rewrite, then delegate ordinary cases to `fold_children`.
+/// Returning a replacement directly leaves its contents untouched.
+pub(super) trait TypeFolder: Sized {
+	fn fold_type(
+		&mut self,
+		types: &mut TypeInterner,
+		ty: TypeIndex,
+	) -> TypeIndex {
+		types.fold_children(ty, self)
+	}
 }
 
 impl TypeInterner {
@@ -397,18 +409,23 @@ impl TypeInterner {
 		ty: TypeIndex,
 		substitution: &Substitution<'_>,
 	) -> TypeIndex {
+		Substitution {
+			env: substitution.env,
+			args: substitution.args,
+		}
+		.fold_type(self, ty)
+	}
+
+	/// Every child passes through the folder. Unchanged nodes retain their
+	/// identity without allocation or an interner lookup.
+	pub(super) fn fold_children<F: TypeFolder>(
+		&mut self,
+		ty: TypeIndex,
+		folder: &mut F,
+	) -> TypeIndex {
 		match self.resolve(ty) {
-			Type::TypeParam { env, param_index } => {
-				if *env == substitution.env {
-					*substitution.args.get(*param_index as usize).expect(
-						"substitution is missing an argument for its parameter frame",
-					)
-				} else {
-					ty
-				}
-			}
 			Type::Tuple { .. } => {
-				let elements = self.substitute_list(ty, substitution, |ty| {
+				let elements = self.fold_list(ty, folder, |ty| {
 					let Type::Tuple { elements } = ty else {
 						unreachable!()
 					};
@@ -421,7 +438,7 @@ impl TypeInterner {
 			}
 			Type::Struct { struct_index, .. } => {
 				let struct_index = *struct_index;
-				let type_args = self.substitute_list(ty, substitution, |ty| {
+				let type_args = self.fold_list(ty, folder, |ty| {
 					let Type::Struct { type_args, .. } = ty else {
 						unreachable!()
 					};
@@ -437,7 +454,7 @@ impl TypeInterner {
 			}
 			Type::FunctionItem { func_index, .. } => {
 				let func_index = *func_index;
-				let type_args = self.substitute_list(ty, substitution, |ty| {
+				let type_args = self.fold_list(ty, folder, |ty| {
 					let Type::FunctionItem { type_args, .. } = ty else {
 						unreachable!()
 					};
@@ -453,13 +470,13 @@ impl TypeInterner {
 			}
 			Type::Function { result, .. } => {
 				let result = *result;
-				let params = self.substitute_list(ty, substitution, |ty| {
+				let params = self.fold_list(ty, folder, |ty| {
 					let Type::Function { params, .. } = ty else {
 						unreachable!()
 					};
 					params
 				});
-				let next_result = self.substitute(result, substitution);
+				let next_result = folder.fold_type(self, result);
 				if params.is_none() && next_result == result {
 					return ty;
 				}
@@ -482,8 +499,8 @@ impl TypeInterner {
 				ownership,
 			} => {
 				let (to, memory, ownership) = (*to, *memory, *ownership);
-				let next_to = self.substitute(to, substitution);
-				let next_memory = self.substitute(memory, substitution);
+				let next_to = folder.fold_type(self, to);
+				let next_memory = folder.fold_type(self, memory);
 				if next_to == to && next_memory == memory {
 					ty
 				} else {
@@ -502,8 +519,8 @@ impl TypeInterner {
 			} => {
 				let (of, size, memory, ownership) =
 					(*of, *size, *memory, *ownership);
-				let next_of = self.substitute(of, substitution);
-				let next_memory = self.substitute(memory, substitution);
+				let next_of = folder.fold_type(self, of);
+				let next_memory = folder.fold_type(self, memory);
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
@@ -521,8 +538,8 @@ impl TypeInterner {
 				ownership,
 			} => {
 				let (of, memory, ownership) = (*of, *memory, *ownership);
-				let next_of = self.substitute(of, substitution);
-				let next_memory = self.substitute(memory, substitution);
+				let next_of = folder.fold_type(self, of);
+				let next_memory = folder.fold_type(self, memory);
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
@@ -540,7 +557,7 @@ impl TypeInterner {
 			} => {
 				let (base, trait_index, assoc_type_index) =
 					(*base, *trait_index, *assoc_type_index);
-				let next_base = self.substitute(base, substitution);
+				let next_base = folder.fold_type(self, base);
 				if next_base == base {
 					ty
 				} else {
@@ -572,32 +589,43 @@ impl TypeInterner {
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
-			| Type::AssociatedType { .. } => ty,
+			| Type::AssociatedType { .. }
+			| Type::TypeParam { .. } => ty,
 		}
 	}
 
-	/// Copies a child list only when its first changed element is found.
-	/// Re-reads the original through its stable type index before each use:
-	/// recursive substitution can grow `entries`, invalidating a borrow,
-	/// but cannot modify an already-interned type or its list.
-	fn substitute_list(
+	fn fold_list<F: TypeFolder>(
 		&mut self,
 		ty: TypeIndex,
-		substitution: &Substitution<'_>,
+		folder: &mut F,
 		list: impl Fn(&Type) -> &[TypeIndex],
 	) -> Option<Box<[TypeIndex]>> {
+		self.map_type_list(ty, list, |types, _, child| {
+			folder.fold_type(types, child)
+		})
+	}
+
+	/// Copies a list only after its first changed child. Read each child
+	/// through the stable parent index: recursion may grow the interner.
+	/// The position lets parent-specific rewrites select an argument slot.
+	pub(super) fn map_type_list(
+		&mut self,
+		ty: TypeIndex,
+		list: impl Fn(&Type) -> &[TypeIndex],
+		mut fold: impl FnMut(&mut Self, usize, TypeIndex) -> TypeIndex,
+	) -> Option<Box<[TypeIndex]>> {
 		let len = list(self.resolve(ty)).len();
-		let mut substituted: Option<Box<[TypeIndex]>> = None;
+		let mut folded: Option<Box<[TypeIndex]>> = None;
 		for index in 0..len {
 			let original = list(self.resolve(ty))[index];
-			let next = self.substitute(original, substitution);
+			let next = fold(self, index, original);
 			if next != original {
-				let items = substituted
+				let items = folded
 					.get_or_insert_with(|| Box::from(list(self.resolve(ty))));
 				items[index] = next;
 			}
 		}
-		substituted
+		folded
 	}
 }
 
@@ -618,6 +646,23 @@ index_newtype!(TypeEnvIdx);
 pub(super) struct Substitution<'a> {
 	pub(super) env: TypeEnvIdx,
 	pub(super) args: &'a [TypeIndex],
+}
+
+impl TypeFolder for Substitution<'_> {
+	fn fold_type(
+		&mut self,
+		types: &mut TypeInterner,
+		ty: TypeIndex,
+	) -> TypeIndex {
+		match types.resolve(ty) {
+			Type::TypeParam { env, param_index } if *env == self.env => {
+				*self.args.get(*param_index as usize).expect(
+					"substitution is missing an argument for its parameter frame",
+				)
+			}
+			_ => types.fold_children(ty, self),
+		}
+	}
 }
 
 /// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
@@ -641,10 +686,12 @@ pub(super) struct TypeParam {
 /// every other `defs.rs`-facing lookup already is — by index into its own
 /// registry array, not by `DefId` — so `name`/`file_id` can reach straight
 /// into `defs.structs[..]` instead of re-deriving the index from a walk
-/// through `ast_node` first. Grows one variant per item kind
-/// `resolve_type_args` learns to instantiate (a type alias next).
-#[derive(Clone, Copy)]
+/// through `ast_node` first. Constants and enums are also represented for
+/// diagnostics, even though they currently have no type parameters.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TypeEnvOwner {
+	Constant(ConstIdx),
+	Enum(EnumIdx),
 	Struct(StructIdx),
 	Function(FunctionIdx),
 	Trait(TraitIdx),
@@ -657,6 +704,8 @@ pub(super) enum TypeEnvOwner {
 impl TypeEnvOwner {
 	pub(super) fn noun(self) -> &'static str {
 		match self {
+			Self::Constant(_) => "constant",
+			Self::Enum(_) => "enum",
 			Self::Struct(_) => "struct",
 			Self::Trait(_) => "trait",
 			Self::Function(_) => "function",
@@ -672,6 +721,8 @@ impl TypeEnvOwner {
 		defs: &DefinitionRegistry,
 	) -> Option<Spanned<SymbolU32>> {
 		Some(match self {
+			Self::Constant(index) => defs.constants[usize::from(index)].name,
+			Self::Enum(index) => defs.enums[usize::from(index)].name,
 			Self::Struct(struct_index) => {
 				defs.structs[usize::from(struct_index)].name
 			}
@@ -690,6 +741,8 @@ impl TypeEnvOwner {
 
 	pub(super) fn file_id(self, defs: &DefinitionRegistry) -> FileId {
 		match self {
+			Self::Constant(index) => defs.constants[usize::from(index)].file_id,
+			Self::Enum(index) => defs.enums[usize::from(index)].file_id,
 			Self::Struct(struct_index) => {
 				defs.structs[usize::from(struct_index)].file_id
 			}
@@ -840,6 +893,14 @@ impl TypeEnvArena {
 		match &self.envs[usize::from(env)] {
 			TypeEnv::Frame { owner, .. } => *owner,
 			_ => unreachable!(),
+		}
+	}
+
+	/// The enclosing lexical frame; Root has no parent.
+	pub(super) fn parent(&self, env: TypeEnvIdx) -> Option<TypeEnvIdx> {
+		match &self.envs[usize::from(env)] {
+			TypeEnv::Root => None,
+			TypeEnv::Frame { parent, .. } => Some(*parent),
 		}
 	}
 
@@ -1220,6 +1281,33 @@ mod tests {
 			),
 			expected,
 			"T -> U and U -> (T,) are simultaneous replacements"
+		);
+	}
+
+	#[test]
+	fn substitution_preserves_a_projection_with_an_error_receiver() {
+		let mut types = TypeInterner::new();
+		let env = TypeEnvIdx::new(1);
+		let subject = parameter(&mut types, env, 0);
+		let projection = types.intern(Type::AssocTypeProjection {
+			base: subject,
+			trait_index: TraitIdx::new(0),
+			assoc_type_index: AssocTypeIdx::new(0),
+		});
+		let result = types.substitute(
+			projection,
+			&Substitution {
+				env,
+				args: &[TypeIndex::ERROR],
+			},
+		);
+		assert_eq!(
+			types.resolve(result),
+			&Type::AssocTypeProjection {
+				base: TypeIndex::ERROR,
+				trait_index: TraitIdx::new(0),
+				assoc_type_index: AssocTypeIdx::new(0),
+			}
 		);
 	}
 

@@ -10,9 +10,12 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::BoundId;
+use super::assumptions::{
+	AssumptionContext, AssumptionKind, QueryError, QueryResult,
+};
+use super::bounds::{BoundId, Readiness};
 use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
-use super::impls::ImplTarget;
+use super::obligations::{BoundRequirements, Obligation};
 use super::signatures::SignatureBuilder;
 use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
 use crate::ast::{Spanned, StringInterner};
@@ -21,62 +24,267 @@ use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
 impl SignatureBuilder<'_, '_> {
-	/// Does `ty` satisfy `trait_index`? `reference` is the span of whatever
-	/// is being checked against this bound, threaded through to
-	/// `ensure_assoc_type_bounds` for its own cycle diagnostic, same role
-	/// it plays in `resolve_type_member`/`resolve_bound_member`.
-	///
-	/// `Error`/`Infer` satisfy everything — both are already diagnosed
-	/// wherever they were produced, so failing a bound check here too would
-	/// only cascade that one root cause into every bound that happens to
-	/// mention it. Same reasoning applies to a projection that fails to
-	/// normalize below: normalization already diagnosed that failure.
-	///
-	/// An abstract receiver tries its effective bound facts first — cheap,
-	/// and the common case for a bare generic parameter — before falling
-	/// back to normalizing and dispatching structurally, the same order
-	/// `find_trait_impl` (members.rs) uses. Without that fallback, a
-	/// projection that reduces to a concrete type satisfying the trait
-	/// (`U::Item` where `U: Value where { Item = i32 }` and `i32: Marker`)
-	/// was rejected outright merely for not having `Marker` as a directly
-	/// asserted bound.
-	pub(super) fn type_satisfies_trait(
+	/// Prove membership from declaration-local assumptions before dispatching
+	/// concrete impls. Impl requirements are proved in this same caller context.
+	pub(super) fn check_trait(
 		&mut self,
+		cx: AssumptionContext,
 		ty: TypeIndex,
 		trait_index: TraitIdx,
 		reference: SourceSpan,
-	) -> bool {
-		if matches!(self.types.resolve(ty), Type::Error | Type::Infer) {
-			return true;
-		}
+	) -> QueryResult<bool> {
+		self.find_trait_impl_query(cx, ty, trait_index, reference)
+			.map(|provider| provider.is_some())
+	}
+
+	/// Direct facts are the fast path. Otherwise compare the requested type
+	/// with subjects that carry this trait in the active scope. Comparison
+	/// reduces assumed equalities only, so it cannot depend on impl dispatch.
+	pub(super) fn check_assumed_trait(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		required: TraitIdx,
+		reference: SourceSpan,
+	) -> QueryResult<bool> {
+		let mut readiness = Readiness::Ready;
 		if matches!(
 			self.types.resolve(ty),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			if self.prepare_effective_bounds(ty, reference).is_err() {
-				return true;
-			}
-			if self.has_effective_trait(ty, trait_index) {
-				return true;
+			self.prepare_effective_bounds(ty, reference)
+				.map_err(|()| QueryError::Failed)?;
+			readiness = self.effective_bounds(ty).readiness;
+			if self.has_effective_trait(ty, required) {
+				return Ok(true);
 			}
 		}
-		let ty = self.normalize_head(ty, reference);
-		if ty == TypeIndex::ERROR {
-			return true;
+		// Retain only scalar subjects of relevant memberships. The borrowed
+		// cursor must be released before normalization can demand signatures.
+		let mut subjects = Vec::new();
+		let mut equality_subjects = Vec::new();
+		{
+			let (reader, types) = self.assumptions();
+			let mut facts = reader.scoped_facts(cx, types);
+			readiness = readiness.and(facts.readiness);
+			while let Some(fact) = facts.next(types) {
+				if matches!(
+					fact.kind,
+					AssumptionKind::Equality(
+						super::bounds::ImpliedBindingKind::Equals(_)
+					)
+				) {
+					equality_subjects.push(fact.subject);
+				}
+				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
+				{
+					if fact.subject == ty {
+						return Ok(true);
+					}
+					if !subjects.contains(&fact.subject) {
+						subjects.push(fact.subject);
+					}
+				}
+			}
 		}
-		let Some(target) = ImplTarget::from_type(self.types.resolve(ty)) else {
-			return false;
+		// A written equality also gives a finite projection path on which
+		// associated declaration bounds may supply evidence (Item: Marker).
+		// Read those paths without recursively expanding every declaration.
+		for subject in equality_subjects {
+			self.prepare_effective_bounds(subject, reference)
+				.map_err(|()| QueryError::Failed)?;
+			let remaining_depth = self.normalization.remaining_depth();
+			let (reader, types) = self.assumptions();
+			let mut facts =
+				reader.subject_facts(subject, types, remaining_depth);
+			readiness = readiness.and(facts.readiness);
+			while let Some(fact) = facts.next(types) {
+				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
+				{
+					if fact.subject == ty {
+						return Ok(true);
+					}
+					if !subjects.contains(&fact.subject) {
+						subjects.push(fact.subject);
+					}
+				}
+			}
+		}
+		if !subjects.is_empty() {
+			let normalized =
+				self.normalize_assumed_type_query(cx, ty, reference)?;
+			for subject in subjects {
+				match self.normalize_assumed_type_query(cx, subject, reference)
+				{
+					Ok(candidate)
+						if candidate == normalized
+							&& candidate != TypeIndex::ERROR =>
+					{
+						return Ok(true);
+					}
+					Ok(_) => {}
+					Err(QueryError::Pending) => {
+						readiness = readiness.and(Readiness::Pending)
+					}
+					Err(QueryError::Failed) => return Err(QueryError::Failed),
+				}
+			}
+		}
+		match readiness {
+			Readiness::Ready => Ok(false),
+			Readiness::Pending => Err(QueryError::Pending),
+			Readiness::Overflowed => {
+				Err(self.normalization_overflow(reference))
+			}
+		}
+	}
+
+	fn requirement_facts(
+		&self,
+		requirements: BoundRequirements,
+	) -> QueryResult<&[super::bounds::ImpliedTraitBound]> {
+		let facts = match requirements {
+			BoundRequirements::Parameter { env, index } => {
+				&self.param_bounds[usize::from(env)][index].facts
+			}
+			BoundRequirements::AssociatedType(index) => {
+				let Some(signature) = &self.assoc_types[usize::from(index)]
+				else {
+					return Err(QueryError::Pending);
+				};
+				&signature.facts
+			}
 		};
-		let candidate =
-			self.impl_dispatch.trait_candidates(target).iter().find_map(
-				|&(candidate, impl_index)| {
-					(candidate == trait_index).then_some(impl_index)
-				},
+		if !facts.is_ready() {
+			return Err(QueryError::Pending);
+		}
+		Ok(facts.current())
+	}
+
+	/// Gather violations before emitting them: another requirement can still
+	/// be pending, and a retry must not duplicate a diagnostic.
+	fn check_requirements(
+		&mut self,
+		cx: AssumptionContext,
+		requirements: BoundRequirements,
+		argument: Spanned<TypeIndex>,
+		reference: SourceSpan,
+		owner: TypeEnvOwner,
+	) -> QueryResult<()> {
+		let count = self.requirement_facts(requirements)?.len();
+		let mut violations = Vec::new();
+		for index in 0..count {
+			let bound = &self.requirement_facts(requirements)?[index];
+			let (required, source) = (bound.trait_index, bound.source);
+			if !self.check_trait(cx, argument.inner, required, reference)? {
+				violations.push((required, source));
+			}
+		}
+		let valid = violations.is_empty();
+		for (required, source) in violations {
+			let diagnostic = self.report_trait_bound_violation(
+				reference.file_id,
+				argument,
+				required,
+				source,
+				owner,
 			);
-		candidate.is_some_and(|impl_index| {
-			self.match_trait_impl_candidate(impl_index, ty, reference)
-				.is_some()
-		})
+			self.diagnostics.push(diagnostic);
+		}
+		if valid {
+			Ok(())
+		} else {
+			Err(QueryError::Failed)
+		}
+	}
+
+	pub(super) fn check_obligation(
+		&mut self,
+		obligation: &Obligation,
+	) -> QueryResult<TypeIndex> {
+		match *obligation {
+			Obligation::CheckBounds {
+				context,
+				requirements,
+				argument,
+				reference,
+				owner,
+			} => self
+				.check_requirements(
+					context,
+					requirements,
+					argument,
+					reference,
+					owner,
+				)
+				.map(|()| argument.inner),
+			Obligation::Normalize {
+				context,
+				subject,
+				reference,
+			} => {
+				let normalized =
+					self.normalize_type_query(context, subject, reference)?;
+				if normalized == TypeIndex::ERROR {
+					Err(QueryError::Failed)
+				} else {
+					Ok(normalized)
+				}
+			}
+			Obligation::CheckTraitMembership {
+				context,
+				subject,
+				required,
+				reference,
+			} => {
+				if self
+					.find_trait_impl_query(
+						context, subject, required, reference,
+					)?
+					.is_some()
+				{
+					return Ok(subject);
+				}
+				let diagnostic = self.report_type_does_not_implement_trait(
+					reference.file_id,
+					reference.span,
+					subject,
+					required,
+				);
+				self.diagnostics.push(diagnostic);
+				Err(QueryError::Failed)
+			}
+		}
+	}
+
+	fn validate_or_defer(
+		&mut self,
+		cx: AssumptionContext,
+		requirements: BoundRequirements,
+		argument: Spanned<TypeIndex>,
+		reference: SourceSpan,
+		owner: TypeEnvOwner,
+	) -> TypeIndex {
+		match self.check_requirements(
+			cx,
+			requirements,
+			argument,
+			reference,
+			owner,
+		) {
+			Ok(()) => argument.inner,
+			Err(QueryError::Failed) => TypeIndex::ERROR,
+			Err(QueryError::Pending) => {
+				self.register_obligation(Obligation::CheckBounds {
+					context: cx,
+					requirements,
+					argument,
+					reference,
+					owner,
+				});
+				argument.inner
+			}
+		}
 	}
 
 	/// Checks a provided associated-type value against the trait's own
@@ -88,19 +296,12 @@ impl SignatureBuilder<'_, '_> {
 	/// requirement `ensure_assoc_type_bounds` already has, which this
 	/// forces first.
 	///
-	/// Diagnoses and returns `TypeIndex::ERROR` for the first bound `value`
-	/// fails; `value.inner` unchanged if every bound is satisfied, or if
-	/// the declaration turned out cyclic (already diagnosed by the force
-	/// above — same shortcut `type_satisfies_trait` takes for `Error`/
-	/// `Infer`, rather than piling a second failure on top).
-	///
-	/// Re-indexes `self.assoc_types[declared_assoc_type]` fresh on each
-	/// iteration instead of holding a slice across the loop, so the
-	/// `&Copy` pair it needs (`trait_index`, `source`) is extracted in a
-	/// scope that ends before the `&mut self` call below — no allocation,
-	/// no cloning the bound list.
+	/// Completed violations recover with `ERROR`. Unfinished requirements
+	/// retain the symbolic value and defer checking to its owning query.
+	/// An already diagnosed declaration cycle does not add another diagnostic.
 	pub(super) fn check_assoc_type_value(
 		&mut self,
+		cx: AssumptionContext,
 		declared_assoc_type: AssocTypeIdx,
 		value: Spanned<TypeIndex>,
 		file_id: FileId,
@@ -113,34 +314,13 @@ impl SignatureBuilder<'_, '_> {
 		{
 			return value.inner;
 		}
-		let len = self.assoc_types[usize::from(declared_assoc_type)]
-			.as_ref()
-			.expect("trait associated type signature is resolved")
-			.facts
-			.current()
-			.len();
-		for i in 0..len {
-			let (trait_index, bound_id) = {
-				let bound = &self.assoc_types[usize::from(declared_assoc_type)]
-					.as_ref()
-					.expect("trait associated type signature is resolved")
-					.facts
-					.current()[i];
-				(bound.trait_index, bound.source)
-			};
-			if !self.type_satisfies_trait(value.inner, trait_index, reference) {
-				let diagnostic = self.report_trait_bound_violation(
-					file_id,
-					value,
-					trait_index,
-					bound_id,
-					owner,
-				);
-				self.diagnostics.push(diagnostic);
-				return TypeIndex::ERROR;
-			}
-		}
-		value.inner
+		self.validate_or_defer(
+			cx,
+			BoundRequirements::AssociatedType(declared_assoc_type),
+			value,
+			reference,
+			owner,
+		)
 	}
 
 	/// Resolves a written type-argument list against `params_env`'s own
@@ -157,9 +337,11 @@ impl SignatureBuilder<'_, '_> {
 	/// bound its corresponding parameter declares — reported per failing
 	/// bound, same granularity as `T: A + B` needing two diagnostics if an
 	/// argument satisfies neither — and only that one slot, not the whole
-	/// list, is poisoned when any of them fails.
+	/// list, is poisoned when any of them fails. Pending requirements retain
+	/// the argument and enqueue a check against the eventual parameter table.
 	pub(super) fn resolve_type_args(
 		&mut self,
+		cx: AssumptionContext,
 		file_id: FileId,
 		reference_span: TextSpan,
 		params_env: TypeEnvIdx,
@@ -181,34 +363,17 @@ impl SignatureBuilder<'_, '_> {
 		}
 
 		let mut result = Vec::with_capacity(expected);
-		for (index, arg) in args.iter().copied().enumerate() {
-			let bounds: Vec<(TraitIdx, BoundId)> = self
-				.implied_bounds(params_env, index as u32)
-				.iter()
-				.map(|bound| (bound.trait_index, bound.source))
-				.collect();
-
-			let mut satisfied = true;
-			let reference = SourceSpan::new(file_id, arg.span);
-			for (trait_index, bound_id) in bounds {
-				if !self.type_satisfies_trait(arg.inner, trait_index, reference)
-				{
-					satisfied = false;
-					let diagnostic = self.report_trait_bound_violation(
-						file_id,
-						arg,
-						trait_index,
-						bound_id,
-						owner,
-					);
-					self.diagnostics.push(diagnostic);
-				}
-			}
-			result.push(if satisfied {
-				arg.inner
-			} else {
-				TypeIndex::ERROR
-			});
+		for (index, argument) in args.iter().copied().enumerate() {
+			result.push(self.validate_or_defer(
+				cx,
+				BoundRequirements::Parameter {
+					env: params_env,
+					index,
+				},
+				argument,
+				SourceSpan::new(file_id, argument.span),
+				owner,
+			));
 		}
 		result.into_boxed_slice()
 	}
@@ -239,16 +404,14 @@ impl SignatureBuilder<'_, '_> {
 					)),
 			)
 			.with_label(
-				self.bounds
-					.get(bound_id)
-					.span
-					.secondary_label()
-					.with_message(format!(
+				self.bounds.span(bound_id).secondary_label().with_message(
+					format!(
 						"required by a bound in `{}`",
 						self.strings
 							.resolve(owner.name(self.defs).unwrap().inner)
 							.unwrap()
-					)),
+					),
+				),
 			)
 	}
 }
@@ -257,7 +420,7 @@ impl SignatureBuilder<'_, '_> {
 /// each `EnvParam`'s own (already `pub(super)`) `name` field directly rather
 /// than going through a single-index accessor per name/span, since nothing
 /// here needs `param`'s own resolved `ty` or `accesses`.
-fn report_type_arg_count_mismatch(
+pub(super) fn report_type_arg_count_mismatch(
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,
 	file_id: FileId,
@@ -283,10 +446,14 @@ fn report_type_arg_count_mismatch(
 	for (index, arg) in args.iter().enumerate() {
 		let label = SourceSpan::new(file_id, arg.span).secondary_label();
 		labels.push(if index + 1 == args.len() {
-			label.with_message(format!(
-				"supplied {found} generic argument{}",
-				plural(found)
-			))
+			if expected == 0 {
+				label.with_message("remove the unnecessary generics")
+			} else {
+				label.with_message(format!(
+					"supplied {found} generic argument{}",
+					plural(found)
+				))
+			}
 		} else {
 			label
 		});
@@ -297,7 +464,8 @@ fn report_type_arg_count_mismatch(
 		SourceSpan::new(owner_file_id, owner_name.span)
 			.secondary_label()
 			.with_message(format!(
-				"defined here, with {expected} generic parameter{}",
+				"{} defined here, with {expected} generic parameter{}",
+				owner.noun(),
 				plural(expected)
 			)),
 	);
@@ -520,7 +688,7 @@ mod tests {
 	}
 
 	#[test]
-	fn error_and_infer_satisfy_everything() {
+	fn error_and_infer_are_recovery_not_proofs() {
 		with_resolved(
 			indoc! {"
 			trait Foo {}
@@ -528,16 +696,22 @@ mod tests {
 			|builder, graph| {
 				let reference = dummy_reference(builder, graph);
 				let foo = trait_index(builder, graph, "Foo");
-				assert!(builder.type_satisfies_trait(
-					TypeIndex::ERROR,
-					foo,
-					reference
-				));
-				assert!(builder.type_satisfies_trait(
-					TypeIndex::INFER,
-					foo,
-					reference
-				));
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						TypeIndex::ERROR,
+						foo,
+						reference
+					) == Err(QueryError::Failed))
+				);
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						TypeIndex::INFER,
+						foo,
+						reference
+					) == Err(QueryError::Failed))
+				);
 			},
 		);
 	}
@@ -554,7 +728,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let foo = trait_index(builder, graph, "Foo");
 				let s = struct_type(builder, graph, "S");
-				assert!(builder.type_satisfies_trait(s, foo, reference));
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						s,
+						foo,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}
@@ -572,7 +753,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let bar = trait_index(builder, graph, "Bar");
 				let s = struct_type(builder, graph, "S");
-				assert!(!builder.type_satisfies_trait(s, bar, reference));
+				assert!(
+					!(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						s,
+						bar,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}
@@ -588,7 +776,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let nums = typeset_trait_index(builder, graph, "Nums");
 				let s = struct_type(builder, graph, "S");
-				assert!(builder.type_satisfies_trait(s, nums, reference));
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						s,
+						nums,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}
@@ -604,7 +799,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let bound = trait_index(builder, graph, "Bound");
 				let t = generic_param_type(builder, graph, "target", 0);
-				assert!(builder.type_satisfies_trait(t, bound, reference));
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						t,
+						bound,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}
@@ -621,7 +823,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let other = trait_index(builder, graph, "Other");
 				let t = generic_param_type(builder, graph, "target", 0);
-				assert!(!builder.type_satisfies_trait(t, other, reference));
+				assert!(
+					!(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						t,
+						other,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}
@@ -638,11 +847,14 @@ mod tests {
 				let reference = dummy_reference(builder, graph);
 				let super_trait = trait_index(builder, graph, "Super");
 				let t = generic_param_type(builder, graph, "target", 0);
-				assert!(builder.type_satisfies_trait(
-					t,
-					super_trait,
-					reference
-				));
+				assert!(
+					(builder.check_trait(
+						AssumptionContext::new(TypeEnvIdx::ROOT),
+						t,
+						super_trait,
+						reference
+					) == Ok(true))
+				);
 			},
 		);
 	}

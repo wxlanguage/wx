@@ -1,19 +1,25 @@
 //! Associated-type normalization. Declaration identity stays in projections;
 //! abstract equalities come from effective bounds; concrete values come from
-//! selected impl providers.
+//! selected impl providers. Evidence comparison uses the same traversal and
+//! budget, reducing assumed equalities without selecting providers.
 //! Structural substitution remains independent in `types.rs`.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 
+use super::assumptions::{AssumptionContext, QueryError, QueryResult};
 use super::bounds::EqualityLookup;
 use super::defs::{AssocTypeIdx, TraitIdx};
 use super::members::TraitImplLookup;
+use super::obligations::Obligation;
 use super::signatures::SignatureBuilder;
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
 
 struct ProjectionFrame {
+	// Evidence comparison and provider reduction have distinct cycle keys.
+	mode: Mode,
+	context: AssumptionContext,
 	projection: TypeIndex,
 	reference: SourceSpan,
 	assumed: bool,
@@ -47,16 +53,6 @@ impl NormalizationState {
 	pub(super) fn remaining_depth(&self) -> usize {
 		self.limit - self.depth
 	}
-
-	/// Poisons the rest of the active normalization the same way the
-	/// recursion-limit check in `normalize` does, for a failure diagnosed
-	/// outside this module (bound-fact readers sharing the same work limit).
-	/// Short-circuits sibling branches still to be visited in this call —
-	/// e.g. other elements of a tuple mid-`normalize_list` — instead of
-	/// letting each rediscover and re-diagnose the same overflow.
-	pub(super) fn mark_failed(&mut self) {
-		self.failed = true;
-	}
 }
 
 #[cfg(test)]
@@ -66,46 +62,23 @@ impl NormalizationState {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
 	Head,
 	Deep,
+	/// Reduce only assumed equalities, including nested type structure.
+	/// Comparing evidence must not recursively select the impl being proved.
+	Assumptions,
 }
 
 impl SignatureBuilder<'_, '_> {
-	/// Exposes the outer constructor, leaving its children untouched.
-	/// Abstract projections and inference are valid unreduced results.
-	pub(super) fn normalize_head(
+	/// Budget exhaustion is a diagnosed failure, never an unfinished fact.
+	/// Poison an active normalization only; a top-level proof can be retried.
+	pub(super) fn normalization_overflow(
 		&mut self,
-		ty: TypeIndex,
 		reference: SourceSpan,
-	) -> TypeIndex {
-		self.normalize(ty, reference, Mode::Head)
-	}
-
-	/// Normalizes projections throughout the type, without expanding nominal
-	/// definitions. Unchanged child lists are borrowed, never cloned.
-	pub(super) fn normalize_type(
-		&mut self,
-		ty: TypeIndex,
-		reference: SourceSpan,
-	) -> TypeIndex {
-		self.normalize(ty, reference, Mode::Deep)
-	}
-
-	fn normalize(
-		&mut self,
-		ty: TypeIndex,
-		reference: SourceSpan,
-		mode: Mode,
-	) -> TypeIndex {
-		if self.normalization.failed {
-			return TypeIndex::ERROR;
-		}
-		if self.normalization.blocked_at.is_some() {
-			return ty;
-		}
-		if self.normalization.depth == self.normalization.limit {
+	) -> QueryError {
+		if !self.normalization.failed {
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeNormalizationOverflow.code())
@@ -114,24 +87,116 @@ impl SignatureBuilder<'_, '_> {
 					)
 					.with_label(reference.primary_label()),
 			);
+		}
+		if self.normalization.depth > 0 {
 			self.normalization.failed = true;
-			return TypeIndex::ERROR;
+		}
+		QueryError::Failed
+	}
+
+	/// Construction keeps unfinished reductions symbolic and records the
+	/// work on the declaration being built. Proof consumers use the query API.
+	pub(super) fn normalize_head(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> TypeIndex {
+		self.normalization_value(cx, ty, reference, Mode::Head)
+	}
+
+	pub(super) fn normalize_type(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> TypeIndex {
+		self.normalization_value(cx, ty, reference, Mode::Deep)
+	}
+
+	fn normalization_value(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+		mode: Mode,
+	) -> TypeIndex {
+		match self.normalize(cx, ty, reference, mode) {
+			Ok(result) => result,
+			Err(QueryError::Failed) => TypeIndex::ERROR,
+			Err(QueryError::Pending) => {
+				self.register_obligation(Obligation::Normalize {
+					context: cx,
+					subject: ty,
+					reference,
+				});
+				ty
+			}
+		}
+	}
+
+	/// A ready result can be an abstract projection. Pending is a dependency
+	/// state, never evidence that a concrete impl does not match.
+	pub(super) fn normalize_head_query(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> QueryResult<TypeIndex> {
+		self.normalize(cx, ty, reference, Mode::Head)
+	}
+
+	pub(super) fn normalize_type_query(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> QueryResult<TypeIndex> {
+		self.normalize(cx, ty, reference, Mode::Deep)
+	}
+
+	pub(super) fn normalize_assumed_type_query(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> QueryResult<TypeIndex> {
+		self.normalize(cx, ty, reference, Mode::Assumptions)
+	}
+
+	fn normalize(
+		&mut self,
+		cx: AssumptionContext,
+		ty: TypeIndex,
+		reference: SourceSpan,
+		mode: Mode,
+	) -> QueryResult<TypeIndex> {
+		if self.normalization.failed {
+			return Err(QueryError::Failed);
+		}
+		if self.normalization.blocked_at.is_some() {
+			return Ok(ty);
+		}
+		if self.normalization.depth == self.normalization.limit {
+			return Err(self.normalization_overflow(reference));
 		}
 		self.normalization.depth += 1;
 		let result = if matches!(
 			self.types.resolve(ty),
 			Type::AssocTypeProjection { .. }
 		) {
-			self.normalize_projection(ty, reference, mode)
+			self.normalize_projection(cx, ty, reference, mode)
 		} else {
 			match mode {
-				Mode::Head => ty,
-				Mode::Deep => self.normalize_children(ty, reference),
+				Mode::Head => Ok(ty),
+				Mode::Deep | Mode::Assumptions => {
+					self.normalize_children(cx, ty, reference, mode)
+				}
 			}
 		};
 		self.normalization.depth -= 1;
 		let result = if self.normalization.failed {
-			TypeIndex::ERROR
+			Err(QueryError::Failed)
 		} else {
 			result
 		};
@@ -145,42 +210,46 @@ impl SignatureBuilder<'_, '_> {
 
 	fn normalize_projection(
 		&mut self,
+		cx: AssumptionContext,
 		projection: TypeIndex,
 		reference: SourceSpan,
 		mode: Mode,
-	) -> TypeIndex {
-		if self.projection_cycle(projection, reference) {
+	) -> QueryResult<TypeIndex> {
+		if self.projection_cycle(cx, projection, reference, mode) {
 			return if self.normalization.failed {
-				TypeIndex::ERROR
+				Err(QueryError::Failed)
 			} else {
-				projection
+				Ok(projection)
 			};
 		}
 		self.normalization.active.push(ProjectionFrame {
+			mode,
+			context: cx,
 			projection,
 			reference,
 			assumed: false,
 		});
 		// Keep the frame active across receiver normalization, provider queries,
 		// and traversal of the resulting type, including compound results.
-		let result = self.reduce_projection(projection, reference, mode);
+		let result = self.reduce_projection(cx, projection, reference, mode);
 		let index = self.normalization.active.len() - 1;
 		self.normalization.active.pop();
 		if let Some(blocked) = self.normalization.blocked_at {
 			if index == blocked {
 				self.normalization.blocked_at = None;
 			}
-			return projection;
+			return Ok(projection);
 		}
 		result
 	}
 
 	fn reduce_projection(
 		&mut self,
+		cx: AssumptionContext,
 		projection: TypeIndex,
 		reference: SourceSpan,
 		mode: Mode,
-	) -> TypeIndex {
+	) -> QueryResult<TypeIndex> {
 		let Type::AssocTypeProjection {
 			base,
 			trait_index,
@@ -192,18 +261,19 @@ impl SignatureBuilder<'_, '_> {
 		// Receiver-specific nested facts must be read before reducing the
 		// receiver to a value that no longer carries their provenance.
 		if let Some(result) = self.reduce_assumed_projection(
+			cx,
 			projection,
 			base,
 			trait_index,
 			assoc_type_index,
 			reference,
 			mode,
-		) {
-			return result;
+		)? {
+			return Ok(result);
 		}
-		let next_base = self.normalize(base, reference, mode);
+		let next_base = self.normalize(cx, base, reference, mode)?;
 		if next_base == TypeIndex::ERROR {
-			return TypeIndex::ERROR;
+			return Err(QueryError::Failed);
 		}
 		let projection = if next_base == base {
 			projection
@@ -213,11 +283,11 @@ impl SignatureBuilder<'_, '_> {
 				trait_index,
 				assoc_type_index,
 			});
-			if self.projection_cycle(next, reference) {
+			if self.projection_cycle(cx, next, reference, mode) {
 				return if self.normalization.failed {
-					TypeIndex::ERROR
+					Err(QueryError::Failed)
 				} else {
-					projection
+					Ok(projection)
 				};
 			}
 			self.normalization.active.last_mut().unwrap().projection = next;
@@ -227,41 +297,49 @@ impl SignatureBuilder<'_, '_> {
 			self.types.resolve(next_base),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			return self
+			return Ok(self
 				.reduce_assumed_projection(
+					cx,
 					projection,
 					next_base,
 					trait_index,
 					assoc_type_index,
 					reference,
 					mode,
-				)
-				.unwrap_or(projection);
+				)?
+				.unwrap_or(projection));
 		}
 		if matches!(
 			self.types.resolve(next_base),
 			Type::Infer | Type::AssociatedType { .. }
 		) {
-			return projection;
+			return Ok(projection);
 		}
-		let Ok(found) = self.find_trait_impl(
-			next_base,
-			trait_index,
-			reference.file_id,
-			reference.span,
-		) else {
-			return TypeIndex::ERROR;
+		if mode == Mode::Assumptions {
+			return Ok(projection);
+		}
+		let Some(found) =
+			self.find_trait_impl_query(cx, next_base, trait_index, reference)?
+		else {
+			let diagnostic = self.report_type_does_not_implement_trait(
+				reference.file_id,
+				reference.span,
+				next_base,
+				trait_index,
+			);
+			self.diagnostics.push(diagnostic);
+			return Err(QueryError::Failed);
 		};
 		let TraitImplLookup::Concrete { impl_index, args } = found else {
-			return projection;
+			return Ok(projection);
 		};
 		let Some(provider) =
 			self.assoc_type_provider(impl_index, assoc_type_index)
 		else {
 			// The later conformance pass owns missing-member diagnostics.
-			return TypeIndex::ERROR;
+			return Err(QueryError::Failed);
 		};
-		let value = self.ensure_assoc_type_value(provider, reference);
+		let value = self.ensure_assoc_type_value_query(provider, reference)?;
 		let instantiated = if args.is_empty() {
 			value
 		} else {
@@ -273,25 +351,27 @@ impl SignatureBuilder<'_, '_> {
 			self.types
 				.substitute(value, &Substitution { env, args: &args })
 		};
-		self.normalize(instantiated, reference, mode)
+		self.normalize(cx, instantiated, reference, mode)
 	}
 
 	fn reduce_assumed_projection(
 		&mut self,
+		cx: AssumptionContext,
 		projection: TypeIndex,
 		base: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
 		reference: SourceSpan,
 		mode: Mode,
-	) -> Option<TypeIndex> {
+	) -> QueryResult<Option<TypeIndex>> {
 		if !matches!(
 			self.types.resolve(base),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			return None;
+			return Ok(None);
 		}
 		match self.projection_equality(
+			cx,
 			base,
 			trait_index,
 			assoc_type_index,
@@ -299,25 +379,27 @@ impl SignatureBuilder<'_, '_> {
 		) {
 			Ok(EqualityLookup::Known(value)) if value != projection => {
 				self.normalization.active.last_mut().unwrap().assumed = true;
-				Some(self.normalize(value, reference, mode))
+				self.normalize(cx, value, reference, mode).map(Some)
 			}
-			Ok(EqualityLookup::Known(_)) => Some(projection),
-			Ok(_) => None,
-			Err(()) => Some(TypeIndex::ERROR),
+			Ok(EqualityLookup::Known(_)) => Ok(Some(projection)),
+			Ok(EqualityLookup::Pending) => Err(QueryError::Pending),
+			Ok(_) => Ok(None),
+			Err(()) => Err(QueryError::Failed),
 		}
 	}
 
 	fn projection_cycle(
 		&mut self,
+		cx: AssumptionContext,
 		projection: TypeIndex,
 		reference: SourceSpan,
+		mode: Mode,
 	) -> bool {
-		let Some(start) = self
-			.normalization
-			.active
-			.iter()
-			.position(|frame| frame.projection == projection)
-		else {
+		let Some(start) = self.normalization.active.iter().position(|frame| {
+			frame.context == cx
+				&& frame.projection == projection
+				&& frame.mode == mode
+		}) else {
 			return false;
 		};
 		if self.normalization.active[start..]
@@ -353,67 +435,76 @@ impl SignatureBuilder<'_, '_> {
 
 	fn normalize_children(
 		&mut self,
+		cx: AssumptionContext,
 		ty: TypeIndex,
 		reference: SourceSpan,
-	) -> TypeIndex {
+		mode: Mode,
+	) -> QueryResult<TypeIndex> {
 		match self.types.resolve(ty) {
 			Type::Tuple { .. } => {
-				let elements = self.normalize_list(ty, reference, |ty| {
-					let Type::Tuple { elements } = ty else {
-						unreachable!()
-					};
-					elements
-				});
+				let elements =
+					self.normalize_list(cx, ty, reference, mode, |ty| {
+						let Type::Tuple { elements } = ty else {
+							unreachable!()
+						};
+						elements
+					})?;
 				match elements {
 					Some(elements) => {
-						self.types.intern(Type::Tuple { elements })
+						Ok(self.types.intern(Type::Tuple { elements }))
 					}
-					None => ty,
+					None => Ok(ty),
 				}
 			}
 			Type::Struct { struct_index, .. } => {
 				let struct_index = *struct_index;
-				let type_args = self.normalize_list(ty, reference, |ty| {
-					let Type::Struct { type_args, .. } = ty else {
-						unreachable!()
-					};
-					type_args
-				});
+				let type_args =
+					self.normalize_list(cx, ty, reference, mode, |ty| {
+						let Type::Struct { type_args, .. } = ty else {
+							unreachable!()
+						};
+						type_args
+					})?;
 				match type_args {
-					Some(type_args) => self.types.intern(Type::Struct {
+					Some(type_args) => Ok(self.types.intern(Type::Struct {
 						struct_index,
 						type_args,
-					}),
-					None => ty,
+					})),
+					None => Ok(ty),
 				}
 			}
 			Type::FunctionItem { func_index, .. } => {
 				let func_index = *func_index;
-				let type_args = self.normalize_list(ty, reference, |ty| {
-					let Type::FunctionItem { type_args, .. } = ty else {
-						unreachable!()
-					};
-					type_args
-				});
+				let type_args =
+					self.normalize_list(cx, ty, reference, mode, |ty| {
+						let Type::FunctionItem { type_args, .. } = ty else {
+							unreachable!()
+						};
+						type_args
+					})?;
 				match type_args {
-					Some(type_args) => self.types.intern(Type::FunctionItem {
-						func_index,
-						type_args,
-					}),
-					None => ty,
+					Some(type_args) => {
+						Ok(self.types.intern(Type::FunctionItem {
+							func_index,
+							type_args,
+						}))
+					}
+					None => Ok(ty),
 				}
 			}
 			Type::Function { result, .. } => {
 				let result = *result;
-				let params = self.normalize_list(ty, reference, |ty| {
-					let Type::Function { params, .. } = ty else {
-						unreachable!()
-					};
-					params
-				});
-				let next_result = self.normalize_type(result, reference);
+				let params =
+					self.normalize_list(cx, ty, reference, mode, |ty| {
+						let Type::Function { params, .. } = ty else {
+							unreachable!()
+						};
+						params
+					})?;
+				let next_result =
+					self.normalize(cx, result, reference, mode)?;
 				if params.is_none() && next_result == result {
-					return ty;
+					return Ok(ty);
 				}
 				// A changed result still needs an owned parameter list, even
 				// when none of those parameters changed.
@@ -424,10 +515,10 @@ impl SignatureBuilder<'_, '_> {
 					};
 					params.clone()
 				});
-				self.types.intern(Type::Function {
+				Ok(self.types.intern(Type::Function {
 					params,
 					result: next_result,
-				})
+				}))
 			}
 			Type::Pointer {
 				to,
@@ -435,16 +526,17 @@ impl SignatureBuilder<'_, '_> {
 				ownership,
 			} => {
 				let (to, memory, ownership) = (*to, *memory, *ownership);
-				let next_to = self.normalize_type(to, reference);
-				let next_memory = self.normalize_type(memory, reference);
+				let next_to = self.normalize(cx, to, reference, mode)?;
+				let next_memory =
+					self.normalize(cx, memory, reference, mode)?;
 				if next_to == to && next_memory == memory {
-					ty
+					Ok(ty)
 				} else {
-					self.types.intern(Type::Pointer {
+					Ok(self.types.intern(Type::Pointer {
 						to: next_to,
 						memory: next_memory,
 						ownership,
-					})
+					}))
 				}
 			}
 			Type::Array {
@@ -455,17 +547,18 @@ impl SignatureBuilder<'_, '_> {
 			} => {
 				let (of, size, memory, ownership) =
 					(*of, *size, *memory, *ownership);
-				let next_of = self.normalize_type(of, reference);
-				let next_memory = self.normalize_type(memory, reference);
+				let next_of = self.normalize(cx, of, reference, mode)?;
+				let next_memory =
+					self.normalize(cx, memory, reference, mode)?;
 				if next_of == of && next_memory == memory {
-					ty
+					Ok(ty)
 				} else {
-					self.types.intern(Type::Array {
+					Ok(self.types.intern(Type::Array {
 						of: next_of,
 						size,
 						memory: next_memory,
 						ownership,
-					})
+					}))
 				}
 			}
 			Type::Slice {
@@ -474,16 +567,17 @@ impl SignatureBuilder<'_, '_> {
 				ownership,
 			} => {
 				let (of, memory, ownership) = (*of, *memory, *ownership);
-				let next_of = self.normalize_type(of, reference);
-				let next_memory = self.normalize_type(memory, reference);
+				let next_of = self.normalize(cx, of, reference, mode)?;
+				let next_memory =
+					self.normalize(cx, memory, reference, mode)?;
 				if next_of == of && next_memory == memory {
-					ty
+					Ok(ty)
 				} else {
-					self.types.intern(Type::Slice {
+					Ok(self.types.intern(Type::Slice {
 						of: next_of,
 						memory: next_memory,
 						ownership,
-					})
+					}))
 				}
 			}
 			Type::AssocTypeProjection { .. } => unreachable!(
@@ -511,22 +605,24 @@ impl SignatureBuilder<'_, '_> {
 			| Type::Memory { .. }
 			| Type::Global { .. }
 			| Type::AssociatedType { .. }
-			| Type::TypeParam { .. } => ty,
+			| Type::TypeParam { .. } => Ok(ty),
 		}
 	}
 
 	/// Allocate output storage only after the first changed child.
 	fn normalize_list(
 		&mut self,
+		cx: AssumptionContext,
 		ty: TypeIndex,
 		reference: SourceSpan,
+		mode: Mode,
 		list: impl Fn(&Type) -> &[TypeIndex],
-	) -> Option<Box<[TypeIndex]>> {
+	) -> QueryResult<Option<Box<[TypeIndex]>>> {
 		let len = list(self.types.resolve(ty)).len();
 		let mut normalized: Option<Box<[TypeIndex]>> = None;
 		for index in 0..len {
 			let original = list(self.types.resolve(ty))[index];
-			let next = self.normalize_type(original, reference);
+			let next = self.normalize(cx, original, reference, mode)?;
 			if next != original {
 				let items = normalized.get_or_insert_with(|| {
 					Box::from(list(self.types.resolve(ty)))
@@ -537,6 +633,6 @@ impl SignatureBuilder<'_, '_> {
 				break;
 			}
 		}
-		normalized
+		Ok(normalized)
 	}
 }
