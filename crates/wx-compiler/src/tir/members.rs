@@ -20,8 +20,8 @@ use super::assumptions::{
 };
 use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
-	AssocTypeIdx, AstNodeRef, BindingKey, DefinitionRegistry, InherentImplIdx,
-	MemberKind, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
+	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
 use super::obligations::Obligation;
@@ -65,7 +65,7 @@ pub(super) enum ApplicableMember {
 		trait_index: TraitIdx,
 		declaration: MemberKind,
 	},
-	/// A concrete trait impl applies; its member may still use the default.
+	/// A concrete trait impl applies; its member may use the trait declaration.
 	TraitImplMember {
 		trait_index: TraitIdx,
 		impl_index: TraitImplIdx,
@@ -78,25 +78,21 @@ impl ApplicableMember {
 	pub(super) fn assoc_type_declaration(
 		self,
 	) -> Option<AssocTypeProjectionTarget> {
-		let (trait_index, declaration) = match self {
+		match self {
 			Self::AbstractTraitMember {
 				trait_index,
-				declaration,
+				declaration: MemberKind::AssociatedType(assoc_type_index),
 			}
 			| Self::TraitImplMember {
 				trait_index,
-				declaration,
+				declaration: MemberKind::AssociatedType(assoc_type_index),
 				..
-			} => (trait_index, declaration),
-			Self::Inherent { .. } => return None,
-		};
-		let MemberKind::AssociatedType(assoc_type_index) = declaration else {
-			return None;
-		};
-		Some(AssocTypeProjectionTarget {
-			trait_index,
-			assoc_type_index,
-		})
+			} => Some(AssocTypeProjectionTarget {
+				trait_index,
+				assoc_type_index,
+			}),
+			_ => None,
+		}
 	}
 
 	/// Returns the definition used for a value member.
@@ -117,44 +113,16 @@ impl ApplicableMember {
 #[derive(Clone, Copy)]
 pub(super) enum TraitMemberSelection {
 	Impl(MemberKind),
-	/// The trait declaration is selected when the impl does not override it.
+	/// The impl omits this member; the trait declaration may supply a default.
 	/// A required declaration may still lack a body or value until conformance.
-	Default(MemberKind),
+	TraitDeclaration(MemberKind),
 }
 
 impl TraitMemberSelection {
 	pub(super) fn kind(self) -> MemberKind {
 		match self {
-			Self::Impl(kind) | Self::Default(kind) => kind,
+			Self::Impl(kind) | Self::TraitDeclaration(kind) => kind,
 		}
-	}
-
-	/// Only an associated type written in an impl provides an impl value.
-	pub(super) fn impl_assoc_type(self) -> Option<ImplAssocTypeIdx> {
-		match self {
-			Self::Impl(MemberKind::AssociatedType(index)) => {
-				Some(ImplAssocTypeIdx(index))
-			}
-			_ => None,
-		}
-	}
-}
-
-/// An associated-type index known to refer to a value provided by an impl:
-///
-/// ```text
-/// trait Trait { type Item; }          // declaration
-/// impl Trait for T { type Item = U; } // value provider
-/// ```
-///
-/// This wraps the impl's `Item` index. Its value may still need to be resolved,
-/// but callers can rely on that value being present after resolution.
-#[derive(Clone, Copy)]
-pub(super) struct ImplAssocTypeIdx(AssocTypeIdx);
-
-impl ImplAssocTypeIdx {
-	pub(super) fn index(self) -> AssocTypeIdx {
-		self.0
 	}
 }
 
@@ -171,12 +139,7 @@ impl DefinitionRegistry {
 			.map(|&index| definition.members[usize::from(index)].kind)
 	}
 
-	/// Selects the impl member when written, or the known trait declaration.
-	pub(super) fn select_trait_member(
-		&self,
-		impl_index: TraitImplIdx,
-		declaration: MemberKind,
-	) -> TraitMemberSelection {
+	fn member_key(&self, declaration: MemberKind) -> BindingKey {
 		let name = match declaration {
 			MemberKind::Function(index) | MemberKind::Method(index) => {
 				self.functions[usize::from(index)].name.inner
@@ -188,14 +151,25 @@ impl DefinitionRegistry {
 				self.assoc_types[usize::from(index)].name.inner
 			}
 		};
-		let key = BindingKey::new(declaration.binding_namespace(), name);
+		BindingKey::new(declaration.binding_namespace(), name)
+	}
+
+	/// Selects an impl member or its trait declaration. The caller must pass a
+	/// declaration of the trait implemented by `impl_index`; member lookup and
+	/// projection resolution establish that relationship before calling here.
+	pub(super) fn select_trait_member(
+		&self,
+		impl_index: TraitImplIdx,
+		declaration: MemberKind,
+	) -> TraitMemberSelection {
+		let key = self.member_key(declaration);
 		let impl_def = &self.trait_impls[usize::from(impl_index)];
 		if let Some(index) = impl_def.bindings.get(&key).copied() {
 			TraitMemberSelection::Impl(
 				impl_def.members[usize::from(index)].kind,
 			)
 		} else {
-			TraitMemberSelection::Default(declaration)
+			TraitMemberSelection::TraitDeclaration(declaration)
 		}
 	}
 }
@@ -375,7 +349,13 @@ impl SignatureBuilder<'_, '_, '_> {
 			file_id,
 		)?;
 		let MemberKind::AssociatedType(assoc_type_index) = kind else {
-			unreachable!("type-tier trait lookup returned a value member")
+			self.diagnostics.push(report_not_an_associated_type(
+				file_id,
+				self.strings,
+				name,
+				self.defs.traits[usize::from(required_trait)].name.inner,
+			));
+			return Err(());
 		};
 		Ok(AssocTypeProjectionTarget {
 			trait_index: required_trait,
@@ -432,11 +412,12 @@ impl SignatureBuilder<'_, '_, '_> {
 		}
 		let trait_def = &self.defs.traits[usize::from(required_trait)];
 		let Some(&member_index) = trait_def.bindings.get(&key) else {
-			self.diagnostics.push(report_not_an_associated_type(
+			self.diagnostics.push(report_missing_trait_member(
 				file_id,
 				self.strings,
 				name,
 				trait_def.name.inner,
+				key.namespace,
 			));
 			return Err(());
 		};
@@ -878,6 +859,30 @@ impl SignatureBuilder<'_, '_, '_> {
 			Some(SmallVec::Many(candidates)) => {
 				MemberLookup::Ambiguous(candidates.into_boxed_slice())
 			}
+		}
+	}
+}
+
+fn report_missing_trait_member(
+	file_id: FileId,
+	strings: &StringInterner,
+	name: Spanned<SymbolU32>,
+	trait_name: SymbolU32,
+	namespace: BindingNamespace,
+) -> Diagnostic<FileId> {
+	match namespace {
+		BindingNamespace::Type => {
+			report_not_an_associated_type(file_id, strings, name, trait_name)
+		}
+		BindingNamespace::Value => {
+			let name_str = strings.resolve(name.inner).unwrap();
+			let trait_str = strings.resolve(trait_name).unwrap();
+			Diagnostic::error()
+				.with_code(DiagnosticCode::NotATraitMember.code())
+				.with_message(format!(
+					"`{name_str}` is not a value member of trait `{trait_str}`"
+				))
+				.with_label(SourceSpan::new(file_id, name.span).primary_label())
 		}
 	}
 }

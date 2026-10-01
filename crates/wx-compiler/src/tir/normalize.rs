@@ -338,10 +338,9 @@ impl SignatureBuilder<'_, '_, '_> {
 			MemberKind::AssociatedType(assoc_type_index),
 		);
 		let instantiated = match selection {
-			TraitMemberSelection::Impl(_) => {
-				let Some(provider) = selection.impl_assoc_type() else {
-					return Err(QueryError::Failed);
-				};
+			TraitMemberSelection::Impl(MemberKind::AssociatedType(
+				provider,
+			)) => {
 				let value =
 					self.ensure_assoc_type_value_query(provider, reference)?;
 				if args.is_empty() {
@@ -356,7 +355,8 @@ impl SignatureBuilder<'_, '_, '_> {
 						.substitute(value, &Substitution { env, args: &args })
 				}
 			}
-			TraitMemberSelection::Default(_) => {
+			TraitMemberSelection::Impl(_) => return Err(QueryError::Failed),
+			TraitMemberSelection::TraitDeclaration(_) => {
 				let Some(value) = self.ensure_assoc_type_default_value_query(
 					assoc_type_index,
 					reference,

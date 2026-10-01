@@ -48,7 +48,6 @@ use super::defs::{
 	StructIdx, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
-use super::members::ImplAssocTypeIdx;
 use super::normalize::NormalizationState;
 use super::obligations::{
 	BoundRequirements, InvalidateTraitDependents, Obligation, ObligationArena,
@@ -1615,7 +1614,7 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 
 	pub(super) fn ensure_assoc_type_value_query(
 		&mut self,
-		provider: ImplAssocTypeIdx,
+		provider: AssocTypeIdx,
 		reference: SourceSpan,
 	) -> QueryResult<TypeIndex> {
 		let value = self.ensure_assoc_type_value(provider, reference);
@@ -1672,21 +1671,22 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 	/// Demands the query that owns this provider's slot. Written impl members
 	/// own a query; synthetic members reuse their memory/global owner's DefId.
 	/// Read the associated-type slot, not the owner's query result kind.
+	/// `provider` must be an associated-type definition selected from an impl,
+	/// whose signature supplies a value (including an error value).
 	/// The value was normalized in its definition environment. Instantiation
 	/// and any normalization made possible by substitution belong to the caller.
 	pub(super) fn ensure_assoc_type_value(
 		&mut self,
-		provider: ImplAssocTypeIdx,
+		provider: AssocTypeIdx,
 		reference: SourceSpan,
 	) -> TypeIndex {
-		let index = provider.index();
-		let def_id = self.defs.assoc_types[usize::from(index)].def_id;
+		let def_id = self.defs.assoc_types[usize::from(provider)].def_id;
 		match self.ensure_signature(QueryInfo {
 			def_id,
 			requested_at: Some(reference),
 		}) {
 			SignatureStatus::Available(_) => self.assoc_types
-				[usize::from(index)]
+				[usize::from(provider)]
 			.as_ref()
 			.expect("the provider's owner populates its associated-type slot")
 			.value
@@ -4893,8 +4893,10 @@ pub(super) mod tests {
 		builder: &mut SignatureBuilder<'_, '_, '_>,
 		receiver: TypeIndex,
 		name: &str,
-	) -> (AssocTypeIdx, ImplAssocTypeIdx, SourceSpan) {
-		use crate::tir::members::{MemberLookup, TraitImplLookup};
+	) -> (AssocTypeIdx, AssocTypeIdx, SourceSpan) {
+		use crate::tir::members::{
+			MemberLookup, TraitImplLookup, TraitMemberSelection,
+		};
 		let file_id = builder.defs.namespaces
 			[usize::from(builder.defs.root_package.root_namespace())]
 		.file_id;
@@ -4940,12 +4942,16 @@ pub(super) mod tests {
 		assert!(
 			matches!(builder.types.resolve(projection), Type::AssocTypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
 		);
-		let provider = builder.defs.select_trait_member(
+		let selection = builder.defs.select_trait_member(
 			impl_index,
 			MemberKind::AssociatedType(declaration),
 		);
-		let provider = provider.impl_assoc_type().unwrap();
-		assert_ne!(declaration, provider.index());
+		let TraitMemberSelection::Impl(MemberKind::AssociatedType(provider)) =
+			selection
+		else {
+			panic!("expected an impl associated-type value")
+		};
+		assert_ne!(declaration, provider);
 		assert!(matches!(
 			builder.ast_node(
 				builder.defs.assoc_types[usize::from(declaration)].def_id
@@ -4953,12 +4959,12 @@ pub(super) mod tests {
 			AstNodeRef::TraitAssocType { .. }
 		));
 		let provider_def_id =
-			builder.defs.assoc_types[usize::from(provider.index())].def_id;
+			builder.defs.assoc_types[usize::from(provider)].def_id;
 		assert!(matches!(
 			builder.query_state[&provider_def_id].state,
 			QueryState::Pending
 		));
-		assert!(builder.assoc_types[usize::from(provider.index())].is_none());
+		assert!(builder.assoc_types[usize::from(provider)].is_none());
 		(declaration, provider, reference)
 	}
 
@@ -6886,7 +6892,7 @@ pub(super) mod tests {
 						let def = &builder.defs.traits[0];
 						assert!(matches!(
 							selection,
-							TraitMemberSelection::Default(_)
+							TraitMemberSelection::TraitDeclaration(_)
 						));
 						def.members[usize::from(def.bindings[&key])].kind
 					};
@@ -6921,6 +6927,25 @@ pub(super) mod tests {
 					MemberLookup::NotFound
 				));
 				assert!(builder.diagnostics.is_empty());
+				let missing = builder.strings.get("Extra").unwrap();
+				assert!(
+					builder
+						.resolve_trait_qualified_value(
+							AssumptionContext::new(TypeEnvIdx::ROOT),
+							receiver,
+							trait_index,
+							Spanned {
+								inner: missing,
+								span: reference.span
+							},
+							reference.file_id,
+						)
+						.is_err()
+				);
+				assert_eq!(
+					builder.diagnostics.last().unwrap().message,
+					"`Extra` is not a value member of trait `Container`"
+				);
 			},
 		);
 	}
@@ -7008,9 +7033,8 @@ pub(super) mod tests {
 					builder.ensure_assoc_type_value(provider, reference),
 					TypeIndex::U32
 				);
-				let def_id = builder.defs.assoc_types
-					[usize::from(provider.index())]
-				.def_id;
+				let def_id =
+					builder.defs.assoc_types[usize::from(provider)].def_id;
 				assert!(
 					matches!(builder.query_state[&def_id].state,
 					QueryState::Resolved(SignatureLocation::Memory(_)) if memory)
@@ -7078,9 +7102,8 @@ pub(super) mod tests {
 					let receiver = builder.types.intern(ty);
 					let (_, provider, reference) =
 						pending_provider(builder, receiver, name);
-					let def_id = builder.defs.assoc_types
-						[usize::from(provider.index())]
-					.def_id;
+					let def_id =
+						builder.defs.assoc_types[usize::from(provider)].def_id;
 					// Simulate re-entry while the provider's owner is computing.
 					// End-to-end source cycles belong to the normalization checkpoint.
 					builder.query_state.get_mut(&def_id).unwrap().state =
@@ -9074,12 +9097,11 @@ pub(super) mod tests {
 				let tuple = builder.types.intern(Type::Tuple {
 					elements: Box::new([projection, TypeIndex::I32]),
 				});
-				let provider_def_id = builder.defs.assoc_types
-					[usize::from(provider.index())]
-				.def_id;
+				let provider_def_id =
+					builder.defs.assoc_types[usize::from(provider)].def_id;
 				// A completed stored value can still contain an abstract projection
 				// that becomes reducible later. Here it models that result directly.
-				builder.assoc_types[usize::from(provider.index())] =
+				builder.assoc_types[usize::from(provider)] =
 					Some(AssocTypeSignature {
 						declared_bounds: Box::new([]),
 						facts: BoundFacts::Ready(Box::new([])),
@@ -9087,7 +9109,7 @@ pub(super) mod tests {
 					});
 				builder.query_state.get_mut(&provider_def_id).unwrap().state =
 					QueryState::Resolved(SignatureLocation::AssocType(
-						provider.index(),
+						provider,
 					));
 				assert_eq!(
 					builder.normalize_head(
@@ -11671,7 +11693,7 @@ pub(super) mod tests {
 						.select_trait_member(impl_index, declaration);
 					assert!(matches!(
 						selection,
-						TraitMemberSelection::Default(_)
+						TraitMemberSelection::TraitDeclaration(_)
 					));
 					assert!(
 						builder.diagnostics.is_empty(),
