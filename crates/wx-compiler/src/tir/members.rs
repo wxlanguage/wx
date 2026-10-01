@@ -20,8 +20,8 @@ use super::assumptions::{
 };
 use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
-	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
-	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, DefinitionRegistry, InherentImplIdx,
+	MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
 use super::obligations::Obligation;
@@ -30,44 +30,114 @@ use super::signatures::{
 };
 use super::types::{Type, TypeIndex};
 
-/// What a type-relative member lookup found.
-pub(super) enum TypeMemberLookup {
+/// What type-relative member applicability found.
+pub(super) enum MemberLookup {
 	/// A dependency has already failed; the caller must not diagnose absence.
 	Error,
-	/// Selecting a declaration needs facts that are not ready yet.
+	/// Selecting a member needs facts that are not ready yet.
 	Pending,
 	NotFound,
-	Found(TypeMemberTarget),
+	Found(ApplicableMember),
 	/// Two or more *unrelated* traits each provide this name for this
 	/// receiver — inherent-vs-trait precedence never lands here (inherent
 	/// always wins outright, checked before any trait candidate at all), so
 	/// this only ever holds trait-sourced candidates.
-	Ambiguous(Box<[TypeMemberTarget]>),
+	Ambiguous(Box<[ApplicableMember]>),
 }
 
+/// A resolved trait-associated type, ready to form a projection on a base.
 #[derive(Clone, Copy)]
-pub(super) struct TypeMemberTarget {
-	/// Trait-associated types always name the trait declaration, even when
-	/// `source` selects an impl override. Value members name the selected
-	/// definition as before. Provider values are accessed separately.
-	pub(super) kind: MemberKind,
-	pub(super) source: MemberSource,
+pub(super) struct AssocTypeProjectionTarget {
+	pub(super) trait_index: TraitIdx,
+	pub(super) assoc_type_index: AssocTypeIdx,
 }
 
+/// A member found through impl dispatch or trait bounds. Trait candidates
+/// retain the declaration; a concrete impl can provide a different definition.
 #[derive(Clone, Copy)]
-pub(super) enum MemberSource {
-	Inherent(InherentImplIdx),
-	/// A concrete `impl Trait for Type` provides (or overrides) this member.
-	TraitImpl(TraitIdx, TraitImplIdx),
-	/// No impl override: the trait declaration may supply a default.
-	/// An absent required member needs error recovery; conformance checking
-	/// owns the diagnostic.
-	TraitDefault(TraitIdx, TraitImplIdx),
-	/// Receiver is abstract (`TypeParam`/`AssocTypeProjection`): resolved
-	/// through one of its own bounds, not a concrete impl at all. Concrete
-	/// dispatch is deferred to monomorphization (mirrors the existing
-	/// `GenericMethodCall`/`AbstractConstAccess` shape).
-	Bound(TraitIdx),
+pub(super) enum ApplicableMember {
+	Inherent {
+		impl_index: InherentImplIdx,
+		kind: MemberKind,
+	},
+	/// The receiver has trait membership through a bound or assumption.
+	AbstractTraitMember {
+		trait_index: TraitIdx,
+		declaration: MemberKind,
+	},
+	/// A concrete trait impl applies; its member may still use the default.
+	TraitImplMember {
+		trait_index: TraitIdx,
+		impl_index: TraitImplIdx,
+		declaration: MemberKind,
+	},
+}
+
+impl ApplicableMember {
+	/// Only a trait-associated type has a projection declaration.
+	pub(super) fn assoc_type_declaration(
+		self,
+	) -> Option<AssocTypeProjectionTarget> {
+		let (trait_index, declaration) = match self {
+			Self::AbstractTraitMember {
+				trait_index,
+				declaration,
+			}
+			| Self::TraitImplMember {
+				trait_index,
+				declaration,
+				..
+			} => (trait_index, declaration),
+			Self::Inherent { .. } => return None,
+		};
+		let MemberKind::AssociatedType(assoc_type_index) = declaration else {
+			return None;
+		};
+		Some(AssocTypeProjectionTarget {
+			trait_index,
+			assoc_type_index,
+		})
+	}
+
+	/// Returns the definition used for a value member.
+	pub(super) fn selected_kind(self, defs: &DefinitionRegistry) -> MemberKind {
+		match self {
+			Self::Inherent { kind, .. } => kind,
+			Self::TraitImplMember {
+				impl_index,
+				declaration,
+				..
+			} => defs.select_trait_member(impl_index, declaration).kind(),
+			Self::AbstractTraitMember { declaration, .. } => declaration,
+		}
+	}
+}
+
+/// Which definition supplies a member of a concrete trait impl.
+#[derive(Clone, Copy)]
+pub(super) enum TraitMemberSelection {
+	Impl(MemberKind),
+	/// The trait declaration is selected when the impl does not override it.
+	/// A required declaration may still lack a body or value until conformance.
+	Default(MemberKind),
+}
+
+impl TraitMemberSelection {
+	pub(super) fn kind(self) -> MemberKind {
+		match self {
+			Self::Impl(kind) | Self::Default(kind) => kind,
+		}
+	}
+
+	/// Only an associated type written in an impl provides an impl value.
+	pub(super) fn impl_assoc_type(self) -> Option<ImplAssocTypeIdx> {
+		match self {
+			Self::Impl(MemberKind::AssociatedType(index)) => {
+				Some(ImplAssocTypeIdx(index))
+			}
+			_ => None,
+		}
+	}
 }
 
 /// An associated-type index known to refer to a value provided by an impl:
@@ -101,56 +171,32 @@ impl DefinitionRegistry {
 			.map(|&index| definition.members[usize::from(index)].kind)
 	}
 
-	/// Keeps type identity on the declaration while preserving value-member
-	/// override selection. An undeclared impl-associated type is not a trait
-	/// projection; full impl conformance checking will diagnose that member.
-	pub(super) fn concrete_trait_member(
-		&self,
-		trait_index: TraitIdx,
-		impl_index: TraitImplIdx,
-		key: BindingKey,
-	) -> Option<TypeMemberTarget> {
-		let trait_def = &self.traits[usize::from(trait_index)];
-		let declared = trait_def
-			.bindings
-			.get(&key)
-			.map(|&index| trait_def.members[usize::from(index)].kind);
-		let impl_def = &self.trait_impls[usize::from(impl_index)];
-		if let Some(&index) = impl_def.bindings.get(&key) {
-			let kind = match impl_def.members[usize::from(index)].kind {
-				MemberKind::AssociatedType(_) => declared?,
-				kind => kind,
-			};
-			Some(TypeMemberTarget {
-				kind,
-				source: MemberSource::TraitImpl(trait_index, impl_index),
-			})
-		} else {
-			declared.map(|kind| TypeMemberTarget {
-				kind,
-				source: MemberSource::TraitDefault(trait_index, impl_index),
-			})
-		}
-	}
-
-	/// Returns the impl's value-providing associated type for this declaration.
-	pub(super) fn impl_assoc_type_for(
+	/// Selects the impl member when written, or the known trait declaration.
+	pub(super) fn select_trait_member(
 		&self,
 		impl_index: TraitImplIdx,
-		declaration: AssocTypeIdx,
-	) -> Option<ImplAssocTypeIdx> {
-		let declaration = &self.assoc_types[usize::from(declaration)];
-		let impl_def = &self.trait_impls[usize::from(impl_index)];
-		let member_idx = impl_def
-			.bindings
-			.get(&BindingKey::ty(declaration.name.inner))
-			.copied()?;
-		let MemberKind::AssociatedType(provider) =
-			impl_def.members[usize::from(member_idx)].kind
-		else {
-			unreachable!("a type-tier impl member is an associated type")
+		declaration: MemberKind,
+	) -> TraitMemberSelection {
+		let name = match declaration {
+			MemberKind::Function(index) | MemberKind::Method(index) => {
+				self.functions[usize::from(index)].name.inner
+			}
+			MemberKind::Constant(index) => {
+				self.constants[usize::from(index)].name.inner
+			}
+			MemberKind::AssociatedType(index) => {
+				self.assoc_types[usize::from(index)].name.inner
+			}
 		};
-		Some(ImplAssocTypeIdx(provider))
+		let key = BindingKey::new(declaration.binding_namespace(), name);
+		let impl_def = &self.trait_impls[usize::from(impl_index)];
+		if let Some(index) = impl_def.bindings.get(&key).copied() {
+			TraitMemberSelection::Impl(
+				impl_def.members[usize::from(index)].kind,
+			)
+		} else {
+			TraitMemberSelection::Default(declaration)
+		}
 	}
 }
 
@@ -170,38 +216,32 @@ pub(super) enum TraitImplLookup {
 }
 
 impl SignatureBuilder<'_, '_, '_> {
-	/// Resolves `name` (in binding tier `tier` — `Value` for a
-	/// function/const, `Type` for an associated type) as a member of
-	/// `receiver`. `reference` is the span of whatever named `receiver` in
-	/// the first place — threaded through to `ensure_assoc_type_bounds`,
-	/// the one path below that can force another item's signature and so
-	/// needs a real "why" to attach to a cycle diagnostic.
-	pub(super) fn resolve_type_member(
+	/// Shared applicability and ambiguity search. Declaration identity and
+	/// implementation selection happen after this search completes.
+	pub(super) fn resolve_applicable_member(
 		&mut self,
 		cx: AssumptionContext,
 		receiver: TypeIndex,
-		tier: BindingNamespace,
-		name: SymbolU32,
+		key: BindingKey,
 		reference: SourceSpan,
-	) -> TypeMemberLookup {
-		let key = BindingKey::new(tier, name);
+	) -> MemberLookup {
 		if matches!(
 			self.types.resolve(receiver),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
 			match self.resolve_bound_member(cx, receiver, key, reference) {
-				TypeMemberLookup::NotFound => {}
+				MemberLookup::NotFound => {}
 				found => return found,
 			}
 		}
 		let receiver = match self.normalize_head_query(cx, receiver, reference)
 		{
 			Ok(receiver) => receiver,
-			Err(QueryError::Pending) => return TypeMemberLookup::Pending,
-			Err(QueryError::Failed) => return TypeMemberLookup::Error,
+			Err(QueryError::Pending) => return MemberLookup::Pending,
+			Err(QueryError::Failed) => return MemberLookup::Error,
 		};
 		if receiver == TypeIndex::ERROR {
-			return TypeMemberLookup::Error;
+			return MemberLookup::Error;
 		}
 		match ImplTarget::from_type(self.types.resolve(receiver)) {
 			Some(target) => self
@@ -236,14 +276,14 @@ impl SignatureBuilder<'_, '_, '_> {
 					"generic args on a type-relative path segment aren't implemented yet"
 				)
 			}
-			match self.resolve_type_member(
+			let key = BindingKey::ty(segment.ident.inner);
+			match self.resolve_applicable_member(
 				cx,
 				current,
-				BindingNamespace::Type,
-				segment.ident.inner,
+				key,
 				SourceSpan::new(file_id, segment.ident.span),
 			) {
-				TypeMemberLookup::Pending => {
+				MemberLookup::Pending => {
 					let receiver = self.type_formatter().display_type(current);
 					let name =
 						self.strings.resolve(segment.ident.inner).unwrap();
@@ -266,11 +306,20 @@ impl SignatureBuilder<'_, '_, '_> {
 					);
 					return TypeIndex::ERROR;
 				}
-				TypeMemberLookup::Error => return TypeIndex::ERROR,
-				TypeMemberLookup::Found(member) => {
-					current = self.project_type_member(current, member);
+				MemberLookup::Error => return TypeIndex::ERROR,
+				MemberLookup::Found(member) => {
+					let Some(declaration) = member.assoc_type_declaration()
+					else {
+						self.diagnostics.push(report_no_such_type_member(
+							file_id,
+							self.strings,
+							segment.ident,
+						));
+						return TypeIndex::ERROR;
+					};
+					current = self.project_assoc_type(current, declaration);
 				}
-				TypeMemberLookup::NotFound => {
+				MemberLookup::NotFound => {
 					self.diagnostics.push(report_no_such_type_member(
 						file_id,
 						self.strings,
@@ -278,7 +327,7 @@ impl SignatureBuilder<'_, '_, '_> {
 					));
 					return TypeIndex::ERROR;
 				}
-				TypeMemberLookup::Ambiguous(candidates) => {
+				MemberLookup::Ambiguous(candidates) => {
 					self.diagnostics.push(report_ambiguous_type_member(
 						file_id,
 						self.strings,
@@ -293,66 +342,94 @@ impl SignatureBuilder<'_, '_, '_> {
 		current
 	}
 
-	/// Turns a resolved member lookup into the next `current` type in a
-	/// path walk — `base` is whatever `member` was looked up on. Shared by
-	/// `resolve_type_member_path`'s per-segment loop and `QualifiedPath`'s
-	/// one-off first segment, which resolves its member a different way
-	/// (`resolve_trait_qualified_member`, not `resolve_type_member`) but
-	/// turns the result into a type the same way.
-	pub(super) fn project_type_member(
+	/// Build a symbolic projection. Ordinary signature types normalize it;
+	/// bound expressions retain it until their assumptions are available.
+	pub(super) fn project_assoc_type(
 		&mut self,
 		base: TypeIndex,
-		member: TypeMemberTarget,
+		member: AssocTypeProjectionTarget,
 	) -> TypeIndex {
-		match member.kind {
-			MemberKind::AssociatedType(assoc_type_index) => {
-				let trait_index = match member.source {
-					MemberSource::Bound(trait_index)
-					| MemberSource::TraitImpl(trait_index, _)
-					| MemberSource::TraitDefault(trait_index, _) => trait_index,
-					MemberSource::Inherent(_) => {
-						todo!("inherent associated types")
-					}
-				};
-				// Projection identity is independent of the selected provider.
-				// Path consumers normalize the constructed projection.
-				self.types.intern(Type::AssocTypeProjection {
-					trait_index,
-					assoc_type_index,
-					base,
-				})
-			}
-			// Every caller resolves in `BindingNamespace::Type` — a
-			// Function/Method/Constant is Value-tier, so `bindings` (keyed
-			// by tier) can never match one here.
-			MemberKind::Function(_)
-			| MemberKind::Method(_)
-			| MemberKind::Constant(_) => unreachable!(
-				"a Type-tier lookup cannot resolve to a Value-tier member"
-			),
-		}
+		self.types.intern(Type::AssocTypeProjection {
+			trait_index: member.trait_index,
+			assoc_type_index: member.assoc_type_index,
+			base,
+		})
 	}
 
-	/// Resolves `<receiver as required_trait>::name` — the first, trait-
-	/// qualified segment of a `QualifiedPath`. The rest of a multi-segment
-	/// qualified path (`<T as Trait>::Item::Next`) continues through the
-	/// ordinary `resolve_type_member_path`, same as `Grouped`/`Path` — only
-	/// the first segment is ever qualified, since a qualification pins down
-	/// *which* trait provides that one name, and everything after it is
-	/// projected off whatever that named.
-	pub(super) fn resolve_trait_qualified_member(
+	/// Resolve the trait declaration named by the first segment of a
+	/// qualified type path. Later segments use ordinary type-member lookup.
+	pub(super) fn resolve_trait_qualified_assoc_type(
 		&mut self,
 		cx: AssumptionContext,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
-		tier: BindingNamespace,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
-	) -> Result<TypeMemberTarget, ()> {
+	) -> Result<AssocTypeProjectionTarget, ()> {
+		let (kind, _) = self.resolve_trait_qualified_declaration(
+			cx,
+			receiver,
+			required_trait,
+			BindingKey::ty(name.inner),
+			name,
+			file_id,
+		)?;
+		let MemberKind::AssociatedType(assoc_type_index) = kind else {
+			unreachable!("type-tier trait lookup returned a value member")
+		};
+		Ok(AssocTypeProjectionTarget {
+			trait_index: required_trait,
+			assoc_type_index,
+		})
+	}
+
+	pub(super) fn resolve_trait_qualified_value(
+		&mut self,
+		cx: AssumptionContext,
+		receiver: TypeIndex,
+		required_trait: TraitIdx,
+		name: Spanned<SymbolU32>,
+		file_id: FileId,
+	) -> Result<ApplicableMember, ()> {
+		let key = BindingKey::value(name.inner);
+		let (declaration, found) = self.resolve_trait_qualified_declaration(
+			cx,
+			receiver,
+			required_trait,
+			key,
+			name,
+			file_id,
+		)?;
+		let member = match found {
+			TraitImplLookup::Concrete { impl_index, .. } => {
+				ApplicableMember::TraitImplMember {
+					trait_index: required_trait,
+					impl_index,
+					declaration,
+				}
+			}
+			TraitImplLookup::Abstract => {
+				ApplicableMember::AbstractTraitMember {
+					trait_index: required_trait,
+					declaration,
+				}
+			}
+		};
+		Ok(member)
+	}
+
+	fn resolve_trait_qualified_declaration(
+		&mut self,
+		cx: AssumptionContext,
+		receiver: TypeIndex,
+		required_trait: TraitIdx,
+		key: BindingKey,
+		name: Spanned<SymbolU32>,
+		file_id: FileId,
+	) -> Result<(MemberKind, TraitImplLookup), ()> {
 		if receiver == TypeIndex::ERROR {
 			return Err(());
 		}
-		let key = BindingKey::new(tier, name.inner);
 		let trait_def = &self.defs.traits[usize::from(required_trait)];
 		let Some(&member_index) = trait_def.bindings.get(&key) else {
 			self.diagnostics.push(report_not_an_associated_type(
@@ -372,16 +449,7 @@ impl SignatureBuilder<'_, '_, '_> {
 			file_id,
 			name.span,
 		)?;
-		Ok(match found {
-			TraitImplLookup::Concrete { impl_index, .. } => self
-				.defs
-				.concrete_trait_member(required_trait, impl_index, key)
-				.expect("the requested trait member was found above"),
-			TraitImplLookup::Abstract => TypeMemberTarget {
-				kind: declared_kind,
-				source: MemberSource::Bound(required_trait),
-			},
-		})
+		Ok((declared_kind, found))
 	}
 
 	/// Finds how `required_trait` applies to `receiver`, if at all — a
@@ -389,7 +457,7 @@ impl SignatureBuilder<'_, '_, '_> {
 	/// in its own implied bounds. Decoupled from looking up any particular
 	/// member, so it's exactly as usable wherever else "does `receiver`
 	/// have an impl/bound for `required_trait`" needs answering, not only
-	/// for `resolve_trait_qualified_member`'s own use. Not a conformance
+	/// for qualified member resolution. Not a conformance
 	/// check: it doesn't care whether that impl/bound actually provides
 	/// everything the trait requires, only whether one exists at all —
 	/// completeness is `check_trait_conformance`'s own, separate job.
@@ -535,7 +603,7 @@ impl SignatureBuilder<'_, '_, '_> {
 		target: ImplTarget,
 		key: BindingKey,
 		reference: SourceSpan,
-	) -> TypeMemberLookup {
+	) -> MemberLookup {
 		// Only a candidate that declares this name can affect precedence.
 		for &index in self.impl_dispatch.inherent_candidates(target) {
 			let impl_def = &self.defs.inherent_impls[usize::from(index)];
@@ -547,14 +615,14 @@ impl SignatureBuilder<'_, '_, '_> {
 				cx, index, receiver, reference,
 			) {
 				Ok(true) => {
-					return TypeMemberLookup::Found(TypeMemberTarget {
+					return MemberLookup::Found(ApplicableMember::Inherent {
 						kind,
-						source: MemberSource::Inherent(index),
+						impl_index: index,
 					});
 				}
 				Ok(false) => {}
-				Err(QueryError::Pending) => return TypeMemberLookup::Pending,
-				Err(QueryError::Failed) => return TypeMemberLookup::Error,
+				Err(QueryError::Pending) => return MemberLookup::Pending,
+				Err(QueryError::Failed) => return MemberLookup::Error,
 			}
 		}
 		let mut traits = Vec::new();
@@ -566,7 +634,7 @@ impl SignatureBuilder<'_, '_, '_> {
 		let (scoped, readiness) =
 			match self.assumed_member_traits(cx, key, reference) {
 				Ok(traits) => traits,
-				Err(()) => return TypeMemberLookup::Error,
+				Err(()) => return MemberLookup::Error,
 			};
 		for trait_index in scoped {
 			if !traits.contains(&trait_index) {
@@ -646,9 +714,14 @@ impl SignatureBuilder<'_, '_, '_> {
 		reference: SourceSpan,
 		traits: Vec<TraitIdx>,
 		mut readiness: Readiness,
-	) -> TypeMemberLookup {
-		let mut candidates: Option<SmallVec<TypeMemberTarget>> = None;
+	) -> MemberLookup {
+		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
 		for trait_index in traits {
+			let Some(declaration) =
+				self.defs.declared_trait_member(trait_index, key)
+			else {
+				continue;
+			};
 			match self.find_trait_impl_query(
 				cx,
 				receiver,
@@ -656,32 +729,29 @@ impl SignatureBuilder<'_, '_, '_> {
 				reference,
 			) {
 				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
-					if let Some(member) = self.defs.concrete_trait_member(
-						trait_index,
-						impl_index,
-						key,
-					) {
-						Self::push_candidate(&mut candidates, member);
-					}
+					Self::push_candidate(
+						&mut candidates,
+						ApplicableMember::TraitImplMember {
+							trait_index,
+							impl_index,
+							declaration,
+						},
+					);
 				}
 				Ok(Some(TraitImplLookup::Abstract)) => {
-					if let Some(kind) =
-						self.defs.declared_trait_member(trait_index, key)
-					{
-						Self::push_candidate(
-							&mut candidates,
-							TypeMemberTarget {
-								kind,
-								source: MemberSource::Bound(trait_index),
-							},
-						);
-					}
+					Self::push_candidate(
+						&mut candidates,
+						ApplicableMember::AbstractTraitMember {
+							trait_index,
+							declaration,
+						},
+					);
 				}
 				Ok(None) => {}
 				Err(QueryError::Pending) => {
 					readiness = readiness.and(Readiness::Pending)
 				}
-				Err(QueryError::Failed) => return TypeMemberLookup::Error,
+				Err(QueryError::Failed) => return MemberLookup::Error,
 			}
 		}
 		// Two known declarations already establish ambiguity. Otherwise pending
@@ -689,7 +759,7 @@ impl SignatureBuilder<'_, '_, '_> {
 		if !matches!(candidates, Some(SmallVec::Many(_)))
 			&& readiness == Readiness::Pending
 		{
-			TypeMemberLookup::Pending
+			MemberLookup::Pending
 		} else {
 			Self::classify(candidates)
 		}
@@ -701,17 +771,17 @@ impl SignatureBuilder<'_, '_, '_> {
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
-	) -> TypeMemberLookup {
+	) -> MemberLookup {
 		if !matches!(
 			self.types.resolve(receiver),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			return TypeMemberLookup::NotFound;
+			return MemberLookup::NotFound;
 		}
 		if self.prepare_effective_bounds(receiver, reference).is_err() {
-			return TypeMemberLookup::Error;
+			return MemberLookup::Error;
 		}
-		let mut candidates: Option<SmallVec<TypeMemberTarget>> = None;
+		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
 		let bounds = self.effective_bounds(receiver);
 		for trait_index in bounds
 			.reflexive_trait
@@ -722,18 +792,19 @@ impl SignatureBuilder<'_, '_, '_> {
 			// receiver constraint; that does not make its member ambiguous.
 			if candidates.as_ref().is_some_and(|items| {
 				items.into_iter().any(|candidate| {
-					matches!(candidate.source, MemberSource::Bound(index) if index == trait_index)
+					matches!(candidate, ApplicableMember::AbstractTraitMember { trait_index: index, .. } if index == trait_index)
 				})
 			}) {
 				continue;
 			}
-			let trait_def = &self.defs.traits[usize::from(trait_index)];
-			if let Some(&member_index) = trait_def.bindings.get(&key) {
+			if let Some(declaration) =
+				self.defs.declared_trait_member(trait_index, key)
+			{
 				Self::push_candidate(
 					&mut candidates,
-					TypeMemberTarget {
-						kind: trait_def.members[usize::from(member_index)].kind,
-						source: MemberSource::Bound(trait_index),
+					ApplicableMember::AbstractTraitMember {
+						trait_index,
+						declaration,
 					},
 				);
 			}
@@ -747,7 +818,7 @@ impl SignatureBuilder<'_, '_, '_> {
 		let (traits, readiness) =
 			match self.assumed_member_traits(cx, key, reference) {
 				Ok(traits) => traits,
-				Err(_) => return TypeMemberLookup::Error,
+				Err(_) => return MemberLookup::Error,
 			};
 		self.resolve_trait_member_candidates(
 			cx, receiver, key, reference, traits, readiness,
@@ -789,8 +860,8 @@ impl SignatureBuilder<'_, '_, '_> {
 	}
 
 	fn push_candidate(
-		candidates: &mut Option<SmallVec<TypeMemberTarget>>,
-		candidate: TypeMemberTarget,
+		candidates: &mut Option<SmallVec<ApplicableMember>>,
+		candidate: ApplicableMember,
 	) {
 		match candidates {
 			Some(items) => items.push(candidate),
@@ -799,15 +870,13 @@ impl SignatureBuilder<'_, '_, '_> {
 	}
 
 	fn classify(
-		candidates: Option<SmallVec<TypeMemberTarget>>,
-	) -> TypeMemberLookup {
+		candidates: Option<SmallVec<ApplicableMember>>,
+	) -> MemberLookup {
 		match candidates {
-			None => TypeMemberLookup::NotFound,
-			Some(SmallVec::One(candidate)) => {
-				TypeMemberLookup::Found(candidate)
-			}
+			None => MemberLookup::NotFound,
+			Some(SmallVec::One(candidate)) => MemberLookup::Found(candidate),
 			Some(SmallVec::Many(candidates)) => {
-				TypeMemberLookup::Ambiguous(candidates.into_boxed_slice())
+				MemberLookup::Ambiguous(candidates.into_boxed_slice())
 			}
 		}
 	}
@@ -827,16 +896,14 @@ fn report_no_such_type_member(
 		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }
 
-/// `candidates` never holds a `MemberSource::Inherent` entry — inherent
-/// always wins outright in `resolve_concrete_member`, before any trait
-/// candidate is even gathered, so nothing ever reaches `Ambiguous` through
-/// it.
+/// Inherent members win before trait candidates are gathered, so ambiguous
+/// associated-type candidates always have trait declaration identities.
 fn report_ambiguous_type_member(
 	file_id: FileId,
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,
 	name: Spanned<SymbolU32>,
-	candidates: &[TypeMemberTarget],
+	candidates: &[ApplicableMember],
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	let mut diagnostic = Diagnostic::error()
@@ -846,14 +913,15 @@ fn report_ambiguous_type_member(
 		))
 		.with_label(SourceSpan::new(file_id, name.span).primary_label());
 	for candidate in candidates {
-		let trait_index = match candidate.source {
-			MemberSource::TraitImpl(trait_index, _)
-			| MemberSource::TraitDefault(trait_index, _)
-			| MemberSource::Bound(trait_index) => trait_index,
-			MemberSource::Inherent(_) => continue,
+		let trait_index = match candidate {
+			ApplicableMember::AbstractTraitMember { trait_index, .. }
+			| ApplicableMember::TraitImplMember { trait_index, .. } => trait_index,
+			ApplicableMember::Inherent { .. } => {
+				unreachable!("inherent members cannot be ambiguous")
+			}
 		};
 		let trait_name = strings
-			.resolve(defs.traits[usize::from(trait_index)].name.inner)
+			.resolve(defs.traits[usize::from(*trait_index)].name.inner)
 			.unwrap();
 		diagnostic =
 			diagnostic.with_note(format!("provided by trait `{trait_name}`"));

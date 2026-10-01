@@ -10,8 +10,8 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 
 use super::assumptions::{AssumptionContext, QueryError, QueryResult};
 use super::bounds::EqualityLookup;
-use super::defs::{AssocTypeIdx, TraitIdx};
-use super::members::TraitImplLookup;
+use super::defs::{AssocTypeIdx, MemberKind, TraitIdx};
+use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::Obligation;
 use super::signatures::SignatureBuilder;
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
@@ -333,39 +333,47 @@ impl SignatureBuilder<'_, '_, '_> {
 		let TraitImplLookup::Concrete { impl_index, args } = found else {
 			return Ok(projection);
 		};
-		let instantiated = if let Some(provider) =
-			self.defs.impl_assoc_type_for(impl_index, assoc_type_index)
-		{
-			let value =
-				self.ensure_assoc_type_value_query(provider, reference)?;
-			if args.is_empty() {
-				value
-			} else {
-				let env = self.trait_impls[usize::from(impl_index)]
-					.as_ref()
-					.expect("a generic selected impl has a resolved header")
-					.type_params;
-				debug_assert_ne!(env, TypeEnvIdx::ROOT);
-				self.types
-					.substitute(value, &Substitution { env, args: &args })
+		let selection = self.defs.select_trait_member(
+			impl_index,
+			MemberKind::AssociatedType(assoc_type_index),
+		);
+		let instantiated = match selection {
+			TraitMemberSelection::Impl(_) => {
+				let Some(provider) = selection.impl_assoc_type() else {
+					return Err(QueryError::Failed);
+				};
+				let value =
+					self.ensure_assoc_type_value_query(provider, reference)?;
+				if args.is_empty() {
+					value
+				} else {
+					let env = self.trait_impls[usize::from(impl_index)]
+						.as_ref()
+						.expect("a generic selected impl has a resolved header")
+						.type_params;
+					debug_assert_ne!(env, TypeEnvIdx::ROOT);
+					self.types
+						.substitute(value, &Substitution { env, args: &args })
+				}
 			}
-		} else {
-			let Some(value) = self.ensure_assoc_type_default_value_query(
-				assoc_type_index,
-				reference,
-			)?
-			else {
-				// The later conformance pass owns missing-member diagnostics.
-				return Err(QueryError::Failed);
-			};
-			let env = self.traits[usize::from(trait_index)].env;
-			self.types.substitute(
-				value,
-				&Substitution {
-					env,
-					args: &[next_base],
-				},
-			)
+			TraitMemberSelection::Default(_) => {
+				let Some(value) = self.ensure_assoc_type_default_value_query(
+					assoc_type_index,
+					reference,
+				)?
+				else {
+					// The later conformance pass owns missing-member diagnostics.
+					return Err(QueryError::Failed);
+				};
+				let env = self.traits[usize::from(trait_index)].env;
+				self.types.substitute(
+					value,
+					&Substitution {
+						env,
+						args: &[next_base],
+					},
+				)
+			}
 		};
 		self.normalize(cx, instantiated, reference, mode)
 	}

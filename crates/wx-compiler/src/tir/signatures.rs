@@ -3197,7 +3197,7 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 					"value-tier DefKind from a type-namespace path walk"
 				),
 				// Never constructed anywhere — associated types are
-				// only ever reached through `resolve_type_member`'s
+				// only ever reached through `resolve_type_member_path`'s
 				// own `MemberKind::AssociatedType`, never as a
 				// top-level namespace symbol.
 				DefKind::TraitAssocType(_) => unreachable!(
@@ -3298,17 +3298,16 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 						"generic args on a type-relative path segment aren't implemented yet"
 					)
 				}
-				let Ok(member) = self.resolve_trait_qualified_member(
+				let Ok(member) = self.resolve_trait_qualified_assoc_type(
 					AssumptionContext::new(env),
 					base_ty,
 					required_trait,
-					BindingNamespace::Type,
 					first.ident,
 					file_id,
 				) else {
 					return TypeIndex::ERROR;
 				};
-				let current = self.project_type_member(base_ty, member);
+				let current = self.project_assoc_type(base_ty, member);
 
 				self.resolve_type_member_path(
 					AssumptionContext::new(env),
@@ -4895,34 +4894,40 @@ pub(super) mod tests {
 		receiver: TypeIndex,
 		name: &str,
 	) -> (AssocTypeIdx, ImplAssocTypeIdx, SourceSpan) {
-		use crate::tir::members::{MemberSource, TypeMemberLookup};
+		use crate::tir::members::{MemberLookup, TraitImplLookup};
 		let file_id = builder.defs.namespaces
 			[usize::from(builder.defs.root_package.root_namespace())]
 		.file_id;
 		let reference = SourceSpan::new(file_id, TextSpan::new(0, 1));
 		let name = builder.strings.get(name).unwrap();
-		let TypeMemberLookup::Found(member) = builder.resolve_type_member(
+		let key = BindingKey::ty(name);
+		let MemberLookup::Found(member) = builder.resolve_applicable_member(
 			AssumptionContext::new(TypeEnvIdx::ROOT),
 			receiver,
-			BindingNamespace::Type,
-			name,
+			key,
 			reference,
 		) else {
 			panic!("expected one associated type");
 		};
-		let MemberKind::AssociatedType(declaration) = member.kind else {
-			panic!("expected an associated type")
-		};
-		let MemberSource::TraitImpl(trait_index, impl_index) = member.source
+		let member = member.assoc_type_declaration().unwrap();
+		let declaration = member.assoc_type_index;
+		let trait_index = member.trait_index;
+		let Some(TraitImplLookup::Concrete { impl_index, .. }) = builder
+			.find_trait_impl_query(
+				AssumptionContext::new(TypeEnvIdx::ROOT),
+				receiver,
+				trait_index,
+				reference,
+			)
+			.unwrap()
 		else {
 			panic!("expected an impl override")
 		};
 		let qualified = builder
-			.resolve_trait_qualified_member(
+			.resolve_trait_qualified_assoc_type(
 				AssumptionContext::new(TypeEnvIdx::ROOT),
 				receiver,
 				trait_index,
-				BindingNamespace::Type,
 				Spanned {
 					inner: name,
 					span: reference.span,
@@ -4930,17 +4935,16 @@ pub(super) mod tests {
 				file_id,
 			)
 			.unwrap();
-		assert!(
-			matches!(qualified.kind, MemberKind::AssociatedType(index) if index == declaration)
-		);
-		let projection = builder.project_type_member(receiver, member);
+		assert_eq!(qualified.assoc_type_index, declaration);
+		let projection = builder.project_assoc_type(receiver, member);
 		assert!(
 			matches!(builder.types.resolve(projection), Type::AssocTypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
 		);
-		let provider = builder
-			.defs
-			.impl_assoc_type_for(impl_index, declaration)
-			.unwrap();
+		let provider = builder.defs.select_trait_member(
+			impl_index,
+			MemberKind::AssociatedType(declaration),
+		);
+		let provider = provider.impl_assoc_type().unwrap();
 		assert_ne!(declaration, provider.index());
 		assert!(matches!(
 			builder.ast_node(
@@ -6820,7 +6824,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn concrete_member_lookup_preserves_value_overrides_and_defaults() {
-		use crate::tir::members::{MemberSource, TypeMemberLookup};
+		use crate::tir::members::{
+			ApplicableMember, MemberLookup, TraitMemberSelection,
+		};
 		with_pending_signatures(
 			indoc! {"
 			trait Container { fn overridden() {} fn inherited() {} }
@@ -6843,42 +6849,55 @@ pub(super) mod tests {
 				{
 					let name = builder.strings.get(name).unwrap();
 					let key = BindingKey::new(BindingNamespace::Value, name);
-					let TypeMemberLookup::Found(member) = builder
-						.resolve_type_member(
+					let MemberLookup::Found(member) = builder
+						.resolve_applicable_member(
 							AssumptionContext::new(TypeEnvIdx::ROOT),
 							receiver,
-							BindingNamespace::Value,
-							name,
+							key,
 							reference,
 						)
 					else {
 						panic!("expected value member")
 					};
-					let MemberKind::Function(actual) = member.kind else {
+					let ApplicableMember::TraitImplMember {
+						trait_index: actual_trait,
+						impl_index: actual_impl,
+						declaration,
+					} = member
+					else {
+						panic!("expected a concrete trait member")
+					};
+					assert_eq!(actual_trait, trait_index);
+					assert_eq!(actual_impl, impl_index);
+					let selection = builder
+						.defs
+						.select_trait_member(impl_index, declaration);
+					let MemberKind::Function(actual) = selection.kind() else {
 						panic!("expected function")
 					};
 					let expected = if overridden {
 						let def = &builder.defs.trait_impls[0];
-						assert!(
-							matches!(member.source, MemberSource::TraitImpl(t, i) if t == trait_index && i == impl_index)
-						);
+						assert!(matches!(
+							selection,
+							TraitMemberSelection::Impl(_)
+						));
 						def.members[usize::from(def.bindings[&key])].kind
 					} else {
 						let def = &builder.defs.traits[0];
-						assert!(
-							matches!(member.source, MemberSource::TraitDefault(t, i) if t == trait_index && i == impl_index)
-						);
+						assert!(matches!(
+							selection,
+							TraitMemberSelection::Default(_)
+						));
 						def.members[usize::from(def.bindings[&key])].kind
 					};
 					assert!(
 						matches!(expected, MemberKind::Function(index) if index == actual)
 					);
 					let qualified = builder
-						.resolve_trait_qualified_member(
+						.resolve_trait_qualified_value(
 							AssumptionContext::new(TypeEnvIdx::ROOT),
 							receiver,
 							trait_index,
-							BindingNamespace::Value,
 							Spanned {
 								inner: name,
 								span: reference.span,
@@ -6887,20 +6906,19 @@ pub(super) mod tests {
 						)
 						.unwrap();
 					assert!(
-						matches!(qualified.kind, MemberKind::Function(index) if index == actual)
+						matches!(qualified.selected_kind(builder.defs), MemberKind::Function(index) if index == actual)
 					);
 				}
 				// No declaration exists for this impl member, so it must not
 				// become a projection with a provider index as its identity.
 				assert!(matches!(
-					builder.resolve_type_member(
+					builder.resolve_applicable_member(
 						AssumptionContext::new(TypeEnvIdx::ROOT),
 						receiver,
-						BindingNamespace::Type,
-						builder.strings.get("Extra").unwrap(),
+						BindingKey::ty(builder.strings.get("Extra").unwrap()),
 						reference
 					),
-					TypeMemberLookup::NotFound
+					MemberLookup::NotFound
 				));
 				assert!(builder.diagnostics.is_empty());
 			},
@@ -11189,7 +11207,8 @@ pub(super) mod tests {
 	mod contextual_members {
 		use super::*;
 		use crate::tir::members::{
-			MemberSource, TraitImplLookup, TypeMemberLookup,
+			ApplicableMember, MemberLookup, TraitImplLookup,
+			TraitMemberSelection,
 		};
 
 		fn checked_case(source: &str) -> TestCase {
@@ -11491,25 +11510,22 @@ pub(super) mod tests {
 					assert!(
 						matches!(proof, TraitImplLookup::Concrete { impl_index, .. } if impl_index == TraitImplIdx::new(0))
 					);
-					let TypeMemberLookup::Found(member) = builder
-						.resolve_type_member(
+					let key =
+						BindingKey::ty(builder.strings.get("Output").unwrap());
+					let MemberLookup::Found(member) = builder
+						.resolve_applicable_member(
 							cx,
 							TypeIndex::I32,
-							BindingNamespace::Type,
-							builder.strings.get("Output").unwrap(),
+							key,
 							reference,
 						)
 					else {
 						panic!("provider member expected")
 					};
-					assert!(
-						matches!(member.source, MemberSource::TraitImpl(t, i) if t == TraitIdx::new(0) && i == TraitImplIdx::new(0))
-					);
-					assert!(
-						matches!(member.kind, MemberKind::AssociatedType(index) if index == AssocTypeIdx::new(0))
-					);
-					let ty =
-						builder.project_type_member(TypeIndex::I32, member);
+					let member = member.assoc_type_declaration().unwrap();
+					assert_eq!(member.trait_index, TraitIdx::new(0));
+					assert_eq!(member.assoc_type_index, AssocTypeIdx::new(0));
+					let ty = builder.project_assoc_type(TypeIndex::I32, member);
 					assert_eq!(
 						builder.normalize_type_query(cx, ty, reference),
 						Ok(TypeIndex::UNIT)
@@ -11568,14 +11584,13 @@ pub(super) mod tests {
 				);
 				builder.normalization.set_limit_for_test(8);
 				assert!(matches!(
-					builder.resolve_type_member(
+					builder.resolve_applicable_member(
 						AssumptionContext::new(env),
 						ty,
-						BindingNamespace::Type,
-						builder.strings.get("Output").unwrap(),
+						BindingKey::ty(builder.strings.get("Output").unwrap()),
 						reference
 					),
-					TypeMemberLookup::Error
+					MemberLookup::Error
 				));
 				assert_eq!(
 					builder.diagnostics.len(),
@@ -11589,14 +11604,13 @@ pub(super) mod tests {
 				);
 				builder.normalization.set_limit_for_test(128);
 				assert!(matches!(
-					builder.resolve_type_member(
+					builder.resolve_applicable_member(
 						AssumptionContext::new(env),
 						ty,
-						BindingNamespace::Type,
-						builder.strings.get("Output").unwrap(),
+						BindingKey::ty(builder.strings.get("Output").unwrap()),
 						reference
 					),
-					TypeMemberLookup::NotFound
+					MemberLookup::NotFound
 				));
 				assert_eq!(builder.diagnostics.len(), 1);
 			});
@@ -11634,20 +11648,30 @@ pub(super) mod tests {
 						builder.defs.functions[index].file_id,
 						TextSpan::new(0, 1),
 					);
-					let TypeMemberLookup::Found(member) = builder
-						.resolve_type_member(
-							cx,
-							receiver,
-							BindingNamespace::Value,
-							builder.strings.get("selected").unwrap(),
-							reference,
+					let key = BindingKey::value(
+						builder.strings.get("selected").unwrap(),
+					);
+					let MemberLookup::Found(member) = builder
+						.resolve_applicable_member(
+							cx, receiver, key, reference,
 						)
 					else {
 						panic!("trait member expected")
 					};
+					let ApplicableMember::TraitImplMember {
+						impl_index,
+						declaration,
+						..
+					} = member
+					else {
+						panic!("expected a concrete trait member")
+					};
+					let selection = builder
+						.defs
+						.select_trait_member(impl_index, declaration);
 					assert!(matches!(
-						member.source,
-						MemberSource::TraitDefault(_, _)
+						selection,
+						TraitMemberSelection::Default(_)
 					));
 					assert!(
 						builder.diagnostics.is_empty(),
