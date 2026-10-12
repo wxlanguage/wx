@@ -16,14 +16,14 @@ use super::assumptions::{
 use super::bounds::{BoundId, Readiness};
 use super::defs::{AssocTypeIdx, DefinitionRegistry, TraitIdx};
 use super::obligations::{BoundRequirements, Obligation};
-use super::signatures::SignatureBuilder;
+use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	/// Prove membership from declaration-local assumptions before dispatching
 	/// concrete impls. Impl requirements are proved in this same caller context.
 	pub(super) fn check_trait(
@@ -503,22 +503,13 @@ mod tests {
 	use crate::vfs;
 
 	/// Parses `source` (playing the stdlib's own role, same reasoning as
-	/// `signatures::tests::TestCase::new` — `ensure_signature` isn't
-	/// selective about which item kinds it drives, so real stdlib content
-	/// would panic on whatever isn't implemented yet before a test even
-	/// runs), forces every registered item's signature, then hands the
-	/// live, fully-resolved `SignatureBuilder` to `f`.
-	///
-	/// `type_satisfies_trait` needs `&mut SignatureBuilder`, and that type
-	/// borrows from the parsed AST (see `signatures.rs`'s own module doc
-	/// comment on why), so — unlike `signatures::tests::TestCase`, which
-	/// only ever keeps the frozen, lifetime-free `SignatureRegistry` around
-	/// after building — nothing borrowed here (`graph`, `defs`, `ast_nodes`,
-	/// `diagnostics`) is allowed to escape this call. Only `f`'s own, owned
-	/// return value is.
+	/// `signatures::tests::source_graph`), sweeps every registered item's
+	/// signature, then hands the live `TypeContext` to `f`. Nothing borrowed
+	/// here (`graph`, `defs`, `ast_nodes`, `diagnostics`) may escape this
+	/// call; only `f`'s own, owned return value does.
 	fn with_resolved<R>(
 		source: &str,
-		f: impl FnOnce(&mut SignatureBuilder, &vfs::CompilationUnit) -> R,
+		f: impl FnOnce(&mut TypeContext, &vfs::CompilationUnit) -> R,
 	) -> R {
 		let mut vfs_builder = vfs::CompilationUnitBuilder::new();
 		let root_id = vfs_builder
@@ -548,19 +539,14 @@ mod tests {
 			&defs,
 			&ast_nodes,
 		);
-		let mut builder = SignatureBuilder::new(
+		let mut builder = TypeContext::new(
 			&mut diagnostics,
 			&graph.strings,
 			&defs,
 			&ast_nodes,
 			&impl_dispatch,
 		);
-		for entry in ast_nodes.iter() {
-			let _ = builder.ensure_signature(QueryInfo {
-				def_id: entry.def_id,
-				requested_at: None,
-			});
-		}
+		builder.sweep();
 		assert!(builder.diagnostics.is_empty(), "{:?}", builder.diagnostics);
 
 		f(&mut builder, &graph)
@@ -570,7 +556,7 @@ mod tests {
 	/// namespace — same mechanism a written bound or type actually uses,
 	/// mirroring `signatures::tests::TestCase::resolve`.
 	fn resolve(
-		builder: &SignatureBuilder,
+		builder: &TypeContext,
 		graph: &vfs::CompilationUnit,
 		tier: BindingNamespace,
 		path: &str,
@@ -609,7 +595,7 @@ mod tests {
 	}
 
 	fn trait_index(
-		builder: &SignatureBuilder,
+		builder: &TypeContext,
 		graph: &vfs::CompilationUnit,
 		path: &str,
 	) -> TraitIdx {
@@ -625,7 +611,7 @@ mod tests {
 	/// a `T: <path>` bound naming this typeset actually resolves to. See
 	/// `TypeSetSignature`'s own doc comment.
 	fn typeset_trait_index(
-		builder: &SignatureBuilder,
+		builder: &TypeContext,
 		graph: &vfs::CompilationUnit,
 		path: &str,
 	) -> TraitIdx {
@@ -641,7 +627,7 @@ mod tests {
 	/// struct's instantiated `TypeIndex` needs type-argument resolution,
 	/// which isn't implemented yet — see `impls.rs::resolve_impl_target`).
 	fn struct_type(
-		builder: &mut SignatureBuilder,
+		builder: &mut TypeContext,
 		graph: &vfs::CompilationUnit,
 		path: &str,
 	) -> TypeIndex {
@@ -664,7 +650,7 @@ mod tests {
 	/// needs a function's own resolved types yet), is what lets this same
 	/// harness reach a `TypeParam` receiver without a wider accessor.
 	fn generic_param_type(
-		builder: &mut SignatureBuilder,
+		builder: &mut TypeContext,
 		graph: &vfs::CompilationUnit,
 		function_path: &str,
 		param_index: u32,
@@ -679,7 +665,7 @@ mod tests {
 	}
 
 	fn dummy_reference(
-		builder: &SignatureBuilder,
+		builder: &TypeContext,
 		graph: &vfs::CompilationUnit,
 	) -> SourceSpan {
 		let root = graph.root_package.root_namespace();

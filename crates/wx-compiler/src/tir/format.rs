@@ -3,9 +3,9 @@
 //! delegates equality types to [`TypeFormatter`], sharing one output buffer.
 //!
 //! A separate borrowing entity (the legacy `TypeFormatter<'a>`'s own
-//! shape), not methods directly on `SignatureBuilder`: formatting is a
+//! shape), not methods directly on `TypeContext`: formatting is a
 //! read-only concern with its own vocabulary (`write_type`, `write_bounds`,
-//! ...), and keeping it off `SignatureBuilder` means a call site can hold
+//! ...), and keeping it off `TypeContext` means a call site can hold
 //! one to build a message while the surrounding code is about to mutate
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
@@ -13,7 +13,7 @@
 //! Borrows `types`/`defs`/`strings` plus `type_envs` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
-//! The formatter currently wraps `SignatureBuilder`'s pieces.
+//! The formatter currently wraps `TypeContext`'s pieces.
 
 use std::fmt::Write as _;
 
@@ -21,7 +21,7 @@ use crate::ast::{Ownership, StringInterner};
 
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
 use super::defs::DefinitionRegistry;
-use super::signatures::SignatureBuilder;
+use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
 pub(super) struct TypeFormatter<'a> {
@@ -39,7 +39,7 @@ pub(super) struct BoundFormatter<'a> {
 	bounds: &'a BoundArena,
 }
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	pub(super) fn type_formatter(&self) -> TypeFormatter<'_> {
 		TypeFormatter {
 			types: &self.types,
@@ -376,7 +376,7 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
-			let mut signatures = SignatureBuilder::new(
+			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&graph.strings,
 				&defs,

@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WX is a Rust-implemented compiler for a language that targets WebAssembly. Syntax is Rust-inspired. This is a bachelor's thesis project.
 
+## Current state: TIR rewrite in progress (branch `tir-refactor`)
+
+The type checker is being rewritten. Only the front half is live:
+
+- **Compiled and tested:** `ast`, `vfs`, `diagnostics`, and `tir` phases 1–2 (`defs.rs`, `imports.rs`, `paths.rs`, `impls.rs`, `signatures.rs` and their support modules, see "TIR" below). The embedded stdlib sweeps with zero diagnostics.
+- **Commented out** in `lib.rs`: `mir`, `opt`, `codegen`, `wasm`. In `tir/mod.rs`: the `TIR` struct, `TIR::build`, `mod builder` (the old body checker, ~22k lines under `tir/builder/`, kept only as the reference to port from) and `mod tests` (`tir/tests.rs` and `tir/snapshots/` are the old suite and are not compiled).
+- **Not compiling:** `wx-fmt`, `wx-lsp`, `wx-cli` (and so `wx` itself) reference things that no longer exist. This is expected mid-refactor state; don't "fix" it as a side effect of unrelated work.
+- **Not started:** body checking (`FunctionContext`), impl conformance, wiring a new `TIR::build`.
+
+Design and rationale: `notes/tir-type-context.md`. Everything below that mentions `tir/builder/`, the `TIR` struct, `TIR::build`, MIR/opt/codegen, or the CLI describes the **previous, still-reference-worthy design**, not what currently builds.
+
 ## Commands
 
 ```bash
@@ -42,7 +53,7 @@ cargo clippy --workspace --no-deps -- -D warnings
 cargo fmt
 ```
 
-Current baseline: 1023 `wx-compiler` + 43 `wx-fmt` + 63 `wx-lsp` tests pass, clippy clean.
+Current baseline (mid-refactor, see below): 557 `wx-compiler` tests pass; `wx-fmt`/`wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
 
 ## Crates & binaries
 
@@ -122,6 +133,8 @@ codegen::Builder::build(&mir, &interner) → Result<WasmModule, ()>
 WASM bytecode (WasmModule::encode() → Vec<u8>)
 ```
 
+Currently only the AST/vfs stages and TIR phases 1–2 are wired; `TIR::build` and everything after it are disabled (see "Current state").
+
 `CompilationUnit` owns diagnostic gathering for the whole package graph — `collect_parser_diagnostics()`, `collect_linker_diagnostics()`, and `collect_diagnostics()` (both, interleaved per package). Don't walk `packages`/`modules` by hand to print or count diagnostics; and use the `Diagnostics` extension trait (`errors`/`error_count`/`has_errors`) rather than spelling out `Severity::Error | Severity::Bug`, since dropping `Bug` from any one such check is a silent hole.
 
 The stdlib is embedded at build time by `crates/wx-compiler/build.rs`, which walks `std/**/*.wx` into `STDLIB_FILES: &[(&str, &str)]` (`/`-prefixed path relative to `std/`, source). `StdlibFileSource` serves it to the loader by reading that table directly. Adding a stdlib file means creating it and writing the `mod` declaration that references it — there is no third list to update. `std/main.wx` defines the fifteen operator traits, the `Memory` trait, `mod wasm` intrinsics, `impl` blocks for the primitives, and stdlib constants.
@@ -129,8 +142,9 @@ The stdlib is embedded at build time by `crates/wx-compiler/build.rs`, which wal
 ## Key modules (`crates/wx-compiler/src/`)
 
 - **`ast/`** — lexer + parser → AST nodes
-- **`tir/builder/`** — prescan + demand-driven type checker and name resolver; 16 modules, ~21k lines (see below)
-- **`tir/mod.rs`** — the TIR data model: `TypeInterner`, `ItemRegistry`, `ModuleGraph`
+- **`tir/`** (live) — `defs.rs` (phase 1 prescan → `DefinitionRegistry`), `imports.rs` (`use`/glob resolution), `paths.rs` (shared path walking), `impls.rs` (`ImplDispatch`), `types.rs` (`TypeInterner`, `TypeEnvArena`), `signatures.rs` (`TypeContext`, `ensure_signature`, `sweep`), plus `bounds.rs`, `assumptions.rs`, `obligations.rs`, `normalize.rs`, `satisfaction.rs`, `members.rs`, `literals.rs`, `format.rs`
+- **`tir/builder/`** (disabled) — the old prescan + body checker; port source for body checking
+- **`tir/mod.rs`** — module wiring; most of its remaining text is the commented-out old data model
 - **`mir/mod.rs`** — desugaring (struct access → `AggregateGet`, `char` → `U32`), monomorphization, lowering
 - **`mir/inlining.rs`** — `run_inlining_pass` (inlining + DCE) and the `Rebaser`
 - **`opt/`** — sea-of-nodes SSA IR for per-function optimization (CSE via `Builder::node`, which delegates to `intern_node`; `liveness.rs`, `scheduler.rs`, and `local_dominance.rs` — a debug-only, deletable verifier for the definite-assignment invariant `coalesce_locals` depends on)
@@ -143,63 +157,26 @@ The stdlib is embedded at build time by `crates/wx-compiler/build.rs`, which wal
 
 The pretty-printer used to live at `fmt/` in this crate; it's now its own crate, `wx-fmt` (`crates/wx-fmt/src/lib.rs`), used by both `wx-cli` (the `format` subcommand) and `wx-lsp` (the LSP formatting request).
 
-### `tir/builder/` layout
+## TIR (rewrite)
 
-Split by **feature slice**, not by kind — each module owns its own `report_*` diagnostics rather than sourcing them from a shared `diagnostics.rs` (of the 88 `report_*` functions, 78 had all their call sites inside one slice). `mod.rs` keeps only the `Builder` struct, the `build()` phase driver, the whole-program lint passes, the genuinely cross-cutting diagnostics, and the enums several slices share. Child modules reach `Builder` through `use super::*`; anything called across a slice boundary is `pub(super)`.
+**Phase 1 — `DefinitionRegistry::build`** (`defs.rs`, with `imports.rs`/`paths.rs`): seeds one root namespace per package (dependency keys become `Module` entries in the declaring package; `crate`/`super` are real namespace symbols), creates one namespace per file, prescans every item into `ast_nodes: Vec<AstEntry>` (parse order) and per-kind arenas with stable indices (`FunctionIdx`, `StructIdx`, …), and resolves `use` imports and globs on demand. Output is read-only afterwards. `ImplDispatch::build` then indexes impl targets.
 
-```
-operators.rs 2078   calls.rs      1782   modules.rs      1636
-types.rs     1585   paths.rs      1578   traits.rs       1568
-signature.rs 1557   control.rs    1398   generics.rs     1337
-body.rs      1123   type_compare.rs 1044   mod.rs        1023
-literal.rs    988   aggregates.rs  976   memory.rs        732
-prescan.rs    718
-```
+**Phase 2 — `TypeContext`** (`signatures.rs`): the single owner of semantic type state (interner, bounds, scope frames, per-kind signature tables, query/obligation/normalization state). It *borrows* `defs`, strings, `ast_nodes`, `ImplDispatch` and the diagnostics sink; the caller owns those and creates the context inside that scope. `sweep()` forces `ensure_signature(DefId)` for every declaration, resolves the export block, and debug-asserts everything is `Resolved` with nothing deferred. The context is **not frozen** afterwards: it stays live and mutable, and body checking will run on it through a per-function `FunctionContext`. Do not reintroduce a frozen `SignatureRegistry`, and don't reach for `Arc`/`Rc`/`unsafe` to make owner and borrower coexist; keep inputs on the caller's stack.
 
-The module is still named `builder`, so `builder::build` and every existing import are unchanged.
+`ensure_signature` is demand-driven and re-entrant. `query_state: HashMap<DefId, QueryEntry>` holds a `QueryState` (`Pending`, `InProgress`, `AwaitingChecks`, `Checking`, `Resolved`, `CycleReported`); `query_stack` records in-progress frames in call order so a cycle diagnostic can name the whole loop. It returns `SignatureStatus { Available, CycleReported, Cycle }`, which is `#[must_use]`: handle `Cycle`, or write `let _ = …` with a reason. Once a frame is pushed, every path must reach the unwind that pops it; a leaked `InProgress` entry makes later cycles name items that finished long ago. Checks that cannot finish yet (a bound waiting on sibling facts) are queued as `Obligation`s and drained as their dependencies complete.
 
-## TIR data model
+Semantic queries (`check_trait`, `find_trait_impl_query`, `normalize_*`, `resolve_type_member`, `resolve_trait_qualified_member`) are methods on `TypeContext`; declaration-local assumptions are read through `AssumptionContext` / `AssumptionReader`. Trait-impl conformance is **not** implemented.
 
-`TIR` is four fields, each its own arena-ish container:
-
-- **`types: TypeInterner`** — `entries: Vec<Type>` plus a private `index_lookup` reverse map. Everything is a `TypeIndex` (u32) into it.
-- **`items: ItemRegistry`** — `functions`, `globals`, `memories`, `enums`, `structs`, `use_items`, `use_prefixes`, `inherent_impls` + its `inherent_impl_dispatch` index, traits, and so on.
-- **`modules: ModuleGraph`** — `namespaces: Vec<ModuleNamespace>`, `package_namespaces: HashMap<PackageId, NamespaceIndex>`, `file_namespaces: Vec<NamespaceIndex>` (indexed by `FileId`), `module_decls`, `import_decls`.
-- **`export_block: Option<ExportBlock>`** — one `Option` answers both "is there a block" and "what does it export", so the two cannot drift.
-
-## TIR resolution design
-
-`tir::builder::build` uses a prescan + demand-driven approach. Before any phase runs it seeds the namespace graph:
-
-- **Package root namespaces** — one per package, the root package included, walked in `graph.packages` order so `NamespaceIndex` values never depend on `HashMap` iteration order (they end up in snapshots). Each gets a `crate` symbol pointing at itself.
-- **Dependency edges** — each `dependencies` key becomes an ordinary `SymbolKind::Module` entry in the *declaring* package's own namespace: a dependency is an implicit `mod <key>;` at the top of the entry file. Nothing global is involved, which is what keeps a package's dependencies invisible to its own dependents.
-
-Then:
-
-1. **Phase 1a** — one namespace per file, created directly from the `SourceModule` tree vfs already built, in `ModuleId` push order (vfs always pushes a parent before loading any child, so a child's parent namespace always already exists). Every `ModuleDecl` field is set exactly once, here; nothing downstream ever writes one afterward. `super` is seeded per namespace in `create_module_namespace`.
-2. **Phase 1b — `pre_scan_item()`**: walks every top-level item and registers it into `builder.ast_nodes: Vec<AstEntry<'ast>>` (parse order; each entry holds `def_id`/`file_id`/`namespace`/`node`). A pure reader of `file_namespaces`. No type-checking. `sig_state` is then built from `ast_nodes` with exact capacity, all entries `Pending`.
-3. **Phase 2 — `ensure_signature(def_id)`**: called for every registered `DefId` in parse order. Demand-driven and re-entrant safe (guarded by `sig_state: HashMap<DefId, SigEntry>`, where `SigEntry` holds the `ast_nodes` index plus a `ComputeState`), so resolving one signature can pull in another on demand. Returns `SignatureStatus { Resolved, Cycle }` — cycle detection lives here, not in callers. `sig_stack` records in-progress frames in call order so E1032 can name the whole loop (`A -> B -> C -> A`). `export { .. }` resolves here as an ordinary `ast_nodes` entry.
-4. **`resolve_operator_traits()`** — resolves the fifteen `#[tag]`ged operator traits into `builder.operator_traits`, between Phases 2 and 3.
-5. **Phase 3 — `ensure_body(def_id)`**: evaluates function bodies for every registered `DefId`.
-6. **Phase 3.5 — `check_trait_conformance()`**: verifies every trait impl provides all required items, comparing signatures through `type_compare.rs`.
-7. **`report_unused_items()`**, then `finish()`.
-
-There is no Phase 4 — the old post-hoc export loop is gone.
-
-`ensure_signature` must have **no early `return` of its own**: every path out has to reach the unwind at the bottom, or the `DefId` is left `InProgress` forever and its `sig_stack` frame never pops, which would make every later cycle name items that finished resolving long ago. The `export` arm was extracted to `signature_export_block` for exactly this reason.
-
-### Trait-conformance comparison (`type_compare.rs`)
-
-Comparison runs against a `TypeEnvArena` addressed by a `Copy` `TypeEnvId`, so a resolver can build an environment and return a type still pointing into it. Both sides normalize through one `resolve_head`, then `project`. Two things this shape exists to prevent: an intermediate `Error`/`Infer` cascading a spurious signature mismatch on top of the diagnostic that already explains it, and the same interned `TypeIndex` reached under two different environments being taken as a fast-path match when it means different things on each side. `TypeDifferenceKind` is re-derived at render time via `classify`, not stored.
+**Old body checker (`tir/builder/`, disabled):** feature-sliced (`operators`, `calls`, `control`, `paths`, `traits`, …), each slice owning its `report_*` diagnostics; `type_compare.rs` did trait-conformance signature comparison. When porting a slice, move it onto `FunctionContext` rather than recreating a second declaration-query system.
 
 ## Type system
 
-Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first 18 slots are pre-interned by the hardcoded `vec![Type::Error, Type::Infer, ..., Type::Char]` literal in **`TypeInterner::new()` (`tir/mod.rs`)** — the reverse `index_lookup` is built by iterating over it — and MUST match the `TypeIndex` constants declared a little further down the same file. Never reorder them; add new pre-interned types at the end only.
+Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first 18 slots are pre-interned by the hardcoded `vec![Type::Infer, Type::Error, ..., Type::Char]` literal in **`TypeInterner::new()` (`tir/types.rs`)** — the reverse `index_lookup` is built by iterating over it — and MUST match the `TypeIndex` constants declared in the same file. Never reorder them; add new pre-interned types at the end only.
 
 | Constant  | Index |
 | --------- | ----- |
-| `ERROR`   | 0     |
-| `INFER`   | 1     |
+| `INFER`   | 0     |
+| `ERROR`   | 1     |
 | `UNIT`    | 2     |
 | `NEVER`   | 3     |
 | `INTEGER` | 4     |
@@ -217,7 +194,7 @@ Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first
 | `BOOL`    | 16    |
 | `CHAR`    | 17    |
 
-`INFER` is a type inference placeholder — used internally when a generic type argument cannot yet be determined, and will be the type of user-written `_` in type annotations. Must never reach MIR or codegen.
+`INFER` (slot 0) is a type inference placeholder — used internally when a generic type argument cannot yet be determined, and will be the type of user-written `_` in type annotations. Must never reach MIR or codegen.
 
 `char` is a primitive in TIR but lowers to `U32` in MIR and WASM.
 
@@ -268,28 +245,17 @@ String literals lower to a `&[u8]` slice aggregate `{ StaticPointer, len }`. Sta
 
 ## Testing patterns
 
-Tests live in `#[cfg(test)]` modules at the bottom of each source file. The `TestCase` helper in `tir/tests.rs` and `mir/tests.rs` constructs a `CompilationUnit` (which automatically includes the embedded stdlib) and runs the pipeline:
+Tests live in `#[cfg(test)]` modules at the bottom of each source file.
 
-```rust
-// TIR test
-let case = TestCase::new(indoc! { "fn add(a: i32, b: i32) -> i32 { a + b } export { add }" });
-assert_no_errors(&case);
-insta::assert_yaml_snapshot!(case.tir);
+**TIR (live):** the tests are inside `tir/signatures.rs` (and a few in `satisfaction.rs`). `TypeContext` borrows its inputs, so a test keeps them on its own stack through a macro: `test_case!(case = "fn f() {}")` (also `test_case!(mut case = …)` and `test_case!(case from <CompilationUnit>)`) declares the graph, `TestInputs` and a swept `TestCase` as three locals; `checked_case!` also asserts a clean parse and link. Read state through `case.context.<field>` (e.g. `case.context.functions`, `case.context.diagnostics`) and look items up with `case.resolve(..)`, which goes through real path resolution. The test source plays the stdlib's own role (`set_stdlib`), so a test that needs a primitive declares its own bodiless `pub type i32;`.
 
-// MIR test
-let case = TestCase::new(indoc! { "..." });
-assert_eq!(case.mir.functions.len(), 2);
-insta::assert_yaml_snapshot!(case.mir);
-
-// Multi-file TIR test
-let case = TestCase::new_multi_file("src/main.wx", "mod math;", &[("src/math.wx", "pub fn add() -> i32 { 1 }")]);
-```
+**Legacy (not compiled):** `tir/tests.rs`, `tir/snapshots/` and `mir/tests.rs` belong to the old pipeline and use `TestCase::new(..)` over a full `TIR`/`MIR`, with `insta` snapshots. They are the pattern to revive when those stages come back.
 
 Test sources do **not** need `use std::*;` — the implicit prelude covers it.
 
 `testing::DiagnosticView` is the shared vocabulary for diagnostic assertions: `assert_none`, `assert_no_errors`, `assert_error`, `assert_warning`, `assert_reported`, `assert_absent`, `assert_codes`, `assert_error_saying`. Prefer these over hand-rolled `matches!` or code-only checks — they render the offending source into the panic message and actually check severity, which a bare code comparison does not. `define_diagnostic_codes!` lives in `crate::diagnostics` and emits a `Code` trait impl, so one assertion accepts a code from any stage.
 
-Adoption is uneven, so follow the suite you're in. `ast/tests.rs` and `vfs/tests.rs` are migrated: their `TestCase` exposes `diagnostics() -> DiagnosticView<'_>`, used as `case.diagnostics().assert_error(DiagnosticCode::…)`. `tir/tests.rs` and `mir/tests.rs` still use a local free `assert_no_errors(&case)` helper plus direct checks against `case.tir.diagnostics`. New assertions in those two suites are worth writing against `DiagnosticView` (construct one with `DiagnosticView::new(stage, diagnostics, files)`) rather than extending the ad-hoc helpers.
+Adoption is uneven, so follow the suite you're in. `ast/tests.rs` and `vfs/tests.rs` are migrated: their `TestCase` exposes `diagnostics() -> DiagnosticView<'_>`, used as `case.diagnostics().assert_error(DiagnosticCode::…)`. The TIR suite's `TestCase::diagnostics()` also returns a `DiagnosticView`; the legacy `tir`/`mir` suites used a local free `assert_no_errors(&case)` helper. Write new assertions against `DiagnosticView` (construct one with `DiagnosticView::new(stage, diagnostics, files)`) rather than ad-hoc helpers.
 
 Prefer assertions that state the claim over snapshots. The parser suite deliberately keeps only two snapshots (`top_level_items`, `use_tree_forms`) — genuinely structural cases — and expresses everything else directly; a `shape()` helper renders an expression as an S-expression (`a + b * c` → `(+ a (* b c))`) so precedence assertions name the tree they expect. Note that a snapshot of a *broken* parse still passes unless the test also asserts no diagnostics first.
 
@@ -297,8 +263,12 @@ Snapshot files live in `src/<stage>/snapshots/`. Never edit `.snap` files by han
 
 ## Common pitfalls
 
-- **Pre-interned `TypeIndex` ordering:** never insert in the middle of the pre-interned `vec![...]` literal in `TypeInterner::new()` (`tir/mod.rs`) — every downstream type check silently gets wrong types. Add at the end only, and update the constants below it in the same file.
-- **`ensure_signature` re-entrancy and early returns:** guarded by `sig_state: HashMap<DefId, SigEntry>` (each entry carries a `ComputeState`); an in-progress state means a cycle. It returns `SignatureStatus` — handle `Cycle`, or say why you don't with `let _ = ... // reason`. Never add an early `return` to it; the `sig_stack` frame must be popped by the unwind at the bottom.
+- **Pre-interned `TypeIndex` ordering:** never insert in the middle of the pre-interned `vec![...]` literal in `TypeInterner::new()` (`tir/types.rs`) — every downstream type check silently gets wrong types. Add at the end only, and update the constants below it in the same file.
+- **`ensure_signature` re-entrancy and early returns:** guarded by `query_state: HashMap<DefId, QueryEntry>` (`QueryState::{Pending, InProgress, AwaitingChecks, Checking, Resolved, CycleReported}`); re-entering an `InProgress` query is a cycle. It returns `SignatureStatus` — handle `Cycle`, or say why you don't with `let _ = ... // reason`. The cached-state check returns before a frame is pushed; after that, add no early `return`, so the `query_stack` frame is always popped by the unwind at the bottom.
+- **Don't freeze or copy `TypeContext`:** it is the one live owner of type state through body checking. A frozen registry, a second type interner, or `Arc`/`unsafe` to let the owner and its borrowed inputs coexist were all considered and rejected (`notes/tir-type-context.md`).
+
+**The pitfalls below mostly describe the disabled `tir/builder/` and MIR and matter again when those are ported; the package-root-namespace invariant and `wx format` are the exceptions that still apply.**
+
 - **Cast checking is looser than it looks:** `are_scalar_compatible`/`WasmScalar` equivalence is the gatekeeper for `as` casts, not a numeric-only allowlist. Two known gaps, both documented at `tir/builder/literal.rs:301`: lossy casts like `u32 as char` pass, and **pointer casts only compare `memory`, not ownership — so `&T as *T` passes, silently defeating "a `&T` is always read-only"**. Fixing the second needs a real rework of `as`-cast checking (likely alongside whatever borrow-checking wx eventually gets), not a local patch.
 - **Privacy is enforced at namespace-lookup sites and struct fields, but not at method calls:** `is_accessible_from`/`is_entry_accessible_from`/`namespace_contains` (`tir/builder/modules.rs`) gate wildcard imports, qualified paths, `mod` declarations and `use` re-exports; `resolve_struct_field` (`tir/builder/aggregates.rs`) gates field access for all three sites that need it (object access, struct literal init, struct pattern destructuring). Method calls — `obj.method()` and `Type::method()`, both funnelling through `resolve_impl_member` (`tir/builder/calls.rs`) — are **not** gated, so a missing `pub` on an impl method does not block access. This is a missing call, not a missing mechanism: impl methods already carry a real `namespace`/`pub_span`. The one real gap is trait *default-body* methods (no impl override), which have no `pub_span` of their own and would need a fallback to the trait's own visibility, mirroring how `SymbolKind::TraitAssocType` already falls back to its trait.
   - Note the predicate renames: `is_ancestor_or_self` → `namespace_contains` (with the argument order the name implies), `visible_from` → `is_accessible_from`, `entry_visible_from` → `is_entry_accessible_from`.

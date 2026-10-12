@@ -26,7 +26,7 @@ use super::defs::{
 use super::impls::ImplTarget;
 use super::obligations::Obligation;
 use super::signatures::{
-	QueryInfo, SignatureBuilder, SignatureLocation, SignatureStatus,
+	QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
 };
 use super::types::{Type, TypeIndex};
 
@@ -189,7 +189,7 @@ pub(super) enum TraitImplLookup {
 	Abstract,
 }
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	/// Shared applicability and ambiguity search. Declaration identity and
 	/// implementation selection happen after this search completes.
 	pub(super) fn resolve_applicable_member(

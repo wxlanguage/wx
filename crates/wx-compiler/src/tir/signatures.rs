@@ -1,27 +1,19 @@
-//! Phase 2, first slice — generic-parameter declarations and their trait
-//! bounds: `<T: Add>` in `fn f<T: Add>(...)`, `struct S<T>`, `impl<T> ...`.
+//! Phase 2: declaration signatures, and the `TypeContext` that owns every
+//! piece of semantic type state.
 //!
-//! Type parameters live here, not in `defs.rs`, on purpose: unlike a
-//! struct/function/trait name, a type parameter is never reachable by a
-//! path written anywhere outside its own declaration — nobody writes
-//! `foo::T`. It's scoped to the item that declares it, exactly like a
-//! function parameter name, which was never a `defs.rs` citizen either.
+//! `TypeContext` borrows Phase 1's output (`defs`, strings, `ast_nodes`, impl
+//! dispatch) and owns the mutable state built on top of it: the type
+//! interner, bounds, scope frames, per-kind signature tables, and the query
+//! and obligation machinery behind `ensure_signature`. `sweep` forces every
+//! registered declaration; the context then stays live and mutable for
+//! later stages, which keep interning types into it rather than reading a
+//! frozen copy.
 //!
-//! A param's *identity* (name, resolved `TypeIndex`, and — once something
-//! needs it — where it's been referenced) and its *bounds* are split the
-//! same way the rest of this rewrite already splits identity from resolved
-//! semantics: identity lives in `TypeEnvArena` (see that type's doc
-//! comment), addressed by the `TypeEnvId` each signature struct carries;
-//! bounds are a resolved-signature fact, index-aligned with that same
-//! frame, and live on the signature struct itself. This mirrors
-//! `defs.rs`/`signatures.rs` joined by a stable index, not the "two
-//! redundant copies of one fact" shape this file used to warn against —
-//! identity and bounds aren't copies of each other, they're different
-//! facts about the same param.
-//!
-//! `defs.rs`'s own two previous exceptions — `TraitDef::self_param` and
-//! `TraitImplDef`/`InherentImplDef::type_params` — were removed in favor of
-//! this module for the same reason.
+//! A type parameter's *identity* lives in `TypeEnvArena` (addressed by the
+//! `TypeEnvIdx` each signature carries); its *bounds* are a resolved-signature
+//! fact in `param_bounds`, index-aligned with that frame. Parameters are not
+//! `defs.rs` citizens: nobody writes `foo::T`, so a parameter is only ever
+//! reachable from the item that declares it.
 
 use std::collections::HashMap;
 
@@ -63,7 +55,7 @@ use super::types::{
 /// beyond its own identity (which lives in `TypeEnvArena`, addressed by the
 /// same `(env, param_index)` pair; see that module's own doc comment for
 /// why the two are split apart rather than living on `TypeParam` directly).
-/// Stored in `SignatureBuilder::param_bounds`, index-aligned with
+/// Stored in `TypeContext::param_bounds`, index-aligned with
 /// `TypeEnvArena`'s own frames — one `Box<[ParamBounds]>` per frame,
 /// reserved for it by `reserve_param_bounds` right after, so the two arrays
 /// can never drift out of length.
@@ -91,9 +83,9 @@ impl ParamBounds {
 }
 
 /// One accepted bound occurrence, decided once by
-/// `SignatureBuilder::collect_bound_occurrences` and shared by both the
+/// `TypeContext::collect_bound_occurrences` and shared by both the
 /// provisional-membership builder (`provisional_from_occurrences`) and the
-/// source-bound resolver (`SignatureBuilder::fill_source_bounds`),
+/// source-bound resolver (`TypeContext::fill_source_bounds`),
 /// so the two cannot disagree about which occurrences exist.
 struct BoundOccurrence<'expr> {
 	id: BoundId,
@@ -302,7 +294,7 @@ impl InferSignatureKind {
 enum InferPolicy {
 	Reject(InferSignatureKind),
 	/// Used by type-resolution contexts that can infer a written `_`.
-	#[allow(dead_code)] // No such caller in the signature registry yet.
+	#[allow(dead_code)] // No such caller yet.
 	Allow,
 }
 
@@ -314,137 +306,42 @@ pub enum ExportedItem {
 	Memory(MemoryIdx),
 }
 
-pub struct SignatureRegistry {
-	/// Resolved, exportable targets keyed by decoded external name.
-	pub exports: HashMap<SymbolU32, ExportedItem>,
-	pub type_aliases: Vec<TypeAliasSignature>,
-	/// Indexed by the same `TraitIndex` `defs.traits` already uses — traits
-	/// need no index space of their own here, unlike `type_aliases`, since
-	/// Phase 1 already has one.
-	pub traits: Vec<TraitSignature>,
-	/// Indexed by the same `StructIndex` `defs.structs` already uses — see
-	/// `traits`.
-	pub structs: Vec<StructSignature>,
-	/// Indexed by the same `EnumIndex` `defs.enums` already uses — see
-	/// `traits`.
-	pub enums: Vec<EnumSignature>,
-	/// Indexed by the same `TypeSetIndex` `defs.typesets` already uses —
-	/// see `traits`.
-	pub typesets: Vec<TypeSetSignature>,
-	/// Indexed by `defs::AssocTypeIdx`. Trait declarations hold bounds;
-	/// distinct impl-provider slots hold their resolved values.
-	pub assoc_types: Vec<Option<AssocTypeSignature>>,
-	pub functions: Vec<FunctionSignature>,
-	/// Index-aligned with `defs.constants`. Free, trait, and impl constants
-	/// all require an explicit type annotation.
-	pub constants: Vec<ConstantSignature>,
-	/// Index-aligned with the corresponding `defs.rs` impl arenas. A slot is
-	/// `None` until its header query completes, even if that query later
-	/// recovers with `TypeIndex::ERROR` or an unresolved trait path.
-	pub inherent_impls: Vec<Option<InherentImplSignature>>,
-	pub trait_impls: Vec<Option<TraitImplSignature>>,
-	pub(super) impl_dispatch: ImplDispatch,
-	pub types: TypeInterner,
-	pub(super) bounds: BoundArena,
-	/// Preserves lexical scope ancestry and parameter ownership after building.
-	pub(super) type_envs: TypeEnvArena,
-	/// See `SignatureBuilder::param_bounds`.
-	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
-	/// Derived once, here, from `SignatureBuilder::query_state` — every
-	/// entry is `Resolved` by construction: `build`'s declaration sweep
-	/// forces every `ast_nodes` entry and resumes checks deferred during
-	/// recursive construction. This is a straight
-	/// `DefId -> SignatureLocation` projection, not a filter. No production
-	/// code needs a `DefId`-keyed reverse lookup once building is over
-	/// (every real consumer already holds the index it wants by then) —
-	/// this exists for tests, which only ever have a path they've resolved
-	/// to a `DefId`, never the index.
-	pub item_lookup: HashMap<DefId, SignatureLocation>,
-}
-
-impl SignatureRegistry {
-	fn build<'ctx>(
-		diagnostics: &mut Vec<Diagnostic<FileId>>,
-		strings: &StringInterner,
-		defs: &DefinitionRegistry,
-		ast_nodes: &[AstEntry<'ctx>],
-	) -> Self {
-		let impl_dispatch =
-			ImplDispatch::build(diagnostics, strings, defs, ast_nodes);
-		let mut builder = SignatureBuilder::new(
-			diagnostics,
-			strings,
-			defs,
-			ast_nodes,
-			&impl_dispatch,
-		);
-		// Dispatch is complete before any signature query can resolve a
-		// concrete member. Impl parameter bounds are resolved here along
-		// with all other signatures, without an earlier header query.
+impl TypeContext<'_, '_, '_> {
+	/// Forces every registered declaration, then resolves the export block.
+	/// Impl dispatch is complete before this runs, so no signature query can
+	/// meet an unindexed member. Impl parameter bounds are resolved here with
+	/// every other signature, without an earlier header query.
+	///
+	/// Afterwards every query is `Resolved` and nothing is deferred; the
+	/// context stays live and mutable for body checking.
+	pub(super) fn sweep(&mut self) {
+		let ast_nodes = self.ast_nodes;
 		for entry in ast_nodes {
-			let _ = builder.ensure_signature(QueryInfo {
+			let _ = self.ensure_signature(QueryInfo {
 				def_id: entry.def_id,
 				requested_at: None,
 			});
 		}
-		builder.obligations.assert_drained();
-
-		let exports = builder.resolve_exports();
-		// Release the builder's read-only dispatch borrow before moving the
-		// completed dispatch into the finished registry.
-		let SignatureBuilder {
-			type_aliases,
-			traits,
-			structs,
-			enums,
-			typesets,
-			assoc_types,
-			functions,
-			constants,
-			inherent_impls,
-			trait_impls,
-			types,
-			bounds,
-			type_envs,
-			param_bounds,
-			query_state,
-			..
-		} = builder;
-
-		Self {
-			exports,
-			type_aliases,
-			traits,
-			structs,
-			enums,
-			typesets,
-			assoc_types,
-			functions,
-			constants,
-			inherent_impls,
-			trait_impls,
-			impl_dispatch,
-			types,
-			bounds,
-			type_envs,
-			param_bounds,
-			item_lookup: query_state
-				.into_iter()
-				.map(|(def_id, entry)| {
-					let QueryState::Resolved(location) = entry.state else {
-						unreachable!(
-							"build()'s own sweep visits every ast_nodes entry, so every query_state entry is Resolved by the time this runs"
-						)
-					};
-					debug_assert!(entry.deferred.is_none());
-					(def_id, location)
-				})
-				.collect(),
-		}
+		self.obligations.assert_drained();
+		self.exports = self.resolve_exports();
+		debug_assert!(self.query_state.values().all(|entry| {
+			entry.deferred.is_none()
+				&& matches!(entry.state, QueryState::Resolved(_))
+		}));
 	}
-}
 
-impl SignatureBuilder<'_, '_, '_> {
+	#[cfg(test)]
+	pub(super) fn signature_location(
+		&self,
+		def_id: DefId,
+	) -> SignatureLocation {
+		let QueryState::Resolved(location) = self.query_state[&def_id].state
+		else {
+			unreachable!("`sweep` leaves every query resolved")
+		};
+		location
+	}
+
 	/// All declaration signatures are available; only the selected crate's entries remain.
 	fn resolve_exports(&mut self) -> HashMap<SymbolU32, ExportedItem> {
 		let mut exports = HashMap::with_capacity(self.defs.exports.len());
@@ -568,7 +465,7 @@ enum QueryState {
 	Checking(SignatureLocation),
 }
 
-/// `ast_index` is this `DefId`'s position in `SignatureBuilder::ast_nodes`
+/// `ast_index` is this `DefId`'s position in `TypeContext::ast_nodes`
 /// — set once, at construction, from `defs.rs`'s parse-order record, so
 /// `ensure_signature` never needs a second lookup to find the AST it's
 /// supposed to resolve.
@@ -605,9 +502,9 @@ enum BoundSubject {
 	Assoc(AssocTypeIdx),
 }
 
-/// The Phase 2 driver. Holds `defs` — Phase 1's finished output, read-only
-/// from here on — plus whatever this phase needs on top of it.
-pub(super) struct SignatureBuilder<'ast, 'ctx, 'dispatch> {
+/// The semantic type context: Phase 1's read-only output plus all mutable
+/// type state. See the module doc; there is no separate finished form.
+pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	pub(super) strings: &'ctx StringInterner,
 	pub(super) defs: &'ctx DefinitionRegistry,
@@ -642,11 +539,13 @@ pub(super) struct SignatureBuilder<'ast, 'ctx, 'dispatch> {
 	pub(super) constants: Vec<ConstantSignature>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
+	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
+	pub exports: HashMap<SymbolU32, ExportedItem>,
 	/// Built before the signature sweep and never mutated by its queries.
 	pub(super) impl_dispatch: &'dispatch ImplDispatch,
 }
 
-impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
+impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		strings: &'ctx StringInterner,
@@ -750,6 +649,7 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 				.collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
+			exports: HashMap::new(),
 			impl_dispatch,
 		}
 	}
@@ -1164,14 +1064,12 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 
 	/// `def_id`'s own `AstNodeRef` — `defs.rs`'s output, so this is pure
 	/// identity: reading it never forces `ensure_signature` and is valid
-	/// the moment `SignatureBuilder` exists, before any query has run at
+	/// the moment `TypeContext` exists, before any query has run at
 	/// all. This is how a pre-seeded kind's own index
 	/// (`AstNodeRef::Trait { trait_index, .. }` and friends) is read
 	/// without forcing that item's signature — the six pre-seeded kinds no
-	/// longer get an early `SignatureLocation` seeded into `query_state`
-	/// the way they briefly got one seeded into the old, separate
-	/// `item_lookup` map; they get this instead, which was already sitting
-	/// there.
+	/// longer get an early `SignatureLocation` seeded into `query_state`;
+	/// they get this instead, which was already sitting there.
 	pub(super) fn ast_node(&self, def_id: DefId) -> &AstNodeRef<'ast> {
 		&self.ast_nodes[self.query_state[&def_id].ast_index as usize].node
 	}
@@ -4031,7 +3929,7 @@ impl<'ast, 'ctx, 'dispatch> SignatureBuilder<'ast, 'ctx, 'dispatch> {
 /// The written name of `def_id`'s own declaration — reads Phase 1's prescan
 /// record directly, since this needs to work even for an item that hasn't
 /// finished resolving yet (a cycle's participants never do), or, in
-/// `SignatureBuilder::new`'s primitive pre-pass, before a `SignatureBuilder`
+/// `TypeContext::new`'s primitive pre-pass, before a `TypeContext`
 /// exists at all to call a method on.
 fn item_name(ast_nodes: &[AstEntry], ast_index: u32) -> Spanned<SymbolU32> {
 	match ast_nodes[ast_index as usize].node.clone() {
@@ -4301,6 +4199,28 @@ pub(super) mod tests {
 	use crate::tir::impls::ImplTarget;
 	use crate::vfs;
 
+	/// `test_case!(case = "source")` / `test_case!(mut case = ..)` /
+	/// `test_case!(case from graph)` declare the graph, inputs and swept
+	/// `TestCase` borrowing them as three locals of the calling test.
+	macro_rules! test_case {
+		($case:ident = $source:expr $(,)?) => {
+			test_case!($case from source_graph($source));
+		};
+		(mut $case:ident = $source:expr $(,)?) => {
+			test_case!(mut $case from source_graph($source));
+		};
+		($case:ident from $graph:expr) => {
+			let mut graph = $graph;
+			let mut inputs = TestInputs::new(&mut graph);
+			let $case = TestCase::new(&mut inputs);
+		};
+		(mut $case:ident from $graph:expr) => {
+			let mut graph = $graph;
+			let mut inputs = TestInputs::new(&mut graph);
+			let mut $case = TestCase::new(&mut inputs);
+		};
+	}
+
 	mod assumption_context {
 		use super::*;
 		use crate::tir::assumptions::{
@@ -4310,7 +4230,7 @@ pub(super) mod tests {
 		use crate::tir::types::Substitution;
 
 		fn memberships(
-			signatures: &mut SignatureRegistry,
+			signatures: &mut TypeContext<'_, '_, '_>,
 			scope: TypeEnvIdx,
 		) -> (Readiness, Vec<(TypeIndex, TraitIdx, TraitAssumptionSource)>) {
 			let (reader, types) = signatures.assumptions();
@@ -4351,7 +4271,7 @@ pub(super) mod tests {
 					_ => None,
 				})
 				.unwrap();
-			case.signatures.types.intern(Type::AssocTypeProjection {
+			case.context.types.intern(Type::AssocTypeProjection {
 				base,
 				trait_index,
 				assoc_type_index,
@@ -4360,7 +4280,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn scopes_preserve_outer_parameters_and_exclude_siblings() {
-			let mut case = TestCase::new(indoc! {"
+			test_case!(mut case = indoc! {"
 				trait Outer {}
 				trait Local {}
 				trait Other {}
@@ -4372,16 +4292,17 @@ pub(super) mod tests {
 				}
 				fn unrelated<V: Other>() {}
 			"});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let outer = case.trait_index("Outer");
 			let local = case.trait_index("Local");
 			let other = case.trait_index("Other");
-			let outer_scope = case.signatures.inherent_impls[0]
-				.as_ref()
-				.unwrap()
-				.type_params;
-			let outer_param =
-				case.signatures.type_envs.frame(outer_scope)[0].ty;
+			let outer_scope =
+				case.context.inherent_impls[0].as_ref().unwrap().type_params;
+			let outer_param = case.context.type_envs.frame(outer_scope)[0].ty;
 			for (name, own_trait) in [
 				("local", Some(local)),
 				("sibling", Some(other)),
@@ -4395,11 +4316,10 @@ pub(super) mod tests {
 					.iter()
 					.position(|function| function.name.inner == name_symbol)
 					.unwrap();
-				let scope = case.signatures.functions[index].type_params;
+				let scope = case.context.functions[index].type_params;
 				let own_param = own_trait
-					.map(|_| case.signatures.type_envs.frame(scope)[0].ty);
-				let (readiness, facts) =
-					memberships(&mut case.signatures, scope);
+					.map(|_| case.context.type_envs.frame(scope)[0].ty);
+				let (readiness, facts) = memberships(&mut case.context, scope);
 				assert_eq!(readiness, Readiness::Ready);
 				let actual: Vec<_> = facts
 					.iter()
@@ -4420,14 +4340,14 @@ pub(super) mod tests {
 				}
 			}
 			let (readiness, facts) =
-				memberships(&mut case.signatures, TypeEnvIdx::ROOT);
+				memberships(&mut case.context, TypeEnvIdx::ROOT);
 			assert_eq!(readiness, Readiness::Ready);
 			assert!(facts.is_empty());
 		}
 
 		#[test]
 		fn inherited_and_nested_facts_keep_subjects_and_provenance() {
-			let mut case = TestCase::new(indoc! {"
+			test_case!(mut case = indoc! {"
 				type i32;
 				trait Leaf {}
 				trait Inner: Leaf { type Value; }
@@ -4436,9 +4356,13 @@ pub(super) mod tests {
 				trait Final: Base {}
 				fn f<T: Final + Outer where { Other: Leaf }>() {}
 			"});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.signatures.type_envs.frame(scope)[0].ty;
+			let base = case.context.type_envs.frame(scope)[0].ty;
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let other = projection(&mut case, base, "Outer", "Other");
@@ -4450,7 +4374,7 @@ pub(super) mod tests {
 				(item, case.trait_index("Leaf")),
 				(other, case.trait_index("Leaf")),
 			];
-			let (readiness, traits) = memberships(&mut case.signatures, scope);
+			let (readiness, traits) = memberships(&mut case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(traits.len(), expected.len());
 			for &(subject, trait_index) in &expected {
@@ -4464,12 +4388,12 @@ pub(super) mod tests {
 					panic!("written/inherited bound expected");
 				};
 				assert_eq!(
-					case.signatures.bounds.trait_index(source),
+					case.context.bounds.trait_index(source),
 					trait_index
 				);
 			}
 			let equalities = {
-				let (reader, types) = case.signatures.assumptions();
+				let (reader, types) = case.context.assumptions();
 				let mut cursor =
 					reader.scoped_facts(AssumptionContext::new(scope), types);
 				let mut equalities = Vec::new();
@@ -4489,7 +4413,7 @@ pub(super) mod tests {
 			assert_eq!(subject, value);
 			assert_eq!(equality.value, TypeIndex::I32);
 			assert!(
-				matches!(case.signatures.bounds.binding(equality.source).kind,
+				matches!(case.context.bounds.binding(equality.source).kind,
 				BindingRequirement::Equals(value) if value.inner == TypeIndex::I32)
 			);
 		}
@@ -4497,24 +4421,27 @@ pub(super) mod tests {
 		#[test]
 		fn associated_declaration_facts_preserve_self_through_nested_requirements()
 		 {
-			let mut case = TestCase::new(indoc! {"
+			test_case!(mut case = indoc! {"
 				trait Deep { type Output; }
 				trait Inner { type Value; }
 				trait Outer { type Item: Inner where { Value: Deep where { Output = Self } }; }
 				fn f<T: Outer>() {}
 			"});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.signatures.type_envs.frame(scope)[0].ty;
+			let base = case.context.type_envs.frame(scope)[0].ty;
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let output = projection(&mut case, value, "Deep", "Output");
 			let inner = case.trait_index("Inner");
 			let deep = case.trait_index("Deep");
-			let outer_env = case.signatures.traits
-				[usize::from(case.trait_index("Outer"))]
-			.env;
-			let (reader, types) = case.signatures.assumptions();
+			let outer_env =
+				case.context.traits[usize::from(case.trait_index("Outer"))].env;
+			let (reader, types) = case.context.assumptions();
 			let mut facts = reader.subject_facts(item, types, 128);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut traits = Vec::new();
@@ -4552,14 +4479,13 @@ pub(super) mod tests {
 
 		#[test]
 		fn implicit_trait_self_has_an_explicit_origin() {
-			let mut case =
-				TestCase::new("trait Parent {} trait Child: Parent {}");
-			assert!(case.diagnostics.is_empty());
+			test_case!(mut case = "trait Parent {} trait Child: Parent {}");
+			assert!(case.context.diagnostics.is_empty());
 			let child = case.trait_index("Child");
 			let parent = case.trait_index("Parent");
-			let scope = case.signatures.traits[usize::from(child)].env;
-			let subject = case.signatures.type_envs.frame(scope)[0].ty;
-			let (readiness, facts) = memberships(&mut case.signatures, scope);
+			let scope = case.context.traits[usize::from(child)].env;
+			let subject = case.context.type_envs.frame(scope)[0].ty;
+			let (readiness, facts) = memberships(&mut case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(facts.len(), 2);
 			assert_eq!(
@@ -4573,31 +4499,31 @@ pub(super) mod tests {
 
 		#[test]
 		fn equality_alternatives_and_conflicts_remain_distinct() {
-			let mut case = TestCase::new(indoc! {"
+			test_case!(mut case = indoc! {"
 				type i32; type u32;
 				trait Value { type Item; }
 				fn ambiguous<T: Value where { Item = U } + Value where { Item = V }, U, V>() {}
 				fn conflicting<T: Value where { Item = i32 } + Value where { Item = u32 }>() {}
 			"});
-			assert_eq!(case.diagnostics.len(), 1);
+			assert_eq!(case.context.diagnostics.len(), 1);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 			);
 			for name in ["ambiguous", "conflicting"] {
 				let scope = case.function_signature(name).type_params;
-				let base = case.signatures.type_envs.frame(scope)[0].ty;
+				let base = case.context.type_envs.frame(scope)[0].ty;
 				let expected_subject =
 					projection(&mut case, base, "Value", "Item");
 				let expected_values: Vec<_> = case
-					.signatures
+					.context
 					.type_envs
 					.frame(scope)
 					.iter()
 					.skip(1)
 					.map(|param| param.ty)
 					.collect();
-				let (reader, types) = case.signatures.assumptions();
+				let (reader, types) = case.context.assumptions();
 				let mut facts =
 					reader.scoped_facts(AssumptionContext::new(scope), types);
 				assert_eq!(facts.readiness, Readiness::Ready);
@@ -4805,18 +4731,18 @@ pub(super) mod tests {
 
 		#[test]
 		fn recursive_declarations_are_read_along_finite_subject_paths() {
-			let mut case = TestCase::new(
+			test_case!(mut case =
 				"trait Node { type Next: Node; } fn f<T: Node>() {}",
 			);
-			assert!(case.diagnostics.is_empty());
+			assert!(case.context.diagnostics.is_empty());
 			let scope = case.function_signature("f").type_params;
-			let base = case.signatures.type_envs.frame(scope)[0].ty;
+			let base = case.context.type_envs.frame(scope)[0].ty;
 			let next = projection(&mut case, base, "Node", "Next");
 			let next_next = projection(&mut case, next, "Node", "Next");
-			let (readiness, facts) = memberships(&mut case.signatures, scope);
+			let (readiness, facts) = memberships(&mut case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(facts.len(), 1);
-			let (reader, types) = case.signatures.assumptions();
+			let (reader, types) = case.context.assumptions();
 			for subject in [next, next_next] {
 				let mut facts = reader.subject_facts(subject, types, 128);
 				assert_eq!(facts.readiness, Readiness::Ready);
@@ -4837,7 +4763,7 @@ pub(super) mod tests {
 	/// Stops before the signature sweep so tests can exercise demand order.
 	pub(in crate::tir) fn with_pending_signatures(
 		source: &str,
-		check: impl FnOnce(&mut SignatureBuilder<'_, '_, '_>),
+		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
 	) {
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		let root = builder
@@ -4880,7 +4806,7 @@ pub(super) mod tests {
 		);
 		DiagnosticView::new("prescan/dispatch", &diagnostics, &graph.files)
 			.assert_none();
-		check(&mut SignatureBuilder::new(
+		check(&mut TypeContext::new(
 			&mut diagnostics,
 			&graph.strings,
 			&defs,
@@ -4890,7 +4816,7 @@ pub(super) mod tests {
 	}
 
 	fn pending_provider(
-		builder: &mut SignatureBuilder<'_, '_, '_>,
+		builder: &mut TypeContext<'_, '_, '_>,
 		receiver: TypeIndex,
 		name: &str,
 	) -> (AssocTypeIdx, AssocTypeIdx, SourceSpan) {
@@ -4968,46 +4894,48 @@ pub(super) mod tests {
 		(declaration, provider, reference)
 	}
 
-	/// Drives the real pipeline — parse, prescan, resolve — and keeps only
-	/// what a test needs to check afterward. AST entries are borrowed during
-	/// construction; the owned registries have no lifetime tied to the AST.
-	struct TestCase {
-		graph: vfs::CompilationUnit,
-		defs: DefinitionRegistry,
-		diagnostics: Vec<Diagnostic<FileId>>,
-		signatures: SignatureRegistry,
+	/// Parses `source` as a single-file binary playing the stdlib's own role
+	/// (`set_stdlib`, the same mechanism a real `"type": "std"` package
+	/// uses) instead of loading the real ~250-line embedded stdlib:
+	/// `sweep` isn't selective about which item kinds it drives, so any real
+	/// stdlib content — including item kinds and members whose signatures
+	/// are not implemented yet — would panic before a test even runs. A test
+	/// that needs a primitive declares its own bodiless `pub type i32;` — no
+	/// `#[intrinsic]` marker required, recognition is implicit for a
+	/// reserved name declared in whichever package is `stdlib_package`
+	/// (see `defs.rs`'s own doc comment on `intrinsics`) — so this still
+	/// works the same way it would for the real thing.
+	fn source_graph(source: &str) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(
+					std::collections::HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)]),
+				),
+			)
+			.unwrap();
+		builder.set_stdlib(root_id);
+		builder.build(root_id)
 	}
 
-	impl TestCase {
-		/// `source` plays the stdlib's own role (`set_stdlib`, the same
-		/// mechanism a real `"type": "std"` package uses) instead of loading
-		/// the real ~250-line embedded stdlib: `ensure_all_signatures` isn't
-		/// selective about which item kinds it drives, so any real stdlib
-		/// content — including item kinds and members whose signatures are
-		/// not implemented yet — would panic before a test even runs. A test
-		/// that needs a primitive declares its own bodiless `pub type i32;` — no
-		/// `#[intrinsic]` marker required, recognition is implicit for a
-		/// reserved name declared in whichever package is `stdlib_package`
-		/// (see `defs.rs`'s own doc comment on `intrinsics`) — so this still
-		/// works the same way it would for the real thing.
-		fn new(source: &str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
-			let root_id = builder
-				.load_binary(
-					vfs::AbsolutePath::new("/main.wx"),
-					&vfs::VirtualFileSource::from_relative(
-						std::collections::HashMap::from([(
-							"main.wx".to_string(),
-							source.to_string(),
-						)]),
-					),
-				)
-				.unwrap();
-			builder.set_stdlib(root_id);
-			Self::from_graph(builder.build(root_id))
-		}
+	/// Everything a `TypeContext` borrows. The context cannot own these —
+	/// `ast_nodes` borrow the graph's packages — so a test keeps them on its
+	/// own stack, declared before the `TestCase` that borrows them, which
+	/// `test_case!` spells out in one line.
+	struct TestInputs<'g> {
+		graph: &'g vfs::CompilationUnit,
+		defs: DefinitionRegistry,
+		ast_nodes: Vec<AstEntry<'g>>,
+		impl_dispatch: ImplDispatch,
+		diagnostics: Vec<Diagnostic<FileId>>,
+	}
 
-		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+	impl<'g> TestInputs<'g> {
+		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
 			let mut diagnostics = Vec::new();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
@@ -5017,19 +4945,52 @@ pub(super) mod tests {
 				graph.stdlib_package,
 				graph.root_package,
 			);
-
-			let signatures = SignatureRegistry::build(
+			let graph = &*graph;
+			let impl_dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&graph.strings,
 				&defs,
 				&ast_nodes,
 			);
-
-			TestCase {
+			Self {
 				graph,
 				defs,
+				ast_nodes,
+				impl_dispatch,
 				diagnostics,
-				signatures,
+			}
+		}
+	}
+
+	/// A live, fully swept `TypeContext` over `TestInputs`, plus the graph
+	/// and definitions tests read alongside it.
+	struct TestCase<'a> {
+		graph: &'a vfs::CompilationUnit,
+		defs: &'a DefinitionRegistry,
+		context: TypeContext<'a, 'a, 'a>,
+	}
+
+	impl<'a> TestCase<'a> {
+		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
+			let TestInputs {
+				graph,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+				diagnostics,
+			} = inputs;
+			let mut context = TypeContext::new(
+				diagnostics,
+				&graph.strings,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+			);
+			context.sweep();
+			Self {
+				graph,
+				defs,
+				context,
 			}
 		}
 
@@ -5090,11 +5051,11 @@ pub(super) mod tests {
 		/// The written clause excludes the implicit `Self: ThisTrait` bound.
 		fn trait_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
 			let env =
-				self.signatures.traits[usize::from(self.trait_index(path))].env;
-			self.signatures.param_bounds[usize::from(env)][0]
+				self.context.traits[usize::from(self.trait_index(path))].env;
+			self.context.param_bounds[usize::from(env)][0]
 				.declared_bounds
 				.iter()
-				.map(|&id| self.signatures.bounds.get(id))
+				.map(|&id| self.context.bounds.get(id))
 				.collect()
 		}
 
@@ -5110,13 +5071,13 @@ pub(super) mod tests {
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new(
 				"siganture",
-				&self.diagnostics,
+				&self.context.diagnostics,
 				&self.graph.files,
 			)
 		}
 
 		fn typeset_signature(&self, path: &str) -> &TypeSetSignature {
-			&self.signatures.typesets[usize::from(self.typeset_index(path))]
+			&self.context.typesets[usize::from(self.typeset_index(path))]
 		}
 
 		/// The `TraitIndex` of `path`'s compiler-generated backing trait —
@@ -5128,13 +5089,13 @@ pub(super) mod tests {
 
 		/// See `trait_supertraits` — only the written clause.
 		fn typeset_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
-			let env = self.signatures.traits
+			let env = self.context.traits
 				[usize::from(self.typeset_trait_index(path))]
 			.env;
-			self.signatures.param_bounds[usize::from(env)][0]
+			self.context.param_bounds[usize::from(env)][0]
 				.declared_bounds
 				.iter()
-				.map(|&id| self.signatures.bounds.get(id))
+				.map(|&id| self.context.bounds.get(id))
 				.collect()
 		}
 
@@ -5165,7 +5126,7 @@ pub(super) mod tests {
 			let MemberKind::AssociatedType(index) = member.kind else {
 				panic!("expected `{name}` to be an associated type");
 			};
-			self.signatures.assoc_types[usize::from(index)]
+			self.context.assoc_types[usize::from(index)]
 				.as_ref()
 				.expect("trait associated type signature is resolved")
 		}
@@ -5199,7 +5160,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{name}` to be a function");
 			};
-			&self.signatures.functions[usize::from(index)]
+			&self.context.functions[usize::from(index)]
 		}
 
 		fn trait_const_signature(
@@ -5224,7 +5185,7 @@ pub(super) mod tests {
 			let MemberKind::Constant(index) = member.kind else {
 				panic!("expected `{name}` to be a const");
 			};
-			&self.signatures.constants[usize::from(index)]
+			&self.context.constants[usize::from(index)]
 		}
 
 		fn trait_impl_index(
@@ -5234,7 +5195,8 @@ pub(super) mod tests {
 		) -> TraitImplIdx {
 			let trait_index = self.trait_index(trait_path);
 			let target = ImplTarget::Struct(self.struct_index(struct_path));
-			self.signatures
+			self.context
+				.impl_dispatch
 				.trait_candidates(target)
 				.iter()
 				.find(|&&(index, _)| index == trait_index)
@@ -5267,7 +5229,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected a function");
 			};
-			&self.signatures.functions[usize::from(index)]
+			&self.context.functions[usize::from(index)]
 		}
 
 		fn trait_impl_const_signature(
@@ -5281,7 +5243,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected a constant");
 			};
-			&self.signatures.constants[usize::from(index)]
+			&self.context.constants[usize::from(index)]
 		}
 
 		/// The `InherentImplIdx` of `struct_path`'s own (single, in these
@@ -5289,7 +5251,7 @@ pub(super) mod tests {
 		/// would at a method call site.
 		fn inherent_impl_index(&self, struct_path: &str) -> InherentImplIdx {
 			let target = ImplTarget::Struct(self.struct_index(struct_path));
-			self.signatures.impl_dispatch.inherent_candidates(target)[0]
+			self.context.impl_dispatch.inherent_candidates(target)[0]
 		}
 
 		fn inherent_function_signature(
@@ -5318,7 +5280,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{name}` to be a function");
 			};
-			&self.signatures.functions[usize::from(index)]
+			&self.context.functions[usize::from(index)]
 		}
 
 		fn inherent_const_signature(
@@ -5343,7 +5305,7 @@ pub(super) mod tests {
 			let MemberKind::Constant(index) = member.kind else {
 				panic!("expected `{name}` to be a const");
 			};
-			&self.signatures.constants[usize::from(index)]
+			&self.context.constants[usize::from(index)]
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
@@ -5352,11 +5314,11 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{path}` to be a type alias");
 			};
-			&self.signatures.type_aliases[usize::from(index)]
+			&self.context.type_aliases[usize::from(index)]
 		}
 
 		fn struct_signature(&self, path: &str) -> &StructSignature {
-			&self.signatures.structs[usize::from(self.struct_index(path))]
+			&self.context.structs[usize::from(self.struct_index(path))]
 		}
 
 		fn struct_index(&self, path: &str) -> StructIdx {
@@ -5374,7 +5336,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{path}` to be an enum");
 			};
-			&self.signatures.enums[usize::from(enum_index)]
+			&self.context.enums[usize::from(enum_index)]
 		}
 
 		fn constant_signature(&self, path: &str) -> &ConstantSignature {
@@ -5383,7 +5345,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{path}` to be a constant");
 			};
-			&self.signatures.constants[usize::from(index)]
+			&self.context.constants[usize::from(index)]
 		}
 
 		fn function_signature(&self, path: &str) -> &FunctionSignature {
@@ -5392,34 +5354,38 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{path}` to be a function");
 			};
-			&self.signatures.functions[usize::from(index)]
+			&self.context.functions[usize::from(index)]
 		}
 
 		/// The one-hop declared bounds on generic parameter `param_index` of
 		/// whichever item owns `env` — bounds no longer live on the
-		/// signature struct itself, see `SignatureBuilder::param_bounds`.
+		/// signature struct itself, see `TypeContext::param_bounds`.
 		fn declared_bounds(
 			&self,
 			env: TypeEnvIdx,
 			param_index: u32,
 		) -> Vec<&SourceTraitBound> {
-			self.signatures.param_bounds[usize::from(env)][param_index as usize]
+			self.context.param_bounds[usize::from(env)][param_index as usize]
 				.declared_bounds
 				.iter()
-				.map(|&id| self.signatures.bounds.get(id))
+				.map(|&id| self.context.bounds.get(id))
 				.collect()
 		}
 
 		fn param_count(&self, env: TypeEnvIdx) -> usize {
-			self.signatures.param_bounds[usize::from(env)].len()
+			self.context.param_bounds[usize::from(env)].len()
 		}
 	}
 
 	#[test]
 	fn unbounded_params_resolve_with_no_diagnostics() {
-		let case = TestCase::new("type A<T, U> = T;");
+		test_case!(case = "type A<T, U> = T;");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.type_alias("A").type_params;
 		assert_eq!(case.param_count(env), 2);
 		assert!((0..2).all(|i| case.declared_bounds(env, i).is_empty()));
@@ -5428,12 +5394,17 @@ pub(super) mod tests {
 	#[test]
 	fn written_infer_in_an_alias_is_reported_at_its_own_span_once() {
 		let source = "type B = A; type A = _;";
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
 		assert_eq!(case.type_alias("A").target, TypeIndex::ERROR);
 		assert_eq!(case.type_alias("B").target, TypeIndex::ERROR);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		let diagnostic = &case.diagnostics[0];
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		let diagnostic = &case.context.diagnostics[0];
 		assert_eq!(
 			diagnostic.code.as_deref(),
 			Some(DiagnosticCode::InferInSignature.code())
@@ -5452,18 +5423,24 @@ pub(super) mod tests {
 
 	#[test]
 	fn function_type_ignores_parameter_names_for_identity() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type bool;
 			type Named = fn(x: i32, y: bool) -> i32;
 			type Unnamed = fn(i32, bool) -> i32;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let named = case.type_alias("Named").target;
 		assert_eq!(named, case.type_alias("Unnamed").target);
 		assert!(matches!(
-			case.signatures.types.resolve(named),
+			case.context.types.resolve(named),
 			Type::Function { params, result }
 				if params.as_ref() == [TypeIndex::I32, TypeIndex::BOOL]
 					&& *result == TypeIndex::I32
@@ -5472,25 +5449,29 @@ pub(super) mod tests {
 
 	#[test]
 	fn nested_function_type_uses_generic_scope_and_defaults_to_unit() {
-		let case = TestCase::new("type Callback<T> = fn(T) -> fn();");
+		test_case!(case = "type Callback<T> = fn(T) -> fn();");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let alias = case.type_alias("Callback");
 		let Type::Function { params, result } =
-			case.signatures.types.resolve(alias.target)
+			case.context.types.resolve(alias.target)
 		else {
 			panic!("expected outer function type");
 		};
 		assert_eq!(params.len(), 1);
 		assert_eq!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			&Type::TypeParam {
 				env: alias.type_params,
 				param_index: 0,
 			}
 		);
 		assert!(matches!(
-			case.signatures.types.resolve(*result),
+			case.context.types.resolve(*result),
 			Type::Function { params, result }
 				if params.is_empty() && *result == TypeIndex::UNIT
 		));
@@ -5499,11 +5480,16 @@ pub(super) mod tests {
 	#[test]
 	fn function_type_placeholders_are_reported_in_source_order() {
 		let source = "type Callback = fn((_, _)) -> _;";
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 3, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			3,
+			"{:?}",
+			case.context.diagnostics
+		);
 		let mut last_start = 0;
-		for diagnostic in &case.diagnostics {
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.code.as_deref(),
 				Some(DiagnosticCode::InferInSignature.code())
@@ -5515,7 +5501,7 @@ pub(super) mod tests {
 			last_start = range.end;
 		}
 		let Type::Function { params, result } = case
-			.signatures
+			.context
 			.types
 			.resolve(case.type_alias("Callback").target)
 		else {
@@ -5524,7 +5510,7 @@ pub(super) mod tests {
 		assert_eq!(params.len(), 1);
 		assert_eq!(*result, TypeIndex::ERROR);
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::Tuple { elements }
 				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
 		));
@@ -5532,35 +5518,38 @@ pub(super) mod tests {
 
 	#[test]
 	fn user_aliases_are_rejected_as_impl_targets_without_dispatch() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Tr {}
 			impl Tr for Alias {}
 			impl Alias {}
 			type Alias = S;
 			struct S {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert!(
-			case.diagnostics.iter().all(|diagnostic| diagnostic
-				.code
-				.as_deref() == Some(
-				DiagnosticCode::InvalidImplTarget.code()
-			))
+			case.context
+				.diagnostics
+				.iter()
+				.all(|diagnostic| diagnostic.code.as_deref()
+					== Some(DiagnosticCode::InvalidImplTarget.code()))
 		);
+		assert_eq!(case.context.trait_impls.len(), case.defs.trait_impls.len());
 		assert_eq!(
-			case.signatures.trait_impls.len(),
-			case.defs.trait_impls.len()
-		);
-		assert_eq!(
-			case.signatures.inherent_impls.len(),
+			case.context.inherent_impls.len(),
 			case.defs.inherent_impls.len()
 		);
-		let trait_header = case.signatures.trait_impls[0].as_ref().unwrap();
-		let inherent_header =
-			case.signatures.inherent_impls[0].as_ref().unwrap();
+		let trait_header = case.context.trait_impls[0].as_ref().unwrap();
+		let inherent_header = case.context.inherent_impls[0].as_ref().unwrap();
 		assert_eq!(
-			case.signatures
+			case.context
 				.impl_dispatch
 				.trait_header(TraitImplIdx::new(0))
 				.trait_def
@@ -5570,131 +5559,167 @@ pub(super) mod tests {
 		);
 		assert_eq!(trait_header.target.inner, TypeIndex::ERROR);
 		assert_eq!(inherent_header.target.inner, trait_header.target.inner);
-		assert!(case.signatures.impl_dispatch_is_empty());
+		assert!(case.context.impl_dispatch.is_empty());
 	}
 
 	#[test]
 	fn intrinsic_primitive_can_be_an_impl_target() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			trait Tr {}
 			impl Tr for u32 {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
-			case.signatures.trait_candidates(ImplTarget::U32),
+			case.context.impl_dispatch.trait_candidates(ImplTarget::U32),
 			&[(case.trait_index("Tr"), TraitImplIdx::new(0))],
 		);
 	}
 
 	#[test]
 	fn intrinsic_never_is_invalid_impl_target() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type never;
 			trait Tr {}
 			impl Tr for never {}
-		"});
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::InvalidImplTarget.code()),
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"cannot use type alias as an impl target"
 		);
 	}
 
 	#[test]
 	fn impl_type_parameter_does_not_resolve_to_a_same_named_struct() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct T {}
 			trait Tr {}
 			impl<T> Tr for T {}
-		"});
-		assert!(case.signatures.impl_dispatch_is_empty());
+		"}
+		);
+		assert!(case.context.impl_dispatch.is_empty());
 		assert_eq!(
-			case.diagnostics
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|diagnostic| diagnostic.code.as_deref()
 					== Some(DiagnosticCode::InvalidImplTarget.code()))
 				.count(),
 			1,
 			"{:?}",
-			case.diagnostics,
+			case.context.diagnostics,
 		);
 	}
 
 	#[test]
 	fn typeset_member_alias_is_rejected_without_a_synthetic_impl() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type Alias = u32;
 			typeset Int { Alias }
-		"});
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::InvalidImplTarget.code()),
 		);
-		assert!(case.signatures.impl_dispatch_is_empty());
+		assert!(case.context.impl_dispatch.is_empty());
 	}
 
 	#[test]
 	fn impl_dispatch_rejects_duplicate_trait_for_same_constructor() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Tr {}
 			struct S {}
 			impl Tr for S {}
 			impl Tr for S {}
-		"});
-		let target = ImplTarget::from_type(
-			case.signatures.types.resolve(
-				case.signatures.trait_impls[0]
-					.as_ref()
-					.unwrap()
-					.target
-					.inner,
-			),
-		)
+		"}
+		);
+		let target = ImplTarget::from_type(case.context.types.resolve(
+			case.context.trait_impls[0].as_ref().unwrap().target.inner,
+		))
 		.unwrap();
-		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.impl_dispatch.trait_candidates(target).len(),
+			1
+		);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateTraitImpl.code())
 		);
 	}
 
 	#[test]
 	fn impl_dispatch_does_not_index_invalid_targets() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			impl<T> T {}
 			impl Missing {}
-		"});
-		assert!(case.signatures.impl_dispatch_is_empty());
+		"}
+		);
+		assert!(case.context.impl_dispatch.is_empty());
 		assert_eq!(
-			case.diagnostics
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
 					== Some(DiagnosticCode::InvalidImplTarget.code()))
 				.count(),
 			1,
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
 	#[test]
 	fn impl_header_resolves_generic_bounds() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound {}
 			struct S {}
 			impl<T: Bound> S {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let header = case.signatures.inherent_impls[0].as_ref().unwrap();
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
+		let header = case.context.inherent_impls[0].as_ref().unwrap();
 		assert_eq!(case.param_count(header.type_params), 1);
 		let bounds = case.declared_bounds(header.type_params, 0);
 		assert_eq!(bounds.len(), 1);
@@ -5703,26 +5728,33 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_header_keeps_target_when_trait_path_is_not_a_trait() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct S {}
 			impl S for S {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitBound.code())
 		);
-		let header = case.signatures.trait_impls[0].as_ref().unwrap();
+		let header = case.context.trait_impls[0].as_ref().unwrap();
 		assert!(
-			case.signatures
+			case.context
 				.impl_dispatch
 				.trait_header(TraitImplIdx::new(0))
 				.trait_def
 				.is_none()
 		);
 		assert!(matches!(
-			case.signatures.types.resolve(header.target.inner),
+			case.context.types.resolve(header.target.inner),
 			Type::Struct { .. }
 		));
 	}
@@ -5730,10 +5762,15 @@ pub(super) mod tests {
 	#[test]
 	fn function_parameter_placeholders_get_separate_diagnostics() {
 		let source = "fn f(x: (_, _)) { }";
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.code.as_deref(),
 				Some(DiagnosticCode::InferInSignature.code())
@@ -5750,18 +5787,23 @@ pub(super) mod tests {
 			);
 		}
 		assert_ne!(
-			case.diagnostics[0].labels[0].range,
-			case.diagnostics[1].labels[0].range
+			case.context.diagnostics[0].labels[0].range,
+			case.context.diagnostics[1].labels[0].range
 		);
 	}
 
 	#[test]
 	fn return_type_placeholders_get_separate_diagnostics() {
 		let source = "fn f() -> (_, _) { }";
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.message,
 				"the placeholder `_` is not allowed within types on item signatures for return types"
@@ -5774,12 +5816,12 @@ pub(super) mod tests {
 			);
 		}
 		assert_ne!(
-			case.diagnostics[0].labels[0].range,
-			case.diagnostics[1].labels[0].range
+			case.context.diagnostics[0].labels[0].range,
+			case.context.diagnostics[1].labels[0].range
 		);
 		let return_type = case.function_signature("f").return_type;
 		assert!(matches!(
-			case.signatures.types.resolve(return_type),
+			case.context.types.resolve(return_type),
 			Type::Tuple { elements }
 				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
 		));
@@ -5787,10 +5829,15 @@ pub(super) mod tests {
 
 	#[test]
 	fn tuple_struct_placeholders_get_separate_diagnostics() {
-		let case = TestCase::new("struct Pair(_, _);");
+		test_case!(case = "struct Pair(_, _);");
 
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.message,
 				"the placeholder `_` is not allowed within types on item signatures for structs"
@@ -5800,16 +5847,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn duplicate_param_name_is_reported_but_both_entries_survive() {
-		let case = TestCase::new("type A<T, T> = T;");
+		test_case!(case = "type A<T, T> = T;");
 
 		assert_eq!(
 			case.param_count(case.type_alias("A").type_params),
 			2,
 			"a duplicate name isn't dropped"
 		);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateGenericParam.code())
 		);
 	}
@@ -5820,58 +5872,81 @@ pub(super) mod tests {
 		// was written to avoid: checking the *post-push* vec for a match
 		// always finds the entry just pushed, spuriously flagging every
 		// single param as its own "duplicate".
-		let case = TestCase::new("type A<X, Y, Z> = X;");
+		test_case!(case = "type A<X, Y, Z> = X;");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 	}
 
 	#[test]
 	fn a_bound_naming_a_real_trait_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Addable { }
 			type A<T: Addable> = T;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.type_alias("A").type_params;
 		assert_eq!(case.declared_bounds(env, 0).len(), 1);
 	}
 
 	#[test]
 	fn a_bound_naming_a_non_trait_is_rejected() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			struct NotATrait { x: i32 }
 			type A<T: NotATrait> = T;
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitBound.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"expected trait, found struct `NotATrait`"
 		);
 	}
 
 	#[test]
 	fn a_bound_naming_nothing_is_reported_by_path_resolution_itself() {
-		let case = TestCase::new("type A<T: DoesNotExist> = T;");
+		test_case!(case = "type A<T: DoesNotExist> = T;");
 
 		let env = case.type_alias("A").type_params;
 		assert_eq!(case.declared_bounds(env, 0).len(), 0);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::UndeclaredIdentifier.code())
 		);
 	}
 
 	#[test]
 	fn type_aliases_to_primitives_resolve_to_the_primitive() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type bool;
 			type char;
@@ -5879,9 +5954,14 @@ pub(super) mod tests {
 			type A = i32;
 			type B = bool;
 			type C = char;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.type_alias("A").target, TypeIndex::I32);
 		assert_eq!(case.type_alias("B").target, TypeIndex::BOOL);
 		assert_eq!(case.type_alias("C").target, TypeIndex::CHAR);
@@ -5889,18 +5969,25 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_type_alias_cycle_is_reported_once_and_both_sides_become_error() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type A = B;
 			type B = A;
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::CyclicTypeAlias.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"cycle detected when expanding type alias `A`"
 		);
 		assert_eq!(
@@ -5917,12 +6004,18 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_real_supertrait_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Y { }
 			trait X: Y { }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let bounds = case.trait_supertraits("X");
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.trait_index("Y"));
@@ -5930,18 +6023,25 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_supertrait_cycle_is_reported_once_and_both_sides_still_finish() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A: B { }
 			trait B: A { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"cycle detected when computing the supertraits of `A`"
 		);
 		assert_eq!(
@@ -5963,26 +6063,38 @@ pub(super) mod tests {
 		// for its whole bound list, so both `B` and `C` independently
 		// re-discover it — without the fix, each would report its own
 		// cycle diagnostic for what's really one finding.
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A: B + C { }
 			trait B: A { }
 			trait C: A { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
 	}
 
 	#[test]
 	fn a_direct_self_supertrait_reports_a_supertrait_cycle() {
-		let case = TestCase::new("trait D: D {}");
+		test_case!(case = "trait D: D {}");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
 	}
@@ -5993,28 +6105,42 @@ pub(super) mod tests {
 			trait Outer { type Item; }
 			trait D: Outer where { Item: D + D } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::CyclicTraitBounds.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"cycle detected when computing the implied bounds of `D`"
 		);
-		assert_eq!(&source[case.diagnostics[0].labels[0].range.clone()], "D");
+		assert_eq!(
+			&source[case.context.diagnostics[0].labels[0].range.clone()],
+			"D"
+		);
 	}
 
 	#[test]
 	fn a_struct_with_primitive_fields_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			struct Point { x: i32, y: i32 }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let field_types = &case.struct_signature("Point").field_types;
 		assert_eq!(field_types.len(), 2);
 		assert_eq!(field_types[0], TypeIndex::I32);
@@ -6023,83 +6149,118 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_tuple_struct_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			struct Pair(i32, i32);
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.struct_signature("Pair").field_types.len(), 2);
 	}
 
 	#[test]
 	fn a_struct_referencing_another_struct_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct Inner { }
 			struct Outer { inner: Inner }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 	}
 
 	#[test]
 	fn a_directly_self_recursive_struct_is_rejected() {
-		let case = TestCase::new("struct A { a: A }");
+		test_case!(case = "struct A { a: A }");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"recursive type `A` has infinite size"
 		);
 	}
 
 	#[test]
 	fn a_tuple_field_embedding_the_struct_directly_is_rejected() {
-		let case = TestCase::new("struct A { a: (A, A) }");
+		test_case!(case = "struct A { a: (A, A) }");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
 	}
 
 	#[test]
 	fn a_mutually_recursive_struct_pair_is_rejected_once() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct A { b: B }
 			struct B { a: A }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"recursive types `A` and `B` have infinite size"
 		);
 	}
 
 	#[test]
 	fn a_struct_reference_with_a_satisfying_type_argument_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct Wrapper<T> { value: T }
 			struct S {}
 			struct Holder { w: Wrapper<S> }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
 		let Type::Struct {
 			struct_index,
 			type_args: args,
-		} = case.signatures.types.resolve(field_ty)
+		} = case.context.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -6108,7 +6269,7 @@ pub(super) mod tests {
 		let Type::Struct {
 			struct_index: arg_struct_index,
 			..
-		} = case.signatures.types.resolve(args[0])
+		} = case.context.types.resolve(args[0])
 		else {
 			panic!("expected the argument to resolve to `S`");
 		};
@@ -6117,18 +6278,24 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_forward_reference_to_a_generic_struct_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct Holder { w: Wrapper<S> }
 			struct Wrapper<T> { value: T }
 			struct S {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
 		let Type::Struct {
 			struct_index,
 			type_args: args,
-		} = case.signatures.types.resolve(field_ty)
+		} = case.context.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -6138,43 +6305,57 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_used_as_a_type_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound {}
 			struct Holder { w: Bound }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotAType.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"expected type, found trait `Bound`"
 		);
 	}
 
 	#[test]
 	fn a_struct_reference_with_too_few_type_arguments_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct Wrapper<A, B> { a: A, b: B }
 			struct S {}
 			struct Holder { w: Wrapper<S> }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TypeArgumentCountMismatch.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"struct `Wrapper` takes 2 generic arguments but 1 generic argument was supplied"
 		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
 		let Type::Struct {
 			type_args: args, ..
-		} = case.signatures.types.resolve(field_ty)
+		} = case.context.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -6183,47 +6364,61 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_struct_reference_with_too_many_type_arguments_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct Wrapper<T> { value: T }
 			struct S {}
 			struct Holder { w: Wrapper<S, S> }
-		"});
+		"}
+		);
 
 		case.diagnostics().print();
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TypeArgumentCountMismatch.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"struct `Wrapper` takes 1 generic argument but 2 generic arguments were supplied"
 		);
 	}
 
 	#[test]
 	fn a_struct_reference_with_a_bound_violating_type_argument_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound {}
 			struct Wrapper<T: Bound> { value: T }
 			struct S {}
 			struct Holder { w: Wrapper<S> }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"the trait bound `S: Bound` is not satisfied"
 		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
 		let Type::Struct {
 			type_args: args, ..
-		} = case.signatures.types.resolve(field_ty)
+		} = case.context.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
@@ -6232,26 +6427,32 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_struct_reference_with_a_bound_satisfying_type_argument_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound {}
 			struct Wrapper<T: Bound> { value: T }
 			struct S {}
 			impl Bound for S {}
 			struct Holder { w: Wrapper<S> }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let field_ty = case.struct_signature("Holder").field_types[0];
 		let Type::Struct {
 			type_args: args, ..
-		} = case.signatures.types.resolve(field_ty)
+		} = case.context.types.resolve(field_ty)
 		else {
 			panic!("expected a Struct type");
 		};
 		let Type::Struct {
 			struct_index: arg_struct_index,
 			..
-		} = case.signatures.types.resolve(args[0])
+		} = case.context.types.resolve(args[0])
 		else {
 			panic!("expected the argument to resolve to `S`");
 		};
@@ -6263,28 +6464,41 @@ pub(super) mod tests {
 		// Same double-report shape as the supertrait regression test above,
 		// but for structs: `A` has two fields (`b`, `c`) that each
 		// independently lead back to `A`.
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct A { b: B, c: C }
 			struct B { a: A }
 			struct C { a: A }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
 		);
 	}
 
 	#[test]
 	fn a_function_with_primitive_params_and_return_resolves() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type bool;
 			fn add(a: i32, b: i32) -> bool { true }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("add");
 		assert_eq!(signature.param_types.len(), 2);
 		assert_eq!(signature.param_types[0], TypeIndex::I32);
@@ -6294,17 +6508,25 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_function_with_no_return_type_defaults_to_unit() {
-		let case = TestCase::new("fn f() { }");
+		test_case!(case = "fn f() { }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.function_signature("f").return_type, TypeIndex::UNIT);
 	}
 
 	#[test]
 	fn a_generic_function_param_resolves_to_its_type_param() {
-		let case = TestCase::new("fn identity<T>(x: T) -> T { x }");
+		test_case!(case = "fn identity<T>(x: T) -> T { x }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("identity");
 		assert_eq!(case.param_count(signature.type_params), 1);
 		assert_eq!(signature.param_types[0], signature.return_type);
@@ -6312,27 +6534,40 @@ pub(super) mod tests {
 
 	#[test]
 	fn duplicate_function_param_name_is_reported_but_both_entries_survive() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			fn f(x: i32, x: i32) { }
-		"});
+		"}
+		);
 
 		assert_eq!(case.function_signature("f").param_types.len(), 2);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateFunctionParameter.code())
 		);
 	}
 
 	#[test]
 	fn a_bodiless_function_declaration_resolves_like_a_function() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			fn imported(x: i32) -> i32;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("imported");
 		assert_eq!(signature.param_types[0], TypeIndex::I32);
 		assert_eq!(signature.return_type, TypeIndex::I32);
@@ -6340,11 +6575,16 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_non_intrinsic_type_alias_without_a_body_is_diagnosed() {
-		let case = TestCase::new("type X;");
+		test_case!(case = "type X;");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingTypeAliasBody.code())
 		);
 		assert_eq!(case.type_alias("X").target, TypeIndex::ERROR);
@@ -6353,11 +6593,16 @@ pub(super) mod tests {
 	#[test]
 	fn an_untyped_free_function_parameter_is_diagnosed_here_not_in_prescan() {
 		for source in ["fn f(x) { }", "fn f(x);"] {
-			let case = TestCase::new(source);
+			test_case!(case = source);
 
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::MissingParameterType.code())
 			);
 			assert_eq!(
@@ -6369,11 +6614,16 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_non_self_trait_function_parameter_is_diagnosed() {
-		let case = TestCase::new("trait Foo { fn get(self, x) -> Self; }");
+		test_case!(case = "trait Foo { fn get(self, x) -> Self; }");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingParameterType.code())
 		);
 		let sig = case.trait_function_signature("Foo", "get");
@@ -6382,7 +6632,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn free_constants_resolve_forward_annotations_in_their_own_namespace() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type bool;
 			const VALUE: Local = 0;
@@ -6391,32 +6642,46 @@ pub(super) mod tests {
 				pub const VALUE: Local = false;
 				type Local = bool;
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.constant_signature("VALUE").ty, TypeIndex::I32);
 		assert_eq!(
 			case.constant_signature("nested::VALUE").ty,
 			TypeIndex::BOOL
 		);
 		for (index, definition) in case.defs.constants.iter().enumerate() {
-			assert!(matches!(case.signatures.item_lookup[&definition.def_id],
-				SignatureLocation::Constant(found) if usize::from(found) == index));
+			assert!(
+				matches!(case.context.signature_location(definition.def_id),
+				SignatureLocation::Constant(found) if usize::from(found) == index)
+			);
 		}
 	}
 
 	#[test]
 	fn free_constants_require_explicit_non_inferred_annotations() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			const MISSING = 0;
 			const INFERRED: _ = 0;
-		"});
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingConstantType.code())
 		);
 		assert_eq!(
-			case.diagnostics[1].code.as_deref(),
+			case.context.diagnostics[1].code.as_deref(),
 			Some(DiagnosticCode::InferInSignature.code())
 		);
 		assert_eq!(case.constant_signature("MISSING").ty, TypeIndex::ERROR);
@@ -6425,7 +6690,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn free_constant_annotations_normalize_projections_and_check_bounds() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			const VALUE: Need<S::Item> = 0;
 			type i32;
 			trait Marker {}
@@ -6434,13 +6700,18 @@ pub(super) mod tests {
 			trait Container { type Item; }
 			struct S {}
 			impl Container for S { type Item = i32; }
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let Type::Struct {
 			struct_index,
 			type_args,
 		} = case
-			.signatures
+			.context
 			.types
 			.resolve(case.constant_signature("VALUE").ty)
 		else {
@@ -6452,19 +6723,26 @@ pub(super) mod tests {
 
 	#[test]
 	fn free_constant_annotations_recover_from_failed_generic_requirements() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Marker {}
 			struct Need<T: Marker> {}
 			const VALUE: Need<i32> = 0;
-		"});
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 		let Type::Struct { type_args, .. } = case
-			.signatures
+			.context
 			.types
 			.resolve(case.constant_signature("VALUE").ty)
 		else {
@@ -6475,15 +6753,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn enum_types_resolve_forward_paths_in_all_signature_positions() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			fn f(x: colors::Color) -> Alias {}
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint { color: Alias }
 			type Alias = colors::Color;
 			mod colors { pub enum Color: i32 { Red, Green } }
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Enum(enum_index) =
 			case.resolve(BindingNamespace::Type, "colors::Color")
 		else {
@@ -6492,7 +6776,7 @@ pub(super) mod tests {
 		let signature = case.function_signature("f");
 		let ty = signature.param_types[0];
 		assert!(
-			matches!(case.signatures.types.resolve(ty), Type::Enum { enum_index: found } if *found == enum_index)
+			matches!(case.context.types.resolve(ty), Type::Enum { enum_index: found } if *found == enum_index)
 		);
 		assert_ne!(ty, TypeIndex::I32);
 		assert_eq!(signature.return_type, ty);
@@ -6510,10 +6794,18 @@ pub(super) mod tests {
 			enum Color: i32 { Red }
 			mod nested { pub enum Color: i32 { Red } }
 		"};
-		let case = TestCase::new(source);
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for (diagnostic, path) in
-			case.diagnostics.iter().zip(["Color", "nested::Color"])
+		test_case!(case = source);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for (diagnostic, path) in case
+			.context
+			.diagnostics
+			.iter()
+			.zip(["Color", "nested::Color"])
 		{
 			assert_eq!(
 				diagnostic.code.as_deref(),
@@ -6552,11 +6844,11 @@ pub(super) mod tests {
 			);
 		}
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"enum `Color` takes 0 generic arguments but 1 generic argument was supplied"
 		);
 		assert_eq!(
-			case.diagnostics[1].message,
+			case.context.diagnostics[1].message,
 			"enum `Color` takes 0 generic arguments but 2 generic arguments were supplied"
 		);
 		assert_eq!(
@@ -6617,14 +6909,22 @@ pub(super) mod tests {
 				DiagnosticCode::EnumReprNotInteger,
 			),
 		] {
-			let case = TestCase::new(&format!(
-				"fn f(x: Color) -> Color {{}} {declaration}"
-			));
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-			assert_eq!(case.diagnostics[0].code.as_deref(), Some(code.code()));
+			test_case!(
+				case = &format!("fn f(x: Color) -> Color {{}} {declaration}")
+			);
+			assert_eq!(
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
+				Some(code.code())
+			);
 			let signature = case.function_signature("f");
 			assert!(matches!(
-				case.signatures.types.resolve(signature.param_types[0]),
+				case.context.types.resolve(signature.param_types[0]),
 				Type::Enum { .. }
 			));
 			assert_eq!(signature.param_types[0], signature.return_type);
@@ -6634,22 +6934,33 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_enum_repr_resolves_to_the_named_integer_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			enum Color: i32 { Red, Green, Blue }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::I32);
 	}
 
 	#[test]
 	fn an_enum_without_a_repr_is_diagnosed() {
-		let case = TestCase::new("enum Color { Red, Green, Blue }");
+		test_case!(case = "enum Color { Red, Green, Blue }");
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingEnumRepr.code())
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
@@ -6657,14 +6968,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_enum_with_a_non_integer_repr_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type bool;
 			enum Color: bool { Red, Green, Blue }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::EnumReprNotInteger.code())
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
@@ -6672,9 +6990,13 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_unbounded_trait_associated_type_resolves_with_no_bounds() {
-		let case = TestCase::new("trait Container { type Item; }");
+		test_case!(case = "trait Container { type Item; }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
 				.declared_bounds
@@ -6684,7 +7006,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn associated_type_defaults_apply_without_hiding_impl_overrides() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type u32;
 			trait Container { type Item = i32; }
@@ -6694,9 +7017,14 @@ pub(super) mod tests {
 			impl Container for Overridden { type Item = u32; }
 			fn inherited(x: Defaulted::Item) {}
 			fn overridden(x: Overridden::Item) {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("inherited").param_types[0],
 			TypeIndex::I32
@@ -6709,7 +7037,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn associated_type_defaults_substitute_self_and_resolve_other_members() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container {
 				type SelfType = Self;
@@ -6721,29 +7050,35 @@ pub(super) mod tests {
 			fn self_type(x: <Wrapper<i32> as Container>::SelfType) {}
 			fn item(x: <Wrapper<i32> as Container>::Item) {}
 			fn abstract_item<T: Container>(x: T::Item) {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("item").param_types[0],
 			TypeIndex::I32
 		);
 		let self_type = case.function_signature("self_type").param_types[0];
 		assert!(matches!(
-			case.signatures.types.resolve(self_type),
+			case.context.types.resolve(self_type),
 			Type::Struct { type_args, .. } if type_args.as_ref() == [TypeIndex::I32]
 		));
 		let abstract_item =
 			case.function_signature("abstract_item").param_types[0];
 		assert!(matches!(
-			case.signatures.types.resolve(abstract_item),
+			case.context.types.resolve(abstract_item),
 			Type::AssocTypeProjection { .. }
 		));
 	}
 
 	#[test]
 	fn bounded_associated_type_default_resolves_forward_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Marker {}
 			trait Container { type Item: Marker = Later; }
 			struct Later {}
@@ -6751,10 +7086,15 @@ pub(super) mod tests {
 			impl Marker for Later {}
 			impl Container for Wrapper {}
 			fn f(x: Wrapper::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert!(matches!(
-			case.signatures.types.resolve(
+			case.context.types.resolve(
 				case.function_signature("f").param_types[0]
 			),
 			Type::Struct { struct_index, .. }
@@ -6764,19 +7104,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn associated_type_default_cycle_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Container { type Item = Self::Item; }
 			struct Wrapper {}
 			impl Container for Wrapper {}
 			fn f(x: Wrapper::Item) {}
-		"});
+		"}
+		);
 		assert!(
-			case.diagnostics.iter().any(|diagnostic| {
+			case.context.diagnostics.iter().any(|diagnostic| {
 				diagnostic.code.as_deref()
 					== Some(DiagnosticCode::CyclicAssociatedType.code())
 			}),
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 		assert_eq!(
 			case.function_signature("f").param_types[0],
@@ -6786,19 +7128,26 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_assoc_type_resolves_to_its_provided_value() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrapper {}
 			impl Container for Wrapper { type Item = i32; }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 
 		let container = case.trait_index("Container");
 		let target = ImplTarget::Struct(case.struct_index("Wrapper"));
 		let &(_, impl_index) = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(target)
 			.iter()
 			.find(|&&(trait_index, _)| trait_index == container)
@@ -6820,10 +7169,9 @@ pub(super) mod tests {
 			panic!("expected `Item` to be an associated type");
 		};
 
-		let signature = case.signatures.assoc_types
-			[usize::from(assoc_type_index)]
-		.as_ref()
-		.expect("impl's associated type value is resolved");
+		let signature = case.context.assoc_types[usize::from(assoc_type_index)]
+			.as_ref()
+			.expect("impl's associated type value is resolved");
 		assert_eq!(signature.value, Some(TypeIndex::I32));
 		assert!(signature.declared_bounds.is_empty());
 	}
@@ -7177,16 +7525,22 @@ pub(super) mod tests {
 			"Wrapper::Item",
 			"<Wrapper>::Item::Next",
 		] {
-			let case = TestCase::new(&format!(
-				"
+			test_case!(
+				case = &format!(
+					"
 				trait Container {{ type Item; }}
 				struct Wrapper {{}}
 				impl Container for Wrapper {{}}
 				fn f(x: {path}) {{}}
 				fn g(x: {path}) {{}}
 			"
-			));
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+				)
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
 				TypeIndex::ERROR
@@ -7200,14 +7554,20 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_declaration_registers_a_synthetic_impl_with_a_checked_size() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 
 		let DefKind::Memory(memory_index) =
 			case.resolve(BindingNamespace::Type, "heap")
@@ -7217,13 +7577,14 @@ pub(super) mod tests {
 
 		let memory_trait = case.trait_index("Memory");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Memory(memory_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, memory_trait);
 
 		let memory_def = &case.defs.memories[usize::from(memory_index)];
-		let size_signature = case.signatures.assoc_types
+		let size_signature = case.context.assoc_types
 			[usize::from(memory_def.size_assoc_type_index)]
 		.as_ref()
 		.expect("memory's Size value is resolved");
@@ -7232,17 +7593,24 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_size_violating_pointer_size_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type bool;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: bool;
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 
@@ -7252,7 +7620,7 @@ pub(super) mod tests {
 			panic!("expected `heap` to be a memory");
 		};
 		let memory_def = &case.defs.memories[usize::from(memory_index)];
-		let size_signature = case.signatures.assoc_types
+		let size_signature = case.context.assoc_types
 			[usize::from(memory_def.size_assoc_type_index)]
 		.as_ref()
 		.expect("memory's Size value is resolved, even poisoned");
@@ -7261,13 +7629,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn global_declaration_registers_a_synthetic_impl_with_its_value_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			trait Global { type Value; }
 			global counter: u32 = 0;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 
 		let DefKind::Global(global_index) =
 			case.resolve(BindingNamespace::Value, "counter")
@@ -7277,14 +7651,15 @@ pub(super) mod tests {
 
 		let global_trait = case.trait_index("Global");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Global(global_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, global_trait);
 
 		let global_def = &case.defs.globals[usize::from(global_index)];
 		assert!(global_def.mut_trait_impl_index.is_none());
-		let value_signature = case.signatures.assoc_types
+		let value_signature = case.context.assoc_types
 			[usize::from(global_def.value_assoc_type_index)]
 		.as_ref()
 		.expect("global's Value is resolved");
@@ -7293,14 +7668,20 @@ pub(super) mod tests {
 
 	#[test]
 	fn mutable_global_also_registers_a_global_mut_impl() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
 			global mut counter: u32 = 0;
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 
 		let DefKind::Global(global_index) =
 			case.resolve(BindingNamespace::Value, "counter")
@@ -7309,7 +7690,8 @@ pub(super) mod tests {
 		};
 		let global_mut_trait = case.trait_index("GlobalMut");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Global(global_index));
 		assert!(
 			candidates.iter().any(|&(t, _)| t == global_mut_trait),
@@ -7319,14 +7701,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn global_without_a_type_annotation_is_diagnosed_and_falls_back_to_error() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Global { type Value; }
 			global counter = 0;
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingGlobalType.code())
 		);
 
@@ -7336,7 +7725,7 @@ pub(super) mod tests {
 			panic!("expected `counter` to be a global");
 		};
 		let global_def = &case.defs.globals[usize::from(global_index)];
-		let value_signature = case.signatures.assoc_types
+		let value_signature = case.context.assoc_types
 			[usize::from(global_def.value_assoc_type_index)]
 		.as_ref()
 		.expect("global's Value is resolved, even poisoned");
@@ -7345,15 +7734,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_memory_registers_a_synthetic_impl_with_a_checked_size() {
-		let case = TestCase::new(indoc! {r#"
+		test_case!(
+			case = indoc! {r#"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			import "env" as host {
 				memory shared: u32;
 			}
-		"#});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"#}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Memory(memory_index) =
 			case.resolve(BindingNamespace::Type, "host::shared")
 		else {
@@ -7361,12 +7756,13 @@ pub(super) mod tests {
 		};
 		let memory_trait = case.trait_index("Memory");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Memory(memory_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, memory_trait);
 		let memory_def = &case.defs.memories[usize::from(memory_index)];
-		let size_signature = case.signatures.assoc_types
+		let size_signature = case.context.assoc_types
 			[usize::from(memory_def.size_assoc_type_index)]
 		.as_ref()
 		.expect("memory's Size value is resolved");
@@ -7375,14 +7771,20 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_global_registers_a_synthetic_impl_with_its_value_type() {
-		let case = TestCase::new(indoc! {r#"
+		test_case!(
+			case = indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			import "env" as host {
 				global counter: u32;
 			}
-		"#});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"#}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Global(global_index) =
 			case.resolve(BindingNamespace::Value, "host::counter")
 		else {
@@ -7390,13 +7792,14 @@ pub(super) mod tests {
 		};
 		let global_trait = case.trait_index("Global");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Global(global_index));
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, global_trait);
 		let global_def = &case.defs.globals[usize::from(global_index)];
 		assert!(global_def.mut_trait_impl_index.is_none());
-		let value_signature = case.signatures.assoc_types
+		let value_signature = case.context.assoc_types
 			[usize::from(global_def.value_assoc_type_index)]
 		.as_ref()
 		.expect("global's Value is resolved");
@@ -7405,15 +7808,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_mutable_global_also_registers_a_global_mut_impl() {
-		let case = TestCase::new(indoc! {r#"
+		test_case!(
+			case = indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
 			import "env" as host {
 				global mut counter: u32;
 			}
-		"#});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"#}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Global(global_index) =
 			case.resolve(BindingNamespace::Value, "host::counter")
 		else {
@@ -7421,7 +7830,8 @@ pub(super) mod tests {
 		};
 		let global_mut_trait = case.trait_index("GlobalMut");
 		let candidates = case
-			.signatures
+			.context
+			.impl_dispatch
 			.trait_candidates(ImplTarget::Global(global_index));
 		assert!(
 			candidates.iter().any(|&(t, _)| t == global_mut_trait),
@@ -7431,33 +7841,45 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_function_resolves_its_parameter_and_return_types() {
-		let case = TestCase::new(indoc! {r#"
+		test_case!(
+			case = indoc! {r#"
 			type u32;
 			import "env" as host {
 				fn log(value: u32) -> u32;
 			}
-		"#});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"#}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Function(function_index) =
 			case.resolve(BindingNamespace::Value, "host::log")
 		else {
 			panic!("expected `host::log` to be a function");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		assert_eq!(signature.param_types.as_ref(), [TypeIndex::U32]);
 		assert_eq!(signature.return_type, TypeIndex::U32);
 	}
 
 	#[test]
 	fn pointer_type_resolves_through_the_sole_declared_memory() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			fn f(x: *u32);
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Function(function_index) =
 			case.resolve(BindingNamespace::Value, "f")
 		else {
@@ -7468,7 +7890,7 @@ pub(super) mod tests {
 		else {
 			panic!("expected `heap` to be a memory");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		let &[param_type] = signature.param_types.as_ref() else {
 			panic!("expected exactly one parameter");
 		};
@@ -7476,27 +7898,34 @@ pub(super) mod tests {
 			to,
 			memory,
 			ownership,
-		} = case.signatures.types.resolve(param_type)
+		} = case.context.types.resolve(param_type)
 		else {
 			panic!("expected `x` to resolve to a pointer type");
 		};
 		assert_eq!(*to, TypeIndex::U32);
 		assert_eq!(*ownership, ast::Ownership::Exclusive);
 		assert_eq!(
-			case.signatures.types.resolve(*memory),
+			case.context.types.resolve(*memory),
 			&Type::Memory { memory_index }
 		);
 	}
 
 	#[test]
 	fn pointer_type_with_no_memory_declared_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			fn f(x: *u32);
-		"});
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NoMemoryForPointer.code())
 		);
 		let DefKind::Function(function_index) =
@@ -7504,23 +7933,30 @@ pub(super) mod tests {
 		else {
 			panic!("expected `f` to be a function");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
 	}
 
 	#[test]
 	fn pointer_type_with_multiple_memories_is_diagnosed_as_ambiguous() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			memory heap2: u32;
 			fn f(x: *u32);
-		"});
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::AmbiguousPointerMemory.code())
 		);
 		let DefKind::Function(function_index) =
@@ -7528,20 +7964,26 @@ pub(super) mod tests {
 		else {
 			panic!("expected `f` to be a function");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
 	}
 
 	#[test]
 	fn slice_and_array_types_resolve_through_the_sole_declared_memory() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			fn f(s: &[u32], a: *[u32; 4]);
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Function(function_index) =
 			case.resolve(BindingNamespace::Value, "f")
 		else {
@@ -7552,7 +7994,7 @@ pub(super) mod tests {
 		else {
 			panic!("expected `heap` to be a memory");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		let &[slice_type, array_type] = signature.param_types.as_ref() else {
 			panic!("expected exactly two parameters");
 		};
@@ -7560,14 +8002,14 @@ pub(super) mod tests {
 			of,
 			memory,
 			ownership,
-		} = case.signatures.types.resolve(slice_type)
+		} = case.context.types.resolve(slice_type)
 		else {
 			panic!("expected `s` to resolve to a slice type");
 		};
 		assert_eq!(*of, TypeIndex::U32);
 		assert_eq!(*ownership, ast::Ownership::Shared);
 		assert_eq!(
-			case.signatures.types.resolve(*memory),
+			case.context.types.resolve(*memory),
 			&Type::Memory { memory_index }
 		);
 		let Type::Array {
@@ -7575,7 +8017,7 @@ pub(super) mod tests {
 			size,
 			memory,
 			ownership,
-		} = case.signatures.types.resolve(array_type)
+		} = case.context.types.resolve(array_type)
 		else {
 			panic!("expected `a` to resolve to an array type");
 		};
@@ -7583,22 +8025,28 @@ pub(super) mod tests {
 		assert_eq!(*size, 4);
 		assert_eq!(*ownership, ast::Ownership::Exclusive);
 		assert_eq!(
-			case.signatures.types.resolve(*memory),
+			case.context.types.resolve(*memory),
 			&Type::Memory { memory_index }
 		);
 	}
 
 	#[test]
 	fn memory_tagged_pointer_resolves_the_explicit_memory_despite_ambiguity() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			memory heap2: u32;
 			fn f(x: heap2::*u32);
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let DefKind::Function(function_index) =
 			case.resolve(BindingNamespace::Value, "f")
 		else {
@@ -7609,17 +8057,17 @@ pub(super) mod tests {
 		else {
 			panic!("expected `heap2` to be a memory");
 		};
-		let signature = &case.signatures.functions[usize::from(function_index)];
+		let signature = &case.context.functions[usize::from(function_index)];
 		let &[param_type] = signature.param_types.as_ref() else {
 			panic!("expected exactly one parameter");
 		};
 		let Type::Pointer { memory, .. } =
-			case.signatures.types.resolve(param_type)
+			case.context.types.resolve(param_type)
 		else {
 			panic!("expected `x` to resolve to a pointer type");
 		};
 		assert_eq!(
-			case.signatures.types.resolve(*memory),
+			case.context.types.resolve(*memory),
 			&Type::Memory {
 				memory_index: heap2_index
 			}
@@ -7628,17 +8076,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_naming_a_non_memory_preserves_the_pointer() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u32;
             trait Memory {}
             struct Foo {}
 
             fn f(x: Foo::*u32) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		assert_eq!(
-			case.signatures
+			case.context
 				.types
 				.resolve(case.function_signature("f").param_types[0]),
 			&Type::Pointer {
@@ -7651,7 +8101,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_accepts_generic_memory_for_pointers_slices_and_arrays() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -7661,11 +8112,12 @@ pub(super) mod tests {
                 slice: M::&[u8],
                 array: M::*[u8; 4],
             ) {}
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		let params = &case.function_signature("test").param_types;
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7673,7 +8125,7 @@ pub(super) mod tests {
 			}
 		);
 		assert_eq!(
-			case.signatures.types.resolve(params[2]),
+			case.context.types.resolve(params[2]),
 			&Type::Slice {
 				of: TypeIndex::U8,
 				memory: params[0],
@@ -7681,7 +8133,7 @@ pub(super) mod tests {
 			}
 		);
 		assert_eq!(
-			case.signatures.types.resolve(params[3]),
+			case.context.types.resolve(params[3]),
 			&Type::Array {
 				of: TypeIndex::U8,
 				size: 4,
@@ -7693,7 +8145,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_requires_a_bound_and_accepts_a_memory_supertrait() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
             trait SpecialMemory: Memory {}
@@ -7701,16 +8154,17 @@ pub(super) mod tests {
             fn unbounded<M>(value: M, ptr: M::*u8) {}
 
             fn inherited<M: SpecialMemory>(value: M, ptr: M::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("unbounded").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -7719,7 +8173,7 @@ pub(super) mod tests {
 		);
 		let params = &case.function_signature("inherited").param_types;
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7730,7 +8184,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_accepts_a_generic_associated_type_bounded_by_memory() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -7739,15 +8194,16 @@ pub(super) mod tests {
             }
 
             fn test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::AssocTypeProjection { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7758,19 +8214,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_accepts_self_with_a_memory_supertrait() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
             trait Tagged: Memory {
                 fn test(value: Self, ptr: Self::*u8);
             }
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		let params =
 			&case.trait_function_signature("Tagged", "test").param_types;
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7781,7 +8239,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_accepts_struct_impls_and_concrete_associated_types() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -7801,11 +8260,12 @@ pub(super) mod tests {
             fn direct(ptr: Heap::*u8) {}
 
             fn associated(value: Holder::Mem, ptr: Holder::Mem::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		let params = &case.function_signature("associated").param_types;
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7817,7 +8277,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_resolves_generic_arguments_and_checks_impl_requirements() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -7827,12 +8288,13 @@ pub(super) mod tests {
             fn bounded<M: Memory>(value: Heap<M>, ptr: Heap<M>::*u8) {}
 
             fn unbounded<M>(ptr: Heap<M>::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("bounded").param_types;
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7840,7 +8302,7 @@ pub(super) mod tests {
 			}
 		);
 		assert_eq!(
-			case.signatures
+			case.context
 				.types
 				.resolve(case.function_signature("unbounded").param_types[0]),
 			&Type::Pointer {
@@ -7853,7 +8315,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_accepts_an_alias_to_a_concrete_memory() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             type u32;
 
@@ -7869,15 +8332,16 @@ pub(super) mod tests {
             type Alias = heap;
 
             fn test(value: Alias, ptr: Alias::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::Memory { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: params[0],
@@ -7888,7 +8352,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_respects_generic_parameter_shadowing() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             type u32;
 
@@ -7903,16 +8368,17 @@ pub(super) mod tests {
             memory M: u32;
 
             fn test<M>(value: M, ptr: M::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -7923,7 +8389,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_resolves_trailing_segments_after_a_concrete_memory() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             type u32;
 
@@ -7938,11 +8405,12 @@ pub(super) mod tests {
             memory heap: u32;
 
             fn test(ptr: heap::Missing::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NotATraitMember]);
 		assert_eq!(
-			case.signatures
+			case.context
 				.types
 				.resolve(case.function_signature("test").param_types[0]),
 			&Type::Pointer {
@@ -7955,7 +8423,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_failure_preserves_a_valid_projection_in_other_positions() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -7964,16 +8433,17 @@ pub(super) mod tests {
             }
 
             fn test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::AssocTypeProjection { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -7984,7 +8454,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_membership_waits_for_associated_equalities() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             type u32;
             trait Memory {}
@@ -7998,10 +8469,11 @@ pub(super) mod tests {
                 T: Container where { Item = U::Item::*u8 },
                 U: Container where { Item = u32 },
             >(ptr: T::Item) {}
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
 		assert_eq!(
-			case.signatures
+			case.context
 				.types
 				.resolve(case.function_signature("test").param_types[0]),
 			&Type::Pointer {
@@ -8015,7 +8487,8 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_deferred_failure_preserves_the_pointer_and_ordinary_subject()
 	{
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             type u32;
             trait Memory {}
@@ -8028,13 +8501,14 @@ pub(super) mod tests {
                 T: Container where { Item = U::Item::*u8 },
                 U: Container where { Item = u32 },
             >(value: U::Item, ptr: T::Item) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("test").param_types;
 		assert_eq!(params[0], TypeIndex::U32);
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -8045,7 +8519,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_tag_with_a_failed_projection_preserves_the_pointer() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -8061,16 +8536,17 @@ pub(super) mod tests {
                 T: Container where { Item = <U as Project>::Output },
                 U,
             >(value: U, ptr: T::Item::*u8) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -8082,7 +8558,8 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_deferred_projection_failure_preserves_its_surrounding_pointer()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -8099,16 +8576,17 @@ pub(super) mod tests {
                 V: Container where { Item = <U as Project>::Output },
                 U,
             >(value: U, ptr: T::Item) {}
-        "});
+        "}
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		let params = &case.function_signature("test").param_types;
 		assert!(matches!(
-			case.signatures.types.resolve(params[0]),
+			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
 		));
 		assert_eq!(
-			case.signatures.types.resolve(params[1]),
+			case.context.types.resolve(params[1]),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -8119,32 +8597,42 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_associated_type_bound_resolves_to_the_named_traits() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound1 {}
 			trait Bound2 {}
 			trait Container { type Item: Bound1 + Bound2; }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let bounds = &case
 			.assoc_type_signature("Container", "Item")
 			.declared_bounds;
 		assert_eq!(bounds.len(), 2);
 		assert_eq!(
-			case.signatures.bounds.get(bounds[0]).trait_index,
+			case.context.bounds.get(bounds[0]).trait_index,
 			case.trait_index("Bound1")
 		);
 		assert_eq!(
-			case.signatures.bounds.get(bounds[1]).trait_index,
+			case.context.bounds.get(bounds[1]).trait_index,
 			case.trait_index("Bound2")
 		);
 	}
 
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_traits_own_self() {
-		let case = TestCase::new("trait Foo { fn get(self) -> Self; }");
+		test_case!(case = "trait Foo { fn get(self) -> Self; }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.trait_function_signature("Foo", "get");
 		assert_eq!(sig.param_types.len(), 1);
 		assert_eq!(
@@ -8156,12 +8644,18 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_impls_own_concrete_target() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct S {}
 			impl S { fn get(self) -> Self { self } }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.inherent_function_signature("S", "get");
 		assert_eq!(sig.param_types.len(), 1);
 		assert_eq!(
@@ -8171,7 +8665,7 @@ pub(super) mod tests {
 		);
 		assert!(
 			matches!(
-				case.signatures.types.resolve(sig.param_types[0]),
+				case.context.types.resolve(sig.param_types[0]),
 				Type::Struct { .. }
 			),
 			"an inherent impl's `self` is a concrete type, not an abstract \
@@ -8181,27 +8675,40 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_inherent_impl_const_resolves_its_declared_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			struct S {}
 			impl S { const X: i32 = 0; }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.inherent_const_signature("S", "X");
 		assert_eq!(sig.ty, TypeIndex::I32);
 	}
 
 	#[test]
 	fn a_non_self_untyped_inherent_impl_function_parameter_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct S {}
 			impl S { fn get(self, x) -> Self { self } }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::MissingParameterType.code())
 		);
 		let sig = case.inherent_function_signature("S", "get");
@@ -8211,17 +8718,23 @@ pub(super) mod tests {
 	#[test]
 	fn trait_impl_methods_and_associated_functions_use_the_concrete_self_type()
 	{
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Service { fn get(self) -> Self; fn make(x: Self) -> Self; }
 			struct S {}
 			impl Service for S {
 				fn get(self) -> Self { self }
 				fn make(x: Self) -> Self { x }
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let impl_index = case.trait_impl_index("S", "Service");
-		let header = case.signatures.trait_impls[usize::from(impl_index)]
+		let header = case.context.trait_impls[usize::from(impl_index)]
 			.as_ref()
 			.unwrap();
 		for name in ["get", "make"] {
@@ -8235,7 +8748,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_member_generics_inherit_the_impl_scope_and_allow_shadowing() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Service {
 				type Item;
 				fn get<U>(self, x: Self::Item, y: U) -> Self;
@@ -8249,27 +8763,32 @@ pub(super) mod tests {
 				fn shadow<T>(self, x: T) -> Self { self }
 				const VALUE: T = 0;
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let impl_index = case.trait_impl_index("Wrap", "Service");
-		let header = case.signatures.trait_impls[usize::from(impl_index)]
+		let header = case.context.trait_impls[usize::from(impl_index)]
 			.as_ref()
 			.unwrap();
-		let outer = case.signatures.type_envs.frame(header.type_params)[0].ty;
+		let outer = case.context.type_envs.frame(header.type_params)[0].ty;
 		let get = case.trait_impl_function_signature("Wrap", "Service", "get");
 		assert_eq!(get.param_types[0], header.target.inner);
 		assert_eq!(get.param_types[1], outer);
 		assert_eq!(
 			get.param_types[2],
-			case.signatures.type_envs.frame(get.type_params)[0].ty
+			case.context.type_envs.frame(get.type_params)[0].ty
 		);
 		assert_eq!(get.return_type, header.target.inner);
 		assert_eq!(
-			case.signatures.type_envs.parent(get.type_params),
+			case.context.type_envs.parent(get.type_params),
 			Some(header.self_scope)
 		);
 		assert_eq!(
-			case.signatures.type_envs.parent(header.self_scope),
+			case.context.type_envs.parent(header.self_scope),
 			Some(header.type_params)
 		);
 		let shadow =
@@ -8286,7 +8805,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_member_checks_use_enclosing_and_local_assumptions() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
@@ -8301,12 +8821,17 @@ pub(super) mod tests {
 				type Item = T;
 				fn get<U: Container where { Item = i32 }>(self, x: Need<T>, y: Need<U::Item>) {}
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature =
 			case.trait_impl_function_signature("Wrap", "Service", "get");
 		let Type::Struct { type_args, .. } =
-			case.signatures.types.resolve(signature.param_types[2])
+			case.context.types.resolve(signature.param_types[2])
 		else {
 			panic!("expected Need<i32>");
 		};
@@ -8316,7 +8841,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_methods_complete_checks_from_forward_associated_equalities() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
@@ -8329,12 +8855,17 @@ pub(super) mod tests {
 			impl Service for S {
 				fn get<U: Container where { A = Need<U::B>, B = i32 }>(self, x: U::A) {}
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature =
 			case.trait_impl_function_signature("S", "Service", "get");
 		let Type::Struct { type_args, .. } =
-			case.signatures.types.resolve(signature.param_types[1])
+			case.context.types.resolve(signature.param_types[1])
 		else {
 			panic!("expected Need<i32>");
 		};
@@ -8343,7 +8874,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_member_signatures_recover_from_failed_generic_requirements() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Marker {}
 			struct Need<T: Marker> {}
@@ -8353,9 +8885,15 @@ pub(super) mod tests {
 				fn get(self, x: Need<i32>) {}
 				const VALUE: Need<i32> = 0;
 			}
-		"});
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		"}
+		);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
@@ -8365,8 +8903,7 @@ pub(super) mod tests {
 			case.trait_impl_function_signature("S", "Service", "get");
 		let constant = case.trait_impl_const_signature("S", "Service", "VALUE");
 		for ty in [signature.param_types[1], constant.ty] {
-			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(ty)
+			let Type::Struct { type_args, .. } = case.context.types.resolve(ty)
 			else {
 				panic!("expected Need<ERROR>");
 			};
@@ -8376,7 +8913,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_constants_normalize_associated_types_declared_after_them() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Service { type Item; const VALUE: Self::Item; }
 			struct S {}
@@ -8384,8 +8922,13 @@ pub(super) mod tests {
 				const VALUE: Self::Item = 0;
 				type Item = i32;
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.trait_impl_const_signature("S", "Service", "VALUE").ty,
 			TypeIndex::I32
@@ -8394,15 +8937,22 @@ pub(super) mod tests {
 
 	#[test]
 	fn impl_constants_require_explicit_type_annotations() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Service { const VALUE: i32; }
 			struct S {}
 			impl Service for S { const VALUE = 0; }
 			impl S { const OTHER = 0; }
-		"});
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		"}
+		);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.code.as_deref(),
 				Some(DiagnosticCode::MissingConstantType.code())
@@ -8420,7 +8970,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn invalid_trait_impl_member_annotations_are_diagnosed_without_panicking() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Service { fn get(self, x: i32, y: i32) -> i32; const VALUE: i32; }
 			struct S {}
@@ -8428,10 +8979,17 @@ pub(super) mod tests {
 				fn get(self, x, y: _) -> _ {}
 				const VALUE: _ = 0;
 			}
-		"});
-		assert_eq!(case.diagnostics.len(), 4, "{:?}", case.diagnostics);
+		"}
+		);
 		assert_eq!(
-			case.diagnostics
+			case.context.diagnostics.len(),
+			4,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
 					== Some(DiagnosticCode::MissingParameterType.code()))
@@ -8439,7 +8997,8 @@ pub(super) mod tests {
 			1
 		);
 		assert_eq!(
-			case.diagnostics
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
 					== Some(DiagnosticCode::InferInSignature.code()))
@@ -8516,9 +9075,13 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_functions_own_generic_param_is_distinct_from_self() {
-		let case = TestCase::new("trait Foo { fn get<T>(self, x: T) -> T; }");
+		test_case!(case = "trait Foo { fn get<T>(self, x: T) -> T; }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.trait_function_signature("Foo", "get");
 		assert_eq!(sig.param_types.len(), 2);
 		assert_eq!(
@@ -8534,7 +9097,8 @@ pub(super) mod tests {
 	#[test]
 	fn associated_type_signatures_keep_definition_indices_when_resolved_out_of_order()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type bool;
 			trait Result { type Value; const FLAG: bool; }
@@ -8544,8 +9108,13 @@ pub(super) mod tests {
 				type Second: Source;
 				const COUNT: i32;
 			}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 
 		// Resolving First's bound forces Second before First finishes.
 		for (name, expected_trait) in
@@ -8554,18 +9123,15 @@ pub(super) mod tests {
 			let signature = case.assoc_type_signature("Container", name);
 			assert_eq!(signature.declared_bounds.len(), 1);
 			assert_eq!(
-				case.signatures
+				case.context
 					.bounds
 					.get(signature.declared_bounds[0])
 					.trait_index,
 				case.trait_index(expected_trait),
 			);
 		}
-		assert_eq!(
-			case.signatures.assoc_types.len(),
-			case.defs.assoc_types.len()
-		);
-		assert_eq!(case.signatures.constants.len(), case.defs.constants.len());
+		assert_eq!(case.context.assoc_types.len(), case.defs.assoc_types.len());
+		assert_eq!(case.context.constants.len(), case.defs.constants.len());
 		assert_eq!(
 			case.trait_const_signature("Result", "FLAG").ty,
 			TypeIndex::BOOL
@@ -8576,13 +9142,13 @@ pub(super) mod tests {
 		);
 		for (index, def) in case.defs.assoc_types.iter().enumerate() {
 			assert!(matches!(
-				case.signatures.item_lookup[&def.def_id],
+				case.context.signature_location(def.def_id),
 				SignatureLocation::AssocType(found) if usize::from(found) == index
 			));
 		}
 		for (index, def) in case.defs.constants.iter().enumerate() {
 			assert!(matches!(
-				case.signatures.item_lookup[&def.def_id],
+				case.context.signature_location(def.def_id),
 				SignatureLocation::Constant(found) if usize::from(found) == index
 			));
 		}
@@ -8590,22 +9156,32 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_const_resolves_its_declared_type() {
-		let case = TestCase::new("type i32; trait Foo { const X: i32; }");
+		test_case!(case = "type i32; trait Foo { const X: i32; }");
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.trait_const_signature("Foo", "X").ty, TypeIndex::I32);
 	}
 
 	#[test]
 	fn a_trait_consts_type_can_reference_self() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Foo {
 				const X: Self;
 				fn get(self) -> Self;
 			}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.trait_const_signature("Foo", "X").ty,
 			case.trait_function_signature("Foo", "get").return_type,
@@ -8616,14 +9192,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_associated_type_bound_to_a_non_trait_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			struct S {}
 			trait Container { type Item: S; }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitBound.code())
 		);
 		assert!(
@@ -8635,13 +9218,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_where_binding_resolves_an_equals_assoc_type_to_a_concrete_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Memory { type Size; }
 			fn f<Mem: Memory where { Size = i32 }>() {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.function_signature("f").type_params;
 		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
@@ -8658,13 +9247,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_where_binding_resolves_a_bound_assoc_type_to_a_trait() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Unsigned {}
 			trait Memory { type Size; }
 			fn f<Mem: Memory where { Size: Unsigned }>() {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.function_signature("f").type_params;
 		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
@@ -8675,22 +9270,29 @@ pub(super) mod tests {
 		};
 		assert_eq!(rhs_bounds.len(), 1);
 		assert_eq!(
-			case.signatures.bounds.get(rhs_bounds[0]).trait_index,
+			case.context.bounds.get(rhs_bounds[0]).trait_index,
 			case.trait_index("Unsigned")
 		);
 	}
 
 	#[test]
 	fn a_duplicate_where_binding_is_diagnosed_and_only_the_first_is_kept() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Memory { type Size; }
 			fn f<Mem: Memory where { Size = i32, Size = i32 }>() {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
 		let env = case.function_signature("f").type_params;
@@ -8700,15 +9302,22 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_where_binding_naming_an_unknown_associated_type_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Memory { type Size; }
 			fn f<Mem: Memory where { Nope = i32 }>() {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
 		let env = case.function_signature("f").type_params;
@@ -8718,34 +9327,46 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_where_binding_may_reference_a_sibling_param_declared_later() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait PointerSize {}
 			trait Memory { type Size; }
 			fn copy<Src: Memory where { Size = S }, S: PointerSize>() {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.function_signature("copy").type_params;
 		let bounds = case.declared_bounds(env, 0);
 		let BindingRequirement::Equals(ty) = &bounds[0].bindings[0].kind else {
 			panic!("expected an `Equals` binding kind");
 		};
 		assert!(matches!(
-			case.signatures.types.resolve(ty.inner),
+			case.context.types.resolve(ty.inner),
 			Type::TypeParam { param_index: 1, .. }
 		));
 	}
 
 	#[test]
 	fn a_typeset_bound_resolves_to_its_backing_trait() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type i32;
 			typeset Int { u32, i32 }
 			fn f<T: Int>() {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let env = case.function_signature("f").type_params;
 		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
@@ -8754,12 +9375,18 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_typesets_own_clause_becomes_its_backing_traits_supertraits() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Bound {}
 			typeset Int: Bound {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let supertraits = case.typeset_supertraits("Int");
 		assert_eq!(supertraits.len(), 1);
 		assert_eq!(supertraits[0].trait_index, case.trait_index("Bound"));
@@ -8767,73 +9394,101 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_typeset_member_registers_a_synthetic_impl() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset Int { u32 }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.typeset_signature("Int").members[0].inner,
 			TypeIndex::U32
 		);
-		let target = ImplTarget::from_type(
-			case.signatures.types.resolve(TypeIndex::U32),
-		)
-		.unwrap();
-		let candidates = case.signatures.trait_candidates(target);
+		let target =
+			ImplTarget::from_type(case.context.types.resolve(TypeIndex::U32))
+				.unwrap();
+		let candidates = case.context.impl_dispatch.trait_candidates(target);
 		assert_eq!(candidates.len(), 1);
 		assert_eq!(candidates[0].0, case.typeset_trait_index("Int"));
 	}
 
 	#[test]
 	fn a_typeset_used_before_its_own_declaration_still_sees_its_members() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			fn f<T: Int>() {}
 			type u32;
 			typeset Int { u32 }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
-		let target = ImplTarget::from_type(
-			case.signatures.types.resolve(TypeIndex::U32),
-		)
-		.unwrap();
-		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
+		let target =
+			ImplTarget::from_type(case.context.types.resolve(TypeIndex::U32))
+				.unwrap();
+		assert_eq!(
+			case.context.impl_dispatch.trait_candidates(target).len(),
+			1
+		);
 	}
 
 	#[test]
 	fn duplicate_typeset_members_are_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			typeset Int { u32, u32 }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateTraitImpl.code())
 		);
-		let target = ImplTarget::from_type(
-			case.signatures.types.resolve(TypeIndex::U32),
-		)
-		.unwrap();
-		assert_eq!(case.signatures.trait_candidates(target).len(), 1);
+		let target =
+			ImplTarget::from_type(case.context.types.resolve(TypeIndex::U32))
+				.unwrap();
+		assert_eq!(
+			case.context.impl_dispatch.trait_candidates(target).len(),
+			1
+		);
 	}
 
 	#[test]
 	fn self_assoc_type_projects_through_the_traits_own_self() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Global {
 				type Value;
 				fn get(self) -> Self::Value;
 			}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.trait_function_signature("Global", "get");
 		let trait_index = case.trait_index("Global");
-		match case.signatures.types.resolve(sig.return_type) {
+		match case.context.types.resolve(sig.return_type) {
 			Type::AssocTypeProjection {
 				trait_index: found_trait,
 				base,
@@ -8851,17 +9506,23 @@ pub(super) mod tests {
 
 	#[test]
 	fn grouped_bracketed_self_type_projects_the_same_as_a_bare_path() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Global {
 				type Value;
 				fn get(self) -> <Self>::Value;
 			}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.trait_function_signature("Global", "get");
 		let trait_index = case.trait_index("Global");
-		match case.signatures.types.resolve(sig.return_type) {
+		match case.context.types.resolve(sig.return_type) {
 			Type::AssocTypeProjection {
 				trait_index: found_trait,
 				base,
@@ -8877,16 +9538,22 @@ pub(super) mod tests {
 	#[test]
 	fn qualified_path_disambiguates_between_two_bounds_with_the_same_associated_type()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A { type X; }
 			trait B { type X; }
 			fn f<T: A + B>(x: <T as A>::X) { }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let trait_a = case.trait_index("A");
 		match case
-			.signatures
+			.context
 			.types
 			.resolve(case.function_signature("f").param_types[0])
 		{
@@ -8899,16 +9566,22 @@ pub(super) mod tests {
 
 	#[test]
 	fn qualified_path_continues_projecting_after_its_first_segment() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait B { type Y; }
 			trait A { type X: B; }
 			fn f<T: A>(x: <T as A>::X::Y) { }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let trait_b = case.trait_index("B");
 		match case
-			.signatures
+			.context
 			.types
 			.resolve(case.function_signature("f").param_types[0])
 		{
@@ -8922,14 +9595,21 @@ pub(super) mod tests {
 	#[test]
 	fn qualified_path_naming_a_member_the_trait_does_not_declare_is_diagnosed()
 	{
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A { type X; }
 			fn f<T: A>(x: <T as A>::Y) { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
 		assert_eq!(
@@ -8941,15 +9621,22 @@ pub(super) mod tests {
 	#[test]
 	fn qualified_path_naming_a_trait_the_type_param_does_not_have_is_diagnosed()
 	{
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A { type X; }
 			trait B {}
 			fn f<T: B>(x: <T as A>::X) { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 		assert_eq!(
@@ -8960,7 +9647,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn concrete_projection_paths_normalize_forward_references_and_chains() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			fn f(a: Wrapper::Item::Value, b: <Wrapper>::Item::Value,
 				c: <Wrapper as Container>::Item::Value) {}
@@ -8970,8 +9658,13 @@ pub(super) mod tests {
 			struct Inner {}
 			impl Container for Wrapper { type Item = Inner; }
 			impl Element for Inner { type Value = i32; }
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("f").param_types.as_ref(),
 			[TypeIndex::I32; 3]
@@ -8980,7 +9673,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn concrete_projections_normalize_in_compound_signatures() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type u32;
 			trait Memory { type Size; }
@@ -8991,8 +9685,13 @@ pub(super) mod tests {
 			type Actual = fn((Wrapper::Item, Wrapper::Item), *Wrapper::Item) -> Wrapper::Item;
 			type Expected = fn((i32, i32), *i32) -> i32;
 			fn f(a: Actual, b: Expected) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("f").param_types[0],
 			case.function_signature("f").param_types[1]
@@ -9006,18 +9705,25 @@ pub(super) mod tests {
 			"type First = Self::Second; type Second = Self::First;",
 			"type First = (Self::Second, Self::Second); type Second = Self::First;",
 		] {
-			let case = TestCase::new(&format!(
-				"
+			test_case!(
+				case = &format!(
+					"
 				type i32;
 				trait Pair {{ type First; type Second; }}
 				struct Example {{}}
 				impl Pair for Example {{ {definitions} }}
 				fn independent(x: i32) {{}}
 			"
-			));
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+				)
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::CyclicAssociatedType.code())
 			);
 			assert_eq!(
@@ -9029,7 +9735,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn synthetic_values_normalize_and_synthetic_cycles_recover() {
-		let case = TestCase::new(indoc! {r#"
+		test_case!(
+			case = indoc! {r#"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
@@ -9041,15 +9748,20 @@ pub(super) mod tests {
 			memory heap: Wrapper::Item;
 			global counter: Wrapper::Item = 0;
 			import "env" as host { memory shared: Wrapper::Item; global counter: Wrapper::Item; }
-		"#});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"#}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("f").param_types.as_ref(),
 			[TypeIndex::U32; 2]
 		);
 		for def in &case.defs.globals {
 			assert_eq!(
-				case.signatures.assoc_types
+				case.context.assoc_types
 					[usize::from(def.value_assoc_type_index)]
 				.as_ref()
 				.unwrap()
@@ -9061,12 +9773,17 @@ pub(super) mod tests {
 			"memory heap: heap::Size;",
 			"import \"env\" as host { memory heap: host::heap::Size; }",
 		] {
-			let case = TestCase::new(&format!(
-				"trait Memory {{ type Size; }} {declaration}"
-			));
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+			test_case!(
+				case = &format!("trait Memory {{ type Size; }} {declaration}")
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::CyclicAssociatedType.code())
 			);
 		}
@@ -9510,22 +10227,24 @@ pub(super) mod tests {
 			"<Missing as Container>::Item",
 			"<Wrapper as Container>::Item::Next",
 		] {
-			let case = TestCase::new(&format!(
-				"
+			test_case!(
+				case = &format!(
+					"
 				trait Container {{ type Item; }}
 				struct Wrapper {{}}
 				impl Container for Wrapper {{ type Item = Missing; }}
 				fn f(x: {ty}) {{}}
 			"
-			));
+				)
+			);
 			// The invalid impl RHS and (where present) the written Missing
 			// receiver each own an error, with no member-lookup cascades.
 			let expected = if ty.contains("Missing") { 2 } else { 1 };
 			assert_eq!(
-				case.diagnostics.len(),
+				case.context.diagnostics.len(),
 				expected,
 				"{:?}",
-				case.diagnostics
+				case.context.diagnostics
 			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
@@ -9536,21 +10255,28 @@ pub(super) mod tests {
 
 	#[test]
 	fn qualified_path_resolves_a_concrete_impls_associated_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrapper {}
 			impl Container for Wrapper { type Item = i32; }
 			fn f(x: <Wrapper as Container>::Item) { }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
 	}
 
 	#[test]
 	fn generic_impl_projection_substitutes_its_own_target_arguments() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type u32;
 			trait Container { type Item; }
@@ -9558,8 +10284,13 @@ pub(super) mod tests {
 			impl<T> Container for Wrapper<T> { type Item = T; }
 			fn first(x: <Wrapper<i32> as Container>::Item) {}
 			fn second(x: <Wrapper<u32> as Container>::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(
 			case.function_signature("first").param_types[0],
 			TypeIndex::I32
@@ -9572,7 +10303,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn generic_impl_target_matches_nested_and_repeated_arguments() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			type u32;
 			trait Container { type Item; }
@@ -9581,7 +10313,8 @@ pub(super) mod tests {
 			impl<T> Container for Pair<Inner<T>, Inner<T>> { type Item = T; }
 			fn good(x: <Pair<Inner<i32>, Inner<i32>> as Container>::Item) {}
 			fn bad(x: <Pair<Inner<i32>, Inner<u32>> as Container>::Item) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("good").param_types[0],
 			TypeIndex::I32
@@ -9590,16 +10323,22 @@ pub(super) mod tests {
 			case.function_signature("bad").param_types[0],
 			TypeIndex::ERROR
 		);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 	}
 
 	#[test]
 	fn generic_impl_requires_its_inferred_arguments_bounds() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Good {}
 			trait Container { type Item; }
@@ -9610,7 +10349,8 @@ pub(super) mod tests {
 			impl<T: Good> Container for Wrapper<T> { type Item = i32; }
 			fn good(x: <Wrapper<Yes> as Container>::Item) {}
 			fn bad(x: <Wrapper<No> as Container>::Item) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("good").param_types[0],
 			TypeIndex::I32
@@ -9619,16 +10359,22 @@ pub(super) mod tests {
 			case.function_signature("bad").param_types[0],
 			TypeIndex::ERROR
 		);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 	}
 
 	#[test]
 	fn generic_impl_bound_checks_descend_through_nested_targets() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Mark {}
 			trait Container { type Item; }
@@ -9640,7 +10386,8 @@ pub(super) mod tests {
 			impl<T: Mark> Container for Wrap<T> { type Item = i32; }
 			fn good(x: <Wrap<Wrap<Leaf>> as Container>::Item) {}
 			fn bad(x: <Wrap<Wrap<Missing>> as Container>::Item) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("good").param_types[0],
 			TypeIndex::I32
@@ -9649,37 +10396,45 @@ pub(super) mod tests {
 			case.function_signature("bad").param_types[0],
 			TypeIndex::ERROR
 		);
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 	}
 
 	#[test]
 	fn generic_impl_with_undetermined_parameter_does_not_match() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrapper<T> {}
 			impl<T> Container for Wrapper<i32> { type Item = T; }
 			fn f(x: <Wrapper<i32> as Container>::Item) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("f").param_types[0],
 			TypeIndex::ERROR
 		);
 		assert!(
-			case.diagnostics.iter().any(|d| d.code.as_deref()
+			case.context.diagnostics.iter().any(|d| d.code.as_deref()
 				== Some(DiagnosticCode::TraitBoundViolation.code())),
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
 	#[test]
 	fn generic_impl_bound_equalities_are_not_silently_assumed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Source { type Item; }
 			trait Container { type Item; }
@@ -9690,22 +10445,24 @@ pub(super) mod tests {
 				type Item = i32;
 			}
 			fn f(x: <Wrapper<Value> as Container>::Item) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("f").param_types[0],
 			TypeIndex::ERROR
 		);
 		assert!(
-			case.diagnostics.iter().any(|d| d.code.as_deref()
+			case.context.diagnostics.iter().any(|d| d.code.as_deref()
 				== Some(DiagnosticCode::TraitBoundViolation.code())),
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
 	#[test]
 	fn generic_projection_cycle_appears_only_after_substitution() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Project { type Out; }
 			struct Wrap<T> {}
@@ -9716,7 +10473,8 @@ pub(super) mod tests {
 			impl Project for Loop { type Out = Wrap<Loop>::Out; }
 			fn finite(x: <Wrap<End> as Project>::Out) {}
 			fn cyclic(x: <Wrap<Loop> as Project>::Out) {}
-		"});
+		"}
+		);
 		assert_eq!(
 			case.function_signature("finite").param_types[0],
 			TypeIndex::I32
@@ -9726,25 +10484,32 @@ pub(super) mod tests {
 			TypeIndex::ERROR
 		);
 		assert!(
-			case.diagnostics.iter().any(|d| d.code.as_deref()
+			case.context.diagnostics.iter().any(|d| d.code.as_deref()
 				== Some(DiagnosticCode::CyclicAssociatedType.code())),
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
 	#[test]
 	fn qualified_path_naming_a_trait_the_concrete_type_does_not_implement_is_diagnosed()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Container { type Item; }
 			struct Wrapper {}
 			fn f(x: <Wrapper as Container>::Item) { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 		assert_eq!(
@@ -9761,16 +10526,22 @@ pub(super) mod tests {
 	/// below). Fixed to mirror its sibling arms exactly.
 	#[test]
 	fn assoc_type_declared_bound_can_reference_the_traits_own_self() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Elem { type Assoc; }
 			trait Container {
 				type Item: Elem where { Assoc = Self::Item };
 			}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.assoc_type_signature("Container", "Item");
-		let bound = case.signatures.bounds.get(sig.declared_bounds[0]);
+		let bound = case.context.bounds.get(sig.declared_bounds[0]);
 		let SourceAssocBinding {
 			kind: BindingRequirement::Equals(value),
 			..
@@ -9780,18 +10551,17 @@ pub(super) mod tests {
 		};
 
 		let container_index = case.trait_index("Container");
-		match case.signatures.types.resolve(value.inner) {
+		match case.context.types.resolve(value.inner) {
 			Type::AssocTypeProjection {
 				trait_index, base, ..
 			} => {
 				assert_eq!(*trait_index, container_index);
-				match case.signatures.types.resolve(*base) {
+				match case.context.types.resolve(*base) {
 					Type::TypeParam { env, param_index } => {
 						assert_eq!(
 							*env,
-							case.signatures.traits
-								[usize::from(container_index)]
-							.env
+							case.context.traits[usize::from(container_index)]
+								.env
 						);
 						assert_eq!(
 							*param_index, 0,
@@ -9811,33 +10581,46 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_bound_generic_params_associated_type_projects_through_the_bound() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait HasSize { type Size; }
 			fn f<T: HasSize>(x: T::Size) -> T::Size { x }
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let sig = case.function_signature("f");
 		assert_eq!(
 			sig.param_types[0], sig.return_type,
 			"`x: T::Size` and `-> T::Size` should resolve to the same projection"
 		);
 		assert!(matches!(
-			case.signatures.types.resolve(sig.return_type),
+			case.context.types.resolve(sig.return_type),
 			Type::AssocTypeProjection { .. }
 		));
 	}
 
 	#[test]
 	fn a_missing_associated_type_on_a_bound_is_diagnosed() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Empty {}
 			fn f<T: Empty>(x: T::Missing) { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
 		assert_eq!(
@@ -9848,15 +10631,22 @@ pub(super) mod tests {
 
 	#[test]
 	fn two_bounds_both_declaring_the_same_associated_type_is_ambiguous() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait A { type X; }
 			trait B { type X; }
 			fn f<T: A + B>(x: T::X) { }
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::AmbiguousTraitMember.code())
 		);
 		assert_eq!(
@@ -9876,24 +10666,31 @@ pub(super) mod tests {
 	#[test]
 	fn a_functions_own_bound_combination_with_conflicting_assoc_type_bindings_is_diagnosed_eagerly()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
 			fn f<T: B + C>(x: T::X) { }
-		"});
+		"}
+		);
 
 		case.diagnostics().print();
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"`T` requires conflicting bindings for `A::X`"
 		);
 		// The conflict is a fact about `A::X`'s *value*, not its identity —
@@ -9902,7 +10699,7 @@ pub(super) mod tests {
 		// Normalization cannot select either conflicting value, so the
 		// existing bound-conflict diagnostic remains the only error.
 		let param_ty = case.function_signature("f").param_types[0];
-		match case.signatures.types.resolve(param_ty) {
+		match case.context.types.resolve(param_ty) {
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, case.trait_index("A"));
 			}
@@ -9919,24 +10716,31 @@ pub(super) mod tests {
 	#[test]
 	fn a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
 			fn f<T: B + C>() { }
-		"});
+		"}
+		);
 
 		case.diagnostics().print();
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics[0].message,
 			"`T` requires conflicting bindings for `A::X`"
 		);
 	}
@@ -9957,16 +10761,21 @@ pub(super) mod tests {
 			trait C: A where { X = u64 } {}
 			trait D: B + C {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
 		case.diagnostics().print();
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].code.as_deref(),
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
-		let labels = &case.diagnostics[0].labels;
+		let labels = &case.context.diagnostics[0].labels;
 		assert_eq!(labels.len(), 3);
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
@@ -9981,10 +10790,15 @@ pub(super) mod tests {
 			trait A { type X; }
 			trait D: A where { X = u32 } + A where { X = u64 } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		let labels = &case.diagnostics[0].labels;
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		let labels = &case.context.diagnostics[0].labels;
 		assert_eq!(labels.len(), 3);
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
@@ -9993,16 +10807,23 @@ pub(super) mod tests {
 
 	#[test]
 	fn conflicting_binding_does_not_poison_another_associated_type() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait A { type X; type Y; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
 			fn f<T: B + C>(x: T::Y) {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_ne!(
 			case.function_signature("f").param_types[0],
 			TypeIndex::ERROR
@@ -10018,10 +10839,15 @@ pub(super) mod tests {
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item: Inner where { X = u64 } } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		let labels = &case.diagnostics[0].labels;
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		let labels = &case.context.diagnostics[0].labels;
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
 	}
@@ -10035,10 +10861,15 @@ pub(super) mod tests {
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
-		let labels = &case.diagnostics[0].labels;
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		let labels = &case.context.diagnostics[0].labels;
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
 	}
@@ -10054,21 +10885,25 @@ pub(super) mod tests {
 			trait B: Inner where { X = u32 } {}
 			trait C: Inner where { X = u64 } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
 		case.diagnostics().print();
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 		assert_eq!(
-			case.diagnostics[0].message,
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(
+			case.context.diagnostics[0].message,
 			"`D` requires conflicting bindings for `Inner::X`"
 		);
-		let labels = &case.diagnostics[0].labels;
+		let labels = &case.context.diagnostics[0].labels;
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
-		let env =
-			case.signatures.traits[usize::from(case.trait_index("D"))].env;
-		let merged = case.signatures.param_bounds[usize::from(env)][0]
+		let env = case.context.traits[usize::from(case.trait_index("D"))].env;
+		let merged = case.context.param_bounds[usize::from(env)][0]
 			.facts
 			.current()
 			.iter()
@@ -10094,14 +10929,19 @@ pub(super) mod tests {
 			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item = u32 } {}
 			trait E: Outer where { Item = u32 } + Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } {}
 		"};
-		let case = TestCase::new(source);
+		test_case!(case = source);
 
-		assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			2,
+			"{:?}",
+			case.context.diagnostics
+		);
 		for trait_name in ["D", "E"] {
-			let env = case.signatures.traits
+			let env = case.context.traits
 				[usize::from(case.trait_index(trait_name))]
 			.env;
-			let merged = case.signatures.param_bounds[usize::from(env)][0]
+			let merged = case.context.param_bounds[usize::from(env)][0]
 				.facts
 				.current()
 				.iter()
@@ -10122,34 +10962,47 @@ pub(super) mod tests {
 
 	#[test]
 	fn inherited_nested_conflict_is_not_reported_again() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
 			trait E: D {}
-		"});
+		"}
+		);
 
-		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
+		);
 	}
 
 	#[test]
 	fn equality_wins_over_associated_type_bounds_in_either_order() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			trait Mark {}
 			trait A { type X; }
 			trait D: A where { X: Mark } + A where { X = u32 } {}
 			trait E: A where { X = u32 } + A where { X: Mark } {}
-		"});
+		"}
+		);
 
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for trait_name in ["D", "E"] {
-			let env = case.signatures.traits
+			let env = case.context.traits
 				[usize::from(case.trait_index(trait_name))]
 			.env;
-			let bounds = &case.signatures.param_bounds[usize::from(env)][0];
+			let bounds = &case.context.param_bounds[usize::from(env)][0];
 			let merged = bounds
 				.facts
 				.current()
@@ -10166,15 +11019,21 @@ pub(super) mod tests {
 	}
 	#[test]
 	fn normalization_uses_direct_and_chained_equality_facts() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrapper {}
 			impl Container for Wrapper { type Item = i32; }
 			fn direct<T: Container where { Item = i32 }>(x: T::Item) {}
 			fn chained<T: Container where { Item = <Wrapper as Container>::Item }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["direct", "chained"] {
 			assert_eq!(
 				case.function_signature(name).param_types[0],
@@ -10185,32 +11044,44 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_rebinds_self_through_multiple_supertraits() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Base { type Item; }
 			trait Middle: Base where { Item = Self } {}
 			trait Final: Middle {}
 			fn f<T: Final>(x: T::Item) {}
 			fn g<U: Final>(x: U::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g"] {
 			let signature = case.function_signature(name);
 			assert!(
-				matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+				matches!(case.context.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
 			);
 		}
 	}
 
 	#[test]
 	fn normalization_reads_nested_constraints_and_deduplicates_memberships() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner; }
 			fn f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
 			fn g<T: Outer where { Item: Inner where { Value = i32 } }>(x: <T::Item as Inner>::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g"] {
 			assert_eq!(
 				case.function_signature(name).param_types[0],
@@ -10221,58 +11092,82 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_reads_nested_constraints_without_a_declared_trait_bound() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			fn f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
 	}
 
 	#[test]
 	fn normalization_rebinds_self_in_inherited_nested_facts() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			trait Middle: Outer where { Item: Inner where { Value = Self } } {}
 			trait Final: Middle {}
 			fn f<T: Final>(x: T::Item::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("f");
 		assert!(
-			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+			matches!(case.context.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
 		);
 	}
 
 	#[test]
 	fn normalization_rebinds_self_in_associated_declaration_facts() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
 			fn f<T: Outer>(x: T::Item::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("f");
 		assert!(
-			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+			matches!(case.context.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
 		);
 	}
 
 	#[test]
 	fn normalization_preserves_nested_facts_when_an_outer_equality_supplies_a_value()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			fn f<T: Outer where { Item = U } + Outer where { Item: Inner where { Value = i32 } }, U>(x: T::Item::Value) {}
 			fn g<T: Outer where { Item: Inner where { Value = i32 } } + Outer where { Item = U }, U>(x: <T::Item as Inner>::Value) {}
 			fn h<T: Outer where { Item = U } + Outer where { Item: Inner where { Value = i32 } }, U>(x: <T::Item>::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g", "h"] {
 			assert_eq!(
 				case.function_signature(name).param_types[0],
@@ -10283,13 +11178,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_resolves_sibling_projection_equalities_in_either_order() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			fn f<T: Container where { Item = U::Item }, U: Container where { Item = i32 }>(x: T::Item) {}
 			fn g<U: Container where { Item = i32 }, T: Container where { Item = U::Item }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g"] {
 			assert_eq!(
 				case.function_signature(name).param_types[0],
@@ -10301,7 +11202,8 @@ pub(super) mod tests {
 	#[test]
 	fn normalization_handles_reciprocal_integer_facts_without_conformance_checks()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u8;
 			type i8;
 			trait UnsignedInt { type Signed: SignedInt where { Unsigned = Self }; }
@@ -10311,12 +11213,17 @@ pub(super) mod tests {
 			fn f<T: UnsignedInt>(x: <T::Signed as SignedInt>::Unsigned) {}
 			fn g<T: SignedInt>(x: <T::Unsigned as UnsignedInt>::Signed) {}
 			fn concrete(x: <u8 as UnsignedInt>::Signed::Unsigned) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g"] {
 			let signature = case.function_signature(name);
 			assert!(
-				matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+				matches!(case.context.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
 			);
 		}
 		assert_eq!(
@@ -10328,17 +11235,23 @@ pub(super) mod tests {
 	#[test]
 	fn normalization_blocks_tautological_mutual_and_structural_abstract_equalities()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Pair { type First; type Second; }
 			fn tautology<T: Pair where { First = T::First }>(x: T::First) {}
 			fn mutual<T: Pair where { First = T::Second, Second = T::First }>(x: T::First, y: T::Second) {}
 			fn structural<T: Pair where { First = (T::First,) }>(x: T::First) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["tautology", "mutual", "structural"] {
 			for &ty in &case.function_signature(name).param_types {
 				assert!(matches!(
-					case.signatures.types.resolve(ty),
+					case.context.types.resolve(ty),
 					Type::AssocTypeProjection { .. }
 				));
 			}
@@ -10347,16 +11260,22 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_leaves_competing_symbolic_equalities_unresolved() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			fn f<T: Container where { Item = U } + Container where { Item = V }, U, V>(x: T::Item) {}
 			fn equivalent<T: Container where { Item = U::Item } + Container where { Item = i32 }, U: Container where { Item = i32 }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "equivalent"] {
 			assert!(matches!(
-				case.signatures
+				case.context
 					.types
 					.resolve(case.function_signature(name).param_types[0]),
 				Type::AssocTypeProjection { .. }
@@ -10366,13 +11285,19 @@ pub(super) mod tests {
 
 	#[test]
 	fn collecting_equality_facts_does_not_check_associated_value_conformance() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Mark {}
 			trait Container { type Item: Mark; }
 			fn f<T: Container where { Item = i32 }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
 	}
 
@@ -10438,44 +11363,62 @@ pub(super) mod tests {
 	}
 	#[test]
 	fn contextual_equalities_agree_after_self_substitution() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
 			fn f<T: Outer where { Item: Inner where { Value = T } }>(x: T::Item::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("f");
 		assert!(
-			matches!(case.signatures.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
+			matches!(case.context.types.resolve(signature.param_types[0]), Type::TypeParam { env, param_index: 0 } if *env == signature.type_params)
 		);
 	}
 
 	#[test]
 	fn equality_rhs_can_read_a_later_siblings_nested_memberships() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			fn f<T: Outer where { Item = U::Item::Value }, U: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert_eq!(case.function_signature("f").param_types[0], TypeIndex::I32);
 	}
 
 	#[test]
 	fn mutually_referencing_associated_bound_facts_do_not_require_conformance()
 	{
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Value { type Item; }
 			trait Pair {
 				type First: Value where { Item = Self::Second::Item };
 				type Second: Value where { Item = Self::First::Item };
 			}
 			fn f<T: Pair>(x: T::First::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		assert!(matches!(
-			case.signatures
+			case.context
 				.types
 				.resolve(case.function_signature("f").param_types[0]),
 			Type::AssocTypeProjection { .. }
@@ -10483,15 +11426,21 @@ pub(super) mod tests {
 	}
 	#[test]
 	fn normalization_reads_facts_through_multiple_nested_projection_sources() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Leaf { type Value; }
 			trait Branch { type Item; }
 			trait Outer { type Branch; }
 			fn f<T: Outer where { Branch: Branch where { Item: Leaf where { Value = i32 } } }>(x: T::Branch::Item::Value) {}
 			fn g<T: Outer where { Branch: Branch where { Item: Leaf where { Value = i32 } } }>(x: <T::Branch::Item as Leaf>::Value) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for name in ["f", "g"] {
 			assert_eq!(
 				case.function_signature(name).param_types[0],
@@ -10502,28 +11451,40 @@ pub(super) mod tests {
 
 	#[test]
 	fn nested_projection_sources_keep_the_declaring_self_context() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			trait Leaf { type Value; }
 			trait Branch { type Item; }
 			trait Marked: Branch where { Item: Leaf where { Value = Self } } {}
 			trait Outer { type Branch: Marked; }
 			fn f<T: Outer>(x: T::Branch::Item::Value, y: T::Branch) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		let signature = case.function_signature("f");
 		assert_eq!(signature.param_types[0], signature.param_types[1]);
 	}
 
 	#[test]
 	fn source_equalities_preserve_projections_inside_compound_types() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrap<X> {}
 			fn f<U: Container where { Item = i32 }, T: Container where { Item = Wrap<(U::Item,)> }>(x: T::Item) {}
 			fn g<T: Container where { Item = Wrap<(U::Item,)> }, U: Container where { Item = i32 }>(x: T::Item) {}
-		"});
-		assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert!(
+			case.context.diagnostics.is_empty(),
+			"{:?}",
+			case.context.diagnostics
+		);
 		for (name, t_index, u_index) in [("f", 1, 0), ("g", 0, 1)] {
 			let signature = case.function_signature(name);
 			let source = case.declared_bounds(signature.type_params, t_index);
@@ -10531,7 +11492,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected equality");
 			};
-			let types = &case.signatures.types;
+			let types = &case.context.types;
 			let Type::Struct { type_args, .. } = types.resolve(value.inner)
 			else {
 				panic!("expected Wrap");
@@ -10561,21 +11522,29 @@ pub(super) mod tests {
 
 	#[test]
 	fn bound_reservations_survive_invalid_occurrences_and_signature_demands() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Leaf { type Value; }
 			trait Outer { type Item; }
 			fn f<T: i32 + Outer where { Missing: Leaf, Item: i32 + Leaf where { Value = Later<U> }, Item: Leaf }, U: Outer>(x: T::Item::Value) {}
 			struct Later<X: Outer> {}
-		"});
-		assert_eq!(case.diagnostics.len(), 4, "{:?}", case.diagnostics);
+		"}
+		);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			4,
+			"{:?}",
+			case.context.diagnostics
+		);
 		for (code, count) in [
 			(DiagnosticCode::NotATraitBound, 2),
 			(DiagnosticCode::NotATraitMember, 1),
 			(DiagnosticCode::DuplicateAssocTypeBinding, 1),
 		] {
 			assert_eq!(
-				case.diagnostics
+				case.context
+					.diagnostics
 					.iter()
 					.filter(|d| d.code.as_deref() == Some(code.code()))
 					.count(),
@@ -10586,13 +11555,13 @@ pub(super) mod tests {
 		let Type::Struct {
 			struct_index,
 			type_args,
-		} = case.signatures.types.resolve(signature.param_types[0])
+		} = case.context.types.resolve(signature.param_types[0])
 		else {
 			panic!("valid nested facts must remain usable");
 		};
 		assert_eq!(*struct_index, case.struct_index("Later"));
 		assert!(
-			matches!(case.signatures.types.resolve(type_args[0]), Type::TypeParam { env, param_index: 1 } if *env == signature.type_params)
+			matches!(case.context.types.resolve(type_args[0]), Type::TypeParam { env, param_index: 1 } if *env == signature.type_params)
 		);
 	}
 
@@ -10605,7 +11574,8 @@ pub(super) mod tests {
 	#[test]
 	fn satisfaction_normalizes_an_abstract_projection_before_checking_trait_membership()
 	 {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
@@ -10613,8 +11583,14 @@ pub(super) mod tests {
 			struct Need<X: Marker> {}
 
 			fn f<U: Value where { Item = i32 }>(x: Need<U::Item>) {}
-		"});
-		assert_eq!(case.diagnostics, Vec::new(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert_eq!(
+			*case.context.diagnostics,
+			Vec::new(),
+			"{:?}",
+			case.context.diagnostics
+		);
 	}
 
 	/// Regression test: structural impl matching used to normalize only the
@@ -10627,7 +11603,8 @@ pub(super) mod tests {
 	/// converges on.
 	#[test]
 	fn structural_match_normalizes_nested_receiver_type_arguments() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type i32;
 			trait Value { type Item; }
 			trait Result { type Out; }
@@ -10635,8 +11612,14 @@ pub(super) mod tests {
 			impl Result for Wrap<i32> { type Out = i32; }
 
 			fn f<S: Value where { Item = i32 }>(x: <Wrap<S::Item> as Result>::Out) {}
-		"});
-		assert_eq!(case.diagnostics, Vec::new(), "{:?}", case.diagnostics);
+		"}
+		);
+		assert_eq!(
+			*case.context.diagnostics,
+			Vec::new(),
+			"{:?}",
+			case.context.diagnostics
+		);
 	}
 
 	/// Regression test for a bug in `union_trait_bound`'s merge: a concrete
@@ -10650,60 +11633,73 @@ pub(super) mod tests {
 	/// diagnose the same way regardless of order.
 	#[test]
 	fn conflicting_equality_is_diagnosed_around_a_symbolic_middle_term() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait A { type Item; }
 			trait Value { type Item; }
 
 			fn f<V: Value, T: A where { Item = u32 } + A where { Item = V::Item } + A where { Item = u64 }>() {}
-		"});
+		"}
+		);
 		assert!(
-			case.diagnostics.iter().any(|d| d.code.as_deref()
+			case.context.diagnostics.iter().any(|d| d.code.as_deref()
 				== Some(DiagnosticCode::DuplicateAssocTypeBinding.code())),
 			"expected u32/u64 to still be flagged as conflicting even with a symbolic term between them: {:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
 	#[test]
 	fn conflicting_equality_is_diagnosed_with_symbolic_term_last() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
 			type u32;
 			type u64;
 			trait A { type Item; }
 			trait Value { type Item; }
 
 			fn f<V: Value, T: A where { Item = u32 } + A where { Item = u64 } + A where { Item = V::Item }>() {}
-		"});
+		"}
+		);
 		assert!(
-			case.diagnostics.iter().any(|d| d.code.as_deref()
+			case.context.diagnostics.iter().any(|d| d.code.as_deref()
 				== Some(DiagnosticCode::DuplicateAssocTypeBinding.code())),
 			"{:?}",
-			case.diagnostics
+			case.context.diagnostics
 		);
 	}
 
-	mod finished_signature_handoff {
+	mod sweep_complete {
 		use super::*;
 		use crate::tir::assumptions::AssumptionKind;
 		use crate::tir::bounds::{ImpliedBindingKind, Readiness};
 
-		fn checked_case(source: &str) -> TestCase {
-			let case = TestCase::new(source);
+		fn assert_graph_clean(graph: &vfs::CompilationUnit) {
 			DiagnosticView::new(
 				"parse",
-				&case.graph.collect_parser_diagnostics(),
-				&case.graph.files,
+				&graph.collect_parser_diagnostics(),
+				&graph.files,
 			)
 			.assert_no_errors();
 			DiagnosticView::new(
 				"link",
-				&case.graph.collect_linker_diagnostics(),
-				&case.graph.files,
+				&graph.collect_linker_diagnostics(),
+				&graph.files,
 			)
 			.assert_no_errors();
-			case
+		}
+
+		macro_rules! checked_case {
+			($case:ident = $source:expr $(,)?) => {
+				test_case!($case = $source);
+				assert_graph_clean($case.graph);
+			};
+			(mut $case:ident = $source:expr $(,)?) => {
+				test_case!(mut $case = $source);
+				assert_graph_clean($case.graph);
+			};
 		}
 
 		#[test]
@@ -10810,25 +11806,29 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn finished_context_preserves_evidence_for_a_normalized_parameter() {
-			let mut case = checked_case(indoc! {"
+		fn swept_context_preserves_evidence_for_a_normalized_parameter() {
+			checked_case!(mut case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 fn f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {}
             "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let signature = case.function_signature("f");
 			let cx = signature.assumption_context();
 			let stored = signature.param_types[0];
-			let params = case.signatures.type_envs.frame(cx.scope());
+			let params = case.context.type_envs.frame(cx.scope());
 			assert_eq!(stored, params[1].ty);
 			let projection =
-				case.signatures.types.intern(Type::AssocTypeProjection {
+				case.context.types.intern(Type::AssocTypeProjection {
 					base: params[0].ty,
 					trait_index: TraitIdx::new(1),
 					assoc_type_index: AssocTypeIdx::new(0),
 				});
-			let (reader, types) = case.signatures.assumptions();
+			let (reader, types) = case.context.assumptions();
 			let mut facts = reader.scoped_facts(cx, types);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut memberships = Vec::new();
@@ -10851,7 +11851,7 @@ pub(super) mod tests {
 			}
 			assert!(memberships.contains(&(projection, TraitIdx::new(0))));
 			let BindingRequirement::Equals(source) =
-				case.signatures.bounds.binding(equality.unwrap()).kind
+				case.context.bounds.binding(equality.unwrap()).kind
 			else {
 				panic!()
 			};
@@ -10860,7 +11860,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn successful_deferred_checks_keep_symbolic_source_evidence() {
-			let mut case = checked_case(indoc! {"
+			checked_case!(mut case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -10868,43 +11868,47 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 fn f<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item) {}
             "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let signature = case.function_signature("f");
 			let cx = signature.assumption_context();
 			let stored = signature.param_types[0];
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(stored)
+				case.context.types.resolve(stored)
 			else {
 				panic!()
 			};
 			assert_eq!(type_args.as_ref(), &[TypeIndex::I32]);
-			let ImpliedBindingKind::Equals(value) =
-				case.signatures.param_bounds[usize::from(cx.scope())][0]
-					.facts
-					.current()[0]
-					.bindings[0]
-					.kind
+			let ImpliedBindingKind::Equals(value) = case.context.param_bounds
+				[usize::from(cx.scope())][0]
+				.facts
+				.current()[0]
+				.bindings[0]
+				.kind
 			else {
 				panic!()
 			};
 			let raw = value.value;
 			let source = value.source;
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(raw)
+				case.context.types.resolve(raw)
 			else {
 				panic!()
 			};
 			assert!(matches!(
-				case.signatures.types.resolve(type_args[0]),
+				case.context.types.resolve(type_args[0]),
 				Type::AssocTypeProjection { .. }
 			));
 			let BindingRequirement::Equals(value) =
-				case.signatures.bounds.binding(source).kind
+				case.context.bounds.binding(source).kind
 			else {
 				panic!()
 			};
 			assert_eq!(value.inner, raw);
-			let (reader, types) = case.signatures.assumptions();
+			let (reader, types) = case.context.assumptions();
 			let mut facts = reader.scoped_facts(cx, types);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut retained = false;
@@ -10920,7 +11924,7 @@ pub(super) mod tests {
 		}
 
 		fn memberships(
-			registry: &mut SignatureRegistry,
+			registry: &mut TypeContext<'_, '_, '_>,
 			cx: AssumptionContext,
 		) -> Vec<(TypeIndex, TraitIdx)> {
 			let (reader, types) = registry.assumptions();
@@ -10937,7 +11941,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn method_context_keeps_local_evidence_about_an_outer_parameter() {
-			let mut case = checked_case(indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Outer {}
                 trait Marker {}
                 trait Container { type Item; }
@@ -10948,7 +11952,11 @@ pub(super) mod tests {
                 }
                 fn free() {}
             "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let function = |name| {
 				case.defs
 					.functions
@@ -10961,44 +11969,38 @@ pub(super) mod tests {
 			let scoped = function("scoped");
 			let plain = function("plain");
 			let free = function("free");
-			let outer_env = case.signatures.inherent_impls[0]
-				.as_ref()
-				.unwrap()
-				.type_params;
-			let outer = case.signatures.type_envs.frame(outer_env)[0].ty;
-			let cx = case.signatures.functions[scoped].assumption_context();
+			let outer_env =
+				case.context.inherent_impls[0].as_ref().unwrap().type_params;
+			let outer = case.context.type_envs.frame(outer_env)[0].ty;
+			let cx = case.context.functions[scoped].assumption_context();
 			assert_ne!(
 				cx.scope(),
 				outer_env,
 				"the normalized parameter's owner is not the body's context"
 			);
-			assert_eq!(case.signatures.functions[scoped].param_types[1], outer);
-			let plain_cx =
-				case.signatures.functions[plain].assumption_context();
+			assert_eq!(case.context.functions[scoped].param_types[1], outer);
+			let plain_cx = case.context.functions[plain].assumption_context();
 			assert_eq!(
 				plain_cx.scope(),
-				case.signatures.inherent_impls[0]
-					.as_ref()
-					.unwrap()
-					.self_scope
+				case.context.inherent_impls[0].as_ref().unwrap().self_scope
 			);
-			let free_cx = case.signatures.functions[free].assumption_context();
+			let free_cx = case.context.functions[free].assumption_context();
 			assert_eq!(free_cx.scope(), TypeEnvIdx::ROOT);
-			let local = memberships(&mut case.signatures, cx);
+			let local = memberships(&mut case.context, cx);
 			assert!(local.contains(&(outer, TraitIdx::new(0))));
 			assert!(local.iter().any(|&(_, index)| index == TraitIdx::new(1)));
 			assert_eq!(
-				memberships(&mut case.signatures, plain_cx),
+				memberships(&mut case.context, plain_cx),
 				vec![(outer, TraitIdx::new(0))]
 			);
-			assert!(memberships(&mut case.signatures, free_cx).is_empty());
+			assert!(memberships(&mut case.context, free_cx).is_empty());
 		}
 
 		#[test]
-		fn trait_body_context_and_instantiated_declaration_bounds_survive_handoff()
+		fn trait_body_context_and_instantiated_declaration_bounds_survive_the_sweep()
 		 {
 			use crate::tir::types::Substitution;
-			let mut case = checked_case(indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Project { type Output; }
                 trait Parent {}
                 trait Child: Parent {
@@ -11007,7 +12009,11 @@ pub(super) mod tests {
                 }
                 fn user<T: Child>(x: T::Item) {}
             "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let index = case
 				.defs
 				.functions
@@ -11017,22 +12023,22 @@ pub(super) mod tests {
 						== Some("provided")
 				})
 				.unwrap();
-			let cx = case.signatures.functions[index].assumption_context();
-			let self_env = case.signatures.traits[2].env;
-			let trait_self = case.signatures.type_envs.frame(self_env)[0].ty;
+			let cx = case.context.functions[index].assumption_context();
+			let self_env = case.context.traits[2].env;
+			let trait_self = case.context.type_envs.frame(self_env)[0].ty;
 			assert_eq!(cx.scope(), self_env);
 			assert_eq!(
-				case.signatures.functions[index].param_types[0],
+				case.context.functions[index].param_types[0],
 				trait_self
 			);
-			let facts = memberships(&mut case.signatures, cx);
+			let facts = memberships(&mut case.context, cx);
 			assert!(facts.contains(&(trait_self, TraitIdx::new(2))));
 			assert!(facts.contains(&(trait_self, TraitIdx::new(1))));
 			let signature = case.function_signature("user");
 			let subject = signature.param_types[0];
 			let receiver =
-				case.signatures.type_envs.frame(signature.type_params)[0].ty;
-			let (reader, types) = case.signatures.assumptions();
+				case.context.type_envs.frame(signature.type_params)[0].ty;
+			let (reader, types) = case.context.assumptions();
 			let mut facts = reader.subject_facts(subject, types, 128);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut equalities = 0;
@@ -11233,38 +12239,53 @@ pub(super) mod tests {
 			TraitMemberSelection,
 		};
 
-		fn checked_case(source: &str) -> TestCase {
-			let case = TestCase::new(source);
+		fn assert_graph_clean(graph: &vfs::CompilationUnit) {
 			DiagnosticView::new(
 				"parse",
-				&case.graph.collect_parser_diagnostics(),
-				&case.graph.files,
+				&graph.collect_parser_diagnostics(),
+				&graph.files,
 			)
 			.assert_no_errors();
 			DiagnosticView::new(
 				"link",
-				&case.graph.collect_linker_diagnostics(),
-				&case.graph.files,
+				&graph.collect_linker_diagnostics(),
+				&graph.files,
 			)
 			.assert_no_errors();
-			case
+		}
+
+		macro_rules! checked_case {
+			($case:ident = $source:expr $(,)?) => {
+				test_case!($case = $source);
+				assert_graph_clean($case.graph);
+			};
+			(mut $case:ident = $source:expr $(,)?) => {
+				test_case!(mut $case = $source);
+				assert_graph_clean($case.graph);
+			};
 		}
 
 		#[test]
 		fn equivalent_subjects_support_unqualified_and_qualified_members() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item; }
                 fn f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output, y: <U as Project>::Output) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let signature = case.function_signature("f");
 			assert_eq!(signature.param_types[0], signature.param_types[1]);
 			let Type::AssocTypeProjection {
 				trait_index,
 				assoc_type_index,
 				base,
-			} = case.signatures.types.resolve(signature.param_types[0])
+			} = case.context.types.resolve(signature.param_types[0])
 			else {
 				panic!("ordinary projection expected")
 			};
@@ -11272,54 +12293,69 @@ pub(super) mod tests {
 			assert_eq!(*assoc_type_index, AssocTypeIdx::new(0));
 			assert_eq!(
 				*base,
-				case.signatures.type_envs.frame(signature.type_params)[1].ty
+				case.context.type_envs.frame(signature.type_params)[1].ty
 			);
 		}
 
 		#[test]
 		fn associated_declaration_bounds_supply_members_through_equality() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item: Project; }
                 fn f<T: Container where { Item = U }, U>(x: U::Output) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
 			assert!(
-				matches!(case.signatures.types.resolve(case.function_signature("f").param_types[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert!(
+				matches!(case.context.types.resolve(case.function_signature("f").param_types[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
 			);
 		}
 
 		#[test]
 		fn equivalent_traits_are_deduplicated_but_distinct_traits_are_ambiguous()
 		 {
-			let valid = checked_case(indoc! {"
+			checked_case!(
+				valid = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item: Project; }
                 fn f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output) {}
-            "});
-			assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
-			let ambiguous = checked_case(indoc! {"
+            "}
+			);
+			assert!(
+				valid.context.diagnostics.is_empty(),
+				"{:?}",
+				valid.context.diagnostics
+			);
+			checked_case!(
+				ambiguous = indoc! {"
                 trait Left { type Output; }
                 trait Right { type Output; }
                 trait Container { type Item; }
                 fn f<T: Container where { Item = U } + Container where { Item: Left + Right }, U>(x: U::Output) {}
-            "});
+            "}
+			);
 			assert_eq!(
-				ambiguous.diagnostics.len(),
+				ambiguous.context.diagnostics.len(),
 				1,
 				"{:?}",
-				ambiguous.diagnostics
+				ambiguous.context.diagnostics
 			);
 			assert_eq!(
-				ambiguous.diagnostics[0].code.as_deref(),
+				ambiguous.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::AmbiguousTraitMember.code())
 			);
-			assert_eq!(ambiguous.diagnostics[0].notes.len(), 2);
+			assert_eq!(ambiguous.context.diagnostics[0].notes.len(), 2);
 		}
 
 		#[test]
 		fn contextual_member_evidence_does_not_escape_to_a_sibling() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item; }
                 struct Host<T> {}
@@ -11327,10 +12363,16 @@ pub(super) mod tests {
                     fn scoped<U: Container where { Item = T } + Container where { Item: Project }>(x: T::Output) {}
                     fn sibling(x: T::Output) {}
                 }
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::NotATraitMember.code())
 			);
 			let signature = |name| {
@@ -11341,7 +12383,7 @@ pub(super) mod tests {
 					.iter()
 					.position(|def| def.name.inner == name)
 					.unwrap();
-				&case.signatures.functions[index]
+				&case.context.functions[index]
 			};
 			assert_ne!(signature("scoped").param_types[0], TypeIndex::ERROR);
 			assert_eq!(signature("sibling").param_types[0], TypeIndex::ERROR);
@@ -11350,7 +12392,8 @@ pub(super) mod tests {
 		#[test]
 		fn qualified_bindings_can_depend_on_a_later_binding_of_the_same_parameter()
 		 {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
@@ -11360,8 +12403,13 @@ pub(super) mod tests {
                 impl Project for Need<i32> { type Output = i32; }
                 fn first<T: Container where { A = <Need< <T as Container>::B> as Project>::Output, B = i32 }>(x: T::A) {}
                 fn reversed<T: Container where { B = i32, A = <Need< <T as Container>::B> as Project>::Output }>(x: T::A) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			for name in ["first", "reversed"] {
 				assert_eq!(
 					case.function_signature(name).param_types[0],
@@ -11372,7 +12420,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn direct_member_identity_does_not_require_complete_binding_values() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
@@ -11381,8 +12430,13 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 impl Project for Need<i32> { type Output = i32; }
                 fn f<T: Container where { A = <Need<T::B> as Project>::Output, B = i32 }>(x: T::A) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
 				TypeIndex::I32
@@ -11391,7 +12445,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn pending_unqualified_selection_explains_how_to_qualify() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
@@ -11401,9 +12456,15 @@ pub(super) mod tests {
                 impl Project for Need<i32> { type Output = i32; }
                 fn first<T: Container where { A = Need<T::B>::Output, B = i32 }>(x: T::A) {}
                 fn reversed<T: Container where { B = i32, A = Need<T::B>::Output }>(x: T::A) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 2, "{:?}", case.diagnostics);
-			for diagnostic in &case.diagnostics {
+            "}
+			);
+			assert_eq!(
+				case.context.diagnostics.len(),
+				2,
+				"{:?}",
+				case.context.diagnostics
+			);
+			for diagnostic in &*case.context.diagnostics {
 				assert_eq!(
 					diagnostic.code.as_deref(),
 					Some(DiagnosticCode::TypeMemberNeedsQualification.code())
@@ -11421,21 +12482,29 @@ pub(super) mod tests {
 
 		#[test]
 		fn pending_member_discovery_is_not_reported_as_a_missing_member() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 trait Container { type A; type Item; }
                 trait Project { type Output; }
                 fn f<T: Container where { A = U::Output, Item = U } + Container where { Item: Project }, U>(x: T::A) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TypeMemberNeedsQualification.code())
 			);
 		}
 
 		#[test]
 		fn unqualified_selection_works_after_binding_facts_are_ready() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -11444,8 +12513,13 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 impl Project for Need<i32> { type Output = i32; }
                 fn f<T: Container where { Item = i32 }>(x: Need<T::Item>::Output) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
 				TypeIndex::I32
@@ -11454,7 +12528,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn sibling_dependent_unqualified_lookup_reports_the_same_limitation() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -11463,10 +12538,16 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 impl Project for Need<i32> { type Output = i32; }
                 fn f<T: Container where { Item = Need<U::Item>::Output }, U: Container where { Item = i32 }>(x: T::Item) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TypeMemberNeedsQualification.code())
 			);
 			assert_eq!(
@@ -11477,17 +12558,24 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_failed_qualified_dependent_binding_reports_one_bound_error() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Container { type A; type B; }
                 trait Project { type Output; }
                 struct Need<X> {}
                 impl Project for Need<i32> { type Output = i32; }
                 fn f<T: Container where { A = <Need<T::B> as Project>::Output, B = () }>(x: T::A, y: i32) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 			assert_eq!(
@@ -11563,17 +12651,23 @@ pub(super) mod tests {
 
 		#[test]
 		fn concrete_equal_subjects_can_use_a_symbolic_assumed_member() {
-			let case = checked_case(indoc! {"
+			checked_case!(
+				case = indoc! {"
                 type i32;
                 trait Project { type Output; }
                 trait Container { type Item; }
                 fn f<T: Container where { Item = i32 } + Container where { Item: Project }>(x: i32::Output, y: <i32 as Project>::Output) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let signature = case.function_signature("f");
 			assert_eq!(signature.param_types[0], signature.param_types[1]);
 			assert!(
-				matches!(case.signatures.types.resolve(signature.param_types[0]), Type::AssocTypeProjection { base, .. } if *base == TypeIndex::I32)
+				matches!(case.context.types.resolve(signature.param_types[0]), Type::AssocTypeProjection { base, .. } if *base == TypeIndex::I32)
 			);
 		}
 
@@ -11711,40 +12805,53 @@ pub(super) mod tests {
 		#[test]
 		fn a_projection_reduced_to_a_bounded_parameter_satisfies_requirements()
 		{
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker> {}
                 fn f<T: Container where { Item = U }, U: Marker>(x: Need<T::Item>) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			let signature = case.function_signature("f");
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(signature.param_types[0])
+				case.context.types.resolve(signature.param_types[0])
 			else {
 				panic!()
 			};
 			assert_eq!(
 				type_args.as_ref(),
-				&[case.signatures.type_envs.frame(signature.type_params)[1].ty]
+				&[case.context.type_envs.frame(signature.type_params)[1].ty]
 			);
 		}
 
 		#[test]
 		fn an_equal_subject_keeps_projection_evidence_after_normalization() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker> {}
                 fn f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: Need<U>) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 		}
 
 		#[test]
 		fn generic_impl_requirements_use_evidence_for_the_callers_equal_subject()
 		 {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -11752,8 +12859,13 @@ pub(super) mod tests {
                 struct Wrap<T> {}
                 impl<X: Marker> Result for Wrap<X> { type Output = i32; }
                 fn f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: <Wrap<T::Item> as Result>::Output) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
 				TypeIndex::I32
@@ -11798,18 +12910,25 @@ pub(super) mod tests {
 
 		#[test]
 		fn associated_declaration_bounds_follow_a_written_equality() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item: Marker; }
                 struct Need<X: Marker> {}
                 fn f<T: Container where { Item = U }, U>(x: Need<U>) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 		}
 
 		#[test]
 		fn local_evidence_about_an_outer_parameter_does_not_escape() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker> {}
@@ -11818,10 +12937,16 @@ pub(super) mod tests {
                     fn scoped<U: Container where { Item = T } + Container where { Item: Marker }>(x: Need<T>) {}
                     fn sibling(x: Need<T>) {}
                 }
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 			let method = |name| {
@@ -11832,18 +12957,18 @@ pub(super) mod tests {
 					.iter()
 					.position(|definition| definition.name.inner == symbol)
 					.unwrap();
-				&case.signatures.functions[index]
+				&case.context.functions[index]
 			};
 			let local = method("scoped");
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(local.param_types[0])
+				case.context.types.resolve(local.param_types[0])
 			else {
 				panic!()
 			};
 			assert_ne!(type_args[0], TypeIndex::ERROR);
 			let sibling = method("sibling");
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(sibling.param_types[0])
+				case.context.types.resolve(sibling.param_types[0])
 			else {
 				panic!()
 			};
@@ -11852,52 +12977,69 @@ pub(super) mod tests {
 
 		#[test]
 		fn an_impl_requirement_cannot_supply_its_own_proof() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 struct Need<X: Marker> {}
                 struct Wrap<X> {}
                 impl<X: Marker> Marker for Wrap<X> {}
                 fn f<U>(x: Need<Wrap<U>>) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 		}
 
 		#[test]
 		fn ambiguous_equalities_do_not_transfer_membership() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker> {}
                 fn f<T: Container where { Item = U } + Container where { Item = V } + Container where { Item: Marker }, U, V>(x: Need<U>, y: Need<V>) {}
-            "});
+            "}
+			);
 			assert_eq!(
-				case.diagnostics
+				case.context
+					.diagnostics
 					.iter()
 					.filter(|d| d.code.as_deref()
 						== Some(DiagnosticCode::TraitBoundViolation.code()))
 					.count(),
 				2,
 				"{:?}",
-				case.diagnostics
+				case.context.diagnostics
 			);
 		}
 
 		#[test]
 		fn an_assumed_cycle_does_not_invent_a_trait_or_recurse_through_dispatch()
 		 {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker> {}
                 fn f<T: Container where { Item = U::Item }, U: Container where { Item = T::Item }, V: Marker>(x: Need<T::Item>) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 		}
@@ -12018,7 +13160,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn bounded_equality_rhs_waits_for_all_sibling_facts() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -12026,11 +13169,16 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 fn first<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item) {}
                 fn reversed<U: Container where { Item = i32 }, T: Container where { Item = Need<U::Item> }>(x: T::Item) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			for name in ["first", "reversed"] {
 				let Type::Struct { type_args, .. } = case
-					.signatures
+					.context
 					.types
 					.resolve(case.function_signature(name).param_types[0])
 				else {
@@ -12043,28 +13191,35 @@ pub(super) mod tests {
 		#[test]
 		fn deferred_failure_recovers_the_argument_and_preserves_unrelated_types()
 		 {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker> {}
                 fn bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item, y: i32) -> i32 {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 			let signature = case.function_signature("bad");
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(signature.param_types[0])
+				case.context.types.resolve(signature.param_types[0])
 			else {
 				panic!("Need identity must survive recovery");
 			};
 			assert_eq!(type_args.as_ref(), &[TypeIndex::ERROR]);
 			assert_eq!(signature.param_types[1], TypeIndex::I32);
 			assert_eq!(signature.return_type, TypeIndex::I32);
-			let binding = &case.signatures.param_bounds
+			let binding = &case.context.param_bounds
 				[usize::from(signature.type_params)][0]
 				.facts
 				.current()[0]
@@ -12075,7 +13230,7 @@ pub(super) mod tests {
 				panic!()
 			};
 			let Type::Struct { type_args, .. } =
-				case.signatures.types.resolve(fact.value)
+				case.context.types.resolve(fact.value)
 			else {
 				panic!()
 			};
@@ -12084,16 +13239,21 @@ pub(super) mod tests {
 
 		#[test]
 		fn deferred_failure_preserves_nested_tuple_and_function_shapes() {
-			let mut case = TestCase::new(indoc! {"
+			test_case!(mut case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker> {}
                 fn bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: (T::Item, i32), y: fn(i32) -> T::Item) -> fn(T::Item) -> i32 {}
             "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 			let signature = case.function_signature("bad");
@@ -12103,7 +13263,7 @@ pub(super) mod tests {
 				signature.return_type,
 			];
 			let struct_index = case.struct_index("Need");
-			let types = &mut case.signatures.types;
+			let types = &mut case.context.types;
 			let recovered = types.intern(Type::Struct {
 				struct_index,
 				type_args: Box::new([TypeIndex::ERROR]),
@@ -12126,37 +13286,51 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_recursive_application_reads_its_eventual_parameter_requirements() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 impl Marker for i32 {}
                 impl Container for i32 { type Item = i32; }
                 struct Node<T: Marker + Container where { Item = Node<i32> }> {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 		}
 
 		#[test]
 		fn eventual_requirements_cannot_be_accepted_from_an_incomplete_list() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 impl Container for i32 { type Item = i32; }
                 struct Node<T: Marker + Container where { Item = Node<i32> }> {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
-			assert!(case.diagnostics[0].message.contains("Marker"));
+			assert!(case.context.diagnostics[0].message.contains("Marker"));
 		}
 
 		#[test]
 		fn qualified_projection_defers_membership_without_losing_identity() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -12165,8 +13339,13 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 impl Project for Need<i32> { type Output = i32; }
                 fn f<T: Container where { Item = <Need<U::Item> as Project>::Output }, U: Container where { Item = i32 }>(x: T::Item) {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 			assert_eq!(
 				case.function_signature("f").param_types[0],
 				TypeIndex::I32
@@ -12175,7 +13354,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn reentrant_queries_complete_in_their_own_contexts() {
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
@@ -12183,24 +13363,36 @@ pub(super) mod tests {
                 impl Marker for i32 {}
                 fn outer<A: Container where { Item = Inner<A, A> }>(x: A::Item) {}
                 struct Inner<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }> {}
-            "});
-			assert!(case.diagnostics.is_empty(), "{:?}", case.diagnostics);
+            "}
+			);
+			assert!(
+				case.context.diagnostics.is_empty(),
+				"{:?}",
+				case.context.diagnostics
+			);
 		}
 
 		#[test]
 		fn an_unsatisfied_qualified_projection_is_reported_once_at_its_source()
 		{
-			let case = TestCase::new(indoc! {"
+			test_case!(
+				case = indoc! {"
                 type i32; type bool;
                 trait Container { type Item; }
                 trait Project { type Output; }
                 struct Plain<T> {}
                 impl Project for Plain<bool> { type Output = bool; }
                 fn f<T: Container where { Item = <Plain<U::Item> as Project>::Output }, U: Container where { Item = i32 }>(x: T::Item) {}
-            "});
-			assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
+            "}
+			);
 			assert_eq!(
-				case.diagnostics[0].code.as_deref(),
+				case.context.diagnostics.len(),
+				1,
+				"{:?}",
+				case.context.diagnostics
+			);
+			assert_eq!(
+				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::TraitBoundViolation.code())
 			);
 			assert_eq!(
@@ -12362,7 +13554,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn nested_exports_resolve_names_in_the_declaring_namespace() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             fn f<T>() {}
 
             mod left {
@@ -12378,11 +13571,12 @@ pub(super) mod tests {
                     f,
                 }
             }
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
-		assert_eq!(case.signatures.exports.len(), 2);
+		assert_eq!(case.context.exports.len(), 2);
 		for (external, path) in [("left", "left::f"), ("f", "right::f")] {
-			let export = case.signatures.exports
+			let export = case.context.exports
 				[&case.graph.strings.get(external).unwrap()];
 			let DefKind::Function(index) =
 				case.resolve(BindingNamespace::Value, path)
@@ -12395,7 +13589,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn exports_reject_ineligible_targets() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type i32;
             const C: i32 = 1;
             struct S {}
@@ -12416,9 +13611,11 @@ pub(super) mod tests {
 
             export generic
             export missing
-        "});
+        "}
+		);
 		assert_eq!(
-			case.diagnostics
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
 					== Some(DiagnosticCode::CannotExportItem.code()))
@@ -12426,29 +13623,36 @@ pub(super) mod tests {
 			2
 		);
 		assert_eq!(
-			case.diagnostics
+			case.context
+				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
 					== Some(DiagnosticCode::UndeclaredIdentifier.code()))
 				.count(),
 			2
 		);
-		assert_eq!(case.diagnostics.len(), 4, "{:?}", case.diagnostics);
-		assert_eq!(case.signatures.exports.len(), 1);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			4,
+			"{:?}",
+			case.context.diagnostics
+		);
+		assert_eq!(case.context.exports.len(), 1);
 		let DefKind::Function(index) =
 			case.resolve(BindingNamespace::Value, "nested::f")
 		else {
 			panic!("expected a function");
 		};
 		assert_eq!(
-			case.signatures.exports[&case.graph.strings.get("f").unwrap()],
+			case.context.exports[&case.graph.strings.get("f").unwrap()],
 			ExportedItem::Function(index)
 		);
 	}
 
 	#[test]
 	fn exports_resolve_import_aliases_and_synthetic_values() {
-		let case = TestCase::new(indoc! {"
+		test_case!(
+			case = indoc! {"
             type u32;
 
             typeset PointerSize {
@@ -12477,9 +13681,10 @@ pub(super) mod tests {
                 heap,
                 counter,
             }
-        "});
+        "}
+		);
 		case.diagnostics().assert_none();
-		assert_eq!(case.signatures.exports.len(), 3);
+		assert_eq!(case.context.exports.len(), 3);
 		let DefKind::Function(function) =
 			case.resolve(BindingNamespace::Value, "inner::f")
 		else {
@@ -12496,16 +13701,15 @@ pub(super) mod tests {
 			panic!("expected a global");
 		};
 		assert_eq!(
-			case.signatures.exports[&case.graph.strings.get("run").unwrap()],
+			case.context.exports[&case.graph.strings.get("run").unwrap()],
 			ExportedItem::Function(function)
 		);
 		assert_eq!(
-			case.signatures.exports[&case.graph.strings.get("heap").unwrap()],
+			case.context.exports[&case.graph.strings.get("heap").unwrap()],
 			ExportedItem::Memory(memory)
 		);
 		assert_eq!(
-			case.signatures.exports
-				[&case.graph.strings.get("counter").unwrap()],
+			case.context.exports[&case.graph.strings.get("counter").unwrap()],
 			ExportedItem::Global(global)
 		);
 	}
@@ -12547,7 +13751,7 @@ pub(super) mod tests {
 				&workspace,
 			)
 			.unwrap();
-		let case = TestCase::from_graph(builder.build(root));
+		test_case!(case from builder.build(root));
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 1);
 		let export =
@@ -12563,8 +13767,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn export_names_resolve_only_in_the_value_namespace() {
-		let case = TestCase::new(
-			r#"
+		test_case!(
+			case = r#"
             type i32;
             struct S {}
             trait T {}
@@ -12574,8 +13778,13 @@ pub(super) mod tests {
             export { S, T, Alias, E, i32, inner }
         "#,
 		);
-		assert_eq!(case.diagnostics.len(), 6, "{:?}", case.diagnostics);
-		for diagnostic in &case.diagnostics {
+		assert_eq!(
+			case.context.diagnostics.len(),
+			6,
+			"{:?}",
+			case.context.diagnostics
+		);
+		for diagnostic in &*case.context.diagnostics {
 			assert_eq!(
 				diagnostic.code.as_deref(),
 				Some(DiagnosticCode::UndeclaredIdentifier.code())
@@ -12590,8 +13799,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_export_can_name_a_value_that_shares_its_name_with_a_type() {
-		let case = TestCase::new(
-			r#"
+		test_case!(
+			case = r#"
             struct Same {}
             fn Same() {}
             export { Same }

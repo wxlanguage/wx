@@ -35,7 +35,7 @@ Commits and PRs are separate from these review checkpoints and are not required.
 ## Agreed API and invariants
 
 Implement the entry points in a new `tir/normalize.rs` as methods on
-`SignatureBuilder`, following the existing sibling-module pattern:
+`TypeContext`, following the existing sibling-module pattern:
 
 ```rust
 pub(super) fn normalize_head(
@@ -161,7 +161,7 @@ arrive together in checkpoint 2.
 Implemented and verified:
 
 - New `tir/normalize.rs` provides `normalize_head` and `normalize_type` on
-  `SignatureBuilder`. Concrete projections select a provider using the trait
+  `TypeContext`. Concrete projections select a provider using the trait
   declaration index and reduce its stored value. Abstract and inference
   projections remain intact. Substitution stays structurally separate.
 - Deep traversal handles tuples, function types, struct/function-item arguments,

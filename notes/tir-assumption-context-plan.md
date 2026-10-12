@@ -3,6 +3,12 @@
 Status: checkpoints 1–4 accepted; checkpoint 5 implemented and ready for review.
 Updated 2026-09-28.
 
+Superseded in part (2026-10-11): the "finished `SignatureRegistry`" this plan
+hands off to body checking no longer exists. `TypeContext` became
+`TypeContext` and stays live and mutable after `sweep`; read "finished registry"
+below as "the `TypeContext` after its sweep". See `tir-type-context.md`. The
+checkpoint logs are kept as written.
+
 ## Objective
 
 Make signature checking preserve declaration-local assumptions across type
@@ -160,7 +166,7 @@ Checkpoint 2 handoff:
 - `Bounds`, `Trait`, and `Normalize` retain their separate representations.
   Bounds refer to the eventual parameter or associated-type requirement table,
   rather than copying a provisional list of requirements.
-- SignatureBuilder owns one ObligationArena. Each existing query entry has a
+- TypeContext owns one ObligationArena. Each existing query entry has a
   four-byte optional chain head; links accommodate reentrant allocation without
   a per-query vector, a second query registry, or a final validity map.
   Retries reuse slots. Completed payloads are removed; the buffer lives until
@@ -411,11 +417,8 @@ Checkpoint 5 handoff:
   retention, inherited method contexts and sibling isolation, trait Self and
   instantiated associated declaration bounds, successful/failed queue completion,
   failed deferred normalization recovery, and overflow diagnostics/recovery.
-- Added [body-checking handoff notes](tir-body-checking-handoff.md) with the data
-  lifetime, context selection, pending-result audit, reusable operations, and
-  explicit remaining limits. Proof methods still live on SignatureBuilder;
-  adapting them to the completed registry belongs with body-checker implementation.
-  The shared reader is already available to both stages.
+- Added body-checking handoff notes (since folded into [tir-type-context.md](tir-type-context.md))
+  covering context selection, the pending-result audit, and reusable operations.
 - Validation: cargo test -p wx-compiler: 496 passed, 0 failed, 0 ignored; doc tests
   also pass (none present). Changed Rust files pass rustfmt --check and
   git diff --check passes.

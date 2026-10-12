@@ -339,8 +339,7 @@ impl TypeInterner {
 	}
 	pub fn new() -> Self {
 		let entries = vec![
-			// Order must match the `TypeIndex` constants below — see
-			// `tir/mod.rs`'s "Type system" table for the frozen layout.
+			// Order must match the `TypeIndex` constants below.
 			Type::Infer,
 			Type::Error,
 			Type::Unit,
@@ -970,9 +969,9 @@ impl TypeIndex {
 		self.is_integer() || self.is_float()
 	}
 
-	// Pre-allocated indices for primitive types — see `tir/mod.rs`'s "Type
-	// system" table. The `TypeInterner` reserves these slots at startup so
-	// comparisons like `ty == TypeIndex::U32` work without a pool lookup.
+	// Pre-allocated indices for primitive types. The `TypeInterner` reserves
+	// these slots at startup so comparisons like `ty == TypeIndex::U32` work
+	// without a pool lookup.
 	pub const INFER: TypeIndex = TypeIndex(0);
 	pub const ERROR: TypeIndex = TypeIndex(1);
 	pub const UNIT: TypeIndex = TypeIndex(2);

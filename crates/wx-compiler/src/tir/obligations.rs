@@ -57,7 +57,7 @@ struct ObligationNode {
 	obligation: Option<Obligation>,
 }
 
-/// All deferred work shares the builder's lifetime and one allocation buffer.
+/// All deferred work shares the type context's lifetime and one allocation buffer.
 /// Links preserve declaration ownership across reentrant, interleaved queries.
 #[derive(Default)]
 pub(super) struct ObligationArena {
@@ -70,7 +70,7 @@ impl ObligationArena {
 		self.nodes.is_empty()
 	}
 
-	/// Completed payloads are dropped before the builder hands off its arenas.
+	/// Completed payloads are dropped by the time a sweep finishes.
 	/// This audit traverses deferred slots only, with no release-build cost.
 	pub(super) fn assert_drained(&self) {
 		debug_assert!(

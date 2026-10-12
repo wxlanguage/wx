@@ -13,7 +13,7 @@ use super::bounds::EqualityLookup;
 use super::defs::{AssocTypeIdx, MemberKind, TraitIdx};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::Obligation;
-use super::signatures::SignatureBuilder;
+use super::signatures::TypeContext;
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
 
 struct ProjectionFrame {
@@ -71,7 +71,7 @@ enum Mode {
 	Assumptions,
 }
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	/// Budget exhaustion is a diagnosed failure, never an unfinished fact.
 	/// Poison an active normalization only; a top-level proof can be retried.
 	pub(super) fn normalization_overflow(

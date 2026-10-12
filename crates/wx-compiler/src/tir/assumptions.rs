@@ -11,8 +11,7 @@ use super::bounds::{
 };
 use super::defs::TraitIdx;
 use super::signatures::{
-	AssocTypeSignature, ParamBounds, SignatureBuilder, SignatureRegistry,
-	TraitSignature,
+	AssocTypeSignature, ParamBounds, TraitSignature, TypeContext,
 };
 use super::types::{
 	Type, TypeEnvArena, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner,
@@ -45,7 +44,7 @@ pub(super) enum QueryError {
 
 pub(super) type QueryResult<T> = Result<T, QueryError>;
 
-/// A borrowed view shared by signature construction and its finished output.
+/// A borrowed view shared by signature construction and body checking.
 /// It does not demand signatures, normalize types, or prove requirements.
 pub(super) struct AssumptionReader<'a> {
 	pub(super) type_envs: &'a TypeEnvArena,
@@ -356,28 +355,9 @@ impl<'a> AssumptionFacts<'a> {
 	}
 }
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	/// Lend fact storage and the interner separately, so traversing facts can
 	/// intern projected subjects without cloning or mutating their bound trees.
-	pub(super) fn assumptions(
-		&mut self,
-	) -> (AssumptionReader<'_>, &mut TypeInterner) {
-		(
-			AssumptionReader {
-				type_envs: &self.type_envs,
-				param_bounds: &self.param_bounds,
-				traits: &self.traits,
-				assoc_types: &self.assoc_types,
-			},
-			&mut self.types,
-		)
-	}
-}
-
-impl SignatureRegistry {
-	/// Body checking reads the same facts after construction has completed.
-	/// The function's stored scope supplies its context; normalized type owners
-	/// do not. Only the interner is mutable, to form projected subjects.
 	pub(super) fn assumptions(
 		&mut self,
 	) -> (AssumptionReader<'_>, &mut TypeInterner) {

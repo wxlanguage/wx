@@ -22,7 +22,7 @@ use super::{
 		NamespaceIdx, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
-	signatures::{SignatureBuilder, SignatureRegistry},
+	signatures::TypeContext,
 	types::{Type, TypeIndex},
 };
 
@@ -676,7 +676,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	}
 }
 
-impl SignatureBuilder<'_, '_, '_> {
+impl TypeContext<'_, '_, '_> {
 	pub(super) fn impl_target_type(&mut self, target: ImplTarget) -> TypeIndex {
 		match target {
 			ImplTarget::U8 => TypeIndex::U8,
@@ -719,26 +719,5 @@ impl SignatureBuilder<'_, '_, '_> {
 			}
 			_ => unreachable!("dispatch trait must name a trait or typeset"),
 		}
-	}
-}
-
-impl SignatureRegistry {
-	#[cfg(test)]
-	pub(super) fn impl_dispatch_is_empty(&self) -> bool {
-		self.impl_dispatch.is_empty()
-	}
-
-	pub(super) fn inherent_candidates(
-		&self,
-		target: ImplTarget,
-	) -> &[InherentImplIdx] {
-		self.impl_dispatch.inherent_candidates(target)
-	}
-
-	pub(super) fn trait_candidates(
-		&self,
-		target: ImplTarget,
-	) -> &[(TraitIdx, TraitImplIdx)] {
-		self.impl_dispatch.trait_candidates(target)
 	}
 }
