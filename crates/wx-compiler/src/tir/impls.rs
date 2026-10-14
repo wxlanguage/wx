@@ -17,9 +17,9 @@ use crate::{
 use super::{
 	bounds::report_not_a_trait_bound,
 	defs::{
-		AstEntry, AstNodeRef, BindingKey, BindingNamespace, DefKind,
-		DefinitionRegistry, DuplicateDefinitionDiagnostic, InherentImplIdx,
-		NamespaceIdx, TraitIdx, TraitImplIdx, TypeAliasIdx,
+		AstEntry, AstNodeRef, BindingKey, DefKind, DefinitionRegistry,
+		DuplicateDefinitionDiagnostic, InherentImplIdx, Scope, Tier, TraitIdx,
+		TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
 	signatures::TypeContext,
@@ -307,7 +307,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.file_id,
 					);
 				}
-				AstNodeRef::ImportedMemory { memory_index, decl } => {
+				AstNodeRef::ImportedMemory {
+					memory_index, decl, ..
+				} => {
 					let ast::ImportDeclaration::Memory { name, .. } = decl
 					else {
 						unreachable!()
@@ -329,7 +331,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.file_id,
 					);
 				}
-				AstNodeRef::ImportedGlobal { global_index, decl } => {
+				AstNodeRef::ImportedGlobal {
+					global_index, decl, ..
+				} => {
 					let ast::ImportDeclaration::Global {
 						name, mut_span, ..
 					} = decl
@@ -568,7 +572,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn resolve_target(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		path: &ast::Path,
 		params: &[ast::TypeParam],
 	) -> Result<ImplTarget, ()> {
@@ -594,7 +598,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			file_id,
 			namespace,
 			&path.segments,
-			BindingNamespace::Type,
+			Tier::Type,
 		);
 		let kind = binding.def_key().ok_or(())?.symbol_kind(self.defs);
 		let target = match kind {
@@ -626,7 +630,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn resolve_trait(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		path: &ast::Path,
 	) -> Option<TraitIdx> {
 		let binding = PathResolver::new(self.defs).resolve_path(
@@ -635,7 +639,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			file_id,
 			namespace,
 			&path.segments,
-			BindingNamespace::Type,
+			Tier::Type,
 		);
 		match binding.def_key()?.symbol_kind(self.defs) {
 			DefKind::Trait(idx) => Some(idx),

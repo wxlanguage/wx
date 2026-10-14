@@ -19,8 +19,8 @@ use super::assumptions::AssumptionKind;
 use super::assumptions::Readiness;
 use super::bounds::report_not_an_associated_type;
 use super::defs::{
-	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
-	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, DefinitionRegistry, InherentImplIdx,
+	MemberKind, Tier, TraitIdx, TraitImplIdx,
 };
 use super::impls::ImplTarget;
 use super::obligations::Obligation;
@@ -166,7 +166,7 @@ impl DefinitionRegistry {
 				self.assoc_types[usize::from(index)].name.inner
 			}
 		};
-		BindingKey::new(declaration.binding_namespace(), name)
+		BindingKey::new(declaration.tier(), name)
 	}
 
 	/// Selects an impl member or its trait declaration. The caller must pass a
@@ -350,9 +350,9 @@ impl TypeContext<'_, '_, '_> {
 	/// through the namespace graph. Intermediate projections retain their
 	/// nested facts. The caller decides whether to normalize the completed type.
 	/// Shared by `resolve_type`'s own `Path`
-	/// arm (for whatever's left once its namespace-tier prefix is
-	/// consumed), its `Grouped` arm (`<T>::Item`, which has no namespace-
-	/// tier prefix at all — `current` starts as `T` itself), and its
+	/// arm (for whatever's left once its namespace prefix is
+	/// consumed), its `Grouped` arm (`<T>::Item`, which has no namespace
+	/// prefix at all — `current` starts as `T` itself), and its
 	/// `QualifiedPath` arm (for whatever's left after the first, trait-
 	/// qualified segment).
 	pub(super) fn resolve_type_member_path(
@@ -592,7 +592,7 @@ impl TypeContext<'_, '_, '_> {
 				self.strings,
 				name,
 				trait_def.name.inner,
-				key.namespace,
+				key.tier,
 			));
 			return Err(());
 		};
@@ -999,13 +999,13 @@ fn report_missing_trait_member(
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,
 	trait_name: SymbolU32,
-	namespace: BindingNamespace,
+	tier: Tier,
 ) -> Diagnostic<FileId> {
-	match namespace {
-		BindingNamespace::Type => {
+	match tier {
+		Tier::Type => {
 			report_not_an_associated_type(file_id, strings, name, trait_name)
 		}
-		BindingNamespace::Value => {
+		Tier::Value => {
 			let name_str = strings.resolve(name.inner).unwrap();
 			let trait_str = strings.resolve(trait_name).unwrap();
 			Diagnostic::error()

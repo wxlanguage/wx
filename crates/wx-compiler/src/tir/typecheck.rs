@@ -12,9 +12,7 @@
 use codespan_reporting::diagnostic::Diagnostic;
 
 use super::body::{Body, BodyBuilder, ExprIdx, ExprKind};
-use super::defs::{
-	BindingNamespace, DefKind, MemberKind, NamespaceIdx, TypesetIdx,
-};
+use super::defs::{DefKind, MemberKind, Scope, Tier, TypesetIdx};
 use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::operators::{
@@ -32,7 +30,7 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 	body: BodyBuilder,
 	file_id: FileId,
-	namespace: NamespaceIdx,
+	namespace: Scope,
 	/// The type scope the expressions are written in: the root for a free
 	/// constant, the impl's or trait's `Self` scope for an associated one.
 	scope: TypeEnvIdx,
@@ -42,7 +40,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		scope: TypeEnvIdx,
 	) -> Self {
 		Self {
@@ -168,7 +166,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.file_id,
 			self.namespace,
 			segments,
-			BindingNamespace::Value,
+			Tier::Value,
 		);
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);

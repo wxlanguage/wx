@@ -313,8 +313,8 @@ mod tests {
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::tir::defs::{
-		AssocTypeIdx, BindingKey, BindingNamespace, BindingTarget, DefKind,
-		FunctionIdx, MemberKind, TraitIdx,
+		AssocTypeIdx, BindingKey, BindingTarget, DefKind, FunctionIdx,
+		MemberKind, Namespace, Tier, TraitIdx,
 	};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
@@ -408,17 +408,17 @@ mod tests {
 			}
 		}
 
-		fn definition(&self, tier: BindingNamespace, name: &str) -> DefKind {
+		fn definition(&self, tier: Tier, name: &str) -> DefKind {
 			let symbol = self
 				.graph
 				.strings
 				.get(name)
 				.expect("expected a fixture name");
-			let root = self.defs.root_package.root_namespace();
-			let BindingTarget::Accessible(key) = self.defs.namespaces
-				[usize::from(root)]
-			.bindings[&BindingKey::new(tier, symbol)]
-				.target
+			let root = Namespace::Package(self.defs.root_package);
+			let BindingTarget::Accessible(key) =
+				self.defs.namespaces.symbols(root).bindings
+					[&BindingKey::new(tier, symbol)]
+					.target
 			else {
 				panic!("expected `{name}` to be accessible");
 			};
@@ -426,8 +426,7 @@ mod tests {
 		}
 
 		fn function(&self, name: &str) -> FunctionIdx {
-			let DefKind::Function(index) =
-				self.definition(BindingNamespace::Value, name)
+			let DefKind::Function(index) = self.definition(Tier::Value, name)
 			else {
 				panic!("expected `{name}` to be a function");
 			};
@@ -559,7 +558,7 @@ mod tests {
 		"});
 		let param = case.type_param("iterate", "T");
 		let DefKind::Trait(trait_index) =
-			case.definition(BindingNamespace::Type, "Iterable")
+			case.definition(Tier::Type, "Iterable")
 		else {
 			panic!("expected Iterable to be a trait");
 		};

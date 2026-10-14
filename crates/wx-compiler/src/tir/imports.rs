@@ -11,15 +11,14 @@ use crate::{
 	ast::{Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	small_vec::SmallVec,
-	tir::defs::{DefKind, EnumDef, ImportDef, ModuleDef},
 	vfs::FileId,
 };
 
 use super::defs::{
 	Binding, BindingKey, BindingLookup, BindingTarget, DefKey,
-	DuplicateDefinitionDiagnostic, GlobImport, Namespace, NamespaceIdx,
-	NamespaceLookup, UseItemDef, UseItemIndex, UseItemKind, UsePathIndex,
-	UsePathSegment, Visibility,
+	DuplicateDefinitionDiagnostic, GlobImport, Namespace, Namespaces, Scope,
+	UseItemDef, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
+	Visibility,
 };
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
@@ -117,20 +116,15 @@ impl<T: Copy> ResolveStatus<T> {
 pub(super) struct ImportResolver<'r> {
 	diagnostics: &'r mut Vec<Diagnostic<FileId>>,
 	strings: &'r StringInterner,
-	namespaces: &'r mut [Namespace],
-
-	// these items necessary in order to get namespace by DefKind
-	modules: &'r [ModuleDef],
-	enums: &'r [EnumDef],
-	imports: &'r [ImportDef],
+	namespaces: &'r mut Namespaces,
 
 	use_items: &'r [UseItemDef],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
-		&'r HashMap<(NamespaceIdx, SymbolU32), SmallVec<UseItemIndex>>,
-	pending_glob_targets: &'r HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
+		&'r HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
+	pending_glob_targets: &'r HashMap<Scope, SmallVec<UseItemIndex>>,
 
-	path_state: &'r mut [ResolveStatus<NamespaceIdx>],
+	path_state: &'r mut [ResolveStatus<Namespace>],
 	item_state: &'r mut [ResolveStatus<()>],
 	/// Every `use` item currently being resolved, innermost last — pushed
 	/// and popped, generically, by `ensure_import_item` for both named leaves
@@ -148,17 +142,14 @@ impl<'r> ImportResolver<'r> {
 	pub(super) fn resolve_imports(
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
-		namespaces: &mut [Namespace],
-		modules: &[ModuleDef],
-		enums: &[EnumDef],
-		imports: &[ImportDef],
+		namespaces: &mut Namespaces,
 		use_items: &[UseItemDef],
 		use_paths: &[UsePathSegment],
 		pending_named_imports: &HashMap<
-			(NamespaceIdx, SymbolU32),
+			(Scope, SymbolU32),
 			SmallVec<UseItemIndex>,
 		>,
-		pending_glob_targets: &HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
+		pending_glob_targets: &HashMap<Scope, SmallVec<UseItemIndex>>,
 	) {
 		let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -168,9 +159,6 @@ impl<'r> ImportResolver<'r> {
 			namespaces,
 			use_items,
 			use_paths,
-			enums,
-			imports,
-			modules,
 			pending_named_imports,
 			pending_glob_targets,
 			path_state: &mut path_state,
@@ -191,17 +179,20 @@ impl<'r> ImportResolver<'r> {
 
 	fn insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIdx,
+		scope: Scope,
 		key: BindingKey,
 		binding: Binding,
 		span: TextSpan,
 	) {
+		let namespace = Namespace::from(scope);
 		if self
 			.namespaces
-			.try_insert_binding(namespace_idx, key, binding)
+			.try_insert_binding(namespace, key, binding)
 			.is_err()
 		{
-			let collision_span = self.namespaces[usize::from(namespace_idx)]
+			let collision_span = self
+				.namespaces
+				.symbols(namespace)
 				.bindings
 				.get(&key)
 				.expect(
@@ -215,7 +206,7 @@ impl<'r> ImportResolver<'r> {
 					definitions: (
 						collision_span,
 						SourceSpan::new(
-							self.namespaces[usize::from(namespace_idx)].file_id,
+							self.namespaces.file_id(namespace),
 							span,
 						),
 					),
@@ -337,7 +328,7 @@ impl<'r> ImportResolver<'r> {
 			}
 			// Bare `use foo;` — look up `foo` directly in the writing
 			// namespace, same as the first segment of any `use` path.
-			None => namespace,
+			None => namespace.into(),
 		};
 
 		// Force any not-yet-resolved `use` in `scope` first — it might be
@@ -352,9 +343,9 @@ impl<'r> ImportResolver<'r> {
 		// what's really just "nothing else defines this name" (a genuine
 		// cycle still gets caught — that only ever comes from another
 		// item's chain looping back, never from this one).
-		if let Some(candidates) =
+		if let Some(candidates) = scope.as_scope().and_then(|scope| {
 			self.pending_named_imports.get(&(scope, name.inner))
-		{
+		}) {
 			for candidate in candidates {
 				if candidate == index {
 					continue;
@@ -366,8 +357,7 @@ impl<'r> ImportResolver<'r> {
 				) {
 					// A concrete type or value already answers this lookup, so
 					// re-entering a candidate would create a spurious cycle.
-					let bindings =
-						&self.namespaces[usize::from(scope)].bindings;
+					let bindings = &self.namespaces.symbols(scope).bindings;
 					let has_real_binding = bindings
 						.get(&BindingKey::ty(name.inner))
 						.is_some_and(|binding| {
@@ -417,7 +407,7 @@ impl<'r> ImportResolver<'r> {
 			if matches!(type_def, ImportSlot::Absent)
 				&& matches!(value_def, ImportSlot::Absent)
 			{
-				let file_id = self.namespaces[usize::from(namespace)].file_id;
+				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_unresolved_import(
 					prefix,
 					name.inner,
@@ -452,7 +442,7 @@ impl<'r> ImportResolver<'r> {
 			if declared_visibility == Visibility::Public
 				&& source_visibility == Visibility::Private
 			{
-				let file_id = self.namespaces[usize::from(namespace)].file_id;
+				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_private_reexport(
 					name.inner,
 					SourceSpan::new(file_id, name.span),
@@ -474,7 +464,7 @@ impl<'r> ImportResolver<'r> {
 			if declared_visibility == Visibility::Public
 				&& source_visibility == Visibility::Private
 			{
-				let file_id = self.namespaces[usize::from(namespace)].file_id;
+				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_private_reexport(
 					name.inner,
 					SourceSpan::new(file_id, name.span),
@@ -516,7 +506,10 @@ impl<'r> ImportResolver<'r> {
 		};
 
 		let mut unsafe_cycle = false;
-		if let Some(candidates) = self.pending_glob_targets.get(&target) {
+		if let Some(candidates) = target
+			.as_scope()
+			.and_then(|scope| self.pending_glob_targets.get(&scope))
+		{
 			for candidate in candidates {
 				// O(1) first: `item_state[candidate] == Resolving` iff
 				// `candidate` is on `resolve_stack` right now — the two are
@@ -562,7 +555,8 @@ impl<'r> ImportResolver<'r> {
 			// into `glob_imports` for `indirect_lookup` to walk into later.
 			return;
 		}
-		self.namespaces[usize::from(namespace)]
+		self.namespaces
+			.scope_mut(namespace)
 			.glob_imports
 			.push(GlobImport {
 				use_item: index,
@@ -594,7 +588,7 @@ impl<'r> ImportResolver<'r> {
 	/// everything else already folded in, so one incomparable pair
 	/// against `deepest` is enough to prove the whole set isn't a chain.
 	fn glob_cycle_is_unsafe(&self, cycle: &[UseItemIndex]) -> bool {
-		let mut deepest: Option<NamespaceIdx> = None;
+		let mut deepest: Option<Scope> = None;
 		for use_item in cycle.iter().copied() {
 			let item = &self.use_items[usize::from(use_item)];
 			if item.pub_span.is_some() {
@@ -604,16 +598,12 @@ impl<'r> ImportResolver<'r> {
 			deepest = Some(match deepest {
 				None => candidate,
 				Some(deepest)
-					if self
-						.namespaces
-						.namespace_contains(candidate, deepest) =>
+					if self.namespaces.contains(candidate, deepest) =>
 				{
 					deepest
 				}
 				Some(deepest)
-					if self
-						.namespaces
-						.namespace_contains(deepest, candidate) =>
+					if self.namespaces.contains(deepest, candidate) =>
 				{
 					candidate
 				}
@@ -632,19 +622,17 @@ impl<'r> ImportResolver<'r> {
 	/// A single `BindingKey` slot lookup — deliberately simpler than
 	/// `binding_to_import_scope`: the terminal leaf of a `use` can be any
 	/// def kind (function, struct, const...), not just a namespace, so
-	/// there's no `as_namespace` requirement here, just visibility and
+	/// there's no `Namespace::of` requirement here, just visibility and
 	/// `Def`-ness.
 	fn resolve_member_def(
 		&mut self,
-		accessor: NamespaceIdx,
-		scope: NamespaceIdx,
+		accessor: Scope,
+		scope: Namespace,
 		key: BindingKey,
 		span: TextSpan,
 	) -> ImportSlot {
-		let source_span = SourceSpan::new(
-			self.namespaces[usize::from(accessor)].file_id,
-			span,
-		);
+		let source_span =
+			SourceSpan::new(self.namespaces.file_id(accessor.into()), span);
 
 		let (target, visibility) = match self.namespaces.lookup(
 			self.use_items,
@@ -720,10 +708,10 @@ impl<'r> ImportResolver<'r> {
 
 	fn ensure_import_path(
 		&mut self,
-		origin: NamespaceIdx,
+		origin: Scope,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIdx, ()> {
+	) -> Result<Namespace, ()> {
 		match self.path_state[usize::from(path)].poll() {
 			ResolveStep::Ready(result) => return result,
 			ResolveStep::Cycle => {
@@ -732,7 +720,7 @@ impl<'r> ImportResolver<'r> {
 				// several items (`use a::{b, c};`), so there's no single
 				// `resolve_stack` frame to build a full-chain report from.
 				let segment = self.use_paths[usize::from(path)];
-				let file_id = self.namespaces[usize::from(origin)].file_id;
+				let file_id = self.namespaces.file_id(origin.into());
 				let diagnostic = Diagnostic::error()
 					.with_code(DiagnosticCode::CyclicImport.code())
 					.with_message("cyclic import")
@@ -759,15 +747,18 @@ impl<'r> ImportResolver<'r> {
 	/// `finish`, so nothing here can leave a slot stuck `Resolving`.
 	fn compute_import_path(
 		&mut self,
-		origin: NamespaceIdx,
+		origin: Scope,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIdx, ()> {
+	) -> Result<Namespace, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		match segment.parent {
-			None => {
-				self.binding_to_import_scope(origin, origin, path, current_item)
-			}
+			None => self.binding_to_import_scope(
+				origin.into(),
+				origin,
+				path,
+				current_item,
+			),
 			// Every segment after the first looks its own name up inside
 			// the namespace the previous segment resolved to, rather than
 			// `origin` — the first segment is the only one looked up
@@ -800,11 +791,11 @@ impl<'r> ImportResolver<'r> {
 	/// forcing *that one* would just be forcing itself mid-resolution.
 	fn binding_to_import_scope(
 		&mut self,
-		target_namespace: NamespaceIdx,
-		accessor: NamespaceIdx,
+		target_namespace: Namespace,
+		accessor: Scope,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
-	) -> Result<NamespaceIdx, ()> {
+	) -> Result<Namespace, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		let key = BindingKey::ty(segment.segment.inner);
 
@@ -819,10 +810,11 @@ impl<'r> ImportResolver<'r> {
 		// Skips `current_item`: `use x::x;` registers itself as a
 		// candidate for its own prefix segment "x", so forcing it here
 		// would just be forcing this same resolution from inside itself.
-		if let Some(candidates) = self
-			.pending_named_imports
-			.get(&(target_namespace, segment.segment.inner))
-		{
+		if let Some(candidates) =
+			target_namespace.as_scope().and_then(|scope| {
+				self.pending_named_imports
+					.get(&(scope, segment.segment.inner))
+			}) {
 			for candidate in candidates {
 				if candidate != current_item {
 					self.ensure_import_item(candidate);
@@ -831,7 +823,7 @@ impl<'r> ImportResolver<'r> {
 		}
 
 		let source_span = SourceSpan::new(
-			self.namespaces[usize::from(accessor)].file_id,
+			self.namespaces.file_id(accessor.into()),
 			segment.segment.span,
 		);
 
@@ -904,22 +896,9 @@ impl<'r> ImportResolver<'r> {
 			return Err(());
 		};
 
-		let def = &self.namespaces[usize::from(def_key.namespace_idx)].items
-			[usize::from(def_key.def_idx)];
-		match def.kind {
-			DefKind::Package(package) => {
-				Ok(NamespaceIdx::new(package.as_u32()))
-			}
-			DefKind::Module(module_idx) => {
-				Ok(self.modules[usize::from(module_idx)].own_namespace)
-			}
-			DefKind::Import(import_idx) => {
-				Ok(self.imports[usize::from(import_idx)].own_namespace)
-			}
-			DefKind::Enum(enum_idx) => {
-				Ok(self.enums[usize::from(enum_idx)].own_namespace)
-			}
-			_ => {
+		match Namespace::of(self.namespaces.kind(def_key)) {
+			Some(namespace) => Ok(namespace),
+			None => {
 				let diagnostic = report_cannot_use_as_namespace(
 					self.namespaces,
 					self.strings,
@@ -986,7 +965,7 @@ impl<'r> ImportResolver<'r> {
 	/// to fall back on anyway, so this keeps named leaves consistent.
 	fn cycle_frame_label(&self, index: UseItemIndex) -> (String, SourceSpan) {
 		let item = &self.use_items[usize::from(index)];
-		let file_id = self.namespaces[usize::from(item.namespace)].file_id;
+		let file_id = self.namespaces.file_id(item.namespace.into());
 		match item.kind {
 			UseItemKind::Name { name, prefix, .. } => {
 				let leaf = self.strings.resolve(name.inner).unwrap();
@@ -1080,7 +1059,7 @@ impl<'r> ImportResolver<'r> {
 /// from here rather than duplicating it, since ambiguity is fundamentally
 /// a glob-import concept that belongs with the rest of import resolution.
 pub(super) fn report_ambiguous_identifier(
-	namespaces: &[Namespace],
+	namespaces: &Namespaces,
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
@@ -1097,10 +1076,7 @@ pub(super) fn report_ambiguous_identifier(
 			 CandidateMerge::push never lets a BindingTarget::Error \
 			 become one",
 		);
-		let noun = namespaces[usize::from(def_key.namespace_idx)].items
-			[usize::from(def_key.def_idx)]
-		.kind
-		.noun();
+		let noun = namespaces.kind(def_key).noun();
 		let also = if index == 0 { "" } else { "also " };
 		diagnostic = diagnostic.with_label(
 			candidate_span.secondary_label().with_message(format!(
@@ -1123,19 +1099,14 @@ pub(super) fn report_ambiguous_identifier(
 /// already-errored glob candidate (see `CandidateMerge::push`), which has
 /// a `Visibility` to fail the check with but no real item behind it.
 pub(super) fn report_private_identifier(
-	namespaces: &[Namespace],
+	namespaces: &Namespaces,
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
 	def_key: Option<DefKey>,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = def_key.map(|def_key| {
-		namespaces[usize::from(def_key.namespace_idx)].items
-			[usize::from(def_key.def_idx)]
-		.kind
-		.noun()
-	});
+	let noun = def_key.map(|def_key| namespaces.kind(def_key).noun());
 	let message = match noun {
 		Some(noun) => format!("{noun} `{name}` is private"),
 		None => format!("`{name}` is private"),
@@ -1162,17 +1133,14 @@ pub(super) fn report_private_identifier(
 /// `BindingTarget::Error` mid-path is handled — or skipped — before either
 /// one gets here).
 pub(super) fn report_cannot_use_as_namespace(
-	namespaces: &[Namespace],
+	namespaces: &Namespaces,
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
 	def_key: DefKey,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = namespaces[usize::from(def_key.namespace_idx)].items
-		[usize::from(def_key.def_idx)]
-	.kind
-	.noun();
+	let noun = namespaces.kind(def_key).noun();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::CannotUseAsNamespace.code())
 		.with_message(format!("cannot use {noun} `{name}` as a namespace"))
@@ -1185,7 +1153,7 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{BindingNamespace, DefinitionRegistry};
+	use crate::tir::defs::{DefinitionRegistry, Tier};
 	use crate::vfs;
 
 	/// Builds definitions and inspects the bindings installed by `use` resolution.
@@ -1256,8 +1224,8 @@ mod tests {
 			Self::from_graph(builder.build(root_id))
 		}
 
-		fn root_namespace(&self) -> NamespaceIdx {
-			self.defs.root_package.root_namespace()
+		fn root_namespace(&self) -> Scope {
+			Scope::Package(self.defs.root_package)
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -1267,12 +1235,14 @@ mod tests {
 		/// Inspects a stored binding without following glob imports or checking privacy.
 		fn direct_binding(
 			&self,
-			namespace: NamespaceIdx,
-			tier: BindingNamespace,
+			namespace: impl Into<Namespace>,
+			tier: Tier,
 			name: &str,
 		) -> Option<&Binding> {
 			let symbol = self.graph.strings.get(name)?;
-			self.defs.namespaces[usize::from(namespace)]
+			self.defs
+				.namespaces
+				.symbols(namespace.into())
 				.bindings
 				.get(&BindingKey::new(tier, symbol))
 		}
@@ -1280,10 +1250,11 @@ mod tests {
 		#[track_caller]
 		fn expect_direct_def(
 			&self,
-			namespace: NamespaceIdx,
-			tier: BindingNamespace,
+			namespace: impl Into<Namespace>,
+			tier: Tier,
 			name: &str,
 		) -> DefKey {
+			let namespace = namespace.into();
 			let target = self
 				.direct_binding(namespace, tier, name)
 				.map(|binding| binding.target);
@@ -1301,20 +1272,26 @@ mod tests {
 		#[track_caller]
 		fn child_namespace(
 			&self,
-			namespace: NamespaceIdx,
+			namespace: impl Into<Namespace>,
 			name: &str,
-		) -> NamespaceIdx {
-			let key =
-				self.expect_direct_def(namespace, BindingNamespace::Type, name);
+		) -> Namespace {
+			let key = self.expect_direct_def(namespace, Tier::Type, name);
 			let kind = key.symbol_kind(&self.defs);
-			self.defs.namespace_of(kind).unwrap_or_else(|| {
+			Namespace::of(kind).unwrap_or_else(|| {
 				panic!("`{name}` is not a namespace: {kind:?}")
 			})
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.
-		fn glob_targets(&self, namespace: NamespaceIdx) -> Vec<NamespaceIdx> {
-			self.defs.namespaces[usize::from(namespace)]
+		fn glob_targets(
+			&self,
+			namespace: impl Into<Namespace>,
+		) -> Vec<Namespace> {
+			let scope =
+				namespace.into().as_scope().expect("only a scope has globs");
+			self.defs
+				.namespaces
+				.scope(scope)
 				.glob_imports
 				.iter()
 				.map(|glob| glob.namespace)
@@ -1334,10 +1311,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let inner = case.child_namespace(root, "inner");
-		let original =
-			case.expect_direct_def(inner, BindingNamespace::Value, "helper");
-		let imported =
-			case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		let original = case.expect_direct_def(inner, Tier::Value, "helper");
+		let imported = case.expect_direct_def(root, Tier::Value, "helper");
 		assert_eq!(imported, original);
 	}
 
@@ -1351,10 +1326,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let color = case.child_namespace(root, "Color");
-		let original =
-			case.expect_direct_def(color, BindingNamespace::Value, "Red");
-		let imported =
-			case.expect_direct_def(root, BindingNamespace::Value, "Red");
+		let original = case.expect_direct_def(color, Tier::Value, "Red");
+		let imported = case.expect_direct_def(root, Tier::Value, "Red");
 		assert_eq!(imported, original);
 	}
 
@@ -1381,10 +1354,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let math = case.child_namespace(root, "math");
-		let original =
-			case.expect_direct_def(math, BindingNamespace::Value, "add");
-		let imported =
-			case.expect_direct_def(root, BindingNamespace::Value, "add");
+		let original = case.expect_direct_def(math, Tier::Value, "add");
+		let imported = case.expect_direct_def(root, Tier::Value, "add");
 		assert_eq!(imported, original);
 	}
 
@@ -1397,10 +1368,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let original =
-			case.expect_direct_def(root, BindingNamespace::Value, "add");
-		let aliased =
-			case.expect_direct_def(root, BindingNamespace::Value, "sub");
+		let original = case.expect_direct_def(root, Tier::Value, "add");
+		let aliased = case.expect_direct_def(root, Tier::Value, "sub");
 		assert_eq!(aliased, original);
 	}
 
@@ -1427,7 +1396,7 @@ mod tests {
 		);
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "secret");
+		case.expect_direct_def(root, Tier::Value, "secret");
 	}
 
 	#[test]
@@ -1446,8 +1415,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Type, "Y");
-		case.expect_direct_def(root, BindingNamespace::Value, "Y");
+		case.expect_direct_def(root, Tier::Type, "Y");
+		case.expect_direct_def(root, Tier::Value, "Y");
 	}
 
 	#[test]
@@ -1649,8 +1618,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Type, "X");
-		case.expect_direct_def(root, BindingNamespace::Value, "X");
+		case.expect_direct_def(root, Tier::Type, "X");
+		case.expect_direct_def(root, Tier::Value, "X");
 	}
 
 	/// Both definitions competing here are the local `use` declarations. The
@@ -1709,9 +1678,8 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
-		let original = case.expect_direct_def(b, BindingNamespace::Value, "f");
-		let reexported =
-			case.expect_direct_def(root, BindingNamespace::Value, "f");
+		let original = case.expect_direct_def(b, Tier::Value, "f");
+		let reexported = case.expect_direct_def(root, Tier::Value, "f");
 		assert_eq!(reexported, original);
 	}
 
@@ -1776,8 +1744,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "add");
-		case.expect_direct_def(root, BindingNamespace::Value, "sub");
+		case.expect_direct_def(root, Tier::Value, "add");
+		case.expect_direct_def(root, Tier::Value, "sub");
 	}
 
 	#[test]
@@ -1791,7 +1759,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		case.expect_direct_def(root, Tier::Value, "helper");
 	}
 
 	#[test]
@@ -1812,9 +1780,9 @@ mod tests {
 		let outer = case.child_namespace(root, "outer");
 		let inner = case.child_namespace(outer, "inner");
 
-		case.expect_direct_def(outer, BindingNamespace::Value, "via_self");
-		case.expect_direct_def(inner, BindingNamespace::Value, "via_super");
-		case.expect_direct_def(inner, BindingNamespace::Value, "via_crate");
+		case.expect_direct_def(outer, Tier::Value, "via_self");
+		case.expect_direct_def(inner, Tier::Value, "via_super");
+		case.expect_direct_def(inner, Tier::Value, "via_crate");
 	}
 
 	#[test]
@@ -1831,8 +1799,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "Y");
-		case.expect_direct_def(root, BindingNamespace::Type, "Y");
+		case.expect_direct_def(root, Tier::Value, "Y");
+		case.expect_direct_def(root, Tier::Type, "Y");
 	}
 
 	#[test]
@@ -1849,7 +1817,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "public_helper");
+		case.expect_direct_def(root, Tier::Value, "public_helper");
 	}
 
 	#[test]
@@ -1875,7 +1843,7 @@ mod tests {
 		]);
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "public_secret");
+		case.expect_direct_def(root, Tier::Value, "public_secret");
 	}
 
 	#[test]
@@ -1896,7 +1864,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		case.expect_direct_def(root, Tier::Value, "helper");
 	}
 
 	#[test]
@@ -1932,10 +1900,7 @@ mod tests {
 		let math = case.child_namespace(root, "math");
 		assert_eq!(case.glob_targets(root), vec![math]);
 		// A plain glob never installs a binding — only the fallback edge.
-		assert!(
-			case.direct_binding(root, BindingNamespace::Value, "add")
-				.is_none()
-		);
+		assert!(case.direct_binding(root, Tier::Value, "add").is_none());
 	}
 
 	#[test]
@@ -2018,10 +1983,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let original =
-			case.expect_direct_def(a, BindingNamespace::Value, "helper");
-		let reexported =
-			case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		let original = case.expect_direct_def(a, Tier::Value, "helper");
+		let reexported = case.expect_direct_def(root, Tier::Value, "helper");
 		assert_eq!(reexported, original);
 	}
 
@@ -2134,10 +2097,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let original =
-			case.expect_direct_def(a, BindingNamespace::Value, "helper");
-		let imported =
-			case.expect_direct_def(root, BindingNamespace::Value, "helper");
+		let original = case.expect_direct_def(a, Tier::Value, "helper");
+		let imported = case.expect_direct_def(root, Tier::Value, "helper");
 		assert_eq!(imported, original);
 	}
 
@@ -2216,9 +2177,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let a_pick = case.expect_direct_def(a, BindingNamespace::Value, "pick");
-		let resolved =
-			case.expect_direct_def(root, BindingNamespace::Value, "pick");
+		let a_pick = case.expect_direct_def(a, Tier::Value, "pick");
+		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2251,9 +2211,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let a_pick = case.expect_direct_def(a, BindingNamespace::Value, "pick");
-		let resolved =
-			case.expect_direct_def(root, BindingNamespace::Value, "pick");
+		let a_pick = case.expect_direct_def(a, Tier::Value, "pick");
+		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2273,10 +2232,9 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let local = case.expect_direct_def(root, BindingNamespace::Value, "X");
-		assert_eq!(local.namespace_idx, root);
-		let selected =
-			case.expect_direct_def(root, BindingNamespace::Value, "selected");
+		let local = case.expect_direct_def(root, Tier::Value, "X");
+		assert_eq!(local.namespace, root.into());
+		let selected = case.expect_direct_def(root, Tier::Value, "selected");
 		assert_eq!(selected, local);
 	}
 
@@ -2363,9 +2321,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let b = case.child_namespace(root, "b");
-		let b_pick = case.expect_direct_def(b, BindingNamespace::Value, "pick");
-		let resolved =
-			case.expect_direct_def(root, BindingNamespace::Value, "pick");
+		let b_pick = case.expect_direct_def(b, Tier::Value, "pick");
+		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
 		assert_eq!(resolved, b_pick);
 	}
 
@@ -2433,7 +2390,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, BindingNamespace::Value, "c");
+		case.expect_direct_def(root, Tier::Value, "c");
 
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
@@ -2464,7 +2421,7 @@ mod tests {
 	fn self_targeting_private_glob_reports_cyclic_import() {
 		// The private counterpart of `self_targeting_pub_glob_reports_cyclic_import`.
 		// A self-glob is always a genuine cycle regardless of visibility —
-		// `namespace_contains(inner, inner)` trivially holds, so *any*
+		// `contains(inner, inner)` trivially holds, so *any*
 		// accessor already inside `inner` (including `inner` itself) can
 		// walk this edge forever. This used to overflow the stack instead
 		// of reaching this diagnostic, since nothing stopped the
@@ -2553,10 +2510,8 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(root, "b");
-		let original =
-			case.expect_direct_def(a, BindingNamespace::Value, "only_in_a");
-		let selected =
-			case.expect_direct_def(b, BindingNamespace::Value, "selected");
+		let original = case.expect_direct_def(a, Tier::Value, "only_in_a");
+		let selected = case.expect_direct_def(b, Tier::Value, "selected");
 		assert_eq!(selected, original);
 	}
 

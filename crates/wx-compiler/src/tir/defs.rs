@@ -6,6 +6,7 @@
 // use super::*;
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -34,7 +35,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	stdlib_package: PackageId,
 	root_package: PackageId,
 
-	namespaces: Vec<Namespace>,
+	namespaces: Namespaces,
 	modules: Vec<ModuleDef>,
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
@@ -55,8 +56,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
-	pending_named_imports:
-		HashMap<(NamespaceIdx, SymbolU32), SmallVec<UseItemIndex>>,
+	pending_named_imports: HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
 	/// Every glob `use` item — `pub` or not — grouped by the namespace it's
 	/// *declared* in — no name dimension, unlike `pending_named_imports`,
 	/// since a glob doesn't claim one. Lets glob resolution find "what does
@@ -67,7 +67,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// lookup time includes private edges just as much as `pub` ones, so
 	/// cycle detection has to see the whole graph, not just its `pub`
 	/// subset.
-	pending_glob_targets: HashMap<NamespaceIdx, SmallVec<UseItemIndex>>,
+	pending_glob_targets: HashMap<Scope, SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -100,24 +100,27 @@ pub enum UseItemKind {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct UseItemDef {
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub pub_span: Option<TextSpan>,
 	pub kind: UseItemKind,
 }
 
+/// Which of a namespace's two sets of names a binding lives in: types or
+/// values. One name can be bound once in each, as a struct is (its type and
+/// its constructor).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum BindingNamespace {
+pub enum Tier {
 	Type,
 	Value,
 }
 
-impl BindingNamespace {
+impl Tier {
 	pub(super) fn noun(self) -> &'static str {
 		match self {
-			BindingNamespace::Type => "type",
-			BindingNamespace::Value => "value",
+			Tier::Type => "type",
+			Tier::Value => "value",
 		}
 	}
 }
@@ -125,25 +128,25 @@ impl BindingNamespace {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct BindingKey {
-	pub(super) namespace: BindingNamespace,
+	pub(super) tier: Tier,
 	pub(super) symbol: SymbolU32,
 }
 
 impl BindingKey {
-	pub(super) fn new(namespace: BindingNamespace, symbol: SymbolU32) -> Self {
-		Self { namespace, symbol }
+	pub(super) fn new(tier: Tier, symbol: SymbolU32) -> Self {
+		Self { tier, symbol }
 	}
 
 	pub(super) fn ty(symbol: SymbolU32) -> Self {
 		Self {
-			namespace: BindingNamespace::Type,
+			tier: Tier::Type,
 			symbol,
 		}
 	}
 
 	pub(super) fn value(symbol: SymbolU32) -> Self {
 		Self {
-			namespace: BindingNamespace::Value,
+			tier: Tier::Value,
 			symbol,
 		}
 	}
@@ -153,7 +156,7 @@ impl BindingKey {
 pub struct TraitDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub pub_span: Option<TextSpan>,
 	pub name: Spanned<SymbolU32>,
 	#[cfg_attr(
@@ -168,7 +171,7 @@ pub struct TraitDef {
 pub struct TraitImplDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub members: Vec<TraitMemberDef>,
 	#[cfg_attr(
 		test,
@@ -181,7 +184,7 @@ pub struct TraitImplDef {
 pub struct InherentImplDef {
 	pub def_id: ast::DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -196,7 +199,7 @@ pub struct InherentImplDef {
 pub struct StructDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub fields: Box<[FieldDef]>,
 	/// The named fields by name, each to its first occurrence.
@@ -226,16 +229,25 @@ pub struct FieldDef {
 pub struct EnumDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub parent_namespace: NamespaceIdx,
-	pub own_namespace: NamespaceIdx,
+	pub parent_namespace: Scope,
 	pub name: Spanned<SymbolU32>,
+	/// The enum's variants, in written order, a duplicate name included: a
+	/// variant is a constant of the enum's type, and an enum's variants are
+	/// one run of `constants`, so a variant's position is what its implicit
+	/// value counts from.
+	///
+	/// Invariant: the run is contiguous. The enum's scan pushes all of its
+	/// variants with one `extend` and nothing pushes a constant in between, so
+	/// the variant before `c` is `c - 1` while that is still in the range. Any
+	/// change to how variants are pushed must keep them together.
+	pub variants: Range<ConstIdx>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TypeAliasDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -255,7 +267,7 @@ pub struct TypeAliasDef {
 pub struct TypeSetDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub trait_index: TraitIdx,
 	pub member_impls: Box<[TraitImplIdx]>,
 }
@@ -268,7 +280,7 @@ pub struct TypeSetDef {
 pub struct FunctionDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub params: Box<[Spanned<SymbolU32>]>,
 }
@@ -291,7 +303,7 @@ pub struct FunctionDef {
 pub struct MemoryDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub trait_impl_index: TraitImplIdx,
 	pub size_assoc_type_index: AssocTypeIdx,
@@ -313,7 +325,7 @@ pub struct MemoryDef {
 pub struct GlobalDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub trait_impl_index: TraitImplIdx,
 	pub value_assoc_type_index: AssocTypeIdx,
@@ -326,7 +338,7 @@ pub struct GlobalDef {
 pub struct ConstDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -338,7 +350,7 @@ pub struct AssocTypeDef {
 	/// or the owning memory/global for synthetic impl members.
 	pub def_id: DefId,
 	pub file_id: FileId,
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -346,7 +358,6 @@ index_newtype!(LocalDefIdx);
 index_newtype!(MemberIdx);
 index_newtype!(ModuleIdx);
 index_newtype!(ImportIdx);
-index_newtype!(NamespaceIdx);
 index_newtype!(TraitIdx);
 index_newtype!(InherentImplIdx);
 index_newtype!(TraitImplIdx);
@@ -360,17 +371,6 @@ index_newtype!(MemoryIdx);
 index_newtype!(GlobalIdx);
 index_newtype!(ConstIdx);
 index_newtype!(AssocTypeIdx);
-
-impl PackageId {
-	/// Packages preallocate their own root namespace 1:1, in `PackageId`
-	/// order, before anything else — see
-	/// `DefinitionRegistryBuilder::build`. So a package's own namespace
-	/// never needs a lookup table; it's this same index reinterpreted.
-	#[inline]
-	pub(super) fn root_namespace(self) -> NamespaceIdx {
-		NamespaceIdx::new(self.as_u32())
-	}
-}
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
@@ -399,11 +399,10 @@ impl LocalDefIdx {
 pub(super) struct AstEntry<'ast> {
 	pub(super) def_id: DefId,
 	pub(super) file_id: FileId,
-	/// The item's owning namespace. For imported declarations this is
-	/// the import block's own namespace, whose `NamespaceOwner::Import`
-	/// identifies its `ImportDef`. Use that definition's `parent_namespace`
-	/// when resolving the declaration's signature in the enclosing scope.
-	pub(super) namespace: NamespaceIdx,
+	/// The scope the item is written in, where its signature resolves. For
+	/// an imported declaration that is the scope around its import block;
+	/// the block itself is named by the entry (`AstNodeRef::Imported*`).
+	pub(super) namespace: Scope,
 	pub(super) node: AstNodeRef<'ast>,
 }
 
@@ -457,6 +456,11 @@ pub(super) enum AstNodeRef<'ast> {
 		trait_index: TraitIdx,
 		item: &'ast ast::TraitItem,
 	},
+	EnumVariant {
+		const_index: ConstIdx,
+		enum_index: EnumIdx,
+		item: &'ast ast::EnumVariant,
+	},
 	TraitAssocType {
 		assoc_type_index: AssocTypeIdx,
 		trait_index: TraitIdx,
@@ -497,21 +501,24 @@ pub(super) enum AstNodeRef<'ast> {
 	},
 	ImportedMemory {
 		memory_index: MemoryIdx,
+		import_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedFunction {
 		function_index: FunctionIdx,
+		import_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 	ImportedGlobal {
 		global_index: GlobalIdx,
+		import_index: ImportIdx,
 		decl: &'ast ast::ImportDeclaration,
 	},
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct ExportEntrySource {
-	pub namespace: NamespaceIdx,
+	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub external_span: SourceSpan,
 }
@@ -520,10 +527,10 @@ pub(super) struct ExportEntrySource {
 pub(super) struct DefinitionRegistry {
 	pub stdlib_package: PackageId,
 	pub root_package: PackageId,
-	pub namespaces: Vec<Namespace>,
+	pub namespaces: Namespaces,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
 	#[cfg_attr(test, serde(skip))]
-	pub file_namespaces: Vec<NamespaceIdx>,
+	pub file_namespaces: Vec<Scope>,
 	pub modules: Vec<ModuleDef>,
 	pub imports: Vec<ImportDef>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
@@ -688,7 +695,7 @@ pub enum DefKind {
 	Import(ImportIdx),
 	Package(PackageId),
 	Enum(EnumIdx),
-	EnumVariant(DefId),
+	EnumVariant(ConstIdx),
 	Struct(StructIdx),
 	Memory(MemoryIdx),
 	Trait(TraitIdx),
@@ -722,21 +729,59 @@ impl DefKind {
 	}
 }
 
-impl DefinitionRegistry {
-	/// The namespace `kind` lets a path continue walking into, if any —
-	/// the four kinds that are themselves a namespace.
-	pub(super) fn namespace_of(&self, kind: DefKind) -> Option<NamespaceIdx> {
+/// Something a path can continue into: what `a::` names when `a` is a
+/// package, a module, an enum or an import block. Each is addressed by its
+/// owner's own index, so the handle and the owner are one thing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum Namespace {
+	Package(PackageId),
+	Module(ModuleIdx),
+	Enum(EnumIdx),
+	Import(ImportIdx),
+}
+
+/// A namespace code is written in: where an unqualified lookup starts, and
+/// the accessor of every privacy check. Only packages and modules are
+/// scopes; an enum's variants and an import block's declarations are only
+/// ever reached through a path.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum Scope {
+	Package(PackageId),
+	Module(ModuleIdx),
+}
+
+impl From<Scope> for Namespace {
+	#[inline]
+	fn from(scope: Scope) -> Self {
+		match scope {
+			Scope::Package(package) => Self::Package(package),
+			Scope::Module(module) => Self::Module(module),
+		}
+	}
+}
+
+impl Namespace {
+	/// The namespace `kind` lets a path continue walking into, if any.
+	pub(super) fn of(kind: DefKind) -> Option<Self> {
 		Some(match kind {
-			DefKind::Package(package) => package.root_namespace(),
-			DefKind::Enum(idx) => self.enums[usize::from(idx)].own_namespace,
-			DefKind::Module(idx) => {
-				self.modules[usize::from(idx)].own_namespace
-			}
-			DefKind::Import(idx) => {
-				self.imports[usize::from(idx)].own_namespace
-			}
+			DefKind::Package(package) => Self::Package(package),
+			DefKind::Module(module) => Self::Module(module),
+			DefKind::Enum(enum_index) => Self::Enum(enum_index),
+			DefKind::Import(import) => Self::Import(import),
 			_ => return None,
 		})
+	}
+
+	pub(super) fn as_scope(self) -> Option<Scope> {
+		match self {
+			Self::Package(package) => Some(Scope::Package(package)),
+			Self::Module(module) => Some(Scope::Module(module)),
+			Self::Enum(_) | Self::Import(_) => None,
+		}
 	}
 }
 
@@ -757,143 +802,58 @@ impl ItemDef {
 	}
 }
 
+/// What one namespace holds: the definitions declared in it (`items`, which
+/// a `DefKey` addresses) and the names it binds. Every namespace is written in
+/// one file.
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum NamespaceOwner {
-	Module(ModuleIdx),
-	Import(ImportIdx),
-	Package(PackageId),
-	Enum(EnumIdx),
-}
-
-/// The symbol table for a module namespace — shared concept for both local
-/// modules (`mod foo;` / `mod foo { }`) and import blocks (`import "env" { }`).
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Namespace {
-	pub parent: Option<NamespaceIdx>,
+pub struct SymbolTable {
 	pub file_id: FileId,
-	/// The package this namespace belongs to — every namespace is inside
-	/// exactly one, so it's stored rather than recovered by walking parents.
-	pub package_id: PackageId,
-	pub owner: NamespaceOwner,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
 	pub bindings: HashMap<BindingKey, Binding>,
 	pub items: Vec<ItemDef>,
-	/// Namespaces brought into scope via `use path::*;`.  Checked during lookup
-	/// after direct symbols but before walking to the parent.
+}
+
+impl SymbolTable {
+	fn new(file_id: FileId) -> Self {
+		Self {
+			file_id,
+			bindings: HashMap::new(),
+			items: Vec::new(),
+		}
+	}
+}
+
+/// A scope's symbols, plus what only a scope has: a place in the module tree
+/// and the globs its `use path::*;` items brought in.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct ScopeTable {
+	pub symbols: SymbolTable,
+	pub parent: Option<Scope>,
+	/// The package this scope belongs to — every scope is inside exactly
+	/// one, so it's stored rather than recovered by walking parents.
+	pub package_id: PackageId,
+	/// Namespaces brought into scope via `use path::*;`. Checked during
+	/// lookup after direct bindings.
 	pub glob_imports: Vec<GlobImport>,
 }
 
-/// Lookup helpers over a namespace graph. Implemented on `[Namespace]`
-/// rather than a dedicated wrapper type so it applies uniformly to
-/// `DefinitionRegistryBuilder`'s still-growing `Vec<Namespace>`,
-/// `DefinitionRegistry`'s frozen storage, and `ImportResolver`'s borrowed
-/// `&mut [Namespace]` — all of them deref to `[Namespace]`.
-pub(super) trait NamespaceLookup {
-	/// Whether `namespace` is `ancestor` itself, or nested inside it.
-	fn namespace_contains(
-		&self,
-		ancestor: NamespaceIdx,
-		namespace: NamespaceIdx,
-	) -> bool;
-
-	/// An item declared `visibility` in `target_namespace` is reachable
-	/// from `accessor` if it's `Public`, or if `target_namespace`
-	/// contains `accessor`.
-	fn is_accessible_from(
-		&self,
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
-		visibility: Visibility,
-	) -> bool;
-
-	/// Inserts `binding` under `key` in `namespace_idx`. `Err` carries the
-	/// colliding `DefKey` when one was already there and both count as
-	/// real occupants of the name — this is an error state, not merely an
-	/// optional value, hence `Result` over `Option`. No diagnostics here —
-	/// this only touches the namespace graph; a caller with
-	/// `diagnostics`/`strings` on hand (see
-	/// `DefinitionRegistryBuilder`/`ImportResolver`'s own `insert_binding`)
-	/// is what turns a collision into a reported error.
-	fn try_insert_binding(
-		&mut self,
-		namespace_idx: NamespaceIdx,
-		key: BindingKey,
-		binding: Binding,
-	) -> Result<(), DefKey>;
-
-	/// Records that `def_key` was referenced at `span` — go-to-definition
-	/// and find-references over the *definition itself*, regardless of
-	/// which name/path was used to reach it (a re-export's own consult of
-	/// the original item counts here too, same as a direct reference).
-	fn record_access(&mut self, def_key: DefKey, span: SourceSpan);
-
-	/// Records that the binding under `key` in `namespace_idx` was
-	/// consulted at `span` — distinct from `record_access`: this tracks
-	/// whether *this specific name slot* (a direct declaration or a `use`)
-	/// was ever looked up, which is what unused-import/unused-declaration
-	/// diagnostics need and `record_access` alone can't answer (a
-	/// re-export's own binding can sit unused while the original
-	/// definition it points to is still referenced elsewhere).
-	fn record_binding_access(
-		&mut self,
-		namespace_idx: NamespaceIdx,
-		key: BindingKey,
-		span: SourceSpan,
-	);
-
-	/// `namespace`'s own binding for `key` — a direct declaration or a
-	/// resolved named `use`. No glob involved, so no ambiguity is
-	/// possible: a `HashMap` has at most one entry per key. Accessor-blind
-	/// by design — filtering happens one level up, once multiple
-	/// candidates are actually competing.
-	fn direct_lookup(
-		&self,
-		target_namespace: NamespaceIdx,
-		key: BindingKey,
-	) -> Option<(BindingTarget, Visibility)>;
-
-	/// What `target_namespace` exposes through its `use path::*;` edges,
-	/// filtered to the ones `accessor` may actually see — a glob is just
-	/// another binding with a visibility, so a `pub` one is visible to
-	/// anyone and a private one only to `target_namespace` itself and its
-	/// descendants, the same rule `is_accessible_from` applies everywhere
-	/// else. Recurses via `lookup` at each hop, not into itself, so a
-	/// re-export chain composes through direct declarations and further
-	/// re-exports alike. Terminates because `compute_glob_item` already
-	/// rejects a cycle in this exact edge set before it can be walked.
-	///
-	/// `accessor` also matters once two *distinct* candidates compete: a
-	/// candidate `accessor` could never legally choose is excluded right
-	/// then, rather than surviving into a misleading `Ambiguous`. A lone
-	/// candidate is always returned `Found`, visibility included,
-	/// regardless of whether `accessor` can see *that candidate* — deferred
-	/// to the caller, same as a direct (non-glob) hit already is.
-	fn indirect_lookup(
-		&self,
-		use_items: &[UseItemDef],
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
-		key: BindingKey,
-	) -> BindingLookup;
-
-	/// What `target_namespace` exposes to `accessor` — `direct_lookup`,
-	/// falling back to `indirect_lookup`. What a named `use a::b;` and a
-	/// glob `use a::*;` should both find when asking `a` for the same
-	/// name, whether `accessor` is `a` itself (or a descendant, consulting
-	/// `a`'s own private globs) or is reaching in from elsewhere.
-	fn lookup(
-		&self,
-		use_items: &[UseItemDef],
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
-		key: BindingKey,
-	) -> BindingLookup;
+/// Every namespace's table, each list indexed by its owner's own index:
+/// `packages` by `PackageId`, `modules` by `ModuleIdx`, `enums` by `EnumIdx`
+/// and `imports` by `ImportIdx`. An owner and its table are pushed together,
+/// which is what keeps the two aligned.
+#[derive(Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct Namespaces {
+	packages: Vec<ScopeTable>,
+	modules: Vec<ScopeTable>,
+	enums: Vec<SymbolTable>,
+	imports: Vec<SymbolTable>,
 }
 
-/// The result of [`NamespaceLookup::lookup`]/[`NamespaceLookup::indirect_lookup`].
+/// The result of [`Namespaces::lookup`]/[`Namespaces::indirect_lookup`].
 /// `Found` pairs a target with its visibility — an accessibility check and
 /// re-export capping both need both at once, and this holds regardless of
 /// whether `accessor` can actually see it; that's left for the caller to
@@ -935,8 +895,8 @@ pub(super) enum BindingLookup {
 /// choose is excluded right then, rather than surviving into a misleading
 /// `Ambiguous`.
 struct CandidateMerge<'a> {
-	namespaces: &'a [Namespace],
-	accessor: NamespaceIdx,
+	namespaces: &'a Namespaces,
+	accessor: Scope,
 	candidates: Candidates,
 }
 
@@ -959,7 +919,7 @@ enum Candidates {
 }
 
 impl<'a> CandidateMerge<'a> {
-	fn new(namespaces: &'a [Namespace], accessor: NamespaceIdx) -> Self {
+	fn new(namespaces: &'a Namespaces, accessor: Scope) -> Self {
 		Self {
 			namespaces,
 			accessor,
@@ -1004,12 +964,12 @@ impl<'a> CandidateMerge<'a> {
 
 				let first_reachable = self.namespaces.is_accessible_from(
 					self.accessor,
-					first_key.namespace_idx,
+					first_key.namespace,
 					*first_visibility,
 				);
 				let this_reachable = self.namespaces.is_accessible_from(
 					self.accessor,
-					def_key.namespace_idx,
+					def_key.namespace,
 					visibility,
 				);
 
@@ -1034,7 +994,7 @@ impl<'a> CandidateMerge<'a> {
 			Candidates::Many(items) => {
 				if !self.namespaces.is_accessible_from(
 					self.accessor,
-					def_key.namespace_idx,
+					def_key.namespace,
 					visibility,
 				) {
 					return;
@@ -1075,45 +1035,106 @@ impl<'a> CandidateMerge<'a> {
 	}
 }
 
-impl NamespaceLookup for [Namespace] {
-	fn namespace_contains(
-		&self,
-		ancestor: NamespaceIdx,
-		current: NamespaceIdx,
-	) -> bool {
-		let mut current = Some(current);
-		while let Some(ns) = current {
-			if ns == ancestor {
+impl Namespaces {
+	pub(super) fn symbols(&self, namespace: Namespace) -> &SymbolTable {
+		match namespace {
+			Namespace::Package(package) => {
+				&self.packages[package.as_usize()].symbols
+			}
+			Namespace::Module(module) => {
+				&self.modules[usize::from(module)].symbols
+			}
+			Namespace::Enum(enum_index) => &self.enums[usize::from(enum_index)],
+			Namespace::Import(import) => &self.imports[usize::from(import)],
+		}
+	}
+
+	fn symbols_mut(&mut self, namespace: Namespace) -> &mut SymbolTable {
+		match namespace {
+			Namespace::Package(package) => {
+				&mut self.packages[package.as_usize()].symbols
+			}
+			Namespace::Module(module) => {
+				&mut self.modules[usize::from(module)].symbols
+			}
+			Namespace::Enum(enum_index) => {
+				&mut self.enums[usize::from(enum_index)]
+			}
+			Namespace::Import(import) => &mut self.imports[usize::from(import)],
+		}
+	}
+
+	pub(super) fn scope(&self, scope: Scope) -> &ScopeTable {
+		match scope {
+			Scope::Package(package) => &self.packages[package.as_usize()],
+			Scope::Module(module) => &self.modules[usize::from(module)],
+		}
+	}
+
+	pub(super) fn scope_mut(&mut self, scope: Scope) -> &mut ScopeTable {
+		match scope {
+			Scope::Package(package) => &mut self.packages[package.as_usize()],
+			Scope::Module(module) => &mut self.modules[usize::from(module)],
+		}
+	}
+
+	pub(super) fn file_id(&self, namespace: Namespace) -> FileId {
+		self.symbols(namespace).file_id
+	}
+
+	/// What `def_key` names.
+	pub(super) fn kind(&self, def_key: DefKey) -> DefKind {
+		self.symbols(def_key.namespace).items[usize::from(def_key.def_idx)].kind
+	}
+
+	/// Whether `scope` is `ancestor` itself, or nested inside it.
+	pub(super) fn contains(&self, ancestor: Scope, scope: Scope) -> bool {
+		let mut current = Some(scope);
+		while let Some(scope) = current {
+			if scope == ancestor {
 				return true;
 			}
-			current = self[usize::from(ns)].parent;
+			current = self.scope(scope).parent;
 		}
 		false
 	}
 
-	fn is_accessible_from(
+	/// An item declared `visibility` in `target` is reachable from
+	/// `accessor` if it's `Public`, or if `target` is a scope that contains
+	/// `accessor`.
+	pub(super) fn is_accessible_from(
 		&self,
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
+		accessor: Scope,
+		target: Namespace,
 		visibility: Visibility,
 	) -> bool {
 		match visibility {
 			Visibility::Public => true,
-			Visibility::Private => {
-				self.namespace_contains(target_namespace, accessor)
-			}
+			// No code is written inside an enum or an import block, so no
+			// accessor is ever inside one.
+			Visibility::Private => target
+				.as_scope()
+				.is_some_and(|target| self.contains(target, accessor)),
 		}
 	}
 
-	fn try_insert_binding(
+	/// Inserts `binding` under `key` in `namespace`. `Err` carries the
+	/// colliding `DefKey` when one was already there and both count as
+	/// real occupants of the name — this is an error state, not merely an
+	/// optional value, hence `Result` over `Option`. No diagnostics here —
+	/// this only touches the namespace graph; a caller with
+	/// `diagnostics`/`strings` on hand (see
+	/// `DefinitionRegistryBuilder`/`ImportResolver`'s own `insert_binding`)
+	/// is what turns a collision into a reported error.
+	pub(super) fn try_insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIdx,
+		namespace: Namespace,
 		key: BindingKey,
 		binding: Binding,
 	) -> Result<(), DefKey> {
 		use std::collections::hash_map::Entry;
 
-		match self[usize::from(namespace_idx)].bindings.entry(key) {
+		match self.symbols_mut(namespace).bindings.entry(key) {
 			Entry::Vacant(entry) => {
 				entry.insert(binding);
 				Ok(())
@@ -1167,56 +1188,86 @@ impl NamespaceLookup for [Namespace] {
 		}
 	}
 
-	fn record_access(&mut self, def_key: DefKey, span: SourceSpan) {
-		self[usize::from(def_key.namespace_idx)].items
-			[usize::from(def_key.def_idx)]
-		.accesses
-		.push(span);
+	/// Records that `def_key` was referenced at `span` — go-to-definition
+	/// and find-references over the *definition itself*, regardless of
+	/// which name/path was used to reach it (a re-export's own consult of
+	/// the original item counts here too, same as a direct reference).
+	pub(super) fn record_access(&mut self, def_key: DefKey, span: SourceSpan) {
+		self.symbols_mut(def_key.namespace).items[usize::from(def_key.def_idx)]
+			.accesses
+			.push(span);
 	}
 
-	fn record_binding_access(
+	/// Records that the binding under `key` in `namespace` was consulted at
+	/// `span` — distinct from `record_access`: this tracks whether *this
+	/// specific name slot* (a direct declaration or a `use`) was ever looked
+	/// up, which is what unused-import/unused-declaration diagnostics need
+	/// and `record_access` alone can't answer (a re-export's own binding can
+	/// sit unused while the original definition it points to is still
+	/// referenced elsewhere).
+	pub(super) fn record_binding_access(
 		&mut self,
-		namespace_idx: NamespaceIdx,
+		namespace: Namespace,
 		key: BindingKey,
 		span: SourceSpan,
 	) {
 		if let Some(binding) =
-			self[usize::from(namespace_idx)].bindings.get_mut(&key)
+			self.symbols_mut(namespace).bindings.get_mut(&key)
 		{
 			binding.accesses.push(span);
 		}
 	}
 
-	fn direct_lookup(
+	/// `namespace`'s own binding for `key` — a direct declaration or a
+	/// resolved named `use`. No glob involved, so no ambiguity is
+	/// possible: a `HashMap` has at most one entry per key. Accessor-blind
+	/// by design — filtering happens one level up, once multiple
+	/// candidates are actually competing.
+	pub(super) fn direct_lookup(
 		&self,
-		target_namespace: NamespaceIdx,
+		namespace: Namespace,
 		key: BindingKey,
 	) -> Option<(BindingTarget, Visibility)> {
-		self[usize::from(target_namespace)]
+		self.symbols(namespace)
 			.bindings
 			.get(&key)
 			.map(|binding| (binding.target, binding.visibility))
 	}
 
-	fn indirect_lookup(
+	/// What `target` exposes through its `use path::*;` edges, filtered to
+	/// the ones `accessor` may actually see — a glob is just another
+	/// binding with a visibility, so a `pub` one is visible to anyone and a
+	/// private one only to `target` itself and its descendants, the same
+	/// rule `is_accessible_from` applies everywhere else. Recurses via
+	/// `lookup` at each hop, not into itself, so a re-export chain composes
+	/// through direct declarations and further re-exports alike. Terminates
+	/// because `compute_glob_item` already rejects a cycle in this exact
+	/// edge set before it can be walked. Only a scope has globs.
+	///
+	/// `accessor` also matters once two *distinct* candidates compete: a
+	/// candidate `accessor` could never legally choose is excluded right
+	/// then, rather than surviving into a misleading `Ambiguous`. A lone
+	/// candidate is always returned `Found`, visibility included,
+	/// regardless of whether `accessor` can see *that candidate* — deferred
+	/// to the caller, same as a direct (non-glob) hit already is.
+	pub(super) fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
+		accessor: Scope,
+		target: Namespace,
 		key: BindingKey,
 	) -> BindingLookup {
+		let Some(target) = target.as_scope() else {
+			return BindingLookup::NotFound;
+		};
 		let mut candidates = CandidateMerge::new(self, accessor);
 
-		for glob in self[usize::from(target_namespace)]
-			.glob_imports
-			.iter()
-			.copied()
-		{
+		for glob in self.scope(target).glob_imports.iter().copied() {
 			let item = &use_items[usize::from(glob.use_item)];
 			let glob_visibility = Visibility::from(item.pub_span);
 			if !self.is_accessible_from(
 				accessor,
-				target_namespace,
+				target.into(),
 				glob_visibility,
 			) {
 				continue;
@@ -1224,10 +1275,8 @@ impl NamespaceLookup for [Namespace] {
 			let UseItemKind::Glob { span, .. } = item.kind else {
 				unreachable!("a glob edge is always produced by a glob item")
 			};
-			let edge_span = SourceSpan::new(
-				self[usize::from(target_namespace)].file_id,
-				span,
-			);
+			let edge_span =
+				SourceSpan::new(self.scope(target).symbols.file_id, span);
 
 			match self.lookup(use_items, accessor, glob.namespace, key) {
 				BindingLookup::NotFound => {}
@@ -1251,20 +1300,23 @@ impl NamespaceLookup for [Namespace] {
 		candidates.finish()
 	}
 
-	fn lookup(
+	/// What `target` exposes to `accessor` — `direct_lookup`, falling back
+	/// to `indirect_lookup`. What a named `use a::b;` and a glob `use a::*;`
+	/// should both find when asking `a` for the same name, whether
+	/// `accessor` is `a` itself (or a descendant, consulting `a`'s own
+	/// private globs) or is reaching in from elsewhere.
+	pub(super) fn lookup(
 		&self,
 		use_items: &[UseItemDef],
-		accessor: NamespaceIdx,
-		target_namespace: NamespaceIdx,
+		accessor: Scope,
+		target: Namespace,
 		key: BindingKey,
 	) -> BindingLookup {
-		match self.direct_lookup(target_namespace, key) {
+		match self.direct_lookup(target.into(), key) {
 			Some((target, visibility)) => {
 				BindingLookup::Found(target, visibility)
 			}
-			None => {
-				self.indirect_lookup(use_items, accessor, target_namespace, key)
-			}
+			None => self.indirect_lookup(use_items, accessor, target, key),
 		}
 	}
 }
@@ -1350,7 +1402,7 @@ impl Binding {
 	/// name at the `use` site, not the definition its target eventually names.
 	pub(super) fn declaration_span(
 		&self,
-		namespaces: &[Namespace],
+		namespaces: &Namespaces,
 		use_items: &[UseItemDef],
 	) -> SourceSpan {
 		match self.source {
@@ -1374,10 +1426,7 @@ impl Binding {
 					}
 					UseItemKind::Glob { span, .. } => span,
 				};
-				SourceSpan::new(
-					namespaces[usize::from(item.namespace)].file_id,
-					span,
-				)
+				SourceSpan::new(namespaces.file_id(item.namespace.into()), span)
 			}
 		}
 	}
@@ -1387,10 +1436,7 @@ impl Binding {
 pub struct ModuleDef {
 	/// The scope `mod foo;` was written in — where the name `foo` itself
 	/// gets bound. The "outside" of the module.
-	pub parent_namespace: NamespaceIdx,
-	/// The scope `foo`'s own items live in — what a path continues into
-	/// after `foo::`. The "inside" of the module.
-	pub own_namespace: NamespaceIdx,
+	pub parent_namespace: Scope,
 	/// The file containing the `mod foo;` (or `mod foo { .. }`) text
 	/// itself — not necessarily where `foo`'s own items live.
 	///
@@ -1423,13 +1469,12 @@ pub struct ModuleDef {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct GlobImport {
 	pub use_item: UseItemIndex,
-	pub namespace: NamespaceIdx,
+	pub namespace: Namespace,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ImportDef {
-	pub parent_namespace: NamespaceIdx,
-	pub own_namespace: NamespaceIdx,
+	pub parent_namespace: Scope,
 	pub external_name: ast::Spanned<SymbolU32>,
 	pub internal_name: ast::Spanned<SymbolU32>,
 }
@@ -1456,11 +1501,11 @@ impl MemberKind {
 		}
 	}
 
-	pub fn binding_namespace(self) -> BindingNamespace {
+	pub fn tier(self) -> Tier {
 		match self {
-			Self::AssociatedType(_) => BindingNamespace::Type,
+			Self::AssociatedType(_) => Tier::Type,
 			Self::Function(_) | Self::Method(_) | Self::Constant(_) => {
-				BindingNamespace::Value
+				Tier::Value
 			}
 		}
 	}
@@ -1470,61 +1515,28 @@ impl MemberKind {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct DefKey {
-	pub(super) namespace_idx: NamespaceIdx,
+	pub(super) namespace: Namespace,
 	pub(super) def_idx: LocalDefIdx,
 }
 
 impl DefKey {
 	#[inline]
-	pub fn new(namespace_idx: NamespaceIdx, def_idx: LocalDefIdx) -> Self {
-		Self {
-			namespace_idx,
-			def_idx,
-		}
+	pub fn new(namespace: Namespace, def_idx: LocalDefIdx) -> Self {
+		Self { namespace, def_idx }
 	}
 
 	#[inline]
-	pub fn source_span(self, namespaces: &[Namespace]) -> SourceSpan {
-		let namespace = &namespaces[usize::from(self.namespace_idx)];
+	pub fn source_span(self, namespaces: &Namespaces) -> SourceSpan {
+		let symbols = namespaces.symbols(self.namespace);
 		SourceSpan::new(
-			namespace.file_id,
-			namespace.items[usize::from(self.def_idx)].span,
+			symbols.file_id,
+			symbols.items[usize::from(self.def_idx)].span,
 		)
 	}
 
 	#[inline]
 	pub fn symbol_kind(self, defs: &DefinitionRegistry) -> DefKind {
-		let namespace = &defs.namespaces[usize::from(self.namespace_idx)];
-		namespace.items[usize::from(self.def_idx)].kind
-	}
-}
-
-#[must_use]
-struct Declared<T: Copy> {
-	value: T,
-	collision: Option<DefKey>,
-}
-
-impl<T: Copy> Declared<T> {
-	fn new(value: T) -> Self {
-		Self {
-			value,
-			collision: None,
-		}
-	}
-
-	fn with_collision(value: T, collision: DefKey) -> Self {
-		Self {
-			value,
-			collision: Some(collision),
-		}
-	}
-
-	fn report_with(self, f: impl FnOnce(DefKey)) -> T {
-		if let Some(existing) = self.collision {
-			f(existing);
-		}
-		self.value
+		defs.namespaces.kind(self)
 	}
 }
 
@@ -1561,7 +1573,7 @@ impl DuplicateDefinitionDiagnostic<'_> {
 			)
 			.with_label(first.secondary_label().with_message(format!(
 				"previous definition of the {} `{name}` here",
-				self.key.namespace.noun(),
+				self.key.tier.noun(),
 			)))
 	}
 }
@@ -1602,61 +1614,59 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		stdlib_package: PackageId,
 		root_package: PackageId,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
-		let namespaces: Vec<Namespace> = packages
-			.iter()
-			.enumerate()
-			.map(|(index, package)| {
-				let namespace_idx = NamespaceIdx(u32::try_from(index).unwrap());
-				let mut namespace = Namespace {
-					parent: None,
-					package_id: package.id,
-					owner: NamespaceOwner::Package(package.id),
-					file_id: package.modules[package.root.as_usize()].file_id,
-					bindings: HashMap::new(),
-					items: vec![ItemDef::new(
-						DefKind::Package(package.id),
-						TextSpan::new(0, 0),
-					)],
-					glob_imports: Vec::new(),
-				};
-				namespace.bindings.insert(
-					BindingKey::ty(ast::Keyword::SelfLower.symbol()),
-					Binding::definition(
-						DefKey::new(namespace_idx, LocalDefIdx::SELF),
-						Visibility::Public,
-					),
+		let mut namespaces = Namespaces::default();
+		for package in packages {
+			debug_assert_eq!(
+				namespaces.packages.len(),
+				package.id.as_usize(),
+				"packages are listed in `PackageId` order"
+			);
+			let root =
+				DefKey::new(Namespace::Package(package.id), LocalDefIdx::SELF);
+			let mut symbols = SymbolTable::new(
+				package.modules[package.root.as_usize()].file_id,
+			);
+			symbols.items.push(ItemDef::new(
+				DefKind::Package(package.id),
+				TextSpan::new(0, 0),
+			));
+			for symbol in [
+				ast::Keyword::SelfLower.symbol(),
+				ast::Keyword::Crate.symbol(),
+			] {
+				symbols.bindings.insert(
+					BindingKey::ty(symbol),
+					Binding::definition(root, Visibility::Public),
 				);
-				namespace.bindings.insert(
-					BindingKey::ty(ast::Keyword::Crate.symbol()),
-					Binding::definition(
-						DefKey::new(namespace_idx, LocalDefIdx::SELF),
-						Visibility::Public,
-					),
-				);
+			}
 
-				// TODO: I want to remove this later, the declaration should be defined in the crate itself
-				// Here's an example:
-				// crate foo;
-				// pub crate bar;
-				// We will use pub modifier here to set Visibility in that symbol
-				// right now it's just private, but in the future we could walk downstream the dependency chain
-				// this will be a neat way to expose peer dependencies
-				for (&name, &dependency_id) in package.dependencies.iter() {
-					namespace.bindings.insert(
-						BindingKey::ty(name),
-						Binding::definition(
-							DefKey::new(
-								dependency_id.root_namespace(),
-								LocalDefIdx::SELF,
-							),
-							Visibility::Public,
+			// TODO: I want to remove this later, the declaration should be defined in the crate itself
+			// Here's an example:
+			// crate foo;
+			// pub crate bar;
+			// We will use pub modifier here to set Visibility in that symbol
+			// right now it's just private, but in the future we could walk downstream the dependency chain
+			// this will be a neat way to expose peer dependencies
+			for (&name, &dependency_id) in package.dependencies.iter() {
+				symbols.bindings.insert(
+					BindingKey::ty(name),
+					Binding::definition(
+						DefKey::new(
+							Namespace::Package(dependency_id),
+							LocalDefIdx::SELF,
 						),
-					);
-				}
+						Visibility::Public,
+					),
+				);
+			}
 
-				namespace
-			})
-			.collect();
+			namespaces.packages.push(ScopeTable {
+				symbols,
+				parent: None,
+				package_id: package.id,
+				glob_imports: Vec::new(),
+			});
+		}
 
 		let mut builder = Self {
 			diagnostics,
@@ -1693,12 +1703,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			.iter()
 			.flat_map(|package_graph| package_graph.modules.iter())
 		{
-			let namespace_idx =
-				file_namespaces[source_module.file_id.as_usize()];
+			let scope = file_namespaces[source_module.file_id.as_usize()];
 			for item in source_module.ast.items.iter() {
 				builder.scan_item(
 					source_module.file_id,
-					namespace_idx,
+					scope,
 					&item.inner.inner,
 				);
 			}
@@ -1708,9 +1717,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			builder.diagnostics,
 			builder.strings,
 			&mut builder.namespaces,
-			&builder.modules,
-			&builder.enums,
-			&builder.imports,
 			&builder.use_items,
 			&builder.use_paths,
 			&builder.pending_named_imports,
@@ -1768,10 +1774,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// a parent's namespace ready before any of its children need it, and
 	/// `push` alone keeps every entry aligned to its `FileId` without
 	/// needing to index ahead of the vec's current length.
-	fn compute_file_namespaces(
-		&mut self,
-		packages: &[Package],
-	) -> Vec<NamespaceIdx> {
+	fn compute_file_namespaces(&mut self, packages: &[Package]) -> Vec<Scope> {
 		let mut file_namespaces = Vec::with_capacity(self.files.len());
 		for source_module in packages
 			.iter()
@@ -1783,55 +1786,48 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				"vfs must assign FileIds in package/module push order",
 			);
 			let package = &packages[source_module.package_id.as_usize()];
-			let namespace_idx = match &source_module.declaration {
-				None => package.id.root_namespace(),
+			let scope = match &source_module.declaration {
+				None => Scope::Package(package.id),
 				Some(declaration) => {
 					let parent_module =
 						&package.modules[declaration.parent.as_usize()];
 					let parent_namespace =
 						file_namespaces[parent_module.file_id.as_usize()];
-					let own_namespace = NamespaceIdx(
-						u32::try_from(self.namespaces.len()).unwrap(),
-					);
-					let module_declaration_idx =
-						self.push_module_declaration(ModuleDef {
+					let module = self.push_module(
+						ModuleDef {
 							declaration_file: parent_module.file_id,
 							own_file: source_module.file_id,
-							own_namespace,
 							parent_namespace,
 							name: declaration.name,
 							pub_span: declaration.pub_span,
-						});
-					let actual_index = self
-						.declare_child_namespace(
-							parent_namespace,
-							source_module.file_id,
-							declaration.name.inner,
-							NamespaceOwner::Module(module_declaration_idx),
-							TextSpan::new(0, u32::MAX),
-							Visibility::from(declaration.pub_span),
-						)
-						.report_with(|collision| {
-							self.diagnostics.push(
-								DuplicateDefinitionDiagnostic {
-									strings: self.strings,
-									key: BindingKey::ty(declaration.name.inner),
-									definitions: (
-										self.definition_span(collision),
-										SourceSpan::new(
-											parent_module.file_id,
-											declaration.name.span,
-										),
+						},
+						TextSpan::new(0, u32::MAX),
+					);
+					if let Err(collision) = self.bind_child(
+						parent_namespace,
+						declaration.name.inner,
+						Namespace::Module(module),
+						Visibility::from(declaration.pub_span),
+					) {
+						self.diagnostics.push(
+							DuplicateDefinitionDiagnostic {
+								strings: self.strings,
+								key: BindingKey::ty(declaration.name.inner),
+								definitions: (
+									self.definition_span(collision),
+									SourceSpan::new(
+										parent_module.file_id,
+										declaration.name.span,
 									),
-								}
-								.report(),
-							)
-						});
-					debug_assert_eq!(own_namespace, actual_index);
-					own_namespace
+								),
+							}
+							.report(),
+						);
+					}
+					Scope::Module(module)
 				}
 			};
-			file_namespaces.push(namespace_idx);
+			file_namespaces.push(scope);
 		}
 
 		file_namespaces
@@ -1859,7 +1855,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		&mut self,
 		def_id: DefId,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		name_span: TextSpan,
 	) -> (TraitImplIdx, AssocTypeIdx) {
 		let size_symbol = self.strings.get_or_intern("Size");
@@ -1898,7 +1894,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		&mut self,
 		def_id: DefId,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		name_span: TextSpan,
 		mutable: bool,
 	) -> (TraitImplIdx, AssocTypeIdx, Option<TraitImplIdx>) {
@@ -1990,54 +1986,42 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn push_def(
 		&mut self,
-		namespace_idx: NamespaceIdx,
+		namespace: impl Into<Namespace>,
 		definition: ItemDef,
 	) -> DefKey {
-		let symbol_idx = LocalDefIdx::new(
-			u32::try_from(
-				self.namespaces[usize::from(namespace_idx)].items.len(),
-			)
-			.unwrap(),
-		);
-		self.namespaces[usize::from(namespace_idx)]
-			.items
-			.push(definition);
-		DefKey::new(namespace_idx, symbol_idx)
+		let namespace = namespace.into();
+		let items = &mut self.namespaces.symbols_mut(namespace).items;
+		let def_idx = LocalDefIdx::new(u32::try_from(items.len()).unwrap());
+		items.push(definition);
+		DefKey::new(namespace, def_idx)
 	}
 
 	/// Namespace self entries describe their contents; collision labels need
 	/// the declaration name, which may be written in a different file.
 	fn definition_span(&self, key: DefKey) -> SourceSpan {
-		match self.namespaces[usize::from(key.namespace_idx)].items
-			[usize::from(key.def_idx)]
-		.kind
-		{
+		match self.namespaces.kind(key) {
 			DefKind::Module(index) => {
 				let module = &self.modules[usize::from(index)];
 				SourceSpan::new(module.declaration_file, module.name.span)
 			}
-			DefKind::Import(index) => {
-				let import = &self.imports[usize::from(index)];
-				SourceSpan::new(
-					self.namespaces[usize::from(import.parent_namespace)]
-						.file_id,
-					import.internal_name.span,
-				)
-			}
+			DefKind::Import(index) => SourceSpan::new(
+				self.namespaces.file_id(Namespace::Import(index)),
+				self.imports[usize::from(index)].internal_name.span,
+			),
 			_ => key.source_span(&self.namespaces),
 		}
 	}
 
 	fn insert_binding(
 		&mut self,
-		namespace_idx: NamespaceIdx,
+		namespace: impl Into<Namespace>,
 		key: BindingKey,
 		binding: Binding,
 		span: TextSpan,
 	) {
+		let namespace = namespace.into();
 		if let Err(collision_key) =
-			self.namespaces
-				.try_insert_binding(namespace_idx, key, binding)
+			self.namespaces.try_insert_binding(namespace, key, binding)
 		{
 			self.diagnostics.push(
 				DuplicateDefinitionDiagnostic {
@@ -2046,7 +2030,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					definitions: (
 						self.definition_span(collision_key),
 						SourceSpan::new(
-							self.namespaces[usize::from(namespace_idx)].file_id,
+							self.namespaces.file_id(namespace),
 							span,
 						),
 					),
@@ -2056,97 +2040,88 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		}
 	}
 
-	fn declare_child_namespace(
+	/// Pushes a module together with its scope, which binds the module's own
+	/// name and `self` to the module, `crate` to its package's root and
+	/// `super` to the scope it was declared in.
+	fn push_module(
 		&mut self,
-		parent_namespace: NamespaceIdx,
-		file_id: FileId,
-		name: SymbolU32,
-		kind: NamespaceOwner,
+		module: ModuleDef,
 		content_span: TextSpan,
-		visibility: Visibility,
-	) -> Declared<NamespaceIdx> {
-		let namespace_idx = NamespaceIdx::new(
-			u32::try_from(self.namespaces.len())
-				.expect("namespace graph exceeded u32 index capacity"),
-		);
-		let package_id =
-			self.namespaces[usize::from(parent_namespace)].package_id;
-		// Only `Module`/`Import` are ever declared through this helper —
-		// `Package` roots are built directly (they have no parent to
-		// declare them from) and `Enum`'s variant namespace is built by its
-		// own prescan arm (it needs neither the `self`/`crate`/`super`
-		// bindings below nor a name claimed in `parent_namespace`).
-		let def_kind = match kind {
-			NamespaceOwner::Module(idx) => DefKind::Module(idx),
-			NamespaceOwner::Import(idx) => DefKind::Import(idx),
-			NamespaceOwner::Package(_) | NamespaceOwner::Enum(_) => {
-				unreachable!("only Module/Import namespaces are declared here")
-			}
-		};
-		let mut namespace = Namespace {
-			parent: Some(parent_namespace),
-			file_id,
-			package_id,
-			owner: kind,
-			bindings: HashMap::new(),
-			items: vec![ItemDef::new(def_kind, content_span)],
-			glob_imports: Vec::new(),
-		};
-		namespace.bindings.insert(
-			BindingKey::ty(name),
-			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIdx::SELF),
-				Visibility::Public,
-			),
-		);
-		namespace.bindings.insert(
-			BindingKey::ty(ast::Keyword::SelfLower.symbol()),
-			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIdx::SELF),
-				Visibility::Public,
-			),
-		);
-
-		namespace.bindings.insert(
+	) -> ModuleIdx {
+		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
+		let parent = module.parent_namespace;
+		let package_id = self.namespaces.scope(parent).package_id;
+		let this = DefKey::new(Namespace::Module(index), LocalDefIdx::SELF);
+		let mut symbols = SymbolTable::new(module.own_file);
+		symbols
+			.items
+			.push(ItemDef::new(DefKind::Module(index), content_span));
+		for symbol in [module.name.inner, ast::Keyword::SelfLower.symbol()] {
+			symbols.bindings.insert(
+				BindingKey::ty(symbol),
+				Binding::definition(this, Visibility::Public),
+			);
+		}
+		symbols.bindings.insert(
 			BindingKey::ty(ast::Keyword::Crate.symbol()),
 			Binding::definition(
-				DefKey::new(package_id.root_namespace(), LocalDefIdx::SELF),
+				DefKey::new(Namespace::Package(package_id), LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
-		namespace.bindings.insert(
+		symbols.bindings.insert(
 			BindingKey::ty(ast::Keyword::Super.symbol()),
 			Binding::definition(
-				DefKey::new(parent_namespace, LocalDefIdx::SELF),
+				DefKey::new(parent.into(), LocalDefIdx::SELF),
 				Visibility::Public,
 			),
 		);
-		self.namespaces.push(namespace);
-		match self.namespaces.try_insert_binding(
-			parent_namespace,
+		self.modules.push(module);
+		self.namespaces.modules.push(ScopeTable {
+			symbols,
+			parent: Some(parent),
+			package_id,
+			glob_imports: Vec::new(),
+		});
+		index
+	}
+
+	/// Pushes an import block together with its table, which holds only the
+	/// block's own declarations: an import block is entered through a path,
+	/// never written in, so it binds no `self`, `crate` or `super`.
+	fn push_import(
+		&mut self,
+		import: ImportDef,
+		file_id: FileId,
+		content_span: TextSpan,
+	) -> ImportIdx {
+		let index = ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
+		let mut symbols = SymbolTable::new(file_id);
+		symbols
+			.items
+			.push(ItemDef::new(DefKind::Import(index), content_span));
+		self.imports.push(import);
+		self.namespaces.imports.push(symbols);
+		index
+	}
+
+	/// Binds a child namespace's name in the scope it was declared in, to the
+	/// child's own entry. `Err` carries the definition already holding it.
+	fn bind_child(
+		&mut self,
+		parent: Scope,
+		name: SymbolU32,
+		child: Namespace,
+		visibility: Visibility,
+	) -> Result<(), DefKey> {
+		self.namespaces.try_insert_binding(
+			parent.into(),
 			BindingKey::ty(name),
 			Binding::definition(
-				DefKey::new(namespace_idx, LocalDefIdx::SELF),
+				DefKey::new(child, LocalDefIdx::SELF),
 				visibility,
 			),
-		) {
-			Err(collision) => {
-				Declared::with_collision(namespace_idx, collision)
-			}
-			Ok(()) => Declared::new(namespace_idx),
-		}
-	}
-
-	fn push_module_declaration(&mut self, decl: ModuleDef) -> ModuleIdx {
-		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
-		self.modules.push(decl);
-		index
-	}
-
-	fn push_import_declaration(&mut self, decl: ImportDef) -> ImportIdx {
-		let index = ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
-		self.imports.push(decl);
-		index
+		)
 	}
 }
 
@@ -2154,10 +2129,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	fn scan_export_entry(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		entry: &ast::ExportEntry,
 	) {
-		let package = self.namespaces[usize::from(namespace)].package_id;
+		let package = self.namespaces.scope(namespace).package_id;
 		if package != self.root_package {
 			return;
 		}
@@ -2210,7 +2185,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	pub(super) fn scan_item(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		item: &'ast ast::Item,
 	) {
 		match item {
@@ -2401,27 +2376,29 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			} => {
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
-				let own_namespace = NamespaceIdx::new(
-					u32::try_from(self.namespaces.len()).unwrap(),
-				);
-				let package_id =
-					self.namespaces[usize::from(namespace)].package_id;
-				self.namespaces.push(Namespace {
-					parent: Some(namespace),
-					file_id,
-					package_id,
-					owner: NamespaceOwner::Enum(enum_index),
-					bindings: HashMap::new(),
-					items: Vec::new(),
-					glob_imports: Vec::new(),
-				});
+				let own_namespace = Namespace::Enum(enum_index);
+				// All of the enum's variants in one `extend`, which is what keeps
+				// `EnumDef::variants` contiguous.
+				let first_variant =
+					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
+				self.constants.extend(variants.iter().map(|variant| {
+					ConstDef {
+						def_id: variant.inner.inner.id,
+						file_id,
+						namespace,
+						name: variant.inner.inner.name,
+					}
+				}));
+				let end_variant =
+					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.enums.push(EnumDef {
 					def_id: *id,
 					file_id,
 					parent_namespace: namespace,
-					own_namespace,
 					name: *name,
+					variants: first_variant..end_variant,
 				});
+				self.namespaces.enums.push(SymbolTable::new(file_id));
 				let def_key = self.push_def(
 					namespace,
 					ItemDef::new(DefKind::Enum(enum_index), name.span),
@@ -2432,12 +2409,25 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				self.ast_nodes.push(AstEntry {
+					def_id: *id,
+					file_id,
+					namespace,
+					node: AstNodeRef::Enum { enum_index, item },
+				});
 
-				for variant in variants.iter().map(|v| &v.inner.inner) {
+				// A variant's written value is read in the scope around the
+				// enum, like any constant's initializer.
+				for (offset, variant) in variants.iter().enumerate() {
+					let variant = &variant.inner.inner;
+					let const_index = ConstIdx::new(
+						u32::from(first_variant)
+							+ u32::try_from(offset).unwrap(),
+					);
 					let variant_key = self.push_def(
 						own_namespace,
 						ItemDef::new(
-							DefKind::EnumVariant(variant.id),
+							DefKind::EnumVariant(const_index),
 							variant.name.span,
 						),
 					);
@@ -2447,14 +2437,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						Binding::definition(variant_key, Visibility::Public),
 						variant.name.span,
 					);
+					self.ast_nodes.push(AstEntry {
+						def_id: variant.id,
+						file_id,
+						namespace,
+						node: AstNodeRef::EnumVariant {
+							const_index,
+							enum_index,
+							item: variant,
+						},
+					});
 				}
-
-				self.ast_nodes.push(AstEntry {
-					def_id: *id,
-					file_id,
-					namespace,
-					node: AstNodeRef::Enum { enum_index, item },
-				});
 			}
 			ast::Item::TypeAlias {
 				id,
@@ -2480,7 +2473,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				if body.is_none()
-					&& self.namespaces[usize::from(namespace)].package_id
+					&& self.namespaces.scope(namespace).package_id
 						== self.stdlib_package
 				{
 					if let Some(name_str) = self.strings.resolve(name.inner) {
@@ -2576,45 +2569,39 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				items,
 				pub_span,
 			} => {
-				let own_namespace_idx =
-					NamespaceIdx(u32::try_from(self.namespaces.len()).unwrap());
-				let module_declaration_idx =
-					self.push_module_declaration(ModuleDef {
+				let module = self.push_module(
+					ModuleDef {
 						parent_namespace: namespace,
-						own_namespace: own_namespace_idx,
 						declaration_file: file_id,
 						own_file: file_id,
 						name: *name,
 						pub_span: *pub_span,
-					});
-				let actual_index = self
-					.declare_child_namespace(
-						namespace,
-						file_id,
-						name.inner,
-						NamespaceOwner::Module(module_declaration_idx),
-						items.span,
-						Visibility::from(*pub_span),
-					)
-					.report_with(|collision_key| {
-						self.diagnostics.push(
-							DuplicateDefinitionDiagnostic {
-								strings: self.strings,
-								key: BindingKey::ty(name.inner),
-								definitions: (
-									self.definition_span(collision_key),
-									SourceSpan::new(file_id, name.span),
-								),
-							}
-							.report(),
-						)
-					});
-				debug_assert_eq!(own_namespace_idx, actual_index);
+					},
+					items.span,
+				);
+				if let Err(collision) = self.bind_child(
+					namespace,
+					name.inner,
+					Namespace::Module(module),
+					Visibility::from(*pub_span),
+				) {
+					self.diagnostics.push(
+						DuplicateDefinitionDiagnostic {
+							strings: self.strings,
+							key: BindingKey::ty(name.inner),
+							definitions: (
+								self.definition_span(collision),
+								SourceSpan::new(file_id, name.span),
+							),
+						}
+						.report(),
+					);
+				}
 
 				for item in items.inner.iter() {
 					self.scan_item(
 						file_id,
-						own_namespace_idx,
+						Scope::Module(module),
 						&item.inner.inner,
 					);
 				}
@@ -2642,7 +2629,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-				if self.namespaces[usize::from(namespace)].package_id
+				if self.namespaces.scope(namespace).package_id
 					== self.stdlib_package
 				{
 					if let Some(slot) = self.intrinsics.trait_slot_mut(
@@ -2944,41 +2931,34 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					span: *external_name,
 				};
 
-				let own_namespace_idx =
-					NamespaceIdx(u32::try_from(self.namespaces.len()).unwrap());
-				let import_declaration_idx =
-					self.push_import_declaration(ImportDef {
+				let import = self.push_import(
+					ImportDef {
 						external_name,
 						internal_name,
 						parent_namespace: namespace,
-						own_namespace: own_namespace_idx,
-					});
-				let actual_index = self
-					.declare_child_namespace(
-						namespace,
-						file_id,
-						internal_name.inner,
-						NamespaceOwner::Import(import_declaration_idx),
-						items.span,
-						Visibility::Public,
-					)
-					.report_with(|collision| {
-						self.diagnostics.push(
-							DuplicateDefinitionDiagnostic {
-								strings: self.strings,
-								key: BindingKey::ty(internal_name.inner),
-								definitions: (
-									self.definition_span(collision),
-									SourceSpan::new(
-										file_id,
-										internal_name.span,
-									),
-								),
-							}
-							.report(),
-						)
-					});
-				debug_assert_eq!(own_namespace_idx, actual_index);
+					},
+					file_id,
+					items.span,
+				);
+				let own_namespace = Namespace::Import(import);
+				if let Err(collision) = self.bind_child(
+					namespace,
+					internal_name.inner,
+					own_namespace,
+					Visibility::Public,
+				) {
+					self.diagnostics.push(
+						DuplicateDefinitionDiagnostic {
+							strings: self.strings,
+							key: BindingKey::ty(internal_name.inner),
+							definitions: (
+								self.definition_span(collision),
+								SourceSpan::new(file_id, internal_name.span),
+							),
+						}
+						.report(),
+					);
+				}
 
 				for item in items.inner.iter() {
 					match &item.inner.inner.declaration {
@@ -2988,28 +2968,25 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							);
 							let (trait_impl_index, size_assoc_type_index) =
 								self.synthesize_memory_impl(
-									*id,
-									file_id,
-									own_namespace_idx,
-									name.span,
+									*id, file_id, namespace, name.span,
 								);
 							self.memories.push(MemoryDef {
 								def_id: *id,
 								file_id,
-								namespace: own_namespace_idx,
+								namespace,
 								name: *name,
 								trait_impl_index,
 								size_assoc_type_index,
 							});
 							let def_key = self.push_def(
-								own_namespace_idx,
+								own_namespace,
 								ItemDef::new(
 									DefKind::Memory(memory_index),
 									name.span,
 								),
 							);
 							self.insert_binding(
-								own_namespace_idx,
+								own_namespace,
 								BindingKey::ty(name.inner),
 								Binding::definition(
 									def_key,
@@ -3018,7 +2995,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name.span,
 							);
 							self.insert_binding(
-								own_namespace_idx,
+								own_namespace,
 								BindingKey::value(name.inner),
 								Binding::definition(
 									def_key,
@@ -3029,9 +3006,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace: own_namespace_idx,
+								namespace,
 								node: AstNodeRef::ImportedMemory {
 									memory_index,
+									import_index: import,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -3045,19 +3023,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									def_id: *id,
 									file_id,
-									namespace: own_namespace_idx,
+									namespace,
 									name: signature.name,
 									params,
 								});
 							let def_key = self.push_def(
-								own_namespace_idx,
+								own_namespace,
 								ItemDef::new(
 									DefKind::Function(function_index),
 									signature.name.span,
 								),
 							);
 							self.insert_binding(
-								own_namespace_idx,
+								own_namespace,
 								BindingKey::value(signature.name.inner),
 								Binding::definition(
 									def_key,
@@ -3068,9 +3046,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace: own_namespace_idx,
+								namespace,
 								node: AstNodeRef::ImportedFunction {
 									function_index,
+									import_index: import,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -3091,28 +3070,28 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							) = self.synthesize_global_impl(
 								*id,
 								file_id,
-								own_namespace_idx,
+								namespace,
 								name.span,
 								mut_span.is_some(),
 							);
 							self.globals.push(GlobalDef {
 								def_id: *id,
 								file_id,
-								namespace: own_namespace_idx,
+								namespace,
 								name: *name,
 								trait_impl_index,
 								value_assoc_type_index,
 								mut_trait_impl_index,
 							});
 							let def_key = self.push_def(
-								own_namespace_idx,
+								own_namespace,
 								ItemDef::new(
 									DefKind::Global(global_index),
 									name.span,
 								),
 							);
 							self.insert_binding(
-								own_namespace_idx,
+								own_namespace,
 								BindingKey::value(name.inner),
 								Binding::definition(
 									def_key,
@@ -3123,9 +3102,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.ast_nodes.push(AstEntry {
 								def_id: *id,
 								file_id,
-								namespace: own_namespace_idx,
+								namespace,
 								node: AstNodeRef::ImportedGlobal {
 									global_index,
+									import_index: import,
 									decl: &item.inner.inner.declaration,
 								},
 							});
@@ -3361,7 +3341,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn scan_use_tree(
 		&mut self,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		tree: &ast::Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
 		pub_span: Option<TextSpan>,
@@ -3685,8 +3665,8 @@ mod tests {
 			Self::from_graph(graph)
 		}
 
-		fn root_namespace(&self) -> NamespaceIdx {
-			self.defs.root_package.root_namespace()
+		fn root_namespace(&self) -> Scope {
+			Scope::Package(self.defs.root_package)
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -3695,21 +3675,17 @@ mod tests {
 
 		/// String queries use synthetic spans. Use `resolve_segments` with
 		/// source path segments when asserting diagnostic locations.
-		fn resolve(
-			&mut self,
-			tier: BindingNamespace,
-			path: &str,
-		) -> ResolutionResult<'_> {
+		fn resolve(&mut self, tier: Tier, path: &str) -> ResolutionResult<'_> {
 			self.resolve_from(self.root_namespace(), tier, path)
 		}
 
 		fn resolve_from(
 			&mut self,
-			namespace: NamespaceIdx,
-			tier: BindingNamespace,
+			namespace: Scope,
+			tier: Tier,
 			path: &str,
 		) -> ResolutionResult<'_> {
-			let file_id = self.defs.namespaces[usize::from(namespace)].file_id;
+			let file_id = self.defs.namespaces.file_id(namespace.into());
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
 				.map(|segment| ast::PathSegment {
@@ -3726,8 +3702,8 @@ mod tests {
 		fn resolve_segments(
 			&self,
 			file_id: FileId,
-			namespace: NamespaceIdx,
-			tier: BindingNamespace,
+			namespace: Scope,
+			tier: Tier,
 			segments: &[ast::PathSegment],
 		) -> ResolutionResult<'_> {
 			let mut diagnostics = Vec::new();
@@ -3746,10 +3722,13 @@ mod tests {
 			}
 		}
 
-		fn namespace(&mut self, path: &str) -> NamespaceIdx {
-			let kind =
-				self.resolve(BindingNamespace::Type, path).expect_success();
-			self.defs.namespace_of(kind).expect("expected a namespace")
+		fn namespace(&mut self, path: &str) -> Namespace {
+			let kind = self.resolve(Tier::Type, path).expect_success();
+			Namespace::of(kind).expect("expected a namespace")
+		}
+
+		fn scope(&mut self, path: &str) -> Scope {
+			self.namespace(path).as_scope().expect("expected a scope")
 		}
 	}
 
@@ -3760,14 +3739,14 @@ mod tests {
 		case.diagnostics()
 			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
 
-		let missing = case.resolve(BindingNamespace::Value, "missing");
+		let missing = case.resolve(Tier::Value, "missing");
 		missing
 			.diagnostics()
 			.assert_error(DiagnosticCode::UndeclaredIdentifier);
 		assert!(matches!(missing.target(), BindingTarget::Error));
 
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "f").expect_success(),
+			case.resolve(Tier::Value, "f").expect_success(),
 			DefKind::Function(_)
 		));
 		assert_eq!(case.diagnostics().all().len(), 1);
@@ -3797,7 +3776,7 @@ mod tests {
 		let result = case.resolve_segments(
 			module.file_id,
 			case.root_namespace(),
-			BindingNamespace::Type,
+			Tier::Type,
 			segments,
 		);
 		result.diagnostics().assert_error_with(
@@ -3822,7 +3801,7 @@ mod tests {
 	 {
 		let mut case =
 			TestCase::new("mod outer { mod hidden { pub struct Visible(); } }");
-		case.resolve(BindingNamespace::Type, "outer::hidden::Visible")
+		case.resolve(Tier::Type, "outer::hidden::Visible")
 			.expect_success();
 	}
 
@@ -3939,7 +3918,7 @@ mod tests {
 		// and (since it isn't in the stdlib package) must not be recorded
 		// as an intrinsic at all.
 		let root_namespace = case.root_namespace();
-		let stdlib_namespace = case.graph.stdlib_package.root_namespace();
+		let stdlib_namespace = Scope::Package(case.graph.stdlib_package);
 		assert_ne!(
 			root_namespace, stdlib_namespace,
 			"the binary package must not be the stdlib package"
@@ -3986,18 +3965,13 @@ mod tests {
 		"#});
 		case.diagnostics().assert_no_errors();
 
+		// An import block's declarations are written in the scope around
+		// the block, so that is their namespace too.
 		let root = case.root_namespace();
-		let host = case.namespace("host");
 		let mut indices = Vec::new();
-		for (path, name, namespace) in
-			[("heap", "heap", root), ("host::shared", "shared", host)]
-		{
-			let kind =
-				case.resolve(BindingNamespace::Type, path).expect_success();
-			assert_eq!(
-				kind,
-				case.resolve(BindingNamespace::Value, path).expect_success()
-			);
+		for (path, name) in [("heap", "heap"), ("host::shared", "shared")] {
+			let kind = case.resolve(Tier::Type, path).expect_success();
+			assert_eq!(kind, case.resolve(Tier::Value, path).expect_success());
 			let DefKind::Memory(index) = kind else {
 				panic!("expected `{path}` to be a memory");
 			};
@@ -4006,10 +3980,10 @@ mod tests {
 				case.graph.strings.resolve(memory.name.inner),
 				Some(name)
 			);
-			assert_eq!(memory.namespace, namespace);
+			assert_eq!(memory.namespace, root);
 			assert_eq!(
 				memory.file_id,
-				case.defs.namespaces[usize::from(root)].file_id
+				case.defs.namespaces.file_id(root.into())
 			);
 			indices.push(index);
 		}
@@ -4018,29 +3992,70 @@ mod tests {
 			case.defs.memories[usize::from(indices[0])].def_id,
 			case.defs.memories[usize::from(indices[1])].def_id,
 		);
-		for tier in [BindingNamespace::Type, BindingNamespace::Value] {
+		for tier in [Tier::Type, Tier::Value] {
 			assert_eq!(
 				case.resolve(tier, "shared_alias").expect_success(),
 				DefKind::Memory(indices[1]),
 			);
 		}
-		let DefKind::Function(index) = case
-			.resolve(BindingNamespace::Value, "host::log")
-			.expect_success()
+		let DefKind::Function(index) =
+			case.resolve(Tier::Value, "host::log").expect_success()
 		else {
 			panic!("expected an imported function");
 		};
 		let function = &case.defs.functions[usize::from(index)];
-		assert_eq!(function.namespace, host);
+		assert_eq!(function.namespace, root);
 		assert_eq!(
 			case.graph.strings.resolve(function.name.inner),
 			Some("log")
 		);
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "host::counter")
-				.expect_success(),
+			case.resolve(Tier::Value, "host::counter").expect_success(),
 			DefKind::Global(_),
 		));
+	}
+
+	#[test]
+	fn an_import_block_is_entered_through_a_path_but_never_written_in() {
+		let mut case = TestCase::new(indoc! {r#"
+			import "env" as host { fn log(); }
+		"#});
+		case.diagnostics().assert_none();
+		assert!(matches!(
+			case.resolve(Tier::Value, "host::log").expect_success(),
+			DefKind::Function(_),
+		));
+		// The block holds only its own declarations: it is not a scope, so
+		// it binds neither its own name nor `self`, `crate` or `super`.
+		for path in ["host::host", "host::self", "host::crate", "host::super"] {
+			case.resolve(Tier::Type, path)
+				.diagnostics()
+				.assert_error(DiagnosticCode::UndeclaredIdentifier);
+		}
+	}
+
+	/// An import block is a namespace like an enum is: `use` can reach its
+	/// declarations by name, by glob, or through a re-export, and all three
+	/// name the same function.
+	#[test]
+	fn an_import_blocks_declarations_can_be_brought_in_by_use() {
+		let block = r#"import "console" as console { fn log(x: i32); }"#;
+		for imports in [
+			"use console::log;",
+			"use console::*;",
+			"mod m { pub use super::console::log; } use m::log;",
+		] {
+			let mut case = TestCase::new(&format!("{block} {imports}"));
+			case.diagnostics().assert_none();
+			let original =
+				case.resolve(Tier::Value, "console::log").expect_success();
+			assert!(matches!(original, DefKind::Function(_)), "{imports}");
+			assert_eq!(
+				case.resolve(Tier::Value, "log").expect_success(),
+				original,
+				"{imports}"
+			);
+		}
 	}
 
 	#[test]
@@ -4069,9 +4084,8 @@ mod tests {
 		"});
 		case.diagnostics().assert_no_errors();
 
-		let DefKind::Const(free_constant) = case
-			.resolve(BindingNamespace::Value, "VALUE")
-			.expect_success()
+		let DefKind::Const(free_constant) =
+			case.resolve(Tier::Value, "VALUE").expect_success()
 		else {
 			panic!("expected a free constant");
 		};
@@ -4129,13 +4143,11 @@ mod tests {
 		let mut case = TestCase::new("trait Item {} fn Item() {}");
 		case.diagnostics().assert_none();
 		assert!(matches!(
-			case.resolve(BindingNamespace::Type, "Item")
-				.expect_success(),
+			case.resolve(Tier::Type, "Item").expect_success(),
 			DefKind::Trait(_)
 		));
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "Item")
-				.expect_success(),
+			case.resolve(Tier::Value, "Item").expect_success(),
 			DefKind::Function(_)
 		));
 	}
@@ -4147,7 +4159,7 @@ mod tests {
 		// is accessible where every field is, so the field is `pub`.)
 		let mut case = TestCase::new("struct Item(pub x: i32);");
 		case.diagnostics().assert_none();
-		for namespace in [BindingNamespace::Type, BindingNamespace::Value] {
+		for namespace in [Tier::Type, Tier::Value] {
 			assert!(matches!(
 				case.resolve(namespace, "Item").expect_success(),
 				DefKind::Struct(_)
@@ -4167,7 +4179,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 		let file_id =
-			case.defs.namespaces[usize::from(case.root_namespace())].file_id;
+			case.defs.namespaces.file_id(case.root_namespace().into());
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::DuplicateDefinition,
 			|diagnostic| {
@@ -4180,7 +4192,7 @@ mod tests {
 			},
 		);
 		let DefKind::Function(index) =
-			case.resolve(BindingNamespace::Value, "f").expect_success()
+			case.resolve(Tier::Value, "f").expect_success()
 		else {
 			panic!("expected a function");
 		};
@@ -4191,8 +4203,7 @@ mod tests {
 			Some("original")
 		);
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "after")
-				.expect_success(),
+			case.resolve(Tier::Value, "after").expect_success(),
 			DefKind::Function(_)
 		));
 	}
@@ -4216,7 +4227,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 		let file_id =
-			case.defs.namespaces[usize::from(case.root_namespace())].file_id;
+			case.defs.namespaces.file_id(case.root_namespace().into());
 		case.diagnostics().assert_error_with(
 			DiagnosticCode::DuplicateDefinition,
 			|diagnostic| {
@@ -4229,13 +4240,12 @@ mod tests {
 			},
 		);
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "clash::file_only")
+			case.resolve(Tier::Value, "clash::file_only")
 				.expect_success(),
 			DefKind::Function(_)
 		));
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "after")
-				.expect_success(),
+			case.resolve(Tier::Value, "after").expect_success(),
 			DefKind::Function(_)
 		));
 	}
@@ -4246,19 +4256,41 @@ mod tests {
 		let mut case = TestCase::new(source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
-		let result = case.resolve(BindingNamespace::Value, "E::Same");
-		assert!(matches!(result.expect_success(), DefKind::EnumVariant(_)));
+		let result = case.resolve(Tier::Value, "E::Same");
+		let DefKind::EnumVariant(same) = result.expect_success() else {
+			panic!("`E::Same` is an enum variant");
+		};
 		let key = result.target().def_key().unwrap();
 		let first = source.find("Same").unwrap();
 		assert_eq!(
 			std::ops::Range::from(key.source_span(&case.defs.namespaces).span),
 			first..first + 4
 		);
-		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "E::After")
-				.expect_success(),
-			DefKind::EnumVariant(_)
-		));
+		let DefKind::EnumVariant(after) =
+			case.resolve(Tier::Value, "E::After").expect_success()
+		else {
+			panic!("`E::After` is an enum variant");
+		};
+		// The duplicate keeps its slot, so the enum's run of constants
+		// matches the written list.
+		let DefKind::Enum(enum_index) =
+			case.resolve(Tier::Type, "E").expect_success()
+		else {
+			panic!("`E` is an enum");
+		};
+		let run = &case.defs.enums[usize::from(enum_index)].variants;
+		assert_eq!(
+			(u32::from(run.start), u32::from(run.end)),
+			(u32::from(same), u32::from(same) + 3)
+		);
+		assert_eq!(u32::from(after), u32::from(same) + 2);
+		let names: Vec<_> = (u32::from(run.start)..u32::from(run.end))
+			.map(|index| {
+				let name = case.defs.constants[index as usize].name.inner;
+				case.graph.strings.resolve(name).unwrap()
+			})
+			.collect();
+		assert_eq!(names, ["Same", "Same", "After"]);
 	}
 
 	#[test]
@@ -4323,7 +4355,7 @@ mod tests {
 		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
-			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+			&case.defs.namespaces.symbols(root_namespace.into()).bindings;
 
 		let value_binding = bindings
 			.get(&BindingKey::value(point_symbol))
@@ -4341,7 +4373,7 @@ mod tests {
 		let point_symbol = case.graph.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
-			&case.defs.namespaces[usize::from(root_namespace)].bindings;
+			&case.defs.namespaces.symbols(root_namespace.into()).bindings;
 
 		// The type itself stays fully nameable...
 		let type_binding = bindings
@@ -4375,9 +4407,8 @@ mod tests {
 		// `Point` isn't necessarily `defs.structs[0]` — the real stdlib
 		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
 		// `RawPtr`), so look it up by name rather than assuming an index.
-		let DefKind::Struct(point_struct_index) = case
-			.resolve(BindingNamespace::Type, "Point")
-			.expect_success()
+		let DefKind::Struct(point_struct_index) =
+			case.resolve(Tier::Type, "Point").expect_success()
 		else {
 			panic!("expected `Point` to be a struct")
 		};
@@ -4410,7 +4441,7 @@ mod tests {
 
 			// Duplicate names still keep their positional slots.
 			let DefKind::Function(index) =
-				case.resolve(BindingNamespace::Value, path).expect_success()
+				case.resolve(Tier::Value, path).expect_success()
 			else {
 				panic!("expected `{path}` to be a function");
 			};
@@ -4577,8 +4608,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "math::add")
-				.expect_success(),
+			case.resolve(Tier::Value, "math::add").expect_success(),
 			DefKind::Function(_)
 		));
 	}
@@ -4604,7 +4634,7 @@ mod tests {
 			case.defs.namespaces.lookup(
 				&case.defs.use_items,
 				root,
-				root,
+				root.into(),
 				BindingKey::value(helper),
 			),
 			BindingLookup::Found(..)
@@ -4612,7 +4642,7 @@ mod tests {
 		assert!(
 			case.defs
 				.namespaces
-				.direct_lookup(root, BindingKey::value(helper))
+				.direct_lookup(root.into(), BindingKey::value(helper))
 				.is_none(),
 			"a glob installs no binding of its own, so `direct_lookup` \
 			 must not find `helper` even though `lookup` does"
@@ -4638,14 +4668,14 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let b = case.namespace("b");
+		let b = case.scope("b");
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		assert!(matches!(
 			case.defs.namespaces.indirect_lookup(
 				&case.defs.use_items,
 				root,
-				b,
+				b.into(),
 				BindingKey::value(helper),
 			),
 			BindingLookup::NotFound
@@ -4672,17 +4702,18 @@ mod tests {
 		"});
 		case.diagnostics().assert_none();
 
-		let m = case.namespace("m");
-		let inner_kind = case
-			.resolve_from(m, BindingNamespace::Type, "inner")
-			.expect_success();
-		let inner = case.defs.namespace_of(inner_kind).unwrap();
+		let m = case.scope("m");
+		let inner_kind =
+			case.resolve_from(m, Tier::Type, "inner").expect_success();
+		let inner = Namespace::of(inner_kind)
+			.and_then(Namespace::as_scope)
+			.unwrap();
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		match case.defs.namespaces.indirect_lookup(
 			&case.defs.use_items,
 			inner,
-			m,
+			m.into(),
 			BindingKey::value(helper),
 		) {
 			BindingLookup::Found(BindingTarget::Accessible(_), _) => {}
@@ -4706,14 +4737,14 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let a = case.namespace("a");
-		let hub = case.namespace("hub");
+		let a = case.scope("a");
+		let hub = case.scope("hub");
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		let Some((BindingTarget::Accessible(original), _)) = case
 			.defs
 			.namespaces
-			.direct_lookup(a, BindingKey::value(helper))
+			.direct_lookup(a.into(), BindingKey::value(helper))
 		else {
 			panic!("`a::helper` should resolve directly");
 		};
@@ -4721,7 +4752,7 @@ mod tests {
 		match case.defs.namespaces.indirect_lookup(
 			&case.defs.use_items,
 			root,
-			hub,
+			hub.into(),
 			BindingKey::value(helper),
 		) {
 			BindingLookup::Found(
@@ -4756,13 +4787,13 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let hub = case.namespace("hub");
+		let hub = case.scope("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
 		match case.defs.namespaces.indirect_lookup(
 			&case.defs.use_items,
 			root,
-			hub,
+			hub.into(),
 			BindingKey::value(pick),
 		) {
 			BindingLookup::Ambiguous(candidates) => {
@@ -4792,13 +4823,13 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let hub = case.namespace("hub");
+		let hub = case.scope("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
 		let Some((BindingTarget::Accessible(direct), _)) = case
 			.defs
 			.namespaces
-			.direct_lookup(hub, BindingKey::value(pick))
+			.direct_lookup(hub.into(), BindingKey::value(pick))
 		else {
 			panic!("`hub::pick` should be bound directly");
 		};
@@ -4806,7 +4837,7 @@ mod tests {
 		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
 			root,
-			hub,
+			hub.into(),
 			BindingKey::value(pick),
 		) {
 			BindingLookup::Found(BindingTarget::Accessible(found), _) => {
@@ -4841,10 +4872,7 @@ mod tests {
 		let source = &case
 			.graph
 			.files
-			.get(
-				case.defs.namespaces[usize::from(import.parent_namespace)]
-					.file_id,
-			)
+			.get(case.defs.namespaces.file_id(import.parent_namespace.into()))
 			.unwrap()
 			.source;
 		assert_eq!(
@@ -4938,7 +4966,7 @@ mod tests {
 		let export =
 			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
 		assert_eq!(export.name.inner, case.graph.strings.get("first").unwrap());
-		assert_eq!(export.namespace, case.defs.root_package.root_namespace());
+		assert_eq!(export.namespace, Scope::Package(case.defs.root_package));
 		let diagnostic = &case.diagnostics[0];
 		assert_eq!(diagnostic.labels.len(), 2);
 	}

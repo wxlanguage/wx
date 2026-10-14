@@ -390,7 +390,7 @@ mod tests {
 	use super::*;
 	use crate::ast::{self, Spanned};
 	use crate::diagnostics::TextSpan;
-	use crate::tir::defs::{BindingNamespace, DefKind, DefinitionRegistry};
+	use crate::tir::defs::{DefKind, DefinitionRegistry, Scope, Tier};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::paths::PathResolver;
 	use crate::tir::types::Type;
@@ -453,11 +453,11 @@ mod tests {
 	fn resolve(
 		builder: &TypeContext,
 		graph: &vfs::CompilationUnit,
-		tier: BindingNamespace,
+		tier: Tier,
 		path: &str,
 	) -> DefKind {
-		let root = graph.root_package.root_namespace();
-		let file_id = builder.defs.namespaces[usize::from(root)].file_id;
+		let root = Scope::Package(graph.root_package);
+		let file_id = builder.defs.namespaces.file_id(root.into());
 
 		let segments: Box<[ast::PathSegment]> = path
 			.split("::")
@@ -495,7 +495,7 @@ mod tests {
 		path: &str,
 	) -> TraitIdx {
 		let DefKind::Trait(trait_index) =
-			resolve(builder, graph, BindingNamespace::Type, path)
+			resolve(builder, graph, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a trait");
 		};
@@ -511,7 +511,7 @@ mod tests {
 		path: &str,
 	) -> TraitIdx {
 		let DefKind::TypeSet(typeset_index) =
-			resolve(builder, graph, BindingNamespace::Type, path)
+			resolve(builder, graph, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a typeset");
 		};
@@ -527,7 +527,7 @@ mod tests {
 		path: &str,
 	) -> TypeIndex {
 		let DefKind::Struct(struct_index) =
-			resolve(builder, graph, BindingNamespace::Type, path)
+			resolve(builder, graph, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a struct");
 		};
@@ -551,7 +551,7 @@ mod tests {
 		param_index: u32,
 	) -> TypeIndex {
 		let DefKind::Function(function_index) =
-			resolve(builder, graph, BindingNamespace::Value, function_path)
+			resolve(builder, graph, Tier::Value, function_path)
 		else {
 			panic!("expected `{function_path}` to be a function");
 		};

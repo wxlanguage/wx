@@ -34,10 +34,10 @@ use super::bounds::{
 	report_not_a_trait_bound, report_not_an_associated_type,
 };
 use super::defs::{
-	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingNamespace, ConstIdx,
-	DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, MemberKind, MemoryIdx, NamespaceIdx, StructIdx, TraitIdx,
-	TraitImplIdx, TypesetIdx,
+	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, ConstIdx, DefKind,
+	DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx, InherentImplIdx,
+	MemberKind, MemoryIdx, Scope, StructIdx, Tier, TraitIdx, TraitImplIdx,
+	TypesetIdx,
 };
 use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
@@ -357,7 +357,7 @@ impl TypeContext<'_, '_, '_> {
 				file_id,
 				source.namespace,
 				&segments,
-				BindingNamespace::Value,
+				Tier::Value,
 			);
 			let Some(key) = target.def_key() else {
 				continue;
@@ -688,7 +688,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) fn resolve_generic_params(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		owner: TypeEnvOwner,
 		parent: TypeEnvIdx,
 		params: &[ast::TypeParam],
@@ -838,7 +838,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_impl_target(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		path: &ast::Path,
 		head: Option<Spanned<ImplTarget>>,
@@ -1020,7 +1020,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_function_signature(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		function_index: FunctionIdx,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
@@ -1081,7 +1081,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_member_function_signature(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		function_index: FunctionIdx,
 		self_scope: TypeEnvIdx,
 		signature: &ast::FunctionSignature,
@@ -1152,7 +1152,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_constant_signature(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		const_index: ConstIdx,
 		scope: TypeEnvIdx,
 		name: Spanned<SymbolU32>,
@@ -1232,7 +1232,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_memory_signature(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		memory_index: MemoryIdx,
 		name: Spanned<SymbolU32>,
 		size: &Spanned<ast::TypeExpression>,
@@ -1358,7 +1358,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn compute_signature(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		ast_node: AstNodeRef<'_>,
 	) -> SignatureLocation {
 		match ast_node {
@@ -1741,7 +1741,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					size,
 				)
 			}
-			AstNodeRef::ImportedMemory { memory_index, decl } => {
+			AstNodeRef::ImportedMemory {
+				memory_index, decl, ..
+			} => {
 				let ast::ImportDeclaration::Memory { name, size, .. } = decl
 				else {
 					unreachable!()
@@ -1793,7 +1795,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					resolved_value,
 				)
 			}
-			AstNodeRef::ImportedGlobal { global_index, decl } => {
+			AstNodeRef::ImportedGlobal {
+				global_index, decl, ..
+			} => {
 				let ast::ImportDeclaration::Global {
 					name, ty, mut_span, ..
 				} = decl
@@ -1893,6 +1897,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			AstNodeRef::ImportedFunction {
 				function_index,
 				decl,
+				..
 			} => {
 				let ast::ImportDeclaration::Function { signature, .. } = decl
 				else {
@@ -2136,6 +2141,20 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					EnumSignature { repr: repr_type };
 				SignatureLocation::Enum(enum_index)
 			}
+			// A variant is a constant of its enum's type; its value, written or
+			// counted from the previous variant, is a value of the enum's repr.
+			AstNodeRef::EnumVariant {
+				const_index,
+				enum_index,
+				..
+			} => {
+				let ty = self.types.intern(Type::Enum { enum_index });
+				self.constants[usize::from(const_index)] = ConstantSignature {
+					ty,
+					scope: TypeEnvIdx::ROOT,
+				};
+				SignatureLocation::Constant(const_index)
+			}
 			AstNodeRef::TypeSet {
 				typeset_index,
 				item,
@@ -2271,7 +2290,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_memory_tag(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
@@ -2315,7 +2334,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_pointer_memory(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		memory: &Option<Box<[ast::PathSegment]>>,
 		span: TextSpan,
@@ -2340,7 +2359,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_type(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		type_expr: &Spanned<ast::TypeExpression>,
 		infer_policy: InferPolicy,
@@ -2371,7 +2390,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_assoc_value(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		scope: TypeEnvIdx,
 		impl_index: TraitImplIdx,
 		provider: AssocTypeIdx,
@@ -2423,7 +2442,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_type_path(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
@@ -2449,7 +2468,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				file_id,
 				namespace,
 				segments,
-				BindingNamespace::Type,
+				Tier::Type,
 			);
 			let Some(def_key) = walk.target.def_key() else {
 				return TypeIndex::ERROR;
@@ -2587,7 +2606,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					));
 					TypeIndex::ERROR
 				}
-				// Value-tier only — a `BindingNamespace::Type` walk
+				// Value-tier only — a `Tier::Type` walk
 				// can never stop on one of these.
 				DefKind::EnumVariant(_)
 				| DefKind::Global(_)
@@ -2619,7 +2638,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_type_expression(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		type_expr: &Spanned<ast::TypeExpression>,
 		infer_policy: InferPolicy,
@@ -2644,7 +2663,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				infer_policy,
 			),
 			ast::TypeExpression::Grouped { inner, segments } => {
-				// `<T>::Item` — no namespace-tier prefix to consume first
+				// `<T>::Item` — no namespace prefix to consume first
 				// (unlike `Path`'s `T::Item`, where `T` might itself be a
 				// multi-segment namespace path): `inner` is already a full
 				// type expression, so the member walk starts on it directly.
@@ -3119,7 +3138,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_subject_bounds(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		bound: Option<&Spanned<ast::BoundExpression>>,
 		location: BoundSubject,
@@ -3201,7 +3220,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn collect_bound_occurrences<'expr>(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		expr: &'expr Spanned<ast::BoundExpression>,
 		out: &mut Vec<BoundOccurrence<'expr>>,
 	) -> bool {
@@ -3296,7 +3315,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn fill_source_bounds(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		env: TypeEnvIdx,
 		occurrences: &[BoundOccurrence<'_>],
 	) {
@@ -3370,7 +3389,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_trait_bound_path(
 		&mut self,
 		file_id: FileId,
-		namespace: NamespaceIdx,
+		namespace: Scope,
 		segments: &[ast::PathSegment],
 	) -> Option<TraitIdx> {
 		let target = PathResolver::new(self.defs).resolve_path(
@@ -3379,7 +3398,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			file_id,
 			namespace,
 			segments,
-			BindingNamespace::Type,
+			Tier::Type,
 		);
 		let def_key = target.def_key()?;
 		match def_key.symbol_kind(self.defs) {
@@ -3680,7 +3699,7 @@ pub(super) mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::DefinitionRegistry;
+	use crate::tir::defs::{DefinitionRegistry, Namespace, Scope};
 	use crate::tir::impls::ImplTarget;
 	use crate::tir::solver::AssocValue;
 	use crate::vfs;
@@ -3792,9 +3811,7 @@ pub(super) mod tests {
 		}
 
 		fn body<'c>(case: &'c TestCase<'_>, name: &str) -> &'c Body {
-			let DefKind::Const(index) =
-				case.resolve(BindingNamespace::Value, name)
-			else {
+			let DefKind::Const(index) = case.resolve(Tier::Value, name) else {
 				panic!("expected `{name}` to be a constant");
 			};
 			case.context.const_bodies[usize::from(index)]
@@ -4030,9 +4047,7 @@ pub(super) mod tests {
 		}
 
 		fn value(case: &TestCase<'_>, name: &str) -> ConstValue {
-			let DefKind::Const(index) =
-				case.resolve(BindingNamespace::Value, name)
-			else {
+			let DefKind::Const(index) = case.resolve(Tier::Value, name) else {
 				panic!("expected `{name}` to be a constant");
 			};
 			match &case.context.const_values[usize::from(index)] {
@@ -4828,9 +4843,10 @@ pub(super) mod tests {
 			MemberLookup, TraitImplLookup, TraitMemberSelection,
 		};
 		builder.sweep();
-		let file_id = builder.defs.namespaces
-			[usize::from(builder.defs.root_package.root_namespace())]
-		.file_id;
+		let file_id = builder
+			.defs
+			.namespaces
+			.file_id(Namespace::Package(builder.defs.root_package));
 		let reference = SourceSpan::new(file_id, TextSpan::new(0, 1));
 		let name = builder.strings.get(name).unwrap();
 		let key = BindingKey::ty(name);
@@ -4987,9 +5003,9 @@ pub(super) mod tests {
 		/// discarded — a path a test asks for is always expected to resolve
 		/// cleanly, so any diagnostic here would only ever be a bug in the
 		/// test, not something worth asserting on.
-		fn resolve(&self, ns: BindingNamespace, path: &str) -> DefKind {
-			let root = self.defs.root_package.root_namespace();
-			let file_id = self.defs.namespaces[usize::from(root)].file_id;
+		fn resolve(&self, tier: Tier, path: &str) -> DefKind {
+			let root = Scope::Package(self.defs.root_package);
+			let file_id = self.defs.namespaces.file_id(root.into());
 
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
@@ -5012,7 +5028,7 @@ pub(super) mod tests {
 				file_id,
 				root,
 				&segments,
-				ns,
+				tier,
 			);
 			let def_key = target.def_key().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
@@ -5021,8 +5037,7 @@ pub(super) mod tests {
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIdx {
-			let DefKind::Trait(trait_index) =
-				self.resolve(BindingNamespace::Type, path)
+			let DefKind::Trait(trait_index) = self.resolve(Tier::Type, path)
 			else {
 				panic!("expected `{path}` to be a trait");
 			};
@@ -5042,7 +5057,7 @@ pub(super) mod tests {
 
 		fn typeset_index(&self, path: &str) -> TypesetIdx {
 			let DefKind::TypeSet(typeset_index) =
-				self.resolve(BindingNamespace::Type, path)
+				self.resolve(Tier::Type, path)
 			else {
 				panic!("expected `{path}` to be a typeset");
 			};
@@ -5290,8 +5305,7 @@ pub(super) mod tests {
 		}
 
 		fn type_alias(&self, path: &str) -> &TypeAliasSignature {
-			let DefKind::TypeAlias(index) =
-				self.resolve(BindingNamespace::Type, path)
+			let DefKind::TypeAlias(index) = self.resolve(Tier::Type, path)
 			else {
 				panic!("expected `{path}` to be a type alias");
 			};
@@ -5303,8 +5317,7 @@ pub(super) mod tests {
 		}
 
 		fn struct_index(&self, path: &str) -> StructIdx {
-			let DefKind::Struct(struct_index) =
-				self.resolve(BindingNamespace::Type, path)
+			let DefKind::Struct(struct_index) = self.resolve(Tier::Type, path)
 			else {
 				panic!("expected `{path}` to be a struct");
 			};
@@ -5312,8 +5325,7 @@ pub(super) mod tests {
 		}
 
 		fn enum_signature(&self, path: &str) -> &EnumSignature {
-			let DefKind::Enum(enum_index) =
-				self.resolve(BindingNamespace::Type, path)
+			let DefKind::Enum(enum_index) = self.resolve(Tier::Type, path)
 			else {
 				panic!("expected `{path}` to be an enum");
 			};
@@ -5321,9 +5333,7 @@ pub(super) mod tests {
 		}
 
 		fn constant_signature(&self, path: &str) -> &ConstantSignature {
-			let DefKind::Const(index) =
-				self.resolve(BindingNamespace::Value, path)
-			else {
+			let DefKind::Const(index) = self.resolve(Tier::Value, path) else {
 				panic!("expected `{path}` to be a constant");
 			};
 			&self.context.constants[usize::from(index)]
@@ -5383,8 +5393,7 @@ pub(super) mod tests {
 		}
 
 		fn function_signature(&self, path: &str) -> &FunctionSignature {
-			let DefKind::Function(index) =
-				self.resolve(BindingNamespace::Value, path)
+			let DefKind::Function(index) = self.resolve(Tier::Value, path)
 			else {
 				panic!("expected `{path}` to be a function");
 			};
@@ -6808,7 +6817,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let DefKind::Enum(enum_index) =
-			case.resolve(BindingNamespace::Type, "colors::Color")
+			case.resolve(Tier::Type, "colors::Color")
 		else {
 			panic!("expected Color to be an enum");
 		};
@@ -6864,9 +6873,7 @@ pub(super) mod tests {
 				argument_labels.last().unwrap().message,
 				"remove the unnecessary generics"
 			);
-			let DefKind::Enum(index) =
-				case.resolve(BindingNamespace::Type, path)
-			else {
+			let DefKind::Enum(index) = case.resolve(Tier::Type, path) else {
 				panic!("expected an enum");
 			};
 			let definition = &case.defs.enums[usize::from(index)];
@@ -6986,6 +6993,36 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::I32);
+	}
+
+	/// A variant is a constant whose type is its enum, declared at the root
+	/// type scope like a free constant.
+	#[test]
+	fn an_enum_variant_is_a_constant_of_its_enum() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			enum Color: i32 { Red, Green = 4 }
+		"}
+		);
+		case.diagnostics().assert_none();
+		let DefKind::Enum(enum_index) = case.resolve(Tier::Type, "Color")
+		else {
+			panic!("`Color` is an enum");
+		};
+		let color = case.context.types.intern(Type::Enum { enum_index });
+		for path in ["Color::Red", "Color::Green"] {
+			let DefKind::EnumVariant(const_index) =
+				case.resolve(Tier::Value, path)
+			else {
+				panic!("`{path}` is an enum variant");
+			};
+			assert_eq!(
+				case.context.constant_type(const_index),
+				(color, TypeEnvIdx::ROOT),
+				"{path}"
+			);
+		}
 	}
 
 	#[test]
@@ -7358,7 +7395,7 @@ pub(super) mod tests {
 					[("overridden", true), ("inherited", false)]
 				{
 					let name = builder.strings.get(name).unwrap();
-					let key = BindingKey::new(BindingNamespace::Value, name);
+					let key = BindingKey::new(Tier::Value, name);
 					let MemberLookup::Found(member) = builder
 						.resolve_applicable_member(
 							TypeEnvIdx::ROOT,
@@ -7525,8 +7562,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 
-		let DefKind::Memory(memory_index) =
-			case.resolve(BindingNamespace::Type, "heap")
+		let DefKind::Memory(memory_index) = case.resolve(Tier::Type, "heap")
 		else {
 			panic!("expected `heap` to be a memory");
 		};
@@ -7570,8 +7606,7 @@ pub(super) mod tests {
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
 
-		let DefKind::Memory(memory_index) =
-			case.resolve(BindingNamespace::Type, "heap")
+		let DefKind::Memory(memory_index) = case.resolve(Tier::Type, "heap")
 		else {
 			panic!("expected `heap` to be a memory");
 		};
@@ -7601,7 +7636,7 @@ pub(super) mod tests {
 		);
 
 		let DefKind::Global(global_index) =
-			case.resolve(BindingNamespace::Value, "counter")
+			case.resolve(Tier::Value, "counter")
 		else {
 			panic!("expected `counter` to be a global");
 		};
@@ -7641,7 +7676,7 @@ pub(super) mod tests {
 		);
 
 		let DefKind::Global(global_index) =
-			case.resolve(BindingNamespace::Value, "counter")
+			case.resolve(Tier::Value, "counter")
 		else {
 			panic!("expected `counter` to be a global");
 		};
@@ -7677,7 +7712,7 @@ pub(super) mod tests {
 		);
 
 		let DefKind::Global(global_index) =
-			case.resolve(BindingNamespace::Value, "counter")
+			case.resolve(Tier::Value, "counter")
 		else {
 			panic!("expected `counter` to be a global");
 		};
@@ -7707,7 +7742,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let DefKind::Memory(memory_index) =
-			case.resolve(BindingNamespace::Type, "host::shared")
+			case.resolve(Tier::Type, "host::shared")
 		else {
 			panic!("expected `host::shared` to be a memory");
 		};
@@ -7743,7 +7778,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let DefKind::Global(global_index) =
-			case.resolve(BindingNamespace::Value, "host::counter")
+			case.resolve(Tier::Value, "host::counter")
 		else {
 			panic!("expected `host::counter` to be a global");
 		};
@@ -7781,7 +7816,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let DefKind::Global(global_index) =
-			case.resolve(BindingNamespace::Value, "host::counter")
+			case.resolve(Tier::Value, "host::counter")
 		else {
 			panic!("expected `host::counter` to be a global");
 		};
@@ -7812,7 +7847,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "host::log")
+			case.resolve(Tier::Value, "host::log")
 		else {
 			panic!("expected `host::log` to be a function");
 		};
@@ -7837,13 +7872,11 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "f")
+		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
 		};
-		let DefKind::Memory(memory_index) =
-			case.resolve(BindingNamespace::Type, "heap")
+		let DefKind::Memory(memory_index) = case.resolve(Tier::Type, "heap")
 		else {
 			panic!("expected `heap` to be a memory");
 		};
@@ -7885,8 +7918,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NoMemoryForPointer.code())
 		);
-		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "f")
+		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
 		};
@@ -7916,8 +7948,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::AmbiguousPointerMemory.code())
 		);
-		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "f")
+		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
 		};
@@ -7941,13 +7972,11 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "f")
+		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
 		};
-		let DefKind::Memory(memory_index) =
-			case.resolve(BindingNamespace::Type, "heap")
+		let DefKind::Memory(memory_index) = case.resolve(Tier::Type, "heap")
 		else {
 			panic!("expected `heap` to be a memory");
 		};
@@ -8004,13 +8033,11 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let DefKind::Function(function_index) =
-			case.resolve(BindingNamespace::Value, "f")
+		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
 		};
-		let DefKind::Memory(heap2_index) =
-			case.resolve(BindingNamespace::Type, "heap2")
+		let DefKind::Memory(heap2_index) = case.resolve(Tier::Type, "heap2")
 		else {
 			panic!("expected `heap2` to be a memory");
 		};
@@ -13453,8 +13480,7 @@ pub(super) mod tests {
 		for (external, path) in [("left", "left::f"), ("f", "right::f")] {
 			let export = case.context.exports
 				[&case.graph.strings.get(external).unwrap()];
-			let DefKind::Function(index) =
-				case.resolve(BindingNamespace::Value, path)
+			let DefKind::Function(index) = case.resolve(Tier::Value, path)
 			else {
 				panic!("expected a function");
 			};
@@ -13515,8 +13541,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		assert_eq!(case.context.exports.len(), 1);
-		let DefKind::Function(index) =
-			case.resolve(BindingNamespace::Value, "nested::f")
+		let DefKind::Function(index) = case.resolve(Tier::Value, "nested::f")
 		else {
 			panic!("expected a function");
 		};
@@ -13562,18 +13587,14 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(case.context.exports.len(), 3);
-		let DefKind::Function(function) =
-			case.resolve(BindingNamespace::Value, "inner::f")
+		let DefKind::Function(function) = case.resolve(Tier::Value, "inner::f")
 		else {
 			panic!("expected a function");
 		};
-		let DefKind::Memory(memory) =
-			case.resolve(BindingNamespace::Value, "heap")
-		else {
+		let DefKind::Memory(memory) = case.resolve(Tier::Value, "heap") else {
 			panic!("expected a memory");
 		};
-		let DefKind::Global(global) =
-			case.resolve(BindingNamespace::Value, "counter")
+		let DefKind::Global(global) = case.resolve(Tier::Value, "counter")
 		else {
 			panic!("expected a global");
 		};
@@ -13635,11 +13656,46 @@ pub(super) mod tests {
 			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
 		assert_eq!(export.name.inner, case.graph.strings.get("f").unwrap());
 		assert!(
-			case.defs.namespaces[usize::from(dep.root_namespace())]
+			case.defs
+				.namespaces
+				.symbols(Namespace::Package(dep))
 				.bindings
 				.get(&BindingKey::value(case.graph.strings.get("run").unwrap()))
 				.is_none()
 		);
+	}
+
+	/// An import block's declarations are written in the scope around the
+	/// block, so their types resolve there. Test sources usually play the
+	/// stdlib's role, where the prelude would find `S` anyway; here the
+	/// stdlib is a separate package, so only the enclosing scope can.
+	#[test]
+	fn an_imported_declaration_resolves_its_types_in_the_enclosing_scope() {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
+			("std.wx".to_string(), "pub type u32;".to_string()),
+			(
+				"main.wx".to_string(),
+				r#"struct S(); import "env" { fn f(s: S); }"#.to_string(),
+			),
+		]));
+		let std = builder
+			.load_package(
+				vfs::PackageKind::Library,
+				vfs::AbsolutePath::new("/std.wx"),
+				&workspace,
+			)
+			.unwrap();
+		builder.set_stdlib(std);
+		let root = builder
+			.load_package(
+				vfs::PackageKind::Library,
+				vfs::AbsolutePath::new("/main.wx"),
+				&workspace,
+			)
+			.unwrap();
+		test_case!(case from builder.build(root));
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -13686,11 +13742,11 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		assert!(matches!(
-			case.resolve(BindingNamespace::Type, "Same"),
+			case.resolve(Tier::Type, "Same"),
 			DefKind::Trait(_)
 		));
 		assert!(matches!(
-			case.resolve(BindingNamespace::Value, "Same"),
+			case.resolve(Tier::Value, "Same"),
 			DefKind::Function(_)
 		));
 		assert_eq!(case.defs.exports.len(), 1);

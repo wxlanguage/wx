@@ -3,7 +3,7 @@
 //!
 //! Matches rustc: an unqualified name is looked up only in the namespace it
 //! was written in (its own direct declarations, its own `use`/glob
-//! imports), then the std prelude tier — **never** by climbing to an
+//! imports), then the std prelude as a fallback — **never** by climbing to an
 //! enclosing module. A struct declared at the package root is not visible,
 //! unqualified, from inside a child `mod inner { }` any more than it would
 //! be in Rust; reaching it needs `super::Outer`, exactly as it would there.
@@ -18,7 +18,7 @@
 //!
 //! Deliberately stops at the namespace graph's edge. Once a segment
 //! resolves to a `DefKind` that doesn't own a namespace of its own
-//! (`DefKind::as_namespace` returns `None`) — a struct, an enum variant, a
+//! (`Namespace::of` returns `None`) — a struct, an enum variant, a
 //! trait, ... — there's nowhere left to look up the next segment using this
 //! module's own machinery: namespace bindings are the only kind it knows
 //! about. Resolving `Type::member` needs the inherent/trait impl dispatch
@@ -40,7 +40,7 @@
 //! visibility and something else decides afterward which hop was illegal.
 //! `try_resolve_path` doesn't need a *separate* pass to get the same result,
 //! though: it already fetches each hop's `Visibility` from
-//! `NamespaceLookup::lookup` regardless, so checking accessibility right
+//! `Namespaces::lookup` regardless, so checking accessibility right
 //! there costs nothing extra — `PathResolution::first_inaccessible` just
 //! reads off what the one walk already computed, still with no diagnostics
 //! pushed and no decision made about whether/how to report it, only
@@ -58,14 +58,12 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{PathSegment, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	tir::defs::{EnumDef, ImportDef, ModuleDef},
 	vfs::FileId,
 };
 
 use super::defs::{
-	BindingKey, BindingLookup, BindingNamespace, BindingTarget, DefKey,
-	DefKind, DefinitionRegistry, Namespace, NamespaceIdx, NamespaceLookup,
-	UseItemDef,
+	BindingKey, BindingLookup, BindingTarget, DefKey, DefinitionRegistry,
+	Namespace, Namespaces, Scope, Tier, UseItemDef,
 };
 use super::imports::{
 	report_ambiguous_identifier, report_cannot_use_as_namespace,
@@ -92,7 +90,7 @@ use super::imports::{
 /// way to consume a resolution, turning this raw shape into the smaller,
 /// already-diagnosed [`PathWalk`]. `try_resolve_path` itself still stays
 /// diagnostics-free internally (same reasoning as
-/// `NamespaceLookup::try_insert_binding`); it's just that nothing outside
+/// `Namespaces::try_insert_binding`); it's just that nothing outside
 /// this file gets to see its raw result anymore.
 ///
 /// `stopped_at` is `u32`, not `usize` — a path realistically never has more
@@ -134,12 +132,9 @@ impl PathWalk {
 /// every call needs — see the module docs for what this does and doesn't
 /// cover.
 pub(super) struct PathResolver<'r> {
-	namespaces: &'r [Namespace],
-	enums: &'r [EnumDef],
-	imports: &'r [ImportDef],
-	modules: &'r [ModuleDef],
+	namespaces: &'r Namespaces,
 	use_items: &'r [UseItemDef],
-	stdlib_root: NamespaceIdx,
+	stdlib_root: Namespace,
 }
 
 impl<'r> PathResolver<'r> {
@@ -147,10 +142,7 @@ impl<'r> PathResolver<'r> {
 		Self {
 			namespaces: &defs.namespaces,
 			use_items: &defs.use_items,
-			enums: &defs.enums,
-			imports: &defs.imports,
-			modules: &defs.modules,
-			stdlib_root: defs.stdlib_package.root_namespace(),
+			stdlib_root: Namespace::Package(defs.stdlib_package),
 		}
 	}
 
@@ -165,24 +157,20 @@ impl<'r> PathResolver<'r> {
 	/// use — see [`PathResolution`]'s own doc comment for why.
 	fn try_resolve_path(
 		&self,
-		accessor: NamespaceIdx,
+		accessor: Scope,
 		segments: &[PathSegment],
-		tier: BindingNamespace,
+		tier: Tier,
 	) -> PathResolution {
 		debug_assert!(
 			!segments.is_empty(),
 			"a path always has at least one segment"
 		);
 
-		let mut base = accessor;
+		let mut base = Namespace::from(accessor);
 		let mut first_inaccessible = None;
 		for (index, segment) in segments.iter().enumerate() {
 			let is_last = index + 1 == segments.len();
-			let seg_tier = if is_last {
-				tier
-			} else {
-				BindingNamespace::Type
-			};
+			let seg_tier = if is_last { tier } else { Tier::Type };
 			let key = BindingKey::new(seg_tier, segment.ident.inner);
 
 			// The std-prelude fallback only ever applies to the first
@@ -228,25 +216,16 @@ impl<'r> PathResolver<'r> {
 							first_inaccessible,
 						};
 					};
-					base = match self.def_kind(def_key) {
-						DefKind::Package(package) => package.root_namespace(),
-						DefKind::Enum(enum_idx) => {
-							self.enums[usize::from(enum_idx)].own_namespace
-						}
-						DefKind::Module(module_idx) => {
-							self.modules[usize::from(module_idx)].own_namespace
-						}
-						DefKind::Import(import_idx) => {
-							self.imports[usize::from(import_idx)].own_namespace
-						}
-						_ => {
-							return PathResolution {
-								stopped_at: index as u32,
-								stopped_with: outcome,
-								first_inaccessible,
-							};
-						}
+					let Some(namespace) =
+						Namespace::of(self.namespaces.kind(def_key))
+					else {
+						return PathResolution {
+							stopped_at: index as u32,
+							stopped_with: outcome,
+							first_inaccessible,
+						};
 					};
+					base = namespace;
 				}
 				BindingLookup::NotFound | BindingLookup::Ambiguous(_) => {
 					return PathResolution {
@@ -285,9 +264,9 @@ impl<'r> PathResolver<'r> {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
 		file_id: FileId,
-		accessor: NamespaceIdx,
+		accessor: Scope,
 		segments: &[PathSegment],
-		tier: BindingNamespace,
+		tier: Tier,
 	) -> PathWalk {
 		let resolution = self.try_resolve_path(accessor, segments, tier);
 		let stopped_at = resolution.stopped_at;
@@ -295,11 +274,7 @@ impl<'r> PathResolver<'r> {
 		// Every segment but the last is always looked up in the `Type`
 		// tier (see `try_resolve_path`) — `tier` only applies once we've
 		// actually reached the last one.
-		let seg_tier = if is_last {
-			tier
-		} else {
-			BindingNamespace::Type
-		};
+		let seg_tier = if is_last { tier } else { Tier::Type };
 		let span = segments[stopped_at as usize].ident.span;
 
 		let target = match &resolution.stopped_with {
@@ -354,9 +329,9 @@ impl<'r> PathResolver<'r> {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		strings: &StringInterner,
 		file_id: FileId,
-		accessor: NamespaceIdx,
+		accessor: Scope,
 		segments: &[PathSegment],
-		tier: BindingNamespace,
+		tier: Tier,
 	) -> BindingTarget {
 		let walk = self.walk_path(
 			diagnostics,
@@ -386,12 +361,6 @@ impl<'r> PathResolver<'r> {
 		}
 		BindingTarget::Error
 	}
-
-	fn def_kind(&self, def_key: DefKey) -> DefKind {
-		self.namespaces[usize::from(def_key.namespace_idx)].items
-			[usize::from(def_key.def_idx)]
-		.kind
-	}
 }
 
 /// One code regardless of tier — matches rustc, which reports both
@@ -403,7 +372,7 @@ fn report_not_found(
 	strings: &StringInterner,
 	file_id: FileId,
 	span: TextSpan,
-	tier: BindingNamespace,
+	tier: Tier,
 	name: SymbolU32,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
@@ -424,7 +393,7 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::DefinitionRegistry;
+	use crate::tir::defs::{DefKind, DefinitionRegistry};
 	use crate::vfs;
 
 	/// Small, path-resolution-only duplicate of `defs::tests::TestCase` —
@@ -530,8 +499,8 @@ mod tests {
 			DiagnosticView::new("prescan", &self.diagnostics, &self.graph.files)
 		}
 
-		fn root_namespace(&self) -> NamespaceIdx {
-			self.defs.root_package.root_namespace()
+		fn root_namespace(&self) -> Scope {
+			Scope::Package(self.defs.root_package)
 		}
 
 		fn resolver(&self) -> PathResolver<'_> {
@@ -566,8 +535,8 @@ mod tests {
 		/// Inspects the raw outcome, including partial paths and inaccessible hops.
 		fn try_resolve(
 			&mut self,
-			from: NamespaceIdx,
-			tier: BindingNamespace,
+			from: Scope,
+			tier: Tier,
 			path: &str,
 		) -> PathResolution {
 			let segments = self.segments(path, None);
@@ -577,11 +546,11 @@ mod tests {
 		/// Uses the complete-path API: stopping early produces an error target.
 		fn resolve(
 			&mut self,
-			from: NamespaceIdx,
-			tier: BindingNamespace,
+			from: Scope,
+			tier: Tier,
 			path: &str,
 		) -> ResolutionResult<'_> {
-			let file_id = self.defs.namespaces[usize::from(from)].file_id;
+			let file_id = self.defs.namespaces.file_id(from.into());
 			let segments = self.segments(path, None);
 			self.resolve_segments(file_id, from, tier, &segments)
 		}
@@ -589,8 +558,8 @@ mod tests {
 		fn resolve_segments(
 			&self,
 			file_id: FileId,
-			from: NamespaceIdx,
-			tier: BindingNamespace,
+			from: Scope,
+			tier: Tier,
 			segments: &[PathSegment],
 		) -> ResolutionResult<'_> {
 			let mut diagnostics = Vec::new();
@@ -621,7 +590,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let key = case
-			.resolve(root, BindingNamespace::Type, "inner::Widget")
+			.resolve(root, Tier::Type, "inner::Widget")
 			.expect_success();
 		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Struct(_)));
 	}
@@ -637,11 +606,9 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let key = case
-			.resolve(root, BindingNamespace::Type, "Widget")
-			.expect_success();
+		let key = case.resolve(root, Tier::Type, "Widget").expect_success();
 		let original = case
-			.resolve(root, BindingNamespace::Type, "inner::Widget")
+			.resolve(root, Tier::Type, "inner::Widget")
 			.expect_success();
 		assert_eq!(key, original);
 	}
@@ -661,17 +628,14 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let inner_key = case
-			.resolve(root, BindingNamespace::Type, "inner")
-			.expect_success();
+		let inner_key =
+			case.resolve(root, Tier::Type, "inner").expect_success();
 		let DefKind::Module(inner) = inner_key.symbol_kind(&case.defs) else {
 			panic!("expected a module");
 		};
-		let inner_namespace =
-			case.defs.modules[usize::from(inner)].own_namespace;
+		let inner_namespace = Scope::Module(inner);
 
-		let resolution =
-			case.try_resolve(inner_namespace, BindingNamespace::Type, "Outer");
+		let resolution = case.try_resolve(inner_namespace, Tier::Type, "Outer");
 		assert_eq!(resolution.stopped_at, 0);
 		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
 	}
@@ -687,11 +651,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let resolution = case.try_resolve(
-			root,
-			BindingNamespace::Type,
-			"inner::deeper::Outer",
-		);
+		let resolution =
+			case.try_resolve(root, Tier::Type, "inner::deeper::Outer");
 		assert_eq!(resolution.stopped_at, 2);
 		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
 	}
@@ -704,13 +665,10 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let key = case
-			.resolve(root, BindingNamespace::Type, "i32")
-			.expect_success();
+		let key = case.resolve(root, Tier::Type, "i32").expect_success();
 		assert!(matches!(key.symbol_kind(&case.defs), DefKind::TypeAlias(_)));
 
-		let resolution =
-			case.try_resolve(root, BindingNamespace::Type, "inner::i32");
+		let resolution = case.try_resolve(root, Tier::Type, "inner::i32");
 		assert_eq!(resolution.stopped_at, 1);
 		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
 	}
@@ -721,10 +679,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let key = case
-			.resolve(root, BindingNamespace::Type, "i32")
-			.expect_success();
-		assert_eq!(key.namespace_idx, root);
+		let key = case.resolve(root, Tier::Type, "i32").expect_success();
+		assert_eq!(key.namespace, root.into());
 		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Struct(_)));
 	}
 
@@ -740,9 +696,9 @@ mod tests {
 
 		let root = case.root_namespace();
 		let original = case
-			.resolve(root, BindingNamespace::Type, "inner::Point")
+			.resolve(root, Tier::Type, "inner::Point")
 			.expect_success();
-		let file_id = case.defs.namespaces[usize::from(root)].file_id;
+		let file_id = case.defs.namespaces.file_id(root.into());
 		let path = "inner::Point::member";
 		let segments = case.segments(path, Some(source.find(path).unwrap()));
 		let mut diagnostics = Vec::new();
@@ -752,7 +708,7 @@ mod tests {
 			file_id,
 			root,
 			&segments,
-			BindingNamespace::Type,
+			Tier::Type,
 		);
 
 		DiagnosticView::new("walk", &diagnostics, &case.graph.files)
@@ -763,12 +719,8 @@ mod tests {
 		};
 		assert_eq!(key, original);
 
-		let result = case.resolve_segments(
-			file_id,
-			root,
-			BindingNamespace::Type,
-			&segments,
-		);
+		let result =
+			case.resolve_segments(file_id, root, Tier::Type, &segments);
 		assert!(matches!(result.target(), BindingTarget::Error));
 		result
 			.diagnostics()
@@ -785,7 +737,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		for path in ["i32", "i32::member"] {
-			let result = case.resolve(root, BindingNamespace::Type, path);
+			let result = case.resolve(root, Tier::Type, path);
 			assert!(matches!(result.target(), BindingTarget::Error), "{path}");
 			result.diagnostics().assert_none();
 		}
@@ -797,8 +749,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let resolution =
-			case.try_resolve(root, BindingNamespace::Type, "DoesNotExist");
+		let resolution = case.try_resolve(root, Tier::Type, "DoesNotExist");
 		assert_eq!(resolution.stopped_at, 0);
 		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
 	}
@@ -819,7 +770,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let key = case
-			.resolve(root, BindingNamespace::Value, "math::add")
+			.resolve(root, Tier::Value, "math::add")
 			.expect_success();
 		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Function(_)));
 	}
@@ -835,7 +786,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let key = case
-			.resolve(root, BindingNamespace::Value, "inner::helper")
+			.resolve(root, Tier::Value, "inner::helper")
 			.expect_success();
 		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Function(_)));
 	}
@@ -855,8 +806,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let resolution =
-			case.try_resolve(root, BindingNamespace::Type, "a::b::C");
+		let resolution = case.try_resolve(root, Tier::Type, "a::b::C");
 		assert_eq!(resolution.stopped_at, 2);
 		let BindingLookup::Found(BindingTarget::Accessible(target), _) =
 			resolution.stopped_with
@@ -874,12 +824,11 @@ mod tests {
 		else {
 			panic!("expected the private module");
 		};
-		let module = &case.defs.modules[usize::from(module)];
-		assert_eq!(case.graph.strings.resolve(module.name.inner), Some("b"));
-		let namespace = module.own_namespace;
-		let original = case
-			.resolve(namespace, BindingNamespace::Type, "C")
-			.expect_success();
+		let name = case.defs.modules[usize::from(module)].name;
+		assert_eq!(case.graph.strings.resolve(name.inner), Some("b"));
+		let namespace = Scope::Module(module);
+		let original =
+			case.resolve(namespace, Tier::Type, "C").expect_success();
 		assert_eq!(target, original);
 	}
 
@@ -895,8 +844,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let resolution =
-			case.try_resolve(root, BindingNamespace::Type, "a::b::C");
+		let resolution = case.try_resolve(root, Tier::Type, "a::b::C");
 		assert_eq!(resolution.first_inaccessible, None);
 		assert_eq!(resolution.stopped_at, 2);
 		let BindingLookup::Found(BindingTarget::Accessible(key), _) =
@@ -925,15 +873,11 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces[usize::from(root)].file_id;
+		let file_id = case.defs.namespaces.file_id(root.into());
 		let path_start = source.rfind("DoesNotExist").unwrap();
 		let segments = case.segments("DoesNotExist", Some(path_start));
-		let result = case.resolve_segments(
-			file_id,
-			root,
-			BindingNamespace::Value,
-			&segments,
-		);
+		let result =
+			case.resolve_segments(file_id, root, Tier::Value, &segments);
 		let target = result.target();
 		let diagnostics = result.diagnostics();
 
@@ -973,15 +917,11 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces[usize::from(root)].file_id;
+		let file_id = case.defs.namespaces.file_id(root.into());
 		let path_start = source.rfind("i32").unwrap();
 		let segments = case.segments("i32", Some(path_start));
-		let result = case.resolve_segments(
-			file_id,
-			root,
-			BindingNamespace::Type,
-			&segments,
-		);
+		let result =
+			case.resolve_segments(file_id, root, Tier::Type, &segments);
 		let target = result.target();
 		let diagnostics = result.diagnostics();
 
@@ -1019,15 +959,11 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces[usize::from(root)].file_id;
+		let file_id = case.defs.namespaces.file_id(root.into());
 		let path_start = source.rfind("a::b::C").unwrap();
 		let segments = case.segments("a::b::C", Some(path_start));
-		let result = case.resolve_segments(
-			file_id,
-			root,
-			BindingNamespace::Type,
-			&segments,
-		);
+		let result =
+			case.resolve_segments(file_id, root, Tier::Type, &segments);
 		let target = result.target();
 		let diagnostics = result.diagnostics();
 
@@ -1068,15 +1004,11 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces[usize::from(root)].file_id;
+		let file_id = case.defs.namespaces.file_id(root.into());
 		let path_start = source.rfind("Point::x").unwrap();
 		let segments = case.segments("Point::x", Some(path_start));
-		let result = case.resolve_segments(
-			file_id,
-			root,
-			BindingNamespace::Type,
-			&segments,
-		);
+		let result =
+			case.resolve_segments(file_id, root, Tier::Type, &segments);
 		let target = result.target();
 		let diagnostics = result.diagnostics();
 
