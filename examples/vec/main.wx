@@ -16,13 +16,13 @@ memory heap: Memory where { Size = u32 };
 // A monotonic bump allocator over `heap`: it only ever moves `next` forward,
 // so there is no individual free — the whole arena is reclaimed at once by
 // dropping the allocator.
-struct BumpAllocator {
+struct BumpAllocator(
     next: RawPtr<heap, u8>,
-}
+);
 
 impl BumpAllocator {
     pub fn from_addr(start: u32) -> Self {
-        Self::{ next: RawPtr::from_addr(start) }
+        Self({ next: RawPtr::from_addr(start) })
     }
 }
 
@@ -36,17 +36,17 @@ impl Allocator for BumpAllocator {
     }
 }
 
-pub struct Vec<T> {
+pub struct Vec<T>(
     buf: RawPtr<heap, T>,
     len: u32,
     cap: u32,
     alloc: heap::*BumpAllocator,
-}
+);
 
 impl<T> Vec<T> {
     #[inline]
     pub fn new(alloc: heap::*BumpAllocator) -> Self {
-        Self::{ buf: RawPtr::null(), len: 0, cap: 0, alloc }
+        Self({ buf: RawPtr::null(), len: 0, cap: 0, alloc })
     }
 
     // Allocates the header itself through `alloc`, then hands back a pointer to

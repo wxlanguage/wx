@@ -1,3 +1,7 @@
+> **Superseded in part:** `AssumptionContext` was a one-field newtype over `TypeEnvIdx`
+> and has been removed; queries now take a `TypeEnvIdx` named `assumption_context`. The design
+> below is otherwise unchanged and kept as a historical record.
+
 # TIR assumption context implementation plan
 
 Status: checkpoints 1–4 accepted; checkpoint 5 implemented and ready for review.

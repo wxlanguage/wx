@@ -45,15 +45,15 @@ pub fn bytes_used() -> u32 {
     bump as u32
 }
 
-struct Node {
+struct Node(
     value: i32,
     next: &Node,
-}
+);
 
 impl Node {
     pub fn new(value: i32, next: &Node) -> &Node {
         local n = alloc::<Node>();
-        n.* = Node::{ value: value, next: next };
+        n.* = Node({ value: value, next: next });
         n
     }
 }

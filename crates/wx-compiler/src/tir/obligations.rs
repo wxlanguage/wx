@@ -1,15 +1,25 @@
-//! Work owned by a declaration while its signature is being constructed.
-//! Requirements refer to their eventual bound table, so provisional tables
-//! cannot lose inherited requirements that have not been published yet.
+//! Checks recorded while signatures are constructed and run by the check pass
+//! that follows construction (see `notes/tir-check-pass.md`). Construction
+//! lowers written syntax and never checks a bound; a site that needs one records
+//! an `Obligation` against the declaration being built. A check never changes a
+//! stored signature: a failure is diagnosed and nothing is rewritten.
+//!
+//! Each check runs through the module that owns its question (bound
+//! satisfaction, the solver's judgements, constant evaluation); this module
+//! records checks, runs the pass, and reports what a solver could not finish.
 
-use super::assumptions::AssumptionContext;
-use super::defs::{AssocTypeIdx, IntrinsicDefs, TraitIdx};
-use super::types::{
-	Type, TypeEnvIdx, TypeEnvOwner, TypeFolder, TypeIndex, TypeInterner,
-};
+use codespan_reporting::diagnostic::Diagnostic;
+use string_interner::symbol::SymbolU32;
+
+use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx};
+use super::signatures::TypeContext;
+use super::solver::{ImplMember, Unsolved};
+use super::types::{TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::Spanned;
-use crate::diagnostics::SourceSpan;
+use crate::diagnostics::{DiagnosticCode, SourceSpan};
 
+/// Requirements refer to their eventual bound table, so a provisional table
+/// cannot lose inherited requirements that have not been published yet.
 #[derive(Clone, Copy)]
 pub(super) enum BoundRequirements {
 	Parameter { env: TypeEnvIdx, index: usize },
@@ -19,426 +29,223 @@ pub(super) enum BoundRequirements {
 #[derive(Clone, Copy)]
 pub(super) enum Obligation {
 	CheckBounds {
-		context: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: TypeEnvOwner,
 	},
 	CheckTraitMembership {
-		context: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		subject: TypeIndex,
 		required: TraitIdx,
 		reference: SourceSpan,
 	},
-	Normalize {
-		context: AssumptionContext,
-		subject: TypeIndex,
+	/// A written type is normalized once, so a cycle or an exhausted budget
+	/// inside it is found even if nothing ever reads the type. The result is
+	/// discarded: the stored type stays as written.
+	CheckWellFormed {
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	},
+	/// An impl member's value (its own, or the trait default it inherits) has a
+	/// meaning. Unlike `CheckWellFormed`, the judgement is the solver's, made
+	/// once whoever asks first (`AssocValue`); this check reports the failure
+	/// the member owns, so a loop through definitions is reported once, where
+	/// it is defined, and readers of a poisoned value stay silent. `reference`
+	/// is the written value, or the impl's target for an inherited default.
+	CheckAssocValue {
+		member: ImplMember,
+		reference: SourceSpan,
+	},
+	/// A constant's initializer is checked against its declared type, in the
+	/// scope the constant is declared in, and evaluated when the type is a
+	/// scalar. Runs once every signature exists, since the initializer may name
+	/// any item.
+	CheckConstant {
+		const_index: ConstIdx,
+		reference: SourceSpan,
+	},
+	/// `Projection::name` was written, and the projection's declared bounds do
+	/// not name `name`. Whether its *value* has such a member depends on impls,
+	/// which construction cannot read, so the type was lowered to `ERROR` and
+	/// this decides what to say: a plain "no such member", or, when the value
+	/// does have one, that the trait must be named (with the spelling).
+	CheckProjectionMember {
+		assumption_context: TypeEnvIdx,
+		projection: TypeIndex,
+		name: SymbolU32,
 		reference: SourceSpan,
 	},
 }
 
-impl Obligation {
-	pub(super) fn context(self) -> AssumptionContext {
-		match self {
-			Self::CheckBounds { context, .. }
-			| Self::CheckTraitMembership { context, .. }
-			| Self::Normalize { context, .. } => context,
+impl TypeContext<'_, '_, '_> {
+	/// Records a check for the pass that follows construction. The owner is the
+	/// signature query being constructed, so the pass can run in definition order.
+	pub(super) fn register_obligation(&mut self, obligation: Obligation) {
+		let owner = self
+			.query_stack
+			.last()
+			.expect("recorded checks belong to a signature query")
+			.def_id;
+		self.checks.push((owner, obligation));
+	}
+
+	/// The check pass: every signature exists and every fact is `Ready`, so a
+	/// check answering `Pending` is an internal invariant failure. A failed check
+	/// has already reported itself; nothing is rewritten.
+	pub(super) fn run_checks(&mut self) {
+		let mut checks = std::mem::take(&mut self.checks);
+		// Stable, so checks of one declaration keep their source order. Order
+		// only arranges the output: a fact one check reads from another
+		// definition is the solver's memoized judgement, not this pass's.
+		checks.sort_by_key(|(owner, _)| self.ast_index(*owner));
+		for (_, obligation) in &checks {
+			self.run_check(obligation);
 		}
-	}
-}
-
-/// One-based indices keep an empty chain in the same four-byte slot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct ObligationIdx(std::num::NonZeroU32);
-
-struct ObligationNode {
-	next: Option<ObligationIdx>,
-	obligation: Option<Obligation>,
-}
-
-/// All deferred work shares the type context's lifetime and one allocation buffer.
-/// Links preserve declaration ownership across reentrant, interleaved queries.
-#[derive(Default)]
-pub(super) struct ObligationArena {
-	nodes: Vec<ObligationNode>,
-}
-
-impl ObligationArena {
-	#[cfg(test)]
-	pub(super) fn is_empty(&self) -> bool {
-		self.nodes.is_empty()
-	}
-
-	/// Completed payloads are dropped by the time a sweep finishes.
-	/// This audit traverses deferred slots only, with no release-build cost.
-	pub(super) fn assert_drained(&self) {
 		debug_assert!(
-			self.nodes.iter().all(|node| node.obligation.is_none()),
-			"completed signatures cannot leave orphaned obligations"
+			self.checks.is_empty(),
+			"running a check cannot record another"
 		);
 	}
 
-	#[cfg(test)]
-	pub(super) fn len(&self) -> usize {
-		self.nodes.len()
-	}
-
-	pub(super) fn push(
-		&mut self,
-		head: &mut Option<ObligationIdx>,
-		obligation: Obligation,
-	) {
-		let index = u32::try_from(self.nodes.len())
-			.expect("too many signature obligations");
-		let id = ObligationIdx(
-			std::num::NonZeroU32::new(
-				index
-					.checked_add(1)
-					.expect("too many signature obligations"),
-			)
-			.unwrap(),
-		);
-		self.nodes.push(ObligationNode {
-			next: *head,
-			obligation: Some(obligation),
-		});
-		*head = Some(id);
-	}
-
-	/// Detach a payload before executing it: execution may grow this arena.
-	pub(super) fn take(
-		&mut self,
-		id: ObligationIdx,
-	) -> (Option<ObligationIdx>, Obligation) {
-		let node = &mut self.nodes[(id.0.get() - 1) as usize];
-		(
-			node.next,
-			node.obligation
-				.take()
-				.expect("only live obligations are resumed"),
-		)
-	}
-
-	pub(super) fn retain(
-		&mut self,
-		id: ObligationIdx,
-		head: &mut Option<ObligationIdx>,
-		obligation: Obligation,
-	) {
-		let node = &mut self.nodes[(id.0.get() - 1) as usize];
-		assert!(node.obligation.is_none());
-		node.next = *head;
-		node.obligation = Some(obligation);
-		*head = Some(id);
-	}
-
-	/// Restore source insertion order without allocating a second list.
-	pub(super) fn reverse(
-		&mut self,
-		mut head: Option<ObligationIdx>,
-	) -> Option<ObligationIdx> {
-		let mut reversed = None;
-		while let Some(id) = head {
-			let node = &mut self.nodes[(id.0.get() - 1) as usize];
-			head = node.next;
-			node.next = reversed;
-			reversed = Some(id);
+	fn run_check(&mut self, obligation: &Obligation) {
+		if let Err(Unsolved::Pending) = self.check_obligation(obligation) {
+			debug_assert!(
+				false,
+				"a check cannot be pending once every signature is built"
+			);
 		}
-		reversed
 	}
-}
 
-/// A completed retry changes only types within its owning declaration.
-/// It is applied transiently, not retained as another result table.
-/// Examples below use `<error>` to denote `TypeIndex::ERROR`.
-pub(super) enum TypeRepair {
-	/// Replace a stored type after deferred normalization completes, or after
-	/// normalization or an associated-type value's bound check fails.
-	///
-	/// For example, once `T::Item` normalizes to `i32`, `(T::Item, bool)`
-	/// becomes `(i32, bool)`. A failed check replaces the affected type with
-	/// `<error>` instead. Replacement contents are inserted without folding
-	/// them again.
-	ReplaceType(ReplaceType),
-	/// Reject a specific generic argument after its deferred bound check fails.
-	///
-	/// For example, given `Need<X: Marker>`, a failed `U: Marker` check turns
-	/// `(Need<U>, U)` into `(Need<error>, U)`. Only the matching argument slot
-	/// in `Need` is rejected; ordinary uses of `U` remain valid.
-	RejectArgument(RejectArgument),
-	/// Invalidate structural dependencies after deferred trait membership fails.
-	///
-	/// A failed `T: Project` check replaces `<T as Project>::Output` with
-	/// `<error>`, while an ordinary `T` remains valid. A failed `T: Memory`
-	/// check turns `T::*u8` into `<error>::*u8`: the pointer and its pointee
-	/// remain intact, and only its memory field becomes error. Slices and
-	/// arrays recover the same way.
-	InvalidateTraitDependents(InvalidateTraitDependents),
-}
-
-impl TypeRepair {
-	pub(super) fn apply(
-		&self,
-		types: &mut TypeInterner,
-		intrinsics: &IntrinsicDefs,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		match *self {
-			Self::ReplaceType(mut folder) => folder.fold_type(types, ty),
-			Self::RejectArgument(mut folder) => folder.fold_type(types, ty),
-			Self::InvalidateTraitDependents(operation) => {
-				TraitDependentsFolder {
-					operation,
-					intrinsics,
+	/// A solver that cannot finish (budget or cycle) reports nothing; the
+	/// construct that wrote the requirement does, here, once, at its own span.
+	/// Any other result passes through for the caller to recover from.
+	pub(super) fn report_unsolved<T>(
+		&mut self,
+		result: Result<T, Unsolved>,
+		site: SourceSpan,
+	) -> Result<T, Unsolved> {
+		let diagnostic = match &result {
+			Err(Unsolved::Overflow) => Diagnostic::error()
+				.with_code(DiagnosticCode::TypeNormalizationOverflow.code())
+				.with_message("type normalization exceeded its recursion limit")
+				.with_label(site.primary_label()),
+			Err(Unsolved::Cycle(cycle)) => {
+				let mut diagnostic = Diagnostic::error()
+					.with_code(DiagnosticCode::CyclicAssociatedType.code())
+					.with_message(format!(
+						"cycle detected when normalizing `{}`",
+						self.type_formatter().display_type(cycle.projection)
+					))
+					.with_label(site.primary_label());
+				for &step in cycle.steps.iter() {
+					diagnostic = diagnostic.with_label(
+						site.secondary_label().with_message(format!(
+							"requires normalizing `{}`",
+							self.type_formatter().display_type(step)
+						)),
+					);
 				}
-				.fold_type(types, ty)
+				diagnostic
 			}
-		}
+			_ => return result,
+		};
+		self.diagnostics.push(diagnostic);
+		Err(Unsolved::Failed)
 	}
-}
 
-#[derive(Clone, Copy)]
-pub(super) struct ReplaceType {
-	pub(super) from: TypeIndex,
-	pub(super) to: TypeIndex,
-}
-
-impl TypeFolder for ReplaceType {
-	fn fold_type(
+	/// `Ok` means the obligation holds. A failure has been reported (or derives
+	/// from one that was), so callers only need to know that it did not.
+	pub(super) fn check_obligation(
 		&mut self,
-		types: &mut TypeInterner,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		if ty == self.from {
-			self.to
-		} else {
-			fold_recovering_children(types, ty, self)
-		}
+		obligation: &Obligation,
+	) -> Result<(), Unsolved> {
+		let site = match *obligation {
+			Obligation::CheckBounds { reference, .. }
+			| Obligation::CheckTraitMembership { reference, .. }
+			| Obligation::CheckWellFormed { reference, .. }
+			| Obligation::CheckAssocValue { reference, .. }
+			| Obligation::CheckConstant { reference, .. }
+			| Obligation::CheckProjectionMember { reference, .. } => reference,
+		};
+		// The obligation is the owning site: a normalization that diverged inside
+		// it is reported here, once.
+		let result = self.run_obligation(obligation);
+		self.report_unsolved(result, site)
 	}
-}
 
-#[derive(Clone, Copy)]
-pub(super) struct RejectArgument {
-	pub(super) owner: TypeEnvOwner,
-	pub(super) index: usize,
-	pub(super) argument: TypeIndex,
-	pub(super) normalized: TypeIndex,
-}
-
-impl TypeFolder for RejectArgument {
-	fn fold_type(
+	fn run_obligation(
 		&mut self,
-		types: &mut TypeInterner,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		if let Type::Struct { struct_index, .. } = types.resolve(ty) {
-			let struct_index = *struct_index;
-			if self.owner == TypeEnvOwner::Struct(struct_index) {
-				let type_args = types.map_type_list(
-					ty,
-					|ty| {
-						let Type::Struct { type_args, .. } = ty else {
-							unreachable!()
-						};
-						type_args
-					},
-					|types, index, child| {
-						if index == self.index
-							&& (child == self.argument
-								|| child == self.normalized)
-						{
-							TypeIndex::ERROR
-						} else {
-							self.fold_type(types, child)
-						}
-					},
+		obligation: &Obligation,
+	) -> Result<(), Unsolved> {
+		match *obligation {
+			Obligation::CheckBounds {
+				assumption_context,
+				requirements,
+				argument,
+				reference,
+				owner,
+			} => self.check_requirements(
+				assumption_context,
+				requirements,
+				argument,
+				reference,
+				owner,
+			),
+			Obligation::CheckTraitMembership {
+				assumption_context,
+				subject,
+				required,
+				reference,
+			} => {
+				if self
+					.find_trait_impl_query(
+						assumption_context,
+						subject,
+						required,
+					)?
+					.is_some()
+				{
+					return Ok(());
+				}
+				let diagnostic = self.report_type_does_not_implement_trait(
+					reference.file_id,
+					reference.span,
+					subject,
+					required,
 				);
-				return match type_args {
-					Some(type_args) => types.intern(Type::Struct {
-						struct_index,
-						type_args,
-					}),
-					None => ty,
-				};
+				self.diagnostics.push(diagnostic);
+				Err(Unsolved::Failed)
 			}
+			Obligation::CheckWellFormed {
+				assumption_context,
+				ty,
+				..
+			} => {
+				self.normalize_type_query(assumption_context, ty)?;
+				Ok(())
+			}
+			Obligation::CheckAssocValue { member, .. } => {
+				self.judge_assoc_value(member)
+			}
+			Obligation::CheckConstant { const_index, .. } => {
+				self.ensure_const_body(const_index);
+				self.evaluate_constant(const_index);
+				Ok(())
+			}
+			Obligation::CheckProjectionMember {
+				assumption_context,
+				projection,
+				name,
+				reference,
+			} => self.check_projection_member(
+				assumption_context,
+				projection,
+				name,
+				reference,
+			),
 		}
-		fold_recovering_children(types, ty, self)
-	}
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct InvalidateTraitDependents {
-	pub(super) subject: TypeIndex,
-	pub(super) normalized: TypeIndex,
-	pub(super) required: TraitIdx,
-}
-
-impl InvalidateTraitDependents {
-	fn matches_subject(&self, ty: TypeIndex) -> bool {
-		ty == self.subject || ty == self.normalized
-	}
-}
-
-/// Borrow traversal context without storing it in the repair operation.
-struct TraitDependentsFolder<'a> {
-	operation: InvalidateTraitDependents,
-	intrinsics: &'a IntrinsicDefs,
-}
-
-impl TraitDependentsFolder<'_> {
-	/// A memory field structurally requires Memory; ordinary occurrences
-	/// of the same subject remain valid when only that proof fails.
-	fn rejects_memory(&self, memory: TypeIndex) -> bool {
-		memory != TypeIndex::ERROR
-			&& self.operation.required
-				== self
-					.intrinsics
-					.memory
-					.expect("memory fields require the intrinsic Memory trait")
-			&& self.operation.matches_subject(memory)
-	}
-}
-
-impl TypeFolder for TraitDependentsFolder<'_> {
-	fn fold_type(
-		&mut self,
-		types: &mut TypeInterner,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		match *types.resolve(ty) {
-			Type::AssocTypeProjection {
-				base, trait_index, ..
-			} if trait_index == self.operation.required
-				&& self.operation.matches_subject(base) =>
-			{
-				TypeIndex::ERROR
-			}
-			Type::Pointer {
-				to,
-				memory,
-				ownership,
-			} if self.rejects_memory(memory) => {
-				let to = self.fold_type(types, to);
-				types.intern(Type::Pointer {
-					to,
-					memory: TypeIndex::ERROR,
-					ownership,
-				})
-			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} if self.rejects_memory(memory) => {
-				let of = self.fold_type(types, of);
-				types.intern(Type::Slice {
-					of,
-					memory: TypeIndex::ERROR,
-					ownership,
-				})
-			}
-			Type::Array {
-				of,
-				size,
-				memory,
-				ownership,
-			} if self.rejects_memory(memory) => {
-				let of = self.fold_type(types, of);
-				types.intern(Type::Array {
-					of,
-					size,
-					memory: TypeIndex::ERROR,
-					ownership,
-				})
-			}
-			_ => fold_recovering_children(types, ty, self),
-		}
-	}
-}
-
-/// Recovery invalidates a projection when its receiver becomes error.
-/// Structural folding and substitution preserve projections as written.
-fn fold_recovering_children<F: TypeFolder>(
-	types: &mut TypeInterner,
-	ty: TypeIndex,
-	folder: &mut F,
-) -> TypeIndex {
-	let Type::AssocTypeProjection {
-		base,
-		trait_index,
-		assoc_type_index,
-	} = *types.resolve(ty)
-	else {
-		return types.fold_children(ty, folder);
-	};
-	let next_base = folder.fold_type(types, base);
-	if next_base == TypeIndex::ERROR {
-		TypeIndex::ERROR
-	} else if next_base == base {
-		ty
-	} else {
-		types.intern(Type::AssocTypeProjection {
-			base: next_base,
-			trait_index,
-			assoc_type_index,
-		})
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn replacement_inserts_the_result_without_folding_it_again() {
-		let mut types = TypeInterner::new();
-		let subject = types.intern(Type::TypeParam {
-			env: TypeEnvIdx::new(1),
-			param_index: 0,
-		});
-		let replacement = types.intern(Type::Tuple {
-			elements: Box::new([subject]),
-		});
-		let original = types.intern(Type::Tuple {
-			elements: Box::new([subject, TypeIndex::BOOL]),
-		});
-		let result = TypeRepair::ReplaceType(ReplaceType {
-			from: subject,
-			to: replacement,
-		})
-		.apply(&mut types, &IntrinsicDefs::default(), original);
-		assert_eq!(
-			types.resolve(result),
-			&Type::Tuple {
-				elements: Box::new([replacement, TypeIndex::BOOL])
-			}
-		);
-		assert_eq!(
-			types.resolve(original),
-			&Type::Tuple {
-				elements: Box::new([subject, TypeIndex::BOOL])
-			}
-		);
-	}
-
-	#[test]
-	fn replacement_recovers_a_projection_with_an_invalid_receiver() {
-		let mut types = TypeInterner::new();
-		let subject = types.intern(Type::TypeParam {
-			env: TypeEnvIdx::new(1),
-			param_index: 0,
-		});
-		let projection = types.intern(Type::AssocTypeProjection {
-			base: subject,
-			trait_index: TraitIdx::new(0),
-			assoc_type_index: AssocTypeIdx::new(0),
-		});
-		let result = TypeRepair::ReplaceType(ReplaceType {
-			from: subject,
-			to: TypeIndex::ERROR,
-		})
-		.apply(&mut types, &IntrinsicDefs::default(), projection);
-		assert_eq!(result, TypeIndex::ERROR);
 	}
 }

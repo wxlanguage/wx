@@ -379,6 +379,7 @@ mod tests {
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&graph.strings,
+				&graph.files,
 				&defs,
 				&ast_nodes,
 				&dispatch,
@@ -622,7 +623,7 @@ mod tests {
 			trait Leaf {}
 			trait Inner { type Value; }
 			trait Outer { type Item; type Count; }
-			struct Wrapper<T> { value: T }
+			struct Wrapper<T>( value: T );
 			fn subject<T, S: Outer where {
 				Item: Inner where { Value = Wrapper<T> } + Leaf,
 				Count = u32

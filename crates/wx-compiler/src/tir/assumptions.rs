@@ -4,45 +4,33 @@
 //! bounds are read along a requested subject's projection path instead of
 //! recursively expanding every associated type: a recursive trait can
 //! describe infinitely many such paths.
+//!
+//! This is the one reader over the bound tables: scoped facts, subject facts, and
+//! `effective_bounds` (the declaration bounds along a receiver's projection
+//! path, with `Readiness` saying whether they are final). Both the solver
+//! (`solver.rs`, through its `SolverView`) and member selection
+//! (`members.rs`) read through it; it holds only references to the tables.
+//!
+//! A query's assumptions are named by a `TypeEnvIdx` called
+//! `assumption_context`: the declaration whose bounds (and enclosing
+//! declarations' bounds) apply. It is not the environment a parameter was
+//! declared in; a query about an outer parameter can use extra facts from an
+//! inner declaration's context. Where both meet (`match_impl_target_and_bounds`)
+//! the `assumption_context` is the caller's and `impl_env` the candidate impl's:
+//! requirements are proved in the caller's context.
+
+use crate::small_vec::SmallVec;
 
 use super::bounds::{
-	BoundId, EffectiveBounds, ImpliedAssocBinding, ImpliedBindingKind,
-	ImpliedTraitBound, Readiness, SelfSubstitution,
+	BoundId, ImpliedAssocBinding, ImpliedBindingKind, ImpliedTraitBound,
 };
-use super::defs::TraitIdx;
+use super::defs::{AssocTypeIdx, TraitIdx};
 use super::signatures::{
 	AssocTypeSignature, ParamBounds, TraitSignature, TypeContext,
 };
 use super::types::{
 	Type, TypeEnvArena, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner,
 };
-
-/// The assumptions available at a declaration, including enclosing scopes.
-/// This is distinct from a type parameter's declaring environment: a query
-/// about an outer parameter can use additional facts from an inner scope.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(super) struct AssumptionContext {
-	scope: TypeEnvIdx,
-}
-
-impl AssumptionContext {
-	pub(super) fn new(scope: TypeEnvIdx) -> Self {
-		Self { scope }
-	}
-	pub(super) fn scope(self) -> TypeEnvIdx {
-		self.scope
-	}
-}
-
-/// An unfinished dependency is retryable; a failed query needs recovery.
-/// `Ok` may still contain a valid abstract type or an unsatisfied requirement.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum QueryError {
-	Pending,
-	Failed,
-}
-
-pub(super) type QueryResult<T> = Result<T, QueryError>;
 
 /// A borrowed view shared by signature construction and body checking.
 /// It does not demand signatures, normalize types, or prove requirements.
@@ -79,21 +67,35 @@ pub(super) struct Assumption<'a> {
 }
 
 impl<'a> AssumptionReader<'a> {
+	pub(super) fn new(
+		type_envs: &'a TypeEnvArena,
+		param_bounds: &'a [Box<[ParamBounds]>],
+		traits: &'a [TraitSignature],
+		assoc_types: &'a [Option<AssocTypeSignature>],
+	) -> Self {
+		Self {
+			type_envs,
+			param_bounds,
+			traits,
+			assoc_types,
+		}
+	}
+
 	/// Read memberships and equalities in this scope and its ancestors.
 	/// Readiness describes these parameter trees; associated declaration
 	/// dependencies are inspected separately by `subject_facts`.
 	pub(super) fn scoped_facts(
 		&self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		types: &TypeInterner,
 	) -> AssumptionFacts<'a> {
 		let mut readiness = Readiness::Ready;
-		let mut roots = ScopedRoots::new(self, cx);
+		let mut roots = ScopedRoots::new(self, assumption_context);
 		while let Some(root) = roots.next(types) {
 			readiness = readiness.and(root.readiness);
 		}
 		AssumptionFacts {
-			sources: Sources::Scope(ScopedRoots::new(self, cx)),
+			sources: Sources::Scope(ScopedRoots::new(self, assumption_context)),
 			current: None,
 			parents: Vec::new(),
 			readiness,
@@ -137,11 +139,14 @@ struct ScopedRoots<'a> {
 }
 
 impl<'a> ScopedRoots<'a> {
-	fn new(reader: &AssumptionReader<'a>, cx: AssumptionContext) -> Self {
+	fn new(
+		reader: &AssumptionReader<'a>,
+		assumption_context: TypeEnvIdx,
+	) -> Self {
 		Self {
 			type_envs: reader.type_envs,
 			param_bounds: reader.param_bounds,
-			scope: Some(cx.scope),
+			scope: Some(assumption_context),
 			param_index: 0,
 		}
 	}
@@ -355,20 +360,250 @@ impl<'a> AssumptionFacts<'a> {
 	}
 }
 
+// ---- Effective bounds: the declaration bounds along a receiver's projection path
+
+/// Interpretation of Self in one associated declaration's bound tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SelfSubstitution {
+	pub(super) env: TypeEnvIdx,
+	pub(super) receiver: TypeIndex,
+}
+
+pub(super) struct BoundView<'a> {
+	pub(super) bound: &'a ImpliedTraitBound,
+	pub(super) context: Option<SelfSubstitution>,
+}
+
+/// Whether `effective_bounds`' traversal reached a state where its equality
+/// facts are safe to read. Separate from `EqualityLookup` (the caller-facing
+/// result of an actual lookup): `Pending` and `Overflowed` used to collapse
+/// into the same `facts_ready: bool = false`, but they call for different
+/// handling — `Pending` is a normal, temporary state a caller can retry once
+/// the dependency it's waiting on resolves; `Overflowed` never resolves no
+/// matter how many times it's retried, and needs its own diagnostic instead
+/// of silently masquerading as "not resolved yet".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Readiness {
+	Ready,
+	Pending,
+	Overflowed,
+}
+
+impl Readiness {
+	/// Keeps the more severe of two readiness observations gathered while
+	/// walking a receiver path — order of collection shouldn't matter.
+	pub(super) fn and(self, other: Readiness) -> Readiness {
+		match (self, other) {
+			(Readiness::Overflowed, _) | (_, Readiness::Overflowed) => {
+				Readiness::Overflowed
+			}
+			(Readiness::Pending, _) | (_, Readiness::Pending) => {
+				Readiness::Pending
+			}
+			(Readiness::Ready, Readiness::Ready) => Readiness::Ready,
+		}
+	}
+
+	pub(super) fn from_ready(ready: bool) -> Readiness {
+		if ready {
+			Readiness::Ready
+		} else {
+			Readiness::Pending
+		}
+	}
+}
+
+/// Declaration bounds for one projection on the receiver path. Its identity
+/// also selects the nested constraints contributed by each ancestor source.
+#[derive(Clone, Copy)]
+struct ProjectionBounds<'a> {
+	trait_index: TraitIdx,
+	assoc_type_index: AssocTypeIdx,
+	bounds: &'a [ImpliedTraitBound],
+	context: SelfSubstitution,
+}
+
+/// A cursor over borrowed bound sources, from the receiver's declaration
+/// through its ancestors to the root parameter. Bounds are never flattened
+/// or cloned. A parameter or a single projection needs no heap storage.
+pub(super) struct EffectiveBounds<'a> {
+	projections: Option<SmallVec<ProjectionBounds<'a>>>,
+	root: &'a [ImpliedTraitBound],
+	source_index: usize,
+	current: std::slice::Iter<'a, ImpliedTraitBound>,
+	context: Option<SelfSubstitution>,
+	pub(super) readiness: Readiness,
+	pub(super) reflexive_trait: Option<TraitIdx>,
+}
+
+impl<'a> EffectiveBounds<'a> {
+	fn projections(&self) -> &[ProjectionBounds<'a>] {
+		match &self.projections {
+			None => &[],
+			Some(SmallVec::One(source)) => std::slice::from_ref(source),
+			Some(SmallVec::Many(sources)) => sources,
+		}
+	}
+}
+
+impl<'a> Iterator for EffectiveBounds<'a> {
+	type Item = BoundView<'a>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			if let Some(bound) = self.current.next() {
+				return Some(BoundView {
+					bound,
+					context: self.context,
+				});
+			}
+			let sources = self.projections();
+			if self.source_index > sources.len() {
+				return None;
+			}
+			let (mut bounds, context): (&'a [ImpliedTraitBound], _) =
+				match sources.get(self.source_index) {
+					Some(source) => (source.bounds, Some(source.context)),
+					None => (self.root, None),
+				};
+			// Ancestor facts describe the ancestor's type. Follow the
+			// intervening projections to select facts about this receiver.
+			for projection in sources[..self.source_index].iter().rev() {
+				let Some(bound) = bounds
+					.iter()
+					.find(|bound| bound.trait_index == projection.trait_index)
+				else {
+					bounds = &[];
+					break;
+				};
+				let Some(binding) = bound.bindings.iter().find(|binding| {
+					binding.assoc_type_index == projection.assoc_type_index
+				}) else {
+					bounds = &[];
+					break;
+				};
+				bounds = &binding.required_bounds;
+			}
+			self.source_index += 1;
+			self.current = bounds.iter();
+			self.context = context;
+		}
+	}
+}
+
+impl<'a> AssumptionReader<'a> {
+	/// The caller prepares declaration bounds first. Readiness is computed
+	/// for the whole receiver path even if a consumer stops iteration early.
+	pub(super) fn effective_bounds(
+		&self,
+		types: &TypeInterner,
+		mut receiver: TypeIndex,
+		remaining_depth: usize,
+	) -> EffectiveBounds<'a> {
+		let reflexive_trait = match *types.resolve(receiver) {
+			Type::TypeParam { env, .. } => {
+				match self.type_envs.frame_owner(env) {
+					TypeEnvOwner::Trait(index) => Some(index),
+					_ => None,
+				}
+			}
+			_ => None,
+		};
+		let mut projections = None;
+		let mut root = &[][..];
+		let mut readiness = Readiness::Ready;
+		let mut remaining = remaining_depth;
+		while remaining > 0 {
+			match *types.resolve(receiver) {
+				Type::TypeParam { env, param_index } => {
+					let bounds = &self.param_bounds[usize::from(env)]
+						[param_index as usize];
+					root = bounds.facts.current();
+					readiness = readiness
+						.and(Readiness::from_ready(bounds.facts.is_ready()));
+					break;
+				}
+				Type::AssocTypeProjection {
+					base,
+					trait_index,
+					assoc_type_index,
+				} => {
+					let declaration = self.assoc_types
+						[usize::from(assoc_type_index)]
+					.as_ref();
+					readiness = readiness.and(Readiness::from_ready(
+						declaration.is_some_and(|value| value.facts.is_ready()),
+					));
+					let source = ProjectionBounds {
+						trait_index,
+						assoc_type_index,
+						bounds: declaration
+							.map(|value| value.facts.current())
+							.unwrap_or_default(),
+						context: SelfSubstitution {
+							env: self.traits[usize::from(trait_index)].env,
+							receiver: base,
+						},
+					};
+					match &mut projections {
+						None => projections = Some(SmallVec::new(source)),
+						Some(sources) => sources.push(source),
+					}
+					receiver = base;
+					remaining -= 1;
+				}
+				_ => break,
+			}
+		}
+		if remaining == 0 {
+			readiness = readiness.and(Readiness::Overflowed);
+		}
+		EffectiveBounds {
+			projections,
+			root,
+			source_index: 0,
+			current: [].iter(),
+			context: None,
+			readiness,
+			reflexive_trait,
+		}
+	}
+}
+
 impl TypeContext<'_, '_, '_> {
+	pub(super) fn reader(&self) -> AssumptionReader<'_> {
+		AssumptionReader::new(
+			&self.type_envs,
+			&self.param_bounds,
+			&self.traits,
+			&self.assoc_types,
+		)
+	}
+
 	/// Lend fact storage and the interner separately, so traversing facts can
 	/// intern projected subjects without cloning or mutating their bound trees.
 	pub(super) fn assumptions(
 		&mut self,
 	) -> (AssumptionReader<'_>, &mut TypeInterner) {
 		(
-			AssumptionReader {
-				type_envs: &self.type_envs,
-				param_bounds: &self.param_bounds,
-				traits: &self.traits,
-				assoc_types: &self.assoc_types,
-			},
+			AssumptionReader::new(
+				&self.type_envs,
+				&self.param_bounds,
+				&self.traits,
+				&self.assoc_types,
+			),
 			&mut self.types,
+		)
+	}
+
+	pub(super) fn effective_bounds(
+		&self,
+		receiver: TypeIndex,
+	) -> EffectiveBounds<'_> {
+		self.reader().effective_bounds(
+			&self.types,
+			receiver,
+			self.solver.remaining_depth(),
 		)
 	}
 }

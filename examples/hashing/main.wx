@@ -17,13 +17,13 @@ type Ptr<T: std::Memory> = T::&u8;
 const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
 
-struct DefaultHasher {
+struct DefaultHasher(
   value: u64,
-}
+);
 
 impl DefaultHasher {
   pub fn new() -> Self {
-    Self::{ value: FNV_OFFSET_BASIS }
+    Self({ value: FNV_OFFSET_BASIS })
   }
 }
 
@@ -57,7 +57,7 @@ impl Hash for i32 {
 memory heap: Memory where { Size = u32 };
 global mut bump: heap::*u8 = heap::DATA_END;
 
-struct BumpAllocator {}
+struct BumpAllocator();
 
 impl Allocator for BumpAllocator {
   type Mem = heap;

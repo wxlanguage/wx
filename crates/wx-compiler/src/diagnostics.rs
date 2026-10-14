@@ -109,6 +109,10 @@ define_diagnostic_codes! {
 		InvalidLabel => "E1014",
 		InvalidBindingPattern => "E1015",
 		MissingImportAlias => "E1016",
+		BlockNeedsKeyword => "E1017",
+		MixedCallArguments => "E1018",
+		StructFieldsNeedParentheses => "E1019",
+		StructLiteralIsACall => "E1020",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 
@@ -226,6 +230,8 @@ define_diagnostic_codes! {
 		MissingConstantType => "E2105",
 		UnknownCharacterEscape => "E2106",
 		UnterminatedStringLiteral => "E2107",
+		ConstEvaluationFailed => "E2108",
+		CyclicConstant => "E2109",
 	}
 }
 

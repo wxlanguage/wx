@@ -114,7 +114,7 @@ impl TestCase {
 		&self,
 		index: usize,
 	) -> &[Separated<Spanned<StructField>>] {
-		let Item::RecordStruct { fields, .. } = self.item(index) else {
+		let Item::Struct { fields, .. } = self.item(index) else {
 			panic!(
 				"item {index} is {}, not a struct",
 				item_kind(self.item(index))
@@ -138,7 +138,9 @@ fn shape_of(expression: &str) -> String {
 fn expression_kind(expression: &Expression) -> &'static str {
 	match expression {
 		Expression::Call { .. } => "call",
+		Expression::NamedCall { .. } => "named-call",
 		Expression::MethodCall(_) => "method-call",
+		Expression::NamedMethodCall(_) => "named-method-call",
 		Expression::ObjectAccess { .. } => "field",
 		Expression::Grouping { .. } => "grouping",
 		Expression::Cast { .. } => "cast",
@@ -164,8 +166,7 @@ fn item_kind(item: &Item) -> &'static str {
 		Item::Enum { .. } => "an enum",
 		Item::InherentImpl { .. } => "an inherent impl",
 		Item::TraitImpl { .. } => "a trait impl",
-		Item::RecordStruct { .. } => "a record struct",
-		Item::TupleStruct { .. } => "a tuple struct",
+		Item::Struct { .. } => "a struct",
 		Item::Memory { .. } => "a memory",
 		Item::Const { .. } => "a const",
 		Item::Module { .. } => "an inline module",
@@ -227,10 +228,10 @@ fn test_top_level_items() {
         global mut counter: i32 = 0;
         const MAX: i32 = 100;
 
-        struct Point {
+        struct Point(
             pub x: i32,
             y: i32,
-        }
+        );
 
         import \"env\" as env {
             fn log(message: string)
@@ -328,17 +329,17 @@ fn test_fn_pointer_param() {
 #[test]
 fn test_type_expression_forms() {
 	let case = TestCase::new(indoc! {"
-        struct TypeForms {
+        struct TypeForms(
             ptr: *u8,
             slice: &[u8],
             array: &[u8; 4],
             tuple: (i32, u32),
             namespaced: math::Number,
-        }
+        );
     "});
 
 	case.diagnostics().assert_none();
-	let Item::RecordStruct { fields, .. } = case.item(0) else {
+	let Item::Struct { fields, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 
@@ -947,38 +948,48 @@ fn test_multi_segment_label_reports_diagnostic_instead_of_panicking() {
 		.assert_codes(&[DiagnosticCode::InvalidLabel]);
 }
 
+/// A named call's path callee and arguments.
+fn named_call(
+	expression: &Expression,
+) -> (&[PathSegment], &[Separated<Spanned<NamedArgument>>]) {
+	let Expression::NamedCall { callee, arguments } = expression else {
+		panic!(
+			"expected a named call, found {}",
+			expression_kind(expression)
+		)
+	};
+	let Expression::Path(path) = &callee.inner else {
+		panic!("expected a path callee")
+	};
+	(path, arguments)
+}
+
 #[test]
-fn test_struct_init() {
-	// explicit fields, shorthand ({ field } == { field: field }), and empty
+fn test_named_call() {
+	// explicit names, shorthand ({ x } == { x: x }), an empty named list, and
+	// a struct constructed by position
 	let case = TestCase::new(indoc! {"
         fn make(x: i32, y: i32) {
-            local full  = Point::{ x: x, y: y };
-            local short = Point::{ x, y };
-            local empty = Unit::{};
+            local full  = Point({ x: x, y: y });
+            local short = Point({ x, y });
+            local empty = f({});
+            local unit  = Unit();
         }
     "});
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
-
-	let init = |index: usize| {
-		let Expression::StructInit { path, fields } =
-			local_definition_value(statements, index)
-		else {
-			panic!("expected a struct initialiser")
-		};
-		(path, fields)
-	};
+	let call =
+		|index: usize| named_call(local_definition_value(statements, index));
 
 	// explicit `x: x` records a value; shorthand `x` leaves it `None`
-	let (path, explicit) = init(0);
+	let (path, explicit) = call(0);
 	assert_eq!(case.name(path[0].ident.inner), "Point");
 	assert!(explicit.iter().all(|f| f.inner.inner.value.is_some()));
 
-	let (_, shorthand) = init(1);
-	assert_eq!(shorthand.len(), 2);
+	let (_, shorthand) = call(1);
 	assert!(
 		shorthand.iter().all(|f| f.inner.inner.value.is_none()),
-		"`Point::{{ x, y }}` is shorthand, so no explicit values"
+		"`Point({{ x, y }})` is shorthand, so no explicit values"
 	);
 	let names: Vec<&str> = shorthand
 		.iter()
@@ -986,28 +997,140 @@ fn test_struct_init() {
 		.collect();
 	assert_eq!(names, ["x", "y"]);
 
-	let (path, empty) = init(2);
-	assert_eq!(case.name(path[0].ident.inner), "Unit");
-	assert!(empty.is_empty());
+	assert!(call(2).1.is_empty());
+	// No arguments at all is the positional form.
+	assert!(matches!(
+		local_definition_value(statements, 3),
+		Expression::Call { arguments, .. } if arguments.is_empty()
+	));
 }
 
 #[test]
-fn test_generic_struct_init() {
+fn test_named_method_call_and_turbofish() {
 	let case = TestCase::new(indoc! {"
-        fn make(x: f32, y: f32) {
-            local p = Point::<f32>::{ x: x, y: y };
+        fn make(x: f32, y: f32, o: Obj) {
+            local p = Point::<f32>({ x: x, y: y });
+            o.move_to({ x, y });
         }
     "});
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
-	let init = local_definition_value(stmts, 0);
-	let Expression::StructInit { path, fields } = init else {
-		panic!("expected StructInit");
-	};
-	// path must be a single-segment path with one type arg: `Point::<f32>`
+	let (path, arguments) = named_call(local_definition_value(stmts, 0));
+	// the turbofish binds to the final segment: `Point::<f32>`
 	assert_eq!(path.len(), 1);
 	assert_eq!(path[0].type_args.len(), 1);
-	assert_eq!(fields.len(), 2);
+	assert_eq!(arguments.len(), 2);
+
+	let Expression::NamedMethodCall(call) = statement_expression(stmts, 1)
+	else {
+		panic!("expected a named method call")
+	};
+	assert_eq!(case.name(call.method.inner), "move_to");
+	assert_eq!(call.arguments.len(), 2);
+}
+
+#[test]
+fn named_and_positional_arguments_do_not_mix() {
+	for source in [
+		"fn f() { g({ a: 1 }, 2); }",
+		"fn f() { g(1, { a: 2 }); }",
+		"fn f() { o.m(1, { a: 2 }); }",
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MixedCallArguments]);
+	}
+}
+
+#[test]
+fn a_plain_block_is_written_with_its_keyword() {
+	let case = TestCase::new(indoc! {"
+        fn f() -> i32 {
+            local x = block { 1 };
+            block { x; }
+            outer: block { break :outer; }
+            if true { x } else { 2 }
+        }
+    "});
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+	assert!(matches!(
+		local_definition_value(statements, 0),
+		Expression::Block { .. }
+	));
+	assert!(matches!(
+		statement_expression(statements, 1),
+		Expression::Block { .. }
+	));
+	assert!(matches!(
+		statement_expression(statements, 2),
+		Expression::Label { .. }
+	));
+
+	// Without the keyword, `{` is reported and still read as a block.
+	let case = TestCase::new("fn f() { local x = { 1 }; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::BlockNeedsKeyword]);
+	assert!(matches!(
+		local_definition_value(case.function_block(0), 0),
+		Expression::Block { .. }
+	));
+}
+
+#[test]
+fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 };
+        fn f(p: Point) {
+            local q = Point::{ x: 1, y: 2 };
+            local Point::{ x, .. } = p;
+        }
+    "});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::StructFieldsNeedParentheses,
+		DiagnosticCode::StructLiteralIsACall,
+		DiagnosticCode::StructLiteralIsACall,
+	]);
+	assert_eq!(case.struct_fields(0).len(), 2);
+	let statements = case.function_block(1);
+	let (_, arguments) = named_call(local_definition_value(statements, 0));
+	assert_eq!(arguments.len(), 2);
+	assert!(matches!(
+		local_definition_pattern(statements, 1),
+		Pattern::NamedStruct { .. }
+	));
+}
+
+#[test]
+fn struct_fields_have_optional_names() {
+	let case = TestCase::new(indoc! {"
+        struct Named(pub x: i32, y: Vec<T>);
+        struct Positional(i32, pub heap::*u8, fn(i32) -> i32, Self, _);
+        struct Mixed(pub id: u32, math::Number);
+        struct Unit();
+    "});
+	case.diagnostics().assert_none();
+	let names = |index: usize| -> Vec<Option<String>> {
+		case.struct_fields(index)
+			.iter()
+			.map(|f| f.inner.inner.name.map(|n| case.name(n.inner).to_string()))
+			.collect()
+	};
+	assert_eq!(names(0), [Some("x".into()), Some("y".into())]);
+	assert_eq!(names(1), [None, None, None, None, None]);
+	assert_eq!(names(2), [Some("id".into()), None]);
+	assert!(names(3).is_empty());
+	// A positional field's type that starts with an identifier is parsed on
+	// from it: `math::Number`, `heap::*u8`.
+	assert!(matches!(
+		case.struct_fields(2)[1].inner.inner.ty.inner,
+		TypeExpression::Path(ref segments) if segments.len() == 2
+	));
+	assert!(matches!(
+		case.struct_fields(1)[1].inner.inner.ty.inner,
+		TypeExpression::Pointer { .. }
+	));
+	assert!(case.struct_fields(1)[1].inner.inner.pub_span.is_some());
 }
 
 #[test]
@@ -1393,72 +1516,68 @@ fn test_pattern_tuple_destructuring() {
 fn test_pattern_struct_destructuring() {
 	let case = TestCase::new(indoc! {"
         fn f(p: Point) {
-            local Point::{ x, y } = p;
-            local Point::{ x: a, y: b } = p;
-            local geom::Point::{ x, .. } = p;
+            local Point({ x, y }) = p;
+            local Point({ x: a, y: b }) = p;
+            local geom::Point({ x, .. }) = p;
+            local Point(a, ..) = p;
         }
     "});
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
 
-	let Pattern::Struct { path, items } = local_definition_pattern(stmts, 0)
-	else {
-		panic!("expected struct pattern")
+	let named_pattern = |index: usize| {
+		let Pattern::NamedStruct {
+			path,
+			fields: items,
+		} = local_definition_pattern(stmts, index)
+		else {
+			panic!("expected a named struct pattern")
+		};
+		(path, struct_pattern_fields(items))
 	};
-	let (fields, rest) = struct_pattern_fields(items);
+
+	let (path, (fields, rest)) = named_pattern(0);
 	assert_eq!(path.len(), 1);
 	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("Point"));
 	assert!(rest.is_empty());
 	assert_eq!(fields.len(), 2);
 	assert!(
-		fields[0].pattern.is_none(),
-		"shorthand field should have no sub-pattern"
-	);
-	assert!(
-		fields[1].pattern.is_none(),
-		"shorthand field should have no sub-pattern"
+		fields.iter().all(|field| field.pattern.is_none()),
+		"shorthand fields have no sub-pattern"
 	);
 
-	let Pattern::Struct { items, .. } = local_definition_pattern(stmts, 1)
-	else {
-		panic!("expected struct pattern")
-	};
-	let (fields, _) = struct_pattern_fields(items);
+	let (_, (fields, _)) = named_pattern(1);
 	assert!(
-		fields[0].pattern.is_some(),
-		"renamed field should have sub-pattern"
-	);
-	assert!(
-		fields[1].pattern.is_some(),
-		"renamed field should have sub-pattern"
+		fields.iter().all(|field| field.pattern.is_some()),
+		"renamed fields have a sub-pattern"
 	);
 
 	// A multi-segment path names a struct in another module, and `..` stands
 	// in for the fields the pattern does not bind.
-	let Pattern::Struct { path, items } = local_definition_pattern(stmts, 2)
-	else {
-		panic!("expected struct pattern")
-	};
-	let (fields, rest) = struct_pattern_fields(items);
+	let (path, (fields, rest)) = named_pattern(2);
 	assert_eq!(path.len(), 2);
 	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("geom"));
 	assert_eq!(case.interner.resolve(path[1].ident.inner), Some("Point"));
 	assert_eq!(fields.len(), 1);
 	assert!(!rest.is_empty());
+
+	assert!(matches!(
+		local_definition_pattern(stmts, 3),
+		Pattern::Struct { elements, .. } if elements.len() == 2
+	));
 }
 
-/// Splits a `Pattern::Struct`'s raw `items` sequence into its named fields
-/// and its `..` rest markers — the same split `control.rs`'s
-/// `collect_struct_pattern_bindings` does on the real (non-test) path.
+/// Splits a named struct pattern's raw items into its fields and its `..`
+/// rest markers.
 fn struct_pattern_fields(
-	items: &[Separated<Spanned<StructPatternItem>>],
-) -> (Vec<&PatternField>, Vec<&Spanned<StructPatternItem>>) {
+	items: &[Separated<Spanned<NamedPatternItem>>],
+) -> (Vec<&PatternField>, Vec<&Spanned<NamedPatternItem>>) {
 	let mut fields = Vec::new();
 	let mut rest = Vec::new();
 	for item in items {
 		match &item.inner.inner {
-			StructPatternItem::Field(field) => fields.push(field),
-			StructPatternItem::Rest => rest.push(&item.inner),
+			NamedPatternItem::Field(field) => fields.push(field),
+			NamedPatternItem::Rest => rest.push(&item.inner),
 		}
 	}
 	(fields, rest)
@@ -1630,10 +1749,10 @@ fn test_missing_initializer() {
 #[test]
 fn test_missing_comma_between_struct_fields_warns_but_parses() {
 	let case = TestCase::new(indoc! {"
-        struct Pair {
+        struct Pair(
             left: i32
             right: i32,
-        }
+        );
     "});
 
 	case.diagnostics()
@@ -1650,9 +1769,9 @@ fn test_module_pub_items_and_associated_types() {
             }
         }
 
-        pub struct Counter {
+        pub struct Counter(
             value: i32,
-        }
+        );
 
         pub trait Iterator {
             type Item: Show + Clone;
@@ -1685,7 +1804,7 @@ fn test_module_pub_items_and_associated_types() {
 		}
 	));
 
-	let Item::RecordStruct { pub_span, .. } = case.item(1) else {
+	let Item::Struct { pub_span, .. } = case.item(1) else {
 		panic!("expected public struct")
 	};
 	assert!(pub_span.is_some());
@@ -1794,13 +1913,13 @@ fn test_generic_signatures() {
 #[test]
 fn test_generic_struct() {
 	let case = TestCase::new(indoc! {"
-        struct Pair<T, U> {
+        struct Pair<T, U>(
             first: T,
             second: U,
-        }
+        );
     "});
 	case.diagnostics().assert_none();
-	let Item::RecordStruct {
+	let Item::Struct {
 		name,
 		type_params,
 		fields,
@@ -1821,12 +1940,12 @@ fn test_generic_struct() {
 #[test]
 fn test_generic_struct_with_bounds() {
 	let case = TestCase::new(indoc! {"
-        struct Wrapper<T: Add + Clone> {
+        struct Wrapper<T: Add + Clone>(
             value: T,
-        }
+        );
     "});
 	case.diagnostics().assert_none();
-	let Item::RecordStruct { type_params, .. } = case.item(0) else {
+	let Item::Struct { type_params, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
 	assert_eq!(type_params.len(), 1);
@@ -1921,10 +2040,10 @@ fn test_turbofish_method_call() {
 #[test]
 fn test_generic_application_type_args() {
 	let case = TestCase::new(indoc! {"
-        struct Pair<T, U> {
+        struct Pair<T, U>(
             first: T,
             second: U,
-        }
+        );
         fn make(x: Pair<i32, f64>) {}
     "});
 	case.diagnostics().assert_none();
@@ -2296,6 +2415,38 @@ fn test_qualified_and_grouped_paths_in_type_position() {
 		matches!(ty(1), TypeExpression::Grouped { .. }),
 		"`<Point>::Out` names no trait, so it is a grouped path"
 	);
+}
+
+#[test]
+fn test_a_qualified_type_may_open_another_without_a_space() {
+	// `<<` is one token to the lexer, but here it is two openings; the parser
+	// splits it, as it splits `>>` where generic lists close together.
+	let case = TestCase::new(indoc! {"
+        fn f(a: <<Point as Show>::Out as Draw>::Frame, b: < <Point as Show>::Out as Draw>::Frame) {}
+    "});
+	case.diagnostics().assert_none();
+
+	let params = &case.function_signature(0).params;
+	for index in 0..2 {
+		let TypeExpression::QualifiedPath { root, segments } = &params[index]
+			.inner
+			.inner
+			.ty
+			.as_ref()
+			.expect("annotated")
+			.inner
+		else {
+			panic!("expected a qualified path type")
+		};
+		assert_eq!(case.name(root.trait_path[0].ident.inner), "Draw");
+		assert_eq!(case.name(segments[0].ident.inner), "Frame");
+		let TypeExpression::QualifiedPath { root: inner, .. } =
+			&root.self_type.inner
+		else {
+			panic!("the self type is itself a qualified path")
+		};
+		assert_eq!(case.name(inner.trait_path[0].ident.inner), "Show");
+	}
 }
 
 // ── keyword expressions ──────────────────────────────────────────────────────

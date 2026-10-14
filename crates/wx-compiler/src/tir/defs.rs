@@ -190,42 +190,35 @@ pub struct InherentImplDef {
 	pub members: Vec<InherentMemberDef>,
 }
 
-/// Field identity only (names, `pub_span`, dedup/lookup) — field *types*
-/// are `signatures::StructSignature::field_types`, index-aligned with
-/// whichever `StructFields` variant is used here.
+/// Field identity only (names, `pub_span`, lookup) — field *types* are
+/// `signatures::StructSignature::field_types`, index-aligned with `fields`.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct StructDef {
 	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: NamespaceIdx,
 	pub name: Spanned<SymbolU32>,
-	pub fields: StructFields,
+	pub fields: Box<[FieldDef]>,
+	/// The named fields by name, each to its first occurrence.
+	#[cfg_attr(
+		test,
+		serde(serialize_with = "crate::testing::serialize_sorted_map")
+	)]
+	pub lookup: HashMap<SymbolU32, FieldIdx>,
 }
 
-/// `Tuple` carries no `lookup` — a tuple field has no name to look up by.
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum StructFields {
-	Record {
-		fields: Box<[RecordFieldDef]>,
-		#[cfg_attr(
-			test,
-			serde(serialize_with = "crate::testing::serialize_sorted_map")
-		)]
-		lookup: HashMap<SymbolU32, FieldIdx>,
-	},
-	Tuple {
-		fields: Box<[TupleFieldDef]>,
-	},
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct RecordFieldDef {
-	pub name: Spanned<SymbolU32>,
-	pub pub_span: Option<TextSpan>,
+impl StructDef {
+	/// Whether every field has a name: only then can the struct be
+	/// constructed (`P({ x: 1, y: 2 })`) or destructured by name.
+	pub fn is_fully_named(&self) -> bool {
+		self.fields.iter().all(|field| field.name.is_some())
+	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct TupleFieldDef {
+pub struct FieldDef {
+	/// `None` for a positional field.
+	pub name: Option<Spanned<SymbolU32>>,
 	pub pub_span: Option<TextSpan>,
 }
 
@@ -422,11 +415,7 @@ pub(super) enum AstNodeRef<'ast> {
 		item: &'ast ast::Item,
 		func_index: FunctionIdx,
 	},
-	RecordStruct {
-		struct_index: StructIdx,
-		item: &'ast ast::Item,
-	},
-	TupleStruct {
+	Struct {
 		struct_index: StructIdx,
 		item: &'ast ast::Item,
 	},
@@ -2316,7 +2305,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					node: AstNodeRef::Global { global_index, item },
 				});
 			}
-			ast::Item::RecordStruct {
+			ast::Item::Struct {
 				id,
 				pub_span,
 				name,
@@ -2335,69 +2324,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-
-				let mut record_fields: Vec<RecordFieldDef> =
-					Vec::with_capacity(fields.len());
-				let mut lookup: HashMap<SymbolU32, FieldIdx> =
-					HashMap::with_capacity(fields.len());
-				for field in fields.iter().map(|f| &f.inner.inner) {
-					let index = FieldIdx::new(
-						u32::try_from(record_fields.len()).unwrap(),
-					);
-					if let Some(&first_index) = lookup.get(&field.name.inner) {
-						let first_name =
-							record_fields[usize::from(first_index)].name;
-						self.diagnostics.push(report_duplicate_struct_field(
-							self.strings,
-							file_id,
-							field.name,
-							first_name,
-						));
-					} else {
-						lookup.insert(field.name.inner, index);
-					}
-					record_fields.push(RecordFieldDef {
-						name: field.name,
-						pub_span: field.pub_span,
-					});
-				}
-
-				self.structs.push(StructDef {
-					def_id: *id,
-					file_id,
-					namespace,
-					name: *name,
-					fields: StructFields::Record {
-						fields: record_fields.into_boxed_slice(),
-						lookup,
-					},
-				});
-				self.ast_nodes.push(AstEntry {
-					def_id: *id,
-					file_id,
-					namespace,
-					node: AstNodeRef::RecordStruct { struct_index, item },
-				});
-			}
-			ast::Item::TupleStruct {
-				id,
-				pub_span,
-				name,
-				fields,
-				..
-			} => {
-				let struct_index =
-					StructIdx::new(u32::try_from(self.structs.len()).unwrap());
-				let def_key = self.push_def(
-					namespace,
-					ItemDef::new(DefKind::Struct(struct_index), name.span),
-				);
-				self.insert_binding(
-					namespace,
-					BindingKey::ty(name.inner),
-					Binding::definition(def_key, Visibility::from(*pub_span)),
-					name.span,
-				);
+				// The name is also the struct's constructor, called like a
+				// function. Constructing it takes every field, so it is only
+				// accessible where every field is.
 				let value_target = if fields
 					.iter()
 					.all(|f| f.inner.inner.pub_span.is_some())
@@ -2416,25 +2345,51 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
+				let mut field_defs: Vec<FieldDef> =
+					Vec::with_capacity(fields.len());
+				let mut lookup: HashMap<SymbolU32, FieldIdx> = HashMap::new();
+				for field in fields.iter().map(|f| &f.inner.inner) {
+					let index =
+						FieldIdx::new(u32::try_from(field_defs.len()).unwrap());
+					// A duplicate name keeps its slot (positions still match
+					// the declaration) but is unreachable by name.
+					if let Some(name) = field.name {
+						if let Some(&first_index) = lookup.get(&name.inner) {
+							let first_name = field_defs
+								[usize::from(first_index)]
+							.name
+							.expect("only named fields are looked up");
+							self.diagnostics.push(
+								report_duplicate_struct_field(
+									self.strings,
+									file_id,
+									name,
+									first_name,
+								),
+							);
+						} else {
+							lookup.insert(name.inner, index);
+						}
+					}
+					field_defs.push(FieldDef {
+						name: field.name,
+						pub_span: field.pub_span,
+					});
+				}
+
 				self.structs.push(StructDef {
 					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
-					fields: StructFields::Tuple {
-						fields: fields
-							.iter()
-							.map(|f| TupleFieldDef {
-								pub_span: f.inner.inner.pub_span,
-							})
-							.collect(),
-					},
+					fields: field_defs.into_boxed_slice(),
+					lookup,
 				});
 				self.ast_nodes.push(AstEntry {
 					def_id: *id,
 					file_id,
 					namespace,
-					node: AstNodeRef::TupleStruct { struct_index, item },
+					node: AstNodeRef::Struct { struct_index, item },
 				});
 			}
 			ast::Item::Enum {
@@ -2941,7 +2896,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 						ast::ImplItem::AssocType { .. } => {
-							todo!()
+							unimplemented!(
+								"associated types are not allowed in inherent impls"
+							)
 						}
 					};
 					if let Some(collision) = bindings.get(&key).copied() {
@@ -3821,7 +3778,7 @@ mod tests {
 	 {
 		let case = TestCase::new(indoc! {"
 			mod outer {
-				mod hidden { pub struct Visible {} }
+				mod hidden { pub struct Visible(); }
 			}
 			type Alias = outer::hidden::Visible;
 		"});
@@ -3864,7 +3821,7 @@ mod tests {
 	fn resolution_success_rejects_privacy_errors_even_with_an_accessible_target()
 	 {
 		let mut case =
-			TestCase::new("mod outer { mod hidden { pub struct Visible {} } }");
+			TestCase::new("mod outer { mod hidden { pub struct Visible(); } }");
 		case.resolve(BindingNamespace::Type, "outer::hidden::Visible")
 			.expect_success();
 	}
@@ -4097,7 +4054,7 @@ mod tests {
 				const VALUE: Unknown;
 				type Item: Unknown;
 			}
-			struct Host {}
+			struct Host();
 			impl Host {
 				fn make() -> Unknown { missing }
 				fn get(self, value: Unknown) -> Unknown { missing }
@@ -4169,18 +4126,36 @@ mod tests {
 
 	#[test]
 	fn type_and_value_definitions_can_share_a_name() {
-		let mut case = TestCase::new("struct Item {} fn Item() {}");
+		let mut case = TestCase::new("trait Item {} fn Item() {}");
 		case.diagnostics().assert_none();
 		assert!(matches!(
 			case.resolve(BindingNamespace::Type, "Item")
 				.expect_success(),
-			DefKind::Struct(_)
+			DefKind::Trait(_)
 		));
 		assert!(matches!(
 			case.resolve(BindingNamespace::Value, "Item")
 				.expect_success(),
 			DefKind::Function(_)
 		));
+	}
+
+	#[test]
+	fn a_struct_name_is_also_its_constructor() {
+		// A struct is constructed by calling its name, so the name is a value
+		// as well as a type, and a function cannot share it. (The constructor
+		// is accessible where every field is, so the field is `pub`.)
+		let mut case = TestCase::new("struct Item(pub x: i32);");
+		case.diagnostics().assert_none();
+		for namespace in [BindingNamespace::Type, BindingNamespace::Value] {
+			assert!(matches!(
+				case.resolve(namespace, "Item").expect_success(),
+				DefKind::Struct(_)
+			));
+		}
+		let case = TestCase::new("struct Item(); fn Item() {}");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 	}
 
 	#[test]
@@ -4290,8 +4265,8 @@ mod tests {
 	fn duplicate_members_keep_the_original_binding_and_later_members() {
 		for source in [
 			"trait T { fn f(original: i32); fn f(replacement: i32); fn after(); }",
-			"struct S {} impl S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
-			"trait T {} struct S {} impl T for S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
+			"struct S(); impl S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
+			"trait T {} struct S(); impl T for S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4388,7 +4363,7 @@ mod tests {
 	#[test]
 	fn duplicate_record_field_is_reported_but_keeps_its_own_slot() {
 		let mut case = TestCase::new(indoc! {"
-			struct Point { x: i32, x: i32 }
+			struct Point( x: i32, x: i32 );
 		"});
 
 		assert_eq!(case.diagnostics.len(), 1, "{:?}", case.diagnostics);
@@ -4408,16 +4383,15 @@ mod tests {
 		};
 		let struct_def = &case.defs.structs[usize::from(point_struct_index)];
 
-		let StructFields::Record { fields, lookup } = &struct_def.fields else {
-			panic!("expected a record struct");
-		};
+		let (fields, lookup) = (&struct_def.fields, &struct_def.lookup);
 		// Both occurrences keep a real field slot — duplicate name isn't
 		// dropped, only unreachable by name — so a later field's index
 		// still matches its declaration position.
 		assert_eq!(fields.len(), 2);
-		assert_eq!(fields[0].name.inner, fields[1].name.inner);
+		let name = fields[0].name.unwrap().inner;
+		assert_eq!(fields[1].name.unwrap().inner, name);
 		// `lookup` only ever points at the first occurrence.
-		assert_eq!(lookup.get(&fields[1].name.inner), Some(&FieldIdx::new(0)));
+		assert_eq!(lookup.get(&name), Some(&FieldIdx::new(0)));
 	}
 
 	#[test]
@@ -4467,8 +4441,8 @@ mod tests {
 	fn duplicate_associated_function_parameters_keep_their_slots() {
 		for source in [
 			"trait T { fn f(x: i32, x: i32, tail: i32); }",
-			"struct S {} impl S { fn f(x: i32, x: i32, tail: i32) {} }",
-			"trait T {} struct S {} impl T for S { fn f(x: i32, x: i32, tail: i32) {} }",
+			"struct S(); impl S { fn f(x: i32, x: i32, tail: i32) {} }",
+			"trait T {} struct S(); impl T for S { fn f(x: i32, x: i32, tail: i32) {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4496,8 +4470,8 @@ mod tests {
 	fn self_not_first_in_an_associated_function_is_rejected() {
 		for source in [
 			"trait T { fn f(x: i32, self); }",
-			"struct S {} impl S { fn f(x: i32, self) {} }",
-			"trait T {} struct S {} impl T for S { fn f(x: i32, self) {} }",
+			"struct S(); impl S { fn f(x: i32, self) {} }",
+			"trait T {} struct S(); impl T for S { fn f(x: i32, self) {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4546,7 +4520,7 @@ mod tests {
 				fn method(self, x: i32);
 				fn associated(x: i32);
 			}
-			struct S {}
+			struct S();
 			impl S {
 				fn method(self, x: i32) {}
 				fn associated(x: i32) {}

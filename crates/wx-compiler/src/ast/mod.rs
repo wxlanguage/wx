@@ -161,6 +161,21 @@ impl std::fmt::Display for Token {
 	}
 }
 
+fn report_mixed_call_arguments(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MixedCallArguments.code())
+		.with_message(
+			"named arguments cannot be combined with positional arguments",
+		)
+		.with_label(Label::primary(file_id, span))
+		.with_note(
+			"pass every argument by position, `f(a, b)`, or every one by name, `f({ x: a, y: b })`",
+		)
+}
+
 fn report_unexpected_token(
 	file_id: FileId,
 	received: Spanned<Token>,
@@ -682,6 +697,21 @@ impl<'src> Lexer<'src> {
 		first
 	}
 
+	/// Consume a `<<` token and split it: return the span of the first `<` and
+	/// push the second `<` into `peeked`. Used when a qualified type opens
+	/// another one immediately (`<<A as B>::C as D>::E`), the mirror of
+	/// `split_double_right_arrow`.
+	fn split_double_left_arrow(&mut self) -> TextSpan {
+		let tok = self.next();
+		debug_assert!(tok.inner == Token::DoubleLeftArrow);
+		let first = TextSpan::new(tok.span.start, tok.span.start + 1);
+		self.peeked = Some(Spanned {
+			inner: Token::LeftArrow,
+			span: TextSpan::new(tok.span.start + 1, tok.span.end),
+		});
+		first
+	}
+
 	/// Advance past each following char for which `pred` holds, leaving
 	/// `self.chars` on the first char that doesn't (or at end of input).
 	#[inline]
@@ -1039,13 +1069,22 @@ pub enum Expression {
 		operator: Spanned<BinaryOp>,
 		right: Box<Spanned<Expression>>,
 	},
-	/// `{expr}::<...>(...)`
+	/// `{expr}::<...>(a, b)`: a function call, or the construction of a
+	/// struct, by position.
 	Call {
 		callee: Box<Spanned<Expression>>,
 		arguments: Box<[Separated<Spanned<Expression>>]>,
 	},
-	/// `{expr}.{method}::<...>(...)`
+	/// `{expr}::<...>({ x: a, y })`: the same, naming each parameter (or
+	/// field). The named list is the call's only argument.
+	NamedCall {
+		callee: Box<Spanned<Expression>>,
+		arguments: Box<[Separated<Spanned<NamedArgument>>]>,
+	},
+	/// `{expr}.{method}::<...>(a, b)`
 	MethodCall(Box<MethodCallExpr>),
+	/// `{expr}.{method}::<...>({ x: a, y })`
+	NamedMethodCall(Box<MethodCallExpr<NamedArgument>>),
 	/// `{expr}::<Type1, Type2>` — turbofish type application on a non-path
 	/// expression. Method turbofish calls are represented as `MethodCall`.
 	TypeApplication {
@@ -1135,11 +1174,6 @@ pub enum Expression {
 		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
-	/// `Name::{ field: expr }` or `module::Name::<T>::{ field: expr }`
-	StructInit {
-		path: Box<[PathSegment]>,
-		fields: Box<[Separated<Spanned<StructInitField>>]>,
-	},
 	/// `(a, b, c)` or `()`
 	Tuple {
 		elements: Box<[Spanned<Expression>]>,
@@ -1172,18 +1206,20 @@ pub enum Expression {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct MethodCallExpr {
+/// A method call; `Argument` is `Expression` for one by position and
+/// `NamedArgument` for one by name.
+pub struct MethodCallExpr<Argument = Expression> {
 	pub object: Box<Spanned<Expression>>,
 	pub method: Spanned<SymbolU32>,
 	pub type_args: Box<[Spanned<TypeExpression>]>,
-	pub arguments: Box<[Separated<Spanned<Expression>>]>,
+	pub arguments: Box<[Separated<Spanned<Argument>>]>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct StructInitField {
+pub struct NamedArgument {
 	pub name: Spanned<SymbolU32>,
-	/// `None` means shorthand: `{ field }` is equivalent to `{ field: field }`
+	/// `None` means shorthand: `{ name }` is equivalent to `{ name: name }`
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
@@ -1273,8 +1309,7 @@ impl Expression {
 			| Expression::IfElse { .. }
 			| Expression::Loop { .. }
 			| Expression::Label { .. }
-			| Expression::Match { .. }
-			| Expression::StructInit { .. } => true,
+			| Expression::Match { .. } => true,
 			_ => false,
 		}
 	}
@@ -1403,7 +1438,7 @@ pub struct PatternField {
 	pub pattern: Option<Spanned<Pattern>>,
 }
 
-/// One entry inside a `Path::{ ... }` pattern body, exactly as written.
+/// One entry of a named struct pattern `Path({ ... })`, exactly as written.
 /// `SeparatedGroup`'s `item_handler` is a plain `fn` pointer that yields
 /// exactly one item, so the `..` rest marker has to come back through the
 /// same channel as a field — that's the only reason this sum type exists.
@@ -1413,17 +1448,17 @@ pub struct PatternField {
 /// duplicate or misplaced `..` means.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum StructPatternItem {
+pub enum NamedPatternItem {
 	Field(PatternField),
 	Rest,
 }
 
-/// One entry inside a `Path(...)` tuple-struct pattern body — the positional
-/// analogue of [`StructPatternItem`], same "raw sequence, no parser-side
+/// One entry of a positional struct pattern `Path(...)` — the positional
+/// analogue of [`NamedPatternItem`], same "raw sequence, no parser-side
 /// assumptions" rationale.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum TupleStructPatternItem {
+pub enum PositionalPatternItem {
 	Element(Pattern),
 	Rest,
 }
@@ -1442,26 +1477,21 @@ pub enum Pattern {
 	Tuple {
 		elements: Box<[Separated<Spanned<Pattern>>]>,
 	},
-	/// `Name::{ field, other: pat, ... }` or `module::Name::{ field, .. }` —
-	/// the `::{` mirrors `Expression::StructInit`'s syntax rather than Rust's
-	/// bare `Name { .. }`, so a pattern and a literal for the same struct read
-	/// the same way. `items` is the raw parsed sequence (see
-	/// [`StructPatternItem`]) — how many `Rest` entries it holds and where is
-	/// a semantic question TIR answers, not a parse-time assumption.
+	/// `Name(pat, pat, ..)` or `module::Name(pat, ..)` — destructures a
+	/// struct by position, written exactly as its construction is
+	/// (`Name(1, 2)`), so a pattern and a value read the same way. The items
+	/// are the raw parsed sequence: how many `Rest` entries there are and
+	/// where is a semantic question TIR answers, not a parse-time assumption.
 	Struct {
 		path: Box<[PathSegment]>,
-		items: Box<[Separated<Spanned<StructPatternItem>>]>,
+		elements: Box<[Separated<Spanned<PositionalPatternItem>>]>,
 	},
-	/// `Name(pat, pat, ...)` or `module::Name(pat, ..)` — destructures a
-	/// tuple struct, mirroring its `Name(1, 2)` construction syntax the way
-	/// `Struct`'s `::{ }` mirrors `Expression::StructInit`'s. `elements` is
-	/// the raw parsed sequence (see [`TupleStructPatternItem`]); unlike the
-	/// named-field form, a tuple struct's positions are meaningful, so where
-	/// a `Rest` sits among `elements` is not incidental — TIR decides what a
-	/// duplicate or a given position means.
-	TupleStruct {
+	/// `Name({ field, other: pat, .. })` — destructures a struct by field
+	/// name, as `Name({ x: 1, y: 2 })` constructs it. Same raw sequence as
+	/// `Struct`.
+	NamedStruct {
 		path: Box<[PathSegment]>,
-		elements: Box<[Separated<Spanned<TupleStructPatternItem>>]>,
+		fields: Box<[Separated<Spanned<NamedPatternItem>>]>,
 	},
 }
 
@@ -1806,28 +1836,17 @@ pub enum Item {
 		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
-	/// `struct Point { x: i32, y: i32 }`
-	RecordStruct {
+	/// `struct Point(x: i32, y: i32);`, `struct Pair(i32, i32);` — one form
+	/// for every struct. A field's name is optional, field by field, like its
+	/// `pub`; a struct is constructed by a call, by position always and by
+	/// name when every field has one.
+	Struct {
 		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		type_params: Box<[TypeParam]>,
 		fields: Box<[Separated<Spanned<StructField>>]>,
-	},
-	/// `struct Point(i32, i32);` — positional fields, no names. A genuinely
-	/// different item from [`Item::RecordStruct`] rather than an alternate
-	/// field-list shape on the same variant: the two have different
-	/// construction syntax (`Point(1, 2)` vs. `Point::{ x: 1, y: 2 }`) and
-	/// destructuring syntax (see [`Pattern::TupleStruct`]), and a tuple
-	/// field has no name to carry at all.
-	TupleStruct {
-		id: DefId,
-		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
-		name: Spanned<SymbolU32>,
-		type_params: Box<[TypeParam]>,
-		fields: Box<[Separated<Spanned<TupleField>>]>,
 	},
 	Memory {
 		id: DefId,
@@ -1905,16 +1924,8 @@ pub enum Item {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct StructField {
 	pub pub_span: Option<TextSpan>,
-	pub name: Spanned<SymbolU32>,
-	pub ty: Box<Spanned<TypeExpression>>,
-}
-
-/// One element of a [`Item::TupleStruct`]'s field list — `StructField` minus
-/// the name, since a tuple field has none.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct TupleField {
-	pub pub_span: Option<TextSpan>,
+	/// `None` for a positional field: `struct Pair(i32, i32);`.
+	pub name: Option<Spanned<SymbolU32>>,
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
@@ -1927,7 +1938,6 @@ impl Item {
 			| Item::Enum { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. }
-			| Item::RecordStruct { .. }
 			| Item::Module { .. }
 			| Item::Trait { .. }
 			| Item::TypeSet { .. } => true,
@@ -1938,7 +1948,7 @@ impl Item {
 			| Item::FunctionDeclaration { .. }
 			| Item::ModuleDeclaration { .. }
 			| Item::TypeAlias { .. }
-			| Item::TupleStruct { .. }
+			| Item::Struct { .. }
 			| Item::Use { .. } => false,
 		}
 	}
@@ -1956,8 +1966,7 @@ impl Item {
 			| Item::Enum { attributes, .. }
 			| Item::TypeAlias { attributes, .. }
 			| Item::Memory { attributes, .. }
-			| Item::RecordStruct { attributes, .. }
-			| Item::TupleStruct { attributes, .. } => {
+			| Item::Struct { attributes, .. } => {
 				*attributes = attrs;
 			}
 			Item::Export { .. }
@@ -2130,6 +2139,7 @@ define_keywords! {
 	Where => "where",
 	Crate => "crate",
 	Super => "super",
+	Block => "block",
 }
 
 impl Keyword {
@@ -2165,6 +2175,16 @@ impl<T> SeparatedGroup<T> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Box<[Separated<Spanned<T>>]>>, ()> {
 		let open_span = parser.next_expect(self.open_token)?.span;
+		self.parse_after_open(parser, open_span)
+	}
+
+	/// `parse`, for a caller that consumed the opening token itself to look
+	/// past it.
+	fn parse_after_open(
+		self,
+		parser: &mut Parser,
+		open_span: TextSpan,
+	) -> Result<Spanned<Box<[Separated<Spanned<T>>]>>, ()> {
 		let mut items: Vec<Separated<Spanned<T>>> = Vec::new();
 
 		let close_span = loop {
@@ -3072,67 +3092,22 @@ impl<'ctx> Parser<'ctx> {
 						(tok, sym)
 					}
 				};
-				let first_span = first_tok.span;
-
-				// Every segment — including this first one — may carry bare
-				// `<...>` generic arguments (`Type<T>`, `module::Wrapper<T>`);
-				// `::` continues to another segment regardless of whether the
-				// one just parsed had args (`Vec<T>::Item` is a plain `Path`,
-				// no bracket needed), and `::` followed by neither an
-				// identifier nor `*`/`&` is a memory-tagged type (`heap::*T`).
-				let mut ident = Spanned {
+				self.parse_type_path_from(Spanned {
 					inner: first_sym,
-					span: first_span,
-				};
-				let mut segments: Vec<PathSegment> = Vec::new();
-				let path_end = loop {
-					let mut type_args: Box<[Spanned<TypeExpression>]> =
-						Box::new([]);
-					let mut end = ident.span.end;
-					if self.lexer.peek().inner == Token::LeftArrow {
-						let (args, close_span) = self.parse_type_args()?;
-						type_args = args;
-						end = close_span.end;
-					}
-					segments.push(PathSegment { ident, type_args });
-					if self.lexer.peek().inner != Token::ColonColon {
-						break end;
-					}
-					self.lexer.next(); // consume `::`
-					match self.lexer.peek().inner {
-						Token::Identifier => {
-							ident = self.parse_path_ident()?;
-						}
-						Token::Star | Token::Amper => {
-							// `::` consumed, followed by a pointer/slice/
-							// array sigil — a memory-tagged type
-							// (`heap::*u8`), tagged with the path built up
-							// so far.
-							return self.parse_pointer_type_expression(Some(
-								segments.into_boxed_slice(),
-							));
-						}
-						_ => {
-							let token = self.lexer.next();
-							self.ast.diagnostics.push(
-								report_expected_path_segment_or_memory_tag(
-									self.ast.file_id,
-									token,
-								),
-							);
-							return Err(());
-						}
-					}
-				};
-
-				let path_span = TextSpan::new(first_span.start, path_end);
-				Ok(Spanned {
-					inner: TypeExpression::Path(segments.into_boxed_slice()),
-					span: path_span,
+					span: first_tok.span,
 				})
 			}
 			Token::OpenParen => self.parse_tuple_or_paren_type_expression(),
-			Token::LeftArrow => self.parse_qualified_path_type_expression(),
+			Token::LeftArrow => {
+				let open_span = self.lexer.next().span; // consume `<`
+				self.parse_qualified_path_type_expression(open_span)
+			}
+			// `<<A as B>::C as D>::E`: the lexer sees one `<<`, but here it is
+			// two openings, so split it and parse the outer one first.
+			Token::DoubleLeftArrow => {
+				let open_span = self.lexer.split_double_left_arrow();
+				self.parse_qualified_path_type_expression(open_span)
+			}
 			_ => {
 				let token = self.lexer.next();
 				self.ast.diagnostics.push(report_unexpected_token(
@@ -3145,14 +3120,70 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
+	/// The rest of a type that starts with a path, its first identifier already
+	/// consumed: a plain path, or a memory-tagged pointer type (`heap::*T`).
+	/// Every segment, including the first, may carry bare `<...>` generic
+	/// arguments (`Type<T>`, `module::Wrapper<T>`); `::` continues to another
+	/// segment regardless of whether the one just parsed had arguments
+	/// (`Vec<T>::Item` is a plain path, no bracket needed).
+	fn parse_type_path_from(
+		&mut self,
+		first: Spanned<SymbolU32>,
+	) -> Result<Spanned<TypeExpression>, ()> {
+		let mut ident = first;
+		let mut segments: Vec<PathSegment> = Vec::new();
+		let path_end = loop {
+			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
+			let mut end = ident.span.end;
+			if self.lexer.peek().inner == Token::LeftArrow {
+				let (args, close_span) = self.parse_type_args()?;
+				type_args = args;
+				end = close_span.end;
+			}
+			segments.push(PathSegment { ident, type_args });
+			if self.lexer.peek().inner != Token::ColonColon {
+				break end;
+			}
+			self.lexer.next(); // consume `::`
+			match self.lexer.peek().inner {
+				Token::Identifier => {
+					ident = self.parse_path_ident()?;
+				}
+				Token::Star | Token::Amper => {
+					// `::` consumed, followed by a pointer/slice/array sigil —
+					// a memory-tagged type (`heap::*u8`), tagged with the path
+					// built up so far.
+					return self.parse_pointer_type_expression(Some(
+						segments.into_boxed_slice(),
+					));
+				}
+				_ => {
+					let token = self.lexer.next();
+					self.ast.diagnostics.push(
+						report_expected_path_segment_or_memory_tag(
+							self.ast.file_id,
+							token,
+						),
+					);
+					return Err(());
+				}
+			}
+		};
+
+		Ok(Spanned {
+			inner: TypeExpression::Path(segments.into_boxed_slice()),
+			span: TextSpan::new(first.span.start, path_end),
+		})
+	}
+
 	/// Parse `<Type as Trait>::Item` (a trait-qualified path) or `<Type>::Item`
-	/// (a bare bracketed self-type, no trait) — the opening `<` is not yet
-	/// consumed. Which one this becomes hinges entirely on whether `as`
-	/// follows `self_type`.
+	/// (a bare bracketed self-type, no trait) — the opening `<` (whose span is
+	/// `open_span`) has already been consumed. Which one this becomes hinges
+	/// entirely on whether `as` follows `self_type`.
 	fn parse_qualified_path_type_expression(
 		&mut self,
+		open_span: TextSpan,
 	) -> Result<Spanned<TypeExpression>, ()> {
-		let open_span = self.lexer.next().span; // consume `<`
 		let self_type = self.parse_type_expression()?;
 		if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
@@ -3428,6 +3459,10 @@ impl<'ctx> Parser<'ctx> {
 						Parser::parse_placeholder_expression,
 						BindingPower::Primary,
 					)),
+					Ok(Keyword::Block) => Some((
+						Parser::parse_keyword_block_expression,
+						BindingPower::Primary,
+					)),
 					_ => Some((
 						Parser::parse_path_expression,
 						BindingPower::Primary,
@@ -3440,9 +3475,10 @@ impl<'ctx> Parser<'ctx> {
 			Token::Float => {
 				Some((Parser::parse_float_expression, BindingPower::Primary))
 			}
-			Token::OpenBrace => {
-				Some((Parser::parse_block_expression, BindingPower::Primary))
-			}
+			Token::OpenBrace => Some((
+				Parser::parse_bare_block_expression,
+				BindingPower::Primary,
+			)),
 			Token::OpenParen => {
 				Some((Parser::parse_tuple_expression, BindingPower::Default))
 			}
@@ -3675,12 +3711,11 @@ impl<'ctx> Parser<'ctx> {
 				Token::LeftArrow => {
 					let (type_args, _close) = parser.parse_type_args()?;
 					segments.last_mut().unwrap().type_args = type_args;
-					// Loop continues: next `::` starts a new segment or `::{ }`
-					// triggers struct init.
+					// Loop continues: next `::` starts a new segment.
 				}
-				// `::{ ... }` — struct init body
+				// `::{ ... }` — the old struct literal
 				Token::OpenBrace => {
-					return Parser::parse_struct_init_expression(
+					return Parser::parse_struct_literal_as_call(
 						parser,
 						segments.into(),
 					);
@@ -3718,56 +3753,115 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_struct_init_expression(
+	/// A named list and the `)` after it, the `(` consumed. The list is the
+	/// call's only argument: anything else before `)` is reported, and read
+	/// for recovery. Returns the arguments and where the call ends.
+	fn parse_named_call_arguments(
 		parser: &mut Parser,
-		path: Box<[PathSegment]>,
+	) -> Result<(Box<[Separated<Spanned<NamedArgument>>]>, u32), ()> {
+		let named = Parser::parse_named_arguments(parser)?;
+		if parser.lexer.peek().inner != Token::CloseParen {
+			let at = parser.lexer.peek().span;
+			parser
+				.ast
+				.diagnostics
+				.push(report_mixed_call_arguments(parser.ast.file_id, at));
+			while parser.lexer.next_if(Token::Comma).is_some()
+				&& parser.lexer.peek().inner != Token::CloseParen
+			{
+				parser.parse_expression(BindingPower::Default)?;
+			}
+		}
+		let close_span = parser.next_expect(Token::CloseParen)?.span;
+		Ok((named.inner, close_span.end))
+	}
+
+	/// One positional argument. A named list here follows other arguments,
+	/// which is a mix: reported, and read so the call still parses.
+	fn parse_positional_argument(
+		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
-		let path_start = path.first().unwrap().ident.span.start;
-		let fields = SeparatedGroup {
+		if parser.lexer.peek().inner != Token::OpenBrace {
+			return parser.parse_expression(BindingPower::Default);
+		}
+		let named = Parser::parse_named_arguments(parser)?;
+		parser
+			.ast
+			.diagnostics
+			.push(report_mixed_call_arguments(parser.ast.file_id, named.span));
+		Ok(Spanned {
+			inner: Expression::Error,
+			span: named.span,
+		})
+	}
+
+	/// `{ name: expr, name, .. }`, braces included.
+	fn parse_named_arguments(
+		parser: &mut Parser,
+	) -> Result<Spanned<Box<[Separated<Spanned<NamedArgument>>]>>, ()> {
+		SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<StructInitField>, ()> {
-					let name_token = parser.next_expect(Token::Identifier)?;
-					let name_symbol = parser.intern_identifier(name_token.span);
-
-					let (value, span) =
-						if parser.lexer.next_if(Token::Colon).is_some() {
-							let expr = parser
-								.parse_expression(BindingPower::Default)?;
-							let span = TextSpan::new(
-								name_token.span.start,
-								expr.span.end,
-							);
-							(Some(Box::new(expr)), span)
-						} else {
-							// Shorthand: `{ field }` — value is the local with the same name
-							(None, name_token.span)
-						};
-
-					Ok(Spanned {
-						inner: StructInitField {
-							name: Spanned {
-								inner: name_symbol,
-								span: name_token.span,
-							},
-							value,
-						},
-						span,
-					})
-				},
+			item_handler: Parser::parse_named_argument,
 			should_warn_missing_separator: None,
 		}
-		.parse(parser)?;
+		.parse(parser)
+	}
 
-		let span = TextSpan::new(path_start, fields.span.end);
+	/// `name: expr`, or the shorthand `name` for `name: name`.
+	fn parse_named_argument(
+		parser: &mut Parser,
+	) -> Result<Spanned<NamedArgument>, ()> {
+		let name_token = parser.next_expect(Token::Identifier)?;
+		let name = Spanned {
+			inner: parser.intern_identifier(name_token.span),
+			span: name_token.span,
+		};
+		let (value, span) = if parser.lexer.next_if(Token::Colon).is_some() {
+			let value = parser.parse_expression(BindingPower::Default)?;
+			let span = TextSpan::new(name_token.span.start, value.span.end);
+			(Some(Box::new(value)), span)
+		} else {
+			(None, name_token.span)
+		};
 		Ok(Spanned {
-			inner: Expression::StructInit {
-				path,
-				fields: fields.inner,
-			},
+			inner: NamedArgument { name, value },
 			span,
+		})
+	}
+
+	/// `Path::{ ... }`, the old struct literal, with `::` consumed and `{`
+	/// next. A struct is constructed by a call now: reported, and read as the
+	/// named call `Path({ ... })` it stands for.
+	fn parse_struct_literal_as_call(
+		parser: &mut Parser,
+		path: Box<[PathSegment]>,
+	) -> Result<Spanned<Expression>, ()> {
+		let path_span = TextSpan::new(
+			path.first().unwrap().ident.span.start,
+			path.last().unwrap().ident.span.end,
+		);
+		let named = Parser::parse_named_arguments(parser)?;
+		parser.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::StructLiteralIsACall.code())
+				.with_message("a struct is constructed by a call")
+				.with_label(Label::primary(
+					parser.ast.file_id,
+					TextSpan::new(path_span.start, named.span.end),
+				))
+				.with_note("write `Name({ field: value, ... })`"),
+		);
+		Ok(Spanned {
+			span: TextSpan::new(path_span.start, named.span.end),
+			inner: Expression::NamedCall {
+				callee: Box::new(Spanned {
+					inner: Expression::Path(path),
+					span: path_span,
+				}),
+				arguments: named.inner,
+			},
 		})
 	}
 
@@ -4226,6 +4320,39 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
+	/// `block { ... }`: a plain block in expression position. Blocks that
+	/// belong to a construct (`if`, `loop`, a match arm, a function body) are
+	/// parsed by it directly and need no keyword.
+	fn parse_keyword_block_expression(
+		parser: &mut Parser,
+	) -> Result<Spanned<Expression>, ()> {
+		let keyword_span = parser.lexer.next().span;
+		let block = Parser::parse_block_expression(parser)?;
+		Ok(Spanned {
+			span: TextSpan::new(keyword_span.start, block.span.end),
+			inner: block.inner,
+		})
+	}
+
+	/// `{ ... }` where an expression starts: the plain block without its
+	/// keyword. `{` is reserved for named arguments in a call, so this is
+	/// reported, and read as the block it was meant to be.
+	fn parse_bare_block_expression(
+		parser: &mut Parser,
+	) -> Result<Spanned<Expression>, ()> {
+		let brace_span = parser.lexer.peek().span;
+		parser.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::BlockNeedsKeyword.code())
+				.with_message("a block expression is written `block { ... }`")
+				.with_label(
+					Label::primary(parser.ast.file_id, brace_span)
+						.with_message("expected `block` before `{`"),
+				),
+		);
+		Parser::parse_block_expression(parser)
+	}
+
 	fn parse_block_expression(
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
@@ -4399,63 +4526,96 @@ impl<'ctx> Parser<'ctx> {
 		Err(())
 	}
 
+	/// `callee(a, b)` or `callee({ x: a, y })`, decided on the token after
+	/// `(`: `{` opens a named list (a plain block is spelled `block { }`, so
+	/// nothing else starts with `{` here), anything else a positional one.
+	/// A callee that names a method on an object makes it a method call.
 	fn parse_call_expression(
 		parser: &mut Parser,
 		callee: Spanned<Expression>,
 		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
+		let start = callee.span.start;
+		let open_span = parser.next_expect(Token::OpenParen)?.span;
+		if parser.lexer.peek().inner == Token::OpenBrace {
+			let (arguments, end) = Parser::parse_named_call_arguments(parser)?;
+			let inner = match Parser::method_callee(callee) {
+				Ok((object, method, type_args)) => {
+					Expression::NamedMethodCall(Box::new(MethodCallExpr {
+						object,
+						method,
+						type_args,
+						arguments,
+					}))
+				}
+				Err(callee) => Expression::NamedCall {
+					callee: Box::new(callee),
+					arguments,
+				},
+			};
+			return Ok(Spanned {
+				inner,
+				span: TextSpan::new(start, end),
+			});
+		}
 		let arguments = SeparatedGroup {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
-			item_handler: |parser| {
-				parser.parse_expression(BindingPower::Default)
-			},
+			item_handler: Parser::parse_positional_argument,
 			should_warn_missing_separator: None,
 		}
-		.parse(parser)?;
-
-		let span = TextSpan::new(callee.span.start, arguments.span.end);
-		let callee_span = callee.span;
-		match callee.inner {
-			Expression::ObjectAccess { object, member } => Ok(Spanned {
-				inner: Expression::MethodCall(Box::new(MethodCallExpr {
+		.parse_after_open(parser, open_span)?;
+		let inner = match Parser::method_callee(callee) {
+			Ok((object, method, type_args)) => {
+				Expression::MethodCall(Box::new(MethodCallExpr {
 					object,
-					method: member,
-					type_args: Box::new([]),
+					method,
+					type_args,
 					arguments: arguments.inner,
-				})),
-				span,
-			}),
+				}))
+			}
+			Err(callee) => Expression::Call {
+				callee: Box::new(callee),
+				arguments: arguments.inner,
+			},
+		};
+		Ok(Spanned {
+			inner,
+			span: TextSpan::new(start, arguments.span.end),
+		})
+	}
+
+	/// The object, method and type arguments of a callee that names a method
+	/// (`object.method`, `object.method::<T>`); any other callee back as is.
+	#[allow(clippy::type_complexity)]
+	fn method_callee(
+		callee: Spanned<Expression>,
+	) -> Result<
+		(
+			Box<Spanned<Expression>>,
+			Spanned<SymbolU32>,
+			Box<[Spanned<TypeExpression>]>,
+		),
+		Spanned<Expression>,
+	> {
+		match callee.inner {
+			Expression::ObjectAccess { object, member } => {
+				Ok((object, member, Box::new([])))
+			}
 			Expression::TypeApplication {
 				callee: inner,
 				args,
 			} if matches!(inner.inner, Expression::ObjectAccess { .. }) => {
-				let (object, member) = match inner.inner {
-					Expression::ObjectAccess { object, member } => {
-						(object, member)
-					}
-					_ => unreachable!(),
+				let Expression::ObjectAccess { object, member } = inner.inner
+				else {
+					unreachable!()
 				};
-				Ok(Spanned {
-					inner: Expression::MethodCall(Box::new(MethodCallExpr {
-						object,
-						method: member,
-						type_args: args,
-						arguments: arguments.inner,
-					})),
-					span,
-				})
+				Ok((object, member, args))
 			}
-			other => Ok(Spanned {
-				inner: Expression::Call {
-					callee: Box::new(Spanned {
-						inner: other,
-						span: callee_span,
-					}),
-					arguments: arguments.inner,
-				},
-				span,
+			inner => Err(Spanned {
+				inner,
+				span: callee.span,
 			}),
 		}
 	}
@@ -4576,88 +4736,111 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_struct_pattern_item(
+	fn parse_named_pattern_item(
 		parser: &mut Parser,
-	) -> Result<Spanned<StructPatternItem>, ()> {
+	) -> Result<Spanned<NamedPatternItem>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: StructPatternItem::Rest,
+				inner: NamedPatternItem::Rest,
 				span: dot_dot.span,
 			});
 		}
 		let field = Parser::parse_pattern_field(parser)?;
 		Ok(Spanned {
-			inner: StructPatternItem::Field(field.inner),
+			inner: NamedPatternItem::Field(field.inner),
 			span: field.span,
 		})
 	}
 
-	/// Parses the `::{ ... }` body of a struct pattern, with `path` already
-	/// consumed. Hands the raw parsed sequence straight to `Pattern::Struct`
-	/// — see [`StructPatternItem`] for why this doesn't collapse it into
-	/// separate fields/rest here.
-	fn parse_struct_pattern(
+	fn parse_positional_pattern_item(
 		parser: &mut Parser,
-		path: Box<[PathSegment]>,
-	) -> Result<Spanned<Pattern>, ()> {
-		let path_start = path.first().unwrap().ident.span.start;
-		let items = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			should_warn_missing_separator: None,
-			item_handler: Parser::parse_struct_pattern_item,
-		}
-		.parse(parser)?;
-
-		let span = TextSpan::new(path_start, items.span.end);
-		Ok(Spanned {
-			inner: Pattern::Struct {
-				path,
-				items: items.inner,
-			},
-			span,
-		})
-	}
-
-	fn parse_tuple_struct_pattern_item(
-		parser: &mut Parser,
-	) -> Result<Spanned<TupleStructPatternItem>, ()> {
+	) -> Result<Spanned<PositionalPatternItem>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: TupleStructPatternItem::Rest,
+				inner: PositionalPatternItem::Rest,
 				span: dot_dot.span,
 			});
 		}
 		let pattern = Parser::parse_pattern(parser)?;
 		Ok(Spanned {
-			inner: TupleStructPatternItem::Element(pattern.inner),
+			inner: PositionalPatternItem::Element(pattern.inner),
 			span: pattern.span,
 		})
 	}
 
-	/// Parses the `(...)` body of a tuple-struct pattern, with `path` already
-	/// consumed — the positional analogue of `parse_struct_pattern`, same
-	/// "hand TIR the raw sequence" rationale.
-	fn parse_tuple_struct_pattern(
+	/// `{ field, other: pat, .. }`, braces included. The items are handed to
+	/// TIR as parsed; see [`NamedPatternItem`].
+	fn parse_named_pattern_items(
+		parser: &mut Parser,
+	) -> Result<Spanned<Box<[Separated<Spanned<NamedPatternItem>>]>>, ()> {
+		SeparatedGroup {
+			open_token: Token::OpenBrace,
+			close_token: Token::CloseBrace,
+			separator_token: Token::Comma,
+			should_warn_missing_separator: None,
+			item_handler: Parser::parse_named_pattern_item,
+		}
+		.parse(parser)
+	}
+
+	/// `Path(pat, ..)` or `Path({ field, .. })`, with `path` consumed and `(`
+	/// next — decided on the token after `(`, exactly as a call's arguments.
+	fn parse_struct_pattern(
 		parser: &mut Parser,
 		path: Box<[PathSegment]>,
 	) -> Result<Spanned<Pattern>, ()> {
 		let path_start = path.first().unwrap().ident.span.start;
-		let items = SeparatedGroup {
+		let open_span = parser.next_expect(Token::OpenParen)?.span;
+		if parser.lexer.peek().inner == Token::OpenBrace {
+			let fields = Parser::parse_named_pattern_items(parser)?;
+			let close_span = parser.next_expect(Token::CloseParen)?.span;
+			return Ok(Spanned {
+				inner: Pattern::NamedStruct {
+					path,
+					fields: fields.inner,
+				},
+				span: TextSpan::new(path_start, close_span.end),
+			});
+		}
+		let elements = SeparatedGroup {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
 			should_warn_missing_separator: None,
-			item_handler: Parser::parse_tuple_struct_pattern_item,
+			item_handler: Parser::parse_positional_pattern_item,
 		}
-		.parse(parser)?;
-
-		let span = TextSpan::new(path_start, items.span.end);
+		.parse_after_open(parser, open_span)?;
 		Ok(Spanned {
-			inner: Pattern::TupleStruct {
+			inner: Pattern::Struct {
 				path,
-				elements: items.inner,
+				elements: elements.inner,
+			},
+			span: TextSpan::new(path_start, elements.span.end),
+		})
+	}
+
+	/// `Path::{ ... }`, the old named pattern, with `::` consumed and `{`
+	/// next: reported, and read as `Path({ ... })`.
+	fn parse_old_struct_pattern(
+		parser: &mut Parser,
+		path: Box<[PathSegment]>,
+	) -> Result<Spanned<Pattern>, ()> {
+		let path_start = path.first().unwrap().ident.span.start;
+		let named = Parser::parse_named_pattern_items(parser)?;
+		let span = TextSpan::new(path_start, named.span.end);
+		parser.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::StructLiteralIsACall.code())
+				.with_message(
+					"a struct pattern is written like its construction",
+				)
+				.with_label(Label::primary(parser.ast.file_id, span))
+				.with_note("write `Name({ field, .. })` or `Name(a, b)`"),
+		);
+		Ok(Spanned {
+			inner: Pattern::NamedStruct {
+				path,
+				fields: named.inner,
 			},
 			span,
 		})
@@ -4709,8 +4892,7 @@ impl<'ctx> Parser<'ctx> {
 					});
 				}
 				// A bare identifier is a binding, but it may also open a path
-				// leading to `::{ ... }` — the same shape
-				// `parse_path_expression` walks to reach `StructInit`.
+				// leading to a struct pattern `Path(...)`.
 				let name_token = parser.lexer.next();
 				let name = Spanned {
 					inner: parser.intern_identifier(name_token.span),
@@ -4730,9 +4912,9 @@ impl<'ctx> Parser<'ctx> {
 								parser.parse_type_args()?;
 							segments.last_mut().unwrap().type_args = type_args;
 						}
-						// `::{ ... }` — struct pattern body
+						// `::{ ... }` — the old named pattern
 						Token::OpenBrace => {
-							return Parser::parse_struct_pattern(
+							return Parser::parse_old_struct_pattern(
 								parser,
 								segments.into(),
 							);
@@ -4762,12 +4944,11 @@ impl<'ctx> Parser<'ctx> {
 					}
 				}
 
-				// `Path(...)` — tuple-struct pattern body. Checked before the
-				// "must be a plain binding" fallback below, same as `::{`
-				// is checked inside the loop, since a multi-segment path is
+				// `Path(...)` — a struct pattern. Checked before the "must be a
+				// plain binding" fallback below, since a multi-segment path is
 				// legal here too (`module::Point(x, y)`).
 				if parser.lexer.peek().inner == Token::OpenParen {
-					return Parser::parse_tuple_struct_pattern(
+					return Parser::parse_struct_pattern(
 						parser,
 						segments.into(),
 					);
@@ -4782,10 +4963,12 @@ impl<'ctx> Parser<'ctx> {
 					);
 					parser.ast.diagnostics.push(
 						Diagnostic::error()
-							.with_code(DiagnosticCode::InvalidBindingPattern.code())
+							.with_code(
+								DiagnosticCode::InvalidBindingPattern.code(),
+							)
 							.with_message("invalid pattern")
 							.with_note(
-								"a path may only appear in a pattern as a struct pattern, `Path::{ ... }`",
+								"a path may only appear in a pattern as a struct pattern, `Path(...)`",
 							)
 							.with_label(
 								Label::primary(parser.ast.file_id, span)
@@ -5594,84 +5777,43 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		};
 
-		if parser.lexer.peek().inner == Token::OpenParen {
-			let fields = SeparatedGroup {
-				open_token: Token::OpenParen,
-				close_token: Token::CloseParen,
-				separator_token: Token::Comma,
-				item_handler:
-					|parser: &mut Parser| -> Result<Spanned<TupleField>, ()> {
-						let pub_span =
-							Parser::parse_struct_field_pub_span(parser);
-						let ty = parser.parse_type_expression()?;
-						let span = TextSpan::new(
-							pub_span.unwrap_or(ty.span).start,
-							ty.span.end,
-						);
-						Ok(Spanned {
-							inner: TupleField {
-								pub_span,
-								ty: Box::new(ty),
-							},
-							span,
-						})
-					},
-				should_warn_missing_separator: None,
-			}
-			.parse(parser)?;
-
-			let span = TextSpan::new(struct_span.start, fields.span.end);
-			return Ok(Spanned {
-				inner: Item::TupleStruct {
-					id: parser.id_generator.next_id(),
-					pub_span: None,
-					attributes: Box::new([]),
-					name,
-					type_params,
-					fields: fields.inner,
-				},
-				span,
-			});
-		}
-
+		// Fields are written in parentheses. A braced list is the old record
+		// form: reported, and read the same way so the rest still parses.
+		let open_token = if parser.lexer.peek().inner == Token::OpenBrace {
+			let brace = parser.lexer.peek();
+			parser.ast.diagnostics.push(
+				Diagnostic::error()
+					.with_code(
+						DiagnosticCode::StructFieldsNeedParentheses.code(),
+					)
+					.with_message("struct fields are written in parentheses")
+					.with_label(
+						Label::primary(parser.ast.file_id, brace.span)
+							.with_message("expected `(`"),
+					)
+					.with_note("write `struct Name(field: Type, ...);`"),
+			);
+			Token::OpenBrace
+		} else {
+			Token::OpenParen
+		};
+		let close_token = if open_token == Token::OpenBrace {
+			Token::CloseBrace
+		} else {
+			Token::CloseParen
+		};
 		let fields = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
+			open_token,
+			close_token,
 			separator_token: Token::Comma,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<StructField>, ()> {
-					let pub_span = Parser::parse_struct_field_pub_span(parser);
-
-					let name_token = parser.next_expect(Token::Identifier)?;
-					let name_symbol = parser.intern_identifier(name_token.span);
-
-					parser.next_expect(Token::Colon)?;
-
-					let ty = parser.parse_type_expression()?;
-					let span = TextSpan::new(
-						pub_span.unwrap_or(name_token.span).start,
-						ty.span.end,
-					);
-
-					Ok(Spanned {
-						inner: StructField {
-							pub_span,
-							name: Spanned {
-								inner: name_symbol,
-								span: name_token.span,
-							},
-							ty: Box::new(ty),
-						},
-						span,
-					})
-				},
+			item_handler: Parser::parse_struct_field,
 			should_warn_missing_separator: None,
 		}
 		.parse(parser)?;
 
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
-			inner: Item::RecordStruct {
+			inner: Item::Struct {
 				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
@@ -5680,6 +5822,45 @@ impl<'ctx> Parser<'ctx> {
 				fields: fields.inner,
 			},
 			span,
+		})
+	}
+
+	/// `[pub] [name:] Type`, decided on one token: a type that starts with a
+	/// keyword (`fn`, `_`, `Self`, ...) is never a name, and a plain identifier
+	/// is a name exactly when `:` follows it; otherwise it was the first
+	/// segment of the field's type, which is parsed on from there.
+	fn parse_struct_field(
+		parser: &mut Parser,
+	) -> Result<Spanned<StructField>, ()> {
+		let pub_span = Parser::parse_struct_field_pub_span(parser);
+		let peek = parser.lexer.peek();
+		let plain_identifier = peek.inner == Token::Identifier
+			&& Keyword::try_from(peek.span.extract_str(parser.source)).is_err();
+		let (name, ty) = if plain_identifier {
+			let token = parser.lexer.next();
+			let ident = Spanned {
+				inner: parser.intern_identifier(token.span),
+				span: token.span,
+			};
+			if parser.lexer.next_if(Token::Colon).is_some() {
+				(Some(ident), parser.parse_type_expression()?)
+			} else {
+				(None, parser.parse_type_path_from(ident)?)
+			}
+		} else {
+			(None, parser.parse_type_expression()?)
+		};
+		let start = pub_span
+			.or(name.map(|name| name.span))
+			.unwrap_or(ty.span)
+			.start;
+		Ok(Spanned {
+			span: TextSpan::new(start, ty.span.end),
+			inner: StructField {
+				pub_span,
+				name,
+				ty: Box::new(ty),
+			},
 		})
 	}
 
@@ -5751,8 +5932,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::FunctionDeclaration { pub_span: span, .. }
 			| Item::Global { pub_span: span, .. }
 			| Item::Enum { pub_span: span, .. }
-			| Item::RecordStruct { pub_span: span, .. }
-			| Item::TupleStruct { pub_span: span, .. }
+			| Item::Struct { pub_span: span, .. }
 			| Item::Const { pub_span: span, .. }
 			| Item::Module { pub_span: span, .. }
 			| Item::ModuleDeclaration { pub_span: span, .. }

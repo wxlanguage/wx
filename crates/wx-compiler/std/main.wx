@@ -172,7 +172,7 @@ impl Ordering {
         match self {
             Ordering::Less -> { Ordering::Greater },
             Ordering::Equal -> { Ordering::Equal },
-            Ordering::Greater -> { Ordering::Less },
+            Ordering::Greater -> { Ordering::Less }
         }
     }
 
@@ -180,7 +180,7 @@ impl Ordering {
     pub fn then(self, other: Ordering) -> Ordering {
         match self {
             Ordering::Equal -> { other },
-            _ -> { self },
+            _ -> { self }
         }
     }
 }
@@ -2195,20 +2195,20 @@ pub fn size_of<T, Mem: Memory>() -> Mem::Size;
 #[intrinsic]
 pub fn align_of<T, Mem: Memory>() -> Mem::Size;
 
-pub struct Layout<Mem: Memory> {
+pub struct Layout<Mem: Memory>(
     size: Mem::Size,
     align: Mem::Size,
-}
+);
 
 impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub fn of<T>() -> Self {
-        Self::{ size: size_of::<T>(), align: align_of::<T>() }
+        Self({ size: size_of::<T>(), align: align_of::<T>() })
     }
 
     #[inline]
     pub fn array<T>(count: Mem::Size) -> Self {
-        Self::{ align: align_of::<T>(), size: size_of::<T>() * count }
+        Self({ align: align_of::<T>(), size: size_of::<T>() * count })
     }
 
     #[inline]
@@ -2243,9 +2243,9 @@ pub trait Allocator {
     }
 }
 
-pub struct RawPtr<Mem: Memory, T> {
+pub struct RawPtr<Mem: Memory, T>(
     addr: Mem::Size,
-}
+);
 
 impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
@@ -2255,22 +2255,22 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub fn null() -> Self {
-        Self::{ addr: 0 }
+        Self({ addr: 0 })
     }
 
     #[inline]
     pub fn from_ref(ref: Mem::&T) -> Self {
-        Self::{ addr: ref as _ }
+        Self({ addr: ref as _ })
     }
 
     #[inline]
     pub fn from_ptr(ptr: Mem::*T) -> Self {
-        Self::{ addr: ptr as _ }
+        Self({ addr: ptr as _ })
     }
 
     #[inline]
     pub fn from_addr(addr: Mem::Size) -> Self {
-        Self::{ addr }
+        Self({ addr })
     }
 
     #[inline]
@@ -2290,21 +2290,21 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub fn cast<U>(self) -> RawPtr<Mem, U> {
-        RawPtr::{ addr: self.addr } as _
+        RawPtr({ addr: self.addr }) as _
     }
 }
 
 impl<Mem: Memory where { Size: Sub }, T> RawPtr<Mem, T> {
     #[inline]
     pub fn sub(self, count: Mem::Size) -> Self {
-        Self::{ addr: self.addr - count * size_of::<T, Mem>() }
+        Self({ addr: self.addr - count * size_of::<T, Mem>() })
     }
 }
 
 impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
     #[inline]
     pub fn add(self, count: Mem::Size) -> Self {
-        Self::{ addr: self.addr + count * size_of::<T, Mem>() }
+        Self({ addr: self.addr + count * size_of::<T, Mem>() })
     }
 }
 
@@ -2313,7 +2313,7 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
     /// **`align` must be a power of two.**
     #[inline]
     pub fn align_up(self, align: Mem::Size) -> Self {
-        Self::{ addr: (self.addr + align - 1) & ^(align - 1) }
+        Self({ addr: (self.addr + align - 1) & ^(align - 1) })
     }
 }
 

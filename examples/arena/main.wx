@@ -1,32 +1,32 @@
 use std::*;
 
-struct Arena<Mem: Memory> {
+struct Arena<Mem: Memory>(
     start: Mem::&u8,
     end: Mem::&u8,
     cursor: Mem::&u8,
-}
+);
 
 impl<Mem: Memory> Arena<Mem> {
     fn new(buffer: Mem::&[u8]) -> Self {
-        Self::{
+        Self({
             start: buffer.ptr(),
             end: ptr::add(buffer.ptr(), buffer.len()),
             cursor: buffer.ptr(),
-        }
+        })
     }
 }
 
 memory heap: Memory where { Size = u32 };
 
-struct Range<Idx> {
+struct Range<Idx>(
     start: Idx,
     end: Idx,
-}
+);
 
-struct RangeIter<Idx> {
+struct RangeIter<Idx>(
     start: Idx,
     end: Idx,
-}
+);
 
 enum Option: u8 {
     None = 0,
@@ -53,7 +53,7 @@ impl<Idx> IntoIterator for Range<Idx> {
     type IntoIter = RangeIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        RangeIter::{ start: self.start, end: self.end }
+        RangeIter({ start: self.start, end: self.end })
     }
 }
 
@@ -86,13 +86,13 @@ trait IntoIterator {
     fn into_iter(self) -> Self::IntoIter;
 }
 
-struct BumpAllocator {
+struct BumpAllocator(
     next: RawPtr<heap, u8>,
-}
+);
 
 impl BumpAllocator {
     pub fn from_addr(start: u32) -> Self {
-        Self::{ next: RawPtr::from_addr(start) }
+        Self({ next: RawPtr::from_addr(start) })
     }
 }
 
@@ -107,7 +107,7 @@ impl Allocator for BumpAllocator {
 }
 
 fn test() {
-    local range: Range<u32> = Range::{ start: 0, end: 10 };
+    local range: Range<u32> = Range({ start: 0, end: 10 });
     local range_iter = range.into_iter();
     loop {
         local x = range_iter.next();

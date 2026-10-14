@@ -13,18 +13,22 @@
 // mod tests;
 
 mod assumptions;
+mod body;
 mod bounds;
 mod defs;
+mod eval;
 mod format;
 mod impls;
 mod imports;
 mod literals;
 mod members;
-mod normalize;
 mod obligations;
+mod operators;
 mod paths;
 mod satisfaction;
 mod signatures;
+mod solver;
+mod typecheck;
 mod types;
 
 // use crate::index::index_newtype;

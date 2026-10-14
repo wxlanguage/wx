@@ -112,10 +112,10 @@ global mut player_x: f64 = 3.5;
 global mut player_y: f64 = 3.5;
 global mut player_angle: f64 = 0.0;
 
-struct RayHit {
+struct RayHit(
     dist: f64,
     side: i32,
-}
+);
 
 fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     local dir_x = angle.cos();
@@ -173,7 +173,7 @@ fn cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
             / dir_y
     };
 
-    RayHit::{ dist, side }
+    RayHit({ dist, side })
 }
 
 // ── render ───────────────────────────────────────────────────────────────────

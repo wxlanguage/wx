@@ -614,7 +614,7 @@ mod tests {
 	fn resolves_through_a_child_module() {
 		let mut case = TestCase::new(indoc! {"
 			mod inner {
-				pub struct Widget { a: i32 }
+				pub struct Widget( a: i32 );
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -630,7 +630,7 @@ mod tests {
 	fn resolves_through_a_glob_import() {
 		let mut case = TestCase::new(indoc! {"
 			mod inner {
-				pub struct Widget { a: i32 }
+				pub struct Widget( a: i32 );
 			}
 			use inner::*;
 		"});
@@ -653,7 +653,7 @@ mod tests {
 	#[test]
 	fn a_child_module_does_not_see_its_parents_declarations() {
 		let mut case = TestCase::new(indoc! {"
-			struct Outer { a: i32 }
+			struct Outer( a: i32 );
 			mod inner {
 				fn use_it() -> i32 { 1 }
 			}
@@ -679,7 +679,7 @@ mod tests {
 	#[test]
 	fn later_segments_do_not_climb_either() {
 		let mut case = TestCase::new(indoc! {"
-			struct Outer { a: i32 }
+			struct Outer( a: i32 );
 			mod inner {
 				mod deeper { }
 			}
@@ -717,7 +717,7 @@ mod tests {
 
 	#[test]
 	fn local_definition_takes_precedence_over_the_std_prelude() {
-		let mut case = TestCase::new("struct i32 {}");
+		let mut case = TestCase::new("struct i32();");
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
@@ -732,7 +732,7 @@ mod tests {
 	fn walk_path_returns_a_partial_target_while_resolve_path_requires_completion()
 	 {
 		let source = indoc! {"
-			mod inner { pub struct Point {} }
+			mod inner { pub struct Point(); }
 			type Alias = inner::Point::member;
 		"};
 		let mut case = TestCase::new(source);
@@ -848,7 +848,7 @@ mod tests {
 		let mut case = TestCase::new(indoc! {"
 			mod a {
 				mod b {
-					pub struct C { x: i32 }
+					pub struct C( x: i32 );
 				}
 			}
 		"});
@@ -888,7 +888,7 @@ mod tests {
 		let mut case = TestCase::new(indoc! {"
 			pub mod a {
 				pub mod b {
-					pub struct C { x: i32 }
+					pub struct C( x: i32 );
 				}
 			}
 		"});
@@ -960,10 +960,10 @@ mod tests {
 		// A prelude definition must not hide ambiguity in the local scope.
 		let source = indoc! {"
 			mod a {
-				pub struct i32 {}
+				pub struct i32();
 			}
 			mod b {
-				pub struct i32 {}
+				pub struct i32();
 			}
 			use a::*;
 			use b::*;
@@ -1010,7 +1010,7 @@ mod tests {
 		let source = indoc! {"
 			mod a {
 				mod b {
-					pub struct C { x: i32 }
+					pub struct C( x: i32 );
 				}
 			}
 			type Alias = a::b::C;
@@ -1061,7 +1061,7 @@ mod tests {
 	#[test]
 	fn resolve_path_reports_not_a_namespace() {
 		let source = indoc! {"
-			struct Point { x: i32 }
+			struct Point( x: i32 );
 			type Alias = Point::x;
 		"};
 		let mut case = TestCase::new(source);

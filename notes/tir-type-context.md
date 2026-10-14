@@ -10,21 +10,21 @@ written for a model (build a `SignatureBuilder`, freeze it into a
 - **`TypeContext<'ast, 'ctx, 'dispatch>`** (`tir/signatures.rs`) is the one
   object that owns semantic type state: `types`, `bounds`, `type_envs`,
   `param_bounds`, the per-kind signature tables, `query_state`, `query_stack`,
-  `obligations`, `normalization`, and `exports`. It is never frozen or
+  `checks`, `normalization`, and `exports`. It is never frozen or
   converted into a second type. Later stages keep interning into it.
 - **Inputs are borrowed**, not owned: `defs`, `strings`, `ast_nodes`,
   `impl_dispatch` (built before the sweep, never mutated by it) and the
   diagnostics sink. The driver owns them and creates the context inside that
   scope. No `Arc`/`Rc`, no `unsafe`, no leaking.
 - **`sweep()`** forces `ensure_signature` for every registered declaration,
-  resolves the export block, and debug-asserts that every query is `Resolved`
-  and every obligation drained. It is a checkpoint, not a freeze: the context
+  runs the check pass, resolves the export block, and debug-asserts that every
+  query is `Resolved` (see `tir-check-pass.md`). It is a checkpoint, not a freeze: the context
   stays live and mutable afterwards.
 - **Body checking** will use a per-function `FunctionContext` holding
   `&mut TypeContext` plus per-body state (locals, scopes, labels, expected
   types, inference). It does not exist yet. A body's own obligations should
   live in the `FunctionContext`, so one failing body cannot poison another.
-- The proof and normalization methods (`check_trait`, `find_trait_impl_query`,
+- The proof and normalization methods (`find_trait_impl_query`,
   `normalize_*`, `resolve_type_member`, `resolve_trait_qualified_member`)
   already live on `TypeContext`; nothing needs porting to use them from a body.
 - Per-item state is keyed by `DefId`, so selective invalidation could be added
@@ -86,16 +86,17 @@ committed test covers it yet).
 
 | Consumer | `Pending` handling |
 | --- | --- |
-| Generic or associated-value bound validation | Queue `Obligation::Bounds` |
-| Qualified member applicability | Form the known projection, queue `Obligation::Trait` |
-| Signature normalization | Keep the symbolic term, queue `Obligation::Normalize` |
+| Generic or associated-value bound validation | Always recorded (`CheckBounds`) and run by the check pass |
+| Qualified member applicability | Form the known projection, record `CheckTraitMembership` |
+| Signature normalization | Keep the symbolic term; whoever reads it normalizes |
 | Unqualified declaration selection | Report E2104, suggest trait qualification |
 | Assumption proof and impl matching | Propagate `Pending`; never treat it as a negative proof |
 
-A recursion-budget overflow is a diagnosed `Failed` result: it must not queue a
-retry or silently produce an error type, and it poisons only the active
-normalization. After the sweep a stalled queue is an internal invariant failure;
-an obligation raised later by a body is that body's own concern.
+A recursion-budget overflow is returned as `Unsolved::Overflow` and reported by
+the construct that asked: it must not queue a retry or silently produce an error
+type. In the check pass a `Pending` answer is an internal invariant
+failure (`debug_assert`); an obligation raised later by a body is that body's
+own concern.
 
 ## Known gaps
 

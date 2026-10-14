@@ -1562,7 +1562,7 @@ mod tests {
 	#[test]
 	fn non_module_path_prefix_reports_not_a_namespace() {
 		let case = TestCase::new(indoc! {"
-			struct Helper { x: i32 }
+			struct Helper( x: i32 );
 
 			use Helper::something;
 		"});
@@ -2321,7 +2321,7 @@ mod tests {
 		// Mirrors `non_module_path_prefix_reports_not_a_namespace`, but for
 		// a glob's own path rather than a named leaf's prefix.
 		let case = TestCase::new(indoc! {"
-			struct Helper { x: i32 }
+			struct Helper( x: i32 );
 
 			use Helper::*;
 		"});

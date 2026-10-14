@@ -38,7 +38,7 @@
 // `build_aggregate_load`/`build_param_value` and
 // `opt::scheduler::Scheduler::ensure_aggregate_locals`), so the nested
 // structs below are built directly with the natural, ordinary syntax
-// (`alloc::<T>(T::{ ... nested literal ... })`), same as any other struct.
+// (`alloc::<T>(T({ ... nested literal ... }))`), same as any other struct.
 //
 // Every record type uses `#[fixed_order]` (declaration-order fields with
 // natural C-style alignment padding, rather than wx's default
@@ -217,12 +217,12 @@ enum Filetype: u8 {
 
 // ── `$dirent` ────────────────────────────────────────────────────────────────
 #[fixed_order]
-struct Dirent {
+struct Dirent(
     d_next: Dircookie,
     d_ino: Inode,
     d_namlen: Dirnamlen,
     d_type: Filetype,
-}
+);
 
 // ── `$advice` ────────────────────────────────────────────────────────────────
 enum Advice: u8 {
@@ -245,12 +245,12 @@ mod Fdflags {
 
 // ── `$fdstat` ────────────────────────────────────────────────────────────────
 #[fixed_order]
-struct Fdstat {
+struct Fdstat(
     fs_filetype: Filetype,
     fs_flags: u16,
     fs_rights_base: u64,
     fs_rights_inheriting: u64,
-}
+);
 
 // ── `$fstflags` (flags, u16) ─────────────────────────────────────────────────
 mod Fstflags {
@@ -275,7 +275,7 @@ mod OFlags {
 
 // ── `$filestat` ──────────────────────────────────────────────────────────────
 #[fixed_order]
-struct Filestat {
+struct Filestat(
     dev: Device,
     ino: Inode,
     filetype: Filetype,
@@ -284,7 +284,7 @@ struct Filestat {
     atim: Timestamp,
     mtim: Timestamp,
     ctim: Timestamp,
-}
+);
 
 // ── `$eventtype` ─────────────────────────────────────────────────────────────
 enum Eventtype: u8 {
@@ -300,21 +300,21 @@ mod Eventrwflags {
 
 // ── `$event_fd_readwrite` ────────────────────────────────────────────────────
 #[fixed_order]
-struct EventFdReadwrite {
+struct EventFdReadwrite(
     nbytes: Filesize,
     flags: u16,
-}
+);
 
 // ── `$event` ─────────────────────────────────────────────────────────────────
 // witx's field name `type` collides with the wx keyword used for type
 // aliases (`type Foo = Bar;`); renamed to `event_type`.
 #[fixed_order]
-struct Event {
+struct Event(
     userdata: Userdata,
     error: Errno,
     event_type: Eventtype,
     fd_readwrite: EventFdReadwrite,
-}
+);
 
 // ── `$subclockflags` (flags, u16) ────────────────────────────────────────────
 mod Subclockflags {
@@ -323,18 +323,18 @@ mod Subclockflags {
 
 // ── `$subscription_clock` ────────────────────────────────────────────────────
 #[fixed_order]
-struct SubscriptionClock {
+struct SubscriptionClock(
     id: ClockId,
     timeout: Timestamp,
     precision: Timestamp,
     flags: u16,
-}
+);
 
 // ── `$subscription_fd_readwrite` ─────────────────────────────────────────────
 #[fixed_order]
-struct SubscriptionFdReadwrite {
+struct SubscriptionFdReadwrite(
     file_descriptor: Fd,
-}
+);
 
 // ── `$subscription_u` (union — see limitation 2 in the file header) ─────────
 // `SubscriptionClock` (24 bytes, align 8) is the larger of the two variants;
@@ -343,10 +343,10 @@ struct SubscriptionFdReadwrite {
 // below rather than a second field, which would double-allocate space no
 // real union has.
 #[fixed_order]
-struct SubscriptionU {
+struct SubscriptionU(
     tag: Eventtype,
     clock: SubscriptionClock,
-}
+);
 
 fn subscription_u_as_fd_readwrite(u: *SubscriptionU) -> *SubscriptionFdReadwrite {
     local base: *SubscriptionU = ptr::null_mut();
@@ -356,10 +356,10 @@ fn subscription_u_as_fd_readwrite(u: *SubscriptionU) -> *SubscriptionFdReadwrite
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
 #[fixed_order]
-struct Subscription {
+struct Subscription(
     userdata: Userdata,
     u: SubscriptionU,
-}
+);
 
 // ── `$signal` ────────────────────────────────────────────────────────────────
 enum Signal: u8 {
@@ -422,15 +422,15 @@ enum Preopentype: u8 {
 // variant, so — unlike `$subscription_u` — a plain tag + single payload
 // field already matches the real layout with no reinterpretation needed.
 #[fixed_order]
-struct PrestatDir {
+struct PrestatDir(
     pr_name_len: Size,
-}
+);
 
 #[fixed_order]
-struct Prestat {
+struct Prestat(
     tag: Preopentype,
     dir: PrestatDir,
-}
+);
 
 // `$clockid`, used by `$subscription_clock` above, declared last among the
 // plain enums only because `SubscriptionClock` needed it first — order
@@ -552,7 +552,7 @@ import "wasi_snapshot_preview1" as wasi {
 // human running it can see real values came back.
 global mut bump: *u8 = heap::DATA_END;
 
-struct BumpAllocator {}
+struct BumpAllocator();
 
 impl Allocator for BumpAllocator {
     type Mem = heap;
@@ -612,12 +612,12 @@ fn main() {
     // fd_fdstat_get: reads a #[fixed_order] record back through a pointer a
     // real host wrote into — proves the struct's byte layout actually lines
     // up, not just that wx accepted the declaration.
-    local stat_ptr = alloc.alloc(Fdstat::{
+    local stat_ptr = alloc.alloc(Fdstat({
         fs_filetype: Filetype::Unknown,
         fs_flags: 0,
         fs_rights_base: 0,
         fs_rights_inheriting: 0,
-    });
+    }));
     if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success {
         unreachable
     };
@@ -631,24 +631,24 @@ fn main() {
     //
     // `Subscription` nests two levels deep (`u.clock`) — plain nested struct
     // literals, same as any other struct.
-    local sub_ptr = alloc.alloc(Subscription::{
+    local sub_ptr = alloc.alloc(Subscription({
         userdata: 0,
-        u: SubscriptionU::{
+        u: SubscriptionU({
             tag: Eventtype::Clock,
-            clock: SubscriptionClock::{
+            clock: SubscriptionClock({
                 id: ClockId::Monotonic,
                 timeout: 5000000,
                 precision: 0,
                 flags: 0,
-            },
-        },
-    });
-    local event_ptr = alloc.alloc(Event::{
+            }),
+        }),
+    }));
+    local event_ptr = alloc.alloc(Event({
         userdata: 0,
         error: Errno::Success,
         event_type: Eventtype::Clock,
-        fd_readwrite: EventFdReadwrite::{ nbytes: 0, flags: 0 },
-    });
+        fd_readwrite: EventFdReadwrite({ nbytes: 0, flags: 0 }),
+    }));
     local nevents_ptr = alloc.alloc::<u32>(0);
     local poll_result = wasi::poll_oneoff(sub_ptr, event_ptr, 1, nevents_ptr);
     write_all(Fd::Stdout, "poll_oneoff: errno=");
@@ -660,15 +660,15 @@ fn main() {
     // Round-trip the union workaround itself, independent of any real WASI
     // call: write through the smaller variant (SubscriptionFdReadwrite),
     // read back through the same bytes via the larger field's address.
-    local scratch = alloc.alloc(SubscriptionU::{
+    local scratch = alloc.alloc(SubscriptionU({
         tag: Eventtype::FdRead,
-        clock: SubscriptionClock::{
+        clock: SubscriptionClock({
             id: ClockId::Realtime,
             timeout: 0,
             precision: 0,
             flags: 0,
-        },
-    });
+        }),
+    }));
     local recovered = subscription_u_as_fd_readwrite(scratch).*.file_descriptor;
     write_all(Fd::Stdout, "union round-trip: file_descriptor=");
     write_decimal(Fd::Stdout, recovered as u32);

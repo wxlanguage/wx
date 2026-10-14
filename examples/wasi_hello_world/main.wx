@@ -21,7 +21,7 @@ import "wasi_snapshot_preview1" as wasi {
 memory heap: Memory where { Size = u32 };
 global mut bump: *u8 = heap::DATA_END;
 
-struct BumpAllocator {}
+struct BumpAllocator();
 
 impl Allocator for BumpAllocator {
   type Mem = heap;

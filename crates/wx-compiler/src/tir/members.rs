@@ -15,10 +15,9 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
-use super::assumptions::{
-	AssumptionContext, AssumptionKind, QueryError, QueryResult,
-};
-use super::bounds::{Readiness, report_not_an_associated_type};
+use super::assumptions::AssumptionKind;
+use super::assumptions::Readiness;
+use super::bounds::report_not_an_associated_type;
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, BindingNamespace, DefinitionRegistry,
 	InherentImplIdx, MemberKind, TraitIdx, TraitImplIdx,
@@ -28,12 +27,16 @@ use super::obligations::Obligation;
 use super::signatures::{
 	QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
 };
-use super::types::{Type, TypeIndex};
+use super::solver::Unsolved;
+use super::types::{Type, TypeEnvIdx, TypeIndex};
 
 /// What type-relative member applicability found.
 pub(super) enum MemberLookup {
 	/// A dependency has already failed; the caller must not diagnose absence.
 	Error,
+	/// The solver could not finish (`Unsolved::Overflow` or `Cycle`). Nothing
+	/// was reported; the site that wrote the path does that.
+	Stuck(Unsolved),
 	/// Selecting a member needs facts that are not ready yet.
 	Pending,
 	NotFound,
@@ -43,6 +46,18 @@ pub(super) enum MemberLookup {
 	/// always wins outright, checked before any trait candidate at all), so
 	/// this only ever holds trait-sourced candidates.
 	Ambiguous(Box<[ApplicableMember]>),
+}
+
+impl From<Unsolved> for MemberLookup {
+	fn from(error: Unsolved) -> Self {
+		match error {
+			Unsolved::Pending => Self::Pending,
+			Unsolved::Failed => Self::Error,
+			fatal @ (Unsolved::Overflow | Unsolved::Cycle(_)) => {
+				Self::Stuck(fatal)
+			}
+		}
+	}
 }
 
 /// A resolved trait-associated type, ready to form a projection on a base.
@@ -190,11 +205,103 @@ pub(super) enum TraitImplLookup {
 }
 
 impl TypeContext<'_, '_, '_> {
+	/// Selects the trait that supplies an associated type named by `key` off
+	/// `receiver`, for a written type path. Selection reads declarations only:
+	/// a parameter's bounds, the assumptions in scope, and the traits that have
+	/// an impl for the receiver's type constructor (`ImplDispatch`). With one
+	/// impl per trait per constructor that index names the provider exactly, so
+	/// no impl header is read and nothing is matched. Whether the receiver
+	/// really implements the selected trait is recorded as a membership check.
+	pub(super) fn select_associated_type(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+		reference: SourceSpan,
+	) -> MemberLookup {
+		match self.declared_bound_member(receiver, key, reference) {
+			MemberLookup::NotFound => {}
+			found => return found,
+		}
+		// Only assumed equalities may rewrite the receiver here, so a concrete
+		// head can come from evidence in scope but never from selecting an impl.
+		let receiver = match self
+			.normalize_assumed_type_query(assumption_context, receiver)
+		{
+			Ok(receiver) => receiver,
+			Err(error) => return error.into(),
+		};
+		if receiver == TypeIndex::ERROR {
+			return MemberLookup::Error;
+		}
+		let mut traits = Vec::new();
+		if let Some(target) =
+			ImplTarget::from_type(self.types.resolve(receiver))
+		{
+			for &(trait_index, _) in self.impl_dispatch.trait_candidates(target)
+			{
+				if self.defs.declared_trait_member(trait_index, key).is_some() {
+					traits.push(trait_index);
+				}
+			}
+		}
+		// Evidence in scope names traits regardless of receiver, so each must
+		// be shown to apply by assumptions alone. No impl is consulted.
+		let (scoped, mut readiness) = match self.assumed_member_traits(
+			assumption_context,
+			key,
+			reference,
+		) {
+			Ok(traits) => traits,
+			Err(lookup) => return lookup,
+		};
+		for trait_index in scoped {
+			if traits.contains(&trait_index) {
+				continue;
+			}
+			match self.check_assumed_trait(
+				assumption_context,
+				receiver,
+				trait_index,
+			) {
+				Ok(true) => traits.push(trait_index),
+				Ok(false) => {}
+				Err(Unsolved::Pending) => {
+					readiness = readiness.and(Readiness::Pending)
+				}
+				Err(error) => return error.into(),
+			}
+		}
+		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
+		for trait_index in traits {
+			let declaration = self
+				.defs
+				.declared_trait_member(trait_index, key)
+				.expect("candidate traits declare the member");
+			Self::push_candidate(
+				&mut candidates,
+				ApplicableMember::AbstractTraitMember {
+					trait_index,
+					declaration,
+				},
+			);
+		}
+		// Two known declarations already establish ambiguity. Otherwise unfinished
+		// discovery could still change a unique or absent answer.
+		if !matches!(candidates, Some(SmallVec::Many(_)))
+			&& readiness == Readiness::Pending
+		{
+			MemberLookup::Pending
+		} else {
+			Self::classify(candidates)
+		}
+	}
+
 	/// Shared applicability and ambiguity search. Declaration identity and
 	/// implementation selection happen after this search completes.
 	pub(super) fn resolve_applicable_member(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -203,24 +310,38 @@ impl TypeContext<'_, '_, '_> {
 			self.types.resolve(receiver),
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		) {
-			match self.resolve_bound_member(cx, receiver, key, reference) {
+			match self.resolve_bound_member(
+				assumption_context,
+				receiver,
+				key,
+				reference,
+			) {
 				MemberLookup::NotFound => {}
 				found => return found,
 			}
 		}
-		let receiver = match self.normalize_head_query(cx, receiver, reference)
-		{
-			Ok(receiver) => receiver,
-			Err(QueryError::Pending) => return MemberLookup::Pending,
-			Err(QueryError::Failed) => return MemberLookup::Error,
-		};
+		let receiver =
+			match self.normalize_head_query(assumption_context, receiver) {
+				Ok(receiver) => receiver,
+				Err(error) => return error.into(),
+			};
 		if receiver == TypeIndex::ERROR {
 			return MemberLookup::Error;
 		}
 		match ImplTarget::from_type(self.types.resolve(receiver)) {
-			Some(target) => self
-				.resolve_concrete_member(cx, receiver, target, key, reference),
-			None => self.resolve_bound_member(cx, receiver, key, reference),
+			Some(target) => self.resolve_concrete_member(
+				assumption_context,
+				receiver,
+				target,
+				key,
+				reference,
+			),
+			None => self.resolve_bound_member(
+				assumption_context,
+				receiver,
+				key,
+				reference,
+			),
 		}
 	}
 
@@ -236,7 +357,7 @@ impl TypeContext<'_, '_, '_> {
 	/// qualified segment).
 	pub(super) fn resolve_type_member_path(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
@@ -251,8 +372,8 @@ impl TypeContext<'_, '_, '_> {
 				)
 			}
 			let key = BindingKey::ty(segment.ident.inner);
-			match self.resolve_applicable_member(
-				cx,
+			match self.select_associated_type(
+				assumption_context,
 				current,
 				key,
 				SourceSpan::new(file_id, segment.ident.span),
@@ -281,6 +402,13 @@ impl TypeContext<'_, '_, '_> {
 					return TypeIndex::ERROR;
 				}
 				MemberLookup::Error => return TypeIndex::ERROR,
+				MemberLookup::Stuck(unsolved) => {
+					let _ = self.report_unsolved::<()>(
+						Err(unsolved),
+						SourceSpan::new(file_id, segment.ident.span),
+					);
+					return TypeIndex::ERROR;
+				}
 				MemberLookup::Found(member) => {
 					let Some(declaration) = member.assoc_type_declaration()
 					else {
@@ -291,14 +419,47 @@ impl TypeContext<'_, '_, '_> {
 						));
 						return TypeIndex::ERROR;
 					};
+					// Selection named the trait without matching an impl; that
+					// the receiver implements it is the check pass's question.
+					self.register_obligation(
+						Obligation::CheckTraitMembership {
+							assumption_context,
+							subject: current,
+							required: declaration.trait_index,
+							reference: SourceSpan::new(
+								file_id,
+								segment.ident.span,
+							),
+						},
+					);
 					current = self.project_assoc_type(current, declaration);
 				}
 				MemberLookup::NotFound => {
-					self.diagnostics.push(report_no_such_type_member(
-						file_id,
-						self.strings,
-						segment.ident,
-					));
+					if matches!(
+						self.types.resolve(current),
+						Type::AssocTypeProjection { .. }
+					) {
+						// A projection's declared bounds are only half of what
+						// it can have: its value may be a type that does. That
+						// takes impls, so the check pass decides what to say.
+						self.register_obligation(
+							Obligation::CheckProjectionMember {
+								assumption_context,
+								projection: current,
+								name: segment.ident.inner,
+								reference: SourceSpan::new(
+									file_id,
+									segment.ident.span,
+								),
+							},
+						);
+					} else {
+						self.diagnostics.push(report_no_such_type_member(
+							file_id,
+							self.strings,
+							segment.ident,
+						));
+					}
 					return TypeIndex::ERROR;
 				}
 				MemberLookup::Ambiguous(candidates) => {
@@ -334,15 +495,16 @@ impl TypeContext<'_, '_, '_> {
 	/// qualified type path. Later segments use ordinary type-member lookup.
 	pub(super) fn resolve_trait_qualified_assoc_type(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
 	) -> Result<AssocTypeProjectionTarget, ()> {
-		let (kind, _) = self.resolve_trait_qualified_declaration(
-			cx,
-			receiver,
+		if receiver == TypeIndex::ERROR {
+			return Err(());
+		}
+		let kind = self.resolve_trait_member_declaration(
 			required_trait,
 			BindingKey::ty(name.inner),
 			name,
@@ -357,6 +519,14 @@ impl TypeContext<'_, '_, '_> {
 			));
 			return Err(());
 		};
+		// Naming the projection does not need an impl; whether `receiver`
+		// implements the trait is the check pass's question.
+		self.register_obligation(Obligation::CheckTraitMembership {
+			assumption_context,
+			subject: receiver,
+			required: required_trait,
+			reference: SourceSpan::new(file_id, name.span),
+		});
 		Ok(AssocTypeProjectionTarget {
 			trait_index: required_trait,
 			assoc_type_index,
@@ -365,20 +535,28 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn resolve_trait_qualified_value(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
 	) -> Result<ApplicableMember, ()> {
 		let key = BindingKey::value(name.inner);
-		let (declaration, found) = self.resolve_trait_qualified_declaration(
-			cx,
-			receiver,
+		if receiver == TypeIndex::ERROR {
+			return Err(());
+		}
+		let declaration = self.resolve_trait_member_declaration(
 			required_trait,
 			key,
 			name,
 			file_id,
+		)?;
+		let found = self.find_trait_impl(
+			assumption_context,
+			receiver,
+			required_trait,
+			file_id,
+			name.span,
 		)?;
 		let member = match found {
 			TraitImplLookup::Concrete { impl_index, .. } => {
@@ -398,18 +576,15 @@ impl TypeContext<'_, '_, '_> {
 		Ok(member)
 	}
 
-	fn resolve_trait_qualified_declaration(
+	/// The trait's own declaration of `key`, with no impl involved. A missing
+	/// member is a written-site error reported here.
+	fn resolve_trait_member_declaration(
 		&mut self,
-		cx: AssumptionContext,
-		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		key: BindingKey,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
-	) -> Result<(MemberKind, TraitImplLookup), ()> {
-		if receiver == TypeIndex::ERROR {
-			return Err(());
-		}
+	) -> Result<MemberKind, ()> {
 		let trait_def = &self.defs.traits[usize::from(required_trait)];
 		let Some(&member_index) = trait_def.bindings.get(&key) else {
 			self.diagnostics.push(report_missing_trait_member(
@@ -421,16 +596,7 @@ impl TypeContext<'_, '_, '_> {
 			));
 			return Err(());
 		};
-		let declared_kind = trait_def.members[usize::from(member_index)].kind;
-
-		let found = self.find_trait_impl(
-			cx,
-			receiver,
-			required_trait,
-			file_id,
-			name.span,
-		)?;
-		Ok((declared_kind, found))
+		Ok(trait_def.members[usize::from(member_index)].kind)
 	}
 
 	/// Finds how `required_trait` applies to `receiver`, if at all — a
@@ -444,7 +610,7 @@ impl TypeContext<'_, '_, '_> {
 	/// completeness is `check_trait_conformance`'s own, separate job.
 	pub(super) fn find_trait_impl(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		file_id: FileId,
@@ -452,10 +618,9 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<TraitImplLookup, ()> {
 		let reference = SourceSpan::new(file_id, span);
 		match self.find_trait_impl_query(
-			cx,
+			assumption_context,
 			receiver,
 			required_trait,
-			reference,
 		) {
 			Ok(Some(found)) => Ok(found),
 			Ok(None) => {
@@ -468,12 +633,16 @@ impl TypeContext<'_, '_, '_> {
 				self.diagnostics.push(diagnostic);
 				Err(())
 			}
-			Err(QueryError::Failed) => Err(()),
-			Err(QueryError::Pending) => {
+			Err(Unsolved::Failed) => Err(()),
+			Err(fatal @ (Unsolved::Overflow | Unsolved::Cycle(_))) => {
+				let _ = self.report_unsolved::<()>(Err(fatal), reference);
+				Err(())
+			}
+			Err(Unsolved::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
 				self.register_obligation(Obligation::CheckTraitMembership {
-					context: cx,
+					assumption_context,
 					subject: receiver,
 					required: required_trait,
 					reference,
@@ -483,70 +652,8 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	pub(super) fn find_trait_impl_query(
-		&mut self,
-		cx: AssumptionContext,
-		receiver: TypeIndex,
-		required_trait: TraitIdx,
-		reference: SourceSpan,
-	) -> QueryResult<Option<TraitImplLookup>> {
-		if matches!(self.types.resolve(receiver), Type::Error | Type::Infer) {
-			return Err(QueryError::Failed);
-		}
-		let mut assumed =
-			self.check_assumed_trait(cx, receiver, required_trait, reference);
-		if assumed == Err(QueryError::Failed) {
-			return Err(QueryError::Failed);
-		}
-		if assumed == Ok(true)
-			&& ImplTarget::from_type(self.types.resolve(receiver)).is_none()
-		{
-			return Ok(Some(TraitImplLookup::Abstract));
-		}
-		let normalized = self.normalize_head_query(cx, receiver, reference)?;
-		if normalized == TypeIndex::ERROR {
-			return Err(QueryError::Failed);
-		}
-		if normalized != receiver {
-			match self.check_assumed_trait(
-				cx,
-				normalized,
-				required_trait,
-				reference,
-			) {
-				Ok(true) => assumed = Ok(true),
-				Err(QueryError::Failed) => return Err(QueryError::Failed),
-				Err(QueryError::Pending) if assumed != Ok(true) => {
-					assumed = Err(QueryError::Pending)
-				}
-				_ => {}
-			}
-		}
-		if let Some(target) =
-			ImplTarget::from_type(self.types.resolve(normalized))
-		{
-			let candidate =
-				self.impl_dispatch.trait_candidates(target).iter().find_map(
-					|&(trait_index, impl_index)| {
-						(trait_index == required_trait).then_some(impl_index)
-					},
-				);
-			if let Some(impl_index) = candidate {
-				if let Some(args) = self.match_trait_impl_candidate_query(
-					cx, impl_index, normalized, reference,
-				)? {
-					return Ok(Some(TraitImplLookup::Concrete {
-						impl_index,
-						args,
-					}));
-				}
-			}
-		}
-		assumed.map(|proven| proven.then_some(TraitImplLookup::Abstract))
-	}
-
-	/// Same code and wording as `check_assoc_type_value`'s own
-	/// `report_trait_bound_violation` (mirroring rustc's `E0277` for this
+	/// Same code and wording as `report_trait_bound_violation`,
+	/// reported for a recorded bounds check (mirroring rustc's `E0277` for this
 	/// same case: `the trait bound `Foo: Bar` is not satisfied`) — this is
 	/// that same condition, just reached with no declared bound clause to
 	/// point a "required by a bound in `X`" secondary label at, since a
@@ -579,7 +686,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn resolve_concrete_member(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		target: ImplTarget,
 		key: BindingKey,
@@ -593,7 +700,9 @@ impl TypeContext<'_, '_, '_> {
 			};
 			let kind = impl_def.members[usize::from(member_index)].kind;
 			match self.match_inherent_impl_candidate_query(
-				cx, index, receiver, reference,
+				assumption_context,
+				index,
+				receiver,
 			) {
 				Ok(true) => {
 					return MemberLookup::Found(ApplicableMember::Inherent {
@@ -602,8 +711,7 @@ impl TypeContext<'_, '_, '_> {
 					});
 				}
 				Ok(false) => {}
-				Err(QueryError::Pending) => return MemberLookup::Pending,
-				Err(QueryError::Failed) => return MemberLookup::Error,
+				Err(error) => return error.into(),
 			}
 		}
 		let mut traits = Vec::new();
@@ -612,18 +720,25 @@ impl TypeContext<'_, '_, '_> {
 				traits.push(trait_index);
 			}
 		}
-		let (scoped, readiness) =
-			match self.assumed_member_traits(cx, key, reference) {
-				Ok(traits) => traits,
-				Err(()) => return MemberLookup::Error,
-			};
+		let (scoped, readiness) = match self.assumed_member_traits(
+			assumption_context,
+			key,
+			reference,
+		) {
+			Ok(traits) => traits,
+			Err(lookup) => return lookup,
+		};
 		for trait_index in scoped {
 			if !traits.contains(&trait_index) {
 				traits.push(trait_index);
 			}
 		}
 		self.resolve_trait_member_candidates(
-			cx, receiver, key, reference, traits, readiness,
+			assumption_context,
+			receiver,
+			key,
+			traits,
+			readiness,
 		)
 	}
 
@@ -631,17 +746,17 @@ impl TypeContext<'_, '_, '_> {
 	/// scanning every trait in the program. Applicability uses the shared proof.
 	fn assumed_member_traits(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		key: BindingKey,
 		reference: SourceSpan,
-	) -> Result<(Vec<TraitIdx>, Readiness), ()> {
+	) -> Result<(Vec<TraitIdx>, Readiness), MemberLookup> {
 		let defs = self.defs;
 		let mut traits = Vec::new();
 		let mut equalities = Vec::new();
 		let mut readiness;
 		{
 			let (reader, types) = self.assumptions();
-			let mut facts = reader.scoped_facts(cx, types);
+			let mut facts = reader.scoped_facts(assumption_context, types);
 			readiness = facts.readiness;
 			while let Some(fact) = facts.next(types) {
 				match fact.kind {
@@ -663,8 +778,9 @@ impl TypeContext<'_, '_, '_> {
 		}
 		// An equality's projection path can carry associated declaration bounds.
 		for subject in equalities {
-			self.prepare_effective_bounds(subject, reference)?;
-			let depth = self.normalization.remaining_depth();
+			self.prepare_effective_bounds(subject, reference)
+				.map_err(|()| MemberLookup::Error)?;
+			let depth = self.solver.remaining_depth();
 			let (reader, types) = self.assumptions();
 			let mut facts = reader.subject_facts(subject, types, depth);
 			readiness = readiness.and(facts.readiness);
@@ -681,18 +797,16 @@ impl TypeContext<'_, '_, '_> {
 			}
 		}
 		if readiness == Readiness::Overflowed {
-			self.normalization_overflow(reference);
-			return Err(());
+			return Err(MemberLookup::Stuck(Unsolved::Overflow));
 		}
 		Ok((traits, readiness))
 	}
 
 	fn resolve_trait_member_candidates(
 		&mut self,
-		cx: AssumptionContext,
+		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
-		reference: SourceSpan,
 		traits: Vec<TraitIdx>,
 		mut readiness: Readiness,
 	) -> MemberLookup {
@@ -704,10 +818,9 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			};
 			match self.find_trait_impl_query(
-				cx,
+				assumption_context,
 				receiver,
 				trait_index,
-				reference,
 			) {
 				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
 					Self::push_candidate(
@@ -729,10 +842,10 @@ impl TypeContext<'_, '_, '_> {
 					);
 				}
 				Ok(None) => {}
-				Err(QueryError::Pending) => {
+				Err(Unsolved::Pending) => {
 					readiness = readiness.and(Readiness::Pending)
 				}
-				Err(QueryError::Failed) => return MemberLookup::Error,
+				Err(error) => return error.into(),
 			}
 		}
 		// Two known declarations already establish ambiguity. Otherwise pending
@@ -746,9 +859,9 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	fn resolve_bound_member(
+	/// Traits supplied by the receiver's own declared bounds, by name only.
+	pub(super) fn declared_bound_member(
 		&mut self,
-		cx: AssumptionContext,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -790,19 +903,37 @@ impl TypeContext<'_, '_, '_> {
 				);
 			}
 		}
+		Self::classify(candidates)
+	}
+
+	fn resolve_bound_member(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+		reference: SourceSpan,
+	) -> MemberLookup {
 		// Preserve direct declaration lookup, including known provisional
 		// memberships. Equality-based discovery is a fallback when these bounds
 		// do not identify the requested name.
-		if candidates.is_some() {
-			return Self::classify(candidates);
+		match self.declared_bound_member(receiver, key, reference) {
+			MemberLookup::NotFound => {}
+			found => return found,
 		}
-		let (traits, readiness) =
-			match self.assumed_member_traits(cx, key, reference) {
-				Ok(traits) => traits,
-				Err(_) => return MemberLookup::Error,
-			};
+		let (traits, readiness) = match self.assumed_member_traits(
+			assumption_context,
+			key,
+			reference,
+		) {
+			Ok(traits) => traits,
+			Err(lookup) => return lookup,
+		};
 		self.resolve_trait_member_candidates(
-			cx, receiver, key, reference, traits, readiness,
+			assumption_context,
+			receiver,
+			key,
+			traits,
+			readiness,
 		)
 	}
 
@@ -887,7 +1018,7 @@ fn report_missing_trait_member(
 	}
 }
 
-fn report_no_such_type_member(
+pub(super) fn report_no_such_type_member(
 	file_id: FileId,
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,

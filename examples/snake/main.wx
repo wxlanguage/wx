@@ -40,11 +40,11 @@ const GRID_W: i32 = 32;
 const GRID_H: i32 = 24;
 const STEP_MS: i64 = 120;
 
-struct Node {
+struct Node(
   x: i32,
   y: i32,
   next: heap::*Node,
-}
+);
 
 global mut head: heap::*Node = ptr::null_mut();
 global mut len: i32 = 0;
@@ -55,7 +55,7 @@ global mut acc_ms: i64 = 0;
 
 pub fn node_new(value_x: i32, value_y: i32, next: heap::*Node) -> heap::*Node {
   local n: heap::*Node = alloc::<Node>();
-  n.* = Node::{ x: value_x, y: value_y, next: next };
+  n.* = Node({ x: value_x, y: value_y, next: next });
   n
 }
 

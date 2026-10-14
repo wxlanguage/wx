@@ -40,11 +40,11 @@ export {
     main,
 }
 
-// struct Point {
+// struct Point(
 //     r: i32,
 //     g: i32,
 //     b: i32,
-// }
+// );
 
 // fn test() {
 //     Point({
