@@ -235,7 +235,7 @@ define_diagnostic_codes! {
 	}
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct TextSpan {
@@ -263,7 +263,7 @@ impl From<TextSpan> for core::ops::Range<usize> {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceSpan {
 	pub file_id: FileId,
 	pub span: TextSpan,

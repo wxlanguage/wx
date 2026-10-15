@@ -25,10 +25,10 @@ use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
 pub(super) struct TypeFormatter<'a> {
-	types: &'a TypeInterner,
-	defs: &'a DefinitionRegistry,
-	strings: &'a StringInterner,
-	type_envs: &'a TypeEnvArena,
+	pub(super) types: &'a TypeInterner,
+	pub(super) defs: &'a DefinitionRegistry,
+	pub(super) strings: &'a StringInterner,
+	pub(super) type_envs: &'a TypeEnvArena,
 }
 
 /// Formats declared source bounds, preserving their order and bindings.
@@ -236,7 +236,7 @@ impl TypeFormatter<'_> {
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.frame(*env)[*param_index as usize]
+				let symbol = self.type_envs.params(*env)[*param_index as usize]
 					.name
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -317,6 +317,7 @@ mod tests {
 		MemberKind, Namespace, Tier, TraitIdx,
 	};
 	use crate::tir::impls::ImplDispatch;
+	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
 	use crate::tir::types::TypeEnvIdx;
 	use crate::vfs;
@@ -359,11 +360,13 @@ mod tests {
 			.assert_no_errors();
 
 			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
 				&mut graph.strings,
 				&mut diagnostics,
+				&mut resolutions,
 				graph.stdlib_package,
 				graph.root_package,
 			);
@@ -372,12 +375,14 @@ mod tests {
 
 			let dispatch = ImplDispatch::build(
 				&mut diagnostics,
+				&mut resolutions,
 				&graph.strings,
 				&defs,
 				&ast_nodes,
 			);
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
+				&mut resolutions,
 				&graph.strings,
 				&graph.files,
 				&defs,
@@ -386,7 +391,7 @@ mod tests {
 			);
 			for entry in &ast_nodes {
 				let _ = signatures.ensure_signature(QueryInfo {
-					def_id: entry.def_id,
+					def_id: entry.node.def_id(),
 					requested_at: None,
 				});
 			}
@@ -438,7 +443,7 @@ mod tests {
 				.type_params;
 			let index = self
 				.type_envs
-				.frame(env)
+				.params(env)
 				.iter()
 				.position(|param| {
 					self.graph.strings.resolve(param.name.inner) == Some(name)
@@ -462,7 +467,7 @@ mod tests {
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.type_envs.frame(env)[index].ty
+			self.type_envs.params(env)[index].ty
 		}
 
 		fn declared_bounds(&self, function: &str, param: &str) -> &[BoundId] {

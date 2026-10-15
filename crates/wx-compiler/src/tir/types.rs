@@ -19,14 +19,13 @@
 //! Structural substitution likewise only replaces parameter identities in
 //! an existing type; it never resolves or normalizes associated types.
 //!
-//! A generic-parameter frame's owner (`TypeEnvOwner`) is a dedicated enum
-//! rather than a bare `ast::DefId`, so it indexes straight into the right
-//! registry array (`defs.structs`, `defs.functions`, ...) without a lookup.
+//! A generic-parameter frame's owner (`TypeEnvOwner`) is an enum of registry
+//! indices, so it indexes straight into the right registry array
+//! (`defs.structs`, `defs.functions`, ...) without a lookup.
 
 use std::collections::HashMap;
 
 use crate::ast::Spanned;
-use crate::diagnostics::SourceSpan;
 use crate::index::index_newtype;
 use crate::tir::defs::{
 	DefinitionRegistry, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
@@ -678,14 +677,11 @@ impl TypeFolder for Substitution<'_> {
 pub(super) struct TypeParam {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) ty: TypeIndex,
-	pub(super) accesses: Vec<SourceSpan>,
 }
 
 /// A generic reference site's target, identified the same way dispatch and
-/// every other `defs.rs`-facing lookup already is — by index into its own
-/// registry array, not by `DefId` — so `name`/`file_id` can reach straight
-/// into `defs.structs[..]` instead of re-deriving the index from a walk
-/// through `ast_node` first. Constants and enums are also represented for
+/// every other `defs.rs`-facing lookup is — by index into its own registry
+/// array — so `name`/`file_id` can reach straight into `defs.structs[..]`. Constants and enums are also represented for
 /// diagnostics, even though they currently have no type parameters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TypeEnvOwner {
@@ -787,10 +783,9 @@ enum TypeEnv {
 /// Generalizes `builder::type_compare::TypeEnv` (which answers "what does
 /// this abstract variable mean, once an impl's own args are known," for
 /// read-only structural comparison after signatures already exist) to also
-/// answer "what does this written name refer to" — and, since this frame
-/// persists for the rest of the compilation rather than being torn down
-/// once its own item finishes, "where has it been referenced since" — while
-/// a signature is being built in the first place. Being append-only is what
+/// answer "what does this written name refer to" while a signature is
+/// being built in the first place; where it was written is recorded in
+/// `NameResolutions`, which the frame's position identifies. Being append-only is what
 /// makes that persistence safe under reentrancy: `ensure_signature` calling
 /// back into itself for some *other* item (a field type naming another
 /// struct, say) pushes that item's own frames on top without disturbing —
@@ -864,11 +859,7 @@ impl TypeEnvArena {
 					env: frame,
 					param_index: u32::try_from(index).unwrap(),
 				});
-				TypeParam {
-					name,
-					ty,
-					accesses: Vec::new(),
-				}
+				TypeParam { name, ty }
 			})
 			.collect();
 		self.envs.push(TypeEnv::Frame {
@@ -879,16 +870,18 @@ impl TypeEnvArena {
 		frame
 	}
 
+	/// A declaration without generics has no frame of its own and stores
+	/// `ROOT`, which declares no parameters.
 	#[inline]
-	pub(super) fn frame(&self, env: TypeEnvIdx) -> &[TypeParam] {
+	pub(super) fn params(&self, env: TypeEnvIdx) -> &[TypeParam] {
 		match &self.envs[usize::from(env)] {
 			TypeEnv::Frame { params, .. } => params,
-			_ => unreachable!(),
+			TypeEnv::Root => &[],
 		}
 	}
 
 	#[inline]
-	pub(super) fn frame_owner(&self, env: TypeEnvIdx) -> TypeEnvOwner {
+	pub(super) fn owner(&self, env: TypeEnvIdx) -> TypeEnvOwner {
 		match &self.envs[usize::from(env)] {
 			TypeEnv::Frame { owner, .. } => *owner,
 			_ => unreachable!(),
@@ -903,25 +896,23 @@ impl TypeEnvArena {
 		}
 	}
 
-	/// Resolves `name` (written at `span`), walking from `id` towards
-	/// `Root`, recording the access against whichever entry matched. `None`
-	/// means no frame in the chain declares it.
+	/// Where `name` is declared, walking from `env` towards `Root`: the
+	/// frame and the parameter's position in it. `None` means no frame in
+	/// the chain declares it.
 	pub(super) fn resolve(
-		&mut self,
+		&self,
 		env: TypeEnvIdx,
 		name: SymbolU32,
-		span: SourceSpan,
-	) -> Option<TypeIndex> {
+	) -> Option<(TypeEnvIdx, u32)> {
 		let mut current = env;
 		loop {
-			match &mut self.envs[usize::from(current)] {
+			match &self.envs[usize::from(current)] {
 				TypeEnv::Root => return None,
 				TypeEnv::Frame { params, parent, .. } => {
-					if let Some(param) =
-						params.iter_mut().find(|p| p.name.inner == name)
+					if let Some(index) =
+						params.iter().position(|p| p.name.inner == name)
 					{
-						param.accesses.push(span);
-						return Some(param.ty);
+						return Some((current, u32::try_from(index).unwrap()));
 					}
 					current = *parent;
 				}

@@ -10,7 +10,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{AssocTypeIdx, DefKind, DefinitionRegistry, TraitIdx};
+use super::defs::{AssocTypeIdx, DefId, DefKind, DefinitionRegistry, TraitIdx};
 use super::signatures::{QueryInfo, SignatureStatus, TypeContext};
 use super::types::{Substitution, Type, TypeIndex, TypeInterner};
 
@@ -280,7 +280,10 @@ impl TypeContext<'_, '_, '_> {
 		let trait_index = bound.trait_index;
 		let id = bound.source;
 		union_trait_bound(&self.types, implied, conflicts, bound, id);
-		let def_id = self.defs.traits[usize::from(trait_index)].def_id;
+		let def_id = match self.defs.traits[usize::from(trait_index)].typeset {
+			Some(typeset_index) => DefId::Typeset(typeset_index),
+			None => DefId::Trait(trait_index),
+		};
 		let reference = self.bounds.span(id);
 		match self.ensure_signature(QueryInfo {
 			def_id,

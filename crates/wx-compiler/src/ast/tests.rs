@@ -12,23 +12,21 @@ use crate::vfs::{FileOrigin, Files};
 /// `CompilationUnit` — because nothing here needs it, and every extra stage
 /// would be another way for a test to fail for reasons it is not about.
 struct TestCase {
-	interner: StringInterner,
+	strings: StringInterner,
 	files: Files,
 	ast: AST,
 }
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut interner = StringInterner::new();
-		let mut id_generator = DefIdGenerator::new();
+		let mut strings = StringInterner::new();
 		let mut files = Files::new();
 		let file_id = files
 			.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
 			.unwrap();
-		let ast =
-			Parser::parse(file_id, &files, &mut interner, &mut id_generator);
+		let ast = Parser::parse(file_id, &files, &mut strings);
 		TestCase {
-			interner,
+			strings,
 			files,
 			ast,
 		}
@@ -44,7 +42,7 @@ impl TestCase {
 	/// Resolves an interned symbol, so assertions can name things rather than
 	/// compare opaque `SymbolU32` integers (which is all a snapshot shows).
 	fn name(&self, symbol: SymbolU32) -> &str {
-		self.interner
+		self.strings
 			.resolve(symbol)
 			.expect("symbol was interned by this parse")
 	}
@@ -267,12 +265,12 @@ fn test_enum_repr_after_name() {
 		panic!("expected enum item")
 	};
 
-	assert_eq!(case.interner.resolve(name.inner), Some("Status"));
+	assert_eq!(case.strings.resolve(name.inner), Some("Status"));
 	assert!(matches!(
 		repr.as_deref().map(|repr| &repr.inner),
 		Some(TypeExpression::Path(p))
 			if p.len() == 1
-				&& case.interner.resolve(p[0].ident.inner) == Some("i32")
+				&& case.strings.resolve(p[0].ident.inner) == Some("i32")
 	));
 	assert_eq!(variants.len(), 2);
 }
@@ -675,7 +673,7 @@ fn single_exports_preserve_raw_aliases_and_use_item_separators() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	assert_eq!(case.ast.items.len(), 5);
-	assert!(case.interner.get("line\n").is_none());
+	assert!(case.strings.get("line\n").is_none());
 
 	for index in 0..4 {
 		let item = &case.ast.items[index];
@@ -1457,11 +1455,11 @@ fn test_pattern_simple_binding() {
 
 	assert!(matches!(
 		local_definition_pattern(stmts, 0),
-		Pattern::Binding { mut_span: None, name } if case.interner.resolve(name.inner) == Some("x")
+		Pattern::Binding { mut_span: None, name } if case.strings.resolve(name.inner) == Some("x")
 	));
 	assert!(matches!(
 		local_definition_pattern(stmts, 1),
-		Pattern::Binding { mut_span: Some(_), name } if case.interner.resolve(name.inner) == Some("y")
+		Pattern::Binding { mut_span: Some(_), name } if case.strings.resolve(name.inner) == Some("y")
 	));
 	assert!(matches!(
 		local_definition_pattern(stmts, 2),
@@ -1538,7 +1536,7 @@ fn test_pattern_struct_destructuring() {
 
 	let (path, (fields, rest)) = named_pattern(0);
 	assert_eq!(path.len(), 1);
-	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("Point"));
+	assert_eq!(case.strings.resolve(path[0].ident.inner), Some("Point"));
 	assert!(rest.is_empty());
 	assert_eq!(fields.len(), 2);
 	assert!(
@@ -1556,8 +1554,8 @@ fn test_pattern_struct_destructuring() {
 	// in for the fields the pattern does not bind.
 	let (path, (fields, rest)) = named_pattern(2);
 	assert_eq!(path.len(), 2);
-	assert_eq!(case.interner.resolve(path[0].ident.inner), Some("geom"));
-	assert_eq!(case.interner.resolve(path[1].ident.inner), Some("Point"));
+	assert_eq!(case.strings.resolve(path[0].ident.inner), Some("geom"));
+	assert_eq!(case.strings.resolve(path[1].ident.inner), Some("Point"));
 	assert_eq!(fields.len(), 1);
 	assert!(!rest.is_empty());
 
@@ -1850,7 +1848,7 @@ fn test_external_module_item() {
 	};
 
 	assert!(pub_span.is_none());
-	assert_eq!(case.interner.resolve(name.inner), Some("math"));
+	assert_eq!(case.strings.resolve(name.inner), Some("math"));
 }
 
 #[test]
@@ -1928,11 +1926,11 @@ fn test_generic_struct() {
 	else {
 		panic!("expected struct item")
 	};
-	assert_eq!(case.interner.resolve(name.inner), Some("Pair"));
+	assert_eq!(case.strings.resolve(name.inner), Some("Pair"));
 	assert_eq!(type_params.len(), 2);
-	assert_eq!(case.interner.resolve(type_params[0].name.inner), Some("T"));
+	assert_eq!(case.strings.resolve(type_params[0].name.inner), Some("T"));
 	assert!(type_params[0].bounds.is_none());
-	assert_eq!(case.interner.resolve(type_params[1].name.inner), Some("U"));
+	assert_eq!(case.strings.resolve(type_params[1].name.inner), Some("U"));
 	assert!(type_params[1].bounds.is_none());
 	assert_eq!(fields.len(), 2);
 }
@@ -1974,7 +1972,7 @@ fn test_import_alias_and_entry_kinds() {
 	else {
 		panic!("expected import block")
 	};
-	assert_eq!(case.interner.resolve(internal_name.inner), Some("host"));
+	assert_eq!(case.strings.resolve(internal_name.inner), Some("host"));
 	assert!(matches!(
 		items.inner[0].inner.inner.declaration,
 		ImportDeclaration::Function { .. }
@@ -2745,21 +2743,6 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 }
 
 #[test]
-fn export_blocks_do_not_consume_definition_ids() {
-	let case =
-		TestCase::new("export {} fn first() {} export {} fn second() {}");
-	case.diagnostics().assert_none();
-	let Item::Function { id: first, .. } = case.item(1) else {
-		panic!("expected function");
-	};
-	let Item::Function { id: second, .. } = case.item(3) else {
-		panic!("expected function");
-	};
-	assert_eq!(*first, DefId(0));
-	assert_eq!(*second, DefId(1));
-}
-
-#[test]
 fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let source = indoc! {"
         #[tag = \"line\\nslash\\\\n\"]
@@ -2778,8 +2761,8 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
     "};
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
-	assert!(case.interner.get("line\nslash\\n").is_none());
-	assert!(case.interner.get(r#""line\nslash\\n""#).is_none());
+	assert!(case.strings.get("line\nslash\\n").is_none());
+	assert!(case.strings.get(r#""line\nslash\\n""#).is_none());
 	let Item::Function { attributes, .. } = case.item(0) else {
 		panic!("expected function");
 	};
@@ -2836,8 +2819,8 @@ fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	assert_eq!(case.ast.items.len(), 4);
-	assert!(case.interner.get("ok").is_none());
-	assert!(case.interner.get(r#""\o""#).is_none());
+	assert!(case.strings.get("ok").is_none());
+	assert!(case.strings.get(r#""\o""#).is_none());
 	let statements = case.function_block(0);
 	for index in [0, 1] {
 		assert!(matches!(

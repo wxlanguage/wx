@@ -20,6 +20,7 @@ use super::defs::{
 	UseItemDef, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
 	Visibility,
 };
+use super::resolutions::{NameResolutions, Referent};
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
 /// name. Kept distinct from a plain `Option<DefKey>` so the caller can
@@ -115,6 +116,7 @@ impl<T: Copy> ResolveStatus<T> {
 /// `namespaces`/`diagnostics`.
 pub(super) struct ImportResolver<'r> {
 	diagnostics: &'r mut Vec<Diagnostic<FileId>>,
+	resolutions: &'r mut NameResolutions,
 	strings: &'r StringInterner,
 	namespaces: &'r mut Namespaces,
 
@@ -141,6 +143,7 @@ impl<'r> ImportResolver<'r> {
 	/// other field/method on `ImportResolver` private to this file.
 	pub(super) fn resolve_imports(
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		resolutions: &mut NameResolutions,
 		strings: &StringInterner,
 		namespaces: &mut Namespaces,
 		use_items: &[UseItemDef],
@@ -155,6 +158,7 @@ impl<'r> ImportResolver<'r> {
 		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
 		let mut resolver = ImportResolver {
 			diagnostics,
+			resolutions,
 			strings,
 			namespaces,
 			use_items,
@@ -641,7 +645,19 @@ impl<'r> ImportResolver<'r> {
 			key,
 		) {
 			BindingLookup::NotFound => return ImportSlot::Absent,
-			BindingLookup::Found(target, visibility) => (target, visibility),
+			BindingLookup::Found {
+				target,
+				visibility,
+				import,
+			} => {
+				if let Some(def_key) = target.def_key() {
+					self.resolutions.by_site.insert(
+						(source_span, key.tier),
+						Referent::from_lookup(def_key, import),
+					);
+				}
+				(target, visibility)
+			}
 			BindingLookup::Ambiguous(candidates) => {
 				let diagnostic = report_ambiguous_identifier(
 					self.namespaces,
@@ -658,10 +674,7 @@ impl<'r> ImportResolver<'r> {
 				(candidates[0].0, Visibility::Public)
 			}
 		};
-		self.namespaces
-			.record_binding_access(scope, key, source_span);
-
-		let slot = match target {
+		match target {
 			// Already flagged by an earlier link in a re-export chain —
 			// can't become more accessible by being re-exported further.
 			BindingTarget::Inaccessible(def_key) => {
@@ -695,15 +708,7 @@ impl<'r> ImportResolver<'r> {
 			// An `Error`-recovery placeholder — already diagnosed by
 			// whoever caused that, nothing new to report here.
 			BindingTarget::Error => ImportSlot::Errored,
-		};
-
-		if let ImportSlot::Accessible(def_key, _)
-		| ImportSlot::Inaccessible(def_key, _) = slot
-		{
-			self.namespaces.record_access(def_key, source_span);
 		}
-
-		slot
 	}
 
 	fn ensure_import_path(
@@ -842,7 +847,19 @@ impl<'r> ImportResolver<'r> {
 				self.diagnostics.push(diagnostic);
 				return Err(());
 			}
-			BindingLookup::Found(target, visibility) => (target, visibility),
+			BindingLookup::Found {
+				target,
+				visibility,
+				import,
+			} => {
+				if let Some(def_key) = target.def_key() {
+					self.resolutions.by_site.insert(
+						(source_span, key.tier),
+						Referent::from_lookup(def_key, import),
+					);
+				}
+				(target, visibility)
+			}
 			BindingLookup::Ambiguous(candidates) => {
 				let diagnostic = report_ambiguous_identifier(
 					self.namespaces,
@@ -859,17 +876,6 @@ impl<'r> ImportResolver<'r> {
 				(candidates[0].0, Visibility::Public)
 			}
 		};
-		self.namespaces.record_binding_access(
-			target_namespace,
-			key,
-			source_span,
-		);
-
-		if let BindingTarget::Accessible(def_key)
-		| BindingTarget::Inaccessible(def_key) = target
-		{
-			self.namespaces.record_access(def_key, source_span);
-		}
 
 		if !self.namespaces.is_accessible_from(
 			accessor,
@@ -1173,11 +1179,13 @@ mod tests {
 				.assert_no_errors();
 
 			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
 				&mut graph.strings,
 				&mut diagnostics,
+				&mut resolutions,
 				graph.stdlib_package,
 				graph.root_package,
 			);

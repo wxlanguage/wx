@@ -8,7 +8,6 @@ items:
   - inner:
       inner:
         Function:
-          id: 0
           pub_span: ~
           attributes: []
           signature:
@@ -136,7 +135,6 @@ items:
   - inner:
       inner:
         Memory:
-          id: 1
           attributes: []
           name:
             inner: 4
@@ -164,7 +162,6 @@ items:
   - inner:
       inner:
         Global:
-          id: 2
           pub_span: ~
           mut_span:
             start: 69
@@ -203,7 +200,6 @@ items:
   - inner:
       inner:
         Const:
-          id: 3
           pub_span: ~
           name:
             inner: 7
@@ -239,7 +235,6 @@ items:
   - inner:
       inner:
         Struct:
-          id: 4
           pub_span: ~
           attributes: []
           name:
@@ -327,7 +322,6 @@ items:
                     external_name: ~
                     declaration:
                       Function:
-                        id: 5
                         signature:
                           name:
                             inner: 12
@@ -375,7 +369,6 @@ items:
   - inner:
       inner:
         Enum:
-          id: 9
           pub_span: ~
           repr: ~
           name:
@@ -386,7 +379,6 @@ items:
           variants:
             - inner:
                 inner:
-                  id: 6
                   name:
                     inner: 16
                     span:
@@ -401,7 +393,6 @@ items:
                 end: 234
             - inner:
                 inner:
-                  id: 7
                   name:
                     inner: 17
                     span:
@@ -422,7 +413,6 @@ items:
                 end: 249
             - inner:
                 inner:
-                  id: 8
                   name:
                     inner: 18
                     span:

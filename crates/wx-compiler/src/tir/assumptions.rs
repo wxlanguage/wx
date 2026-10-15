@@ -60,7 +60,7 @@ pub(super) enum AssumptionKind<'a> {
 
 /// The subject is already instantiated. An equality's RHS stays borrowed
 /// from its source tree; `self_substitution` supplies its meaning of Self.
-pub(super) struct Assumption<'a> {
+pub(super) struct Fact<'a> {
 	pub(super) subject: TypeIndex,
 	pub(super) kind: AssumptionKind<'a>,
 	pub(super) self_substitution: Option<SelfSubstitution>,
@@ -110,9 +110,9 @@ impl<'a> AssumptionReader<'a> {
 		&self,
 		subject: TypeIndex,
 		types: &TypeInterner,
-		remaining_depth: usize,
+		recursion_budget: usize,
 	) -> AssumptionFacts<'a> {
-		let bounds = self.effective_bounds(types, subject, remaining_depth);
+		let bounds = self.effective_bounds(types, subject, recursion_budget);
 		let readiness = bounds.readiness;
 		AssumptionFacts {
 			sources: Sources::Subject { subject, bounds },
@@ -154,7 +154,7 @@ impl<'a> ScopedRoots<'a> {
 	fn next(&mut self, types: &TypeInterner) -> Option<BoundSource<'a>> {
 		while let Some(env) = self.scope {
 			if env != TypeEnvIdx::ROOT {
-				let params = self.type_envs.frame(env);
+				let params = self.type_envs.params(env);
 				while let Some(param) = params.get(self.param_index) {
 					let index = self.param_index;
 					self.param_index += 1;
@@ -173,7 +173,7 @@ impl<'a> ScopedRoots<'a> {
 						subject: param.ty,
 						bounds: facts.current(),
 						context: None,
-						reflexive_trait: match self.type_envs.frame_owner(env) {
+						reflexive_trait: match self.type_envs.owner(env) {
 							TypeEnvOwner::Trait(index) => Some(index),
 							_ => None,
 						},
@@ -254,7 +254,7 @@ impl<'a> AssumptionFacts<'a> {
 	pub(super) fn next(
 		&mut self,
 		types: &mut TypeInterner,
-	) -> Option<Assumption<'a>> {
+	) -> Option<Fact<'a>> {
 		loop {
 			match self.current.take() {
 				Some(Visit::Traits {
@@ -284,7 +284,7 @@ impl<'a> AssumptionFacts<'a> {
 							context,
 						});
 					}
-					return Some(Assumption {
+					return Some(Fact {
 						subject,
 						kind: AssumptionKind::Trait {
 							trait_index: bound.trait_index,
@@ -328,7 +328,7 @@ impl<'a> AssumptionFacts<'a> {
 						});
 					}
 					if !matches!(binding.kind, ImpliedBindingKind::Bound) {
-						return Some(Assumption {
+						return Some(Fact {
 							subject: projection,
 							kind: AssumptionKind::Equality(&binding.kind),
 							self_substitution: context,
@@ -343,7 +343,7 @@ impl<'a> AssumptionFacts<'a> {
 						context: source.context,
 					});
 					if let Some(trait_index) = source.reflexive_trait {
-						return Some(Assumption {
+						return Some(Fact {
 							subject: source.subject,
 							kind: AssumptionKind::Trait {
 								trait_index,
@@ -498,21 +498,19 @@ impl<'a> AssumptionReader<'a> {
 		&self,
 		types: &TypeInterner,
 		mut receiver: TypeIndex,
-		remaining_depth: usize,
+		recursion_budget: usize,
 	) -> EffectiveBounds<'a> {
 		let reflexive_trait = match *types.resolve(receiver) {
-			Type::TypeParam { env, .. } => {
-				match self.type_envs.frame_owner(env) {
-					TypeEnvOwner::Trait(index) => Some(index),
-					_ => None,
-				}
-			}
+			Type::TypeParam { env, .. } => match self.type_envs.owner(env) {
+				TypeEnvOwner::Trait(index) => Some(index),
+				_ => None,
+			},
 			_ => None,
 		};
 		let mut projections = None;
 		let mut root = &[][..];
 		let mut readiness = Readiness::Ready;
-		let mut remaining = remaining_depth;
+		let mut remaining = recursion_budget;
 		while remaining > 0 {
 			match *types.resolve(receiver) {
 				Type::TypeParam { env, param_index } => {
@@ -603,7 +601,7 @@ impl TypeContext<'_, '_, '_> {
 		self.reader().effective_bounds(
 			&self.types,
 			receiver,
-			self.solver.remaining_depth(),
+			self.solver.state.recursion_budget,
 		)
 	}
 }

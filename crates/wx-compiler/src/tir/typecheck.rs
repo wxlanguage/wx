@@ -12,7 +12,7 @@
 use codespan_reporting::diagnostic::Diagnostic;
 
 use super::body::{Body, BodyBuilder, ExprIdx, ExprKind};
-use super::defs::{DefKind, MemberKind, Scope, Tier, TypesetIdx};
+use super::defs::{ConstIdx, DefKind, MemberKind, Scope, Tier, TypesetIdx};
 use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::operators::{
@@ -63,6 +63,52 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.finish(root)
 	}
 
+	/// Checks an enum variant's value as a value of the enum's `repr`. A
+	/// variant written without one counts on from `previous`, the variant
+	/// before it; the first variant has nothing to count from.
+	pub(super) fn check_variant_value(
+		mut self,
+		variant: &ast::EnumVariant,
+		previous: Option<ConstIdx>,
+		repr: TypeIndex,
+	) -> Body {
+		let span = variant.name.span;
+		// A missing or non-integer repr was reported on the enum; checking each
+		// value against it would only repeat that.
+		if repr == TypeIndex::ERROR {
+			let root = self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			return self.body.finish(root);
+		}
+		let root = match (variant.value.as_deref(), previous) {
+			(Some(value), _) => self.check(value, repr),
+			(None, Some(previous)) => {
+				self.body
+					.push(ExprKind::NextDiscriminant(previous), repr, span)
+			}
+			(None, None) => {
+				let label = self
+					.source_span(span)
+					.primary_label()
+					.with_message("add `= <value>` here");
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::EnumVariantRequiresExplicitValue
+								.code(),
+						)
+						.with_message("enum variant requires an explicit value")
+						.with_label(label)
+						.with_note(
+							"or add a value to an earlier variant to anchor \
+							 auto-increment",
+						),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+		};
+		self.body.finish(root)
+	}
+
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
 	/// type, any other type must equal it. `INFER` and `ERROR` expect nothing.
 	fn check(
@@ -84,6 +130,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		} else if actual != TypeIndex::ERROR && actual != expected {
 			let diagnostic = self.report_type_mismatch(expected, actual, expr);
 			self.cx.diagnostics.push(diagnostic);
+			// Reported: nothing reads a value from it, or reports it again.
+			self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		expr
 	}
@@ -152,22 +200,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// A value path. Only constants are modelled yet; a path the checker does
-	/// not cover, including an associated item reached through a type, is
-	/// `Unsupported` rather than an error.
+	/// A value path. Only constants and enum variants are modelled yet; a
+	/// path the checker does not cover, including an associated item reached
+	/// through a type, is `Unsupported` rather than an error.
 	fn build_path(
 		&mut self,
 		segments: &[ast::PathSegment],
 		span: TextSpan,
 	) -> ExprIdx {
-		let walk = PathResolver::new(self.cx.defs).walk_path(
+		let walk = PathResolver::new(
 			self.cx.diagnostics,
+			self.cx.resolutions,
 			self.cx.strings,
-			self.file_id,
-			self.namespace,
-			segments,
-			Tier::Value,
-		);
+			self.cx.defs,
+		)
+		.walk_path(self.file_id, self.namespace, segments, Tier::Value);
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -179,7 +226,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			);
 		}
 		match key.symbol_kind(self.cx.defs) {
-			DefKind::Const(const_index) => {
+			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
 				let (ty, scope) = self.cx.constant_type(const_index);
 				let ty = self.normalized(ty, scope);
 				self.body.push(ExprKind::Const(const_index), ty, span)
@@ -417,7 +464,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Ok(found) => found.map(|lookup| (method, lookup)),
 					Err(error) => {
 						let site = self.source_span(op_span);
-						let _ = self.cx.report_unsolved::<()>(Err(error), site);
+						let _ =
+							self.cx.report_solver_error::<()>(Err(error), site);
 						return None;
 					}
 				}

@@ -149,7 +149,7 @@ impl File {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct FileId(u32);
 
 impl FileId {
@@ -369,7 +369,6 @@ pub struct CompilationUnit {
 	/// `Option`. Equal to `root_package` when the root package *is* the
 	/// stdlib.
 	pub stdlib_package: PackageId,
-	pub id_generator: ast::DefIdGenerator,
 	pub strings: ast::StringInterner,
 }
 
@@ -407,7 +406,6 @@ impl CompilationUnit {
 
 pub struct CompilationUnitBuilder {
 	pub files: Files,
-	pub id_generator: ast::DefIdGenerator,
 	pub strings: ast::StringInterner,
 	pub packages: Vec<Package>,
 	/// Set once the stdlib exists, and seeded into every package loaded
@@ -486,7 +484,6 @@ impl CompilationUnitBuilder {
 	pub fn new() -> Self {
 		Self {
 			files: Files::new(),
-			id_generator: ast::DefIdGenerator::new(),
 			strings: ast::Keyword::create_interner(),
 			packages: Vec::new(),
 			stdlib: None,
@@ -661,7 +658,6 @@ impl CompilationUnitBuilder {
 			packages: self.packages,
 			root_package,
 			stdlib_package,
-			id_generator: self.id_generator,
 			strings: self.strings,
 		}
 	}
@@ -720,12 +716,8 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			.expect(
 				"file count should never realistically approach FileId's limit",
 			);
-		let ast = ast::Parser::parse(
-			file_id,
-			&self.ctx.files,
-			&mut self.ctx.strings,
-			&mut self.ctx.id_generator,
-		);
+		let ast =
+			ast::Parser::parse(file_id, &self.ctx.files, &mut self.ctx.strings);
 
 		let module_id = ModuleId(self.modules.len() as u32);
 		let child_decls: Box<[ModuleDeclaration]> = ast

@@ -1572,14 +1572,12 @@ pub enum ImplItem {
 	/// A method or associated function — TIR distinguishes the two after
 	/// parsing, by checking whether the first param is named `self`.
 	Function {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 		block: Box<Spanned<Expression>>,
 	},
 	Constant {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
@@ -1587,7 +1585,6 @@ pub enum ImplItem {
 		attributes: Box<[Attribute]>,
 	},
 	AssocType {
-		id: DefId,
 		/// Always an error to have set — an associated type is only legal in
 		/// a trait impl, where visibility comes from the trait. Recorded
 		/// anyway so the qualifier can be reported and round-tripped:
@@ -1613,7 +1610,6 @@ impl ImplItem {
 pub enum TraitItem {
 	/// A method with an optional default body.
 	Function {
-		id: DefId,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 		/// `None` = abstract (must be provided by impl); `Some` = default
@@ -1624,7 +1620,6 @@ pub enum TraitItem {
 	/// `None` = abstract (must be provided by every impl); `Some` = a
 	/// default value impls may omit and inherit as-is.
 	Const {
-		id: DefId,
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		ty: Box<Spanned<TypeExpression>>,
@@ -1632,7 +1627,6 @@ pub enum TraitItem {
 	},
 	/// An associated type declaration, optionally with a default value.
 	AssociatedType {
-		id: DefId,
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		/// Trait bounds the concrete type must satisfy. `None` = unconstrained.
@@ -1678,8 +1672,6 @@ pub enum UseTree {
 	/// `*` — every visible name in the namespace walked to so far.
 	Glob { segment: Spanned<SymbolU32> },
 	/// A single imported name, optionally renamed: `add`, `add as plus`.
-	/// Carries its own `DefId` — this leaf is what binds a local name, so
-	/// it is what `claim_name_binding` and `item_lookup` key on.
 	Name {
 		segment: Spanned<SymbolU32>,
 		alias: Option<Spanned<SymbolU32>>,
@@ -1712,17 +1704,14 @@ pub struct ExportEntry {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum ImportDeclaration {
 	Function {
-		id: DefId,
 		signature: FunctionSignature,
 	},
 	Global {
-		id: DefId,
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Box<Spanned<TypeExpression>>,
 	},
 	Memory {
-		id: DefId,
 		name: Spanned<SymbolU32>,
 		size: Box<Spanned<TypeExpression>>,
 	},
@@ -1738,60 +1727,25 @@ pub struct ImportEntry {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct EnumVariant {
-	pub id: DefId,
 	pub name: Spanned<SymbolU32>,
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct DefId(u32);
-
-impl DefId {
-	#[inline]
-	pub fn as_u32(self) -> u32 {
-		self.0
-	}
-}
-
-#[derive(Clone, Copy)]
-pub struct DefIdGenerator {
-	next_id: u32,
-}
-
-impl DefIdGenerator {
-	#[inline]
-	pub fn new() -> Self {
-		DefIdGenerator { next_id: 0 }
-	}
-
-	#[inline]
-	pub fn next_id(&mut self) -> DefId {
-		let id = self.next_id;
-		self.next_id += 1;
-		DefId(id)
-	}
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
 pub enum Item {
 	Function {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 		block: Box<Spanned<Expression>>,
 	},
 	FunctionDeclaration {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 	},
 	Global {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
@@ -1813,7 +1767,6 @@ pub enum Item {
 		items: Spanned<Box<[Separated<Spanned<ImportEntry>>]>>,
 	},
 	Enum {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		repr: Option<Box<Spanned<TypeExpression>>>,
 		name: Spanned<SymbolU32>,
@@ -1822,14 +1775,12 @@ pub enum Item {
 	},
 	/// `impl Type { ... }`
 	InherentImpl {
-		id: DefId,
 		type_params: Box<[TypeParam]>,
 		target: Path,
 		items: Box<[Separated<Spanned<ImplItem>>]>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
 	TraitImpl {
-		id: DefId,
 		type_params: Box<[TypeParam]>,
 		/// Plain path to the trait, e.g. `module::Trait`.
 		trait_name: Path,
@@ -1841,7 +1792,6 @@ pub enum Item {
 	/// `pub`; a struct is constructed by a call, by position always and by
 	/// name when every field has one.
 	Struct {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
@@ -1849,13 +1799,11 @@ pub enum Item {
 		fields: Box<[Separated<Spanned<StructField>>]>,
 	},
 	Memory {
-		id: DefId,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		size: Box<Spanned<TypeExpression>>,
 	},
 	Const {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
@@ -1872,7 +1820,6 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 	},
 	Trait {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
@@ -1885,7 +1832,6 @@ pub enum Item {
 	/// member: each member must satisfy `A + B`, and a body generic over the
 	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
@@ -1897,12 +1843,6 @@ pub enum Item {
 	},
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
-	///
-	/// The `DefId` lives on each `UseTree::Name` leaf rather than here: one
-	/// `use` item can bind several names, and `ensure_signature` keys its
-	/// compute state — and `item_lookup` its declaration span — per `DefId`.
-	/// A leaf is the thing that binds a name, so a leaf is the thing that
-	/// gets an id.
 	Use {
 		pub_span: Option<TextSpan>,
 		tree: Spanned<UseTree>,
@@ -1911,7 +1851,6 @@ pub enum Item {
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
 	/// declaration (primitives).
 	TypeAlias {
-		id: DefId,
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		type_params: Box<[TypeParam]>,
@@ -2153,9 +2092,8 @@ impl Keyword {
 pub struct Parser<'input> {
 	source: &'input str,
 	lexer: Lexer<'input>,
-	interner: &'input mut StringInterner,
+	strings: &'input mut StringInterner,
 	ast: AST,
-	id_generator: &'input mut DefIdGenerator,
 }
 
 struct SeparatedGroup<T> {
@@ -2300,21 +2238,19 @@ impl<'ctx> Parser<'ctx> {
 	pub fn parse(
 		file_id: FileId,
 		files: &'ctx vfs::Files,
-		interner: &'ctx mut StringInterner,
-		id_generator: &'ctx mut DefIdGenerator,
+		strings: &'ctx mut StringInterner,
 	) -> AST {
 		let source = &files.get(file_id).unwrap().source;
 		let mut parser = Self {
 			source,
 			lexer: Lexer::new(source),
-			interner,
+			strings,
 			ast: AST {
 				file_id,
 				diagnostics: Vec::new(),
 				items: Vec::new(),
 				comments: CommentMap::empty(),
 			},
-			id_generator,
 		};
 
 		loop {
@@ -2512,7 +2448,7 @@ impl<'ctx> Parser<'ctx> {
 				.push(report_reserved_identifier(self.ast.file_id, span));
 		}
 
-		self.interner.get_or_intern(text)
+		self.strings.get_or_intern(text)
 	}
 
 	fn parse_attributes(parser: &mut Parser) -> Result<Box<[Attribute]>, ()> {
@@ -2533,7 +2469,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 			let name_span = parser.lexer.next().span;
 			let name_symbol = parser
-				.interner
+				.strings
 				.get_or_intern(name_span.extract_str(parser.source));
 
 			let value = if parser.lexer.next_if(Token::Eq).is_some() {
@@ -2643,7 +2579,7 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let name = Spanned {
-			inner: parser.interner.get_or_intern(text),
+			inner: parser.strings.get_or_intern(text),
 			span: name_span,
 		};
 
@@ -2682,7 +2618,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 		let name_symbol = self
-			.interner
+			.strings
 			.get_or_intern(name_span.extract_str(self.source));
 		let name = Spanned {
 			inner: name_symbol,
@@ -2916,13 +2852,11 @@ impl<'ctx> Parser<'ctx> {
 					attributes: Box::new([]),
 					signature: signature.inner,
 					block,
-					id: parser.id_generator.next_id(),
 				},
 				None => Item::FunctionDeclaration {
 					pub_span: None,
 					attributes: Box::new([]),
 					signature: signature.inner,
-					id: parser.id_generator.next_id(),
 				},
 			},
 			span,
@@ -3082,7 +3016,7 @@ impl<'ctx> Parser<'ctx> {
 					| Ok(Keyword::Super) => {
 						let tok = self.lexer.next();
 						let sym = self
-							.interner
+							.strings
 							.get_or_intern(tok.span.extract_str(self.source));
 						(tok, sym)
 					}
@@ -3688,7 +3622,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let symbol = parser.interner.get_or_intern(text);
+		let symbol = parser.strings.get_or_intern(text);
 		let start = token.span;
 
 		// Start the path with the first segment (no type args yet).
@@ -3724,7 +3658,7 @@ impl<'ctx> Parser<'ctx> {
 				Token::Identifier => {
 					let seg_token = parser.lexer.next();
 					let seg_text = seg_token.span.extract_str(parser.source);
-					let seg_symbol = parser.interner.get_or_intern(seg_text);
+					let seg_symbol = parser.strings.get_or_intern(seg_text);
 					segments.push(PathSegment {
 						ident: Spanned {
 							inner: seg_symbol,
@@ -5086,7 +5020,6 @@ impl<'ctx> Parser<'ctx> {
 				name,
 				ty,
 				value: Box::new(value),
-				id: parser.id_generator.next_id(),
 				attributes: Box::new([]),
 			},
 			span,
@@ -5110,7 +5043,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(const_span.start, value.span.end);
 		Ok(Spanned {
 			inner: Item::Const {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -5262,7 +5194,6 @@ impl<'ctx> Parser<'ctx> {
 
 					Ok(Spanned {
 						inner: EnumVariant {
-							id: parser.id_generator.next_id(),
 							name: Spanned {
 								inner: name_symbol,
 								span: name_token.span,
@@ -5280,7 +5211,6 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Enum {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				repr,
 				name: Spanned {
@@ -5311,7 +5241,6 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(type_span.start, ty.span.end);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
-						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5342,7 +5271,6 @@ impl<'ctx> Parser<'ctx> {
 				let span = TextSpan::new(const_span.start, value.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
-						id: parser.id_generator.next_id(),
 						pub_span,
 						name: Spanned {
 							inner: name_symbol,
@@ -5388,7 +5316,6 @@ impl<'ctx> Parser<'ctx> {
 				let method_span = TextSpan::new(fn_span.start, block.span.end);
 				Ok(Spanned {
 					inner: ImplItem::Function {
-						id: parser.id_generator.next_id(),
 						pub_span,
 						attributes: attrs,
 						signature: FunctionSignature {
@@ -5477,7 +5404,6 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
 				inner: Item::TraitImpl {
-					id: parser.id_generator.next_id(),
 					type_params,
 					items: items.inner,
 					target,
@@ -5501,7 +5427,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::InherentImpl {
-				id: parser.id_generator.next_id(),
 				type_params,
 				items: items.inner,
 				target: first_path,
@@ -5592,7 +5517,6 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::AssociatedType {
-									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5629,7 +5553,6 @@ impl<'ctx> Parser<'ctx> {
 							);
 							Ok(Spanned {
 								inner: TraitItem::Const {
-									id: parser.id_generator.next_id(),
 									name: Spanned {
 										inner: name_symbol,
 										span: name_span,
@@ -5663,7 +5586,6 @@ impl<'ctx> Parser<'ctx> {
 
 							Ok(Spanned {
 								inner: TraitItem::Function {
-									id: parser.id_generator.next_id(),
 									attributes,
 									signature: signature.inner,
 									body,
@@ -5693,7 +5615,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(trait_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::Trait {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5741,7 +5662,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(typeset_span.start, members.span.end);
 		Ok(Spanned {
 			inner: Item::TypeSet {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5814,7 +5734,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
 			inner: Item::Struct {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				attributes: Box::new([]),
 				name,
@@ -5898,7 +5817,6 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(type_span.start, end);
 		Ok(Spanned {
 			inner: Item::TypeAlias {
-				id: parser.id_generator.next_id(),
 				pub_span: None,
 				name: Spanned {
 					inner: name_symbol,
@@ -5983,7 +5901,6 @@ impl<'ctx> Parser<'ctx> {
 				attributes: Box::new([]),
 				name,
 				size,
-				id: parser.id_generator.next_id(),
 			},
 			span,
 		})
@@ -6016,7 +5933,6 @@ impl<'ctx> Parser<'ctx> {
 				mut_span,
 				name,
 				ty: Box::new(type_expr),
-				id: self.id_generator.next_id(),
 			},
 			span,
 		})
@@ -6035,11 +5951,7 @@ impl<'ctx> Parser<'ctx> {
 		let size = Box::new(self.parse_type_expression()?);
 		let span = TextSpan::new(keyword_span.start, size.span.end);
 		Ok(Spanned {
-			inner: ImportDeclaration::Memory {
-				name,
-				size,
-				id: self.id_generator.next_id(),
-			},
+			inner: ImportDeclaration::Memory { name, size },
 			span,
 		})
 	}
@@ -6061,7 +5973,6 @@ impl<'ctx> Parser<'ctx> {
 						external_name: None,
 						declaration: ImportDeclaration::Function {
 							signature: signature.inner,
-							id: parser.id_generator.next_id(),
 						},
 					},
 					span: signature.span,
@@ -6182,7 +6093,7 @@ impl<'ctx> Parser<'ctx> {
 		let text = token.span.extract_str(self.source);
 		let symbol = match Keyword::try_from(text) {
 			Ok(Keyword::Crate | Keyword::Super | Keyword::SelfLower)
-			| Err(_) => self.interner.get_or_intern(text),
+			| Err(_) => self.strings.get_or_intern(text),
 			Ok(kwd) => {
 				self.ast.diagnostics.push(report_reserved_identifier(
 					self.ast.file_id,

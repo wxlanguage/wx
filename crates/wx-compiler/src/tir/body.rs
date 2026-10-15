@@ -38,6 +38,9 @@ pub(super) enum ExprKind {
 	Bool(bool),
 	Char(char),
 	Const(ConstIdx),
+	/// An enum variant written without a value: the value of the variant
+	/// before it, plus one, in the enum's repr.
+	NextDiscriminant(ConstIdx),
 	/// A builtin operator: the operand is a primitive scalar.
 	Unary {
 		op: UnaryOp,
@@ -181,7 +184,8 @@ impl BodyBuilder {
 			| ExprKind::Float(_)
 			| ExprKind::Bool(_)
 			| ExprKind::Char(_)
-			| ExprKind::Const(_) => ([None, None], &[]),
+			| ExprKind::Const(_)
+			| ExprKind::NextDiscriminant(_) => ([None, None], &[]),
 		};
 		fixed.into_iter().flatten().chain(args.iter().copied())
 	}

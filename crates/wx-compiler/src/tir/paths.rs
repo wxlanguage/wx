@@ -63,12 +63,14 @@ use crate::{
 
 use super::defs::{
 	BindingKey, BindingLookup, BindingTarget, DefKey, DefinitionRegistry,
-	Namespace, Namespaces, Scope, Tier, UseItemDef,
+	Namespace, Scope, Tier,
 };
 use super::imports::{
 	report_ambiguous_identifier, report_cannot_use_as_namespace,
 	report_private_identifier,
 };
+use super::resolutions::{NameResolutions, Referent};
+use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
 
 /// The result of walking a whole path. `stopped_with` is the answer for
 /// `segments[stopped_at]`:
@@ -88,10 +90,9 @@ use super::imports::{
 ///
 /// Both fields are private — [`PathResolver::walk_path`] is the intended
 /// way to consume a resolution, turning this raw shape into the smaller,
-/// already-diagnosed [`PathWalk`]. `try_resolve_path` itself still stays
-/// diagnostics-free internally (same reasoning as
-/// `Namespaces::try_insert_binding`); it's just that nothing outside
-/// this file gets to see its raw result anymore.
+/// already-diagnosed [`PathWalk`]. `try_resolve_path` itself reports
+/// nothing (same reasoning as `Namespaces::try_insert_binding`); it only
+/// records the segments it resolves in `NameResolutions`.
 ///
 /// `stopped_at` is `u32`, not `usize` — a path realistically never has more
 /// than a handful of segments, so matching every other arena/segment index
@@ -109,6 +110,11 @@ struct PathResolution {
 	/// which is what makes "a hop, but no DefKey" unrepresentable here
 	/// rather than a case this type has to account for.
 	first_inaccessible: Option<(u32, DefKey)>,
+	/// `(segment index, its DefKey)` for the earliest namespace the path
+	/// passed through that was written with generic arguments (`m<u8>::S`).
+	/// A namespace has no generic parameters; the last segment's arguments
+	/// are the caller's, since only it knows what they apply to.
+	first_namespace_with_type_args: Option<(u32, DefKey)>,
 }
 
 /// [`PathResolver::walk_path`]'s result: the target reached, and which
@@ -128,20 +134,30 @@ impl PathWalk {
 	}
 }
 
-/// Namespace-graph path resolution, holding just the read-only inputs
-/// every call needs — see the module docs for what this does and doesn't
-/// cover.
+/// Namespace-graph path resolution, holding everything a walk reads and
+/// writes, so a call only describes the path — see the module docs for
+/// what this does and doesn't cover. Built for one call, so its borrows end
+/// with it.
 pub(super) struct PathResolver<'r> {
-	namespaces: &'r Namespaces,
-	use_items: &'r [UseItemDef],
+	diagnostics: &'r mut Vec<Diagnostic<FileId>>,
+	resolutions: &'r mut NameResolutions,
+	strings: &'r StringInterner,
+	defs: &'r DefinitionRegistry,
 	stdlib_root: Namespace,
 }
 
 impl<'r> PathResolver<'r> {
-	pub(super) fn new(defs: &'r DefinitionRegistry) -> Self {
+	pub(super) fn new(
+		diagnostics: &'r mut Vec<Diagnostic<FileId>>,
+		resolutions: &'r mut NameResolutions,
+		strings: &'r StringInterner,
+		defs: &'r DefinitionRegistry,
+	) -> Self {
 		Self {
-			namespaces: &defs.namespaces,
-			use_items: &defs.use_items,
+			diagnostics,
+			resolutions,
+			strings,
+			defs,
 			stdlib_root: Namespace::Package(defs.stdlib_package),
 		}
 	}
@@ -156,7 +172,8 @@ impl<'r> PathResolver<'r> {
 	/// Private: [`Self::resolve_path`] is the surface other modules
 	/// use — see [`PathResolution`]'s own doc comment for why.
 	fn try_resolve_path(
-		&self,
+		&mut self,
+		file_id: FileId,
 		accessor: Scope,
 		segments: &[PathSegment],
 		tier: Tier,
@@ -168,6 +185,7 @@ impl<'r> PathResolver<'r> {
 
 		let mut base = Namespace::from(accessor);
 		let mut first_inaccessible = None;
+		let mut first_namespace_with_type_args = None;
 		for (index, segment) in segments.iter().enumerate() {
 			let is_last = index + 1 == segments.len();
 			let seg_tier = if is_last { tier } else { Tier::Type };
@@ -175,25 +193,46 @@ impl<'r> PathResolver<'r> {
 
 			// The std-prelude fallback only ever applies to the first
 			// segment, and only once nothing binds it directly.
-			let mut outcome =
-				self.namespaces.lookup(self.use_items, accessor, base, key);
+			let mut outcome = self.defs.namespaces.lookup(
+				&self.defs.use_items,
+				accessor,
+				base,
+				key,
+			);
 			if index == 0 && matches!(outcome, BindingLookup::NotFound) {
 				base = self.stdlib_root;
-				outcome =
-					self.namespaces.lookup(self.use_items, accessor, base, key);
+				outcome = self.defs.namespaces.lookup(
+					&self.defs.use_items,
+					accessor,
+					base,
+					key,
+				);
 			}
 
 			match &outcome {
-				BindingLookup::Found(target, visibility) => {
+				BindingLookup::Found {
+					target,
+					visibility,
+					import,
+				} => {
 					// `target.def_key()` computed once and reused below —
 					// also what makes an already-errored placeholder
 					// (`None` here) never get checked for accessibility at
 					// all, so `first_inaccessible` can never end up with a
 					// hop that has no real `DefKey` behind it.
 					let def_key = target.def_key();
+					if let Some(def_key) = def_key {
+						self.resolutions.by_site.insert(
+							(
+								SourceSpan::new(file_id, segment.ident.span),
+								seg_tier,
+							),
+							Referent::from_lookup(def_key, *import),
+						);
+					}
 					if first_inaccessible.is_none()
 						&& let Some(def_key) = def_key
-						&& !self.namespaces.is_accessible_from(
+						&& !self.defs.namespaces.is_accessible_from(
 							accessor,
 							base,
 							*visibility,
@@ -205,6 +244,7 @@ impl<'r> PathResolver<'r> {
 							stopped_at: index as u32,
 							stopped_with: outcome,
 							first_inaccessible,
+							first_namespace_with_type_args,
 						};
 					}
 					let Some(def_key) = def_key else {
@@ -214,17 +254,25 @@ impl<'r> PathResolver<'r> {
 							stopped_at: index as u32,
 							stopped_with: outcome,
 							first_inaccessible,
+							first_namespace_with_type_args,
 						};
 					};
 					let Some(namespace) =
-						Namespace::of(self.namespaces.kind(def_key))
+						Namespace::of(self.defs.namespaces.kind(def_key))
 					else {
 						return PathResolution {
 							stopped_at: index as u32,
 							stopped_with: outcome,
 							first_inaccessible,
+							first_namespace_with_type_args,
 						};
 					};
+					if first_namespace_with_type_args.is_none()
+						&& !segment.type_args.is_empty()
+					{
+						first_namespace_with_type_args =
+							Some((index as u32, def_key));
+					}
 					base = namespace;
 				}
 				BindingLookup::NotFound | BindingLookup::Ambiguous(_) => {
@@ -232,6 +280,7 @@ impl<'r> PathResolver<'r> {
 						stopped_at: index as u32,
 						stopped_with: outcome,
 						first_inaccessible,
+						first_namespace_with_type_args,
 					};
 				}
 			}
@@ -259,16 +308,18 @@ impl<'r> PathResolver<'r> {
 	/// past this module's own edge (`members.rs`'s territory) calls this
 	/// directly and decides for itself, using [`PathWalk::stopped_at`] to
 	/// know where to pick up from.
+	///
+	/// Every segment that resolves to a definition is recorded in
+	/// `resolutions`, including the one the walk stopped at.
 	pub(super) fn walk_path(
-		&self,
-		diagnostics: &mut Vec<Diagnostic<FileId>>,
-		strings: &StringInterner,
+		&mut self,
 		file_id: FileId,
 		accessor: Scope,
 		segments: &[PathSegment],
 		tier: Tier,
 	) -> PathWalk {
-		let resolution = self.try_resolve_path(accessor, segments, tier);
+		let resolution =
+			self.try_resolve_path(file_id, accessor, segments, tier);
 		let stopped_at = resolution.stopped_at;
 		let is_last = stopped_at as usize + 1 == segments.len();
 		// Every segment but the last is always looked up in the `Type`
@@ -277,13 +328,25 @@ impl<'r> PathResolver<'r> {
 		let seg_tier = if is_last { tier } else { Tier::Type };
 		let span = segments[stopped_at as usize].ident.span;
 
+		if let Some((index, def_key)) =
+			resolution.first_namespace_with_type_args
+		{
+			let segment = &segments[index as usize];
+			self.diagnostics.push(report_type_arg_count_mismatch(
+				self.strings,
+				self.defs,
+				file_id,
+				segment,
+				TypeArgsTarget::Namespace(self.defs.namespaces.kind(def_key)),
+			));
+		}
 		let target = match &resolution.stopped_with {
-			BindingLookup::Found(target, _) => {
+			BindingLookup::Found { target, .. } => {
 				let target = *target;
 				if let Some((bad, def_key)) = resolution.first_inaccessible {
-					diagnostics.push(report_private_identifier(
-						self.namespaces,
-						strings,
+					self.diagnostics.push(report_private_identifier(
+						&self.defs.namespaces,
+						self.strings,
 						segments[bad as usize].ident.inner,
 						SourceSpan::new(
 							file_id,
@@ -295,8 +358,8 @@ impl<'r> PathResolver<'r> {
 				target
 			}
 			BindingLookup::NotFound => {
-				diagnostics.push(report_not_found(
-					strings,
+				self.diagnostics.push(report_not_found(
+					self.strings,
 					file_id,
 					span,
 					seg_tier,
@@ -305,9 +368,9 @@ impl<'r> PathResolver<'r> {
 				BindingTarget::Error
 			}
 			BindingLookup::Ambiguous(candidates) => {
-				diagnostics.push(report_ambiguous_identifier(
-					self.namespaces,
-					strings,
+				self.diagnostics.push(report_ambiguous_identifier(
+					&self.defs.namespaces,
+					self.strings,
 					segments[stopped_at as usize].ident.inner,
 					SourceSpan::new(file_id, span),
 					candidates,
@@ -325,22 +388,13 @@ impl<'r> PathResolver<'r> {
 	/// plus the one thing every non-continuing caller does with its second
 	/// outcome, not a special path through it.
 	pub(super) fn resolve_path(
-		&self,
-		diagnostics: &mut Vec<Diagnostic<FileId>>,
-		strings: &StringInterner,
+		&mut self,
 		file_id: FileId,
 		accessor: Scope,
 		segments: &[PathSegment],
 		tier: Tier,
 	) -> BindingTarget {
-		let walk = self.walk_path(
-			diagnostics,
-			strings,
-			file_id,
-			accessor,
-			segments,
-			tier,
-		);
+		let walk = self.walk_path(file_id, accessor, segments, tier);
 		if walk.is_complete(segments) {
 			return walk.target;
 		}
@@ -348,9 +402,9 @@ impl<'r> PathResolver<'r> {
 		// (`BindingTarget::Error`) mid-path — already diagnosed by
 		// whoever caused that, nothing new to report.
 		if let Some(def_key) = walk.target.def_key() {
-			diagnostics.push(report_cannot_use_as_namespace(
-				self.namespaces,
-				strings,
+			self.diagnostics.push(report_cannot_use_as_namespace(
+				&self.defs.namespaces,
+				self.strings,
 				segments[walk.stopped_at as usize].ident.inner,
 				SourceSpan::new(
 					file_id,
@@ -448,11 +502,13 @@ mod tests {
 				.assert_no_errors();
 
 			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
 				&mut graph.strings,
 				&mut diagnostics,
+				&mut resolutions,
 				graph.stdlib_package,
 				graph.root_package,
 			);
@@ -503,10 +559,6 @@ mod tests {
 			Scope::Package(self.defs.root_package)
 		}
 
-		fn resolver(&self) -> PathResolver<'_> {
-			PathResolver::new(&self.defs)
-		}
-
 		/// Supply a source offset for diagnostic tests; synthetic queries use empty spans.
 		fn segments(
 			&mut self,
@@ -540,7 +592,14 @@ mod tests {
 			path: &str,
 		) -> PathResolution {
 			let segments = self.segments(path, None);
-			self.resolver().try_resolve_path(from, &segments, tier)
+			let file_id = self.defs.namespaces.file_id(from.into());
+			PathResolver::new(
+				&mut Vec::new(),
+				&mut NameResolutions::default(),
+				&self.graph.strings,
+				&self.defs,
+			)
+			.try_resolve_path(file_id, from, &segments, tier)
 		}
 
 		/// Uses the complete-path API: stopping early produces an error target.
@@ -563,14 +622,14 @@ mod tests {
 			segments: &[PathSegment],
 		) -> ResolutionResult<'_> {
 			let mut diagnostics = Vec::new();
-			let target = self.resolver().resolve_path(
+			let mut resolutions = NameResolutions::default();
+			let target = PathResolver::new(
 				&mut diagnostics,
+				&mut resolutions,
 				&self.graph.strings,
-				file_id,
-				from,
-				segments,
-				tier,
-			);
+				&self.defs,
+			)
+			.resolve_path(file_id, from, segments, tier);
 			ResolutionResult {
 				case: self,
 				target,
@@ -702,14 +761,14 @@ mod tests {
 		let path = "inner::Point::member";
 		let segments = case.segments(path, Some(source.find(path).unwrap()));
 		let mut diagnostics = Vec::new();
-		let walk = case.resolver().walk_path(
+		let mut resolutions = NameResolutions::default();
+		let walk = PathResolver::new(
 			&mut diagnostics,
+			&mut resolutions,
 			&case.graph.strings,
-			file_id,
-			root,
-			&segments,
-			Tier::Type,
-		);
+			&case.defs,
+		)
+		.walk_path(file_id, root, &segments, Tier::Type);
 
 		DiagnosticView::new("walk", &diagnostics, &case.graph.files)
 			.assert_none();
@@ -808,8 +867,10 @@ mod tests {
 		let root = case.root_namespace();
 		let resolution = case.try_resolve(root, Tier::Type, "a::b::C");
 		assert_eq!(resolution.stopped_at, 2);
-		let BindingLookup::Found(BindingTarget::Accessible(target), _) =
-			resolution.stopped_with
+		let BindingLookup::Found {
+			target: BindingTarget::Accessible(target),
+			..
+		} = resolution.stopped_with
 		else {
 			panic!(
 				"expected the terminal definition, got {:?}",
@@ -847,8 +908,10 @@ mod tests {
 		let resolution = case.try_resolve(root, Tier::Type, "a::b::C");
 		assert_eq!(resolution.first_inaccessible, None);
 		assert_eq!(resolution.stopped_at, 2);
-		let BindingLookup::Found(BindingTarget::Accessible(key), _) =
-			resolution.stopped_with
+		let BindingLookup::Found {
+			target: BindingTarget::Accessible(key),
+			..
+		} = resolution.stopped_with
 		else {
 			panic!(
 				"expected the terminal definition, got {:?}",

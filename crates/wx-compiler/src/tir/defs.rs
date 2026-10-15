@@ -12,11 +12,14 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
-	ast::{self, DefId, Keyword, Spanned, StringInterner},
+	ast::{self, Keyword, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	index::index_newtype,
 	small_vec::SmallVec,
-	tir::{imports::ImportResolver, literals::unescape_string_literal},
+	tir::{
+		imports::ImportResolver, literals::unescape_string_literal,
+		resolutions::NameResolutions,
+	},
 	vfs::{FileId, Files, Package, PackageId},
 };
 
@@ -46,7 +49,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	structs: Vec<StructDef>,
 	type_aliases: Vec<TypeAliasDef>,
 	enums: Vec<EnumDef>,
-	typesets: Vec<TypeSetDef>,
+	typesets: Vec<TypesetDef>,
 	functions: Vec<FunctionDef>,
 	memories: Vec<MemoryDef>,
 	globals: Vec<GlobalDef>,
@@ -126,6 +129,7 @@ impl Tier {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct BindingKey {
 	pub(super) tier: Tier,
@@ -154,7 +158,9 @@ impl BindingKey {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitDef {
-	pub def_id: DefId,
+	/// The typeset this trait was generated for, whose signature query builds
+	/// it; `None` for a written trait.
+	pub typeset: Option<TypesetIdx>,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub pub_span: Option<TextSpan>,
@@ -169,7 +175,6 @@ pub struct TraitDef {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitImplDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub members: Vec<TraitMemberDef>,
@@ -182,7 +187,6 @@ pub struct TraitImplDef {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct InherentImplDef {
-	pub def_id: ast::DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	#[cfg_attr(
@@ -197,7 +201,6 @@ pub struct InherentImplDef {
 /// `signatures::StructSignature::field_types`, index-aligned with `fields`.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct StructDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -227,7 +230,6 @@ pub struct FieldDef {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct EnumDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub parent_namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -245,29 +247,23 @@ pub struct EnumDef {
 
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TypeAliasDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 }
 
-/// `typeset X: A + B { m1, m2 }` — `trait_index` is a compiler-generated
-/// trait with no AST node of its own, reusing this typeset's own `def_id`
-/// rather than minting a fresh one (nothing ever names it independently,
-/// and "force this trait's signature" has to mean the same query as
-/// "force this typeset's signature" anyway, since the trait's data — its
-/// supertraits, from the typeset's own `: A + B` clause — is written as a
-/// direct side effect of the typeset's own Phase 2 resolution, not through
-/// an independent `ensure_signature` call on the trait itself).
-/// `member_impls` is index-aligned with the AST's own `members` list —
-/// one pre-allocated synthetic `impl <trait_index> for <member>` slot per
-/// written member, same `def_id`-reuse reasoning, filled in with each
-/// member's resolved type during that same Phase 2 pass.
+/// `typeset X: A + B { m1, m2 }` — `trait_index` is a generated trait with
+/// no AST node of its own (`TraitDef::typeset` names this typeset). Its
+/// data, the supertraits from `: A + B`, is written by this typeset's
+/// signature query, so forcing the trait means forcing `DefId::Typeset`.
+/// `member_impls` is index-aligned with the AST's own `members` list: one
+/// generated `impl <trait_index> for <member>` per written member, filled in
+/// with the member's resolved type by that same query.
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct TypeSetDef {
-	pub def_id: DefId,
+pub struct TypesetDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
+	pub name: Spanned<SymbolU32>,
 	pub trait_index: TraitIdx,
 	pub member_impls: Box<[TraitImplIdx]>,
 }
@@ -278,7 +274,6 @@ pub struct TypeSetDef {
 /// here, same split as `StructDef`/`StructSignature`.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -289,10 +284,9 @@ pub struct FunctionDef {
 /// expression remains in the AST for later resolution.
 ///
 /// `trait_impl_index`/`size_assoc_type_index` are this memory's synthetic
-/// `impl Memory for <memory>` — pre-allocated unconditionally, here, same
-/// `def_id`-reuse reasoning as `TypeSetDef`'s own synthetic impls (see that
-/// struct's doc comment): nothing ever forces these through their own
-/// `ensure_signature` query, they're populated directly as a side effect of
+/// `impl Memory for <memory>` — pre-allocated unconditionally, here. Like a
+/// typeset's generated impls (see `TypesetDef`), nothing forces these
+/// through a query of their own: they're populated as a side effect of
 /// resolving this memory's own signature. Allocating the slot never depends
 /// on `IntrinsicDefs::memory` — it's just an index and a name, no reference
 /// to the `Memory` trait itself. That trait is only needed later, to bucket
@@ -301,7 +295,6 @@ pub struct FunctionDef {
 /// every reader of this struct has to keep re-checking for.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemoryDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -323,7 +316,6 @@ pub struct MemoryDef {
 /// non-`mut` global, unlike the other two fields.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct GlobalDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -336,7 +328,6 @@ pub struct GlobalDef {
 /// resolved in later phases.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConstDef {
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -346,9 +337,6 @@ pub struct ConstDef {
 /// Declared bounds and impl target types remain in the AST for resolution.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct AssocTypeDef {
-	/// Query that populates this slot: the member itself for written items,
-	/// or the owning memory/global for synthetic impl members.
-	pub def_id: DefId,
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -375,7 +363,6 @@ index_newtype!(AssocTypeIdx);
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct TraitMemberDef {
 	pub kind: MemberKind,
-	pub accesses: Vec<SourceSpan>,
 	pub span: TextSpan,
 }
 
@@ -383,7 +370,6 @@ pub struct TraitMemberDef {
 pub struct InherentMemberDef {
 	pub kind: MemberKind,
 	pub visibility: Visibility,
-	pub accesses: Vec<SourceSpan>,
 	pub span: TextSpan,
 }
 
@@ -397,7 +383,6 @@ impl LocalDefIdx {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct AstEntry<'ast> {
-	pub(super) def_id: DefId,
 	pub(super) file_id: FileId,
 	/// The scope the item is written in, where its signature resolves. For
 	/// an imported declaration that is the scope around its import block;
@@ -516,6 +501,51 @@ pub(super) enum AstNodeRef<'ast> {
 	},
 }
 
+impl AstNodeRef<'_> {
+	/// The declaration this entry writes.
+	pub(super) fn def_id(&self) -> DefId {
+		match *self {
+			Self::Function { func_index, .. } => DefId::Function(func_index),
+			Self::TraitFunction { function_index, .. }
+			| Self::TraitImplFunction { function_index, .. }
+			| Self::InherentImplFunction { function_index, .. }
+			| Self::ImportedFunction { function_index, .. } => {
+				DefId::Function(function_index)
+			}
+			Self::Struct { struct_index, .. } => DefId::Struct(struct_index),
+			Self::Enum { enum_index, .. } => DefId::Enum(enum_index),
+			Self::Global { global_index, .. }
+			| Self::ImportedGlobal { global_index, .. } => DefId::Global(global_index),
+			Self::Memory { memory_index, .. }
+			| Self::ImportedMemory { memory_index, .. } => DefId::Memory(memory_index),
+			Self::Constant { const_index, .. }
+			| Self::TraitConst { const_index, .. }
+			| Self::TraitImplConstant { const_index, .. }
+			| Self::InherentImplConst { const_index, .. }
+			| Self::EnumVariant { const_index, .. } => DefId::Const(const_index),
+			Self::TypeSet { typeset_index, .. } => {
+				DefId::Typeset(typeset_index)
+			}
+			Self::TypeAlias {
+				type_alias_index, ..
+			} => DefId::TypeAlias(type_alias_index),
+			Self::Trait { trait_index, .. } => DefId::Trait(trait_index),
+			Self::TraitAssocType {
+				assoc_type_index, ..
+			}
+			| Self::TraitImplAssocType {
+				assoc_type_index, ..
+			} => DefId::AssocType(assoc_type_index),
+			Self::TraitImplBlock { block_index, .. } => {
+				DefId::TraitImpl(block_index)
+			}
+			Self::InherentImplBlock { block_index, .. } => {
+				DefId::InherentImpl(block_index)
+			}
+		}
+	}
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct ExportEntrySource {
 	pub namespace: Scope,
@@ -540,7 +570,7 @@ pub(super) struct DefinitionRegistry {
 	pub inherent_impls: Vec<InherentImplDef>,
 	pub structs: Vec<StructDef>,
 	pub enums: Vec<EnumDef>,
-	pub typesets: Vec<TypeSetDef>,
+	pub typesets: Vec<TypesetDef>,
 	pub functions: Vec<FunctionDef>,
 	pub memories: Vec<MemoryDef>,
 	pub globals: Vec<GlobalDef>,
@@ -687,6 +717,27 @@ impl Visibility {
 	}
 }
 
+/// A declaration: the arena it lives in and its index there (an enum
+/// variant is a constant). Assigned by the
+/// prescan, which is what decides what a declaration is; a generated one (a
+/// typeset's trait and impls, a memory's or global's impl) is built by the
+/// signature query of the declaration that generates it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DefId {
+	Struct(StructIdx),
+	Enum(EnumIdx),
+	Trait(TraitIdx),
+	Typeset(TypesetIdx),
+	TypeAlias(TypeAliasIdx),
+	Function(FunctionIdx),
+	Const(ConstIdx),
+	Memory(MemoryIdx),
+	Global(GlobalIdx),
+	AssocType(AssocTypeIdx),
+	TraitImpl(TraitImplIdx),
+	InherentImpl(InherentImplIdx),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -789,16 +840,11 @@ impl Namespace {
 pub(super) struct ItemDef {
 	pub(super) kind: DefKind,
 	pub(super) span: TextSpan,
-	pub(super) accesses: Vec<SourceSpan>,
 }
 
 impl ItemDef {
 	fn new(kind: DefKind, span: TextSpan) -> Self {
-		Self {
-			kind,
-			span,
-			accesses: Vec::new(),
-		}
+		Self { kind, span }
 	}
 }
 
@@ -870,7 +916,14 @@ pub struct Namespaces {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum BindingLookup {
 	NotFound,
-	Found(BindingTarget, Visibility),
+	Found {
+		target: BindingTarget,
+		visibility: Visibility,
+		/// The `use` item in the looked-up namespace that made the binding
+		/// visible there, a named import or a glob; `None` for a declaration
+		/// in that namespace.
+		import: Option<UseItemIndex>,
+	},
 	Ambiguous(Box<[(BindingTarget, SourceSpan)]>),
 }
 
@@ -900,21 +953,33 @@ struct CandidateMerge<'a> {
 	candidates: Candidates,
 }
 
+/// A binding a glob leads to, and the glob that leads there.
+#[derive(Clone, Copy)]
+struct GlobCandidate {
+	target: BindingTarget,
+	visibility: Visibility,
+	/// The glob's span: what an ambiguity between candidates names.
+	span: SourceSpan,
+	/// The glob's `use` item.
+	glob: UseItemIndex,
+}
+
 enum Candidates {
 	Empty,
-	// An already-diagnosed broken edge. Never competes with a real
-	// candidate for ambiguity — kept only as a fallback, and only the
-	// first one seen, so a later re-export sees `Errored` instead of
-	// re-diagnosing `Absent`, mirroring how a broken named `use` installs
-	// its own `Error` placeholder. The moment a real candidate arrives,
-	// this becomes moot for good: `finish` never looks at it again once
-	// `One`/`Many` is reached, so there's nothing to keep it for.
-	Error(Visibility),
-	// `finish` itself never reads this span — `Found` doesn't carry one.
-	// It's kept for `push`: if a second, distinct `DefKey` arrives later
-	// and this candidate turns out to still be a real competitor, its
-	// span is what seeds the new `Many` entry.
-	One(BindingTarget, Visibility, SourceSpan),
+	// An already-diagnosed broken edge (its target is `Error`). Never
+	// competes with a real candidate for ambiguity — kept only as a
+	// fallback, and only the first one seen, so a later re-export sees
+	// `Errored` instead of re-diagnosing `Absent`, mirroring how a broken
+	// named `use` installs its own `Error` placeholder. The moment a real
+	// candidate arrives, this becomes moot for good: `finish` never looks
+	// at it again once `One`/`Many` is reached, so there's nothing to keep
+	// it for.
+	Error(GlobCandidate),
+	// `finish` never reads the span — `Found` doesn't carry one. It's kept
+	// for `push`: if a second, distinct `DefKey` arrives later and this
+	// candidate turns out to still be a real competitor, its span is what
+	// seeds the new `Many` entry.
+	One(GlobCandidate),
 	Many(Vec<(BindingTarget, SourceSpan)>),
 }
 
@@ -927,37 +992,31 @@ impl<'a> CandidateMerge<'a> {
 		}
 	}
 
-	fn push(
-		&mut self,
-		target: BindingTarget,
-		visibility: Visibility,
-		span: SourceSpan,
-	) {
-		let Some(def_key) = target.def_key() else {
+	fn push(&mut self, candidate: GlobCandidate) {
+		let Some(def_key) = candidate.target.def_key() else {
 			if matches!(self.candidates, Candidates::Empty) {
-				self.candidates = Candidates::Error(visibility);
+				self.candidates = Candidates::Error(candidate);
 			}
 			return;
 		};
 
 		match &mut self.candidates {
-			Candidates::Empty | Candidates::Error(..) => {
-				self.candidates = Candidates::One(target, visibility, span);
+			Candidates::Empty | Candidates::Error(_) => {
+				self.candidates = Candidates::One(candidate);
 			}
-			Candidates::One(first_target, first_visibility, first_span) => {
-				let first_key = first_target
+			Candidates::One(first) => {
+				let first_key = first
+					.target
 					.def_key()
 					.expect("a real candidate always carries a DefKey");
 
 				if first_key == def_key {
-					if matches!(target, BindingTarget::Accessible(_))
+					if matches!(candidate.target, BindingTarget::Accessible(_))
 						&& matches!(
-							*first_target,
+							first.target,
 							BindingTarget::Inaccessible(_)
 						) {
-						*first_target = target;
-						*first_visibility = visibility;
-						*first_span = span;
+						*first = candidate;
 					}
 					return;
 				}
@@ -965,19 +1024,19 @@ impl<'a> CandidateMerge<'a> {
 				let first_reachable = self.namespaces.is_accessible_from(
 					self.accessor,
 					first_key.namespace,
-					*first_visibility,
+					first.visibility,
 				);
 				let this_reachable = self.namespaces.is_accessible_from(
 					self.accessor,
 					def_key.namespace,
-					visibility,
+					candidate.visibility,
 				);
 
 				match (first_reachable, this_reachable) {
 					(true, true) => {
 						self.candidates = Candidates::Many(vec![
-							(*first_target, *first_span),
-							(target, span),
+							(first.target, first.span),
+							(candidate.target, candidate.span),
 						]);
 					}
 					// Only one side is a real option for `accessor` — that
@@ -985,8 +1044,7 @@ impl<'a> CandidateMerge<'a> {
 					// already was `first`); neither case is an ambiguity.
 					(true, false) => {}
 					(false, true) => {
-						self.candidates =
-							Candidates::One(target, visibility, span);
+						self.candidates = Candidates::One(candidate);
 					}
 					(false, false) => {}
 				}
@@ -995,25 +1053,27 @@ impl<'a> CandidateMerge<'a> {
 				if !self.namespaces.is_accessible_from(
 					self.accessor,
 					def_key.namespace,
-					visibility,
+					candidate.visibility,
 				) {
 					return;
 				}
 				let slot = items
 					.iter_mut()
-					.find(|(t, _)| t.def_key() == Some(def_key));
+					.find(|(target, _)| target.def_key() == Some(def_key));
 				match slot {
 					Some(slot)
-						if matches!(target, BindingTarget::Accessible(_))
-							&& matches!(
-								slot.0,
-								BindingTarget::Inaccessible(_)
-							) =>
+						if matches!(
+							candidate.target,
+							BindingTarget::Accessible(_)
+						) && matches!(
+							slot.0,
+							BindingTarget::Inaccessible(_)
+						) =>
 					{
-						*slot = (target, span);
+						*slot = (candidate.target, candidate.span);
 					}
 					Some(_) => {}
-					None => items.push((target, span)),
+					None => items.push((candidate.target, candidate.span)),
 				}
 			}
 		}
@@ -1022,11 +1082,12 @@ impl<'a> CandidateMerge<'a> {
 	fn finish(self) -> BindingLookup {
 		match self.candidates {
 			Candidates::Empty => BindingLookup::NotFound,
-			Candidates::Error(visibility) => {
-				BindingLookup::Found(BindingTarget::Error, visibility)
-			}
-			Candidates::One(target, visibility, _) => {
-				BindingLookup::Found(target, visibility)
+			Candidates::Error(found) | Candidates::One(found) => {
+				BindingLookup::Found {
+					target: found.target,
+					visibility: found.visibility,
+					import: Some(found.glob),
+				}
 			}
 			Candidates::Many(items) => {
 				BindingLookup::Ambiguous(items.into_boxed_slice())
@@ -1188,36 +1249,6 @@ impl Namespaces {
 		}
 	}
 
-	/// Records that `def_key` was referenced at `span` — go-to-definition
-	/// and find-references over the *definition itself*, regardless of
-	/// which name/path was used to reach it (a re-export's own consult of
-	/// the original item counts here too, same as a direct reference).
-	pub(super) fn record_access(&mut self, def_key: DefKey, span: SourceSpan) {
-		self.symbols_mut(def_key.namespace).items[usize::from(def_key.def_idx)]
-			.accesses
-			.push(span);
-	}
-
-	/// Records that the binding under `key` in `namespace` was consulted at
-	/// `span` — distinct from `record_access`: this tracks whether *this
-	/// specific name slot* (a direct declaration or a `use`) was ever looked
-	/// up, which is what unused-import/unused-declaration diagnostics need
-	/// and `record_access` alone can't answer (a re-export's own binding can
-	/// sit unused while the original definition it points to is still
-	/// referenced elsewhere).
-	pub(super) fn record_binding_access(
-		&mut self,
-		namespace: Namespace,
-		key: BindingKey,
-		span: SourceSpan,
-	) {
-		if let Some(binding) =
-			self.symbols_mut(namespace).bindings.get_mut(&key)
-		{
-			binding.accesses.push(span);
-		}
-	}
-
 	/// `namespace`'s own binding for `key` — a direct declaration or a
 	/// resolved named `use`. No glob involved, so no ambiguity is
 	/// possible: a `HashMap` has at most one entry per key. Accessor-blind
@@ -1227,11 +1258,8 @@ impl Namespaces {
 		&self,
 		namespace: Namespace,
 		key: BindingKey,
-	) -> Option<(BindingTarget, Visibility)> {
-		self.symbols(namespace)
-			.bindings
-			.get(&key)
-			.map(|binding| (binding.target, binding.visibility))
+	) -> Option<&Binding> {
+		self.symbols(namespace).bindings.get(&key)
 	}
 
 	/// What `target` exposes through its `use path::*;` edges, filtered to
@@ -1280,8 +1308,15 @@ impl Namespaces {
 
 			match self.lookup(use_items, accessor, glob.namespace, key) {
 				BindingLookup::NotFound => {}
-				BindingLookup::Found(target, visibility) => {
-					candidates.push(target, visibility, edge_span);
+				BindingLookup::Found {
+					target, visibility, ..
+				} => {
+					candidates.push(GlobCandidate {
+						target,
+						visibility,
+						span: edge_span,
+						glob: glob.use_item,
+					});
 				}
 				BindingLookup::Ambiguous(nested) => {
 					// Every nested entry was already confirmed accessible
@@ -1291,7 +1326,12 @@ impl Namespaces {
 					// that same "yes" when re-checked just below, not a
 					// claim about its real declared visibility.
 					for (target, span) in nested.iter().copied() {
-						candidates.push(target, Visibility::Public, span);
+						candidates.push(GlobCandidate {
+							target,
+							visibility: Visibility::Public,
+							span,
+							glob: glob.use_item,
+						});
 					}
 				}
 			}
@@ -1312,10 +1352,15 @@ impl Namespaces {
 		target: Namespace,
 		key: BindingKey,
 	) -> BindingLookup {
-		match self.direct_lookup(target.into(), key) {
-			Some((target, visibility)) => {
-				BindingLookup::Found(target, visibility)
-			}
+		match self.direct_lookup(target, key) {
+			Some(binding) => BindingLookup::Found {
+				target: binding.target,
+				visibility: binding.visibility,
+				import: match binding.source {
+					BindingSource::Definition => None,
+					BindingSource::Import(import) => Some(import),
+				},
+			},
 			None => self.indirect_lookup(use_items, accessor, target, key),
 		}
 	}
@@ -1359,7 +1404,6 @@ enum BindingSource {
 pub(super) struct Binding {
 	pub(super) target: BindingTarget,
 	pub(super) visibility: Visibility,
-	pub(super) accesses: Vec<SourceSpan>,
 	source: BindingSource,
 }
 
@@ -1379,7 +1423,6 @@ impl Binding {
 	) -> Self {
 		Self {
 			target,
-			accesses: Vec::new(),
 			visibility,
 			source: BindingSource::Definition,
 		}
@@ -1392,7 +1435,6 @@ impl Binding {
 	) -> Self {
 		Self {
 			target,
-			accesses: Vec::new(),
 			visibility,
 			source: BindingSource::Import(index),
 		}
@@ -1489,15 +1531,13 @@ pub enum MemberKind {
 }
 
 impl MemberKind {
-	pub(super) fn def_id(self, defs: &DefinitionRegistry) -> DefId {
+	pub(super) fn def_id(self) -> DefId {
 		match self {
 			Self::Function(index) | Self::Method(index) => {
-				defs.functions[usize::from(index)].def_id
+				DefId::Function(index)
 			}
-			Self::Constant(index) => defs.constants[usize::from(index)].def_id,
-			Self::AssociatedType(index) => {
-				defs.assoc_types[usize::from(index)].def_id
-			}
+			Self::Constant(index) => DefId::Const(index),
+			Self::AssociatedType(index) => DefId::AssocType(index),
 		}
 	}
 
@@ -1579,6 +1619,32 @@ impl DuplicateDefinitionDiagnostic<'_> {
 }
 
 impl DefinitionRegistry {
+	/// The written name of `def_id`'s declaration. A generated trait has its
+	/// typeset's name.
+	pub(super) fn name(&self, def_id: DefId) -> Spanned<SymbolU32> {
+		match def_id {
+			DefId::Struct(index) => self.structs[usize::from(index)].name,
+			DefId::Enum(index) => self.enums[usize::from(index)].name,
+			DefId::Trait(index) => self.traits[usize::from(index)].name,
+			DefId::Typeset(index) => self.typesets[usize::from(index)].name,
+			DefId::TypeAlias(index) => {
+				self.type_aliases[usize::from(index)].name
+			}
+			DefId::Function(index) => self.functions[usize::from(index)].name,
+			DefId::Const(index) => self.constants[usize::from(index)].name,
+			DefId::Memory(index) => self.memories[usize::from(index)].name,
+			DefId::Global(index) => self.globals[usize::from(index)].name,
+			DefId::AssocType(index) => {
+				self.assoc_types[usize::from(index)].name
+			}
+			DefId::TraitImpl(_) | DefId::InherentImpl(_) => {
+				todo!(
+					"an impl has no name; describing one isn't implemented yet"
+				)
+			}
+		}
+	}
+
 	/// Returns the registry alongside `ast_nodes` — every top-level item in
 	/// parse order, for Phase 2's demand-driven `ensure_signature` to walk.
 	/// Kept separate rather than a field: the registry itself needs no
@@ -1591,6 +1657,7 @@ impl DefinitionRegistry {
 		files: &Files,
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		resolutions: &mut NameResolutions,
 		stdlib_package: PackageId,
 		root_package: PackageId,
 	) -> (Self, Vec<AstEntry<'ast>>) {
@@ -1599,6 +1666,7 @@ impl DefinitionRegistry {
 			files,
 			strings,
 			diagnostics,
+			resolutions,
 			stdlib_package,
 			root_package,
 		)
@@ -1611,6 +1679,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		files: &'ctx Files,
 		strings: &'ctx mut ast::StringInterner,
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
+		resolutions: &mut NameResolutions,
 		stdlib_package: PackageId,
 		root_package: PackageId,
 	) -> (DefinitionRegistry, Vec<AstEntry<'ast>>) {
@@ -1715,6 +1784,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 		ImportResolver::resolve_imports(
 			builder.diagnostics,
+			resolutions,
 			builder.strings,
 			&mut builder.namespaces,
 			&builder.use_items,
@@ -1853,7 +1923,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// needs `IntrinsicDefs::memory` to already be resolved.
 	fn synthesize_memory_impl(
 		&mut self,
-		def_id: DefId,
 		file_id: FileId,
 		namespace: Scope,
 		name_span: TextSpan,
@@ -1862,7 +1931,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		let size_assoc_type_index =
 			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
 		self.assoc_types.push(AssocTypeDef {
-			def_id,
 			file_id,
 			namespace,
 			name: Spanned {
@@ -1871,12 +1939,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			},
 		});
 		let trait_impl_index = self.push_trait_impl(TraitImplDef {
-			def_id,
 			file_id,
 			namespace,
 			members: vec![TraitMemberDef {
 				kind: MemberKind::AssociatedType(size_assoc_type_index),
-				accesses: Vec::new(),
 				span: name_span,
 			}],
 			bindings: HashMap::from([(
@@ -1892,7 +1958,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// <global>` — see `GlobalDef`'s own doc comment.
 	fn synthesize_global_impl(
 		&mut self,
-		def_id: DefId,
 		file_id: FileId,
 		namespace: Scope,
 		name_span: TextSpan,
@@ -1902,7 +1967,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		let value_assoc_type_index =
 			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
 		self.assoc_types.push(AssocTypeDef {
-			def_id,
 			file_id,
 			namespace,
 			name: Spanned {
@@ -1911,12 +1975,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			},
 		});
 		let trait_impl_index = self.push_trait_impl(TraitImplDef {
-			def_id,
 			file_id,
 			namespace,
 			members: vec![TraitMemberDef {
 				kind: MemberKind::AssociatedType(value_assoc_type_index),
-				accesses: Vec::new(),
 				span: name_span,
 			}],
 			bindings: HashMap::from([(
@@ -1929,7 +1991,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		// to make it a dispatch candidate.
 		let mut_trait_impl_index = mutable.then(|| {
 			self.push_trait_impl(TraitImplDef {
-				def_id,
 				file_id,
 				namespace,
 				members: Vec::new(),
@@ -1944,7 +2005,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	}
 
 	#[inline]
-	fn push_typeset(&mut self, item: TypeSetDef) -> TypesetIdx {
+	fn push_typeset(&mut self, item: TypesetDef) -> TypesetIdx {
 		let index =
 			TypesetIdx::new(u32::try_from(self.typesets.len()).unwrap());
 		self.typesets.push(item);
@@ -2190,13 +2251,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	) {
 		match item {
 			ast::Item::Function {
-				id,
 				signature,
 				pub_span,
 				..
 			}
 			| ast::Item::FunctionDeclaration {
-				id,
 				signature,
 				pub_span,
 				..
@@ -2221,21 +2280,18 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let params =
 					self.scan_free_function_params(file_id, &signature.params);
 				self.functions.push(FunctionDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: signature.name,
 					params,
 				});
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Function { item, func_index },
 				});
 			}
 			ast::Item::Global {
-				id,
 				pub_span,
 				mut_span,
 				name,
@@ -2248,14 +2304,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					value_assoc_type_index,
 					mut_trait_impl_index,
 				) = self.synthesize_global_impl(
-					*id,
 					file_id,
 					namespace,
 					name.span,
 					mut_span.is_some(),
 				);
 				self.globals.push(GlobalDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
@@ -2274,14 +2328,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Global { global_index, item },
 				});
 			}
 			ast::Item::Struct {
-				id,
 				pub_span,
 				name,
 				fields,
@@ -2353,7 +2405,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 
 				self.structs.push(StructDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
@@ -2361,14 +2412,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					lookup,
 				});
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Struct { struct_index, item },
 				});
 			}
 			ast::Item::Enum {
-				id,
 				pub_span,
 				name,
 				variants,
@@ -2383,7 +2432,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.constants.extend(variants.iter().map(|variant| {
 					ConstDef {
-						def_id: variant.inner.inner.id,
 						file_id,
 						namespace,
 						name: variant.inner.inner.name,
@@ -2392,7 +2440,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let end_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.enums.push(EnumDef {
-					def_id: *id,
 					file_id,
 					parent_namespace: namespace,
 					name: *name,
@@ -2410,7 +2457,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Enum { enum_index, item },
@@ -2438,7 +2484,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						variant.name.span,
 					);
 					self.ast_nodes.push(AstEntry {
-						def_id: variant.id,
 						file_id,
 						namespace,
 						node: AstNodeRef::EnumVariant {
@@ -2450,7 +2495,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 			}
 			ast::Item::TypeAlias {
-				id,
 				pub_span,
 				name,
 				body,
@@ -2485,13 +2529,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					}
 				}
 				self.type_aliases.push(TypeAliasDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
 				});
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::TypeAlias {
@@ -2500,13 +2542,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::Memory { id, name, .. } => {
+			ast::Item::Memory { name, .. } => {
 				let memory_index =
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
-				let (trait_impl_index, size_assoc_type_index) = self
-					.synthesize_memory_impl(*id, file_id, namespace, name.span);
+				let (trait_impl_index, size_assoc_type_index) =
+					self.synthesize_memory_impl(file_id, namespace, name.span);
 				self.memories.push(MemoryDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
@@ -2530,19 +2571,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Memory { memory_index, item },
 				});
 			}
-			ast::Item::Const {
-				id, pub_span, name, ..
-			} => {
+			ast::Item::Const { pub_span, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.constants.push(ConstDef {
-					def_id: *id,
 					file_id,
 					namespace,
 					name: *name,
@@ -2558,7 +2595,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Constant { const_index, item },
@@ -2611,7 +2647,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			// `SourceModule` tree, before any file's items were scanned.
 			ast::Item::ModuleDeclaration { .. } => {}
 			ast::Item::Trait {
-				id,
 				name,
 				items,
 				pub_span,
@@ -2639,7 +2674,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					}
 				}
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::Trait { trait_index, item },
@@ -2652,7 +2686,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
-						ast::TraitItem::Function { signature, id, .. } => {
+						ast::TraitItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
 								file_id,
 								&signature.params,
@@ -2662,14 +2696,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							let function_index =
 								self.push_function(FunctionDef {
-									def_id: *id,
 									file_id,
 									namespace,
 									name: signature.name,
 									params,
 								});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitFunction {
@@ -2685,24 +2717,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									} else {
 										MemberKind::Function(function_index)
 									},
-									accesses: Vec::new(),
 									span: signature.name.span,
 								},
 								BindingKey::value(signature.name.inner),
 							)
 						}
-						ast::TraitItem::Const { name, id, .. } => {
+						ast::TraitItem::Const { name, .. } => {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
 							self.constants.push(ConstDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitConst {
@@ -2714,24 +2743,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							(
 								TraitMemberDef {
 									kind: MemberKind::Constant(const_index),
-									accesses: Vec::new(),
 									span: name.span,
 								},
 								BindingKey::value(name.inner),
 							)
 						}
-						ast::TraitItem::AssociatedType { name, id, .. } => {
+						ast::TraitItem::AssociatedType { name, .. } => {
 							let assoc_type_index = AssocTypeIdx::new(
 								u32::try_from(self.assoc_types.len()).unwrap(),
 							);
 							self.assoc_types.push(AssocTypeDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitAssocType {
@@ -2745,7 +2771,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									kind: MemberKind::AssociatedType(
 										assoc_type_index,
 									),
-									accesses: Vec::new(),
 									span: name.span,
 								},
 								BindingKey::ty(name.inner),
@@ -2774,7 +2799,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 
 				let actual_index = self.push_trait(TraitDef {
-					def_id: *id,
+					typeset: None,
 					file_id,
 					namespace,
 					pub_span: *pub_span,
@@ -2784,9 +2809,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 				debug_assert_eq!(trait_index, actual_index);
 			}
-			ast::Item::InherentImpl {
-				id: impl_id, items, ..
-			} => {
+			ast::Item::InherentImpl { items, .. } => {
 				let mut members: Vec<InherentMemberDef> = Vec::new();
 				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
@@ -2794,7 +2817,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					u32::try_from(self.inherent_impls.len()).unwrap(),
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *impl_id,
 					file_id,
 					namespace,
 					node: AstNodeRef::InherentImplBlock { item, block_index },
@@ -2804,7 +2826,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key, binding) = match &impl_item.inner.inner {
 						ast::ImplItem::Function {
-							id,
 							signature,
 							pub_span,
 							..
@@ -2818,14 +2839,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							let function_index =
 								self.push_function(FunctionDef {
-									def_id: *id,
 									file_id,
 									namespace,
 									name: signature.name,
 									params,
 								});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplFunction {
@@ -2836,7 +2855,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							(
 								InherentMemberDef {
-									accesses: Vec::new(),
 									kind: if is_method {
 										MemberKind::Method(function_index)
 									} else {
@@ -2849,20 +2867,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								member_index,
 							)
 						}
-						ast::ImplItem::Constant {
-							id, name, pub_span, ..
-						} => {
+						ast::ImplItem::Constant { name, pub_span, .. } => {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
 							self.constants.push(ConstDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplConst {
@@ -2873,7 +2887,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							(
 								InherentMemberDef {
-									accesses: Vec::new(),
 									kind: MemberKind::Constant(const_index),
 									visibility: Visibility::from(*pub_span),
 									span: name.span,
@@ -2910,7 +2923,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 
 				let actual_index = self.push_inherent_impl(InherentImplDef {
-					def_id: *impl_id,
 					file_id,
 					namespace,
 					members,
@@ -2962,16 +2974,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 				for item in items.inner.iter() {
 					match &item.inner.inner.declaration {
-						ast::ImportDeclaration::Memory { id, name, .. } => {
+						ast::ImportDeclaration::Memory { name, .. } => {
 							let memory_index = MemoryIdx::new(
 								u32::try_from(self.memories.len()).unwrap(),
 							);
 							let (trait_impl_index, size_assoc_type_index) =
 								self.synthesize_memory_impl(
-									*id, file_id, namespace, name.span,
+									file_id, namespace, name.span,
 								);
 							self.memories.push(MemoryDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
@@ -3004,7 +3015,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::ImportedMemory {
@@ -3014,14 +3024,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								},
 							});
 						}
-						ast::ImportDeclaration::Function { id, signature } => {
+						ast::ImportDeclaration::Function {
+							signature, ..
+						} => {
 							let params = self.scan_free_function_params(
 								file_id,
 								&signature.params,
 							);
 							let function_index =
 								self.push_function(FunctionDef {
-									def_id: *id,
 									file_id,
 									namespace,
 									name: signature.name,
@@ -3044,7 +3055,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								signature.name.span,
 							);
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::ImportedFunction {
@@ -3055,7 +3065,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 						}
 						ast::ImportDeclaration::Global {
-							id,
 							mut_span,
 							name,
 							..
@@ -3068,14 +3077,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								value_assoc_type_index,
 								mut_trait_impl_index,
 							) = self.synthesize_global_impl(
-								*id,
 								file_id,
 								namespace,
 								name.span,
 								mut_span.is_some(),
 							);
 							self.globals.push(GlobalDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
@@ -3100,7 +3107,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::ImportedGlobal {
@@ -3129,7 +3135,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 			}
 			ast::Item::TypeSet {
-				id,
 				name,
 				pub_span,
 				members,
@@ -3149,7 +3154,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				let trait_index = self.push_trait(TraitDef {
-					def_id: *id,
+					typeset: Some(typeset_index),
 					file_id,
 					namespace,
 					pub_span: *pub_span,
@@ -3161,7 +3166,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					.iter()
 					.map(|_| {
 						self.push_trait_impl(TraitImplDef {
-							def_id: *id,
 							file_id,
 							namespace,
 							members: Vec::new(),
@@ -3169,15 +3173,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						})
 					})
 					.collect();
-				self.typesets.push(TypeSetDef {
-					def_id: *id,
+				self.typesets.push(TypesetDef {
 					file_id,
 					namespace,
+					name: *name,
 					trait_index,
 					member_impls,
 				});
 				self.ast_nodes.push(AstEntry {
-					def_id: *id,
 					file_id,
 					namespace,
 					node: AstNodeRef::TypeSet {
@@ -3186,9 +3189,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::TraitImpl {
-				id: impl_id, items, ..
-			} => {
+			ast::Item::TraitImpl { items, .. } => {
 				let mut members: Vec<TraitMemberDef> = Vec::new();
 				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
@@ -3196,7 +3197,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					u32::try_from(self.trait_impls.len()).unwrap(),
 				);
 				self.ast_nodes.push(AstEntry {
-					def_id: *impl_id,
 					file_id,
 					namespace,
 					node: AstNodeRef::TraitImplBlock { item, block_index },
@@ -3205,7 +3205,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (member, key) = match &item.inner.inner {
-						ast::ImplItem::Function { id, signature, .. } => {
+						ast::ImplItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
 								file_id,
 								&signature.params,
@@ -3215,14 +3215,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							let function_index =
 								self.push_function(FunctionDef {
-									def_id: *id,
 									file_id,
 									namespace,
 									name: signature.name,
 									params,
 								});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplFunction {
@@ -3233,7 +3231,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							(
 								TraitMemberDef {
-									accesses: Vec::new(),
 									kind: if is_method {
 										MemberKind::Method(function_index)
 									} else {
@@ -3244,18 +3241,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								BindingKey::value(signature.name.inner),
 							)
 						}
-						ast::ImplItem::Constant { id, name, .. } => {
+						ast::ImplItem::Constant { name, .. } => {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
 							self.constants.push(ConstDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplConstant {
@@ -3266,25 +3261,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							(
 								TraitMemberDef {
-									accesses: Vec::new(),
 									kind: MemberKind::Constant(const_index),
 									span: name.span,
 								},
 								BindingKey::value(name.inner),
 							)
 						}
-						ast::ImplItem::AssocType { id, name, .. } => {
+						ast::ImplItem::AssocType { name, .. } => {
 							let assoc_type_index = AssocTypeIdx::new(
 								u32::try_from(self.assoc_types.len()).unwrap(),
 							);
 							self.assoc_types.push(AssocTypeDef {
-								def_id: *id,
 								file_id,
 								namespace,
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
-								def_id: *id,
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplAssocType {
@@ -3295,7 +3287,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							});
 							(
 								TraitMemberDef {
-									accesses: Vec::new(),
 									kind: MemberKind::AssociatedType(
 										assoc_type_index,
 									),
@@ -3328,7 +3319,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 
 				let actual_index = self.push_trait_impl(TraitImplDef {
-					def_id: *impl_id,
 					file_id,
 					namespace,
 					bindings,
@@ -3595,11 +3585,13 @@ mod tests {
 				.assert_no_errors();
 
 			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
 				&mut graph.strings,
 				&mut diagnostics,
+				&mut resolutions,
 				graph.stdlib_package,
 				graph.root_package,
 			);
@@ -3707,14 +3699,14 @@ mod tests {
 			segments: &[ast::PathSegment],
 		) -> ResolutionResult<'_> {
 			let mut diagnostics = Vec::new();
-			let target = PathResolver::new(&self.defs).resolve_path(
+			let mut resolutions = NameResolutions::default();
+			let target = PathResolver::new(
 				&mut diagnostics,
+				&mut resolutions,
 				&self.graph.strings,
-				file_id,
-				namespace,
-				segments,
-				tier,
-			);
+				&self.defs,
+			)
+			.resolve_path(file_id, namespace, segments, tier);
 			ResolutionResult {
 				case: self,
 				target,
@@ -3988,10 +3980,6 @@ mod tests {
 			indices.push(index);
 		}
 		assert_ne!(indices[0], indices[1]);
-		assert_ne!(
-			case.defs.memories[usize::from(indices[0])].def_id,
-			case.defs.memories[usize::from(indices[1])].def_id,
-		);
 		for tier in [Tier::Type, Tier::Value] {
 			assert_eq!(
 				case.resolve(tier, "shared_alias").expect_success(),
@@ -4089,9 +4077,8 @@ mod tests {
 		else {
 			panic!("expected a free constant");
 		};
-		let mut ids = std::collections::HashSet::from([case.defs.constants
-			[usize::from(free_constant)]
-		.def_id]);
+		let mut ids =
+			std::collections::HashSet::from([DefId::Const(free_constant)]);
 		let members = case.defs.traits[0]
 			.members
 			.iter()
@@ -4110,7 +4097,7 @@ mod tests {
 			);
 		for kind in members {
 			assert!(
-				ids.insert(kind.def_id(&case.defs)),
+				ids.insert(kind.def_id()),
 				"members must have distinct identities"
 			);
 			let (name, expected) = match kind {
@@ -4637,7 +4624,7 @@ mod tests {
 				root.into(),
 				BindingKey::value(helper),
 			),
-			BindingLookup::Found(..)
+			BindingLookup::Found { .. }
 		));
 		assert!(
 			case.defs
@@ -4716,7 +4703,11 @@ mod tests {
 			m.into(),
 			BindingKey::value(helper),
 		) {
-			BindingLookup::Found(BindingTarget::Accessible(_), _) => {}
+			BindingLookup::Found {
+				target: BindingTarget::Accessible(_),
+				import: Some(_),
+				..
+			} => {}
 			other => panic!(
 				"a descendant of `m` should see `m`'s own private glob, \
 				 got {other:?}"
@@ -4741,7 +4732,10 @@ mod tests {
 		let hub = case.scope("hub");
 		let helper = case.graph.strings.get_or_intern("helper");
 
-		let Some((BindingTarget::Accessible(original), _)) = case
+		let Some(Binding {
+			target: BindingTarget::Accessible(original),
+			..
+		}) = case
 			.defs
 			.namespaces
 			.direct_lookup(a.into(), BindingKey::value(helper))
@@ -4755,11 +4749,12 @@ mod tests {
 			hub.into(),
 			BindingKey::value(helper),
 		) {
-			BindingLookup::Found(
-				BindingTarget::Accessible(found),
+			BindingLookup::Found {
+				target: BindingTarget::Accessible(found),
 				visibility,
-			) => {
-				assert_eq!(found, original);
+				import: Some(_),
+			} => {
+				assert_eq!(found, *original);
 				assert_eq!(visibility, Visibility::Public);
 			}
 			other => panic!("expected a single found candidate, got {other:?}"),
@@ -4826,7 +4821,10 @@ mod tests {
 		let hub = case.scope("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
-		let Some((BindingTarget::Accessible(direct), _)) = case
+		let Some(Binding {
+			target: BindingTarget::Accessible(direct),
+			..
+		}) = case
 			.defs
 			.namespaces
 			.direct_lookup(hub.into(), BindingKey::value(pick))
@@ -4840,9 +4838,13 @@ mod tests {
 			hub.into(),
 			BindingKey::value(pick),
 		) {
-			BindingLookup::Found(BindingTarget::Accessible(found), _) => {
+			BindingLookup::Found {
+				target: BindingTarget::Accessible(found),
+				import: None,
+				..
+			} => {
 				assert_eq!(
-					found, direct,
+					found, *direct,
 					"lookup should return hub's own `pick`, not a::pick \
 					 through the glob"
 				);
@@ -5099,11 +5101,13 @@ mod tests {
 			Some(DiagnosticCode::UnclosedDelimiter.code())
 		);
 		let mut diagnostics = Vec::new();
+		let mut resolutions = NameResolutions::default();
 		let _ = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
 			&mut graph.strings,
 			&mut diagnostics,
+			&mut resolutions,
 			graph.stdlib_package,
 			graph.root_package,
 		);

@@ -6,19 +6,21 @@
 //! the operand type exactly, and a result outside it is an error, not a wrapped
 //! value.
 //!
-//! A constant's value is a memoized query (`const_value`). Like an impl
-//! member's value (`AssocValue`), a constant owns the failures of its own
-//! evaluation: its check reports them, and a constant that reads a failed one
-//! fails silently. A loop through constants is owned by its first-defined
-//! member, so it is reported once whichever constant is asked first.
+//! A constant's value is a memoized query (`const_value`), and evaluation asks
+//! it on demand: a constant is read when the node naming it is evaluated, so a
+//! branch that is not taken reads nothing. Like an impl member's value
+//! (`AssocValue`), a constant owns the failures of its own evaluation: the body
+//! phase reports them, and a constant that reads a failed one fails silently. A
+//! loop through constants is owned by its first-defined member, so it is
+//! reported once whichever constant is asked first.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{Body, ExprIdx, ExprKind};
-use super::defs::ConstIdx;
+use super::body::{ExprIdx, ExprKind};
+use super::defs::{ConstIdx, EnumIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::types::TypeIndex;
+use super::types::{Type, TypeIndex};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 
@@ -103,8 +105,18 @@ enum Unevaluable {
 	Cycle(ConstCycle),
 }
 
+/// Why evaluating a node gave no value.
+enum Halt {
+	/// The constant being evaluated fails here; it owns the failure.
+	Own(EvalError),
+	/// Reported, or to be reported, by whoever owns it.
+	Silent,
+	/// A loop still unwinding towards its owner.
+	Cycle(ConstCycle),
+}
+
 impl TypeContext<'_, '_, '_> {
-	/// Evaluates a constant once its check runs, and reports what it owns.
+	/// Evaluates a constant in the body phase, and reports what it owns.
 	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
 		let _ = self.const_value(const_index);
 		let ConstValueState::Failed(Some(failure)) =
@@ -133,94 +145,143 @@ impl TypeContext<'_, '_, '_> {
 			}
 			ConstValueState::Unevaluated => {}
 		}
-		let Some(scalar) = self.constant_scalar(const_index) else {
-			self.const_values[usize::from(const_index)] =
-				ConstValueState::NotEvaluated;
-			return Err(Unevaluable::NotEvaluated);
-		};
-		self.ensure_const_body(const_index);
-		// Every constant the body names is evaluated first, as a required
-		// input, whether or not the branch naming it is taken.
-		let referenced = match &self.const_bodies[usize::from(const_index)] {
-			Some(body) => referenced_constants(body),
-			None => {
+		let scalar = match self.constant_scalar(const_index) {
+			Ok(Some(scalar)) => scalar,
+			Ok(None) => {
 				self.const_values[usize::from(const_index)] =
 					ConstValueState::NotEvaluated;
 				return Err(Unevaluable::NotEvaluated);
 			}
+			Err(()) => {
+				self.const_values[usize::from(const_index)] =
+					ConstValueState::Failed(None);
+				return Err(Unevaluable::Silent);
+			}
 		};
+		self.ensure_const_body(const_index);
+		let Some(body) = &self.const_bodies[usize::from(const_index)] else {
+			self.const_values[usize::from(const_index)] =
+				ConstValueState::NotEvaluated;
+			return Err(Unevaluable::NotEvaluated);
+		};
+		let root = body.root();
 		self.const_values[usize::from(const_index)] =
 			ConstValueState::InProgress;
 		self.const_stack.push(const_index);
-		let mut inputs = Vec::with_capacity(referenced.len());
-		let mut outcome = Ok(());
-		for referenced in referenced {
-			match self.const_value(referenced) {
-				Ok(value) => inputs.push((referenced, value)),
-				// The node naming it is not a constant expression; evaluation
-				// reports it there, if it gets that far.
-				Err(Unevaluable::NotEvaluated) => {}
-				Err(failure) => {
-					outcome = Err(failure);
-					break;
-				}
-			}
-		}
+		let evaluated = self.eval(const_index, root);
 		self.const_stack.pop();
 
-		let (state, answer) = match outcome {
-			Ok(()) => {
-				let body = self.const_bodies[usize::from(const_index)]
-					.as_ref()
-					.unwrap();
-				let evaluated = Evaluator {
-					body,
-					inputs: &inputs,
-				}
-				.eval(body.root());
-				match evaluated {
-					Ok(value) if value.scalar() == Some(scalar) => {
-						(ConstValueState::Evaluated(value), Ok(value))
-					}
-					// The initializer has another type; the checker reported
-					// the mismatch.
-					Ok(_) => (
-						ConstValueState::Failed(None),
-						Err(Unevaluable::Silent),
-					),
-					Err(Some(error)) => (
-						ConstValueState::Failed(Some(OwnedFailure::Eval(
-							error,
-						))),
-						Err(Unevaluable::Silent),
-					),
-					Err(None) => (
-						ConstValueState::Failed(None),
-						Err(Unevaluable::Silent),
-					),
-				}
+		let (state, answer) = match evaluated {
+			Ok(value) if value.scalar() == Some(scalar) => {
+				(ConstValueState::Evaluated(value), Ok(value))
 			}
-			Err(Unevaluable::Silent) => {
+			// A root of another type is `ERROR` once the checker reports it, so
+			// this is a value the checker accepted in another scalar.
+			Ok(_) => (ConstValueState::Failed(None), Err(Unevaluable::Silent)),
+			Err(Halt::Own(error)) => (
+				ConstValueState::Failed(Some(OwnedFailure::Eval(error))),
+				Err(Unevaluable::Silent),
+			),
+			Err(Halt::Silent) => {
 				(ConstValueState::Failed(None), Err(Unevaluable::Silent))
 			}
-			Err(Unevaluable::NotEvaluated) => {
-				unreachable!("an unevaluated input is skipped, not a failure")
-			}
 			// The owner keeps the loop; its readers further out derive from it.
-			Err(Unevaluable::Cycle(cycle))
-				if cycle.members[0] == const_index =>
-			{
-				(
-					ConstValueState::Failed(Some(OwnedFailure::Cycle(cycle))),
-					Err(Unevaluable::Silent),
-				)
-			}
-			Err(cycle @ Unevaluable::Cycle(_)) => {
-				(ConstValueState::Failed(None), Err(cycle))
-			}
+			Err(Halt::Cycle(cycle)) if cycle.members[0] == const_index => (
+				ConstValueState::Failed(Some(OwnedFailure::Cycle(cycle))),
+				Err(Unevaluable::Silent),
+			),
+			Err(Halt::Cycle(cycle)) => (
+				ConstValueState::Failed(None),
+				Err(Unevaluable::Cycle(cycle)),
+			),
 		};
 		self.const_values[usize::from(const_index)] = state;
 		answer
+	}
+
+	/// Folds one node of `owner`'s body. Each step reads the node by index, so
+	/// no borrow of the body is held while a constant it names is evaluated.
+	fn eval(
+		&mut self,
+		owner: ConstIdx,
+		expr: ExprIdx,
+	) -> Result<ConstValue, Halt> {
+		let body = self.const_bodies[usize::from(owner)].as_ref().unwrap();
+		let (kind, ty, span) =
+			(body.kind(expr), body.ty(expr), body.span(expr));
+		if ty == TypeIndex::ERROR && !matches!(kind, ExprKind::Unsupported) {
+			return Err(Halt::Silent);
+		}
+		let own = |kind| Halt::Own(EvalError { span, kind });
+		match kind {
+			ExprKind::Error => Err(Halt::Silent),
+			ExprKind::Unsupported
+			| ExprKind::MethodCall { .. }
+			| ExprKind::GenericMethodCall { .. } => Err(own(EvalErrorKind::NotConst)),
+			ExprKind::Int(value) => match Scalar::from_type(ty) {
+				Some(scalar) => Ok(ConstValue::Int {
+					value: i128::from(value),
+					scalar,
+				}),
+				None => Err(own(EvalErrorKind::NotConst)),
+			},
+			ExprKind::Float(value) => match Scalar::from_type(ty) {
+				Some(scalar) => Ok(ConstValue::Float { value, scalar }),
+				None => Err(own(EvalErrorKind::NotConst)),
+			},
+			ExprKind::Bool(value) => Ok(ConstValue::Bool(value)),
+			ExprKind::Char(value) => Ok(ConstValue::Char(value)),
+			ExprKind::Const(const_index) => {
+				self.read_constant(const_index, span)
+			}
+			ExprKind::NextDiscriminant(previous) => {
+				let ConstValue::Int { value, scalar } =
+					self.read_constant(previous, span)?
+				else {
+					unreachable!("a variant's value is an integer")
+				};
+				int(value + 1, scalar, Operation::Binary(BinaryOp::Add))
+					.map_err(own)
+			}
+			ExprKind::Unary { op, operand } => {
+				let operand = self.eval(owner, operand)?;
+				unary(op, operand).map_err(own)
+			}
+			ExprKind::Binary { op, lhs, rhs } => {
+				let lhs = self.eval(owner, lhs)?;
+				// `&&` and `||` do not evaluate a right side they do not need.
+				match (op, lhs) {
+					(BinaryOp::And, ConstValue::Bool(false)) => {
+						return Ok(ConstValue::Bool(false));
+					}
+					(BinaryOp::Or, ConstValue::Bool(true)) => {
+						return Ok(ConstValue::Bool(true));
+					}
+					_ => {}
+				}
+				let rhs = self.eval(owner, rhs)?;
+				binary(op, lhs, rhs).map_err(own)
+			}
+		}
+	}
+
+	/// The value of a constant a node names. One with no compile-time value
+	/// (its type is not a scalar) makes the naming node not a constant
+	/// expression.
+	fn read_constant(
+		&mut self,
+		const_index: ConstIdx,
+		span: TextSpan,
+	) -> Result<ConstValue, Halt> {
+		self.const_value(const_index)
+			.map_err(|failure| match failure {
+				Unevaluable::NotEvaluated => Halt::Own(EvalError {
+					span,
+					kind: EvalErrorKind::NotConst,
+				}),
+				Unevaluable::Silent => Halt::Silent,
+				Unevaluable::Cycle(cycle) => Halt::Cycle(cycle),
+			})
 	}
 
 	/// `const_index` was asked for again while it is evaluated: the loop is
@@ -241,11 +302,70 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// The scalar a constant's declared type means, if it is one.
-	fn constant_scalar(&mut self, const_index: ConstIdx) -> Option<Scalar> {
+	/// The scalar a constant's value is held in, if there is one: its
+	/// declared type's, or for a value of an enum, the enum's repr. `Err` when
+	/// that type failed to resolve, which was reported where it is written.
+	fn constant_scalar(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Result<Option<Scalar>, ()> {
 		let (ty, scope) = self.constant_type(const_index);
-		let ty = self.normalize_type_query(scope, ty).unwrap_or(ty);
-		Scalar::from_type(ty)
+		let mut ty = self.normalize_type_query(scope, ty).unwrap_or(ty);
+		if let Type::Enum { enum_index } = *self.types.resolve(ty) {
+			ty = self.enum_repr(enum_index);
+		}
+		if ty == TypeIndex::ERROR {
+			return Err(());
+		}
+		Ok(Scalar::from_type(ty))
+	}
+
+	/// Reports each set of an enum's variants that share a value, once, on the
+	/// enum. A variant without a value reports itself and is left out.
+	pub(super) fn check_discriminants(&mut self, enum_index: EnumIdx) {
+		let enum_def = &self.defs.enums[usize::from(enum_index)];
+		let (file_id, name_span) = (enum_def.file_id, enum_def.name.span);
+		let run = enum_def.variants.clone();
+		let mut values = Vec::new();
+		for variant in u32::from(run.start)..u32::from(run.end) {
+			let variant = ConstIdx::new(variant);
+			if let Ok(ConstValue::Int { value, .. }) = self.const_value(variant)
+			{
+				values.push((value, variant));
+			}
+		}
+		// Stable, so each set keeps source order; the sets are then reported in
+		// the source order of their first variant.
+		values.sort_by_key(|&(value, _)| value);
+		let mut groups: Vec<&[(i128, ConstIdx)]> = values
+			.chunk_by(|a, b| a.0 == b.0)
+			.filter(|group| group.len() > 1)
+			.collect();
+		groups.sort_unstable_by_key(|group| usize::from(group[0].1));
+		for group in groups {
+			let value = group[0].0;
+			let mut diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::EnumDuplicateValue.code())
+				.with_message(format!(
+					"multiple variants of this enum have the same value \
+					 `{value}`"
+				))
+				.with_label(
+					SourceSpan::new(file_id, name_span).primary_label(),
+				);
+			for &(_, variant) in group {
+				// The written value, or the name of a variant counted on.
+				let body =
+					self.const_bodies[usize::from(variant)].as_ref().unwrap();
+				let span = body.span(body.root());
+				diagnostic = diagnostic.with_label(
+					SourceSpan::new(file_id, span)
+						.secondary_label()
+						.with_message(format!("value `{value}` assigned here")),
+				);
+			}
+			self.diagnostics.push(diagnostic);
+		}
 	}
 
 	fn report_owned_failure(
@@ -330,103 +450,6 @@ impl TypeContext<'_, '_, '_> {
 					);
 				}
 				diagnostic
-			}
-		}
-	}
-}
-
-/// The distinct constants a body names, in order of first mention.
-fn referenced_constants(body: &Body) -> Vec<ConstIdx> {
-	let mut referenced = Vec::new();
-	for index in 0..=usize::from(body.root()) {
-		if let ExprKind::Const(const_index) =
-			body.kind(ExprIdx::new(index as u32))
-			&& !referenced.contains(&const_index)
-		{
-			referenced.push(const_index);
-		}
-	}
-	referenced
-}
-
-/// Folds one body, given the values of the constants it names. `Err(None)`
-/// is a failure already reported elsewhere (a node the checker marked as an
-/// error); `Err(Some)` is this body's own.
-struct Evaluator<'b> {
-	body: &'b Body,
-	inputs: &'b [(ConstIdx, ConstValue)],
-}
-
-impl Evaluator<'_> {
-	fn eval(&self, expr: ExprIdx) -> Result<ConstValue, Option<EvalError>> {
-		let ty = self.body.ty(expr);
-		if ty == TypeIndex::ERROR
-			&& !matches!(self.body.kind(expr), ExprKind::Unsupported)
-		{
-			return Err(None);
-		}
-		let fail = |kind| {
-			Err(Some(EvalError {
-				span: self.body.span(expr),
-				kind,
-			}))
-		};
-		match self.body.kind(expr) {
-			ExprKind::Error => Err(None),
-			ExprKind::Unsupported
-			| ExprKind::MethodCall { .. }
-			| ExprKind::GenericMethodCall { .. } => fail(EvalErrorKind::NotConst),
-			ExprKind::Int(value) => match Scalar::from_type(ty) {
-				Some(scalar) => Ok(ConstValue::Int {
-					value: i128::from(value),
-					scalar,
-				}),
-				None => fail(EvalErrorKind::NotConst),
-			},
-			ExprKind::Float(value) => match Scalar::from_type(ty) {
-				Some(scalar) => Ok(ConstValue::Float { value, scalar }),
-				None => fail(EvalErrorKind::NotConst),
-			},
-			ExprKind::Bool(value) => Ok(ConstValue::Bool(value)),
-			ExprKind::Char(value) => Ok(ConstValue::Char(value)),
-			// Every named constant was evaluated first; one without a value is
-			// not a constant (its type is not a scalar).
-			ExprKind::Const(const_index) => match self
-				.inputs
-				.iter()
-				.find(|(input, _)| *input == const_index)
-			{
-				Some(&(_, value)) => Ok(value),
-				None => fail(EvalErrorKind::NotConst),
-			},
-			ExprKind::Unary { op, operand } => {
-				let operand = self.eval(operand)?;
-				unary(op, operand).map_err(|kind| {
-					Some(EvalError {
-						span: self.body.span(expr),
-						kind,
-					})
-				})
-			}
-			ExprKind::Binary { op, lhs, rhs } => {
-				let lhs = self.eval(lhs)?;
-				// `&&` and `||` do not evaluate a right side they do not need.
-				match (op, lhs) {
-					(BinaryOp::And, ConstValue::Bool(false)) => {
-						return Ok(ConstValue::Bool(false));
-					}
-					(BinaryOp::Or, ConstValue::Bool(true)) => {
-						return Ok(ConstValue::Bool(true));
-					}
-					_ => {}
-				}
-				let rhs = self.eval(rhs)?;
-				binary(op, lhs, rhs).map_err(|kind| {
-					Some(EvalError {
-						span: self.body.span(expr),
-						kind,
-					})
-				})
 			}
 		}
 	}

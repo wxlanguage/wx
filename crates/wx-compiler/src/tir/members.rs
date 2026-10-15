@@ -16,27 +16,30 @@ use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
 use super::assumptions::AssumptionKind;
+use super::assumptions::EffectiveBounds;
 use super::assumptions::Readiness;
 use super::bounds::report_not_an_associated_type;
 use super::defs::{
-	AssocTypeIdx, AstNodeRef, BindingKey, DefinitionRegistry, InherentImplIdx,
-	MemberKind, Tier, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, DefId, DefinitionRegistry,
+	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
 };
+use super::format::TypeFormatter;
 use super::impls::ImplTarget;
 use super::obligations::Obligation;
+use super::resolutions::Referent;
 use super::signatures::{
 	QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
 };
-use super::solver::Unsolved;
+use super::solver::{Assumption, SolverError};
 use super::types::{Type, TypeEnvIdx, TypeIndex};
 
 /// What type-relative member applicability found.
 pub(super) enum MemberLookup {
 	/// A dependency has already failed; the caller must not diagnose absence.
 	Error,
-	/// The solver could not finish (`Unsolved::Overflow` or `Cycle`). Nothing
+	/// The solver could not finish (`SolverError::Overflow` or `Cycle`). Nothing
 	/// was reported; the site that wrote the path does that.
-	Stuck(Unsolved),
+	Stuck(SolverError),
 	/// Selecting a member needs facts that are not ready yet.
 	Pending,
 	NotFound,
@@ -48,12 +51,12 @@ pub(super) enum MemberLookup {
 	Ambiguous(Box<[ApplicableMember]>),
 }
 
-impl From<Unsolved> for MemberLookup {
-	fn from(error: Unsolved) -> Self {
+impl From<SolverError> for MemberLookup {
+	fn from(error: SolverError) -> Self {
 		match error {
-			Unsolved::Pending => Self::Pending,
-			Unsolved::Failed => Self::Error,
-			fatal @ (Unsolved::Overflow | Unsolved::Cycle(_)) => {
+			SolverError::Pending => Self::Pending,
+			SolverError::Poisoned => Self::Error,
+			fatal @ (SolverError::Overflow | SolverError::Cycle(_)) => {
 				Self::Stuck(fatal)
 			}
 		}
@@ -264,9 +267,9 @@ impl TypeContext<'_, '_, '_> {
 				receiver,
 				trait_index,
 			) {
-				Ok(true) => traits.push(trait_index),
-				Ok(false) => {}
-				Err(Unsolved::Pending) => {
+				Ok(Assumption::Holds) => traits.push(trait_index),
+				Ok(Assumption::Unproven) => {}
+				Ok(Assumption::Pending) => {
 					readiness = readiness.and(Readiness::Pending)
 				}
 				Err(error) => return error.into(),
@@ -402,9 +405,9 @@ impl TypeContext<'_, '_, '_> {
 					return TypeIndex::ERROR;
 				}
 				MemberLookup::Error => return TypeIndex::ERROR,
-				MemberLookup::Stuck(unsolved) => {
-					let _ = self.report_unsolved::<()>(
-						Err(unsolved),
+				MemberLookup::Stuck(error) => {
+					let _ = self.report_solver_error::<()>(
+						Err(error),
 						SourceSpan::new(file_id, segment.ident.span),
 					);
 					return TypeIndex::ERROR;
@@ -420,7 +423,7 @@ impl TypeContext<'_, '_, '_> {
 						return TypeIndex::ERROR;
 					};
 					// Selection named the trait without matching an impl; that
-					// the receiver implements it is the check pass's question.
+					// the receiver implements it is the declaration check's question.
 					self.register_obligation(
 						Obligation::CheckTraitMembership {
 							assumption_context,
@@ -432,6 +435,15 @@ impl TypeContext<'_, '_, '_> {
 							),
 						},
 					);
+					self.resolutions.by_site.insert(
+						(
+							SourceSpan::new(file_id, segment.ident.span),
+							Tier::Type,
+						),
+						Referent::Member(MemberKind::AssociatedType(
+							declaration.assoc_type_index,
+						)),
+					);
 					current = self.project_assoc_type(current, declaration);
 				}
 				MemberLookup::NotFound => {
@@ -441,7 +453,7 @@ impl TypeContext<'_, '_, '_> {
 					) {
 						// A projection's declared bounds are only half of what
 						// it can have: its value may be a type that does. That
-						// takes impls, so the check pass decides what to say.
+						// takes impls, so the declaration check decides what to say.
 						self.register_obligation(
 							Obligation::CheckProjectionMember {
 								assumption_context,
@@ -519,8 +531,12 @@ impl TypeContext<'_, '_, '_> {
 			));
 			return Err(());
 		};
+		self.resolutions.by_site.insert(
+			(SourceSpan::new(file_id, name.span), Tier::Type),
+			Referent::Member(kind),
+		);
 		// Naming the projection does not need an impl; whether `receiver`
-		// implements the trait is the check pass's question.
+		// implements the trait is the declaration check's question.
 		self.register_obligation(Obligation::CheckTraitMembership {
 			assumption_context,
 			subject: receiver,
@@ -573,6 +589,10 @@ impl TypeContext<'_, '_, '_> {
 				}
 			}
 		};
+		self.resolutions.by_site.insert(
+			(SourceSpan::new(file_id, name.span), Tier::Value),
+			Referent::Member(member.selected_kind(self.defs)),
+		);
 		Ok(member)
 	}
 
@@ -624,7 +644,8 @@ impl TypeContext<'_, '_, '_> {
 		) {
 			Ok(Some(found)) => Ok(found),
 			Ok(None) => {
-				let diagnostic = self.report_type_does_not_implement_trait(
+				let diagnostic = report_type_does_not_implement_trait(
+					&self.type_formatter(),
 					file_id,
 					span,
 					receiver,
@@ -633,12 +654,12 @@ impl TypeContext<'_, '_, '_> {
 				self.diagnostics.push(diagnostic);
 				Err(())
 			}
-			Err(Unsolved::Failed) => Err(()),
-			Err(fatal @ (Unsolved::Overflow | Unsolved::Cycle(_))) => {
-				let _ = self.report_unsolved::<()>(Err(fatal), reference);
+			Err(SolverError::Poisoned) => Err(()),
+			Err(fatal @ (SolverError::Overflow | SolverError::Cycle(_))) => {
+				let _ = self.report_solver_error::<()>(Err(fatal), reference);
 				Err(())
 			}
-			Err(Unsolved::Pending) => {
+			Err(SolverError::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
 				self.register_obligation(Obligation::CheckTraitMembership {
@@ -650,38 +671,6 @@ impl TypeContext<'_, '_, '_> {
 				Ok(TraitImplLookup::Abstract)
 			}
 		}
-	}
-
-	/// Same code and wording as `report_trait_bound_violation`,
-	/// reported for a recorded bounds check (mirroring rustc's `E0277` for this
-	/// same case: `the trait bound `Foo: Bar` is not satisfied`) — this is
-	/// that same condition, just reached with no declared bound clause to
-	/// point a "required by a bound in `X`" secondary label at, since a
-	/// qualified path's `as Trait` isn't one.
-	pub(super) fn report_type_does_not_implement_trait(
-		&self,
-		file_id: FileId,
-		span: TextSpan,
-		receiver: TypeIndex,
-		required_trait: TraitIdx,
-	) -> Diagnostic<FileId> {
-		let receiver_name = self.type_formatter().display_type(receiver);
-		let trait_name = self
-			.strings
-			.resolve(self.defs.traits[usize::from(required_trait)].name.inner)
-			.unwrap();
-		Diagnostic::error()
-			.with_code(DiagnosticCode::TraitBoundViolation.code())
-			.with_message(format!(
-				"the trait bound `{receiver_name}: {trait_name}` is not satisfied"
-			))
-			.with_label(
-				SourceSpan::new(file_id, span).primary_label().with_message(
-					format!(
-						"the trait `{trait_name}` is not implemented for `{receiver_name}`"
-					),
-				),
-			)
 	}
 
 	fn resolve_concrete_member(
@@ -780,9 +769,9 @@ impl TypeContext<'_, '_, '_> {
 		for subject in equalities {
 			self.prepare_effective_bounds(subject, reference)
 				.map_err(|()| MemberLookup::Error)?;
-			let depth = self.solver.remaining_depth();
+			let budget = self.solver.state.recursion_budget;
 			let (reader, types) = self.assumptions();
-			let mut facts = reader.subject_facts(subject, types, depth);
+			let mut facts = reader.subject_facts(subject, types, budget);
 			readiness = readiness.and(facts.readiness);
 			while let Some(fact) = facts.next(types) {
 				if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
@@ -797,7 +786,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 		}
 		if readiness == Readiness::Overflowed {
-			return Err(MemberLookup::Stuck(Unsolved::Overflow));
+			return Err(MemberLookup::Stuck(SolverError::Overflow));
 		}
 		Ok((traits, readiness))
 	}
@@ -842,7 +831,7 @@ impl TypeContext<'_, '_, '_> {
 					);
 				}
 				Ok(None) => {}
-				Err(Unsolved::Pending) => {
+				Err(SolverError::Pending) => {
 					readiness = readiness.and(Readiness::Pending)
 				}
 				Err(error) => return error.into(),
@@ -875,8 +864,20 @@ impl TypeContext<'_, '_, '_> {
 		if self.prepare_effective_bounds(receiver, reference).is_err() {
 			return MemberLookup::Error;
 		}
+		Self::select_declared_member(
+			self.defs,
+			self.effective_bounds(receiver),
+			key,
+		)
+	}
+
+	/// The members named `key` among the traits `bounds` supply.
+	pub(super) fn select_declared_member(
+		defs: &DefinitionRegistry,
+		bounds: EffectiveBounds<'_>,
+		key: BindingKey,
+	) -> MemberLookup {
 		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
-		let bounds = self.effective_bounds(receiver);
 		for trait_index in bounds
 			.reflexive_trait
 			.into_iter()
@@ -892,7 +893,7 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			}
 			if let Some(declaration) =
-				self.defs.declared_trait_member(trait_index, key)
+				defs.declared_trait_member(trait_index, key)
 			{
 				Self::push_candidate(
 					&mut candidates,
@@ -945,8 +946,7 @@ impl TypeContext<'_, '_, '_> {
 		assoc_type_index: AssocTypeIdx,
 		requested_at: SourceSpan,
 	) -> Result<(), ()> {
-		let def_id =
-			self.defs.assoc_types[usize::from(assoc_type_index)].def_id;
+		let def_id = DefId::AssocType(assoc_type_index);
 		assert!(
 			matches!(self.ast_node(def_id), AstNodeRef::TraitAssocType { .. }),
 			"bound access requires a trait declaration, not a provider"
@@ -1063,4 +1063,40 @@ fn report_ambiguous_type_member(
 			diagnostic.with_note(format!("provided by trait `{trait_name}`"));
 	}
 	diagnostic
+}
+
+/// Same code and wording as `report_trait_bound_violation`,
+/// reported for a recorded bounds check (mirroring rustc's `E0277` for this
+/// same case: `the trait bound `Foo: Bar` is not satisfied`) — this is
+/// that same condition, just reached with no declared bound clause to
+/// point a "required by a bound in `X`" secondary label at, since a
+/// qualified path's `as Trait` isn't one.
+pub(super) fn report_type_does_not_implement_trait(
+	formatter: &TypeFormatter<'_>,
+	file_id: FileId,
+	span: TextSpan,
+	receiver: TypeIndex,
+	required_trait: TraitIdx,
+) -> Diagnostic<FileId> {
+	let receiver_name = formatter.display_type(receiver);
+	let trait_name = formatter
+		.strings
+		.resolve(
+			formatter.defs.traits[usize::from(required_trait)]
+				.name
+				.inner,
+		)
+		.unwrap();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TraitBoundViolation.code())
+		.with_message(format!(
+			"the trait bound `{receiver_name}: {trait_name}` is not satisfied"
+		))
+		.with_label(
+			SourceSpan::new(file_id, span).primary_label().with_message(
+				format!(
+					"the trait `{trait_name}` is not implemented for `{receiver_name}`"
+				),
+			),
+		)
 }

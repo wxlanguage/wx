@@ -13,189 +13,21 @@ use codespan_reporting::diagnostic::Diagnostic;
 use super::bounds::BoundId;
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{BindingKey, DefinitionRegistry, TraitIdx};
+use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
-use super::obligations::{BoundRequirements, Obligation};
+use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
 use super::signatures::TypeContext;
-use super::solver::Unsolved;
-use super::types::{TypeEnvIdx, TypeIndex, TypeParam};
-use crate::ast::{Spanned, StringInterner};
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use super::solver::SolverError;
+use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
+use crate::ast::{self, Keyword, Spanned, StringInterner};
+use crate::diagnostics::{DiagnosticCode, SourceSpan};
+use crate::tir::bounds::{BoundFacts, ImpliedTraitBound};
+use crate::tir::solver::SolverView;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
 impl TypeContext<'_, '_, '_> {
-	fn requirement_facts(
-		&self,
-		requirements: BoundRequirements,
-	) -> Result<&[super::bounds::ImpliedTraitBound], Unsolved> {
-		let facts = match requirements {
-			BoundRequirements::Parameter { env, index } => {
-				&self.param_bounds[usize::from(env)][index].facts
-			}
-			BoundRequirements::AssociatedType(index) => {
-				let Some(signature) = &self.assoc_types[usize::from(index)]
-				else {
-					return Err(Unsolved::Pending);
-				};
-				&signature.facts
-			}
-		};
-		if !facts.is_ready() {
-			return Err(Unsolved::Pending);
-		}
-		Ok(facts.current())
-	}
-
-	/// Gather violations before emitting them: another requirement can still
-	/// be pending, and a retry must not duplicate a diagnostic.
-	pub(super) fn check_requirements(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		requirements: BoundRequirements,
-		argument: Spanned<TypeIndex>,
-		reference: SourceSpan,
-		owner: TypeEnvOwner,
-	) -> Result<(), Unsolved> {
-		let count = self.requirement_facts(requirements)?.len();
-		let mut violations = Vec::new();
-		for index in 0..count {
-			let bound = &self.requirement_facts(requirements)?[index];
-			let (required, source) = (bound.trait_index, bound.source);
-			if self
-				.find_trait_impl_query(
-					assumption_context,
-					argument.inner,
-					required,
-				)?
-				.is_none()
-			{
-				violations.push((required, source));
-			}
-		}
-		let valid = violations.is_empty();
-		for (required, source) in violations {
-			let diagnostic = self.report_trait_bound_violation(
-				reference.file_id,
-				argument,
-				required,
-				source,
-				owner,
-			);
-			self.diagnostics.push(diagnostic);
-		}
-		if valid { Ok(()) } else { Err(Unsolved::Failed) }
-	}
-
-	/// `projection::name` could not be selected from the projection's declared
-	/// bounds. Resolve what the projection's value is and which traits could
-	/// supply `name` on it, as rustc does to build its suggestion. Selecting
-	/// through an impl unqualified is ambiguous by design, so a trait that
-	/// *would* work is still an error, but one that says how to write it.
-	/// Always fails: the lowered type was `ERROR`.
-	pub(super) fn check_projection_member(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		projection: TypeIndex,
-		name: SymbolU32,
-		reference: SourceSpan,
-	) -> Result<(), Unsolved> {
-		let key = BindingKey::ty(name);
-		let ident = Spanned {
-			inner: name,
-			span: reference.span,
-		};
-		let declared_anywhere = (0..self.defs.traits.len()).any(|index| {
-			self.defs
-				.declared_trait_member(TraitIdx::new(index as u32), key)
-				.is_some()
-		});
-		let normalized =
-			match self.normalize_head_query(assumption_context, projection) {
-				Ok(normalized) => normalized,
-				// The projection has no value (an impl omits it, or its own
-				// requirement failed); that is reported where it belongs. Only a
-				// name no trait declares is certainly wrong.
-				Err(Unsolved::Failed) => {
-					if !declared_anywhere {
-						self.diagnostics.push(report_no_such_type_member(
-							reference.file_id,
-							self.strings,
-							ident,
-						));
-					}
-					return Err(Unsolved::Failed);
-				}
-				Err(error) => return Err(error),
-			};
-		// Each source names a trait at most once: the dispatch index holds one
-		// impl per trait per type constructor, and `declared_bound_member` skips
-		// a trait it has already collected.
-		let mut traits: Vec<TraitIdx> = Vec::new();
-		match ImplTarget::from_type(self.types.resolve(normalized)) {
-			Some(target) => {
-				for &(trait_index, _) in
-					self.impl_dispatch.trait_candidates(target)
-				{
-					if self
-						.defs
-						.declared_trait_member(trait_index, key)
-						.is_some()
-					{
-						traits.push(trait_index);
-					}
-				}
-			}
-			None => {
-				match self.declared_bound_member(normalized, key, reference) {
-					MemberLookup::Found(member) => {
-						traits.extend(
-							member
-								.assoc_type_declaration()
-								.map(|d| d.trait_index),
-						);
-					}
-					MemberLookup::Ambiguous(members) => {
-						traits.extend(members.iter().filter_map(|member| {
-							member
-								.assoc_type_declaration()
-								.map(|d| d.trait_index)
-						}));
-					}
-					_ => {}
-				}
-			}
-		}
-		if traits.is_empty() {
-			self.diagnostics.push(report_no_such_type_member(
-				reference.file_id,
-				self.strings,
-				ident,
-			));
-			return Err(Unsolved::Failed);
-		}
-		let name_str = self.strings.resolve(name).unwrap().to_string();
-		let receiver = self.type_formatter().display_type(projection);
-		let mut diagnostic = Diagnostic::error()
-			.with_code(DiagnosticCode::TypeMemberNeedsQualification.code())
-			.with_message(format!("ambiguous associated type `{name_str}`"))
-			.with_label(reference.primary_label().with_message(format!(
-				"`{receiver}` is known only through an impl, so the trait must be named"
-			)));
-		for trait_index in traits {
-			let trait_name = self
-				.strings
-				.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
-				.unwrap();
-			diagnostic = diagnostic.with_note(format!(
-				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
-			));
-		}
-		self.diagnostics.push(diagnostic);
-		Err(Unsolved::Failed)
-	}
-
 	/// Records the check of `argument` against `requirements` for the check
 	/// pass. Construction never decides a bound: the argument is kept as
 	/// written, and a failure is diagnosed later without rewriting it.
@@ -237,9 +69,9 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
-		reference_span: TextSpan,
+		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
-		args: &[Spanned<TypeIndex>],
+		args: &[TypeIndex],
 		owner: TypeEnvOwner,
 	) -> Box<[TypeIndex]> {
 		let expected = self.param_bounds[usize::from(params_env)].len();
@@ -248,28 +80,233 @@ impl TypeContext<'_, '_, '_> {
 				self.strings,
 				self.defs,
 				file_id,
-				reference_span,
-				self.type_envs.frame(params_env),
-				args,
-				owner,
+				segment,
+				TypeArgsTarget::Item {
+					owner,
+					params: self.type_envs.params(params_env),
+				},
 			));
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
 
 		let mut result = Vec::with_capacity(expected);
-		for (index, argument) in args.iter().copied().enumerate() {
+		for (index, (&argument, written)) in
+			args.iter().zip(&segment.type_args).enumerate()
+		{
 			result.push(self.record_bounds_check(
 				assumption_context,
 				BoundRequirements::Parameter {
 					env: params_env,
 					index,
 				},
-				argument,
-				SourceSpan::new(file_id, argument.span),
+				Spanned {
+					inner: argument,
+					span: written.span,
+				},
+				SourceSpan::new(file_id, written.span),
 				owner,
 			));
 		}
 		result.into_boxed_slice()
+	}
+}
+
+impl<'a> SolverView<'a> {
+	/// The facts live in the shared tables, not in the view, so they outlive
+	/// this borrow of it: a caller can read them while it lends the view on.
+	fn requirement_facts(
+		&self,
+		requirements: BoundRequirements,
+	) -> Result<&'a [ImpliedTraitBound], ()> {
+		// Copied out, so indexing yields `'a` rather than this `&self`.
+		let (param_bounds, assoc_types) = (self.param_bounds, self.assoc_types);
+		let facts = match requirements {
+			BoundRequirements::Parameter { env, index } => {
+				&param_bounds[usize::from(env)][index].facts
+			}
+			BoundRequirements::AssociatedType(index) => {
+				let Some(signature) = &assoc_types[usize::from(index)] else {
+					return Err(());
+				};
+				&signature.facts
+			}
+		};
+		match facts {
+			BoundFacts::Ready(facts) => Ok(facts),
+			BoundFacts::Provisional(_) => Err(()),
+		}
+	}
+}
+
+/// The checks bound satisfaction owns, run by the declaration check.
+impl ObligationChecker<'_> {
+	/// Gather violations before emitting them: another requirement can still
+	/// be pending, and a retry must not duplicate a diagnostic.
+	pub(super) fn check_requirements(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		requirements: BoundRequirements,
+		argument: Spanned<TypeIndex>,
+		reference: SourceSpan,
+		owner: TypeEnvOwner,
+	) -> Result<(), SolverError> {
+		let mut result = Ok(());
+		for bound in self
+			.view
+			.requirement_facts(requirements)
+			.map_err(|_| SolverError::Pending)?
+		{
+			if self
+				.solver
+				.find_trait_impl_query(
+					&mut self.view,
+					assumption_context,
+					argument.inner,
+					bound.trait_index,
+				)?
+				.is_none()
+			{
+				let diagnostic = self.report_trait_bound_violation(
+					reference.file_id,
+					argument,
+					bound.trait_index,
+					bound.source,
+					owner,
+				);
+				self.diagnostics.push(diagnostic);
+				result = Err(SolverError::Poisoned);
+			}
+		}
+		result
+	}
+
+	/// `projection::name` could not be selected from the projection's declared
+	/// bounds. Resolve what the projection's value is and which traits could
+	/// supply `name` on it, as rustc does to build its suggestion. Selecting
+	/// through an impl unqualified is ambiguous by design, so a trait that
+	/// *would* work is still an error, but one that says how to write it.
+	/// Always fails: the lowered type was `ERROR`.
+	pub(super) fn check_projection_member(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		projection: TypeIndex,
+		name: SymbolU32,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		let key = BindingKey::ty(name);
+		let ident = Spanned {
+			inner: name,
+			span: reference.span,
+		};
+		let declared_anywhere = (0..self.view.defs.traits.len()).any(|index| {
+			self.view
+				.defs
+				.declared_trait_member(TraitIdx::new(index as u32), key)
+				.is_some()
+		});
+		let normalized = match self.solver.normalize_head_query(
+			&mut self.view,
+			assumption_context,
+			projection,
+		) {
+			Ok(normalized) => normalized,
+			// The projection has no value (an impl omits it, or its own
+			// requirement failed); that is reported where it belongs. Only a
+			// name no trait declares is certainly wrong.
+			Err(SolverError::Poisoned) => {
+				if !declared_anywhere {
+					self.diagnostics.push(report_no_such_type_member(
+						reference.file_id,
+						self.strings,
+						ident,
+					));
+				}
+				return Err(SolverError::Poisoned);
+			}
+			Err(error) => return Err(error),
+		};
+		// Each source names a trait at most once: the dispatch index holds one
+		// impl per trait per type constructor, and `declared_bound_member` skips
+		// a trait it has already collected.
+		let mut traits: Vec<TraitIdx> = Vec::new();
+		match ImplTarget::from_type(self.view.types.resolve(normalized)) {
+			Some(target) => {
+				for &(trait_index, _) in
+					self.view.impl_dispatch.trait_candidates(target)
+				{
+					if self
+						.view
+						.defs
+						.declared_trait_member(trait_index, key)
+						.is_some()
+					{
+						traits.push(trait_index);
+					}
+				}
+			}
+			// Every signature exists, so the bounds are ready to read.
+			None if matches!(
+				self.view.types.resolve(normalized),
+				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+			) =>
+			{
+				let bounds = self.view.effective_bounds(
+					normalized,
+					self.solver.state.recursion_budget,
+				);
+				match TypeContext::select_declared_member(
+					self.view.defs,
+					bounds,
+					key,
+				) {
+					MemberLookup::Found(member) => {
+						traits.extend(
+							member
+								.assoc_type_declaration()
+								.map(|d| d.trait_index),
+						);
+					}
+					MemberLookup::Ambiguous(members) => {
+						traits.extend(members.iter().filter_map(|member| {
+							member
+								.assoc_type_declaration()
+								.map(|d| d.trait_index)
+						}));
+					}
+					_ => {}
+				}
+			}
+			None => {}
+		}
+		if traits.is_empty() {
+			self.diagnostics.push(report_no_such_type_member(
+				reference.file_id,
+				self.strings,
+				ident,
+			));
+			return Err(SolverError::Poisoned);
+		}
+		let name_str = self.strings.resolve(name).unwrap().to_string();
+		let receiver = self.type_formatter().display_type(projection);
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::TypeMemberNeedsQualification.code())
+			.with_message(format!("ambiguous associated type `{name_str}`"))
+			.with_label(reference.primary_label().with_message(format!(
+				"`{receiver}` is known only through an impl, so the trait must be named"
+			)));
+		for trait_index in traits {
+			let trait_name = self
+				.strings
+				.resolve(
+					self.view.defs.traits[usize::from(trait_index)].name.inner,
+				)
+				.unwrap();
+			diagnostic = diagnostic.with_note(format!(
+				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
+			));
+		}
+		self.diagnostics.push(diagnostic);
+		Err(SolverError::Poisoned)
 	}
 
 	fn report_trait_bound_violation(
@@ -283,7 +320,7 @@ impl TypeContext<'_, '_, '_> {
 		let arg_name = self.type_formatter().display_type(argument.inner);
 		let trait_name = self
 			.strings
-			.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
+			.resolve(self.view.defs.traits[usize::from(trait_index)].name.inner)
 			.unwrap();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -302,7 +339,7 @@ impl TypeContext<'_, '_, '_> {
 					format!(
 						"required by a bound in `{}`",
 						self.strings
-							.resolve(owner.name(self.defs).unwrap().inner)
+							.resolve(owner.name(self.view.defs).unwrap().inner)
 							.unwrap()
 					),
 				),
@@ -310,27 +347,52 @@ impl TypeContext<'_, '_, '_> {
 	}
 }
 
-/// `params` is the target's own frame, straight from `TypeEnvArena` — reads
-/// each `EnvParam`'s own (already `pub(super)`) `name` field directly rather
-/// than going through a single-index accessor per name/span, since nothing
-/// here needs `param`'s own resolved `ty` or `accesses`.
+/// What a path segment written with generic arguments names.
+pub(super) enum TypeArgsTarget<'a> {
+	/// A declaration and its own generic parameters, possibly none.
+	Item {
+		owner: TypeEnvOwner,
+		params: &'a [TypeParam],
+	},
+	/// A generic parameter or `Self`, which has no parameter list.
+	TypeParam,
+	/// A namespace the path passes through, which has no parameter list.
+	Namespace(DefKind),
+}
+
 pub(super) fn report_type_arg_count_mismatch(
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,
 	file_id: FileId,
-	reference_span: TextSpan,
-	params: &[TypeParam],
-	args: &[Spanned<TypeIndex>],
-	owner: TypeEnvOwner,
+	segment: &ast::PathSegment,
+	target: TypeArgsTarget<'_>,
 ) -> Diagnostic<FileId> {
-	let owner_file_id = owner.file_id(defs);
-	let owner_name = owner.name(defs).unwrap();
+	let (noun, name, declaration) = match target {
+		TypeArgsTarget::Item { owner, params } => {
+			let name = owner.name(defs).unwrap();
+			let declared_at = SourceSpan::new(owner.file_id(defs), name.span);
+			(owner.noun(), name.inner, Some((declared_at, params)))
+		}
+		TypeArgsTarget::TypeParam
+			if segment.ident.inner == Keyword::SelfPascal.symbol() =>
+		{
+			("self type", segment.ident.inner, None)
+		}
+		TypeArgsTarget::TypeParam => {
+			("type parameter", segment.ident.inner, None)
+		}
+		TypeArgsTarget::Namespace(kind) => {
+			(kind.noun(), segment.ident.inner, None)
+		}
+	};
+	let args = &segment.type_args;
+	let params = declaration.map_or(&[][..], |(_, params)| params);
 	let expected = params.len();
 	let found = args.len();
 	let plural = |n: usize| if n == 1 { "" } else { "s" };
 
 	let mut labels = vec![
-		SourceSpan::new(file_id, reference_span)
+		SourceSpan::new(file_id, segment.ident.span)
 			.primary_label()
 			.with_message(format!(
 				"expected {expected} generic argument{}",
@@ -353,27 +415,24 @@ pub(super) fn report_type_arg_count_mismatch(
 		});
 	}
 
-	let owner_str = strings.resolve(owner_name.inner).unwrap();
-	labels.push(
-		SourceSpan::new(owner_file_id, owner_name.span)
-			.secondary_label()
-			.with_message(format!(
-				"{} defined here, with {expected} generic parameter{}",
-				owner.noun(),
-				plural(expected)
-			)),
-	);
-	for param in params {
-		labels.push(
-			SourceSpan::new(owner_file_id, param.name.span).secondary_label(),
-		);
+	if let Some((declared_at, params)) = declaration {
+		labels.push(declared_at.secondary_label().with_message(format!(
+			"{noun} defined here, with {expected} generic parameter{}",
+			plural(expected)
+		)));
+		for param in params {
+			labels.push(
+				SourceSpan::new(declared_at.file_id, param.name.span)
+					.secondary_label(),
+			);
+		}
 	}
 
+	let name = strings.resolve(name).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::TypeArgumentCountMismatch.code())
 		.with_message(format!(
-			"{} `{owner_str}` takes {expected} generic argument{} but {found} generic argument{} {} supplied",
-			owner.noun(),
+			"{noun} `{name}` takes {expected} generic argument{} but {found} generic argument{} {} supplied",
 			plural(expected),
 			plural(found),
 			if found == 1 { "was" } else { "were" },
@@ -393,6 +452,7 @@ mod tests {
 	use crate::tir::defs::{DefKind, DefinitionRegistry, Scope, Tier};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::paths::PathResolver;
+	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::types::Type;
 	use crate::vfs;
 
@@ -419,22 +479,26 @@ mod tests {
 		let mut graph = vfs_builder.build(root_id);
 
 		let mut diagnostics = Vec::new();
+		let mut resolutions = NameResolutions::default();
 		let (defs, ast_nodes) = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
 			&mut graph.strings,
 			&mut diagnostics,
+			&mut resolutions,
 			graph.stdlib_package,
 			graph.root_package,
 		);
 		let impl_dispatch = ImplDispatch::build(
 			&mut diagnostics,
+			&mut resolutions,
 			&graph.strings,
 			&defs,
 			&ast_nodes,
 		);
 		let mut builder = TypeContext::new(
 			&mut diagnostics,
+			&mut resolutions,
 			&graph.strings,
 			&graph.files,
 			&defs,
@@ -473,14 +537,14 @@ mod tests {
 			})
 			.collect();
 		let mut diagnostics = Vec::new();
-		let target = PathResolver::new(builder.defs).resolve_path(
+		let mut resolutions = NameResolutions::default();
+		let target = PathResolver::new(
 			&mut diagnostics,
+			&mut resolutions,
 			&graph.strings,
-			file_id,
-			root,
-			&segments,
-			tier,
-		);
+			builder.defs,
+		)
+		.resolve_path(file_id, root, &segments, tier);
 		target
 			.def_key()
 			.unwrap_or_else(|| {
@@ -575,7 +639,7 @@ mod tests {
 							foo
 						)
 						.map(|found| found.is_some())
-						== Err(Unsolved::Failed))
+						== Err(SolverError::Poisoned))
 				);
 				assert!(
 					(builder
@@ -585,7 +649,7 @@ mod tests {
 							foo
 						)
 						.map(|found| found.is_some())
-						== Err(Unsolved::Failed))
+						== Err(SolverError::Poisoned))
 				);
 			},
 		);

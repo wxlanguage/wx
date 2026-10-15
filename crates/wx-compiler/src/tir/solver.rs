@@ -37,26 +37,27 @@ use super::types::{
 /// requirement owns any diagnostic, so a query never emits one.
 #[derive(Clone, PartialEq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum Unsolved {
+pub(super) enum SolverError {
 	/// A fact the answer depends on is not final yet (declarations are still
 	/// being built). It is not evidence of absence; ask again once construction
 	/// has advanced.
 	Pending,
-	/// There is no answer, and the construct that wrote the input owns the
-	/// report: an erroneous receiver, a trait the type does not implement, a
-	/// provider that supplies nothing, or a check that already reported its
-	/// violation. Consumers recover silently.
-	Failed,
+	/// There is no answer because the input derives from an error another
+	/// construct owns: an erroneous receiver, a poisoned value, a provider that
+	/// supplies nothing, or a check that already reported its violation. The
+	/// owner reports it; consumers recover silently.
+	Poisoned,
 	/// The recursion budget ran out. The asking site reports it.
 	Overflow,
 	/// A projection requires itself. The asking site reports it.
-	Cycle(Box<Cycle>),
+	Cycle(Box<ProjectionCycle>),
 }
 
-/// The loop a normalization closed on itself.
+/// A projection that normalization reached again while normalizing it: the
+/// loop, read from the projection that closed it.
 #[derive(Clone, PartialEq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) struct Cycle {
+pub(super) struct ProjectionCycle {
 	/// The projection that was requested again.
 	pub(super) projection: TypeIndex,
 	/// The projections in flight when it came back, outermost first.
@@ -103,109 +104,123 @@ pub(super) enum AssocValue {
 	/// The value normalizes in the impl's own scope. Readers still take the
 	/// value as written and normalize it in their own context.
 	Resolved,
-	/// The value has no meaning: a cycle, an exhausted budget, or it derives
-	/// from a value that has none. `Some` holds the failure (`Overflow` or
-	/// `Cycle`) this definition owns and its check reports; `None` derives from
-	/// a failure reported elsewhere.
-	Poisoned(Option<Unsolved>),
+	/// The value has no meaning because it derives from a failure another
+	/// construct owns and reports.
+	Poisoned,
+	/// The judgement ran out of budget. The definition owns this, and its
+	/// check reports it.
+	Overflowed,
+	/// The value requires itself through definitions only, and this member
+	/// owns the loop. Its check reports it.
+	Cyclic(Box<ProjectionCycle>),
 }
 
-/// A type reduced as far as its mode asks. The result can still be an abstract
-/// projection; that is a valid answer, not an unfinished one.
-pub(super) type Normalized = Result<TypeIndex, Unsolved>;
+/// What the facts in scope establish for a trait requirement, without impl
+/// dispatch. Ordered by strength, so combining two readings keeps the
+/// stronger (`max`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum Assumption {
+	/// The facts are final and none proves it.
+	Unproven,
+	/// No fact read so far proves it; an unfinished table may still add one.
+	Pending,
+	/// A fact proves it.
+	Holds,
+}
 
 /// One frame of the solver's stack: work started and not yet finished, the
 /// solver's counterpart of a `query_stack` frame. The stack is the path a
 /// cycle is read from.
+///
+/// A projection is rewritten by one of two facts, and a loop is judged by
+/// which it passes through:
+///
+/// ```text
+/// fn f<T: Tr where { A = U::A }, U: Tr where { A = T::A }>() {}
+/// // T::A -> U::A -> T::A through equalities: a tautology, T::A stays abstract
+///
+/// impl Tr for W { type A = <W as Tr>::A; }
+/// // W::A -> W::A through a definition only: a cycle, reported by its member
+/// ```
 enum SolverFrame {
-	/// A projection being reduced. Evidence comparison and provider reduction
-	/// have distinct cycle keys.
-	Projection {
-		mode: Mode,
-		assumption_context: TypeEnvIdx,
-		projection: TypeIndex,
-	},
-	/// The frame above it was justified by a hypothesis (an equality written in
-	/// a bound), not by a definition. A loop through one is a tautology that
-	/// leaves the projection abstract; a loop through definitions only is an
-	/// error.
-	Assumption,
-	/// An impl member's value being judged (`Solver::assoc_value`), selected by
+	/// A projection being normalized; its `ty` advances as the base reduces.
+	/// Evidence comparison and provider reduction differ in `facts`, so they
+	/// are distinct cycle keys.
+	Projection(Normalization),
+	/// The projection below was rewritten by an equality written in a bound
+	/// (`T: Tr where { A = U }` rewrites `T::A` to `U`). It states what the
+	/// caller may assume, not what a type is, so a loop through one is a
+	/// tautology.
+	Equality,
+	/// A definition: an impl member's value being judged (`impl Tr for W
+	/// { type A = u32; }` rewrites `W::A` to `u32`). Selected by
 	/// `requested_by` (`None` when its own check asked). The member's verdict is
 	/// `InProgress` while this frame is on the stack, as a signature's query state
-	/// is while its frame is on `query_stack`. The judgement counts its depth
-	/// from zero, so running out of budget is a verdict on the definition alone;
-	/// `outer_depth` is the depth to restore once it is done.
+	/// is while its frame is on `query_stack`. The judgement starts with a full
+	/// recursion budget, so running out of it is a verdict on the definition
+	/// alone; `outer_budget` is the budget to restore once it is done.
 	Judgement {
 		member: ImplMember,
 		requested_by: Option<TypeIndex>,
-		outer_depth: usize,
+		outer_budget: usize,
 	},
 }
 
 /// The derivation currently being computed. Shared across re-entrant
 /// signature queries and value judgements, not recreated per API call, so
 /// cycle detection sees every frame of a loop, whichever judgement it crosses.
-struct SolverState {
+pub(super) struct SolverState {
 	frames: Vec<SolverFrame>,
-	/// How deeply the innermost judgement's derivation (or the request, outside
-	/// any judgement) is nested; the budget is measured against it.
-	depth: usize,
+	/// How many more levels the innermost judgement (or the request, outside
+	/// any judgement) may recurse. Equals `Solver::recursion_limit` when no frame is open.
+	pub(super) recursion_budget: usize,
 	/// Roll back an assumed equality chain that made no finite progress.
 	blocked_at: Option<usize>,
-}
-
-impl Default for SolverState {
-	fn default() -> Self {
-		Self {
-			frames: Vec::new(),
-			depth: 0,
-			blocked_at: None,
-		}
-	}
-}
-
-impl SolverState {
-	/// No frame is open: no projection, assumption or judgement is in flight, so
-	/// no rollback can be pending either. An answer asked for now cannot depend
-	/// on anything above it.
-	fn is_idle(&self) -> bool {
-		self.frames.is_empty()
-	}
+	/// The outermost frame the innermost request's answer read so far (a
+	/// cycle, a re-entered judgement or a rollback), `usize::MAX` when none.
+	/// An answer that read no frame below its own request is a function of its
+	/// `Normalization` alone.
+	lowest_frame_read: usize,
 }
 
 /// The engine that normalizes types and selects impls, with everything it
 /// keeps: the derivation in flight, the finished-answer cache and the rule for
 /// when it may be used, and the verdicts on impl members' values.
 pub(super) struct Solver {
-	/// The recursion budget: how deeply one request may nest. Fixed
+	/// The recursion budget each request and each judgement starts with. Fixed
 	/// configuration, not state; only tests change it.
-	limit: usize,
-	state: SolverState,
+	recursion_limit: usize,
+	pub(super) state: SolverState,
 	/// Only `Ok` answers are stored. `Pending` means a fact is not final yet,
-	/// and `Failed` is not a permanent verdict (a budget overflow can be
+	/// and `Poisoned` is not a permanent verdict (a budget overflow can be
 	/// retried), so neither is remembered. Every
 	/// stored answer was final when computed, so no "facts are final" switch is
 	/// needed.
-	completed: HashMap<(TypeEnvIdx, TypeIndex, Mode), TypeIndex>,
+	pub(super) normalized: HashMap<Normalization, TypeIndex>,
 	/// The verdict on each impl member asked about; absent is `Unchecked`.
 	/// A member is `InProgress` exactly while its `SolverFrame::Judgement` is on
 	/// the stack.
-	pub(super) values: HashMap<ImplMember, AssocValue>,
+	pub(super) verdicts: HashMap<ImplMember, AssocValue>,
 }
 
 impl Solver {
 	pub(super) fn new() -> Self {
+		let recursion_limit = 128;
 		Self {
-			limit: 128,
-			state: SolverState::default(),
-			completed: HashMap::new(),
-			values: HashMap::new(),
+			recursion_limit,
+			state: SolverState {
+				frames: Vec::new(),
+				recursion_budget: recursion_limit,
+				blocked_at: None,
+				lowest_frame_read: usize::MAX,
+			},
+			normalized: HashMap::new(),
+			verdicts: HashMap::new(),
 		}
 	}
 
 	pub(super) fn verdict(&self, member: ImplMember) -> &AssocValue {
-		self.values.get(&member).unwrap_or(&AssocValue::Unchecked)
+		self.verdicts.get(&member).unwrap_or(&AssocValue::Unchecked)
 	}
 
 	/// `member`'s value, judged once: normalized in its impl's `Self` scope with
@@ -217,28 +232,30 @@ impl Solver {
 	/// instantiates it. The judgement is a frame on the same stack, so
 	/// reaching the member again sees the whole loop: through definitions only,
 	/// it is a cycle owned by its first defined member (see `AssocValue`);
-	/// through a hypothesis, it is a tautology the derivation itself blocks.
-	fn assoc_value(
+	/// through an equality, it is a tautology the derivation itself blocks.
+	pub(super) fn assoc_value(
 		&mut self,
 		view: &mut SolverView<'_>,
 		member: ImplMember,
 		requested_by: Option<TypeIndex>,
-	) -> Normalized {
+	) -> Result<TypeIndex, SolverError> {
 		match self.verdict(member) {
 			AssocValue::Unchecked => {}
 			AssocValue::InProgress => {
 				return self.reenter_judgement(view, member, requested_by);
 			}
 			AssocValue::Resolved => return view.impl_member_value(member),
-			AssocValue::Poisoned(_) => return Err(Unsolved::Failed),
+			AssocValue::Poisoned
+			| AssocValue::Overflowed
+			| AssocValue::Cyclic(_) => return Err(SolverError::Poisoned),
 		}
 		let value = match view.impl_member_value(member) {
 			Ok(value) => value,
 			// No value (lowering failed and reported, or neither the impl nor the
 			// trait supplies one, which conformance owns); nothing to judge.
-			Err(Unsolved::Failed) => {
-				self.values.insert(member, AssocValue::Poisoned(None));
-				return Err(Unsolved::Failed);
+			Err(SolverError::Poisoned) => {
+				self.verdicts.insert(member, AssocValue::Poisoned);
+				return Err(SolverError::Poisoned);
 			}
 			Err(error) => return Err(error),
 		};
@@ -246,64 +263,76 @@ impl Solver {
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
 			.self_scope;
-		self.values.insert(member, AssocValue::InProgress);
+		self.verdicts.insert(member, AssocValue::InProgress);
 		let index = self.state.frames.len();
 		self.state.frames.push(SolverFrame::Judgement {
 			member,
 			requested_by,
-			outer_depth: std::mem::take(&mut self.state.depth),
+			outer_budget: std::mem::replace(
+				&mut self.state.recursion_budget,
+				self.recursion_limit,
+			),
 		});
-		let result = self.normalize(view, scope, value, Mode::Deep);
-		let Some(SolverFrame::Judgement { outer_depth, .. }) =
+		let result = self.normalize(
+			view,
+			scope,
+			value,
+			NormalizationDepth::Deep,
+			RewriteFacts::EqualitiesAndDefinitions,
+		);
+		let Some(SolverFrame::Judgement { outer_budget, .. }) =
 			self.state.frames.pop()
 		else {
 			unreachable!("the judgement is the innermost frame once it is done")
 		};
-		self.state.depth = outer_depth;
+		self.state.recursion_budget = outer_budget;
 		// A tautology further out is unwinding through this judgement, which was
 		// cut short: there is no verdict yet, so it is judged again when asked.
 		if self.state.blocked_at.is_some_and(|blocked| blocked < index) {
-			self.values.remove(&member);
+			self.verdicts.remove(&member);
 			return Ok(value);
 		}
 		let (verdict, answer) = match result {
 			Ok(_) => (AssocValue::Resolved, Ok(value)),
-			Err(Unsolved::Pending) => {
-				(AssocValue::Unchecked, Err(Unsolved::Pending))
+			Err(SolverError::Pending) => {
+				(AssocValue::Unchecked, Err(SolverError::Pending))
 			}
-			Err(Unsolved::Failed) => {
-				(AssocValue::Poisoned(None), Err(Unsolved::Failed))
+			Err(SolverError::Poisoned) => {
+				(AssocValue::Poisoned, Err(SolverError::Poisoned))
 			}
 			// Another member owns the loop. Its own judgement, further out,
-			// answers `Failed` once it has kept the loop, so members past it
+			// answers `Poisoned` once it has kept the loop, so members past it
 			// unwind as derived failures.
-			Err(Unsolved::Cycle(cycle))
+			Err(SolverError::Cycle(cycle))
 				if cycle.owner.is_some_and(|owner| owner != member) =>
 			{
-				(AssocValue::Poisoned(None), Err(Unsolved::Cycle(cycle)))
+				(AssocValue::Poisoned, Err(SolverError::Cycle(cycle)))
 			}
 			// The budget counts from this judgement, so running out is a verdict
 			// on the definition, like a cycle.
-			Err(owned @ (Unsolved::Overflow | Unsolved::Cycle(_))) => {
-				(AssocValue::Poisoned(Some(owned)), Err(Unsolved::Failed))
+			Err(SolverError::Overflow) => {
+				(AssocValue::Overflowed, Err(SolverError::Poisoned))
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				(AssocValue::Cyclic(cycle), Err(SolverError::Poisoned))
 			}
 		};
-		self.values.insert(member, verdict);
+		self.verdicts.insert(member, verdict);
 		answer
 	}
 
-	/// `member` was reached again while its judgement is on the stack. A
-	/// hypothesis on the way back makes the loop a tautology, not an error: the
+	/// `member` was reached again while its judgement is on the stack. An
+	/// equality on the way back makes the loop a tautology, not an error: the
 	/// value as written goes on, and the derivation blocks once its projections
-	/// repeat (`projection_cycle`), as it does for any loop through a
-	/// hypothesis. Through definitions only, the loop is a cycle, read from the
+	/// repeat (`projection_cycle`), as it does for any loop through an
+	/// equality. Through definitions only, the loop is a cycle, read from the
 	/// stack and owned by its first defined member.
 	fn reenter_judgement(
 		&mut self,
 		view: &mut SolverView<'_>,
 		member: ImplMember,
 		requested_by: Option<TypeIndex>,
-	) -> Normalized {
+	) -> Result<TypeIndex, SolverError> {
 		let start = self
 			.state
 			.frames
@@ -312,10 +341,11 @@ impl Solver {
 				matches!(frame, SolverFrame::Judgement { member: judged, .. } if *judged == member)
 			})
 			.expect("an in-progress judgement is on the stack");
+		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
-			.any(|frame| matches!(frame, SolverFrame::Assumption))
+			.any(|frame| matches!(frame, SolverFrame::Equality))
 		{
 			return view.impl_member_value(member);
 		}
@@ -351,68 +381,53 @@ impl Solver {
 			.expect("the loop has a member");
 		// Read the loop from the owner: its value requires the first step.
 		steps.rotate_left(at);
-		Err(Unsolved::Cycle(Box::new(Cycle {
+		Err(SolverError::Cycle(Box::new(ProjectionCycle {
 			projection: steps[0],
 			steps: steps.into_boxed_slice(),
 			owner: Some(owner),
 		})))
 	}
 
-	/// Bound readers traverse receiver structure within the same work limit.
-	pub(super) fn remaining_depth(&self) -> usize {
-		self.limit - self.state.depth
-	}
-
-	/// A finished answer, if this request may be served from the cache. With a
-	/// frame open the answer can depend on it (cycle and rollback state, an
-	/// open judgement), so the cache is bypassed entirely; with none it is a
-	/// function of the key alone.
-	fn cached(
-		&self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-		mode: Mode,
-	) -> Option<TypeIndex> {
-		if !self.state.is_idle() {
-			return None;
-		}
-		self.completed.get(&(assumption_context, ty, mode)).copied()
-	}
-
-	/// Remember an answer under the same rule. Called after the request has
-	/// settled, so the state is idle exactly when no frame enclosed it.
-	fn remember(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-		mode: Mode,
-		result: &Normalized,
-	) {
-		if self.state.is_idle()
-			&& let Ok(normalized) = *result
-		{
-			self.completed
-				.insert((assumption_context, ty, mode), normalized);
-		}
-	}
-
 	#[cfg(test)]
 	pub(super) fn set_limit_for_test(&mut self, limit: usize) {
-		self.limit = limit;
+		debug_assert!(self.state.frames.is_empty());
+		self.recursion_limit = limit;
+		self.state.recursion_budget = limit;
 	}
 }
 
+/// One normalization: `ty` under the assumptions of `env`, reduced to `depth`
+/// by `facts`. Two are the same exactly when their answers must be, so it keys
+/// both cycle detection and the cache.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Mode {
-	Head,
+pub(super) struct Normalization {
+	env: TypeEnvIdx,
+	pub(super) ty: TypeIndex,
+	depth: NormalizationDepth,
+	facts: RewriteFacts,
+}
+
+/// How far into a type a normalization reduces.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NormalizationDepth {
+	/// Only the outermost type: enough to select an impl.
+	Shallow,
+	/// The type and every type nested in it.
 	Deep,
-	/// Reduce only assumed equalities, including nested type structure.
-	/// Comparing evidence must not recursively select the impl being proved.
-	Assumptions,
+}
+
+/// The facts that may replace a projection with a value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RewriteFacts {
+	/// Only equalities written in bounds. Comparing evidence for a trait must
+	/// not select the impl being proved.
+	Equalities,
+	/// Equalities, and the impl's definition when no equality applies.
+	EqualitiesAndDefinitions,
 }
 
 /// What the assumptions in scope say a projection equals. Unfinished facts are
-/// not an answer (`Unsolved::Pending`), and neither absence nor competing
+/// not an answer (`SolverError::Pending`), and neither absence nor competing
 /// equalities make an abstract projection invalid.
 pub(super) enum EqualityLookup {
 	Known(TypeIndex),
@@ -458,31 +473,13 @@ impl<'a> SolverView<'a> {
 		(self.reader(), &mut *self.types)
 	}
 
-	fn effective_bounds(
+	pub(super) fn effective_bounds(
 		&self,
 		receiver: TypeIndex,
-		remaining_depth: usize,
+		recursion_budget: usize,
 	) -> EffectiveBounds<'a> {
 		self.reader()
-			.effective_bounds(&*self.types, receiver, remaining_depth)
-	}
-
-	fn has_effective_trait(
-		&self,
-		receiver: TypeIndex,
-		trait_index: TraitIdx,
-		remaining_depth: usize,
-	) -> bool {
-		let bounds = self.effective_bounds(receiver, remaining_depth);
-		if bounds.reflexive_trait == Some(trait_index) {
-			return true;
-		}
-		for entry in bounds {
-			if entry.bound.trait_index == trait_index {
-				return true;
-			}
-		}
-		false
+			.effective_bounds(&*self.types, receiver, recursion_budget)
 	}
 
 	/// Only a parameter or a projection of one can carry assumed equalities.
@@ -497,13 +494,16 @@ impl<'a> SolverView<'a> {
 	/// environment. Instantiation and any normalization made possible by
 	/// substitution belong to the caller. Reads the finished slot: an unfilled
 	/// one is an unfinished fact (`Pending`), never something to construct here.
-	fn assoc_type_value(&self, provider: AssocTypeIdx) -> Normalized {
+	fn assoc_type_value(
+		&self,
+		provider: AssocTypeIdx,
+	) -> Result<TypeIndex, SolverError> {
 		let Some(signature) = self.assoc_types[usize::from(provider)].as_ref()
 		else {
-			return Err(Unsolved::Pending);
+			return Err(SolverError::Pending);
 		};
 		match signature.value {
-			Some(TypeIndex::ERROR) => Err(Unsolved::Failed),
+			Some(TypeIndex::ERROR) => Err(SolverError::Poisoned),
 			Some(value) => Ok(value),
 			None => unreachable!("an impl provider has a value"),
 		}
@@ -512,11 +512,14 @@ impl<'a> SolverView<'a> {
 	/// `member`'s value in its impl's environment, as written: the impl's own,
 	/// or the trait's default with `Self` the impl's target. Readers go through
 	/// `Solver::assoc_value`, which judges it.
-	fn impl_member_value(&mut self, member: ImplMember) -> Normalized {
+	fn impl_member_value(
+		&mut self,
+		member: ImplMember,
+	) -> Result<TypeIndex, SolverError> {
 		let Some(header) =
 			self.trait_impls[usize::from(member.impl_index)].as_ref()
 		else {
-			return Err(Unsolved::Pending);
+			return Err(SolverError::Pending);
 		};
 		let target = header.target.inner;
 		match self.defs.select_trait_member(
@@ -526,7 +529,7 @@ impl<'a> SolverView<'a> {
 			TraitMemberSelection::Impl(MemberKind::AssociatedType(
 				provider,
 			)) => self.assoc_type_value(provider),
-			TraitMemberSelection::Impl(_) => Err(Unsolved::Failed),
+			TraitMemberSelection::Impl(_) => Err(SolverError::Poisoned),
 			TraitMemberSelection::TraitDeclaration(_) => {
 				let default = self.assoc_type_default(member.declaration)?;
 				let trait_index = self
@@ -550,14 +553,17 @@ impl<'a> SolverView<'a> {
 	/// The default a trait declaration supplies when the selected impl omits
 	/// the member, in the trait's `Self` scope. A declaration without a default
 	/// has no value; the later conformance pass owns the missing-member report.
-	fn assoc_type_default(&self, declaration: AssocTypeIdx) -> Normalized {
+	fn assoc_type_default(
+		&self,
+		declaration: AssocTypeIdx,
+	) -> Result<TypeIndex, SolverError> {
 		let Some(signature) =
 			self.assoc_types[usize::from(declaration)].as_ref()
 		else {
-			return Err(Unsolved::Pending);
+			return Err(SolverError::Pending);
 		};
 		match signature.value {
-			Some(TypeIndex::ERROR) | None => Err(Unsolved::Failed),
+			Some(TypeIndex::ERROR) | None => Err(SolverError::Poisoned),
 			Some(value) => Ok(value),
 		}
 	}
@@ -569,51 +575,98 @@ impl Solver {
 	pub(super) fn normalize_head_query(
 		&mut self,
 		view: &mut SolverView<'_>,
-		assumption_context: TypeEnvIdx,
+		env: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
-		self.normalize(view, assumption_context, ty, Mode::Head)
+	) -> Result<TypeIndex, SolverError> {
+		self.normalize(
+			view,
+			env,
+			ty,
+			NormalizationDepth::Shallow,
+			RewriteFacts::EqualitiesAndDefinitions,
+		)
 	}
 
 	pub(super) fn normalize_type_query(
 		&mut self,
 		view: &mut SolverView<'_>,
-		assumption_context: TypeEnvIdx,
+		env: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
-		self.normalize(view, assumption_context, ty, Mode::Deep)
+	) -> Result<TypeIndex, SolverError> {
+		self.normalize(
+			view,
+			env,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::EqualitiesAndDefinitions,
+		)
 	}
 
 	pub(super) fn normalize_assumed_type_query(
 		&mut self,
 		view: &mut SolverView<'_>,
-		assumption_context: TypeEnvIdx,
+		env: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
-		self.normalize(view, assumption_context, ty, Mode::Assumptions)
+	) -> Result<TypeIndex, SolverError> {
+		self.normalize(
+			view,
+			env,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::Equalities,
+		)
 	}
 }
 
 impl Solver {
-	/// The cache layer around `normalize_uncached`; when the cache may be used
-	/// is decided by `Solver`.
+	/// The cache layer around `normalize_uncached`. An answer that read a frame
+	/// below its own request (cycle and rollback state, an open judgement)
+	/// holds only while that frame is open, so it is not stored. Only a request
+	/// with no frame open reads the cache: a nested one could reuse an answer
+	/// whose derivation passed through a frame open now, skipping the cycle it
+	/// would have found.
+	///
+	/// TODO: let nested requests read the cache too, removing the repeated
+	/// work inside one deep normalization. Each entry would also store what its
+	/// derivation pushed (projection normalizations and judged members), and a
+	/// nested read would use it only when none of those is on the stack now,
+	/// as rustc's search graph does. Worth it once body checking makes
+	/// normalization measurably hot; every frame-pushing path must then record
+	/// itself, or reads silently become order-dependent.
 	fn normalize(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
-		if let Some(hit) = self.cached(assumption_context, ty, mode) {
-			return Ok(hit);
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
+		let normalization = Normalization {
+			env: assumption_context,
+			ty,
+			depth,
+			facts,
+		};
+		let frame = self.state.frames.len();
+		if frame == 0
+			&& let Some(&normalized) = self.normalized.get(&normalization)
+		{
+			return Ok(normalized);
 		}
-		let enclosed = !self.state.is_idle();
+		let outer_read =
+			std::mem::replace(&mut self.state.lowest_frame_read, usize::MAX);
 		let result =
-			self.normalize_uncached(view, assumption_context, ty, mode);
+			self.normalize_uncached(view, assumption_context, ty, depth, facts);
+		let lowest_read = self.state.lowest_frame_read;
+		self.state.lowest_frame_read = outer_read.min(lowest_read);
 		// A request that started with nothing in flight leaves nothing behind.
-		debug_assert!(enclosed || self.state.is_idle());
-		debug_assert!(enclosed || self.state.blocked_at.is_none());
-		self.remember(assumption_context, ty, mode, &result);
+		debug_assert!(frame != 0 || self.state.frames.is_empty());
+		debug_assert!(frame != 0 || self.state.blocked_at.is_none());
+		if lowest_read >= frame
+			&& let Ok(normalized) = result
+		{
+			self.normalized.insert(normalization, normalized);
+		}
 		result
 	}
 
@@ -622,31 +675,45 @@ impl Solver {
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
-		if self.state.blocked_at.is_some() {
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
+		if let Some(blocked) = self.state.blocked_at {
+			// Unwinding to `blocked`: the answer is only a way out.
+			self.state.lowest_frame_read =
+				self.state.lowest_frame_read.min(blocked);
 			return Ok(ty);
 		}
-		if self.state.depth == self.limit {
+		if self.state.recursion_budget == 0 {
 			// Budget exhaustion is a failure the asking site reports, never an
 			// unfinished fact; a top-level request can be retried with more.
-			return Err(Unsolved::Overflow);
+			return Err(SolverError::Overflow);
 		}
-		self.state.depth += 1;
+		self.state.recursion_budget -= 1;
 		let result = if matches!(
 			view.types.resolve(ty),
 			Type::AssocTypeProjection { .. }
 		) {
-			self.normalize_projection(view, assumption_context, ty, mode)
+			self.normalize_projection(
+				view,
+				assumption_context,
+				ty,
+				depth,
+				facts,
+			)
 		} else {
-			match mode {
-				Mode::Head => Ok(ty),
-				Mode::Deep | Mode::Assumptions => {
-					self.normalize_children(view, assumption_context, ty, mode)
-				}
+			match depth {
+				NormalizationDepth::Shallow => Ok(ty),
+				NormalizationDepth::Deep => self.normalize_children(
+					view,
+					assumption_context,
+					ty,
+					depth,
+					facts,
+				),
 			}
 		};
-		self.state.depth -= 1;
+		self.state.recursion_budget += 1;
 		result
 	}
 
@@ -655,20 +722,30 @@ impl Solver {
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		projection: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
-		if self.projection_cycle(assumption_context, projection, mode)? {
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
+		let normalization = Normalization {
+			env: assumption_context,
+			ty: projection,
+			depth,
+			facts,
+		};
+		if self.projection_cycle(normalization)? {
 			return Ok(projection);
 		}
-		self.state.frames.push(SolverFrame::Projection {
-			mode,
-			assumption_context,
-			projection,
-		});
+		self.state
+			.frames
+			.push(SolverFrame::Projection(normalization));
 		// Keep the frame active across receiver normalization, provider queries,
 		// and traversal of the resulting type, including compound results.
-		let result =
-			self.reduce_projection(view, assumption_context, projection, mode);
+		let result = self.reduce_projection(
+			view,
+			assumption_context,
+			projection,
+			depth,
+			facts,
+		);
 		let index = self.state.frames.len() - 1;
 		self.state.frames.pop();
 		if let Some(blocked) = self.state.blocked_at {
@@ -685,8 +762,9 @@ impl Solver {
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		projection: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
 		let Type::AssocTypeProjection {
 			base,
 			trait_index,
@@ -706,20 +784,22 @@ impl Solver {
 				assoc_type_index,
 			)? {
 				EqualityLookup::Known(value) => {
-					return self.reduce_to_assumed(
+					return self.reduce_by_equality(
 						view,
 						assumption_context,
 						projection,
 						value,
-						mode,
+						depth,
+						facts,
 					);
 				}
 				EqualityLookup::Absent | EqualityLookup::Ambiguous => {}
 			}
 		}
-		let next_base = self.normalize(view, assumption_context, base, mode)?;
+		let next_base =
+			self.normalize(view, assumption_context, base, depth, facts)?;
 		if next_base == TypeIndex::ERROR {
-			return Err(Unsolved::Failed);
+			return Err(SolverError::Poisoned);
 		}
 		let projection = if next_base == base {
 			projection
@@ -729,17 +809,20 @@ impl Solver {
 				trait_index,
 				assoc_type_index,
 			});
-			if self.projection_cycle(assumption_context, next, mode)? {
+			if self.projection_cycle(Normalization {
+				env: assumption_context,
+				ty: next,
+				depth,
+				facts,
+			})? {
 				return Ok(projection);
 			}
-			let Some(SolverFrame::Projection {
-				projection: current,
-				..
-			}) = self.state.frames.last_mut()
+			let Some(SolverFrame::Projection(current)) =
+				self.state.frames.last_mut()
 			else {
 				unreachable!("the reducing projection is the innermost frame")
 			};
-			*current = next;
+			current.ty = next;
 			next
 		};
 		if view.is_abstract(next_base) {
@@ -750,12 +833,13 @@ impl Solver {
 				trait_index,
 				assoc_type_index,
 			)? {
-				EqualityLookup::Known(value) => self.reduce_to_assumed(
+				EqualityLookup::Known(value) => self.reduce_by_equality(
 					view,
 					assumption_context,
 					projection,
 					value,
-					mode,
+					depth,
+					facts,
 				),
 				EqualityLookup::Absent | EqualityLookup::Ambiguous => {
 					Ok(projection)
@@ -768,7 +852,7 @@ impl Solver {
 		) {
 			return Ok(projection);
 		}
-		if mode == Mode::Assumptions {
+		if facts == RewriteFacts::Equalities {
 			return Ok(projection);
 		}
 		// `None` is silent on purpose: normalization is a query and reports
@@ -782,7 +866,7 @@ impl Solver {
 			trait_index,
 		)?
 		else {
-			return Err(Unsolved::Failed);
+			return Err(SolverError::Poisoned);
 		};
 		let TraitImplLookup::Concrete { impl_index, args } = found else {
 			return Ok(projection);
@@ -803,49 +887,44 @@ impl Solver {
 			view.types
 				.substitute(value, &Substitution { env, args: &args })
 		};
-		self.normalize(view, assumption_context, instantiated, mode)
+		self.normalize(view, assumption_context, instantiated, depth, facts)
 	}
 
-	/// The assumptions in scope give `projection` the value `value`. Evidence
-	/// that restates the projection itself leaves it abstract.
-	fn reduce_to_assumed(
+	/// An equality in scope gives `projection` the value `value`. One that
+	/// restates the projection (`A = T::A` for `T::A`) leaves it abstract.
+	fn reduce_by_equality(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		projection: TypeIndex,
 		value: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
 		if value == projection {
 			return Ok(projection);
 		}
-		self.state.frames.push(SolverFrame::Assumption);
-		let result = self.normalize(view, assumption_context, value, mode);
+		self.state.frames.push(SolverFrame::Equality);
+		let result =
+			self.normalize(view, assumption_context, value, depth, facts);
 		self.state.frames.pop();
 		result
 	}
 
 	fn projection_cycle(
 		&mut self,
-		assumption_context: TypeEnvIdx,
-		projection: TypeIndex,
-		mode: Mode,
-	) -> Result<bool, Unsolved> {
+		normalization: Normalization,
+	) -> Result<bool, SolverError> {
 		let Some(start) = self.state.frames.iter().position(|frame| {
-			matches!(frame, SolverFrame::Projection {
-					mode: step_mode,
-					assumption_context: step_context,
-					projection: step_projection,
-				} if *step_context == assumption_context
-					&& *step_projection == projection
-					&& *step_mode == mode)
+			matches!(frame, SolverFrame::Projection(step) if *step == normalization)
 		}) else {
 			return Ok(false);
 		};
+		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
-			.any(|frame| matches!(frame, SolverFrame::Assumption))
+			.any(|frame| matches!(frame, SolverFrame::Equality))
 		{
 			self.state.blocked_at = Some(
 				self.state
@@ -866,12 +945,12 @@ impl Solver {
 		let steps = loop_frames
 			.iter()
 			.filter_map(|frame| match frame {
-				SolverFrame::Projection { projection, .. } => Some(*projection),
-				SolverFrame::Assumption | SolverFrame::Judgement { .. } => None,
+				SolverFrame::Projection(step) => Some(step.ty),
+				SolverFrame::Equality | SolverFrame::Judgement { .. } => None,
 			})
 			.collect();
-		Err(Unsolved::Cycle(Box::new(Cycle {
-			projection,
+		Err(SolverError::Cycle(Box::new(ProjectionCycle {
+			projection: normalization.ty,
 			steps,
 			owner: None,
 		})))
@@ -884,8 +963,9 @@ impl Solver {
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-		mode: Mode,
-	) -> Normalized {
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
 		let rebuilt = match view.types.resolve(ty).clone() {
 			Type::Tuple { mut elements } => {
 				for element in elements.iter_mut() {
@@ -893,7 +973,8 @@ impl Solver {
 						view,
 						assumption_context,
 						*element,
-						mode,
+						depth,
+						facts,
 					)?;
 				}
 				Type::Tuple { elements }
@@ -903,8 +984,13 @@ impl Solver {
 				mut type_args,
 			} => {
 				for arg in type_args.iter_mut() {
-					*arg =
-						self.normalize(view, assumption_context, *arg, mode)?;
+					*arg = self.normalize(
+						view,
+						assumption_context,
+						*arg,
+						depth,
+						facts,
+					)?;
 				}
 				Type::Struct {
 					struct_index,
@@ -916,8 +1002,13 @@ impl Solver {
 				mut type_args,
 			} => {
 				for arg in type_args.iter_mut() {
-					*arg =
-						self.normalize(view, assumption_context, *arg, mode)?;
+					*arg = self.normalize(
+						view,
+						assumption_context,
+						*arg,
+						depth,
+						facts,
+					)?;
 				}
 				Type::FunctionItem {
 					func_index,
@@ -926,8 +1017,13 @@ impl Solver {
 			}
 			Type::Function { mut params, result } => {
 				for param in params.iter_mut() {
-					*param =
-						self.normalize(view, assumption_context, *param, mode)?;
+					*param = self.normalize(
+						view,
+						assumption_context,
+						*param,
+						depth,
+						facts,
+					)?;
 				}
 				Type::Function {
 					params,
@@ -935,7 +1031,8 @@ impl Solver {
 						view,
 						assumption_context,
 						result,
-						mode,
+						depth,
+						facts,
 					)?,
 				}
 			}
@@ -944,12 +1041,19 @@ impl Solver {
 				memory,
 				ownership,
 			} => Type::Pointer {
-				to: self.normalize(view, assumption_context, to, mode)?,
+				to: self.normalize(
+					view,
+					assumption_context,
+					to,
+					depth,
+					facts,
+				)?,
 				memory: self.normalize(
 					view,
 					assumption_context,
 					memory,
-					mode,
+					depth,
+					facts,
 				)?,
 				ownership,
 			},
@@ -959,13 +1063,20 @@ impl Solver {
 				memory,
 				ownership,
 			} => Type::Array {
-				of: self.normalize(view, assumption_context, of, mode)?,
+				of: self.normalize(
+					view,
+					assumption_context,
+					of,
+					depth,
+					facts,
+				)?,
 				size,
 				memory: self.normalize(
 					view,
 					assumption_context,
 					memory,
-					mode,
+					depth,
+					facts,
 				)?,
 				ownership,
 			},
@@ -974,12 +1085,19 @@ impl Solver {
 				memory,
 				ownership,
 			} => Type::Slice {
-				of: self.normalize(view, assumption_context, of, mode)?,
+				of: self.normalize(
+					view,
+					assumption_context,
+					of,
+					depth,
+					facts,
+				)?,
 				memory: self.normalize(
 					view,
 					assumption_context,
 					memory,
-					mode,
+					depth,
+					facts,
 				)?,
 				ownership,
 			},
@@ -1019,22 +1137,17 @@ impl Solver {
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
-	) -> Result<Option<TraitImplLookup>, Unsolved> {
+	) -> Result<Option<TraitImplLookup>, SolverError> {
 		if matches!(view.types.resolve(receiver), Type::Error | Type::Infer) {
-			return Err(Unsolved::Failed);
+			return Err(SolverError::Poisoned);
 		}
 		let mut assumed = self.check_assumed_trait(
 			view,
 			assumption_context,
 			receiver,
 			required_trait,
-		);
-		if let Err(error) = &assumed
-			&& *error != Unsolved::Pending
-		{
-			return Err(error.clone());
-		}
-		if assumed == Ok(true)
+		)?;
+		if assumed == Assumption::Holds
 			&& ImplTarget::from_type(view.types.resolve(receiver)).is_none()
 		{
 			return Ok(Some(TraitImplLookup::Abstract));
@@ -1042,24 +1155,15 @@ impl Solver {
 		let normalized =
 			self.normalize_head_query(view, assumption_context, receiver)?;
 		if normalized == TypeIndex::ERROR {
-			return Err(Unsolved::Failed);
+			return Err(SolverError::Poisoned);
 		}
 		if normalized != receiver {
-			match self.check_assumed_trait(
+			assumed = assumed.max(self.check_assumed_trait(
 				view,
 				assumption_context,
 				normalized,
 				required_trait,
-			) {
-				Ok(true) => assumed = Ok(true),
-				Ok(false) => {}
-				Err(Unsolved::Pending) => {
-					if assumed != Ok(true) {
-						assumed = Err(Unsolved::Pending)
-					}
-				}
-				Err(error) => return Err(error),
-			}
+			)?);
 		}
 		if let Some(target) =
 			ImplTarget::from_type(view.types.resolve(normalized))
@@ -1084,87 +1188,74 @@ impl Solver {
 				}
 			}
 		}
-		assumed.map(|proven| proven.then_some(TraitImplLookup::Abstract))
+		match assumed {
+			Assumption::Holds => Ok(Some(TraitImplLookup::Abstract)),
+			Assumption::Unproven => Ok(None),
+			Assumption::Pending => Err(SolverError::Pending),
+		}
 	}
 
-	/// Direct facts are the fast path. Otherwise compare the requested type
-	/// with subjects that carry this trait in the active scope. Comparison
-	/// reduces assumed equalities only, so it cannot depend on impl dispatch.
-	/// It reads finished declaration bounds and never demands one: an unfinished
-	/// table is `Pending`.
+	/// Whether the facts in scope prove `ty: required`. Comparison reduces
+	/// assumed equalities only, so it cannot depend on impl dispatch. It reads
+	/// finished declaration bounds and never demands one: an unfinished table
+	/// is `Assumption::Pending`, never an error.
 	pub(super) fn check_assumed_trait(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
-	) -> Result<bool, Unsolved> {
-		let mut readiness = Readiness::Ready;
-		if matches!(
-			view.types.resolve(ty),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
-		) {
-			readiness =
-				view.effective_bounds(ty, self.remaining_depth()).readiness;
-			if view.has_effective_trait(ty, required, self.remaining_depth()) {
-				return Ok(true);
-			}
-		}
-		// Retain only scalar subjects of relevant memberships. The borrowed
-		// cursor must be released before normalization can demand signatures.
+	) -> Result<Assumption, SolverError> {
+		let recursion_budget = self.state.recursion_budget;
+		// Subjects carrying `required`: the scope's facts, then declaration
+		// bounds along `ty`'s path and along each path a written equality
+		// names (Item: Marker). Paths found there are not followed: a
+		// recursive trait describes infinitely many.
 		let mut subjects = Vec::new();
-		let mut equality_subjects = Vec::new();
+		let mut paths = vec![ty];
+		let mut readiness;
 		{
 			let (reader, types) = view.assumptions();
 			let mut facts = reader.scoped_facts(assumption_context, types);
-			readiness = readiness.and(facts.readiness);
+			readiness = facts.readiness;
 			while let Some(fact) = facts.next(types) {
-				if matches!(
-					fact.kind,
-					AssumptionKind::Equality(
-						super::bounds::ImpliedBindingKind::Equals(_)
-					)
-				) {
-					equality_subjects.push(fact.subject);
-				}
-				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
-				{
-					if fact.subject == ty {
-						return Ok(true);
+				match fact.kind {
+					AssumptionKind::Trait { trait_index, .. }
+						if trait_index == required =>
+					{
+						subjects.push(fact.subject)
 					}
-					if !subjects.contains(&fact.subject) {
+					AssumptionKind::Equality(ImpliedBindingKind::Equals(_)) => {
+						paths.push(fact.subject)
+					}
+					_ => {}
+				}
+			}
+			for path in paths {
+				let mut facts =
+					reader.subject_facts(path, types, recursion_budget);
+				readiness = readiness.and(facts.readiness);
+				while let Some(fact) = facts.next(types) {
+					if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
+					{
 						subjects.push(fact.subject);
 					}
 				}
 			}
 		}
-		// A written equality also gives a finite projection path on which
-		// associated declaration bounds may supply evidence (Item: Marker).
-		// Read those paths without recursively expanding every declaration.
-		for subject in equality_subjects {
-			let remaining_depth = self.remaining_depth();
-			let (reader, types) = view.assumptions();
-			let mut facts =
-				reader.subject_facts(subject, types, remaining_depth);
-			readiness = readiness.and(facts.readiness);
-			while let Some(fact) = facts.next(types) {
-				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
-				{
-					if fact.subject == ty {
-						return Ok(true);
-					}
-					if !subjects.contains(&fact.subject) {
-						subjects.push(fact.subject);
-					}
-				}
-			}
+		if subjects.contains(&ty) {
+			return Ok(Assumption::Holds);
 		}
 		if !subjects.is_empty() {
-			let normalized = self.normalize_assumed_type_query(
+			let normalized = match self.normalize_assumed_type_query(
 				view,
 				assumption_context,
 				ty,
-			)?;
+			) {
+				Ok(normalized) => normalized,
+				Err(SolverError::Pending) => return Ok(Assumption::Pending),
+				Err(error) => return Err(error),
+			};
 			for subject in subjects {
 				match self.normalize_assumed_type_query(
 					view,
@@ -1175,20 +1266,20 @@ impl Solver {
 						if candidate == normalized
 							&& candidate != TypeIndex::ERROR =>
 					{
-						return Ok(true);
+						return Ok(Assumption::Holds);
 					}
 					Ok(_) => {}
-					Err(Unsolved::Pending) => {
+					Err(SolverError::Pending) => {
 						readiness = readiness.and(Readiness::Pending)
 					}
-					Err(error) => return Err(error.into()),
+					Err(error) => return Err(error),
 				}
 			}
 		}
 		match readiness {
-			Readiness::Ready => Ok(false),
-			Readiness::Pending => Err(Unsolved::Pending),
-			Readiness::Overflowed => Err(Unsolved::Overflow),
+			Readiness::Ready => Ok(Assumption::Unproven),
+			Readiness::Pending => Ok(Assumption::Pending),
+			Readiness::Overflowed => Err(SolverError::Overflow),
 		}
 	}
 
@@ -1202,10 +1293,10 @@ impl Solver {
 		assumption_context: TypeEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
-	) -> Result<Option<Box<[TypeIndex]>>, Unsolved> {
+	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
 		let Some(header) = view.trait_impls[usize::from(impl_index)].as_ref()
 		else {
-			return Err(Unsolved::Pending);
+			return Err(SolverError::Pending);
 		};
 		self.match_impl_target_and_bounds(
 			view,
@@ -1226,7 +1317,7 @@ impl Solver {
 		impl_env: TypeEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
-	) -> Result<Option<Box<[TypeIndex]>>, Unsolved> {
+	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
 		// Structural matching below compares `receiver`'s nested children
 		// against `target`'s pattern directly, with no normalization of its
 		// own (`TypeInterner::match_pattern` is `&self`, with no access to
@@ -1243,7 +1334,7 @@ impl Solver {
 		let count = if impl_env == TypeEnvIdx::ROOT {
 			0
 		} else {
-			view.type_envs.frame(impl_env).len()
+			view.type_envs.params(impl_env).len()
 		};
 		let Some(args) = view
 			.types
@@ -1256,7 +1347,7 @@ impl Solver {
 				.facts
 				.is_ready()
 			{
-				return Err(Unsolved::Pending);
+				return Err(SolverError::Pending);
 			}
 			let bound_count = view.param_bounds[usize::from(impl_env)][index]
 				.facts
@@ -1295,13 +1386,14 @@ impl Solver {
 		receiver: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
-	) -> Result<EqualityLookup, Unsolved> {
+	) -> Result<EqualityLookup, SolverError> {
 		let mut first = None;
 		// No allocation for the usual zero/one-equality lookup. Competing
 		// contexts are rare, and only need scalar handles for substitution.
 		let mut alternatives = Vec::new();
 		let mut ambiguous = false;
-		let effective = view.effective_bounds(receiver, self.remaining_depth());
+		let effective =
+			view.effective_bounds(receiver, self.state.recursion_budget);
 		let readiness = effective.readiness;
 		for entry in effective {
 			let bound = entry.bound;
@@ -1336,8 +1428,8 @@ impl Solver {
 		}
 		match readiness {
 			Readiness::Ready => {}
-			Readiness::Pending => return Err(Unsolved::Pending),
-			Readiness::Overflowed => return Err(Unsolved::Overflow),
+			Readiness::Pending => return Err(SolverError::Pending),
+			Readiness::Overflowed => return Err(SolverError::Overflow),
 		}
 		if ambiguous {
 			return Ok(EqualityLookup::Ambiguous);
@@ -1393,35 +1485,11 @@ impl TypeContext<'_, '_, '_> {
 		)
 	}
 
-	/// Judges `member`'s value for the definition's own check. `Err` with
-	/// `Overflow` or `Cycle` is a failure this definition owns and must report;
-	/// any other failure is reported elsewhere.
-	pub(super) fn judge_assoc_value(
-		&mut self,
-		member: ImplMember,
-	) -> Result<(), Unsolved> {
-		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
-		let (solver, mut view) = self.solver_and_view();
-		if let Err(Unsolved::Pending) =
-			solver.assoc_value(&mut view, member, None)
-		{
-			return Err(Unsolved::Pending);
-		}
-		match solver.verdict(member) {
-			AssocValue::Resolved => Ok(()),
-			AssocValue::Poisoned(Some(owned)) => Err(owned.clone()),
-			AssocValue::Poisoned(None) => Err(Unsolved::Failed),
-			AssocValue::Unchecked | AssocValue::InProgress => {
-				unreachable!("a finished judgement has a verdict")
-			}
-		}
-	}
-
 	pub(super) fn normalize_head_query(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
+	) -> Result<TypeIndex, SolverError> {
 		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		let (solver, mut view) = self.solver_and_view();
 		solver.normalize_head_query(&mut view, assumption_context, ty)
@@ -1431,7 +1499,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
+	) -> Result<TypeIndex, SolverError> {
 		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		let (solver, mut view) = self.solver_and_view();
 		solver.normalize_type_query(&mut view, assumption_context, ty)
@@ -1441,7 +1509,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Normalized {
+	) -> Result<TypeIndex, SolverError> {
 		let (solver, mut view) = self.solver_and_view();
 		solver.normalize_assumed_type_query(&mut view, assumption_context, ty)
 	}
@@ -1451,7 +1519,7 @@ impl TypeContext<'_, '_, '_> {
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
-	) -> Result<Option<TraitImplLookup>, Unsolved> {
+	) -> Result<Option<TraitImplLookup>, SolverError> {
 		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		let (solver, mut view) = self.solver_and_view();
 		solver.find_trait_impl_query(
@@ -1467,7 +1535,7 @@ impl TypeContext<'_, '_, '_> {
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
-	) -> Result<bool, Unsolved> {
+	) -> Result<Assumption, SolverError> {
 		let (solver, mut view) = self.solver_and_view();
 		solver.check_assumed_trait(&mut view, assumption_context, ty, required)
 	}
@@ -1478,7 +1546,7 @@ impl TypeContext<'_, '_, '_> {
 		impl_env: TypeEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
-	) -> Result<Option<Box<[TypeIndex]>>, Unsolved> {
+	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
 		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		let (solver, mut view) = self.solver_and_view();
 		solver.match_impl_target_and_bounds(
@@ -1518,13 +1586,13 @@ impl TypeContext<'_, '_, '_> {
 	#[cfg(test)]
 	fn settle(
 		&mut self,
-		result: Normalized,
+		result: Result<TypeIndex, SolverError>,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
-		match self.report_unsolved(result, site) {
+		match self.report_solver_error(result, site) {
 			Ok(result) => result,
-			Err(Unsolved::Pending) => ty,
+			Err(SolverError::Pending) => ty,
 			Err(_) => TypeIndex::ERROR,
 		}
 	}

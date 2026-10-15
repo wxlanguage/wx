@@ -8,7 +8,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
-	ast::{self, DefId, Spanned, StringInterner},
+	ast::{self, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	tir::defs::{EnumIdx, GlobalIdx, MemoryIdx, StructIdx},
 	vfs::FileId,
@@ -22,6 +22,7 @@ use super::{
 		TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
+	resolutions::NameResolutions,
 	signatures::TypeContext,
 	types::{Type, TypeIndex},
 };
@@ -104,6 +105,7 @@ pub(super) struct ImplDispatch {
 
 struct ImplDispatchBuilder<'a, 'ast> {
 	diagnostics: &'a mut Vec<Diagnostic<FileId>>,
+	resolutions: &'a mut NameResolutions,
 	strings: &'a StringInterner,
 	defs: &'a DefinitionRegistry,
 	ast_nodes: &'a [AstEntry<'ast>],
@@ -116,11 +118,19 @@ struct ImplDispatchBuilder<'a, 'ast> {
 impl ImplDispatch {
 	pub(super) fn build(
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
+		resolutions: &mut NameResolutions,
 		strings: &StringInterner,
 		defs: &DefinitionRegistry,
 		ast_nodes: &[AstEntry<'_>],
 	) -> Self {
-		ImplDispatchBuilder::new(diagnostics, strings, defs, ast_nodes).build()
+		ImplDispatchBuilder::new(
+			diagnostics,
+			resolutions,
+			strings,
+			defs,
+			ast_nodes,
+		)
+		.build()
 	}
 
 	pub(super) fn inherent_target(
@@ -157,12 +167,14 @@ impl ImplDispatch {
 impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn new(
 		diagnostics: &'a mut Vec<Diagnostic<FileId>>,
+		resolutions: &'a mut NameResolutions,
 		strings: &'a StringInterner,
 		defs: &'a DefinitionRegistry,
 		ast_nodes: &'a [AstEntry<'ast>],
 	) -> Self {
 		Self {
 			diagnostics,
+			resolutions,
 			strings,
 			defs,
 			ast_nodes,
@@ -592,14 +604,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			);
 			return Err(());
 		}
-		let binding = PathResolver::new(self.defs).resolve_path(
+		let binding = PathResolver::new(
 			self.diagnostics,
+			self.resolutions,
 			self.strings,
-			file_id,
-			namespace,
-			&path.segments,
-			Tier::Type,
-		);
+			self.defs,
+		)
+		.resolve_path(file_id, namespace, &path.segments, Tier::Type);
 		let kind = binding.def_key().ok_or(())?.symbol_kind(self.defs);
 		let target = match kind {
 			DefKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
@@ -633,14 +644,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		namespace: Scope,
 		path: &ast::Path,
 	) -> Option<TraitIdx> {
-		let binding = PathResolver::new(self.defs).resolve_path(
+		let binding = PathResolver::new(
 			self.diagnostics,
+			self.resolutions,
 			self.strings,
-			file_id,
-			namespace,
-			&path.segments,
-			Tier::Type,
-		);
+			self.defs,
+		)
+		.resolve_path(file_id, namespace, &path.segments, Tier::Type);
 		match binding.def_key()?.symbol_kind(self.defs) {
 			DefKind::Trait(idx) => Some(idx),
 			other => {
@@ -712,16 +722,6 @@ impl TypeContext<'_, '_, '_> {
 			ImplTarget::Memory(_) | ImplTarget::Global(_) => unreachable!(
 				"memory/global impls are never resolved through a written path — see ImplTarget's own doc comment"
 			),
-		}
-	}
-
-	pub(super) fn impl_trait_index(&self, def_id: DefId) -> TraitIdx {
-		match self.ast_node(def_id) {
-			AstNodeRef::Trait { trait_index, .. } => *trait_index,
-			AstNodeRef::TypeSet { typeset_index, .. } => {
-				self.defs.typesets[usize::from(*typeset_index)].trait_index
-			}
-			_ => unreachable!("dispatch trait must name a trait or typeset"),
 		}
 	}
 }

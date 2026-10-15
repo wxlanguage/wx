@@ -25,6 +25,7 @@ mod members;
 mod obligations;
 mod operators;
 mod paths;
+mod resolutions;
 mod satisfaction;
 mod signatures;
 mod solver;
