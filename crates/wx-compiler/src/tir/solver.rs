@@ -20,7 +20,8 @@ use super::assumptions::{
 };
 use super::bounds::ImpliedBindingKind;
 use super::defs::{
-	AssocTypeIdx, DefinitionRegistry, MemberKind, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, BindingKey, DefinitionRegistry, FunctionOwner, MemberKind,
+	TraitIdx, TraitImplIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -542,6 +543,7 @@ impl<'a> SolverView<'a> {
 				Ok(self.types.substitute(
 					default,
 					Substitution {
+						envs: self.type_envs,
 						env,
 						args: &[target],
 					},
@@ -690,19 +692,29 @@ impl Solver {
 			return Err(SolverError::Overflow);
 		}
 		self.state.recursion_budget -= 1;
-		let result = if matches!(
-			view.types.resolve(ty),
-			Type::AssocTypeProjection { .. }
-		) {
-			self.normalize_projection(
+		let result = match *view.types.resolve(ty) {
+			Type::AssocTypeProjection { .. } => self.normalize_projection(
 				view,
 				assumption_context,
 				ty,
 				depth,
 				facts,
-			)
-		} else {
-			match depth {
+			),
+			Type::Function { func_index, .. }
+				if matches!(
+					view.defs.functions[usize::from(func_index)].owner,
+					FunctionOwner::Trait(_)
+				) =>
+			{
+				self.reduce_trait_function(
+					view,
+					assumption_context,
+					ty,
+					depth,
+					facts,
+				)
+			}
+			_ => match depth {
 				NormalizationDepth::Shallow => Ok(ty),
 				NormalizationDepth::Deep => self.normalize_children(
 					view,
@@ -711,7 +723,7 @@ impl Solver {
 					depth,
 					facts,
 				),
-			}
+			},
 		};
 		self.state.recursion_budget += 1;
 		result
@@ -884,10 +896,102 @@ impl Solver {
 				.expect("a generic selected impl has a resolved header")
 				.type_params;
 			debug_assert_ne!(env, TypeEnvIdx::ROOT);
-			view.types
-				.substitute(value, Substitution { env, args: &args })
+			view.types.substitute(
+				value,
+				Substitution {
+					envs: view.type_envs,
+					env,
+					args: &args,
+				},
+			)
 		};
 		self.normalize(view, assumption_context, instantiated, depth, facts)
+	}
+
+	/// A trait declaration's type, `<Self as Trait>::f`, is the selected impl's
+	/// member once `Self` has a concrete impl, and stays the declaration while
+	/// `Self` is abstract or the impl inherits the trait's default. It reads no
+	/// value, so unlike a projection it opens no frame: a loop can only pass
+	/// through `Self`, whose own normalization owns it.
+	fn reduce_trait_function(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
+		let Type::Function {
+			func_index: declaration,
+			type_args,
+		} = *view.types.resolve(ty)
+		else {
+			unreachable!()
+		};
+		let FunctionOwner::Trait(trait_index) =
+			view.defs.functions[usize::from(declaration)].owner
+		else {
+			unreachable!()
+		};
+		let mut type_args = view.types.list(type_args).to_vec();
+		// `Self` decides the head, so it is normalized at any depth; the
+		// declaration's own arguments only when the whole type is.
+		for (index, arg) in type_args.iter_mut().enumerate() {
+			if index == 0 || depth == NormalizationDepth::Deep {
+				*arg = self.normalize(
+					view,
+					assumption_context,
+					*arg,
+					depth,
+					facts,
+				)?;
+			}
+		}
+		let self_type = type_args[0];
+		if self_type == TypeIndex::ERROR {
+			return Err(SolverError::Poisoned);
+		}
+		let unchanged = view.types.intern_function(declaration, &type_args);
+		if facts == RewriteFacts::Equalities
+			|| view.is_abstract(self_type)
+			|| matches!(
+				view.types.resolve(self_type),
+				Type::Infer | Type::AssociatedType { .. }
+			) {
+			return Ok(unchanged);
+		}
+		// `None` is silent, as for a projection: the membership check the
+		// written path recorded owns the report.
+		let Some(found) = self.find_trait_impl_query(
+			view,
+			assumption_context,
+			self_type,
+			trait_index,
+		)?
+		else {
+			return Err(SolverError::Poisoned);
+		};
+		let TraitImplLookup::Concrete { impl_index, args } = found else {
+			return Ok(unchanged);
+		};
+		let name = view.defs.functions[usize::from(declaration)].name.inner;
+		let kind = view
+			.defs
+			.declared_trait_member(trait_index, BindingKey::value(name))
+			.expect("a trait declares its own function");
+		match view.defs.select_trait_member(impl_index, kind) {
+			TraitMemberSelection::Impl(
+				MemberKind::Function(member) | MemberKind::Method(member),
+			) => {
+				// The member's chain is the impl's followed by its own, so
+				// the impl's arguments take the declaration's `Self` slot.
+				let mut member_args = args.into_vec();
+				member_args.extend_from_slice(&type_args[1..]);
+				Ok(view.types.intern_function(member, &member_args))
+			}
+			TraitMemberSelection::Impl(_) => Err(SolverError::Poisoned),
+			TraitMemberSelection::TraitDeclaration(_) => Ok(unchanged),
+		}
 	}
 
 	/// An equality in scope gives `projection` the value `value`. One that
@@ -1322,48 +1426,42 @@ impl Solver {
 		// of them instead of requiring each to remember it independently.
 		let receiver =
 			self.normalize_type_query(view, assumption_context, receiver)?;
-		let count = if impl_env == TypeEnvIdx::ROOT {
-			0
-		} else {
-			view.type_envs.params(impl_env).len()
-		};
+		let (envs, param_bounds) = (view.type_envs, view.param_bounds);
 		let Some(args) = view
 			.types
-			.match_impl_target(target, receiver, impl_env, count)
+			.match_impl_target(target, receiver, envs, impl_env)
 		else {
 			return Ok(None);
 		};
-		for (index, &arg) in args.iter().enumerate() {
-			if !view.param_bounds[usize::from(impl_env)][index]
-				.facts
-				.is_ready()
+		// Every parameter on the impl's chain is an argument of the match,
+		// at its flat slot; its bounds stay in its own frame.
+		for frame in envs.chain(impl_env) {
+			let start = envs.parent_count(frame);
+			for (index, bounds) in
+				param_bounds[usize::from(frame)].iter().enumerate()
 			{
-				return Err(SolverError::Pending);
-			}
-			let bound_count = view.param_bounds[usize::from(impl_env)][index]
-				.facts
-				.current()
-				.len();
-			for bound_index in 0..bound_count {
-				let bound = &view.param_bounds[usize::from(impl_env)][index]
-					.facts
-					.current()[bound_index];
-				// Associated equalities and nested requirements are not yet
-				// proved. Trait membership alone cannot justify accepting them.
-				if !bound.bindings.is_empty() {
-					return Ok(None);
+				if !bounds.facts.is_ready() {
+					return Err(SolverError::Pending);
 				}
-				let trait_index = bound.trait_index;
-				if self
-					.find_trait_impl_query(
-						view,
-						assumption_context,
-						arg,
-						trait_index,
-					)?
-					.is_none()
-				{
-					return Ok(None);
+				let arg = args[start + index];
+				for bound in bounds.facts.current() {
+					// Associated equalities and nested requirements are not
+					// yet proved. Trait membership alone cannot justify
+					// accepting them.
+					if !bound.bindings.is_empty() {
+						return Ok(None);
+					}
+					if self
+						.find_trait_impl_query(
+							view,
+							assumption_context,
+							arg,
+							bound.trait_index,
+						)?
+						.is_none()
+					{
+						return Ok(None);
+					}
 				}
 			}
 		}
@@ -1446,6 +1544,7 @@ impl Solver {
 			Some(context) => view.types.substitute(
 				fact.value,
 				Substitution {
+					envs: view.type_envs,
 					env: context.env,
 					args: &[context.receiver],
 				},

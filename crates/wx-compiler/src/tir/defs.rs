@@ -273,16 +273,28 @@ pub struct TypesetDef {
 /// three. Field *types* stay in that struct, index-aligned with `params`
 /// here, same split as `StructDef`/`StructSignature`.
 ///
-/// `function_impls` are the synthetic `impl Call` and `impl Function` of a
-/// free or imported function, which is its own type. Members are values only
-/// and have none.
+/// Every function is its own type, so each has `function_impls`, its
+/// synthetic `impl Call` and `impl Function`.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
+	pub owner: FunctionOwner,
 	pub name: Spanned<SymbolU32>,
 	pub params: Box<[Spanned<SymbolU32>]>,
-	pub function_impls: Option<FunctionImpls>,
+	pub function_impls: FunctionImpls,
+}
+
+/// Where a function is declared: directly in a scope (a free or imported
+/// function), or as a member of a trait or impl. A trait's declaration is
+/// the one whose type normalizes to an impl member's once `Self` is known.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum FunctionOwner {
+	Free,
+	Trait(TraitIdx),
+	InherentImpl(InherentImplIdx),
+	TraitImpl(TraitImplIdx),
 }
 
 /// A function's synthetic `impl Call for <function>`, which holds `Args` and
@@ -797,6 +809,60 @@ impl DefKind {
 			DefKind::TraitAssocType(_) => "associated type",
 			DefKind::TypeAlias(_) => "type alias",
 		}
+	}
+
+	/// Where the declaration's name is written, for diagnostics. A package,
+	/// module or import block has no declaration of its own to point at.
+	pub(super) fn declared_at(
+		self,
+		defs: &DefinitionRegistry,
+	) -> Option<SourceSpan> {
+		let (file_id, name) = match self {
+			DefKind::Module(_) | DefKind::Import(_) | DefKind::Package(_) => {
+				return None;
+			}
+			DefKind::Enum(index) => {
+				let def = &defs.enums[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::EnumVariant(index) | DefKind::Const(index) => {
+				let def = &defs.constants[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::Struct(index) => {
+				let def = &defs.structs[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::Memory(index) => {
+				let def = &defs.memories[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::Trait(index) => {
+				let def = &defs.traits[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::TypeSet(index) => {
+				let def = &defs.typesets[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::Global(index) => {
+				let def = &defs.globals[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::Function(index) => {
+				let def = &defs.functions[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::TraitAssocType(index) => {
+				let def = &defs.assoc_types[usize::from(index)];
+				(def.file_id, def.name)
+			}
+			DefKind::TypeAlias(index) => {
+				let def = &defs.type_aliases[usize::from(index)];
+				(def.file_id, def.name)
+			}
+		};
+		Some(SourceSpan::new(file_id, name.span))
 	}
 }
 
@@ -2012,8 +2078,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		)
 	}
 
-	/// Pre-allocates a free or imported function's synthetic `impl Call for
-	/// <function>` and `impl Function for <function>` — see `FunctionImpls`.
+	/// Pre-allocates a function's synthetic `impl Call for <function>` and
+	/// `impl Function for <function>` — see `FunctionImpls`.
 	fn synthesize_function_impls(
 		&mut self,
 		file_id: FileId,
@@ -2395,9 +2461,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				self.functions.push(FunctionDef {
 					file_id,
 					namespace,
+					owner: FunctionOwner::Free,
 					name: signature.name,
 					params,
-					function_impls: Some(function_impls),
+					function_impls,
 				});
 				self.ast_nodes.push(AstEntry {
 					file_id,
@@ -2799,13 +2866,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
+							let function_impls = self
+								.synthesize_function_impls(
+									file_id,
+									namespace,
+									signature.name.span,
+								);
 							let function_index =
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
+									owner: FunctionOwner::Trait(trait_index),
 									name: signature.name,
 									params,
-									function_impls: None,
+									function_impls,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -2883,7 +2957,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 					};
-					if let Some(collision) = bindings.get(&key).copied() {
+					// A function is also its own type, so it holds the name in both
+					// tiers, and a clash in either is one duplicate definition.
+					let type_key = matches!(
+						member.kind,
+						MemberKind::Function(_) | MemberKind::Method(_)
+					)
+					.then(|| BindingKey::ty(key.symbol));
+					let collision =
+						std::iter::once(key).chain(type_key).find_map(|key| {
+							bindings
+								.get(&key)
+								.map(|&collision| (key, collision))
+						});
+					if let Some((key, collision)) = collision {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
@@ -2900,6 +2987,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						);
 					} else {
 						bindings.insert(key, member_index);
+						if let Some(type_key) = type_key {
+							bindings.insert(type_key, member_index);
+						}
 					}
 					members.push(member);
 				}
@@ -2943,13 +3033,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
+							let function_impls = self
+								.synthesize_function_impls(
+									file_id,
+									namespace,
+									signature.name.span,
+								);
 							let function_index =
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
+									owner: FunctionOwner::InherentImpl(
+										block_index,
+									),
 									name: signature.name,
 									params,
-									function_impls: None,
+									function_impls,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3008,7 +3107,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							)
 						}
 					};
-					if let Some(collision) = bindings.get(&key).copied() {
+					// A function is also its own type, so it holds the name in both
+					// tiers, and a clash in either is one duplicate definition.
+					let type_key = matches!(
+						member.kind,
+						MemberKind::Function(_) | MemberKind::Method(_)
+					)
+					.then(|| BindingKey::ty(key.symbol));
+					let collision =
+						std::iter::once(key).chain(type_key).find_map(|key| {
+							bindings
+								.get(&key)
+								.map(|&collision| (key, collision))
+						});
+					if let Some((key, collision)) = collision {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
@@ -3025,6 +3137,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						);
 					} else {
 						bindings.insert(key, binding);
+						if let Some(type_key) = type_key {
+							bindings.insert(type_key, binding);
+						}
 					}
 					members.push(member);
 				}
@@ -3141,9 +3256,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
+									owner: FunctionOwner::Free,
 									name: signature.name,
 									params,
-									function_impls: Some(function_impls),
+									function_impls,
 								});
 							let def_key = self.push_def(
 								own_namespace,
@@ -3304,9 +3420,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let mut members: Vec<TraitMemberDef> = Vec::new();
 				let mut bindings: HashMap<BindingKey, MemberIdx> =
 					HashMap::new();
-				let block_index = TraitImplIdx(
-					u32::try_from(self.trait_impls.len()).unwrap(),
-				);
+				// Reserved before the members, whose synthetic impls (each
+				// function's `Call` and `Function`) take slots after it.
+				let block_index = self.push_trait_impl(TraitImplDef {
+					file_id,
+					namespace,
+					members: Vec::new(),
+					bindings: HashMap::new(),
+				});
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -3324,13 +3445,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							let is_method = params.first().is_some_and(|p| {
 								p.inner == Keyword::SelfLower.symbol()
 							});
+							let function_impls = self
+								.synthesize_function_impls(
+									file_id,
+									namespace,
+									signature.name.span,
+								);
 							let function_index =
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
+									owner: FunctionOwner::TraitImpl(
+										block_index,
+									),
 									name: signature.name,
 									params,
-									function_impls: None,
+									function_impls,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3409,7 +3539,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						}
 					};
 
-					if let Some(collision) = bindings.get(&key).copied() {
+					// A function is also its own type, so it holds the name in both
+					// tiers, and a clash in either is one duplicate definition.
+					let type_key = matches!(
+						member.kind,
+						MemberKind::Function(_) | MemberKind::Method(_)
+					)
+					.then(|| BindingKey::ty(key.symbol));
+					let collision =
+						std::iter::once(key).chain(type_key).find_map(|key| {
+							bindings
+								.get(&key)
+								.map(|&collision| (key, collision))
+						});
+					if let Some((key, collision)) = collision {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
 								strings: self.strings,
@@ -3426,17 +3569,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						);
 					} else {
 						bindings.insert(key, member_index);
+						if let Some(type_key) = type_key {
+							bindings.insert(type_key, member_index);
+						}
 					}
 					members.push(member);
 				}
 
-				let actual_index = self.push_trait_impl(TraitImplDef {
+				self.trait_impls[usize::from(block_index)] = TraitImplDef {
 					file_id,
 					namespace,
 					bindings,
 					members,
-				});
-				debug_assert_eq!(block_index, actual_index);
+				};
 			}
 		}
 	}
@@ -3653,6 +3798,20 @@ mod tests {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
 		diagnostics: Vec<Diagnostic<FileId>>,
+	}
+
+	/// The written trait impl declaring `member`, among the synthetic impls
+	/// every function brings.
+	fn written_trait_impl<'a>(
+		case: &'a TestCase,
+		member: &str,
+	) -> &'a TraitImplDef {
+		let key = BindingKey::value(case.graph.strings.get(member).unwrap());
+		case.defs
+			.trait_impls
+			.iter()
+			.find(|owner| owner.bindings.contains_key(&key))
+			.expect("a written trait impl declares the member")
 	}
 
 	#[must_use]
@@ -4200,7 +4359,7 @@ mod tests {
 					.map(|member| member.kind),
 			)
 			.chain(
-				case.defs.trait_impls[0]
+				written_trait_impl(&case, "make")
 					.members
 					.iter()
 					.map(|member| member.kind),
@@ -4270,6 +4429,29 @@ mod tests {
 				.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 		}
+	}
+
+	#[test]
+	fn a_member_function_name_is_also_a_type_member() {
+		// A member function is its own type too, so it holds its name in the
+		// member table's type tier, where an associated type of the same
+		// name is a duplicate definition.
+		for source in [
+			"trait T { type X; func X(); }",
+			"trait T {} struct S(); impl T for S { type X = (); func X() {} }",
+		] {
+			TestCase::new_stdlib(source)
+				.diagnostics()
+				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		}
+		let case = TestCase::new_stdlib("struct S(); impl S { func f() {} }");
+		case.diagnostics().assert_none();
+		let symbol = case.graph.strings.get("f").unwrap();
+		let owner = &case.defs.inherent_impls[0];
+		assert_eq!(
+			owner.bindings[&BindingKey::ty(symbol)],
+			owner.bindings[&BindingKey::value(symbol)]
+		);
 	}
 
 	#[test]
@@ -4430,7 +4612,12 @@ mod tests {
 						owner.members[usize::from(owner.bindings[&f])].kind,
 						owner.members[usize::from(owner.bindings[&after])].kind,
 					)
-				} else if let Some(owner) = case.defs.trait_impls.first() {
+				} else if let Some(owner) = case
+					.defs
+					.trait_impls
+					.iter()
+					.find(|owner| owner.bindings.contains_key(&after))
+				{
 					(
 						owner.members[usize::from(owner.bindings[&f])].kind,
 						owner.members[usize::from(owner.bindings[&after])].kind,
@@ -4691,7 +4878,7 @@ mod tests {
 					.map(|member| member.kind),
 			)
 			.chain(
-				case.defs.trait_impls[0]
+				written_trait_impl(&case, "method")
 					.members
 					.iter()
 					.map(|member| member.kind),

@@ -43,7 +43,7 @@ use super::defs::{
 use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
-use super::members::TraitMemberSelection;
+use super::members::{AssocTypeProjectionTarget, TraitMemberSelection};
 use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
@@ -252,7 +252,7 @@ pub struct TraitImplSignature {
 }
 
 #[derive(Clone, Copy)]
-enum InferSignatureKind {
+pub(super) enum InferSignatureKind {
 	Function,
 	ReturnType,
 	Struct,
@@ -277,7 +277,7 @@ impl InferSignatureKind {
 }
 
 #[derive(Clone, Copy)]
-enum InferPolicy {
+pub(super) enum InferPolicy {
 	Reject(InferSignatureKind),
 	/// Used by type-resolution contexts that can infer a written `_`.
 	#[allow(dead_code)] // No such caller yet.
@@ -914,19 +914,78 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn resolve_impl_self(
 		&self,
 		env: TypeEnvIdx,
-	) -> Option<(Referent, TypeIndex)> {
-		match self.type_envs.enclosing_impl(env)? {
-			ImplKind::Inherent(index) => Some((
-				Referent::InherentImplSelf(index),
+	) -> Option<(ImplKind, TypeIndex)> {
+		let impl_kind = self.type_envs.enclosing_impl(env)?;
+		let target = match impl_kind {
+			ImplKind::Inherent(index) => {
+				self.inherent_impls[usize::from(index)].as_ref()?.target
+			}
+			ImplKind::Trait(index) => {
+				self.trait_impls[usize::from(index)].as_ref()?.target
+			}
+		};
+		Some((impl_kind, target.inner))
+	}
+
+	/// Type arguments written on an impl's `Self`, which already names the
+	/// target with its arguments: the target is shown, and a struct's own
+	/// name suggested for writing other arguments.
+	fn report_type_args_on_impl_self(
+		&self,
+		file_id: FileId,
+		segment: &ast::PathSegment,
+		impl_kind: ImplKind,
+	) -> Diagnostic<FileId> {
+		// `Self` resolves only past the impl's header.
+		let (impl_file, target) = match impl_kind {
+			ImplKind::Inherent(index) => (
+				self.defs.inherent_impls[usize::from(index)].file_id,
 				self.inherent_impls[usize::from(index)]
-					.as_ref()?
-					.target
-					.inner,
-			)),
-			ImplKind::Trait(index) => Some((
-				Referent::TraitImplSelf(index),
-				self.trait_impls[usize::from(index)].as_ref()?.target.inner,
-			)),
+					.as_ref()
+					.unwrap()
+					.target,
+			),
+			ImplKind::Trait(index) => (
+				self.defs.trait_impls[usize::from(index)].file_id,
+				self.trait_impls[usize::from(index)]
+					.as_ref()
+					.unwrap()
+					.target,
+			),
+		};
+		let (first, last) = (
+			segment.type_args.first().unwrap(),
+			segment.type_args.last().unwrap(),
+		);
+		let target_name = self.type_formatter().display_type(target.inner);
+		let diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
+			.with_message("type arguments are not allowed on `Self`")
+			.with_labels(vec![
+				SourceSpan::new(
+					file_id,
+					TextSpan::new(first.span.start, last.span.end),
+				)
+				.primary_label()
+				.with_message("type arguments not allowed"),
+				SourceSpan::new(file_id, segment.ident.span)
+					.secondary_label()
+					.with_message("not allowed on `Self`"),
+				SourceSpan::new(impl_file, target.span)
+					.secondary_label()
+					.with_message(format!(
+						"`Self` is `{target_name}` in this impl"
+					)),
+			]);
+		match self.types.resolve(target.inner) {
+			Type::Struct { struct_index, .. } => {
+				let name = self.defs.structs[usize::from(*struct_index)].name;
+				diagnostic.with_note(format!(
+					"to write other type arguments, use the struct's name `{}` instead",
+					self.strings.resolve(name.inner).unwrap()
+				))
+			}
+			_ => diagnostic,
 		}
 	}
 
@@ -996,6 +1055,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			segment,
 			params_env,
 			&resolved_args,
+			DefKind::Struct(struct_index),
 			TypeEnvOwner::Struct(struct_index),
 		);
 		self.types.intern_struct(struct_index, &args)
@@ -1185,23 +1245,52 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			None => TypeIndex::UNIT,
 		};
 
-		// The synthetic `impl Call` and `impl Function` for <function>: generic
-		// over the function's own parameters, with their bounds as their
-		// assumptions. `Args` is the one parameter type (`func(..)`'s rule).
+		self.resolve_function_impls(
+			file_id,
+			function_index,
+			type_env,
+			&param_types,
+			return_type,
+			signature,
+		);
+		self.functions[usize::from(function_index)] = FunctionSignature {
+			type_params: type_env,
+			param_types,
+			return_type,
+		};
+		SignatureLocation::Function(function_index)
+	}
+
+	/// Fills a function's synthetic `impl Call` and `impl Function`: generic
+	/// over every parameter on the function's chain, with their bounds as
+	/// their assumptions. `Args` is the one parameter type (`func(..)`'s
+	/// rule), a method's `self` included.
+	fn resolve_function_impls(
+		&mut self,
+		file_id: FileId,
+		function_index: FunctionIdx,
+		type_env: TypeEnvIdx,
+		param_types: &[TypeIndex],
+		return_type: TypeIndex,
+		signature: &ast::FunctionSignature,
+	) {
 		let function_def = &self.defs.functions[usize::from(function_index)];
-		let function_impls = function_def
-			.function_impls
-			.expect("a free or imported function has synthetic impls");
+		let function_impls = function_def.function_impls;
 		let name_span = function_def.name.span;
-		let args = if let [param] = &param_types[..] {
+		let args = if let [param] = param_types {
 			*param
 		} else {
-			self.types.intern_tuple(&param_types)
+			self.types.intern_tuple(param_types)
 		};
-		let type_args: Vec<TypeIndex> = self
-			.type_envs
-			.params(type_env)
-			.iter()
+		// Instantiating `type_env` takes an argument for every parameter on
+		// its chain, outer first, so a member's type carries its parent's
+		// parameters ahead of its own (`Wrap<T>::get<U>` is `get<T, U>`).
+		let mut frames: Vec<TypeEnvIdx> =
+			self.type_envs.chain(type_env).collect();
+		frames.reverse();
+		let type_args: Vec<TypeIndex> = frames
+			.into_iter()
+			.flat_map(|frame| self.type_envs.params(frame))
 			.map(|param| param.ty)
 			.collect();
 		let function_type =
@@ -1267,13 +1356,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					},
 				});
 		}
-
-		self.functions[usize::from(function_index)] = FunctionSignature {
-			type_params: type_env,
-			param_types,
-			return_type,
-		};
-		SignatureLocation::Function(function_index)
 	}
 
 	/// Resolve a member in its parent's scope (the trait's or the impl's),
@@ -1341,6 +1423,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			None => TypeIndex::UNIT,
 		};
 
+		self.resolve_function_impls(
+			file_id,
+			function_index,
+			scope,
+			&param_types,
+			return_type,
+			signature,
+		);
 		self.functions[usize::from(function_index)] = FunctionSignature {
 			type_params: scope,
 			param_types: param_types.into_boxed_slice(),
@@ -2624,25 +2714,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// don't change what the name means: a parameter shadows an
 		// item of the same name with or without them, and takes none.
 		let first = &segments[0];
-		let parameter = self
-			.type_envs
-			.resolve(env, first.ident.inner)
-			.map(|(frame, index)| {
-				(
-					Referent::TypeParam { env: frame, index },
-					self.type_envs.params(frame)[index as usize].ty,
-				)
-			})
-			.or_else(|| {
-				(first.ident.inner == Keyword::SelfPascal.symbol())
-					.then(|| self.resolve_impl_self(env))
-					.flatten()
-			});
-		let (current, next) = if let Some((referent, ty)) = parameter {
-			self.resolutions.by_site.insert(
-				(SourceSpan::new(file_id, first.ident.span), Tier::Type),
-				referent,
-			);
+		let site = (SourceSpan::new(file_id, first.ident.span), Tier::Type);
+		let (current, next) = if let Some((frame, index)) =
+			self.type_envs.resolve(env, first.ident.inner)
+		{
+			self.resolutions
+				.by_site
+				.insert(site, Referent::TypeParam { env: frame, index });
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
@@ -2659,10 +2737,41 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					self.defs,
 					file_id,
 					first,
-					TypeArgsTarget::TypeParam,
+					TypeArgsTarget::TypeParam {
+						owner: self.type_envs.owner(frame),
+						param: &self.type_envs.params(frame)[index as usize],
+					},
 				));
 			}
-			(ty, 1)
+			(self.type_envs.params(frame)[index as usize].ty, 1)
+		} else if first.ident.inner == Keyword::SelfPascal.symbol()
+			&& let Some((impl_kind, target)) = self.resolve_impl_self(env)
+		{
+			self.resolutions.by_site.insert(
+				site,
+				match impl_kind {
+					ImplKind::Inherent(index) => {
+						Referent::InherentImplSelf(index)
+					}
+					ImplKind::Trait(index) => Referent::TraitImplSelf(index),
+				},
+			);
+			if !first.type_args.is_empty() {
+				// Resolved only to report what is wrong inside them.
+				for arg in &first.type_args {
+					self.resolve_type_expression(
+						file_id,
+						namespace,
+						env,
+						arg,
+						infer_policy,
+					);
+				}
+				let diagnostic = self
+					.report_type_args_on_impl_self(file_id, first, impl_kind);
+				self.diagnostics.push(diagnostic);
+			}
+			(target, 1)
 		} else {
 			// TODO: this probably should be resolve_path instead of walk_path
 			let walk = PathResolver::new(
@@ -2729,11 +2838,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								stopped,
 								type_params,
 								&resolved_args,
+								DefKind::TypeAlias(index),
 								TypeEnvOwner::TypeAlias(index),
 							);
 							self.types.substitute(
 								target,
 								Substitution {
+									envs: &self.type_envs,
 									env: type_params,
 									args: &type_args,
 								},
@@ -2788,6 +2899,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						stopped,
 						params_env,
 						&resolved_args,
+						DefKind::Struct(struct_index),
 						TypeEnvOwner::Struct(struct_index),
 					);
 					self.types.intern_struct(struct_index, &type_args)
@@ -2809,8 +2921,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							self.defs,
 							file_id,
 							stopped,
-							TypeArgsTarget::Item {
-								owner: TypeEnvOwner::Enum(enum_index),
+							TypeArgsTarget::Declaration {
+								kind: DefKind::Enum(enum_index),
 								params: &[],
 							},
 						));
@@ -2878,6 +2990,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						stopped,
 						params_env,
 						&resolved_args,
+						DefKind::Function(func_index),
 						TypeEnvOwner::Function(func_index),
 					);
 					self.types.intern_function(func_index, &type_args)
@@ -2903,7 +3016,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							self.defs,
 							file_id,
 							stopped,
-							TypeArgsTarget::Namespace(kind),
+							TypeArgsTarget::Declaration { kind, params: &[] },
 						));
 						TypeIndex::ERROR
 					}
@@ -2928,7 +3041,103 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// Whatever's left continues through impl dispatch or a
 		// bound instead of the namespace graph — `members.rs`'s
 		// job, not this module's.
-		self.resolve_type_member_path(env, file_id, current, &segments[next..])
+		self.resolve_type_member_path(
+			env,
+			file_id,
+			namespace,
+			current,
+			&segments[next..],
+			infer_policy,
+		)
+	}
+
+	/// The written arguments for a member function's own parameters. Without
+	/// generics of its own the function stores its parent's frame, so it then
+	/// takes none.
+	pub(super) fn member_function_type_args(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		file_id: FileId,
+		namespace: Scope,
+		function: FunctionIdx,
+		segment: &ast::PathSegment,
+		infer_policy: InferPolicy,
+	) -> Box<[TypeIndex]> {
+		let def_id = DefId::Function(function);
+		if matches!(self.query_state[&def_id].state, QueryState::Pending) {
+			let _ = self.ensure_signature(QueryInfo {
+				def_id,
+				requested_at: Some(SourceSpan::new(
+					file_id,
+					segment.ident.span,
+				)),
+			});
+		}
+		let type_params = self.functions[usize::from(function)].type_params;
+		let own = if type_params != TypeEnvIdx::ROOT
+			&& matches!(
+				self.type_envs.owner(type_params),
+				TypeEnvOwner::Function(owner) if owner == function
+			) {
+			type_params
+		} else {
+			TypeEnvIdx::ROOT
+		};
+		let written: Box<[TypeIndex]> = segment
+			.type_args
+			.iter()
+			.map(|arg| {
+				self.resolve_type_expression(
+					file_id,
+					namespace,
+					assumption_context,
+					arg,
+					infer_policy,
+				)
+			})
+			.collect();
+		self.resolve_type_args(
+			assumption_context,
+			file_id,
+			segment,
+			own,
+			&written,
+			DefKind::Function(function),
+			TypeEnvOwner::Function(function),
+		)
+	}
+
+	/// An associated type declares no generic parameters, so arguments
+	/// written on one are reported; they are still lowered, to report what is
+	/// wrong inside them too.
+	pub(super) fn report_assoc_type_args(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		env: TypeEnvIdx,
+		segment: &ast::PathSegment,
+		assoc_type_index: AssocTypeIdx,
+		infer_policy: InferPolicy,
+	) {
+		for arg in &segment.type_args {
+			self.resolve_type_expression(
+				file_id,
+				namespace,
+				env,
+				arg,
+				infer_policy,
+			);
+		}
+		self.diagnostics.push(report_type_arg_count_mismatch(
+			self.strings,
+			self.defs,
+			file_id,
+			segment,
+			TypeArgsTarget::Declaration {
+				kind: DefKind::TraitAssocType(assoc_type_index),
+				params: &[],
+			},
+		));
 	}
 
 	/// Resolve identities and structure without reducing the resulting type.
@@ -2974,7 +3183,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					inner,
 					infer_policy,
 				);
-				self.resolve_type_member_path(env, file_id, current, segments)
+				self.resolve_type_member_path(
+					env,
+					file_id,
+					namespace,
+					current,
+					segments,
+					infer_policy,
+				)
 			}
 			ast::TypeExpression::QualifiedPath { root, segments } => {
 				let base_ty = self.resolve_type_expression(
@@ -3001,12 +3217,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// `Grouped`/`Path`, through the ordinary
 				// `resolve_type_member_path`.
 				let first = &segments[0];
-				if !first.type_args.is_empty() {
-					todo!(
-						"generic args on a type-relative path segment aren't implemented yet"
-					)
-				}
-				let Ok(member) = self.resolve_trait_qualified_assoc_type(
+				let Ok(declaration) = self.resolve_trait_qualified_type_member(
 					env,
 					base_ty,
 					required_trait,
@@ -3015,13 +3226,55 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				) else {
 					return TypeIndex::ERROR;
 				};
-				let current = self.project_assoc_type(base_ty, member);
+				let current = match declaration {
+					MemberKind::AssociatedType(assoc_type_index) => {
+						if !first.type_args.is_empty() {
+							self.report_assoc_type_args(
+								file_id,
+								namespace,
+								env,
+								first,
+								assoc_type_index,
+								infer_policy,
+							);
+							return TypeIndex::ERROR;
+						}
+						self.project_assoc_type(
+							base_ty,
+							AssocTypeProjectionTarget {
+								trait_index: required_trait,
+								assoc_type_index,
+							},
+						)
+					}
+					// The declaration's own type, which normalization takes to
+					// the impl's member once `base_ty` has an impl.
+					MemberKind::Function(function)
+					| MemberKind::Method(function) => {
+						let own_args = self.member_function_type_args(
+							env,
+							file_id,
+							namespace,
+							function,
+							first,
+							infer_policy,
+						);
+						let mut type_args = vec![base_ty];
+						type_args.extend_from_slice(&own_args);
+						self.types.intern_function(function, &type_args)
+					}
+					MemberKind::Constant(_) => {
+						unreachable!("a constant is a value member")
+					}
+				};
 
 				self.resolve_type_member_path(
 					env,
 					file_id,
+					namespace,
 					current,
 					&segments[1..],
+					infer_policy,
 				)
 			}
 			ast::TypeExpression::Function { params, result } => {
@@ -3928,7 +4181,9 @@ pub(super) mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{DefinitionRegistry, Namespace, Scope, UseItemKind};
+	use crate::tir::defs::{
+		DefinitionRegistry, FunctionOwner, Namespace, Scope, UseItemKind,
+	};
 	use crate::tir::impls::ImplTarget;
 	use crate::tir::solver::AssocValue;
 	use crate::vfs;
@@ -5221,6 +5476,7 @@ pub(super) mod tests {
 							types.substitute(
 								equality.value,
 								Substitution {
+									envs: reader.type_envs,
 									env: context.env,
 									args: &[context.receiver],
 								}
@@ -7279,12 +7535,113 @@ pub(super) mod tests {
 		));
 	}
 
+	/// An associated type declares no generic parameters, so arguments on
+	/// one are reported in both spellings, and what is written inside them
+	/// is still resolved.
+	#[test]
+	fn type_arguments_on_an_associated_type_are_diagnosed() {
+		for path in ["T::Item<u8>", "<T as Iterable>::Item<u8>"] {
+			test_case!(
+				case = &format!(
+					"type u8; trait Iterable {{ type Item; }} func f<T: Iterable>(x: {path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+				)
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			assert_eq!(
+				case.context.diagnostics[0].message,
+				"associated type `Item` takes 0 generic arguments but 1 generic argument was supplied"
+			);
+		}
+		test_case!(
+			case = "trait Iterable { type Item; } func f<T: Iterable>(x: T::Item<Missing>) {} pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::TypeArgumentCountMismatch,
+		]);
+	}
+
+	/// Type arguments on a parameter or a trait's `Self` point back at its
+	/// declaration: the parameter's name, the trait's for its `Self`.
+	#[test]
+	fn type_arguments_on_a_parameter_point_at_its_declaration() {
+		let call = "pub trait Call { type Args; type Result; } pub trait Function: Call {}";
+		for (source, declared, name) in [
+			("type u8; func f<T>(x: T<u8>) {}", "f<T", "T"),
+			(
+				"type u8; trait Tr { func g(x: Self<u8>); }",
+				"trait Tr",
+				"Tr",
+			),
+		] {
+			let source = format!("{source} {call}");
+			test_case!(case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			// `declared` ends with the declared name.
+			let end = source.find(declared).unwrap() + declared.len();
+			let label = case.context.diagnostics[0]
+				.labels
+				.iter()
+				.find(|label| label.message.contains("defined here"))
+				.expect("the report points at the declaration");
+			assert_eq!(label.range, end - name.len()..end, "{source}");
+		}
+	}
+
+	/// An impl's `Self` already names the target with its arguments, so
+	/// arguments on it are their own error: it shows what `Self` is, and
+	/// for a struct suggests writing the struct's name instead.
+	#[test]
+	fn type_arguments_on_an_impls_self_are_their_own_error() {
+		let call = "pub trait Call { type Args; type Result; } pub trait Function: Call {}";
+		for (source, target, shown, note) in [
+			(
+				"type u8; struct X<T>(); impl<T> X<T> { func f(x: Self<u8, T>) {} }",
+				"X<T> {",
+				"`Self` is `X<T>` in this impl",
+				true,
+			),
+			(
+				"type u8; trait Tr {} impl Tr for u8 { func f(x: Self<u8>) {} }",
+				"u8 {",
+				"`Self` is `u8` in this impl",
+				false,
+			),
+		] {
+			let source = format!("{source} {call}");
+			test_case!(case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
+			let diagnostic = &case.context.diagnostics[0];
+			let args = source.find("Self<").unwrap() + "Self<".len();
+			assert_eq!(diagnostic.labels[0].range.start, args, "{source}");
+			let label = diagnostic
+				.labels
+				.iter()
+				.find(|label| label.message == shown)
+				.expect("the report shows what `Self` is");
+			assert_eq!(
+				label.range.start,
+				source.find(target).unwrap(),
+				"{source}"
+			);
+			assert_eq!(
+				diagnostic.notes.iter().any(|note| note.contains("`X`")),
+				note,
+				"{source}"
+			);
+		}
+	}
+
 	#[test]
 	fn type_arguments_on_self_are_diagnosed() {
 		test_case!(
 			case = indoc! {"
 			type u8;
 			trait Tr { func g(x: Self<u8>); }
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		case.diagnostics()
@@ -7577,7 +7934,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_non_self_trait_function_parameter_is_diagnosed() {
-		test_case!(case = "trait Foo { func get(self, x) -> Self; }");
+		test_case!(
+			case = "trait Foo { func get(self, x) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+		);
 
 		assert_eq!(
 			case.context.diagnostics.len(),
@@ -8244,6 +8603,7 @@ pub(super) mod tests {
 			trait Pair {{ type First; type Second; }}
 			struct Example();
 			impl Example {{ }}
+			pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 			impl Pair for Example {{
 			    {method}
 			    type First = Self::Second;
@@ -8357,13 +8717,24 @@ pub(super) mod tests {
 			trait Container { func overridden() {} func inherited() {} }
 			struct Wrapper();
 			impl Container for Wrapper { func overridden() {} type Extra = (); }
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"},
 			|builder| {
 				builder.sweep();
 				let receiver =
 					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let trait_index = TraitIdx::new(0);
-				let impl_index = TraitImplIdx::new(0);
+				// The written impl, after its trait's members' synthetic ones.
+				let impl_index = builder
+					.ast_nodes
+					.iter()
+					.find_map(|entry| match entry.node {
+						AstNodeRef::TraitImplBlock { block_index, .. } => {
+							Some(block_index)
+						}
+						_ => None,
+					})
+					.unwrap();
 				let reference = SourceSpan::new(
 					builder.defs.traits[0].file_id,
 					TextSpan::new(0, 1),
@@ -8400,7 +8771,8 @@ pub(super) mod tests {
 						panic!("expected function")
 					};
 					let expected = if overridden {
-						let def = &builder.defs.trait_impls[0];
+						let def =
+							&builder.defs.trait_impls[usize::from(impl_index)];
 						assert!(matches!(
 							selection,
 							TraitMemberSelection::Impl(_)
@@ -9204,6 +9576,7 @@ pub(super) mod tests {
             trait Tagged: Memory {
                 func test(value: Self, ptr: Self::*u8);
             }
+        pub trait Call { type Args; type Result; } pub trait Function: Call {}
         "}
 		);
 		case.diagnostics().assert_none();
@@ -9643,7 +10016,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_traits_own_self() {
-		test_case!(case = "trait Foo { func get(self) -> Self; }");
+		test_case!(
+			case = "trait Foo { func get(self) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+		);
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -9665,6 +10040,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			struct S();
 			impl S { func get(self) -> Self { self } }
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -9715,6 +10091,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			struct S();
 			impl S { func get(self, x) -> Self { self } }
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -9743,6 +10120,7 @@ pub(super) mod tests {
 				func get(self) -> Self { self }
 				func make(x: Self) -> Self { x }
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -9782,6 +10160,7 @@ pub(super) mod tests {
 				func shadow<T>(self, x: T) -> Self { self }
 				const VALUE: T = 0;
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -9836,6 +10215,7 @@ pub(super) mod tests {
 				type Item = T;
 				func get<U: Container where { Item = i32 }>(self, x: Need<T>, y: Need<U::Item>) {}
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -9877,6 +10257,7 @@ pub(super) mod tests {
 			impl Service for S {
 				func get<U: Container where { A = Need<U::B>, B = i32 }>(self, x: U::A) {}
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -9910,6 +10291,7 @@ pub(super) mod tests {
 				func get(self, x: Need<i32>) {}
 				const VALUE: Need<i32> = Need();
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert_eq!(
@@ -10005,6 +10387,7 @@ pub(super) mod tests {
 				func get(self, x, y: _) -> _ {}
 				const VALUE: _ = 0;
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert_eq!(
@@ -10053,6 +10436,7 @@ pub(super) mod tests {
 				trait Service { func get(self) -> Self; const VALUE: i32; }
 				struct S();
 				impl Service for S { func get(self) -> Self { self } const VALUE: i32 = 0; }
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			"},
 				|builder| {
 					let member = builder
@@ -10073,7 +10457,20 @@ pub(super) mod tests {
 						})
 						.unwrap();
 					let id = member.node.def_id();
-					assert!(builder.trait_impls[0].is_none());
+					let impl_index = usize::from(
+						builder
+							.ast_nodes
+							.iter()
+							.find_map(|entry| match entry.node {
+								AstNodeRef::TraitImplBlock {
+									block_index,
+									..
+								} => Some(block_index),
+								_ => None,
+							})
+							.unwrap(),
+					);
+					assert!(builder.trait_impls[impl_index].is_none());
 					assert!(matches!(
 						builder.ensure_signature(QueryInfo {
 							def_id: id,
@@ -10081,7 +10478,7 @@ pub(super) mod tests {
 						}),
 						SignatureStatus::Available(_)
 					));
-					assert!(builder.trait_impls[0].is_some());
+					assert!(builder.trait_impls[impl_index].is_some());
 					for entry in builder.ast_nodes {
 						let _ = builder.ensure_signature(QueryInfo {
 							def_id: entry.node.def_id(),
@@ -10101,7 +10498,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_functions_own_generic_param_is_distinct_from_self() {
-		test_case!(case = "trait Foo { func get<T>(self, x: T) -> T; }");
+		test_case!(
+			case = "trait Foo { func get<T>(self, x: T) -> T; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+		);
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -10200,6 +10599,7 @@ pub(super) mod tests {
 				const X: Self;
 				func get(self) -> Self;
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -10511,6 +10911,7 @@ pub(super) mod tests {
 				type Value;
 				func get(self) -> Self::Value;
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -10545,6 +10946,7 @@ pub(super) mod tests {
 				type Value;
 				func get(self) -> <Self>::Value;
 			}
+		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -13353,6 +13755,7 @@ pub(super) mod tests {
 					let rhs = types.substitute(
 						value.value,
 						Substitution {
+							envs: reader.type_envs,
 							env: substitution.env,
 							args: &[substitution.receiver],
 						},
@@ -13539,6 +13942,7 @@ pub(super) mod tests {
                     func scoped<U: Container where { Item = T } + Container where { Item: Project }>(x: T::Output) {}
                     func sibling(x: T::Output) {}
                 }
+            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			assert_eq!(
@@ -14115,6 +14519,7 @@ pub(super) mod tests {
                 impl<T> Host<T> {
                     func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(x: Need<T>) {}
                 }
+            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			case.diagnostics().assert_none();
@@ -14130,6 +14535,7 @@ pub(super) mod tests {
                     func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(x: Need<T>) {}
                     func sibling(x: Need<T>) {}
                 }
+            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			case.diagnostics()
@@ -14941,6 +15347,216 @@ pub(super) mod tests {
 		assert_eq!(case.normalized_param("f", 1), TypeIndex::I32);
 	}
 
+	/// A method is its own type like a free function, and `self` is its
+	/// first argument: `Point::at` takes `(Point, i32)`.
+	#[test]
+	fn a_member_function_type_implements_call_with_self_in_its_args() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			type bool;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			struct Point();
+			impl Point {
+				func at(self, x: i32) -> bool {}
+				func origin() -> Point {}
+			}
+			func f(a: Point::at::Args, b: Point::at::Result, c: Point::origin::Args) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		let point = case
+			.context
+			.types
+			.intern_struct(case.struct_index("Point"), &[]);
+		let args = case.context.types.intern_tuple(&[point, TypeIndex::I32]);
+		assert_eq!(case.normalized_param("f", 0), args);
+		assert_eq!(case.normalized_param("f", 1), TypeIndex::BOOL);
+		assert_eq!(case.normalized_param("f", 2), TypeIndex::UNIT);
+	}
+
+	/// A member's type takes its parent's parameters ahead of its own, so
+	/// `Wrap<i32>::get<bool>` substitutes both.
+	#[test]
+	fn a_member_function_types_arguments_cover_its_parents_parameters() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			type bool;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			struct Wrap<T>();
+			impl<T> Wrap<T> {
+				func get<U>(self, u: U) -> T {}
+			}
+			func f(a: Wrap<i32>::get<bool>::Args, b: Wrap<i32>::get<bool>::Result) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		let wrap = case
+			.context
+			.types
+			.intern_struct(case.struct_index("Wrap"), &[TypeIndex::I32]);
+		let args = case.context.types.intern_tuple(&[wrap, TypeIndex::BOOL]);
+		assert_eq!(case.normalized_param("f", 0), args);
+		assert_eq!(case.normalized_param("f", 1), TypeIndex::I32);
+	}
+
+	/// Written off a concrete type, a trait's function is the declaration's
+	/// type over that `Self`, which normalizes to the impl's member, so both
+	/// spellings name one type. An inherited default stays the declaration;
+	/// an abstract `Self` keeps it abstract.
+	#[test]
+	fn a_trait_functions_declaration_normalizes_to_the_impls_member() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Make {
+				func make(x: i32) -> Self;
+				func fresh() -> Self {}
+			}
+			struct Point();
+			impl Make for Point { func make(x: i32) -> Point {} }
+			func direct(x: Point::make, y: Point::fresh::Result) {}
+			func qualified(x: <Point as Make>::make, y: <Point as Make>::fresh) {}
+			func generic<T: Make>(x: T::make, y: T::make::Result) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		let make = case.graph.strings.get("make").unwrap();
+		let fresh = case.graph.strings.get("fresh").unwrap();
+		let position = |name, owner: fn(FunctionOwner) -> bool| {
+			FunctionIdx::new(
+				u32::try_from(
+					case.defs
+						.functions
+						.iter()
+						.position(|definition| {
+							definition.name.inner == name
+								&& owner(definition.owner)
+						})
+						.unwrap(),
+				)
+				.unwrap(),
+			)
+		};
+		let member = position(make, |owner| {
+			matches!(owner, FunctionOwner::TraitImpl(_))
+		});
+		let declaration =
+			position(make, |owner| matches!(owner, FunctionOwner::Trait(_)));
+		let default =
+			position(fresh, |owner| matches!(owner, FunctionOwner::Trait(_)));
+		let point = case
+			.context
+			.types
+			.intern_struct(case.struct_index("Point"), &[]);
+		let member = case.context.types.intern_function(member, &[]);
+		let inherited = case.context.types.intern_function(default, &[point]);
+		assert_eq!(case.normalized_param("direct", 0), member);
+		assert_eq!(case.normalized_param("direct", 1), point);
+		assert_eq!(case.normalized_param("qualified", 0), member);
+		assert_eq!(case.normalized_param("qualified", 1), inherited);
+		let env = case.function_signature("generic").type_params;
+		let t = case.context.type_envs.params(env)[0].ty;
+		let abstract_make =
+			case.context.types.intern_function(declaration, &[t]);
+		assert_eq!(case.normalized_param("generic", 0), abstract_make);
+		assert_eq!(case.normalized_param("generic", 1), t);
+	}
+
+	/// An associated function's own arguments follow its receiver's:
+	/// `Foo<i32>::new<u8>` is `new<i32, u8>`. A trait member's follow `Self`,
+	/// and normalization hands them to the impl's member after the impl's.
+	#[test]
+	fn member_functions_take_their_own_type_arguments_after_the_receivers() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			type u8;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			struct Foo<T>();
+			impl<T> Foo<T> { func new<U>(x: U) -> T {} }
+			trait Make { func make<U>(x: U) -> Self; }
+			struct Wrap<T>();
+			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> {} }
+			func f(
+				a: Foo<i32>::new<u8>::Args,
+				b: Foo<i32>::new<u8>::Result,
+				c: Wrap<i32>::make<u8>::Args,
+				d: <Wrap<i32> as Make>::make<u8>::Result,
+			) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		let wrap = case
+			.context
+			.types
+			.intern_struct(case.struct_index("Wrap"), &[TypeIndex::I32]);
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U8);
+		assert_eq!(case.normalized_param("f", 1), TypeIndex::I32);
+		assert_eq!(case.normalized_param("f", 2), TypeIndex::U8);
+		assert_eq!(case.normalized_param("f", 3), wrap);
+	}
+
+	/// As in value lookup, an inherent function wins over a trait's of the
+	/// same name; the trait's stays reachable qualified.
+	#[test]
+	fn an_inherent_function_takes_precedence_over_a_traits_in_a_type() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Make { func make() -> Self; }
+			struct Point();
+			impl Point { func make() -> i32 {} }
+			impl Make for Point { func make() -> Point {} }
+			func f(x: Point::make::Result, y: <Point as Make>::make::Result) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		let point = case
+			.context
+			.types
+			.intern_struct(case.struct_index("Point"), &[]);
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
+		assert_eq!(case.normalized_param("f", 1), point);
+	}
+
+	/// The inherent impl matched for a member's type supplies its leading
+	/// arguments, so its bounds on them are checked where it is written.
+	#[test]
+	fn an_inherent_impls_bounds_apply_to_its_members_type() {
+		test_case!(
+			case = indoc! {"
+			type i32;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Marker {}
+			struct Wrap<T>();
+			impl<T: Marker> Wrap<T> { func get() {} }
+			func f(x: Wrap<i32>::get) {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	/// A function and an associated type are both type members, so two
+	/// bounds that each declare the name make it ambiguous.
+	#[test]
+	fn a_function_and_an_associated_type_of_one_name_are_ambiguous() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait A { func f(); }
+			trait B { type f; }
+			func g<T: A + B>(x: T::f) {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AmbiguousTraitMember]);
+	}
+
 	/// `Function` is an ordinary bound: a function type satisfies it, any
 	/// other type does not, nor its supertrait `Call`.
 	#[test]
@@ -15117,5 +15733,132 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	/// A method's chain is the impl's frame, then its own: one flat argument
+	/// list `[T, U]` instantiates both, an outer frame alone instantiates
+	/// only its own parameters, and another declaration's are never touched.
+	#[test]
+	fn substitution_and_matching_cover_a_methods_whole_chain() {
+		test_case!(
+			mut case = indoc! {"
+			type i32;
+			type bool;
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Number {}
+			impl Number for i32 {}
+			struct Wrap<T>();
+			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) {} }
+			func free<V>(v: V) {}
+			trait Service { func make<W>(w: W) -> Self; }
+		"}
+		);
+		case.diagnostics().assert_none();
+		let get = case.inherent_function_signature("Wrap", "get");
+		let (method, pair) = (get.type_params, get.return_type);
+		let outer = case.context.inherent_impls
+			[usize::from(case.inherent_impl_index("Wrap"))]
+		.as_ref()
+		.unwrap()
+		.type_params;
+		let free = case.function_signature("free").type_params;
+		let make = case.trait_function_signature("Service", "make").type_params;
+		let envs = &case.context.type_envs;
+		let t = envs.params(outer)[0].ty;
+		let u = envs.params(method)[0].ty;
+		let v = envs.params(free)[0].ty;
+
+		// Counts: rustc's `parent_count`, and the whole chain's length.
+		assert_eq!(envs.parent(method), Some(outer));
+		for (env, parent_count, generic_count) in [
+			(TypeEnvIdx::ROOT, 0, 0),
+			(outer, 0, 1),
+			(method, 1, 2),
+			(free, 0, 1),
+			(make, 1, 2),
+		] {
+			assert_eq!(envs.parent_count(env), parent_count);
+			assert_eq!(envs.generic_count(env), generic_count);
+		}
+
+		let types = &mut case.context.types;
+		let (i32_, bool_) = (TypeIndex::I32, TypeIndex::BOOL);
+		let triple = types.intern_tuple(&[t, u, v]);
+		let full = types.substitute(
+			triple,
+			Substitution {
+				envs,
+				env: method,
+				args: &[i32_, bool_],
+			},
+		);
+		assert_eq!(full, types.intern_tuple(&[i32_, bool_, v]));
+		let partial = types.substitute(
+			pair,
+			Substitution {
+				envs,
+				env: outer,
+				args: &[i32_],
+			},
+		);
+		assert_eq!(partial, types.intern_tuple(&[i32_, u]));
+
+		// Matching fills the same flat slots; a parameter outside the chain
+		// is an ordinary identity.
+		let concrete = types.intern_tuple(&[i32_, bool_]);
+		assert_eq!(
+			types
+				.match_impl_target(pair, concrete, envs, method)
+				.as_deref(),
+			Some(&[i32_, bool_][..])
+		);
+		let repeated = types.intern_tuple(&[t, u, t]);
+		let consistent = types.intern_tuple(&[i32_, bool_, i32_]);
+		let inconsistent = types.intern_tuple(&[i32_, bool_, bool_]);
+		assert!(
+			types
+				.match_impl_target(repeated, consistent, envs, method)
+				.is_some()
+		);
+		assert!(
+			types
+				.match_impl_target(repeated, inconsistent, envs, method)
+				.is_none()
+		);
+		assert!(
+			types
+				.match_impl_target(pair, concrete, envs, outer)
+				.is_none()
+		);
+		let half = types.intern_tuple(&[i32_, u]);
+		assert_eq!(
+			types.match_impl_target(pair, half, envs, outer).as_deref(),
+			Some(&[i32_][..])
+		);
+
+		// Bounds are checked in each parameter's own frame: `T: Number`
+		// against the outer argument, nothing against `U`.
+		let swapped = case.context.types.intern_tuple(&[bool_, i32_]);
+		assert_eq!(
+			case.context
+				.match_impl_target_and_bounds(
+					TypeEnvIdx::ROOT,
+					method,
+					pair,
+					concrete,
+				)
+				.unwrap()
+				.as_deref(),
+			Some(&[i32_, bool_][..])
+		);
+		assert_eq!(
+			case.context.match_impl_target_and_bounds(
+				TypeEnvIdx::ROOT,
+				method,
+				pair,
+				swapped,
+			),
+			Ok(None)
+		);
 	}
 }

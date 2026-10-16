@@ -233,6 +233,7 @@ define_diagnostic_codes! {
 		ConstEvaluationFailed => "E2108",
 		CyclicConstant => "E2109",
 		StructUsedAsValue => "E2110",
+		TypeArgumentsNotAllowed => "E2111",
 	}
 }
 

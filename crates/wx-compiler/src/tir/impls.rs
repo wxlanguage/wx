@@ -362,7 +362,10 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				AstNodeRef::Function { func_index, .. } => {
 					self.register_function_impls(*func_index, entry.file_id);
 				}
-				AstNodeRef::ImportedFunction { function_index, .. } => {
+				AstNodeRef::ImportedFunction { function_index, .. }
+				| AstNodeRef::TraitFunction { function_index, .. }
+				| AstNodeRef::InherentImplFunction { function_index, .. }
+				| AstNodeRef::TraitImplFunction { function_index, .. } => {
 					self.register_function_impls(
 						*function_index,
 						entry.file_id,
@@ -529,7 +532,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		}
 	}
 
-	/// Registers a free or imported function's synthetic `Call` and
+	/// Registers a function's synthetic `Call` and
 	/// `Function` impls under its own `ImplTarget::Function` bucket, same
 	/// reasoning as `register_global_impl`.
 	fn register_function_impls(
@@ -539,18 +542,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	) {
 		let defs = self.defs;
 		let function_def = &defs.functions[usize::from(func_index)];
-		let function_impls = function_def
-			.function_impls
-			.expect("a free or imported function has synthetic impls");
+		let function_impls = function_def.function_impls;
 		let name_span = function_def.name.span;
 		let call_trait_idx = defs.intrinsics.call.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Call` trait — every free function needs one to synthesize its impl against"
+				"the stdlib package must declare a `Call` trait — every function needs one to synthesize its impl against"
 			)
 		});
 		let function_trait_idx = defs.intrinsics.function.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Function` trait — every free function needs one to synthesize its impl against"
+				"the stdlib package must declare a `Function` trait — every function needs one to synthesize its impl against"
 			)
 		});
 		for (trait_idx, trait_impl_index) in [

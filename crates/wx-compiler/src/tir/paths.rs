@@ -343,7 +343,10 @@ impl<'r> PathResolver<'r> {
 				self.defs,
 				file_id,
 				segment,
-				TypeArgsTarget::Namespace(self.defs.namespaces.kind(def_key)),
+				TypeArgsTarget::Declaration {
+					kind: self.defs.namespaces.kind(def_key),
+					params: &[],
+				},
 			));
 		}
 		let target = match &resolution.stopped_with {

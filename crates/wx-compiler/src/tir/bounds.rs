@@ -300,6 +300,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		let trait_env = self.traits[usize::from(trait_index)].env;
 		let substitution = Substitution {
+			envs: &self.type_envs,
 			env: trait_env,
 			args: &[subject],
 		};

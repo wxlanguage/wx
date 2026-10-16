@@ -238,18 +238,19 @@ impl Type {
 }
 
 impl TypeInterner {
-	/// Match a resolved impl target against one receiver. Only parameters
-	/// declared by `env` are holes; parameters from every other frame are
-	/// ordinary identities. All holes must be determined by the target.
+	/// Match a resolved impl target against one receiver. The parameters on
+	/// `env`'s chain are holes, filled into the chain's flat argument list
+	/// (see `Substitution`); parameters from every other frame are ordinary
+	/// identities. All holes must be determined by the target.
 	pub(super) fn match_impl_target(
 		&self,
 		pattern: TypeIndex,
 		actual: TypeIndex,
+		envs: &TypeEnvArena,
 		env: TypeEnvIdx,
-		param_count: usize,
 	) -> Option<Box<[TypeIndex]>> {
-		let mut args = vec![None; param_count];
-		self.match_pattern(pattern, actual, env, &mut args)?;
+		let mut args = vec![None; envs.generic_count(env)];
+		self.match_pattern(pattern, actual, envs, env, &mut args)?;
 		args.into_iter().collect::<Option<Box<[TypeIndex]>>>()
 	}
 
@@ -257,6 +258,7 @@ impl TypeInterner {
 		&self,
 		pattern: TypeIndex,
 		actual: TypeIndex,
+		envs: &TypeEnvArena,
 		env: TypeEnvIdx,
 		args: &mut [Option<TypeIndex>],
 	) -> Option<()> {
@@ -273,17 +275,20 @@ impl TypeInterner {
 					param_index,
 				},
 				_,
-			) if *owner == env => {
-				let slot = args.get_mut(*param_index as usize)?;
-				match slot {
-					Some(previous) if *previous != actual => None,
-					Some(_) => Some(()),
-					None => {
-						*slot = Some(actual);
-						Some(())
+			) => match envs.flat_slot(env, *owner, *param_index) {
+				Some(slot) => {
+					let slot = args.get_mut(slot)?;
+					match slot {
+						Some(previous) if *previous != actual => None,
+						Some(_) => Some(()),
+						None => {
+							*slot = Some(actual);
+							Some(())
+						}
 					}
 				}
-			}
+				None => (pattern == actual).then_some(()),
+			},
 			(
 				Type::Struct {
 					struct_index: a,
@@ -293,11 +298,21 @@ impl TypeInterner {
 					struct_index: b,
 					type_args: ys,
 				},
-			) if a == b => {
-				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
-			}
+			) if a == b => self.match_patterns(
+				self.list(*xs),
+				self.list(*ys),
+				envs,
+				env,
+				args,
+			),
 			(Type::Tuple { elements: xs }, Type::Tuple { elements: ys }) => {
-				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
+				self.match_patterns(
+					self.list(*xs),
+					self.list(*ys),
+					envs,
+					env,
+					args,
+				)
 			}
 			(
 				Type::Function {
@@ -308,9 +323,13 @@ impl TypeInterner {
 					func_index: b,
 					type_args: ys,
 				},
-			) if a == b => {
-				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
-			}
+			) if a == b => self.match_patterns(
+				self.list(*xs),
+				self.list(*ys),
+				envs,
+				env,
+				args,
+			),
 			(
 				Type::FunctionRef {
 					param: xp,
@@ -321,8 +340,8 @@ impl TypeInterner {
 					result: yr,
 				},
 			) => {
-				self.match_pattern(*xp, *yp, env, args)?;
-				self.match_pattern(*xr, *yr, env, args)
+				self.match_pattern(*xp, *yp, envs, env, args)?;
+				self.match_pattern(*xr, *yr, envs, env, args)
 			}
 			(
 				Type::Pointer {
@@ -336,8 +355,8 @@ impl TypeInterner {
 					ownership: yo,
 				},
 			) if xo == yo => {
-				self.match_pattern(*x, *y, env, args)?;
-				self.match_pattern(*xm, *ym, env, args)
+				self.match_pattern(*x, *y, envs, env, args)?;
+				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
 				Type::Array {
@@ -353,8 +372,8 @@ impl TypeInterner {
 					ownership: yo,
 				},
 			) if xs == ys && xo == yo => {
-				self.match_pattern(*x, *y, env, args)?;
-				self.match_pattern(*xm, *ym, env, args)
+				self.match_pattern(*x, *y, envs, env, args)?;
+				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
 				Type::Slice {
@@ -368,8 +387,8 @@ impl TypeInterner {
 					ownership: yo,
 				},
 			) if xo == yo => {
-				self.match_pattern(*x, *y, env, args)?;
-				self.match_pattern(*xm, *ym, env, args)
+				self.match_pattern(*x, *y, envs, env, args)?;
+				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
 				Type::AssocTypeProjection {
@@ -382,7 +401,7 @@ impl TypeInterner {
 					assoc_type_index: ba,
 					base: y,
 				},
-			) if at == bt && aa == ba => self.match_pattern(*x, *y, env, args),
+			) if at == bt && aa == ba => self.match_pattern(*x, *y, envs, env, args),
 			_ if pattern == actual => Some(()),
 			_ => None,
 		}
@@ -392,6 +411,7 @@ impl TypeInterner {
 		&self,
 		expected: &[TypeIndex],
 		found: &[TypeIndex],
+		envs: &TypeEnvArena,
 		env: TypeEnvIdx,
 		args: &mut [Option<TypeIndex>],
 	) -> Option<()> {
@@ -401,7 +421,7 @@ impl TypeInterner {
 		for (pattern, actual) in
 			expected.iter().copied().zip(found.iter().copied())
 		{
-			self.match_pattern(pattern, actual, env, args)?;
+			self.match_pattern(pattern, actual, envs, env, args)?;
 		}
 		Some(())
 	}
@@ -581,11 +601,15 @@ impl TypeInterner {
 		substitution: Substitution<'_>,
 	) -> TypeIndex {
 		match *self.resolve(ty) {
-			Type::TypeParam { env, param_index } if env == substitution.env => {
-				*substitution.args.get(param_index as usize).expect(
-					"substitution is missing an argument for its parameter frame",
-				)
-			}
+			Type::TypeParam { env, param_index } => match substitution
+				.envs
+				.flat_slot(substitution.env, env, param_index)
+			{
+				Some(slot) => *substitution.args.get(slot).expect(
+					"substitution is missing an argument for its parameter chain",
+				),
+				None => ty,
+			},
 			Type::Tuple { elements } => {
 				match self.substitute_list(elements, substitution) {
 					Some(elements) => self.intern_tuple(&elements),
@@ -707,8 +731,7 @@ impl TypeInterner {
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
-			| Type::AssociatedType { .. }
-			| Type::TypeParam { .. } => ty,
+			| Type::AssociatedType { .. } => ty,
 		}
 	}
 
@@ -741,13 +764,17 @@ impl Default for TypeInterner {
 // A `Copy` handle into a `TypeEnvArena` — see that type's doc comment.
 index_newtype!(TypeEnvIdx);
 
-/// Replacements for all parameters in one declaring frame. `args[i]`
-/// replaces `TypeParam { env, param_index: i }`; other frames are untouched.
-/// Callers supply one argument per parameter in `env`, in declaration order.
-/// This borrows an instantiation's arguments without changing the original
-/// lexical environment. Replacement types may themselves contain parameters.
+/// Replacements for every parameter on `env`'s chain: `args` is the chain's
+/// flat argument list, outer frames first, so `TypeParam { env: e, i }` is
+/// replaced by `args[parent_count(e) + i]` for each frame `e` on the chain
+/// (`TypeEnvArena::flat_slot`). Parameters of any other frame, including a
+/// frame nested inside `env`, are untouched, so instantiating an outer frame
+/// alone is a partial substitution. This borrows an instantiation's arguments
+/// without changing the original lexical environment. Replacement types may
+/// themselves contain parameters.
 #[derive(Clone, Copy)]
 pub(super) struct Substitution<'a> {
+	pub(super) envs: &'a TypeEnvArena,
 	pub(super) env: TypeEnvIdx,
 	pub(super) args: &'a [TypeIndex],
 }
@@ -859,12 +886,17 @@ impl TypeEnvOwner {
 /// are: a trait's synthetic single-entry `Self` frame, or an impl's own
 /// `<T>` frame (which every impl has, even an empty one); then the item's
 /// own explicit `<T>`. Every frame declares parameters, and nothing else.
+///
+/// `parent_count` is how many parameters the frames above this one declare
+/// (rustc's `Generics::parent_count`): a parameter's position in its chain's
+/// flat argument list is `parent_count + param_index`.
 enum TypeEnv {
 	Root,
 	Frame {
 		owner: TypeEnvOwner,
 		params: Box<[TypeParam]>,
 		parent: TypeEnvIdx,
+		parent_count: u32,
 	},
 }
 
@@ -928,6 +960,7 @@ impl TypeEnvArena {
 		names: impl IntoIterator<Item = Spanned<SymbolU32>>,
 	) -> TypeEnvIdx {
 		let frame = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
+		let parent_count = u32::try_from(self.generic_count(parent)).unwrap();
 		let params: Box<[TypeParam]> = names
 			.into_iter()
 			.enumerate()
@@ -943,6 +976,7 @@ impl TypeEnvArena {
 			params,
 			parent,
 			owner,
+			parent_count,
 		});
 		frame
 	}
@@ -971,6 +1005,44 @@ impl TypeEnvArena {
 			TypeEnv::Root => None,
 			TypeEnv::Frame { parent, .. } => Some(*parent),
 		}
+	}
+
+	/// How many parameters the frames above `env` declare.
+	#[inline]
+	pub(super) fn parent_count(&self, env: TypeEnvIdx) -> usize {
+		match &self.envs[usize::from(env)] {
+			TypeEnv::Root => 0,
+			TypeEnv::Frame { parent_count, .. } => *parent_count as usize,
+		}
+	}
+
+	/// How many arguments instantiating `env` takes: every parameter on its
+	/// chain.
+	#[inline]
+	pub(super) fn generic_count(&self, env: TypeEnvIdx) -> usize {
+		self.parent_count(env) + self.params(env).len()
+	}
+
+	/// `env` and the frames above it, innermost first, without `Root`.
+	pub(super) fn chain(
+		&self,
+		env: TypeEnvIdx,
+	) -> impl Iterator<Item = TypeEnvIdx> + '_ {
+		std::iter::successors(Some(env), |&frame| self.parent(frame))
+			.take_while(|&frame| frame != TypeEnvIdx::ROOT)
+	}
+
+	/// The position of `TypeParam { env: owner, param_index }` in the flat
+	/// argument list of `env`'s chain, or `None` when `owner` is not on it.
+	pub(super) fn flat_slot(
+		&self,
+		env: TypeEnvIdx,
+		owner: TypeEnvIdx,
+		param_index: u32,
+	) -> Option<usize> {
+		self.chain(env)
+			.any(|frame| frame == owner)
+			.then(|| self.parent_count(owner) + param_index as usize)
 	}
 
 	/// The impl owning the nearest impl frame on `env`'s chain, if any.
@@ -1111,7 +1183,27 @@ impl IntrinsicDefs {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::ast::Ownership;
+	use crate::ast::{Keyword, Ownership};
+	use crate::diagnostics::TextSpan;
+
+	/// Two unrelated root frames: `TypeEnvIdx(1)` with two parameters and
+	/// `TypeEnvIdx(2)` with one.
+	fn root_frames(types: &mut TypeInterner) -> TypeEnvArena {
+		let mut envs = TypeEnvArena::new();
+		let name = Spanned {
+			inner: Keyword::SelfPascal.symbol(),
+			span: TextSpan::new(0, 0),
+		};
+		for count in [2, 1] {
+			envs.push_param_frame(
+				types,
+				TypeEnvOwner::Function(FunctionIdx::new(0)),
+				TypeEnvIdx::ROOT,
+				vec![name.clone(); count],
+			);
+		}
+		envs
+	}
 
 	fn parameter(
 		types: &mut TypeInterner,
@@ -1124,6 +1216,7 @@ mod tests {
 	#[test]
 	fn substitution_replaces_only_the_targeted_frames_parameters() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
@@ -1136,6 +1229,7 @@ mod tests {
 		let actual = types.substitute(
 			original,
 			Substitution {
+				envs: &envs,
 				env,
 				args: &[TypeIndex::I32, TypeIndex::BOOL],
 			},
@@ -1196,6 +1290,7 @@ mod tests {
 	#[test]
 	fn substitution_traverses_nested_types_without_normalizing_projections() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let m = parameter(&mut types, env, 1);
@@ -1207,6 +1302,7 @@ mod tests {
 		let actual = types.substitute(
 			original,
 			Substitution {
+				envs: &envs,
 				env,
 				args: &[TypeIndex::I32, memory],
 			},
@@ -1220,6 +1316,7 @@ mod tests {
 	#[test]
 	fn unchanged_substitution_preserves_indices_without_growing_the_interner() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let m = parameter(&mut types, env, 1);
@@ -1230,6 +1327,7 @@ mod tests {
 			types.substitute(
 				original,
 				Substitution {
+					envs: &envs,
 					env: TypeEnvIdx::new(2),
 					args: &[]
 				},
@@ -1237,7 +1335,14 @@ mod tests {
 			original
 		);
 		assert_eq!(
-			types.substitute(original, Substitution { env, args: &[t, m] }),
+			types.substitute(
+				original,
+				Substitution {
+					envs: &envs,
+					env,
+					args: &[t, m]
+				}
+			),
 			original
 		);
 		assert_eq!(types.entries.len(), count);
@@ -1246,10 +1351,12 @@ mod tests {
 	#[test]
 	fn substitution_preserves_unchanged_list_elements_around_late_changes() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
 		let substitution = Substitution {
+			envs: &envs,
 			env,
 			args: &[TypeIndex::I32, TypeIndex::U8],
 		};
@@ -1278,9 +1385,11 @@ mod tests {
 	fn substitution_handles_independent_function_parameter_and_result_changes()
 	{
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let substitution = Substitution {
+			envs: &envs,
 			env,
 			args: &[TypeIndex::I32],
 		};
@@ -1326,6 +1435,7 @@ mod tests {
 	#[test]
 	fn substitution_inserts_replacements_without_substituting_them_again() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
@@ -1337,6 +1447,7 @@ mod tests {
 			types.substitute(
 				original,
 				Substitution {
+					envs: &envs,
 					env,
 					args: &[u, replacement]
 				}
@@ -1349,6 +1460,7 @@ mod tests {
 	#[test]
 	fn substitution_preserves_a_projection_with_an_error_receiver() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let subject = parameter(&mut types, env, 0);
 		let projection = types.intern(Type::AssocTypeProjection {
@@ -1359,6 +1471,7 @@ mod tests {
 		let result = types.substitute(
 			projection,
 			Substitution {
+				envs: &envs,
 				env,
 				args: &[TypeIndex::ERROR],
 			},
@@ -1383,6 +1496,7 @@ mod tests {
 	#[test]
 	fn substitution_preserves_leaf_types() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let leaves = [
 			Type::Error,
 			Type::Infer,
@@ -1430,6 +1544,7 @@ mod tests {
 				types.substitute(
 					ty,
 					Substitution {
+						envs: &envs,
 						env: TypeEnvIdx::new(1),
 						args: &[]
 					}
@@ -1443,6 +1558,7 @@ mod tests {
 	#[test]
 	fn substitution_keeps_error_and_inference_arguments_as_supplied() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		for replacement in [TypeIndex::ERROR, TypeIndex::INFER] {
@@ -1450,6 +1566,7 @@ mod tests {
 				types.substitute(
 					t,
 					Substitution {
+						envs: &envs,
 						env,
 						args: &[replacement]
 					}
@@ -1461,15 +1578,17 @@ mod tests {
 
 	#[test]
 	#[should_panic(
-		expected = "substitution is missing an argument for its parameter frame"
+		expected = "substitution is missing an argument for its parameter chain"
 	)]
 	fn substitution_rejects_missing_arguments_for_the_targeted_frame() {
 		let mut types = TypeInterner::new();
+		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let u = parameter(&mut types, env, 1);
 		types.substitute(
 			u,
 			Substitution {
+				envs: &envs,
 				env,
 				args: &[TypeIndex::I32],
 			},

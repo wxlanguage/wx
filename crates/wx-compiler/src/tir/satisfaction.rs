@@ -72,6 +72,7 @@ impl TypeContext<'_, '_, '_> {
 		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
 		args: &[TypeIndex],
+		kind: DefKind,
 		owner: TypeEnvOwner,
 	) -> Box<[TypeIndex]> {
 		let expected = self.param_bounds[usize::from(params_env)].len();
@@ -81,8 +82,8 @@ impl TypeContext<'_, '_, '_> {
 				self.defs,
 				file_id,
 				segment,
-				TypeArgsTarget::Item {
-					owner,
+				TypeArgsTarget::Declaration {
+					kind,
 					params: self.type_envs.params(params_env),
 				},
 			));
@@ -336,12 +337,14 @@ impl ObligationChecker<'_> {
 			)
 			.with_label(
 				self.bounds.span(bound_id).secondary_label().with_message(
-					format!(
-						"required by a bound in `{}`",
-						self.strings
-							.resolve(owner.name(self.view.defs).unwrap().inner)
-							.unwrap()
-					),
+					// An impl has no name to point at; its bound is shown.
+					match owner.name(self.view.defs) {
+						Some(name) => format!(
+							"required by a bound in `{}`",
+							self.strings.resolve(name.inner).unwrap()
+						),
+						None => "required by this bound".to_owned(),
+					},
 				),
 			)
 	}
@@ -349,15 +352,19 @@ impl ObligationChecker<'_> {
 
 /// What a path segment written with generic arguments names.
 pub(super) enum TypeArgsTarget<'a> {
-	/// A declaration and its own generic parameters, possibly none.
-	Item {
-		owner: TypeEnvOwner,
+	/// A declaration and its own generic parameters, none for one that
+	/// declares no parameter list (a namespace a path passes through, a
+	/// global, an enum, an associated type).
+	Declaration {
+		kind: DefKind,
 		params: &'a [TypeParam],
 	},
-	/// A generic parameter or `Self`, which has no parameter list.
-	TypeParam,
-	/// A namespace the path passes through, which has no parameter list.
-	Namespace(DefKind),
+	/// A generic parameter, or a trait's `Self`, which has no parameter
+	/// list, and the declaration whose frame declares it.
+	TypeParam {
+		owner: TypeEnvOwner,
+		param: &'a TypeParam,
+	},
 }
 
 pub(super) fn report_type_arg_count_mismatch(
@@ -368,22 +375,24 @@ pub(super) fn report_type_arg_count_mismatch(
 	target: TypeArgsTarget<'_>,
 ) -> Diagnostic<FileId> {
 	let (noun, name, declaration) = match target {
-		TypeArgsTarget::Item { owner, params } => {
-			let name = owner.name(defs).unwrap();
-			let declared_at = SourceSpan::new(owner.file_id(defs), name.span);
-			(owner.noun(), name.inner, Some((declared_at, params)))
-		}
-		TypeArgsTarget::TypeParam
-			if segment.ident.inner == Keyword::SelfPascal.symbol() =>
-		{
-			("self type", segment.ident.inner, None)
-		}
-		TypeArgsTarget::TypeParam => {
-			("type parameter", segment.ident.inner, None)
-		}
-		TypeArgsTarget::Namespace(kind) => {
-			(kind.noun(), segment.ident.inner, None)
-		}
+		TypeArgsTarget::Declaration { kind, params } => (
+			kind.noun(),
+			segment.ident.inner,
+			kind.declared_at(defs)
+				.map(|declared_at| (declared_at, params)),
+		),
+		TypeArgsTarget::TypeParam { owner, param } => (
+			if param.name.inner == Keyword::SelfPascal.symbol() {
+				"self type"
+			} else {
+				"type parameter"
+			},
+			param.name.inner,
+			Some((
+				SourceSpan::new(owner.file_id(defs), param.name.span),
+				&[][..],
+			)),
+		),
 	};
 	let args = &segment.type_args;
 	let params = declaration.map_or(&[][..], |(_, params)| params);

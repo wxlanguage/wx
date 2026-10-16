@@ -21,17 +21,17 @@ use super::assumptions::Readiness;
 use super::bounds::report_not_an_associated_type;
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, DefId, DefinitionRegistry,
-	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
+	InherentImplIdx, MemberKind, Scope, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
-use super::obligations::Obligation;
+use super::obligations::{BoundRequirements, Obligation};
 use super::resolutions::Referent;
 use super::signatures::{
-	QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
+	InferPolicy, QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
 };
 use super::solver::{Assumption, SolverError};
-use super::types::{Type, TypeEnvIdx, TypeIndex};
+use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 
 /// What type-relative member applicability found.
 pub(super) enum MemberLookup {
@@ -362,17 +362,26 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
+		namespace: Scope,
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
+		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		if current == TypeIndex::ERROR {
 			return current;
 		}
 		for segment in segments {
-			if !segment.type_args.is_empty() {
-				todo!(
-					"generic args on a type-relative path segment aren't implemented yet"
-				)
+			// An inherent function comes first, as in value lookup.
+			if let Some(function) = self.select_inherent_function(
+				assumption_context,
+				file_id,
+				namespace,
+				current,
+				segment,
+				infer_policy,
+			) {
+				current = function;
+				continue;
 			}
 			let key = BindingKey::ty(segment.ident.inner);
 			match self.select_associated_type(
@@ -413,14 +422,14 @@ impl TypeContext<'_, '_, '_> {
 					return TypeIndex::ERROR;
 				}
 				MemberLookup::Found(member) => {
-					let Some(declaration) = member.assoc_type_declaration()
+					let ApplicableMember::AbstractTraitMember {
+						trait_index,
+						declaration,
+					} = member
 					else {
-						self.diagnostics.push(report_no_such_type_member(
-							file_id,
-							self.strings,
-							segment.ident,
-						));
-						return TypeIndex::ERROR;
+						unreachable!(
+							"type-position selection reads trait declarations only"
+						)
 					};
 					// Selection named the trait without matching an impl; that
 					// the receiver implements it is the declaration check's question.
@@ -428,7 +437,7 @@ impl TypeContext<'_, '_, '_> {
 						Obligation::CheckTraitMembership {
 							assumption_context,
 							subject: current,
-							required: declaration.trait_index,
+							required: trait_index,
 							reference: SourceSpan::new(
 								file_id,
 								segment.ident.span,
@@ -440,11 +449,49 @@ impl TypeContext<'_, '_, '_> {
 							SourceSpan::new(file_id, segment.ident.span),
 							Tier::Type,
 						),
-						Referent::Member(MemberKind::AssociatedType(
-							declaration.assoc_type_index,
-						)),
+						Referent::Member(declaration),
 					);
-					current = self.project_assoc_type(current, declaration);
+					current = match declaration {
+						MemberKind::AssociatedType(assoc_type_index) => {
+							if !segment.type_args.is_empty() {
+								self.report_assoc_type_args(
+									file_id,
+									namespace,
+									assumption_context,
+									segment,
+									assoc_type_index,
+									infer_policy,
+								);
+								return TypeIndex::ERROR;
+							}
+							self.project_assoc_type(
+								current,
+								AssocTypeProjectionTarget {
+									trait_index,
+									assoc_type_index,
+								},
+							)
+						}
+						// `<current as Trait>::f`, which normalization takes to
+						// the impl's member once `current` has an impl.
+						MemberKind::Function(function)
+						| MemberKind::Method(function) => {
+							let own_args = self.member_function_type_args(
+								assumption_context,
+								file_id,
+								namespace,
+								function,
+								segment,
+								infer_policy,
+							);
+							let mut type_args = vec![current];
+							type_args.extend_from_slice(&own_args);
+							self.types.intern_function(function, &type_args)
+						}
+						MemberKind::Constant(_) => {
+							unreachable!("a constant is a value member")
+						}
+					};
 				}
 				MemberLookup::NotFound => {
 					if matches!(
@@ -489,6 +536,86 @@ impl TypeContext<'_, '_, '_> {
 		current
 	}
 
+	/// The inherent function `segment` names off a concrete `receiver`: the
+	/// impl whose target matches it supplies the leading arguments, and its
+	/// bounds on them are recorded as checks. `None` leaves the name to the
+	/// trait members.
+	fn select_inherent_function(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		file_id: FileId,
+		namespace: Scope,
+		receiver: TypeIndex,
+		segment: &ast::PathSegment,
+		infer_policy: InferPolicy,
+	) -> Option<TypeIndex> {
+		let key = BindingKey::ty(segment.ident.inner);
+		let reference = SourceSpan::new(file_id, segment.ident.span);
+		// Only assumed equalities may rewrite the receiver here, as for an
+		// associated type; a failure is the trait selection's to report.
+		let receiver = self
+			.normalize_assumed_type_query(assumption_context, receiver)
+			.ok()?;
+		let target = ImplTarget::from_type(self.types.resolve(receiver))?;
+		let impl_dispatch = self.impl_dispatch;
+		for &impl_index in impl_dispatch.inherent_candidates(target) {
+			let impl_def = &self.defs.inherent_impls[usize::from(impl_index)];
+			let Some(&member_index) = impl_def.bindings.get(&key) else {
+				continue;
+			};
+			let kind = impl_def.members[usize::from(member_index)].kind;
+			let (MemberKind::Function(function) | MemberKind::Method(function)) =
+				kind
+			else {
+				continue;
+			};
+			let _ = self.ensure_signature(QueryInfo {
+				def_id: DefId::InherentImpl(impl_index),
+				requested_at: Some(reference),
+			});
+			let Some(header) = &self.inherent_impls[usize::from(impl_index)]
+			else {
+				continue;
+			};
+			let env = header.type_params;
+			let Some(impl_args) = self.types.match_impl_target(
+				header.target.inner,
+				receiver,
+				&self.type_envs,
+				env,
+			) else {
+				continue;
+			};
+			let mut type_args = Vec::with_capacity(impl_args.len());
+			for (index, &argument) in impl_args.iter().enumerate() {
+				type_args.push(self.record_bounds_check(
+					assumption_context,
+					BoundRequirements::Parameter { env, index },
+					Spanned {
+						inner: argument,
+						span: segment.ident.span,
+					},
+					reference,
+					TypeEnvOwner::InherentImpl(impl_index),
+				));
+			}
+			self.resolutions
+				.by_site
+				.insert((reference, Tier::Type), Referent::Member(kind));
+			let own_args = self.member_function_type_args(
+				assumption_context,
+				file_id,
+				namespace,
+				function,
+				segment,
+				infer_policy,
+			);
+			type_args.extend_from_slice(&own_args);
+			return Some(self.types.intern_function(function, &type_args));
+		}
+		None
+	}
+
 	/// Build a symbolic projection. Ordinary signature types normalize it;
 	/// bound expressions retain it until their assumptions are available.
 	pub(super) fn project_assoc_type(
@@ -504,15 +631,16 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// Resolve the trait declaration named by the first segment of a
-	/// qualified type path. Later segments use ordinary type-member lookup.
-	pub(super) fn resolve_trait_qualified_assoc_type(
+	/// qualified type path: an associated type or a function. Later segments
+	/// use ordinary type-member lookup.
+	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
-	) -> Result<AssocTypeProjectionTarget, ()> {
+	) -> Result<MemberKind, ()> {
 		if receiver == TypeIndex::ERROR {
 			return Err(());
 		}
@@ -522,20 +650,11 @@ impl TypeContext<'_, '_, '_> {
 			name,
 			file_id,
 		)?;
-		let MemberKind::AssociatedType(assoc_type_index) = kind else {
-			self.diagnostics.push(report_not_an_associated_type(
-				file_id,
-				self.strings,
-				name,
-				self.defs.traits[usize::from(required_trait)].name.inner,
-			));
-			return Err(());
-		};
 		self.resolutions.by_site.insert(
 			(SourceSpan::new(file_id, name.span), Tier::Type),
 			Referent::Member(kind),
 		);
-		// Naming the projection does not need an impl; whether `receiver`
+		// Naming the member does not need an impl; whether `receiver`
 		// implements the trait is the declaration check's question.
 		self.register_obligation(Obligation::CheckTraitMembership {
 			assumption_context,
@@ -543,10 +662,7 @@ impl TypeContext<'_, '_, '_> {
 			required: required_trait,
 			reference: SourceSpan::new(file_id, name.span),
 		});
-		Ok(AssocTypeProjectionTarget {
-			trait_index: required_trait,
-			assoc_type_index,
-		})
+		Ok(kind)
 	}
 
 	pub(super) fn resolve_trait_qualified_value(
