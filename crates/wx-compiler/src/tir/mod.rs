@@ -1187,7 +1187,7 @@ mod types;
 // /// is what lets `get_symbol_location` produce a declaration span for a name
 // /// whose signature hasn't been computed yet. A leaf that bound a name
 // /// without a stub would be a `Pending` with nothing behind it, and the
-// /// duplicate-definition diagnostic for `use a::foo;` alongside `fn foo`
+// /// duplicate-definition diagnostic for `use a::foo;` alongside `func foo`
 // /// would panic on the missing key rather than report.
 // #[cfg_attr(debug_assertions, derive(Debug))]
 // #[cfg_attr(test, derive(serde::Serialize))]
@@ -3425,7 +3425,7 @@ mod types;
 // 	}
 
 // 	/// The value an *abstract* `ty` declares for `trait_index::assoc_name` in
-// 	/// its own bounds — `fn g<U: Has where { Item = bool }>` says `U::Item` is
+// 	/// its own bounds — `func g<U: Has where { Item = bool }>` says `U::Item` is
 // 	/// `bool` for the whole of `g`, with no impl involved.
 // 	///
 // 	/// This is the counterpart to reading the value off a concrete impl. A

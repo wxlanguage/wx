@@ -14,7 +14,7 @@ export const wxLanguageExtensionConfig: monaco.languages.ILanguageExtensionPoint
 /** Minimal syntax highlighting for WX — enough to be readable, not a full grammar. */
 export const wxMonarchLanguage: monaco.languages.IMonarchLanguage = {
 	keywords: [
-		"fn",
+		"func",
 		"local",
 		"mut",
 		"if",

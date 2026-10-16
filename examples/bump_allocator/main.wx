@@ -24,7 +24,7 @@ global mut bump: heap::*u8 = 4 as heap::*u8;
 
 // ── core allocator ────────────────────────────────────────────────────────────
 // Allocates space for one T, respecting its alignment.
-pub fn alloc<T>() -> heap::*T {
+pub func alloc<T>() -> heap::*T {
     local align = align_of::<T, heap>();
     local ptr = ptr::align_up::<heap>(bump as u32, align);
     local new_end = ptr + size_of::<T, heap>();
@@ -37,11 +37,11 @@ pub fn alloc<T>() -> heap::*T {
     ptr as heap::*T
 }
 
-pub fn reset() {
+pub func reset() {
     bump = 4 as heap::*u8
 }
 
-pub fn bytes_used() -> u32 {
+pub func bytes_used() -> u32 {
     bump as u32
 }
 
@@ -51,7 +51,7 @@ struct Node(
 );
 
 impl Node {
-    pub fn new(value: i32, next: &Node) -> &Node {
+    pub func new(value: i32, next: &Node) -> &Node {
         local n = alloc::<Node>();
         n.* = Node({ value: value, next: next });
         n
@@ -60,7 +60,7 @@ impl Node {
 
 // ── demo entry point ──────────────────────────────────────────────────────────
 // Builds the list  3 → 2 → 1  and returns the sum of all node values.
-pub fn demo() -> i32 {
+pub func demo() -> i32 {
     local n1 = Node::new(1, ptr::null());
     local n2 = Node::new(2, n1);
     local n3 = Node::new(3, n2);

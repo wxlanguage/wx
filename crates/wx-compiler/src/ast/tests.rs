@@ -126,7 +126,7 @@ impl TestCase {
 /// Parses `expression` as the whole body of a function and renders its shape.
 /// See [`TestCase::shape`].
 fn shape_of(expression: &str) -> String {
-	let case = TestCase::new(&format!("fn f() {{ {expression} }}"));
+	let case = TestCase::new(&format!("func f() {{ {expression} }}"));
 	case.diagnostics().assert_none();
 	case.shape(statement_expression(case.function_block(0), 0))
 }
@@ -218,7 +218,7 @@ fn local_definition_pattern(
 #[test]
 fn test_top_level_items() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 {
+        func add(a: i32, b: i32) -> i32 {
             a + b
         }
 
@@ -232,7 +232,7 @@ fn test_top_level_items() {
         );
 
         import \"env\" as env {
-            fn log(message: string)
+            func log(message: string)
         }
 
         enum Color {
@@ -279,7 +279,7 @@ fn test_enum_repr_after_name() {
 fn test_function_mut_param() {
 	// mut on a parameter; mut local with compound assignment
 	let case = TestCase::new(indoc! {"
-        fn sum_down(mut n: i32) -> i32 {
+        func sum_down(mut n: i32) -> i32 {
             local mut acc: i32 = 0;
             acc += n;
             acc
@@ -307,9 +307,9 @@ fn test_function_mut_param() {
 
 #[test]
 fn test_fn_pointer_param() {
-	// fn(…) -> … as a parameter type
+	// func(…) -> … as a parameter type
 	let case = TestCase::new(indoc! {"
-        fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+        func apply(f: func(i32) -> i32, x: i32) -> i32 {
             f(x)
         }
     "});
@@ -372,7 +372,7 @@ fn test_impl() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
             #[inline]
-            pub fn double(self) -> i32 {
+            pub func double(self) -> i32 {
                 self * 2
             }
         }
@@ -393,7 +393,7 @@ fn test_impl() {
 		panic!("expected a method")
 	};
 	assert_eq!(case.name(signature.name.inner), "double");
-	assert!(pub_span.is_some(), "`pub fn` should record a pub span");
+	assert!(pub_span.is_some(), "`pub func` should record a pub span");
 	assert_eq!(attributes.len(), 1);
 	assert_eq!(case.name(attributes[0].name.inner), "inline");
 }
@@ -403,7 +403,7 @@ fn test_impl_trait_for_type() {
 	// impl Trait for Type — trait implementation block
 	let case = TestCase::new(indoc! {"
         impl Drawable for Point {
-            fn draw(self) {
+            func draw(self) {
                 draw_point(self.x, self.y)
             }
         }
@@ -456,10 +456,10 @@ fn test_trait_items() {
         trait Widget: Drawable + Sized {
             const SIZE: u32;
 
-            fn render(self);
+            func render(self);
 
             #[inline]
-            fn grow(self, delta: u32) -> u32 {
+            func grow(self, delta: u32) -> u32 {
                 delta
             }
         }
@@ -495,7 +495,7 @@ fn test_trait_items() {
 		panic!("expected a trait method")
 	};
 	assert_eq!(case.name(signature.name.inner), "render");
-	assert!(body.is_none(), "`fn render(self);` has no default body");
+	assert!(body.is_none(), "`func render(self);` has no default body");
 
 	let TraitItem::Function {
 		signature,
@@ -517,7 +517,7 @@ fn test_pub_not_permitted_in_trait_items() {
         trait Widget {
             pub const SIZE: u32;
             pub type Assoc;
-            pub fn render(self);
+            pub func render(self);
         }
     "});
 
@@ -541,11 +541,11 @@ fn test_pub_not_permitted_in_trait_impl_items() {
         impl Widget for Button {
             pub const SIZE: u32 = 1;
             pub type Assoc = u32;
-            pub fn render(self) {}
+            pub func render(self) {}
         }
 
         impl Button {
-            pub fn area(self) -> u32 { 1 }
+            pub func area(self) -> u32 { 1 }
         }
     "});
 
@@ -583,7 +583,7 @@ fn test_pub_on_impl_assoc_type_is_recorded() {
 fn test_pub_not_applicable_to_memory_item_recovers() {
 	let case = TestCase::new(indoc! {"
         pub memory MEM: u32;
-        fn add(a: i32, b: i32) -> i32 { a + b }
+        func add(a: i32, b: i32) -> i32 { a + b }
     "});
 
 	case.diagnostics()
@@ -639,7 +639,7 @@ fn test_use_tree_forms() {
 #[test]
 fn test_export_alias() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
+        func add(a: i32, b: i32) -> i32 { a + b }
         export { add as \"wasm_add\" }
     "});
 	case.diagnostics().assert_none();
@@ -667,7 +667,7 @@ fn single_exports_preserve_raw_aliases_and_use_item_separators() {
         export foo as \"line\\n\"
         export foo as \"line\\n\";
 
-        fn foo() {
+        func foo() {
         }
     "};
 	let case = TestCase::new(source);
@@ -707,7 +707,7 @@ fn single_exports_preserve_raw_aliases_and_use_item_separators() {
 fn test_literals() {
 	// float, char, and string literals (int is covered everywhere else)
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local a = 2.75;
             local b = 'z';
             local c = \"hello\";
@@ -734,7 +734,7 @@ fn test_literals() {
 #[test]
 fn test_if_else() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             if x > 0 {
                 1
             } else {
@@ -762,7 +762,7 @@ fn test_if_else() {
 #[test]
 fn test_match_int_literal_patterns() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             match x {
                 0 -> { 0 },
                 1 -> { 1 },
@@ -805,7 +805,7 @@ fn test_match_enum_variant_patterns() {
             StdErr,
         }
 
-        fn name(fd: FileDescriptor) -> u8 {
+        func name(fd: FileDescriptor) -> u8 {
             match fd {
                 FileDescriptor::StdIn -> { 0 },
                 FileDescriptor::StdOut -> { 1 },
@@ -848,7 +848,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
 	// specific to `match` — which cascades into a second diagnostic
 	// (E0009) while re-syncing at the enclosing item boundary.
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             match x {
                 0 { 1 },
                 _ -> { 0 },
@@ -865,7 +865,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
 fn test_loop_break_label() {
 	// labeled loop, break with label and a value, continue
 	let case = TestCase::new(indoc! {"
-        fn first_positive(mut n: i32) -> i32 {
+        func first_positive(mut n: i32) -> i32 {
             result: loop {
                 if n > 0 {
                     break :result n;
@@ -920,7 +920,7 @@ fn test_loop_break_label() {
 #[test]
 fn test_label_requires_block_like_expression() {
 	let case = TestCase::new(indoc! {"
-        fn f(value: i32) {
+        func f(value: i32) {
             target: value
         }
     "});
@@ -937,7 +937,7 @@ fn test_multi_segment_label_reports_diagnostic_instead_of_panicking() {
 	// followed by a colon, which used to hit `unreachable!()` in
 	// `parse_labelled_expression`.
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             std::io:
         }
     "});
@@ -967,7 +967,7 @@ fn test_named_call() {
 	// explicit names, shorthand ({ x } == { x: x }), an empty named list, and
 	// a struct constructed by position
 	let case = TestCase::new(indoc! {"
-        fn make(x: i32, y: i32) {
+        func make(x: i32, y: i32) {
             local full  = Point({ x: x, y: y });
             local short = Point({ x, y });
             local empty = f({});
@@ -1006,7 +1006,7 @@ fn test_named_call() {
 #[test]
 fn test_named_method_call_and_turbofish() {
 	let case = TestCase::new(indoc! {"
-        fn make(x: f32, y: f32, o: Obj) {
+        func make(x: f32, y: f32, o: Obj) {
             local p = Point::<f32>({ x: x, y: y });
             o.move_to({ x, y });
         }
@@ -1030,9 +1030,9 @@ fn test_named_method_call_and_turbofish() {
 #[test]
 fn named_and_positional_arguments_do_not_mix() {
 	for source in [
-		"fn f() { g({ a: 1 }, 2); }",
-		"fn f() { g(1, { a: 2 }); }",
-		"fn f() { o.m(1, { a: 2 }); }",
+		"func f() { g({ a: 1 }, 2); }",
+		"func f() { g(1, { a: 2 }); }",
+		"func f() { o.m(1, { a: 2 }); }",
 	] {
 		let case = TestCase::new(source);
 		case.diagnostics()
@@ -1043,7 +1043,7 @@ fn named_and_positional_arguments_do_not_mix() {
 #[test]
 fn a_plain_block_is_written_with_its_keyword() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local x = block { 1 };
             block { x; }
             outer: block { break :outer; }
@@ -1066,7 +1066,7 @@ fn a_plain_block_is_written_with_its_keyword() {
 	));
 
 	// Without the keyword, `{` is reported and still read as a block.
-	let case = TestCase::new("fn f() { local x = { 1 }; }");
+	let case = TestCase::new("func f() { local x = { 1 }; }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::BlockNeedsKeyword]);
 	assert!(matches!(
@@ -1079,7 +1079,7 @@ fn a_plain_block_is_written_with_its_keyword() {
 fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 };
-        fn f(p: Point) {
+        func f(p: Point) {
             local q = Point::{ x: 1, y: 2 };
             local Point::{ x, .. } = p;
         }
@@ -1103,7 +1103,7 @@ fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
 fn struct_fields_have_optional_names() {
 	let case = TestCase::new(indoc! {"
         struct Named(pub x: i32, y: Vec<T>);
-        struct Positional(i32, pub heap::*u8, fn(i32) -> i32, Self, _);
+        struct Positional(i32, pub heap::*u8, func(i32) -> i32, Self, _);
         struct Mixed(pub id: u32, math::Number);
         struct Unit();
     "});
@@ -1134,7 +1134,7 @@ fn struct_fields_have_optional_names() {
 #[test]
 fn test_grouping_and_tuple_expressions() {
 	let case = TestCase::new(indoc! {"
-        fn shapes(x: i32, y: i32) {
+        func shapes(x: i32, y: i32) {
             local grouped = (x);
             local single = (x,);
             local pair = (x, y);
@@ -1161,7 +1161,7 @@ fn test_grouping_and_tuple_expressions() {
 fn test_call_field_namespace() {
 	// function call, field access, namespace access, unary ops
 	let case = TestCase::new(indoc! {"
-        fn ops(x: i32, p: Point) -> i32 {
+        func ops(x: i32, p: Point) -> i32 {
             local neg   = -x;
             local inv   = ^x;
             local field = p.x;
@@ -1211,7 +1211,7 @@ fn test_call_field_namespace() {
 #[test]
 fn test_operator_precedence() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: i32, b: i32, c: i32) -> i32 {
+        func f(a: i32, b: i32, c: i32) -> i32 {
             a + b * c
         }
     "});
@@ -1239,7 +1239,7 @@ fn test_operator_precedence() {
 #[test]
 fn test_left_associativity() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: i32, b: i32, c: i32) -> i32 {
+        func f(a: i32, b: i32, c: i32) -> i32 {
             a - b - c
         }
     "});
@@ -1269,8 +1269,8 @@ fn test_left_associativity() {
 #[test]
 fn test_cast_precedence() {
 	let case = TestCase::new(indoc! {"
-        fn arith(a: i32, b: i32) -> i32 { a + b as i32 }
-        fn unary(x: i32) -> i32 { -x as i32 }
+        func arith(a: i32, b: i32) -> i32 { a + b as i32 }
+        func unary(x: i32) -> i32 { -x as i32 }
     "});
 
 	let arithmetic = case.function_block(0);
@@ -1299,7 +1299,7 @@ fn test_chained_member_access() {
 	// member access is left-associative: p.x.y  =>  (p.x).y
 	// a call result can be immediately accessed:  p.foo().z  =>  (p.foo()).z
 	let case = TestCase::new(indoc! {"
-        fn f(p: Point) {
+        func f(p: Point) {
             local a = p.x.y;
             local b = p.foo().z;
         }
@@ -1334,7 +1334,7 @@ fn test_chained_member_access() {
 fn test_address_of() {
 	// ptr.*.& — address-of; value is Deref. Always produces a shared reference.
 	let case = TestCase::new(indoc! {"
-        fn f(ptr: &i32) {
+        func f(ptr: &i32) {
             local a = ptr.*.&;
         }
     "});
@@ -1354,7 +1354,7 @@ fn test_address_of() {
 fn test_address_of_through_field() {
 	// ptr.*.field.& — address-of a field: AddressOf > ObjectAccess > Deref
 	let case = TestCase::new(indoc! {"
-        fn f(ptr: &Point) {
+        func f(ptr: &Point) {
             local a = ptr.*.x.&;
         }
     "});
@@ -1376,7 +1376,7 @@ fn test_address_of_through_field() {
 #[test]
 fn test_numeric_literal_forms() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local hex    = 0xFF;
             local binary = 0b1010;
             local sep    = 1_000_000;
@@ -1402,7 +1402,7 @@ fn test_numeric_literal_forms() {
 #[test]
 fn test_scientific_notation_float_literals() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local plain  = 1e10;
             local dot    = 3.4e2;
             local plus   = 1e+5;
@@ -1444,7 +1444,7 @@ fn test_scientific_notation_literal_at_end_of_input_is_float() {
 #[test]
 fn test_pattern_simple_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f(v: i32) {
+        func f(v: i32) {
             local x = v;
             local mut y = v;
             local _ = v;
@@ -1470,7 +1470,7 @@ fn test_pattern_simple_binding() {
 #[test]
 fn test_pattern_tuple_destructuring() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) {
+        func f(pair: (i32, i32)) {
             local (a, b) = pair;
             local (mut c, _) = pair;
             local (x, (y, z)) = pair;
@@ -1513,7 +1513,7 @@ fn test_pattern_tuple_destructuring() {
 #[test]
 fn test_pattern_struct_destructuring() {
 	let case = TestCase::new(indoc! {"
-        fn f(p: Point) {
+        func f(p: Point) {
             local Point({ x, y }) = p;
             local Point({ x: a, y: b }) = p;
             local geom::Point({ x, .. }) = p;
@@ -1584,7 +1584,7 @@ fn struct_pattern_fields(
 #[test]
 fn test_pattern_with_type_annotation() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) {
+        func f(pair: (i32, i32)) {
             local (a, b): (i32, i32) = pair;
         }
     "});
@@ -1604,7 +1604,7 @@ fn test_pattern_with_type_annotation() {
 #[test]
 fn test_missing_semicolon_warns_but_parses() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             local y: i32 = x
             y
         }
@@ -1618,7 +1618,7 @@ fn test_missing_semicolon_warns_but_parses() {
 #[test]
 fn test_unclosed_delimiter() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local x: i32 = 1;
     "});
 
@@ -1630,7 +1630,7 @@ fn test_unclosed_delimiter() {
 #[test]
 fn test_invalid_function_param_type_reports_parse_error() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: =) {}
+        func f(x: =) {}
     "});
 
 	case.diagnostics()
@@ -1640,7 +1640,7 @@ fn test_invalid_function_param_type_reports_parse_error() {
 #[test]
 fn test_invalid_integer_literal() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             99999999999999999999
         }
     "});
@@ -1659,7 +1659,7 @@ fn test_invalid_float_literal_empty_exponent() {
 	// than backtracking to split off `e`/`e+` as a separate identifier —
 	// see the comment on `Lexer::consume_number`'s exponent handling.
 	let case = TestCase::new(indoc! {"
-        fn f() -> f32 {
+        func f() -> f32 {
             1e
         }
     "});
@@ -1675,8 +1675,8 @@ fn test_invalid_float_literal_empty_exponent() {
 #[test]
 fn test_incomplete_expression() {
 	let case = TestCase::new(indoc! {"
-        fn binary() -> i32 { 1 + }
-        fn unary()  -> i32 { -   }
+        func binary() -> i32 { 1 + }
+        func unary()  -> i32 { -   }
     "});
 
 	case.diagnostics().assert_codes(&[
@@ -1690,8 +1690,8 @@ fn test_incomplete_expression() {
 #[test]
 fn test_reserved_identifier() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
-            local fn = 1;
+        func f() {
+            local func = 1;
         }
     "});
 
@@ -1704,9 +1704,9 @@ fn test_reserved_identifier() {
 fn test_invalid_attribute_and_namespace_diagnostics() {
 	let case = TestCase::new(indoc! {"
         #[123]
-        fn attr() {}
+        func attr() {}
 
-        fn namespace_error(x: i32, y: i32) {
+        func namespace_error(x: i32, y: i32) {
             (x + y)::value
         }
     "});
@@ -1723,7 +1723,7 @@ fn test_invalid_attribute_and_namespace_diagnostics() {
 #[test]
 fn test_missing_initializer() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local x: i32
         }
         global y: i32
@@ -1762,7 +1762,7 @@ fn test_missing_comma_between_struct_fields_warns_but_parses() {
 fn test_module_pub_items_and_associated_types() {
 	let case = TestCase::new(indoc! {"
         pub mod math {
-            pub fn zero() -> i32 {
+            pub func zero() -> i32 {
                 0
             }
         }
@@ -1773,13 +1773,13 @@ fn test_module_pub_items_and_associated_types() {
 
         pub trait Iterator {
             type Item: Show + Clone;
-            fn next(self) -> Self::Item;
+            func next(self) -> Self::Item;
         }
 
         impl Iterator for Range {
             type Item = i32;
 
-            fn next(self) -> Self::Item {
+            func next(self) -> Self::Item {
                 0
             }
         }
@@ -1854,7 +1854,7 @@ fn test_external_module_item() {
 #[test]
 fn test_chained_comparison_error() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: i32, b: i32, c: i32) -> bool {
+        func f(a: i32, b: i32, c: i32) -> bool {
             a < b < c
         }
     "});
@@ -1884,7 +1884,7 @@ fn test_chained_comparison_error() {
 #[test]
 fn test_generic_signatures() {
 	let case = TestCase::new(indoc! {"
-        fn zip<T, U: Show + Clone, V: Scalable>(left: T, middle: U, right: V) -> U {
+        func zip<T, U: Show + Clone, V: Scalable>(left: T, middle: U, right: V) -> U {
             middle
         }
     "});
@@ -1957,7 +1957,7 @@ fn test_generic_struct_with_bounds() {
 fn test_import_alias_and_entry_kinds() {
 	let case = TestCase::new(indoc! {"
         import \"env\" as host {
-            fn log(message: string);
+            func log(message: string);
             global mut counter: i32;
             memory MEM: u32;
         }
@@ -1993,7 +1993,7 @@ fn test_import_alias_and_entry_kinds() {
 #[test]
 fn test_turbofish_call() {
 	let case = TestCase::new(indoc! {"
-        fn main() {
+        func main() {
             identity::<i32>(42)
         }
     "});
@@ -2018,7 +2018,7 @@ fn test_turbofish_call() {
 #[test]
 fn test_turbofish_method_call() {
 	let case = TestCase::new(indoc! {"
-        fn main(obj: Foo) {
+        func main(obj: Foo) {
             obj.transform::<i32>()
         }
     "});
@@ -2042,7 +2042,7 @@ fn test_generic_application_type_args() {
             first: T,
             second: U,
         );
-        fn make(x: Pair<i32, f64>) {}
+        func make(x: Pair<i32, f64>) {}
     "});
 	case.diagnostics().assert_none();
 	let Item::Function { signature, .. } = case.item(1) else {
@@ -2062,7 +2062,7 @@ fn test_generic_application_type_args() {
 #[test]
 fn test_path_continues_after_a_segment_with_type_args() {
 	let case = TestCase::new(indoc! {"
-        fn make(x: Vec<i32>::Item) {}
+        func make(x: Vec<i32>::Item) {}
     "});
 	case.diagnostics().assert_none();
 	let Item::Function { signature, .. } = case.item(0) else {
@@ -2085,9 +2085,9 @@ fn test_double_right_arrow_split() {
 	// instead of two separate `>` tokens. Test across type expressions,
 	// bare generics in a bound, and turbofish in an expression.
 	let case = TestCase::new(indoc! {"
-        fn type_expr(x: Outer<Inner<u32>>) {}
-        fn bound_generic<T: Wrapper<Inner<u32>>>(t: T) {}
-        fn method_turbofish(obj: Foo) { obj.transform::<Vec<u32>>() }
+        func type_expr(x: Outer<Inner<u32>>) {}
+        func bound_generic<T: Wrapper<Inner<u32>>>(t: T) {}
+        func method_turbofish(obj: Foo) { obj.transform::<Vec<u32>>() }
     "});
 	case.diagnostics().assert_none();
 }
@@ -2095,7 +2095,7 @@ fn test_double_right_arrow_split() {
 #[test]
 fn test_where_binding_parses_as_bound_with_bindings() {
 	let case = TestCase::new(indoc! {"
-        fn f<T: Memory where { Size = u32 }>(t: T) {}
+        func f<T: Memory where { Size = u32 }>(t: T) {}
     "});
 	case.diagnostics().assert_none();
 	let Item::Function { signature, .. } = case.item(0) else {
@@ -2117,7 +2117,7 @@ fn test_impl_trait_multi_segment_trait_name() {
 	// `impl gfx::Drawable for Point` — trait_name must be two path segments.
 	let case = TestCase::new(indoc! {"
         impl gfx::Drawable for Point {
-            fn draw(self) {}
+            func draw(self) {}
         }
     "});
 	case.diagnostics().assert_none();
@@ -2288,7 +2288,7 @@ fn test_unary_binds_tighter_than_any_binary_operator() {
 #[test]
 fn test_index_and_array_literal_expressions() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: &[i32]) {
+        func f(a: &[i32]) {
             local list   = [1, 2, 3];
             local repeat = [0; 8];
             local single = a[0];
@@ -2323,7 +2323,7 @@ fn test_index_and_array_literal_expressions() {
 #[test]
 fn test_slice_range_bounds_are_independently_optional() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: &[i32]) {
+        func f(a: &[i32]) {
             local both = a[1..3];
             local from = a[1..];
             local to   = a[..3];
@@ -2354,11 +2354,11 @@ fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 	// The two forms differ only in whether a trait disambiguates the item, so
 	// that is the thing worth pinning.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             <Point as Show>::render()
         }
 
-        fn g() -> i32 {
+        func g() -> i32 {
             <Point>::origin()
         }
     "});
@@ -2389,7 +2389,7 @@ fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 #[test]
 fn test_qualified_and_grouped_paths_in_type_position() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: <Point as Show>::Out, b: <Point>::Out) {}
+        func f(a: <Point as Show>::Out, b: <Point>::Out) {}
     "});
 	case.diagnostics().assert_none();
 
@@ -2420,7 +2420,7 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 	// `<<` is one token to the lexer, but here it is two openings; the parser
 	// splits it, as it splits `>>` where generic lists close together.
 	let case = TestCase::new(indoc! {"
-        fn f(a: <<Point as Show>::Out as Draw>::Frame, b: < <Point as Show>::Out as Draw>::Frame) {}
+        func f(a: <<Point as Show>::Out as Draw>::Frame, b: < <Point as Show>::Out as Draw>::Frame) {}
     "});
 	case.diagnostics().assert_none();
 
@@ -2452,7 +2452,7 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 #[test]
 fn test_keyword_expressions() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> bool {
+        func f() -> bool {
             local t = true;
             local u = false;
             local v = unreachable;
@@ -2485,7 +2485,7 @@ fn test_keyword_expressions() {
 
 #[test]
 fn test_bare_return_has_no_value() {
-	let case = TestCase::new("fn f() { return; }");
+	let case = TestCase::new("func f() { return; }");
 	case.diagnostics().assert_none();
 	let Expression::Return { value } =
 		statement_expression(case.function_block(0), 0)
@@ -2500,7 +2500,7 @@ fn test_turbofish_on_a_non_path_expression_is_a_type_application() {
 	// A turbofish on a plain path attaches to the segment (see
 	// `test_turbofish_call`); on anything else it becomes its own node.
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local a = (g)::<i32>;
         }
     "});
@@ -2516,9 +2516,25 @@ fn test_turbofish_on_a_non_path_expression_is_a_type_application() {
 // ── remaining type expressions ───────────────────────────────────────────────
 
 #[test]
+fn test_never_type() {
+	let case = TestCase::new("func f(a: !) -> ! {}");
+	case.diagnostics().assert_none();
+	let signature = case.function_signature(0);
+	let param = signature.params[0]
+		.inner
+		.inner
+		.ty
+		.as_ref()
+		.expect("annotated");
+	assert!(matches!(param.inner, TypeExpression::Never));
+	let result = signature.result.as_ref().expect("a result type");
+	assert!(matches!(result.inner, TypeExpression::Never));
+}
+
+#[test]
 fn test_infer_and_memory_tagged_types() {
 	let case = TestCase::new(indoc! {"
-        fn f(p: heap::*u8, s: heap::&[i32]) {
+        func f(p: heap::*u8, s: heap::&[i32]) {
             local a: _ = 1;
         }
     "});
@@ -2584,7 +2600,7 @@ fn test_type_alias_item() {
 fn test_imported_function_is_a_declaration_without_a_body() {
 	let case = TestCase::new(indoc! {"
         import \"env\" as env {
-            fn log(x: i32)
+            func log(x: i32)
         }
     "});
 	case.diagnostics().assert_none();
@@ -2603,14 +2619,14 @@ fn test_imported_function_is_a_declaration_without_a_body() {
 
 #[test]
 fn test_bodyless_function_is_a_declaration() {
-	// A `fn` with no block is an `Item::FunctionDeclaration` rather than an
+	// A `func` with no block is an `Item::FunctionDeclaration` rather than an
 	// `Item::Function` with an empty body — that split is what lets
 	// `#[intrinsic]` and imported functions carry a signature and nothing else.
 	let case = TestCase::new(indoc! {"
         #[intrinsic]
-        fn raw_load(address: u32) -> i32;
+        func raw_load(address: u32) -> i32;
 
-        fn real() -> i32 { 1 }
+        func real() -> i32 { 1 }
     "});
 	case.diagnostics().assert_none();
 
@@ -2679,7 +2695,7 @@ fn test_attribute_with_arguments() {
 
 #[test]
 fn test_local_without_initializer_reports() {
-	let case = TestCase::new("fn f() { local x: i32; }");
+	let case = TestCase::new("func f() { local x: i32; }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::MissingInitializer]);
 }
@@ -2687,7 +2703,7 @@ fn test_local_without_initializer_reports() {
 #[test]
 fn test_path_in_pattern_position_reports() {
 	// A path is only a pattern as a struct pattern, `Path::{ .. }`.
-	let case = TestCase::new("fn f() { local Foo::Bar = 1; }");
+	let case = TestCase::new("func f() { local Foo::Bar = 1; }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::InvalidBindingPattern]);
 }
@@ -2702,7 +2718,7 @@ fn test_unknown_token_reports() {
 	// Listed parse-error-first only because unknown tokens are appended once
 	// lexing is done; nothing reads diagnostics positionally, so the order
 	// here records what happens rather than anything that must hold.
-	let case = TestCase::new("fn f() -> i32 { 1 @ 2 }");
+	let case = TestCase::new("func f() -> i32 { 1 @ 2 }");
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::MissingSeparator,
 		DiagnosticCode::UnknownToken,
@@ -2713,12 +2729,12 @@ fn test_unknown_token_reports() {
 fn test_a_run_of_unknown_characters_reports_once() {
 	// Adjacent unknown characters coalesce into one run, so `@@@` is one
 	// diagnostic rather than three...
-	let case = TestCase::new("fn f() { @@@ }");
+	let case = TestCase::new("func f() { @@@ }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnknownToken]);
 
 	// ...while separate runs stay separate.
-	let case = TestCase::new("fn f() { @ } fn g() { $ }");
+	let case = TestCase::new("func f() { @ } func g() { $ }");
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::UnknownToken,
 		DiagnosticCode::UnknownToken,
@@ -2732,9 +2748,9 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 	// at whatever token happened to follow the unknown one.
 	for source in [
 		"@",
-		"fn f() {} @",
-		"fn f() -> i32 { 1 + @ 2 }",
-		"fn f() -> i32 { g(@) }",
+		"func f() {} @",
+		"func f() -> i32 { 1 + @ 2 }",
+		"func f() -> i32 { g(@) }",
 	] {
 		let case = TestCase::new(source);
 		case.diagnostics()
@@ -2747,12 +2763,12 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let source = indoc! {"
         #[tag = \"line\\nslash\\\\n\"]
         #[other(value = \"line\\nslash\\\\n\")]
-        fn f() {
+        func f() {
             local text = \"line\\nslash\\\\n\";
         }
 
         import \"line\\nslash\\\\n\" as host {
-            fn imported();
+            func imported();
         }
 
         export {
@@ -2800,13 +2816,13 @@ fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let source = indoc! {"
         #[tag = \"\\o\"]
         #[other(value = \"\\o\")]
-        fn f() {
+        func f() {
             local bad = \"\\o\";
             local good = \"ok\";
         }
 
         import \"\\o\" as host {
-            fn imported();
+            func imported();
         }
 
         export {
@@ -2814,7 +2830,7 @@ fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
             f as \"valid\",
         }
 
-        fn after() {}
+        func after() {}
     "};
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();

@@ -478,7 +478,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// only a block's own signature fills, and through `members`, which only
 	/// each member's signature fills. Nothing can demand it, so an impl the
 	/// sweep reaches late is an impl that every earlier lookup silently
-	/// failed to see — which is why `fn f(v: S::X)` used to resolve only when
+	/// failed to see — which is why `func f(v: S::X)` used to resolve only when
 	/// `impl Tr for S` happened to precede it in the file.
 	///
 	/// Headers only, deliberately. Forcing the members here too would resolve

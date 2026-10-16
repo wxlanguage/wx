@@ -34,7 +34,7 @@
 //! The raw resolver does not emit diagnostics. Rustc splits privacy-checking off
 //! into a wholly separate later pass over already-resolved paths — I
 //! compiled a private-module test case (`mod a { mod b { pub struct C; } }
-//! fn f() -> a::b::C`) and rustc reports the error against `b` — "module
+//! func f() -> a::b::C`) and rustc reports the error against `b` — "module
 //! `b` is private" — even though the terminal `C` is `pub`, which only
 //! makes sense if resolution finds every segment's identity regardless of
 //! visibility and something else decides afterward which hop was illegal.
@@ -293,13 +293,19 @@ impl<'r> PathResolver<'r> {
 	/// Walks `segments`, diagnosing only what's *always* an error
 	/// regardless of caller:
 	/// - `NotFound` / `Ambiguous` — nothing real to hand back.
-	/// - A hop that resolved to something real but isn't visible to
-	///   `accessor` — reported, but *not* turned into `Error`: matching
-	///   rustc (verified empirically — a privacy violation doesn't stop
-	///   type-checking from also reporting its own, unrelated errors on the
-	///   same resolved item), the real target is still returned, so a
+	/// - A hop before the last that resolved to something real but isn't
+	///   visible to `accessor` — reported, but *not* turned into `Error`:
+	///   matching rustc (verified empirically — a privacy violation doesn't
+	///   stop type-checking from also reporting its own, unrelated errors on
+	///   the same resolved item), the real target is still returned, so a
 	///   caller building on top of it doesn't get a spurious cascade on top
 	///   of the privacy diagnostic.
+	///
+	/// The last segment's own visibility is not reported here: an item not
+	/// visible to `accessor`, whether named directly or through an import
+	/// that could not make it so, comes back `BindingTarget::Inaccessible`,
+	/// and the caller reports it, as only the caller knows what the item is
+	/// used for ([`Self::resolve_definition`] is the plain report).
 	///
 	/// Stopping before the last segment is deliberately left undiagnosed —
 	/// whether that's fine depends entirely on what the caller does next,
@@ -342,20 +348,27 @@ impl<'r> PathResolver<'r> {
 		}
 		let target = match &resolution.stopped_with {
 			BindingLookup::Found { target, .. } => {
-				let target = *target;
-				if let Some((bad, def_key)) = resolution.first_inaccessible {
-					self.diagnostics.push(report_private_identifier(
-						&self.defs.namespaces,
-						self.strings,
-						segments[bad as usize].ident.inner,
-						SourceSpan::new(
-							file_id,
-							segments[bad as usize].ident.span,
-						),
-						Some(def_key),
-					));
+				match resolution.first_inaccessible {
+					// The named item itself is not visible here: the caller, which
+					// knows what it is used for, reports it.
+					Some((bad, def_key)) if is_last && bad == stopped_at => {
+						BindingTarget::Inaccessible(def_key)
+					}
+					Some((bad, def_key)) => {
+						self.diagnostics.push(report_private_identifier(
+							&self.defs.namespaces,
+							self.strings,
+							segments[bad as usize].ident.inner,
+							SourceSpan::new(
+								file_id,
+								segments[bad as usize].ident.span,
+							),
+							Some(def_key),
+						));
+						*target
+					}
+					None => *target,
 				}
-				target
 			}
 			BindingLookup::NotFound => {
 				self.diagnostics.push(report_not_found(
@@ -414,6 +427,32 @@ impl<'r> PathResolver<'r> {
 			));
 		}
 		BindingTarget::Error
+	}
+
+	/// [`Self::resolve_path`] for a caller that only needs the definition and
+	/// has nothing more specific to say about its privacy: an item not
+	/// visible here is reported plainly and still answered, so nothing built
+	/// on it reports again. `Err` when the path names nothing, already
+	/// reported.
+	pub(super) fn resolve_definition(
+		&mut self,
+		file_id: FileId,
+		accessor: Scope,
+		segments: &[PathSegment],
+		tier: Tier,
+	) -> Result<DefKey, ()> {
+		let target = self.resolve_path(file_id, accessor, segments, tier);
+		if let BindingTarget::Inaccessible(def_key) = target {
+			let segment = segments.last().unwrap();
+			self.diagnostics.push(report_private_identifier(
+				&self.defs.namespaces,
+				self.strings,
+				segment.ident.inner,
+				SourceSpan::new(file_id, segment.ident.span),
+				Some(def_key),
+			));
+		}
+		target.def_key().ok_or(())
 	}
 }
 
@@ -681,7 +720,7 @@ mod tests {
 		let mut case = TestCase::new(indoc! {"
 			struct Outer( a: i32 );
 			mod inner {
-				fn use_it() -> i32 { 1 }
+				func use_it() -> i32 { 1 }
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -821,7 +860,7 @@ mod tests {
 				(vfs::AbsolutePath::new("/main.wx"), "mod math;".to_string()),
 				(
 					vfs::AbsolutePath::new("/math.wx"),
-					"pub fn add() -> i32 { 1 }".to_string(),
+					"pub func add() -> i32 { 1 }".to_string(),
 				),
 			]),
 		);
@@ -838,7 +877,7 @@ mod tests {
 	fn value_tier_is_only_applied_to_the_last_segment() {
 		let mut case = TestCase::new(indoc! {"
 			mod inner {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -931,7 +970,7 @@ mod tests {
 
 	#[test]
 	fn resolve_path_reports_not_found_with_the_right_tier_and_name() {
-		let source = "fn main() { DoesNotExist; }";
+		let source = "func main() { DoesNotExist; }";
 		let mut case = TestCase::new(source);
 		case.diagnostics().assert_none();
 
@@ -1008,6 +1047,41 @@ mod tests {
 	/// exercised through the diagnosing wrapper this time, confirming it
 	/// reports the private hop *and* still hands back the real, fully
 	/// resolved target rather than `Error`.
+	#[test]
+	fn a_private_last_segment_is_left_to_the_caller() {
+		let source = indoc! {"
+			mod a {
+				struct C();
+			}
+			type Alias = a::C;
+		"};
+		let mut case = TestCase::new(source);
+		let root = case.root_namespace();
+		let file_id = case.defs.namespaces.file_id(root.into());
+		let path_start = source.rfind("a::C").unwrap();
+		let segments = case.segments("a::C", Some(path_start));
+
+		// The walk answers the item inaccessible and reports nothing...
+		let result =
+			case.resolve_segments(file_id, root, Tier::Type, &segments);
+		assert!(matches!(result.target(), BindingTarget::Inaccessible(_)));
+		result.diagnostics().assert_none();
+
+		// ...and the plain caller reports it once, still with its definition.
+		let mut diagnostics = Vec::new();
+		let definition = PathResolver::new(
+			&mut diagnostics,
+			&mut NameResolutions::default(),
+			&case.graph.strings,
+			&case.defs,
+		)
+		.resolve_definition(file_id, root, &segments, Tier::Type);
+		assert!(definition.is_ok());
+		let diagnostics =
+			DiagnosticView::new("resolve", &diagnostics, &case.graph.files);
+		diagnostics.assert_codes(&[DiagnosticCode::PrivateItem]);
+	}
+
 	#[test]
 	fn resolve_path_reports_private_but_still_returns_the_real_target() {
 		let source = indoc! {"

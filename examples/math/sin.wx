@@ -20,7 +20,7 @@ use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
 /// The sine of `x`, with `x` in radians.
 ///
 /// `sin(inf)`, `sin(-inf)` and `sin(NaN)` are all NaN.
-pub fn sin(x: f64) -> f64 {
+pub func sin(x: f64) -> f64 {
     // High 32 bits of `x` with the sign cleared — see `rem_pio2` on why this stays a `u64`.
     local ix = (x.to_bits() >> 32) & 0x7fffffff;
 

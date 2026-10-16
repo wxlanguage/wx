@@ -8,19 +8,30 @@
 //!
 //! Untyped literals keep the pseudo-types `Integer`/`Float` until context
 //! gives them one (`coerce`), which rewrites the subtree in place.
+//!
+//! A struct's name is a value only to be called: calling it constructs the
+//! struct (`Construct`). It is not a function, and naming it without a call is
+//! an error.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{Body, BodyBuilder, ExprIdx, ExprKind};
-use super::defs::{ConstIdx, DefKind, MemberKind, Scope, Tier, TypesetIdx};
+use super::body::{
+	ArgOrder, Body, BodyBuilder, ExprIdx, ExprKind, ExprRange, ParamIdx,
+};
+use super::defs::{
+	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, MemberKind, Scope,
+	StructIdx, Tier, TypesetIdx,
+};
+use super::imports::report_private_identifier;
 use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::operators::{
 	Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
 };
 use super::paths::PathResolver;
+use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
 use super::signatures::TypeContext;
-use super::types::{TypeEnvIdx, TypeIndex};
+use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -165,6 +176,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				right,
 			} => self.build_binary(*operator, left, right, span),
 			ast::Expression::Path(segments) => self.build_path(segments, span),
+			ast::Expression::Call { callee, arguments } => {
+				self.build_call(callee, Arguments::Positional(arguments), span)
+			}
+			ast::Expression::NamedCall { callee, arguments } => {
+				self.build_call(callee, Arguments::Named(arguments), span)
+			}
 			ast::Expression::Error => {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
@@ -218,6 +235,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
+		let kind = key.symbol_kind(self.cx.defs);
+		// A bare struct name is an error of its own, whoever may construct it.
+		if let BindingTarget::Inaccessible(_) = walk.target
+			&& !matches!(kind, DefKind::Struct(_))
+		{
+			let segment = &segments[walk.stopped_at as usize];
+			self.cx.diagnostics.push(report_private_identifier(
+				&self.cx.defs.namespaces,
+				self.cx.strings,
+				segment.ident.inner,
+				self.source_span(segment.ident.span),
+				Some(key),
+			));
+		}
 		if !walk.is_complete(segments) {
 			return self.body.push(
 				ExprKind::Unsupported,
@@ -225,16 +256,378 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				span,
 			);
 		}
-		match key.symbol_kind(self.cx.defs) {
+		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
 				let (ty, scope) = self.cx.constant_type(const_index);
 				let ty = self.normalized(ty, scope);
 				self.body.push(ExprKind::Const(const_index), ty, span)
 			}
+			DefKind::Struct(struct_index) => {
+				let name = self.cx.defs.structs[usize::from(struct_index)].name;
+				let name = self.cx.strings.resolve(name.inner).unwrap();
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::StructUsedAsValue.code())
+						.with_message(format!(
+							"expected a value, found struct `{name}`"
+						))
+						.with_label(self.source_span(span).primary_label())
+						.with_note(format!(
+							"a struct's name is only a value when it is called: \
+							 `{name}(...)`"
+						)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
 			_ => self
 				.body
 				.push(ExprKind::Unsupported, TypeIndex::ERROR, span),
 		}
+	}
+
+	/// A call. Only the construction of a struct that is not generic is
+	/// modelled yet; a call to anything else is `Unsupported`.
+	fn build_call(
+		&mut self,
+		callee: &Spanned<ast::Expression>,
+		arguments: Arguments<'_>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let ast::Expression::Path(segments) = &callee.inner else {
+			return self.body.push(
+				ExprKind::Unsupported,
+				TypeIndex::ERROR,
+				span,
+			);
+		};
+		let walk = PathResolver::new(
+			self.cx.diagnostics,
+			self.cx.resolutions,
+			self.cx.strings,
+			self.cx.defs,
+		)
+		.walk_path(self.file_id, self.namespace, segments, Tier::Value);
+		let Some(key) = walk.target.def_key() else {
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		};
+		let kind = key.symbol_kind(self.cx.defs);
+		let (DefKind::Struct(struct_index), true) =
+			(kind, walk.is_complete(segments))
+		else {
+			if let BindingTarget::Inaccessible(_) = walk.target {
+				let segment = &segments[walk.stopped_at as usize];
+				self.cx.diagnostics.push(report_private_identifier(
+					&self.cx.defs.namespaces,
+					self.cx.strings,
+					segment.ident.inner,
+					self.source_span(segment.ident.span),
+					Some(key),
+				));
+			}
+			return self.body.push(
+				ExprKind::Unsupported,
+				TypeIndex::ERROR,
+				span,
+			);
+		};
+		let segment = segments.last().unwrap();
+		if let BindingTarget::Inaccessible(key) = walk.target {
+			let diagnostic =
+				self.report_private_constructor(struct_index, key, segment);
+			self.cx.diagnostics.push(diagnostic);
+		}
+		if self.cx.structs[usize::from(struct_index)].type_params
+			!= TypeEnvIdx::ROOT
+		{
+			return self.body.push(
+				ExprKind::Unsupported,
+				TypeIndex::ERROR,
+				span,
+			);
+		}
+		if !segment.type_args.is_empty() {
+			self.cx.diagnostics.push(report_type_arg_count_mismatch(
+				self.cx.strings,
+				self.cx.defs,
+				self.file_id,
+				segment,
+				TypeArgsTarget::Item {
+					owner: TypeEnvOwner::Struct(struct_index),
+					params: &[],
+				},
+			));
+		}
+		let (args, order) = match arguments {
+			Arguments::Positional(arguments) => {
+				let args =
+					self.positional_fields(struct_index, arguments, span);
+				(args, ArgOrder::InOrder)
+			}
+			Arguments::Named(arguments) => {
+				self.named_fields(struct_index, arguments, span)
+			}
+		};
+		let ty = self.cx.types.intern(Type::Struct {
+			struct_index,
+			type_args: Box::new([]),
+		});
+		self.body.push(
+			ExprKind::Construct {
+				struct_index,
+				args,
+				order,
+			},
+			ty,
+			span,
+		)
+	}
+
+	/// A field's type, as expected of the value given for it.
+	fn field_type(
+		&mut self,
+		struct_index: StructIdx,
+		field: usize,
+	) -> TypeIndex {
+		let ty = self.cx.struct_field_types(struct_index)[field];
+		self.normalized(ty, TypeEnvIdx::ROOT)
+	}
+
+	/// The fields of `Point(1, 2)`: the n-th argument gives the n-th field. An
+	/// argument past the last field is checked and dropped.
+	fn positional_fields(
+		&mut self,
+		struct_index: StructIdx,
+		arguments: &[ast::Separated<Spanned<ast::Expression>>],
+		span: TextSpan,
+	) -> ExprRange {
+		let count = self.cx.struct_field_types(struct_index).len();
+		if arguments.len() != count {
+			let plural = |n: usize| if n == 1 { "" } else { "s" };
+			let label =
+				self.source_span(span).primary_label().with_message(format!(
+					"expected {count} field{}, found {}",
+					plural(count),
+					arguments.len()
+				));
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::ArgumentCountMismatch.code())
+					.with_message(format!(
+						"this struct takes {count} field{} but {} {} supplied",
+						plural(count),
+						arguments.len(),
+						if arguments.len() == 1 { "was" } else { "were" }
+					))
+					.with_label(label),
+			);
+		}
+		let mut fields = Vec::with_capacity(count);
+		for (at, argument) in arguments.iter().enumerate() {
+			let expected = if at < count {
+				self.field_type(struct_index, at)
+			} else {
+				TypeIndex::INFER
+			};
+			let value = self.check(&argument.inner, expected);
+			if at < count {
+				fields.push(value);
+			}
+		}
+		self.body.push_args(fields)
+	}
+
+	/// The fields of `Point({ y: 2, x })`, in written order, each with the
+	/// field it gives. Only a struct whose every field is named is built this
+	/// way. An argument naming no field, or a field already given, is checked
+	/// and dropped.
+	fn named_fields(
+		&mut self,
+		struct_index: StructIdx,
+		arguments: &[ast::Separated<Spanned<ast::NamedArgument>>],
+		span: TextSpan,
+	) -> (ExprRange, ArgOrder) {
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
+		let count = def.fields.len();
+		if !def.is_fully_named() {
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TupleStructBraceLiteral.code())
+					.with_message(format!(
+						"struct `{struct_name}` has unnamed fields, so it is \
+						 constructed with `{struct_name}(...)`"
+					))
+					.with_label(self.source_span(span).primary_label()),
+			);
+			return (self.body.push_args([]), self.body.push_permutation([]));
+		}
+		let mut values = Vec::with_capacity(arguments.len());
+		let mut given: Vec<(FieldIdx, TextSpan)> =
+			Vec::with_capacity(arguments.len());
+		for argument in arguments {
+			let argument = &argument.inner.inner;
+			let name = argument.name;
+			let field = self.cx.defs.structs[usize::from(struct_index)]
+				.lookup
+				.get(&name.inner)
+				.copied();
+			let expected = match field {
+				Some(field) => {
+					self.field_type(struct_index, usize::from(field))
+				}
+				None => TypeIndex::INFER,
+			};
+			let value = match &argument.value {
+				Some(value) => self.check(value, expected),
+				// `{ x }` is `{ x: x }`.
+				None => {
+					let path = [ast::PathSegment {
+						ident: name,
+						type_args: Box::new([]),
+					}];
+					let built = self.build_path(&path, name.span);
+					self.expect(built, expected)
+				}
+			};
+			let def = &self.cx.defs.structs[usize::from(struct_index)];
+			let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
+			let field_name = self.cx.strings.resolve(name.inner).unwrap();
+			let Some(field) = field else {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::UnknownStructField.code())
+						.with_message(format!(
+							"no such field `{field_name}` in struct \
+							 `{struct_name}`"
+						))
+						.with_label(
+							self.source_span(name.span).primary_label(),
+						),
+				);
+				continue;
+			};
+			if let Some(&(_, first)) =
+				given.iter().find(|&&(given, _)| given == field)
+			{
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::DuplicateStructFieldInit.code(),
+						)
+						.with_message(format!(
+							"field `{field_name}` specified more than once"
+						))
+						.with_label(self.source_span(name.span).primary_label())
+						.with_label(
+							self.source_span(first)
+								.secondary_label()
+								.with_message("first use of this field"),
+						),
+				);
+				continue;
+			}
+			values.push(value);
+			given.push((field, name.span));
+		}
+		// A later field of a name declared twice is one no argument can name;
+		// the duplicate was reported on the struct.
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		let missing: Vec<String> = (0..count)
+			.map(|at| FieldIdx::new(at as u32))
+			.filter(|&field| {
+				let name = def.fields[usize::from(field)].name.unwrap().inner;
+				!given.iter().any(|&(given, _)| given == field)
+					&& def.lookup.get(&name) == Some(&field)
+			})
+			.map(|field| {
+				let name = def.fields[usize::from(field)].name.unwrap().inner;
+				format!("`{}`", self.cx.strings.resolve(name).unwrap())
+			})
+			.collect();
+		if !missing.is_empty() {
+			let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::MissingStructFields.code())
+					.with_message(format!(
+						"missing field{} {} in construction of `{struct_name}`",
+						if missing.len() == 1 { "" } else { "s" },
+						missing.join(", ")
+					))
+					.with_label(self.source_span(span).primary_label()),
+			);
+		}
+		let order = self.body.push_permutation(
+			given
+				.into_iter()
+				.map(|(field, _)| ParamIdx::new(u32::from(field))),
+		);
+		(self.body.push_args(values), order)
+	}
+
+	/// A struct's constructor is as visible as the struct and every one of
+	/// its fields. When the struct is visible, the private fields are why its
+	/// constructor is not, and the report says so.
+	fn report_private_constructor(
+		&self,
+		struct_index: StructIdx,
+		key: DefKey,
+		segment: &ast::PathSegment,
+	) -> Diagnostic<FileId> {
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		let strings = self.cx.strings;
+		let name = strings.resolve(def.name.inner).unwrap();
+		let private: Vec<String> = def
+			.fields
+			.iter()
+			.enumerate()
+			.filter(|(_, field)| field.pub_span.is_none())
+			.map(|(at, field)| match field.name {
+				Some(name) => {
+					format!("`{}`", strings.resolve(name.inner).unwrap())
+				}
+				None => format!("field {at}"),
+			})
+			.collect();
+		let site = self.source_span(segment.ident.span);
+		if private.is_empty() {
+			return report_private_identifier(
+				&self.cx.defs.namespaces,
+				strings,
+				segment.ident.inner,
+				site,
+				Some(key),
+			);
+		}
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::PrivateItem.code())
+			.with_message(format!(
+				"the constructor of struct `{name}` is private"
+			))
+			.with_label(
+				site.primary_label().with_message("private constructor"),
+			);
+		for field in def.fields.iter().filter(|field| field.pub_span.is_none())
+		{
+			if let Some(field_name) = field.name {
+				diagnostic = diagnostic.with_label(
+					SourceSpan::new(def.file_id, field_name.span)
+						.secondary_label()
+						.with_message("private field"),
+				);
+			}
+		}
+		let fields = private.join(", ");
+		diagnostic
+			.with_note(format!(
+				"a constructor is private if any field is: {fields} of `{name}` \
+				 {} private",
+				if private.len() == 1 { "is" } else { "are" }
+			))
+			.with_note(format!(
+				"make every field of `{name}` `pub`, or expose a `pub func` that \
+				 constructs it"
+			))
 	}
 
 	fn build_unary(
@@ -863,6 +1256,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn source_span(&self, span: TextSpan) -> SourceSpan {
 		SourceSpan::new(self.file_id, span)
 	}
+}
+
+/// A call's arguments, by position or by name.
+enum Arguments<'e> {
+	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
+	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
 }
 
 /// One scalar a literal must fit; see `BodyContext::literal_targets`.

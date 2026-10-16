@@ -7,20 +7,42 @@
 //! diagnostics. A node's children are pushed before it, so every child index is
 //! smaller than its parent's and the root is the last node.
 
-use super::defs::{ConstIdx, FunctionIdx};
+use super::defs::{ConstIdx, FunctionIdx, StructIdx};
 use super::types::TypeIndex;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
 
 index_newtype!(ExprIdx);
+// The declared position of a parameter: what an argument gives. A struct's
+// fields are the parameters of its construction, in declaration order.
+index_newtype!(ParamIdx);
 
-/// A run of `Body::extra`: the arguments of a call, in order.
+/// A run of `Body::extra`: the arguments of a call or a construction, in the
+/// order they are written, which is the order they are evaluated in.
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) struct ExprRange {
 	start: u32,
 	len: u32,
+}
+
+impl ExprRange {
+	pub(super) fn len(self) -> usize {
+		self.len as usize
+	}
+}
+
+/// How the written order of arguments relates to the declared order of what
+/// they give.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum ArgOrder {
+	/// The n-th argument gives the n-th parameter.
+	InOrder,
+	/// A run of `Body::arg_order` starting at `start` gives the parameter of
+	/// each argument, so it is as long as the arguments it belongs to.
+	Permuted { start: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +87,15 @@ pub(super) enum ExprKind {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
+	/// A struct built from its fields, written as a call to its name;
+	/// `order` says which field each argument gives. A construction
+	/// missing a field, which is reported, has fewer arguments than the struct
+	/// has fields.
+	Construct {
+		struct_index: StructIdx,
+		args: ExprRange,
+		order: ArgOrder,
+	},
 }
 
 /// One definition's checked expression tree.
@@ -73,6 +104,7 @@ pub(super) struct Body {
 	types: Vec<TypeIndex>,
 	spans: Vec<TextSpan>,
 	extra: Vec<ExprIdx>,
+	arg_order: Vec<ParamIdx>,
 	root: ExprIdx,
 }
 
@@ -96,6 +128,18 @@ impl Body {
 	pub(super) fn args(&self, range: ExprRange) -> &[ExprIdx] {
 		&self.extra[range.start as usize..(range.start + range.len) as usize]
 	}
+
+	/// The parameter the argument at `at`, in written order, gives.
+	pub(super) fn declared_index(
+		&self,
+		order: ArgOrder,
+		at: usize,
+	) -> ParamIdx {
+		match order {
+			ArgOrder::InOrder => ParamIdx::new(at as u32),
+			ArgOrder::Permuted { start } => self.arg_order[start as usize + at],
+		}
+	}
 }
 
 /// Builds a `Body`. The checker owns one while it walks a definition, and may
@@ -106,6 +150,7 @@ pub(super) struct BodyBuilder {
 	types: Vec<TypeIndex>,
 	spans: Vec<TextSpan>,
 	extra: Vec<ExprIdx>,
+	arg_order: Vec<ParamIdx>,
 }
 
 impl BodyBuilder {
@@ -137,6 +182,17 @@ impl BodyBuilder {
 		ExprRange { start, len }
 	}
 
+	/// Records the field each argument of a call written by name gives, in
+	/// the order of the arguments.
+	pub(super) fn push_permutation(
+		&mut self,
+		declared: impl IntoIterator<Item = ParamIdx>,
+	) -> ArgOrder {
+		let start = u32::try_from(self.arg_order.len()).unwrap();
+		self.arg_order.extend(declared);
+		ArgOrder::Permuted { start }
+	}
+
 	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
 		self.kinds[usize::from(expr)]
 	}
@@ -164,6 +220,7 @@ impl BodyBuilder {
 			types: self.types,
 			spans: self.spans,
 			extra: self.extra,
+			arg_order: self.arg_order,
 			root,
 		}
 	}
@@ -173,7 +230,8 @@ impl BodyBuilder {
 			ExprKind::Unary { operand, .. } => ([Some(operand), None], &[]),
 			ExprKind::Binary { lhs, rhs, .. } => ([Some(lhs), Some(rhs)], &[]),
 			ExprKind::MethodCall { args, .. }
-			| ExprKind::GenericMethodCall { args, .. } => (
+			| ExprKind::GenericMethodCall { args, .. }
+			| ExprKind::Construct { args, .. } => (
 				[None, None],
 				&self.extra
 					[args.start as usize..(args.start + args.len) as usize],
@@ -197,6 +255,6 @@ mod tests {
 
 	#[test]
 	fn an_expression_node_stays_small() {
-		assert!(std::mem::size_of::<ExprKind>() <= 16);
+		assert!(std::mem::size_of::<ExprKind>() <= 24);
 	}
 }

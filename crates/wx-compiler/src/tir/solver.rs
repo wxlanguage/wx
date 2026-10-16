@@ -136,7 +136,7 @@ pub(super) enum Assumption {
 /// which it passes through:
 ///
 /// ```text
-/// fn f<T: Tr where { A = U::A }, U: Tr where { A = T::A }>() {}
+/// func f<T: Tr where { A = U::A }, U: Tr where { A = T::A }>() {}
 /// // T::A -> U::A -> T::A through equalities: a tautology, T::A stays abstract
 ///
 /// impl Tr for W { type A = <W as Tr>::A; }
@@ -1106,7 +1106,6 @@ impl Solver {
 			),
 			Type::Error
 			| Type::Infer
-			| Type::Unit
 			| Type::Never
 			| Type::Integer
 			| Type::Float

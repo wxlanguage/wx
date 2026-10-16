@@ -580,7 +580,7 @@ pub(super) struct DefinitionRegistry {
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
-	/// stdlib package — primitive types (`u8`, `char`, `never`, ...) and
+	/// stdlib package — primitive types (`u8`, `char`, ...) and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
 	/// prescan never found declared there. No `#[intrinsic]` marker is
 	/// involved: recognition is implicit — a reserved name, of the right
@@ -615,7 +615,6 @@ pub struct IntrinsicDefs {
 	pub f64: Option<TypeAliasIdx>,
 	pub bool: Option<TypeAliasIdx>,
 	pub char: Option<TypeAliasIdx>,
-	pub never: Option<TypeAliasIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
 	pub mul: Option<TraitIdx>,
@@ -656,7 +655,6 @@ impl IntrinsicDefs {
 			"f64" => &mut self.f64,
 			"bool" => &mut self.bool,
 			"char" => &mut self.char,
-			"never" => &mut self.never,
 			_ => return None,
 		})
 	}
@@ -1409,20 +1407,8 @@ pub(super) struct Binding {
 
 impl Binding {
 	fn definition(key: DefKey, visibility: Visibility) -> Self {
-		Self::definition_with_target(BindingTarget::Accessible(key), visibility)
-	}
-
-	/// Like `definition`, but for the rare case where a direct declaration
-	/// doesn't bind `Accessible` outright — a tuple struct's own value-namespace
-	/// binding (its constructor) is `Inaccessible` when any field is private,
-	/// since the type itself is still fine to name, but nothing outside the
-	/// declaring namespace can construct it.
-	fn definition_with_target(
-		target: BindingTarget,
-		visibility: Visibility,
-	) -> Self {
 		Self {
-			target,
+			target: BindingTarget::Accessible(key),
 			visibility,
 			source: BindingSource::Definition,
 		}
@@ -1986,7 +1972,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				MemberIdx::new(0),
 			)]),
 		});
-		// `GlobalMut` declares no members of its own (`fn set` has a
+		// `GlobalMut` declares no members of its own (`func set` has a
 		// default body reusing `Global::Value`) — an empty impl is enough
 		// to make it a dispatch candidate.
 		let mut_trait_impl_index = mutable.then(|| {
@@ -2353,22 +2339,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				);
 				// The name is also the struct's constructor, called like a
 				// function. Constructing it takes every field, so it is only
-				// accessible where every field is.
-				let value_target = if fields
-					.iter()
-					.all(|f| f.inner.inner.pub_span.is_some())
-				{
-					BindingTarget::Accessible(def_key)
-				} else {
-					BindingTarget::Inaccessible(def_key)
-				};
+				// as visible as the struct and every one of its fields.
+				let constructor_visibility = fields.iter().fold(
+					Visibility::from(*pub_span),
+					|visibility, f| {
+						visibility.cap(Visibility::from(f.inner.inner.pub_span))
+					},
+				);
 				self.insert_binding(
 					namespace,
 					BindingKey::value(name.inner),
-					Binding::definition_with_target(
-						value_target,
-						Visibility::from(*pub_span),
-					),
+					Binding::definition(def_key, constructor_visibility),
 					name.span,
 				);
 
@@ -3727,7 +3708,7 @@ mod tests {
 	#[test]
 	fn resolution_diagnostics_are_kept_separate_from_other_queries_and_prescan()
 	{
-		let mut case = TestCase::new("fn f(x: i32, x: i32) {}");
+		let mut case = TestCase::new("func f(x: i32, x: i32) {}");
 		case.diagnostics()
 			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
 
@@ -3812,7 +3793,6 @@ mod tests {
 			type f64;
 			type bool;
 			type char;
-			type never;
 		"});
 		case.diagnostics().assert_none();
 
@@ -3830,7 +3810,6 @@ mod tests {
 			(intrinsics.f64, "f64"),
 			(intrinsics.bool, "bool"),
 			(intrinsics.char, "char"),
-			(intrinsics.never, "never"),
 		] {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
@@ -3931,7 +3910,7 @@ mod tests {
 		// lookups specifically so this can't happen.
 		let case = TestCase::new_stdlib(indoc! {"
 			type Add;
-			trait u8 { fn f(self) -> Self; }
+			trait u8 { func f(self) -> Self; }
 		"});
 		case.diagnostics().assert_none();
 		assert!(
@@ -3950,7 +3929,7 @@ mod tests {
 			memory heap: UnknownSize;
 			import "env" as host {
 				memory shared: UnknownSize;
-				fn log(value: UnknownType);
+				func log(value: UnknownType);
 				global counter: UnknownType;
 			}
 			use host::shared as shared_alias;
@@ -4006,7 +3985,7 @@ mod tests {
 	#[test]
 	fn an_import_block_is_entered_through_a_path_but_never_written_in() {
 		let mut case = TestCase::new(indoc! {r#"
-			import "env" as host { fn log(); }
+			import "env" as host { func log(); }
 		"#});
 		case.diagnostics().assert_none();
 		assert!(matches!(
@@ -4027,7 +4006,7 @@ mod tests {
 	/// name the same function.
 	#[test]
 	fn an_import_blocks_declarations_can_be_brought_in_by_use() {
-		let block = r#"import "console" as console { fn log(x: i32); }"#;
+		let block = r#"import "console" as console { func log(x: i32); }"#;
 		for imports in [
 			"use console::log;",
 			"use console::*;",
@@ -4052,20 +4031,20 @@ mod tests {
 		let mut case = TestCase::new_stdlib(indoc! {"
 			const VALUE: Unknown = missing;
 			trait Api {
-				fn make() -> Unknown;
-				fn get(self, value: Unknown) -> Unknown;
+				func make() -> Unknown;
+				func get(self, value: Unknown) -> Unknown;
 				const VALUE: Unknown;
 				type Item: Unknown;
 			}
 			struct Host();
 			impl Host {
-				fn make() -> Unknown { missing }
-				fn get(self, value: Unknown) -> Unknown { missing }
+				func make() -> Unknown { missing }
+				func get(self, value: Unknown) -> Unknown { missing }
 				const VALUE: Unknown = missing;
 			}
 			impl Api for Host {
-				fn make() -> Unknown { missing }
-				fn get(self, value: Unknown) -> Unknown { missing }
+				func make() -> Unknown { missing }
+				func get(self, value: Unknown) -> Unknown { missing }
 				const VALUE: Unknown = missing;
 				type Item = Unknown;
 			}
@@ -4127,7 +4106,7 @@ mod tests {
 
 	#[test]
 	fn type_and_value_definitions_can_share_a_name() {
-		let mut case = TestCase::new("trait Item {} fn Item() {}");
+		let mut case = TestCase::new("trait Item {} func Item() {}");
 		case.diagnostics().assert_none();
 		assert!(matches!(
 			case.resolve(Tier::Type, "Item").expect_success(),
@@ -4152,7 +4131,7 @@ mod tests {
 				DefKind::Struct(_)
 			));
 		}
-		let case = TestCase::new("struct Item(); fn Item() {}");
+		let case = TestCase::new("struct Item(); func Item() {}");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 	}
@@ -4160,8 +4139,7 @@ mod tests {
 	#[test]
 	fn duplicate_function_keeps_the_original_binding_and_continues_collection()
 	{
-		let source =
-			"fn f(original: i32) {} fn f(replacement: i32) {} fn after() {}";
+		let source = "func f(original: i32) {} func f(replacement: i32) {} func after() {}";
 		let mut case = TestCase::new(source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
@@ -4199,15 +4177,14 @@ mod tests {
 	fn duplicate_module_labels_declarations_in_source_order_and_keeps_the_file_module()
 	 {
 		// File modules are registered before inline modules, independently of source order.
-		let source =
-			"mod clash { pub fn inline_only() {} } mod clash; fn after() {}";
+		let source = "mod clash { pub func inline_only() {} } mod clash; func after() {}";
 		let mut case = TestCase::new_workspace(
 			vfs::AbsolutePath::new("/main.wx"),
 			HashMap::from([
 				(vfs::AbsolutePath::new("/main.wx"), source.to_string()),
 				(
 					vfs::AbsolutePath::new("/clash.wx"),
-					"pub fn file_only() {}".to_string(),
+					"pub func file_only() {}".to_string(),
 				),
 			]),
 		);
@@ -4283,9 +4260,9 @@ mod tests {
 	#[test]
 	fn duplicate_members_keep_the_original_binding_and_later_members() {
 		for source in [
-			"trait T { fn f(original: i32); fn f(replacement: i32); fn after(); }",
-			"struct S(); impl S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
-			"trait T {} struct S(); impl T for S { fn f(original: i32) {} fn f(replacement: i32) {} fn after() {} }",
+			"trait T { func f(original: i32); func f(replacement: i32); func after(); }",
+			"struct S(); impl S { func f(original: i32) {} func f(replacement: i32) {} func after() {} }",
+			"trait T {} struct S(); impl T for S { func f(original: i32) {} func f(replacement: i32) {} func after() {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4333,7 +4310,7 @@ mod tests {
 	}
 
 	#[test]
-	fn tuple_struct_with_all_pub_fields_has_an_accessible_constructor() {
+	fn tuple_struct_with_all_pub_fields_has_a_public_constructor() {
 		let mut case = TestCase::new(indoc! {"
 			pub struct Point(pub i32, pub i32);
 		"});
@@ -4348,10 +4325,11 @@ mod tests {
 			.get(&BindingKey::value(point_symbol))
 			.expect("`Point` should be bound in the value namespace");
 		assert!(matches!(value_binding.target, BindingTarget::Accessible(_)));
+		assert_eq!(value_binding.visibility, Visibility::Public);
 	}
 
 	#[test]
-	fn tuple_struct_with_a_private_field_has_an_inaccessible_constructor() {
+	fn tuple_struct_with_a_private_field_has_a_private_constructor() {
 		let mut case = TestCase::new(indoc! {"
 			pub struct Point(pub i32, i32);
 		"});
@@ -4362,21 +4340,20 @@ mod tests {
 		let bindings =
 			&case.defs.namespaces.symbols(root_namespace.into()).bindings;
 
-		// The type itself stays fully nameable...
+		// The type itself is public...
 		let type_binding = bindings
 			.get(&BindingKey::ty(point_symbol))
 			.expect("`Point` should be bound in the type namespace");
 		assert!(matches!(type_binding.target, BindingTarget::Accessible(_)));
+		assert_eq!(type_binding.visibility, Visibility::Public);
 
-		// ...but the constructor can't be, since a private field can't be
-		// initialized from outside this namespace.
+		// ...but the constructor is private, as the field it initializes is:
+		// usable where the field is visible, and nowhere else.
 		let value_binding = bindings
 			.get(&BindingKey::value(point_symbol))
 			.expect("`Point` should be bound in the value namespace");
-		assert!(matches!(
-			value_binding.target,
-			BindingTarget::Inaccessible(_)
-		));
+		assert!(matches!(value_binding.target, BindingTarget::Accessible(_)));
+		assert_eq!(value_binding.visibility, Visibility::Private);
 	}
 
 	#[test]
@@ -4415,10 +4392,10 @@ mod tests {
 	#[test]
 	fn duplicate_function_parameter_is_reported_but_keeps_its_own_slot() {
 		for (source, path) in [
-			("fn f(x: i32, x: i32) {}", "f"),
-			("fn f(x: i32, x: i32);", "f"),
+			("func f(x: i32, x: i32) {}", "f"),
+			("func f(x: i32, x: i32);", "f"),
 			(
-				r#"import "env" as host { fn f(x: i32, x: i32); }"#,
+				r#"import "env" as host { func f(x: i32, x: i32); }"#,
 				"host::f",
 			),
 		] {
@@ -4444,10 +4421,10 @@ mod tests {
 	#[test]
 	fn self_in_a_free_function_is_rejected() {
 		for source in [
-			"fn f(self) {}",
-			"fn f(self);",
-			r#"import "env" as host { fn f(self); }"#,
-			r#"import "env" as host { fn f(x: i32, self); }"#,
+			"func f(self) {}",
+			"func f(self);",
+			r#"import "env" as host { func f(self); }"#,
+			r#"import "env" as host { func f(x: i32, self); }"#,
 		] {
 			let case = TestCase::new(source);
 			case.diagnostics()
@@ -4458,9 +4435,9 @@ mod tests {
 	#[test]
 	fn duplicate_associated_function_parameters_keep_their_slots() {
 		for source in [
-			"trait T { fn f(x: i32, x: i32, tail: i32); }",
-			"struct S(); impl S { fn f(x: i32, x: i32, tail: i32) {} }",
-			"trait T {} struct S(); impl T for S { fn f(x: i32, x: i32, tail: i32) {} }",
+			"trait T { func f(x: i32, x: i32, tail: i32); }",
+			"struct S(); impl S { func f(x: i32, x: i32, tail: i32) {} }",
+			"trait T {} struct S(); impl T for S { func f(x: i32, x: i32, tail: i32) {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4487,9 +4464,9 @@ mod tests {
 	#[test]
 	fn self_not_first_in_an_associated_function_is_rejected() {
 		for source in [
-			"trait T { fn f(x: i32, self); }",
-			"struct S(); impl S { fn f(x: i32, self) {} }",
-			"trait T {} struct S(); impl T for S { fn f(x: i32, self) {} }",
+			"trait T { func f(x: i32, self); }",
+			"struct S(); impl S { func f(x: i32, self) {} }",
+			"trait T {} struct S(); impl T for S { func f(x: i32, self) {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4506,7 +4483,7 @@ mod tests {
 
 	#[test]
 	fn repeated_self_reports_both_duplicate_name_and_invalid_position() {
-		let source = "trait T { fn f(self, self); }";
+		let source = "trait T { func f(self, self); }";
 		let case = TestCase::new_stdlib(source);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicateFunctionParameter,
@@ -4535,17 +4512,17 @@ mod tests {
 	fn receiver_presence_classifies_trait_and_impl_functions() {
 		let case = TestCase::new_stdlib(indoc! {"
 			trait T {
-				fn method(self, x: i32);
-				fn associated(x: i32);
+				func method(self, x: i32);
+				func associated(x: i32);
 			}
 			struct S();
 			impl S {
-				fn method(self, x: i32) {}
-				fn associated(x: i32) {}
+				func method(self, x: i32) {}
+				func associated(x: i32) {}
 			}
 			impl T for S {
-				fn method(self, x: i32) {}
-				fn associated(x: i32) {}
+				func method(self, x: i32) {}
+				func associated(x: i32) {}
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -4588,7 +4565,7 @@ mod tests {
 				(vfs::AbsolutePath::new("/main.wx"), "mod math;".to_string()),
 				(
 					vfs::AbsolutePath::new("/math.wx"),
-					"pub fn add() -> i32 { 1 }".to_string(),
+					"pub func add() -> i32 { 1 }".to_string(),
 				),
 			]),
 		);
@@ -4608,7 +4585,7 @@ mod tests {
 		// installs, pins down that boundary explicitly.
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			use a::*;
 		"});
@@ -4646,7 +4623,7 @@ mod tests {
 		// `indirect_lookup_reaches_a_private_glob_from_a_descendant_namespace`.)
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod b {
 				use crate::a::*;
@@ -4680,7 +4657,7 @@ mod tests {
 		// access to everything `m` privately imports.
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod m {
 				use crate::a::*;
@@ -4719,7 +4696,7 @@ mod tests {
 	fn indirect_lookup_finds_a_single_pub_glob_candidate() {
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod hub {
 				pub use crate::a::*;
@@ -4769,10 +4746,10 @@ mod tests {
 		// demand; the pipeline just never happens to ask.
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				pub fn pick() -> i32 { 2 }
+				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
 				pub use crate::a::*;
@@ -4808,11 +4785,11 @@ mod tests {
 		// direct one without ever consulting the indirect half.
 		let mut case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod hub {
 				pub use crate::a::*;
-				fn pick() -> i32 { 2 }
+				func pick() -> i32 { 2 }
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -4859,7 +4836,7 @@ mod tests {
 	fn import_external_names_are_decoded_during_prescan() {
 		let case = TestCase::new(indoc! {"
             import \"slash\\\\n\" as host {
-                fn f();
+                func f();
             }
         "});
 		case.diagnostics().assert_none();
@@ -4892,10 +4869,10 @@ mod tests {
 
             export f as \"start\";
 
-            fn f() {
+            func f() {
             }
 
-            fn g() {
+            func g() {
             }
 
             export g
@@ -4930,8 +4907,8 @@ mod tests {
 	#[test]
 	fn duplicate_exports_keep_the_first_target_across_forms() {
 		let case = TestCase::new(indoc! {"
-            fn first() {}
-            fn second() {}
+            func first() {}
+            func second() {}
 
             export {
                 first as \"run\",
@@ -4950,14 +4927,14 @@ mod tests {
 	#[test]
 	fn duplicate_exports_share_one_map_across_namespaces() {
 		let case = TestCase::new(indoc! {"
-            fn first() {}
+            func first() {}
 
             export {
                 first as \"run\",
             }
 
             mod nested {
-                fn run() {}
+                func run() {}
 
                 export run
             }
@@ -4976,7 +4953,7 @@ mod tests {
 	#[test]
 	fn export_aliases_are_decoded_once_and_retain_literal_spans() {
 		let source = indoc! {"
-            fn f() {}
+            func f() {}
 
             export {
                 f as \"line\\n\",
@@ -5004,13 +4981,13 @@ mod tests {
 		for source in [
 			indoc! {"
             import \"\\o\" as host {
-                fn f();
+                func f();
             }
 
-            fn after() {}
+            func after() {}
         "},
 			indoc! {"
-            fn f() {}
+            func f() {}
 
             export {
                 f as \"\\o\",
@@ -5018,7 +4995,7 @@ mod tests {
             }
         "},
 			indoc! {"
-            fn f() {
+            func f() {
             }
 
             export f as \"\\o\"
@@ -5063,7 +5040,7 @@ mod tests {
 	fn unknown_escape_labels_use_utf8_byte_offsets() {
 		let source = indoc! {"
             import \"λ\\💥\" as host {
-                fn f();
+                func f();
             }
         "};
 		let case = TestCase::new(source);

@@ -1375,6 +1375,8 @@ pub enum TypeExpression {
 	/// `_` — explicit inference placeholder; type-resolution context decides
 	/// whether it stays `INFER` or is rejected as `ERROR`.
 	Infer,
+	/// `!`, the type of an expression that never produces a value.
+	Never,
 	/// `i32`, `module::Type`, `Point<i32>`, `module::Wrapper<T>` — a flat path
 	/// of segments; any segment (including the first) may carry bare
 	/// `<...>` generic arguments. Turbofish is never accepted in type
@@ -1384,7 +1386,7 @@ pub enum TypeExpression {
 	Tuple {
 		elements: Box<[Spanned<TypeExpression>]>,
 	},
-	/// `fn(i32, i32) -> i32`
+	/// `func(i32, i32) -> i32`
 	Function {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
@@ -2049,7 +2051,7 @@ define_keywords! {
 	Global => "global",
 	Mut => "mut",
 	Enum => "enum",
-	Fn => "fn",
+	Func => "func",
 	Loop => "loop",
 	Break => "break",
 	Continue => "continue",
@@ -2374,7 +2376,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		match keyword {
-			Some(Keyword::Fn) => Ok(Parser::parse_function_definition_item),
+			Some(Keyword::Func) => Ok(Parser::parse_function_definition_item),
 			Some(Keyword::Global) => Ok(Parser::parse_global_definition_item),
 			Some(Keyword::Export) => Ok(Parser::parse_export_item),
 			Some(Keyword::Import) => Ok(Parser::parse_import_block),
@@ -2992,6 +2994,13 @@ impl<'ctx> Parser<'ctx> {
 			Token::Star | Token::Amper => {
 				self.parse_pointer_type_expression(None)
 			}
+			Token::Bang => {
+				let span = self.lexer.next().span;
+				Ok(Spanned {
+					inner: TypeExpression::Never,
+					span,
+				})
+			}
 			Token::Identifier => {
 				let (first_tok, first_sym) = match Keyword::try_from(
 					token.span.extract_str(self.source),
@@ -3003,7 +3012,7 @@ impl<'ctx> Parser<'ctx> {
 							span,
 						});
 					}
-					Ok(Keyword::Fn) => {
+					Ok(Keyword::Func) => {
 						return Parser::parse_function_type_expression(self);
 					}
 					// `Self` is valid in type paths for `Self::AssocType`, etc.;
@@ -5283,7 +5292,7 @@ impl<'ctx> Parser<'ctx> {
 					span,
 				})
 			}
-			Some(Keyword::Fn) => {
+			Some(Keyword::Func) => {
 				let fn_span = parser.lexer.next().span;
 				let name_span = parser.next_expect(Token::Identifier)?.span;
 				let name_symbol = parser.intern_identifier(name_span);
@@ -5564,7 +5573,7 @@ impl<'ctx> Parser<'ctx> {
 								span,
 							})
 						}
-						Some(Keyword::Fn) => {
+						Some(Keyword::Func) => {
 							let signature =
 								parser.parse_function_signature()?;
 							let body = if parser.lexer.peek().inner
@@ -5745,7 +5754,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// `[pub] [name:] Type`, decided on one token: a type that starts with a
-	/// keyword (`fn`, `_`, `Self`, ...) is never a name, and a plain identifier
+	/// keyword (`func`, `_`, `Self`, ...) is never a name, and a plain identifier
 	/// is a name exactly when `:` follows it; otherwise it was the first
 	/// segment of the field's type, which is parsed on from there.
 	fn parse_struct_field(
@@ -5967,7 +5976,7 @@ impl<'ctx> Parser<'ctx> {
 			_ => None,
 		};
 		match keyword {
-			Some(Keyword::Fn) => {
+			Some(Keyword::Func) => {
 				parser.parse_function_signature().map(|signature| Spanned {
 					inner: ImportEntry {
 						external_name: None,

@@ -140,26 +140,26 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 #[test]
 fn executable_block_eligibility() {
 	for (body, expected) in [
-		("", "fn f() {}\n"),
-		("foo()", "fn f() { foo() }\n"),
-		("a + b", "fn f() { a + b }\n"),
-		("foo();", "fn f() {\n    foo();\n}\n"),
-		("local a = 1", "fn f() {\n    local a = 1;\n}\n"),
-		("local a = 1;", "fn f() {\n    local a = 1;\n}\n"),
-		("foo(); bar()", "fn f() {\n    foo();\n    bar()\n}\n"),
-		("_ = foo()", "fn f() { _ = foo() }\n"),
-		("return 1", "fn f() { return 1 }\n"),
-		("return 1;", "fn f() {\n    return 1;\n}\n"),
-		("break 1", "fn f() { break 1 }\n"),
-		("continue", "fn f() { continue }\n"),
-		("unreachable", "fn f() { unreachable }\n"),
+		("", "func f() {}\n"),
+		("foo()", "func f() { foo() }\n"),
+		("a + b", "func f() { a + b }\n"),
+		("foo();", "func f() {\n    foo();\n}\n"),
+		("local a = 1", "func f() {\n    local a = 1;\n}\n"),
+		("local a = 1;", "func f() {\n    local a = 1;\n}\n"),
+		("foo(); bar()", "func f() {\n    foo();\n    bar()\n}\n"),
+		("_ = foo()", "func f() { _ = foo() }\n"),
+		("return 1", "func f() { return 1 }\n"),
+		("return 1;", "func f() {\n    return 1;\n}\n"),
+		("break 1", "func f() { break 1 }\n"),
+		("continue", "func f() { continue }\n"),
+		("unreachable", "func f() { unreachable }\n"),
 	] {
 		assert_eq!(
-			checked_format(&format!("fn f() {{ {{ {body} }} }}"), 80, 4),
+			checked_format(&format!("func f() {{ {{ {body} }} }}"), 80, 4),
 			format!(
-				"fn f() {{\n    {}\n}}\n",
+				"func f() {{\n    {}\n}}\n",
 				expected
-					.strip_prefix("fn f() ")
+					.strip_prefix("func f() ")
 					.unwrap()
 					.trim_end()
 					.replace("\n", "\n    ")
@@ -172,47 +172,47 @@ fn executable_block_eligibility() {
 		"foo()\n// trailing\n",
 		"// empty\n",
 	] {
-		let output = checked_format(&format!("fn f() {{ {body} }}"), 80, 4);
-		assert!(output.starts_with("fn f() {\n"), "{output}");
+		let output = checked_format(&format!("func f() {{ {body} }}"), 80, 4);
+		assert!(output.starts_with("func f() {\n"), "{output}");
 		assert!(output.contains("//"));
 	}
 }
 
 #[test]
 fn function_bodies_always_break_without_expanding_short_signatures() {
-	let flat = "fn f(x: i32) -> i32 { x }";
+	let flat = "func f(x: i32) -> i32 { x }";
 	for width in [flat.len() - 1, flat.len(), flat.len() + 1] {
 		let output = checked_format(flat, width as u32, 4);
 		assert!(output.ends_with("{\n    x\n}\n"), "{output}");
-		assert!(output.starts_with("fn f(x: i32) -> i32 {"));
+		assert!(output.starts_with("func f(x: i32) -> i32 {"));
 	}
 	for body in ["foo()", "foo();", "a + b", "return 1", "_ = foo()"] {
 		assert_eq!(
-			checked_format(&format!("fn f() {{ {body} }}"), 120, 4),
-			format!("fn f() {{\n    {body}\n}}\n"),
+			checked_format(&format!("func f() {{ {body} }}"), 120, 4),
+			format!("func f() {{\n    {body}\n}}\n"),
 		);
 	}
-	assert_eq!(checked_format("fn f() {}", 120, 4), "fn f() {}\n");
+	assert_eq!(checked_format("func f() {}", 120, 4), "func f() {}\n");
 
 	let output = checked_format(
-		"fn many(first: i32, second: i32, third: i32) -> i32 { first }",
+		"func many(first: i32, second: i32, third: i32) -> i32 { first }",
 		36,
 		4,
 	);
-	assert!(output.starts_with("fn many(\n"), "{output}");
+	assert!(output.starts_with("func many(\n"), "{output}");
 	assert!(output.ends_with(") -> i32 {\n    first\n}\n"), "{output}");
 	for body in ["if x { a() } else { b() }", "a(); b()"] {
 		let output =
-			checked_format(&format!("fn f(x: bool) {{ {body} }}"), 80, 4);
-		assert!(output.starts_with("fn f(x: bool) {\n"), "{output}");
+			checked_format(&format!("func f(x: bool) {{ {body} }}"), 80, 4);
+		assert!(output.starts_with("func f(x: bool) {\n"), "{output}");
 	}
 	assert_eq!(
-		checked_format("#[inline] fn f() { 1 }", 80, 4),
-		"#[inline]\nfn f() {\n    1\n}\n"
+		checked_format("#[inline] func f() { 1 }", 80, 4),
+		"#[inline]\nfunc f() {\n    1\n}\n"
 	);
 	let output =
-		checked_format("fn f() { very_long_function_name(argument) }", 35, 2);
-	assert_eq!(output, "fn f() {\n  very_long_function_name(argument)\n}\n");
+		checked_format("func f() { very_long_function_name(argument) }", 35, 2);
+	assert_eq!(output, "func f() {\n  very_long_function_name(argument)\n}\n");
 }
 
 #[test]
@@ -231,16 +231,16 @@ fn all_block_like_variants_and_separator_positions() {
 		"match n {}",
 	] {
 		for separator in ["", ";"] {
-			let source = format!("fn f() {{ {expression}{separator} next() }}");
+			let source = format!("func f() {{ {expression}{separator} next() }}");
 			let output = checked_format(&source, 120, 4);
 			assert!(
 				output.contains(&format!("    {expression};\n    next()")),
 				"{output}"
 			);
-			let final_source = format!("fn f() {{ {expression}{separator} }}");
+			let final_source = format!("func f() {{ {expression}{separator} }}");
 			assert_eq!(
 				checked_format(&final_source, 120, 4),
-				format!("fn f() {{\n    {expression}{separator}\n}}\n")
+				format!("func f() {{\n    {expression}{separator}\n}}\n")
 			);
 		}
 	}
@@ -253,13 +253,13 @@ fn all_block_like_variants_and_separator_positions() {
 	] {
 		for separator in ["", ";"] {
 			let output = checked_format(
-				&format!("fn f() {{ {expression}{separator} next() }}"),
+				&format!("func f() {{ {expression}{separator} next() }}"),
 				80,
 				4,
 			);
 			assert!(output.contains("\n    }\n    next()"), "{output}");
 			let output = checked_format(
-				&format!("fn f() {{ {expression}{separator} }}"),
+				&format!("func f() {{ {expression}{separator} }}"),
 				80,
 				4,
 			);
@@ -282,7 +282,7 @@ fn branch_coordination_and_comments() {
 		for (a, b) in [(body, "bar()"), ("bar()", body)] {
 			let output = checked_format(
 				&format!(
-					"fn f() {{ if true {{ {a} }} else {{ {b} }}; next() }}"
+					"func f() {{ if true {{ {a} }} else {{ {b} }}; next() }}"
 				),
 				80,
 				4,
@@ -293,7 +293,7 @@ fn branch_coordination_and_comments() {
 		}
 	}
 	let output = checked_format(
-		"fn f() { if true { foo() } // boundary\nnext() }",
+		"func f() { if true { foo() } // boundary\nnext() }",
 		80,
 		4,
 	);
@@ -302,7 +302,7 @@ fn branch_coordination_and_comments() {
 		"{output}"
 	);
 	let output = checked_format(
-		"fn f() { if true { foo(); }; // boundary\nnext() }",
+		"func f() { if true { foo(); }; // boundary\nnext() }",
 		80,
 		4,
 	);
@@ -321,7 +321,7 @@ fn flat_semicolon_participates_in_width() {
 		for width in [boundary - 1, boundary, boundary + 1] {
 			for separator in ["", ";"] {
 				let output = checked_format(
-					&format!("fn f() {{ {expression}{separator} next() }}"),
+					&format!("func f() {{ {expression}{separator} next() }}"),
 					width as u32,
 					4,
 				);
@@ -360,18 +360,18 @@ fn diagnostics_and_tir_types_survive_formatting() {
 	}
 	for (source, invalid) in [
 		(
-			"fn calculate() -> i32 { 1 } fn f() { calculate(); } export { f }",
+			"func calculate() -> i32 { 1 } func f() { calculate(); } export { f }",
 			true,
 		),
 		(
-			"fn effect() {} fn f(flag: bool) -> i32 { if flag { effect() } else { effect() }; if flag { effect(); }; local x: i32 = 1; x } export { f }",
+			"func effect() {} func f(flag: bool) -> i32 { if flag { effect() } else { effect() }; if flag { effect(); }; local x: i32 = 1; x } export { f }",
 			false,
 		),
 		(
-			"fn f() -> i32 { local x: i32 = loop { break 1 }; x } export { f }",
+			"func f() -> i32 { local x: i32 = loop { break 1 }; x } export { f }",
 			false,
 		),
-		("fn f() { local x: i32 = 1 } export { f }", false),
+		("func f() { local x: i32 = 1 } export { f }", false),
 	] {
 		let (_graph, before) = build(source);
 		if !invalid {
@@ -430,7 +430,7 @@ fn empty_constructs_use_broken_mode_at_tiny_widths() {
 		"match n {}",
 	] {
 		let output =
-			checked_format(&format!("fn f() {{ {expression} next() }}"), 1, 4);
+			checked_format(&format!("func f() {{ {expression} next() }}"), 1, 4);
 		assert!(output.contains(&format!("    {expression}\n")), "{output}");
 	}
 }
@@ -438,37 +438,37 @@ fn empty_constructs_use_broken_mode_at_tiny_widths() {
 #[test]
 fn nested_mandatory_lines_prevent_flat_layout() {
 	let output = checked_format(
-		"fn f() { return if true { a(); } else { b() } }",
+		"func f() { return if true { a(); } else { b() } }",
 		120,
 		4,
 	);
-	assert!(output.starts_with("fn f() {\n"), "{output}");
+	assert!(output.starts_with("func f() {\n"), "{output}");
 	assert!(output.contains("} else {\n"), "{output}");
 	// The top-level rule deliberately allows an unterminated return whose
 	// operand is block-like when the whole thing is physically one line.
 	assert_eq!(
 		checked_format(
-			"fn f() { return if true { a() } else { b() } }",
+			"func f() { return if true { a() } else { b() } }",
 			120,
 			4
 		),
-		"fn f() {\n    return if true { a() } else { b() }\n}\n"
+		"func f() {\n    return if true { a() } else { b() }\n}\n"
 	);
 	let output =
-		checked_format("fn f() { wrap(Point::{ x: { a(); } }) }", 120, 4);
-	assert!(output.starts_with("fn f() {\n"), "{output}");
+		checked_format("func f() { wrap(Point::{ x: { a(); } }) }", 120, 4);
+	assert!(output.starts_with("func f() {\n"), "{output}");
 }
 
 #[test]
 fn methods_and_generic_signatures_follow_the_function_rule() {
 	for source in [
-		"impl Point { fn f(self) -> i32 { 1 } }",
-		"trait T { fn f(self) -> i32 { 1 } }",
-		"impl T for Point { fn f(self) -> i32 { 1 } }",
+		"impl Point { func f(self) -> i32 { 1 } }",
+		"trait T { func f(self) -> i32 { 1 } }",
+		"impl T for Point { func f(self) -> i32 { 1 } }",
 	] {
 		let output = checked_format(source, 80, 4);
 		assert!(
-			output.contains("fn f(self) -> i32 {\n        1\n    }"),
+			output.contains("func f(self) -> i32 {\n        1\n    }"),
 			"{output}"
 		);
 		let output = checked_format(source, 24, 4);
@@ -476,11 +476,11 @@ fn methods_and_generic_signatures_follow_the_function_rule() {
 		assert!(!output.contains("{ 1 }"), "{output}");
 	}
 	let output = checked_format(
-		"fn f<First: VeryLongBound, Second: AnotherVeryLongBound>(x: First) -> First { x }",
+		"func f<First: VeryLongBound, Second: AnotherVeryLongBound>(x: First) -> First { x }",
 		40,
 		4,
 	);
-	assert!(output.starts_with("fn f<\n"), "{output}");
+	assert!(output.starts_with("func f<\n"), "{output}");
 	assert!(output.ends_with("{\n    x\n}\n"), "{output}");
 }
 
@@ -488,7 +488,7 @@ fn methods_and_generic_signatures_follow_the_function_rule() {
 fn empty_branches_follow_the_owning_group_mode() {
 	for expression in ["if test(a) {}", "if !test(a) {}", "match test(a) {}"] {
 		for separator in ["", ";"] {
-			let source = format!("fn f() {{ {expression}{separator} next() }}");
+			let source = format!("func f() {{ {expression}{separator} next() }}");
 			let boundary = (4 + expression.len() + 1) as u32;
 			for width in [boundary - 1, boundary, boundary + 1] {
 				let output = checked_format(&source, width, 4);
@@ -498,7 +498,7 @@ fn empty_branches_follow_the_owning_group_mode() {
 				assert_eq!(
 					output,
 					format!(
-						"fn f() {{\n    {expression}{semi}\n    next()\n}}\n"
+						"func f() {{\n    {expression}{semi}\n    next()\n}}\n"
 					)
 				);
 			}
@@ -511,11 +511,11 @@ fn empty_branches_follow_the_owning_group_mode() {
 #[test]
 fn source_newlines_prevent_flat_blocks() {
 	let output = checked_format(
-		r#"fn f() { "one
+		r#"func f() { "one
 two" }"#,
 		120,
 		4,
 	);
-	assert!(output.starts_with("fn f() {\n"), "{output}");
+	assert!(output.starts_with("func f() {\n"), "{output}");
 	assert!(output.contains("one\ntwo"), "{output}");
 }

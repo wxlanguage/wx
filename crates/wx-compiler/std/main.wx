@@ -34,80 +34,77 @@ pub type bool;
 #[intrinsic]
 pub type char;
 
-#[intrinsic]
-pub type never;
-
 #[tag = "Add"]
 pub trait Add {
-    fn add(self, rhs: Self) -> Self;
+    func add(self, rhs: Self) -> Self;
 }
 
 #[tag = "Sub"]
 pub trait Sub {
-    fn sub(self, rhs: Self) -> Self;
+    func sub(self, rhs: Self) -> Self;
 }
 
 #[tag = "Mul"]
 pub trait Mul {
-    fn mul(self, rhs: Self) -> Self;
+    func mul(self, rhs: Self) -> Self;
 }
 
 #[tag = "Div"]
 pub trait Div {
-    fn div(self, rhs: Self) -> Self;
+    func div(self, rhs: Self) -> Self;
 }
 
 #[tag = "Rem"]
 pub trait Rem {
-    fn rem(self, rhs: Self) -> Self;
+    func rem(self, rhs: Self) -> Self;
 }
 
 #[tag = "Neg"]
 pub trait Neg {
-    fn neg(self) -> Self;
+    func neg(self) -> Self;
 }
 
 #[tag = "BitAnd"]
 pub trait BitAnd {
-    fn bitand(self, rhs: Self) -> Self;
+    func bitand(self, rhs: Self) -> Self;
 }
 
 #[tag = "BitOr"]
 pub trait BitOr {
-    fn bitor(self, rhs: Self) -> Self;
+    func bitor(self, rhs: Self) -> Self;
 }
 
 #[tag = "BitXor"]
 pub trait BitXor {
-    fn bitxor(self, rhs: Self) -> Self;
+    func bitxor(self, rhs: Self) -> Self;
 }
 
 #[tag = "Shl"]
 pub trait Shl {
-    fn shl(self, rhs: Self) -> Self;
+    func shl(self, rhs: Self) -> Self;
 }
 
 #[tag = "Shr"]
 pub trait Shr {
-    fn shr(self, rhs: Self) -> Self;
+    func shr(self, rhs: Self) -> Self;
 }
 
 #[tag = "BitNot"]
 pub trait BitNot {
-    fn bitnot(self) -> Self;
+    func bitnot(self) -> Self;
 }
 
 #[tag = "Not"]
 pub trait Not {
-    fn not(self) -> Self;
+    func not(self) -> Self;
 }
 
 #[tag = "PartialEq"]
 pub trait PartialEq {
-    fn eq(self, other: Self) -> bool;
+    func eq(self, other: Self) -> bool;
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         !self.eq(other)
     }
 }
@@ -116,13 +113,13 @@ pub trait Eq: PartialEq {}
 
 #[tag = "PartialOrd"]
 pub trait PartialOrd: PartialEq {
-    fn lt(self, other: Self) -> bool;
+    func lt(self, other: Self) -> bool;
 
-    fn le(self, other: Self) -> bool;
+    func le(self, other: Self) -> bool;
 
-    fn gt(self, other: Self) -> bool;
+    func gt(self, other: Self) -> bool;
 
-    fn ge(self, other: Self) -> bool;
+    func ge(self, other: Self) -> bool;
 }
 
 pub enum Ordering: i8 {
@@ -133,42 +130,42 @@ pub enum Ordering: i8 {
 
 impl Ordering {
     #[inline]
-    pub fn of<T: PartialOrd>(a: T, b: T) -> Ordering {
+    pub func of<T: PartialOrd>(a: T, b: T) -> Ordering {
         ((a > b) as i8 - (a < b) as i8) as Ordering
     }
 
     #[inline]
-    pub fn is_lt(self) -> bool {
+    pub func is_lt(self) -> bool {
         self == Ordering::Less
     }
 
     #[inline]
-    pub fn is_eq(self) -> bool {
+    pub func is_eq(self) -> bool {
         self == Ordering::Equal
     }
 
     #[inline]
-    pub fn is_gt(self) -> bool {
+    pub func is_gt(self) -> bool {
         self == Ordering::Greater
     }
 
     #[inline]
-    pub fn is_le(self) -> bool {
+    pub func is_le(self) -> bool {
         self != Ordering::Greater
     }
 
     #[inline]
-    pub fn is_ge(self) -> bool {
+    pub func is_ge(self) -> bool {
         self != Ordering::Less
     }
 
     #[inline]
-    pub fn is_ne(self) -> bool {
+    pub func is_ne(self) -> bool {
         self != Ordering::Equal
     }
 
     #[inline]
-    pub fn reverse(self) -> Ordering {
+    pub func reverse(self) -> Ordering {
         match self {
             Ordering::Less -> { Ordering::Greater },
             Ordering::Equal -> { Ordering::Equal },
@@ -177,7 +174,7 @@ impl Ordering {
     }
 
     #[inline]
-    pub fn then(self, other: Ordering) -> Ordering {
+    pub func then(self, other: Ordering) -> Ordering {
         match self {
             Ordering::Equal -> { other },
             _ -> { self }
@@ -186,20 +183,20 @@ impl Ordering {
 }
 
 pub trait Ord: PartialOrd + Eq {
-    fn cmp(self, other: Self) -> Ordering;
+    func cmp(self, other: Self) -> Ordering;
 
     #[inline]
-    fn min(self, other: Self) -> Self {
+    func min(self, other: Self) -> Self {
         if self < other { self } else { other }
     }
 
     #[inline]
-    fn max(self, other: Self) -> Self {
+    func max(self, other: Self) -> Self {
         if self < other { other } else { self }
     }
 
     #[inline]
-    fn clamp(self, min: Self, max: Self) -> Self {
+    func clamp(self, min: Self, max: Self) -> Self {
         if max < min { unreachable };
         if self < min { return min };
         if self > max { return max };
@@ -208,361 +205,361 @@ pub trait Ord: PartialOrd + Eq {
 }
 
 #[intrinsic]
-pub fn slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
+pub func slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
 #[intrinsic]
-pub fn slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
+pub func slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
 #[intrinsic]
-pub fn slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
+pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
 
 #[intrinsic]
-pub fn i64_extend_i32(value: i32) -> i64;
+pub func i64_extend_i32(value: i32) -> i64;
 
 #[intrinsic]
-pub fn u64_extend_u32(value: u32) -> u64;
+pub func u64_extend_u32(value: u32) -> u64;
 
 #[intrinsic]
-pub fn i32_wrap_i64(value: i64) -> i32;
+pub func i32_wrap_i64(value: i64) -> i32;
 
 #[intrinsic]
-pub fn f32_sqrt(value: f32) -> f32;
+pub func f32_sqrt(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_sqrt(value: f64) -> f64;
+pub func f64_sqrt(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_abs(value: f32) -> f32;
+pub func f32_abs(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_abs(value: f64) -> f64;
+pub func f64_abs(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_floor(value: f32) -> f32;
+pub func f32_floor(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_floor(value: f64) -> f64;
+pub func f64_floor(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_ceil(value: f32) -> f32;
+pub func f32_ceil(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_ceil(value: f64) -> f64;
+pub func f64_ceil(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_trunc(value: f32) -> f32;
+pub func f32_trunc(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_trunc(value: f64) -> f64;
+pub func f64_trunc(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_nearest(value: f32) -> f32;
+pub func f32_nearest(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_nearest(value: f64) -> f64;
+pub func f64_nearest(value: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_min(a: f32, b: f32) -> f32;
+pub func f32_min(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_min(a: f64, b: f64) -> f64;
+pub func f64_min(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_max(a: f32, b: f32) -> f32;
+pub func f32_max(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_max(a: f64, b: f64) -> f64;
+pub func f64_max(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn f32_copysign(a: f32, b: f32) -> f32;
+pub func f32_copysign(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_copysign(a: f64, b: f64) -> f64;
+pub func f64_copysign(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_neg(value: i32) -> i32;
+pub func i32_neg(value: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_neg(value: i64) -> i64;
+pub func i64_neg(value: i64) -> i64;
 
 #[intrinsic]
-pub fn f32_neg(value: f32) -> f32;
+pub func f32_neg(value: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_neg(value: f64) -> f64;
+pub func f64_neg(value: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_add(a: i32, b: i32) -> i32;
+pub func i32_add(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_add(a: i64, b: i64) -> i64;
+pub func i64_add(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn f32_add(a: f32, b: f32) -> f32;
+pub func f32_add(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_add(a: f64, b: f64) -> f64;
+pub func f64_add(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_sub(a: i32, b: i32) -> i32;
+pub func i32_sub(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_sub(a: i64, b: i64) -> i64;
+pub func i64_sub(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn f32_sub(a: f32, b: f32) -> f32;
+pub func f32_sub(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_sub(a: f64, b: f64) -> f64;
+pub func f64_sub(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_mul(a: i32, b: i32) -> i32;
+pub func i32_mul(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_mul(a: i64, b: i64) -> i64;
+pub func i64_mul(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn f32_mul(a: f32, b: f32) -> f32;
+pub func f32_mul(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_mul(a: f64, b: f64) -> f64;
+pub func f64_mul(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_div(a: i32, b: i32) -> i32;
+pub func i32_div(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn u32_div(a: u32, b: u32) -> u32;
+pub func u32_div(a: u32, b: u32) -> u32;
 
 #[intrinsic]
-pub fn i64_div(a: i64, b: i64) -> i64;
+pub func i64_div(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn u64_div(a: u64, b: u64) -> u64;
+pub func u64_div(a: u64, b: u64) -> u64;
 
 #[intrinsic]
-pub fn f32_div(a: f32, b: f32) -> f32;
+pub func f32_div(a: f32, b: f32) -> f32;
 
 #[intrinsic]
-pub fn f64_div(a: f64, b: f64) -> f64;
+pub func f64_div(a: f64, b: f64) -> f64;
 
 #[intrinsic]
-pub fn i32_rem(a: i32, b: i32) -> i32;
+pub func i32_rem(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn u32_rem(a: u32, b: u32) -> u32;
+pub func u32_rem(a: u32, b: u32) -> u32;
 
 #[intrinsic]
-pub fn i64_rem(a: i64, b: i64) -> i64;
+pub func i64_rem(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn u64_rem(a: u64, b: u64) -> u64;
+pub func u64_rem(a: u64, b: u64) -> u64;
 
 #[intrinsic]
-pub fn i32_bitand(a: i32, b: i32) -> i32;
+pub func i32_bitand(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_bitand(a: i64, b: i64) -> i64;
+pub func i64_bitand(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn i32_bitor(a: i32, b: i32) -> i32;
+pub func i32_bitor(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_bitor(a: i64, b: i64) -> i64;
+pub func i64_bitor(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn i32_bitxor(a: i32, b: i32) -> i32;
+pub func i32_bitxor(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_bitxor(a: i64, b: i64) -> i64;
+pub func i64_bitxor(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn i32_shl(a: i32, b: i32) -> i32;
+pub func i32_shl(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_shl(a: i64, b: i64) -> i64;
+pub func i64_shl(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn i32_shr(a: i32, b: i32) -> i32;
+pub func i32_shr(a: i32, b: i32) -> i32;
 
 #[intrinsic]
-pub fn u32_shr(a: u32, b: u32) -> u32;
+pub func u32_shr(a: u32, b: u32) -> u32;
 
 #[intrinsic]
-pub fn i64_shr(a: i64, b: i64) -> i64;
+pub func i64_shr(a: i64, b: i64) -> i64;
 
 #[intrinsic]
-pub fn u64_shr(a: u64, b: u64) -> u64;
+pub func u64_shr(a: u64, b: u64) -> u64;
 
 #[intrinsic]
-pub fn i32_bitnot(value: i32) -> i32;
+pub func i32_bitnot(value: i32) -> i32;
 
 #[intrinsic]
-pub fn i64_bitnot(value: i64) -> i64;
+pub func i64_bitnot(value: i64) -> i64;
 
 #[intrinsic]
-pub fn i32_eqz(value: i32) -> bool;
+pub func i32_eqz(value: i32) -> bool;
 
 #[intrinsic]
-pub fn i32_eq(a: i32, b: i32) -> bool;
+pub func i32_eq(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn i64_eq(a: i64, b: i64) -> bool;
+pub func i64_eq(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn f32_eq(a: f32, b: f32) -> bool;
+pub func f32_eq(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_eq(a: f64, b: f64) -> bool;
+pub func f64_eq(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn i32_ne(a: i32, b: i32) -> bool;
+pub func i32_ne(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn i64_ne(a: i64, b: i64) -> bool;
+pub func i64_ne(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn f32_ne(a: f32, b: f32) -> bool;
+pub func f32_ne(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_ne(a: f64, b: f64) -> bool;
+pub func f64_ne(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn i32_lt(a: i32, b: i32) -> bool;
+pub func i32_lt(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn u32_lt(a: u32, b: u32) -> bool;
+pub func u32_lt(a: u32, b: u32) -> bool;
 
 #[intrinsic]
-pub fn i64_lt(a: i64, b: i64) -> bool;
+pub func i64_lt(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn u64_lt(a: u64, b: u64) -> bool;
+pub func u64_lt(a: u64, b: u64) -> bool;
 
 #[intrinsic]
-pub fn f32_lt(a: f32, b: f32) -> bool;
+pub func f32_lt(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_lt(a: f64, b: f64) -> bool;
+pub func f64_lt(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn i32_le(a: i32, b: i32) -> bool;
+pub func i32_le(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn u32_le(a: u32, b: u32) -> bool;
+pub func u32_le(a: u32, b: u32) -> bool;
 
 #[intrinsic]
-pub fn i64_le(a: i64, b: i64) -> bool;
+pub func i64_le(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn u64_le(a: u64, b: u64) -> bool;
+pub func u64_le(a: u64, b: u64) -> bool;
 
 #[intrinsic]
-pub fn f32_le(a: f32, b: f32) -> bool;
+pub func f32_le(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_le(a: f64, b: f64) -> bool;
+pub func f64_le(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn i32_gt(a: i32, b: i32) -> bool;
+pub func i32_gt(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn u32_gt(a: u32, b: u32) -> bool;
+pub func u32_gt(a: u32, b: u32) -> bool;
 
 #[intrinsic]
-pub fn i64_gt(a: i64, b: i64) -> bool;
+pub func i64_gt(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn u64_gt(a: u64, b: u64) -> bool;
+pub func u64_gt(a: u64, b: u64) -> bool;
 
 #[intrinsic]
-pub fn f32_gt(a: f32, b: f32) -> bool;
+pub func f32_gt(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_gt(a: f64, b: f64) -> bool;
+pub func f64_gt(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn i32_ge(a: i32, b: i32) -> bool;
+pub func i32_ge(a: i32, b: i32) -> bool;
 
 #[intrinsic]
-pub fn u32_ge(a: u32, b: u32) -> bool;
+pub func u32_ge(a: u32, b: u32) -> bool;
 
 #[intrinsic]
-pub fn i64_ge(a: i64, b: i64) -> bool;
+pub func i64_ge(a: i64, b: i64) -> bool;
 
 #[intrinsic]
-pub fn u64_ge(a: u64, b: u64) -> bool;
+pub func u64_ge(a: u64, b: u64) -> bool;
 
 #[intrinsic]
-pub fn f32_ge(a: f32, b: f32) -> bool;
+pub func f32_ge(a: f32, b: f32) -> bool;
 
 #[intrinsic]
-pub fn f64_ge(a: f64, b: f64) -> bool;
+pub func f64_ge(a: f64, b: f64) -> bool;
 
 #[intrinsic]
-pub fn f32_convert_i32(value: i32) -> f32;
+pub func f32_convert_i32(value: i32) -> f32;
 
 #[intrinsic]
-pub fn f32_convert_u32(value: u32) -> f32;
+pub func f32_convert_u32(value: u32) -> f32;
 
 #[intrinsic]
-pub fn f32_convert_i64(value: i64) -> f32;
+pub func f32_convert_i64(value: i64) -> f32;
 
 #[intrinsic]
-pub fn f32_convert_u64(value: u64) -> f32;
+pub func f32_convert_u64(value: u64) -> f32;
 
 #[intrinsic]
-pub fn f64_convert_i32(value: i32) -> f64;
+pub func f64_convert_i32(value: i32) -> f64;
 
 #[intrinsic]
-pub fn f64_convert_u32(value: u32) -> f64;
+pub func f64_convert_u32(value: u32) -> f64;
 
 #[intrinsic]
-pub fn f64_convert_i64(value: i64) -> f64;
+pub func f64_convert_i64(value: i64) -> f64;
 
 #[intrinsic]
-pub fn f64_convert_u64(value: u64) -> f64;
+pub func f64_convert_u64(value: u64) -> f64;
 
 #[intrinsic]
-pub fn i32_trunc_f32(value: f32) -> i32;
+pub func i32_trunc_f32(value: f32) -> i32;
 
 #[intrinsic]
-pub fn u32_trunc_f32(value: f32) -> u32;
+pub func u32_trunc_f32(value: f32) -> u32;
 
 #[intrinsic]
-pub fn i32_trunc_f64(value: f64) -> i32;
+pub func i32_trunc_f64(value: f64) -> i32;
 
 #[intrinsic]
-pub fn u32_trunc_f64(value: f64) -> u32;
+pub func u32_trunc_f64(value: f64) -> u32;
 
 #[intrinsic]
-pub fn i64_trunc_f32(value: f32) -> i64;
+pub func i64_trunc_f32(value: f32) -> i64;
 
 #[intrinsic]
-pub fn u64_trunc_f32(value: f32) -> u64;
+pub func u64_trunc_f32(value: f32) -> u64;
 
 #[intrinsic]
-pub fn i64_trunc_f64(value: f64) -> i64;
+pub func i64_trunc_f64(value: f64) -> i64;
 
 #[intrinsic]
-pub fn u64_trunc_f64(value: f64) -> u64;
+pub func u64_trunc_f64(value: f64) -> u64;
 
 #[intrinsic]
-pub fn f64_promote_f32(value: f32) -> f64;
+pub func f64_promote_f32(value: f32) -> f64;
 
 #[intrinsic]
-pub fn f32_demote_f64(value: f64) -> f32;
+pub func f32_demote_f64(value: f64) -> f32;
 
 #[intrinsic]
-pub fn i32_reinterpret_f32(value: f32) -> i32;
+pub func i32_reinterpret_f32(value: f32) -> i32;
 
 #[intrinsic]
-pub fn f32_reinterpret_i32(value: i32) -> f32;
+pub func f32_reinterpret_i32(value: i32) -> f32;
 
 #[intrinsic]
-pub fn i64_reinterpret_f64(value: f64) -> i64;
+pub func i64_reinterpret_f64(value: f64) -> i64;
 
 #[intrinsic]
-pub fn f64_reinterpret_i64(value: i64) -> f64;
+pub func f64_reinterpret_i64(value: i64) -> f64;
 
 impl f32 {
     pub const NAN: f32 = 0.0 / 0.0;
@@ -580,82 +577,82 @@ impl f32 {
     pub const MAX: f32 = 3.40282347e+38;
 
     #[inline]
-    pub fn trunc(self) -> Self {
+    pub func trunc(self) -> Self {
         f32_trunc(self)
     }
 
     #[inline]
-    pub fn abs(self) -> Self {
+    pub func abs(self) -> Self {
         f32_abs(self)
     }
 
     #[inline]
-    pub fn sqrt(self) -> Self {
+    pub func sqrt(self) -> Self {
         f32_sqrt(self)
     }
 
     #[inline]
-    pub fn floor(self) -> Self {
+    pub func floor(self) -> Self {
         f32_floor(self)
     }
 
     #[inline]
-    pub fn ceil(self) -> Self {
+    pub func ceil(self) -> Self {
         f32_ceil(self)
     }
 
     #[inline]
-    pub fn nearest(self) -> Self {
+    pub func nearest(self) -> Self {
         f32_nearest(self)
     }
 
     #[inline]
-    pub fn min(self, other: Self) -> Self {
+    pub func min(self, other: Self) -> Self {
         f32_min(self, other)
     }
 
     #[inline]
-    pub fn max(self, other: Self) -> Self {
+    pub func max(self, other: Self) -> Self {
         f32_max(self, other)
     }
 
     #[inline]
-    pub fn copysign(self, sign: Self) -> Self {
+    pub func copysign(self, sign: Self) -> Self {
         f32_copysign(self, sign)
     }
 
     #[inline]
-    pub fn to_bits(self) -> u32 {
+    pub func to_bits(self) -> u32 {
         i32_reinterpret_f32(self) as u32
     }
 
     #[inline]
-    pub fn from_bits(bits: u32) -> Self {
+    pub func from_bits(bits: u32) -> Self {
         f32_reinterpret_i32(bits as i32)
     }
 
     #[inline]
-    pub fn promote(self) -> f64 {
+    pub func promote(self) -> f64 {
         f64_promote_f32(self)
     }
 
     #[inline]
-    pub fn to_i32(self) -> i32 {
+    pub func to_i32(self) -> i32 {
         i32_trunc_f32(self)
     }
 
     #[inline]
-    pub fn to_u32(self) -> u32 {
+    pub func to_u32(self) -> u32 {
         u32_trunc_f32(self)
     }
 
     #[inline]
-    pub fn to_i64(self) -> i64 {
+    pub func to_i64(self) -> i64 {
         i64_trunc_f32(self)
     }
 
     #[inline]
-    pub fn to_u64(self) -> u64 {
+    pub func to_u64(self) -> u64 {
         u64_trunc_f32(self)
     }
 }
@@ -676,1294 +673,1294 @@ impl f64 {
     pub const MAX: f64 = 1.7976931348623157e+308;
 
     #[inline]
-    pub fn trunc(self) -> Self {
+    pub func trunc(self) -> Self {
         f64_trunc(self)
     }
 
     #[inline]
-    pub fn abs(self) -> Self {
+    pub func abs(self) -> Self {
         f64_abs(self)
     }
 
     #[inline]
-    pub fn sqrt(self) -> Self {
+    pub func sqrt(self) -> Self {
         f64_sqrt(self)
     }
 
     #[inline]
-    pub fn floor(self) -> Self {
+    pub func floor(self) -> Self {
         f64_floor(self)
     }
 
     #[inline]
-    pub fn ceil(self) -> Self {
+    pub func ceil(self) -> Self {
         f64_ceil(self)
     }
 
     #[inline]
-    pub fn nearest(self) -> Self {
+    pub func nearest(self) -> Self {
         f64_nearest(self)
     }
 
     #[inline]
-    pub fn min(self, other: Self) -> Self {
+    pub func min(self, other: Self) -> Self {
         f64_min(self, other)
     }
 
     #[inline]
-    pub fn max(self, other: Self) -> Self {
+    pub func max(self, other: Self) -> Self {
         f64_max(self, other)
     }
 
     #[inline]
-    pub fn copysign(self, sign: Self) -> Self {
+    pub func copysign(self, sign: Self) -> Self {
         f64_copysign(self, sign)
     }
 
     #[inline]
-    pub fn to_bits(self) -> u64 {
+    pub func to_bits(self) -> u64 {
         i64_reinterpret_f64(self) as u64
     }
 
     #[inline]
-    pub fn from_bits(bits: u64) -> Self {
+    pub func from_bits(bits: u64) -> Self {
         f64_reinterpret_i64(bits as i64)
     }
 
     #[inline]
-    pub fn demote(self) -> f32 {
+    pub func demote(self) -> f32 {
         f32_demote_f64(self)
     }
 
     #[inline]
-    pub fn to_i32(self) -> i32 {
+    pub func to_i32(self) -> i32 {
         i32_trunc_f64(self)
     }
 
     #[inline]
-    pub fn to_u32(self) -> u32 {
+    pub func to_u32(self) -> u32 {
         u32_trunc_f64(self)
     }
 
     #[inline]
-    pub fn to_i64(self) -> i64 {
+    pub func to_i64(self) -> i64 {
         i64_trunc_f64(self)
     }
 
     #[inline]
-    pub fn to_u64(self) -> u64 {
+    pub func to_u64(self) -> u64 {
         u64_trunc_f64(self)
     }
 }
 
 impl i32 {
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub func to_f32(self) -> f32 {
         f32_convert_i32(self)
     }
 
     #[inline]
-    pub fn to_f64(self) -> f64 {
+    pub func to_f64(self) -> f64 {
         f64_convert_i32(self)
     }
 }
 
 impl Add for i32 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self, rhs)
     }
 }
 
 impl Sub for i32 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self, rhs)
     }
 }
 
 impl Mul for i32 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self, rhs)
     }
 }
 
 impl Div for i32 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         i32_div(self, rhs)
     }
 }
 
 impl Rem for i32 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         i32_rem(self, rhs)
     }
 }
 
 impl Neg for i32 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         i32_neg(self)
     }
 }
 
 impl BitAnd for i32 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self, rhs)
     }
 }
 
 impl BitOr for i32 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self, rhs)
     }
 }
 
 impl BitXor for i32 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self, rhs)
     }
 }
 
 impl Shl for i32 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self, rhs)
     }
 }
 
 impl Shr for i32 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         i32_shr(self, rhs)
     }
 }
 
 impl BitNot for i32 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self)
     }
 }
 
 impl u32 {
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub func to_f32(self) -> f32 {
         f32_convert_u32(self)
     }
 
     #[inline]
-    pub fn to_f64(self) -> f64 {
+    pub func to_f64(self) -> f64 {
         f64_convert_u32(self)
     }
 }
 
 impl Add for u32 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self as i32, rhs as i32) as u32
     }
 }
 
 impl Sub for u32 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self as i32, rhs as i32) as u32
     }
 }
 
 impl Mul for u32 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self as i32, rhs as i32) as u32
     }
 }
 
 impl Div for u32 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         u32_div(self, rhs)
     }
 }
 
 impl Rem for u32 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         u32_rem(self, rhs)
     }
 }
 
 impl BitAnd for u32 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as u32
     }
 }
 
 impl BitOr for u32 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as u32
     }
 }
 
 impl BitXor for u32 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as u32
     }
 }
 
 impl Shl for u32 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self as i32, rhs as i32) as u32
     }
 }
 
 impl Shr for u32 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         u32_shr(self, rhs)
     }
 }
 
 impl BitNot for u32 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self as i32) as u32
     }
 }
 
 impl i64 {
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub func to_f32(self) -> f32 {
         f32_convert_i64(self)
     }
 
     #[inline]
-    pub fn to_f64(self) -> f64 {
+    pub func to_f64(self) -> f64 {
         f64_convert_i64(self)
     }
 }
 
 impl Add for i64 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i64_add(self, rhs)
     }
 }
 
 impl Sub for i64 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i64_sub(self, rhs)
     }
 }
 
 impl Mul for i64 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i64_mul(self, rhs)
     }
 }
 
 impl Div for i64 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         i64_div(self, rhs)
     }
 }
 
 impl Rem for i64 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         i64_rem(self, rhs)
     }
 }
 
 impl Neg for i64 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         i64_neg(self)
     }
 }
 
 impl BitAnd for i64 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i64_bitand(self, rhs)
     }
 }
 
 impl BitOr for i64 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i64_bitor(self, rhs)
     }
 }
 
 impl BitXor for i64 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i64_bitxor(self, rhs)
     }
 }
 
 impl Shl for i64 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i64_shl(self, rhs)
     }
 }
 
 impl Shr for i64 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         i64_shr(self, rhs)
     }
 }
 
 impl BitNot for i64 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i64_bitnot(self)
     }
 }
 
 impl u64 {
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub func to_f32(self) -> f32 {
         f32_convert_u64(self)
     }
 
     #[inline]
-    pub fn to_f64(self) -> f64 {
+    pub func to_f64(self) -> f64 {
         f64_convert_u64(self)
     }
 }
 
 impl Add for u64 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i64_add(self as i64, rhs as i64) as u64
     }
 }
 
 impl Sub for u64 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i64_sub(self as i64, rhs as i64) as u64
     }
 }
 
 impl Mul for u64 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i64_mul(self as i64, rhs as i64) as u64
     }
 }
 
 impl Div for u64 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         u64_div(self, rhs)
     }
 }
 
 impl Rem for u64 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         u64_rem(self, rhs)
     }
 }
 
 impl BitAnd for u64 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i64_bitand(self as i64, rhs as i64) as u64
     }
 }
 
 impl BitOr for u64 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i64_bitor(self as i64, rhs as i64) as u64
     }
 }
 
 impl BitXor for u64 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i64_bitxor(self as i64, rhs as i64) as u64
     }
 }
 
 impl Shl for u64 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i64_shl(self as i64, rhs as i64) as u64
     }
 }
 
 impl Shr for u64 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         u64_shr(self, rhs)
     }
 }
 
 impl BitNot for u64 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i64_bitnot(self as i64) as u64
     }
 }
 
 impl Add for f32 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         f32_add(self, rhs)
     }
 }
 
 impl Sub for f32 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         f32_sub(self, rhs)
     }
 }
 
 impl Mul for f32 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         f32_mul(self, rhs)
     }
 }
 
 impl Div for f32 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         f32_div(self, rhs)
     }
 }
 
 impl Neg for f32 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         f32_neg(self)
     }
 }
 
 impl Rem for f32 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         self - rhs * (self / rhs).trunc()
     }
 }
 
 impl Add for f64 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         f64_add(self, rhs)
     }
 }
 
 impl Sub for f64 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         f64_sub(self, rhs)
     }
 }
 
 impl Mul for f64 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         f64_mul(self, rhs)
     }
 }
 
 impl Div for f64 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         f64_div(self, rhs)
     }
 }
 
 impl Neg for f64 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         f64_neg(self)
     }
 }
 
 impl Rem for f64 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         self - rhs * (self / rhs).trunc()
     }
 }
 
 impl Add for i8 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self as i32, rhs as i32) as i8
     }
 }
 
 impl Sub for i8 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self as i32, rhs as i32) as i8
     }
 }
 
 impl Mul for i8 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self as i32, rhs as i32) as i8
     }
 }
 
 impl Div for i8 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         i32_div(self as i32, rhs as i32) as i8
     }
 }
 
 impl Rem for i8 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         i32_rem(self as i32, rhs as i32) as i8
     }
 }
 
 impl Neg for i8 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         i32_neg(self as i32) as i8
     }
 }
 
 impl BitAnd for i8 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as i8
     }
 }
 
 impl BitOr for i8 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as i8
     }
 }
 
 impl BitXor for i8 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as i8
     }
 }
 
 impl Shl for i8 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self as i32, rhs as i32) as i8
     }
 }
 
 impl Shr for i8 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         i32_shr(self as i32, rhs as i32) as i8
     }
 }
 
 impl BitNot for i8 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self as i32) as i8
     }
 }
 
 impl Add for u8 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self as i32, rhs as i32) as u8
     }
 }
 
 impl Sub for u8 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self as i32, rhs as i32) as u8
     }
 }
 
 impl Mul for u8 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self as i32, rhs as i32) as u8
     }
 }
 
 impl Div for u8 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         u32_div(self as u32, rhs as u32) as u8
     }
 }
 
 impl Rem for u8 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         u32_rem(self as u32, rhs as u32) as u8
     }
 }
 
 impl BitAnd for u8 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as u8
     }
 }
 
 impl BitOr for u8 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as u8
     }
 }
 
 impl BitXor for u8 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as u8
     }
 }
 
 impl Shl for u8 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self as i32, rhs as i32) as u8
     }
 }
 
 impl Shr for u8 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         u32_shr(self as u32, rhs as u32) as u8
     }
 }
 
 impl BitNot for u8 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self as i32) as u8
     }
 }
 
 impl Add for i16 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self as i32, rhs as i32) as i16
     }
 }
 
 impl Sub for i16 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self as i32, rhs as i32) as i16
     }
 }
 
 impl Mul for i16 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self as i32, rhs as i32) as i16
     }
 }
 
 impl Div for i16 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         i32_div(self as i32, rhs as i32) as i16
     }
 }
 
 impl Rem for i16 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         i32_rem(self as i32, rhs as i32) as i16
     }
 }
 
 impl Neg for i16 {
     #[inline]
-    fn neg(self) -> Self {
+    func neg(self) -> Self {
         i32_neg(self as i32) as i16
     }
 }
 
 impl BitAnd for i16 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as i16
     }
 }
 
 impl BitOr for i16 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as i16
     }
 }
 
 impl BitXor for i16 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as i16
     }
 }
 
 impl Shl for i16 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self as i32, rhs as i32) as i16
     }
 }
 
 impl Shr for i16 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         i32_shr(self as i32, rhs as i32) as i16
     }
 }
 
 impl BitNot for i16 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self as i32) as i16
     }
 }
 
 impl Add for u16 {
     #[inline]
-    fn add(self, rhs: Self) -> Self {
+    func add(self, rhs: Self) -> Self {
         i32_add(self as i32, rhs as i32) as u16
     }
 }
 
 impl Sub for u16 {
     #[inline]
-    fn sub(self, rhs: Self) -> Self {
+    func sub(self, rhs: Self) -> Self {
         i32_sub(self as i32, rhs as i32) as u16
     }
 }
 
 impl Mul for u16 {
     #[inline]
-    fn mul(self, rhs: Self) -> Self {
+    func mul(self, rhs: Self) -> Self {
         i32_mul(self as i32, rhs as i32) as u16
     }
 }
 
 impl Div for u16 {
     #[inline]
-    fn div(self, rhs: Self) -> Self {
+    func div(self, rhs: Self) -> Self {
         u32_div(self as u32, rhs as u32) as u16
     }
 }
 
 impl Rem for u16 {
     #[inline]
-    fn rem(self, rhs: Self) -> Self {
+    func rem(self, rhs: Self) -> Self {
         u32_rem(self as u32, rhs as u32) as u16
     }
 }
 
 impl BitAnd for u16 {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as u16
     }
 }
 
 impl BitOr for u16 {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as u16
     }
 }
 
 impl BitXor for u16 {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as u16
     }
 }
 
 impl Shl for u16 {
     #[inline]
-    fn shl(self, rhs: Self) -> Self {
+    func shl(self, rhs: Self) -> Self {
         i32_shl(self as i32, rhs as i32) as u16
     }
 }
 
 impl Shr for u16 {
     #[inline]
-    fn shr(self, rhs: Self) -> Self {
+    func shr(self, rhs: Self) -> Self {
         u32_shr(self as u32, rhs as u32) as u16
     }
 }
 
 impl BitNot for u16 {
     #[inline]
-    fn bitnot(self) -> Self {
+    func bitnot(self) -> Self {
         i32_bitnot(self as i32) as u16
     }
 }
 
 impl BitAnd for bool {
     #[inline]
-    fn bitand(self, rhs: Self) -> Self {
+    func bitand(self, rhs: Self) -> Self {
         i32_bitand(self as i32, rhs as i32) as bool
     }
 }
 
 impl BitOr for bool {
     #[inline]
-    fn bitor(self, rhs: Self) -> Self {
+    func bitor(self, rhs: Self) -> Self {
         i32_bitor(self as i32, rhs as i32) as bool
     }
 }
 
 impl BitXor for bool {
     #[inline]
-    fn bitxor(self, rhs: Self) -> Self {
+    func bitxor(self, rhs: Self) -> Self {
         i32_bitxor(self as i32, rhs as i32) as bool
     }
 }
 
 impl Not for bool {
     #[inline]
-    fn not(self) -> Self {
+    func not(self) -> Self {
         i32_eqz(self as i32)
     }
 }
 
 impl PartialEq for i32 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self, other)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self, other)
     }
 }
 
 impl PartialEq for u32 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for i64 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i64_eq(self, other)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i64_ne(self, other)
     }
 }
 
 impl PartialEq for u64 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i64_eq(self as i64, other as i64)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i64_ne(self as i64, other as i64)
     }
 }
 
 impl PartialEq for i8 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for u8 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for i16 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for u16 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for f32 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         f32_eq(self, other)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         f32_ne(self, other)
     }
 }
 
 impl PartialEq for f64 {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         f64_eq(self, other)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         f64_ne(self, other)
     }
 }
 
 impl PartialEq for bool {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialEq for char {
     #[inline]
-    fn eq(self, other: Self) -> bool {
+    func eq(self, other: Self) -> bool {
         i32_eq(self as i32, other as i32)
     }
 
     #[inline]
-    fn ne(self, other: Self) -> bool {
+    func ne(self, other: Self) -> bool {
         i32_ne(self as i32, other as i32)
     }
 }
 
 impl PartialOrd for i32 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         i32_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         i32_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         i32_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         i32_ge(self, other)
     }
 }
 
 impl PartialOrd for u32 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u32_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u32_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u32_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u32_ge(self, other)
     }
 }
 
 impl PartialOrd for i64 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         i64_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         i64_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         i64_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         i64_ge(self, other)
     }
 }
 
 impl PartialOrd for u64 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u64_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u64_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u64_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u64_ge(self, other)
     }
 }
 
 impl PartialOrd for i8 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         i32_lt(self as i32, other as i32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         i32_le(self as i32, other as i32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         i32_gt(self as i32, other as i32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         i32_ge(self as i32, other as i32)
     }
 }
 
 impl PartialOrd for u8 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u32_lt(self as u32, other as u32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u32_le(self as u32, other as u32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u32_gt(self as u32, other as u32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u32_ge(self as u32, other as u32)
     }
 }
 
 impl PartialOrd for i16 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         i32_lt(self as i32, other as i32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         i32_le(self as i32, other as i32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         i32_gt(self as i32, other as i32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         i32_ge(self as i32, other as i32)
     }
 }
 
 impl PartialOrd for u16 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u32_lt(self as u32, other as u32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u32_le(self as u32, other as u32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u32_gt(self as u32, other as u32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u32_ge(self as u32, other as u32)
     }
 }
 
 impl PartialOrd for f32 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         f32_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         f32_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         f32_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         f32_ge(self, other)
     }
 }
 
 impl PartialOrd for f64 {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         f64_lt(self, other)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         f64_le(self, other)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         f64_gt(self, other)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         f64_ge(self, other)
     }
 }
 
 impl PartialOrd for bool {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u32_lt(self as u32, other as u32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u32_le(self as u32, other as u32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u32_gt(self as u32, other as u32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u32_ge(self as u32, other as u32)
     }
 }
 
 impl PartialOrd for char {
     #[inline]
-    fn lt(self, other: Self) -> bool {
+    func lt(self, other: Self) -> bool {
         u32_lt(self as u32, other as u32)
     }
 
     #[inline]
-    fn le(self, other: Self) -> bool {
+    func le(self, other: Self) -> bool {
         u32_le(self as u32, other as u32)
     }
 
     #[inline]
-    fn gt(self, other: Self) -> bool {
+    func gt(self, other: Self) -> bool {
         u32_gt(self as u32, other as u32)
     }
 
     #[inline]
-    fn ge(self, other: Self) -> bool {
+    func ge(self, other: Self) -> bool {
         u32_ge(self as u32, other as u32)
     }
 }
@@ -1990,70 +1987,70 @@ impl Eq for char {}
 
 impl Ord for u8 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for u16 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for u32 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for u64 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for i8 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for i16 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for i32 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for i64 {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for bool {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
 impl Ord for char {
     #[inline]
-    fn cmp(self, other: Self) -> Ordering {
+    func cmp(self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
@@ -2112,23 +2109,23 @@ impl SignedInt for i64 {
 /// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
 #[intrinsic]
-pub fn memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
+pub func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
 /// Returns the current size of `mem` in pages. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/size
 #[intrinsic]
-pub fn memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
+pub func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 /// This is analogous to `memset` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
 #[intrinsic]
-pub fn memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
+pub func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
 /// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
 #[intrinsic]
-pub fn memory_copy<
+pub func memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
@@ -2137,21 +2134,21 @@ pub fn memory_copy<
 pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
 
 #[intrinsic]
-fn global_get<G: Global>(g: G) -> G::Value;
+func global_get<G: Global>(g: G) -> G::Value;
 
 #[intrinsic]
-fn global_set<G: Global>(g: G, value: G::Value);
+func global_set<G: Global>(g: G, value: G::Value);
 
 pub trait Global {
     type Value;
 
-    fn get(self) -> Self::Value {
+    func get(self) -> Self::Value {
         global_get(self)
     }
 }
 
 pub trait GlobalMut: Global {
-    fn set(self, value: Self::Value) {
+    func set(self, value: Self::Value) {
         global_set(self, value)
     }
 }
@@ -2172,28 +2169,40 @@ pub trait Memory {
 
     /// Grows this memory by `delta` pages; returns the previous size in pages, or `-1` on failure.
     #[inline]
-    fn grow(self, delta: Self::Size) -> Self::Size::Signed {
+    func grow(self, delta: Self::Size) -> Self::Size::Signed {
         memory_grow(self, delta)
     }
 
     /// Returns the current size of this memory, in pages.
     #[inline]
-    fn size_pages(self) -> Self::Size {
+    func size_pages(self) -> Self::Size {
         memory_size(self)
     }
 
     /// Returns the current size of this memory, in bytes.
     #[inline]
-    fn size_bytes(self) -> Self::Size {
+    func size_bytes(self) -> Self::Size {
         self.size_pages() * Self::PAGE_SIZE
     }
 }
 
 #[intrinsic]
-pub fn size_of<T, Mem: Memory>() -> Mem::Size;
+pub func func_ref<F: Function>(f: F) -> func(F::Args) -> F::Result;
+
+pub trait Function {
+    type Args;
+    type Result;
+
+    func as_ref(self) -> func(Self::Args) -> Self::Result {
+        func_ref(self)
+    }
+}
 
 #[intrinsic]
-pub fn align_of<T, Mem: Memory>() -> Mem::Size;
+pub func size_of<T, Mem: Memory>() -> Mem::Size;
+
+#[intrinsic]
+pub func align_of<T, Mem: Memory>() -> Mem::Size;
 
 pub struct Layout<Mem: Memory>(
     size: Mem::Size,
@@ -2202,22 +2211,22 @@ pub struct Layout<Mem: Memory>(
 
 impl<Mem: Memory> Layout<Mem> {
     #[inline]
-    pub fn of<T>() -> Self {
+    pub func of<T>() -> Self {
         Self({ size: size_of::<T>(), align: align_of::<T>() })
     }
 
     #[inline]
-    pub fn array<T>(count: Mem::Size) -> Self {
+    pub func array<T>(count: Mem::Size) -> Self {
         Self({ align: align_of::<T>(), size: size_of::<T>() * count })
     }
 
     #[inline]
-    pub fn size(self) -> Mem::Size {
+    pub func size(self) -> Mem::Size {
         self.size
     }
 
     #[inline]
-    pub fn align(self) -> Mem::Size {
+    pub func align(self) -> Mem::Size {
         self.align
     }
 }
@@ -2225,17 +2234,17 @@ impl<Mem: Memory> Layout<Mem> {
 pub trait Allocator {
     type Mem: Memory;
 
-    fn allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
+    func allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    fn allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+    func allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
         local ptr = self.allocate(Layout::of::<T>()) as Self::Mem::*T;
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    fn allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
+    func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
             self.allocate(Layout::array::<T>(len)) as Self::Mem::&T,
             len,
@@ -2249,61 +2258,61 @@ pub struct RawPtr<Mem: Memory, T>(
 
 impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
-    pub fn addr(self) -> Mem::Size {
+    pub func addr(self) -> Mem::Size {
         self.addr
     }
 
     #[inline]
-    pub fn null() -> Self {
+    pub func null() -> Self {
         Self({ addr: 0 })
     }
 
     #[inline]
-    pub fn from_ref(ref: Mem::&T) -> Self {
+    pub func from_ref(ref: Mem::&T) -> Self {
         Self({ addr: ref as _ })
     }
 
     #[inline]
-    pub fn from_ptr(ptr: Mem::*T) -> Self {
+    pub func from_ptr(ptr: Mem::*T) -> Self {
         Self({ addr: ptr as _ })
     }
 
     #[inline]
-    pub fn from_addr(addr: Mem::Size) -> Self {
+    pub func from_addr(addr: Mem::Size) -> Self {
         Self({ addr })
     }
 
     #[inline]
-    pub fn as_ref(self) -> Mem::&T {
+    pub func as_ref(self) -> Mem::&T {
         self.addr as _
     }
 
     #[inline]
-    pub fn as_ptr(self) -> Mem::*T {
+    pub func as_ptr(self) -> Mem::*T {
         self.addr as _
     }
 
     #[inline]
-    pub fn is_null(self) -> bool {
+    pub func is_null(self) -> bool {
         self.addr == 0
     }
 
     #[inline]
-    pub fn cast<U>(self) -> RawPtr<Mem, U> {
+    pub func cast<U>(self) -> RawPtr<Mem, U> {
         RawPtr({ addr: self.addr }) as _
     }
 }
 
 impl<Mem: Memory where { Size: Sub }, T> RawPtr<Mem, T> {
     #[inline]
-    pub fn sub(self, count: Mem::Size) -> Self {
+    pub func sub(self, count: Mem::Size) -> Self {
         Self({ addr: self.addr - count * size_of::<T, Mem>() })
     }
 }
 
 impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
     #[inline]
-    pub fn add(self, count: Mem::Size) -> Self {
+    pub func add(self, count: Mem::Size) -> Self {
         Self({ addr: self.addr + count * size_of::<T, Mem>() })
     }
 }
@@ -2312,7 +2321,7 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
     /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
     #[inline]
-    pub fn align_up(self, align: Mem::Size) -> Self {
+    pub func align_up(self, align: Mem::Size) -> Self {
         Self({ addr: (self.addr + align - 1) & ^(align - 1) })
     }
 }
@@ -2323,12 +2332,12 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
 // that lands.
 // impl<Mem: Memory, T> Mem::&[T] {
 //     #[inline]
-//     pub fn len(self) -> Mem::Size {
+//     pub func len(self) -> Mem::Size {
 //         slice_len(self)
 //     }
 //
 //     #[inline]
-//     pub fn ptr(self) -> Mem::&T {
+//     pub func ptr(self) -> Mem::&T {
 //         slice_ptr(self)
 //     }
 // }
@@ -2337,7 +2346,7 @@ const ASCII_CASE_MASK: u8 = 0b0010_0000;
 
 impl char {
     #[inline]
-    pub fn to_ascii_uppercase(self) -> char {
+    pub func to_ascii_uppercase(self) -> char {
         if self.is_ascii_lowercase() {
             ((self as u8) ^ ASCII_CASE_MASK) as char
         } else {
@@ -2346,7 +2355,7 @@ impl char {
     }
 
     #[inline]
-    pub fn to_ascii_lowercase(self) -> char {
+    pub func to_ascii_lowercase(self) -> char {
         if self.is_ascii_uppercase() {
             ((self as u8) ^ ASCII_CASE_MASK) as char
         } else {
@@ -2355,39 +2364,39 @@ impl char {
     }
 
     #[inline]
-    pub fn is_ascii(self) -> bool {
+    pub func is_ascii(self) -> bool {
         (self as u32) <= 0x7F
     }
 
     #[inline]
-    pub fn is_ascii_uppercase(self) -> bool {
+    pub func is_ascii_uppercase(self) -> bool {
         self >= 'A' && self <= 'Z'
     }
 
     #[inline]
-    pub fn is_ascii_lowercase(self) -> bool {
+    pub func is_ascii_lowercase(self) -> bool {
         self >= 'a' && self <= 'z'
     }
 
     #[inline]
-    pub fn is_ascii_alphabetic(self) -> bool {
+    pub func is_ascii_alphabetic(self) -> bool {
         (self >= 'A' && self <= 'Z') | (self >= 'a' && self <= 'z')
     }
 
     #[inline]
-    pub fn is_ascii_digit(self) -> bool {
+    pub func is_ascii_digit(self) -> bool {
         self >= '0' && self <= '9'
     }
 
     #[inline]
-    pub fn is_ascii_alphanumeric(self) -> bool {
+    pub func is_ascii_alphanumeric(self) -> bool {
         (self >= 'A' && self <= 'Z')
             | (self >= 'a' && self <= 'z')
             | (self >= '0' && self <= '9')
     }
 
     #[inline]
-    pub fn is_ascii_whitespace(self) -> bool {
+    pub func is_ascii_whitespace(self) -> bool {
         self == '\t'
             || self == '\n'
             || self == '\x0C'
@@ -2396,19 +2405,19 @@ impl char {
     }
 
     #[inline]
-    pub fn is_ascii_control(self) -> bool {
+    pub func is_ascii_control(self) -> bool {
         (self as u32) <= 0x1F || self == '\x7F'
     }
 
     #[inline]
-    pub fn is_ascii_hexdigit(self) -> bool {
+    pub func is_ascii_hexdigit(self) -> bool {
         (self >= '0' && self <= '9')
             | (self >= 'A' && self <= 'F')
             | (self >= 'a' && self <= 'f')
     }
 
     #[inline]
-    pub fn is_ascii_punctuation(self) -> bool {
+    pub func is_ascii_punctuation(self) -> bool {
         (self >= '!' && self <= '/')
             | (self >= ':' && self <= '@')
             | (self >= '[' && self <= '`')
@@ -2416,7 +2425,7 @@ impl char {
     }
 
     #[inline]
-    pub fn is_ascii_graphic(self) -> bool {
+    pub func is_ascii_graphic(self) -> bool {
         self >= '!' && self <= '~'
     }
 }

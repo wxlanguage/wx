@@ -1525,7 +1525,7 @@ impl<'ast> Builder<'ast, '_> {
 			});
 
 			// Resolve the method's own param bounds (e.g. `Mem:
-			// Memory` in `fn write<Mem: Memory>(...)`)  — without
+			// Memory` in `func write<Mem: Memory>(...)`)  — without
 			// this, resolve_type_identifier can still find the type
 			// param by name (it's registered above), but any trait
 			// bound on it is silently dropped.

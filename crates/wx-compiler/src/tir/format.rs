@@ -125,8 +125,7 @@ impl TypeFormatter<'_> {
 		match self.types.resolve(ty) {
 			Type::Error => f.push_str("{unknown}"),
 			Type::Infer => f.push('_'),
-			Type::Unit => f.push_str("()"),
-			Type::Never => f.push_str("never"),
+			Type::Never => f.push('!'),
 			Type::Integer => f.push_str("{integer}"),
 			Type::Float => f.push_str("{float}"),
 			Type::U8 => f.push_str("u8"),
@@ -148,6 +147,9 @@ impl TypeFormatter<'_> {
 						f.push_str(", ");
 					}
 					self.write_type(f, element);
+				}
+				if elements.len() == 1 {
+					f.push(',');
 				}
 				f.push(')');
 			}
@@ -212,7 +214,7 @@ impl TypeFormatter<'_> {
 			}
 			Type::Function { params, result } => {
 				let result = *result;
-				f.push_str("fn(");
+				f.push_str("func(");
 				for (i, param) in params.iter().copied().enumerate() {
 					if i > 0 {
 						f.push_str(", ");
@@ -226,7 +228,7 @@ impl TypeFormatter<'_> {
 				func_index: function_index,
 				type_args,
 			} => {
-				f.push_str("fn ");
+				f.push_str("func ");
 				let symbol = self.defs.functions[usize::from(*function_index)]
 					.name
 					.inner;
@@ -526,13 +528,13 @@ mod tests {
 		});
 		assert_eq!(
 			case.type_formatter().display_type(function),
-			"fn((i32, {unknown}), _) -> never"
+			"func((i32, {unknown}), _) -> !"
 		);
 	}
 
 	#[test]
 	fn memory_qualified_types_preserve_ownership_and_shape() {
-		let mut case = TestCase::new("fn allocate<M>() {}");
+		let mut case = TestCase::new("func allocate<M>() {}");
 		let memory = case.type_param("allocate", "M");
 		let slice = case.types.intern(Type::Slice {
 			of: TypeIndex::I32,
@@ -559,7 +561,7 @@ mod tests {
 	fn named_functions_and_associated_types_keep_names_and_qualification() {
 		let mut case = TestCase::new(indoc! {"
 			trait Iterable { type Item; }
-			fn iterate<T: Iterable>() {}
+			func iterate<T: Iterable>() {}
 		"});
 		let param = case.type_param("iterate", "T");
 		let DefKind::Trait(trait_index) =
@@ -582,7 +584,7 @@ mod tests {
 			type_args: Box::new([param]),
 		});
 		let formatter = case.type_formatter();
-		assert_eq!(formatter.display_type(function), "fn iterate<T>");
+		assert_eq!(formatter.display_type(function), "func iterate<T>");
 		assert_eq!(formatter.display_type(associated), "Iterable::Item");
 		assert_eq!(formatter.display_type(projection), "<T as Iterable>::Item");
 	}
@@ -593,7 +595,7 @@ mod tests {
 			trait Base {}
 			trait A: Base {}
 			trait B {}
-			fn subject<T, U: A, V: B + A + B>() {}
+			func subject<T, U: A, V: B + A + B>() {}
 		"});
 		let formatter = case.bound_formatter();
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
@@ -610,7 +612,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			trait Unsigned {}
 			trait Store { type Size; }
-			fn grow<S: Store where { Size: Unsigned }>() {}
+			func grow<S: Store where { Size: Unsigned }>() {}
 		"});
 		assert_eq!(
 			case.bound_formatter()
@@ -628,7 +630,7 @@ mod tests {
 			trait Inner { type Value; }
 			trait Outer { type Item; type Count; }
 			struct Wrapper<T>( value: T );
-			fn subject<T, S: Outer where {
+			func subject<T, S: Outer where {
 				Item: Inner where { Value = Wrapper<T> } + Leaf,
 				Count = u32
 			} + Plain>() {}

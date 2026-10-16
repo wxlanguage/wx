@@ -288,7 +288,7 @@ mod tests {
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
-				"fn f() {}".to_string(),
+				"func f() {}".to_string(),
 				FileOrigin::Local,
 			)
 			.unwrap();
@@ -340,7 +340,7 @@ mod tests {
 		let message = fails(|| view(&files, &items).assert_no_errors());
 		assert!(message.contains("expected no check errors"), "{message}");
 		// the whole point: the failure shows the source, not just a bool
-		assert!(message.contains("fn f() {}"), "{message}");
+		assert!(message.contains("func f() {}"), "{message}");
 	}
 
 	#[test]
@@ -349,7 +349,7 @@ mod tests {
 			fixture(&[(DiagnosticCode::PrivateItem, Severity::Error)]);
 		let rendered = view(&files, &items).render();
 		assert!(rendered.contains(DiagnosticCode::PrivateItem.code()));
-		assert!(rendered.contains("fn f() {}"));
+		assert!(rendered.contains("func f() {}"));
 	}
 
 	#[test]
@@ -417,7 +417,7 @@ mod tests {
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
-				"fn f() {}".to_string(),
+				"func f() {}".to_string(),
 				FileOrigin::Local,
 			)
 			.unwrap();

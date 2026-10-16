@@ -38,7 +38,7 @@ enum ImportSlot {
 	/// `Absent` so a consulting `use` item knows not to report "not
 	/// found" a second time for the same underlying problem — see its
 	/// use in `compute_import_item`.
-	Errored,
+	Poisoned,
 }
 
 impl ImportSlot {
@@ -55,7 +55,18 @@ impl ImportSlot {
 			Self::Inaccessible(key, visibility) => {
 				Some((BindingTarget::Inaccessible(key), visibility))
 			}
-			Self::Absent | Self::Errored => None,
+			Self::Absent | Self::Poisoned => None,
+		}
+	}
+
+	/// The slot once its inaccessibility has been reported: usable, so
+	/// nothing reading the installed binding reports it again.
+	fn recovered(self) -> Self {
+		match self {
+			Self::Inaccessible(key, visibility) => {
+				Self::Accessible(key, visibility)
+			}
+			slot => slot,
 		}
 	}
 }
@@ -380,13 +391,13 @@ impl<'r> ImportResolver<'r> {
 			}
 		}
 
-		let type_def = self.resolve_member_def(
+		let mut type_def = self.resolve_member_def(
 			namespace,
 			scope,
 			BindingKey::ty(name.inner),
 			name.span,
 		);
-		let value_def = self.resolve_member_def(
+		let mut value_def = self.resolve_member_def(
 			namespace,
 			scope,
 			BindingKey::value(name.inner),
@@ -395,6 +406,32 @@ impl<'r> ImportResolver<'r> {
 
 		let local_name = alias.unwrap_or(name);
 		let declared_visibility = Visibility::from(item.pub_span);
+
+		// A leaf imports whatever it can. An inaccessible namespace next to an
+		// accessible one is installed `Inaccessible`, unreported: the type of
+		// `pub struct P(x: u32)` is importable though its constructor is not,
+		// and whoever uses the constructor reports it. With nothing accessible
+		// the `use` itself is the error, reported once, here, and installed
+		// `Accessible`: having been reported, there is nothing left to defer.
+		match (type_def, value_def) {
+			(ImportSlot::Accessible(..), _)
+			| (_, ImportSlot::Accessible(..)) => {}
+			(ImportSlot::Inaccessible(def_key, _), _)
+			| (_, ImportSlot::Inaccessible(def_key, _)) => {
+				let file_id = self.namespaces.file_id(namespace.into());
+				let diagnostic = report_private_identifier(
+					self.namespaces,
+					self.strings,
+					name.inner,
+					SourceSpan::new(file_id, name.span),
+					Some(def_key),
+				);
+				self.diagnostics.push(diagnostic);
+				type_def = type_def.recovered();
+				value_def = value_def.recovered();
+			}
+			_ => {}
+		}
 
 		// Nothing usable came out of either namespace — either genuinely
 		// nothing by this name exists (`Absent`), or it does but is
@@ -405,8 +442,8 @@ impl<'r> ImportResolver<'r> {
 		// `Errored` too and stays silent, however many hops deep the
 		// chain goes, instead of hitting genuine `Absent` again and
 		// reporting the same underlying problem a second time.
-		if matches!(type_def, ImportSlot::Absent | ImportSlot::Errored)
-			&& matches!(value_def, ImportSlot::Absent | ImportSlot::Errored)
+		if matches!(type_def, ImportSlot::Absent | ImportSlot::Poisoned)
+			&& matches!(value_def, ImportSlot::Absent | ImportSlot::Poisoned)
 		{
 			if matches!(type_def, ImportSlot::Absent)
 				&& matches!(value_def, ImportSlot::Absent)
@@ -445,6 +482,7 @@ impl<'r> ImportResolver<'r> {
 		if let Some((target, source_visibility)) = type_def.resolved() {
 			if declared_visibility == Visibility::Public
 				&& source_visibility == Visibility::Private
+				&& matches!(target, BindingTarget::Accessible(_))
 			{
 				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_private_reexport(
@@ -467,6 +505,7 @@ impl<'r> ImportResolver<'r> {
 		if let Some((target, source_visibility)) = value_def.resolved() {
 			if declared_visibility == Visibility::Public
 				&& source_visibility == Visibility::Private
+				&& matches!(target, BindingTarget::Accessible(_))
 			{
 				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_private_reexport(
@@ -674,8 +713,10 @@ impl<'r> ImportResolver<'r> {
 				(candidates[0].0, Visibility::Public)
 			}
 		};
+		// Nothing is reported here: whether an inaccessible slot is an error
+		// depends on the leaf's other namespace (`compute_named_import`).
 		match target {
-			// Already flagged by an earlier link in a re-export chain —
+			// Already inaccessible at an earlier link in a re-export chain —
 			// can't become more accessible by being re-exported further.
 			BindingTarget::Inaccessible(def_key) => {
 				ImportSlot::Inaccessible(def_key, visibility)
@@ -687,27 +728,12 @@ impl<'r> ImportResolver<'r> {
 				{
 					ImportSlot::Accessible(def_key, visibility)
 				} else {
-					// `Inaccessible` exists to defer a check to wherever a
-					// binding is next consulted — but this *is* that
-					// consult, and we already have the accessor and the
-					// def right here, so report it now rather than risk
-					// nothing ever consulting this binding again and the
-					// problem going unreported. Recover as `Accessible`:
-					// having reported it, there's nothing left to defer.
-					let diagnostic = report_private_identifier(
-						self.namespaces,
-						self.strings,
-						key.symbol,
-						source_span,
-						Some(def_key),
-					);
-					self.diagnostics.push(diagnostic);
-					ImportSlot::Accessible(def_key, visibility)
+					ImportSlot::Inaccessible(def_key, visibility)
 				}
 			}
 			// An `Error`-recovery placeholder — already diagnosed by
 			// whoever caused that, nothing new to report here.
-			BindingTarget::Error => ImportSlot::Errored,
+			BindingTarget::Error => ImportSlot::Poisoned,
 		}
 	}
 
@@ -810,7 +836,7 @@ impl<'r> ImportResolver<'r> {
 		//
 		//   use alias::helper;
 		//   use real as alias;
-		//   mod real { pub fn helper() {} }
+		//   mod real { pub func helper() {} }
 		//
 		// Skips `current_item`: `use x::x;` registers itself as a
 		// candidate for its own prefix segment "x", so forcing it here
@@ -1311,7 +1337,7 @@ mod tests {
 	fn use_binds_to_the_same_def_as_the_original() {
 		let case = TestCase::new(indoc! {"
 			mod inner {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			use inner::helper;
 		"});
@@ -1354,7 +1380,7 @@ mod tests {
 				),
 				(
 					vfs::AbsolutePath::new("/math.wx"),
-					"pub fn add() -> i32 { 1 }".to_string(),
+					"pub func add() -> i32 { 1 }".to_string(),
 				),
 			]),
 		);
@@ -1370,7 +1396,7 @@ mod tests {
 	#[test]
 	fn use_with_alias_binds_under_the_alias_name() {
 		let case = TestCase::new(indoc! {"
-			fn add() -> i32 { 1 }
+			func add() -> i32 { 1 }
 			use add as sub;
 		"});
 		case.diagnostics().assert_none();
@@ -1385,7 +1411,7 @@ mod tests {
 	fn use_of_private_item_reports_immediately_and_recovers_as_accessible() {
 		let case = TestCase::new(indoc! {"
 			mod inner {
-				fn secret() -> i32 { 1 }
+				func secret() -> i32 { 1 }
 			}
 			use inner::secret;
 		"});
@@ -1413,7 +1439,7 @@ mod tests {
 			mod x {
 				pub type Y = u32;
 
-				pub fn Y() -> u32 {
+				pub func Y() -> u32 {
 					42
 				}
 			}
@@ -1432,7 +1458,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod math {
 				pub mod inner {
-					pub fn helper() -> i32 { 1 }
+					pub func helper() -> i32 { 1 }
 				}
 			}
 
@@ -1501,7 +1527,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod math {
 				mod inner {
-					pub fn helper() -> i32 { 1 }
+					pub func helper() -> i32 { 1 }
 				}
 			}
 
@@ -1519,7 +1545,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod outer {
 				mod inner {
-					pub fn helper() -> i32 { 1 }
+					pub func helper() -> i32 { 1 }
 				}
 			}
 
@@ -1596,7 +1622,7 @@ mod tests {
 	fn direct_definition_anchors_an_apparent_import_cycle() {
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn x() -> i32 { 1 }
+				pub func x() -> i32 { 1 }
 				pub use super::b::x;
 			}
 
@@ -1615,7 +1641,7 @@ mod tests {
 			use a::X;
 
 			mod a {
-				pub fn X() -> i32 { 1 }
+				pub func X() -> i32 { 1 }
 				pub use super::source::X;
 			}
 
@@ -1637,10 +1663,10 @@ mod tests {
 	fn duplicate_named_import_labels_the_first_use() {
 		let source = indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				pub fn pick() -> i32 { 2 }
+				pub func pick() -> i32 { 2 }
 			}
 
 			use a::pick;
@@ -1675,7 +1701,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod a {
 				mod b {
-					pub fn f() -> i32 { 1 }
+					pub func f() -> i32 { 1 }
 				}
 				pub use b::f;
 			}
@@ -1744,8 +1770,8 @@ mod tests {
 	fn use_group_binds_every_name() {
 		let case = TestCase::new(indoc! {"
 			mod math {
-				pub fn add() -> i32 { 1 }
-				pub fn sub() -> i32 { 2 }
+				pub func add() -> i32 { 1 }
+				pub func sub() -> i32 { 2 }
 			}
 			use math::{add, sub};
 		"});
@@ -1761,7 +1787,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			use inner::helper;
 			mod inner {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -1774,7 +1800,7 @@ mod tests {
 	fn use_via_self_crate_and_super() {
 		let case = TestCase::new(indoc! {"
 			mod outer {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 				use self::helper as via_self;
 				mod inner {
 					use super::helper as via_super;
@@ -1796,7 +1822,7 @@ mod tests {
 	#[test]
 	fn import_only_claims_the_namespace_it_occupies() {
 		let case = TestCase::new(indoc! {"
-			fn Y() -> i32 { 1 }
+			func Y() -> i32 { 1 }
 
 			mod x {
 				pub type Y = u32;
@@ -1817,7 +1843,7 @@ mod tests {
 		// should already pass and should keep passing once capping exists.
 		let case = TestCase::new(indoc! {"
 			mod inner {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 				pub use helper as public_helper;
 			}
 			use inner::public_helper;
@@ -1839,7 +1865,7 @@ mod tests {
 		// each recovers as `Accessible` rather than cascading further.
 		let case = TestCase::new(indoc! {"
 			mod inner {
-				fn secret() -> i32 { 1 }
+				func secret() -> i32 { 1 }
 				pub use secret as public_secret;
 			}
 			use inner::public_secret;
@@ -1866,7 +1892,7 @@ mod tests {
 			use alias::helper;
 			use real as alias;
 			mod real {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -1898,7 +1924,7 @@ mod tests {
 	fn plain_glob_records_a_fallback_edge_to_its_target() {
 		let case = TestCase::new(indoc! {"
 			mod math {
-				pub fn add() -> i32 { 1 }
+				pub func add() -> i32 { 1 }
 			}
 			use math::*;
 		"});
@@ -1954,7 +1980,7 @@ mod tests {
 		// twice, once via `b` and once via `c`'s recursion into `b`.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod b {
 				pub use crate::a::*;
@@ -1980,7 +2006,7 @@ mod tests {
 		// `lookup`'s indirect half to find it at all.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod b {
 				pub use crate::a::*;
@@ -2003,7 +2029,7 @@ mod tests {
 		// through `b`, named or otherwise.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod b {
 				use crate::a::*;
@@ -2019,10 +2045,10 @@ mod tests {
 	fn two_pub_globs_disagreeing_on_a_name_report_ambiguous_reexport() {
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				pub fn pick() -> i32 { 2 }
+				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
 				pub use crate::a::*;
@@ -2041,7 +2067,7 @@ mod tests {
 		// vs "constant" wording is actually exercised.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
 				pub const pick: i32 = 2;
@@ -2087,7 +2113,7 @@ mod tests {
 		// rather than reading as two re-exports disagreeing on the name.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod b {
 				pub use crate::a::*;
@@ -2121,7 +2147,7 @@ mod tests {
 		// `broken`'s own `use` already reported.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 			mod broken {
 				pub use crate::a::nonexistent_fn as helper;
@@ -2147,7 +2173,7 @@ mod tests {
 		// `broken`'s own `use` already reported.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn something_else() -> i32 { 1 }
+				pub func something_else() -> i32 { 1 }
 			}
 			mod broken {
 				pub use crate::a::nonexistent_fn as helper;
@@ -2170,10 +2196,10 @@ mod tests {
 		// choice and one that was never actually reachable.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				fn pick() -> i32 { 2 }
+				func pick() -> i32 { 2 }
 			}
 			mod hub {
 				pub use crate::a::*;
@@ -2204,10 +2230,10 @@ mod tests {
 		// arrives first and the unreachable one is simply turned away.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				fn pick() -> i32 { 2 }
+				func pick() -> i32 { 2 }
 			}
 			mod hub {
 				pub use crate::b::*;
@@ -2255,7 +2281,7 @@ mod tests {
 		// (`unresolved_leaf_reports_unresolved_import`) does.
 		let case = TestCase::new(indoc! {"
 			mod math {
-				pub fn helper() -> i32 { 1 }
+				pub func helper() -> i32 { 1 }
 			}
 
 			use math::inner::*;
@@ -2317,10 +2343,10 @@ mod tests {
 		// direct-definition case does.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				pub fn pick() -> i32 { 2 }
+				pub func pick() -> i32 { 2 }
 			}
 			pub use a::*;
 			use b::pick;
@@ -2346,10 +2372,10 @@ mod tests {
 		// glob import (E0659) is only ever reported at a use site.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub fn pick() -> i32 { 1 }
+				pub func pick() -> i32 { 1 }
 			}
 			mod b {
-				pub fn pick() -> i32 { 2 }
+				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
 				pub use crate::a::*;
@@ -2389,9 +2415,9 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod a {
 				pub mod b {
-					pub fn helper() -> i32 { 1 }
+					pub func helper() -> i32 { 1 }
 				}
-				pub fn c() -> i32 { 2 }
+				pub func c() -> i32 { 2 }
 			}
 			use a::{b::*, c};
 		"});
@@ -2506,7 +2532,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 			mod a {
 				use crate::b::*;
-				pub fn only_in_a() -> i32 { 1 }
+				pub func only_in_a() -> i32 { 1 }
 			}
 			mod b {
 				use crate::a::*;

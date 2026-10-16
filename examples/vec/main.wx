@@ -21,7 +21,7 @@ struct BumpAllocator(
 );
 
 impl BumpAllocator {
-    pub fn from_addr(start: u32) -> Self {
+    pub func from_addr(start: u32) -> Self {
         Self({ next: RawPtr::from_addr(start) })
     }
 }
@@ -29,7 +29,7 @@ impl BumpAllocator {
 impl Allocator for BumpAllocator {
     type Mem = heap;
 
-    fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+    func allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
         local aligned_next = self.*.next.align_up(layout.align());
         self.*.next = aligned_next.add(layout.size());
         aligned_next.as_ptr()
@@ -45,7 +45,7 @@ pub struct Vec<T>(
 
 impl<T> Vec<T> {
     #[inline]
-    pub fn new(alloc: heap::*BumpAllocator) -> Self {
+    pub func new(alloc: heap::*BumpAllocator) -> Self {
         Self({ buf: RawPtr::null(), len: 0, cap: 0, alloc })
     }
 
@@ -53,11 +53,11 @@ impl<T> Vec<T> {
     // it — the shape callers actually want, since every other method is on
     // `heap::*Self`.
     #[inline]
-    pub fn new_in(alloc: heap::*BumpAllocator) -> heap::*Self {
+    pub func new_in(alloc: heap::*BumpAllocator) -> heap::*Self {
         alloc.allocate_value(Self::new(alloc))
     }
 
-    pub fn push(self: heap::*Self, value: T) {
+    pub func push(self: heap::*Self, value: T) {
         if self.*.len == self.*.cap {
             local new_cap = if self.*.cap == 0 { 4 } else { self.*.cap * 2 };
             local new_buf = self.*.alloc.allocate(Layout::array::<T>(new_cap));
@@ -75,29 +75,29 @@ impl<T> Vec<T> {
     }
 
     #[inline]
-    pub fn get(self: heap::*Self, index: u32) -> T {
+    pub func get(self: heap::*Self, index: u32) -> T {
         self.*.buf.add(index).as_ptr().*
     }
 
     #[inline]
-    pub fn len(self: heap::*Self) -> u32 {
+    pub func len(self: heap::*Self) -> u32 {
         self.*.len
     }
 
     #[inline]
-    pub fn capacity(self: heap::*Self) -> u32 {
+    pub func capacity(self: heap::*Self) -> u32 {
         self.*.cap
     }
 
     #[inline]
-    pub fn as_slice(self: heap::*Self) -> heap::&[T] {
+    pub func as_slice(self: heap::*Self) -> heap::&[T] {
         slice_from_parts(self.*.buf.as_ref(), self.*.len)
     }
 }
 
 // Places a `BumpAllocator` at `DATA_END` and points it just past itself, so
 // every later allocation lands in the free region that follows.
-fn bootstrap_allocator() -> heap::*BumpAllocator {
+func bootstrap_allocator() -> heap::*BumpAllocator {
     local self_ptr = heap::DATA_END as heap::*BumpAllocator;
     self_ptr.*
         = BumpAllocator::from_addr(
@@ -107,7 +107,7 @@ fn bootstrap_allocator() -> heap::*BumpAllocator {
 }
 
 // Pushes 1..=10 through three reallocations and returns their sum (55).
-pub fn demo() -> i32 {
+pub func demo() -> i32 {
     local alloc = bootstrap_allocator();
     local v = Vec::<i32>::new_in(alloc);
 

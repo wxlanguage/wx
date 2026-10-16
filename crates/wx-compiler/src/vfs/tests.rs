@@ -127,7 +127,7 @@ fn as_absolute(path: &Path) -> AbsolutePath {
 fn load_package_parses_entry_file() {
 	let case = TestCase::binary(
 		"/main.wx",
-		&[("/main.wx", "mod math;"), ("/math.wx", "fn add() {} ")],
+		&[("/main.wx", "mod math;"), ("/math.wx", "func add() {} ")],
 	);
 	case.diagnostics().assert_none();
 	assert_eq!(case.graph().modules.len(), 2);
@@ -161,7 +161,7 @@ fn load_package_diagnoses_missing_child_module_without_aborting() {
 	// same file — still load normally.
 	let case = TestCase::binary(
 		"/main.wx",
-		&[("/main.wx", "mod boo;\nfn works() -> i32 { 1 }")],
+		&[("/main.wx", "mod boo;\nfunc works() -> i32 { 1 }")],
 	);
 
 	let root = case.root_module();
@@ -188,8 +188,8 @@ fn load_package_rejects_ambiguous_module_paths() {
 		"/main.wx",
 		&[
 			("/main.wx", "mod math;"),
-			("/math.wx", "fn from_file() {}"),
-			("/math/mod.wx", "fn from_dir() {}"),
+			("/math.wx", "func from_file() {}"),
+			("/math/mod.wx", "func from_dir() {}"),
 		],
 	);
 
@@ -210,7 +210,7 @@ fn load_package_resolves_module_directory_file() {
 	// would exercise actual directory traversal or path normalisation.
 	let dir = TempDir::new("dir-module-root");
 	let entry = dir.write("main.wx", "mod math;");
-	let child_path = dir.write("math/mod.wx", "fn add() {}");
+	let child_path = dir.write("math/mod.wx", "func add() {}");
 
 	let mut builder = CompilationUnitBuilder::new();
 	let package_id = builder
@@ -235,7 +235,7 @@ fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 			AbsolutePath::new("/src/main.wx"),
 			&workspace(&[
 				("/src/main.wx", "mod math;"),
-				("/src/math.wx", "fn add() {}"),
+				("/src/math.wx", "func add() {}"),
 			]),
 		)
 		.expect("failed to load package");
@@ -267,7 +267,7 @@ fn load_virtual_compilation_child_of_a_sibling_file_module_resolves_under_its_ow
 		&[
 			("/src/main.wx", "mod a;"),
 			("/src/a.wx", "mod shared;"),
-			("/src/shared.wx", "pub fn x() -> i32 { 1 }"),
+			("/src/shared.wx", "pub func x() -> i32 { 1 }"),
 		],
 	);
 
@@ -293,7 +293,7 @@ fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
 		"/main.wx",
 		&[(
 			"/main.wx",
-			"mod utils { mod extra; }\nfn works() -> i32 { 1 }",
+			"mod utils { mod extra; }\nfunc works() -> i32 { 1 }",
 		)],
 	);
 

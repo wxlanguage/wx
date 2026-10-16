@@ -282,7 +282,7 @@ impl<'a> BoundChecker<'a> {
 			for binding in trait_bound.bindings.iter() {
 				// A concrete subject answers from its impl; an abstract one
 				// answers from its own declared bounds, which are the whole
-				// truth about it (`fn g<U: Has where { Item = bool }>` fixes
+				// truth about it (`func g<U: Has where { Item = bool }>` fixes
 				// `U::Item` for the whole of `g`). Consulting only the first
 				// meant a binding on an abstract subject was never compared,
 				// even when its declaration already contradicted it.
@@ -308,7 +308,7 @@ impl<'a> BoundChecker<'a> {
 						}
 						// The RHS is written in the *declaring* item's scope,
 						// so it may name that item's own type parameters
-						// (`fn f<T: Has where { Item = U }, U>`) or an
+						// (`func f<T: Has where { Item = U }, U>`) or an
 						// inherited one from the parent impl. `type_args`
 						// carries what the site being checked pinned those to
 						// — empty at a declaration site, where they stay

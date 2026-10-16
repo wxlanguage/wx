@@ -80,7 +80,7 @@ Sources are listed in §10.
   { global_index }` are per-declaration nominal type constructors
   (`tir/types.rs`). `Type::FunctionItem { func_index, type_args }` is the
   unique type of a named function; `Type::Function { params, result }` is the
-  structural `fn(...) -> ...` type. `Type::Pointer { to, memory, ownership }`
+  structural `func(...) -> ...` type. `Type::Pointer { to, memory, ownership }`
   carries its memory.
 - **Definitions.** `DefKind` has `Memory`, `Global`, `Function`, `Import`,
   `TypeSet`, `Trait`, etc. (`tir/defs.rs`); there is no `Table` or `Tag`.
@@ -106,7 +106,7 @@ Sources are listed in §10.
   unrelated to the Wasm `tag` item proposed below; keep the two apart in
   diagnostics and docs.
 - **Function pointers today.** Codegen builds one implicit `funcref` table
-  (`builder.table` in `codegen/mod.rs`); a `fn(..)` value is an index into it,
+  (`builder.table` in `codegen/mod.rs`); a `func(..)` value is an index into it,
   and calls lower to `CallIndirectSym`. The implicit table has no identity in
   source. (MIR/opt/codegen are disabled on this branch, see
   `tir-refactor-state` in memory.)
@@ -141,7 +141,7 @@ traits for reference families.
 ```wx
 trait Tag { type Result; }
 trait Exception: Tag where { Result = ! } {
-    fn throw(self) -> ! { throw(self) }
+    func throw(self) -> ! { throw(self) }
 }
 
 tag ApplicationError(status: ErrorStatus) -> !;
@@ -189,8 +189,8 @@ methods over bodiless `#[intrinsic]` functions, as `Global::get` is.
 ```wx
 import "dom" {
     type Node: extern;
-    fn create() -> Node;
-    fn append(parent: Node, child: Node);
+    func create() -> Node;
+    func append(parent: Node, child: Node);
 }
 ```
 
@@ -206,10 +206,10 @@ import "dom" {
   `(type $T (sub extern))` and typed references. Source does not change.
 - Principle: an imported-type declaration exists only for kinds that have no
   structural type of their own. `extern` and `any` have none. `func` already
-  has `fn(A) -> R`.
+  has `func(A) -> R`.
 - **No signature-bearing nominal func types.** Wasm cannot express them
   (Type Imports bounds are abstract heap types only) and wx already gets
-  nominal wrappers from `struct Handler(T::fn() -> i32);`.
+  nominal wrappers from `struct Handler(T::func() -> i32);`.
   `type X: func;` (opaque, uncallable) is kept for completeness and for
   future compatibility.
 - Spelling `type[extern] Node;` (matching `table[extern]`) is an undecided
@@ -221,8 +221,8 @@ The same two layers as memory:
 
 | | memory | table |
 | --- | --- | --- |
-| location, an integer carrying its container | `M::*u32` | `T::fn(i32) -> i32`, `T::Node` |
-| value | `u32` | `fn(i32) -> i32`, `Node` (reference) |
+| location, an integer carrying its container | `M::*u32` | `T::func(i32) -> i32`, `T::Node` |
+| value | `u32` | `func(i32) -> i32`, `Node` (reference) |
 | read | load | `table.get` |
 | write | store | `table.set` |
 
@@ -231,7 +231,7 @@ The same two layers as memory:
   (`M::*[nodes::Node]` is an array of `u32`). Always written with the `T::`
   qualifier when it sits in memory. Calling a handle lowers to
   `call_indirect`.
-- **Reference (bare `fn(..)`, bare `Node`)**: a Wasm reference value. Allowed
+- **Reference (bare `func(..)`, bare `Node`)**: a Wasm reference value. Allowed
   in locals, parameters, results and globals. **Not allowed** as the pointee
   of `M::*`, in an array/slice in memory, or in a struct that has a memory
   layout. Calling a function reference lowers to `call_ref`.
@@ -247,7 +247,7 @@ The same two layers as memory:
   plus a free list, not a primitive.
 - A shared `func` table holds any function. A slot's static type is
   guaranteed by how slots are made: there are no raw indexes, and a
-  `T::fn(i32) -> i32` can only come from a function item with that signature
+  `T::func(i32) -> i32` can only come from a function item with that signature
   or another slot of that type. Null slots, out-of-range indexes and
   host-modified tables can still trap; `call_indirect`'s runtime check
   remains the backstop. State the claim at exactly that strength.
@@ -260,10 +260,10 @@ effect profiles differ: `ref.func` is pure and cannot trap, `table.get` can).
 
 ```wx
 trait Function {              // compiler-implemented for every function item
-    type Ref;                 // the matching fn(A) -> R
-    fn as_ref(self) -> Self::Ref { ref_func(self) }
+    type Ref;                 // the matching func(A) -> R
+    func as_ref(self) -> Self::Ref { ref_func(self) }
 }
-#[intrinsic] fn ref_func<F: Function>(f: F) -> F::Ref;
+#[intrinsic] func ref_func<F: Function>(f: F) -> F::Ref;
 
 local f = on_click.as_ref();  // ref.func
 f(1);                         // call_ref
@@ -324,7 +324,7 @@ Following the existing shape of memory/global; names are placeholders.
    or goes away.
 9. **Extension gating.** `call_ref`/typed references (Wasm 3.0), exception
    handling, table64 and Type Imports each follow the opt-in allowlist rule;
-   without typed function references a bare `fn` value cannot lower and must
+   without typed function references a bare `func` value cannot lower and must
    be an error, or fall back to a table (open, §6).
 
 ---
@@ -335,7 +335,7 @@ Following the existing shape of memory/global; names are placeholders.
 | --- | --- |
 | Nullability. Wasm has `ref null` and `ref`. | Non-null everywhere; `table.get` traps on null (shows as an effect). |
 | Generic pointee bound for memory-representable types. | Implicit bound with an opt-out. |
-| Gating of bare `fn` without typed function references. | Error; require the extension. |
+| Gating of bare `func` without typed function references. | Error; require the extension. |
 | Fate of the implicit hidden funcref table. | Becomes an ordinary table item. |
 | Marker for host handles in type position (`T::Node` reads like a path to an associated item). | Undecided. |
 | Spelling of imported kind bound: `type Node: extern;` vs `type[extern] Node;`. | Colon form (mirrors `sub`). |

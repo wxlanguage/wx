@@ -279,7 +279,7 @@ impl<'ast> Builder<'ast, '_> {
 			}
 			DefKind::Memory { .. } => return false,
 		};
-		// `import "env" { fn log(...); }` declarations share the same
+		// `import "env" { func log(...); }` declarations share the same
 		// `ModuleNamespace` machinery as real modules, but there's no
 		// visibility concept for them — they exist purely to be called, and
 		// their functions/globals never carry a real `pub_span`. Without
@@ -329,7 +329,7 @@ impl<'ast> Builder<'ast, '_> {
 	/// Pair it with [`Self::is_accessible_from`] against the *struct's* namespace:
 	/// a field has no scope of its own, so it is private to the module that
 	/// declares the struct. That deliberately makes an inherent impl written
-	/// in another module an outside accessor — `impl geom::Point { fn f(self)
+	/// in another module an outside accessor — `impl geom::Point { func f(self)
 	/// -> i32 { self.y } }` has no more claim on a private `y` than any other
 	/// foreign code does.
 	pub(super) fn field_visibility(

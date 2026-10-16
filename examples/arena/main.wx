@@ -7,7 +7,7 @@ struct Arena<Mem: Memory>(
 );
 
 impl<Mem: Memory> Arena<Mem> {
-    fn new(buffer: Mem::&[u8]) -> Self {
+    func new(buffer: Mem::&[u8]) -> Self {
         Self({
             start: buffer.ptr(),
             end: ptr::add(buffer.ptr(), buffer.len()),
@@ -36,13 +36,13 @@ enum Option: u8 {
 trait Receiver {
     type Target;
 
-    fn receive(self) -> Self::Target;
+    func receive(self) -> Self::Target;
 }
 
 impl Receiver for i32 {
     type Target = i32;
 
-    fn receive(self) -> i32 {
+    func receive(self) -> i32 {
         self
     }
 }
@@ -52,7 +52,7 @@ impl<Idx> IntoIterator for Range<Idx> {
 
     type IntoIter = RangeIter<Self::Item>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    func into_iter(self) -> Self::IntoIter {
         RangeIter({ start: self.start, end: self.end })
     }
 }
@@ -60,7 +60,7 @@ impl<Idx> IntoIterator for Range<Idx> {
 trait Iterator {
     type Item;
 
-    fn next<R: Receiver where { Target = Self }>(receiver: R) -> (
+    func next<R: Receiver where { Target = Self }>(receiver: R) -> (
         Option,
         Self::Item,
     );
@@ -69,7 +69,7 @@ trait Iterator {
 impl<Idx> Iterator for RangeIter<Idx> {
     type Item = Idx;
 
-    fn next<R: Receiver where { Target = RangeIter<Idx> }>(receiver: R) -> (
+    func next<R: Receiver where { Target = RangeIter<Idx> }>(receiver: R) -> (
         Option,
         Idx,
     ) {
@@ -83,7 +83,7 @@ trait IntoIterator {
 
     type IntoIter: Iterator where { Item = Self::Item };
 
-    fn into_iter(self) -> Self::IntoIter;
+    func into_iter(self) -> Self::IntoIter;
 }
 
 struct BumpAllocator(
@@ -91,7 +91,7 @@ struct BumpAllocator(
 );
 
 impl BumpAllocator {
-    pub fn from_addr(start: u32) -> Self {
+    pub func from_addr(start: u32) -> Self {
         Self({ next: RawPtr::from_addr(start) })
     }
 }
@@ -99,14 +99,14 @@ impl BumpAllocator {
 impl Allocator for BumpAllocator {
     type Mem = heap;
 
-    fn allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+    func allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
         local aligned_next = self.*.next.align_up(layout.align());
         self.*.next = aligned_next.add(layout.size());
         aligned_next.as_ptr()
     }
 }
 
-fn test() {
+func test() {
     local range: Range<u32> = Range({ start: 0, end: 10 });
     local range_iter = range.into_iter();
     loop {

@@ -32,7 +32,7 @@ macro_rules! define_text {
 define_text! {
 	enum Text {
 		// keywords with trailing space
-		Fn      => "fn ",
+		Func    => "func ",
 		Pub     => "pub ",
 		Struct  => "struct ",
 		Impl    => "impl",
@@ -97,7 +97,7 @@ define_text! {
 		Where        => " where ",
 		// compound tokens
 		ExportLBrace => "export {",
-		FnParen      => "fn(",
+		FuncParen    => "func(",
 		// binary operators
 		Add       => "+",
 		Sub       => "-",
@@ -125,7 +125,7 @@ define_text! {
 		CaretAssign => "^=",
 		LtLtAssign  => "<<=",
 		GtGtAssign  => ">>=",
-		// unary-only
+		// unary `!`, and the never type
 		Bang => "!",
 	}
 }
@@ -1863,7 +1863,7 @@ impl<'a> Builder<'a> {
 		out: &mut Vec<NodeId>,
 		signature: &ast::FunctionSignature,
 	) {
-		out.push(self.text(Text::Fn));
+		out.push(self.text(Text::Func));
 		out.push(self.symbol(signature.name.inner));
 		self.build_type_params(out, &signature.type_params);
 		let mut paren_nodes: Vec<NodeId> = vec![self.text(Text::LParen)];
@@ -2675,9 +2675,10 @@ impl<'a> Builder<'a> {
 				self.build_qualified_path(inner_node, None, segments)
 			}
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
+			ast::TypeExpression::Never => self.text(Text::Bang),
 			ast::TypeExpression::Path(path) => self.build_path_segments(path),
 			ast::TypeExpression::Function { params, result } => {
-				let mut items: Vec<NodeId> = vec![self.text(Text::FnParen)];
+				let mut items: Vec<NodeId> = vec![self.text(Text::FuncParen)];
 
 				if !params.is_empty() {
 					let mut param_items: Vec<NodeId> = vec![self.line()];

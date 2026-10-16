@@ -20,7 +20,7 @@ impl<'ast> Builder<'ast, '_> {
 
 		// `Point(1, 2)` reuses call syntax to construct a tuple struct
 		// positionally — `Point` is never a real value (it reserves the
-		// Value namespace only so a colliding `fn Point` is an ordinary
+		// Value namespace only so a colliding `func Point` is an ordinary
 		// duplicate-definition error, not a silent ambiguity). Checked
 		// before the callee is built as a value expression below, via the
 		// general `resolve_symbol_and_type_args` (not a struct-specific

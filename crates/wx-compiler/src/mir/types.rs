@@ -810,8 +810,8 @@ mod tests {
 						trait Container { type Item; }
 						struct Wrapper<T> { value: T }
 						impl<T> Container for Wrapper<T> { type Item = (T,); }
-						fn project<U: Container>(value: U) -> U::Item { unreachable }
-						fn concrete(value: Wrapper<i32>) {}
+						func project<U: Container>(value: U) -> U::Item { unreachable }
+						func concrete(value: Wrapper<i32>) {}
 						export {}
 					"#
 					.to_string(),
@@ -868,9 +868,9 @@ mod tests {
 					r#"
 						trait Callable { type Arg; }
 						struct Wrapper<T> { value: T }
-						impl<T> Callable for Wrapper<fn(T) -> T> { type Arg = T; }
-						fn project<U: Callable>(value: U) -> U::Arg { unreachable }
-						fn concrete(value: Wrapper<fn(i32) -> i32>) {}
+						impl<T> Callable for Wrapper<func(T) -> T> { type Arg = T; }
+						func project<U: Callable>(value: U) -> U::Arg { unreachable }
+						func concrete(value: Wrapper<func(i32) -> i32>) {}
 						export {}
 					"#
 					.to_string(),
@@ -921,14 +921,14 @@ mod tests {
 					"main.wx".to_string(),
 					r#"
 						trait Values {
-							fn default_value() -> i32 { 1 }
-							fn replaced_value() -> i32 { 2 }
+							func default_value() -> i32 { 1 }
+							func replaced_value() -> i32 { 2 }
 							const DEFAULT: i32 = 3;
 							const REPLACED: i32 = 4;
 						}
 						struct Subject {}
 						impl Values for Subject {
-							fn replaced_value() -> i32 { 5 }
+							func replaced_value() -> i32 { 5 }
 							const REPLACED: i32 = 6;
 						}
 						export {}

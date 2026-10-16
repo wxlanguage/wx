@@ -75,7 +75,6 @@ impl ImplTarget {
 			Type::Global { global_index } => Self::Global(*global_index),
 			Type::Error
 			| Type::Infer
-			| Type::Unit
 			| Type::Never
 			| Type::Integer
 			| Type::Float
@@ -604,14 +603,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			);
 			return Err(());
 		}
-		let binding = PathResolver::new(
+		let definition = PathResolver::new(
 			self.diagnostics,
 			self.resolutions,
 			self.strings,
 			self.defs,
 		)
-		.resolve_path(file_id, namespace, &path.segments, Tier::Type);
-		let kind = binding.def_key().ok_or(())?.symbol_kind(self.defs);
+		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
+		let kind = definition?.symbol_kind(self.defs);
 		let target = match kind {
 			DefKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
 			DefKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
@@ -644,14 +643,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		namespace: Scope,
 		path: &ast::Path,
 	) -> Option<TraitIdx> {
-		let binding = PathResolver::new(
+		let definition = PathResolver::new(
 			self.diagnostics,
 			self.resolutions,
 			self.strings,
 			self.defs,
 		)
-		.resolve_path(file_id, namespace, &path.segments, Tier::Type);
-		match binding.def_key()?.symbol_kind(self.defs) {
+		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
+		match definition.ok()?.symbol_kind(self.defs) {
 			DefKind::Trait(idx) => Some(idx),
 			other => {
 				self.diagnostics.push(report_not_a_trait_bound(

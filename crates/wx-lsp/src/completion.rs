@@ -403,7 +403,7 @@ pub fn type_completion_items(
 
 /// Maps every entry in an impl block's/trait impl's/trait's own `members`
 /// map to a `CompletionItem`, gated on `pub_span.is_some()` — per the "`pub
-/// fn` only" rule (see `Common pitfalls` in `CLAUDE.md`): a non-`pub` member
+/// func` only" rule (see `Common pitfalls` in `CLAUDE.md`): a non-`pub` member
 /// isn't reachable via `Type::name()` at all, so it shouldn't complete as if
 /// it were.
 fn member_completion_items(
@@ -738,7 +738,7 @@ mod tests {
 
 	#[test]
 	fn blank_inside_block_is_identifier() {
-		let src = "fn add(a: i32, b: i32) -> i32 {\n    ";
+		let src = "func add(a: i32, b: i32) -> i32 {\n    ";
 		assert_eq!(
 			classify_context(src, src.len()),
 			CompletionContext::Identifier
@@ -851,9 +851,9 @@ mod tests {
 
 	#[test]
 	fn colon_with_partial_type_is_type_annotation() {
-		// "fn f(a: i" — prefix "i"
+		// "func f(a: i" — prefix "i"
 		assert_eq!(
-			classify_context("fn f(a: i", 9),
+			classify_context("func f(a: i", 9),
 			CompletionContext::TypeAnnotation
 		);
 	}

@@ -56,7 +56,6 @@ pub enum Type {
 	/// Must never reach MIR or codegen; the TIR checker reports an error
 	/// whenever `Infer` survives past the call site that created it.
 	Infer,
-	Unit,
 	Never,
 	Integer,
 	Float,
@@ -72,6 +71,7 @@ pub enum Type {
 	F64,
 	Bool,
 	Char,
+	/// `()` is the empty tuple, pre-interned as `TypeIndex::UNIT`.
 	Tuple {
 		elements: Box<[TypeIndex]>,
 	},
@@ -341,7 +341,11 @@ impl TypeInterner {
 			// Order must match the `TypeIndex` constants below.
 			Type::Infer,
 			Type::Error,
-			Type::Unit,
+			// `()` is the empty tuple, not a type of its own, so interning
+			// `Tuple { [] }` anywhere finds this slot.
+			Type::Tuple {
+				elements: Box::new([]),
+			},
 			Type::Never,
 			Type::Integer,
 			Type::Float,
@@ -568,7 +572,6 @@ impl TypeInterner {
 			}
 			Type::Error
 			| Type::Infer
-			| Type::Unit
 			| Type::Never
 			| Type::Integer
 			| Type::Float
@@ -1004,7 +1007,6 @@ impl IntrinsicDefs {
 			(self.f64, TypeIndex::F64),
 			(self.bool, TypeIndex::BOOL),
 			(self.char, TypeIndex::CHAR),
-			(self.never, TypeIndex::NEVER),
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
@@ -1302,12 +1304,20 @@ mod tests {
 	}
 
 	#[test]
+	fn unit_is_the_empty_tuple() {
+		let mut types = TypeInterner::new();
+		let unit = types.intern(Type::Tuple {
+			elements: Box::new([]),
+		});
+		assert_eq!(unit, TypeIndex::UNIT);
+	}
+
+	#[test]
 	fn substitution_preserves_leaf_types() {
 		let mut types = TypeInterner::new();
 		let leaves = [
 			Type::Error,
 			Type::Infer,
-			Type::Unit,
 			Type::Never,
 			Type::Integer,
 			Type::Float,

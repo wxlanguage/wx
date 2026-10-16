@@ -232,6 +232,7 @@ define_diagnostic_codes! {
 		UnterminatedStringLiteral => "E2107",
 		ConstEvaluationFailed => "E2108",
 		CyclicConstant => "E2109",
+		StructUsedAsValue => "E2110",
 	}
 }
 

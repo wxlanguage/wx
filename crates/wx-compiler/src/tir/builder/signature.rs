@@ -238,7 +238,7 @@ impl<'ast> Builder<'ast, '_> {
 				// `Point` also claims the Value namespace, using the same
 				// `SymbolKind::Struct` as the Type-namespace claim above —
 				// not because a tuple struct is a real value, but purely for
-				// collision safety, so a colliding `fn Point` becomes an
+				// collision safety, so a colliding `func Point` becomes an
 				// ordinary duplicate-definition error (E2005) rather than a
 				// silent, lookup-order-dependent ambiguity at a call site.
 				// `Point(1, 2)` never actually reaches this binding through

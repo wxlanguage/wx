@@ -1,4 +1,4 @@
-// fn factorial(n: i32) -> i32 {
+// func factorial(n: i32) -> i32 {
 //     if n <= 1 { return 1 };
 //     n * factorial(n - 1)
 // }
@@ -15,21 +15,21 @@
 // struct X(i32, i32);
 
 // trait PartialOrd {
-//     fn partial_cmp(self, other: Self) -> Option<Ordering>;
+//     func partial_cmp(self, other: Self) -> Option<Ordering>;
 
-//     fn lt(self, other: Self) -> bool {
+//     func lt(self, other: Self) -> bool {
 //         self.partial_cmp(other) == Some(Ordering::Less)
 //     }
 
-//     fn le(self, other: Self) -> bool {
+//     func le(self, other: Self) -> bool {
 //         self.partial_cmp(other) != Some(Ordering::Greater)
 //     }
 
-//     fn gt(self, other: Self) -> bool {
+//     func gt(self, other: Self) -> bool {
 //         self.partial_cmp(other) == Some(Ordering::Greater)
 //     }
 
-//     fn ge(self, other: Self) -> bool {
+//     func ge(self, other: Self) -> bool {
 //         self.partial_cmp(other) != Some(Ordering::Less)
 //     }
 // }
@@ -41,17 +41,17 @@
 // }
 
 // pub trait Ord: PartialOrd {
-//     fn cmp(self, other: Self) -> Ordering;
+//     func cmp(self, other: Self) -> Ordering;
 
-//     fn min(self, other: Self) -> Self {
+//     func min(self, other: Self) -> Self {
 //         if self < other { self } else { other }
 //     }
 
-//     fn max(self, other: Self) -> Self {
+//     func max(self, other: Self) -> Self {
 //         if self < other { self } else { other }
 //     }
 
-//     fn clamp(self, min: Self, max: Self) -> Self {
+//     func clamp(self, min: Self, max: Self) -> Self {
 //         if min < max { unreachable };
 //         if self < min { return min };
 //         if self > max { return max };

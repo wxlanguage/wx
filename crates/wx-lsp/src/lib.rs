@@ -809,7 +809,7 @@ async fn handle_command(
 				let interner = &compiled.graph.strings;
 
 				let name = interner.resolve(func.name.inner).unwrap();
-				let mut label = format!("fn {name}(");
+				let mut label = format!("func {name}(");
 				let mut param_infos: Vec<ParameterInformation> = Vec::new();
 				// If the first parameter is named `self`, treat this as a
 				// method: show `self` in the signature label but do not
@@ -2179,7 +2179,7 @@ fn push_type_params(
 
 /// The point to search backward from for `kind`'s own leading doc comment —
 /// `pub_span`'s start when the item is `pub` (it sits to the left of
-/// `fn`/`struct`/etc., closer to any attributes/doc comments above), else
+/// `func`/`struct`/etc., closer to any attributes/doc comments above), else
 /// the item's name span. `None` for symbol kinds that aren't a standalone
 /// declaration with its own doc comment (locals, params, `self`, type
 /// params, labels, enum variants, struct fields, associated types, and the
@@ -2296,7 +2296,7 @@ fn symbol_hover_text(
 			let func = &tir.items.functions[fi];
 			let name = interner.resolve(func.name.inner).unwrap();
 			let pub_prefix = if func.pub_span.is_some() { "pub " } else { "" };
-			let mut s = format!("{pub_prefix}fn {name}");
+			let mut s = format!("{pub_prefix}func {name}");
 			push_type_params(
 				&mut s,
 				tir,

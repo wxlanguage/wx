@@ -1,10 +1,10 @@
 memory heap: Memory where { Size = u32 };
 
 import "console" as console {
-    fn log(message: &[u8]);
+    func log(message: &[u8]);
 }
 
-// fn fibonacci(n: i32, b: i32, c: i32, d: i32, e: i32, h: i32) -> i32 {
+// func fibonacci(n: i32, b: i32, c: i32, d: i32, e: i32, h: i32) -> i32 {
 //     if n <= 1 { return n };
 
 //     console::log("calculating fibonacci");
@@ -12,7 +12,7 @@ import "console" as console {
 //     fibonacci(n - 1) + fibonacci(n - 2)
 // }
 
-fn fibonacci_iterative(mut n: i32) -> i32 {
+func fibonacci_iterative(mut n: i32) -> i32 {
     if n <= 1 { return n };
 
     local mut a: i32 = 0;
@@ -30,7 +30,7 @@ fn fibonacci_iterative(mut n: i32) -> i32 {
     }
 }
 
-fn main() {
+func main() {
     console::log("hello");
 }
 
@@ -46,7 +46,7 @@ export {
 //     b: i32,
 // );
 
-// fn test() {
+// func test() {
 //     Point({
 //         r: 5,
 //         g: 1,
@@ -55,12 +55,12 @@ export {
 //     Point(1, 2, 3)
 // }
 
-// fn Point(r: i32, g: i32, b: i32) -> Point {
+// func Point(r: i32, g: i32, b: i32) -> Point {
 //     Point({ r, g, b })
 
 // struct Point(i32, i32);
 
-// fn test() -> Point {
+// func test() -> Point {
 //     Point(5, 2)
 // }
 
@@ -69,11 +69,11 @@ export {
 //     None,
 // }
 
-// fn test() -> Option<i32> {
+// func test() -> Option<i32> {
 //     Option::Some(5)
 // }
 
-fn binary_search<
+func binary_search<
     M: Memory where { Size: Sub + Add + Div + Eq },
     T: Ord,
 >(arr: M::&[T], target: T) -> (bool, M::Size) {

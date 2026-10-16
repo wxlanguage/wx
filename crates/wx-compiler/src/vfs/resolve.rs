@@ -351,8 +351,8 @@ mod tests {
 		}
 		let source = Source {
 			files: workspace(&[
-				("/app/main.wx", "fn main() {}"),
-				("/dep/main.wx", "pub fn helper() {}"),
+				("/app/main.wx", "func main() {}"),
+				("/dep/main.wx", "pub func helper() {}"),
 			]),
 			json_reads: std::cell::Cell::new(0),
 		};
@@ -379,7 +379,7 @@ mod tests {
 	fn manifested_binary_with_no_dependencies_gets_std() {
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -405,7 +405,7 @@ mod tests {
 				"/app/wx.json",
 				r#"{ "type": "bin", "entry": "src/start.wx" }"#,
 			),
-			("/app/src/start.wx", "fn add() {}"),
+			("/app/src/start.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -416,7 +416,7 @@ mod tests {
 
 	#[test]
 	fn manifest_directory_without_a_wx_json_fails() {
-		let source = workspace(&[("/app/main.wx", "fn add() {}")]);
+		let source = workspace(&[("/app/main.wx", "func add() {}")]);
 		assert!(
 			open_manifest(AbsolutePath::new("/app"), &source).is_err(),
 			"a directory argument commits to the manifest-driven path — no \
@@ -428,7 +428,7 @@ mod tests {
 	fn std_root_package_does_not_get_a_second_std_loaded() {
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -463,12 +463,12 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/alt_std/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/alt_std/main.wx", "fn replacement() {}"),
+			("/alt_std/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -501,9 +501,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			("/mystd/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
-			("/mystd/main.wx", "fn replacement() {}"),
+			("/mystd/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -550,12 +550,12 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/shared/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/shared/main.wx", "fn shared() {}"),
+			("/shared/main.wx", "func shared() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -587,9 +587,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			("/x/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
-			("/x/main.wx", "fn from_x() {}"),
+			("/x/main.wx", "func from_x() {}"),
 			(
 				"/y/wx.json",
 				r#"{
@@ -600,9 +600,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/y/main.wx", "fn from_y() {}"),
+			("/y/main.wx", "func from_y() {}"),
 			("/z/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
-			("/z/main.wx", "fn from_z() {}"),
+			("/z/main.wx", "func from_z() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -636,7 +636,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/a/wx.json",
 				r#"{
@@ -647,7 +647,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/a/main.wx", "fn from_a() {}"),
+			("/a/main.wx", "func from_a() {}"),
 			(
 				"/b/wx.json",
 				r#"{
@@ -658,12 +658,12 @@ mod tests {
 					}
 				}"#,
 			),
-			("/b/main.wx", "fn from_b() {}"),
+			("/b/main.wx", "func from_b() {}"),
 			(
 				"/shared/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/shared/main.wx", "fn from_shared() {}"),
+			("/shared/main.wx", "func from_shared() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -692,7 +692,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/a/main.wx", "fn from_a() {}"),
+			("/a/main.wx", "func from_a() {}"),
 			(
 				"/b/wx.json",
 				r#"{
@@ -703,7 +703,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/b/main.wx", "fn from_b() {}"),
+			("/b/main.wx", "func from_b() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/a"), &source).unwrap();

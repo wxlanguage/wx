@@ -1,10 +1,10 @@
 //! Constant evaluation: folds a constant's checked `Body` into a value.
 //!
-//! The evaluator handles literals, builtin operators over them and references
-//! to other constants, and nothing else: whatever else a body holds (a call, a
-//! form the checker does not cover yet) is not a constant. Arithmetic follows
-//! the operand type exactly, and a result outside it is an error, not a wrapped
-//! value.
+//! The evaluator handles literals, builtin operators over them, references to
+//! other constants and the construction of structs, and nothing else: whatever
+//! else a body holds (a call, a form the checker does not cover yet) is not a
+//! constant. Arithmetic follows the operand type exactly, and a result outside
+//! it is an error, not a wrapped value.
 //!
 //! A constant's value is a memoized query (`const_value`), and evaluation asks
 //! it on demand: a constant is read when the node naming it is evaluated, so a
@@ -17,21 +17,29 @@
 use codespan_reporting::diagnostic::Diagnostic;
 
 use super::body::{ExprIdx, ExprKind};
-use super::defs::{ConstIdx, EnumIdx};
+use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::types::{Type, TypeIndex};
+use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 
 /// A constant's value. Integers are held exactly, in the range of their type.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum ConstValue {
-	Int { value: i128, scalar: Scalar },
-	Float { value: f64, scalar: Scalar },
+	Int {
+		value: i128,
+		scalar: Scalar,
+	},
+	Float {
+		value: f64,
+		scalar: Scalar,
+	},
 	Bool(bool),
 	Char(char),
+	/// A struct's field values, in declaration order.
+	Struct(Box<[ConstValue]>),
 }
 
 /// Why evaluating a body failed, at the node that failed.
@@ -47,12 +55,11 @@ pub(super) struct EvalError {
 pub(super) enum EvalErrorKind {
 	/// The node is not a constant expression.
 	NotConst,
-	/// The result does not fit the operand type.
+	/// The result does not fit the operand type, or a shift amount is outside
+	/// its width.
 	Overflow(Operation),
 	DivisionByZero,
 	RemainderByZero,
-	/// A shift amount outside the operand's width.
-	ShiftOverflow(BinaryOp),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,22 +67,6 @@ pub(super) enum EvalErrorKind {
 pub(super) enum Operation {
 	Binary(BinaryOp),
 	Negate,
-}
-
-/// A loop through constants, read from its owner: each member requires the
-/// next, and the last requires the first.
-#[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) struct ConstCycle {
-	pub(super) members: Box<[ConstIdx]>,
-}
-
-/// A failure this constant owns and its check reports.
-#[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum OwnedFailure {
-	Eval(EvalError),
-	Cycle(ConstCycle),
 }
 
 /// The value query's state for one constant.
@@ -86,23 +77,43 @@ pub(super) enum ConstValueState {
 	/// Being evaluated; asking for it again closes a loop.
 	InProgress,
 	Evaluated(ConstValue),
-	/// Not evaluated at all: its type is not a scalar, or it has no
-	/// initializer. A constant that reads it is not a constant expression.
-	NotEvaluated,
-	/// No value. `Some` holds the failure this constant owns; `None` derives
-	/// from one reported elsewhere.
-	Failed(Option<OwnedFailure>),
+	/// Not evaluated at all: the evaluator holds no values of its type
+	/// (`check_value_type`), or it has no initializer. A constant that reads
+	/// it is not a constant expression.
+	NoValue,
+	/// No value, and the failure is reported elsewhere: it derives from
+	/// another constant's failure or from an error in its signature.
+	Poisoned,
+	/// No value; this constant owns the error and its check reports it.
+	Failed(EvalError),
+	/// No value; this constant owns the loop (its first member) and its check
+	/// reports it.
+	Cyclic(Box<[ConstIdx]>),
+}
+
+impl ConstValueState {
+	/// What a reader of the constant learns, once the state is final.
+	fn answer(&self) -> Option<Result<ConstValue, Unevaluable>> {
+		match self {
+			Self::Unevaluated | Self::InProgress => None,
+			Self::Evaluated(value) => Some(Ok(value.clone())),
+			Self::NoValue => Some(Err(Unevaluable::NoValue)),
+			Self::Poisoned | Self::Failed(_) | Self::Cyclic(_) => {
+				Some(Err(Unevaluable::Silent))
+			}
+		}
+	}
 }
 
 /// Why `const_value` has no value for its caller.
 enum Unevaluable {
 	/// The constant has no compile-time value; reading it is the reader's
 	/// error.
-	NotEvaluated,
+	NoValue,
 	/// Reported, or to be reported, by whoever owns it; the caller is silent.
 	Silent,
 	/// A loop still unwinding towards its owner.
-	Cycle(ConstCycle),
+	Cycle(Box<[ConstIdx]>),
 }
 
 /// Why evaluating a node gave no value.
@@ -112,57 +123,44 @@ enum Halt {
 	/// Reported, or to be reported, by whoever owns it.
 	Silent,
 	/// A loop still unwinding towards its owner.
-	Cycle(ConstCycle),
+	Cycle(Box<[ConstIdx]>),
 }
 
 impl TypeContext<'_, '_, '_> {
 	/// Evaluates a constant in the body phase, and reports what it owns.
 	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
 		let _ = self.const_value(const_index);
-		let ConstValueState::Failed(Some(failure)) =
-			&self.const_values[usize::from(const_index)]
-		else {
-			return;
+		let diagnostic = match &self.const_values[usize::from(const_index)] {
+			ConstValueState::Failed(error) => {
+				self.report_eval_failure(const_index, error)
+			}
+			ConstValueState::Cyclic(cycle) => {
+				self.report_const_cycle(const_index, cycle)
+			}
+			_ => return,
 		};
-		let diagnostic =
-			self.report_owned_failure(const_index, failure.clone());
 		self.diagnostics.push(diagnostic);
 	}
 
-	/// The memoized value of a constant whose type is a scalar.
+	/// The memoized value of a constant.
 	fn const_value(
 		&mut self,
 		const_index: ConstIdx,
 	) -> Result<ConstValue, Unevaluable> {
-		match &self.const_values[usize::from(const_index)] {
-			ConstValueState::Evaluated(value) => return Ok(*value),
-			ConstValueState::NotEvaluated => {
-				return Err(Unevaluable::NotEvaluated);
-			}
-			ConstValueState::Failed(_) => return Err(Unevaluable::Silent),
-			ConstValueState::InProgress => {
-				return Err(Unevaluable::Cycle(self.const_cycle(const_index)));
-			}
-			ConstValueState::Unevaluated => {}
+		let state = &self.const_values[usize::from(const_index)];
+		if let Some(answer) = state.answer() {
+			return answer;
 		}
-		let scalar = match self.constant_scalar(const_index) {
-			Ok(Some(scalar)) => scalar,
-			Ok(None) => {
-				self.const_values[usize::from(const_index)] =
-					ConstValueState::NotEvaluated;
-				return Err(Unevaluable::NotEvaluated);
-			}
-			Err(()) => {
-				self.const_values[usize::from(const_index)] =
-					ConstValueState::Failed(None);
-				return Err(Unevaluable::Silent);
-			}
+		if matches!(state, ConstValueState::InProgress) {
+			return Err(Unevaluable::Cycle(self.const_cycle(const_index)));
+		}
+		let ty = match self.constant_value_type(const_index) {
+			Ok(ty) => ty,
+			Err(state) => return self.settle_constant(const_index, state),
 		};
 		self.ensure_const_body(const_index);
 		let Some(body) = &self.const_bodies[usize::from(const_index)] else {
-			self.const_values[usize::from(const_index)] =
-				ConstValueState::NotEvaluated;
-			return Err(Unevaluable::NotEvaluated);
+			return self.settle_constant(const_index, ConstValueState::NoValue);
 		};
 		let root = body.root();
 		self.const_values[usize::from(const_index)] =
@@ -171,30 +169,37 @@ impl TypeContext<'_, '_, '_> {
 		let evaluated = self.eval(const_index, root);
 		self.const_stack.pop();
 
-		let (state, answer) = match evaluated {
-			Ok(value) if value.scalar() == Some(scalar) => {
-				(ConstValueState::Evaluated(value), Ok(value))
+		let state = match evaluated {
+			Ok(value) if value.scalar() == Scalar::from_type(ty) => {
+				ConstValueState::Evaluated(value)
 			}
 			// A root of another type is `ERROR` once the checker reports it, so
 			// this is a value the checker accepted in another scalar.
-			Ok(_) => (ConstValueState::Failed(None), Err(Unevaluable::Silent)),
-			Err(Halt::Own(error)) => (
-				ConstValueState::Failed(Some(OwnedFailure::Eval(error))),
-				Err(Unevaluable::Silent),
-			),
-			Err(Halt::Silent) => {
-				(ConstValueState::Failed(None), Err(Unevaluable::Silent))
-			}
+			Ok(_) => ConstValueState::Poisoned,
+			Err(Halt::Own(error)) => ConstValueState::Failed(error),
+			Err(Halt::Silent) => ConstValueState::Poisoned,
 			// The owner keeps the loop; its readers further out derive from it.
-			Err(Halt::Cycle(cycle)) if cycle.members[0] == const_index => (
-				ConstValueState::Failed(Some(OwnedFailure::Cycle(cycle))),
-				Err(Unevaluable::Silent),
-			),
-			Err(Halt::Cycle(cycle)) => (
-				ConstValueState::Failed(None),
-				Err(Unevaluable::Cycle(cycle)),
-			),
+			Err(Halt::Cycle(cycle)) if cycle[0] == const_index => {
+				ConstValueState::Cyclic(cycle)
+			}
+			// Still unwinding: the one answer that is not a function of the
+			// state, since the loop it carries belongs to another constant.
+			Err(Halt::Cycle(cycle)) => {
+				self.const_values[usize::from(const_index)] =
+					ConstValueState::Poisoned;
+				return Err(Unevaluable::Cycle(cycle));
+			}
 		};
+		self.settle_constant(const_index, state)
+	}
+
+	/// Records the final state of a constant and answers its reader with it.
+	fn settle_constant(
+		&mut self,
+		const_index: ConstIdx,
+		state: ConstValueState,
+	) -> Result<ConstValue, Unevaluable> {
+		let answer = state.answer().expect("a settled state is final");
 		self.const_values[usize::from(const_index)] = state;
 		answer
 	}
@@ -247,10 +252,36 @@ impl TypeContext<'_, '_, '_> {
 				let operand = self.eval(owner, operand)?;
 				unary(op, operand).map_err(own)
 			}
+			ExprKind::Construct {
+				struct_index,
+				args,
+				order,
+			} => {
+				let body =
+					self.const_bodies[usize::from(owner)].as_ref().unwrap();
+				let fields: Vec<_> = (0..args.len())
+					.map(|at| {
+						(body.args(args)[at], body.declared_index(order, at))
+					})
+					.collect();
+				let count = self.struct_field_types(struct_index).len();
+				// A missing field was reported.
+				if fields.len() != count {
+					return Err(Halt::Silent);
+				}
+				// Evaluated in written order, held in declaration order.
+				let mut values = vec![None; count];
+				for (expr, field) in fields {
+					values[usize::from(field)] = Some(self.eval(owner, expr)?);
+				}
+				Ok(ConstValue::Struct(
+					values.into_iter().map(Option::unwrap).collect(),
+				))
+			}
 			ExprKind::Binary { op, lhs, rhs } => {
 				let lhs = self.eval(owner, lhs)?;
 				// `&&` and `||` do not evaluate a right side they do not need.
-				match (op, lhs) {
+				match (op, &lhs) {
 					(BinaryOp::And, ConstValue::Bool(false)) => {
 						return Ok(ConstValue::Bool(false));
 					}
@@ -275,7 +306,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<ConstValue, Halt> {
 		self.const_value(const_index)
 			.map_err(|failure| match failure {
-				Unevaluable::NotEvaluated => Halt::Own(EvalError {
+				Unevaluable::NoValue => Halt::Own(EvalError {
 					span,
 					kind: EvalErrorKind::NotConst,
 				}),
@@ -285,8 +316,9 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// `const_index` was asked for again while it is evaluated: the loop is
-	/// the stack from its first request, read from its first-defined member.
-	fn const_cycle(&self, const_index: ConstIdx) -> ConstCycle {
+	/// the stack from its first request, read from its first-defined member:
+	/// each member requires the next, and the last requires the first.
+	fn const_cycle(&self, const_index: ConstIdx) -> Box<[ConstIdx]> {
 		let start = self
 			.const_stack
 			.iter()
@@ -297,27 +329,82 @@ impl TypeContext<'_, '_, '_> {
 			.min_by_key(|&at| usize::from(members[at]))
 			.unwrap();
 		members.rotate_left(owner);
-		ConstCycle {
-			members: members.into_boxed_slice(),
-		}
+		members.into_boxed_slice()
 	}
 
-	/// The scalar a constant's value is held in, if there is one: its
-	/// declared type's, or for a value of an enum, the enum's repr. `Err` when
-	/// that type failed to resolve, which was reported where it is written.
-	fn constant_scalar(
+	/// The type a constant's value is held in: its declared type, normalized,
+	/// or for a value of an enum, the enum's repr. `Err` is the final state of
+	/// a constant of a type the evaluator holds no values of.
+	fn constant_value_type(
 		&mut self,
 		const_index: ConstIdx,
-	) -> Result<Option<Scalar>, ()> {
+	) -> Result<TypeIndex, ConstValueState> {
 		let (ty, scope) = self.constant_type(const_index);
 		let mut ty = self.normalize_type_query(scope, ty).unwrap_or(ty);
 		if let Type::Enum { enum_index } = *self.types.resolve(ty) {
 			ty = self.enum_repr(enum_index);
 		}
+		self.check_value_type(ty, &mut Vec::new())?;
+		Ok(ty)
+	}
+
+	/// Whether the evaluator holds values of the normalized type `ty`: a
+	/// scalar, an enum (in its repr), or a struct that is not generic and
+	/// whose fields it holds. `Err` is the final state of a constant of a
+	/// type it does not: no value, or poisoned when the type, or a field's,
+	/// failed to resolve, which was reported where it is written. A struct
+	/// reached again through `visiting`, the structs being looked through,
+	/// contains itself, which is reported on the struct.
+	fn check_value_type(
+		&mut self,
+		ty: TypeIndex,
+		visiting: &mut Vec<StructIdx>,
+	) -> Result<(), ConstValueState> {
 		if ty == TypeIndex::ERROR {
-			return Err(());
+			return Err(ConstValueState::Poisoned);
 		}
-		Ok(Scalar::from_type(ty))
+		if Scalar::from_type(ty).is_some() {
+			return Ok(());
+		}
+		match *self.types.resolve(ty) {
+			Type::Enum { enum_index } => {
+				if self.enum_repr(enum_index) == TypeIndex::ERROR {
+					Err(ConstValueState::Poisoned)
+				} else {
+					Ok(())
+				}
+			}
+			Type::Struct { struct_index, .. } => {
+				if visiting.contains(&struct_index) {
+					return Err(ConstValueState::Poisoned);
+				}
+				if self.structs[usize::from(struct_index)].type_params
+					!= TypeEnvIdx::ROOT
+				{
+					return Err(ConstValueState::NoValue);
+				}
+				visiting.push(struct_index);
+				let mut held = Ok(());
+				for field in self.struct_field_types(struct_index).to_vec() {
+					let field = self
+						.normalize_type_query(TypeEnvIdx::ROOT, field)
+						.unwrap_or(field);
+					match self.check_value_type(field, visiting) {
+						Ok(()) => {}
+						// A poisoned field poisons the struct, whatever the other
+						// fields are, so a reader of it is never reported.
+						Err(ConstValueState::Poisoned) => {
+							held = Err(ConstValueState::Poisoned);
+							break;
+						}
+						Err(state) => held = Err(state),
+					}
+				}
+				visiting.pop();
+				held
+			}
+			_ => Err(ConstValueState::NoValue),
+		}
 	}
 
 	/// Reports each set of an enum's variants that share a value, once, on the
@@ -368,101 +455,99 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	fn report_owned_failure(
+	fn const_name(&self, index: ConstIdx) -> &str {
+		let def = &self.defs.constants[usize::from(index)];
+		self.strings.resolve(def.name.inner).unwrap()
+	}
+
+	fn report_eval_failure(
 		&self,
 		const_index: ConstIdx,
-		failure: OwnedFailure,
+		error: &EvalError,
 	) -> Diagnostic<crate::vfs::FileId> {
 		let def = &self.defs.constants[usize::from(const_index)];
-		let name = |index: ConstIdx| {
-			let def = &self.defs.constants[usize::from(index)];
-			self.strings.resolve(def.name.inner).unwrap()
+		let site = SourceSpan::new(def.file_id, error.span);
+		let message = match error.kind {
+			EvalErrorKind::NotConst => format!(
+				"`{}` cannot be evaluated at compile time",
+				self.const_name(const_index)
+			),
+			_ => format!(
+				"evaluation of constant `{}` failed",
+				self.const_name(const_index)
+			),
 		};
-		match failure {
-			OwnedFailure::Eval(error) => {
-				let site = SourceSpan::new(def.file_id, error.span);
-				let (code, label) = match error.kind {
-					EvalErrorKind::NotConst => (
-						DiagnosticCode::NotConstEvaluatable,
-						"not a constant expression".to_string(),
-					),
-					EvalErrorKind::Overflow(operation) => (
-						DiagnosticCode::ConstEvaluationFailed,
-						format!("attempt to {} with overflow", operation.verb()),
-					),
-					EvalErrorKind::DivisionByZero => (
-						DiagnosticCode::ConstEvaluationFailed,
-						"attempt to divide by zero".to_string(),
-					),
-					EvalErrorKind::RemainderByZero => (
-						DiagnosticCode::ConstEvaluationFailed,
-						"attempt to calculate the remainder with a divisor of zero"
-							.to_string(),
-					),
-					EvalErrorKind::ShiftOverflow(op) => (
-						DiagnosticCode::ConstEvaluationFailed,
-						format!(
-							"attempt to {} with overflow",
-							Operation::Binary(op).verb()
-						),
-					),
-				};
-				let message = match error.kind {
-					EvalErrorKind::NotConst => format!(
-						"`{}` cannot be evaluated at compile time",
-						name(const_index)
-					),
-					_ => format!(
-						"evaluation of constant `{}` failed",
-						name(const_index)
-					),
-				};
-				Diagnostic::error()
-					.with_code(code.code())
-					.with_message(message)
-					.with_label(site.primary_label().with_message(label))
-			}
-			OwnedFailure::Cycle(cycle) => {
-				let mut diagnostic = Diagnostic::error()
-					.with_code(DiagnosticCode::CyclicConstant.code())
+		Diagnostic::error()
+			.with_code(error.kind.code().code())
+			.with_message(message)
+			.with_label(site.primary_label().with_message(error.kind.label()))
+	}
+
+	fn report_const_cycle(
+		&self,
+		const_index: ConstIdx,
+		cycle: &[ConstIdx],
+	) -> Diagnostic<crate::vfs::FileId> {
+		let def = &self.defs.constants[usize::from(const_index)];
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicConstant.code())
+			.with_message(format!(
+				"cycle detected when evaluating constant `{}`",
+				self.const_name(cycle[0])
+			))
+			.with_label(
+				SourceSpan::new(def.file_id, def.name.span).primary_label(),
+			);
+		for (at, &member) in cycle.iter().enumerate() {
+			let next = cycle[(at + 1) % cycle.len()];
+			let member_def = &self.defs.constants[usize::from(member)];
+			diagnostic = diagnostic.with_label(
+				SourceSpan::new(member_def.file_id, member_def.name.span)
+					.secondary_label()
 					.with_message(format!(
-						"cycle detected when evaluating constant `{}`",
-						name(cycle.members[0])
-					))
-					.with_label(
-						SourceSpan::new(def.file_id, def.name.span)
-							.primary_label(),
-					);
-				for (at, &member) in cycle.members.iter().enumerate() {
-					let next = cycle.members[(at + 1) % cycle.members.len()];
-					let member_def = &self.defs.constants[usize::from(member)];
-					diagnostic = diagnostic.with_label(
-						SourceSpan::new(
-							member_def.file_id,
-							member_def.name.span,
-						)
-						.secondary_label()
-						.with_message(format!(
-							"`{}` requires evaluating `{}`",
-							name(member),
-							name(next)
-						)),
-					);
-				}
-				diagnostic
+						"`{}` requires evaluating `{}`",
+						self.const_name(member),
+						self.const_name(next)
+					)),
+			);
+		}
+		diagnostic
+	}
+}
+
+impl EvalErrorKind {
+	fn code(self) -> DiagnosticCode {
+		match self {
+			Self::NotConst => DiagnosticCode::NotConstEvaluatable,
+			_ => DiagnosticCode::ConstEvaluationFailed,
+		}
+	}
+
+	fn label(self) -> String {
+		match self {
+			Self::NotConst => "not a constant expression".to_string(),
+			Self::Overflow(operation) => {
+				format!("attempt to {} with overflow", operation.verb())
+			}
+			Self::DivisionByZero => "attempt to divide by zero".to_string(),
+			Self::RemainderByZero => {
+				"attempt to calculate the remainder with a divisor of zero"
+					.to_string()
 			}
 		}
 	}
 }
 
 impl ConstValue {
-	fn scalar(self) -> Option<Scalar> {
-		match self {
+	/// The scalar the value is held in; `None` for a struct.
+	fn scalar(&self) -> Option<Scalar> {
+		match *self {
 			Self::Int { scalar, .. } | Self::Float { scalar, .. } => {
 				Some(scalar)
 			}
 			Self::Bool(_) => Some(Scalar::Bool),
 			Self::Char(_) => Some(Scalar::Char),
+			Self::Struct(_) => None,
 		}
 	}
 }
@@ -516,7 +601,7 @@ fn binary(
 	rhs: ConstValue,
 ) -> Result<ConstValue, EvalErrorKind> {
 	use ConstValue::{Bool, Float, Int};
-	if let Some(ordering) = compare(op, lhs, rhs) {
+	if let Some(ordering) = compare(op, &lhs, &rhs) {
 		return Ok(Bool(ordering));
 	}
 	Ok(match (lhs, rhs) {
@@ -550,7 +635,7 @@ fn binary(
 				},
 				BinaryOp::LeftShift | BinaryOp::RightShift => {
 					if b < 0 || b >= i128::from(scalar.bits()) {
-						return Err(EvalErrorKind::ShiftOverflow(op));
+						return Err(EvalErrorKind::Overflow(overflow));
 					}
 					// Bits shifted past the width are dropped, as at runtime;
 					// a right shift is arithmetic on a signed type.
@@ -567,25 +652,21 @@ fn binary(
 			}
 		}
 		(Float { value: a, scalar }, Float { value: b, .. }) => {
+			let value = match op {
+				BinaryOp::Add => a + b,
+				BinaryOp::Sub => a - b,
+				BinaryOp::Mul => a * b,
+				BinaryOp::Div => a / b,
+				BinaryOp::Rem => a % b,
+				_ => unreachable!(),
+			};
+			// An `f32` operation rounds the exact result once. A double holds
+			// the result of `+ - * /` on two `f32`s closely enough that rounding
+			// it to `f32` agrees, and `%` is exact in both.
 			let value = if scalar == Scalar::F32 {
-				let (a, b) = (a as f32, b as f32);
-				f64::from(match op {
-					BinaryOp::Add => a + b,
-					BinaryOp::Sub => a - b,
-					BinaryOp::Mul => a * b,
-					BinaryOp::Div => a / b,
-					BinaryOp::Rem => a % b,
-					_ => unreachable!(),
-				})
+				f64::from(value as f32)
 			} else {
-				match op {
-					BinaryOp::Add => a + b,
-					BinaryOp::Sub => a - b,
-					BinaryOp::Mul => a * b,
-					BinaryOp::Div => a / b,
-					BinaryOp::Rem => a % b,
-					_ => unreachable!(),
-				}
+				value
 			};
 			Float { value, scalar }
 		}
@@ -602,20 +683,20 @@ fn binary(
 }
 
 /// The answer of a comparison, `None` for any other operator.
-fn compare(op: BinaryOp, lhs: ConstValue, rhs: ConstValue) -> Option<bool> {
+fn compare(op: BinaryOp, lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
 	use std::cmp::Ordering;
 	let ordering = match (lhs, rhs) {
 		(
 			ConstValue::Int { value: a, .. },
 			ConstValue::Int { value: b, .. },
-		) => a.partial_cmp(&b),
+		) => a.partial_cmp(b),
 		// IEEE: any comparison with NaN is false, except `!=`.
 		(
 			ConstValue::Float { value: a, .. },
 			ConstValue::Float { value: b, .. },
-		) => a.partial_cmp(&b),
-		(ConstValue::Bool(a), ConstValue::Bool(b)) => a.partial_cmp(&b),
-		(ConstValue::Char(a), ConstValue::Char(b)) => a.partial_cmp(&b),
+		) => a.partial_cmp(b),
+		(ConstValue::Bool(a), ConstValue::Bool(b)) => a.partial_cmp(b),
+		(ConstValue::Char(a), ConstValue::Char(b)) => a.partial_cmp(b),
 		_ => None,
 	};
 	Some(match op {

@@ -602,7 +602,7 @@ mod tests {
 	}
 
 	/// The `TypeIndex` of `function_path`'s `param_index`-th own declared
-	/// generic parameter — e.g. the `T` in `fn target<T: Bound>(x: T)`.
+	/// generic parameter — e.g. the `T` in `func target<T: Bound>(x: T)`.
 	/// Declaring the type under test as a generic function's own type
 	/// parameter, rather than reading a resolved parameter type back out of
 	/// `FunctionSignature` (private to `signatures.rs` — nothing outside it
@@ -723,7 +723,7 @@ mod tests {
 		with_resolved(
 			indoc! {"
 				trait Bound {}
-				fn target<T: Bound>(x: T) {}
+				func target<T: Bound>(x: T) {}
 			"},
 			|builder, graph| {
 				let bound = trait_index(builder, graph, "Bound");
@@ -744,7 +744,7 @@ mod tests {
 			indoc! {"
 				trait Bound {}
 				trait Other {}
-				fn target<T: Bound>(x: T) {}
+				func target<T: Bound>(x: T) {}
 			"},
 			|builder, graph| {
 				let other = trait_index(builder, graph, "Other");
@@ -765,7 +765,7 @@ mod tests {
 			indoc! {"
 				trait Super {}
 				trait Sub: Super {}
-				fn target<T: Sub>(x: T) {}
+				func target<T: Sub>(x: T) {}
 			"},
 			|builder, graph| {
 				let super_trait = trait_index(builder, graph, "Super");

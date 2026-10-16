@@ -995,7 +995,7 @@ impl<'ast> Builder<'ast, '_> {
 			member.span,
 		);
 		// See the identical check in `resolve_method_call`: a `TypeParam`
-		// namespace (e.g. `T::SOME_CONST` inside `fn f<T: SomeTrait>()`)
+		// namespace (e.g. `T::SOME_CONST` inside `func f<T: SomeTrait>()`)
 		// resolving to `MemberLookup::Trait` is abstract dispatch — mark
 		// every impl of the trait accessed, not just the one entry
 		// returned, since the concrete one is only known at monomorphization.

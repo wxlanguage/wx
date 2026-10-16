@@ -40,7 +40,7 @@ const C6: f64 = -1.13596475577881948265e-11; // 0xBDA8FAE9, 0xBE8838D4
 //         expression for cos().  Retention happens in all cases tested
 //         under FreeBSD, so don't pessimize things by forcibly clipping
 //         any extra precision in w.
-pub fn k_cos(x: f64, y: f64) -> f64 {
+pub func k_cos(x: f64, y: f64) -> f64 {
     local z = x * x;
     local w = z * z;
     local r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6));
