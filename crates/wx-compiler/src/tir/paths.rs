@@ -70,7 +70,7 @@ use super::imports::{
 	report_private_identifier,
 };
 use super::resolutions::{NameResolutions, Referent};
-use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
+use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 
 /// The result of walking a whole path. `stopped_with` is the answer for
 /// `segments[stopped_at]`:
@@ -338,15 +338,14 @@ impl<'r> PathResolver<'r> {
 			resolution.first_namespace_with_type_args
 		{
 			let segment = &segments[index as usize];
-			self.diagnostics.push(report_type_arg_count_mismatch(
+			self.diagnostics.push(report_type_args_not_allowed(
 				self.strings,
 				self.defs,
 				file_id,
 				segment,
-				TypeArgsTarget::Declaration {
-					kind: self.defs.namespaces.kind(def_key),
-					params: &[],
-				},
+				TypeArgsNotAllowedOn::Declaration(
+					self.defs.namespaces.kind(def_key),
+				),
 			));
 		}
 		let target = match &resolution.stopped_with {

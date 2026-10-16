@@ -29,7 +29,7 @@ use super::operators::{
 	Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
 };
 use super::paths::PathResolver;
-use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
+use super::satisfaction::report_type_arg_count_mismatch;
 use super::signatures::TypeContext;
 use super::types::{TypeEnvIdx, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
@@ -351,10 +351,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.defs,
 				self.file_id,
 				segment,
-				TypeArgsTarget::Declaration {
-					kind: DefKind::Struct(struct_index),
-					params: &[],
-				},
+				DefKind::Struct(struct_index),
+				&[],
 			));
 		}
 		let (args, order) = match arguments {

@@ -21,7 +21,7 @@ use super::signatures::TypeContext;
 use super::solver::SolverError;
 use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
-use crate::diagnostics::{DiagnosticCode, SourceSpan};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::bounds::{BoundFacts, ImpliedTraitBound};
 use crate::tir::solver::SolverView;
 use crate::tir::types::TypeEnvOwner;
@@ -82,10 +82,8 @@ impl TypeContext<'_, '_, '_> {
 				self.defs,
 				file_id,
 				segment,
-				TypeArgsTarget::Declaration {
-					kind,
-					params: self.type_envs.params(params_env),
-				},
+				kind,
+				self.type_envs.params(params_env),
 			));
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
@@ -350,50 +348,98 @@ impl ObligationChecker<'_> {
 	}
 }
 
-/// What a path segment written with generic arguments names.
-pub(super) enum TypeArgsTarget<'a> {
-	/// A declaration and its own generic parameters, none for one that
-	/// declares no parameter list (a namespace a path passes through, a
-	/// global, an enum, an associated type).
-	Declaration {
-		kind: DefKind,
-		params: &'a [TypeParam],
-	},
-	/// A generic parameter, or a trait's `Self`, which has no parameter
-	/// list, and the declaration whose frame declares it.
+/// What a path segment written with type arguments names when it can
+/// never declare parameters. An impl's `Self` has its own report, which
+/// shows the target the impl names.
+pub(super) enum TypeArgsNotAllowedOn<'a> {
+	/// A namespace a path passes through, an enum, a global, a memory, an
+	/// associated type or an intrinsic type alias.
+	Declaration(DefKind),
+	/// A generic parameter or a trait's `Self`, and the declaration whose
+	/// frame declares it.
 	TypeParam {
 		owner: TypeEnvOwner,
 		param: &'a TypeParam,
 	},
 }
 
-pub(super) fn report_type_arg_count_mismatch(
+/// Type arguments on a name that never takes any, as opposed to a wrong
+/// count for one that declares a parameter list.
+pub(super) fn report_type_args_not_allowed(
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,
 	file_id: FileId,
 	segment: &ast::PathSegment,
-	target: TypeArgsTarget<'_>,
+	target: TypeArgsNotAllowedOn<'_>,
 ) -> Diagnostic<FileId> {
-	let (noun, name, declaration) = match target {
-		TypeArgsTarget::Declaration { kind, params } => (
-			kind.noun(),
-			segment.ident.inner,
-			kind.declared_at(defs)
-				.map(|declared_at| (declared_at, params)),
-		),
-		TypeArgsTarget::TypeParam { owner, param } => (
+	let (noun, declared_at) = match target {
+		TypeArgsNotAllowedOn::Declaration(kind) => {
+			(kind.noun(), kind.declared_at(defs))
+		}
+		TypeArgsNotAllowedOn::TypeParam { owner, param } => (
 			if param.name.inner == Keyword::SelfPascal.symbol() {
 				"self type"
 			} else {
 				"type parameter"
 			},
-			param.name.inner,
-			Some((
-				SourceSpan::new(owner.file_id(defs), param.name.span),
-				&[][..],
-			)),
+			Some(SourceSpan::new(owner.file_id(defs), param.name.span)),
 		),
 	};
+	let name = strings.resolve(segment.ident.inner).unwrap();
+	let (first, last) = (
+		segment.type_args.first().unwrap(),
+		segment.type_args.last().unwrap(),
+	);
+	let mut labels = vec![
+		SourceSpan::new(
+			file_id,
+			TextSpan::new(first.span.start, last.span.end),
+		)
+		.primary_label()
+		.with_message(format!(
+			"type argument{} not allowed",
+			if segment.type_args.len() == 1 {
+				""
+			} else {
+				"s"
+			}
+		)),
+		SourceSpan::new(file_id, segment.ident.span)
+			.secondary_label()
+			.with_message(format!("not allowed on {noun} `{name}`")),
+	];
+	if let Some(declared_at) = declared_at {
+		labels.push(
+			declared_at
+				.secondary_label()
+				.with_message(format!("{noun} `{name}` defined here")),
+		);
+	}
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
+		.with_message(format!(
+			"type arguments are not allowed on {noun} `{name}`"
+		))
+		.with_labels(labels)
+		.with_note(format!(
+			"{noun} `{name}` has no generic parameters; write `{name}` alone"
+		))
+}
+
+/// A wrong number of type arguments for a declaration with its own
+/// parameter list, possibly empty: a struct, a function or a type alias.
+pub(super) fn report_type_arg_count_mismatch(
+	strings: &StringInterner,
+	defs: &DefinitionRegistry,
+	file_id: FileId,
+	segment: &ast::PathSegment,
+	kind: DefKind,
+	params: &[TypeParam],
+) -> Diagnostic<FileId> {
+	let (noun, name) = (kind.noun(), segment.ident.inner);
+	let declaration = kind
+		.declared_at(defs)
+		.map(|declared_at| (declared_at, params));
 	let args = &segment.type_args;
 	let params = declaration.map_or(&[][..], |(_, params)| params);
 	let expected = params.len();

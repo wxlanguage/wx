@@ -48,7 +48,7 @@ use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
 use super::resolutions::{NameResolutions, Referent};
-use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
+use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 use super::solver::{ImplMember, Solver, SolverError, SolverView};
 use super::typecheck::BodyContext;
 use super::types::{
@@ -967,7 +967,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					TextSpan::new(first.span.start, last.span.end),
 				)
 				.primary_label()
-				.with_message("type arguments not allowed"),
+				.with_message(format!(
+					"type argument{} not allowed",
+					if segment.type_args.len() == 1 {
+						""
+					} else {
+						"s"
+					}
+				)),
 				SourceSpan::new(file_id, segment.ident.span)
 					.secondary_label()
 					.with_message("not allowed on `Self`"),
@@ -2732,12 +2739,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						infer_policy,
 					);
 				}
-				self.diagnostics.push(report_type_arg_count_mismatch(
+				self.diagnostics.push(report_type_args_not_allowed(
 					self.strings,
 					self.defs,
 					file_id,
 					first,
-					TypeArgsTarget::TypeParam {
+					TypeArgsNotAllowedOn::TypeParam {
 						owner: self.type_envs.owner(frame),
 						param: &self.type_envs.params(frame)[index as usize],
 					},
@@ -2796,6 +2803,36 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 
 			let resolved = match def_key.symbol_kind(self.defs) {
+				// An intrinsic alias takes no arguments: it is a primitive,
+				// not an alias with an empty parameter list.
+				kind @ DefKind::TypeAlias(type_alias_index)
+					if !stopped.type_args.is_empty()
+						&& self
+							.defs
+							.intrinsics
+							.identity_of(type_alias_index)
+							.is_some() =>
+				{
+					// Resolved only to report what is wrong inside them.
+					for arg in &stopped.type_args {
+						self.resolve_type_expression(
+							file_id,
+							namespace,
+							env,
+							arg,
+							infer_policy,
+						);
+					}
+					self.diagnostics.push(report_type_args_not_allowed(
+						self.strings,
+						self.defs,
+						file_id,
+						stopped,
+						TypeArgsNotAllowedOn::Declaration(kind),
+					));
+					// What it names is unambiguous, so the type is kept.
+					self.defs.intrinsics.identity_of(type_alias_index).unwrap()
+				}
 				DefKind::TypeAlias(type_alias_index) => {
 					let def_id = DefId::TypeAlias(type_alias_index);
 					let reference =
@@ -2916,15 +2953,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								infer_policy,
 							);
 						}
-						self.diagnostics.push(report_type_arg_count_mismatch(
+						self.diagnostics.push(report_type_args_not_allowed(
 							self.strings,
 							self.defs,
 							file_id,
 							stopped,
-							TypeArgsTarget::Declaration {
-								kind: DefKind::Enum(enum_index),
-								params: &[],
-							},
+							TypeArgsNotAllowedOn::Declaration(DefKind::Enum(
+								enum_index,
+							)),
 						));
 						TypeIndex::ERROR
 					} else {
@@ -2935,8 +2971,29 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 				// Every memory declaration is its own nominal type,
 				// including when referenced as a memory tag.
-				DefKind::Memory(memory_index) => {
-					self.types.intern(Type::Memory { memory_index })
+				kind @ DefKind::Memory(memory_index) => {
+					if stopped.type_args.is_empty() {
+						self.types.intern(Type::Memory { memory_index })
+					} else {
+						// Resolved only to report what is wrong inside them.
+						for arg in &stopped.type_args {
+							self.resolve_type_expression(
+								file_id,
+								namespace,
+								env,
+								arg,
+								infer_policy,
+							);
+						}
+						self.diagnostics.push(report_type_args_not_allowed(
+							self.strings,
+							self.defs,
+							file_id,
+							stopped,
+							TypeArgsNotAllowedOn::Declaration(kind),
+						));
+						TypeIndex::ERROR
+					}
 				}
 				kind @ (DefKind::Module(_)
 				| DefKind::Package(_)
@@ -3011,12 +3068,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								infer_policy,
 							);
 						}
-						self.diagnostics.push(report_type_arg_count_mismatch(
+						self.diagnostics.push(report_type_args_not_allowed(
 							self.strings,
 							self.defs,
 							file_id,
 							stopped,
-							TypeArgsTarget::Declaration { kind, params: &[] },
+							TypeArgsNotAllowedOn::Declaration(kind),
 						));
 						TypeIndex::ERROR
 					}
@@ -3128,15 +3185,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				infer_policy,
 			);
 		}
-		self.diagnostics.push(report_type_arg_count_mismatch(
+		self.diagnostics.push(report_type_args_not_allowed(
 			self.strings,
 			self.defs,
 			file_id,
 			segment,
-			TypeArgsTarget::Declaration {
-				kind: DefKind::TraitAssocType(assoc_type_index),
-				params: &[],
-			},
+			TypeArgsNotAllowedOn::Declaration(DefKind::TraitAssocType(
+				assoc_type_index,
+			)),
 		));
 	}
 
@@ -7458,7 +7514,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeArgumentCountMismatch,
-			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentsNotAllowed,
 			DiagnosticCode::TypeArgumentCountMismatch,
 		]);
 		let params = &case.function_signature("f").param_types;
@@ -7523,10 +7579,10 @@ pub(super) mod tests {
 		"}
 		);
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 		assert_eq!(
 			case.context.diagnostics[0].message,
-			"type parameter `T` takes 0 generic arguments but 1 generic argument was supplied"
+			"type arguments are not allowed on type parameter `T`"
 		);
 		let param = case.function_signature("f").param_types[0];
 		assert!(matches!(
@@ -7547,10 +7603,10 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics()
-				.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+				.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 			assert_eq!(
 				case.context.diagnostics[0].message,
-				"associated type `Item` takes 0 generic arguments but 1 generic argument was supplied"
+				"type arguments are not allowed on associated type `Item`"
 			);
 		}
 		test_case!(
@@ -7558,7 +7614,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UndeclaredIdentifier,
-			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentsNotAllowed,
 		]);
 	}
 
@@ -7578,7 +7634,7 @@ pub(super) mod tests {
 			let source = format!("{source} {call}");
 			test_case!(case = &source);
 			case.diagnostics()
-				.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+				.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 			// `declared` ends with the declared name.
 			let end = source.find(declared).unwrap() + declared.len();
 			let label = case.context.diagnostics[0]
@@ -7645,10 +7701,10 @@ pub(super) mod tests {
 		"}
 		);
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 		assert_eq!(
 			case.context.diagnostics[0].message,
-			"self type `Self` takes 0 generic arguments but 1 generic argument was supplied"
+			"type arguments are not allowed on self type `Self`"
 		);
 	}
 
@@ -7663,7 +7719,7 @@ pub(super) mod tests {
 		"}
 		);
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 		assert!(case.is_projection_param("f", 0));
 	}
 
@@ -7680,10 +7736,10 @@ pub(super) mod tests {
 		"}
 		);
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TypeArgumentCountMismatch]);
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 		assert_eq!(
 			case.context.diagnostics[0].message,
-			"module `m` takes 0 generic arguments but 1 generic argument was supplied"
+			"type arguments are not allowed on module `m`"
 		);
 		let param = case.function_signature("f").param_types[0];
 		assert!(matches!(
@@ -8110,6 +8166,43 @@ pub(super) mod tests {
 		assert_eq!(case.enum_signature("colors::Color").repr, TypeIndex::I32);
 	}
 
+	/// An intrinsic type alias is a primitive, not an alias with an empty
+	/// parameter list: its arguments are not allowed, and it keeps its type.
+	/// A memory takes none either.
+	#[test]
+	fn builtin_and_memory_types_reject_type_arguments() {
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			func f(x: u8<u8>, y: heap<u8>) {}
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeArgumentsNotAllowed,
+			DiagnosticCode::TypeArgumentsNotAllowed,
+		]);
+		let [builtin, memory] = &case.context.diagnostics[..] else {
+			unreachable!()
+		};
+		assert_eq!(
+			builtin.message,
+			"type arguments are not allowed on type alias `u8`"
+		);
+		assert_eq!(
+			memory.message,
+			"type arguments are not allowed on memory `heap`"
+		);
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U8);
+	}
+
+	/// An enum never declares parameters, so arguments on it are not
+	/// allowed at all: the report marks the arguments, the name, and the
+	/// enum's declaration.
 	#[test]
 	fn enum_types_reject_generic_arguments() {
 		let source = indoc! {"
@@ -8120,64 +8213,45 @@ pub(super) mod tests {
 			mod nested { pub enum Color: i32 { Red = 0 } }
 		"};
 		test_case!(case = source);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			2,
-			"{:?}",
-			case.context.diagnostics
-		);
-		for (diagnostic, path) in case
-			.context
-			.diagnostics
-			.iter()
-			.zip(["Color", "nested::Color"])
-		{
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeArgumentsNotAllowed,
+			DiagnosticCode::TypeArgumentsNotAllowed,
+		]);
+		for (diagnostic, path, args, plural) in [
+			(&case.context.diagnostics[0], "Color", "i32", ""),
+			(
+				&case.context.diagnostics[1],
+				"nested::Color",
+				"i32, i32",
+				"s",
+			),
+		] {
 			assert_eq!(
-				diagnostic.code.as_deref(),
-				Some(DiagnosticCode::TypeArgumentCountMismatch.code())
+				diagnostic.message,
+				"type arguments are not allowed on enum `Color`"
 			);
+			let [arguments, name, declaration] = &diagnostic.labels[..] else {
+				panic!("expected three labels: {:?}", diagnostic.labels);
+			};
+			assert_eq!(&source[arguments.range.clone()], args);
 			assert_eq!(
-				diagnostic.labels[0].message,
-				"expected 0 generic arguments"
+				arguments.message,
+				format!("type argument{plural} not allowed")
 			);
-			assert_eq!(&source[diagnostic.labels[0].range.clone()], "Color");
-			let (argument_labels, declaration_labels) =
-				diagnostic.labels[1..].split_at(diagnostic.labels.len() - 2);
-			for label in argument_labels {
-				assert_eq!(&source[label.range.clone()], "i32");
-			}
-			assert_eq!(
-				argument_labels.last().unwrap().message,
-				"remove the unnecessary generics"
-			);
+			assert_eq!(&source[name.range.clone()], "Color");
+			assert_eq!(name.message, "not allowed on enum `Color`");
 			let DefKind::Enum(index) = case.resolve(Tier::Type, path) else {
 				panic!("expected an enum");
 			};
 			let definition = &case.defs.enums[usize::from(index)];
-			let declaration = &declaration_labels[0];
 			assert_eq!(declaration.file_id, definition.file_id);
 			assert_eq!(
 				declaration.range,
 				definition.name.span.start as usize
 					..definition.name.span.end as usize
 			);
-			assert_eq!(
-				declaration.message,
-				"enum defined here, with 0 generic parameters"
-			);
+			assert_eq!(declaration.message, "enum `Color` defined here");
 		}
-		assert_eq!(
-			case.context.diagnostics[0].message,
-			"enum `Color` takes 0 generic arguments but 1 generic argument was supplied"
-		);
-		assert_eq!(
-			case.context.diagnostics[1].message,
-			"enum `Color` takes 0 generic arguments but 2 generic arguments were supplied"
-		);
-		assert_eq!(
-			case.function_signature("f").param_types.as_ref(),
-			[TypeIndex::ERROR, TypeIndex::ERROR]
-		);
 	}
 
 	#[test]
@@ -15262,7 +15336,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeArgumentCountMismatch,
-			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentsNotAllowed,
 		]);
 		let DefKind::Global(counter) = case.resolve(Tier::Value, "counter")
 		else {
