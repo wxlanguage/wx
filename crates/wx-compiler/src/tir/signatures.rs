@@ -15597,6 +15597,25 @@ pub(super) mod tests {
 		assert_eq!(case.normalized_param("f", 1), point);
 	}
 
+	/// Inherent impls of one type constructor are separate sources of
+	/// members for it, whatever their targets' arguments, so a name two of
+	/// them declare is one duplicate definition, however many tiers the
+	/// member is bound in.
+	#[test]
+	fn a_member_two_inherent_impls_declare_is_one_duplicate() {
+		for second in ["func get() {}", "const get: i32 = 0;"] {
+			test_case!(
+				case = &format!(
+					"type i32; type u8; pub trait Call {{ type Args; type Result; }} \
+					pub trait Function: Call {{}} struct Wrap<T>(); \
+					impl Wrap<i32> {{ func get() {{}} }} impl Wrap<u8> {{ {second} }}"
+				)
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		}
+	}
+
 	/// The inherent impl matched for a member's type supplies its leading
 	/// arguments, so its bounds on them are checked where it is written.
 	#[test]

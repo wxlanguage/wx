@@ -18,8 +18,8 @@ use super::{
 	bounds::report_not_a_trait_bound,
 	defs::{
 		AstEntry, AstNodeRef, BindingKey, DefKind, DefinitionRegistry,
-		DuplicateDefinitionDiagnostic, InherentImplIdx, Scope, Tier, TraitIdx,
-		TraitImplIdx, TypeAliasIdx,
+		DuplicateDefinitionDiagnostic, InherentImplIdx, MemberIdx, Scope, Tier,
+		TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
 	resolutions::NameResolutions,
@@ -605,17 +605,24 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			.unwrap_or(&[]);
 
 		// Sorted by source position so a diagnostic here can't depend on
-		// `HashMap` iteration order.
-		let mut new_members: Vec<(BindingKey, TextSpan)> = new_impl
+		// `HashMap` iteration order. A function is bound in both tiers but is
+		// one definition: its value key comes first, and it is reported once.
+		let mut new_members: Vec<(BindingKey, MemberIdx, TextSpan)> = new_impl
 			.bindings
 			.iter()
 			.map(|(&key, &member)| {
-				(key, new_impl.members[usize::from(member)].span)
+				(key, member, new_impl.members[usize::from(member)].span)
 			})
 			.collect();
-		new_members.sort_by_key(|&(_, span)| span.start);
+		new_members.sort_by_key(|&(key, _, span)| {
+			(span.start, key.tier == Tier::Type)
+		});
+		let mut reported: Vec<MemberIdx> = Vec::new();
 
-		for (key, span) in new_members {
+		for (key, member, span) in new_members {
+			if reported.contains(&member) {
+				continue;
+			}
 			let collision = earlier_in_bucket.iter().find_map(|&earlier| {
 				let earlier_impl = &defs.inherent_impls[usize::from(earlier)];
 				earlier_impl.bindings.get(&key).map(|&member| {
@@ -626,6 +633,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				})
 			});
 			if let Some((earlier_file, earlier_span)) = collision {
+				reported.push(member);
 				self.diagnostics.push(
 					DuplicateDefinitionDiagnostic {
 						strings: self.strings,
