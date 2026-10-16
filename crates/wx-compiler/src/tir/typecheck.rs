@@ -31,7 +31,7 @@ use super::operators::{
 use super::paths::PathResolver;
 use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
 use super::signatures::TypeContext;
-use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::types::{TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -367,10 +367,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.named_fields(struct_index, arguments, span)
 			}
 		};
-		let ty = self.cx.types.intern(Type::Struct {
-			struct_index,
-			type_args: Box::new([]),
-		});
+		let ty = self.cx.types.intern_struct(struct_index, &[]);
 		self.body.push(
 			ExprKind::Construct {
 				struct_index,

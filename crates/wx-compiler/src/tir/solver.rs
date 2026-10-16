@@ -541,7 +541,7 @@ impl<'a> SolverView<'a> {
 				let env = self.traits[usize::from(trait_index)].env;
 				Ok(self.types.substitute(
 					default,
-					&Substitution {
+					Substitution {
 						env,
 						args: &[target],
 					},
@@ -885,7 +885,7 @@ impl Solver {
 				.type_params;
 			debug_assert_ne!(env, TypeEnvIdx::ROOT);
 			view.types
-				.substitute(value, &Substitution { env, args: &args })
+				.substitute(value, Substitution { env, args: &args })
 		};
 		self.normalize(view, assumption_context, instantiated, depth, facts)
 	}
@@ -966,76 +966,68 @@ impl Solver {
 		depth: NormalizationDepth,
 		facts: RewriteFacts,
 	) -> Result<TypeIndex, SolverError> {
-		let rebuilt = match view.types.resolve(ty).clone() {
-			Type::Tuple { mut elements } => {
-				for element in elements.iter_mut() {
-					*element = self.normalize(
+		let rebuilt = match *view.types.resolve(ty) {
+			Type::Tuple { elements } => {
+				let mut elements = view.types.list(elements).to_vec();
+				for item in elements.iter_mut() {
+					*item = self.normalize(
 						view,
 						assumption_context,
-						*element,
+						*item,
 						depth,
 						facts,
 					)?;
 				}
-				Type::Tuple { elements }
+				return Ok(view.types.intern_tuple(&elements));
 			}
 			Type::Struct {
 				struct_index,
-				mut type_args,
+				type_args,
 			} => {
-				for arg in type_args.iter_mut() {
-					*arg = self.normalize(
+				let mut type_args = view.types.list(type_args).to_vec();
+				for item in type_args.iter_mut() {
+					*item = self.normalize(
 						view,
 						assumption_context,
-						*arg,
+						*item,
 						depth,
 						facts,
 					)?;
 				}
-				Type::Struct {
-					struct_index,
-					type_args,
-				}
+				return Ok(view.types.intern_struct(struct_index, &type_args));
 			}
-			Type::FunctionItem {
+			Type::Function {
 				func_index,
-				mut type_args,
+				type_args,
 			} => {
-				for arg in type_args.iter_mut() {
-					*arg = self.normalize(
+				let mut type_args = view.types.list(type_args).to_vec();
+				for item in type_args.iter_mut() {
+					*item = self.normalize(
 						view,
 						assumption_context,
-						*arg,
+						*item,
 						depth,
 						facts,
 					)?;
 				}
-				Type::FunctionItem {
-					func_index,
-					type_args,
-				}
+				return Ok(view.types.intern_function(func_index, &type_args));
 			}
-			Type::Function { mut params, result } => {
-				for param in params.iter_mut() {
-					*param = self.normalize(
-						view,
-						assumption_context,
-						*param,
-						depth,
-						facts,
-					)?;
-				}
-				Type::Function {
-					params,
-					result: self.normalize(
-						view,
-						assumption_context,
-						result,
-						depth,
-						facts,
-					)?,
-				}
-			}
+			Type::FunctionRef { param, result } => Type::FunctionRef {
+				param: self.normalize(
+					view,
+					assumption_context,
+					param,
+					depth,
+					facts,
+				)?,
+				result: self.normalize(
+					view,
+					assumption_context,
+					result,
+					depth,
+					facts,
+				)?,
+			},
 			Type::Pointer {
 				to,
 				memory,
@@ -1453,7 +1445,7 @@ impl Solver {
 		match fact.context {
 			Some(context) => view.types.substitute(
 				fact.value,
-				&Substitution {
+				Substitution {
 					env: context.env,
 					args: &[context.receiver],
 				},

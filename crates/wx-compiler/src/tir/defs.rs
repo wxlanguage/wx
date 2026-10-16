@@ -2033,10 +2033,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn push_def(
 		&mut self,
-		namespace: impl Into<Namespace>,
+		namespace: Namespace,
 		definition: ItemDef,
 	) -> DefKey {
-		let namespace = namespace.into();
 		let items = &mut self.namespaces.symbols_mut(namespace).items;
 		let def_idx = LocalDefIdx::new(u32::try_from(items.len()).unwrap());
 		items.push(definition);
@@ -2061,30 +2060,64 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 	fn insert_binding(
 		&mut self,
-		namespace: impl Into<Namespace>,
+		namespace: Namespace,
 		key: BindingKey,
 		binding: Binding,
 		span: TextSpan,
 	) {
-		let namespace = namespace.into();
 		if let Err(collision_key) =
 			self.namespaces.try_insert_binding(namespace, key, binding)
 		{
-			self.diagnostics.push(
-				DuplicateDefinitionDiagnostic {
-					strings: self.strings,
-					key,
-					definitions: (
-						self.definition_span(collision_key),
-						SourceSpan::new(
-							self.namespaces.file_id(namespace),
-							span,
-						),
-					),
-				}
-				.report(),
-			);
+			self.report_duplicate(namespace, key, collision_key, span);
 		}
+	}
+
+	/// Binds one declaration under its name in both tiers, as a struct,
+	/// function or memory is. It is one definition, so a clash in either
+	/// tier is reported once, the value's first.
+	fn insert_type_and_value(
+		&mut self,
+		namespace: Namespace,
+		symbol: SymbolU32,
+		ty: Binding,
+		value: Binding,
+		span: TextSpan,
+	) {
+		let value_key = BindingKey::value(symbol);
+		let type_key = BindingKey::ty(symbol);
+		let value = self
+			.namespaces
+			.try_insert_binding(namespace, value_key, value);
+		let ty = self.namespaces.try_insert_binding(namespace, type_key, ty);
+		match (value, ty) {
+			(Err(collision_key), _) => {
+				self.report_duplicate(namespace, value_key, collision_key, span)
+			}
+			(Ok(()), Err(collision_key)) => {
+				self.report_duplicate(namespace, type_key, collision_key, span)
+			}
+			(Ok(()), Ok(())) => {}
+		}
+	}
+
+	fn report_duplicate(
+		&mut self,
+		namespace: Namespace,
+		key: BindingKey,
+		collision_key: DefKey,
+		span: TextSpan,
+	) {
+		self.diagnostics.push(
+			DuplicateDefinitionDiagnostic {
+				strings: self.strings,
+				key,
+				definitions: (
+					self.definition_span(collision_key),
+					SourceSpan::new(self.namespaces.file_id(namespace), span),
+				),
+			}
+			.report(),
+		);
 	}
 
 	/// Pushes a module together with its scope, which binds the module's own
@@ -2250,16 +2283,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					u32::try_from(self.functions.len()).unwrap(),
 				);
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(
 						DefKind::Function(func_index),
 						signature.name.span,
 					),
 				);
-				self.insert_binding(
-					namespace,
-					BindingKey::value(signature.name.inner),
-					Binding::definition(def_key, Visibility::from(*pub_span)),
+				// A function is a value and, like a struct, its own type: each
+				// one is a zero-sized type of its own (`foo<i32>`).
+				let binding =
+					Binding::definition(def_key, Visibility::from(*pub_span));
+				self.insert_type_and_value(
+					Namespace::from(namespace),
+					signature.name.inner,
+					binding.clone(),
+					binding,
 					signature.name.span,
 				);
 
@@ -2304,13 +2342,18 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					mut_trait_impl_index,
 				});
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Global(global_index), name.span),
 				);
-				self.insert_binding(
-					namespace,
-					BindingKey::value(name.inner),
-					Binding::definition(def_key, Visibility::from(*pub_span)),
+				// The name is the global's zero-sized value and its own
+				// type, the one `Global` is implemented for.
+				let binding =
+					Binding::definition(def_key, Visibility::from(*pub_span));
+				self.insert_type_and_value(
+					Namespace::from(namespace),
+					name.inner,
+					binding.clone(),
+					binding,
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -2328,14 +2371,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let struct_index =
 					StructIdx::new(u32::try_from(self.structs.len()).unwrap());
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Struct(struct_index), name.span),
-				);
-				self.insert_binding(
-					namespace,
-					BindingKey::ty(name.inner),
-					Binding::definition(def_key, Visibility::from(*pub_span)),
-					name.span,
 				);
 				// The name is also the struct's constructor, called like a
 				// function. Constructing it takes every field, so it is only
@@ -2346,9 +2383,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						visibility.cap(Visibility::from(f.inner.inner.pub_span))
 					},
 				);
-				self.insert_binding(
-					namespace,
-					BindingKey::value(name.inner),
+				self.insert_type_and_value(
+					Namespace::from(namespace),
+					name.inner,
+					Binding::definition(def_key, Visibility::from(*pub_span)),
 					Binding::definition(def_key, constructor_visibility),
 					name.span,
 				);
@@ -2428,11 +2466,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 				self.namespaces.enums.push(SymbolTable::new(file_id));
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Enum(enum_index), name.span),
 				);
 				self.insert_binding(
-					namespace,
+					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
@@ -2485,14 +2523,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					u32::try_from(self.type_aliases.len()).unwrap(),
 				);
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(
 						DefKind::TypeAlias(type_alias_index),
 						name.span,
 					),
 				);
 				self.insert_binding(
-					namespace,
+					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
@@ -2536,19 +2574,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					size_assoc_type_index,
 				});
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Memory(memory_index), name.span),
 				);
-				self.insert_binding(
-					namespace,
-					BindingKey::ty(name.inner),
-					Binding::definition(def_key, Visibility::Private),
-					name.span,
-				);
-				self.insert_binding(
-					namespace,
-					BindingKey::value(name.inner),
-					Binding::definition(def_key, Visibility::Private),
+				let binding = Binding::definition(def_key, Visibility::Private);
+				self.insert_type_and_value(
+					Namespace::from(namespace),
+					name.inner,
+					binding.clone(),
+					binding,
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -2566,11 +2600,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name: *name,
 				});
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Const(const_index), name.span),
 				);
 				self.insert_binding(
-					namespace,
+					Namespace::from(namespace),
 					BindingKey::value(name.inner),
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
@@ -2636,11 +2670,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let trait_index =
 					TraitIdx(u32::try_from(self.traits.len()).unwrap());
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::Trait(trait_index), name.span),
 				);
 				self.insert_binding(
-					namespace,
+					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
@@ -2977,22 +3011,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name.span,
 								),
 							);
-							self.insert_binding(
-								own_namespace,
-								BindingKey::ty(name.inner),
-								Binding::definition(
-									def_key,
-									Visibility::Public,
-								),
-								name.span,
+							let binding = Binding::definition(
+								def_key,
+								Visibility::Public,
 							);
-							self.insert_binding(
+							self.insert_type_and_value(
 								own_namespace,
-								BindingKey::value(name.inner),
-								Binding::definition(
-									def_key,
-									Visibility::Public,
-								),
+								name.inner,
+								binding.clone(),
+								binding,
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -3026,13 +3053,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									signature.name.span,
 								),
 							);
-							self.insert_binding(
+							let binding = Binding::definition(
+								def_key,
+								Visibility::Public,
+							);
+							self.insert_type_and_value(
 								own_namespace,
-								BindingKey::value(signature.name.inner),
-								Binding::definition(
-									def_key,
-									Visibility::Public,
-								),
+								signature.name.inner,
+								binding.clone(),
+								binding,
 								signature.name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -3078,13 +3107,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name.span,
 								),
 							);
-							self.insert_binding(
+							let binding = Binding::definition(
+								def_key,
+								Visibility::Public,
+							);
+							self.insert_type_and_value(
 								own_namespace,
-								BindingKey::value(name.inner),
-								Binding::definition(
-									def_key,
-									Visibility::Public,
-								),
+								name.inner,
+								binding.clone(),
+								binding,
 								name.span,
 							);
 							self.ast_nodes.push(AstEntry {
@@ -3125,11 +3156,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					u32::try_from(self.typesets.len()).unwrap(),
 				);
 				let def_key = self.push_def(
-					namespace,
+					Namespace::from(namespace),
 					ItemDef::new(DefKind::TypeSet(typeset_index), name.span),
 				);
 				self.insert_binding(
-					namespace,
+					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
@@ -4106,7 +4137,7 @@ mod tests {
 
 	#[test]
 	fn type_and_value_definitions_can_share_a_name() {
-		let mut case = TestCase::new("trait Item {} func Item() {}");
+		let mut case = TestCase::new("trait Item {} const Item: i32 = 1;");
 		case.diagnostics().assert_none();
 		assert!(matches!(
 			case.resolve(Tier::Type, "Item").expect_success(),
@@ -4114,8 +4145,31 @@ mod tests {
 		));
 		assert!(matches!(
 			case.resolve(Tier::Value, "Item").expect_success(),
-			DefKind::Function(_)
+			DefKind::Const(_)
 		));
+	}
+
+	#[test]
+	fn a_function_name_is_also_its_type() {
+		// A function is its own zero-sized type, so its name is bound in
+		// both tiers, and a clash in either is one duplicate definition.
+		let mut case = TestCase::new("func f() {}");
+		case.diagnostics().assert_none();
+		for tier in [Tier::Type, Tier::Value] {
+			assert!(matches!(
+				case.resolve(tier, "f").expect_success(),
+				DefKind::Function(_)
+			));
+		}
+		for source in [
+			"trait Item {} func Item() {}",
+			"func Item() {} const Item: i32 = 1;",
+			"func f() {} func f() {}",
+		] {
+			TestCase::new(source)
+				.diagnostics()
+				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
+		}
 	}
 
 	#[test]

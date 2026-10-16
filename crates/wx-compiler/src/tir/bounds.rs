@@ -312,7 +312,7 @@ impl TypeContext<'_, '_, '_> {
 				.facts
 				.current()[index];
 			let inherited =
-				instantiate_bound(&mut self.types, source, &substitution);
+				instantiate_bound(&mut self.types, source, substitution);
 			union_trait_bound(&self.types, implied, conflicts, inherited, id);
 		}
 	}
@@ -422,7 +422,7 @@ struct AssocBindingConflict {
 fn instantiate_bound(
 	types: &mut TypeInterner,
 	bound: &ImpliedTraitBound,
-	substitution: &Substitution<'_>,
+	substitution: Substitution<'_>,
 ) -> ImpliedTraitBound {
 	ImpliedTraitBound {
 		trait_index: bound.trait_index,
@@ -452,7 +452,7 @@ fn instantiate_bound(
 fn instantiate_binding_kind(
 	types: &mut TypeInterner,
 	kind: &ImpliedBindingKind,
-	substitution: &Substitution<'_>,
+	substitution: Substitution<'_>,
 ) -> ImpliedBindingKind {
 	match kind {
 		ImpliedBindingKind::Equals(fact) => {

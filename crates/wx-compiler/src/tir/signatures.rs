@@ -981,10 +981,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&resolved_args,
 			TypeEnvOwner::Struct(struct_index),
 		);
-		self.types.intern(Type::Struct {
-			struct_index,
-			type_args: args,
-		})
+		self.types.intern_struct(struct_index, &args)
 	}
 
 	pub(super) fn match_inherent_impl_candidate_query(
@@ -2652,7 +2649,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							);
 							self.types.substitute(
 								target,
-								&Substitution {
+								Substitution {
 									env: type_params,
 									args: &type_args,
 								},
@@ -2709,11 +2706,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						&resolved_args,
 						TypeEnvOwner::Struct(struct_index),
 					);
-
-					self.types.intern(Type::Struct {
-						struct_index,
-						type_args,
-					})
+					self.types.intern_struct(struct_index, &type_args)
 				}
 				DefKind::Enum(enum_index) => {
 					if !stopped.type_args.is_empty() {
@@ -2762,12 +2755,78 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					));
 					TypeIndex::ERROR
 				}
+				// A free function is its own zero-sized type, applied
+				// like a struct (`foo<i32>`). The type-param frame is
+				// pushed before the parameters are lowered, so a
+				// function naming itself reads a valid `type_params`.
+				DefKind::Function(func_index) => {
+					let def_id = DefId::Function(func_index);
+					if matches!(
+						self.query_state[&def_id].state,
+						QueryState::Pending
+					) {
+						let _ = self.ensure_signature(QueryInfo {
+							def_id,
+							requested_at: Some(SourceSpan::new(
+								file_id,
+								stopped.ident.span,
+							)),
+						});
+					}
+					let params_env =
+						self.functions[usize::from(func_index)].type_params;
+					let resolved_args: Box<[TypeIndex]> = stopped
+						.type_args
+						.iter()
+						.map(|arg| {
+							self.resolve_type_expression(
+								file_id,
+								namespace,
+								env,
+								arg,
+								infer_policy,
+							)
+						})
+						.collect();
+					let type_args = self.resolve_type_args(
+						env,
+						file_id,
+						stopped,
+						params_env,
+						&resolved_args,
+						TypeEnvOwner::Function(func_index),
+					);
+					self.types.intern_function(func_index, &type_args)
+				}
+				// Every global is its own nominal type, the one its
+				// `Global` impl targets; it takes no arguments.
+				kind @ DefKind::Global(global_index) => {
+					if stopped.type_args.is_empty() {
+						self.types.intern(Type::Global { global_index })
+					} else {
+						// Resolved only to report what is wrong inside them.
+						for arg in &stopped.type_args {
+							self.resolve_type_expression(
+								file_id,
+								namespace,
+								env,
+								arg,
+								infer_policy,
+							);
+						}
+						self.diagnostics.push(report_type_arg_count_mismatch(
+							self.strings,
+							self.defs,
+							file_id,
+							stopped,
+							TypeArgsTarget::Namespace(kind),
+						));
+						TypeIndex::ERROR
+					}
+				}
 				// Value-tier only — a `Tier::Type` walk
 				// can never stop on one of these.
-				DefKind::EnumVariant(_)
-				| DefKind::Global(_)
-				| DefKind::Function(_)
-				| DefKind::Const(_) => unreachable!(
+				DefKind::EnumVariant(_) | DefKind::Const(_) => unreachable!(
 					"value-tier DefKind from a type-namespace path walk"
 				),
 				// Never constructed anywhere — associated types are
@@ -2882,16 +2941,29 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				)
 			}
 			ast::TypeExpression::Function { params, result } => {
-				let mut param_types = Vec::with_capacity(params.len());
-				for param in params.iter() {
-					param_types.push(self.resolve_type_expression(
+				// One parameter type: a single one is itself, any other count
+				// is its tuple (`()` for none).
+				let param = if let [param] = &params[..] {
+					self.resolve_type_expression(
 						file_id,
 						namespace,
 						env,
 						&param.inner.inner.ty,
 						infer_policy,
-					));
-				}
+					)
+				} else {
+					let mut elements = Vec::with_capacity(params.len());
+					for param in params.iter() {
+						elements.push(self.resolve_type_expression(
+							file_id,
+							namespace,
+							env,
+							&param.inner.inner.ty,
+							infer_policy,
+						));
+					}
+					self.types.intern_tuple(&elements)
+				};
 				let result_type = match result {
 					Some(result) => self.resolve_type_expression(
 						file_id,
@@ -2902,8 +2974,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					),
 					None => TypeIndex::UNIT,
 				};
-				self.types.intern(Type::Function {
-					params: param_types.into_boxed_slice(),
+				self.types.intern(Type::FunctionRef {
+					param,
 					result: result_type,
 				})
 			}
@@ -3005,9 +3077,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						infer_policy,
 					));
 				}
-				self.types.intern(Type::Tuple {
-					elements: elems.into_boxed_slice(),
-				})
+				self.types.intern_tuple(&elems)
 			}
 			_ => todo!("this type-expression form isn't implemented yet"),
 		}
@@ -3217,18 +3287,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.with_note("insert a pointer or slice field to break the cycle")
 	}
 
-	/// One element of a resolved `Type::Tuple`, re-resolving `ty` fresh
-	/// rather than holding onto a borrowed slice — lets
-	/// `check_struct_direct_recursion` iterate elements without cloning the
-	/// whole `Box<[TypeIndex]>` just to sidestep borrowing `self.types`
-	/// across its own recursive (`&mut self`) call.
-	fn tuple_element(&self, ty: TypeIndex, index: usize) -> TypeIndex {
-		let Type::Tuple { elements } = self.types.resolve(ty) else {
-			unreachable!("only called when ty is already known to be a Tuple")
-		};
-		elements[index]
-	}
-
 	/// Walks `ty` for directly-embedded (non-indirected) struct references —
 	/// `Type::Struct`/`Type::Tuple` embed inline and are followed;
 	/// `Type::Pointer`/`Slice`/`Array` always carry their own memory +
@@ -3255,9 +3313,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		field_span: TextSpan,
 		ty: TypeIndex,
 	) {
-		match self.types.resolve(ty) {
+		match *self.types.resolve(ty) {
 			Type::Struct { struct_index, .. } => {
-				let embedded_def_id = DefId::Struct(*struct_index);
+				let embedded_def_id = DefId::Struct(struct_index);
 				let reference = SourceSpan::new(file_id, field_span);
 				let status = self.ensure_signature(QueryInfo {
 					def_id: embedded_def_id,
@@ -3272,9 +3330,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			}
 			Type::Tuple { elements } => {
-				let len = elements.len();
-				for i in 0..len {
-					let element = self.tuple_element(ty, i);
+				for i in 0..elements.len() {
+					let element = self.types.list(elements)[i];
 					self.check_struct_direct_recursion(
 						file_id, field_span, element,
 					);
@@ -5072,7 +5129,7 @@ pub(super) mod tests {
 						assert_eq!(
 							types.substitute(
 								equality.value,
-								&Substitution {
+								Substitution {
 									env: context.env,
 									args: &[context.receiver],
 								}
@@ -6082,10 +6139,47 @@ pub(super) mod tests {
 		assert_eq!(named, case.type_alias("Unnamed").target);
 		assert!(matches!(
 			case.context.types.resolve(named),
-			Type::Function { params, result }
-				if params.as_ref() == [TypeIndex::I32, TypeIndex::BOOL]
-					&& *result == TypeIndex::I32
+			Type::FunctionRef { param, result }
+				if *result == TypeIndex::I32
+					&& matches!(
+						case.context.types.resolve(*param),
+						Type::Tuple { elements }
+							if case.context.types.list(*elements) == [TypeIndex::I32, TypeIndex::BOOL]
+					)
 		));
+	}
+
+	#[test]
+	fn a_function_type_takes_one_parameter_type() {
+		test_case!(
+			case = indoc! {"
+			type i32;
+			type bool;
+			type List = func(i32, bool) -> i32;
+			type Tupled = func((i32, bool)) -> i32;
+			type Single = func(i32);
+			type Grouped = func((i32));
+			type OneTuple = func((i32,));
+			type TrailingComma = func(i32,);
+			type Empty = func();
+		"}
+		);
+		case.diagnostics().assert_none();
+		let target = |name| case.type_alias(name).target;
+		assert_eq!(target("List"), target("Tupled"));
+		assert_eq!(target("Single"), target("Grouped"));
+		assert_eq!(target("Single"), target("TrailingComma"));
+		assert_ne!(target("Single"), target("OneTuple"));
+
+		let formatter = case.context.type_formatter();
+		for (name, written) in [
+			("List", "func(i32, bool) -> i32"),
+			("Single", "func(i32) -> ()"),
+			("OneTuple", "func((i32,)) -> ()"),
+			("Empty", "func() -> ()"),
+		] {
+			assert_eq!(formatter.display_type(target(name)), written);
+		}
 	}
 
 	#[test]
@@ -6098,14 +6192,13 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let alias = case.type_alias("Callback");
-		let Type::Function { params, result } =
+		let Type::FunctionRef { param, result } =
 			case.context.types.resolve(alias.target)
 		else {
 			panic!("expected outer function type");
 		};
-		assert_eq!(params.len(), 1);
 		assert_eq!(
-			case.context.types.resolve(params[0]),
+			case.context.types.resolve(*param),
 			&Type::TypeParam {
 				env: alias.type_params,
 				param_index: 0,
@@ -6113,8 +6206,8 @@ pub(super) mod tests {
 		);
 		assert!(matches!(
 			case.context.types.resolve(*result),
-			Type::Function { params, result }
-				if params.is_empty() && *result == TypeIndex::UNIT
+			Type::FunctionRef { param, result }
+				if *param == TypeIndex::UNIT && *result == TypeIndex::UNIT
 		));
 	}
 
@@ -6141,19 +6234,18 @@ pub(super) mod tests {
 			assert!(range.start >= last_start);
 			last_start = range.end;
 		}
-		let Type::Function { params, result } = case
+		let Type::FunctionRef { param, result } = case
 			.context
 			.types
 			.resolve(case.type_alias("Callback").target)
 		else {
 			panic!("expected function type");
 		};
-		assert_eq!(params.len(), 1);
 		assert_eq!(*result, TypeIndex::ERROR);
 		assert!(matches!(
-			case.context.types.resolve(params[0]),
+			case.context.types.resolve(*param),
 			Type::Tuple { elements }
-				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
+				if case.context.types.list(*elements) == [TypeIndex::ERROR, TypeIndex::ERROR]
 		));
 	}
 
@@ -6451,7 +6543,7 @@ pub(super) mod tests {
 		assert!(matches!(
 			case.context.types.resolve(return_type),
 			Type::Tuple { elements }
-				if elements.as_ref() == [TypeIndex::ERROR, TypeIndex::ERROR]
+				if case.context.types.list(*elements) == [TypeIndex::ERROR, TypeIndex::ERROR]
 		));
 	}
 
@@ -6897,7 +6989,10 @@ pub(super) mod tests {
 		let Type::Struct {
 			struct_index: arg_struct_index,
 			..
-		} = case.context.types.resolve(args[0])
+		} = case
+			.context
+			.types
+			.resolve(case.context.types.list(*args)[0])
 		else {
 			panic!("expected the argument to resolve to `S`");
 		};
@@ -6987,7 +7082,10 @@ pub(super) mod tests {
 		else {
 			panic!("expected a Struct type");
 		};
-		assert_eq!(args.as_ref(), [TypeIndex::ERROR, TypeIndex::ERROR]);
+		assert_eq!(
+			case.context.types.list(*args),
+			[TypeIndex::ERROR, TypeIndex::ERROR]
+		);
 	}
 
 	#[test]
@@ -7060,7 +7158,10 @@ pub(super) mod tests {
 		else {
 			panic!("expected the alias's tuple");
 		};
-		assert_eq!(elements.as_ref(), [TypeIndex::ERROR, TypeIndex::ERROR]);
+		assert_eq!(
+			case.context.types.list(*elements),
+			[TypeIndex::ERROR, TypeIndex::ERROR]
+		);
 	}
 
 	#[test]
@@ -7077,7 +7178,10 @@ pub(super) mod tests {
 		let Type::Tuple { elements } = case.context.types.resolve(param) else {
 			panic!("expected the alias's tuple");
 		};
-		assert_eq!(elements.as_ref(), [TypeIndex::U8, TypeIndex::U8]);
+		assert_eq!(
+			case.context.types.list(*elements),
+			[TypeIndex::U8, TypeIndex::U8]
+		);
 	}
 
 	#[test]
@@ -7207,7 +7311,7 @@ pub(super) mod tests {
 			panic!("expected a Struct type");
 		};
 		assert!(matches!(
-			case.context.types.resolve(args[0]),
+			case.context.types.resolve(case.context.types.list(*args)[0]),
 			Type::Struct { struct_index, .. } if *struct_index == case.struct_index("S")
 		));
 	}
@@ -7239,7 +7343,10 @@ pub(super) mod tests {
 		let Type::Struct {
 			struct_index: arg_struct_index,
 			..
-		} = case.context.types.resolve(args[0])
+		} = case
+			.context
+			.types
+			.resolve(case.context.types.list(*args)[0])
 		else {
 			panic!("expected the argument to resolve to `S`");
 		};
@@ -7505,7 +7612,7 @@ pub(super) mod tests {
 			panic!("expected Need<i32>");
 		};
 		assert_eq!(*struct_index, case.struct_index("Need"));
-		assert_eq!(type_args.as_ref(), [TypeIndex::I32]);
+		assert_eq!(case.context.types.list(*type_args), [TypeIndex::I32]);
 	}
 
 	#[test]
@@ -7536,7 +7643,7 @@ pub(super) mod tests {
 		else {
 			panic!("expected Need<i32>");
 		};
-		assert_eq!(type_args.as_ref(), [TypeIndex::I32]);
+		assert_eq!(case.context.types.list(*type_args), [TypeIndex::I32]);
 	}
 
 	#[test]
@@ -7872,7 +7979,7 @@ pub(super) mod tests {
 		let self_type = case.normalized_param("self_type", 0);
 		assert!(matches!(
 			case.context.types.resolve(self_type),
-			Type::Struct { type_args, .. } if type_args.as_ref() == [TypeIndex::I32]
+			Type::Struct { type_args, .. } if case.context.types.list(*type_args) == [TypeIndex::I32]
 		));
 		// Under its own bounds `T::Item` has no concrete value: it stays abstract.
 		let abstract_item = case.normalized_param("abstract_item", 0);
@@ -8172,10 +8279,8 @@ pub(super) mod tests {
 		"},
 			|builder| {
 				builder.sweep();
-				let receiver = builder.types.intern(Type::Struct {
-					struct_index: StructIdx::new(0),
-					type_args: Box::new([]),
-				});
+				let receiver =
+					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let trait_index = TraitIdx::new(0);
 				let impl_index = TraitImplIdx::new(0);
 				let reference = SourceSpan::new(
@@ -9653,7 +9758,7 @@ pub(super) mod tests {
 		else {
 			panic!("expected Need<i32>");
 		};
-		assert_eq!(type_args.as_ref(), [TypeIndex::I32]);
+		assert_eq!(case.context.types.list(*type_args), [TypeIndex::I32]);
 		assert_eq!(return_type, TypeIndex::UNIT);
 	}
 
@@ -9690,7 +9795,7 @@ pub(super) mod tests {
 		else {
 			panic!("expected Need<i32>");
 		};
-		assert_eq!(type_args.as_ref(), [TypeIndex::I32]);
+		assert_eq!(case.context.types.list(*type_args), [TypeIndex::I32]);
 	}
 
 	#[test]
@@ -9729,7 +9834,7 @@ pub(super) mod tests {
 				panic!("expected Need<i32>");
 			};
 			// Each written site reports its own violation; the type is kept.
-			assert_eq!(type_args.as_ref(), [TypeIndex::I32]);
+			assert_eq!(case.context.types.list(*type_args), [TypeIndex::I32]);
 		}
 	}
 
@@ -10975,10 +11080,8 @@ pub(super) mod tests {
 			impl Container for Wrapper { type Item = i32; }
 		"},
 			|builder| {
-				let receiver = builder.types.intern(Type::Struct {
-					struct_index: StructIdx::new(0),
-					type_args: Box::new([]),
-				});
+				let receiver =
+					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, provider, reference) =
 					selected_provider(builder, receiver, "Item");
 				let projection =
@@ -10987,9 +11090,8 @@ pub(super) mod tests {
 						trait_index: TraitIdx::new(0),
 						assoc_type_index: declaration,
 					});
-				let tuple = builder.types.intern(Type::Tuple {
-					elements: Box::new([projection, TypeIndex::I32]),
-				});
+				let tuple =
+					builder.types.intern_tuple(&[projection, TypeIndex::I32]);
 				// A completed stored value can still contain an abstract projection
 				// that becomes reducible later. Here it models that result directly.
 				builder.assoc_types[usize::from(provider)] =
@@ -11111,10 +11213,8 @@ pub(super) mod tests {
 		"},
 			|builder| {
 				use crate::ast::Ownership;
-				let receiver = builder.types.intern(Type::Struct {
-					struct_index: StructIdx::new(0),
-					type_args: Box::new([]),
-				});
+				let receiver =
+					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, _, reference) =
 					selected_provider(builder, receiver, "Item");
 				let projection =
@@ -11125,88 +11225,82 @@ pub(super) mod tests {
 					});
 				let cases = [
 					(
-						Type::Tuple {
-							elements: Box::new([projection, TypeIndex::I32]),
-						},
-						Type::Tuple {
-							elements: Box::new([
-								TypeIndex::I32,
-								TypeIndex::I32,
-							]),
-						},
+						builder
+							.types
+							.intern_tuple(&[projection, TypeIndex::I32]),
+						builder
+							.types
+							.intern_tuple(&[TypeIndex::I32, TypeIndex::I32]),
 					),
 					(
-						Type::Struct {
-							struct_index: StructIdx::new(0),
-							type_args: Box::new([projection]),
-						},
-						Type::Struct {
-							struct_index: StructIdx::new(0),
-							type_args: Box::new([TypeIndex::I32]),
-						},
+						builder
+							.types
+							.intern_struct(StructIdx::new(0), &[projection]),
+						builder.types.intern_struct(
+							StructIdx::new(0),
+							&[TypeIndex::I32],
+						),
 					),
 					(
-						Type::FunctionItem {
-							func_index: FunctionIdx::new(0),
-							type_args: Box::new([projection]),
-						},
-						Type::FunctionItem {
-							func_index: FunctionIdx::new(0),
-							type_args: Box::new([TypeIndex::I32]),
-						},
+						builder.types.intern_function(
+							FunctionIdx::new(0),
+							&[projection],
+						),
+						builder.types.intern_function(
+							FunctionIdx::new(0),
+							&[TypeIndex::I32],
+						),
 					),
 					(
-						Type::Function {
-							params: Box::new([projection, TypeIndex::I32]),
+						builder.types.intern(Type::FunctionRef {
+							param: projection,
 							result: projection,
-						},
-						Type::Function {
-							params: Box::new([TypeIndex::I32, TypeIndex::I32]),
+						}),
+						builder.types.intern(Type::FunctionRef {
+							param: TypeIndex::I32,
 							result: TypeIndex::I32,
-						},
+						}),
 					),
 					(
-						Type::Pointer {
+						builder.types.intern(Type::Pointer {
 							to: projection,
 							memory: projection,
 							ownership: Ownership::Shared,
-						},
-						Type::Pointer {
+						}),
+						builder.types.intern(Type::Pointer {
 							to: TypeIndex::I32,
 							memory: TypeIndex::I32,
 							ownership: Ownership::Shared,
-						},
+						}),
 					),
 					(
-						Type::Array {
+						builder.types.intern(Type::Array {
 							of: projection,
 							size: 7,
 							memory: projection,
 							ownership: Ownership::Exclusive,
-						},
-						Type::Array {
+						}),
+						builder.types.intern(Type::Array {
 							of: TypeIndex::I32,
 							size: 7,
 							memory: TypeIndex::I32,
 							ownership: Ownership::Exclusive,
-						},
+						}),
 					),
 					(
-						Type::Slice {
+						builder.types.intern(Type::Slice {
 							of: projection,
 							memory: projection,
 							ownership: Ownership::Shared,
-						},
-						Type::Slice {
+						}),
+						builder.types.intern(Type::Slice {
 							of: TypeIndex::I32,
 							memory: TypeIndex::I32,
 							ownership: Ownership::Shared,
-						},
+						}),
 					),
 				];
 				for (before, after) in cases {
-					let before = builder.types.intern(before);
-					let after = builder.types.intern(after);
 					assert_eq!(
 						builder.normalize_head(
 							TypeEnvIdx::ROOT,
@@ -11246,10 +11340,8 @@ pub(super) mod tests {
 		with_pending_signatures(
 			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; }",
 			|builder| {
-				let receiver = builder.types.intern(Type::Struct {
-					struct_index: StructIdx::new(0),
-					type_args: Box::new([]),
-				});
+				let receiver =
+					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, _, reference) =
 					selected_provider(builder, receiver, "Item");
 				let projection =
@@ -11258,12 +11350,11 @@ pub(super) mod tests {
 						trait_index: TraitIdx::new(0),
 						assoc_type_index: declaration,
 					});
-				let pair = builder.types.intern(Type::Tuple {
-					elements: Box::new([projection, projection]),
-				});
-				let expected = builder.types.intern(Type::Tuple {
-					elements: Box::new([TypeIndex::I32, TypeIndex::I32]),
-				});
+				let pair =
+					builder.types.intern_tuple(&[projection, projection]);
+				let expected = builder
+					.types
+					.intern_tuple(&[TypeIndex::I32, TypeIndex::I32]);
 				assert_eq!(
 					builder.normalize_type(TypeEnvIdx::ROOT, pair, reference),
 					expected
@@ -11287,9 +11378,7 @@ pub(super) mod tests {
 			builder.solver.set_limit_for_test(4);
 			let mut nested = TypeIndex::I32;
 			for _ in 0..5 {
-				nested = builder.types.intern(Type::Tuple {
-					elements: Box::new([nested]),
-				});
+				nested = builder.types.intern_tuple(&[nested]);
 			}
 			assert_eq!(
 				builder.normalize_type(TypeEnvIdx::ROOT, nested, reference),
@@ -12622,11 +12711,13 @@ pub(super) mod tests {
 			else {
 				panic!("expected Wrap");
 			};
-			let Type::Tuple { elements } = types.resolve(type_args[0]) else {
+			let Type::Tuple { elements } =
+				types.resolve(types.list(*type_args)[0])
+			else {
 				panic!("expected tuple");
 			};
 			let Type::AssocTypeProjection { base, .. } =
-				types.resolve(elements[0])
+				types.resolve(types.list(*elements)[0])
 			else {
 				panic!("source must retain U::Item");
 			};
@@ -12641,10 +12732,12 @@ pub(super) mod tests {
 			else {
 				panic!("expected normalized Wrap");
 			};
-			let Type::Tuple { elements } = types.resolve(type_args[0]) else {
+			let Type::Tuple { elements } =
+				types.resolve(types.list(*type_args)[0])
+			else {
 				panic!("expected normalized tuple");
 			};
-			assert_eq!(elements.as_ref(), &[TypeIndex::I32]);
+			assert_eq!(case.context.types.list(*elements), &[TypeIndex::I32]);
 		}
 	}
 
@@ -12692,7 +12785,7 @@ pub(super) mod tests {
 		};
 		assert_eq!(*struct_index, case.struct_index("Later"));
 		assert!(
-			matches!(case.context.types.resolve(type_args[0]), Type::TypeParam { env, param_index: 1 } if *env == scope)
+			matches!(case.context.types.resolve(case.context.types.list(*type_args)[0]), Type::TypeParam { env, param_index: 1 } if *env == scope)
 		);
 	}
 
@@ -12919,7 +13012,7 @@ pub(super) mod tests {
 			else {
 				panic!()
 			};
-			assert_eq!(type_args.as_ref(), &[TypeIndex::I32]);
+			assert_eq!(case.context.types.list(*type_args), &[TypeIndex::I32]);
 			// ...while the stored source fact keeps `U::Item` symbolic.
 			let ImpliedBindingKind::Equals(value) = case.context.param_bounds
 				[usize::from(assumption_context)][0]
@@ -12938,7 +13031,9 @@ pub(super) mod tests {
 				panic!()
 			};
 			assert!(matches!(
-				case.context.types.resolve(type_args[0]),
+				case.context
+					.types
+					.resolve(case.context.types.list(*type_args)[0]),
 				Type::AssocTypeProjection { .. }
 			));
 			let BindingRequirement::Equals(value) =
@@ -13091,7 +13186,7 @@ pub(super) mod tests {
 					assert_eq!(substitution.receiver, receiver);
 					let rhs = types.substitute(
 						value.value,
-						&Substitution {
+						Substitution {
 							env: substitution.env,
 							args: &[substitution.receiver],
 						},
@@ -13721,7 +13816,7 @@ pub(super) mod tests {
 				panic!()
 			};
 			assert_eq!(
-				type_args.as_ref(),
+				case.context.types.list(*type_args),
 				&[case.context.type_envs.params(scope)[1].ty]
 			);
 		}
@@ -14053,7 +14148,10 @@ pub(super) mod tests {
 				else {
 					panic!("Need application expected");
 				};
-				assert_eq!(type_args.as_ref(), &[TypeIndex::I32]);
+				assert_eq!(
+					case.context.types.list(*type_args),
+					&[TypeIndex::I32]
+				);
 			}
 		}
 
@@ -14080,7 +14178,7 @@ pub(super) mod tests {
 			else {
 				panic!("Need identity must survive the failed check");
 			};
-			assert_eq!(type_args.as_ref(), &[TypeIndex::I32]);
+			assert_eq!(case.context.types.list(*type_args), &[TypeIndex::I32]);
 			// The stored fact `Item = Need<U::Item>` is exactly as written; the
 			// failed check does not rewrite it.
 			let signature = case.function_signature("bad");
@@ -14100,7 +14198,9 @@ pub(super) mod tests {
 				panic!()
 			};
 			assert!(matches!(
-				case.context.types.resolve(type_args[0]),
+				case.context
+					.types
+					.resolve(case.context.types.list(*type_args)[0]),
 				Type::AssocTypeProjection { .. }
 			));
 		}
@@ -14130,20 +14230,15 @@ pub(super) mod tests {
 			let actual = written.map(|ty| case.normalized(scope, ty));
 			let struct_index = case.struct_index("Need");
 			let types = &mut case.context.types;
-			let need = types.intern(Type::Struct {
-				struct_index,
-				type_args: Box::new([TypeIndex::I32]),
-			});
+			let need = types.intern_struct(struct_index, &[TypeIndex::I32]);
 			let expected = [
-				types.intern(Type::Tuple {
-					elements: Box::new([need, TypeIndex::I32]),
-				}),
-				types.intern(Type::Function {
-					params: Box::new([TypeIndex::I32]),
+				types.intern_tuple(&[need, TypeIndex::I32]),
+				types.intern(Type::FunctionRef {
+					param: TypeIndex::I32,
 					result: need,
 				}),
-				types.intern(Type::Function {
-					params: Box::new([need]),
+				types.intern(Type::FunctionRef {
+					param: need,
 					result: TypeIndex::I32,
 				}),
 			];
@@ -14545,23 +14640,51 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn an_export_can_name_a_value_that_shares_its_name_with_a_type() {
+	fn functions_and_globals_are_their_own_types() {
 		test_case!(
-			case = r#"
-            trait Same {}
-            func Same() {}
-            export { Same }
-        "#,
+			case = indoc! {"
+			type i32;
+			trait Global { type Value; }
+			global counter: i32 = 0;
+			func id<T>(x: T) -> T {}
+			func takes(g: counter, f: id<i32>, me: takes) {}
+			func bare(f: id) {}
+			func applied(g: counter<i32>) {}
+		"}
 		);
-		case.diagnostics().assert_none();
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+		]);
+		let DefKind::Global(counter) = case.resolve(Tier::Value, "counter")
+		else {
+			panic!("expected `counter` to be a global");
+		};
+		let function = |path| {
+			let DefKind::Function(index) = case.resolve(Tier::Value, path)
+			else {
+				panic!("expected `{path}` to be a function");
+			};
+			index
+		};
+		let (id, takes) = (function("id"), function("takes"));
+		let params = &case.function_signature("takes").param_types;
+		assert_eq!(
+			case.context.types.resolve(params[0]),
+			&Type::Global {
+				global_index: counter
+			}
+		);
+		let types = &case.context.types;
 		assert!(matches!(
-			case.resolve(Tier::Type, "Same"),
-			DefKind::Trait(_)
+			*types.resolve(params[1]),
+			Type::Function { func_index, type_args }
+				if func_index == id && types.list(type_args) == [TypeIndex::I32]
 		));
 		assert!(matches!(
-			case.resolve(Tier::Value, "Same"),
-			DefKind::Function(_)
+			*types.resolve(params[2]),
+			Type::Function { func_index, type_args }
+				if func_index == takes && type_args.is_empty()
 		));
-		assert_eq!(case.defs.exports.len(), 1);
 	}
 }

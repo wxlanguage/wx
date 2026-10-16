@@ -23,7 +23,9 @@
 //! indices, so it indexes straight into the right registry array
 //! (`defs.structs`, `defs.functions`, ...) without a lookup.
 
-use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
+
+use hashbrown::HashTable;
 
 use crate::ast::Spanned;
 use crate::index::index_newtype;
@@ -40,9 +42,37 @@ use super::defs::{
 
 index_newtype!(TypeIndex);
 
+/// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
+/// interned on its own; the type holding it is, by the list's contents, so
+/// equal types still share one `TypeIndex`. Built only by the interner.
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeList {
+	start: u32,
+	len: u32,
+}
+
+impl TypeList {
+	const EMPTY: TypeList = TypeList { start: 0, len: 0 };
+
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	/// This list's elements, out of the interner's `lists`.
+	fn slice(self, lists: &[TypeIndex]) -> &[TypeIndex] {
+		&lists[self.start as usize..][..self.len as usize]
+	}
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 // `TypeParam`/`AssociatedType`/`AssocTypeProjection` echo the enum's own
 // name because "type" is the domain term (a type parameter, an associated
 // type), not accidental repetition — renaming to `Param`/`Associated` would
@@ -73,27 +103,28 @@ pub enum Type {
 	Char,
 	/// `()` is the empty tuple, pre-interned as `TypeIndex::UNIT`.
 	Tuple {
-		elements: Box<[TypeIndex]>,
+		elements: TypeList,
 	},
 	Struct {
 		struct_index: StructIdx,
-		/// Encodes three states via length: non-generic struct (always
-		/// empty), generic and not yet instantiated (empty), generic and
-		/// instantiated (one entry per type param, e.g. `Vec<i32, u8>` →
-		/// `[i32_idx, u8_idx]`).
-		type_args: Box<[TypeIndex]>,
+		/// One argument per type parameter of the struct.
+		type_args: TypeList,
 	},
-	Function {
-		params: Box<[TypeIndex]>,
+	/// A reference to a function, written `func(A) -> R`. It takes exactly
+	/// one parameter type; a written parameter list is sugar for it:
+	/// `func()` takes `()`, `func(A)` takes `A`, `func(A, B)` takes
+	/// `(A, B)`, so `func((A, B))` is the same type.
+	FunctionRef {
+		param: TypeIndex,
 		/// `TypeIndex::UNIT` when the written function type omits its result.
-		/// A tuple result is one `TypeIndex`.
 		result: TypeIndex,
 	},
-	/// Named function reference before coercion to a fn pointer. Encodes
-	/// three states via length, same convention as `Struct::args`.
-	FunctionItem {
+	/// A function's own zero-sized type, written with its name (`foo<i32>`).
+	/// Always applied: one argument per type parameter of the function, so a
+	/// generic function has no type until it is instantiated.
+	Function {
 		func_index: FunctionIdx,
-		type_args: Box<[TypeIndex]>,
+		type_args: TypeList,
 	},
 	Pointer {
 		to: TypeIndex,
@@ -158,19 +189,51 @@ pub enum Type {
 #[cfg_attr(test, serde(transparent))]
 pub struct TypeInterner {
 	entries: Vec<Type>,
+	/// Every `TypeList`'s elements, back to back.
 	#[cfg_attr(test, serde(skip))]
-	index_lookup: HashMap<Type, TypeIndex>,
+	lists: Vec<TypeIndex>,
+	/// The index of every entry, found by its contents: a type's fields
+	/// and its list's elements, never where the list is stored.
+	#[cfg_attr(test, serde(skip))]
+	index_lookup: HashTable<TypeIndex>,
+	#[cfg_attr(test, serde(skip))]
+	hasher: RandomState,
 }
 
-/// Override a node's rewrite, then delegate ordinary cases to `fold_children`.
-/// Returning a replacement directly leaves its contents untouched.
-pub(super) trait TypeFolder: Sized {
-	fn fold_type(
-		&mut self,
-		types: &mut TypeInterner,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		types.fold_children(ty, self)
+impl Type {
+	/// This type with its list blanked, and the list: hashing and comparing
+	/// the first ignores where the list lives, so the list is compared by
+	/// its elements.
+	fn split_list(self) -> (Type, TypeList) {
+		match self {
+			Type::Tuple { elements } => (
+				Type::Tuple {
+					elements: TypeList::EMPTY,
+				},
+				elements,
+			),
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => (
+				Type::Struct {
+					struct_index,
+					type_args: TypeList::EMPTY,
+				},
+				type_args,
+			),
+			Type::Function {
+				func_index,
+				type_args,
+			} => (
+				Type::Function {
+					func_index,
+					type_args: TypeList::EMPTY,
+				},
+				type_args,
+			),
+			ty => (ty, TypeList::EMPTY),
+		}
 	}
 }
 
@@ -230,31 +293,35 @@ impl TypeInterner {
 					struct_index: b,
 					type_args: ys,
 				},
-			) if a == b => self.match_patterns(xs, ys, env, args),
+			) if a == b => {
+				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
+			}
 			(Type::Tuple { elements: xs }, Type::Tuple { elements: ys }) => {
-				self.match_patterns(xs, ys, env, args)
+				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
 			}
 			(
-				Type::FunctionItem {
+				Type::Function {
 					func_index: a,
 					type_args: xs,
 				},
-				Type::FunctionItem {
+				Type::Function {
 					func_index: b,
 					type_args: ys,
 				},
-			) if a == b => self.match_patterns(xs, ys, env, args),
+			) if a == b => {
+				self.match_patterns(self.list(*xs), self.list(*ys), env, args)
+			}
 			(
-				Type::Function {
-					params: xs,
+				Type::FunctionRef {
+					param: xp,
 					result: xr,
 				},
-				Type::Function {
-					params: ys,
+				Type::FunctionRef {
+					param: yp,
 					result: yr,
 				},
 			) => {
-				self.match_patterns(xs, ys, env, args)?;
+				self.match_pattern(*xp, *yp, env, args)?;
 				self.match_pattern(*xr, *yr, env, args)
 			}
 			(
@@ -331,20 +398,29 @@ impl TypeInterner {
 		if expected.len() != found.len() {
 			return None;
 		}
-		for (&pattern, &actual) in expected.iter().zip(found) {
+		for (pattern, actual) in
+			expected.iter().copied().zip(found.iter().copied())
+		{
 			self.match_pattern(pattern, actual, env, args)?;
 		}
 		Some(())
 	}
+
 	pub fn new() -> Self {
-		let entries = vec![
-			// Order must match the `TypeIndex` constants below.
+		let mut types = Self {
+			entries: Vec::new(),
+			lists: Vec::new(),
+			index_lookup: HashTable::new(),
+			hasher: RandomState::new(),
+		};
+		// Order must match the `TypeIndex` constants below.
+		for ty in [
 			Type::Infer,
 			Type::Error,
 			// `()` is the empty tuple, not a type of its own, so interning
-			// `Tuple { [] }` anywhere finds this slot.
+			// an empty tuple anywhere finds this slot.
 			Type::Tuple {
-				elements: Box::new([]),
+				elements: TypeList::EMPTY,
 			},
 			Type::Never,
 			Type::Integer,
@@ -361,34 +437,127 @@ impl TypeInterner {
 			Type::F64,
 			Type::Bool,
 			Type::Char,
-		];
-		let index_lookup = entries
-			.iter()
-			.cloned()
-			.enumerate()
-			.map(|(index, ty)| {
-				let index = u32::try_from(index)
-					.expect("type interner exceeded u32 index capacity");
-				(ty, TypeIndex::new(index))
-			})
-			.collect();
-		Self {
-			entries,
-			index_lookup,
+		] {
+			types.intern(ty);
+		}
+		types
+	}
+
+	/// Interns a type whose list, if it has one, is already stored.
+	pub fn intern(&mut self, ty: Type) -> TypeIndex {
+		let (shape, list) = ty.split_list();
+		let hash = self.hasher.hash_one((shape, list.slice(&self.lists)));
+		match self.find(hash, shape, list.slice(&self.lists)) {
+			Some(index) => index,
+			None => self.insert(hash, ty),
 		}
 	}
 
-	pub fn intern(&mut self, ty: Type) -> TypeIndex {
-		if let Some(&index) = self.index_lookup.get(&ty) {
+	pub fn intern_tuple(&mut self, elements: &[TypeIndex]) -> TypeIndex {
+		let shape = Type::Tuple {
+			elements: TypeList::EMPTY,
+		};
+		let hash = self.hasher.hash_one((shape, elements));
+		if let Some(index) = self.find(hash, shape, elements) {
 			return index;
 		}
+		// Stored only now, when no equal type exists yet.
+		let list = self.push_list(elements);
+		self.insert(hash, Type::Tuple { elements: list })
+	}
 
-		let index = u32::try_from(self.entries.len())
-			.expect("type interner exceeded u32 index capacity");
-		let index = TypeIndex::new(index);
-		self.entries.push(ty.clone());
-		self.index_lookup.insert(ty, index);
+	pub fn intern_struct(
+		&mut self,
+		struct_index: StructIdx,
+		type_args: &[TypeIndex],
+	) -> TypeIndex {
+		let shape = Type::Struct {
+			struct_index,
+			type_args: TypeList::EMPTY,
+		};
+		let hash = self.hasher.hash_one((shape, type_args));
+		if let Some(index) = self.find(hash, shape, type_args) {
+			return index;
+		}
+		let list = self.push_list(type_args);
+		self.insert(
+			hash,
+			Type::Struct {
+				struct_index,
+				type_args: list,
+			},
+		)
+	}
+
+	pub fn intern_function(
+		&mut self,
+		func_index: FunctionIdx,
+		type_args: &[TypeIndex],
+	) -> TypeIndex {
+		let shape = Type::Function {
+			func_index,
+			type_args: TypeList::EMPTY,
+		};
+		let hash = self.hasher.hash_one((shape, type_args));
+		if let Some(index) = self.find(hash, shape, type_args) {
+			return index;
+		}
+		let list = self.push_list(type_args);
+		self.insert(
+			hash,
+			Type::Function {
+				func_index,
+				type_args: list,
+			},
+		)
+	}
+
+	fn push_list(&mut self, elements: &[TypeIndex]) -> TypeList {
+		let list = TypeList {
+			start: u32::try_from(self.lists.len())
+				.expect("type interner exceeded u32 list capacity"),
+			len: u32::try_from(elements.len()).unwrap(),
+		};
+		self.lists.extend_from_slice(elements);
+		list
+	}
+
+	fn find(
+		&self,
+		hash: u64,
+		shape: Type,
+		elements: &[TypeIndex],
+	) -> Option<TypeIndex> {
+		self.index_lookup
+			.find(hash, |&index| {
+				let (candidate, list) = self.resolve(index).split_list();
+				candidate == shape && list.slice(&self.lists) == elements
+			})
+			.copied()
+	}
+
+	fn insert(&mut self, hash: u64, ty: Type) -> TypeIndex {
+		let index = TypeIndex::new(
+			u32::try_from(self.entries.len())
+				.expect("type interner exceeded u32 index capacity"),
+		);
+		self.entries.push(ty);
+		let Self {
+			entries,
+			lists,
+			index_lookup,
+			hasher,
+		} = self;
+		// Growing the table rehashes what it holds, from the same contents.
+		index_lookup.insert_unique(hash, index, |&index| {
+			let (shape, list) = entries[usize::from(index)].split_list();
+			hasher.hash_one((shape, list.slice(lists)))
+		});
 		index
+	}
+
+	pub fn list(&self, list: TypeList) -> &[TypeIndex] {
+		list.slice(&self.lists)
 	}
 
 	#[inline]
@@ -409,100 +578,53 @@ impl TypeInterner {
 	pub(super) fn substitute(
 		&mut self,
 		ty: TypeIndex,
-		substitution: &Substitution<'_>,
+		substitution: Substitution<'_>,
 	) -> TypeIndex {
-		Substitution {
-			env: substitution.env,
-			args: substitution.args,
-		}
-		.fold_type(self, ty)
-	}
-
-	/// Every child passes through the folder. Unchanged nodes retain their
-	/// identity without allocation or an interner lookup.
-	pub(super) fn fold_children<F: TypeFolder>(
-		&mut self,
-		ty: TypeIndex,
-		folder: &mut F,
-	) -> TypeIndex {
-		match self.resolve(ty) {
-			Type::Tuple { .. } => {
-				let elements = self.fold_list(ty, folder, |ty| {
-					let Type::Tuple { elements } = ty else {
-						unreachable!()
-					};
-					elements
-				});
-				match elements {
-					Some(elements) => self.intern(Type::Tuple { elements }),
+		match *self.resolve(ty) {
+			Type::TypeParam { env, param_index } if env == substitution.env => {
+				*substitution.args.get(param_index as usize).expect(
+					"substitution is missing an argument for its parameter frame",
+				)
+			}
+			Type::Tuple { elements } => {
+				match self.substitute_list(elements, substitution) {
+					Some(elements) => self.intern_tuple(&elements),
 					None => ty,
 				}
 			}
-			Type::Struct { struct_index, .. } => {
-				let struct_index = *struct_index;
-				let type_args = self.fold_list(ty, folder, |ty| {
-					let Type::Struct { type_args, .. } = ty else {
-						unreachable!()
-					};
-					type_args
-				});
-				match type_args {
-					Some(type_args) => self.intern(Type::Struct {
-						struct_index,
-						type_args,
-					}),
-					None => ty,
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => match self.substitute_list(type_args, substitution) {
+				Some(type_args) => self.intern_struct(struct_index, &type_args),
+				None => ty,
+			},
+			Type::Function {
+				func_index,
+				type_args,
+			} => match self.substitute_list(type_args, substitution) {
+				Some(type_args) => self.intern_function(func_index, &type_args),
+				None => ty,
+			},
+			Type::FunctionRef { param, result } => {
+				let next_param = self.substitute(param, substitution);
+				let next_result = self.substitute(result, substitution);
+				if next_param == param && next_result == result {
+					ty
+				} else {
+					self.intern(Type::FunctionRef {
+						param: next_param,
+						result: next_result,
+					})
 				}
-			}
-			Type::FunctionItem { func_index, .. } => {
-				let func_index = *func_index;
-				let type_args = self.fold_list(ty, folder, |ty| {
-					let Type::FunctionItem { type_args, .. } = ty else {
-						unreachable!()
-					};
-					type_args
-				});
-				match type_args {
-					Some(type_args) => self.intern(Type::FunctionItem {
-						func_index,
-						type_args,
-					}),
-					None => ty,
-				}
-			}
-			Type::Function { result, .. } => {
-				let result = *result;
-				let params = self.fold_list(ty, folder, |ty| {
-					let Type::Function { params, .. } = ty else {
-						unreachable!()
-					};
-					params
-				});
-				let next_result = folder.fold_type(self, result);
-				if params.is_none() && next_result == result {
-					return ty;
-				}
-				// A changed result still needs an owned parameter list, even
-				// when none of those parameters changed.
-				let params = params.unwrap_or_else(|| {
-					let Type::Function { params, .. } = self.resolve(ty) else {
-						unreachable!()
-					};
-					params.clone()
-				});
-				self.intern(Type::Function {
-					params,
-					result: next_result,
-				})
 			}
 			Type::Pointer {
 				to,
 				memory,
 				ownership,
 			} => {
-				let (to, memory, ownership) = (*to, *memory, *ownership);
-				let next_to = folder.fold_type(self, to);
-				let next_memory = folder.fold_type(self, memory);
+				let next_to = self.substitute(to, substitution);
+				let next_memory = self.substitute(memory, substitution);
 				if next_to == to && next_memory == memory {
 					ty
 				} else {
@@ -519,10 +641,8 @@ impl TypeInterner {
 				memory,
 				ownership,
 			} => {
-				let (of, size, memory, ownership) =
-					(*of, *size, *memory, *ownership);
-				let next_of = folder.fold_type(self, of);
-				let next_memory = folder.fold_type(self, memory);
+				let next_of = self.substitute(of, substitution);
+				let next_memory = self.substitute(memory, substitution);
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
@@ -539,9 +659,8 @@ impl TypeInterner {
 				memory,
 				ownership,
 			} => {
-				let (of, memory, ownership) = (*of, *memory, *ownership);
-				let next_of = folder.fold_type(self, of);
-				let next_memory = folder.fold_type(self, memory);
+				let next_of = self.substitute(of, substitution);
+				let next_memory = self.substitute(memory, substitution);
 				if next_of == of && next_memory == memory {
 					ty
 				} else {
@@ -557,9 +676,7 @@ impl TypeInterner {
 				trait_index,
 				assoc_type_index,
 			} => {
-				let (base, trait_index, assoc_type_index) =
-					(*base, *trait_index, *assoc_type_index);
-				let next_base = folder.fold_type(self, base);
+				let next_base = self.substitute(base, substitution);
 				if next_base == base {
 					ty
 				} else {
@@ -595,38 +712,23 @@ impl TypeInterner {
 		}
 	}
 
-	fn fold_list<F: TypeFolder>(
+	/// The substituted elements, copied only after the first changed one.
+	/// Each element is read by position: substituting may store more lists.
+	fn substitute_list(
 		&mut self,
-		ty: TypeIndex,
-		folder: &mut F,
-		list: impl Fn(&Type) -> &[TypeIndex],
-	) -> Option<Box<[TypeIndex]>> {
-		self.map_type_list(ty, list, |types, _, child| {
-			folder.fold_type(types, child)
-		})
-	}
-
-	/// Copies a list only after its first changed child. Read each child
-	/// through the stable parent index: recursion may grow the interner.
-	/// The position lets parent-specific rewrites select an argument slot.
-	pub(super) fn map_type_list(
-		&mut self,
-		ty: TypeIndex,
-		list: impl Fn(&Type) -> &[TypeIndex],
-		mut fold: impl FnMut(&mut Self, usize, TypeIndex) -> TypeIndex,
-	) -> Option<Box<[TypeIndex]>> {
-		let len = list(self.resolve(ty)).len();
-		let mut folded: Option<Box<[TypeIndex]>> = None;
-		for index in 0..len {
-			let original = list(self.resolve(ty))[index];
-			let next = fold(self, index, original);
+		list: TypeList,
+		substitution: Substitution<'_>,
+	) -> Option<Vec<TypeIndex>> {
+		let mut substituted: Option<Vec<TypeIndex>> = None;
+		for index in 0..list.len as usize {
+			let original = self.list(list)[index];
+			let next = self.substitute(original, substitution);
 			if next != original {
-				let items = folded
-					.get_or_insert_with(|| Box::from(list(self.resolve(ty))));
-				items[index] = next;
+				substituted.get_or_insert_with(|| self.list(list).to_vec())
+					[index] = next;
 			}
 		}
-		folded
+		substituted
 	}
 }
 
@@ -644,26 +746,10 @@ index_newtype!(TypeEnvIdx);
 /// Callers supply one argument per parameter in `env`, in declaration order.
 /// This borrows an instantiation's arguments without changing the original
 /// lexical environment. Replacement types may themselves contain parameters.
+#[derive(Clone, Copy)]
 pub(super) struct Substitution<'a> {
 	pub(super) env: TypeEnvIdx,
 	pub(super) args: &'a [TypeIndex],
-}
-
-impl TypeFolder for Substitution<'_> {
-	fn fold_type(
-		&mut self,
-		types: &mut TypeInterner,
-		ty: TypeIndex,
-	) -> TypeIndex {
-		match types.resolve(ty) {
-			Type::TypeParam { env, param_index } if *env == self.env => {
-				*self.args.get(*param_index as usize).expect(
-					"substitution is missing an argument for its parameter frame",
-				)
-			}
-			_ => types.fold_children(ty, self),
-		}
-	}
 }
 
 /// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
@@ -1033,17 +1119,14 @@ mod tests {
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
 		let other = parameter(&mut types, TypeEnvIdx::new(2), 0);
-		let original = types.intern(Type::Tuple {
-			elements: Box::new([t, u, other]),
-		});
-		let expected = types.intern(Type::Tuple {
-			elements: Box::new([TypeIndex::I32, TypeIndex::BOOL, other]),
-		});
+		let original = types.intern_tuple(&[t, u, other]);
+		let expected =
+			types.intern_tuple(&[TypeIndex::I32, TypeIndex::BOOL, other]);
 		let count = types.entries.len();
 
 		let actual = types.substitute(
 			original,
-			&Substitution {
+			Substitution {
 				env,
 				args: &[TypeIndex::I32, TypeIndex::BOOL],
 			},
@@ -1052,10 +1135,8 @@ mod tests {
 		assert_eq!(actual, expected);
 		assert_eq!(types.entries.len(), count, "reuse the interned result");
 		assert_eq!(
-			types.resolve(original),
-			&Type::Tuple {
-				elements: Box::new([t, u, other])
-			},
+			original,
+			types.intern_tuple(&[t, u, other]),
 			"the generic template must remain unchanged"
 		);
 	}
@@ -1067,10 +1148,7 @@ mod tests {
 		element: TypeIndex,
 		memory: TypeIndex,
 	) -> TypeIndex {
-		let wrapper = types.intern(Type::Struct {
-			struct_index: StructIdx::new(0),
-			type_args: Box::new([element]),
-		});
+		let wrapper = types.intern_struct(StructIdx::new(0), &[element]);
 		let item = types.intern(Type::AssocTypeProjection {
 			trait_index: TraitIdx::new(0),
 			assoc_type_index: AssocTypeIdx::new(0),
@@ -1097,15 +1175,11 @@ mod tests {
 			memory,
 			ownership: Ownership::Shared,
 		});
-		let function_item = types.intern(Type::FunctionItem {
-			func_index: FunctionIdx::new(0),
-			type_args: Box::new([element, memory]),
-		});
-		let tuple = types.intern(Type::Tuple {
-			elements: Box::new([array, slice, function_item]),
-		});
-		types.intern(Type::Function {
-			params: Box::new([tuple]),
+		let function_item =
+			types.intern_function(FunctionIdx::new(0), &[element, memory]);
+		let tuple = types.intern_tuple(&[array, slice, function_item]);
+		types.intern(Type::FunctionRef {
+			param: tuple,
 			result: next,
 		})
 	}
@@ -1123,7 +1197,7 @@ mod tests {
 
 		let actual = types.substitute(
 			original,
-			&Substitution {
+			Substitution {
 				env,
 				args: &[TypeIndex::I32, memory],
 			},
@@ -1146,7 +1220,7 @@ mod tests {
 		assert_eq!(
 			types.substitute(
 				original,
-				&Substitution {
+				Substitution {
 					env: TypeEnvIdx::new(2),
 					args: &[]
 				},
@@ -1154,7 +1228,7 @@ mod tests {
 			original
 		);
 		assert_eq!(
-			types.substitute(original, &Substitution { env, args: &[t, m] }),
+			types.substitute(original, Substitution { env, args: &[t, m] }),
 			original
 		);
 		assert_eq!(types.entries.len(), count);
@@ -1185,16 +1259,9 @@ mod tests {
 			),
 		];
 		for (original, expected) in cases {
-			let original = types.intern(Type::Tuple {
-				elements: Box::new(original),
-			});
-			let actual = types.substitute(original, &substitution);
-			assert_eq!(
-				types.resolve(actual),
-				&Type::Tuple {
-					elements: Box::new(expected)
-				}
-			);
+			let original = types.intern_tuple(&original);
+			let actual = types.substitute(original, substitution);
+			assert_eq!(actual, types.intern_tuple(&expected));
 		}
 	}
 
@@ -1210,39 +1277,39 @@ mod tests {
 		};
 		let cases = [
 			(
-				Type::Function {
-					params: Box::new([TypeIndex::BOOL]),
+				Type::FunctionRef {
+					param: TypeIndex::BOOL,
 					result: t,
 				},
-				Type::Function {
-					params: Box::new([TypeIndex::BOOL]),
+				Type::FunctionRef {
+					param: TypeIndex::BOOL,
 					result: TypeIndex::I32,
 				},
 			),
 			(
-				Type::Function {
-					params: Box::new([TypeIndex::BOOL, t]),
+				Type::FunctionRef {
+					param: t,
 					result: TypeIndex::CHAR,
 				},
-				Type::Function {
-					params: Box::new([TypeIndex::BOOL, TypeIndex::I32]),
+				Type::FunctionRef {
+					param: TypeIndex::I32,
 					result: TypeIndex::CHAR,
 				},
 			),
 			(
-				Type::Function {
-					params: Box::new([]),
+				Type::FunctionRef {
+					param: TypeIndex::UNIT,
 					result: t,
 				},
-				Type::Function {
-					params: Box::new([]),
+				Type::FunctionRef {
+					param: TypeIndex::UNIT,
 					result: TypeIndex::I32,
 				},
 			),
 		];
 		for (original, expected) in cases {
 			let original = types.intern(original);
-			let actual = types.substitute(original, &substitution);
+			let actual = types.substitute(original, substitution);
 			assert_eq!(types.resolve(actual), &expected);
 		}
 	}
@@ -1253,20 +1320,14 @@ mod tests {
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
-		let original = types.intern(Type::Tuple {
-			elements: Box::new([t, u]),
-		});
-		let replacement = types.intern(Type::Tuple {
-			elements: Box::new([t]),
-		});
-		let expected = types.intern(Type::Tuple {
-			elements: Box::new([u, replacement]),
-		});
+		let original = types.intern_tuple(&[t, u]);
+		let replacement = types.intern_tuple(&[t]);
+		let expected = types.intern_tuple(&[u, replacement]);
 
 		assert_eq!(
 			types.substitute(
 				original,
-				&Substitution {
+				Substitution {
 					env,
 					args: &[u, replacement]
 				}
@@ -1288,7 +1349,7 @@ mod tests {
 		});
 		let result = types.substitute(
 			projection,
-			&Substitution {
+			Substitution {
 				env,
 				args: &[TypeIndex::ERROR],
 			},
@@ -1306,9 +1367,7 @@ mod tests {
 	#[test]
 	fn unit_is_the_empty_tuple() {
 		let mut types = TypeInterner::new();
-		let unit = types.intern(Type::Tuple {
-			elements: Box::new([]),
-		});
+		let unit = types.intern_tuple(&[]);
 		assert_eq!(unit, TypeIndex::UNIT);
 	}
 
@@ -1348,11 +1407,11 @@ mod tests {
 			},
 			Type::Struct {
 				struct_index: StructIdx::new(0),
-				type_args: Box::new([]),
+				type_args: TypeList::EMPTY,
 			},
-			Type::FunctionItem {
+			Type::Function {
 				func_index: FunctionIdx::new(0),
-				type_args: Box::new([]),
+				type_args: TypeList::EMPTY,
 			},
 		];
 		for leaf in leaves {
@@ -1361,7 +1420,7 @@ mod tests {
 			assert_eq!(
 				types.substitute(
 					ty,
-					&Substitution {
+					Substitution {
 						env: TypeEnvIdx::new(1),
 						args: &[]
 					}
@@ -1381,7 +1440,7 @@ mod tests {
 			assert_eq!(
 				types.substitute(
 					t,
-					&Substitution {
+					Substitution {
 						env,
 						args: &[replacement]
 					}
@@ -1401,7 +1460,7 @@ mod tests {
 		let u = parameter(&mut types, env, 1);
 		types.substitute(
 			u,
-			&Substitution {
+			Substitution {
 				env,
 				args: &[TypeIndex::I32],
 			},

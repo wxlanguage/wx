@@ -79,8 +79,8 @@ impl ImplTarget {
 			| Type::Integer
 			| Type::Float
 			| Type::Tuple { .. }
+			| Type::FunctionRef { .. }
 			| Type::Function { .. }
-			| Type::FunctionItem { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
 			| Type::AssociatedType { .. }
@@ -705,10 +705,7 @@ impl TypeContext<'_, '_, '_> {
 			ImplTarget::Bool => TypeIndex::BOOL,
 			ImplTarget::Char => TypeIndex::CHAR,
 			ImplTarget::Struct(struct_index) => {
-				self.types.intern(Type::Struct {
-					struct_index,
-					type_args: Box::new([]),
-				})
+				self.types.intern_struct(struct_index, &[])
 			}
 			ImplTarget::Enum(enum_index) => {
 				self.types.intern(Type::Enum { enum_index })

@@ -142,7 +142,9 @@ impl TypeFormatter<'_> {
 			Type::Char => f.push_str("char"),
 			Type::Tuple { elements } => {
 				f.push('(');
-				for (i, element) in elements.iter().copied().enumerate() {
+				for (i, element) in
+					self.types.list(*elements).iter().copied().enumerate()
+				{
 					if i > 0 {
 						f.push_str(", ");
 					}
@@ -160,7 +162,7 @@ impl TypeFormatter<'_> {
 				let symbol =
 					self.defs.structs[usize::from(*struct_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
-				self.write_type_args(f, type_args);
+				self.write_type_args(f, self.types.list(*type_args));
 			}
 			Type::Enum { enum_index } => {
 				let symbol =
@@ -212,28 +214,40 @@ impl TypeFormatter<'_> {
 				self.write_type(f, *of);
 				let _ = write!(f, "; {}]", *size);
 			}
-			Type::Function { params, result } => {
-				let result = *result;
+			Type::FunctionRef { param, result } => {
+				let (param, result) = (*param, *result);
 				f.push_str("func(");
-				for (i, param) in params.iter().copied().enumerate() {
-					if i > 0 {
-						f.push_str(", ");
+				// A parameter list is written back as one; a one-element
+				// tuple is not a list, so it keeps its own parentheses.
+				match self.types.resolve(param) {
+					Type::Tuple { elements } if elements.len() != 1 => {
+						for (i, element) in self
+							.types
+							.list(*elements)
+							.iter()
+							.copied()
+							.enumerate()
+						{
+							if i > 0 {
+								f.push_str(", ");
+							}
+							self.write_type(f, element);
+						}
 					}
-					self.write_type(f, param);
+					_ => self.write_type(f, param),
 				}
 				f.push_str(") -> ");
 				self.write_type(f, result);
 			}
-			Type::FunctionItem {
+			Type::Function {
 				func_index: function_index,
 				type_args,
 			} => {
-				f.push_str("func ");
 				let symbol = self.defs.functions[usize::from(*function_index)]
 					.name
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
-				self.write_type_args(f, type_args);
+				self.write_type_args(f, self.types.list(*type_args));
 			}
 			Type::TypeParam {
 				env, param_index, ..
@@ -519,11 +533,11 @@ mod tests {
 	#[test]
 	fn function_types_format_nested_tuples_and_recovery_placeholders() {
 		let mut case = TestCase::new("");
-		let tuple = case.types.intern(Type::Tuple {
-			elements: Box::new([TypeIndex::I32, TypeIndex::ERROR]),
-		});
-		let function = case.types.intern(Type::Function {
-			params: Box::new([tuple, TypeIndex::INFER]),
+		let tuple =
+			case.types.intern_tuple(&[TypeIndex::I32, TypeIndex::ERROR]);
+		let param = case.types.intern_tuple(&[tuple, TypeIndex::INFER]);
+		let function = case.types.intern(Type::FunctionRef {
+			param,
 			result: TypeIndex::NEVER,
 		});
 		assert_eq!(
@@ -579,12 +593,11 @@ mod tests {
 			assoc_type_index,
 			base: param,
 		});
-		let function = case.types.intern(Type::FunctionItem {
-			func_index: case.function("iterate"),
-			type_args: Box::new([param]),
-		});
+		let function = case
+			.types
+			.intern_function(case.function("iterate"), &[param]);
 		let formatter = case.type_formatter();
-		assert_eq!(formatter.display_type(function), "func iterate<T>");
+		assert_eq!(formatter.display_type(function), "iterate<T>");
 		assert_eq!(formatter.display_type(associated), "Iterable::Item");
 		assert_eq!(formatter.display_type(projection), "<T as Iterable>::Item");
 	}

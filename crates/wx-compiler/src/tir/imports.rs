@@ -205,30 +205,62 @@ impl<'r> ImportResolver<'r> {
 			.try_insert_binding(namespace, key, binding)
 			.is_err()
 		{
-			let collision_span = self
-				.namespaces
-				.symbols(namespace)
-				.bindings
-				.get(&key)
-				.expect(
-					"a rejected insertion must leave the existing binding in place",
-				)
-				.declaration_span(self.namespaces, self.use_items);
-			self.diagnostics.push(
-				DuplicateDefinitionDiagnostic {
-					strings: self.strings,
-					key,
-					definitions: (
-						collision_span,
-						SourceSpan::new(
-							self.namespaces.file_id(namespace),
-							span,
-						),
-					),
-				}
-				.report(),
-			);
+			self.report_duplicate(scope, key, span);
 		}
+	}
+
+	/// Binds a `use` leaf's local name in both tiers. The leaf is one
+	/// declaration, so a clash in either tier is reported once, the
+	/// value's first.
+	fn insert_type_and_value(
+		&mut self,
+		scope: Scope,
+		symbol: SymbolU32,
+		ty: Binding,
+		value: Binding,
+		span: TextSpan,
+	) {
+		let namespace = Namespace::from(scope);
+		let value_key = BindingKey::value(symbol);
+		let type_key = BindingKey::ty(symbol);
+		let value = self
+			.namespaces
+			.try_insert_binding(namespace, value_key, value);
+		let ty = self.namespaces.try_insert_binding(namespace, type_key, ty);
+		match (value, ty) {
+			(Err(_), _) => self.report_duplicate(scope, value_key, span),
+			(Ok(()), Err(_)) => self.report_duplicate(scope, type_key, span),
+			(Ok(()), Ok(())) => {}
+		}
+	}
+
+	fn report_duplicate(
+		&mut self,
+		scope: Scope,
+		key: BindingKey,
+		span: TextSpan,
+	) {
+		let namespace = Namespace::from(scope);
+		let collision_span = self
+			.namespaces
+			.symbols(namespace)
+			.bindings
+			.get(&key)
+			.expect(
+				"a rejected insertion must leave the existing binding in place",
+			)
+			.declaration_span(self.namespaces, self.use_items);
+		self.diagnostics.push(
+			DuplicateDefinitionDiagnostic {
+				strings: self.strings,
+				key,
+				definitions: (
+					collision_span,
+					SourceSpan::new(self.namespaces.file_id(namespace), span),
+				),
+			}
+			.report(),
+		);
 	}
 
 	fn ensure_import_item(&mut self, index: UseItemIndex) {
@@ -260,24 +292,16 @@ impl<'r> ImportResolver<'r> {
 						);
 						self.diagnostics.push(diagnostic);
 
-						self.insert_binding(
-							namespace,
-							BindingKey::ty(local_name.inner),
-							Binding::import(
-								BindingTarget::Error,
-								visibility,
-								index,
-							),
-							local_name.span,
+						let binding = Binding::import(
+							BindingTarget::Error,
+							visibility,
+							index,
 						);
-						self.insert_binding(
+						self.insert_type_and_value(
 							namespace,
-							BindingKey::value(local_name.inner),
-							Binding::import(
-								BindingTarget::Error,
-								visibility,
-								index,
-							),
+							local_name.inner,
+							binding.clone(),
+							binding,
 							local_name.span,
 						);
 					}
@@ -391,18 +415,23 @@ impl<'r> ImportResolver<'r> {
 			}
 		}
 
-		let mut type_def = self.resolve_member_def(
+		let (mut type_def, type_ambiguity) = self.resolve_member_def(
 			namespace,
 			scope,
 			BindingKey::ty(name.inner),
 			name.span,
 		);
-		let mut value_def = self.resolve_member_def(
+		let (mut value_def, value_ambiguity) = self.resolve_member_def(
 			namespace,
 			scope,
 			BindingKey::value(name.inner),
 			name.span,
 		);
+		// Both tiers can name the same candidates (a function is a type and
+		// a value), but the leaf is one name: report its ambiguity once.
+		if let Some(diagnostic) = value_ambiguity.or(type_ambiguity) {
+			self.diagnostics.push(diagnostic);
+		}
 
 		let local_name = alias.unwrap_or(name);
 		let declared_visibility = Visibility::from(item.pub_span);
@@ -456,74 +485,70 @@ impl<'r> ImportResolver<'r> {
 				);
 				self.diagnostics.push(diagnostic);
 			}
-			self.insert_binding(
-				namespace,
-				BindingKey::ty(local_name.inner),
-				Binding::import(
-					BindingTarget::Error,
-					declared_visibility,
-					index,
-				),
-				local_name.span,
+			let binding = Binding::import(
+				BindingTarget::Error,
+				declared_visibility,
+				index,
 			);
-			self.insert_binding(
+			self.insert_type_and_value(
 				namespace,
-				BindingKey::value(local_name.inner),
-				Binding::import(
-					BindingTarget::Error,
-					declared_visibility,
-					index,
-				),
+				local_name.inner,
+				binding.clone(),
+				binding,
 				local_name.span,
 			);
 			return;
 		}
 
-		if let Some((target, source_visibility)) = type_def.resolved() {
-			if declared_visibility == Visibility::Public
-				&& source_visibility == Visibility::Private
-				&& matches!(target, BindingTarget::Accessible(_))
-			{
-				let file_id = self.namespaces.file_id(namespace.into());
-				let diagnostic = self.report_private_reexport(
-					name.inner,
-					SourceSpan::new(file_id, name.span),
-				);
-				self.diagnostics.push(diagnostic);
-			}
-			self.insert_binding(
+		let (type_def, value_def) = (type_def.resolved(), value_def.resolved());
+		// One leaf re-exports one name, however many tiers it fills.
+		let reexports_private = [type_def, value_def]
+			.into_iter()
+			.flatten()
+			.any(|(target, source_visibility)| {
+				declared_visibility == Visibility::Public
+					&& source_visibility == Visibility::Private
+					&& matches!(target, BindingTarget::Accessible(_))
+			});
+		if reexports_private {
+			let file_id = self.namespaces.file_id(Namespace::from(namespace));
+			let diagnostic = self.report_private_reexport(
+				name.inner,
+				SourceSpan::new(file_id, name.span),
+			);
+			self.diagnostics.push(diagnostic);
+		}
+		let binding =
+			|(target, source_visibility): (BindingTarget, Visibility)| {
+				Binding::import(
+					target,
+					declared_visibility.cap(source_visibility),
+					index,
+				)
+			};
+		match (type_def.map(binding), value_def.map(binding)) {
+			(Some(ty), Some(value)) => self.insert_type_and_value(
+				namespace,
+				local_name.inner,
+				ty,
+				value,
+				local_name.span,
+			),
+			(Some(ty), None) => self.insert_binding(
 				namespace,
 				BindingKey::ty(local_name.inner),
-				Binding::import(
-					target,
-					declared_visibility.cap(source_visibility),
-					index,
-				),
+				ty,
 				local_name.span,
-			);
-		}
-		if let Some((target, source_visibility)) = value_def.resolved() {
-			if declared_visibility == Visibility::Public
-				&& source_visibility == Visibility::Private
-				&& matches!(target, BindingTarget::Accessible(_))
-			{
-				let file_id = self.namespaces.file_id(namespace.into());
-				let diagnostic = self.report_private_reexport(
-					name.inner,
-					SourceSpan::new(file_id, name.span),
-				);
-				self.diagnostics.push(diagnostic);
-			}
-			self.insert_binding(
+			),
+			(None, Some(value)) => self.insert_binding(
 				namespace,
 				BindingKey::value(local_name.inner),
-				Binding::import(
-					target,
-					declared_visibility.cap(source_visibility),
-					index,
-				),
+				value,
 				local_name.span,
-			);
+			),
+			(None, None) => unreachable!(
+				"a leaf with nothing in either tier returned above"
+			),
 		}
 	}
 
@@ -673,17 +698,18 @@ impl<'r> ImportResolver<'r> {
 		scope: Namespace,
 		key: BindingKey,
 		span: TextSpan,
-	) -> ImportSlot {
+	) -> (ImportSlot, Option<Diagnostic<FileId>>) {
 		let source_span =
 			SourceSpan::new(self.namespaces.file_id(accessor.into()), span);
 
+		let mut ambiguity = None;
 		let (target, visibility) = match self.namespaces.lookup(
 			self.use_items,
 			accessor,
 			scope,
 			key,
 		) {
-			BindingLookup::NotFound => return ImportSlot::Absent,
+			BindingLookup::NotFound => return (ImportSlot::Absent, None),
 			BindingLookup::Found {
 				target,
 				visibility,
@@ -698,14 +724,13 @@ impl<'r> ImportResolver<'r> {
 				(target, visibility)
 			}
 			BindingLookup::Ambiguous(candidates) => {
-				let diagnostic = report_ambiguous_identifier(
+				ambiguity = Some(report_ambiguous_identifier(
 					self.namespaces,
 					self.strings,
 					key.symbol,
 					source_span,
 					&candidates,
-				);
-				self.diagnostics.push(diagnostic);
+				));
 				// Every surviving candidate here was already confirmed
 				// accessible to `accessor` by `indirect_lookup` — `Public`
 				// is just a stand-in that reproduces that same "yes" below,
@@ -714,8 +739,9 @@ impl<'r> ImportResolver<'r> {
 			}
 		};
 		// Nothing is reported here: whether an inaccessible slot is an error
-		// depends on the leaf's other namespace (`compute_named_import`).
-		match target {
+		// depends on the leaf's other namespace (`compute_named_import`), and
+		// an ambiguity is the leaf's to report once.
+		let slot = match target {
 			// Already inaccessible at an earlier link in a re-export chain —
 			// can't become more accessible by being re-exported further.
 			BindingTarget::Inaccessible(def_key) => {
@@ -734,7 +760,8 @@ impl<'r> ImportResolver<'r> {
 			// An `Error`-recovery placeholder — already diagnosed by
 			// whoever caused that, nothing new to report here.
 			BindingTarget::Error => ImportSlot::Poisoned,
-		}
+		};
+		(slot, ambiguity)
 	}
 
 	fn ensure_import_path(
@@ -1258,8 +1285,8 @@ mod tests {
 			Self::from_graph(builder.build(root_id))
 		}
 
-		fn root_namespace(&self) -> Scope {
-			Scope::Package(self.defs.root_package)
+		fn root_namespace(&self) -> Namespace {
+			Namespace::Package(self.defs.root_package)
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -1269,14 +1296,14 @@ mod tests {
 		/// Inspects a stored binding without following glob imports or checking privacy.
 		fn direct_binding(
 			&self,
-			namespace: impl Into<Namespace>,
+			namespace: Namespace,
 			tier: Tier,
 			name: &str,
 		) -> Option<&Binding> {
 			let symbol = self.graph.strings.get(name)?;
 			self.defs
 				.namespaces
-				.symbols(namespace.into())
+				.symbols(namespace)
 				.bindings
 				.get(&BindingKey::new(tier, symbol))
 		}
@@ -1284,11 +1311,10 @@ mod tests {
 		#[track_caller]
 		fn expect_direct_def(
 			&self,
-			namespace: impl Into<Namespace>,
+			namespace: Namespace,
 			tier: Tier,
 			name: &str,
 		) -> DefKey {
-			let namespace = namespace.into();
 			let target = self
 				.direct_binding(namespace, tier, name)
 				.map(|binding| binding.target);
@@ -1306,7 +1332,7 @@ mod tests {
 		#[track_caller]
 		fn child_namespace(
 			&self,
-			namespace: impl Into<Namespace>,
+			namespace: Namespace,
 			name: &str,
 		) -> Namespace {
 			let key = self.expect_direct_def(namespace, Tier::Type, name);
@@ -1317,12 +1343,8 @@ mod tests {
 		}
 
 		/// The namespaces `namespace` glob-imports, in declaration order.
-		fn glob_targets(
-			&self,
-			namespace: impl Into<Namespace>,
-		) -> Vec<Namespace> {
-			let scope =
-				namespace.into().as_scope().expect("only a scope has globs");
+		fn glob_targets(&self, namespace: Namespace) -> Vec<Namespace> {
+			let scope = namespace.as_scope().expect("only a scope has globs");
 			self.defs
 				.namespaces
 				.scope(scope)
@@ -1439,9 +1461,7 @@ mod tests {
 			mod x {
 				pub type Y = u32;
 
-				pub func Y() -> u32 {
-					42
-				}
+				pub const Y: u32 = 42;
 			}
 
 			use x::Y;
@@ -1641,7 +1661,7 @@ mod tests {
 			use a::X;
 
 			mod a {
-				pub func X() -> i32 { 1 }
+				pub const X: i32 = 1;
 				pub use super::source::X;
 			}
 
@@ -1822,7 +1842,7 @@ mod tests {
 	#[test]
 	fn import_only_claims_the_namespace_it_occupies() {
 		let case = TestCase::new(indoc! {"
-			func Y() -> i32 { 1 }
+			const Y: i32 = 1;
 
 			mod x {
 				pub type Y = u32;

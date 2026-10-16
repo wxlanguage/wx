@@ -595,10 +595,7 @@ mod tests {
 		else {
 			panic!("expected `{path}` to be a struct");
 		};
-		builder.types.intern(Type::Struct {
-			struct_index,
-			type_args: Box::new([]),
-		})
+		builder.types.intern_struct(struct_index, &[])
 	}
 
 	/// The `TypeIndex` of `function_path`'s `param_index`-th own declared

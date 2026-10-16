@@ -1,8 +1,10 @@
 # Function types, the `Function` trait and the one-parameter rule — design note
 
-**Status: design only.** Nothing here is implemented. Today `Type::Function`
-holds a parameter list and `Type::FunctionItem` exists, but there is no
-`Function` trait and calls are not checked in bodies yet. Written 2026-10-16
+**Status: partly implemented.** The one-parameter rule (§2) is in:
+`Type::FunctionRef` is the `func(A) -> R` type, and a declared function is
+its own zero-sized type `Type::Function`, named like a struct (`foo<i32>`,
+always fully applied). There is no `Function` trait yet, and calls are not
+checked in bodies. Written 2026-10-16
 on `tir-refactor`, from a design discussion that went through several
 rejected alternatives (§7). The first version of this note used a
 parameter-list slot with a `..` spelling; it was replaced the same day by the
@@ -29,7 +31,7 @@ tables), `wx-named-invocation-and-struct-constructors.md` (call syntax).
 ## 2. Every function takes one parameter
 
 ```
-Type::Function { param: TypeIndex, result: TypeIndex }
+Type::FunctionRef { param: TypeIndex, result: TypeIndex }
 ```
 
 A function type has exactly **one** parameter type. A written parameter list
@@ -130,7 +132,7 @@ pub trait Function {
 ```
 
 - **Impls are built into the solver,** not synthesized per function. A
-  `FunctionItem` answers `Args` and `Result` from its signature:
+  `Type::Function` answers `Args` and `Result` from its signature:
   - `Args` is the parameter type: `()`, `A`, `(A, B)`, ….
   - `Result` is the return type.
 - **The exact type is rebuilt** by `func(F::Args) -> F::Result`.
@@ -226,7 +228,7 @@ func table_init<T: FuncTable, F: Function>(
 
 ## 8. Open points
 
-- **Methods of generic impls.** `Type::FunctionItem { func_index, type_args }`
+- **Methods of generic impls.** `Type::Function { func_index, type_args }`
   carries only the function's own type arguments. A method of
   `impl<T> Wrapper<T>` has no place for `T`, so it cannot be a value or
   implement `Function` until the item type also carries the parent impl's
