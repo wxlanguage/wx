@@ -10,7 +10,7 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{self, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	tir::defs::{EnumIdx, GlobalIdx, MemoryIdx, StructIdx},
+	tir::defs::{EnumIdx, FunctionIdx, GlobalIdx, MemoryIdx, StructIdx},
 	vfs::FileId,
 };
 
@@ -50,6 +50,7 @@ pub(super) enum ImplTarget {
 	Enum(EnumIdx),
 	Memory(MemoryIdx),
 	Global(GlobalIdx),
+	Function(FunctionIdx),
 }
 
 impl ImplTarget {
@@ -73,6 +74,7 @@ impl ImplTarget {
 			Type::Enum { enum_index } => Self::Enum(*enum_index),
 			Type::Memory { memory_index } => Self::Memory(*memory_index),
 			Type::Global { global_index } => Self::Global(*global_index),
+			Type::Function { func_index, .. } => Self::Function(*func_index),
 			Type::Error
 			| Type::Infer
 			| Type::Never
@@ -80,7 +82,6 @@ impl ImplTarget {
 			| Type::Float
 			| Type::Tuple { .. }
 			| Type::FunctionRef { .. }
-			| Type::Function { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
 			| Type::AssociatedType { .. }
@@ -358,6 +359,15 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.file_id,
 					);
 				}
+				AstNodeRef::Function { func_index, .. } => {
+					self.register_function_impls(*func_index, entry.file_id);
+				}
+				AstNodeRef::ImportedFunction { function_index, .. } => {
+					self.register_function_impls(
+						*function_index,
+						entry.file_id,
+					);
+				}
 				_ => {}
 			}
 		}
@@ -514,6 +524,57 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				global_mut_trait_idx,
 				defs.traits[usize::from(global_mut_trait_idx)].name.inner,
 				mut_trait_impl_index,
+				file_id,
+			);
+		}
+	}
+
+	/// Registers a free or imported function's synthetic `Call` and
+	/// `Function` impls under its own `ImplTarget::Function` bucket, same
+	/// reasoning as `register_global_impl`.
+	fn register_function_impls(
+		&mut self,
+		func_index: FunctionIdx,
+		file_id: FileId,
+	) {
+		let defs = self.defs;
+		let function_def = &defs.functions[usize::from(func_index)];
+		let function_impls = function_def
+			.function_impls
+			.expect("a free or imported function has synthetic impls");
+		let name_span = function_def.name.span;
+		let call_trait_idx = defs.intrinsics.call.unwrap_or_else(|| {
+			panic!(
+				"the stdlib package must declare a `Call` trait — every free function needs one to synthesize its impl against"
+			)
+		});
+		let function_trait_idx = defs.intrinsics.function.unwrap_or_else(|| {
+			panic!(
+				"the stdlib package must declare a `Function` trait — every free function needs one to synthesize its impl against"
+			)
+		});
+		for (trait_idx, trait_impl_index) in [
+			(call_trait_idx, function_impls.call_impl_index),
+			(function_trait_idx, function_impls.function_impl_index),
+		] {
+			self.trait_headers[usize::from(trait_impl_index)] = TraitImplHead {
+				trait_def: Some(Spanned {
+					inner: trait_idx,
+					span: name_span,
+				}),
+				target: Some(Spanned {
+					inner: ImplTarget::Function(func_index),
+					span: name_span,
+				}),
+			};
+			self.register_trait(
+				Spanned {
+					inner: ImplTarget::Function(func_index),
+					span: name_span,
+				},
+				trait_idx,
+				defs.traits[usize::from(trait_idx)].name.inner,
+				trait_impl_index,
 				file_id,
 			);
 		}
@@ -715,8 +776,10 @@ impl TypeContext<'_, '_, '_> {
 					"array and slice types cannot be path-only impl targets"
 				)
 			}
-			ImplTarget::Memory(_) | ImplTarget::Global(_) => unreachable!(
-				"memory/global impls are never resolved through a written path — see ImplTarget's own doc comment"
+			ImplTarget::Memory(_)
+			| ImplTarget::Global(_)
+			| ImplTarget::Function(_) => unreachable!(
+				"memory/global/function impls are never resolved through a written path — see ImplTarget's own doc comment"
 			),
 		}
 	}

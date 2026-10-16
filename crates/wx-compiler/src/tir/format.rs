@@ -548,7 +548,9 @@ mod tests {
 
 	#[test]
 	fn memory_qualified_types_preserve_ownership_and_shape() {
-		let mut case = TestCase::new("func allocate<M>() {}");
+		let mut case = TestCase::new(
+			"pub trait Call { type Args; type Result; } pub trait Function: Call {} func allocate<M>() {}",
+		);
 		let memory = case.type_param("allocate", "M");
 		let slice = case.types.intern(Type::Slice {
 			of: TypeIndex::I32,
@@ -574,6 +576,7 @@ mod tests {
 	#[test]
 	fn named_functions_and_associated_types_keep_names_and_qualification() {
 		let mut case = TestCase::new(indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Iterable { type Item; }
 			func iterate<T: Iterable>() {}
 		"});
@@ -605,6 +608,7 @@ mod tests {
 	#[test]
 	fn bound_lists_preserve_written_order_without_expanding_supertraits() {
 		let case = TestCase::new(indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Base {}
 			trait A: Base {}
 			trait B {}
@@ -623,6 +627,7 @@ mod tests {
 	#[test]
 	fn bound_only_associated_binding_keeps_its_where_clause() {
 		let case = TestCase::new(indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Unsigned {}
 			trait Store { type Size; }
 			func grow<S: Store where { Size: Unsigned }>() {}
@@ -637,6 +642,7 @@ mod tests {
 	#[test]
 	fn nested_bounds_and_equalities_share_type_formatting() {
 		let case = TestCase::new(indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type u32;
 			trait Plain {}
 			trait Leaf {}

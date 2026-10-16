@@ -2186,17 +2186,14 @@ pub trait Memory {
     }
 }
 
-#[intrinsic]
-pub func func_ref<F: Function>(f: F) -> func(F::Args) -> F::Result;
-
-pub trait Function {
+pub trait Call {
     type Args;
     type Result;
 
-    func as_ref(self) -> func(Self::Args) -> Self::Result {
-        func_ref(self)
-    }
+    func call(self, args: Self::Args) -> Self::Result;
 }
+
+pub trait Function: Call {}
 
 #[intrinsic]
 pub func size_of<T, Mem: Memory>() -> Mem::Size;

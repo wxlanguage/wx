@@ -719,6 +719,7 @@ mod tests {
 	fn a_generic_param_with_a_matching_bound_satisfies_the_trait() {
 		with_resolved(
 			indoc! {"
+				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Bound {}
 				func target<T: Bound>(x: T) {}
 			"},
@@ -739,6 +740,7 @@ mod tests {
 	fn a_generic_param_without_the_bound_does_not_satisfy_the_trait() {
 		with_resolved(
 			indoc! {"
+				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Bound {}
 				trait Other {}
 				func target<T: Bound>(x: T) {}
@@ -760,6 +762,7 @@ mod tests {
 	fn a_generic_param_satisfies_a_bounds_supertrait_transitively() {
 		with_resolved(
 			indoc! {"
+				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Super {}
 				trait Sub: Super {}
 				func target<T: Sub>(x: T) {}

@@ -272,12 +272,30 @@ pub struct TypesetDef {
 /// arena, the same reason `signatures::FunctionSignature` covers all
 /// three. Field *types* stay in that struct, index-aligned with `params`
 /// here, same split as `StructDef`/`StructSignature`.
+///
+/// `function_impls` are the synthetic `impl Call` and `impl Function` of a
+/// free or imported function, which is its own type. Members are values only
+/// and have none.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct FunctionDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub params: Box<[Spanned<SymbolU32>]>,
+	pub function_impls: Option<FunctionImpls>,
+}
+
+/// A function's synthetic `impl Call for <function>`, which holds `Args` and
+/// `Result`, and its `impl Function for <function>`, which declares nothing
+/// (like a `global mut`'s `GlobalMut` impl). Pre-allocated for the same
+/// reason as `MemoryDef`'s own fields.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct FunctionImpls {
+	pub call_impl_index: TraitImplIdx,
+	pub args_assoc_type_index: AssocTypeIdx,
+	pub result_assoc_type_index: AssocTypeIdx,
+	pub function_impl_index: TraitImplIdx,
 }
 
 /// Identity shared by local and imported memories. The written size
@@ -633,6 +651,8 @@ pub struct IntrinsicDefs {
 	pub memory: Option<TraitIdx>,
 	pub global: Option<TraitIdx>,
 	pub global_mut: Option<TraitIdx>,
+	pub call: Option<TraitIdx>,
+	pub function: Option<TraitIdx>,
 }
 
 impl IntrinsicDefs {
@@ -681,6 +701,8 @@ impl IntrinsicDefs {
 			"Memory" => &mut self.memory,
 			"Global" => &mut self.global,
 			"GlobalMut" => &mut self.global_mut,
+			"Call" => &mut self.call,
+			"Function" => &mut self.function,
 			_ => return None,
 		})
 	}
@@ -1990,6 +2012,68 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		)
 	}
 
+	/// Pre-allocates a free or imported function's synthetic `impl Call for
+	/// <function>` and `impl Function for <function>` — see `FunctionImpls`.
+	fn synthesize_function_impls(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		name_span: TextSpan,
+	) -> FunctionImpls {
+		let args_symbol = self.strings.get_or_intern("Args");
+		let result_symbol = self.strings.get_or_intern("Result");
+		let args_assoc_type_index =
+			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
+		self.assoc_types.push(AssocTypeDef {
+			file_id,
+			namespace,
+			name: Spanned {
+				inner: args_symbol,
+				span: name_span,
+			},
+		});
+		let result_assoc_type_index =
+			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
+		self.assoc_types.push(AssocTypeDef {
+			file_id,
+			namespace,
+			name: Spanned {
+				inner: result_symbol,
+				span: name_span,
+			},
+		});
+		let call_impl_index = self.push_trait_impl(TraitImplDef {
+			file_id,
+			namespace,
+			members: vec![
+				TraitMemberDef {
+					kind: MemberKind::AssociatedType(args_assoc_type_index),
+					span: name_span,
+				},
+				TraitMemberDef {
+					kind: MemberKind::AssociatedType(result_assoc_type_index),
+					span: name_span,
+				},
+			],
+			bindings: HashMap::from([
+				(BindingKey::ty(args_symbol), MemberIdx::new(0)),
+				(BindingKey::ty(result_symbol), MemberIdx::new(1)),
+			]),
+		});
+		let function_impl_index = self.push_trait_impl(TraitImplDef {
+			file_id,
+			namespace,
+			members: Vec::new(),
+			bindings: HashMap::new(),
+		});
+		FunctionImpls {
+			call_impl_index,
+			args_assoc_type_index,
+			result_assoc_type_index,
+			function_impl_index,
+		}
+	}
+
 	#[inline]
 	fn push_typeset(&mut self, item: TypesetDef) -> TypesetIdx {
 		let index =
@@ -2303,11 +2387,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 				let params =
 					self.scan_free_function_params(file_id, &signature.params);
+				let function_impls = self.synthesize_function_impls(
+					file_id,
+					namespace,
+					signature.name.span,
+				);
 				self.functions.push(FunctionDef {
 					file_id,
 					namespace,
 					name: signature.name,
 					params,
+					function_impls: Some(function_impls),
 				});
 				self.ast_nodes.push(AstEntry {
 					file_id,
@@ -2715,6 +2805,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									namespace,
 									name: signature.name,
 									params,
+									function_impls: None,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -2858,6 +2949,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									namespace,
 									name: signature.name,
 									params,
+									function_impls: None,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3039,12 +3131,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								file_id,
 								&signature.params,
 							);
+							let function_impls = self
+								.synthesize_function_impls(
+									file_id,
+									namespace,
+									signature.name.span,
+								);
 							let function_index =
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
 									name: signature.name,
 									params,
+									function_impls: Some(function_impls),
 								});
 							let def_key = self.push_def(
 								own_namespace,
@@ -3231,6 +3330,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									namespace,
 									name: signature.name,
 									params,
+									function_impls: None,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
