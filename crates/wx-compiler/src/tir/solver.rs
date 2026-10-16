@@ -262,7 +262,7 @@ impl Solver {
 		let scope = view.trait_impls[usize::from(member.impl_index)]
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
-			.self_scope;
+			.type_params;
 		self.verdicts.insert(member, AssocValue::InProgress);
 		let index = self.state.frames.len();
 		self.state.frames.push(SolverFrame::Judgement {

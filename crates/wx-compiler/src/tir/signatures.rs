@@ -52,8 +52,8 @@ use super::satisfaction::{TypeArgsTarget, report_type_arg_count_mismatch};
 use super::solver::{ImplMember, Solver, SolverError, SolverView};
 use super::typecheck::BodyContext;
 use super::types::{
-	Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex, TypeInterner,
-	TypeParam,
+	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
+	TypeInterner,
 };
 
 /// One generic parameter's bounds — everything about a `Type::TypeParam`
@@ -242,13 +242,6 @@ pub struct InherentImplSignature {
 	/// See `TypeAliasSignature::type_params`.
 	pub type_params: TypeEnvIdx,
 	pub target: Spanned<TypeIndex>,
-	/// The frame binding `Self` to `target`, parented at `type_params` and
-	/// pushed once, right here, rather than separately by each member —
-	/// every member's own resolution parents *its* frame at this one
-	/// instead of pushing a fresh `Self` binding of its own, so a `Self`
-	/// written anywhere in this impl resolves to one `Referent::TypeParam`
-	/// instead of a different frame per member.
-	pub self_scope: TypeEnvIdx,
 }
 
 /// The resolved header of `impl<...> Trait for Target { ... }`.
@@ -256,8 +249,6 @@ pub struct TraitImplSignature {
 	/// See `TypeAliasSignature::type_params`.
 	pub type_params: TypeEnvIdx,
 	pub target: Spanned<TypeIndex>,
-	/// See `InherentImplSignature::self_scope`.
-	pub self_scope: TypeEnvIdx,
 }
 
 #[derive(Clone, Copy)]
@@ -597,8 +588,8 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `types.rs` is deliberately independent of this module's
 	/// resolved-signature data (`BoundId`, diagnostics, ...; see that
 	/// module's own doc comment). Grown only through
-	/// `reserve_param_bounds`, called once per frame right after whichever
-	/// of `push_frame`/`push_param_frame` created it, so the two arrays can
+	/// `reserve_param_bounds` and `resolve_generic_params`, once per frame
+	/// right after `push_param_frame` created it, so the two arrays can
 	/// never drift in length.
 	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
 	type_aliases: Vec<TypeAliasSignature>,
@@ -774,7 +765,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		parent: TypeEnvIdx,
 		params: &[ast::TypeParam],
 	) -> TypeEnvIdx {
-		if params.is_empty() {
+		// An impl always owns a frame, even an empty one: it is where a `Self`
+		// written inside the impl finds the impl it means (`resolve_impl_self`).
+		let is_impl = matches!(
+			owner,
+			TypeEnvOwner::InherentImpl(_) | TypeEnvOwner::TraitImpl(_)
+		);
+		if params.is_empty() && !is_impl {
 			return parent;
 		}
 
@@ -893,24 +890,44 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// see that module's own doc comment), so it's kept as a deliberately
 	/// separate step from whatever just built the frame's identities rather
 	/// than folded into one combining call. Must be called exactly once per
-	/// frame, immediately after it's created — whichever of `push_frame` or
-	/// `push_param_frame` did that — so the two arrays can never drift in
+	/// frame, immediately after `push_param_frame` creates it, so the two
+	/// arrays can never drift in
 	/// length; this is the one place `param_bounds` is ever pushed to.
 	///
 	/// The placeholder is filled in by `resolve_generic_params`, right after
 	/// it resolves the bounds that needed the frame to exist first (a bound
-	/// can reference a sibling param). A `Self` frame (trait, typeset, or
-	/// impl — none of them routed through `resolve_generic_params`) never
-	/// gets filled in and keeps the empty placeholder — correct either way,
-	/// since neither is ever queried through it: an impl's `Self` is never
-	/// abstract at all, and a trait's/typeset's own `Self` is answered
-	/// directly from `TraitSignature::implied_bounds` instead (see
-	/// `resolve_bound_member`'s own doc comment).
+	/// can reference a sibling param). A trait's or typeset's `Self` frame
+	/// (not routed through `resolve_generic_params`) keeps the empty
+	/// placeholder: its `Self` is answered directly from
+	/// `TraitSignature::implied_bounds` instead (see `resolve_bound_member`'s
+	/// own doc comment).
 	fn reserve_param_bounds(&mut self, frame: TypeEnvIdx) {
 		debug_assert_eq!(usize::from(frame), self.param_bounds.len());
 		let count = self.type_envs.params(frame).len();
 		self.param_bounds
 			.push((0..count).map(|_| ParamBounds::empty()).collect());
+	}
+
+	/// What `Self` means inside an impl: the impl's target, found through the
+	/// frame every impl owns. `None` outside an impl, and in the impl's own
+	/// header, whose target is what `Self` would name.
+	fn resolve_impl_self(
+		&self,
+		env: TypeEnvIdx,
+	) -> Option<(Referent, TypeIndex)> {
+		match self.type_envs.enclosing_impl(env)? {
+			ImplKind::Inherent(index) => Some((
+				Referent::InherentImplSelf(index),
+				self.inherent_impls[usize::from(index)]
+					.as_ref()?
+					.target
+					.inner,
+			)),
+			ImplKind::Trait(index) => Some((
+				Referent::TraitImplSelf(index),
+				self.trait_impls[usize::from(index)].as_ref()?.target.inner,
+			)),
+		}
 	}
 
 	/// Resolves a written impl target in the impl's own parameter frame. The
@@ -1248,7 +1265,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						inner: function_type,
 						span: name_span,
 					},
-					self_scope: type_env,
 				});
 		}
 
@@ -1260,22 +1276,23 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		SignatureLocation::Function(function_index)
 	}
 
-	/// Resolve a member in its parent Self scope, with a child frame for
-	/// method generics. Definition collection already validates receiver position.
+	/// Resolve a member in its parent's scope (the trait's or the impl's),
+	/// with a child frame for method generics; `self_type` is what `Self`
+	/// means there. Definition collection already validates receiver position.
 	fn resolve_member_function_signature(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
-		self_scope: TypeEnvIdx,
+		parent: TypeEnvIdx,
+		self_type: TypeIndex,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
-		let self_type = self.type_envs.params(self_scope)[0].ty;
 		let scope = self.resolve_generic_params(
 			file_id,
 			namespace,
 			TypeEnvOwner::Function(function_index),
-			self_scope,
+			parent,
 			&signature.type_params,
 		);
 
@@ -1498,7 +1515,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					inner: memory_type,
 					span: name.span,
 				},
-				self_scope: TypeEnvIdx::ROOT,
 			});
 		SignatureLocation::Memory(memory_index)
 	}
@@ -1537,7 +1553,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					inner: global_type,
 					span: name.span,
 				},
-				self_scope: TypeEnvIdx::ROOT,
 			});
 		if let Some(mut_trait_impl_index) = mut_trait_impl_index {
 			debug_assert!(mut_span.is_some());
@@ -1548,7 +1563,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						inner: global_type,
 						span: name.span,
 					},
-					self_scope: TypeEnvIdx::ROOT,
 				});
 		}
 		SignatureLocation::Global(global_index)
@@ -1710,12 +1724,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					requested_at: None,
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
+				let self_type = self.type_envs.params(self_scope)[0].ty;
 
 				self.resolve_member_function_signature(
 					file_id,
 					namespace,
 					function_index,
 					self_scope,
+					self_type,
 					signature,
 				)
 			}
@@ -1826,15 +1842,17 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					def_id: impl_def_id,
 					requested_at: None,
 				});
-				let self_scope = self.trait_impls[usize::from(block_index)]
+				let header = self.trait_impls[usize::from(block_index)]
 					.as_ref()
-					.expect("trait impl header is resolved")
-					.self_scope;
+					.expect("trait impl header is resolved");
+				let (scope, self_type) =
+					(header.type_params, header.target.inner);
 				self.resolve_member_function_signature(
 					file_id,
 					namespace,
 					function_index,
-					self_scope,
+					scope,
+					self_type,
 					signature,
 				)
 			}
@@ -1851,15 +1869,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					def_id: impl_def_id,
 					requested_at: None,
 				});
-				let self_scope = self.trait_impls[usize::from(block_index)]
+				let scope = self.trait_impls[usize::from(block_index)]
 					.as_ref()
 					.expect("trait impl header is resolved")
-					.self_scope;
+					.type_params;
 				self.resolve_constant_signature(
 					file_id,
 					namespace,
 					const_index,
-					self_scope,
+					scope,
 					*name,
 					ty.as_deref(),
 				)
@@ -1874,9 +1892,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				};
 
 				// Forces the impl's own header — its generic params and,
-				// what this member actually needs, its `Self` frame (bound
-				// to the impl's target type) — before resolving anything
-				// against it. Same reasoning as `TraitFunction`'s force of
+				// what this member actually needs, the target type a `Self`
+				// written here means — before resolving anything against
+				// it. Same reasoning as `TraitFunction`'s force of
 				// its trait, and equally cycle-free: an impl's own header
 				// only ever depends on other items' signatures, never on
 				// one of its own members'.
@@ -1885,17 +1903,17 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					def_id: impl_def_id,
 					requested_at: None,
 				});
-				let self_scope = self.trait_impls[usize::from(block_index)]
+				let scope = self.trait_impls[usize::from(block_index)]
 					.as_ref()
 					.expect(
 						"an impl's own header resolves before any of its members are forced",
 					)
-					.self_scope;
+					.type_params;
 
 				let resolved_ty = self.resolve_assoc_value(
 					file_id,
 					namespace,
-					self_scope,
+					scope,
 					block_index,
 					assoc_type_index,
 					ty,
@@ -2117,28 +2135,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					target,
 					self.impl_dispatch.inherent_target(block_index),
 				);
-				let target_span = target.span();
-				let target_spanned = Spanned {
-					inner: target_type,
-					span: target_span,
-				};
-				let self_scope = self.type_envs.push_frame(
-					Box::new([TypeParam {
-						name: Spanned {
-							inner: ast::Keyword::SelfPascal.symbol(),
-							span: target_span,
-						},
-						ty: target_type,
-					}]),
-					TypeEnvOwner::InherentImpl(block_index),
-					scope,
-				);
-				self.reserve_param_bounds(self_scope);
 				self.inherent_impls[usize::from(block_index)] =
 					Some(InherentImplSignature {
 						type_params: scope,
-						target: target_spanned,
-						self_scope,
+						target: Spanned {
+							inner: target_type,
+							span: target.span(),
+						},
 					});
 				SignatureLocation::InherentImpl(block_index)
 			}
@@ -2151,8 +2154,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 
-				// Forces the impl block's own header — its target type and
-				// `self` frame — before resolving anything against it. Can
+				// Forces the impl block's own header — its generic params and
+				// target type — before resolving anything against it. Can
 				// never close a cycle back through *this* member: the
 				// block's own header only depends on its target path/
 				// generic bounds, never on one of its members' signatures.
@@ -2161,15 +2164,17 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					def_id: impl_def_id,
 					requested_at: None,
 				});
-				let self_scope = self.inherent_impls[usize::from(block_index)]
+				let header = self.inherent_impls[usize::from(block_index)]
 					.as_ref()
-					.expect("inherent impl header is resolved")
-					.self_scope;
+					.expect("inherent impl header is resolved");
+				let (scope, self_type) =
+					(header.type_params, header.target.inner);
 				self.resolve_member_function_signature(
 					file_id,
 					namespace,
 					function_index,
-					self_scope,
+					scope,
+					self_type,
 					signature,
 				)
 			}
@@ -2188,16 +2193,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					def_id: impl_def_id,
 					requested_at: None,
 				});
-				let self_scope = self.inherent_impls[usize::from(block_index)]
+				let scope = self.inherent_impls[usize::from(block_index)]
 					.as_ref()
 					.expect("inherent impl header is resolved")
-					.self_scope;
+					.type_params;
 
 				self.resolve_constant_signature(
 					file_id,
 					namespace,
 					const_index,
-					self_scope,
+					scope,
 					*name,
 					ty.as_deref(),
 				)
@@ -2226,28 +2231,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					target,
 					header.target,
 				);
-				let target_span = target.span();
-				let target_spanned = Spanned {
-					inner: target_type,
-					span: target_span,
-				};
-				let self_scope = self.type_envs.push_frame(
-					Box::new([TypeParam {
-						name: Spanned {
-							inner: ast::Keyword::SelfPascal.symbol(),
-							span: target_span,
-						},
-						ty: target_type,
-					}]),
-					TypeEnvOwner::TraitImpl(block_index),
-					scope,
-				);
-				self.reserve_param_bounds(self_scope);
 				self.trait_impls[usize::from(block_index)] =
 					Some(TraitImplSignature {
 						type_params: scope,
-						target: target_spanned,
-						self_scope,
+						target: Spanned {
+							inner: target_type,
+							span: target.span(),
+						},
 					});
 				// A default this impl inherits means something here that it
 				// does not in the trait, so the impl owns its judgement; a
@@ -2273,7 +2263,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 									},
 									reference: SourceSpan::new(
 										file_id,
-										target_span,
+										target.span(),
 									),
 								},
 							);
@@ -2412,17 +2402,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						inner: member_ty,
 						span: m.inner.span,
 					};
-					// No `Self` frame: a typeset member is a concrete type
-					// by construction (it's the thing being implemented
-					// for), never a context anything else resolves `Self`
-					// against — the synthetic impl has no members of its
-					// own to write a `Self` reference in either (see the
-					// `TypeSetSignature` doc comment).
+					// No frame: a typeset member is a concrete type by
+					// construction (it's the thing being implemented for),
+					// and the synthetic impl has no members of its own to
+					// write a `Self` reference in (see the `TypeSetSignature`
+					// doc comment).
 					self.trait_impls[usize::from(impl_index)] =
 						Some(TraitImplSignature {
 							type_params: TypeEnvIdx::ROOT,
 							target: target_spanned,
-							self_scope: TypeEnvIdx::ROOT,
 						});
 					resolved_members.push(target_spanned);
 				}
@@ -2636,12 +2624,24 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// don't change what the name means: a parameter shadows an
 		// item of the same name with or without them, and takes none.
 		let first = &segments[0];
-		let (current, next) = if let Some((frame, index)) =
-			self.type_envs.resolve(env, first.ident.inner)
-		{
+		let parameter = self
+			.type_envs
+			.resolve(env, first.ident.inner)
+			.map(|(frame, index)| {
+				(
+					Referent::TypeParam { env: frame, index },
+					self.type_envs.params(frame)[index as usize].ty,
+				)
+			})
+			.or_else(|| {
+				(first.ident.inner == Keyword::SelfPascal.symbol())
+					.then(|| self.resolve_impl_self(env))
+					.flatten()
+			});
+		let (current, next) = if let Some((referent, ty)) = parameter {
 			self.resolutions.by_site.insert(
 				(SourceSpan::new(file_id, first.ident.span), Tier::Type),
-				Referent::TypeParam { env: frame, index },
+				referent,
 			);
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
@@ -2662,7 +2662,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					TypeArgsTarget::TypeParam,
 				));
 			}
-			(self.type_envs.params(frame)[index as usize].ty, 1)
+			(ty, 1)
 		} else {
 			// TODO: this probably should be resolve_path instead of walk_path
 			let walk = PathResolver::new(
@@ -5438,47 +5438,6 @@ pub(super) mod tests {
 						reader.subject_facts(item, types, 0).readiness,
 						Readiness::Overflowed
 					);
-				},
-			);
-		}
-
-		#[test]
-		fn self_rebinding_to_an_outer_abstract_parameter_is_not_a_fact_source()
-		{
-			with_pending_signatures(
-				"trait Marker {} func f<T: Marker>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-				|builder| {
-					let def_id = DefId::Function(FunctionIdx::new(0));
-					let _ = builder.ensure_signature(QueryInfo {
-						def_id,
-						requested_at: None,
-					});
-					let parent = builder.functions[0].type_params;
-					let subject = builder.type_envs.params(parent)[0].ty;
-					// Exercise rebinding directly: a bare parameter is not a
-					// legal written impl target, but the arena supports this alias.
-					let scope = builder.type_envs.push_frame(
-						Box::new([TypeParam {
-							name: Spanned {
-								inner: Keyword::SelfPascal.symbol(),
-								span: TextSpan::new(0, 1),
-							},
-							ty: subject,
-						}]),
-						TypeEnvOwner::Function(FunctionIdx::new(0)),
-						parent,
-					);
-					builder.reserve_param_bounds(scope);
-					let (reader, types) = builder.assumptions();
-					let mut facts = reader.scoped_facts(scope, types);
-					assert_eq!(facts.readiness, Readiness::Ready);
-					let fact = facts.next(types).unwrap();
-					assert_eq!(fact.subject, subject);
-					assert!(
-						matches!(fact.kind, AssumptionKind::Trait { trait_index, source: TraitAssumptionSource::Bound(_) }
-						if trait_index == TraitIdx::new(0))
-					);
-					assert!(facts.next(types).is_none());
 				},
 			);
 		}
@@ -9800,7 +9759,7 @@ pub(super) mod tests {
 				case.trait_impl_function_signature("S", "Service", name);
 			assert_eq!(signature.param_types.as_ref(), [header.target.inner]);
 			assert_eq!(signature.return_type, header.target.inner);
-			assert_eq!(signature.type_params, header.self_scope);
+			assert_eq!(signature.type_params, header.type_params);
 		}
 	}
 
@@ -9845,10 +9804,6 @@ pub(super) mod tests {
 		assert_eq!(get.return_type, header.target.inner);
 		assert_eq!(
 			case.context.type_envs.parent(get.type_params),
-			Some(header.self_scope)
-		);
-		assert_eq!(
-			case.context.type_envs.parent(header.self_scope),
 			Some(header.type_params)
 		);
 		let shadow =
@@ -13327,7 +13282,7 @@ pub(super) mod tests {
 			let plain_cx = case.context.functions[plain].type_params;
 			assert_eq!(
 				plain_cx,
-				case.context.inherent_impls[0].as_ref().unwrap().self_scope
+				case.context.inherent_impls[0].as_ref().unwrap().type_params
 			);
 			let free_cx = case.context.functions[free].type_params;
 			assert_eq!(free_cx, TypeEnvIdx::ROOT);
@@ -15072,5 +15027,95 @@ pub(super) mod tests {
 			"the trait bound `Adder: Function` is not satisfied",
 		);
 		assert_eq!(case.normalized_param("callables", 2), TypeIndex::I32);
+	}
+
+	/// `Self` in an impl is not a parameter: it names the impl's target and
+	/// resolves through the frame every impl owns, even a non-generic one.
+	/// A trait's `Self` stays its parameter 0.
+	#[test]
+	fn impl_self_names_the_target_through_the_impls_own_frame() {
+		const SOURCE: &str = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Service { func make() -> Self; }
+			struct Wrap<T>();
+			struct Plain();
+			impl<T> Wrap<T> { func get(self) -> Self {} }
+			impl Plain { func get(self) -> Self {} }
+			impl Service for Plain { func make() -> Self {} }
+		"};
+		test_case!(case = SOURCE);
+		case.diagnostics().assert_none();
+		for (path, impl_index) in [
+			("Wrap", case.inherent_impl_index("Wrap")),
+			("Plain", case.inherent_impl_index("Plain")),
+		] {
+			let header = case.context.inherent_impls[usize::from(impl_index)]
+				.as_ref()
+				.unwrap();
+			assert_ne!(header.type_params, TypeEnvIdx::ROOT, "{path}");
+			let get = case.inherent_function_signature(path, "get");
+			assert_eq!(get.return_type, header.target.inner, "{path}");
+			assert_eq!(get.type_params, header.type_params, "{path}");
+		}
+		let plain = case.context.inherent_impls
+			[usize::from(case.inherent_impl_index("Plain"))]
+		.as_ref()
+		.unwrap();
+		assert!(case.context.type_envs.params(plain.type_params).is_empty());
+		let make =
+			case.trait_impl_function_signature("Plain", "Service", "make");
+		let header = case.context.trait_impls
+			[usize::from(case.trait_impl_index("Plain", "Service"))]
+		.as_ref()
+		.unwrap();
+		assert_eq!(make.return_type, header.target.inner);
+		// Each written `Self`, in source order: the trait's is its parameter,
+		// every impl's names that impl.
+		let referents: Vec<_> = SOURCE
+			.match_indices("Self")
+			.map(|(at, _)| {
+				let start = u32::try_from(at).unwrap();
+				let span = TextSpan::new(start, start + 4);
+				case.context
+					.resolutions
+					.by_site
+					.iter()
+					.find(|((site, tier), _)| {
+						*tier == Tier::Type && site.span == span
+					})
+					.map(|(_, referent)| *referent)
+			})
+			.collect();
+		assert!(matches!(referents[0], Some(Referent::TypeParam { .. })));
+		assert_eq!(
+			referents[1..],
+			[
+				Some(Referent::InherentImplSelf(
+					case.inherent_impl_index("Wrap")
+				)),
+				Some(Referent::InherentImplSelf(
+					case.inherent_impl_index("Plain")
+				)),
+				Some(Referent::TraitImplSelf(
+					case.trait_impl_index("Plain", "Service")
+				)),
+			]
+		);
+	}
+
+	/// An impl's header is where its target is written, so `Self` names
+	/// nothing there yet.
+	#[test]
+	fn self_is_not_available_in_an_impl_header() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Marker {}
+			struct Wrap<T>();
+			impl Marker for Wrap<Self> {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
 }

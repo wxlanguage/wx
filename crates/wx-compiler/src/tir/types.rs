@@ -752,13 +752,11 @@ pub(super) struct Substitution<'a> {
 	pub(super) args: &'a [TypeIndex],
 }
 
-/// One named binding inside a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
-/// interned as `Type::TypeParam { env, param_index }` the moment its frame
-/// is built, or `Self`, bound to whatever it means right here: a trait's own
-/// abstract `TypeParam { env, param_index: 0 }`, or an impl's
-/// already-concrete `target`. Both are just "this name resolves to this
-/// `TypeIndex`" once interning is out of the way — one shape covers both, so
-/// `resolve_name` never needs a separate concrete-vs-abstract case.
+/// One generic parameter of a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
+/// or a trait's or typeset's own `Self` — interned as
+/// `Type::TypeParam { env, param_index }` the moment its frame is built. An
+/// impl's `Self` is not a parameter: it names the impl's target, found
+/// through the impl's frame (`TypeEnvArena::enclosing_impl`).
 ///
 /// No bounds here — a frame is never asked for a param's bounds, and those
 /// are a resolved-signature fact anyway (see `signatures.rs`'s own doc
@@ -783,6 +781,13 @@ pub(super) enum TypeEnvOwner {
 	/// An impl block's own `<T>` frame — has no written name (see `name`).
 	InherentImpl(InherentImplIdx),
 	TraitImpl(TraitImplIdx),
+}
+
+/// The impl a frame chain is inside of: what `Self` there names.
+#[derive(Clone, Copy)]
+pub(super) enum ImplKind {
+	Inherent(InherentImplIdx),
+	Trait(TraitImplIdx),
 }
 
 impl TypeEnvOwner {
@@ -852,8 +857,8 @@ impl TypeEnvOwner {
 /// One frame of the chain of generic-parameter names visible while resolving
 /// one item's own signature — composed parent-first, the way lexical scopes
 /// are: a trait's synthetic single-entry `Self` frame, or an impl's own
-/// `<T>` frame; then, for an impl member, a `Self` frame rebinding it to a
-/// concrete type; then the item's own explicit `<T>`.
+/// `<T>` frame (which every impl has, even an empty one); then the item's
+/// own explicit `<T>`. Every frame declares parameters, and nothing else.
 enum TypeEnv {
 	Root,
 	Frame {
@@ -901,21 +906,6 @@ impl TypeEnvArena {
 		}
 	}
 
-	pub(super) fn push_frame(
-		&mut self,
-		params: Box<[TypeParam]>,
-		owner: TypeEnvOwner,
-		parent: TypeEnvIdx,
-	) -> TypeEnvIdx {
-		let idx = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
-		self.envs.push(TypeEnv::Frame {
-			params,
-			parent,
-			owner,
-		});
-		idx
-	}
-
 	/// Builds a new frame out of `owner`'s own declared parameter names —
 	/// the "insert the identities" step, and *only* that: no bounds (a
 	/// bound can reference a sibling param, so it can only resolve once the
@@ -924,9 +914,7 @@ impl TypeEnvArena {
 	/// module has no vocabulary for, and just as cheaply done over the
 	/// caller's own name list before ever calling this). Covers both a
 	/// fresh `<T, U>` list and a single-entry abstract `Self` frame (trait,
-	/// typeset) — anything that mints new `Type::TypeParam` identities
-	/// rather than rebinding `Self` to an already-concrete type, which
-	/// stays a direct `push_frame` call at its own two sites.
+	/// typeset); it is the only way a frame is made.
 	///
 	/// Interns each name's own `Type::TypeParam` against the frame's id
 	/// before the frame exists, predicted via `next_id` — the id has to be
@@ -983,6 +971,27 @@ impl TypeEnvArena {
 			TypeEnv::Root => None,
 			TypeEnv::Frame { parent, .. } => Some(*parent),
 		}
+	}
+
+	/// The impl owning the nearest impl frame on `env`'s chain, if any.
+	pub(super) fn enclosing_impl(
+		&self,
+		mut env: TypeEnvIdx,
+	) -> Option<ImplKind> {
+		while let TypeEnv::Frame { owner, parent, .. } =
+			&self.envs[usize::from(env)]
+		{
+			match *owner {
+				TypeEnvOwner::InherentImpl(index) => {
+					return Some(ImplKind::Inherent(index));
+				}
+				TypeEnvOwner::TraitImpl(index) => {
+					return Some(ImplKind::Trait(index));
+				}
+				_ => env = *parent,
+			}
+		}
+		None
 	}
 
 	/// Where `name` is declared, walking from `env` towards `Root`: the

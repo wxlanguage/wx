@@ -16,7 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use super::defs::{DefKey, MemberKind, Tier, UseItemIndex};
+use super::defs::{
+	DefKey, InherentImplIdx, MemberKind, Tier, TraitImplIdx, UseItemIndex,
+};
 use super::types::TypeEnvIdx;
 use crate::diagnostics::SourceSpan;
 
@@ -42,8 +44,14 @@ pub(super) enum Referent {
 		definition: DefKey,
 		import: UseItemIndex,
 	},
-	/// A generic parameter or `Self`: its frame and position in it.
+	/// A generic parameter, or a trait's own `Self`: its frame and position
+	/// in it.
 	TypeParam { env: TypeEnvIdx, index: u32 },
+	/// `Self` inside an inherent impl, which names the impl's target and is
+	/// not a parameter of it.
+	InherentImplSelf(InherentImplIdx),
+	/// `Self` inside a trait impl; see `InherentImplSelf`.
+	TraitImplSelf(TraitImplIdx),
 	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
 	Member(MemberKind),
 }
