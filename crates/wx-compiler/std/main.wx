@@ -2139,8 +2139,10 @@ func global_get<G: Global>(g: G) -> G::Value;
 #[intrinsic]
 func global_set<G: Global>(g: G, value: G::Value);
 
+pub trait ValueType {}
+
 pub trait Global {
-    type Value;
+    type Value: ValueType;
 
     func get(self) -> Self::Value {
         global_get(self)

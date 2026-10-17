@@ -6,6 +6,12 @@
 //! constant. Arithmetic follows the operand type exactly, and a result outside
 //! it is an error, not a wrapped value.
 //!
+//! A value is held as a Wasm runtime holds one: a list of Wasm numbers, one
+//! per Wasm value the type occupies, each with the scalar it means. A struct
+//! or tuple is its fields' numbers in declaration order, and a zero-sized
+//! value is the empty list. Nodes are evaluated on a value stack: each pushes
+//! its numbers, and an operator pops its operands.
+//!
 //! A constant's value is a memoized query (`const_value`), and evaluation asks
 //! it on demand: a constant is read when the node naming it is evaluated, so a
 //! branch that is not taken reads nothing. Like an impl member's value
@@ -16,31 +22,39 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{ExprIdx, ExprKind};
+use super::body::{ArgOrder, ExprIdx, ExprKind};
 use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::types::{Type, TypeEnvIdx, TypeIndex};
+use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 
-/// A constant's value. Integers are held exactly, in the range of their type.
-#[derive(Clone, PartialEq)]
+/// A Wasm number, as its bits.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum ConstValue {
-	Int {
-		value: i128,
-		scalar: Scalar,
-	},
-	Float {
-		value: f64,
-		scalar: Scalar,
-	},
-	Bool(bool),
-	Char(char),
-	/// A struct's field values, in declaration order.
-	Struct(Box<[ConstValue]>),
+pub(super) enum Val {
+	I32(u32),
+	I64(u64),
+	F32(u32),
+	F64(u64),
+	V128(u128),
 }
+
+/// One number of a constant's value: a Wasm number and the scalar it means.
+/// A `bool`, `char` or narrow integer is an `I32`; a signed one is held
+/// sign-extended. Built and read only through one constructor and one
+/// `expect_*` reader per scalar, the one place each scalar's holding is
+/// written.
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct ConstScalar {
+	pub(super) val: Val,
+	pub(super) scalar: Scalar,
+}
+
+/// A constant's value: its numbers, in declaration order.
+pub(super) type ConstValue = Box<[ConstScalar]>;
 
 /// Why evaluating a body failed, at the node that failed.
 #[derive(Clone, Copy, PartialEq)]
@@ -93,10 +107,10 @@ pub(super) enum ConstValueState {
 
 impl ConstValueState {
 	/// What a reader of the constant learns, once the state is final.
-	fn answer(&self) -> Option<Result<ConstValue, Unevaluable>> {
+	fn answer(&self) -> Option<Result<&[ConstScalar], Unevaluable>> {
 		match self {
 			Self::Unevaluated | Self::InProgress => None,
-			Self::Evaluated(value) => Some(Ok(value.clone())),
+			Self::Evaluated(value) => Some(Ok(value)),
 			Self::NoValue => Some(Err(Unevaluable::NoValue)),
 			Self::Poisoned | Self::Failed(_) | Self::Cyclic(_) => {
 				Some(Err(Unevaluable::Silent))
@@ -146,16 +160,20 @@ impl TypeContext<'_, '_, '_> {
 	fn const_value(
 		&mut self,
 		const_index: ConstIdx,
-	) -> Result<ConstValue, Unevaluable> {
-		let state = &self.const_values[usize::from(const_index)];
-		if let Some(answer) = state.answer() {
-			return answer;
+	) -> Result<&[ConstScalar], Unevaluable> {
+		match self.const_values[usize::from(const_index)] {
+			ConstValueState::Unevaluated => {}
+			ConstValueState::InProgress => {
+				return Err(Unevaluable::Cycle(self.const_cycle(const_index)));
+			}
+			_ => {
+				return self.const_values[usize::from(const_index)]
+					.answer()
+					.expect("a state past evaluation is final");
+			}
 		}
-		if matches!(state, ConstValueState::InProgress) {
-			return Err(Unevaluable::Cycle(self.const_cycle(const_index)));
-		}
-		let ty = match self.constant_value_type(const_index) {
-			Ok(ty) => ty,
+		let scalars = match self.constant_scalars(const_index) {
+			Ok(scalars) => scalars,
 			Err(state) => return self.settle_constant(const_index, state),
 		};
 		self.ensure_const_body(const_index);
@@ -166,16 +184,22 @@ impl TypeContext<'_, '_, '_> {
 		self.const_values[usize::from(const_index)] =
 			ConstValueState::InProgress;
 		self.const_stack.push(const_index);
-		let evaluated = self.eval(const_index, root);
+		let mut stack = Vec::new();
+		let evaluated = self.eval(const_index, root, &mut stack);
 		self.const_stack.pop();
 
 		let state = match evaluated {
-			Ok(value) if value.scalar() == Scalar::from_type(ty) => {
-				ConstValueState::Evaluated(value)
+			Ok(())
+				if stack
+					.iter()
+					.map(|value| value.scalar)
+					.eq(scalars.iter().copied()) =>
+			{
+				ConstValueState::Evaluated(stack.into_boxed_slice())
 			}
 			// A root of another type is `ERROR` once the checker reports it, so
 			// this is a value the checker accepted in another scalar.
-			Ok(_) => ConstValueState::Poisoned,
+			Ok(()) => ConstValueState::Poisoned,
 			Err(Halt::Own(error)) => ConstValueState::Failed(error),
 			Err(Halt::Silent) => ConstValueState::Poisoned,
 			// The owner keeps the loop; its readers further out derive from it.
@@ -198,19 +222,22 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 		state: ConstValueState,
-	) -> Result<ConstValue, Unevaluable> {
-		let answer = state.answer().expect("a settled state is final");
+	) -> Result<&[ConstScalar], Unevaluable> {
 		self.const_values[usize::from(const_index)] = state;
-		answer
+		self.const_values[usize::from(const_index)]
+			.answer()
+			.expect("a settled state is final")
 	}
 
-	/// Folds one node of `owner`'s body. Each step reads the node by index, so
-	/// no borrow of the body is held while a constant it names is evaluated.
+	/// Folds one node of `owner`'s body onto `stack`: it pushes the node's
+	/// numbers. Each step reads the node by index, so no borrow of the body is
+	/// held while a constant it names is evaluated.
 	fn eval(
 		&mut self,
 		owner: ConstIdx,
 		expr: ExprIdx,
-	) -> Result<ConstValue, Halt> {
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
 		let body = self.const_bodies[usize::from(owner)].as_ref().unwrap();
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
@@ -219,81 +246,111 @@ impl TypeContext<'_, '_, '_> {
 		}
 		let own = |kind| Halt::Own(EvalError { span, kind });
 		match kind {
-			ExprKind::Error => Err(Halt::Silent),
+			ExprKind::Error => return Err(Halt::Silent),
 			ExprKind::Unsupported
 			| ExprKind::MethodCall { .. }
-			| ExprKind::GenericMethodCall { .. } => Err(own(EvalErrorKind::NotConst)),
+			| ExprKind::GenericMethodCall { .. } => {
+				return Err(own(EvalErrorKind::NotConst));
+			}
 			ExprKind::Int(value) => match Scalar::from_type(ty) {
-				Some(scalar) => Ok(ConstValue::Int {
-					value: i128::from(value),
-					scalar,
-				}),
-				None => Err(own(EvalErrorKind::NotConst)),
+				Some(scalar) => {
+					stack.push(literal(value, false, scalar).expect(
+						"the checker keeps a literal in its type's range",
+					))
+				}
+				None => return Err(own(EvalErrorKind::NotConst)),
 			},
 			ExprKind::Float(value) => match Scalar::from_type(ty) {
-				Some(scalar) => Ok(ConstValue::Float { value, scalar }),
-				None => Err(own(EvalErrorKind::NotConst)),
+				Some(Scalar::F32) => stack.push(ConstScalar::f32(value as f32)),
+				Some(Scalar::F64) => stack.push(ConstScalar::f64(value)),
+				_ => return Err(own(EvalErrorKind::NotConst)),
 			},
-			ExprKind::Bool(value) => Ok(ConstValue::Bool(value)),
-			ExprKind::Char(value) => Ok(ConstValue::Char(value)),
+			ExprKind::Bool(value) => stack.push(ConstScalar::bool(value)),
+			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			ExprKind::Const(const_index) => {
-				self.read_constant(const_index, span)
+				self.read_constant(const_index, span, stack)?;
 			}
 			ExprKind::NextDiscriminant(previous) => {
-				let ConstValue::Int { value, scalar } =
-					self.read_constant(previous, span)?
-				else {
-					unreachable!("a variant's value is an integer")
-				};
-				int(value + 1, scalar, Operation::Binary(BinaryOp::Add))
-					.map_err(own)
+				self.read_constant(previous, span, stack)?;
+				let previous = stack.pop().expect("a variant's value");
+				let one = literal(1, false, previous.scalar)
+					.expect("an enum's repr holds one");
+				stack.push(binary(BinaryOp::Add, previous, one).map_err(own)?);
+			}
+			// A negated literal is one literal, so `-128` fits an `i8` although
+			// `128` does not.
+			ExprKind::Unary {
+				op: UnaryOp::InvertSign,
+				operand,
+			} if let ExprKind::Int(value) = body.kind(operand)
+				&& let Some(scalar) = Scalar::from_type(ty) =>
+			{
+				stack.push(
+					literal(value, true, scalar).ok_or(own(
+						EvalErrorKind::Overflow(Operation::Negate),
+					))?,
+				);
 			}
 			ExprKind::Unary { op, operand } => {
-				let operand = self.eval(owner, operand)?;
-				unary(op, operand).map_err(own)
+				self.eval(owner, operand, stack)?;
+				let operand = stack.pop().expect("an operand's value");
+				stack.push(unary(op, operand).map_err(own)?);
 			}
 			ExprKind::Construct {
 				struct_index,
 				args,
 				order,
 			} => {
-				let body =
-					self.const_bodies[usize::from(owner)].as_ref().unwrap();
-				let fields: Vec<_> = (0..args.len())
-					.map(|at| {
-						(body.args(args)[at], body.declared_index(order, at))
-					})
-					.collect();
-				let count = self.struct_field_types(struct_index).len();
+				let count =
+					self.structs[usize::from(struct_index)].field_types.len();
 				// A missing field was reported.
-				if fields.len() != count {
+				if args.len() != count {
 					return Err(Halt::Silent);
 				}
 				// Evaluated in written order, held in declaration order.
-				let mut values = vec![None; count];
-				for (expr, field) in fields {
-					values[usize::from(field)] = Some(self.eval(owner, expr)?);
+				let start = stack.len();
+				let mut fields = Vec::new();
+				for at in 0..count {
+					let body =
+						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let (arg, field) =
+						(body.args(args)[at], body.declared_index(order, at));
+					let field_start = stack.len();
+					self.eval(owner, arg, stack)?;
+					if matches!(order, ArgOrder::Permuted { .. }) {
+						fields.push((
+							usize::from(field),
+							field_start - start..stack.len() - start,
+						));
+					}
 				}
-				Ok(ConstValue::Struct(
-					values.into_iter().map(Option::unwrap).collect(),
-				))
+				if !fields.is_empty() {
+					fields.sort_unstable_by_key(|&(field, _)| field);
+					let written = stack.split_off(start);
+					for (_, range) in fields {
+						stack.extend_from_slice(&written[range]);
+					}
+				}
 			}
 			ExprKind::Binary { op, lhs, rhs } => {
-				let lhs = self.eval(owner, lhs)?;
-				// `&&` and `||` do not evaluate a right side they do not need.
-				match (op, &lhs) {
-					(BinaryOp::And, ConstValue::Bool(false)) => {
-						return Ok(ConstValue::Bool(false));
+				self.eval(owner, lhs, stack)?;
+				// `&&` and `||` do not evaluate a right side they do not need;
+				// otherwise the right side is the answer.
+				if matches!(op, BinaryOp::And | BinaryOp::Or) {
+					let lhs = stack.last().expect("an operand's value");
+					if lhs.expect_bool() == (op == BinaryOp::Or) {
+						return Ok(());
 					}
-					(BinaryOp::Or, ConstValue::Bool(true)) => {
-						return Ok(ConstValue::Bool(true));
-					}
-					_ => {}
+					stack.pop();
+					return self.eval(owner, rhs, stack);
 				}
-				let rhs = self.eval(owner, rhs)?;
-				binary(op, lhs, rhs).map_err(own)
+				self.eval(owner, rhs, stack)?;
+				let rhs = stack.pop().expect("an operand's value");
+				let lhs = stack.pop().expect("an operand's value");
+				stack.push(binary(op, lhs, rhs).map_err(own)?);
 			}
 		}
+		Ok(())
 	}
 
 	/// The value of a constant a node names. One with no compile-time value
@@ -303,16 +360,20 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 		span: TextSpan,
-	) -> Result<ConstValue, Halt> {
-		self.const_value(const_index)
-			.map_err(|failure| match failure {
-				Unevaluable::NoValue => Halt::Own(EvalError {
-					span,
-					kind: EvalErrorKind::NotConst,
-				}),
-				Unevaluable::Silent => Halt::Silent,
-				Unevaluable::Cycle(cycle) => Halt::Cycle(cycle),
-			})
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		match self.const_value(const_index) {
+			Ok(value) => {
+				stack.extend_from_slice(value);
+				Ok(())
+			}
+			Err(Unevaluable::NoValue) => Err(Halt::Own(EvalError {
+				span,
+				kind: EvalErrorKind::NotConst,
+			})),
+			Err(Unevaluable::Silent) => Err(Halt::Silent),
+			Err(Unevaluable::Cycle(cycle)) => Err(Halt::Cycle(cycle)),
+		}
 	}
 
 	/// `const_index` was asked for again while it is evaluated: the loop is
@@ -332,72 +393,100 @@ impl TypeContext<'_, '_, '_> {
 		members.into_boxed_slice()
 	}
 
-	/// The type a constant's value is held in: its declared type, normalized,
-	/// or for a value of an enum, the enum's repr. `Err` is the final state of
-	/// a constant of a type the evaluator holds no values of.
-	fn constant_value_type(
+	/// The scalars a value of the constant's declared type holds, one per
+	/// number. `Err` is the final state of a constant of a type the evaluator
+	/// holds no values of.
+	fn constant_scalars(
 		&mut self,
 		const_index: ConstIdx,
-	) -> Result<TypeIndex, ConstValueState> {
+	) -> Result<Vec<Scalar>, ConstValueState> {
 		let (ty, scope) = self.constant_type(const_index);
-		let mut ty = self.normalize_type_query(scope, ty).unwrap_or(ty);
-		if let Type::Enum { enum_index } = *self.types.resolve(ty) {
-			ty = self.enum_repr(enum_index);
-		}
-		self.check_value_type(ty, &mut Vec::new())?;
-		Ok(ty)
+		let mut scalars = Vec::new();
+		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
+		Ok(scalars)
 	}
 
-	/// Whether the evaluator holds values of the normalized type `ty`: a
-	/// scalar, an enum (in its repr), or a struct that is not generic and
-	/// whose fields it holds. `Err` is the final state of a constant of a
-	/// type it does not: no value, or poisoned when the type, or a field's,
-	/// failed to resolve, which was reported where it is written. A struct
-	/// reached again through `visiting`, the structs being looked through,
-	/// contains itself, which is reported on the struct.
-	fn check_value_type(
+	/// Appends the scalars a value of `ty` holds, normalized in `scope`: a
+	/// scalar's own, an enum's repr, a struct's or tuple's fields in
+	/// declaration order, nothing for a zero-sized type. `Err` is the final
+	/// state of a constant of a type the evaluator holds no values of: no
+	/// value (`!`, an address, a function reference, an abstract type), or
+	/// poisoned when the type, or a field's, failed to resolve, which was
+	/// reported where it is written. A struct reached again through
+	/// `visiting`, the structs being looked through, contains itself, which is
+	/// reported on the struct.
+	fn push_scalars(
 		&mut self,
+		scope: TypeEnvIdx,
 		ty: TypeIndex,
+		out: &mut Vec<Scalar>,
 		visiting: &mut Vec<StructIdx>,
 	) -> Result<(), ConstValueState> {
+		let ty = self.normalize_type_query(scope, ty).unwrap_or(ty);
 		if ty == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
 		}
-		if Scalar::from_type(ty).is_some() {
+		if let Some(scalar) = Scalar::from_type(ty) {
+			out.push(scalar);
 			return Ok(());
 		}
 		match *self.types.resolve(ty) {
+			Type::Function { .. }
+			| Type::Memory { .. }
+			| Type::Global { .. } => Ok(()),
 			Type::Enum { enum_index } => {
-				if self.enum_repr(enum_index) == TypeIndex::ERROR {
-					Err(ConstValueState::Poisoned)
-				} else {
-					Ok(())
-				}
+				let repr = self.enum_repr(enum_index);
+				self.push_scalars(scope, repr, out, visiting)
 			}
-			Type::Struct { struct_index, .. } => {
+			Type::Tuple { elements } => {
+				let mut held = Ok(());
+				for at in 0..self.types.list(elements).len() {
+					let element = self.types.list(elements)[at];
+					held = merge(
+						held,
+						self.push_scalars(scope, element, out, visiting),
+					);
+					if held == Err(ConstValueState::Poisoned) {
+						break;
+					}
+				}
+				held
+			}
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => {
 				if visiting.contains(&struct_index) {
 					return Err(ConstValueState::Poisoned);
 				}
-				if self.structs[usize::from(struct_index)].type_params
-					!= TypeEnvIdx::ROOT
-				{
+				// A generic struct is not constructed yet (`Construct` is
+				// non-generic), so its values could not be written.
+				let env = self.structs[usize::from(struct_index)].type_params;
+				if env != TypeEnvIdx::ROOT {
 					return Err(ConstValueState::NoValue);
 				}
 				visiting.push(struct_index);
+				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				let mut held = Ok(());
-				for field in self.struct_field_types(struct_index).to_vec() {
-					let field = self
-						.normalize_type_query(TypeEnvIdx::ROOT, field)
-						.unwrap_or(field);
-					match self.check_value_type(field, visiting) {
-						Ok(()) => {}
-						// A poisoned field poisons the struct, whatever the other
-						// fields are, so a reader of it is never reported.
-						Err(ConstValueState::Poisoned) => {
-							held = Err(ConstValueState::Poisoned);
-							break;
-						}
-						Err(state) => held = Err(state),
+				let count =
+					self.structs[usize::from(struct_index)].field_types.len();
+				for at in 0..count {
+					let field =
+						self.structs[usize::from(struct_index)].field_types[at];
+					let field = self.types.substitute(
+						field,
+						Substitution {
+							envs: &self.type_envs,
+							env,
+							args: &args,
+						},
+					);
+					held = merge(
+						held,
+						self.push_scalars(scope, field, out, visiting),
+					);
+					if held == Err(ConstValueState::Poisoned) {
+						break;
 					}
 				}
 				visiting.pop();
@@ -416,15 +505,15 @@ impl TypeContext<'_, '_, '_> {
 		let mut values = Vec::new();
 		for variant in u32::from(run.start)..u32::from(run.end) {
 			let variant = ConstIdx::new(variant);
-			if let Ok(ConstValue::Int { value, .. }) = self.const_value(variant)
-			{
+			if let Ok(&[value]) = self.const_value(variant) {
 				values.push((value, variant));
 			}
 		}
-		// Stable, so each set keeps source order; the sets are then reported in
-		// the source order of their first variant.
-		values.sort_by_key(|&(value, _)| value);
-		let mut groups: Vec<&[(i128, ConstIdx)]> = values
+		// Every variant has the repr's scalar, so equal values are equal
+		// numbers. Stable, so each set keeps source order; the sets are then
+		// reported in the source order of their first variant.
+		values.sort_by_key(|&(value, _)| value.val);
+		let mut groups: Vec<&[(ConstScalar, ConstIdx)]> = values
 			.chunk_by(|a, b| a.0 == b.0)
 			.filter(|group| group.len() > 1)
 			.collect();
@@ -538,17 +627,272 @@ impl EvalErrorKind {
 	}
 }
 
-impl ConstValue {
-	/// The scalar the value is held in; `None` for a struct.
-	fn scalar(&self) -> Option<Scalar> {
-		match *self {
-			Self::Int { scalar, .. } | Self::Float { scalar, .. } => {
-				Some(scalar)
-			}
-			Self::Bool(_) => Some(Scalar::Bool),
-			Self::Char(_) => Some(Scalar::Char),
-			Self::Struct(_) => None,
+impl ConstScalar {
+	pub(super) fn u8(value: u8) -> Self {
+		Self {
+			val: Val::I32(u32::from(value)),
+			scalar: Scalar::U8,
 		}
+	}
+
+	pub(super) fn i8(value: i8) -> Self {
+		Self {
+			val: Val::I32(i32::from(value) as u32),
+			scalar: Scalar::I8,
+		}
+	}
+
+	pub(super) fn u16(value: u16) -> Self {
+		Self {
+			val: Val::I32(u32::from(value)),
+			scalar: Scalar::U16,
+		}
+	}
+
+	pub(super) fn i16(value: i16) -> Self {
+		Self {
+			val: Val::I32(i32::from(value) as u32),
+			scalar: Scalar::I16,
+		}
+	}
+
+	pub(super) fn u32(value: u32) -> Self {
+		Self {
+			val: Val::I32(value),
+			scalar: Scalar::U32,
+		}
+	}
+
+	pub(super) fn i32(value: i32) -> Self {
+		Self {
+			val: Val::I32(value as u32),
+			scalar: Scalar::I32,
+		}
+	}
+
+	pub(super) fn u64(value: u64) -> Self {
+		Self {
+			val: Val::I64(value),
+			scalar: Scalar::U64,
+		}
+	}
+
+	pub(super) fn i64(value: i64) -> Self {
+		Self {
+			val: Val::I64(value as u64),
+			scalar: Scalar::I64,
+		}
+	}
+
+	pub(super) fn f32(value: f32) -> Self {
+		Self {
+			val: Val::F32(value.to_bits()),
+			scalar: Scalar::F32,
+		}
+	}
+
+	pub(super) fn f64(value: f64) -> Self {
+		Self {
+			val: Val::F64(value.to_bits()),
+			scalar: Scalar::F64,
+		}
+	}
+
+	pub(super) fn bool(value: bool) -> Self {
+		Self {
+			val: Val::I32(u32::from(value)),
+			scalar: Scalar::Bool,
+		}
+	}
+
+	pub(super) fn char(value: char) -> Self {
+		Self {
+			val: Val::I32(u32::from(value)),
+			scalar: Scalar::Char,
+		}
+	}
+
+	pub(super) fn expect_u8(self) -> u8 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::U8,
+			} => bits as u8,
+			_ => unreachable!("not a `u8`"),
+		}
+	}
+
+	pub(super) fn expect_i8(self) -> i8 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::I8,
+			} => bits as i8,
+			_ => unreachable!("not an `i8`"),
+		}
+	}
+
+	pub(super) fn expect_u16(self) -> u16 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::U16,
+			} => bits as u16,
+			_ => unreachable!("not a `u16`"),
+		}
+	}
+
+	pub(super) fn expect_i16(self) -> i16 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::I16,
+			} => bits as i16,
+			_ => unreachable!("not an `i16`"),
+		}
+	}
+
+	pub(super) fn expect_u32(self) -> u32 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::U32,
+			} => bits,
+			_ => unreachable!("not a `u32`"),
+		}
+	}
+
+	pub(super) fn expect_i32(self) -> i32 {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::I32,
+			} => bits as i32,
+			_ => unreachable!("not an `i32`"),
+		}
+	}
+
+	pub(super) fn expect_u64(self) -> u64 {
+		match self {
+			Self {
+				val: Val::I64(bits),
+				scalar: Scalar::U64,
+			} => bits,
+			_ => unreachable!("not a `u64`"),
+		}
+	}
+
+	pub(super) fn expect_i64(self) -> i64 {
+		match self {
+			Self {
+				val: Val::I64(bits),
+				scalar: Scalar::I64,
+			} => bits as i64,
+			_ => unreachable!("not an `i64`"),
+		}
+	}
+
+	pub(super) fn expect_f32(self) -> f32 {
+		match self {
+			Self {
+				val: Val::F32(bits),
+				scalar: Scalar::F32,
+			} => f32::from_bits(bits),
+			_ => unreachable!("not an `f32`"),
+		}
+	}
+
+	pub(super) fn expect_f64(self) -> f64 {
+		match self {
+			Self {
+				val: Val::F64(bits),
+				scalar: Scalar::F64,
+			} => f64::from_bits(bits),
+			_ => unreachable!("not an `f64`"),
+		}
+	}
+
+	pub(super) fn expect_bool(self) -> bool {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::Bool,
+			} => bits != 0,
+			_ => unreachable!("not a `bool`"),
+		}
+	}
+
+	pub(super) fn expect_char(self) -> char {
+		match self {
+			Self {
+				val: Val::I32(bits),
+				scalar: Scalar::Char,
+			} => char::from_u32(bits).expect("a `char` holds a scalar value"),
+			_ => unreachable!("not a `char`"),
+		}
+	}
+}
+
+impl std::fmt::Display for ConstScalar {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.scalar {
+			Scalar::U8 => write!(f, "{}", self.expect_u8()),
+			Scalar::I8 => write!(f, "{}", self.expect_i8()),
+			Scalar::U16 => write!(f, "{}", self.expect_u16()),
+			Scalar::I16 => write!(f, "{}", self.expect_i16()),
+			Scalar::U32 => write!(f, "{}", self.expect_u32()),
+			Scalar::I32 => write!(f, "{}", self.expect_i32()),
+			Scalar::U64 => write!(f, "{}", self.expect_u64()),
+			Scalar::I64 => write!(f, "{}", self.expect_i64()),
+			Scalar::F32 => write!(f, "{}", self.expect_f32()),
+			Scalar::F64 => write!(f, "{}", self.expect_f64()),
+			Scalar::Bool => write!(f, "{}", self.expect_bool()),
+			Scalar::Char => write!(f, "{:?}", self.expect_char()),
+		}
+	}
+}
+
+/// The integer literal `value` as `scalar`, negated when it is written
+/// `-value`; `None` when it does not fit.
+fn literal(value: u64, negated: bool, scalar: Scalar) -> Option<ConstScalar> {
+	if !scalar.is_signed() {
+		if negated && value != 0 {
+			return None;
+		}
+		return Some(match scalar {
+			Scalar::U8 => ConstScalar::u8(u8::try_from(value).ok()?),
+			Scalar::U16 => ConstScalar::u16(u16::try_from(value).ok()?),
+			Scalar::U32 => ConstScalar::u32(u32::try_from(value).ok()?),
+			Scalar::U64 => ConstScalar::u64(value),
+			_ => unreachable!("an integer literal has an integer type"),
+		});
+	}
+	let value = if negated {
+		0i64.checked_sub_unsigned(value)?
+	} else {
+		i64::try_from(value).ok()?
+	};
+	Some(match scalar {
+		Scalar::I8 => ConstScalar::i8(i8::try_from(value).ok()?),
+		Scalar::I16 => ConstScalar::i16(i16::try_from(value).ok()?),
+		Scalar::I32 => ConstScalar::i32(i32::try_from(value).ok()?),
+		Scalar::I64 => ConstScalar::i64(value),
+		_ => unreachable!("an integer literal has an integer type"),
+	})
+}
+
+/// The state of a value walked so far and of its next part: a poisoned part
+/// poisons the whole, whatever the other parts are, so a reader of it is
+/// never reported.
+fn merge(
+	held: Result<(), ConstValueState>,
+	part: Result<(), ConstValueState>,
+) -> Result<(), ConstValueState> {
+	match (held, part) {
+		(Err(ConstValueState::Poisoned), _)
+		| (_, Err(ConstValueState::Poisoned)) => Err(ConstValueState::Poisoned),
+		(Err(state), _) | (Ok(()), Err(state)) => Err(state),
+		(Ok(()), Ok(())) => Ok(()),
 	}
 }
 
@@ -570,134 +914,296 @@ impl Operation {
 
 fn unary(
 	op: UnaryOp,
-	operand: ConstValue,
-) -> Result<ConstValue, EvalErrorKind> {
-	Ok(match (op, operand) {
-		(UnaryOp::InvertSign, ConstValue::Int { value, scalar }) => {
-			int(-value, scalar, Operation::Negate)?
+	operand: ConstScalar,
+) -> Result<ConstScalar, EvalErrorKind> {
+	match (op, operand.scalar) {
+		(UnaryOp::InvertSign, Scalar::F32) => {
+			Ok(ConstScalar::f32(-operand.expect_f32()))
 		}
-		(UnaryOp::InvertSign, ConstValue::Float { value, scalar }) => {
-			ConstValue::Float {
-				value: -value,
-				scalar,
-			}
+		(UnaryOp::InvertSign, Scalar::F64) => {
+			Ok(ConstScalar::f64(-operand.expect_f64()))
 		}
-		(UnaryOp::BitNot, ConstValue::Int { value, scalar }) => {
-			ConstValue::Int {
-				value: from_bits(!to_bits(value, scalar), scalar),
-				scalar,
-			}
+		(UnaryOp::Not, _) => Ok(ConstScalar::bool(!operand.expect_bool())),
+		(UnaryOp::InvertSign | UnaryOp::BitNot, _) => {
+			integer_unary(op, operand)
+				.ok_or(EvalErrorKind::Overflow(Operation::Negate))
 		}
-		(UnaryOp::Not, ConstValue::Bool(value)) => ConstValue::Bool(!value),
-		_ => unreachable!(
-			"the checker builds builtin operators on their scalars"
-		),
+	}
+}
+
+/// `-a` or `^a` on an integer, at its own width: `None` when the negation
+/// overflows (`-MIN`, or a nonzero unsigned value).
+fn integer_unary(op: UnaryOp, operand: ConstScalar) -> Option<ConstScalar> {
+	let negate = op == UnaryOp::InvertSign;
+	Some(match operand.scalar {
+		Scalar::U8 => {
+			let a = operand.expect_u8();
+			ConstScalar::u8(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::I8 => {
+			let a = operand.expect_i8();
+			ConstScalar::i8(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::U16 => {
+			let a = operand.expect_u16();
+			ConstScalar::u16(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::I16 => {
+			let a = operand.expect_i16();
+			ConstScalar::i16(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::U32 => {
+			let a = operand.expect_u32();
+			ConstScalar::u32(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::I32 => {
+			let a = operand.expect_i32();
+			ConstScalar::i32(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::U64 => {
+			let a = operand.expect_u64();
+			ConstScalar::u64(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::I64 => {
+			let a = operand.expect_i64();
+			ConstScalar::i64(if negate { a.checked_neg()? } else { !a })
+		}
+		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
+			unreachable!(
+				"the checker builds builtin operators on their scalars"
+			)
+		}
 	})
 }
 
 fn binary(
 	op: BinaryOp,
-	lhs: ConstValue,
-	rhs: ConstValue,
-) -> Result<ConstValue, EvalErrorKind> {
-	use ConstValue::{Bool, Float, Int};
-	if let Some(ordering) = compare(op, &lhs, &rhs) {
-		return Ok(Bool(ordering));
+	lhs: ConstScalar,
+	rhs: ConstScalar,
+) -> Result<ConstScalar, EvalErrorKind> {
+	if let Some(ordering) = compare(op, lhs, rhs) {
+		return Ok(ConstScalar::bool(ordering));
 	}
-	Ok(match (lhs, rhs) {
-		(Int { value: a, scalar }, Int { value: b, .. }) => {
-			let overflow = Operation::Binary(op);
-			match op {
-				BinaryOp::Add => int(a + b, scalar, overflow)?,
-				BinaryOp::Sub => int(a - b, scalar, overflow)?,
-				BinaryOp::Mul => int(a * b, scalar, overflow)?,
-				BinaryOp::Div if b == 0 => {
-					return Err(EvalErrorKind::DivisionByZero);
-				}
-				// Truncating, as wasm's `div_s`; `MIN / -1` overflows.
-				BinaryOp::Div => int(a / b, scalar, overflow)?,
-				BinaryOp::Rem if b == 0 => {
-					return Err(EvalErrorKind::RemainderByZero);
-				}
-				// The sign of the dividend, as wasm's `rem_s`.
-				BinaryOp::Rem => int(a % b, scalar, overflow)?,
-				BinaryOp::BitAnd => Int {
-					value: a & b,
-					scalar,
-				},
-				BinaryOp::BitOr => Int {
-					value: a | b,
-					scalar,
-				},
-				BinaryOp::BitXor => Int {
-					value: a ^ b,
-					scalar,
-				},
-				BinaryOp::LeftShift | BinaryOp::RightShift => {
-					if b < 0 || b >= i128::from(scalar.bits()) {
-						return Err(EvalErrorKind::Overflow(overflow));
-					}
-					// Bits shifted past the width are dropped, as at runtime;
-					// a right shift is arithmetic on a signed type.
-					let value = if op == BinaryOp::LeftShift {
-						from_bits(to_bits(a, scalar) << b, scalar)
-					} else {
-						a >> b
-					};
-					Int { value, scalar }
-				}
-				_ => unreachable!(
-					"the checker builds builtin operators on their scalars"
-				),
-			}
-		}
-		(Float { value: a, scalar }, Float { value: b, .. }) => {
-			let value = match op {
+	match lhs.scalar {
+		Scalar::F32 => {
+			let (a, b) = (lhs.expect_f32(), rhs.expect_f32());
+			Ok(ConstScalar::f32(match op {
 				BinaryOp::Add => a + b,
 				BinaryOp::Sub => a - b,
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
 				BinaryOp::Rem => a % b,
 				_ => unreachable!(),
-			};
-			// An `f32` operation rounds the exact result once. A double holds
-			// the result of `+ - * /` on two `f32`s closely enough that rounding
-			// it to `f32` agrees, and `%` is exact in both.
-			let value = if scalar == Scalar::F32 {
-				f64::from(value as f32)
-			} else {
-				value
-			};
-			Float { value, scalar }
+			}))
 		}
-		(Bool(a), Bool(b)) => Bool(match op {
-			BinaryOp::BitAnd | BinaryOp::And => a & b,
-			BinaryOp::BitOr | BinaryOp::Or => a | b,
-			BinaryOp::BitXor => a ^ b,
-			_ => unreachable!(),
-		}),
-		_ => unreachable!(
-			"the checker builds builtin operators on their scalars"
-		),
+		Scalar::F64 => {
+			let (a, b) = (lhs.expect_f64(), rhs.expect_f64());
+			Ok(ConstScalar::f64(match op {
+				BinaryOp::Add => a + b,
+				BinaryOp::Sub => a - b,
+				BinaryOp::Mul => a * b,
+				BinaryOp::Div => a / b,
+				BinaryOp::Rem => a % b,
+				_ => unreachable!(),
+			}))
+		}
+		Scalar::Bool => {
+			let (a, b) = (lhs.expect_bool(), rhs.expect_bool());
+			Ok(ConstScalar::bool(match op {
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				_ => unreachable!(),
+			}))
+		}
+		_ => {
+			// A checked division answers `None` for a zero divisor too.
+			let zero = Some(rhs) == literal(0, false, rhs.scalar);
+			match op {
+				BinaryOp::Div if zero => Err(EvalErrorKind::DivisionByZero),
+				BinaryOp::Rem if zero => Err(EvalErrorKind::RemainderByZero),
+				_ => integer_binary(op, lhs, rhs)
+					.ok_or(EvalErrorKind::Overflow(Operation::Binary(op))),
+			}
+		}
+	}
+}
+
+/// `a op b` on two integers of one scalar, at its own width: `None` when the
+/// result is outside it, or a shift amount is outside its width. Division
+/// truncates and `MIN / -1` overflows, as wasm's `div_s`; a remainder has
+/// the dividend's sign and never overflows, as wasm's `rem_s`. A shift drops
+/// the bits shifted past the width, and a right shift of a signed type is
+/// arithmetic.
+fn integer_binary(
+	op: BinaryOp,
+	lhs: ConstScalar,
+	rhs: ConstScalar,
+) -> Option<ConstScalar> {
+	Some(match lhs.scalar {
+		Scalar::U8 => {
+			let (a, b) = (lhs.expect_u8(), rhs.expect_u8());
+			ConstScalar::u8(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::from(b))?,
+				BinaryOp::RightShift => a.checked_shr(u32::from(b))?,
+				_ => unreachable!(),
+			})
+		}
+		Scalar::I8 => {
+			let (a, b) = (lhs.expect_i8(), rhs.expect_i8());
+			ConstScalar::i8(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::try_from(b).ok()?)?,
+				BinaryOp::RightShift => {
+					a.checked_shr(u32::try_from(b).ok()?)?
+				}
+				_ => unreachable!(),
+			})
+		}
+		Scalar::U16 => {
+			let (a, b) = (lhs.expect_u16(), rhs.expect_u16());
+			ConstScalar::u16(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::from(b))?,
+				BinaryOp::RightShift => a.checked_shr(u32::from(b))?,
+				_ => unreachable!(),
+			})
+		}
+		Scalar::I16 => {
+			let (a, b) = (lhs.expect_i16(), rhs.expect_i16());
+			ConstScalar::i16(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::try_from(b).ok()?)?,
+				BinaryOp::RightShift => {
+					a.checked_shr(u32::try_from(b).ok()?)?
+				}
+				_ => unreachable!(),
+			})
+		}
+		Scalar::U32 => {
+			let (a, b) = (lhs.expect_u32(), rhs.expect_u32());
+			ConstScalar::u32(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(b)?,
+				BinaryOp::RightShift => a.checked_shr(b)?,
+				_ => unreachable!(),
+			})
+		}
+		Scalar::I32 => {
+			let (a, b) = (lhs.expect_i32(), rhs.expect_i32());
+			ConstScalar::i32(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::try_from(b).ok()?)?,
+				BinaryOp::RightShift => {
+					a.checked_shr(u32::try_from(b).ok()?)?
+				}
+				_ => unreachable!(),
+			})
+		}
+		Scalar::U64 => {
+			let (a, b) = (lhs.expect_u64(), rhs.expect_u64());
+			ConstScalar::u64(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::try_from(b).ok()?)?,
+				BinaryOp::RightShift => {
+					a.checked_shr(u32::try_from(b).ok()?)?
+				}
+				_ => unreachable!(),
+			})
+		}
+		Scalar::I64 => {
+			let (a, b) = (lhs.expect_i64(), rhs.expect_i64());
+			ConstScalar::i64(match op {
+				BinaryOp::Add => a.checked_add(b)?,
+				BinaryOp::Sub => a.checked_sub(b)?,
+				BinaryOp::Mul => a.checked_mul(b)?,
+				BinaryOp::Div => a.checked_div(b)?,
+				BinaryOp::Rem => a.wrapping_rem(b),
+				BinaryOp::BitAnd => a & b,
+				BinaryOp::BitOr => a | b,
+				BinaryOp::BitXor => a ^ b,
+				BinaryOp::LeftShift => a.checked_shl(u32::try_from(b).ok()?)?,
+				BinaryOp::RightShift => {
+					a.checked_shr(u32::try_from(b).ok()?)?
+				}
+				_ => unreachable!(),
+			})
+		}
+		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
+			unreachable!(
+				"the checker builds builtin operators on their scalars"
+			)
+		}
 	})
 }
 
 /// The answer of a comparison, `None` for any other operator.
-fn compare(op: BinaryOp, lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
+fn compare(op: BinaryOp, lhs: ConstScalar, rhs: ConstScalar) -> Option<bool> {
 	use std::cmp::Ordering;
-	let ordering = match (lhs, rhs) {
-		(
-			ConstValue::Int { value: a, .. },
-			ConstValue::Int { value: b, .. },
-		) => a.partial_cmp(b),
+	let ordering = match lhs.scalar {
+		Scalar::U8 => lhs.expect_u8().partial_cmp(&rhs.expect_u8()),
+		Scalar::I8 => lhs.expect_i8().partial_cmp(&rhs.expect_i8()),
+		Scalar::U16 => lhs.expect_u16().partial_cmp(&rhs.expect_u16()),
+		Scalar::I16 => lhs.expect_i16().partial_cmp(&rhs.expect_i16()),
+		Scalar::U32 => lhs.expect_u32().partial_cmp(&rhs.expect_u32()),
+		Scalar::I32 => lhs.expect_i32().partial_cmp(&rhs.expect_i32()),
+		Scalar::U64 => lhs.expect_u64().partial_cmp(&rhs.expect_u64()),
+		Scalar::I64 => lhs.expect_i64().partial_cmp(&rhs.expect_i64()),
 		// IEEE: any comparison with NaN is false, except `!=`.
-		(
-			ConstValue::Float { value: a, .. },
-			ConstValue::Float { value: b, .. },
-		) => a.partial_cmp(b),
-		(ConstValue::Bool(a), ConstValue::Bool(b)) => a.partial_cmp(b),
-		(ConstValue::Char(a), ConstValue::Char(b)) => a.partial_cmp(b),
-		_ => None,
+		Scalar::F32 => lhs.expect_f32().partial_cmp(&rhs.expect_f32()),
+		Scalar::F64 => lhs.expect_f64().partial_cmp(&rhs.expect_f64()),
+		Scalar::Bool => lhs.expect_bool().partial_cmp(&rhs.expect_bool()),
+		Scalar::Char => lhs.expect_char().partial_cmp(&rhs.expect_char()),
 	};
 	Some(match op {
 		BinaryOp::Eq => ordering == Some(Ordering::Equal),
@@ -712,38 +1218,4 @@ fn compare(op: BinaryOp, lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
 		}
 		_ => return None,
 	})
-}
-
-/// `value` if it is in `scalar`'s range, an overflow of `operation` otherwise.
-fn int(
-	value: i128,
-	scalar: Scalar,
-	operation: Operation,
-) -> Result<ConstValue, EvalErrorKind> {
-	let bits = scalar.bits();
-	let (min, max) = if scalar.is_signed() {
-		(-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-	} else {
-		(0, (1i128 << bits) - 1)
-	};
-	if value < min || value > max {
-		return Err(EvalErrorKind::Overflow(operation));
-	}
-	Ok(ConstValue::Int { value, scalar })
-}
-
-/// The two's-complement bit pattern of an in-range value, at `scalar`'s width.
-fn to_bits(value: i128, scalar: Scalar) -> u128 {
-	(value as u128) & ((1u128 << scalar.bits()) - 1)
-}
-
-/// The value a bit pattern means at `scalar`'s width and signedness.
-fn from_bits(bits: u128, scalar: Scalar) -> i128 {
-	let width = scalar.bits();
-	let bits = bits & ((1u128 << width) - 1);
-	if scalar.is_signed() && bits >> (width - 1) == 1 {
-		bits as i128 - (1i128 << width)
-	} else {
-		bits as i128
-	}
 }

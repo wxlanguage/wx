@@ -665,6 +665,7 @@ pub struct IntrinsicDefs {
 	pub global_mut: Option<TraitIdx>,
 	pub call: Option<TraitIdx>,
 	pub function: Option<TraitIdx>,
+	pub value_type: Option<TraitIdx>,
 }
 
 impl IntrinsicDefs {
@@ -715,6 +716,7 @@ impl IntrinsicDefs {
 			"GlobalMut" => &mut self.global_mut,
 			"Call" => &mut self.call,
 			"Function" => &mut self.function,
+			"ValueType" => &mut self.value_type,
 			_ => return None,
 		})
 	}

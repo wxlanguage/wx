@@ -25,8 +25,8 @@ use super::defs::{
 use super::impls::{ImplDispatch, ImplTarget};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
-	AssocTypeSignature, InherentImplSignature, ParamBounds, TraitImplSignature,
-	TraitSignature, TypeContext,
+	AssocTypeSignature, EnumSignature, InherentImplSignature, ParamBounds,
+	StructSignature, TraitImplSignature, TraitSignature, TypeContext,
 };
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
@@ -69,6 +69,30 @@ pub(super) enum Unsatisfied {
 		expected: TypeIndex,
 		source: BindingRef,
 	},
+}
+
+/// One Wasm value type (`valtype`).
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum ValType {
+	I32,
+	I64,
+	F32,
+	F64,
+	V128,
+	FuncRef,
+	ExternRef,
+}
+
+/// One value in a type's layout (`Solver::value_layout`).
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum LayoutValue {
+	Known(ValType),
+	/// One value whose kind its instantiation decides: a type parameter or
+	/// a projection that does not reduce, assumed `ValueType`, or an address
+	/// into a memory not known yet.
+	Abstract(TypeIndex),
 }
 
 /// `ty`, a projection path over `root`, with `root` replaced by `onto`.
@@ -620,6 +644,8 @@ pub(super) struct SolverView<'a> {
 	pub(super) trait_impls: &'a [Option<TraitImplSignature>],
 	pub(super) inherent_impls: &'a [Option<InherentImplSignature>],
 	pub(super) assoc_types: &'a [Option<AssocTypeSignature>],
+	pub(super) structs: &'a [StructSignature],
+	pub(super) enums: &'a [EnumSignature],
 	pub(super) param_bounds: &'a [Box<[ParamBounds]>],
 	pub(super) clauses: &'a ClauseArena,
 	pub(super) type_envs: &'a TypeEnvArena,
@@ -1385,6 +1411,14 @@ impl Solver {
 		if matches!(view.types.resolve(receiver), Type::Error | Type::Infer) {
 			return Err(SolverError::Poisoned);
 		}
+		// A value type is one Wasm value, whatever impls exist.
+		if Some(required_trait) == view.defs.intrinsics.value_type {
+			let layout =
+				self.value_layout(view, assumption_context, receiver)?;
+			return Ok(layout
+				.is_some_and(|layout| layout.len() == 1)
+				.then_some(TraitImplLookup::Builtin));
+		}
 		// Only an abstract type takes a trait from assumptions. A type an impl
 		// can target has the trait exactly when its impl says so: there is one
 		// impl per trait and constructor, so a local assumption cannot make it
@@ -1442,6 +1476,206 @@ impl Solver {
 			Assumption::Unproven => Ok(None),
 			Assumption::Pending => Err(SolverError::Pending),
 		}
+	}
+
+	/// The Wasm values a value of `ty` occupies, as `ValueType` judges it:
+	/// fields in declaration order. `None` when some part of it is abstract
+	/// and not assumed `ValueType`, so its values are unknown.
+	pub(super) fn value_layout(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+	) -> Result<Option<Box<[LayoutValue]>>, SolverError> {
+		let mut layout = Vec::new();
+		let known =
+			self.push_layout(view, assumption_context, ty, &mut layout, 0)?;
+		Ok(known.then(|| layout.into_boxed_slice()))
+	}
+
+	/// Appends `ty`'s values to `out`; `false` when some part of it is
+	/// abstract and not assumed `ValueType`.
+	fn push_layout(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		out: &mut Vec<LayoutValue>,
+		depth: usize,
+	) -> Result<bool, SolverError> {
+		if depth > self.state.recursion_budget {
+			return Err(SolverError::Overflow);
+		}
+		let ty = self.normalize_head_query(view, assumption_context, ty)?;
+		let known = match *view.types.resolve(ty) {
+			Type::Error | Type::Infer | Type::Integer | Type::Float => {
+				return Err(SolverError::Poisoned);
+			}
+			Type::Never
+			| Type::Function { .. }
+			| Type::Memory { .. }
+			| Type::Global { .. } => true,
+			Type::U8
+			| Type::I8
+			| Type::U16
+			| Type::I16
+			| Type::U32
+			| Type::I32
+			| Type::Bool
+			| Type::Char => {
+				out.push(LayoutValue::Known(ValType::I32));
+				true
+			}
+			Type::U64 | Type::I64 => {
+				out.push(LayoutValue::Known(ValType::I64));
+				true
+			}
+			Type::F32 => {
+				out.push(LayoutValue::Known(ValType::F32));
+				true
+			}
+			Type::F64 => {
+				out.push(LayoutValue::Known(ValType::F64));
+				true
+			}
+			Type::FunctionRef { .. } => {
+				out.push(LayoutValue::Known(ValType::FuncRef));
+				true
+			}
+			Type::Enum { enum_index } => {
+				let repr = view.enums[usize::from(enum_index)].repr;
+				self.push_layout(
+					view,
+					assumption_context,
+					repr,
+					out,
+					depth + 1,
+				)?
+			}
+			// An address, as wide as its memory's `Size`.
+			Type::Pointer { memory, .. } | Type::Array { memory, .. } => self
+				.push_address(
+				view,
+				assumption_context,
+				ty,
+				memory,
+				out,
+				depth,
+			)?,
+			// An address and a length, both as wide as the memory's `Size`.
+			Type::Slice { memory, .. } => {
+				self.push_address(
+					view,
+					assumption_context,
+					ty,
+					memory,
+					out,
+					depth,
+				)? && self.push_address(
+					view,
+					assumption_context,
+					ty,
+					memory,
+					out,
+					depth,
+				)?
+			}
+			Type::Tuple { elements } => {
+				let elements: Box<[TypeIndex]> =
+					view.types.list(elements).into();
+				let mut known = true;
+				for element in elements {
+					known &= self.push_layout(
+						view,
+						assumption_context,
+						element,
+						out,
+						depth + 1,
+					)?;
+				}
+				known
+			}
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => {
+				let signature = &view.structs[usize::from(struct_index)];
+				let (env, fields) =
+					(signature.type_params, &*signature.field_types);
+				let args: Box<[TypeIndex]> = view.types.list(type_args).into();
+				let mut known = true;
+				for &field in fields {
+					let field = view.types.substitute(
+						field,
+						Substitution {
+							envs: view.type_envs,
+							env,
+							args: &args,
+						},
+					);
+					known &= self.push_layout(
+						view,
+						assumption_context,
+						field,
+						out,
+						depth + 1,
+					)?;
+				}
+				known
+			}
+			Type::TypeParam { .. }
+			| Type::AssociatedType { .. }
+			| Type::AssocTypeProjection { .. } => {
+				let value_type = view
+					.defs
+					.intrinsics
+					.value_type
+					.expect("only `ValueType` asks for a layout");
+				match self.check_assumed_trait(
+					view,
+					assumption_context,
+					ty,
+					value_type,
+				)? {
+					Assumption::Holds => {
+						out.push(LayoutValue::Abstract(ty));
+						true
+					}
+					Assumption::Unproven => false,
+					Assumption::Pending => return Err(SolverError::Pending),
+				}
+			}
+		};
+		Ok(known)
+	}
+
+	/// Appends one address into `memory`, the layout of its `Size`. An
+	/// address into a memory not known yet is still one value: `pointer`,
+	/// abstract.
+	fn push_address(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		pointer: TypeIndex,
+		memory: TypeIndex,
+		out: &mut Vec<LayoutValue>,
+		depth: usize,
+	) -> Result<bool, SolverError> {
+		let memory =
+			self.normalize_head_query(view, assumption_context, memory)?;
+		let Type::Memory { memory_index } = *view.types.resolve(memory) else {
+			out.push(LayoutValue::Abstract(pointer));
+			return Ok(true);
+		};
+		let size =
+			view.defs.memories[usize::from(memory_index)].size_assoc_type_index;
+		let Some(size) = view.assoc_types[usize::from(size)]
+			.as_ref()
+			.and_then(|signature| signature.value)
+		else {
+			return Err(SolverError::Pending);
+		};
+		self.push_layout(view, assumption_context, size, out, depth + 1)
 	}
 
 	/// Whether the facts in scope prove `ty: required`. Comparison reduces
@@ -2009,6 +2243,8 @@ impl TypeContext<'_, '_, '_> {
 				trait_impls: &self.trait_impls,
 				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
+				structs: &self.structs,
+				enums: &self.enums,
 				param_bounds: &self.param_bounds,
 				clauses: &self.clauses,
 				type_envs: &self.type_envs,
@@ -2069,6 +2305,16 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<Assumption, SolverError> {
 		let (solver, mut view) = self.solver_and_view();
 		solver.check_assumed_trait(&mut view, assumption_context, ty, required)
+	}
+
+	#[cfg(test)]
+	pub(super) fn value_layout(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+	) -> Result<Option<Box<[LayoutValue]>>, SolverError> {
+		let (solver, mut view) = self.solver_and_view();
+		solver.value_layout(&mut view, assumption_context, ty)
 	}
 
 	pub(super) fn match_impl_target_and_bounds(

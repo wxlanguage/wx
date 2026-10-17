@@ -373,6 +373,19 @@ conflict is reported when the clauses are built, once, and not again by a
 declaration that inherits both values. The migration ran with a debug-only
 check that the clauses described what the trees did, then deleted the trees.
 
+`ValueType` (2026-10-17): std's `trait ValueType {}` holds for a type whose
+values are exactly one Wasm value, and `Global::Value` requires it, checked
+like `Memory::Size` (`resolve_global_signature` records the bound). No impl
+provides it: `find_trait_impl_query` answers it from `Solver::value_layout`,
+the receiver's values in declaration order (`LayoutValue::Known(ValType)`),
+as `TraitImplLookup::Builtin`. A parameter or a projection that does not
+reduce is one `LayoutValue::Abstract` value when assumed `ValueType`, so
+`Wrap<T>` holds under `T: ValueType`, and an instantiation is proved where it
+is used; an address into a memory not known yet is one abstract value too.
+The layout is the type checker's alone; MIR lays types out itself. A
+hand-written `impl ValueType` is not rejected yet; that comes with the other
+builtin traits.
+
 ## Invariants
 
 - Order: construction, then check pass, then bodies. Construction-time code does

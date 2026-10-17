@@ -145,7 +145,7 @@ pub struct FunctionSignature {
 pub struct StructSignature {
 	/// See `TypeAliasSignature::type_params`.
 	pub(super) type_params: TypeEnvIdx,
-	field_types: Box<[TypeIndex]>,
+	pub(super) field_types: Box<[TypeIndex]>,
 }
 
 /// The repr every variant's value is held in. A variant is a constant
@@ -154,7 +154,7 @@ pub struct StructSignature {
 /// a non-integer type — either way already diagnosed once, here, when that
 /// happened.
 pub struct EnumSignature {
-	repr: TypeIndex,
+	pub(super) repr: TypeIndex,
 }
 
 /// Resolved member types only — identity (the backing trait, the
@@ -293,6 +293,8 @@ impl TypeContext<'_, '_, '_> {
 				trait_impls: &self.trait_impls,
 				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
+				structs: &self.structs,
+				enums: &self.enums,
 				param_bounds: &self.param_bounds,
 				clauses: &self.clauses,
 				type_envs: &self.type_envs,
@@ -560,7 +562,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	type_aliases: Vec<TypeAliasSignature>,
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
-	enums: Vec<EnumSignature>,
+	pub(super) enums: Vec<EnumSignature>,
 	typesets: Vec<TypeSetSignature>,
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
@@ -1564,14 +1566,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `global mut`, its `GlobalMut` impl too) once its `Value` type is
 	/// already resolved. Shared by `AstNodeRef::Global` and
 	/// `AstNodeRef::ImportedGlobal`, which differ only in how they arrive at
-	/// `resolved_value` — a written global may omit its type and gets
-	/// diagnosed for it, an imported one's type is mandatory in the grammar.
+	/// `value` — a written global may omit its type and gets diagnosed for
+	/// it, an imported one's type is mandatory in the grammar.
 	fn resolve_global_signature(
 		&mut self,
+		file_id: FileId,
 		global_index: GlobalIdx,
 		name: Spanned<SymbolU32>,
 		mut_span: Option<TextSpan>,
-		resolved_value: TypeIndex,
+		value: Spanned<TypeIndex>,
 	) -> SignatureLocation {
 		let global_def = &self.defs.globals[usize::from(global_index)];
 		let trait_impl_index = global_def.trait_impl_index;
@@ -1579,6 +1582,37 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let mut_trait_impl_index = global_def.mut_trait_impl_index;
 
 		let global_type = self.types.intern(Type::Global { global_index });
+
+		// `Value`'s constraint lives on `Global`'s own declaration, checked
+		// like `Memory::Size` (`resolve_memory_signature`).
+		let global_trait = self.defs.intrinsics.global.expect(
+			"checked by impls.rs's dispatch pass before any signature is resolved",
+		);
+		let value_symbol = self
+			.strings
+			.get("Value")
+			.expect("interned by synthesize_global_impl during pre-scan");
+		let Some(MemberKind::AssociatedType(declared_value_index)) = self
+			.defs
+			.declared_trait_member(global_trait, BindingKey::ty(value_symbol))
+		else {
+			panic!("the stdlib's `Global` trait must declare `type Value`")
+		};
+		let resolved_value = if value.inner == TypeIndex::ERROR {
+			value.inner
+		} else {
+			self.record_bounds_check(
+				TypeEnvIdx::ROOT,
+				BoundRequirements::AssociatedType {
+					declaration: declared_value_index,
+					trait_index: global_trait,
+					receiver: global_type,
+				},
+				value,
+				SourceSpan::new(file_id, value.span),
+				TypeEnvOwner::Trait(global_trait),
+			)
+		};
 
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
@@ -2008,30 +2042,37 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// body phase this architecture doesn't have yet — rather
 				// than leave this global's `Value` silently unresolved,
 				// require the annotation and fall back to `ERROR`.
-				let resolved_value = match ty {
+				let value = match ty {
 					Some(ty) => {
 						let global_def =
 							&self.defs.globals[usize::from(global_index)];
-						self.resolve_assoc_value(
-							file_id,
-							namespace,
-							TypeEnvIdx::ROOT,
-							global_def.trait_impl_index,
-							global_def.value_assoc_type_index,
-							ty,
-						)
+						Spanned {
+							inner: self.resolve_assoc_value(
+								file_id,
+								namespace,
+								TypeEnvIdx::ROOT,
+								global_def.trait_impl_index,
+								global_def.value_assoc_type_index,
+								ty,
+							),
+							span: ty.span,
+						}
 					}
 					None => {
 						self.diagnostics
 							.push(report_missing_global_type(file_id, *name));
-						TypeIndex::ERROR
+						Spanned {
+							inner: TypeIndex::ERROR,
+							span: name.span,
+						}
 					}
 				};
 				self.resolve_global_signature(
+					file_id,
 					global_index,
 					*name,
 					*mut_span,
-					resolved_value,
+					value,
 				)
 			}
 			AstNodeRef::ImportedGlobal {
@@ -2048,19 +2089,23 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// expression to fall back to anyway, so there's nothing to
 				// diagnose here.
 				let global_def = &self.defs.globals[usize::from(global_index)];
-				let resolved_value = self.resolve_assoc_value(
-					file_id,
-					namespace,
-					TypeEnvIdx::ROOT,
-					global_def.trait_impl_index,
-					global_def.value_assoc_type_index,
-					ty,
-				);
+				let value = Spanned {
+					inner: self.resolve_assoc_value(
+						file_id,
+						namespace,
+						TypeEnvIdx::ROOT,
+						global_def.trait_impl_index,
+						global_def.value_assoc_type_index,
+						ty,
+					),
+					span: ty.span,
+				};
 				self.resolve_global_signature(
+					file_id,
 					global_index,
 					*name,
 					*mut_span,
-					resolved_value,
+					value,
 				)
 			}
 			AstNodeRef::Struct { struct_index, item } => {
@@ -4491,8 +4536,7 @@ pub(super) mod tests {
 	mod const_initializers {
 		use super::*;
 		use crate::tir::body::{ArgOrder, Body, ExprIdx, ExprKind};
-		use crate::tir::eval::{ConstValue, ConstValueState};
-		use crate::tir::operators::Scalar;
+		use crate::tir::eval::{ConstScalar, ConstValue, ConstValueState};
 
 		/// Test items appended to the real stdlib, so operators are checked
 		/// against its actual traits and impls.
@@ -4795,10 +4839,11 @@ pub(super) mod tests {
 			}
 		}
 
-		fn int(case: &TestCase<'_>, name: &str) -> i128 {
-			match value(case, name) {
-				ConstValue::Int { value, .. } => value,
-				other => panic!("`{name}` is not an integer: {other:?}"),
+		/// The one number of `name`'s value.
+		fn scalar(case: &TestCase<'_>, name: &str) -> ConstScalar {
+			match *value(case, name) {
+				[scalar] => scalar,
+				ref other => panic!("`{name}` is not one number: {other:?}"),
 			}
 		}
 
@@ -4820,20 +4865,20 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics().assert_none();
-			assert_eq!(int(&case, "A"), 255);
-			assert_eq!(int(&case, "B"), -128);
+			assert_eq!(scalar(&case, "A"), ConstScalar::u8(255));
+			assert_eq!(scalar(&case, "B"), ConstScalar::i8(-128));
 			// Truncating division; the remainder has the dividend's sign.
-			assert_eq!(int(&case, "C"), -3);
-			assert_eq!(int(&case, "D"), -1);
-			assert_eq!(int(&case, "E"), 254);
-			assert_eq!(int(&case, "F"), -1);
+			assert_eq!(scalar(&case, "C"), ConstScalar::i32(-3));
+			assert_eq!(scalar(&case, "D"), ConstScalar::i32(-1));
+			assert_eq!(scalar(&case, "E"), ConstScalar::u8(254));
+			assert_eq!(scalar(&case, "F"), ConstScalar::i8(-1));
 			// Bits shifted past the width are dropped, as at runtime.
-			assert_eq!(int(&case, "G"), 128);
+			assert_eq!(scalar(&case, "G"), ConstScalar::u8(128));
 			// A right shift on a signed type is arithmetic.
-			assert_eq!(int(&case, "H"), -64);
-			assert_eq!(int(&case, "I"), i128::from(u64::MAX));
-			assert_eq!(int(&case, "J"), i128::from(i64::MIN));
-			assert_eq!(int(&case, "K"), (6 & 3) | (8 ^ 1));
+			assert_eq!(scalar(&case, "H"), ConstScalar::i8(-64));
+			assert_eq!(scalar(&case, "I"), ConstScalar::u64(u64::MAX));
+			assert_eq!(scalar(&case, "J"), ConstScalar::i64(i64::MIN));
+			assert_eq!(scalar(&case, "K"), ConstScalar::u32((6 & 3) | (8 ^ 1)));
 		}
 
 		#[test]
@@ -4848,21 +4893,40 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics().assert_none();
-			let ConstValue::Float { value: a, .. } = value(&case, "A") else {
-				panic!()
-			};
-			assert_eq!(a, f64::from(0.1f32 + 0.2f32));
-			let ConstValue::Float { value: b, .. } = value(&case, "B") else {
-				panic!()
-			};
-			assert_eq!(b, 0.1 + 0.2);
-			assert_eq!(value(&case, "C"), ConstValue::Bool(true));
-			assert_eq!(value(&case, "D"), ConstValue::Bool(true));
+			assert_eq!(scalar(&case, "A"), ConstScalar::f32(0.1 + 0.2));
+			assert_eq!(scalar(&case, "B"), ConstScalar::f64(0.1 + 0.2));
+			assert_eq!(scalar(&case, "C"), ConstScalar::bool(true));
+			assert_eq!(scalar(&case, "D"), ConstScalar::bool(true));
 			// IEEE results are values, not errors.
-			let ConstValue::Float { value: e, .. } = value(&case, "E") else {
-				panic!()
-			};
-			assert!(e.is_infinite());
+			assert!(scalar(&case, "E").expect_f64().is_infinite());
+		}
+
+		#[test]
+		fn a_value_is_held_as_wasm_numbers() {
+			use crate::tir::eval::Val;
+			test_case!(
+				case = &with_std(
+					"const A: u8 = 255;
+					const B: i8 = -1;
+					const C: i64 = -2;
+					const D: f32 = 0.5;
+					const E: bool = true;
+					const F: char = 'a';"
+				)
+			);
+			case.diagnostics().assert_none();
+			// Narrow integers, `bool` and `char` are `I32`s; a signed one is
+			// sign-extended; a float is its bits.
+			for (name, val) in [
+				("A", Val::I32(0xFF)),
+				("B", Val::I32(u32::MAX)),
+				("C", Val::I64(-2i64 as u64)),
+				("D", Val::F32(0.5f32.to_bits())),
+				("E", Val::I32(1)),
+				("F", Val::I32(u32::from('a'))),
+			] {
+				assert_eq!(scalar(&case, name).val, val, "{name}");
+			}
 		}
 
 		#[test]
@@ -4875,7 +4939,7 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics().assert_none();
-			assert_eq!(int(&case, "A"), 42);
+			assert_eq!(scalar(&case, "A"), ConstScalar::i32(42));
 		}
 
 		#[test]
@@ -4912,7 +4976,7 @@ pub(super) mod tests {
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 			assert_eq!(state(&case, "B"), &ConstValueState::Poisoned);
-			assert_eq!(value(&case, "C"), ConstValue::Bool(false));
+			assert_eq!(scalar(&case, "C"), ConstScalar::bool(false));
 		}
 
 		#[test]
@@ -4925,8 +4989,8 @@ pub(super) mod tests {
 			);
 			// `A` is `false` without reading `B`, so there is no loop.
 			case.diagnostics().assert_none();
-			assert_eq!(value(&case, "A"), ConstValue::Bool(false));
-			assert_eq!(value(&case, "B"), ConstValue::Bool(false));
+			assert_eq!(scalar(&case, "A"), ConstScalar::bool(false));
+			assert_eq!(scalar(&case, "B"), ConstScalar::bool(false));
 		}
 
 		#[test]
@@ -4965,8 +5029,8 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics().assert_none();
-			assert_eq!(value(&case, "A"), ConstValue::Bool(false));
-			assert_eq!(value(&case, "B"), ConstValue::Bool(true));
+			assert_eq!(scalar(&case, "A"), ConstScalar::bool(false));
+			assert_eq!(scalar(&case, "B"), ConstScalar::bool(true));
 		}
 
 		#[test]
@@ -5051,23 +5115,17 @@ pub(super) mod tests {
 				shape(&case, "L"),
 				"(Line (Point 0:i32 0:i32):Point P:Point):Line"
 			);
-			let int = |value, scalar| ConstValue::Int { value, scalar };
-			let point = |x, y| {
-				ConstValue::Struct(Box::new([
-					int(x, Scalar::I32),
-					int(y, Scalar::I32),
-				]))
+			// A struct is its fields' numbers, nested ones flattened.
+			let i32s = |values: &[i32]| -> ConstValue {
+				values
+					.iter()
+					.map(|&value| ConstScalar::i32(value))
+					.collect()
 			};
-			assert_eq!(
-				value(&case, "M"),
-				ConstValue::Struct(Box::new([int(5, Scalar::U32)]))
-			);
-			assert_eq!(value(&case, "P"), point(1, 2));
-			assert_eq!(value(&case, "Q"), point(3, -3));
-			assert_eq!(
-				value(&case, "L"),
-				ConstValue::Struct(Box::new([point(0, 0), point(1, 2)]))
-			);
+			assert_eq!(*value(&case, "M"), [ConstScalar::u32(5)]);
+			assert_eq!(value(&case, "P"), i32s(&[1, 2]));
+			assert_eq!(value(&case, "Q"), i32s(&[3, -3]));
+			assert_eq!(value(&case, "L"), i32s(&[0, 0, 1, 2]));
 		}
 
 		#[test]
@@ -5228,19 +5286,13 @@ pub(super) mod tests {
 				)
 			);
 			case.diagnostics().assert_none();
-			assert_eq!(int(&case, "E::A"), 20);
-			assert_eq!(int(&case, "E::B"), 21);
-			assert_eq!(int(&case, "E::C"), -2);
-			assert_eq!(int(&case, "E::D"), -1);
-			assert_eq!(int(&case, "E::F"), 0);
+			assert_eq!(scalar(&case, "E::A"), ConstScalar::i16(20));
+			assert_eq!(scalar(&case, "E::B"), ConstScalar::i16(21));
+			assert_eq!(scalar(&case, "E::C"), ConstScalar::i16(-2));
+			assert_eq!(scalar(&case, "E::D"), ConstScalar::i16(-1));
+			assert_eq!(scalar(&case, "E::F"), ConstScalar::i16(0));
 			// A value of an enum is held in its repr.
-			assert_eq!(
-				value(&case, "X"),
-				ConstValue::Int {
-					value: 21,
-					scalar: Scalar::I16
-				}
-			);
+			assert_eq!(scalar(&case, "X"), ConstScalar::i16(21));
 			// A written value is checked against the repr; an implicit one is
 			// the previous variant's, plus one.
 			assert_eq!(shape(&case, "E::A"), "(* BASE:i16 2:i16):i16");
@@ -5251,9 +5303,9 @@ pub(super) mod tests {
 		fn the_stdlib_ordering_has_its_written_values() {
 			test_case!(case = &with_std(""));
 			case.diagnostics().assert_none();
-			assert_eq!(int(&case, "Ordering::Less"), -1);
-			assert_eq!(int(&case, "Ordering::Equal"), 0);
-			assert_eq!(int(&case, "Ordering::Greater"), 1);
+			assert_eq!(scalar(&case, "Ordering::Less"), ConstScalar::i8(-1));
+			assert_eq!(scalar(&case, "Ordering::Equal"), ConstScalar::i8(0));
+			assert_eq!(scalar(&case, "Ordering::Greater"), ConstScalar::i8(1));
 		}
 
 		#[test]
@@ -5265,7 +5317,7 @@ pub(super) mod tests {
 			]);
 			assert_eq!(state(&case, "E::A"), &ConstValueState::Poisoned);
 			assert_eq!(state(&case, "E::B"), &ConstValueState::Poisoned);
-			assert_eq!(int(&case, "E::D"), 2);
+			assert_eq!(scalar(&case, "E::D"), ConstScalar::u8(2));
 		}
 
 		#[test]
@@ -14782,6 +14834,163 @@ pub(super) mod tests {
 					);
 				},
 			);
+		}
+	}
+
+	mod value_types {
+		use super::*;
+		use crate::tir::solver::{LayoutValue, ValType};
+
+		/// The declarations a `ValueType` test builds on, as std writes them.
+		fn with_value_type(source: &str) -> String {
+			format!(
+				"{}\n{source}",
+				indoc! {"
+				pub trait Call { type Args; type Result; } pub trait Function: Call {}
+				type u8; type u32; type u64; type f32; type f64;
+				typeset PointerSize { u32 }
+				trait Memory { type Size: PointerSize; }
+				trait ValueType {}
+				trait Global { type Value: ValueType; }
+				memory heap: u32;
+			"}
+			)
+		}
+
+		/// The layout of the global `name`'s value type.
+		fn global_layout(
+			case: &mut TestCase<'_>,
+			name: &str,
+		) -> Option<Box<[LayoutValue]>> {
+			let DefKind::Global(global_index) = case.resolve(Tier::Value, name)
+			else {
+				panic!("expected `{name}` to be a global");
+			};
+			let declaration = case.defs.globals[usize::from(global_index)]
+				.value_assoc_type_index;
+			let value = case.context.assoc_types[usize::from(declaration)]
+				.as_ref()
+				.and_then(|signature| signature.value)
+				.expect("a global's value type is resolved");
+			case.context
+				.value_layout(TypeEnvIdx::ROOT, value)
+				.expect("a global's layout is final")
+		}
+
+		fn known(values: &[ValType]) -> Option<Box<[LayoutValue]>> {
+			Some(
+				values
+					.iter()
+					.map(|&value| LayoutValue::Known(value))
+					.collect(),
+			)
+		}
+
+		#[test]
+		fn a_global_of_one_wasm_value_is_accepted() {
+			let source = with_value_type(indoc! {"
+				struct Meters(u32);
+				struct Tagged(u64, ());
+				struct Wrap<T>(T);
+				enum Small: u8 { A = 0 }
+				global int: u32 = 0;
+				global float: f64 = 0;
+				global newtype: Meters = 0;
+				global with_empty: Tagged = 0;
+				global tuple: (f32,) = 0;
+				global generic: Wrap<u64> = 0;
+				global variant: Small = 0;
+				global pointer: heap::&u32 = 0;
+				global reference: func(u32) -> u32 = 0;
+				global size: <heap as Memory>::Size = 0;
+			"});
+			test_case!(mut case = &source);
+			case.diagnostics().assert_none();
+			for (name, layout) in [
+				("int", [ValType::I32]),
+				("float", [ValType::F64]),
+				("newtype", [ValType::I32]),
+				("with_empty", [ValType::I64]),
+				("tuple", [ValType::F32]),
+				("generic", [ValType::I64]),
+				("variant", [ValType::I32]),
+				("pointer", [ValType::I32]),
+				("reference", [ValType::FuncRef]),
+				("size", [ValType::I32]),
+			] {
+				assert_eq!(
+					global_layout(&mut case, name),
+					known(&layout),
+					"{name}"
+				);
+			}
+		}
+
+		#[test]
+		fn a_global_of_zero_or_several_wasm_values_is_rejected() {
+			let source = with_value_type(indoc! {"
+				struct Pair(u32, f64);
+				struct Unit();
+				global pair: Pair = 0;
+				global unit: Unit = 0;
+				global empty: () = 0;
+				global slice: heap::&[u8] = 0;
+			"});
+			test_case!(mut case = &source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+			assert_eq!(
+				global_layout(&mut case, "pair"),
+				known(&[ValType::I32, ValType::F64])
+			);
+			assert_eq!(global_layout(&mut case, "unit"), known(&[]));
+			assert_eq!(
+				global_layout(&mut case, "slice"),
+				known(&[ValType::I32, ValType::I32])
+			);
+		}
+
+		#[test]
+		fn an_abstract_field_is_one_value_when_assumed_a_value_type() {
+			let source = with_value_type(indoc! {"
+				struct Wrap<T>(T);
+				struct Pair<T>(T, T);
+				struct Needs<U: ValueType>();
+				func bounded<T: ValueType>(x: Needs<Wrap<T>>) {}
+				func unbounded<T>(x: Needs<Wrap<T>>) {}
+				func two<T: ValueType>(x: Needs<Pair<T>>) {}
+			"});
+			test_case!(mut case = &source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+			let scope = case.function_signature("bounded").type_params;
+			let parameter = case.context.type_envs.param_types(scope)[0];
+			let struct_index = case.struct_index("Wrap");
+			let type_args = case.context.types.push_list([&parameter]);
+			let wrap = case.context.types.intern(Type::Struct {
+				struct_index,
+				type_args,
+			});
+			assert_eq!(
+				case.context.value_layout(scope, wrap),
+				Ok(Some(Box::from([LayoutValue::Abstract(parameter)])))
+			);
+		}
+
+		#[test]
+		fn an_equality_on_a_global_value_must_be_a_value_type() {
+			let source = with_value_type(indoc! {"
+				func f<G: Global where { Value = (u32, u32) }>() {}
+			"});
+			test_case!(case = &source);
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TraitBoundViolation);
 		}
 	}
 

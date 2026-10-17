@@ -202,6 +202,9 @@ pub(super) enum TraitImplLookup {
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
 	Abstract,
+	/// A trait the compiler answers from the receiver's structure
+	/// (`ValueType`); no impl provides it.
+	Builtin,
 }
 
 impl TypeContext<'_, '_, '_> {
@@ -706,6 +709,9 @@ impl TypeContext<'_, '_, '_> {
 					declaration,
 				}
 			}
+			TraitImplLookup::Builtin => {
+				unreachable!("a builtin trait declares no members")
+			}
 		};
 		self.resolutions.by_site.insert(
 			(SourceSpan::new(file_id, name.span), Tier::Value),
@@ -900,6 +906,9 @@ impl TypeContext<'_, '_, '_> {
 							declaration,
 						},
 					);
+				}
+				Ok(Some(TraitImplLookup::Builtin)) => {
+					unreachable!("a builtin trait declares no members")
 				}
 				Ok(None) => {}
 				Err(SolverError::Pending) => {
