@@ -103,7 +103,7 @@ demand-driven `ensure_*` calls existed inside the normalizer. It is gone:
 
 The normalizer then only reads finished tables. `assoc_type_value`,
 `assoc_type_default` and the impl-header match are plain reads; an unfilled slot
-is `Pending`, never something to construct. `prepare_effective_bounds` (which
+is `Pending`, never something to construct. `prepare_declarations_of` (which
 forces a declaration's bounds) is called by lowering's member selection only. A
 `debug_assert` in `normalize_uncached` enforces that impl-based normalization
 never runs while a signature is being built (`Mode::Assumptions` may).
@@ -266,7 +266,8 @@ The cache is a pure performance cache with no diagnostic meaning, keyed by `(ass
   Caching `Failed` was tried and broke the two tests that raise the budget
   between calls.
 - Validity rests on one invariant: **a non-`Pending` answer is final.** Any code
-  path that reads a non-final fact (`BoundFacts::Provisional`, an impl header
+  path that reads a non-final fact (a subject whose `BoundClauses::equalities`
+  is still `None`, an impl header
   still under construction) must return `Pending`. The suite is green without a
   "facts are final" switch, which is evidence for the invariant, not proof; a
   debug-only check that recomputes on a cache hit and asserts equality would
@@ -315,7 +316,7 @@ Done (2026-10-17, "Impl requirements are definitions"): `AssocValue` became
 `Requirements(ImplKind)`). An impl's requirements are judged once for its own
 parameters in its own scope (`Solver::requirements_verdict`,
 `SolverFrame::Requirements`); impl selection consults that verdict before
-proving them for its arguments (`satisfies_bound`, shared with use-site
+proving them for its arguments (`satisfies_clauses`, shared with use-site
 checks). A loop through them is reported once by `CheckImplRequirements`, at
 the bound it closed in, whatever the source order; selections stay silent.
 A loop that only some instantiation reaches and the impl's own judgement does
@@ -356,6 +357,21 @@ diagnostic at the site level. Mutation checks (dropping the `CheckWellFormed`
 record; making `report_unsolved` swallow) are each caught by the cycle and
 overflow tests. `the_embedded_stdlib_sweeps_without_diagnostics` pins the real
 `std/main.wx`.
+
+Assumptions as flat clauses (2026-10-17): the merged bound trees
+(`ImpliedTraitBound` and its nested bindings, `BoundFacts`, the
+`AssumptionFacts` cursor and `EffectiveBounds`) are replaced by
+`bounds::BoundClauses`, ranges of `TraitClause`/`EqualityClause` in one
+`ClauseArena`. Each written bound becomes clauses in one pass, a supertrait's
+clauses copied in with `Self` substituted; trait clauses are published before
+equality values are resolved. Readers scan a scope's clauses
+(`assumed_traits`) or the declarations along a receiver's projection path
+(`declarations_of`, matched without interning). A use substitutes and proves each
+clause (`Solver::satisfies_clauses`); a clause reached through a membership
+that fails is not proved. Ambiguity is decided where equalities are read; a
+conflict is reported when the clauses are built, once, and not again by a
+declaration that inherits both values. The migration ran with a debug-only
+check that the clauses described what the trees did, then deleted the trees.
 
 ## Invariants
 

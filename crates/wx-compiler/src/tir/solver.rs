@@ -4,7 +4,7 @@
 //! table it may touch.
 //!
 //! Declaration identity stays in projections; abstract equalities come from
-//! effective bounds; concrete values come from selected impl members, whose
+//! equality clauses; concrete values come from selected impl members, whose
 //! values the solver judges once (`Verdict`). Evidence comparison uses the
 //! same traversal and budget, reducing assumed equalities without selecting
 //! providers. Structural substitution remains independent in `types.rs`.
@@ -14,12 +14,9 @@ use std::collections::HashMap;
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
-use super::assumptions::{
-	AssumptionKind, AssumptionReader, EffectiveBounds, Readiness,
-	SelfSubstitution,
-};
 use super::bounds::{
-	BoundId, EqualityFact, ImpliedBindingKind, ImpliedTraitBound,
+	BindingRef, BoundClauses, BoundId, ClauseArena, ClauseTables, Readiness,
+	SelfSubstitution, known_distinct,
 };
 use super::defs::{
 	AssocTypeIdx, BindingKey, DefinitionRegistry, FunctionOwner, MemberKind,
@@ -58,19 +55,64 @@ pub(super) enum SolverError {
 }
 
 /// Why a bound does not hold, for the check that owns it to report.
-pub(super) enum Unsatisfied<'a> {
-	/// `subject` lacks the trait `bound` names.
+pub(super) enum Unsatisfied {
+	/// `subject` lacks `trait_index`, which the bound `source` requires.
 	Trait {
 		subject: TypeIndex,
-		bound: &'a ImpliedTraitBound,
+		trait_index: TraitIdx,
+		source: BoundId,
 	},
-	/// The projection an equality names has another value.
+	/// The projection the equality `source` names has another value.
 	Equality {
 		projection: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
-		fact: &'a EqualityFact,
+		source: BindingRef,
 	},
+}
+
+/// `ty`, a projection path over `root`, with `root` replaced by `onto`.
+fn rebase(
+	types: &mut TypeInterner,
+	ty: TypeIndex,
+	root: TypeIndex,
+	onto: TypeIndex,
+) -> TypeIndex {
+	if ty == root {
+		return onto;
+	}
+	let Type::AssocTypeProjection {
+		base,
+		trait_index,
+		assoc_type_index,
+	} = *types.resolve(ty)
+	else {
+		unreachable!("a clause's subject is a projection path over its root")
+	};
+	let base = rebase(types, base, root, onto);
+	types.intern(Type::AssocTypeProjection {
+		base,
+		trait_index,
+		assoc_type_index,
+	})
+}
+
+/// Whether a step of `ty`'s projection path is a membership in `failed`.
+fn through_failed(
+	types: &TypeInterner,
+	mut ty: TypeIndex,
+	failed: &[(TypeIndex, TraitIdx)],
+) -> bool {
+	while let Type::AssocTypeProjection {
+		base, trait_index, ..
+	} = *types.resolve(ty)
+	{
+		if failed.contains(&(base, trait_index)) {
+			return true;
+		}
+		ty = base;
+	}
+	false
 }
 
 /// A projection that normalization reached again while normalizing it: the
@@ -579,32 +621,19 @@ pub(super) struct SolverView<'a> {
 	pub(super) inherent_impls: &'a [Option<InherentImplSignature>],
 	pub(super) assoc_types: &'a [Option<AssocTypeSignature>],
 	pub(super) param_bounds: &'a [Box<[ParamBounds]>],
+	pub(super) clauses: &'a ClauseArena,
 	pub(super) type_envs: &'a TypeEnvArena,
 }
 
 impl<'a> SolverView<'a> {
-	fn reader(&self) -> AssumptionReader<'a> {
-		AssumptionReader::new(
+	pub(super) fn clause_tables(&self) -> ClauseTables<'a> {
+		ClauseTables::new(
 			self.type_envs,
 			self.param_bounds,
 			self.traits,
 			self.assoc_types,
+			self.clauses,
 		)
-	}
-
-	/// Lend fact storage and the interner separately, so traversing facts can
-	/// intern projected subjects without cloning or mutating their bound trees.
-	fn assumptions(&mut self) -> (AssumptionReader<'a>, &mut TypeInterner) {
-		(self.reader(), &mut *self.types)
-	}
-
-	pub(super) fn effective_bounds(
-		&self,
-		receiver: TypeIndex,
-		recursion_budget: usize,
-	) -> EffectiveBounds<'a> {
-		self.reader()
-			.effective_bounds(&*self.types, receiver, recursion_budget)
 	}
 
 	/// Only a parameter or a projection of one can carry assumed equalities.
@@ -914,7 +943,6 @@ impl Solver {
 		if view.is_abstract(base) {
 			match self.projection_equality(
 				view,
-				assumption_context,
 				base,
 				trait_index,
 				assoc_type_index,
@@ -964,7 +992,6 @@ impl Solver {
 		if view.is_abstract(next_base) {
 			return match self.projection_equality(
 				view,
-				assumption_context,
 				next_base,
 				trait_index,
 				assoc_type_index,
@@ -1428,37 +1455,31 @@ impl Solver {
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
-		let recursion_budget = self.state.recursion_budget;
-		// Subjects carrying `required`: the scope's facts, then declaration
-		// bounds along `ty`'s own path. A projection an equality names lends
-		// its declaration bounds to nothing else: `Item = U` with `type Item:
-		// Marker` does not make `U: Marker`, which must be written. Paths found
-		// there are not followed: a recursive trait describes infinitely many.
-		let mut subjects = Vec::new();
-		let mut readiness;
-		{
-			let (reader, types) = view.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context);
-			readiness = facts.readiness;
-			while let Some(fact) = facts.next(types) {
-				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
-				{
-					subjects.push(fact.subject);
-				}
-			}
-			let mut facts = reader.subject_facts(ty, types, recursion_budget);
-			readiness = readiness.and(facts.readiness);
-			while let Some(fact) = facts.next(types) {
-				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
-				{
-					subjects.push(fact.subject);
-				}
-			}
-		}
-		if subjects.contains(&ty) {
+		// `ty` holds `required` when a declaration on its own path states it,
+		// or when the scope's clauses name it or a subject it normalizes to
+		// and carry `required`. A projection an equality names lends its
+		// declaration bounds to nothing else: `Item = U` with `type Item:
+		// Marker` does not make `U: Marker`, which must be written.
+		let tables = view.clause_tables();
+		let mut declared =
+			tables.declared_traits(view.types, ty, self.state.recursion_budget);
+		if declared.any(|trait_index| trait_index == required) {
 			return Ok(Assumption::Holds);
 		}
-		if !subjects.is_empty() {
+		let mut readiness = tables
+			.assumptions_readiness(assumption_context)
+			.and(declared.readiness);
+		if tables.assumed_traits(assumption_context).any(
+			|(subject, trait_index)| subject == ty && trait_index == required,
+		) {
+			return Ok(Assumption::Holds);
+		}
+		let mut subjects = tables
+			.assumed_traits(assumption_context)
+			.filter(|&(_, trait_index)| trait_index == required)
+			.map(|(subject, _)| subject)
+			.peekable();
+		if subjects.peek().is_some() {
 			let normalized = match self.normalize_assumed_type_query(
 				view,
 				assumption_context,
@@ -1729,155 +1750,159 @@ impl Solver {
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let (envs, param_bounds) = (view.type_envs, view.param_bounds);
 		// Every parameter on the impl's chain is an argument of the match,
 		// at its flat slot; its bounds stay in its own frame.
-		for frame in envs.chain(impl_env) {
-			let start = envs.parent_count(frame);
+		for frame in view.type_envs.chain(impl_env) {
+			let start = view.type_envs.parent_count(frame);
 			for (index, bounds) in
-				param_bounds[usize::from(frame)].iter().enumerate()
+				view.param_bounds[usize::from(frame)].iter().enumerate()
 			{
-				if !bounds.facts.is_ready() {
-					return Err(SolverError::Pending);
-				}
-				let arg = args[start + index];
-				for bound in bounds.facts.current() {
-					if let Some(judgement) = judgement {
-						let SolverFrame::Requirements {
-							bound: proving, ..
-						} = &mut self.state.frames[judgement]
-						else {
-							unreachable!("the judgement's own frame")
-						};
-						*proving = Some(bound.source);
-					}
-					if !self.satisfies_bound(
-						view,
-						assumption_context,
-						(impl_env, args),
-						arg,
-						bound,
-						None,
-					)? {
-						return Ok(false);
-					}
+				if !self.satisfies_clauses(
+					view,
+					assumption_context,
+					bounds.clauses,
+					(
+						view.type_envs.param_types(frame)[index],
+						args[start + index],
+					),
+					(impl_env, args),
+					None,
+					judgement,
+				)? {
+					return Ok(false);
 				}
 			}
 		}
 		Ok(true)
 	}
 
-	/// Whether `subject` satisfies `bound`: its trait, then each binding the
-	/// bound states, as Rust proves `T: Tr<A = X, A: Other>`. An equality
-	/// compares the normalized projection with the written value, substituted
-	/// over `substitution` (the frame the bound is written in and the
-	/// arguments for its whole chain); a nested bound is proved on the
-	/// projection's value the same way. With `failures`, every failure is
-	/// collected for the caller to report; without, the first one answers.
-	pub(super) fn satisfies_bound<'b>(
+	/// Whether `subject` satisfies `clauses`, which a declaration states
+	/// about `root`: each membership, then each equality, as Rust proves `T:
+	/// Tr<A = X, A: Other>`. A clause's subject is a path over `root`, read
+	/// over `subject` and named by its value; its other types are substituted
+	/// over `substitution` (the frame the clauses are written in and the
+	/// arguments for its whole chain). A clause reached through a membership
+	/// that does not hold is not proved: that membership is the failure. With
+	/// `failures`, every failure is collected for the caller to report;
+	/// without, the first one answers. A judgement passes its frame, which
+	/// records the bound being proved.
+	pub(super) fn satisfies_clauses(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
-		substitution: (TypeEnvIdx, &[TypeIndex]),
-		subject: TypeIndex,
-		bound: &'b ImpliedTraitBound,
-		mut failures: Option<&mut Vec<Unsatisfied<'b>>>,
+		clauses: BoundClauses,
+		(root, subject): (TypeIndex, TypeIndex),
+		(frame, arguments): (TypeEnvIdx, &[TypeIndex]),
+		mut failures: Option<&mut Vec<Unsatisfied>>,
+		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		if self
-			.find_trait_impl_query(
-				view,
-				assumption_context,
-				subject,
-				bound.trait_index,
-			)?
-			.is_none()
-		{
-			if let Some(failures) = failures {
-				failures.push(Unsatisfied::Trait { subject, bound });
-			}
-			return Ok(false);
-		}
+		let Some(equalities) = clauses.equalities else {
+			return Err(SolverError::Pending);
+		};
+		let arena = view.clauses;
+		let mut failed = Vec::new();
 		let mut satisfied = true;
-		for binding in &bound.bindings {
-			let values = match &binding.kind {
-				ImpliedBindingKind::Equals(fact) => std::slice::from_ref(fact),
-				ImpliedBindingKind::Ambiguous(facts) => facts.as_slice(),
-				// A conflict is the declaration's own error.
-				ImpliedBindingKind::Bound | ImpliedBindingKind::Conflicting => {
-					&[]
-				}
-			};
-			if values.is_empty() && binding.required_bounds.is_empty() {
+		for clause in arena.traits(clauses.traits) {
+			if through_failed(view.types, clause.subject, &failed) {
 				continue;
 			}
-			let projection = view.types.intern(Type::AssocTypeProjection {
-				trait_index: bound.trait_index,
-				assoc_type_index: binding.assoc_type_index,
-				base: subject,
+			self.record_proving(judgement, clause.origin);
+			let mut receiver =
+				rebase(view.types, clause.subject, root, subject);
+			if clause.subject != root {
+				receiver = self.normalize_type_query(
+					view,
+					assumption_context,
+					receiver,
+				)?;
+			}
+			if self
+				.find_trait_impl_query(
+					view,
+					assumption_context,
+					receiver,
+					clause.trait_index,
+				)?
+				.is_some()
+			{
+				continue;
+			}
+			failed.push((clause.subject, clause.trait_index));
+			let Some(failures) = failures.as_deref_mut() else {
+				return Ok(false);
+			};
+			failures.push(Unsatisfied::Trait {
+				subject: receiver,
+				trait_index: clause.trait_index,
+				source: clause.source,
 			});
-			// The projection's value, compared with each equality and, named
-			// by it as the written type it stands for, the nested bounds'
-			// subject.
+			satisfied = false;
+		}
+		let equalities = arena.equalities(equalities);
+		for clause in equalities {
+			// A conflict is the declaration's own error.
+			if equalities.iter().any(|other| {
+				other.projection == clause.projection
+					&& known_distinct(view.types, other.value, clause.value)
+			}) || through_failed(view.types, clause.projection, &failed)
+			{
+				continue;
+			}
+			self.record_proving(judgement, clause.origin);
+			let projection =
+				rebase(view.types, clause.projection, root, subject);
+			let expected = view.types.substitute(
+				clause.value,
+				Substitution {
+					envs: view.type_envs,
+					env: frame,
+					args: arguments,
+				},
+			);
 			let found = self.normalize_type_query(
 				view,
 				assumption_context,
 				projection,
 			)?;
-			for fact in values {
-				let (frame, arguments) = substitution;
-				let expected = view.types.substitute(
-					fact.value,
-					Substitution {
-						envs: view.type_envs,
-						env: frame,
-						args: arguments,
-					},
-				);
-				let expected = self.normalize_type_query(
-					view,
-					assumption_context,
-					expected,
-				)?;
-				if found == expected
-					|| found == TypeIndex::ERROR
-					|| expected == TypeIndex::ERROR
-				{
-					continue;
-				}
-				let Some(failures) = failures.as_deref_mut() else {
-					return Ok(false);
-				};
-				failures.push(Unsatisfied::Equality {
-					projection,
-					found,
-					expected,
-					fact,
-				});
-				satisfied = false;
+			let expected =
+				self.normalize_type_query(view, assumption_context, expected)?;
+			if found == expected
+				|| found == TypeIndex::ERROR
+				|| expected == TypeIndex::ERROR
+			{
+				continue;
 			}
-			for nested in &binding.required_bounds {
-				if !self.satisfies_bound(
-					view,
-					assumption_context,
-					substitution,
-					found,
-					nested,
-					failures.as_deref_mut(),
-				)? {
-					if failures.is_none() {
-						return Ok(false);
-					}
-					satisfied = false;
-				}
-			}
+			let Some(failures) = failures.as_deref_mut() else {
+				return Ok(false);
+			};
+			failures.push(Unsatisfied::Equality {
+				projection,
+				found,
+				expected,
+				source: clause.source,
+			});
+			satisfied = false;
 		}
 		Ok(satisfied)
+	}
+
+	/// Records on a requirements judgement's frame the bound being proved,
+	/// where a loop that closes in it is reported.
+	fn record_proving(&mut self, judgement: Option<usize>, bound: BoundId) {
+		let Some(judgement) = judgement else {
+			return;
+		};
+		let SolverFrame::Requirements { bound: proving, .. } =
+			&mut self.state.frames[judgement]
+		else {
+			unreachable!("the judgement's own frame")
+		};
+		*proving = Some(bound);
 	}
 
 	pub(super) fn projection_equality(
 		&mut self,
 		view: &mut SolverView<'_>,
-		_cx: TypeEnvIdx,
 		receiver: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -1886,38 +1911,47 @@ impl Solver {
 		// No allocation for the usual zero/one-equality lookup. Competing
 		// contexts are rare, and only need scalar handles for substitution.
 		let mut alternatives = Vec::new();
-		let mut ambiguous = false;
-		let effective =
-			view.effective_bounds(receiver, self.state.recursion_budget);
-		let readiness = effective.readiness;
-		for entry in effective {
-			let bound = entry.bound;
-			if bound.trait_index != trait_index {
+		// The equalities on `<receiver as Tr>::A`, from each subject whose
+		// clauses can describe `receiver`.
+		let tables = view.clause_tables();
+		let types = &*view.types;
+		let sources = tables.declarations_of(
+			types,
+			receiver,
+			self.state.recursion_budget,
+		);
+		let readiness = sources.readiness;
+		for source in sources {
+			let Some(equalities) = source.clauses.equalities else {
 				continue;
-			}
-			for binding in &bound.bindings {
-				if binding.assoc_type_index != assoc_type_index {
+			};
+			for clause in tables.clauses.equalities(equalities) {
+				let Type::AssocTypeProjection {
+					base,
+					trait_index: clause_trait,
+					assoc_type_index: clause_assoc,
+				} = *types.resolve(clause.projection)
+				else {
+					unreachable!("an equality is on a projection")
+				};
+				if clause_trait != trait_index
+					|| clause_assoc != assoc_type_index
+					|| !source.names(types, tables.type_envs, base, receiver)
+				{
 					continue;
 				}
-				match binding.kind {
-					ImpliedBindingKind::Equals(fact) => {
-						let candidate = ContextualEquality {
-							value: fact.value,
-							context: entry.context,
-						};
-						match first {
-							None => first = Some(candidate),
-							Some(previous) if previous == candidate => {}
-							Some(_) => {
-								if !alternatives.contains(&candidate) {
-									alternatives.push(candidate);
-								}
-							}
+				let candidate = ContextualEquality {
+					value: clause.value,
+					context: source.context,
+				};
+				match first {
+					None => first = Some(candidate),
+					Some(previous) if previous == candidate => {}
+					Some(_) => {
+						if !alternatives.contains(&candidate) {
+							alternatives.push(candidate);
 						}
 					}
-					ImpliedBindingKind::Ambiguous(_)
-					| ImpliedBindingKind::Conflicting => ambiguous = true,
-					ImpliedBindingKind::Bound => {}
 				}
 			}
 		}
@@ -1926,9 +1960,8 @@ impl Solver {
 			Readiness::Pending => return Err(SolverError::Pending),
 			Readiness::Overflowed => return Err(SolverError::Overflow),
 		}
-		if ambiguous {
-			return Ok(EqualityLookup::Ambiguous);
-		}
+		// Two values are ambiguous unless they agree once instantiated,
+		// conflicting ones included (the declaration reports those).
 		let Some(first) = first else {
 			return Ok(EqualityLookup::Absent);
 		};
@@ -1977,6 +2010,7 @@ impl TypeContext<'_, '_, '_> {
 				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
 				param_bounds: &self.param_bounds,
+				clauses: &self.clauses,
 				type_envs: &self.type_envs,
 			},
 		)

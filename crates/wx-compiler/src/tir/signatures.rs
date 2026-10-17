@@ -29,9 +29,9 @@ use crate::vfs::{FileId, Files};
 
 use super::body::Body;
 use super::bounds::{
-	BindingRequirement, BoundArena, BoundFacts, BoundId, ImpliedAssocBinding,
-	ImpliedBindingKind, ImpliedTraitBound, SourceAssocBinding,
-	SourceTraitBound, report_duplicate_assoc_type_binding,
+	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
+	ClauseRange, SourceAssocBinding, SourceTraitBound, TraitClause,
+	push_trait_clause, report_duplicate_assoc_type_binding,
 	report_not_a_trait_bound, report_not_an_associated_type,
 };
 use super::defs::{
@@ -66,32 +66,30 @@ use super::types::{
 /// can never drift out of length.
 pub struct ParamBounds {
 	/// One-hop, as written (`T: A + B`) — used for display and as the seed
-	/// `compute_implied_bounds` merges from. Left empty for a frame whose one
+	/// the clauses are built from. Left empty for a frame whose one
 	/// entry is never itself abstract (an impl's own `Self`, bound
 	/// directly to a concrete type) — nothing ever queries bounds for one
 	/// of those, so there's nothing to fill in.
 	pub declared_bounds: Box<[BoundId]>,
-	/// Includes inherited and nested facts. Memberships are published before
-	/// equality RHS resolution — see `BoundFacts` — and the completed merge
-	/// diagnoses only conflicts already established by incompatible outer
-	/// constructors.
-	pub(super) facts: BoundFacts,
+	/// What the parameter assumes, its inherited and nested bounds included
+	/// (`BoundClauses`).
+	pub(super) clauses: BoundClauses,
 }
 
 impl ParamBounds {
 	fn empty() -> Self {
 		Self {
 			declared_bounds: Box::new([]),
-			facts: BoundFacts::empty(),
+			clauses: BoundClauses::PENDING,
 		}
 	}
 }
 
 /// One accepted bound occurrence, decided once by
 /// `TypeContext::collect_bound_occurrences` and shared by both the
-/// provisional-membership builder (`provisional_from_occurrences`) and the
-/// source-bound resolver (`TypeContext::fill_source_bounds`),
-/// so the two cannot disagree about which occurrences exist.
+/// membership builder (`TypeContext::trait_clauses`) and the source-bound
+/// resolver (`TypeContext::fill_source_bounds`), so the two cannot disagree
+/// about which occurrences exist.
 struct BoundOccurrence<'expr> {
 	id: BoundId,
 	trait_index: TraitIdx,
@@ -110,44 +108,6 @@ enum BindingOccurrenceKind<'expr> {
 	/// every sibling param has provisional memberships published.
 	Equals(&'expr Spanned<ast::TypeExpression>),
 	Bound(Vec<BoundOccurrence<'expr>>),
-}
-
-/// Builds direct memberships from a decided occurrence tree, with
-/// `ImpliedBindingKind::Bound` standing in for every equality binding until
-/// `merge_implied_memberships` resolves its RHS. Whether any equality
-/// binding exists at all — the fact that decides if that merge pass is
-/// needed — is answered by `collect_bound_occurrences` itself, which
-/// already visits every binding once; it isn't rediscovered here.
-fn provisional_from_occurrences(
-	occurrences: &[BoundOccurrence<'_>],
-) -> Vec<ImpliedTraitBound> {
-	occurrences
-		.iter()
-		.map(|occurrence| {
-			let bindings = occurrence
-				.bindings
-				.iter()
-				.map(|binding| {
-					let required_bounds = match &binding.kind {
-						BindingOccurrenceKind::Equals(_) => Vec::new(),
-						BindingOccurrenceKind::Bound(nested) => {
-							provisional_from_occurrences(nested)
-						}
-					};
-					ImpliedAssocBinding {
-						assoc_type_index: binding.assoc_type_index,
-						kind: ImpliedBindingKind::Bound,
-						required_bounds,
-					}
-				})
-				.collect();
-			ImpliedTraitBound {
-				trait_index: occurrence.trait_index,
-				source: occurrence.id,
-				bindings,
-			}
-		})
-		.collect()
 }
 
 pub struct TypeAliasSignature {
@@ -220,19 +180,19 @@ pub struct ConstantSignature {
 }
 
 /// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
-/// `implied_bounds` (`type Name: Bound1 + Bound2;`, resolved against the
+/// `clauses` (`type Name: Bound1 + Bound2;`, resolved against the
 /// trait's own `self_scope` — forced first, same as `TraitFunction`/
 /// `TraitConst` — so a bound may reference `Self`, e.g. `type Size: Memory
 /// where { X = Self::Size }`) only ever come from a trait's own declaration.
 /// `value` holds a trait default or an impl's provided type, when present.
 /// Each impl definition has a separate `AssocTypeIdx` from its declaration;
-/// only the declaration carries bounds and implied facts.
+/// only the declaration carries bounds and clauses.
 pub struct AssocTypeSignature {
 	pub(super) declared_bounds: Box<[BoundId]>,
-	/// Effective facts from the declaration — see `BoundFacts`. A
-	/// provisional membership table can be read while equality RHS types
+	/// What the declaration assumes about `<Self as Trait>::Name`
+	/// (`BoundClauses`); its memberships can be read while equality values
 	/// are still being resolved.
-	pub(super) facts: BoundFacts,
+	pub(super) clauses: BoundClauses,
 	pub(super) value: Option<TypeIndex>,
 }
 
@@ -334,6 +294,7 @@ impl TypeContext<'_, '_, '_> {
 				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
 				param_bounds: &self.param_bounds,
+				clauses: &self.clauses,
 				type_envs: &self.type_envs,
 			},
 			bounds: &self.bounds,
@@ -581,6 +542,9 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) solver: Solver,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
+	/// What each parameter and associated declaration assumes, flat
+	/// (`BoundClauses`).
+	pub(super) clauses: ClauseArena,
 	pub(super) type_envs: TypeEnvArena,
 	/// Every generic-param-bearing frame's bounds, index-aligned with
 	/// `type_envs`'s own frames (one `Box<[ParamBounds]>` per `TypeEnvId`,
@@ -666,6 +630,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			solver: Solver::new(),
 			types: TypeInterner::new(),
 			bounds: BoundArena::default(),
+			clauses: ClauseArena::default(),
 			type_envs: TypeEnvArena::new(),
 			// `TypeEnvArena::new()` seeds one `Root` entry (`TypeEnvId::ROOT`)
 			// before anything else is pushed — matched here with one empty
@@ -813,15 +778,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 
 		// A single walk per param decides which bound occurrences exist;
-		// both the provisional-membership pass below and the source-bound
-		// pass after it consume that same decided tree, so they cannot
-		// disagree about what they saw. See `collect_bound_occurrences`.
+		// both the membership pass below and the source-bound pass after it
+		// consume that same decided tree, so they cannot disagree about what
+		// they saw. See `collect_bound_occurrences`.
 		let mut occurrences_per_param = Vec::with_capacity(params.len());
-		let mut has_equalities = false;
 		for ast_param in params {
 			let mut occurrences = Vec::new();
 			if let Some(bound) = &ast_param.bounds {
-				has_equalities |= self.collect_bound_occurrences(
+				self.collect_bound_occurrences(
 					file_id,
 					namespace,
 					bound,
@@ -831,29 +795,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			occurrences_per_param.push(occurrences);
 		}
 
-		// Publish direct memberships for every sibling first. No binding RHS
-		// types or signature dependencies are resolved here.
+		// Publish every sibling's memberships first: an equality's value,
+		// resolved next, can name the members they supply. No value is
+		// resolved here.
 		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
-			let memberships = provisional_from_occurrences(occurrences);
+			let subject = self.type_envs.param_types(type_env)[index];
+			let traits = self.trait_clauses(subject, occurrences);
 			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
 				declared_bounds: occurrences.iter().map(|o| o.id).collect(),
-				facts: BoundFacts::Provisional(memberships.into_boxed_slice()),
+				clauses: BoundClauses {
+					traits,
+					equalities: None,
+				},
 			};
-		}
-		// Only equality expressions can need memberships during construction.
-		if has_equalities {
-			for index in 0..params.len() {
-				let subject = self.type_envs.param_types(type_env)[index];
-				let memberships = self.param_bounds[usize::from(type_env)]
-					[index]
-					.facts
-					.take();
-				self.param_bounds[usize::from(type_env)][index].facts =
-					BoundFacts::Provisional(
-						self.merge_implied_memberships(memberships, subject)
-							.into_boxed_slice(),
-					);
-			}
 		}
 
 		// Resolve source bounds now that every sibling has provisional
@@ -872,21 +826,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 		for (index, ast_param) in params.iter().enumerate() {
 			let subject = self.type_envs.param_types(type_env)[index];
-			let declared_bounds = std::mem::take(
+			let ids = std::mem::take(
 				&mut self.param_bounds[usize::from(type_env)][index]
 					.declared_bounds,
 			);
-			let implied_bounds = self
-				.compute_implied_bounds(
-					&declared_bounds,
-					ast_param.name.inner,
-					subject,
-				)
-				.into_boxed_slice();
-			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
-				declared_bounds,
-				facts: BoundFacts::Ready(implied_bounds),
-			};
+			let equalities =
+				self.equality_clauses(subject, &ids, ast_param.name.inner);
+			let bounds = &mut self.param_bounds[usize::from(type_env)][index];
+			bounds.declared_bounds = ids;
+			bounds.clauses.equalities = Some(equalities);
 		}
 
 		type_env
@@ -905,10 +853,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// The placeholder is filled in by `resolve_generic_params`, right after
 	/// it resolves the bounds that needed the frame to exist first (a bound
 	/// can reference a sibling param). A trait's or typeset's `Self` frame
-	/// (not routed through `resolve_generic_params`) keeps the empty
-	/// placeholder: its `Self` is answered directly from
-	/// `TraitSignature::implied_bounds` instead (see `resolve_bound_member`'s
-	/// own doc comment).
+	/// (not routed through `resolve_generic_params`) is filled by the
+	/// trait's own signature: its supertraits, as clauses on `Self`, which
+	/// `inherit_trait_clauses` copies into every bound that names the trait.
 	fn reserve_param_bounds(&mut self, frame: TypeEnvIdx) {
 		debug_assert_eq!(usize::from(frame), self.param_bounds.len());
 		let count = self.type_envs.param_types(frame).len();
@@ -1129,16 +1076,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		&self.typesets[usize::from(typeset_index)].members
 	}
 
-	pub(super) fn implied_bounds(
-		&self,
-		env: TypeEnvIdx,
-		param_index: u32,
-	) -> &[ImpliedTraitBound] {
-		self.param_bounds[usize::from(env)][param_index as usize]
-			.facts
-			.current()
-	}
-
 	/// `def_id`'s own `AstNodeRef` — `defs.rs`'s output, so this is pure
 	/// identity: reading it never forces `ensure_signature` and is valid
 	/// the moment `TypeContext` exists, before any query has run at
@@ -1345,13 +1282,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		self.assoc_types[usize::from(function_impls.args_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				facts: BoundFacts::Ready(Box::new([])),
+				clauses: BoundClauses::NONE,
 				value: Some(args),
 			});
 		self.assoc_types[usize::from(function_impls.result_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				facts: BoundFacts::Ready(Box::new([])),
+				clauses: BoundClauses::NONE,
 				value: Some(return_type),
 			});
 		for trait_impl_index in [
@@ -1609,7 +1546,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		self.assoc_types[usize::from(size_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				facts: BoundFacts::Ready(Box::new([])),
+				clauses: BoundClauses::NONE,
 				value: Some(checked_size),
 			});
 		self.trait_impls[usize::from(trait_impl_index)] =
@@ -1646,7 +1583,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
-				facts: BoundFacts::Ready(Box::new([])),
+				clauses: BoundClauses::NONE,
 				value: Some(resolved_value),
 			});
 
@@ -1785,22 +1722,21 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
 				let subject = self.type_envs.param_types(self_scope)[0];
-				let (declared_bounds, implied_bounds) = self
-					.resolve_subject_bounds(
-						file_id,
-						namespace,
-						self_scope,
-						supertraits.as_ref(),
-						BoundSubject::Param {
-							env: self_scope,
-							index: 0,
-						},
-						subject,
-						name.inner,
-					);
+				let (declared_bounds, clauses) = self.resolve_subject_bounds(
+					file_id,
+					namespace,
+					self_scope,
+					supertraits.as_ref(),
+					BoundSubject::Param {
+						env: self_scope,
+						index: 0,
+					},
+					subject,
+					name.inner,
+				);
 				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
 					declared_bounds,
-					facts: BoundFacts::Ready(implied_bounds.into_boxed_slice()),
+					clauses,
 				};
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
@@ -1902,16 +1838,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					trait_index,
 					assoc_type_index,
 				});
-				let (resolved_bounds, implied_bounds) = self
-					.resolve_subject_bounds(
-						file_id,
-						namespace,
-						self_scope,
-						bounds.as_ref(),
-						BoundSubject::Assoc(assoc_type_index),
-						subject,
-						name.inner,
-					);
+				let (resolved_bounds, clauses) = self.resolve_subject_bounds(
+					file_id,
+					namespace,
+					self_scope,
+					bounds.as_ref(),
+					BoundSubject::Assoc(assoc_type_index),
+					subject,
+					name.inner,
+				);
 				let resolved_value = value.as_ref().map(|value| {
 					self.resolve_type(
 						file_id,
@@ -1926,9 +1861,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				self.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: resolved_bounds,
-						facts: BoundFacts::Ready(
-							implied_bounds.into_boxed_slice(),
-						),
+						clauses,
 						value: resolved_value,
 					});
 				SignatureLocation::AssocType(assoc_type_index)
@@ -2024,13 +1957,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				);
 
 				// An impl provides a value, it doesn't declare a
-				// requirement — `declared_bounds`/`implied_bounds` stay
+				// requirement — `declared_bounds`/`clauses` stay
 				// empty; only a trait's own declaration (the
 				// `TraitAssocType` arm above) ever populates those.
 				self.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: Box::new([]),
-						facts: BoundFacts::Ready(Box::new([])),
+						clauses: BoundClauses::NONE,
 						value: Some(resolved_ty),
 					});
 				SignatureLocation::AssocType(assoc_type_index)
@@ -2486,22 +2419,21 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
 				let subject = self.type_envs.param_types(self_scope)[0];
-				let (clause_bounds, implied_bounds) = self
-					.resolve_subject_bounds(
-						file_id,
-						namespace,
-						self_scope,
-						bounds.as_ref(),
-						BoundSubject::Param {
-							env: self_scope,
-							index: 0,
-						},
-						subject,
-						name.inner,
-					);
+				let (clause_bounds, clauses) = self.resolve_subject_bounds(
+					file_id,
+					namespace,
+					self_scope,
+					bounds.as_ref(),
+					BoundSubject::Param {
+						env: self_scope,
+						index: 0,
+					},
+					subject,
+					name.inner,
+				);
 				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
 					declared_bounds: clause_bounds,
-					facts: BoundFacts::Ready(implied_bounds.into_boxed_slice()),
+					clauses,
 				};
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
@@ -3773,17 +3705,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		location: BoundSubject,
 		subject: TypeIndex,
 		name: SymbolU32,
-	) -> (Box<[BoundId]>, Vec<ImpliedTraitBound>) {
+	) -> (Box<[BoundId]>, BoundClauses) {
 		let mut occurrences = Vec::new();
-		let has_equalities = bound.is_some_and(|bound| {
+		if let Some(bound) = bound {
 			self.collect_bound_occurrences(
 				file_id,
 				namespace,
 				bound,
 				&mut occurrences,
-			)
-		});
-		let memberships = provisional_from_occurrences(&occurrences);
+			);
+		}
 		if matches!(location, BoundSubject::Param { .. })
 			&& matches!(self.type_envs.owner(env), TypeEnvOwner::Trait(_))
 		{
@@ -3807,37 +3738,95 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			}
 		}
-		let memberships = if has_equalities {
-			self.merge_implied_memberships(memberships, subject)
-		} else {
-			memberships
-		}
-		.into_boxed_slice();
+		let traits = self.trait_clauses(subject, &occurrences);
+		let provisional = BoundClauses {
+			traits,
+			equalities: None,
+		};
 		match location {
 			BoundSubject::Param { env, index } => {
-				self.param_bounds[usize::from(env)][index].facts =
-					BoundFacts::Provisional(memberships)
+				self.param_bounds[usize::from(env)][index].clauses =
+					provisional;
 			}
 			BoundSubject::Assoc(index) => {
 				self.assoc_types[usize::from(index)] =
 					Some(AssocTypeSignature {
 						declared_bounds: Box::new([]),
-						facts: BoundFacts::Provisional(memberships),
+						clauses: provisional,
 						value: None,
 					})
 			}
 		}
 		self.fill_source_bounds(file_id, namespace, env, subject, &occurrences);
 		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
-		let implied = self.compute_implied_bounds(&ids, name, subject);
-		(ids, implied)
+		let equalities = self.equality_clauses(subject, &ids, name);
+		(
+			ids,
+			BoundClauses {
+				traits,
+				equalities: Some(equalities),
+			},
+		)
+	}
+
+	/// The memberships `occurrences` state about `subject`, published before
+	/// any equality's value is resolved (`BoundClauses`).
+	fn trait_clauses(
+		&mut self,
+		subject: TypeIndex,
+		occurrences: &[BoundOccurrence<'_>],
+	) -> ClauseRange<TraitClause> {
+		let mut traits = Vec::new();
+		for occurrence in occurrences {
+			self.collect_trait_clauses(
+				&mut traits,
+				subject,
+				occurrence,
+				occurrence.id,
+			);
+		}
+		self.clauses.push_traits(&traits)
+	}
+
+	/// The memberships `occurrence` states about `subject`: its trait, its
+	/// nested bounds on projections, then the trait's own clauses.
+	fn collect_trait_clauses(
+		&mut self,
+		out: &mut Vec<TraitClause>,
+		subject: TypeIndex,
+		occurrence: &BoundOccurrence<'_>,
+		origin: BoundId,
+	) {
+		push_trait_clause(
+			out,
+			TraitClause {
+				subject,
+				trait_index: occurrence.trait_index,
+				source: occurrence.id,
+				origin,
+			},
+		);
+		for binding in &occurrence.bindings {
+			let BindingOccurrenceKind::Bound(nested) = &binding.kind else {
+				continue;
+			};
+			let projection = self.types.intern(Type::AssocTypeProjection {
+				base: subject,
+				trait_index: occurrence.trait_index,
+				assoc_type_index: binding.assoc_type_index,
+			});
+			for nested in nested {
+				self.collect_trait_clauses(out, projection, nested, origin);
+			}
+		}
+		self.inherit_trait_clauses(out, subject, occurrence.id, origin);
 	}
 
 	/// Walks a bound expression exactly once, resolving trait paths,
 	/// reserving a `BoundId` per accepted occurrence, and reporting the
 	/// "not an associated type"/duplicate-binding diagnostics. The result is
-	/// consumed twice — once by `provisional_from_occurrences` to publish
-	/// direct memberships (no equality RHS types resolved), once by
+	/// consumed twice — once by `trait_clauses` to publish memberships (no
+	/// equality RHS types resolved), once by
 	/// `fill_source_bounds` to resolve those RHS types and fill in
 	/// `self.bounds` — but which occurrences exist, and which bindings on
 	/// them are accepted, is decided exactly once, here. The two former
@@ -3845,27 +3834,21 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// proven to agree by comparing how many `BoundId`s each had reserved;
 	/// walking a shared `BoundOccurrence` tree instead makes that agreement
 	/// structural rather than an invariant to maintain by hand.
-	/// Returns whether any equality binding (nested ones included) was seen
-	/// — the fact `resolve_generic_params`/`resolve_subject_bounds` need to
-	/// decide whether `merge_implied_memberships` is worth running at all —
-	/// since this walk already visits every binding once and would
-	/// otherwise make a caller re-derive the same fact from its output.
 	fn collect_bound_occurrences<'expr>(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
 		expr: &'expr Spanned<ast::BoundExpression>,
 		out: &mut Vec<BoundOccurrence<'expr>>,
-	) -> bool {
+	) {
 		let (segments, bindings) = match &expr.inner {
 			ast::BoundExpression::BoundList(list) => {
-				let mut has_equalities = false;
 				for entry in list.iter() {
-					has_equalities |= self.collect_bound_occurrences(
+					self.collect_bound_occurrences(
 						file_id, namespace, entry, out,
 					);
 				}
-				return has_equalities;
+				return;
 			}
 			ast::BoundExpression::Path(segments) => {
 				(segments.as_ref(), &[][..])
@@ -3880,12 +3863,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let Some(trait_index) =
 			self.resolve_trait_bound_path(file_id, namespace, segments)
 		else {
-			return false;
+			return;
 		};
 		let span = SourceSpan::new(file_id, expr.span);
 		let id = self.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
-		let mut has_equalities = false;
 		for binding in bindings.iter() {
 			let Some(assoc_type_index) =
 				self.assoc_binding_index(trait_index, binding.name.inner)
@@ -3912,12 +3894,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			let kind = match &binding.kind {
 				ast::AssocTypeBindingKind::Equals(ty) => {
-					has_equalities = true;
 					BindingOccurrenceKind::Equals(ty)
 				}
 				ast::AssocTypeBindingKind::Bound(rhs) => {
 					let mut nested = Vec::new();
-					has_equalities |= self.collect_bound_occurrences(
+					self.collect_bound_occurrences(
 						file_id,
 						namespace,
 						rhs,
@@ -3938,7 +3919,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			span,
 			bindings: occurrence_bindings,
 		});
-		has_equalities
 	}
 
 	/// Resolves every equality binding's RHS type and fills `self.bounds` at
@@ -5349,28 +5329,18 @@ pub(super) mod tests {
 
 	mod assumption_context {
 		use super::*;
-		use crate::tir::assumptions::{
-			AssumptionKind, Readiness, TraitAssumptionSource,
-		};
+		use crate::tir::bounds::Readiness;
 		use crate::tir::types::Substitution;
 
 		fn memberships(
-			signatures: &mut TypeContext<'_, '_, '_>,
+			signatures: &TypeContext<'_, '_, '_>,
 			scope: TypeEnvIdx,
-		) -> (Readiness, Vec<(TypeIndex, TraitIdx, TraitAssumptionSource)>) {
-			let (reader, types) = signatures.assumptions();
-			let mut facts = reader.scoped_facts(scope);
-			let mut result = Vec::new();
-			while let Some(fact) = facts.next(types) {
-				if let AssumptionKind::Trait {
-					trait_index,
-					source,
-				} = fact.kind
-				{
-					result.push((fact.subject, trait_index, source));
-				}
-			}
-			(facts.readiness, result)
+		) -> (Readiness, Vec<(TypeIndex, TraitIdx)>) {
+			let tables = signatures.clause_tables();
+			(
+				tables.assumptions_readiness(scope),
+				tables.assumed_traits(scope).collect(),
+			)
 		}
 
 		fn projection(
@@ -5445,12 +5415,8 @@ pub(super) mod tests {
 				let scope = case.context.functions[index].type_params;
 				let own_param = own_trait
 					.map(|_| case.context.type_envs.param_types(scope)[0]);
-				let (readiness, facts) = memberships(&mut case.context, scope);
+				let (readiness, actual) = memberships(&case.context, scope);
 				assert_eq!(readiness, Readiness::Ready);
-				let actual: Vec<_> = facts
-					.iter()
-					.map(|&(subject, trait_index, _)| (subject, trait_index))
-					.collect();
 				let mut expected = Vec::new();
 				if let (Some(subject), Some(trait_index)) =
 					(own_param, own_trait)
@@ -5466,13 +5432,13 @@ pub(super) mod tests {
 				}
 			}
 			let (readiness, facts) =
-				memberships(&mut case.context, TypeEnvIdx::ROOT);
+				memberships(&case.context, TypeEnvIdx::ROOT);
 			assert_eq!(readiness, Readiness::Ready);
 			assert!(facts.is_empty());
 		}
 
 		#[test]
-		fn inherited_and_nested_facts_keep_subjects_and_provenance() {
+		fn inherited_and_nested_clauses_keep_subjects_and_provenance() {
 			test_case!(mut case = indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				type i32;
@@ -5501,51 +5467,35 @@ pub(super) mod tests {
 				(item, case.trait_index("Leaf")),
 				(other, case.trait_index("Leaf")),
 			];
-			let (readiness, traits) = memberships(&mut case.context, scope);
+			let (readiness, traits) = memberships(&case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(traits.len(), expected.len());
-			for &(subject, trait_index) in &expected {
-				assert!(
-					traits.iter().any(|&(actual, index, _)| actual == subject
-						&& index == trait_index)
-				);
+			for membership in &expected {
+				assert!(traits.contains(membership));
 			}
-			for (_, trait_index, source) in traits {
-				let TraitAssumptionSource::Bound(source) = source else {
-					panic!("written/inherited bound expected");
-				};
+			let clauses =
+				case.context.param_bounds[usize::from(scope)][0].clauses;
+			// Each clause names the written bound that states it, whether
+			// written here or inherited from a supertrait's declaration.
+			for clause in case.context.clauses.traits(clauses.traits) {
 				assert_eq!(
-					case.context.bounds.trait_index(source),
-					trait_index
+					case.context.bounds.trait_index(clause.source),
+					clause.trait_index
 				);
 			}
-			let equalities = {
-				let (reader, types) = case.context.assumptions();
-				let mut cursor = reader.scoped_facts(scope);
-				let mut equalities = Vec::new();
-				while let Some(fact) = cursor.next(types) {
-					if let AssumptionKind::Equality(
-						ImpliedBindingKind::Equals(equality),
-					) = fact.kind
-					{
-						assert!(fact.self_substitution.is_none());
-						equalities.push((fact.subject, *equality));
-					}
-				}
-				equalities
-			};
+			let equalities =
+				case.context.clauses.equalities(clauses.equalities.unwrap());
 			assert_eq!(equalities.len(), 1);
-			let (subject, equality) = equalities[0];
-			assert_eq!(subject, value);
-			assert_eq!(equality.value, TypeIndex::I32);
+			assert_eq!(equalities[0].projection, value);
+			assert_eq!(equalities[0].value, TypeIndex::I32);
 			assert!(
-				matches!(case.context.bounds.binding(equality.source).kind,
+				matches!(case.context.bounds.binding(equalities[0].source).kind,
 				BindingRequirement::Equals(value) if value.inner == TypeIndex::I32)
 			);
 		}
 
 		#[test]
-		fn associated_declaration_facts_preserve_self_through_nested_requirements()
+		fn associated_declaration_clauses_read_self_through_nested_requirements()
 		 {
 			test_case!(mut case = indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -5568,65 +5518,70 @@ pub(super) mod tests {
 			let deep = case.trait_index("Deep");
 			let outer_env =
 				case.context.traits[usize::from(case.trait_index("Outer"))].env;
-			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.subject_facts(item, types, 128);
-			assert_eq!(facts.readiness, Readiness::Ready);
-			let mut traits = Vec::new();
-			let mut equalities = 0;
-			while let Some(fact) = facts.next(types) {
-				let context = fact.self_substitution.unwrap();
-				assert_eq!(context.env, outer_env);
-				assert_eq!(context.receiver, base);
-				match fact.kind {
-					AssumptionKind::Trait { trait_index, .. } => {
-						traits.push((fact.subject, trait_index))
-					}
-					AssumptionKind::Equality(ImpliedBindingKind::Equals(
-						equality,
-					)) => {
-						assert_eq!(fact.subject, output);
-						assert_eq!(
-							types.substitute(
-								equality.value,
-								Substitution {
-									envs: reader.type_envs,
-									env: context.env,
-									args: &[context.receiver],
-								}
-							),
-							base
-						);
-						equalities += 1;
-					}
-					_ => panic!("expected a known equality"),
-				}
-			}
-			assert_eq!(traits, [(item, inner), (value, deep)]);
-			assert_eq!(equalities, 1);
+			let tables = case.context.clause_tables();
+			let types = &case.context.types;
+			let mut sources = tables.declarations_of(types, item, 128);
+			assert_eq!(sources.readiness, Readiness::Ready);
+			// `Item`'s declaration first, read with `Self` as `T`.
+			let source = sources.next().unwrap();
+			let context = source.context.unwrap();
+			assert_eq!(context.env, outer_env);
+			assert_eq!(context.receiver, base);
+			let traits = tables.clauses.traits(source.clauses.traits);
+			assert_eq!(traits.len(), 2);
+			assert!(
+				source.names(types, tables.type_envs, traits[0].subject, item)
+					&& traits[0].trait_index == inner
+			);
+			assert!(
+				source.names(types, tables.type_envs, traits[1].subject, value)
+					&& traits[1].trait_index == deep
+			);
+			let equalities = tables
+				.clauses
+				.equalities(source.clauses.equalities.unwrap());
+			assert_eq!(equalities.len(), 1);
+			assert!(source.names(
+				types,
+				tables.type_envs,
+				equalities[0].projection,
+				output
+			));
+			let written = equalities[0].value;
+			// Then the parameter at the path's root.
+			assert!(sources.next().unwrap().context.is_none());
+			assert!(sources.next().is_none());
+			let value = case.context.types.substitute(
+				written,
+				Substitution {
+					envs: &case.context.type_envs,
+					env: context.env,
+					args: &[context.receiver],
+				},
+			);
+			assert_eq!(value, base);
 		}
 
 		#[test]
-		fn implicit_trait_self_has_an_explicit_origin() {
-			test_case!(mut case = "trait Parent {} trait Child: Parent {}");
+		fn implicit_trait_self_comes_first_and_is_no_clause() {
+			test_case!(case = "trait Parent {} trait Child: Parent {}");
 			assert!(case.context.diagnostics.is_empty());
 			let child = case.trait_index("Child");
 			let parent = case.trait_index("Parent");
 			let scope = case.context.traits[usize::from(child)].env;
 			let subject = case.context.type_envs.param_types(scope)[0];
-			let (readiness, facts) = memberships(&mut case.context, scope);
+			let (readiness, facts) = memberships(&case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
-			assert_eq!(facts.len(), 2);
-			assert_eq!(
-				facts[0],
-				(subject, child, TraitAssumptionSource::TraitSelf(child))
-			);
-			assert!(
-				matches!(facts[1], (ty, index, TraitAssumptionSource::Bound(_)) if ty == subject && index == parent)
-			);
+			assert_eq!(facts, [(subject, child), (subject, parent)]);
+			let clauses =
+				case.context.param_bounds[usize::from(scope)][0].clauses;
+			let traits = case.context.clauses.traits(clauses.traits);
+			assert_eq!(traits.len(), 1);
+			assert_eq!(traits[0].trait_index, parent);
 		}
 
 		#[test]
-		fn equality_alternatives_and_conflicts_remain_distinct() {
+		fn equality_alternatives_and_conflicts_both_keep_their_values() {
 			test_case!(mut case = indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				type i32; type u32;
@@ -5639,58 +5594,38 @@ pub(super) mod tests {
 				case.context.diagnostics[0].code.as_deref(),
 				Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 			);
-			for name in ["ambiguous", "conflicting"] {
+			for (name, values) in [
+				("ambiguous", None),
+				("conflicting", Some([TypeIndex::I32, TypeIndex::U32])),
+			] {
 				let scope = case.function_signature(name).type_params;
 				let base = case.context.type_envs.param_types(scope)[0];
 				let expected_subject =
 					projection(&mut case, base, "Value", "Item");
-				let expected_values: Vec<_> = case
+				let expected_values = values.map_or_else(
+					|| case.context.type_envs.param_types(scope)[1..].to_vec(),
+					|values| values.to_vec(),
+				);
+				let clauses =
+					case.context.param_bounds[usize::from(scope)][0].clauses;
+				let equalities = case
 					.context
-					.type_envs
-					.param_types(scope)
-					.iter()
-					.skip(1)
-					.copied()
-					.collect();
-				let (reader, types) = case.context.assumptions();
-				let mut facts = reader.scoped_facts(scope);
-				assert_eq!(facts.readiness, Readiness::Ready);
-				let mut equalities = 0;
-				while let Some(fact) = facts.next(types) {
-					if let AssumptionKind::Equality(kind) = fact.kind {
-						assert_eq!(fact.subject, expected_subject);
-						assert!(fact.self_substitution.is_none());
-						match kind {
-							ImpliedBindingKind::Ambiguous(candidates)
-								if name == "ambiguous" =>
-							{
-								assert_eq!(
-									candidates
-										.iter()
-										.map(|candidate| candidate.value)
-										.collect::<Vec<_>>(),
-									expected_values
-								);
-								assert_ne!(
-									candidates[0].source,
-									candidates[1].source
-								);
-								let original = &reader.param_bounds
-									[usize::from(scope)][0]
-									.facts
-									.current()[0]
-									.bindings[0]
-									.kind;
-								assert!(std::ptr::eq(kind, original));
-							}
-							ImpliedBindingKind::Conflicting
-								if name == "conflicting" => {}
-							_ => panic!("unexpected equality state"),
-						}
-						equalities += 1;
-					}
-				}
-				assert_eq!(equalities, 1);
+					.clauses
+					.equalities(clauses.equalities.unwrap());
+				assert!(
+					equalities
+						.iter()
+						.all(|clause| clause.projection == expected_subject)
+				);
+				assert_eq!(
+					equalities
+						.iter()
+						.map(|clause| clause.value)
+						.collect::<Vec<_>>(),
+					expected_values,
+					"{name}"
+				);
+				assert_ne!(equalities[0].source, equalities[1].source);
 			}
 		}
 
@@ -5705,30 +5640,18 @@ pub(super) mod tests {
 						requested_at: None,
 					});
 					let scope = builder.functions[0].type_params;
-					let facts = builder.param_bounds[usize::from(scope)][1]
-						.facts
-						.take()
-						.into_boxed_slice();
-					builder.param_bounds[usize::from(scope)][1].facts =
-						BoundFacts::Provisional(facts);
-					{
-						let (reader, types) = builder.assumptions();
-						let mut facts = reader.scoped_facts(scope);
-						assert_eq!(facts.readiness, Readiness::Pending);
-						let first = facts.next(types).unwrap();
-						assert!(
-							matches!(first.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == TraitIdx::new(0))
-						);
-					}
-					let facts = builder.param_bounds[usize::from(scope)][1]
-						.facts
-						.take()
-						.into_boxed_slice();
-					builder.param_bounds[usize::from(scope)][1].facts =
-						BoundFacts::Ready(facts);
-					let (reader, types) = builder.assumptions();
+					let clauses =
+						builder.param_bounds[usize::from(scope)][1].clauses;
+					builder.param_bounds[usize::from(scope)][1]
+						.clauses
+						.equalities = None;
+					let (readiness, facts) = memberships(builder, scope);
+					assert_eq!(readiness, Readiness::Pending);
+					assert_eq!(facts[0].1, TraitIdx::new(0));
+					builder.param_bounds[usize::from(scope)][1].clauses =
+						clauses;
 					assert_eq!(
-						reader.scoped_facts(scope).readiness,
+						builder.clause_tables().assumptions_readiness(scope),
 						Readiness::Ready
 					);
 				},
@@ -5762,10 +5685,11 @@ pub(super) mod tests {
 						builder.assoc_types[usize::from(declaration)].is_none()
 					);
 					{
-						let (reader, types) = builder.assumptions();
-						let mut facts = reader.subject_facts(item, types, 128);
-						assert_eq!(facts.readiness, Readiness::Pending);
-						assert!(facts.next(types).is_none());
+						let mut traits = builder
+							.clause_tables()
+							.declared_traits(&builder.types, item, 128);
+						assert_eq!(traits.readiness, Readiness::Pending);
+						assert!(traits.next().is_none());
 					}
 					assert!(
 						builder.assoc_types[usize::from(declaration)].is_none()
@@ -5777,34 +5701,27 @@ pub(super) mod tests {
 					builder
 						.ensure_assoc_type_bounds(declaration, reference)
 						.unwrap();
-					{
-						let (reader, types) = builder.assumptions();
-						assert_eq!(
-							reader.subject_facts(item, types, 128).readiness,
-							Readiness::Ready
-						);
-					}
-					let facts = builder.assoc_types[usize::from(declaration)]
-						.as_mut()
-						.unwrap()
-						.facts
-						.take()
-						.into_boxed_slice();
+					assert_eq!(
+						builder
+							.clause_tables()
+							.declared_traits(&builder.types, item, 128)
+							.readiness,
+						Readiness::Ready
+					);
 					builder.assoc_types[usize::from(declaration)]
 						.as_mut()
 						.unwrap()
-						.facts = BoundFacts::Provisional(facts);
-					let (reader, types) = builder.assumptions();
-					let mut facts = reader.subject_facts(item, types, 128);
-					assert_eq!(facts.readiness, Readiness::Pending);
-					let membership = facts.next(types).unwrap();
-					assert_eq!(membership.subject, item);
-					assert!(
-						matches!(membership.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == TraitIdx::new(0))
-					);
-					assert!(facts.next(types).is_none());
+						.clauses
+						.equalities = None;
+					let tables = builder.clause_tables();
+					let traits =
+						tables.declared_traits(&builder.types, item, 128);
+					assert_eq!(traits.readiness, Readiness::Pending);
+					assert_eq!(traits.collect::<Vec<_>>(), [TraitIdx::new(0)]);
 					assert_eq!(
-						reader.subject_facts(item, types, 0).readiness,
+						tables
+							.declared_traits(&builder.types, item, 0)
+							.readiness,
 						Readiness::Overflowed
 					);
 				},
@@ -5821,22 +5738,20 @@ pub(super) mod tests {
 			let base = case.context.type_envs.param_types(scope)[0];
 			let next = projection(&mut case, base, "Node", "Next");
 			let next_next = projection(&mut case, next, "Node", "Next");
-			let (readiness, facts) = memberships(&mut case.context, scope);
+			let (readiness, facts) = memberships(&case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(facts.len(), 1);
-			let (reader, types) = case.context.assumptions();
+			let tables = case.context.clause_tables();
 			for subject in [next, next_next] {
-				let mut facts = reader.subject_facts(subject, types, 128);
-				assert_eq!(facts.readiness, Readiness::Ready);
-				let fact = facts.next(types).unwrap();
-				assert_eq!(fact.subject, subject);
-				assert!(
-					matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == TraitIdx::new(0))
-				);
-				assert!(facts.next(types).is_none());
+				let traits =
+					tables.declared_traits(&case.context.types, subject, 128);
+				assert_eq!(traits.readiness, Readiness::Ready);
+				assert_eq!(traits.collect::<Vec<_>>(), [TraitIdx::new(0)]);
 			}
 			assert_eq!(
-				reader.subject_facts(next_next, types, 1).readiness,
+				tables
+					.declared_traits(&case.context.types, next_next, 1)
+					.readiness,
 				Readiness::Overflowed
 			);
 		}
@@ -12002,7 +11917,7 @@ pub(super) mod tests {
 				builder.assoc_types[usize::from(provider)] =
 					Some(AssocTypeSignature {
 						declared_bounds: Box::new([]),
-						facts: BoundFacts::Ready(Box::new([])),
+						clauses: BoundClauses::NONE,
 						value: Some(tuple),
 					});
 				assert_eq!(
@@ -12989,7 +12904,7 @@ pub(super) mod tests {
 	/// = u64> {}`, `func f<T: B + C>() {}`): rejected immediately with
 	/// `E0284`, zero uses of `T` anywhere past the bound list — bound
 	/// well-formedness is checked once at declaration, not deferred to
-	/// first use. wx matches that here (see `ParamBounds::implied_bounds`);
+	/// first use. wx matches that here (see `ParamBounds::clauses`);
 	/// `a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed`
 	/// below re-checks the fully-unused case, which the old
 	/// lazy-on-first-projection design let compile silently.
@@ -13228,20 +13143,33 @@ pub(super) mod tests {
 		assert_eq!(&source[labels[0].range.clone()], "u64");
 		assert_eq!(&source[labels[1].range.clone()], "u32");
 		let env = case.context.traits[usize::from(case.trait_index("D"))].env;
-		let merged = case.context.param_bounds[usize::from(env)][0]
-			.facts
-			.current()
-			.iter()
-			.find(|bound| bound.trait_index == case.trait_index("Outer"))
-			.unwrap();
-		let inner = &merged.bindings[0].required_bounds;
-		assert!(inner.iter().any(|bound| {
-			bound.trait_index == case.trait_index("Inner")
-				&& matches!(
-					bound.bindings[0].kind,
-					ImpliedBindingKind::Conflicting
-				)
-		}));
+		// Both values stay, so the projection reads as ambiguous.
+		assert_eq!(
+			equality_values(&case, env),
+			[vec![TypeIndex::U32, TypeIndex::U64]]
+		);
+	}
+
+	/// The values each projection `env`'s first parameter assumes is equal
+	/// to, one list per projection, in clause order.
+	fn equality_values(
+		case: &TestCase,
+		env: TypeEnvIdx,
+	) -> Vec<Vec<TypeIndex>> {
+		let clauses = case.context.param_bounds[usize::from(env)][0].clauses;
+		let mut groups: Vec<(TypeIndex, Vec<TypeIndex>)> = Vec::new();
+		for clause in
+			case.context.clauses.equalities(clauses.equalities.unwrap())
+		{
+			match groups
+				.iter_mut()
+				.find(|(projection, _)| *projection == clause.projection)
+			{
+				Some((_, values)) => values.push(clause.value),
+				None => groups.push((clause.projection, vec![clause.value])),
+			}
+		}
+		groups.into_iter().map(|(_, values)| values).collect()
 	}
 
 	#[test]
@@ -13266,22 +13194,14 @@ pub(super) mod tests {
 			let env = case.context.traits
 				[usize::from(case.trait_index(trait_name))]
 			.env;
-			let merged = case.context.param_bounds[usize::from(env)][0]
-				.facts
-				.current()
-				.iter()
-				.find(|bound| bound.trait_index == case.trait_index("Outer"))
-				.unwrap();
-			assert!(matches!(
-				merged.bindings[0].kind,
-				ImpliedBindingKind::Equals(_)
-			));
-			let inner = &merged.bindings[0].required_bounds;
-			assert_eq!(inner.len(), 1);
-			assert!(matches!(
-				inner[0].bindings[0].kind,
-				ImpliedBindingKind::Conflicting
-			));
+			// `Item` keeps its one value; the nested `X` keeps both of its.
+			let mut groups = equality_values(&case, env);
+			groups.sort();
+			assert_eq!(
+				groups,
+				[vec![TypeIndex::U32], vec![TypeIndex::U32, TypeIndex::U64]],
+				"{trait_name}"
+			);
 		}
 	}
 
@@ -13328,18 +13248,15 @@ pub(super) mod tests {
 				[usize::from(case.trait_index(trait_name))]
 			.env;
 			let bounds = &case.context.param_bounds[usize::from(env)][0];
-			let merged = bounds
-				.facts
-				.current()
+			let membership = case
+				.context
+				.clauses
+				.traits(bounds.clauses.traits)
 				.iter()
-				.find(|bound| bound.trait_index == case.trait_index("A"))
+				.find(|clause| clause.trait_index == case.trait_index("A"))
 				.unwrap();
-			assert_eq!(merged.source, bounds.declared_bounds[0]);
-			let ImpliedBindingKind::Equals(reference) = merged.bindings[0].kind
-			else {
-				panic!("expected equality to win")
-			};
-			assert_eq!(reference.value, TypeIndex::U32);
+			assert_eq!(membership.source, bounds.declared_bounds[0]);
+			assert_eq!(equality_values(&case, env), [vec![TypeIndex::U32]]);
 		}
 	}
 	#[test]
@@ -13631,19 +13548,14 @@ pub(super) mod tests {
 						trait_index: TraitIdx::new(0),
 						assoc_type_index,
 					});
-				let facts = builder.param_bounds[usize::from(env)][0]
-					.facts
-					.current()
-					.to_vec()
-					.into_boxed_slice();
-				builder.param_bounds[usize::from(env)][0].facts =
-					BoundFacts::Provisional(facts.clone());
+				let clauses = builder.param_bounds[usize::from(env)][0].clauses;
+				builder.param_bounds[usize::from(env)][0].clauses.equalities =
+					None;
 				assert_eq!(
 					builder.normalize_type_query(env, projection),
 					Err(SolverError::Pending)
 				);
-				builder.param_bounds[usize::from(env)][0].facts =
-					BoundFacts::Ready(facts);
+				builder.param_bounds[usize::from(env)][0].clauses = clauses;
 				assert_eq!(
 					builder.normalize_type_query(env, projection),
 					Ok(TypeIndex::I32)
@@ -13989,8 +13901,7 @@ pub(super) mod tests {
 
 	mod sweep_complete {
 		use super::*;
-		use crate::tir::assumptions::{AssumptionKind, Readiness};
-		use crate::tir::bounds::ImpliedBindingKind;
+		use crate::tir::bounds::Readiness;
 
 		fn assert_graph_clean(graph: &vfs::CompilationUnit) {
 			DiagnosticView::new(
@@ -14050,30 +13961,20 @@ pub(super) mod tests {
 					trait_index: TraitIdx::new(1),
 					assoc_type_index: AssocTypeIdx::new(0),
 				});
-			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context);
-			assert_eq!(facts.readiness, Readiness::Ready);
-			let mut memberships = Vec::new();
-			let mut equality = None;
-			while let Some(fact) = facts.next(types) {
-				match fact.kind {
-					AssumptionKind::Trait { trait_index, .. } => {
-						memberships.push((fact.subject, trait_index))
-					}
-					AssumptionKind::Equality(ImpliedBindingKind::Equals(
-						value,
-					)) => {
-						assert_eq!(fact.subject, projection);
-						assert_eq!(value.value, stored);
-						assert!(fact.self_substitution.is_none());
-						equality = Some(value.source);
-					}
-					_ => {}
-				}
-			}
-			assert!(memberships.contains(&(projection, TraitIdx::new(0))));
+			assert!(
+				memberships(&case.context, assumption_context)
+					.contains(&(projection, TraitIdx::new(0)))
+			);
+			let clauses = case.context.param_bounds
+				[usize::from(assumption_context)][0]
+				.clauses;
+			let equalities =
+				case.context.clauses.equalities(clauses.equalities.unwrap());
+			assert_eq!(equalities.len(), 1);
+			assert_eq!(equalities[0].projection, projection);
+			assert_eq!(equalities[0].value, stored);
 			let BindingRequirement::Equals(source) =
-				case.context.bounds.binding(equality.unwrap()).kind
+				case.context.bounds.binding(equalities[0].source).kind
 			else {
 				panic!()
 			};
@@ -14107,18 +14008,13 @@ pub(super) mod tests {
 				panic!()
 			};
 			assert_eq!(case.context.types.list(*type_args), &[TypeIndex::I32]);
-			// ...while the stored source fact keeps `U::Item` symbolic.
-			let ImpliedBindingKind::Equals(value) = case.context.param_bounds
+			// ...while the stored clause keeps `U::Item` symbolic.
+			let clauses = case.context.param_bounds
 				[usize::from(assumption_context)][0]
-				.facts
-				.current()[0]
-				.bindings[0]
-				.kind
-			else {
-				panic!()
-			};
-			let raw = value.value;
-			let source = value.source;
+				.clauses;
+			let clause =
+				case.context.clauses.equalities(clauses.equalities.unwrap())[0];
+			let (raw, source) = (clause.value, clause.source);
 			let Type::Struct { type_args, .. } =
 				case.context.types.resolve(raw)
 			else {
@@ -14136,35 +14032,18 @@ pub(super) mod tests {
 				panic!()
 			};
 			assert_eq!(value.inner, raw);
-			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context);
-			assert_eq!(facts.readiness, Readiness::Ready);
-			let mut retained = false;
-			while let Some(fact) = facts.next(types) {
-				if let AssumptionKind::Equality(ImpliedBindingKind::Equals(
-					value,
-				)) = fact.kind
-				{
-					retained |= value.source == source && value.value == raw;
-				}
-			}
-			assert!(retained);
 		}
 
 		fn memberships(
-			registry: &mut TypeContext<'_, '_, '_>,
+			registry: &TypeContext<'_, '_, '_>,
 			assumption_context: TypeEnvIdx,
 		) -> Vec<(TypeIndex, TraitIdx)> {
-			let (reader, types) = registry.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context);
-			assert_eq!(facts.readiness, Readiness::Ready);
-			let mut result = Vec::new();
-			while let Some(fact) = facts.next(types) {
-				if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
-					result.push((fact.subject, trait_index));
-				}
-			}
-			result
+			let tables = registry.clause_tables();
+			assert_eq!(
+				tables.assumptions_readiness(assumption_context),
+				Readiness::Ready
+			);
+			tables.assumed_traits(assumption_context).collect()
 		}
 
 		#[test]
@@ -14216,14 +14095,14 @@ pub(super) mod tests {
 			);
 			let free_cx = case.context.functions[free].type_params;
 			assert_eq!(free_cx, TypeEnvIdx::ROOT);
-			let local = memberships(&mut case.context, assumption_context);
+			let local = memberships(&case.context, assumption_context);
 			assert!(local.contains(&(outer, TraitIdx::new(0))));
 			assert!(local.iter().any(|&(_, index)| index == TraitIdx::new(1)));
 			assert_eq!(
-				memberships(&mut case.context, plain_cx),
+				memberships(&case.context, plain_cx),
 				vec![(outer, TraitIdx::new(0))]
 			);
-			assert!(memberships(&mut case.context, free_cx).is_empty());
+			assert!(memberships(&case.context, free_cx).is_empty());
 		}
 
 		#[test]
@@ -14262,37 +14141,40 @@ pub(super) mod tests {
 				case.context.functions[index].param_types[0],
 				trait_self
 			);
-			let facts = memberships(&mut case.context, assumption_context);
+			let facts = memberships(&case.context, assumption_context);
 			assert!(facts.contains(&(trait_self, TraitIdx::new(2))));
 			assert!(facts.contains(&(trait_self, TraitIdx::new(1))));
 			let signature = case.function_signature("user");
 			let subject = signature.param_types[0];
 			let receiver =
 				case.context.type_envs.param_types(signature.type_params)[0];
-			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.subject_facts(subject, types, 128);
-			assert_eq!(facts.readiness, Readiness::Ready);
-			let mut equalities = 0;
-			while let Some(fact) = facts.next(types) {
-				if let AssumptionKind::Equality(ImpliedBindingKind::Equals(
-					value,
-				)) = fact.kind
+			// `Item`'s declaration states its equality with `Self` read as
+			// the receiver.
+			let tables = case.context.clause_tables();
+			let sources =
+				tables.declarations_of(&case.context.types, subject, 128);
+			assert_eq!(sources.readiness, Readiness::Ready);
+			let mut equalities = Vec::new();
+			for source in sources {
+				for clause in tables
+					.clauses
+					.equalities(source.clauses.equalities.unwrap())
 				{
-					let substitution = fact.self_substitution.unwrap();
-					assert_eq!(substitution.receiver, receiver);
-					let rhs = types.substitute(
-						value.value,
-						Substitution {
-							envs: reader.type_envs,
-							env: substitution.env,
-							args: &[substitution.receiver],
-						},
-					);
-					assert_eq!(rhs, receiver);
-					equalities += 1;
+					equalities.push((clause.value, source.context.unwrap()));
 				}
 			}
-			assert_eq!(equalities, 1);
+			assert_eq!(equalities.len(), 1);
+			let (value, context) = equalities[0];
+			assert_eq!(context.receiver, receiver);
+			let rhs = case.context.types.substitute(
+				value,
+				Substitution {
+					envs: &case.context.type_envs,
+					env: context.env,
+					args: &[context.receiver],
+				},
+			);
+			assert_eq!(rhs, receiver);
 		}
 
 		#[test]
@@ -15177,21 +15059,18 @@ pub(super) mod tests {
 					// `U` is only provably a `Marker` through `T::Item = U`, an
 					// equality fact: the proof must wait for the facts to be final.
 					let ty = builder.type_envs.param_types(env)[1];
-					let facts = builder.param_bounds[usize::from(env)][0]
-						.facts
-						.current()
-						.to_vec()
-						.into_boxed_slice();
-					builder.param_bounds[usize::from(env)][0].facts =
-						BoundFacts::Provisional(facts.clone());
+					let clauses =
+						builder.param_bounds[usize::from(env)][0].clauses;
+					builder.param_bounds[usize::from(env)][0]
+						.clauses
+						.equalities = None;
 					assert_eq!(
 						builder
 							.find_trait_impl_query(env, ty, TraitIdx::new(0))
 							.map(|found| found.is_some()),
 						Err(SolverError::Pending)
 					);
-					builder.param_bounds[usize::from(env)][0].facts =
-						BoundFacts::Ready(facts);
+					builder.param_bounds[usize::from(env)][0].clauses = clauses;
 					assert_eq!(
 						builder
 							.find_trait_impl_query(env, ty, TraitIdx::new(0))
@@ -15313,18 +15192,13 @@ pub(super) mod tests {
 			// The stored fact `Item = Need<U::Item>` is exactly as written; the
 			// failed check does not rewrite it.
 			let signature = case.function_signature("bad");
-			let binding = &case.context.param_bounds
+			let clauses = case.context.param_bounds
 				[usize::from(signature.type_params)][0]
-				.facts
-				.current()[0]
-				.bindings[0];
-			let super::super::super::bounds::ImpliedBindingKind::Equals(fact) =
-				binding.kind
-			else {
-				panic!()
-			};
+				.clauses;
+			let clause =
+				case.context.clauses.equalities(clauses.equalities.unwrap())[0];
 			let Type::Struct { type_args, .. } =
-				case.context.types.resolve(fact.value)
+				case.context.types.resolve(clause.value)
 			else {
 				panic!()
 			};

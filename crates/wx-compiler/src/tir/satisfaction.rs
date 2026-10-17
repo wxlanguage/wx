@@ -4,10 +4,10 @@
 //! verification — will eventually go through, once any of those exist.
 //!
 //! Concrete membership uses dispatch candidate discovery followed by full
-//! impl-target matching. Abstract membership reads the same effective facts
-//! as normalization and member lookup. A bound's bindings are proven too: an
+//! impl-target matching. Abstract membership reads the same clauses as
+//! normalization and member lookup. A bound's bindings are proven too: an
 //! equality by comparing the normalized projection with the written value, a
-//! nested bound on the projection. That proof is `Solver::satisfies_bound`,
+//! nested bound on the projection. That proof is `Solver::satisfies_clauses`,
 //! shared with impl selection; this module reports its failures. Impl
 //! conformance (an impl's associated values against their declared bounds)
 //! is not validated.
@@ -26,10 +26,7 @@ use super::solver::{SolverError, Unsatisfied};
 use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::bounds::{
-	BindingRequirement, BoundFacts, EqualityFact, ImpliedTraitBound,
-};
-use crate::tir::solver::SolverView;
+use crate::tir::bounds::{BindingRef, BindingRequirement};
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
@@ -129,36 +126,8 @@ impl TypeContext<'_, '_, '_> {
 	}
 }
 
-impl<'a> SolverView<'a> {
-	/// The facts live in the shared tables, not in the view, so they outlive
-	/// this borrow of it: a caller can read them while it lends the view on.
-	fn requirement_facts(
-		&self,
-		requirements: BoundRequirements,
-	) -> Result<&'a [ImpliedTraitBound], ()> {
-		// Copied out, so indexing yields `'a` rather than this `&self`.
-		let (param_bounds, assoc_types) = (self.param_bounds, self.assoc_types);
-		let facts = match requirements {
-			BoundRequirements::Parameter { env, index, .. } => {
-				&param_bounds[usize::from(env)][index].facts
-			}
-			BoundRequirements::AssociatedType { declaration, .. } => {
-				let Some(signature) = &assoc_types[usize::from(declaration)]
-				else {
-					return Err(());
-				};
-				&signature.facts
-			}
-		};
-		match facts {
-			BoundFacts::Ready(facts) => Ok(facts),
-			BoundFacts::Provisional(_) => Err(()),
-		}
-	}
-}
-
 /// The checks bound satisfaction owns, run by the declaration check.
-impl<'a> ObligationChecker<'a> {
+impl ObligationChecker<'_> {
 	/// Gather violations before emitting them: another requirement can still
 	/// be pending, and a retry must not duplicate a diagnostic.
 	pub(super) fn check_requirements(
@@ -169,98 +138,86 @@ impl<'a> ObligationChecker<'a> {
 		reference: SourceSpan,
 		owner: TypeEnvOwner,
 	) -> Result<(), SolverError> {
-		let facts = self
-			.view
-			.requirement_facts(requirements)
-			.map_err(|_| SolverError::Pending)?;
-		// The facts are written in the declaration's frame; the use supplies
-		// that frame's arguments.
-		// The list is copied out of the interner, which the proof interns into.
-		let owned: Box<[TypeIndex]>;
-		let (frame, arguments) = match requirements {
-			BoundRequirements::Parameter { env, arguments, .. } => {
-				owned = self.view.types.list(arguments).into();
-				(env, &*owned)
-			}
-			BoundRequirements::AssociatedType {
-				trait_index,
-				ref receiver,
-				..
-			} => (
-				self.view.traits[usize::from(trait_index)].env,
-				std::slice::from_ref(receiver),
-			),
-		};
-		let mut result = Ok(());
-		for bound in facts {
-			if !self.check_bound(
-				assumption_context,
-				(frame, arguments),
-				reference.file_id,
-				argument,
-				bound,
-				owner,
-			)? {
-				result = Err(SolverError::Poisoned);
-			}
-		}
-		result
-	}
-
-	/// Proves `bound` on `subject` (`Solver::satisfies_bound`) and reports
-	/// each failure here, once, at the use.
-	fn check_bound(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		substitution: (TypeEnvIdx, &[TypeIndex]),
-		file_id: FileId,
-		subject: Spanned<TypeIndex>,
-		bound: &'a ImpliedTraitBound,
-		owner: TypeEnvOwner,
-	) -> Result<bool, SolverError> {
+		// The clauses are written in the declaration's frame, about its own
+		// subject; the use supplies that frame's arguments and the subject.
+		// The arguments are owned: the proof interns while it reads them.
+		let (clauses, root, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
+			match requirements {
+				BoundRequirements::Parameter {
+					env,
+					index,
+					arguments,
+				} => (
+					self.view.param_bounds[usize::from(env)][index].clauses,
+					self.view.type_envs.param_types(env)[index],
+					env,
+					self.view.types.list(arguments).into(),
+				),
+				BoundRequirements::AssociatedType {
+					declaration,
+					trait_index,
+					receiver,
+				} => {
+					let Some(signature) =
+						&self.view.assoc_types[usize::from(declaration)]
+					else {
+						return Err(SolverError::Pending);
+					};
+					let env = self.view.traits[usize::from(trait_index)].env;
+					let root =
+						self.view.types.intern(Type::AssocTypeProjection {
+							base: self.view.type_envs.param_types(env)[0],
+							trait_index,
+							assoc_type_index: declaration,
+						});
+					(signature.clauses, root, env, Box::new([receiver]))
+				}
+			};
 		let mut failures = Vec::new();
-		if self.solver.satisfies_bound(
+		if self.solver.satisfies_clauses(
 			&mut self.view,
 			assumption_context,
-			substitution,
-			subject.inner,
-			bound,
+			clauses,
+			(root, argument.inner),
+			(frame, &arguments),
 			Some(&mut failures),
+			None,
 		)? {
-			return Ok(true);
+			return Ok(());
 		}
 		for failure in failures {
 			let diagnostic = match failure {
 				Unsatisfied::Trait {
-					subject: failed,
-					bound,
+					subject,
+					trait_index,
+					source,
 				} => self.report_trait_bound_violation(
-					file_id,
+					reference.file_id,
 					Spanned {
-						inner: failed,
-						span: subject.span,
+						inner: subject,
+						span: argument.span,
 					},
-					bound.trait_index,
-					bound.source,
+					trait_index,
+					source,
 					owner,
 				),
 				Unsatisfied::Equality {
 					projection,
 					found,
 					expected,
-					fact,
+					source,
 				} => self.report_equality_mismatch(
-					SourceSpan::new(file_id, subject.span),
+					SourceSpan::new(reference.file_id, argument.span),
 					projection,
 					found,
 					expected,
-					fact,
+					source,
 					owner,
 				),
 			};
 			self.diagnostics.push(diagnostic);
 		}
-		Ok(false)
+		Err(SolverError::Poisoned)
 	}
 
 	/// `projection::name` could not be selected from the projection's declared
@@ -333,13 +290,14 @@ impl<'a> ObligationChecker<'a> {
 				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) =>
 			{
-				let bounds = self.view.effective_bounds(
+				let declared = self.view.clause_tables().declared_traits(
+					&*self.view.types,
 					normalized,
 					self.solver.state.recursion_budget,
 				);
 				match TypeContext::select_declared_member(
 					self.view.defs,
-					bounds,
+					declared,
 					key,
 				) {
 					MemberLookup::Found(member) => {
@@ -440,7 +398,7 @@ impl<'a> ObligationChecker<'a> {
 		projection: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
-		fact: &EqualityFact,
+		source: BindingRef,
 		owner: TypeEnvOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter();
@@ -449,17 +407,14 @@ impl<'a> ObligationChecker<'a> {
 			formatter.display_type(found),
 			formatter.display_type(expected),
 		);
-		let ast::Spanned { span, .. } =
-			match self.bounds.binding(fact.source).kind {
-				BindingRequirement::Equals(value) => value,
-				BindingRequirement::Bound(_) => {
-					unreachable!(
-						"an equality fact comes from a written equality"
-					)
-				}
-			};
+		let ast::Spanned { span, .. } = match self.bounds.binding(source).kind {
+			BindingRequirement::Equals(value) => value,
+			BindingRequirement::Bound(_) => {
+				unreachable!("an equality clause comes from a written equality")
+			}
+		};
 		let written =
-			SourceSpan::new(self.bounds.span(fact.source.bound).file_id, span);
+			SourceSpan::new(self.bounds.span(source.bound).file_id, span);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::AssocTypeEqualityMismatch.code())
 			.with_message(format!(

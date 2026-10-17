@@ -15,10 +15,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
-use super::assumptions::AssumptionKind;
-use super::assumptions::EffectiveBounds;
-use super::assumptions::Readiness;
-use super::bounds::report_not_an_associated_type;
+use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, DefId, DefinitionRegistry,
 	InherentImplIdx, MemberKind, Scope, Tier, TraitIdx, TraitImplIdx,
@@ -260,9 +257,6 @@ impl TypeContext<'_, '_, '_> {
 					Err(lookup) => return lookup,
 				};
 			for trait_index in scoped {
-				if traits.contains(&trait_index) {
-					continue;
-				}
 				match self.check_assumed_trait(
 					assumption_context,
 					receiver,
@@ -850,20 +844,16 @@ impl TypeContext<'_, '_, '_> {
 		assumption_context: TypeEnvIdx,
 		key: BindingKey,
 	) -> Result<(Vec<TraitIdx>, Readiness), MemberLookup> {
-		let defs = self.defs;
+		let tables = self.clause_tables();
+		let readiness = tables.assumptions_readiness(assumption_context);
 		let mut traits = Vec::new();
-		let (reader, types) = self.assumptions();
-		let mut facts = reader.scoped_facts(assumption_context);
-		let readiness = facts.readiness;
-		while let Some(fact) = facts.next(types) {
-			if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
-				if defs.traits[usize::from(trait_index)]
-					.bindings
-					.contains_key(&key)
-					&& !traits.contains(&trait_index)
-				{
-					traits.push(trait_index);
-				}
+		for (_, trait_index) in tables.assumed_traits(assumption_context) {
+			if self.defs.traits[usize::from(trait_index)]
+				.bindings
+				.contains_key(&key)
+				&& !traits.contains(&trait_index)
+			{
+				traits.push(trait_index);
 			}
 		}
 		if readiness == Readiness::Overflowed {
@@ -942,12 +932,16 @@ impl TypeContext<'_, '_, '_> {
 		) {
 			return MemberLookup::NotFound;
 		}
-		if self.prepare_effective_bounds(receiver, reference).is_err() {
+		if self.prepare_declarations_of(receiver, reference).is_err() {
 			return MemberLookup::Error;
 		}
 		Self::select_declared_member(
 			self.defs,
-			self.effective_bounds(receiver),
+			self.clause_tables().declared_traits(
+				&self.types,
+				receiver,
+				self.solver.state.recursion_budget,
+			),
 			key,
 		)
 	}
@@ -955,15 +949,11 @@ impl TypeContext<'_, '_, '_> {
 	/// The members named `key` among the traits `bounds` supply.
 	pub(super) fn select_declared_member(
 		defs: &DefinitionRegistry,
-		bounds: EffectiveBounds<'_>,
+		traits: impl IntoIterator<Item = TraitIdx>,
 		key: BindingKey,
 	) -> MemberLookup {
 		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
-		for trait_index in bounds
-			.reflexive_trait
-			.into_iter()
-			.chain(bounds.map(|view| view.bound.trait_index))
-		{
+		for trait_index in traits {
 			// The same trait can be supplied by a declaration and a nested
 			// receiver constraint; that does not make its member ambiguous.
 			if candidates.as_ref().is_some_and(|items| {

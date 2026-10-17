@@ -53,24 +53,27 @@ committed test covers it yet).
   stores `x: T`, but the body also has the local facts `U::Item = T` and
   `U::Item: Marker`. Always start from the function's context, not from the
   type's declaring frame. Sibling methods never see each other's facts.
-- Facts are read with the borrowed reader, which lends fact storage and the
-  interner separately (forming projected subjects may intern):
+- What a parameter or an associated declaration assumes is a flat run of
+  clauses (`bounds::BoundClauses` in the `ClauseArena`): `subject: Trait` and
+  `projection == value`, its nested bounds as clauses on projections and each
+  trait's own clauses (its supertraits) substituted for `Self`. They are read
+  with the borrowed `ClauseTables`:
 
   ```rust
-  let cx = tcx.functions[usize::from(function_index)].assumption_context();
-  let (reader, types) = tcx.assumptions();
-  let mut facts = reader.scoped_facts(cx, types);
-  while let Some(fact) = facts.next(types) { /* trait memberships, equalities */ }
+  let tables = tcx.clause_tables();
+  let readiness = tables.assumptions_readiness(cx);
+  for (subject, trait_index) in tables.assumed_traits(cx) { /* memberships */ }
+  for source in tables.declarations_of(&tcx.types, receiver, budget) { /* clauses describing `receiver` */ }
   ```
 
-  `scoped_facts` walks finite written parameter trees and lexical parents, skips
-  Self frames that merely name an existing type, and gives a trait's abstract
-  Self an implicit membership in that trait plus its written supertraits.
-  `subject_facts(subject, types, remaining_depth)` adds associated-declaration
-  bounds along a projection path; pass the operation's remaining budget. Such
-  facts may carry a `SelfSubstitution`: instantiate the borrowed equality RHS
-  with its recorded environment and the receiver before comparing, never with the
-  declaration's literal Self.
+  `assumed_traits` scans the parameters of the scope and its lexical parents,
+  and gives a trait's abstract Self an implicit membership in that trait.
+  `declarations_of` yields the associated declarations along a projection path,
+  then the parameter at its root; pass the operation's remaining budget. A
+  declaration's clauses carry a `SelfSubstitution`: `DeclarationSource::names` matches
+  a clause's subject against the receiver without interning, and an equality's
+  value is instantiated with the recorded environment and the receiver before
+  comparing, never with the declaration's literal Self.
 - Normalization keeps symbolic source terms: a stored `Need<i32>` may stem from
   `T::Item = Need<U::Item>`. Both identities matter when matching subjects.
   Ambiguous or conflicting equalities keep their distinct representations.
