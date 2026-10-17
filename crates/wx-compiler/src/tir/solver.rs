@@ -5,7 +5,7 @@
 //!
 //! Declaration identity stays in projections; abstract equalities come from
 //! effective bounds; concrete values come from selected impl members, whose
-//! values the solver judges once (`AssocValue`). Evidence comparison uses the
+//! values the solver judges once (`Verdict`). Evidence comparison uses the
 //! same traversal and budget, reducing assumed equalities without selecting
 //! providers. Structural substitution remains independent in `types.rs`.
 
@@ -18,7 +18,9 @@ use super::assumptions::{
 	AssumptionKind, AssumptionReader, EffectiveBounds, Readiness,
 	SelfSubstitution,
 };
-use super::bounds::ImpliedBindingKind;
+use super::bounds::{
+	BoundId, EqualityFact, ImpliedBindingKind, ImpliedTraitBound,
+};
 use super::defs::{
 	AssocTypeIdx, BindingKey, DefinitionRegistry, FunctionOwner, MemberKind,
 	TraitIdx, TraitImplIdx,
@@ -26,11 +28,12 @@ use super::defs::{
 use super::impls::{ImplDispatch, ImplTarget};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
-	AssocTypeSignature, ParamBounds, TraitImplSignature, TraitSignature,
-	TypeContext,
+	AssocTypeSignature, InherentImplSignature, ParamBounds, TraitImplSignature,
+	TraitSignature, TypeContext,
 };
 use super::types::{
-	Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex, TypeInterner,
+	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
+	TypeInterner,
 };
 
 /// Why the solver (normalization and impl selection, which are one recursive
@@ -54,6 +57,22 @@ pub(super) enum SolverError {
 	Cycle(Box<ProjectionCycle>),
 }
 
+/// Why a bound does not hold, for the check that owns it to report.
+pub(super) enum Unsatisfied<'a> {
+	/// `subject` lacks the trait `bound` names.
+	Trait {
+		subject: TypeIndex,
+		bound: &'a ImpliedTraitBound,
+	},
+	/// The projection an equality names has another value.
+	Equality {
+		projection: TypeIndex,
+		found: TypeIndex,
+		expected: TypeIndex,
+		fact: &'a EqualityFact,
+	},
+}
+
 /// A projection that normalization reached again while normalizing it: the
 /// loop, read from the projection that closed it.
 #[derive(Clone, PartialEq)]
@@ -63,10 +82,48 @@ pub(super) struct ProjectionCycle {
 	pub(super) projection: TypeIndex,
 	/// The projections in flight when it came back, outermost first.
 	pub(super) steps: Box<[TypeIndex]>,
-	/// The impl member in the loop that owns it (`AssocValue`): the first
-	/// defined, so the report does not depend on which member was asked for
-	/// first. `None` for a loop found within one derivation.
-	pub(super) owner: Option<ImplMember>,
+	/// The definition in the loop that owns it: the first defined, so the
+	/// report does not depend on which was asked for first. `None` for a loop
+	/// found within one derivation.
+	pub(super) owner: Option<Definition>,
+	/// For a loop an impl's requirements own: the bound being proved when it
+	/// closed, where the impl's check reports it.
+	pub(super) bound: Option<BoundId>,
+}
+
+/// A definition the solver judges once, in its own scope, and which owns the
+/// loops through it (`Verdict`). These are the definitions on the solver's own
+/// path: a projection reduces through an impl member's value, and selecting
+/// an impl proves its requirements. Another declaration's bounds are proved
+/// only where it is used, by the obligation that uses it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum Definition {
+	/// An impl member's value.
+	Member(ImplMember),
+	/// An impl's requirements (the bounds on its parameters), proved for its
+	/// own parameters in its own scope: the instantiation every other one is
+	/// a substitution of.
+	Requirements(ImplKind),
+}
+
+impl Definition {
+	/// Definition order, which picks a loop's owner: an impl's requirements
+	/// come before its members, as its header comes before its body.
+	fn order(self) -> (u8, usize, u8, usize) {
+		match self {
+			Self::Requirements(ImplKind::Trait(index)) => {
+				(0, usize::from(index), 0, 0)
+			}
+			Self::Member(member) => {
+				let (impl_index, declaration) = member.order();
+				(0, impl_index, 1, declaration)
+			}
+			Self::Requirements(ImplKind::Inherent(index)) => {
+				(1, usize::from(index), 0, 0)
+			}
+		}
+	}
 }
 
 /// One associated type of one trait impl: the value the impl supplies, or the
@@ -86,24 +143,25 @@ impl ImplMember {
 	}
 }
 
-/// What the solver has concluded about an impl member's value, judged on first
-/// use (`Solver::assoc_value`). The signatures keep the value as
-/// written (`AssocTypeSignature::value`).
+/// What the solver has concluded about a `Definition`, judged on first use
+/// (`Solver::assoc_value`, `Solver::requirements_verdict`). The signatures
+/// keep what was written.
 ///
 /// A loop through definitions has no root cause, so the definitions own it:
-/// the first defined member keeps the failure for its own check to report,
-/// and every other reader of a poisoned value fails silently, as it would for
-/// a value that failed to lower. The verdict depends on the definitions alone,
-/// so it does not matter who asks first.
+/// the first defined keeps the failure for its own check to report, and
+/// every other reader of a poisoned definition fails silently, as it would
+/// for a value that failed to lower. The verdict depends on the definitions
+/// alone, so it does not matter who asks first.
 #[derive(Clone, PartialEq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum AssocValue {
+pub(super) enum Verdict {
 	/// Not asked for yet.
 	Unchecked,
 	/// Being judged; reaching it again closes a loop through definitions.
 	InProgress,
-	/// The value normalizes in the impl's own scope. Readers still take the
-	/// value as written and normalize it in their own context.
+	/// A member's value normalizes, or an impl's requirements are decided, in
+	/// the impl's own scope. Readers still take what is written and judge it
+	/// in their own context.
 	Resolved,
 	/// The value has no meaning because it derives from a failure another
 	/// construct owns and reports.
@@ -111,8 +169,8 @@ pub(super) enum AssocValue {
 	/// The judgement ran out of budget. The definition owns this, and its
 	/// check reports it.
 	Overflowed,
-	/// The value requires itself through definitions only, and this member
-	/// owns the loop. Its check reports it.
+	/// The definition requires itself through definitions only, and owns the
+	/// loop. Its check reports it.
 	Cyclic(Box<ProjectionCycle>),
 }
 
@@ -165,6 +223,47 @@ enum SolverFrame {
 		requested_by: Option<TypeIndex>,
 		outer_budget: usize,
 	},
+	/// A definition: an impl's requirements being judged for its own
+	/// parameters in its own scope (`impl<T: Tr where { A = W<T> }> ..`
+	/// proves `T: Tr` and `T::A = W<T>`). Selecting the impl for those same
+	/// parameters there again closes a loop; for other arguments it is
+	/// ordinary recursion (`impl<T: Tr> Tr for Box<T>`). `bound` is the bound
+	/// being proved, where a loop it owns is reported; the budget is the
+	/// judgement's own, as for a member.
+	Requirements {
+		impl_kind: ImplKind,
+		bound: Option<BoundId>,
+		outer_budget: usize,
+	},
+}
+
+/// The projections in flight on `frames`, outermost first.
+fn projection_steps(frames: &[SolverFrame]) -> Vec<TypeIndex> {
+	frames
+		.iter()
+		.filter_map(|frame| match frame {
+			SolverFrame::Projection(step) => Some(step.ty),
+			SolverFrame::Equality
+			| SolverFrame::Judgement { .. }
+			| SolverFrame::Requirements { .. } => None,
+		})
+		.collect()
+}
+
+/// The first defined definition on a loop's frames.
+fn loop_owner(frames: &[SolverFrame]) -> Option<Definition> {
+	frames
+		.iter()
+		.filter_map(|frame| match *frame {
+			SolverFrame::Judgement { member, .. } => {
+				Some(Definition::Member(member))
+			}
+			SolverFrame::Requirements { impl_kind, .. } => {
+				Some(Definition::Requirements(impl_kind))
+			}
+			SolverFrame::Projection(_) | SolverFrame::Equality => None,
+		})
+		.min_by_key(|definition| definition.order())
 }
 
 /// The derivation currently being computed. Shared across re-entrant
@@ -186,7 +285,7 @@ pub(super) struct SolverState {
 
 /// The engine that normalizes types and selects impls, with everything it
 /// keeps: the derivation in flight, the finished-answer cache and the rule for
-/// when it may be used, and the verdicts on impl members' values.
+/// when it may be used, and the verdicts on the definitions it judges.
 pub(super) struct Solver {
 	/// The recursion budget each request and each judgement starts with. Fixed
 	/// configuration, not state; only tests change it.
@@ -198,10 +297,10 @@ pub(super) struct Solver {
 	/// stored answer was final when computed, so no "facts are final" switch is
 	/// needed.
 	pub(super) normalized: HashMap<Normalization, TypeIndex>,
-	/// The verdict on each impl member asked about; absent is `Unchecked`.
-	/// A member is `InProgress` exactly while its `SolverFrame::Judgement` is on
-	/// the stack.
-	pub(super) verdicts: HashMap<ImplMember, AssocValue>,
+	/// The verdict on each definition asked about; absent is `Unchecked`. A
+	/// definition is `InProgress` exactly while its judgement's frame
+	/// (`SolverFrame::Judgement`, `SolverFrame::Requirements`) is on the stack.
+	pub(super) verdicts: HashMap<Definition, Verdict>,
 }
 
 impl Solver {
@@ -220,8 +319,10 @@ impl Solver {
 		}
 	}
 
-	pub(super) fn verdict(&self, member: ImplMember) -> &AssocValue {
-		self.verdicts.get(&member).unwrap_or(&AssocValue::Unchecked)
+	pub(super) fn verdict(&self, definition: Definition) -> &Verdict {
+		self.verdicts
+			.get(&definition)
+			.unwrap_or(&Verdict::Unchecked)
 	}
 
 	/// `member`'s value, judged once: normalized in its impl's `Self` scope with
@@ -232,7 +333,7 @@ impl Solver {
 	/// Answers the value as written in the impl's environment; the caller
 	/// instantiates it. The judgement is a frame on the same stack, so
 	/// reaching the member again sees the whole loop: through definitions only,
-	/// it is a cycle owned by its first defined member (see `AssocValue`);
+	/// it is a cycle owned by its first defined member (see `Verdict`);
 	/// through an equality, it is a tautology the derivation itself blocks.
 	pub(super) fn assoc_value(
 		&mut self,
@@ -240,22 +341,23 @@ impl Solver {
 		member: ImplMember,
 		requested_by: Option<TypeIndex>,
 	) -> Result<TypeIndex, SolverError> {
-		match self.verdict(member) {
-			AssocValue::Unchecked => {}
-			AssocValue::InProgress => {
+		match self.verdict(Definition::Member(member)) {
+			Verdict::Unchecked => {}
+			Verdict::InProgress => {
 				return self.reenter_judgement(view, member, requested_by);
 			}
-			AssocValue::Resolved => return view.impl_member_value(member),
-			AssocValue::Poisoned
-			| AssocValue::Overflowed
-			| AssocValue::Cyclic(_) => return Err(SolverError::Poisoned),
+			Verdict::Resolved => return view.impl_member_value(member),
+			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
+				return Err(SolverError::Poisoned);
+			}
 		}
 		let value = match view.impl_member_value(member) {
 			Ok(value) => value,
 			// No value (lowering failed and reported, or neither the impl nor the
 			// trait supplies one, which conformance owns); nothing to judge.
 			Err(SolverError::Poisoned) => {
-				self.verdicts.insert(member, AssocValue::Poisoned);
+				self.verdicts
+					.insert(Definition::Member(member), Verdict::Poisoned);
 				return Err(SolverError::Poisoned);
 			}
 			Err(error) => return Err(error),
@@ -264,7 +366,8 @@ impl Solver {
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
 			.type_params;
-		self.verdicts.insert(member, AssocValue::InProgress);
+		self.verdicts
+			.insert(Definition::Member(member), Verdict::InProgress);
 		let index = self.state.frames.len();
 		self.state.frames.push(SolverFrame::Judgement {
 			member,
@@ -290,35 +393,37 @@ impl Solver {
 		// A tautology further out is unwinding through this judgement, which was
 		// cut short: there is no verdict yet, so it is judged again when asked.
 		if self.state.blocked_at.is_some_and(|blocked| blocked < index) {
-			self.verdicts.remove(&member);
+			self.verdicts.remove(&Definition::Member(member));
 			return Ok(value);
 		}
 		let (verdict, answer) = match result {
-			Ok(_) => (AssocValue::Resolved, Ok(value)),
+			Ok(_) => (Verdict::Resolved, Ok(value)),
 			Err(SolverError::Pending) => {
-				(AssocValue::Unchecked, Err(SolverError::Pending))
+				(Verdict::Unchecked, Err(SolverError::Pending))
 			}
 			Err(SolverError::Poisoned) => {
-				(AssocValue::Poisoned, Err(SolverError::Poisoned))
+				(Verdict::Poisoned, Err(SolverError::Poisoned))
 			}
 			// Another member owns the loop. Its own judgement, further out,
 			// answers `Poisoned` once it has kept the loop, so members past it
 			// unwind as derived failures.
 			Err(SolverError::Cycle(cycle))
-				if cycle.owner.is_some_and(|owner| owner != member) =>
+				if cycle.owner.is_some_and(|owner| {
+					owner != Definition::Member(member)
+				}) =>
 			{
-				(AssocValue::Poisoned, Err(SolverError::Cycle(cycle)))
+				(Verdict::Poisoned, Err(SolverError::Cycle(cycle)))
 			}
 			// The budget counts from this judgement, so running out is a verdict
 			// on the definition, like a cycle.
 			Err(SolverError::Overflow) => {
-				(AssocValue::Overflowed, Err(SolverError::Poisoned))
+				(Verdict::Overflowed, Err(SolverError::Poisoned))
 			}
 			Err(SolverError::Cycle(cycle)) => {
-				(AssocValue::Cyclic(cycle), Err(SolverError::Poisoned))
+				(Verdict::Cyclic(cycle), Err(SolverError::Poisoned))
 			}
 		};
-		self.verdicts.insert(member, verdict);
+		self.verdicts.insert(Definition::Member(member), verdict);
 		answer
 	}
 
@@ -349,6 +454,23 @@ impl Solver {
 			.any(|frame| matches!(frame, SolverFrame::Equality))
 		{
 			return view.impl_member_value(member);
+		}
+		// Through an impl's requirements too: read from its projections, and
+		// owned by the first defined definition on it.
+		if loop_frames
+			.iter()
+			.any(|frame| matches!(frame, SolverFrame::Requirements { .. }))
+		{
+			let mut steps = projection_steps(loop_frames);
+			steps.push(
+				requested_by.expect("only a projection re-enters a judgement"),
+			);
+			return Err(SolverError::Cycle(Box::new(ProjectionCycle {
+				projection: steps[0],
+				steps: steps.into_boxed_slice(),
+				owner: loop_owner(loop_frames),
+				bound: None,
+			})));
 		}
 		let mut members = Vec::new();
 		// Each judgement after the first was selected by the projection on its
@@ -385,7 +507,8 @@ impl Solver {
 		Err(SolverError::Cycle(Box::new(ProjectionCycle {
 			projection: steps[0],
 			steps: steps.into_boxed_slice(),
-			owner: Some(owner),
+			owner: Some(Definition::Member(owner)),
+			bound: None,
 		})))
 	}
 
@@ -453,6 +576,7 @@ pub(super) struct SolverView<'a> {
 	pub(super) impl_dispatch: &'a ImplDispatch,
 	pub(super) traits: &'a [TraitSignature],
 	pub(super) trait_impls: &'a [Option<TraitImplSignature>],
+	pub(super) inherent_impls: &'a [Option<InherentImplSignature>],
 	pub(super) assoc_types: &'a [Option<AssocTypeSignature>],
 	pub(super) param_bounds: &'a [Box<[ParamBounds]>],
 	pub(super) type_envs: &'a TypeEnvArena,
@@ -1037,26 +1161,24 @@ impl Solver {
 			);
 			return Ok(true);
 		}
-		// The loop goes through a value being judged. Repeating the projection
-		// selects that member again one step later, where the judgement reads
-		// the loop and its owner (`reenter_judgement`).
-		if loop_frames
-			.iter()
-			.any(|frame| matches!(frame, SolverFrame::Judgement { .. }))
-		{
+		// The loop goes through a definition: a value being judged or an impl's
+		// requirements being proved. Repeating the projection reaches that
+		// definition again one step later, where it reads the loop and its owner
+		// (`reenter_judgement`, `reenter_requirements`).
+		if loop_frames.iter().any(|frame| {
+			matches!(
+				frame,
+				SolverFrame::Judgement { .. }
+					| SolverFrame::Requirements { .. }
+			)
+		}) {
 			return Ok(false);
 		}
-		let steps = loop_frames
-			.iter()
-			.filter_map(|frame| match frame {
-				SolverFrame::Projection(step) => Some(step.ty),
-				SolverFrame::Equality | SolverFrame::Judgement { .. } => None,
-			})
-			.collect();
 		Err(SolverError::Cycle(Box::new(ProjectionCycle {
 			projection: normalization.ty,
-			steps,
+			steps: projection_steps(loop_frames).into_boxed_slice(),
 			owner: None,
+			bound: None,
 		})))
 	}
 
@@ -1236,29 +1358,28 @@ impl Solver {
 		if matches!(view.types.resolve(receiver), Type::Error | Type::Infer) {
 			return Err(SolverError::Poisoned);
 		}
-		let mut assumed = self.check_assumed_trait(
-			view,
-			assumption_context,
-			receiver,
-			required_trait,
-		)?;
-		if assumed == Assumption::Holds
-			&& ImplTarget::from_type(view.types.resolve(receiver)).is_none()
-		{
-			return Ok(Some(TraitImplLookup::Abstract));
+		// Only an abstract type takes a trait from assumptions. A type an impl
+		// can target has the trait exactly when its impl says so: there is one
+		// impl per trait and constructor, so a local assumption cannot make it
+		// hold, only make the declaration that assumes it impossible to use.
+		let receiver_is_abstract =
+			ImplTarget::from_type(view.types.resolve(receiver)).is_none();
+		let mut assumed = Assumption::Unproven;
+		if receiver_is_abstract {
+			assumed = self.check_assumed_trait(
+				view,
+				assumption_context,
+				receiver,
+				required_trait,
+			)?;
+			if assumed == Assumption::Holds {
+				return Ok(Some(TraitImplLookup::Abstract));
+			}
 		}
 		let normalized =
 			self.normalize_head_query(view, assumption_context, receiver)?;
 		if normalized == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
-		}
-		if normalized != receiver {
-			assumed = assumed.max(self.check_assumed_trait(
-				view,
-				assumption_context,
-				normalized,
-				required_trait,
-			)?);
 		}
 		if let Some(target) =
 			ImplTarget::from_type(view.types.resolve(normalized))
@@ -1269,19 +1390,25 @@ impl Solver {
 						(trait_index == required_trait).then_some(impl_index)
 					},
 				);
-			if let Some(impl_index) = candidate {
-				if let Some(args) = self.match_trait_impl_candidate_query(
+			let Some(impl_index) = candidate else {
+				return Ok(None);
+			};
+			return Ok(self
+				.match_trait_impl_candidate_query(
 					view,
 					assumption_context,
 					impl_index,
 					normalized,
-				)? {
-					return Ok(Some(TraitImplLookup::Concrete {
-						impl_index,
-						args,
-					}));
-				}
-			}
+				)?
+				.map(|args| TraitImplLookup::Concrete { impl_index, args }));
+		}
+		if normalized != receiver {
+			assumed = assumed.max(self.check_assumed_trait(
+				view,
+				assumption_context,
+				normalized,
+				required_trait,
+			)?);
 		}
 		match assumed {
 			Assumption::Holds => Ok(Some(TraitImplLookup::Abstract)),
@@ -1303,38 +1430,28 @@ impl Solver {
 	) -> Result<Assumption, SolverError> {
 		let recursion_budget = self.state.recursion_budget;
 		// Subjects carrying `required`: the scope's facts, then declaration
-		// bounds along `ty`'s path and along each path a written equality
-		// names (Item: Marker). Paths found there are not followed: a
-		// recursive trait describes infinitely many.
+		// bounds along `ty`'s own path. A projection an equality names lends
+		// its declaration bounds to nothing else: `Item = U` with `type Item:
+		// Marker` does not make `U: Marker`, which must be written. Paths found
+		// there are not followed: a recursive trait describes infinitely many.
 		let mut subjects = Vec::new();
-		let mut paths = vec![ty];
 		let mut readiness;
 		{
 			let (reader, types) = view.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context, types);
+			let mut facts = reader.scoped_facts(assumption_context);
 			readiness = facts.readiness;
 			while let Some(fact) = facts.next(types) {
-				match fact.kind {
-					AssumptionKind::Trait { trait_index, .. }
-						if trait_index == required =>
-					{
-						subjects.push(fact.subject)
-					}
-					AssumptionKind::Equality(ImpliedBindingKind::Equals(_)) => {
-						paths.push(fact.subject)
-					}
-					_ => {}
+				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
+				{
+					subjects.push(fact.subject);
 				}
 			}
-			for path in paths {
-				let mut facts =
-					reader.subject_facts(path, types, recursion_budget);
-				readiness = readiness.and(facts.readiness);
-				while let Some(fact) = facts.next(types) {
-					if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
-					{
-						subjects.push(fact.subject);
-					}
+			let mut facts = reader.subject_facts(ty, types, recursion_budget);
+			readiness = readiness.and(facts.readiness);
+			while let Some(fact) = facts.next(types) {
+				if matches!(fact.kind, AssumptionKind::Trait { trait_index, .. } if trait_index == required)
+				{
+					subjects.push(fact.subject);
 				}
 			}
 		}
@@ -1396,6 +1513,7 @@ impl Solver {
 		self.match_impl_target_and_bounds(
 			view,
 			assumption_context,
+			ImplKind::Trait(impl_index),
 			header.type_params,
 			header.target.inner,
 			receiver,
@@ -1403,12 +1521,14 @@ impl Solver {
 	}
 
 	/// `assumption_context` is the caller's; `impl_env` is the candidate impl's own
-	/// parameter frame. The impl's requirements are proved in the caller's
-	/// assumptions, never the candidate's.
+	/// parameter frame (for a synthetic impl, the frame it is generic over). The
+	/// impl's requirements are proved in the caller's assumptions, never the
+	/// candidate's.
 	fn match_impl_target_and_bounds(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
+		impl_kind: ImplKind,
 		impl_env: TypeEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
@@ -1426,13 +1546,190 @@ impl Solver {
 		// of them instead of requiring each to remember it independently.
 		let receiver =
 			self.normalize_type_query(view, assumption_context, receiver)?;
-		let (envs, param_bounds) = (view.type_envs, view.param_bounds);
-		let Some(args) = view
-			.types
-			.match_impl_target(target, receiver, envs, impl_env)
-		else {
+		let Some(args) = view.types.match_impl_target(
+			target,
+			receiver,
+			view.type_envs,
+			impl_env,
+		) else {
 			return Ok(None);
 		};
+		// The impl's requirements are a definition, judged once before any
+		// selection relies on them. While they are judged, the impl's own
+		// instantiation is that judgement; any other is proved as usual.
+		if *self.verdict(Definition::Requirements(impl_kind))
+			== Verdict::InProgress
+		{
+			if assumption_context == impl_env
+				&& *args == *view.type_envs.identity_args(impl_env)
+			{
+				self.reenter_requirements(impl_kind)?;
+				return Ok(Some(args));
+			}
+		} else {
+			self.requirements_verdict(view, impl_kind)?;
+		}
+		if self.prove_requirements(
+			view,
+			assumption_context,
+			impl_env,
+			&args,
+			None,
+		)? {
+			Ok(Some(args))
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// `impl_kind`'s requirements, judged once: proved for its own parameters
+	/// in its own scope, with a budget of its own, so the verdict depends on
+	/// the definitions alone and is memoized whoever asks first. A loop is a
+	/// selection of the impl's own instantiation while this judgement runs
+	/// (`reenter_requirements`); the verdict keeps a loop it owns, at the bound
+	/// it closed in, for the impl's check to report (`CheckImplRequirements`),
+	/// and every reader of a failed verdict fails silently.
+	///
+	/// Whether the requirements hold there is no part of the verdict: in its
+	/// own scope they are assumptions, and a selection proves them for its own
+	/// arguments.
+	pub(super) fn requirements_verdict(
+		&mut self,
+		view: &mut SolverView<'_>,
+		impl_kind: ImplKind,
+	) -> Result<(), SolverError> {
+		let definition = Definition::Requirements(impl_kind);
+		match self.verdict(definition) {
+			Verdict::Unchecked => {}
+			Verdict::Resolved => return Ok(()),
+			Verdict::InProgress => {
+				unreachable!("a selection re-entering the judgement is a loop")
+			}
+			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
+				return Err(SolverError::Poisoned);
+			}
+		}
+		let impl_env = match impl_kind {
+			ImplKind::Trait(index) => view.trait_impls[usize::from(index)]
+				.as_ref()
+				.map(|header| header.type_params),
+			ImplKind::Inherent(index) => view.inherent_impls
+				[usize::from(index)]
+			.as_ref()
+			.map(|header| header.type_params),
+		}
+		.ok_or(SolverError::Pending)?;
+		let args = view.type_envs.identity_args(impl_env);
+		self.verdicts.insert(definition, Verdict::InProgress);
+		let index = self.state.frames.len();
+		self.state.frames.push(SolverFrame::Requirements {
+			impl_kind,
+			bound: None,
+			outer_budget: std::mem::replace(
+				&mut self.state.recursion_budget,
+				self.recursion_limit,
+			),
+		});
+		let result = self.prove_requirements(
+			view,
+			impl_env,
+			impl_env,
+			args,
+			Some(index),
+		);
+		let Some(SolverFrame::Requirements {
+			bound,
+			outer_budget,
+			..
+		}) = self.state.frames.pop()
+		else {
+			unreachable!("the judgement is the innermost frame once it is done")
+		};
+		self.state.recursion_budget = outer_budget;
+		// A tautology further out is unwinding through this judgement, which was
+		// cut short: there is no verdict yet, so it is judged again when asked.
+		if self.state.blocked_at.is_some_and(|blocked| blocked < index) {
+			self.verdicts.remove(&definition);
+			return Ok(());
+		}
+		let (verdict, answer) = match result {
+			Ok(_) => (Verdict::Resolved, Ok(())),
+			Err(SolverError::Pending) => {
+				self.verdicts.remove(&definition);
+				return Err(SolverError::Pending);
+			}
+			Err(SolverError::Poisoned) => {
+				(Verdict::Poisoned, Err(SolverError::Poisoned))
+			}
+			// Another definition owns the loop; this one derives from it.
+			Err(SolverError::Cycle(cycle))
+				if cycle.owner.is_some_and(|owner| owner != definition) =>
+			{
+				(Verdict::Poisoned, Err(SolverError::Cycle(cycle)))
+			}
+			Err(SolverError::Overflow) => {
+				(Verdict::Overflowed, Err(SolverError::Poisoned))
+			}
+			// This impl owns the loop, or one found inside its requirements:
+			// either way the requirement it closed in is where it is written.
+			Err(SolverError::Cycle(mut cycle)) => {
+				cycle.owner = Some(definition);
+				cycle.bound = bound;
+				(Verdict::Cyclic(cycle), Err(SolverError::Poisoned))
+			}
+		};
+		self.verdicts.insert(definition, verdict);
+		answer
+	}
+
+	/// The impl's own instantiation was selected again while its requirements
+	/// are judged. Through an equality on the way back the loop is a
+	/// tautology: the requirements are taken to hold, and nothing read through
+	/// them is cached. Through definitions only, it is a cycle, owned by the
+	/// first defined definition on it.
+	fn reenter_requirements(
+		&mut self,
+		impl_kind: ImplKind,
+	) -> Result<(), SolverError> {
+		let start = self
+			.state
+			.frames
+			.iter()
+			.position(|frame| {
+				matches!(frame, SolverFrame::Requirements { impl_kind: judged, .. } if *judged == impl_kind)
+			})
+			.expect("an in-progress judgement is on the stack");
+		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		let loop_frames = &self.state.frames[start..];
+		if loop_frames
+			.iter()
+			.any(|frame| matches!(frame, SolverFrame::Equality))
+		{
+			return Ok(());
+		}
+		let steps = projection_steps(loop_frames);
+		Err(SolverError::Cycle(Box::new(ProjectionCycle {
+			projection: *steps
+				.first()
+				.expect("a selection is reached again through a projection"),
+			steps: steps.into_boxed_slice(),
+			owner: loop_owner(loop_frames),
+			bound: None,
+		})))
+	}
+
+	/// Whether every bound on `impl_env`'s chain holds for `args` (its flat
+	/// arguments) under `assumption_context`. A judgement passes its frame,
+	/// which records the bound being proved.
+	fn prove_requirements(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		impl_env: TypeEnvIdx,
+		args: &[TypeIndex],
+		judgement: Option<usize>,
+	) -> Result<bool, SolverError> {
+		let (envs, param_bounds) = (view.type_envs, view.param_bounds);
 		// Every parameter on the impl's chain is an argument of the match,
 		// at its flat slot; its bounds stay in its own frame.
 		for frame in envs.chain(impl_env) {
@@ -1445,27 +1742,136 @@ impl Solver {
 				}
 				let arg = args[start + index];
 				for bound in bounds.facts.current() {
-					// Associated equalities and nested requirements are not
-					// yet proved. Trait membership alone cannot justify
-					// accepting them.
-					if !bound.bindings.is_empty() {
-						return Ok(None);
+					if let Some(judgement) = judgement {
+						let SolverFrame::Requirements {
+							bound: proving, ..
+						} = &mut self.state.frames[judgement]
+						else {
+							unreachable!("the judgement's own frame")
+						};
+						*proving = Some(bound.source);
 					}
-					if self
-						.find_trait_impl_query(
-							view,
-							assumption_context,
-							arg,
-							bound.trait_index,
-						)?
-						.is_none()
-					{
-						return Ok(None);
+					if !self.satisfies_bound(
+						view,
+						assumption_context,
+						(impl_env, args),
+						arg,
+						bound,
+						None,
+					)? {
+						return Ok(false);
 					}
 				}
 			}
 		}
-		Ok(Some(args))
+		Ok(true)
+	}
+
+	/// Whether `subject` satisfies `bound`: its trait, then each binding the
+	/// bound states, as Rust proves `T: Tr<A = X, A: Other>`. An equality
+	/// compares the normalized projection with the written value, substituted
+	/// over `substitution` (the frame the bound is written in and the
+	/// arguments for its whole chain); a nested bound is proved on the
+	/// projection's value the same way. With `failures`, every failure is
+	/// collected for the caller to report; without, the first one answers.
+	pub(super) fn satisfies_bound<'b>(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		substitution: (TypeEnvIdx, &[TypeIndex]),
+		subject: TypeIndex,
+		bound: &'b ImpliedTraitBound,
+		mut failures: Option<&mut Vec<Unsatisfied<'b>>>,
+	) -> Result<bool, SolverError> {
+		if self
+			.find_trait_impl_query(
+				view,
+				assumption_context,
+				subject,
+				bound.trait_index,
+			)?
+			.is_none()
+		{
+			if let Some(failures) = failures {
+				failures.push(Unsatisfied::Trait { subject, bound });
+			}
+			return Ok(false);
+		}
+		let mut satisfied = true;
+		for binding in &bound.bindings {
+			let values = match &binding.kind {
+				ImpliedBindingKind::Equals(fact) => std::slice::from_ref(fact),
+				ImpliedBindingKind::Ambiguous(facts) => facts.as_slice(),
+				// A conflict is the declaration's own error.
+				ImpliedBindingKind::Bound | ImpliedBindingKind::Conflicting => {
+					&[]
+				}
+			};
+			if values.is_empty() && binding.required_bounds.is_empty() {
+				continue;
+			}
+			let projection = view.types.intern(Type::AssocTypeProjection {
+				trait_index: bound.trait_index,
+				assoc_type_index: binding.assoc_type_index,
+				base: subject,
+			});
+			// The projection's value, compared with each equality and, named
+			// by it as the written type it stands for, the nested bounds'
+			// subject.
+			let found = self.normalize_type_query(
+				view,
+				assumption_context,
+				projection,
+			)?;
+			for fact in values {
+				let (frame, arguments) = substitution;
+				let expected = view.types.substitute(
+					fact.value,
+					Substitution {
+						envs: view.type_envs,
+						env: frame,
+						args: arguments,
+					},
+				);
+				let expected = self.normalize_type_query(
+					view,
+					assumption_context,
+					expected,
+				)?;
+				if found == expected
+					|| found == TypeIndex::ERROR
+					|| expected == TypeIndex::ERROR
+				{
+					continue;
+				}
+				let Some(failures) = failures.as_deref_mut() else {
+					return Ok(false);
+				};
+				failures.push(Unsatisfied::Equality {
+					projection,
+					found,
+					expected,
+					fact,
+				});
+				satisfied = false;
+			}
+			for nested in &binding.required_bounds {
+				if !self.satisfies_bound(
+					view,
+					assumption_context,
+					substitution,
+					found,
+					nested,
+					failures.as_deref_mut(),
+				)? {
+					if failures.is_none() {
+						return Ok(false);
+					}
+					satisfied = false;
+				}
+			}
+		}
+		Ok(satisfied)
 	}
 
 	pub(super) fn projection_equality(
@@ -1568,6 +1974,7 @@ impl TypeContext<'_, '_, '_> {
 				impl_dispatch: self.impl_dispatch,
 				traits: &self.traits,
 				trait_impls: &self.trait_impls,
+				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
 				param_bounds: &self.param_bounds,
 				type_envs: &self.type_envs,
@@ -1633,6 +2040,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
 		assumption_context: TypeEnvIdx,
+		impl_kind: ImplKind,
 		impl_env: TypeEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
@@ -1642,6 +2050,7 @@ impl TypeContext<'_, '_, '_> {
 		solver.match_impl_target_and_bounds(
 			&mut view,
 			assumption_context,
+			impl_kind,
 			impl_env,
 			target,
 			receiver,

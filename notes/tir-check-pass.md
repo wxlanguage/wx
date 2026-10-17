@@ -310,6 +310,17 @@ inference variable.
 
 ## Implementation status
 
+Done (2026-10-17, "Impl requirements are definitions"): `AssocValue` became
+`Verdict`, keyed by `solver::Definition` (`Member(ImplMember)` or
+`Requirements(ImplKind)`). An impl's requirements are judged once for its own
+parameters in its own scope (`Solver::requirements_verdict`,
+`SolverFrame::Requirements`); impl selection consults that verdict before
+proving them for its arguments (`satisfies_bound`, shared with use-site
+checks). A loop through them is reported once by `CheckImplRequirements`, at
+the bound it closed in, whatever the source order; selections stay silent.
+A loop that only some instantiation reaches and the impl's own judgement does
+not stays an unowned (`owner: None`) loop, reported by each asker.
+
 Done (latest, "Definitions own their loops"): `AssocValue` verdicts per
 associated type, `Obligation::CheckAssocValue` in place of `CheckWellFormed` for
 an impl's value, the solver's silent `Failed` for a `Poisoned` provider, and the

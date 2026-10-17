@@ -9,7 +9,7 @@
 //! A constant's value is a memoized query (`const_value`), and evaluation asks
 //! it on demand: a constant is read when the node naming it is evaluated, so a
 //! branch that is not taken reads nothing. Like an impl member's value
-//! (`AssocValue`), a constant owns the failures of its own evaluation: the body
+//! (`Verdict`), a constant owns the failures of its own evaluation: the body
 //! phase reports them, and a constant that reads a failed one fails silently. A
 //! loop through constants is owned by its first-defined member, so it is
 //! reported once whichever constant is asked first.

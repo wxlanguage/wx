@@ -532,14 +532,19 @@ impl TypeInterner {
 		)
 	}
 
-	fn push_list(&mut self, elements: &[TypeIndex]) -> TypeList {
-		let list = TypeList {
-			start: u32::try_from(self.lists.len())
+	/// Stores `elements` as a list of their own, not shared with an equal one:
+	/// a type's list is shared through the type, which is interned.
+	pub(super) fn push_list<'e>(
+		&mut self,
+		elements: impl IntoIterator<Item = &'e TypeIndex>,
+	) -> TypeList {
+		let start = self.lists.len();
+		self.lists.extend(elements);
+		TypeList {
+			start: u32::try_from(start)
 				.expect("type interner exceeded u32 list capacity"),
-			len: u32::try_from(elements.len()).unwrap(),
-		};
-		self.lists.extend_from_slice(elements);
-		list
+			len: u32::try_from(self.lists.len() - start).unwrap(),
+		}
 	}
 
 	fn find(
@@ -779,20 +784,6 @@ pub(super) struct Substitution<'a> {
 	pub(super) args: &'a [TypeIndex],
 }
 
-/// One generic parameter of a [`TypeEnv`] frame — a `T` from `<T: Bound>`,
-/// or a trait's or typeset's own `Self` — interned as
-/// `Type::TypeParam { env, param_index }` the moment its frame is built. An
-/// impl's `Self` is not a parameter: it names the impl's target, found
-/// through the impl's frame (`TypeEnvArena::enclosing_impl`).
-///
-/// No bounds here — a frame is never asked for a param's bounds, and those
-/// are a resolved-signature fact anyway (see `signatures.rs`'s own doc
-/// comment), not an identity one.
-pub(super) struct TypeParam {
-	pub(super) name: Spanned<SymbolU32>,
-	pub(super) ty: TypeIndex,
-}
-
 /// A generic reference site's target, identified the same way dispatch and
 /// every other `defs.rs`-facing lookup is — by index into its own registry
 /// array — so `name`/`file_id` can reach straight into `defs.structs[..]`. Constants and enums are also represented for
@@ -811,7 +802,8 @@ pub(super) enum TypeEnvOwner {
 }
 
 /// The impl a frame chain is inside of: what `Self` there names.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum ImplKind {
 	Inherent(InherentImplIdx),
 	Trait(TraitImplIdx),
@@ -887,16 +879,27 @@ impl TypeEnvOwner {
 /// `<T>` frame (which every impl has, even an empty one); then the item's
 /// own explicit `<T>`. Every frame declares parameters, and nothing else.
 ///
+/// A parameter is a `T` from `<T: Bound>`, or a trait's or typeset's own
+/// `Self`, interned as `Type::TypeParam { env, param_index }` the moment its
+/// frame is built. An impl's `Self` is not a parameter: it names the impl's
+/// target, found through the impl's frame (`TypeEnvArena::enclosing_impl`).
+/// No bounds here: those are a resolved-signature fact (see `signatures.rs`'s
+/// own doc comment), not an identity one.
+///
 /// `parent_count` is how many parameters the frames above this one declare
 /// (rustc's `Generics::parent_count`): a parameter's position in its chain's
-/// flat argument list is `parent_count + param_index`.
+/// flat argument list is `parent_count + param_index`. A frame's parameters
+/// live in the arena's tables: `len` names from `names_start`, and from
+/// `types_start` its identity arguments, `parent_count + len` of them.
 enum TypeEnv {
 	Root,
 	Frame {
 		owner: TypeEnvOwner,
-		params: Box<[TypeParam]>,
 		parent: TypeEnvIdx,
 		parent_count: u32,
+		len: u32,
+		names_start: u32,
+		types_start: u32,
 	},
 }
 
@@ -920,6 +923,12 @@ enum TypeEnv {
 /// `TypeIndex`.
 pub(super) struct TypeEnvArena {
 	envs: Vec<TypeEnv>,
+	/// Each frame's own parameter names.
+	names: Vec<Spanned<SymbolU32>>,
+	/// Each frame's identity arguments: the parameters of its whole chain,
+	/// outer frames first, so an instantiation of a frame with its own
+	/// parameters is a slice of this.
+	types: Vec<TypeIndex>,
 }
 
 impl TypeEnvIdx {
@@ -935,6 +944,8 @@ impl TypeEnvArena {
 	pub(super) fn new() -> Self {
 		Self {
 			envs: vec![TypeEnv::Root],
+			names: Vec::new(),
+			types: Vec::new(),
 		}
 	}
 
@@ -949,8 +960,7 @@ impl TypeEnvArena {
 	/// typeset); it is the only way a frame is made.
 	///
 	/// Interns each name's own `Type::TypeParam` against the frame's id
-	/// before the frame exists, predicted via `next_id` — the id has to be
-	/// knowable ahead of building the `params` that will fill it.
+	/// before the frame exists, predicted from the arena's length.
 	#[inline]
 	pub(super) fn push_param_frame(
 		&mut self,
@@ -960,34 +970,66 @@ impl TypeEnvArena {
 		names: impl IntoIterator<Item = Spanned<SymbolU32>>,
 	) -> TypeEnvIdx {
 		let frame = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
-		let parent_count = u32::try_from(self.generic_count(parent)).unwrap();
-		let params: Box<[TypeParam]> = names
-			.into_iter()
-			.enumerate()
-			.map(|(index, name)| {
-				let ty = types.intern(Type::TypeParam {
-					env: frame,
-					param_index: u32::try_from(index).unwrap(),
-				});
-				TypeParam { name, ty }
+		let parent_count = self.generic_count(parent);
+		let names_start = self.names.len();
+		self.names.extend(names);
+		let len = self.names.len() - names_start;
+		let types_start = self.types.len();
+		self.types.extend_from_within(self.identity_range(parent));
+		self.types.extend((0..len).map(|index| {
+			types.intern(Type::TypeParam {
+				env: frame,
+				param_index: u32::try_from(index).unwrap(),
 			})
-			.collect();
+		}));
 		self.envs.push(TypeEnv::Frame {
-			params,
-			parent,
 			owner,
-			parent_count,
+			parent,
+			parent_count: u32::try_from(parent_count).unwrap(),
+			len: u32::try_from(len).unwrap(),
+			names_start: u32::try_from(names_start).unwrap(),
+			types_start: u32::try_from(types_start).unwrap(),
 		});
 		frame
 	}
 
-	/// A declaration without generics has no frame of its own and stores
-	/// `ROOT`, which declares no parameters.
+	/// The names of `env`'s own parameters. A declaration without generics
+	/// has no frame of its own and stores `ROOT`, which declares none.
 	#[inline]
-	pub(super) fn params(&self, env: TypeEnvIdx) -> &[TypeParam] {
-		match &self.envs[usize::from(env)] {
-			TypeEnv::Frame { params, .. } => params,
+	pub(super) fn param_names(&self, env: TypeEnvIdx) -> &[Spanned<SymbolU32>] {
+		match self.envs[usize::from(env)] {
+			TypeEnv::Frame {
+				len, names_start, ..
+			} => &self.names[names_start as usize..][..len as usize],
 			TypeEnv::Root => &[],
+		}
+	}
+
+	/// The types of `env`'s own parameters.
+	#[inline]
+	pub(super) fn param_types(&self, env: TypeEnvIdx) -> &[TypeIndex] {
+		&self.identity_args(env)[self.parent_count(env)..]
+	}
+
+	/// The arguments that instantiate `env`'s chain with its own parameters,
+	/// each at its flat slot (`flat_slot`).
+	#[inline]
+	pub(super) fn identity_args(&self, env: TypeEnvIdx) -> &[TypeIndex] {
+		&self.types[self.identity_range(env)]
+	}
+
+	fn identity_range(&self, env: TypeEnvIdx) -> std::ops::Range<usize> {
+		match self.envs[usize::from(env)] {
+			TypeEnv::Frame {
+				parent_count,
+				len,
+				types_start,
+				..
+			} => {
+				let start = types_start as usize;
+				start..start + (parent_count + len) as usize
+			}
+			TypeEnv::Root => 0..0,
 		}
 	}
 
@@ -1020,7 +1062,7 @@ impl TypeEnvArena {
 	/// chain.
 	#[inline]
 	pub(super) fn generic_count(&self, env: TypeEnvIdx) -> usize {
-		self.parent_count(env) + self.params(env).len()
+		self.identity_args(env).len()
 	}
 
 	/// `env` and the frames above it, innermost first, without `Root`.
@@ -1078,9 +1120,11 @@ impl TypeEnvArena {
 		loop {
 			match &self.envs[usize::from(current)] {
 				TypeEnv::Root => return None,
-				TypeEnv::Frame { params, parent, .. } => {
-					if let Some(index) =
-						params.iter().position(|p| p.name.inner == name)
+				TypeEnv::Frame { parent, .. } => {
+					if let Some(index) = self
+						.param_names(current)
+						.iter()
+						.position(|param| param.inner == name)
 					{
 						return Some((current, u32::try_from(index).unwrap()));
 					}

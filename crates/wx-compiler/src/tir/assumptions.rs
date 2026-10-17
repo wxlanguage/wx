@@ -87,11 +87,10 @@ impl<'a> AssumptionReader<'a> {
 	pub(super) fn scoped_facts(
 		&self,
 		assumption_context: TypeEnvIdx,
-		types: &TypeInterner,
 	) -> AssumptionFacts<'a> {
 		let mut readiness = Readiness::Ready;
 		let mut roots = ScopedRoots::new(self, assumption_context);
-		while let Some(root) = roots.next(types) {
+		while let Some(root) = roots.next() {
 			readiness = readiness.and(root.readiness);
 		}
 		AssumptionFacts {
@@ -151,26 +150,17 @@ impl<'a> ScopedRoots<'a> {
 		}
 	}
 
-	fn next(&mut self, types: &TypeInterner) -> Option<BoundSource<'a>> {
+	fn next(&mut self) -> Option<BoundSource<'a>> {
 		while let Some(env) = self.scope {
 			if env != TypeEnvIdx::ROOT {
-				let params = self.type_envs.params(env);
-				while let Some(param) = params.get(self.param_index) {
+				let params = self.type_envs.param_types(env);
+				if let Some(&subject) = params.get(self.param_index) {
 					let index = self.param_index;
 					self.param_index += 1;
-					// An impl's Self frame binds a name to an existing type.
-					// Its placeholder row is not a new assumption source,
-					// even when that type is an outer abstract parameter.
-					if !matches!(types.resolve(param.ty),
-						Type::TypeParam { env: owner, param_index }
-						if *owner == env && *param_index as usize == index)
-					{
-						continue;
-					}
 					let facts =
 						&self.param_bounds[usize::from(env)][index].facts;
 					return Some(BoundSource {
-						subject: param.ty,
+						subject,
 						bounds: facts.current(),
 						context: None,
 						reflexive_trait: match self.type_envs.owner(env) {
@@ -197,9 +187,9 @@ enum Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
-	fn next(&mut self, types: &TypeInterner) -> Option<BoundSource<'a>> {
+	fn next(&mut self) -> Option<BoundSource<'a>> {
 		match self {
-			Self::Scope(roots) => roots.next(types),
+			Self::Scope(roots) => roots.next(),
 			Self::Subject { subject, bounds } => {
 				if let Some(trait_index) = bounds.reflexive_trait.take() {
 					return Some(BoundSource {
@@ -336,7 +326,7 @@ impl<'a> AssumptionFacts<'a> {
 					}
 				}
 				None => {
-					let source = self.sources.next(types)?;
+					let source = self.sources.next()?;
 					self.current = Some(Visit::Traits {
 						subject: source.subject,
 						bounds: source.bounds,

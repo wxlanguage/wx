@@ -238,41 +238,43 @@ impl TypeContext<'_, '_, '_> {
 			return MemberLookup::Error;
 		}
 		let mut traits = Vec::new();
+		let mut readiness = Readiness::Ready;
 		if let Some(target) =
 			ImplTarget::from_type(self.types.resolve(receiver))
 		{
+			// A type an impl can target takes its traits from impls only,
+			// never from assumptions (`Solver::find_trait_impl_query`).
 			for &(trait_index, _) in self.impl_dispatch.trait_candidates(target)
 			{
 				if self.defs.declared_trait_member(trait_index, key).is_some() {
 					traits.push(trait_index);
 				}
 			}
-		}
-		// Evidence in scope names traits regardless of receiver, so each must
-		// be shown to apply by assumptions alone. No impl is consulted.
-		let (scoped, mut readiness) = match self.assumed_member_traits(
-			assumption_context,
-			key,
-			reference,
-		) {
-			Ok(traits) => traits,
-			Err(lookup) => return lookup,
-		};
-		for trait_index in scoped {
-			if traits.contains(&trait_index) {
-				continue;
-			}
-			match self.check_assumed_trait(
-				assumption_context,
-				receiver,
-				trait_index,
-			) {
-				Ok(Assumption::Holds) => traits.push(trait_index),
-				Ok(Assumption::Unproven) => {}
-				Ok(Assumption::Pending) => {
-					readiness = readiness.and(Readiness::Pending)
+		} else {
+			// Evidence in scope names traits regardless of receiver, so each
+			// must be shown to apply by assumptions alone. No impl is consulted.
+			let scoped;
+			(scoped, readiness) =
+				match self.assumed_member_traits(assumption_context, key) {
+					Ok(traits) => traits,
+					Err(lookup) => return lookup,
+				};
+			for trait_index in scoped {
+				if traits.contains(&trait_index) {
+					continue;
 				}
-				Err(error) => return error.into(),
+				match self.check_assumed_trait(
+					assumption_context,
+					receiver,
+					trait_index,
+				) {
+					Ok(Assumption::Holds) => traits.push(trait_index),
+					Ok(Assumption::Unproven) => {}
+					Ok(Assumption::Pending) => {
+						readiness = readiness.and(Readiness::Pending)
+					}
+					Err(error) => return error.into(),
+				}
 			}
 		}
 		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
@@ -337,7 +339,6 @@ impl TypeContext<'_, '_, '_> {
 				receiver,
 				target,
 				key,
-				reference,
 			),
 			None => self.resolve_bound_member(
 				assumption_context,
@@ -481,6 +482,7 @@ impl TypeContext<'_, '_, '_> {
 								file_id,
 								namespace,
 								function,
+								&[current],
 								segment,
 								infer_policy,
 							);
@@ -587,10 +589,15 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			};
 			let mut type_args = Vec::with_capacity(impl_args.len());
+			let arguments = self.types.push_list(&impl_args);
 			for (index, &argument) in impl_args.iter().enumerate() {
 				type_args.push(self.record_bounds_check(
 					assumption_context,
-					BoundRequirements::Parameter { env, index },
+					BoundRequirements::Parameter {
+						env,
+						index,
+						arguments,
+					},
 					Spanned {
 						inner: argument,
 						span: segment.ident.span,
@@ -607,6 +614,7 @@ impl TypeContext<'_, '_, '_> {
 				file_id,
 				namespace,
 				function,
+				&type_args,
 				segment,
 				infer_policy,
 			);
@@ -795,7 +803,6 @@ impl TypeContext<'_, '_, '_> {
 		receiver: TypeIndex,
 		target: ImplTarget,
 		key: BindingKey,
-		reference: SourceSpan,
 	) -> MemberLookup {
 		// Only a candidate that declares this name can affect precedence.
 		for &index in self.impl_dispatch.inherent_candidates(target) {
@@ -819,22 +826,11 @@ impl TypeContext<'_, '_, '_> {
 				Err(error) => return error.into(),
 			}
 		}
+		// Only impls give a concrete receiver a trait, so no assumption in
+		// scope can add a candidate (`Solver::find_trait_impl_query`).
 		let mut traits = Vec::new();
 		for &(trait_index, _) in self.impl_dispatch.trait_candidates(target) {
 			if self.defs.declared_trait_member(trait_index, key).is_some() {
-				traits.push(trait_index);
-			}
-		}
-		let (scoped, readiness) = match self.assumed_member_traits(
-			assumption_context,
-			key,
-			reference,
-		) {
-			Ok(traits) => traits,
-			Err(lookup) => return lookup,
-		};
-		for trait_index in scoped {
-			if !traits.contains(&trait_index) {
 				traits.push(trait_index);
 			}
 		}
@@ -843,7 +839,7 @@ impl TypeContext<'_, '_, '_> {
 			receiver,
 			key,
 			traits,
-			readiness,
+			Readiness::Ready,
 		)
 	}
 
@@ -853,51 +849,20 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		key: BindingKey,
-		reference: SourceSpan,
 	) -> Result<(Vec<TraitIdx>, Readiness), MemberLookup> {
 		let defs = self.defs;
 		let mut traits = Vec::new();
-		let mut equalities = Vec::new();
-		let mut readiness;
-		{
-			let (reader, types) = self.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context, types);
-			readiness = facts.readiness;
-			while let Some(fact) = facts.next(types) {
-				match fact.kind {
-					AssumptionKind::Trait { trait_index, .. }
-						if defs.traits[usize::from(trait_index)]
-							.bindings
-							.contains_key(&key) =>
-					{
-						if !traits.contains(&trait_index) {
-							traits.push(trait_index);
-						}
-					}
-					AssumptionKind::Equality(
-						super::bounds::ImpliedBindingKind::Equals(_),
-					) => equalities.push(fact.subject),
-					_ => {}
-				}
-			}
-		}
-		// An equality's projection path can carry associated declaration bounds.
-		for subject in equalities {
-			self.prepare_effective_bounds(subject, reference)
-				.map_err(|()| MemberLookup::Error)?;
-			let budget = self.solver.state.recursion_budget;
-			let (reader, types) = self.assumptions();
-			let mut facts = reader.subject_facts(subject, types, budget);
-			readiness = readiness.and(facts.readiness);
-			while let Some(fact) = facts.next(types) {
-				if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
-					if defs.traits[usize::from(trait_index)]
-						.bindings
-						.contains_key(&key)
-						&& !traits.contains(&trait_index)
-					{
-						traits.push(trait_index);
-					}
+		let (reader, types) = self.assumptions();
+		let mut facts = reader.scoped_facts(assumption_context);
+		let readiness = facts.readiness;
+		while let Some(fact) = facts.next(types) {
+			if let AssumptionKind::Trait { trait_index, .. } = fact.kind {
+				if defs.traits[usize::from(trait_index)]
+					.bindings
+					.contains_key(&key)
+					&& !traits.contains(&trait_index)
+				{
+					traits.push(trait_index);
 				}
 			}
 		}
@@ -1037,14 +1002,11 @@ impl TypeContext<'_, '_, '_> {
 			MemberLookup::NotFound => {}
 			found => return found,
 		}
-		let (traits, readiness) = match self.assumed_member_traits(
-			assumption_context,
-			key,
-			reference,
-		) {
-			Ok(traits) => traits,
-			Err(lookup) => return lookup,
-		};
+		let (traits, readiness) =
+			match self.assumed_member_traits(assumption_context, key) {
+				Ok(traits) => traits,
+				Err(lookup) => return lookup,
+			};
 		self.resolve_trait_member_candidates(
 			assumption_context,
 			receiver,

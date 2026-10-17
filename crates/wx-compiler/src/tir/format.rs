@@ -252,8 +252,8 @@ impl TypeFormatter<'_> {
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.params(*env)[*param_index as usize]
-					.name
+				let symbol = self.type_envs.param_names(*env)
+					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
@@ -459,10 +459,10 @@ mod tests {
 				.type_params;
 			let index = self
 				.type_envs
-				.params(env)
+				.param_names(env)
 				.iter()
 				.position(|param| {
-					self.graph.strings.resolve(param.name.inner) == Some(name)
+					self.graph.strings.resolve(param.inner) == Some(name)
 				})
 				.unwrap_or_else(|| {
 					panic!(
@@ -483,7 +483,7 @@ mod tests {
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.type_envs.params(env)[index].ty
+			self.type_envs.param_types(env)[index]
 		}
 
 		fn declared_bounds(&self, function: &str, param: &str) -> &[BoundId] {

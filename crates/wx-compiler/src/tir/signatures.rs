@@ -331,6 +331,7 @@ impl TypeContext<'_, '_, '_> {
 				impl_dispatch: self.impl_dispatch,
 				traits: &self.traits,
 				trait_impls: &self.trait_impls,
+				inherent_impls: &self.inherent_impls,
 				assoc_types: &self.assoc_types,
 				param_bounds: &self.param_bounds,
 				type_envs: &self.type_envs,
@@ -842,7 +843,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// Only equality expressions can need memberships during construction.
 		if has_equalities {
 			for index in 0..params.len() {
-				let subject = self.type_envs.params(type_env)[index].ty;
+				let subject = self.type_envs.param_types(type_env)[index];
 				let memberships = self.param_bounds[usize::from(type_env)]
 					[index]
 					.facts
@@ -858,12 +859,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// Resolve source bounds now that every sibling has provisional
 		// memberships published, so an equality RHS can reference them.
 		// Bound IDs were published above; filling their sources preserves them.
-		for occurrences in &occurrences_per_param {
-			self.fill_source_bounds(file_id, namespace, type_env, occurrences);
+		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
+			let subject = self.type_envs.param_types(type_env)[index];
+			self.fill_source_bounds(
+				file_id,
+				namespace,
+				type_env,
+				subject,
+				occurrences,
+			);
 		}
 
 		for (index, ast_param) in params.iter().enumerate() {
-			let subject = self.type_envs.params(type_env)[index].ty;
+			let subject = self.type_envs.param_types(type_env)[index];
 			let declared_bounds = std::mem::take(
 				&mut self.param_bounds[usize::from(type_env)][index]
 					.declared_bounds,
@@ -903,7 +911,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// own doc comment).
 	fn reserve_param_bounds(&mut self, frame: TypeEnvIdx) {
 		debug_assert_eq!(usize::from(frame), self.param_bounds.len());
-		let count = self.type_envs.params(frame).len();
+		let count = self.type_envs.param_types(frame).len();
 		self.param_bounds
 			.push((0..count).map(|_| ParamBounds::empty()).collect());
 	}
@@ -1061,6 +1069,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			file_id,
 			segment,
 			params_env,
+			&[],
 			&resolved_args,
 			DefKind::Struct(struct_index),
 			TypeEnvOwner::Struct(struct_index),
@@ -1081,6 +1090,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		};
 		self.match_impl_target_and_bounds(
 			assumption_context,
+			ImplKind::Inherent(impl_index),
 			header.type_params,
 			header.target.inner,
 			receiver,
@@ -1292,16 +1302,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// Instantiating `type_env` takes an argument for every parameter on
 		// its chain, outer first, so a member's type carries its parent's
 		// parameters ahead of its own (`Wrap<T>::get<U>` is `get<T, U>`).
-		let mut frames: Vec<TypeEnvIdx> =
-			self.type_envs.chain(type_env).collect();
-		frames.reverse();
-		let type_args: Vec<TypeIndex> = frames
-			.into_iter()
-			.flat_map(|frame| self.type_envs.params(frame))
-			.map(|param| param.ty)
-			.collect();
-		let function_type =
-			self.types.intern_function(function_index, &type_args);
+		let function_type = self.types.intern_function(
+			function_index,
+			self.type_envs.identity_args(type_env),
+		);
 		// Each value is judged as the member's own (`CheckAssocValue`), so a
 		// loop through it (`func f() -> f::Result`) is reported once, here.
 		let call_trait = self.defs.intrinsics.call.expect(
@@ -1586,9 +1590,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			};
 			index
 		};
+		let memory_type = self.types.intern(Type::Memory { memory_index });
 		let checked_size = self.record_bounds_check(
 			TypeEnvIdx::ROOT,
-			BoundRequirements::AssociatedType(declared_size_index),
+			BoundRequirements::AssociatedType {
+				declaration: declared_size_index,
+				trait_index: memory_trait,
+				receiver: memory_type,
+			},
 			Spanned {
 				inner: resolved_size,
 				span: size.span,
@@ -1596,8 +1605,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			SourceSpan::new(file_id, size.span),
 			TypeEnvOwner::Trait(memory_trait),
 		);
-
-		let memory_type = self.types.intern(Type::Memory { memory_index });
 
 		self.assoc_types[usize::from(size_assoc_type_index)] =
 			Some(AssocTypeSignature {
@@ -1777,7 +1784,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// the surrounding signature query remains in progress.
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
-				let subject = self.type_envs.params(self_scope)[0].ty;
+				let subject = self.type_envs.param_types(self_scope)[0];
 				let (declared_bounds, implied_bounds) = self
 					.resolve_subject_bounds(
 						file_id,
@@ -1821,7 +1828,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					requested_at: None,
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
-				let self_type = self.type_envs.params(self_scope)[0].ty;
+				let self_type = self.type_envs.param_types(self_scope)[0];
 
 				self.resolve_member_function_signature(
 					file_id,
@@ -1889,7 +1896,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
 
-				let base = self.type_envs.params(self_scope)[0].ty;
+				let base = self.type_envs.param_types(self_scope)[0];
 				let subject = self.types.intern(Type::AssocTypeProjection {
 					base,
 					trait_index,
@@ -2240,6 +2247,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							span: target.span(),
 						},
 					});
+				if !self.type_envs.param_types(scope).is_empty() {
+					self.register_obligation(
+						Obligation::CheckImplRequirements {
+							impl_kind: ImplKind::Inherent(block_index),
+							reference: SourceSpan::new(file_id, target.span()),
+						},
+					);
+				}
 				SignatureLocation::InherentImpl(block_index)
 			}
 			AstNodeRef::InherentImplFunction {
@@ -2336,6 +2351,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							span: target.span(),
 						},
 					});
+				if !self.type_envs.param_types(scope).is_empty() {
+					self.register_obligation(
+						Obligation::CheckImplRequirements {
+							impl_kind: ImplKind::Trait(block_index),
+							reference: SourceSpan::new(file_id, target.span()),
+						},
+					);
+				}
 				// A default this impl inherits means something here that it
 				// does not in the trait, so the impl owns its judgement; a
 				// member the impl writes is checked where it is written.
@@ -2462,7 +2485,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// the surrounding signature query remains in progress.
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
-				let subject = self.type_envs.params(self_scope)[0].ty;
+				let subject = self.type_envs.param_types(self_scope)[0];
 				let (clause_bounds, implied_bounds) = self
 					.resolve_subject_bounds(
 						file_id,
@@ -2746,11 +2769,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					first,
 					TypeArgsNotAllowedOn::TypeParam {
 						owner: self.type_envs.owner(frame),
-						param: &self.type_envs.params(frame)[index as usize],
+						name: &self.type_envs.param_names(frame)
+							[index as usize],
 					},
 				));
 			}
-			(self.type_envs.params(frame)[index as usize].ty, 1)
+			(self.type_envs.param_types(frame)[index as usize], 1)
 		} else if first.ident.inner == Keyword::SelfPascal.symbol()
 			&& let Some((impl_kind, target)) = self.resolve_impl_self(env)
 		{
@@ -2874,6 +2898,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								file_id,
 								stopped,
 								type_params,
+								&[],
 								&resolved_args,
 								DefKind::TypeAlias(index),
 								TypeEnvOwner::TypeAlias(index),
@@ -2935,6 +2960,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						file_id,
 						stopped,
 						params_env,
+						&[],
 						&resolved_args,
 						DefKind::Struct(struct_index),
 						TypeEnvOwner::Struct(struct_index),
@@ -3046,6 +3072,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						file_id,
 						stopped,
 						params_env,
+						&[],
 						&resolved_args,
 						DefKind::Function(func_index),
 						TypeEnvOwner::Function(func_index),
@@ -3117,6 +3144,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		file_id: FileId,
 		namespace: Scope,
 		function: FunctionIdx,
+		parent_args: &[TypeIndex],
 		segment: &ast::PathSegment,
 		infer_policy: InferPolicy,
 	) -> Box<[TypeIndex]> {
@@ -3158,6 +3186,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			file_id,
 			segment,
 			own,
+			parent_args,
 			&written,
 			DefKind::Function(function),
 			TypeEnvOwner::Function(function),
@@ -3312,6 +3341,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							file_id,
 							namespace,
 							function,
+							&[base_ty],
 							first,
 							infer_policy,
 						);
@@ -3797,7 +3827,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					})
 			}
 		}
-		self.fill_source_bounds(file_id, namespace, env, &occurrences);
+		self.fill_source_bounds(file_id, namespace, env, subject, &occurrences);
 		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
 		let implied = self.compute_implied_bounds(&ids, name, subject);
 		(ids, implied)
@@ -3915,11 +3945,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// each occurrence's already-reserved `BoundId`. Run once every sibling
 	/// param has provisional memberships published, so an equality RHS can
 	/// reference a sibling's associated types.
+	/// `subject` is the type the occurrences bound, the `Self` of each trait
+	/// they name.
 	fn fill_source_bounds(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
+		subject: TypeIndex,
 		occurrences: &[BoundOccurrence<'_>],
 	) {
 		for occurrence in occurrences {
@@ -3940,14 +3973,37 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								InferSignatureKind::AssocTypeBinding,
 							),
 						);
-						BindingRequirement::Equals(Spanned {
+						let value = Spanned {
 							inner: value,
 							span: ty.span,
-						})
+						};
+						// The value must be one the trait's associated type
+						// can take: `Size = i32` against `type Size:
+						// PointerSize` states a fact no impl can satisfy.
+						if value.inner != TypeIndex::ERROR {
+							self.record_bounds_check(
+								env,
+								BoundRequirements::AssociatedType {
+									declaration: binding.assoc_type_index,
+									trait_index: occurrence.trait_index,
+									receiver: subject,
+								},
+								value,
+								SourceSpan::new(file_id, ty.span),
+								TypeEnvOwner::Trait(occurrence.trait_index),
+							);
+						}
+						BindingRequirement::Equals(value)
 					}
 					BindingOccurrenceKind::Bound(nested) => {
+						let projection =
+							self.types.intern(Type::AssocTypeProjection {
+								trait_index: occurrence.trait_index,
+								assoc_type_index: binding.assoc_type_index,
+								base: subject,
+							});
 						self.fill_source_bounds(
-							file_id, namespace, env, nested,
+							file_id, namespace, env, projection, nested,
 						);
 						BindingRequirement::Bound(
 							nested.iter().map(|o| o.id).collect(),
@@ -4241,7 +4297,7 @@ pub(super) mod tests {
 		DefinitionRegistry, FunctionOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
-	use crate::tir::solver::AssocValue;
+	use crate::tir::solver::Verdict;
 	use crate::vfs;
 
 	/// `test_case!(case = "source")` / `test_case!(mut case = ..)` /
@@ -5303,7 +5359,7 @@ pub(super) mod tests {
 			scope: TypeEnvIdx,
 		) -> (Readiness, Vec<(TypeIndex, TraitIdx, TraitAssumptionSource)>) {
 			let (reader, types) = signatures.assumptions();
-			let mut facts = reader.scoped_facts(scope, types);
+			let mut facts = reader.scoped_facts(scope);
 			let mut result = Vec::new();
 			while let Some(fact) = facts.next(types) {
 				if let AssumptionKind::Trait {
@@ -5371,7 +5427,8 @@ pub(super) mod tests {
 			let other = case.trait_index("Other");
 			let outer_scope =
 				case.context.inherent_impls[0].as_ref().unwrap().type_params;
-			let outer_param = case.context.type_envs.params(outer_scope)[0].ty;
+			let outer_param =
+				case.context.type_envs.param_types(outer_scope)[0];
 			for (name, own_trait) in [
 				("local", Some(local)),
 				("sibling", Some(other)),
@@ -5387,7 +5444,7 @@ pub(super) mod tests {
 					.unwrap();
 				let scope = case.context.functions[index].type_params;
 				let own_param = own_trait
-					.map(|_| case.context.type_envs.params(scope)[0].ty);
+					.map(|_| case.context.type_envs.param_types(scope)[0]);
 				let (readiness, facts) = memberships(&mut case.context, scope);
 				assert_eq!(readiness, Readiness::Ready);
 				let actual: Vec<_> = facts
@@ -5432,7 +5489,7 @@ pub(super) mod tests {
 				case.context.diagnostics
 			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.params(scope)[0].ty;
+			let base = case.context.type_envs.param_types(scope)[0];
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let other = projection(&mut case, base, "Outer", "Other");
@@ -5464,7 +5521,7 @@ pub(super) mod tests {
 			}
 			let equalities = {
 				let (reader, types) = case.context.assumptions();
-				let mut cursor = reader.scoped_facts(scope, types);
+				let mut cursor = reader.scoped_facts(scope);
 				let mut equalities = Vec::new();
 				while let Some(fact) = cursor.next(types) {
 					if let AssumptionKind::Equality(
@@ -5503,7 +5560,7 @@ pub(super) mod tests {
 				case.context.diagnostics
 			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.params(scope)[0].ty;
+			let base = case.context.type_envs.param_types(scope)[0];
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let output = projection(&mut case, value, "Deep", "Output");
@@ -5555,7 +5612,7 @@ pub(super) mod tests {
 			let child = case.trait_index("Child");
 			let parent = case.trait_index("Parent");
 			let scope = case.context.traits[usize::from(child)].env;
-			let subject = case.context.type_envs.params(scope)[0].ty;
+			let subject = case.context.type_envs.param_types(scope)[0];
 			let (readiness, facts) = memberships(&mut case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(facts.len(), 2);
@@ -5584,19 +5641,19 @@ pub(super) mod tests {
 			);
 			for name in ["ambiguous", "conflicting"] {
 				let scope = case.function_signature(name).type_params;
-				let base = case.context.type_envs.params(scope)[0].ty;
+				let base = case.context.type_envs.param_types(scope)[0];
 				let expected_subject =
 					projection(&mut case, base, "Value", "Item");
 				let expected_values: Vec<_> = case
 					.context
 					.type_envs
-					.params(scope)
+					.param_types(scope)
 					.iter()
 					.skip(1)
-					.map(|param| param.ty)
+					.copied()
 					.collect();
 				let (reader, types) = case.context.assumptions();
-				let mut facts = reader.scoped_facts(scope, types);
+				let mut facts = reader.scoped_facts(scope);
 				assert_eq!(facts.readiness, Readiness::Ready);
 				let mut equalities = 0;
 				while let Some(fact) = facts.next(types) {
@@ -5656,7 +5713,7 @@ pub(super) mod tests {
 						BoundFacts::Provisional(facts);
 					{
 						let (reader, types) = builder.assumptions();
-						let mut facts = reader.scoped_facts(scope, types);
+						let mut facts = reader.scoped_facts(scope);
 						assert_eq!(facts.readiness, Readiness::Pending);
 						let first = facts.next(types).unwrap();
 						assert!(
@@ -5671,7 +5728,7 @@ pub(super) mod tests {
 						BoundFacts::Ready(facts);
 					let (reader, types) = builder.assumptions();
 					assert_eq!(
-						reader.scoped_facts(scope, types).readiness,
+						reader.scoped_facts(scope).readiness,
 						Readiness::Ready
 					);
 				},
@@ -5689,7 +5746,7 @@ pub(super) mod tests {
 						requested_at: None,
 					});
 					let scope = builder.functions[0].type_params;
-					let base = builder.type_envs.params(scope)[0].ty;
+					let base = builder.type_envs.param_types(scope)[0];
 					let declaration =
 						match builder.defs.traits[1].members[0].kind {
 							MemberKind::AssociatedType(index) => index,
@@ -5761,7 +5818,7 @@ pub(super) mod tests {
 			);
 			assert!(case.context.diagnostics.is_empty());
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.params(scope)[0].ty;
+			let base = case.context.type_envs.param_types(scope)[0];
 			let next = projection(&mut case, base, "Node", "Next");
 			let next_next = projection(&mut case, next, "Node", "Next");
 			let (readiness, facts) = memberships(&mut case.context, scope);
@@ -7463,8 +7520,6 @@ pub(super) mod tests {
 		"}
 		);
 
-		case.diagnostics().print();
-
 		assert_eq!(
 			case.context.diagnostics.len(),
 			1,
@@ -8602,9 +8657,9 @@ pub(super) mod tests {
 			assert!(
 				case.context.solver.verdicts.values().all(|value| !matches!(
 					value,
-					AssocValue::Poisoned
-						| AssocValue::Overflowed
-						| AssocValue::Cyclic(_)
+					Verdict::Poisoned
+						| Verdict::Overflowed
+						| Verdict::Cyclic(_)
 				)),
 				"{source}"
 			);
@@ -10246,13 +10301,13 @@ pub(super) mod tests {
 		let header = case.context.trait_impls[usize::from(impl_index)]
 			.as_ref()
 			.unwrap();
-		let outer = case.context.type_envs.params(header.type_params)[0].ty;
+		let outer = case.context.type_envs.param_types(header.type_params)[0];
 		let get = case.trait_impl_function_signature("Wrap", "Service", "get");
 		assert_eq!(get.param_types[0], header.target.inner);
 		assert_eq!(get.param_types[1], outer);
 		assert_eq!(
 			get.param_types[2],
-			case.context.type_envs.params(get.type_params)[0].ty
+			case.context.type_envs.param_types(get.type_params)[0]
 		);
 		assert_eq!(get.return_type, header.target.inner);
 		assert_eq!(
@@ -10744,6 +10799,260 @@ pub(super) mod tests {
 				..
 			})
 		));
+	}
+
+	#[test]
+	fn a_where_equality_satisfying_the_declared_bound_is_accepted() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			trait Small {}
+			impl Small for u8 {}
+			trait Memory { type Size: Small; }
+			func f<Mem: Memory where { Size = u8 }>() {}
+		"}
+		);
+
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_where_equality_violating_the_declared_bound_is_reported() {
+		// The equality cannot vouch for itself: `Mem::Size: Small` and
+		// `Mem::Size = i32` do not make `i32: Small`, which only an impl can.
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type i32;
+			trait Small {}
+			trait Memory { type Size: Small; }
+			func f<Mem: Memory where { Size = i32 }>(x: Mem::Size) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `i32: Small` is not satisfied",
+		);
+		// The equality is kept as written, and still normalizes.
+		let env = case.function_signature("f").type_params;
+		assert!(matches!(
+			case.declared_bounds(env, 0)[0].bindings[0].kind,
+			BindingRequirement::Equals(Spanned {
+				inner: TypeIndex::I32,
+				..
+			})
+		));
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
+	}
+
+	#[test]
+	fn a_where_equality_to_a_parameter_needs_the_bound_written() {
+		// An equality does not lend `U` the declared bound: `U: Small` is
+		// written, as in Rust, or the equality is reported.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Small {}
+			trait Memory { type Size: Small; }
+			func bounded<U: Small, Mem: Memory where { Size = U }>() {}
+			func unbounded<U, Mem: Memory where { Size = U }>() {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `U: Small` is not satisfied");
+	}
+
+	#[test]
+	fn a_nested_where_equality_is_checked_against_its_declared_bound() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type i32;
+			trait Small {}
+			trait Memory { type Size: Small; }
+			trait Owner { type Mem; }
+			func f<O: Owner where { Mem: Memory where { Size = i32 } }>() {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `i32: Small` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn an_associated_type_bound_equality_is_checked_against_its_declared_bound()
+	{
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type i32;
+			trait Small {}
+			trait Memory { type Size: Small; }
+			trait Owner { type Mem: Memory where { Size = i32 }; }
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `i32: Small` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn a_where_equality_that_failed_to_resolve_is_not_checked() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Small {}
+			trait Memory { type Size: Small; }
+			func f<Mem: Memory where { Size = Missing }>() {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_absent(DiagnosticCode::TraitBoundViolation);
+		assert_eq!(case.context.diagnostics.len(), 1);
+	}
+
+	#[test]
+	fn a_use_proves_the_equalities_its_bound_states() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			struct W<T: HasItem where { Item = bool }>();
+			struct V<T: HasItem where { Item = u8 }>();
+			func f(w: W<u64>, v: V<u64>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+		);
+	}
+
+	#[test]
+	fn an_equality_naming_a_sibling_parameter_takes_its_argument() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			struct W<T: HasItem where { Item = U }, U>();
+			func ok(w: W<u64, u8>) {}
+			func bad(w: W<u64, bool>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+		);
+	}
+
+	#[test]
+	fn a_generic_use_proves_an_equality_from_its_own_assumptions() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type bool;
+			trait HasItem { type Item; }
+			struct W<T: HasItem where { Item = bool }>();
+			func ok<T: HasItem where { Item = bool }>(w: W<T>) {}
+			func bad<T: HasItem>(w: W<T>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<T as HasItem>::Item == bool`",
+		);
+	}
+
+	#[test]
+	fn a_use_proves_a_nested_bound_on_the_projection() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			trait Outer { type Inner; }
+			impl HasItem for u64 { type Item = u8; }
+			impl Outer for u8 { type Inner = u64; }
+			impl Outer for bool { type Inner = bool; }
+			struct W<T: Outer where { Inner: HasItem where { Item = u8 } }>();
+			func ok(w: W<u8>) {}
+			func bad(w: W<bool>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `bool: HasItem` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn a_member_function_bound_takes_its_impl_arguments() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			struct Host<T>();
+			impl<T> Host<T> { func f<U: HasItem where { Item = T }>() {} }
+			func ok(x: Host<u8>::f<u64>) {}
+			func bad(x: Host<bool>::f<u64>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+		);
+	}
+
+	#[test]
+	fn a_declared_bound_equality_takes_the_bound_subject_as_self() {
+		// `type A: HasItem where { Item = Self::B }`: checking `A = u64` reads
+		// `Self` as `T`, so `Item` must be `T::B`.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			trait Tr { type B; type A: HasItem where { Item = Self::B }; }
+			func ok<T: Tr where { A = u64, B = u8 }>() {}
+			func bad<T: Tr where { A = u64, B = bool }>() {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+		);
 	}
 
 	#[test]
@@ -11442,8 +11751,8 @@ pub(super) mod tests {
 			.verdicts
 			.values()
 			.filter_map(|value| match value {
-				AssocValue::Overflowed | AssocValue::Cyclic(_) => Some(true),
-				AssocValue::Poisoned => Some(false),
+				Verdict::Overflowed | Verdict::Cyclic(_) => Some(true),
+				Verdict::Poisoned => Some(false),
 				_ => None,
 			})
 			.collect();
@@ -11550,9 +11859,7 @@ pub(super) mod tests {
 			);
 			assert!(builder.solver.verdicts.values().any(|value| matches!(
 				value,
-				AssocValue::Poisoned
-					| AssocValue::Overflowed
-					| AssocValue::Cyclic(_)
+				Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_)
 			)));
 		});
 	}
@@ -12269,33 +12576,207 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn generic_impl_bound_equalities_are_not_silently_assumed() {
+	fn an_impl_with_an_equality_requirement_gives_its_trait_where_it_holds() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u16; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			impl HasItem for u16 { type Item = bool; }
+			trait Show {}
+			struct W<T>();
+			impl<T: HasItem where { Item = u8 }> Show for W<T> {}
+			struct Need<X: Show>();
+			func ok(x: Need<W<u64>>) {}
+			func bad(x: Need<W<u16>>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `W<u16>: Show` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn an_inherent_impl_with_an_equality_requirement_applies_where_it_holds() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u16; type u64; type bool;
+			trait HasItem { type Item; }
+			impl HasItem for u64 { type Item = u8; }
+			impl HasItem for u16 { type Item = bool; }
+			struct W<T>();
+			impl<T: HasItem where { Item = u8 }> W<T> { func m() {} }
+			func ok(x: W<u64>::m) {}
+			func bad(x: W<u16>::m) {}
+		"}
+		);
+
+		// The member is selected by the impl's target; its requirement is
+		// then proven at the use.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<u16 as HasItem>::Item == u8`",
+		);
+	}
+
+	#[test]
+	fn an_impl_requirement_proves_a_nested_bound() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8; type u64; type bool;
+			trait HasItem { type Item; }
+			trait Outer { type Inner; }
+			impl HasItem for u64 { type Item = u8; }
+			impl Outer for u8 { type Inner = u64; }
+			impl Outer for bool { type Inner = bool; }
+			trait Show {}
+			struct W<T>();
+			impl<T: Outer where { Inner: HasItem where { Item = u8 } }> Show for W<T> {}
+			struct Need<X: Show>();
+			func ok(x: Need<W<u8>>) {}
+			func bad(x: Need<W<bool>>) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `W<bool>: Show` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn an_impl_requirement_that_normalizes_through_its_own_impl_terminates() {
+		// Proving `S<u8>: Loop` normalizes `<S<u8> as Loop>::Out`, which
+		// selects the same impl and asks the same question again.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			trait Loop { type Out; }
+			impl Loop for u8 { type Out = u8; }
+			struct S<T>();
+			impl<T: Loop where { Out = <S<T> as Loop>::Out }> Loop for S<T> {
+				type Out = T;
+			}
+			func f(x: <S<u8> as Loop>::Out) {}
+		"}
+		);
+
+		// Once, by the impl, at the requirement that names it again; the use
+		// and the header's own `<S<T> as Loop>` stay silent.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+		case.diagnostics().assert_error_saying(
+			"cycle detected when normalizing `<S<T> as Loop>::Out`",
+		);
+	}
+
+	#[test]
+	fn an_impl_requirement_loop_is_reported_once_whatever_the_source_order() {
+		// The use is checked first; the impl's verdict still owns the loop.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			func f(x: <S<u8> as Loop>::Out) {}
+			trait Loop { type Out; }
+			impl Loop for u8 { type Out = u8; }
+			struct S<T>();
+			impl<T: Loop where { Out = <S<T> as Loop>::Out }> Loop for S<T> {
+				type Out = T;
+			}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+		case.diagnostics().assert_error_saying(
+			"cycle detected when normalizing `<S<T> as Loop>::Out`",
+		);
+	}
+
+	#[test]
+	fn an_impl_requirement_naming_a_concrete_instantiation_is_owned_by_the_impl()
+	 {
+		// Only `S<u8>` loops, but judging the impl's own requirements reaches
+		// it, so the impl reports it once.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			trait Loop { type Out; }
+			impl Loop for u8 { type Out = u8; }
+			struct S<T>();
+			impl<T: Loop where { Out = <S<u8> as Loop>::Out }> Loop for S<T> {
+				type Out = T;
+			}
+			func f(x: <S<u8> as Loop>::Out) {}
+		"}
+		);
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+	}
+
+	#[test]
+	fn an_impl_selected_again_for_other_arguments_is_not_a_loop() {
 		test_case!(
 			mut case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
+			type u8; type u64;
+			trait Tr { type X; }
+			impl Tr for u64 { type X = u8; }
+			struct W<T>();
+			impl<T: Tr where { X = u8 }> Tr for W<T> { type X = u8; }
+			func f(x: <W<W<u64>> as Tr>::X) {}
+		"}
+		);
+
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U8);
+	}
+
+	#[test]
+	fn generic_impl_bound_equalities_are_proven_not_assumed() {
+		// The impl applies exactly where its equality holds: `Value::Item` is
+		// `i32`, `Other::Item` is not.
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type i32; type bool;
 			trait Source { type Item; }
 			trait Container { type Item; }
 			struct Value();
+			struct Other();
 			struct Wrapper<T>();
 			impl Source for Value { type Item = i32; }
+			impl Source for Other { type Item = bool; }
 			impl<T: Source where { Item = i32 }> Container for Wrapper<T> {
 				type Item = i32;
 			}
 			func f(x: <Wrapper<Value> as Container>::Item) {}
+			func g(x: <Wrapper<Other> as Container>::Item) {}
 		"}
 		);
-		// Diagnosed below; the written projection is kept and has no value.
-		assert!(case.is_projection_param("f", 0));
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
+		// Diagnosed; the written projection is kept and has no value.
+		assert!(case.is_projection_param("g", 0));
 		assert_eq!(
-			case.try_normalized_param("f", 0),
+			case.try_normalized_param("g", 0),
 			Err(SolverError::Poisoned)
 		);
-		assert!(
-			case.context.diagnostics.iter().any(|d| d.code.as_deref()
-				== Some(DiagnosticCode::TraitBoundViolation.code())),
-			"{:?}",
-			case.context.diagnostics
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `Wrapper<Other>: Container` is not satisfied",
 		);
 	}
 
@@ -12527,8 +13008,6 @@ pub(super) mod tests {
 		"}
 		);
 
-		case.diagnostics().print();
-
 		assert_eq!(
 			case.context.diagnostics.len(),
 			1,
@@ -12578,8 +13057,6 @@ pub(super) mod tests {
 		"}
 		);
 
-		case.diagnostics().print();
-
 		assert_eq!(
 			case.context.diagnostics.len(),
 			1,
@@ -12613,8 +13090,6 @@ pub(super) mod tests {
 			trait D: B + C {}
 		"};
 		test_case!(case = source);
-
-		case.diagnostics().print();
 
 		assert_eq!(
 			case.context.diagnostics.len(),
@@ -12738,8 +13213,6 @@ pub(super) mod tests {
 			trait C: Inner where { X = u64 } {}
 		"};
 		test_case!(case = source);
-
-		case.diagnostics().print();
 
 		assert_eq!(
 			case.context.diagnostics.len(),
@@ -13136,25 +13609,6 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn collecting_equality_facts_does_not_check_associated_value_conformance() {
-		test_case!(
-			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			trait Mark {}
-			trait Container { type Item: Mark; }
-			func f<T: Container where { Item = i32 }>(x: T::Item) {}
-		"}
-		);
-		assert!(
-			case.context.diagnostics.is_empty(),
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
-	}
-
-	#[test]
 	fn normalization_does_not_cache_an_unfinished_assumption_set() {
 		with_pending_signatures(
 			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
@@ -13165,7 +13619,7 @@ pub(super) mod tests {
 					requested_at: None,
 				});
 				let env = builder.functions[0].type_params;
-				let base = builder.type_envs.params(env)[0].ty;
+				let base = builder.type_envs.param_types(env)[0];
 				let assoc_type_index =
 					match builder.defs.traits[0].members[0].kind {
 						MemberKind::AssociatedType(index) => index,
@@ -13580,8 +14034,8 @@ pub(super) mod tests {
 			let signature = case.function_signature("f");
 			let assumption_context = signature.type_params;
 			let written = signature.param_types[0];
-			let params = case.context.type_envs.params(assumption_context);
-			let (t, u) = (params[0].ty, params[1].ty);
+			let params = case.context.type_envs.param_types(assumption_context);
+			let (t, u) = (params[0], params[1]);
 			// The parameter is stored as `T::Item` and means `U`; the evidence
 			// about `T::Item` is kept as written.
 			assert!(matches!(
@@ -13597,7 +14051,7 @@ pub(super) mod tests {
 					assoc_type_index: AssocTypeIdx::new(0),
 				});
 			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context, types);
+			let mut facts = reader.scoped_facts(assumption_context);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut memberships = Vec::new();
 			let mut equality = None;
@@ -13683,7 +14137,7 @@ pub(super) mod tests {
 			};
 			assert_eq!(value.inner, raw);
 			let (reader, types) = case.context.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context, types);
+			let mut facts = reader.scoped_facts(assumption_context);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut retained = false;
 			while let Some(fact) = facts.next(types) {
@@ -13702,7 +14156,7 @@ pub(super) mod tests {
 			assumption_context: TypeEnvIdx,
 		) -> Vec<(TypeIndex, TraitIdx)> {
 			let (reader, types) = registry.assumptions();
-			let mut facts = reader.scoped_facts(assumption_context, types);
+			let mut facts = reader.scoped_facts(assumption_context);
 			assert_eq!(facts.readiness, Readiness::Ready);
 			let mut result = Vec::new();
 			while let Some(fact) = facts.next(types) {
@@ -13746,7 +14200,7 @@ pub(super) mod tests {
 			let free = function("free");
 			let outer_env =
 				case.context.inherent_impls[0].as_ref().unwrap().type_params;
-			let outer = case.context.type_envs.params(outer_env)[0].ty;
+			let outer = case.context.type_envs.param_types(outer_env)[0];
 			let assumption_context = case.context.functions[scoped].type_params;
 			assert_ne!(
 				assumption_context, outer_env,
@@ -13802,7 +14256,7 @@ pub(super) mod tests {
 				.unwrap();
 			let assumption_context = case.context.functions[index].type_params;
 			let self_env = case.context.traits[2].env;
-			let trait_self = case.context.type_envs.params(self_env)[0].ty;
+			let trait_self = case.context.type_envs.param_types(self_env)[0];
 			assert_eq!(assumption_context, self_env);
 			assert_eq!(
 				case.context.functions[index].param_types[0],
@@ -13814,7 +14268,7 @@ pub(super) mod tests {
 			let signature = case.function_signature("user");
 			let subject = signature.param_types[0];
 			let receiver =
-				case.context.type_envs.params(signature.type_params)[0].ty;
+				case.context.type_envs.param_types(signature.type_params)[0];
 			let (reader, types) = case.context.assumptions();
 			let mut facts = reader.subject_facts(subject, types, 128);
 			assert_eq!(facts.readiness, Readiness::Ready);
@@ -13849,12 +14303,13 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}",
+				path = "::Next".repeat(16)
 			);
 			with_pending_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
-				let ty = builder.type_envs.params(env)[1].ty;
+				let ty = builder.functions[0].param_types[0];
 				builder.solver.set_limit_for_test(8);
 				// Overflow is returned as such, never folded into "not a member" or
 				// an error type; the site that asked owns the report.
@@ -13943,27 +14398,29 @@ pub(super) mod tests {
 			assert_eq!(*assoc_type_index, AssocTypeIdx::new(0));
 			assert_eq!(
 				*base,
-				case.context.type_envs.params(signature.type_params)[1].ty
+				case.context.type_envs.param_types(signature.type_params)[1]
 			);
 		}
 
 		#[test]
-		fn associated_declaration_bounds_supply_members_through_equality() {
+		fn associated_declaration_bounds_supply_no_members_through_equality() {
+			// `Item: Project` belongs to `T::Item`; `Item = U` does not lend it
+			// to `U`, so `U::Output` needs `U: Project` written.
 			checked_case!(
 				case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U }, U>(x: U::Output) {}
+                func g<T: Container where { Item = U }, U: Project>(x: U::Output) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::NotATraitMember,
+				DiagnosticCode::TraitBoundViolation,
+			]);
 			assert!(
-				case.context.diagnostics.is_empty(),
-				"{:?}",
-				case.context.diagnostics
-			);
-			assert!(
-				matches!(case.context.types.resolve(case.function_signature("f").param_types[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				matches!(case.context.types.resolve(case.function_signature("g").param_types[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
 			);
 		}
 
@@ -14298,7 +14755,9 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn concrete_equal_subjects_can_use_a_symbolic_assumed_member() {
+		fn a_concrete_equal_subject_takes_no_assumed_trait() {
+			// `T::Item = i32` and `T::Item: Project` say nothing about `i32`:
+			// only an impl gives a concrete type a trait.
 			checked_case!(
 				case = indoc! {"
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -14308,15 +14767,12 @@ pub(super) mod tests {
                 func f<T: Container where { Item = i32 } + Container where { Item: Project }>(x: i32::Output, y: <i32 as Project>::Output) {}
             "}
 			);
-			assert!(
-				case.context.diagnostics.is_empty(),
-				"{:?}",
-				case.context.diagnostics
-			);
-			let signature = case.function_signature("f");
-			assert_eq!(signature.param_types[0], signature.param_types[1]);
-			assert!(
-				matches!(case.context.types.resolve(signature.param_types[0]), Type::AssocTypeProjection { base, .. } if *base == TypeIndex::I32)
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::NotATraitMember,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+			case.diagnostics().assert_error_saying(
+				"the trait bound `i32: Project` is not satisfied",
 			);
 		}
 
@@ -14328,7 +14784,8 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U>() {{}}"
+				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}}",
+				path = "::Next".repeat(16)
 			);
 			with_pending_signatures(&source, |builder| {
 				let id = DefId::Function(FunctionIdx::new(0));
@@ -14337,7 +14794,7 @@ pub(super) mod tests {
 					requested_at: None,
 				});
 				let env = builder.functions[0].type_params;
-				let ty = builder.type_envs.params(env)[1].ty;
+				let ty = builder.functions[0].param_types[0];
 				let reference = SourceSpan::new(
 					builder.defs.functions[0].file_id,
 					TextSpan::new(0, 1),
@@ -14476,7 +14933,7 @@ pub(super) mod tests {
 			};
 			assert_eq!(
 				case.context.types.list(*type_args),
-				&[case.context.type_envs.params(scope)[1].ty]
+				&[case.context.type_envs.param_types(scope)[1]]
 			);
 		}
 
@@ -14530,7 +14987,7 @@ pub(super) mod tests {
 					let signature = &builder.functions[0];
 					let env = signature.type_params;
 					let written = signature.param_types[0];
-					let u = builder.type_envs.params(env)[1].ty;
+					let u = builder.type_envs.param_types(env)[1];
 					// The parameter is stored as written, `T::Item`, and under its
 					// own context means `U`...
 					assert!(matches!(
@@ -14563,7 +15020,9 @@ pub(super) mod tests {
 			);
 		}
 		#[test]
-		fn associated_declaration_bounds_follow_a_written_equality() {
+		fn associated_declaration_bounds_do_not_follow_a_written_equality() {
+			// Both requirements on `U` fail: the equality's own, against
+			// `Item`'s declared bound, and `Need`'s.
 			test_case!(
 				case = indoc! {"
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -14571,12 +15030,15 @@ pub(super) mod tests {
                 trait Container { type Item: Marker; }
                 struct Need<X: Marker>();
                 func f<T: Container where { Item = U }, U>(x: Need<U>) {}
+                func g<T: Container where { Item = U }, U: Marker>(x: Need<U>) {}
             "}
 			);
-			assert!(
-				case.context.diagnostics.is_empty(),
-				"{:?}",
-				case.context.diagnostics
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+			case.diagnostics().assert_error_saying(
+				"the trait bound `U: Marker` is not satisfied",
 			);
 		}
 
@@ -14714,7 +15176,7 @@ pub(super) mod tests {
 					let env = builder.functions[0].type_params;
 					// `U` is only provably a `Marker` through `T::Item = U`, an
 					// equality fact: the proof must wait for the facts to be final.
-					let ty = builder.type_envs.params(env)[1].ty;
+					let ty = builder.type_envs.param_types(env)[1];
 					let facts = builder.param_bounds[usize::from(env)][0]
 						.facts
 						.current()
@@ -14755,7 +15217,7 @@ pub(super) mod tests {
 			with_pending_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
-				let ty = builder.type_envs.params(env)[1].ty;
+				let ty = builder.type_envs.param_types(env)[1];
 				assert!(
 					builder.diagnostics.is_empty(),
 					"{:?}",
@@ -14922,7 +15384,7 @@ pub(super) mod tests {
                 trait Marker {}
                 trait Container { type Item; }
                 impl Marker for i32 {}
-                impl Container for i32 { type Item = i32; }
+                impl Container for i32 { type Item = Node<i32>; }
                 struct Node<T: Marker + Container where { Item = Node<i32> }>();
             "}
 			);
@@ -14940,21 +15402,18 @@ pub(super) mod tests {
                 type i32;
                 trait Marker {}
                 trait Container { type Item; }
-                impl Container for i32 { type Item = i32; }
+                impl Container for i32 { type Item = Node<i32>; }
                 struct Node<T: Marker + Container where { Item = Node<i32> }>();
             "}
 			);
-			assert_eq!(
-				case.context.diagnostics.len(),
-				1,
-				"{:?}",
-				case.context.diagnostics
+			// Once per use of `Node<i32>`: the impl's value and the bound's own.
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+			case.diagnostics().assert_error_saying(
+				"the trait bound `i32: Marker` is not satisfied",
 			);
-			assert_eq!(
-				case.context.diagnostics[0].code.as_deref(),
-				Some(DiagnosticCode::TraitBoundViolation.code())
-			);
-			assert!(case.context.diagnostics[0].message.contains("Marker"));
 		}
 
 		#[test]
@@ -14990,7 +15449,7 @@ pub(super) mod tests {
                 trait Container { type Item; }
                 struct Need<T: Marker>();
                 impl Marker for i32 {}
-                func outer<A: Container where { Item = Inner<A, A> }>(x: A::Item) {}
+                func outer<A: Container where { Item = Inner<B, C> }, B: Container where { Item = Need<i32> }, C: Container where { Item = i32 }>(x: A::Item) {}
                 struct Inner<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>();
             "}
 			);
@@ -15532,7 +15991,7 @@ pub(super) mod tests {
 		assert_eq!(case.normalized_param("qualified", 0), member);
 		assert_eq!(case.normalized_param("qualified", 1), inherited);
 		let env = case.function_signature("generic").type_params;
-		let t = case.context.type_envs.params(env)[0].ty;
+		let t = case.context.type_envs.param_types(env)[0];
 		let abstract_make =
 			case.context.types.intern_function(declaration, &[t]);
 		assert_eq!(case.normalized_param("generic", 0), abstract_make);
@@ -15770,7 +16229,12 @@ pub(super) mod tests {
 			[usize::from(case.inherent_impl_index("Plain"))]
 		.as_ref()
 		.unwrap();
-		assert!(case.context.type_envs.params(plain.type_params).is_empty());
+		assert!(
+			case.context
+				.type_envs
+				.param_types(plain.type_params)
+				.is_empty()
+		);
 		let make =
 			case.trait_impl_function_signature("Plain", "Service", "make");
 		let header = case.context.trait_impls
@@ -15857,9 +16321,9 @@ pub(super) mod tests {
 		let free = case.function_signature("free").type_params;
 		let make = case.trait_function_signature("Service", "make").type_params;
 		let envs = &case.context.type_envs;
-		let t = envs.params(outer)[0].ty;
-		let u = envs.params(method)[0].ty;
-		let v = envs.params(free)[0].ty;
+		let t = envs.param_types(outer)[0];
+		let u = envs.param_types(method)[0];
+		let v = envs.param_types(free)[0];
 
 		// Counts: rustc's `parent_count`, and the whole chain's length.
 		assert_eq!(envs.parent(method), Some(outer));
@@ -15931,11 +16395,17 @@ pub(super) mod tests {
 
 		// Bounds are checked in each parameter's own frame: `T: Number`
 		// against the outer argument, nothing against `U`.
+		let impl_kind = case
+			.context
+			.type_envs
+			.enclosing_impl(method)
+			.expect("the method is inside an impl");
 		let swapped = case.context.types.intern_tuple(&[bool_, i32_]);
 		assert_eq!(
 			case.context
 				.match_impl_target_and_bounds(
 					TypeEnvIdx::ROOT,
+					impl_kind,
 					method,
 					pair,
 					concrete,
@@ -15947,6 +16417,7 @@ pub(super) mod tests {
 		assert_eq!(
 			case.context.match_impl_target_and_bounds(
 				TypeEnvIdx::ROOT,
+				impl_kind,
 				method,
 				pair,
 				swapped,

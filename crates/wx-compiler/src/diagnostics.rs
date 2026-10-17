@@ -234,6 +234,7 @@ define_diagnostic_codes! {
 		CyclicConstant => "E2109",
 		StructUsedAsValue => "E2110",
 		TypeArgumentsNotAllowed => "E2111",
+		AssocTypeEqualityMismatch => "E2112",
 	}
 }
 

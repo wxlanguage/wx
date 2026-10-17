@@ -5,8 +5,12 @@
 //!
 //! Concrete membership uses dispatch candidate discovery followed by full
 //! impl-target matching. Abstract membership reads the same effective facts
-//! as normalization and member lookup. This module does not prove associated
-//! equality requirements or validate impl conformance.
+//! as normalization and member lookup. A bound's bindings are proven too: an
+//! equality by comparing the normalized projection with the written value, a
+//! nested bound on the projection. That proof is `Solver::satisfies_bound`,
+//! shared with impl selection; this module reports its failures. Impl
+//! conformance (an impl's associated values against their declared bounds)
+//! is not validated.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
@@ -18,11 +22,13 @@ use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
 use super::signatures::TypeContext;
-use super::solver::SolverError;
-use super::types::{Type, TypeEnvIdx, TypeIndex, TypeParam};
+use super::solver::{SolverError, Unsatisfied};
+use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::bounds::{BoundFacts, ImpliedTraitBound};
+use crate::tir::bounds::{
+	BindingRequirement, BoundFacts, EqualityFact, ImpliedTraitBound,
+};
 use crate::tir::solver::SolverView;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
@@ -65,12 +71,15 @@ impl TypeContext<'_, '_, '_> {
 	/// argument satisfies neither — and only that one slot, not the whole
 	/// list, is poisoned when any of them fails. Pending requirements retain
 	/// the argument and enqueue a check against the eventual parameter table.
+	/// `parent_args` are the arguments of the frames around `params_env`, outer
+	/// first (a member function's impl or trait), which a bound may name.
 	pub(super) fn resolve_type_args(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
+		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
 		kind: DefKind,
 		owner: TypeEnvOwner,
@@ -83,12 +92,21 @@ impl TypeContext<'_, '_, '_> {
 				file_id,
 				segment,
 				kind,
-				self.type_envs.params(params_env),
+				self.type_envs.param_names(params_env),
 			));
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
 
 		let mut result = Vec::with_capacity(expected);
+		if expected == 0 {
+			return result.into_boxed_slice();
+		}
+		debug_assert_eq!(
+			parent_args.len(),
+			self.type_envs.parent_count(params_env),
+			"a bound is substituted over the frame's whole chain"
+		);
+		let arguments = self.types.push_list(parent_args.iter().chain(args));
 		for (index, (&argument, written)) in
 			args.iter().zip(&segment.type_args).enumerate()
 		{
@@ -97,6 +115,7 @@ impl TypeContext<'_, '_, '_> {
 				BoundRequirements::Parameter {
 					env: params_env,
 					index,
+					arguments,
 				},
 				Spanned {
 					inner: argument,
@@ -120,11 +139,12 @@ impl<'a> SolverView<'a> {
 		// Copied out, so indexing yields `'a` rather than this `&self`.
 		let (param_bounds, assoc_types) = (self.param_bounds, self.assoc_types);
 		let facts = match requirements {
-			BoundRequirements::Parameter { env, index } => {
+			BoundRequirements::Parameter { env, index, .. } => {
 				&param_bounds[usize::from(env)][index].facts
 			}
-			BoundRequirements::AssociatedType(index) => {
-				let Some(signature) = &assoc_types[usize::from(index)] else {
+			BoundRequirements::AssociatedType { declaration, .. } => {
+				let Some(signature) = &assoc_types[usize::from(declaration)]
+				else {
 					return Err(());
 				};
 				&signature.facts
@@ -138,7 +158,7 @@ impl<'a> SolverView<'a> {
 }
 
 /// The checks bound satisfaction owns, run by the declaration check.
-impl ObligationChecker<'_> {
+impl<'a> ObligationChecker<'a> {
 	/// Gather violations before emitting them: another requirement can still
 	/// be pending, and a retry must not duplicate a diagnostic.
 	pub(super) fn check_requirements(
@@ -149,34 +169,98 @@ impl ObligationChecker<'_> {
 		reference: SourceSpan,
 		owner: TypeEnvOwner,
 	) -> Result<(), SolverError> {
-		let mut result = Ok(());
-		for bound in self
+		let facts = self
 			.view
 			.requirement_facts(requirements)
-			.map_err(|_| SolverError::Pending)?
-		{
-			if self
-				.solver
-				.find_trait_impl_query(
-					&mut self.view,
-					assumption_context,
-					argument.inner,
-					bound.trait_index,
-				)?
-				.is_none()
-			{
-				let diagnostic = self.report_trait_bound_violation(
-					reference.file_id,
-					argument,
-					bound.trait_index,
-					bound.source,
-					owner,
-				);
-				self.diagnostics.push(diagnostic);
+			.map_err(|_| SolverError::Pending)?;
+		// The facts are written in the declaration's frame; the use supplies
+		// that frame's arguments.
+		// The list is copied out of the interner, which the proof interns into.
+		let owned: Box<[TypeIndex]>;
+		let (frame, arguments) = match requirements {
+			BoundRequirements::Parameter { env, arguments, .. } => {
+				owned = self.view.types.list(arguments).into();
+				(env, &*owned)
+			}
+			BoundRequirements::AssociatedType {
+				trait_index,
+				ref receiver,
+				..
+			} => (
+				self.view.traits[usize::from(trait_index)].env,
+				std::slice::from_ref(receiver),
+			),
+		};
+		let mut result = Ok(());
+		for bound in facts {
+			if !self.check_bound(
+				assumption_context,
+				(frame, arguments),
+				reference.file_id,
+				argument,
+				bound,
+				owner,
+			)? {
 				result = Err(SolverError::Poisoned);
 			}
 		}
 		result
+	}
+
+	/// Proves `bound` on `subject` (`Solver::satisfies_bound`) and reports
+	/// each failure here, once, at the use.
+	fn check_bound(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		substitution: (TypeEnvIdx, &[TypeIndex]),
+		file_id: FileId,
+		subject: Spanned<TypeIndex>,
+		bound: &'a ImpliedTraitBound,
+		owner: TypeEnvOwner,
+	) -> Result<bool, SolverError> {
+		let mut failures = Vec::new();
+		if self.solver.satisfies_bound(
+			&mut self.view,
+			assumption_context,
+			substitution,
+			subject.inner,
+			bound,
+			Some(&mut failures),
+		)? {
+			return Ok(true);
+		}
+		for failure in failures {
+			let diagnostic = match failure {
+				Unsatisfied::Trait {
+					subject: failed,
+					bound,
+				} => self.report_trait_bound_violation(
+					file_id,
+					Spanned {
+						inner: failed,
+						span: subject.span,
+					},
+					bound.trait_index,
+					bound.source,
+					owner,
+				),
+				Unsatisfied::Equality {
+					projection,
+					found,
+					expected,
+					fact,
+				} => self.report_equality_mismatch(
+					SourceSpan::new(file_id, subject.span),
+					projection,
+					found,
+					expected,
+					fact,
+					owner,
+				),
+			};
+			self.diagnostics.push(diagnostic);
+		}
+		Ok(false)
 	}
 
 	/// `projection::name` could not be selected from the projection's declared
@@ -346,6 +430,54 @@ impl ObligationChecker<'_> {
 				),
 			)
 	}
+
+	/// rustc's E0271: the projection a bound's equality names has another
+	/// value. The written equality is shown, since that is what the value
+	/// failed.
+	fn report_equality_mismatch(
+		&self,
+		reference: SourceSpan,
+		projection: TypeIndex,
+		found: TypeIndex,
+		expected: TypeIndex,
+		fact: &EqualityFact,
+		owner: TypeEnvOwner,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter();
+		let (projection, found, expected) = (
+			formatter.display_type(projection),
+			formatter.display_type(found),
+			formatter.display_type(expected),
+		);
+		let ast::Spanned { span, .. } =
+			match self.bounds.binding(fact.source).kind {
+				BindingRequirement::Equals(value) => value,
+				BindingRequirement::Bound(_) => {
+					unreachable!(
+						"an equality fact comes from a written equality"
+					)
+				}
+			};
+		let written =
+			SourceSpan::new(self.bounds.span(fact.source.bound).file_id, span);
+		Diagnostic::error()
+			.with_code(DiagnosticCode::AssocTypeEqualityMismatch.code())
+			.with_message(format!(
+				"type mismatch resolving `{projection} == {expected}`"
+			))
+			.with_label(reference.primary_label().with_message(format!(
+				"expected `{expected}`, found `{found}`"
+			)))
+			.with_label(written.secondary_label().with_message(
+				match owner.name(self.view.defs) {
+					Some(name) => format!(
+						"required by this equality in `{}`",
+						self.strings.resolve(name.inner).unwrap()
+					),
+					None => "required by this equality".to_owned(),
+				},
+			))
+	}
 }
 
 /// What a path segment written with type arguments names when it can
@@ -359,7 +491,7 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 	/// frame declares it.
 	TypeParam {
 		owner: TypeEnvOwner,
-		param: &'a TypeParam,
+		name: &'a Spanned<SymbolU32>,
 	},
 }
 
@@ -376,13 +508,13 @@ pub(super) fn report_type_args_not_allowed(
 		TypeArgsNotAllowedOn::Declaration(kind) => {
 			(kind.noun(), kind.declared_at(defs))
 		}
-		TypeArgsNotAllowedOn::TypeParam { owner, param } => (
-			if param.name.inner == Keyword::SelfPascal.symbol() {
+		TypeArgsNotAllowedOn::TypeParam { owner, name } => (
+			if name.inner == Keyword::SelfPascal.symbol() {
 				"self type"
 			} else {
 				"type parameter"
 			},
-			Some(SourceSpan::new(owner.file_id(defs), param.name.span)),
+			Some(SourceSpan::new(owner.file_id(defs), name.span)),
 		),
 	};
 	let name = strings.resolve(segment.ident.inner).unwrap();
@@ -434,7 +566,7 @@ pub(super) fn report_type_arg_count_mismatch(
 	file_id: FileId,
 	segment: &ast::PathSegment,
 	kind: DefKind,
-	params: &[TypeParam],
+	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
 	let (noun, name) = (kind.noun(), segment.ident.inner);
 	let declaration = kind
@@ -477,7 +609,7 @@ pub(super) fn report_type_arg_count_mismatch(
 		)));
 		for param in params {
 			labels.push(
-				SourceSpan::new(declared_at.file_id, param.name.span)
+				SourceSpan::new(declared_at.file_id, param.span)
 					.secondary_label(),
 			);
 		}

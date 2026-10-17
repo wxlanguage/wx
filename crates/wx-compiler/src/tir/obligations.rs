@@ -22,8 +22,10 @@ use super::defs::{AssocTypeIdx, TraitIdx};
 use super::format::TypeFormatter;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::TypeContext;
-use super::solver::{AssocValue, ImplMember, Solver, SolverError, SolverView};
-use super::types::{TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::solver::{
+	Definition, ImplMember, Solver, SolverError, SolverView, Verdict,
+};
+use super::types::{ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
@@ -32,8 +34,21 @@ use crate::vfs::FileId;
 /// cannot lose inherited requirements that have not been published yet.
 #[derive(Clone, Copy)]
 pub(super) enum BoundRequirements {
-	Parameter { env: TypeEnvIdx, index: usize },
-	AssociatedType(AssocTypeIdx),
+	/// Parameter `index` of `env`. `arguments` is the use's flat argument list
+	/// for `env`'s whole chain, outer frames first: a binding's value is
+	/// written in the declaration, so it may name any of them.
+	Parameter {
+		env: TypeEnvIdx,
+		index: usize,
+		arguments: TypeList,
+	},
+	/// The declared bounds of `declaration`, a member of `trait_index`, whose
+	/// `Self` is `receiver`.
+	AssociatedType {
+		declaration: AssocTypeIdx,
+		trait_index: TraitIdx,
+		receiver: TypeIndex,
+	},
 }
 
 #[derive(Clone, Copy)]
@@ -61,12 +76,23 @@ pub(super) enum Obligation {
 	},
 	/// An impl member's value (its own, or the trait default it inherits) has a
 	/// meaning. Unlike `CheckWellFormed`, the judgement is the solver's, made
-	/// once whoever asks first (`AssocValue`); this check reports the failure
+	/// once whoever asks first (`Verdict`); this check reports the failure
 	/// the member owns, so a loop through definitions is reported once, where
 	/// it is defined, and readers of a poisoned value stay silent. `reference`
 	/// is the written value, or the impl's target for an inherited default.
 	CheckAssocValue {
 		member: ImplMember,
+		reference: SourceSpan,
+	},
+	/// A generic impl's requirements have a meaning: proving them for its own
+	/// parameters in its own scope does not need the impl itself. Like
+	/// `CheckAssocValue`, the judgement is the solver's, made once whoever
+	/// asks first; this check reports a loop the impl owns, once, at the bound
+	/// it closed in, and every selection of the impl stays silent.
+	/// `reference` is the impl's target, for a judgement that ran out of
+	/// budget.
+	CheckImplRequirements {
+		impl_kind: ImplKind,
 		reference: SourceSpan,
 	},
 	/// `Projection::name` was written, and the projection's declared bounds do
@@ -180,6 +206,7 @@ impl ObligationChecker<'_> {
 			| Obligation::CheckTraitMembership { reference, .. }
 			| Obligation::CheckWellFormed { reference, .. }
 			| Obligation::CheckAssocValue { reference, .. }
+			| Obligation::CheckImplRequirements { reference, .. }
 			| Obligation::CheckProjectionMember { reference, .. } => reference,
 		};
 		// The obligation is the owning site: a normalization that diverged inside
@@ -260,14 +287,46 @@ impl ObligationChecker<'_> {
 				{
 					return Err(SolverError::Pending);
 				}
-				match self.solver.verdict(member) {
-					AssocValue::Resolved => Ok(()),
-					AssocValue::Overflowed => Err(SolverError::Overflow),
-					AssocValue::Cyclic(cycle) => {
+				match self.solver.verdict(Definition::Member(member)) {
+					Verdict::Resolved => Ok(()),
+					Verdict::Overflowed => Err(SolverError::Overflow),
+					Verdict::Cyclic(cycle) => {
 						Err(SolverError::Cycle(cycle.clone()))
 					}
-					AssocValue::Poisoned => Err(SolverError::Poisoned),
-					AssocValue::Unchecked | AssocValue::InProgress => {
+					Verdict::Poisoned => Err(SolverError::Poisoned),
+					Verdict::Unchecked | Verdict::InProgress => {
+						unreachable!("a finished judgement has a verdict")
+					}
+				}
+			}
+			Obligation::CheckImplRequirements { impl_kind, .. } => {
+				if let Err(SolverError::Pending) =
+					self.solver.requirements_verdict(&mut self.view, impl_kind)
+				{
+					return Err(SolverError::Pending);
+				}
+				let definition = Definition::Requirements(impl_kind);
+				match self.solver.verdict(definition) {
+					Verdict::Resolved => Ok(()),
+					Verdict::Overflowed => Err(SolverError::Overflow),
+					// Reported at the bound the loop closed in, not at the impl:
+					// that is the requirement that names the impl again.
+					Verdict::Cyclic(cycle) => {
+						let bound = cycle.bound.expect(
+							"an impl's requirements own a loop in a bound",
+						);
+						let error = SolverError::Cycle(cycle.clone());
+						let diagnostic = solver_error_diagnostic(
+							&self.type_formatter(),
+							&error,
+							self.bounds.span(bound),
+						)
+						.expect("a cycle has a report");
+						self.diagnostics.push(diagnostic);
+						Err(SolverError::Poisoned)
+					}
+					Verdict::Poisoned => Err(SolverError::Poisoned),
+					Verdict::Unchecked | Verdict::InProgress => {
 						unreachable!("a finished judgement has a verdict")
 					}
 				}
