@@ -31,18 +31,19 @@ use crate::tir::types::TypeEnvOwner;
 use crate::vfs::FileId;
 
 impl TypeContext<'_, '_, '_> {
-	/// Records the check of `argument` against `requirements` for the check
-	/// pass. Construction never decides a bound: the argument is kept as
+	/// Records the check of `argument` against `requirements` in
+	/// `obligations`, for whoever lowers it to check. Construction never decides a bound: the argument is kept as
 	/// written, and a failure is diagnosed later without rewriting it.
 	pub(super) fn record_bounds_check(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: TypeEnvOwner,
 	) -> TypeIndex {
-		self.register_obligation(Obligation::CheckBounds {
+		obligations.push(Obligation::CheckBounds {
 			assumption_context,
 			requirements,
 			argument,
@@ -72,6 +73,7 @@ impl TypeContext<'_, '_, '_> {
 	/// first (a member function's impl or trait), which a bound may name.
 	pub(super) fn resolve_type_args(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		segment: &ast::PathSegment,
@@ -108,6 +110,7 @@ impl TypeContext<'_, '_, '_> {
 			args.iter().zip(&segment.type_args).enumerate()
 		{
 			result.push(self.record_bounds_check(
+				obligations,
 				assumption_context,
 				BoundRequirements::Parameter {
 					env: params_env,

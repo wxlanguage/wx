@@ -444,9 +444,11 @@ builtin traits.
 - Only the first loop found through a definition is reported; a second loop
   through the same definition appears once the first is fixed. By design: the
   check stops at the first `Err(Cycle)`, and the definition is then poisoned.
-- `register_obligation` expects a signature query on the stack. Body checking
-  needs its own list (rustc's fulfillment context); `find_trait_impl`'s `Pending`
-  arm still registers on the signature list.
+- Lowering records requirements in the list its caller passes
+  (`obligations: &mut Vec<Obligation>`, rustc's fulfillment context): a
+  signature's is kept and checked by `check_declarations`, a body's is checked
+  right after lowering, once every fact is final. `find_trait_impl`'s `Pending`
+  arm records into the same list.
 
 ## Migration
 

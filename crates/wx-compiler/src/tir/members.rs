@@ -358,6 +358,7 @@ impl TypeContext<'_, '_, '_> {
 	/// qualified segment).
 	pub(super) fn resolve_type_member_path(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		namespace: Scope,
@@ -371,6 +372,7 @@ impl TypeContext<'_, '_, '_> {
 		for segment in segments {
 			// An inherent function comes first, as in value lookup.
 			if let Some(function) = self.select_inherent_function(
+				obligations,
 				assumption_context,
 				file_id,
 				namespace,
@@ -431,17 +433,12 @@ impl TypeContext<'_, '_, '_> {
 					};
 					// Selection named the trait without matching an impl; that
 					// the receiver implements it is the declaration check's question.
-					self.register_obligation(
-						Obligation::CheckTraitMembership {
-							assumption_context,
-							subject: current,
-							required: trait_index,
-							reference: SourceSpan::new(
-								file_id,
-								segment.ident.span,
-							),
-						},
-					);
+					obligations.push(Obligation::CheckTraitMembership {
+						assumption_context,
+						subject: current,
+						required: trait_index,
+						reference: SourceSpan::new(file_id, segment.ident.span),
+					});
 					self.resolutions.by_site.insert(
 						(
 							SourceSpan::new(file_id, segment.ident.span),
@@ -453,6 +450,7 @@ impl TypeContext<'_, '_, '_> {
 						MemberKind::AssociatedType(assoc_type_index) => {
 							if !segment.type_args.is_empty() {
 								self.report_assoc_type_args(
+									obligations,
 									file_id,
 									namespace,
 									assumption_context,
@@ -475,6 +473,7 @@ impl TypeContext<'_, '_, '_> {
 						MemberKind::Function(function)
 						| MemberKind::Method(function) => {
 							let own_args = self.member_function_type_args(
+								obligations,
 								assumption_context,
 								file_id,
 								namespace,
@@ -500,17 +499,15 @@ impl TypeContext<'_, '_, '_> {
 						// A projection's declared bounds are only half of what
 						// it can have: its value may be a type that does. That
 						// takes impls, so the declaration check decides what to say.
-						self.register_obligation(
-							Obligation::CheckProjectionMember {
-								assumption_context,
-								projection: current,
-								name: segment.ident.inner,
-								reference: SourceSpan::new(
-									file_id,
-									segment.ident.span,
-								),
-							},
-						);
+						obligations.push(Obligation::CheckProjectionMember {
+							assumption_context,
+							projection: current,
+							name: segment.ident.inner,
+							reference: SourceSpan::new(
+								file_id,
+								segment.ident.span,
+							),
+						});
 					} else {
 						self.diagnostics.push(report_no_such_type_member(
 							file_id,
@@ -541,6 +538,7 @@ impl TypeContext<'_, '_, '_> {
 	/// trait members.
 	fn select_inherent_function(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		namespace: Scope,
@@ -589,6 +587,7 @@ impl TypeContext<'_, '_, '_> {
 			let arguments = self.types.push_list(&impl_args);
 			for (index, &argument) in impl_args.iter().enumerate() {
 				type_args.push(self.record_bounds_check(
+					obligations,
 					assumption_context,
 					BoundRequirements::Parameter {
 						env,
@@ -607,6 +606,7 @@ impl TypeContext<'_, '_, '_> {
 				.by_site
 				.insert((reference, Tier::Type), Referent::Member(kind));
 			let own_args = self.member_function_type_args(
+				obligations,
 				assumption_context,
 				file_id,
 				namespace,
@@ -640,6 +640,7 @@ impl TypeContext<'_, '_, '_> {
 	/// use ordinary type-member lookup.
 	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -661,7 +662,7 @@ impl TypeContext<'_, '_, '_> {
 		);
 		// Naming the member does not need an impl; whether `receiver`
 		// implements the trait is the declaration check's question.
-		self.register_obligation(Obligation::CheckTraitMembership {
+		obligations.push(Obligation::CheckTraitMembership {
 			assumption_context,
 			subject: receiver,
 			required: required_trait,
@@ -672,6 +673,7 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn resolve_trait_qualified_value(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -689,6 +691,7 @@ impl TypeContext<'_, '_, '_> {
 			file_id,
 		)?;
 		let found = self.find_trait_impl(
+			obligations,
 			assumption_context,
 			receiver,
 			required_trait,
@@ -754,6 +757,7 @@ impl TypeContext<'_, '_, '_> {
 	/// completeness is `check_trait_conformance`'s own, separate job.
 	pub(super) fn find_trait_impl(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -786,7 +790,7 @@ impl TypeContext<'_, '_, '_> {
 			Err(SolverError::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
-				self.register_obligation(Obligation::CheckTraitMembership {
+				obligations.push(Obligation::CheckTraitMembership {
 					assumption_context,
 					subject: receiver,
 					required: required_trait,

@@ -498,14 +498,6 @@ struct QueryEntry {
 	obligations: Range<u32>,
 }
 
-/// An in-progress signature query on `query_stack`: what was asked, and the
-/// requirements its construction has registered so far.
-pub(super) struct QueryFrame {
-	pub(super) def_id: DefId,
-	pub(super) requested_at: Option<SourceSpan>,
-	pub(super) obligations: Vec<Obligation>,
-}
-
 /// What a caller passes to `ensure_signature` — also pushed as-is onto
 /// `query_stack` as that in-progress query's own frame. `requested_at` is
 /// the span of the reference that demanded `def_id`; `None` only for a
@@ -540,7 +532,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	// The resolved data below is read across the sibling TIR modules.
 	query_state: HashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
-	pub(super) query_stack: Vec<QueryFrame>,
+	pub(super) query_stack: Vec<QueryInfo>,
 	pub(super) solver: Solver,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
@@ -727,6 +719,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `type_param_bounds` field).
 	pub(super) fn resolve_generic_params(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		owner: TypeEnvOwner,
@@ -818,6 +811,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
 			let subject = self.type_envs.param_types(type_env)[index];
 			self.fill_source_bounds(
+				obligations,
 				file_id,
 				namespace,
 				type_env,
@@ -958,6 +952,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// retained here so matching can use the full target later.
 	fn resolve_impl_target(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -1005,6 +1000,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.iter()
 			.map(|arg| {
 				self.resolve_type(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -1014,6 +1010,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			})
 			.collect();
 		let args = self.resolve_type_args(
+			obligations,
 			env,
 			file_id,
 			segment,
@@ -1122,22 +1119,23 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 		self.query_state.get_mut(&query.def_id).unwrap().state =
 			QueryState::InProgress;
-		self.query_stack.push(QueryFrame {
-			def_id: query.def_id,
-			requested_at: query.requested_at,
-			obligations: Vec::new(),
-		});
+		self.query_stack.push(query);
 
 		let entry =
 			&self.ast_nodes[self.query_state[&query.def_id].ast_index as usize];
-		let location =
-			self.compute_signature(entry.file_id, entry.namespace, entry.node);
+		// A nested query keeps its own list, so this one's obligations join
+		// the shared list as one run when it finishes.
+		let mut obligations = Vec::new();
+		let location = self.compute_signature(
+			&mut obligations,
+			entry.file_id,
+			entry.namespace,
+			entry.node,
+		);
 
-		let frame = self.query_stack.pop().unwrap();
-		// Nested queries register while this one is open, so its own
-		// obligations join the shared list as one run only when it finishes.
+		self.query_stack.pop();
 		let start = u32::try_from(self.obligations.len()).unwrap();
-		self.obligations.extend(frame.obligations);
+		self.obligations.extend(obligations);
 		let end = u32::try_from(self.obligations.len()).unwrap();
 		let entry = self.query_state.get_mut(&query.def_id).unwrap();
 		entry.state = QueryState::Resolved(location);
@@ -1152,12 +1150,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// resolution itself that differs once that signature is in hand.
 	fn resolve_function_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
 		let type_env = self.resolve_generic_params(
+			obligations,
 			file_id,
 			namespace,
 			TypeEnvOwner::Function(function_index),
@@ -1170,6 +1170,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.iter()
 			.map(|param| match &param.inner.inner.ty {
 				Some(ty) => self.resolve_type(
+					obligations,
 					file_id,
 					namespace,
 					type_env,
@@ -1192,6 +1193,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 		let return_type = match &signature.result {
 			Some(result) => self.resolve_type(
+				obligations,
 				file_id,
 				namespace,
 				type_env,
@@ -1202,6 +1204,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		};
 
 		self.resolve_function_impls(
+			obligations,
 			file_id,
 			function_index,
 			type_env,
@@ -1223,6 +1226,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// rule), a method's `self` included.
 	fn resolve_function_impls(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		function_index: FunctionIdx,
 		type_env: TypeEnvIdx,
@@ -1273,7 +1277,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			else {
 				continue;
 			};
-			self.register_obligation(Obligation::CheckAssocValue {
+			obligations.push(Obligation::CheckAssocValue {
 				member: ImplMember {
 					impl_index: function_impls.call_impl_index,
 					declaration,
@@ -1313,6 +1317,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// means there. Definition collection already validates receiver position.
 	fn resolve_member_function_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
@@ -1321,6 +1326,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
 		let scope = self.resolve_generic_params(
+			obligations,
 			file_id,
 			namespace,
 			TypeEnvOwner::Function(function_index),
@@ -1339,6 +1345,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		for (index, param) in signature.params.iter().enumerate() {
 			let ty = match &param.inner.inner.ty {
 				Some(ty) => self.resolve_type(
+					obligations,
 					file_id,
 					namespace,
 					scope,
@@ -1364,6 +1371,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 		let return_type = match &signature.result {
 			Some(result) => self.resolve_type(
+				obligations,
 				file_id,
 				namespace,
 				scope,
@@ -1374,6 +1382,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		};
 
 		self.resolve_function_impls(
+			obligations,
 			file_id,
 			function_index,
 			scope,
@@ -1392,6 +1401,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Resolve a constant's required annotation in its declaration scope.
 	fn resolve_constant_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		const_index: ConstIdx,
@@ -1401,6 +1411,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	) -> SignatureLocation {
 		let ty = match ty {
 			Some(ty) => self.resolve_type(
+				obligations,
 				file_id,
 				namespace,
 				scope,
@@ -1487,6 +1498,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// resolve identically once their `size` type expression is in hand.
 	fn resolve_memory_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		memory_index: MemoryIdx,
@@ -1498,6 +1510,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let size_assoc_type_index = memory_def.size_assoc_type_index;
 
 		let resolved_size = self.resolve_assoc_value(
+			obligations,
 			file_id,
 			namespace,
 			TypeEnvIdx::ROOT,
@@ -1531,6 +1544,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		};
 		let memory_type = self.types.intern(Type::Memory { memory_index });
 		let checked_size = self.record_bounds_check(
+			obligations,
 			TypeEnvIdx::ROOT,
 			BoundRequirements::AssociatedType {
 				declaration: declared_size_index,
@@ -1570,6 +1584,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// it, an imported one's type is mandatory in the grammar.
 	fn resolve_global_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		global_index: GlobalIdx,
 		name: Spanned<SymbolU32>,
@@ -1602,6 +1617,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			value.inner
 		} else {
 			self.record_bounds_check(
+				obligations,
 				TypeEnvIdx::ROOT,
 				BoundRequirements::AssociatedType {
 					declaration: declared_value_index,
@@ -1645,6 +1661,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	fn compute_signature(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		ast_node: AstNodeRef<'_>,
@@ -1677,6 +1694,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						},
 						None => {
 							let type_env = self.resolve_generic_params(
+								obligations,
 								file_id,
 								namespace,
 								TypeEnvOwner::TypeAlias(type_alias_index),
@@ -1685,6 +1703,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							);
 							let target = match body {
 								Some(body) => self.resolve_type(
+									obligations,
 									file_id,
 									namespace,
 									type_env,
@@ -1717,6 +1736,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				self.resolve_constant_signature(
+					obligations,
 					file_id,
 					namespace,
 					const_index,
@@ -1757,6 +1777,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					TraitSignature { env: self_scope };
 				let subject = self.type_envs.param_types(self_scope)[0];
 				let (declared_bounds, clauses) = self.resolve_subject_bounds(
+					obligations,
 					file_id,
 					namespace,
 					self_scope,
@@ -1801,6 +1822,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let self_type = self.type_envs.param_types(self_scope)[0];
 
 				self.resolve_member_function_signature(
+					obligations,
 					file_id,
 					namespace,
 					function_index,
@@ -1827,6 +1849,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let self_scope = self.traits[usize::from(trait_index)].env;
 
 				let resolved_ty = self.resolve_type(
+					obligations,
 					file_id,
 					namespace,
 					self_scope,
@@ -1873,6 +1896,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					assoc_type_index,
 				});
 				let (resolved_bounds, clauses) = self.resolve_subject_bounds(
+					obligations,
 					file_id,
 					namespace,
 					self_scope,
@@ -1883,6 +1907,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				);
 				let resolved_value = value.as_ref().map(|value| {
 					self.resolve_type(
+						obligations,
 						file_id,
 						namespace,
 						self_scope,
@@ -1919,6 +1944,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let (scope, self_type) =
 					(header.type_params, header.target.inner);
 				self.resolve_member_function_signature(
+					obligations,
 					file_id,
 					namespace,
 					function_index,
@@ -1945,6 +1971,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.expect("trait impl header is resolved")
 					.type_params;
 				self.resolve_constant_signature(
+					obligations,
 					file_id,
 					namespace,
 					const_index,
@@ -1982,6 +2009,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.type_params;
 
 				let resolved_ty = self.resolve_assoc_value(
+					obligations,
 					file_id,
 					namespace,
 					scope,
@@ -2007,6 +2035,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				self.resolve_memory_signature(
+					obligations,
 					file_id,
 					namespace,
 					memory_index,
@@ -2022,6 +2051,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				self.resolve_memory_signature(
+					obligations,
 					file_id,
 					namespace,
 					memory_index,
@@ -2048,6 +2078,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							&self.defs.globals[usize::from(global_index)];
 						Spanned {
 							inner: self.resolve_assoc_value(
+								obligations,
 								file_id,
 								namespace,
 								TypeEnvIdx::ROOT,
@@ -2068,6 +2099,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					}
 				};
 				self.resolve_global_signature(
+					obligations,
 					file_id,
 					global_index,
 					*name,
@@ -2091,6 +2123,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let global_def = &self.defs.globals[usize::from(global_index)];
 				let value = Spanned {
 					inner: self.resolve_assoc_value(
+						obligations,
 						file_id,
 						namespace,
 						TypeEnvIdx::ROOT,
@@ -2101,6 +2134,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					span: ty.span,
 				};
 				self.resolve_global_signature(
+					obligations,
 					file_id,
 					global_index,
 					*name,
@@ -2119,6 +2153,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				};
 
 				let type_env = self.resolve_generic_params(
+					obligations,
 					file_id,
 					namespace,
 					TypeEnvOwner::Struct(struct_index),
@@ -2144,6 +2179,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				for f in fields.iter() {
 					let ty_expr = &f.inner.inner.ty;
 					let ty = self.resolve_type(
+						obligations,
 						file_id,
 						namespace,
 						type_env,
@@ -2172,6 +2208,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				self.resolve_function_signature(
+					obligations,
 					file_id,
 					namespace,
 					function_index,
@@ -2188,6 +2225,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				self.resolve_function_signature(
+					obligations,
 					file_id,
 					namespace,
 					function_index,
@@ -2204,6 +2242,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				let scope = self.resolve_generic_params(
+					obligations,
 					file_id,
 					namespace,
 					TypeEnvOwner::InherentImpl(block_index),
@@ -2211,6 +2250,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					type_params,
 				);
 				let target_type = self.resolve_impl_target(
+					obligations,
 					file_id,
 					namespace,
 					scope,
@@ -2226,12 +2266,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						},
 					});
 				if !self.type_envs.param_types(scope).is_empty() {
-					self.register_obligation(
-						Obligation::CheckImplRequirements {
-							impl_kind: ImplKind::Inherent(block_index),
-							reference: SourceSpan::new(file_id, target.span()),
-						},
-					);
+					obligations.push(Obligation::CheckImplRequirements {
+						impl_kind: ImplKind::Inherent(block_index),
+						reference: SourceSpan::new(file_id, target.span()),
+					});
 				}
 				SignatureLocation::InherentImpl(block_index)
 			}
@@ -2260,6 +2298,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let (scope, self_type) =
 					(header.type_params, header.target.inner);
 				self.resolve_member_function_signature(
+					obligations,
 					file_id,
 					namespace,
 					function_index,
@@ -2289,6 +2328,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.type_params;
 
 				self.resolve_constant_signature(
+					obligations,
 					file_id,
 					namespace,
 					const_index,
@@ -2307,6 +2347,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 				let scope = self.resolve_generic_params(
+					obligations,
 					file_id,
 					namespace,
 					TypeEnvOwner::TraitImpl(block_index),
@@ -2315,6 +2356,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				);
 				let header = self.impl_dispatch.trait_header(block_index);
 				let target_type = self.resolve_impl_target(
+					obligations,
 					file_id,
 					namespace,
 					scope,
@@ -2330,12 +2372,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						},
 					});
 				if !self.type_envs.param_types(scope).is_empty() {
-					self.register_obligation(
-						Obligation::CheckImplRequirements {
-							impl_kind: ImplKind::Trait(block_index),
-							reference: SourceSpan::new(file_id, target.span()),
-						},
-					);
+					obligations.push(Obligation::CheckImplRequirements {
+						impl_kind: ImplKind::Trait(block_index),
+						reference: SourceSpan::new(file_id, target.span()),
+					});
 				}
 				// A default this impl inherits means something here that it
 				// does not in the trait, so the impl owns its judgement; a
@@ -2353,18 +2393,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							.defs
 							.select_trait_member(block_index, declaration)
 						{
-							self.register_obligation(
-								Obligation::CheckAssocValue {
-									member: ImplMember {
-										impl_index: block_index,
-										declaration: index,
-									},
-									reference: SourceSpan::new(
-										file_id,
-										target.span(),
-									),
+							obligations.push(Obligation::CheckAssocValue {
+								member: ImplMember {
+									impl_index: block_index,
+									declaration: index,
 								},
-							);
+								reference: SourceSpan::new(
+									file_id,
+									target.span(),
+								),
+							});
 						}
 					}
 				}
@@ -2378,6 +2416,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let repr_type = match repr {
 					Some(repr_expr) => {
 						let resolved = self.resolve_type(
+							obligations,
 							file_id,
 							namespace,
 							TypeEnvIdx::ROOT,
@@ -2465,6 +2504,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					TraitSignature { env: self_scope };
 				let subject = self.type_envs.param_types(self_scope)[0];
 				let (clause_bounds, clauses) = self.resolve_subject_bounds(
+					obligations,
 					file_id,
 					namespace,
 					self_scope,
@@ -2489,6 +2529,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				for (m, &impl_index) in members.iter().zip(member_impls.iter())
 				{
 					let member_ty = self.resolve_impl_target(
+						obligations,
 						file_id,
 						namespace,
 						TypeEnvIdx::ROOT,
@@ -2554,6 +2595,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// A tag is an ordinary type with an additional Memory requirement.
 	fn resolve_memory_tag(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -2561,6 +2603,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let ty = self.resolve_type_path(
+			obligations,
 			file_id,
 			namespace,
 			env,
@@ -2588,7 +2631,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			required,
 			reference,
 		};
-		self.register_obligation(obligation);
+		obligations.push(obligation);
 		ty
 	}
 
@@ -2598,6 +2641,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// otherwise differ only in which `Type` variant they intern.
 	fn resolve_pointer_memory(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -2607,6 +2651,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	) -> Result<TypeIndex, ()> {
 		match memory {
 			Some(segments) => Ok(self.resolve_memory_tag(
+				obligations,
 				file_id,
 				namespace,
 				env,
@@ -2623,6 +2668,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// to find cycles, and readers normalize under their own assumptions.
 	fn resolve_type(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -2630,6 +2676,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let ty = self.resolve_type_expression(
+			obligations,
 			file_id,
 			namespace,
 			env,
@@ -2637,7 +2684,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			infer_policy,
 		);
 		if ty != TypeIndex::ERROR {
-			self.register_obligation(Obligation::CheckWellFormed {
+			obligations.push(Obligation::CheckWellFormed {
 				assumption_context: env,
 				ty,
 				reference: SourceSpan::new(file_id, type_expr.span),
@@ -2654,6 +2701,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// declare is never selected, so it only gets the generic check.
 	fn resolve_assoc_value(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		scope: TypeEnvIdx,
@@ -2676,6 +2724,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			});
 		let Some(MemberKind::AssociatedType(declaration)) = declaration else {
 			return self.resolve_type(
+				obligations,
 				file_id,
 				namespace,
 				scope,
@@ -2684,6 +2733,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			);
 		};
 		let ty = self.resolve_type_expression(
+			obligations,
 			file_id,
 			namespace,
 			scope,
@@ -2692,7 +2742,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		);
 		// Lowering that failed has already reported; nothing to judge.
 		if ty != TypeIndex::ERROR {
-			self.register_obligation(Obligation::CheckAssocValue {
+			obligations.push(Obligation::CheckAssocValue {
 				member: ImplMember {
 					impl_index,
 					declaration,
@@ -2706,6 +2756,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Resolve both ordinary type paths and explicit memory tags.
 	fn resolve_type_path(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -2732,6 +2783,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
 					self.resolve_type_expression(
+						obligations,
 						file_id,
 						namespace,
 						env,
@@ -2768,6 +2820,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
 					self.resolve_type_expression(
+						obligations,
 						file_id,
 						namespace,
 						env,
@@ -2817,6 +2870,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
 						self.resolve_type_expression(
+							obligations,
 							file_id,
 							namespace,
 							env,
@@ -2862,6 +2916,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								.iter()
 								.map(|arg| {
 									self.resolve_type_expression(
+										obligations,
 										file_id,
 										namespace,
 										env,
@@ -2871,6 +2926,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								})
 								.collect();
 							let type_args = self.resolve_type_args(
+								obligations,
 								env,
 								file_id,
 								stopped,
@@ -2924,6 +2980,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						.iter()
 						.map(|arg| {
 							self.resolve_type_expression(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -2933,6 +2990,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						})
 						.collect();
 					let type_args = self.resolve_type_args(
+						obligations,
 						env,
 						file_id,
 						stopped,
@@ -2949,6 +3007,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						// Resolved only to report what is wrong inside them.
 						for arg in &stopped.type_args {
 							self.resolve_type_expression(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -2981,6 +3040,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						// Resolved only to report what is wrong inside them.
 						for arg in &stopped.type_args {
 							self.resolve_type_expression(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -3036,6 +3096,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						.iter()
 						.map(|arg| {
 							self.resolve_type_expression(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -3045,6 +3106,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						})
 						.collect();
 					let type_args = self.resolve_type_args(
+						obligations,
 						env,
 						file_id,
 						stopped,
@@ -3065,6 +3127,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						// Resolved only to report what is wrong inside them.
 						for arg in &stopped.type_args {
 							self.resolve_type_expression(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -3103,6 +3166,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// bound instead of the namespace graph — `members.rs`'s
 		// job, not this module's.
 		self.resolve_type_member_path(
+			obligations,
 			env,
 			file_id,
 			namespace,
@@ -3117,6 +3181,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// takes none.
 	pub(super) fn member_function_type_args(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		assumption_context: TypeEnvIdx,
 		file_id: FileId,
 		namespace: Scope,
@@ -3150,6 +3215,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.iter()
 			.map(|arg| {
 				self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					assumption_context,
@@ -3159,6 +3225,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			})
 			.collect();
 		self.resolve_type_args(
+			obligations,
 			assumption_context,
 			file_id,
 			segment,
@@ -3175,6 +3242,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// wrong inside them too.
 	pub(super) fn report_assoc_type_args(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -3184,6 +3252,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	) {
 		for arg in &segment.type_args {
 			self.resolve_type_expression(
+				obligations,
 				file_id,
 				namespace,
 				env,
@@ -3207,6 +3276,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// member, but stored equality expressions retain symbolic projections.
 	fn resolve_type_expression(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -3227,6 +3297,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			},
 			ast::TypeExpression::Never => TypeIndex::NEVER,
 			ast::TypeExpression::Path(segments) => self.resolve_type_path(
+				obligations,
 				file_id,
 				namespace,
 				env,
@@ -3239,6 +3310,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// multi-segment namespace path): `inner` is already a full
 				// type expression, so the member walk starts on it directly.
 				let current = self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3246,6 +3318,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					infer_policy,
 				);
 				self.resolve_type_member_path(
+					obligations,
 					env,
 					file_id,
 					namespace,
@@ -3256,6 +3329,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			ast::TypeExpression::QualifiedPath { root, segments } => {
 				let base_ty = self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3280,6 +3354,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// `resolve_type_member_path`.
 				let first = &segments[0];
 				let Ok(declaration) = self.resolve_trait_qualified_type_member(
+					obligations,
 					env,
 					base_ty,
 					required_trait,
@@ -3292,6 +3367,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					MemberKind::AssociatedType(assoc_type_index) => {
 						if !first.type_args.is_empty() {
 							self.report_assoc_type_args(
+								obligations,
 								file_id,
 								namespace,
 								env,
@@ -3314,6 +3390,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					MemberKind::Function(function)
 					| MemberKind::Method(function) => {
 						let own_args = self.member_function_type_args(
+							obligations,
 							env,
 							file_id,
 							namespace,
@@ -3332,6 +3409,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				};
 
 				self.resolve_type_member_path(
+					obligations,
 					env,
 					file_id,
 					namespace,
@@ -3345,6 +3423,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// is its tuple (`()` for none).
 				let param = if let [param] = &params[..] {
 					self.resolve_type_expression(
+						obligations,
 						file_id,
 						namespace,
 						env,
@@ -3355,6 +3434,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					let mut elements = Vec::with_capacity(params.len());
 					for param in params.iter() {
 						elements.push(self.resolve_type_expression(
+							obligations,
 							file_id,
 							namespace,
 							env,
@@ -3366,6 +3446,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				};
 				let result_type = match result {
 					Some(result) => self.resolve_type_expression(
+						obligations,
 						file_id,
 						namespace,
 						env,
@@ -3385,6 +3466,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				inner,
 			} => {
 				let to = self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3392,6 +3474,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					infer_policy,
 				);
 				let Ok(memory) = self.resolve_pointer_memory(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3413,6 +3496,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				inner,
 			} => {
 				let of = self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3420,6 +3504,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					infer_policy,
 				);
 				let Ok(memory) = self.resolve_pointer_memory(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3442,6 +3527,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				size,
 			} => {
 				let of = self.resolve_type_expression(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3449,6 +3535,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					infer_policy,
 				);
 				let Ok(memory) = self.resolve_pointer_memory(
+					obligations,
 					file_id,
 					namespace,
 					env,
@@ -3470,6 +3557,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					Vec::with_capacity(elements.len());
 				for element in elements.iter() {
 					elems.push(self.resolve_type_expression(
+						obligations,
 						file_id,
 						namespace,
 						env,
@@ -3743,6 +3831,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	fn resolve_subject_bounds(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -3802,7 +3891,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					})
 			}
 		}
-		self.fill_source_bounds(file_id, namespace, env, subject, &occurrences);
+		self.fill_source_bounds(
+			obligations,
+			file_id,
+			namespace,
+			env,
+			subject,
+			&occurrences,
+		);
 		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
 		let equalities = self.equality_clauses(subject, &ids, name);
 		(
@@ -3974,6 +4070,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// they name.
 	fn fill_source_bounds(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		file_id: FileId,
 		namespace: Scope,
 		env: TypeEnvIdx,
@@ -3990,6 +4087,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						// its final value. Member lookup may still need
 						// to expose a receiver's constructor.
 						let value = self.resolve_type_expression(
+							obligations,
 							file_id,
 							namespace,
 							env,
@@ -4007,6 +4105,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						// PointerSize` states a fact no impl can satisfy.
 						if value.inner != TypeIndex::ERROR {
 							self.record_bounds_check(
+								obligations,
 								env,
 								BoundRequirements::AssociatedType {
 									declaration: binding.assoc_type_index,
@@ -4028,7 +4127,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								base: subject,
 							});
 						self.fill_source_bounds(
-							file_id, namespace, env, projection, nested,
+							obligations,
+							file_id,
+							namespace,
+							env,
+							projection,
+							nested,
 						);
 						BindingRequirement::Bound(
 							nested.iter().map(|o| o.id).collect(),
@@ -8887,6 +8991,7 @@ pub(super) mod tests {
 					);
 					let qualified = builder
 						.resolve_trait_qualified_value(
+							&mut Vec::new(),
 							TypeEnvIdx::ROOT,
 							receiver,
 							trait_index,
@@ -8922,6 +9027,7 @@ pub(super) mod tests {
 				assert!(
 					builder
 						.resolve_trait_qualified_value(
+							&mut Vec::new(),
 							TypeEnvIdx::ROOT,
 							receiver,
 							trait_index,

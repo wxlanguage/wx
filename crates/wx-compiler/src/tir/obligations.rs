@@ -109,15 +109,6 @@ pub(super) enum Obligation {
 }
 
 impl TypeContext<'_, '_, '_> {
-	/// Registers a requirement of the signature being constructed.
-	pub(super) fn register_obligation(&mut self, obligation: Obligation) {
-		self.query_stack
-			.last_mut()
-			.expect("a requirement belongs to the signature being constructed")
-			.obligations
-			.push(obligation);
-	}
-
 	/// A solver that cannot finish (budget or cycle) reports nothing; the
 	/// construct that wrote the requirement does, here, once, at its own span.
 	/// Any other result passes through for the caller to recover from.
