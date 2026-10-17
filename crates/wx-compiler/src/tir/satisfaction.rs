@@ -21,7 +21,7 @@ use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
-use super::signatures::TypeContext;
+use super::signatures::{LexicalScope, TypeContext};
 use super::solver::{SolverError, Unsatisfied};
 use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
@@ -60,7 +60,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Always returns exactly that many slots.
 	///
 	/// A wrong count poisons every slot to `ERROR` — there's no sensible
-	/// pairing to salvage — but keeps `owner_name`'s own identity meaningful
+	/// pairing to salvage — but keeps `owner`'s own identity meaningful
 	/// to whatever reads the result next (a caller still sees "a `Wrapper`",
 	/// not a second, unrelated "not a struct" error stacked on this one). A
 	/// correct count checks each argument, in its own right, against every
@@ -69,18 +69,19 @@ impl TypeContext<'_, '_, '_> {
 	/// argument satisfies neither — and only that one slot, not the whole
 	/// list, is poisoned when any of them fails. Pending requirements retain
 	/// the argument and enqueue a check against the eventual parameter table.
-	/// `parent_args` are the arguments of the frames around `params_env`, outer
-	/// first (a member function's impl or trait), which a bound may name.
+	/// `scope` is where the arguments are written, and what proving them may
+	/// assume; `params_env` is `owner`'s own frame, whose bounds they must
+	/// satisfy (`ROOT` when it declares no parameters). `parent_args` are the
+	/// arguments of the frames around `params_env`, outer first (a member
+	/// function's impl or trait), which a bound may name.
 	pub(super) fn resolve_type_args(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
-		assumption_context: TypeEnvIdx,
-		file_id: FileId,
+		scope: LexicalScope,
 		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
 		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
-		kind: DefKind,
 		owner: TypeEnvOwner,
 	) -> Box<[TypeIndex]> {
 		let expected = self.param_bounds[usize::from(params_env)].len();
@@ -88,9 +89,9 @@ impl TypeContext<'_, '_, '_> {
 			self.diagnostics.push(report_type_arg_count_mismatch(
 				self.strings,
 				self.defs,
-				file_id,
+				scope.file_id,
 				segment,
-				kind,
+				owner,
 				self.type_envs.param_names(params_env),
 			));
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
@@ -111,7 +112,7 @@ impl TypeContext<'_, '_, '_> {
 		{
 			result.push(self.record_bounds_check(
 				obligations,
-				assumption_context,
+				scope.env,
 				BoundRequirements::Parameter {
 					env: params_env,
 					index,
@@ -121,7 +122,7 @@ impl TypeContext<'_, '_, '_> {
 					inner: argument,
 					span: written.span,
 				},
-				SourceSpan::new(file_id, written.span),
+				SourceSpan::new(scope.file_id, written.span),
 				owner,
 			));
 		}
@@ -523,13 +524,13 @@ pub(super) fn report_type_arg_count_mismatch(
 	defs: &DefinitionRegistry,
 	file_id: FileId,
 	segment: &ast::PathSegment,
-	kind: DefKind,
+	owner: TypeEnvOwner,
 	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
-	let (noun, name) = (kind.noun(), segment.ident.inner);
-	let declaration = kind
-		.declared_at(defs)
-		.map(|declared_at| (declared_at, params));
+	let (noun, name) = (owner.noun(), segment.ident.inner);
+	let declaration = owner.name(defs).map(|declared| {
+		(SourceSpan::new(owner.file_id(defs), declared.span), params)
+	});
 	let args = &segment.type_args;
 	let params = declaration.map_or(&[][..], |(_, params)| params);
 	let expected = params.len();

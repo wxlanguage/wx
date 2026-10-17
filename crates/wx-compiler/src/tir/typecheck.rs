@@ -31,7 +31,7 @@ use super::operators::{
 use super::paths::PathResolver;
 use super::satisfaction::report_type_arg_count_mismatch;
 use super::signatures::TypeContext;
-use super::types::{TypeEnvIdx, TypeIndex};
+use super::types::{TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -351,7 +351,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.defs,
 				self.file_id,
 				segment,
-				DefKind::Struct(struct_index),
+				TypeEnvOwner::Struct(struct_index),
 				&[],
 			));
 		}

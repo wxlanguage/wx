@@ -18,14 +18,15 @@ use crate::vfs::FileId;
 use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, DefId, DefinitionRegistry,
-	InherentImplIdx, MemberKind, Scope, Tier, TraitIdx, TraitImplIdx,
+	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
 use super::obligations::{BoundRequirements, Obligation};
 use super::resolutions::Referent;
 use super::signatures::{
-	InferPolicy, QueryInfo, SignatureLocation, SignatureStatus, TypeContext,
+	InferPolicy, LexicalScope, QueryInfo, SignatureLocation, SignatureStatus,
+	TypeContext,
 };
 use super::solver::{Assumption, SolverError};
 use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
@@ -359,9 +360,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn resolve_type_member_path(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
-		assumption_context: TypeEnvIdx,
-		file_id: FileId,
-		namespace: Scope,
+		scope: LexicalScope,
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
@@ -373,9 +372,7 @@ impl TypeContext<'_, '_, '_> {
 			// An inherent function comes first, as in value lookup.
 			if let Some(function) = self.select_inherent_function(
 				obligations,
-				assumption_context,
-				file_id,
-				namespace,
+				scope,
 				current,
 				segment,
 				infer_policy,
@@ -385,10 +382,10 @@ impl TypeContext<'_, '_, '_> {
 			}
 			let key = BindingKey::ty(segment.ident.inner);
 			match self.select_associated_type(
-				assumption_context,
+				scope.env,
 				current,
 				key,
-				SourceSpan::new(file_id, segment.ident.span),
+				SourceSpan::new(scope.file_id, segment.ident.span),
 			) {
 				MemberLookup::Pending => {
 					let receiver = self.type_formatter().display_type(current);
@@ -404,8 +401,11 @@ impl TypeContext<'_, '_, '_> {
 								"selecting associated type `{name}` depends on unfinished bounds"
 							))
 							.with_label(
-								SourceSpan::new(file_id, segment.ident.span)
-									.primary_label(),
+								SourceSpan::new(
+									scope.file_id,
+									segment.ident.span,
+								)
+								.primary_label(),
 							)
 							.with_note(format!(
 								"qualify the declaring trait with `<{receiver} as Trait>::{name}`"
@@ -417,7 +417,7 @@ impl TypeContext<'_, '_, '_> {
 				MemberLookup::Stuck(error) => {
 					let _ = self.report_solver_error::<()>(
 						Err(error),
-						SourceSpan::new(file_id, segment.ident.span),
+						SourceSpan::new(scope.file_id, segment.ident.span),
 					);
 					return TypeIndex::ERROR;
 				}
@@ -434,14 +434,17 @@ impl TypeContext<'_, '_, '_> {
 					// Selection named the trait without matching an impl; that
 					// the receiver implements it is the declaration check's question.
 					obligations.push(Obligation::CheckTraitMembership {
-						assumption_context,
+						assumption_context: scope.env,
 						subject: current,
 						required: trait_index,
-						reference: SourceSpan::new(file_id, segment.ident.span),
+						reference: SourceSpan::new(
+							scope.file_id,
+							segment.ident.span,
+						),
 					});
 					self.resolutions.by_site.insert(
 						(
-							SourceSpan::new(file_id, segment.ident.span),
+							SourceSpan::new(scope.file_id, segment.ident.span),
 							Tier::Type,
 						),
 						Referent::Member(declaration),
@@ -451,9 +454,7 @@ impl TypeContext<'_, '_, '_> {
 							if !segment.type_args.is_empty() {
 								self.report_assoc_type_args(
 									obligations,
-									file_id,
-									namespace,
-									assumption_context,
+									scope,
 									segment,
 									assoc_type_index,
 									infer_policy,
@@ -474,9 +475,7 @@ impl TypeContext<'_, '_, '_> {
 						| MemberKind::Method(function) => {
 							let own_args = self.member_function_type_args(
 								obligations,
-								assumption_context,
-								file_id,
-								namespace,
+								scope,
 								function,
 								&[current],
 								segment,
@@ -500,17 +499,17 @@ impl TypeContext<'_, '_, '_> {
 						// it can have: its value may be a type that does. That
 						// takes impls, so the declaration check decides what to say.
 						obligations.push(Obligation::CheckProjectionMember {
-							assumption_context,
+							assumption_context: scope.env,
 							projection: current,
 							name: segment.ident.inner,
 							reference: SourceSpan::new(
-								file_id,
+								scope.file_id,
 								segment.ident.span,
 							),
 						});
 					} else {
 						self.diagnostics.push(report_no_such_type_member(
-							file_id,
+							scope.file_id,
 							self.strings,
 							segment.ident,
 						));
@@ -519,7 +518,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 				MemberLookup::Ambiguous(candidates) => {
 					self.diagnostics.push(report_ambiguous_type_member(
-						file_id,
+						scope.file_id,
 						self.strings,
 						self.defs,
 						segment.ident,
@@ -539,19 +538,17 @@ impl TypeContext<'_, '_, '_> {
 	fn select_inherent_function(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
-		assumption_context: TypeEnvIdx,
-		file_id: FileId,
-		namespace: Scope,
+		scope: LexicalScope,
 		receiver: TypeIndex,
 		segment: &ast::PathSegment,
 		infer_policy: InferPolicy,
 	) -> Option<TypeIndex> {
 		let key = BindingKey::ty(segment.ident.inner);
-		let reference = SourceSpan::new(file_id, segment.ident.span);
+		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
 		// Only assumed equalities may rewrite the receiver here, as for an
 		// associated type; a failure is the trait selection's to report.
 		let receiver = self
-			.normalize_assumed_type_query(assumption_context, receiver)
+			.normalize_assumed_type_query(scope.env, receiver)
 			.ok()?;
 		let target = ImplTarget::from_type(self.types.resolve(receiver))?;
 		let impl_dispatch = self.impl_dispatch;
@@ -588,7 +585,7 @@ impl TypeContext<'_, '_, '_> {
 			for (index, &argument) in impl_args.iter().enumerate() {
 				type_args.push(self.record_bounds_check(
 					obligations,
-					assumption_context,
+					scope.env,
 					BoundRequirements::Parameter {
 						env,
 						index,
@@ -607,9 +604,7 @@ impl TypeContext<'_, '_, '_> {
 				.insert((reference, Tier::Type), Referent::Member(kind));
 			let own_args = self.member_function_type_args(
 				obligations,
-				assumption_context,
-				file_id,
-				namespace,
+				scope,
 				function,
 				&type_args,
 				segment,
