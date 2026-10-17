@@ -50,10 +50,6 @@ pub(super) enum ArgOrder {
 pub(super) enum ExprKind {
 	/// Already reported; whatever reads it stays silent.
 	Error,
-	/// A form the checker does not cover yet. It has no type, so nothing is
-	/// checked against it, and constant evaluation refuses it. It disappears as
-	/// the checker grows.
-	Unsupported,
 	/// A literal's magnitude, as written; `-1` is `Unary` over `Int(1)`.
 	Int(u64),
 	Float(f64),
@@ -87,11 +83,15 @@ pub(super) enum ExprKind {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
+	/// A tuple of its elements, in order: `(a, b)`, `(a,)` or `()`.
+	Tuple {
+		elements: ExprRange,
+	},
 	/// A struct built from its fields, written as a call to its name;
 	/// `order` says which field each argument gives. A construction
 	/// missing a field, which is reported, has fewer arguments than the struct
 	/// has fields.
-	Construct {
+	StructConstructor {
 		struct_index: StructIdx,
 		args: ExprRange,
 		order: ArgOrder,
@@ -172,6 +172,11 @@ impl BodyBuilder {
 		index
 	}
 
+	/// The arguments pushed as `range`.
+	pub(super) fn args(&self, range: ExprRange) -> &[ExprIdx] {
+		&self.extra[range.start as usize..(range.start + range.len) as usize]
+	}
+
 	pub(super) fn push_args(
 		&mut self,
 		args: impl IntoIterator<Item = ExprIdx>,
@@ -231,13 +236,13 @@ impl BodyBuilder {
 			ExprKind::Binary { lhs, rhs, .. } => ([Some(lhs), Some(rhs)], &[]),
 			ExprKind::MethodCall { args, .. }
 			| ExprKind::GenericMethodCall { args, .. }
-			| ExprKind::Construct { args, .. } => (
+			| ExprKind::StructConstructor { args, .. }
+			| ExprKind::Tuple { elements: args } => (
 				[None, None],
 				&self.extra
 					[args.start as usize..(args.start + args.len) as usize],
 			),
 			ExprKind::Error
-			| ExprKind::Unsupported
 			| ExprKind::Int(_)
 			| ExprKind::Float(_)
 			| ExprKind::Bool(_)

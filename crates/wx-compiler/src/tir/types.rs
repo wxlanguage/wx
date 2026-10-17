@@ -185,10 +185,37 @@ pub enum Type {
 	},
 }
 
+/// What holds of a type or anything inside it, computed once when the type
+/// is interned, from its own kind and its parts' flags (rustc's
+/// `TypeFlags`). An interned type never changes, so neither do its flags.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TypeFlags(u8);
+
+impl TypeFlags {
+	/// An `Infer` is in it: something about the type is not known yet.
+	pub(super) const HAS_INFER: Self = Self(1 << 0);
+	/// An `Error` is in it: something about the type was reported.
+	pub(super) const HAS_ERROR: Self = Self(1 << 1);
+	/// An `Integer` or `Float` is in it: an untyped literal's type, which
+	/// context has not given it yet.
+	pub(super) const HAS_UNTYPED: Self = Self(1 << 2);
+
+	fn union(self, other: Self) -> Self {
+		Self(self.0 | other.0)
+	}
+
+	fn contains(self, other: Self) -> bool {
+		self.0 & other.0 == other.0
+	}
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(test, serde(transparent))]
 pub struct TypeInterner {
 	entries: Vec<Type>,
+	/// Each entry's flags, by the entry's index.
+	#[cfg_attr(test, serde(skip))]
+	flags: Vec<TypeFlags>,
 	/// Every `TypeList`'s elements, back to back.
 	#[cfg_attr(test, serde(skip))]
 	lists: Vec<TypeIndex>,
@@ -429,6 +456,7 @@ impl TypeInterner {
 	pub fn new() -> Self {
 		let mut types = Self {
 			entries: Vec::new(),
+			flags: Vec::new(),
 			lists: Vec::new(),
 			index_lookup: HashTable::new(),
 			hasher: RandomState::new(),
@@ -566,9 +594,12 @@ impl TypeInterner {
 			u32::try_from(self.entries.len())
 				.expect("type interner exceeded u32 index capacity"),
 		);
+		let flags = self.flags_of(ty);
 		self.entries.push(ty);
+		self.flags.push(flags);
 		let Self {
 			entries,
+			flags: _,
 			lists,
 			index_lookup,
 			hasher,
@@ -583,6 +614,396 @@ impl TypeInterner {
 
 	pub fn list(&self, list: TypeList) -> &[TypeIndex] {
 		list.slice(&self.lists)
+	}
+
+	/// The flags of a type about to be interned: its own kind's, joined with
+	/// those of its parts, which are interned already.
+	fn flags_of(&self, ty: Type) -> TypeFlags {
+		match ty {
+			Type::Infer => TypeFlags::HAS_INFER,
+			Type::Error => TypeFlags::HAS_ERROR,
+			Type::Integer | Type::Float => TypeFlags::HAS_UNTYPED,
+			Type::Tuple { elements: list }
+			| Type::Struct {
+				type_args: list, ..
+			}
+			| Type::Function {
+				type_args: list, ..
+			} => {
+				let mut flags = TypeFlags::default();
+				for &part in list.slice(&self.lists) {
+					flags = flags.union(self.flags[usize::from(part)]);
+				}
+				flags
+			}
+			Type::Pointer { to: of, memory, .. }
+			| Type::Array { of, memory, .. }
+			| Type::Slice { of, memory, .. } => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(memory)]),
+			Type::FunctionRef { param, result } => self.flags
+				[usize::from(param)]
+			.union(self.flags[usize::from(result)]),
+			Type::AssocTypeProjection { base, .. } => {
+				self.flags[usize::from(base)]
+			}
+			Type::Never
+			| Type::U8
+			| Type::I8
+			| Type::U16
+			| Type::I16
+			| Type::U32
+			| Type::I32
+			| Type::U64
+			| Type::I64
+			| Type::F32
+			| Type::F64
+			| Type::Bool
+			| Type::Char
+			| Type::Enum { .. }
+			| Type::Memory { .. }
+			| Type::Global { .. }
+			| Type::TypeParam { .. }
+			| Type::AssociatedType { .. } => TypeFlags::default(),
+		}
+	}
+
+	/// Whether something in `ty` is not known yet (an `Infer` anywhere in it).
+	pub(super) fn has_infer(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_INFER)
+	}
+
+	/// Whether something in `ty` was reported (an `Error` anywhere in it).
+	pub(super) fn has_error(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_ERROR)
+	}
+
+	/// `ty`, collapsed to `ERROR` when an `Error` is anywhere in it: a type
+	/// built of a reported part would only be reported again, as a mismatch
+	/// against `Wrapper<{unknown}>`.
+	pub(super) fn collapse_error(&self, ty: TypeIndex) -> TypeIndex {
+		if self.has_error(ty) {
+			TypeIndex::ERROR
+		} else {
+			ty
+		}
+	}
+
+	/// Whether something in `ty` is an untyped literal's (an `Integer` or
+	/// `Float` anywhere in it).
+	pub(super) fn has_untyped(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_UNTYPED)
+	}
+
+	/// The type both `a` and `b` describe, where `Infer` is a part not known
+	/// yet and gives way to the other side: `Pair<_, u8>` and `Pair<u16, _>`
+	/// meet in `Pair<u16, u8>`. Parts meet where the constructors match. An
+	/// `Error` absorbs the other side, since it was reported. `None` when the
+	/// two disagree somewhere; `Integer` and `Float` are ordinary leaves.
+	pub(super) fn meet(
+		&mut self,
+		a: TypeIndex,
+		b: TypeIndex,
+	) -> Option<TypeIndex> {
+		if a == b || b == TypeIndex::INFER {
+			return Some(a);
+		}
+		if a == TypeIndex::INFER {
+			return Some(b);
+		}
+		if a == TypeIndex::ERROR || b == TypeIndex::ERROR {
+			return Some(TypeIndex::ERROR);
+		}
+		// Two distinct types with nothing unknown or reported in them differ.
+		if !self.has_infer(a) && !self.has_infer(b) {
+			return None;
+		}
+		match (*self.resolve(a), *self.resolve(b)) {
+			(Type::Tuple { elements: a }, Type::Tuple { elements: b }) => {
+				let elements = self.meet_lists(a, b)?;
+				Some(self.intern_tuple(&elements))
+			}
+			(
+				Type::Struct {
+					struct_index,
+					type_args: a,
+				},
+				Type::Struct {
+					struct_index: other,
+					type_args: b,
+				},
+			) if struct_index == other => {
+				let type_args = self.meet_lists(a, b)?;
+				Some(self.intern_struct(struct_index, &type_args))
+			}
+			(
+				Type::Function {
+					func_index,
+					type_args: a,
+				},
+				Type::Function {
+					func_index: other,
+					type_args: b,
+				},
+			) if func_index == other => {
+				let type_args = self.meet_lists(a, b)?;
+				Some(self.intern_function(func_index, &type_args))
+			}
+			(
+				Type::FunctionRef { param, result },
+				Type::FunctionRef {
+					param: other_param,
+					result: other_result,
+				},
+			) => {
+				let param = self.meet(param, other_param)?;
+				let result = self.meet(result, other_result)?;
+				Some(self.intern(Type::FunctionRef { param, result }))
+			}
+			(
+				Type::Pointer {
+					to,
+					memory,
+					ownership,
+				},
+				Type::Pointer {
+					to: other_to,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			) if ownership == other_ownership => {
+				let to = self.meet(to, other_to)?;
+				let memory = self.meet(memory, other_memory)?;
+				Some(self.intern(Type::Pointer {
+					to,
+					memory,
+					ownership,
+				}))
+			}
+			(
+				Type::Array {
+					of,
+					size,
+					memory,
+					ownership,
+				},
+				Type::Array {
+					of: other_of,
+					size: other_size,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			) if size == other_size && ownership == other_ownership => {
+				let of = self.meet(of, other_of)?;
+				let memory = self.meet(memory, other_memory)?;
+				Some(self.intern(Type::Array {
+					of,
+					size,
+					memory,
+					ownership,
+				}))
+			}
+			(
+				Type::Slice {
+					of,
+					memory,
+					ownership,
+				},
+				Type::Slice {
+					of: other_of,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			) if ownership == other_ownership => {
+				let of = self.meet(of, other_of)?;
+				let memory = self.meet(memory, other_memory)?;
+				Some(self.intern(Type::Slice {
+					of,
+					memory,
+					ownership,
+				}))
+			}
+			(
+				Type::AssocTypeProjection {
+					trait_index,
+					assoc_type_index,
+					base,
+				},
+				Type::AssocTypeProjection {
+					trait_index: other_trait,
+					assoc_type_index: other_assoc_type,
+					base: other_base,
+				},
+			) if trait_index == other_trait
+				&& assoc_type_index == other_assoc_type =>
+			{
+				let base = self.meet(base, other_base)?;
+				Some(self.intern(Type::AssocTypeProjection {
+					trait_index,
+					assoc_type_index,
+					base,
+				}))
+			}
+			_ => None,
+		}
+	}
+
+	/// Learns parameters of `env` from a value: walks `declared`, a type
+	/// written in `env`, beside `actual`, the value's type, and meets each of
+	/// `env`'s parameters' slot with the part of `actual` at its position.
+	/// Parts that do not line up teach nothing; the value's own check against
+	/// the declared type reports them. A value with an untyped literal in it
+	/// is not known yet, so it teaches nothing either.
+	pub(super) fn learn(
+		&mut self,
+		envs: &TypeEnvArena,
+		env: TypeEnvIdx,
+		slots: &mut [TypeIndex],
+		declared: TypeIndex,
+		actual: TypeIndex,
+	) {
+		if self.has_untyped(actual) {
+			return;
+		}
+		match (*self.resolve(declared), *self.resolve(actual)) {
+			(
+				Type::TypeParam {
+					env: owner,
+					param_index,
+				},
+				_,
+			) => {
+				let Some(slot) = envs.flat_slot(env, owner, param_index) else {
+					return;
+				};
+				if let Some(met) = self.meet(slots[slot], actual) {
+					slots[slot] = met;
+				}
+			}
+			(
+				Type::Tuple { elements: declared },
+				Type::Tuple { elements: actual },
+			) => self.learn_lists(envs, env, slots, declared, actual),
+			(
+				Type::Struct {
+					struct_index,
+					type_args: declared,
+				},
+				Type::Struct {
+					struct_index: other,
+					type_args: actual,
+				},
+			) if struct_index == other => {
+				self.learn_lists(envs, env, slots, declared, actual)
+			}
+			(
+				Type::Function {
+					func_index,
+					type_args: declared,
+				},
+				Type::Function {
+					func_index: other,
+					type_args: actual,
+				},
+			) if func_index == other => {
+				self.learn_lists(envs, env, slots, declared, actual)
+			}
+			(
+				Type::FunctionRef { param, result },
+				Type::FunctionRef {
+					param: other_param,
+					result: other_result,
+				},
+			) => {
+				self.learn(envs, env, slots, param, other_param);
+				self.learn(envs, env, slots, result, other_result);
+			}
+			(
+				Type::Pointer {
+					to: of,
+					memory,
+					ownership,
+				},
+				Type::Pointer {
+					to: other_of,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			)
+			| (
+				Type::Slice {
+					of,
+					memory,
+					ownership,
+				},
+				Type::Slice {
+					of: other_of,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			) if ownership == other_ownership => {
+				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, memory, other_memory);
+			}
+			(
+				Type::Array {
+					of,
+					size,
+					memory,
+					ownership,
+				},
+				Type::Array {
+					of: other_of,
+					size: other_size,
+					memory: other_memory,
+					ownership: other_ownership,
+				},
+			) if size == other_size && ownership == other_ownership => {
+				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, memory, other_memory);
+			}
+			// A projection's value is not its base: `<T as Tr>::X` being `u8`
+			// says nothing of `T`.
+			_ => {}
+		}
+	}
+
+	/// `learn` over two lists, element by element, when their lengths agree.
+	/// Each pair is read just before it is learned from, as in `meet_lists`.
+	fn learn_lists(
+		&mut self,
+		envs: &TypeEnvArena,
+		env: TypeEnvIdx,
+		slots: &mut [TypeIndex],
+		declared: TypeList,
+		actual: TypeList,
+	) {
+		if declared.len() != actual.len() {
+			return;
+		}
+		for at in 0..declared.len() {
+			let (part, other) =
+				(self.list(declared)[at], self.list(actual)[at]);
+			self.learn(envs, env, slots, part, other);
+		}
+	}
+
+	/// Two lists meeting element by element; `None` when their lengths or any
+	/// pair of elements disagree. Each pair is read just before it meets: a
+	/// meeting can intern, and so grow `lists`, but never change a list.
+	fn meet_lists(
+		&mut self,
+		a: TypeList,
+		b: TypeList,
+	) -> Option<Box<[TypeIndex]>> {
+		if a.len() != b.len() {
+			return None;
+		}
+		let mut met = Vec::with_capacity(a.len());
+		for at in 0..a.len() {
+			let (left, right) = (self.list(a)[at], self.list(b)[at]);
+			met.push(self.meet(left, right)?);
+		}
+		Some(met.into_boxed_slice())
 	}
 
 	#[inline]
@@ -1229,6 +1650,51 @@ mod tests {
 	use super::*;
 	use crate::ast::{Keyword, Ownership};
 	use crate::diagnostics::TextSpan;
+
+	#[test]
+	fn types_meet_where_the_unknown_parts_give_way() {
+		let mut types = TypeInterner::new();
+		let pair = |types: &mut TypeInterner, a, b| {
+			types.intern_struct(StructIdx::new(0), &[a, b])
+		};
+		let left = pair(&mut types, TypeIndex::INFER, TypeIndex::U8);
+		let right = pair(&mut types, TypeIndex::U16, TypeIndex::INFER);
+		let both = pair(&mut types, TypeIndex::U16, TypeIndex::U8);
+		assert_eq!(types.meet(left, right), Some(both));
+		assert_eq!(types.meet(TypeIndex::INFER, both), Some(both));
+		assert_eq!(types.meet(both, both), Some(both));
+		// Nested: `(Pair<_, u8>, _)` and `(Pair<u16, _>, bool)`.
+		let outer = types.intern_tuple(&[left, TypeIndex::INFER]);
+		let other = types.intern_tuple(&[right, TypeIndex::BOOL]);
+		let met = types.intern_tuple(&[both, TypeIndex::BOOL]);
+		assert_eq!(types.meet(outer, other), Some(met));
+		// A part known on both sides must agree, and so must the shapes.
+		let wide = pair(&mut types, TypeIndex::INFER, TypeIndex::U32);
+		assert_eq!(types.meet(left, wide), None);
+		assert_eq!(types.meet(TypeIndex::U8, TypeIndex::U16), None);
+		let short = types.intern_tuple(&[left]);
+		assert_eq!(types.meet(outer, short), None);
+		// A reported part takes the other side with it.
+		assert_eq!(types.meet(TypeIndex::ERROR, both), Some(TypeIndex::ERROR));
+	}
+
+	#[test]
+	fn a_type_has_infer_or_error_when_one_is_anywhere_in_it() {
+		let mut types = TypeInterner::new();
+		let open = types.intern_tuple(&[TypeIndex::INFER, TypeIndex::U8]);
+		let nested = types.intern_tuple(&[open, TypeIndex::U16]);
+		let closed = types.intern_tuple(&[TypeIndex::U16, TypeIndex::U8]);
+		let broken =
+			types.intern_struct(StructIdx::new(0), &[closed, TypeIndex::ERROR]);
+		assert!(types.has_infer(TypeIndex::INFER));
+		assert!(types.has_infer(open));
+		assert!(types.has_infer(nested));
+		assert!(!types.has_infer(closed));
+		assert!(!types.has_infer(TypeIndex::UNIT));
+		assert!(types.has_error(broken));
+		assert!(!types.has_infer(broken));
+		assert!(!types.has_error(nested));
+	}
 
 	/// Two unrelated root frames: `TypeEnvIdx(1)` with two parameters and
 	/// `TypeEnvIdx(2)` with one.

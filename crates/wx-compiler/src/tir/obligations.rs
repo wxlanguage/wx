@@ -109,6 +109,45 @@ pub(super) enum Obligation {
 }
 
 impl TypeContext<'_, '_, '_> {
+	/// The checker over this context's finished tables.
+	fn obligation_checker(&mut self) -> ObligationChecker<'_> {
+		ObligationChecker {
+			solver: &mut self.solver,
+			view: SolverView {
+				types: &mut self.types,
+				defs: self.defs,
+				impl_dispatch: self.impl_dispatch,
+				traits: &self.traits,
+				trait_impls: &self.trait_impls,
+				inherent_impls: &self.inherent_impls,
+				assoc_types: &self.assoc_types,
+				structs: &self.structs,
+				enums: &self.enums,
+				param_bounds: &self.param_bounds,
+				clauses: &self.clauses,
+				type_envs: &self.type_envs,
+			},
+			bounds: &self.bounds,
+			strings: self.strings,
+			diagnostics: self.diagnostics,
+		}
+	}
+
+	/// Checks `obligations` once every signature exists: a declaration's
+	/// own, or what a body recorded while lowering a written type. Every fact
+	/// is final then, so nothing can be pending; a failure reports itself.
+	pub(super) fn check_now(&mut self, obligations: &[Obligation]) {
+		let mut checker = self.obligation_checker();
+		for obligation in obligations {
+			if let Err(SolverError::Pending) = checker.check(obligation) {
+				debug_assert!(
+					false,
+					"a check cannot be pending once every signature is built"
+				);
+			}
+		}
+	}
+
 	/// A solver that cannot finish (budget or cycle) reports nothing; the
 	/// construct that wrote the requirement does, here, once, at its own span.
 	/// Any other result passes through for the caller to recover from.

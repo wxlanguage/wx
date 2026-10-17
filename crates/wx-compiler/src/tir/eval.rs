@@ -241,14 +241,13 @@ impl TypeContext<'_, '_, '_> {
 		let body = self.const_bodies[usize::from(owner)].as_ref().unwrap();
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
-		if ty == TypeIndex::ERROR && !matches!(kind, ExprKind::Unsupported) {
+		if ty == TypeIndex::ERROR {
 			return Err(Halt::Silent);
 		}
 		let own = |kind| Halt::Own(EvalError { span, kind });
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
-			ExprKind::Unsupported
-			| ExprKind::MethodCall { .. }
+			ExprKind::MethodCall { .. }
 			| ExprKind::GenericMethodCall { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
@@ -296,7 +295,16 @@ impl TypeContext<'_, '_, '_> {
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
 			}
-			ExprKind::Construct {
+			// Its values are its elements', in order, as its type's layout is.
+			ExprKind::Tuple { elements } => {
+				for at in 0..elements.len() {
+					let body =
+						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let element = body.args(elements)[at];
+					self.eval(owner, element, stack)?;
+				}
+			}
+			ExprKind::StructConstructor {
 				struct_index,
 				args,
 				order,
@@ -459,12 +467,7 @@ impl TypeContext<'_, '_, '_> {
 				if visiting.contains(&struct_index) {
 					return Err(ConstValueState::Poisoned);
 				}
-				// A generic struct is not constructed yet (`Construct` is
-				// non-generic), so its values could not be written.
 				let env = self.structs[usize::from(struct_index)].type_params;
-				if env != TypeEnvIdx::ROOT {
-					return Err(ConstValueState::NoValue);
-				}
 				visiting.push(struct_index);
 				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				let mut held = Ok(());

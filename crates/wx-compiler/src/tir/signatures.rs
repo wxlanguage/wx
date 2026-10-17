@@ -44,12 +44,12 @@ use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::members::{AssocTypeProjectionTarget, TraitMemberSelection};
-use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
+use super::obligations::{BoundRequirements, Obligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
 use super::resolutions::{NameResolutions, Referent};
 use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
-use super::solver::{ImplMember, Solver, SolverError, SolverView};
+use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::BodyContext;
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
@@ -283,42 +283,17 @@ impl TypeContext<'_, '_, '_> {
 	/// Checks every declaration, in definition order, which is the order
 	/// their diagnostics come out in.
 	pub(super) fn check_declarations(&mut self) {
-		let mut checker = ObligationChecker {
-			solver: &mut self.solver,
-			view: SolverView {
-				types: &mut self.types,
-				defs: self.defs,
-				impl_dispatch: self.impl_dispatch,
-				traits: &self.traits,
-				trait_impls: &self.trait_impls,
-				inherent_impls: &self.inherent_impls,
-				assoc_types: &self.assoc_types,
-				structs: &self.structs,
-				enums: &self.enums,
-				param_bounds: &self.param_bounds,
-				clauses: &self.clauses,
-				type_envs: &self.type_envs,
-			},
-			bounds: &self.bounds,
-			strings: self.strings,
-			diagnostics: self.diagnostics,
-		};
+		// The checker borrows the whole context; the runs it reads are taken
+		// out for the sweep and put back unchanged.
+		let obligations = std::mem::take(&mut self.obligations);
 		for entry in self.ast_nodes {
 			let range =
 				self.query_state[&entry.node.def_id()].obligations.clone();
-			for obligation in
-				&self.obligations[range.start as usize..range.end as usize]
-			{
-				// Every signature exists and every fact is `Ready`, so nothing
-				// can be pending; a failure has reported itself.
-				if let Err(SolverError::Pending) = checker.check(obligation) {
-					debug_assert!(
-						false,
-						"a check cannot be pending once every signature is built"
-					);
-				}
-			}
+			self.check_now(
+				&obligations[range.start as usize..range.end as usize],
+			);
 		}
+		self.obligations = obligations;
 	}
 
 	/// The body phase. Every signature exists and every fact is final, so a
@@ -1491,9 +1466,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.then(|| ConstIdx::new(u32::from(const_index) - 1));
 				let body = BodyContext::new(
 					self,
-					file_id,
-					namespace,
-					TypeEnvIdx::ROOT,
+					LexicalScope {
+						file_id,
+						namespace,
+						env: TypeEnvIdx::ROOT,
+					},
 				)
 				.check_variant_value(item, previous, repr);
 				self.const_bodies[usize::from(const_index)] = Some(body);
@@ -1501,10 +1478,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			_ => unreachable!("a constant's entry is a constant"),
 		};
-		let scope = self.constants[usize::from(const_index)].scope;
+		let env = self.constants[usize::from(const_index)].scope;
 		let ty = self.constants[usize::from(const_index)].ty;
-		let body = BodyContext::new(self, file_id, namespace, scope)
-			.check_body(value, ty);
+		let scope = LexicalScope {
+			file_id,
+			namespace,
+			env,
+		};
+		let body = BodyContext::new(self, scope).check_body(value, ty);
 		self.const_bodies[usize::from(const_index)] = Some(body);
 	}
 
@@ -2700,7 +2681,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// policy; nominal types retain their structure. The type is stored as
 	/// written, with projections unreduced; the declaration check normalizes it once
 	/// to find cycles, and readers normalize under their own assumptions.
-	fn resolve_type(
+	pub(super) fn resolve_type(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
 		scope: LexicalScope,
@@ -4603,7 +4584,6 @@ pub(super) mod tests {
 			) -> String {
 				let node = match body.kind(expr) {
 					ExprKind::Error => "error".to_string(),
-					ExprKind::Unsupported => "unsupported".to_string(),
 					ExprKind::Int(value) => value.to_string(),
 					ExprKind::Float(value) => format!("{value:?}"),
 					ExprKind::Bool(value) => value.to_string(),
@@ -4653,8 +4633,23 @@ pub(super) mod tests {
 						}
 						text + ")"
 					}
+					ExprKind::Tuple { elements } => {
+						let mut text = "(".to_string();
+						for (at, &element) in
+							body.args(elements).iter().enumerate()
+						{
+							if at > 0 {
+								text.push_str(", ");
+							}
+							text.push_str(&render(case, body, element));
+						}
+						if elements.len() == 1 {
+							text.push(',');
+						}
+						text + ")"
+					}
 					// A named argument shows the field it gives: `(P y=2:u8)`.
-					ExprKind::Construct {
+					ExprKind::StructConstructor {
 						struct_index,
 						args,
 						order,
@@ -5114,20 +5109,6 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn a_form_the_checker_does_not_cover_is_not_a_constant() {
-			test_case!(
-				case = &with_std(
-					"func f() -> i32 { 1 }
-					const A: i32 = f();"
-				)
-			);
-			// The checker leaves the call unchecked; evaluation refuses it.
-			assert_eq!(shape(&case, "A"), "unsupported:{unknown}");
-			case.diagnostics()
-				.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
-		}
-
-		#[test]
 		fn a_struct_is_constructed_by_calling_its_name() {
 			test_case!(
 				case = &with_std(
@@ -5198,6 +5179,205 @@ pub(super) mod tests {
 				);
 				// Reported once: the value is poisoned, not evaluated again.
 				case.diagnostics().assert_codes(&[code]);
+			}
+		}
+
+		#[test]
+		fn a_generic_struct_takes_its_arguments_from_the_expected_type() {
+			test_case!(
+				case = &with_std(
+					"struct Wrapper<T>(T);
+					struct Pair<A, B>(first: A, second: B);
+					const W: Wrapper<u32> = Wrapper(5);
+					const P: Pair<u8, i64> = Pair({ second: -1, first: 2 });
+					const N: Pair<Wrapper<u8>, u8> = Pair(Wrapper(1), 2);"
+				)
+			);
+			case.diagnostics().assert_none();
+			assert_eq!(shape(&case, "W"), "(Wrapper 5:u32):Wrapper<u32>");
+			// A field's type is the declared one with the arguments in it.
+			assert_eq!(
+				shape(&case, "P"),
+				"(Pair second=(- 1:i64):i64 first=2:u8):Pair<u8, i64>"
+			);
+			assert_eq!(
+				shape(&case, "N"),
+				"(Pair (Wrapper 1:u8):Wrapper<u8> 2:u8):Pair<Wrapper<u8>, u8>"
+			);
+			assert_eq!(*value(&case, "W"), [ConstScalar::u32(5)]);
+			assert_eq!(
+				*value(&case, "P"),
+				[ConstScalar::u8(2), ConstScalar::i64(-1)]
+			);
+			assert_eq!(
+				*value(&case, "N"),
+				[ConstScalar::u8(1), ConstScalar::u8(2)]
+			);
+		}
+
+		#[test]
+		fn a_written_argument_is_used_and_a_written_placeholder_is_taken_from_the_expected_type()
+		 {
+			test_case!(
+				case = &with_std(
+					"struct Wrapper<T>(T);
+					struct Pair<A, B>(first: A, second: B);
+					const W: Wrapper<u32> = Wrapper::<u32>(5);
+					const P: Pair<u8, u16> = Pair::<_, u16>(1, 2);
+					const N: Wrapper<Pair<u16, u8>> = Wrapper::<Pair<_, u8>>(Pair(1, 2));
+					const M: u8 = 7;
+					const L: Pair<u8, u8> = Pair::<_, _>(M, 1);"
+				)
+			);
+			case.diagnostics().assert_none();
+			assert_eq!(shape(&case, "W"), "(Wrapper 5:u32):Wrapper<u32>");
+			assert_eq!(shape(&case, "P"), "(Pair 1:u8 2:u16):Pair<u8, u16>");
+			// A `_` inside a written argument is filled the same way.
+			assert_eq!(
+				shape(&case, "N"),
+				"(Wrapper (Pair 1:u16 2:u8):Pair<u16, u8>):Wrapper<Pair<u16, u8>>"
+			);
+			assert_eq!(shape(&case, "L"), "(Pair M:u8 1:u8):Pair<u8, u8>");
+			assert_eq!(
+				*value(&case, "P"),
+				[ConstScalar::u8(1), ConstScalar::u16(2)]
+			);
+		}
+
+		#[test]
+		fn a_generic_construction_is_checked_against_its_arguments() {
+			use DiagnosticCode::*;
+			for (initializer, codes) in [
+				// A field is checked against its substituted type.
+				(
+					"const W: Wrapper<u8> = Wrapper(300);",
+					&[IntegerLiteralOutOfRange][..],
+				),
+				// Written arguments make the type, which must be the expected.
+				(
+					"const W: Wrapper<u64> = Wrapper::<u32>(5);",
+					&[TypeMistmatch],
+				),
+				// Nothing gives `T`: one report, not a mismatch as well.
+				("const W: u32 = Wrapper(5);", &[TypeAnnotationRequired]),
+				// A comparison's operands expect nothing, and a literal alone
+				// has no type. The right side expects the left's, which is
+				// reported already.
+				(
+					"const C: bool = Wrapper(1) == Wrapper(2);",
+					&[TypeAnnotationRequired],
+				),
+				// The right side takes the left's type, so `1` is a `u8`.
+				(
+					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(1);",
+					&[BinaryOperatorCannotBeApplied],
+				),
+				// Learned from `M` on both sides: what fails is the operator,
+				// which `Wrapper<u8>` does not implement, not the type.
+				(
+					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(M);",
+					&[BinaryOperatorCannotBeApplied],
+				),
+				(
+					"const P: Pair<u8, u8> = Pair::<u8>(1, 2);",
+					&[TypeArgumentCountMismatch],
+				),
+				// A written argument is held to its parameter's bounds.
+				(
+					"const B: u32 = Bounded::<Unit>(Unit());",
+					&[TraitBoundViolation, TypeMistmatch],
+				),
+				// So is one taken from the expected type: the construction
+				// proves its own instantiation, as the annotation does.
+				(
+					"const B: Bounded<Unit> = Bounded::<_>(Unit());",
+					&[TraitBoundViolation, TraitBoundViolation],
+				),
+			] {
+				test_case!(
+					case = &with_std(&format!(
+						"struct Wrapper<T>(T);
+						struct Pair<A, B>(first: A, second: B);
+						struct Bounded<T: Add>(T);
+						struct Unit();
+						{initializer}"
+					))
+				);
+				case.diagnostics().assert_codes(codes);
+			}
+		}
+
+		#[test]
+		fn a_tuple_is_its_elements_in_order() {
+			test_case!(
+				case = &with_std(
+					"struct Wrapper<T>(T);
+					const T: (u8, u16) = (1, 2);
+					const U: () = ();
+					const O: (bool,) = (true,);
+					const N: ((u8, bool), u8) = ((1, true), 2);
+					const W: Wrapper<(u8, bool)> = Wrapper((1, true));"
+				)
+			);
+			case.diagnostics().assert_none();
+			assert_eq!(shape(&case, "T"), "(1:u8, 2:u16):(u8, u16)");
+			assert_eq!(shape(&case, "U"), "():()");
+			assert_eq!(shape(&case, "O"), "(true:bool,):(bool,)");
+			assert_eq!(
+				shape(&case, "W"),
+				"(Wrapper (1:u8, true:bool):(u8, bool)):Wrapper<(u8, bool)>"
+			);
+			assert_eq!(
+				*value(&case, "T"),
+				[ConstScalar::u8(1), ConstScalar::u16(2)]
+			);
+			assert_eq!(*value(&case, "U"), []);
+			assert_eq!(*value(&case, "O"), [ConstScalar::bool(true)]);
+			// Nested tuples are flattened.
+			assert_eq!(
+				*value(&case, "N"),
+				[
+					ConstScalar::u8(1),
+					ConstScalar::bool(true),
+					ConstScalar::u8(2)
+				]
+			);
+			assert_eq!(
+				*value(&case, "W"),
+				[ConstScalar::u8(1), ConstScalar::bool(true)]
+			);
+		}
+
+		#[test]
+		fn a_tuple_of_literals_takes_its_type_from_context() {
+			use DiagnosticCode::*;
+			for (initializer, codes) in [
+				("const T: (u8, u16) = (1, 2, 3);", &[TypeMistmatch][..]),
+				(
+					"const T: (u8, u16) = (256, 2);",
+					&[IntegerLiteralOutOfRange],
+				),
+				// Each element is held to its own position's type.
+				("const T: (u8, bool) = (1, 2);", &[UnableToCoerce]),
+				(
+					"const C: bool = (1, 2) == (3, 4);",
+					&[ComparisonTypeAnnotationRequired],
+				),
+				// `(1, 2)` waits for `(M, M)` to give `T`; what fails is the
+				// operator, which `Same<(u8, u8)>` does not implement.
+				(
+					"const M: u8 = 1;
+					const C: bool = Same((1, 2), (M, M)) == Same((M, M), (M, M));",
+					&[BinaryOperatorCannotBeApplied],
+				),
+			] {
+				test_case!(
+					case = &with_std(&format!(
+						"struct Same<T>(a: T, b: T);
+						{initializer}"
+					))
+				);
+				case.diagnostics().assert_codes(codes);
 			}
 		}
 
@@ -5290,27 +5470,17 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn a_constant_of_a_type_without_values_is_not_evaluated() {
+		fn a_constant_of_a_struct_containing_itself_is_not_evaluated() {
 			test_case!(
 				case = &with_std(
-					"struct Wrapper<T>(T);
-					struct Callback(f: func(u32));
-					struct Selfish(s: Selfish);
-					func g(x: u32) {}
-					const W: Wrapper<u32> = Wrapper(5);
-					const F: Callback = Callback(g);
+					"struct Selfish(s: Selfish);
 					const S: Selfish = Selfish(S);"
 				)
 			);
-			// A generic struct is not constructed yet, and a function has no
-			// compile-time value: neither is an error of the constant. A struct
-			// containing itself is reported on the struct, and only there.
+			// Reported on the struct, and only there.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::RecursiveTypeWithoutIndirection,
 			]);
-			assert_eq!(shape(&case, "W"), "unsupported:{unknown}");
-			assert_eq!(state(&case, "W"), &ConstValueState::NoValue);
-			assert_eq!(state(&case, "F"), &ConstValueState::NoValue);
 			assert_eq!(state(&case, "S"), &ConstValueState::Poisoned);
 		}
 
@@ -8169,16 +8339,12 @@ pub(super) mod tests {
 			const VALUE: Need<i32> = Need();
 		"}
 		);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::TraitBoundViolation.code())
-		);
+		// Once at the annotation, and once at the construction, which proves
+		// its own instantiation as every use does.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
 		// The violation is diagnosed; the written `Need<i32>` is kept.
 		let Type::Struct { type_args, .. } = case
 			.context
@@ -10430,9 +10596,11 @@ pub(super) mod tests {
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
+		// Both annotations, and the construction, which proves its own
+		// instantiation as every use does.
 		assert_eq!(
 			case.context.diagnostics.len(),
-			2,
+			3,
 			"{:?}",
 			case.context.diagnostics
 		);

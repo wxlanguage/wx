@@ -382,6 +382,20 @@ as `TraitImplLookup::Builtin`. A parameter or a projection that does not
 reduce is one `LayoutValue::Abstract` value when assumed `ValueType`, so
 `Wrap<T>` holds under `T: ValueType`, and an instantiation is proved where it
 is used; an address into a memory not known yet is one abstract value too.
+
+Generic construction (2026-10-18): a body lowers a written type into its own
+obligation list and checks it on the spot (`check_now`). A generic struct's
+type arguments are learned within the call, as the old checker did and rustc's
+inference does in its simplest case, without a table: slots start as the
+written arguments (`_` anywhere is `INFER`) or `INFER`, meet the expected
+type's (`TypeInterner::meet`), then learn from each field's value
+(`TypeInterner::learn`, walking the declared field type to the struct's own
+parameters). A slot still not known is E2002 "cannot infer type for type
+parameter"; every final argument's bounds are proved at the call, as every use
+proves its own instantiation (so an annotation's violation is reported there
+too). `TypeFlags` on interned types (`HAS_INFER`, `HAS_ERROR`, `HAS_UNTYPED`)
+answer "anywhere inside" without a walk. Tuples are expressions: a tuple of
+untyped literals is untyped, and takes its type from context like a literal.
 The layout is the type checker's alone; MIR lays types out itself. A
 hand-written `impl ValueType` is not rejected yet; that comes with the other
 builtin traits.

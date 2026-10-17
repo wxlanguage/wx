@@ -53,27 +53,15 @@ impl TypeContext<'_, '_, '_> {
 		argument.inner
 	}
 
-	/// Resolves a written type-argument list against `params_env`'s own
-	/// declared parameters — the count comes from `params_env` itself
-	/// (`self.param_bounds[params_env].len()`), never a separately-passed
-	/// number, so it can't drift from what the frame actually declares.
-	/// Always returns exactly that many slots.
-	///
-	/// A wrong count poisons every slot to `ERROR` — there's no sensible
-	/// pairing to salvage — but keeps `owner`'s own identity meaningful
-	/// to whatever reads the result next (a caller still sees "a `Wrapper`",
-	/// not a second, unrelated "not a struct" error stacked on this one). A
-	/// correct count checks each argument, in its own right, against every
-	/// bound its corresponding parameter declares — reported per failing
-	/// bound, same granularity as `T: A + B` needing two diagnostics if an
-	/// argument satisfies neither — and only that one slot, not the whole
-	/// list, is poisoned when any of them fails. Pending requirements retain
-	/// the argument and enqueue a check against the eventual parameter table.
-	/// `scope` is where the arguments are written, and what proving them may
-	/// assume; `params_env` is `owner`'s own frame, whose bounds they must
-	/// satisfy (`ROOT` when it declares no parameters). `parent_args` are the
-	/// arguments of the frames around `params_env`, outer first (a member
-	/// function's impl or trait), which a bound may name.
+	/// Resolves a written type-argument list against `params_env`, `owner`'s
+	/// own frame (`ROOT` when it declares no parameters). Always returns as
+	/// many arguments as the frame declares. A wrong count is reported and
+	/// makes every one `ERROR`: there is no sensible pairing to salvage, and
+	/// the caller still sees a `Wrapper`, not a second "not a struct" error.
+	/// Otherwise the arguments are kept as written, and each one's bounds are
+	/// recorded at the argument, so `T: A + B` is two reports when an
+	/// argument satisfies neither. `parent_args` are the arguments of the
+	/// frames around `params_env`, outer first, which a bound may name.
 	pub(super) fn resolve_type_args(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
@@ -84,22 +72,12 @@ impl TypeContext<'_, '_, '_> {
 		args: &[TypeIndex],
 		owner: TypeEnvOwner,
 	) -> Box<[TypeIndex]> {
-		let expected = self.param_bounds[usize::from(params_env)].len();
-		if args.len() != expected {
-			self.diagnostics.push(report_type_arg_count_mismatch(
-				self.strings,
-				self.defs,
-				scope.file_id,
-				segment,
-				owner,
-				self.type_envs.param_names(params_env),
-			));
+		if !self.check_type_arg_count(scope, segment, params_env, owner) {
+			let expected = self.param_bounds[usize::from(params_env)].len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
-
-		let mut result = Vec::with_capacity(expected);
-		if expected == 0 {
-			return result.into_boxed_slice();
+		if args.is_empty() {
+			return Box::new([]);
 		}
 		debug_assert_eq!(
 			parent_args.len(),
@@ -110,7 +88,7 @@ impl TypeContext<'_, '_, '_> {
 		for (index, (&argument, written)) in
 			args.iter().zip(&segment.type_args).enumerate()
 		{
-			result.push(self.record_bounds_check(
+			self.record_bounds_check(
 				obligations,
 				scope.env,
 				BoundRequirements::Parameter {
@@ -124,9 +102,33 @@ impl TypeContext<'_, '_, '_> {
 				},
 				SourceSpan::new(scope.file_id, written.span),
 				owner,
-			));
+			);
 		}
-		result.into_boxed_slice()
+		args.into()
+	}
+
+	/// Whether `segment` writes as many type arguments as `params_env`
+	/// declares; reports the mismatch when it does not.
+	pub(super) fn check_type_arg_count(
+		&mut self,
+		scope: LexicalScope,
+		segment: &ast::PathSegment,
+		params_env: TypeEnvIdx,
+		owner: TypeEnvOwner,
+	) -> bool {
+		let expected = self.param_bounds[usize::from(params_env)].len();
+		if segment.type_args.len() == expected {
+			return true;
+		}
+		self.diagnostics.push(report_type_arg_count_mismatch(
+			self.strings,
+			self.defs,
+			scope.file_id,
+			segment,
+			owner,
+			self.type_envs.param_names(params_env),
+		));
+		false
 	}
 }
 
@@ -519,7 +521,7 @@ pub(super) fn report_type_args_not_allowed(
 
 /// A wrong number of type arguments for a declaration with its own
 /// parameter list, possibly empty: a struct, a function or a type alias.
-pub(super) fn report_type_arg_count_mismatch(
+fn report_type_arg_count_mismatch(
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,
 	file_id: FileId,

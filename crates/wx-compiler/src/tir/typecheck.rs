@@ -10,8 +10,11 @@
 //! gives them one (`coerce`), which rewrites the subtree in place.
 //!
 //! A struct's name is a value only to be called: calling it constructs the
-//! struct (`Construct`). It is not a function, and naming it without a call is
-//! an error.
+//! struct (`StructConstructor`). It is not a function, and naming it without a call is
+//! an error. A generic struct's type arguments are learned within the call,
+//! from what is written on its name, the expected type and the fields' values
+//! (`TypeInterner::meet`/`learn`); what none of them gives needs an
+//! annotation.
 
 use codespan_reporting::diagnostic::Diagnostic;
 
@@ -19,19 +22,19 @@ use super::body::{
 	ArgOrder, Body, BodyBuilder, ExprIdx, ExprKind, ExprRange, ParamIdx,
 };
 use super::defs::{
-	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, MemberKind, Scope,
-	StructIdx, Tier, TypesetIdx,
+	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, MemberKind, StructIdx,
+	Tier, TypesetIdx,
 };
 use super::imports::report_private_identifier;
 use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
+use super::obligations::BoundRequirements;
 use super::operators::{
 	Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
 };
 use super::paths::PathResolver;
-use super::satisfaction::report_type_arg_count_mismatch;
-use super::signatures::TypeContext;
-use super::types::{TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::signatures::{InferPolicy, LexicalScope, TypeContext};
+use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -40,25 +43,19 @@ use crate::vfs::FileId;
 pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 	body: BodyBuilder,
-	file_id: FileId,
-	namespace: Scope,
-	/// The type scope the expressions are written in: the root for a free
-	/// constant, the impl's or trait's `Self` scope for an associated one.
-	scope: TypeEnvIdx,
+	/// Where the expressions are written. Its type scope is the root for a
+	/// free constant, the impl's or trait's `Self` scope for an associated one.
+	scope: LexicalScope,
 }
 
 impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
-		file_id: FileId,
-		namespace: Scope,
-		scope: TypeEnvIdx,
+		scope: LexicalScope,
 	) -> Self {
 		Self {
 			cx,
 			body: BodyBuilder::default(),
-			file_id,
-			namespace,
 			scope,
 		}
 	}
@@ -69,7 +66,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
 	) -> Body {
-		let expected = self.normalized(expected, self.scope);
+		let expected = self.normalized(expected, self.scope.env);
 		let root = self.check(expr, expected);
 		self.body.finish(root)
 	}
@@ -127,7 +124,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
 	) -> ExprIdx {
-		let built = self.build(expr);
+		let built = self.build(expr, expected);
 		self.expect(built, expected)
 	}
 
@@ -136,7 +133,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return expr;
 		}
 		let actual = self.body.ty(expr);
-		if is_untyped(actual) {
+		if self.cx.types.has_untyped(actual) {
 			self.coerce(expr, expected);
 		} else if actual != TypeIndex::ERROR && actual != expected {
 			let diagnostic = self.report_type_mismatch(expected, actual, expr);
@@ -147,8 +144,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr
 	}
 
-	/// Lowers `expr` without an expectation: an untyped literal stays untyped.
-	fn build(&mut self, expr: &Spanned<ast::Expression>) -> ExprIdx {
+	/// Lowers `expr`. `expected` is the type the context hints at this site:
+	/// `INFER` is no constraint, and a type with `INFER` positions in it
+	/// (`Wrapper<_>`) constrains only the others. A construct whose meaning
+	/// depends on its type reads it; the node's type may still differ, which
+	/// is `expect`'s to report. An untyped literal stays untyped.
+	fn build(
+		&mut self,
+		expr: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+	) -> ExprIdx {
 		let span = expr.span;
 		match &expr.inner {
 			ast::Expression::Int { value } => {
@@ -166,33 +171,76 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Bool(false), TypeIndex::BOOL, span)
 			}
 			ast::Expression::Char => self.build_char(span),
-			ast::Expression::Grouping { value } => self.build(value),
+			ast::Expression::Grouping { value } => self.build(value, expected),
 			ast::Expression::Unary { operator, operand } => {
-				self.build_unary(*operator, operand, span)
+				self.build_unary(*operator, operand, expected, span)
 			}
 			ast::Expression::Binary {
 				left,
 				operator,
 				right,
-			} => self.build_binary(*operator, left, right, span),
+			} => self.build_binary(*operator, left, right, expected, span),
 			ast::Expression::Path(segments) => self.build_path(segments, span),
-			ast::Expression::Call { callee, arguments } => {
-				self.build_call(callee, Arguments::Positional(arguments), span)
-			}
-			ast::Expression::NamedCall { callee, arguments } => {
-				self.build_call(callee, Arguments::Named(arguments), span)
+			ast::Expression::Call { callee, arguments } => self.build_call(
+				callee,
+				Arguments::Positional(arguments),
+				expected,
+				span,
+			),
+			ast::Expression::NamedCall { callee, arguments } => self
+				.build_call(
+					callee,
+					Arguments::Named(arguments),
+					expected,
+					span,
+				),
+			ast::Expression::Tuple { elements } => {
+				self.build_tuple(elements, expected, span)
 			}
 			ast::Expression::Error => {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			_ => self
-				.body
-				.push(ExprKind::Unsupported, TypeIndex::ERROR, span),
+			_ => todo!("checking this expression form"),
 		}
 	}
 
+	/// A tuple, each element built with the expected type's element at its
+	/// position when the expected type is a tuple as long. Its type is its
+	/// elements': one with an untyped literal in it is untyped, and takes its
+	/// type from context later, as a literal does (`coerce`).
+	fn build_tuple(
+		&mut self,
+		elements: &[Spanned<ast::Expression>],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let hints = match *self.cx.types.resolve(expected) {
+			Type::Tuple { elements: hints }
+				if hints.len() == elements.len() =>
+			{
+				Some(hints)
+			}
+			_ => None,
+		};
+		let mut values = Vec::with_capacity(elements.len());
+		let mut types = Vec::with_capacity(elements.len());
+		for (at, element) in elements.iter().enumerate() {
+			let hint = match hints {
+				Some(hints) => self.cx.types.list(hints)[at],
+				None => TypeIndex::INFER,
+			};
+			let value = self.build(element, hint);
+			values.push(value);
+			types.push(self.body.ty(value));
+		}
+		let ty = self.cx.types.intern_tuple(&types);
+		let ty = self.cx.types.collapse_error(ty);
+		let elements = self.body.push_args(values);
+		self.body.push(ExprKind::Tuple { elements }, ty, span)
+	}
+
 	fn build_char(&mut self, span: TextSpan) -> ExprIdx {
-		let source = &self.cx.files.get(self.file_id).unwrap().source;
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		match parse_char_literal(span.extract_str(source)) {
 			Ok(value) => {
 				self.body.push(ExprKind::Char(value), TypeIndex::CHAR, span)
@@ -217,9 +265,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// A value path. Only constants and enum variants are modelled yet; a
-	/// path the checker does not cover, including an associated item reached
-	/// through a type, is `Unsupported` rather than an error.
+	/// A value path. Only constants, enum variants and struct names are
+	/// checked yet.
 	fn build_path(
 		&mut self,
 		segments: &[ast::PathSegment],
@@ -231,7 +278,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.strings,
 			self.cx.defs,
 		)
-		.walk_path(self.file_id, self.namespace, segments, Tier::Value);
+		.walk_path(
+			self.scope.file_id,
+			self.scope.namespace,
+			segments,
+			Tier::Value,
+		);
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -250,11 +302,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			));
 		}
 		if !walk.is_complete(segments) {
-			return self.body.push(
-				ExprKind::Unsupported,
-				TypeIndex::ERROR,
-				span,
-			);
+			todo!("checking a value path through a type");
 		}
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
@@ -279,26 +327,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			_ => self
-				.body
-				.push(ExprKind::Unsupported, TypeIndex::ERROR, span),
+			_ => todo!("checking a path to a `{}`", kind.noun()),
 		}
 	}
 
-	/// A call. Only the construction of a struct that is not generic is
-	/// modelled yet; a call to anything else is `Unsupported`.
+	/// A call. Only the construction of a struct is checked yet.
 	fn build_call(
 		&mut self,
 		callee: &Spanned<ast::Expression>,
 		arguments: Arguments<'_>,
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		let ast::Expression::Path(segments) = &callee.inner else {
-			return self.body.push(
-				ExprKind::Unsupported,
-				TypeIndex::ERROR,
-				span,
-			);
+			todo!("checking a call of a computed callee");
 		};
 		let walk = PathResolver::new(
 			self.cx.diagnostics,
@@ -306,7 +348,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.strings,
 			self.cx.defs,
 		)
-		.walk_path(self.file_id, self.namespace, segments, Tier::Value);
+		.walk_path(
+			self.scope.file_id,
+			self.scope.namespace,
+			segments,
+			Tier::Value,
+		);
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -324,11 +371,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Some(key),
 				));
 			}
-			return self.body.push(
-				ExprKind::Unsupported,
-				TypeIndex::ERROR,
-				span,
-			);
+			todo!("checking a call of a `{}`", kind.noun());
 		};
 		let segment = segments.last().unwrap();
 		if let BindingTarget::Inaccessible(key) = walk.target {
@@ -336,38 +379,40 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.report_private_constructor(struct_index, key, segment);
 			self.cx.diagnostics.push(diagnostic);
 		}
-		if self.cx.structs[usize::from(struct_index)].type_params
-			!= TypeEnvIdx::ROOT
-		{
-			return self.body.push(
-				ExprKind::Unsupported,
-				TypeIndex::ERROR,
+		// The struct's type arguments are learned within this call: from what
+		// is written on its name, the expected type, and then the fields.
+		let mut type_args =
+			self.struct_type_args(struct_index, segment, expected);
+		let given = match arguments {
+			Arguments::Positional(arguments) => self.positional_fields(
+				struct_index,
+				&mut type_args,
+				arguments,
 				span,
-			);
-		}
-		if !segment.type_args.is_empty() {
-			self.cx.diagnostics.push(report_type_arg_count_mismatch(
-				self.cx.strings,
-				self.cx.defs,
-				self.file_id,
-				segment,
-				TypeEnvOwner::Struct(struct_index),
-				&[],
-			));
-		}
-		let (args, order) = match arguments {
-			Arguments::Positional(arguments) => {
-				let args =
-					self.positional_fields(struct_index, arguments, span);
-				(args, ArgOrder::InOrder)
-			}
+			),
 			Arguments::Named(arguments) => {
-				self.named_fields(struct_index, arguments, span)
+				self.named_fields(struct_index, &mut type_args, arguments, span)
 			}
 		};
-		let ty = self.cx.types.intern_struct(struct_index, &[]);
+		self.report_uninferred(struct_index, segment, expected, &mut type_args);
+		// Every argument is known now, so each value is held to its field's
+		// final type: an untyped literal takes it only here.
+		for &(field, value) in &given {
+			let field_ty = self.field_type(struct_index, &type_args, field);
+			self.expect(value, field_ty);
+		}
+		self.check_struct_bounds(struct_index, segment, &type_args, &given);
+		let order = match arguments {
+			Arguments::Positional(_) => ArgOrder::InOrder,
+			Arguments::Named(_) => self.body.push_permutation(
+				given.iter().map(|&(field, _)| ParamIdx::new(field as u32)),
+			),
+		};
+		let args = self.body.push_args(given.iter().map(|&(_, value)| value));
+		let ty = self.cx.types.intern_struct(struct_index, &type_args);
+		let ty = self.cx.types.collapse_error(ty);
 		self.body.push(
-			ExprKind::Construct {
+			ExprKind::StructConstructor {
 				struct_index,
 				args,
 				order,
@@ -377,24 +422,210 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		)
 	}
 
-	/// A field's type, as expected of the value given for it.
+	/// What a constructed struct's type arguments are known to be before its
+	/// fields are: the ones written on its name (`Wrapper<u32>(..)`, a `_`
+	/// anywhere in one unknown), met with the expected type's when that is this
+	/// struct. `INFER` per parameter when none are written; `ERROR` per
+	/// parameter when the written count is wrong.
+	fn struct_type_args(
+		&mut self,
+		struct_index: StructIdx,
+		segment: &ast::PathSegment,
+		expected: TypeIndex,
+	) -> Box<[TypeIndex]> {
+		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		let count = self.cx.type_envs.param_names(params_env).len();
+		let mut type_args = if segment.type_args.is_empty() {
+			vec![TypeIndex::INFER; count].into_boxed_slice()
+		} else {
+			let mut obligations = Vec::new();
+			let mut written = Vec::with_capacity(segment.type_args.len());
+			for arg in &segment.type_args {
+				written.push(self.cx.resolve_type(
+					&mut obligations,
+					self.scope,
+					arg,
+					InferPolicy::Allow,
+				));
+			}
+			self.cx.check_now(&obligations);
+			if !self.cx.check_type_arg_count(
+				self.scope,
+				segment,
+				params_env,
+				TypeEnvOwner::Struct(struct_index),
+			) {
+				return vec![TypeIndex::ERROR; count].into_boxed_slice();
+			}
+			written.into_boxed_slice()
+		};
+		if expected == TypeIndex::INFER {
+			return type_args;
+		}
+		// A disagreement teaches nothing: the construction's own type is held
+		// to the expected one where the call is checked.
+		let expected = self.normalized(expected, self.scope.env);
+		if let Type::Struct {
+			struct_index: hinted,
+			type_args: hints,
+		} = *self.cx.types.resolve(expected)
+			&& hinted == struct_index
+		{
+			for at in 0..count {
+				let hint = self.cx.types.list(hints)[at];
+				if let Some(met) = self.cx.types.meet(type_args[at], hint) {
+					type_args[at] = met;
+				}
+			}
+		}
+		type_args
+	}
+
+	/// Records and checks the bounds of the struct's parameters for its final
+	/// type arguments, at the call, wherever they were learned from. Each is
+	/// reported at its written argument, else at the value of a field whose
+	/// declared type is that parameter, else at the struct's name.
+	fn check_struct_bounds(
+		&mut self,
+		struct_index: StructIdx,
+		segment: &ast::PathSegment,
+		type_args: &[TypeIndex],
+		given: &[(usize, ExprIdx)],
+	) {
+		if type_args.is_empty() {
+			return;
+		}
+		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		let arguments = self.cx.types.push_list(type_args);
+		let mut obligations = Vec::new();
+		for (index, &argument) in type_args.iter().enumerate() {
+			let span = match segment.type_args.get(index) {
+				Some(written) => written.span,
+				None => {
+					let param =
+						self.cx.type_envs.param_types(params_env)[index];
+					let mut span = segment.ident.span;
+					for &(field, value) in given {
+						if self.cx.struct_field_types(struct_index)[field]
+							== param
+						{
+							span = self.body.span(value);
+							break;
+						}
+					}
+					span
+				}
+			};
+			self.cx.record_bounds_check(
+				&mut obligations,
+				self.scope.env,
+				BoundRequirements::Parameter {
+					env: params_env,
+					index,
+					arguments,
+				},
+				Spanned {
+					inner: argument,
+					span,
+				},
+				self.source_span(span),
+				TypeEnvOwner::Struct(struct_index),
+			);
+		}
+		self.cx.check_now(&obligations);
+	}
+
+	/// Reports each parameter whose argument is still not fully known (an
+	/// `INFER` anywhere in it), and makes it `ERROR`.
+	/// Nothing is reported against an `ERROR` expectation: whoever made it
+	/// has said why.
+	fn report_uninferred(
+		&mut self,
+		struct_index: StructIdx,
+		segment: &ast::PathSegment,
+		expected: TypeIndex,
+		args: &mut [TypeIndex],
+	) {
+		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		for at in 0..args.len() {
+			if !self.cx.types.has_infer(args[at]) {
+				continue;
+			}
+			args[at] = TypeIndex::ERROR;
+			if expected == TypeIndex::ERROR {
+				continue;
+			}
+			let name = self.cx.type_envs.param_names(params_env)[at].inner;
+			let name = self.cx.strings.resolve(name).unwrap();
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+					.with_message(format!(
+						"cannot infer type for type parameter `{name}`"
+					))
+					.with_label(
+						self.source_span(segment.ident.span)
+							.primary_label()
+							.with_message("type annotation required"),
+					),
+			);
+		}
+	}
+
+	/// What `value`, given for `field`, teaches the struct's type arguments:
+	/// the parts of its type standing where the field's declared type names a
+	/// parameter.
+	fn learn_field(
+		&mut self,
+		struct_index: StructIdx,
+		type_args: &mut [TypeIndex],
+		field: usize,
+		value: ExprIdx,
+	) {
+		let declared = self.cx.struct_field_types(struct_index)[field];
+		let env = self.cx.structs[usize::from(struct_index)].type_params;
+		let actual = self.body.ty(value);
+		self.cx.types.learn(
+			&self.cx.type_envs,
+			env,
+			type_args,
+			declared,
+			actual,
+		);
+	}
+
+	/// A field's type, as expected of the value given for it: as declared,
+	/// with the struct's type arguments `args` for its parameters. An argument
+	/// not known yet leaves its parts `INFER`, which expect nothing.
 	fn field_type(
 		&mut self,
 		struct_index: StructIdx,
+		args: &[TypeIndex],
 		field: usize,
 	) -> TypeIndex {
 		let ty = self.cx.struct_field_types(struct_index)[field];
-		self.normalized(ty, TypeEnvIdx::ROOT)
+		let ty = self.cx.types.substitute(
+			ty,
+			Substitution {
+				envs: &self.cx.type_envs,
+				env: self.cx.structs[usize::from(struct_index)].type_params,
+				args,
+			},
+		);
+		self.normalized(ty, self.scope.env)
 	}
 
-	/// The fields of `Point(1, 2)`: the n-th argument gives the n-th field. An
-	/// argument past the last field is checked and dropped.
+	/// The fields of `Point(1, 2)`: the n-th argument gives the n-th field.
+	/// Each value is built with its field's type as known so far, and teaches
+	/// `type_args` what it can; it is held to the field's final type by the
+	/// caller. An argument past the last field is built and dropped.
 	fn positional_fields(
 		&mut self,
 		struct_index: StructIdx,
+		type_args: &mut [TypeIndex],
 		arguments: &[ast::Separated<Spanned<ast::Expression>>],
 		span: TextSpan,
-	) -> ExprRange {
+	) -> Vec<(usize, ExprIdx)> {
 		let count = self.cx.struct_field_types(struct_index).len();
 		if arguments.len() != count {
 			let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -416,31 +647,31 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					.with_label(label),
 			);
 		}
-		let mut fields = Vec::with_capacity(count);
+		let mut given = Vec::with_capacity(count);
 		for (at, argument) in arguments.iter().enumerate() {
-			let expected = if at < count {
-				self.field_type(struct_index, at)
-			} else {
-				TypeIndex::INFER
-			};
-			let value = self.check(&argument.inner, expected);
-			if at < count {
-				fields.push(value);
+			if at >= count {
+				self.build(&argument.inner, TypeIndex::INFER);
+				continue;
 			}
+			let hint = self.field_type(struct_index, type_args, at);
+			let value = self.build(&argument.inner, hint);
+			self.learn_field(struct_index, type_args, at, value);
+			given.push((at, value));
 		}
-		self.body.push_args(fields)
+		given
 	}
 
 	/// The fields of `Point({ y: 2, x })`, in written order, each with the
-	/// field it gives. Only a struct whose every field is named is built this
-	/// way. An argument naming no field, or a field already given, is checked
-	/// and dropped.
+	/// field it gives, built and learned from as `positional_fields` does. Only
+	/// a struct whose every field is named is built this way. An argument
+	/// naming no field, or a field already given, is built and dropped.
 	fn named_fields(
 		&mut self,
 		struct_index: StructIdx,
+		type_args: &mut [TypeIndex],
 		arguments: &[ast::Separated<Spanned<ast::NamedArgument>>],
 		span: TextSpan,
-	) -> (ExprRange, ArgOrder) {
+	) -> Vec<(usize, ExprIdx)> {
 		let def = &self.cx.defs.structs[usize::from(struct_index)];
 		let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
 		let count = def.fields.len();
@@ -454,10 +685,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					))
 					.with_label(self.source_span(span).primary_label()),
 			);
-			return (self.body.push_args([]), self.body.push_permutation([]));
+			return Vec::new();
 		}
-		let mut values = Vec::with_capacity(arguments.len());
-		let mut given: Vec<(FieldIdx, TextSpan)> =
+		// Each field given, with its name as written and its value.
+		let mut given: Vec<(FieldIdx, TextSpan, ExprIdx)> =
 			Vec::with_capacity(arguments.len());
 		for argument in arguments {
 			let argument = &argument.inner.inner;
@@ -466,22 +697,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				.lookup
 				.get(&name.inner)
 				.copied();
-			let expected = match field {
+			let hint = match field {
 				Some(field) => {
-					self.field_type(struct_index, usize::from(field))
+					self.field_type(struct_index, type_args, usize::from(field))
 				}
 				None => TypeIndex::INFER,
 			};
 			let value = match &argument.value {
-				Some(value) => self.check(value, expected),
+				Some(value) => self.build(value, hint),
 				// `{ x }` is `{ x: x }`.
 				None => {
 					let path = [ast::PathSegment {
 						ident: name,
 						type_args: Box::new([]),
 					}];
-					let built = self.build_path(&path, name.span);
-					self.expect(built, expected)
+					self.build_path(&path, name.span)
 				}
 			};
 			let def = &self.cx.defs.structs[usize::from(struct_index)];
@@ -501,8 +731,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				continue;
 			};
-			if let Some(&(_, first)) =
-				given.iter().find(|&&(given, _)| given == field)
+			if let Some(&(_, first, _)) =
+				given.iter().find(|&&(given, ..)| given == field)
 			{
 				self.cx.diagnostics.push(
 					Diagnostic::error()
@@ -521,8 +751,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				continue;
 			}
-			values.push(value);
-			given.push((field, name.span));
+			self.learn_field(
+				struct_index,
+				type_args,
+				usize::from(field),
+				value,
+			);
+			given.push((field, name.span, value));
 		}
 		// A later field of a name declared twice is one no argument can name;
 		// the duplicate was reported on the struct.
@@ -531,7 +766,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			.map(|at| FieldIdx::new(at as u32))
 			.filter(|&field| {
 				let name = def.fields[usize::from(field)].name.unwrap().inner;
-				!given.iter().any(|&(given, _)| given == field)
+				!given.iter().any(|&(given, ..)| given == field)
 					&& def.lookup.get(&name) == Some(&field)
 			})
 			.map(|field| {
@@ -552,12 +787,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					.with_label(self.source_span(span).primary_label()),
 			);
 		}
-		let order = self.body.push_permutation(
-			given
-				.into_iter()
-				.map(|(field, _)| ParamIdx::new(u32::from(field))),
-		);
-		(self.body.push_args(values), order)
+		given
+			.into_iter()
+			.map(|(field, _, value)| (usize::from(field), value))
+			.collect()
 	}
 
 	/// A struct's constructor is as visible as the struct and every one of
@@ -629,12 +862,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		op: Spanned<UnaryOp>,
 		operand: &Spanned<ast::Expression>,
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let operand = self.build(operand);
+		// Every unary operator's method returns `Self`: the operand is expected
+		// to have the result's type, and an untyped operand leaves the node
+		// untyped until context coerces both.
+		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
-		// Every unary operator answers its operand's type, so an untyped
-		// operand leaves the node untyped until context coerces both.
 		if is_untyped(ty) {
 			return self.body.push(
 				ExprKind::Unary {
@@ -654,6 +889,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		op: Spanned<BinaryOp>,
 		left: &Spanned<ast::Expression>,
 		right: &Spanned<ast::Expression>,
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		match op.inner {
@@ -681,20 +917,33 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			| BinaryOp::BitXorAssign
 			| BinaryOp::LeftShiftAssign
 			| BinaryOp::RightShiftAssign => {
-				return self.body.push(
-					ExprKind::Unsupported,
-					TypeIndex::ERROR,
-					span,
-				);
+				todo!("checking an assignment");
 			}
 			_ => {}
 		}
-		let lhs = self.build(left);
-		let rhs = self.build(right);
-		let (left_ty, right_ty) = (self.body.ty(lhs), self.body.ty(rhs));
+		// An arithmetic or bitwise method returns `Self`, so its operands are
+		// expected to have the result's type; a comparison returns `bool`
+		// whatever they are.
+		let expected = if is_comparison(op.inner) {
+			TypeIndex::INFER
+		} else {
+			expected
+		};
 		// Both operands share one type (every operator trait takes
-		// `rhs: Self`); a typed side gives it to an untyped one.
-		let operand_ty = match (is_untyped(left_ty), is_untyped(right_ty)) {
+		// `rhs: Self`): a typed left side is what the right one is expected to
+		// be, and below, a typed side gives its type to an untyped one.
+		let lhs = self.build(left, expected);
+		let left_ty = self.body.ty(lhs);
+		let rhs = if self.cx.types.has_untyped(left_ty) {
+			self.build(right, expected)
+		} else {
+			self.build(right, left_ty)
+		};
+		let right_ty = self.body.ty(rhs);
+		let operand_ty = match (
+			self.cx.types.has_untyped(left_ty),
+			self.cx.types.has_untyped(right_ty),
+		) {
 			(true, true) => {
 				if is_comparison(op.inner) {
 					self.cx.diagnostics.push(
@@ -714,7 +963,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						span,
 					);
 				}
-				let ty = if left_ty == TypeIndex::FLOAT
+				// Two literals are a float if either is; anything else untyped
+				// (a tuple of literals) keeps the left side's shape.
+				let ty = if !is_untyped(left_ty) || !is_untyped(right_ty) {
+					left_ty
+				} else if left_ty == TypeIndex::FLOAT
 					|| right_ty == TypeIndex::FLOAT
 				{
 					TypeIndex::FLOAT
@@ -845,7 +1098,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let found = match method {
 			Some(method) => {
 				match self.cx.find_trait_impl_query(
-					self.scope,
+					self.scope.env,
 					ty,
 					method.trait_index,
 				) {
@@ -941,8 +1194,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let typeset = TypesetIdx::new(index as u32);
 			let trait_index = self.cx.defs.typesets[index].trait_index;
 			if !matches!(
-				self.cx
-					.find_trait_impl_query(self.scope, target, trait_index),
+				self.cx.find_trait_impl_query(
+					self.scope.env,
+					target,
+					trait_index
+				),
 				Ok(Some(_))
 			) {
 				continue;
@@ -963,6 +1219,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if target == TypeIndex::ERROR {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
+		}
+		if let ExprKind::Tuple { elements } = self.body.kind(expr) {
+			return self.coerce_tuple(expr, elements, target);
 		}
 		let Some(targets) = self.literal_targets(target) else {
 			return self.report_unable_to_coerce(expr, target);
@@ -1063,6 +1322,41 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
+	/// Gives an untyped tuple the type `target`: each element is held to the
+	/// target's element at its position, which coerces the untyped ones. A
+	/// target that is not a tuple as long is a mismatch.
+	fn coerce_tuple(
+		&mut self,
+		expr: ExprIdx,
+		elements: ExprRange,
+		target: TypeIndex,
+	) {
+		let targets = match *self.cx.types.resolve(target) {
+			Type::Tuple { elements: targets }
+				if targets.len() == elements.len() =>
+			{
+				targets
+			}
+			_ => {
+				let actual = self.body.ty(expr);
+				let diagnostic =
+					self.report_type_mismatch(target, actual, expr);
+				self.cx.diagnostics.push(diagnostic);
+				return self.body.set_ty(expr, TypeIndex::ERROR);
+			}
+		};
+		let mut types = Vec::with_capacity(elements.len());
+		for at in 0..elements.len() {
+			let element = self.body.args(elements)[at];
+			let element_target = self.cx.types.list(targets)[at];
+			let element = self.expect(element, element_target);
+			types.push(self.body.ty(element));
+		}
+		let ty = self.cx.types.intern_tuple(&types);
+		let ty = self.cx.types.collapse_error(ty);
+		self.body.set_ty(expr, ty);
+	}
+
 	/// Reads a float literal's value from its text at each target's width.
 	fn coerce_float(
 		&mut self,
@@ -1070,7 +1364,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		targets: &[LiteralTarget],
 	) {
-		let source = &self.cx.files.get(self.file_id).unwrap().source;
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		let text = self.body.span(expr).extract_str(source).to_owned();
 		let nonzero = text.bytes().any(|b| b.is_ascii_digit() && b != b'0');
 		let mut value = None;
@@ -1249,7 +1543,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn source_span(&self, span: TextSpan) -> SourceSpan {
-		SourceSpan::new(self.file_id, span)
+		SourceSpan::new(self.scope.file_id, span)
 	}
 }
 
