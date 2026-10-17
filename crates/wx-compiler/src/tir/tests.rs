@@ -5,9 +5,8 @@ use indoc::indoc;
 
 use super::*;
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::builder::{
-	CharLiteralError, parse_char_literal, unescape_string,
-};
+use crate::testing::DiagnosticView;
+use crate::tir::builder::{CharLiteralError, parse_char_literal};
 use crate::vfs;
 
 #[allow(unused)]
@@ -111,6 +110,10 @@ impl TestCase {
 		let tir = TIR::build(&mut graph);
 		TestCase { graph, tir }
 	}
+
+	fn diagnostics(&self) -> DiagnosticView<'_> {
+		DiagnosticView::new("check", &self.tir.diagnostics, &self.graph.files)
+	}
 }
 
 #[test]
@@ -211,24 +214,6 @@ fn test_stdlib_typechecks_as_root_package() {
 }
 
 #[test]
-fn test_unescape_string() {
-	assert_eq!(unescape_string(r#""hello""#), "hello");
-	assert_eq!(unescape_string(r#""hello\nworld""#), "hello\nworld");
-	assert_eq!(unescape_string(r#""tab\tthere""#), "tab\tthere");
-	assert_eq!(unescape_string(r#""quote\"here""#), "quote\"here");
-	assert_eq!(unescape_string(r#""backslash\\here""#), "backslash\\here");
-	assert_eq!(unescape_string(r#""null\0byte""#), "null\0byte");
-	assert_eq!(unescape_string(r#""carriage\rreturn""#), "carriage\rreturn");
-	// Multiple escapes
-	assert_eq!(
-		unescape_string(r#""line1\nline2\nline3""#),
-		"line1\nline2\nline3"
-	);
-	// No quotes (should return as-is)
-	assert_eq!(unescape_string("hello"), "hello");
-}
-
-#[test]
 fn test_parse_char_literal() {
 	// Plain characters
 	assert_eq!(parse_char_literal("'a'"), Ok('a'));
@@ -268,7 +253,7 @@ fn test_build_with_package_graph_lowers_child_module_items() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
 		"mod math;",
-		&[("src/math.wx", "fn add() -> i32 { 1 }")],
+		&[("src/math.wx", "func add() -> i32 { 1 }")],
 	);
 
 	assert!(
@@ -287,13 +272,13 @@ fn test_build_with_package_graph_resolves_cross_file_module_function_call() {
 		indoc! {"
             mod math;
 
-            fn main() -> i32 {
+            func main() -> i32 {
                 math::add()
             }
 
             export { main }
         "},
-		&[("src/math.wx", "pub fn add() -> i32 { 1 }")],
+		&[("src/math.wx", "pub func add() -> i32 { 1 }")],
 	);
 
 	no_errors(&case);
@@ -306,7 +291,7 @@ fn test_build_with_package_graph_resolves_cross_file_module_type_access() {
 		indoc! {"
             mod shapes;
 
-            fn use_circle(circle: shapes::Circle) {
+            func use_circle(circle: shapes::Circle) {
                 unreachable
             }
         "},
@@ -329,7 +314,7 @@ fn test_export_block_preceding_the_items_it_names() {
 
         memory heap: Memory where { Size = u32 }
 
-        fn elem(arr: heap::&[i32; 4], i: u32) -> i32 { arr[i] }
+        func elem(arr: heap::&[i32; 4], i: u32) -> i32 { arr[i] }
     "});
 
 	no_errors(&case);
@@ -353,10 +338,10 @@ fn test_use_named_import_binds_the_name() {
 	let case = use_case(
 		indoc! {"
             use math::add;
-            fn main() -> i32 { add() }
+            func main() -> i32 { add() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 }
@@ -366,10 +351,10 @@ fn test_use_alias_binds_the_local_name() {
 	let case = use_case(
 		indoc! {"
             use math::add as plus;
-            fn main() -> i32 { plus() }
+            func main() -> i32 { plus() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 }
@@ -379,10 +364,10 @@ fn test_use_group_imports_every_leaf() {
 	let case = use_case(
 		indoc! {"
             use math::{add, sub};
-            fn main() -> i32 { add() + sub() }
+            func main() -> i32 { add() + sub() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+		"pub func add() -> i32 { 1 }\npub func sub() -> i32 { 2 }",
 	);
 	no_errors(&case);
 	assert_eq!(
@@ -401,16 +386,16 @@ fn test_use_nested_group_with_both_leaf_kinds() {
 		indoc! {"
             mod math;
             use math::{trig::{sin, cos}, ops::*};
-            fn main() -> i32 { sin() + cos() + double(1) }
+            func main() -> i32 { sin() + cos() + double(1) }
             export { main }
         "},
 		&[
 			("src/math.wx", "pub mod trig;\npub mod ops;"),
 			(
 				"src/math/trig.wx",
-				"pub fn sin() -> i32 { 1 }\npub fn cos() -> i32 { 2 }",
+				"pub func sin() -> i32 { 1 }\npub func cos() -> i32 { 2 }",
 			),
-			("src/math/ops.wx", "pub fn double(x: i32) -> i32 { x * 2 }"),
+			("src/math/ops.wx", "pub func double(x: i32) -> i32 { x * 2 }"),
 		],
 	);
 	no_errors(&case);
@@ -426,10 +411,10 @@ fn test_group_prefix_is_walked_once() {
 	let case = use_case(
 		indoc! {"
             use math::{add, sub};
-            fn main() -> i32 { add() + sub() }
+            func main() -> i32 { add() + sub() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+		"pub func add() -> i32 { 1 }\npub func sub() -> i32 { 2 }",
 	);
 	no_errors(&case);
 
@@ -445,7 +430,7 @@ fn test_group_prefix_is_walked_once() {
 		panic!("`math` should have resolved")
 	};
 	assert_eq!(
-		case.tir.modules.namespaces[usize::from(math_ns)]
+		case.tir.defs.namespaces[usize::from(math_ns)]
 			.accesses
 			.len(),
 		1,
@@ -461,10 +446,10 @@ fn test_separate_use_statements_do_not_share_a_prefix() {
 		indoc! {"
             use math::add;
             use math::sub;
-            fn main() -> i32 { add() + sub() }
+            func main() -> i32 { add() + sub() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }\npub fn sub() -> i32 { 2 }",
+		"pub func add() -> i32 { 1 }\npub func sub() -> i32 { 2 }",
 	);
 	no_errors(&case);
 	assert_eq!(case.tir.items.use_prefixes.len(), 2);
@@ -474,8 +459,8 @@ fn test_separate_use_statements_do_not_share_a_prefix() {
 #[test]
 fn test_glob_allocates_no_prefix() {
 	let case = use_case(
-		"use math::*;\nfn main() -> i32 { add() }\nexport { main }",
-		"pub fn add() -> i32 { 1 }",
+		"use math::*;\nfunc main() -> i32 { add() }\nexport { main }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 	assert!(case.tir.items.use_prefixes.is_empty());
@@ -486,7 +471,7 @@ fn test_use_imports_a_type() {
 	let case = use_case(
 		indoc! {"
             use math::Point;
-            fn main() -> i32 { local p: Point = Point::{ x: 1 }; p.x }
+            func main() -> i32 { local p: Point = Point::{ x: 1 }; p.x }
             export { main }
         "},
 		"pub struct Point { pub x: i32 }",
@@ -497,8 +482,8 @@ fn test_use_imports_a_type() {
 #[test]
 fn test_use_private_item_reports_at_the_use_site() {
 	let case = use_case(
-		"use math::hidden;\nfn main() -> i32 { 1 }\nexport { main }",
-		"fn hidden() -> i32 { 1 }",
+		"use math::hidden;\nfunc main() -> i32 { 1 }\nexport { main }",
+		"func hidden() -> i32 { 1 }",
 	);
 	assert!(has_error_code(&case.tir, DiagnosticCode::PrivateItem));
 }
@@ -509,8 +494,8 @@ fn test_use_private_item_reports_at_the_use_site() {
 #[test]
 fn test_use_unresolved_name_reports() {
 	let case = use_case(
-		"use math::nope;\nfn main() -> i32 { 1 }\nexport { main }",
-		"pub fn add() -> i32 { 1 }",
+		"use math::nope;\nfunc main() -> i32 { 1 }\nexport { main }",
+		"pub func add() -> i32 { 1 }",
 	);
 	assert!(has_error_code(
 		&case.tir,
@@ -521,8 +506,8 @@ fn test_use_unresolved_name_reports() {
 #[test]
 fn test_use_unresolved_prefix_reports() {
 	let case = use_case(
-		"use nothere::thing;\nfn main() -> i32 { 1 }\nexport { main }",
-		"pub fn add() -> i32 { 1 }",
+		"use nothere::thing;\nfunc main() -> i32 { 1 }\nexport { main }",
+		"pub func add() -> i32 { 1 }",
 	);
 	assert!(has_error_code(
 		&case.tir,
@@ -537,8 +522,8 @@ fn test_use_unresolved_prefix_reports() {
 #[test]
 fn test_use_without_a_module_reports() {
 	let case = use_case(
-		"use add;\nfn main() -> i32 { 1 }\nexport { main }",
-		"pub fn add() -> i32 { 1 }",
+		"use add;\nfunc main() -> i32 { 1 }\nexport { main }",
+		"pub func add() -> i32 { 1 }",
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
@@ -554,8 +539,8 @@ fn test_use_without_a_module_reports() {
 #[test]
 fn test_use_prefix_that_is_not_a_module_reports() {
 	let case = use_case(
-		"use S::thing;\nstruct S {}\nfn main() -> i32 { 1 }\nexport { main }",
-		"pub fn add() -> i32 { 1 }",
+		"use S::thing;\nstruct S {}\nfunc main() -> i32 { 1 }\nexport { main }",
+		"pub func add() -> i32 { 1 }",
 	);
 	assert!(has_error_code(&case.tir, DiagnosticCode::NotANamespace));
 }
@@ -570,10 +555,10 @@ fn test_value_import_does_not_collide_with_a_type_declaration() {
 		indoc! {"
             use math::add;
             struct add { x: i32 }
-            fn main() -> i32 { add() }
+            func main() -> i32 { add() }
             export { main }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	assert!(
 		!has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
@@ -592,8 +577,8 @@ fn test_type_import_does_not_collide_with_a_value_declaration() {
 	let case = use_case(
 		indoc! {"
             use math::Point;
-            fn Point() -> i32 { 2 }
-            fn main() -> i32 { Point() }
+            func Point() -> i32 { 2 }
+            func main() -> i32 { Point() }
             export { main }
         "},
 		"pub struct Point { x: i32 }",
@@ -610,12 +595,12 @@ fn test_type_import_does_not_collide_with_a_value_declaration() {
 #[test]
 fn test_import_colliding_in_the_same_namespace_reports_once() {
 	for source in [
-		"use math::add;\nfn add() -> i32 { 2 }\nfn main() -> i32 { add() }",
-		"fn add() -> i32 { 2 }\nuse math::add;\nfn main() -> i32 { add() }",
+		"use math::add;\nfunc add() -> i32 { 2 }\nfunc main() -> i32 { add() }",
+		"func add() -> i32 { 2 }\nuse math::add;\nfunc main() -> i32 { add() }",
 	] {
 		let case = use_case(
 			&format!("{source}\nexport {{ main }}"),
-			"pub fn add() -> i32 { 1 }",
+			"pub func add() -> i32 { 1 }",
 		);
 		let duplicates = case
 			.tir
@@ -640,7 +625,7 @@ fn test_value_reference_forces_a_pending_signature() {
 		indoc! {"
             const DOUBLE: i32 = BASE;
             use math::BASE;
-            fn main() -> i32 { DOUBLE }
+            func main() -> i32 { DOUBLE }
             export { main }
         "},
 		"pub const BASE: i32 = 21;",
@@ -652,7 +637,7 @@ fn test_value_reference_forces_a_pending_signature() {
 	let case = TestCase::new(indoc! {"
         const A: i32 = B;
         const B: i32 = 1;
-        fn main() -> i32 { A }
+        func main() -> i32 { A }
         export { main }
     "});
 	no_errors(&case);
@@ -662,7 +647,7 @@ fn test_value_reference_forces_a_pending_signature() {
 fn test_self_referential_const_reports_a_cycle() {
 	let case = TestCase::new(indoc! {"
         const A: i32 = A;
-        fn main() -> i32 { A }
+        func main() -> i32 { A }
         export { main }
     "});
 	assert!(has_error_code(
@@ -682,8 +667,8 @@ fn test_self_referential_const_reports_a_cycle() {
 fn test_cyclic_const_referenced_afterward_reports_once_not_per_reference() {
 	let case = TestCase::new(indoc! {"
         const A: i32 = A;
-        fn main() -> i32 { A }
-        fn other() -> i32 { A + 1 }
+        func main() -> i32 { A }
+        func other() -> i32 { A + 1 }
         export { main, other }
     "});
 
@@ -750,8 +735,8 @@ fn test_mutual_const_cycle_referenced_afterward_reports_once() {
 	let case = TestCase::new(indoc! {"
         const A: i32 = B;
         const B: i32 = A;
-        fn main() -> i32 { A }
-        fn other() -> i32 { B }
+        func main() -> i32 { A }
+        func other() -> i32 { B }
         export { main, other }
     "});
 
@@ -792,7 +777,7 @@ fn test_named_import_alias_cycle_across_modules_reports_a_cycle() {
 		indoc! {"
             mod a;
             mod b;
-            fn main() -> i32 { 1 }
+            func main() -> i32 { 1 }
             export { main }
         "},
 		&[
@@ -817,17 +802,17 @@ fn test_two_modules_importing_concrete_items_from_each_other_is_not_cyclic() {
 		indoc! {"
             mod a;
             mod b;
-            fn main() -> i32 { a::use_b() + b::use_a() }
+            func main() -> i32 { a::use_b() + b::use_a() }
             export { main }
         "},
 		&[
 			(
 				"src/a.wx",
-				"use b::real_b;\npub fn use_b() -> i32 { real_b() }\npub fn real_a() -> i32 { 1 }",
+				"use b::real_b;\npub func use_b() -> i32 { real_b() }\npub func real_a() -> i32 { 1 }",
 			),
 			(
 				"src/b.wx",
-				"use a::real_a;\npub fn use_a() -> i32 { real_a() }\npub fn real_b() -> i32 { 2 }",
+				"use a::real_a;\npub func use_a() -> i32 { real_a() }\npub func real_b() -> i32 { 2 }",
 			),
 		],
 	);
@@ -847,12 +832,12 @@ fn test_duplicate_named_import_is_duplicate_definition_not_ambiguity() {
             mod y;
             use x::pick;
             use y::pick;
-            fn main() -> i32 { pick() }
+            func main() -> i32 { pick() }
             export { main }
         "},
 		&[
-			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
-			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+			("src/x.wx", "pub func pick() -> i32 { 6 }"),
+			("src/y.wx", "pub func pick() -> i32 { 5 }"),
 		],
 	);
 	assert!(has_error_code(
@@ -872,16 +857,16 @@ fn test_duplicate_named_import_is_duplicate_definition_not_ambiguity() {
 fn test_glob_import_records_its_path_span() {
 	let case = TestCase::new_multi_file(
 		"src/main.wx",
-		"mod math;\nuse math::{trig::*};\nfn main() -> i32 { 1 }\nexport { main }",
+		"mod math;\nuse math::{trig::*};\nfunc main() -> i32 { 1 }\nexport { main }",
 		&[
 			("src/math.wx", "pub mod trig;"),
-			("src/math/trig.wx", "pub fn sin() -> i32 { 1 }"),
+			("src/math/trig.wx", "pub func sin() -> i32 { 1 }"),
 		],
 	);
 	no_errors(&case);
 
-	let root = case.tir.modules.file_namespaces[1];
-	let spelled: Vec<&str> = case.tir.modules.namespaces[usize::from(root)]
+	let root = case.tir.defs.file_namespaces[1];
+	let spelled: Vec<&str> = case.tir.defs.namespaces[usize::from(root)]
 		.wildcard_imports
 		.iter()
 		.map(|import| {
@@ -918,7 +903,7 @@ fn ambiguity_case(entry: &str, x: &str, y: &str) -> TestCase {
 #[test]
 fn test_two_globs_supplying_one_name_is_ambiguous() {
 	let case = ambiguity_case(
-		"fn main() -> i32 { FOO }\nexport { main }",
+		"func main() -> i32 { FOO }\nexport { main }",
 		"pub const FOO: i32 = 6;",
 		"pub const FOO: i32 = 5;",
 	);
@@ -958,9 +943,9 @@ fn test_two_globs_supplying_one_name_is_ambiguous() {
 #[test]
 fn test_ambiguity_is_reported_in_value_position() {
 	let case = ambiguity_case(
-		"fn main() -> i32 { pick() }\nexport { main }",
-		"pub fn pick() -> i32 { 6 }",
-		"pub fn pick() -> i32 { 5 }",
+		"func main() -> i32 { pick() }\nexport { main }",
+		"pub func pick() -> i32 { 6 }",
+		"pub func pick() -> i32 { 5 }",
 	);
 	assert!(has_error_code(
 		&case.tir,
@@ -971,7 +956,7 @@ fn test_ambiguity_is_reported_in_value_position() {
 #[test]
 fn test_ambiguity_is_reported_in_type_position() {
 	let case = ambiguity_case(
-		"fn main(p: Point) -> i32 { 1 }\nexport { main }",
+		"func main(p: Point) -> i32 { 1 }\nexport { main }",
 		"pub struct Point { pub x: i32 }",
 		"pub struct Point { pub y: i32 }",
 	);
@@ -988,8 +973,8 @@ fn test_ambiguity_is_reported_in_type_position() {
 fn test_ambiguity_is_reported_from_the_export_block() {
 	let case = ambiguity_case(
 		"export { pick }",
-		"pub fn pick() -> i32 { 6 }",
-		"pub fn pick() -> i32 { 5 }",
+		"pub func pick() -> i32 { 6 }",
+		"pub func pick() -> i32 { 5 }",
 	);
 	assert!(has_error_code(
 		&case.tir,
@@ -1010,11 +995,11 @@ fn test_one_item_through_two_globs_is_not_ambiguous() {
             use x::*;
             use y::*;
 
-            fn main() -> i32 { shared() }
+            func main() -> i32 { shared() }
             export { main }
         "},
 		&[
-			("src/base.wx", "pub fn shared() -> i32 { 1 }"),
+			("src/base.wx", "pub func shared() -> i32 { 1 }"),
 			("src/x.wx", "pub use base::shared;"),
 			("src/y.wx", "pub use base::shared;"),
 		],
@@ -1036,12 +1021,12 @@ fn test_explicit_import_disambiguates_two_globs() {
             use y::*;
             use x::pick;
 
-            fn main() -> i32 { pick() }
+            func main() -> i32 { pick() }
             export { main }
         "},
 		&[
-			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
-			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+			("src/x.wx", "pub func pick() -> i32 { 6 }"),
+			("src/y.wx", "pub func pick() -> i32 { 5 }"),
 		],
 	);
 	no_errors(&case);
@@ -1061,15 +1046,15 @@ fn test_glob_in_an_inner_scope_shadows_an_outer_one() {
 
             mod inner {
                 use y::*;
-                pub fn get() -> i32 { pick() }
+                pub func get() -> i32 { pick() }
             }
 
-            fn main() -> i32 { inner::get() }
+            func main() -> i32 { inner::get() }
             export { main }
         "},
 		&[
-			("src/x.wx", "pub fn pick() -> i32 { 6 }"),
-			("src/y.wx", "pub fn pick() -> i32 { 5 }"),
+			("src/x.wx", "pub func pick() -> i32 { 6 }"),
+			("src/y.wx", "pub func pick() -> i32 { 5 }"),
 		],
 	);
 	no_errors(&case);
@@ -1085,7 +1070,7 @@ fn test_glob_in_an_inner_scope_shadows_an_outer_one() {
 #[test]
 fn test_prelude_resolves_without_any_import() {
 	let case = TestCase::new(indoc! {"
-        fn main(x: f32) -> f32 { f32_sqrt(x) }
+        func main(x: f32) -> f32 { f32_sqrt(x) }
         export { main }
     "});
 	no_errors(&case);
@@ -1100,10 +1085,10 @@ fn test_prelude_reaches_a_submodule() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            fn main(x: f32) -> f32 { a::call_it(x) }
+            func main(x: f32) -> f32 { a::call_it(x) }
             export { main }
         "},
-		&[("src/a.wx", "pub fn call_it(x: f32) -> f32 { f32_sqrt(x) }")],
+		&[("src/a.wx", "pub func call_it(x: f32) -> f32 { f32_sqrt(x) }")],
 	);
 	no_errors(&case);
 }
@@ -1114,8 +1099,8 @@ fn test_prelude_reaches_a_submodule() {
 #[test]
 fn test_local_declaration_shadows_the_prelude() {
 	let case = TestCase::new(indoc! {"
-        fn f32_sqrt(x: f32) -> bool { true }
-        fn main(x: f32) -> bool { f32_sqrt(x) }
+        func f32_sqrt(x: f32) -> bool { true }
+        func main(x: f32) -> bool { f32_sqrt(x) }
         export { main }
     "});
 	no_errors(&case);
@@ -1132,10 +1117,10 @@ fn test_glob_import_shadows_the_prelude() {
 		indoc! {"
             mod a;
             use a::*;
-            fn main(x: f32) -> bool { f32_sqrt(x) }
+            func main(x: f32) -> bool { f32_sqrt(x) }
             export { main }
         "},
-		&[("src/a.wx", "pub fn f32_sqrt(x: f32) -> bool { true }")],
+		&[("src/a.wx", "pub func f32_sqrt(x: f32) -> bool { true }")],
 	);
 	no_errors(&case);
 }
@@ -1154,11 +1139,11 @@ fn test_crate_path_reaches_package_root_from_submodule() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            pub fn helper() -> i32 { 1 }
-            fn main() -> i32 { a::call_it() }
+            pub func helper() -> i32 { 1 }
+            func main() -> i32 { a::call_it() }
             export { main }
         "},
-		&[("src/a.wx", "pub fn call_it() -> i32 { crate::helper() }")],
+		&[("src/a.wx", "pub func call_it() -> i32 { crate::helper() }")],
 	);
 	no_errors(&case);
 }
@@ -1170,13 +1155,13 @@ fn test_use_crate_path_binds_a_package_root_item() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            pub fn helper() -> i32 { 1 }
-            fn main() -> i32 { a::call_it() }
+            pub func helper() -> i32 { 1 }
+            func main() -> i32 { a::call_it() }
             export { main }
         "},
 		&[(
 			"src/a.wx",
-			"use crate::helper;\npub fn call_it() -> i32 { helper() }",
+			"use crate::helper;\npub func call_it() -> i32 { helper() }",
 		)],
 	);
 	no_errors(&case);
@@ -1190,13 +1175,13 @@ fn test_use_crate_glob_imports_the_package_root() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            pub fn helper() -> i32 { 1 }
-            fn main() -> i32 { a::call_it() }
+            pub func helper() -> i32 { 1 }
+            func main() -> i32 { a::call_it() }
             export { main }
         "},
 		&[(
 			"src/a.wx",
-			"use crate::*;\npub fn call_it() -> i32 { helper() }",
+			"use crate::*;\npub func call_it() -> i32 { helper() }",
 		)],
 	);
 	no_errors(&case);
@@ -1210,12 +1195,12 @@ fn test_crate_path_in_type_position_resolves() {
 		indoc! {"
             mod a;
             pub struct Point { pub x: i32 }
-            fn main() -> i32 { a::make().x }
+            func main() -> i32 { a::make().x }
             export { main }
         "},
 		&[(
 			"src/a.wx",
-			"pub fn make() -> crate::Point { crate::Point::{ x: 1 } }",
+			"pub func make() -> crate::Point { crate::Point::{ x: 1 } }",
 		)],
 	);
 	no_errors(&case);
@@ -1225,11 +1210,11 @@ fn test_crate_path_in_type_position_resolves() {
 #[test]
 fn test_super_path_reaches_parent_from_nested_module() {
 	let case = TestCase::new(indoc! {"
-        pub fn outer_helper() -> i32 { 1 }
+        pub func outer_helper() -> i32 { 1 }
         mod inner {
-            pub fn call_super() -> i32 { super::outer_helper() }
+            pub func call_super() -> i32 { super::outer_helper() }
         }
-        fn main() -> i32 { inner::call_super() }
+        func main() -> i32 { inner::call_super() }
         export { main }
     "});
 	no_errors(&case);
@@ -1240,13 +1225,13 @@ fn test_super_path_reaches_parent_from_nested_module() {
 #[test]
 fn test_super_super_path_chains_to_grandparent() {
 	let case = TestCase::new(indoc! {"
-        pub fn root_helper() -> i32 { 1 }
+        pub func root_helper() -> i32 { 1 }
         mod outer {
             pub mod inner {
-                pub fn call_grandparent() -> i32 { super::super::root_helper() }
+                pub func call_grandparent() -> i32 { super::super::root_helper() }
             }
         }
-        fn main() -> i32 { outer::inner::call_grandparent() }
+        func main() -> i32 { outer::inner::call_grandparent() }
         export { main }
     "});
 	no_errors(&case);
@@ -1259,11 +1244,11 @@ fn test_super_super_path_chains_to_grandparent() {
 #[test]
 fn test_non_leading_super_segment_resolves() {
 	let case = TestCase::new(indoc! {"
-        pub fn root_helper() -> i32 { 1 }
+        pub func root_helper() -> i32 { 1 }
         mod a {
-            pub fn unused() -> i32 { 0 }
+            pub func unused() -> i32 { 0 }
         }
-        fn main() -> i32 { a::super::root_helper() }
+        func main() -> i32 { a::super::root_helper() }
         export { main }
     "});
 	no_errors(&case);
@@ -1275,7 +1260,7 @@ fn test_non_leading_super_segment_resolves() {
 #[test]
 fn test_super_beyond_package_root_is_undeclared() {
 	let case = TestCase::new(indoc! {"
-        fn main() -> i32 { super::main() }
+        func main() -> i32 { super::main() }
         export { main }
     "});
 	assert!(
@@ -1309,11 +1294,11 @@ fn test_transitive_glob_import_two_hops() {
             mod a;
             mod b;
             use b::*;
-            fn main() -> i32 { foo() }
+            func main() -> i32 { foo() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/a.wx", "pub func foo() -> i32 { 1 }"),
 			("src/b.wx", "pub use crate::a::*;"),
 		],
 	);
@@ -1334,11 +1319,11 @@ fn test_transitive_glob_import_three_hops() {
             mod b;
             mod c;
             use c::*;
-            fn main() -> i32 { foo() }
+            func main() -> i32 { foo() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/a.wx", "pub func foo() -> i32 { 1 }"),
 			("src/b.wx", "pub use crate::a::*;"),
 			("src/c.wx", "pub use crate::b::*;"),
 		],
@@ -1363,7 +1348,7 @@ fn test_two_module_glob_cycle_is_a_cyclic_error() {
 		indoc! {"
             mod a;
             mod b;
-            fn main() -> i32 { 1 }
+            func main() -> i32 { 1 }
             export { main }
         "},
 		&[
@@ -1387,7 +1372,7 @@ fn test_module_glob_importing_itself_is_a_cyclic_error() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            fn main() -> i32 { 1 }
+            func main() -> i32 { 1 }
             export { main }
         "},
 		&[("src/a.wx", "pub use crate::a::*;")],
@@ -1424,11 +1409,11 @@ fn test_private_use_is_not_visible_via_qualified_path_from_outside() {
 		indoc! {"
             mod a;
             mod baz;
-            fn main() -> i32 { baz::bar() }
+            func main() -> i32 { baz::bar() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/a.wx", "pub func bar() -> i32 { 1 }"),
 			("src/baz.wx", "use a::bar;"),
 		],
 	);
@@ -1444,11 +1429,11 @@ fn test_pub_use_is_visible_via_qualified_path_from_outside() {
 		indoc! {"
             mod a;
             mod baz;
-            fn main() -> i32 { baz::bar() }
+            func main() -> i32 { baz::bar() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/a.wx", "pub func bar() -> i32 { 1 }"),
 			("src/baz.wx", "pub use a::bar;"),
 		],
 	);
@@ -1466,11 +1451,11 @@ fn test_private_use_is_not_reachable_through_an_external_glob() {
             mod a;
             mod baz;
             use baz::*;
-            fn main() -> i32 { bar() }
+            func main() -> i32 { bar() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/a.wx", "pub func bar() -> i32 { 1 }"),
 			("src/baz.wx", "use a::bar;"),
 		],
 	);
@@ -1491,11 +1476,11 @@ fn test_pub_use_is_reachable_through_an_external_glob() {
             mod a;
             mod baz;
             use baz::*;
-            fn main() -> i32 { bar() }
+            func main() -> i32 { bar() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn bar() -> i32 { 1 }"),
+			("src/a.wx", "pub func bar() -> i32 { 1 }"),
 			("src/baz.wx", "pub use a::bar;"),
 		],
 	);
@@ -1514,11 +1499,11 @@ fn test_chained_pub_use_re_export_resolves() {
             mod a;
             mod b;
             mod c;
-            fn main() -> i32 { c::foo() }
+            func main() -> i32 { c::foo() }
             export { main }
         "},
 		&[
-			("src/a.wx", "pub fn foo() -> i32 { 1 }"),
+			("src/a.wx", "pub func foo() -> i32 { 1 }"),
 			("src/b.wx", "pub use a::foo;"),
 			("src/c.wx", "pub use b::foo;"),
 		],
@@ -1540,10 +1525,10 @@ fn test_private_item_reference_records_access_and_is_not_flagged_unused() {
 		"src/main.wx",
 		indoc! {"
             mod a;
-            fn main() -> i32 { a::foo() }
+            func main() -> i32 { a::foo() }
             export { main }
         "},
-		&[("src/a.wx", "fn foo() -> i32 { 1 }")],
+		&[("src/a.wx", "func foo() -> i32 { 1 }")],
 	);
 	assert!(has_error_code(&case.tir, DiagnosticCode::PrivateItem));
 	assert!(!has_error_code(&case.tir, DiagnosticCode::UnusedItem));
@@ -1576,7 +1561,7 @@ fn test_private_field_read_rejected_across_modules() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn main(p: geom::Point) -> i32 { p.y }
+            func main(p: geom::Point) -> i32 { p.y }
             export { main }
         "},
 		&[("src/geom.wx", "pub struct Point { pub x: i32, y: i32 }")],
@@ -1593,7 +1578,7 @@ fn test_private_field_init_rejected_across_modules() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn main() -> geom::Point { geom::Point::{ x: 1, y: 2 } }
+            func main() -> geom::Point { geom::Point::{ x: 1, y: 2 } }
             export { main }
         "},
 		&[("src/geom.wx", "pub struct Point { pub x: i32, y: i32 }")],
@@ -1610,7 +1595,7 @@ fn test_private_field_destructuring_rejected_across_modules() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn main(p: geom::Point) -> i32 {
+            func main(p: geom::Point) -> i32 {
                 local geom::Point::{ x, y } = p;
                 x + y
             }
@@ -1632,7 +1617,7 @@ fn test_private_field_visible_to_declaring_module_and_descendants() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn main() -> i32 { geom::read() }
+            func main() -> i32 { geom::read() }
             export { main }
         "},
 		&[
@@ -1641,7 +1626,7 @@ fn test_private_field_visible_to_declaring_module_and_descendants() {
 				indoc! {"
                     mod inner;
                     pub struct Point { y: i32 }
-                    pub fn read() -> i32 {
+                    pub func read() -> i32 {
                         local p = Point::{ y: 1 };
                         p.y + inner::read(p)
                     }
@@ -1649,7 +1634,7 @@ fn test_private_field_visible_to_declaring_module_and_descendants() {
 			),
 			(
 				"src/geom/inner.wx",
-				"pub fn read(p: super::Point) -> i32 { p.y }",
+				"pub func read(p: super::Point) -> i32 { p.y }",
 			),
 		],
 	);
@@ -1666,7 +1651,7 @@ fn test_private_field_access_reports_once_and_recovers() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn main(p: geom::Point) -> i32 { p.y + p.y }
+            func main(p: geom::Point) -> i32 { p.y + p.y }
             export { main }
         "},
 		&[("src/geom.wx", "pub struct Point { y: i32 }")],
@@ -1698,7 +1683,7 @@ fn test_export_reaches_a_named_import() {
             use math::add;
             export { add }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 	assert_eq!(case.tir.export_block.as_ref().unwrap().items.len(), 1);
@@ -1711,7 +1696,7 @@ fn test_export_reaches_a_glob_import() {
             use math::*;
             export { add }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 	assert_eq!(case.tir.export_block.as_ref().unwrap().items.len(), 1);
@@ -1727,7 +1712,7 @@ fn test_export_reaches_an_aliased_import() {
             use math::add as plus;
             export { plus }
         "},
-		"pub fn add() -> i32 { 1 }",
+		"pub func add() -> i32 { 1 }",
 	);
 	no_errors(&case);
 	let block = case.tir.export_block.as_ref().unwrap();
@@ -1743,7 +1728,7 @@ fn test_export_cannot_reach_a_private_item_through_a_glob() {
             use math::*;
             export { hidden }
         "},
-		"fn hidden() -> i32 { 1 }",
+		"func hidden() -> i32 { 1 }",
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
@@ -1760,8 +1745,8 @@ fn test_export_cannot_reach_a_private_item_through_a_glob() {
 #[test]
 fn test_second_export_block_reports_duplicate() {
 	let case = TestCase::new(indoc! {"
-        fn foo() -> i32 { 42 }
-        fn bar() -> i32 { 43 }
+        func foo() -> i32 { 42 }
+        func bar() -> i32 { 43 }
 
         export { foo }
         export { bar }
@@ -1784,11 +1769,11 @@ fn test_export_block_in_submodule_reports_not_at_root() {
 		indoc! {"
             mod math;
 
-            fn main() -> i32 { math::add() }
+            func main() -> i32 { math::add() }
 
             export { main }
         "},
-		&[("src/math.wx", "pub fn add() -> i32 { 1 }\nexport { add }")],
+		&[("src/math.wx", "pub func add() -> i32 { 1 }\nexport { add }")],
 	);
 
 	assert!(has_error_code(
@@ -1804,7 +1789,7 @@ fn test_export_block_in_inline_module_reports_not_at_root() {
 	// for the same reason it catches a separate module file.
 	let case = TestCase::new(indoc! {"
         mod inner {
-            pub fn f() -> i32 { 1 }
+            pub func f() -> i32 { 1 }
             export { f }
         }
     "});
@@ -1826,11 +1811,11 @@ fn test_misplaced_export_block_does_not_claim_the_export_slot() {
 		indoc! {"
             mod math;
 
-            fn main() -> i32 { math::add() }
+            func main() -> i32 { math::add() }
 
             export { main }
         "},
-		&[("src/math.wx", "pub fn add() -> i32 { 1 }\nexport { add }")],
+		&[("src/math.wx", "pub func add() -> i32 { 1 }\nexport { add }")],
 	);
 
 	assert!(has_error_code(
@@ -1858,7 +1843,7 @@ fn test_misplaced_export_block_does_not_claim_the_export_slot() {
 #[test]
 fn test_library_package_cannot_export() {
 	let case = TestCase::new_library(indoc! {"
-        pub fn add() -> i32 { 1 }
+        pub func add() -> i32 { 1 }
 
         export { add }
     "});
@@ -1876,8 +1861,8 @@ fn test_library_package_cannot_export() {
 #[test]
 fn test_duplicate_export() {
 	let case = TestCase::new(indoc! {"
-        fn foo() -> i32 { 42 }
-        fn bar() -> i32 { 43 }
+        func foo() -> i32 { 42 }
+        func bar() -> i32 { 43 }
 
         export {
             foo as \"add\",
@@ -1930,8 +1915,15 @@ fn test_export_enum_reports_cannot_export_not_undeclared() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>(),
 	);
+	let status = case
+		.tir
+		.items
+		.enums
+		.iter()
+		.find(|e| case.graph.interner.resolve(e.name.inner) == Some("Status"))
+		.expect("the `Status` enum should be registered");
 	assert_eq!(
-		case.tir.items.enums[0].accesses.len(),
+		status.accesses.len(),
 		1,
 		"the `Status` mention in `export {{ Status }}` must still be recorded as an \
 		 access so the LSP can resolve hover/go-to-definition on it despite the error"
@@ -1944,7 +1936,7 @@ fn test_export_generic_function_reports_cannot_export() {
 	// silently and only fail later, in the MIR phase, with a much less
 	// helpful error. It should be rejected at export time instead.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(value: T) -> T {
+        func identity<T>(value: T) -> T {
             value
         }
 
@@ -2029,8 +2021,8 @@ fn test_export_const_reports_cannot_export_and_records_access() {
 #[test]
 fn test_duplicate_export_with_alias() {
 	let case = TestCase::new(indoc! {"
-        fn foo() -> i32 { 42 }
-        fn bar() -> i32 { 43 }
+        func foo() -> i32 { 42 }
+        func bar() -> i32 { 43 }
 
         export {
             foo,
@@ -2052,7 +2044,7 @@ fn test_duplicate_export_with_alias() {
 #[test]
 fn test_parse_simple_addition() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
+        func add(a: i32, b: i32) -> i32 { a + b }
 
         export { add, add as \"plus\" }
     "});
@@ -2063,10 +2055,10 @@ fn test_parse_simple_addition() {
 fn test_parse_import_with_alias() {
 	let case = TestCase::new(indoc! {"
         import \"console\" as console {
-            fn log(ptr: u32, len: u32) -> ();
+            func log(ptr: u32, len: u32) -> ();
         }
 
-        fn main() {
+        func main() {
             console::log(0, 0);
         }
 
@@ -2083,7 +2075,7 @@ fn test_imported_global() {
             global mut flag: bool;
         }
 
-        fn read() -> i32 {
+        func read() -> i32 {
             env::counter
         }
 
@@ -2111,7 +2103,7 @@ fn test_imported_global() {
 			.all(|g| case.tir.is_import_namespace(g.namespace))
 	);
 	// They appear in the import_decl lookup.
-	let decl = &case.tir.modules.import_decls[0];
+	let decl = &case.tir.defs.import_decls[0];
 	assert_eq!(decl.lookup.len(), 2);
 }
 
@@ -2119,10 +2111,10 @@ fn test_imported_global() {
 fn test_import_without_alias_reports_error_but_recovers() {
 	let case = TestCase::new(indoc! {"
         import \"env\" {
-            fn log(message: i32);
+            func log(message: i32);
         }
 
-        fn main() {
+        func main() {
             env::log(42);
         }
 
@@ -2145,10 +2137,10 @@ fn test_import_without_alias_reports_error_but_recovers() {
 fn test_local_variable_used_in_import_call() {
 	let case = TestCase::new(indoc! {"
         import \"console\" as console {
-            fn log(ptr: u32, len: u32);
+            func log(ptr: u32, len: u32);
         }
 
-        fn main() {
+        func main() {
             local length = \"test\".len();
             console::log(0, length);
         }
@@ -2164,8 +2156,8 @@ fn test_local_with_type_annotation_invalid_rhs_recovers() {
 	// the checker must still register the local with the declared type so that
 	// subsequent uses don't cascade into "undeclared identifier" errors.
 	let case = TestCase::new(indoc! {"
-        fn use_ptr(x: u32) -> u32 { x }
-        fn main() -> u32 {
+        func use_ptr(x: u32) -> u32 { x }
+        func main() -> u32 {
             local p: u32 = unknown_fn()
             use_ptr(p)
         }
@@ -2196,8 +2188,8 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
-        fn make_ptr() -> heap::&u16 { unreachable }
-        fn f(count: heap::Size) -> heap::&[u8] {
+        func make_ptr() -> heap::&u16 { unreachable }
+        func f(count: heap::Size) -> heap::&[u8] {
             local ptr = make_ptr();
             std::slice_from_parts(ptr, count)
         }
@@ -2261,7 +2253,7 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        fn write(x: i32) {
+        func write(x: i32) {
             local p: heap::*Node = alloc_node()
             p.*.x = x
         }
@@ -2280,7 +2272,7 @@ fn test_assign_to_undeclared_identifier_no_e1013() {
 	// Assignment to an undeclared variable should produce only E1007 (undeclared
 	// identifier), not a cascading E1013 (invalid assignment target).
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             undeclared_var = 42
         }
         export { f }
@@ -2290,23 +2282,6 @@ fn test_assign_to_undeclared_identifier_no_e1013() {
 		&case.tir,
 		DiagnosticCode::UndeclaredIdentifier
 	));
-}
-
-#[test]
-fn test_compare_mutable_pointer_with_null() {
-	// `cur == ptr::null()` must infer M and T for null<M,T>() from the type of `cur`
-	// (`heap::*Node`), even though null()'s return type is an immutable pointer.
-	// Previously `infer_type_args` required matching mutability, causing E1002.
-	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
-        memory heap: Memory where { Size = u32 }
-        struct Node { x: i32 }
-        fn is_null(p: heap::&Node) -> bool {
-            p == ptr::null()
-        }
-        export { is_null }
-    "});
-	assert!(case.tir.diagnostics.is_empty());
 }
 
 fn has_error_code(tir: &TIR, code: DiagnosticCode) -> bool {
@@ -2319,7 +2294,7 @@ fn has_error_code(tir: &TIR, code: DiagnosticCode) -> bool {
 
 #[test]
 fn test_coerce_int_to_i32() {
-	let case = TestCase::new("fn f() -> i32 { 42 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 42 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2333,7 +2308,7 @@ fn test_coerce_int_to_i32() {
 
 #[test]
 fn test_coerce_int_to_i64() {
-	let case = TestCase::new("fn f() -> i64 { 9999999999 } export { f }");
+	let case = TestCase::new("func f() -> i64 { 9999999999 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2347,7 +2322,7 @@ fn test_coerce_int_to_i64() {
 
 #[test]
 fn test_coerce_int_to_u32() {
-	let case = TestCase::new("fn f() -> u32 { 100 } export { f }");
+	let case = TestCase::new("func f() -> u32 { 100 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2361,7 +2336,7 @@ fn test_coerce_int_to_u32() {
 
 #[test]
 fn test_coerce_int_to_u64() {
-	let case = TestCase::new("fn f() -> u64 { 0 } export { f }");
+	let case = TestCase::new("func f() -> u64 { 0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2376,7 +2351,7 @@ fn test_coerce_int_to_u64() {
 #[test]
 fn test_coerce_int_overflow_i32() {
 	// i32::MAX + 1 = 2147483648 overflows i32
-	let case = TestCase::new("fn f() -> i32 { 2147483648 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 2147483648 } export { f }");
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::IntegerLiteralOutOfRange),
 		"expected E1004 (out of range), got: {:?}",
@@ -2390,7 +2365,7 @@ fn test_coerce_int_overflow_i32() {
 
 #[test]
 fn test_coerce_int_negative_for_u32() {
-	let case = TestCase::new("fn f() -> u32 { -1 } export { f }");
+	let case = TestCase::new("func f() -> u32 { -1 } export { f }");
 	// `-1` is `Unary { InvertSign, Int(1) }` — coerce_untyped_unary_expr
 	// allows InvertSign for any signed numeric target (i8/i16/i32/i64/
 	// f32/f64) but deliberately excludes unsigned targets, so u32
@@ -2412,12 +2387,12 @@ fn test_coerce_negated_literal_to_every_signed_width_and_float() {
 	// used to only accept i32/i64 for `InvertSign`, rejecting `-1`/`-1.5`
 	// coerced to any other signed numeric type.
 	let case = TestCase::new(indoc! {"
-        fn a() -> i8 { -1 }
-        fn b() -> i16 { -1 }
-        fn c() -> i32 { -1 }
-        fn d() -> i64 { -1 }
-        fn e() -> f32 { -1.5 }
-        fn f() -> f64 { -1.5 }
+        func a() -> i8 { -1 }
+        func b() -> i16 { -1 }
+        func c() -> i32 { -1 }
+        func d() -> i64 { -1 }
+        func e() -> f32 { -1.5 }
+        func f() -> f64 { -1.5 }
         export { a, b, c, d, e, f }
     "});
 	no_errors(&case);
@@ -2431,10 +2406,10 @@ fn test_coerce_min_value_literal_for_every_signed_width() {
 	// un-negated magnitude against the ordinary positive-max bound,
 	// wrongly rejecting exactly the most-negative value of each width.
 	let case = TestCase::new(indoc! {"
-        fn a() -> i8 { -128 }
-        fn b() -> i16 { -32768 }
-        fn c() -> i32 { -2147483648 }
-        fn d() -> i64 { -9223372036854775808 }
+        func a() -> i8 { -128 }
+        func b() -> i16 { -32768 }
+        func c() -> i32 { -2147483648 }
+        func d() -> i64 { -9223372036854775808 }
         export { a, b, c, d }
     "});
 	no_errors(&case);
@@ -2442,7 +2417,7 @@ fn test_coerce_min_value_literal_for_every_signed_width() {
 
 #[test]
 fn test_coerce_one_past_min_value_literal_still_out_of_range() {
-	let case = TestCase::new("fn f() -> i8 { -129 } export { f }");
+	let case = TestCase::new("func f() -> i8 { -129 } export { f }");
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::IntegerLiteralOutOfRange),
 		"expected E1004 (out of range) for `-129i8` (one past `i8::MIN`), got: {:?}",
@@ -2461,7 +2436,7 @@ fn test_coerce_u64_max_literal_succeeds() {
 	// `u64::MAX` itself, a purely positive literal with no negation
 	// involved) failed to parse at all.
 	let case =
-		TestCase::new("fn f() -> u64 { 18446744073709551615 } export { f }");
+		TestCase::new("func f() -> u64 { 18446744073709551615 } export { f }");
 	no_errors(&case);
 }
 
@@ -2470,7 +2445,7 @@ fn test_eval_const_expr_double_negated_i64_min_does_not_panic() {
 	// `-(-9223372036854775808)` — the inner negation must fold via
 	// `wrapping_neg` (not a bare `-`, which would panic on `i64::MIN`).
 	let case = TestCase::new(
-		"const X: i64 = -(-9223372036854775808); fn f() -> i64 { X } export { f }",
+		"const X: i64 = -(-9223372036854775808); func f() -> i64 { X } export { f }",
 	);
 	no_errors(&case);
 }
@@ -2595,7 +2570,7 @@ fn test_eval_const_expr_zero_div_zero_folds_to_nan() {
 #[test]
 fn test_f32_nan_infinity_neg_infinity_consts_resolve() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> bool {
+        func f() -> bool {
             f32::NAN != f32::NAN
                 && f32::INFINITY > 0.0
                 && f32::NEG_INFINITY < 0.0
@@ -2608,7 +2583,7 @@ fn test_f32_nan_infinity_neg_infinity_consts_resolve() {
 #[test]
 fn test_f64_nan_infinity_neg_infinity_consts_resolve() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> bool {
+        func f() -> bool {
             f64::NAN != f64::NAN
                 && f64::INFINITY > 0.0
                 && f64::NEG_INFINITY < 0.0
@@ -2619,23 +2594,41 @@ fn test_f64_nan_infinity_neg_infinity_consts_resolve() {
 }
 
 #[test]
-fn test_coerce_int_literal_for_float_type_errors() {
-	// An untyped integer literal cannot be coerced to f32 (must write 1.0)
-	let case = TestCase::new("fn f() -> f32 { 1 } export { f }");
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::LiteralTypeMismatch),
-		"expected E1006 (int literal for float type), got: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
-	);
+fn test_coerce_exact_int_literal_to_float_succeeds() {
+	// An integer literal coerces to a float target when it fits exactly — no
+	// decimal point required. `16777216` is `2^24`: a single set bit, so its
+	// significant span is 1 and it sits comfortably in an f32.
+	let case = TestCase::new(indoc! {"
+        func a() -> f32 { 0 }
+        func b() -> f32 { 1 }
+        func c() -> f64 { 4503599627370496 }
+        func d() -> f32 { 16777216 }
+        export { a, b, c, d }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_coerce_inexact_int_literal_to_float_errors() {
+	// `16777217` (`2^24 + 1`) needs 25 significant bits — not exact in f32.
+	let f32_case = TestCase::new("func f() -> f32 { 16777217 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::IntegerLiteralNotRepresentable
+	));
+
+	// `2^53 + 1` is the same story one width up.
+	let f64_case =
+		TestCase::new("func f() -> f64 { 9007199254740993 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::IntegerLiteralNotRepresentable
+	));
 }
 
 #[test]
 fn test_coerce_int_to_bool_errors() {
-	let case = TestCase::new("fn f() -> bool { 1 } export { f }");
+	let case = TestCase::new("func f() -> bool { 1 } export { f }");
 	// int literal is not coercible to bool — expect E1005 (unable to coerce)
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UnableToCoerce),
@@ -2652,7 +2645,7 @@ fn test_coerce_int_to_bool_errors() {
 
 #[test]
 fn test_coerce_float_to_f32() {
-	let case = TestCase::new("fn f() -> f32 { 3.14 } export { f }");
+	let case = TestCase::new("func f() -> f32 { 3.14 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2666,7 +2659,7 @@ fn test_coerce_float_to_f32() {
 
 #[test]
 fn test_coerce_float_to_f64() {
-	let case = TestCase::new("fn f() -> f64 { 2.718 } export { f }");
+	let case = TestCase::new("func f() -> f64 { 2.718 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2680,7 +2673,7 @@ fn test_coerce_float_to_f64() {
 
 #[test]
 fn test_coerce_float_to_i32_errors() {
-	let case = TestCase::new("fn f() -> i32 { 1.5 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 1.5 } export { f }");
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UnableToCoerce),
 		"expected E1005 (unable to coerce float to i32), got: {:?}",
@@ -2692,11 +2685,94 @@ fn test_coerce_float_to_i32_errors() {
 	);
 }
 
+#[test]
+fn test_scientific_notation_float_values() {
+	// The parser only checks a float token's syntax now; the value is
+	// assembled here, by parsing the source slice against the f64 target.
+	let case = TestCase::new(indoc! {"
+        #[tag = \"a\"] const A: f64 = 1e10;
+        #[tag = \"b\"] const B: f64 = 3.4e2;
+        #[tag = \"c\"] const C: f64 = 1e+5;
+        #[tag = \"d\"] const D: f64 = 1.5e-3;
+        #[tag = \"e\"] const E: f64 = 2E3;
+        export {}
+    "});
+	no_errors(&case);
+	let value_of = |tag: &str| {
+		let key = case.graph.interner.get(tag).unwrap();
+		let def_id = *case.tir.items.tagged_items.get(&key).unwrap();
+		let idx = case.tir.items.expect_const_index(def_id);
+		case.tir.items.constants[usize::from(idx)].const_value
+	};
+	assert_eq!(value_of("a"), Some(ConstValue::Float(1e10)));
+	assert_eq!(value_of("b"), Some(ConstValue::Float(3.4e2)));
+	assert_eq!(value_of("c"), Some(ConstValue::Float(1e5)));
+	assert_eq!(value_of("d"), Some(ConstValue::Float(1.5e-3)));
+	assert_eq!(value_of("e"), Some(ConstValue::Float(2e3)));
+}
+
+#[test]
+fn test_f32_literal_is_rounded_once_at_the_target() {
+	// `0.1` is representable in neither f32 nor f64. The stored value must be
+	// the f32 rounding of the decimal — parsed straight to f32 — not the f64
+	// rounding cast down (which double-rounds for boundary decimals).
+	let case = TestCase::new(indoc! {"
+        #[tag = \"x\"]
+        const X: f32 = 0.1;
+        export {}
+    "});
+	no_errors(&case);
+	let key = case.graph.interner.get("x").unwrap();
+	let def_id = *case.tir.items.tagged_items.get(&key).unwrap();
+	let idx = case.tir.items.expect_const_index(def_id);
+	assert_eq!(
+		case.tir.items.constants[usize::from(idx)].const_value,
+		Some(ConstValue::Float(0.1f32 as f64)),
+	);
+}
+
+#[test]
+fn test_float_literal_overflow_reports_error() {
+	let f32_case = TestCase::new("func f() -> f32 { 1e40 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::FloatLiteralOverflow
+	));
+
+	let f64_case = TestCase::new("func f() -> f64 { 1e400 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::FloatLiteralOverflow
+	));
+}
+
+#[test]
+fn test_float_literal_underflow_reports_error() {
+	let f32_case = TestCase::new("func f() -> f32 { 1e-50 } export { f }");
+	assert!(has_error_code(
+		&f32_case.tir,
+		DiagnosticCode::FloatLiteralUnderflow
+	));
+
+	let f64_case = TestCase::new("func f() -> f64 { 1e-400 } export { f }");
+	assert!(has_error_code(
+		&f64_case.tir,
+		DiagnosticCode::FloatLiteralUnderflow
+	));
+}
+
+#[test]
+fn test_written_zero_float_literal_is_not_underflow() {
+	// `0.0` parses to exactly `0.0` but is a written zero, not an underflow.
+	let case = TestCase::new("func f() -> f32 { 0.0 } export { f }");
+	no_errors(&case);
+}
+
 // ── binary arithmetic coercion ───────────────────────────────────────────
 
 #[test]
 fn test_coerce_binary_arithmetic_i32() {
-	let case = TestCase::new("fn f() -> i32 { 1 + 2 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 1 + 2 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2710,7 +2786,7 @@ fn test_coerce_binary_arithmetic_i32() {
 
 #[test]
 fn test_coerce_binary_bitwise_i32() {
-	let case = TestCase::new("fn f() -> i32 { 10 & 12 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 10 & 12 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2726,7 +2802,7 @@ fn test_coerce_binary_bitwise_i32() {
 /// (`Shl::shl` etc.) via `build_operator_dispatch`, exactly like arithmetic —
 /// which records a go-to-definition / hover access at the operator's own span
 /// against the resolved method. Without it, LSP hover on `<<` finds nothing
-/// while hover on `+` shows `fn shl(...)`.
+/// while hover on `+` shows `func shl(...)`.
 ///
 /// Both operand shapes must work: two concrete operands (`a << b`) and — the
 /// far more common one for a shift — a concrete left with a literal right
@@ -2758,24 +2834,119 @@ fn test_primitive_bitwise_operator_records_access_for_hover() {
 
 	assert!(
 		shl_access_recorded(
-			"fn f(a: u64, b: u64) -> u64 { a << b } export { f }",
+			"func f(a: u64, b: u64) -> u64 { a << b } export { f }",
 			"<<",
 		),
 		"two concrete operands: expected a `Shl::shl` access at the `<<` span"
 	);
 	assert!(
 		shl_access_recorded(
-			"fn f(a: u64) -> u64 { a << 52 } export { f }",
+			"func f(a: u64) -> u64 { a << 52 } export { f }",
 			"<<",
 		),
 		"literal right operand: expected a `Shl::shl` access at the `<<` span"
 	);
 }
 
+/// `==` / `!=` on a primitive still lowers to a native `Binary` node, but the
+/// operator span is recorded as an access against `PartialEq::eq` / `::ne` for
+/// that type, so hover / go-to-definition on `==` works the same as on `+`.
+#[test]
+fn test_primitive_equality_operator_records_access_for_hover() {
+	let access_recorded = |src: &str, op: &str, method: &str| {
+		let case = TestCase::new(src);
+		assert!(
+			case.tir.diagnostics.is_empty(),
+			"unexpected diagnostics for {src:?}: {:?}",
+			case.tir
+				.diagnostics
+				.iter()
+				.map(|d| &d.message)
+				.collect::<Vec<_>>()
+		);
+		let op_start = src.find(op).unwrap() as u32;
+		let method_sym = case.graph.interner.get(method).unwrap();
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == method_sym
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		})
+	};
+
+	assert!(
+		access_recorded(
+			"func f(a: i32, b: i32) -> bool { a == b } export { f }",
+			"==",
+			"eq",
+		),
+		"expected a `PartialEq::eq` access at the `==` span",
+	);
+	assert!(
+		access_recorded(
+			"func f(a: char) -> bool { a != 'x' } export { f }",
+			"!=",
+			"ne",
+		),
+		"expected a `PartialEq::ne` access at the `!=` span",
+	);
+}
+
+/// A typeset-bounded associated type (e.g. `Mem::Size: Sub + Add + Div`,
+/// mirroring `PointerSize: Mul + UnsignedInt`) has no bound implying
+/// `PartialEq`, so `==` must go through the same
+/// `abstract_operand_defers_operator` check arithmetic uses — a typeset bound
+/// alone does not imply comparison is supported.
+#[test]
+fn test_typeset_bounded_assoc_type_equality_without_partial_eq_bound_reports_diagnostic()
+ {
+	let case = TestCase::new(indoc! {"
+        func eq_check<Mem: Memory where { Size: Sub + Add + Div }>(a: Mem::Size, b: Mem::Size) -> bool {
+            a == b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 for `Mem::Size == Mem::Size` with no `PartialEq` bound, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+/// Once the bound actually implies `PartialEq`, `==` on a typeset-bounded
+/// associated type defers to a `GenericMethodCall` (same as `+` on a
+/// `T: Add` type param) and records the operator span as an access against
+/// `PartialEq::eq`, so hover / go-to-definition work.
+#[test]
+fn test_typeset_bounded_assoc_type_equality_with_partial_eq_bound_dispatches_and_records_access()
+ {
+	let src = indoc! {"
+        func eq_check<Mem: Memory where { Size: Sub + Add + Div + PartialEq }>(a: Mem::Size, b: Mem::Size) -> bool {
+            a == b
+        }
+    "};
+	let case = TestCase::new(src);
+	no_errors(&case);
+
+	let op_start = src.find("==").unwrap() as u32;
+	let method_sym = case.graph.interner.get("eq").unwrap();
+	assert!(
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == method_sym
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		}),
+		"expected a `PartialEq::eq` access at the `==` span",
+	);
+}
+
 #[test]
 fn test_primitive_bitwise_compound_assign_operators() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local mut x: i32 = 10;
             x &= 12;
             x |= 3;
@@ -2801,7 +2972,7 @@ fn test_primitive_bitwise_compound_assign_operators() {
 
 #[test]
 fn test_coerce_int_to_i8() {
-	let case = TestCase::new("fn f() -> i8 { 127 } export { f }");
+	let case = TestCase::new("func f() -> i8 { 127 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2815,7 +2986,7 @@ fn test_coerce_int_to_i8() {
 
 #[test]
 fn test_coerce_int_to_u8() {
-	let case = TestCase::new("fn f() -> u8 { 255 } export { f }");
+	let case = TestCase::new("func f() -> u8 { 255 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2829,7 +3000,7 @@ fn test_coerce_int_to_u8() {
 
 #[test]
 fn test_coerce_int_to_i16() {
-	let case = TestCase::new("fn f() -> i16 { 1000 } export { f }");
+	let case = TestCase::new("func f() -> i16 { 1000 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2843,7 +3014,7 @@ fn test_coerce_int_to_i16() {
 
 #[test]
 fn test_coerce_int_to_u16() {
-	let case = TestCase::new("fn f() -> u16 { 65535 } export { f }");
+	let case = TestCase::new("func f() -> u16 { 65535 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2859,7 +3030,7 @@ fn test_coerce_int_to_u16() {
 
 #[test]
 fn test_coerce_binary_arithmetic_f32() {
-	let case = TestCase::new("fn f() -> f32 { 1.5 + 0.5 } export { f }");
+	let case = TestCase::new("func f() -> f32 { 1.5 + 0.5 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2873,7 +3044,7 @@ fn test_coerce_binary_arithmetic_f32() {
 
 #[test]
 fn test_coerce_binary_arithmetic_f64() {
-	let case = TestCase::new("fn f() -> f64 { 1.0 + 2.0 } export { f }");
+	let case = TestCase::new("func f() -> f64 { 1.0 + 2.0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2887,7 +3058,7 @@ fn test_coerce_binary_arithmetic_f64() {
 
 #[test]
 fn test_coerce_binary_float_multiply() {
-	let case = TestCase::new("fn f() -> f64 { 2.0 * 3.0 } export { f }");
+	let case = TestCase::new("func f() -> f64 { 2.0 * 3.0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -2904,7 +3075,7 @@ fn test_coerce_binary_float_multiply() {
 #[test]
 fn test_integer_plus_float_literal_errors() {
 	// 1 is INTEGER, 1.0 is FLOAT — different comptime kinds → type mismatch
-	let case = TestCase::new("fn f() -> i32 { 1 + 1.0 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 1 + 1.0 } export { f }");
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
 		"expected E1001 (type mismatch for INTEGER + FLOAT), got: {:?}",
@@ -2919,7 +3090,7 @@ fn test_integer_plus_float_literal_errors() {
 #[test]
 fn test_float_plus_integer_literal_errors() {
 	// Symmetric: FLOAT on the left, INTEGER on the right
-	let case = TestCase::new("fn f() -> f64 { 1.0 + 1 } export { f }");
+	let case = TestCase::new("func f() -> f64 { 1.0 + 1 } export { f }");
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeMistmatch),
 		"expected E1001 (type mismatch for FLOAT + INTEGER), got: {:?}",
@@ -2936,7 +3107,7 @@ fn test_float_plus_integer_literal_errors() {
 #[test]
 fn test_if_without_else_returning_value_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local x: i32 = if true { 5 };
             x
         }
@@ -2947,7 +3118,7 @@ fn test_if_without_else_returning_value_is_error() {
 #[test]
 fn test_if_without_else_unit_body_is_ok() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             if true { local x: i32 = 1; }
         }
     "});
@@ -2957,7 +3128,7 @@ fn test_if_without_else_unit_body_is_ok() {
 #[test]
 fn test_if_bad_condition_still_checks_branches() {
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             if undefined_var { undefined_then(); } else { undefined_else(); }
         }
     "});
@@ -2987,7 +3158,7 @@ fn test_if_bad_condition_still_checks_branches() {
 #[test]
 fn test_coerce_chained_integer_arithmetic() {
 	// All three literals are INTEGER; type propagates through both additions
-	let case = TestCase::new("fn f() -> i32 { 1 + 2 + 3 } export { f }");
+	let case = TestCase::new("func f() -> i32 { 1 + 2 + 3 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3001,7 +3172,7 @@ fn test_coerce_chained_integer_arithmetic() {
 
 #[test]
 fn test_coerce_chained_float_arithmetic() {
-	let case = TestCase::new("fn f() -> f64 { 1.0 + 2.0 + 3.0 } export { f }");
+	let case = TestCase::new("func f() -> f64 { 1.0 + 2.0 + 3.0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3018,7 +3189,7 @@ fn test_coerce_chained_float_arithmetic() {
 #[test]
 fn test_comptime_right_operand_coerced_by_typed_left() {
 	// x has concrete type i32; literal `1` (INTEGER) on the right gets coerced
-	let case = TestCase::new("fn f(x: i32) -> i32 { x + 1 } export { f }");
+	let case = TestCase::new("func f(x: i32) -> i32 { x + 1 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3033,7 +3204,7 @@ fn test_comptime_right_operand_coerced_by_typed_left() {
 #[test]
 fn test_comptime_left_operand_coerced_by_typed_right() {
 	// literal `1` (INTEGER) on the left, x has concrete type i32 on the right
-	let case = TestCase::new("fn f(x: i32) -> i32 { 1 + x } export { f }");
+	let case = TestCase::new("func f(x: i32) -> i32 { 1 + x } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3047,7 +3218,7 @@ fn test_comptime_left_operand_coerced_by_typed_right() {
 
 #[test]
 fn test_comptime_float_operand_coerced_by_typed_variable() {
-	let case = TestCase::new("fn f(x: f64) -> f64 { x + 1.0 } export { f }");
+	let case = TestCase::new("func f(x: f64) -> f64 { x + 1.0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3064,7 +3235,7 @@ fn test_comptime_float_operand_coerced_by_typed_variable() {
 #[test]
 fn test_comptime_integer_coerced_in_local_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local x: i32 = 1 + 2;
             x
         }
@@ -3084,7 +3255,7 @@ fn test_comptime_integer_coerced_in_local_binding() {
 #[test]
 fn test_comptime_float_coerced_in_local_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> f64 {
+        func f() -> f64 {
             local x: f64 = 1.0 + 2.0;
             x
         }
@@ -3106,7 +3277,7 @@ fn test_comptime_integer_local_missing_annotation_errors() {
 	// No type annotation on the binding and no outer context → type annotation
 	// required
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local x = 1 + 2;
         }
         export { f }
@@ -3127,8 +3298,8 @@ fn test_comptime_integer_local_missing_annotation_errors() {
 #[test]
 fn test_comptime_literal_coerced_by_fn_param_type() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
-        fn f() -> i32 { add(1, 2) }
+        func add(a: i32, b: i32) -> i32 { a + b }
+        func f() -> i32 { add(1, 2) }
         export { f }
     "});
 	assert!(
@@ -3145,8 +3316,8 @@ fn test_comptime_literal_coerced_by_fn_param_type() {
 #[test]
 fn test_comptime_float_literal_coerced_by_fn_param_type() {
 	let case = TestCase::new(indoc! {"
-        fn scale(x: f32, factor: f32) -> f32 { x * factor }
-        fn f(x: f32) -> f32 { scale(x, 2.0) }
+        func scale(x: f32, factor: f32) -> f32 { x * factor }
+        func f(x: f32) -> f32 { scale(x, 2.0) }
         export { f }
     "});
 	assert!(
@@ -3165,7 +3336,7 @@ fn test_comptime_float_literal_coerced_by_fn_param_type() {
 #[test]
 fn test_comptime_integers_standalone_comparison_requires_annotation() {
 	// `1 == 2` has no type context: cannot decide i32.eq vs i64.eq → E1014
-	let case = TestCase::new("fn f() -> bool { 1 == 2 } export { f }");
+	let case = TestCase::new("func f() -> bool { 1 == 2 } export { f }");
 	assert!(
 		has_error_code(
 			&case.tir,
@@ -3183,7 +3354,7 @@ fn test_comptime_integers_standalone_comparison_requires_annotation() {
 #[test]
 fn test_comptime_integer_coerced_by_typed_comparand() {
 	// Typed variable on the left drives coercion of the literal on the right
-	let case = TestCase::new("fn f(x: i32) -> bool { x == 1 } export { f }");
+	let case = TestCase::new("func f(x: i32) -> bool { x == 1 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3197,7 +3368,7 @@ fn test_comptime_integer_coerced_by_typed_comparand() {
 
 #[test]
 fn test_comptime_integer_coerced_by_typed_comparand_on_right() {
-	let case = TestCase::new("fn f(x: i32) -> bool { 1 == x } export { f }");
+	let case = TestCase::new("func f(x: i32) -> bool { 1 == x } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3211,7 +3382,7 @@ fn test_comptime_integer_coerced_by_typed_comparand_on_right() {
 
 #[test]
 fn test_comptime_float_coerced_by_typed_comparand() {
-	let case = TestCase::new("fn f(x: f64) -> bool { x < 1.0 } export { f }");
+	let case = TestCase::new("func f(x: f64) -> bool { x < 1.0 } export { f }");
 	assert!(
 		case.tir.diagnostics.is_empty(),
 		"{:?}",
@@ -3228,7 +3399,7 @@ fn test_comptime_integer_vs_float_comparison_errors() {
 	// When both sides are comptime numbers (INTEGER and FLOAT), the comparison
 	// builder emits E1014 (ComparisonTypeAnnotationRequired) since neither side
 	// has a concrete type to drive resolution.
-	let case = TestCase::new("fn f() -> bool { 1 == 1.0 } export { f }");
+	let case = TestCase::new("func f() -> bool { 1 == 1.0 } export { f }");
 	assert!(
 		has_error_code(
 			&case.tir,
@@ -3254,7 +3425,7 @@ fn test_struct_valid_init() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ x: 1, y: 2 }
         }
 
@@ -3281,7 +3452,7 @@ fn test_struct_shorthand_init() {
             pub y: i32,
         }
 
-        fn make(x: i32, y: i32) -> Point {
+        func make(x: i32, y: i32) -> Point {
             Point::{ x, y }
         }
 
@@ -3307,7 +3478,7 @@ fn test_struct_init_out_of_order() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ y: 2, x: 1 }
         }
 
@@ -3350,7 +3521,7 @@ fn test_struct_duplicate_field_definition() {
 #[test]
 fn test_struct_init_undeclared_name() {
 	let case = TestCase::new(indoc! {"
-        fn main() {
+        func main() {
             Unknown::{ }
         }
 
@@ -3376,7 +3547,7 @@ fn test_struct_init_unknown_field() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ x: 1, y: 2, z: 3 }
         }
 
@@ -3404,7 +3575,7 @@ fn test_struct_init_duplicate_field() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ x: 1, y: 2, x: 3 }
         }
 
@@ -3435,7 +3606,7 @@ fn test_struct_init_missing_fields() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ x: 1 }
         }
 
@@ -3462,7 +3633,7 @@ fn test_struct_init_errored_field_not_reported_as_missing() {
             pub y: i32,
         }
 
-        fn make() -> Point {
+        func make() -> Point {
             Point::{ x: true, y: 2 }
         }
 
@@ -3499,7 +3670,7 @@ fn test_structs() {
             pub len: u32,
         }
 
-        fn main() -> str {
+        func main() -> str {
             str::{ ptr: 0, ptr: 10 }
         }
 
@@ -3514,7 +3685,7 @@ fn test_structs() {
 #[test]
 fn test_stdlib_types_available() {
 	let case = TestCase::new(indoc! {"
-        fn is_lower(c: char) -> bool {
+        func is_lower(c: char) -> bool {
             c >= 'a' && c <= 'z'
         }
 
@@ -3538,7 +3709,7 @@ fn test_stdlib_types_available() {
 #[test]
 fn test_char_arithmetic_requires_explicit_cast() {
 	let case = TestCase::new(indoc! {"
-        fn shift(c: char) -> char {
+        func shift(c: char) -> char {
             ((c as u8) - 32) as char
         }
 
@@ -3563,7 +3734,7 @@ fn test_char_arithmetic_requires_explicit_cast() {
 #[test]
 fn test_char_arithmetic_without_cast_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn shift(c: char) -> char {
+        func shift(c: char) -> char {
             c - 32
         }
 
@@ -3593,12 +3764,12 @@ fn test_method_accessed_as_field_is_error() {
         }
 
         impl Point {
-            pub fn area(self) -> i32 {
+            pub func area(self) -> i32 {
                 self.x
             }
         }
 
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             p.area
         }
 
@@ -3619,7 +3790,7 @@ fn test_method_accessed_as_field_is_error() {
 #[test]
 fn test_stdlib_method_callable() {
 	let case = TestCase::new(indoc! {"
-        fn uppercase(c: char) -> char {
+        func uppercase(c: char) -> char {
             c.to_ascii_uppercase()
         }
 
@@ -3644,16 +3815,16 @@ fn test_impl_members_registered() {
         struct Signed { value: i32 }
 
         impl Signed {
-            pub fn magnitude(self) -> i32 {
+            pub func magnitude(self) -> i32 {
                 if self.value < 0 { -self.value } else { self.value }
             }
 
-            pub fn from_flag(b: bool) -> i32 {
+            pub func from_flag(b: bool) -> i32 {
                 if b { 1 } else { 0 }
             }
         }
 
-        fn use_them(x: i32, b: bool) -> i32 {
+        func use_them(x: i32, b: bool) -> i32 {
             Signed::{ value: x }.magnitude() + Signed::from_flag(b)
         }
 
@@ -3697,7 +3868,7 @@ fn test_impl_members_registered() {
 		.expect("method missing from members");
 	let assoc_fn_entry = members
 		.get(&assoc_fn_sym)
-		.expect("assoc fn missing from members");
+		.expect("assoc func missing from members");
 
 	assert!(
 		matches!(method_entry, ImplEntry::Method(_)),
@@ -3706,7 +3877,7 @@ fn test_impl_members_registered() {
 	);
 	assert!(
 		matches!(assoc_fn_entry, ImplEntry::AssocFunction(_)),
-		"assoc fn should be ImplEntry::AssociatedFn, got {:?}",
+		"assoc func should be ImplEntry::AssociatedFn, got {:?}",
 		assoc_fn_entry
 	);
 
@@ -3723,21 +3894,21 @@ fn test_impl_members_registered() {
 	);
 	assert!(
 		(usize::from(assoc_fn_idx)) < case.tir.items.functions.len(),
-		"assoc fn func_index out of bounds"
+		"assoc func func_index out of bounds"
 	);
 }
 
-/// `pub fn` on a user-defined function suppresses the unused warning.
+/// `pub func` on a user-defined function suppresses the unused warning.
 #[test]
 fn test_pub_fn_no_unused_warning() {
 	let case = TestCase::new(indoc! {"
-        pub fn helper() -> i32 {
+        pub func helper() -> i32 {
             42
         }
     "});
 	assert!(
 		case.tir.diagnostics.is_empty(),
-		"expected no diagnostics for pub fn, got: {:?}",
+		"expected no diagnostics for pub func, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -3758,7 +3929,7 @@ fn test_struct_fields_kept_in_declaration_order() {
             d: f64,
         }
 
-        fn dummy(m: Mixed) -> Mixed { m }
+        func dummy(m: Mixed) -> Mixed { m }
         export { dummy }
     "});
 	eprintln!(
@@ -3792,12 +3963,15 @@ fn test_struct_fields_kept_in_declaration_order() {
 			}
 		})
 		.unwrap();
-	let field_names: Vec<&str> = case.tir.items.structs
-		[usize::from(struct_index)]
-	.fields
-	.iter()
-	.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
-	.collect();
+	let StructKind::Record { fields, .. } =
+		&case.tir.items.structs[usize::from(struct_index)].fields
+	else {
+		panic!("expected record struct")
+	};
+	let field_names: Vec<&str> = fields
+		.iter()
+		.map(|f| case.graph.interner.resolve(f.name.inner).unwrap())
+		.collect();
 	assert_eq!(field_names, vec!["a", "b", "c", "d"]);
 }
 
@@ -3805,7 +3979,7 @@ fn test_struct_fields_kept_in_declaration_order() {
 #[test]
 fn test_non_pub_fn_unused_warning() {
 	let case = TestCase::new(indoc! {"
-        fn unused() -> i32 {
+        func unused() -> i32 {
             42
         }
     "});
@@ -3825,7 +3999,7 @@ fn test_module_fn_no_unused_warning() {
 	let case = TestCase::new(indoc! {"
         mod math {
             #[intrinsic]
-            fn add(a: i32, b: i32) -> i32;
+            func add(a: i32, b: i32) -> i32;
         }
     "});
 	assert!(
@@ -3924,7 +4098,7 @@ fn test_memory_unresolved_kind_does_not_panic() {
 	// anything referenced it.
 	let case = TestCase::new(indoc! {"
         memory MEM: NoSuchTrait where { Size = u32 };
-        pub fn f() -> u32 { MEM::INDEX }
+        pub func f() -> u32 { MEM::INDEX }
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -3935,9 +4109,9 @@ fn test_memory_unresolved_kind_does_not_panic() {
 
 #[test]
 fn test_fn_declaration_without_body_is_error() {
-	// A bare `fn` with no body and no #[intrinsic] must produce E0011.
+	// A bare `func` with no body and no #[intrinsic] must produce E0011.
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32
+        func add(a: i32, b: i32) -> i32
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -3953,7 +4127,7 @@ fn test_memory_index_const_resolves() {
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        pub fn f() -> u32 { MEM::INDEX }
+        pub func f() -> u32 { MEM::INDEX }
     "},
 		&[],
 	);
@@ -3968,6 +4142,54 @@ fn test_memory_index_const_resolves() {
 	);
 }
 
+/// A memory's synthetic `impl Memory for <mem>` is built in two passes:
+/// associated types first, then the impl is registered, then everything whose
+/// declared type may name one of them. `const PAGE_SIZE: Self::Size` is that
+/// second kind — substituting `Self` leaves a projection that resolves
+/// through `find_trait_impl`, which cannot see an impl that isn't registered
+/// yet. Build it in one pass and `PAGE_SIZE`'s type comes out `ERROR`.
+#[test]
+fn test_memory_impl_resolves_self_projections_in_its_own_members() {
+	let case = TestCase::new(indoc! {"
+        memory MEM: Memory where { Size = u32 };
+        pub func f() -> MEM::Size { MEM::PAGE_SIZE }
+    "});
+	no_errors(&case);
+	let memory_impl = case
+		.tir
+		.items
+		.trait_impls
+		.iter()
+		.find(|imp| {
+			matches!(
+				case.tir.types.resolve(imp.target.inner),
+				Type::Memory { .. }
+			)
+		})
+		.expect("a memory declaration synthesizes a trait impl");
+	let member = |wanted: &str| {
+		memory_impl
+			.members
+			.iter()
+			.find(|(name, _)| {
+				case.graph.interner.resolve(**name) == Some(wanted)
+			})
+			.map(|(_, entry)| *entry)
+	};
+	assert!(
+		matches!(member("Size"), Some(ImplEntry::AssocType(_))),
+		"the impl must carry its associated types",
+	);
+	let Some(ImplEntry::AssocConstant(index)) = member("PAGE_SIZE") else {
+		panic!("expected a specialized `PAGE_SIZE` constant");
+	};
+	assert_eq!(
+		case.tir.items.constants[usize::from(index)].ty.inner,
+		TypeIndex::U32,
+		"`Self::Size` must have resolved to this memory's size, not `ERROR`",
+	);
+}
+
 #[test]
 fn test_memory_size_call_resolves() {
 	// `.size_pages()` is a method from the Memory trait; calling it should
@@ -3976,7 +4198,7 @@ fn test_memory_size_call_resolves() {
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        pub fn f() { _ = MEM.size_pages(); }
+        pub func f() { _ = MEM.size_pages(); }
     "},
 		&[],
 	);
@@ -3999,7 +4221,7 @@ fn test_memory_grow_call_resolves() {
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        pub fn f() { _ = MEM.grow(1); }
+        pub func f() { _ = MEM.grow(1); }
     "},
 		&[],
 	);
@@ -4020,7 +4242,7 @@ fn test_memory_unknown_member_is_error() {
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        fn f() { _ = MEM::pages; }
+        func f() { _ = MEM::pages; }
     "},
 		&[],
 	);
@@ -4039,7 +4261,7 @@ fn test_memory_as_value_in_expression() {
 		"main.wx",
 		indoc! {"
         memory MEM: Memory where { Size = u32 };
-        fn f() { _ = MEM; }
+        func f() { _ = MEM; }
     "},
 		&[],
 	);
@@ -4057,7 +4279,7 @@ fn test_memory_as_value_in_expression() {
 fn test_impl_trait_for_type_registers_trait_impl() {
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point {
@@ -4066,7 +4288,7 @@ fn test_impl_trait_for_type_registers_trait_impl() {
         }
 
         impl Drawable for Point {
-            fn draw(self) {
+            func draw(self) {
                 unreachable
             }
         }
@@ -4170,20 +4392,20 @@ fn test_inherent_method_wins_over_same_named_trait_method() {
 	// diagnostic, exactly like Rust's inherent-shadows-trait rule.
 	let case = TestCase::new(indoc! {"
         trait Greeter {
-            fn greet(self) -> i32;
+            func greet(self) -> i32;
         }
 
         struct Foo {}
 
         impl Foo {
-            pub fn greet(self) -> i32 { 1 }
+            pub func greet(self) -> i32 { 1 }
         }
 
         impl Greeter for Foo {
-            fn greet(self) -> i32 { 2 }
+            func greet(self) -> i32 { 2 }
         }
 
-        fn use_it(f: Foo) -> i32 {
+        func use_it(f: Foo) -> i32 {
             f.greet()
         }
 
@@ -4211,14 +4433,14 @@ fn test_single_applicable_trait_method_resolves_without_ambiguity() {
 	// cleanly via the bodied trait default, with no ambiguity diagnostic.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32 { 1 }
+            func foo(self) -> i32 { 1 }
         }
 
         struct S {}
 
         impl A for S {}
 
-        fn use_it(s: S) -> i32 {
+        func use_it(s: S) -> i32 {
             s.foo()
         }
 
@@ -4246,24 +4468,24 @@ fn test_two_trait_impls_with_colliding_method_name_is_ambiguous() {
 	// `s.foo()` cannot pick one without disambiguation.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
 
         trait B {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
 
         struct S {}
 
         impl A for S {
-            fn foo(self) -> i32 { 1 }
+            func foo(self) -> i32 { 1 }
         }
 
         impl B for S {
-            fn foo(self) -> i32 { 2 }
+            func foo(self) -> i32 { 2 }
         }
 
-        fn use_it(s: S) -> i32 {
+        func use_it(s: S) -> i32 {
             s.foo()
         }
 
@@ -4289,28 +4511,28 @@ fn test_qualified_path_expression_disambiguates_trait_method() {
 	// meant, so neither call should be ambiguous.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
 
         trait B {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
 
         struct S {}
 
         impl A for S {
-            fn foo(self) -> i32 { 1 }
+            func foo(self) -> i32 { 1 }
         }
 
         impl B for S {
-            fn foo(self) -> i32 { 2 }
+            func foo(self) -> i32 { 2 }
         }
 
-        fn use_a(s: S) -> i32 {
+        func use_a(s: S) -> i32 {
             <S as A>::foo(s)
         }
 
-        fn use_b(s: S) -> i32 {
+        func use_b(s: S) -> i32 {
             <S as B>::foo(s)
         }
 
@@ -4341,10 +4563,10 @@ fn test_qualified_path_type_position_assoc_type_projection() {
         impl Unsigned for u32 {
             type Signed = i32;
         }
-        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+        func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
             unreachable
         }
-        fn grow_concrete(mem: Mem32, delta: u32) -> i32 {
+        func grow_concrete(mem: Mem32, delta: u32) -> i32 {
             grow(mem, delta)
         }
         export { grow_concrete }
@@ -4360,10 +4582,10 @@ fn test_qualified_path_trait_not_implemented_is_error() {
 	// undeclared-item error.
 	let case = TestCase::new(indoc! {"
         trait Greeter {
-            fn greet(self) -> u32;
+            func greet(self) -> u32;
         }
         struct Empty {}
-        fn use_it(e: Empty) -> u32 {
+        func use_it(e: Empty) -> u32 {
             <Empty as Greeter>::greet(e)
         }
         export { use_it }
@@ -4387,13 +4609,13 @@ fn test_qualified_path_no_such_member_is_error() {
 	// fallback already uses.
 	let case = TestCase::new(indoc! {"
         trait Other {
-            fn shout(self) -> u32;
+            func shout(self) -> u32;
         }
         struct Thing {}
         impl Other for Thing {
-            fn shout(self) -> u32 { 3 }
+            func shout(self) -> u32 { 3 }
         }
-        fn use_it(t: Thing) -> u32 {
+        func use_it(t: Thing) -> u32 {
             <Thing as Other>::greet(t)
         }
         export { use_it }
@@ -4417,12 +4639,12 @@ fn test_qualified_path_type_param_not_bound_is_error() {
 	// `Type::TypeParam` branch rather than the concrete-type one.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
         trait B {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
-        fn use_it<T: A>(x: T) -> i32 {
+        func use_it<T: A>(x: T) -> i32 {
             <T as B>::foo(x)
         }
         export { }
@@ -4454,7 +4676,7 @@ fn test_qualified_path_trait_not_satisfied_span_covers_bracket_only() {
         trait Memory {
             type Size;
         }
-        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+        func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
             unreachable
         }
         export { }
@@ -4498,14 +4720,14 @@ fn test_qualified_path_grouped_form_resolves_like_unqualified_path() {
 	let case = TestCase::new(indoc! {"
         trait Container {
             type Item;
-            fn get(self) -> Self::Item;
+            func get(self) -> Self::Item;
         }
         struct Boxed {}
         impl Container for Boxed {
             type Item = u32;
-            fn get(self) -> u32 { 42 }
+            func get(self) -> u32 { 42 }
         }
-        fn use_it<T: Container>(x: T) -> <T>::Item {
+        func use_it<T: Container>(x: T) -> <T>::Item {
             <T>::get(x)
         }
         export { }
@@ -4532,7 +4754,7 @@ fn test_qualified_path_assoc_type_projection_recovers_type_despite_unsatisfied_b
         trait Container {
             type Item;
         }
-        fn f<Mem: Container>(mem: Mem, delta: Mem::Item) -> <Mem::Item as Converter>::Output {
+        func f<Mem: Container>(mem: Mem, delta: Mem::Item) -> <Mem::Item as Converter>::Output {
             unreachable
         }
         export { }
@@ -4602,7 +4824,7 @@ fn test_qualified_path_assoc_type_on_bound_type_param_resolves() {
         trait A {
             type Item;
         }
-        fn use_it<T: A>(x: T) -> <T as A>::Item {
+        func use_it<T: A>(x: T) -> <T as A>::Item {
             unreachable
         }
         export { }
@@ -4634,12 +4856,12 @@ fn test_qualified_path_type_param_not_bound_recovers_type() {
 	// `Item` assoc type — `<T as B>::Item` should still recover that shape.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
         trait B {
             type Item;
         }
-        fn use_it<T: A>(x: T) -> <T as B>::Item {
+        func use_it<T: A>(x: T) -> <T as B>::Item {
             unreachable
         }
         export { }
@@ -4681,13 +4903,13 @@ fn test_qualified_path_no_such_member_does_not_recover() {
 	// for a name that was never declared anywhere.
 	let case = TestCase::new(indoc! {"
         trait Other {
-            fn shout(self) -> u32;
+            func shout(self) -> u32;
         }
         struct Thing {}
         impl Other for Thing {
-            fn shout(self) -> u32 { 3 }
+            func shout(self) -> u32 { 3 }
         }
-        fn use_it(t: Thing) -> <Thing as Other>::Nope {
+        func use_it(t: Thing) -> <Thing as Other>::Nope {
             unreachable
         }
         export { }
@@ -4725,11 +4947,11 @@ fn test_ambiguity_between_explicit_override_and_bodied_default() {
 	// from candidacy.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32 { 1 }
+            func foo(self) -> i32 { 1 }
         }
 
         trait B {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
 
         struct S {}
@@ -4737,10 +4959,10 @@ fn test_ambiguity_between_explicit_override_and_bodied_default() {
         impl A for S {}
 
         impl B for S {
-            fn foo(self) -> i32 { 2 }
+            func foo(self) -> i32 { 2 }
         }
 
-        fn use_it(s: S) -> i32 {
+        func use_it(s: S) -> i32 {
             s.foo()
         }
 
@@ -4774,10 +4996,10 @@ fn test_generic_inherent_impl_repeated_type_param_rejects_inconsistent_receiver(
         struct Pair<A, B> { a: A, b: B }
 
         impl<T> Pair<T, T> {
-            fn foo(self) {}
+            func foo(self) {}
         }
 
-        fn use_it(p: Pair<i32, bool>) {
+        func use_it(p: Pair<i32, bool>) {
             p.foo()
         }
 
@@ -4815,14 +5037,14 @@ fn test_overlapping_generic_inherent_impls_cannot_share_a_member_name() {
         struct Pair<A, B> { a: A, b: B }
 
         impl<T> Pair<T, T> {
-            fn foo(self) {}
+            func foo(self) {}
         }
 
         impl<A, B> Pair<A, B> {
-            fn foo(self) -> i32 { 1 }
+            func foo(self) -> i32 { 1 }
         }
 
-        fn use_it(p: Pair<i32, bool>) -> i32 {
+        func use_it(p: Pair<i32, bool>) -> i32 {
             p.foo()
         }
 
@@ -4845,14 +5067,14 @@ fn test_disjoint_generic_inherent_impls_may_share_a_member_name() {
         struct Box<T> { v: T }
 
         impl Box<i32> {
-            pub fn get(self) -> i32 { self.v }
+            pub func get(self) -> i32 { self.v }
         }
 
         impl Box<bool> {
-            pub fn get(self) -> bool { self.v }
+            pub func get(self) -> bool { self.v }
         }
 
-        fn use_it(a: Box<i32>, b: Box<bool>) -> i32 {
+        func use_it(a: Box<i32>, b: Box<bool>) -> i32 {
             if b.get() { a.get() } else { 0 }
         }
 
@@ -4871,14 +5093,14 @@ fn test_inherent_impls_in_separate_blocks_conflict_without_a_call_site() {
         struct Deg { value: i32 }
 
         impl Deg {
-            pub fn turns(self) -> i32 { self.value }
+            pub func turns(self) -> i32 { self.value }
         }
 
         impl Deg {
-            pub fn turns(self) -> bool { true }
+            pub func turns(self) -> bool { true }
         }
 
-        fn use_it(d: Deg) -> i32 { d.value }
+        func use_it(d: Deg) -> i32 { d.value }
 
         export { use_it }
     "});
@@ -4898,14 +5120,14 @@ fn test_generic_inherent_impl_blanket_conflicts_with_a_concrete_block() {
         struct Box<T> { v: T }
 
         impl<T> Box<T> {
-            pub fn get(self) -> T { self.v }
+            pub func get(self) -> T { self.v }
         }
 
         impl Box<i32> {
-            pub fn get(self) -> i32 { self.v }
+            pub func get(self) -> i32 { self.v }
         }
 
-        fn use_it(a: Box<i32>) -> i32 { a.v }
+        func use_it(a: Box<i32>) -> i32 { a.v }
 
         export { use_it }
     "});
@@ -4930,12 +5152,12 @@ fn test_generic_inherent_impl_bound_violation_rejects_receiver() {
         struct Box<T> { value: T }
 
         impl<T: Numeric> Box<T> {
-            fn get(self) -> T { self.value }
+            func get(self) -> T { self.value }
         }
 
         struct NotNumeric {}
 
-        fn use_it(b: Box<NotNumeric>) -> NotNumeric {
+        func use_it(b: Box<NotNumeric>) -> NotNumeric {
             b.get()
         }
 
@@ -4963,13 +5185,13 @@ fn test_generic_inherent_impl_bound_violation_rejects_receiver() {
 fn test_impl_trait_function_origin_is_trait_impl() {
 	let case = TestCase::new(indoc! {"
         trait Greet {
-            fn hello(self);
+            func hello(self);
         }
 
         struct Foo {}
 
         impl Greet for Foo {
-            fn hello(self) {
+            func hello(self) {
                 unreachable
             }
         }
@@ -5012,7 +5234,7 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 }
 
 /// Regression test: a method declared with its own generic type param
-/// (`fn write<Mem: Memory>(...)`, distinct from any impl-level type param)
+/// (`func write<Mem: Memory>(...)`, distinct from any impl-level type param)
 /// previously failed to resolve that param when the method lived inside a
 /// `impl Trait for Type { .. }` block — `AstNodeRef::TraitImplFunction`
 /// hardcoded the new `Function`'s own `type_params` to empty and skipped
@@ -5024,7 +5246,7 @@ fn test_impl_trait_function_origin_is_trait_impl() {
 fn test_trait_impl_method_with_own_generic_type_param_resolves() {
 	let case = TestCase::new(indoc! {"
         trait Hasher {
-            fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
+            func write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
         }
 
         struct DefaultHasher {
@@ -5032,7 +5254,7 @@ fn test_trait_impl_method_with_own_generic_type_param_resolves() {
         }
 
         impl Hasher for DefaultHasher {
-            fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]) {
+            func write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]) {
                 unreachable
             }
         }
@@ -5052,10 +5274,10 @@ fn test_self_keyword_recorded_in_impl_block_self_accesses() {
 	let case = TestCase::new(indoc! {"
         struct Foo {}
         impl Foo {
-            fn make() -> Self {
+            func make() -> Self {
                 Self::{}
             }
-            fn other() -> Self {
+            func other() -> Self {
                 Self::make()
             }
         }
@@ -5093,16 +5315,16 @@ fn test_self_keyword_recorded_in_impl_block_self_accesses() {
 fn test_self_keyword_recorded_in_trait_impl_self_accesses() {
 	let case = TestCase::new(indoc! {"
         trait Greet {
-            fn make() -> Self;
-            fn other() -> Self;
+            func make() -> Self;
+            func other() -> Self;
         }
         #[tag = \"target\"]
         struct Foo {}
         impl Greet for Foo {
-            fn make() -> Self {
+            func make() -> Self {
                 Self::{}
             }
-            fn other() -> Self {
+            func other() -> Self {
                 Self::make()
             }
         }
@@ -5221,7 +5443,7 @@ fn test_private_module_item_not_visible_via_wildcard_import() {
             const SECRET: i32 = 1;
         }
         use foo::*;
-        fn f() -> i32 {
+        func f() -> i32 {
             SECRET
         }
         export { }
@@ -5244,7 +5466,7 @@ fn test_pub_module_item_visible_via_wildcard_import() {
             pub const PUBLIC: i32 = 1;
         }
         use foo::*;
-        fn f() -> i32 {
+        func f() -> i32 {
             PUBLIC
         }
         export { f }
@@ -5269,7 +5491,7 @@ fn test_private_module_item_not_visible_via_qualified_path() {
         mod foo {
             const SECRET: i32 = 1;
         }
-        fn f() -> i32 {
+        func f() -> i32 {
             foo::SECRET
         }
         export { }
@@ -5291,7 +5513,7 @@ fn test_pub_module_item_visible_via_qualified_path() {
         mod foo {
             pub const PUBLIC: i32 = 1;
         }
-        fn f() -> i32 {
+        func f() -> i32 {
             foo::PUBLIC
         }
         export { f }
@@ -5318,13 +5540,13 @@ fn test_private_item_visible_to_descendant_module_not_to_ancestor() {
             const SECRET: i32 = 1;
 
             mod bar {
-                pub fn uses_secret() -> i32 {
+                pub func uses_secret() -> i32 {
                     foo::SECRET
                 }
             }
         }
 
-        fn ancestor_access() -> i32 {
+        func ancestor_access() -> i32 {
             foo::SECRET
         }
 
@@ -5358,8 +5580,8 @@ fn test_trait_default_body_referencing_sibling_method_does_not_panic() {
 	// in global_symbol_to_expression.
 	let _case = TestCase::new(indoc! {"
         trait Counter {
-            fn step() -> i32;
-            fn doubled() -> i32 { step() + step() }
+            func step() -> i32;
+            func doubled() -> i32 { step() + step() }
         }
     "});
 	// Test passes as long as it does not panic.
@@ -5375,10 +5597,10 @@ fn test_method_call_on_self_less_trait_fn_reports_not_a_method() {
 	// `signature.params()[1..]` with an empty params list and panicked.
 	let case = TestCase::new(indoc! {"
         trait Reserve {
-            fn reserve() -> i32;
+            func reserve() -> i32;
         }
 
-        fn use_it<T: Reserve>(x: T) -> i32 {
+        func use_it<T: Reserve>(x: T) -> i32 {
             x.reserve()
         }
     "});
@@ -5404,7 +5626,7 @@ fn test_trait_conformance_missing_fn() {
 	// impl block omits the required abstract method → E1033
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point {
@@ -5434,15 +5656,15 @@ fn test_trait_impl_item_not_declared_by_trait() {
 	// additions to the type.
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point { x: i32 }
 
         impl Drawable for Point {
-            fn draw(self) {}
+            func draw(self) {}
 
-            fn hide(self) {}
+            func hide(self) {}
 
             const SCALE: i32 = 2;
         }
@@ -5471,18 +5693,18 @@ fn test_trait_impl_duplicate_member_keeps_the_first() {
 	// proves the survivor: had the later `bool` won, the call would not.
 	let case = TestCase::new(indoc! {"
         trait Angle {
-            fn turns(self) -> i32;
+            func turns(self) -> i32;
         }
 
         struct Deg { value: i32 }
 
         impl Angle for Deg {
-            fn turns(self) -> i32 { self.value }
+            func turns(self) -> i32 { self.value }
 
-            fn turns(self) -> bool { true }
+            func turns(self) -> bool { true }
         }
 
-        fn use_it(d: Deg) -> i32 { d.turns() }
+        func use_it(d: Deg) -> i32 { d.turns() }
 
         export { use_it }
     "});
@@ -5508,16 +5730,16 @@ fn test_inherent_impl_duplicate_member_keeps_the_first() {
         struct Deg { value: i32 }
 
         impl Deg {
-            pub fn turns(self) -> i32 { self.value }
+            pub func turns(self) -> i32 { self.value }
 
-            pub fn turns(self) -> bool { true }
+            pub func turns(self) -> bool { true }
 
             pub const SCALE: i32 = 1;
 
             pub const SCALE: bool = true;
         }
 
-        fn use_it(d: Deg) -> i32 { d.turns() }
+        func use_it(d: Deg) -> i32 { d.turns() }
 
         export { use_it }
     "});
@@ -5542,7 +5764,7 @@ fn test_inherent_impl_duplicate_member_keeps_the_first() {
 fn test_trait_impl_item_of_the_wrong_kind_does_not_satisfy_the_requirement() {
 	let case = TestCase::new(indoc! {"
         trait Angle {
-            fn turns(self) -> i32;
+            func turns(self) -> i32;
         }
 
         struct Deg { value: i32 }
@@ -5570,13 +5792,13 @@ fn test_trait_impl_item_of_the_wrong_kind_does_not_satisfy_the_requirement() {
 fn test_trait_impl_may_drop_the_receiver_without_a_membership_error() {
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point { x: i32 }
 
         impl Drawable for Point {
-            fn draw() {}
+            func draw() {}
         }
     "});
 	assert!(
@@ -5598,11 +5820,11 @@ fn test_trait_impl_method_return_type_mismatch_is_error() {
 	// unit).
 	let case = TestCase::new(indoc! {"
         trait T {
-            fn foo(b: i32, d: i32, o: i32) -> i32;
+            func foo(b: i32, d: i32, o: i32) -> i32;
         }
         struct X {}
         impl T for X {
-            fn foo(b: i32, d: i32, o: i32) {}
+            func foo(b: i32, d: i32, o: i32) {}
         }
     "});
 	assert!(
@@ -5616,11 +5838,11 @@ fn test_trait_impl_method_return_type_mismatch_is_error() {
 fn test_trait_impl_method_param_type_mismatch_is_error() {
 	let case = TestCase::new(indoc! {"
         trait T {
-            fn foo(x: i32);
+            func foo(x: i32);
         }
         struct X {}
         impl T for X {
-            fn foo(x: bool) {}
+            func foo(x: bool) {}
         }
     "});
 	assert!(
@@ -5652,11 +5874,11 @@ fn test_trait_impl_assoc_const_type_mismatch_is_error() {
 fn test_trait_impl_method_matching_signature_no_error() {
 	let case = TestCase::new(indoc! {"
         trait T {
-            fn foo(x: i32, y: bool) -> i32;
+            func foo(x: i32, y: bool) -> i32;
         }
         struct X {}
         impl T for X {
-            fn foo(x: i32, y: bool) -> i32 { x }
+            func foo(x: i32, y: bool) -> i32 { x }
         }
     "});
 	no_errors(&case);
@@ -5669,11 +5891,11 @@ fn test_trait_impl_method_own_generic_param_alpha_equivalent_no_error() {
 	// a `TypeParam` mismatch.
 	let case = TestCase::new(indoc! {"
         trait Container {
-            fn wrap<T>(self, value: T) -> T;
+            func wrap<T>(self, value: T) -> T;
         }
         struct X {}
         impl Container for X {
-            fn wrap<U>(self, value: U) -> U { value }
+            func wrap<U>(self, value: U) -> U { value }
         }
     "});
 	no_errors(&case);
@@ -5693,12 +5915,12 @@ fn test_trait_impl_method_self_type_projection_matching_no_error() {
         impl Bound for u32 {}
         trait Container {
             type Elem: Bound;
-            fn first(self) -> Self::Elem;
+            func first(self) -> Self::Elem;
         }
         struct X {}
         impl Container for X {
             type Elem = u32;
-            fn first(self) -> u32 { 0 }
+            func first(self) -> u32 { 0 }
         }
     "});
 	no_errors(&case);
@@ -5717,7 +5939,7 @@ fn test_nested_assoc_type_projection_mismatch_is_detected() {
 
         trait Outer {
             type Mid: Inner;
-            fn f(self) -> Self::Mid::Out;
+            func f(self) -> Self::Mid::Out;
         }
 
         struct M {}
@@ -5726,7 +5948,7 @@ fn test_nested_assoc_type_projection_mismatch_is_detected() {
         struct X {}
         impl Outer for X {
             type Mid = M;
-            fn f(self) -> bool { true }
+            func f(self) -> bool { true }
         }
     "});
 	assert!(
@@ -5751,7 +5973,7 @@ fn test_nested_assoc_type_projection_match_is_accepted() {
 
         trait Outer {
             type Mid: Inner;
-            fn f(self) -> Self::Mid::Out;
+            func f(self) -> Self::Mid::Out;
         }
 
         struct M {}
@@ -5760,7 +5982,7 @@ fn test_nested_assoc_type_projection_match_is_accepted() {
         struct X {}
         impl Outer for X {
             type Mid = M;
-            fn f(self) -> i32 { 0 }
+            func f(self) -> i32 { 0 }
         }
     "});
 	no_errors(&case);
@@ -5776,11 +5998,11 @@ fn test_impl_side_projection_normalizes_against_concrete_trait_return_type() {
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
         trait T {
-            fn f<U: Inner where { Out = i32 }>(u: U) -> i32;
+            func f<U: Inner where { Out = i32 }>(u: U) -> i32;
         }
         struct X {}
         impl T for X {
-            fn f<V: Inner where { Out = i32 }>(v: V) -> V::Out { unreachable }
+            func f<V: Inner where { Out = i32 }>(v: V) -> V::Out { unreachable }
         }
     "});
 	no_errors(&case);
@@ -5793,7 +6015,7 @@ fn test_recursive_same_impl_nonidentity_binding_is_detected() {
 	// for the outer `::Value` against `Next`'s hardcoded `Wrap<i32>` (a
 	// *non-identity* binding, `T` -> `i32`). Both land on the same interned
 	// `(T,)`, but the trait side's is under an env where `T` means `i32`
-	// while the impl's own `fn f(self) -> (T,)` is under the root env where
+	// while the impl's own `func f(self) -> (T,)` is under the root env where
 	// `T` is the impl's free parameter. `compare`'s fast path must reject
 	// them as equal — index match, env mismatch — and let structural
 	// comparison find that `(i32,)` != `(T,)`.
@@ -5801,7 +6023,7 @@ fn test_recursive_same_impl_nonidentity_binding_is_detected() {
         trait C {
             type Next: C;
             type Value;
-            fn f(self) -> Self::Next::Value;
+            func f(self) -> Self::Next::Value;
         }
 
         struct Wrap<T> {}
@@ -5810,7 +6032,7 @@ fn test_recursive_same_impl_nonidentity_binding_is_detected() {
             type Next = Wrap<i32>;
             type Value = (T,);
 
-            fn f(self) -> (T,) {
+            func f(self) -> (T,) {
                 unreachable
             }
         }
@@ -5840,12 +6062,12 @@ fn test_error_in_intermediate_resolution_does_not_cascade() {
 	let case = TestCase::new(indoc! {"
         trait T {
             type Out;
-            fn f(self) -> Self::Out;
+            func f(self) -> Self::Out;
         }
         struct X {}
         impl T for X {
             type Out = MissingType;
-            fn f(self) -> i32 { 0 }
+            func f(self) -> i32 { 0 }
         }
     "});
 	assert!(
@@ -5872,11 +6094,11 @@ fn test_expected_typeparam_reduces_against_found_projection() {
 	let case = TestCase::new(indoc! {"
         trait Inner { type Out; }
         trait T {
-            fn f<A, B: Inner where { Out = A }>(b: B) -> A;
+            func f<A, B: Inner where { Out = A }>(b: B) -> A;
         }
         struct X {}
         impl T for X {
-            fn f<C, D: Inner where { Out = C }>(d: D) -> D::Out {
+            func f<C, D: Inner where { Out = C }>(d: D) -> D::Out {
                 unreachable
             }
         }
@@ -5900,11 +6122,11 @@ fn test_found_side_nested_projection_normalizes_via_find_trait_impl() {
         impl Inner for M { type Out = i32; }
 
         trait T {
-            fn f<A: Outer where { Mid = M }>(a: A) -> i32;
+            func f<A: Outer where { Mid = M }>(a: A) -> i32;
         }
         struct X {}
         impl T for X {
-            fn f<B: Outer where { Mid = M }>(b: B) -> B::Mid::Out {
+            func f<B: Outer where { Mid = M }>(b: B) -> B::Mid::Out {
                 unreachable
             }
         }
@@ -5926,12 +6148,12 @@ fn test_self_referential_assoc_type_value_does_not_hang_or_cascade() {
 	let case = TestCase::new(indoc! {"
         trait C {
             type Value;
-            fn f(self) -> Self::Value;
+            func f(self) -> Self::Value;
         }
         struct Wrap<T> {}
         impl<T> C for Wrap<T> {
             type Value = Self::Value;
-            fn f(self) -> i32 { unreachable }
+            func f(self) -> i32 { unreachable }
         }
     "});
 	assert!(
@@ -6007,7 +6229,7 @@ fn test_trait_conformance_default_fn_not_required() {
 	// Trait methods with a default body are optional to override — no E1033
 	let case = TestCase::new(indoc! {"
         trait Greet {
-            fn hello(self) {
+            func hello(self) {
                 unreachable
             }
         }
@@ -6044,7 +6266,7 @@ fn test_supertrait_resolved() {
         }
 
         trait Drawable: Sized {
-            fn draw(self);
+            func draw(self);
         }
     "});
 	assert!(
@@ -6085,9 +6307,7 @@ fn test_supertrait_resolved() {
 
 	assert_eq!(
 		case.tir.items.traits[usize::from(drawable_idx)]
-			.bounds
-			.traits
-			.iter()
+			.supertraits(drawable_idx)
 			.map(|trait_bound| trait_bound.trait_index)
 			.collect::<Vec<_>>(),
 		vec![sized_idx],
@@ -6104,7 +6324,7 @@ fn test_supertrait_missing_impl_errors() {
         }
 
         trait Drawable: Sized {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point {
@@ -6113,7 +6333,7 @@ fn test_supertrait_missing_impl_errors() {
         }
 
         impl Drawable for Point {
-            fn draw(self) {
+            func draw(self) {
                 unreachable
             }
         }
@@ -6131,6 +6351,124 @@ fn test_supertrait_missing_impl_errors() {
 }
 
 #[test]
+fn test_supertrait_method_callable_in_default_body() {
+	// `Self` carries its trait's supertraits as bounds, so a default body can
+	// reach an inherited method — the thing that made supertraits unusable.
+	let case = TestCase::new(indoc! {"
+        trait A { func a(self) -> i32 { 1 } }
+        trait B: A { func b(self) -> i32 { self.a() } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_assoc_const_callable_in_default_body() {
+	let case = TestCase::new(indoc! {"
+        trait A { const X: i32; }
+        trait B: A { func b(self) -> i32 { Self::X } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_assoc_type_usable_in_member_signature() {
+	// Resolved during Phase 2, and prescan registers a trait's members before
+	// the trait itself — so this only works because a member resolves its
+	// parent's supertrait clause (`ensure_trait_supertraits`) first.
+	let case = TestCase::new(indoc! {"
+        trait A { type X; }
+        trait B: A { func g(self, v: Self::X) { } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_declared_after_its_subtrait() {
+	// Parse order must not matter: `B: A` is resolved before `A` is reached.
+	let case = TestCase::new(indoc! {"
+        trait B: A { func b(self) -> i32 { self.a() } }
+        trait A { func a(self) -> i32 { 1 } }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_subtrait_method_call_on_generic_param() {
+	// The trait's `Self` param is checked against the call's type arguments
+	// like any other, so `T: B` has to satisfy `B`'s own supertrait `A`
+	// through `trait_implies` rather than by being declared `T: B + A`.
+	let case = TestCase::new(indoc! {"
+        trait A { }
+        trait B: A { func b(self) -> i32 { 1 } }
+        func f<T: B>(x: T) -> i32 { x.b() }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_supertrait_cycle_is_reported_once_and_terminates() {
+	// The cycle is reported where it closes, and only once — every trait in
+	// it has its bounds written by then, so no later walk re-enters it. It is
+	// still *resolved*, both bounds and all, which is why every walk over the
+	// supertrait graph stays visited-guarded rather than assuming a DAG: this
+	// test hangs or blows the stack if one ever isn't.
+	let case = TestCase::new(indoc! {"
+        trait A: B { }
+        trait B: A { }
+        func requires_a<T: A>(x: T) { }
+        func call<T: B>(x: T) { requires_a(x); }
+        export {}
+    "});
+	let view = case.diagnostics();
+	view.assert_error(DiagnosticCode::CyclicTraitBounds);
+	assert_eq!(
+		view.errors().count(),
+		1,
+		"reported where the cycle closes, not once per trait in it"
+	);
+}
+
+#[test]
+fn test_trait_that_is_its_own_supertrait_is_reported() {
+	// `trait A: A` collapses into the reflexive `Self: A` bound every trait
+	// gets, so `Trait::supertraits` filters it back out and nothing
+	// downstream can see it. The cycle walk catches it on the way in, where
+	// the clause is still a clause.
+	let case = TestCase::new(indoc! {"
+        trait A: A { }
+        export {}
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::CyclicTraitBounds);
+}
+
+#[test]
+fn test_unrelated_trait_bound_still_rejected() {
+	// The transitive walk must not turn every bound into a match.
+	let case = TestCase::new(indoc! {"
+        trait A { }
+        trait B { }
+        func requires_a<T: A>(x: T) { }
+        func call_with_b<T: B>(x: T) { requires_a(x); }
+        export {}
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected E1063 for an unrelated bound, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
 fn test_supertrait_satisfied_impl_no_errors() {
 	// Both Sized and Drawable implemented for Point — no E1034
 	let case = TestCase::new(indoc! {"
@@ -6139,7 +6477,7 @@ fn test_supertrait_satisfied_impl_no_errors() {
         }
 
         trait Drawable: Sized {
-            fn draw(self);
+            func draw(self);
         }
 
         struct Point {
@@ -6152,7 +6490,7 @@ fn test_supertrait_satisfied_impl_no_errors() {
         }
 
         impl Drawable for Point {
-            fn draw(self) {
+            func draw(self) {
                 unreachable
             }
         }
@@ -6184,12 +6522,12 @@ fn test_forward_ref_resolves_on_demand() {
 	// NOT UndeclaredType (E1021). E1021 would mean the forward reference was
 	// never resolved at all.
 	let case = TestCase::new(indoc! {"
-        fn uses_memory32(mem: Memory32, delta: u32) -> u32 {
+        func uses_memory32(mem: Memory32, delta: u32) -> u32 {
             mem.grow(delta)
         }
 
         trait Memory32 {
-            fn grow(self, delta: u32) -> u32;
+            func grow(self, delta: u32) -> u32;
         }
     "});
 	assert!(
@@ -6267,7 +6605,7 @@ fn test_cyclic_type_dependency_names_every_item_in_the_chain() {
         type A = B;
         type B = C;
         type C = A;
-        fn f(x: A) -> i32 { 1 }
+        func f(x: A) -> i32 { 1 }
     "});
 	let diagnostic = case
 		.tir
@@ -6301,7 +6639,7 @@ fn test_self_referential_alias_cycle_omits_the_chain_note() {
 	// it as "the cycle is `A` -> `A`" would be noise.
 	let case = TestCase::new(indoc! {"
         type A = A;
-        fn f(x: A) -> i32 { 1 }
+        func f(x: A) -> i32 { 1 }
     "});
 	let diagnostic = case
 		.tir
@@ -6331,7 +6669,7 @@ fn test_generic_alias_cycle_is_reported_exactly_once() {
 	let case = TestCase::new(indoc! {"
         type A<T> = B<T>;
         type B<T> = A<T>;
-        fn f(x: A<i32>) -> i32 { 1 }
+        func f(x: A<i32>) -> i32 { 1 }
     "});
 	let cyclic: Vec<_> = case
 		.tir
@@ -6401,7 +6739,7 @@ fn test_fn_uses_struct_declared_after_is_ok() {
 	// A function's parameter/return type that references a struct defined later
 	// in the file must resolve cleanly — no type errors.
 	let case = TestCase::new(indoc! {"
-        fn f(x: Point) -> Point { x }
+        func f(x: Point) -> Point { x }
         struct Point { x: i32, y: i32 }
     "});
 	let type_errors: Vec<_> = case
@@ -6423,7 +6761,7 @@ fn test_struct_cycle_does_not_prevent_other_structs_from_resolving() {
 	let case = TestCase::new(indoc! {"
         struct Bad { bad: Bad }
         struct Good { val: i32 }
-        fn uses_good(x: Good) -> i32 { x.val }
+        func uses_good(x: Good) -> i32 { x.val }
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -6487,14 +6825,17 @@ fn test_generic_struct_field_type_is_type_param() {
 		.iter()
 		.find(|s| case.graph.interner.resolve(s.name.inner) == Some("Wrapper"))
 		.expect("Wrapper struct not found");
+	let StructKind::Record { fields, .. } = &s.fields else {
+		panic!("expected record struct")
+	};
 	// Field `value` should have type TypeParam { param_index: 0 }.
 	assert!(
 		matches!(
-			case.tir.types.resolve(s.fields[0].ty.inner),
+			case.tir.types.resolve(fields[0].ty.inner),
 			Type::TypeParam { param_index: 0, .. }
 		),
 		"expected TypeParam, got {:?}",
-		case.tir.types.resolve(s.fields[0].ty.inner)
+		case.tir.types.resolve(fields[0].ty.inner)
 	);
 }
 
@@ -6502,7 +6843,7 @@ fn test_generic_struct_field_type_is_type_param() {
 fn test_generic_struct_in_type_position_resolves() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { value: T }
-        fn get(w: Wrapper<i32>) -> i32 { w.value }
+        func get(w: Wrapper<i32>) -> i32 { w.value }
         export { get }
     "});
 	assert!(
@@ -6525,12 +6866,12 @@ fn test_turbofish_first_segment_resolves_enclosing_type_param() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { x: T }
         impl <T> Wrapper<T> {
-            pub fn make() -> i32 { 0 }
+            pub func make() -> i32 { 0 }
         }
-        fn use_it<T>() -> i32 {
+        func use_it<T>() -> i32 {
             Wrapper::<T>::make()
         }
-        fn concrete() -> i32 { use_it::<i32>() }
+        func concrete() -> i32 { use_it::<i32>() }
         export { concrete }
     "});
 	no_errors(&case);
@@ -6540,7 +6881,7 @@ fn test_turbofish_first_segment_resolves_enclosing_type_param() {
 fn test_generic_struct_init_with_type_args() {
 	let case = TestCase::new(indoc! {"
         struct Pair<T> { pub first: T, pub second: T }
-        fn make() -> Pair<i32> {
+        func make() -> Pair<i32> {
             Pair::<i32>::{ first: 1, second: 2 }
         }
         export { make }
@@ -6557,8 +6898,8 @@ fn test_generic_struct_init_with_type_args() {
 fn test_generic_struct_field_access_substitutes_type() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { value: T }
-        fn get_i32(w: Wrapper<i32>) -> i32 { w.value }
-        fn get_f64(w: Wrapper<f64>) -> f64 { w.value }
+        func get_i32(w: Wrapper<i32>) -> i32 { w.value }
+        func get_f64(w: Wrapper<f64>) -> f64 { w.value }
         export { get_i32, get_f64 }
     "});
 	assert!(
@@ -6572,7 +6913,7 @@ fn test_generic_struct_field_access_substitutes_type() {
 fn test_generic_struct_wrong_type_arg_count_is_error() {
 	let case = TestCase::new(indoc! {"
         struct Point<T> { x: T, y: T }
-        fn bad(p: Point<i32, f64>) -> i32 { p.x }
+        func bad(p: Point<i32, f64>) -> i32 { p.x }
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -6585,7 +6926,7 @@ fn test_generic_struct_wrong_type_arg_count_is_error() {
 fn test_generic_struct_init_wrong_type_arg_count_is_error() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { value: T }
-        fn bad() -> Wrapper<i32> {
+        func bad() -> Wrapper<i32> {
             Wrapper::<i32, f64>::{ value: 1 }
         }
     "});
@@ -6605,7 +6946,7 @@ fn test_generic_struct_fewer_type_args_in_signature_is_error() {
 	// point of the mismatch itself, not a later "`_` isn't allowed here" check.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
-        fn f(p: Pair<i32>) -> i32 { p.a }
+        func f(p: Pair<i32>) -> i32 { p.a }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
@@ -6624,7 +6965,7 @@ fn test_generic_struct_bare_reference_in_signature_is_error() {
 	// still an arity mismatch, same as a partial list.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
-        fn f(p: Pair) { }
+        func f(p: Pair) { }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
@@ -6683,7 +7024,7 @@ fn test_generic_struct_fewer_type_args_infers_from_local_initializer() {
 	// initializer afterward, same as it always has.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
-        fn f() {
+        func f() {
             local p: Pair<_, _> = Pair::<i32, bool>::{ a: 1, b: true }
         }
     "});
@@ -6699,7 +7040,7 @@ fn test_generic_struct_fewer_type_args_in_local_annotation_without_underscore_is
 	// other type-expression position.
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
-        fn f() {
+        func f() {
             local p: Pair<i32> = Pair::<i32, bool>::{ a: 1, b: true }
         }
     "});
@@ -6718,7 +7059,7 @@ fn test_generic_struct_fewer_type_args_in_local_annotation_without_underscore_is
 fn test_generic_struct_too_many_type_args_still_errors() {
 	let case = TestCase::new(indoc! {"
         struct Pair<T, U> { a: T, b: U }
-        fn f(p: Pair<i32, f64, bool>) { }
+        func f(p: Pair<i32, f64, bool>) { }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
@@ -6733,7 +7074,7 @@ fn test_generic_struct_too_many_type_args_still_errors() {
 fn test_type_alias_simple() {
 	let case = TestCase::new(indoc! {"
         type Foo = i32;
-        fn f(x: Foo) -> Foo { x }
+        func f(x: Foo) -> Foo { x }
     "});
 	no_errors(&case);
 	let alias = case
@@ -6752,7 +7093,7 @@ fn test_type_alias_to_struct_is_transparent() {
 	let case = TestCase::new(indoc! {"
         struct Bar { field: i32 }
         type Foo = Bar;
-        fn f(x: Foo) -> i32 { x.field }
+        func f(x: Foo) -> i32 { x.field }
     "});
 	no_errors(&case);
 }
@@ -6764,7 +7105,7 @@ fn test_type_alias_generic_rhs() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { data: T }
         type WrapperI32 = Wrapper<i32>;
-        fn f(w: WrapperI32) -> i32 { w.data }
+        func f(w: WrapperI32) -> i32 { w.data }
     "});
 	no_errors(&case);
 	let alias = case
@@ -6791,7 +7132,7 @@ fn test_parametric_type_alias_instantiated_at_use_site() {
 	// through the tuple template, producing a plain concrete tuple type.
 	let case = TestCase::new(indoc! {"
         type Pair<T> = (T, T);
-        fn make() -> Pair<i32> {
+        func make() -> Pair<i32> {
             (1, 2)
         }
         export { make }
@@ -6845,7 +7186,7 @@ fn test_type_alias_mutual_cycle_is_error() {
 fn test_type_alias_wrong_type_arg_count_is_error() {
 	let case = TestCase::new(indoc! {"
         type Pair<T> = (T, T);
-        fn f(p: Pair<i32, f64>) { }
+        func f(p: Pair<i32, f64>) { }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
@@ -6859,7 +7200,7 @@ fn test_type_alias_fewer_type_args_in_signature_is_error() {
 	// immediate arity mismatch in type-expression position.
 	let case = TestCase::new(indoc! {"
         type Pair<T, U> = (T, U);
-        fn f(p: Pair<i32>) { }
+        func f(p: Pair<i32>) { }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
@@ -6878,7 +7219,7 @@ fn test_type_alias_fewer_type_args_infers_from_local_initializer() {
 	// from the initializer, same as for a generic struct.
 	let case = TestCase::new(indoc! {"
         type Pair<T, U> = (T, U);
-        fn f() {
+        func f() {
             local p: Pair<_, _> = (1, true)
         }
     "});
@@ -6890,7 +7231,7 @@ fn test_type_alias_fewer_type_args_in_local_annotation_without_underscore_is_err
  {
 	let case = TestCase::new(indoc! {"
         type Pair<T, U> = (T, U);
-        fn f() {
+        func f() {
             local p: Pair<i32> = (1, true)
         }
     "});
@@ -6909,7 +7250,7 @@ fn test_type_alias_fewer_type_args_in_local_annotation_without_underscore_is_err
 fn test_type_alias_forward_reference_resolves() {
 	// Foo is used before its declaration further down the file.
 	let case = TestCase::new(indoc! {"
-        fn f(x: Foo) -> i32 { x.field }
+        func f(x: Foo) -> i32 { x.field }
         struct Bar { field: i32 }
         type Foo = Bar;
     "});
@@ -6923,7 +7264,7 @@ fn test_generic_identity_resolves() {
 	// identity<T>(t: T) -> T called with i32 — TIR must have no diagnostics
 	// and the function must carry one TypeParamInfo named "T".
 	let case = TestCase::new(indoc! {"
-        pub fn identity<T>(t: T) -> T {
+        pub func identity<T>(t: T) -> T {
             t
         }
     "});
@@ -6963,10 +7304,10 @@ fn test_generic_call_return_type_substituted() {
 	// Calling identity(42) must produce no diagnostics — the return type
 	// is substituted from TypeParam{0} → i32 via the argument.
 	let case = TestCase::new(indoc! {"
-        pub fn identity<T>(t: T) -> T {
+        pub func identity<T>(t: T) -> T {
             t
         }
-        pub fn main() -> i32 {
+        pub func main() -> i32 {
             identity(42)
         }
     "});
@@ -6988,9 +7329,9 @@ fn test_generic_with_bound_resolves() {
 	// fn with a trait bound — TypeParamInfo.bounds must contain the trait index.
 	let case = TestCase::new(indoc! {"
         trait Scalable {
-            fn scale(self, factor: i32) -> i32;
+            func scale(self, factor: i32) -> i32;
         }
-        fn call_scale<T: Scalable>(t: T, n: i32) -> i32 {
+        func call_scale<T: Scalable>(t: T, n: i32) -> i32 {
             t.scale(n)
         }
     "});
@@ -7034,7 +7375,7 @@ fn test_type_param_referenced_in_binding_rhs_records_access() {
         trait Container {
             type Item;
         }
-        fn wrap<T, C: Container where { Item = T }>(c: C) -> C {
+        func wrap<T, C: Container where { Item = T }>(c: C) -> C {
             c
         }
     "});
@@ -7064,7 +7405,7 @@ fn test_type_param_referenced_in_binding_rhs_records_access() {
 fn test_generic_unknown_bound_is_error() {
 	// A bound that names an undeclared type should produce a diagnostic.
 	let case = TestCase::new(indoc! {"
-        fn f<T: Nonexistent>(t: T) -> T {
+        func f<T: Nonexistent>(t: T) -> T {
             t
         }
     "});
@@ -7161,16 +7502,420 @@ fn has_error_matching(case: &TestCase, substring: &str) {
 }
 
 #[test]
+fn test_assoc_type_does_not_collide_with_module_alias() {
+	for source in [
+		"trait B { type X; } type X = u32;",
+		"type X = u32; trait B { type X; }",
+	] {
+		let case = TestCase::new(&format!(
+			"{source}
+			trait C {{ type X; }}
+			func alias(x: X) -> u32 {{ x }}
+			func projection<T: B>(x: T::X) -> T::X {{ x }}"
+		));
+		case.diagnostics().assert_no_errors();
+	}
+}
+
+#[test]
+fn test_assoc_type_does_not_leak_into_module_scope() {
+	let case = TestCase::new("trait B { type X; } func f(x: X) {}");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredType);
+}
+
+#[test]
+fn test_assoc_binding_spans_survive_sorting_duplicates_and_nesting() {
+	let source = indoc! {"
+		trait First { type Alpha; type Beta; }
+		trait Nested { type Item; }
+		type Alias<T: First where {
+			Beta: Nested where { Item = u16 },
+			Alpha = u32,
+			Alpha = bool,
+		}> = ();
+	"};
+	let case = TestCase::new(source);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateAssocTypeBinding);
+	let alias = case
+		.tir
+		.items
+		.type_aliases
+		.iter()
+		.find(|alias| {
+			case.graph.interner.resolve(alias.name.inner) == Some("Alias")
+		})
+		.unwrap();
+	let bindings = &alias.type_params[0].bounds.traits[0].bindings;
+	assert_eq!(bindings.len(), 2);
+	assert!(bindings[0].name.inner < bindings[1].name.inner);
+	let alpha = bindings
+		.iter()
+		.find(|binding| {
+			case.graph.interner.resolve(binding.name.inner) == Some("Alpha")
+		})
+		.unwrap();
+	assert_eq!(alpha.file_id, alias.file_id);
+	assert_eq!(
+		alpha.name.span.start as usize,
+		source.find("Alpha = u32").unwrap()
+	);
+	assert_eq!(
+		&source[alpha.name.span.start as usize..alpha.name.span.end as usize],
+		"Alpha"
+	);
+	assert_eq!(
+		&source[alpha.rhs.span.start as usize..alpha.rhs.span.end as usize],
+		"u32"
+	);
+	assert!(matches!(
+		alpha.rhs.inner,
+		AssocBindingKind::Equals(TypeIndex::U32)
+	));
+
+	let beta = bindings
+		.iter()
+		.find(|binding| {
+			case.graph.interner.resolve(binding.name.inner) == Some("Beta")
+		})
+		.unwrap();
+	assert_eq!(
+		&source[beta.rhs.span.start as usize..beta.rhs.span.end as usize],
+		"Nested where { Item = u16 }"
+	);
+	let AssocBindingKind::Bound(nested) = &beta.rhs.inner else {
+		panic!("expected nested bound")
+	};
+	let item = &nested.traits[0].bindings[0];
+	assert_eq!(item.file_id, alias.file_id);
+	assert_eq!(
+		&source[item.name.span.start as usize..item.name.span.end as usize],
+		"Item"
+	);
+	assert_eq!(
+		&source[item.rhs.span.start as usize..item.rhs.span.end as usize],
+		"u16"
+	);
+}
+
+#[test]
+fn test_assoc_binding_spans_retain_inherited_source_file() {
+	let main = "mod defs; trait Extra {} type Alias<T: defs::Outer where { Assoc: Extra }> = ();";
+	let defs = "pub trait Inner { type Item; } pub trait Outer { type Assoc: Inner where { Item = u32 }; }";
+	let case = TestCase::new_multi_file("main.wx", main, &[("defs.wx", defs)]);
+	case.diagnostics().assert_no_errors();
+	let alias = case
+		.tir
+		.items
+		.type_aliases
+		.iter()
+		.find(|alias| {
+			case.graph.interner.resolve(alias.name.inner) == Some("Alias")
+		})
+		.unwrap();
+	let binding = &alias.type_params[0].bounds.traits[0].bindings[0];
+	assert_eq!(binding.file_id, alias.file_id);
+	assert_eq!(
+		&main[binding.rhs.span.start as usize..binding.rhs.span.end as usize],
+		"Extra"
+	);
+	let AssocBindingKind::Bound(written) = &binding.rhs.inner else {
+		panic!("expected written bounds")
+	};
+	assert_eq!(written.traits.len(), 1);
+	let outer = alias.type_params[0].bounds.traits[0].trait_index;
+	let declaration = case
+		.tir
+		.items
+		.trait_associated_type(outer, binding.name.inner)
+		.unwrap();
+	let projection = case
+		.tir
+		.types
+		.entries
+		.iter()
+		.enumerate()
+		.find_map(|(index, ty)| match ty {
+			Type::AssocTypeProjection {
+				base,
+				trait_index,
+				assoc_name,
+			} if *trait_index == outer
+				&& *assoc_name == binding.name.inner
+				&& matches!(
+					case.tir.types.resolve(*base),
+					Type::TypeParam {
+						owner: TypeParamOwner::TypeAlias(_),
+						..
+					}
+				) =>
+			{
+				Some(TypeIndex(index as u32))
+			}
+			_ => None,
+		})
+		.unwrap();
+	let effective = case
+		.tir
+		.items
+		.effective_bounds(&case.tir.types, projection)
+		.unwrap();
+	assert_eq!(effective.traits().count(), 2);
+	let inherited = declaration
+		.bounds
+		.traits
+		.iter()
+		.find(|bound| {
+			case.graph.interner.resolve(
+				case.tir.items.traits[usize::from(bound.trait_index)]
+					.name
+					.inner,
+			) == Some("Inner")
+		})
+		.unwrap();
+	let item = &inherited.bindings[0];
+	assert_ne!(item.file_id, alias.file_id);
+	let file = case.graph.files.get(item.file_id).unwrap();
+	assert_eq!(file.source.as_str(), defs);
+	assert_eq!(
+		&file.source
+			[item.name.span.start as usize..item.name.span.end as usize],
+		"Item"
+	);
+	assert_eq!(
+		&file.source[item.rhs.span.start as usize..item.rhs.span.end as usize],
+		"u32"
+	);
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_alias_function_and_struct() {
+	for declaration in [
+		"type Alias<T: Z where { A = u32 }> = ();",
+		"func f<T: Z where { A = u32 }>() {}",
+		"struct S<T: Z where { A = u32 }> {}",
+		"trait Child: Z where { A = u32 } {}",
+	] {
+		let source =
+			format!("trait X {{}} trait Z {{ type A: X; }} {declaration}");
+		let case = TestCase::new(&source);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `u32: X` is not satisfied");
+		let diagnostic = case
+			.tir
+			.diagnostics
+			.iter()
+			.find(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.unwrap();
+		let primary = diagnostic
+			.labels
+			.iter()
+			.find(|label| {
+				label.style
+					== codespan_reporting::diagnostic::LabelStyle::Primary
+			})
+			.unwrap();
+		assert_eq!(&source[primary.range.clone()], "u32");
+		assert!(
+			diagnostic
+				.labels
+				.iter()
+				.any(|label| label.message == "required by a bound in `Z::A`"
+					&& &source[label.range.clone()] == "X")
+		);
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_accepts_impl_in_either_order() {
+	for source in [
+		"trait X {} trait Z { type A: X; } impl X for u32 {} type Alias<T: Z where { A = u32 }> = ();",
+		"type Alias<T: Z where { A = u32 }> = (); trait Z { type A: X; } trait X {} impl X for u32 {}",
+	] {
+		TestCase::new(source).diagnostics().assert_no_errors();
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_sees_all_parameter_bounds() {
+	for params in ["T: Z where { A = U }, U: X", "U: X, T: Z where { A = U }"] {
+		let case = TestCase::new(&format!(
+			"trait X {{}} trait Z {{ type A: X; }} type Alias<{params}> = ();"
+		));
+		case.diagnostics().assert_no_errors();
+	}
+	let case = TestCase::new(
+		"trait X {} trait Z { type A: X; } type Alias<T: Z where { A = U }, U> = ();",
+	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_typeset_bounds() {
+	for (ty, valid) in [("u8", true), ("u32", false)] {
+		let case = TestCase::new(&format!(
+			"typeset Small {{ u8, u16 }} trait Z {{ type A: Small; }} type Alias<T: Z where {{ A = {ty} }}> = ();"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			// `u32` has no `impl` of `Small`'s generated trait.
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TraitBoundViolation);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_checks_nested_bound_bindings() {
+	let case = TestCase::new(indoc! {"
+		trait Marker {}
+		trait Inner { type Item: Marker; }
+		trait Outer { type Value; }
+		type Alias<T: Outer where { Value: Inner where { Item = u32 } }> = ();
+	"});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+}
+
+#[test]
+fn test_declaration_assoc_equality_handles_bound_lists_and_duplicates() {
+	let case = TestCase::new(indoc! {"
+		trait Marker {}
+		trait First { type Item: Marker; }
+		trait Second { type Item; }
+		impl Marker for u8 {}
+		type Alias<T: First where { Item = u8, Item = u32 } + Second where { Item = u32 }> = ();
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateAssocTypeBinding);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
+fn test_typeset_supertrait_bound_is_proven_for_typeset_bounded_param() {
+	// `typeset Choices: Marker` makes `U: Choices` prove `U: Marker` through
+	// the generated trait's supertrait chain — as long as every member of
+	// `Choices` actually implements `Marker` (checked at the typeset itself).
+	for (members, valid) in [("u8, u16", true), ("u8, u32", false)] {
+		let case = TestCase::new(&format!(
+			"trait Marker {{}} impl Marker for u8 {{}} impl Marker for u16 {{}}
+			typeset Choices: Marker {{ {members} }} trait Z {{ type A: Marker; }}
+			type Alias<T: Z where {{ A = U }}, U: Choices> = ();"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			// `u32` is a member of `Choices` but does not implement `Marker`.
+			case.diagnostics()
+				.assert_error(DiagnosticCode::UnsatisfiedTraitBound);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_demands_later_impl_members() {
+	for requirement in ["Item = u8", "Item: Marker"] {
+		for (ty, valid) in [("u8", true), ("u16", false)] {
+			let case = TestCase::new(&format!(
+				"trait Marker {{}} impl Marker for u8 {{}}
+				trait HasItem {{ type Item; }}
+				trait Z {{ type A: HasItem where {{ {requirement} }}; }}
+				type Alias<T: Z where {{ A = Node }}> = ();
+				struct Node {{}}
+				impl HasItem for Node {{ type Item = {ty}; }}"
+			));
+			if valid {
+				case.diagnostics().assert_no_errors();
+			} else {
+				case.diagnostics()
+					.assert_error(DiagnosticCode::TraitBoundViolation);
+			}
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_accepts_recursive_trait_bounds() {
+	let case = TestCase::new(indoc! {"
+		trait A { type X: B where { Y = Self }; }
+		trait B { type Y: A where { X = Self }; }
+		type Alias<T: A where { X = U }, U: B where { Y = T }> = ();
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_declaration_assoc_equality_handles_inherited_method_parameters() {
+	for (rhs, valid) in [("U", true), ("u32", false)] {
+		let case = TestCase::new(&format!(
+			"trait Marker {{}} trait Z {{ type A: Marker; }}
+			struct Host<P> {{ value: P }}
+			impl<P> Host<P> {{
+				func f<T: Z where {{ A = {rhs} }}, U: Marker>() {{}}
+			}}"
+		));
+		if valid {
+			case.diagnostics().assert_no_errors();
+		} else {
+			case.diagnostics()
+				.assert_error(DiagnosticCode::TraitBoundViolation);
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_in_impl_header_sees_later_impls() {
+	for declaration in [
+		"impl<T: Z where { A = u32 }> Q for Host<T> {}",
+		"impl<T: Z where { A = u32 }> Host<T> {}",
+		"type Alias<T: Z where { A = u32 }> = Host<T>;
+		impl<T: Z> Q for Alias<T> {}",
+	] {
+		for later_impl in ["impl X for u32 {}", ""] {
+			let case = TestCase::new(&format!(
+				"trait X {{}} trait Z {{ type A: X; }} trait Q {{}}
+				struct Host<T> {{ value: T }}
+				{declaration}
+				{later_impl}"
+			));
+			if later_impl.is_empty() {
+				case.diagnostics()
+					.assert_error(DiagnosticCode::TraitBoundViolation);
+			} else {
+				case.diagnostics().assert_no_errors();
+			}
+		}
+	}
+}
+
+#[test]
+fn test_declaration_assoc_equality_does_not_cascade_unresolved_type() {
+	let case = TestCase::new(
+		"trait X {} trait Z { type A: X; } type Alias<T: Z where { A = Missing }> = ();",
+	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredType);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+#[test]
 fn test_assoc_type_declared_in_trait() {
-	// A trait with an associated type must register it in `members` and
-	// `assoc_type_bounds`.
+	// The member index points to one arena-owned declaration with its bounds.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         trait Container {
             type Elem: Bound;
         }
     "});
-	no_errors(&case);
+	case.diagnostics().assert_no_errors();
 
 	let container_trait = case
 		.tir
@@ -7190,27 +7935,39 @@ fn test_assoc_type_declared_in_trait() {
 
 	assert!(
 		matches!(
-			container_trait.entries.get(&elem_sym),
-			Some(ImplEntry::AssocType(_))
+			container_trait.bindings.get(&elem_sym),
+			Some(TraitMemberKind::AssociatedType(_))
 		),
 		"expected 'Elem' in Container::members as AssociatedType"
 	);
+	let index = container_trait.associated_type(elem_sym).unwrap();
+	let item = &case.tir.items.associated_types[usize::from(index)];
+	assert_eq!(item.name.inner, elem_sym);
 	assert!(
-		container_trait.assoc_types.contains_key(&elem_sym),
-		"expected 'Elem' in Container::assoc_types"
+		item.ty.is_none(),
+		"a trait declaration has no assigned type"
 	);
+	assert_eq!(
+		item.id,
+		container_trait.bindings[&elem_sym].id(&case.tir.items)
+	);
+	assert_eq!(item.file_id, container_trait.file_id);
+	assert_eq!(item.bounds.traits.len(), 1);
+	let bound =
+		&case.tir.items.traits[usize::from(item.bounds.traits[0].trait_index)];
+	assert_eq!(case.graph.interner.resolve(bound.name.inner), Some("Bound"));
 }
 
 #[test]
 fn test_assoc_type_projection_in_return_type() {
-	// `fn foo<C: Container>() -> C::Elem` — the return type must resolve to
+	// `func foo<C: Container>() -> C::Elem` — the return type must resolve to
 	// `AssocTypeProjection` (no error diagnostics).
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         trait Container {
             type Elem: Bound;
         }
-        fn foo<C: Container>() -> C::Elem {
+        func foo<C: Container>() -> C::Elem {
             unreachable
         }
     "});
@@ -7261,7 +8018,7 @@ fn test_assoc_type_projection_display_is_qualified_when_ambiguous() {
         trait B {
             type Item;
         }
-        fn foo<T: A + B>() -> <T as A>::Item {
+        func foo<T: A + B>() -> <T as A>::Item {
             unreachable
         }
     "});
@@ -7292,14 +8049,14 @@ fn test_assoc_type_projection_display_is_qualified_when_ambiguous() {
 
 #[test]
 fn test_assoc_type_projection_in_param_type() {
-	// `fn consume<C: Container>(elem: C::Elem)` — the parameter type resolves to
+	// `func consume<C: Container>(elem: C::Elem)` — the parameter type resolves to
 	// `AssocTypeProjection` without errors.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         trait Container {
             type Elem: Bound;
         }
-        fn consume<C: Container>(elem: C::Elem) {
+        func consume<C: Container>(elem: C::Elem) {
             unreachable
         }
     "});
@@ -7313,7 +8070,7 @@ fn test_assoc_type_unknown_member_is_error() {
         trait Memory {
             type Size;
         }
-        fn bad<M: Memory>() -> M::Nonexistent {
+        func bad<M: Memory>() -> M::Nonexistent {
             unreachable
         }
     "});
@@ -7323,25 +8080,38 @@ fn test_assoc_type_unknown_member_is_error() {
 
 #[test]
 fn test_assoc_type_bare_name_suggests_self_prefix() {
-	// Using the associated type name directly (e.g. `Size` instead of
-	// `Self::Size`) must produce a targeted error with a `Self::` suggestion.
-	let case = TestCase::new(indoc! {"
-        trait Memory {
-            type Size;
-            fn alloc(n: Size) -> *u8;
+	let source = indoc! {"
+        trait B {
+            type X;
+            func test(u: X) -> u32;
         }
-    "});
-	// report_bare_assoc_type emits E1021 with message "cannot find type `Size` in
-	// this scope" and a note containing the "Self::Size" suggestion.
-	assert!(
-		has_error_code(&case.tir, DiagnosticCode::UndeclaredType),
-		"expected E1021 (UndeclaredType) for bare associated type name, got: {:?}",
-		case.tir
-			.diagnostics
-			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>(),
-	);
+    "};
+	let case = TestCase::new(source);
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref() == Some(DiagnosticCode::UndeclaredType.code())
+		})
+		.expect("bare associated type must be rejected");
+	assert_eq!(diagnostic.message, "cannot find type `X` in this scope");
+	assert!(diagnostic.notes.iter().any(|note| note.contains(
+		"you might have meant to use the associated type: `Self::X`"
+	)));
+	let label = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Primary
+		})
+		.unwrap();
+	assert_eq!(label.range.start, source.find("u: X").unwrap() + 3);
+	assert_eq!(&source[label.range.clone()], "X");
+	assert_eq!(label.message, "use `Self::X` here");
+
+	let corrected = TestCase::new(&source.replace("u: X", "u: Self::X"));
+	corrected.diagnostics().assert_no_errors();
 }
 
 #[test]
@@ -7386,7 +8156,7 @@ fn test_assoc_type_impl_registers_in_trait_impl() {
 		matches!(
 			ti.members.get(&elem_sym),
 			Some(ImplEntry::AssocType(idx))
-				if case.tir.items.assoc_type_impls[usize::from(*idx)].ty.unwrap().inner == TypeIndex::U32
+				if case.tir.items.associated_types[usize::from(*idx)].ty.unwrap().inner == TypeIndex::U32
 		),
 		"expected 'Elem' → u32 in TraitImpl::members"
 	);
@@ -7398,7 +8168,7 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 	// block resolves `Self` to the concrete `Type::Struct` for `Heap` (not a
 	// `TypeParam`/`AssocTypeProjection`), so the associated-type lookup for
 	// `Elem` fell into `resolve_impl_member`'s inherent/trait-impl fallback —
-	// which never recorded an access on `Container::assoc_types["Elem"]`,
+	// which never recorded an access on `Container::Elem`,
 	// leaving hover/go-to-definition on `Elem` with nothing to find.
 	let source = indoc! {"
         trait Bound {}
@@ -7411,7 +8181,7 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
             type Elem = u32;
         }
         impl Heap {
-            fn zero() -> Self::Elem {
+            func zero() -> Self::Elem {
                 0
             }
         }
@@ -7435,10 +8205,11 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 		.get("Elem")
 		.expect("symbol 'Elem' not interned");
 
-	let elem_assoc_type = container_trait
-		.assoc_types
-		.get(&elem_sym)
-		.expect("expected 'Elem' in Container::assoc_types");
+	let elem_assoc_type = &case.tir.items.associated_types[usize::from(
+		container_trait
+			.associated_type(elem_sym)
+			.expect("expected Container's associated-type declaration"),
+	)];
 
 	let self_elem_offset = source.find("Self::Elem").unwrap() + "Self::".len();
 	assert!(
@@ -7454,14 +8225,14 @@ fn test_self_assoc_type_projection_in_inherent_impl_records_access() {
 #[test]
 fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	// Regression test: `resolve_bounds`'s `WithBindings` arm looked up
-	// `assoc_types.get_mut(&binding.name)` on the *other* trait before that
+	// the associated-type declaration on the *other* trait before that
 	// trait had necessarily inserted its own entry — for two traits whose
 	// assoc-type `where` clauses reference each other (`A::X` bound by `B
 	// where { Y = Self }`, and vice versa), the first trait processed (`A`,
 	// being earlier in parse order) would reference `B::Y` before `B`'s own
 	// `TraitAssocType` node had run, silently dropping the access (no
 	// diagnostic — the lookup just missed). Fixed by pre-registering the
-	// assoc type in `assoc_types` (with placeholder bounds) before resolving
+	// assoc type in the arena (with placeholder bounds) before resolving
 	// its own bounds, so a same-name lookup during mutual resolution always
 	// finds an entry to record against.
 	//
@@ -7499,10 +8270,11 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 	let y_binding_offset = source.find("Y = Self").unwrap();
 	let x_binding_offset = source.find("X = Self").unwrap();
 
-	let x_at = trait_a
-		.assoc_types
-		.get(&x_sym)
-		.expect("expected 'X' in A::assoc_types");
+	let x_at = &case.tir.items.associated_types[usize::from(
+		trait_a
+			.associated_type(x_sym)
+			.expect("expected A's associated-type declaration X"),
+	)];
 	assert!(
 		x_at.accesses
 			.iter()
@@ -7512,10 +8284,11 @@ fn test_mutually_recursive_trait_assoc_type_where_bindings_record_accesses() {
 		x_at.accesses
 	);
 
-	let y_at = trait_b
-		.assoc_types
-		.get(&y_sym)
-		.expect("expected 'Y' in B::assoc_types");
+	let y_at = &case.tir.items.associated_types[usize::from(
+		trait_b
+			.associated_type(y_sym)
+			.expect("expected B's associated-type declaration Y"),
+	)];
 	assert!(
 		y_at.accesses
 			.iter()
@@ -7553,7 +8326,6 @@ fn test_assoc_type_impl_bound_violation_is_error() {
 }
 
 #[test]
-#[ignore = "false-positive TraitBoundViolation for an abstract projection's own trait-declared bound — see comment above"]
 fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
 	// `impl<T: Container> Container for Wrap<T> { type Elem = T::Elem; }` —
 	// the impl's own `Elem` value is the still-abstract projection `T::Elem`,
@@ -7603,7 +8375,6 @@ fn test_generic_impl_assoc_type_projection_satisfies_its_own_declared_bound() {
 }
 
 #[test]
-#[ignore = "mutual assoc-type-value reference reports a misleading cascade instead of CyclicTypeDependency — see comment above"]
 fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependency()
  {
 	// `impl Container for A { type Elem = B::Elem; }` next to
@@ -7614,42 +8385,21 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
 	// correctly for `const A: i32 = A;` via `ensure_signature`'s
 	// `ComputeState::InProgress` guard + `report_cyclic_type_dependency`.
 	//
-	// That machinery isn't wired up for this path, though:
-	// `resolve_namespace_type_member`'s catch-all arm (paths.rs, reached
-	// because `B`/`A` are concrete struct types) reads
-	// `self.items.assoc_type_impls[idx].ty.unwrap()` straight off the
-	// found `AssocTypeImpl`, without first calling `ensure_signature` on
-	// *that specific assoc-type-impl's own* `DefId` the way
-	// `resolve_bounds`'s `WithBindings` arm (generics.rs) and every
-	// "parent before member" call in traits.rs already do before reading
-	// something another item owns. So instead of catching the cycle via
-	// `ComputeState::InProgress`, whichever impl is processed first (parse
-	// order: `A` here) just finds the other's `Elem` isn't in `members` yet
-	// — not because of a cycle, but because `B`'s own `Elem` member hasn't
-	// been registered at all yet — and reports a plain "not found" instead.
-	// That result (`TypeIndex::ERROR`) then flows into `B`'s `Elem`, which
-	// resolves "successfully" against it, and the whole thing cascades into
-	// two more confusing `TraitBoundViolation`s on top, none of which say
-	// anything about a cycle.
+	// Now caught: `signature_trait_impl_assoc_type` reserves the member's
+	// arena slot (and its `item_lookup` / `ItemIndex::AssocType` entry)
+	// *before* resolving its `ty`, so a re-entrant lookup during that
+	// resolve (`trait_member_via_impl` -> `ensure_signature` -> `Cycle`)
+	// reports E1032 via `report_cyclic_type_dependency`. The slot is not
+	// published into the impl's `members` map until `ty` is filled, so the
+	// cycle is still observed rather than a `ty: None` placeholder being
+	// handed back. `AssociatedType::parent` lets the chain name each frame
+	// by its owner (`A::Elem`, not a bare `Elem`), and — since no aggregate
+	// is in the loop — the "insert indirection" note is correctly omitted.
 	//
-	// Fix sketch: in `resolve_namespace_type_member`'s
-	// `MemberLookup::Trait`/`MemberLookup::Inherent` arms for
-	// `ImplEntry::AssocType(idx)`, call
-	// `self.ensure_signature(self.items.assoc_type_impls[idx].id)` first,
-	// and report via `report_cyclic_type_dependency` on `SignatureStatus::
-	// Cycle` — mirroring `resolve_pending_global_symbol`/
-	// `resolve_pending_namespace_symbol` (modules.rs). Each `AssocTypeImpl`
-	// already carries its own registered `id`/`ast_nodes` entry
-	// (`AstNodeRef::TraitImplAssocType`, prescan.rs), so `ensure_signature`
-	// dispatches correctly — it's just never called on this path.
-	//
-	// One more thing the fix needs: `push_assoc_type_impl` (tir/mod.rs)
-	// never inserts its `id` into `item_lookup`, unlike every other
-	// `push_*` — so `item_name()`, which `report_cyclic_type_dependency`
-	// uses to label each frame in the "the cycle is `X` -> `Y`" note, has
-	// no case for an associated type and would silently skip that frame.
-	// Needs an `ItemIndex::AssocType` variant added the same way
-	// `push_typeset` registers `ItemIndex::TypeSet` right below it.
+	// One cosmetic edge remains: the errored `Elem` still feeds the
+	// `type Elem: Bound` conformance check, so two follow-on `E1063`
+	// ("`{unknown}: Bound`") land after the E1032 — secondary noise, not a
+	// missing-cycle report.
 	let case = TestCase::new(indoc! {"
         trait Bound {}
         impl Bound for u32 {}
@@ -7665,15 +8415,39 @@ fn test_mutual_concrete_assoc_type_value_reference_should_report_cyclic_dependen
             type Elem = A::Elem;
         }
     "});
+	let cycle = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::CyclicTypeDependency.code())
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"expected a CyclicTypeDependency diagnostic for the A::Elem <-> B::Elem cycle, got: {:?}",
+				case.tir
+					.diagnostics
+					.iter()
+					.map(|d| &d.message)
+					.collect::<Vec<_>>(),
+			)
+		});
+	// The chain names each frame by its owning type, not a bare `Elem`.
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::CyclicTypeDependency),
-		"expected a CyclicTypeDependency diagnostic for the A::Elem <-> \
-		 B::Elem cycle, got: {:?}",
-		case.tir
-			.diagnostics
+		cycle
+			.notes
 			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>(),
+			.any(|n| n.contains("`A::Elem` -> `B::Elem` -> `A::Elem`")),
+		"cycle note should spell out the owner-qualified chain, got: {:?}",
+		cycle.notes,
+	);
+	// A pointer can't break an associated-type-value cycle, so the
+	// aggregate-only "insert indirection" note must not appear.
+	assert!(
+		!cycle.notes.iter().any(|n| n.contains("indirection")),
+		"an assoc-type value cycle should not suggest indirection, got: {:?}",
+		cycle.notes,
 	);
 }
 
@@ -7687,7 +8461,7 @@ fn test_assoc_type_where_binding_out_of_order_type_param_resolves() {
         trait Memory {
             type Size: PointerSize;
         }
-        fn copy<Src: Memory where { Size = S }, S: PointerSize>() {
+        func copy<Src: Memory where { Size = S }, S: PointerSize>() {
             unreachable
         }
     "});
@@ -7719,10 +8493,10 @@ fn test_assoc_type_projection_forwarded_in_generic_wrapper() {
         trait Container {
             type Item;
         }
-        fn process<C: Container>(item: C::Item) {
+        func process<C: Container>(item: C::Item) {
             unreachable
         }
-        fn wrap<C: Container>(item: C::Item) {
+        func wrap<C: Container>(item: C::Item) {
             process(item)
         }
     "});
@@ -7737,10 +8511,10 @@ fn test_assoc_type_projection_concrete_mismatch_in_generic_wrapper() {
         trait Container {
             type Item;
         }
-        fn process<C: Container>(item: C::Item) {
+        func process<C: Container>(item: C::Item) {
             unreachable
         }
-        fn wrap<C: Container>(item: C::Item, n: i32) {
+        func wrap<C: Container>(item: C::Item, n: i32) {
             process(n)
         }
     "});
@@ -7755,10 +8529,10 @@ fn test_assoc_type_projection_in_nested_function_type_wrapper() {
         trait Container {
             type Item;
         }
-        fn process<C: Container>(f: fn(C::Item) -> C::Item) {
+        func process<C: Container>(f: func(C::Item) -> C::Item) {
             unreachable
         }
-        fn wrap<C: Container>(f: fn(C::Item) -> C::Item) {
+        func wrap<C: Container>(f: func(C::Item) -> C::Item) {
             process(f)
         }
     "});
@@ -7773,10 +8547,10 @@ fn test_assoc_type_projection_in_tuple_wrapper() {
         trait Container {
             type Item;
         }
-        fn process<C: Container>(pair: (C::Item, C::Item)) {
+        func process<C: Container>(pair: (C::Item, C::Item)) {
             unreachable
         }
-        fn wrap<C: Container>(pair: (C::Item, C::Item)) {
+        func wrap<C: Container>(pair: (C::Item, C::Item)) {
             process(pair)
         }
     "});
@@ -7795,10 +8569,10 @@ fn test_assoc_type_projection_in_pointer_wrapper() {
             trait Container {
                 type Item;
             }
-            fn process<C: Container>(ptr: &C::Item) {
+            func process<C: Container>(ptr: &C::Item) {
                 unreachable
             }
-            fn wrap<C: Container>(ptr: &C::Item) {
+            func wrap<C: Container>(ptr: &C::Item) {
                 process(ptr)
             }
         "},
@@ -7811,13 +8585,13 @@ fn test_assoc_type_projection_in_pointer_wrapper() {
 
 #[test]
 fn test_generic_over_memory_size_in_signature() {
-	// A generic fn<M: Memory>(M::Size) → M::Size must resolve without errors:
+	// A generic func<M: Memory>(M::Size) → M::Size must resolve without errors:
 	// M::Size stays as AssocTypeProjection in the generic signature.
 	let case = TestCase::new_multi_file(
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
+            func pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
                 n
             }
         "},
@@ -7833,10 +8607,10 @@ fn test_generic_over_memory_called_with_concrete_memory() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
+            func pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
                 n
             }
-            pub fn caller(n: u32) -> u32 {
+            pub func caller(n: u32) -> u32 {
                 pass(heap, n)
             }
         "},
@@ -7852,10 +8626,10 @@ fn test_generic_over_memory_wrong_size_type_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
+            func pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
                 n
             }
-            pub fn caller(n: i64) -> u32 {
+            pub func caller(n: i64) -> u32 {
                 pass(heap, n)
             }
         "},
@@ -7873,13 +8647,13 @@ fn test_generic_over_memory_two_concrete_memories() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             memory stack: Memory where { Size = u64 };
-            fn pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
+            func pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
                 n
             }
-            pub fn use_heap(n: u32) -> u32 {
+            pub func use_heap(n: u32) -> u32 {
                 pass(heap, n)
             }
-            pub fn use_stack(n: u64) -> u64 {
+            pub func use_stack(n: u64) -> u64 {
                 pass(stack, n)
             }
         "},
@@ -7901,11 +8675,11 @@ fn test_infer_placeholder_in_generic_type_arg() {
             memory heap: Memory where { Size = u32 };
             struct Layout<M: Memory> { size: M::Size }
             impl <M: Memory> Layout<M> {
-                pub fn new(size: M::Size) -> Layout<M> {
+                pub func new(size: M::Size) -> Layout<M> {
                     Layout::{ size }
                 }
             }
-            pub fn demo() {
+            pub func demo() {
                 local x: Layout<_> = Layout::<heap>::new(4 as u32);
             }
         "},
@@ -7925,11 +8699,11 @@ fn test_cannot_infer_generic_type_param_error() {
             memory heap: Memory where { Size = u32 };
             struct Layout<M: Memory> { size: M::Size }
             impl <M: Memory> Layout<M> {
-                pub fn array<T>(count: M::Size) -> Layout<M> {
+                pub func array<T>(count: M::Size) -> Layout<M> {
                     Layout::{ size: count }
                 }
             }
-            pub fn demo() {
+            pub func demo() {
                 local y = Layout::array::<i32>(4);
             }
         "},
@@ -7945,11 +8719,11 @@ fn test_cannot_infer_generic_type_param_error() {
             memory heap: Memory where { Size = u32 };
             struct Layout<M: Memory> { size: M::Size }
             impl <M: Memory> Layout<M> {
-                pub fn array<T>(count: M::Size) -> Layout<M> {
+                pub func array<T>(count: M::Size) -> Layout<M> {
                     Layout::{ size: count }
                 }
             }
-            pub fn demo() {
+            pub func demo() {
                 local y = Layout::<heap>::array::<i32>(10);
             }
         "},
@@ -7963,7 +8737,7 @@ fn test_cannot_infer_generic_type_param_error() {
 #[test]
 fn test_infer_in_function_param_type_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn foo(x: _) -> i32 { 0 }
+        func foo(x: _) -> i32 { 0 }
     "});
 	has_error_matching(
 		&case,
@@ -7974,7 +8748,7 @@ fn test_infer_in_function_param_type_is_error() {
 #[test]
 fn test_infer_in_function_return_type_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn foo() -> _ { 0 }
+        func foo() -> _ { 0 }
     "});
 	has_error_matching(
 		&case,
@@ -8008,7 +8782,7 @@ fn test_infer_in_global_declaration_is_error() {
 fn test_infer_in_cast_without_context_is_error() {
 	// `42 as _` with no type context — target type cannot be inferred.
 	let case = TestCase::new(indoc! {"
-        fn foo() { local x = 42 as _; }
+        func foo() { local x = 42 as _; }
     "});
 	assert!(has_error_code(
 		&case.tir,
@@ -8020,7 +8794,7 @@ fn test_infer_in_cast_without_context_is_error() {
 fn test_infer_in_cast_with_context_succeeds() {
 	// `42 as _` where context supplies the target type — should lower cleanly.
 	let case = TestCase::new(indoc! {"
-        fn foo() -> i32 { 42 as _ }
+        func foo() -> i32 { 42 as _ }
     "});
 	no_errors(&case);
 }
@@ -8029,7 +8803,7 @@ fn test_infer_in_cast_with_context_succeeds() {
 fn test_infer_multi_wildcard_tuple_annotation() {
 	// Both `_` slots should be filled from the RHS — no error.
 	let case = TestCase::new(indoc! {"
-        fn foo() {
+        func foo() {
             local x: (i32, f32) = (1 as i32, 2.0 as f32);
             local y: (_, _) = (1 as i32, 2.0 as f32);
         }
@@ -8042,7 +8816,7 @@ fn test_infer_annotation_type_mismatch_still_errors() {
 	// `local x: i32 = 1.0 as f32` should still produce a type mismatch even
 	// when using `_` for the other slot.
 	let case = TestCase::new(indoc! {"
-        fn foo() {
+        func foo() {
             local x: (i32, _) = (1.0 as f32, 2 as i32);
         }
     "});
@@ -8054,7 +8828,7 @@ fn test_infer_local_no_rhs_annotation_only_is_error() {
 	// `local x: _` with no initializer is not valid syntax, but `local x: _ = expr`
 	// where expr is also completely unconstrained should produce an error.
 	let case = TestCase::new(indoc! {"
-        fn foo() -> i32 {
+        func foo() -> i32 {
             local x: _ = 42;
             x
         }
@@ -8074,7 +8848,7 @@ fn test_module_namespace_type_access() {
         mod shapes {
             pub struct Circle {}
         }
-        fn use_circle(c: shapes::Circle) {
+        func use_circle(c: shapes::Circle) {
             unreachable
         }
     "});
@@ -8090,7 +8864,7 @@ fn test_memory_tagged_pointer() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(p: heap::&i32) {
+            func f(p: heap::&i32) {
                 unreachable
             }
         "},
@@ -8128,7 +8902,7 @@ fn test_memory_tagged_slice() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(s: heap::&[u8]) {
+            func f(s: heap::&[u8]) {
                 unreachable
             }
         "},
@@ -8166,7 +8940,7 @@ fn test_memory_tagged_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[u8; 4]) {
+            func f(a: heap::&[u8; 4]) {
                 unreachable
             }
         "},
@@ -8206,7 +8980,7 @@ fn test_memory_tagged_nested_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[heap::&[u8; 4]; 4]) {
+            func f(a: heap::&[heap::&[u8; 4]; 4]) {
                 unreachable
             }
         "},
@@ -8257,7 +9031,7 @@ fn test_memory_tagged_non_pointer_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(x: heap::i32) {
+            func f(x: heap::i32) {
                 unreachable
             }
         "},
@@ -8273,7 +9047,7 @@ fn test_untagged_and_tagged_pointer_resolve_to_same_type() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: &i32, b: heap::&i32) {
+            func f(a: &i32, b: heap::&i32) {
                 unreachable
             }
         "},
@@ -8307,8 +9081,8 @@ fn test_function_reference_has_function_item_type() {
 	// ensures the compiler preserves the function's identity rather than
 	// exposing its raw (potentially TypeParam-polluted) signature.
 	let case = TestCase::new(indoc! {"
-        fn square(n: i32) -> i32 { n * n }
-        fn main() {
+        func square(n: i32) -> i32 { n * n }
+        func main() {
             local f = square
         }
     "});
@@ -8339,12 +9113,12 @@ fn test_function_reference_has_function_item_type() {
 #[test]
 fn test_generic_function_reference_has_function_item_not_fn_pointer() {
 	// A reference to a generic function must produce `FunctionItem`, not
-	// `Function { signature: fn(TypeParam{0}) -> TypeParam{0} }`. The old
+	// `Function { signature: func(TypeParam{0}) -> TypeParam{0} }`. The old
 	// representation leaked TypeParam internals and made it impossible to
 	// distinguish which function was being referenced.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
-        fn main() {
+        func identity<T>(t: T) -> T { t }
+        func main() {
             local f = identity
         }
     "});
@@ -8367,7 +9141,7 @@ fn test_generic_function_reference_has_function_item_not_fn_pointer() {
 		"expected Type::FunctionItem for generic 'identity'"
 	);
 
-	// The function's own signature_index is still fn(TypeParam{0}) ->
+	// The function's own signature_index is still func(TypeParam{0}) ->
 	// TypeParam{0} in the pool (needed for the function body), but function
 	// *reference* expressions must use FunctionItem, not expose that raw
 	// signature as their value type.
@@ -8379,8 +9153,8 @@ fn test_indirect_call_via_function_item_local_compiles() {
 	// `f` has type `FunctionItem`, but calling it works because
 	// `build_call_expression` resolves the signature through the function id.
 	let case = TestCase::new(indoc! {"
-        fn square(n: i32) -> i32 { n * n }
-        fn main() -> i32 {
+        func square(n: i32) -> i32 { n * n }
+        func main() -> i32 {
             local f = square
             f(5)
         }
@@ -8392,12 +9166,12 @@ fn test_indirect_call_via_function_item_local_compiles() {
 fn test_function_item_type_error_label_names_function() {
 	// When a `FunctionItem` is passed where a concrete function-pointer type is
 	// expected, the error label must name the function ("identity"), not show
-	// its raw signature ("fn(T0) -> T0"). This verifies `display_type` for
+	// its raw signature ("func(T0) -> T0"). This verifies `display_type` for
 	// `Type::FunctionItem` returns the function name.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
-        fn take_fn(f: fn(i32) -> i32) -> i32 { f(0) }
-        fn main() -> i32 {
+        func identity<T>(t: T) -> T { t }
+        func take_fn(f: func(i32) -> i32) -> i32 { f(0) }
+        func main() -> i32 {
             take_fn(identity)
         }
     "});
@@ -8406,7 +9180,7 @@ fn test_function_item_type_error_label_names_function() {
 			.diagnostics
 			.iter()
 			.any(|d| d.severity == Severity::Error),
-		"expected a type error when passing FunctionItem where fn pointer expected"
+		"expected a type error when passing FunctionItem where func pointer expected"
 	);
 	assert!(
 		case.tir.diagnostics.iter().any(|d| {
@@ -8419,11 +9193,11 @@ fn test_function_item_type_error_label_names_function() {
 #[test]
 fn test_missing_argument_uses_callee_type_param_names() {
 	let case = TestCase::new(indoc! {"
-        fn take<T>(value: T) {
+        func take<T>(value: T) {
             unreachable
         }
 
-        fn wrap<U>() {
+        func wrap<U>() {
             take()
         }
     "});
@@ -8451,9 +9225,9 @@ fn test_two_functions_have_distinct_function_item_types() {
 	// Sharing a type between different functions would break identity-based
 	// dispatch and type checking.
 	let case = TestCase::new(indoc! {"
-        fn square(n: i32) -> i32 { n * n }
-        fn double(n: i32) -> i32 { n + n }
-        fn main() {
+        func square(n: i32) -> i32 { n * n }
+        func double(n: i32) -> i32 { n + n }
+        func main() {
             local a = square
             local b = double
         }
@@ -8497,16 +9271,16 @@ fn test_two_functions_have_distinct_function_item_types() {
 
 #[test]
 fn test_function_item_coerces_to_matching_fn_pointer_type() {
-	// A FunctionItem must be implicitly coercible to a `fn(...)` parameter
+	// A FunctionItem must be implicitly coercible to a `func(...)` parameter
 	// whose signature matches exactly. This is the `func_pointers.wx` pattern:
 	// passing a named function where a function-pointer argument is expected.
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
-        fn sub(a: i32, b: i32) -> i32 { a - b }
-        fn apply(binop: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+        func add(a: i32, b: i32) -> i32 { a + b }
+        func sub(a: i32, b: i32) -> i32 { a - b }
+        func apply(binop: func(i32, i32) -> i32, a: i32, b: i32) -> i32 {
             binop(a, b)
         }
-        fn main() -> i32 {
+        func main() -> i32 {
             local a = apply(add, 5, 10)
             local b = apply(sub, 10, 5)
             a + b
@@ -8517,12 +9291,12 @@ fn test_function_item_coerces_to_matching_fn_pointer_type() {
 
 #[test]
 fn test_function_item_wrong_signature_is_error() {
-	// A FunctionItem must NOT coerce to a `fn(...)` type with a different
+	// A FunctionItem must NOT coerce to a `func(...)` type with a different
 	// signature — the arity or parameter types must match exactly.
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
-        fn apply(binop: fn(i32) -> i32, n: i32) -> i32 { binop(n) }
-        fn main() -> i32 {
+        func add(a: i32, b: i32) -> i32 { a + b }
+        func apply(binop: func(i32) -> i32, n: i32) -> i32 { binop(n) }
+        func main() -> i32 {
             apply(add, 5)
         }
     "});
@@ -8533,11 +9307,11 @@ fn test_function_item_wrong_signature_is_error() {
 
 #[test]
 fn test_type_application_coerces_to_fn_pointer() {
-	// `identity::<i32>` must coerce to `fn(i32) -> i32`.
+	// `identity::<i32>` must coerce to `func(i32) -> i32`.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
-        fn main() {
-            local f: fn(i32) -> i32 = identity::<i32>
+        func identity<T>(t: T) -> T { t }
+        func main() {
+            local f: func(i32) -> i32 = identity::<i32>
         }
     "});
 	no_errors(&case);
@@ -8546,8 +9320,8 @@ fn test_type_application_coerces_to_fn_pointer() {
 #[test]
 fn test_type_application_wrong_arg_count_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
-        fn main() {
+        func identity<T>(t: T) -> T { t }
+        func main() {
             local f = identity::<i32, i64>
         }
     "});
@@ -8565,14 +9339,14 @@ fn test_type_application_wrong_arg_count_is_error() {
 #[test]
 fn test_type_application_on_non_generic_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
-        fn main() {
+        func add(a: i32, b: i32) -> i32 { a + b }
+        func main() {
             local f = add::<i32>
         }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypeArgCountMismatch),
-		"expected E1040 (TypeArgCountMismatch) for type args on non-generic fn, got: {:?}",
+		"expected E1040 (TypeArgCountMismatch) for type args on non-generic func, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -8596,14 +9370,14 @@ fn test_generic_method_self_shape_mismatch_reports_clear_diagnostic() {
         memory heap: Memory where { Size = u32 };
 
         trait Foo {
-            fn bar<T>(self: &Self) -> T { unreachable }
+            func bar<T>(self: &Self) -> T { unreachable }
         }
 
         struct S {}
 
         impl Foo for S {}
 
-        fn f() {
+        func f() {
             local s = S::{};
             local n = s.bar::<u32>();
         }
@@ -8637,9 +9411,9 @@ fn test_method_call_turbofish_resolves_own_type_param() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<M> { x: M }
         impl <M> Wrapper<M> {
-            pub fn make<T>(self) -> T { unreachable }
+            pub func make<T>(self) -> T { unreachable }
         }
-        fn f(w: Wrapper<i32>) -> u32 {
+        func f(w: Wrapper<i32>) -> u32 {
             w.make::<u32>()
         }
         export { f }
@@ -8653,7 +9427,7 @@ fn test_method_call_turbofish_pads_past_impl_level_type_args() {
 	// (e.g. `[M = heap]`, length 1) as-is whenever it was non-empty, instead
 	// of padding it out to the method's *total* type param count (impl-level
 	// + the method's own). For a generic inherent-impl method that also
-	// declares its own additional type param (`fn make<T>` on `impl<M> Wrapper<M>`),
+	// declares its own additional type param (`func make<T>` on `impl<M> Wrapper<M>`),
 	// this left `type_args` one slot too short. Turbofish merging (which
 	// writes into the trailing "own" slots, offset by the impl-level count)
 	// then corrupted the *impl-level* slot instead — `M` got overwritten with
@@ -8664,9 +9438,9 @@ fn test_method_call_turbofish_pads_past_impl_level_type_args() {
         memory heap: Memory where { Size = u32 };
         struct Wrapper<M: Memory> { x: M::Size }
         impl <M: Memory> Wrapper<M> {
-            pub fn make<T>(self) -> T { unreachable }
+            pub func make<T>(self) -> T { unreachable }
         }
-        fn f(w: Wrapper<heap>) -> u32 {
+        func f(w: Wrapper<heap>) -> u32 {
             w.make::<u32>()
         }
         export { f }
@@ -8679,9 +9453,9 @@ fn test_method_call_turbofish_wrong_count_is_error() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<M> { x: M }
         impl <M> Wrapper<M> {
-            pub fn make<T>(self) -> T { unreachable }
+            pub func make<T>(self) -> T { unreachable }
         }
-        fn f(w: Wrapper<i32>) -> u32 {
+        func f(w: Wrapper<i32>) -> u32 {
             w.make::<u32, i32>()
         }
         export { f }
@@ -8702,9 +9476,9 @@ fn test_method_call_turbofish_on_non_generic_method_is_error() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<M> { x: M }
         impl <M> Wrapper<M> {
-            pub fn plain(self) -> i32 { 0 }
+            pub func plain(self) -> i32 { 0 }
         }
-        fn f(w: Wrapper<i32>) -> i32 {
+        func f(w: Wrapper<i32>) -> i32 {
             w.plain::<i32>()
         }
         export { f }
@@ -8724,10 +9498,10 @@ fn test_method_call_turbofish_on_non_generic_method_is_error() {
 fn test_type_application_in_if_else_unifies() {
 	// Two distinct generic instantiations with the same signature unify.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
-        fn wrap<T>(t: T) -> T { t }
-        fn main() -> fn(i32) -> i32 {
-            local f: fn(i32) -> i32 = if true { identity::<i32> } else { wrap::<i32> }
+        func identity<T>(t: T) -> T { t }
+        func wrap<T>(t: T) -> T { t }
+        func main() -> func(i32) -> i32 {
+            local f: func(i32) -> i32 = if true { identity::<i32> } else { wrap::<i32> }
             f
         }
     "});
@@ -8742,7 +9516,7 @@ fn test_deref_load_through_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn read(ptr: heap::&i32) -> i32 { ptr.* }
+        func read(ptr: heap::&i32) -> i32 { ptr.* }
     "},
 		&[],
 	);
@@ -8755,7 +9529,7 @@ fn test_deref_store_through_mutable_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn write(ptr: heap::*i32) { ptr.* = 42 }
+        func write(ptr: heap::*i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -8768,7 +9542,7 @@ fn test_deref_arithmetic_assignment_through_mutable_pointer() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn increment(ptr: heap::*i32) { ptr.* += 1 }
+        func increment(ptr: heap::*i32) { ptr.* += 1 }
     "},
 		&[],
 	);
@@ -8778,7 +9552,7 @@ fn test_deref_arithmetic_assignment_through_mutable_pointer() {
 #[test]
 fn test_deref_non_pointer_type_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn bad(x: i32) -> i32 { x.* }
+        func bad(x: i32) -> i32 { x.* }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::CannotDerefNonPointer),
@@ -8789,7 +9563,7 @@ fn test_deref_non_pointer_type_is_error() {
 #[test]
 fn test_deref_no_memory_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn bad(ptr: *i32) -> i32 { ptr.* }
+        func bad(ptr: *i32) -> i32 { ptr.* }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::NoMemoryForPointer),
@@ -8803,7 +9577,7 @@ fn test_deref_store_through_immutable_pointer_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::&i32) { ptr.* = 42 }
+        func bad(ptr: heap::&i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -8824,7 +9598,7 @@ fn test_deref_arithmetic_assignment_through_immutable_pointer_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::&i32) { ptr.* += 1 }
+        func bad(ptr: heap::&i32) { ptr.* += 1 }
     "},
 		&[],
 	);
@@ -8845,7 +9619,7 @@ fn test_deref_type_mismatch_on_store_is_error() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(ptr: heap::*i32) { ptr.* = true }
+        func bad(ptr: heap::*i32) { ptr.* = true }
     "},
 		&[],
 	);
@@ -8863,11 +9637,11 @@ fn test_path_type_associated_fn_ufcs() {
 	let case = TestCase::new(indoc! {"
         struct Signed { value: i32 }
         impl Signed {
-            pub fn abs(self) -> i32 {
+            pub func abs(self) -> i32 {
                 if self.value < 0 { -self.value } else { self.value }
             }
         }
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             Signed::abs(Signed::{ value: x })
         }
         export { f }
@@ -8881,9 +9655,9 @@ fn test_path_struct_associated_fn_no_params() {
 	let case = TestCase::new(indoc! {"
         struct Counter { value: u32 }
         impl Counter {
-            pub fn zero() -> Counter { Counter::{ value: 0 } }
+            pub func zero() -> Counter { Counter::{ value: 0 } }
         }
-        fn test() -> Counter { Counter::zero() }
+        func test() -> Counter { Counter::zero() }
         export { test }
     "});
 	no_errors(&case);
@@ -8895,9 +9669,9 @@ fn test_path_generic_struct_associated_fn() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { value: T }
         impl<T> Wrapper<T> {
-            pub fn new(value: T) -> Wrapper<T> { Wrapper::{ value } }
+            pub func new(value: T) -> Wrapper<T> { Wrapper::{ value } }
         }
-        fn test() -> Wrapper<u32> { Wrapper::<u32>::new(42) }
+        func test() -> Wrapper<u32> { Wrapper::<u32>::new(42) }
         export { test }
     "});
 	no_errors(&case);
@@ -8911,10 +9685,10 @@ fn test_path_inline_module_type_associated_fn() {
         mod math {
             pub struct Point {}
             impl Point {
-                pub fn zero() -> i32 { 0 }
+                pub func zero() -> i32 { 0 }
             }
         }
-        fn f() -> i32 {
+        func f() -> i32 {
             math::Point::zero()
         }
         export { f }
@@ -8930,7 +9704,7 @@ fn test_path_cross_module_struct_init() {
 		indoc! {"
             mod shapes;
 
-            fn make() -> shapes::Point {
+            func make() -> shapes::Point {
                 shapes::Point::{ x: 1, y: 2 }
             }
 
@@ -8953,7 +9727,7 @@ fn test_path_cross_module_generic_struct_init() {
 		indoc! {"
             mod containers;
 
-            fn make() -> containers::Wrapper::<i32> {
+            func make() -> containers::Wrapper::<i32> {
                 containers::Wrapper::<i32>::{ value: 42 }
             }
 
@@ -8977,10 +9751,10 @@ fn test_generic_struct_concrete_impl() {
         }
 
         impl Point<i32> {
-            pub fn sum(self) -> i32 { self.x + self.y }
+            pub func sum(self) -> i32 { self.x + self.y }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local p: Point<i32> = Point::{ x: 3, y: 4 };
             p.sum()
         }
@@ -9000,10 +9774,10 @@ fn test_generic_struct_method() {
         }
 
         impl<T> Point<T> {
-            pub fn get_x(self) -> T { self.x }
+            pub func get_x(self) -> T { self.x }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local p: Point<i32> = Point::{ x: 3, y: 4 };
             p.get_x()
         }
@@ -9022,7 +9796,7 @@ fn test_array_literal_basic() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::&[i32; 3] {
+            func f() -> heap::&[i32; 3] {
                 local x: heap::&[i32; 3] = [1, 2, 3];
                 x
             }
@@ -9038,7 +9812,7 @@ fn test_array_literal_mutable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::*[i32; 3] {
+            func f() -> heap::*[i32; 3] {
                 local x: heap::*[i32; 3] = [1, 2, 3];
                 x
             }
@@ -9054,7 +9828,7 @@ fn test_array_literal_float_elements() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::&[f32; 2] {
+            func f() -> heap::&[f32; 2] {
                 local x: heap::&[f32; 2] = [1.0, 2.0];
                 x
             }
@@ -9070,7 +9844,7 @@ fn test_array_literal_empty_with_annotation() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::&[i32; 0] {
+            func f() -> heap::&[i32; 0] {
                 local x: heap::&[i32; 0] = [];
                 x
             }
@@ -9086,7 +9860,7 @@ fn test_array_literal_size_mismatch_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() {
+            func f() {
                 local x: heap::&[i32; 3] = [1, 2];
             }
         "},
@@ -9106,7 +9880,7 @@ fn test_array_literal_no_annotation_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() {
+            func f() {
                 local x = [1, 2, 3];
             }
         "},
@@ -9122,7 +9896,7 @@ fn test_array_literal_no_annotation_is_error() {
 fn test_array_literal_no_memory_is_error() {
 	// No memory declaration — array cannot be placed in linear memory.
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
             local x: &[i32; 3] = [1, 2, 3];
         }
     "});
@@ -9138,7 +9912,7 @@ fn test_array_literal_non_numeric_element_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() {
+            func f() {
                 local x: heap::&[i32; 2] = [true, false];
             }
         "},
@@ -9154,7 +9928,7 @@ fn test_array_literal_mixed_element_types_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(b: bool) {
+            func f(b: bool) {
                 local x: heap::&[bool; 2] = [b, b];
             }
         "},
@@ -9172,7 +9946,7 @@ fn test_array_repeat_basic() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::&[i32; 4] {
+            func f() -> heap::&[i32; 4] {
                 local x: heap::&[i32; 4] = [0; 4];
                 x
             }
@@ -9188,7 +9962,7 @@ fn test_array_repeat_float() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() -> heap::&[f64; 8] {
+            func f() -> heap::&[f64; 8] {
                 local x: heap::&[f64; 8] = [0.0; 8];
                 x
             }
@@ -9204,7 +9978,7 @@ fn test_array_repeat_count_not_const_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(n: u32) {
+            func f(n: u32) {
                 local x: heap::&[i32; 4] = [0; n];
             }
         "},
@@ -9222,7 +9996,7 @@ fn test_array_repeat_size_mismatch_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() {
+            func f() {
                 local x: heap::&[i32; 4] = [0; 3];
             }
         "},
@@ -9240,7 +10014,7 @@ fn test_array_repeat_no_annotation_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f() {
+            func f() {
                 local x = [0; 4];
             }
         "},
@@ -9258,7 +10032,7 @@ fn test_array_repeat_non_numeric_value_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(b: bool) {
+            func f(b: bool) {
                 local x: heap::&[i32; 4] = [b; 4];
             }
         "},
@@ -9276,7 +10050,7 @@ fn test_index_read_from_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
+            func f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -9289,7 +10063,7 @@ fn test_index_read_from_slice() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32]) -> i32 { a[0] }
+            func f(a: heap::&[i32]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -9299,7 +10073,7 @@ fn test_index_read_from_slice() {
 #[test]
 fn test_index_on_non_indexable_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 { x[0] }
+        func f(x: i32) -> i32 { x[0] }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::IndexOnNonIndexable),
@@ -9314,7 +10088,7 @@ fn test_index_wrong_index_type_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4], i: i64) -> i32 { a[i] }
+            func f(a: heap::&[i32; 4], i: i64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -9335,7 +10109,7 @@ fn test_index_store_through_mutable_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::*[i32; 4]) { a[0] = 42 }
+            func f(a: heap::*[i32; 4]) { a[0] = 42 }
         "},
 		&[],
 	);
@@ -9348,7 +10122,7 @@ fn test_index_store_through_immutable_array_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4]) { a[0] = 42 }
+            func f(a: heap::&[i32; 4]) { a[0] = 42 }
         "},
 		&[],
 	);
@@ -9369,7 +10143,7 @@ fn test_index_arithmetic_assignment_through_mutable_array() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::*[i32; 4]) { a[0] += 1 }
+            func f(a: heap::*[i32; 4]) { a[0] += 1 }
         "},
 		&[],
 	);
@@ -9382,7 +10156,7 @@ fn test_index_arithmetic_assignment_through_immutable_array_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4]) { a[0] += 1 }
+            func f(a: heap::&[i32; 4]) { a[0] += 1 }
         "},
 		&[],
 	);
@@ -9403,7 +10177,7 @@ fn test_index_store_type_mismatch_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::*[i32; 4]) { a[0] = true }
+            func f(a: heap::*[i32; 4]) { a[0] = true }
         "},
 		&[],
 	);
@@ -9416,7 +10190,7 @@ fn test_index_memory64_requires_u64_index() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u64 };
-            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
+            func f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -9432,7 +10206,7 @@ fn test_index_ambiguous_memory_is_error() {
 		indoc! {"
             memory heap: Memory where { Size = u32 };
             memory stack: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4]) -> i32 { a[0] }
+            func f(a: heap::&[i32; 4]) -> i32 { a[0] }
         "},
 		&[],
 	);
@@ -9447,7 +10221,7 @@ fn test_array_literal_runtime_element_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(x: i32) {
+            func f(x: i32) {
                 local arr: heap::&[i32; 2] = [x, 1];
             }
         "},
@@ -9465,7 +10239,7 @@ fn test_array_repeat_runtime_value_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(x: i32) {
+            func f(x: i32) {
                 local arr: heap::&[i32; 4] = [x; 4];
             }
         "},
@@ -9486,7 +10260,7 @@ fn test_index_concrete_memory32_typed_variable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4], i: u32) -> i32 { a[i] }
+            func f(a: heap::&[i32; 4], i: u32) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -9500,7 +10274,7 @@ fn test_index_concrete_memory64_typed_variable() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u64 };
-            fn f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
+            func f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -9514,7 +10288,7 @@ fn test_index_memory32_with_u64_variable_is_error() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
+            func f(a: heap::&[i32; 4], i: u64) -> i32 { a[i] }
         "},
 		&[],
 	);
@@ -9537,7 +10311,7 @@ fn test_index_generic_array_with_assoc_size_type() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
+            func read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
                 arr[i]
             }
         "},
@@ -9553,7 +10327,7 @@ fn test_index_generic_slice_with_assoc_size_type() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(s: M::&[i32], i: M::Size) -> i32 {
+            func read<M: Memory>(s: M::&[i32], i: M::Size) -> i32 {
                 s[i]
             }
         "},
@@ -9570,10 +10344,10 @@ fn test_index_generic_array_call_with_concrete_memory() {
 		"main.wx",
 		indoc! {"
             memory heap: Memory where { Size = u32 };
-            fn read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
+            func read<M: Memory>(arr: M::&[i32; 4], i: M::Size) -> i32 {
                 arr[i]
             }
-            fn caller(arr: heap::&[i32; 4], i: u32) -> i32 {
+            func caller(arr: heap::&[i32; 4], i: u32) -> i32 {
                 read(arr, i)
             }
         "},
@@ -9590,8 +10364,8 @@ fn test_generic_call_with_satisfying_type_is_ok() {
 	let case = TestCase::new(indoc! {"
         trait UnsignedInteger {}
         impl UnsignedInteger for u32 {}
-        fn test<U: UnsignedInteger>(u: U) {}
-        fn main() { test(42 as u32); }
+        func test<U: UnsignedInteger>(u: U) {}
+        func main() { test(42 as u32); }
         export { main }
     "});
 	let errors: Vec<_> = case
@@ -9625,8 +10399,8 @@ fn test_generic_call_turbofish_with_non_satisfying_type_is_error() {
         }
         impl UnsignedInt for u32 { type Signed = i32; }
         impl SignedInt for i32 { type Unsigned = u32; }
-        fn get_signed<T: UnsignedInt>(unsigne: T) -> T::Signed { unreachable }
-        fn test() {
+        func get_signed<T: UnsignedInt>(unsigne: T) -> T::Signed { unreachable }
+        func test() {
             local x = get_signed::<i32>(1);
         }
     "});
@@ -9656,8 +10430,8 @@ fn test_generic_call_inferred_with_non_satisfying_type_is_error() {
         }
         impl UnsignedInt for u32 { type Signed = i32; }
         impl SignedInt for i32 { type Unsigned = u32; }
-        fn get_signed<T: UnsignedInt>(unsigne: T) -> T::Signed { unreachable }
-        fn test() {
+        func get_signed<T: UnsignedInt>(unsigne: T) -> T::Signed { unreachable }
+        func test() {
             local x = get_signed(1 as i32);
         }
     "});
@@ -9671,6 +10445,392 @@ fn test_generic_call_inferred_with_non_satisfying_type_is_error() {
 			.map(|d| &d.message)
 			.collect::<Vec<_>>(),
 	);
+}
+
+// ── bound-consistency matrix ────────────────────────────────────────────────
+//
+// One associated-type constraint of the form `T: Trait where { Assoc = Type }`
+// (or a nested `{ Assoc: Bound where { .. } }`), checked against a concrete
+// `T` whose impl disagrees. `check_bound_bindings` (validation.rs) enforces
+// the declaration form — see `test_declaration_assoc_equality_demands_later_
+// impl_members`, which passes — but the other two entry points into "does
+// this type satisfy these bounds" do not:
+//   * call sites go through the `assoc_checks` pass in calls.rs, which only
+//     re-checks `AssocBindingKind::Bound` entries and never recurses into a
+//     bound's own nested bindings;
+//   * impl selection goes through `type_args_satisfy_bounds` (tir/mod.rs),
+//     which inspects `bounds.traits` / `bounds.typeset` but not
+//     `trait_bound.bindings` at all.
+// Each `#[ignore]`d test flips to passing once a shared bound evaluator backs
+// all three sites.
+
+/// `f`'s bound requires `T::Item == u32`; `u8::Item` is `bool`, so `f(0 as u8)`
+/// picks `T = u8` and violates it. The call site only queues
+/// `AssocBindingKind::Bound` entries into `assoc_checks` — `Equals` bindings
+/// are dropped once `T: Has` itself is satisfied.
+#[test]
+fn test_assoc_equality_binding_mismatch_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = u32 }>(_t: T) {}
+        func main() { f(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+/// Nested `where` on a `: Bound` binding. `Foo::Mid` is `u8`, `u8: Inner`
+/// holds, but `u8::Out` is `bool`, not the required `u32`. The call-site
+/// second pass checks `required.traits` / `required.typeset` on the concrete
+/// associated value but does not recurse into `required`'s own bindings the
+/// way `check_bound_bindings` does for the declaration form.
+#[test]
+fn test_nested_assoc_binding_mismatch_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Inner { type Out; }
+        trait Outer { type Mid: Inner; }
+        impl Inner for u8 { type Out = bool; }
+        struct Foo {}
+        impl Outer for Foo { type Mid = u8; }
+        func f<T: Outer where { Mid: Inner where { Out = u32 } }>(_t: T) {}
+        func main() { f(Foo::{}); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
+}
+
+/// Method resolved through `impl<T: Has where { Item = u32 }> W<T>`. Impl
+/// selection runs `type_args_satisfy_bounds`, which walks `param.bounds.traits`
+/// and `.typeset` but never inspects `trait_bound.bindings`, so the impl is
+/// considered applicable to `W<u8>` even though `u8::Item` is `bool`.
+#[test]
+fn test_assoc_binding_mismatch_caught_during_impl_selection() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T: Has where { Item = u32 }> W<T> {
+            func go(self) {}
+        }
+        func use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	// A `MethodNotFound` for `go` (the impl correctly not applying) would be
+	// an equally acceptable outcome; today neither is produced.
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation)
+			|| case.tir.diagnostics.iter().any(|d| {
+				d.code.as_deref() == Some(DiagnosticCode::MethodNotFound.code())
+					&& d.message.contains("go")
+			}),
+		"expected an unsatisfied-binding error for `W<u8>.go()`, got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+/// The `: Bound` form of an associated binding at method-call impl selection
+/// (`impl<T: Has where { Item: Marker }> W<T>`) — the sibling above only
+/// covers `= Type`. `u8::Item` is `bool`, which does not implement `Marker`,
+/// so the impl must not apply.
+#[test]
+fn test_bound_kind_assoc_binding_at_impl_selection_rejects() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T: Has where { Item: Marker }> W<T> {
+            func go(self) {}
+        }
+        func use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation)
+			|| case.tir.diagnostics.iter().any(|d| {
+				d.code.as_deref() == Some(DiagnosticCode::MethodNotFound.code())
+					&& d.message.contains("go")
+			}),
+		"expected `W<u8>.go()` not to resolve (`u8::Item` = `bool` is not `Marker`), got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+/// The same impl *does* apply once the binding is satisfied — guards
+/// `assoc_bindings_hold` against false-rejecting a valid generic impl.
+#[test]
+fn test_bound_kind_assoc_binding_at_impl_selection_accepts() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        impl Marker for bool {}
+        struct W<T> { v: T }
+        impl<T: Has where { Item: Marker }> W<T> {
+            func go(self) {}
+        }
+        func use_it(w: W<u8>) { w.go(); }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+/// Three levels of `Bound` nesting in one `where` clause, with the violation
+/// at the innermost (`TopImpl::A::B::C` resolves to `bool`, which is not
+/// `Marker`). `check_bounds` reaches it only by recursing once per nested
+/// `where`; a one-level check would stop at `A`'s own refinements. Regression
+/// guard for keeping that recursion.
+#[test]
+fn test_deeply_nested_bound_binding_violation_caught_at_free_call() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid { type B: Deep; }
+        trait Top { type A: Mid; }
+
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = bool; }
+
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+
+        struct TopImpl {}
+        impl Top for TopImpl { type A = MidImpl; }
+
+        func f<T: Top where { A: Mid where { B: Deep where { C: Marker } } }>(_t: T) {}
+        func main() { f(TopImpl::{}); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `bool: Marker` is not satisfied");
+}
+
+/// The same violation with the callee in another file. Every span a bound
+/// check reports has to be paired with the file that actually contains it:
+/// the nested levels are spanned by the *callee's* `where` clause, so pairing
+/// one of those with the caller's file id put the primary label at an offset
+/// past the end of `main.wx`, which renders as a blank line.
+///
+/// The primary belongs on the call — that is the code whose author can act on
+/// it — and which nested constraint failed is what the secondary label says,
+/// in the file that holds it.
+#[test]
+fn test_nested_bound_violation_labels_the_call_not_the_callees_span() {
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod dep;
+            struct TopImpl {}
+            impl dep::Top for TopImpl { type A = dep::MidImpl; }
+            func main() { dep::f(TopImpl::{}); }
+            export { main }
+        "},
+		&[(
+			"src/dep.wx",
+			indoc! {"
+                pub trait Marker {}
+                pub trait Deep { type C; }
+                pub trait Mid { type B: Deep; }
+                pub trait Top { type A: Mid; }
+                pub struct DeepImpl {}
+                impl Deep for DeepImpl { type C = bool; }
+                pub struct MidImpl {}
+                impl Mid for MidImpl { type B = DeepImpl; }
+                pub func f<T: Top where { A: Mid where { B: Deep where { C: Marker } } }>(_t: T) {}
+            "},
+		)],
+	);
+	let diagnostic = case
+		.tir
+		.diagnostics
+		.iter()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())
+		})
+		.expect("expected the nested bound violation to be reported");
+	for label in diagnostic.labels.iter() {
+		let file = case.graph.files.get(label.file_id).unwrap();
+		assert!(
+			label.range.end <= file.source.len(),
+			"label range {:?} is outside its own file (len {})",
+			label.range,
+			file.source.len(),
+		);
+	}
+	let primary = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Primary
+		})
+		.unwrap();
+	let primary_file = case.graph.files.get(primary.file_id).unwrap();
+	assert_eq!(
+		&primary_file.source[primary.range.clone()],
+		"TopImpl::{}",
+		"the primary label belongs on the call"
+	);
+	let secondary = diagnostic
+		.labels
+		.iter()
+		.find(|label| {
+			label.style == codespan_reporting::diagnostic::LabelStyle::Secondary
+		})
+		.unwrap();
+	assert_ne!(
+		secondary.file_id, primary.file_id,
+		"the bound that imposed this lives in the callee's file"
+	);
+	let secondary_file = case.graph.files.get(secondary.file_id).unwrap();
+	assert_eq!(&secondary_file.source[secondary.range.clone()], "Marker");
+}
+
+/// An `= Type` binding whose RHS is another of the callee's own type
+/// parameters. The RHS is written in `f`'s scope, so at the call it means
+/// whatever `U` was inferred to — `bool` here, which is exactly `u8::Item`.
+/// Comparing the RHS as written would reject this valid call with
+/// "`Item` is `bool`, expected `U`".
+#[test]
+fn test_assoc_equality_binding_rhs_reads_the_calls_type_args() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = U }, U>(_t: T, _u: U) {}
+        func main() { f(0 as u8, true); }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// The other half of the pair above: substituting the RHS must not blunt the
+/// check. `U` is `u32` here and `u8::Item` is `bool`, so the call is a real
+/// violation.
+#[test]
+fn test_assoc_equality_binding_rhs_type_param_still_catches_mismatch() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = U }, U>(_t: T, _u: U) {}
+        func main() { f(0 as u8, 0 as u32); }
+        export { main }
+    "});
+	// The message naming `u32` rather than `U` is the substitution itself
+	// showing through.
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// The same substitution, but for a parameter *inherited* from the impl
+/// block rather than one of the method's own — `T` is pinned by the
+/// receiver, not by an argument. Guards that the positional substitution
+/// indexes the whole inherited-then-own chain (`param_index` is absolute)
+/// and not just the method's own slice.
+#[test]
+fn test_assoc_equality_binding_rhs_reads_an_inherited_type_param() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            func go<U: Has where { Item = T }>(self, _u: U) {}
+        }
+        func main() { W::<bool>::{ v: true }.go(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_assoc_equality_binding_rhs_inherited_type_param_catches_mismatch() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            func go<U: Has where { Item = T }>(self, _u: U) {}
+        }
+        func main() { W::<u32>::{ v: 0 as u32 }.go(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// A phantom parameter in the RHS — `U` appears nowhere in `f`'s signature,
+/// so the call can never pin it down. That is already reported as
+/// un-inferrable; the binding is then unprovable rather than violated, and
+/// must not stack a second error naming the unsubstituted `U`.
+#[test]
+fn test_uninferrable_binding_rhs_reports_only_the_inference_error() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = U }, U>(_t: T) {}
+        func main() { f(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TypeAnnotationRequired);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
+}
+
+/// A binding is compared even when the subject is *abstract*. Inside `g`,
+/// `f`'s `T` is `U` — a type parameter with no impl to read a value from —
+/// but `U`'s own declared bounds fix `U::Item` as `bool` for the whole of
+/// `g`, which is enough to disprove `Item = u32`. Membership checks already
+/// consulted that side; the binding comparison did not, so this compiled.
+#[test]
+fn test_assoc_equality_binding_violated_through_a_generic_caller() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = u32 }>(_t: T) {}
+        func g<U: Has where { Item = bool }>(u: U) { f(u); }
+        func main() { g(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics().assert_error_saying(
+		"the associated type binding `Item = u32` is not satisfied",
+	);
+}
+
+/// The other direction: a caller whose declaration agrees must stay clean.
+#[test]
+fn test_assoc_equality_binding_satisfied_through_a_generic_caller() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = bool }>(_t: T) {}
+        func g<U: Has where { Item = bool }>(u: U) { f(u); }
+        func main() { g(0 as u8); }
+        export { main }
+    "});
+	no_errors(&case);
+}
+
+/// And a caller that says nothing about `Item` stays silent — nothing
+/// disproves the binding there, so reporting would be a false positive. The
+/// obligation is still checked wherever `g` itself is called with a concrete
+/// type.
+#[test]
+fn test_assoc_equality_binding_unconstrained_caller_is_not_disproved() {
+	let case = TestCase::new(indoc! {"
+        trait Has { type Item; }
+        impl Has for u8 { type Item = bool; }
+        func f<T: Has where { Item = u32 }>(_t: T) {}
+        func g<U: Has>(u: U) { f(u); }
+        func main() { g(0 as u8); }
+        export { main }
+    "});
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::TraitBoundViolation);
 }
 
 // ── enum tests
@@ -9768,7 +10928,7 @@ fn test_enum_variant_access_resolves() {
             Green,
             Blue,
         }
-        fn get_red() -> Color {
+        func get_red() -> Color {
             Color::Red
         }
         export { get_red }
@@ -9788,14 +10948,15 @@ fn test_enum_variant_access_resolves() {
 
 #[test]
 fn test_enum_comparison() {
+	// `==`/`!=` on an enum lower natively (every enum has an integer repr).
 	let case = TestCase::new(indoc! {"
         enum Color: i32 {
             Red = 1,
             Green,
             Blue,
         }
-        fn is_red(c: Color) -> bool {
-            c == Color::Red
+        func is_red(c: Color) -> bool {
+            c == Color::Red && c != Color::Blue
         }
         export { is_red }
     "});
@@ -9809,6 +10970,33 @@ fn test_enum_comparison() {
 		errors.is_empty(),
 		"expected no errors comparing enum values: {:?}",
 		errors
+	);
+}
+
+#[test]
+fn test_enum_ordering_requires_explicit_partial_ord_impl() {
+	// Unlike `==`, `<`/`>` on an enum is *not* implicit — it needs an
+	// `impl PartialOrd`, matching Rust (enums get nothing without `#[derive]`).
+	let case = TestCase::new(indoc! {"
+        enum Dir: i32 {
+            North = 0,
+            South,
+        }
+        func f(a: Dir, b: Dir) -> bool {
+            a < b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 for `Dir < Dir` with no `PartialOrd` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
 	);
 }
 
@@ -10276,7 +11464,7 @@ fn test_const_whose_value_failed_to_build_is_still_referenceable() {
 	let case = TestCase::new(indoc! {"
         const A: f64 = f64::NOPE;
 
-        fn f() -> f64 {
+        func f() -> f64 {
             local x = A;
             x
         }
@@ -10398,7 +11586,7 @@ fn test_enum_variant_unused_is_warned() {
             Red = 0,
             Green,
         }
-        fn get_red() -> Color {
+        func get_red() -> Color {
             Color::Red
         }
         export { get_red }
@@ -10429,7 +11617,7 @@ fn test_enum_all_variants_used_no_warn() {
             Red = 0,
             Green,
         }
-        fn both(c: Color) -> bool {
+        func both(c: Color) -> bool {
             c == Color::Red || c == Color::Green
         }
         export { both }
@@ -10454,7 +11642,7 @@ fn test_enum_two_unused_variants_grouped_without_oxford_comma() {
             Down,
             Left,
         }
-        fn get_right() -> Direction {
+        func get_right() -> Direction {
             Direction::Right
         }
         export { get_right }
@@ -10483,7 +11671,7 @@ fn test_enum_five_unused_variants_grouped_with_oxford_comma() {
             Boo,
             Bar,
         }
-        fn get_right() -> Direction {
+        func get_right() -> Direction {
             Direction::Right
         }
         export { get_right }
@@ -10514,7 +11702,7 @@ fn test_enum_six_unused_variants_collapses_to_generic_message() {
             Bar,
             Baz,
         }
-        fn get_right() -> Direction {
+        func get_right() -> Direction {
             Direction::Right
         }
         export { get_right }
@@ -10548,7 +11736,7 @@ fn test_enum_six_unused_variants_collapses_to_generic_message() {
 fn test_tagged_items_registered_for_every_taggable_item_kind() {
 	let case = TestCase::new(indoc! {"
         #[tag = \"tagged_fn\"]
-        fn f() -> i32 { 1 }
+        func f() -> i32 { 1 }
         #[tag = \"tagged_struct\"]
         struct S { x: i32 }
         #[tag = \"tagged_const\"]
@@ -10562,7 +11750,7 @@ fn test_tagged_items_registered_for_every_taggable_item_kind() {
         #[tag = \"tagged_memory\"]
         memory M: Memory where { Size = u32 };
         #[tag = \"tagged_trait\"]
-        trait T { fn m(self) -> i32; }
+        trait T { func m(self) -> i32; }
         export { f }
     "});
 	// Warnings are expected here (nothing reads these items); errors are not.
@@ -10597,7 +11785,7 @@ fn test_tagged_items_registered() {
         pub trait MyTrait {}
 
         #[tag = \"my_fn\"]
-        pub fn my_function() {}
+        pub func my_function() {}
     "});
 	assert!(case.tir.diagnostics.is_empty());
 	let trait_key = case
@@ -10615,7 +11803,7 @@ fn test_tagged_items_registered() {
 		.items
 		.tagged_items
 		.get(&fn_key)
-		.expect("fn tagged item not registered");
+		.expect("func tagged item not registered");
 	assert!(
 		case.tir.items.tagged_items.contains_key(&trait_key),
 		"trait tagged item not registered"
@@ -10659,7 +11847,7 @@ fn test_generic_impl_block_registers_and_dispatches() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn get_len(s: heap::&[u8]) -> u32 {
+        func get_len(s: heap::&[u8]) -> u32 {
             s.len()
         }
 
@@ -10676,7 +11864,7 @@ fn test_generic_impl_block_registers_and_dispatches() {
 fn test_generic_impl_bare_type_param_is_error() {
 	let case = TestCase::new(indoc! {"
         impl<T> T {
-            pub fn nope(self) {}
+            pub func nope(self) {}
         }
     "});
 	assert!(
@@ -10694,7 +11882,7 @@ fn test_generic_impl_bare_type_param_is_error() {
 fn test_slice_range_full_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(s: heap::&[u8]) -> heap::&[u8] {
+        func f(s: heap::&[u8]) -> heap::&[u8] {
             s[..]
         }
         export { f }
@@ -10710,7 +11898,7 @@ fn test_slice_range_full_is_ok() {
 fn test_slice_range_with_bounds_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(s: heap::&[u8], i: u32, n: u32) -> heap::&[u8] {
+        func f(s: heap::&[u8], i: u32, n: u32) -> heap::&[u8] {
             s[i..n]
         }
         export { f }
@@ -10726,7 +11914,7 @@ fn test_slice_range_with_bounds_is_ok() {
 fn test_slice_range_on_array_is_ok() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(arr: heap::&[u8; 4]) -> heap::&[u8] {
+        func f(arr: heap::&[u8; 4]) -> heap::&[u8] {
             arr[1..3]
         }
         export { f }
@@ -10742,7 +11930,7 @@ fn test_slice_range_on_array_is_ok() {
 fn test_slice_range_on_non_indexable_is_error() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn f(x: i32) -> heap::&[i32] {
+        func f(x: i32) -> heap::&[i32] {
             x[..]
         }
         export { f }
@@ -10764,7 +11952,7 @@ fn test_slice_range_on_non_indexable_is_error() {
 #[test]
 fn test_global_init_function_call_resolves() {
 	let case = TestCase::new(indoc! {"
-        fn compute() -> i32 { 42 as i32 }
+        func compute() -> i32 { 42 as i32 }
         global mut result: i32 = compute()
         export { result }
     "});
@@ -10835,7 +12023,7 @@ fn test_global_init_reverse_cross_reference_resolves() {
 #[test]
 fn test_global_init_if_expression_resolves() {
 	let case = TestCase::new(indoc! {"
-        fn flag() -> bool { true }
+        func flag() -> bool { true }
         global mut x: i32 = if flag() { 1 as i32 } else { 2 as i32 }
         export { x }
     "});
@@ -10866,8 +12054,8 @@ fn test_global_initialized_to_data_end_tir() {
 fn test_typeset_definition_registers_in_tir() {
 	let case = TestCase::new(indoc! {"
         typeset Numbers { u8, i8, u16, i16, u32, i32, u64, i64 }
-        fn identity<N: Numbers>(x: N) -> N { x }
-        fn use_it() -> i32 { identity(42 as i32) }
+        func identity<N: Numbers>(x: N) -> N { x }
+        func use_it() -> i32 { identity(42 as i32) }
         export { use_it }
     "});
 	assert!(
@@ -10877,50 +12065,126 @@ fn test_typeset_definition_registers_in_tir() {
 	);
 	// At least stdlib Integer + user Numbers typesets are registered
 	assert!(!case.tir.items.typesets.is_empty());
-	// The user-defined identity function has one type param with one typeset bound
+	// A typeset bound is a trait bound on the typeset's generated trait.
+	let numbers = case
+		.tir
+		.items
+		.typesets
+		.iter()
+		.find(|t| case.graph.interner.resolve(t.name.inner) == Some("Numbers"))
+		.expect("Numbers typeset");
 	let identity = case
 		.tir
 		.items
 		.functions
 		.iter()
-		.find(|f| {
-			case.graph.interner.resolve(f.name.inner) == Some("identity")
-				&& f.type_params.iter().any(|tp| tp.bounds.typeset.is_some())
-		})
-		.expect("no identity function with typeset bounds found");
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("identity"))
+		.expect("identity function");
 	assert_eq!(identity.type_params.len(), 1);
-	assert!(identity.type_params[0].bounds.typeset.is_some());
+	assert!(
+		identity.type_params[0]
+			.bounds
+			.traits
+			.iter()
+			.any(|tb| tb.trait_index == numbers.trait_index)
+	);
+}
+
+#[test]
+fn test_typeset_generates_backing_trait_with_member_impls() {
+	let case = TestCase::new(indoc! {"
+        typeset Numbers { u8, u32 }
+        export { }
+    "});
+	assert_no_errors(&case);
+	let ts = case
+		.tir
+		.items
+		.typesets
+		.iter()
+		.find(|t| case.graph.interner.resolve(t.name.inner) == Some("Numbers"))
+		.expect("Numbers typeset");
+	let backing = &case.tir.items.traits[usize::from(ts.trait_index)];
+	assert_eq!(backing.typeset_index, case.tir.items.typeset_index(ts.id));
+	// Empty trait, reflexive `Self: Numbers` bound only (no clause).
+	assert!(backing.bindings.is_empty());
+	assert_eq!(backing.self_type_param.bounds.traits.len(), 1);
+	// A synthetic `impl` of the backing trait for each member.
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::U8, ts.trait_index)
+			.is_some()
+	);
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::U32, ts.trait_index)
+			.is_some()
+	);
+	assert!(
+		case.tir
+			.items
+			.find_trait_impl(&case.tir.types, TypeIndex::I64, ts.trait_index)
+			.is_none()
+	);
+}
+
+#[test]
+fn test_typeset_bound_clause_unsatisfied_by_member_reports_error() {
+	// `bool` does not implement `Add`, so it cannot be a member of a typeset
+	// that requires `Add`.
+	let case = TestCase::new(indoc! {"
+        typeset Addable: Add { u32, bool }
+        export { }
+    "});
+	assert!(
+		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnsatisfiedTraitBound.code())),
+		"expected E for `bool: Add`, got: {:?}",
+		case.tir.diagnostics
+	);
 }
 
 #[test]
 fn test_typeset_bound_violation_reports_error() {
 	let case = TestCase::new(indoc! {"
         typeset Numbers { u8, i8, u16, i16, u32, i32, u64, i64 }
-        fn identity<N: Numbers>(x: N) -> N { x }
-        fn main() -> f32 {
+        func identity<N: Numbers>(x: N) -> N { x }
+        func main() -> f32 {
             identity(1.0 as f32)
         }
         export { main }
     "});
 	assert!(case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-		== Some(DiagnosticCode::TypesetBoundViolation.code())));
+		== Some(DiagnosticCode::TraitBoundViolation.code())));
 }
 
 #[test]
-fn test_typeset_member_not_integer_reports_error() {
+fn test_typeset_member_not_concrete_reports_error() {
+	// A non-integer *concrete* type is fine now (`f32` here); a type that
+	// isn't a valid `impl` target — the unit type — is not.
 	let case = TestCase::new(indoc! {"
-        typeset BadSet { u32, f32 }
+        typeset BadSet { u32, f32, () }
         export { }
     "});
 	assert!(case.tir.diagnostics.iter().any(|d| d.code.as_deref()
-		== Some(DiagnosticCode::TypesetMemberNotInteger.code())));
+		== Some(DiagnosticCode::TypesetMemberNotConcrete.code())));
+	assert!(
+		!case
+			.tir
+			.diagnostics
+			.iter()
+			.any(|d| d.message.contains("f32")),
+		"`f32` should be an accepted concrete member"
+	);
 }
 
 #[test]
 fn test_stdlib_integer_typeset_exists() {
 	let case = TestCase::new(indoc! {"
-        fn double<N: Integer>(x: N) -> N { x }
-        fn use_it() -> i32 { double(21 as i32) }
+        func double<N: Integer>(x: N) -> N { x }
+        func use_it() -> i32 { double(21 as i32) }
         export { use_it }
     "});
 	assert!(
@@ -10931,13 +12195,14 @@ fn test_stdlib_integer_typeset_exists() {
 }
 
 #[test]
-fn test_typeset_intersection_range_in_bounds() {
-	// Integer intersection is [0, 127]; literals within that range are accepted
+fn test_typeset_bounded_literal_within_every_member_range_is_accepted() {
+	// `Integer`'s tightest member is `i8`/`u8` → [0, 127] for a value that
+	// must fit every member; literals inside that are fine.
 	let case = TestCase::new(indoc! {"
-        fn make<N: Integer>(x: N) -> N { x }
-        fn use_zero() -> i32 { make(0 as i32) }
-        fn use_mid() -> u8 { make(100 as u8) }
-        fn use_max() -> i8 { make(127 as i8) }
+        func make<N: Integer>(x: N) -> N { x }
+        func use_zero() -> i32 { make(0 as i32) }
+        func use_mid() -> u8 { make(100 as u8) }
+        func use_max() -> i8 { make(127 as i8) }
         export { use_zero, use_mid, use_max }
     "});
 	assert!(
@@ -10948,15 +12213,16 @@ fn test_typeset_intersection_range_in_bounds() {
 }
 
 #[test]
-fn test_typeset_intersection_range_literal_in_local() {
-	// 0 and 100 are within Integer intersection [0, 127]; locals typed as TypeParam should be fine
+fn test_typeset_bounded_literal_in_local_is_checked_against_members() {
+	// 0 and 100 fit every `Integer` member; a local typed as the type param
+	// should be fine.
 	let case = TestCase::new(indoc! {"
-        fn with_bounds<N: Integer>(x: N) -> N {
+        func with_bounds<N: Integer>(x: N) -> N {
             local _lo: N = 0;
             local _hi: N = 100;
             x
         }
-        fn use_it() -> i32 { with_bounds(50 as i32) }
+        func use_it() -> i32 { with_bounds(50 as i32) }
         export { use_it }
     "});
 	let errors: Vec<_> = case
@@ -10971,14 +12237,14 @@ fn test_typeset_intersection_range_literal_in_local() {
 }
 
 #[test]
-fn test_typeset_intersection_range_out_of_bounds_reports_error() {
-	// Integer intersection max is 127; 200 is outside the safe range
-	// This fires when assigning an untyped literal to a local of TypeParam type
+fn test_typeset_bounded_literal_outside_a_member_range_reports_error() {
+	// 200 fits `i32` but not `i8`/`u8`, both `Integer` members — so it cannot
+	// be assigned to a local typed as an `Integer`-bounded type param.
 	let case = TestCase::new(indoc! {"
-        fn test<N: Integer>() {
+        func test<N: Integer>() {
             local x: N = 200;
         }
-        fn use_it() { test() }
+        func use_it() { test() }
         export { use_it }
     "});
 	assert!(
@@ -10987,6 +12253,96 @@ fn test_typeset_intersection_range_out_of_bounds_reports_error() {
 		"expected E1047, got: {:?}",
 		case.tir.diagnostics
 	);
+}
+
+#[test]
+fn test_float_literal_coerces_to_float_only_typeset_bound() {
+	// `typeset Float { f32, f64 }` is usable: a float literal in range for
+	// every member coerces to a value of the bounded (still abstract) param.
+	let case = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        func f<T: Float>(_seed: T) {
+            local _x: T = 1.5;
+        }
+        func use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_float_literal_outside_a_float_member_range_reports_error() {
+	// `1e40` fits f64 but overflows f32, so it cannot coerce to a `Float`-
+	// bounded param (which could concretize to either).
+	let case = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        func f<T: Float>(_seed: T) {
+            local _x: T = 1e40;
+        }
+        func use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&case.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
+}
+
+#[test]
+fn test_int_literal_coerces_to_float_typeset_member_when_exact() {
+	// An integer literal exactly representable in every (float) member coerces;
+	// `2^24 + 1` (not exact in f32) does not.
+	let ok = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        func f<T: Float>(_seed: T) {
+            local _x: T = 5;
+        }
+        func use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	no_errors(&ok);
+
+	let bad = TestCase::new(indoc! {"
+        typeset Float { f32, f64 }
+        func f<T: Float>(_seed: T) {
+            local _x: T = 16777217;
+        }
+        func use_it() { f(1.0 as f32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&bad.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
+}
+
+#[test]
+fn test_mixed_int_float_typeset_accepts_int_literal_rejects_float_literal() {
+	// A set spanning both kinds: an integer literal fitting every member is
+	// fine (it concretizes to whichever member mono picks); a float literal is
+	// rejected because it cannot become the integer member.
+	let int_ok = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        func f<T: Num>(_seed: T) {
+            local _x: T = 5;
+        }
+        func use_it() { f(1 as i32) }
+        export { use_it }
+    "});
+	no_errors(&int_ok);
+
+	let float_bad = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        func f<T: Num>(_seed: T) {
+            local _x: T = 1.5;
+        }
+        func use_it() { f(1 as i32) }
+        export { use_it }
+    "});
+	assert!(has_error_code(
+		&float_bad.tir,
+		DiagnosticCode::TypesetBoundViolation
+	));
 }
 
 // ── operators on typeset-bounded type params ─────────────────────────────
@@ -11001,8 +12357,8 @@ fn test_typeset_intersection_range_out_of_bounds_reports_error() {
 #[test]
 fn test_typeset_bounded_type_param_supports_arithmetic_operator() {
 	let case = TestCase::new(indoc! {"
-        fn add<N: Integer>(a: N, b: N) -> N { a + b }
-        fn use_it() -> i32 { add(1 as i32, 2 as i32) }
+        func add<N: Integer>(a: N, b: N) -> N { a + b }
+        func use_it() -> i32 { add(1 as i32, 2 as i32) }
         export { use_it }
     "});
 	no_errors(&case);
@@ -11011,8 +12367,8 @@ fn test_typeset_bounded_type_param_supports_arithmetic_operator() {
 #[test]
 fn test_typeset_bounded_type_param_supports_bitwise_operator() {
 	let case = TestCase::new(indoc! {"
-        fn and<N: Integer>(a: N, b: N) -> N { a & b }
-        fn use_it() -> i32 { and(6 as i32, 3 as i32) }
+        func and<N: Integer>(a: N, b: N) -> N { a & b }
+        func use_it() -> i32 { and(6 as i32, 3 as i32) }
         export { use_it }
     "});
 	no_errors(&case);
@@ -11021,12 +12377,12 @@ fn test_typeset_bounded_type_param_supports_bitwise_operator() {
 #[test]
 fn test_typeset_bounded_type_param_supports_compound_assignment() {
 	let case = TestCase::new(indoc! {"
-        fn add_assign<N: Integer>(a: N, b: N) -> N {
+        func add_assign<N: Integer>(a: N, b: N) -> N {
             local mut x: N = a;
             x += b;
             x
         }
-        fn use_it() -> i32 { add_assign(1 as i32, 2 as i32) }
+        func use_it() -> i32 { add_assign(1 as i32, 2 as i32) }
         export { use_it }
     "});
 	no_errors(&case);
@@ -11040,9 +12396,9 @@ fn test_generic_slice_index_coerces_to_pointer_size() {
 	// members — [0, u32::MAX] — not `u64`'s. So both ends of that range are
 	// valid, and so is an index already of type `M::Size`.
 	let case = TestCase::new(indoc! {"
-        fn _low<M: Memory, T>(s: M::&[T]) -> T { s[0] }
-        fn _high<M: Memory, T>(s: M::&[T]) -> T { s[4294967295] }
-        fn _exact<M: Memory, T>(s: M::&[T], i: M::Size) -> T { s[i] }
+        func _low<M: Memory, T>(s: M::&[T]) -> T { s[0] }
+        func _high<M: Memory, T>(s: M::&[T]) -> T { s[4294967295] }
+        func _exact<M: Memory, T>(s: M::&[T], i: M::Size) -> T { s[i] }
     "});
 	assert!(
 		case.tir.diagnostics.is_empty(),
@@ -11056,7 +12412,7 @@ fn test_generic_slice_index_rejects_out_of_range_literal() {
 	// One past the intersection range's top. Fits `u64`, so it is only
 	// rejectable by checking the typeset as a whole.
 	let case = TestCase::new(indoc! {"
-        fn _f<M: Memory, T>(s: M::&[T]) -> T { s[4294967296] }
+        func _f<M: Memory, T>(s: M::&[T]) -> T { s[4294967296] }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::TypesetBoundViolation),
@@ -11070,7 +12426,7 @@ fn test_generic_slice_index_rejects_negative_literal() {
 	// Every `PointerSize` member is unsigned, so there is no member for a
 	// negative literal to coerce to at all.
 	let case = TestCase::new(indoc! {"
-        fn _f<M: Memory, T>(s: M::&[T]) -> T { s[-1] }
+        func _f<M: Memory, T>(s: M::&[T]) -> T { s[-1] }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UnableToCoerce),
@@ -11090,20 +12446,20 @@ fn test_type_position_inline_module_registers_module_access() {
             pub struct Vec2 { pub x: i32, pub y: i32 }
         }
 
-        fn f(v: math::Vec2) { }
+        func f(v: math::Vec2) { }
 
         export { f }
     "});
 	no_errors(&case);
 	assert!(
 		case.tir
-			.modules
+			.defs
 			.namespaces
 			.iter()
 			.any(|ns| !ns.accesses.is_empty()),
 		"expected at least one access registered on a namespace, got: {:?}",
 		case.tir
-			.modules
+			.defs
 			.namespaces
 			.iter()
 			.map(|ns| ns.accesses.len())
@@ -11122,7 +12478,7 @@ fn test_type_position_three_segment_inline_module_path() {
             }
         }
 
-        fn f(p: outer::inner::Point) { }
+        func f(p: outer::inner::Point) { }
 
         export { f }
     "});
@@ -11139,10 +12495,10 @@ fn test_module_colliding_with_implicit_std_dependency_is_duplicate_definition()
 	// as a same-scope duplicate definition, same as any other name clash.
 	let case = TestCase::new(indoc! {"
         mod std {
-            pub fn my_helper() -> i32 { 42 }
+            pub func my_helper() -> i32 { 42 }
         }
 
-        fn main() -> i32 { std::my_helper() }
+        func main() -> i32 { std::my_helper() }
 
         export { main }
     "});
@@ -11174,10 +12530,10 @@ fn test_file_declared_module_colliding_with_implicit_std_dependency_is_duplicate
 		"src/main.wx",
 		indoc! {"
             mod std;
-            fn main() -> i32 { 1 }
+            func main() -> i32 { 1 }
             export { main }
         "},
-		&[("src/std.wx", "pub fn my_helper() -> i32 { 42 }")],
+		&[("src/std.wx", "pub func my_helper() -> i32 { 42 }")],
 	);
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::DuplicateDefinition),
@@ -11199,10 +12555,10 @@ fn test_import_alias_colliding_with_implicit_std_dependency_is_duplicate_definit
 	// steal the `std` binding either.
 	let case = TestCase::new(indoc! {"
         import \"env\" as std {
-            fn foo();
+            func foo();
         }
 
-        fn main() -> i32 { 1 }
+        func main() -> i32 { 1 }
 
         export { main }
     "});
@@ -11227,7 +12583,7 @@ fn test_type_position_undeclared_in_module_path_is_error() {
 		indoc! {"
             mod shapes;
 
-            fn f(x: shapes::NonExistent) { }
+            func f(x: shapes::NonExistent) { }
 
             export { f }
         "},
@@ -11258,20 +12614,20 @@ fn test_sibling_modules_get_independent_same_named_children() {
 		indoc! {"
             mod a;
             mod b;
-            fn main() -> i32 { a::use_a() + b::use_b() }
+            func main() -> i32 { a::use_a() + b::use_b() }
             export { main }
         "},
 		&[
 			(
 				"src/a.wx",
-				"mod shared;\npub fn use_a() -> i32 { shared::x() }",
+				"mod shared;\npub func use_a() -> i32 { shared::x() }",
 			),
-			("src/a/shared.wx", "pub fn x() -> i32 { 1 }"),
+			("src/a/shared.wx", "pub func x() -> i32 { 1 }"),
 			(
 				"src/b.wx",
-				"mod shared;\npub fn use_b() -> i32 { shared::x() }",
+				"mod shared;\npub func use_b() -> i32 { shared::x() }",
 			),
-			("src/b/shared.wx", "pub fn x() -> i32 { 2 }"),
+			("src/b/shared.wx", "pub func x() -> i32 { 2 }"),
 		],
 	);
 	no_errors(&case);
@@ -11282,7 +12638,7 @@ fn test_type_position_non_namespace_as_intermediate_is_error() {
 	// `i32::Foo` — `i32` is a primitive, not a module; looking up an associated
 	// type that doesn't exist should produce E1021 (UndeclaredType).
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32::Foo) { }
+        func f(x: i32::Foo) { }
 
         export { f }
     "});
@@ -11309,7 +12665,7 @@ fn test_struct_init_three_segment_inline_module_path() {
             }
         }
 
-        fn make() -> outer::inner::Point {
+        func make() -> outer::inner::Point {
             outer::inner::Point::{ x: 1, y: 2 }
         }
 
@@ -11326,7 +12682,7 @@ fn test_struct_init_undeclared_type_in_module_path_is_error() {
 		indoc! {"
             mod shapes;
 
-            fn f() -> shapes::Ghost {
+            func f() -> shapes::Ghost {
                 shapes::Ghost::{ }
             }
 
@@ -11360,11 +12716,11 @@ fn test_assoc_type_projection_normalised_across_functions() {
         }
 
         impl<M: Memory> Layout<M> {
-            pub fn of<T>() -> Layout<M> {
+            pub func of<T>() -> Layout<M> {
                 Layout::{ size: size_of::<T, M>(), align: align_of::<T, M>() }
             }
 
-            pub fn array<T>(count: M::Size) -> Layout<M> {
+            pub func array<T>(count: M::Size) -> Layout<M> {
                 Layout::{ size: size_of::<T, M>() * count, align: align_of::<T, M>() }
             }
         }
@@ -11395,9 +12751,9 @@ fn test_assoc_type_as_memory_tag_in_trait() {
         trait Allocator {
             type M: Memory;
 
-            fn alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8;
+            func alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8;
 
-            fn dealloc(self: *Self, ptr: Self::M::*u8, layout: Layout<Self::M>);
+            func dealloc(self: *Self, ptr: Self::M::*u8, layout: Layout<Self::M>);
         }
     "});
 	no_errors(&case);
@@ -11422,10 +12778,10 @@ fn test_assoc_type_resolves_in_trait_default_body() {
         trait Allocator {
             type M: Memory;
 
-            fn reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
+            func reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
 
             #[inline]
-            fn alloc_slice<T>(self: Self::M::*Self, count: Self::M::Size) -> Self::M::*u8 {
+            func alloc_slice<T>(self: Self::M::*Self, count: Self::M::Size) -> Self::M::*u8 {
                 local layout = Layout::<Self::M>::array::<T>(count);
                 self.reserve(layout)
             }
@@ -11457,10 +12813,10 @@ fn test_generic_call_result_type_infers_assoc_type_arg() {
         trait Allocator {
             type M: Memory;
 
-            fn reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
+            func reserve(self: Self::M::*Self, layout: Layout<Self::M>) -> Self::M::*u8;
 
             #[inline]
-            fn alloc<T>(self: Self::M::*Self) -> Self::M::*T {
+            func alloc<T>(self: Self::M::*Self) -> Self::M::*T {
                 self.reserve(Layout::of::<T>()) as _
             }
         }
@@ -11477,10 +12833,10 @@ fn test_generic_function_call_result_type_infers_nested_call_arg() {
 	let case = TestCase::new(indoc! {"
         struct Wrapper<T> { x: T }
         impl <T> Wrapper<T> {
-            pub fn make() -> Self { unreachable }
+            pub func make() -> Self { unreachable }
         }
-        fn take<T>(w: Wrapper<T>) -> T { unreachable }
-        fn use_it() -> i32 {
+        func take<T>(w: Wrapper<T>) -> T { unreachable }
+        func use_it() -> i32 {
             take(Wrapper::make())
         }
         export { use_it }
@@ -11503,7 +12859,7 @@ fn test_assoc_type_memory_bound_satisfied_by_memory_decl() {
         trait Allocator {
             type M: Memory;
 
-            fn alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8;
+            func alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8;
         }
 
         struct BumpAllocator {}
@@ -11511,7 +12867,7 @@ fn test_assoc_type_memory_bound_satisfied_by_memory_decl() {
         impl Allocator for BumpAllocator {
             type M = heap;
 
-            fn alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8 {
+            func alloc(self: *Self, layout: Layout<Self::M>) -> Self::M::*u8 {
                 unreachable
             }
         }
@@ -11566,7 +12922,7 @@ fn test_memory_records_access_in_type_position() {
 fn test_infinite_loop_has_never_type() {
 	// `loop {}` with no break coerces to any return type — proves Never type.
 	let case = TestCase::new(indoc! {"
-        pub fn f() -> i32 { loop {} }
+        pub func f() -> i32 { loop {} }
     "});
 	no_errors(&case);
 }
@@ -11575,7 +12931,7 @@ fn test_infinite_loop_has_never_type() {
 fn test_loop_with_break_has_unit_type() {
 	// bare `break` makes the loop yield Unit; returning it from a () fn is fine.
 	let case = TestCase::new(indoc! {"
-        pub fn f() { loop { break; } }
+        pub func f() { loop { break; } }
     "});
 	no_errors(&case);
 }
@@ -11584,7 +12940,7 @@ fn test_loop_with_break_has_unit_type() {
 fn test_loop_with_break_value_has_that_type() {
 	// `break 42` makes the loop yield i32.
 	let case = TestCase::new(indoc! {"
-        pub fn f() -> i32 { loop { break 42; } }
+        pub func f() -> i32 { loop { break 42; } }
     "});
 	no_errors(&case);
 }
@@ -11593,7 +12949,7 @@ fn test_loop_with_break_value_has_that_type() {
 fn test_loop_with_continue_only_has_never_type() {
 	// `continue` does not count as a break — loop still has Never type.
 	let case = TestCase::new(indoc! {"
-        pub fn f() -> i32 { loop { continue; } }
+        pub func f() -> i32 { loop { continue; } }
     "});
 	no_errors(&case);
 }
@@ -11601,7 +12957,7 @@ fn test_loop_with_continue_only_has_never_type() {
 #[test]
 fn test_break_outside_of_loop_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
-        pub fn f() { break; }
+        pub func f() { break; }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::BreakOutsideOfLoop),
@@ -11617,7 +12973,33 @@ fn test_break_outside_of_loop_reports_diagnostic() {
 #[test]
 fn test_continue_outside_of_loop_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
-        pub fn f() { continue; }
+        pub func f() { continue; }
+    "});
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::ContinueOutsideOfLoop),
+		"expected E1054 (ContinueOutsideOfLoop), got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_continue_targeting_a_labeled_block_reports_diagnostic() {
+	// `resolve_label` resolves any labeled construct (blocks and if/else
+	// included, not just loops) with no restriction on its own — unlike
+	// `break`, which can legitimately exit a plain labeled block, a
+	// `continue` has no sound meaning against one (there is no "next
+	// iteration" to continue into). Regression test: this used to be
+	// silently accepted by TIR and panic downstream in opt instead.
+	let case = TestCase::new(indoc! {"
+        pub func f() {
+            outer: {
+                continue :outer;
+            }
+        }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::ContinueOutsideOfLoop),
@@ -11635,7 +13017,7 @@ fn test_break_with_undeclared_label_reports_only_that_diagnostic() {
 	// No loop anywhere in `f`, so the label-less "outside of loop" check
 	// must not also fire alongside the undeclared-label error.
 	let case = TestCase::new(indoc! {"
-        pub fn f() { break :outer; }
+        pub func f() { break :outer; }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredLabel),
@@ -11662,7 +13044,7 @@ fn test_break_with_undeclared_label_reports_only_that_diagnostic() {
 fn test_continue_with_undeclared_label_reports_only_that_diagnostic() {
 	// Same as above but for `continue`.
 	let case = TestCase::new(indoc! {"
-        pub fn f() { continue :outer; }
+        pub func f() { continue :outer; }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredLabel),
@@ -11689,7 +13071,7 @@ fn test_continue_with_undeclared_label_reports_only_that_diagnostic() {
 fn test_unused_label_reports_diagnostic() {
 	// `outer` is declared but never referenced by a `break`/`continue`.
 	let case = TestCase::new(indoc! {"
-        pub fn f() {
+        pub func f() {
             outer: loop {
                 break;
             }
@@ -11710,7 +13092,7 @@ fn test_unused_label_reports_diagnostic() {
 fn test_used_label_reports_no_unused_label_diagnostic() {
 	// `outer` is referenced by `break :outer;`, so it must not be flagged.
 	let case = TestCase::new(indoc! {"
-        pub fn f() {
+        pub func f() {
             outer: loop {
                 break :outer;
             }
@@ -11745,46 +13127,36 @@ fn test_used_label_reports_no_unused_label_diagnostic() {
 // still-abstract type param into another bounded generic call, as in both
 // tests below.
 //
-// To fix this, `TIR::type_implements_trait`'s abstract branch would need to
-// walk supertraits of a TypeParam's declared bounds, transitively. That
-// requires supertrait-cycle detection first — `trait A: B {} trait B: A {}`
-// is not currently rejected anywhere (`resolve_identifier_as_bound`,
-// builder.rs, resolves a supertrait purely to its `TraitIndex` without
-// forcing the supertrait's own signature to resolve first, so no existing
-// re-entrancy guard — e.g. `ensure_signature`'s `sig_state` — ever sees this
-// case) — an unbounded transitive walk over user-controlled trait
-// declarations could recurse forever. The likely fix: make supertrait
-// resolution (in the `AstNodeRef::Trait` arm of `ensure_signature`,
-// builder.rs) force-resolve each supertrait's own signature first (e.g. via
-// `ensure_signature` on the supertrait's `DefId`), so `sig_state`'s existing
-// `ComputeState::InProgress` re-entrancy check naturally detects the cycle —
-// matching rustc's E0391 — and report a dedicated diagnostic there, rather
-// than adding an ad hoc cycle guard inside the trait-bound-checking walk
-// itself.
+// Both are handled now: `TIR::type_implements_trait`'s abstract branch asks
+// `trait_implies`, which walks the declared bound's supertraits transitively.
+// The walk carries a visited set rather than relying on the graph being
+// acyclic, because `trait A: B {} trait B: A {}` is still accepted silently —
+// nothing forces a supertrait's own signature, so no re-entrancy guard ever
+// sees it. A dedicated cycle diagnostic belongs in
+// `Builder::ensure_trait_supertraits`, which is the one place that walks the
+// clause and already has the `sig_stack` chain to name the loop with.
 #[test]
-#[ignore = "supertrait transitivity through an abstract type param isn't implemented yet — see comment above"]
 fn test_supertrait_single_level_satisfies_bound() {
 	// T: B where B: A — passing T to a fn requiring A should type-check.
 	let case = TestCase::new(indoc! {"
         trait A {}
         trait B: A {}
-        fn requires_a<T: A>(x: T) {}
-        fn call_with_b<T: B>(x: T) { requires_a(x); }
+        func requires_a<T: A>(x: T) {}
+        func call_with_b<T: B>(x: T) { requires_a(x); }
         export {}
     "});
 	no_errors(&case);
 }
 
 #[test]
-#[ignore = "supertrait transitivity through an abstract type param isn't implemented yet — see comment above"]
 fn test_supertrait_two_levels_deep_satisfies_bound() {
 	// T: C where C: B and B: A — passing T to a fn requiring A should type-check.
 	let case = TestCase::new(indoc! {"
         trait A {}
         trait B: A {}
         trait C: B {}
-        fn requires_a<T: A>(x: T) {}
-        fn call_with_c<T: C>(x: T) { requires_a(x); }
+        func requires_a<T: A>(x: T) {}
+        func call_with_c<T: C>(x: T) { requires_a(x); }
         export {}
     "});
 	no_errors(&case);
@@ -11798,7 +13170,7 @@ fn test_nested_assoc_type_projection_resolves() {
         memory heap: Memory where { Size = u32 };
         trait Allocator {
             type M: Memory;
-            fn alloc(mut self, size: Self::M::Size) -> Self::M::*u8;
+            func alloc(mut self, size: Self::M::Size) -> Self::M::*u8;
         }
         struct Vec<T, A: Allocator> {
             len: A::M::Size,
@@ -11813,8 +13185,8 @@ fn test_phantom_type_param_as_infer_is_error() {
 	// T does not appear in the return type of `phantom`, so `_` for T
 	// cannot be verified by the result-type check — it should still error.
 	let case = TestCase::new(indoc! {"
-        fn phantom<T>() -> i32 { 0 }
-        fn f() -> i32 { phantom::<_>() }
+        func phantom<T>() -> i32 { 0 }
+        func f() -> i32 { phantom::<_>() }
     "});
 	assert!(has_error_code(
 		&case.tir,
@@ -11837,9 +13209,9 @@ fn test_phantom_inherited_type_param_reports_error_not_panic() {
 	let case = TestCase::new(indoc! {"
         struct Holder<M> { x: i32 }
         impl<M> Holder<M> {
-            pub fn get() -> i32 { 0 }
+            pub func get() -> i32 { 0 }
         }
-        fn use_it() -> i32 {
+        func use_it() -> i32 {
             Holder::get()
         }
         export { use_it }
@@ -11857,8 +13229,8 @@ fn test_phantom_type_param_suppressed_by_type_mismatch() {
 	// phantom-param check is skipped to avoid double-reporting on the same
 	// call site.  Only TypeMistmatch should appear.
 	let case = TestCase::new(indoc! {"
-        fn phantom<T>(x: i32) -> i32 { x }
-        fn f() -> i32 { phantom::<_>(true) }
+        func phantom<T>(x: i32) -> i32 { x }
+        func f() -> i32 { phantom::<_>(true) }
     "});
 	assert!(has_error_code(&case.tir, DiagnosticCode::TypeMistmatch));
 	assert!(!has_error_code(
@@ -11876,8 +13248,8 @@ fn test_phantom_type_param_suppressed_when_unrelated_arg_mismatches() {
 	// `true` is a concrete bool (not a comptime literal), so T is properly
 	// inferred as bool without triggering the comptime-literal annotation path.
 	let case = TestCase::new(indoc! {"
-        fn f<T, U>(x: T, y: i32) -> i32 { y }
-        fn g() -> i32 { f(true, true) }
+        func f<T, U>(x: T, y: i32) -> i32 { y }
+        func g() -> i32 { f(true, true) }
     "});
 	assert!(has_error_code(&case.tir, DiagnosticCode::TypeMistmatch));
 	assert!(!has_error_code(
@@ -11891,7 +13263,7 @@ fn test_phantom_type_param_suppressed_when_unrelated_arg_mismatches() {
 #[test]
 fn test_unused_type_param_warns() {
 	let case = TestCase::new(indoc! {"
-        pub fn phantom<T>() -> i32 { 0 }
+        pub func phantom<T>() -> i32 { 0 }
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -11909,7 +13281,7 @@ fn test_unused_type_param_warns() {
 #[test]
 fn test_used_type_param_in_param_no_warn() {
 	let case = TestCase::new(indoc! {"
-        pub fn identity<T>(x: T) -> T { x }
+        pub func identity<T>(x: T) -> T { x }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -11922,7 +13294,7 @@ fn test_used_type_param_in_param_no_warn() {
 fn test_implicit_self_type_param_in_trait_method_no_warn() {
 	let case = TestCase::new(indoc! {"
         pub trait PointerSize {
-            fn size() -> u32;
+            func size() -> u32;
         }
     "});
 	assert!(
@@ -11935,7 +13307,7 @@ fn test_implicit_self_type_param_in_trait_method_no_warn() {
 #[test]
 fn test_used_type_param_in_return_only_no_warn() {
 	let case = TestCase::new(indoc! {"
-        pub fn produce<T>() -> T { loop {} }
+        pub func produce<T>() -> T { loop {} }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -11950,7 +13322,7 @@ fn test_used_type_param_in_return_only_no_warn() {
 fn test_unused_field_init_but_not_read_warns() {
 	let case = TestCase::new(indoc! {"
         pub struct Pair { pub x: i32, y: i32 }
-        pub fn make(x: i32) -> Pair {
+        pub func make(x: i32) -> Pair {
             Pair::{ x: x, y: 0 }
         }
     "});
@@ -11971,9 +13343,9 @@ fn test_unused_field_init_but_not_read_warns() {
 fn test_unused_field_read_suppresses_warn() {
 	let case = TestCase::new(indoc! {"
         pub struct Pair { x: i32, y: i32 }
-        pub fn make(x: i32, y: i32) -> Pair { Pair::{ x: x, y: y } }
-        pub fn get_x(p: Pair) -> i32 { p.x }
-        pub fn get_y(p: Pair) -> i32 { p.y }
+        pub func make(x: i32, y: i32) -> Pair { Pair::{ x: x, y: y } }
+        pub func get_x(p: Pair) -> i32 { p.x }
+        pub func get_y(p: Pair) -> i32 { p.y }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -11990,12 +13362,12 @@ fn test_unused_field_read_suppresses_warn() {
 fn test_unused_field_write_does_not_suppress_warn() {
 	let case = TestCase::new(indoc! {"
         pub struct Pair { x: i32, y: i32 }
-        pub fn make(x: i32) -> Pair {
+        pub func make(x: i32) -> Pair {
             local mut p = Pair::{ x: x, y: 0 };
             p.y = 1;
             p
         }
-        pub fn get_x(p: Pair) -> i32 { p.x }
+        pub func get_x(p: Pair) -> i32 { p.x }
     "});
 	assert!(
 		case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -12019,12 +13391,12 @@ fn test_unused_field_write_does_not_suppress_warn() {
 fn test_unused_field_compound_assignment_counts_as_read() {
 	let case = TestCase::new(indoc! {"
         pub struct Pair { x: i32, y: i32 }
-        pub fn make(x: i32) -> Pair {
+        pub func make(x: i32) -> Pair {
             local mut p = Pair::{ x: x, y: 0 };
             p.y += 1;
             p
         }
-        pub fn get_x(p: Pair) -> i32 { p.x }
+        pub func get_x(p: Pair) -> i32 { p.x }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -12042,7 +13414,7 @@ fn test_unused_field_compound_assignment_counts_as_read() {
 fn test_pub_field_no_unused_warn() {
 	let case = TestCase::new(indoc! {"
         pub struct Pair { pub x: i32, pub y: i32 }
-        pub fn make() -> Pair { Pair::{ x: 1, y: 2 } }
+        pub func make() -> Pair { Pair::{ x: 1, y: 2 } }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -12055,7 +13427,7 @@ fn test_pub_field_no_unused_warn() {
 fn test_never_initialized_field_no_warn() {
 	let case = TestCase::new(indoc! {"
         pub struct Node { value: i32, next: i32 }
-        pub fn is_zero(n: Node) -> bool { false }
+        pub func is_zero(n: Node) -> bool { false }
     "});
 	assert!(
 		!case.tir.diagnostics.iter().any(|d| d.code.as_deref()
@@ -12069,9 +13441,9 @@ fn test_type_param_multiple_bounds_both_enforced() {
 	// `T: Scalable + Printable` — BoundList must be flattened so both bounds
 	// end up in TypeParamInfo.bounds (exercises resolve_type_param_bounds).
 	let case = TestCase::new(indoc! {"
-        trait Scalable { fn scale(self, n: i32) -> i32; }
-        trait Printable { fn print(self); }
-        fn do_both<T: Scalable + Printable>(t: T) -> i32 {
+        trait Scalable { func scale(self, n: i32) -> i32; }
+        trait Printable { func print(self); }
+        func do_both<T: Scalable + Printable>(t: T) -> i32 {
             t.print();
             t.scale(1)
         }
@@ -12095,25 +13467,18 @@ fn test_type_param_multiple_bounds_both_enforced() {
 }
 
 #[test]
-#[ignore = "TODO: TIR does not currently check trait bound satisfaction at generic call sites"]
 fn test_type_param_multiple_bounds_missing_impl_is_error() {
-	// Pass a type that only satisfies one of two bounds — should error once
-	// call-site trait bound checking is implemented.
+	// Pass a type that only satisfies one of two bounds.
 	let case = TestCase::new(indoc! {"
-        trait Scalable { fn scale(self, n: i32) -> i32; }
-        trait Printable { fn print(self); }
-        fn do_both<T: Scalable + Printable>(t: T) {}
+        trait Scalable { func scale(self, n: i32) -> i32; }
+        trait Printable { func print(self); }
+        func do_both<T: Scalable + Printable>(t: T) {}
         struct Num {}
-        impl Scalable for Num { fn scale(self, n: i32) -> i32 { n } }
-        fn call() { do_both(Num::{}); }
+        impl Scalable for Num { func scale(self, n: i32) -> i32 { n } }
+        func call() { do_both(Num::{}); }
     "});
-	assert!(
-		case.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.severity == Severity::Error),
-		"expected an error: Num does not implement Printable"
-	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::TraitBoundViolation);
 }
 
 #[test]
@@ -12122,7 +13487,7 @@ fn test_multiple_supertraits_both_resolved() {
 	// tir.items.traits[widget_idx].supertraits (exercises BoundList flattening in
 	// the supertrait resolution handler).
 	let case = TestCase::new(indoc! {"
-        trait Drawable { fn draw(self); }
+        trait Drawable { func draw(self); }
         trait Sized { const SIZE: u32; }
         trait Widget: Drawable + Sized {}
     "});
@@ -12159,9 +13524,7 @@ fn test_multiple_supertraits_both_resolved() {
 	);
 
 	let supertraits = &case.tir.items.traits[widget_idx]
-		.bounds
-		.traits
-		.iter()
+		.supertraits(TraitIndex::new(widget_idx as u32))
 		.map(|bound| bound.trait_index)
 		.collect::<Vec<_>>();
 	assert_eq!(supertraits.len(), 2, "Widget should have two supertraits");
@@ -12179,11 +13542,11 @@ fn test_multiple_supertraits_both_resolved() {
 fn test_multiple_supertraits_missing_one_impl_is_error() {
 	// impl Widget for Point without impl Sized for Point — must error.
 	let case = TestCase::new(indoc! {"
-        trait Drawable { fn draw(self); }
+        trait Drawable { func draw(self); }
         trait Sized { const SIZE: u32; }
         trait Widget: Drawable + Sized {}
         struct Point { x: i32 }
-        impl Drawable for Point { fn draw(self) {} }
+        impl Drawable for Point { func draw(self) {} }
         impl Widget for Point {}
     "});
 	assert!(
@@ -12221,10 +13584,11 @@ fn test_assoc_type_multiple_bounds_both_stored() {
 		.interner
 		.get("Elem")
 		.expect("symbol 'Elem' not interned");
-	let assoc = container
-		.assoc_types
-		.get(&elem_sym)
-		.expect("assoc type 'Elem' not found");
+	let assoc = &case.tir.items.associated_types[usize::from(
+		container
+			.associated_type(elem_sym)
+			.expect("assoc type 'Elem' not found"),
+	)];
 	assert_eq!(
 		assoc.bounds.traits.len(),
 		2,
@@ -12267,14 +13631,14 @@ fn test_impl_module_trait_for_type_resolves() {
             use shapes::*;
             struct Point { x: i32 }
             impl shapes::Drawable for Point {
-                fn draw(self) {}
+                func draw(self) {}
             }
         "},
 		&[(
 			"shapes.wx",
 			indoc! {"
                 pub trait Drawable {
-                    pub fn draw(self);
+                    pub func draw(self);
                 }
             "},
 		)],
@@ -12304,7 +13668,7 @@ fn test_invalid_self_type_rejected() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: i32 }
         impl Foo {
-            pub fn bad(self: u32) -> i32 { 0 }
+            pub func bad(self: u32) -> i32 { 0 }
         }
         export { }
     "});
@@ -12312,7 +13676,7 @@ fn test_invalid_self_type_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12328,7 +13692,7 @@ fn test_invalid_self_type_rejected_in_trait_declaration() {
 	// accept a mismatched receiver.
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn bad(self: i32) -> i32;
+            func bad(self: i32) -> i32;
         }
         export { }
     "});
@@ -12336,7 +13700,7 @@ fn test_invalid_self_type_rejected_in_trait_declaration() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12347,11 +13711,11 @@ fn test_invalid_self_type_rejected_in_trait_impl() {
 	// Same gap as above, but for the `impl Trait for Type` registration site.
 	let case = TestCase::new(indoc! {"
         trait Drawable {
-            fn bad(self) -> i32;
+            func bad(self) -> i32;
         }
         struct Foo { x: i32 }
         impl Drawable for Foo {
-            fn bad(self: i32) -> i32 { 0 }
+            func bad(self: i32) -> i32 { 0 }
         }
         export { }
     "});
@@ -12359,7 +13723,7 @@ fn test_invalid_self_type_rejected_in_trait_impl() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1053")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::InvalidSelfType.code())),
 		"expected InvalidSelfType diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12374,7 +13738,7 @@ fn test_duplicate_param_name_in_method_rejected() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: i32 }
         impl Foo {
-            pub fn bad(self, a: i32, a: i32) -> i32 { a }
+            pub func bad(self, a: i32, a: i32) -> i32 { a }
         }
         export { }
     "});
@@ -12382,7 +13746,7 @@ fn test_duplicate_param_name_in_method_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12397,7 +13761,7 @@ fn test_infer_in_method_param_type_rejected() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: i32 }
         impl Foo {
-            pub fn bad(self, a: _) -> i32 { 0 }
+            pub func bad(self, a: _) -> i32 { 0 }
         }
         export { }
     "});
@@ -12419,7 +13783,7 @@ fn test_bare_self_param_resolves_to_self_type() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: i32 }
         impl Foo {
-            pub fn by_value(self) -> i32 { 0 }
+            pub func by_value(self) -> i32 { 0 }
         }
         export { }
     "});
@@ -12449,9 +13813,9 @@ fn test_valid_self_types_accepted() {
         memory heap: Memory where { Size = u32 };
         struct Foo { x: i32 }
         impl Foo {
-            pub fn by_value(self) -> i32 { 0 }
-            pub fn by_const_ptr(self: heap::*Foo) -> i32 { 0 }
-            pub fn by_mut_ptr(self: heap::*Foo) -> i32 { 0 }
+            pub func by_value(self) -> i32 { 0 }
+            pub func by_const_ptr(self: heap::*Foo) -> i32 { 0 }
+            pub func by_mut_ptr(self: heap::*Foo) -> i32 { 0 }
         }
         export { }
     "});
@@ -12463,8 +13827,8 @@ fn test_duplicate_method_name_in_impl_rejected() {
 	let case = TestCase::new(indoc! {"
         struct Foo { x: i32 }
         impl Foo {
-            pub fn bar(self) -> i32 { 0 }
-            pub fn bar(self) -> i32 { 1 }
+            pub func bar(self) -> i32 { 0 }
+            pub func bar(self) -> i32 { 1 }
         }
         export { }
     "});
@@ -12472,7 +13836,7 @@ fn test_duplicate_method_name_in_impl_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12484,8 +13848,8 @@ fn test_duplicate_method_name_in_generic_impl_rejected() {
         memory heap: Memory where { Size = u32 };
         struct Vec<T> { len: u32 }
         impl<T> Vec<T> {
-            pub fn len(self) -> u32 { 0 }
-            pub fn len(self) -> u32 { 1 }
+            pub func len(self) -> u32 { 0 }
+            pub func len(self) -> u32 { 1 }
         }
         export { }
     "});
@@ -12493,7 +13857,7 @@ fn test_duplicate_method_name_in_generic_impl_rejected() {
 		case.tir
 			.diagnostics
 			.iter()
-			.any(|d| d.code.as_deref() == Some("E1000")),
+			.any(|d| d.code.as_deref() == Some(DiagnosticCode::DuplicateDefinition.code())),
 		"expected DuplicateDefinition diagnostic, got: {:?}",
 		case.tir.diagnostics
 	);
@@ -12508,7 +13872,7 @@ fn test_tree_mut_binding_mut_does_not_grant_write_through() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(mut ptr: heap::&i32) { ptr.* = 42 }
+        func bad(mut ptr: heap::&i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -12526,7 +13890,7 @@ fn test_tree_mut_immutable_binding_mutable_pointer_write_ok() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ok(ptr: heap::*i32) { ptr.* = 42 }
+        func ok(ptr: heap::*i32) { ptr.* = 42 }
     "},
 		&[],
 	);
@@ -12540,7 +13904,7 @@ fn test_tree_mut_nested_inner_immutable_blocks_deep_write() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(p: heap::*heap::&i32) { p.*.* = 99 }
+        func bad(p: heap::*heap::&i32) { p.*.* = 99 }
     "},
 		&[],
 	);
@@ -12558,7 +13922,7 @@ fn test_tree_mut_nested_both_mutable_write_ok() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ok(p: heap::*heap::*i32) { p.*.* = 99 }
+        func ok(p: heap::*heap::*i32) { p.*.* = 99 }
     "},
 		&[],
 	);
@@ -12573,7 +13937,7 @@ fn test_tree_mut_struct_field_through_immutable_ptr_is_error() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { x: i32 }
-        fn bad(ptr: heap::&Node) { ptr.*.x = 1 }
+        func bad(ptr: heap::&Node) { ptr.*.x = 1 }
     "},
 		&[],
 	);
@@ -12592,7 +13956,7 @@ fn test_tree_mut_struct_field_through_mutable_ptr_ok() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { x: i32 }
-        fn ok(ptr: heap::*Node) { ptr.*.x = 1 }
+        func ok(ptr: heap::*Node) { ptr.*.x = 1 }
     "},
 		&[],
 	);
@@ -12606,8 +13970,8 @@ fn test_tree_mut_mutable_ptr_coerces_to_immutable_param() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn read(ptr: heap::&i32) -> i32 { ptr.* }
-        fn call(p: heap::*i32) -> i32 { read(p) }
+        func read(ptr: heap::&i32) -> i32 { ptr.* }
+        func call(p: heap::*i32) -> i32 { read(p) }
     "},
 		&[],
 	);
@@ -12621,8 +13985,8 @@ fn test_tree_mut_immutable_ptr_cannot_satisfy_mutable_param() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn write(ptr: heap::*i32) { ptr.* = 1 }
-        fn call(p: heap::&i32) { write(p) }
+        func write(ptr: heap::*i32) { ptr.* = 1 }
+        func call(p: heap::&i32) { write(p) }
     "},
 		&[],
 	);
@@ -12639,7 +14003,7 @@ fn test_tree_mut_binding_mut_allows_reassign_but_not_write_through() {
 		"main.wx",
 		indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn bad(a: heap::&i32, b: heap::&i32) {
+        func bad(a: heap::&i32, b: heap::&i32) {
             local mut p: heap::&i32 = a;
             p = b;
             p.* = 99
@@ -12676,9 +14040,9 @@ fn test_ptr_autoderef_calls_method_on_inner_type() {
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn value(self: heap::&Node) -> i32 { self.*.value }
+            pub func value(self: heap::&Node) -> i32 { self.*.value }
         }
-        fn get(n: heap::&Node) -> i32 { n.value() }
+        func get(n: heap::&Node) -> i32 { n.value() }
         export { get }
     "});
 	assert!(
@@ -12695,9 +14059,9 @@ fn test_ptr_autoderef_mutable_ptr_calls_mut_self_method() {
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn set(self: heap::*Node, v: i32) { self.*.value = v }
+            pub func set(self: heap::*Node, v: i32) { self.*.value = v }
         }
-        fn update(n: heap::*Node) { n.set(42) }
+        func update(n: heap::*Node) { n.set(42) }
         export { update }
     "});
 	assert!(
@@ -12714,9 +14078,9 @@ fn test_ptr_autoderef_mutable_ptr_coerces_to_immutable_self() {
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::&Node) -> i32 { self.*.val }
+            pub func read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn get(n: heap::*Node) -> i32 { n.read() }
+        func get(n: heap::*Node) -> i32 { n.read() }
         export { get }
     "});
 	assert!(
@@ -12733,9 +14097,9 @@ fn test_ptr_autoderef_immutable_ptr_rejects_mut_self_method() {
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn set(self: heap::*Node, v: i32) { self.*.value = v }
+            pub func set(self: heap::*Node, v: i32) { self.*.value = v }
         }
-        fn bad(n: heap::&Node) { n.set(42) }
+        func bad(n: heap::&Node) { n.set(42) }
         export { bad }
     "});
 	assert!(
@@ -12752,9 +14116,9 @@ fn test_ptr_autoderef_owned_self_reports_mismatch() {
         memory heap: Memory where { Size = u32 };
         struct Node { value: i32 }
         impl Node {
-            pub fn owned(self: Node) -> i32 { self.value }
+            pub func owned(self: Node) -> i32 { self.value }
         }
-        fn bad(n: heap::*Node) -> i32 { n.owned() }
+        func bad(n: heap::*Node) -> i32 { n.owned() }
         export { bad }
     "});
 	assert!(
@@ -12770,9 +14134,9 @@ fn test_ptr_autoderef_generic_impl_method() {
         memory heap: Memory where { Size = u32 };
         struct Wrapper<T> { inner: T }
         impl <T> Wrapper<T> {
-            pub fn get(self: heap::&Wrapper<T>) -> T { self.*.inner }
+            pub func get(self: heap::&Wrapper<T>) -> T { self.*.inner }
         }
-        fn unwrap(w: heap::&Wrapper<i32>) -> i32 { w.get() }
+        func unwrap(w: heap::&Wrapper<i32>) -> i32 { w.get() }
         export { unwrap }
     "});
 	assert!(
@@ -12791,9 +14155,9 @@ fn test_ptr_autoderef_memory_qualifier_mismatch_errors() {
         memory other: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::&Node) -> i32 { self.*.val }
+            pub func read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn bad(n: other::&Node) -> i32 { n.read() }
+        func bad(n: other::&Node) -> i32 { n.read() }
         export { bad }
     "});
 	assert!(
@@ -12810,9 +14174,9 @@ fn test_ptr_autoderef_double_pointer_not_found() {
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn read(self: heap::&Node) -> i32 { self.*.val }
+            pub func read(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn bad(n: heap::&heap::&Node) -> i32 { n.read() }
+        func bad(n: heap::&heap::&Node) -> i32 { n.read() }
         export { bad }
     "});
 	assert!(
@@ -12828,7 +14192,7 @@ fn test_ptr_field_access_does_not_auto_deref() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
-        fn bad(n: heap::&Node) -> i32 { n.val }
+        func bad(n: heap::&Node) -> i32 { n.val }
         export { bad }
     "});
 	assert!(
@@ -12845,10 +14209,10 @@ fn test_ptr_autoderef_chained_calls() {
         memory heap: Memory where { Size = u32 };
         struct Node { val: i32 }
         impl Node {
-            pub fn next(self: heap::&Node) -> heap::&Node { self }
-            pub fn get_val(self: heap::&Node) -> i32 { self.*.val }
+            pub func next(self: heap::&Node) -> heap::&Node { self }
+            pub func get_val(self: heap::&Node) -> i32 { self.*.val }
         }
-        fn chain(n: heap::&Node) -> i32 { n.next().get_val() }
+        func chain(n: heap::&Node) -> i32 { n.next().get_val() }
         export { chain }
     "});
 	assert!(
@@ -12864,7 +14228,7 @@ fn test_ptr_autoderef_chained_calls() {
 fn test_address_of_non_place_rejected() {
 	// `.&` on a stack value (not a memory place) must emit a diagnostic.
 	let case = TestCase::new(indoc! {"
-        fn bad() -> i32 { (5 as i32).& }
+        func bad() -> i32 { (5 as i32).& }
         export { bad }
     "});
 	assert!(
@@ -12881,8 +14245,8 @@ fn test_address_of_place_has_correct_pointer_type() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn arr_elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
-        fn field_ptr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
+        func arr_elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
+        func field_ptr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
         export { arr_elem_ptr, field_ptr }
     "});
 	assert!(
@@ -12905,7 +14269,7 @@ fn test_struct_triple_duplicate_attributes_to_first_definition() {
 	// definition, A. Both duplicates must now attribute to the same
 	// (first) definition.
 	let case = TestCase::new(indoc! {"
-        fn uses_foo(x: Foo) -> i32 { 0 }
+        func uses_foo(x: Foo) -> i32 { 0 }
         struct Foo { a: i32 }
         struct Foo { b: i32 }
         struct Foo { c: i32 }
@@ -12993,7 +14357,7 @@ fn test_true_false_are_keywords_not_shadowable() {
 	// keywords parsed directly into dedicated `Bool` expressions, so a
 	// same-named local can never be referenced and is flagged as unused.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local true = false;
             if true { 1 } else { 2 }
         }
@@ -13015,7 +14379,7 @@ fn test_underscore_prefixed_local_suppresses_unused_warning() {
 	// `_foo` still binds the name (unlike a bare `_` wildcard) but, matching
 	// Rust's convention, should not trigger the unused-variable lint.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local _unused: i32 = 1;
             2
         }
@@ -13035,7 +14399,7 @@ fn test_underscore_prefixed_local_suppresses_unused_warning() {
 #[test]
 fn test_underscore_prefixed_param_suppresses_unused_warning() {
 	let case = TestCase::new(indoc! {"
-        fn f(_unused: i32) -> i32 {
+        func f(_unused: i32) -> i32 {
             1
         }
         export { f }
@@ -13056,7 +14420,7 @@ fn test_plain_unused_local_still_warns() {
 	// Sanity check that the underscore-prefix exemption didn't accidentally
 	// disable the lint entirely.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local unused: i32 = 1;
             2
         }
@@ -13082,14 +14446,14 @@ fn test_generic_trait_impl_resolves() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl<T> Getter for Box<T> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             b.get()
         }
 
@@ -13139,18 +14503,18 @@ fn test_generic_inherent_impl_vs_trait_priority() {
         struct Box<T> { v: T }
 
         impl<T> Box<T> {
-            pub fn get(self) -> T { self.v }
+            pub func get(self) -> T { self.v }
         }
 
         trait Getter {
-            fn get(self) -> bool;
+            func get(self) -> bool;
         }
 
         impl Getter for Box<i32> {
-            fn get(self) -> bool { true }
+            func get(self) -> bool { true }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             b.get()
         }
 
@@ -13181,14 +14545,14 @@ fn test_generic_trait_impl_bound_satisfied() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl<T: Foo> Getter for Box<T> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
-        fn use_it(b: Box<Yes>) -> i32 {
+        func use_it(b: Box<Yes>) -> i32 {
             b.get()
         }
 
@@ -13218,14 +14582,14 @@ fn test_generic_trait_impl_bound_violation_reports_error() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl<T: Foo> Getter for Box<T> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
-        fn use_it(b: Box<No>) -> i32 {
+        func use_it(b: Box<No>) -> i32 {
             b.get()
         }
 
@@ -13255,18 +14619,18 @@ fn test_generic_trait_impl_and_concrete_impl_ambiguous() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl Getter for Box<i32> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
         impl<T> Getter for Box<T> {
-            fn get(self) -> i32 { 2 }
+            func get(self) -> i32 { 2 }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             b.get()
         }
 
@@ -13292,15 +14656,15 @@ fn test_two_concrete_trait_impls_for_same_struct_is_duplicate() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl Getter for Box<i32> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
         impl Getter for Box<u8> {
-            fn get(self) -> i32 { 2 }
+            func get(self) -> i32 { 2 }
         }
 
         export { }
@@ -13329,15 +14693,15 @@ fn test_two_generic_trait_impls_for_same_struct_is_duplicate() {
         struct Box<T> { v: T }
 
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl<T: Foo> Getter for Box<T> {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
         impl<T: Bar> Getter for Box<T> {
-            fn get(self) -> i32 { 2 }
+            func get(self) -> i32 { 2 }
         }
 
         export { }
@@ -13367,11 +14731,11 @@ fn test_blanket_trait_impl_reports_invalid_impl_target() {
 	// call site instead.
 	let case = TestCase::new(indoc! {"
         trait Getter {
-            fn get(self) -> i32;
+            func get(self) -> i32;
         }
 
         impl<T> Getter for T {
-            fn get(self) -> i32 { 1 }
+            func get(self) -> i32 { 1 }
         }
 
         export { }
@@ -13398,17 +14762,17 @@ fn test_generic_trait_impl_associated_type_substitutes() {
 	let case = TestCase::new(indoc! {"
         trait Container {
             type Item;
-            fn get(self) -> Self::Item;
+            func get(self) -> Self::Item;
         }
 
         struct Box<T> { v: T }
 
         impl<T> Container for Box<T> {
             type Item = T;
-            fn get(self) -> Self::Item { self.v }
+            func get(self) -> Self::Item { self.v }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             b.get()
         }
 
@@ -13446,11 +14810,11 @@ fn test_abstract_dispatch_access_recorded_for_associated_const() {
             const FOO: i32 = 42;
         }
 
-        fn use_it<T: HasConst>() -> i32 {
+        func use_it<T: HasConst>() -> i32 {
             T::FOO
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             use_it::<Impl1>()
         }
 
@@ -13476,12 +14840,12 @@ fn test_type_param_ambiguous_bound_methods_reports_error() {
 	// as concrete types.
 	let case = TestCase::new(indoc! {"
         trait A {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
         trait B {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
-        fn use_it<T: A + B>(x: T) -> i32 {
+        func use_it<T: A + B>(x: T) -> i32 {
             x.foo()
         }
         export { }
@@ -13498,24 +14862,117 @@ fn test_type_param_ambiguous_bound_methods_reports_error() {
 }
 
 #[test]
+fn test_trait_impl_assoc_type_resolves_when_impl_is_declared_later() {
+	// `S::X` in a *signature* is resolved during Phase 2, where an impl is
+	// reachable only through the dispatch index its own header fills, and its
+	// members only once each member's signature has run. Both used to happen
+	// wherever parse order put them, so this exact program failed with E1021
+	// and compiled with the `impl` moved above `f`.
+	let case = TestCase::new(indoc! {"
+        trait Tr { type X; }
+        struct S { a: i32 }
+        func f(v: S::X) -> i32 { v }
+        impl Tr for S { type X = i32; }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_trait_impl_assoc_type_resolves_from_another_module() {
+	// Same, with the impl in a module the entry file declares *after* the use
+	// site — the order the sweep reaches files in must not matter either.
+	let case = TestCase::new_multi_file(
+		"src/main.wx",
+		indoc! {"
+            mod impls;
+            struct S { a: i32 }
+            trait Tr { type X; }
+            func f(v: S::X) -> i32 { v }
+            export { f }
+        "},
+		&[(
+			"src/impls.wx",
+			"impl crate::Tr for crate::S { type X = i32; }",
+		)],
+	);
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_two_inherent_blocks_claiming_one_name_report_both_sites() {
+	// Unlike two members of a *single* block, where the first declaration wins
+	// the name outright, both blocks stay candidates — the same shape as
+	// rustc, which reports the collision on the impls and E0034 again at each
+	// use. Dropping the second would silence the call site in favour of one
+	// diagnostic pointing at neither of them.
+	let case = TestCase::new(indoc! {"
+        struct S { a: i32 }
+        impl S { pub func get(self) -> i32 { self.a } }
+        impl S { pub func get(self) -> bool { true } }
+        func f(s: S) -> i32 { s.get() }
+        export { f }
+    "});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::DuplicateDefinition,
+		DiagnosticCode::DuplicateDefinition,
+	]);
+}
+
+#[test]
+fn test_inherent_impl_const_resolves_when_impl_is_declared_later() {
+	// The inherent half of
+	// `test_trait_impl_assoc_type_resolves_when_impl_is_declared_later`, and
+	// the reason `inherent_impl_dispatch` is filled from the block's *header*:
+	// filled per resolved member instead, the bucket `S::N` looks in is still
+	// empty here and the program fails with E1007 — but compiles with the
+	// `impl` moved above the `const`.
+	let case = TestCase::new(indoc! {"
+        struct S { a: i32 }
+        const A: u32 = S::N;
+        impl S { const N: u32 = 4; }
+        func f() -> u32 { A }
+        export { f }
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
+fn test_typeset_bound_checked_against_resolved_members() {
+	// A typeset's symbol is registered resolved at prescan, so naming it in a
+	// bound never forced its signature: `members` could still be empty when a
+	// membership check read them, making a legal type fail E1047 purely
+	// because of where the typeset was declared. `Small` is declared after the
+	// bound that names it.
+	let case = TestCase::new(indoc! {"
+        trait Holder { type N: Small; }
+        struct S { a: i32 }
+        impl Holder for S { type N = u8; }
+        typeset Small { u8, u16 }
+        export {}
+    "});
+	assert_no_errors(&case);
+}
+
+#[test]
 fn test_stdlib_inherent_slice_method_beats_trait_no_ambiguity() {
 	// Same inherent-always-wins rule as the struct case, but on
 	// `ImplTarget::Slice`. The inherent side is the stdlib's own
-	// `impl<Mem: Memory, T> Mem::&[T] { fn len(self) -> Mem::Size }`, which
+	// `impl<Mem: Memory, T> Mem::&[T] { func len(self) -> Mem::Size }`, which
 	// is now the only inherent impl a slice can have. `Counter::len` returns
 	// `bool`, so picking it would make `use_it`'s return type fail to check.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
         trait Counter {
-            fn len(self) -> bool;
+            func len(self) -> bool;
         }
 
         impl Counter for heap::&[i32] {
-            fn len(self) -> bool { true }
+            func len(self) -> bool { true }
         }
 
-        fn use_it(s: heap::&[i32]) -> u32 {
+        func use_it(s: heap::&[i32]) -> u32 {
             s.len()
         }
 
@@ -13535,10 +14992,10 @@ fn test_generic_inherent_impl_resolves_via_path_call_syntax() {
         struct Box<T> { v: T }
 
         impl<T> Box<T> {
-            pub fn get(self) -> T { self.v }
+            pub func get(self) -> T { self.v }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             Box::get(b)
         }
 
@@ -13549,8 +15006,8 @@ fn test_generic_inherent_impl_resolves_via_path_call_syntax() {
 
 #[test]
 fn test_concrete_and_generic_inherent_impl_collision_is_rejected() {
-	// `impl Box<i32> { fn get(...) -> bool }` (concrete) and
-	// `impl<T> Box<T> { fn get(...) -> T }` (generic) both provide `get` for
+	// `impl Box<i32> { func get(...) -> bool }` (concrete) and
+	// `impl<T> Box<T> { func get(...) -> T }` (generic) both provide `get` for
 	// `Box<i32>`. Concrete and generic inherent impls are no longer two
 	// separate registries (`impl_members` vs `generic_impl_list`) — they're
 	// both just `ImplBlock`s sharing the same `impl_block_dispatch` bucket,
@@ -13560,14 +15017,14 @@ fn test_concrete_and_generic_inherent_impl_collision_is_rejected() {
         struct Box<T> { v: T }
 
         impl<T> Box<T> {
-            pub fn get(self) -> T { self.v }
+            pub func get(self) -> T { self.v }
         }
 
         impl Box<i32> {
-            pub fn get(self) -> bool { true }
+            pub func get(self) -> bool { true }
         }
 
-        fn use_it(b: Box<i32>) -> i32 {
+        func use_it(b: Box<i32>) -> i32 {
             b.get()
         }
 
@@ -13595,14 +15052,14 @@ fn test_two_generic_impl_blocks_with_colliding_method_name_is_rejected() {
         struct S<T> { v: T }
 
         impl<T> S<T> {
-            pub fn foo(self) -> i32 { 1 }
+            pub func foo(self) -> i32 { 1 }
         }
 
         impl<T> S<T> {
-            pub fn foo(self) -> i32 { 2 }
+            pub func foo(self) -> i32 { 2 }
         }
 
-        fn use_it(s: S<i32>) -> i32 {
+        func use_it(s: S<i32>) -> i32 {
             s.foo()
         }
 
@@ -13636,14 +15093,14 @@ fn test_two_generic_impl_blocks_colliding_despite_differing_bounds_is_rejected()
         trait Marker {}
 
         impl<T: Marker> Y {
-            pub fn bar(self, x: T) -> i32 { 1 }
+            pub func bar(self, x: T) -> i32 { 1 }
         }
 
         impl<T> Y {
-            pub fn bar(self, x: T) -> i32 { 2 }
+            pub func bar(self, x: T) -> i32 { 2 }
         }
 
-        fn use_it(y: Y, v: i32) -> i32 {
+        func use_it(y: Y, v: i32) -> i32 {
             y.bar(v)
         }
 
@@ -13676,22 +15133,22 @@ fn test_trait_impl_resolution_uses_global_index_not_local_position() {
 	// having `foo`.
 	let case = TestCase::new(indoc! {"
         trait Other {
-            fn bar(self) -> i32;
+            func bar(self) -> i32;
         }
         struct Unrelated {}
         impl Other for Unrelated {
-            fn bar(self) -> i32 { 1 }
+            func bar(self) -> i32 { 1 }
         }
 
         trait Foo {
-            fn foo(self) -> i32;
+            func foo(self) -> i32;
         }
         struct S {}
         impl Foo for S {
-            fn foo(self) -> i32 { 2 }
+            func foo(self) -> i32 { 2 }
         }
 
-        fn use_it(s: S) -> i32 { s.foo() }
+        func use_it(s: S) -> i32 { s.foo() }
         export { use_it }
     "});
 	assert!(
@@ -13729,7 +15186,7 @@ fn test_where_clause_bound_on_assoc_type_lets_qualified_path_resolve() {
             type Unsigned = u32;
         }
 
-        fn grow<Mem: Memory where { Size: UnsignedInt }>(_mem: Mem, _delta: Mem::Size) -> <Mem::Size as UnsignedInt>::Signed {
+        func grow<Mem: Memory where { Size: UnsignedInt }>(_mem: Mem, _delta: Mem::Size) -> <Mem::Size as UnsignedInt>::Signed {
             unreachable
         }
     "});
@@ -13800,8 +15257,8 @@ fn test_trait_conformance_checks_bound_kind_assoc_binding_typeset_violation() {
         }
     "});
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::TypesetBoundViolation),
-		"expected a typeset-bound-violation diagnostic for BadElem::Size (bool) not in Ints, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a bound-violation diagnostic for BadElem::Size (bool) not in Ints, got: {:?}",
 		case.tir
 			.diagnostics
 			.iter()
@@ -13841,6 +15298,210 @@ fn test_trait_conformance_bound_kind_assoc_binding_satisfied_no_error() {
 	);
 }
 
+/// `Container::Elem`'s declared bound carries `where { Y = Self }`. When an
+/// impl binds `Elem` to a concrete type, conformance must check that type's
+/// `Y` against the impl target (what `Self` resolves to) — the
+/// `substitute_type(Self, [self_ty])` + compare branch in
+/// `check_declared_bounds`, which every abstract-RHS test skips.
+#[test]
+fn test_conformance_declared_self_binding_violation() {
+	let case = TestCase::new(indoc! {"
+        trait X { type Y; }
+        trait Container { type Elem: X where { Y = Self }; }
+
+        struct Foo {}
+        struct Bar {}
+        struct Elem {}
+        impl X for Elem { type Y = Bar; }
+        impl Container for Foo { type Elem = Elem; }
+    "});
+	// `where { Y = Self }` requires `Elem::Y == Foo`; the impl makes it `Bar`.
+	assert!(
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected a binding mismatch (`Elem::Y` is `Bar`, not `Foo`), got: {:?}",
+		error_messages(&case.tir),
+	);
+}
+
+#[test]
+fn test_conformance_declared_self_binding_satisfied() {
+	let case = TestCase::new(indoc! {"
+        trait X { type Y; }
+        trait Container { type Elem: X where { Y = Self }; }
+
+        struct Foo {}
+        struct Elem {}
+        impl X for Elem { type Y = Foo; }
+        impl Container for Foo { type Elem = Elem; }
+    "});
+	no_errors(&case);
+}
+
+/// `Self` on the *impl* side of an associated-type value is not a type
+/// parameter: `types.rs` resolves it to the target type itself inside an impl
+/// block or trait impl, and only inside a trait declaration is it the trait's
+/// `self_type_param`. Conformance therefore checks `Foo` against `Y`'s
+/// declared bounds with no substitution of its own — this pins that, since a
+/// change to `Self` resolution would otherwise silently reintroduce the need
+/// for one.
+/// A `where` nested inside a trait's *declared* associated-type bound is an
+/// obligation on whoever implements it, and conformance is the only place it
+/// can be discharged — the declaration site can only check that the clause is
+/// coherent, not that some particular impl satisfies it. `Foo::A` is
+/// `MidImpl`, whose `B` is `DeepImpl`, whose `C` is `bool`, which is not
+/// `Marker`. Checking only the nested bound's trait *membership* and stopping
+/// dropped this.
+#[test]
+fn test_conformance_checks_nested_where_in_a_declared_assoc_bound() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid  { type B: Deep; }
+        trait Top  { type A: Mid where { B: Deep where { C: Marker } }; }
+
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = bool; }
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+        struct Foo {}
+        impl Top for Foo { type A = MidImpl; }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `bool: Marker` is not satisfied");
+}
+
+/// The same shape with the innermost obligation met stays clean — the
+/// recursion must not invent a violation where the written nesting is
+/// satisfied.
+#[test]
+fn test_conformance_nested_where_in_a_declared_assoc_bound_satisfied() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait Deep { type C; }
+        trait Mid  { type B: Deep; }
+        trait Top  { type A: Mid where { B: Deep where { C: Marker } }; }
+
+        struct Leaf {}
+        impl Marker for Leaf {}
+        struct DeepImpl {}
+        impl Deep for DeepImpl { type C = Leaf; }
+        struct MidImpl {}
+        impl Mid for MidImpl { type B = DeepImpl; }
+        struct Foo {}
+        impl Top for Foo { type A = MidImpl; }
+    "});
+	no_errors(&case);
+}
+
+/// Mutually-referential declarations must not hang. `check_written_bounds`
+/// only ever descends written syntax and never opens a declaration's bounds,
+/// so the declaration-to-declaration edge that could ping-pong here is
+/// followed exactly once, by `check_declared_bounds`. This is the case that
+/// made the nested check flat in the first place; it is why the fix needs no
+/// `visited` set.
+#[test]
+fn test_mutually_referential_declared_bounds_terminate() {
+	let case = TestCase::new(indoc! {"
+        trait A { type X: B where { Y = Self }; }
+        trait B { type Y: A where { X = Self }; }
+        struct P {}
+        struct Q {}
+        impl A for P { type X = Q; }
+        impl B for Q { type Y = P; }
+    "});
+	no_errors(&case);
+}
+
+/// The same, with the mutual reference written as nested `Bound` refinements
+/// rather than `Equals` — the form the recursion actually descends.
+#[test]
+fn test_mutually_referential_nested_bounds_terminate() {
+	let case = TestCase::new(indoc! {"
+        trait A { type X: B where { Y: A where { X: B } }; }
+        trait B { type Y: A where { X: B where { Y: A } }; }
+        struct P {}
+        struct Q {}
+        impl A for P { type X = Q; }
+        impl B for Q { type Y = P; }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_conformance_reads_self_in_an_impl_value_as_the_target() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X { type Y: Marker; }
+        struct Foo {}
+        impl X for Foo { type Y = Self; }
+    "});
+	case.diagnostics()
+		.assert_error_saying("the trait bound `Foo: Marker` is not satisfied");
+}
+
+/// Conformance walks the trait's members, which live in a `HashMap`, and
+/// nothing sorts diagnostics downstream — they render in push order. So the
+/// walk is ordered by each member's span *in the impl*, where every one of
+/// these diagnostics puts its primary label. The impl here lists `C, B, A`
+/// against a trait declaring `A, B, C`, so trait order and impl order
+/// disagree and only the intended one produces ascending labels.
+#[test]
+fn test_conformance_diagnostics_follow_the_impls_own_order() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X {
+            type A: Marker;
+            type B: Marker;
+            type C: Marker;
+        }
+        struct Foo {}
+        impl X for Foo {
+            type C = bool;
+            type B = bool;
+            type A = bool;
+        }
+    "});
+	let starts: Vec<u32> = case
+		.tir
+		.diagnostics
+		.iter()
+		.filter(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code())
+		})
+		.filter_map(|d| {
+			d.labels
+				.iter()
+				.find(|label| {
+					label.style
+						== codespan_reporting::diagnostic::LabelStyle::Primary
+				})
+				.map(|label| label.range.start as u32)
+		})
+		.collect();
+	assert_eq!(
+		starts.len(),
+		3,
+		"expected one violation per associated type"
+	);
+	assert!(
+		starts.windows(2).all(|w| w[0] < w[1]),
+		"diagnostics should follow the impl's source order, got {starts:?}"
+	);
+}
+
+#[test]
+fn test_conformance_self_in_an_impl_value_satisfies_its_bound() {
+	let case = TestCase::new(indoc! {"
+        trait Marker {}
+        trait X { type Y: Marker; }
+        struct Foo {}
+        impl Marker for Foo {}
+        impl X for Foo { type Y = Self; }
+    "});
+	no_errors(&case);
+}
+
 #[test]
 fn test_call_site_assoc_bound_satisfied_no_error() {
 	// `needs_marker`'s own `where { Size: Marker }` isn't checked merely by
@@ -13856,8 +15517,8 @@ fn test_call_site_assoc_bound_satisfied_no_error() {
             type Size = u32;
         }
         impl Marker for u32 {}
-        fn needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
-        fn use_it(mem: Mem32, delta: u32) {
+        func needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
+        func use_it(mem: Mem32, delta: u32) {
             needs_marker(mem, delta);
         }
         export { use_it }
@@ -13882,8 +15543,8 @@ fn test_call_site_assoc_bound_violated_reports_error() {
         impl Memory for Mem32 {
             type Size = u32;
         }
-        fn needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
-        fn use_it(mem: Mem32, delta: u32) {
+        func needs_marker<Mem: Memory where { Size: Marker }>(_mem: Mem, _delta: Mem::Size) {}
+        func use_it(mem: Mem32, delta: u32) {
             needs_marker(mem, delta);
         }
         export { use_it }
@@ -13913,8 +15574,8 @@ fn test_unqualified_chained_projection_resolves_when_unambiguous() {
         impl Memory for Mem32 { type Size = u32; }
         impl Unsigned for u32 { type Signed = i32; }
 
-        fn f<Mem: Memory where { Size: Unsigned }>(_m: Mem) -> Mem::Size::Signed { unreachable }
-        fn f_concrete(m: Mem32) -> i32 { f(m) }
+        func f<Mem: Memory where { Size: Unsigned }>(_m: Mem) -> Mem::Size::Signed { unreachable }
+        func f_concrete(m: Mem32) -> i32 { f(m) }
         export { f_concrete }
     "});
 	no_errors(&case);
@@ -13936,7 +15597,7 @@ fn test_unqualified_chained_projection_ambiguous_reports_error() {
         impl TraitA for u32 { type Foo = i32; }
         impl TraitB for u32 { type Foo = i64; }
 
-        fn f<Mem: Memory where { Size: TraitB }>(_m: Mem) -> Mem::Size::Foo { unreachable }
+        func f<Mem: Memory where { Size: TraitB }>(_m: Mem) -> Mem::Size::Foo { unreachable }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::AmbiguousTraitMember),
@@ -13950,30 +15611,42 @@ fn test_unqualified_chained_projection_ambiguous_reports_error() {
 }
 
 #[test]
-fn test_where_clause_assoc_type_conflicting_typeset_bound_reports_error() {
-	// `Memory::Size` is already pinned to `SetA` by the trait's own
-	// declaration (`type Size: SetA`); `f`'s `where { Size: SetB }` tries to
-	// layer on a second, different typeset bound for the same associated
-	// type. `Bounds` only ever holds one typeset slot, so this must be
-	// rejected at the point the `where` clause is resolved rather than
-	// silently keeping (or silently dropping) one of the two.
+fn test_where_clause_can_layer_a_second_typeset_bound_on_assoc_type() {
+	// `Memory::Size` is bounded by `SetA` at the trait declaration; `f` layers
+	// a second typeset bound `SetB` via its `where` clause. Two typeset bounds
+	// are just two trait bounds now — the declaration is fine, but any `Mem`
+	// whose `Size` isn't in *both* sets fails at the call site.
 	let case = TestCase::new(indoc! {"
         typeset SetA { u8, u16 }
-        typeset SetB { u32, u64 }
+        typeset SetB { u16, u32 }
         trait Memory { type Size: SetA; }
         struct Mem8 {}
         impl Memory for Mem8 { type Size = u8; }
 
-        fn f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
+        func f<Mem: Memory where { Size: SetB }>(_m: Mem) {}
+        func bad() { f(Mem8::{}); }
+        export { bad }
     "});
+	// The only error is the call-site violation — layering two typeset bounds
+	// on one associated type is legal (they are just two trait bounds).
+	// `Mem8::Size = u8` is in `SetA` but not `SetB`.
 	assert!(
-		has_error_code(&case.tir, DiagnosticCode::MultipleTypesetBounds),
-		"expected a multiple-typeset-bounds diagnostic, got: {:?}",
+		has_error_code(&case.tir, DiagnosticCode::TraitBoundViolation),
+		"expected `u8: SetB` violation, got: {:?}",
+		error_messages(&case.tir),
+	);
+	assert_eq!(
 		case.tir
 			.diagnostics
 			.iter()
-			.map(|d| &d.message)
-			.collect::<Vec<_>>()
+			.filter(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.count(),
+		1,
+		"exactly one violation expected: {:?}",
+		error_messages(&case.tir),
 	);
 }
 
@@ -13983,35 +15656,35 @@ fn test_display_bounds_includes_where_clause_assoc_type_bound() {
 	// messages and LSP hover) used to only look at `TraitBound.bindings`'
 	// `Equals` entries when deciding whether to print a `where { }` clause
 	// at all — a bound with *only* a `where { Size: Unsigned }` entry (no
-	// `=` binding) printed as bare `Memory`, silently dropping the
+	// `=` binding) printed as bare `Store`, silently dropping the
 	// constraint from what the user sees on hover.
+	//
+	// The subject is `#[tag]`ged rather than looked up by name: the stdlib
+	// declares its own trait methods (`Memory::grow` and friends), so a
+	// bare name match here is order-dependent.
 	let case = TestCase::new(indoc! {"
         trait Unsigned {}
-        trait Memory { type Size; }
-        fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem, delta: Mem::Size) -> Mem::Size {
+        trait Store { type Size; }
+        #[tag = \"subject\"]
+        func grow<S: Store where { Size: Unsigned }>(store: S, delta: S::Size) -> S::Size {
             unreachable
         }
     "});
-	let func = case
+	let def_id = *case
 		.tir
 		.items
-		.functions
-		.iter()
-		.find(|f| {
-			case.graph
-				.interner
-				.resolve(f.name.inner)
-				.map(|n| n == "grow")
-				.unwrap_or(false)
-		})
+		.tagged_items
+		.get(&case.graph.interner.get("subject").unwrap())
 		.unwrap();
+	let func = &case.tir.items.functions
+		[usize::from(case.tir.items.function_index(def_id).unwrap())];
 	let fmt = case.tir.formatter(
 		&case.graph.interner,
 		&case.graph.packages,
 		case.graph.root_package,
 	);
 	let s = fmt.display_bounds(&func.type_params[0].bounds).unwrap();
-	assert_eq!(s, "Memory where { Size: Unsigned }");
+	assert_eq!(s, "Store where { Size: Unsigned }");
 }
 
 #[test]
@@ -14026,7 +15699,7 @@ fn test_where_clause_duplicate_binding_name_reports_error() {
         struct Mem32 {}
         impl Memory for Mem32 { type Size = u32; }
 
-        fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(_m: Mem) {}
+        func f<Mem: Memory where { Size = u32, Size: Unsigned }>(_m: Mem) {}
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::DuplicateAssocTypeBinding),
@@ -14052,7 +15725,7 @@ fn test_qualified_bound_with_undeclared_member_reports_diagnostic_not_panic() {
             pub trait Marker {}
         }
 
-        fn f<T: ns::Missing>() {}
+        func f<T: ns::Missing>() {}
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredType),
@@ -14079,7 +15752,7 @@ fn test_qualified_bound_namespace_segment_records_access() {
             pub trait Marker {}
         }
 
-        fn f<T: ns::Marker>(_x: T) {}
+        func f<T: ns::Marker>(_x: T) {}
     "});
 	assert!(
 		!case
@@ -14097,7 +15770,7 @@ fn test_qualified_bound_namespace_segment_records_access() {
 
 	let has_namespace_access = case
 		.tir
-		.modules
+		.defs
 		.namespaces
 		.iter()
 		.any(|ns| !ns.accesses.is_empty());
@@ -14113,7 +15786,7 @@ fn test_qualified_bound_namespace_segment_records_access() {
 #[test]
 fn test_match_int_exhaustive_with_wildcard() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             match x {
                 0 -> { 0 },
                 1 -> { 1 },
@@ -14142,7 +15815,7 @@ fn test_match_enum_all_variants_covered_no_wildcard_ok() {
             StdOut,
             StdErr,
         }
-        fn name(fd: FileDescriptor) -> u8 {
+        func name(fd: FileDescriptor) -> u8 {
             match fd {
                 FileDescriptor::StdIn -> { 0 },
                 FileDescriptor::StdOut -> { 1 },
@@ -14170,7 +15843,7 @@ fn test_match_enum_missing_variant_is_error() {
             StdOut,
             StdErr,
         }
-        fn name(fd: FileDescriptor) -> u8 {
+        func name(fd: FileDescriptor) -> u8 {
             match fd {
                 FileDescriptor::StdIn -> { 0 },
                 FileDescriptor::StdOut -> { 1 },
@@ -14192,7 +15865,7 @@ fn test_match_enum_missing_variant_is_error() {
 #[test]
 fn test_match_int_without_wildcard_is_error() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             match x {
                 0 -> { 0 },
                 1 -> { 1 },
@@ -14217,7 +15890,7 @@ fn test_match_invalid_pattern_shape_is_error() {
 	// pattern: it isn't a literal, `_`, or an `Enum::Variant` path, and it
 	// doesn't fold to a compile-time constant.
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32, y: i32) -> i32 {
+        func f(x: i32, y: i32) -> i32 {
             match x {
                 y -> { 1 },
                 _ -> { 2 },
@@ -14239,7 +15912,7 @@ fn test_match_invalid_pattern_shape_is_error() {
 #[test]
 fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) {
+        func f(x: i32) {
             local y = match x {
                 0 -> { x > 0 },
                 _ -> { x },
@@ -14266,7 +15939,7 @@ fn test_match_enum_variant_marks_variant_used() {
             StdOut,
             StdErr,
         }
-        fn name(fd: FileDescriptor) -> u8 {
+        func name(fd: FileDescriptor) -> u8 {
             match fd {
                 FileDescriptor::StdIn -> { 0 },
                 _ -> { 1 },
@@ -14304,7 +15977,7 @@ fn test_match_enum_variant_marks_variant_used() {
 #[test]
 fn test_match_duplicate_pattern_warns_unreachable() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             match x {
                 0 -> { 1 },
                 0 -> { 2 },
@@ -14329,7 +16002,7 @@ fn test_match_duplicate_pattern_warns_unreachable() {
 #[test]
 fn test_generic_type_param_bounded_by_add_dispatches() {
 	let case = TestCase::new(indoc! {"
-        pub fn add_generic<T: Add>(a: T, b: T) -> T {
+        pub func add_generic<T: Add>(a: T, b: T) -> T {
             a + b
         }
     "});
@@ -14339,7 +16012,7 @@ fn test_generic_type_param_bounded_by_add_dispatches() {
 #[test]
 fn test_generic_type_param_unbounded_operator_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
-        pub fn add_generic<T>(a: T, b: T) -> T {
+        pub func add_generic<T>(a: T, b: T) -> T {
             a + b
         }
     "});
@@ -14360,7 +16033,7 @@ fn test_generic_type_param_unbounded_operator_reports_diagnostic() {
 #[test]
 fn test_generic_type_param_bounded_compound_assign_dispatches() {
 	let case = TestCase::new(indoc! {"
-        pub fn add_assign_generic<T: Add>(a: T, b: T) -> T {
+        pub func add_assign_generic<T: Add>(a: T, b: T) -> T {
             local mut x: T = a;
             x += b;
             x
@@ -14372,7 +16045,7 @@ fn test_generic_type_param_bounded_compound_assign_dispatches() {
 #[test]
 fn test_generic_type_param_bitand_bounded_compound_assign_dispatches() {
 	let case = TestCase::new(indoc! {"
-        pub fn and_assign_generic<T: BitAnd>(a: T, b: T) -> T {
+        pub func and_assign_generic<T: BitAnd>(a: T, b: T) -> T {
             local mut x: T = a;
             x &= b;
             x
@@ -14384,7 +16057,7 @@ fn test_generic_type_param_bitand_bounded_compound_assign_dispatches() {
 #[test]
 fn test_generic_type_param_unbounded_compound_assign_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
-        pub fn add_assign_generic<T>(a: T, b: T) -> T {
+        pub func add_assign_generic<T>(a: T, b: T) -> T {
             local mut x: T = a;
             x += b;
             x
@@ -14419,12 +16092,12 @@ fn test_struct_impl_add_dispatches() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        pub func add_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a + b
         }
     "});
@@ -14443,12 +16116,12 @@ fn test_struct_operator_dispatch_records_goto_definition_access() {
 
         impl Add for Vec2 {
             #[tag = \"vec2_add\"]
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        pub func add_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a + b
         }
     "});
@@ -14474,7 +16147,7 @@ fn test_struct_without_operator_impl_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
         struct Vec2 { x: i32, y: i32 }
 
-        pub fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        pub func add_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a + b
         }
     "});
@@ -14503,12 +16176,12 @@ fn test_struct_operator_impl_does_not_grant_other_operators() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        pub fn mul_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        pub func mul_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a * b
         }
     "});
@@ -14533,12 +16206,12 @@ fn test_struct_impl_neg_dispatches() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Neg for Vec2 {
-            fn neg(self: Self) -> Self {
+            func neg(self: Self) -> Self {
                 Vec2::{ x: -self.x, y: -self.y }
             }
         }
 
-        pub fn neg_vec2(a: Vec2) -> Vec2 {
+        pub func neg_vec2(a: Vec2) -> Vec2 {
             -a
         }
     "});
@@ -14551,12 +16224,12 @@ fn test_struct_compound_assignment_dispatches_to_add_method() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        pub fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
+        pub func add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
             a += b;
             a
         }
@@ -14570,12 +16243,12 @@ fn test_struct_compound_assignment_dispatches_to_bitand_method() {
         struct Flags { bits: i32 }
 
         impl BitAnd for Flags {
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        pub fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+        pub func and_assign_flags(mut a: Flags, b: Flags) -> Flags {
             a &= b;
             a
         }
@@ -14600,12 +16273,12 @@ fn test_struct_impl_bitand_dispatches() {
         struct Flags { bits: i32 }
 
         impl BitAnd for Flags {
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        pub fn and_flags(a: Flags, b: Flags) -> Flags {
+        pub func and_flags(a: Flags, b: Flags) -> Flags {
             a & b
         }
     "});
@@ -14621,7 +16294,7 @@ fn test_struct_without_bitand_impl_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
         struct Flags { bits: i32 }
 
-        pub fn and_flags(a: Flags, b: Flags) -> Flags {
+        pub func and_flags(a: Flags, b: Flags) -> Flags {
             a & b
         }
     "});
@@ -14646,12 +16319,12 @@ fn test_struct_bitand_impl_does_not_grant_other_bitwise_operators() {
         struct Flags { bits: i32 }
 
         impl BitAnd for Flags {
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        pub fn or_flags(a: Flags, b: Flags) -> Flags {
+        pub func or_flags(a: Flags, b: Flags) -> Flags {
             a | b
         }
     "});
@@ -14673,11 +16346,11 @@ fn test_struct_bitand_impl_does_not_grant_other_bitwise_operators() {
 #[test]
 fn test_generic_bitand_bound_dispatches() {
 	let case = TestCase::new(indoc! {"
-        pub fn and_it<T: BitAnd>(a: T, b: T) -> T {
+        pub func and_it<T: BitAnd>(a: T, b: T) -> T {
             a & b
         }
 
-        pub fn use_and(a: i32, b: i32) -> i32 {
+        pub func use_and(a: i32, b: i32) -> i32 {
             and_it(a, b)
         }
     "});
@@ -14698,12 +16371,12 @@ fn test_struct_impl_bitnot_dispatches() {
         struct Flags { bits: i32 }
 
         impl BitNot for Flags {
-            fn bitnot(self: Self) -> Self {
+            func bitnot(self: Self) -> Self {
                 Flags::{ bits: ^self.bits }
             }
         }
 
-        pub fn not_flags(a: Flags) -> Flags {
+        pub func not_flags(a: Flags) -> Flags {
             ^a
         }
     "});
@@ -14715,7 +16388,7 @@ fn test_struct_without_bitnot_impl_reports_diagnostic() {
 	let case = TestCase::new(indoc! {"
         struct Flags { bits: i32 }
 
-        pub fn not_flags(a: Flags) -> Flags {
+        pub func not_flags(a: Flags) -> Flags {
             ^a
         }
     "});
@@ -14741,12 +16414,12 @@ fn test_struct_bitnot_impl_does_not_grant_neg() {
         struct Flags { bits: i32 }
 
         impl BitNot for Flags {
-            fn bitnot(self: Self) -> Self {
+            func bitnot(self: Self) -> Self {
                 Flags::{ bits: ^self.bits }
             }
         }
 
-        pub fn neg_flags(a: Flags) -> Flags {
+        pub func neg_flags(a: Flags) -> Flags {
             -a
         }
     "});
@@ -14769,11 +16442,11 @@ fn test_generic_bitnot_bound_dispatches() {
 	// bounded by `BitNot` dispatches through `resolve_bounded_operator_method`
 	// instead of failing with "operator cannot be applied".
 	let case = TestCase::new(indoc! {"
-        pub fn not_it<T: BitNot>(a: T) -> T {
+        pub func not_it<T: BitNot>(a: T) -> T {
             ^a
         }
 
-        pub fn use_not(a: i32) -> i32 {
+        pub func use_not(a: i32) -> i32 {
             not_it(a)
         }
     "});
@@ -14792,13 +16465,200 @@ fn test_generic_bitnot_bound_dispatches() {
 	);
 }
 
+// ── `PartialEq` overload (`==` / `!=`) ─────────────────────────────────────
+//
+// `==` dispatches through `PartialEq::eq`, `!=` through `PartialEq::ne`.
+// An impl that overrides only `eq` still gets `!=` for free: dispatch falls
+// back to the trait's own bodied default (`!self.eq(other)`), invoked as a
+// `GenericMethodCall` so monomorphization resolves `self.eq` on the concrete
+// type. Primitive `==`/`!=` stay native and never touch dispatch.
+
+#[test]
+fn test_struct_partial_eq_dispatches_both_operators() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        impl PartialEq for Point {
+            func eq(self, other: Self) -> bool {
+                self.x == other.x && self.y == other.y
+            }
+        }
+
+        pub func cmp(a: Point, b: Point) -> bool {
+            a == b && !(a != b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_partial_eq_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        pub func cmp(a: Point, b: Point) -> bool {
+            a == b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 (BinaryOperatorCannotBeApplied) for `Point == Point` \
+		 with no `PartialEq` impl, got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_partial_eq_bound_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub func equal<T: PartialEq>(a: T, b: T) -> bool {
+            a == b
+        }
+
+        pub func use_equal(a: bool, b: bool) -> bool {
+            equal(a, b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_primitive_equality_still_type_checks() {
+	// Primitives keep the native comparison path (a plain `Binary` node, not a
+	// `MethodCall`) even though `impl PartialEq for i32` now exists for
+	// generic-bound resolution.
+	let case = TestCase::new(indoc! {"
+        pub func cmp(a: i32, b: i32) -> bool {
+            a == b && a != b
+        }
+    "});
+	no_errors(&case);
+}
+
+// ── `PartialOrd` overload (`<` / `<=` / `>` / `>=`) ────────────────────────
+//
+// Same machinery as `PartialEq`, one method per operator. Primitives keep the
+// native path; structs dispatch through `impl PartialOrd`; generic `<T:
+// PartialOrd>` resolves per instantiation.
+
+#[test]
+fn test_struct_partial_ord_dispatches_all_operators() {
+	let case = TestCase::new(indoc! {"
+        struct Meters { v: i32 }
+
+        impl PartialEq for Meters {
+            func eq(self, other: Self) -> bool { self.v == other.v }
+            func ne(self, other: Self) -> bool { self.v != other.v }
+        }
+
+        impl PartialOrd for Meters {
+            func lt(self, other: Self) -> bool { self.v < other.v }
+            func le(self, other: Self) -> bool { self.v <= other.v }
+            func gt(self, other: Self) -> bool { self.v > other.v }
+            func ge(self, other: Self) -> bool { self.v >= other.v }
+        }
+
+        pub func cmp(a: Meters, b: Meters) -> bool {
+            a < b && a <= b && a > b && a >= b
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_struct_without_partial_ord_impl_reports_diagnostic() {
+	let case = TestCase::new(indoc! {"
+        struct Meters { v: i32 }
+
+        pub func cmp(a: Meters, b: Meters) -> bool {
+            a < b
+        }
+    "});
+	assert!(
+		has_error_code(
+			&case.tir,
+			DiagnosticCode::BinaryOperatorCannotBeApplied
+		),
+		"expected E1008 for `Meters < Meters` with no `PartialOrd` impl, \
+		 got: {:?}",
+		case.tir
+			.diagnostics
+			.iter()
+			.map(|d| &d.message)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn test_generic_partial_ord_bound_dispatches() {
+	let case = TestCase::new(indoc! {"
+        pub func min<T: PartialOrd>(a: T, b: T) -> bool {
+            a < b
+        }
+
+        pub func use_min(a: u32, b: u32) -> bool {
+            min(a, b)
+        }
+    "});
+	no_errors(&case);
+}
+
+#[test]
+fn test_primitive_ordering_operator_records_access_for_hover() {
+	// `<` on a primitive stays a native `Binary` node but records the operator
+	// span as an access against `PartialOrd::lt` for that type, so hover /
+	// go-to-definition on `<` works.
+	let src = "func f(a: u32, b: u32) -> bool { a < b } export { f }";
+	let case = TestCase::new(src);
+	assert!(
+		case.tir.diagnostics.is_empty(),
+		"{:?}",
+		case.tir.diagnostics
+	);
+	let op_start = src.find('<').unwrap() as u32;
+	let lt = case.graph.interner.get("lt").unwrap();
+	assert!(
+		case.tir.items.functions.iter().any(|f| {
+			f.name.inner == lt
+				&& f.accesses.iter().any(|a| a.span.start == op_start)
+		}),
+		"expected a `PartialOrd::lt` access at the `<` span",
+	);
+}
+
+#[test]
+fn test_ord_cmp_on_primitive_returns_ordering() {
+	// `Ord::cmp` is a plain trait method (no operator maps to it). Its
+	// primitive impls are branchless — `(a > b) - (a < b)` cast to
+	// `Ordering` — so this only checks the type story: `x.cmp(y)` resolves
+	// and yields `Ordering`, and the stdlib `Ordering` variants are not
+	// flagged unused (`impl Ordering`'s `is_*`/`reverse` reference them).
+	let case = TestCase::new(indoc! {"
+        pub func c(a: i32, b: i32) -> Ordering {
+            a.cmp(b)
+        }
+
+        pub func less(a: u32, b: u32) -> bool {
+            a.cmp(b).is_lt()
+        }
+    "});
+	no_errors(&case);
+}
+
 #[test]
 fn test_deref_of_error_type_does_not_repeat_diagnostic() {
 	// The `{unknown}` type means an error was already reported for this
 	// binding; dereferencing it must absorb that rather than piling an
 	// E1037 on top.
 	let case = TestCase::new(indoc! {"
-        fn bad() { local p = nonexistent(); p.* = 1; }
+        func bad() { local p = nonexistent(); p.* = 1; }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::UndeclaredIdentifier),
@@ -14816,9 +16676,9 @@ fn test_deref_of_error_type_still_checks_the_assigned_value() {
 	// diagnostic, but must not swallow the rest of the statement with it —
 	// the right-hand side still gets built, so its own errors surface.
 	for src in [
-		"fn bad() { local p = nonexistent(); p.* = also_missing(); }",
-		"fn bad() { local p = nonexistent(); p.* += also_missing(); }",
-		"fn bad() { local p = nonexistent(); p.*.field = also_missing(); }",
+		"func bad() { local p = nonexistent(); p.* = also_missing(); }",
+		"func bad() { local p = nonexistent(); p.* += also_missing(); }",
+		"func bad() { local p = nonexistent(); p.*.field = also_missing(); }",
 	] {
 		let case = TestCase::new(src);
 		let undeclared = case
@@ -14853,13 +16713,13 @@ fn test_unresolved_callee_still_checks_its_arguments() {
 	for (src, args) in [
 		// method not found
 		(
-			"struct S {} fn f(s: S) { s.nope(missing_a(), missing_b()); }",
+			"struct S {} func f(s: S) { s.nope(missing_a(), missing_b()); }",
 			2,
 		),
 		// resolves, but to a field rather than a method
-		("struct S { x: i32 } fn f(s: S) { s.x(missing_a()); }", 1),
+		("struct S { x: i32 } func f(s: S) { s.x(missing_a()); }", 1),
 		// associated function that doesn't exist
-		("struct S {} fn f() { S::nope(missing_a()); }", 1),
+		("struct S {} func f() { S::nope(missing_a()); }", 1),
 	] {
 		let case = TestCase::new(src);
 		let undeclared = case
@@ -14885,8 +16745,8 @@ fn test_unresolved_callee_does_not_demand_a_type_annotation() {
 	// the user to annotate their way out of it misdirects. Both the method
 	// and the plain-call path must stay quiet.
 	for src in [
-		"struct S {} fn f<T>(s: S) { local p = s.nope(Layout::of::<T>()); }",
-		"struct S {} fn f<T>() { local p = nope(Layout::of::<T>()); }",
+		"struct S {} func f<T>(s: S) { local p = s.nope(Layout::of::<T>()); }",
+		"struct S {} func f<T>() { local p = nope(Layout::of::<T>()); }",
 	] {
 		let case = TestCase::new(src);
 		assert!(
@@ -14904,8 +16764,8 @@ fn test_poisoned_context_still_reports_mismatch_between_sibling_arguments() {
 	// checks both arguments against `ERROR` and loses this silently.
 	let case = TestCase::new(indoc! {"
         struct S {}
-        fn same<T>(a: T, b: T) -> T { a }
-        fn f(s: S) { local p = s.missing(same(1 as i32, true)); }
+        func same<T>(a: T, b: T) -> T { a }
+        func f(s: S) { local p = s.missing(same(1 as i32, true)); }
     "});
 	assert!(
 		has_error_code(&case.tir, DiagnosticCode::MethodNotFound),
@@ -14928,7 +16788,7 @@ fn test_poisoned_deref_store_records_rhs_access_for_hover() {
 	// that asserts the RHS produces diagnostics, this asserts it leaves the
 	// index entry behind. Nothing else in the suite covers the latter.
 	let case = TestCase::new(
-		"fn bad(value: i32) { local p = nonexistent(); p.* = value; }",
+		"func bad(value: i32) { local p = nonexistent(); p.* = value; }",
 	);
 	let function = case
 		.tir
@@ -14971,7 +16831,7 @@ fn assert_no_errors(case: &TestCase) {
 #[test]
 fn test_tuple_destructuring_binds_each_element() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, b) = pair;
             a + b
         }
@@ -14983,7 +16843,7 @@ fn test_tuple_destructuring_binds_each_element() {
 #[test]
 fn test_tuple_destructuring_nested() {
 	let case = TestCase::new(indoc! {"
-        fn f(nested: (i32, (i32, i32))) -> i32 {
+        func f(nested: (i32, (i32, i32))) -> i32 {
             local (x, (y, z)) = nested;
             x + y + z
         }
@@ -14995,7 +16855,7 @@ fn test_tuple_destructuring_nested() {
 #[test]
 fn test_tuple_destructuring_arity_mismatch_errors() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, b, c) = pair;
             a + b + c
         }
@@ -15007,7 +16867,7 @@ fn test_tuple_destructuring_arity_mismatch_errors() {
 #[test]
 fn test_tuple_pattern_on_non_tuple_errors() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             local (a, b) = x;
             a + b
         }
@@ -15021,7 +16881,7 @@ fn test_tuple_pattern_on_non_tuple_errors() {
 #[test]
 fn test_failed_tuple_pattern_still_binds_names() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             local (a, b) = x;
             a + b
         }
@@ -15039,7 +16899,7 @@ fn test_tuple_destructuring_untyped_literal_requires_annotation() {
 	// Same rule as `local x = 1;` — an untyped literal never picks a type on
 	// its own, and a tuple of them must not sneak past it.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local (a, b) = (1, 2);
             a + b
         }
@@ -15054,7 +16914,7 @@ fn test_tuple_destructuring_untyped_literal_requires_annotation() {
 #[test]
 fn test_tuple_destructuring_with_annotation_coerces_literals() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local (a, b): (i32, i32) = (1, 2);
             a + b
         }
@@ -15066,7 +16926,7 @@ fn test_tuple_destructuring_with_annotation_coerces_literals() {
 #[test]
 fn test_destructured_binding_mutability_is_per_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (mut a, b) = pair;
             a = a + b;
             a
@@ -15079,7 +16939,7 @@ fn test_destructured_binding_mutability_is_per_binding() {
 #[test]
 fn test_destructured_immutable_binding_cannot_be_assigned() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, b) = pair;
             a = b;
             a
@@ -15098,7 +16958,7 @@ fn test_destructured_immutable_binding_cannot_be_assigned() {
 #[test]
 fn test_wildcard_in_tuple_pattern_is_not_an_unused_local() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, _) = pair;
             a
         }
@@ -15115,7 +16975,7 @@ fn test_wildcard_in_tuple_pattern_is_not_an_unused_local() {
 #[test]
 fn test_unused_destructured_binding_still_warns() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, b) = pair;
             a
         }
@@ -15131,8 +16991,8 @@ fn test_unused_destructured_binding_still_warns() {
 #[test]
 fn test_top_level_wildcard_local_is_accepted() {
 	let case = TestCase::new(indoc! {"
-        fn g() -> i32 { 1 }
-        fn f() -> i32 {
+        func g() -> i32 { 1 }
+        func f() -> i32 {
             local _ = g();
             2
         }
@@ -15145,7 +17005,7 @@ fn test_top_level_wildcard_local_is_accepted() {
 fn test_struct_destructuring_shorthand_and_renamed() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Point::{ x, y } = p;
             local Point::{ x: a, y: b } = p;
             x + y + a + b
@@ -15159,7 +17019,7 @@ fn test_struct_destructuring_shorthand_and_renamed() {
 fn test_struct_destructuring_missing_field_errors() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Point::{ x } = p;
             x
         }
@@ -15175,7 +17035,7 @@ fn test_struct_destructuring_missing_field_errors() {
 fn test_struct_destructuring_rest_allows_omitted_fields() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32, z: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Point::{ x, .. } = p;
             x
         }
@@ -15188,7 +17048,7 @@ fn test_struct_destructuring_rest_allows_omitted_fields() {
 fn test_struct_destructuring_unknown_field_errors() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Point::{ x, y, w } = p;
             x
         }
@@ -15204,7 +17064,7 @@ fn test_struct_destructuring_unknown_field_errors() {
 fn test_struct_destructuring_duplicate_field_errors() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Point::{ x, x: other, y } = p;
             x + other
         }
@@ -15221,7 +17081,7 @@ fn test_struct_pattern_naming_the_wrong_struct_errors() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
         struct Size { x: i32, y: i32 }
-        fn f(p: Point) -> i32 {
+        func f(p: Point) -> i32 {
             local Size::{ x, y } = p;
             x + y
         }
@@ -15234,7 +17094,7 @@ fn test_struct_pattern_naming_the_wrong_struct_errors() {
 fn test_struct_destructuring_nested_in_tuple() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn f(pair: (Point, i32)) -> i32 {
+        func f(pair: (Point, i32)) -> i32 {
             local (Point::{ x, y }, n) = pair;
             x + y + n
         }
@@ -15247,7 +17107,7 @@ fn test_struct_destructuring_nested_in_tuple() {
 fn test_struct_destructuring_generic_substitutes_field_types() {
 	let case = TestCase::new(indoc! {"
         struct Pair<T> { first: T, second: T }
-        fn f(p: Pair<i64>) -> i64 {
+        func f(p: Pair<i64>) -> i64 {
             local Pair::{ first, second } = p;
             first + second
         }
@@ -15262,7 +17122,7 @@ fn test_struct_destructuring_across_modules() {
 		"src/main.wx",
 		indoc! {"
             mod geom;
-            fn f(p: geom::Point) -> i32 {
+            func f(p: geom::Point) -> i32 {
                 local geom::Point::{ x, y } = p;
                 x + y
             }
@@ -15280,7 +17140,7 @@ fn test_inherent_impl_on_type_from_another_package_rejected() {
 	let case = TestCase::new_with_dependency(
 		indoc! {"
             impl dep::Point {
-                pub fn sum(self) -> i32 { self.x + self.y }
+                pub func sum(self) -> i32 { self.x + self.y }
             }
         "},
 		"pub struct Point { pub x: i32, pub y: i32 }",
@@ -15299,11 +17159,11 @@ fn test_trait_impl_on_type_from_another_package_allowed() {
 	let case = TestCase::new_with_dependency(
 		indoc! {"
             trait Sum {
-                fn sum(self) -> i32;
+                func sum(self) -> i32;
             }
 
             impl Sum for dep::Point {
-                fn sum(self) -> i32 { self.x + self.y }
+                func sum(self) -> i32 { self.x + self.y }
             }
         "},
 		"pub struct Point { pub x: i32, pub y: i32 }",
@@ -15321,7 +17181,7 @@ fn test_inherent_impl_from_another_module_of_the_same_package_allowed() {
             mod geom;
 
             impl geom::Point {
-                pub fn sum(self) -> i32 { self.x + self.y }
+                pub func sum(self) -> i32 { self.x + self.y }
             }
         "},
 		&[("src/geom.wx", "pub struct Point { pub x: i32, pub y: i32 }")],
@@ -15335,7 +17195,7 @@ fn test_inherent_impl_on_primitive_rejected_outside_stdlib() {
 	// its inherent impls are the stdlib's alone.
 	let case = TestCase::new(indoc! {"
         impl i32 {
-            pub fn double(self) -> i32 { self * 2 }
+            pub func double(self) -> i32 { self * 2 }
         }
     "});
 	assert!(
@@ -15355,15 +17215,15 @@ fn test_inherent_impl_on_slice_rejected_outside_stdlib() {
         memory heap: Memory where { Size = u32 };
 
         trait Counter {
-            fn count(self) -> u32;
+            func count(self) -> u32;
         }
 
         impl<M: Memory, T> M::&[T] {
-            pub fn count(self) -> u32 { 0 }
+            pub func count(self) -> u32 { 0 }
         }
 
         impl Counter for heap::&[i32] {
-            fn count(self) -> u32 { 0 }
+            func count(self) -> u32 { 0 }
         }
     "});
 	assert_eq!(
@@ -15377,4 +17237,355 @@ fn test_inherent_impl_on_slice_rejected_outside_stdlib() {
 		"only the inherent impl should be rejected: {:?}",
 		case.tir.diagnostics
 	);
+}
+
+#[test]
+fn test_member_candidates_three_bounds_and_repeated_later_bound() {
+	for bounds in ["A + B + C", "A + B + B + C", "C + B + A"] {
+		let case = TestCase::new(&format!(
+			"
+			trait A {{ func foo(self) -> i32; }}
+			trait B {{ func foo(self) -> i32; }}
+			trait C {{ func foo(self) -> i32; }}
+			func f<T: {bounds}>(x: T) -> i32 {{ x.foo() }}
+		"
+		));
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+		let diagnostic = diagnostics
+			.errors()
+			.find(|d| {
+				d.code.as_deref()
+					== Some(DiagnosticCode::AmbiguousTraitMember.code())
+			})
+			.expect("three distinct methods must be ambiguous");
+		assert_eq!(
+			diagnostic.labels.len(),
+			4,
+			"one use and three distinct declarations"
+		);
+	}
+}
+
+#[test]
+fn test_member_candidates_repeated_bound_is_unique() {
+	let case = TestCase::new(
+		"trait A { func foo(self) -> i32; } func f<T: A + A>(x: T) -> i32 { x.foo() }",
+	);
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_member_candidates_three_inherent_members_have_all_labels() {
+	let case = TestCase::new(
+		"
+		struct S { n: i32 }
+		impl S { func foo(self) -> i32 { 1 } }
+		impl S { func foo(self) -> i32 { 2 } }
+		impl S { func foo(self) -> i32 { 3 } }
+		func f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::DuplicateDefinition);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| d.labels.iter().any(|l| l.message == "multiple `foo` found"))
+		.expect("three inherent members must be ambiguous at the use");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
+
+#[test]
+fn test_member_candidates_assoc_type_deduplicates_later_bound() {
+	let case = TestCase::new(
+		"
+		trait A { type X; }
+		trait B { type X; }
+		func f<T: A + B + B>(x: T::X) {}
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("two distinct associated types must be ambiguous");
+	assert_eq!(
+		diagnostic.labels.len(),
+		3,
+		"one use and two distinct declarations"
+	);
+}
+
+#[test]
+fn test_member_candidates_three_trait_impls_are_ambiguous() {
+	let case = TestCase::new(
+		"
+		trait A { func foo(self) -> i32 { 1 } }
+		trait B { func foo(self) -> i32 { 2 } }
+		trait C { func foo(self) -> i32 { 3 } }
+		struct S { n: i32 }
+		impl A for S {}
+		impl B for S {}
+		impl C for S {}
+		func f(x: S) -> i32 { x.foo() }
+	",
+	);
+	let diagnostics = case.diagnostics();
+	diagnostics.assert_error(DiagnosticCode::AmbiguousTraitMember);
+	let diagnostic = diagnostics
+		.errors()
+		.find(|d| {
+			d.code.as_deref()
+				== Some(DiagnosticCode::AmbiguousTraitMember.code())
+		})
+		.expect("three applicable trait impls must be ambiguous");
+	assert_eq!(diagnostic.labels.len(), 4);
+}
+
+#[test]
+fn test_trait_member_search_transitive_methods_and_constants() {
+	let case = TestCase::new(indoc! {"
+		trait A { func value(self) -> i32; const N: i32; }
+		trait B: A {}
+		trait C: B {
+			func inherited(self) -> i32 { self.value() + Self::N }
+		}
+		func f<T: C>(x: T) -> i32 { x.value() + T::N }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_diamond_counts_declaration_once() {
+	let case = TestCase::new(indoc! {"
+		trait A { func value(self) -> i32; type Item; }
+		trait B: A {}
+		trait C: A {}
+		trait D: B + C {}
+		func f<T: D + A>(x: T) -> i32 { x.value() }
+		func item<T: D>(x: T::Item) -> T::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_distinct_parent_and_child_are_ambiguous() {
+	let case = TestCase::new(indoc! {"
+		trait A { func value(self) -> i32; }
+		trait B: A { func value(self) -> i32; }
+		func f<T: B>(x: T) -> i32 { x.value() }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::AmbiguousTraitMember);
+}
+
+#[test]
+fn test_trait_member_search_qualified_parent_satisfied_transitively() {
+	let case = TestCase::new(indoc! {"
+		trait A { func value(self) -> i32; type Item; }
+		trait B: A {}
+		trait C: B {}
+		func f<T: C>(x: T) -> i32 { <T as A>::value(x) }
+		func item<T: C>(x: <T as A>::Item) -> T::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_projection_uses_supertraits() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; }
+		trait B: A {}
+		trait C: B {}
+		trait Container { type Element: C; }
+		func f<T: Container>(x: T::Element::Item) -> <T::Element as A>::Item { x }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_resolves_later_sibling() {
+	let case = TestCase::new(indoc! {"
+		func f<T: A>(x: T::Item) -> T::Item { x }
+		trait A {
+			func first(self, x: Self::Item) -> Self::Item;
+			type Item;
+		}
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_qualified_impl_before_declaration() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; }
+		struct S { n: i32 }
+		func f(x: <S as A>::Item) -> i32 { x }
+		impl A for S { type Item = i32; }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_demand_duplicate_declarations_are_reported() {
+	let case = TestCase::new(indoc! {"
+		trait A { type Item; type Item; }
+		func f<T: A>(x: T::Item) -> T::Item { x }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::DuplicateDefinition);
+	case.diagnostics()
+		.assert_absent(DiagnosticCode::AmbiguousTraitMember);
+}
+
+#[test]
+fn test_trait_member_search_late_supertrait_across_modules() {
+	let case = TestCase::new_multi_file(
+		"main.wx",
+		indoc! {"
+		mod parent;
+		trait Child: parent::Parent {}
+		func f<T: Child>(x: T) -> i32 { x.value() }
+		func item<T: Child>(x: T::Item) -> <T as parent::Parent>::Item { x }
+	"},
+		&[(
+			"parent.wx",
+			"pub trait Parent { func value(self) -> i32; type Item; }",
+		)],
+	);
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_trait_member_search_qualified_child_does_not_search_parent() {
+	let case = TestCase::new(indoc! {"
+		trait A { func value(self) -> i32; }
+		trait B: A {}
+		func f<T: B>(x: T) -> i32 { <T as B>::value(x) }
+	"});
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UndeclaredIdentifier);
+}
+
+#[test]
+fn test_trait_member_search_concrete_call_through_generic() {
+	let case = TestCase::new(indoc! {"
+		trait Parent { func value(self) -> i32; }
+		trait Child: Parent {}
+		trait Grandchild: Child {}
+		struct S { n: i32 }
+		impl Parent for S { func value(self) -> i32 { self.n } }
+		impl Child for S {}
+		impl Grandchild for S {}
+		func read<T: Grandchild>(x: T) -> i32 { x.value() }
+		pub func run(n: i32) -> i32 { read(S::{ n: n }) }
+		export { run }
+	"});
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_effective_bounds_keep_repeated_trait_refinements() {
+	let case = TestCase::new("
+trait Marker { func mark(self) -> u32; }
+trait Inner { type Item; }
+trait Outer { type A: Inner; }
+func refined<T: Outer where { A: Inner where { Item: Marker } }>(value: T::A::Item) -> u32 { value.mark() }
+");
+	case.diagnostics().assert_no_errors();
+}
+
+#[test]
+fn test_written_refinement_equality_is_validated_with_repeated_trait() {
+	let case = TestCase::new(
+		"
+trait Marker {}
+trait Inner { type Item: Marker; }
+trait Outer { type A: Inner; }
+type Alias<T: Outer where { A: Inner where { Item = u32 } }> = ();
+",
+	);
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+}
+
+#[test]
+fn test_declaration_validation_checks_associated_type_written_bounds() {
+	for declarations in [
+		"trait Marker {} trait Inner { type Item: Marker; } trait Outer { type A: Inner where { Item = u32 }; }",
+		"trait Outer { type A: Inner where { Item = u32 }; } trait Inner { type Item: Marker; } trait Marker {}",
+	] {
+		let case = TestCase::new(declarations);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `u32: Marker` is not satisfied",
+		);
+		assert_eq!(
+			case.tir
+				.diagnostics
+				.iter()
+				.filter(|d| d.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code()))
+				.count(),
+			1
+		);
+	}
+}
+
+#[test]
+fn test_declaration_validation_checks_inherited_parameters_once() {
+	let case = TestCase::new(
+		"trait Marker {} trait Z { type A: Marker; }
+	struct Host<T> { value: T }
+	impl<T: Z where { A = u32 }> Host<T> {
+		func first(self) {} func second(self) {}
+	}",
+	);
+	case.diagnostics()
+		.assert_error_saying("the trait bound `u32: Marker` is not satisfied");
+	assert_eq!(
+		case.tir
+			.diagnostics
+			.iter()
+			.filter(|d| d.code.as_deref()
+				== Some(DiagnosticCode::TraitBoundViolation.code()))
+			.count(),
+		1
+	);
+}
+
+/// `type_param_info` addresses a parameter by its *absolute* index in the
+/// owner's visible chain, so index 0 on a method of a generic impl names the
+/// impl block's parameter, not the method's own. The `Function` arm used to
+/// compute `type_params[abs_index - inherited]` and underflow on exactly the
+/// indices its own doc comment promised to accept.
+#[test]
+fn test_type_param_info_resolves_an_inherited_parameter_by_absolute_index() {
+	let case = TestCase::new(indoc! {"
+        struct W<T> { v: T }
+        impl<T> W<T> {
+            func go<U>(self, u: U) -> U { u }
+        }
+    "});
+	let go = case
+		.tir
+		.items
+		.functions
+		.iter()
+		.find(|f| case.graph.interner.resolve(f.name.inner) == Some("go"))
+		.expect("function `go` not found in TIR");
+	assert_eq!(go.inherited_type_param_count, 1);
+	let owner = TypeParamOwner::Function(go.id);
+	let name_at = |index| {
+		case.graph
+			.interner
+			.resolve(case.tir.items.type_param_info(owner, index).name.inner)
+			.unwrap()
+			.to_string()
+	};
+	assert_eq!(name_at(0), "T", "index 0 is the impl block's parameter");
+	assert_eq!(name_at(1), "U", "index 1 is the method's own");
 }

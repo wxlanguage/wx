@@ -27,6 +27,7 @@ required-features = ["bench"]
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }
 leb128fmt = "0.1.0"
+hashbrown = { version = "0.17", default-features = false }
 string-interner = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

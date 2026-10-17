@@ -9,7 +9,7 @@ const C4_PIO2: f64 = 4. * f64::FRAC_PI_2; // 0x401921FB, 0x54442D18
 /// The cosine of `x` (f32).
 ///
 /// `x` is specified in radians.
-pub fn cosf(x: f32) -> f32 {
+pub func cosf(x: f32) -> f32 {
     local x64 = x.promote();
 
     local mut ix = x.to_bits();

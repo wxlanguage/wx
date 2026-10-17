@@ -1,7 +1,7 @@
 //! Aggregate expressions: struct initialisation, tuples, array literals and
 //! repeats, and the indexing and slice-range expressions that read out of them.
 
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, TextSpan};
 
 use super::*;
 
@@ -25,15 +25,17 @@ impl<'ast> Builder<'ast, '_> {
 		name: Spanned<SymbolU32>,
 		kind: FieldAccessKind,
 	) -> Option<ResolvedField> {
-		let declaration = &self.items.structs[usize::from(struct_index)];
-		let index = declaration.lookup.get(&name.inner).copied()?;
-		let raw_ty = declaration.fields[usize::from(index)].ty.inner;
+		let declaration = &mut self.items.structs[usize::from(struct_index)];
 		let declaring_namespace = declaration.namespace;
-
-		self.items.structs[usize::from(struct_index)].fields
-			[usize::from(index)]
-		.accesses
-		.push(FieldAccess {
+		// Tuple-struct fields have no names to look up — this is not an
+		// error here, callers disagree about what a miss means (see above).
+		let StructKind::Record { fields, lookup } = &mut declaration.fields
+		else {
+			return None;
+		};
+		let index = lookup.get(&name.inner).copied()?;
+		let raw_ty = fields[usize::from(index)].ty.inner;
+		fields[usize::from(index)].accesses.push(FieldAccess {
 			kind,
 			file_id: resolve_context.file_id,
 			span: name.span,
@@ -68,7 +70,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		init_span: ast::TextSpan,
+		init_span: TextSpan,
 		path: &[ast::PathSegment],
 		fields: &[ast::Separated<ast::Spanned<ast::StructInitField>>],
 	) -> Result<Expression, ()> {
@@ -153,14 +155,27 @@ impl<'ast> Builder<'ast, '_> {
 			.unwrap()
 			.to_string();
 		let field_count =
-			self.items.structs[usize::from(struct_index)].fields.len();
+			match &self.items.structs[usize::from(struct_index)].fields {
+				StructKind::Record { fields, .. } => fields.len(),
+				StructKind::Tuple { .. } => {
+					self.diagnostics.push(report_tuple_struct_brace_literal(
+						file_id,
+						&struct_name,
+						init_span,
+					));
+					return Err(());
+				}
+			};
 		// Tracks the field name span of the first mention of each field (regardless of
 		// whether the value built successfully). Used for duplicate detection and to
 		// distinguish genuinely-missing fields from errored ones.
-		let mut first_mention: Vec<Option<ast::TextSpan>> =
+		let mut first_mention: Vec<Option<TextSpan>> =
 			(0..field_count).map(|_| None).collect();
-		let mut field_slots: Vec<Option<Expression>> =
-			(0..field_count).map(|_| None).collect();
+		// Built in source-written order (not declaration order) so that
+		// evaluation order — and any side effects field initializers
+		// contain — matches what the user wrote; see `ExprKind::StructInit`.
+		let mut ordered_fields: Vec<(FieldIndex, Expression)> =
+			Vec::with_capacity(field_count);
 
 		for field in fields.iter() {
 			let field = &field.inner.inner;
@@ -258,7 +273,7 @@ impl<'ast> Builder<'ast, '_> {
 				continue;
 			}
 
-			field_slots[field_index] = Some(field_expr);
+			ordered_fields.push((resolved.index, field_expr));
 		}
 
 		let missing: Box<[&str]> = first_mention
@@ -268,9 +283,16 @@ impl<'ast> Builder<'ast, '_> {
 			.map(|(i, _)| {
 				self.interner
 					.resolve(
-						self.items.structs[usize::from(struct_index)].fields[i]
-							.name
-							.inner,
+						match &self.items.structs[usize::from(struct_index)]
+							.fields
+						{
+							StructKind::Record { fields, .. } => {
+								fields[i].name.inner
+							}
+							StructKind::Tuple { .. } => {
+								unreachable!("tuple structs rejected above")
+							}
+						},
 					)
 					.unwrap()
 			})
@@ -291,38 +313,230 @@ impl<'ast> Builder<'ast, '_> {
 			args: resolved_args,
 		});
 
-		// If any field was mentioned but failed to build (type error, coercion error,
-		// …), its slot is still None even though first_mention is Some. Return
-		// an error expression so we don't panic on unwrap, and the error has
-		// already been reported above.
-		let has_field_errors = field_slots.iter().any(|s| s.is_none());
-		if has_field_errors {
-			return Ok(Expression {
-				kind: ExprKind::StructInit {
-					struct_index,
-					fields: Box::new([]),
-				},
-				ty,
-				span: init_span,
-			});
-		}
-
-		let fields: Box<[Expression]> =
-			field_slots.into_iter().map(|e| e.unwrap()).collect();
+		// `ordered_fields` may be short of `field_count` here — a missing or
+		// failed-to-build field was already diagnosed above; there's nothing
+		// unsafe about handing back whatever fields did build.
 		Ok(Expression {
-			kind: ExprKind::StructInit {
+			kind: ExprKind::RecordStructInit {
 				struct_index,
-				fields,
+				fields: ordered_fields.into_boxed_slice(),
 			},
 			ty,
 			span: init_span,
 		})
 	}
 
+	/// Builds `Point(1, 2)` — positional tuple-struct construction. The
+	/// positional sibling of [`Self::build_struct_init_expression`]: same
+	/// expected-type seeding and per-field coercion/inference, just walking
+	/// fields by position instead of by name. Privacy is *not* checked
+	/// here — a struct with any private field has its Value-namespace
+	/// constructor binding itself marked private at registration time
+	/// (`signature.rs`), so an inaccessible call was already rejected by
+	/// `resolve_symbol_and_type_args` before this function is ever reached.
+	///
+	/// `type_args` arrives already `INFER`-padded to `struct_index`'s own
+	/// `type_params.len()` — the caller's job (`calls.rs`), not this
+	/// function's, since only the caller knows which symbol kind it
+	/// resolved and therefore what the correct arity is.
+	pub(super) fn build_tuple_struct_call_expression(
+		&mut self,
+		ctx: &mut ExprContext,
+		struct_index: StructIndex,
+		mut type_args: Box<[TypeIndex]>,
+		arguments: &[ast::Separated<ast::Spanned<ast::Expression>>],
+		expected_result: TypeIndex,
+		call_span: TextSpan,
+	) -> Result<Expression, ()> {
+		let resolve_context = ctx.resolve_context;
+		let StructKind::Tuple { fields } =
+			&self.items.structs[usize::from(struct_index)].fields
+		else {
+			unreachable!("caller already checked StructKind::Tuple")
+		};
+		let field_count = fields.len();
+
+		let struct_name = self
+			.interner
+			.resolve(self.items.structs[usize::from(struct_index)].name.inner)
+			.unwrap()
+			.to_string();
+		if arguments.len() != field_count {
+			self.diagnostics.push(report_tuple_struct_arity_mismatch(
+				&struct_name,
+				field_count,
+				arguments.len(),
+				SourceSpan::new(resolve_context.file_id, call_span),
+			));
+		}
+
+		// Cheap expected-type seed, identical in spirit to
+		// `build_struct_init_expression`'s: only bother when every slot is
+		// still open (a turbofish-free reference) and there's an expected
+		// type shaped like this exact struct to copy args from — no real
+		// unification, just reusing an already-concrete answer if one's
+		// sitting right there.
+		if type_args.is_empty() {
+			let type_params_len = self.items.structs[usize::from(struct_index)]
+				.type_params
+				.len();
+			if type_params_len > 0
+				&& let Type::Struct {
+					struct_index: esi,
+					args,
+				} = self.types.resolve(expected_result)
+				&& *esi == struct_index
+				&& args.len() == type_params_len
+			{
+				type_args = args.clone();
+			} else {
+				type_args =
+					vec![TypeIndex::INFER; type_params_len].into_boxed_slice();
+			}
+		}
+
+		self.items.structs[usize::from(struct_index)]
+			.accesses
+			.push(SourceSpan::new(resolve_context.file_id, call_span));
+
+		// Position *is* the field index for a tuple struct — no per-entry
+		// `FieldIndex` to carry, unlike `RecordStructInit`. May end up
+		// shorter than `field_count` if a field failed to build or an
+		// arity mismatch was diagnosed above; safe the same way
+		// `RecordStructInit`'s own `ordered_fields` is — a diagnosed TIR
+		// error halts compilation before MIR ever lowers this expression,
+		// so a short/misaligned array is never actually observed.
+		let mut built_arguments: Vec<Expression> =
+			Vec::with_capacity(field_count.min(arguments.len()));
+		for (position, argument) in arguments.iter().enumerate() {
+			let StructKind::Tuple { fields } =
+				&self.items.structs[usize::from(struct_index)].fields
+			else {
+				unreachable!("checked above")
+			};
+			// Extra arguments past arity: still build (and discard) so
+			// mistakes inside them are still reported, matching
+			// `build_call_expression`'s own broken-callee convention —
+			// but with nothing to check them against.
+			let Some(raw_field_ty) = fields.get(position).map(|f| f.ty.inner)
+			else {
+				let _ = self.build_expression(
+					ctx,
+					AccessContext {
+						expected_type: TypeIndex::ERROR,
+						access_kind: AccessKind::Read,
+					},
+					&argument.inner,
+				);
+				continue;
+			};
+			let expected_ty = if type_args.is_empty() {
+				raw_field_ty
+			} else {
+				self.substitute_type(raw_field_ty, &type_args)
+			};
+
+			let mut field_expr = match self.build_expression(
+				ctx,
+				AccessContext {
+					expected_type: expected_ty,
+					access_kind: AccessKind::Read,
+				},
+				&argument.inner,
+			) {
+				Ok(e) => e,
+				Err(_) => continue,
+			};
+
+			// Ignored — same convention as every other call site: a genuine
+			// mismatch still surfaces below via the ordinary coercion check
+			// against the (by-then possibly still-generic) expected type.
+			let _ = self.types.infer_type_args(
+				&mut type_args,
+				raw_field_ty,
+				field_expr.ty,
+			);
+
+			if field_expr.ty.is_comptime_number() {
+				match self.coerce_untyped_expr(
+					ctx,
+					&mut field_expr,
+					expected_ty,
+				) {
+					Ok(_) => {}
+					Err(_) => continue,
+				}
+			} else if !self.coercible_to(field_expr.ty, expected_ty) {
+				self.diagnostics.push(report_type_mistmatch(
+					self.formatter(resolve_context.namespace),
+					TypeMistmatchDiagnostic {
+						expected_type: expected_ty,
+						actual_type: field_expr.ty,
+						span: SourceSpan::new(
+							resolve_context.file_id,
+							field_expr.span,
+						),
+					},
+				));
+				continue;
+			}
+
+			let StructKind::Tuple { fields } =
+				&mut self.items.structs[usize::from(struct_index)].fields
+			else {
+				unreachable!("checked above")
+			};
+			fields[position].accesses.push(FieldAccess {
+				kind: FieldAccessKind::Init,
+				file_id: resolve_context.file_id,
+				span: field_expr.span,
+			});
+
+			built_arguments.push(field_expr);
+		}
+
+		for (i, slot) in type_args.iter_mut().enumerate() {
+			if *slot != TypeIndex::INFER {
+				continue;
+			}
+			let param_name = self.interner.resolve(
+				self.items.structs[usize::from(struct_index)].type_params[i]
+					.name
+					.inner,
+			);
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+					.with_message(format!(
+						"cannot infer type for type parameter `{}`",
+						param_name.unwrap()
+					))
+					.with_label(
+						Label::primary(resolve_context.file_id, call_span)
+							.with_message("type annotation required"),
+					),
+			);
+			*slot = TypeIndex::ERROR;
+		}
+
+		let ty = self.types.intern(Type::Struct {
+			struct_index,
+			args: type_args,
+		});
+		Ok(Expression {
+			kind: ExprKind::TupleStructInit {
+				struct_index,
+				arguments: built_arguments.into_boxed_slice(),
+			},
+			ty,
+			span: call_span,
+		})
+	}
+
 	pub(super) fn build_tuple_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		ast_elements: &[ast::Spanned<ast::Expression>],
 		access_ctx: AccessContext,
 	) -> Result<Expression, ()> {
@@ -404,7 +618,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		elements: &[ast::Spanned<ast::Expression>],
 	) -> Result<Expression, ()> {
 		let source_span =
@@ -535,7 +749,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		value_expr: &ast::Spanned<ast::Expression>,
 		count_expr: &ast::Spanned<ast::Expression>,
 	) -> Result<Expression, ()> {
@@ -655,7 +869,7 @@ impl<'ast> Builder<'ast, '_> {
 		&mut self,
 		func_ctx: &mut ExprContext,
 		access_ctx: AccessContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		object_expr: &ast::Spanned<ast::Expression>,
 		index_expr: &ast::Spanned<ast::Expression>,
 	) -> Result<Expression, ()> {
@@ -756,7 +970,7 @@ impl<'ast> Builder<'ast, '_> {
 	pub(super) fn build_slice_range_expression(
 		&mut self,
 		func_ctx: &mut ExprContext,
-		span: ast::TextSpan,
+		span: TextSpan,
 		object_expr: &ast::Spanned<ast::Expression>,
 		start_expr: &Option<Box<ast::Spanned<ast::Expression>>>,
 		end_expr: &Option<Box<ast::Spanned<ast::Expression>>>,
@@ -854,14 +1068,45 @@ impl<'ast> Builder<'ast, '_> {
 	}
 }
 
+fn report_tuple_struct_arity_mismatch(
+	struct_name: &str,
+	field_count: usize,
+	found: usize,
+	span: SourceSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TypeMistmatch.code())
+		.with_message("tuple struct call does not match its fields")
+		.with_label(span.primary_label().with_message(format!(
+			"expected {} argument{}, found {} for `{}`",
+			field_count,
+			if field_count == 1 { "" } else { "s" },
+			found,
+			struct_name,
+		)))
+}
+
 pub(super) fn report_not_a_struct_type(
 	file_id: FileId,
 	name: String,
-	span: ast::TextSpan,
+	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::TypeMistmatch.code())
 		.with_message(format!("expected struct, found `{}`", name))
+		.with_label(Label::primary(file_id, span))
+}
+
+pub(super) fn report_tuple_struct_brace_literal(
+	file_id: FileId,
+	struct_name: &str,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TupleStructBraceLiteral.code())
+		.with_message(format!(
+			"tuple struct `{struct_name}` must be constructed with `{struct_name}(...)`"
+		))
 		.with_label(Label::primary(file_id, span))
 }
 
@@ -933,14 +1178,14 @@ pub(super) struct UnknownStructFieldDiagnostic<'a> {
 	pub(super) file_id: FileId,
 	pub(super) struct_name: &'a str,
 	pub(super) field_name: &'a str,
-	pub(super) field_span: ast::TextSpan,
+	pub(super) field_span: TextSpan,
 }
 
 struct MissingStructFieldsDiagnostic<'a> {
 	file_id: FileId,
 	struct_name: &'a str,
 	missing_fields: Box<[&'a str]>,
-	init_span: ast::TextSpan,
+	init_span: TextSpan,
 }
 
 fn report_array_size_mismatch(

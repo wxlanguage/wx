@@ -1,10 +1,10 @@
 global mut x: f32 = 0.0;
 
-fn get() -> f32 {
+func get() -> f32 {
   x
 }
 
-fn set(value: f32) -> f32 {
+func set(value: f32) -> f32 {
   x = value;
 
   x

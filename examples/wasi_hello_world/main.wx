@@ -10,7 +10,7 @@ enum FileDescriptor: u8 {
 }
 
 import "wasi_snapshot_preview1" as wasi {
-  fn fd_write(
+  func fd_write(
     file_descriptor: FileDescriptor,
     io_vecs: &[&[u8]],
     bytes_written: *u32,
@@ -21,12 +21,12 @@ import "wasi_snapshot_preview1" as wasi {
 memory heap: Memory where { Size = u32 };
 global mut bump: *u8 = heap::DATA_END;
 
-struct BumpAllocator {}
+struct BumpAllocator();
 
 impl Allocator for BumpAllocator {
   type Mem = heap;
 
-  fn reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
+  func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
     local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align());
     local new_end = ptr + layout.size();
     local cur_end = heap.size_bytes();
@@ -39,7 +39,7 @@ impl Allocator for BumpAllocator {
   }
 }
 
-fn main() {
+func main() {
   local bump: *BumpAllocator = std::ptr::null_mut();
   local io_vecs = bump.alloc_slice::<&[u8]>(1);
   io_vecs[0] = "Hello, world!\n";
