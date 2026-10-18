@@ -1498,8 +1498,7 @@ impl Namespaces {
 				target: binding.target,
 				visibility: binding.visibility,
 				import: match binding.source {
-					BindingSource::Definition
-					| BindingSource::PoisonedCrate { .. } => None,
+					BindingSource::Definition => None,
 					BindingSource::Import(import) => Some(import),
 				},
 			},
@@ -1539,12 +1538,6 @@ impl BindingTarget {
 enum BindingSource {
 	Definition,
 	Import(UseItemIndex),
-	/// The alias of a `crate` item whose key the manifest does not declare:
-	/// a binding with nothing behind it, kept only so the name does not
-	/// read as undeclared on top of the error already reported at the item.
-	PoisonedCrate {
-		alias: SourceSpan,
-	},
 }
 
 #[derive(Clone)]
@@ -1564,11 +1557,16 @@ impl Binding {
 		}
 	}
 
-	fn poisoned_crate(visibility: Visibility, alias: SourceSpan) -> Self {
+	/// A name declared by a definition that could not be resolved, such as
+	/// a `crate` item whose key the manifest does not declare. It carries
+	/// no `DefKey`, so a path through it ends silently on top of the error
+	/// already reported at the declaration, instead of adding "undeclared"
+	/// errors at every use.
+	fn poisoned(visibility: Visibility) -> Self {
 		Self {
 			target: BindingTarget::Error,
 			visibility,
-			source: BindingSource::PoisonedCrate { alias },
+			source: BindingSource::Definition,
 		}
 	}
 
@@ -1596,15 +1594,18 @@ impl Binding {
 				let def_key = match self.target {
 					BindingTarget::Accessible(key)
 					| BindingTarget::Inaccessible(key) => key,
+					// Only a binding that rejected an insertion is asked
+					// for its declaration, and an `Error` one never does.
 					BindingTarget::Error => {
 						unreachable!(
-							"a definition binding cannot target recovery state"
+							"a poisoned binding never collides, so nothing \
+							 asks where it was declared"
 						)
 					}
 				};
 				def_key.source_span(namespaces)
 			}
-			BindingSource::PoisonedCrate { alias } => alias,
+
 			BindingSource::Import(index) => {
 				let item = &use_items[usize::from(index)];
 				let span = match item.kind {
@@ -2407,10 +2408,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			);
 			Binding::definition(def_key, visibility)
 		} else {
-			Binding::poisoned_crate(
-				visibility,
-				SourceSpan::new(file_id, alias.span),
-			)
+			Binding::poisoned(visibility)
 		};
 		self.insert_binding(
 			Namespace::from(namespace),
