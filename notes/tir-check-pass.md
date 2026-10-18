@@ -464,6 +464,14 @@ builtin traits.
   right after lowering, once every fact is final. `find_trait_impl`'s `Pending`
   arm records into the same list.
 
+- A trait's function type is nominal: `<Point as Make>::make` is the
+  declaration over `Self` (`make<Point>`) and is never normalized into the
+  impl's member. Normalization handles associated-type projections only, and
+  the impl's body is chosen where a call is resolved (`method_call` in bodies,
+  monomorphization later). The cost: a use sees the trait's declared signature,
+  so an impl whose signature disagrees is accepted until trait-impl conformance
+  checks signature agreement.
+
 ## Migration
 
 Steps 1-4 are done (see "Implementation status"); each was meant to keep the

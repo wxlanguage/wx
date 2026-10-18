@@ -19,8 +19,7 @@ use super::bounds::{
 	SelfSubstitution, known_distinct,
 };
 use super::defs::{
-	AssocTypeIdx, BindingKey, DefinitionRegistry, FunctionOwner, MemberKind,
-	TraitIdx, TraitImplIdx,
+	AssocTypeIdx, DefinitionRegistry, MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -597,6 +596,32 @@ pub(super) struct Normalization {
 	facts: RewriteFacts,
 }
 
+impl Normalization {
+	/// `ty` under `env`'s assumptions. Only an abstract type reads them
+	/// (`TypeInterner::is_abstract`), and every abstract type has a
+	/// parameter in it, so a type with none means the same in every scope:
+	/// its request is the root's, computed and cached once for all of them.
+	fn new(
+		types: &TypeInterner,
+		env: TypeEnvIdx,
+		ty: TypeIndex,
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Self {
+		let env = if types.has_param(ty) {
+			env
+		} else {
+			TypeEnvIdx::ROOT
+		};
+		Self {
+			env,
+			ty,
+			depth,
+			facts,
+		}
+	}
+}
+
 /// How far into a type a normalization reduces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NormalizationDepth {
@@ -659,14 +684,6 @@ impl<'a> SolverView<'a> {
 			self.traits,
 			self.assoc_types,
 			self.clauses,
-		)
-	}
-
-	/// Only a parameter or a projection of one can carry assumed equalities.
-	fn is_abstract(&self, ty: TypeIndex) -> bool {
-		matches!(
-			self.types.resolve(ty),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 		)
 	}
 
@@ -822,12 +839,18 @@ impl Solver {
 		depth: NormalizationDepth,
 		facts: RewriteFacts,
 	) -> Result<TypeIndex, SolverError> {
-		let normalization = Normalization {
-			env: assumption_context,
+		// Nothing to reduce: no frame is opened or read, and no budget spent,
+		// since a type without a projection cannot loop.
+		if !view.types.has_projection(ty) {
+			return Ok(ty);
+		}
+		let normalization = Normalization::new(
+			view.types,
+			assumption_context,
 			ty,
 			depth,
 			facts,
-		};
+		);
 		let frame = self.state.frames.len();
 		if frame == 0
 			&& let Some(&normalized) = self.normalized.get(&normalization)
@@ -837,7 +860,7 @@ impl Solver {
 		let outer_read =
 			std::mem::replace(&mut self.state.lowest_frame_read, usize::MAX);
 		let result =
-			self.normalize_uncached(view, assumption_context, ty, depth, facts);
+			self.normalize_uncached(view, normalization.env, ty, depth, facts);
 		let lowest_read = self.state.lowest_frame_read;
 		self.state.lowest_frame_read = outer_read.min(lowest_read);
 		// A request that started with nothing in flight leaves nothing behind.
@@ -879,20 +902,6 @@ impl Solver {
 				depth,
 				facts,
 			),
-			Type::Function { func_index, .. }
-				if matches!(
-					view.defs.functions[usize::from(func_index)].owner,
-					FunctionOwner::Trait(_)
-				) =>
-			{
-				self.reduce_trait_function(
-					view,
-					assumption_context,
-					ty,
-					depth,
-					facts,
-				)
-			}
 			_ => match depth {
 				NormalizationDepth::Shallow => Ok(ty),
 				NormalizationDepth::Deep => self.normalize_children(
@@ -916,12 +925,13 @@ impl Solver {
 		depth: NormalizationDepth,
 		facts: RewriteFacts,
 	) -> Result<TypeIndex, SolverError> {
-		let normalization = Normalization {
-			env: assumption_context,
-			ty: projection,
+		let normalization = Normalization::new(
+			view.types,
+			assumption_context,
+			projection,
 			depth,
 			facts,
-		};
+		);
 		if self.projection_cycle(normalization)? {
 			return Ok(projection);
 		}
@@ -966,7 +976,7 @@ impl Solver {
 		};
 		// Receiver-specific nested facts must be read before reducing the
 		// receiver to a value that no longer carries their provenance.
-		if view.is_abstract(base) {
+		if view.types.is_param_or_projection(base) {
 			match self.projection_equality(
 				view,
 				base,
@@ -991,20 +1001,24 @@ impl Solver {
 		if next_base == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
 		}
-		let projection = if next_base == base {
-			projection
+		// A base reduced to a type with no parameter (`T::A` to `i32`) leaves a
+		// request that is the root's from here on.
+		let (projection, assumption_context) = if next_base == base {
+			(projection, assumption_context)
 		} else {
 			let next = view.types.intern(Type::AssocTypeProjection {
 				base: next_base,
 				trait_index,
 				assoc_type_index,
 			});
-			if self.projection_cycle(Normalization {
-				env: assumption_context,
-				ty: next,
+			let normalization = Normalization::new(
+				view.types,
+				assumption_context,
+				next,
 				depth,
 				facts,
-			})? {
+			);
+			if self.projection_cycle(normalization)? {
 				return Ok(projection);
 			}
 			let Some(SolverFrame::Projection(current)) =
@@ -1012,10 +1026,10 @@ impl Solver {
 			else {
 				unreachable!("the reducing projection is the innermost frame")
 			};
-			current.ty = next;
-			next
+			*current = normalization;
+			(next, normalization.env)
 		};
-		if view.is_abstract(next_base) {
+		if view.types.is_param_or_projection(next_base) {
 			return match self.projection_equality(
 				view,
 				next_base,
@@ -1035,10 +1049,7 @@ impl Solver {
 				}
 			};
 		}
-		if matches!(
-			view.types.resolve(next_base),
-			Type::Infer | Type::AssociatedType { .. }
-		) {
+		if matches!(view.types.resolve(next_base), Type::Infer) {
 			return Ok(projection);
 		}
 		if facts == RewriteFacts::Equalities {
@@ -1083,92 +1094,6 @@ impl Solver {
 			)
 		};
 		self.normalize(view, assumption_context, instantiated, depth, facts)
-	}
-
-	/// A trait declaration's type, `<Self as Trait>::f`, is the selected impl's
-	/// member once `Self` has a concrete impl, and stays the declaration while
-	/// `Self` is abstract or the impl inherits the trait's default. It reads no
-	/// value, so unlike a projection it opens no frame: a loop can only pass
-	/// through `Self`, whose own normalization owns it.
-	fn reduce_trait_function(
-		&mut self,
-		view: &mut SolverView<'_>,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-		depth: NormalizationDepth,
-		facts: RewriteFacts,
-	) -> Result<TypeIndex, SolverError> {
-		let Type::Function {
-			func_index: declaration,
-			type_args,
-		} = *view.types.resolve(ty)
-		else {
-			unreachable!()
-		};
-		let FunctionOwner::Trait(trait_index) =
-			view.defs.functions[usize::from(declaration)].owner
-		else {
-			unreachable!()
-		};
-		let mut type_args = view.types.list(type_args).to_vec();
-		// `Self` decides the head, so it is normalized at any depth; the
-		// declaration's own arguments only when the whole type is.
-		for (index, arg) in type_args.iter_mut().enumerate() {
-			if index == 0 || depth == NormalizationDepth::Deep {
-				*arg = self.normalize(
-					view,
-					assumption_context,
-					*arg,
-					depth,
-					facts,
-				)?;
-			}
-		}
-		let self_type = type_args[0];
-		if self_type == TypeIndex::ERROR {
-			return Err(SolverError::Poisoned);
-		}
-		let unchanged = view.types.intern_function(declaration, &type_args);
-		if facts == RewriteFacts::Equalities
-			|| view.is_abstract(self_type)
-			|| matches!(
-				view.types.resolve(self_type),
-				Type::Infer | Type::AssociatedType { .. }
-			) {
-			return Ok(unchanged);
-		}
-		// `None` is silent, as for a projection: the membership check the
-		// written path recorded owns the report.
-		let Some(found) = self.find_trait_impl_query(
-			view,
-			assumption_context,
-			self_type,
-			trait_index,
-		)?
-		else {
-			return Err(SolverError::Poisoned);
-		};
-		let TraitImplLookup::Concrete { impl_index, args } = found else {
-			return Ok(unchanged);
-		};
-		let name = view.defs.functions[usize::from(declaration)].name.inner;
-		let kind = view
-			.defs
-			.declared_trait_member(trait_index, BindingKey::value(name))
-			.expect("a trait declares its own function");
-		match view.defs.select_trait_member(impl_index, kind) {
-			TraitMemberSelection::Impl(
-				MemberKind::Function(member) | MemberKind::Method(member),
-			) => {
-				// The member's chain is the impl's followed by its own, so
-				// the impl's arguments take the declaration's `Self` slot.
-				let mut member_args = args.into_vec();
-				member_args.extend_from_slice(&type_args[1..]);
-				Ok(view.types.intern_function(member, &member_args))
-			}
-			TraitMemberSelection::Impl(_) => Err(SolverError::Poisoned),
-			TraitMemberSelection::TraitDeclaration(_) => Ok(unchanged),
-		}
 	}
 
 	/// An equality in scope gives `projection` the value `value`. One that
@@ -1395,7 +1320,6 @@ impl Solver {
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
-			| Type::AssociatedType { .. }
 			| Type::TypeParam { .. } => return Ok(ty),
 		};
 		Ok(view.types.intern(rebuilt))
@@ -1419,14 +1343,13 @@ impl Solver {
 				.is_some_and(|layout| layout.len() == 1)
 				.then_some(TraitImplLookup::Builtin));
 		}
-		// Only an abstract type takes a trait from assumptions. A type an impl
-		// can target has the trait exactly when its impl says so: there is one
-		// impl per trait and constructor, so a local assumption cannot make it
-		// hold, only make the declaration that assumes it impossible to use.
-		let receiver_is_abstract =
-			ImplTarget::from_type(view.types.resolve(receiver)).is_none();
+		// Only an abstract type takes a trait from assumptions. Any other type
+		// has the trait exactly when its impl says so: there is one impl per
+		// trait and constructor, so a local assumption cannot make it hold, only
+		// make the declaration that assumes it impossible to use. A type no impl
+		// can target (a tuple, a pointer) is no exception: it has no impl.
 		let mut assumed = Assumption::Unproven;
-		if receiver_is_abstract {
+		if view.types.is_param_or_projection(receiver) {
 			assumed = self.check_assumed_trait(
 				view,
 				assumption_context,
@@ -1463,7 +1386,9 @@ impl Solver {
 				)?
 				.map(|args| TraitImplLookup::Concrete { impl_index, args }));
 		}
-		if normalized != receiver {
+		if normalized != receiver
+			&& view.types.is_param_or_projection(normalized)
+		{
 			assumed = assumed.max(self.check_assumed_trait(
 				view,
 				assumption_context,
@@ -1623,9 +1548,7 @@ impl Solver {
 				}
 				known
 			}
-			Type::TypeParam { .. }
-			| Type::AssociatedType { .. }
-			| Type::AssocTypeProjection { .. } => {
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
 				let value_type = view
 					.defs
 					.intrinsics
@@ -1678,10 +1601,26 @@ impl Solver {
 		self.push_layout(view, assumption_context, size, out, depth + 1)
 	}
 
-	/// Whether the facts in scope prove `ty: required`. Comparison reduces
-	/// assumed equalities only, so it cannot depend on impl dispatch. It reads
-	/// finished declaration bounds and never demands one: an unfinished table
-	/// is `Assumption::Pending`, never an error.
+	/// Whether the facts in scope prove `ty: required`, from three sources:
+	///
+	/// 1. a declaration on `ty`'s own path states it (`type Item: Marker`);
+	/// 2. a clause in scope states it of `ty` as written;
+	/// 3. a clause states it of another subject that means what `ty` means,
+	///    by assumed equalities: `T::Item: Marker` with `T::Item = U` proves
+	///    `U: Marker`.
+	///
+	/// The first holds wherever `ty` is used; the other two are the scope's
+	/// own, and only an abstract `ty` with an abstract meaning takes them. A
+	/// concrete one has its traits from impls alone, so a clause whose subject
+	/// means `i32`, or `<P as Container>::Item`, proves nothing about it, and
+	/// the answer for it never depends on `assumption_context`.
+	///
+	/// Declaration bounds are not lent through an equality: `Item = U` with
+	/// `type Item: Marker` does not make `U: Marker`, which must be written.
+	///
+	/// Comparison reduces assumed equalities only, so it cannot depend on impl
+	/// dispatch. It reads finished declaration bounds and never demands one:
+	/// an unfinished table is `Assumption::Pending`, never an error.
 	pub(super) fn check_assumed_trait(
 		&mut self,
 		view: &mut SolverView<'_>,
@@ -1689,57 +1628,57 @@ impl Solver {
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
-		// `ty` holds `required` when a declaration on its own path states it,
-		// or when the scope's clauses name it or a subject it normalizes to
-		// and carry `required`. A projection an equality names lends its
-		// declaration bounds to nothing else: `Item = U` with `type Item:
-		// Marker` does not make `U: Marker`, which must be written.
 		let tables = view.clause_tables();
+		// 1. Declared on `ty`'s own path.
 		let mut declared =
 			tables.declared_traits(view.types, ty, self.state.recursion_budget);
 		if declared.any(|trait_index| trait_index == required) {
 			return Ok(Assumption::Holds);
 		}
-		let mut readiness = tables
-			.assumptions_readiness(assumption_context)
-			.and(declared.readiness);
-		if tables.assumed_traits(assumption_context).any(
-			|(subject, trait_index)| subject == ty && trait_index == required,
-		) {
-			return Ok(Assumption::Holds);
-		}
-		let mut subjects = tables
-			.assumed_traits(assumption_context)
-			.filter(|&(_, trait_index)| trait_index == required)
-			.map(|(subject, _)| subject)
-			.peekable();
-		if subjects.peek().is_some() {
-			let normalized = match self.normalize_assumed_type_query(
-				view,
-				assumption_context,
-				ty,
-			) {
-				Ok(normalized) => normalized,
-				Err(SolverError::Pending) => return Ok(Assumption::Pending),
-				Err(error) => return Err(error),
-			};
-			for subject in subjects {
-				match self.normalize_assumed_type_query(
+		let mut readiness = declared.readiness;
+		if view.types.is_abstract(ty) {
+			readiness =
+				readiness.and(tables.assumptions_readiness(assumption_context));
+			// 2. Stated of `ty` itself.
+			if tables
+				.assumed_subjects(assumption_context, required)
+				.any(|subject| subject == ty)
+			{
+				return Ok(Assumption::Holds);
+			}
+			// 3. Stated of another subject with the same, abstract, meaning.
+			let mut subjects = tables
+				.assumed_subjects(assumption_context, required)
+				.peekable();
+			if subjects.peek().is_some() {
+				let meaning = match self.normalize_assumed_type_query(
 					view,
 					assumption_context,
-					subject,
+					ty,
 				) {
-					Ok(candidate)
-						if candidate == normalized
-							&& candidate != TypeIndex::ERROR =>
-					{
-						return Ok(Assumption::Holds);
-					}
-					Ok(_) => {}
+					Ok(meaning) => meaning,
 					Err(SolverError::Pending) => {
-						readiness = readiness.and(Readiness::Pending)
+						return Ok(Assumption::Pending);
 					}
 					Err(error) => return Err(error),
+				};
+				if view.types.is_abstract(meaning) {
+					for subject in subjects {
+						match self.normalize_assumed_type_query(
+							view,
+							assumption_context,
+							subject,
+						) {
+							Ok(candidate) if candidate == meaning => {
+								return Ok(Assumption::Holds);
+							}
+							Ok(_) => {}
+							Err(SolverError::Pending) => {
+								readiness = readiness.and(Readiness::Pending)
+							}
+							Err(error) => return Err(error),
+						}
+					}
 				}
 			}
 		}

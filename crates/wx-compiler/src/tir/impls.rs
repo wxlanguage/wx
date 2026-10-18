@@ -84,7 +84,6 @@ impl ImplTarget {
 			| Type::FunctionRef { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
-			| Type::AssociatedType { .. }
 			| Type::AssocTypeProjection { .. } => return None,
 		})
 	}

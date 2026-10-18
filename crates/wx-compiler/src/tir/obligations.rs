@@ -189,7 +189,7 @@ fn solver_error_diagnostic(
 					formatter.display_type(cycle.projection)
 				))
 				.with_label(site.primary_label());
-			for &step in cycle.steps.iter() {
+			for step in cycle.steps.iter().copied() {
 				diagnostic = diagnostic.with_label(
 					site.secondary_label().with_message(format!(
 						"requires normalizing `{}`",

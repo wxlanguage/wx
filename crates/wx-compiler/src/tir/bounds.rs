@@ -615,6 +615,17 @@ impl<'a> ClauseTables<'a> {
 		})
 	}
 
+	/// The subjects assumed in `assumption_context` to implement `trait_index`.
+	pub(super) fn assumed_subjects(
+		&self,
+		assumption_context: TypeEnvIdx,
+		trait_index: TraitIdx,
+	) -> impl Iterator<Item = TypeIndex> + 'a {
+		self.assumed_traits(assumption_context)
+			.filter(move |&(_, assumed)| assumed == trait_index)
+			.map(|(subject, _)| subject)
+	}
+
 	/// Whether every parameter in scope has its equalities: a membership read
 	/// before that can still be one an equality's value has to confirm.
 	pub(super) fn assumptions_readiness(
@@ -906,7 +917,6 @@ pub(super) fn known_distinct(
 			| Type::Integer
 			| Type::Float
 			| Type::TypeParam { .. }
-			| Type::AssociatedType { .. }
 			| Type::AssocTypeProjection { .. },
 			_,
 		)
@@ -917,7 +927,6 @@ pub(super) fn known_distinct(
 			| Type::Integer
 			| Type::Float
 			| Type::TypeParam { .. }
-			| Type::AssociatedType { .. }
 			| Type::AssocTypeProjection { .. },
 		) => false,
 		// A nominal type is its declaration: two declarations never meet,

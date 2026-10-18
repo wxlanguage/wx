@@ -42,6 +42,72 @@ use super::defs::{
 
 index_newtype!(TypeIndex);
 
+impl TypeIndex {
+	/// Use wherever `INFER` acts as an absent-type sentinel and a concrete
+	/// fallback is needed.
+	#[inline]
+	pub fn infer_or(self, other: TypeIndex) -> TypeIndex {
+		if self == TypeIndex::INFER {
+			other
+		} else {
+			self
+		}
+	}
+
+	pub fn is_untyped(self) -> bool {
+		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
+	}
+
+	#[inline]
+	pub fn is_comptime_number(self) -> bool {
+		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
+	}
+
+	#[inline]
+	pub fn is_integer(self) -> bool {
+		self == TypeIndex::U8
+			|| self == TypeIndex::I8
+			|| self == TypeIndex::U16
+			|| self == TypeIndex::I16
+			|| self == TypeIndex::U32
+			|| self == TypeIndex::I32
+			|| self == TypeIndex::U64
+			|| self == TypeIndex::I64
+	}
+
+	#[inline]
+	pub fn is_float(self) -> bool {
+		self == TypeIndex::F32 || self == TypeIndex::F64
+	}
+
+	#[inline]
+	pub fn is_numeric(self) -> bool {
+		self.is_integer() || self.is_float()
+	}
+
+	// Pre-allocated indices for primitive types. The `TypeInterner` reserves
+	// these slots at startup so comparisons like `ty == TypeIndex::U32` work
+	// without a pool lookup.
+	pub const INFER: TypeIndex = TypeIndex(0);
+	pub const ERROR: TypeIndex = TypeIndex(1);
+	pub const UNIT: TypeIndex = TypeIndex(2);
+	pub const NEVER: TypeIndex = TypeIndex(3);
+	pub const INTEGER: TypeIndex = TypeIndex(4);
+	pub const FLOAT: TypeIndex = TypeIndex(5);
+	pub const U8: TypeIndex = TypeIndex(6);
+	pub const I8: TypeIndex = TypeIndex(7);
+	pub const U16: TypeIndex = TypeIndex(8);
+	pub const I16: TypeIndex = TypeIndex(9);
+	pub const U32: TypeIndex = TypeIndex(10);
+	pub const I32: TypeIndex = TypeIndex(11);
+	pub const U64: TypeIndex = TypeIndex(12);
+	pub const I64: TypeIndex = TypeIndex(13);
+	pub const F32: TypeIndex = TypeIndex(14);
+	pub const F64: TypeIndex = TypeIndex(15);
+	pub const BOOL: TypeIndex = TypeIndex(16);
+	pub const CHAR: TypeIndex = TypeIndex(17);
+}
+
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
 /// interned on its own; the type holding it is, by the list's contents, so
 /// equal types still share one `TypeIndex`. Built only by the interner.
@@ -73,7 +139,7 @@ impl TypeList {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-// `TypeParam`/`AssociatedType`/`AssocTypeProjection` echo the enum's own
+// `TypeParam`/`AssocTypeProjection` echo the enum's own
 // name because "type" is the domain term (a type parameter, an associated
 // type), not accidental repetition — renaming to `Param`/`Associated` would
 // read worse at every call site (`Type::Param` loses the "type" a reader
@@ -122,6 +188,13 @@ pub enum Type {
 	/// A function's own zero-sized type, written with its name (`foo<i32>`).
 	/// Always applied: one argument per type parameter of the function, so a
 	/// generic function has no type until it is instantiated.
+	///
+	/// Nominal, like a struct: it equals only itself. A trait's function is
+	/// its declaration applied to `Self` first (`<Point as Make>::make` is
+	/// `make<Point>`), and stays that at every use, concrete `Self` included;
+	/// which impl's body runs is decided where it is called, never by
+	/// rewriting the type. The impl's own member appears only as the type of
+	/// its definition.
 	Function {
 		func_index: FunctionIdx,
 		type_args: TypeList,
@@ -169,11 +242,6 @@ pub enum Type {
 		env: TypeEnvIdx,
 		param_index: u32,
 	},
-	/// `M::Size` — opaque until monomorphization substitutes `M`.
-	AssociatedType {
-		trait_index: TraitIdx,
-		assoc_type_index: AssocTypeIdx,
-	},
 	/// `<Base as Trait>::Item`, pending normalization. The base can be
 	/// concrete or abstract. `assoc_type_index` always names the trait's
 	/// declaration, never an impl's value provider; substitution preserves
@@ -199,6 +267,10 @@ impl TypeFlags {
 	/// An `Integer` or `Float` is in it: an untyped literal's type, which
 	/// context has not given it yet.
 	pub(super) const HAS_UNTYPED: Self = Self(1 << 2);
+	/// A `TypeParam` is in it: substitution can change the type.
+	pub(super) const HAS_PARAM: Self = Self(1 << 3);
+	/// An `AssocTypeProjection` is in it: normalization can change the type.
+	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
 
 	fn union(self, other: Self) -> Self {
 		Self(self.0 | other.0)
@@ -644,8 +716,9 @@ impl TypeInterner {
 				[usize::from(param)]
 			.union(self.flags[usize::from(result)]),
 			Type::AssocTypeProjection { base, .. } => {
-				self.flags[usize::from(base)]
+				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
 			}
+			Type::TypeParam { .. } => TypeFlags::HAS_PARAM,
 			Type::Never
 			| Type::U8
 			| Type::I8
@@ -661,9 +734,7 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. }
-			| Type::TypeParam { .. }
-			| Type::AssociatedType { .. } => TypeFlags::default(),
+			| Type::Global { .. } => TypeFlags::default(),
 		}
 	}
 
@@ -692,6 +763,42 @@ impl TypeInterner {
 	/// `Float` anywhere in it).
 	pub(super) fn has_untyped(&self, ty: TypeIndex) -> bool {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_UNTYPED)
+	}
+
+	/// Whether `ty`'s head is a parameter or a projection: the types with
+	/// declarations of their own (a parameter's bounds, the bounds its trait
+	/// declares on an associated type), which hold wherever `ty` is used.
+	pub(super) fn is_param_or_projection(&self, ty: TypeIndex) -> bool {
+		matches!(
+			self.resolve(ty),
+			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+		)
+	}
+
+	/// Whether `ty` is a parameter or a projection out of one (`T::Item`,
+	/// `T::Item::Size`): the only types that take traits and equalities from
+	/// assumptions. Any other type has a trait exactly when an impl or a
+	/// builtin says so: a tuple or a pointer, and a projection out of a
+	/// concrete type too (`<P as Container>::Item` is whatever `P`'s impl
+	/// says, unreduced or not).
+	pub(super) fn is_abstract(&self, ty: TypeIndex) -> bool {
+		match *self.resolve(ty) {
+			Type::TypeParam { .. } => true,
+			Type::AssocTypeProjection { base, .. } => self.is_abstract(base),
+			_ => false,
+		}
+	}
+
+	/// Whether something in `ty` is a parameter: without one, no substitution
+	/// changes it.
+	pub(super) fn has_param(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_PARAM)
+	}
+
+	/// Whether something in `ty` is a projection: without one, it is already
+	/// normal, in every assumption context.
+	pub(super) fn has_projection(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_PROJECTION)
 	}
 
 	/// The type both `a` and `b` describe, where `Infer` is a part not known
@@ -1026,6 +1133,9 @@ impl TypeInterner {
 		ty: TypeIndex,
 		substitution: Substitution<'_>,
 	) -> TypeIndex {
+		if !self.has_param(ty) {
+			return ty;
+		}
 		match *self.resolve(ty) {
 			Type::TypeParam { env, param_index } => match substitution
 				.envs
@@ -1156,8 +1266,7 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. }
-			| Type::AssociatedType { .. } => ty,
+			| Type::Global { .. } => ty,
 		}
 	}
 
@@ -1556,68 +1665,6 @@ impl TypeEnvArena {
 	}
 }
 
-impl TypeIndex {
-	/// Use wherever `INFER` acts as an absent-type sentinel and a concrete
-	/// fallback is needed.
-	#[inline]
-	pub fn infer_or(self, other: TypeIndex) -> TypeIndex {
-		if self == TypeIndex::INFER {
-			other
-		} else {
-			self
-		}
-	}
-
-	#[inline]
-	pub fn is_comptime_number(self) -> bool {
-		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
-	}
-
-	#[inline]
-	pub fn is_integer(self) -> bool {
-		self == TypeIndex::U8
-			|| self == TypeIndex::I8
-			|| self == TypeIndex::U16
-			|| self == TypeIndex::I16
-			|| self == TypeIndex::U32
-			|| self == TypeIndex::I32
-			|| self == TypeIndex::U64
-			|| self == TypeIndex::I64
-	}
-
-	#[inline]
-	pub fn is_float(self) -> bool {
-		self == TypeIndex::F32 || self == TypeIndex::F64
-	}
-
-	#[inline]
-	pub fn is_numeric(self) -> bool {
-		self.is_integer() || self.is_float()
-	}
-
-	// Pre-allocated indices for primitive types. The `TypeInterner` reserves
-	// these slots at startup so comparisons like `ty == TypeIndex::U32` work
-	// without a pool lookup.
-	pub const INFER: TypeIndex = TypeIndex(0);
-	pub const ERROR: TypeIndex = TypeIndex(1);
-	pub const UNIT: TypeIndex = TypeIndex(2);
-	pub const NEVER: TypeIndex = TypeIndex(3);
-	pub const INTEGER: TypeIndex = TypeIndex(4);
-	pub const FLOAT: TypeIndex = TypeIndex(5);
-	pub const U8: TypeIndex = TypeIndex(6);
-	pub const I8: TypeIndex = TypeIndex(7);
-	pub const U16: TypeIndex = TypeIndex(8);
-	pub const I16: TypeIndex = TypeIndex(9);
-	pub const U32: TypeIndex = TypeIndex(10);
-	pub const I32: TypeIndex = TypeIndex(11);
-	pub const U64: TypeIndex = TypeIndex(12);
-	pub const I64: TypeIndex = TypeIndex(13);
-	pub const F32: TypeIndex = TypeIndex(14);
-	pub const F64: TypeIndex = TypeIndex(15);
-	pub const BOOL: TypeIndex = TypeIndex(16);
-	pub const CHAR: TypeIndex = TypeIndex(17);
-}
-
 impl IntrinsicDefs {
 	/// `idx`'s real identity as a primitive type, if it has one. `None` for
 	/// the common case — an ordinary, non-primitive alias — and `Some` only
@@ -1694,6 +1741,40 @@ mod tests {
 		assert!(types.has_error(broken));
 		assert!(!types.has_infer(broken));
 		assert!(!types.has_error(nested));
+	}
+
+	/// A parameter is what substitution replaces and a projection is what
+	/// normalization reduces; a function type is nominal and has neither of
+	/// its own, only what its arguments have.
+	#[test]
+	fn a_type_has_a_param_or_projection_when_one_is_anywhere_in_it() {
+		let mut types = TypeInterner::new();
+		let t = parameter(&mut types, TypeEnvIdx::new(1), 0);
+		let wrapped = types.intern_struct(StructIdx::new(0), &[t]);
+		let projection = |types: &mut TypeInterner, base| {
+			types.intern(Type::AssocTypeProjection {
+				trait_index: TraitIdx::new(0),
+				assoc_type_index: AssocTypeIdx::new(0),
+				base,
+			})
+		};
+		let abstract_item = projection(&mut types, t);
+		let concrete_item = projection(&mut types, TypeIndex::I32);
+		let holds_item = types.intern_tuple(&[TypeIndex::U8, concrete_item]);
+		let function = types.intern_function(FunctionIdx::new(0), &[t]);
+		assert!(types.has_param(t));
+		assert!(types.has_param(wrapped));
+		assert!(!types.has_projection(wrapped));
+		assert!(types.has_param(abstract_item));
+		assert!(types.has_projection(abstract_item));
+		assert!(!types.has_param(concrete_item));
+		assert!(types.has_projection(holds_item));
+		assert!(types.has_param(function));
+		assert!(!types.has_projection(function));
+		let point = types.intern_struct(StructIdx::new(1), &[]);
+		let make_point = types.intern_function(FunctionIdx::new(0), &[point]);
+		assert!(!types.has_param(make_point));
+		assert!(!types.has_projection(make_point));
 	}
 
 	/// Two unrelated root frames: `TypeEnvIdx(1)` with two parameters and
@@ -2033,10 +2114,6 @@ mod tests {
 			},
 			Type::Global {
 				global_index: GlobalIdx::new(0),
-			},
-			Type::AssociatedType {
-				trait_index: TraitIdx::new(0),
-				assoc_type_index: AssocTypeIdx::new(0),
 			},
 			Type::Struct {
 				struct_index: StructIdx::new(0),

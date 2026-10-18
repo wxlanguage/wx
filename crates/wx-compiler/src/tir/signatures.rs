@@ -3339,8 +3339,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							},
 						)
 					}
-					// The declaration's own type, which normalization takes to
-					// the impl's member once `base_ty` has an impl.
+					// The declaration's own type over `base_ty`, whatever
+					// impl `base_ty` has.
 					MemberKind::Function(function)
 					| MemberKind::Method(function) => {
 						let own_args = self.member_function_type_args(
@@ -8838,6 +8838,36 @@ pub(super) mod tests {
 	}
 
 	#[test]
+	fn a_type_with_no_parameter_is_normalized_once_for_every_scope() {
+		// `P::Item` means `Q` whatever `f` and `g` assume, so both scopes'
+		// requests are one, under the root.
+		test_case!(
+			mut case = indoc! {"
+                pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                trait Container { type Item; }
+                struct Q();
+                struct P();
+                impl Container for P { type Item = Q; }
+                func f<T: Container>(x: P::Item) {}
+                func g<U: Container where { Item = Q }>(x: P::Item) {}
+            "}
+		);
+		case.diagnostics().assert_none();
+		let q = case.normalized_param("f", 0);
+		assert_eq!(case.normalized_param("g", 0), q);
+		let projection = case.function_signature("f").param_types[0];
+		assert_eq!(case.function_signature("g").param_types[0], projection);
+		let entries = case
+			.context
+			.solver
+			.normalized
+			.keys()
+			.filter(|normalization| normalization.ty == projection)
+			.count();
+		assert_eq!(entries, 1);
+	}
+
+	#[test]
 	fn an_answer_given_while_unwinding_a_loop_is_not_cached() {
 		// `T::A`'s value restates `T::A`, so normalizing `x` rolls back to its
 		// frame. `W::B` is reached while unwinding and answers unreduced: that
@@ -12457,7 +12487,13 @@ pub(super) mod tests {
 				TextSpan::new(0, 1),
 			);
 			builder.solver.set_limit_for_test(4);
-			let mut nested = TypeIndex::I32;
+			// A projection at the bottom: a type without one is already normal
+			// and spends no budget.
+			let mut nested = builder.types.intern(Type::AssocTypeProjection {
+				base: TypeIndex::I32,
+				trait_index: TraitIdx::new(0),
+				assoc_type_index: AssocTypeIdx::new(0),
+			});
 			for _ in 0..5 {
 				nested = builder.types.intern_tuple(&[nested]);
 			}
@@ -15205,6 +15241,67 @@ pub(super) mod tests {
 	mod equality_satisfaction {
 		use super::*;
 
+		/// A tuple has no impl, so no trait: an assumption about a subject that
+		/// means `(i32, i32)` does not make it one, exactly as for a struct.
+		#[test]
+		fn a_type_no_impl_can_target_takes_no_trait_from_assumptions() {
+			for source in [
+				"func f<T: Container where { Item = (i32, i32) } + Container where { Item: Marker }>(x: Need<(i32, i32)>) {}",
+				"struct P(); func f<T: Container where { Item = P } + Container where { Item: Marker }>(x: Need<P>) {}",
+			] {
+				let source = format!(
+					"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type i32; trait Marker {{}} trait Container {{ type Item; }} struct Need<X: Marker>(); {source}"
+				);
+				test_case!(case = &source);
+				case.diagnostics()
+					.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+			}
+		}
+
+		/// `V::Item` means `i32`, as `T::Item` does, but `T::Item: Marker` lends
+		/// it nothing: what both mean is concrete, and has traits from impls.
+		#[test]
+		fn an_equal_subject_that_means_a_concrete_type_lends_no_trait() {
+			test_case!(
+				case = indoc! {"
+                pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type i32;
+                trait Marker {}
+                trait Container { type Item; }
+                struct Need<X: Marker>();
+                func f<
+                    T: Container where { Item = i32 } + Container where { Item: Marker },
+                    V: Container where { Item = i32 },
+                >(x: Need<V::Item>) {}
+            "}
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		}
+
+		#[test]
+		fn a_projection_out_of_a_concrete_type_takes_no_trait_from_assumptions()
+		{
+			// `<P as Container>::Item` is `Q`, whatever the scope assumes of a
+			// subject equal to it; `Q` is not `Marker`.
+			test_case!(
+				case = indoc! {"
+                pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                trait Marker {}
+                trait Container { type Item; }
+                struct Q();
+                struct P();
+                impl Container for P { type Item = Q; }
+                struct Need<X: Marker>();
+                func f<
+                    T: Container where { Item = P::Item } + Container where { Item: Marker },
+                >(x: Need<P::Item>) {}
+            "}
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		}
+
 		#[test]
 		fn a_projection_reduced_to_a_bounded_parameter_satisfies_requirements()
 		{
@@ -15506,9 +15603,12 @@ pub(super) mod tests {
 		#[test]
 		fn equality_comparison_uses_the_existing_budget_and_recovers_after_overflow()
 		 {
-			let nested = format!("{}U{}", "Wrap<".repeat(16), ">".repeat(16));
+			// A projection at the bottom: a type without one is already normal
+			// and spends no budget.
+			let nested =
+				format!("{}U::Item{}", "Wrap<".repeat(16), ">".repeat(16));
 			let source = format!(
-				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
 			);
 			with_pending_signatures(&source, |builder| {
 				builder.sweep();
@@ -16225,12 +16325,12 @@ pub(super) mod tests {
 		assert_eq!(case.normalized_param("f", 1), TypeIndex::I32);
 	}
 
-	/// Written off a concrete type, a trait's function is the declaration's
-	/// type over that `Self`, which normalizes to the impl's member, so both
-	/// spellings name one type. An inherited default stays the declaration;
-	/// an abstract `Self` keeps it abstract.
+	/// A trait's function is its declaration over `Self`, concrete or not:
+	/// `Point::make` and `<Point as Make>::make` are both `make<Point>`, and
+	/// normalization never swaps in the impl's member. What it takes and
+	/// returns is the declaration's signature with `Self` substituted.
 	#[test]
-	fn a_trait_functions_declaration_normalizes_to_the_impls_member() {
+	fn a_trait_function_stays_its_declaration_over_self() {
 		test_case!(
 			mut case = indoc! {"
 			type i32;
@@ -16242,14 +16342,17 @@ pub(super) mod tests {
 			struct Point();
 			impl Make for Point { func make(x: i32) -> Point {} }
 			func direct(x: Point::make, y: Point::fresh::Result) {}
-			func qualified(x: <Point as Make>::make, y: <Point as Make>::fresh) {}
+			func qualified(
+				x: <Point as Make>::make,
+				y: <Point as Make>::fresh,
+				z: <Point as Make>::make::Args,
+			) {}
 			func generic<T: Make>(x: T::make, y: T::make::Result) {}
 		"}
 		);
 		case.diagnostics().assert_none();
-		let make = case.graph.strings.get("make").unwrap();
-		let fresh = case.graph.strings.get("fresh").unwrap();
-		let position = |name, owner: fn(FunctionOwner) -> bool| {
+		let declaration = |name| {
+			let name = case.graph.strings.get(name).unwrap();
 			FunctionIdx::new(
 				u32::try_from(
 					case.defs
@@ -16257,41 +16360,42 @@ pub(super) mod tests {
 						.iter()
 						.position(|definition| {
 							definition.name.inner == name
-								&& owner(definition.owner)
+								&& matches!(
+									definition.owner,
+									FunctionOwner::Trait(_)
+								)
 						})
 						.unwrap(),
 				)
 				.unwrap(),
 			)
 		};
-		let member = position(make, |owner| {
-			matches!(owner, FunctionOwner::TraitImpl(_))
-		});
-		let declaration =
-			position(make, |owner| matches!(owner, FunctionOwner::Trait(_)));
-		let default =
-			position(fresh, |owner| matches!(owner, FunctionOwner::Trait(_)));
+		let (make, fresh) = (declaration("make"), declaration("fresh"));
 		let point = case
 			.context
 			.types
 			.intern_struct(case.struct_index("Point"), &[]);
-		let member = case.context.types.intern_function(member, &[]);
-		let inherited = case.context.types.intern_function(default, &[point]);
-		assert_eq!(case.normalized_param("direct", 0), member);
+		let make_point = case.context.types.intern_function(make, &[point]);
+		let fresh_point = case.context.types.intern_function(fresh, &[point]);
+		assert_eq!(case.normalized_param("direct", 0), make_point);
 		assert_eq!(case.normalized_param("direct", 1), point);
-		assert_eq!(case.normalized_param("qualified", 0), member);
-		assert_eq!(case.normalized_param("qualified", 1), inherited);
+		assert_eq!(case.normalized_param("qualified", 0), make_point);
+		assert_eq!(case.normalized_param("qualified", 1), fresh_point);
+		assert_eq!(case.normalized_param("qualified", 2), TypeIndex::I32);
+		assert_eq!(
+			case.context.type_formatter().display_type(make_point),
+			"<Point as Make>::make"
+		);
 		let env = case.function_signature("generic").type_params;
 		let t = case.context.type_envs.param_types(env)[0];
-		let abstract_make =
-			case.context.types.intern_function(declaration, &[t]);
-		assert_eq!(case.normalized_param("generic", 0), abstract_make);
+		let make_t = case.context.types.intern_function(make, &[t]);
+		assert_eq!(case.normalized_param("generic", 0), make_t);
 		assert_eq!(case.normalized_param("generic", 1), t);
 	}
 
 	/// An associated function's own arguments follow its receiver's:
-	/// `Foo<i32>::new<u8>` is `new<i32, u8>`. A trait member's follow `Self`,
-	/// and normalization hands them to the impl's member after the impl's.
+	/// `Foo<i32>::new<u8>` is `new<i32, u8>`. A trait member's follow `Self`:
+	/// `Wrap<i32>::make<u8>` is `make<Wrap<i32>, u8>`.
 	#[test]
 	fn member_functions_take_their_own_type_arguments_after_the_receivers() {
 		test_case!(

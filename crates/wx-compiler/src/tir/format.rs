@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use crate::ast::{Ownership, StringInterner};
 
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
-use super::defs::DefinitionRegistry;
+use super::defs::{DefinitionRegistry, FunctionOwner};
 use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
@@ -243,11 +243,27 @@ impl TypeFormatter<'_> {
 				func_index: function_index,
 				type_args,
 			} => {
-				let symbol = self.defs.functions[usize::from(*function_index)]
-					.name
-					.inner;
-				f.push_str(self.strings.resolve(symbol).unwrap());
-				self.write_type_args(f, self.types.list(*type_args));
+				let function =
+					&self.defs.functions[usize::from(*function_index)];
+				let mut type_args = self.types.list(*type_args);
+				// A trait's declaration takes `Self` first; it is written as
+				// the receiver, `<Self as Trait>::f<own>`, always qualified
+				// for the same reason a projection is.
+				if let FunctionOwner::Trait(trait_index) = function.owner {
+					let (&receiver, own) = type_args
+						.split_first()
+						.expect("a trait's function takes `Self` first");
+					f.push('<');
+					self.write_type(f, receiver);
+					f.push_str(" as ");
+					let symbol =
+						self.defs.traits[usize::from(trait_index)].name.inner;
+					f.push_str(self.strings.resolve(symbol).unwrap());
+					f.push_str(">::");
+					type_args = own;
+				}
+				f.push_str(self.strings.resolve(function.name.inner).unwrap());
+				self.write_type_args(f, type_args);
 			}
 			Type::TypeParam {
 				env, param_index, ..
@@ -256,20 +272,6 @@ impl TypeFormatter<'_> {
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
-			}
-			Type::AssociatedType {
-				trait_index,
-				assoc_type_index,
-			} => {
-				let symbol =
-					self.defs.traits[usize::from(*trait_index)].name.inner;
-				f.push_str(self.strings.resolve(symbol).unwrap());
-				f.push_str("::");
-				let assoc_symbol = self.defs.assoc_types
-					[usize::from(*assoc_type_index)]
-				.name
-				.inner;
-				f.push_str(self.strings.resolve(assoc_symbol).unwrap());
 			}
 			// Always qualified (`<Base as Trait>::name`), never the shorter
 			// `base::name` a formatter with ambiguity detection could use
@@ -587,10 +589,6 @@ mod tests {
 			panic!("expected Iterable to be a trait");
 		};
 		let assoc_type_index = case.assoc_type_index(trait_index, "Item");
-		let associated = case.types.intern(Type::AssociatedType {
-			trait_index,
-			assoc_type_index,
-		});
 		let projection = case.types.intern(Type::AssocTypeProjection {
 			trait_index,
 			assoc_type_index,
@@ -601,7 +599,6 @@ mod tests {
 			.intern_function(case.function("iterate"), &[param]);
 		let formatter = case.type_formatter();
 		assert_eq!(formatter.display_type(function), "iterate<T>");
-		assert_eq!(formatter.display_type(associated), "Iterable::Item");
 		assert_eq!(formatter.display_type(projection), "<T as Iterable>::Item");
 	}
 

@@ -149,10 +149,9 @@ impl DefinitionRegistry {
 		key: BindingKey,
 	) -> Option<MemberKind> {
 		let definition = &self.traits[usize::from(trait_index)];
-		definition
-			.bindings
-			.get(&key)
-			.map(|&index| definition.members[usize::from(index)].kind)
+		definition.bindings.get(&key).copied().map(|member_index| {
+			definition.members[usize::from(member_index)].kind
+		})
 	}
 
 	fn member_key(&self, declaration: MemberKind) -> BindingKey {
@@ -240,13 +239,16 @@ impl TypeContext<'_, '_, '_> {
 		}
 		let mut traits = Vec::new();
 		let mut readiness = Readiness::Ready;
-		if let Some(target) =
-			ImplTarget::from_type(self.types.resolve(receiver))
-		{
-			// A type an impl can target takes its traits from impls only,
-			// never from assumptions (`Solver::find_trait_impl_query`).
-			for &(trait_index, _) in self.impl_dispatch.trait_candidates(target)
-			{
+		if !self.types.is_abstract(receiver) {
+			// A concrete type takes its traits from impls only, never from
+			// assumptions (`Solver::find_trait_impl_query`); one no impl can
+			// target has none.
+			let candidates =
+				ImplTarget::from_type(self.types.resolve(receiver))
+					.map_or(&[][..], |target| {
+						self.impl_dispatch.trait_candidates(target)
+					});
+			for &(trait_index, _) in candidates {
 				if self.defs.declared_trait_member(trait_index, key).is_some() {
 					traits.push(trait_index);
 				}
@@ -469,8 +471,8 @@ impl TypeContext<'_, '_, '_> {
 								},
 							)
 						}
-						// `<current as Trait>::f`, which normalization takes to
-						// the impl's member once `current` has an impl.
+						// `<current as Trait>::f`: the declaration over
+						// `current`, whatever impl `current` has.
 						MemberKind::Function(function)
 						| MemberKind::Method(function) => {
 							let own_args = self.member_function_type_args(
