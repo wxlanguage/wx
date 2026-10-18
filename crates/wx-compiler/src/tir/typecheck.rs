@@ -16,7 +16,7 @@
 //! (`TypeInterner::meet`/`learn`); what none of them gives needs an
 //! annotation.
 
-use codespan_reporting::diagnostic::Diagnostic;
+use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::body::{
 	ArgOrder, Body, BodyBuilder, ExprIdx, ExprKind, ExprRange, ParamIdx,
@@ -37,6 +37,7 @@ use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::tir::operators::OperatorMethod;
 use crate::vfs::FileId;
 
 /// Checks the expressions of one definition into a `Body`.
@@ -94,10 +95,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					.push(ExprKind::NextDiscriminant(previous), repr, span)
 			}
 			(None, None) => {
-				let label = self
-					.source_span(span)
-					.primary_label()
-					.with_message("add `= <value>` here");
 				self.cx.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
@@ -105,7 +102,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 								.code(),
 						)
 						.with_message("enum variant requires an explicit value")
-						.with_label(label)
+						.with_label(
+							Label::primary(self.scope.file_id, span)
+								.with_message("add `= <value>` here"),
+						)
 						.with_note(
 							"or add a value to an earlier variant to anchor \
 							 auto-increment",
@@ -258,7 +258,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 							DiagnosticCode::InvalidCharacterLiteral.code(),
 						)
 						.with_message(message)
-						.with_label(self.source_span(span).primary_label()),
+						.with_label(Label::primary(self.scope.file_id, span)),
 				);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
@@ -297,7 +297,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				&self.cx.defs.namespaces,
 				self.cx.strings,
 				segment.ident.inner,
-				self.source_span(segment.ident.span),
+				SourceSpan::new(self.scope.file_id, segment.ident.span),
 				Some(key),
 			));
 		}
@@ -319,7 +319,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						.with_message(format!(
 							"expected a value, found struct `{name}`"
 						))
-						.with_label(self.source_span(span).primary_label())
+						.with_label(Label::primary(self.scope.file_id, span))
 						.with_note(format!(
 							"a struct's name is only a value when it is called: \
 							 `{name}(...)`"
@@ -367,7 +367,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					&self.cx.defs.namespaces,
 					self.cx.strings,
 					segment.ident.inner,
-					self.source_span(segment.ident.span),
+					SourceSpan::new(self.scope.file_id, segment.ident.span),
 					Some(key),
 				));
 			}
@@ -528,7 +528,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					inner: argument,
 					span,
 				},
-				self.source_span(span),
+				SourceSpan::new(self.scope.file_id, span),
 				TypeEnvOwner::Struct(struct_index),
 			);
 		}
@@ -564,8 +564,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"cannot infer type for type parameter `{name}`"
 					))
 					.with_label(
-						self.source_span(segment.ident.span)
-							.primary_label()
+						Label::primary(self.scope.file_id, segment.ident.span)
 							.with_message("type annotation required"),
 					),
 			);
@@ -630,7 +629,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if arguments.len() != count {
 			let plural = |n: usize| if n == 1 { "" } else { "s" };
 			let label =
-				self.source_span(span).primary_label().with_message(format!(
+				Label::primary(self.scope.file_id, span).with_message(format!(
 					"expected {count} field{}, found {}",
 					plural(count),
 					arguments.len()
@@ -683,7 +682,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"struct `{struct_name}` has unnamed fields, so it is \
 						 constructed with `{struct_name}(...)`"
 					))
-					.with_label(self.source_span(span).primary_label()),
+					.with_label(Label::primary(self.scope.file_id, span)),
 			);
 			return Vec::new();
 		}
@@ -726,7 +725,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 							 `{struct_name}`"
 						))
 						.with_label(
-							self.source_span(name.span).primary_label(),
+							SourceSpan::new(self.scope.file_id, name.span)
+								.primary_label(),
 						),
 				);
 				continue;
@@ -742,10 +742,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						.with_message(format!(
 							"field `{field_name}` specified more than once"
 						))
-						.with_label(self.source_span(name.span).primary_label())
+						.with_label(Label::primary(
+							self.scope.file_id,
+							name.span,
+						))
 						.with_label(
-							self.source_span(first)
-								.secondary_label()
+							Label::secondary(self.scope.file_id, first)
 								.with_message("first use of this field"),
 						),
 				);
@@ -784,7 +786,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						if missing.len() == 1 { "" } else { "s" },
 						missing.join(", ")
 					))
-					.with_label(self.source_span(span).primary_label()),
+					.with_label(Label::primary(self.scope.file_id, span)),
 			);
 		}
 		given
@@ -817,7 +819,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				None => format!("field {at}"),
 			})
 			.collect();
-		let site = self.source_span(segment.ident.span);
+		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		if private.is_empty() {
 			return report_private_identifier(
 				&self.cx.defs.namespaces,
@@ -870,7 +872,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
-		if is_untyped(ty) {
+		if ty.is_untyped() {
 			return self.body.push(
 				ExprKind::Unary {
 					op: op.inner,
@@ -955,7 +957,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 							.with_message(
 								"type annotation required to compare untyped literals",
 							)
-							.with_label(self.source_span(span).primary_label()),
+							.with_label(Label::primary(self.scope.file_id, span)),
 					);
 					return self.body.push(
 						ExprKind::Error,
@@ -965,7 +967,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				}
 				// Two literals are a float if either is; anything else untyped
 				// (a tuple of literals) keeps the left side's shape.
-				let ty = if !is_untyped(left_ty) || !is_untyped(right_ty) {
+				let ty = if !left_ty.is_untyped() || !right_ty.is_untyped() {
 					left_ty
 				} else if left_ty == TypeIndex::FLOAT
 					|| right_ty == TypeIndex::FLOAT
@@ -1086,12 +1088,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn operator_impl(
 		&mut self,
 		ty: TypeIndex,
-		method: Option<super::operators::OperatorMethod>,
+		method: Option<OperatorMethod>,
 		operand: ExprIdx,
 		op_span: TextSpan,
 		op_text: &str,
 		code: DiagnosticCode,
-	) -> Option<(super::operators::OperatorMethod, TraitImplLookup)> {
+	) -> Option<(OperatorMethod, TraitImplLookup)> {
 		if ty == TypeIndex::ERROR {
 			return None;
 		}
@@ -1104,9 +1106,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				) {
 					Ok(found) => found.map(|lookup| (method, lookup)),
 					Err(error) => {
-						let site = self.source_span(op_span);
-						let _ =
-							self.cx.report_solver_error::<()>(Err(error), site);
+						let _ = self.cx.report_solver_error::<()>(
+							Err(error),
+							SourceSpan::new(self.scope.file_id, op_span),
+						);
 						return None;
 					}
 				}
@@ -1114,19 +1117,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			None => None,
 		};
 		if found.is_none() {
-			let message = format!(
-				"operator `{op_text}` cannot be applied to type `{}`",
-				self.cx.type_formatter().display_type(ty)
-			);
 			self.cx.diagnostics.push(
 				Diagnostic::error()
 					.with_code(code.code())
-					.with_message(message)
-					.with_label(
-						self.source_span(self.body.span(operand))
-							.primary_label(),
-					)
-					.with_label(self.source_span(op_span).secondary_label()),
+					.with_message(format!(
+						"operator `{op_text}` cannot be applied to type `{}`",
+						self.cx.type_formatter().display_type(ty)
+					))
+					.with_label(self.source_span(operand).primary_label())
+					.with_label(Label::secondary(self.scope.file_id, op_span)),
 			);
 		}
 		found
@@ -1175,42 +1174,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// The scalars a literal given type `target` must fit: `target` itself, or
-	/// every member of every typeset bounding an abstract `target`, since any
-	/// of them can be substituted for it. Each comes with the typeset member it
-	/// stands for, if any. `None` when no literal can have type `target`.
-	fn literal_targets(
-		&mut self,
-		target: TypeIndex,
-	) -> Option<Vec<LiteralTarget>> {
-		if let Some(scalar) = Scalar::from_type(target) {
-			return Some(vec![LiteralTarget {
-				scalar: Some(scalar),
-				member: None,
-			}]);
-		}
+	/// Every member of every typeset an abstract `target` assumes, any of
+	/// which can be substituted for it. Empty when no literal can have type
+	/// `target`.
+	fn typeset_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
+		// An abstract target is constrained by its own bounds alone, so read
+		// the typesets those name rather than probing every typeset.
 		let mut targets = Vec::new();
-		for index in 0..self.cx.defs.typesets.len() {
-			let typeset = TypesetIdx::new(index as u32);
-			let trait_index = self.cx.defs.typesets[index].trait_index;
-			if !matches!(
-				self.cx.find_trait_impl_query(
-					self.scope.env,
-					target,
-					trait_index
-				),
-				Ok(Some(_))
-			) {
+		for trait_index in self.cx.clause_tables().declared_traits(
+			&self.cx.types,
+			target,
+			self.cx.solver.state.recursion_budget,
+		) {
+			let Some(typeset) =
+				self.cx.defs.traits[usize::from(trait_index)].typeset
+			else {
 				continue;
-			}
-			for member in self.cx.typeset_members(typeset).to_vec() {
-				targets.push(LiteralTarget {
-					scalar: Scalar::from_type(member.inner),
-					member: Some((typeset, member)),
-				});
+			};
+			for member in self.cx.typeset_members(typeset).iter().copied() {
+				targets.push(LiteralTarget::TypesetMember(typeset, member));
 			}
 		}
-		(!targets.is_empty()).then_some(targets)
+		targets
 	}
 
 	/// Gives an untyped subtree the type `target`, checking each literal fits.
@@ -1223,81 +1208,57 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if let ExprKind::Tuple { elements } = self.body.kind(expr) {
 			return self.coerce_tuple(expr, elements, target);
 		}
-		let Some(targets) = self.literal_targets(target) else {
-			return self.report_unable_to_coerce(expr, target);
-		};
+		// The common case: one concrete number, held on the stack.
+		if Integer::from_type(target).is_some()
+			|| Float::from_type(target).is_some()
+		{
+			let single = [LiteralTarget::Target(target)];
+			return self.coerce_against(expr, target, &single);
+		}
+		let targets = self.typeset_targets(target);
+		if targets.is_empty() {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		self.coerce_against(expr, target, &targets);
+	}
+
+	/// `coerce` against the scalars a literal must fit: `target`'s own, or
+	/// every member of every typeset it assumes.
+	fn coerce_against(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+	) {
 		match self.body.kind(expr) {
 			ExprKind::Int(value) => {
-				for fit in &targets {
-					let fits = fit.scalar.is_some_and(|scalar| {
-						if scalar.is_integer() {
-							value <= max_magnitude(scalar, false)
-						} else if scalar.is_float() {
-							exact_in_float(value, mantissa_bits(scalar))
-						} else {
-							false
-						}
-					});
-					if !fits {
-						return self.report_int_misfit(
-							expr, value, false, target, fit,
-						);
-					}
-				}
-				// An integer literal of float type is a float.
-				if targets
-					.iter()
-					.all(|fit| fit.scalar.is_some_and(Scalar::is_float))
-				{
-					self.body.set_kind(expr, ExprKind::Float(value as f64));
-				}
-				self.body.set_ty(expr, target);
+				self.coerce_int(expr, expr, target, targets, value, false);
 			}
-			ExprKind::Float(_) => self.coerce_float(expr, target, &targets),
+			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
 			ExprKind::Unary { op, operand } => {
-				for fit in &targets {
-					let fits = fit.scalar.is_some_and(|scalar| match op {
-						UnaryOp::InvertSign => {
-							scalar.is_signed() || scalar.is_float()
-						}
-						UnaryOp::BitNot => scalar.is_integer(),
-						UnaryOp::Not => false,
-					});
-					if !fits {
+				for fit in targets {
+					if !fit.fits_unary(op) {
 						return self.report_misfit(expr, target, fit);
 					}
 				}
-				// `-128` is in range for `i8` though `128` is not: a negated
-				// literal is checked against the negative bound.
-				match (op, self.body.kind(operand)) {
-					(UnaryOp::InvertSign, ExprKind::Int(value)) => {
-						for fit in &targets {
-							let scalar = fit.scalar.unwrap();
-							let fits = if scalar.is_integer() {
-								value <= max_magnitude(scalar, true)
-							} else {
-								exact_in_float(value, mantissa_bits(scalar))
-							};
-							if !fits {
-								return self.report_int_misfit(
-									expr, value, true, target, fit,
-								);
-							}
-						}
-						if targets
-							.iter()
-							.all(|fit| fit.scalar.is_some_and(Scalar::is_float))
-						{
-							self.body.set_kind(
-								operand,
-								ExprKind::Float(value as f64),
-							);
-						}
-						self.body.set_ty(operand, target);
+				let coerced = match (op, self.body.kind(operand)) {
+					// `-128` is in range for `i8` though `128` is not: a
+					// negated literal is checked against the negative bound.
+					(UnaryOp::InvertSign, ExprKind::Int(value)) => self
+						.coerce_int(
+							expr, operand, target, targets, value, true,
+						),
+					_ => {
+						self.coerce(operand, target);
+						true
 					}
-					_ => self.coerce(operand, target),
+				};
+				if coerced {
+					self.body.set_ty(expr, target);
 				}
-				self.body.set_ty(expr, target);
 			}
 			ExprKind::Binary { op, lhs, rhs } => {
 				debug_assert!(
@@ -1320,6 +1281,36 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				"only literals and operators over them are untyped: {kind:?}"
 			),
 		}
+	}
+
+	/// Checks an integer literal (`value`, optionally negated) against every
+	/// candidate, then gives `literal` the type `target` and returns `true`.
+	/// On a misfit it draws the report, leaves the node at `ERROR`, and
+	/// returns `false`. `report` is the node a diagnostic points at — the
+	/// unary itself, for a negated literal.
+	fn coerce_int(
+		&mut self,
+		report: ExprIdx,
+		literal: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+		value: u64,
+		negated: bool,
+	) -> bool {
+		let mut all_float = true;
+		for fit in targets {
+			if !fit.fits_int(value, negated) {
+				self.report_int_misfit(report, value, negated, target, fit);
+				return false;
+			}
+			all_float &= fit.is_float();
+		}
+		// An integer literal of float type is a float.
+		if all_float {
+			self.body.set_kind(literal, ExprKind::Float(value as f64));
+		}
+		self.body.set_ty(literal, target);
+		true
 	}
 
 	/// Gives an untyped tuple the type `target`: each element is held to the
@@ -1366,42 +1357,51 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		let text = self.body.span(expr).extract_str(source).to_owned();
-		let nonzero = text.bytes().any(|b| b.is_ascii_digit() && b != b'0');
 		let mut value = None;
 		for fit in targets {
-			let Some(scalar) = fit.scalar.filter(|scalar| scalar.is_float())
-			else {
-				return self.report_misfit(expr, target, fit);
-			};
-			let parsed = match scalar {
-				Scalar::F32 => text.parse::<f32>().map(f64::from).ok(),
-				_ => text.parse::<f64>().ok(),
-			};
-			// Malformed syntax was reported by the parser.
-			let Some(parsed) = parsed else {
-				return self.body.set_ty(expr, TypeIndex::ERROR);
-			};
-			let name = self.cx.type_formatter().display_type(scalar.ty());
-			if parsed.is_infinite() {
-				return self.push_error(
-					DiagnosticCode::FloatLiteralOverflow,
-					format!("float literal is too large for `{name}`"),
-					expr,
-				);
+			match fit.fits_float(&text) {
+				FloatFit::Fits(parsed) => {
+					value.get_or_insert(parsed);
+				}
+				// Malformed syntax was reported by the parser.
+				FloatFit::Invalid => {
+					return self.body.set_ty(expr, TypeIndex::ERROR);
+				}
+				FloatFit::Overflow => {
+					return self.report_float(expr, fit, true);
+				}
+				FloatFit::Underflow => {
+					return self.report_float(expr, fit, false);
+				}
+				FloatFit::NotFloat => {
+					return self.report_misfit(expr, target, fit);
+				}
 			}
-			if parsed == 0.0 && nonzero {
-				return self.push_error(
-					DiagnosticCode::FloatLiteralUnderflow,
-					format!(
-						"float literal is too small to represent in `{name}`"
-					),
-					expr,
-				);
-			}
-			value.get_or_insert(parsed);
 		}
 		self.body.set_kind(expr, ExprKind::Float(value.unwrap()));
 		self.body.set_ty(expr, target);
+	}
+
+	/// A float literal `fit` cannot hold: too large or too small for its width.
+	fn report_float(
+		&mut self,
+		expr: ExprIdx,
+		fit: &LiteralTarget,
+		overflow: bool,
+	) {
+		let name = self.cx.type_formatter().display_type(fit.ty());
+		let (code, message) = if overflow {
+			(
+				DiagnosticCode::FloatLiteralOverflow,
+				format!("float literal is too large for `{name}`"),
+			)
+		} else {
+			(
+				DiagnosticCode::FloatLiteralUnderflow,
+				format!("float literal is too small to represent in `{name}`"),
+			)
+		};
+		self.push_error(code, message, expr);
 	}
 
 	/// An integer literal that does not fit `fit`: out of range for a plain
@@ -1414,27 +1414,30 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		fit: &LiteralTarget,
 	) {
-		match fit.scalar {
-			Some(scalar) if fit.member.is_none() && scalar.is_integer() => {
-				let value = if negated {
-					-(value as i128)
-				} else {
-					value as i128
-				};
-				self.report_out_of_range(expr, value, target);
-			}
-			Some(scalar) if fit.member.is_none() && scalar.is_float() => {
-				let message = format!(
-					"integer literal cannot be represented exactly by `{}`",
-					self.cx.type_formatter().display_type(target)
-				);
-				self.push_error(
-					DiagnosticCode::IntegerLiteralNotRepresentable,
-					message,
-					expr,
-				);
-			}
-			_ => self.report_misfit(expr, target, fit),
+		let LiteralTarget::Target(ty) = fit else {
+			return self.report_misfit(expr, target, fit);
+		};
+		if Integer::from_type(*ty).is_some() {
+			let value = if negated {
+				-(value as i128)
+			} else {
+				value as i128
+			};
+			self.report_out_of_range(expr, value, target);
+		} else if Float::from_type(*ty).is_some() {
+			let message = format!(
+				"integer literal cannot be represented exactly by `{}`",
+				self.cx.type_formatter().display_type(target)
+			);
+			self.push_error(
+				DiagnosticCode::IntegerLiteralNotRepresentable,
+				message,
+				expr,
+			);
+		} else {
+			// A concrete type that is neither integer nor float (bool, char)
+			// has no integer proof, just as a typeset member has none.
+			self.report_misfit(expr, target, fit);
 		}
 	}
 
@@ -1446,10 +1449,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		fit: &LiteralTarget,
 	) {
-		let Some((typeset, member)) = fit.member else {
-			return self.report_unable_to_coerce(expr, target);
+		let LiteralTarget::TypesetMember(typeset, member) = fit else {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
-		let def = &self.cx.defs.typesets[usize::from(typeset)];
+		let def = &self.cx.defs.typesets[usize::from(*typeset)];
 		let typeset_name = self
 			.cx
 			.strings
@@ -1458,16 +1464,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			)
 			.unwrap();
 		let member_name = self.cx.type_formatter().display_type(member.inner);
-		let label = self.source_span(self.body.span(expr)).primary_label();
 		self.cx.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypesetBoundViolation.code())
 				.with_message(format!(
 					"literal is not representable by every member of typeset `{typeset_name}`"
 				))
-				.with_label(label.with_message(format!(
-					"cannot be represented by `{member_name}`"
-				)))
+				.with_label(
+					Label::primary(self.scope.file_id, self.body.span(expr))
+						.with_message(format!(
+							"cannot be represented by `{member_name}`"
+						)),
+				)
 				.with_label(
 					SourceSpan::new(def.file_id, member.span)
 						.secondary_label()
@@ -1496,12 +1504,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	fn report_unable_to_coerce(&mut self, expr: ExprIdx, target: TypeIndex) {
-		let message = format!(
-			"unable to coerce to type `{}`",
-			self.cx.type_formatter().display_type(target)
-		);
-		self.push_error(DiagnosticCode::UnableToCoerce, message, expr);
+	fn report_unable_to_coerce(
+		&self,
+		expr: ExprIdx,
+		target: TypeIndex,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::UnableToCoerce.code())
+			.with_message(format!(
+				"unable to coerce to type `{}`",
+				self.cx.type_formatter().display_type(target)
+			))
+			.with_label(self.source_span(expr).primary_label())
 	}
 
 	/// Reports at `expr` and leaves it at `ERROR`, so nothing reports it again.
@@ -1511,12 +1525,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		message: String,
 		expr: ExprIdx,
 	) {
-		let label = self.source_span(self.body.span(expr)).primary_label();
 		self.cx.diagnostics.push(
 			Diagnostic::error()
 				.with_code(code.code())
 				.with_message(message)
-				.with_label(label),
+				.with_label(self.source_span(expr).primary_label()),
 		);
 		self.body.set_ty(expr, TypeIndex::ERROR);
 	}
@@ -1531,19 +1544,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMistmatch.code())
 			.with_message("type mismatch")
-			.with_label(
-				self.source_span(self.body.span(expr))
-					.primary_label()
-					.with_message(format!(
-						"expected `{}`, found `{}`",
-						formatter.display_type(expected),
-						formatter.display_type(actual)
-					)),
-			)
+			.with_label(self.source_span(expr).primary_label().with_message(
+				format!(
+					"expected `{}`, found `{}`",
+					formatter.display_type(expected),
+					formatter.display_type(actual)
+				),
+			))
 	}
 
-	fn source_span(&self, span: TextSpan) -> SourceSpan {
-		SourceSpan::new(self.scope.file_id, span)
+	fn source_span(&self, expr: ExprIdx) -> SourceSpan {
+		SourceSpan::new(self.scope.file_id, self.body.span(expr))
 	}
 }
 
@@ -1553,34 +1564,195 @@ enum Arguments<'e> {
 	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
 }
 
-/// One scalar a literal must fit; see `BodyContext::literal_targets`.
-struct LiteralTarget {
-	/// `None` for a typeset member that is not a primitive scalar, which no
-	/// literal fits.
-	scalar: Option<Scalar>,
-	member: Option<(TypesetIdx, Spanned<TypeIndex>)>,
+/// A type a literal must fit, and where the requirement comes from.
+enum LiteralTarget {
+	/// The target type itself.
+	Target(TypeIndex),
+	/// A member of a typeset an abstract target assumes: the typeset, to name
+	/// it, and the member's written type, for its place in a diagnostic.
+	TypesetMember(TypesetIdx, Spanned<TypeIndex>),
 }
 
-fn mantissa_bits(scalar: Scalar) -> u32 {
-	if scalar == Scalar::F32 { 24 } else { 53 }
-}
-
-fn is_untyped(ty: TypeIndex) -> bool {
-	ty == TypeIndex::INTEGER || ty == TypeIndex::FLOAT
-}
-
-/// The largest literal magnitude `scalar` holds, written plainly or negated.
-fn max_magnitude(scalar: Scalar, negated: bool) -> u64 {
-	let bits = scalar.bits();
-	if !scalar.is_signed() {
-		return if negated { 0 } else { u64::MAX >> (64 - bits) };
+impl LiteralTarget {
+	/// The candidate type. `Integer::from_type` or `Float::from_type` narrows
+	/// it when the check wants one; a typeset member need be neither.
+	fn ty(&self) -> TypeIndex {
+		match self {
+			LiteralTarget::Target(ty) => *ty,
+			LiteralTarget::TypesetMember(_, member) => member.inner,
+		}
 	}
-	let positive = (1u64 << (bits - 1)) - 1;
-	if negated { positive + 1 } else { positive }
+
+	/// Whether an integer literal (`value`, optionally negated) fits.
+	fn fits_int(&self, value: u64, negated: bool) -> bool {
+		let ty = self.ty();
+		if let Some(integer) = Integer::from_type(ty) {
+			integer.in_range(value, negated)
+		} else if let Some(float) = Float::from_type(ty) {
+			float.exact_precision_int(value)
+		} else {
+			false
+		}
+	}
+
+	/// Whether a float literal written `text` fits, and its value when it does.
+	fn fits_float(&self, text: &str) -> FloatFit {
+		let Some(float) = Float::from_type(self.ty()) else {
+			return FloatFit::NotFloat;
+		};
+		let result = match float {
+			Float::F32 => text
+				.parse::<f32>()
+				// f64::from is a lossless conversion
+				.map(f64::from),
+			Float::F64 => text.parse::<f64>(),
+		};
+		match result {
+			Ok(parsed) if parsed.is_infinite() => FloatFit::Overflow,
+			Ok(parsed)
+				if parsed == 0.0
+					&& text
+						.bytes()
+						.any(|b| b.is_ascii_digit() && b != b'0') =>
+			{
+				FloatFit::Underflow
+			}
+			Ok(parsed) => FloatFit::Fits(parsed),
+			Err(_) => FloatFit::Invalid,
+		}
+	}
+
+	/// Whether `op` means anything over a literal of this candidate's type.
+	fn fits_unary(&self, op: UnaryOp) -> bool {
+		let ty = self.ty();
+		match op {
+			UnaryOp::InvertSign => {
+				Integer::from_type(ty).is_some_and(Integer::is_signed)
+					|| Float::from_type(ty).is_some()
+			}
+			UnaryOp::BitNot => Integer::from_type(ty).is_some(),
+			UnaryOp::Not => false,
+		}
+	}
+
+	/// Whether a literal of this candidate's type is a float.
+	fn is_float(&self) -> bool {
+		Float::from_type(self.ty()).is_some()
+	}
 }
 
-/// Whether `value` survives the trip through a float with `mantissa` bits.
-fn exact_in_float(value: u64, mantissa: u32) -> bool {
-	value == 0
-		|| 64 - value.leading_zeros() - value.trailing_zeros() <= mantissa
+/// How a float literal fares against one candidate.
+enum FloatFit {
+	/// It parses and is representable at the candidate's width, at this value.
+	Fits(f64),
+	/// The text is not a float; the parser has already reported it.
+	Invalid,
+	/// It parses to infinity at the candidate's width.
+	Overflow,
+	/// It is nonzero in text but rounds to zero at the candidate's width.
+	Underflow,
+	/// The candidate is not a float type.
+	NotFloat,
+}
+
+#[derive(Clone, Copy)]
+enum Float {
+	F32,
+	F64,
+}
+
+impl Float {
+	fn from_type(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::F32 => Self::F32,
+			TypeIndex::F64 => Self::F64,
+			_ => return None,
+		})
+	}
+
+	fn mantissa_bits(self) -> u32 {
+		match self {
+			Self::F32 => 24,
+			Self::F64 => 53,
+		}
+	}
+
+	fn exact_precision_int(self, value: u64) -> bool {
+		value == 0
+			|| 64 - value.leading_zeros() - value.trailing_zeros()
+				<= self.mantissa_bits()
+	}
+}
+
+#[derive(Clone, Copy)]
+enum Integer {
+	I8,
+	U8,
+	I16,
+	U16,
+	I32,
+	U32,
+	I64,
+	U64,
+}
+
+impl Integer {
+	fn from_type(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::U8 => Self::U8,
+			TypeIndex::I8 => Self::I8,
+			TypeIndex::U16 => Self::U16,
+			TypeIndex::I16 => Self::I16,
+			TypeIndex::U32 => Self::U32,
+			TypeIndex::I32 => Self::I32,
+			TypeIndex::U64 => Self::U64,
+			TypeIndex::I64 => Self::I64,
+			_ => return None,
+		})
+	}
+
+	/// Whether an integer literal `value`, optionally negated, is in range.
+	fn in_range(self, value: u64, negated: bool) -> bool {
+		// A negated literal reaches one past the maximum: `-min`, e.g. `-128`
+		// is in range for `i8` although `128` is not.
+		let limit = if negated {
+			self.min().unsigned_abs()
+		} else {
+			self.max()
+		};
+		value <= limit
+	}
+
+	fn is_signed(self) -> bool {
+		match self {
+			Self::I8 | Self::I16 | Self::I32 | Self::I64 => true,
+			Self::U8 | Self::U16 | Self::U32 | Self::U64 => false,
+		}
+	}
+
+	fn max(self) -> u64 {
+		match self {
+			Self::I8 => i8::MAX as u64,
+			Self::U8 => u8::MAX as u64,
+			Self::I16 => i16::MAX as u64,
+			Self::U16 => u16::MAX as u64,
+			Self::I32 => i32::MAX as u64,
+			Self::U32 => u32::MAX as u64,
+			Self::I64 => i64::MAX as u64,
+			Self::U64 => u64::MAX,
+		}
+	}
+
+	fn min(self) -> i64 {
+		match self {
+			Self::I8 => i8::MIN as i64,
+			Self::U8 => 0,
+			Self::I16 => i16::MIN as i64,
+			Self::U16 => 0,
+			Self::I32 => i32::MIN as i64,
+			Self::U32 => 0,
+			Self::I64 => i64::MIN,
+			Self::U64 => 0,
+		}
+	}
 }
