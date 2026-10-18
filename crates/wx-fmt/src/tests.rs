@@ -13,8 +13,11 @@ pub(super) struct TestCase {
 
 impl TestCase {
 	pub(super) fn new(source: &str) -> Self {
-		let mut interner = ast::StringInterner::new();
-		let mut files = vfs::Files::new();
+		// The builder's interner is the one the real pipeline parses with: it
+		// has the keywords pre-interned, which `StringInterner::new()` does not.
+		let builder = vfs::CompilationUnitBuilder::new();
+		let mut interner = builder.strings;
+		let mut files = builder.files;
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
@@ -22,13 +25,7 @@ impl TestCase {
 				vfs::FileOrigin::Local,
 			)
 			.unwrap();
-		let mut id_generator = ast::DefIdGenerator::new();
-		let ast = ast::Parser::parse(
-			file_id,
-			&files,
-			&mut interner,
-			&mut id_generator,
-		);
+		let ast = ast::Parser::parse(file_id, &files, &mut interner);
 
 		TestCase {
 			interner,
@@ -425,9 +422,9 @@ fn test_format_enum_items() {
 #[test]
 fn test_format_struct_items() {
 	let case = TestCase::new(indoc! {"
-        pub struct Point { pub x: i32, y: i32 }
+        pub struct Point(pub x: i32, y: i32);
 
-        struct Unit { value: f64 }
+        struct Unit(value: f64);
     "});
 	let output = format(
 		&case.ast,
@@ -442,14 +439,14 @@ fn test_format_struct_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            pub struct Point {
+            pub struct Point(
                 pub x: i32,
                 y: i32,
-            }
+            );
 
-            struct Unit {
+            struct Unit(
                 value: f64,
-            }
+            );
         "}
 	);
 }
@@ -563,9 +560,9 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 #[test]
 fn test_format_generic_struct_stays_inline() {
 	let case = TestCase::new(indoc! {"
-        struct Pair<A, B> { first: A, second: B }
+        struct Pair<A, B>(first: A, second: B);
 
-        struct Wrapper<T> { value: T }
+        struct Wrapper<T>(value: T);
     "});
 	let output = format(
 		&case.ast,
@@ -580,14 +577,14 @@ fn test_format_generic_struct_stays_inline() {
 	assert_eq!(
 		output,
 		indoc! {"
-            struct Pair<A, B> {
+            struct Pair<A, B>(
                 first: A,
                 second: B,
-            }
+            );
 
-            struct Wrapper<T> {
+            struct Wrapper<T>(
                 value: T,
-            }
+            );
         "}
 	);
 }
@@ -631,8 +628,8 @@ fn test_format_generic_function() {
 fn test_format_struct_init() {
 	let case = TestCase::new(indoc! {"
         func main() {
-            local a = Point::{ x: 1, y: 2 };
-            local b = Point::{ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 }
+            local a = Point({ x: 1, y: 2 });
+            local b = Point({ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 })
         }
     "});
 	let output = format(
@@ -649,14 +646,14 @@ fn test_format_struct_init() {
 		output,
 		indoc! {"
             func main() {
-                local a = Point::{ x: 1, y: 2 };
-                local b = Point::{
+                local a = Point({ x: 1, y: 2 });
+                local b = Point({
                     x: 1,
                     y: 2,
                     z: 3,
                     w: 4,
                     extra_long_field: 99,
-                };
+                });
             }
         "}
 	);
@@ -666,7 +663,7 @@ fn test_format_struct_init() {
 fn test_format_struct_init_block_value() {
 	let case = TestCase::new(indoc! {"
         func main() -> i32 {
-            local p = Point::{ x: g: { break :g 5 }, y: 10 }
+            local p = Point({ x: g: block { break :g 5 }, y: 10 })
         }
     "});
 	let output = format(
@@ -683,10 +680,10 @@ fn test_format_struct_init_block_value() {
 		output,
 		indoc! {"
             func main() -> i32 {
-                local p = Point::{
-                    x: g: { break :g 5 },
+                local p = Point({
+                    x: g: block { break :g 5 },
                     y: 10,
-                };
+                });
             }
         "}
 	);
@@ -701,9 +698,9 @@ fn test_format_local_patterns() {
             local _ = 3;
             local (a,b) = pair;
             local (mut c,_) = pair;
-            local Point::{x,y:renamed} = p;
-            local geom::Point::{x,..} = p;
-            local Point::{..} = p;
+            local Point({x,y:renamed}) = p;
+            local geom::Point({x,..}) = p;
+            local Point({..}) = p;
             local (a,b): (i32,i32) = pair;
         }
     "});
@@ -726,9 +723,9 @@ fn test_format_local_patterns() {
                 local _ = 3;
                 local (a, b) = pair;
                 local (mut c, _) = pair;
-                local Point::{ x, y: renamed } = p;
-                local geom::Point::{ x, .. } = p;
-                local Point::{ .. } = p;
+                local Point({ x, y: renamed }) = p;
+                local geom::Point({ x, .. }) = p;
+                local Point({ .. }) = p;
                 local (a, b): (i32, i32) = pair;
             }
         "}
@@ -920,10 +917,10 @@ fn test_format_local_definition_wraps() {
 	// Using FB_WIDTH (a named constant) makes the expression exceed 80 cols.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
+			"memory heap: Memory32; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
             func set_pixel(x: u32, y: u32) {
                 local base: heap::*u8 =
@@ -932,18 +929,18 @@ fn test_format_local_definition_wraps() {
         "},
 	);
 
-	// Block-like value (struct init): = stays on the same line, struct breaks inside.
+	// Block-like value (call by name): = stays on the same line, the braces break inside.
 	assert_eq!(
 		fmt(
-			"func f() { local p = Point::{ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }; }"
+			"func f() { local p = Point({ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }); }"
 		),
 		indoc! {"
             func f() {
-                local p = Point::{
+                local p = Point({
                     x: very_long_name_one,
                     y: very_long_name_two,
                     z: very_long_name_three,
-                };
+                });
             }
         "},
 	);
@@ -959,14 +956,14 @@ fn test_format_local_definition_wraps() {
 	// it's in is actually rendered Flat or Break.
 	assert_eq!(
 		fmt(
-			"func f() { local p = alloc(Outer::{ tag: 1, inner: Inner::{ id: 2, timeout: 3 } }); }"
+			"func f() { local p = alloc(Outer({ tag: 10001, inner: Inner({ id: 20002, timeout: 30003 }) })); }"
 		),
 		indoc! {"
             func f() {
-                local p = alloc(Outer::{
-                    tag: 1,
-                    inner: Inner::{ id: 2, timeout: 3 },
-                });
+                local p = alloc(Outer({
+                    tag: 10001,
+                    inner: Inner({ id: 20002, timeout: 30003 }),
+                }));
             }
         "},
 	);
@@ -991,10 +988,10 @@ fn test_format_inline_blocks() {
 	// Single-statement if guard: fits → inline.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; func check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
+			"memory heap: Memory32; func check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
             func check(data: heap::&[u8]) -> bool {
                 if data.len() < 4 { return false };
@@ -1061,33 +1058,26 @@ fn test_format_memory_config() {
 	};
 
 	// No config block
-	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 };"),
-		"memory heap: Memory where { Size = u32 };\n",
-	);
+	assert_eq!(fmt("memory heap: Memory32;"), "memory heap: Memory32;\n",);
 
 	// min_pages only
 	assert_eq!(
-		fmt(
-			"#[memory_limits(min_pages = 4)] memory heap: Memory where { Size = u32 };"
-		),
-		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory where { Size = u32 };\n",
+		fmt("#[memory_limits(min_pages = 4)] memory heap: Memory32;"),
+		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory32;\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt(
-			"#[memory_limits(max_pages = 10)] memory heap: Memory where { Size = u32 };"
-		),
-		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
+		fmt("#[memory_limits(max_pages = 10)] memory heap: Memory32;"),
+		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory32;\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory where { Size = u32 };"
+			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory32;"
 		),
-		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
+		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory32;\n",
 	);
 }
 
@@ -1120,10 +1110,10 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 	// Long chain: exceeds 80 columns, each operand on its own line.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; func read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
+			"memory heap: Memory32; func read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
             func read(data: heap::&[u8], off: u32) -> i32 {
                 (data[off] as i32)
@@ -1291,12 +1281,12 @@ fn test_format_comments_preserved() {
 	// Comment as the only content of an otherwise empty import block.
 	assert_eq!(
 		fmt(indoc! {"
-            import \"env\" {
+            import \"env\" as env {
                 // nothing yet
             }
         "}),
 		indoc! {"
-            import \"env\" {
+            import \"env\" as env {
                 // nothing yet
             }
         "},
@@ -1341,20 +1331,23 @@ fn test_format_comments_preserved() {
 	// Truly empty export/import blocks collapse to one line, matching
 	// every other empty brace body (struct/module/trait/enum/impl).
 	assert_eq!(fmt("export {}\n"), "export {}\n");
-	assert_eq!(fmt("import \"env\" {}\n"), "import \"env\" {}\n");
+	assert_eq!(
+		fmt("import \"env\" as env {}\n"),
+		"import \"env\" as env {}\n"
+	);
 
 	// Comment as the only content of an otherwise empty body, for every
 	// other brace-bodied item kind.
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {
+            struct Foo(
                 // fields tbd
-            }
+            );
         "}),
 		indoc! {"
-            struct Foo {
+            struct Foo(
                 // fields tbd
-            }
+            );
         "},
 	);
 	assert_eq!(
@@ -1395,13 +1388,13 @@ fn test_format_comments_preserved() {
 	);
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {}
+            struct Foo();
             impl Foo {
                 // methods tbd
             }
         "}),
 		indoc! {"
-            struct Foo {}
+            struct Foo();
 
             impl Foo {
                 // methods tbd
@@ -1411,7 +1404,7 @@ fn test_format_comments_preserved() {
 	assert_eq!(
 		fmt(indoc! {"
             trait T {}
-            struct Foo {}
+            struct Foo();
             impl T for Foo {
                 // methods tbd
             }
@@ -1419,7 +1412,7 @@ fn test_format_comments_preserved() {
 		indoc! {"
             trait T {}
 
-            struct Foo {}
+            struct Foo();
 
             impl T for Foo {
                 // methods tbd
@@ -1434,7 +1427,7 @@ fn test_format_comments_preserved() {
 	// silently dropped.
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {}
+            struct Foo();
             impl Foo {
                 // first method
                 func bar(self: Self) -> Self {
@@ -1443,7 +1436,7 @@ fn test_format_comments_preserved() {
             }
         "}),
 		indoc! {"
-            struct Foo {}
+            struct Foo();
 
             impl Foo {
                 // first method
@@ -1650,12 +1643,12 @@ fn test_format_trailing_comments_keep_their_line() {
         const A: u32 = 1; // trailing on item
         const B: u32 = 2;
 
-        struct S {
+        struct S(
             // leading on first field
             x: u32, // trailing on field
             y: u32,
             // own-line before closing brace
-        }
+        );
 
         enum E: u32 {
             A = 0, // trailing on variant
@@ -1829,9 +1822,9 @@ fn test_format_comment_after_a_list_opener_wraps() {
             pub const A: u32 = 1;
         }
 
-        struct S { // opens a `struct`
+        struct S( // opens a `struct`
             x: u32,
-        }
+        );
 
         enum E: u32 { // opens an `enum`
             A = 0,
@@ -1843,7 +1836,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             }
         }
 
-        import \"env\" { // opens an `import`
+        import \"env\" as env { // opens an `import`
             func h() -> u32;
         }
 
@@ -1868,10 +1861,10 @@ fn test_format_comment_after_a_list_opener_wraps() {
             pub const A: u32 = 1;
         }
 
-        struct S {
+        struct S(
             // opens a `struct`
             x: u32,
-        }
+        );
 
         enum E: u32 {
             // opens an `enum`
@@ -1885,7 +1878,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             }
         }
 
-        import \"env\" {
+        import \"env\" as env {
             // opens an `import`
             func h() -> u32;
         }
@@ -1933,10 +1926,10 @@ fn test_format_trailing_comment_after_a_non_block_item_is_kept() {
         const X: i32 = 5; // documents X, not Y
         const Y: i32 = 6;
 
-        struct S {
+        struct S(
             x: u32, // documents x
             y: u32,
-        }
+        );
 
         func g() -> i32 {
             local a = 1; // documents a
@@ -2009,12 +2002,12 @@ fn test_format_blank_line_between_leading_comments() {
 	};
 
 	let source = indoc! {"
-        struct S {
+        struct S(
             // one
 
             // two
             x: u32,
-        }
+        );
 
         impl S {
             // one
@@ -2056,18 +2049,18 @@ fn test_format_empty_body_comments_match_a_non_empty_one() {
 	// The only difference between the two is the field. It must not be what
 	// decides whether the blank line between the comments survives.
 	let source = indoc! {"
-        struct Empty {
+        struct Empty(
             // one
 
             // two
-        }
+        );
 
-        struct HasAField {
+        struct HasAField(
             // one
 
             // two
             x: u32,
-        }
+        );
 
         impl Empty {
             // one
@@ -2102,11 +2095,11 @@ fn test_format_no_blank_line_after_a_list_opener() {
 	};
 
 	let source = indoc! {"
-        struct S {
+        struct S(
 
             // separated from the brace
             x: u32,
-        }
+        );
 
         impl S {
 
@@ -2122,10 +2115,10 @@ fn test_format_no_blank_line_after_a_list_opener() {
     "};
 
 	let expected = indoc! {"
-        struct S {
+        struct S(
             // separated from the brace
             x: u32,
-        }
+        );
 
         impl S {
             func a(self) -> u32 {
@@ -2200,3 +2193,625 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 5);
 	assert_eq!(fmt(&formatted), formatted);
 }
+
+// Formatting must keep what the author wrote readable as the same program:
+// the output reparses cleanly, formats to itself, and every block keeps the
+// role of its statements (see `preserve_roles`). The tests below go through
+// `checked_format` so each case gets all three checks.
+
+fn checked_format(source: &str, width: u32, indent: u8) -> String {
+	let case = TestCase::new(source);
+	assert!(
+		case.ast.diagnostics.is_empty(),
+		"{:#?}\n{source}",
+		case.ast.diagnostics
+	);
+	let config = RendererConfig {
+		max_line_width: width,
+		indent_width: indent,
+		..RendererConfig::default()
+	};
+	let output = format(&case.ast, &case.interner, source, config);
+	let reparsed = TestCase::new(&output);
+	assert!(
+		reparsed.ast.diagnostics.is_empty(),
+		"{:#?}\n{output}",
+		reparsed.ast.diagnostics
+	);
+	assert_eq!(
+		format(&reparsed.ast, &reparsed.interner, &output, config),
+		output,
+		"idempotence: {source}"
+	);
+	for (before, after) in case.ast.items.iter().zip(&reparsed.ast.items) {
+		if let (
+			ast::Item::Function { block: a, .. },
+			ast::Item::Function { block: b, .. },
+		) = (&before.inner.inner, &after.inner.inner)
+		{
+			preserve_roles(&a.inner, &b.inner);
+		}
+	}
+	output
+}
+
+// Compare nested block roles while allowing precisely the two authorized
+// normalizations: non-final block-like separators and local definitions.
+fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
+	use ast::Expression as E;
+	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
+	match (a, b) {
+		(E::Block { statements: a }, E::Block { statements: b }) => {
+			assert_eq!(a.len(), b.len());
+			let count = a.len();
+			for (i, (a, b)) in a.iter().zip(b).enumerate() {
+				match (&a.inner.inner, &b.inner.inner) {
+					(
+						ast::Statement::Expression(x),
+						ast::Statement::Expression(y),
+					) => {
+						if i + 1 == count || !x.inner.is_block_like() {
+							assert_eq!(
+								a.separator.is_some(),
+								b.separator.is_some(),
+								"expression role changed"
+							);
+						}
+						preserve_roles(&x.inner, &y.inner);
+					}
+					(
+						ast::Statement::LocalDefinition { value: x, .. },
+						ast::Statement::LocalDefinition { value: y, .. },
+					) => {
+						assert!(b.separator.is_some());
+						preserve_roles(&x.inner, &y.inner);
+					}
+					_ => panic!("statement kind changed"),
+				}
+			}
+		}
+		(
+			E::IfElse {
+				condition: ac,
+				then_block: at,
+				else_block: ae,
+			},
+			E::IfElse {
+				condition: bc,
+				then_block: bt,
+				else_block: be,
+			},
+		) => {
+			preserve_roles(&ac.inner, &bc.inner);
+			preserve_roles(&at.inner, &bt.inner);
+			assert_eq!(ae.is_some(), be.is_some());
+			if let (Some(a), Some(b)) = (ae, be) {
+				preserve_roles(&a.inner, &b.inner);
+			}
+		}
+		(
+			E::Loop { block: a } | E::Label { block: a, .. },
+			E::Loop { block: b } | E::Label { block: b, .. },
+		) => preserve_roles(&a.inner, &b.inner),
+		(
+			E::Match {
+				scrutinee: a,
+				arms: aa,
+			},
+			E::Match {
+				scrutinee: b,
+				arms: ba,
+			},
+		) => {
+			preserve_roles(&a.inner, &b.inner);
+			assert_eq!(aa.len(), ba.len());
+			for (a, b) in aa.iter().zip(ba) {
+				preserve_roles(
+					&a.inner.inner.body.inner,
+					&b.inner.inner.body.inner,
+				);
+			}
+		}
+		(
+			E::NamedCall { arguments: a, .. },
+			E::NamedCall { arguments: b, .. },
+		) => {
+			for (a, b) in a.iter().zip(b) {
+				if let (Some(a), Some(b)) =
+					(&a.inner.inner.value, &b.inner.inner.value)
+				{
+					preserve_roles(&a.inner, &b.inner);
+				}
+			}
+		}
+		(
+			E::Return { value: a } | E::Break { value: a, .. },
+			E::Return { value: b } | E::Break { value: b, .. },
+		) => {
+			if let (Some(a), Some(b)) = (a, b) {
+				preserve_roles(&a.inner, &b.inner);
+			}
+		}
+		_ => {}
+	}
+}
+
+#[test]
+fn executable_block_eligibility() {
+	for (body, expected) in [
+		("", "func f() {}\n"),
+		("foo()", "func f() { foo() }\n"),
+		("a + b", "func f() { a + b }\n"),
+		("foo();", "func f() {\n    foo();\n}\n"),
+		("local a = 1", "func f() {\n    local a = 1;\n}\n"),
+		("local a = 1;", "func f() {\n    local a = 1;\n}\n"),
+		("foo(); bar()", "func f() {\n    foo();\n    bar()\n}\n"),
+		("_ = foo()", "func f() { _ = foo() }\n"),
+		("return 1", "func f() { return 1 }\n"),
+		("return 1;", "func f() {\n    return 1;\n}\n"),
+		("break 1", "func f() { break 1 }\n"),
+		("continue", "func f() { continue }\n"),
+		("unreachable", "func f() { unreachable }\n"),
+	] {
+		assert_eq!(
+			checked_format(
+				&format!("func f() {{ block {{ {body} }} }}"),
+				80,
+				4
+			),
+			format!(
+				"func f() {{\n    block {}\n}}\n",
+				expected
+					.strip_prefix("func f() ")
+					.unwrap()
+					.trim_end()
+					.replace("\n", "\n    ")
+			)
+		);
+	}
+	for body in [
+		"// leading\nfoo()",
+		"foo() // trailing\n",
+		"foo()\n// trailing\n",
+		"// empty\n",
+	] {
+		let output = checked_format(&format!("func f() {{ {body} }}"), 80, 4);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("//"));
+	}
+}
+
+#[test]
+fn function_bodies_always_break() {
+	// A body always breaks, but never expands a short signature.
+	{
+		let flat = "func f(x: i32) -> i32 { x }";
+		for width in [flat.len() - 1, flat.len(), flat.len() + 1] {
+			let output = checked_format(flat, width as u32, 4);
+			assert!(output.ends_with("{\n    x\n}\n"), "{output}");
+			assert!(output.starts_with("func f(x: i32) -> i32 {"));
+		}
+		for body in ["foo()", "foo();", "a + b", "return 1", "_ = foo()"] {
+			assert_eq!(
+				checked_format(&format!("func f() {{ {body} }}"), 120, 4),
+				format!("func f() {{\n    {body}\n}}\n"),
+			);
+		}
+		assert_eq!(checked_format("func f() {}", 120, 4), "func f() {}\n");
+
+		let output = checked_format(
+			"func many(first: i32, second: i32, third: i32) -> i32 { first }",
+			36,
+			4,
+		);
+		assert!(output.starts_with("func many(\n"), "{output}");
+		assert!(output.ends_with(") -> i32 {\n    first\n}\n"), "{output}");
+		for body in ["if x { a() } else { b() }", "a(); b()"] {
+			let output =
+				checked_format(&format!("func f(x: bool) {{ {body} }}"), 80, 4);
+			assert!(output.starts_with("func f(x: bool) {\n"), "{output}");
+		}
+		assert_eq!(
+			checked_format("#[inline] func f() { 1 }", 80, 4),
+			"#[inline]\nfunc f() {\n    1\n}\n"
+		);
+		let output = checked_format(
+			"func f() { very_long_function_name(argument) }",
+			35,
+			2,
+		);
+		assert_eq!(
+			output,
+			"func f() {\n  very_long_function_name(argument)\n}\n"
+		);
+	}
+
+	// Methods follow the same rule; generic signatures wrap before the body.
+	{
+		for source in [
+			"impl Point { func f(self) -> i32 { 1 } }",
+			"trait T { func f(self) -> i32 { 1 } }",
+			"impl T for Point { func f(self) -> i32 { 1 } }",
+		] {
+			let output = checked_format(source, 80, 4);
+			assert!(
+				output.contains("func f(self) -> i32 {\n        1\n    }"),
+				"{output}"
+			);
+			let output = checked_format(source, 24, 4);
+			assert!(output.contains("-> i32 {\n"), "{output}");
+			assert!(!output.contains("{ 1 }"), "{output}");
+		}
+		let output = checked_format(
+			"func f<First: VeryLongBound, Second: AnotherVeryLongBound>(x: First) -> First { x }",
+			40,
+			4,
+		);
+		assert!(output.starts_with("func f<\n"), "{output}");
+		assert!(output.ends_with("{\n    x\n}\n"), "{output}");
+	}
+}
+
+#[test]
+fn block_like_statement_separators() {
+	// Every block-like form, with and without its optional `;`.
+	{
+		for expression in [
+			"block { foo() }",
+			"if true { foo() } else { bar() }",
+			"loop { break 1 }",
+			"label: block { break :label 1 }",
+			"if true {}",
+			"block {}",
+			"loop {}",
+			"label: block {}",
+			"match n {}",
+		] {
+			for separator in ["", ";"] {
+				let source =
+					format!("func f() {{ {expression}{separator} next() }}");
+				let output = checked_format(&source, 120, 4);
+				assert!(
+					output.contains(&format!("    {expression};\n    next()")),
+					"{output}"
+				);
+				let final_source =
+					format!("func f() {{ {expression}{separator} }}");
+				assert_eq!(
+					checked_format(&final_source, 120, 4),
+					format!("func f() {{\n    {expression}{separator}\n}}\n")
+				);
+			}
+		}
+		for expression in [
+			"block { foo(); }",
+			"if true { foo(); } else { bar() }",
+			"loop { break 1; }",
+			"label: block { break :label 1; }",
+			"match n { _ -> { 1 } }",
+		] {
+			for separator in ["", ";"] {
+				let output = checked_format(
+					&format!("func f() {{ {expression}{separator} next() }}"),
+					80,
+					4,
+				);
+				assert!(output.contains("\n    }\n    next()"), "{output}");
+				let output = checked_format(
+					&format!("func f() {{ {expression}{separator} }}"),
+					80,
+					4,
+				);
+				assert!(
+					output.ends_with(&format!("    }}{separator}\n}}\n")),
+					"{output}"
+				);
+			}
+		}
+	}
+
+	// The flat `;` counts toward the width the line must fit.
+	{
+		for expression in [
+			"if true { foo() } else { bar() }",
+			"loop { break value }",
+			"label: block { break :label 1 }",
+		] {
+			let boundary = 4 + expression.len() + 1;
+			for width in [boundary - 1, boundary, boundary + 1] {
+				for separator in ["", ";"] {
+					let output = checked_format(
+						&format!(
+							"func f() {{ {expression}{separator} next() }}"
+						),
+						width as u32,
+						4,
+					);
+					if width >= boundary {
+						assert!(
+							output.contains(&format!("    {expression};\n")),
+							"{output}"
+						);
+					} else {
+						assert!(
+							output.contains("\n    }\n    next()"),
+							"{output}"
+						);
+					}
+				}
+			}
+		}
+	}
+
+	// Empty bodies follow the mode of the group that owns them.
+	{
+		for expression in [
+			"if test(a) {}",
+			"if !test(a) {}",
+			"match test(a) {}",
+			"loop {}",
+			"block {}",
+			"label: block {}",
+		] {
+			for separator in ["", ";"] {
+				let source =
+					format!("func f() {{ {expression}{separator} next() }}");
+				let boundary = (4 + expression.len() + 1) as u32;
+				for width in [boundary - 1, boundary, boundary + 1] {
+					let output = checked_format(&source, width, 4);
+					// Below the flat width, the owning group chooses Break even
+					// though the nested condition and empty braces stay on one line.
+					let semi = if width >= boundary { ";" } else { "" };
+					assert_eq!(
+						output,
+						format!(
+							"func f() {{\n    {expression}{semi}\n    next()\n}}\n"
+						)
+					);
+				}
+				let output = checked_format(&source, 8, 4);
+				assert!(!output.contains("{};"), "{output}");
+			}
+		}
+	}
+}
+
+#[test]
+fn branch_coordination_and_comments() {
+	for body in [
+		"foo();",
+		"prepare(); foo()",
+		"// branch\nfoo()",
+		"foo() // branch\n",
+	] {
+		for (a, b) in [(body, "bar()"), ("bar()", body)] {
+			let output = checked_format(
+				&format!(
+					"func f() {{ if true {{ {a} }} else {{ {b} }}; next() }}"
+				),
+				80,
+				4,
+			);
+			assert!(output.contains("if true {\n"), "{output}");
+			assert!(output.contains("} else {\n"), "{output}");
+			assert!(output.contains("\n    }\n    next()"), "{output}");
+		}
+	}
+	let output = checked_format(
+		"func f() { if true { foo() } // boundary\nnext() }",
+		80,
+		4,
+	);
+	assert!(
+		output.contains("if true { foo() }; // boundary\n"),
+		"{output}"
+	);
+	let output = checked_format(
+		"func f() { if true { foo(); }; // boundary\nnext() }",
+		80,
+		4,
+	);
+	assert!(output.contains("    } // boundary\n"), "{output}");
+}
+
+#[test]
+fn mandatory_lines_prevent_flat_layout() {
+	// A nested block that must break stops its parents going flat.
+	{
+		let output = checked_format(
+			"func f() { return if true { a(); } else { b() } }",
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("} else {\n"), "{output}");
+		// The top-level rule deliberately allows an unterminated return whose
+		// operand is block-like when the whole thing is physically one line.
+		assert_eq!(
+			checked_format(
+				"func f() { return if true { a() } else { b() } }",
+				120,
+				4
+			),
+			"func f() {\n    return if true { a() } else { b() }\n}\n"
+		);
+		let output = checked_format(
+			"func f() { wrap(Point({ x: block { a(); } })) }",
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+	}
+
+	// So does a newline inside a source token.
+	{
+		let output = checked_format(
+			r#"func f() { "one
+two" }"#,
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("one\ntwo"), "{output}");
+	}
+}
+
+/// Forms that exist only in the current syntax, each written the way the
+/// formatter should leave it: a single `export`, `use` globs and groups,
+/// structs with unnamed fields, patterns that mirror construction, calls by
+/// name, memory-tagged and qualified paths, and an associated type default.
+#[test]
+fn test_format_current_syntax_forms() {
+	let source = indoc! {"
+        memory heap: Memory32;
+
+        export main;
+
+        use a::b::*;
+        use a::{b, c::{d, e as f}, g::*};
+
+        struct Pair(i32, pub u8);
+
+        struct Unit();
+
+        trait Tr {
+            type A: Bound = u32;
+
+            func f(self);
+        }
+
+        func main() {
+            local Pair(a, ..) = p;
+            local Named({ x, y: (q, _), .. }) = n;
+            local v = obj.method::<u32>({ a: 1, b });
+            local w = <Vec<u32> as Tr>::A::f::<u8>(x);
+            local z = <u32>::MAX;
+            local f: func(a: i32, i32) -> heap::*u8 = g;
+        }
+    "};
+	let case = TestCase::new(source);
+	assert!(
+		case.ast.diagnostics.is_empty(),
+		"{:#?}",
+		case.ast.diagnostics
+	);
+	let output =
+		format(&case.ast, &case.interner, source, RendererConfig::default());
+	assert_eq!(
+		output,
+		indoc! {"
+            memory heap: Memory32;
+
+            export main;
+
+            use a::b::*;
+            use a::{b, c::{d, e as f}, g::*};
+
+            struct Pair(
+                i32,
+                pub u8,
+            );
+
+            struct Unit();
+
+            trait Tr {
+                type A: Bound = u32;
+
+                func f(self);
+            }
+
+            func main() {
+                local Pair(a, ..) = p;
+                local Named({ x, y: (q, _), .. }) = n;
+                local v = obj.method::<u32>({ a: 1, b });
+                local w = <Vec<u32> as Tr>::A::f::<u8>(x);
+                local z = <u32>::MAX;
+                local f: func(a: i32, i32) -> heap::*u8 = g;
+            }
+        "}
+	);
+}
+
+// Disabled with the old `TIR::build` it drives: this checks that formatting
+// changes neither the diagnostics nor the body types of a program. Port it onto
+// the new `TypeContext` once function bodies are checked again.
+// #[test]
+// fn diagnostics_and_tir_types_survive_formatting() {
+// 	use std::collections::HashMap;
+// 	use wx_compiler::tir::TIR;
+// 	fn build(source: &str) -> (vfs::CompilationUnit, TIR) {
+// 		let mut builder = vfs::CompilationUnitBuilder::new();
+// 		builder.load_stdlib();
+// 		let root = builder
+// 			.load_binary(
+// 				vfs::AbsolutePath::new("/main.wx"),
+// 				&vfs::VirtualFileSource::new(HashMap::from([(
+// 					vfs::AbsolutePath::new("/main.wx"),
+// 					source.to_owned(),
+// 				)])),
+// 			)
+// 			.unwrap();
+// 		let mut graph = builder.build(root);
+// 		let tir = TIR::build(&mut graph);
+// 		(graph, tir)
+// 	}
+// 	for (source, invalid) in [
+// 		(
+// 			"func calculate() -> i32 { 1 } func f() { calculate(); } export { f }",
+// 			true,
+// 		),
+// 		(
+// 			"func effect() {} func f(flag: bool) -> i32 { if flag { effect() } else { effect() }; if flag { effect(); }; local x: i32 = 1; x } export { f }",
+// 			false,
+// 		),
+// 		(
+// 			"func f() -> i32 { local x: i32 = loop { break 1 }; x } export { f }",
+// 			false,
+// 		),
+// 		("func f() { local x: i32 = 1 } export { f }", false),
+// 	] {
+// 		let (_graph, before) = build(source);
+// 		if !invalid {
+// 			assert!(
+// 				!before.diagnostics.iter().any(|d| d
+// 					.code
+// 					.as_deref()
+// 					.is_some_and(|code| code.starts_with('E'))),
+// 				"{:#?}",
+// 				before.diagnostics
+// 			);
+// 		}
+// 		assert_eq!(
+// 			before.diagnostics.iter().any(|d| d.code.as_deref()
+// 				== Some(DiagnosticCode::UnusedValue.code())),
+// 			invalid,
+// 			"{:#?}",
+// 			before.diagnostics
+// 		);
+// 		for width in [30, 120] {
+// 			let output = checked_format(source, width, 4);
+// 			let (_, after) = build(&output);
+// 			let diagnostics = |tir: &TIR| {
+// 				tir.diagnostics
+// 					.iter()
+// 					.map(|d| (d.severity, d.code.clone(), d.message.clone()))
+// 					.collect::<Vec<_>>()
+// 			};
+// 			assert_eq!(diagnostics(&before), diagnostics(&after));
+// 			assert_eq!(
+// 				before
+// 					.items
+// 					.bodies
+// 					.iter()
+// 					.map(|b| b.block.ty)
+// 					.collect::<Vec<_>>(),
+// 				after
+// 					.items
+// 					.bodies
+// 					.iter()
+// 					.map(|b| b.block.ty)
+// 					.collect::<Vec<_>>()
+// 			);
+// 		}
+// 	}
+// }
