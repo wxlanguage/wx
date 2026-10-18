@@ -333,26 +333,17 @@ pub struct Package {
 	pub id: PackageId,
 	pub root: ModuleId,
 	pub kind: PackageKind,
-	/// The other packages *this* package may refer to, keyed by the name it
-	/// refers to them by — its own `dependencies` keys, plus the implicit
-	/// `std`.
+	/// The packages this package's manifest declares, by the key it
+	/// declares them under. A key only *makes a package available*: nothing
+	/// is nameable in the source until a `crate "<key>" as <alias>;` item
+	/// instantiates it, which is also what lets one package be instantiated
+	/// under several aliases, in any module. The implicit `std` is not
+	/// listed here; TIR binds it itself.
 	///
-	/// A name lives here, on the edge, rather than on the target: the same
+	/// A key lives here, on the edge, rather than on the target: the same
 	/// package can legitimately be `foo` here and `bar` in another package's
-	/// map, and no package has a name of its own at all. Nothing outside
-	/// this map can name a package, which is what keeps a transitive
-	/// dependency invisible to anyone who didn't declare it.
-	///
-	/// Read these as an implicit `mod <key>;` at the top of the package's
-	/// entry file — that's exactly the meaning TIR gives them, and why a
-	/// local `mod foo;` colliding with a key here is an ordinary
-	/// duplicate definition rather than an ambiguity to arbitrate.
+	/// map, and no package has a name of its own at all.
 	pub dependencies: HashMap<SymbolU32, PackageId>,
-	/// Inverse of [`Self::dependencies`]. Well-defined only because
-	/// [`CompilationUnitBuilder::add_dependency`] keeps the mapping
-	/// injective: a package is declared under exactly one name here, which
-	/// is what makes that name its canonical one — it has none of its own.
-	pub dependency_names: HashMap<PackageId, SymbolU32>,
 	pub entry_path: AbsolutePath,
 	pub modules: Vec<SourceModule>,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
@@ -536,53 +527,33 @@ impl CompilationUnitBuilder {
 		self.load_package(PackageKind::Binary, entry_path, file_source)
 	}
 
-	/// Records that `owner` refers to `dependency` by `name`, diagnosing a
-	/// collision itself rather than handing one back.
+	/// Records that `owner`'s manifest declares `dependency` under `name`.
 	///
-	/// A `dependencies` entry is a *declaration*, not an alias — it's what
-	/// introduces a package into the compilation, the way `mod foo;`
-	/// introduces a module. So the mapping is kept one-to-one in both
-	/// directions: declaring one package under two names is a duplicate
-	/// declaration, and a second name is spelled with an alias instead.
-	///
-	/// An existing binding always wins, which is what makes the seeded `std`
-	/// survive a manifest that tries to bind that name — the stdlib is
-	/// unreplaceable with no reserved-key check anywhere.
+	/// A key is a declaration of availability, not a binding, so the same
+	/// package may be declared under several keys. The one name that cannot
+	/// be a key is `std`: the stdlib is implicit in every package and not
+	/// replaceable, so a manifest trying to claim that name is diagnosed
+	/// and the declaration dropped.
 	pub fn add_dependency(
 		&mut self,
 		owner: PackageId,
 		name: SymbolU32,
 		dependency: PackageId,
 	) {
+		let is_std = self.strings.get_or_intern("std") == name;
 		let package = &mut self.packages[owner.as_usize()];
-		if let Some(existing) =
-			package.dependency_names.get(&dependency).copied()
-		{
-			let diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::PackageDeclaredTwice.code())
-				.with_message(format!(
-					"this package is already declared as `{}`, so it cannot \
-			 also be declared as `{}`",
-					self.strings.resolve(existing).unwrap(),
-					self.strings.resolve(name).unwrap(),
-				));
-			package.diagnostics.push(diagnostic);
-			return;
-		}
-		if package.dependencies.contains_key(&name) {
-			let diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::DuplicatePackageName.code())
-				.with_message(format!(
-					"the name `{}` is already used by another package this one \
-			 depends on",
-					self.strings.resolve(name).unwrap()
-				));
-			package.diagnostics.push(diagnostic);
+		if is_std {
+			package.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::ReservedPackageName.code())
+					.with_message(
+						"the name `std` is reserved for the standard library",
+					),
+			);
 			return;
 		}
 
 		package.dependencies.insert(name, dependency);
-		package.dependency_names.insert(dependency, name);
 	}
 
 	/// Loads a package starting from `entry_path`. Fails only if the entry
@@ -598,25 +569,6 @@ impl CompilationUnitBuilder {
 	) -> Result<PackageId, ()> {
 		let package_id = PackageId(self.packages.len() as u32);
 
-		// Every package can reach the stdlib under the name `std` without
-		// declaring it — seeded here rather than left to each caller so it
-		// cannot be forgotten, and seeded *before* any manifest key is
-		// inserted so that declaring `"std"` yourself collides with it
-		// instead of replacing it. `self.stdlib` is still `None` while the
-		// stdlib itself is being loaded, so it never depends on itself.
-		//
-		// Computed before the loader takes its `&mut self`.
-		let (dependencies, dependency_names) = match self.stdlib {
-			Some(stdlib) => {
-				let std = self.strings.get_or_intern("std");
-				(
-					HashMap::from([(std, stdlib)]),
-					HashMap::from([(stdlib, std)]),
-				)
-			}
-			None => (HashMap::new(), HashMap::new()),
-		};
-
 		let mut loader = Loader::new(self, package_id, file_source);
 		let root_owned_dir = entry_path.parent();
 		let root =
@@ -627,8 +579,7 @@ impl CompilationUnitBuilder {
 		let package_graph = Package {
 			id: package_id,
 			kind,
-			dependencies,
-			dependency_names,
+			dependencies: HashMap::new(),
 			root,
 			entry_path,
 			modules: loader.modules,
@@ -644,10 +595,7 @@ impl CompilationUnitBuilder {
 	/// exactly one provider of the language's `#[tag = "..."]` items — the
 	/// embedded stdlib, or the root package itself when it declares
 	/// `"type": "std"` — so a `CompilationUnit` without one isn't a state
-	/// worth representing. The stdlib is taken from the builder rather than
-	/// passed in, so the value that gets recorded is necessarily the same
-	/// one that was seeded into every package's dependencies; passing it
-	/// separately would let the two disagree.
+	///worth representing.
 	pub fn build(self, root_package: PackageId) -> CompilationUnit {
 		let stdlib_package = self.stdlib.expect(
 			"a stdlib must be established (`load_stdlib` or `set_stdlib`) \

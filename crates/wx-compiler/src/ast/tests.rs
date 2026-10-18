@@ -169,6 +169,7 @@ fn item_kind(item: &Item) -> &'static str {
 		Item::Const { .. } => "a const",
 		Item::Module { .. } => "an inline module",
 		Item::ModuleDeclaration { .. } => "a module declaration",
+		Item::Crate { .. } => "a crate item",
 		Item::Trait { .. } => "a trait",
 		Item::TypeSet { .. } => "a typeset",
 		Item::Use { .. } => "a use",
@@ -1859,6 +1860,80 @@ fn test_external_module_item() {
 
 	assert!(pub_span.is_none());
 	assert_eq!(case.strings.resolve(name.inner), Some("math"));
+}
+
+#[test]
+fn test_crate_items() {
+	let case = TestCase::new(indoc! {"
+        crate \"math\" as math;
+        pub crate \"math\" as math2;
+    "});
+
+	case.diagnostics().assert_none();
+
+	let Item::Crate {
+		pub_span,
+		package,
+		alias,
+	} = case.item(0)
+	else {
+		panic!("expected a crate item, got {}", item_kind(case.item(0)))
+	};
+	assert!(pub_span.is_none());
+	assert_eq!(case.strings.resolve(package.inner), Some("math"));
+	assert_eq!(
+		package
+			.span
+			.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		"\"math\"",
+		"the span keeps the quotes, the symbol does not"
+	);
+	assert_eq!(case.strings.resolve(alias.inner), Some("math"));
+
+	let Item::Crate {
+		pub_span, alias, ..
+	} = case.item(1)
+	else {
+		panic!("expected a crate item, got {}", item_kind(case.item(1)))
+	};
+	assert!(pub_span.is_some());
+	assert_eq!(case.strings.resolve(alias.inner), Some("math2"));
+}
+
+/// A crate item is an item like any other, so it is not limited to the
+/// package root.
+#[test]
+fn test_crate_item_in_a_nested_module() {
+	let case = TestCase::new(indoc! {"
+        mod outer {
+            mod inner {
+                pub crate \"math\" as math;
+            }
+        }
+    "});
+
+	case.diagnostics().assert_none();
+	let Item::Module { items, .. } = case.item(0) else {
+		panic!("expected a module")
+	};
+	let Item::Module { items, .. } = &items.inner[0].inner.inner else {
+		panic!("expected a nested module")
+	};
+	assert!(matches!(
+		items.inner[0].inner.inner,
+		Item::Crate {
+			pub_span: Some(_),
+			..
+		}
+	));
+}
+
+#[test]
+fn test_crate_item_requires_an_alias() {
+	let case = TestCase::new("crate \"math\";");
+
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingCrateAlias]);
 }
 
 #[test]

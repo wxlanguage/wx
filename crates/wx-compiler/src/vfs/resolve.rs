@@ -45,9 +45,9 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 /// directory. The embedded stdlib is loaded first, before the root and
 /// before any dependency, unless the root declares `"type": "std"` and so
 /// provides it itself. That is the whole of the implicit-`std` rule: the
-/// stdlib is not replaceable, so there is no override path and no
-/// reserved-key check — a dependency bound to the key `std` simply loses
-/// the first-claim-wins race and gets `DuplicatePackageName`.
+/// stdlib is not replaceable, so there is no override path: the name `std`
+/// is reserved, and a dependency declared under that key is diagnosed
+/// (`ReservedPackageName`) and dropped.
 ///
 /// `source` is shared, unchanged, across every package this resolves —
 /// correct today only because `Local` is the only `DependencySource`
@@ -293,7 +293,7 @@ fn report_std_package_as_dependency(key: &str) -> Diagnostic<FileId> {
 }
 
 /// No label: there's no specific span inside a `wx.json` to point at from
-/// here (see `DuplicatePackageName`'s own reasoning) — the message just
+/// here (see `report_std_package_as_dependency`'s own reasoning) — the message just
 /// names the dependency key whose edge closes the cycle.
 fn report_circular_dependency(key: &str) -> Diagnostic<FileId> {
 	Diagnostic::error()
@@ -385,10 +385,12 @@ mod tests {
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(compilation.packages.len(), 2, "root + std");
+		assert_ne!(compilation.stdlib_package, compilation.root_package);
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			Some(compilation.stdlib_package),
-			"every package can reach the stdlib without declaring it"
+			None,
+			"`std` is implicit, bound by TIR rather than listed as a \
+			 dependency"
 		);
 		let root = &compilation.packages[compilation.root_package.as_usize()];
 		assert!(matches!(root.kind, PackageKind::Binary));
@@ -447,11 +449,10 @@ mod tests {
 		);
 	}
 
-	/// The stdlib isn't replaceable, and this is how that's enforced: it's
-	/// loaded before anything else, so a dependency bound to `std` loses the
-	/// first-claim-wins race rather than needing a reserved-key check.
+	/// The stdlib isn't replaceable: `std` is a reserved name, so a
+	/// dependency declared under that key is diagnosed and dropped.
 	#[test]
-	fn dependency_bound_to_std_collides_with_the_stdlib() {
+	fn dependency_declared_as_std_is_reserved() {
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -475,13 +476,13 @@ mod tests {
 
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			Some(compilation.stdlib_package),
-			"the seeded stdlib holds the name; the declared one can't take it"
+			None,
+			"the declared package can't take the reserved name"
 		);
 
 		let diagnostics = compilation.collect_linker_diagnostics();
 		DiagnosticView::new("link", &diagnostics, &compilation.files)
-			.assert_error(DiagnosticCode::DuplicatePackageName);
+			.assert_error(DiagnosticCode::ReservedPackageName);
 	}
 
 	/// `"type": "std"` says "suppress the embedded stdlib for this
@@ -515,7 +516,7 @@ mod tests {
 		);
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			Some(compilation.stdlib_package),
+			None,
 			"a `std`-kind dependency does not become the stdlib provider"
 		);
 
@@ -524,20 +525,12 @@ mod tests {
 			.assert_error(DiagnosticCode::StdPackageAsDependency);
 	}
 
-	/// Inverted deliberately. Under the old model a name was a property of
-	/// the package, so two packages reached under the same key collided
-	/// globally. A name is now a property of the edge, so `app` calling `/x`
-	/// "libx" and `y` calling `/z` "libx" are two independent bindings in
-	/// two different maps — the whole point of edge-scoped names, and not
-	/// something to diagnose.
+	/// A `dependencies` key only makes a package available; the names the
+	/// source uses come from `crate` items. So reaching one package under
+	/// two keys is no longer a duplicate declaration — both keys are
+	/// available, and either can be instantiated under any alias.
 	#[test]
-	fn one_package_declared_under_two_names_is_diagnosed() {
-		// The inverse of `two_packages_may_use_the_same_key_for_different_
-		// targets`: there, two owners each bind `libx` to a target of their
-		// own, which is fine. Here one owner reaches the *same* package twice
-		// under different keys, which is not — a `dependencies` entry is a
-		// declaration, so the mapping is kept one-to-one in both directions
-		// and a second name has to be spelled with an alias instead.
+	fn one_package_may_be_declared_under_two_keys() {
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -560,17 +553,18 @@ mod tests {
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
-		let diagnostics = compilation.collect_linker_diagnostics();
-		DiagnosticView::new("link", &diagnostics, &compilation.files)
-			.assert_error(DiagnosticCode::PackageDeclaredTwice);
-
-		// The first key still binds — the package loaded, it just cannot be
-		// reached under both names.
-		assert!(
-			dependency_of(&compilation, compilation.root_package, "one")
-				.is_some(),
-			"the first declaration should still bind its name"
+		DiagnosticView::new(
+			"link",
+			&compilation.collect_linker_diagnostics(),
+			&compilation.files,
+		)
+		.assert_none();
+		let root = compilation.root_package;
+		assert_eq!(
+			dependency_of(&compilation, root, "one"),
+			dependency_of(&compilation, root, "two"),
 		);
+		assert!(dependency_of(&compilation, root, "one").is_some());
 	}
 
 	#[test]

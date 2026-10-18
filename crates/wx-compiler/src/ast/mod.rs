@@ -1822,6 +1822,16 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 	},
+	/// `crate "math" as math;` — instantiates the package the manifest
+	/// declares under the key `"math"` and binds it here as `math`. With
+	/// `pub`, whoever can see this module can also name the package through
+	/// it. Allowed in any module, not just a package's root.
+	Crate {
+		pub_span: Option<TextSpan>,
+		/// The manifest key, without its quotes; the span includes them.
+		package: Spanned<SymbolU32>,
+		alias: Spanned<SymbolU32>,
+	},
 	Trait {
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
@@ -1891,6 +1901,7 @@ impl Item {
 			| Item::ModuleDeclaration { .. }
 			| Item::TypeAlias { .. }
 			| Item::Struct { .. }
+			| Item::Crate { .. }
 			| Item::Use { .. } => false,
 		}
 	}
@@ -1918,6 +1929,7 @@ impl Item {
 			| Item::TraitImpl { .. }
 			| Item::Module { .. }
 			| Item::ModuleDeclaration { .. }
+			| Item::Crate { .. }
 			| Item::Use { .. } => {}
 		}
 	}
@@ -2388,6 +2400,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
 			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
+			Some(Keyword::Crate) => Ok(Parser::parse_crate_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
 			Some(Keyword::Typeset) => Ok(Parser::parse_typeset_item),
@@ -5868,6 +5881,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::TypeSet { pub_span: span, .. }
 			| Item::Memory { pub_span: span, .. }
 			| Item::TypeAlias { pub_span: span, .. }
+			| Item::Crate { pub_span: span, .. }
 			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
@@ -6197,6 +6211,61 @@ impl<'ctx> Parser<'ctx> {
 		Ok(Spanned {
 			inner: UseTree::Name { segment, alias },
 			span,
+		})
+	}
+
+	/// `crate "name" as alias;`. The trailing `;` is left for the caller, like
+	/// every other item's.
+	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
+		let crate_span = parser.lexer.next().span; // consume `crate`
+
+		let name_span = parser.next_expect(Token::String)?.span;
+		let quoted = name_span.extract_str(parser.source);
+		let package = Spanned {
+			inner: parser.strings.get_or_intern(
+				quoted
+					.strip_prefix('"')
+					.and_then(|text| text.strip_suffix('"'))
+					.unwrap_or(quoted),
+			),
+			span: name_span,
+		};
+
+		let token = parser.lexer.peek();
+		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
+			_ = parser.lexer.next(); // consume "as"
+			let alias_span = parser.next_expect(Token::Identifier)?.span;
+			Spanned {
+				inner: parser.intern_identifier(alias_span),
+				span: alias_span,
+			}
+		} else {
+			parser.ast.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::MissingCrateAlias.code())
+					.with_message("a crate item requires an `as` alias")
+					.with_label(
+						SourceSpan::new(parser.ast.file_id, token.span)
+							.primary_label()
+							.with_message("expected `as <name>` here"),
+					),
+			);
+			Spanned {
+				inner: Keyword::Error.symbol(),
+				span: TextSpan::new(token.span.start, token.span.start),
+			}
+		};
+
+		Ok(Spanned {
+			span: TextSpan::new(
+				crate_span.start,
+				name_span.end.max(alias.span.end),
+			),
+			inner: Item::Crate {
+				pub_span: None,
+				package,
+				alias,
+			},
 		})
 	}
 

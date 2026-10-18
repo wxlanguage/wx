@@ -53,6 +53,7 @@ define_text! {
 		Match   => "match ",
 		Enum    => "enum ",
 		Export  => "export ",
+		Crate   => "crate ",
 		Block   => "block ",
 		// keywords without trailing space
 		Break       => "break",
@@ -864,6 +865,22 @@ impl<'a> Builder<'a> {
 				body.as_deref(),
 				attributes,
 			),
+			ast::Item::Crate {
+				pub_span,
+				package,
+				alias,
+			} => {
+				let mut parts: Vec<NodeId> = Vec::new();
+				if pub_span.is_some() {
+					parts.push(self.text(Text::Pub));
+				}
+				parts.push(self.text(Text::Crate));
+				parts.push(self.source_text(package.span));
+				parts.push(self.text(Text::As));
+				parts.push(self.symbol(alias.inner));
+				parts.push(self.text(Text::Semi));
+				self.arena.concat(parts)
+			}
 			ast::Item::Use { tree, pub_span } => {
 				let mut items: Vec<NodeId> = Vec::new();
 				if pub_span.is_some() {

@@ -87,10 +87,10 @@ define_diagnostic_codes! {
 		// VFS diagnostics (E0xxx).
 		ModuleFileNotFound => "E0000",
 		AmbiguousModuleFile => "E0001",
-		DuplicatePackageName => "E0002",
+		ReservedPackageName => "E0002",
 		CircularDependency => "E0003",
 		StdPackageAsDependency => "E0004",
-		PackageDeclaredTwice => "E0005",
+
 		NestedModuleDeclaration => "E0006",
 
 		// AST diagnostics (E1xxx/W1xxx).
@@ -113,6 +113,7 @@ define_diagnostic_codes! {
 		MixedCallArguments => "E1018",
 		StructFieldsNeedParentheses => "E1019",
 		StructLiteralIsACall => "E1020",
+		MissingCrateAlias => "E1021",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 
@@ -235,6 +236,7 @@ define_diagnostic_codes! {
 		StructUsedAsValue => "E2110",
 		TypeArgumentsNotAllowed => "E2111",
 		AssocTypeEqualityMismatch => "E2112",
+		UnknownCrate => "E2113",
 	}
 }
 

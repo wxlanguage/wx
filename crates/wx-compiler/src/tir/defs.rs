@@ -37,6 +37,9 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// Always present, from `CompilationUnit::stdlib_package`.
 	stdlib_package: PackageId,
 	root_package: PackageId,
+	/// What a `crate "key" as alias;` item looks its key up in: each
+	/// package's manifest-declared dependencies.
+	packages: &'ast [Package],
 
 	namespaces: Namespaces,
 	modules: Vec<ModuleDef>,
@@ -57,6 +60,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	assoc_types: Vec<AssocTypeDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
+	crate_items: Vec<CrateItemDef>,
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports: HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
@@ -75,6 +79,28 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 
 index_newtype!(UsePathIndex);
 index_newtype!(UseItemIndex);
+index_newtype!(CrateItemIdx);
+
+/// One `crate "key" as alias;` item: an instantiation of a package.
+///
+/// Every item is its own instantiation site, so the same package named by
+/// two items (`crate "math" as a; crate "math" as b;`) is instantiated
+/// twice. Resolution does not yet tell the instances apart: both aliases
+/// bind the package's one namespace. This list is what a stage that must
+/// (emitting a separate copy of the package per item) walks instead.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct CrateItemDef {
+	pub file_id: FileId,
+	/// The scope the item was written in, where `alias` is bound.
+	pub namespace: Scope,
+	pub pub_span: Option<TextSpan>,
+	/// The manifest key as written; the span includes its quotes.
+	pub package_name: Spanned<SymbolU32>,
+	pub alias: Spanned<SymbolU32>,
+	/// The package `package_name` names, or `None` when the manifest
+	/// declares no such key (which is reported where the item is scanned).
+	pub package: Option<PackageId>,
+}
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -609,6 +635,7 @@ pub(super) struct DefinitionRegistry {
 	pub type_aliases: Vec<TypeAliasDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
+	pub crate_items: Vec<CrateItemDef>,
 	/// The `DefKey` of every language builtin recognized by name in the
 	/// stdlib package — primitive types (`u8`, `char`, ...) and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
@@ -1785,19 +1812,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				);
 			}
 
-			// TODO: I want to remove this later, the declaration should be defined in the crate itself
-			// Here's an example:
-			// crate foo;
-			// pub crate bar;
-			// We will use pub modifier here to set Visibility in that symbol
-			// right now it's just private, but in the future we could walk downstream the dependency chain
-			// this will be a neat way to expose peer dependencies
-			for (&name, &dependency_id) in package.dependencies.iter() {
+			// The stdlib is implicit in every package but its own provider.
+			// Every other dependency is named by a `crate` item, bound when
+			// that item is scanned.
+			if package.id != stdlib_package {
+				let std = strings.get_or_intern("std");
 				symbols.bindings.insert(
-					BindingKey::ty(name),
+					BindingKey::ty(std),
 					Binding::definition(
 						DefKey::new(
-							Namespace::Package(dependency_id),
+							Namespace::Package(stdlib_package),
 							LocalDefIdx::SELF,
 						),
 						Visibility::Public,
@@ -1820,6 +1844,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			files,
 			stdlib_package,
 			root_package,
+			packages,
 			imports: Vec::new(),
 			modules: Vec::new(),
 			traits: Vec::new(),
@@ -1836,6 +1861,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			assoc_types: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
+			crate_items: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: HashMap::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1890,6 +1916,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			assoc_types: builder.assoc_types,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
+			crate_items: builder.crate_items,
 			intrinsics: builder.intrinsics,
 			type_aliases: builder.type_aliases,
 		};
@@ -2259,16 +2286,90 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		collision_key: DefKey,
 		span: TextSpan,
 	) {
+		// A crate alias is bound to its package's root, which has no
+		// declaration of its own to point at; the `crate` item that bound
+		// it does.
+		let first = match self.namespaces.kind(collision_key) {
+			DefKind::Package(_) => self
+				.crate_items
+				.iter()
+				.find(|item| {
+					Namespace::from(item.namespace) == namespace
+						&& item.alias.inner == key.symbol
+				})
+				.map(|item| SourceSpan::new(item.file_id, item.alias.span)),
+			_ => None,
+		}
+		.unwrap_or_else(|| self.definition_span(collision_key));
 		self.diagnostics.push(
 			DuplicateDefinitionDiagnostic {
 				strings: self.strings,
 				key,
 				definitions: (
-					self.definition_span(collision_key),
+					first,
 					SourceSpan::new(self.namespaces.file_id(namespace), span),
 				),
 			}
 			.report(),
+		);
+	}
+
+	/// Records a `crate "key" as alias;` item and binds `alias` in its scope
+	/// to the package the manifest declares under `key`. The binding is as
+	/// visible as the item: private to the scope and everything inside it,
+	/// or public with `pub`, which lets a downstream package name the
+	/// dependency through this one.
+	fn scan_crate_item(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		pub_span: Option<TextSpan>,
+		package_name: Spanned<SymbolU32>,
+		alias: Spanned<SymbolU32>,
+	) {
+		let owner = self.namespaces.scope(namespace).package_id;
+		let package = self.packages[owner.as_usize()]
+			.dependencies
+			.get(&package_name.inner)
+			.copied();
+		self.crate_items.push(CrateItemDef {
+			file_id,
+			namespace,
+			pub_span,
+			package_name,
+			alias,
+			package,
+		});
+
+		let Some(package) = package else {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::UnknownCrate.code())
+					.with_message(format!(
+						"no dependency named `{}` is declared in `wx.json`",
+						self.strings.resolve(package_name.inner).unwrap(),
+					))
+					.with_label(
+						SourceSpan::new(file_id, package_name.span)
+							.primary_label()
+							.with_message("not a declared dependency"),
+					),
+			);
+			return;
+		};
+		// The alias of a malformed item was already reported by the parser.
+		if alias.inner == Keyword::Error.symbol() {
+			return;
+		}
+
+		self.insert_binding(
+			Namespace::from(namespace),
+			BindingKey::ty(alias.inner),
+			Binding::definition(
+				DefKey::new(Namespace::Package(package), LocalDefIdx::SELF),
+				Visibility::from(pub_span),
+			),
+			alias.span,
 		);
 	}
 
@@ -3351,6 +3452,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Use { tree, pub_span } => {
 				self.scan_use_tree(namespace, tree, None, *pub_span);
+			}
+			ast::Item::Crate {
+				pub_span,
+				package: package_name,
+				alias,
+			} => {
+				self.scan_crate_item(
+					file_id,
+					namespace,
+					*pub_span,
+					*package_name,
+					*alias,
+				);
 			}
 			ast::Item::Export { entry } => {
 				self.scan_export_entry(file_id, namespace, &entry.inner);
@@ -5433,5 +5547,228 @@ mod tests {
 			graph.root_package,
 		);
 		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
+
+	// ── `crate` items ────────────────────────────────────────────────────
+
+	/// A real project on virtual files: `/app` is the root, and every
+	/// `wx.json` is read, so a `crate` item looks its key up in an actual
+	/// manifest.
+	fn manifest_case(files: &[(&str, &str)]) -> TestCase {
+		let workspace = vfs::VirtualFileSource::new(
+			files
+				.iter()
+				.map(|(path, source)| {
+					(vfs::AbsolutePath::new(*path), source.to_string())
+				})
+				.collect(),
+		);
+		let graph =
+			vfs::open_manifest(vfs::AbsolutePath::new("/app"), &workspace)
+				.unwrap();
+		TestCase::from_graph(graph)
+	}
+
+	const APP_WITH_MATH: &str = r#"{
+		"type": "bin",
+		"entry": "main.wx",
+		"dependencies": { "math": { "type": "local", "path": "../math" } }
+	}"#;
+	const MATH_MANIFEST: &str = r#"{ "type": "lib", "entry": "main.wx" }"#;
+	const MATH_SOURCE: &str = "pub func add() {}";
+
+	#[test]
+	fn a_crate_item_binds_its_alias_to_the_declared_package() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			("/app/main.wx", r#"crate "math" as m;"#),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics().assert_none();
+
+		assert_eq!(case.defs.crate_items.len(), 1);
+		let item = &case.defs.crate_items[0];
+		assert_eq!(
+			case.graph.strings.resolve(item.package_name.inner),
+			Some("math")
+		);
+		assert_eq!(case.graph.strings.resolve(item.alias.inner), Some("m"));
+		assert!(item.package.is_some());
+
+		assert!(matches!(
+			case.resolve(Tier::Value, "m::add").expect_success(),
+			DefKind::Function(_)
+		));
+	}
+
+	/// The point of the item over the old implicit binding: one package can
+	/// be instantiated several times, each under an alias of its own.
+	#[test]
+	fn one_package_can_be_instantiated_under_several_aliases() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			(
+				"/app/main.wx",
+				r#"crate "math" as math; pub crate "math" as math2;"#,
+			),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics().assert_none();
+
+		assert_eq!(case.defs.crate_items.len(), 2);
+		assert_eq!(
+			case.defs.crate_items[0].package,
+			case.defs.crate_items[1].package
+		);
+		for path in ["math::add", "math2::add"] {
+			assert!(matches!(
+				case.resolve(Tier::Value, path).expect_success(),
+				DefKind::Function(_)
+			));
+		}
+	}
+
+	/// A manifest key only makes a package available. Without a `crate`
+	/// item nothing names it, which is what the implicit binding used to
+	/// do on every key.
+	#[test]
+	fn a_declared_dependency_is_not_nameable_without_a_crate_item() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			("/app/main.wx", "func main() {}"),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics().assert_none();
+
+		let result = case.resolve(Tier::Value, "math::add");
+		assert!(matches!(result.target(), BindingTarget::Error));
+		result
+			.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+	}
+
+	#[test]
+	fn a_crate_item_may_be_declared_in_a_nested_module() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			(
+				"/app/main.wx",
+				r#"mod outer { pub mod inner { pub crate "math" as m; } }"#,
+			),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics().assert_none();
+
+		assert!(matches!(
+			case.resolve(Tier::Value, "outer::inner::m::add")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+		// Bound in `inner`, not at the root.
+		let result = case.resolve(Tier::Value, "m::add");
+		assert!(matches!(result.target(), BindingTarget::Error));
+	}
+
+	#[test]
+	fn a_private_crate_item_is_not_visible_outside_its_module() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			("/app/main.wx", r#"pub mod inner { crate "math" as m; }"#),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics().assert_none();
+
+		case.resolve(Tier::Value, "inner::m::add")
+			.diagnostics()
+			.assert_error(DiagnosticCode::PrivateItem);
+	}
+
+	/// `pub crate` hands the dependency on: whoever depends on this package
+	/// can name it through the alias. Without `pub` they cannot.
+	#[test]
+	fn a_pub_crate_item_exposes_the_dependency_to_consumers() {
+		let app = r#"{
+			"type": "bin",
+			"entry": "main.wx",
+			"dependencies": { "mid": { "type": "local", "path": "../mid" } }
+		}"#;
+		let mid = r#"{
+			"type": "lib",
+			"entry": "main.wx",
+			"dependencies": { "math": { "type": "local", "path": "../math" } }
+		}"#;
+		let files = |mid_source: &'static str| {
+			vec![
+				("/app/wx.json", app),
+				("/app/main.wx", r#"crate "mid" as mid;"#),
+				("/mid/wx.json", mid),
+				("/mid/main.wx", mid_source),
+				("/math/wx.json", MATH_MANIFEST),
+				("/math/main.wx", MATH_SOURCE),
+			]
+		};
+
+		let mut public = manifest_case(&files(r#"pub crate "math" as math;"#));
+		public.diagnostics().assert_none();
+		assert!(matches!(
+			public
+				.resolve(Tier::Value, "mid::math::add")
+				.expect_success(),
+			DefKind::Function(_)
+		));
+
+		let mut private = manifest_case(&files(r#"crate "math" as math;"#));
+		private.diagnostics().assert_none();
+		private
+			.resolve(Tier::Value, "mid::math::add")
+			.diagnostics()
+			.assert_error(DiagnosticCode::PrivateItem);
+	}
+
+	#[test]
+	fn a_crate_item_naming_an_undeclared_dependency_is_an_error() {
+		let case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			("/app/main.wx", r#"crate "nope" as nope;"#),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+
+		case.diagnostics()
+			.assert_error(DiagnosticCode::UnknownCrate);
+		assert!(case.defs.crate_items[0].package.is_none());
+	}
+
+	#[test]
+	fn a_crate_alias_colliding_with_another_name_is_a_duplicate() {
+		let case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			("/app/main.wx", r#"crate "math" as m; struct m();"#),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+
+		case.diagnostics()
+			.assert_error(DiagnosticCode::DuplicateDefinition);
+	}
+
+	/// The stdlib stays implicit: `std` needs no `crate` item.
+	#[test]
+	fn std_is_bound_without_a_crate_item() {
+		let mut case = manifest_case(&[
+			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
+			("/app/main.wx", "func main() {}"),
+		]);
+		case.diagnostics().assert_none();
+
+		assert!(matches!(
+			case.resolve(Tier::Type, "std::Memory").expect_success(),
+			DefKind::Trait(_)
+		));
 	}
 }
