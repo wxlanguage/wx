@@ -3049,6 +3049,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 				kind @ (DefKind::Module(_)
 				| DefKind::Package(_)
+				| DefKind::Crate(_)
 				| DefKind::Import(_)
 				| DefKind::Trait(_)
 				| DefKind::TypeSet(_)) => {

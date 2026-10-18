@@ -806,6 +806,10 @@ pub enum DefKind {
 	Module(ModuleIdx),
 	Import(ImportIdx),
 	Package(PackageId),
+	/// A `crate "key" as alias;` item, the name it binds. What a path
+	/// continues into is the package it instantiates, which only
+	/// [`Namespaces::entered_by`] can say.
+	Crate(CrateItemIdx),
 	Enum(EnumIdx),
 	EnumVariant(ConstIdx),
 	Struct(StructIdx),
@@ -826,6 +830,7 @@ impl DefKind {
 			DefKind::Module(_) => "module",
 			DefKind::Import(_) => "import block",
 			DefKind::Package(_) => "package",
+			DefKind::Crate(_) => "crate",
 			DefKind::Enum(_) => "enum",
 			DefKind::EnumVariant(_) => "enum variant",
 			DefKind::Struct(_) => "struct",
@@ -849,6 +854,10 @@ impl DefKind {
 		let (file_id, name) = match self {
 			DefKind::Module(_) | DefKind::Import(_) | DefKind::Package(_) => {
 				return None;
+			}
+			DefKind::Crate(index) => {
+				let def = &defs.crate_items[usize::from(index)];
+				(def.file_id, def.alias)
 			}
 			DefKind::Enum(index) => {
 				let def = &defs.enums[usize::from(index)];
@@ -931,7 +940,8 @@ impl From<Scope> for Namespace {
 }
 
 impl Namespace {
-	/// The namespace `kind` lets a path continue walking into, if any.
+	/// The namespace `kind` lets a path continue walking into, if any. A
+	/// crate item needs a table to say; see [`Namespaces::entered_by`].
 	pub(super) fn of(kind: DefKind) -> Option<Self> {
 		Some(match kind {
 			DefKind::Package(package) => Self::Package(package),
@@ -1012,6 +1022,11 @@ pub struct Namespaces {
 	modules: Vec<ScopeTable>,
 	enums: Vec<SymbolTable>,
 	imports: Vec<SymbolTable>,
+	/// The package each crate item instantiates, indexed by
+	/// `CrateItemIdx`; `None` where the manifest declares no such key. Until
+	/// instances are told apart, what a crate item's alias leads into is its
+	/// package's own namespace.
+	crates: Vec<Option<PackageId>>,
 }
 
 /// The result of [`Namespaces::lookup`]/[`Namespaces::indirect_lookup`].
@@ -1263,6 +1278,17 @@ impl Namespaces {
 		self.symbols(def_key.namespace).items[usize::from(def_key.def_idx)].kind
 	}
 
+	/// The namespace a path continues into after `def_key`, if it names
+	/// one.
+	pub(super) fn entered_by(&self, def_key: DefKey) -> Option<Namespace> {
+		match self.kind(def_key) {
+			DefKind::Crate(index) => {
+				self.crates[usize::from(index)].map(Namespace::Package)
+			}
+			kind => Namespace::of(kind),
+		}
+	}
+
 	/// Whether `scope` is `ancestor` itself, or nested inside it.
 	pub(super) fn contains(&self, ancestor: Scope, scope: Scope) -> bool {
 		let mut current = Some(scope);
@@ -1472,7 +1498,8 @@ impl Namespaces {
 				target: binding.target,
 				visibility: binding.visibility,
 				import: match binding.source {
-					BindingSource::Definition => None,
+					BindingSource::Definition
+					| BindingSource::PoisonedCrate { .. } => None,
 					BindingSource::Import(import) => Some(import),
 				},
 			},
@@ -1512,6 +1539,12 @@ impl BindingTarget {
 enum BindingSource {
 	Definition,
 	Import(UseItemIndex),
+	/// The alias of a `crate` item whose key the manifest does not declare:
+	/// a binding with nothing behind it, kept only so the name does not
+	/// read as undeclared on top of the error already reported at the item.
+	PoisonedCrate {
+		alias: SourceSpan,
+	},
 }
 
 #[derive(Clone)]
@@ -1528,6 +1561,14 @@ impl Binding {
 			target: BindingTarget::Accessible(key),
 			visibility,
 			source: BindingSource::Definition,
+		}
+	}
+
+	fn poisoned_crate(visibility: Visibility, alias: SourceSpan) -> Self {
+		Self {
+			target: BindingTarget::Error,
+			visibility,
+			source: BindingSource::PoisonedCrate { alias },
 		}
 	}
 
@@ -1563,6 +1604,7 @@ impl Binding {
 				};
 				def_key.source_span(namespaces)
 			}
+			BindingSource::PoisonedCrate { alias } => alias,
 			BindingSource::Import(index) => {
 				let item = &use_items[usize::from(index)];
 				let span = match item.kind {
@@ -2286,27 +2328,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		collision_key: DefKey,
 		span: TextSpan,
 	) {
-		// A crate alias is bound to its package's root, which has no
-		// declaration of its own to point at; the `crate` item that bound
-		// it does.
-		let first = match self.namespaces.kind(collision_key) {
-			DefKind::Package(_) => self
-				.crate_items
-				.iter()
-				.find(|item| {
-					Namespace::from(item.namespace) == namespace
-						&& item.alias.inner == key.symbol
-				})
-				.map(|item| SourceSpan::new(item.file_id, item.alias.span)),
-			_ => None,
-		}
-		.unwrap_or_else(|| self.definition_span(collision_key));
 		self.diagnostics.push(
 			DuplicateDefinitionDiagnostic {
 				strings: self.strings,
 				key,
 				definitions: (
-					first,
+					self.definition_span(collision_key),
 					SourceSpan::new(self.namespaces.file_id(namespace), span),
 				),
 			}
@@ -2340,6 +2367,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			.dependencies
 			.get(&package_name.inner)
 			.copied();
+		let index =
+			CrateItemIdx::new(u32::try_from(self.crate_items.len()).unwrap());
 		self.crate_items.push(CrateItemDef {
 			file_id,
 			namespace,
@@ -2348,8 +2377,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			alias,
 			package,
 		});
+		self.namespaces.crates.push(package);
 
-		let Some(package) = package else {
+		if package.is_none() {
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::UnknownCrate.code())
@@ -2363,20 +2393,29 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							.with_message("not a declared dependency"),
 					),
 			);
-			return;
-		};
+		}
 		// The alias of a malformed item was already reported by the parser.
 		if alias.inner == Keyword::Error.symbol() {
 			return;
 		}
 
+		let visibility = Visibility::from(pub_span);
+		let binding = if package.is_some() {
+			let def_key = self.push_def(
+				Namespace::from(namespace),
+				ItemDef::new(DefKind::Crate(index), alias.span),
+			);
+			Binding::definition(def_key, visibility)
+		} else {
+			Binding::poisoned_crate(
+				visibility,
+				SourceSpan::new(file_id, alias.span),
+			)
+		};
 		self.insert_binding(
 			Namespace::from(namespace),
 			BindingKey::ty(alias.inner),
-			Binding::definition(
-				DefKey::new(Namespace::Package(package), LocalDefIdx::SELF),
-				Visibility::from(pub_span),
-			),
+			binding,
 			alias.span,
 		);
 	}
@@ -5736,7 +5775,7 @@ mod tests {
 
 	#[test]
 	fn a_crate_item_naming_an_undeclared_dependency_is_an_error() {
-		let case = manifest_case(&[
+		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
 			("/app/main.wx", r#"crate "nope" as nope;"#),
 			("/math/wx.json", MATH_MANIFEST),
@@ -5746,19 +5785,72 @@ mod tests {
 		case.diagnostics()
 			.assert_error(DiagnosticCode::UnknownCrate);
 		assert!(case.defs.crate_items[0].package.is_none());
+
+		// The alias is still bound, to a poisoned binding: a path through it
+		// ends in `Error` without a second diagnostic, since the one at the
+		// item already says what is wrong.
+		let result = case.resolve(Tier::Value, "nope::add");
+		assert!(matches!(result.target(), BindingTarget::Error));
+		result.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_crate_alias_colliding_with_another_name_is_a_duplicate() {
-		let case = manifest_case(&[
+		// Whichever is written first, the diagnostic points at both sites.
+		for source in [
+			r#"crate "math" as m; struct m();"#,
+			r#"struct m(); crate "math" as m;"#,
+		] {
+			let case = manifest_case(&[
+				("/app/wx.json", APP_WITH_MATH),
+				("/app/main.wx", source),
+				("/math/wx.json", MATH_MANIFEST),
+				("/math/main.wx", MATH_SOURCE),
+			]);
+
+			case.diagnostics()
+				.assert_error(DiagnosticCode::DuplicateDefinition);
+			let alias = case.defs.crate_items[0].alias.span;
+			let ranges: Vec<_> = case.diagnostics[0]
+				.labels
+				.iter()
+				.map(|label| label.range.clone())
+				.collect();
+			assert!(
+				ranges.contains(&(alias.start as usize..alias.end as usize)),
+				"{source}: no label on the crate alias, got {ranges:?}"
+			);
+		}
+	}
+
+	/// The alias is a definition of its own, so it has the declaration span
+	/// of every other definition, and a `use` can lead through it.
+	#[test]
+	fn a_crate_alias_is_a_definition_a_use_can_lead_through() {
+		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
-			("/app/main.wx", r#"crate "math" as m; struct m();"#),
+			("/app/main.wx", r#"crate "math" as m; use m::add;"#),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
 		]);
+		case.diagnostics().assert_none();
 
-		case.diagnostics()
-			.assert_error(DiagnosticCode::DuplicateDefinition);
+		let DefKind::Crate(index) =
+			case.resolve(Tier::Type, "m").expect_success()
+		else {
+			panic!("expected a crate item");
+		};
+		let item = &case.defs.crate_items[usize::from(index)];
+		let declared = DefKind::Crate(index).declared_at(&case.defs).unwrap();
+		assert_eq!(
+			(declared.file_id, declared.span),
+			(item.file_id, item.alias.span)
+		);
+
+		assert!(matches!(
+			case.resolve(Tier::Value, "add").expect_success(),
+			DefKind::Function(_)
+		));
 	}
 
 	/// The stdlib stays implicit: `std` needs no `crate` item.

@@ -258,7 +258,7 @@ impl<'r> PathResolver<'r> {
 						};
 					};
 					let Some(namespace) =
-						Namespace::of(self.defs.namespaces.kind(def_key))
+						self.defs.namespaces.entered_by(def_key)
 					else {
 						return PathResolution {
 							stopped_at: index as u32,

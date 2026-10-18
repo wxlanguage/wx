@@ -955,7 +955,7 @@ impl<'r> ImportResolver<'r> {
 			return Err(());
 		};
 
-		match Namespace::of(self.namespaces.kind(def_key)) {
+		match self.namespaces.entered_by(def_key) {
 			Some(namespace) => Ok(namespace),
 			None => {
 				let diagnostic = report_cannot_use_as_namespace(
