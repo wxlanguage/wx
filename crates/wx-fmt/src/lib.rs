@@ -58,7 +58,6 @@ define_text! {
 		Break       => "break",
 		Continue    => "continue",
 		Return      => "return",
-		Unreachable => "unreachable",
 		True        => "true",
 		False       => "false",
 		// punctuation
@@ -2353,7 +2352,6 @@ impl<'a> Builder<'a> {
 					self.build_block_content(statements, expression.span);
 				self.arena.concat2(keyword, content)
 			}
-			ast::Expression::Unreachable => self.text(Text::Unreachable),
 			ast::Expression::True => self.text(Text::True),
 			ast::Expression::False => self.text(Text::False),
 			ast::Expression::Placeholder => self.text(Text::Underscore),

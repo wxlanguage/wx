@@ -52,7 +52,7 @@
 //     }
 
 //     func clamp(self, min: Self, max: Self) -> Self {
-//         if min < max { unreachable };
+//         if min < max { trap() };
 //         if self < min { return min };
 //         if self > max { return max };
 //         self

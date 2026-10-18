@@ -2465,7 +2465,6 @@ fn test_keyword_expressions() {
         func f() -> bool {
             local t = true;
             local u = false;
-            local v = unreachable;
             return t;
         }
     "});
@@ -2480,13 +2479,9 @@ fn test_keyword_expressions() {
 		local_definition_value(statements, 1),
 		Expression::False
 	));
-	assert!(matches!(
-		local_definition_value(statements, 2),
-		Expression::Unreachable
-	));
 
 	// `return` carries an optional value
-	let Expression::Return { value } = statement_expression(statements, 3)
+	let Expression::Return { value } = statement_expression(statements, 2)
 	else {
 		panic!("expected a return")
 	};

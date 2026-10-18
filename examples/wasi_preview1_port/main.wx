@@ -564,7 +564,7 @@ impl Allocator for BumpAllocator {
         if new_end > cur_end {
             local needed =
                 (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-            if heap.grow(needed) == -1 { unreachable }
+            if heap.grow(needed) == -1 { trap() }
         }
         bump = new_end as *u8;
         ptr as *u8
@@ -576,7 +576,7 @@ func write_all(fd: Fd, bytes: &[u8]) {
     local io_vecs = alloc.alloc_slice::<&[u8]>(1);
     io_vecs[0] = bytes;
     local nwritten = alloc.alloc::<u32>(0);
-    if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+    if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { trap() };
 }
 
 // Decimal, not hex, so the demo output reads naturally; values here are all
@@ -605,7 +605,7 @@ func main() {
     // clock_time_get: a plain scalar (u64) out-param.
     local time_ptr = alloc.alloc::<u64>(0);
     if wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success {
-        unreachable
+        trap()
     };
     write_all(Fd::Stdout, "clock_time_get: ok\n");
 
@@ -619,7 +619,7 @@ func main() {
         fs_rights_inheriting: 0,
     }));
     if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success {
-        unreachable
+        trap()
     };
     write_all(Fd::Stdout, "fd_fdstat_get: fs_filetype=");
     write_decimal(Fd::Stdout, stat_ptr.*.fs_filetype as u32);

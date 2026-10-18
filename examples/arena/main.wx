@@ -74,7 +74,7 @@ impl<Idx> Iterator for RangeIter<Idx> {
         Idx,
     ) {
         local x = receiver.receive();
-        unreachable
+        trap()
     }
 }
 

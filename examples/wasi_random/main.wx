@@ -36,7 +36,7 @@ impl Allocator for BumpAllocator {
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
       local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-      if heap.grow(needed) == -1 { unreachable }
+      if heap.grow(needed) == -1 { trap() }
     }
     bump = new_end as *u8;
     ptr as *u8
@@ -50,7 +50,7 @@ func write_all(fd: FileDescriptor, bytes: &[u8]) {
   local io_vecs = alloc.alloc_slice::<&[u8]>(1);
   io_vecs[0] = bytes;
   local nwritten = alloc.alloc::<u32>(0);
-  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { trap() };
 }
 
 func hex_digit(nibble: u8) -> u8 {
@@ -60,7 +60,7 @@ func hex_digit(nibble: u8) -> u8 {
 func main() {
   local alloc: *BumpAllocator = std::ptr::null_mut();
   local random_bytes = alloc.alloc_slice::<u8>(RANDOM_BYTES);
-  if wasi::random_get(random_bytes) != Errno::Success { unreachable };
+  if wasi::random_get(random_bytes) != Errno::Success { trap() };
   
   // Two hex digits per random byte, plus a trailing newline.
   local text = alloc.alloc_slice::<u8>(RANDOM_BYTES * 2 + 1);

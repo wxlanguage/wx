@@ -53,7 +53,7 @@ impl Allocator for BumpAllocator<heap> {
 }
 
 func main() {
-    local bump: *BumpAllocator<heap> = unreachable;
+    local bump: *BumpAllocator<heap> = trap();
     local ptr = bump.alloc(Layout::{ size: 4, align: 1 });
 }
 

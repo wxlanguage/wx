@@ -2381,7 +2381,6 @@ fn executable_block_eligibility() {
 		("return 1;", "func f() {\n    return 1;\n}\n"),
 		("break 1", "func f() { break 1 }\n"),
 		("continue", "func f() { continue }\n"),
-		("unreachable", "func f() { unreachable }\n"),
 	] {
 		assert_eq!(
 			checked_format(
