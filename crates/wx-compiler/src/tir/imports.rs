@@ -1336,9 +1336,11 @@ mod tests {
 			name: &str,
 		) -> Namespace {
 			let key = self.expect_direct_def(namespace, Tier::Type, name);
-			let kind = key.symbol_kind(&self.defs);
-			Namespace::of(kind).unwrap_or_else(|| {
-				panic!("`{name}` is not a namespace: {kind:?}")
+			self.defs.namespaces.entered_by(key).unwrap_or_else(|| {
+				panic!(
+					"`{name}` is not a namespace: {:?}",
+					key.symbol_kind(&self.defs)
+				)
 			})
 		}
 

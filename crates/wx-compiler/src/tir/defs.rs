@@ -940,18 +940,6 @@ impl From<Scope> for Namespace {
 }
 
 impl Namespace {
-	/// The namespace `kind` lets a path continue walking into, if any. A
-	/// crate item needs a table to say; see [`Namespaces::entered_by`].
-	pub(super) fn of(kind: DefKind) -> Option<Self> {
-		Some(match kind {
-			DefKind::Package(package) => Self::Package(package),
-			DefKind::Module(module) => Self::Module(module),
-			DefKind::Enum(enum_index) => Self::Enum(enum_index),
-			DefKind::Import(import) => Self::Import(import),
-			_ => return None,
-		})
-	}
-
 	pub(super) fn as_scope(self) -> Option<Scope> {
 		match self {
 			Self::Package(package) => Some(Scope::Package(package)),
@@ -1278,15 +1266,22 @@ impl Namespaces {
 		self.symbols(def_key.namespace).items[usize::from(def_key.def_idx)].kind
 	}
 
-	/// The namespace a path continues into after `def_key`, if it names
-	/// one.
+	/// The namespace a path continues into after `def_key`: what `a::` names
+	/// when `a` is a package, a module, an enum, an import block or a crate
+	/// item. `None` for anything a path cannot continue through.
 	pub(super) fn entered_by(&self, def_key: DefKey) -> Option<Namespace> {
-		match self.kind(def_key) {
+		Some(match self.kind(def_key) {
+			DefKind::Package(package) => Namespace::Package(package),
+			DefKind::Module(module) => Namespace::Module(module),
+			DefKind::Enum(enum_index) => Namespace::Enum(enum_index),
+			DefKind::Import(import) => Namespace::Import(import),
+			// Until instances are told apart, a crate item leads into its
+			// package's own namespace.
 			DefKind::Crate(index) => {
-				self.crates[usize::from(index)].map(Namespace::Package)
+				Namespace::Package(self.crates[usize::from(index)]?)
 			}
-			kind => Namespace::of(kind),
-		}
+			_ => return None,
+		})
 	}
 
 	/// Whether `scope` is `ancestor` itself, or nested inside it.
@@ -3992,6 +3987,19 @@ mod tests {
 			)
 		}
 
+		/// The namespace the resolved definition leads into.
+		fn expect_namespace(&self) -> Namespace {
+			self.expect_success();
+			let BindingTarget::Accessible(key) = self.target else {
+				unreachable!("`expect_success` found an accessible definition")
+			};
+			self.case
+				.defs
+				.namespaces
+				.entered_by(key)
+				.expect("expected a namespace")
+		}
+
 		fn expect_success(&self) -> DefKind {
 			self.diagnostics().assert_none();
 			let BindingTarget::Accessible(key) = self.target else {
@@ -4144,8 +4152,7 @@ mod tests {
 		}
 
 		fn namespace(&mut self, path: &str) -> Namespace {
-			let kind = self.resolve(Tier::Type, path).expect_success();
-			Namespace::of(kind).expect("expected a namespace")
+			self.resolve(Tier::Type, path).expect_namespace()
 		}
 
 		fn scope(&mut self, path: &str) -> Scope {
@@ -5166,10 +5173,10 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let m = case.scope("m");
-		let inner_kind =
-			case.resolve_from(m, Tier::Type, "inner").expect_success();
-		let inner = Namespace::of(inner_kind)
-			.and_then(Namespace::as_scope)
+		let inner = case
+			.resolve_from(m, Tier::Type, "inner")
+			.expect_namespace()
+			.as_scope()
 			.unwrap();
 		let helper = case.graph.strings.get_or_intern("helper");
 
