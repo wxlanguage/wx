@@ -5470,6 +5470,47 @@ pub(super) mod tests {
 		}
 
 		#[test]
+		fn a_pub_memory_or_global_is_reachable_from_outside_its_module() {
+			test_case!(
+				case = &with_std(
+					"mod inner {
+						pub memory heap: u32;
+						pub global G: u32 = 0;
+						pub global mut M: u32 = 0;
+					}
+					use inner::heap;
+					use inner::G;
+					use inner::M;"
+				)
+			);
+			case.diagnostics().assert_none();
+		}
+
+		#[test]
+		fn a_private_memory_or_global_is_hidden_outside_its_module() {
+			test_case!(
+				case = &with_std(
+					"mod inner {
+						memory heap: u32;
+						global G: u32 = 0;
+					}
+					use inner::heap;
+					use inner::G;"
+				)
+			);
+			let messages: Vec<_> = case
+				.context
+				.diagnostics
+				.iter()
+				.map(|diagnostic| diagnostic.message.as_str())
+				.collect();
+			assert_eq!(
+				messages,
+				["memory `heap` is private", "global `G` is private"]
+			);
+		}
+
+		#[test]
 		fn a_constant_of_a_struct_containing_itself_is_not_evaluated() {
 			test_case!(
 				case = &with_std(

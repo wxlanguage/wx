@@ -1042,6 +1042,36 @@ fn test_format_inline_blocks() {
 }
 
 #[test]
+fn test_format_keeps_pub_on_memory_and_global() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+				trailing_comma: true,
+			},
+		)
+	};
+
+	assert_eq!(
+		fmt("pub memory heap: Memory32;"),
+		"pub memory heap: Memory32;\n"
+	);
+	assert_eq!(
+		fmt("#[memory_limits(min_pages = 4)] pub memory heap: Memory32;"),
+		"#[memory_limits(min_pages = 4)]\npub memory heap: Memory32;\n",
+	);
+	assert_eq!(
+		fmt("pub global mut g: u32 = 0;"),
+		"pub global mut g: u32 = 0;\n"
+	);
+}
+
+#[test]
 fn test_format_memory_config() {
 	let fmt = |src: &str| -> String {
 		let case = TestCase::new(src);

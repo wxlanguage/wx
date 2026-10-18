@@ -1801,6 +1801,7 @@ pub enum Item {
 		fields: Box<[Separated<Spanned<StructField>>]>,
 	},
 	Memory {
+		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		size: Box<Spanned<TypeExpression>>,
@@ -5865,14 +5866,14 @@ impl<'ctx> Parser<'ctx> {
 			| Item::ModuleDeclaration { pub_span: span, .. }
 			| Item::Trait { pub_span: span, .. }
 			| Item::TypeSet { pub_span: span, .. }
+			| Item::Memory { pub_span: span, .. }
 			| Item::TypeAlias { pub_span: span, .. }
 			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
 			| Item::Import { .. }
 			| Item::InherentImpl { .. }
-			| Item::TraitImpl { .. }
-			| Item::Memory { .. } => {
+			| Item::TraitImpl { .. } => {
 				parser.ast.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(
@@ -5907,6 +5908,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(memory_span.start, size.span.end);
 		Ok(Spanned {
 			inner: Item::Memory {
+				pub_span: None,
 				attributes: Box::new([]),
 				name,
 				size,

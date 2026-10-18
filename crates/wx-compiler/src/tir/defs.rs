@@ -2720,7 +2720,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::Memory { name, .. } => {
+			ast::Item::Memory { pub_span, name, .. } => {
 				let memory_index =
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
 				let (trait_impl_index, size_assoc_type_index) =
@@ -2736,7 +2736,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Namespace::from(namespace),
 					ItemDef::new(DefKind::Memory(memory_index), name.span),
 				);
-				let binding = Binding::definition(def_key, Visibility::Private);
+				let binding =
+					Binding::definition(def_key, Visibility::from(*pub_span));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,

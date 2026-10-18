@@ -580,16 +580,26 @@ fn test_pub_on_impl_assoc_type_is_recorded() {
 }
 
 #[test]
-fn test_pub_not_applicable_to_memory_item_recovers() {
+fn test_pub_memory_and_global_record_pub_span() {
 	let case = TestCase::new(indoc! {"
         pub memory MEM: u32;
-        func add(a: i32, b: i32) -> i32 { a + b }
+        pub global mut G: u32 = 0;
+        memory PRIVATE: u32;
     "});
 
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::VisibilityNotPermitted]);
-	assert!(matches!(case.item(0), Item::Memory { .. }));
-	assert!(matches!(case.item(1), Item::Function { .. }));
+	case.diagnostics().assert_none();
+	let Item::Memory { pub_span, .. } = case.item(0) else {
+		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
+	};
+	assert!(pub_span.is_some());
+	let Item::Global { pub_span, .. } = case.item(1) else {
+		panic!("item 1 is {}, not a global", item_kind(case.item(1)))
+	};
+	assert!(pub_span.is_some());
+	let Item::Memory { pub_span, .. } = case.item(2) else {
+		panic!("item 2 is {}, not a memory", item_kind(case.item(2)))
+	};
+	assert!(pub_span.is_none());
 }
 
 #[test]

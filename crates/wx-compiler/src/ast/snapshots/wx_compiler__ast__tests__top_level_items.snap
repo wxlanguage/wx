@@ -135,6 +135,7 @@ items:
   - inner:
       inner:
         Memory:
+          pub_span: ~
           attributes: []
           name:
             inner: 4

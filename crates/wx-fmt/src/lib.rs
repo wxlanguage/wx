@@ -737,6 +737,7 @@ impl<'a> Builder<'a> {
 				&entries.inner,
 			),
 			ast::Item::Memory {
+				pub_span,
 				name,
 				size,
 				attributes,
@@ -744,6 +745,9 @@ impl<'a> Builder<'a> {
 			} => {
 				let mut parts: Vec<NodeId> = Vec::new();
 				self.build_attributes(&mut parts, attributes);
+				if pub_span.is_some() {
+					parts.push(self.text(Text::Pub));
+				}
 				parts.push(self.text(Text::Memory));
 				parts.push(self.symbol(name.inner));
 				parts.push(self.text(Text::ColonSp));
