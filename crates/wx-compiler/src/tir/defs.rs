@@ -94,7 +94,7 @@ pub struct CrateItemDef {
 	/// The scope the item was written in, where `alias` is bound.
 	pub namespace: Scope,
 	pub pub_span: Option<TextSpan>,
-	/// The manifest key as written; the span includes its quotes.
+	/// The manifest key, decoded; the span covers the literal as written.
 	pub package_name: Spanned<SymbolU32>,
 	pub alias: Spanned<SymbolU32>,
 	/// The package `package_name` names, or `None` when the manifest
@@ -2324,9 +2324,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		file_id: FileId,
 		namespace: Scope,
 		pub_span: Option<TextSpan>,
-		package_name: Spanned<SymbolU32>,
+		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	) {
+		// A key that cannot be decoded was reported by `intern_string`.
+		let Ok(key) = self.intern_string(file_id, package) else {
+			return;
+		};
+		let package_name = Spanned {
+			inner: key,
+			span: package,
+		};
 		let owner = self.namespaces.scope(namespace).package_id;
 		let package = self.packages[owner.as_usize()]
 			.dependencies
@@ -3455,15 +3463,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Crate {
 				pub_span,
-				package: package_name,
+				package,
 				alias,
 			} => {
 				self.scan_crate_item(
-					file_id,
-					namespace,
-					*pub_span,
-					*package_name,
-					*alias,
+					file_id, namespace, *pub_span, *package, *alias,
 				);
 			}
 			ast::Item::Export { entry } => {

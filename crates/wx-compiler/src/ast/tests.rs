@@ -1880,13 +1880,10 @@ fn test_crate_items() {
 		panic!("expected a crate item, got {}", item_kind(case.item(0)))
 	};
 	assert!(pub_span.is_none());
-	assert_eq!(case.strings.resolve(package.inner), Some("math"));
 	assert_eq!(
-		package
-			.span
-			.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		package.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
 		"\"math\"",
-		"the span keeps the quotes, the symbol does not"
+		"the key stays as written, quotes included"
 	);
 	assert_eq!(case.strings.resolve(alias.inner), Some("math"));
 

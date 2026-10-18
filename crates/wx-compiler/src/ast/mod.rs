@@ -1828,8 +1828,8 @@ pub enum Item {
 	/// it. Allowed in any module, not just a package's root.
 	Crate {
 		pub_span: Option<TextSpan>,
-		/// The manifest key, without its quotes; the span includes them.
-		package: Spanned<SymbolU32>,
+		/// The raw quoted manifest key, decoded where it is resolved.
+		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	},
 	Trait {
@@ -6219,17 +6219,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let crate_span = parser.lexer.next().span; // consume `crate`
 
-		let name_span = parser.next_expect(Token::String)?.span;
-		let quoted = name_span.extract_str(parser.source);
-		let package = Spanned {
-			inner: parser.strings.get_or_intern(
-				quoted
-					.strip_prefix('"')
-					.and_then(|text| text.strip_suffix('"'))
-					.unwrap_or(quoted),
-			),
-			span: name_span,
-		};
+		let package = parser.next_expect(Token::String)?.span;
 
 		let token = parser.lexer.peek();
 		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
@@ -6259,7 +6249,7 @@ impl<'ctx> Parser<'ctx> {
 		Ok(Spanned {
 			span: TextSpan::new(
 				crate_span.start,
-				name_span.end.max(alias.span.end),
+				package.end.max(alias.span.end),
 			),
 			inner: Item::Crate {
 				pub_span: None,

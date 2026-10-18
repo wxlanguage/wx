@@ -337,8 +337,8 @@ pub struct Package {
 	/// declares them under. A key only *makes a package available*: nothing
 	/// is nameable in the source until a `crate "<key>" as <alias>;` item
 	/// instantiates it, which is also what lets one package be instantiated
-	/// under several aliases, in any module. The implicit `std` is not
-	/// listed here; TIR binds it itself.
+	/// under several aliases, in any module. The stdlib is registered here
+	/// first, as `std`, since every package depends on it.
 	///
 	/// A key lives here, on the edge, rather than on the target: the same
 	/// package can legitimately be `foo` here and `bar` in another package's
@@ -527,29 +527,30 @@ impl CompilationUnitBuilder {
 		self.load_package(PackageKind::Binary, entry_path, file_source)
 	}
 
-	/// Records that `owner`'s manifest declares `dependency` under `name`.
+	/// Records that `owner`'s manifest declares `dependency` under `name`,
+	/// diagnosing a collision itself rather than handing one back.
 	///
 	/// A key is a declaration of availability, not a binding, so the same
-	/// package may be declared under several keys. The one name that cannot
-	/// be a key is `std`: the stdlib is implicit in every package and not
-	/// replaceable, so a manifest trying to claim that name is diagnosed
-	/// and the declaration dropped.
+	/// package may be declared under several keys. Two declarations of one
+	/// *name* are different: nothing says which of them a `crate` item means.
+	/// An existing entry always wins, which is what makes the `std` registered
+	/// first survive a manifest that tries to use that name.
 	pub fn add_dependency(
 		&mut self,
 		owner: PackageId,
 		name: SymbolU32,
 		dependency: PackageId,
 	) {
-		let is_std = self.strings.get_or_intern("std") == name;
 		let package = &mut self.packages[owner.as_usize()];
-		if is_std {
-			package.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::ReservedPackageName.code())
-					.with_message(
-						"the name `std` is reserved for the standard library",
-					),
-			);
+		if package.dependencies.contains_key(&name) {
+			let diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::DuplicatePackageName.code())
+				.with_message(format!(
+					"the name `{}` is already used by another package this one \
+					 depends on",
+					self.strings.resolve(name).unwrap()
+				));
+			package.diagnostics.push(diagnostic);
 			return;
 		}
 
@@ -569,6 +570,21 @@ impl CompilationUnitBuilder {
 	) -> Result<PackageId, ()> {
 		let package_id = PackageId(self.packages.len() as u32);
 
+		// Every package depends on the stdlib, so it is registered first,
+		// under the name `std`, before any manifest key: declaring `"std"`
+		// yourself then collides with it instead of replacing it.
+		// `self.stdlib` is still `None` while the stdlib itself is being
+		// loaded, so it never depends on itself.
+		//
+		// Computed before the loader takes its `&mut self`.
+		let dependencies = match self.stdlib {
+			Some(stdlib) => {
+				let std = self.strings.get_or_intern("std");
+				HashMap::from([(std, stdlib)])
+			}
+			None => HashMap::new(),
+		};
+
 		let mut loader = Loader::new(self, package_id, file_source);
 		let root_owned_dir = entry_path.parent();
 		let root =
@@ -579,7 +595,7 @@ impl CompilationUnitBuilder {
 		let package_graph = Package {
 			id: package_id,
 			kind,
-			dependencies: HashMap::new(),
+			dependencies,
 			root,
 			entry_path,
 			modules: loader.modules,

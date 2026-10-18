@@ -45,9 +45,9 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 /// directory. The embedded stdlib is loaded first, before the root and
 /// before any dependency, unless the root declares `"type": "std"` and so
 /// provides it itself. That is the whole of the implicit-`std` rule: the
-/// stdlib is not replaceable, so there is no override path: the name `std`
-/// is reserved, and a dependency declared under that key is diagnosed
-/// (`ReservedPackageName`) and dropped.
+/// stdlib is not replaceable, so there is no override path and no
+/// reserved-key check — a dependency bound to the key `std` simply loses
+/// the first-claim-wins race and gets `DuplicatePackageName`.
 ///
 /// `source` is shared, unchanged, across every package this resolves —
 /// correct today only because `Local` is the only `DependencySource`
@@ -385,12 +385,10 @@ mod tests {
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
 		assert_eq!(compilation.packages.len(), 2, "root + std");
-		assert_ne!(compilation.stdlib_package, compilation.root_package);
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			None,
-			"`std` is implicit, bound by TIR rather than listed as a \
-			 dependency"
+			Some(compilation.stdlib_package),
+			"every package can reach the stdlib without declaring it"
 		);
 		let root = &compilation.packages[compilation.root_package.as_usize()];
 		assert!(matches!(root.kind, PackageKind::Binary));
@@ -449,10 +447,11 @@ mod tests {
 		);
 	}
 
-	/// The stdlib isn't replaceable: `std` is a reserved name, so a
-	/// dependency declared under that key is diagnosed and dropped.
+	/// The stdlib isn't replaceable, and this is how that's enforced: it's
+	/// registered before anything else, so a dependency bound to `std` loses
+	/// the first-claim-wins race rather than needing a reserved-key check.
 	#[test]
-	fn dependency_declared_as_std_is_reserved() {
+	fn dependency_bound_to_std_collides_with_the_stdlib() {
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -476,13 +475,13 @@ mod tests {
 
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			None,
-			"the declared package can't take the reserved name"
+			Some(compilation.stdlib_package),
+			"the stdlib holds the name; the declared one can't take it"
 		);
 
 		let diagnostics = compilation.collect_linker_diagnostics();
 		DiagnosticView::new("link", &diagnostics, &compilation.files)
-			.assert_error(DiagnosticCode::ReservedPackageName);
+			.assert_error(DiagnosticCode::DuplicatePackageName);
 	}
 
 	/// `"type": "std"` says "suppress the embedded stdlib for this
@@ -516,7 +515,7 @@ mod tests {
 		);
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
-			None,
+			Some(compilation.stdlib_package),
 			"a `std`-kind dependency does not become the stdlib provider"
 		);
 

@@ -87,7 +87,7 @@ define_diagnostic_codes! {
 		// VFS diagnostics (E0xxx).
 		ModuleFileNotFound => "E0000",
 		AmbiguousModuleFile => "E0001",
-		ReservedPackageName => "E0002",
+		DuplicatePackageName => "E0002",
 		CircularDependency => "E0003",
 		StdPackageAsDependency => "E0004",
 

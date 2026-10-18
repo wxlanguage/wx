@@ -875,7 +875,7 @@ impl<'a> Builder<'a> {
 					parts.push(self.text(Text::Pub));
 				}
 				parts.push(self.text(Text::Crate));
-				parts.push(self.source_text(package.span));
+				parts.push(self.source_text(*package));
 				parts.push(self.text(Text::As));
 				parts.push(self.symbol(alias.inner));
 				parts.push(self.text(Text::Semi));
