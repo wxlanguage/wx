@@ -60,7 +60,6 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	assoc_types: Vec<AssocTypeDef>,
 	use_items: Vec<UseItemDef>,
 	use_paths: Vec<UsePathSegment>,
-	crate_items: Vec<CrateItemDef>,
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports: HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
@@ -97,6 +96,11 @@ pub struct CrateItemDef {
 	/// The manifest key, decoded; the span covers the literal as written.
 	pub package_name: Spanned<SymbolU32>,
 	pub alias: Spanned<SymbolU32>,
+	/// The package `package_name` names, or `None` when the manifest
+	/// declares no such key (which is reported where the item is scanned).
+	/// Until instances are told apart, what the alias leads into is this
+	/// package's own namespace.
+	pub package: Option<PackageId>,
 }
 
 #[derive(Clone, Copy)]
@@ -632,7 +636,6 @@ pub(super) struct DefinitionRegistry {
 	pub type_aliases: Vec<TypeAliasDef>,
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
-	pub crate_items: Vec<CrateItemDef>,
 	/// The `DefKey` of every language builtin recognized by name in the
 	/// stdlib package — primitive types (`u8`, `char`, ...) and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
@@ -853,7 +856,7 @@ impl DefKind {
 				return None;
 			}
 			DefKind::Crate(index) => {
-				let def = &defs.crate_items[usize::from(index)];
+				let def = &defs.namespaces.crate_items()[usize::from(index)];
 				(def.file_id, def.alias)
 			}
 			DefKind::Enum(index) => {
@@ -1007,12 +1010,10 @@ pub struct Namespaces {
 	modules: Vec<ScopeTable>,
 	enums: Vec<SymbolTable>,
 	imports: Vec<SymbolTable>,
-	/// The package each crate item instantiates, indexed by `CrateItemIdx`;
-	/// `None` where the manifest declares no such key (reported where the
-	/// item is scanned). This is the one place the mapping is kept: it is
-	/// what the item's alias leads into, which until instances are told
-	/// apart is the package's own namespace.
-	crates: Vec<Option<PackageId>>,
+	/// Every `crate` item, indexed by `CrateItemIdx`. Held here because what
+	/// a crate item's alias leads into is part of how a path walks, and the
+	/// item says which package that is.
+	crate_items: Vec<CrateItemDef>,
 }
 
 /// The result of [`Namespaces::lookup`]/[`Namespaces::indirect_lookup`].
@@ -1264,9 +1265,8 @@ impl Namespaces {
 		self.symbols(def_key.namespace).items[usize::from(def_key.def_idx)].kind
 	}
 
-	/// The package a crate item instantiates, if the manifest declares its key.
-	pub fn crate_package(&self, index: CrateItemIdx) -> Option<PackageId> {
-		self.crates[usize::from(index)]
+	pub fn crate_items(&self) -> &[CrateItemDef] {
+		&self.crate_items
 	}
 
 	/// The namespace a path continues into after `def_key`: what `a::` names
@@ -1280,9 +1280,9 @@ impl Namespaces {
 			DefKind::Import(import) => Namespace::Import(import),
 			// Until instances are told apart, a crate item leads into its
 			// package's own namespace.
-			DefKind::Crate(index) => {
-				Namespace::Package(self.crate_package(index)?)
-			}
+			DefKind::Crate(index) => Namespace::Package(
+				self.crate_items[usize::from(index)].package?,
+			),
 			_ => return None,
 		})
 	}
@@ -1902,7 +1902,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			assoc_types: Vec::new(),
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
-			crate_items: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: HashMap::new(),
 			intrinsics: IntrinsicDefs::default(),
@@ -1957,7 +1956,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			assoc_types: builder.assoc_types,
 			use_items: builder.use_items,
 			use_paths: builder.use_paths,
-			crate_items: builder.crate_items,
 			intrinsics: builder.intrinsics,
 			type_aliases: builder.type_aliases,
 		};
@@ -2366,16 +2364,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			.dependencies
 			.get(&package_name.inner)
 			.copied();
-		let index =
-			CrateItemIdx::new(u32::try_from(self.crate_items.len()).unwrap());
-		self.crate_items.push(CrateItemDef {
+		let index = CrateItemIdx::new(
+			u32::try_from(self.namespaces.crate_items.len()).unwrap(),
+		);
+		self.namespaces.crate_items.push(CrateItemDef {
 			file_id,
 			namespace,
 			pub_span,
 			package_name,
 			alias,
+			package,
 		});
-		self.namespaces.crates.push(package);
 
 		if package.is_none() {
 			self.diagnostics.push(
@@ -5637,19 +5636,14 @@ mod tests {
 		]);
 		case.diagnostics().assert_none();
 
-		assert_eq!(case.defs.crate_items.len(), 1);
-		let item = &case.defs.crate_items[0];
+		assert_eq!(case.defs.namespaces.crate_items().len(), 1);
+		let item = &case.defs.namespaces.crate_items()[0];
 		assert_eq!(
 			case.graph.strings.resolve(item.package_name.inner),
 			Some("math")
 		);
 		assert_eq!(case.graph.strings.resolve(item.alias.inner), Some("m"));
-		assert!(
-			case.defs
-				.namespaces
-				.crate_package(CrateItemIdx::new(0))
-				.is_some()
-		);
+		assert!(item.package.is_some());
 
 		assert!(matches!(
 			case.resolve(Tier::Value, "m::add").expect_success(),
@@ -5672,12 +5666,9 @@ mod tests {
 		]);
 		case.diagnostics().assert_none();
 
-		assert_eq!(case.defs.crate_items.len(), 2);
-		let namespaces = &case.defs.namespaces;
-		assert_eq!(
-			namespaces.crate_package(CrateItemIdx::new(0)),
-			namespaces.crate_package(CrateItemIdx::new(1))
-		);
+		assert_eq!(case.defs.namespaces.crate_items().len(), 2);
+		let items = case.defs.namespaces.crate_items();
+		assert_eq!(items[0].package, items[1].package);
 		for path in ["math::add", "math2::add"] {
 			assert!(matches!(
 				case.resolve(Tier::Value, path).expect_success(),
@@ -5797,12 +5788,7 @@ mod tests {
 
 		case.diagnostics()
 			.assert_error(DiagnosticCode::UnknownCrate);
-		assert!(
-			case.defs
-				.namespaces
-				.crate_package(CrateItemIdx::new(0))
-				.is_none()
-		);
+		assert!(case.defs.namespaces.crate_items()[0].package.is_none());
 
 		// The alias is still bound, to a poisoned binding: a path through it
 		// ends in `Error` without a second diagnostic, since the one at the
@@ -5828,7 +5814,7 @@ mod tests {
 
 			case.diagnostics()
 				.assert_error(DiagnosticCode::DuplicateDefinition);
-			let alias = case.defs.crate_items[0].alias.span;
+			let alias = case.defs.namespaces.crate_items()[0].alias.span;
 			let ranges: Vec<_> = case.diagnostics[0]
 				.labels
 				.iter()
@@ -5858,7 +5844,7 @@ mod tests {
 		else {
 			panic!("expected a crate item");
 		};
-		let item = &case.defs.crate_items[usize::from(index)];
+		let item = &case.defs.namespaces.crate_items()[usize::from(index)];
 		let declared = DefKind::Crate(index).declared_at(&case.defs).unwrap();
 		assert_eq!(
 			(declared.file_id, declared.span),
