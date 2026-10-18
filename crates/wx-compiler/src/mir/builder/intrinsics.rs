@@ -824,6 +824,10 @@ impl<'tir> Builder<'tir> {
 					ty: ValueType::Unit,
 				}
 			}
+			"trap" => Expression {
+				kind: ExprKind::Unreachable,
+				ty: self.lower_type_index(expr_ty),
+			},
 			name => unreachable!("cannot lower unknown intrinsic `{name}`"),
 		}
 	}

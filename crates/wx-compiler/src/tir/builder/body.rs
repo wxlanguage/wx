@@ -649,11 +649,6 @@ impl<'ast> Builder<'ast, '_> {
 				ty: TypeIndex::FLOAT,
 				span: expr.span,
 			}),
-			ast::Expression::Unreachable => Ok(Expression {
-				kind: ExprKind::Unreachable,
-				ty: TypeIndex::NEVER,
-				span: expr.span,
-			}),
 			ast::Expression::True => Ok(Expression {
 				kind: ExprKind::Bool { value: true },
 				ty: TypeIndex::BOOL,

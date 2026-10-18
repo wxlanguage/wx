@@ -1141,8 +1141,6 @@ pub enum Expression {
 	Loop {
 		block: Box<Spanned<Expression>>,
 	},
-	/// `unreachable`
-	Unreachable,
 	/// `true`
 	True,
 	/// `false`
@@ -2072,7 +2070,6 @@ define_keywords! {
 	If => "if",
 	Else => "else",
 	As => "as",
-	Unreachable => "unreachable",
 	True => "true",
 	False => "false",
 	Impl => "impl",
@@ -3398,10 +3395,6 @@ impl<'ctx> Parser<'ctx> {
 					)),
 					Ok(Keyword::Continue) => Some((
 						Parser::parse_continue_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Unreachable) => Some((
-						Parser::parse_unreachable_expression,
 						BindingPower::Primary,
 					)),
 					Ok(Keyword::True) => Some((
@@ -5076,16 +5069,6 @@ impl<'ctx> Parser<'ctx> {
 				attributes: Box::new([]),
 			},
 			span,
-		})
-	}
-
-	fn parse_unreachable_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let unreachable_keyword = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::Unreachable,
-			span: unreachable_keyword.span,
 		})
 	}
 

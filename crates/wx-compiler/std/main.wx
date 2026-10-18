@@ -1,105 +1,83 @@
-#[intrinsic]
 pub type i8;
 
-#[intrinsic]
 pub type u8;
 
-#[intrinsic]
 pub type i16;
 
-#[intrinsic]
 pub type u16;
 
-#[intrinsic]
 pub type i32;
 
-#[intrinsic]
 pub type u32;
 
-#[intrinsic]
 pub type i64;
 
-#[intrinsic]
 pub type u64;
 
-#[intrinsic]
 pub type f32;
 
-#[intrinsic]
 pub type f64;
 
-#[intrinsic]
 pub type bool;
 
-#[intrinsic]
 pub type char;
 
-#[tag = "Add"]
+/// Aborts execution by trapping: normal control flow never continues past a
+/// call to `trap`, so it has the bottom type `!`.
+pub func trap() -> !;
+
 pub trait Add {
     func add(self, rhs: Self) -> Self;
 }
 
-#[tag = "Sub"]
 pub trait Sub {
     func sub(self, rhs: Self) -> Self;
 }
 
-#[tag = "Mul"]
 pub trait Mul {
     func mul(self, rhs: Self) -> Self;
 }
 
-#[tag = "Div"]
 pub trait Div {
     func div(self, rhs: Self) -> Self;
 }
 
-#[tag = "Rem"]
 pub trait Rem {
     func rem(self, rhs: Self) -> Self;
 }
 
-#[tag = "Neg"]
 pub trait Neg {
     func neg(self) -> Self;
 }
 
-#[tag = "BitAnd"]
 pub trait BitAnd {
     func bitand(self, rhs: Self) -> Self;
 }
 
-#[tag = "BitOr"]
 pub trait BitOr {
     func bitor(self, rhs: Self) -> Self;
 }
 
-#[tag = "BitXor"]
 pub trait BitXor {
     func bitxor(self, rhs: Self) -> Self;
 }
 
-#[tag = "Shl"]
 pub trait Shl {
     func shl(self, rhs: Self) -> Self;
 }
 
-#[tag = "Shr"]
 pub trait Shr {
     func shr(self, rhs: Self) -> Self;
 }
 
-#[tag = "BitNot"]
 pub trait BitNot {
     func bitnot(self) -> Self;
 }
 
-#[tag = "Not"]
 pub trait Not {
     func not(self) -> Self;
 }
 
-#[tag = "PartialEq"]
 pub trait PartialEq {
     func eq(self, other: Self) -> bool;
 
@@ -111,7 +89,6 @@ pub trait PartialEq {
 
 pub trait Eq: PartialEq {}
 
-#[tag = "PartialOrd"]
 pub trait PartialOrd: PartialEq {
     func lt(self, other: Self) -> bool;
 
@@ -197,368 +174,249 @@ pub trait Ord: PartialOrd + Eq {
 
     #[inline]
     func clamp(self, min: Self, max: Self) -> Self {
-        if max < min { unreachable };
+        if max < min { trap() };
         if self < min { return min };
         if self > max { return max };
         self
     }
 }
 
-#[intrinsic]
 pub func slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
-#[intrinsic]
 pub func slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
-#[intrinsic]
 pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
 
-#[intrinsic]
 pub func i64_extend_i32(value: i32) -> i64;
 
-#[intrinsic]
 pub func u64_extend_u32(value: u32) -> u64;
 
-#[intrinsic]
 pub func i32_wrap_i64(value: i64) -> i32;
 
-#[intrinsic]
 pub func f32_sqrt(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_sqrt(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_abs(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_abs(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_floor(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_floor(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_ceil(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_ceil(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_trunc(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_trunc(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_nearest(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_nearest(value: f64) -> f64;
 
-#[intrinsic]
 pub func f32_min(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_min(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func f32_max(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_max(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func f32_copysign(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_copysign(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func i32_neg(value: i32) -> i32;
 
-#[intrinsic]
 pub func i64_neg(value: i64) -> i64;
 
-#[intrinsic]
 pub func f32_neg(value: f32) -> f32;
 
-#[intrinsic]
 pub func f64_neg(value: f64) -> f64;
 
-#[intrinsic]
 pub func i32_add(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_add(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func f32_add(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_add(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func i32_sub(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_sub(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func f32_sub(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_sub(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func i32_mul(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_mul(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func f32_mul(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_mul(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func i32_div(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func u32_div(a: u32, b: u32) -> u32;
 
-#[intrinsic]
 pub func i64_div(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func u64_div(a: u64, b: u64) -> u64;
 
-#[intrinsic]
 pub func f32_div(a: f32, b: f32) -> f32;
 
-#[intrinsic]
 pub func f64_div(a: f64, b: f64) -> f64;
 
-#[intrinsic]
 pub func i32_rem(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func u32_rem(a: u32, b: u32) -> u32;
 
-#[intrinsic]
 pub func i64_rem(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func u64_rem(a: u64, b: u64) -> u64;
 
-#[intrinsic]
 pub func i32_bitand(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_bitand(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func i32_bitor(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_bitor(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func i32_bitxor(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_bitxor(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func i32_shl(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func i64_shl(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func i32_shr(a: i32, b: i32) -> i32;
 
-#[intrinsic]
 pub func u32_shr(a: u32, b: u32) -> u32;
 
-#[intrinsic]
 pub func i64_shr(a: i64, b: i64) -> i64;
 
-#[intrinsic]
 pub func u64_shr(a: u64, b: u64) -> u64;
 
-#[intrinsic]
 pub func i32_bitnot(value: i32) -> i32;
 
-#[intrinsic]
 pub func i64_bitnot(value: i64) -> i64;
 
-#[intrinsic]
 pub func i32_eqz(value: i32) -> bool;
 
-#[intrinsic]
 pub func i32_eq(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func i64_eq(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func f32_eq(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_eq(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func i32_ne(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func i64_ne(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func f32_ne(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_ne(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func i32_lt(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func u32_lt(a: u32, b: u32) -> bool;
 
-#[intrinsic]
 pub func i64_lt(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func u64_lt(a: u64, b: u64) -> bool;
 
-#[intrinsic]
 pub func f32_lt(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_lt(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func i32_le(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func u32_le(a: u32, b: u32) -> bool;
 
-#[intrinsic]
 pub func i64_le(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func u64_le(a: u64, b: u64) -> bool;
 
-#[intrinsic]
 pub func f32_le(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_le(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func i32_gt(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func u32_gt(a: u32, b: u32) -> bool;
 
-#[intrinsic]
 pub func i64_gt(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func u64_gt(a: u64, b: u64) -> bool;
 
-#[intrinsic]
 pub func f32_gt(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_gt(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func i32_ge(a: i32, b: i32) -> bool;
 
-#[intrinsic]
 pub func u32_ge(a: u32, b: u32) -> bool;
 
-#[intrinsic]
 pub func i64_ge(a: i64, b: i64) -> bool;
 
-#[intrinsic]
 pub func u64_ge(a: u64, b: u64) -> bool;
 
-#[intrinsic]
 pub func f32_ge(a: f32, b: f32) -> bool;
 
-#[intrinsic]
 pub func f64_ge(a: f64, b: f64) -> bool;
 
-#[intrinsic]
 pub func f32_convert_i32(value: i32) -> f32;
 
-#[intrinsic]
 pub func f32_convert_u32(value: u32) -> f32;
 
-#[intrinsic]
 pub func f32_convert_i64(value: i64) -> f32;
 
-#[intrinsic]
 pub func f32_convert_u64(value: u64) -> f32;
 
-#[intrinsic]
 pub func f64_convert_i32(value: i32) -> f64;
 
-#[intrinsic]
 pub func f64_convert_u32(value: u32) -> f64;
 
-#[intrinsic]
 pub func f64_convert_i64(value: i64) -> f64;
 
-#[intrinsic]
 pub func f64_convert_u64(value: u64) -> f64;
 
-#[intrinsic]
 pub func i32_trunc_f32(value: f32) -> i32;
 
-#[intrinsic]
 pub func u32_trunc_f32(value: f32) -> u32;
 
-#[intrinsic]
 pub func i32_trunc_f64(value: f64) -> i32;
 
-#[intrinsic]
 pub func u32_trunc_f64(value: f64) -> u32;
 
-#[intrinsic]
 pub func i64_trunc_f32(value: f32) -> i64;
 
-#[intrinsic]
 pub func u64_trunc_f32(value: f32) -> u64;
 
-#[intrinsic]
 pub func i64_trunc_f64(value: f64) -> i64;
 
-#[intrinsic]
 pub func u64_trunc_f64(value: f64) -> u64;
 
-#[intrinsic]
 pub func f64_promote_f32(value: f32) -> f64;
 
-#[intrinsic]
 pub func f32_demote_f64(value: f64) -> f32;
 
-#[intrinsic]
 pub func i32_reinterpret_f32(value: f32) -> i32;
 
-#[intrinsic]
 pub func f32_reinterpret_i32(value: i32) -> f32;
 
-#[intrinsic]
 pub func i64_reinterpret_f64(value: f64) -> i64;
 
-#[intrinsic]
 pub func f64_reinterpret_i64(value: i64) -> f64;
 
 impl f32 {
@@ -2108,23 +1966,19 @@ impl SignedInt for i64 {
 
 /// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
-#[intrinsic]
 pub func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
 /// Returns the current size of `mem` in pages. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/size
-#[intrinsic]
 pub func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 /// This is analogous to `memset` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
-#[intrinsic]
 pub func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
 /// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
-#[intrinsic]
 pub func memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
@@ -2133,10 +1987,8 @@ pub func memory_copy<
 
 pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
 
-#[intrinsic]
 func global_get<G: Global>(g: G) -> G::Value;
 
-#[intrinsic]
 func global_set<G: Global>(g: G, value: G::Value);
 
 pub trait ValueType {}
@@ -2197,10 +2049,8 @@ pub trait Call {
 
 pub trait Function: Call {}
 
-#[intrinsic]
 pub func size_of<T, Mem: Memory>() -> Mem::Size;
 
-#[intrinsic]
 pub func align_of<T, Mem: Memory>() -> Mem::Size;
 
 pub struct Layout<Mem: Memory>(

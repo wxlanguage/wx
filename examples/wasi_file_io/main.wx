@@ -68,7 +68,7 @@ impl Allocator for BumpAllocator {
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
       local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-      if heap.grow(needed) == -1 { unreachable }
+      if heap.grow(needed) == -1 { trap() }
     }
     bump = new_end as *u8;
     ptr as *u8
@@ -80,7 +80,7 @@ func write_all(fd: FileDescriptor, bytes: &[u8]) {
   local io_vecs = alloc.alloc_slice::<&[u8]>(1);
   io_vecs[0] = bytes;
   local nwritten = alloc.alloc::<u32>(0);
-  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { unreachable };
+  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { trap() };
 }
 
 func main() {
@@ -97,11 +97,11 @@ func main() {
     0,
     created_fd_ptr,
   );
-  if create_result != Errno::Success { unreachable };
+  if create_result != Errno::Success { trap() };
 
   local created_fd = created_fd_ptr.* as FileDescriptor;
   write_all(created_fd, "Hello from wx, written straight to disk!\n");
-  if wasi::fd_close(created_fd) != Errno::Success { unreachable };
+  if wasi::fd_close(created_fd) != Errno::Success { trap() };
 
   local read_fd_ptr = alloc.alloc::<u32>(0);
   local open_result = wasi::path_open(
@@ -114,15 +114,15 @@ func main() {
     0,
     read_fd_ptr,
   );
-  if open_result != Errno::Success { unreachable };
+  if open_result != Errno::Success { trap() };
 
   local read_fd = read_fd_ptr.* as FileDescriptor;
   local buf = alloc.alloc_slice::<u8>(256);
   local io_vecs = alloc.alloc_slice::<*[u8]>(1);
   io_vecs[0] = buf;
   local nread = alloc.alloc::<u32>(0);
-  if wasi::fd_read(read_fd, io_vecs, nread) != Errno::Success { unreachable };
-  if wasi::fd_close(read_fd) != Errno::Success { unreachable };
+  if wasi::fd_read(read_fd, io_vecs, nread) != Errno::Success { trap() };
+  if wasi::fd_close(read_fd) != Errno::Success { trap() };
 
   write_all(FileDescriptor::Stdout, slice_from_parts(buf.ptr(), nread.*));
 }
