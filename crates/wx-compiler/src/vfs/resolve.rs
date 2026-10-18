@@ -525,7 +525,7 @@ mod tests {
 	}
 
 	/// A `dependencies` key only makes a package available; the names the
-	/// source uses come from `crate` items. So reaching one package under
+	/// source uses come from package instances. So reaching one package under
 	/// two keys is no longer a duplicate declaration — both keys are
 	/// available, and either can be instantiated under any alias.
 	#[test]

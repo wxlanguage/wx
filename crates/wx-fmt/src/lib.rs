@@ -865,7 +865,7 @@ impl<'a> Builder<'a> {
 				body.as_deref(),
 				attributes,
 			),
-			ast::Item::Crate {
+			ast::Item::PackageInstance {
 				pub_span,
 				package,
 				alias,

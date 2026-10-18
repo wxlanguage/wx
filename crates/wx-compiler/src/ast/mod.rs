@@ -1822,11 +1822,11 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 	},
-	/// `crate "math" as math;` — instantiates the package the manifest
+	/// A package instance, `crate "math" as math;` — instantiates the package the manifest
 	/// declares under the key `"math"` and binds it here as `math`. With
 	/// `pub`, whoever can see this module can also name the package through
 	/// it. Allowed in any module, not just a package's root.
-	Crate {
+	PackageInstance {
 		pub_span: Option<TextSpan>,
 		/// The raw quoted manifest key, decoded where it is resolved.
 		package: TextSpan,
@@ -1901,7 +1901,7 @@ impl Item {
 			| Item::ModuleDeclaration { .. }
 			| Item::TypeAlias { .. }
 			| Item::Struct { .. }
-			| Item::Crate { .. }
+			| Item::PackageInstance { .. }
 			| Item::Use { .. } => false,
 		}
 	}
@@ -1929,7 +1929,7 @@ impl Item {
 			| Item::TraitImpl { .. }
 			| Item::Module { .. }
 			| Item::ModuleDeclaration { .. }
-			| Item::Crate { .. }
+			| Item::PackageInstance { .. }
 			| Item::Use { .. } => {}
 		}
 	}
@@ -2400,7 +2400,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
 			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
-			Some(Keyword::Crate) => Ok(Parser::parse_crate_item),
+			Some(Keyword::Crate) => Ok(Parser::parse_package_instance),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
 			Some(Keyword::Typeset) => Ok(Parser::parse_typeset_item),
@@ -5881,7 +5881,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::TypeSet { pub_span: span, .. }
 			| Item::Memory { pub_span: span, .. }
 			| Item::TypeAlias { pub_span: span, .. }
-			| Item::Crate { pub_span: span, .. }
+			| Item::PackageInstance { pub_span: span, .. }
 			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
@@ -6216,7 +6216,9 @@ impl<'ctx> Parser<'ctx> {
 
 	/// `crate "name" as alias;`. The trailing `;` is left for the caller, like
 	/// every other item's.
-	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
+	fn parse_package_instance(
+		parser: &mut Parser,
+	) -> Result<Spanned<Item>, ()> {
 		let crate_span = parser.lexer.next().span; // consume `crate`
 
 		let package = parser.next_expect(Token::String)?.span;
@@ -6232,8 +6234,8 @@ impl<'ctx> Parser<'ctx> {
 		} else {
 			parser.ast.diagnostics.push(
 				Diagnostic::error()
-					.with_code(DiagnosticCode::MissingCrateAlias.code())
-					.with_message("a crate item requires an `as` alias")
+					.with_code(DiagnosticCode::MissingPackageAlias.code())
+					.with_message("a package instance requires an `as` alias")
 					.with_label(
 						SourceSpan::new(parser.ast.file_id, token.span)
 							.primary_label()
@@ -6251,7 +6253,7 @@ impl<'ctx> Parser<'ctx> {
 				crate_span.start,
 				package.end.max(alias.span.end),
 			),
-			inner: Item::Crate {
+			inner: Item::PackageInstance {
 				pub_span: None,
 				package,
 				alias,

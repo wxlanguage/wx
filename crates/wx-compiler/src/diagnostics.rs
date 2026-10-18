@@ -113,7 +113,7 @@ define_diagnostic_codes! {
 		MixedCallArguments => "E1018",
 		StructFieldsNeedParentheses => "E1019",
 		StructLiteralIsACall => "E1020",
-		MissingCrateAlias => "E1021",
+		MissingPackageAlias => "E1021",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 
@@ -236,7 +236,7 @@ define_diagnostic_codes! {
 		StructUsedAsValue => "E2110",
 		TypeArgumentsNotAllowed => "E2111",
 		AssocTypeEqualityMismatch => "E2112",
-		UnknownCrate => "E2113",
+		UnknownPackage => "E2113",
 	}
 }
 

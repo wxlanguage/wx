@@ -2688,7 +2688,7 @@ two" }"#,
 
 /// Forms that exist only in the current syntax, each written the way the
 /// formatter should leave it: a single `export`, `use` globs and groups,
-/// crate items, structs with unnamed fields, patterns that mirror construction, calls by
+/// package instances, structs with unnamed fields, patterns that mirror construction, calls by
 /// name, memory-tagged and qualified paths, and an associated type default.
 #[test]
 fn test_format_current_syntax_forms() {

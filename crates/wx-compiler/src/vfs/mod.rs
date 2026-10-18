@@ -335,9 +335,9 @@ pub struct Package {
 	pub kind: PackageKind,
 	/// The packages this package's manifest declares, by the key it
 	/// declares them under. A key only *makes a package available*: nothing
-	/// is nameable in the source until a `crate "<key>" as <alias>;` item
-	/// instantiates it, which is also what lets one package be instantiated
-	/// under several aliases, in any module. The stdlib is registered here
+	/// is nameable in the source until a package instance,
+	/// `crate "<key>" as <alias>;`, instantiates it, which is also what lets
+	/// one package be instantiated under several aliases, in any module. The stdlib is registered here
 	/// first, as `std`, since every package depends on it.
 	///
 	/// A key lives here, on the edge, rather than on the target: the same
@@ -532,7 +532,7 @@ impl CompilationUnitBuilder {
 	///
 	/// A key is a declaration of availability, not a binding, so the same
 	/// package may be declared under several keys. Two declarations of one
-	/// *name* are different: nothing says which of them a `crate` item means.
+	/// *name* are different: nothing says which of them a package instance means.
 	/// An existing entry always wins, which is what makes the `std` registered
 	/// first survive a manifest that tries to use that name.
 	pub fn add_dependency(

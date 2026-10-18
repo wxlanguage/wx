@@ -169,7 +169,7 @@ fn item_kind(item: &Item) -> &'static str {
 		Item::Const { .. } => "a const",
 		Item::Module { .. } => "an inline module",
 		Item::ModuleDeclaration { .. } => "a module declaration",
-		Item::Crate { .. } => "a crate item",
+		Item::PackageInstance { .. } => "a package instance",
 		Item::Trait { .. } => "a trait",
 		Item::TypeSet { .. } => "a typeset",
 		Item::Use { .. } => "a use",
@@ -1863,7 +1863,7 @@ fn test_external_module_item() {
 }
 
 #[test]
-fn test_crate_items() {
+fn test_package_instances() {
 	let case = TestCase::new(indoc! {"
         crate \"math\" as math;
         pub crate \"math\" as math2;
@@ -1871,13 +1871,16 @@ fn test_crate_items() {
 
 	case.diagnostics().assert_none();
 
-	let Item::Crate {
+	let Item::PackageInstance {
 		pub_span,
 		package,
 		alias,
 	} = case.item(0)
 	else {
-		panic!("expected a crate item, got {}", item_kind(case.item(0)))
+		panic!(
+			"expected a package instance, got {}",
+			item_kind(case.item(0))
+		)
 	};
 	assert!(pub_span.is_none());
 	assert_eq!(
@@ -1887,20 +1890,23 @@ fn test_crate_items() {
 	);
 	assert_eq!(case.strings.resolve(alias.inner), Some("math"));
 
-	let Item::Crate {
+	let Item::PackageInstance {
 		pub_span, alias, ..
 	} = case.item(1)
 	else {
-		panic!("expected a crate item, got {}", item_kind(case.item(1)))
+		panic!(
+			"expected a package instance, got {}",
+			item_kind(case.item(1))
+		)
 	};
 	assert!(pub_span.is_some());
 	assert_eq!(case.strings.resolve(alias.inner), Some("math2"));
 }
 
-/// A crate item is an item like any other, so it is not limited to the
+/// A package instance is an item like any other, so it is not limited to the
 /// package root.
 #[test]
-fn test_crate_item_in_a_nested_module() {
+fn test_package_instance_in_a_nested_module() {
 	let case = TestCase::new(indoc! {"
         mod outer {
             mod inner {
@@ -1918,7 +1924,7 @@ fn test_crate_item_in_a_nested_module() {
 	};
 	assert!(matches!(
 		items.inner[0].inner.inner,
-		Item::Crate {
+		Item::PackageInstance {
 			pub_span: Some(_),
 			..
 		}
@@ -1926,11 +1932,11 @@ fn test_crate_item_in_a_nested_module() {
 }
 
 #[test]
-fn test_crate_item_requires_an_alias() {
+fn test_package_instance_requires_an_alias() {
 	let case = TestCase::new("crate \"math\";");
 
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::MissingCrateAlias]);
+		.assert_codes(&[DiagnosticCode::MissingPackageAlias]);
 }
 
 #[test]
