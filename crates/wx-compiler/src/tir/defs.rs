@@ -97,9 +97,6 @@ pub struct CrateItemDef {
 	/// The manifest key, decoded; the span covers the literal as written.
 	pub package_name: Spanned<SymbolU32>,
 	pub alias: Spanned<SymbolU32>,
-	/// The package `package_name` names, or `None` when the manifest
-	/// declares no such key (which is reported where the item is scanned).
-	pub package: Option<PackageId>,
 }
 
 #[derive(Clone, Copy)]
@@ -1010,10 +1007,11 @@ pub struct Namespaces {
 	modules: Vec<ScopeTable>,
 	enums: Vec<SymbolTable>,
 	imports: Vec<SymbolTable>,
-	/// The package each crate item instantiates, indexed by
-	/// `CrateItemIdx`; `None` where the manifest declares no such key. Until
-	/// instances are told apart, what a crate item's alias leads into is its
-	/// package's own namespace.
+	/// The package each crate item instantiates, indexed by `CrateItemIdx`;
+	/// `None` where the manifest declares no such key (reported where the
+	/// item is scanned). This is the one place the mapping is kept: it is
+	/// what the item's alias leads into, which until instances are told
+	/// apart is the package's own namespace.
 	crates: Vec<Option<PackageId>>,
 }
 
@@ -1266,6 +1264,11 @@ impl Namespaces {
 		self.symbols(def_key.namespace).items[usize::from(def_key.def_idx)].kind
 	}
 
+	/// The package a crate item instantiates, if the manifest declares its key.
+	pub fn crate_package(&self, index: CrateItemIdx) -> Option<PackageId> {
+		self.crates[usize::from(index)]
+	}
+
 	/// The namespace a path continues into after `def_key`: what `a::` names
 	/// when `a` is a package, a module, an enum, an import block or a crate
 	/// item. `None` for anything a path cannot continue through.
@@ -1278,7 +1281,7 @@ impl Namespaces {
 			// Until instances are told apart, a crate item leads into its
 			// package's own namespace.
 			DefKind::Crate(index) => {
-				Namespace::Package(self.crates[usize::from(index)]?)
+				Namespace::Package(self.crate_package(index)?)
 			}
 			_ => return None,
 		})
@@ -2371,7 +2374,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			pub_span,
 			package_name,
 			alias,
-			package,
 		});
 		self.namespaces.crates.push(package);
 
@@ -5642,7 +5644,12 @@ mod tests {
 			Some("math")
 		);
 		assert_eq!(case.graph.strings.resolve(item.alias.inner), Some("m"));
-		assert!(item.package.is_some());
+		assert!(
+			case.defs
+				.namespaces
+				.crate_package(CrateItemIdx::new(0))
+				.is_some()
+		);
 
 		assert!(matches!(
 			case.resolve(Tier::Value, "m::add").expect_success(),
@@ -5666,9 +5673,10 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		assert_eq!(case.defs.crate_items.len(), 2);
+		let namespaces = &case.defs.namespaces;
 		assert_eq!(
-			case.defs.crate_items[0].package,
-			case.defs.crate_items[1].package
+			namespaces.crate_package(CrateItemIdx::new(0)),
+			namespaces.crate_package(CrateItemIdx::new(1))
 		);
 		for path in ["math::add", "math2::add"] {
 			assert!(matches!(
@@ -5789,7 +5797,12 @@ mod tests {
 
 		case.diagnostics()
 			.assert_error(DiagnosticCode::UnknownCrate);
-		assert!(case.defs.crate_items[0].package.is_none());
+		assert!(
+			case.defs
+				.namespaces
+				.crate_package(CrateItemIdx::new(0))
+				.is_none()
+		);
 
 		// The alias is still bound, to a poisoned binding: a path through it
 		// ends in `Error` without a second diagnostic, since the one at the
