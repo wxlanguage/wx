@@ -52,7 +52,7 @@ Changed, because the rest of TIR moved on:
 | --- | --- |
 | Boxed `Expression` tree, `Result<Expression, ()>` (a failure drops the node) | Arena, failures are `ExprKind::Error` nodes typed `ERROR` |
 | `accesses: Vec<..>` on locals, labels, items | `NameResolutions`; add `Referent::Local` |
-| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx` with a `scope` field; a label is a field of its scope; typing state per scope stays in the checker |
+| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx` with a `scope` field; labels stay their own arena (`Body::labels`, a scope points at one); typing state per scope stays in the checker |
 | `EvalMode::{Comptime, Runtime}` deciding whether operators dispatch | Gone already: scalars always get builtin nodes, the evaluator folds them |
 | Generic call inference via `infer_type_args` + `substitute_expected_type` + `type_satisfies_annotation` | `meet`/`learn` (struct construction already uses them) |
 | Bound checks via `check_bounds(BoundOrigin, ..)` | `record_bounds_check` + `check_now` |
@@ -89,6 +89,7 @@ so one tree serves both. The lifetime and ownership analyses designed in
 ```rust
 index_newtype!(ScopeIdx);
 index_newtype!(LocalIdx);
+index_newtype!(LabelIdx);
 
 /// One lexical block. Scope 0 is the body's root: a function's parameters
 /// live there and `return` jumps out of it. A constant's or global's
@@ -96,8 +97,8 @@ index_newtype!(LocalIdx);
 struct Scope {
     kind: ScopeKind,
     parent: Option<ScopeIdx>,
-    /// `outer: loop { .. }`, `outer: block { .. }`.
-    label: Option<Spanned<SymbolU32>>,
+    /// `outer: loop { .. }`, `outer: block { .. }`, `outer: if .. { .. }`.
+    label: Option<LabelIdx>,
     span: TextSpan,
 }
 
@@ -120,7 +121,13 @@ struct Local {
     scope: ScopeIdx,
 }
 
-// Body gains: scopes: Vec<Scope>, locals: Vec<Local>
+/// A written block label, as the old `BlockLabel`. One label can name two
+/// scopes: both branches of a labelled `if`/`else` point at it.
+struct Label {
+    name: Spanned<SymbolU32>,
+}
+
+// Body gains: scopes: Vec<Scope>, locals: Vec<Local>, labels: Vec<Label>
 ```
 
 **Two orders, one per arena.** A scope is allocated when the checker *enters*
@@ -140,7 +147,10 @@ ExprKind::Return   { value: Option<ExprIdx> }                    // leaves scope
 ```
 
 A statement is just an expression; `Let` is the one statement-only kind. A
-labelled block or loop is an ordinary `Block`/`Loop` whose scope has a label.
+labelled block or loop is an ordinary `Block`/`Loop` whose scope points at a
+label. A labelled `if` pushes one label and gives both branch scopes that
+`LabelIdx`, as `build_label_expression` did; a `break :outer` inside a branch
+leaves that branch's scope, which ends the `if`.
 `return` keeps its own kind, since MIR emits it differently, but is typed by
 the same rule as a `break` out of scope 0.
 
@@ -182,11 +192,14 @@ Leaving a block needs no cleanup: lookups start from `current`, and a sibling
 block has a different `ScopeIdx`. A name that is not a local falls through to
 the namespace walk.
 
-Labels resolve the same way: walk up from `current` to the first scope with
-that label (`break :outer`), the nearest `Loop` (`break`, `continue`), or the
-root (`return`), and record `Referent::Label { owner, scope }` at the use. Old
-`BlockLabel` existed only to keep its `accesses` list, which is what
-`NameResolutions` now holds.
+Labels resolve the same way, as the old `ExprContext::resolve_label` did: walk
+up from `current` to the first scope whose label has that name (`break :outer`),
+giving `(ScopeIdx, LabelIdx)`; the jump stores the scope and the use records
+`Referent::Label { owner: BodyOwner, label: LabelIdx }`. An unlabelled `break`
+or `continue` takes the nearest `Loop`, `return` the root. The label's old
+`accesses: Vec<TextSpan>` is that resolution entry now, so the checker keeps
+only a `used: Vec<bool>` beside `labels` for the unused-label warning
+(`report_stack_warnings`'s check), rather than scanning the table.
 
 For comparison, rustc keeps the same facts, spread over a few phases. Name
 resolution uses ribs. HIR records each `break` target as the id of the
