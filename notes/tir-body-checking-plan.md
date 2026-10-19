@@ -368,14 +368,24 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 
 ### 2. Moderate (needs a small design decision, listed in the section)
 
-- **Method calls** `x.m(..)` and **type-relative paths** `T::f`, `Self::CONST`,
-  `<T as Tr>::f`, `heap::DATA_END`: `resolve_applicable_member` with a value
-  key, then `select_trait_member`. Decision: how the impl's own parameters are
-  inferred from the receiver for `impl<T> Wrapper<T> { func m(self) }`. Proposal:
-  `learn` the impl's frame from the impl target against the receiver type (the
-  same walk `learn` does for a field), then the method's own frame from its
-  arguments. A trait-owned constant on an abstract receiver needs a node of its
-  own (`AbstractConst { receiver, const_index }`), as in the old checker.
+- **Type-relative paths** (functions done): `Ordering::of`, `Self::f`, `T::f`,
+  `W::<u8>::new`, `<T>::f` and `<T as Tr>::f` (`typecheck/members.rs`). A value
+  path starting at a type parameter or `Self` names a type from its first
+  segment; any other walks the namespace graph and continues past the type it
+  stops at (an enum is such a stop for a name it does not bind). The member is
+  found by `resolve_applicable_member` (or the named trait alone), and becomes
+  a `Callee`: the function, its leading type arguments (the impl's, from
+  `match_impl_target` or `find_trait_impl`; `[Self]` for a trait's
+  declaration) and whether it is reached directly or abstractly. The call then
+  learns the function's own arguments as any call does. An inherent member is
+  as visible as written, a trait's member as the trait. Open: associated
+  constants (a trait's on an abstract receiver needs a node of its own, as in
+  the old checker), `Self` as a value (`Self(..)`), and a generic type named
+  without its arguments (`Layout::of::<T>()`), which needs the impl selected by
+  its constructor with the bounds proved after the call learns the arguments.
+- **Method calls** `x.m(..)`: the same `Callee`, with the checked receiver as
+  the first argument. No auto-deref; a `self: M::*Self` method is found on the
+  pointee when the receiver is that pointer.
 - **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.

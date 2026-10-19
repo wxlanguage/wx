@@ -36,9 +36,9 @@ use super::bounds::{
 };
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
-	DefId, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier, TraitIdx,
-	TraitImplIdx, TypesetIdx,
+	DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx,
+	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
+	TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
@@ -2838,7 +2838,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	}
 
 	/// Resolve both ordinary type paths and explicit memory tags.
-	fn resolve_type_path(
+	pub(super) fn resolve_type_path(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
 		scope: LexicalScope,
@@ -2938,17 +2938,209 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				));
 			}
 
-			let resolved = match def_key.symbol_kind(self.defs) {
-				// An intrinsic alias takes no arguments: it is a primitive,
-				// not an alias with an empty parameter list.
-				kind @ DefKind::TypeAlias(type_alias_index)
-					if !stopped.type_args.is_empty()
-						&& self
-							.defs
-							.intrinsics
-							.identity_of(type_alias_index)
-							.is_some() =>
-				{
+			let resolved = self.resolve_named_type(
+				obligations,
+				scope,
+				def_key,
+				stopped,
+				infer_policy,
+			);
+
+			(resolved, walk.stopped_at as usize + 1)
+		};
+
+		// Whatever's left continues through impl dispatch or a
+		// bound instead of the scope.namespace graph — `members.rs`'s
+		// job, not this module's.
+		self.resolve_type_member_path(
+			obligations,
+			scope,
+			current,
+			&segments[next..],
+			infer_policy,
+		)
+	}
+
+	/// The type a definition a path stopped at names, with the arguments
+	/// written on its segment (`stopped`): a struct, enum, alias, memory,
+	/// global or function. Anything else is reported as not a type.
+	pub(super) fn resolve_named_type(
+		&mut self,
+		obligations: &mut Vec<Obligation>,
+		scope: LexicalScope,
+		def_key: DefKey,
+		stopped: &ast::PathSegment,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		match def_key.symbol_kind(self.defs) {
+			// An intrinsic alias takes no arguments: it is a primitive,
+			// not an alias with an empty parameter list.
+			kind @ DefKind::TypeAlias(type_alias_index)
+				if !stopped.type_args.is_empty()
+					&& self
+						.defs
+						.intrinsics
+						.identity_of(type_alias_index)
+						.is_some() =>
+			{
+				// Resolved only to report what is wrong inside them.
+				for arg in &stopped.type_args {
+					self.resolve_type_expression(
+						obligations,
+						scope,
+						arg,
+						infer_policy,
+					);
+				}
+				self.diagnostics.push(report_type_args_not_allowed(
+					self.strings,
+					self.defs,
+					scope.file_id,
+					stopped,
+					TypeArgsNotAllowedOn::Declaration(kind),
+				));
+				// What it names is unambiguous, so the type is kept.
+				self.defs.intrinsics.identity_of(type_alias_index).unwrap()
+			}
+			DefKind::TypeAlias(type_alias_index) => {
+				let def_id = DefId::TypeAlias(type_alias_index);
+				let reference =
+					SourceSpan::new(scope.file_id, stopped.ident.span);
+				let status = self.ensure_signature(QueryInfo {
+					def_id,
+					requested_at: Some(reference),
+				});
+				match status {
+					SignatureStatus::Cycle => {
+						let diagnostic =
+							self.report_cyclic_type_alias(def_id, reference);
+						self.diagnostics.push(diagnostic);
+						TypeIndex::ERROR
+					}
+					SignatureStatus::CycleReported => TypeIndex::ERROR,
+					SignatureStatus::Available(
+						SignatureLocation::TypeAlias(index),
+					) => {
+						let TypeAliasSignature {
+							type_params,
+							target,
+						} = self.type_aliases[usize::from(index)];
+						let resolved_args: Box<[TypeIndex]> = stopped
+							.type_args
+							.iter()
+							.map(|arg| {
+								self.resolve_type_expression(
+									obligations,
+									scope,
+									arg,
+									infer_policy,
+								)
+							})
+							.collect();
+						let type_args = self.resolve_type_args(
+							obligations,
+							scope,
+							stopped,
+							type_params,
+							&[],
+							&resolved_args,
+							TypeEnvOwner::TypeAlias(index),
+						);
+						self.types.substitute(
+							target,
+							Substitution {
+								envs: &self.type_envs,
+								env: type_params,
+								args: &type_args,
+							},
+						)
+					}
+					SignatureStatus::Available(_) => unreachable!(
+						"a TypeAlias DefId always resolves to SignatureLocation::TypeAlias"
+					),
+				}
+			}
+			DefKind::Struct(struct_index) => {
+				// Only forces resolution for a genuine forward
+				// reference (`Pending`); an in-progress struct
+				// is left alone so `check_struct_direct_recursion`
+				// downstream still gets to observe `Cycle`
+				// itself. Either way `type_params` (written
+				// before fields, see `RecordStruct`/
+				// `TupleStruct` above) is already valid to
+				// read by the time we get here.
+				let def_id = DefId::Struct(struct_index);
+				if matches!(
+					self.query_state[&def_id].state,
+					QueryState::Pending
+				) {
+					let _ = self.ensure_signature(QueryInfo {
+						def_id,
+						requested_at: Some(SourceSpan::new(
+							scope.file_id,
+							stopped.ident.span,
+						)),
+					});
+				}
+				let params_env =
+					self.structs[usize::from(struct_index)].type_params;
+
+				let resolved_args: Box<[TypeIndex]> = stopped
+					.type_args
+					.iter()
+					.map(|arg| {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						)
+					})
+					.collect();
+				let type_args = self.resolve_type_args(
+					obligations,
+					scope,
+					stopped,
+					params_env,
+					&[],
+					&resolved_args,
+					TypeEnvOwner::Struct(struct_index),
+				);
+				self.types.intern_struct(struct_index, &type_args)
+			}
+			DefKind::Enum(enum_index) => {
+				if !stopped.type_args.is_empty() {
+					// Resolved only to report what is wrong inside them.
+					for arg in &stopped.type_args {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						);
+					}
+					self.diagnostics.push(report_type_args_not_allowed(
+						self.strings,
+						self.defs,
+						scope.file_id,
+						stopped,
+						TypeArgsNotAllowedOn::Declaration(DefKind::Enum(
+							enum_index,
+						)),
+					));
+					TypeIndex::ERROR
+				} else {
+					// Nominal identity is available from definition collection;
+					// naming an enum does not depend on resolving its repr.
+					self.types.intern(Type::Enum { enum_index })
+				}
+			}
+			// Every memory declaration is its own nominal type,
+			// including when referenced as a memory tag.
+			kind @ DefKind::Memory(memory_index) => {
+				if stopped.type_args.is_empty() {
+					self.types.intern(Type::Memory { memory_index })
+				} else {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
 						self.resolve_type_expression(
@@ -2965,276 +3157,104 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						stopped,
 						TypeArgsNotAllowedOn::Declaration(kind),
 					));
-					// What it names is unambiguous, so the type is kept.
-					self.defs.intrinsics.identity_of(type_alias_index).unwrap()
+					TypeIndex::ERROR
 				}
-				DefKind::TypeAlias(type_alias_index) => {
-					let def_id = DefId::TypeAlias(type_alias_index);
-					let reference =
-						SourceSpan::new(scope.file_id, stopped.ident.span);
-					let status = self.ensure_signature(QueryInfo {
+			}
+			kind @ (DefKind::Module(_)
+			| DefKind::Package(_)
+			| DefKind::PackageInstance(_)
+			| DefKind::Import(_)
+			| DefKind::Trait(_)
+			| DefKind::TypeSet(_)) => {
+				self.diagnostics.push(report_not_a_type(
+					scope.file_id,
+					self.strings,
+					stopped.ident,
+					kind,
+				));
+				TypeIndex::ERROR
+			}
+			// A free function is its own zero-sized type, applied
+			// like a struct (`foo<i32>`). The type-param frame is
+			// pushed before the parameters are lowered, so a
+			// function naming itself reads a valid `type_params`.
+			DefKind::Function(func_index) => {
+				let def_id = DefId::Function(func_index);
+				if matches!(
+					self.query_state[&def_id].state,
+					QueryState::Pending
+				) {
+					let _ = self.ensure_signature(QueryInfo {
 						def_id,
-						requested_at: Some(reference),
+						requested_at: Some(SourceSpan::new(
+							scope.file_id,
+							stopped.ident.span,
+						)),
 					});
-					match status {
-						SignatureStatus::Cycle => {
-							let diagnostic = self
-								.report_cyclic_type_alias(def_id, reference);
-							self.diagnostics.push(diagnostic);
-							TypeIndex::ERROR
-						}
-						SignatureStatus::CycleReported => TypeIndex::ERROR,
-						SignatureStatus::Available(
-							SignatureLocation::TypeAlias(index),
-						) => {
-							let TypeAliasSignature {
-								type_params,
-								target,
-							} = self.type_aliases[usize::from(index)];
-							let resolved_args: Box<[TypeIndex]> = stopped
-								.type_args
-								.iter()
-								.map(|arg| {
-									self.resolve_type_expression(
-										obligations,
-										scope,
-										arg,
-										infer_policy,
-									)
-								})
-								.collect();
-							let type_args = self.resolve_type_args(
-								obligations,
-								scope,
-								stopped,
-								type_params,
-								&[],
-								&resolved_args,
-								TypeEnvOwner::TypeAlias(index),
-							);
-							self.types.substitute(
-								target,
-								Substitution {
-									envs: &self.type_envs,
-									env: type_params,
-									args: &type_args,
-								},
-							)
-						}
-						SignatureStatus::Available(_) => unreachable!(
-							"a TypeAlias DefId always resolves to SignatureLocation::TypeAlias"
-						),
-					}
 				}
-				DefKind::Struct(struct_index) => {
-					// Only forces resolution for a genuine forward
-					// reference (`Pending`); an in-progress struct
-					// is left alone so `check_struct_direct_recursion`
-					// downstream still gets to observe `Cycle`
-					// itself. Either way `type_params` (written
-					// before fields, see `RecordStruct`/
-					// `TupleStruct` above) is already valid to
-					// read by the time we get here.
-					let def_id = DefId::Struct(struct_index);
-					if matches!(
-						self.query_state[&def_id].state,
-						QueryState::Pending
-					) {
-						let _ = self.ensure_signature(QueryInfo {
-							def_id,
-							requested_at: Some(SourceSpan::new(
-								scope.file_id,
-								stopped.ident.span,
-							)),
-						});
+				let params_env =
+					self.functions[usize::from(func_index)].type_params;
+				let resolved_args: Box<[TypeIndex]> = stopped
+					.type_args
+					.iter()
+					.map(|arg| {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						)
+					})
+					.collect();
+				let type_args = self.resolve_type_args(
+					obligations,
+					scope,
+					stopped,
+					params_env,
+					&[],
+					&resolved_args,
+					TypeEnvOwner::Function(func_index),
+				);
+				self.types.intern_function(func_index, &type_args)
+			}
+			// Every global is its own nominal type, the one its
+			// `Global` impl targets; it takes no arguments.
+			kind @ DefKind::Global(global_index) => {
+				if stopped.type_args.is_empty() {
+					self.types.intern(Type::Global { global_index })
+				} else {
+					// Resolved only to report what is wrong inside them.
+					for arg in &stopped.type_args {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						);
 					}
-					let params_env =
-						self.structs[usize::from(struct_index)].type_params;
-
-					let resolved_args: Box<[TypeIndex]> = stopped
-						.type_args
-						.iter()
-						.map(|arg| {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							)
-						})
-						.collect();
-					let type_args = self.resolve_type_args(
-						obligations,
-						scope,
-						stopped,
-						params_env,
-						&[],
-						&resolved_args,
-						TypeEnvOwner::Struct(struct_index),
-					);
-					self.types.intern_struct(struct_index, &type_args)
-				}
-				DefKind::Enum(enum_index) => {
-					if !stopped.type_args.is_empty() {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(DefKind::Enum(
-								enum_index,
-							)),
-						));
-						TypeIndex::ERROR
-					} else {
-						// Nominal identity is available from definition collection;
-						// naming an enum does not depend on resolving its repr.
-						self.types.intern(Type::Enum { enum_index })
-					}
-				}
-				// Every memory declaration is its own nominal type,
-				// including when referenced as a memory tag.
-				kind @ DefKind::Memory(memory_index) => {
-					if stopped.type_args.is_empty() {
-						self.types.intern(Type::Memory { memory_index })
-					} else {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(kind),
-						));
-						TypeIndex::ERROR
-					}
-				}
-				kind @ (DefKind::Module(_)
-				| DefKind::Package(_)
-				| DefKind::PackageInstance(_)
-				| DefKind::Import(_)
-				| DefKind::Trait(_)
-				| DefKind::TypeSet(_)) => {
-					self.diagnostics.push(report_not_a_type(
-						scope.file_id,
+					self.diagnostics.push(report_type_args_not_allowed(
 						self.strings,
-						stopped.ident,
-						kind,
+						self.defs,
+						scope.file_id,
+						stopped,
+						TypeArgsNotAllowedOn::Declaration(kind),
 					));
 					TypeIndex::ERROR
 				}
-				// A free function is its own zero-sized type, applied
-				// like a struct (`foo<i32>`). The type-param frame is
-				// pushed before the parameters are lowered, so a
-				// function naming itself reads a valid `type_params`.
-				DefKind::Function(func_index) => {
-					let def_id = DefId::Function(func_index);
-					if matches!(
-						self.query_state[&def_id].state,
-						QueryState::Pending
-					) {
-						let _ = self.ensure_signature(QueryInfo {
-							def_id,
-							requested_at: Some(SourceSpan::new(
-								scope.file_id,
-								stopped.ident.span,
-							)),
-						});
-					}
-					let params_env =
-						self.functions[usize::from(func_index)].type_params;
-					let resolved_args: Box<[TypeIndex]> = stopped
-						.type_args
-						.iter()
-						.map(|arg| {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							)
-						})
-						.collect();
-					let type_args = self.resolve_type_args(
-						obligations,
-						scope,
-						stopped,
-						params_env,
-						&[],
-						&resolved_args,
-						TypeEnvOwner::Function(func_index),
-					);
-					self.types.intern_function(func_index, &type_args)
-				}
-				// Every global is its own nominal type, the one its
-				// `Global` impl targets; it takes no arguments.
-				kind @ DefKind::Global(global_index) => {
-					if stopped.type_args.is_empty() {
-						self.types.intern(Type::Global { global_index })
-					} else {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(kind),
-						));
-						TypeIndex::ERROR
-					}
-				}
-				// Value-tier only — a `Tier::Type` walk
-				// can never stop on one of these.
-				DefKind::EnumVariant(_) | DefKind::Const(_) => unreachable!(
-					"value-tier DefKind from a type-scope.namespace path walk"
-				),
-				// Never constructed anywhere — associated types are
-				// only ever reached through `resolve_type_member_path`'s
-				// own `MemberKind::AssociatedType`, never as a
-				// top-level scope.namespace symbol.
-				DefKind::TraitAssocType(_) => unreachable!(
-					"TraitAssocType is never registered as a scope.namespace symbol"
-				),
-			};
-
-			(resolved, walk.stopped_at as usize + 1)
-		};
-
-		// Whatever's left continues through impl dispatch or a
-		// bound instead of the scope.namespace graph — `members.rs`'s
-		// job, not this module's.
-		self.resolve_type_member_path(
-			obligations,
-			scope,
-			current,
-			&segments[next..],
-			infer_policy,
-		)
+			}
+			// Value-tier only — a `Tier::Type` walk
+			// can never stop on one of these.
+			DefKind::EnumVariant(_) | DefKind::Const(_) => unreachable!(
+				"value-tier DefKind from a type-scope.namespace path walk"
+			),
+			// Never constructed anywhere — associated types are
+			// only ever reached through `resolve_type_member_path`'s
+			// own `MemberKind::AssociatedType`, never as a
+			// top-level scope.namespace symbol.
+			DefKind::TraitAssocType(_) => unreachable!(
+				"TraitAssocType is never registered as a scope.namespace symbol"
+			),
+		}
 	}
 
 	/// The written arguments for a member function's own parameters. Without
@@ -4169,7 +4189,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `None` if the path failed to resolve to a real trait; already
 	/// diagnosed either way, by `resolve_path` itself or by the "expected a
 	/// trait" report below.
-	fn resolve_trait_bound_path(
+	pub(super) fn resolve_trait_bound_path(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,

@@ -26,7 +26,11 @@
 mod blocks;
 mod calls;
 mod casts;
+mod members;
 mod places;
+
+use calls::Callee;
+use members::MemberPath;
 
 use std::collections::HashMap;
 
@@ -330,9 +334,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
-			| ast::Expression::Grouped { .. } => {
-				self.unsupported(span, "a qualified path")
-			}
+			| ast::Expression::Grouped { .. } => match self.resolve_rooted_path(expr) {
+				Ok(path) => self.build_member_value(path, span),
+				Err(error) => error,
+			},
 			ast::Expression::ArrayList { .. }
 			| ast::Expression::ArrayRepeat { .. } => {
 				self.unsupported(span, "an array literal")
@@ -473,8 +478,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let ty = self.body.local(local).ty;
 			return self.body.push(ExprKind::Local(local), ty, span);
 		}
-		let walk = match self.walk_value_path(segments, span) {
-			Ok(walk) => walk,
+		let walk = match self.resolve_value_path(segments, span) {
+			Ok(ValuePath::Item(walk)) => walk,
+			Ok(ValuePath::Member(path)) => {
+				return self.build_member_value(path, span);
+			}
 			Err(error) => return error,
 		};
 		let Some(key) = walk.target.def_key() else {
@@ -493,9 +501,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				SourceSpan::new(self.scope.file_id, segment.ident.span),
 				Some(key),
 			));
-		}
-		if !walk.is_complete(segments) {
-			return self.unsupported(span, "a path through a type");
 		}
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
@@ -521,7 +526,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 			DefKind::Function(function_index) => self.build_function_value(
-				function_index,
+				Callee::free(function_index),
 				segments.last().unwrap(),
 				span,
 			),
@@ -537,19 +542,35 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// Walks a value path through the namespace graph. A path that continues
-	/// through a type (`Self::X`, `Enum::function`) needs member lookup, which
-	/// is not checked yet: it is reported as unsupported, with an error node,
-	/// rather than as a name the walk could not find.
-	fn walk_value_path(
+	/// Resolves a value path: an item the namespace walk reaches, or a member
+	/// of the type the segments before the last name (`Ordering::of`,
+	/// `Self::f`, `T::f`, `W::<u8>::new`). A path starting at a type parameter
+	/// or `Self` names a type from its first segment; any other walks the
+	/// namespace graph, and continues past a type where the walk stops at one.
+	fn resolve_value_path<'s>(
 		&mut self,
-		segments: &[ast::PathSegment],
+		segments: &'s [ast::PathSegment],
 		span: TextSpan,
-	) -> Result<PathWalk, ExprIdx> {
-		if segments[0].ident.inner == Keyword::SelfPascal.symbol() {
-			return Err(self.unsupported(span, "a path through `Self`"));
+	) -> Result<ValuePath<'s>, ExprIdx> {
+		let (member, prefix) = segments.split_last().unwrap();
+		let first = segments[0].ident.inner;
+		if prefix.is_empty() && first == Keyword::SelfPascal.symbol() {
+			return Err(self.unsupported(span, "`Self` as a value"));
 		}
-		let reported = self.cx.diagnostics.len();
+		if !prefix.is_empty()
+			&& (first == Keyword::SelfPascal.symbol()
+				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
+		{
+			let mut obligations = Vec::new();
+			let receiver = self.cx.resolve_type_path(
+				&mut obligations,
+				self.scope,
+				prefix,
+				InferPolicy::Allow,
+			);
+			self.cx.check_now(&obligations);
+			return Ok(ValuePath::Member(MemberPath::new(receiver, member)));
+		}
 		let walk = PathResolver::new(
 			self.cx.diagnostics,
 			self.cx.resolutions,
@@ -562,27 +583,49 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			segments,
 			Tier::Value,
 		);
-		// Not found in an enum: the name may be one of its impls' members, so
-		// the walk's "not found" is replaced by the unsupported report.
-		if walk.target.def_key().is_none() && walk.stopped_at > 0 {
-			let prefix = &segments[walk.stopped_at as usize - 1];
-			let site = (
-				SourceSpan::new(self.scope.file_id, prefix.ident.span),
-				Tier::Type,
-			);
-			if let Some(
-				Referent::Definition(key)
-				| Referent::Import {
-					definition: key, ..
-				},
-			) = self.cx.resolutions.by_site.get(&site)
-				&& let DefKind::Enum(_) = key.symbol_kind(self.cx.defs)
-			{
-				self.cx.diagnostics.truncate(reported);
-				return Err(self.unsupported(span, "a path through a type"));
-			}
+		let Some(key) = walk.target.def_key() else {
+			return Ok(ValuePath::Item(walk));
+		};
+		if walk.is_complete(segments) {
+			return Ok(ValuePath::Item(walk));
 		}
-		Ok(walk)
+		let stop = walk.stopped_at as usize;
+		let stopped = &segments[stop];
+		// Arguments a generic type leaves unwritten would be learned from
+		// the call, which needs its impl selected before its bounds can be
+		// proved.
+		if stopped.type_args.is_empty()
+			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
+			&& !self
+				.cx
+				.type_envs
+				.param_names(
+					self.cx.structs[usize::from(struct_index)].type_params,
+				)
+				.is_empty()
+		{
+			return Err(self.unsupported(
+				span,
+				"a path through a generic type without its type arguments",
+			));
+		}
+		let mut obligations = Vec::new();
+		let head = self.cx.resolve_named_type(
+			&mut obligations,
+			self.scope,
+			key,
+			stopped,
+			InferPolicy::Allow,
+		);
+		let receiver = self.cx.resolve_type_member_path(
+			&mut obligations,
+			self.scope,
+			head,
+			&prefix[stop + 1..],
+			InferPolicy::Allow,
+		);
+		self.cx.check_now(&obligations);
+		Ok(ValuePath::Member(MemberPath::new(receiver, member)))
 	}
 
 	/// The local `name` refers to from the current scope: declared in it or in
@@ -617,25 +660,38 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let ast::Expression::Path(segments) = &callee.inner else {
-			return self.unsupported(span, "a call of a computed callee");
+		let segments = match &callee.inner {
+			ast::Expression::Path(segments) => segments,
+			ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. } => {
+				return match self.resolve_rooted_path(callee) {
+					Ok(path) => {
+						self.build_member_call(path, arguments, expected, span)
+					}
+					Err(error) => error,
+				};
+			}
+			_ => {
+				return self.unsupported(span, "a call of a computed callee");
+			}
 		};
 		if let [segment] = &**segments
 			&& self.lookup_local(segment.ident.inner).is_some()
 		{
 			return self.unsupported(span, "a call of a local");
 		}
-		let walk = match self.walk_value_path(segments, span) {
-			Ok(walk) => walk,
+		let walk = match self.resolve_value_path(segments, span) {
+			Ok(ValuePath::Item(walk)) => walk,
+			Ok(ValuePath::Member(path)) => {
+				return self.build_member_call(path, arguments, expected, span);
+			}
 			Err(error) => return error,
 		};
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let kind = key.symbol_kind(self.cx.defs);
-		let (DefKind::Struct(struct_index), true) =
-			(kind, walk.is_complete(segments))
-		else {
+		let DefKind::Struct(struct_index) = kind else {
 			if let BindingTarget::Inaccessible(_) = walk.target {
 				let segment = &segments[walk.stopped_at as usize];
 				self.cx.diagnostics.push(report_private_identifier(
@@ -646,23 +702,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Some(key),
 				));
 			}
-			return match (kind, walk.is_complete(segments), arguments) {
+			return match (kind, arguments) {
 				(
 					DefKind::Function(function_index),
-					true,
 					Arguments::Positional(arguments),
 				) => self.build_function_call(
-					function_index,
+					Callee::free(function_index),
 					segments.last().unwrap(),
+					None,
 					arguments,
 					expected,
 					span,
 				),
-				(DefKind::Function(_), true, Arguments::Named(_)) => {
+				(DefKind::Function(_), Arguments::Named(_)) => {
 					self.unsupported(span, "a function call by name")
-				}
-				(_, false, _) => {
-					self.unsupported(span, "a path through a type")
 				}
 				_ => self
 					.unsupported(span, &format!("a call of a {}", kind.noun())),
@@ -809,10 +862,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	/// Records and checks the bounds of the parameters of `params_env` (a
-	/// struct's or a function's) for their final type arguments, at the call,
-	/// wherever they were learned from. Each is reported at its written
-	/// argument, else at the value given for a field or parameter whose
-	/// declared type (`declared`) is that parameter, else at the name.
+	/// struct's or a function's own frame) for their final type arguments, at
+	/// the call, wherever they were learned from. `type_args` are flat: the
+	/// frames around `params_env` first, whose bounds the selection of the
+	/// callee proved. Each is reported at its written argument, else at the
+	/// value given for a field or parameter whose declared type (`declared`)
+	/// is that parameter, else at the name.
 	fn check_param_bounds(
 		&mut self,
 		params_env: TypeEnvIdx,
@@ -822,12 +877,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		type_args: &[TypeIndex],
 		given: &[(usize, ExprIdx)],
 	) {
-		if type_args.is_empty() {
+		let own = self.cx.type_envs.param_names(params_env).len();
+		if own == 0 {
 			return;
 		}
 		let arguments = self.cx.types.push_list(type_args);
 		let mut obligations = Vec::new();
-		for (index, &argument) in type_args.iter().enumerate() {
+		let leading = type_args.len() - own;
+		for (index, &argument) in type_args[leading..].iter().enumerate() {
 			let span = match segment.type_args.get(index) {
 				Some(written) => written.span,
 				None => {
@@ -862,10 +919,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.cx.check_now(&obligations);
 	}
 
-	/// Reports each parameter whose argument is still not fully known (an
-	/// `INFER` anywhere in it), and makes it `ERROR`. Nothing is reported in a
-	/// `poisoned` call (an `ERROR` expectation, an argument that failed):
-	/// whatever failed has said why, and may be why nothing was learned.
+	/// Reports each parameter on `params_env`'s chain whose argument in the
+	/// flat `args` is still not fully known (an `INFER` anywhere in it), and
+	/// makes it `ERROR`. Nothing is reported in a `poisoned` call (an `ERROR`
+	/// expectation, an argument that failed): whatever failed has said why,
+	/// and may be why nothing was learned.
 	fn report_uninferred(
 		&mut self,
 		params_env: TypeEnvIdx,
@@ -881,7 +939,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			if poisoned {
 				continue;
 			}
-			let name = self.cx.type_envs.param_names(params_env)[at].inner;
+			let frame = self
+				.cx
+				.type_envs
+				.chain(params_env)
+				.find(|&frame| self.cx.type_envs.parent_count(frame) <= at)
+				.unwrap();
+			let index = at - self.cx.type_envs.parent_count(frame);
+			let name = self.cx.type_envs.param_names(frame)[index].inner;
 			let name = self.cx.strings.resolve(name).unwrap();
 			self.cx.diagnostics.push(
 				Diagnostic::error()
@@ -2071,6 +2136,14 @@ enum SelectedMethod {
 	},
 }
 
+/// What a value path names.
+enum ValuePath<'s> {
+	/// What the namespace walk reached, all of the path or where it failed.
+	Item(PathWalk),
+	/// A member of the type the segments before the last name.
+	Member(MemberPath<'s>),
+}
+
 /// A call's arguments, by position or by name.
 #[derive(Clone, Copy)]
 enum Arguments<'e> {
@@ -2278,7 +2351,7 @@ mod tests {
 
 	use super::super::body::{Body, ExprIdx, ExprKind, PlaceIdx, PlaceKind};
 	use super::super::defs::{
-		AstEntry, DefKind, DefinitionRegistry, Scope, Tier,
+		AstEntry, DefKind, DefinitionRegistry, FunctionOwner, Scope, Tier,
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::impls::ImplDispatch;
@@ -2456,6 +2529,22 @@ mod tests {
 			self.context.function_bodies[usize::from(index)]
 				.as_ref()
 				.expect("a function with a block has a body")
+		}
+
+		/// The rendered block of the impl member `name`, which only one impl
+		/// in the test declares.
+		fn member_shape(&self, name: &str) -> String {
+			let symbol = self.context.strings.get(name).unwrap();
+			let mut found = self.defs.functions.iter().enumerate().filter(
+				|(_, function)| {
+					function.name.inner == symbol
+						&& !matches!(function.owner, FunctionOwner::Free)
+				},
+			);
+			let (index, _) = found.next().unwrap();
+			assert!(found.next().is_none(), "`{name}` is declared twice");
+			let body = self.context.function_bodies[index].as_ref().unwrap();
+			self.render(body, body.root())
 		}
 
 		fn display(&self, ty: TypeIndex) -> String {
@@ -3561,6 +3650,120 @@ mod tests {
 		test_case!(case = "global small: u8 = 300;");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+	}
+
+	#[test]
+	fn a_path_through_a_type_calls_its_member_directly() {
+		test_case!(
+			case = indoc! {"
+				enum E: u8 { A = 0 }
+				impl E { pub func pick<T>(t: T) -> E { E::A } }
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T) -> W<T> { W(x) }
+					pub func get(self) -> T { loop {} }
+					func again(x: T) -> W<T> { Self::new(x) }
+				}
+				trait Make { func make() -> Self; }
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				func inherent() -> E { E::pick(true) }
+				func generic_impl(w: W<u8>) -> u8 { W::<u8>::get(w) }
+				func constructed() -> W<u16> { W::<u16>::new(1) }
+				func trait_impl() -> P { P::make() }
+				func value() { local f = W::<u8>::new; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("inherent"), "(block => (call pick<bool> true))");
+		assert_eq!(case.shape("generic_impl"), "(block => (call get<u8> w#0))");
+		assert_eq!(case.shape("constructed"), "(block => (call new<u16> 1))");
+		assert_eq!(case.member_shape("again"), "(block => (call new<T> x#0))");
+		assert_eq!(case.shape("trait_impl"), "(block => (call make))");
+		assert_eq!(case.locals("value"), [("f".into(), "new<u8>".into())]);
+	}
+
+	#[test]
+	fn a_trait_declaration_is_called_with_its_receiver_as_self() {
+		test_case!(
+			case = indoc! {"
+				trait Make {
+					func make() -> Self;
+					func zero() -> u32 { 0 }
+				}
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				func abstract_receiver<T: Make>() -> T { T::make() }
+				func inherited_default() -> u32 { P::zero() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract make<T>))"
+		);
+		assert_eq!(
+			case.shape("inherited_default"),
+			"(block => (abstract zero<P>))"
+		);
+	}
+
+	#[test]
+	fn a_bracketed_root_names_the_receiver_and_maybe_its_trait() {
+		test_case!(
+			case = indoc! {"
+				trait Make { func make() -> Self; }
+				trait Other { func make() -> Self; }
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				impl Other for P { func make() -> Self { P() } }
+				struct W<T>(x: T);
+				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
+				func qualified() -> P { <P as Make>::make() }
+				func abstract_qualified<T: Make>() -> T { <T as Make>::make() }
+				func grouped() -> W<u8> { <W<u8>>::new(1) }
+				func ambiguous() -> P { P::make() }
+				func not_implemented() -> bool { <bool as Make>::make() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::AmbiguousTraitMember,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		assert_eq!(case.shape("qualified"), "(block => (call make))");
+		assert_eq!(
+			case.shape("abstract_qualified"),
+			"(block => (abstract make<T>))"
+		);
+		assert_eq!(case.shape("grouped"), "(block => (call new<u8> 1))");
+	}
+
+	#[test]
+	fn a_member_must_exist_and_be_visible() {
+		test_case!(
+			case = indoc! {"
+				mod inner {
+					pub struct S();
+					impl S { func hidden() {} pub func shown() {} }
+					trait Secret { func secret(); }
+					impl Secret for S { func secret() {} }
+				}
+				struct W<T>(x: T);
+				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
+				func missing() { inner::S::nothing(); }
+				func private() { inner::S::hidden(); inner::S::shown(); }
+				func private_trait() { inner::S::secret(); }
+				func unwritten() -> W<u8> { W::new(1) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::PrivateItem,
+			DiagnosticCode::PrivateItem,
+			DiagnosticCode::UnsupportedExpression,
+		]);
+		case.diagnostics()
+			.assert_error_saying("associated function `hidden` is private");
 	}
 
 	#[test]

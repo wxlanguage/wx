@@ -15,42 +15,79 @@ use crate::tir::body::{ExprIdx, ExprKind};
 use crate::tir::defs::FunctionIdx;
 use crate::tir::types::{Substitution, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 
+/// The function a call or a path selects, with what the call knows of it
+/// before its arguments are checked.
+pub(super) struct Callee {
+	pub(super) function: FunctionIdx,
+	/// The arguments of the frames around the function's own: an impl's, or
+	/// `Self` for a trait's declaration; empty for a free function.
+	pub(super) leading: Box<[TypeIndex]>,
+	pub(super) dispatch: Dispatch,
+}
+
+/// How a callee is reached.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Dispatch {
+	/// The function itself is called (`Call`).
+	Direct,
+	/// The function is a trait's declaration, whose impl is selected once
+	/// `Self` is known (`AbstractCall`).
+	Abstract,
+}
+
+impl Callee {
+	pub(super) fn free(function: FunctionIdx) -> Self {
+		Self {
+			function,
+			leading: Box::new([]),
+			dispatch: Dispatch::Direct,
+		}
+	}
+}
+
 impl BodyContext<'_, '_, '_, '_> {
-	/// A function named without a call. It needs every type argument
-	/// written, since nothing else gives them.
+	/// A function named without a call. It needs every type argument of its
+	/// own written, since nothing else gives them.
 	pub(super) fn build_function_value(
 		&mut self,
-		function_index: FunctionIdx,
+		callee: Callee,
 		segment: &ast::PathSegment,
 		span: TextSpan,
 	) -> ExprIdx {
-		let env = self.cx.functions[usize::from(function_index)].type_params;
-		let owner = TypeEnvOwner::Function(function_index);
-		let mut type_args = self.written_type_args(segment, env, owner);
+		let function = callee.function;
+		let (env, own) = self.function_frames(function);
+		let mut type_args = self.callee_type_args(&callee, own, segment);
 		self.report_uninferred(env, segment.ident.span, false, &mut type_args);
-		self.check_param_bounds(env, owner, segment, &[], &type_args, &[]);
-		let ty = self.cx.types.intern_function(function_index, &type_args);
+		self.check_param_bounds(
+			own,
+			TypeEnvOwner::Function(function),
+			segment,
+			&[],
+			&type_args,
+			&[],
+		);
+		let ty = self.cx.types.intern_function(function, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		self.body.push(ExprKind::Function(function_index), ty, span)
+		self.body.push(ExprKind::Function(function), ty, span)
 	}
 
-	/// `f(a, b)`: a call of the function `callee` names, by position.
+	/// `f(a, b)`, `Type::f(a, b)` or `receiver.f(a, b)`: a call of `callee`,
+	/// by position. A method call's `receiver` is checked already and gives
+	/// the first parameter.
 	pub(super) fn build_function_call(
 		&mut self,
-		function_index: FunctionIdx,
+		callee: Callee,
 		segment: &ast::PathSegment,
+		receiver: Option<ExprIdx>,
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let function = &self.cx.functions[usize::from(function_index)];
-		let (env, params, return_type) = (
-			function.type_params,
-			function.params().to_vec(),
-			function.return_type(),
-		);
-		let owner = TypeEnvOwner::Function(function_index);
-		let mut type_args = self.written_type_args(segment, env, owner);
+		let function = &self.cx.functions[usize::from(callee.function)];
+		let (params, return_type) =
+			(function.params().to_vec(), function.return_type());
+		let (env, own) = self.function_frames(callee.function);
+		let mut type_args = self.callee_type_args(&callee, own, segment);
 		// The result is learned from first: a disagreement teaches nothing,
 		// and the call's own type is held to the expected one by the caller.
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
@@ -63,11 +100,28 @@ impl BodyContext<'_, '_, '_, '_> {
 				expected,
 			);
 		}
-		if arguments.len() != params.len() {
-			self.report_argument_count(params.len(), arguments.len(), span);
-		}
+		let skipped = usize::from(receiver.is_some());
 		let mut given = Vec::with_capacity(params.len());
+		if let Some(receiver) = receiver {
+			let actual = self.body.ty(receiver);
+			self.cx.types.learn(
+				&self.cx.type_envs,
+				env,
+				&mut type_args,
+				params[0],
+				actual,
+			);
+			given.push((0, receiver));
+		}
+		if arguments.len() + skipped != params.len() {
+			self.report_argument_count(
+				params.len() - skipped,
+				arguments.len(),
+				span,
+			);
+		}
 		for (at, argument) in arguments.iter().enumerate() {
+			let at = at + skipped;
 			// An argument past the last parameter is checked and dropped.
 			let Some(&param) = params.get(at) else {
 				self.build(&argument.inner, TypeIndex::INFER);
@@ -102,21 +156,64 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.expect(value, param);
 		}
 		self.check_param_bounds(
-			env, owner, segment, &params, &type_args, &given,
+			own,
+			TypeEnvOwner::Function(callee.function),
+			segment,
+			&params,
+			&type_args,
+			&given,
 		);
 		let args = self.body.push_args(given.iter().map(|&(_, value)| value));
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		let type_args = self.cx.types.push_list(&type_args);
-		self.body.push(
-			ExprKind::Call {
-				function: function_index,
+		let kind = match callee.dispatch {
+			Dispatch::Direct => ExprKind::Call {
+				function: callee.function,
 				type_args,
 				args,
 			},
-			ty,
-			span,
-		)
+			Dispatch::Abstract => ExprKind::AbstractCall {
+				method: callee.function,
+				type_args,
+				args,
+			},
+		};
+		self.body.push(kind, ty, span)
+	}
+
+	/// A function's parameter frames: its whole chain, which its type
+	/// arguments instantiate, and its own frame (`ROOT` when it declares no
+	/// parameters, which then stores its parent's frame).
+	fn function_frames(
+		&self,
+		function: FunctionIdx,
+	) -> (TypeEnvIdx, TypeEnvIdx) {
+		let env = self.cx.functions[usize::from(function)].type_params;
+		let own = if env != TypeEnvIdx::ROOT
+			&& self.cx.type_envs.owner(env) == TypeEnvOwner::Function(function)
+		{
+			env
+		} else {
+			TypeEnvIdx::ROOT
+		};
+		(env, own)
+	}
+
+	/// A callee's flat type arguments before its call is checked: the leading
+	/// ones it was selected with, then those written for its own parameters.
+	fn callee_type_args(
+		&mut self,
+		callee: &Callee,
+		own: TypeEnvIdx,
+		segment: &ast::PathSegment,
+	) -> Box<[TypeIndex]> {
+		let written = self.written_type_args(
+			segment,
+			own,
+			TypeEnvOwner::Function(callee.function),
+		);
+		callee.leading.iter().chain(&written).copied().collect()
 	}
 
 	/// `ty`, written with the parameters of `env`, with `args` for them. A
