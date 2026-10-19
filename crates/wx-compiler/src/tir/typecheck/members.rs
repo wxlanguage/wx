@@ -21,13 +21,14 @@ use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
 use crate::tir::defs::{BindingKey, MemberKind, Tier, TraitIdx, Visibility};
+use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
 	ApplicableMember, MemberLookup, TraitImplLookup, TraitMemberSelection,
 	report_ambiguous_type_member,
 };
 use crate::tir::resolutions::Referent;
 use crate::tir::signatures::InferPolicy;
-use crate::tir::types::{Type, TypeIndex};
+use crate::tir::types::{Substitution, Type, TypeIndex};
 
 /// A member of a type a path names.
 pub(super) struct MemberPath<'s> {
@@ -238,6 +239,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let reference = SourceSpan::new(self.scope.file_id, member.ident.span);
 		let key = BindingKey::value(member.ident.inner);
+		// The impl's arguments, learned from a receiver with arguments still
+		// unknown; the call proves its bounds once it knows them.
+		let mut learned = None;
 		let lookup = match qualified {
 			// The named trait alone is searched; that the receiver implements
 			// it is checked, and reported, here.
@@ -256,6 +260,12 @@ impl BodyContext<'_, '_, '_, '_> {
 					Ok(found) => MemberLookup::Found(found),
 					Err(()) => MemberLookup::Error,
 				}
+			}
+			None if self.cx.types.has_infer(receiver) => {
+				let (found, impl_args) =
+					self.select_inherent_with_holes(receiver, key, member)?;
+				learned = Some(impl_args);
+				MemberLookup::Found(found)
 			}
 			None => self.cx.resolve_applicable_member(
 				self.scope.env,
@@ -296,7 +306,14 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		self.check_member_access(found, key, member);
 		let receiver = self.normalized(receiver, self.scope.env);
+		let mut impl_bounds = None;
 		let (kind, leading, dispatch) = match found {
+			ApplicableMember::Inherent { impl_index, kind }
+				if let Some(impl_args) = learned =>
+			{
+				impl_bounds = Some(impl_index);
+				(kind, impl_args, Dispatch::Direct)
+			}
 			ApplicableMember::Inherent { impl_index, kind } => {
 				let header = self.cx.inherent_impls[usize::from(impl_index)]
 					.as_ref()
@@ -345,17 +362,101 @@ impl BodyContext<'_, '_, '_, '_> {
 				function,
 				leading,
 				dispatch,
+				impl_bounds,
 			}),
 			MemberKind::Method(function) => Member::Method(Callee {
 				function,
 				leading,
 				dispatch,
+				impl_bounds,
 			}),
 			MemberKind::Constant(_) => Member::Constant,
 			MemberKind::AssociatedType(_) => {
 				unreachable!("a value lookup finds no associated type")
 			}
 		})
+	}
+
+	/// The inherent member `key` of `receiver`, a type whose arguments are
+	/// partly unknown (`Layout<_>`), and the impl's arguments as far as the
+	/// receiver gives them. An impl is a candidate when its target, with what
+	/// the receiver teaches its parameters, still meets the receiver; its
+	/// bounds wait for the call, which learns the rest. Trait members are not
+	/// looked up on such a receiver yet.
+	fn select_inherent_with_holes(
+		&mut self,
+		receiver: TypeIndex,
+		key: BindingKey,
+		member: &ast::PathSegment,
+	) -> Option<(ApplicableMember, Box<[TypeIndex]>)> {
+		let Some(target) =
+			ImplTarget::from_type(self.cx.types.resolve(receiver))
+		else {
+			self.report_no_member(receiver, member);
+			return None;
+		};
+		let impl_dispatch = self.cx.impl_dispatch;
+		let mut candidates = Vec::new();
+		for &impl_index in impl_dispatch.inherent_candidates(target) {
+			let impl_def =
+				&self.cx.defs.inherent_impls[usize::from(impl_index)];
+			let Some(&member_index) = impl_def.bindings.get(&key) else {
+				continue;
+			};
+			let kind = impl_def.members[usize::from(member_index)].kind;
+			let Some(header) = &self.cx.inherent_impls[usize::from(impl_index)]
+			else {
+				continue;
+			};
+			let (env, pattern) = (header.type_params, header.target.inner);
+			let count = self.cx.type_envs.generic_count(env);
+			let mut impl_args =
+				vec![TypeIndex::INFER; count].into_boxed_slice();
+			self.cx.types.learn(
+				&self.cx.type_envs,
+				env,
+				&mut impl_args,
+				pattern,
+				receiver,
+			);
+			let instantiated = self.cx.types.substitute(
+				pattern,
+				Substitution {
+					envs: &self.cx.type_envs,
+					env,
+					args: &impl_args,
+				},
+			);
+			if self.cx.types.meet(instantiated, receiver).is_some() {
+				candidates.push((impl_index, kind, impl_args));
+			}
+		}
+		// A type's inherent impls declare a name once between them, so a
+		// second candidate is a duplicate already reported.
+		if candidates.len() > 1 {
+			return None;
+		}
+		let Some((impl_index, kind, impl_args)) = candidates.pop() else {
+			let is_trait_member = impl_dispatch
+				.trait_candidates(target)
+				.iter()
+				.any(|&(trait_index, _)| {
+					self.cx
+						.defs
+						.declared_trait_member(trait_index, key)
+						.is_some()
+				});
+			if is_trait_member {
+				self.report_unsupported(
+					member.ident.span,
+					"a trait member of a type without its type arguments",
+				);
+			} else {
+				self.report_no_member(receiver, member);
+			}
+			return None;
+		};
+		Some((ApplicableMember::Inherent { impl_index, kind }, impl_args))
 	}
 
 	/// Reports a member not visible here: an inherent member by its own

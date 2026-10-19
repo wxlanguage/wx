@@ -593,23 +593,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		let stop = walk.stopped_at as usize;
 		let stopped = &segments[stop];
-		// Arguments a generic type leaves unwritten would be learned from
-		// the call, which needs its impl selected before its bounds can be
-		// proved.
+		// A generic struct named without its arguments leaves them to the
+		// call to learn, as its construction does (`Layout::of::<T>()`).
 		if stopped.type_args.is_empty()
 			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
-			&& !self
-				.cx
-				.type_envs
-				.param_names(
-					self.cx.structs[usize::from(struct_index)].type_params,
-				)
-				.is_empty()
 		{
-			return Err(self.unsupported(
-				span,
-				"a path through a generic type without its type arguments",
-			));
+			let params = self.cx.structs[usize::from(struct_index)].type_params;
+			let count = self.cx.type_envs.param_names(params).len();
+			if count > 0 {
+				if stop + 1 != prefix.len() {
+					return Err(self.unsupported(
+						span,
+						"a path past a generic type without its type arguments",
+					));
+				}
+				let receiver = self.cx.types.intern_struct(
+					struct_index,
+					&vec![TypeIndex::INFER; count],
+				);
+				return Ok(ValuePath::Member(MemberPath::new(
+					receiver, member,
+				)));
+			}
 		}
 		let mut obligations = Vec::new();
 		let head = self.cx.resolve_named_type(
@@ -3750,22 +3755,70 @@ mod tests {
 					trait Secret { func secret(); }
 					impl Secret for S { func secret() {} }
 				}
-				struct W<T>(x: T);
-				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
 				func missing() { inner::S::nothing(); }
 				func private() { inner::S::hidden(); inner::S::shown(); }
 				func private_trait() { inner::S::secret(); }
-				func unwritten() -> W<u8> { W::new(1) }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MethodNotFound,
 			DiagnosticCode::PrivateItem,
 			DiagnosticCode::PrivateItem,
-			DiagnosticCode::UnsupportedExpression,
 		]);
 		case.diagnostics()
 			.assert_error_saying("associated function `hidden` is private");
+	}
+
+	#[test]
+	fn a_type_named_without_its_arguments_leaves_them_to_the_call() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T) -> W<T> { W(x) }
+					pub func empty() -> W<T> { loop {} }
+					pub func of<U>() -> W<T> { loop {} }
+				}
+				struct M<T>(x: T);
+				impl M<u8> { pub func one() -> M<u8> { loop {} } }
+				impl M<u32> { pub func only() -> M<u32> { loop {} } }
+				func from_argument(a: u8) -> W<u8> { W::new(a) }
+				func from_expected() -> W<u16> { W::empty() }
+				func with_own(a: u8) -> W<bool> { W::of::<u8>() }
+				func picked() -> M<u32> { M::only() }
+				func uninferred() { W::empty(); }
+				func other_impl() -> M<u8> { M::only() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics()
+			.assert_error_saying("cannot infer type for type parameter `T`");
+		assert_eq!(
+			case.shape("from_argument"),
+			"(block => (call new<u8> a#0))"
+		);
+		assert_eq!(case.shape("from_expected"), "(block => (call empty<u16>))");
+		assert_eq!(case.shape("with_own"), "(block => (call of<bool, u8>))");
+		assert_eq!(case.shape("picked"), "(block => (call only))");
+	}
+
+	#[test]
+	fn an_impl_selected_before_its_arguments_proves_its_bounds_at_the_call() {
+		test_case!(
+			case = indoc! {"
+				trait Small {}
+				impl Small for u8 {}
+				struct B<T>(x: T);
+				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
+				func holds(a: u8) { local b = B::new(a); }
+				func violated() { local b = B::new(true); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 	}
 
 	#[test]

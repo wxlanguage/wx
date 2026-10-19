@@ -10,9 +10,10 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::BodyContext;
 use crate::ast::{self, Separated, Spanned};
-use crate::diagnostics::{DiagnosticCode, TextSpan};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
-use crate::tir::defs::FunctionIdx;
+use crate::tir::defs::{FunctionIdx, InherentImplIdx};
+use crate::tir::obligations::BoundRequirements;
 use crate::tir::types::{Substitution, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 
 /// The function a call or a path selects, with what the call knows of it
@@ -23,6 +24,10 @@ pub(super) struct Callee {
 	/// `Self` for a trait's declaration; empty for a free function.
 	pub(super) leading: Box<[TypeIndex]>,
 	pub(super) dispatch: Dispatch,
+	/// The inherent impl the callee was selected from before the impl's
+	/// arguments were known, whose bounds the call proves once it has learned
+	/// them (`Layout::of::<T>()`).
+	pub(super) impl_bounds: Option<InherentImplIdx>,
 }
 
 /// How a callee is reached.
@@ -41,6 +46,7 @@ impl Callee {
 			function,
 			leading: Box::new([]),
 			dispatch: Dispatch::Direct,
+			impl_bounds: None,
 		}
 	}
 }
@@ -58,6 +64,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let (env, own) = self.function_frames(function);
 		let mut type_args = self.callee_type_args(&callee, own, segment);
 		self.report_uninferred(env, segment.ident.span, false, &mut type_args);
+		self.check_impl_bounds(&callee, segment, &type_args);
 		self.check_param_bounds(
 			own,
 			TypeEnvOwner::Function(function),
@@ -155,6 +162,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let param = self.instantiate(params[at], env, &type_args);
 			self.expect(value, param);
 		}
+		self.check_impl_bounds(&callee, segment, &type_args);
 		self.check_param_bounds(
 			own,
 			TypeEnvOwner::Function(callee.function),
@@ -198,6 +206,46 @@ impl BodyContext<'_, '_, '_, '_> {
 			TypeEnvIdx::ROOT
 		};
 		(env, own)
+	}
+
+	/// Records and checks the bounds of the impl `callee` was selected from
+	/// with arguments still unknown, now that `type_args` holds them; they
+	/// lead the flat list. Reported at the callee's name.
+	fn check_impl_bounds(
+		&mut self,
+		callee: &Callee,
+		segment: &ast::PathSegment,
+		type_args: &[TypeIndex],
+	) {
+		let Some(impl_index) = callee.impl_bounds else {
+			return;
+		};
+		let env = self.cx.inherent_impls[usize::from(impl_index)]
+			.as_ref()
+			.expect("a selected impl has a header")
+			.type_params;
+		let impl_args = &type_args[..self.cx.type_envs.generic_count(env)];
+		let arguments = self.cx.types.push_list(impl_args);
+		let reference = SourceSpan::new(self.scope.file_id, segment.ident.span);
+		let mut obligations = Vec::new();
+		for (index, &argument) in impl_args.iter().enumerate() {
+			self.cx.record_bounds_check(
+				&mut obligations,
+				self.scope.env,
+				BoundRequirements::Parameter {
+					env,
+					index,
+					arguments,
+				},
+				Spanned {
+					inner: argument,
+					span: segment.ident.span,
+				},
+				reference,
+				TypeEnvOwner::InherentImpl(impl_index),
+			);
+		}
+		self.cx.check_now(&obligations);
 	}
 
 	/// A callee's flat type arguments before its call is checked: the leading

@@ -378,11 +378,18 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `match_impl_target` or `find_trait_impl`; `[Self]` for a trait's
   declaration) and whether it is reached directly or abstractly. The call then
   learns the function's own arguments as any call does. An inherent member is
-  as visible as written, a trait's member as the trait. Open: associated
+  as visible as written, a trait's member as the trait.
+  A generic struct named without its arguments (`Layout::of::<T>()`) is the
+  receiver `Layout<_>`: the call's flat list is the impl's slots, `INFER`
+  where the receiver does not say, then the method's own. The inherent impl is
+  chosen by shape: its slots are learned from the receiver, and it is a
+  candidate when its instantiated target still meets the receiver (a type's
+  inherent impls declare a name once, so there is at most one). Its bounds
+  wait for the call (`Callee::impl_bounds`), which proves them after learning
+  from the expected type and the arguments, as it does the function's own.
+  Trait members are not looked up on such a receiver yet. Open: associated
   constants (a trait's on an abstract receiver needs a node of its own, as in
-  the old checker), `Self` as a value (`Self(..)`), and a generic type named
-  without its arguments (`Layout::of::<T>()`), which needs the impl selected by
-  its constructor with the bounds proved after the call learns the arguments.
+  the old checker) and `Self` as a value (`Self(..)`).
 - **Method calls** `x.m(..)` (done): the same `Callee`, the checked receiver
   its first argument, learned from like any argument. Only a member taking
   `self` is a method. No auto-deref: a pointer receiver finds the pointee's
