@@ -521,9 +521,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				segments.last().unwrap(),
 				span,
 			),
+			// A global's name is its handle, of its own nominal type: its value
+			// is read with `Global::get` and written with `GlobalMut::set`.
 			DefKind::Global(global_index) => {
-				let ty = self.cx.global_value_type(global_index);
-				let ty = self.normalized(ty, TypeEnvIdx::ROOT);
+				let ty = self.cx.types.intern(Type::Global { global_index });
 				self.body.push(ExprKind::Global(global_index), ty, span)
 			}
 			_ => {
@@ -2974,20 +2975,16 @@ mod tests {
 	}
 
 	#[test]
-	fn assignment_writes_a_mutable_local_or_global() {
+	fn assignment_writes_a_mutable_local() {
 		test_case!(
 			case = indoc! {"
-				global mut counter: u32 = 0;
-				global limit: u32 = 10;
 				func f() {
 					local mut x: u8 = 1;
 					x = 2;
-					counter = 3;
 				}
 				func errors() {
 					local x: u8 = 1;
 					x = 2;
-					limit = 1;
 					errors() = ();
 					_ = 1;
 				}
@@ -2995,13 +2992,29 @@ mod tests {
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotMutateImmutable,
-			DiagnosticCode::CannotMutateImmutable,
 			DiagnosticCode::InvalidAssignmentTarget,
 			DiagnosticCode::TypeAnnotationRequired,
 		]);
-		assert_eq!(
-			case.shape("f"),
-			"(block (local x#0 1) (= x#0 2) (= counter 3))"
+		assert_eq!(case.shape("f"), "(block (local x#0 1) (= x#0 2))");
+	}
+
+	#[test]
+	fn a_global_is_a_handle_and_is_not_assigned() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				func f() {
+					counter = 3;
+					counter += 1;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::InvalidAssignmentTarget,
+		]);
+		case.diagnostics().assert_error_saying(
+			"a `global mut` is written with `counter.set(value)`",
 		);
 	}
 

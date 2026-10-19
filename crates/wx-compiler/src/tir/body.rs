@@ -191,9 +191,9 @@ pub(super) enum ExprKind {
 	Return {
 		value: Option<ExprIdx>,
 	},
-	/// `target = value`, where `target` is a `Local`, a `Global`, a
-	/// `FieldAccess` rooted in one of them, or a `Placeholder`: a location
-	/// that is not in linear memory.
+	/// `target = value`, where `target` is a `Local`, a `FieldAccess` rooted
+	/// in one, or a `Placeholder`: a location that is not in linear memory.
+	/// A global is never one: it is written through `GlobalMut::set`.
 	Assign {
 		target: ExprIdx,
 		value: ExprIdx,

@@ -2,10 +2,11 @@
 //!
 //! A place is a location in linear memory, reached through a pointer: `p.*`,
 //! and a field of a place. Everything else is a value, even when it names a
-//! location (a local, a global, a field of either), and is assigned through
-//! `Assign`; a place is written through `Store`. Reading a place is a `Load`,
-//! pushed only where its value is used, so `.&` and the left of `=` take the
-//! place itself.
+//! location (a local, or a field of one), and is assigned through `Assign`; a
+//! place is written through `Store`. A global's name is a handle, written
+//! through `GlobalMut::set`, so it is never the target of `=`. Reading a place
+//! is a `Load`, pushed only where its value is used, so `.&` and the left of
+//! `=` take the place itself.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
@@ -482,10 +483,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 	}
 
-	/// Whether `target`, a value, is something `=` can write: a local, a
-	/// global, `_`, or a field of one of them. A target that is not is
-	/// reported and gives `false`; one that is but is not `mut` is reported
-	/// and gives `true`, since its type still holds the value to it.
+	/// Whether `target`, a value, is something `=` can write: a local, `_`,
+	/// or a field of a local. A target that is not is reported and gives
+	/// `false`; one that is but is not `mut` is reported and gives `true`,
+	/// since its type still holds the value to it.
 	fn check_assignable(&mut self, target: ExprIdx) -> bool {
 		let mut root = target;
 		while let ExprKind::FieldAccess { object, .. } = self.body.kind(root) {
@@ -524,31 +525,28 @@ impl BodyContext<'_, '_, '_, '_> {
 				}
 				true
 			}
+			// A global is a handle, not a location: it is written through
+			// `GlobalMut::set`, never with `=`.
 			ExprKind::Global(global) => {
-				let def = &self.cx.defs.globals[usize::from(global)];
-				if def.mut_trait_impl_index.is_none() {
-					let name = self.cx.strings.resolve(def.name.inner).unwrap();
-					self.cx.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::CannotMutateImmutable.code(),
-							)
-							.with_message(format!(
-								"cannot assign to immutable global `{name}`"
-							))
-							.with_label(Label::primary(
-								self.scope.file_id,
-								span,
-							))
-							.with_label(
-								Label::secondary(def.file_id, def.name.span)
-									.with_message(format!(
-										"declare it `global mut {name}` to assign to it"
-									)),
-							),
-					);
-				}
-				true
+				let name = self.cx.defs.globals[usize::from(global)].name.inner;
+				let name = self.cx.strings.resolve(name).unwrap();
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidAssignmentTarget.code(),
+						)
+						.with_message(format!(
+							"cannot assign to global `{name}`"
+						))
+						.with_label(
+							Label::primary(self.scope.file_id, span)
+								.with_message("a global's name is its handle"),
+						)
+						.with_note(format!(
+							"a `global mut` is written with `{name}.set(value)`"
+						)),
+				);
+				false
 			}
 			_ => {
 				self.cx.diagnostics.push(

@@ -241,9 +241,11 @@ ExprKind::AddressOf(PlaceIdx)                // `.&`
 ExprKind::FieldAccess { object, field }      // a field of a value (local, call result)
 ```
 
-A local, a global or a field of a value is not a place: it has no address, and
-whether it is assignable is a property of the expression (`Local`, `Global`,
-`FieldAccess` rooted in one, `Placeholder`). There is no temporary root:
+A local or a field of a value is not a place: it has no address, and whether
+it is assignable is a property of the expression (`Local`, `FieldAccess`
+rooted in one, `Placeholder`). A global's name is its handle (`Type::Global`),
+not a location: it is read with `Global::get` and written with
+`GlobalMut::set`, so `=` on it is an invalid target. There is no temporary root:
 deciding where a call's result lives is MIR's job. The assignment kinds stay
 separate, for the reasons they were split in the old checker: a place is an
 address computed once and written through (`Store`, `CompoundStore`), the other
@@ -355,7 +357,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 - **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.
-  Decision: Q2 (globals).
+  Globals are handles, written through `GlobalMut::set` (Q2).
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
 - **`match`** on enums, `bool`, integers and `char`: patterns, exhaustiveness
@@ -390,13 +392,11 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   inference variables across statements; `local x = 5;` needs a type)? Everything
   above assumes yes; the alternative needs a fulfillment context and deferred
   obligations per body, which `check_now` deliberately avoids.
-- **Q2. Globals.** A global's type is now nominal (`Type::Global`, with `impl
-  Global { get }` and `impl GlobalMut { set }`), but the examples read and
-  assign them as plain values (`bump = new_end; bump as u32`). Is the plan that
-  the name `bump` in an expression means its value and is a place (implicit
-  `get`/`set`), or that it means the handle and the user writes `bump.get()` /
-  `bump.set(x)`? Same question, smaller, for a memory's name (`heap.grow(1)` is a
-  handle; is it ever a value otherwise?).
+- **Q2. Globals.** Decided: a global's name means its handle, of its nominal
+  type `Type::Global` (with `impl Global { get }` and, for `global mut`,
+  `impl GlobalMut { set }`). Its value is `g.get()`, a write is `g.set(x)`;
+  `g = x` and `g op= x` are invalid assignment targets. Until method calls are
+  checked, both forms are reported as unsupported.
 - **Q3. Calls through `Call`.** Should `f(x)` on a value whose type implements
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
