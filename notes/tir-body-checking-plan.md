@@ -308,6 +308,68 @@ Calling a value of a user type that implements `Call` would be a `Call` of
 
 ### Patterns
 
+Decided design; not implemented yet. One pattern grammar serves `local` and
+`match` arms. Function parameters are never patterns: a parameter is
+`[mut] name`, since a call by name needs every parameter to have one.
+
+**Two modes.** A pattern is parsed in *binding mode* or *value mode*, and every
+subpattern inherits its parent's mode unless it is marked. `case P` parses `P`
+in value mode; `local P` parses `P` in binding mode. A pattern starts in
+binding mode.
+
+| | binding mode (default) | value mode |
+|---|---|---|
+| bare name `x` | a binding | a value, resolved as a path |
+| path `a::B` | error: a value needs `case` | a value |
+| literal `0`, `-1`, `'a'`, `true` | error: a value needs `case` | a value |
+| `_`, `(..)`, `P(..)`, `P({ .. })` | destructures | destructures; children in value mode |
+| `A \| B` | not allowed (yet) | an or-pattern; its alternatives bind nothing (yet) |
+| `mut x` | a mutable binding | written `local mut x` |
+| switch | `case P` | `local P` |
+
+```
+match point {
+    case Point(0, 0) -> origin(),
+    case Point(local x, 0) -> on_x_axis(x),
+    Point(x, case 0) -> on_x_axis(x),
+    Point(case 0, case 5 | 10) -> { .. },
+    (x, y) -> { .. },
+    _ -> { .. },
+}
+```
+
+`case` binds looser than `|`: `case 5 | 10` is `case (5 | 10)`. A redundant
+marker (`case` inside value mode, `local` inside binding mode) parses and is
+warned about. Arms keep `->`. `case` becomes a keyword.
+
+**Why modes.** A single name in a pattern means one thing by syntax alone: the
+mode, not name lookup, decides whether `MAX` binds or compares, so renaming or
+removing a constant is an error ("cannot find value `MAX`") and never a silent
+catch-all, as it is in Rust.
+
+**Refutability is syntactic.** wx enums carry no data, so destructuring a tuple
+or a struct always matches, and a pattern can fail only where it is in value
+mode. A `local` statement therefore takes a pattern without `case`; a `case`
+there is an error ("a `local` pattern cannot test a value"), and a plain
+`local (5, 'a') = x` is already one, a literal needing `case`. A match arm takes
+any pattern.
+
+**Values are constants.** A value leaf is a literal, an enum variant, a
+`const`, or an associated constant (`case u32::MAX`, `case Self::LIMIT`),
+resolved as a value path that never sees locals: `case y` for a local `y` is
+"cannot find value `y`", with a note that a local cannot be compared in a
+pattern. An untyped literal takes the type it is checked against. A struct in
+value mode is compared structurally, field by field, never through
+`PartialEq`. An abstract constant (`case T::LIMIT`) is accepted and never
+counts towards exhaustiveness.
+
+**Checking flows down.** A pattern is checked against the type it is given:
+the scrutinee's, or a `local`'s value (or annotation). A struct pattern names
+its struct (`Point(..)`, `Self(..)`), checks field privacy as construction
+does, and takes at most one `..`. Each match arm owns a scope for its bindings.
+
+**TIR.** One arena in `Body`, shared by `local` and `match`:
+
 ```rust
 index_newtype!(PatIdx);
 enum PatKind {
@@ -315,19 +377,29 @@ enum PatKind {
     Bind(LocalIdx),
     Tuple(PatRange),
     Struct { struct_index: StructIdx, fields: PatRange, order: ArgOrder, rest: bool },
-    // match only:
-    Literal(ExprIdx),            // an integer/bool/char literal node, already coerced
-    Variant(ConstIdx),
+    // value mode
+    Int { value: u64, negative: bool },
+    Bool(bool),
+    Char(char),
+    Constant { constant: ConstIdx, type_args: TypeList },
+    AbstractConstant { constant: ConstIdx, type_args: TypeList },
+    Or(PatRange),
 }
-// Body gains: pats: Vec<PatKind>, pat_types: Vec<TypeIndex>, pat_spans, pat_extra
+// Body gains pats: Vec<PatKind>, with a type and a span each.
 ```
 
-`local` destructuring and `match` arms share it. `ArgOrder` already models
-"which field does the n-th element give", so struct patterns reuse it. MIR's
-flattened `PathStep` list is a walk over this. Match arms are still parsed as
-expressions (`ast::MatchArm::pattern`), so the pattern lowerer reads expression
-syntax; that is fine for literals, `_` and variant paths, and is where an
-or-pattern or a binding pattern would need a parser change later.
+`ExprKind::LocalDeclaration` takes a `PatIdx`; `ExprKind::Match { scrutinee,
+arms }` holds `(PatIdx, ExprIdx)` pairs. Exhaustiveness and unreachable arms
+are one usefulness pass (Maranget's algorithm, as rustc's
+`rustc_pattern_analysis`): enum variants and `bool` are finite, integers and
+`char` need a catch-all, tuples and structs are products.
+
+**AST.** `ast::Pattern` gains the value leaves (a literal, possibly negated; a
+path), `Or`, and the two markers, kept with their keyword spans for the
+formatter and the redundancy warning. The parser decides the mode, so a bare
+name reaches the AST as a `Binding` or a one-segment value path, never as
+something TIR must reinterpret. `MatchArm::pattern` becomes a `Pattern`
+instead of an expression.
 
 ## Order of work
 
@@ -415,10 +487,10 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   Globals are handles, written through `GlobalMut::set` (Q2).
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
-- **`match`** on enums, `bool`, integers and `char`: patterns, exhaustiveness
-  (enum variants and `bool` by set, integers need `_`), unreachable arms.
-- **`local` destructuring**: the pattern arena; mostly a port of
-  `collect_pattern_bindings`, minus the path bookkeeping.
+- **Patterns** (designed, see "Patterns"), in this order: the parser (modes,
+  markers, value leaves, `MatchArm::pattern` as a pattern); `local`
+  destructuring, binding mode only, with the pattern arena; then `match`, with
+  value mode, arm scopes and the usefulness pass.
 
 ### 3. Think first
 
