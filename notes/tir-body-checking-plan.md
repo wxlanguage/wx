@@ -389,7 +389,13 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   from the expected type and the arguments, as it does the function's own.
   Trait members are not looked up on such a receiver yet. Open: associated
   constants (a trait's on an abstract receiver needs a node of its own, as in
-  the old checker) and `Self` as a value (`Self(..)`).
+  the old checker).
+- **`Self` as a value** (done): inside an impl whose target is a struct,
+  `Self(..)` and `Self({ .. })` construct it with the target's arguments
+  (`impl<Mem> Layout<Mem>` builds `Layout<Mem>`), checked where every field is
+  visible like any construction. Bare `Self` is a struct used as a value
+  (E2110). In a trait's default body, outside an impl, or for a target that is
+  not a struct, `Self` names nothing to construct (E2009).
 - **Method calls** `x.m(..)` (done): the same `Callee`, the checked receiver
   its first argument, learned from like any argument. Only a member taking
   `self` is a method. No auto-deref: a pointer receiver finds the pointee's

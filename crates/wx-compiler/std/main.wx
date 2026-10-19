@@ -2061,12 +2061,12 @@ pub struct Layout<Mem: Memory>(
 impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub func of<T>() -> Self {
-        Self({ size: size_of::<T>(), align: align_of::<T>() })
+        Self({ size: size_of::<T, Mem>(), align: align_of::<T, Mem>() })
     }
 
     #[inline]
     pub func array<T>(count: Mem::Size) -> Self {
-        Self({ align: align_of::<T>(), size: size_of::<T>() * count })
+        Self({ align: align_of::<T, Mem>(), size: size_of::<T, Mem>() * count })
     }
 
     #[inline]

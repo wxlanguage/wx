@@ -43,7 +43,7 @@ use super::body::{
 };
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, FunctionIdx,
-	MemberKind, StructIdx, Tier, TypesetIdx,
+	MemberKind, StructIdx, Tier, TypesetIdx, Visibility,
 };
 use super::imports::report_private_identifier;
 use super::literals::{
@@ -58,7 +58,7 @@ use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{
-	Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
 use crate::ast::{self, BinaryOp, Keyword, Ownership, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -480,6 +480,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let ty = self.body.local(local).ty;
 			return self.body.push(ExprKind::Local(local), ty, span);
 		}
+		if let [segment] = segments
+			&& segment.ident.inner == Keyword::SelfPascal.symbol()
+		{
+			if self.impl_self_struct(segment).is_some() {
+				self.report_struct_used_as_value(
+					Keyword::SelfPascal.symbol(),
+					span,
+				);
+			}
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		}
 		let walk = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => walk,
 			Ok(ValuePath::Member(path)) => {
@@ -512,19 +523,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			DefKind::Struct(struct_index) => {
 				let name = self.cx.defs.structs[usize::from(struct_index)].name;
-				let name = self.cx.strings.resolve(name.inner).unwrap();
-				self.cx.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::StructUsedAsValue.code())
-						.with_message(format!(
-							"expected a value, found struct `{name}`"
-						))
-						.with_label(Label::primary(self.scope.file_id, span))
-						.with_note(format!(
-							"a struct's name is only a value when it is called: \
-							 `{name}(...)`"
-						)),
-				);
+				self.report_struct_used_as_value(name.inner, span);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 			DefKind::Function(function_index) => self.build_function_value(
@@ -556,9 +555,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Result<ValuePath<'s>, ExprIdx> {
 		let (member, prefix) = segments.split_last().unwrap();
 		let first = segments[0].ident.inner;
-		if prefix.is_empty() && first == Keyword::SelfPascal.symbol() {
-			return Err(self.unsupported(span, "`Self` as a value"));
-		}
 		if !prefix.is_empty()
 			&& (first == Keyword::SelfPascal.symbol()
 				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
@@ -687,6 +683,33 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		{
 			return self.unsupported(span, "a call of a local");
 		}
+		// `Self(..)` constructs the struct the impl around it is for, with
+		// that target's arguments.
+		if let [segment] = &**segments
+			&& segment.ident.inner == Keyword::SelfPascal.symbol()
+		{
+			let Some((struct_index, type_args)) =
+				self.impl_self_struct(segment)
+			else {
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			};
+			if !self.constructor_accessible(struct_index) {
+				let diagnostic = self.report_private_constructor(
+					struct_index,
+					None,
+					segment,
+				);
+				self.cx.diagnostics.push(diagnostic);
+			}
+			return self.build_construction(
+				struct_index,
+				type_args,
+				segment,
+				arguments,
+				expected,
+				span,
+			);
+		}
 		let walk = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => walk,
 			Ok(ValuePath::Member(path)) => {
@@ -730,14 +753,37 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		};
 		let segment = segments.last().unwrap();
 		if let BindingTarget::Inaccessible(key) = walk.target {
-			let diagnostic =
-				self.report_private_constructor(struct_index, key, segment);
+			let diagnostic = self.report_private_constructor(
+				struct_index,
+				Some(key),
+				segment,
+			);
 			self.cx.diagnostics.push(diagnostic);
 		}
 		// The struct's type arguments are learned within this call: from what
 		// is written on its name, the expected type, and then the fields.
-		let mut type_args =
-			self.struct_type_args(struct_index, segment, expected);
+		let type_args = self.struct_type_args(struct_index, segment, expected);
+		self.build_construction(
+			struct_index,
+			type_args,
+			segment,
+			arguments,
+			expected,
+			span,
+		)
+	}
+
+	/// The construction of `struct_index` from `arguments`, its type
+	/// arguments as known before the fields are (`INFER` where unknown).
+	fn build_construction(
+		&mut self,
+		struct_index: StructIdx,
+		mut type_args: Box<[TypeIndex]>,
+		segment: &ast::PathSegment,
+		arguments: Arguments<'_>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
 		let given = match arguments {
 			Arguments::Positional(arguments) => self.positional_fields(
 				struct_index,
@@ -1197,10 +1243,102 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// A struct's constructor is as visible as the struct and every one of
 	/// its fields. When the struct is visible, the private fields are why its
 	/// constructor is not, and the report says so.
+	/// The struct `Self` names here, the target of the impl around this
+	/// body, with that target's arguments; recorded as what `Self` refers to.
+	/// `None` when `Self` names no struct here (reported).
+	fn impl_self_struct(
+		&mut self,
+		segment: &ast::PathSegment,
+	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
+		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
+		let Some((impl_kind, target)) =
+			self.cx.resolve_impl_self(self.scope.env)
+		else {
+			// A trait's `Self` is the type implementing it, which is not
+			// known to be a struct; elsewhere `Self` names nothing.
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::CannotCallExpression.code())
+					.with_message("`Self` names no struct here")
+					.with_label(site.primary_label())
+					.with_note(
+						"`Self` is constructed only inside an impl for a struct",
+					),
+			);
+			return None;
+		};
+		self.cx.resolutions.by_site.insert(
+			(site, Tier::Value),
+			match impl_kind {
+				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
+				ImplKind::Trait(index) => Referent::TraitImplSelf(index),
+			},
+		);
+		if !segment.type_args.is_empty() {
+			let diagnostic = self.cx.report_type_args_on_impl_self(
+				self.scope.file_id,
+				segment,
+				impl_kind,
+			);
+			self.cx.diagnostics.push(diagnostic);
+		}
+		let Type::Struct {
+			struct_index,
+			type_args,
+		} = *self.cx.types.resolve(target)
+		else {
+			if target != TypeIndex::ERROR {
+				let target = self.cx.type_formatter().display_type(target);
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::CannotCallExpression.code())
+						.with_message(format!(
+							"`Self` is `{target}`, which is not a struct"
+						))
+						.with_label(site.primary_label())
+						.with_note(
+							"only a struct is constructed through `Self`",
+						),
+				);
+			}
+			return None;
+		};
+		Some((struct_index, self.cx.types.list(type_args).into()))
+	}
+
+	/// Whether every field of `struct_index` is visible here, which is where
+	/// its constructor is.
+	fn constructor_accessible(&self, struct_index: StructIdx) -> bool {
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		def.fields.iter().all(|field| {
+			self.cx.defs.namespaces.is_accessible_from(
+				self.scope.namespace,
+				def.namespace.into(),
+				Visibility::from(field.pub_span),
+			)
+		})
+	}
+
+	fn report_struct_used_as_value(&mut self, name: SymbolU32, span: TextSpan) {
+		let name = self.cx.strings.resolve(name).unwrap();
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::StructUsedAsValue.code())
+				.with_message(format!(
+					"expected a value, found struct `{name}`"
+				))
+				.with_label(Label::primary(self.scope.file_id, span))
+				.with_note(format!(
+					"a struct's name is only a value when it is called: \
+					 `{name}(...)`"
+				)),
+		);
+	}
+
 	fn report_private_constructor(
 		&self,
 		struct_index: StructIdx,
-		key: DefKey,
+		key: Option<DefKey>,
 		segment: &ast::PathSegment,
 	) -> Diagnostic<FileId> {
 		let def = &self.cx.defs.structs[usize::from(struct_index)];
@@ -1225,7 +1363,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				strings,
 				segment.ident.inner,
 				site,
-				Some(key),
+				key,
 			);
 		}
 		let mut diagnostic = Diagnostic::error()
@@ -2538,14 +2676,15 @@ mod tests {
 				.expect("a function with a block has a body")
 		}
 
-		/// The rendered block of the impl member `name`, which only one impl
-		/// in the test declares.
+		/// The rendered block of the member `name`, which only one impl or
+		/// trait in the test defines with a block.
 		fn member_shape(&self, name: &str) -> String {
 			let symbol = self.context.strings.get(name).unwrap();
 			let mut found = self.defs.functions.iter().enumerate().filter(
-				|(_, function)| {
+				|&(index, function)| {
 					function.name.inner == symbol
 						&& !matches!(function.owner, FunctionOwner::Free)
+						&& self.context.function_bodies[index].is_some()
 				},
 			);
 			let (index, _) = found.next().unwrap();
@@ -3819,6 +3958,59 @@ mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	#[test]
+	fn self_constructs_the_struct_its_impl_is_for() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					func positional(x: T) -> W<T> { Self(x) }
+					func named(x: T) -> Self { Self({ x }) }
+				}
+				struct P();
+				trait Make { func make() -> Self; }
+				impl Make for P { func make() -> Self { Self() } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.member_shape("positional"), "(block => (W x#0))");
+		assert_eq!(case.member_shape("named"), "(block => (W x#0))");
+		assert_eq!(case.member_shape("make"), "(block => (P))");
+	}
+
+	#[test]
+	fn self_is_constructed_only_where_it_names_an_accessible_struct() {
+		test_case!(
+			case = indoc! {"
+				mod inner { pub struct P(x: u32); }
+				impl inner::P { func outside() -> inner::P { Self(1) } }
+				struct W(x: u32);
+				impl W {
+					func bare() { local w = Self; }
+					func written() -> W { Self::<u8>(1) }
+				}
+				enum E: u8 { A = 0 }
+				impl E { func variant() -> E { Self(0) } }
+				trait Tr { func make() -> Self { Self() } }
+				func free() { Self(); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PrivateItem,
+			DiagnosticCode::StructUsedAsValue,
+			DiagnosticCode::TypeArgumentsNotAllowed,
+			DiagnosticCode::CannotCallExpression,
+			DiagnosticCode::CannotCallExpression,
+			DiagnosticCode::CannotCallExpression,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the constructor of struct `P` is private");
+		case.diagnostics()
+			.assert_error_saying("`Self` is `E`, which is not a struct");
+		case.diagnostics()
+			.assert_error_saying("`Self` names no struct here");
 	}
 
 	#[test]

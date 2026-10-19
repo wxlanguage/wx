@@ -939,7 +939,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// What `Self` means inside an impl: the impl's target, found through the
 	/// frame every impl owns. `None` outside an impl, and in the impl's own
 	/// header, whose target is what `Self` would name.
-	fn resolve_impl_self(
+	pub(super) fn resolve_impl_self(
 		&self,
 		env: TypeEnvIdx,
 	) -> Option<(ImplKind, TypeIndex)> {
@@ -958,7 +958,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Type arguments written on an impl's `Self`, which already names the
 	/// target with its arguments: the target is shown, and a struct's own
 	/// name suggested for writing other arguments.
-	fn report_type_args_on_impl_self(
+	pub(super) fn report_type_args_on_impl_self(
 		&self,
 		file_id: FileId,
 		segment: &ast::PathSegment,
