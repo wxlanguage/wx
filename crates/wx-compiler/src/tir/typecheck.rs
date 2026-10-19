@@ -121,7 +121,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// Pushes the root scope, which every body has.
 	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
 		let root = self.body.push_scope(Scope {
-			kind: ScopeKind::Root,
+			kind: ScopeKind::Block,
 			parent: None,
 			label: None,
 			span,
@@ -2621,10 +2621,7 @@ mod tests {
 			body.local(super::LocalIdx::new(0)).scope,
 			super::ScopeIdx::ROOT
 		);
-		assert_eq!(
-			body.scope(super::ScopeIdx::ROOT).kind,
-			super::ScopeKind::Root
-		);
+		assert!(body.scope(super::ScopeIdx::ROOT).parent.is_none());
 		// Each use of a parameter is recorded as a reference to it.
 		let file_id = case
 			.defs

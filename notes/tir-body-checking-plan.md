@@ -104,9 +104,9 @@ struct Scope {
 }
 
 enum ScopeKind {
-    Root,
-    /// `block { .. }`, an `if`/`else` branch, a match arm's body. Its type is
-    /// its tail's, or a `break` value's when it is labelled.
+    /// `block { .. }`, an `if`/`else` branch, a match arm's body, or the body
+    /// itself (the root is the scope without a parent). Its type is its
+    /// tail's, or a `break` value's when it is labelled.
     Block,
     /// `loop { .. }`: `continue` re-enters it, its type comes only from `break`.
     Loop,

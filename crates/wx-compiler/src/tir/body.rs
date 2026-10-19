@@ -262,10 +262,8 @@ pub(super) enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum ScopeKind {
-	/// The body itself: a function's block, or a constant's or global's
-	/// initializer.
-	Root,
-	/// A block, an `if`/`else` branch.
+	/// A block, an `if`/`else` branch, or the body itself (the root scope,
+	/// the one without a parent).
 	Block,
 	/// A loop's block, which `continue` restarts.
 	Loop,
