@@ -9,7 +9,7 @@
 //! Operators are checked through their trait (`OperatorTraits`): the trait
 //! decides whether the operator applies to a type. The node built for it is a
 //! `PrimitiveBinary`/`PrimitiveUnary` on a primitive scalar, and a call of the
-//! impl's or the trait's method otherwise (`ImplMethodCall`/`TraitMethodCall`).
+//! impl's or the trait's method otherwise (`ConcreteMethodCall`/`AbstractMethodCall`).
 //!
 //! Untyped literals keep the pseudo-types `Integer`/`Float` until context
 //! gives them one (`coerce`), which rewrites the subtree in place.
@@ -1486,10 +1486,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let args = self.body.push_args(args);
 		match self.select_operator_method(selected) {
 			SelectedMethod::Concrete(method) => {
-				ExprKind::ImplMethodCall { method, args }
+				ExprKind::ConcreteMethodCall { method, args }
 			}
 			SelectedMethod::Abstract(method) => {
-				ExprKind::TraitMethodCall { method, args }
+				ExprKind::AbstractMethodCall { method, args }
 			}
 		}
 	}
@@ -2393,11 +2393,11 @@ mod tests {
 				ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 					list(op.as_str(), &[lhs, rhs])
 				}
-				ExprKind::ImplMethodCall { method, args } => {
+				ExprKind::ConcreteMethodCall { method, args } => {
 					let method = self.function_name(method);
 					list(&format!("call {method}"), body.args(args))
 				}
-				ExprKind::TraitMethodCall { method, args } => {
+				ExprKind::AbstractMethodCall { method, args } => {
 					let method = self.function_name(method);
 					list(&format!("generic {method}"), body.args(args))
 				}
@@ -2480,7 +2480,7 @@ mod tests {
 				ExprKind::PrimitiveCompoundAssign { op, target, value } => {
 					list(&format!("{}=", op.as_str()), &[target, value])
 				}
-				ExprKind::ImplCompoundAssign {
+				ExprKind::ConcreteCompoundAssign {
 					method,
 					target,
 					value,
@@ -2488,7 +2488,7 @@ mod tests {
 					&format!("assign call {}", self.function_name(method)),
 					&[target, value],
 				),
-				ExprKind::TraitCompoundAssign {
+				ExprKind::AbstractCompoundAssign {
 					method,
 					target,
 					value,
@@ -2504,7 +2504,7 @@ mod tests {
 						self.render(body, value)
 					)
 				}
-				ExprKind::ImplCompoundStore {
+				ExprKind::ConcreteCompoundStore {
 					method,
 					place,
 					value,
@@ -2514,7 +2514,7 @@ mod tests {
 					self.render_place(body, place),
 					self.render(body, value)
 				),
-				ExprKind::TraitCompoundStore {
+				ExprKind::AbstractCompoundStore {
 					method,
 					place,
 					value,

@@ -98,8 +98,8 @@ pub(super) enum ExprKind {
 	Function(FunctionIdx),
 	// Operators and compound assignment. A name says what defines the
 	// operation: `Primitive`, the operator of a primitive scalar (it holds the
-	// `op`); `Impl`, the method of the impl selected for a concrete type;
-	// `Trait`, the trait's declaration of the method, for an abstract type,
+	// `op`); `Concrete`, the method of the impl selected for a concrete type;
+	// `Abstract`, the trait's declaration of the method, for an abstract type,
 	// whose impl is selected at monomorphization (both hold the `method`).
 	// It then says where the result goes: `Assign`, a local or a field of
 	// one; `Store`, a place in linear memory; neither, it is a value.
@@ -117,13 +117,13 @@ pub(super) enum ExprKind {
 	},
 	/// An operator on a concrete type: a call of the selected impl's method,
 	/// the receiver first in `args`.
-	ImplMethodCall {
+	ConcreteMethodCall {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
 	/// An operator on an abstract type: a call of the trait's declaration of
 	/// the method, the receiver first in `args`.
-	TraitMethodCall {
+	AbstractMethodCall {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
@@ -224,14 +224,14 @@ pub(super) enum ExprKind {
 	},
 	/// `target op= value` on a concrete type, through the selected impl's
 	/// method.
-	ImplCompoundAssign {
+	ConcreteCompoundAssign {
 		method: FunctionIdx,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
 	/// `target op= value` on an abstract type, through the trait's
 	/// declaration of the method.
-	TraitCompoundAssign {
+	AbstractCompoundAssign {
 		method: FunctionIdx,
 		target: ExprIdx,
 		value: ExprIdx,
@@ -245,14 +245,14 @@ pub(super) enum ExprKind {
 	},
 	/// `place op= value` on a concrete type, through the selected impl's
 	/// method.
-	ImplCompoundStore {
+	ConcreteCompoundStore {
 		method: FunctionIdx,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
 	/// `place op= value` on an abstract type, through the trait's
 	/// declaration of the method.
-	TraitCompoundStore {
+	AbstractCompoundStore {
 		method: FunctionIdx,
 		place: PlaceIdx,
 		value: ExprIdx,
@@ -547,12 +547,12 @@ impl BodyBuilder {
 				value: rhs,
 				..
 			}
-			| ExprKind::ImplCompoundAssign {
+			| ExprKind::ConcreteCompoundAssign {
 				target: lhs,
 				value: rhs,
 				..
 			}
-			| ExprKind::TraitCompoundAssign {
+			| ExprKind::AbstractCompoundAssign {
 				target: lhs,
 				value: rhs,
 				..
@@ -563,8 +563,8 @@ impl BodyBuilder {
 			| ExprKind::LocalDeclaration { value, .. }
 			| ExprKind::Store { value, .. }
 			| ExprKind::PrimitiveCompoundStore { value, .. }
-			| ExprKind::ImplCompoundStore { value, .. }
-			| ExprKind::TraitCompoundStore { value, .. } => {
+			| ExprKind::ConcreteCompoundStore { value, .. }
+			| ExprKind::AbstractCompoundStore { value, .. } => {
 				([Some(value), None, None], &[])
 			}
 			ExprKind::IfElse {
@@ -587,8 +587,8 @@ impl BodyBuilder {
 				&self.extra[statements.start as usize
 					..(statements.start + statements.len) as usize],
 			),
-			ExprKind::ImplMethodCall { args, .. }
-			| ExprKind::TraitMethodCall { args, .. }
+			ExprKind::ConcreteMethodCall { args, .. }
+			| ExprKind::AbstractMethodCall { args, .. }
 			| ExprKind::StructConstructor { args, .. }
 			| ExprKind::Tuple { elements: args }
 			| ExprKind::Loop {

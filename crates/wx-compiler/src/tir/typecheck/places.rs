@@ -369,14 +369,14 @@ impl BodyContext<'_, '_, '_, '_> {
 						}
 					}
 					CompoundMethod::Concrete(method) => {
-						ExprKind::ImplCompoundStore {
+						ExprKind::ConcreteCompoundStore {
 							method,
 							place,
 							value,
 						}
 					}
 					CompoundMethod::Abstract(method) => {
-						ExprKind::TraitCompoundStore {
+						ExprKind::AbstractCompoundStore {
 							method,
 							place,
 							value,
@@ -415,14 +415,14 @@ impl BodyContext<'_, '_, '_, '_> {
 						}
 					}
 					CompoundMethod::Concrete(method) => {
-						ExprKind::ImplCompoundAssign {
+						ExprKind::ConcreteCompoundAssign {
 							method,
 							target,
 							value,
 						}
 					}
 					CompoundMethod::Abstract(method) => {
-						ExprKind::TraitCompoundAssign {
+						ExprKind::AbstractCompoundAssign {
 							method,
 							target,
 							value,

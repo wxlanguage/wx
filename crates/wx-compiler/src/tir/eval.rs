@@ -248,8 +248,8 @@ impl TypeContext<'_, '_, '_> {
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
 			// Locals, calls, control flow and memory are not evaluated (yet).
-			ExprKind::ImplMethodCall { .. }
-			| ExprKind::TraitMethodCall { .. }
+			ExprKind::ConcreteMethodCall { .. }
+			| ExprKind::AbstractMethodCall { .. }
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)
 			| ExprKind::Function(_)
@@ -269,11 +269,11 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::Assign { .. }
 			| ExprKind::Store { .. }
 			| ExprKind::PrimitiveCompoundAssign { .. }
-			| ExprKind::ImplCompoundAssign { .. }
-			| ExprKind::TraitCompoundAssign { .. }
+			| ExprKind::ConcreteCompoundAssign { .. }
+			| ExprKind::AbstractCompoundAssign { .. }
 			| ExprKind::PrimitiveCompoundStore { .. }
-			| ExprKind::ImplCompoundStore { .. }
-			| ExprKind::TraitCompoundStore { .. } => {
+			| ExprKind::ConcreteCompoundStore { .. }
+			| ExprKind::AbstractCompoundStore { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::Int(value) => match Scalar::from_type(ty) {

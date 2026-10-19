@@ -4719,11 +4719,11 @@ pub(super) mod tests {
 						render(case, body, lhs),
 						render(case, body, rhs)
 					),
-					ExprKind::ImplMethodCall { method, args }
-					| ExprKind::TraitMethodCall { method, args } => {
+					ExprKind::ConcreteMethodCall { method, args }
+					| ExprKind::AbstractMethodCall { method, args } => {
 						let generic = matches!(
 							body.kind(expr),
-							ExprKind::TraitMethodCall { .. }
+							ExprKind::AbstractMethodCall { .. }
 						);
 						let name =
 							case.defs.functions[usize::from(method)].name.inner;

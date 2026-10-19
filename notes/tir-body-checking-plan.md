@@ -11,7 +11,7 @@ the end; several sections depend on their answers.
 (`body.rs`) for a constant initializer or an enum discriminant. It covers:
 literals (with in-place coercion of untyped subtrees, typeset targets included),
 grouping, unary/binary operators through their traits (`PrimitiveBinary`/
-`PrimitiveUnary` on a primitive scalar, `ImplMethodCall`/`TraitMethodCall`
+`PrimitiveUnary` on a primitive scalar, `ConcreteMethodCall`/`AbstractMethodCall`
 otherwise), tuples, paths to
 constants and variants, and struct construction by position or name with local
 inference of the struct's type arguments (`meet`/`learn`) and bound checks at
@@ -256,8 +256,8 @@ checker: a place is an address computed once and written through (`Store`,
 `*CompoundAssign`); and an abstract target type keeps the trait's declaration
 for monomorphization. Operator and compound nodes are named on two axes. The
 prefix says what defines the operation: `Primitive` (the primitive scalar's
-operator, holding `op`), `Impl` (the method of the impl selected for a concrete
-type) or `Trait` (the trait's declaration, its impl selected at
+operator, holding `op`), `Concrete` (the method of the impl selected for a
+concrete type) or `Abstract` (the trait's declaration, its impl selected at
 monomorphization), both holding `method`. The rest says where the result goes:
 `Assign` (a local or a field of one), `Store` (a place in linear memory), or
 nowhere (a value):
@@ -265,8 +265,8 @@ nowhere (a value):
 | | value | into a local | into memory |
 |---|---|---|---|
 | `Primitive` | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
-| `Impl` | `ImplMethodCall` | `ImplCompoundAssign` | `ImplCompoundStore` |
-| `Trait` | `TraitMethodCall` | `TraitCompoundAssign` | `TraitCompoundStore` |
+| `Concrete` | `ConcreteMethodCall` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
+| `Abstract` | `AbstractMethodCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
 
 Compared with the old checker, which had four compound nodes that always held a
 method (primitives went through their `#[inline]` impls), the `Primitive`
@@ -288,7 +288,7 @@ enum Callee {
 }
 ```
 
-`ImplMethodCall`/`TraitMethodCall` from operators fold into this. Struct
+`ConcreteMethodCall`/`AbstractMethodCall` from operators fold into this. Struct
 construction stays its own kind (no callee). Inference for a function call is
 struct construction generalised: the callee's parameter frame plays the struct's
 role, the parameter types the fields', and the return type is met with the
@@ -397,7 +397,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   pitfall). New code can do it from the start since impl members carry
   visibility; decide the rule for trait default methods (fall back to the
   trait's visibility).
-- **Impl conformance** is not a body concern, but `TraitMethodCall` to a
+- **Impl conformance** is not a body concern, but `AbstractMethodCall` to a
   default the impl does not override assumes it. Keep it on the list.
 - **Constant evaluation of richer bodies**: the evaluator returns `NotConst`
   for anything it does not know, so new kinds are safe by default. Whether
@@ -419,9 +419,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
 - **Q4. Operator nodes.** Decided: one node per way an operation is defined
-  (`Primitive`/`Impl`/`Trait`) and per destination (value, `Assign`, `Store`);
+  (`Primitive`/`Concrete`/`Abstract`) and per destination (value, `Assign`, `Store`);
   see the table under places and assignment.
 - **Q5. Typeset-abstract literal arithmetic in bodies.** Coercion of literals
   to an abstract typeset-bounded `T` exists for constants; in a body, an operator
-  on `T` gives a `TraitMethodCall`. Is anything beyond that expected (for
+  on `T` gives a `AbstractMethodCall`. Is anything beyond that expected (for
   example `as` casts between typeset members)?
