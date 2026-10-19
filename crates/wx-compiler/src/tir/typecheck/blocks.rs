@@ -50,7 +50,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			block.inner.as_block_statements(),
 			block.span,
 		);
-		self.finish(root)
+		self.body.finish(root)
 	}
 
 	/// Enters a new scope inside the current one; `leave_scope` returns to

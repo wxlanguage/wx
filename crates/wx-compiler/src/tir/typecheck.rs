@@ -111,7 +111,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let expected = self.normalized(expected, self.scope.env);
 		self.enter_root(expr.span, expected);
 		let root = self.check(expr, expected);
-		self.finish(root)
+		self.body.finish(root)
 	}
 
 	/// Pushes the root scope, which every body has.
@@ -129,10 +129,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		});
 	}
 
-	fn finish(self, root: ExprIdx) -> Body {
-		self.body.finish(root)
-	}
-
 	/// Checks an enum variant's value as a value of the enum's `repr`. A
 	/// variant written without one counts on from `previous`, the variant
 	/// before it; the first variant has nothing to count from.
@@ -148,7 +144,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// value against it would only repeat that.
 		if repr == TypeIndex::ERROR {
 			let root = self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
-			return self.finish(root);
+			return self.body.finish(root);
 		}
 		let root = match (variant.value.as_deref(), previous) {
 			(Some(value), _) => self.check(value, repr),
@@ -176,7 +172,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 		};
-		self.finish(root)
+		self.body.finish(root)
 	}
 
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
