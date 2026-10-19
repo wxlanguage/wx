@@ -52,7 +52,7 @@ Changed, because the rest of TIR moved on:
 | --- | --- |
 | Boxed `Expression` tree, `Result<Expression, ()>` (a failure drops the node) | Arena, failures are `ExprKind::Error` nodes typed `ERROR` |
 | `accesses: Vec<..>` on locals, labels, items | `NameResolutions`; add `Referent::Local` |
-| `lookup: HashMap<(ScopeIndex, Symbol), LocalIndex>` + `BlockScope` tree stored in the body | A shadowing stack in the checker only; locals flat in the body |
+| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx` with a `scope` field; a label is a field of its scope; typing state per scope stays in the checker |
 | `EvalMode::{Comptime, Runtime}` deciding whether operators dispatch | Gone already: scalars always get builtin nodes, the evaluator folds them |
 | Generic call inference via `infer_type_args` + `substitute_expected_type` + `type_satisfies_annotation` | `meet`/`learn` (struct construction already uses them) |
 | Bound checks via `check_bounds(BoundOrigin, ..)` | `record_bounds_check` + `check_now` |
@@ -79,51 +79,122 @@ Storage next to `const_bodies`: `function_bodies: Vec<Option<Body>>`,
 is checked in `LexicalScope { env: signature.type_params, .. }`, expected type
 its return type; a trait default method's `Self` stays abstract.
 
-### Locals
+### Scopes and locals
+
+A body's lexical structure is stored, not discarded. A block scope is
+where locals are declared and what `break`, `continue` and `return` jump to,
+so one tree serves both. The lifetime and ownership analyses designed in
+`notes/` will read it later.
 
 ```rust
+index_newtype!(ScopeIdx);
 index_newtype!(LocalIdx);
-struct LocalDecl { name: Spanned<SymbolU32>, ty: TypeIndex, mutable: Option<TextSpan> }
-// Body gains: locals: Vec<LocalDecl>   (parameters are locals 0..n)
+
+/// One lexical block. Scope 0 is the body's root: a function's parameters
+/// live there and `return` jumps out of it. A constant's or global's
+/// initializer has a root too, with no locals.
+struct Scope {
+    kind: ScopeKind,
+    parent: Option<ScopeIdx>,
+    /// `outer: loop { .. }`, `outer: block { .. }`.
+    label: Option<Spanned<SymbolU32>>,
+    span: TextSpan,
+}
+
+enum ScopeKind {
+    Root,
+    /// `block { .. }`, an `if`/`else` branch, a match arm's body. Its type is
+    /// its tail's, or a `break` value's when it is labelled.
+    Block,
+    /// `loop { .. }`: `continue` re-enters it, its type comes only from `break`.
+    Loop,
+}
+
+/// A parameter or a name a `local` pattern binds.
+struct Local {
+    name: Spanned<SymbolU32>,
+    ty: TypeIndex,
+    mutable: Option<TextSpan>,
+    /// The block it is declared in. It is visible from its `Let` to the end
+    /// of that block.
+    scope: ScopeIdx,
+}
+
+// Body gains: scopes: Vec<Scope>, locals: Vec<Local>
 ```
 
-Name lookup is a stack in `BodyContext`: `Vec<(SymbolU32, LocalIdx)>` plus a
-mark per block; entering a block saves `len()`, leaving truncates. Lookup scans
-from the top, so shadowing is free. A single-segment value path tries locals
-first, then the namespace walk. No scope tree is stored: MIR/opt compute
-liveness and coalesce locals themselves (`opt/liveness.rs`), so the body does
-not need to say which block owned a local. Each use records
-`Referent::Local { owner: BodyOwner, local: LocalIdx }` for the LSP.
-
-### Statements and blocks
+**Two orders, one per arena.** A scope is allocated when the checker *enters*
+the block (top-down), and an expression node when it *finishes* one (bottom-up,
+children first). Each order fits its job: a scope must exist before its
+contents, because a `break` inside names it, and a node must come after its
+children. So a jump names the scope it leaves, and no extra index is needed for
+jump targets:
 
 ```rust
-ExprKind::Block { stmts: ExprRange, tail: Option<ExprIdx>, target: Option<TargetIdx> }
-ExprKind::Let { pattern: PatIdx, value: ExprIdx }        // type `()`, or `!` if value is
+ExprKind::Block { scope: ScopeIdx, stmts: ExprRange, tail: Option<ExprIdx> }
+ExprKind::Loop  { scope: ScopeIdx, stmts: ExprRange }
+ExprKind::Let   { pattern: PatIdx, value: ExprIdx }     // type `()`, or `!` if the value is
+ExprKind::Break    { scope: ScopeIdx, value: Option<ExprIdx> }   // type `!`
+ExprKind::Continue { scope: ScopeIdx }                           // a `Loop` scope; type `!`
+ExprKind::Return   { value: Option<ExprIdx> }                    // leaves scope 0; type `!`
 ```
 
-A statement is just an expression; `Let` is the one statement-only kind.
+A statement is just an expression; `Let` is the one statement-only kind. A
+labelled block or loop is an ordinary `Block`/`Loop` whose scope has a label.
+`return` keeps its own kind, since MIR emits it differently, but is typed by
+the same rule as a `break` out of scope 0.
 
-### Control flow: targets
+**A local has one identity, `LocalIdx`, plus a pointer to its scope.** The old
+model numbered locals per scope and addressed one by `(ScopeIndex, LocalIndex)`.
+Here the scope is a field of the local rather than half of its name, so
+`Referent::Local { owner: BodyOwner, local: LocalIdx }`, a pattern binding and a
+place all carry one index. LocalIdx order is declaration order, so "the locals
+of scope S, in order" is a filter over `locals`. If a consumer needs that list
+often, it can be cached on `Scope` later; storing both from the start would give
+the same fact two homes. Shadowing is explicit: `local x = 1; local x = x + 1;`
+is two `Local`s with the same name in the same scope, and the second hides the
+first from its own `Let` onwards. That is what rustc models with its
+"remainder" scopes, and here it falls out of declaration order.
 
-Children are pushed before parents, so a `break` cannot point at its loop's
-`ExprIdx`. Give jump targets their own index, allocated on entry:
+**Checking state lives beside the tree, not in it.** `BodyContext` holds:
 
 ```rust
-index_newtype!(TargetIdx);
-struct Target { kind: TargetKind /* Loop | Block | Function */, label: Option<Spanned<SymbolU32>>,
-                expected: TypeIndex, ty: TypeIndex /* INFER until a value arrives */ }
-ExprKind::Loop { body: ExprIdx, target: TargetIdx }
-ExprKind::Break { target: TargetIdx, value: Option<ExprIdx> }   // type `!`
-ExprKind::Continue { target: TargetIdx }                        // type `!`
-ExprKind::Return { value: Option<ExprIdx> }                     // target 0 is the function
+current: ScopeIdx,
+/// Scope-relative lookup, as in the old `ExprContext::lookup`.
+names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+/// Index-aligned with `Body::scopes`.
+scope_types: Vec<ScopeTyping>,
+
+struct ScopeTyping {
+    expected: TypeIndex,     // INFER = unconstrained
+    ty: TypeIndex,           // INFER until a tail or a break value settles it
+    breaks: Vec<ExprIdx>,    // valued breaks, to coerce untyped ones once `ty` is known
+}
 ```
 
-Targets are kept in the `Body` (MIR needs them as branch depths). During
-checking each target also collects the `break`s that gave it a value, so that
-when its type is settled the untyped ones can be coerced (`loop { if c { break 1 }
-break x }`). That list is checker state only. `return` is a break to the
-function's target, so `if c { return 1 }` and `break` share one rule.
+To resolve a name, probe `(current, name)`, then `(parent, name)`, and so on up
+to the root: one hash probe per enclosing block, so the cost grows with nesting
+depth, not with the number of locals. rustc's resolver works the same way: a
+stack of "ribs", one hash map per scope, walked outwards. A declaration inserts
+`(current, name)` after its initializer is checked, so `local x = x + 1` reads
+the outer `x`, and a later `local x` in the same block overwrites the entry.
+Leaving a block needs no cleanup: lookups start from `current`, and a sibling
+block has a different `ScopeIdx`. A name that is not a local falls through to
+the namespace walk.
+
+Labels resolve the same way: walk up from `current` to the first scope with
+that label (`break :outer`), the nearest `Loop` (`break`, `continue`), or the
+root (`return`), and record `Referent::Label { owner, scope }` at the use. Old
+`BlockLabel` existed only to keep its `accesses` list, which is what
+`NameResolutions` now holds.
+
+For comparison, rustc keeps the same facts, spread over a few phases. Name
+resolution uses ribs. HIR records each `break` target as the id of the
+block or loop (`hir::Destination`). THIR blocks carry a `region_scope`, and
+`Break`/`Continue` name a `region::Scope`. A separate `ScopeTree` built after
+type checking maps every variable to its declaring scope (`var_map`) for
+borrow checking. Here the checker builds the scope tree directly, since nothing
+between parsing and checking produces one.
 
 `IfElse { cond, then, else_: Option<ExprIdx> }` and
 `Match { scrutinee, arms: ArmRange }` type their branches by the same "join"
@@ -249,14 +320,14 @@ Each step ends with tests in `signatures.rs`'s suite style and with no
 
 ### 1. Relatively simple (the existing machinery covers the hard part)
 
-- **Locals and `local x: T = e` / `local x = e`** with the binding stack;
+- **Scopes, locals and `local x: T = e` / `local x = e`**, with scope-relative name lookup;
   `Referent::Local`; "annotation required" for an untyped initializer without
   a type, as before.
 - **Blocks** with statements, tails, unreachable-code warning, unused-value
   warning.
 - **`if`/`else`** (condition `bool`, join rule, missing `else` when the then
   branch is not `()`/`!`).
-- **`return`** (target 0).
+- **`return`** (leaves scope 0).
 - **Direct calls** to free functions, generic included, by position and by
   name: the struct-construction inference generalised. Intrinsic functions are
   ordinary bodiless functions here.
@@ -278,7 +349,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   same walk `learn` does for a field), then the method's own frame from its
   arguments. A trait-owned constant on an abstract receiver needs a node of its
   own (`AbstractConst { receiver, const_index }`), as in the old checker.
-- **`loop`/`break`/`continue`/labels**: the target table. Decision: whether a
+- **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.
   Decision: Q2 (globals).
