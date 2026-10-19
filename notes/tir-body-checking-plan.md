@@ -391,8 +391,13 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `PointerWithoutMemory`, E2038), and the compiler never picks one from how
   many are declared. A literal that becomes static data takes its type, and so
   its memory, from the expected type (decided); without one it needs an
-  annotation. Still open: what a string literal node carries (its decoded
-  bytes, or a span decoded later). A literal also needs a static-data story that MIR used to own.
+  annotation. A string literal node carries its unescaped contents as a
+  `SymbolU32` (decided), decoded with `literals::unescape_string_literal`, as
+  `defs.rs` already does for `import` module names; its span is the node's,
+  like every expression's. To settle when implementing: the body phase sees
+  the interner only as `&StringInterner` (`TypeContext::strings`, and
+  `DefinitionRegistry` holds a shared borrow of it for its whole life), so
+  interning a new symbol there needs that borrow reworked. A literal also needs a static-data story that MIR used to own.
 - **Calls through `Call`** for non-function values (Q3), and whether
   `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md
