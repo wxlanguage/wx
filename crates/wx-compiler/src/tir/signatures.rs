@@ -2692,37 +2692,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// The memory an untagged pointer/slice/array type implicitly belongs
-	/// to: the sole `memory` declaration visible to the whole compilation,
-	/// if there's exactly one. Zero or several are both errors — there's no
-	/// sense in which one memory could be "the" ambient one among several,
-	/// and nothing to be ambient at all with none declared. A concrete
-	/// memory needs none of its own signature forced to be interned here:
-	/// `Type::Memory` carries only `memory_index`, so this is pure identity,
-	/// unlike the legacy builder's version (which had to force the size).
-	fn resolve_ambient_memory(
-		&mut self,
-		file_id: FileId,
-		span: TextSpan,
-	) -> Result<TypeIndex, ()> {
-		match self.defs.memories.len() {
-			0 => {
-				self.diagnostics
-					.push(report_no_memory_for_pointer(file_id, span));
-				Err(())
-			}
-			1 => {
-				let memory_index = MemoryIdx::new(0);
-				Ok(self.types.intern(Type::Memory { memory_index }))
-			}
-			_ => {
-				self.diagnostics
-					.push(report_ambiguous_pointer_memory(file_id, span));
-				Err(())
-			}
-		}
-	}
-
 	/// A tag is an ordinary type with an additional Memory requirement.
 	fn resolve_memory_tag(
 		&mut self,
@@ -2758,10 +2727,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		ty
 	}
 
-	/// The memory a pointer/slice/array type belongs to — an explicit
-	/// `heap::` tag if it has one, the ambient one otherwise. Shared by
-	/// `Pointer`/`Slice`/`Array`'s three arms in `resolve_type`, which
-	/// otherwise differ only in which `Type` variant they intern.
+	/// The memory a pointer/slice/array type belongs to: its `heap::` tag.
+	/// A type without one is an error; there is no default memory to guess
+	/// from, however many are declared. Shared by `Pointer`/`Slice`/
+	/// `Array`'s three arms in `resolve_type`, which otherwise differ only in
+	/// which `Type` variant they intern.
 	fn resolve_pointer_memory(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
@@ -2777,7 +2747,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				segments,
 				infer_policy,
 			)),
-			None => self.resolve_ambient_memory(scope.file_id, span),
+			None => {
+				self.diagnostics
+					.push(report_pointer_without_memory(scope.file_id, span));
+				Err(())
+			}
 		}
 	}
 
@@ -4412,28 +4386,22 @@ fn report_missing_constant_type(
 		)
 }
 
-fn report_no_memory_for_pointer(
+fn report_pointer_without_memory(
 	file_id: FileId,
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::NoMemoryForPointer.code())
-		.with_message("a pointer type requires a linear memory")
-		.with_label(SourceSpan::new(file_id, span).primary_label())
-		.with_note("declare a memory in this module: `memory <name>: u32;`")
-}
-
-fn report_ambiguous_pointer_memory(
-	file_id: FileId,
-	span: TextSpan,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::AmbiguousPointerMemory.code())
-		.with_message(
-			"pointer type is ambiguous: multiple memories are declared",
+		.with_code(DiagnosticCode::PointerWithoutMemory.code())
+		.with_message("a pointer type must name its memory")
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("no memory written here"),
 		)
-		.with_label(SourceSpan::new(file_id, span).primary_label())
-		.with_note("specify which memory with `<memory_name>::*T` syntax")
+		.with_note(
+			"write the memory before the sigil: `heap::*T`, or a memory \
+			 parameter `Mem::*T`",
+		)
 }
 
 #[cfg(test)]
@@ -9701,7 +9669,7 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_resolves_through_the_sole_declared_memory() {
+	fn pointer_type_resolves_through_its_memory_tag() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9709,7 +9677,7 @@ pub(super) mod tests {
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
-			func f(x: *u32);
+			func f(x: heap::*u32);
 		"}
 		);
 		assert!(
@@ -9746,7 +9714,7 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_with_no_memory_declared_is_diagnosed() {
+	fn pointer_type_without_a_memory_is_diagnosed_with_no_memory_declared() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9754,16 +9722,8 @@ pub(super) mod tests {
 			func f(x: *u32);
 		"}
 		);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::NoMemoryForPointer.code())
-		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PointerWithoutMemory]);
 		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
@@ -9773,7 +9733,28 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_with_multiple_memories_is_diagnosed_as_ambiguous() {
+	fn pointer_type_without_a_memory_is_diagnosed_even_with_one_memory() {
+		// A sole declared memory is not taken as the default: the memory is
+		// always written.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			func f(x: *u32, y: &[u32], z: *[u32; 2]);
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PointerWithoutMemory,
+			DiagnosticCode::PointerWithoutMemory,
+			DiagnosticCode::PointerWithoutMemory,
+		]);
+	}
+
+	#[test]
+	fn pointer_type_without_a_memory_is_diagnosed_with_several_memories() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9785,26 +9766,12 @@ pub(super) mod tests {
 			func f(x: *u32);
 		"}
 		);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::AmbiguousPointerMemory.code())
-		);
-		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
-		else {
-			panic!("expected `f` to be a function");
-		};
-		let signature = &case.context.functions[usize::from(function_index)];
-		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PointerWithoutMemory]);
 	}
 
 	#[test]
-	fn slice_and_array_types_resolve_through_the_sole_declared_memory() {
+	fn slice_and_array_types_resolve_through_their_memory_tag() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9812,7 +9779,7 @@ pub(super) mod tests {
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
-			func f(s: &[u32], a: *[u32; 4]);
+			func f(s: heap::&[u32], a: heap::*[u32; 4]);
 		"}
 		);
 		assert!(
@@ -12040,8 +12007,8 @@ pub(super) mod tests {
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
-			type Actual = func((Wrapper::Item, Wrapper::Item), *Wrapper::Item) -> Wrapper::Item;
-			type Expected = func((i32, i32), *i32) -> i32;
+			type Actual = func((Wrapper::Item, Wrapper::Item), heap::*Wrapper::Item) -> Wrapper::Item;
+			type Expected = func((i32, i32), heap::*i32) -> i32;
 			func f(a: Actual, b: Expected) {}
 		"}
 		);

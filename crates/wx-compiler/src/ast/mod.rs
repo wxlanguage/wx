@@ -1389,8 +1389,10 @@ pub enum TypeExpression {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
 	},
-	/// `*u8` or `&u8`; `heap::*u8` tags the memory explicitly instead of
-	/// leaving it to ambient resolution — carried on the pointer itself
+	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into. The
+	/// parser accepts an untagged pointer and the type checker reports it,
+	/// since a pointer always needs its memory. The tag is carried on the
+	/// pointer itself
 	/// (rather than as a separate wrapper node) so only a pointer/slice/
 	/// array can ever be tagged, a constraint the parser otherwise has to
 	/// enforce by hand against an arbitrary inner type expression.
