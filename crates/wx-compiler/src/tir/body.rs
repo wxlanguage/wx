@@ -415,11 +415,6 @@ impl BodyBuilder {
 		span: TextSpan,
 	) -> ExprIdx {
 		let index = ExprIdx::new(u32::try_from(self.kinds.len()).unwrap());
-		debug_assert!(
-			self.children(kind)
-				.all(|child| u32::from(child) < u32::from(index)),
-			"children are pushed before their parent"
-		);
 		self.kinds.push(kind);
 		self.types.push(ty);
 		self.spans.push(span);
@@ -527,89 +522,6 @@ impl BodyBuilder {
 			places: self.places,
 			root,
 		}
-	}
-
-	fn children(&self, kind: ExprKind) -> impl Iterator<Item = ExprIdx> + '_ {
-		let (fixed, args): ([Option<ExprIdx>; 3], &[ExprIdx]) = match kind {
-			ExprKind::PrimitiveUnary { operand, .. } => {
-				([Some(operand), None, None], &[])
-			}
-			ExprKind::PrimitiveBinary { lhs, rhs, .. }
-			| ExprKind::Assign {
-				target: lhs,
-				value: rhs,
-			}
-			| ExprKind::PrimitiveCompoundAssign {
-				target: lhs,
-				value: rhs,
-				..
-			}
-			| ExprKind::ConcreteCompoundAssign {
-				target: lhs,
-				value: rhs,
-				..
-			}
-			| ExprKind::AbstractCompoundAssign {
-				target: lhs,
-				value: rhs,
-				..
-			} => ([Some(lhs), Some(rhs), None], &[]),
-			ExprKind::FieldAccess { object: value, .. }
-			| ExprKind::Cast { value }
-			| ExprKind::Drop { value }
-			| ExprKind::LocalDeclaration { value, .. }
-			| ExprKind::Store { value, .. }
-			| ExprKind::PrimitiveCompoundStore { value, .. }
-			| ExprKind::ConcreteCompoundStore { value, .. }
-			| ExprKind::AbstractCompoundStore { value, .. } => {
-				([Some(value), None, None], &[])
-			}
-			ExprKind::IfElse {
-				condition,
-				then_block,
-				else_block,
-			} => ([Some(condition), Some(then_block), else_block], &[]),
-			ExprKind::Break { value, .. } | ExprKind::Return { value } => {
-				([value, None, None], &[])
-			}
-			ExprKind::Call { callee, args } => (
-				[Some(callee), None, None],
-				&self.extra
-					[args.start as usize..(args.start + args.len) as usize],
-			),
-			ExprKind::Block {
-				statements, result, ..
-			} => (
-				[result, None, None],
-				&self.extra[statements.start as usize
-					..(statements.start + statements.len) as usize],
-			),
-			ExprKind::ConcreteMethodCall { args, .. }
-			| ExprKind::AbstractMethodCall { args, .. }
-			| ExprKind::StructConstructor { args, .. }
-			| ExprKind::Tuple { elements: args }
-			| ExprKind::Loop {
-				statements: args, ..
-			} => (
-				[None, None, None],
-				&self.extra
-					[args.start as usize..(args.start + args.len) as usize],
-			),
-			ExprKind::Error
-			| ExprKind::Int(_)
-			| ExprKind::Float(_)
-			| ExprKind::Bool(_)
-			| ExprKind::Char(_)
-			| ExprKind::Const(_)
-			| ExprKind::NextDiscriminant(_)
-			| ExprKind::Local(_)
-			| ExprKind::Global(_)
-			| ExprKind::Function(_)
-			| ExprKind::Load(_)
-			| ExprKind::AddressOf(_)
-			| ExprKind::Continue { .. } => ([None, None, None], &[]),
-		};
-		fixed.into_iter().flatten().chain(args.iter().copied())
 	}
 }
 
