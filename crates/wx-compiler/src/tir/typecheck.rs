@@ -48,8 +48,7 @@ use super::literals::{
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
 use super::operators::{
-	OperatorMethod, Scalar, is_comparison, is_primitive_binary,
-	is_primitive_unary,
+	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
@@ -1383,9 +1382,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		) else {
 			return (ExprKind::Error, TypeIndex::ERROR);
 		};
-		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_primitive_unary(op.inner, scalar))
-		{
+		if is_primitive_unary(op.inner, ty) {
 			let kind = ExprKind::PrimitiveUnary {
 				op: op.inner,
 				operand,
@@ -1432,9 +1429,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		} else {
 			ty
 		};
-		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_primitive_binary(op.inner, scalar))
-		{
+		if is_primitive_binary(op.inner, ty) {
 			let kind = ExprKind::PrimitiveBinary {
 				op: op.inner,
 				lhs,

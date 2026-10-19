@@ -117,11 +117,14 @@ impl Scalar {
 	}
 }
 
-/// Whether the compiler implements `op` natively on `scalar`. Mirrors the
-/// stdlib's primitive impls of the operator traits exactly
-/// (`primitive_operators_match_the_stdlib_impls`); `&&`/`||` are not
-/// overloadable and exist only on `bool`.
-pub(super) fn is_primitive_binary(op: BinaryOp, scalar: Scalar) -> bool {
+/// Whether the compiler implements `op` natively on `ty`, a primitive
+/// scalar; `false` for any other type. Mirrors the stdlib's primitive impls of
+/// the operator traits exactly (`primitive_operators_match_the_stdlib_impls`);
+/// `&&`/`||` are not overloadable and exist only on `bool`.
+pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
+	let Some(scalar) = Scalar::from_type(ty) else {
+		return false;
+	};
 	let numeric = scalar.is_integer() || scalar.is_float();
 	match op {
 		BinaryOp::Add
@@ -155,7 +158,10 @@ pub(super) fn is_primitive_binary(op: BinaryOp, scalar: Scalar) -> bool {
 }
 
 /// See `is_primitive_binary`.
-pub(super) fn is_primitive_unary(op: UnaryOp, scalar: Scalar) -> bool {
+pub(super) fn is_primitive_unary(op: UnaryOp, ty: TypeIndex) -> bool {
+	let Some(scalar) = Scalar::from_type(ty) else {
+		return false;
+	};
 	match op {
 		UnaryOp::InvertSign => scalar.is_float() || scalar.is_signed(),
 		UnaryOp::BitNot => scalar.is_integer(),

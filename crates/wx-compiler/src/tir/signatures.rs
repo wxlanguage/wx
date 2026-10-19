@@ -4604,7 +4604,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_primitive_binary(op, scalar),
+					is_primitive_binary(op, scalar.ty()),
 					"`{}` on {scalar:?}",
 					op.as_str()
 				);
@@ -4619,7 +4619,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_primitive_unary(op, scalar),
+					is_primitive_unary(op, scalar.ty()),
 					"{op:?} on {scalar:?}"
 				);
 			}

@@ -19,7 +19,6 @@ use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
 use crate::tir::defs::{BindingKey, MemberKind};
-use crate::tir::operators::Scalar;
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::{Type, TypeIndex};
 
@@ -77,7 +76,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		} else if self.cx.types.has_untyped(source) {
 			let literal_target = match *self.cx.types.resolve(target) {
 				Type::Pointer { memory, .. } => self.memory_size(memory),
-				_ if Scalar::from_type(target).is_some() => target,
+				_ if target.is_numeric() => target,
 				_ => TypeIndex::ERROR,
 			};
 			if literal_target == TypeIndex::ERROR {
@@ -144,19 +143,16 @@ impl BodyContext<'_, '_, '_, '_> {
 		if size == other {
 			return true;
 		}
-		Scalar::from_type(other).is_some_and(Scalar::is_integer)
-			&& self.wasm_value(other).is_some()
-			&& self.wasm_value(other) == self.wasm_value(size)
+		other.is_integer() && self.wasm_value(other) == self.wasm_value(size)
 	}
 
 	/// The Wasm value a scalar or an enum is held in on the stack; `None`
 	/// for anything else.
 	fn wasm_value(&self, ty: TypeIndex) -> Option<WasmValue> {
 		if let Type::Enum { enum_index } = *self.cx.types.resolve(ty) {
-			let repr = self.cx.enum_repr(enum_index);
-			return Scalar::from_type(repr).map(WasmValue::of);
+			return WasmValue::of(self.cx.enum_repr(enum_index));
 		}
-		Scalar::from_type(ty).map(WasmValue::of)
+		WasmValue::of(ty)
 	}
 
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
@@ -250,19 +246,22 @@ enum WasmValue {
 }
 
 impl WasmValue {
-	fn of(scalar: Scalar) -> Self {
-		match scalar {
-			Scalar::U8
-			| Scalar::I8
-			| Scalar::U16
-			| Scalar::I16
-			| Scalar::U32
-			| Scalar::I32
-			| Scalar::Bool
-			| Scalar::Char => Self::I32,
-			Scalar::U64 | Scalar::I64 => Self::I64,
-			Scalar::F32 => Self::F32,
-			Scalar::F64 => Self::F64,
-		}
+	/// The Wasm value a primitive scalar is held in; `None` for any other
+	/// type.
+	fn of(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::U8
+			| TypeIndex::I8
+			| TypeIndex::U16
+			| TypeIndex::I16
+			| TypeIndex::U32
+			| TypeIndex::I32
+			| TypeIndex::BOOL
+			| TypeIndex::CHAR => Self::I32,
+			TypeIndex::U64 | TypeIndex::I64 => Self::I64,
+			TypeIndex::F32 => Self::F32,
+			TypeIndex::F64 => Self::F64,
+			_ => return None,
+		})
 	}
 }

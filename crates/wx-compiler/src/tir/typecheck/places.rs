@@ -16,7 +16,7 @@ use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
 use crate::tir::defs::{FunctionIdx, Visibility};
-use crate::tir::operators::{Scalar, is_primitive_binary};
+use crate::tir::operators::is_primitive_binary;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
 /// What the left of `=`, the operand of `.&` or the object of `.field` is.
@@ -451,9 +451,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			op.inner.as_str(),
 			DiagnosticCode::BinaryOperatorCannotBeApplied,
 		)?;
-		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_primitive_binary(plain, scalar))
-		{
+		if is_primitive_binary(plain, ty) {
 			return Some(CompoundMethod::Primitive);
 		}
 		Some(match self.select_operator_method(selected) {
