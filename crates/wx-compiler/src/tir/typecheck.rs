@@ -48,7 +48,7 @@ use super::operators::{
 	is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
-use super::resolutions::{NameResolutions, Referent};
+use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
 use crate::ast::{self, BinaryOp, Keyword, Spanned, UnaryOp};
@@ -524,11 +524,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if segments[0].ident.inner == Keyword::SelfPascal.symbol() {
 			return Err(self.unsupported(span, "a path through `Self`"));
 		}
-		let mut diagnostics = Vec::new();
-		let mut resolutions = NameResolutions::default();
+		let reported = self.cx.diagnostics.len();
 		let walk = PathResolver::new(
-			&mut diagnostics,
-			&mut resolutions,
+			self.cx.diagnostics,
+			self.cx.resolutions,
 			self.cx.strings,
 			self.cx.defs,
 		)
@@ -538,7 +537,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			segments,
 			Tier::Value,
 		);
-		// Not found in an enum: the name may be one of its impls' members.
+		// Not found in an enum: the name may be one of its impls' members, so
+		// the walk's "not found" is replaced by the unsupported report.
 		if walk.target.def_key().is_none() && walk.stopped_at > 0 {
 			let prefix = &segments[walk.stopped_at as usize - 1];
 			let site = (
@@ -550,14 +550,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				| Referent::Import {
 					definition: key, ..
 				},
-			) = resolutions.by_site.get(&site)
+			) = self.cx.resolutions.by_site.get(&site)
 				&& let DefKind::Enum(_) = key.symbol_kind(self.cx.defs)
 			{
+				self.cx.diagnostics.truncate(reported);
 				return Err(self.unsupported(span, "a path through a type"));
 			}
 		}
-		self.cx.diagnostics.extend(diagnostics);
-		self.cx.resolutions.by_site.extend(resolutions.by_site);
 		Ok(walk)
 	}
 
