@@ -1,12 +1,15 @@
 //! `value as T`.
 //!
-//! A cast converts between primitive scalars (every number to every number;
-//! `bool` and `char` to and from integers), between an enum and an integer
-//! (its discriminant), between
-//! pointers into the same memory, and between a pointer and its memory's
-//! `Size`. A pointer cast may give up exclusivity (`*T as &T`) but never gain
-//! it (`&T as *T`), so a shared pointer stays read-only. A string literal is
-//! cast to what it can be coerced to: a shared byte slice or byte array of its
+//! A cast reinterprets a value on the Wasm stack without changing it, so it
+//! is valid only between types held in the same Wasm value: integers of one
+//! width class (`u8`, `i32`, `bool`, `char`, an enum with such a repr are all
+//! `i32`), two pointers into the same memory, and a pointer and an integer of
+//! its memory's `Size` width. Converting a value (`i32` to `i64`, an integer
+//! to a float, `f32` to its bits) is an instruction's job, not a cast's. A
+//! pointer cast may give up exclusivity (`*T as &T`) but never gain it
+//! (`&T as *T`), so a shared pointer stays read-only. A literal is untyped,
+//! so casting one gives it the target as its type: a number takes a scalar or
+//! a pointer's `Size`, a string a shared byte slice or byte array of its
 //! length. `as _` casts to the expected type.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
@@ -87,31 +90,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.body.push(ExprKind::Cast { value }, target, span)
 	}
 
+	/// A cast reinterprets the value on the Wasm stack and never changes it,
+	/// so source and target must be the same Wasm value. Changing the value
+	/// (`i32` to `i64`, an integer to a float) is an instruction's job. A
+	/// pointer is its memory's `Size`; between two pointers, the memory must
+	/// match and a shared one never becomes exclusive.
 	fn is_valid_cast(&mut self, source: TypeIndex, target: TypeIndex) -> bool {
 		if source == target {
 			return true;
-		}
-		if let (Some(from), Some(to)) =
-			(Scalar::from_type(source), Scalar::from_type(target))
-		{
-			let numeric =
-				|scalar: Scalar| scalar.is_integer() || scalar.is_float();
-			return (numeric(from) && numeric(to))
-				|| (from.is_integer()
-					&& matches!(to, Scalar::Bool | Scalar::Char))
-				|| (matches!(from, Scalar::Bool | Scalar::Char)
-					&& to.is_integer());
 		}
 		match (
 			*self.cx.types.resolve(source),
 			*self.cx.types.resolve(target),
 		) {
-			(Type::Enum { .. }, _) => {
-				Scalar::from_type(target).is_some_and(Scalar::is_integer)
-			}
-			(_, Type::Enum { .. }) => {
-				Scalar::from_type(source).is_some_and(Scalar::is_integer)
-			}
 			(
 				Type::Pointer {
 					memory: from_memory,
@@ -129,13 +120,43 @@ impl BodyContext<'_, '_, '_, '_> {
 						&& to_ownership == Ownership::Exclusive)
 			}
 			(Type::Pointer { memory, .. }, _) => {
-				self.memory_size(memory) == target
+				self.is_pointer_integer(memory, target)
 			}
 			(_, Type::Pointer { memory, .. }) => {
-				self.memory_size(memory) == source
+				self.is_pointer_integer(memory, source)
 			}
-			_ => false,
+			_ => matches!(
+				(self.wasm_value(source), self.wasm_value(target)),
+				(Some(from), Some(to)) if from == to
+			),
 		}
+	}
+
+	/// Whether `other` is an integer a pointer into `memory` can be
+	/// reinterpreted as: its memory's `Size`, or one held in the same Wasm
+	/// value.
+	fn is_pointer_integer(
+		&mut self,
+		memory: TypeIndex,
+		other: TypeIndex,
+	) -> bool {
+		let size = self.memory_size(memory);
+		if size == other {
+			return true;
+		}
+		Scalar::from_type(other).is_some_and(Scalar::is_integer)
+			&& self.wasm_value(other).is_some()
+			&& self.wasm_value(other) == self.wasm_value(size)
+	}
+
+	/// The Wasm value a scalar or an enum is held in on the stack; `None`
+	/// for anything else.
+	fn wasm_value(&self, ty: TypeIndex) -> Option<WasmValue> {
+		if let Type::Enum { enum_index } = *self.cx.types.resolve(ty) {
+			let repr = self.cx.enum_repr(enum_index);
+			return Scalar::from_type(repr).map(WasmValue::of);
+		}
+		Scalar::from_type(ty).map(WasmValue::of)
 	}
 
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
@@ -169,6 +190,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		target: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
+		let target_ty = target;
 		let formatter = self.cx.type_formatter();
 		let (source, target) = (
 			formatter.display_type(source),
@@ -182,7 +204,15 @@ impl BodyContext<'_, '_, '_, '_> {
 					.with_message("invalid cast"),
 			);
 		let value_ty = self.body.ty(value);
-		if value_ty == TypeIndex::STRING {
+		if self.wasm_value(value_ty).is_some()
+			&& self.wasm_value(target_ty).is_some()
+		{
+			diagnostic = diagnostic.with_note(
+				"a cast reinterprets a value without changing it, and these \
+				 are held in different Wasm values; converting one into the \
+				 other needs an instruction",
+			);
+		} else if value_ty == TypeIndex::STRING {
 			diagnostic = diagnostic.with_note(STRING_TARGETS_NOTE);
 		} else if self.cx.types.has_untyped(value_ty) {
 			diagnostic = diagnostic
@@ -208,4 +238,31 @@ fn is_byte_slice_or_array(cx: &BodyContext, target: TypeIndex) -> bool {
 			..
 		}
 	)
+}
+
+/// A Wasm value type: what a scalar is held in on the stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WasmValue {
+	I32,
+	I64,
+	F32,
+	F64,
+}
+
+impl WasmValue {
+	fn of(scalar: Scalar) -> Self {
+		match scalar {
+			Scalar::U8
+			| Scalar::I8
+			| Scalar::U16
+			| Scalar::I16
+			| Scalar::U32
+			| Scalar::I32
+			| Scalar::Bool
+			| Scalar::Char => Self::I32,
+			Scalar::U64 | Scalar::I64 => Self::I64,
+			Scalar::F32 => Self::F32,
+			Scalar::F64 => Self::F64,
+		}
+	}
 }

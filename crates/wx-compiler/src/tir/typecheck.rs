@@ -3324,28 +3324,57 @@ mod tests {
 	}
 
 	#[test]
-	fn casts_convert_between_scalars_and_pointers() {
+	fn a_cast_reinterprets_a_value_of_the_same_wasm_type() {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
-				func numbers(a: u8) -> f64 { (a as i32) as f64 }
-				func literal() -> u8 { 300 as u8 }
+				func widen(a: u8) -> i32 { a as i32 }
+				func sign(a: i64) -> u64 { a as u64 }
+				func truth(b: bool) -> u8 { b as u8 }
+				func code(c: char) -> u32 { c as u32 }
+				func enum_value(o: Ordering) -> i8 { o as i8 }
 				func inferred(a: u16) -> u32 { a as _ }
+				func literal() -> u8 { 300 as u8 }
 				func give_up(p: heap::*u8) -> heap::&u8 { p as heap::&u8 }
 				func address(p: heap::&u8) -> u32 { p as u32 }
+				func signed_address(p: heap::&u8) -> i32 { p as i32 }
 				func from_int(a: u32) -> heap::*u8 { a as heap::*u8 }
-				func enum_value(o: Ordering) -> i8 { o as i8 }
-				func gain(p: heap::&u8) -> heap::*u8 { p as heap::*u8 }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		assert_eq!(case.shape("widen"), "(block => (as a#0 i32))");
+		assert_eq!(case.shape("inferred"), "(block => (as a#0 u32))");
+	}
+
+	#[test]
+	fn a_cast_never_changes_the_value() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func wider(a: i32) -> i64 { a as i64 }
+				func narrower(a: u64) -> u32 { a as u32 }
+				func to_float(a: u8) -> f64 { a as f64 }
+				func to_int(f: f32) -> i32 { f as i32 }
+				func bits(f: f32) -> u32 { f as u32 }
 				func float_to_bool(f: f32) -> bool { f as bool }
+				func gain(p: heap::&u8) -> heap::*u8 { p as heap::*u8 }
+				func wide_address(p: heap::&u8) -> u64 { p as u64 }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
 			DiagnosticCode::InvalidCast,
 			DiagnosticCode::InvalidCast,
 		]);
-		assert_eq!(case.shape("numbers"), "(block => (as (as a#0 i32) f64))");
-		assert_eq!(case.shape("inferred"), "(block => (as a#0 u32))");
+		case.diagnostics().assert_error_saying(
+			"a cast reinterprets a value without changing it",
+		);
 	}
 
 	#[test]
