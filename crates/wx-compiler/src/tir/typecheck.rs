@@ -1108,7 +1108,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		segment: &ast::PathSegment,
 	) -> Diagnostic<FileId> {
 		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		let strings = self.cx.strings;
+		let strings = &*self.cx.strings;
 		let name = strings.resolve(def.name.inner).unwrap();
 		let private: Vec<String> = def
 			.fields
@@ -2147,10 +2147,10 @@ mod tests {
 	use super::super::resolutions::{NameResolutions, Referent};
 	use super::super::signatures::TypeContext;
 	use super::super::types::{Type, TypeIndex};
-	use crate::ast::{self, Spanned};
+	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
-	use crate::vfs::{self, FileId};
+	use crate::vfs::{self, FileId, Files};
 
 	const STDLIB: &str = include_str!("../../std/main.wx");
 
@@ -2185,7 +2185,8 @@ mod tests {
 
 	/// Everything a `TypeContext` borrows, kept on the test's stack.
 	struct TestInputs<'g> {
-		graph: &'g vfs::CompilationUnit,
+		files: &'g Files,
+		strings: &'g mut StringInterner,
 		defs: DefinitionRegistry,
 		ast_nodes: Vec<AstEntry<'g>>,
 		impl_dispatch: ImplDispatch,
@@ -2195,27 +2196,34 @@ mod tests {
 
 	impl<'g> TestInputs<'g> {
 		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+			let vfs::CompilationUnit {
+				files,
+				packages,
+				strings,
+				stdlib_package,
+				root_package,
+			} = graph;
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
-				&graph.packages,
-				&graph.files,
-				&mut graph.strings,
+				packages,
+				files,
+				strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
-				graph.root_package,
+				*stdlib_package,
+				*root_package,
 			);
-			let graph = &*graph;
 			let impl_dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				strings,
 				&defs,
 				&ast_nodes,
 			);
 			Self {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -2226,7 +2234,6 @@ mod tests {
 	}
 
 	struct TestCase<'a> {
-		graph: &'a vfs::CompilationUnit,
 		defs: &'a DefinitionRegistry,
 		context: TypeContext<'a, 'a, 'a>,
 	}
@@ -2234,7 +2241,8 @@ mod tests {
 	impl<'a> TestCase<'a> {
 		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
 			let TestInputs {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -2244,8 +2252,8 @@ mod tests {
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
-				&graph.strings,
-				&graph.files,
+				strings,
+				files,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -2263,18 +2271,14 @@ mod tests {
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
-			Self {
-				graph,
-				defs,
-				context,
-			}
+			Self { defs, context }
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new(
 				"typecheck",
 				self.context.diagnostics,
-				&self.graph.files,
+				&self.context.files,
 			)
 		}
 
@@ -2285,7 +2289,7 @@ mod tests {
 				.split("::")
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
-						inner: self.graph.strings.get(segment).unwrap(),
+						inner: self.context.strings.get(segment).unwrap(),
 						span: TextSpan::new(0, 0),
 					},
 					type_args: Box::new([]),
@@ -2296,7 +2300,7 @@ mod tests {
 			PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				&self.graph.strings,
+				self.context.strings,
 				self.defs,
 			)
 			.resolve_path(file_id, root, &segments, Tier::Value)
@@ -2343,7 +2347,7 @@ mod tests {
 				}
 				text + ")"
 			};
-			let name = |symbol| self.graph.strings.resolve(symbol).unwrap();
+			let name = |symbol| self.context.strings.resolve(symbol).unwrap();
 			match body.kind(expr) {
 				ExprKind::Error => "error".to_string(),
 				ExprKind::Int(value) => value.to_string(),
@@ -2518,14 +2522,14 @@ mod tests {
 
 		fn function_name(&self, index: super::FunctionIdx) -> &str {
 			let name = self.defs.functions[usize::from(index)].name.inner;
-			self.graph.strings.resolve(name).unwrap()
+			self.context.strings.resolve(name).unwrap()
 		}
 
 		fn local_name(&self, body: &Body, local: super::LocalIdx) -> String {
 			let name = body.local(local).name.inner;
 			format!(
 				"{}#{}",
-				self.graph.strings.resolve(name).unwrap(),
+				self.context.strings.resolve(name).unwrap(),
 				u32::from(local)
 			)
 		}
@@ -2544,7 +2548,7 @@ mod tests {
 				[usize::from(field)]
 			.name
 			.unwrap();
-			self.graph.strings.resolve(field.inner).unwrap()
+			self.context.strings.resolve(field.inner).unwrap()
 		}
 
 		/// A jump's target: its label, else the kind of scope it leaves.
@@ -2552,7 +2556,7 @@ mod tests {
 			let scope = body.scope(scope);
 			match scope.label {
 				Some(label) => self
-					.graph
+					.context
 					.strings
 					.resolve(body.label(label).name.inner)
 					.unwrap()
@@ -2569,7 +2573,7 @@ mod tests {
 				.iter()
 				.map(|local| {
 					let name =
-						self.graph.strings.resolve(local.name.inner).unwrap();
+						self.context.strings.resolve(local.name.inner).unwrap();
 					(name.to_string(), self.display(local.ty))
 				})
 				.collect()

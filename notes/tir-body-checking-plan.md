@@ -394,10 +394,8 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   annotation. A string literal node carries its unescaped contents as a
   `SymbolU32` (decided), decoded with `literals::unescape_string_literal`, as
   `defs.rs` already does for `import` module names; its span is the node's,
-  like every expression's. To settle when implementing: the body phase sees
-  the interner only as `&StringInterner` (`TypeContext::strings`, and
-  `DefinitionRegistry` holds a shared borrow of it for its whole life), so
-  interning a new symbol there needs that borrow reworked. A literal also needs a static-data story that MIR used to own.
+  like every expression's. `TypeContext::strings` is `&mut StringInterner`,
+  so the body phase can intern the decoded contents. A literal also needs a static-data story that MIR used to own.
 - **Calls through `Call`** for non-function values (Q3), and whether
   `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md

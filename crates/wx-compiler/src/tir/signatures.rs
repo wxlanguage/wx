@@ -588,7 +588,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	/// Every written name resolved so far; see `resolutions.rs`.
 	pub(super) resolutions: &'ctx mut NameResolutions,
-	pub(super) strings: &'ctx StringInterner,
+	pub(super) strings: &'ctx mut StringInterner,
 	/// Source text, for literals whose value is read from their span.
 	pub(super) files: &'ctx Files,
 	pub(super) defs: &'ctx DefinitionRegistry,
@@ -653,7 +653,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		resolutions: &'ctx mut NameResolutions,
-		strings: &'ctx StringInterner,
+		strings: &'ctx mut StringInterner,
 		files: &'ctx Files,
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
@@ -683,13 +683,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			})
 			.collect();
 
+		let operators = OperatorTraits::new(defs, strings);
 		Self {
 			diagnostics,
 			resolutions,
 			strings,
 			files,
 			defs,
-			operators: OperatorTraits::new(defs, strings),
+			operators,
 			ast_nodes,
 			query_state,
 			query_stack: Vec::new(),
@@ -4503,7 +4504,7 @@ pub(super) mod tests {
 				panic!("expected an associated type, got {referent:?}");
 			};
 			assert_eq!(
-				case.graph.strings.resolve(
+				case.context.strings.resolve(
 					case.defs.assoc_types[usize::from(index)].name.inner
 				),
 				Some("A")
@@ -4664,14 +4665,14 @@ pub(super) mod tests {
 					ExprKind::Const(index) => {
 						let name =
 							case.defs.constants[usize::from(index)].name.inner;
-						case.graph.strings.resolve(name).unwrap().to_string()
+						case.context.strings.resolve(name).unwrap().to_string()
 					}
 					ExprKind::NextDiscriminant(index) => {
 						let name =
 							case.defs.constants[usize::from(index)].name.inner;
 						format!(
 							"(next {})",
-							case.graph.strings.resolve(name).unwrap()
+							case.context.strings.resolve(name).unwrap()
 						)
 					}
 					ExprKind::PrimitiveUnary { op, operand } => {
@@ -4698,7 +4699,7 @@ pub(super) mod tests {
 						let mut text = format!(
 							"({}{}",
 							if generic { "generic " } else { "call " },
-							case.graph.strings.resolve(name).unwrap()
+							case.context.strings.resolve(name).unwrap()
 						);
 						for &arg in body.args(args) {
 							text.push(' ');
@@ -4728,7 +4729,7 @@ pub(super) mod tests {
 						order,
 					} => {
 						let def = &case.defs.structs[usize::from(struct_index)];
-						let strings = &case.graph.strings;
+						let strings = &case.context.strings;
 						let mut text = format!(
 							"({}",
 							strings.resolve(def.name.inner).unwrap()
@@ -5726,7 +5727,7 @@ pub(super) mod tests {
 			member_name: &str,
 		) -> TypeIndex {
 			let trait_index = case.trait_index(trait_name);
-			let name = case.graph.strings.get(member_name).unwrap();
+			let name = case.context.strings.get(member_name).unwrap();
 			let assoc_type_index = case.defs.traits[usize::from(trait_index)]
 				.members
 				.iter()
@@ -5781,7 +5782,7 @@ pub(super) mod tests {
 				("plain", None),
 				("unrelated", Some(other)),
 			] {
-				let name_symbol = case.graph.strings.get(name).unwrap();
+				let name_symbol = case.context.strings.get(name).unwrap();
 				let index = case
 					.defs
 					.functions
@@ -6185,7 +6186,7 @@ pub(super) mod tests {
 		check(&mut TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			&mut graph.strings,
 			&graph.files,
 			&defs,
 			&ast_nodes,
@@ -6282,7 +6283,8 @@ pub(super) mod tests {
 	/// own stack, declared before the `TestCase` that borrows them, which
 	/// `test_case!` spells out in one line.
 	struct TestInputs<'g> {
-		graph: &'g vfs::CompilationUnit,
+		files: &'g Files,
+		strings: &'g mut StringInterner,
 		defs: DefinitionRegistry,
 		ast_nodes: Vec<AstEntry<'g>>,
 		impl_dispatch: ImplDispatch,
@@ -6292,27 +6294,34 @@ pub(super) mod tests {
 
 	impl<'g> TestInputs<'g> {
 		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+			let vfs::CompilationUnit {
+				files,
+				packages,
+				strings,
+				stdlib_package,
+				root_package,
+			} = graph;
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
-				&graph.packages,
-				&graph.files,
-				&mut graph.strings,
+				packages,
+				files,
+				strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
-				graph.root_package,
+				*stdlib_package,
+				*root_package,
 			);
-			let graph = &*graph;
 			let impl_dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				strings,
 				&defs,
 				&ast_nodes,
 			);
 			Self {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -6325,7 +6334,6 @@ pub(super) mod tests {
 	/// A live, fully swept `TypeContext` over `TestInputs`, plus the graph
 	/// and definitions tests read alongside it.
 	struct TestCase<'a> {
-		graph: &'a vfs::CompilationUnit,
 		defs: &'a DefinitionRegistry,
 		context: TypeContext<'a, 'a, 'a>,
 	}
@@ -6333,7 +6341,8 @@ pub(super) mod tests {
 	impl<'a> TestCase<'a> {
 		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
 			let TestInputs {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -6343,8 +6352,8 @@ pub(super) mod tests {
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
-				&graph.strings,
-				&graph.files,
+				strings,
+				files,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -6357,11 +6366,7 @@ pub(super) mod tests {
 				diagnostic.code.as_deref()
 					!= Some(DiagnosticCode::UnsupportedExpression.code())
 			});
-			Self {
-				graph,
-				defs,
-				context,
-			}
+			Self { defs, context }
 		}
 
 		/// Resolves `name` as a type-position path from the root namespace —
@@ -6385,7 +6390,7 @@ pub(super) mod tests {
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
 						inner: self
-							.graph
+							.context
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
@@ -6399,7 +6404,7 @@ pub(super) mod tests {
 			let target = PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				&self.graph.strings,
+				self.context.strings,
 				self.defs,
 			)
 			.resolve_path(file_id, root, &segments, tier);
@@ -6441,7 +6446,7 @@ pub(super) mod tests {
 			DiagnosticView::new(
 				"siganture",
 				&self.context.diagnostics,
-				&self.graph.files,
+				&self.context.files,
 			)
 		}
 
@@ -6478,7 +6483,7 @@ pub(super) mod tests {
 		) -> &AssocTypeSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6510,7 +6515,7 @@ pub(super) mod tests {
 		) -> &FunctionSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6539,7 +6544,7 @@ pub(super) mod tests {
 		) -> &ConstantSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6580,7 +6585,7 @@ pub(super) mod tests {
 			name: &str,
 		) -> MemberKind {
 			let impl_index = self.trait_impl_index(struct_path, trait_path);
-			let symbol = self.graph.strings.get(name).unwrap();
+			let symbol = self.context.strings.get(name).unwrap();
 			let definition = &self.defs.trait_impls[usize::from(impl_index)];
 			let &index =
 				definition.bindings.get(&BindingKey::value(symbol)).unwrap();
@@ -6630,7 +6635,7 @@ pub(super) mod tests {
 		) -> &FunctionSignature {
 			let impl_index = self.inherent_impl_index(struct_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6659,7 +6664,7 @@ pub(super) mod tests {
 		) -> &ConstantSignature {
 			let impl_index = self.inherent_impl_index(struct_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -9139,7 +9144,7 @@ pub(super) mod tests {
 
 		let impl_def = &case.defs.trait_impls[usize::from(impl_index)];
 		let item_symbol = case
-			.graph
+			.context
 			.strings
 			.get("Item")
 			.expect("already interned from source");
@@ -14338,12 +14343,14 @@ pub(super) mod tests {
 
 		macro_rules! checked_case {
 			($case:ident = $source:expr $(,)?) => {
-				test_case!($case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!($case from graph);
 			};
 			(mut $case:ident = $source:expr $(,)?) => {
-				test_case!(mut $case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!(mut $case from graph);
 			};
 		}
 
@@ -14488,7 +14495,8 @@ pub(super) mod tests {
 					.functions
 					.iter()
 					.position(|def| {
-						case.graph.strings.resolve(def.name.inner) == Some(name)
+						case.context.strings.resolve(def.name.inner)
+							== Some(name)
 					})
 					.unwrap()
 			};
@@ -14547,7 +14555,7 @@ pub(super) mod tests {
 				.functions
 				.iter()
 				.position(|def| {
-					case.graph.strings.resolve(def.name.inner)
+					case.context.strings.resolve(def.name.inner)
 						== Some("provided")
 				})
 				.unwrap();
@@ -14660,12 +14668,14 @@ pub(super) mod tests {
 
 		macro_rules! checked_case {
 			($case:ident = $source:expr $(,)?) => {
-				test_case!($case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!($case from graph);
 			};
 			(mut $case:ident = $source:expr $(,)?) => {
-				test_case!(mut $case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!(mut $case from graph);
 			};
 		}
 
@@ -14787,7 +14797,7 @@ pub(super) mod tests {
 				Some(DiagnosticCode::NotATraitMember.code())
 			);
 			let signature = |name| {
-				let name = case.graph.strings.get(name).unwrap();
+				let name = case.context.strings.get(name).unwrap();
 				let index = case
 					.defs
 					.functions
@@ -15594,7 +15604,7 @@ pub(super) mod tests {
 			);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-			let sibling = case.graph.strings.get("sibling").unwrap();
+			let sibling = case.context.strings.get("sibling").unwrap();
 			let index = case
 				.defs
 				.functions
@@ -16033,7 +16043,7 @@ pub(super) mod tests {
 		assert_eq!(case.context.exports.len(), 2);
 		for (external, path) in [("left", "left::f"), ("f", "right::f")] {
 			let export = case.context.exports
-				[&case.graph.strings.get(external).unwrap()];
+				[&case.context.strings.get(external).unwrap()];
 			let DefKind::Function(index) = case.resolve(Tier::Value, path)
 			else {
 				panic!("expected a function");
@@ -16101,7 +16111,7 @@ pub(super) mod tests {
 			panic!("expected a function");
 		};
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("f").unwrap()],
+			case.context.exports[&case.context.strings.get("f").unwrap()],
 			ExportedItem::Function(index)
 		);
 	}
@@ -16155,15 +16165,15 @@ pub(super) mod tests {
 			panic!("expected a global");
 		};
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("run").unwrap()],
+			case.context.exports[&case.context.strings.get("run").unwrap()],
 			ExportedItem::Function(function)
 		);
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("heap").unwrap()],
+			case.context.exports[&case.context.strings.get("heap").unwrap()],
 			ExportedItem::Memory(memory)
 		);
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("counter").unwrap()],
+			case.context.exports[&case.context.strings.get("counter").unwrap()],
 			ExportedItem::Global(global)
 		);
 	}
@@ -16210,14 +16220,16 @@ pub(super) mod tests {
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 1);
 		let export =
-			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
-		assert_eq!(export.name.inner, case.graph.strings.get("f").unwrap());
+			&case.defs.exports[&case.context.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.context.strings.get("f").unwrap());
 		assert!(
 			case.defs
 				.namespaces
 				.symbols(Namespace::Package(dep))
 				.bindings
-				.get(&BindingKey::value(case.graph.strings.get("run").unwrap()))
+				.get(&BindingKey::value(
+					case.context.strings.get("run").unwrap()
+				))
 				.is_none()
 		);
 	}
@@ -16474,7 +16486,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		let declaration = |name| {
-			let name = case.graph.strings.get(name).unwrap();
+			let name = case.context.strings.get(name).unwrap();
 			FunctionIdx::new(
 				u32::try_from(
 					case.defs

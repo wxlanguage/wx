@@ -401,7 +401,7 @@ mod tests {
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				&mut graph.strings,
 				&graph.files,
 				&defs,
 				&ast_nodes,
