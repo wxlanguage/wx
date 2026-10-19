@@ -73,10 +73,6 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
-	/// Whether each label is named by a `break` or `continue`, index-aligned
-	/// with the body's labels: a label never named is reported as unused
-	/// when the body is finished.
-	label_used: Vec<bool>,
 }
 
 /// The type a scope's value is held to while its block is checked.
@@ -103,7 +99,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			current: ScopeIdx::ROOT,
 			lookup: HashMap::new(),
 			scope_types: Vec::new(),
-			label_used: Vec::new(),
 		}
 	}
 
@@ -135,21 +130,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn finish(self, root: ExprIdx) -> Body {
-		for (at, &used) in self.label_used.iter().enumerate() {
-			if !used {
-				let label =
-					self.body.label(super::body::LabelIdx::new(at as u32));
-				self.cx.diagnostics.push(
-					Diagnostic::warning()
-						.with_code(DiagnosticCode::UnusedLabel.code())
-						.with_message("unused label")
-						.with_label(Label::primary(
-							self.scope.file_id,
-							label.name.span,
-						)),
-				);
-			}
-		}
 		self.body.finish(root)
 	}
 
@@ -2936,7 +2916,6 @@ mod tests {
 				func outside_continue() { continue; }
 				func unknown() { loop { break :nowhere; } }
 				func not_a_loop() { l: block { continue :l; } }
-				func unused() { l: loop { break; } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -2944,10 +2923,31 @@ mod tests {
 			DiagnosticCode::ContinueOutsideOfLoop,
 			DiagnosticCode::UndeclaredLabel,
 			DiagnosticCode::ContinueOutsideOfLoop,
-			DiagnosticCode::UnusedLabel,
 		]);
-		case.diagnostics()
-			.assert_warning(DiagnosticCode::UnusedLabel);
+	}
+
+	#[test]
+	fn a_labelled_jump_is_recorded_as_a_reference_to_its_label() {
+		const SOURCE: &str = "func f() { outer: loop { break :outer; } }";
+		test_case!(case = SOURCE);
+		case.diagnostics().assert_none();
+		let file_id = case
+			.defs
+			.namespaces
+			.file_id(Scope::Package(case.defs.root_package).into());
+		let start =
+			(STDLIB.len() + 1 + SOURCE.find(":outer").unwrap() + 1) as u32;
+		let site = (
+			crate::diagnostics::SourceSpan::new(
+				file_id,
+				TextSpan::new(start, start + "outer".len() as u32),
+			),
+			Tier::Value,
+		);
+		assert!(matches!(
+			case.context.resolutions.by_site.get(&site),
+			Some(Referent::Label { label, .. }) if u32::from(*label) == 0
+		));
 	}
 
 	#[test]

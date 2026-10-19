@@ -200,9 +200,11 @@ up from `current` to the first scope whose label has that name (`break :outer`),
 giving `(ScopeIdx, LabelIdx)`; the jump stores the scope and the use records
 `Referent::Label { owner: BodyOwner, label: LabelIdx }`. An unlabelled `break`
 or `continue` takes the nearest `Loop`, `return` the root. The label's old
-`accesses: Vec<TextSpan>` is that resolution entry now, so the checker keeps
-only a `used: Vec<bool>` beside `labels` for the unused-label warning
-(`report_stack_warnings`'s check), rather than scanning the table.
+`accesses: Vec<TextSpan>` is that resolution entry now, and the checker keeps
+nothing beside it. Unused labels (and later unused locals and imports) are not
+reported while checking: they are the inverse of the resolutions table, and
+will be reported together from it in one pass (for a body, a range query over
+its span).
 
 For comparison, rustc keeps the same facts, spread over a few phases. Name
 resolution uses ribs. HIR records each `break` target as the id of the

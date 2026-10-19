@@ -452,7 +452,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let label = self.body.push_label(body::Label { name });
-		self.label_used.push(false);
 		match &labelled.inner {
 			ast::Expression::Block { statements } => {
 				self.build_block(statements, expected, Some(label), span)
@@ -558,7 +557,6 @@ impl BodyContext<'_, '_, '_, '_> {
 			};
 			if found {
 				if let (Some(name), Some(scope_label)) = (label, scope_label) {
-					self.label_used[usize::from(scope_label)] = true;
 					self.cx.resolutions.by_site.insert(
 						(
 							SourceSpan::new(self.scope.file_id, name.span),
