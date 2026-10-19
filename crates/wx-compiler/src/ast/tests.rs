@@ -1034,7 +1034,7 @@ fn test_named_method_call_and_turbofish() {
 	else {
 		panic!("expected a named method call")
 	};
-	assert_eq!(case.name(call.method.inner), "move_to");
+	assert_eq!(case.name(call.method.ident.inner), "move_to");
 	assert_eq!(call.arguments.len(), 2);
 }
 
@@ -2118,8 +2118,8 @@ fn test_turbofish_method_call() {
 	else {
 		panic!("expected a method call")
 	};
-	assert_eq!(case.name(call.method.inner), "transform");
-	assert_eq!(call.type_args.len(), 1);
+	assert_eq!(case.name(call.method.ident.inner), "transform");
+	assert_eq!(call.method.type_args.len(), 1);
 	assert!(call.arguments.is_empty());
 }
 

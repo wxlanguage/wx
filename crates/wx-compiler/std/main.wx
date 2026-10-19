@@ -185,7 +185,7 @@ pub func slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
 pub func slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
-pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
+pub func slice_from_parts<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T];
 
 pub func i64_extend_i32(value: i32) -> i64;
 
@@ -2095,9 +2095,9 @@ pub trait Allocator {
     #[inline]
     func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.allocate(Layout::array::<T>(len)) as Self::Mem::&T,
+            self.allocate(Layout::array::<T>(len)) as Self::Mem::*T,
             len,
-        ) as _
+        )
     }
 }
 

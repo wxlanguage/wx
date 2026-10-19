@@ -322,9 +322,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Cast { value, ty } => {
 				self.build_cast(value, ty, expected, span)
 			}
-			ast::Expression::MethodCall(_)
-			| ast::Expression::NamedMethodCall(_) => {
-				self.unsupported(span, "a method call")
+			ast::Expression::MethodCall(call) => {
+				self.build_method_call(call, expected, span)
+			}
+			ast::Expression::NamedMethodCall(_) => {
+				self.unsupported(span, "a method call by name")
 			}
 			ast::Expression::TypeApplication { .. } => {
 				self.unsupported(span, "a type application")
@@ -3767,10 +3769,110 @@ mod tests {
 	}
 
 	#[test]
+	fn a_method_call_passes_its_receiver_first() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func get(self) -> T { loop {} }
+					pub func map<U>(self, u: U) -> W<U> { W(u) }
+					pub func by_pointer(self: heap::*Self) -> T { loop {} }
+				}
+				trait Twice { func twice(self) -> Self; }
+				impl Twice for u8 { func twice(self) -> Self { self } }
+				func inherent(w: W<u8>) -> u8 { w.get() }
+				func own_args(w: W<u8>) -> W<bool> { w.map(true) }
+				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
+				func trait_impl(a: u8) -> u8 { a.twice() }
+				func abstract_receiver<T: Twice>(t: T) -> T { t.twice() }
+				func pointer(p: heap::*W<u8>) -> u8 { p.by_pointer() }
+				func reverse(o: Ordering) -> Ordering { o.reverse() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("inherent"), "(block => (call get<u8> w#0))");
+		assert_eq!(
+			case.shape("own_args"),
+			"(block => (call map<u8, bool> w#0 true))"
+		);
+		assert_eq!(
+			case.shape("turbofish"),
+			"(block => (call map<u8, u16> w#0 1))"
+		);
+		assert_eq!(case.shape("trait_impl"), "(block => (call twice a#0))");
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract twice<T> t#0))"
+		);
+		assert_eq!(
+			case.shape("pointer"),
+			"(block => (call by_pointer<u8> p#0))"
+		);
+		assert_eq!(case.shape("reverse"), "(block => (call reverse o#0))");
+	}
+
+	/// `Global::get` and `GlobalMut::set` are declarations a global's impls
+	/// inherit, so they are called with the global as `Self`.
+	#[test]
+	fn a_global_is_read_and_written_through_its_handle() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				global limit: u32 = 10;
+				func bump() -> u32 {
+					counter.set(counter.get() + 1);
+					counter.get()
+				}
+				func fixed() { limit.set(1); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MethodNotFound]);
+		assert_eq!(
+			case.shape("bump"),
+			"(block (abstract set<counter> counter (+ (abstract get<counter> \
+			 counter) 1)) => (abstract get<counter> counter))"
+		);
+	}
+
+	#[test]
+	fn a_method_call_needs_a_method_of_the_receiver() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct S();
+				impl S {
+					pub func by_value(self) {}
+					pub func associated() {}
+				}
+				func missing(s: S) { s.nothing(); }
+				func not_a_method(s: S) { s.associated(); }
+				func through_pointer(p: heap::*S) { p.by_value(); }
+				func loaded(p: heap::*S) { p.*.by_value(); }
+				func untyped() { (1).add(2); }
+				func arguments(s: S) { s.by_value(1); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::NotAMethod,
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this function takes 0 arguments but 1 was supplied",
+		);
+	}
+
+	#[test]
 	fn an_unsupported_form_is_reported_once_as_a_bug() {
 		test_case!(
 			case = indoc! {"
-				func f(o: Ordering) -> Ordering { o.reverse() }
+				func f(o: Ordering) -> Ordering {
+					match o { Ordering::Less -> { o }, _ -> { o } }
+				}
 			"}
 		);
 		case.diagnostics()

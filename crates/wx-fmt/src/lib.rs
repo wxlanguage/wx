@@ -2459,8 +2459,8 @@ impl<'a> Builder<'a> {
 			ast::Expression::MethodCall(mc) => {
 				let mut items = self.build_method_callee(
 					&mc.object,
-					&mc.method,
-					&mc.type_args,
+					&mc.method.ident,
+					&mc.method.type_args,
 				);
 				self.build_call_args(&mut items, &mc.arguments);
 				let concat = self.arena.concat(items);
@@ -2476,8 +2476,8 @@ impl<'a> Builder<'a> {
 			ast::Expression::NamedMethodCall(mc) => {
 				let mut items = self.build_method_callee(
 					&mc.object,
-					&mc.method,
-					&mc.type_args,
+					&mc.method.ident,
+					&mc.method.type_args,
 				);
 				self.build_named_call_args(&mut items, &mc.arguments);
 				let concat = self.arena.concat(items);

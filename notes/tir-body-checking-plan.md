@@ -383,9 +383,13 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   the old checker), `Self` as a value (`Self(..)`), and a generic type named
   without its arguments (`Layout::of::<T>()`), which needs the impl selected by
   its constructor with the bounds proved after the call learns the arguments.
-- **Method calls** `x.m(..)`: the same `Callee`, with the checked receiver as
-  the first argument. No auto-deref; a `self: M::*Self` method is found on the
-  pointee when the receiver is that pointer.
+- **Method calls** `x.m(..)` (done): the same `Callee`, the checked receiver
+  its first argument, learned from like any argument. Only a member taking
+  `self` is a method. No auto-deref: a pointer receiver finds the pointee's
+  methods that take `self` by pointer (`self: M::*Self`), and is itself
+  `self`; a by-value method through a pointer is reported, pointing at `.*`.
+  An untyped receiver (`(1).add(2)`) needs an annotation. Open: calls by name
+  (`x.m({ a })`, `T::f({ a })`), as for free functions.
 - **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.
@@ -439,8 +443,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 - **Q2. Globals.** Decided: a global's name means its handle, of its nominal
   type `Type::Global` (with `impl Global { get }` and, for `global mut`,
   `impl GlobalMut { set }`). Its value is `g.get()`, a write is `g.set(x)`;
-  `g = x` and `g op= x` are invalid assignment targets. Until method calls are
-  checked, both forms are reported as unsupported.
+  `g = x` and `g op= x` are invalid assignment targets. The global's impls
+  declare no members, so `g.get()` is an `AbstractCall` of `Global::get` with
+  the global as `Self`, which MIR lowers to `global.get`.
 - **Q3. Calls through `Call`.** Should `f(x)` on a value whose type implements
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?

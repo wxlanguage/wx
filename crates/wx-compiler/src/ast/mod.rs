@@ -1208,8 +1208,9 @@ pub enum Expression {
 /// `NamedArgument` for one by name.
 pub struct MethodCallExpr<Argument = Expression> {
 	pub object: Box<Spanned<Expression>>,
-	pub method: Spanned<SymbolU32>,
-	pub type_args: Box<[Spanned<TypeExpression>]>,
+	/// The method's name, with the type arguments written on it
+	/// (`.m::<T>(..)`).
+	pub method: PathSegment,
 	pub arguments: Box<[Separated<Spanned<Argument>>]>,
 }
 
@@ -4492,11 +4493,10 @@ impl<'ctx> Parser<'ctx> {
 		if parser.lexer.peek().inner == Token::OpenBrace {
 			let (arguments, end) = Parser::parse_named_call_arguments(parser)?;
 			let inner = match Parser::method_callee(callee) {
-				Ok((object, method, type_args)) => {
+				Ok((object, method)) => {
 					Expression::NamedMethodCall(Box::new(MethodCallExpr {
 						object,
 						method,
-						type_args,
 						arguments,
 					}))
 				}
@@ -4519,11 +4519,10 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse_after_open(parser, open_span)?;
 		let inner = match Parser::method_callee(callee) {
-			Ok((object, method, type_args)) => {
+			Ok((object, method)) => {
 				Expression::MethodCall(Box::new(MethodCallExpr {
 					object,
 					method,
-					type_args,
 					arguments: arguments.inner,
 				}))
 			}
@@ -4543,18 +4542,15 @@ impl<'ctx> Parser<'ctx> {
 	#[allow(clippy::type_complexity)]
 	fn method_callee(
 		callee: Spanned<Expression>,
-	) -> Result<
-		(
-			Box<Spanned<Expression>>,
-			Spanned<SymbolU32>,
-			Box<[Spanned<TypeExpression>]>,
-		),
-		Spanned<Expression>,
-	> {
+	) -> Result<(Box<Spanned<Expression>>, PathSegment), Spanned<Expression>> {
 		match callee.inner {
-			Expression::ObjectAccess { object, member } => {
-				Ok((object, member, Box::new([])))
-			}
+			Expression::ObjectAccess { object, member } => Ok((
+				object,
+				PathSegment {
+					ident: member,
+					type_args: Box::new([]),
+				},
+			)),
 			Expression::TypeApplication {
 				callee: inner,
 				args,
@@ -4563,7 +4559,13 @@ impl<'ctx> Parser<'ctx> {
 				else {
 					unreachable!()
 				};
-				Ok((object, member, args))
+				Ok((
+					object,
+					PathSegment {
+						ident: member,
+						type_args: args,
+					},
+				))
 			}
 			inner => Err(Spanned {
 				inner,

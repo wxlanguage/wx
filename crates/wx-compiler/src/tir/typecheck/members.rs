@@ -27,7 +27,7 @@ use crate::tir::members::{
 };
 use crate::tir::resolutions::Referent;
 use crate::tir::signatures::InferPolicy;
-use crate::tir::types::TypeIndex;
+use crate::tir::types::{Type, TypeIndex};
 
 /// A member of a type a path names.
 pub(super) struct MemberPath<'s> {
@@ -53,7 +53,10 @@ impl<'s> MemberPath<'s> {
 
 /// What a member path selects.
 enum Member {
+	/// A function without `self`.
 	Function(Callee),
+	/// A function taking `self`.
+	Method(Callee),
 	Constant,
 }
 
@@ -129,7 +132,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		match self.select_member(&path) {
-			Some(Member::Function(callee)) => {
+			Some(Member::Function(callee) | Member::Method(callee)) => {
 				self.build_function_value(callee, path.member, span)
 			}
 			Some(Member::Constant) => {
@@ -153,19 +156,72 @@ impl BodyContext<'_, '_, '_, '_> {
 			return self.unsupported(span, "a function call by name");
 		};
 		match self.select_member(&path) {
-			Some(Member::Function(callee)) => self.build_function_call(
-				callee,
-				path.member,
-				None,
-				arguments,
-				expected,
-				span,
-			),
+			Some(Member::Function(callee) | Member::Method(callee)) => self
+				.build_function_call(
+					callee,
+					path.member,
+					None,
+					arguments,
+					expected,
+					span,
+				),
 			Some(Member::Constant) => {
 				self.unsupported(span, "a call of an associated constant")
 			}
 			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
 		}
+	}
+
+	/// `receiver.method(a, b)`: a call of the method the receiver's type
+	/// has, the receiver its first argument. A pointer is not dereferenced: a
+	/// method of the pointee is found only when it takes `self` by pointer,
+	/// as `self: Mem::*Self` does, and the pointer itself is then `self`.
+	pub(super) fn build_method_call(
+		&mut self,
+		call: &ast::MethodCallExpr,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let receiver = self.build(&call.object, TypeIndex::INFER);
+		let receiver_ty = self.body.ty(receiver);
+		if self.cx.types.has_untyped(receiver_ty) {
+			self.report_annotation_required(receiver);
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		}
+		let receiver_ty = self.normalized(receiver_ty, self.scope.env);
+		let pointee = match *self.cx.types.resolve(receiver_ty) {
+			Type::Pointer { to, .. } => Some(to),
+			_ => None,
+		};
+		let path =
+			MemberPath::new(pointee.unwrap_or(receiver_ty), &call.method);
+		let callee = match self.select_member(&path) {
+			Some(Member::Method(callee)) => callee,
+			Some(Member::Function(_) | Member::Constant) => {
+				self.report_not_a_method(receiver_ty, &call.method);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+			None => {
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+		};
+		if pointee.is_some() {
+			let declared =
+				self.cx.functions[usize::from(callee.function)].params()[0];
+			if !matches!(self.cx.types.resolve(declared), Type::Pointer { .. })
+			{
+				self.report_by_value_through_pointer(receiver_ty, &call.method);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+		}
+		self.build_function_call(
+			callee,
+			&call.method,
+			Some(receiver),
+			&call.arguments,
+			expected,
+			span,
+		)
 	}
 
 	/// The value member `member` names on `receiver`, recorded as what the
@@ -285,13 +341,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 		};
 		Some(match kind {
-			MemberKind::Function(function) | MemberKind::Method(function) => {
-				Member::Function(Callee {
-					function,
-					leading,
-					dispatch,
-				})
-			}
+			MemberKind::Function(function) => Member::Function(Callee {
+				function,
+				leading,
+				dispatch,
+			}),
+			MemberKind::Method(function) => Member::Method(Callee {
+				function,
+				leading,
+				dispatch,
+			}),
 			MemberKind::Constant(_) => Member::Constant,
 			MemberKind::AssociatedType(_) => {
 				unreachable!("a value lookup finds no associated type")
@@ -361,6 +420,56 @@ impl BodyContext<'_, '_, '_, '_> {
 					self.scope.file_id,
 					member.ident.span,
 				)),
+		);
+	}
+}
+
+impl BodyContext<'_, '_, '_, '_> {
+	fn report_not_a_method(
+		&mut self,
+		receiver: TypeIndex,
+		method: &ast::PathSegment,
+	) {
+		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
+		let receiver = self.cx.type_formatter().display_type(receiver);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::NotAMethod.code())
+				.with_message(format!(
+					"`{name}` of `{receiver}` does not take `self`, so it is \
+					 not a method"
+				))
+				.with_label(Label::primary(
+					self.scope.file_id,
+					method.ident.span,
+				))
+				.with_note(format!(
+					"call it through its type: `{receiver}::{name}(..)`"
+				)),
+		);
+	}
+
+	fn report_by_value_through_pointer(
+		&mut self,
+		receiver: TypeIndex,
+		method: &ast::PathSegment,
+	) {
+		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
+		let receiver = self.cx.type_formatter().display_type(receiver);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::MethodNotFound.code())
+				.with_message(format!(
+					"no method `{name}` takes a `{receiver}` receiver"
+				))
+				.with_label(Label::primary(
+					self.scope.file_id,
+					method.ident.span,
+				))
+				.with_note(
+					"this method takes `self` by value, and a pointer is not \
+					 dereferenced: read the value with `.*` first",
+				),
 		);
 	}
 }
