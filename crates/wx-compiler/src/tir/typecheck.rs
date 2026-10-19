@@ -2384,7 +2384,6 @@ mod tests {
 					name(self.defs.functions[usize::from(index)].name.inner)
 						.to_string()
 				}
-				ExprKind::Placeholder => "_".to_string(),
 				ExprKind::Unary { op, operand } => {
 					list(op.as_str(), &[operand])
 				}
@@ -2466,6 +2465,7 @@ mod tests {
 					format!("(continue {})", self.scope_name(body, scope))
 				}
 				ExprKind::Return { value } => list("return", value.as_slice()),
+				ExprKind::Drop { value } => list("drop", &[value]),
 				ExprKind::Assign { target, value } => {
 					list("=", &[target, value])
 				}
@@ -2734,16 +2734,12 @@ mod tests {
 				func f() {
 					one();
 					_ = one();
-					local _ = one();
 				}
 			"}
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnusedValue]);
-		assert_eq!(
-			case.shape("f"),
-			"(block (call one) (= _ (call one)) (= _ (call one)))"
-		);
+		assert_eq!(case.shape("f"), "(block (call one) (drop (call one)))");
 	}
 
 	#[test]

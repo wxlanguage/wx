@@ -253,7 +253,7 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)
 			| ExprKind::Function(_)
-			| ExprKind::Placeholder
+			| ExprKind::Drop { .. }
 			| ExprKind::Call { .. }
 			| ExprKind::Cast { .. }
 			| ExprKind::FieldAccess { .. }

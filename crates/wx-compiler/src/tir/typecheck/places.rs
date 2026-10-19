@@ -292,10 +292,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			if self.cx.types.has_untyped(ty) {
 				self.report_annotation_required(value);
 			}
-			let ty = self.body.ty(value);
-			let target = self.body.push(ExprKind::Placeholder, ty, target.span);
 			return self.body.push(
-				ExprKind::Assign { target, value },
+				ExprKind::Drop { value },
 				TypeIndex::UNIT,
 				span,
 			);
@@ -483,8 +481,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 	}
 
-	/// Whether `target`, a value, is something `=` can write: a local, `_`,
-	/// or a field of a local. A target that is not is reported and gives
+	/// Whether `target`, a value, is something `=` can write: a local or a
+	/// field of a local. A target that is not is reported and gives
 	/// `false`; one that is but is not `mut` is reported and gives `true`,
 	/// since its type still holds the value to it.
 	fn check_assignable(&mut self, target: ExprIdx) -> bool {
@@ -494,7 +492,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let span = self.body.span(target);
 		match self.body.kind(root) {
-			ExprKind::Error | ExprKind::Placeholder => true,
+			ExprKind::Error => true,
 			ExprKind::Local(local) => {
 				let local = *self.body.local(local);
 				if local.mut_span.is_none() {

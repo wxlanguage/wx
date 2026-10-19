@@ -302,35 +302,15 @@ impl BodyContext<'_, '_, '_, '_> {
 					span,
 				)
 			}
-			// `local _ = value` is `_ = value`: evaluated and dropped.
-			ast::Pattern::Wildcard => {
-				self.discard(value, local_ty, pattern.span, ty, span)
-			}
-			ast::Pattern::Tuple { .. }
+			// TODO: patterns, `_` among them, need their own representation.
+			ast::Pattern::Wildcard
+			| ast::Pattern::Tuple { .. }
 			| ast::Pattern::Struct { .. }
 			| ast::Pattern::NamedStruct { .. } => {
-				self.report_unsupported(
-					pattern.span,
-					"a destructuring pattern",
-				);
-				self.discard(value, TypeIndex::ERROR, pattern.span, ty, span)
+				self.report_unsupported(pattern.span, "a pattern");
+				self.body.push(ExprKind::Error, ty, span)
 			}
 		}
-	}
-
-	/// `_ = value`.
-	fn discard(
-		&mut self,
-		value: ExprIdx,
-		value_ty: TypeIndex,
-		placeholder_span: TextSpan,
-		ty: TypeIndex,
-		span: TextSpan,
-	) -> ExprIdx {
-		let target =
-			self.body
-				.push(ExprKind::Placeholder, value_ty, placeholder_span);
-		self.body.push(ExprKind::Assign { target, value }, ty, span)
 	}
 
 	/// `if condition { .. } else { .. }`. Without `else` the `if` is `()`, so

@@ -90,14 +90,11 @@ pub(super) enum ExprKind {
 	NextDiscriminant(ConstIdx),
 	/// A local's value.
 	Local(LocalIdx),
-	/// A global's value.
+	/// A global's handle, of its own nominal type (`Type::Global`).
 	Global(GlobalIdx),
 	/// A function as a value, of its own zero-sized type (`Type::Function`,
 	/// which carries the type arguments).
 	Function(FunctionIdx),
-	/// `_` on the left of `=`: the value is evaluated and dropped. Its type is
-	/// the value's.
-	Placeholder,
 	/// A builtin operator: the operand is a primitive scalar.
 	Unary {
 		op: UnaryOp,
@@ -191,9 +188,13 @@ pub(super) enum ExprKind {
 	Return {
 		value: Option<ExprIdx>,
 	},
-	/// `target = value`, where `target` is a `Local`, a `FieldAccess` rooted
-	/// in one, or a `Placeholder`: a location that is not in linear memory.
-	/// A global is never one: it is written through `GlobalMut::set`.
+	/// `_ = value`: the value is evaluated and dropped.
+	Drop {
+		value: ExprIdx,
+	},
+	/// `target = value`, where `target` is a `Local` or a `FieldAccess`
+	/// rooted in one: a location that is not in linear memory. A global is
+	/// never one: it is written through `GlobalMut::set`.
 	Assign {
 		target: ExprIdx,
 		value: ExprIdx,
@@ -537,6 +538,7 @@ impl BodyBuilder {
 			} => ([Some(lhs), Some(rhs), None], &[]),
 			ExprKind::FieldAccess { object: value, .. }
 			| ExprKind::Cast { value }
+			| ExprKind::Drop { value }
 			| ExprKind::LocalDeclaration { value, .. }
 			| ExprKind::Store { value, .. }
 			| ExprKind::CompoundStore { value, .. }
@@ -584,7 +586,6 @@ impl BodyBuilder {
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)
 			| ExprKind::Function(_)
-			| ExprKind::Placeholder
 			| ExprKind::Load(_)
 			| ExprKind::AddressOf(_)
 			| ExprKind::Continue { .. } => ([None, None, None], &[]),
