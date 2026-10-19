@@ -1485,10 +1485,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> ExprKind {
 		let args = self.body.push_args(args);
 		match self.select_operator_method(selected) {
-			SelectedMethod::Impl(method) => {
+			SelectedMethod::Concrete(method) => {
 				ExprKind::ImplMethodCall { method, args }
 			}
-			SelectedMethod::Trait(method) => {
+			SelectedMethod::Abstract(method) => {
 				ExprKind::TraitMethodCall { method, args }
 			}
 		}
@@ -1502,7 +1502,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		(method, lookup): (OperatorMethod, TraitImplLookup),
 	) -> SelectedMethod {
 		let TraitImplLookup::Concrete { impl_index, .. } = lookup else {
-			return SelectedMethod::Trait(method.method);
+			return SelectedMethod::Abstract(method.method);
 		};
 		match self
 			.cx
@@ -1511,10 +1511,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		{
 			TraitMemberSelection::Impl(
 				MemberKind::Method(selected) | MemberKind::Function(selected),
-			) => SelectedMethod::Impl(selected),
+			) => SelectedMethod::Concrete(selected),
 			TraitMemberSelection::Impl(_)
 			| TraitMemberSelection::TraitDeclaration(_) => {
-				SelectedMethod::Trait(method.method)
+				SelectedMethod::Abstract(method.method)
 			}
 		}
 	}
@@ -1950,10 +1950,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 #[derive(Clone, Copy)]
 enum SelectedMethod {
 	/// The selected impl's own method, called directly.
-	Impl(FunctionIdx),
+	Concrete(FunctionIdx),
 	/// The trait's declaration, whose impl is selected once the receiver is
 	/// known.
-	Trait(FunctionIdx),
+	Abstract(FunctionIdx),
 }
 
 /// A call's arguments, by position or by name.

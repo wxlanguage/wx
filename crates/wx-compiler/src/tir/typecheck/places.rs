@@ -26,14 +26,14 @@ enum Operand {
 	Value(ExprIdx),
 }
 
-/// What defines an `op=`, as in the `*Compound*` node names.
+/// What defines an `op=`.
 enum CompoundMethod {
 	/// The primitive scalar's operator.
 	Primitive,
 	/// The selected impl's method.
-	Impl(FunctionIdx),
+	Concrete(FunctionIdx),
 	/// The trait's declaration of the method.
-	Trait(FunctionIdx),
+	Abstract(FunctionIdx),
 }
 
 impl BodyContext<'_, '_, '_, '_> {
@@ -368,14 +368,14 @@ impl BodyContext<'_, '_, '_, '_> {
 							value,
 						}
 					}
-					CompoundMethod::Impl(method) => {
+					CompoundMethod::Concrete(method) => {
 						ExprKind::ImplCompoundStore {
 							method,
 							place,
 							value,
 						}
 					}
-					CompoundMethod::Trait(method) => {
+					CompoundMethod::Abstract(method) => {
 						ExprKind::TraitCompoundStore {
 							method,
 							place,
@@ -414,14 +414,14 @@ impl BodyContext<'_, '_, '_, '_> {
 							value,
 						}
 					}
-					CompoundMethod::Impl(method) => {
+					CompoundMethod::Concrete(method) => {
 						ExprKind::ImplCompoundAssign {
 							method,
 							target,
 							value,
 						}
 					}
-					CompoundMethod::Trait(method) => {
+					CompoundMethod::Abstract(method) => {
 						ExprKind::TraitCompoundAssign {
 							method,
 							target,
@@ -457,8 +457,12 @@ impl BodyContext<'_, '_, '_, '_> {
 			return Some(CompoundMethod::Primitive);
 		}
 		Some(match self.select_operator_method(selected) {
-			SelectedMethod::Impl(method) => CompoundMethod::Impl(method),
-			SelectedMethod::Trait(method) => CompoundMethod::Trait(method),
+			SelectedMethod::Concrete(method) => {
+				CompoundMethod::Concrete(method)
+			}
+			SelectedMethod::Abstract(method) => {
+				CompoundMethod::Abstract(method)
+			}
 		})
 	}
 
